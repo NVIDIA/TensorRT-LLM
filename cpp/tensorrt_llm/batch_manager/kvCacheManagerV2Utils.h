@@ -1,0 +1,107 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "kv_cache_manager_v2/common.h"
+#include "kv_cache_manager_v2/utils/copyUtils.h"
+#include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/kernels/kvCacheIndex.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
+#include "tensorrt_llm/runtime/iTensor.h"
+#include <ATen/ATen.h>
+#include <cstdint>
+#include <cuda.h>
+#include <set>
+#include <unordered_map>
+#include <vector>
+
+namespace tk = tensorrt_llm::kernels;
+using SizeType32 = tensorrt_llm::runtime::SizeType32;
+using ITensor = tensorrt_llm::runtime::ITensor;
+
+namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
+{
+// DiskAddress and MemAddress are defined in kv_cache_manager_v2/common.h (included above).
+
+// Please make sure to align with the definition in tensorrt_llm/runtime/kv_cache_manager_v2/_common.py
+constexpr tk::KVCacheIndex::UnderlyingType BAD_PAGE_INDEX = -1;
+
+using PackedInt = union
+{
+    int4 packed;
+    tk::KVCacheIndex::UnderlyingType unpacked[4];
+};
+
+class IndexMapper
+{
+public:
+    //! maxBeamWidth is the source page-table stride. maxCopyBeamWidth can be
+    //! larger for request-scoped caches whose beam-0 row is broadcast to beams.
+    IndexMapper(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxCopyBeamWidth = 0);
+
+    ~IndexMapper();
+
+    IndexMapper(IndexMapper const&) = delete;
+    IndexMapper& operator=(IndexMapper const&) = delete;
+
+    SizeType32 addNewSequence(LlmRequest::RequestIdType requestId);
+
+    SizeType32 getIndex(LlmRequest::RequestIdType requestId);
+
+    void removeSequence(LlmRequest::RequestIdType requestId);
+
+    //! Map scheduled sequence rows to source page-table rows. When
+    //! replicateBeamZero is true, every generation beam maps to beam 0.
+    at::Tensor getCopyIndex(std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 numContext,
+        SizeType32 beamWidth, bool replicateBeamZero = false);
+
+    //! Gathers each request's beam-0 K block offsets into a host snapshot.
+    void gatherKBlockOffsets(at::Tensor const& source, at::Tensor destination,
+        std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 numBlocks);
+
+    /// Number of sequences currently tracked (i.e. active IndexMapper slots).
+    [[nodiscard]] SizeType32 size() const noexcept
+    {
+        return static_cast<SizeType32>(indexMap_.size());
+    }
+
+    /// Number of free IndexMapper slots available for new sequences.
+    [[nodiscard]] SizeType32 numFreeSlots() const noexcept
+    {
+        return static_cast<SizeType32>(freeIndices_.size());
+    }
+
+private:
+    std::unordered_map<LlmRequest::RequestIdType, SizeType32> indexMap_;
+    std::set<SizeType32> freeIndices_;
+    SizeType32 maxBeamWidth_;
+    SizeType32 maxCopyBeamWidth_;
+    at::Tensor copyIndex_;
+};
+
+//! Gathers canonical base-page rows selected by copyIndex into a dense host tensor.
+void gatherBasePageRows(
+    at::Tensor const& source, at::Tensor destination, at::Tensor const& copyIndex, SizeType32 numBlocks);
+
+//! Copies plane-0 base-page rows between contiguous 4-D host and device tables.
+void copyBasePageRowsToDevice(ITensor const& input, ITensor& output, SizeType32 numRows, CUstream stream);
+
+void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITensor const& copyIndex,
+    ITensor const& indexScales, ITensor const& kvOffset, CUstream stream) noexcept;
+
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

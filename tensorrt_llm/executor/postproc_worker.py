@@ -1,0 +1,346 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+import asyncio
+import traceback
+from dataclasses import dataclass
+from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
+                    Optional, Union)
+
+import zmq
+
+from .._utils import nvtx_range_debug
+from ..bindings import executor as tllm
+from ..llmapi.tokenizer import TransformersTokenizer, load_hf_tokenizer
+from ..llmapi.utils import print_traceback_on_error
+from ..logger import logger
+from ..sampling_params import SamplingParams
+from .ipc import ZeroMqQueue
+from .postprocessor_hook import load_post_processor_hook
+from .utils import ErrorResponse, bucket_responses_by_frontend, is_llm_response
+
+if TYPE_CHECKING:
+    from ..disaggregated_params import DisaggregatedParams
+    from .result import (DetokenizedGenerationResultBase, GenerationResult,
+                         GenerationResultBase, ResponseWrapper)
+
+__all__ = [
+    "PostprocWorker",
+    "PostprocWorkerConfig",
+]
+
+
+@dataclass(kw_only=True)
+class PostprocArgs:
+    first_iteration: bool = True
+    num_prompt_tokens: Optional[int] = None
+    # Subtracted from num_prompt_tokens when reporting usage. Lets servers
+    # exclude generation-prompt stub tokens the vendor accounting treats as
+    # pending output (e.g. Kimi K3's 3-token channel opener) without changing
+    # what the model sees. num_prompt_tokens itself is overwritten by the
+    # executor on the postproc-worker path, so the offset must be separate.
+    num_prompt_tokens_offset: int = 0
+    tokenizer: Optional[TransformersTokenizer] = None
+    ctx_usage: Optional[Any] = None
+    # Per-request speculative-decoding acceptance stats. Set on the base so
+    # every endpoint's args subclass inherits one opt-in path. Mirrors the
+    # server's per_request_spec_decode_stats setting; there is no per-request
+    # opt-in, so clients need send nothing.
+    return_spec_decode_stats: bool = False
+    # Fixed per-step draft bound, or None when draft_len_schedule makes it vary
+    # by batch size. Sizes the emitted acceptance histogram so its length is a
+    # function of configuration rather than of what a request happened to hit.
+    spec_decode_num_spec_tokens: Optional[int] = None
+
+
+@dataclass(kw_only=True)
+class PostprocParams:
+    post_processor: Callable[["GenerationResultBase", PostprocArgs], Any] = None
+    postproc_args: PostprocArgs = None
+
+
+@dataclass
+class PostprocWorkerConfig:
+    ''' The config for the postprocess worker. '''
+    num_postprocess_workers: int = 0
+    postprocess_tokenizer_dir: Optional[str] = None
+    # Dotted import path of the user post-processing hook, or
+    # None. NOTE: distinct from ``PostprocParams.post_processor``, which is the
+    # per-endpoint response *formatter* (a Callable), not this hook.
+    post_processor_hook: Optional[str] = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.num_postprocess_workers > 0
+
+
+class PostprocWorker:
+    '''
+    The worker to postprocess the responses from the executor's await_response.
+    '''
+
+    @dataclass
+    class Input:
+        rsp: Union["tllm.Response", "ResponseWrapper"]
+
+        # The information necessary for creating a GenerationResult in the first Input for each request
+        sampling_params: Optional[SamplingParams] = None
+        postproc_params: Optional[PostprocParams] = None
+        disaggregated_params: Optional["DisaggregatedParams"] = None
+        streaming: Optional[bool] = None
+
+    class Output(NamedTuple):
+        client_id: int
+        res: Any
+        is_final: bool
+        metrics: Optional[dict[str, float]] = None
+        request_perf_metrics: Any = None
+        disaggregated_params: Any = None
+        should_abort: bool = False
+        finish_reason: Optional[str] = None
+        num_generated_tokens: Optional[int] = None
+        decoding_iter: int = 0
+        avg_decoded_tokens_per_iter: Optional[float] = None
+        cached_tokens: int = 0
+
+    def __init__(
+        self,
+        pull_pipe_addr: tuple[str, Optional[bytes]],
+        push_pipe_addrs: List[tuple[str, Optional[bytes]]],
+        tokenizer_dir: str,
+        record_creator: Callable[
+            ["PostprocWorker.Input", TransformersTokenizer], Any],
+        post_processor_hook: Optional[str] = None,
+    ):
+        '''
+        Args:
+            pull_pipe_addr (tuple[str, Optional[bytes]]): The address and HMAC key of the input IPC.
+            push_pipe_addrs: The addresses and HMAC keys of the output IPC
+                lanes, one per frontend (a single-element list in
+                single-frontend mode).
+            tokenizer_dir (str): The directory to load tokenizer.
+            record_creator (Callable[["ResponsePostprocessWorker.Input"], Any]): A creator for creating a record for a request.
+            result_handler (Optional[Callable[[GenerationResultBase], Any]]): A callback handles the final result.
+            post_processor_hook (Optional[str]): Import path of the user post-processing hook; built once and threaded onto each record.
+        '''
+
+        self._records: Dict[int, GenerationResult] = {}
+        self._record_creator = record_creator
+        self._pull_pipe = ZeroMqQueue(address=pull_pipe_addr,
+                                      is_async=True,
+                                      is_server=False,
+                                      name="postprocess_pull_pipe")
+        self._push_pipes = [
+            ZeroMqQueue(address=addr,
+                        is_async=True,
+                        is_server=False,
+                        socket_type=zmq.PUSH,
+                        name=f"postprocess_push_pipe_{i}")
+            for i, addr in enumerate(push_pipe_addrs)
+        ]
+        self._to_stop = asyncio.Event()
+
+        # Load the tokenizer and share in all records.
+        # Guard against a None tokenizer_dir: transformers'
+        # PreTrainedConfig._get_config_dict coerces it via str(None) → "None",
+        # which then becomes a HEAD request to huggingface.co/None/...
+        self._tokenizer = load_hf_tokenizer(
+            tokenizer_dir) if tokenizer_dir is not None else None
+
+        # Build the user post-processing hook once, like the
+        # tokenizer above; threaded onto each record in ``_handle_input``.
+        self._post_processor_hook = (
+            load_post_processor_hook(post_processor_hook)
+            if post_processor_hook else None)
+
+    @staticmethod
+    def default_record_creator(
+            inp: "PostprocWorker.Input", tokenizer: TransformersTokenizer
+    ) -> "DetokenizedGenerationResultBase":
+        from .result import DetokenizedGenerationResultBase
+        assert inp.sampling_params is not None
+        return DetokenizedGenerationResultBase(
+            inp.rsp.client_id,
+            sampling_params=inp.sampling_params,
+            postproc_params=inp.postproc_params,
+            streaming=inp.streaming,
+            tokenizer=tokenizer)
+
+    async def _handle_input(
+        self, input: Union["PostprocWorker.Input", "ResponseWrapper"]
+    ) -> [Any, Optional[dict[str, float]]]:
+        ''' Handle a single response from await_response worker. '''
+        result = input.rsp.result
+        if not isinstance(result, tllm.Result) and (
+                result.context_logits is not None
+                or result.generation_logits is not None):
+            raise ValueError(
+                "Context logits or generation logits are not supposed to be "
+                "sent to postprocessing workers.")
+
+        with nvtx_range_debug("handle_input",
+                              color="yellow",
+                              category="Postproc"):
+            req_id = input.rsp.client_id
+            if req_id not in self._records:
+                # TODO: support variant creation later
+                self._records[req_id] = self._record_creator(
+                    input, self._tokenizer)
+                # Thread the hook onto the record here rather than
+                # via record_creator, so custom record_creators keep working.
+                self._records[
+                    req_id]._post_processor_hook = self._post_processor_hook
+                if input.disaggregated_params is not None:
+                    self._records[
+                        req_id]._disaggregated_params = input.disaggregated_params
+
+            record = self._records[req_id]
+            record._handle_response(input.rsp)  # inplace
+            # Left the result_handler determine the final output dtype.
+            # NOTE: This will change the CompletionOutput._postprocess_result
+            metrics_dict = record.metrics_dict
+            perf_metrics = None
+            disaggregated_params = None
+            if record.outputs:
+                perf_metrics = record.outputs[0].request_perf_metrics
+                disaggregated_params = record.outputs[0].disaggregated_params
+            if postproc_params := record.postproc_params:
+                result_handler, args = postproc_params.post_processor, postproc_params.postproc_args
+                args.tokenizer = self._tokenizer
+                out = result_handler(record, args)
+            else:
+                # This should only be called in streaming mode, and each time it
+                # produces a single output.
+                out = record.outputs[0]
+
+            # TODO: Keep only the diff token_ids and text in streaming mode when
+            # result_handler is not set
+            return out, metrics_dict, perf_metrics, disaggregated_params
+
+    async def _batched_put(self):
+        ''' Batched IPC send. '''
+        async for batch in self._mainloop():
+            if batch is None:
+                # notify the dispatch_result coroutine in every frontend to
+                # quit
+                for pipe in self._push_pipes:
+                    await pipe.put_async(None)
+                break
+            assert isinstance(batch, list)
+            if len(self._push_pipes) == 1:
+                await self._push_pipes[0].put_async(batch)
+                continue
+            for frontend_id, sub_batch in enumerate(
+                    bucket_responses_by_frontend(batch, len(self._push_pipes))):
+                if sub_batch:
+                    await self._push_pipes[frontend_id].put_async(sub_batch)
+
+    async def _mainloop(self):
+        ''' The loop for handle_response and keep producing outputs. '''
+
+        async def handle_single_input(inp: PostprocWorker.Input,
+                                      batch: List[PostprocWorker.Output]):
+            assert isinstance(
+                inp, PostprocWorker.Input
+            ), f"Expect PostprocWorker.Input, got {type(inp)}."
+            client_id = inp.rsp.client_id
+            # ErrorResponse has no 'result' attribute; pass it through
+            # directly so the proxy handles it via its ErrorResponse path.
+            if isinstance(inp.rsp, ErrorResponse):
+                batch.append(inp.rsp)
+                self._records.pop(client_id, None)
+                return
+            try:
+                response_result = inp.rsp.result if is_llm_response(
+                    inp.rsp) else None
+                is_final = response_result.is_final if response_result else True
+                res, metrics, perf_metrics, disaggregated_params = await self._handle_input(
+                    inp)
+                record = self._records.get(client_id)
+                # A `terminate` verdict forces the record done;
+                # honor it so the stream stops and the record is popped without
+                # waiting for the engine's own is_final.
+                if record is not None and record._done:
+                    is_final = True
+                should_abort = record._aborted if record else False
+                finish_reason = record.outputs[0].finish_reason if (
+                    record and record.outputs
+                ) else None  # pass this through for _handle_response
+                num_generated_tokens = len(record.outputs[0].token_ids) if (
+                    record and record.outputs) else None
+                batch.append(
+                    PostprocWorker.Output(
+                        client_id=client_id,
+                        res=res,
+                        is_final=is_final,
+                        metrics=metrics,
+                        request_perf_metrics=perf_metrics,
+                        disaggregated_params=disaggregated_params,
+                        should_abort=should_abort,
+                        finish_reason=finish_reason,
+                        num_generated_tokens=num_generated_tokens,
+                        decoding_iter=getattr(response_result, "decoding_iter",
+                                              0),
+                        avg_decoded_tokens_per_iter=getattr(
+                            response_result, "avg_decoded_tokens_per_iter",
+                            None),
+                        cached_tokens=getattr(response_result, "cached_tokens",
+                                              0),
+                    ))
+                if is_final:
+                    self._records.pop(client_id, None)
+            except Exception as e:
+                logger.error(
+                    f"Postprocessing error for client {client_id}: {e}\n"
+                    f"{traceback.format_exc()}")
+                batch.append(
+                    ErrorResponse(
+                        client_id=client_id,
+                        error_msg=f"Postprocessing error: {e}",
+                        request_id=getattr(inp.rsp, 'request_id', -1),
+                    ))
+                self._records.pop(client_id, None)
+
+        while not self._to_stop.is_set():
+            batch = []
+            inputs: Optional[List[PostprocWorker.Input]
+                             | PostprocWorker.
+                             Input] = await self._pull_pipe.get_async()
+
+            if not isinstance(inputs, list):
+                inputs = [inputs]
+
+            for inp in inputs:
+                if inp is None:
+                    self._to_stop.set()
+                    yield None
+                    break
+                await handle_single_input(inp, batch)
+
+            yield batch
+
+    def start(self):
+        ''' Start the workflow in the current thread. '''
+
+        async def main():
+            await asyncio.gather(self._batched_put())
+
+        try:
+            asyncio.run(main())
+        except Exception as e:
+            print(traceback.format_exc())
+            raise e
+
+
+@print_traceback_on_error
+def postproc_worker_main(feedin_ipc_addr: tuple[str, Optional[bytes]],
+                         feedout_ipc_addrs: List[tuple[str, Optional[bytes]]],
+                         tokenizer_dir: str,
+                         record_creator: Callable,
+                         post_processor_hook: Optional[str] = None):
+    # Pass the hook import path; PostprocWorker builds it once.
+    worker = PostprocWorker(feedin_ipc_addr,
+                            feedout_ipc_addrs,
+                            tokenizer_dir=tokenizer_dir,
+                            record_creator=record_creator,
+                            post_processor_hook=post_processor_hook)
+    worker.start()

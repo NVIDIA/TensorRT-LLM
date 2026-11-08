@@ -1,0 +1,466 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# An alternative lib to trt_test to let TRT_LLM developer run test using pure pytest command
+import contextlib
+import logging
+import os
+import platform
+import re
+import signal
+import subprocess
+import sys
+import time
+import traceback
+import warnings
+from collections.abc import Generator
+from typing import List, Optional
+
+import psutil
+
+# Match env-var names / CLI flag names that carry credentials, used to redact
+# values from subprocess invocation logs (env dumps + `--flag=value` args).
+# Patterns matched as case-insensitive substrings of the key/flag name.
+_SENSITIVE_NAME_RE = re.compile(
+    r"(?i)(secret|token|password|passwd|psw|credential"
+    r"|api[_-]?key|private[_-]?key|access[_-]?key)")
+_REDACTED = "***"
+
+
+def _is_sensitive_name(name: str) -> bool:
+    return isinstance(name, str) and bool(_SENSITIVE_NAME_RE.search(name))
+
+
+def redact_env(env):
+    """Return a shallow copy of ``env`` with sensitive values masked."""
+    if env is None:
+        return env
+    try:
+        items = env.items()
+    except AttributeError:
+        return env
+    return {k: (_REDACTED if _is_sensitive_name(k) else v) for k, v in items}
+
+
+def redact_args(args):
+    """Return a copy of ``args`` (list of CLI tokens) with sensitive values masked.
+
+    Handles both ``--flag=value`` and ``--flag value`` forms.
+    """
+    if not args:
+        return args
+    try:
+        seq = list(args)
+    except TypeError:
+        return args
+    out = []
+    i = 0
+    while i < len(seq):
+        a = seq[i]
+        if isinstance(a, str) and a.startswith("-") and "=" in a:
+            flag, sep, _ = a.partition("=")
+            if _is_sensitive_name(flag):
+                out.append(f"{flag}{sep}{_REDACTED}")
+                i += 1
+                continue
+        if (isinstance(a, str) and a.startswith("-") and _is_sensitive_name(a)
+                and i + 1 < len(seq)):
+            out.append(a)
+            out.append(_REDACTED)
+            i += 2
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
+def redact_popenargs(popenargs):
+    """Return a copy of ``popenargs`` with the first arg (the command list) redacted."""
+    if not popenargs:
+        return popenargs
+    first = popenargs[0]
+    if isinstance(first, (list, tuple)):
+        return (redact_args(first), ) + tuple(popenargs[1:])
+    return popenargs
+
+
+def redact_kwargs(kwargs):
+    """Return a copy of ``kwargs`` with ``env`` redacted."""
+    if not kwargs:
+        return kwargs
+    new_kw = dict(kwargs)
+    if "env" in new_kw:
+        new_kw["env"] = redact_env(new_kw["env"])
+    return new_kw
+
+
+general_logger = logging.getLogger("general")
+general_logger.setLevel(logging.CRITICAL)
+
+exists = os.path.exists
+is_windows = lambda: platform.system() == "Windows"
+is_linux = lambda: platform.system() == "Linux"
+is_wsl = lambda: False  # FIXME: llm cases never on WSL?
+makedirs = os.makedirs
+wsl_to_win_path = lambda x: x  # FIXME: a hack for llm not run on WSL
+SessionDataWriter = None  # TODO: hope never runs
+
+
+@contextlib.contextmanager
+def altered_env(**kwargs):
+    old = {}
+    for k, v in kwargs.items():
+        if k in os.environ:
+            old[k] = os.environ[k]
+        os.environ[k] = v
+    try:
+        yield
+    finally:
+        for k in kwargs:
+            if k not in old:
+                os.environ.pop(k)
+            else:
+                os.environ[k] = old[k]
+
+
+# Our own version of subprocess functions that clean up the whole process tree upon failure.
+# This ensures subsequent tests won't be affected by left over processes from previous testcase.
+#
+# On Linux we create a new session (start_new_session) when starting subprocess to trace
+# descendants even when parent processes already exited.
+# Subprocesses spawned by tests usually create their own process groups, so killpg() is not
+# enough here. However, they usually don't create new session, so we use it to track.
+#
+# On Windows we create a job object and put the subprocess into it. Descendants created by
+# a process in job will also in the job. Terminate the job object in turn terminates all process in
+# the job.
+
+if is_linux():
+    Popen = subprocess.Popen
+
+    def list_process_sid(sid: int):
+        current_uid = os.getuid()
+
+        pids = []
+        for proc in psutil.process_iter(['pid', 'uids']):
+            if current_uid in proc.info['uids']:
+                try:
+                    if os.getsid(proc.pid) == sid:
+                        pids.append(proc.pid)
+                except (ProcessLookupError, PermissionError):
+                    pass
+
+        return pids
+
+    def cleanup_process_tree(p: subprocess.Popen,
+                             has_session=False,
+                             verbose_message=False):
+        target_pids = set()
+        if has_session:
+            # Session ID is the pid of the leader process
+            target_pids.update(list_process_sid(p.pid))
+
+        # Backup plan: using ppid to build subprocess tree
+        try:
+            target_pids.update(
+                sub.pid
+                for sub in psutil.Process(p.pid).children(recursive=True))
+        except psutil.Error:
+            pass
+
+        persist_pids = []
+        if target_pids:
+            # Grace period
+            time.sleep(5)
+
+            lines = []
+            torch_inductors = []
+
+            for pid in sorted(target_pids):
+                try:
+                    sp = psutil.Process(pid)
+                    if verbose_message:
+                        cmdline = sp.cmdline()
+
+                        # Detect repetitive torch inductor worker processes
+                        if len(cmdline) > 3 and \
+                            'python' in cmdline[0] and \
+                            'torch/_inductor/compile_worker/__main__.py' in cmdline[1] and \
+                            '--pickler=torch._inductor.compile_worker.subproc_pool.SubprocPickler' == cmdline[2]:
+                            torch_inductors.append(pid)
+                            continue
+
+                        # Readability for ray processes. They have a lot of empty args
+                        if cmdline and cmdline[0].startswith('ray::'):
+                            cmdline = [arg for arg in cmdline if arg]
+
+                        lines.append(f"{pid}: {cmdline}")
+                    persist_pids.append(pid)
+                except psutil.Error:
+                    pass
+
+            if torch_inductors:
+                lines.append(
+                    f"{len(torch_inductors)}*torch inductor workers: {torch_inductors}"
+                )
+
+            if persist_pids:
+                msg = f"Found leftover subprocesses: {persist_pids} launched by {p.args}"
+                if verbose_message:
+                    detail = '\n'.join(lines)
+                    msg = f"{msg}\n{detail}"
+                warnings.warn(msg)
+
+        for pid in persist_pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        p.kill()
+
+elif is_windows():
+    import pywintypes
+    import win32api
+    import win32job
+
+    class MyHandle:
+
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __del__(self):
+            win32api.CloseHandle(self.handle)
+
+    def Popen(*popenargs, start_new_session, **kwargs):
+        job_handle = None
+        if start_new_session:
+            job_handle = win32job.CreateJobObject(None, "")
+        p = subprocess.Popen(*popenargs, **kwargs)
+        if start_new_session:
+            # It would be best to start with creationflags=0x04 (CREATE_SUSPENDED),
+            # add process to job, and resume the primary thread.
+            # However, subprocess.Popen simply discarded the thread handle and tid.
+            # Instead, simply hope we add the process early enough.
+            try:
+                win32job.AssignProcessToJobObject(job_handle, p._handle)
+                p.job_handle = MyHandle(job_handle)
+            except pywintypes.error:
+                p.job_handle = None
+        return p
+
+    def cleanup_process_tree(p: subprocess.Popen, has_session=False):
+        target_pids = []
+        try:
+            target_pids = [
+                sub.pid
+                for sub in psutil.Process(p.pid).children(recursive=True)
+            ]
+        except psutil.Error:
+            pass
+
+        if has_session and p.job_handle is not None:
+            process_exit_code = 3600  # Some obvious special exit code
+            try:
+                win32job.TerminateJobObject(p.job_handle.handle,
+                                            process_exit_code)
+            except pywintypes.error:
+                pass
+
+        print("Found leftover pids:", target_pids)
+        for pid in target_pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+        p.kill()
+
+
+def _append_output(message: str, stdout, stderr):
+    for name, stream in (("stdout", stdout), ("stderr", stderr)):
+        if stream is None:
+            continue
+        if isinstance(stream, bytes):
+            stream = stream.decode(errors="replace")
+        message += f"\n{name}:\n{stream}"
+    return message
+
+
+class CalledProcessErrorWithOutput(subprocess.CalledProcessError):
+    """``CalledProcessError`` whose message includes the captured output."""
+
+    def __str__(self):
+        return _append_output(super().__str__(), self.stdout, self.stderr)
+
+
+class TimeoutExpiredWithOutput(subprocess.TimeoutExpired):
+    """``TimeoutExpired`` whose message includes the captured output."""
+
+    def __str__(self):
+        return _append_output(super().__str__(), self.stdout, self.stderr)
+
+
+# Bounds collecting a killed process's output, in case a process outside the
+# cleaned-up tree still holds its pipes open.
+_OUTPUT_DRAIN_TIMEOUT = 10
+
+
+def _timeout_with_output(p: subprocess.Popen, exc: subprocess.TimeoutExpired):
+    """Returns ``exc`` as a ``TimeoutExpiredWithOutput``.
+
+    The returned exception holds all of ``p``'s output, including what an
+     earlier timed-out ``communicate`` read. ``p`` must already be killed.
+    """
+    try:
+        stdout, stderr = p.communicate(timeout=_OUTPUT_DRAIN_TIMEOUT)
+    except subprocess.TimeoutExpired as drain_exc:
+        stdout, stderr = drain_exc.stdout, drain_exc.stderr
+    return TimeoutExpiredWithOutput(exc.cmd,
+                                    exc.timeout,
+                                    output=stdout,
+                                    stderr=stderr)
+
+
+@contextlib.contextmanager
+def popen(*popenargs,
+          start_new_session=True,
+          suppress_output_info=False,
+          **kwargs) -> Generator[subprocess.Popen]:
+    if not suppress_output_info:
+        print(f"Start subprocess with popen({redact_popenargs(popenargs)}, "
+              f"{redact_kwargs(kwargs)})")
+
+    with Popen(*popenargs, start_new_session=start_new_session, **kwargs) as p:
+        try:
+            yield p
+            if start_new_session:
+                cleanup_process_tree(p, True, True)
+        except BaseException as e:
+            try:
+                cleanup_process_tree(p, start_new_session)
+            except Exception as ee:
+                print(
+                    f"cleanup_process_tree failed while handling exception: {''.join(traceback.format_exception(ee))}"
+                )
+            if (isinstance(e, subprocess.TimeoutExpired)
+                    and not isinstance(e, TimeoutExpiredWithOutput)
+                    and e.cmd == p.args):
+                print("Process timed out.")
+                raise _timeout_with_output(p, e) from e
+            raise
+
+
+def call(*popenargs,
+         timeout: Optional[float] = None,
+         start_new_session=True,
+         suppress_output_info=False,
+         spin_time: float = 1.0,
+         poll_procs: Optional[List[subprocess.Popen]] = None,
+         **kwargs):
+    poll_procs = poll_procs or []
+    if not suppress_output_info:
+        print(f"Start subprocess with call({redact_popenargs(popenargs)}, "
+              f"{redact_kwargs(kwargs)})")
+    with popen(*popenargs,
+               start_new_session=start_new_session,
+               suppress_output_info=True,
+               **kwargs) as p:
+        elapsed_time = 0
+        while True:
+            try:
+                return p.wait(timeout=spin_time)
+            except subprocess.TimeoutExpired as e:
+                elapsed_time += spin_time
+                if timeout is not None and elapsed_time >= timeout:
+                    e.timeout = timeout
+                    raise
+            for p_poll in poll_procs:
+                if p_poll.poll() is None:
+                    continue
+                raise RuntimeError("A sub-process has exited.")
+
+
+def check_call(*popenargs, **kwargs):
+    print(f"Start subprocess with check_call({redact_popenargs(popenargs)}, "
+          f"{redact_kwargs(kwargs)})")
+    retcode = call(*popenargs, suppress_output_info=True, **kwargs)
+    if retcode:
+        cmd = kwargs.get("args")
+        if cmd is None:
+            cmd = popenargs[0]
+        raise CalledProcessErrorWithOutput(retcode, cmd)
+    return 0
+
+
+def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
+    print(f"Start subprocess with check_output({redact_popenargs(popenargs)}, "
+          f"{redact_kwargs(kwargs)})")
+    with Popen(*popenargs,
+               stdout=subprocess.PIPE,
+               start_new_session=start_new_session,
+               **kwargs) as process:
+        try:
+            stdout, stderr = process.communicate(None, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            cleanup_process_tree(process, start_new_session)
+            raise _timeout_with_output(process, exc) from None
+        except:
+            cleanup_process_tree(process, start_new_session)
+            raise
+        retcode = process.poll()
+        if start_new_session:
+            cleanup_process_tree(process, True, True)
+        if retcode:
+            raise CalledProcessErrorWithOutput(retcode,
+                                               process.args,
+                                               output=stdout,
+                                               stderr=stderr)
+    return stdout.decode()
+
+
+def make_clean_dirs(path):
+    """
+    Make directories for @path, clean content if it already exists.
+    """
+    import shutil
+    if os.path.exists(path):
+        shutil.rmtree(path)
+    os.makedirs(path)
+
+
+def print_info(message: str) -> None:
+    """
+    Prints an informational message.
+    """
+    print(f"[INFO] {message}")
+    sys.stdout.flush()
+    general_logger.info(message)
+
+
+def print_warning(message: str) -> None:
+    """
+    Prints a warning message.
+    """
+    print(f"[WARNING] {message}")
+    sys.stdout.flush()
+    general_logger.warning(message)
+
+
+def print_error(message: str) -> None:
+    """
+    Prints an error message.
+    """
+    print(f"[ERROR] {message}")
+    sys.stdout.flush()
+    general_logger.error(message)

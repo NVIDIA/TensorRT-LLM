@@ -1,0 +1,5 @@
+name: nixl
+description: NVIDIA Inference Xfer Library
+source: container
+directory_matches:
+- nvda_nixl

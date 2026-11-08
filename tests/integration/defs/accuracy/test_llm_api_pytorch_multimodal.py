@@ -1,0 +1,907 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import json
+import os
+from pathlib import Path
+from typing import ClassVar
+
+import numpy as np
+import pytest
+from PIL import Image
+from transformers import AutoProcessor
+
+from tensorrt_llm import LLM
+from tensorrt_llm.evaluate.post_processing import (
+    extract_kimi_k3_mmmu_answer,
+    strip_thinking_and_extract_mmmu_answer,
+)
+from tensorrt_llm.llmapi import (
+    CudaGraphConfig,
+    KvCacheConfig,
+    MoeConfig,
+    MTPDecodingConfig,
+    SamplingParams,
+)
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
+from tensorrt_llm.quantization import QuantAlgo
+
+from ..conftest import (
+    get_sm_version,
+    llm_models_root,
+    skip_post_blackwell_ultra,
+    skip_pre_blackwell,
+    skip_pre_hopper,
+)
+from .accuracy_core import (
+    MMMU,
+    LlmapiAccuracyTestHarness,
+    VideoMME,
+    VoxPopuli,
+    assert_acceptance_length_for_llm,
+    assert_guided_decoding_regex,
+)
+
+
+class TestExaone4_5_33B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "LGAI-EXAONE/EXAONE-4.5-33B"
+    MODEL_PATH = f"{llm_models_root()}/EXAONE-4.5-33B"
+    MAX_NUM_TOKENS = 16384
+
+    # EXAONE 4.5 ends each assistant turn with `<|endofturn|>`.
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endofturn|>",
+    )
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
+    @pytest.mark.parametrize(
+        "enable_chunked_prefill,max_num_tokens",
+        [
+            (False, MAX_NUM_TOKENS),
+            (True, 1024),
+        ],
+        ids=["full_budget", "forced_chunked_prefill"],
+    )
+    @pytest.mark.skip_less_device_memory(60000)
+    def test_auto_dtype(self, enable_chunked_prefill, max_num_tokens):
+        with LLM(
+            self.MODEL_PATH,
+            enable_chunked_prefill=enable_chunked_prefill,
+            max_num_tokens=max_num_tokens,
+            kv_cache_config=self.kv_cache_config,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+@skip_pre_hopper
+class TestNemotron_Nano_12B_V2_VL(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"
+    MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"
+    MAX_NUM_TOKENS = 25600
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        system_prompt="/no_think",
+    )
+
+    # NOTE: MMMU adds <|endoftext|> to the stop token.
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        temperature=0.0,
+        top_k=1,
+        stop="<|endoftext|>",
+    )
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8, enable_block_reuse=False)
+
+    @pytest.mark.parametrize(
+        "enable_chunked_prefill,max_num_tokens",
+        [
+            (True, 1024),
+        ],
+        ids=["forced_chunked_prefill"],
+    )
+    def test_auto_dtype(self, enable_chunked_prefill, max_num_tokens):
+        with LLM(
+            self.MODEL_PATH,
+            max_batch_size=128,
+            enable_chunked_prefill=enable_chunked_prefill,
+            max_num_tokens=max_num_tokens,
+            kv_cache_config=self.kv_cache_config,
+            trust_remote_code=True,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+
+@pytest.mark.skip_device_not_contain(["B200", "GB10"])
+class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "google/gemma-4-26B-A4B-it"
+    MODEL_PATH = f"{llm_models_root()}/gemma/nvidia-Gemma-4-26B-A4B-NVFP4"
+    MTP_MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-26B-A4B-it-assistant"
+    EXTRA_EVALUATOR_KWARGS = {
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+    # NOTE: MMMU adds <|endoftext|> to the stop token.
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+    )
+
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False,
+        enable_partial_reuse=False,
+        free_gpu_memory_fraction=0.6,
+        dtype="fp8",
+    )
+
+    def test_nvfp4(self):
+        with LLM(
+            self.MODEL_PATH,
+            max_batch_size=16,
+            kv_cache_config=self.kv_cache_config,
+            enable_chunked_prefill=True,
+            speculative_config=MTPDecodingConfig(
+                max_draft_len=3,
+                speculative_model=self.MTP_MODEL_PATH,
+            ),
+            max_stats_len=-1,
+            enable_iter_perf_stats=True,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+            assert_acceptance_length_for_llm(
+                "TestGemma4_26B_A4B::test_nvfp4",
+                llm,
+            )
+
+    def test_nvfp4_no_mtp(self):
+        # Same checkpoint without MTP drafting.
+        # SM121 (GB10) needs FlashInfer set explicitly; other GPUs use the model default.
+        extra_kwargs = {"attn_backend": "FLASHINFER"} if get_sm_version() == 121 else {}
+        with LLM(
+            self.MODEL_PATH,
+            max_batch_size=16,
+            kv_cache_config=self.kv_cache_config,
+            enable_chunked_prefill=True,
+            guided_decoding_backend="xgrammar",
+            **extra_kwargs,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            assert_guided_decoding_regex(llm)
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(80000)
+class TestGemma4_31B(LlmapiAccuracyTestHarness):
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-31B-it"
+
+    def test_multi_image_encoder_budget(self, tmp_path: Path) -> None:
+        """A request spanning several encoder steps completes, and the executor keeps serving."""
+        # Raise every image to 1120 soft tokens (10,080 encoder patches) so 8 images need several
+        # encoder steps.
+        for name in os.listdir(self.MODEL_PATH):
+            if name != "processor_config.json":
+                os.symlink(os.path.join(self.MODEL_PATH, name), tmp_path / name)
+        with open(os.path.join(self.MODEL_PATH, "processor_config.json")) as f:
+            processor_config = json.load(f)
+        processor_config["image_processor"]["max_soft_tokens"] = 1120
+        with open(tmp_path / "processor_config.json", "w") as f:
+            json.dump(processor_config, f)
+        processor = AutoProcessor.from_pretrained(tmp_path)
+        assert processor.image_processor.max_soft_tokens == 1120
+
+        num_images = 8
+        prompt = processor.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image"}] * num_images
+                    + [{"type": "text", "text": "Describe these images."}],
+                }
+            ],
+            add_generation_prompt=True,
+        )
+        rng = np.random.default_rng(0)
+        images = [
+            Image.fromarray(rng.integers(0, 256, (2000, 2000, 3), dtype=np.uint8))
+            for _ in range(num_images)
+        ]
+        sampling_params = SamplingParams(max_tokens=8)
+        with LLM(
+            str(tmp_path),
+            max_seq_len=65536,
+            max_batch_size=32,
+            max_num_tokens=2048,
+            enable_chunked_prefill=True,
+            attn_backend="FLASHINFER",
+            cuda_graph_config=None,
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
+        ) as llm:
+            output = llm.generate(
+                {"prompt": prompt, "multi_modal_data": {"image": images}}, sampling_params
+            )
+            # About 8.7k prompt tokens at 1120 soft tokens per image, about 2.1k at the default 280.
+            assert len(output.prompt_token_ids) > num_images * 1000
+            assert output.outputs[0].token_ids
+            output = llm.generate("Hello", sampling_params)
+            assert output.outputs[0].token_ids
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(40000)
+class TestGemma4Unified12B(LlmapiAccuracyTestHarness):
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-12B-it"
+
+    def test_guided_decoding(self):
+        if not os.path.exists(self.MODEL_PATH):
+            pytest.skip(f"Model directory {self.MODEL_PATH} does not exist")
+        with LLM(
+            self.MODEL_PATH,
+            disable_mm_encoder=True,
+            max_batch_size=1,
+            max_seq_len=512,
+            max_num_tokens=512,
+            attn_backend="FLASHINFER",
+            guided_decoding_backend="xgrammar",
+        ) as llm:
+            assert_guided_decoding_regex(llm)
+
+
+class TestQwen3VL_MOE(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3-VL-30B-A3B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-VL-30B-A3B-Instruct"
+    MAX_NUM_TOKENS = 16384
+
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<|endoftext|>"
+    )
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+
+    @pytest.mark.skip_less_device_memory(140000)
+    def test_auto_dtype(self):
+        with LLM(
+            self.MODEL_PATH,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            kv_cache_config=self.kv_cache_config,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistral/Mistral-Large-3-675B"
+    MODEL_PATH = (
+        f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-NVFP4/"
+    )
+    MAX_NUM_TOKENS = 16384
+
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<|endoftext|>"
+    )
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @pytest.mark.skip_less_device_memory(183000)
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
+        [
+            (4, 1, 4, False, True, True, "TRTLLM"),
+        ],
+        ids=[
+            "latency_moe_trtllm",
+        ],
+    )
+    def test_nvfp4_4gpus(
+        self,
+        tp_size,
+        pp_size,
+        ep_size,
+        attention_dp,
+        cuda_graph,
+        overlap_scheduler,
+        moe_backend,
+        mocker,
+    ):
+        mocker.patch.dict(
+            MMMU.EVALUATE_KWARGS,
+            {
+                "model_type": "mistral_common",
+                "is_force_single_image": True,
+            },
+        )
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend=moe_backend),
+        )
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
+
+        with LLM(
+            self.MODEL_PATH,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            checkpoint_format="mistral_large_3",
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            moe_expert_parallel_size=ep_size,
+            **pytorch_config,
+            enable_attention_dp=attention_dp,
+            kv_cache_config=kv_cache_config,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+# Qwen3.5-MoE-VL is hybrid (Mamba + attention);
+# the FlashInfer GDN prefill kernel is sm90+ only.
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(80000)
+class TestQwen3_5_35B_A3B_VL(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.5-35B-A3B"
+    MAX_NUM_TOKENS = 16384
+    MAX_BATCH_SIZE = 32
+
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+    )
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6, enable_block_reuse=False)
+
+    def _make_llm(self, model_path: str) -> LLM:
+        return LLM(
+            model_path,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            max_batch_size=self.MAX_BATCH_SIZE,
+            kv_cache_config=self.kv_cache_config,
+        )
+
+    def test_auto_dtype(self) -> None:
+        with self._make_llm(self.MODEL_PATH) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+    def test_fp8_prequantized(self) -> None:
+        model_path = f"{llm_models_root()}/Qwen3.5-35B-A3B-FP8"
+        with self._make_llm(model_path) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(80000)
+class TestQwen3_5_27B_VL(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3.5-27B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.5-27B"
+    MAX_NUM_TOKENS = 16384
+    MAX_BATCH_SIZE = 32
+
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+    )
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6, enable_block_reuse=False)
+
+    def _make_llm(self, model_path: str) -> LLM:
+        return LLM(
+            model_path,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            max_batch_size=self.MAX_BATCH_SIZE,
+            kv_cache_config=self.kv_cache_config,
+        )
+
+    def test_auto_dtype(self) -> None:
+        with self._make_llm(self.MODEL_PATH) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+class TestQwen3VL(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-VL-8B-Instruct"
+    MAX_NUM_TOKENS = 16384
+
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<|endoftext|>"
+    )
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
+    @pytest.mark.parametrize(
+        "enable_chunked_prefill,max_num_tokens",
+        [
+            (True, 1024),
+        ],
+        ids=["forced_chunked_prefill"],
+    )
+    def test_auto_dtype(self, enable_chunked_prefill, max_num_tokens):
+        with LLM(
+            self.MODEL_PATH,
+            enable_chunked_prefill=enable_chunked_prefill,
+            max_num_tokens=max_num_tokens,
+            kv_cache_config=self.kv_cache_config,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+@skip_pre_blackwell
+@pytest.mark.timeout(28800)
+class TestQwen3_8_Flash_Next_VL(LlmapiAccuracyTestHarness):
+    """MMMU accuracy for the composite Qwen4-Exp vision + text model."""
+
+    MODEL_NAME = "Qwen/Qwen3.8-Flash-Next"
+    MAX_NUM_TOKENS = 8192
+    MAX_BATCH_SIZE = 16
+
+    # NOTE: MMMU adds <|endoftext|> to the stop token.
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+    )
+
+    # The chat template thinks by default at `reasoning_effort=xhigh`, which does
+    # not fit in MMMU's 512-token budget: the trace would be truncated before the
+    # answer and the score would measure truncation rather than the model.
+    # `enable_thinking=False` makes the template prefill an empty
+    # `<think></think>` block, so the model answers directly and the run stays
+    # reproducible.
+    EXTRA_EVALUATOR_KWARGS: ClassVar[dict] = dict(
+        chat_template_kwargs={"enable_thinking": False},
+    )
+
+    kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=0.5,
+        enable_block_reuse=False,
+        mamba_ssm_cache_dtype="bfloat16",
+    )
+
+    def _run_mmmu(
+        self, model_path: str, moe_backend: str, expected_quant_algo: QuantAlgo, monkeypatch
+    ) -> None:
+        """Evaluate MMMU on one GPU with MTP3 and the PLE table on the host."""
+        monkeypatch.setenv("TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD", "1")
+
+        with LLM(
+            model_path,
+            trust_remote_code=True,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            enable_chunked_prefill=True,
+            max_batch_size=self.MAX_BATCH_SIZE,
+            kv_cache_config=self.kv_cache_config,
+            cuda_graph_config=CudaGraphConfig(
+                max_batch_size=self.MAX_BATCH_SIZE, enable_padding=True
+            ),
+            moe_config=MoeConfig(backend=moe_backend),
+            speculative_config=MTPDecodingConfig(max_draft_len=3),
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == expected_quant_algo
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+    @pytest.mark.skip_less_device_memory(105000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_nvfp4_1gpu_mtp3_trtllm_ple_offload(self, monkeypatch) -> None:
+        """NVFP4 on one GPU with MTP3 and the PLE table offloaded to host."""
+        self._run_mmmu(
+            f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+            "TRTLLM",
+            QuantAlgo.MIXED_PRECISION,
+            monkeypatch,
+        )
+
+
+class TestKimiK25(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "moonshotai/Kimi-K2.5"
+    MODEL_PATH = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
+    MAX_NUM_TOKENS = 16384
+
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+    )
+
+    kv_cache_config = KvCacheConfig(
+        free_gpu_memory_fraction=0.75,
+    )
+
+    # Thinking mode (thinking=True): model uses <think>...</think>
+    # chain-of-thought reasoning before outputting the answer.
+    # post_process_fn strips the thinking block and extracts the final
+    # answer, compensating for lm-eval's MMMU regex which fails on common
+    # reasoning-model output formats (see
+    # tensorrt_llm.evaluate.post_processing for cross-engine evidence).
+    # preserve_caller_max_tokens=True keeps our 16384 max_tokens instead of
+    # being overridden by lm-eval task's default 512 (too small for CoT).
+    EXTRA_EVALUATOR_KWARGS = dict(
+        chat_template_kwargs={"thinking": True},
+        post_process_fn=strip_thinking_and_extract_mmmu_answer,
+        preserve_caller_max_tokens=True,
+    )
+
+    @pytest.mark.timeout(7200)
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.skip_less_device_memory(183000)
+    @pytest.mark.parametrize(
+        "ep_size,attention_dp",
+        [(8, True)],
+        ids=["dep8"],
+    )
+    def test_nvfp4(self, ep_size, attention_dp):
+        """NVFP4 accuracy on MMMU benchmark (8x B200)."""
+        # Do not pass ``max_num_tokens`` here: keep it at the LLM default
+        # (8192) so the resolved ``moe_max_num_tokens`` stays at
+        # ``8192 * dp_size`` and the per-call fused_moe workspace fits
+        # within activation headroom. Raising it pushed the workspace
+        # past the fragmented allocator budget on dep8 (NVBug 6182617).
+        with LLM(
+            self.MODEL_PATH,
+            kv_cache_config=self.kv_cache_config,
+            tensor_parallel_size=8,
+            pipeline_parallel_size=1,
+            moe_expert_parallel_size=ep_size,
+            enable_attention_dp=attention_dp,
+            trust_remote_code=True,
+            enable_chunked_prefill=True,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+
+class TestKimiK3(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "moonshotai/Kimi-K3"
+    MODEL_PATH = f"{llm_models_root()}/Kimi-K3"
+    MAX_NUM_TOKENS = 16384
+
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+    )
+
+    # K3 reasons inside its <|open|>response<|sep|>...<|close|> channel (no
+    # <think> markup), so the K2.5 strip-thinking extractor cannot see the
+    # answer; extract_kimi_k3_mmmu_answer reads the channel and falls back to
+    # the K2.5 cascade for channel-less outputs. No chat_template_kwargs: K3
+    # thinks by default. preserve_caller_max_tokens keeps max_tokens=16384
+    # over lm-eval's 512-token MMMU default — without it the CoT is truncated
+    # before the response channel opens, the extractor silently falls back,
+    # and the score sinks toward the K2.5 reference floor (see
+    # references/mmmu.yaml): treat such a score with clean logs as a harness
+    # failure, not a model regression.
+    EXTRA_EVALUATOR_KWARGS: ClassVar[dict] = dict(
+        post_process_fn=extract_kimi_k3_mmmu_answer,
+        preserve_caller_max_tokens=True,
+    )
+
+    @skip_pre_blackwell
+    @pytest.mark.timeout(7200)
+    @pytest.mark.skip_less_mpi_world_size(16)
+    # The 16-GPU K3 recipes are qualified on GB300 (one NVL72 domain) only:
+    # on 2-node 180-190 GiB parts (B200/GB200, InfiniBand between nodes) the
+    # EP16 MoE-comm bring-up hangs and the KV-budget assumptions do not hold,
+    # so gate on GB300-class device memory. B300 clears this memory gate but
+    # pairs 8-GPU nodes over InfiniBand (same non-NVL72 topology) — do not
+    # schedule these tests on B300; that exclusion is enforced by QA's
+    # platform selection, not by this marker.
+    @pytest.mark.skip_less_device_memory(200000)
+    def test_w4a16_mxfp4(self) -> None:
+        """MMMU-val on the K3 VL checkpoint (16 GPUs, DEP16).
+
+        No automated L0 stage schedules 16-GPU functional tests; this case is
+        registered in qa/llm_function_multinode.txt and run by QA's weekly
+        multinode pipeline (qualified on 4x4 GB300 nodes; reference in
+        references/mmmu.yaml). Mirrors examples/kimi_k3/run_eval_kimi_k3.sbatch
+        --task mmmu: the base eval_extra_llm_options.yaml serving config with
+        max_seq_len raised to 24576 (8192 input + 16384 output).
+        """
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=16,
+            moe_expert_parallel_size=16,
+            enable_attention_dp=True,
+            max_batch_size=32,
+            max_num_tokens=8192,
+            max_seq_len=24576,
+            trust_remote_code=True,
+            enable_chunked_prefill=True,
+            cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=32),
+            moe_config=MoeConfig(max_num_tokens=33024, use_low_precision_moe_combine=True),
+            # use_kv_cache_manager_v2=False: the VL wrapper inherits K2.5's
+            # V2 cache-manager preference, but the qualified K3 MMMU
+            # configuration ran V1, and under V2 this test's long-generation
+            # shape (max_seq_len 24576, 16k-token outputs) stalled with all
+            # GPUs idle in QA validation (the GSM8K legs' shorter shape runs
+            # fine under V2). Pin V1 until the V2 x KDA-hybrid path is
+            # qualified at this shape.
+            kv_cache_config=KvCacheConfig(
+                free_gpu_memory_fraction=0.25,
+                tokens_per_block=64,
+                use_kv_cache_manager_v2=False,
+            ),
+        ) as llm:
+            # Reference-key contract: the K3 checkpoint carries its
+            # quantization as nested text_config.quantization_config
+            # (compressed-tensors MXFP4 experts), which the LLM-args layer
+            # does not surface, so the reference matcher sees
+            # quant_algo=None and the references/mmmu.yaml entry carries no
+            # quant_algo key. If this fires, the args-level resolution
+            # changed: update the yaml key together with this assert.
+            assert llm.args.quant_config.quant_algo is None
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+
+class TestMistralSmall24B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
+    MODEL_PATH = f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503"
+
+    # NOTE: MMMU adds <|endoftext|> to the stop token.
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+    )
+
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.parametrize(
+        "max_num_tokens",
+        [
+            1024,
+        ],
+        ids=["forced_chunked_prefill"],
+    )
+    def test_auto_dtype(self, max_num_tokens):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75, use_kv_cache_manager_v2=True)
+        with LLM(
+            self.MODEL_PATH,
+            kv_cache_config=kv_cache_config,
+            enable_chunked_prefill=True,
+            max_num_tokens=max_num_tokens,
+            # Size the independent encoder budget for MMMU multi-image requests, whose aggregate
+            # resident encoder output can exceed the model's largest individual image.
+            encoder_max_num_tokens=32_768,
+        ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+# Skip for B300 / GB300:
+# * B300 coverage does not meaningfully extend what we test via B200.
+# * GB300 may not be entirely up to date for `llm-models`, leading to repo-wide CI errors.
+@skip_post_blackwell_ultra
+class TestNanoV3Omni(LlmapiAccuracyTestHarness):
+    # The score here may be lower than VLMEvalKitMcore (official) runs. This path uses
+    # lm_eval's MMMU task, prompt formatting, and scoring, while VLMEvalKitMcore
+    # uses MMMU_DEV_VAL with its own MCQ prompt builder, answer extraction, and
+    # explicit image tiling/token accounting in the Mcore wrapper.
+    # We also keep the generation budget small for CI speed, and this evaluator
+    # does not strip reasoning traces after </think> before scoring. If the model
+    # ignores the non-thinking directive, answer extraction may see the reasoning.
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        is_multimodal=True,
+    )
+
+    # NOTE: MMMU adds <|endoftext|> to the stop token.
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+        temperature=0.0,
+        top_k=1,
+    )
+    MMMU_TASK_SPEC = (MMMU, sampling_params, EXTRA_EVALUATOR_KWARGS)
+
+    voxpopuli_sampling_params = SamplingParams(
+        max_tokens=512,
+        truncate_prompt_tokens=VoxPopuli.MAX_INPUT_LEN,
+        temperature=0.0,
+        top_k=1,
+    )
+    no_thinking_evaluator_kwargs = {
+        # We explicitly disable thinking, because otherwise the thinking traces could
+        # be absurdly long (20k+ tokens), which is not helpful for test-runtime, nor
+        # for reproducibility (the more tokens there are, the higher likelihood of the
+        # end output not being the same).
+        # In addition, if reasoning is cut off, then the WER goes through the roof,
+        # since each word in the output is treated as an error.
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    VOXPOPULI_TASK_SPEC = (
+        VoxPopuli,
+        voxpopuli_sampling_params,
+        no_thinking_evaluator_kwargs,
+    )
+
+    videomme_sampling_params = SamplingParams(
+        max_tokens=VideoMME.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=VideoMME.MAX_INPUT_LEN,
+        temperature=0.0,
+        top_k=1,
+    )
+    VIDEOMME_TASK_SPEC = (
+        VideoMME,
+        videomme_sampling_params,
+        no_thinking_evaluator_kwargs,
+    )
+
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.parametrize(
+        (
+            "model_name,model_path,kv_cache_config,max_batch_size,"
+            "expected_quant_algo,task_specs,multimodal_config"
+        ),
+        [
+            pytest.param(
+                "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16",
+                KvCacheConfig(
+                    free_gpu_memory_fraction=0.8,
+                    mamba_ssm_cache_dtype="float32",
+                    enable_block_reuse=False,
+                ),
+                32,
+                None,
+                (MMMU_TASK_SPEC,),
+                None,
+                id="bf16",
+            ),
+            pytest.param(
+                "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8",
+                KvCacheConfig(
+                    free_gpu_memory_fraction=0.8,
+                    mamba_ssm_cache_dtype="float32",
+                    enable_block_reuse=False,
+                    dtype="fp8",
+                ),
+                64,
+                QuantAlgo.FP8,
+                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC, VIDEOMME_TASK_SPEC),
+                None,
+                marks=skip_pre_hopper,
+                id="fp8",
+            ),
+            pytest.param(
+                "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8",
+                KvCacheConfig(
+                    free_gpu_memory_fraction=0.8,
+                    mamba_ssm_cache_dtype="float32",
+                    enable_block_reuse=False,
+                    dtype="fp8",
+                ),
+                64,
+                QuantAlgo.FP8,
+                (MMMU_TASK_SPEC,),
+                MultimodalConfig(
+                    encoder_cuda_graph={
+                        "vision": MultimodalEncoderCudaGraphConfig(
+                            # Uncomment to debug (logs will show hits / misses), which is how the
+                            # below buckets were determined.
+                            # enable_replay_stats=True,
+                            buckets=[
+                                (1280, 1),
+                                (4096, 1),
+                                (5500, 2),
+                            ],
+                        )
+                    },
+                ),
+                marks=(skip_pre_hopper,),
+                id="fp8_mmmu_encoder_cuda_graph",
+            ),
+            pytest.param(
+                "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
+                KvCacheConfig(
+                    free_gpu_memory_fraction=0.8,
+                    mamba_ssm_cache_dtype="float32",
+                    enable_block_reuse=False,
+                    dtype="fp8",
+                ),
+                128,
+                QuantAlgo.MIXED_PRECISION,
+                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC),
+                None,
+                marks=(skip_pre_blackwell,),
+                id="nvfp4",
+            ),
+        ],
+    )
+    # `torch.compile` uses a thread pool to compile and it's used in audio pre-processing.
+    @pytest.mark.threadleak(enabled=False)
+    def test_auto_dtype(
+        self,
+        model_name: str,
+        model_path: str,
+        kv_cache_config: KvCacheConfig,
+        max_batch_size: int,
+        expected_quant_algo: QuantAlgo | None,
+        task_specs: tuple[
+            tuple[type[MMMU] | type[VoxPopuli], SamplingParams, dict[str, object]],
+            ...,
+        ],
+        multimodal_config: MultimodalConfig | None,
+    ) -> None:
+        multimodal_config_kwargs = {}
+        if multimodal_config is not None:
+            multimodal_config_kwargs["multimodal_config"] = multimodal_config
+
+        with LLM(
+            model_path,
+            trust_remote_code=True,
+            kv_cache_config=kv_cache_config,
+            enable_chunked_prefill=True,
+            # Use a low-ish value for the below to force chunking for requests (helping to surface
+            # runtime errors if introduced by a change).
+            max_num_tokens=512,
+            # The amount of memory pre-allocated for mamba SSM states is proportional to the below,
+            # so lower it from its default of 2048.
+            # Quantized variants fit larger batches within the CI GPU memory budget.
+            max_batch_size=max_batch_size,
+            **multimodal_config_kwargs,
+        ) as llm:
+            if expected_quant_algo is not None:
+                assert llm.args.quant_config.quant_algo == expected_quant_algo
+            for task_cls, sampling_params, extra_evaluator_kwargs in task_specs:
+                task = task_cls(model_name)
+                task.evaluate(
+                    llm,
+                    sampling_params=sampling_params,
+                    extra_evaluator_kwargs=extra_evaluator_kwargs,
+                )

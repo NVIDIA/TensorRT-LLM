@@ -1,0 +1,631 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+#include <cuda/std/array>
+#include <fmha/hopper/compute_tile.h>
+#include <fmha/hopper/gmem_tile_o_packed.h>
+#include <fmha/hopper/smem_tile.h>
+#include <fmha/numeric_types.h>
+#include <fmha/utils.h>
+#include <fmha/warpspec/circular_buffer.h>
+#include <fmha/warpspec/epilogue.h>
+
+namespace fmha
+{
+namespace ws
+{
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Picks the BMM1 instruction traits for a warp-specialized kernel whose BMM2 is QGMMA e4m3.
+// SageAttention is INT8 QK with e4m3 PV: BMM1 is IGMMA int8 -> int32. Plain FP8 attention runs
+// both GEMMs in e4m3. A template-template argument cannot be chosen with std::conditional_t,
+// hence this selector.
+template <bool SAGE>
+struct Bmm1_traits_selector;
+
+template <>
+struct Bmm1_traits_selector<false>
+{
+    template <int GMMA_M, int GMMA_N, int GMMA_K, bool GMMA_A_RF, bool GMMA_B_RF>
+    using type = Hopper_qgmma_e4m3_fp32_traits<GMMA_M, GMMA_N, GMMA_K, GMMA_A_RF, GMMA_B_RF>;
+};
+
+template <>
+struct Bmm1_traits_selector<true>
+{
+    template <int GMMA_M, int GMMA_N, int GMMA_K, bool GMMA_A_RF, bool GMMA_B_RF>
+    using type = Hopper_igmma_int8_int32_traits<GMMA_M, GMMA_N, GMMA_K, GMMA_A_RF, GMMA_B_RF>;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <
+    // The instruction trait template for initializing BMM1 and BMM2 traits.
+    template <int, int, int, bool, bool> class Instruction_traits,
+    // The step size in query sequence dimension (M of BMM1 and BMM2).
+    int STEP_Q_,
+    // The step size in key/value sequence dimension (N of BMM1 and K of BMM2).
+    int STEP_KV_,
+    // The head dimension.
+    int D_,
+    // The head dimension of V.
+    int DV_,
+    // The number of smem buffers for Q tiles.
+    int Q_BUFFERS_,
+    // The number of smem buffers for K, and V tiles.
+    int KV_BUFFERS_,
+    // The number of compute warpgroups (128 threads per warpgroup).
+    int NUM_COMPUTE_GROUPS_,
+    // The number of data warpgroups (TMA).
+    int DMA2COMPUTE_DEPTH_,
+    // The attention mask type: padding (0), causal (1), sliding_or_chunked_attention (2),
+    // bidirectional_sliding_window_attention (3), custom_mask (4). See fused_multihead_attention_kernel.h for
+    // description.
+    int ATTENTION_MASK_TYPE_ = 0,
+    // Is head interleaved ?
+    // (head_interleaved means input [bxs, h, 3, d], otherwise [bx3, 3, h, d]).
+    bool HEADS_INTERLEAVED_ = true,
+    // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
+    bool APPLY_ALIBI_ = false,
+    // Enable mutex to overlap mma and softmax ?
+    bool ENABLE_MUTEX_ = true,
+    // The tile scheduling mode: static (0), dynamic unbalanced (1), dynamic balanced (2)
+    int SCHEDULING_MODE_ = 0,
+    // The qkv input layout: packed_qkv (0), contiguous_q_kv (1), q_paged_kv (2).
+    int INPUT_LAYOUT_ = 0,
+    // Whether use UTMASTG in epilogue. This is ignored for FP16/BF16 at the moment.
+    bool USE_TMA_STORE_ = false,
+    // Enable softcapping_scale to the qk products ? (from Grok models)
+    bool ENABLE_BMM1_SOFTCAPPING_SCALE_ = false,
+    // Save softmax stats ?
+    bool RETURN_SOFTMAX_STATS_ = false,
+    // Enable skip softmax attention feature
+    bool ENABLE_SKIP_SOFTMAX_ = false,
+    // The output type (only used by fp8 kernels).
+    typename OutputType = typename Instruction_traits<STEP_Q_, STEP_KV_, 0, false, false>::A_type,
+    // The sage attention block size for Q, K and V
+    int SAGE_BLOCK_SIZE_Q_ = 0, int SAGE_BLOCK_SIZE_K_ = 0, int SAGE_BLOCK_SIZE_V_ = 0,
+    // The BMM2 instruction traits. Defaults to the BMM1 ones; SageAttention overrides BMM1 to
+    // IGMMA int8 while BMM2 stays QGMMA e4m3, so the two differ there.
+    template <int, int, int, bool, bool> class Instruction_traits_o = Instruction_traits>
+struct Kernel_traits
+{
+
+    // The BMM2 input element type. Every V/O shared-memory buffer is sized from this rather than
+    // from the BMM1 element type, which SageAttention makes int8.
+    using Element_data_type_o = typename Instruction_traits_o<STEP_Q_, STEP_KV_, 0, false, false>::A_type;
+
+    // The step size in query sequence dimension (M of BMM1 and BMM2).
+    static constexpr int STEP_Q = STEP_Q_;
+
+    // The step size in key/value sequence dimension (N of BMM1 and K of BMM2).
+    static constexpr int STEP_KV = STEP_KV_;
+
+    // The valid head dimension.
+    static constexpr int VALID_D = D_;
+
+    static constexpr int VALID_DV = (DV_ == 0 ? D_ : DV_);
+
+    // Bootstrap GMMA_K from dummy Instruction_traits where FP16/BF16 K = 16, FP8 K = 32.
+    static constexpr int GMMA_K = Instruction_traits<STEP_Q, STEP_KV, 0, false, false>::GMMA_K;
+
+    // The instruction traits for the BMM1.
+    using Traits_p = Instruction_traits<STEP_Q, STEP_KV, GMMA_K, false, false>;
+
+    // The element type.
+    using Element_data_type = typename Traits_p::A_type;
+
+    // The bytes per element.
+    static constexpr int ELEMENT_BYTES = sizeof(Element_data_type);
+
+    // The padded head dimension.
+    static constexpr int D
+        = std::min<int>(Round_up<VALID_D, 128 / ELEMENT_BYTES>::VALUE, Next_power_of_two<VALID_D>::VALUE);
+
+    static constexpr int DV
+        = std::min<int>(Round_up<VALID_DV, 128 / ELEMENT_BYTES>::VALUE, Next_power_of_two<VALID_DV>::VALUE);
+
+    // The number of smem buffers for Q tiles.
+    static constexpr int Q_BUFFERS = Q_BUFFERS_;
+
+    // The number of smem buffers for K, and V tiles.
+    static constexpr int KV_BUFFERS = KV_BUFFERS_;
+
+    // Whether read from paged kv buffers or not.
+    static constexpr int PAGED_KV_INPUT = INPUT_LAYOUT_ == 2;
+
+    // Whether Q and KV is in separate buffer, which means we need to consider different Q and KV lengths.
+    static constexpr int SEPARATE_Q_KV_BUFFER = INPUT_LAYOUT_ > 0;
+
+    // Whether use UTMASTG in epilogue. This is always false for FP16/BF16 at the moment.
+    static constexpr int USE_TMA_STORE = 0;
+
+    // SageAttention needs fp8 input
+    static constexpr int SAGE_ATTENTION = SAGE_BLOCK_SIZE_Q_ > 0 || SAGE_BLOCK_SIZE_K_ > 0 || SAGE_BLOCK_SIZE_V_ > 0;
+
+    static constexpr int SAGE_BLOCK_SIZE_Q = SAGE_BLOCK_SIZE_Q_;
+
+    static constexpr int SAGE_BLOCK_SIZE_K = SAGE_BLOCK_SIZE_K_;
+
+    static constexpr int SAGE_BLOCK_SIZE_V = SAGE_BLOCK_SIZE_V_;
+
+    // SageAttention quantizes with the groups the BMM1 fragment hands each thread. A thread owns
+    // STEP_KV / 4 keys, so a block of SAGE_BLOCK_SIZE_K_ keys splits them into this many chunks.
+    static constexpr int SAGE_K_CHUNKS = SAGE_BLOCK_SIZE_K_ > 0 ? STEP_KV_ / (4 * SAGE_BLOCK_SIZE_K_) : 1;
+
+    // SAGE_BLOCK_SIZE_V_ counts channels, not tokens: 1 means one scale per channel. V is
+    // quantized along the channel (head-dim) axis, which is the N dimension of BMM2, so the scale
+    // is constant along the BMM2 reduction and applies once after the wgmma chain.
+    static constexpr int SAGE_V_PER_CHANNEL = SAGE_BLOCK_SIZE_V_ == 1;
+
+    // Whether the dma group transposes the v tile explicitly.
+    static constexpr int DMA_GROUP_TRANSPOSE_V = (std::is_same<Element_data_type_o, fmha::e4m3_t>::value
+        || std::is_same<Element_data_type_o, fmha::e5m2_t>::value);
+
+    // The number of smem scratch buffer for staging V transpose for Hopper QGMMA
+    static constexpr int V_SCRATCH_BUFFERS = DMA_GROUP_TRANSPOSE_V ? 1 : 0;
+
+    // The number of compute warpgroups (128 threads per warpgroup).
+    static constexpr int NUM_COMPUTE_GROUPS = NUM_COMPUTE_GROUPS_;
+
+    // The number of data warpgroups (TMA).
+    static constexpr int DMA2COMPUTE_DEPTH = DMA2COMPUTE_DEPTH_;
+
+    // The number of ctas per cluster.
+    static constexpr int CTAS_PER_CGA = 1;
+
+    // The total number of threads per block,
+    static constexpr int THREADS = 128 + NUM_COMPUTE_GROUPS * 128;
+
+    // The number of warps in the M dimension.
+    static constexpr int WARPS_M = 4;
+
+    // The number of warpgroups in the M dimensions.
+    static constexpr int WARP_GROUP_M = WARPS_M / 4;
+
+    // The number of warps in the N dimension.
+    static constexpr int WARPS_N = 1;
+
+    // The number of warpgroups in the N dimension.
+    static constexpr int WARP_GROUP_N = WARPS_N;
+
+    // The number of warpgroups in the K dimension.
+    static constexpr int WARP_GROUP_K = 1;
+
+    // The attention mask type: padding (0), causal (1), sliding_or_chunked_attention (2),
+    // bidirectional_sliding_window_attention (3), custom_mask (4).
+    static constexpr int CAUSAL_MASK = (ATTENTION_MASK_TYPE_ == 1 || ATTENTION_MASK_TYPE_ == 2);
+
+    static constexpr int SLIDING_OR_CHUNKED_ATTENTION = ATTENTION_MASK_TYPE_ == 2 || ATTENTION_MASK_TYPE_ == 3;
+
+    static constexpr int BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = ATTENTION_MASK_TYPE_ == 3;
+
+    // Is head interleaved ?
+    // (head_interleaved means input [bxs, h, 3, d], otherwise [bx3, 3, h, d]).
+    static constexpr int HEADS_INTERLEAVED = HEADS_INTERLEAVED_;
+
+    // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
+    static constexpr int APPLY_ALIBI = APPLY_ALIBI_;
+
+    // Are we save the softmax stats?
+    static constexpr int RETURN_SOFTMAX_STATS = RETURN_SOFTMAX_STATS_;
+
+    // Are we applying softcapping scale for qk products ?
+    static constexpr int ENABLE_BMM1_SOFTCAPPING_SCALE = ENABLE_BMM1_SOFTCAPPING_SCALE_;
+
+    // Use the custom mask input ( attention_mask_type == 4.)
+    static constexpr int USE_CUSTOM_MASK = ATTENTION_MASK_TYPE_ == 4;
+
+    // Are we enabling skip softmax attention feature?
+    static constexpr int ENABLE_SKIP_SOFTMAX = ENABLE_SKIP_SOFTMAX_;
+
+    static_assert(!USE_CUSTOM_MASK || STEP_KV == 64 || STEP_KV == 128 || STEP_KV == 256, "Not implemented!");
+
+    // Apply the exp2f optimization (fuse bmm1_scale and -max into FMAs).
+    // Performance degradation when enabled exp2f tricks with dense mask.
+    // with softcapping scale, exp2f optimization cannot work.
+    static constexpr int EXP2F_OPTIMIZATION = !APPLY_ALIBI && !ENABLE_BMM1_SOFTCAPPING_SCALE;
+
+    // Enable mutex to overlap mma and softmax ?
+    static constexpr int ENABLE_MUTEX = ENABLE_MUTEX_;
+
+    // The tile scheduling mode: static (0), dynamic (1)
+    static constexpr int SCHEDULING_MODE = SCHEDULING_MODE_;
+
+    // The bytes of head dimension.
+    static constexpr int D_BYTES = D * ELEMENT_BYTES;
+
+    // Split D into multiple groups in order to match the TMA swizzle mode (128B).
+    // 1. BMM1: we split D into multiple K groups.
+    // 2. BMM2: we split D into multiple N groups,
+    //          but only have one MMA_N as we can use leading_dim_offset to handle this.
+
+    // The number of head_dimension groups.
+    static constexpr int D_GROUPS = fmha::Div_up<D_BYTES, 128>::VALUE;
+
+    // The head_dimension per group.
+    static constexpr int D_PER_GROUP = D / D_GROUPS;
+
+    static_assert(D_GROUPS * D_PER_GROUP == D);
+
+    // The head_dimension bytes per group
+    static constexpr int D_BYTES_PER_GROUP = D_BYTES / D_GROUPS;
+
+    // The bytes of head dimension of V.
+    static constexpr int DV_BYTES = DV * ELEMENT_BYTES;
+
+    // The number of head_dimension groups of V.
+    static constexpr int DV_GROUPS = fmha::Div_up<DV_BYTES, 128>::VALUE;
+
+    // QGMMA: BMM2 will be split into multiple K groups as we explicitly transpose v (128 * D) in the smem.
+    // HGMMA: BMM2 will load from row-major (K * N) smem_v, so we don't need to explicitly split K.
+    static constexpr auto BMM2_LEADING_DIM_BYTES = ELEMENT_BYTES == 1 ? 128 : STEP_KV * ELEMENT_BYTES;
+
+    static constexpr int BMM2_K_GROUPS = fmha::Div_up<STEP_KV * ELEMENT_BYTES, BMM2_LEADING_DIM_BYTES>::VALUE;
+
+    // The K dimension per group
+    static constexpr int BMM2_K_PER_GROUP = fmha::Div_up<STEP_KV, BMM2_K_GROUPS>::VALUE;
+
+    // The K dimension bytes per group
+    static constexpr int BMM2_K_BYTES_PER_GROUP = ELEMENT_BYTES * BMM2_K_PER_GROUP * BMM2_K_GROUPS;
+
+    // Set GMMA descriptor mode based on the head_size.
+    static constexpr auto GMMA_DESC_MODE = (D_BYTES_PER_GROUP > 64 ? fmha::Gmma_descriptor_mode::SWIZZLE_128B
+            : D_BYTES_PER_GROUP > 32                               ? fmha::Gmma_descriptor_mode::SWIZZLE_64B
+                                                                   : fmha::Gmma_descriptor_mode::SWIZZLE_32B);
+
+    // Named barrier ids
+    static constexpr int DMA_SYNC_BARRIER_ID = 0x1;
+    static constexpr int MMA_SYNC_BARRIER_ID = 0x2;
+    // There are 2 warpgroups so 0x3 and 0x4 are used for skip-softmax
+    static constexpr int SKIP_SOFTMAX_BARRIER_ID = 0x3;
+
+    // How many threads get involved in the dma group.
+    static constexpr int NUM_THREADS_IN_DMA_GROUP = DMA_GROUP_TRANSPOSE_V ? 128 : (PAGED_KV_INPUT ? 1 : 32);
+
+    // The instruction traits for the BMM2.
+    // FP16/BF16 K = 16, FP8 K = 32.
+    using Traits_o = Instruction_traits_o<STEP_Q, DV, GMMA_K, true, false>;
+
+    // The CTA description for BMM1.
+    using Cta_tile_p =
+        typename Traits_p::template Cta_tile<STEP_Q, STEP_KV, D, WARP_GROUP_M, WARP_GROUP_N, WARP_GROUP_K>;
+
+    // The CTA description for BMM1 (after head_dimension is split).
+    using Cta_tile_p_split_d =
+        typename Traits_p::template Cta_tile<STEP_Q, STEP_KV, D_PER_GROUP, WARP_GROUP_M, WARP_GROUP_N, WARP_GROUP_K>;
+
+    // The CTA description for BMM2.
+    using Cta_tile_o = typename Traits_o::template Cta_padded_tile<STEP_Q, DV, STEP_KV, VALID_DV, STEP_KV, WARP_GROUP_M,
+        WARP_GROUP_K, WARP_GROUP_N>;
+
+    // The MMA tile for the 1st GEMM.
+    using Mma_tile_p = typename Traits_p::template Mma_tile<Cta_tile_p>;
+    // The MMA tile for the 2nd GEMM.
+    using Mma_tile_o = typename Traits_o::template Mma_tile<Cta_tile_o>;
+
+    // Smem_tiles are currently only used as meta data for the compute tile.
+    // The Q shared memory tile.
+    using Smem_tile_q
+        = fmha::Smem_tile_hopper_a<Traits_p, Cta_tile_p_split_d, fmha::Row, 16, Q_BUFFERS * D_GROUPS, GMMA_DESC_MODE,
+            true, // USE_TMA_Q
+            Traits_p::GMMA_A_RF>;
+
+    // The K shared memory tile.
+    using Smem_tile_k
+        = fmha::Smem_tile_hopper_b<Traits_p, Cta_tile_p_split_d, fmha::Col, 16, KV_BUFFERS * D_GROUPS, GMMA_DESC_MODE,
+            true // USE_TMA_K
+            >;
+
+    // The V shared memory tile.
+    using Smem_tile_v = fmha::Smem_tile_hopper_b<Traits_o, Cta_tile_o, fmha::Row, 16, KV_BUFFERS, GMMA_DESC_MODE,
+        true // USE_TMA_V
+        >;
+
+    // The GMMA compute tile for BMM1.
+    using Compute_tile_p = fmha::Compute_tile_with_gmma<Traits_p, Cta_tile_p, Smem_tile_q, Smem_tile_k,
+        Traits_p::GMMA_A_RF, Traits_p::GMMA_B_RF>;
+
+    // The GMMA compute tile for BMM2.
+    using Compute_tile_o = fmha::Compute_tile_with_gmma<Traits_o, Cta_tile_o, Smem_tile_q, Smem_tile_v,
+        Traits_o::GMMA_A_RF, Traits_o::GMMA_B_RF>;
+
+    // The global memory tile for O.
+    using Gmem_tile_o = fmha::v2::Gmem_tile_o_hopper<Traits_o, Cta_tile_o, Cta_tile_o::WARPS_K>;
+
+    // The q, k, v tile buffer.
+    using Buffer_q_t = cuda::std::array<Element_data_type, D * STEP_Q * Q_BUFFERS>;
+    using Buffer_k_t = cuda::std::array<Element_data_type, D * STEP_KV * KV_BUFFERS>;
+    using Buffer_v_t = cuda::std::array<Element_data_type_o, DV * STEP_KV * KV_BUFFERS>;
+    // We need one kv buffer to explicitly transose fp8 smem_tile.
+    using Buffer_v_scratch_t = cuda::std::array<Element_data_type_o, DV * STEP_KV * V_SCRATCH_BUFFERS>;
+
+    // The smem bytes of q, k, v tiles.
+    static constexpr int SMEM_BYTES_Q = sizeof(Buffer_q_t);
+    static constexpr int SMEM_BYTES_K = sizeof(Buffer_k_t);
+    static constexpr int SMEM_BYTES_V = sizeof(Buffer_v_t);
+
+    // The reader/writer (consumer/producer) barriers.
+    using Circular_buffer_kv_reader = typename CircularBuffer<KV_BUFFERS, CTAS_PER_CGA>::Reader;
+    using Circular_buffer_kv_writer = typename CircularBuffer<KV_BUFFERS, CTAS_PER_CGA>::Writer;
+    using Circular_buffer_q_reader = typename CircularBuffer<Q_BUFFERS, CTAS_PER_CGA>::Reader;
+    using Circular_buffer_q_writer = typename CircularBuffer<Q_BUFFERS, CTAS_PER_CGA>::Writer;
+    using Circular_buffer_v_scratch_reader = typename CircularBuffer<V_SCRATCH_BUFFERS, CTAS_PER_CGA>::Reader;
+    using Circular_buffer_v_scratch_writer = typename CircularBuffer<V_SCRATCH_BUFFERS, CTAS_PER_CGA>::Writer;
+
+    // The struct of shared memory buffers.
+    struct __align__(128) Shared
+    {
+
+        // The smem buffer of q, k, v tiles
+        Buffer_q_t smem_q[NUM_COMPUTE_GROUPS];
+        Buffer_k_t smem_k;
+        Buffer_v_t smem_v;
+        uint32_t tile_id;
+
+        // The head info to be shared among compute groups
+        struct Head_info
+        {
+            // How many steps to execute.
+            int q_steps;
+            // The start tile offset for query.
+            int local_q_tile_offset;
+
+            union
+            {
+                // The start tile offset for query (counting the past query length).
+                // Used by fixed-pattern mask types like padding, causal, sliding_window_causal
+                int q_tile_offset;
+                // The mask sum_s.
+                // Used by custom mask input.
+                int mask_sum_s;
+            };
+
+            // How many steps to execute.
+            int kv_steps;
+            // The actual query sequence length (variable sequence length).
+            int actual_seqlen;
+            // The actual key/value sequence length (variable sequence length).
+            int actual_kv_seqlen;
+            // The batch/head index.
+            int bidx;
+            // The head index.
+            int bidh;
+            int bidb;
+        };
+
+        // DMA to Compute:
+        // In this use case it probably makes sense to have the same number of BUFFERS in both queues.
+        // - barriers to wait for K+V loads to complete.
+        CircularBuffer<KV_BUFFERS, CTAS_PER_CGA> tma_k_tracker;
+        CircularBuffer<KV_BUFFERS, CTAS_PER_CGA> tma_v_tracker;
+        CircularBuffer<Q_BUFFERS, CTAS_PER_CGA> tma_q_tracker[NUM_COMPUTE_GROUPS];
+        // Not used for fp16/bf16 kernels.
+        CircularBuffer<V_SCRATCH_BUFFERS, CTAS_PER_CGA> tma_v_scratch_tracker;
+        CircularBufferWithData<DMA2COMPUTE_DEPTH, Head_info> head_info_tracker[NUM_COMPUTE_GROUPS];
+
+        // Mutex
+        OrderedMutex compute_mutex;
+
+        // 4 warps in a warpgroup vote to an atomic variable in shared memory
+        // to decide whether to skip this STEP_KV. Double-buffered to avoid races between consecutive KV_STEPS.
+        uint32_t skip_softmax_votes[2][NUM_COMPUTE_GROUPS];
+
+        inline __device__ void init(int tid0)
+        {
+
+#pragma unroll
+            for (int i = 0; i < NUM_COMPUTE_GROUPS; i++)
+            {
+                tma_q_tracker[i].init(tid0, 1, CTAS_PER_CGA);
+                head_info_tracker[i].init(tid0, /*producer_threads=*/1, /*consumer_threads=*/128);
+            }
+
+            tma_k_tracker.init(tid0, 1, NUM_COMPUTE_GROUPS);
+            tma_v_tracker.init(tid0, 1, NUM_COMPUTE_GROUPS);
+
+            compute_mutex.init(tid0, 128, 128);
+        }
+    };
+
+    static constexpr int BYTES_PER_SMEM = sizeof(Shared);
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Specialized kernel traits for Hopper_qgmma_e4m3_fp32_traits.
+template < // The step size in query sequence dimension (M of BMM1 and BMM2).
+    int STEP_Q_,
+    // The step size in key/value sequence dimension (N of BMM1 and K of BMM2).
+    int STEP_KV_,
+    // The head dimension.
+    int D_,
+    // The head dimension of V.
+    int DV_,
+    // The number of smem buffers for Q tiles.
+    int Q_BUFFERS_,
+    // The number of smem buffers for K, and V tiles.
+    int KV_BUFFERS_,
+    // The number of compute warpgroups (128 threads per warpgroup).
+    int NUM_COMPUTE_GROUPS_,
+    // The number of data warpgroups (TMA).
+    int DMA2COMPUTE_DEPTH_,
+    // The attention mask type: padding (0), causal (1), sliding_window_causal (2).
+    // See fused_multihead_attention_kernel.h for description.
+    int ATTENTION_MASK_TYPE_ = 0,
+    // Is head interleaved ?
+    // (head_interleaved means input [bxs, h, 3, d], otherwise [bx3, 3, h, d]).
+    bool HEADS_INTERLEAVED_ = true,
+    // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
+    bool APPLY_ALIBI_ = false,
+    // Enable mutex to overlap mma and softmax ?
+    bool ENABLE_MUTEX_ = true,
+    // The tile scheduling mode: static (0), dynamic unbalanced (1), dynamic balanced (2).
+    int SCHEDULING_MODE_ = 0,
+    // The qkv input layout: packed_qkv (0), contiguous_q_kv (1), q_paged_kv (2).
+    int INPUT_LAYOUT_ = 0,
+    // Whether use UTMASTG in epilogue. This is ignored for FP16/BF16 at the moment.
+    bool USE_TMA_STORE_ = false,
+    // Enable softcapping scale to the qk products ? (from Grok models)
+    bool ENABLE_BMM1_SOFTCAPPING_SCALE_ = false,
+    // Save softmax stats ?
+    bool RETURN_SOFTMAX_STATS_ = false,
+    // Enable skip softmax attention feature
+    bool ENABLE_SKIP_SOFTMAX_ = false,
+    // The output type (only used by fp8 kernels).
+    typename OutputType = e4m3_t,
+    // The sage attention block size for Q, K and V
+    int SAGE_BLOCK_SIZE_Q_ = 0, int SAGE_BLOCK_SIZE_K_ = 0, int SAGE_BLOCK_SIZE_V_ = 0>
+struct Kernel_traits_Hopper_qgmma_e4m3_fp32
+    : public Kernel_traits<Bmm1_traits_selector<(SAGE_BLOCK_SIZE_Q_ > 0 || SAGE_BLOCK_SIZE_K_ > 0
+                               || SAGE_BLOCK_SIZE_V_ > 0)>::template type,
+          STEP_Q_, STEP_KV_, D_, DV_, Q_BUFFERS_, KV_BUFFERS_, NUM_COMPUTE_GROUPS_, DMA2COMPUTE_DEPTH_,
+          ATTENTION_MASK_TYPE_, HEADS_INTERLEAVED_, APPLY_ALIBI_, ENABLE_MUTEX_, SCHEDULING_MODE_, INPUT_LAYOUT_,
+          USE_TMA_STORE_, ENABLE_BMM1_SOFTCAPPING_SCALE_, RETURN_SOFTMAX_STATS_, ENABLE_SKIP_SOFTMAX_, OutputType,
+          SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_, Hopper_qgmma_e4m3_fp32_traits>
+{
+
+    // Base class.
+    using Base = Kernel_traits<Bmm1_traits_selector<(SAGE_BLOCK_SIZE_Q_ > 0 || SAGE_BLOCK_SIZE_K_ > 0
+                                   || SAGE_BLOCK_SIZE_V_ > 0)>::template type,
+        STEP_Q_, STEP_KV_, D_, DV_, Q_BUFFERS_, KV_BUFFERS_, NUM_COMPUTE_GROUPS_, DMA2COMPUTE_DEPTH_,
+        ATTENTION_MASK_TYPE_, HEADS_INTERLEAVED_, APPLY_ALIBI_, ENABLE_MUTEX_, SCHEDULING_MODE_, INPUT_LAYOUT_,
+        USE_TMA_STORE_, ENABLE_BMM1_SOFTCAPPING_SCALE_, RETURN_SOFTMAX_STATS_, ENABLE_SKIP_SOFTMAX_, OutputType,
+        SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_, Hopper_qgmma_e4m3_fp32_traits>;
+
+    static constexpr int USE_TMA_STORE = USE_TMA_STORE_;
+
+    static constexpr int O_BUFFERS = USE_TMA_STORE ? 1 : 0;
+
+    // Inherit Traits_o, Cta_tile_o, Smem_tile_q.
+    using Traits_o = typename Base::Traits_o;
+    using Cta_tile_o = typename Base::Cta_tile_o;
+    using Smem_tile_q = typename Base::Smem_tile_q;
+
+    // The V shared memory tile.
+    // For true case below, as QGMMA only supports K-major, Smem_tile_v remaps row-major to col-major
+    // as well as the GMMA descriptor for V.
+    using Smem_tile_v = fmha::Smem_tile_v<Traits_o, Cta_tile_o, Base::KV_BUFFERS, Base::GMMA_DESC_MODE, false>;
+
+    // The GMMA compute tile for BMM2.
+    using Compute_tile_o = fmha::Compute_tile_with_gmma<Traits_o, Cta_tile_o, Smem_tile_q, Smem_tile_v,
+        Traits_o::GMMA_A_RF, Traits_o::GMMA_B_RF>;
+
+    // The global memory tile for O.
+    using Gmem_tile_o = std::conditional_t<std::is_same_v<OutputType, e4m3_t>,
+        // e4m3 output
+        fmha::v2::Gmem_tile_o_hopper_32bit_8bit<Traits_o, Cta_tile_o, Cta_tile_o::WARPS_K, USE_TMA_STORE>,
+        // fp16/bf16 output
+        fmha::v2::Gmem_tile_o_qgmma_fp32_16bits<Traits_o, Cta_tile_o, OutputType>>;
+
+    // Inherit Buffer qkv class.
+    using Buffer_q_t = typename Base::Buffer_q_t;
+    using Buffer_k_t = typename Base::Buffer_k_t;
+    using Buffer_v_t = typename Base::Buffer_v_t;
+    // We need one kv buffer to explicitly transose fp8 smem_tile.
+    using Buffer_v_scratch_t = typename Base::Buffer_v_scratch_t;
+    // Extra O buffer if TMA is used for epilogue
+    using Element_data_type = typename Base::Element_data_type;
+    using Buffer_o_t = cuda::std::array<typename Base::Element_data_type_o, Base::DV * Base::STEP_Q * O_BUFFERS>;
+
+    // The struct of shared memory buffers.
+    struct __align__(128) Shared
+    {
+
+        // The smem buffer of q, k, v tiles
+        Buffer_q_t smem_q[Base::NUM_COMPUTE_GROUPS];
+        Buffer_k_t smem_k;
+        Buffer_v_t smem_v;
+        Buffer_v_scratch_t smem_v_scratch;
+        Buffer_o_t smem_o[Base::NUM_COMPUTE_GROUPS];
+        uint32_t tile_id;
+
+        // The head info to be shared among compute groups
+        struct Head_info
+        {
+            // How many steps to execute.
+            int q_steps;
+            // The start tile offset for query.
+            int local_q_tile_offset;
+
+            union
+            {
+                // The start tile offset for query (counting the past query length).
+                // Used by fixed-pattern mask types like padding, causal, sliding_window_causal
+                int q_tile_offset;
+                // The mask sum_s.
+                // Used by custom mask input.
+                int mask_sum_s;
+            };
+
+            // How many steps to execute.
+            int kv_steps;
+            // The actual query sequence length (variable sequence length).
+            int actual_seqlen;
+            // The actual key/value sequence length (variable sequence length).
+            int actual_kv_seqlen;
+            // The batch/head index.
+            int bidx;
+            // The head index.
+            int bidh;
+            int bidb;
+        };
+
+        // DMA to Compute:
+        // In this use case it probably makes sense to have the same number of BUFFERS in both queues.
+        // - barriers to wait for K+V loads to complete.
+        CircularBuffer<Base::KV_BUFFERS, Base::CTAS_PER_CGA> tma_k_tracker;
+        CircularBuffer<Base::KV_BUFFERS, Base::CTAS_PER_CGA> tma_v_tracker;
+        CircularBuffer<Base::Q_BUFFERS, Base::CTAS_PER_CGA> tma_q_tracker[Base::NUM_COMPUTE_GROUPS];
+        CircularBuffer<Base::V_SCRATCH_BUFFERS, Base::CTAS_PER_CGA> tma_v_scratch_tracker;
+        CircularBufferWithData<Base::DMA2COMPUTE_DEPTH, Head_info> head_info_tracker[Base::NUM_COMPUTE_GROUPS];
+
+        // Mutex
+        OrderedMutex compute_mutex;
+
+        // 4 warps in a warpgroup vote to an atomic variable in shared memory
+        // to decide whether to skip this STEP_KV. Double-buffered to avoid races between consecutive STEP_KVs.
+        uint32_t skip_softmax_votes[2][Base::NUM_COMPUTE_GROUPS];
+
+        inline __device__ void init(int tid0)
+        {
+
+#pragma unroll
+            for (int i = 0; i < Base::NUM_COMPUTE_GROUPS; i++)
+            {
+                tma_q_tracker[i].init(tid0, 1, Base::CTAS_PER_CGA);
+                head_info_tracker[i].init(tid0, /*producer_threads=*/1, /*consumer_threads=*/128);
+            }
+
+            tma_k_tracker.init(tid0, 1, Base::NUM_COMPUTE_GROUPS);
+            tma_v_tracker.init(tid0, 1, Base::NUM_COMPUTE_GROUPS);
+
+            tma_v_scratch_tracker.init(tid0, 1, 1); // producer/consumer in same warp
+
+            compute_mutex.init(tid0, 128, 128);
+        }
+    };
+
+    static constexpr int BYTES_PER_SMEM = sizeof(Shared);
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+} // namespace ws
+} // namespace fmha

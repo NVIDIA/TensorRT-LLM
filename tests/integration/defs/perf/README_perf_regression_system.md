@@ -1,0 +1,227 @@
+# Perf Regression System
+
+Generic performance regression detection pipeline used by `test_perf_sanity.py` and any future perf test scripts. This document describes the three-layer architecture and how to integrate a new test script.
+
+For `test_perf_sanity.py`-specific details (config files, test case formats, CI rules, SLURM execution), see [README_test_perf_sanity.md](README_test_perf_sanity.md).
+
+## Three-Layer Architecture
+
+```
+test_perf_sanity.py              (test-specific data assembly)
+  └── perf_regression_utils.py       (generic regression pipeline)
+        └── open_search_db_utils.py      (pure DB operations)
+              └── OpenSearchDB           (low-level OpenSearch client)
+```
+
+### Layer 1: `open_search_db_utils.py` — Pure DB Operations
+
+The lowest layer. It knows only how to talk to OpenSearch and nothing about regression logic or metrics.
+
+| Function | Purpose |
+|----------|---------|
+| `add_id(data)` | Generates a unique `_id` for a data dict |
+| `get_history_data(new_data_dict, match_keys, common_values_dict)` | Queries OpenSearch for the last 90 days of valid post-merge data, matches each history record to the correct `cmd_idx` based on `match_keys`. Returns a 3-tuple: `latest_history_data_dict` (most recent entry per cmd_idx), `latest_baseline_threshold_dict` (baseline/threshold fields from the most recent entry that has them, per cmd_idx), and `history_data_dict` (all entries per cmd_idx) |
+| `post_new_perf_data(new_data_dict)` | Posts all entries to OpenSearch |
+
+### Layer 2: `perf_regression_utils.py` — Generic Regression Pipeline
+
+The reusable middle layer. Contains all business logic but is completely agnostic to what test produced the data. It takes metric lists as parameters rather than using hardcoded constants.
+
+The main entry point is `process_and_upload_test_results()`, which orchestrates the full pipeline:
+
+| Step | Function | Description |
+|------|----------|-------------|
+| 1 | `get_job_info()` | Reads CI environment variables (BUILD_URL, JOB_NAME, globalVars, etc.) to build a `job_config` dict with branch, commit, job URL, PR info, and `b_is_post_merge` flag |
+| 2 | Enrich data | Merges `job_config` and `extra_fields` into each entry, then calls `add_id()` |
+| 3 | `get_common_values()` | Scans all entries to find match_keys where every entry has the same value (e.g., all share `s_gpu_type=H100`). These become additional query filters |
+| 4 | `get_history_data()` | Queries OpenSearch with the narrowed filters, matches results back to `cmd_idx` |
+| 5 | `prepare_regressive_test_cases()` | Compares each metric's new value against baseline. Baseline comes from `latest_baseline_threshold_dict` (the most recent entry with baseline fields); if missing, falls back to `calculate_baseline_metrics()`. Threshold also comes from `latest_baseline_threshold_dict`; if missing, uses defaults. Sets `b_is_regression=True` if any regression metric exceeds the threshold. Returns the set of pre-merge `cmd_idx` exempt from gating (empty when the history query failed) |
+| 6 | `add_baseline_fields_to_post_merge_data()` | Post-merge only: embeds `d_baseline_*` and `d_threshold_*` fields into new data from `latest_baseline_threshold_dict`. Only sets fields when inherited values exist and are > 0; skips otherwise |
+| 7 | `post_new_perf_data()` | Uploads to OpenSearch |
+| 8 | `check_perf_regression()` | Prints regression details. For pre-merge, raises `RuntimeError` if `fail_on_regression=True` (default for pre-merge, auto-detected) and at least one regressive case is **not** exempt. Exempt cases are still printed as warnings |
+
+`s_branch` comes from `globalVars["build_branch"]`, which the pipeline resolves
+once in `resolveBuildBranch()` (`jenkins/L0_MergeRequest.groovy`) and also writes
+into the build's `build_info.txt`, so the two always agree. It is
+`github-pr-<N>` for GitHub PR builds (the only builds that carry
+`github_pr_api_url`), and otherwise `env.gitlabBranch` — the pushed branch
+(`main`, `release/1.3.0rcXX`, ...) for post-merge builds, the source branch for
+GitLab MR builds — falling back to `main` when that is unset. A value the
+pipeline did not publish as a string becomes `""`, because an empty branch is
+recoverable and a wrong one is not. Do **not** try to recover it from
+`s_job_url`: the `/job/LLM/job/<folder>/` segment there names the Jenkins folder
+the job definition lives in, which is `main` even for release-branch post-merge
+builds.
+
+**Baseline calculation** (`calculate_baseline_metrics`):
+1. Group all data points by day, average within each day
+2. Apply trailing rolling mean (window=3) to smooth noise
+3. Take P95 for maximize-metrics (throughput) and P5 for minimize-metrics (latency)
+
+A caller can pass `metric_history_floors_ms` (metric -> epoch-ms `ts_created`) to
+compute a metric's baseline only from records created at or after its floor. Use it
+when a metric's *definition* changes: rows recorded under the old definition are still
+valid records of what was measured then, but they are not comparable to new rows, and
+the P5/P95 baseline is pulled by the most extreme of them. Rows with no numeric
+`ts_created` are excluded under a floor. A metric with no history left above its floor
+gets no baseline, so it is not gated until new rows accrue.
+
+A stored `d_baseline_*` pin is still honoured for a floored metric when the record it
+came from was created at or after the floor. A pin from before the floor (or of unknown
+age) is ignored for gating and is not copied onto new post-merge records (Step 7); its
+`d_threshold_*` fields are kept. Remove a floor once `QUERY_LOOKBACK_DAYS` have passed,
+since the history window then no longer reaches back past it.
+
+**Regression detection** (`prepare_regressive_test_cases`):
+- A metric is regressive if the new value breaches `baseline * (1 +/- threshold)`
+- Default thresholds: **5%** for post-merge, **10%** for pre-merge (can be overridden per-metric via embedded `d_threshold_*` fields from history)
+
+**Pre-merge exemption when `main` has already regressed**
+
+Both pipelines compare against the same baseline, so a regression that lands on
+`main` makes every subsequent PR measure the same regressed value and fail a
+test it did not break — blocking all PRs until a fix merges and everyone
+rebases. To prevent that, a pre-merge case does not fail the stage when the
+latest post-merge record for the same case would itself miss the pre-merge gate:
+
+- The latest post-merge **value** is re-evaluated here, against the same baseline
+  and the same **pre-merge** threshold (10%) used for the pre-merge verdict. The
+  `b_is_regression` recorded by the post-merge run is *not* consulted, because it
+  was computed at the tighter post-merge threshold (5%).
+- That makes the exemption exactly as wide as the failure it prevents. If `main`
+  sits within the pre-merge threshold, a PR reproducing `main`'s value does not
+  fail the gate, so there is nothing to exempt and the gate stays armed.
+- Granularity is the whole test case (per `cmd_idx`), not per metric.
+- Anything unusable in that record — metric absent, null, non-numeric, or
+  non-positive — does **not** exempt, so a broken post-merge document leaves the
+  gate armed rather than silently disarming it.
+- The pre-merge document still uploads `b_is_regression` exactly as measured and
+  keeps the full metric detail in `s_regression_info`; only the `RuntimeError` is
+  suppressed, and an explanatory line is appended. No new field is written.
+- `latest_history_data_dict` already supplies this record, so no extra
+  OpenSearch query is issued.
+
+Consequences worth knowing:
+
+- Within the exempt band the case is **fully** exempt: once `main` is more than
+  10% off baseline, a PR that makes the same case worse still passes. This is
+  inherent to exempting a whole case rather than diffing against `main`'s value.
+- It **self-clears**, which also hides the regression. Nothing seeds
+  `d_baseline_*` automatically, so the effective baseline is the rolling
+  P95/P5 window; within a few days it drifts down to the regressed level, the
+  latest post-merge value comes back inside the threshold, and the gate re-arms
+  against the *lowered* bar — with no fix ever landing.
+- A single flaky post-merge data point disarms the gate until the next
+  post-merge run: "latest" is one record, not a smoothed trend.
+- To force gating back on, mark the offending post-merge document
+  `b_is_valid: false` in OpenSearch, which drops it from the history query.
+- Match keys do not include `s_stage_name`, so the exempting record is whichever
+  stage most recently measured that case.
+
+### Layer 3: Test-Specific Data Assembly
+
+Each test script (e.g., `test_perf_sanity.py`) is responsible for:
+
+1. Running benchmarks and collecting metric outputs
+2. Assembling `new_data_dict` — a `Dict[int, dict]` mapping `cmd_idx` to data dicts
+3. Building `match_keys` — the list of fields that uniquely identify a test case
+4. Calling `process_and_upload_test_results()` with its own metric definitions
+
+## How to Add a New Test Script That Reuses the Pipeline
+
+A new test script (e.g., `test_module_perf.py`) needs to do three things: define metrics, assemble data, and call the pipeline.
+
+### Step 1: Define Your Metric Lists
+
+```python
+# test_module_perf.py
+
+from .perf_regression_utils import process_and_upload_test_results
+
+# Which metrics does your test produce?
+MAXIMIZE_METRICS = ["d_flops", "d_bandwidth"]           # larger = better
+MINIMIZE_METRICS = ["d_latency_ms", "d_p99_latency_ms"] # smaller = better
+REGRESSION_METRICS = ["d_flops", "d_latency_ms"]        # which ones gate pass/fail
+```
+
+### Step 2: Assemble `new_data_dict`
+
+Build a `Dict[int, dict]` where each key is a sequential command index and each value is a flat dict with:
+
+- Test config fields that identify this test case (e.g., `s_gpu_type`, `s_module_name`, `l_batch_size`). Use the `s_`, `l_`, `b_`, `d_` type prefixes to match OpenSearch field naming.
+- Metric fields with `d_` prefix (e.g., `d_flops`, `d_latency_ms`).
+- `s_test_case_name` — a human-readable name shown in regression reports.
+
+```python
+new_data_dict = {}
+for idx, result in enumerate(test_results):
+    new_data_dict[idx] = {
+        # Test config (these become match keys)
+        "s_gpu_type": gpu_type,
+        "s_module_name": result.module_name,
+        "l_batch_size": result.batch_size,
+        "s_dtype": result.dtype,
+        # Human-readable name
+        "s_test_case_name": f"{result.module_name}-bs{result.batch_size}-{result.dtype}",
+        # Metrics
+        "d_flops": result.flops,
+        "d_bandwidth": result.bandwidth,
+        "d_latency_ms": result.latency_ms,
+        "d_p99_latency_ms": result.p99_latency_ms,
+    }
+```
+
+Do NOT include job config fields (`s_branch`, `s_job_url`, etc.) or call `add_id()` — the pipeline handles those automatically.
+
+### Step 3: Define `match_keys`
+
+List the fields that uniquely identify a test case for history lookup. Two data entries with the same `match_keys` values are considered the "same test" across runs.
+
+```python
+match_keys = ["s_gpu_type", "s_module_name", "l_batch_size", "s_dtype"]
+```
+
+### Step 4: Call the Pipeline
+
+```python
+process_and_upload_test_results(
+    new_data_dict=new_data_dict,
+    match_keys=match_keys,
+    maximize_metrics=MAXIMIZE_METRICS,
+    minimize_metrics=MINIMIZE_METRICS,
+    regression_metrics=REGRESSION_METRICS,
+    extra_fields={
+        "s_stage_name": os.environ.get("stageName", ""),
+        "s_test_list": my_test_labels,
+    },
+    upload_to_db=True,
+    # fail_on_regression=None means auto:
+    #   fail for pre-merge, warn for post-merge
+)
+```
+
+### Parameters of `process_and_upload_test_results`
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `new_data_dict` | `Dict[int, dict]` | Test config + metric values per test case |
+| `match_keys` | `List[str]` | Fields that uniquely identify a test case |
+| `maximize_metrics` | `List[str]` | Metrics where larger is better (baseline = P95) |
+| `minimize_metrics` | `List[str]` | Metrics where smaller is better (baseline = P5) |
+| `regression_metrics` | `List[str]` | Subset of `maximize_metrics + minimize_metrics` checked for pass/fail regression. Raises `ValueError` if any entry is not in those lists |
+| `extra_fields` | `dict` or `None` | Additional fields merged into every entry |
+| `upload_to_db` | `bool` | Whether to actually post to OpenSearch |
+| `fail_on_regression` | `bool` or `None` | `None` = auto (fail pre-merge, warn post-merge) |
+| `metric_history_floors_ms` | `dict` or `None` | Metric -> epoch-ms `ts_created` floor; older history is ignored for that metric's baseline |
+
+### What the Pipeline Handles for You
+
+You don't need to worry about:
+- Reading CI environment variables (job URL, branch, commit, PR info)
+- Generating document IDs
+- Querying history from OpenSearch
+- Calculating baselines from historical data
+- Detecting regressions against thresholds
+- Embedding baseline fields into post-merge data for future runs
+- Uploading to the database
+- Failing the build on regression (pre-merge) vs. warning (post-merge)

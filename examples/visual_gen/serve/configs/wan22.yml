@@ -1,0 +1,5 @@
+cache_config:
+  cache_backend: cache_dit
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1

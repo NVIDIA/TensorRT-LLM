@@ -1,0 +1,268 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "tensorrt_llm/common/tllmDataType.h"
+#include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/iTensor.h"
+
+#include <atomic>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <tuple>
+#include <unordered_map>
+#include <vector>
+
+namespace tensorrt_llm::batch_manager::kv_cache_manager
+{
+class FabricMemory;
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+
+namespace tensorrt_llm::batch_manager
+{
+
+enum class BufferKind : uint8_t
+{
+    kKV = 0,
+    kKV_INDEXER = 1,
+    kRNN = 2
+};
+
+class BaseTransBufferManager;
+
+/// @brief RAII holder for an index from BaseTransBufferManager::assignBufferIndexFor{Send,Recv}.
+///        Releases on destruction (incl. exception unwind). A dynamic-buffer holder has no
+///        concrete index, but retains its manager binding so poison() can fail closed.
+///        Move-only; call release() on the happy path or detach() when ownership is handed off downstream.
+class BufferIndexHolder
+{
+public:
+    BufferIndexHolder() = default;
+
+    BufferIndexHolder(BaseTransBufferManager& mgr, std::optional<int> index, bool isRecv) noexcept
+        : mMgr(&mgr)
+        , mIndex(index)
+        , mHeld(index.has_value())
+        , mIsRecv(isRecv)
+    {
+    }
+
+    // Defined out-of-line in baseTransBuffer.cpp: release() calls
+    // BaseTransBufferManager methods, whose full definition appears later
+    // in this header.
+    ~BufferIndexHolder()
+    {
+        release();
+    }
+
+    BufferIndexHolder(BufferIndexHolder const&) = delete;
+    BufferIndexHolder& operator=(BufferIndexHolder const&) = delete;
+
+    BufferIndexHolder(BufferIndexHolder&& other) noexcept
+        : mMgr(other.mMgr)
+        , mIndex(other.mIndex)
+        , mHeld(other.mHeld)
+        , mIsRecv(other.mIsRecv)
+    {
+        other.mHeld = false;
+        other.mMgr = nullptr;
+    }
+
+    BufferIndexHolder& operator=(BufferIndexHolder&& other) noexcept
+    {
+        if (this != &other)
+        {
+            release();
+            mMgr = other.mMgr;
+            mIndex = other.mIndex;
+            mHeld = other.mHeld;
+            mIsRecv = other.mIsRecv;
+            other.mHeld = false;
+            other.mMgr = nullptr;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] std::optional<int> index() const noexcept
+    {
+        return mIndex;
+    }
+
+    [[nodiscard]] bool held() const noexcept
+    {
+        return mHeld;
+    }
+
+    [[nodiscard]] bool isBoundTo(BaseTransBufferManager const& manager) const noexcept
+    {
+        return mMgr == &manager;
+    }
+
+    /// @brief Relinquish ownership without releasing. Use when a downstream
+    ///        owner (e.g. the formatter inside receiveSync) takes over the
+    ///        release responsibility on the happy path.
+    std::optional<int> detach() noexcept
+    {
+        mHeld = false;
+        mMgr = nullptr;
+        return mIndex;
+    }
+
+    /// @brief Release the slot now and disarm the destructor. Safe to call multiple times.
+    void release() noexcept;
+
+    /// @brief Fail-closed release for an exit path where transfer-buffer quiescence is unknown.
+    void poison() noexcept;
+
+private:
+    BaseTransBufferManager* mMgr{nullptr};
+    std::optional<int> mIndex{};
+    bool mHeld{false};
+    bool mIsRecv{true};
+};
+
+inline constexpr int64_t kBufferAcquireSliceMs = 100;
+
+/// @brief Base class for cache transfer buffer management.
+/// Handles buffer pool allocation, index assignment, and slicing.
+/// Derived classes provide cache-specific size calculations.
+class BaseTransBufferManager
+{
+public:
+    virtual ~BaseTransBufferManager() = default;
+
+    [[nodiscard]] virtual BufferKind getBufferKind() const = 0;
+
+    /// @brief Assign a buffer index for sending.
+    /// @return Assigned buffer index, or nullopt if using dynamic buffers.
+    std::optional<int> assignBufferIndexForSend(
+        std::atomic<bool> const* perRequestCancel = nullptr, int64_t waitSliceMs = kBufferAcquireSliceMs);
+
+    /// @brief Free a buffer index used for sending.
+    /// @param bufferId The buffer index to free.
+    void freeBufferIndexForSend(std::optional<int> bufferId);
+
+    /// @brief Poison a send buffer index after an unquiesced transfer exit.
+    void poisonBufferIndexForSend(std::optional<int> bufferId) noexcept;
+
+    /// @brief Assign a buffer index for receiving.
+    /// @return Assigned buffer index, or nullopt if using dynamic buffers.
+    std::optional<int> assignBufferIndexForRecv(
+        std::atomic<bool> const* perRequestCancel = nullptr, int64_t waitSliceMs = kBufferAcquireSliceMs);
+
+    /// @brief Free a buffer index used for receiving.
+    /// @param bufferId The buffer index to free.
+    void freeBufferIndexForRecv(std::optional<int> bufferId);
+
+    /// @brief Poison a receive buffer index after an unquiesced transfer exit.
+    void poisonBufferIndexForRecv(std::optional<int> bufferId) noexcept;
+
+    /// @brief Get or allocate send buffers for cache transfer.
+    /// @param bufferId The assigned buffer ID.
+    /// @param targetNum Number of target sequences.
+    /// @param requestedNumberOfElements Sizes requested for each target.
+    /// @param bufferManagerToUse Buffer manager for dynamic allocation.
+    /// @return Tuple of (buffers, covered target count, is dynamic only).
+    std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateSendBuffers(
+        std::optional<int> bufferId, int targetNum, std::vector<size_t> const& requestedNumberOfElements,
+        runtime::BufferManager const& bufferManagerToUse);
+
+    /// @brief Get or allocate receive buffers for cache transfer.
+    /// @param bufferId The assigned buffer ID.
+    /// @param targetNum Number of target sequences.
+    /// @param requestedNumberOfElements Sizes requested for each target.
+    /// @param bufferManagerToUse Buffer manager for dynamic allocation.
+    /// @return Tuple of (buffers, covered target count, is dynamic only).
+    std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateRecvBuffers(
+        std::optional<int> bufferId, int targetNum, std::vector<size_t> const& requestedNumberOfElements,
+        runtime::BufferManager const& bufferManagerToUse);
+
+    /// @brief Get the send buffer for a given buffer ID.
+    runtime::ITensor::SharedPtr getSendBuffer(std::optional<int> bufferId);
+
+    /// @brief Get the receive buffer for a given buffer ID.
+    runtime::ITensor::SharedPtr getRecvBuffer(std::optional<int> bufferId);
+
+    /// @brief Get the number of receive buffers.
+    size_t getRecvBufferCount();
+
+    /// @brief Get the number of send buffers.
+    size_t getSendBufferCount();
+
+    /// @brief Get the maximum number of tokens configured.
+    std::optional<size_t> getMaxNumTokens()
+    {
+        return mMaxNumTokens;
+    }
+
+    [[nodiscard]] bool hasPoisonedBuffer() const noexcept
+    {
+        return mConcurrenceSendResource.mPoisoned.load(std::memory_order_relaxed)
+            || mConcurrenceRecvResource.mPoisoned.load(std::memory_order_relaxed);
+    }
+
+protected:
+    /// @brief Constructor - derived classes call this after computing buffer sizes.
+    /// @param transferBufferSize Size of each transfer buffer in bytes.
+    /// @param dataType Data type for the buffers.
+    /// @param maxNumTokens Optional max tokens for sizing.
+    BaseTransBufferManager(
+        size_t transferBufferSize, tensorrt_llm::DataType dataType, std::optional<size_t> maxNumTokens = std::nullopt);
+
+    struct ConcurrenceResource
+    {
+        std::unordered_map<int, runtime::ITensor::SharedPtr> mBuffers;
+        std::vector<int> mBufferIndexFlag;
+        std::mutex mBuffersMutex;
+        std::condition_variable mBuffersCV;
+        std::atomic<int> mConcurrence{0};
+        std::atomic<bool> mPoisoned{false};
+    };
+
+    std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateBuffers(std::optional<int> bufferId,
+        int targetNum, std::vector<size_t> const& requestedNumberOfElements,
+        runtime::BufferManager const& bufferManagerToUse, ConcurrenceResource& concurrenceResource);
+
+    void allocateBuffer();
+    std::optional<int> assignBufferIndex(ConcurrenceResource& resource, size_t bufferCount, bool onlyUseDynamicBuffer,
+        std::atomic<bool> const* perRequestCancel = nullptr, int64_t waitSliceMs = kBufferAcquireSliceMs);
+    void freeBufferIndex(
+        ConcurrenceResource& resource, std::optional<int> bufferId, size_t bufferCount, bool onlyUseDynamicBuffer);
+    void poisonBufferIndex(ConcurrenceResource& resource, std::optional<int> bufferId, size_t bufferCount,
+        bool onlyUseDynamicBuffer, char const* direction) noexcept;
+
+    size_t mPreAllocBufferSize;
+    size_t mRecvBufferCount;
+    size_t mSendBufferCount;
+    size_t mTransferBufferSize;
+    bool mOnlyUseDynamicBuffer;
+    bool mUseFabricMemory;
+    size_t mNumberOfElements;
+    tensorrt_llm::DataType mDataType;
+    ConcurrenceResource mConcurrenceSendResource;
+    ConcurrenceResource mConcurrenceRecvResource;
+    runtime::BufferManager mBufferManager;
+    std::vector<std::unique_ptr<kv_cache_manager::FabricMemory>> mFabricMemory;
+    std::optional<size_t> mMaxNumTokens;
+};
+
+} // namespace tensorrt_llm::batch_manager

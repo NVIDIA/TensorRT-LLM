@@ -1,0 +1,642 @@
+from __future__ import annotations
+
+import asyncio
+from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import replace
+from typing import Any, AsyncIterator, Callable
+
+import anyio
+
+from .backends import create_backend
+from .backends.base import Backend, BackendClient, ResultEvent
+from .config import AgentLayerConfig, HumanRequest, HumanRequestOption
+from .console import (
+    print_agent_completed,
+    print_agent_failed,
+    print_agent_started,
+    print_agent_text,
+    print_compact_boundary,
+    print_human_input_request,
+    print_human_reply,
+    print_rate_limit,
+    print_server_tool_call,
+    print_session_init,
+    print_thinking,
+    print_tool_call,
+    print_user_prompt,
+)
+from .hooks import RequiredToolCallError, RequiredToolPolicy
+from .logger import Logger, get_logger
+from .module import Module
+from .runtime import PortalRunner, build_request
+from .tools import tool
+from .types import (
+    AgentRequest,
+    AgentResponse,
+    AgentTextEvent,
+    CompactBoundaryEvent,
+    RateLimitWarningEvent,
+    ServerToolCallEvent,
+    SessionInitEvent,
+    ThinkingEvent,
+    ToolCallEvent,
+    UsageInfo,
+)
+
+PromptBuilder = Callable[[str], AgentRequest]
+
+
+def _merge_turn_usage(previous: UsageInfo | None, current: UsageInfo | None) -> UsageInfo | None:
+    """Sum per-SDK-turn accounting and keep the final context snapshot.
+
+    Backends normalize cumulative upstream counters to turn deltas before
+    yielding ResultEvent. Context occupancy is a snapshot, not an expense,
+    and must not be summed across the initial and corrective turns.
+    """
+    if previous is None:
+        return current
+    if current is None:
+        return previous
+    additive = (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_tokens",
+        "cache_read_tokens",
+        "total_tokens",
+        "cost_usd",
+        "num_turns",
+        "duration_ms",
+    )
+    totals = {}
+    for field in additive:
+        before, after = getattr(previous, field), getattr(current, field)
+        totals[field] = None if before is None and after is None else (before or 0) + (after or 0)
+    estimate = current.estimated_thread_cost_usd
+    if estimate is None:
+        estimate = previous.estimated_thread_cost_usd
+    return replace(current, **totals, estimated_thread_cost_usd=estimate)
+
+
+def _read_stdin(prompt: str = "> ") -> str:
+    """Indirection so tests can monkeypatch the blocking stdin read."""
+    return input(prompt)
+
+
+def _read_human_reply(request: HumanRequest) -> str:
+    """Read one ``ask_human`` reply from stdin, resolving choice options.
+
+    When the request includes options the reply is interpreted in this
+    order, falling through on each miss:
+
+    1. A 1-based numeric index — returns the matching option's canonical
+       label (so the agent never sees "2" as a tool result).
+    2. The label text itself, matched case-insensitively after stripping
+       whitespace — returns the canonical label.
+    3. Anything else — returned verbatim as free-form text. This is the
+       escape hatch for when none of the offered options captures what
+       the human actually wants to say.
+
+    Empty / whitespace-only input is returned as-is and the dispatcher
+    normalizes it to ``None`` ("no answer").
+    """
+    raw = _read_stdin("> ")
+    stripped = raw.strip()
+    if request.options and stripped:
+        try:
+            idx = int(stripped)
+        except ValueError:
+            pass
+        else:
+            if 1 <= idx <= len(request.options):
+                return request.options[idx - 1].label
+        lowered = stripped.lower()
+        for opt in request.options:
+            if opt.label.strip().lower() == lowered:
+                return opt.label
+    return raw
+
+
+class AgentLayer(Module):
+    def __init__(
+        self,
+        config: AgentLayerConfig,
+        prompt_builder: PromptBuilder | None = None,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.prompt_builder = prompt_builder
+        self._runner = PortalRunner()
+        self._backend: Backend | None = None
+        self._persistent_client: BackendClient | None = None
+        self._persistent_client_stack: AsyncExitStack | None = None
+        self._persistent_system_prompt: str | None = None
+        # The backend's id of the session the last turn ran in, if reported.
+        self.session_id: str | None = None
+
+    @property
+    def layer_name(self) -> str:
+        return self.config.name or self.__class__.__name__
+
+    def forward(self, content: str) -> str:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            # A loop is already running on this thread. The stateless path
+            # (``anyio.run``) would fail here with a cryptic message, and the
+            # persistent path (``PortalRunner`` on a background loop) might not
+            # fail at all — silently binding the client to the wrong loop.
+            # Raise one clear, consistent error for both modes.
+            raise RuntimeError(
+                "AgentLayer.forward() called from within a running event "
+                "loop; use `await aforward()` instead."
+            )
+        if self.config.session.mode == "persistent":
+            return self._runner.call(self._invoke_persistent, content)
+        return anyio.run(self._invoke_once, content)
+
+    async def aforward(self, content: str) -> str:
+        if self.config.session.mode == "persistent":
+            return await self._invoke_persistent(content)
+        return await self._invoke_once(content)
+
+    def reset_session(self) -> None:
+        """Drop the persistent session so the next call starts a fresh one.
+
+        The next ``forward``/``aforward`` builds a new client from the
+        same config — same system prompt, tools, and hooks, but no
+        conversation history. Lets a long-lived layer be re-scoped to
+        units of work (e.g. one session per work item) without rebuilding
+        the layer. No-op for stateless layers and before a session's
+        first turn.
+        """
+        if self._persistent_client is None:
+            return
+        if self._runner.started:
+            self._runner.call(self._drop_persistent_client)
+            return
+        anyio.run(self._drop_persistent_client)
+
+    async def areset_session(self) -> None:
+        """Async variant of :meth:`reset_session` for ``aforward`` callers."""
+        if self._persistent_client is None:
+            return
+        await self._drop_persistent_client()
+
+    def _build_request(self, content: str) -> AgentRequest:
+        if self.prompt_builder is None:
+            return build_request(content, system_prompt=self.config.system_prompt)
+
+        request = self.prompt_builder(content)
+        return AgentRequest(
+            content=request.content,
+            system_prompt=(
+                request.system_prompt
+                if request.system_prompt is not None
+                else self.config.system_prompt
+            ),
+            metadata=dict(request.metadata),
+        )
+
+    async def _ensure_backend(self) -> Backend:
+        if self._backend is None:
+            self._backend = create_backend(self.config.backend)
+            await self._backend.__aenter__()
+        return self._backend
+
+    def _resolve_tools(self) -> list[Any] | None:
+        """Return the tool list for ``backend.create_client``.
+
+        Prepends the in-process ``ask_human`` MCP tool when human-input is
+        enabled. Returns ``None`` when no tools are configured anywhere —
+        preserving the existing behavior of the underlying backends,
+        which treat ``None`` and ``[]`` slightly differently in some code
+        paths.
+        """
+        base = list(self.config.backend.tools or [])
+        if self.config.human_input_enabled:
+            base.insert(0, self._build_ask_human_tool())
+        return base or None
+
+    def _resolve_disallowed_tools(self) -> list[str] | None:
+        """Tools the agent must not call for this layer.
+
+        When HITL is enabled we ban the built-in ``AskUserQuestion`` tool.
+        It is handled inside the Claude Code CLI process, which has no UI
+        on the SDK side and silently auto-defaults to "No answers
+        selected" — so leaving it available means the agent's questions
+        never reach the human. With it disallowed, the agent reaches for
+        our ``ask_human`` MCP tool instead, whose handler reads the
+        reply from stdin.
+
+        The layer's own ban and the config's are unioned, not chosen
+        between: a caller that passes ``disallowed_tools`` to keep an
+        untrusted input away from ``Bash`` must not silently lose that
+        ban by also enabling HITL.
+        """
+        banned = list(self.config.disallowed_tools)
+        if self.config.human_input_enabled and "AskUserQuestion" not in banned:
+            banned.append("AskUserQuestion")
+        return banned or None
+
+    def _build_ask_human_tool(self):
+        """Construct the ``ask_human`` MCP tool bound to this layer.
+
+        The schema is a deliberate partial-alignment with Claude Code's
+        built-in ``AskUserQuestion``: same single-question shape with
+        ``question``, optional ``header`` (short chip), and optional
+        ``options`` of ``{label, description}``. We omit ``questions[]``
+        (multi-question), ``multiSelect``, and ``preview`` because they
+        either don't translate to stdin or would force a structured
+        reply where a single string suffices. The goal is to lean on
+        the model's training around ``AskUserQuestion`` without paying
+        the complexity tax of full alignment.
+        """
+        layer = self
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": (
+                        "The complete question to ask the human. Should "
+                        "be clear, specific, and end with a question "
+                        "mark."
+                    ),
+                },
+                "header": {
+                    "type": "string",
+                    "description": (
+                        "Optional very short label (≤12 chars) shown as a "
+                        'chip/tag next to the question. Examples: "Auth '
+                        'method", "Library", "Approach".'
+                    ),
+                },
+                "options": {
+                    "type": "array",
+                    "description": (
+                        "Optional list of mutually exclusive choices. When "
+                        "provided, the human is shown a numbered selection "
+                        "panel; their reply is the matching option "
+                        "``label`` (or free-form text if they type "
+                        "something that doesn't match — the framework "
+                        "always allows that escape hatch). Omit ``options`` "
+                        "for free-form input."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {
+                                "type": "string",
+                                "description": (
+                                    "Display text for this option. Should be concise (1-5 words)."
+                                ),
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": (
+                                    "Explanation of what this option means "
+                                    "or what will happen if chosen."
+                                ),
+                            },
+                        },
+                        "required": ["label", "description"],
+                    },
+                },
+            },
+            "required": ["question"],
+        }
+
+        @tool(
+            "ask_human",
+            (
+                "Ask the human operator a question and wait for their "
+                "reply. This is the drop-in replacement for "
+                "``AskUserQuestion`` in this app: supply a clear "
+                "``question``, optionally a short ``header`` chip, and — "
+                "when the answer is one of a small set of choices — an "
+                "``options`` list of ``{label, description}`` entries. The "
+                "reply is returned as free text (the chosen ``label``, or "
+                "whatever the human typed)."
+            ),
+            schema,
+        )
+        async def ask_human(args):
+            raw_options = args.get("options") or []
+            options = tuple(
+                HumanRequestOption(
+                    label=str(opt.get("label", "")),
+                    description=str(opt.get("description", "")),
+                )
+                for opt in raw_options
+                if isinstance(opt, dict)
+            )
+            reply = await layer._dispatch_human_request(
+                HumanRequest(
+                    layer_name=layer.layer_name,
+                    prompt=str(args.get("question", "")),
+                    options=options,
+                    header=str(args.get("header", "")),
+                )
+            )
+            text = reply if reply else "(no response from human)"
+            return {"content": [{"type": "text", "text": text}]}
+
+        return ask_human
+
+    def _client_options(self, system_prompt: str | None) -> dict[str, Any]:
+        """Resolve the same client configuration for either session mode."""
+        options = {
+            "system_prompt": system_prompt or "",
+            "model": self.config.backend.model,
+            "tools": self._resolve_tools(),
+            "hooks": self.config.backend.hooks,
+            "disallowed_tools": self._resolve_disallowed_tools(),
+            "extra_mcp_servers": self.config.backend.extra_mcp_servers,
+            "cwd": self.config.backend.cwd,
+        }
+        if self.config.session.fork_from is not None:
+            options["fork_from"] = self.config.session.fork_from
+        return options
+
+    @asynccontextmanager
+    async def _temporary_client(
+        self, system_prompt: str | None
+    ) -> AsyncIterator[tuple[Backend, BackendClient]]:
+        backend = create_backend(self.config.backend)
+        async with backend:
+            async with backend.create_client(**self._client_options(system_prompt)) as client:
+                yield backend, client
+
+    async def _ensure_persistent_client(
+        self, system_prompt: str | None
+    ) -> tuple[BackendClient, bool]:
+        """Return the persistent client and whether it was created just now.
+
+        The ``created`` flag lets the caller report the pre-input context
+        baseline only on the session's very first turn (later turns of a
+        persistent session already carry conversation history).
+        """
+        if self._persistent_client is not None and self._persistent_system_prompt != system_prompt:
+            raise ValueError("Persistent AgentLayer sessions require a stable system prompt.")
+
+        created = False
+        if self._persistent_client is None:
+            backend = await self._ensure_backend()
+            stack = AsyncExitStack()
+            await stack.__aenter__()
+            client = await stack.enter_async_context(
+                backend.create_client(**self._client_options(system_prompt))
+            )
+            self._persistent_client = client
+            self._persistent_client_stack = stack
+            self._persistent_system_prompt = system_prompt
+            created = True
+        return self._persistent_client, created
+
+    async def _drop_persistent_client(self) -> None:
+        if self._persistent_client_stack is not None:
+            await self._persistent_client_stack.aclose()
+        self._persistent_client = None
+        self._persistent_client_stack = None
+        self._persistent_system_prompt = None
+
+    async def _execute(
+        self,
+        client: BackendClient,
+        request: AgentRequest,
+        logger: Logger,
+    ) -> AgentResponse:
+        sink = logger.console
+        result_text = ""
+        usage: UsageInfo | None = None
+        policy = RequiredToolPolicy(self.config.required_tools)
+
+        def observe(kind: str, event: Any) -> None:
+            """Forward one event to the config's observer, if any.
+
+            Errors are swallowed on purpose. The observer is typically writing
+            progress somewhere a UI can poll; a full disk or a closed file there
+            must not take down the agent turn it is describing.
+            """
+            hook = self.config.on_activity
+            if hook is None:
+                return
+            try:
+                hook(kind, event)
+            except Exception:  # noqa: BLE001 - an observer cannot fail the run
+                pass
+
+        # A correction is a second SDK turn, after the original turn has
+        # completed. Keep the same client even for a stateless invocation:
+        # its history contains the work needed to finish missing calls.
+        # The policy survives this correction, but never another invocation.
+        message = request.content
+        for attempt in range(2):
+            turn_usage: UsageInfo | None = None
+            async for event in client.send_message(message):
+                if isinstance(event, ResultEvent):
+                    if event.is_error:
+                        raise RuntimeError(
+                            "; ".join(event.errors) or event.text or "Agent turn failed"
+                        )
+                    result_text = event.text
+                    turn_usage = event.usage
+                    if event.session_id is not None:
+                        self.session_id = event.session_id
+                elif isinstance(event, ToolCallEvent):
+                    policy.record(event)
+                    observe("tool", event)
+                    if self.config.print_activity:
+                        print_tool_call(self.layer_name, event, sink)
+                elif isinstance(event, ServerToolCallEvent):
+                    observe("server_tool", event)
+                    if self.config.print_activity:
+                        print_server_tool_call(self.layer_name, event, sink)
+                elif isinstance(event, ThinkingEvent):
+                    observe("thinking", event)
+                    if self.config.print_activity:
+                        print_thinking(self.layer_name, event, sink)
+                elif isinstance(event, AgentTextEvent):
+                    observe("text", event)
+                    if self.config.print_activity:
+                        print_agent_text(self.layer_name, event, sink)
+                elif isinstance(event, SessionInitEvent):
+                    observe("session", event)
+                    if self.config.print_activity:
+                        print_session_init(self.layer_name, event, sink)
+                elif isinstance(event, RateLimitWarningEvent):
+                    observe("rate_limit", event)
+                    if self.config.print_activity:
+                        print_rate_limit(self.layer_name, event, sink)
+                elif isinstance(event, CompactBoundaryEvent):
+                    observe("compact", event)
+                    if self.config.print_activity:
+                        print_compact_boundary(self.layer_name, event, sink)
+                else:
+                    raise TypeError(f"Unexpected backend event: {type(event).__name__}")
+            usage = _merge_turn_usage(usage, turn_usage)
+            if not policy.missing:
+                break
+            if attempt:
+                missing = ", ".join(policy.missing)
+                raise RequiredToolCallError(
+                    f"{self.layer_name} did not call required tools after one corrective turn: "
+                    f"{missing}"
+                )
+            message = policy.correction_message()
+
+        return AgentResponse(
+            content=result_text,
+            metadata=dict(request.metadata),
+            usage=usage,
+        )
+
+    async def _run_with_client(
+        self,
+        request: AgentRequest,
+        client: BackendClient,
+        backend: Backend,
+        report_baseline: bool = False,
+    ) -> str:
+        logger = get_logger()
+        sink = logger.console
+
+        if self.config.print_activity:
+            # Surface the context already consumed by the system prompt,
+            # tools, and memory before this turn's input is added. Only
+            # meaningful on a session's first turn, so callers gate it via
+            # ``report_baseline``. Backends without a pre-input breakdown
+            # return ``None`` and the line is omitted.
+            baseline = await client.get_context_usage() if report_baseline else None
+            print_agent_started(
+                self.layer_name,
+                self.config.backend.kind,
+                self.config.backend.model,
+                sink,
+                version=backend.version() or None,
+                reasoning_effort=backend.reasoning_effort() or None,
+                context_percentage=baseline.context_percentage if baseline else None,
+                context_tokens=baseline.context_tokens if baseline else None,
+                context_window=baseline.context_window if baseline else None,
+            )
+            print_user_prompt(self.layer_name, request.content, sink)
+
+        try:
+            response = await self._execute(client, request, logger)
+        except Exception as exc:
+            if self.config.print_activity:
+                print_agent_failed(self.layer_name, exc, sink)
+            raise
+        else:
+            if self.config.print_activity:
+                print_agent_completed(self.layer_name, sink, response.usage)
+            return response.content
+
+    async def _invoke_once(self, content: str) -> str:
+        request = self._build_request(content)
+        if request.system_prompt is None:
+            request.system_prompt = self.config.system_prompt
+
+        async with self._temporary_client(request.system_prompt) as (backend, client):
+            return await self._run_with_client(request, client, backend, report_baseline=True)
+
+    async def _invoke_persistent(self, content: str) -> str:
+        request = self._build_request(content)
+        if request.system_prompt is None:
+            request.system_prompt = self.config.system_prompt
+
+        try:
+            client, created = await self._ensure_persistent_client(request.system_prompt)
+            assert self._backend is not None
+            return await self._run_with_client(
+                request, client, self._backend, report_baseline=created
+            )
+        except Exception:
+            await self._drop_persistent_client()
+            raise
+
+    async def _dispatch_human_request(self, request: HumanRequest) -> str | None:
+        """Surface an ``ask_human`` request to the human via stdin.
+
+        Prints a panel so the user sees the agent's question and any
+        options, then reads one reply from stdin, prints another panel
+        reflecting the reply (or ``(no reply)`` when the input was
+        empty), and returns the normalized reply text — ``None`` when
+        the input was empty. The stdin read runs synchronously inside
+        the awaiting coroutine: ``ask_human`` is an exclusive
+        interaction (the agent is waiting for the human), so blocking
+        the event loop here is not a contention concern, and avoiding
+        the worker-thread hop sidesteps environments where
+        ``anyio.to_thread.run_sync`` cannot reliably spawn a thread.
+        """
+        sink = get_logger().console if self.config.print_activity else None
+
+        if self.config.print_activity:
+            print_human_input_request(self.layer_name, request, sink)
+
+        raw = _read_human_reply(request)
+        stripped = raw.strip() if isinstance(raw, str) else ""
+        normalized: str | None = stripped or None
+
+        if self.config.print_activity:
+            print_human_reply(self.layer_name, request, normalized or "", sink)
+        return normalized
+
+    async def _aclose_owned_resources(self) -> None:
+        await self._drop_persistent_client()
+        if self._backend is not None:
+            await self._backend.__aexit__(None, None, None)
+            self._backend = None
+
+    async def _aclose_self(self) -> None:
+        if self._runner.started:
+            try:
+                self._runner.call(self._aclose_owned_resources)
+            finally:
+                self._runner.close()
+            return
+        await self._aclose_owned_resources()
+
+    # ------------------------------------------------------------------
+    # Session inspection helpers
+    # ------------------------------------------------------------------
+
+    def fetch_available_skills(self) -> list[str] | None:
+        """Open a temporary client and read the skills it can invoke.
+
+        Costs a client connection and **no model call**: both backends
+        can answer from the session the client already established (see
+        ``BackendClient.list_available_skills``), so nothing here sends a
+        turn. Returns ``None`` when the backend could not say — an
+        unreachable CLI, or one that answered with nothing usable — which
+        is not the same as an empty environment.
+        """
+
+        async def run() -> list[str] | None:
+            async with self._temporary_client(self.config.system_prompt) as (_, client):
+                return await client.list_available_skills()
+
+        return anyio.run(run)
+
+    def fetch_baseline_context_usage(self) -> UsageInfo | None:
+        """Read the pre-input context usage for a fresh session.
+
+        Opens a temporary client and queries the backend's context-usage
+        breakdown *before sending any user message* — the baseline cost of
+        the system prompt, tools, and memory ("before any user input").
+        For Claude Code this is a local ``/context`` control request (no
+        model call), so it works wherever the CLI is available. Backends
+        without a pre-input breakdown return ``None``.
+
+        This inspection never sends a model turn. A backend without a
+        pre-input breakdown cannot provide a baseline by adding input.
+        """
+
+        async def run() -> UsageInfo | None:
+            async with self._temporary_client(self.config.system_prompt) as (_, client):
+                return await client.get_context_usage()
+
+        return anyio.run(run)

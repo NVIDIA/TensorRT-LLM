@@ -1,0 +1,1000 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import contextlib
+import os
+import re
+from types import SimpleNamespace
+from typing import Any, Dict
+from unittest import mock
+
+import pytest
+import torch
+import transformers
+import transformers.models.mistral3
+from _torch.helpers import create_mock_cuda_graph_runner
+from PIL import Image
+from utils.util import getSMVersion
+
+import tensorrt_llm
+from tensorrt_llm import mapping as mapping_lib
+from tensorrt_llm._torch import metadata as metadata_lib
+from tensorrt_llm._torch import model_config as model_config_lib
+from tensorrt_llm._torch.attention.backends import utils as attention_utils
+from tensorrt_llm._torch.models import modeling_mistral
+from tensorrt_llm._torch.models.modeling_mistral import (
+    MistralHFInputProcessor,
+    MistralNativeInputProcessor,
+)
+from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+from tensorrt_llm._torch.pyexecutor import resource_manager
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
+from tensorrt_llm.bindings import executor as executor_lib
+from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.models import modeling_utils
+
+_PATCH_SIZE = 14
+
+
+@pytest.fixture
+def mistral_small_3_1_24b_config():
+    return {
+        "architectures": ["Mistral3ForConditionalGeneration"],
+        "image_token_index": 10,
+        "model_type": "mistral3",
+        "multimodal_projector_bias": False,
+        "projector_hidden_act": "gelu",
+        "spatial_merge_size": 2,
+        "text_config": {
+            "attention_dropout": 0.0,
+            "head_dim": 128,
+            "hidden_act": "silu",
+            "hidden_size": 5120,
+            "initializer_range": 0.02,
+            "intermediate_size": 32768,
+            "max_position_embeddings": 131072,
+            "model_type": "mistral",
+            "num_attention_heads": 32,
+            # Reduce this from the original 40 to relieve memory needs for CI.
+            "num_hidden_layers": 4,
+            "num_key_value_heads": 8,
+            "rms_norm_eps": 1e-05,
+            "rope_theta": 1000000000.0,
+            "sliding_window": None,
+            "use_cache": True,
+            "vocab_size": 131072,
+        },
+        "torch_dtype": "bfloat16",
+        "transformers_version": "4.50.0.dev0",
+        "vision_config": {
+            "attention_dropout": 0.0,
+            "head_dim": 64,
+            "hidden_act": "silu",
+            "hidden_size": 1024,
+            "image_size": 1540,
+            "initializer_range": 0.02,
+            "intermediate_size": 4096,
+            "model_type": "pixtral",
+            "num_attention_heads": 16,
+            "num_channels": 3,
+            "num_hidden_layers": 24,
+            "patch_size": _PATCH_SIZE,
+            "rope_theta": 10000.0,
+        },
+        "vision_feature_layer": -1,
+    }
+
+
+def reduce_mistral_config(
+    mem_for_full_model: int, config_dict: Dict[str, Any], default_num_layers: int = 4
+):
+    _, total_mem = torch.cuda.mem_get_info()
+    if "text_config" in config_dict:
+        config_dict = config_dict["text_config"]
+    # scale model down if gpu memory is low
+    if total_mem < mem_for_full_model:
+        model_fraction = total_mem / mem_for_full_model
+        num_layers = int(config_dict["num_hidden_layers"] * model_fraction)
+        num_layers = min(num_layers, default_num_layers)
+        config_dict["num_hidden_layers"] = num_layers
+
+
+def init_hf_model(cls, config, dtype, device):
+    """Helper function for initializing a model from `transformers`.
+
+    The reason this function exists is: by default, instantiating a `transformers` model also
+    eagerly initializes the model's weights on the CPU, which takes an absurdly long time to
+    complete.
+
+    Instead, we lazily instantiate the model, and initialize the weights only after moving it to
+    the requested `device`.
+    """
+    # transformers 5.x removed ``no_init_weights``; weights are initialized lazily
+    # via ``model.init_weights()`` below instead.
+    model = cls(config).eval()
+
+    model.to(device=device)
+    model.init_weights()
+    model.to(dtype=dtype)
+
+    return model
+
+
+def convert_weights_names(weights: dict) -> dict:
+    # Since transformers version >= 4.52.0, the default model architecture is changed.
+    # We need to convert the weight names accordingly to match TRTLLM naming.
+    _checkpoint_conversion_mapping = {
+        "^model.language_model": "language_model.model",
+        "^model.vision_tower": "vision_tower",
+        "^model.multi_modal_projector": "multi_modal_projector",
+        "^lm_head": "language_model.lm_head",
+    }
+    converted_weights = {}
+    for weight_name, weight_value in weights.items():
+        new_name = weight_name
+        for pattern, replacement in _checkpoint_conversion_mapping.items():
+            new_name = re.sub(pattern, replacement, new_name)
+        converted_weights[new_name] = weight_value
+    return converted_weights
+
+
+@pytest.fixture(autouse=True)
+def empty_cuda_cache():
+    torch.cuda.empty_cache()
+
+
+@contextlib.contextmanager
+def kv_cache_manager_context(kv_cache_manager):
+    try:
+        yield
+    finally:
+        kv_cache_manager.shutdown()
+
+
+def test_mistral_3_vlm_rejects_disagg(mistral_small_3_1_24b_config):
+    with (
+        mock.patch.dict(os.environ, {"TLLM_MULTIMODAL_DISAGGREGATED": "1"}),
+        pytest.raises(NotImplementedError, match="disaggregated inference"),
+    ):
+        modeling_mistral.Mistral3VLM(
+            model_config=model_config_lib.ModelConfig(
+                pretrained_config=transformers.Mistral3Config.from_dict(
+                    mistral_small_3_1_24b_config
+                )
+            ),
+        )
+
+
+def test_mistral_3_vlm_constructs_under_meta_init(mistral_small_3_1_24b_config):
+    config_dict = mistral_small_3_1_24b_config
+    config_dict["text_config"]["num_hidden_layers"] = 1
+    config_dict["vision_config"]["num_hidden_layers"] = 1
+
+    mistral_3_config = transformers.Mistral3Config.from_dict(config_dict)
+    model_config = model_config_lib.ModelConfig(pretrained_config=mistral_3_config)
+
+    with MetaInitMode():
+        model = modeling_mistral.Mistral3VLM(model_config)
+
+    assert "_image_token_ids" in dict(model.named_buffers())
+    assert "_image_token_ids" not in model.state_dict()
+    assert model._vision_tower is not None
+    assert model._multi_modal_projector is not None
+
+
+def test_mistral_3_vlm_disable_mm_encoder_skips_vision_modules(mistral_small_3_1_24b_config):
+    config_dict = mistral_small_3_1_24b_config
+    config_dict["text_config"]["num_hidden_layers"] = 1
+    config_dict["vision_config"]["num_hidden_layers"] = 1
+    model_config = model_config_lib.ModelConfig(
+        pretrained_config=transformers.Mistral3Config.from_dict(config_dict),
+        disable_mm_encoder=True,
+    )
+
+    with MetaInitMode():
+        model = modeling_mistral.Mistral3VLM(model_config)
+
+    assert model._vision_tower is None
+    assert model._multi_modal_projector is None
+    assert not any(
+        name.startswith(("_vision_tower", "_multi_modal_projector"))
+        for name, _ in model.named_parameters()
+    )
+
+    with mock.patch.object(model.llm, "load_weights") as load_llm_weights:
+        model.load_weights({})
+    load_llm_weights.assert_called_once()
+
+    multimodal_params = MultimodalParams(
+        multimodal_data={
+            "image": {
+                "pixel_values": torch.empty(1, 3, _PATCH_SIZE, _PATCH_SIZE),
+                "image_sizes": [[_PATCH_SIZE, _PATCH_SIZE]],
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="require a local multimodal encoder"):
+        model.encode_multimodal_inputs([multimodal_params])
+
+
+@pytest.mark.parametrize("quant_algo", [None, "FP8"])
+def test_mistral_3_vlm_sanity(mistral_small_3_1_24b_config, quant_algo):
+    if quant_algo == "FP8" and getSMVersion() < 89:
+        pytest.skip("This test is not supported in pre-Ada architecture")
+
+    config_dict = mistral_small_3_1_24b_config
+    # 24B * sizeof(float16) plus some extra for activations
+    mem_for_full_model = int(2.1 * 24 * 2 ** (30))
+    reduce_mistral_config(mem_for_full_model, config_dict)
+
+    if config_dict["text_config"]["num_hidden_layers"] <= 0:
+        pytest.skip("Insufficient memory for a single Mistral layer")
+
+    mistral_3_config = transformers.Mistral3Config.from_dict(config_dict)
+    if quant_algo:
+        quant_config = modeling_utils.QuantConfig(quant_algo=quant_algo)
+    else:
+        quant_config = None
+
+    dtype = mistral_3_config.torch_dtype
+    device = torch.device("cuda")
+
+    model_config = model_config_lib.ModelConfig(
+        pretrained_config=mistral_3_config,
+        quant_config=quant_config,
+    )
+    mistral = modeling_mistral.Mistral3VLM(model_config).to(device)
+
+    input_ids = torch.tensor(
+        [100, 200, 300, 100, 200, 100, 400, 500], dtype=torch.int, device=device
+    )
+
+    context_sequence_lengths = [3, 2, 1]
+    sequence_lengths = context_sequence_lengths + [1, 1]
+    past_seen_tokens = [0, 0, 0, 62, 75]
+    request_ids = list(range(len(sequence_lengths)))
+    token_nums = (torch.tensor(past_seen_tokens) + torch.tensor(sequence_lengths)).tolist()
+    prompt_lens = token_nums[:3] + past_seen_tokens[3:]
+
+    num_blocks = 100
+    tokens_per_block = 128
+    head_dim = mistral.config.head_dim
+    num_layers = mistral.config.num_hidden_layers
+    num_kv_heads = mistral.config.num_key_value_heads
+    max_seq_len = num_blocks * tokens_per_block
+    batch_size = len(context_sequence_lengths) + 2
+
+    if dtype == torch.half:
+        kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
+    elif dtype == torch.bfloat16:
+        kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
+    else:
+        raise ValueError("Invalid dtype")
+
+    mapping = mapping_lib.Mapping(world_size=1, tp_size=1, rank=0)
+    kv_cache_config = executor_lib.KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
+    kv_cache_manager = resource_manager.KVCacheManager(
+        kv_cache_config,
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max_seq_len,
+        max_batch_size=batch_size,
+        mapping=mapping,
+        dtype=kv_cache_dtype,
+    )
+    with kv_cache_manager_context(kv_cache_manager):
+        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+
+        metadata_cls = attention_utils.get_attention_backend(model_config.attn_backend).Metadata
+        attn_metadata = metadata_cls(
+            seq_lens=torch.tensor(sequence_lengths, dtype=torch.int),
+            num_contexts=len(context_sequence_lengths),
+            kv_cache_params=metadata_lib.KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=past_seen_tokens,
+            ),
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=prompt_lens,
+            max_num_requests=len(context_sequence_lengths) + 2,
+            max_num_tokens=8192,
+        )
+
+        position_ids = []
+        for i, tokens in enumerate(past_seen_tokens):
+            seq_len = context_sequence_lengths[i] if i < len(context_sequence_lengths) else 1
+            position_id = torch.arange(tokens, tokens + seq_len, device=input_ids.device)
+            position_ids.append(position_id)
+
+        position_ids = torch.cat(position_ids).unsqueeze(0)
+
+        with torch.inference_mode():
+            attn_metadata.prepare()
+            logits = mistral.forward(
+                input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
+            )
+
+        assert len(past_seen_tokens) == logits.shape[0]
+
+        with torch.inference_mode():
+            attn_metadata.prepare()
+            logits = mistral.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attn_metadata=attn_metadata,
+                return_context_logits=True,
+            )
+        assert input_ids.shape == logits.shape[:-1]
+
+
+@pytest.mark.parametrize(
+    "backend, use_cuda_graph",
+    [
+        ("VANILLA", False),
+        ("FLASHINFER", False),
+        ("FLASHINFER", True),
+        ("TRTLLM", False),
+        ("TRTLLM", True),
+    ],
+)
+@torch.no_grad()
+def test_mistral_3_vlm_allclose_to_hf(mistral_small_3_1_24b_config, backend, use_cuda_graph):
+    metadata_cls = attention_utils.get_attention_backend(backend).Metadata
+
+    torch.random.manual_seed(0)
+    config_dict = mistral_small_3_1_24b_config
+    # 24B * sizeof(float16) plus some extra for activations
+    # times 2, since we'll need 2 of these
+    mem_for_full_model = int(2.1 * 24 * 2 ** (30) * 2)
+    reduce_mistral_config(mem_for_full_model, config_dict)
+    if config_dict["text_config"]["num_hidden_layers"] <= 0:
+        pytest.skip("Insufficient memory for a single Mistral layer")
+    mistral_config = transformers.Mistral3Config.from_dict(config_dict)
+    dtype = mistral_config.torch_dtype
+    device = torch.device("cuda")
+
+    hf_mistral = init_hf_model(
+        cls=transformers.Mistral3ForConditionalGeneration,
+        config=mistral_config,
+        dtype=dtype,
+        device=device,
+    )
+
+    model_config = model_config_lib.ModelConfig(
+        pretrained_config=mistral_config,
+        attn_backend=backend,
+    )
+    mistral = modeling_mistral.Mistral3VLM(model_config).to(dtype).to(device)
+    mistral.load_weights(convert_weights_names(hf_mistral.state_dict()))
+
+    num_blocks = 1
+    tokens_per_block = 128
+    head_dim = mistral.config.head_dim
+    num_layers = mistral.config.num_hidden_layers
+    num_kv_heads = mistral.config.num_key_value_heads
+    max_seq_len = num_blocks * tokens_per_block
+    batch_size = 1
+
+    if dtype == torch.half:
+        kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
+    elif dtype == torch.bfloat16:
+        kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
+    else:
+        raise ValueError("Invalid dtype")
+
+    mapping = mapping_lib.Mapping(world_size=1, tp_size=1, rank=0)
+    kv_cache_config = executor_lib.KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
+    kv_cache_manager = resource_manager.KVCacheManager(
+        kv_cache_config,
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max_seq_len,
+        max_batch_size=batch_size,
+        mapping=mapping,
+        dtype=kv_cache_dtype,
+    )
+
+    with kv_cache_manager_context(kv_cache_manager):
+        # context
+        input_ids = torch.tensor(
+            [100, 200, 300, 100, 200, 100, 400, 500], dtype=torch.int, device=device
+        )
+
+        num_cached_tokens_per_seq = [0]
+        request_ids = [1]
+        token_nums = [input_ids.size(-1)]
+        prompt_lens = [input_ids.size(-1)]
+        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+
+        attn_metadata = metadata_cls(
+            seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
+            num_contexts=1,
+            kv_cache_params=metadata_lib.KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+            ),
+            max_num_requests=1,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=prompt_lens,
+        )
+
+        # Note: no CUDA graphs for prefill, the graph runner is built for
+        # decoding only.
+        position_ids = [torch.arange(0, input_ids.size(-1))]
+        position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
+        with torch.inference_mode():
+            attn_metadata.prepare()
+            logits = mistral.forward(
+                input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
+            )
+            ref = hf_mistral.forward(
+                input_ids=input_ids.unsqueeze(0), position_ids=position_ids, use_cache=True
+            )
+
+        torch.testing.assert_close(logits, ref.logits[:, -1].float(), atol=0.4, rtol=0.4)
+
+        # gen
+        gen_input_ids = torch.tensor([600], dtype=torch.int, device=device)
+
+        num_cached_tokens_per_seq = [input_ids.size(-1)]
+
+        attn_metadata = metadata_cls(
+            seq_lens=torch.tensor([gen_input_ids.size(-1)], dtype=torch.int),
+            num_contexts=0,
+            kv_cache_params=metadata_lib.KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+            ),
+            max_num_requests=1,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=prompt_lens,
+        )
+
+        gen_position_ids = [
+            torch.arange(input_ids.size(-1), input_ids.size(-1) + gen_input_ids.size(-1))
+        ]
+        gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
+
+        graph_runner = create_mock_cuda_graph_runner(1) if use_cuda_graph else None
+
+        def run_forward(input_ids, position_ids, attn_metadata):
+            attn_metadata.prepare()
+            if not use_cuda_graph:
+                return mistral.forward(
+                    input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
+                )
+            else:
+                inputs = {
+                    "input_ids": input_ids,
+                    "position_ids": position_ids,
+                    "attn_metadata": attn_metadata,
+                }
+                key = KeyType(batch_size=1, draft_len=0)
+                graph_runner.capture(key, lambda inputs: mistral.forward(**inputs), inputs)
+
+                for _ in range(2):
+                    # Run it twice. This helps us catch problems if buffers are accidentally reallocated
+                    # in prepare().
+                    attn_metadata.prepare()
+                    logits = graph_runner.replay(key, inputs)
+                return logits
+
+        if use_cuda_graph:
+            attn_metadata = attn_metadata.create_cuda_graph_metadata(1)
+
+        with torch.inference_mode():
+            logits = run_forward(
+                input_ids=gen_input_ids, position_ids=gen_position_ids, attn_metadata=attn_metadata
+            )
+            ref = hf_mistral.forward(
+                input_ids=gen_input_ids.unsqueeze(0),
+                position_ids=gen_position_ids,
+                past_key_values=ref.past_key_values,
+                use_cache=True,
+            )
+
+        torch.testing.assert_close(logits, ref.logits[:, -1].float(), atol=0.4, rtol=0.4)
+        if graph_runner is not None:
+            graph_runner.clear()
+
+
+@pytest.mark.parametrize(
+    "in_shapes, image_sizes, expected_out_shape",
+    [
+        (
+            [(2, 3, 100, 150), (1, 3, 200, 100), (3, 3, 120, 180)],
+            [
+                [[92, 150], [100, 73]],
+                [[200, 100]],
+                [[37, 130], [120, 83], [73, 180]],
+            ],
+            [6, 3, 200, 180],
+        ),
+        # Single batch, single image.
+        (
+            [(1, 3, 64, 128)],
+            [[[64, 128]]],
+            [1, 3, 64, 128],
+        ),
+        # Same max size across batches.
+        (
+            [(2, 3, 59, 59), (1, 3, 59, 59), (5, 3, 59, 59)],
+            [
+                [[13, 59], [59, 17]],
+                [[59, 59]],
+                [[19, 29], [59, 31], [17, 54], [13, 59], [11, 37]],
+            ],
+            [8, 3, 59, 59],
+        ),
+    ],
+)
+def test_batch_pixel_values(in_shapes, image_sizes, expected_out_shape):
+    # Test case 1: Basic functionality with different sized images
+    pixel_values = [torch.randn(*shape) for shape in in_shapes]
+    image_sizes = [torch.tensor(size) for size in image_sizes]
+
+    batched_pixels, batched_sizes = modeling_mistral.Mistral3VLM.batch_pixel_values(
+        pixel_values, image_sizes
+    )
+
+    # Check output shapes
+    assert list(batched_pixels.shape) == expected_out_shape
+    assert list(batched_sizes.shape) == [expected_out_shape[0], 2]
+
+    # Check that the original image data is preserved (with padding).
+    start_idx = 0
+    for original_values in pixel_values:
+        batch_size = original_values.shape[0]
+        end_idx = start_idx + batch_size
+        orig_h, orig_w = original_values.shape[-2:]
+        padded_values = batched_pixels[start_idx:end_idx, :, :orig_h, :orig_w]
+        torch.testing.assert_close(padded_values, original_values)
+
+        start_idx += batch_size
+
+
+@pytest.mark.parametrize("height, width", [(37, 91), (128, 256), (512, 512)])
+@torch.no_grad()
+def test_processor_get_num_tokens_per_image(
+    tmp_path,
+    mistral_small_3_1_24b_config,
+    height,
+    width,
+):
+    # NOTES:
+    # 1. Setting up a fake model checkpoint that `AutoTokenizer.from_pretrained` /
+    #    `AutoProcessor.from_pretrained` is too involved (need at least several config JSONs, as well
+    #    as tokenizer files like vocab files, etc.).
+    # 2. On the other hand, using an actual model checkpoint for what should be a simple unit test
+    #    feels overkill.
+    # We therefore settle for this intermediate approach where we check that the expected calls are
+    # are made by mocking the auto classes out.
+
+    mistral_3_config = transformers.Mistral3Config.from_dict(mistral_small_3_1_24b_config)
+
+    with mock.patch(
+        "tensorrt_llm._torch.models.modeling_mistral.AutoProcessor"
+    ) as mocked_auto_processor:
+        input_processor = modeling_mistral.MistralHFInputProcessor(
+            model_path=str(tmp_path),
+            config=mistral_3_config,
+            tokenizer=mock.MagicMock(),
+        )
+
+    input_processor.get_num_tokens_per_image(
+        image=Image.new("RGB", (width, height), color=(255, 128, 0))
+    )
+
+    mocked_auto_processor.from_pretrained.return_value._get_num_multimodal_tokens.assert_called_once_with(
+        [(height, width)]
+    )
+
+
+def test_mistral_attention_swa_wiring():
+    """Verify MistralAttention.forward passes sliding_window to Attention.forward."""
+    config = transformers.MistralConfig(
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        sliding_window=4096,
+    )
+    mc = model_config_lib.ModelConfig(
+        pretrained_config=config,
+        mapping=mapping_lib.Mapping(world_size=1, tp_size=1, rank=0),
+    )
+    attn = modeling_mistral.MistralAttention(mc, layer_idx=0)
+
+    with mock.patch(
+        "tensorrt_llm._torch.models.modeling_mistral.Attention.forward"
+    ) as mocked_forward:
+        attn.forward(position_ids=None, hidden_states=None, attn_metadata=None)
+
+    mocked_forward.assert_called_once()
+    _, call_kwargs = mocked_forward.call_args
+    assert call_kwargs["attention_window_size"] == config.sliding_window
+
+
+def test_mistral_attention_swa_none_when_unset():
+    """Verify MistralAttention.forward passes None when sliding_window is unset."""
+    config = transformers.MistralConfig(
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        sliding_window=None,
+    )
+    mc = model_config_lib.ModelConfig(
+        pretrained_config=config,
+        mapping=mapping_lib.Mapping(world_size=1, tp_size=1, rank=0),
+    )
+    attn = modeling_mistral.MistralAttention(mc, layer_idx=0)
+
+    with mock.patch(
+        "tensorrt_llm._torch.models.modeling_mistral.Attention.forward"
+    ) as mocked_forward:
+        attn.forward(position_ids=None, hidden_states=None, attn_metadata=None)
+
+    mocked_forward.assert_called_once()
+    _, call_kwargs = mocked_forward.call_args
+    assert call_kwargs["attention_window_size"] is None
+
+
+def test_mistral_attention_swa_layer_types():
+    """Ministral-style layer_types: sliding layers get SWA, full layers get None."""
+    config = transformers.MistralConfig(
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        sliding_window=32768,
+    )
+    # Ministral pattern: alternating sliding/full attention
+    config.layer_types = [
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+    ]
+
+    mc = model_config_lib.ModelConfig(
+        pretrained_config=config,
+        mapping=mapping_lib.Mapping(world_size=1, tp_size=1, rank=0),
+    )
+
+    # Layer 0: sliding_attention → should use SWA
+    attn_sliding = modeling_mistral.MistralAttention(mc, layer_idx=0)
+    assert attn_sliding.attention_window_size == 32768
+
+    # Layer 1: full_attention → should be None
+    attn_full = modeling_mistral.MistralAttention(mc, layer_idx=1)
+    assert attn_full.attention_window_size is None
+
+
+# ---------------------------------------------------------------------------
+# Deterministic dummy-input sizing (Mistral3 / Pixtral input processor).
+#
+# CPU-only unit tests for the encoder-profiling dummy contract: reach into
+# MistralHFInputProcessor directly (no model load) and stub the geometry the
+# dummy math reads. The ViT token unit is the pre-merge patch count
+# ``(h//patch)*(w//patch)`` -- deliberately *not* the hashing path's LLM-side
+# Pixtral count with framing tokens.
+# ---------------------------------------------------------------------------
+def _make_dummy_processor(
+    *,
+    patch_size: int = 14,
+    spatial_merge_size: int = 2,
+    image_size: int = 1540,
+    num_channels: int = 3,
+    processor_cls: type[MistralHFInputProcessor]
+    | type[MistralNativeInputProcessor] = MistralHFInputProcessor,
+    geometry_from_processor: bool = False,
+) -> MistralHFInputProcessor | MistralNativeInputProcessor:
+    """Construct a processor stub with just the geometry the dummy math reads.
+
+    Bypasses the real ``__init__`` (tokenizer/processor loading). By default the
+    empty ``_processor`` forces ``_vision_geometry`` to fall back to
+    ``vision_config`` (the HF ``mistral3`` path); ``geometry_from_processor``
+    instead exposes ``patch_size``/``image_size`` on the processor -- the
+    mistral-common source (``mm_config.image_patch_size`` / ``max_image_size``)
+    -- and blanks them on ``vision_config`` so a regression that ignores the
+    processor is caught. ``processor_cls`` selects the frontend; both share the
+    same encoder contract.
+    """
+    instance = processor_cls.__new__(processor_cls)
+    instance._config = SimpleNamespace(
+        vision_config=SimpleNamespace(
+            patch_size=None if geometry_from_processor else patch_size,
+            image_size=None if geometry_from_processor else image_size,
+            num_channels=num_channels,
+        ),
+        spatial_merge_size=spatial_merge_size,
+    )
+    instance._processor = (
+        SimpleNamespace(patch_size=patch_size, image_size=image_size)
+        if geometry_from_processor
+        else SimpleNamespace()
+    )
+    instance._dtype = torch.float16
+    return instance
+
+
+def _make_text_only_native_processor() -> MistralNativeInputProcessor:
+    """A mistral-native processor for a checkpoint with no vision encoder.
+
+    ``MistralNativeInputProcessor`` serves every ``checkpoint_format="mistral"``
+    checkpoint, so `adapt_config_dict` leaves `vision_config` unset for the
+    text-only / MoE / mamba / audio shapes. Deliberately stubs *nothing* beyond
+    that config: the encoder geometry must not be reached at all, so dropping
+    the guard surfaces as an `AttributeError` rather than a soft assertion.
+    """
+    instance = MistralNativeInputProcessor.__new__(MistralNativeInputProcessor)
+    instance._config = SimpleNamespace()
+    return instance
+
+
+def test_dummy_mm_max_tokens_per_item_is_image_only():
+    proc = _make_dummy_processor(patch_size=14, image_size=1540)
+    demand = proc.get_mm_max_tokens_per_item()
+    assert set(demand) == {"image"}
+    # max square = 1540 (a multiple of patch*merge=28); patches = (1540/14)^2.
+    assert demand["image"] == (1540 // 14) ** 2 == 110**2
+
+
+def test_attention_metadata_capacity_uses_token_budget():
+    proc = _make_dummy_processor(spatial_merge_size=2)
+
+    assert proc.get_mm_encoder_attention_metadata_capacity(max_num_tokens=100) == {"attention": 25}
+    assert proc.get_mm_encoder_attention_metadata_capacity(max_num_tokens=12) == {"attention": 3}
+
+
+def test_mistral_item_metadata_separates_patch_and_embedding_units():
+    processor = _make_dummy_processor()
+
+    metadata = processor.get_mm_item_metadata([], {"image": {"image_sizes": [[28, 56], [56, 56]]}})
+
+    assert metadata.item_refs == (("image", 0), ("image", 1))
+    assert metadata.encoder_token_lengths == (8, 16)
+    assert metadata.output_embedding_lengths == (2, 4)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sizes, encoder_lengths, embedding_lengths",
+    [
+        ([[28, 56]], [8], [2]),
+        ([[28, 56], [28, 56]], [8, 8], [2, 2]),
+        ([[28, 56], [56, 84]], [8, 24], [2, 6]),
+    ],
+)
+def test_native_processed_images_preserve_item_sizes(
+    sizes: list[list[int]], encoder_lengths: list[int], embedding_lengths: list[int]
+) -> None:
+    """Keep unpadded per-image geometry through native processing and scheduling."""
+    proc = _make_dummy_processor(processor_cls=MistralNativeInputProcessor)
+    pixels = [
+        torch.full((3, height, width), float(i + 1)) for i, (height, width) in enumerate(sizes)
+    ]
+    encoded = transformers.BatchEncoding(
+        {
+            "input_ids": [1, 2, 3],
+            "attention_mask": [1, 1, 1],
+            "pixel_values": [pixel.numpy() for pixel in pixels],
+            "image_sizes": sizes,
+        }
+    )
+    tokenizer = SimpleNamespace(
+        transformers_tokenizer=mock.Mock(),
+        instruct=SimpleNamespace(
+            mm_encoder=mock.Mock(
+                spec=modeling_mistral.ImageEncoder,
+                mm_config=SimpleNamespace(image_patch_size=14, max_image_size=1540),
+            )
+        ),
+    )
+
+    def apply_chat_template(
+        *args: Any, return_tensors: str | None, **kwargs: Any
+    ) -> transformers.BatchEncoding:
+        assert return_tensors is None
+        return encoded
+
+    tokenizer.transformers_tokenizer.apply_chat_template.side_effect = apply_chat_template
+    proc._processor = modeling_mistral.MistralCommonImageProcessor(tokenizer, proc.dtype)
+    input_ids, extra = proc.call_with_text_prompt(
+        {
+            "prompt": "Describe these images.",
+            "multi_modal_data": {"image": [Image.new("RGB", (w, h)) for h, w in sizes]},
+        },
+        tensorrt_llm.SamplingParams(),
+    )
+
+    assert input_ids == [1, 2, 3]
+    image = extra["multimodal_data"]["image"]
+    assert image["image_sizes"] == sizes
+    assert image["pixel_values"].shape == (
+        len(sizes),
+        3,
+        max(h for h, _ in sizes),
+        max(w for _, w in sizes),
+    )
+    for i, ((height, width), pixel) in enumerate(zip(sizes, pixels)):
+        torch.testing.assert_close(
+            image["pixel_values"][i, :, :height, :width], pixel.to(proc.dtype)
+        )
+        assert torch.count_nonzero(image["pixel_values"][i, :, height:]) == 0
+        assert torch.count_nonzero(image["pixel_values"][i, :, :, width:]) == 0
+    metadata = proc.get_mm_item_metadata(input_ids, extra["multimodal_data"])
+    metadata.validate()
+    assert metadata.item_refs == tuple(("image", i) for i in range(len(sizes)))
+    assert metadata.encoder_token_lengths == tuple(encoder_lengths)
+    assert metadata.output_embedding_lengths == tuple(embedding_lengths)
+
+
+@pytest.mark.parametrize("budget", [1024, 4096, 8192])
+def test_dummy_get_size_for_max_tokens_fits_and_aligns(budget):
+    proc = _make_dummy_processor()
+    size = proc.get_size_for_max_tokens(max_tokens=budget)
+    unit = 14 * 2  # patch * spatial_merge_size
+    assert size["width"] == size["height"]
+    assert size["width"] % unit == 0
+    patches = (size["width"] // 14) * (size["height"] // 14)
+    assert patches <= budget
+    # Adding one more aligned step would exceed the budget (saturated).
+    nxt = size["width"] + unit
+    assert (nxt // 14) ** 2 > budget or nxt > 1540
+
+
+def test_dummy_get_size_rejects_non_positive_budget():
+    proc = _make_dummy_processor()
+    with pytest.raises(ValueError, match=r"max_tokens must be positive"):
+        proc.get_size_for_max_tokens(max_tokens=0)
+
+
+def test_dummy_get_dummy_mm_data_rejects_negative_item_count():
+    proc = _make_dummy_processor()
+    with pytest.raises(ValueError, match=r"item counts must be nonnegative"):
+        proc.get_dummy_mm_data(max_num_encoder_tokens=1024, mm_counts={"image": -1})
+
+
+@pytest.mark.parametrize("budget", [4096, 8192])
+def test_dummy_get_dummy_mm_data_saturates_budget(budget):
+    proc = _make_dummy_processor()
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=budget,
+        mm_counts={"image": 1},
+        dtype=torch.float16,
+    )["image"]
+    pixel_values = image["pixel_values"]
+    num_images, channels, height, width = pixel_values.shape
+    assert num_images == 1
+    assert channels == 3
+    assert image["image_sizes"] == [[height, width]]
+    per_image = (height // 14) * (width // 14)
+    assert per_image <= budget
+    assert 2 * per_image > budget
+
+
+def test_dummy_get_dummy_mm_data_respects_requested_item_count():
+    proc = _make_dummy_processor(image_size=448)
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=8192,
+        mm_counts={"image": 3},
+        dtype=torch.float16,
+    )["image"]
+
+    assert image["pixel_values"].shape[0] == 3
+
+
+def test_dummy_mm_data_satisfies_the_encoder_input_contract():
+    """KV-cache profiling feeds `get_dummy_mm_data()` straight to the encoder.
+
+    Nothing rebuilds these tensors through the input processor any more, so the
+    processor now restates the encoder's input layout on its own. A drift
+    between the two would surface only as a crash during startup memory
+    estimation. Drive the encoder's real batching step instead of restating its
+    expectations here, so a change on either side fails this test.
+    """
+    proc = _make_dummy_processor()
+    budget = 8192
+    tokens_per_image = proc.get_mm_max_tokens_per_item(max_num_encoder_tokens=budget)["image"]
+    num_images = min(8, budget // tokens_per_image)
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=budget,
+        mm_counts={"image": num_images},
+        dtype=torch.float16,
+    )["image"]
+
+    # `_vision_forward` collects one entry per request and converts the sizes to
+    # tensors before batching; mirror that, then run the real batching step.
+    batched_pixel_values, batched_sizes = modeling_mistral.Mistral3VLM.batch_pixel_values(
+        pixel_values=[image["pixel_values"]],
+        image_sizes=[torch.tensor(image["image_sizes"])],
+    )
+
+    num_images = image["pixel_values"].shape[0]
+    assert batched_pixel_values.shape[0] == num_images
+    assert batched_sizes.shape == (num_images, 2)
+    assert batched_pixel_values.dtype == torch.float16
+
+
+# ---------------------------------------------------------------------------
+# MM encoder item scheduling is enabled from the *model* class
+# (`Mistral3VLM.supports_mm_encoder_item_scheduling`), but the contract it
+# implies is required of the *input processor*, and `create_input_processor`
+# picks the processor from `checkpoint_format` alone. Both Mistral frontends
+# therefore have to satisfy the contract.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "processor_cls, geometry_from_processor",
+    [(MistralHFInputProcessor, False), (MistralNativeInputProcessor, True)],
+    ids=["hf-config", "native-processor"],
+)
+@pytest.mark.cpu_only
+def test_both_mistral_processors_satisfy_item_scheduling_contract(
+    processor_cls: type[MistralHFInputProcessor] | type[MistralNativeInputProcessor],
+    geometry_from_processor: bool,
+) -> None:
+    """Check encoder budgets, request metadata, and dummy inputs for both frontends."""
+    proc = _make_dummy_processor(
+        processor_cls=processor_cls, geometry_from_processor=geometry_from_processor
+    )
+    budget = 8192
+
+    # Exercise the sequence `ModelEngine.__init__` runs for item scheduling.
+    max_tokens_per_item = proc.get_mm_max_tokens_per_item()
+    assert max_tokens_per_item == {"image": 12100}
+
+    capacity = proc.get_mm_encoder_attention_metadata_capacity(budget)
+    assert capacity == {"attention": 2048}
+
+    max_output_embeddings = proc.get_max_mm_encoder_output_embeddings(budget)
+    assert max_output_embeddings == 2048
+
+    # ...and the request-routing hook, which gates the item-scheduled path.
+    metadata = proc.get_mm_item_metadata([], {"image": {"image_sizes": [[28, 56]]}})
+    assert metadata is not None
+    metadata.validate()
+    assert metadata.item_refs == (("image", 0),)
+    assert metadata.encoder_token_lengths == (8,)
+    assert metadata.output_embedding_lengths == (2,)
+
+    dummy = proc.get_dummy_mm_data(max_num_encoder_tokens=16, mm_counts={"image": 1})
+    assert dummy["image"]["pixel_values"].shape == (1, 3, 56, 56)
+    assert dummy["image"]["pixel_values"].dtype == proc.dtype
+    assert dummy["image"]["image_sizes"] == [[56, 56]]
+    dummy_metadata = proc.get_mm_item_metadata([], dummy)
+    assert dummy_metadata is not None
+    dummy_metadata.validate()
+    assert dummy_metadata.item_refs == (("image", 0),)
+    assert dummy_metadata.encoder_token_lengths == (16,)
+    assert dummy_metadata.output_embedding_lengths == (4,)
+
+
+# The native processor is shared by every `checkpoint_format="mistral"`
+# checkpoint, including the text-only / MoE / mamba / audio shapes that carry no
+# `vision_config` at all. Those must keep the base class's neutral behaviour
+# rather than raising `AttributeError` out of the encoder geometry -- the engine
+# calls `get_mm_max_tokens_per_item` unconditionally.
+@pytest.mark.cpu_only
+def test_text_only_native_checkpoint_reports_no_encoder_geometry() -> None:
+    proc = _make_text_only_native_processor()
+
+    assert proc.get_mm_max_tokens_per_item() == {}
+    assert proc.get_max_mm_encoder_output_embeddings(8192) is None
+    assert proc.get_mm_encoder_attention_metadata_capacity(8192) is None
+    # A text-only request carries no image payload, which the routing hook
+    # already treats as "not item-scheduled".
+    assert proc.get_mm_item_metadata([], {}) is None
+    assert proc.get_mm_item_metadata([], {"image": {"image_sizes": [[28, 56]]}}) is None
+
+    # The memory profiler treats `NotImplementedError` as "skip MM profiling".
+    with pytest.raises(NotImplementedError):
+        proc.get_dummy_mm_data(max_num_encoder_tokens=8192, mm_counts={"image": 1})

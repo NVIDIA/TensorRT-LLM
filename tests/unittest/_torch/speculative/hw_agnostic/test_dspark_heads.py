@@ -1,0 +1,186 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Unit tests for the DSpark draft-network heads (hardware-agnostic, CPU)."""
+
+import pytest
+import torch
+
+from tensorrt_llm._torch.models.modeling_speculative import (
+    DSparkConfidenceHead,
+    RNNHead,
+    VanillaMarkov,
+    build_markov_head,
+    dspark_markov_step_bias,
+    markov_prev_embeddings,
+)
+
+VOCAB, RANK, HID, B, BLK = 257, 16, 32, 3, 5
+
+
+@pytest.mark.parametrize("head_type", ["vanilla", "gated", "rnn"])
+def test_markov_block_sampling_shapes_and_determinism(head_type):
+    torch.manual_seed(0)
+    head = build_markov_head(
+        markov_head_type=head_type, vocab_size=VOCAB, markov_rank=RANK, hidden_size=HID
+    ).eval()
+    base = torch.randn(B, BLK, VOCAB)
+    first = torch.randint(0, VOCAB, (B,))
+    hid = torch.randn(B, BLK, HID)
+    with torch.no_grad():
+        tok, logits = head.sample_block_tokens(
+            base, first_prev_token_ids=first, hidden_states=hid, temperature=0.0
+        )
+        tok2, _ = head.sample_block_tokens(
+            base, first_prev_token_ids=first, hidden_states=hid, temperature=0.0
+        )
+    assert tok.shape == (B, BLK)
+    assert logits.shape == (B, BLK, VOCAB)
+    # Greedy is deterministic.
+    assert torch.equal(tok, tok2)
+    # Each sampled token is the argmax of its (bias-corrected) step logits.
+    assert torch.equal(tok, logits.argmax(dim=-1))
+
+
+def test_markov_bias_is_additive_low_rank():
+    # bias = W2(W1[token]); the corrected first-step logits == base + bias.
+    torch.manual_seed(1)
+    head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK).eval()
+    base = torch.randn(B, BLK, VOCAB)
+    first = torch.randint(0, VOCAB, (B,))
+    with torch.no_grad():
+        _, corrected = head.sample_block_tokens(
+            base, first_prev_token_ids=first, hidden_states=None, temperature=0.0
+        )
+        expected0 = base[:, 0] + head.markov_w2(head.markov_w1(first))
+    assert torch.allclose(corrected[:, 0], expected0, atol=1e-5)
+
+
+def test_rnn_state_carries_across_positions():
+    torch.manual_seed(2)
+    head = RNNHead(vocab_size=VOCAB, markov_rank=RANK, hidden_size=HID).eval()
+    initial_state = torch.zeros(1, RANK)
+    prev_embedding = head.get_prev_embeddings(torch.zeros(1, dtype=torch.long))
+    prefix_hidden = torch.randn(1, HID)
+    current_hidden = torch.randn(1, HID)
+
+    with torch.no_grad():
+        state_a, _ = head._rnn_step(initial_state, prev_embedding, prefix_hidden)
+        state_b, _ = head._rnn_step(initial_state, prev_embedding, -prefix_hidden)
+        _, bias_a = head._rnn_step(state_a, prev_embedding, current_hidden)
+        _, bias_b = head._rnn_step(state_b, prev_embedding, current_hidden)
+
+    assert not torch.allclose(state_a, state_b)
+    assert not torch.allclose(bias_a, bias_b)
+
+
+def test_build_markov_head_rank_zero_returns_none():
+    assert (
+        build_markov_head(
+            markov_head_type="vanilla", vocab_size=VOCAB, markov_rank=0, hidden_size=HID
+        )
+        is None
+    )
+
+
+def test_confidence_head_emits_raw_logits_and_applies_sts():
+    head = DSparkConfidenceHead(hidden_size=HID, block_size=BLK)
+    logits = head(torch.randn(B, BLK, HID))
+    assert logits.shape == (B, BLK)
+    assert logits.dtype == torch.float32
+
+    temperatures = torch.tensor([1.0, 2.0, 4.0, 1.0, 1.0])
+    head.load_sts_temperatures(temperatures)
+    raw = torch.full((1, BLK), 4.0)
+    assert torch.allclose(head.apply_sts(raw), torch.sigmoid(raw / temperatures))
+
+
+@pytest.mark.parametrize(
+    ("temperatures", "message"),
+    [
+        (torch.ones(BLK + 1), "one per block position"),
+        (torch.zeros(BLK), "strictly positive"),
+    ],
+)
+def test_confidence_head_rejects_invalid_sts_tables(temperatures, message):
+    head = DSparkConfidenceHead(hidden_size=HID, block_size=BLK)
+    with pytest.raises(ValueError, match=message):
+        head.load_sts_temperatures(temperatures)
+
+
+def test_confidence_head_updates_sts_in_place():
+    head = DSparkConfidenceHead(hidden_size=HID, block_size=BLK)
+    storage = head.sts_temperatures
+
+    head.load_sts_temperatures(torch.full((BLK,), 2.0))
+
+    assert head.sts_temperatures is storage
+    assert "sts_temperatures" not in head.state_dict()
+
+
+def test_confidence_head_loads_checkpoint_weights_strictly():
+    head = DSparkConfidenceHead(hidden_size=HID, block_size=BLK)
+    weight = torch.randn(1, HID)
+    head.load_weights([{"proj.weight": weight}])
+    assert torch.equal(head.proj.weight, weight)
+
+    with pytest.raises(ValueError, match="bias=True"):
+        head.load_weights([{"proj.weight": weight, "proj.bias": torch.zeros(1)}])
+    with pytest.raises(ValueError, match="missing key"):
+        head.load_weights([{}])
+
+    biased = DSparkConfidenceHead(hidden_size=HID, block_size=BLK, bias=True)
+    bias = torch.randn(1)
+    biased.load_weights([{"proj.weight": weight, "proj.bias": bias}])
+    assert torch.equal(biased.proj.bias, bias)
+
+
+def test_confidence_head_with_markov_concat_dim():
+    head = DSparkConfidenceHead(hidden_size=HID, markov_rank=RANK, with_markov=True)
+    hid = torch.randn(B, BLK, HID)
+    prev_emb = torch.randn(B, BLK, RANK)
+    out = head(hid, prev_embeddings=prev_emb)
+    assert out.shape == (B, BLK)
+    with pytest.raises(AssertionError):
+        head(hid)  # with_markov requires prev_embeddings
+
+
+# The anchor is a rejection-sampled token id, which can be -1 or out of vocab;
+# an unmasked lookup raises IndexError on CPU and asserts device-side on CUDA.
+@pytest.mark.parametrize("bad_token", [-1, VOCAB])
+def test_markov_bias_is_zero_for_out_of_vocab_anchor(bad_token):
+    torch.manual_seed(3)
+    w1, w2 = torch.randn(VOCAB, RANK), torch.randn(VOCAB, RANK)
+    prev = torch.tensor([0, bad_token], dtype=torch.long)
+
+    emb = markov_prev_embeddings(prev, w1)
+    assert torch.equal(emb[0], w1[0])
+    assert torch.all(emb[1] == 0.0)
+    assert torch.all(dspark_markov_step_bias(prev, w1, w2)[1] == 0.0)
+
+
+def test_markov_head_tolerates_out_of_vocab_anchor():
+    # Same guard reached through the module's get_prev_embeddings, which the
+    # gated/RNN heads also use.
+    torch.manual_seed(4)
+    head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK).eval()
+    base = torch.randn(2, BLK, VOCAB)
+    first = torch.tensor([-1, 0], dtype=torch.long)
+    with torch.no_grad():
+        _, corrected = head.sample_block_tokens(
+            base, first_prev_token_ids=first, hidden_states=None, temperature=0.0
+        )
+    # Invalid anchor -> no step-0 bias; the valid neighbour still gets one.
+    assert torch.allclose(corrected[0, 0], base[0, 0], atol=1e-5)
+    assert not torch.allclose(corrected[1, 0], base[1, 0], atol=1e-5)

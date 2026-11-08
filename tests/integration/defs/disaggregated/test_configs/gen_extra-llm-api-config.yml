@@ -1,0 +1,2 @@
+cache_transceiver_config:
+  backend: "DEFAULT"

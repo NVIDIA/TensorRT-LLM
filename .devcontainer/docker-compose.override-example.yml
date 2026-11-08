@@ -1,0 +1,8 @@
+# Example .devcontainer/docker-compose.override.yml
+version: "3.9"
+services:
+  tensorrt_llm-dev:
+    volumes:
+      # Uncomment the following lines to enable
+      # # Mount TRTLLM data volume:
+      # - /home/scratch.trt_llm_data_ci/:/home/scratch.trt_llm_data_ci/:ro

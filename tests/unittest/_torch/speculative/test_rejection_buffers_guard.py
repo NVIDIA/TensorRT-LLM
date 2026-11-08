@@ -1,0 +1,387 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""GPU unit tests for the one-model rejection slot-buffer allocation and the
+fail-closed acceptance guard.
+
+These exercise the pure buffer/guard logic with synthetic tensors and lightweight
+attribute stand-ins (``types.SimpleNamespace``), so they do not construct a full
+``SpecMetadata`` or run any model forward:
+
+- ``SpecMetadata.prepare_rejection_sampling_buffers`` only reads/writes ``self``
+  attributes (``use_rejection_sampling``, ``vocab_size``, ``max_num_requests``,
+  ``max_draft_len``, ``draft_probs``, ``batch_slot_ids``, ``full_draft_probs``).
+- ``SpecWorkerBase._rejection_buffers_valid`` only reads its arguments and
+  ``spec_metadata`` attributes (no ``self`` use), so it can be called unbound.
+- ``SpecWorkerBase._zero_padding_rows`` is a staticmethod over plain tensors.
+
+The CUDA-graph view test builds a bare ``SpecMetadata`` (no model) because it
+checks that its shallow-copied views share the slot-indexed buffers.
+
+Requires CUDA because the buffers are allocated on ``device='cuda'``.
+"""
+
+import types
+
+import pytest
+import torch
+
+from tensorrt_llm._torch.speculative.interface import SpecMetadata, SpecWorkerBase
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="rejection buffers are CUDA tensors"
+)
+
+R, K, V = 8, 4, 32  # max_num_requests, max_draft_len, vocab_size
+
+
+def _alloc_meta(**over):
+    base = dict(
+        use_rejection_sampling=True,
+        draft_probs=None,
+        vocab_size=V,
+        draft_vocab_size=V,
+        max_num_requests=R,
+        max_draft_len=K,
+        num_seq_slots=0,
+        batch_slot_ids=None,
+        full_draft_probs=None,
+        draft_probs_vocab_size=0,
+    )
+    base.update(over)
+    return types.SimpleNamespace(**base)
+
+
+def test_prepare_buffers_allocates_when_enabled():
+    # Shared draft/target vocab: draft_probs + batch_slot_ids are allocated;
+    # full_draft_probs is skipped (only needed when the vocabs differ).
+    m = _alloc_meta()
+    SpecMetadata.prepare_rejection_sampling_buffers(m)
+    assert m.draft_probs is not None and tuple(m.draft_probs.shape) == (R + 1, K, V)
+    assert m.batch_slot_ids is not None and m.batch_slot_ids.shape[0] == R
+    assert m.batch_slot_ids.dtype == torch.long
+    assert m.full_draft_probs is None
+    assert m.draft_probs_vocab_size == V
+
+
+@pytest.mark.parametrize("num_seq_slots", [0, 2 * R], ids=["default_pool", "larger_pool"])
+def test_prepare_buffers_allocates_full_draft_probs_on_vocab_mismatch(num_seq_slots: int) -> None:
+    """Expanded probabilities use batch capacity while draft state spans the slot pool."""
+    m = _alloc_meta(draft_vocab_size=V - 1, num_seq_slots=num_seq_slots)
+    SpecMetadata.prepare_rejection_sampling_buffers(m)
+    assert m.full_draft_probs is not None and tuple(m.full_draft_probs.shape) == (R, K, V)
+    slot_capacity = num_seq_slots or R
+    assert m.draft_probs is not None and tuple(m.draft_probs.shape) == (slot_capacity + 1, K, V)
+    assert m.dummy_slot_row == slot_capacity
+
+
+def test_prepare_buffers_span_seq_slot_pool():
+    # Under DeepSeek-V4 overlap scheduling the SeqSlotManager pool
+    # (num_seq_slots) can exceed max_num_requests; py_seq_slot then indexes past
+    # max_num_requests. Slot-indexed buffers must span the full pool plus the
+    # dummy scratch row, and dummy_slot_row must land on that last row so a real
+    # slot never aliases the dummy row.
+    pool = 2 * R
+    m = _alloc_meta(num_seq_slots=pool)
+    SpecMetadata.prepare_rejection_sampling_buffers(m)
+    assert tuple(m.draft_probs.shape) == (pool + 1, K, V)
+    assert m.dummy_slot_row == pool
+
+
+@pytest.mark.parametrize("enable_penalty", [False, True], ids=["rejection", "rejection_penalty"])
+def test_cuda_graph_views_share_slot_buffers(enable_penalty: bool) -> None:
+    # A graph view created before the first prepare() must not allocate its own
+    # slot-indexed state: the drafter scatters into the buffer of the view that
+    # ran this step, and the next step's rejection kernel (eager or another
+    # graph) must read that same buffer.
+    pool = 2 * R
+    meta = SpecMetadata(
+        max_num_requests=R,
+        max_draft_len=K,
+        max_total_draft_tokens=K,
+        use_rejection_sampling=True,
+        enable_penalty=enable_penalty,
+        vocab_size=V,
+        draft_vocab_size=V,
+        num_seq_slots=pool,
+    )
+    graph_small = meta.create_cuda_graph_metadata(2)
+    graph_large = meta.create_cuda_graph_metadata(4)
+    for view in (graph_small, graph_large, meta):
+        view.prepare_rejection_sampling_buffers()
+        view.prepare_penalty_buffers()
+
+    assert tuple(meta.draft_probs.shape) == (pool + 1, K, V)
+    assert graph_small.draft_probs is meta.draft_probs
+    assert graph_large.draft_probs is meta.draft_probs
+    assert graph_small.dummy_slot_row == graph_large.dummy_slot_row == pool
+    if enable_penalty:
+        assert graph_small.penalty_state is meta.penalty_state
+        assert graph_large.penalty_state is meta.penalty_state
+
+
+def test_prepare_buffers_noop_when_disabled():
+    m = _alloc_meta(use_rejection_sampling=False)
+    SpecMetadata.prepare_rejection_sampling_buffers(m)
+    assert m.draft_probs is None
+    assert m.batch_slot_ids is None
+    assert m.full_draft_probs is None
+
+
+def _valid_state():
+    return types.SimpleNamespace(
+        is_ragged_verify=False,
+        draft_probs=torch.empty((R, K, V), device="cuda"),
+        batch_slot_ids=torch.arange(R, device="cuda", dtype=torch.long),
+    )
+
+
+# num_contexts=0, num_gens=4
+_NUM_CTX = 0
+_BATCH = 4
+_NUM_GENS = _BATCH - _NUM_CTX
+
+
+def _good_args():
+    draft_tokens = torch.zeros((_NUM_GENS, K), dtype=torch.int, device="cuda")
+    logits = torch.zeros((_NUM_CTX + _NUM_GENS * (K + 1), V), device="cuda")
+    return draft_tokens, K, V, _NUM_CTX, _BATCH, logits
+
+
+_DUMMY = object()  # _rejection_buffers_valid does not use self
+
+
+def _call(meta, draft_tokens, draft_len, stored_vocab, num_contexts, batch_size, logits):
+    return SpecWorkerBase._rejection_buffers_valid(
+        _DUMMY, draft_tokens, draft_len, stored_vocab, num_contexts, batch_size, logits, meta
+    )
+
+
+def test_guard_true_on_valid_state():
+    assert _call(_valid_state(), *_good_args()) is True
+
+
+# Each builder returns (meta, *_call args) for one malformed state that the
+# fail-closed guard must reject. Kept as a single parametrized test so the guard's
+# rejection branches read as one table.
+def _case_draft_probs_missing():
+    m = _valid_state()
+    m.draft_probs = None
+    return (m, *_good_args())
+
+
+def _case_batch_slot_ids_missing():
+    m = _valid_state()
+    m.batch_slot_ids = None
+    return (m, *_good_args())
+
+
+def _case_stored_vocab_nonpositive():
+    dt, dl, _sv, nc, bs, lg = _good_args()
+    return (_valid_state(), dt, dl, 0, nc, bs, lg)
+
+
+def _case_stored_vocab_exceeds_buffer():
+    dt, dl, _sv, nc, bs, lg = _good_args()
+    return (_valid_state(), dt, dl, V + 1, nc, bs, lg)
+
+
+def _case_draft_len_exceeds_buffer():
+    # draft_probs has K steps; ask for K+1.
+    draft_tokens = torch.zeros((_NUM_GENS, K + 1), dtype=torch.int, device="cuda")
+    logits = torch.zeros((_NUM_CTX + _NUM_GENS * (K + 2), V), device="cuda")
+    return (_valid_state(), draft_tokens, K + 1, V, _NUM_CTX, _BATCH, logits)
+
+
+def _case_draft_tokens_wrong_rows():
+    dt = torch.zeros((_NUM_GENS + 1, K), dtype=torch.int, device="cuda")
+    _, dl, sv, nc, bs, lg = _good_args()
+    return (_valid_state(), dt, dl, sv, nc, bs, lg)
+
+
+def _case_too_few_logits_rows():
+    dt, dl, sv, nc, bs, _lg = _good_args()
+    too_few = torch.zeros((nc + _NUM_GENS, V), device="cuda")  # missing +1 each
+    return (_valid_state(), dt, dl, sv, nc, bs, too_few)
+
+
+def _case_batch_slot_ids_too_short():
+    m = _valid_state()
+    m.batch_slot_ids = torch.arange(_BATCH - 1, device="cuda", dtype=torch.long)
+    return (m, *_good_args())
+
+
+@pytest.mark.parametrize(
+    "build_case",
+    [
+        _case_draft_probs_missing,
+        _case_batch_slot_ids_missing,
+        _case_stored_vocab_nonpositive,
+        _case_stored_vocab_exceeds_buffer,
+        _case_draft_len_exceeds_buffer,
+        _case_draft_tokens_wrong_rows,
+        _case_too_few_logits_rows,
+        _case_batch_slot_ids_too_short,
+    ],
+    ids=lambda f: f.__name__.removeprefix("_case_"),
+)
+def test_guard_false_on_malformed_state(build_case):
+    assert _call(*build_case()) is False
+
+
+# --------------------------------------------------------------------------
+# Fail-closed acceptance dispatch: prove _accept_draft_tokens() routes to
+# strict/base acceptance when the buffers are malformed, and routes to the
+# rejection method when the state is valid. The two acceptance methods are
+# stubbed to record which path ran; the real _can_use_rejection_sampling and
+# _rejection_buffers_valid are exercised.
+# --------------------------------------------------------------------------
+
+
+class _Worker(SpecWorkerBase):
+    @property
+    def max_draft_len(self) -> int:
+        return K
+
+    def _forward_impl(self, *args: object, **kwargs: object) -> None:
+        raise NotImplementedError
+
+
+def _dispatch_meta(**over):
+    base = dict(
+        is_ragged_verify=False,
+        use_rejection_sampling=True,
+        is_all_greedy_sample=False,
+        draft_probs_vocab_size=V,
+        draft_probs_last_dim=V,
+        batch_slot_ids=torch.arange(R, device="cuda", dtype=torch.long),
+        draft_probs=torch.zeros((R, K, V), device="cuda"),
+    )
+    base.update(over)
+    return types.SimpleNamespace(**base)
+
+
+def _make_worker():
+    w = _Worker()
+    calls = {"base": 0, "rejection": 0}
+
+    def _base(logits, draft_tokens, num_contexts, batch_size, spec_metadata):
+        calls["base"] += 1
+        return ("base", None)
+
+    def _rej(logits, draft_tokens, draft_probs, num_contexts, batch_size, spec_metadata):
+        calls["rejection"] += 1
+        return ("rejection", None)
+
+    w._sample_and_accept_draft_tokens_base = _base
+    w._sample_and_accept_draft_tokens_rejection = _rej
+    return w, calls
+
+
+def test_accept_dispatch_fails_closed_on_malformed_buffers():
+    w, calls = _make_worker()
+    # Buffers are malformed (draft_probs None) -> _rejection_buffers_valid must
+    # return False, so acceptance falls back to base and the rejection kernel is
+    # skipped.
+    meta = _dispatch_meta(draft_probs=None)
+    draft_tokens = torch.zeros((_NUM_GENS, K), dtype=torch.int, device="cuda")
+    logits = torch.zeros((_NUM_CTX + _NUM_GENS * (K + 1), V), device="cuda")
+    out = w._accept_draft_tokens(logits, draft_tokens, _NUM_CTX, _BATCH, meta)
+    assert out == ("base", None)
+    assert calls["base"] == 1 and calls["rejection"] == 0
+
+
+def test_accept_dispatch_routes_to_rejection_on_valid_state():
+    w, calls = _make_worker()
+    meta = _dispatch_meta()  # valid buffers
+    draft_tokens = torch.zeros((_NUM_GENS, K), dtype=torch.int, device="cuda")
+    logits = torch.zeros((_NUM_CTX + _NUM_GENS * (K + 1), V), device="cuda")
+    out = w._accept_draft_tokens(logits, draft_tokens, _NUM_CTX, _BATCH, meta)
+    assert out == ("rejection", None)
+    assert calls["rejection"] == 1 and calls["base"] == 0
+
+
+def test_accept_dispatch_base_when_all_greedy():
+    w, calls = _make_worker()
+    # All-greedy batch: rejection is bypassed regardless of buffers.
+    meta = _dispatch_meta(is_all_greedy_sample=True)
+    draft_tokens = torch.zeros((_NUM_GENS, K), dtype=torch.int, device="cuda")
+    logits = torch.zeros((_NUM_CTX + _NUM_GENS * (K + 1), V), device="cuda")
+    out = w._accept_draft_tokens(logits, draft_tokens, _NUM_CTX, _BATCH, meta)
+    assert out == ("base", None)
+    assert calls["base"] == 1 and calls["rejection"] == 0
+
+
+# --------------------------------------------------------------------------
+# Padding-row sanitization: SpecWorkerBase._zero_padding_rows keeps the
+# CUDA-graph padding requests' (possibly non-finite) logits out of the
+# rejection kernel. Another staticmethod over plain tensors, same stand-ins.
+# --------------------------------------------------------------------------
+
+_PAD_ROW = 16  # spec_metadata.dummy_slot_row
+_zero = SpecWorkerBase._zero_padding_rows
+
+
+def _pad_meta(slot_ids, dummy_slot_row=_PAD_ROW):
+    ids = None if slot_ids is None else torch.tensor(slot_ids, dtype=torch.long, device="cuda")
+    return types.SimpleNamespace(batch_slot_ids=ids, dummy_slot_row=dummy_slot_row)
+
+
+def _nan_logits(num_rows):
+    # A padding request decodes from uninitialized state; softmax of such a row
+    # is NaN, which is what has to be kept out of the rejection kernel.
+    return torch.full((num_rows, V), float("nan"), device="cuda")
+
+
+@pytest.mark.parametrize("rows_per_request", [1, 3])
+def test_only_padding_rows_are_zeroed(rows_per_request):
+    # Two real requests, then two CUDA-graph padding requests on the shared
+    # dummy row -- the layout pad_batch() produces (padding appended last).
+    n = 2 * rows_per_request
+    real = torch.randn(n, V, device="cuda")
+    logits = torch.cat([real, _nan_logits(n)])
+
+    out = _zero(logits, _pad_meta([0, 1, _PAD_ROW, _PAD_ROW]), 0, 4, rows_per_request)
+
+    torch.testing.assert_close(out[:n], real)
+    assert torch.all(out[n:] == 0.0)
+    assert torch.isnan(logits[n:]).all(), "must not mutate the caller's logits"
+
+
+def test_padding_mask_excludes_context_rows():
+    # Mixed batch: the first num_contexts requests own one logits row each and
+    # are not part of the gen slice this helper is handed.
+    out = _zero(_nan_logits(4), _pad_meta([7, _PAD_ROW, 3]), 1, 3, 2)
+
+    assert torch.all(out[:2] == 0.0)  # the _PAD_ROW request
+    assert torch.isnan(out[2:]).all()  # the real request, untouched
+
+
+# Builders, not built values: the metas hold CUDA tensors, and parametrize
+# arguments are evaluated at import time, before the CUDA skip applies.
+def _pad_case_no_slot_ids():
+    return _pad_meta(None), 2  # rejection buffers never allocated
+
+
+def _pad_case_unpublished_scratch_row():
+    return _pad_meta([0, 1], dummy_slot_row=0), 2  # slot 0 is a live request
+
+
+def _pad_case_unexpected_row_count():
+    return _pad_meta([0, _PAD_ROW]), 3  # does not match the batch
+
+
+@pytest.mark.parametrize(
+    "build_case",
+    [_pad_case_no_slot_ids, _pad_case_unpublished_scratch_row, _pad_case_unexpected_row_count],
+    ids=lambda f: f.__name__.removeprefix("_pad_case_"),
+)
+def test_padding_mask_returns_input_when_layout_is_unrecognized(build_case):
+    meta, num_rows = build_case()
+    logits = torch.randn(num_rows, V, device="cuda")
+    assert _zero(logits, meta, 0, 2, 1) is logits
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

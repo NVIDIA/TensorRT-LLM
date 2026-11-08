@@ -1,0 +1,31 @@
+# Adapted from https://github.com/vllm-project/vllm/tree/main/.github/ISSUE_TEMPLATE/100-documentation.yml
+name: 📚 Documentation
+description: Report an issue related to https://nvidia.github.io/TensorRT-LLM/
+title: "[Doc]: "
+labels: ["Documentation"]
+assignees: ["nv-guomingz"]
+
+body:
+- type: textarea
+  attributes:
+    label: 📚 The doc issue
+    description: >
+      A clear and concise description of what content in https://nvidia.github.io/TensorRT-LLM/ is an issue.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Suggest a potential alternative/fix
+    description: >
+      Tell us how we could improve the documentation in this regard.
+- type: markdown
+  attributes:
+    value: >
+      Thanks for contributing 🎉!
+- type: checkboxes
+  id: askllm
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: Make sure you already searched for relevant issues, and checked the [documentation](https://nvidia.github.io/TensorRT-LLM/) and [examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples) for answers to frequently asked questions.
+        required: true

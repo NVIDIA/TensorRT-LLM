@@ -1,0 +1,272 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import contextlib
+import contextvars
+import functools
+import gc
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Hashable, List, Optional, Protocol, Tuple, TypeAlias
+
+import torch
+
+from tensorrt_llm.logger import logger
+
+from ..nccl_window_graph import nccl_window_graph_capture
+from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
+from ..utils import make_weak_ref
+
+# Extra-key values the runner resolved host-side for the call it is currently
+# capturing. CUDA-graph capture forbids device-to-host syncs, so anything a
+# forward would otherwise derive from a CUDA tensor with `.item()` -- the
+# sparse-attention dense-prefix phase, for instance -- must be resolved before
+# capture and read back from here inside it. The runner already computes these
+# values to build the graph key; this just makes them visible to the callee.
+_RESOLVED_EXTRA_KEYS: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+    "cuda_graph_resolved_extra_keys", default=None
+)
+
+
+def resolved_extra_key(name: str) -> Any:
+    """Return the extra-key value `name` resolved for the call being captured, else None.
+
+    None means "not inside a runner-driven call" (or the key was omitted), and
+    callers must fall back to deriving the value themselves.
+    """
+    resolved = _RESOLVED_EXTRA_KEYS.get()
+    return None if resolved is None else resolved.get(name)
+
+
+@contextlib.contextmanager
+def resolved_extra_keys_scope(values: Dict[str, Any]):
+    """Expose `values` through `resolved_extra_key` for the enclosed block."""
+    token = _RESOLVED_EXTRA_KEYS.set(dict(values))
+    try:
+        yield
+    finally:
+        _RESOLVED_EXTRA_KEYS.reset(token)
+
+
+# One named graph-key component, e.g. ("hidden_states", (1, 4096, 3072)).
+KeyPart: TypeAlias = Tuple[str, Hashable]
+# Full CUDA graph cache key, stored as a tuple so it can be used as a dict key.
+KeyType: TypeAlias = Tuple[KeyPart, ...]
+
+
+class ExtraKeyFn(Protocol):
+    """Computes one optional non-shape graph-key value from model.forward inputs."""
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Optional[Hashable]: ...
+
+
+@dataclass
+class CUDAGraphRunnerConfig:
+    """Configuration for the CUDAGraphRunner."""
+
+    use_cuda_graph: bool
+    """
+    Master switch. Same three-path semantics as the LLM runner:
+
+    1. False  → runner is dormant, maybe_get_cuda_graph always returns None
+    2. True, ineligible → fallback to eager (e.g., first call with new shapes)
+    3. True, eligible   → capture (if new) or replay
+    """
+    cuda_graph_mem_pool: Any = None
+
+
+class SharedGraphPool:
+    """Mutable container for sharing a CUDA graph memory pool across multiple runners.
+
+    When multiple CUDAGraphRunners wrap different models that never execute
+    concurrently (e.g., WAN 2.2 high-noise / low-noise transformers), sharing
+    a pool lets CUDA alias memory between their graphs, avoiding duplication.
+    """
+
+    def __init__(self):
+        self.handle = None
+
+
+class CUDAGraphRunner:
+    """
+    Manages CUDA graph lifecycle for visual generation.
+
+    Mirrors the LLM CUDAGraphRunner API:
+      get_graph_key → maybe_get_cuda_graph → needs_capture → capture / replay
+
+    Key differences from the LLM runner:
+    - Keys are derived from model-forward tensor shapes plus optional explicit
+      graph-visible state
+    - Static buffers are per-key (allocated at capture time), not shared/pre-allocated
+    - No batch padding, speculative decoding, or cross-rank coordination
+    - Outputs returned via make_weak_ref (zero-copy, same as LLM runner)
+    """
+
+    WARMUP_STEPS = 2
+
+    def __init__(
+        self,
+        config: CUDAGraphRunnerConfig,
+        shared_pool: SharedGraphPool = None,
+    ):
+        self.config = config
+        self.enabled = config.use_cuda_graph
+        # When False, uncaptured keys run eagerly instead of triggering capture.
+        self.allow_capture = True
+        self._shared_pool = shared_pool
+        self._extra_key_fns: Dict[str, ExtraKeyFn] = {}
+
+        self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
+        self.graph_outputs: Dict[KeyType, Any] = {}  # weak refs
+        # Keep the capture-created output tensors alive. Some pipelines keep
+        # outputs from multiple graph keys live at once, for example true CFG
+        # combines positive and negative Qwen-Image-Edit transformer outputs.
+        # Without strong refs, a later graph capture using the same memory pool
+        # can reuse the earlier output storage and make those outputs alias.
+        self._graph_output_refs: Dict[KeyType, Any] = {}
+        self.static_inputs: Dict[KeyType, Tuple[List[Any], Dict[str, Any]]] = {}
+        self.memory_pool = config.cuda_graph_mem_pool
+
+    def register_extra_key_fn(self, name: str, fn: ExtraKeyFn) -> None:
+        """Register a graph-key extension computed from forward args/kwargs.
+
+        The function is called with only the wrapped model.forward inputs.
+        """
+        if self.graphs:
+            raise RuntimeError(
+                "CUDA graph extra key functions must be registered before graph capture."
+            )
+        self._extra_key_fns[name] = fn
+
+    def _get_tensor_shape_key(self, *args, **kwargs) -> KeyType:
+        # Base VisualGen graphs are keyed by tensor shapes from the wrapped
+        # model.forward call.
+        return tuple(
+            list(
+                (f"arg{i}", tuple(arg.shape))
+                for i, arg in enumerate(args)
+                if isinstance(arg, torch.Tensor)
+            )
+            + list(
+                (k, tuple(kwargs[k].shape))
+                for k in sorted(kwargs.keys())
+                if isinstance(kwargs[k], torch.Tensor)
+            )
+        )
+
+    def _get_extra_key(self, *args, **kwargs) -> KeyType:
+        parts = []
+        for name, fn in sorted(self._extra_key_fns.items()):
+            value = fn(*args, **kwargs)
+            if value is not None:
+                parts.append((name, value))
+        # Remembered so `capture()` can republish them to the callee; this runs
+        # outside capture, where the `.item()` these callbacks need is legal.
+        self._last_resolved_extra_keys = dict(parts)
+        return tuple(parts)
+
+    def get_graph_key(self, *args, **kwargs) -> KeyType:
+        return self._get_tensor_shape_key(*args, **kwargs) + self._get_extra_key(*args, **kwargs)
+
+    def _get_pool(self):
+        """Return the best available pool: shared first, then own, then None."""
+        if self._shared_pool is not None and self._shared_pool.handle is not None:
+            return self._shared_pool.handle
+        return self.memory_pool
+
+    def capture(
+        self, key: KeyType, fn: Callable, args: Tuple[Any, ...], kwargs: Dict[str, Any]
+    ) -> None:
+        logger.info(f"Capturing graph for key: {key}")
+
+        # One time clone of inputs
+        static_args = [arg.clone() if isinstance(arg, torch.Tensor) else arg for arg in args]
+        static_kwargs = {
+            k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()
+        }
+
+        graph = torch.cuda.CUDAGraph()
+        # Warmup and capture both see the host-resolved extra keys, so a
+        # forward that needs the dense-prefix phase reads it from here instead
+        # of syncing a CUDA tensor -- which capture would reject.
+        with resolved_extra_keys_scope(getattr(self, "_last_resolved_extra_keys", {})):
+            for _ in range(self.WARMUP_STEPS):
+                with discard_nccl_window_tensor_outputs((static_args, static_kwargs)):
+                    fn(*static_args, **static_kwargs)
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            graph_pool = self._get_pool() or torch.cuda.graph_pool_handle()
+            with nccl_window_graph_capture(graph, graph_pool):
+                output = fn(*static_args, **static_kwargs)
+
+        self.graphs[key] = graph
+        self.static_inputs[key] = (static_args, static_kwargs)
+        self._graph_output_refs[key] = output
+        self.graph_outputs[key] = make_weak_ref(output)
+        self.memory_pool = graph_pool
+
+        # Publish pool so other runners sharing the same SharedGraphPool can reuse it
+        if self._shared_pool is not None and self._shared_pool.handle is None:
+            self._shared_pool.handle = self.memory_pool
+
+    def replay(
+        self,
+        key: KeyType,
+        args: Tuple[Any, ...],
+        kwargs: Dict[str, Any],
+    ) -> Any:
+        static_args, static_kwargs = self.static_inputs[key]
+
+        for i, arg in enumerate(args):
+            if isinstance(arg, torch.Tensor):
+                static_args[i].copy_(arg)
+            else:
+                static_args[i] = arg
+
+        for k, v in kwargs.items():
+            if isinstance(v, torch.Tensor):
+                static_kwargs[k].copy_(v)
+            else:
+                static_kwargs[k] = v
+
+        self.graphs[key].replay()
+        return self.graph_outputs[key]
+
+    def wrap(self, fn):
+        """Wrap a callable with CUDA graph capture/replay.
+
+        Returns a drop-in replacement that:
+        - On first call with a new graph key: captures a graph
+        - On subsequent calls with the same graph key: replays the graph
+        - Falls back to eager if disabled
+        """
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if not self.enabled:
+                return fn(*args, **kwargs)
+
+            key = self.get_graph_key(*args, **kwargs)
+
+            if key not in self.graphs:
+                if not self.allow_capture:
+                    return fn(*args, **kwargs)
+                self.capture(key, fn, args, kwargs)
+                return self.replay(key, args, kwargs)
+            else:
+                return self.replay(key, args, kwargs)
+
+        return wrapper
+
+    def clear(self):
+        """Releases all captured graphs and the associated memory pool."""
+        if not self.graphs:
+            return
+        for graph in self.graphs.values():
+            graph.reset()
+        self.graphs.clear()
+        self.graph_outputs.clear()
+        self._graph_output_refs.clear()
+        self.static_inputs.clear()
+        self.memory_pool = None

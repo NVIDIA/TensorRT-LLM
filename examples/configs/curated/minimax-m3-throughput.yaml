@@ -1,0 +1,24 @@
+max_batch_size: 256
+max_num_tokens: 8192
+# Cap max_seq_len explicitly. Without this cap the warmup decode used for
+# CUDA-graph capture inherits the checkpoint's max_position_embeddings
+# (1M for MXFP8, 512K for BF16), which makes both the dense GQA expansion
+# in `_dense_forward` and the per-Q FP32 slab in `_sparse_gqa_masked`
+# allocate gigabyte-scale temporaries that exceed the caching allocator's
+# graph-safe path and fail capture with cudaErrorStreamCaptureUnsupported.
+# 2068 leaves a small margin over ISL+OSL=2048 (1k/1k benchmark).
+max_seq_len: 2068
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+enable_attention_dp: true
+trust_remote_code: true
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 256
+kv_cache_config:
+  free_gpu_memory_fraction: 0.7
+  enable_block_reuse: false
+sparse_attention_config:
+  algorithm: minimax_m3
+stream_interval: 10
+num_postprocess_workers: 4

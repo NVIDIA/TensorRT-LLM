@@ -1,0 +1,1504 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from unittest.mock import Mock
+
+import numpy as np
+import pytest
+import torch
+
+from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
+    KVRegionExtractorV1,
+    build_page_table_from_manager,
+)
+from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, MapperKind
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    get_global_layer_ids,
+    get_layer_byte_ranges,
+    get_layer_to_layer_group,
+    get_num_layer_groups,
+    get_num_layers,
+    get_physical_pool,
+    get_unique_layers,
+)
+from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
+    PLE_NGRAM_CONTEXT,
+    Qwen4ExpHybridCacheManager,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
+    KVCacheManagerV2,
+    Role,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaRole
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    CacheTypeCpp,
+    DataType,
+    KvCacheConfig,
+    KVCacheManager,
+    Mapping,
+)
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
+
+
+class DummyRankInfo:
+    instance_name = "dummy"
+    instance_rank = 0
+    tp_size = 1
+    tp_rank = 0
+    pp_size = 1
+    pp_rank = 0
+    dp_size = 1
+    dp_rank = 0
+    cp_size = 1
+    cp_rank = 0
+    device_id = 0
+    kv_heads_per_rank = 8
+    tokens_per_block = 32
+    dims_per_head = 16
+    element_bytes = 2
+    enable_attention_dp = False
+    is_mla = False
+    layer_num_per_pp = [1]
+
+    @property
+    def kv_factor(self) -> int:
+        return 2 if not self.is_mla else 1
+
+
+@pytest.mark.cuda
+def test_extract():
+    num_layers = 1
+    num_kv_heads = 8
+    head_dim = 16
+    tokens_per_block = 32
+    max_seq_len = 128
+    max_batch_size = 2
+    dtype = DataType.HALF
+    mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1, gpus_per_node=1)
+    kv_cache_config = KvCacheConfigV2(
+        max_tokens=512,
+        free_gpu_memory_fraction=0.1,
+        max_attention_window=None,
+        enable_block_reuse=False,
+        event_buffer_max_size=0,
+        host_cache_size=0,
+        enable_partial_reuse=False,
+        copy_on_partial_reuse=False,
+        sink_token_length=0,
+        max_util_for_resume=1,
+    )
+    kv_cache_type = CacheTypeCpp.SELF
+
+    manager = KVCacheManagerV2(
+        kv_cache_config=kv_cache_config,
+        kv_cache_type=kv_cache_type,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        mapping=mapping,
+        dtype=dtype,
+        vocab_size=32000,
+    )
+
+    extractor = KVRegionExtractorV1(manager)
+    region_ids = np.array([0, 1], dtype=np.int64)
+    spec_region = extractor.extract(region_ids)
+
+    assert isinstance(spec_region, SpecRegion)
+    memory = spec_region.memory
+    assert isinstance(memory, MemRegionGroup)
+    assert len(memory.ptrs) == len(region_ids)
+    assert memory.bytes_per_region > 0
+
+    pool_base_ptr = extractor.page_table.pool_groups[0].pools[0].base_address
+    assert isinstance(memory.ptrs, np.ndarray)
+    expected_block_bytes = memory.bytes_per_region
+    expected_ptrs = [pool_base_ptr + block_id * expected_block_bytes for block_id in region_ids]
+    np.testing.assert_array_equal(memory.ptrs, expected_ptrs)
+
+    manager.shutdown()
+
+
+@pytest.mark.cuda
+def test_build_page_table():
+    num_layers = 8
+    num_kv_heads = 8
+    head_dim = 128
+    tokens_per_block = 64
+    max_tokens = 3200
+
+    kv_cache_config = KvCacheConfigV2(max_tokens=max_tokens)
+
+    mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
+
+    manager = KVCacheManagerV2(
+        kv_cache_config=kv_cache_config,
+        kv_cache_type=CacheTypeCpp.SELF,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=2048,
+        max_batch_size=8,
+        mapping=mapping,
+        dtype=DataType.HALF,
+        vocab_size=32000,
+        max_num_tokens=max_tokens,
+    )
+
+    page_table = build_page_table_from_manager(manager)
+
+    assert page_table.tokens_per_block == 64
+    assert get_num_layers(page_table) == 8
+    assert get_num_layer_groups(page_table) > 0
+
+    lg = page_table.layer_groups[0]
+    pv = lg.pool_views[0]
+    pool = get_physical_pool(page_table, 0, pv.pool_idx)
+    assert pool.base_address > 0
+    # V2 reserves additional slots beyond the requested token capacity.
+    assert pool.num_slots >= max_tokens // tokens_per_block
+    assert len(pv.buffer_entries) > 0
+    assert pv.pool_role == frozenset({"key", "value"})
+    assert pv.mapper_kind == MapperKind.INDEXED
+    assert len(get_global_layer_ids(lg)) > 0
+
+    local_layer_id = list(get_unique_layers(pv))[0]
+    layer_entries = sorted(
+        (e for e in pv.buffer_entries if int(e["local_layer_id"]) == local_layer_id),
+        key=lambda e: int(e["offset"]),
+    )
+    assert len(layer_entries) >= 2  # KV layout: K + V buffer per layer
+    pool = get_physical_pool(page_table, 0, pv.pool_idx)
+    ptr_key = int(pool.base_address) + int(layer_entries[0]["offset"])
+    ptr_value = int(pool.base_address) + int(layer_entries[1]["offset"])
+    assert ptr_key > 0
+    assert ptr_value > ptr_key
+
+    # Verify layer_groups are populated
+    assert page_table.layer_groups is not None
+    assert len(page_table.layer_groups) == get_num_layer_groups(page_table)
+    assert len(get_global_layer_ids(page_table.layer_groups[0])) > 0
+    assert page_table.layer_groups[0].kv_head_num_per_rank == num_kv_heads
+
+    layer_to_lg = get_layer_to_layer_group(page_table)
+    assert layer_to_lg is not None
+    assert len(layer_to_lg) == num_layers
+
+    print(
+        f"Page table created: {get_num_layer_groups(page_table)} layer_groups,"
+        f" tokens_per_block={page_table.tokens_per_block},"
+        f" num_layers={get_num_layers(page_table)}"
+    )
+
+    manager.shutdown()
+
+
+@pytest.mark.cpu_only
+def test_layer_group_meta_serialization():
+    import numpy as np
+
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        BUFFER_ENTRY_DTYPE,
+        AttentionLayerGroup,
+        KVCachePageTable,
+        LocalLayer,
+        PhysicalPool,
+        PhysicalPoolGroup,
+        PoolView,
+    )
+
+    entries = np.array(
+        [(0, 0, 256), (0, 256, 256)],
+        dtype=BUFFER_ENTRY_DTYPE,
+    )
+    kv_pool = PhysicalPool(base_address=1000, slot_bytes=512, num_slots=10)
+    pv = PoolView(pool_idx=0, buffer_entries=entries, num_kv_heads=4)
+    local_layers = [
+        LocalLayer(local_layer_id=0, global_layer_id=0),
+        LocalLayer(local_layer_id=1, global_layer_id=1),
+    ]
+    lg = AttentionLayerGroup(
+        pool_group_idx=0,
+        kv_head_num_per_rank=4,
+        sliding_window_size=512,
+        local_layers=local_layers,
+        pool_views=[pv],
+    )
+    page_table = KVCachePageTable(
+        tokens_per_block=16,
+        layer_groups=[lg],
+        pool_groups=[PhysicalPoolGroup(pools=[kv_pool])],
+    )
+    d = page_table.to_dict()
+    restored = KVCachePageTable.from_dict(d)
+    restored_lg = restored.layer_groups[0]
+    assert isinstance(restored.layer_groups[0], AttentionLayerGroup)
+    assert restored_lg.sliding_window_size == 512
+    assert restored_lg.kv_head_num_per_rank == 4
+    assert len(restored_lg.local_layers) == 2
+    assert len(restored_lg.pool_views[0].buffer_entries) == 2
+    assert restored_lg.pool_views[0].num_kv_heads == 4
+    # Absent wire metadata remains absent so consumers can reject it.
+    del d["layer_groups"][0]["pool_views"][0]["num_kv_heads"]
+    assert KVCachePageTable.from_dict(d).layer_groups[0].pool_views[0].num_kv_heads is None
+
+
+def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_list=(640,)):
+    """Build a minimal duck-typed KVCacheManagerV2 for _build_page_table_v2.
+
+    ``attrs`` keeps the storage-layer shape ``{(layer_id, role):
+    (life_cycle_id, pool_index, offset, size)}``; the fake synthesizes the
+    public ``pool_group_descs`` view from it. Buffer order within a
+    coalesced buffer follows ascending offset, mirroring how the real
+    storage config assigns offsets in ``buffer_ids`` order.
+    """
+    from types import SimpleNamespace
+
+    base = 0x1000
+
+    per_pool: dict[int, list] = {}
+    for (layer_id, role), attr in attrs.items():
+        per_pool.setdefault(int(attr.pool_index), []).append(
+            (int(attr.offset), layer_id, role, int(attr.size))
+        )
+
+    coalesced_buffers = []
+    for pool_idx in range(num_pools):
+        buffers = sorted(per_pool.get(pool_idx, []))
+        sizes = {size for _, _, _, size in buffers}
+        assert len(sizes) == 1, "buffers in a coalesced buffer are uniform-size by construction"
+        coalesced_buffers.append(
+            SimpleNamespace(
+                single_buffer_size=sizes.pop(),
+                buffer_ids=[
+                    SimpleNamespace(layer_id=layer_id, role=role)
+                    for _, layer_id, role, _ in buffers
+                ],
+            )
+        )
+
+    pg_desc = SimpleNamespace(
+        pool_group_index=0,
+        num_slots=4,
+        pools=[
+            SimpleNamespace(pool_index=pi, base_address=base, slot_bytes=sb)
+            for pi, sb in enumerate(slot_bytes_list)
+        ],
+        slot_desc=SimpleNamespace(
+            variants=[SimpleNamespace(layer_group_id=0, coalesced_buffers=coalesced_buffers)]
+        ),
+    )
+
+    impl = SimpleNamespace(
+        layer_grouping=((0, 1),),
+        init_config=SimpleNamespace(
+            tokens_per_block=16,
+            layers=[SimpleNamespace(window_size=None), SimpleNamespace(window_size=None)],
+        ),
+        pool_group_descs=[pg_desc],
+    )
+    return Mock(
+        spec=KVCacheManagerV2,
+        get_disagg_pool_view_partition=None,
+        get_disagg_ignored_roles=lambda: frozenset(),
+        impl=impl,
+        pp_layers=[0, 1],
+        layer_offsets={0: 0, 1: 1},
+        num_kv_heads_per_layer=[1, 1],
+        mixed_precision_high_layers={},
+        get_disagg_role_mapper_kinds=lambda: role_mapper_kinds,
+        get_disagg_role_layouts=lambda: {},
+    )
+
+
+@pytest.mark.cpu_only
+def test_v2_builder_stamps_homogeneous_pool_kinds():
+    """Split KV / INDEX_KEY pools get NHD and REPLICATED views respectively."""
+    from types import SimpleNamespace
+
+    attrs = {
+        (0, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
+        (0, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=128, size=128),
+        (1, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=256, size=128),
+        (1, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=384, size=128),
+        (1, Role.INDEX_KEY): SimpleNamespace(life_cycle_id=0, pool_index=1, offset=0, size=128),
+    }
+    manager = _make_fake_v2_manager(
+        attrs,
+        {Role.ALL: MapperKind.NHD, Role.INDEX_KEY: MapperKind.REPLICATED},
+        num_pools=2,
+        slot_bytes_list=(512, 128),
+    )
+
+    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
+    assert len(views) == 2
+    assert views[0].pool_role == frozenset({"key", "value"})
+    assert views[0].mapper_kind == MapperKind.NHD
+    assert views[0].num_kv_heads == 1
+    assert get_unique_layers(views[0]) == {0, 1}
+    assert views[1].pool_role == frozenset({"index_key"})
+    assert views[1].mapper_kind == MapperKind.REPLICATED
+    assert views[1].num_kv_heads is None
+    assert get_unique_layers(views[1]) == {1}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "owners, head_counts, expected_num_views",
+    [
+        pytest.param(("target", "target"), (2, 2), 1, id="target-uniform-heads"),
+        pytest.param(("target", "target"), (2, 1), 2, id="target-mixed-heads"),
+        pytest.param(("target", "draft"), (2, 2), 2, id="mixed-owners-uniform-heads"),
+        pytest.param(("target", "draft"), (2, 1), 2, id="mixed-owners-mixed-heads"),
+        pytest.param(("draft", "draft"), (2, 1), 2, id="draft-mixed-heads"),
+        pytest.param(None, (2, 2), 1, id="no-layer-specs-uniform-heads"),
+        pytest.param(None, (2, 1), 2, id="no-layer-specs-mixed-heads"),
+    ],
+)
+def test_v2_builder_partitions_coalesced_views_by_owner_and_heads(
+    owners: tuple[str, str] | None, head_counts: tuple[int, int], expected_num_views: int
+) -> None:
+    from types import SimpleNamespace
+
+    # FP16 (2 heads, dim 64) and (1 head, dim 128) share a 4096-byte K/V
+    # buffer size at 16 tokens per block.
+    buffer_size = 4096
+    attrs = {
+        (layer, role): SimpleNamespace(
+            life_cycle_id=0,
+            pool_index=0,
+            offset=(2 * layer + role_index) * buffer_size,
+            size=buffer_size,
+        )
+        for layer in range(2)
+        for role_index, role in enumerate((Role.KEY, Role.VALUE))
+    }
+    manager = _make_fake_v2_manager(
+        attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(4 * buffer_size,)
+    )
+    manager.num_kv_heads_per_layer = list(head_counts)
+    manager.layer_specs = None
+    if owners is not None:
+        manager.layer_specs = tuple(
+            KVCacheLayerSpec(
+                global_layer_id=layer,
+                owner=KVCacheLayerOwner(owners[layer]),
+                dtype=DataType.HALF,
+                num_kv_heads=heads,
+                head_dim=128 // heads,
+                buffer_roles=(Role.KEY, Role.VALUE),
+            )
+            for layer, heads in enumerate(head_counts)
+        )
+    manager.get_disagg_pool_view_partition = (
+        KVCacheManagerV2.get_disagg_pool_view_partition.__get__(manager)
+    )
+
+    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
+
+    assert len(views) == expected_num_views
+    if expected_num_views == 2:
+        assert [view.num_kv_heads for view in views] == list(head_counts)
+        assert [get_unique_layers(view) for view in views] == [{0}, {1}]
+        assert [view.pool_idx for view in views] == [0, 0]
+        assert [view.buffer_entries["offset"].tolist() for view in views] == [
+            [0, buffer_size],
+            [2 * buffer_size, 3 * buffer_size],
+        ]
+    else:
+        assert views[0].num_kv_heads == 2
+        assert get_unique_layers(views[0]) == {0, 1}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mapper_kind", [MapperKind.INDEXED, MapperKind.NHD])
+@pytest.mark.parametrize("internal_ids", [(0, 1), (0, 2), (2, 3)])
+@pytest.mark.parametrize("head_counts", [(2, 2), (2, 1)])
+def test_v2_builder_resolves_virtual_layer_heads(
+    mapper_kind: MapperKind, internal_ids: tuple[int, int], head_counts: tuple[int, int]
+) -> None:
+    from enum import IntEnum
+    from types import SimpleNamespace
+
+    class AttentionKind(IntEnum):
+        PRIMARY = 0
+        SHARED = 1
+
+    attrs = {
+        (layer, role): SimpleNamespace(
+            life_cycle_id=0, pool_index=0, offset=(2 * index + role_index) * 128, size=128
+        )
+        for index, layer in enumerate(internal_ids)
+        for role_index, role in enumerate((Role.KEY, Role.VALUE))
+    }
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: mapper_kind}, slot_bytes_list=(512,))
+    manager.layer_specs = None
+    manager.impl.layer_grouping = (internal_ids,)
+    manager.pp_layers = [20, 22]
+    manager.layer_offsets = {20: 0, 22: 1}
+    manager.num_kv_heads_per_layer = list(head_counts)
+    # Storage IDs can be in-range yet name a different model layer. The
+    # later alias must retain the first model layer's cache ownership.
+    manager._layer_attn_to_layer_id = {
+        (22, AttentionKind.PRIMARY): internal_ids[0],
+        (20, AttentionKind.SHARED): internal_ids[0],
+        (20, AttentionKind.PRIMARY): internal_ids[1],
+    }
+    manager.get_disagg_pool_view_partition = (
+        KVCacheManagerV2.get_disagg_pool_view_partition.__get__(manager)
+    )
+
+    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
+
+    if head_counts[0] == head_counts[1]:
+        assert len(views) == 1
+        assert get_unique_layers(views[0]) == set(internal_ids)
+        assert views[0].num_kv_heads == 2
+        assert views[0].buffer_entries["offset"].tolist() == [0, 128, 256, 384]
+    else:
+        assert len(views) == 2
+        assert [get_unique_layers(view) for view in views] == [{layer} for layer in internal_ids]
+        assert [view.num_kv_heads for view in views] == [head_counts[1], head_counts[0]]
+        assert [view.buffer_entries["offset"].tolist() for view in views] == [
+            [0, 128],
+            [256, 384],
+        ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("virtual_layers", [False, True])
+def test_v2_builder_resolves_mixed_precision_high_layer_heads(virtual_layers: bool) -> None:
+    """Each mixed-precision high layer takes the KV-head count of the layer it belongs to.
+
+    As a mixed-precision manager does, the fake appends both high layers as one layer group,
+    records them in ``mixed_precision_high_layers``, and names and partitions them with the
+    manager's own methods. With ``virtual_layers`` it also has the virtual layer mapping of its
+    own layers, as DeepSeek-V4 does.
+    """
+    from enum import IntEnum
+    from types import SimpleNamespace
+
+    class AttentionKind(IntEnum):
+        PRIMARY = 0
+
+    high_layers = (2, 3)
+    attrs = {
+        (layer, role): SimpleNamespace(
+            life_cycle_id=0, pool_index=0, offset=(2 * index + role_index) * 128, size=128
+        )
+        for index, layer in enumerate(high_layers)
+        for role_index, role in enumerate((Role.KEY, Role.VALUE))
+    }
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
+    manager.layer_specs = None
+    manager.impl.layer_grouping = (high_layers,)
+    manager.impl.init_config.layers.extend(
+        [SimpleNamespace(window_size=128), SimpleNamespace(window_size=128)]
+    )
+    manager.pp_layers = [20, 22]
+    manager.layer_offsets = {20: 0, 22: 1}
+    manager.num_kv_heads_per_layer = [8, 2]
+    manager.mixed_precision_high_layers = {0: 2, 1: 3}
+    if virtual_layers:
+        manager._layer_attn_to_layer_id = {
+            (20, AttentionKind.PRIMARY): 0,
+            (22, AttentionKind.PRIMARY): 1,
+        }
+    manager.get_disagg_global_layer_ids = (
+        KVCacheManagerV2._mixed_precision_global_layer_ids.__get__(manager)
+    )
+    manager.get_disagg_pool_view_partition = (
+        KVCacheManagerV2.get_disagg_pool_view_partition.__get__(manager)
+    )
+
+    layer_group = build_page_table_from_manager(manager).layer_groups[0]
+
+    # The high layer of model layer L is global layer 2L + 1.
+    assert [layer.global_layer_id for layer in layer_group.local_layers] == [41, 45]
+    assert [get_unique_layers(view) for view in layer_group.pool_views] == [{2}, {3}]
+    assert [view.num_kv_heads for view in layer_group.pool_views] == [8, 2]
+    assert layer_group.sliding_window_size == 128
+
+
+@pytest.mark.cpu_only
+def test_v2_builder_accepts_replicated_virtual_layer_without_head_count() -> None:
+    from types import SimpleNamespace
+
+    attrs = {
+        (0, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
+        (0, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=128, size=128),
+        (2, Role.INDEX_KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=256, size=128),
+    }
+    manager = _make_fake_v2_manager(
+        attrs,
+        {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED},
+        slot_bytes_list=(384,),
+    )
+    manager.layer_specs = None
+    manager.impl.layer_grouping = ((0, 2),)
+    manager.get_disagg_global_layer_ids = lambda _: [0, 2]
+    manager.get_disagg_pool_view_partition = (
+        KVCacheManagerV2.get_disagg_pool_view_partition.__get__(manager)
+    )
+
+    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
+
+    assert len(views) == 2
+    assert get_unique_layers(views[0]) == {0}
+    assert views[0].num_kv_heads == 1
+    assert get_unique_layers(views[1]) == {2}
+    assert views[1].mapper_kind == MapperKind.REPLICATED
+    assert views[1].num_kv_heads is None
+    assert views[1].buffer_entries["offset"].tolist() == [256]
+
+
+@pytest.mark.cpu_only
+def test_v2_builder_accepts_replicated_only_layer_group_without_head_count() -> None:
+    from types import SimpleNamespace
+
+    attrs = {
+        (2, Role.INDEX_KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
+    }
+    manager = _make_fake_v2_manager(
+        attrs,
+        {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED},
+        slot_bytes_list=(128,),
+    )
+    manager.impl.layer_grouping = ((2,),)
+    manager.impl.init_config.layers.append(SimpleNamespace(window_size=None))
+    manager.get_disagg_global_layer_ids = lambda _: [2]
+    manager.num_kv_heads_per_layer = []
+
+    layer_group = build_page_table_from_manager(manager).layer_groups[0]
+
+    assert layer_group.kv_head_num_per_rank == 0
+    assert len(layer_group.pool_views) == 1
+    assert layer_group.pool_views[0].mapper_kind == MapperKind.REPLICATED
+    assert layer_group.pool_views[0].num_kv_heads is None
+
+
+@pytest.mark.cpu_only
+def test_v2_builder_splits_mixed_heads_without_view_partition() -> None:
+    from types import SimpleNamespace
+
+    attrs = {
+        (layer, role): SimpleNamespace(
+            life_cycle_id=0, pool_index=0, offset=(2 * layer + role_index) * 128, size=128
+        )
+        for layer in range(2)
+        for role_index, role in enumerate((Role.KEY, Role.VALUE))
+    }
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
+    manager.num_kv_heads_per_layer = [2, 1]
+    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
+    assert [view.num_kv_heads for view in views] == [2, 1]
+    assert [get_unique_layers(view) for view in views] == [{0}, {1}]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("virtual_layers", [False, True])
+def test_v2_builder_resolves_mixed_precision_high_pool_heads(virtual_layers: bool) -> None:
+    from enum import IntEnum
+    from types import SimpleNamespace
+
+    class AttentionKind(IntEnum):
+        PRIMARY = 0
+        COMPRESSED = 1
+
+    high_layers = (3, 4) if virtual_layers else (2, 3)
+    attrs = {
+        (layer, role): SimpleNamespace(
+            life_cycle_id=0, pool_index=0, offset=(2 * index + role_index) * 128, size=128
+        )
+        for index, layer in enumerate(high_layers)
+        for role_index, role in enumerate((Role.KEY, Role.VALUE))
+    }
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
+    manager.impl.layer_grouping = (high_layers,)
+    manager.impl.init_config.layers = [
+        SimpleNamespace(window_size=None) for _ in range(high_layers[-1] + 1)
+    ]
+    manager.pp_layers = [20, 21]
+    manager.layer_offsets = {20: 0, 21: 1}
+    manager.num_kv_heads_per_layer = [2, 1]
+    manager.mixed_precision_high_layers = dict(enumerate(high_layers))
+    manager.get_disagg_global_layer_ids = lambda _: [41, 43]
+    if virtual_layers:
+        # Local model layer 1 owns the second high pool, while virtual storage layer 1
+        # belongs to model layer 20. Resolving the high owner through this map is wrong.
+        manager._layer_attn_to_layer_id = {
+            (20, AttentionKind.PRIMARY): 0,
+            (20, AttentionKind.COMPRESSED): 1,
+            (21, AttentionKind.PRIMARY): 2,
+        }
+
+    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
+    assert [view.num_kv_heads for view in views] == [2, 1]
+    assert [get_unique_layers(view) for view in views] == [{layer} for layer in high_layers]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("head_counts", [(0, 1), (-1, 1), (1,)])
+def test_v2_builder_rejects_unresolved_or_nonpositive_heads(head_counts: tuple[int, ...]) -> None:
+    from types import SimpleNamespace
+
+    attrs = {
+        (layer, role): SimpleNamespace(
+            life_cycle_id=0, pool_index=0, offset=(2 * layer + role_index) * 128, size=128
+        )
+        for layer in range(2)
+        for role_index, role in enumerate((Role.KEY, Role.VALUE))
+    }
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
+    manager.num_kv_heads_per_layer = list(head_counts)
+
+    with pytest.raises(ValueError, match="KV-head count"):
+        build_page_table_from_manager(manager)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("missing_owner", [False, True])
+def test_v2_builder_rejects_unresolved_virtual_layer_heads(missing_owner: bool) -> None:
+    from enum import IntEnum
+    from types import SimpleNamespace
+
+    class AttentionKind(IntEnum):
+        PRIMARY = 0
+
+    attrs = {
+        (0, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
+        (0, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=128, size=128),
+    }
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(256,))
+    manager.impl.layer_grouping = ((0,),)
+    manager.get_disagg_global_layer_ids = lambda _: [20]
+    manager._layer_attn_to_layer_id = {} if missing_owner else {(20, AttentionKind.PRIMARY): 0}
+    manager.layer_offsets = {}
+
+    with pytest.raises(ValueError, match="Cannot resolve KV-head count for internal layer 0"):
+        build_page_table_from_manager(manager)
+
+
+def test_v2_builder_splits_mixed_kind_pool_into_per_class_views():
+    """A pool coalescing several role classes yields one view per class.
+
+    Miniature of the MiniMax M3 layout at TP degrees where
+    K == V == INDEX_KEY bytes per block: V2 storage coalesces all three
+    into one pool and the slot interleaves the sparse layer's INDEX_KEY
+    between the layers' K/V regions. The builder must split the pool into
+    a NHD K/V view (non-uniform layer offsets, uniform per-layer size)
+    and a REPLICATED INDEX_KEY view covering only the sparse layer.
+    """
+    from types import SimpleNamespace
+
+    attrs = {
+        (0, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
+        (0, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=128, size=128),
+        (0, Role.INDEX_KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=256, size=128),
+        (1, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=384, size=128),
+        (1, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=512, size=128),
+    }
+    manager = _make_fake_v2_manager(
+        attrs,
+        {Role.ALL: MapperKind.NHD, Role.INDEX_KEY: MapperKind.REPLICATED},
+    )
+
+    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
+    assert len(views) == 2
+    kv_view, idx_view = views
+    # Both views address the same physical pool.
+    assert kv_view.pool_idx == idx_view.pool_idx == 0
+
+    assert kv_view.pool_role == frozenset({"key", "value"})
+    assert kv_view.mapper_kind == MapperKind.NHD
+    assert get_unique_layers(kv_view) == {0, 1}
+    assert kv_view.bytes_per_layer == 256
+    kv_starts, kv_bytes_per_layer = get_layer_byte_ranges(kv_view)
+    # Layer stride is non-uniform: INDEX_KEY interleaves after layer 0.
+    assert kv_starts == {0: 0, 1: 384}
+    assert kv_bytes_per_layer == 256
+
+    assert idx_view.pool_role == frozenset({"index_key"})
+    assert idx_view.mapper_kind == MapperKind.REPLICATED
+    assert get_unique_layers(idx_view) == {0}
+    assert idx_view.bytes_per_layer == 128
+    idx_starts, _ = get_layer_byte_ranges(idx_view)
+    assert idx_starts == {0: 256}
+
+
+def test_v2_builder_validates_role_mapper_declaration():
+    from types import SimpleNamespace
+
+    attrs = {
+        (0, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
+        (0, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=128, size=128),
+        (1, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=256, size=128),
+        (1, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=384, size=128),
+    }
+
+    # Default INDEXED declaration keeps the whole-slot HND view.
+    views = (
+        build_page_table_from_manager(_make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}))
+        .layer_groups[0]
+        .pool_views
+    )
+    assert len(views) == 1
+    assert views[0].mapper_kind == MapperKind.INDEXED
+
+    # V2 managers must expose the capability method explicitly.
+    missing_capability = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED})
+    del missing_capability.get_disagg_role_mapper_kinds
+    with pytest.raises(AttributeError, match="get_disagg_role_mapper_kinds"):
+        build_page_table_from_manager(missing_capability)
+
+    with pytest.raises(ValueError, match="must define Role.ALL"):
+        build_page_table_from_manager(
+            _make_fake_v2_manager(attrs, {Role.INDEX_KEY: MapperKind.REPLICATED})
+        )
+
+    with pytest.raises(ValueError, match="Invalid disaggregation mapper kind 'HND'"):
+        build_page_table_from_manager(_make_fake_v2_manager(attrs, {Role.ALL: "HND"}))
+
+    with pytest.raises(ValueError, match="INDEXED is only valid as the Role.ALL mapping"):
+        build_page_table_from_manager(
+            _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.NHD, Role.KEY: MapperKind.INDEXED})
+        )
+
+    # INDEXED as the Role.ALL fallback coexists with side-cache roles that
+    # declare their own kind (the base-manager default for INDEX_KEY); with
+    # no INDEX_KEY buffers registered the declaration is inert.
+    views = (
+        build_page_table_from_manager(
+            _make_fake_v2_manager(
+                attrs,
+                {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED},
+            )
+        )
+        .layer_groups[0]
+        .pool_views
+    )
+    assert len(views) == 1
+    assert views[0].mapper_kind == MapperKind.INDEXED
+
+
+@pytest.mark.cpu_only
+def test_mamba_layer_group_serialization():
+    import numpy as np
+
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        BUFFER_ENTRY_DTYPE,
+        MAMBA_CONV_ROLE,
+        MAMBA_SSM_ROLE,
+        LayerGroup,
+        LocalLayer,
+        MambaLayerGroup,
+        PhysicalPool,
+        PoolView,
+    )
+
+    sorted_lids = [0, 1, 2]
+    conv_slot_bytes = 128
+    ssm_slot_bytes = 256
+    local_layers = [
+        LocalLayer(local_layer_id=0, global_layer_id=10),
+        LocalLayer(local_layer_id=1, global_layer_id=11),
+        LocalLayer(local_layer_id=2, global_layer_id=12),
+    ]
+    pool_views = [
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(
+                [(lid, 0, conv_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_CONV_ROLE,
+            mapper_kind=MapperKind.SECTIONED,
+            bytes_per_layer=conv_slot_bytes,
+        ),
+        PoolView(
+            pool_idx=1,
+            buffer_entries=np.array(
+                [(lid, 0, ssm_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_SSM_ROLE,
+            mapper_kind=MapperKind.INDEXED,
+            bytes_per_layer=ssm_slot_bytes,
+            bytes_per_head=128,
+        ),
+    ]
+    pool_views[0].section_bytes = [512, 256, 256]
+    mlg = MambaLayerGroup(
+        pool_group_idx=1,
+        local_layers=local_layers,
+        pool_views=pool_views,
+    )
+
+    d = mlg.to_dict()
+    assert d["slot_major_layout"] is True
+    assert d["pool_views"][0]["section_bytes"] == [512, 256, 256]
+    assert d["pool_views"][1]["bytes_per_head"] == 128
+    assert d["kind"] == int(CacheKind.STATE)
+    assert "mamba_layer_offsets" not in d
+    assert "conv_section_bytes" not in d
+
+    restored = LayerGroup.from_dict(d)
+    assert isinstance(restored, MambaLayerGroup)
+    assert len(restored.pool_views) == 2
+    assert restored.pool_views[0].pool_role == MAMBA_CONV_ROLE
+    assert restored.pool_views[0].bytes_per_layer == conv_slot_bytes
+    assert restored.pool_views[0].mapper_kind == MapperKind.SECTIONED
+    assert restored.pool_views[1].pool_role == MAMBA_SSM_ROLE
+    assert restored.pool_views[1].bytes_per_layer == ssm_slot_bytes
+    assert restored.pool_views[1].mapper_kind == MapperKind.INDEXED
+    assert restored.pool_views[0].section_bytes == [512, 256, 256]
+    assert restored.pool_views[0].bytes_per_head is None
+    assert restored.pool_views[1].bytes_per_head == 128
+    assert restored.pool_views[1].section_bytes is None
+    assert [(ll.local_layer_id, ll.global_layer_id) for ll in restored.local_layers] == [
+        (0, 10),
+        (1, 11),
+        (2, 12),
+    ]
+
+    legacy_pool = PhysicalPool.from_dict({"base_address": 1000, "slot_bytes": 128, "num_slots": 10})
+    assert legacy_pool.slot_stride_bytes == legacy_pool.slot_bytes
+
+
+def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
+    """Qwen4 manager stub whose descriptors hold two life cycles.
+
+    Life cycle 0 is recurrent (layers 0 and 1): SSM and conv state coalesce
+    into one 64-byte pool in ``[ssm, conv]`` order per layer, and PLE n-gram
+    context lives in a second, 32-byte pool on ``ple_on_layer`` only. Life
+    cycle 1 is attention (layer 2) with K/V in its own pool group.
+    """
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+
+    def buf(layer_id, role):
+        return SimpleNamespace(layer_id=layer_id, role=role)
+
+    recurrent_pg = SimpleNamespace(
+        pool_group_index=0,
+        num_slots=4,
+        pools=[
+            SimpleNamespace(pool_index=0, base_address=0x10000, slot_bytes=256),
+            SimpleNamespace(pool_index=1, base_address=0x20000, slot_bytes=32),
+        ],
+        slot_desc=SimpleNamespace(
+            variants=[
+                SimpleNamespace(
+                    layer_group_id=0,
+                    coalesced_buffers=[
+                        SimpleNamespace(
+                            single_buffer_size=64,
+                            buffer_ids=[
+                                buf(0, MambaRole.SSM_STATE),
+                                buf(0, MambaRole.CONV_STATE),
+                                buf(1, MambaRole.SSM_STATE),
+                                buf(1, MambaRole.CONV_STATE),
+                            ],
+                        ),
+                        SimpleNamespace(
+                            single_buffer_size=32,
+                            buffer_ids=[buf(ple_on_layer, PLE_NGRAM_CONTEXT)],
+                        ),
+                    ],
+                )
+            ]
+        ),
+    )
+    attention_pg = SimpleNamespace(
+        pool_group_index=1,
+        num_slots=8,
+        pools=[SimpleNamespace(pool_index=0, base_address=0x30000, slot_bytes=128)],
+        slot_desc=SimpleNamespace(
+            variants=[
+                SimpleNamespace(
+                    layer_group_id=1,
+                    coalesced_buffers=[
+                        SimpleNamespace(
+                            single_buffer_size=64,
+                            buffer_ids=[buf(2, Role.KEY), buf(2, Role.VALUE)],
+                        )
+                    ],
+                )
+            ]
+        ),
+    )
+
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
+    manager.impl = SimpleNamespace(
+        layer_grouping=((0, 1), (2,)),
+        init_config=SimpleNamespace(
+            tokens_per_block=16,
+            layers=[SimpleNamespace(window_size=None) for _ in range(3)],
+        ),
+        pool_group_descs=[recurrent_pg, attention_pg],
+    )
+    manager.pp_layers = [0, 1, 2]
+    manager._mamba_layer_mask = [True, True, False]
+    manager.local_num_mamba_layers = 2
+    manager.num_kv_heads_per_layer = [1, 1, 1]
+    # conv: [8, 4] fp16 = 64 bytes as sections [2, 2, 4] * 4 * 2 = [16, 16, 32]
+    manager.conv_state_shape = [8, 4]
+    manager.conv_state_dtype = torch.float16
+    manager.conv_section_dims = [2, 2, 4]
+    # ssm: [2 heads, 4, 4] fp16 = 64 bytes, 32 bytes per head
+    manager.ssm_state_shape = [2, 4, 4]
+    manager.ssm_state_dtype = torch.float16
+    return manager
+
+
+def test_v2_builder_describes_recurrent_life_cycle_from_descriptors():
+    """Conv, SSM and PLE views all come from pool_group_descs, geometry included."""
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        MAMBA_CONV_ROLE,
+        MAMBA_SSM_ROLE,
+        AttentionLayerGroup,
+        MambaLayerGroup,
+    )
+
+    manager = _make_fake_v2_mamba_manager()
+    manager.num_kv_heads_per_layer = [0, 0, 1]
+    page_table = build_page_table_from_manager(manager)
+
+    assert len(page_table.layer_groups) == 2
+    recurrent, attention = page_table.layer_groups
+    assert isinstance(recurrent, MambaLayerGroup)
+    assert isinstance(attention, AttentionLayerGroup)
+    assert all(view.num_kv_heads is None for view in recurrent.pool_views)
+    assert attention.pool_views[0].num_kv_heads == 1
+    # The recurrent group uses the shared descriptor pool group, not a
+    # dedicated tensor-derived one, and keeps V2 layer numbering.
+    assert recurrent.pool_group_idx == 0
+    assert [(ll.local_layer_id, ll.global_layer_id) for ll in recurrent.local_layers] == [
+        (0, 0),
+        (1, 1),
+    ]
+    pools = page_table.pool_groups[recurrent.pool_group_idx].pools
+    assert (pools[0].base_address, pools[0].slot_bytes, pools[0].num_slots) == (0x10000, 256, 4)
+
+    by_role = {pv.pool_role: pv for pv in recurrent.pool_views}
+    assert set(by_role) == {
+        MAMBA_SSM_ROLE,
+        MAMBA_CONV_ROLE,
+        frozenset({str(PLE_NGRAM_CONTEXT)}),
+    }
+
+    ssm = by_role[MAMBA_SSM_ROLE]
+    assert ssm.pool_idx == 0
+    assert ssm.mapper_kind == MapperKind.INDEXED
+    assert ssm.bytes_per_layer == 64
+    assert ssm.bytes_per_head == 32
+    assert ssm.section_bytes is None
+    assert [tuple(int(x) for x in e) for e in ssm.buffer_entries] == [(0, 0, 64), (1, 128, 64)]
+
+    conv = by_role[MAMBA_CONV_ROLE]
+    assert conv.pool_idx == 0
+    assert conv.mapper_kind == MapperKind.SECTIONED
+    assert conv.bytes_per_layer == 64
+    assert conv.section_bytes == [16, 16, 32]
+    assert conv.bytes_per_head is None
+    assert [tuple(int(x) for x in e) for e in conv.buffer_entries] == [(0, 64, 64), (1, 192, 64)]
+
+    ple = by_role[frozenset({str(PLE_NGRAM_CONTEXT)})]
+    assert ple.pool_idx == 1
+    assert ple.mapper_kind == MapperKind.REPLICATED
+    assert ple.bytes_per_layer == 32
+    assert [tuple(int(x) for x in e) for e in ple.buffer_entries] == [(1, 0, 32)]
+
+    # extract_slot addresses layer regions inside the descriptor slot.
+    # (Look views up by role: PoolView.__eq__ compares numpy entries.)
+    extractor = KVRegionExtractorV1(page_table)
+    view_index = {pv.pool_role: idx for idx, pv in enumerate(recurrent.pool_views)}
+    conv_idx = view_index[MAMBA_CONV_ROLE]
+    ple_idx = view_index[frozenset({str(PLE_NGRAM_CONTEXT)})]
+    assert extractor.extract_slot(2, 0, conv_idx).memory.ptrs.tolist() == [
+        0x10000 + 2 * 256 + 64,
+        0x10000 + 2 * 256 + 192,
+    ]
+    assert extractor.extract_slot(3, 0, ple_idx).memory.ptrs.tolist() == [0x20000 + 3 * 32]
+
+    # Attention life cycle is untouched by the recurrent one.
+    assert attention.pool_group_idx == 1
+    assert [ll.global_layer_id for ll in attention.local_layers] == [2]
+
+
+def test_v2_builder_rejects_sectioned_view_in_attention_life_cycle():
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+
+    attrs = {
+        (0, Role.KEY): SimpleNamespace(pool_index=0, offset=0, size=64),
+        (0, Role.VALUE): SimpleNamespace(pool_index=0, offset=64, size=64),
+        (1, Role.KEY): SimpleNamespace(pool_index=0, offset=128, size=64),
+        (1, Role.VALUE): SimpleNamespace(pool_index=0, offset=192, size=64),
+    }
+    manager = _make_fake_v2_manager(
+        attrs,
+        {Role.ALL: MapperKind.INDEXED, Role.KEY: MapperKind.SECTIONED},
+        slot_bytes_list=(256,),
+    )
+    with pytest.raises(ValueError, match="no mapper for SECTIONED"):
+        build_page_table_from_manager(manager)
+
+
+def test_v2_builder_rejects_section_bytes_that_do_not_cover_the_layer():
+    manager = _make_fake_v2_mamba_manager()
+    manager.conv_section_dims = [2, 2, 2]  # 48 bytes, but the conv buffer is 64
+    with pytest.raises(ValueError, match="do not sum to bytes_per_layer"):
+        build_page_table_from_manager(manager)
+
+
+def test_v2_mamba_registration_uses_coalesced_physical_pool():
+    import numpy as np
+
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        BUFFER_ENTRY_DTYPE,
+        MAMBA_CONV_ROLE,
+        MAMBA_SSM_ROLE,
+        KVCachePageTable,
+        LocalLayer,
+        MambaLayerGroup,
+        PhysicalPool,
+        PhysicalPoolGroup,
+        PoolView,
+    )
+    from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
+
+    state_bytes = 64
+    num_layers = 2
+    num_slots = 8
+    # Equal-sized SSM and convolution states share one interleaved V2 pool.
+    physical_slot_bytes = state_bytes * num_layers * 2
+    physical_pool = PhysicalPool(
+        base_address=1000,
+        slot_bytes=physical_slot_bytes,
+        num_slots=num_slots,
+    )
+    sorted_lids = [0, 1]
+    local_layers = [
+        LocalLayer(local_layer_id=0, global_layer_id=1),
+        LocalLayer(local_layer_id=1, global_layer_id=2),
+    ]
+    pool_views = [
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(
+                [(lid, lid * state_bytes, state_bytes) for lid in sorted_lids],
+                dtype=BUFFER_ENTRY_DTYPE,
+            ),
+            pool_role=MAMBA_CONV_ROLE,
+            mapper_kind=MapperKind.SECTIONED,
+            bytes_per_layer=state_bytes,
+        ),
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(
+                [(lid, (num_layers + lid) * state_bytes, state_bytes) for lid in sorted_lids],
+                dtype=BUFFER_ENTRY_DTYPE,
+            ),
+            pool_role=MAMBA_SSM_ROLE,
+            mapper_kind=MapperKind.INDEXED,
+            bytes_per_layer=state_bytes,
+        ),
+    ]
+    mamba_group = MambaLayerGroup(
+        pool_group_idx=0,
+        local_layers=local_layers,
+        pool_views=pool_views,
+    )
+    page_table = KVCachePageTable(
+        tokens_per_block=16,
+        layer_groups=[mamba_group],
+        pool_groups=[PhysicalPoolGroup(pools=[physical_pool])],
+    )
+
+    # V2 interleaved: one shared pool registered once
+    assert get_unique_pool_memory_descs(page_table, device_id=3) == [
+        (1000, physical_slot_bytes * num_slots, 3, "kv_cache_memory_pool0")
+    ]
+
+
+@pytest.mark.cpu_only
+def test_mixed_page_table_serialization():
+    import numpy as np
+
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        BUFFER_ENTRY_DTYPE,
+        AttentionLayerGroup,
+        KVCachePageTable,
+        LocalLayer,
+        MambaLayerGroup,
+        PhysicalPool,
+        PhysicalPoolGroup,
+        PoolView,
+    )
+
+    # Attention layer group
+    entries = np.array(
+        [(0, 0, 256), (0, 256, 256)],
+        dtype=BUFFER_ENTRY_DTYPE,
+    )
+    attn_lg = AttentionLayerGroup(
+        pool_group_idx=0,
+        kv_head_num_per_rank=4,
+        local_layers=[LocalLayer(0, 0)],
+        pool_views=[PoolView(pool_idx=0, buffer_entries=entries)],
+    )
+
+    # Mamba layer group
+    from tensorrt_llm._torch.disaggregation.resource.page import MAMBA_CONV_ROLE, MAMBA_SSM_ROLE
+
+    mamba_sorted_lids = [0, 1]
+    mamba_local_layers = [
+        LocalLayer(local_layer_id=0, global_layer_id=1),
+        LocalLayer(local_layer_id=1, global_layer_id=2),
+    ]
+    mamba_pool_views = [
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(
+                [(lid, 0, 1024) for lid in mamba_sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_CONV_ROLE,
+            mapper_kind=MapperKind.SECTIONED,
+            bytes_per_layer=1024,
+            section_bytes=[256, 128, 128],
+        ),
+        PoolView(
+            pool_idx=1,
+            buffer_entries=np.array(
+                [(lid, 0, 2048) for lid in mamba_sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_SSM_ROLE,
+            mapper_kind=MapperKind.INDEXED,
+            bytes_per_layer=2048,
+            bytes_per_head=64,
+        ),
+    ]
+    mamba_lg = MambaLayerGroup(
+        pool_group_idx=1,
+        local_layers=mamba_local_layers,
+        pool_views=mamba_pool_views,
+    )
+
+    page_table = KVCachePageTable(
+        tokens_per_block=16,
+        layer_groups=[attn_lg, mamba_lg],
+        pool_groups=[
+            PhysicalPoolGroup(pools=[PhysicalPool(1000, 512, 10)]),
+            PhysicalPoolGroup(pools=[PhysicalPool(2000, 1024, 10), PhysicalPool(3000, 2048, 10)]),
+        ],
+    )
+
+    d = page_table.to_dict()
+    restored = KVCachePageTable.from_dict(d)
+
+    assert len(restored.layer_groups) == 2
+    assert isinstance(restored.layer_groups[0], AttentionLayerGroup)
+    assert isinstance(restored.layer_groups[1], MambaLayerGroup)
+    assert restored.layer_groups[0].kv_head_num_per_rank == 4
+    assert [
+        (ll.local_layer_id, ll.global_layer_id) for ll in restored.layer_groups[1].local_layers
+    ] == [
+        (0, 1),
+        (1, 2),
+    ]
+
+    # Verify utils work correctly with mixed page table
+    from tensorrt_llm._torch.disaggregation.resource.utils import (
+        get_layer_to_layer_group,
+        get_num_layer_groups,
+        get_num_layers,
+    )
+
+    assert get_num_layer_groups(restored) == 2
+    # get_num_layers counts only attention layers
+    assert get_num_layers(restored) == 1
+    # get_layer_to_layer_group maps only attention layers
+    layer_map = get_layer_to_layer_group(restored)
+    assert layer_map == {0: 0}
+
+
+# ---------------------------------------------------------------------------
+# Boundary tests for block_id -> primary memory-pool slot translation
+# (see kv_extractor.py / cache_reuse.py: when host offload is enabled, a
+#  block's logical ID can diverge from its primary-pool slot index after an
+#  offload+onboard cycle, and the cache transceiver must translate before
+#  doing pointer arithmetic).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.cuda
+def test_get_memory_pool_block_indices_vswa():
+    """VSWA / multi-window dispatch boundary check.
+
+    Without host offload, primary slot indices should equal block IDs
+    (no offload has happened), and the wrapper must:
+    - dispatch correctly per window_size,
+    - return non-negative pool indices that match what
+      `KVRegionExtractorV1.extract` plugs into `base_ptr + idx * slot_bytes`.
+    """
+    import torch
+
+    import tensorrt_llm
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    if not torch.cuda.is_available():
+        pytest.skip("Requires CUDA")
+
+    num_layers = 4
+    num_kv_heads = 2
+    head_dim = 64
+    tokens_per_block = 16
+    # Two distinct window sizes -> is_variable_window=True. Keep windows
+    # large enough that a short prefill keeps every block live.
+    max_attention_window_vec = [128] * 2 + [256] * 2
+
+    kv_cache_config = KvCacheConfig(
+        max_tokens=512,
+        free_gpu_memory_fraction=0.1,
+        max_attention_window=max_attention_window_vec,
+        enable_block_reuse=False,
+        host_cache_size=0,
+    )
+    mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1, gpus_per_node=1)
+
+    manager = KVCacheManager(
+        kv_cache_config=kv_cache_config,
+        kv_cache_type=CacheTypeCpp.SELF,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max(max_attention_window_vec),
+        max_batch_size=2,
+        mapping=mapping,
+        dtype=DataType.HALF,
+    )
+
+    try:
+        # Drive a small prefill so the manager has resident blocks.
+        sampling_params = SamplingParams()
+        req = LlmRequest(
+            request_id=0,
+            max_new_tokens=1,
+            input_tokens=list(range(tokens_per_block * 3)),
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                sampling_params._get_sampling_config()
+            ),
+            is_streaming=False,
+        )
+        manager.impl.add_sequence_batch([(req.py_request_id, req.prompt_len, 1)], [req])
+
+        # For each unique window, look up that window's first layer to fetch
+        # its block IDs, then translate and confirm the pool-slot indices
+        # match what KVRegionExtractorV1.extract would compute against
+        # the live primary pool.
+        unique_windows = sorted(set(max_attention_window_vec))
+        assert len(unique_windows) >= 2, "Test premise: at least 2 windows"
+
+        for w in unique_windows:
+            # Pick the first layer whose window matches.
+            layer_idx = max_attention_window_vec.index(w)
+            block_ids = manager.get_batch_cache_indices([req.py_request_id], layer_idx=layer_idx)[0]
+            assert len(block_ids) > 0, f"prefill should populate window={w}"
+
+            translated = manager.get_memory_pool_block_indices(block_ids, window_size=w)
+            assert len(translated) == len(block_ids)
+            assert all(idx >= 0 for idx in translated), (
+                f"primary pool slot indices must be >= 0, got {translated}"
+            )
+
+            # Without host offload the translation is identity. This locks
+            # the no-offload contract — if a future change introduces a
+            # gratuitous remapping, this test will catch it.
+            assert list(translated) == list(block_ids)
+
+        # Note: with two distinct windows the underlying primary pools may
+        # share a slot index *value* across windows but they live in
+        # different pools, so we do not assert distinctness across windows.
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.cuda
+def test_get_memory_pool_block_indices_with_offload_onboard():
+    """Offload -> onboard -> transfer cycle.
+
+    What this test proves:
+      1. While a block IS primary, its block ID can still differ from
+         its primary-pool slot (primary-side divergence). This happens
+         because block IDs are allocated globally (req_b's blocks get
+         IDs 4-7 after req_a took 0-3), but primary-pool slots are
+         recycled (req_a's freed slots 0-3 get reused for req_b's new
+         blocks). Without translation, the disagg sender would
+         compute `base + 4 * slot_bytes` and read past the end of a
+         4-block primary pool — the exact pointer-arithmetic bug this
+         fix addresses.
+      2. Translation aborts on offloaded blocks with the documented
+         "Block is not in the primary pool" message — the disagg cache
+         transceiver relies on this to refuse host-pool transfers.
+      3. After reuse-driven onboard, all blocks are primary again and
+         pointers computed from the translated slot indices match
+         `primary_pool_base + slot_idx * slot_bytes`.
+    """
+    import torch
+
+    import tensorrt_llm
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm.bindings.internal.testing import (
+        simulate_prefill_completion_only_use_for_testing,
+    )
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    if not torch.cuda.is_available():
+        pytest.skip("Requires CUDA")
+
+    tokens_per_block = 16
+    # Tight primary capacity (~4 blocks) + plenty of host space (~32 blocks)
+    # so eviction must spill to host rather than free outright.
+    kv_cache_config = KvCacheConfig(
+        max_tokens=tokens_per_block * 4,
+        free_gpu_memory_fraction=0.1,
+        enable_block_reuse=True,
+        enable_partial_reuse=True,
+        copy_on_partial_reuse=False,
+        host_cache_size=tokens_per_block * 32 * 2 * 2 * 2 * 64,  # generous host pool
+    )
+    mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1, gpus_per_node=1)
+
+    manager = KVCacheManager(
+        kv_cache_config=kv_cache_config,
+        kv_cache_type=CacheTypeCpp.SELF,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=64,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=tokens_per_block * 4,
+        max_batch_size=4,
+        mapping=mapping,
+        dtype=DataType.HALF,
+    )
+
+    try:
+        # Skip cleanly if the build/test env didn't actually allocate a
+        # secondary pool (e.g. host_cache_size rounded to 0). Without it,
+        # this test cannot exercise the offload path.
+        if getattr(manager, "blocks_in_secondary_pool", 0) <= 0:
+            pytest.skip(
+                "secondary (host) pool not allocated in this build; "
+                "offload/onboard path cannot be exercised"
+            )
+
+        def _run(req_id, tokens):
+            sampling_params = SamplingParams()
+            req = LlmRequest(
+                request_id=req_id,
+                max_new_tokens=1,
+                input_tokens=list(tokens),
+                sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                    sampling_params._get_sampling_config()
+                ),
+                is_streaming=False,
+            )
+            manager.impl.add_sequence_batch([(req.py_request_id, req.prompt_len, 1)], [req])
+            return req
+
+        window = manager.max_attention_window_vec[0]
+
+        # Warm: take blocks for a 4-block prefill, capture its block_ids,
+        # then commit to reuse so they live in the radix tree (eligible
+        # for offload, not freed outright).
+        prefill_tokens_a = list(range(tokens_per_block * 4))
+        req_a = _run(0, prefill_tokens_a)
+        block_ids_a = manager.get_batch_cache_indices([req_a.py_request_id], layer_idx=0)[0]
+        # Translation is the identity at this point — block_ids equal
+        # primary slot indices because nothing has been offloaded yet.
+        original_indices = manager.get_memory_pool_block_indices(block_ids_a, window_size=window)
+        assert list(original_indices) == list(block_ids_a)
+        simulate_prefill_completion_only_use_for_testing(req_a)
+        manager.free_resources(req_a)
+
+        # Pressure: bring in a brand-new request that needs more primary
+        # blocks than are currently free, forcing eviction of req_a's
+        # cached prefix to the host pool.
+        prefill_tokens_b = list(range(10_000, 10_000 + tokens_per_block * 4))
+        req_b = _run(1, prefill_tokens_b)
+
+        # Primary-side divergence: req_b's block IDs are allocated fresh
+        # (typically 4..7 since req_a took 0..3 from the radix tree), but
+        # the primary-pool slots are recycled from req_a's freed slots
+        # (0..3). So even though every req_b block is currently primary,
+        # `block_id != slot` for every one of them. This is the most
+        # visible failure mode of the pre-fix code: the disagg sender
+        # would compute `base + block_id_b * slot_bytes` and walk off the
+        # end of a 4-block primary pool.
+        block_ids_b = list(manager.get_batch_cache_indices([req_b.py_request_id], layer_idx=0)[0])
+        slots_b = list(manager.get_memory_pool_block_indices(block_ids_b, window_size=window))
+        primary_diverged = [(b, s) for b, s in zip(block_ids_b, slots_b) if b != s]
+        assert primary_diverged, (
+            f"expected req_b's block_ids to differ from its primary slots "
+            f"(block IDs allocate forward, primary slots recycle); got "
+            f"identity mapping block_ids={block_ids_b}, slots={slots_b}"
+        )
+
+        # Translation must abort for any offloaded block — this is the policy
+        # the disagg cache transceiver relies on (otherwise the sender would
+        # compute garbage pointers against host-pool blocks).
+        any_non_primary = False
+        for bid in block_ids_a:
+            try:
+                manager.get_memory_pool_block_indices([int(bid)], window_size=window)
+            except RuntimeError as exc:
+                assert "Block is not in the primary pool" in str(exc), (
+                    f"unexpected error message: {exc}"
+                )
+                any_non_primary = True
+        # If the eviction policy ended up keeping every prefix block in
+        # primary (small possibility under fragmentation), we cannot
+        # observe the offload assertion — skip the negative leg.
+        if not any_non_primary:
+            pytest.skip("no req_a block was offloaded under this build's eviction policy")
+
+        # Onboard back: re-issue req_a with the same prompt. Reuse will
+        # bring its blocks back to primary, possibly at *different*
+        # primary slots than before.
+        simulate_prefill_completion_only_use_for_testing(req_b)
+        manager.free_resources(req_b)
+
+        req_a2 = _run(2, prefill_tokens_a)
+        block_ids_a2 = manager.get_batch_cache_indices([req_a2.py_request_id], layer_idx=0)[0]
+        # After reuse-driven onboard, every block must be primary again
+        # (translation succeeds); its primary slot may differ from the
+        # logical block ID because onboard swaps slots in-place.
+        translated_a2 = manager.get_memory_pool_block_indices(block_ids_a2, window_size=window)
+        assert all(idx >= 0 for idx in translated_a2)
+
+        simulate_prefill_completion_only_use_for_testing(req_a2)
+        manager.free_resources(req_a2)
+    finally:
+        manager.shutdown()

@@ -1,0 +1,841 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import json
+import os
+from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
+from typing import List, Optional
+from unittest.mock import patch
+
+import pytest
+import torch
+import transformers
+from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
+from transformers import Qwen3_5ForConditionalGeneration as HFQwen3_5ForConditionalGeneration
+from utils.llm_data import llm_models_root
+from utils.util import skip_pre_hopper
+
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models import Qwen3_5ForCausalLM, Qwen3_5VLModel
+from tensorrt_llm._torch.models.checkpoints.auto_mapper import AutoCheckpointMapper
+from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
+from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
+from tensorrt_llm._torch.models.modeling_qwen3_5 import (
+    _lm_head_nvfp4_enabled,
+    _normalize_qwen35_quant_config_dict,
+    _normalize_qwen35_vl_config,
+)
+from tensorrt_llm._torch.pyexecutor.config_utils import (
+    extract_mamba_kv_cache_params,
+    load_pretrained_config,
+)
+from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader as TorchModelLoader
+from tensorrt_llm._torch.pyexecutor.model_loader import (
+    _construct_checkpoint_loader,
+    validate_and_set_mamba_ssm_cache_dtype,
+)
+from tensorrt_llm.inputs import ContentFormat
+from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+from tensorrt_llm.llmapi.llm_args import Nvfp4GemmConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_utils import (
+    ModelLoader,
+    _resolve_kv_cache_manager_v2_auto,
+    apply_model_defaults_to_llm_args,
+)
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
+
+# Dense sibling of test_modeling_qwen3_5_vl_moe.py. The dense Qwen3.5-VL
+# (Qwen/Qwen3.5-27B, arch Qwen3_5ForConditionalGeneration, model_type qwen3_5)
+# reuses the same hybrid Qwen3Next runtime as the MoE variant, differing only in
+# the feed-forward block (GatedMLP instead of SparseMoeBlock). This file mirrors
+# the MoE routing + parity tests with a dense synthetic config.
+#
+# Two dense-specific differences from the MoE config:
+#   - No MoE fields (num_experts / moe_intermediate_size / ...); a native
+#     `intermediate_size` is present and must be preserved by the normalizer
+#     (the Qwen3Next-alias synthesis is a no-op for dense).
+#   - `deepstack_visual_indexes: []` matches the real dense checkpoint (as it
+#     does for the MoE one — the Qwen3.5 family dropped Qwen3-VL's deepstack).
+#     `use_deepstack` stays truthy via `hasattr`, but
+#     `deepstack_num_level == 0` makes the split a no-op.
+#   - `attn_output_gate: true` mirrors the real config and matches TRT-LLM's
+#     Qwen3NextAttention, which hardcodes output gating.
+
+
+def _write_qwen35_dense_vl_config(tmp_path: Path, **extra_config) -> Path:
+    config = {
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "image_token_id": 248056,
+        "model_type": "qwen3_5",
+        "text_config": {
+            "attention_bias": False,
+            "attention_dropout": 0.0,
+            "attn_output_gate": True,
+            "dtype": "bfloat16",
+            "eos_token_id": 248044,
+            "full_attention_interval": 4,
+            "head_dim": 256,
+            "hidden_act": "silu",
+            "hidden_size": 2048,
+            "intermediate_size": 2048,
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_value_head_dim": 128,
+            "mamba_ssm_dtype": "float32",
+            "max_position_embeddings": 262144,
+            "mlp_only_layers": [],
+            "model_type": "qwen3_5_text",
+            "num_attention_heads": 16,
+            "num_hidden_layers": 2,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-6,
+            "rope_parameters": {
+                "mrope_interleaved": True,
+                "mrope_section": [11, 11, 10],
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 10000000.0,
+                "rope_type": "default",
+            },
+            "use_cache": True,
+            "vocab_size": 248320,
+        },
+        "tie_word_embeddings": False,
+        "video_token_id": 248057,
+        "vision_config": {
+            "deepstack_visual_indexes": [],
+            "depth": 2,
+            "hidden_act": "gelu_pytorch_tanh",
+            "hidden_size": 1152,
+            "in_channels": 3,
+            "intermediate_size": 4304,
+            "model_type": "qwen3_5",
+            "num_heads": 16,
+            "num_position_embeddings": 2304,
+            "out_hidden_size": 2048,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+        },
+        "vision_end_token_id": 248054,
+        "vision_start_token_id": 248053,
+        **extra_config,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    return tmp_path
+
+
+def test_qwen35_dense_vl_config_preserves_vlm_architecture(
+    tmp_path: Path,
+) -> None:
+    config = load_pretrained_config(str(_write_qwen35_dense_vl_config(tmp_path)))
+
+    assert isinstance(config, transformers.Qwen3_5Config)
+    assert config.architectures == ["Qwen3_5ForConditionalGeneration"]
+    assert config.text_config.architectures == ["Qwen3_5ForCausalLM"]
+    # Dense: native intermediate_size is preserved (no MoE synthesis).
+    assert config.text_config.intermediate_size == 2048
+    assert getattr(config.text_config, "num_experts", 0) in (0, None)
+    # Qwen3.5 family contract: deepstack stays disabled (empty) — both real
+    # checkpoints (dense 27B and MoE 35B-A3B) publish []. Normalization must
+    # not synthesize indices; the placeholder path depends on this staying
+    # empty (see re-greening item D in the MoE testing-notes doc).
+    assert config.vision_config.deepstack_visual_indexes == []
+    assert config.text_config.rope_theta == 10000000.0
+    assert config.text_config.partial_rotary_factor == 0.25
+    assert config.text_config.rope_scaling["type"] == "mrope"
+    assert config.text_config.rope_scaling["mrope_section"] == [11, 11, 10]
+    # mrope_interleaved must survive normalization: the fused QK-norm-RoPE op
+    # gates the mRoPE path on it, and without it position_ids gets flattened
+    # to 3*num_tokens and mismatches the QKV token count.
+    assert config.text_config.rope_scaling["mrope_interleaved"] is True
+    assert config.text_config.mamba_ssm_dtype == "float32"
+    assert config.get_text_config() is config.text_config
+
+
+def test_qwen35_dense_vl_resolves_mamba_ssm_cache_dtype(
+    tmp_path: Path,
+) -> None:
+    config = load_pretrained_config(str(_write_qwen35_dense_vl_config(tmp_path)))
+    model_config = ModelConfig(pretrained_config=config)
+
+    # "auto" keeps the SSM cache in the model weights dtype for performance:
+    # the checkpoint's mamba_ssm_dtype=float32 expresses SSM compute intent,
+    # and honoring it for cache allocation disables the FlashInfer bf16-state
+    # GDN decode kernel and doubles state memory traffic.
+    validate_and_set_mamba_ssm_cache_dtype(model_config, "auto")
+    assert model_config.quant_config.mamba_ssm_cache_dtype is torch.bfloat16
+
+    mamba_params = extract_mamba_kv_cache_params(
+        config.text_config,
+        quant_config=model_config.quant_config,
+    )
+    assert mamba_params.dtype is torch.bfloat16
+    assert mamba_params.mamba_ssm_cache_dtype is torch.bfloat16
+
+    # Explicit opt-in honors the checkpoint's fp32 SSM state intent.
+    opt_in_config = ModelConfig(pretrained_config=config)
+    validate_and_set_mamba_ssm_cache_dtype(opt_in_config, "float32")
+    assert opt_in_config.quant_config.mamba_ssm_cache_dtype is torch.float32
+
+
+# Qwen3.6/3.8-27B checkpoints (and fine-tunes such as Qwen-Image-Bench) publish
+# `language_model_only: false`; they must still load through the generic wrapper.
+@pytest.mark.parametrize("extra_config", [{}, {"language_model_only": False}])
+def test_qwen35_dense_vl_resolves_model_and_mapper(tmp_path: Path, extra_config: dict) -> None:
+    config = load_pretrained_config(str(_write_qwen35_dense_vl_config(tmp_path, **extra_config)))
+    model_config = ModelConfig(pretrained_config=config)
+
+    assert config.architectures == ["Qwen3_5ForConditionalGeneration"]
+    model_cls = AutoModelForCausalLM._resolve_class(model_config)
+    assert model_cls is Qwen3_5VLModel
+    assert model_cls.supports_encoder_cache
+    assert isinstance(
+        AutoCheckpointMapper.get("HF", "Qwen3_5ForConditionalGeneration"),
+        Qwen3_5MoeHfWeightMapper,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("quant_algo", "sm_version", "use_marlin"),
+    [
+        pytest.param(QuantAlgo.NVFP4, 90, True, id="hopper-nvfp4"),
+        pytest.param(QuantAlgo.MIXED_PRECISION, 90, True, id="hopper-mixed-precision"),
+        pytest.param(QuantAlgo.NVFP4, 89, True, id="ada-nvfp4"),
+        pytest.param(QuantAlgo.FP8, 90, False, id="hopper-fp8"),
+        pytest.param(QuantAlgo.NVFP4, 100, False, id="blackwell-nvfp4"),
+        pytest.param(QuantAlgo.MIXED_PRECISION, 120, False, id="sm120-mixed-precision"),
+    ],
+)
+def test_qwen35_dense_model_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    quant_algo: QuantAlgo,
+    sm_version: int,
+    use_marlin: bool,
+) -> None:
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
+        lambda: sm_version,
+    )
+
+    expected_gemm_backends = ["marlin"] if use_marlin else Nvfp4GemmConfig().allowed_backends
+    for model_cls in (Qwen3_5ForCausalLM, Qwen3_5VLModel):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        llm_args.quant_config = QuantConfig(quant_algo=quant_algo)
+        defaults = model_cls.get_model_defaults(llm_args)
+        apply_model_defaults_to_llm_args(llm_args, defaults)
+        _resolve_kv_cache_manager_v2_auto(llm_args, model_cls)
+
+        assert llm_args.kv_cache_config.enable_block_reuse is False
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+        assert llm_args.nvfp4_gemm_config.allowed_backends == expected_gemm_backends
+        assert llm_args.moe_config.backend == "AUTO"
+
+
+@pytest.mark.cpu_only
+def test_qwen35_dense_model_defaults_keep_explicit_backends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
+        lambda: 90,
+    )
+
+    for model_cls in (Qwen3_5ForCausalLM, Qwen3_5VLModel):
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model", nvfp4_gemm_config={"allowed_backends": ["cublaslt"]}
+        )
+        llm_args.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+        apply_model_defaults_to_llm_args(llm_args, model_cls.get_model_defaults(llm_args))
+
+        assert llm_args.nvfp4_gemm_config.allowed_backends == ["cublaslt"]
+
+
+def _qwen38_layers(*suffixes: str) -> List[str]:
+    return [f"model.language_model.layers.{i}.{suffix}" for i in (0, 1) for suffix in suffixes]
+
+
+# hf_quant_config.json of RadixArk/Qwen3.8-27B-NVFP4 (rev 319f741c) and
+# Inferact/Qwen3.8-27B-NVFP4 (rev 6128240e), cut to the two layers of the
+# synthetic config above.
+_QWEN38_27B_NVFP4_HF_QUANT_CONFIGS = {
+    "radixark-mixed-precision": {
+        "producer": {"name": "modelopt", "version": "0.47.0.dev0"},
+        "quantization": {
+            "quant_algo": "MIXED_PRECISION",
+            "kv_cache_quant_algo": "FP8",
+            "quantized_layers": {
+                **{
+                    name: {"quant_algo": "FP8"}
+                    for name in _qwen38_layers(
+                        "linear_attn.out_proj", "linear_attn.in_proj_qkv", "linear_attn.in_proj_z"
+                    )
+                },
+                **{
+                    name: {"quant_algo": "NVFP4", "group_size": 16}
+                    for name in _qwen38_layers("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+                },
+                "lm_head": {"quant_algo": "NVFP4", "group_size": 16},
+            },
+            "exclude_modules": ["mtp*", "mtp.layers.0*"],
+        },
+    },
+    "inferact-nvfp4": {
+        "producer": {"name": "modelopt", "version": "0.0.1.dev1+ga21173a4d"},
+        "quantization": {
+            "exclude_modules": [
+                "lm_head",
+                "model.language_model.embed_tokens",
+                *_qwen38_layers(
+                    "linear_attn.conv1d",
+                    "linear_attn.in_proj_a",
+                    "linear_attn.in_proj_b",
+                    "linear_attn.in_proj_qkv",
+                    "linear_attn.in_proj_z",
+                ),
+                "model.visual*",
+                "mtp*",
+            ],
+            "group_size": 16,
+            "kv_cache_quant_algo": None,
+            "quant_algo": "NVFP4",
+        },
+    },
+}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "hf_quant_config",
+    list(_QWEN38_27B_NVFP4_HF_QUANT_CONFIGS.values()),
+    ids=list(_QWEN38_27B_NVFP4_HF_QUANT_CONFIGS),
+)
+@pytest.mark.parametrize(
+    ("llm_kwargs", "expected_gemm_backends"),
+    [
+        pytest.param({}, ["marlin"], id="default"),
+        pytest.param(
+            {"nvfp4_gemm_config": {"allowed_backends": ["cublaslt"]}}, ["cublaslt"], id="explicit"
+        ),
+    ],
+)
+def test_qwen38_nvfp4_checkpoint_load_applies_hopper_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hf_quant_config: dict,
+    llm_kwargs: dict,
+    expected_gemm_backends: List[str],
+) -> None:
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
+        lambda: 90,
+    )
+    checkpoint_dir = _write_qwen35_dense_vl_config(tmp_path, language_model_only=False)
+    (checkpoint_dir / "hf_quant_config.json").write_text(
+        json.dumps(hf_quant_config), encoding="utf-8"
+    )
+
+    llm_args = TorchLlmArgs(model=str(checkpoint_dir), **llm_kwargs)
+    assert ModelLoader(llm_args)._update_from_hf_quant_config() is True
+    assert llm_args.quant_config.quant_algo == hf_quant_config["quantization"]["quant_algo"]
+
+    checkpoint_loader = _construct_checkpoint_loader(
+        llm_args.checkpoint_loader,
+        llm_args.checkpoint_format,
+        mx_config=llm_args.mx_config,
+        checkpoint_io_policy=llm_args.checkpoint_io_policy,
+        load_format=llm_args.load_format,
+        partial_model_loading=llm_args.is_partial_model_loading,
+    )
+    TorchModelLoader.load_config_and_apply_defaults(
+        str(checkpoint_dir), llm_args, checkpoint_loader
+    )
+
+    assert llm_args.nvfp4_gemm_config.allowed_backends == expected_gemm_backends
+    assert llm_args.moe_config.backend == "AUTO"
+
+
+@pytest.mark.parametrize("sm_version", [90, 100, 103, 120, 121])
+def test_qwen35_dense_vl_normalizes_native_nvfp4_mlp_paths(sm_version: int) -> None:
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(num_hidden_layers=64),
+        quant_config_dict={
+            f"model.language_model.layers.0.mlp.{proj}": QuantConfig(quant_algo=QuantAlgo.NVFP4)
+            for proj in ("gate_proj", "up_proj", "down_proj")
+        },
+    )
+
+    with patch(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
+        return_value=sm_version,
+    ):
+        _normalize_qwen35_quant_config_dict(model_config)
+
+    assert set(model_config.quant_config_dict) == {
+        f"model.layers.0.mlp.mlp.{proj}" for proj in ("gate_proj", "up_proj", "down_proj")
+    }
+    assert all(
+        config.quant_algo == QuantAlgo.NVFP4 for config in model_config.quant_config_dict.values()
+    )
+
+
+@pytest.mark.parametrize(
+    ("sm_version", "expected_algo"),
+    [
+        (90, QuantAlgo.W4A16_NVFP4),
+        (100, QuantAlgo.NVFP4),
+        (103, QuantAlgo.NVFP4),
+        (120, QuantAlgo.W4A16_NVFP4),
+        (121, QuantAlgo.W4A16_NVFP4),
+    ],
+)
+def test_qwen35_dense_vl_preserves_w4a16_nvfp4_behavior(
+    sm_version: int, expected_algo: QuantAlgo
+) -> None:
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(num_hidden_layers=64),
+        quant_config_dict={
+            "model.language_model.layers.0.mlp.gate_proj": QuantConfig(
+                quant_algo=QuantAlgo.W4A16_NVFP4
+            )
+        },
+    )
+
+    with patch(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
+        return_value=sm_version,
+    ):
+        _normalize_qwen35_quant_config_dict(model_config)
+
+    config = model_config.quant_config_dict["model.layers.0.mlp.mlp.gate_proj"]
+    assert config.quant_algo == expected_algo
+
+
+@pytest.mark.parametrize("sm_version", [100, 103])
+@pytest.mark.cpu_only
+def test_qwen35_dense_vl_keeps_w4a16_nvfp4_for_32_element_blocks(sm_version: int) -> None:
+    """32-element weight-only scale blocks cannot feed the W4A4 NVFP4 GEMMs, so
+    the SM100/103 promotion must leave dense MLP entries on the W4A16 path
+    and send lm_head through load-time bf16 dequantization. The dense Qwen3.5-27B checkpoint (recipe
+    nvfp4_mlp_weight_only) has no MoE experts, and the MoE methods reject
+    group_size=32 outright, so only dense Linear paths are exercised here."""
+    cfg = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4, group_size=32)
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(num_hidden_layers=64, vocab_size=248320),
+        mapping=Mapping(),
+        quant_config_dict={
+            "model.language_model.layers.0.mlp.gate_proj": cfg,
+            "lm_head": cfg,
+        },
+    )
+
+    with patch(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version",
+        return_value=sm_version,
+    ):
+        keep_lm_head_quant = _lm_head_nvfp4_enabled(model_config)
+        assert not keep_lm_head_quant
+        _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=keep_lm_head_quant)
+
+    assert set(model_config.quant_config_dict) == {"model.layers.0.mlp.mlp.gate_proj"}
+    assert all(
+        config.quant_algo == QuantAlgo.W4A16_NVFP4 and config.group_size == 32
+        for config in model_config.quant_config_dict.values()
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_version", [100, 103, 120])
+@pytest.mark.parametrize("group_size", [16, 32])
+def test_qwen35_lm_head_requires_native_nvfp4_blocks(sm_version: int, group_size: int) -> None:
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(num_hidden_layers=64, vocab_size=248320),
+        mapping=Mapping(),
+        quant_config_dict={
+            "lm_head": QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4, group_size=group_size),
+        },
+    )
+    with patch(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version", return_value=sm_version
+    ):
+        keep = _lm_head_nvfp4_enabled(model_config)
+        assert keep is (group_size == 16)
+        _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=keep)
+    assert ("lm_head" in model_config.quant_config_dict) is keep
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_version", [90, 100, 103, 120])
+def test_qwen35_rejects_32_element_experts_before_promotion(sm_version: int) -> None:
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(num_hidden_layers=64),
+        quant_config_dict={
+            "model.language_model.layers.0.mlp.experts": QuantConfig(
+                quant_algo=QuantAlgo.W4A16_NVFP4, group_size=32
+            ),
+        },
+    )
+    with (
+        patch(
+            "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version", return_value=sm_version
+        ),
+        pytest.raises(ValueError, match="for layer 'model.layers.0.mlp.experts'"),
+    ):
+        _normalize_qwen35_quant_config_dict(model_config)
+
+
+@pytest.mark.parametrize("group_size", [16, 32])
+@pytest.mark.cpu_only
+def test_qwen35_mapper_dequantizes_lm_head_nvfp4_by_scale_shape(group_size: int) -> None:
+    """The bf16 lm_head fallback infers the scale block width from ``weight_scale``,
+    so 32-element weight-only exports dequantize correctly, and a scale shape that
+    does not divide the input width is rejected."""
+    out_features, in_features = 2, 64
+    mapper = SimpleNamespace(
+        config=SimpleNamespace(
+            quant_config_dict={},
+            pretrained_config=SimpleNamespace(torch_dtype=torch.float32),
+        ),
+        _E2M1_VALUES=Qwen3_5MoeHfWeightMapper._E2M1_VALUES,
+    )
+    torch.manual_seed(0)
+    packed = torch.randint(0, 256, (out_features, in_features // 2), dtype=torch.uint8)
+    num_groups = in_features // group_size
+    # Distinct, exactly representable E4M3 values so a mis-mapped block shows up.
+    block_scale = (
+        torch.arange(1, out_features * num_groups + 1, dtype=torch.float32)
+        .view(out_features, num_groups)
+        .to(torch.float8_e4m3fn)
+    )
+    global_scale = torch.tensor(0.5, dtype=torch.float32)
+    weights = {
+        "lm_head.weight": packed,
+        "lm_head.weight_scale": block_scale,
+        "lm_head.weight_scale_2": global_scale,
+        "lm_head.input_scale": torch.tensor(1.0),
+        "model.norm.weight": torch.ones(4),
+    }
+
+    result = Qwen3_5MoeHfWeightMapper._dequantize_lm_head_nvfp4(mapper, weights)
+
+    lut = torch.tensor(Qwen3_5MoeHfWeightMapper._E2M1_VALUES, dtype=torch.float32)
+    expected = torch.empty(out_features, in_features)
+    expected[:, 0::2] = lut[(packed & 0x0F).long()]
+    expected[:, 1::2] = lut[(packed >> 4).long()]
+    expected = expected.view(out_features, num_groups, group_size) * (
+        block_scale.float() * global_scale
+    ).unsqueeze(-1)
+    assert set(result) == {"lm_head.weight", "model.norm.weight"}
+    torch.testing.assert_close(result["lm_head.weight"], expected.view(out_features, in_features))
+
+    # Three scale groups cannot tile 64 inputs regardless of the block width.
+    bad_scale = torch.ones(out_features, 3, dtype=torch.float32).to(torch.float8_e4m3fn)
+    with pytest.raises(AssertionError, match="3 groups for 64 inputs"):
+        Qwen3_5MoeHfWeightMapper._dequantize_lm_head_nvfp4(
+            mapper, {**weights, "lm_head.weight_scale": bad_scale}
+        )
+
+
+def test_qwen35_dense_vl_leaves_fp8_mlp_paths_unchanged() -> None:
+    name = "model.language_model.layers.0.mlp.gate_proj"
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(num_hidden_layers=64),
+        quant_config_dict={name: QuantConfig(quant_algo=QuantAlgo.FP8)},
+    )
+
+    _normalize_qwen35_quant_config_dict(model_config)
+
+    assert model_config.quant_config_dict == {
+        "model.layers.0.mlp.gate_proj": QuantConfig(quant_algo=QuantAlgo.FP8)
+    }
+
+
+def test_qwen35_dense_vl_disable_mm_encoder_skips_vision_tower(
+    tmp_path: Path,
+) -> None:
+    """disable_mm_encoder must not instantiate the vision encoder (nvbug
+    6405760: the tower's GPU memory shrank the KV cache pool for text-only
+    serving of VLM checkpoints)."""
+    config = load_pretrained_config(str(_write_qwen35_dense_vl_config(tmp_path)))
+    model_config = ModelConfig(pretrained_config=config, disable_mm_encoder=True)
+    with torch.device("cuda"):
+        model = Qwen3_5VLModel(model_config)
+
+    assert model.mm_encoder is None
+    assert not any("mm_encoder" in name for name, _ in model.named_parameters())
+
+
+def test_qwen35_dense_vl_default_keeps_vision_tower(tmp_path: Path) -> None:
+    config = load_pretrained_config(str(_write_qwen35_dense_vl_config(tmp_path)))
+    model_config = ModelConfig(pretrained_config=config)
+    with torch.device("cuda"):
+        model = Qwen3_5VLModel(model_config)
+
+    assert model.mm_encoder is not None
+    assert any("mm_encoder" in name for name, _ in model.named_parameters())
+
+
+def test_qwen35_dense_vl_placeholder_metadata_registered() -> None:
+    metadata = MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder_metadata("qwen3_5")
+
+    assert metadata.placeholder_map == {
+        "image": "<|vision_start|><|image_pad|><|vision_end|>",
+        "video": "<|vision_start|><|video_pad|><|vision_end|>",
+    }
+    assert metadata.placeholders_separator == ""
+    assert metadata.content_format is ContentFormat.STRING
+
+
+# --- Layered parity test scaffold -------------------------------------------
+#
+# Tiny synthetic config used by TestQwen3_5VL below. Same architecture as the
+# real Qwen/Qwen3.5-27B checkpoint but with much smaller dimensions. The shape
+# constraints are identical to the MoE parity config (see
+# test_modeling_qwen3_5_vl_moe.py) except:
+#
+#   - dense MLP: native `intermediate_size` (no MoE fields), so Qwen3NextModel
+#     selects GatedMLP for the feed-forward layers.
+#   - `deepstack_visual_indexes=[]` matches the real dense checkpoint (same
+#     as the MoE parity config — the Qwen3.5 family dropped deepstack);
+#     `depth=2` keeps the tower tiny since nothing pins its depth, and the
+#     config exercises the `deepstack_num_level == 0` no-op path.
+#
+# `_name_or_path` points at the real checkpoint dir so the test can load the
+# tokenizer/processor (only the processor; not the full model weights).
+QWEN3_5_VL_DENSE_PARITY_CONFIG = {
+    "architectures": ["Qwen3_5ForConditionalGeneration"],
+    "image_token_id": 248056,
+    "model_type": "qwen3_5",
+    "text_config": {
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "attn_output_gate": True,
+        "dtype": "bfloat16",
+        "eos_token_id": 248044,
+        "full_attention_interval": 2,
+        "head_dim": 256,
+        "hidden_act": "silu",
+        "hidden_size": 2048,
+        "intermediate_size": 2048,
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 128,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32,
+        "linear_value_head_dim": 128,
+        "mamba_ssm_dtype": "float32",
+        "max_position_embeddings": 8192,
+        "mlp_only_layers": [],
+        "model_type": "qwen3_5_text",
+        "num_attention_heads": 16,
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 2,
+        "rms_norm_eps": 1e-6,
+        "rope_parameters": {
+            "mrope_interleaved": True,
+            "mrope_section": [11, 11, 10],
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 10000000.0,
+            "rope_type": "default",
+        },
+        "use_cache": True,
+        "vocab_size": 248320,
+    },
+    "tie_word_embeddings": False,
+    "video_token_id": 248057,
+    "vision_config": {
+        "deepstack_visual_indexes": [],
+        "depth": 2,
+        "hidden_act": "gelu_pytorch_tanh",
+        "hidden_size": 1152,
+        "in_channels": 3,
+        "initializer_range": 0.02,
+        "intermediate_size": 4304,
+        "model_type": "qwen3_5",
+        "num_heads": 16,
+        "num_position_embeddings": 2304,
+        "out_hidden_size": 2048,
+        "patch_size": 16,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2,
+    },
+    "vision_end_token_id": 248054,
+    "vision_start_token_id": 248053,
+    "_name_or_path": str(os.path.join(llm_models_root(), "Qwen3.5-27B")),
+}
+
+
+@skip_pre_hopper
+class TestQwen3_5VL(TestModelingMultimodal):
+    """Forward-parity test for dense Qwen3.5-VL against HuggingFace.
+
+    Dense sibling of `TestQwen3_5MoeVL`: both stacks are constructed from
+    `QWEN3_5_VL_DENSE_PARITY_CONFIG` (2 LM layers, 1 linear + 1 full attention,
+    dense GatedMLP, 2 vision layers, deepstack disabled), HF weights are copied
+    into TRT-LLM via `Qwen3_5MoeHfWeightMapper`, then `test_all` sweeps the
+    default `MultimodalScenario`s comparing last-position logits.
+
+    Two-config design (same as the MoE test): `self.hf_config` stays raw HF
+    schema; TRT-LLM gets a deep-copied + normalized copy via the
+    `get_trtllm_pretrained_config` override, mirroring production
+    `load_pretrained_config`
+    (`_normalize_qwen35_vl_config(..., inner_arch="Qwen3_5ForCausalLM")`).
+    """
+
+    def get_model_config(self):
+        return QWEN3_5_VL_DENSE_PARITY_CONFIG
+
+    def get_trtllm_model_class(self):
+        return Qwen3_5VLModel
+
+    def get_hf_model_class(self):
+        return HFQwen3_5ForConditionalGeneration
+
+    def get_weight_mapper_class(self):
+        return Qwen3_5MoeHfWeightMapper
+
+    def get_model_type(self):
+        return "qwen3_5"
+
+    def get_model_config_class(self):
+        return transformers.Qwen3_5Config
+
+    def get_trtllm_pretrained_config(self) -> transformers.PretrainedConfig:
+        """Return a normalized config copy for TRT-LLM model construction.
+
+        Mirrors the MoE test but passes `inner_arch="Qwen3_5ForCausalLM"` to the
+        shared normalizer so the dense text decoder is selected.
+        """
+        trtllm_config = deepcopy(self.hf_config)
+        _normalize_qwen35_vl_config(trtllm_config, inner_arch="Qwen3_5ForCausalLM")
+        return trtllm_config
+
+    def _dummy_request_kwargs(self, scenario):
+        """Qwen3.5-VL uses mRoPE; the cache manager needs the mRoPE
+        position-id buffer allocated at dummy-request time."""
+        return {"use_mrope": True}
+
+    def get_tolerance(self):
+        """Tighten `rtol` to `0.1` (4x tighter than the base 0.4 default)
+        while keeping `atol` at `0.4` to absorb single-logit tail outliers.
+        Same band as the MoE parity test.
+        """
+        return 0.4, 0.1
+
+    def get_trtllm_inputs(
+        self,
+        input_ids,
+        multimodal_params_list,
+        is_gen: bool = False,
+        num_cached_tokens_per_seq: Optional[List[int]] = None,
+        total_prompt_len: Optional[int] = None,
+    ):
+        """Override position_ids with mRoPE position IDs from the multimodal
+        params. Identical to the MoE test — the VLM wrapper feeds mRoPE-shaped
+        position IDs to the decoder, not the base class's range-based default.
+        """
+        trtllm_inputs = super().get_trtllm_inputs(
+            input_ids,
+            multimodal_params_list,
+            is_gen,
+            num_cached_tokens_per_seq,
+            total_prompt_len=total_prompt_len,
+        )
+
+        if is_gen:
+            mrope_gen_position_ids = []
+            for multimodal_param in multimodal_params_list:
+                mrope_gen_position_ids.append(
+                    multimodal_param.multimodal_data["mrope_config"]["mrope_position_deltas"]
+                )
+            mrope_gen_position_ids = torch.cat(mrope_gen_position_ids, dim=-1).to(self.device)
+            trtllm_inputs["position_ids"] = (
+                (trtllm_inputs["position_ids"] + mrope_gen_position_ids)
+                .expand(3, -1, 1)
+                .to(self.device)
+            )
+            gen_multimodal_params_list = []
+            for multimodal_param in multimodal_params_list:
+                multimodal_param.strip_for_generation()
+                multimodal_param.to_device(
+                    "multimodal_data",
+                    self.device,
+                    pin_memory=True,
+                    target_keywords=["mrope_config.mrope_position_deltas"],
+                )
+                gen_multimodal_params_list.append(multimodal_param)
+            trtllm_inputs["multimodal_params"] = gen_multimodal_params_list
+            # Cached-mRoPE read slots (added in #11943): the decode path reads
+            # per-request deltas from the cache by seq slot.
+            trtllm_inputs["mrope_delta_read_seq_slots"] = torch.arange(
+                len(multimodal_params_list), device=self.device, dtype=torch.long
+            )
+        else:
+            # Mrope position ids. For chunked prefill / KV cache reuse we must
+            # mirror production `ModelEngine` and slice each request's
+            # full `mrope_position_ids` to the current chunk's token range —
+            # the fused QK-norm-RoPE op requires position_ids tokens to match
+            # the QKV token count.
+            chunk_len = input_ids.shape[-1]
+            if num_cached_tokens_per_seq is None:
+                begin_offsets = [0] * len(multimodal_params_list)
+            elif isinstance(num_cached_tokens_per_seq, int):
+                begin_offsets = [num_cached_tokens_per_seq] * len(multimodal_params_list)
+            else:
+                begin_offsets = list(num_cached_tokens_per_seq)
+            mrope_position_ids = []
+            for multimodal_param, begin in zip(multimodal_params_list, begin_offsets):
+                full_mrope = multimodal_param.multimodal_data["mrope_config"]["mrope_position_ids"]
+                mrope_position_ids.append(full_mrope[:, :, begin : begin + chunk_len])
+            position_ids = torch.cat(mrope_position_ids, dim=-1).to(self.device)
+            trtllm_inputs["position_ids"] = position_ids
+            # Cached-mRoPE write slots (added in #11943): the context path
+            # writes per-request deltas into the cache by seq slot.
+            trtllm_inputs["mrope_delta_write_seq_slots"] = torch.arange(
+                len(multimodal_params_list), device=self.device, dtype=torch.long
+            )
+
+        return trtllm_inputs
+
+    def get_scenarios(self) -> List[MultimodalScenario]:
+        """Modality-sanity sweep (image / multiple_image / video).
+
+        CUDA-graph capture is intentionally not exercised — the hybrid
+        (Mamba + attention) cache's SSM state buffer isn't threaded through the
+        harness graph-capture path. Same limitation as the MoE parity test.
+        """
+        return [
+            MultimodalScenario(
+                modality="image",
+                use_cuda_graph=False,
+                chunked_prefill=False,
+                kv_cache_reuse=False,
+            ),
+            MultimodalScenario(
+                modality="multiple_image",
+                use_cuda_graph=False,
+                chunked_prefill=False,
+                kv_cache_reuse=False,
+            ),
+            MultimodalScenario(
+                modality="video",
+                use_cuda_graph=False,
+                chunked_prefill=False,
+                kv_cache_reuse=False,
+            ),
+        ]
+
+    def test_construction_and_weight_loading_smoke(self):
+        """Smoke test: setUp built HF + TRT-LLM models and copied HF weights
+        into TRT-LLM via the weight mapper. Detailed assertions on the
+        normalizer's outputs live in the routing tests above — this one just
+        confirms construction reached the end without exception.
+        """
+        self.assertIsNotNone(self.hf_model)
+        self.assertIsNotNone(self.trtllm_model)
+        self.assertIsNotNone(self.model_config)

@@ -1,0 +1,8 @@
+version = "1.0.0"
+
+[[pulse-trufflehog.files]]
+file = "jenkins/L0_Test.groovy"
+
+  [[pulse-trufflehog.files.secrets]]
+  type = "sshpass"
+  values = ["ssh********************sswd"]

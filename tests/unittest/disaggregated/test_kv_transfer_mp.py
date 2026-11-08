@@ -1,0 +1,808 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import os
+import random
+import time
+from unittest.mock import patch
+
+import numpy as np
+import pytest
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+# Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
+# Force a deterministic UCX config regardless of what the cluster/CI injects;
+# see test_kv_transfer.py for the full rationale.
+os.environ["UCX_TLS"] = "^ib,gdr_copy"
+# Limit NIXL busy-polling progress threads; see test_kv_transfer.py for the
+# full rationale (intermittent 120s timeouts on shared CI nodes,
+# https://nvbugs/6426834).
+os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
+
+from kv_cache_manager_v2_test_utils import allocate_request, initialize_cache, request_block_data
+
+import tensorrt_llm
+import tensorrt_llm.bindings
+from tensorrt_llm import DisaggregatedParams, SamplingParams
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.lifecycle.retirement import QuiescenceFatalEvent
+from tensorrt_llm._torch.disaggregation.native.context_first_profile import (
+    supports_context_first_bf16,
+)
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
+from tensorrt_llm._torch.disaggregation.native.transfer import (
+    RxSession,
+    TransferWorker,
+    TransferWorkerConfig,
+    TxSession,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
+from tensorrt_llm.bindings import DataType
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
+from tensorrt_llm.mapping import MpiTopology as Mapping
+
+
+class _GlooQuotaSync:
+    def __init__(self, group: dist.ProcessGroup) -> None:
+        self.group = group
+
+    def allreduce(self, value: float, op: object) -> float:
+        del op
+        tensor = torch.tensor(value, dtype=torch.float64)
+        dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=self.group)
+        return tensor.item()
+
+
+def _create_cache_manager(group: dist.ProcessGroup, *args, **kwargs) -> KVCacheManagerV2:
+    """Synchronize the V2 constructor's capacity within this instance's Gloo group."""
+    with patch(
+        "tensorrt_llm._torch.distributed.communicator.Distributed.get",
+        return_value=_GlooQuotaSync(group),
+    ):
+        return KVCacheManagerV2(*args, **kwargs)
+
+
+def _instance_mapping(**kwargs) -> Mapping:
+    """Use explicit instance-local ranks for the ctx/gen Gloo process groups."""
+    mapping = object.__new__(Mapping)
+    Mapping.__init__(mapping, **kwargs)
+    return mapping
+
+
+def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = None) -> str:
+    """Broadcast a string from src rank to all other ranks in the group."""
+    # Use CPU tensors for gloo backend compatibility
+    if dist.get_rank(group) == src:
+        encoded = s.encode("utf-8")
+        length = torch.tensor([len(encoded)], dtype=torch.long)
+    else:
+        length = torch.tensor([0], dtype=torch.long)
+
+    dist.broadcast(length, src=src, group=group)
+
+    if dist.get_rank(group) == src:
+        data = torch.tensor(list(encoded), dtype=torch.uint8)
+    else:
+        data = torch.empty(length.item(), dtype=torch.uint8)
+
+    dist.broadcast(data, src=src, group=group)
+
+    return bytes(data.tolist()).decode("utf-8")
+
+
+def allgather_strings(s: str, group: dist.ProcessGroup | None = None) -> list[str]:
+    """Allgather strings from all ranks in the group."""
+    world_size = dist.get_world_size(group)
+
+    # Use CPU tensors for gloo backend compatibility
+    # First gather lengths
+    encoded = s.encode("utf-8")
+    local_length = torch.tensor([len(encoded)], dtype=torch.long)
+    all_lengths = [torch.zeros(1, dtype=torch.long) for _ in range(world_size)]
+    dist.all_gather(all_lengths, local_length, group=group)
+
+    # Then gather data
+    max_length = max(length.item() for length in all_lengths)
+    local_data = torch.zeros(max_length, dtype=torch.uint8)
+    local_data[: len(encoded)] = torch.tensor(list(encoded), dtype=torch.uint8)
+
+    all_data = [torch.zeros(max_length, dtype=torch.uint8) for _ in range(world_size)]
+    dist.all_gather(all_data, local_data, group=group)
+
+    # Decode
+    results = []
+    for data, length in zip(all_data, all_lengths):
+        results.append(bytes(data[: length.item()].tolist()).decode("utf-8"))
+
+    return results
+
+
+def allgather_int(value: int, group: dist.ProcessGroup | None = None) -> list[int]:
+    """Allgather integers from all ranks in the group."""
+    # Use CPU tensors for gloo backend compatibility
+    world_size = dist.get_world_size(group)
+    local_tensor = torch.tensor([value], dtype=torch.long)
+    all_tensors = [torch.zeros(1, dtype=torch.long) for _ in range(world_size)]
+    dist.all_gather(all_tensors, local_tensor, group=group)
+    return [t.item() for t in all_tensors]
+
+
+def broadcast_int(value: int | None, src: int, group: dist.ProcessGroup | None = None) -> int:
+    """Broadcast an int64 from src rank to all other ranks in the group."""
+    # Use CPU tensors for gloo backend compatibility
+    if dist.get_rank(group) == src:
+        data = torch.tensor([value], dtype=torch.long)
+    else:
+        data = torch.zeros(1, dtype=torch.long)
+
+    dist.broadcast(data, src=src, group=group)
+    return data.item()
+
+
+def find_free_port():
+    """Find a free port on localhost."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return s.getsockname()[1]
+
+
+def _assert_owned_session_settled(session: TxSession | RxSession) -> None:
+    """Observe successful physical retirement before releasing either K/V pool.
+
+    Args:
+        session: Native session with real NIXL requests and manager allocations.
+    """
+    assert session._enforce_physical_ownership and session._retirement is not None
+    assert not session._need_aux
+    deadline = time.monotonic() + 10
+    while not session.resources_drained() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert session.resources_drained()
+    assert session.wait_complete(blocking=False) is WaitResult.COMPLETED
+    assert session.close()
+    assert session.close()
+
+
+def worker_fn(
+    rank: int,
+    world_size: int,
+    master_addr: str,
+    master_port: int,
+    ctx_tp: int,
+    ctx_pp: int,
+    gen_tp: int,
+    gen_pp: int,
+    context_first_ownership: bool = False,
+):
+    """Worker function for each process."""
+    # Set environment variables for distributed
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = str(master_port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    # Use 4 worker threads for KV transfer to exercise multi-thread code paths
+    os.environ["TRTLLM_KV_TRANSFER_NUM_THREADS"] = "4"
+
+    # Initialize distributed (use gloo for single GPU compatibility)
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+
+    ctx_instance_num = ctx_tp * ctx_pp
+    gen_instance_num = gen_tp * gen_pp
+
+    # Determine if this process is ctx or gen
+    is_ctx = rank < ctx_instance_num
+    local_rank = rank if is_ctx else rank - ctx_instance_num
+
+    # Set GPU device
+    device_id = rank % torch.cuda.device_count()
+    torch.cuda.set_device(device_id)
+
+    # Create process groups
+    ctx_ranks = list(range(ctx_instance_num))
+    gen_ranks = list(range(ctx_instance_num, ctx_instance_num + gen_instance_num))
+
+    ctx_group = dist.new_group(ranks=ctx_ranks)
+    gen_group = dist.new_group(ranks=gen_ranks)
+    # Group for broadcasting ctx_info_endpoint from ctx rank 0 to all gen ranks
+    ctx_to_gen_group = dist.new_group(ranks=[0] + gen_ranks)
+
+    # Common parameters
+    num_layers = 4
+    head_dim = 128
+    num_kv_heads = 4
+    tokens_per_block = 8
+    max_seq_len = 256
+    max_batch_size = 4
+    dtype = DataType.BF16 if context_first_ownership else DataType.FLOAT
+    request_len = 16
+    fatal_events: list[QuiescenceFatalEvent] = []
+    ownership_config = CacheTransceiverConfig(
+        backend="NIXL", transceiver_runtime="PYTHON", kv_transfer_timeout_ms=60_000
+    )
+
+    def create_worker(manager: KVCacheManagerV2, instance_name: str) -> TransferWorker:
+        """Use real eligibility checks while keeping this test below executor orchestration.
+
+        Args:
+            manager: Instance-local, initialized GPU K/V manager.
+            instance_name: Unique NIXL instance identity for this test.
+
+        Returns:
+            Native transfer worker; fatal events are recorded and fail the test.
+        """
+        if context_first_ownership:
+            assert supports_context_first_bf16(manager.mapping, manager, ownership_config)
+        return TransferWorker(
+            TransferWorkerConfig(
+                kv_cache_manager=manager,
+                device_id=device_id,
+                instance_name=instance_name,
+                max_concurrent_sessions=max_batch_size * 2,
+                context_first_ownership=context_first_ownership,
+                tx_timeout_s=60 if context_first_ownership else None,
+                tx_overall_timeout_s=60 if context_first_ownership else None,
+                rx_timeout_s=60 if context_first_ownership else None,
+                quiescence_fatal_callback=fatal_events.append if context_first_ownership else None,
+            )
+        )
+
+    # NIXL agent names share one namespace per node, and this file and the multi-process one both
+    # used to name themselves the same thing. Two xdist workers then registered one name twice and
+    # the loser's transfer came back "remote agent was invalidated" -- a red that reads like a
+    # transport bug. The worker id is inherited by any process this test spawns, so every rank of
+    # one test agrees while two concurrent tests do not.
+    suffix = os.environ.get("PYTEST_XDIST_WORKER", "")
+    ctx_instance_name = f"ctx_instance{suffix}"
+    gen_instance_name = f"gen_instance{suffix}"
+
+    if is_ctx:
+        # Create ctx mapping
+        _ = local_rank // ctx_tp
+        tp_rank = local_rank % ctx_tp
+        mapping = _instance_mapping(
+            world_size=ctx_instance_num,
+            rank=local_rank,
+            tp_size=ctx_tp,
+            pp_size=ctx_pp,
+        )
+
+        # Create KVCacheManager
+        kv_cache_manager = _create_cache_manager(
+            ctx_group if is_ctx else gen_group,
+            KvCacheConfig(max_tokens=2048, enable_block_reuse=False, host_cache_size=0),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            mapping=mapping,
+            dtype=dtype,
+            vocab_size=32000,
+            is_disagg=context_first_ownership,
+        )
+
+        # Initialize with random data
+        initialize_cache(
+            kv_cache_manager, seed=100 + local_rank if context_first_ownership else None
+        )
+        if context_first_ownership:
+            # Producer-side writes must be complete before NIXL reads these pools.
+            torch.cuda.synchronize()
+
+        # Create TransferWorker
+        transfer_worker = create_worker(kv_cache_manager, ctx_instance_name)
+
+        # Get local endpoint
+        local_endpoint = transfer_worker._sender.endpoint
+        local_layer_num = len(kv_cache_manager.pp_layers)
+
+        # Allgather endpoints within ctx group
+        ctx_endpoints = allgather_strings(local_endpoint, group=ctx_group)
+
+        # Allgather layer_num_per_pp (only from pp_rank's first tp_rank)
+        layer_num_for_gather = local_layer_num if tp_rank == 0 else 0
+        all_layer_nums = allgather_int(layer_num_for_gather, group=ctx_group)
+
+        # Extract layer_num_per_pp (one per pp_rank)
+        ctx_layer_num_per_pp = []
+        for pp in range(ctx_pp):
+            ctx_layer_num_per_pp.append(all_layer_nums[pp * ctx_tp])
+
+        # Update instance info
+        transfer_worker.populate_instance_and_rank_info(
+            endpoints=ctx_endpoints, layer_num_per_pp=ctx_layer_num_per_pp
+        )
+
+        # Get ctx_info_endpoint (only rank 0 has the real value)
+        if local_rank == 0:
+            ctx_info_endpoint = transfer_worker._rank_info_server.endpoint
+        else:
+            ctx_info_endpoint = None
+
+    else:  # gen process
+        # Create gen mapping
+        _ = local_rank // gen_tp  # pp_rank (unused)
+        tp_rank = local_rank % gen_tp
+        mapping = _instance_mapping(
+            world_size=gen_instance_num,
+            rank=local_rank,
+            tp_size=gen_tp,
+            pp_size=gen_pp,
+        )
+
+        # Create KVCacheManager
+        kv_cache_manager = _create_cache_manager(
+            ctx_group if is_ctx else gen_group,
+            KvCacheConfig(max_tokens=2048, enable_block_reuse=False, host_cache_size=0),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            mapping=mapping,
+            dtype=dtype,
+            vocab_size=32000,
+            is_disagg=context_first_ownership,
+        )
+        if context_first_ownership:
+            initialize_cache(kv_cache_manager, seed=900 + local_rank)
+            torch.cuda.synchronize()
+
+        # Create TransferWorker
+        transfer_worker = create_worker(kv_cache_manager, gen_instance_name)
+
+        # Get local endpoint
+        local_endpoint = transfer_worker._sender.endpoint
+        local_layer_num = len(kv_cache_manager.pp_layers)
+
+        # Allgather endpoints within gen group
+        gen_endpoints = allgather_strings(local_endpoint, group=gen_group)
+
+        # Allgather layer_num_per_pp
+        layer_num_for_gather = local_layer_num if tp_rank == 0 else 0
+        all_layer_nums = allgather_int(layer_num_for_gather, group=gen_group)
+
+        gen_layer_num_per_pp = []
+        for pp in range(gen_pp):
+            gen_layer_num_per_pp.append(all_layer_nums[pp * gen_tp])
+
+        # Update instance info
+        transfer_worker.populate_instance_and_rank_info(
+            endpoints=gen_endpoints, layer_num_per_pp=gen_layer_num_per_pp
+        )
+
+        ctx_info_endpoint = None  # Will be received later
+
+    # Broadcast ctx_info_endpoint from ctx rank 0 to gen ranks
+    if rank in [0] + gen_ranks:
+        ctx_info_endpoint = broadcast_string(ctx_info_endpoint, src=0, group=ctx_to_gen_group)
+
+    # Broadcast gen_layer_num_per_pp from gen rank 0 to world rank 0
+    # gen rank 0 is world rank ctx_instance_num
+    # Use CPU tensors for gloo backend compatibility
+    if rank in [0] + gen_ranks:
+        if rank == ctx_instance_num:
+            # gen rank 0 sends
+            gen_layer_num_per_pp_tensor = torch.tensor(gen_layer_num_per_pp, dtype=torch.long)
+        else:
+            gen_layer_num_per_pp_tensor = torch.zeros(gen_pp, dtype=torch.long)
+        dist.broadcast(gen_layer_num_per_pp_tensor, src=ctx_instance_num, group=ctx_to_gen_group)
+        if rank == 0:
+            gen_layer_num_per_pp = gen_layer_num_per_pp_tensor.tolist()
+
+    # Synchronize all processes
+    dist.barrier()
+
+    # Helper function to process and verify a single request
+    def process_and_verify_request(
+        ctx_request_id: int, gen_request_id: int, req_len: int, unique_rid: int
+    ):
+        """Process a single request and verify the transfer."""
+        sampling_params = SamplingParams()
+
+        if is_ctx:
+            # Create ctx request
+            ctx_request = LlmRequest(
+                request_id=ctx_request_id,
+                max_new_tokens=1,
+                input_tokens=list(range(req_len)),
+                sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                    sampling_params._get_sampling_config()
+                ),
+                is_streaming=False,
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+            )
+            ctx_request.py_disaggregated_params = DisaggregatedParams(
+                disagg_request_id=unique_rid,
+                schedule_style=(
+                    DisaggScheduleStyle.CONTEXT_FIRST if context_first_ownership else None
+                ),
+            )
+
+            # Add sequence to KVCacheManager
+            allocate_request(kv_cache_manager, ctx_request)
+
+            # Create sender session
+            sender_session = transfer_worker.create_tx_session(ctx_request)
+
+            # Get block ids and send
+            block_ids = np.asarray(
+                kv_cache_manager.get_page_indices_by_layer_group(ctx_request)[0],
+                dtype=np.int64,
+            )
+            send_kv_slice = Chunk(
+                block_ids_per_layer_groups=[block_ids],
+                kind_per_layer_group=[CacheKind.PAGED],
+                token_range=TokenRange(start=0, end=ctx_request.prompt_len),
+                is_last=True,
+            )
+            sender_session.send(send_kv_slice)
+
+            # Wait for send to complete
+            sender_session.wait_complete()
+            assert sender_session.status == SessionStatus.TRANSFERRED
+
+            # Get block data for verification
+            block_data = request_block_data(kv_cache_manager, ctx_request)
+            if context_first_ownership:
+                _assert_owned_session_settled(sender_session)
+
+        else:  # gen process
+            # Create gen request
+            gen_request = LlmRequest(
+                request_id=gen_request_id,
+                max_new_tokens=1,
+                input_tokens=list(range(req_len)),
+                sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                    sampling_params._get_sampling_config()
+                ),
+                is_streaming=False,
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+            )
+            gen_request.py_disaggregated_params = DisaggregatedParams(
+                ctx_request_id=ctx_request_id,
+                ctx_dp_rank=0,
+                ctx_info_endpoint=ctx_info_endpoint,
+                disagg_request_id=unique_rid,
+                schedule_style=(
+                    DisaggScheduleStyle.CONTEXT_FIRST if context_first_ownership else None
+                ),
+            )
+
+            # Add sequence to KVCacheManager
+            allocate_request(kv_cache_manager, gen_request)
+
+            # Create receiver session
+            receiver_session = transfer_worker.create_rx_session(gen_request)
+
+            # Get block ids and receive
+            block_ids = np.asarray(
+                kv_cache_manager.get_page_indices_by_layer_group(gen_request)[0],
+                dtype=np.int64,
+            )
+            recv_kv_slice = Chunk(
+                block_ids_per_layer_groups=[block_ids],
+                kind_per_layer_group=[CacheKind.PAGED],
+                token_range=TokenRange(start=0, end=gen_request.prompt_len),
+                is_last=True,
+            )
+            expected_write_bytes = None
+            if context_first_ownership:
+                destination = request_block_data(kv_cache_manager, gen_request)
+                expected_write_bytes = destination.numel() * destination.element_size()
+            receiver_session.receive(recv_kv_slice, expected_write_bytes=expected_write_bytes)
+
+            # Wait for receive to complete
+            receiver_session.wait_complete(blocking=True)
+            assert receiver_session.status == SessionStatus.TRANSFERRED
+
+            # Get block data for verification
+            block_data = request_block_data(kv_cache_manager, gen_request)
+            if context_first_ownership:
+                assert receiver_session.kv_write_verified()
+                _assert_owned_session_settled(receiver_session)
+
+        # Synchronize before verification
+        dist.barrier()
+        if context_first_ownership:
+            assert not fatal_events
+            assert not transfer_worker._retirement_watchdog.has_unclosed_owners
+
+        print(
+            f"[Rank {rank}] Request {ctx_request_id}: "
+            f"{'CTX' if is_ctx else 'GEN'} finished. Block data shape: {block_data.shape}"
+        )
+
+        # ===== Gather block_data for verification =====
+        # Use CPU tensors for gloo backend compatibility
+        block_data_cpu = block_data.cpu()
+
+        # Gather ctx block_data to ctx local rank 0 (world rank 0)
+        ctx_block_datas = None
+        gen_block_datas = None
+
+        if is_ctx:
+            # Gather within ctx group to ctx local rank 0
+            if local_rank == 0:
+                ctx_block_datas_cpu = [
+                    torch.zeros_like(block_data_cpu) for _ in range(ctx_instance_num)
+                ]
+            else:
+                ctx_block_datas_cpu = None
+            # Use group_dst for group-local rank
+            dist.gather(block_data_cpu, ctx_block_datas_cpu, group_dst=0, group=ctx_group)
+            if local_rank == 0:
+                ctx_block_datas = [d.cuda() for d in ctx_block_datas_cpu]
+        else:
+            # Gather within gen group to gen local rank 0 (world rank ctx_instance_num)
+            if local_rank == 0:
+                gen_block_datas_cpu = [
+                    torch.zeros_like(block_data_cpu) for _ in range(gen_instance_num)
+                ]
+            else:
+                gen_block_datas_cpu = None
+            # Use group_dst for group-local rank
+            dist.gather(block_data_cpu, gen_block_datas_cpu, group_dst=0, group=gen_group)
+            if local_rank == 0:
+                gen_block_datas = [d.cuda() for d in gen_block_datas_cpu]
+
+        dist.barrier()
+
+        # Send gen_block_datas from gen rank 0 to world rank 0
+        gen_rank_0 = ctx_instance_num
+        if rank == gen_rank_0:
+            # Send shape first
+            shape_tensor = torch.tensor(list(block_data.shape), dtype=torch.long)
+            dist.send(shape_tensor, dst=0)
+            # Send each block_data (as CPU tensors)
+            for data in gen_block_datas:
+                dist.send(data.cpu().contiguous(), dst=0)
+        elif rank == 0:
+            # Receive shape
+            shape_tensor = torch.zeros(4, dtype=torch.long)
+            dist.recv(shape_tensor, src=gen_rank_0)
+            gen_shape = tuple(shape_tensor.tolist())
+            # Receive each block_data
+            gen_block_datas = []
+            for _ in range(gen_instance_num):
+                data_cpu = torch.zeros(gen_shape, dtype=block_data.dtype)
+                dist.recv(data_cpu, src=gen_rank_0)
+                gen_block_datas.append(data_cpu.cuda())
+
+        dist.barrier()
+
+        # Verification on rank 0
+        if rank == 0:
+            print(f"\n[Rank {rank}] Request {ctx_request_id}: Starting verification...")
+
+            # Merge ctx block data
+            # shape [block_num, layer_num, 2, block_size]
+            ctx_block_data_merge = torch.zeros(
+                size=(
+                    ctx_block_datas[0].shape[0],
+                    num_layers,
+                    2,
+                    ctx_block_datas[0].shape[3] * ctx_tp,
+                ),
+                device="cuda",
+            )
+            for pp_idx in range(ctx_pp):
+                for tp_idx in range(ctx_tp):
+                    layer_start_idx = sum(ctx_layer_num_per_pp[:pp_idx])
+                    layer_end_idx = layer_start_idx + ctx_layer_num_per_pp[pp_idx]
+                    head_dim_per_rank = num_kv_heads // ctx_tp * head_dim * tokens_per_block
+                    start_head_offset = tp_idx * head_dim_per_rank
+                    end_head_offset = start_head_offset + head_dim_per_rank
+                    block_idx = pp_idx * ctx_tp + tp_idx
+                    ctx_block_data_merge[
+                        :,
+                        layer_start_idx:layer_end_idx,
+                        :,
+                        start_head_offset:end_head_offset,
+                    ] = ctx_block_datas[block_idx]
+
+            # Merge gen block data
+            gen_block_data_merge = torch.zeros(
+                size=(
+                    gen_block_datas[0].shape[0],
+                    num_layers,
+                    2,
+                    gen_block_datas[0].shape[3] * gen_tp,
+                ),
+                device="cuda",
+            )
+            for pp_idx in range(gen_pp):
+                for tp_idx in range(gen_tp):
+                    layer_start_idx = sum(gen_layer_num_per_pp[:pp_idx])
+                    layer_end_idx = layer_start_idx + gen_layer_num_per_pp[pp_idx]
+                    head_dim_per_rank = num_kv_heads // gen_tp * head_dim * tokens_per_block
+                    start_head_offset = tp_idx * head_dim_per_rank
+                    end_head_offset = start_head_offset + head_dim_per_rank
+                    block_idx = pp_idx * gen_tp + tp_idx
+                    gen_block_data_merge[
+                        :,
+                        layer_start_idx:layer_end_idx,
+                        :,
+                        start_head_offset:end_head_offset,
+                    ] = gen_block_datas[block_idx]
+
+            # Verify
+            assert ctx_block_data_merge.equal(gen_block_data_merge), (
+                f"Request {ctx_request_id}: Data mismatch!"
+            )
+            print(
+                f"[Rank {rank}] Request {ctx_request_id}: Verification PASSED! "
+                f"ctx shape: {ctx_block_data_merge.shape}, "
+                f"gen shape: {gen_block_data_merge.shape}"
+            )
+
+        dist.barrier()
+
+    # ===== Process multiple requests =====
+    # Request 1
+    unique_rid_1 = broadcast_int(random.getrandbits(63) if rank == 0 else None, src=0)
+    process_and_verify_request(
+        ctx_request_id=0, gen_request_id=1, req_len=request_len, unique_rid=unique_rid_1
+    )
+
+    # Request 2 (with different length)
+    unique_rid_2 = broadcast_int(random.getrandbits(63) if rank == 0 else None, src=0)
+    process_and_verify_request(
+        ctx_request_id=2, gen_request_id=3, req_len=request_len * 2, unique_rid=unique_rid_2
+    )
+
+    if rank == 0:
+        print(f"\n[Rank {rank}] All requests verified successfully!")
+
+    # Cleanup
+    transfer_worker.shutdown()
+    kv_cache_manager.shutdown()
+    dist.destroy_process_group()
+
+
+def _is_port_conflict_error(exc: Exception) -> bool:
+    """Check if an exception is caused by a port conflict (EADDRINUSE)."""
+    msg = str(exc).lower()
+    return "eaddrinuse" in msg or "address already in use" in msg
+
+
+def run_transfer_worker_mp(
+    ctx_tp: int,
+    ctx_pp: int,
+    gen_tp: int,
+    gen_pp: int,
+    max_port_retries: int = 5,
+    *,
+    context_first_ownership: bool = False,
+):
+    """Multi-process test for TransferWorker using mp.spawn."""
+    world_size = ctx_tp * ctx_pp + gen_tp * gen_pp
+
+    master_addr = "127.0.0.1"
+
+    for attempt in range(max_port_retries):
+        master_port = find_free_port()
+
+        print(
+            f"Starting {world_size} processes for test: "
+            f"ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}"
+            f" (port={master_port}, attempt {attempt + 1}/{max_port_retries})"
+        )
+
+        try:
+            # Use mp.spawn to start all processes
+            mp.spawn(
+                worker_fn,
+                args=(
+                    world_size,
+                    master_addr,
+                    master_port,
+                    ctx_tp,
+                    ctx_pp,
+                    gen_tp,
+                    gen_pp,
+                    context_first_ownership,
+                ),
+                nprocs=world_size,
+                join=True,
+            )
+            break  # success
+        except Exception as e:
+            if _is_port_conflict_error(e) and attempt < max_port_retries - 1:
+                print(
+                    f"Port {master_port} conflict on attempt {attempt + 1}/{max_port_retries}, "
+                    f"retrying with a new port..."
+                )
+                continue
+            raise
+
+    print(f"Test passed: ctx_tp={ctx_tp}, ctx_pp={ctx_pp}, gen_tp={gen_tp}, gen_pp={gen_pp}\n")
+
+
+# Test configurations as pytest parameters
+MP_TEST_CONFIGS = [
+    # (ctx_tp, ctx_pp, gen_tp, gen_pp, test_id)
+    (1, 1, 1, 1, "mp_tp1_pp1_to_tp1_pp1"),
+    (1, 1, 1, 2, "mp_tp1_pp1_to_tp1_pp2"),
+    (2, 1, 1, 2, "mp_tp2_pp1_to_tp1_pp2"),
+]
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize(
+    "ctx_tp,ctx_pp,gen_tp,gen_pp",
+    [(c[0], c[1], c[2], c[3]) for c in MP_TEST_CONFIGS],
+    ids=[c[4] for c in MP_TEST_CONFIGS],
+)
+def test_transfer_worker_mp(ctx_tp, ctx_pp, gen_tp, gen_pp, monkeypatch):
+    """Test transfer worker with multi-process configurations."""
+    # Gloo workers own their rank identities and must not inherit the enclosing MPI job.
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
+    for name in list(os.environ):
+        if name.startswith(("SLURM_", "PMIX_", "PMI_", "OMPI_", "I_MPI_", "HYDRA_", "MPI_")):
+            monkeypatch.delenv(name)
+    # Set multiprocessing start method
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass  # Already set
+
+    run_transfer_worker_mp(ctx_tp=ctx_tp, ctx_pp=ctx_pp, gen_tp=gen_tp, gen_pp=gen_pp)
+
+
+@pytest.mark.gpu4
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2"])
+def test_context_first_bf16_owned_transfer(monkeypatch: pytest.MonkeyPatch, tp_size: int) -> None:
+    """Transfer both BF16 K/V pools and settle native owners on symmetric TP1/TP2.
+
+    This covers real manager/NIXL transfer, not executor MPI failure containment.
+
+    Args:
+        monkeypatch: Isolates the no-retry/direct-transfer environment for spawned ranks.
+        tp_size: Tensor-parallel ranks in each endpoint.
+    """
+    if torch.cuda.device_count() < 4:
+        pytest.skip("context-first TP2 ownership qualification requires four GPUs")
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
+    monkeypatch.setenv("TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT", "1")
+    monkeypatch.setenv("TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE", "0")
+    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
+    monkeypatch.setenv("TRTLLM_USE_PY_NIXL_KVCACHE", "0")
+    monkeypatch.setenv("TRTLLM_NIXL_KVCACHE_BACKEND", "UCX")
+    monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "0")
+    monkeypatch.setenv("TRTLLM_DISAGG_LAYERWISE", "0")
+    for name in list(os.environ):
+        if name.startswith(("SLURM_", "PMIX_", "PMI_", "OMPI_", "I_MPI_", "HYDRA_", "MPI_")):
+            monkeypatch.delenv(name)
+    run_transfer_worker_mp(
+        ctx_tp=tp_size,
+        ctx_pp=1,
+        gen_tp=tp_size,
+        gen_pp=1,
+        max_port_retries=1,
+        context_first_ownership=True,
+    )

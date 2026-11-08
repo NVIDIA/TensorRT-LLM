@@ -1,0 +1,1882 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import base64
+import gc
+import json
+import os
+import pickle
+import re
+import time
+from typing import Callable, List, Optional, Tuple
+
+import pytest
+import torch
+from _torch.ray_orchestrator.single_gpu.test_llm_update_weights import (
+    RefHFModelWithIPCHandles,
+    compare_logits,
+    run_generate,
+)
+from safetensors import safe_open
+from torch.multiprocessing.reductions import reduce_tensor
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    Qwen3_5MoeForConditionalGeneration,
+)
+from utils.llm_data import llm_models_root
+from utils.torch_ref import RefHFModel
+from utils.util import skip_pre_blackwell, skip_pre_hopper, skip_pre_rubin
+
+from tensorrt_llm import LLM
+from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight, quant_bf16_to_mxfp8
+from tensorrt_llm._torch.moe.fused_moe.triton_dequant_nvfp4 import dequant_nvfp4_2d_triton
+from tensorrt_llm._torch.utils import get_device_uuid
+from tensorrt_llm.executor.ray.utils import control_action_decorator
+from tensorrt_llm.llmapi import (
+    CudaGraphConfig,
+    KvCacheConfig,
+    MoeConfig,
+    SamplingParams,
+    TorchCompileConfig,
+)
+from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
+
+# Ray-backed LLM teardown only fires from RayExecutor.shutdown(), which runs
+# after pytest-threadleak's per-test snapshot — see the matching docstring in
+# tests/unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py
+# (the parent test module this file imports from).
+pytestmark = pytest.mark.threadleak(enabled=False)
+
+
+@pytest.fixture(autouse=True)
+def release_shared_cuda_memory():
+    """Reclaim producer-side CUDA IPC memory between parametrize IDs."""
+    yield
+    # Break reference cycles so the test-local hf_model actually dies now.
+    gc.collect()
+    # Free sent IPC storages whose consumers have already closed them.
+    torch.cuda.ipc_collect()
+    # Return freed cached segments to the driver so other processes
+    # (the next test's Ray workers) can allocate them.
+    torch.cuda.empty_cache()
+
+
+def _decoder_weight_group(name: str) -> str:
+    """Group the same parameter across repeated decoder layers."""
+    return re.sub(r"^model\.layers\.\d+\.", "", name)
+
+
+def _run_multi_gpu_update_weights(
+    *,
+    model_dir: str,
+    hf_model: RefHFModelWithIPCHandles,
+    device_ids: List[int],
+    llm_kwargs: dict,
+    sampling_params: SamplingParams,
+    partial: bool,
+    weight_group: Callable[[str], str] = _decoder_weight_group,
+    prompts_texts: Optional[List[str]] = None,
+    tokenizer_dir: Optional[str] = None,
+    warm_before_update: bool = False,
+    generate_fn: Callable = run_generate,
+    threshold: float = 0.9,
+) -> None:
+    """Run the shared warm/update/finalize/reference-comparison workflow."""
+    if prompts_texts is None:
+        prompts_texts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir or model_dir)
+    prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
+    del tokenizer
+
+    with LLM(
+        model=model_dir,
+        ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
+        tensor_parallel_size=len(device_ids),
+        load_format="dummy",
+        pipeline_parallel_size=1,
+        **llm_kwargs,
+    ) as llm:
+        if warm_before_update:
+            llm.generate(prompts, sampling_params)
+
+        if partial:
+            groups = sorted(
+                {weight_group(name) for name, _ in hf_model.all_weights[hf_model.device_id]}
+            )
+            for group in groups:
+                ipc_handles = hf_model.get_weight_ipc_handles_serialized(
+                    device_ids,
+                    weight_filter=lambda name, group=group: (weight_group(name) == group),
+                )
+                llm._collective_rpc("update_weights", (ipc_handles,))
+        else:
+            ipc_handles = hf_model.get_weight_ipc_handles_serialized(device_ids)
+            llm._collective_rpc("update_weights", (ipc_handles,))
+
+        llm._collective_rpc("update_weights", (None,))
+        llm_logits, ref_logits = generate_fn(llm, hf_model, prompts, sampling_params)
+        compare_logits(llm_logits, ref_logits, threshold=threshold)
+
+
+def _run_fp8_update_weights(model_dir: str, fp8_model_dir: str, partial: bool) -> None:
+    model_dir = str(llm_models_root() / model_dir)
+    fp8_model_dir = str(llm_models_root() / fp8_model_dir)
+    num_hidden_layers = 1
+    hf_model = RefHFModelWithIPCHandles(fp8_model_dir, num_hidden_layers=num_hidden_layers)
+
+    llm_kwargs = {
+        "kv_cache_config": KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1),
+        "model_kwargs": {
+            "num_hidden_layers": num_hidden_layers,
+            "quantization_config": {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+            },
+        },
+    }
+    if "Qwen3/Qwen3-30B-A3B" in model_dir:
+        llm_kwargs["moe_config"] = {"backend": "DEEPGEMM"}
+
+    _run_multi_gpu_update_weights(
+        model_dir=model_dir,
+        hf_model=hf_model,
+        device_ids=[0, 1],
+        llm_kwargs=llm_kwargs,
+        sampling_params=SamplingParams(
+            temperature=0, return_generation_logits=True, max_tokens=1024
+        ),
+        partial=partial,
+        tokenizer_dir=fp8_model_dir,
+    )
+
+
+@pytest.mark.part0
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "model_dir, fp8_model_dir",
+    [
+        ("Qwen3/Qwen3-8B", "Qwen3/Qwen3-8B-FP8"),
+        ("Qwen3/Qwen3-30B-A3B", "Qwen3/Qwen3-30B-A3B-FP8"),
+    ],
+)
+def test_llm_update_weights_fp8(model_dir, fp8_model_dir):
+    _run_fp8_update_weights(model_dir, fp8_model_dir, partial=False)
+
+
+@pytest.mark.part1
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "model_dir, fp8_model_dir",
+    [
+        ("Qwen3/Qwen3-8B", "Qwen3/Qwen3-8B-FP8"),
+        ("Qwen3/Qwen3-30B-A3B", "Qwen3/Qwen3-30B-A3B-FP8"),
+    ],
+)
+def test_llm_partial_update_weights_fp8(model_dir, fp8_model_dir):
+    _run_fp8_update_weights(model_dir, fp8_model_dir, partial=True)
+
+
+_QWEN35_35B_TP8 = 8
+_QWEN35_35B_REDUCED_LAYERS = 4
+_QWEN35_35B_LAYER_TYPES = [
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+]
+_QWEN35_35B_TP8_EXTENSION = (
+    "_torch.ray_orchestrator.multi_gpu.test_llm_update_weights_multi_gpu."
+    "Qwen35_35BTP8WorkerExtension"
+)
+
+
+def _mxfp8_397b_model_dir() -> str:
+    """BF16 397B checkpoint, for reproducing the 397B MXFP8 shapes cheaply.
+
+    Same architecture family and layer_types pattern as the 35B model, so the
+    reduced-depth config applies unchanged; what differs is the width and
+    expert count (hidden 4096 vs 2048, moe_intermediate 1024 vs 512, 512
+    experts vs 256) and the TP8/MEP8 split the 397B recipe runs. Four layers of
+    it fit on two nodes, which is the point: the full e2e needs sixteen.
+    """
+    model_dir = os.environ.get("MXFP8_397B_MODEL_DIR")
+    if model_dir:
+        return model_dir
+    return str(llm_models_root() / "Qwen3.5-397B-A17B")
+
+
+def _mxfp8_base_model_dir() -> str:
+    """BF16 base checkpoint the MXFP8 reference quantizes on the fly.
+
+    No MXFP8 checkpoint is needed (none is published for Qwen3 / Qwen3.5): the
+    test runs a single layer with load_format="dummy" and pushes quantized
+    weights in through update_weights.
+
+    The reference builds Qwen3_5MoeForConditionalGeneration directly (via
+    RefQwen35_35BModelWithIPCHandles), so the nested text_config is handled and
+    no flat-config model is required.
+    """
+    model_dir = os.environ.get("MXFP8_BASE_MODEL_DIR")
+    if model_dir:
+        return model_dir
+    return str(llm_models_root() / "Qwen3.5-35B-A3B")
+
+
+def _qwen35_35b_bf16_model_dir() -> str:
+    """Resolve the real BF16 checkpoint, with a local override for bring-up."""
+    model_dir = os.environ.get("QWEN35_35B_BF16_MODEL_DIR")
+    if model_dir:
+        return model_dir
+    return str(llm_models_root() / "Qwen3.5-35B-A3B")
+
+
+def _qwen35_35b_fp8_model_dir() -> str:
+    """Resolve the real block-FP8 checkpoint, with a local override."""
+    model_dir = os.environ.get("QWEN35_35B_FP8_MODEL_DIR")
+    if model_dir:
+        return model_dir
+    return str(llm_models_root() / "Qwen3.5-35B-A3B-FP8")
+
+
+def _qwen35_35b_test_config(model_dir: str):
+    """Keep the exact 35B width while reducing depth for refit-test memory."""
+    config = AutoConfig.from_pretrained(model_dir)
+    text_config = config.text_config
+
+    text_config.num_hidden_layers = _QWEN35_35B_REDUCED_LAYERS
+    text_config.layer_types = _QWEN35_35B_LAYER_TYPES
+
+    # MTP refit is independent of the rollout-model refit under test.
+    if hasattr(text_config, "mtp_num_hidden_layers"):
+        text_config.mtp_num_hidden_layers = 0
+
+    # Transformers eagerly evaluates this fallback even when
+    # moe_intermediate_size is present.
+    if not hasattr(text_config, "intermediate_size"):
+        text_config.intermediate_size = text_config.moe_intermediate_size
+
+    # Text-only generation still constructs the VLM wrapper.
+    config.vision_config.depth = 1
+    return config
+
+
+def _qwen35_35b_model_kwargs() -> dict:
+    """Apply the same depth, MTP, and vision reductions to TRT-LLM."""
+    return {
+        "text_config": {
+            "num_hidden_layers": _QWEN35_35B_REDUCED_LAYERS,
+            "layer_types": _QWEN35_35B_LAYER_TYPES,
+            "mtp_num_hidden_layers": 0,
+        },
+        "vision_config": {"depth": 1},
+    }
+
+
+def _qwen35_35b_sampling_params() -> SamplingParams:
+    """Sample enough positions to resolve GDN recurrent-state drift.
+
+    compare_logits averages a top-k overlap ratio over the generated positions,
+    so at max_tokens=8 it only resolves 1/(8 * topk) steps — too coarse to tell
+    real state drift from one arbitrary top-k tie-break. 32 positions also let
+    the state accumulate long enough to diverge. Matches _nemotron_h_body.
+    """
+    return SamplingParams(temperature=0, return_generation_logits=True, max_tokens=32)
+
+
+def _qwen35_35b_is_test_weight(name: str) -> bool:
+    """Select checkpoint weights used by the reduced-depth text model."""
+    if name.startswith("model.visual.") or ".mtp." in name:
+        return False
+    layer_match = re.search(r"\.layers\.(\d+)\.", name)
+    return not (layer_match and int(layer_match.group(1)) >= _QWEN35_35B_REDUCED_LAYERS)
+
+
+class RefQwen35_35BModelWithIPCHandles(RefHFModelWithIPCHandles):
+    """Production-width BF16 35B reference model for exact-logit comparison.
+
+    Unlike the generic helper, the source-device IPC entries alias the HF
+    parameters instead of cloning them. update_weights only reads these
+    allocations, saving one complete model copy on cuda:0 while keeping the
+    reference model available for logits comparison.
+    """
+
+    def __init__(
+        self,
+        model_dir: str,
+        device_id: int = 0,
+        device_ids: Optional[List[int]] = None,
+    ):
+        self.device_id = device_id
+        config = _qwen35_35b_test_config(model_dir)
+        self.model = (
+            Qwen3_5MoeForConditionalGeneration.from_pretrained(
+                model_dir,
+                config=config,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="eager",
+                low_cpu_mem_usage=True,
+            )
+            .eval()
+            .to(f"cuda:{device_id}")
+        )
+        self.all_weights = {}
+        self.device_uuid = [get_device_uuid(i) for i in range(torch.cuda.device_count())]
+        self._replicate_weights_to_devices(
+            list(range(torch.cuda.device_count())) if device_ids is None else device_ids
+        )
+
+    def _replicate_weights_to_devices(self, device_ids: List[int]) -> None:
+        source_weights = [
+            (name, parameter.detach()) for name, parameter in self.model.named_parameters()
+        ]
+        self.all_weights[self.device_id] = source_weights
+        for device_id in device_ids:
+            if device_id == self.device_id:
+                continue
+            self.all_weights[device_id] = [
+                (name, parameter.to(f"cuda:{device_id}")) for name, parameter in source_weights
+            ]
+
+
+class RefQwen35_35BFP8CheckpointWithIPCHandles(RefHFModelWithIPCHandles):
+    """Expose exact production-width checkpoint tensors through CUDA IPC.
+
+    Transformers currently does not ingest Qwen3.5's per-expert block-FP8
+    checkpoint layout: it reports the split expert weights/scales as
+    unexpected and initializes fused expert parameters. Refit must consume
+    the checkpoint representation, so load the selected safetensors entries
+    directly rather than silently testing randomly initialized BF16 tensors.
+    """
+
+    def __init__(self, model_dir: str, device_ids: List[int]):
+        self.device_id = device_ids[0]
+        self.device_uuid = [get_device_uuid(i) for i in range(torch.cuda.device_count())]
+        self.all_weights = {device_id: [] for device_id in device_ids}
+
+        with open(os.path.join(model_dir, "model.safetensors.index.json")) as f:
+            weight_map = json.load(f)["weight_map"]
+
+        selected_by_shard = {}
+        for name, shard in weight_map.items():
+            if _qwen35_35b_is_test_weight(name):
+                selected_by_shard.setdefault(shard, []).append(name)
+
+        for shard, names in sorted(selected_by_shard.items()):
+            with safe_open(
+                os.path.join(model_dir, shard), framework="pt", device="cpu"
+            ) as checkpoint:
+                for name in sorted(names):
+                    weight = checkpoint.get_tensor(name)
+                    for device_id in device_ids:
+                        self.all_weights[device_id].append((name, weight.to(f"cuda:{device_id}")))
+
+
+def _qwen35_35b_weight_group(name: str) -> str:
+    """Group repeated layers/experts while separating projection families.
+
+    This produces a practical number of update RPCs and deliberately places
+    QKV, Z, B, A, gate-up, and down projections in separate invocations. It
+    therefore exercises mapper state across incremental calls rather than
+    relying on checkpoint or dictionary order to keep fusion groups together.
+    """
+    name = re.sub(r"(\.layers\.)\d+\.", r"\1*.", name)
+    name = re.sub(r"(\.blocks\.)\d+\.", r"\1*.", name)
+    name = re.sub(r"(\.experts\.)\d+\.", r"\1*.", name)
+    return name
+
+
+def _qwen35_35b_selected_checkpoint_names(model_dir: str) -> List[str]:
+    """Return the production-width text weights used by the reduced-depth test."""
+    with open(os.path.join(model_dir, "model.safetensors.index.json")) as f:
+        weight_map = json.load(f)["weight_map"]
+
+    return sorted(name for name in weight_map if _qwen35_35b_is_test_weight(name))
+
+
+def _qwen35_35b_load_checkpoint_group(
+    model_dir: str, weight_group: str, device: torch.device
+) -> List[Tuple[str, torch.Tensor]]:
+    """Load one incremental update group onto a Ray worker's local GPU."""
+    with open(os.path.join(model_dir, "model.safetensors.index.json")) as f:
+        weight_map = json.load(f)["weight_map"]
+
+    selected_by_shard = {}
+    for name in _qwen35_35b_selected_checkpoint_names(model_dir):
+        if _qwen35_35b_weight_group(name) == weight_group:
+            selected_by_shard.setdefault(weight_map[name], []).append(name)
+
+    weights = []
+    for shard, names in sorted(selected_by_shard.items()):
+        with safe_open(os.path.join(model_dir, shard), framework="pt", device="cpu") as checkpoint:
+            weights.extend((name, checkpoint.get_tensor(name).to(device)) for name in sorted(names))
+    return weights
+
+
+def _return_local_weight(tensor: torch.Tensor, *_: object) -> torch.Tensor:
+    """Return a worker-local tensor through the refit handle interface."""
+    return tensor
+
+
+class Qwen35_35BTP8WorkerExtension(WorkerExtension):
+    """Refit helpers that also work when TP8 spans two Ray nodes."""
+
+    def get_test_device_name(self) -> str:
+        return torch.cuda.get_device_name(self.device_id)
+
+    @control_action_decorator
+    def update_weights_from_local_checkpoint(
+        self, model_dir: str, weight_group: Optional[str] = None
+    ) -> None:
+        """Load a bucket beside each worker, avoiding cross-node CUDA IPC."""
+        if weight_group is None:
+            WorkerExtension.update_weights.__wrapped__(self, None)
+            return
+
+        local_weights = _qwen35_35b_load_checkpoint_group(
+            model_dir,
+            weight_group,
+            torch.device("cuda", self.device_id),
+        )
+        device_uuid = get_device_uuid(self.device_id)
+        handles = {
+            device_uuid: [
+                (
+                    name,
+                    (
+                        _return_local_weight,
+                        (weight, None, None, None, None, None, None),
+                    ),
+                )
+                for name, weight in local_weights
+            ]
+        }
+        WorkerExtension.update_weights.__wrapped__(self, handles)
+
+    @control_action_decorator
+    def update_mxfp8_weights_from_local_checkpoint(
+        self, model_dir: str, weight_group: Optional[str] = None
+    ) -> None:
+        """Load and quantize a worker-local MXFP8 bucket."""
+        if weight_group is None:
+            WorkerExtension.update_weights.__wrapped__(self, None)
+            return
+
+        checkpoint_weights = _qwen35_35b_load_checkpoint_group(
+            model_dir,
+            weight_group,
+            torch.device("cuda", self.device_id),
+        )
+        local_weights = []
+        for name, weight in checkpoint_weights:
+            match = re.fullmatch(
+                r"(?P<prefix>.*\.mlp\.experts)\.(?P<projection>gate_up_proj|down_proj)",
+                name,
+            )
+            if match is None:
+                local_weights.append((name, weight))
+                continue
+
+            prefix = match.group("prefix")
+            projection = match.group("projection")
+            for start in range(0, weight.shape[0], 8):
+                end = min(start + 8, weight.shape[0])
+                if projection == "gate_up_proj":
+                    intermediate_size = weight.shape[1] // 2
+                    projections = (
+                        ("gate_proj", weight[start:end, :intermediate_size]),
+                        ("up_proj", weight[start:end, intermediate_size:]),
+                    )
+                else:
+                    projections = (("down_proj", weight[start:end]),)
+
+                for projection_name, projection_weight in projections:
+                    data, scale = RefQwen35MXFP8ModelWithIPCHandles._quantize_2d(projection_weight)
+                    for offset, expert_id in enumerate(range(start, end)):
+                        weight_name = f"{prefix}.{expert_id}.{projection_name}.weight"
+                        local_weights.append((weight_name, data[offset]))
+                        local_weights.append(
+                            (
+                                weight_name.removesuffix(".weight") + ".weight_scale_inv",
+                                scale[offset],
+                            )
+                        )
+
+        device_uuid = get_device_uuid(self.device_id)
+        handles = {
+            device_uuid: [
+                (
+                    name,
+                    (
+                        _return_local_weight,
+                        (weight, None, None, None, None, None, None),
+                    ),
+                )
+                for name, weight in local_weights
+            ]
+        }
+        WorkerExtension.update_weights.__wrapped__(self, handles)
+
+
+def _run_generate_qwen35_35b(llm, hf_model, prompts, sampling_params):
+    """Compare short generations without allocating 2K-token 248K-vocab logits."""
+    llm_responses = []
+    llm_logits = []
+    for output in llm.generate(prompts, sampling_params):
+        llm_logits.append(output.outputs[0].generation_logits)
+        llm_responses.append(output.outputs[0].token_ids)
+
+    prompt_max_len = max(len(prompt) for prompt in prompts)
+    response_max_len = max(len(response) for response in llm_responses)
+    input_ids, attention_mask, position_ids = RefHFModel.pad_data(
+        prompts,
+        llm_responses,
+        prompt_max_len=prompt_max_len,
+        response_max_len=response_max_len,
+    )
+    ref_logits = hf_model.generate_batch_with_padding(
+        input_ids,
+        attention_mask,
+        position_ids,
+        llm_responses,
+        prompt_max_len=prompt_max_len,
+        micro_batch_size=1,
+        return_logits=True,
+    )
+    return llm_logits, ref_logits
+
+
+def _prefetch_flashinfer_trtllm_gen_artifacts(attempts: int = 3) -> None:
+    """Download FlashInfer's TRT-LLM-Gen artifacts once, before the Ray workers start."""
+    try:
+        from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
+    except ImportError:
+        return
+    enable_rubin = torch.cuda.get_device_capability() == (10, 7)
+    for attempt in range(1, attempts + 1):
+        try:
+            gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=enable_rubin)
+            return
+        except AssertionError:
+            if attempt == attempts:
+                raise
+            time.sleep(5 * attempt)
+
+
+def _run_qwen35_35b_update(
+    model_dir: str,
+    partial: bool,
+    tp_size: int = 4,
+    explicit_cuda_graph: bool = False,
+) -> None:
+    if not os.path.isdir(model_dir):
+        pytest.skip(f"Model directory {model_dir} does not exist")
+
+    _prefetch_flashinfer_trtllm_gen_artifacts()
+    device_ids = list(range(tp_size))
+    hf_model = RefQwen35_35BModelWithIPCHandles(model_dir, device_ids=device_ids)
+    cuda_graph_config = (
+        CudaGraphConfig(batch_sizes=[1, 2], max_batch_size=2) if explicit_cuda_graph else None
+    )
+    _run_multi_gpu_update_weights(
+        model_dir=model_dir,
+        hf_model=hf_model,
+        device_ids=device_ids,
+        llm_kwargs={
+            "max_batch_size": 2,
+            "max_seq_len": 256,
+            "max_num_tokens": 256,
+            # The HF reference always carries the GDN state in fp32, so only
+            # the engine accumulates rounding with a bf16 state cache. Serving
+            # keeps bf16 for throughput (see resolve_ssm_cache_dtype), so a
+            # test comparing against HF has to opt in explicitly.
+            "kv_cache_config": KvCacheConfig(
+                enable_block_reuse=True,
+                free_gpu_memory_fraction=0.05,
+                mamba_ssm_cache_dtype="float32",
+            ),
+            **({"cuda_graph_config": cuda_graph_config} if cuda_graph_config is not None else {}),
+            "model_kwargs": _qwen35_35b_model_kwargs(),
+            "moe_config": MoeConfig(backend="TRTLLM"),
+        },
+        sampling_params=_qwen35_35b_sampling_params(),
+        partial=partial,
+        weight_group=_qwen35_35b_weight_group,
+        prompts_texts=["Hello, my name is", "The future of AI is"],
+        warm_before_update=True,
+        generate_fn=_run_generate_qwen35_35b,
+    )
+
+
+def _run_qwen35_35b_bf16_update(
+    partial: bool,
+    tp_size: int = 4,
+    explicit_cuda_graph: bool = False,
+) -> None:
+    _run_qwen35_35b_update(_qwen35_35b_bf16_model_dir(), partial, tp_size, explicit_cuda_graph)
+
+
+def _run_qwen35_35b_fp8_update(partial: bool) -> None:
+    model_dir = _qwen35_35b_fp8_model_dir()
+    if not os.path.isdir(model_dir):
+        pytest.skip(f"Model directory {model_dir} does not exist")
+
+    _prefetch_flashinfer_trtllm_gen_artifacts()
+    device_ids = list(range(4))
+    checkpoint = RefQwen35_35BFP8CheckpointWithIPCHandles(model_dir, device_ids)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    prompts = [tokenizer.encode(prompt) for prompt in ["Hello, my name is", "The future of AI is"]]
+    del tokenizer
+    sampling_params = _qwen35_35b_sampling_params()
+
+    def generate_logits(llm):
+        return [
+            output.outputs[0].generation_logits for output in llm.generate(prompts, sampling_params)
+        ]
+
+    def update(llm, incremental: bool) -> None:
+        if incremental:
+            groups = sorted(
+                {
+                    _qwen35_35b_weight_group(name)
+                    for name, _ in checkpoint.all_weights[checkpoint.device_id]
+                }
+            )
+            for group in groups:
+                ipc_handles = checkpoint.get_weight_ipc_handles_serialized(
+                    device_ids,
+                    weight_filter=lambda name, group=group: (
+                        _qwen35_35b_weight_group(name) == group
+                    ),
+                )
+                llm._collective_rpc("update_weights", (ipc_handles,))
+        else:
+            ipc_handles = checkpoint.get_weight_ipc_handles_serialized(device_ids)
+            llm._collective_rpc("update_weights", (ipc_handles,))
+        llm._collective_rpc("update_weights", (None,))
+
+    with LLM(
+        model=model_dir,
+        ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
+        tensor_parallel_size=len(device_ids),
+        load_format="dummy",
+        pipeline_parallel_size=1,
+        max_batch_size=2,
+        max_seq_len=256,
+        max_num_tokens=256,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.05),
+        model_kwargs=_qwen35_35b_model_kwargs(),
+        moe_config=MoeConfig(backend="TRTLLM"),
+    ) as llm:
+        # Compile CUDA graphs before refit, then use the first exact-checkpoint
+        # update as the reference for an identical one-shot or partial update.
+        llm.generate(prompts, sampling_params)
+        update(llm, incremental=False)
+        reference_logits = generate_logits(llm)
+        update(llm, incremental=partial)
+        updated_logits = generate_logits(llm)
+        compare_logits(updated_logits, reference_logits)
+
+
+def _attach_to_tp8_ray_cluster(monkeypatch) -> None:
+    """Attach to a cluster with eight GPUs when the driver has only four."""
+    test_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+    python_path = os.environ.get("PYTHONPATH")
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        f"{test_root}{os.pathsep}{python_path}" if python_path else test_root,
+    )
+    monkeypatch.setenv("TLLM_RAY_FORCE_LOCAL_CLUSTER", "0")
+
+    import ray
+
+    if not ray.is_initialized():
+        try:
+            ray.init(address="auto", ignore_reinit_error=True)
+        except ConnectionError:
+            pytest.skip(
+                "TP8 requires either eight local B200s or an attached Ray cluster with eight B200s"
+            )
+
+    available_gpus = int(ray.cluster_resources().get("GPU", 0))
+    if available_gpus < _QWEN35_35B_TP8:
+        pytest.skip(f"TP8 requires eight cluster GPUs, found {available_gpus}")
+
+
+def _run_qwen35_35b_tp8_multinode_update() -> None:
+    """Run the TP8 CUDA Graph test with checkpoint buckets local to each worker."""
+    model_dir = _qwen35_35b_bf16_model_dir()
+    if not os.path.isdir(model_dir):
+        pytest.skip(f"Model directory {model_dir} does not exist")
+
+    groups = sorted(
+        {
+            _qwen35_35b_weight_group(name)
+            for name in _qwen35_35b_selected_checkpoint_names(model_dir)
+        }
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    prompts = [tokenizer.encode(prompt) for prompt in ["Hello, my name is", "The future of AI is"]]
+    del tokenizer
+    sampling_params = _qwen35_35b_sampling_params()
+
+    def generate_logits(llm):
+        return [
+            output.outputs[0].generation_logits for output in llm.generate(prompts, sampling_params)
+        ]
+
+    def update(llm) -> None:
+        for group in groups:
+            llm._collective_rpc("update_weights_from_local_checkpoint", (model_dir, group))
+        llm._collective_rpc("update_weights_from_local_checkpoint", (model_dir, None))
+
+    with LLM(
+        model=model_dir,
+        ray_worker_extension_cls=_QWEN35_35B_TP8_EXTENSION,
+        orchestrator_type="ray",
+        tensor_parallel_size=_QWEN35_35B_TP8,
+        load_format="dummy",
+        pipeline_parallel_size=1,
+        max_batch_size=2,
+        max_seq_len=256,
+        max_num_tokens=256,
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2], max_batch_size=2),
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=True,
+            free_gpu_memory_fraction=0.05,
+            mamba_ssm_cache_dtype="bfloat16",
+        ),
+        model_kwargs=_qwen35_35b_model_kwargs(),
+        moe_config=MoeConfig(backend="TRTLLM"),
+    ) as llm:
+        device_names = llm._collective_rpc("get_test_device_name")
+        assert all("B200" in name.upper() for name in device_names), (
+            f"TP8 alignment coverage requires B200 GPUs, got {device_names}"
+        )
+
+        # Capture before refit, then replay the same graph after two identical
+        # cross-bucket updates. The 35B TP8 layout executes the alignment clone.
+        llm.generate(prompts, sampling_params)
+        update(llm)
+        reference_logits = generate_logits(llm)
+        update(llm)
+        updated_logits = generate_logits(llm)
+        compare_logits(updated_logits, reference_logits)
+
+
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_partial_update_weights_qwen35_35b_bf16_tp8_cuda_graph(
+    monkeypatch,
+):
+    """Exercise TP8's BF16 alignment clone through CUDA Graph replay."""
+    if torch.cuda.device_count() >= _QWEN35_35B_TP8:
+        device_names = [
+            torch.cuda.get_device_name(device_id) for device_id in range(_QWEN35_35B_TP8)
+        ]
+        assert all("B200" in name.upper() for name in device_names), (
+            f"TP8 alignment coverage requires B200 GPUs, got {device_names}"
+        )
+        _run_qwen35_35b_bf16_update(
+            partial=True,
+            tp_size=_QWEN35_35B_TP8,
+            explicit_cuda_graph=True,
+        )
+        return
+
+    _attach_to_tp8_ray_cluster(monkeypatch)
+    _run_qwen35_35b_tp8_multinode_update()
+
+
+@pytest.mark.part5
+@pytest.mark.gpu4
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_update_weights_qwen35_35b_bf16():
+    """One-shot BF16 refit of the production-width 35B model."""
+    _run_qwen35_35b_bf16_update(partial=False)
+
+
+@pytest.mark.part5
+@pytest.mark.gpu4
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_partial_update_weights_qwen35_35b_bf16():
+    """Incremental BF16 refit with GDN and MoE fusion groups split across RPCs."""
+    _run_qwen35_35b_bf16_update(partial=True)
+
+
+@pytest.mark.part5
+@pytest.mark.gpu4
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_update_weights_qwen35_35b_fp8():
+    """One-shot block-FP8 refit of the production-width 35B model."""
+    _run_qwen35_35b_fp8_update(partial=False)
+
+
+@pytest.mark.part5
+@pytest.mark.gpu4
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_partial_update_weights_qwen35_35b_fp8():
+    """Incremental block-FP8 refit with weights and scales split across RPCs."""
+    _run_qwen35_35b_fp8_update(partial=True)
+
+
+class RefNVFP4ModelWithIPCHandles(RefHFModel):
+    """Reference model that loads bf16 weights from HuggingFace, quantizes
+    them to NVFP4 format, and keeps a round-tripped bf16 model for reference
+    inference.
+
+    Since HuggingFace cannot run NVFP4 inference natively, this class:
+    1. Loads the bf16 model from HF
+    2. Quantizes each linear weight to NVFP4
+    3. Dequantizes back to bf16 and replaces model parameters (round-trip),
+       so the HF model can serve as a reference for logits comparison
+    4. Provides IPC handles with NVFP4 weight keys (weight, weight_scale, weight_scale_2)
+    """
+
+    NVFP4_BLOCK_SIZE = 16
+
+    # Patterns for determining which parameters to quantize
+    EXCLUDE_PATTERNS = [
+        "embed_tokens",
+        "lm_head",
+        "layernorm",
+        "norm",
+        "ln_",
+        "embeddings",
+        "mlp.gate.weight",  # MoE router
+    ]
+    INCLUDE_PATTERNS = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "fc1",
+        "fc2",
+        "mlp",
+    ]
+
+    # Fusion groups: projections that TRT-LLM fuses together must share weight_scale_2.
+    FUSION_GROUPS = (
+        ("q_proj", "k_proj", "v_proj"),
+        ("gate_proj", "up_proj"),
+    )
+    _PROJ_TO_GROUP = {proj: group for group in FUSION_GROUPS for proj in group}
+
+    def __init__(self, model_dir: str, device_id: int = 0, num_hidden_layers: Optional[int] = None):
+        self.device_id = device_id
+        config = AutoConfig.from_pretrained(model_dir)
+        if num_hidden_layers is not None:
+            config.num_hidden_layers = num_hidden_layers
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_dir, config=config, torch_dtype=torch.bfloat16, attn_implementation="eager"
+        ).to(f"cuda:{device_id}")
+        self.all_weights = {}
+        self._dequantized_weights = {}
+        self.device_uuid = [get_device_uuid(i) for i in range(torch.cuda.device_count())]
+        self._quantize_and_replicate_weights()
+
+    @staticmethod
+    def _unfuse_moe_expert_params(
+        all_params: List[tuple],
+    ) -> Tuple[List[tuple], dict]:
+        """Unfuse HF transformers >=5.x fused MoE expert parameters.
+
+        HF stores MoE experts as fused 3D ``nn.Parameter``s whose names do
+        not end in ``.weight`` (so they would silently bypass
+        ``_should_quantize``):
+
+            ...mlp.experts.gate_up_proj  -> [num_experts, 2*intermediate, hidden]
+            ...mlp.experts.down_proj     -> [num_experts, hidden, intermediate]
+
+        Split them into per-expert names that match the TRT-LLM weight
+        loader convention so quantization and IPC weight upload route them
+        correctly:
+
+            ...mlp.experts.{i}.gate_proj.weight
+            ...mlp.experts.{i}.up_proj.weight
+            ...mlp.experts.{i}.down_proj.weight
+
+        Also returns a ``refuse_map`` that records, per unfused-param name,
+        the originating fused-param name plus how to slice it back. This
+        lets the dequantize-and-copy-back step write per-expert dequantized
+        weights into the HF model's fused parameter tensors, keeping the HF
+        reference and the TRT-LLM weights numerically aligned.
+        """
+        unfused: List[tuple] = []
+        # name -> (fused_param_name, expert_index, "gate" | "up" | "down")
+        refuse_map: dict = {}
+        for name, p in all_params:
+            if name.endswith(".experts.gate_up_proj") and p.dim() == 3:
+                prefix = name[: -len("gate_up_proj")]
+                num_experts = p.shape[0]
+                half = p.shape[1] // 2
+                for i in range(num_experts):
+                    g_name = f"{prefix}{i}.gate_proj.weight"
+                    u_name = f"{prefix}{i}.up_proj.weight"
+                    unfused.append((g_name, p[i, :half, :].clone()))
+                    unfused.append((u_name, p[i, half:, :].clone()))
+                    refuse_map[g_name] = (name, i, "gate")
+                    refuse_map[u_name] = (name, i, "up")
+            elif name.endswith(".experts.down_proj") and p.dim() == 3:
+                prefix = name[: -len("down_proj")]
+                num_experts = p.shape[0]
+                for i in range(num_experts):
+                    d_name = f"{prefix}{i}.down_proj.weight"
+                    unfused.append((d_name, p[i].clone()))
+                    refuse_map[d_name] = (name, i, "down")
+            else:
+                unfused.append((name, p))
+        return unfused, refuse_map
+
+    def _quantize_and_replicate_weights(self):
+        """Quantize linear weights to NVFP4 and replicate across devices.
+
+        Projections in the same fusion group (qkv, gate_up) share a unified
+        weight_scale_2 computed from their joint amax, matching the behavior
+        of verl's TRTLLMNVFP4QuantizerHelper.
+        """
+        # First pass: collect all params, buffer fusion groups
+        all_params = [
+            (name, param.detach().clone()) for name, param in self.model.named_parameters()
+        ]
+        # transformers >=5.x ships fused 3D MoE expert parameters; split them
+        # back into per-expert ``.weight`` entries so the quantize loop and
+        # the TRT-LLM weight loader can match them.
+        all_params, moe_refuse_map = self._unfuse_moe_expert_params(all_params)
+
+        # Buffer: {(layer_prefix, group): {proj_type: (name, tensor)}}
+        fusion_buffer: dict[tuple, dict] = {}
+        model_weights = []
+
+        for name, p in all_params:
+            if not self._should_quantize(name):
+                model_weights.append((name, p))
+                continue
+
+            proj_type, group = self._get_proj_info(name)
+            if proj_type is not None:
+                layer_prefix = name[: name.index(proj_type)].rstrip(".")
+                buf_key = (layer_prefix, group)
+                fusion_buffer.setdefault(buf_key, {})[proj_type] = (name, p)
+
+                # Flush when all members of the group are collected
+                if all(proj in fusion_buffer[buf_key] for proj in group):
+                    projs = fusion_buffer.pop(buf_key)
+                    model_weights.extend(self._quantize_fusion_group(group, projs))
+            else:
+                model_weights.extend(self._quantize_single_weight(name, p))
+
+        assert not fusion_buffer, f"Incomplete fusion groups: {list(fusion_buffer.keys())}"
+
+        self.all_weights[self.device_id] = model_weights
+        for i in range(torch.cuda.device_count()):
+            if i != self.device_id:
+                self.all_weights[i] = [(n, p.to(f"cuda:{i}")) for n, p in model_weights]
+
+        with torch.no_grad():
+            param_dict = dict(self.model.named_parameters())
+            for name, dequant_weight in self._dequantized_weights.items():
+                if name in param_dict:
+                    param_dict[name].copy_(dequant_weight)
+                elif name in moe_refuse_map:
+                    # Per-expert dequantized weight that came from an
+                    # unfused 3D MoE param: write back into the fused
+                    # tensor's expert slice.
+                    fused_name, expert_idx, kind = moe_refuse_map[name]
+                    fused = param_dict[fused_name]
+                    if kind == "gate":
+                        half = fused.shape[1] // 2
+                        fused[expert_idx, :half, :].copy_(dequant_weight)
+                    elif kind == "up":
+                        half = fused.shape[1] // 2
+                        fused[expert_idx, half:, :].copy_(dequant_weight)
+                    else:  # "down"
+                        fused[expert_idx].copy_(dequant_weight)
+        del self._dequantized_weights
+
+    @classmethod
+    def _should_quantize(cls, name: str) -> bool:
+        """Determine whether to quantize a parameter to NVFP4."""
+        if not name.endswith(".weight"):
+            return False
+        name_lower = name.lower()
+        for pattern in cls.EXCLUDE_PATTERNS:
+            if pattern in name_lower:
+                return False
+        for pattern in cls.INCLUDE_PATTERNS:
+            if pattern in name_lower:
+                return True
+        return False
+
+    @classmethod
+    def _get_proj_info(cls, name: str):
+        """Return (proj_type, fusion_group) if param belongs to a fusion group."""
+        for proj, group in cls._PROJ_TO_GROUP.items():
+            if proj in name:
+                return proj, group
+        return None, None
+
+    def _quantize_single_weight(self, name: str, weight: torch.Tensor) -> List[tuple]:
+        """Quantize a single (non-fused) weight to NVFP4."""
+        return list(self._do_quantize(name, weight))
+
+    def _quantize_fusion_group(self, group: tuple, projs: dict) -> List[tuple]:
+        """Quantize a fusion group with unified weight_scale_2."""
+        # Compute joint amax across all members
+        all_amaxes = [v.float().abs().amax() for _, v in projs.values()]
+        unified_scale_2 = torch.stack(all_amaxes).amax() / (6.0 * 448.0)
+
+        results = []
+        for proj_type in group:
+            if proj_type in projs:
+                name, weight = projs[proj_type]
+                results.extend(self._do_quantize(name, weight, unified_scale_2))
+        return results
+
+    def _do_quantize(
+        self,
+        name: str,
+        weight: torch.Tensor,
+        weight_scale_2: Optional[torch.Tensor] = None,
+    ) -> List[tuple]:
+        """Core NVFP4 quantization. Returns [(name, packed), (name_scale, bs), (name_scale_2, s2)]."""
+        weight_float = weight.float()
+        if weight_scale_2 is None:
+            weight_scale_2 = weight_float.abs().amax().float() / (6.0 * 448.0)
+
+        global_scale = weight_scale_2.reciprocal()
+        packed_weight, block_scale = torch.ops.trtllm.fp4_quantize(
+            weight_float.to(torch.bfloat16),
+            global_scale,
+            self.NVFP4_BLOCK_SIZE,
+            False,
+            False,
+        )
+        packed_uint8 = packed_weight.to(torch.uint8)
+        block_scale_fp8 = block_scale.view(torch.float8_e4m3fn).reshape(
+            weight_float.shape[0], weight_float.shape[1] // self.NVFP4_BLOCK_SIZE
+        )
+
+        self._dequantized_weights[name] = dequant_nvfp4_2d_triton(
+            packed_uint8,
+            # The dequant kernel loads raw scale bytes and bitcasts them to FP8.
+            block_scale_fp8.view(torch.uint8),
+            weight_scale_2,
+            target_dtype=torch.bfloat16,
+            sf_vec_size=self.NVFP4_BLOCK_SIZE,
+        )
+
+        return [
+            (name, packed_uint8),
+            (name + "_scale", block_scale_fp8),
+            (name + "_scale_2", weight_scale_2),
+        ]
+
+    def get_weight_ipc_handles_serialized(
+        self,
+        device_ids: Optional[List[int]] = None,
+        weight_filter: Optional[Callable[[str], bool]] = None,
+    ):
+        ret = {}
+        device_list = list(range(torch.cuda.device_count())) if device_ids is None else device_ids
+
+        for device in device_list:
+            all_handles = []
+            for item in self.all_weights[device]:
+                name, p = item
+                if weight_filter is not None and not weight_filter(name):
+                    continue
+                handle = reduce_tensor(p)
+                all_handles.append((name, handle))
+
+            serialized = base64.b64encode(pickle.dumps(all_handles)).decode("utf-8")
+            ret[self.device_uuid[device]] = serialized
+
+        return ret
+
+
+class RefQwen35MXFP8ModelWithIPCHandles(RefQwen35_35BModelWithIPCHandles):
+    """Qwen3.5 MoE reference whose weights are quantized to MXFP8 in place.
+
+    Built on the Qwen3.5 reference rather than the NVFP4 one because the
+    checkpoint is a Qwen3_5MoeForConditionalGeneration: its vocab_size and
+    num_hidden_layers live under `text_config`, so the generic
+    AutoModelForCausalLM path fails with "no attribute 'vocab_size'".
+
+    Routed MoE experts only, matching the production contract
+    (FP8_BLOCK_QUANT_KWARGS.modules_to_not_convert in NeMo-RL): attention,
+    shared experts, routers, GDN, embeddings, lm_head and the vision tower
+    stay BF16. `_qwen35_mxfp8_model_kwargs` passes the matching
+    `ignored_layers`, since a module the engine quantizes but the reference
+    does not would be fed BF16 bytes as if they were e4m3.
+
+    Deliberately not "quantize everything": a fused QKV Linear under MXFP8
+    hits a separate, unrelated limitation. With an attention output gate the
+    fused 'q' slot spans 2*q_size rows while the checkpoint's q_proj scale
+    has q_size, so the scale cannot be sliced to match the weight ("scale
+    has 128 rows but the shard spans 256"). No NeMo-RL recipe quantizes
+    attention, so that path is out of scope here; MXFP8LinearMethod now
+    asserts the mismatch instead of failing deep inside a tensor copy.
+    """
+
+    MXFP8_BLOCK_SIZE = 32
+
+    EXCLUDE_PATTERNS = [
+        "embed_tokens",
+        "lm_head",
+        "layernorm",
+        "norm",
+        "ln_",
+        "embeddings",
+        "mlp.gate.weight",  # MoE router stays BF16
+        "visual",
+        "vision",
+    ]
+    # Routed experts only. "mlp.experts." is what separates them from the
+    # shared expert, whose projections carry the same leaf names.
+    INCLUDE_PATTERNS = [
+        "mlp.experts.",
+    ]
+
+    @classmethod
+    def _should_quantize(cls, name: str, param: torch.Tensor) -> bool:
+        name_lower = name.lower()
+        if any(pattern in name_lower for pattern in cls.EXCLUDE_PATTERNS):
+            return False
+        if not any(pattern in name_lower for pattern in cls.INCLUDE_PATTERNS):
+            return False
+        # 1x32 blocks run along K; anything whose last dim is not a multiple of
+        # the block size (or that is not at least 2D) cannot be MXFP8.
+        return param.dim() >= 2 and param.shape[-1] % cls.MXFP8_BLOCK_SIZE == 0
+
+    @classmethod
+    def _quantize_2d(cls, w: torch.Tensor):
+        """MXFP8-quantize a [..., K] tensor; blocks run along the last dim."""
+        flat = w.reshape(-1, w.shape[-1]).to(torch.bfloat16)
+        q, s = quant_bf16_to_mxfp8(flat, cls.MXFP8_BLOCK_SIZE)
+        return (q.reshape(w.shape), s.reshape(*w.shape[:-1], w.shape[-1] // cls.MXFP8_BLOCK_SIZE))
+
+    def _emit_expert_projection(self, out, prefix, expert_id, leaf, tensor):
+        """Emit one per-expert projection in NeMo-RL refit naming.
+
+        Returns the dequantized tensor so the caller can restore it into the
+        reference model.
+        """
+        q, s = self._quantize_2d(tensor)
+        name = f"{prefix}.{expert_id}.{leaf}.weight"
+        out.append((name, q))
+        out.append((name.removesuffix(".weight") + ".weight_scale_inv", s))
+        return dequant_mxfp8_weight(q, s, self.MXFP8_BLOCK_SIZE).to(torch.bfloat16)
+
+    def _replicate_weights_to_devices(self, device_ids: List[int]) -> None:
+        """Mirror what NeMo-RL sends at refit time.
+
+        nemo_rl's fp8._convert_fused_expert_weight expands the stacked expert
+        tensors into per-expert gate_proj/up_proj/down_proj names and quantizes
+        each one, so TRT-LLM never sees a fused expert tensor from a refit.
+        This test guards that contract, not the raw-checkpoint layout: loading a
+        Qwen3.5 BF16 checkpoint directly puts the MoE in FUSED_GATE_UP_PROJ
+        mode, a path no NeMo-RL recipe takes.
+
+        Layout, read from the checkpoint rather than assumed: gate_up_proj is
+        [E, 2I, H] and down_proj is [E, H, I] -- i.e. [E, out, in], so the
+        contraction dim is already last and no transpose is needed. MXFP8
+        blocks run along that dim. This matches what
+        fp8._convert_fused_expert_weight slices (`tensor[start:end,
+        :intermediate_size, :]`).
+        """
+        source_weights = []
+        quantized = 0
+        with torch.no_grad():
+            for name, parameter in self.model.named_parameters():
+                lowered = name.lower()
+                is_expert = (
+                    ".mlp.experts." in lowered
+                    and parameter.dim() == 3
+                    and not any(p in lowered for p in self.EXCLUDE_PATTERNS)
+                )
+                if not is_expert:
+                    source_weights.append((name, parameter.detach()))
+                    continue
+
+                prefix, leaf = name.rsplit(".", 1)
+                stacked = parameter.detach()
+                rebuilt = []
+                for expert_id in range(stacked.shape[0]):
+                    per_expert = stacked[expert_id]
+                    if leaf == "gate_up_proj":
+                        half = per_expert.shape[0] // 2
+                        gate = self._emit_expert_projection(
+                            source_weights, prefix, expert_id, "gate_proj", per_expert[:half]
+                        )
+                        up = self._emit_expert_projection(
+                            source_weights, prefix, expert_id, "up_proj", per_expert[half:]
+                        )
+                        rebuilt.append(torch.cat((gate, up), dim=0))
+                    else:
+                        rebuilt.append(
+                            self._emit_expert_projection(
+                                source_weights, prefix, expert_id, "down_proj", per_expert
+                            )
+                        )
+                # Put the dequantized values back so the reference logits carry
+                # the same MXFP8 rounding as the engine's.
+                parameter.copy_(torch.stack(rebuilt, dim=0).to(parameter.dtype))
+                quantized += 1
+        assert quantized > 0, "no stacked expert tensor matched the filter"
+
+        self.all_weights[self.device_id] = source_weights
+        for device_id in device_ids:
+            if device_id == self.device_id:
+                continue
+            self.all_weights[device_id] = [
+                (n, t.to(f"cuda:{device_id}")) for n, t in source_weights
+            ]
+
+
+def _qwen35_mxfp8_model_kwargs() -> dict:
+    """Qwen3.5 test-shape kwargs plus the MXFP8 quantization config.
+
+    model_config.py maps quant_method="mxfp8" to QuantAlgo.MXFP8 and asserts
+    the block size is exactly [1, 32].
+    """
+    kwargs = _qwen35_35b_model_kwargs()
+    kwargs["quantization_config"] = {
+        "quant_method": "mxfp8",
+        "weight_block_size": [1, 32],
+        # Must mirror RefQwen35MXFP8ModelWithIPCHandles' filter exactly: a
+        # module the engine quantizes but the reference does not would be fed
+        # BF16 bytes as if they were e4m3, and vice versa.
+        #
+        # linear_attn is not merely a convention here -- the GDN mixer's
+        # in_proj_ba projects to N=16, and the MXFP8 GEMM requires N % 32 == 0
+        # ("RuntimeError: N (16) must be divisible by 32"), so those layers
+        # cannot be MXFP8 at all. The production recipe keeps them BF16 for the
+        # same reason (see modules_to_not_convert in the 397B fp8 recipe).
+        # Mirror of the reference filter: everything except routed experts,
+        # the same scope as NeMo-RL's FP8_BLOCK_QUANT_KWARGS.
+        "ignored_layers": [
+            "*self_attn*",
+            "*linear_attn*",
+            "*mlp.gate",
+            "*mlp.shared_expert*",
+            "*visual*",
+            "*vision*",
+            "*embed_tokens*",
+            "lm_head",
+        ],
+    }
+    return kwargs
+
+
+def _run_qwen35_mxfp8_update(
+    partial: bool, tp_size: int = 4, model_dir: Optional[str] = None
+) -> None:
+    """MXFP8 refit of the Qwen3.5 MoE test shape against a BF16 reference."""
+    model_dir = model_dir or _mxfp8_base_model_dir()
+    if not os.path.isdir(model_dir):
+        pytest.skip(f"Model directory {model_dir} does not exist")
+
+    device_ids = list(range(tp_size))
+    hf_model = RefQwen35MXFP8ModelWithIPCHandles(model_dir, device_ids=device_ids)
+    _run_multi_gpu_update_weights(
+        model_dir=model_dir,
+        hf_model=hf_model,
+        device_ids=device_ids,
+        llm_kwargs={
+            "max_batch_size": 2,
+            "max_seq_len": 256,
+            "max_num_tokens": 256,
+            # load_format="dummy" is set by _run_multi_gpu_update_weights.
+            # Block reuse off: warm_before_update runs a generate against the
+            # load_format="dummy" engine, whose MXFP8 scale buffer is
+            # uninitialised. A garbage UE8M0 exponent denormalises to inf, so
+            # the warmup writes NaN KV blocks; a refit replaces the weights but
+            # does not invalidate the cache, and a prompt that hits those blocks
+            # then produces NaN logits while a prompt that misses is exact.
+            # (Observed as 397B prompt0 cosine=nan while prompt1 cosine=0.9997.)
+            "kv_cache_config": KvCacheConfig(
+                enable_block_reuse=False,
+                free_gpu_memory_fraction=0.05,
+                mamba_ssm_cache_dtype="bfloat16",
+            ),
+            "model_kwargs": _qwen35_mxfp8_model_kwargs(),
+            "moe_config": MoeConfig(backend="CUTLASS"),
+            "torch_compile_config": TorchCompileConfig(enable_piecewise_cuda_graph=True),
+            "disable_mm_encoder": True,
+        },
+        sampling_params=SamplingParams(temperature=0, return_generation_logits=True, max_tokens=8),
+        partial=partial,
+        weight_group=_qwen35_35b_weight_group,
+        # NaN follows the text, not the batch slot: swapping these two showed
+        # "Hello, my name is" NaN in either position while "The future of AI
+        # is" stayed at cosine 0.9997. Content-dependence points at routing.
+        prompts_texts=["Hello, my name is", "The future of AI is"],
+        warm_before_update=True,
+        generate_fn=_mxfp8_generate_with_stats,
+        # The engine also quantizes activations to MXFP8; the BF16 reference does not.
+        threshold=0.85,
+    )
+
+
+def _mxfp8_generate_with_stats(llm, hf_model, prompts, sampling_params):
+    """Wrap the shared generate step to report how far the logits actually are.
+
+    Token overlap alone cannot separate "the refit loaded garbage" from "MXFP8
+    is coarse enough to flip a greedy argmax": both show up as 0% overlap. The
+    engine quantizes activations to MXFP8 as well (use_mxfp8_act_scaling), while
+    the reference only carries the dequantized weights, so some divergence is
+    expected by construction. A high cosine with flipped argmax means precision;
+    a low cosine means the weights themselves are wrong.
+    """
+    llm_logits, ref_logits = _run_generate_qwen35_35b(llm, hf_model, prompts, sampling_params)
+    for i, (a, b) in enumerate(zip(llm_logits, ref_logits)):
+        x = a.float().flatten()
+        y = b.float().to(x.device).flatten()
+        n = min(x.numel(), y.numel())
+        x, y = x[:n], y[:n]
+        cos = torch.nn.functional.cosine_similarity(x, y, dim=0).item()
+        rel = ((x - y).norm() / y.norm().clamp_min(1e-6)).item()
+        top1 = (
+            (x.reshape(a.shape[0], -1).argmax(-1) == y.reshape(a.shape[0], -1).argmax(-1))
+            .float()
+            .mean()
+            .item()
+        )
+        print(
+            f"[MXFP8DBG] logits prompt{i}: cosine={cos:.4f} rel_err={rel:.4f} "
+            f"top1_match={top1:.2%} finite={bool(torch.isfinite(x).all())}",
+            flush=True,
+        )
+    return llm_logits, ref_logits
+
+
+def _run_qwen35_397b_mxfp8_tp8_multinode(
+    torch_compile_config: Optional[TorchCompileConfig],
+) -> List[torch.Tensor]:
+    """Refit TP8 and return short generation logits."""
+    model_dir = _mxfp8_397b_model_dir()
+    if not os.path.isdir(model_dir):
+        pytest.skip(f"Model directory {model_dir} does not exist")
+
+    groups = sorted(
+        {
+            _qwen35_35b_weight_group(name)
+            for name in _qwen35_35b_selected_checkpoint_names(model_dir)
+        }
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    prompts = [tokenizer.encode(prompt) for prompt in ["Hello, my name is", "The future of AI is"]]
+    del tokenizer
+    sampling_params = SamplingParams(
+        temperature=0,
+        return_generation_logits=True,
+        max_tokens=4,
+    )
+
+    llm_kwargs = {}
+    if torch_compile_config is not None:
+        llm_kwargs["torch_compile_config"] = torch_compile_config
+    # Temporary isolation control: distinguish torch.compile/MXFP8 refit from any CUDA-graph recapture.
+    if os.environ.get("TLLM_TEST_DISABLE_CUDA_GRAPHS"):
+        llm_kwargs["cuda_graph_config"] = None
+    # Diagnostic override for the Rubin TP8 PCG regression: retain AUTO as the
+    # production default, but permit an isolated NCCL control run without
+    # changing the model/refit/capture lifecycle under test.
+    allreduce_strategy = os.environ.get("TLLM_TEST_ALLREDUCE_STRATEGY")
+    if allreduce_strategy:
+        llm_kwargs["allreduce_strategy"] = allreduce_strategy
+
+    with LLM(
+        model=model_dir,
+        ray_worker_extension_cls=_QWEN35_35B_TP8_EXTENSION,
+        tensor_parallel_size=_QWEN35_35B_TP8,
+        load_format="dummy",
+        pipeline_parallel_size=1,
+        max_batch_size=2,
+        max_seq_len=256,
+        max_num_tokens=256,
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            free_gpu_memory_fraction=0.05,
+            mamba_ssm_cache_dtype="float32",
+        ),
+        model_kwargs=_qwen35_mxfp8_model_kwargs(),
+        moe_config=MoeConfig(backend="CUTLASS"),
+        enable_chunked_prefill=True,
+        disable_mm_encoder=True,
+        **llm_kwargs,
+    ) as llm:
+        # Match RL by capturing the dummy model before refit.  The opt-out is
+        # an isolation control for the Rubin PCG regression: it leaves the
+        # real MXFP8 refit and final PCG capture intact, but removes only the
+        # initial capture -> release -> recapture lifecycle.
+        if not os.environ.get("TLLM_TEST_SKIP_PREFIT_PCG_CAPTURE"):
+            llm.generate(prompts, sampling_params)
+        for group in groups:
+            llm._collective_rpc(
+                "update_mxfp8_weights_from_local_checkpoint",
+                (model_dir, group),
+            )
+        llm._collective_rpc(
+            "update_mxfp8_weights_from_local_checkpoint",
+            (model_dir, None),
+        )
+        return [
+            output.outputs[0].generation_logits.detach().cpu()
+            for output in llm.generate(prompts, sampling_params)
+        ]
+
+
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def _run_qwen35_397b_bf16_tp8_multinode(
+    torch_compile_config: Optional[TorchCompileConfig],
+) -> List[torch.Tensor]:
+    """TP8 BF16 refit control matching the 397B MXFP8 repro topology."""
+    model_dir = _mxfp8_397b_model_dir()
+    if not os.path.isdir(model_dir):
+        pytest.skip(f"Model directory {model_dir} does not exist")
+
+    groups = sorted(
+        {
+            _qwen35_35b_weight_group(name)
+            for name in _qwen35_35b_selected_checkpoint_names(model_dir)
+        }
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    prompts = [tokenizer.encode(prompt) for prompt in ["Hello, my name is", "The future of AI is"]]
+    del tokenizer
+    sampling_params = SamplingParams(temperature=0, return_generation_logits=True, max_tokens=4)
+    llm_kwargs = {}
+    if torch_compile_config is not None:
+        llm_kwargs["torch_compile_config"] = torch_compile_config
+    # Temporary isolation control: disable normal CUDA graphs while retaining torch.compile.
+    if os.environ.get("TLLM_TEST_DISABLE_CUDA_GRAPHS"):
+        llm_kwargs["cuda_graph_config"] = None
+
+    with LLM(
+        model=model_dir,
+        ray_worker_extension_cls=_QWEN35_35B_TP8_EXTENSION,
+        orchestrator_type="ray",
+        tensor_parallel_size=_QWEN35_35B_TP8,
+        load_format="dummy",
+        pipeline_parallel_size=1,
+        max_batch_size=2,
+        max_seq_len=256,
+        max_num_tokens=256,
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False, free_gpu_memory_fraction=0.05, mamba_ssm_cache_dtype="float32"
+        ),
+        model_kwargs=_qwen35_35b_model_kwargs(),
+        moe_config=MoeConfig(backend="CUTLASS"),
+        enable_chunked_prefill=True,
+        disable_mm_encoder=True,
+        **llm_kwargs,
+    ) as llm:
+        llm.generate(prompts, sampling_params)
+        for group in groups:
+            llm._collective_rpc("update_weights_from_local_checkpoint", (model_dir, group))
+        llm._collective_rpc("update_weights_from_local_checkpoint", (model_dir, None))
+        return [
+            output.outputs[0].generation_logits.detach().cpu()
+            for output in llm.generate(prompts, sampling_params)
+        ]
+
+
+@pytest.mark.high_cuda_memory
+@skip_pre_rubin
+def test_llm_update_weights_qwen35_397b_bf16_tp8_compiled_no_pcg(monkeypatch):
+    """BF16 control: eager and torch.compile TP8 refits must agree without PCG."""
+    _attach_to_tp8_ray_cluster(monkeypatch)
+    eager_logits = _run_qwen35_397b_bf16_tp8_multinode(None)
+    compiled_logits = _run_qwen35_397b_bf16_tp8_multinode(TorchCompileConfig())
+    assert all(torch.isfinite(logits).all() for logits in eager_logits)
+    assert all(torch.isfinite(logits).all() for logits in compiled_logits)
+    compare_logits(compiled_logits, eager_logits)
+
+
+@pytest.mark.high_cuda_memory
+@skip_pre_rubin
+def test_llm_update_weights_qwen35_397b_mxfp8_tp8_piecewise_cuda_graph(
+    monkeypatch,
+):
+    """Compare TP8 refit logits with and without PWCG."""
+    _attach_to_tp8_ray_cluster(monkeypatch)
+    eager_logits = _run_qwen35_397b_mxfp8_tp8_multinode(None)
+    piecewise_logits = _run_qwen35_397b_mxfp8_tp8_multinode(
+        TorchCompileConfig(enable_piecewise_cuda_graph=True)
+    )
+    assert all(torch.isfinite(logits).all() for logits in eager_logits)
+    assert all(torch.isfinite(logits).all() for logits in piecewise_logits)
+    compare_logits(piecewise_logits, eager_logits)
+
+
+@pytest.mark.high_cuda_memory
+@skip_pre_rubin
+def test_llm_update_weights_qwen35_397b_mxfp8_tp8_eager_repeat(
+    monkeypatch,
+):
+    """Control: two independent TP8 MXFP8 refits without PCG must agree."""
+    _attach_to_tp8_ray_cluster(monkeypatch)
+    first_eager_logits = _run_qwen35_397b_mxfp8_tp8_multinode(None)
+    second_eager_logits = _run_qwen35_397b_mxfp8_tp8_multinode(None)
+    assert all(torch.isfinite(logits).all() for logits in first_eager_logits)
+    assert all(torch.isfinite(logits).all() for logits in second_eager_logits)
+    compare_logits(second_eager_logits, first_eager_logits)
+
+
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_update_weights_qwen35_397b_mxfp8_tp8_compiled_no_pcg(
+    monkeypatch,
+):
+    """Control: torch.compile without piecewise CUDA graphs must agree with eager."""
+    _attach_to_tp8_ray_cluster(monkeypatch)
+    eager_logits = _run_qwen35_397b_mxfp8_tp8_multinode(None)
+    compiled_logits = _run_qwen35_397b_mxfp8_tp8_multinode(TorchCompileConfig())
+    assert all(torch.isfinite(logits).all() for logits in eager_logits)
+    assert all(torch.isfinite(logits).all() for logits in compiled_logits)
+    compare_logits(compiled_logits, eager_logits)
+
+
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_update_weights_qwen35_397b_mxfp8_tp1():
+    """397B shapes on a single GPU: isolates TP sharding as a variable.
+
+    The isolated MoE probe (no TP) is numerically correct at these shapes and
+    the same full-model test passes at 35B/TP4, so TP sharding of the MXFP8
+    routed experts is the remaining difference. If this passes, TP is the
+    trigger; if it fails, the trigger is elsewhere in the full-model path.
+    """
+    _run_qwen35_mxfp8_update(partial=False, tp_size=1, model_dir=_mxfp8_397b_model_dir())
+
+
+@pytest.mark.gpu4
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_update_weights_qwen35_397b_mxfp8():
+    """397B width and expert count at TP4, i.e. on a single 4-GPU node.
+
+    Isolates the width/expert-count half of the 397B configuration from the
+    TP8/MEP8 half: the reference model is replicated onto every device in one
+    process, so TP8 needs eight *local* GPUs, which a 4-GPU node cannot give.
+    If the MXFP8 refit fails here, the trigger is the shape; if it passes, the
+    trigger is the 8-way split.
+    """
+    _run_qwen35_mxfp8_update(partial=False, tp_size=4, model_dir=_mxfp8_397b_model_dir())
+
+
+@pytest.mark.gpu4
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_partial_update_weights_qwen35_397b_mxfp8():
+    """Bucketed variant of the 397B-shape refit at TP4."""
+    _run_qwen35_mxfp8_update(partial=True, tp_size=4, model_dir=_mxfp8_397b_model_dir())
+
+
+@pytest.mark.gpu8
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_update_weights_qwen35_397b_mxfp8_tp8():
+    """397B shapes at TP8: reproduces the width, expert count and MoE EP split
+    of the 16-node recipe on two nodes, so an MXFP8 refit failure that only
+    appears at 397B scale can be chased without an e2e allocation."""
+    _run_qwen35_mxfp8_update(partial=False, tp_size=8, model_dir=_mxfp8_397b_model_dir())
+
+
+@pytest.mark.gpu8
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_partial_update_weights_qwen35_397b_mxfp8_tp8():
+    """Bucketed variant of the 397B-shape refit."""
+    _run_qwen35_mxfp8_update(partial=True, tp_size=8, model_dir=_mxfp8_397b_model_dir())
+
+
+@pytest.mark.part5
+@pytest.mark.gpu4
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_update_weights_qwen35_mxfp8():
+    """One-shot MXFP8 refit covering both the Linear and MoE quant paths."""
+    _run_qwen35_mxfp8_update(partial=False)
+
+
+@pytest.mark.part5
+@pytest.mark.gpu4
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_partial_update_weights_qwen35_mxfp8():
+    """Incremental MXFP8 refit: weights and scales split across update RPCs."""
+    _run_qwen35_mxfp8_update(partial=True)
+
+
+@pytest.mark.part2
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "model_dir",
+    [
+        "Qwen3/Qwen3-30B-A3B",
+        "Qwen3/Qwen3-8B",
+    ],
+)
+@pytest.mark.parametrize(
+    "kv_cache_dtype",
+    [
+        "auto",
+        "fp8",
+    ],
+)
+def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
+    model_dir = str(llm_models_root() / model_dir)
+    num_hidden_layers = 1
+    hf_model = RefNVFP4ModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True, free_gpu_memory_fraction=0.1, dtype=kv_cache_dtype
+    )
+    with LLM(
+        model=model_dir,
+        ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
+        tensor_parallel_size=2,
+        load_format="dummy",
+        pipeline_parallel_size=1,
+        kv_cache_config=kv_cache_config,
+        force_dynamic_quantization=True,
+        model_kwargs={
+            "num_hidden_layers": num_hidden_layers,
+            "quantization_config": {
+                "quant_method": "nvfp4",
+                "group_size": 16,
+            },
+        },
+    ) as llm:
+        prompts_texts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+        prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
+        del tokenizer
+        sampling_params = SamplingParams(
+            temperature=0, return_generation_logits=True, max_tokens=1024
+        )
+
+        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1])
+        llm._collective_rpc("update_weights", (ipc_handles,))
+        llm._collective_rpc("update_weights", (None,))
+
+        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
+        # Use a looser threshold because NVFP4 logits are compared against a BF16 reference.
+        compare_logits(llm_logits, ref_logits, threshold=0.8)
+
+
+@pytest.mark.part3
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "model_dir",
+    [
+        "Qwen3/Qwen3-30B-A3B",
+        "Qwen3/Qwen3-8B",
+    ],
+)
+@pytest.mark.parametrize(
+    "kv_cache_dtype",
+    [
+        "auto",
+        "fp8",
+    ],
+)
+def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
+    model_dir = str(llm_models_root() / model_dir)
+    num_hidden_layers = 1
+    hf_model = RefNVFP4ModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True, free_gpu_memory_fraction=0.1, dtype=kv_cache_dtype
+    )
+    with LLM(
+        model=model_dir,
+        ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
+        tensor_parallel_size=2,
+        load_format="dummy",
+        pipeline_parallel_size=1,
+        kv_cache_config=kv_cache_config,
+        force_dynamic_quantization=True,
+        model_kwargs={
+            "num_hidden_layers": num_hidden_layers,
+            "quantization_config": {
+                "quant_method": "nvfp4",
+                "group_size": 16,
+            },
+        },
+    ) as llm:
+        prompts_texts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+        prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
+        del tokenizer
+
+        sampling_params = SamplingParams(
+            temperature=0, return_generation_logits=True, max_tokens=1024
+        )
+
+        def common_filter(filter_name: str) -> Callable[[str], bool]:
+            def filter_fn(name: str) -> bool:
+                return name.endswith(filter_name)
+
+            return filter_fn
+
+        # Generate filter_list from model weight keys by removing layer prefix
+        layer_prefix_pattern = re.compile(r"^model\.layers\.\d+\.")
+        filter_set = set()
+        for name, _ in hf_model.all_weights[hf_model.device_id]:
+            suffix = layer_prefix_pattern.sub("", name)
+            filter_set.add(suffix)
+        filter_list = list(filter_set)
+
+        for filter_name in filter_list:
+            weight_filter = common_filter(filter_name=filter_name)
+            ipc_handles = hf_model.get_weight_ipc_handles_serialized(
+                [0, 1], weight_filter=weight_filter
+            )
+            llm._collective_rpc("update_weights", (ipc_handles,))
+        llm._collective_rpc("update_weights", (None,))
+
+        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
+        # Use a looser threshold because NVFP4 logits are compared against a BF16 reference.
+        compare_logits(llm_logits, ref_logits, threshold=0.8)
+
+
+@pytest.mark.part4
+@skip_pre_hopper
+def test_llm_update_weights_nemotron_h():
+    """Weight update on Nemotron-H, a hybrid model mixing mamba, MoE and
+    attention layers.
+
+    Requires mamba-ssm and causal-conv1d to be importable: without them HF
+    falls back to the naive Python selective_scan path, which OOMs on
+    Nemotron-H and produces unmatched logits. Ray CI builds both against the
+    installed torch with jenkins/scripts/install_mamba.sh."""
+    try:
+        import causal_conv1d  # noqa: F401
+        import mamba_ssm  # noqa: F401
+    except ImportError as e:
+        # Fail loudly here rather than let the naive fallback OOM further in,
+        # which is a much harder failure to read.
+        pytest.fail(
+            f"The mamba fast path is unavailable: {e}. "
+            "Build and install the extensions against the current torch with "
+            "bash jenkins/scripts/install_mamba.sh."
+        )
+    from transformers.models.nemotron_h import modeling_nemotron_h
+
+    model_dir = str(llm_models_root() / "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
+    num_hidden_layers = 7
+    # NemotronHConfig derives num_hidden_layers from ``layers_block_type``
+    # and silently ignores direct assignment, so truncation must go through
+    # the layer-type list. The first 7 entries of the checkpoint's pattern
+    # ("MEMEM*E") keep all three layer types: mamba, MoE and attention.
+    layers_block_type = AutoConfig.from_pretrained(model_dir).layers_block_type[:num_hidden_layers]
+    hf_model = RefHFModelWithIPCHandles(
+        model_dir, num_hidden_layers=num_hidden_layers, layers_block_type=layers_block_type
+    )
+    assert modeling_nemotron_h.is_fast_path_available, (
+        "HF Nemotron-H did not enable the Mamba fast path despite the installed extensions."
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    # Nemotron-H's Mamba state dominates the cache budget; 0.25 of free memory
+    # leaves enough room for HF (resident on cuda:0 + replicas on cuda:1..3)
+    # plus the TRT-LLM model shard. BF16 model -> CUTLASS MoE backend.
+    # mamba_ssm_cache_dtype="float32" matches the official Nemotron-Nano
+    # accuracy test (TestNemotronV3Nano::test_auto_dtype) — BF16 SSM cache
+    # loses precision in long-decode selective_state_update.
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True, free_gpu_memory_fraction=0.25, mamba_ssm_cache_dtype="float32"
+    )
+    moe_config = MoeConfig(backend="CUTLASS")
+    with LLM(
+        model=model_dir,
+        ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
+        tensor_parallel_size=4,
+        load_format="dummy",
+        pipeline_parallel_size=1,
+        kv_cache_config=kv_cache_config,
+        moe_config=moe_config,
+        max_batch_size=4,
+        model_kwargs={"layers_block_type": layers_block_type},
+    ) as llm:
+        prompts_texts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+        prompts = [tokenizer.encode(p) for p in prompts_texts]
+        del tokenizer
+        sampling_params = SamplingParams(
+            temperature=0, return_generation_logits=True, max_tokens=32
+        )
+
+        # Warm the KV-cache prefix reuse store with the *dummy* weights before
+        # update_weights. If update_weights' finalize path fails to invalidate
+        # the prefix cache, the second generation would reuse cached KV blocks
+        # produced by random weights and the logits comparison would fail —
+        # a stricter check of enable_block_reuse=True correctness than just
+        # running once after update_weights.
+        llm.generate(prompts, sampling_params)
+
+        # Group weights by trailing suffix (e.g. "input_layernorm.weight",
+        # "mixer.A_log"); send one filtered batch per suffix.
+        layer_prefix_pattern = re.compile(r"^model\.layers\.\d+\.")
+        filter_set = set()
+        for name, _ in hf_model.all_weights[hf_model.device_id]:
+            filter_set.add(layer_prefix_pattern.sub("", name))
+        filter_list = sorted(filter_set)
+
+        def common_filter(filter_name: str) -> Callable[[str], bool]:
+            def filter_fn(name: str) -> bool:
+                return name.endswith(filter_name)
+
+            return filter_fn
+
+        for fname in filter_list:
+            ipc_handles = hf_model.get_weight_ipc_handles_serialized(
+                weight_filter=common_filter(fname)
+            )
+            llm._collective_rpc("update_weights", (ipc_handles,))
+        # Finalize once to trigger post_load_weights on all modules.
+        llm._collective_rpc("update_weights", (None,))
+
+        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
+        # Looser threshold: Nemotron-H logits are compared against a BF16
+        # reference and the mamba SSM / selective-scan path introduces small
+        # numerical differences. Measured over 5 runs x 4 prompts (GB200, TP=4,
+        # BF16): mean top-20 overlap 0.891, overall range 0.867-0.928. The
+        # spread is dominated by which prompt it is, not by run-to-run noise --
+        # the weakest prompt stays in 0.867-0.875 across all 5 runs, so 0.85
+        # clears the worst observation by ~0.017 while 0.88 would already flake.
+        compare_logits(llm_logits, ref_logits, threshold=0.85)
+
+    del hf_model

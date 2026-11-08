@@ -1,0 +1,27 @@
+# Extra LLM API options for trtllm-serve with the Mooncake store KV connector.
+#
+# Prerequisites:
+#   - The Mooncake Python bindings, which tensorrt-llm pulls in as
+#     mooncake-transfer-engine-cuda13 (pinned in requirements.txt)
+#   - A master owning the pool, started first:
+#       trtllm-serve mooncake_master --pool_file /shared/pool.json
+#   - PyTorch backend
+#
+# Example:
+#   trtllm-serve Qwen/Qwen2-1.5B-Instruct --backend pytorch --host 0.0.0.0 --port 8000 \
+#     --extra_llm_api_options /path/to/this/file
+
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: true
+
+kv_connector_config:
+  connector: mooncake-store
+  mooncake_store:
+    pool: file:///shared/pool.json
+    # both | producer | consumer | capacity ('capacity' only lends memory)
+    role: both
+    # Per rank, and the same on every server joining the pool.
+    segment_size: 32GiB
+    # Identifies this checkpoint to the pool. Must match on every server.
+    model_key: qwen2-1.5b-instruct

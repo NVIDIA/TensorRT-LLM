@@ -1,0 +1,547 @@
+from collections import namedtuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import torch
+
+from tensorrt_llm._utils import prefer_pinned
+
+
+@dataclass
+class LoraLayerParams:
+    """
+    Parameters for a single LoRA layer.
+    All tensors are persistent device tensors that can be updated outside of graph replay.
+    """
+
+    # Weight pointers
+    # Shape: [layer_module_num, max_lora_size]
+    d_b_ptrs: torch.Tensor  # Lora_in weight pointers
+    d_b_prime_ptrs: torch.Tensor  # Lora_out weight pointers
+    h_b_ptrs: torch.Tensor  # Lora_in weight pointers in host
+    h_b_prime_ptrs: torch.Tensor  # Lora_out weight pointers in host
+
+    d_output_sizes: torch.Tensor
+    d_output_sizes_offset: torch.Tensor
+    h_output_sizes: torch.Tensor
+    h_output_sizes_offset: torch.Tensor
+
+
+class CudaGraphLoraParams:
+    """
+    CUDA Graph compatible LoRA parameters for all layers and batch management.
+
+    This structure maintains persistent device tensors that can be updated outside
+    of CUDA Graph replay to support different LoRA combinations per batch.
+    """
+
+    LoraLayerKey = namedtuple("LoraLayerKey", ["layer_idx", "module_ids"])
+
+    PTR_DTYPE = torch.int64
+    LD_DTYPE = torch.int64
+    SIZES_DTYPE = torch.int32
+
+    @dataclass
+    class LoraLayerInfo:
+        module_num: int = 0
+        output_sizes: List[int] | torch.Tensor | None = None
+        input_hidden_size: int = 0
+
+        def is_enabled(self) -> bool:
+            return self.input_hidden_size > 0
+
+    def __init__(
+        self,
+        max_batch_size: int,
+        max_lora_size: int,
+        max_rank: int,
+        layer_info: Dict[LoraLayerKey, LoraLayerInfo],
+        device: str = "cuda",
+        max_tokens_per_seq: int = 1,
+    ):
+        """
+        Initialize CUDA Graph compatible LoRA parameters.
+
+        Args:
+            max_batch_size: Maximum batch size for this graph
+            max_lora_size: Maximum number of LoRA adapters
+            max_rank: Maximum rank for all layers
+            layer_info: Layer information for each layer
+            device: Device to allocate tensors on
+            max_tokens_per_seq: Maximum tokens per sequence (>1 for spec decode)
+        """
+        self.max_batch_size = max_batch_size
+        self.max_lora_size = max_lora_size
+        self.max_rank = max_rank
+        self.layer_info = layer_info
+        self.layer_module2key = self._calculate_layer_module2key()
+        self.device = device
+        self.max_tokens_per_seq = max_tokens_per_seq
+
+        self.layer_params: Dict[self.LoraLayerKey, LoraLayerParams] = dict()
+
+        # sorted indices using token ids as keys, grouping tokens by their slot id.
+        # For spec decode with tokens_per_seq > 1, this is per-token (size =
+        # max_batch_size * max_tokens_per_seq) so all tokens of a sequence stay
+        # together when sorted by slot.
+        max_num_tokens = max_batch_size * max_tokens_per_seq
+        self.max_num_tokens = max_num_tokens
+        self.sorted_ids = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
+        self.sorted_ids_host = torch.zeros_like(
+            self.sorted_ids, device="cpu", pin_memory=prefer_pinned()
+        )
+
+        # token_to_slot maps an *unsorted* token index to its adapter slot id.
+        # Used by the routed-expert MoE LoRA path to look up per-token rank /
+        # weight pointers from slot-indexed tables. Pinned host so the C++ op
+        # can dereference it directly and the address stays stable across CUDA
+        # graph captures and replays.
+        self.token_to_slot_host = torch.zeros(
+            max_num_tokens, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+        )
+
+        # persistent values for gen-only batch with cuda graph
+        self.persistent_sorted_ids = self.sorted_ids
+
+        self.slot_ids = torch.zeros(max_batch_size, dtype=torch.int64, device=device)
+
+        self.slot_counts = torch.zeros(max_lora_size, dtype=torch.int32, device=device)
+        self.slot_counts_host = torch.zeros_like(
+            self.slot_counts, device="cpu", pin_memory=prefer_pinned()
+        )
+        self.slot_offsets_full = torch.zeros(max_lora_size + 1, dtype=torch.int64, device=device)
+        self.slot_offsets = self.slot_offsets_full[:-1]
+        self.slot_offsets_full_host = torch.zeros_like(
+            self.slot_offsets_full, device="cpu", pin_memory=prefer_pinned()
+        )
+
+        self.slot_ranks = torch.zeros(max_lora_size, dtype=torch.int32, device=device)
+        self.slot_ranks_host = torch.zeros_like(
+            self.slot_ranks, device="cpu", pin_memory=prefer_pinned()
+        )
+
+        # Per-(layer_idx, module_id) host tables for the routed-expert MoE LoRA
+        # path: a [max_lora_size] int32 rank table, a packed [max_lora_size, 3]
+        # (A, B, dora) pointer table, and a [max_lora_size] bool scratch buffer so
+        # the rank masking allocates nothing. Allocated on first use by
+        # _moe_slot_entry and refreshed in place by _refresh_moe_slot_cache, whose
+        # only caller is update_weight_pointers -- the single writer. Initialized
+        # here (not lazily) so the refresh path cannot silently no-op out of order.
+        #
+        # The ranks are the global per-slot ranks masked to the slots this
+        # layer/module actually has pointers for: an adapter need not cover every
+        # MoE layer, and the grouped-GEMM problem builder reads an unmasked
+        # rank > 0 on a null-pointer slot as an active rank-sized GEMM.
+        self._moe_slot_cache: dict[
+            tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+
+        # The pointer table is packed as PTR_DTYPE and relies on Tensor.copy_'s
+        # implicit cast; anything narrower than int64 would silently truncate a
+        # device address and hand the grouped GEMM a mangled pointer.
+        assert self.PTR_DTYPE == torch.int64, (
+            f"PTR_DTYPE must hold a full device address, got {self.PTR_DTYPE}"
+        )
+
+        for key, info in self.layer_info.items():
+            assert (
+                info.module_num > 0
+                and info.output_sizes is not None
+                and len(info.output_sizes) == info.module_num
+            )
+            # Allocate layer parameters
+            self.layer_params[key] = self._allocate_layer_params(
+                key, info.module_num, info.output_sizes
+            )
+
+    def _calculate_layer_module2key(self) -> Dict[Tuple[int, int], LoraLayerKey]:
+        layer_module2key = dict()
+        for key in self.layer_info.keys():
+            layer_id = key.layer_idx
+            module_ids = key.module_ids
+            for module_id in module_ids:
+                layer_module2key[(layer_id, module_id)] = key
+        return layer_module2key
+
+    def _allocate_layer_params(
+        self, key: LoraLayerKey, layer_module_num: int, module_output_sizes: torch.Tensor
+    ) -> LoraLayerParams:
+        """
+        Create LoraLayerParams for a specific layer.
+
+        Args:
+            key: Key of the layer
+            layer_module_num: Number of modules in this layer
+            module_output_sizes: Output sizes for each module in this layer
+
+        Returns:
+            LoraLayerParams for the specified layer
+        """
+        # GEMM parameter tensors only need max_lora_size (no dummy slot for base model)
+        # Base model requests are handled separately and don't participate in GEMM operations
+        shape_2d = (layer_module_num, self.max_lora_size)
+
+        output_hidden_sizes = torch.tensor(module_output_sizes, dtype=self.SIZES_DTYPE)
+        output_hidden_sizes_device = output_hidden_sizes.to(device="cuda")
+
+        output_sizes_offset = self.get_offset_from_counts(output_hidden_sizes).to(
+            dtype=self.PTR_DTYPE
+        )  # [num_layer_modules]
+        output_sizes_offset_device = output_sizes_offset.to(device="cuda")
+
+        return LoraLayerParams(
+            # Weight pointers - managed by PEFT cache manager
+            d_b_ptrs=torch.zeros(shape_2d, dtype=torch.int64, device=self.device),
+            d_b_prime_ptrs=torch.zeros(shape_2d, dtype=torch.int64, device=self.device),
+            h_b_ptrs=torch.zeros(shape_2d, dtype=torch.int64, pin_memory=prefer_pinned()),
+            h_b_prime_ptrs=torch.zeros(shape_2d, dtype=torch.int64, pin_memory=prefer_pinned()),
+            d_output_sizes=output_hidden_sizes_device,
+            d_output_sizes_offset=output_sizes_offset_device,
+            h_output_sizes=output_hidden_sizes,
+            h_output_sizes_offset=output_sizes_offset,
+        )
+
+    @staticmethod
+    def get_sorted_indices(slot_ids: List[int]) -> torch.Tensor:
+        """
+        Get sorted indices for the given slot IDs.
+        """
+        slot_ids = torch.tensor(slot_ids, dtype=torch.int64)
+
+        # Compute sorted indices for gather/scatter operations
+        sorted_slot_ids, sorted_indices = torch.sort(slot_ids, stable=True)
+        return sorted_indices
+
+    def update_sorted_indices(self, slot_ids: List[int], tokens_per_seq: int = 1):
+        """
+        Update slot IDs for the current batch and compute sorted indices.
+
+        Args:
+            slot_ids: List of slot IDs, one per sequence in the batch.
+            tokens_per_seq: Number of tokens per sequence (>1 for spec decode
+                verification where each sequence contributes multiple tokens).
+        """
+        actual_batch_size = len(slot_ids)
+        assert actual_batch_size <= self.max_batch_size, (
+            f"CudaGraphLoraParams: Actual batch size {actual_batch_size} exceeds max {self.max_batch_size}!"
+        )
+        sorted_indices = self.get_sorted_indices(slot_ids)
+
+        # For spec decode, expand from per-sequence to per-token sorted indices.
+        # Sequence at sorted position k contributes tokens at positions
+        # k*tokens_per_seq .. (k+1)*tokens_per_seq-1 in the slot-sorted tensor.
+        # The original token positions are sorted_indices[k]*tokens_per_seq + j.
+        if tokens_per_seq > 1:
+            token_sorted_ids = (
+                sorted_indices.unsqueeze(1) * tokens_per_seq
+                + torch.arange(tokens_per_seq, dtype=sorted_indices.dtype)
+            ).flatten()
+        else:
+            token_sorted_ids = sorted_indices
+
+        num_tokens = actual_batch_size * tokens_per_seq
+        self.sorted_ids = self.persistent_sorted_ids
+        sorted_ids_host = self.sorted_ids_host[:num_tokens]
+        sorted_ids_host.copy_(token_sorted_ids)
+        self.sorted_ids[:num_tokens].copy_(sorted_ids_host, non_blocking=True)
+
+        # Populate token_to_slot for the routed-expert MoE LoRA path. Each
+        # sequence contributes tokens_per_seq tokens carrying its slot id.
+        # Update in place to preserve the pinned-host address (graph-capture safe).
+        slot_ids_t = torch.as_tensor(slot_ids, dtype=torch.int32)
+        if tokens_per_seq > 1:
+            token_slots = slot_ids_t.repeat_interleave(tokens_per_seq)
+        else:
+            token_slots = slot_ids_t
+        self.token_to_slot_host[:num_tokens].copy_(token_slots)
+        # Padding region is zeroed once at construction; leave it untouched so
+        # the address arithmetic in the C++ op never reads stale slot ids past
+        # the active num_tokens.
+
+    def update_weight_pointers(
+        self,
+        peft_table: Optional[Dict[int, List]],
+        slot_to_task_mapping: tuple[Optional[int], ...],
+    ):
+        """
+        Update weight pointers from PEFT cache manager.
+
+        Args:
+            peft_table: PEFT table from cache manager containing weight pointers, map task id to list of layer
+                        module configs. Can be None when slot membership changes without any newly prepared PEFT
+                        entries in the current batch.
+            slot_to_task_mapping: Mapping from slot_id to task_id, tuple of None for empty slots
+        """
+
+        # get slot ranks
+        # assume ranks are the same for a given slot,
+        # input_hidden_size are the same within a layer
+        # output sizes are the same for all slots with the same module
+        def zero_out_weight_pointers(slot_id: int):
+            """
+            Zero out all weight pointers for a given slot_id for all layers
+            """
+            for layer_param in self.layer_params.values():
+                layer_param.h_b_ptrs[:, slot_id] = 0
+                layer_param.h_b_prime_ptrs[:, slot_id] = 0
+
+        for slot_id in range(self.max_lora_size):
+            task_id = slot_to_task_mapping[slot_id]
+            if task_id is None:  # empty slot
+                self.slot_ranks_host[slot_id] = 0
+                zero_out_weight_pointers(slot_id)
+            elif peft_table is None or task_id not in peft_table:
+                # No new PEFT entry was prepared for this task in the current batch, so retain
+                # the existing rank and weight pointers for the occupied slot.
+                continue
+            else:  # task might have changed in the slot, update its rank
+                task_configs = peft_table[task_id]
+                config = task_configs[0]  # assume all layerModuleConfigs have the same rank
+                self.slot_ranks_host[slot_id] = config.adapter_size
+
+                zero_out_weight_pointers(
+                    slot_id
+                )  # in case new task in slot do not have LoRA adapter for some module in some layer
+                for config in task_configs:
+                    layer_id = config.layer_id
+                    module_id = config.module_id
+                    key = self.layer_module2key[(layer_id, module_id)]
+                    layer_param = self.layer_params[key]
+                    local_module_id = key.module_ids.index(module_id)
+
+                    assert key in self.layer_params, (
+                        f"Layer {layer_id} not found in layer_params, assumption that all LoRA has their adapters on "
+                        "the same layers is broken"
+                    )
+
+                    # Validate LoRA rank
+                    rank = config.adapter_size
+                    assert rank <= self.max_rank, (
+                        f"LoRA rank {rank} in layer {layer_id} exceeds configured max_rank {self.max_rank}. "
+                    )
+
+                    layer_param.h_b_ptrs[local_module_id, slot_id] = config.weights_in_pointer
+                    layer_param.h_b_prime_ptrs[local_module_id, slot_id] = (
+                        config.weights_out_pointer
+                    )
+
+        self.slot_ranks.copy_(self.slot_ranks_host, non_blocking=True)
+
+        for layer_param in self.layer_params.values():
+            layer_param.d_b_ptrs.copy_(layer_param.h_b_ptrs, non_blocking=True)
+            layer_param.d_b_prime_ptrs.copy_(layer_param.h_b_prime_ptrs, non_blocking=True)
+
+        # The routed-expert MoE LoRA path reads its slot rank and weight-pointer
+        # tables from pinned buffers that get_moe_slot_inputs caches for stable
+        # addresses but only refreshes during graph capture. The captured H2D
+        # copy reads them by address at replay, so refresh them in place here;
+        # otherwise the ranks update but the pointers stay stale and an active
+        # (rank>0) slot dereferences a stale/null pointer at replay.
+        for layer_idx, module_id in list(self._moe_slot_cache):
+            self._refresh_moe_slot_cache(layer_idx, module_id)
+
+    def _moe_slot_entry(
+        self, layer_idx: int, module_id: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Return this (layer, module)'s cached MoE slot buffers, allocating them
+        on first use. Never refreshes their contents.
+
+        Allocating and refreshing are split so that `update_weight_pointers` is
+        the single writer: after it returns, every cached entry is current, and no
+        read mutates one. Refreshing on read instead would make the freshness of a
+        returned table depend on which of two call paths touched it last -- and
+        would hide a missing refresh from any test that reads back through
+        `get_moe_slot_inputs`.
+
+        Args:
+            layer_idx: Model layer whose cached slot buffers are requested.
+            module_id: Routed-expert LoRA module within the layer.
+
+        Returns:
+            The cached rank, pointer, and scratch-mask tensors, or None if the
+            layer and module carry no LoRA weights.
+        """
+        key = self.layer_module2key.get((layer_idx, module_id))
+        layer_param = self.layer_params.get(key) if key is not None else None
+        if layer_param is None:
+            return None
+
+        cache_key = (layer_idx, module_id)
+        entry = self._moe_slot_cache.get(cache_key)
+        if entry is None:
+            # Allocated rather than viewed: the per-layer storage is not laid out
+            # as (A, B, dora) per slot, and the ranks are per layer and module
+            # while slot_ranks_host is global. The mask buffer is preallocated
+            # alongside them so the refresh below allocates nothing: it runs for
+            # every cached (layer, module) on the per-step host path that feeds
+            # CUDA-graph replay.
+            entry = (
+                torch.zeros(
+                    self.max_lora_size,
+                    dtype=self.SIZES_DTYPE,
+                    device="cpu",
+                    pin_memory=prefer_pinned(),
+                ),
+                torch.zeros(
+                    (self.max_lora_size, 3),
+                    dtype=self.PTR_DTYPE,
+                    device="cpu",
+                    pin_memory=prefer_pinned(),
+                ),
+                torch.zeros(self.max_lora_size, dtype=torch.bool, device="cpu"),
+            )
+            self._moe_slot_cache[cache_key] = entry
+            self._refresh_moe_slot_cache(layer_idx, module_id)
+        return entry
+
+    def _refresh_moe_slot_cache(self, layer_idx: int, module_id: int) -> None:
+        """Re-pack an already-allocated (layer, module) entry from the current
+        per-layer host pointers and global per-slot ranks.
+
+        The ranks are masked to zero on slots whose A/B pointers are null here:
+        `slot_ranks_host` is global to the adapter, but the pointer tables are per
+        layer and module, and an adapter may target only a subset of the MoE
+        layers. The kernels treat rank == 0 as "slot inactive" and rely on
+        rank > 0 implying dereferenceable A/B pointers.
+
+        The cached pinned buffers are updated in place to keep their addresses
+        stable (the captured H2D copy reads them by address at replay).
+
+        Args:
+            layer_idx: Model layer whose cached slot buffers are refreshed.
+            module_id: Routed-expert LoRA module within the layer.
+
+        Returns:
+            None.
+        """
+        key = self.layer_module2key[(layer_idx, module_id)]
+        layer_param = self.layer_params[key]
+        ranks, packed, mask = self._moe_slot_cache[(layer_idx, module_id)]
+
+        local_module_id = key.module_ids.index(module_id)
+        packed[:, 0].copy_(layer_param.h_b_ptrs[local_module_id])
+        packed[:, 1].copy_(layer_param.h_b_prime_ptrs[local_module_id])
+        # Column 2 (DoRA magnitude) stays zero.
+        # Mask the global ranks by pointer validity, one column at a time through
+        # a preallocated buffer, so this allocates nothing: `.ne(0).all(dim=1)`
+        # would allocate two temporaries per call, and this runs for every cached
+        # (layer, module) on the per-step host path that feeds CUDA-graph replay.
+        torch.ne(packed[:, 0], 0, out=mask)
+        torch.mul(self.slot_ranks_host, mask, out=ranks)
+        torch.ne(packed[:, 1], 0, out=mask)
+        torch.mul(ranks, mask, out=ranks)
+
+    @staticmethod
+    def get_offset_from_counts(
+        counts: torch.Tensor, full: bool = False, out: torch.Tensor = None
+    ) -> torch.Tensor:
+        if out is None:
+            if full:
+                offset = torch.empty(counts.shape[0] + 1, dtype=torch.int64, device=counts.device)
+            else:
+                offset = torch.empty(counts.shape[0], dtype=torch.int64, device=counts.device)
+        else:
+            assert (full and out.shape[0] == counts.shape[0] + 1) or (
+                (not full) and out.shape[0] == counts.shape[0]
+            )
+            offset = out
+
+        offset[0] = 0
+
+        if full:
+            offset[1:] = counts
+        else:
+            offset[1:] = counts[:-1]
+        offset[1:].cumsum_(dim=0)
+        return offset
+
+    @staticmethod
+    def get_slot_counts(batch_slot_ids: List[int], max_lora_size: int) -> torch.Tensor:
+        """
+        Get the number of tokens for each slot_id in the batch.
+        """
+        slot_counts = torch.bincount(
+            torch.tensor(batch_slot_ids, dtype=torch.int32), minlength=max_lora_size
+        )
+        assert slot_counts.size(0) <= max_lora_size + 1
+        slot_counts = slot_counts[:max_lora_size]
+        return slot_counts
+
+    def update_slots_params(self, batch_slot_ids: List[int], tokens_per_seq: int = 1):
+        """
+        Update GEMM sizes and buffer offsets based on current batch composition.
+
+        Args:
+            batch_slot_ids: Slot IDs, one per sequence in the batch.
+            tokens_per_seq: Number of tokens per sequence (>1 for spec decode).
+        """
+        slot_counts = self.get_slot_counts(batch_slot_ids, self.max_lora_size) * tokens_per_seq
+        self.slot_counts_host.copy_(slot_counts)
+        self.get_offset_from_counts(slot_counts, full=True, out=self.slot_offsets_full_host)
+        self.slot_counts.copy_(self.slot_counts_host, non_blocking=True)
+        self.slot_offsets_full.copy_(self.slot_offsets_full_host, non_blocking=True)
+
+    def get_problem_count(self, layer_key: LoraLayerKey) -> int:
+        """
+        Get the number of GEMM problems for a layer.
+
+        Args:
+            layer_key: Key of the layer
+
+        Returns:
+            Number of GEMM problems (layer_module_num * max_lora_size)
+            Returns 0 if layer has no LoRA modules
+            Note: Only actual LoRA slots are counted, not the dummy base model slot
+        """
+        if layer_key not in self.layer_params:
+            return 0  # Layer has no LoRA modules
+        return self.layer_info[layer_key].module_num * self.max_lora_size
+
+    def get_layer_params(self, layer_key: LoraLayerKey) -> Optional[LoraLayerParams]:
+        """
+        Get LoRA parameters for a specific layer.
+
+        Args:
+            layer_key: Key of the layer
+
+        Returns:
+            LoraLayerParams for the specified layer, or None if layer has no LoRA modules
+        """
+        return self.layer_params.get(layer_key)
+
+    def get_moe_slot_inputs(
+        self,
+        layer_idx: int,
+        module_id: int,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Return slot-indexed LoRA tables for an MoE module on a given layer.
+
+        Used by the routed-expert MoE LoRA path in CUDA-graph decode mode. The
+        returned tensors are pinned host views over the persistent buffers held
+        by this instance, so their data_ptr() is stable across CUDA graph
+        captures and replays.
+
+        Args:
+            layer_idx: Decoder layer index.
+            module_id: One of the MOE_H_TO_4H, MOE_4H_TO_H, or MOE_GATE
+                LoraModuleType int values.
+
+        Returns:
+            A tuple (slot_ranks_host, slot_weight_ptrs_host), where
+            slot_ranks_host is [max_lora_size] int32 holding this layer/module's
+            per-slot ranks -- the global ranks masked to zero on slots whose
+            adapter does not target this layer/module -- and slot_weight_ptrs_host
+            is [max_lora_size, 3] int64 with columns (A_ptr, B_ptr, dora_ptr).
+            dora_ptr is always 0, since DoRA with MoE is rejected upstream.
+            Returns None if (layer_idx, module_id) is not in this layer's map.
+
+        The tables are populated on first use and thereafter written only by
+        `update_weight_pointers`; this call does not refresh them. Reading is
+        therefore side-effect free, and a returned table is current exactly when
+        the last `update_weight_pointers` was.
+        """
+        entry = self._moe_slot_entry(layer_idx, module_id)
+        if entry is None:
+            return None
+        ranks, packed, _mask = entry
+        return ranks, packed

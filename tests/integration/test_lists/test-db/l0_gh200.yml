@@ -1,0 +1,20 @@
+version: 0.0.1
+l0_gh200:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*h200*'
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  - unittest/bindings
+  - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
+  - examples/visual_gen/test_visual_gen_wan.py::test_visual_gen_quickstart
+  - examples/visual_gen/test_visual_gen_wan.py::test_visual_gen_api_walkthrough

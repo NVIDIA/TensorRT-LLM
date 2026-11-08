@@ -1,0 +1,79 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Release Checks
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'commit sha to check'
+        required: true
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+jobs:
+  precommit-check:
+    name: Pre-commit Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref || github.ref }}
+
+      - name: Test stale pull request cleanup workflow
+        run: node .github/scripts/cleanup_stale_prs.test.js
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Get changed files
+        id: changed-files
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            --paginate --jq '.[].filename' | paste -sd ' ' -)
+          count=$(echo "$files" | tr ' ' '\n' | sed '/^$/d' | wc -l)
+          echo "Changed file count from API: ${count}"
+          echo "files=$files" >> $GITHUB_OUTPUT
+          echo "count=$count" >> $GITHUB_OUTPUT
+
+      - name: Run pre-commit checks
+        run: |
+          args=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            count="${{ steps.changed-files.outputs.count }}"
+            # GitHub's PR Files API caps out at 3000 entries, silently truncating the
+            # list for huge PRs. Fail closed with a 2500 margin below that cap.
+            if [ -n "$count" ] && [ "$count" -gt 0 ] && [ "$count" -lt 2500 ]; then
+              echo "${{ steps.changed-files.outputs.files }}" | tr ' ' '\n' | sed '/^$/d' > changed_files.txt
+              args="--files-from changed_files.txt"
+            fi
+          fi
+          python3 -u scripts/release_check.py $args
+
+      # Informational only: list test-list entries whose parametrize IDs cannot
+      # be verified statically (runtime-computed argvalues/ids), grouped by
+      # reason, so they can be swept without rerunning the analysis locally. The
+      # pre-commit step above remains the gate for actual validation errors;
+      # this step never fails the job.
+      - name: Report unverifiable test-list param IDs
+        if: always()
+        continue-on-error: true
+        run: python3 -u scripts/check_test_list.py --validate --report-unverifiable

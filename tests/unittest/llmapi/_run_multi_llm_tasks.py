@@ -1,0 +1,32 @@
+import os
+import sys
+
+from tensorrt_llm import LLM  # noqa: E402
+from tensorrt_llm.llmapi import SamplingParams
+from tensorrt_llm.llmapi.utils import print_colored
+
+# Standalone script: won't pollute sys.path of pytest process.
+sys.path.append(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+
+from test_common.llm_data import llm_models_root  # noqa: E402
+
+model_path = llm_models_root() / "Qwen3" / "Qwen3-0.6B"
+
+
+def run_llm_tp2():
+    with LLM(model=model_path, tensor_parallel_size=2) as llm:
+        sampling_params = SamplingParams(max_tokens=10, end_id=-1)
+        for output in llm.generate(["Hello, my name is"], sampling_params):
+            print(output)
+
+
+def run_multi_llm_tasks():
+    for i in range(3):
+        print_colored(f"Running LLM task {i}\n", "green")
+        run_llm_tp2()
+        print_colored(f"LLM task {i} completed\n", "green")
+
+
+if __name__ == "__main__":
+    run_multi_llm_tasks()

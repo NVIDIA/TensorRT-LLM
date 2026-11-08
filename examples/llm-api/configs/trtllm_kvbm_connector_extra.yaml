@@ -1,0 +1,15 @@
+# Extra LLM API options for trtllm-serve with the Dynamo KVBM connector.
+#
+# Prerequisites:
+#   - dynamo kvbm installed: see https://github.com/ai-dynamo/dynamo
+#   - PyTorch backend
+#
+# Example:
+#   trtllm-serve Qwen/Qwen2-1.5B-Instruct --backend pytorch --host 0.0.0.0 --port 8000 \
+#     --extra_llm_api_options /path/to/this/file
+
+kv_cache_config:
+  enable_block_reuse: true
+
+kv_connector_config:
+  connector: kvbm

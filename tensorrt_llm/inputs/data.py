@@ -1,0 +1,110 @@
+# Adapt from
+# https://github.com/vllm-project/vllm/blob/2e33fe419186c65a18da6668972d61d7bbc31564/vllm/inputs/data.py
+from typing import Any, Dict, List, Union
+
+from typing_extensions import NotRequired, TypedDict
+
+
+class TextPrompt(TypedDict):
+    """Schema for a text prompt."""
+
+    prompt: str
+    """The input text to be tokenized before passing to the model."""
+
+    multi_modal_data: NotRequired[Dict[str, Any]]
+    """
+    Optional multi-modal data to pass to the model,
+    if the model supports it.
+    """
+
+    multi_modal_uuids: NotRequired[Dict[str, List[Any]]]
+    """
+    Optional user-provided UUIDs for multimodal items.
+    Structure mirrors multi_modal_data: {"image": ["uuid1", None, "uuid3"]}.
+    When a UUID is provided for an item, it is preserved in KV cache events.
+    V1 uses it as the legacy hash value; V2 returns it in the optional uuid
+    field while retaining the derived digest as hash. Use None for specific
+    items that need content-only hashing.
+    """
+
+    mm_processor_kwargs: NotRequired[Dict[str, Any]]
+    """
+    Optional multi-modal processor kwargs to be forwarded to the
+    input processor for mm input processing.
+    """
+
+    chat_template_applied: NotRequired[bool]
+    """
+    True when ``prompt`` is the chat template's output with one registered
+    multimodal placeholder per media item already in it. Set by trtllm-serve
+    and by the prompt builders in ``tensorrt_llm.inputs.utils``; input
+    processors that otherwise render a raw ``prompt`` through the model's chat
+    template use it verbatim when this is set.
+    """
+
+
+class TokensPrompt(TypedDict):
+    """Schema for a tokenized prompt."""
+
+    prompt_token_ids: List[int]
+    """A list of token IDs to pass to the model."""
+
+    multi_modal_data: NotRequired[Dict[str, Any]]
+    """
+    Optional multi-modal data to pass to the model,
+    if the model supports it.
+    """
+
+    multi_modal_uuids: NotRequired[Dict[str, List[Any]]]
+    """
+    Optional user-provided UUIDs for multimodal items.
+    Structure mirrors multi_modal_data: {"image": ["uuid1", None, "uuid3"]}.
+    When a UUID is provided for an item, it is preserved in KV cache events.
+    V1 uses it as the legacy hash value; V2 returns it in the optional uuid
+    field while retaining the derived digest as hash. Use None for specific
+    items that need content-only hashing.
+    """
+
+    mm_processor_kwargs: NotRequired[Dict[str, Any]]
+    """
+    Optional multi-modal processor kwargs to be forwarded to the
+    input processor for mm input processing.
+    """
+
+    multi_item_part_lens: NotRequired[List[int]]
+    """Metadata for multi-item scoring.
+
+    Specifying this enables the multi-item scoring mode.
+    In this mode, `prompt_token_ids` is assumed to consist of a prefix (or query) and
+    multiple items (or candidates). Each part of the prompt is assumed to be followed
+    by a delimiter token. The attention computation (masking and positional encodings)
+    is altered such that the prefill logits correspond to those that would
+    have been obtained upon running separate prefills for prefix + item1, prefix + item2,
+    and so on. Currently, this feature is only supported in prefill-only execution
+    via `LLM.encode`.
+
+    The list elements should correspond, in order, to prefix length and the length of
+    each following item to score (all lengths in tokens).
+    See https://github.com/flashinfer-ai/flashinfer/pull/1015 for details and nomenclature.
+    The length should not include the delimiter tokens.
+    """
+
+
+PromptInputs = Union[str, List[int], TextPrompt, TokensPrompt]
+
+
+def prompt_inputs(inputs: PromptInputs, ) -> Union[TextPrompt, TokensPrompt]:
+    if isinstance(inputs, str):
+        prompt_inputs = TextPrompt(prompt=inputs)
+    elif isinstance(inputs, list):
+        assert len(inputs) == 0 or isinstance(inputs[0], int)
+        prompt_inputs = TokensPrompt(prompt_token_ids=inputs)
+    elif isinstance(inputs, dict):
+        assert inputs.get("prompt") is not None \
+            or inputs.get("prompt_token_ids") is not None
+        return inputs
+    else:
+        raise TypeError(
+            f"Invalid type of inputs for llm.generate: {type(inputs)}")
+
+    return prompt_inputs

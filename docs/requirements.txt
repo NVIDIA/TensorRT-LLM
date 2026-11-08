@@ -1,0 +1,11 @@
+sphinx>=7.0
+sphinx-argparse
+sphinx-click
+nvidia-sphinx-theme
+myst_parser
+breathe
+pygit2
+sphinx_copybutton
+autodoc_pydantic
+sphinx-togglebutton
+sphinxcontrib-mermaid

@@ -1,0 +1,274 @@
+mistralai/Mistral-Small-3.1-24B-Instruct-2503:
+  - accuracy: 81.7
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 81.1
+google/gemma-4-26B-A4B-it:
+  - accuracy: 71.296
+google/gemma-3n-E2B-it:
+  - accuracy: 59.527
+google/gemma-4-E2B-it:
+  - accuracy: 56.823
+deepseek-ai/DeepSeek-V3-Lite:
+  - accuracy: 71.40
+  - quant_algo: NVFP4
+    accuracy: 70.60
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 70.60
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 71.27
+  - spec_dec_algo: MTP
+    accuracy: 71.39
+  - spec_dec_algo: MTP
+    extra_acc_spec: use_sa_spec
+    accuracy: 71.39
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 71.29
+deepseek-ai/DeepSeek-R1:
+  - quant_algo: NVFP4
+    accuracy: 87.33
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 87.33
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 87.33
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 87.33
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 87.573
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 87.573
+  - quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    accuracy: 87.573
+  - quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 87.573
+deepseek-ai/DeepSeek-R1-0528:
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 84.722
+  - quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    accuracy: 84.722
+deepseek-ai/DeepSeek-V3.2-Exp:
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 88.2
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 88.2
+  - quant_algo: NVFP4
+    accuracy: 87.2
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 87.2
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 87.9
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 87.2
+deepseek-ai/DeepSeek-V4-Flash:
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 87.2
+Qwen3/Qwen3-8B:
+  - quant_algo: W4A8_MXFP4_FP8
+    accuracy: 72.70
+  - quant_algo: W4A8_MXFP4_MXFP8
+    accuracy: 72.70
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 76.12
+  - accuracy: 76.0   # WAR for https://nvbugs/5575902
+  - spec_dec_algo: Eagle
+    accuracy: 76.12
+  - spec_dec_algo: Eagle3
+    accuracy: 76.12
+Qwen3/Qwen3-30B-A3B:
+  - accuracy: 79.53
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 79.53
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 79.53
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 79.53
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 79.53
+  - quant_algo: W4A8_MXFP4_FP8
+    accuracy: 79.78
+  - quant_algo: W4A8_MXFP4_MXFP8
+    accuracy: 79.78
+  - quant_algo: W4A16_MXFP4
+    accuracy: 79.80
+Qwen3/Qwen3-235B-A22B:
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 86
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 85.5
+  - spec_dec_algo: Eagle
+    quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 85.5
+  - spec_dec_algo: Eagle3
+    quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 85.5
+Qwen3/Qwen3-Next-80B-A3B-Instruct:
+  - accuracy: 86.03
+Qwen/Qwen3.8-Flash-Next:
+  - accuracy: 87.82
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 87.91
+  - quant_algo: MIXED_PRECISION
+    accuracy: 87.50
+  - quant_algo: MIXED_PRECISION
+    spec_dec_algo: MTP
+    accuracy: 87.57
+  # FP8 KV cache, measured on the built-in implementation: TEP4 on GB300, no MTP,
+  # TRTLLM MoE, bf16 Mamba SSM cache.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 87.33
+  # NVFP4 KV cache, measured on the built-in implementation: ADP4 on GB300, no MTP,
+  # TRTLLM MoE, bf16 Mamba SSM cache.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: NVFP4
+    accuracy: 87.21
+Qwen/Qwen3.5-397B-A17B:
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 85.0
+MiniMaxAI/MiniMax-M3:
+  - accuracy: 85
+MiniMaxAI/MiniMax-M3-MXFP8:
+  - quant_algo: MXFP8
+    accuracy: 85
+nvidia/MiniMax-M3-NVFP4:
+  - quant_algo: MIXED_PRECISION
+    accuracy: 83
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 81
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: Eagle3
+    accuracy: 81
+  # Measured with MSA on 4 B200 GPUs (TP4/EP4), 2026-09-22.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: NVFP4
+    accuracy: 84.479
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: NVFP4
+    spec_dec_algo: Eagle3
+    accuracy: 84.747
+
+moonshotai/Kimi-K2.5:
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 89.67
+# TODO: update once https://nvbugs/5393849 is fixed.
+mistralai/Ministral-8B-Instruct-2410:
+  - accuracy: 66.35
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 65.96
+GPT-OSS/BF16:
+  - accuracy: 77.50
+GPT-OSS/MXFP4:
+  - accuracy: 75.50
+  - quant_algo: W4A8_MXFP4_MXFP8
+    accuracy: 75.50
+  - quant_algo: W4A8_MXFP4_FP8
+    accuracy: 75.50
+poolside/laguna-XS.2:
+  - accuracy: 74.93
+  - quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    accuracy: 75.19
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 73.66
+poolside/Laguna-XS-2.1:
+  - spec_dec_algo: DFlash
+    accuracy: 76.194
+  - spec_dec_algo: DFlash
+    quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    accuracy: 75.780
+  - spec_dec_algo: DFlash
+    quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 75.317
+mistral/Mistral-Large-3-675B:
+  - accuracy: 85.30
+  - spec_dec_algo: Eagle
+    accuracy: 85.30
+  - spec_dec_algo: Eagle3
+    accuracy: 85.30
+nvidia/Nemotron-Super-V3:
+  - accuracy: 85.90
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 85.30
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 85.70
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 77.56
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    mtp_enabled: true
+    max_draft_len: 3
+    accuracy: 77.56
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 85.13
+nvidia/Nemotron-Ultra-V3:
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 85.70
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 89.449
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 89.449
+nvidia/Nemotron-3-Nano:
+  - accuracy: 73.85
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 74.35
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 73.684
+nvidia/Nemotron-3.5-Lightning:
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 79.264
+nvidia/NVIDIA-Nemotron-Nano-9B-v2:
+  - accuracy: 74.927
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 74.659
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 73.977
+Qwen/Qwen3.5-35B-A3B:
+  - dtype: bfloat16
+    accuracy: 81.092

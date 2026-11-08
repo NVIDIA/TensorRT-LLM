@@ -1,0 +1,123 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+@Library(['trtllm-jenkins-shared-lib@main']) _
+
+DOCKER_IMAGE = "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:pytorch-26.09-py3-x86_64-ubuntu24.04-skip-tritondevel-202610150933-20252"
+ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
+
+// LLM repository configuration
+withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
+    LLM_REPO = env.gitlabSourceRepoHttpUrl ? env.gitlabSourceRepoHttpUrl : "${DEFAULT_LLM_REPO}"
+}
+LLM_ROOT = "llm"
+
+def createKubernetesPodConfig(image, arch = "amd64")
+{
+    def archSuffix = arch == "arm64" ? "arm" : "amd"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+
+    def podConfig = [
+        cloud: "kubernetes-cpu",
+        namespace: "sw-tensorrt",
+        yaml: """
+            apiVersion: v1
+            kind: Pod
+            spec:
+                nodeSelector:
+                  nvidia.com/node_type: builder
+                  kubernetes.io/os: linux
+                imagePullSecrets:
+                  - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
+                containers:
+                  - name: trt-llm
+                    image: ${image}
+                    command: ['cat']
+                    volumeMounts:
+                    - name: sw-tensorrt-pvc
+                      mountPath: "/mnt/sw-tensorrt-pvc"
+                      readOnly: false
+                    tty: true
+                    resources:
+                      requests:
+                        cpu: 2
+                        memory: 5Gi
+                        ephemeral-storage: 25Gi
+                      limits:
+                        cpu: 2
+                        memory: 5Gi
+                        ephemeral-storage: 25Gi
+                    imagePullPolicy: Always
+                  - name: jnlp
+                    image: ${jnlpImage}
+                    args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
+                    resources:
+                      requests:
+                        cpu: '2'
+                        memory: 5Gi
+                        ephemeral-storage: 25Gi
+                      limits:
+                        cpu: '2'
+                        memory: 5Gi
+                        ephemeral-storage: 25Gi
+                qosClass: Guaranteed
+                volumes:
+                - name: sw-tensorrt-pvc
+                  persistentVolumeClaim:
+                    claimName: sw-tensorrt-pvc
+        """.stripIndent(),
+    ]
+
+    return podConfig
+}
+
+pipeline {
+    agent {
+        kubernetes createKubernetesPodConfig(DOCKER_IMAGE)
+    }
+    options {
+        timestamps()
+    }
+    environment {
+        OPEN_SEARCH_DB_BASE_URL=credentials("open_search_db_base_url")
+        OPEN_SEARCH_DB_CREDENTIALS=credentials("open_search_db_credentials")
+    }
+    parameters {
+        choice(name: "OPERATION", choices: ["Update Perf Data"], description: "Operation to perform.")
+        string(name: "BRANCH", defaultValue: "main", description: "Branch to checkout.")
+        choice(name: "OPEN_SEARCH_PROJECT_NAME", choices: ["swdl-trtllm-infra-ci-prod-perf_sanity_info"], description: "OpenSearch project name.")
+        text(name: "COMMANDS", defaultValue: "", description: "UPDATE commands, one per line. Example: UPDATE SET field=value WHERE condition=value.")
+    }
+    stages {
+        stage("Update Perf Data") {
+            when { expression { params.OPERATION == "Update Perf Data" } }
+            steps {
+                container("trt-llm") {
+                    script {
+                        sh "pwd && ls -alh"
+                        trtllm_utils.checkoutSource(LLM_REPO, params.BRANCH, LLM_ROOT, true, false)
+                        def commandsBase64 = params.COMMANDS.bytes.encodeBase64().toString()
+                        sh """
+                            cd ${LLM_ROOT}/jenkins/scripts/perf && python3 perf_sanity_triage.py \
+                            --project_name "${params.OPEN_SEARCH_PROJECT_NAME}" \
+                            --commands "\$(echo '${commandsBase64}' | base64 -d)"
+                        """
+                    }
+                }
+            }
+        } // stage Update Perf Data
+    } // stages
+} // pipeline

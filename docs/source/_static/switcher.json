@@ -1,0 +1,7 @@
+[
+    {
+        "preferred": true,
+        "version": "latest",
+        "url": "https://nvidia.github.io/TensorRT-LLM/latest/"
+    }
+]

@@ -1,0 +1,155 @@
+from typing import Optional
+
+import torch
+import triton  # type: ignore[import]
+import triton.language as tl  # type: ignore[import]
+
+
+@triton.jit
+def scale_and_clamp(x, scale, dtype):
+    if dtype == tl.float8e4nv:
+        clamp_min = -448.0
+        clamp_max = 448.0
+    elif dtype == tl.float8e5:
+        clamp_min = -57344.0
+        clamp_max = 57344.0
+    elif dtype == tl.float16:
+        clamp_min = -65504.0
+        clamp_max = 65504.0
+    elif dtype == tl.bfloat16:
+        clamp_min = -3.3895313892515355e38
+        clamp_max = 3.3895313892515355e38
+    else:
+        tl.static_assert(False, f"Unsupported dtype: {dtype}")
+
+    return tl.clamp(x.to(tl.float32) / scale, clamp_min, clamp_max).to(dtype)
+
+
+@triton.jit
+def silu_and_mul_kernel(o_ptr, o_stride, o_scale_ptr, x_ptr, x_stride, d,
+                        swiglu_limit: tl.constexpr, swiglu_alpha: tl.constexpr,
+                        swiglu_beta: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+                        HAS_O_SCALE: tl.constexpr,
+                        HAS_SWIGLU_LIMIT: tl.constexpr) -> None:
+    i = tl.program_id(axis=0).to(tl.int64)
+    j = tl.program_id(axis=1)
+
+    o_row_ptr = o_ptr + o_stride * i
+    x_row_ptr = x_ptr + x_stride * i
+
+    offsets = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < d
+
+    a = tl.load(x_row_ptr + offsets, mask=mask).to(tl.float32)
+    b = tl.load(x_row_ptr + offsets + d, mask=mask).to(tl.float32)
+
+    if HAS_SWIGLU_LIMIT:
+        # Gate clamp is upper-side only, up clamp is symmetric, as both plain
+        # SwiGLU-with-limit and the SGLang swigluoai activation require.
+        a = tl.minimum(a, swiglu_limit)
+        b = tl.clamp(b, -swiglu_limit, swiglu_limit)
+
+    # swiglu_alpha=1.0, swiglu_beta=0.0 recovers plain silu_and_mul;
+    # swiglu_alpha=1.702, swiglu_beta=1.0 is the swigluoai shape (alpha gain
+    # inside the sigmoid, (up + 1) offset).
+    result = a * tl.sigmoid(swiglu_alpha * a) * (b + swiglu_beta)
+
+    if HAS_O_SCALE:
+        o_scale = tl.load(o_scale_ptr)
+        result = scale_and_clamp(result, o_scale, o_ptr.dtype.element_ty)
+
+    tl.store(o_row_ptr + offsets, result, mask=mask)
+
+
+@triton.jit
+def silu_and_mul_2in_kernel(o_ptr, o_scale_ptr, gate_ptr, up_ptr, n_elements,
+                            swiglu_limit: tl.constexpr,
+                            swiglu_alpha: tl.constexpr,
+                            swiglu_beta: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+                            HAS_O_SCALE: tl.constexpr,
+                            HAS_SWIGLU_LIMIT: tl.constexpr) -> None:
+    """As silu_and_mul_kernel, but gate and up come from separate tensors.
+
+    Used when a model keeps gate/up as distinct projections instead of one fused
+    Linear, so their outputs are never adjacent in memory.
+
+    Indexes both operands as flat contiguous runs, so callers must pass
+    contiguous tensors -- the op enforces this.
+    """
+    offsets = tl.program_id(axis=0).to(tl.int64) * BLOCK_SIZE + tl.arange(
+        0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    a = tl.load(gate_ptr + offsets, mask=mask).to(tl.float32)
+    b = tl.load(up_ptr + offsets, mask=mask).to(tl.float32)
+
+    if HAS_SWIGLU_LIMIT:
+        a = tl.minimum(a, swiglu_limit)
+        b = tl.clamp(b, -swiglu_limit, swiglu_limit)
+
+    result = a * tl.sigmoid(swiglu_alpha * a) * (b + swiglu_beta)
+
+    if HAS_O_SCALE:
+        o_scale = tl.load(o_scale_ptr)
+        result = scale_and_clamp(result, o_scale, o_ptr.dtype.element_ty)
+
+    tl.store(o_ptr + offsets, result, mask=mask)
+
+
+def swiglu(x,
+           quant_scale: Optional[torch.Tensor] = None,
+           quant_type=None,
+           swiglu_limit: Optional[float] = None,
+           swiglu_alpha: Optional[float] = None,
+           swiglu_beta: Optional[float] = None):
+    if quant_scale is not None:
+        assert quant_type is not None
+        return torch.ops.trtllm.silu_and_mul(
+            x,
+            scale=quant_scale,
+            dtype=quant_type,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        )
+
+    return torch.ops.trtllm.silu_and_mul(x,
+                                         swiglu_limit=swiglu_limit,
+                                         swiglu_alpha=swiglu_alpha,
+                                         swiglu_beta=swiglu_beta)
+
+
+def swiglu_2in(gate,
+               up,
+               quant_scale: Optional[torch.Tensor] = None,
+               quant_type=None,
+               swiglu_limit: Optional[float] = None,
+               swiglu_alpha: Optional[float] = None,
+               swiglu_beta: Optional[float] = None):
+    """SiLU(gate) * up for separately projected gate and up tensors.
+
+    Equivalent to ``swiglu(torch.cat([gate, up], dim=-1), ...)`` without
+    materializing the concatenation.
+    """
+    if quant_scale is not None:
+        if quant_type is None:
+            # Not an assert: stripped under -O this would not raise but would
+            # let the kernel apply the scale while writing gate.dtype, i.e.
+            # scaled values in an unquantized tensor.
+            raise ValueError(
+                "swiglu_2in: quant_type is required when quant_scale is given")
+        return torch.ops.trtllm.silu_and_mul_2in(
+            gate,
+            up,
+            scale=quant_scale,
+            dtype=quant_type,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+        )
+
+    return torch.ops.trtllm.silu_and_mul_2in(gate,
+                                             up,
+                                             swiglu_limit=swiglu_limit,
+                                             swiglu_alpha=swiglu_alpha,
+                                             swiglu_beta=swiglu_beta)

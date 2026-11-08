@@ -1,0 +1,66 @@
+# https://clangd.llvm.org/config
+# Copied from CCCL
+
+# Apply a config conditionally to all C files
+If:
+  PathMatch: .*\.(c|h)$
+
+---
+
+# Apply a config conditionally to all C++ files
+If:
+  PathMatch: .*\.(c|h)pp
+
+---
+
+# Apply a config conditionally to all CUDA files
+If:
+  PathMatch: .*\.cuh?
+CompileFlags:
+  # Compiler: nvcc
+  Add:
+    - -x
+    - cuda
+    # Allow variadic CUDA functions
+    - "-Xclang=-fcuda-allow-variadic-functions"
+
+---
+
+# Tweak the clangd parse settings for all files
+CompileFlags:
+  Compiler: clang++
+  CompilationDatabase: cpp/build
+  Add:
+    # report all errors
+    - "-ferror-limit=0"
+    - "-ftemplate-backtrace-limit=0"
+    - "--no-cuda-version-check"
+  Remove:
+    - -stdpar
+    # strip CUDA fatbin args
+    - "-Xfatbin*"
+    - "-Xcompiler*"
+    - "-Xcudafe*"
+    - "-rdc=*"
+    - "-gpu=*"
+    - "--diag_suppress*"
+    # strip CUDA arch flags
+    - "-gencode*"
+    - "--generate-code*"
+    # strip gcc's -fcoroutines
+    - -fcoroutines
+    # strip CUDA flags unknown to clang
+    - "-ccbin*"
+    - "--compiler-options*"
+    - "--expt-extended-lambda"
+    - "--expt-relaxed-constexpr"
+    - "-forward-unknown-to-host-compiler"
+    - "-Werror=cross-execution-space-call"
+    - "--options-file"
+Diagnostics:
+  Suppress:
+    - "variadic_device_fn"
+    - "attributes_not_allowed"
+    # The NVHPC version of _NVCXX_EXPAND_PACK macro triggers this clang error.
+    # Temporarily suppressing it, but should probably fix
+    - "template_param_shadow"

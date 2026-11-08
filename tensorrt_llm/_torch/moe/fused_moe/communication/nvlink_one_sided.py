@@ -1,0 +1,1211 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ruff: noqa: E501
+
+
+"""
+NVLINK One-Sided AllToAll Communication Strategy
+
+This module implements the NVLINK one-sided comm AllToAll throughput communication method for MoE.
+
+NVLINK One-Sided supports post-quant dispatch.
+"""
+
+import os
+import re
+import sys
+from typing import Callable, Dict, List, Optional, Tuple
+
+import pynvml
+import torch
+
+from tensorrt_llm._torch.alltoall_watchdog import (
+    DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
+    DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
+    ActiveRankMaskSnapshot,
+    AlltoAllWatchdog,
+    AlltoAllWatchdogCoordinator,
+    AlltoAllWatchdogTimeout,
+    EPGroupHealthLike,
+    reject_rank_mask_cuda_graph_capture,
+)
+from tensorrt_llm._torch.distributed.mnnvl_memory import (
+    CftMnnvlMemory,
+    MnnvlCheckpointCommunicator,
+    MnnvlMemory,
+    cuda,
+)
+from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
+from tensorrt_llm.bindings import BuildInfo
+from tensorrt_llm.bindings import internal as _tllm_internal
+from tensorrt_llm.logger import logger as tllm_logger
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.math_utils import pad_up
+
+from ..moe_comm_timeout_guard import register_moe_comm_timeout_proxy
+from .base import Communication
+
+_CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH = 128
+_CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
+_CFT_DEFAULT_MAX_BATCH_FOR_COMBINE = 128
+_CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_COMBINE"
+FORCE_CFT_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT"
+_CFT_ALIGNMENT_BYTES = 16
+_CFT_MIN_DRIVER_BRANCH = 615
+
+
+def get_force_cft() -> bool | None:
+    value = os.environ.get(FORCE_CFT_ENV)
+    if value == "0":
+        return False
+    if value == "1":
+        return True
+    return None
+
+
+def _get_nvidia_driver_version() -> str | None:
+    try:
+        try:
+            pynvml.nvmlDeviceGetCount()
+        except pynvml.NVMLError_Uninitialized:
+            pynvml.nvmlInit()
+        value = pynvml.nvmlSystemGetDriverVersion()
+    except pynvml.NVMLError as error:
+        tllm_logger.warning_once(
+            "CFT counted writes disabled: failed to query the NVIDIA driver "
+            f"version via NVML ({error}). Falling back to fence-based dispatch.",
+            key="moe_a2a_cft_driver_query_failed",
+        )
+        return None
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
+
+
+def cft_driver_is_supported(driver_version: str | bytes | None) -> bool:
+    if isinstance(driver_version, bytes):
+        driver_version = driver_version.decode(errors="replace")
+    if not driver_version:
+        return False
+    match = re.match(r"^(\d+)(?:\.|$)", driver_version.strip())
+    return bool(match and int(match.group(1)) >= _CFT_MIN_DRIVER_BRANCH)
+
+
+def resolve_cft_counted_writes(
+    force_cft: bool | None,
+    driver_version: str | bytes | None,
+) -> bool:
+    """Allow automatic or forced CFT only on a supported driver."""
+    return force_cft is not False and cft_driver_is_supported(driver_version)
+
+
+def _cft_device_support_reason() -> str | None:
+    """Return why the current device cannot use counted-write fabric endpoints."""
+    major, minor = torch.cuda.get_device_capability()
+    if major < 10:
+        return f"SM{major}{minor} requires SM100 or newer"
+    try:
+        attributes = (
+            cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
+            cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_UNICAST_SUPPORTED,
+            cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_COUNTED_OPS_SUPPORTED,
+        )
+    except AttributeError:
+        return "CUDA Python bindings do not expose Logical Endpoint capabilities"
+    device = torch.cuda.current_device()
+    for attribute in attributes:
+        status, supported = cuda.cuDeviceGetAttribute(attribute, device)
+        if status != cuda.CUresult.CUDA_SUCCESS:
+            return f"querying {attribute.name} failed with {status.name}"
+        if not supported:
+            return f"device does not support {attribute.name}"
+    return None
+
+
+def select_cft_counted_writes(force_cft: bool | None) -> bool:
+    """Resolve CFT availability identically for workspace sizing and construction."""
+    if not BuildInfo.CFT_COUNTED_WRITES:
+        tllm_logger.warning_once(
+            "CFT counted writes disabled: this build was compiled against CUDA "
+            "below 13.4 and has no logical endpoint support. Falling back to fence.",
+            key="moe_a2a_cft_not_compiled",
+        )
+        return False
+    driver_version = None
+    if force_cft is not False:
+        driver_version = _get_nvidia_driver_version()
+    if not resolve_cft_counted_writes(force_cft, driver_version):
+        if driver_version is not None:
+            tllm_logger.warning_once(
+                "CFT counted writes disabled: NVIDIA driver "
+                f"{driver_version} is below required {_CFT_MIN_DRIVER_BRANCH}.00. "
+                "Falling back to fence-based dispatch.",
+                key=f"moe_a2a_cft_driver_unsupported_{driver_version}",
+            )
+        return False
+    unsupported_reason = _cft_device_support_reason()
+    if unsupported_reason is not None:
+        tllm_logger.warning_once(
+            f"CFT counted writes disabled: {unsupported_reason}. Falling back to fence.",
+            key=f"moe_a2a_cft_device_unsupported_{unsupported_reason}",
+        )
+        return False
+    return True
+
+
+def should_use_cft(
+    can_use_cft: bool,
+    force_cft: bool | None,
+    max_batch: int | None,
+    runtime_max_tokens_per_rank: int,
+) -> bool:
+    if not can_use_cft:
+        return False
+    if force_cft is not None:
+        return force_cft
+    if max_batch is None:
+        return True
+    return runtime_max_tokens_per_rank <= max_batch
+
+
+def _use_cft_for_dispatch_payloads(use_cft: bool, payloads: list[torch.Tensor]) -> bool:
+    if not use_cft:
+        return False
+    for payload_index, payload in enumerate(payloads):
+        bytes_per_token = payload.shape[1] * payload.element_size()
+        if bytes_per_token % _CFT_ALIGNMENT_BYTES != 0:
+            tllm_logger.warning_once(
+                "CFT counted writes disabled: dispatch payload "
+                f"{payload_index} has {bytes_per_token} bytes per token, which is not "
+                f"{_CFT_ALIGNMENT_BYTES}-byte aligned. Falling back to fence-based dispatch.",
+                key=f"moe_a2a_cft_dispatch_alignment_{payload_index}_{bytes_per_token}",
+            )
+            return False
+    return True
+
+
+def _use_cft_for_combine_payload(
+    use_cft: bool, payload: torch.Tensor, use_low_precision: bool
+) -> bool:
+    if not use_cft:
+        return False
+    wire_element_size = 1 if use_low_precision else payload.element_size()
+    bytes_per_token = payload.shape[-1] * wire_element_size
+    if bytes_per_token % _CFT_ALIGNMENT_BYTES != 0:
+        tllm_logger.warning_once(
+            "CFT counted writes disabled: combine payload has "
+            f"{bytes_per_token} bytes per token, which is not "
+            f"{_CFT_ALIGNMENT_BYTES}-byte aligned. Falling back to fence-based combine.",
+            key=f"moe_a2a_cft_combine_alignment_{bytes_per_token}",
+        )
+        return False
+    return True
+
+
+def _get_cft_max_batch(env_name: str, default: int) -> int:
+    env_value = os.environ.get(env_name)
+    if env_value is None:
+        return default
+    try:
+        threshold = int(env_value)
+    except ValueError as e:
+        raise ValueError(f"{env_name} must be an integer") from e
+    if threshold < 0:
+        raise ValueError(f"{env_name} must be non-negative")
+    return threshold
+
+
+def _get_cft_max_batch_for_dispatch() -> int:
+    return _get_cft_max_batch(_CFT_MAX_BATCH_FOR_DISPATCH_ENV, _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH)
+
+
+def _get_cft_max_batch_for_combine() -> int:
+    return _get_cft_max_batch(_CFT_MAX_BATCH_FOR_COMBINE_ENV, _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE)
+
+
+class _NVLinkOneSidedTimeoutProxy:
+    """Applies MoE communication timeouts to the process-wide completion-flag budget."""
+
+    name = "NVLinkOneSided"
+
+    def set_timeout_seconds(self, seconds: int | None) -> None:
+        # The op restores its native default for 0.
+        torch.ops.trtllm.moe_a2a_set_timeout(0 if seconds is None else seconds)
+
+
+_TIMEOUT_PROXY = _NVLinkOneSidedTimeoutProxy()
+
+
+class NVLinkOneSided(Communication):
+    """
+    NVLINK one-sided comm AllToAll strategy for throughput scenarios.
+
+    This implementation utilizes symmetric memory to enable peer-to-peer access between GPUs over NVLink.
+    The kernels only take the role as one side of the communication: the dispatch kernel puts the data
+    into peer ranks' symmetric memory from local buffer, while the combine kernel gets the data from peer
+    ranks' symmetric memory and reduces the data into local buffer. It is the most efficient implementation
+    by now, but requires symmetric memory size proportional to `max_num_tokens * n_ranks`, which may not
+    scale well for very large-scale parallelization.
+    """
+
+    # Constants from C++ (must match moeAlltoAllKernels.h)
+    MAX_RANKS = int(_tllm_internal.thop.MOE_A2A_MAX_RANKS)
+    MAX_TOP_K = int(_tllm_internal.thop.MOE_A2A_MAX_TOP_K)
+    MAX_PAYLOADS = int(_tllm_internal.thop.MOE_A2A_MAX_PAYLOADS)
+
+    # Shared workspaces/memory across the process, keyed by payload layout and CFT mode.
+    _WORKSPACES: Dict[Tuple[object, ...], dict] = {}
+    _WORKSPACE_REFCOUNTS: Dict[Tuple[object, ...], int] = {}
+    _WORKSPACE: dict | None = None
+    # Layout of the workspace holding the process-wide CFT logical endpoints, if any.
+    # The endpoints are bound to a single allocation once per process, so only one
+    # workspace can use counted writes; a model whose MoE layers differ in layout
+    # allocates several, and the rest fall back to fence. Nemotron-H Puzzle is one
+    # such model: its top_k varies across MoE layers. Remove once the endpoints can
+    # be bound per workspace.
+    _CFT_OWNER_SHAPE: Tuple[object, ...] | None = None
+
+    # MetaInfo indices - initialized from C++ constants
+    FLAG_VAL_OFFSET_INDEX = None
+    LOCAL_TOKEN_COUNTER_OFFSET_INDEX = None
+    SEND_COUNTERS_OFFSET_INDEX = None
+    RECV_COUNTERS_OFFSET_INDEX = None
+    DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX = None
+    COMBINE_COMPLETION_FLAGS_OFFSET_INDEX = None
+    EPLB_GATHERED_STATS_OFFSET_INDEX = None
+    DISPATCH_PAYLOAD_OFFSET_INDEX = None
+    DISPATCH_PAYLOAD_SIZE_INDEX = None
+    COMBINE_INPUT_OFFSET_INDEX = None
+    COMBINE_INPUT_SIZE_INDEX = None
+    COMBINE_RECV_OFFSET_INDEX = None
+    COMBINE_RECV_SIZE_INDEX = None
+    WORKSPACE_SIZE_INDEX = None
+
+    @staticmethod
+    def _make_workspace_layout(
+        ep_size: int,
+        top_k: int,
+        max_num_tokens: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        eplb_stats_num_experts: Optional[int],
+        extra_payload_bytes_per_token: int,
+        can_use_cft_counted_writes: bool,
+        use_low_precision_combine: bool,
+    ) -> torch.Tensor:
+        """Plan per-rank control buffers and independently sized payload regions."""
+        if hidden_size <= 0 or extra_payload_bytes_per_token < 0:
+            raise ValueError("hidden_size must be positive and extra payload size non-negative")
+        tokens = ep_size * max_num_tokens
+        # The wrapper accepts raw activations or quantized activations plus scales.
+        # A FP32 scale per 16 elements bounds the supported block-scale formats;
+        # accounting for its separate alignment also covers very small payloads.
+        activations = pad_up(tokens * hidden_size * dtype.itemsize, 128)
+        quantized = pad_up(tokens * hidden_size, 128) + pad_up(
+            tokens * ((hidden_size + 15) // 16) * 4, 128
+        )
+        dispatch_bytes = (
+            max(activations, quantized)
+            + 2 * pad_up(tokens * top_k * 4, 128)
+            + pad_up(tokens * extra_payload_bytes_per_token, 128)
+        )
+        # MoE may write its original-dtype output directly into the input region,
+        # even when the communication wire format is FP8.
+        combine_element_size = max(dtype.itemsize, 2)
+        combine_input_bytes = tokens * hidden_size * combine_element_size
+        combine_recv_bytes = (
+            tokens * hidden_size * (1 if use_low_precision_combine else combine_element_size)
+            if can_use_cft_counted_writes
+            else 0
+        )
+        return torch.ops.trtllm.moe_a2a_get_workspace_layout(
+            ep_size,
+            max_num_tokens,
+            top_k,
+            dispatch_bytes,
+            combine_input_bytes,
+            combine_recv_bytes,
+            eplb_stats_num_experts,
+            can_use_cft_counted_writes,
+        )
+
+    @staticmethod
+    def get_aux_data_size(
+        ep_size: int,
+        max_num_tokens: int,
+        eplb_stats_num_experts: Optional[int] = None,
+        can_use_cft_counted_writes: bool = False,
+        top_k: Optional[int] = None,
+    ) -> int:
+        """Control-buffer bytes; omitted top_k reserves the native routing limit."""
+        layout = torch.ops.trtllm.moe_a2a_get_workspace_layout(
+            ep_size,
+            max_num_tokens,
+            NVLinkOneSided.MAX_TOP_K if top_k is None else top_k,
+            0,
+            0,
+            0,
+            eplb_stats_num_experts,
+            can_use_cft_counted_writes,
+        )
+        return int(layout[_tllm_internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX])
+
+    @classmethod
+    def _init_constants(cls):
+        """Initialize constants from C++ if not already done."""
+        if cls.FLAG_VAL_OFFSET_INDEX is None:
+            thop = _tllm_internal.thop
+            cls.FLAG_VAL_OFFSET_INDEX = int(thop.MOE_A2A_FLAG_VAL_OFFSET_INDEX)
+            cls.LOCAL_TOKEN_COUNTER_OFFSET_INDEX = int(
+                thop.MOE_A2A_LOCAL_TOKEN_COUNTER_OFFSET_INDEX
+            )
+            cls.SEND_COUNTERS_OFFSET_INDEX = int(thop.MOE_A2A_SEND_COUNTERS_OFFSET_INDEX)
+            cls.RECV_COUNTERS_OFFSET_INDEX = int(thop.MOE_A2A_RECV_COUNTERS_OFFSET_INDEX)
+            cls.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX = int(
+                thop.MOE_A2A_DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX
+            )
+            cls.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX = int(
+                thop.MOE_A2A_COMBINE_COMPLETION_FLAGS_OFFSET_INDEX
+            )
+            cls.EPLB_GATHERED_STATS_OFFSET_INDEX = int(
+                thop.MOE_A2A_EPLB_GATHERED_STATS_OFFSET_INDEX
+            )
+            cls.DISPATCH_PAYLOAD_OFFSET_INDEX = int(thop.MOE_A2A_DISPATCH_PAYLOAD_OFFSET_INDEX)
+            cls.DISPATCH_PAYLOAD_SIZE_INDEX = int(thop.MOE_A2A_DISPATCH_PAYLOAD_SIZE_INDEX)
+            cls.COMBINE_INPUT_OFFSET_INDEX = int(thop.MOE_A2A_COMBINE_INPUT_OFFSET_INDEX)
+            cls.COMBINE_INPUT_SIZE_INDEX = int(thop.MOE_A2A_COMBINE_INPUT_SIZE_INDEX)
+            cls.COMBINE_RECV_OFFSET_INDEX = int(thop.MOE_A2A_COMBINE_RECV_OFFSET_INDEX)
+            cls.COMBINE_RECV_SIZE_INDEX = int(thop.MOE_A2A_COMBINE_RECV_SIZE_INDEX)
+            cls.WORKSPACE_SIZE_INDEX = int(thop.MOE_A2A_WORKSPACE_SIZE_INDEX)
+
+    def __init__(
+        self,
+        mapping: Mapping,
+        num_slots: int,
+        top_k: int,
+        max_num_tokens_per_rank: int,
+        payload_in_workspace: bool = False,
+        hidden_size: Optional[int] = None,
+        dtype: Optional[torch.dtype] = None,
+        num_experts: Optional[int] = None,
+        use_low_precision_combine: bool = False,
+        ep_group_health: EPGroupHealthLike | None = None,
+        alltoall_watchdog_timeout_s: Optional[float] = None,
+        alltoall_watchdog_poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
+        alltoall_watchdog_on_timeout: Optional[Callable[[AlltoAllWatchdogTimeout], None]] = None,
+    ) -> None:
+        """
+        Initialize NVLinkOneSided with workspace allocation.
+
+        CFT is selected automatically on supported platforms using separate
+        dispatch/combine token-count thresholds (128 by default).
+        TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0 selects fence; 1 bypasses the thresholds,
+        but not capability or payload-alignment requirements. CFT requires
+        sm_100+, a build against CUDA 13.4+, an NVLink fabric, and a driver
+        exporting the Logical Endpoint API (615.00+). Unsupported devices or
+        payloads fall back to fence with a one-time warning.
+
+        Args:
+            mapping: TensorRT-LLM Mapping object containing rank information
+            num_slots: Number of routing slots (token_selected_experts values are in [0, num_slots)).
+                Note: The terminology is mapped to `num_experts` in this class and the kernels.
+            top_k: Number of experts per token
+            max_num_tokens_per_rank: Maximum number of tokens per rank (for workspace allocation)
+            payload_in_workspace: If True, final_hidden_states is already in workspace
+            hidden_size: Hidden dimension size (optional, for auto workspace calculation)
+            dtype: Data type (optional, for auto workspace calculation)
+            num_experts: (Optional) Number of experts for EPLB stats (must be <= num_slots). DO NOT provide this parameter if EPLB is not enabled.
+                Note: The terminology is mapped to `eplb_stats_num_experts` in this class and the kernels.
+            use_low_precision_combine: If True, quantize the combine payload to FP8 for NVLink
+                transfer (halves NVLink bandwidth usage, output precision is preserved).
+                Corresponds to model_config.use_low_precision_moe_combine.
+            ep_group_health: Optional read-only committed EP membership. When present, rank-mask handling is
+                enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
+                detection never mutates it. CUDA graphs are rejected until membership-scoped recapture lands.
+            alltoall_watchdog_timeout_s: Optional timeout for the host-side AlltoAll watchdog. If None, the
+                watchdog is disabled.
+            alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
+            alltoall_watchdog_on_timeout: Optional callback invoked when the watchdog reports suspects.
+        """
+        super().__init__(mapping)
+        if mapping.has_cp_helix():
+            raise ValueError(
+                "NVLinkOneSided does not support Helix context parallelism because "
+                "its MNNVL communicator covers only the tensor-parallel group"
+            )
+
+        if self.mapping.world_size != self.ep_size:
+            raise RuntimeError("Currently NVLinkOneSided only supports pure EP for MoE.")
+        # Check the kernel rank cap before allocating the (large) symmetric workspace.
+        if self.ep_size > self.MAX_RANKS:
+            raise RuntimeError(
+                f"NVLinkOneSided supports at most {self.MAX_RANKS} EP ranks, got ep_size={self.ep_size}."
+            )
+        # The completion-flag budget is process-wide, so every instance shares one proxy.
+        register_moe_comm_timeout_proxy(_TIMEOUT_PROXY)
+
+        # Store needed parameters
+        self.num_experts = num_slots
+        self.top_k = top_k
+        self.max_num_tokens_per_rank = max_num_tokens_per_rank
+        self.payload_in_workspace = payload_in_workspace
+        self.use_low_precision_combine = use_low_precision_combine
+        if num_experts is not None:
+            assert num_experts > 0 and num_experts <= num_slots, (
+                "num_experts must be in (0, num_slots]"
+            )
+            tllm_logger.info(
+                "NVLinkOneSided AlltoAll: EPLB is enabled, with num_slots="
+                f"{num_slots} and num_experts={num_experts}"
+            )
+        self.enable_eplb = num_experts is not None
+        self.eplb_stats_num_experts = num_experts
+        self._force_cft = get_force_cft()
+        can_use_cft_counted_writes = select_cft_counted_writes(self._force_cft)
+        self._cft_shape = (
+            self.ep_size,
+            max_num_tokens_per_rank,
+            self.eplb_stats_num_experts,
+            self.num_experts,
+            self.top_k,
+            hidden_size,
+            dtype,
+            use_low_precision_combine,
+        )
+        if can_use_cft_counted_writes:
+            owner = NVLinkOneSided._CFT_OWNER_SHAPE
+            if owner is not None and owner != self._cft_shape:
+                tllm_logger.warning_once(
+                    "CFT counted writes disabled for this workspace: logical endpoints are "
+                    "already bound to a workspace with a different layout, and only one "
+                    "workspace per process may use them. Falling back to fence.",
+                    key="moe_a2a_cft_workspace_already_bound",
+                )
+                can_use_cft_counted_writes = False
+        self.can_use_cft_counted_writes = can_use_cft_counted_writes
+        if self._force_cft is None:
+            self.cft_max_batch_for_dispatch = _get_cft_max_batch_for_dispatch()
+            self.cft_max_batch_for_combine = _get_cft_max_batch_for_combine()
+        else:
+            self.cft_max_batch_for_dispatch = None
+            self.cft_max_batch_for_combine = None
+        if can_use_cft_counted_writes:
+            if self._force_cft is True:
+                tllm_logger.info("NVLinkOneSided AlltoAll: CFT forced for supported workloads")
+            else:
+                tllm_logger.info(
+                    "NVLinkOneSided AlltoAll: automatic CFT enabled with token-count limits "
+                    f"dispatch={self.cft_max_batch_for_dispatch}, "
+                    f"combine={self.cft_max_batch_for_combine}"
+                )
+        else:
+            tllm_logger.info(
+                "NVLinkOneSided AlltoAll: CFT handle-based counted writes disabled for dispatch"
+            )
+
+        # Initialize constants from C++
+        self._init_constants()
+
+        # Get workspace size
+        auto_workspace_size = None
+        metainfo = None
+        if hidden_size is not None and dtype is not None:
+            metainfo = self._make_workspace_layout(
+                self.ep_size,
+                self.top_k,
+                max_num_tokens_per_rank,
+                hidden_size,
+                dtype,
+                self.eplb_stats_num_experts,
+                0,
+                self.can_use_cft_counted_writes,
+                self.use_low_precision_combine,
+            )
+            auto_workspace_size = int(metainfo[self.WORKSPACE_SIZE_INDEX])
+        workspace_mb_env = os.environ.get("TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB")
+        if workspace_mb_env:
+            self.workspace_size_per_rank = int(workspace_mb_env) * 1024 * 1024
+            msg = f"NVLinkOneSided: Forcing workspace size to {self.workspace_size_per_rank} bytes (TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB={workspace_mb_env})."
+            if auto_workspace_size is not None:
+                msg += f"Automatically calculated workspace size is {auto_workspace_size} bytes."
+                if self.workspace_size_per_rank < auto_workspace_size:
+                    raise ValueError(
+                        f"Workspace override is too small: {self.workspace_size_per_rank} bytes, "
+                        f"layout requires {auto_workspace_size} bytes per rank"
+                    )
+            tllm_logger.warning(msg)
+        elif auto_workspace_size is not None:
+            self.workspace_size_per_rank = auto_workspace_size
+        else:
+            tllm_logger.warning(
+                "NVLinkOneSided: hidden_size and dtype are not provided (which are required for calculating workspace size)."
+                "Using default workspace size 2048MB."
+            )
+            self.workspace_size_per_rank = 2048 * 1024 * 1024
+
+        if metainfo is None:
+            # Without a model shape, distribute the explicit/default byte budget
+            # conservatively. The resulting boundaries are still fixed at initialization.
+            alignment = int(_tllm_internal.thop.MOE_A2A_WORKSPACE_ALIGNMENT)
+            control_bytes = self.get_aux_data_size(
+                self.ep_size,
+                max_num_tokens_per_rank,
+                self.eplb_stats_num_experts,
+                self.can_use_cft_counted_writes,
+                self.top_k,
+            )
+            regions = 3 if self.can_use_cft_counted_writes else 2
+            capacity = (
+                (self.workspace_size_per_rank - control_bytes) // regions // alignment * alignment
+            )
+            if capacity <= 0:
+                raise ValueError("Workspace byte budget leaves no room for payloads")
+            metainfo = torch.ops.trtllm.moe_a2a_get_workspace_layout(
+                self.ep_size,
+                max_num_tokens_per_rank,
+                self.top_k,
+                capacity,
+                capacity,
+                capacity if self.can_use_cft_counted_writes else 0,
+                self.eplb_stats_num_experts,
+                self.can_use_cft_counted_writes,
+            )
+        # Fixed region capacities are shared by allocation, native bounds checks,
+        # and workspace-backed views. Runtime shapes only pack tokens inside them.
+        MnnvlMemory.initialize()
+        self._workspace_key = (
+            self.workspace_size_per_rank,
+            self.max_num_tokens_per_rank,
+            self.ep_rank,
+            self.ep_size,
+            self.eplb_stats_num_experts,
+            self.num_experts,
+            self.top_k,
+            hidden_size,
+            dtype,
+            self.use_low_precision_combine,
+            self.can_use_cft_counted_writes,
+            tuple(metainfo.tolist()),
+        )
+
+        workspace_state = NVLinkOneSided._WORKSPACES.get(self._workspace_key)
+        memory_cls = CftMnnvlMemory if self.can_use_cft_counted_writes else MnnvlMemory
+        workspace_created = workspace_state is None
+        if workspace_state is None:
+            tllm_logger.info(
+                f"NVLinkOneSided: Allocating workspace with size {self.workspace_size_per_rank} bytes."
+                f"ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, top_k: {self.top_k}, max_num_tokens_per_rank: {self.max_num_tokens_per_rank}"
+            )
+            mnnvl_mem = memory_cls(mapping, self.workspace_size_per_rank)
+            workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
+            torch.ops.trtllm.moe_a2a_initialize(workspace, metainfo, self.ep_rank, self.ep_size)
+            workspace_state = {
+                "workspace_size_per_rank": self.workspace_size_per_rank,
+                "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
+                "ep_rank": self.ep_rank,
+                "ep_size": self.ep_size,
+                "eplb_stats_num_experts": self.eplb_stats_num_experts,
+                "num_experts": self.num_experts,
+                "top_k": self.top_k,
+                "hidden_size": hidden_size,
+                "dtype": dtype,
+                "use_low_precision_combine": self.use_low_precision_combine,
+                "can_use_cft_counted_writes": self.can_use_cft_counted_writes,
+                "mnnvl_mem": mnnvl_mem,
+                "workspace": workspace,
+                "metainfo": metainfo,
+                "cft_initialized": False,
+            }
+        else:
+            expected_workspace_state = {
+                "workspace_size_per_rank": self.workspace_size_per_rank,
+                "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
+                "ep_rank": self.ep_rank,
+                "ep_size": self.ep_size,
+                "eplb_stats_num_experts": self.eplb_stats_num_experts,
+                "num_experts": self.num_experts,
+                "top_k": self.top_k,
+                "hidden_size": hidden_size,
+                "dtype": dtype,
+                "use_low_precision_combine": self.use_low_precision_combine,
+                "can_use_cft_counted_writes": self.can_use_cft_counted_writes,
+            }
+            for key, expected_value in expected_workspace_state.items():
+                assert workspace_state[key] == expected_value, (
+                    f"reuse workspace with different {key}"
+                )
+
+        self._destroyed = False
+        self._workspace_registered = False
+        self._workspace_state = workspace_state
+        self.mnnvl_mem = workspace_state["mnnvl_mem"]
+        self.workspace = workspace_state["workspace"]
+        self.max_num_tokens_per_rank = workspace_state["max_num_tokens_per_rank"]
+        self.ep_group_health = ep_group_health
+        # Keep the kernel specialization stable for this communicator's lifetime.
+        self._rank_mask_enabled = ep_group_health is not None
+        if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
+            alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
+        flag_val_offset_index = self.FLAG_VAL_OFFSET_INDEX
+        dispatch_flags_offset_index = self.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX
+        combine_flags_offset_index = self.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX
+        if (
+            flag_val_offset_index is None
+            or dispatch_flags_offset_index is None
+            or combine_flags_offset_index is None
+        ):
+            raise RuntimeError("MoE All-to-All metadata indices are not initialized")
+        self._workspace_lifecycle = _MnnvlAlltoAllWorkspaceLifecycle.get_or_create(
+            workspace_state=workspace_state,
+            memory=self.mnnvl_mem,
+            workspace=self.workspace,
+            metainfo=workspace_state["metainfo"],
+            metainfo_index={
+                "FLAG_VAL_OFFSET_INDEX": flag_val_offset_index,
+                "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": dispatch_flags_offset_index,
+                "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": combine_flags_offset_index,
+            },
+            ep_rank=self.ep_rank,
+            ep_size=self.ep_size,
+            health=self.ep_group_health,
+        )
+        self._workspace_lifecycle.register(
+            self,
+            watchdog_timeout_s=alltoall_watchdog_timeout_s,
+            watchdog_poll_interval_s=alltoall_watchdog_poll_interval_s,
+            watchdog_on_timeout=alltoall_watchdog_on_timeout,
+        )
+        if workspace_created:
+            NVLinkOneSided._WORKSPACES[self._workspace_key] = workspace_state
+        NVLinkOneSided._WORKSPACE = workspace_state
+        NVLinkOneSided._WORKSPACE_REFCOUNTS[self._workspace_key] = (
+            NVLinkOneSided._WORKSPACE_REFCOUNTS.get(self._workspace_key, 0) + 1
+        )
+        self._workspace_registered = True
+
+        # Initialize CFT Logical Endpoints by binding the LE to the workspace.
+        # The LE IS the workspace — no separate allocation or payload layout needed.
+        if self.can_use_cft_counted_writes and not workspace_state.get("cft_initialized", False):
+            torch.ops.trtllm.moe_a2a_cft_initialize(
+                self.workspace,
+                self.mnnvl_mem.local_mem_handle,
+                int(self.workspace.size(1)),
+                self.ep_rank,
+                self.ep_size,
+            )
+            workspace_state["cft_initialized"] = True
+            NVLinkOneSided._CFT_OWNER_SHAPE = self._cft_shape
+
+        # Initialize dispatch state
+        self._dispatch_state = {"phase": "idle"}
+
+        # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-code to support -1 only.
+        self.invalid_token_expert_id: int = -1
+
+    @property
+    def moe_a2a_metainfo(self) -> torch.Tensor:
+        return self._require_workspace_lifecycle().metainfo
+
+    @property
+    def _watchdog_coordinator(self) -> AlltoAllWatchdogCoordinator:
+        return self._require_workspace_lifecycle().coordinator
+
+    @property
+    def _alltoall_watchdog(self) -> AlltoAllWatchdog | None:
+        return self._require_workspace_lifecycle().watchdog_for(self)
+
+    def _require_workspace_lifecycle(self) -> _MnnvlAlltoAllWorkspaceLifecycle:
+        lifecycle = self._workspace_lifecycle
+        if lifecycle is None:
+            raise RuntimeError("NVLinkOneSided workspace has been destroyed")
+        return lifecycle
+
+    @staticmethod
+    def is_platform_supported() -> bool:
+        """
+        Check if NVLINK one-sided comm is supported on current hardware.
+        """
+        return MnnvlMemory.supports_mnnvl()
+
+    def supports_post_quant_dispatch(self) -> bool:
+        """
+        NVLINK one-sided comm supports post-quant dispatch.
+        """
+        return True
+
+    @classmethod
+    def _release_workspace(cls, workspace_key: Tuple[object, ...]) -> None:
+        """Release a shared workspace after its last communicator is destroyed."""
+        workspace_state = cls._WORKSPACES.get(workspace_key)
+        if workspace_state is None:
+            return
+
+        owns_cft = workspace_state.get("cft_initialized", False)
+        try:
+            if owns_cft:
+                # The C++ manager owns a logical endpoint bound to this
+                # allocation. Destroy it before dropping the final Python
+                # references to the MNNVL memory, otherwise the endpoint
+                # outlives its backing pages and a recycled virtual address
+                # could resolve to it.
+                torch.ops.trtllm.moe_a2a_cft_release(
+                    workspace_state["workspace"], workspace_state["ep_rank"]
+                )
+        finally:
+            # This workspace held the process-wide endpoints, so a later
+            # workspace may claim them. Clear the owner even when the release
+            # raised: the entry is dropped below either way.
+            if owns_cft:
+                cls._CFT_OWNER_SHAPE = None
+            # Drop the workspace whether or not the release succeeded. By the
+            # time we get here ``destroy`` has already decremented the refcount
+            # and unregistered the lifecycle, so nothing will call this again:
+            # leaving the entry behind would hand a later communicator an
+            # allocation whose endpoint state is unknown. The exception still
+            # propagates -- the caller learns the release failed, but not by
+            # inheriting a reusable half-released workspace.
+            cls._WORKSPACES.pop(workspace_key, None)
+            if cls._WORKSPACE is workspace_state:
+                cls._WORKSPACE = None
+            workspace_state.clear()
+
+    def destroy(self):
+        """Release this instance's reference after all ranks finish using the workspace."""
+        if getattr(self, "_destroyed", False):
+            return
+
+        self._destroyed = True
+        lifecycle = getattr(self, "_workspace_lifecycle", None)
+        if lifecycle is not None and getattr(self, "_workspace_registered", False):
+            lifecycle.unregister(self)
+        workspace_key = getattr(self, "_workspace_key", None)
+        if workspace_key is None or not getattr(self, "_workspace_registered", False):
+            self._workspace_lifecycle = None
+            return
+        self._workspace_registered = False
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        refcount = NVLinkOneSided._WORKSPACE_REFCOUNTS.get(workspace_key, 0) - 1
+        if refcount > 0:
+            NVLinkOneSided._WORKSPACE_REFCOUNTS[workspace_key] = refcount
+        else:
+            NVLinkOneSided._WORKSPACE_REFCOUNTS.pop(workspace_key, None)
+            NVLinkOneSided._release_workspace(workspace_key)
+
+        self.mnnvl_mem = None
+        self.workspace = None
+        self._workspace_state = None
+        self._workspace_lifecycle = None
+        self._dispatch_state = {"phase": "destroyed"}
+
+    def __del__(self) -> None:
+        if sys.is_finalizing():
+            return
+        # Finalizers cannot safely perform collective cache eviction because
+        # their order is nondeterministic across ranks.
+        lifecycle = getattr(self, "_workspace_lifecycle", None)
+        if lifecycle is not None and getattr(self, "_workspace_registered", False):
+            lifecycle.unregister(self)
+        workspace_key = getattr(self, "_workspace_key", None)
+        if workspace_key is not None and getattr(self, "_workspace_registered", False):
+            refcount = NVLinkOneSided._WORKSPACE_REFCOUNTS.get(workspace_key, 0) - 1
+            if refcount > 0:
+                NVLinkOneSided._WORKSPACE_REFCOUNTS[workspace_key] = refcount
+            else:
+                NVLinkOneSided._WORKSPACE_REFCOUNTS.pop(workspace_key, None)
+        self._workspace_registered = False
+        self._workspace_lifecycle = None
+
+    def is_workload_feasible(self, all_rank_num_tokens: List[int], num_chunks: int) -> bool:
+        """
+        Check if NVLINK one-sided comm is feasible for the given workload at runtime.
+
+        This method performs runtime checks based on workload characteristics such as
+        token counts, number of chunks, and other runtime parameters.
+        """
+        return True
+
+    def use_cft_for_dispatch(self, runtime_max_tokens_per_rank: int) -> bool:
+        return should_use_cft(
+            self.can_use_cft_counted_writes,
+            self._force_cft,
+            self.cft_max_batch_for_dispatch,
+            runtime_max_tokens_per_rank,
+        )
+
+    def use_cft_for_combine(self, runtime_max_tokens_per_rank: int) -> bool:
+        return should_use_cft(
+            self.can_use_cft_counted_writes,
+            self._force_cft,
+            self.cft_max_batch_for_combine,
+            runtime_max_tokens_per_rank,
+        )
+
+    def _require_mapped(self) -> None:
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("Native MoE All-to-All workspace handles are unmapped")
+
+    def checkpoint_resource_key(self) -> int:
+        """Identify wrappers sharing the same MNNVL workspace lifecycle."""
+        return id(self._require_workspace_lifecycle())
+
+    def checkpoint_blocked_reason(self) -> Optional[str]:
+        """Block checkpointing while CFT counted writes are in use.
+
+        CFT binds logical endpoints to the workspace for the life of the
+        process, and detaching the backing memory would strand them.
+        """
+        if self.can_use_cft_counted_writes:
+            return (
+                "the MoE All-to-All workspace uses CFT counted writes, which pin "
+                "the workspace for the lifetime of the process. Set "
+                "TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0 to select fence-based "
+                "dispatch and enable sleep/wakeup"
+            )
+        return None
+
+    def checkpoint_prepare(self) -> None:
+        """Collectively detach handles after every shared owner is idle."""
+        reason = self.checkpoint_blocked_reason()
+        if reason is not None:
+            raise RuntimeError(f"Cannot checkpoint the MoE All-to-All workspace: {reason}")
+        self._require_workspace_lifecycle().checkpoint_prepare()
+
+    def checkpoint_restore(
+        self,
+        comm: MnnvlCheckpointCommunicator | None = None,
+    ) -> None:
+        """Collectively restore handles and all shared frontend state.
+
+        Args:
+            comm: An mpi4py-like communicator exposing ``Get_rank()``,
+                ``Get_size()``, ``allgather()``, and ``barrier()``. Its local
+                rank and size must match the communicator used for the
+                original allocation. Every rank must call this method
+                symmetrically.
+        """
+        if comm is None:
+            comm = self.mnnvl_mem.comm
+        if comm is None:
+            raise RuntimeError("MNNVL workspace communicator is not initialized")
+
+        # The native op re-validates the planned layout and resets control state;
+        # the layout itself is unchanged by a restore.
+        def reinitialize_frontend() -> torch.Tensor:
+            torch.ops.trtllm.moe_a2a_initialize(
+                self.workspace, self.moe_a2a_metainfo, self.ep_rank, self.ep_size
+            )
+            return self.moe_a2a_metainfo
+
+        self._require_workspace_lifecycle().checkpoint_restore(comm, reinitialize_frontend)
+
+    def _mnnvl_checkpoint_is_idle(self) -> bool:
+        return self._dispatch_state.get("phase") == "idle"
+
+    def _mnnvl_checkpoint_reset(self) -> None:
+        self._dispatch_state = {"phase": "idle"}
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_sf: Optional[torch.Tensor],
+        token_selected_slots: torch.Tensor,
+        token_final_scales: Optional[torch.Tensor],
+        all_rank_num_tokens: List[int],
+        use_dp_padding: Optional[bool] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Dispatch phase: scatter/send data to different ranks
+
+        Args:
+            hidden_states: Input tensor [local_num_tokens, hidden_size]
+            hidden_states_sf: Input scaling factor [local_num_tokens, sf_size]
+            token_selected_slots: Selected expert slots [local_num_tokens, top_k]
+            token_final_scales: Router weights [local_num_tokens, top_k]
+            all_rank_num_tokens: Token counts per rank [ep_size]
+            use_dp_padding: Whether to use DP padding (optional)
+            **kwargs: Strategy-specific arguments. In rank-mask mode, ``active_rank_mask`` may override the
+                committed membership for dispatch. Without an override, the committed mask and generation are
+                captured together; combine reuses that mask and fails closed if the generation changes first.
+                The masked kernel rejects inactive routes before remote access; that sentinel is an internal abort
+                artifact, not valid model output.
+
+        Returns:
+            Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales)
+            Each tensor has shape [ep_size, max_tokens_per_rank, ...]
+        """
+        self._require_mapped()
+        if self._dispatch_state.get("phase") == "dispatched":
+            raise RuntimeError("dispatch called twice without an intervening combine")
+        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
+
+        # Calculate runtime_max_tokens_per_rank from all_rank_num_tokens
+        runtime_max_tokens_per_rank = max(all_rank_num_tokens)
+        can_use_cft_for_dispatch = self.use_cft_for_dispatch(runtime_max_tokens_per_rank)
+
+        # Build payloads list - match TRTLLMGen baseline order for optimal performance
+        # Order: [hidden_states, hidden_states_sf (optional), token_selected_slots, token_final_scales (optional)]
+
+        payloads = []
+        payloads.append(hidden_states)
+        if hidden_states_sf is not None:
+            payloads.append(hidden_states_sf)
+
+        payloads.append(token_selected_slots)
+        if token_final_scales is not None:
+            payloads.append(token_final_scales)
+        can_use_cft_for_dispatch = _use_cft_for_dispatch_payloads(
+            can_use_cft_for_dispatch, payloads
+        )
+        expert_id_payload_index = len(payloads) - (2 if token_final_scales is not None else 1)
+        can_fuse_sanitize = can_use_cft_for_dispatch
+
+        eplb_local_stats = kwargs.get("eplb_local_stats")
+        if eplb_local_stats is not None:
+            assert self.enable_eplb, "eplb_local_stats provided but enable_eplb is False"
+            assert eplb_local_stats.dim() == 1, "eplb_local_stats must be a 1D tensor"
+            assert eplb_local_stats.size(0) == self.eplb_stats_num_experts, (
+                "eplb_local_stats size must match eplb_stats_num_experts"
+            )
+        requested_active_rank_mask = kwargs.get("active_rank_mask")
+        if not self._rank_mask_enabled and requested_active_rank_mask is not None:
+            raise ValueError("active_rank_mask requires committed EP group health")
+        active_rank_mask_snapshot = self._watchdog_coordinator.capture_active_rank_mask(
+            requested_active_rank_mask
+        )
+        active_rank_mask = active_rank_mask_snapshot.active_rank_mask
+
+        recv_buffers, combine_payload_offset, eplb_gathered_stats = (
+            torch.ops.trtllm.moe_a2a_dispatch(
+                token_selected_slots,
+                payloads,
+                self.workspace,
+                self.moe_a2a_metainfo,
+                runtime_max_tokens_per_rank,
+                self.ep_rank,
+                self.ep_size,
+                self.top_k,
+                self.num_experts,
+                eplb_local_stats,
+                can_use_cft_for_dispatch,
+                expert_id_payload_index if can_fuse_sanitize else None,
+                int(self.invalid_token_expert_id) if can_fuse_sanitize else None,
+                self._rank_mask_enabled,
+                active_rank_mask,
+            )
+        )
+        self._watchdog_coordinator.watch_collective(
+            self._alltoall_watchdog, "dispatch", active_rank_mask
+        )
+        if eplb_gathered_stats.numel() == 0:
+            eplb_gathered_stats = None
+        self._dispatch_state["eplb_gathered_stats"] = eplb_gathered_stats
+        self._dispatch_state["combine_payload_offset"] = int(combine_payload_offset)
+        self._dispatch_state["local_num_tokens"] = token_selected_slots.size(0)
+        self._dispatch_state["runtime_max_tokens_per_rank"] = runtime_max_tokens_per_rank
+        self._dispatch_state["active_rank_mask_snapshot"] = active_rank_mask_snapshot
+        self._dispatch_state["phase"] = "dispatched"
+
+        # Extract results from recv_buffers
+        # Payload order matches input:
+        # [hidden_states, hidden_states_sf (optional), token_selected_slots, token_final_scales (optional)]
+        hidden_states_recv = recv_buffers[0]
+        if hidden_states_sf is not None:
+            hidden_states_sf_recv = recv_buffers[1]
+            token_selected_slots_recv = recv_buffers[2]
+            token_final_scales_recv = recv_buffers[3] if token_final_scales is not None else None
+        else:
+            hidden_states_sf_recv = None
+            token_selected_slots_recv = recv_buffers[1]
+            token_final_scales_recv = recv_buffers[2] if token_final_scales is not None else None
+
+        if not can_fuse_sanitize:
+            torch.ops.trtllm.moe_a2a_sanitize_expert_ids(
+                token_selected_slots_recv,
+                self.workspace,
+                self.moe_a2a_metainfo,
+                self.ep_rank,
+                int(self.invalid_token_expert_id),
+            )
+
+        # Flatten 3D tensors to 2D for compatibility with MoE backends
+        # recv_buffers have shape [ep_size, max_tokens_per_rank, ...], flatten to [ep_size * max_tokens_per_rank, ...]
+        hidden_states_recv = hidden_states_recv.view(-1, hidden_states_recv.shape[-1])
+        if hidden_states_sf_recv is not None:
+            hidden_states_sf_recv = hidden_states_sf_recv.view(-1, hidden_states_sf_recv.shape[-1])
+        token_selected_slots_recv = token_selected_slots_recv.view(
+            -1, token_selected_slots_recv.shape[-1]
+        )
+        if token_final_scales_recv is not None:
+            token_final_scales_recv = token_final_scales_recv.view(
+                -1, token_final_scales_recv.shape[-1]
+            )
+
+        return (
+            hidden_states_recv,
+            hidden_states_sf_recv,
+            token_selected_slots_recv,
+            token_final_scales_recv,
+        )
+
+    def get_eplb_gathered_statistics(self) -> Optional[torch.Tensor]:
+        """
+        Return gathered EPLB statistics from the last dispatch, if available.
+        """
+        assert self.enable_eplb, "EPLB is not enabled"
+        return self._dispatch_state.get("eplb_gathered_stats")
+
+    def combine(
+        self,
+        final_hidden_states: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Combine phase: gather/receive data from different ranks
+
+        Args:
+            final_hidden_states: Output from MoE computation
+                Shape: [ep_size, max_tokens_per_rank, hidden_size] or
+                       [ep_size * max_tokens_per_rank, hidden_size] (will be reshaped)
+            **kwargs: Strategy-specific arguments. In rank-mask mode, ``active_rank_mask`` must match the mask
+                captured by dispatch for this collective when supplied. A committed-generation change since
+                dispatch aborts the collective epoch.
+
+        Returns:
+            Combined output tensor [local_num_tokens, hidden_size]
+
+        """
+        self._require_mapped()
+        if self._dispatch_state.get("phase") != "dispatched":
+            raise RuntimeError("combine called before a successful dispatch")
+        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
+
+        local_num_tokens = self._dispatch_state.get("local_num_tokens")
+        combine_payload_offset = self._dispatch_state.get("combine_payload_offset")
+        runtime_max_tokens_per_rank = self._dispatch_state.get("runtime_max_tokens_per_rank")
+
+        if (
+            local_num_tokens is None
+            or combine_payload_offset is None
+            or runtime_max_tokens_per_rank is None
+        ):
+            raise RuntimeError("combine called but dispatch state is missing")
+
+        # Reshape if needed (handle case where input is flattened)
+        if final_hidden_states.dim() == 2:
+            # Flattened: [ep_size * max_tokens_per_rank, hidden_size]
+            # Reshape to: [ep_size, max_tokens_per_rank, hidden_size]
+            hidden_size = final_hidden_states.shape[-1]
+            final_hidden_states = final_hidden_states.view(
+                self.ep_size, runtime_max_tokens_per_rank, hidden_size
+            )
+        elif final_hidden_states.dim() == 3:
+            # Already shaped: [ep_size, max_tokens_per_rank, hidden_size]
+            pass
+        else:
+            raise ValueError(
+                f"final_hidden_states must be 2D or 3D, got {final_hidden_states.dim()}D"
+            )
+        active_rank_mask_snapshot = self._dispatch_state.get("active_rank_mask_snapshot")
+        if not isinstance(active_rank_mask_snapshot, ActiveRankMaskSnapshot):
+            raise RuntimeError("combine called but dispatch rank-mask snapshot is missing")
+        requested_active_rank_mask = kwargs.get("active_rank_mask")
+        if not self._rank_mask_enabled and requested_active_rank_mask is not None:
+            raise ValueError("active_rank_mask requires committed EP group health")
+        active_rank_mask = self._watchdog_coordinator.active_rank_mask_for_combine(
+            active_rank_mask_snapshot,
+            requested_active_rank_mask,
+        )
+        use_cft_for_combine = _use_cft_for_combine_payload(
+            self.use_cft_for_combine(runtime_max_tokens_per_rank),
+            final_hidden_states,
+            self.use_low_precision_combine,
+        )
+        output = torch.ops.trtllm.moe_a2a_combine(
+            final_hidden_states,
+            int(local_num_tokens),
+            self.workspace,
+            self.moe_a2a_metainfo,
+            int(runtime_max_tokens_per_rank),
+            self.ep_rank,
+            self.ep_size,
+            self.top_k,
+            int(combine_payload_offset),
+            bool(self.payload_in_workspace),
+            bool(self.use_low_precision_combine),
+            use_cft_for_combine,
+            self._rank_mask_enabled,
+            active_rank_mask,
+        )
+        self._watchdog_coordinator.watch_collective(
+            self._alltoall_watchdog, "combine", active_rank_mask
+        )
+
+        # Reset state for next round
+        self.reset_state()
+
+        return output
+
+    def reset_state(self) -> None:
+        """Reset the dispatch/combine state machine to ``idle``.
+
+        Safe to call between forward passes (or from an error handler) to
+        recover from a forward that called ``dispatch`` but did not reach
+        ``combine`` — e.g. because an OOM aborted the forward. Without this,
+        the next ``dispatch`` would raise ``dispatch called twice``.
+        """
+        self._dispatch_state = {"phase": "idle"}
+
+    def get_combine_payload_tensor_in_workspace(
+        self, runtime_max_tokens_per_rank: int, hidden_size: int, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """
+        Return the combine payload tensor in the workspace, which could be used
+        as the output of MoE kernel to avoid extra copy.
+        Passing the returned tensor to combine lets the C++ op detect workspace ownership.
+
+        Args:
+            runtime_max_tokens_per_rank: Runtime max tokens per rank
+            hidden_size: Hidden dimension size
+            dtype: Data type
+
+        Returns:
+            Tensor view into combine input [ep_size * runtime_max_tokens_per_rank, hidden_size]
+        """
+        self._require_mapped()
+        if self._dispatch_state.get("phase") != "dispatched":
+            raise RuntimeError(
+                "get_combine_payload_tensor_in_workspace called before a successful dispatch"
+            )
+
+        combine_payload_offset = self._dispatch_state.get("combine_payload_offset")
+        if combine_payload_offset is None:
+            raise RuntimeError("combine_payload_offset not found in dispatch state")
+
+        result = torch.ops.trtllm.moe_a2a_get_combine_payload_tensor(
+            self.workspace,
+            self.moe_a2a_metainfo,
+            int(self.ep_rank),
+            int(self.ep_size),
+            int(runtime_max_tokens_per_rank),
+            dtype,
+            int(hidden_size),
+        )
+
+        return result

@@ -1,0 +1,7 @@
+name: nvshmem
+description: NVIDIA Shared Memory (NVSHMEM) library for inter-GPU communication
+source: fetched
+basename_matches:
+- libnvshmem.a
+directory_matches:
+- nvshmem

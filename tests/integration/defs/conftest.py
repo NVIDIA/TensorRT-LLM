@@ -1,0 +1,1608 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# -*- coding: utf-8 -*-
+
+import datetime
+import gc
+import importlib
+import importlib.util
+import logging
+import os
+import platform
+import re
+import shutil
+import subprocess as sp
+import tempfile
+import time
+import urllib.request
+import warnings
+from functools import wraps
+from pathlib import Path
+from typing import Iterable, Sequence
+
+import defs.ci_profiler
+import psutil
+import pytest
+import torch
+import tqdm
+import yaml
+from _pytest.mark import ParameterSet
+# Dispatched explicitly (not via pytest_plugins, which pytest forbids in a
+# non-top-level conftest: a repo-root invocation like `pytest tests` loads
+# this file as a NESTED conftest and would fail collection; and not via "-p"
+# in pytest.ini addopts, which imports at preparse, before the ini pythonpath
+# entries are usable). The wrappers below forward to the plugin; hooks are
+# idempotent, so a repo-root run that also dispatches from tests/conftest.py
+# is harmless.
+from test_common import session_prefetcher_hooks as _prefetch_hooks
+
+from .perf.gpu_clock_lock import GPUClockLock
+from .perf.session_data_writer import SessionDataWriter
+from .test_list_parser import (TestCorrectionMode, apply_waives,
+                               get_test_name_corrections_v2, handle_corrections,
+                               modify_by_test_list, preprocess_test_list_lines)
+from .trt_test_alternative import (check_output, exists, is_windows, is_wsl,
+                                   makedirs, print_info, print_warning,
+                                   wsl_to_win_path)
+from .utils.periodic_junit import PeriodicJUnitXML
+
+try:
+    from llm import trt_environment
+except ImportError:
+    trt_environment = None
+
+# Logger
+logger = logging.getLogger(__name__)
+
+# TODO: turn off this when the nightly storage issue is resolved.
+DEBUG_CI_STORAGE = os.environ.get("DEBUG_CI_STORAGE", False)
+
+
+def _get_s3_output():
+    # tests/ is on the path via the pythonpath entry in pytest.ini.
+    return importlib.import_module("test_common.s3_output")
+
+
+def print_storage_usage(path, tag, capfd):
+    if DEBUG_CI_STORAGE:
+        stat = shutil.disk_usage(path)
+        with capfd.disabled():
+            print_info(
+                f"\nUsage of {path} {stat} @{tag}, used in GB: {stat.used/(2**30)}"
+            )
+
+
+def wget(url, out):
+    filename = os.path.basename(url)
+    os.makedirs(out, exist_ok=True)
+    urllib.request.urlretrieve(url, os.path.join(out, filename))
+
+
+def llm_models_root() -> str:
+    """Return LLM_MODELS_ROOT path if it is set in env, assert when it's set but not a valid path."""
+
+    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
+    if "LLM_MODELS_ROOT" in os.environ:
+        root = Path(os.environ.get("LLM_MODELS_ROOT"))
+
+    if not root.exists():
+        root = Path("/scratch.trt_llm_data/llm-models/")
+
+    assert root.exists(), (
+        "You shall set LLM_MODELS_ROOT env or be able to access scratch.trt_llm_data to run this test"
+    )
+
+    return str(root)
+
+
+def tests_path() -> Path:
+    return (Path(os.path.dirname(__file__)) / "../..").resolve()
+
+
+def unittest_path() -> Path:
+    return tests_path() / "unittest"
+
+
+def integration_path() -> Path:
+    return tests_path() / "integration"
+
+
+def cached_in_llm_models_root(path_relative_to_llm_models_root,
+                              fail_if_path_is_invalid=False):
+    """
+    Use this decorator to declare a cached path in the LLM_MODELS_ROOT directory.
+
+    That decorator is intended to be used with pytest.fixture functions which prepare and return a data path for some tests.
+
+    The cache is only queried when llm_models_root() does not return None, and the cache is skipped otherwise.
+    When the cache is queried, and the specified path does not exist, the function:
+
+        - Triggers an AssertionFailure when fail_if_path_is_invalid is True,
+        - Ignore the invalid path and fallbacks to calling the fixture otherwise.
+
+    The purpose of the `fail_if_path_is_invalid` is the following:
+        -  If you submit a test and the data is not in the cached NFS LLM_MODELS_ROOT dir yet, you can use `fail_if_path_is_invalid=False` (the default).
+        In that case, the fixture will use the fallback path and ignore the cache miss in the CI. After submitting the data to the cached NFS LLM_MODELS_ROOT dir,
+        your test will automatically pickup the cached data.
+
+        - If your data is known to always be in the LLM_MODELS_ROOT, and you want to make sure that the test fails loudly when it misses in cache,
+          you should specify fail_if_path_is_invalid=True to force the failure. It is useful for when a cache miss will cause a big performance drop for the CI jobs.
+
+       Example:
+       If you have a fixture which downloads the SantaCoder repo and returns its path for one SantaCoder test, you can do the following:
+
+       @pytest.fixture(scope="session")
+       def llm_gpt2_santacoder_model_root(llm_venv):
+           workspace = llm_venv.get_working_directory()
+           gpt2_santacoder_model_root = os.path.join(workspace, "santacoder")
+           call(
+               f"git clone https://huggingface.co/bigcode/santacoder {gpt2_santacoder_model_root}",
+               shell=True)
+           return gpt2_santacoder_model_root
+
+        At some point, if you decide to cache the SantaCoder in the LLM_MODELS_ROOT, you can decorate the fixture to enforce the test to
+        use the ${LLM_MODELS_ROOT}/santacoder cached directory. You can upload SantaCoder to that location before or after submitting
+        this code since there is a fallback path to clone the repo if it is not found in cache.
+
+        @pytest.fixture(scope="session")
+        @cached_in_llm_models_root("santacoder")
+        def llm_gpt2_santacoder_model_root(llm_venv):
+            ... keep the original code
+    """
+
+    def wrapper(f):
+
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            cached_dir = f"{llm_models_root()}/{path_relative_to_llm_models_root}"
+            if os.path.exists(cached_dir):
+                return cached_dir
+            elif fail_if_path_is_invalid:
+                assert (
+                    False
+                ), f"{cached_dir} does not exist, and fail_if_path_is_invalid is True, please check the cache directory"
+            return f(*args, **kwargs)
+
+        return decorated
+
+    return wrapper
+
+
+# Fixture about whether the current pipeline is running in TRT environment.
+@pytest.fixture(scope="session")
+def is_trt_environment():
+    return trt_environment is not None
+
+
+# Helper function to get llm_root. Do not define it as a fixture so that this
+# function can be used during test collection phase.
+def get_llm_root(trt_config=None, gitlab_token=None):
+    if trt_environment:
+        return trt_environment.setup_tensorrt_llm_repo(trt_config, gitlab_token)
+    llm_repo_root = os.environ.get("LLM_ROOT", None)
+    if llm_repo_root is None:
+        llm_repo_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        print_warning(
+            f"The LLM_ROOT env var is not defined! Using {llm_repo_root} as LLM_ROOT."
+        )
+    return llm_repo_root
+
+
+@pytest.fixture(scope="session")
+def llm_root():
+    return get_llm_root()
+
+
+@pytest.fixture(scope="session")
+def llm_backend_root():
+    llm_root_directory = get_llm_root()
+    llm_backend_repo_root = os.path.join(llm_root_directory, "triton_backend")
+    return llm_backend_repo_root
+
+
+@pytest.fixture(scope="session")
+def llm_datasets_root() -> str:
+    return os.path.join(llm_models_root(), "datasets")
+
+
+@pytest.fixture(scope="session")
+def llm_rouge_root() -> str:
+    return os.path.join(llm_models_root(), "rouge")
+
+
+@pytest.fixture(scope="module")
+def bert_example_root(llm_root):
+    "Get bert example root"
+    example_root = os.path.join(llm_root, "examples", "models", "core", "bert")
+
+    return example_root
+
+
+@pytest.fixture(scope="module")
+def whisper_example_root(llm_root, llm_venv):
+    "Get whisper example root"
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "whisper")
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+    return example_root
+
+
+@pytest.fixture(scope="module")
+def llmapi_example_root(llm_root, llm_venv):
+    "Get llm api example root"
+
+    example_root = os.path.join(llm_root, "examples", "llm-api")
+
+    return example_root
+
+
+@pytest.fixture(scope="module")
+def disaggregated_example_root(llm_root, llm_venv):
+    "Get disaggregated example root"
+
+    example_root = os.path.join(llm_root, "examples", "disaggregated")
+
+    return example_root
+
+
+@pytest.fixture(scope="module")
+def gpt_example_root(llm_root, llm_venv):
+    "Get gpt example root"
+    example_root = os.path.join(llm_root, "examples", "models", "core", "gpt")
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+
+    return example_root
+
+
+@pytest.fixture(scope="module")
+def internlm2_example_root(llm_root, llm_venv):
+    "Get internlm2 example root"
+    example_root = os.path.join(llm_root, "examples", "models", "core",
+                                "internlm2")
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+
+    return example_root
+
+
+@pytest.fixture(scope="module")
+def medusa_example_root(llm_root, llm_venv):
+    "Get medusa example root"
+    example_root = os.path.join(llm_root, "examples", "medusa")
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+
+    return example_root
+
+
+@pytest.fixture(scope="function")
+def deepseek_v3_model_root(request):
+    models_root = llm_models_root()
+    if request.param == "DeepSeek-V3":
+        deepseek_v3_model_root = os.path.join(models_root, "DeepSeek-V3")
+    elif request.param == "DeepSeek-V3-Lite-bf16":
+        deepseek_v3_model_root = os.path.join(models_root, "DeepSeek-V3-Lite",
+                                              "bf16")
+    elif request.param == "DeepSeek-V3-Lite-fp8":
+        deepseek_v3_model_root = os.path.join(models_root, "DeepSeek-V3-Lite",
+                                              "fp8")
+    elif request.param == "DeepSeek-V3-Lite-nvfp4_moe_only":
+        deepseek_v3_model_root = os.path.join(models_root, "DeepSeek-V3-Lite",
+                                              "nvfp4_moe_only")
+    assert exists(
+        deepseek_v3_model_root), f"{deepseek_v3_model_root} does not exist!"
+    return deepseek_v3_model_root
+
+
+@pytest.fixture(scope="function")
+def gpt_oss_model_root(request):
+    models_root = os.path.join(llm_models_root(), "gpt_oss")
+    if request.param == "gpt-oss-20b":
+        gpt_oss_model_root = os.path.join(models_root, "gpt-oss-20b")
+    assert exists(gpt_oss_model_root), f"{gpt_oss_model_root} does not exist!"
+    return gpt_oss_model_root
+
+
+@pytest.fixture(scope="session")
+def trt_performance_cache_name():
+    return "performance.cache"
+
+
+@pytest.fixture(scope="session")
+def trt_performance_cache_fpath(llm_venv, trt_performance_cache_name):
+    workspace = llm_venv.get_working_directory()
+    fpath = os.path.join(workspace, trt_performance_cache_name)
+    if is_wsl():
+        return wsl_to_win_path(fpath)
+    return fpath
+
+
+# Get the executing perf case name
+@pytest.fixture(autouse=True)
+def perf_case_name(request):
+    return request.node.nodeid
+
+
+@pytest.fixture(scope="session")
+def output_dir(request):
+    output = request.config.getoption("--output-dir")
+    if output:
+        os.makedirs(str(output), exist_ok=True)
+    return output
+
+
+@pytest.fixture(scope="session")
+def trt_gpu_clock_lock(request):
+    """
+    Fixture for the GPUClockLock, used to interface with pynvml to get system properties and to lock/monitor GPU clocks.
+    """
+    gpu_list = get_gpu_device_list()
+    gpu_ids = [gpu.split()[1][:-1] for gpu in gpu_list]  # Extract GPU IDs
+    gpu_ids_str = ",".join(gpu_ids)
+    enable_clock_locking = request.config.getoption("--enable-gpu-clock-lock")
+    gpu_clock_lock = GPUClockLock(
+        gpu_id=gpu_ids_str,
+        interval_ms=1000.0,
+        enable_clock_locking=enable_clock_locking,
+    )
+
+    yield gpu_clock_lock
+
+    gpu_clock_lock.teardown()
+
+
+@pytest.fixture(scope="session")
+def llm_session_data_writer(request, trt_gpu_clock_lock, output_dir):
+    """
+    Fixture for the SessionDataWriter, used to write session data to output directory.
+    """
+    session_data_writer = SessionDataWriter(
+        log_output_directory=output_dir,
+        output_formats=request.config.getoption("--perf-log-formats"),
+        gpu_clock_lock=trt_gpu_clock_lock,
+    )
+
+    yield session_data_writer
+
+    session_data_writer.teardown()
+
+
+@pytest.fixture(scope="session")
+def custom_user_workspace(request):
+    return request.config.getoption("--workspace")
+
+
+@pytest.fixture(scope="session")
+def llm_venv(request, llm_root, custom_user_workspace):
+    workspace_dir = custom_user_workspace
+    subdir = datetime.datetime.now().strftime("ws-%Y-%m-%d-%H-%M-%S")
+    if workspace_dir is None:
+        workspace_dir = "llm-test-workspace"
+    workspace_dir = os.path.join(workspace_dir, subdir)
+    keep_workspace = request.config.getoption("--keep-workspace", default=False)
+    from defs.local_venv import PythonVenvRunnerImpl
+
+    venv = PythonVenvRunnerImpl("", "", "python3",
+                                os.path.join(os.getcwd(), workspace_dir))
+    yield venv
+    # Remove the workspace directory
+    if os.path.exists(workspace_dir):
+        if keep_workspace:
+            print(f"Keeping workspace (--keep-workspace): {workspace_dir}")
+        else:
+            print(f"Cleaning up workspace: {workspace_dir}")
+            shutil.rmtree(workspace_dir, ignore_errors=True)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _auto_install_media_deps(llm_venv):
+    """Ensure OpenCV is available for video multimodal tests.
+
+    Uses ``opencv-python-headless`` already on the system when present. Otherwise
+    set ``TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1`` to install it.
+    """
+    if importlib.util.find_spec("cv2") is not None:
+        return
+    if os.environ.get("TRTLLM_AUTO_INSTALL_MEDIA_DEPS", "0") != "1":
+        # TODO remove autouse once callers that need OpenCV depend on this
+        # fixture explicitly, and replace this warning with an error.
+        print_warning(
+            "OpenCV (cv2) is not installed, which is required for some tests.\n"
+            "You may need to install opencv-python-headless manually, or set "
+            "TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1 to auto-install.")
+        return
+    llm_venv.run_cmd(["-m", "pip", "install", "opencv-python-headless"])
+
+
+def remove_file(fn):
+    if os.path.isfile(fn) or os.path.islink(fn):
+        os.remove(fn)
+
+
+@pytest.fixture(scope="module")
+@cached_in_llm_models_root("santacoder", True)
+def llm_gpt2_santacoder_model_root():
+    "get santacoder data"
+    raise RuntimeError("santacoder must be cached")
+
+
+@pytest.fixture(scope="function")
+def llm_lora_model_root(request):
+    "get lora model path"
+    models_root = llm_models_root()
+    assert models_root, "Did you set LLM_MODELS_ROOT?"
+    assert hasattr(request, "param"), "Param is missing!"
+    model_list = []
+    model_root_list = []
+    if isinstance(request.param, tuple):
+        model_list = list(request.param)
+    else:
+        model_list = [request.param]
+
+    for item in model_list:
+        if item == "peft-lora-starcoder2-15b-unity-copilot":
+            model_root_list.append(
+                os.path.join(
+                    models_root,
+                    "lora",
+                    "starcoder",
+                    "peft-lora-starcoder2-15b-unity-copilot",
+                ))
+        elif item == "gpt-oss-20b-lora-adapter_NIM_r8":
+            model_root_list.append(
+                os.path.join(models_root, "gpt_oss",
+                             "gpt-oss-20b-lora-adapter_NIM_r8"))
+
+    return ",".join(model_root_list)
+
+
+@pytest.fixture(scope="session")
+def mmlu_dataset_root():
+    models_root = llm_models_root()
+    assert models_root, "Did you set LLM_MODELS_ROOT?"
+
+    mmlu_dataset_root = os.path.join(models_root, "datasets", "mmlu")
+
+    assert os.path.exists(
+        mmlu_dataset_root
+    ), f"{mmlu_dataset_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    return mmlu_dataset_root
+
+
+@pytest.fixture(scope="function")
+def engine_dir(llm_venv, capfd):
+    "Get engine dir"
+    engine_path = os.path.join(llm_venv.get_working_directory(), "engines")
+    print_storage_usage(llm_venv.get_working_directory(),
+                        "before removing existing engines", capfd)
+    # clean the engine dir for each case.
+    cur_time = time.time()
+    expire = time.time() + 60
+    while exists(engine_path) and cur_time < expire:
+        shutil.rmtree(engine_path, ignore_errors=True)
+        time.sleep(2)
+        cur_time = time.time()
+
+    print_storage_usage(llm_venv.get_working_directory(),
+                        "after removing existing engines", capfd)
+    return engine_path
+
+
+@pytest.fixture(scope="function")
+def cmodel_dir(llm_venv):
+    "converted model dir"
+    model_dir = os.path.join(llm_venv.get_working_directory(), "cmodels")
+
+    yield model_dir
+
+    if exists(model_dir):
+        shutil.rmtree(model_dir)
+
+
+@pytest.fixture(scope="function")
+def cmodel_base_dir(llm_venv):
+    "converted base model dir for redrafter"
+    model_dir = os.path.join(llm_venv.get_working_directory(), "cmodels_base")
+
+    yield model_dir
+
+    if exists(model_dir):
+        shutil.rmtree(model_dir)
+
+
+@pytest.fixture(scope="module")
+def qcache_dir(llm_venv, llm_root):
+    "get quantization cache dir"
+    defs.ci_profiler.start("qcache_dir")
+
+    cache_dir = os.path.join(llm_venv.get_working_directory(), "qcache")
+
+    quantization_root = os.path.join(llm_root, "examples", "quantization")
+
+    # Fix the issue that the requirements.txt is not available on aarch64.
+    if "aarch64" not in platform.machine() and get_sm_version() >= 89:
+        llm_venv.run_cmd([
+            "-m",
+            "pip",
+            "install",
+            "-r",
+            os.path.join(quantization_root, "requirements.txt"),
+        ])
+
+    if not exists(cache_dir):
+        makedirs(cache_dir)
+
+    yield cache_dir
+
+    if exists(cache_dir):
+        shutil.rmtree(cache_dir)
+
+    defs.ci_profiler.stop("qcache_dir")
+    print(
+        f"qcache_dir: {defs.ci_profiler.elapsed_time_in_sec('qcache_dir')} sec")
+
+
+@pytest.fixture(scope="module")
+def qcache_dir_without_install_package(llm_venv, llm_root):
+    "get quantization cache dir"
+    defs.ci_profiler.start("qcache_dir_without_install_package")
+
+    cache_dir = os.path.join(llm_venv.get_working_directory(), "qcache")
+
+    if not exists(cache_dir):
+        makedirs(cache_dir)
+
+    yield cache_dir
+
+    if exists(cache_dir):
+        shutil.rmtree(cache_dir)
+
+    defs.ci_profiler.stop("qcache_dir_without_install_package")
+    print(
+        f"qcache_dir_without_install_package: {defs.ci_profiler.elapsed_time_in_sec('qcache_dir_without_install_package')} sec"
+    )
+
+
+def parametrize_with_ids(
+    argnames: str | Sequence[str],
+    argvalues: Iterable[ParameterSet | Sequence[object] | object],
+    **kwargs,
+):
+    """An alternative to pytest.mark.parametrize with automatically generated test ids."""
+    if isinstance(argnames, str):
+        argname_list = [n.strip() for n in argnames.split(",")]
+    else:
+        argname_list = argnames
+
+    case_ids = []
+    for case_argvalues in argvalues:
+        if isinstance(case_argvalues, ParameterSet):
+            case_argvalues = case_argvalues.values
+        elif case_argvalues is None or isinstance(case_argvalues,
+                                                  (str, float, int, bool)):
+            case_argvalues = (case_argvalues, )
+        assert len(case_argvalues) == len(argname_list)
+
+        case_id = [
+            f"{name}={value}"
+            for name, value in zip(argname_list, case_argvalues)
+        ]
+        case_ids.append("-".join(case_id))
+
+    return pytest.mark.parametrize(argnames, argvalues, ids=case_ids, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def skip_by_device_count(request):
+    "fixture for skip less device count"
+    if request.node.get_closest_marker("skip_less_device"):
+        device_count = get_device_count()
+        expected_count = request.node.get_closest_marker(
+            "skip_less_device").args[0]
+        if expected_count > int(device_count):
+            pytest.skip(
+                f"Device count {device_count} is less than {expected_count}")
+
+
+def get_mpi_world_size() -> int:
+    """Lazy wrapper so conftest import does not load MPI bindings."""
+    from tensorrt_llm.llmapi.mpi_session import \
+        get_mpi_world_size as _get_mpi_world_size
+    return _get_mpi_world_size()
+
+
+@pytest.fixture(autouse=True)
+def skip_by_mpi_world_size(request):
+    "fixture for skip less mpi world size"
+    if request.node.get_closest_marker("skip_less_mpi_world_size"):
+        mpi_world_size = get_mpi_world_size()
+        device_count = get_device_count()
+        if mpi_world_size == 1:
+            # For mpi_world_size == 1 case, we only need to check device count since we can spawn mpi workers in the test itself
+            total_count = device_count
+        else:
+            # Otherwise, we follow the mpi world size setting
+            total_count = mpi_world_size
+        expected_count = request.node.get_closest_marker(
+            "skip_less_mpi_world_size").args[0]
+        if expected_count > int(total_count):
+            pytest.skip(
+                f"Total world size {total_count} is less than {expected_count}")
+
+
+@pytest.fixture(autouse=True)
+def skip_by_device_memory(request):
+    "fixture for skip less device memory"
+    # Get all markers, not just the closest one
+    markers = request.node.iter_markers("skip_less_device_memory")
+
+    for marker in markers:
+        device_memory = get_device_memory()
+        expected_memory = marker.args[0]
+        if expected_memory > int(device_memory):
+            pytest.skip(
+                f"Device memory {device_memory} is less than {expected_memory}")
+
+
+def get_sm_version():
+    "get compute capability"
+    if not torch.cuda.is_available():
+        return 0
+    try:
+        prop = torch.cuda.get_device_properties(0)
+    except RuntimeError:
+        return 0
+    return prop.major * 10 + prop.minor
+
+
+def is_sm_100f(sm_version=None):
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version >= 100 and sm_version < 110
+
+
+def is_sm_120f(sm_version=None):
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version >= 120 and sm_version < 130
+
+
+def get_gpu_device_list():
+    "get device list"
+    with tempfile.TemporaryDirectory() as temp_dirname:
+        suffix = ".exe" if is_windows() else ""
+        # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
+        cmd = " ".join(["nvidia-smi" + suffix, "-L"])
+        try:
+            output = check_output(cmd, shell=True, cwd=temp_dirname)
+        except sp.CalledProcessError:
+            return []
+    return [l.strip() for l in output.strip().split("\n")]
+
+
+def check_device_contain(keyword_list):
+    "check device not contain keyword"
+    devices = get_gpu_device_list()
+    device = devices[0] if devices else ""
+    return any(keyword in device for keyword in keyword_list)
+
+
+def is_ipc_nvls_supported():
+    if not torch.cuda.is_available():
+        return False
+    try:
+        from tensorrt_llm.bindings import ipc_nvls_supported
+        return ipc_nvls_supported()
+    except (RuntimeError, ImportError):
+        return False
+
+
+skip_pre_ada = pytest.mark.skipif(
+    get_sm_version() < 89,
+    reason="This test is not supported in pre-Ada architecture")
+
+skip_pre_hopper = pytest.mark.skipif(
+    get_sm_version() < 90,
+    reason="This test is not supported in pre-Hopper architecture",
+)
+
+skip_post_hopper = pytest.mark.skipif(
+    get_sm_version() > 90,
+    reason="This test is not supported in post-Hopper architecture",
+)
+
+skip_pre_blackwell = pytest.mark.skipif(
+    get_sm_version() < 100,
+    reason="This test is not supported in pre-Blackwell architecture",
+)
+
+skip_post_blackwell = pytest.mark.skipif(
+    get_sm_version() >= 100,
+    reason="This test is not supported in post-Blackwell architecture",
+)
+
+skip_no_rubin = pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported in Rubin architecture",
+)
+
+skip_post_blackwell_ultra = pytest.mark.skipif(
+    get_sm_version() >= 103,
+    reason="This test is not supported in post-Blackwell-Ultra architecture",
+)
+
+skip_pre_rubin = pytest.mark.skipif(
+    get_sm_version() < 107,
+    reason="This test is not supported in pre-Rubin architecture",
+)
+
+skip_device_contain_gb200 = pytest.mark.skipif(
+    check_device_contain(["GB200"]),
+    reason="This test is not supported on GB200 or GB100",
+)
+
+skip_no_nvls = pytest.mark.skipif(not is_ipc_nvls_supported(),
+                                  reason="NVLS is not supported")
+skip_no_hopper = pytest.mark.skipif(
+    get_sm_version() != 90,
+    reason="This test is only  supported in Hopper architecture")
+
+skip_no_mxfp4_swizzle = pytest.mark.skipif(
+    check_device_contain(["H20"]) and not check_device_contain(["H200"]),
+    reason="nvbugs/5446119: MXFP4 swizzle not supported on H20")
+
+skip_no_sm120 = pytest.mark.skipif(not is_sm_120f(),
+                                   reason="This test is for SM120")
+
+skip_arm = pytest.mark.skipif(
+    "aarch64" in platform.machine(),
+    reason="This test is not supported on ARM architecture",
+)
+
+skip_x86 = pytest.mark.skipif(
+    "x86_64" in platform.machine(),
+    reason="This test is not supported on x86 architecture",
+)
+
+
+def skip_fp8_pre_ada(use_fp8):
+    "skip fp8 tests if sm version less than 8.9"
+    if use_fp8 and get_sm_version() < 89:
+        pytest.skip("FP8 is not supported on pre-Ada architectures")
+
+
+def skip_fp4_pre_blackwell(use_fp4):
+    "skip fp4 tests if sm version less than 10.0 or greater or equal to 12.0"
+    if use_fp4 and (get_sm_version() < 100 or get_sm_version() >= 120):
+        pytest.skip("FP4 is not supported on pre-Blackwell architectures")
+
+
+@pytest.fixture(autouse=True)
+def skip_device_not_contain(request):
+    "skip test if device not contain keyword"
+    if request.node.get_closest_marker("skip_device_not_contain"):
+        keyword_list = request.node.get_closest_marker(
+            "skip_device_not_contain").args[0]
+        if not check_device_contain(keyword_list):
+            pytest.skip(
+                f"Device {get_gpu_device_list()[0]} does not contain keyword in {keyword_list}."
+            )
+
+
+def get_device_count():
+    "return device count"
+    return len(get_gpu_device_list())
+
+
+def get_device_memory():
+    "get gpu memory"
+    memory = 0
+    with tempfile.TemporaryDirectory() as temp_dirname:
+        suffix = ".exe" if is_windows() else ""
+        # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
+        cmd = " ".join([
+            "nvidia-smi" + suffix, "--query-gpu=memory.total",
+            "--format=csv,noheader"
+        ])
+        # Try to get memory from nvidia-smi first, if failed, fallback to system memory from /proc/meminfo
+        # This fallback is needed for systems with unified memory (e.g. DGX Spark)
+        try:
+            output = check_output(cmd, shell=True, cwd=temp_dirname)
+            memory_str = output.strip().split()[0]
+            # Check if nvidia-smi returned a valid numeric value
+            if "N/A" in memory_str:
+                raise ValueError("nvidia-smi returned invalid memory info")
+            memory = int(memory_str)
+        except (sp.CalledProcessError, ValueError, IndexError):
+            # Fallback to system memory from /proc/meminfo (in kB, convert to MiB)
+            try:
+                with open("/proc/meminfo", "r") as f:
+                    for line in f:
+                        if line.startswith("MemTotal:"):
+                            memory = int(
+                                line.split()[1]) // 1024  # Convert kB to MiB
+                            break
+            except:
+                memory = 8192  # Default 8GB if all else fails
+
+    return memory
+
+
+def pytest_addoption(parser):
+    _get_s3_output().add_options(parser)
+    parser.addoption(
+        "--test-list",
+        "-F",
+        action="store",
+        default=None,
+        help="Path to the file containing the list of tests to run",
+    )
+    parser.addoption(
+        "--workspace",
+        "--ws",
+        action="store",
+        default=None,
+        help="Workspace path to store temp data generated during the tests",
+    )
+    parser.addoption(
+        "--waives-file",
+        "-S",
+        action="store",
+        default=None,
+        help=
+        "Specify a file containing a list of waives, one per line. After filtering collected tests, Pytest will "
+        "apply the waive state specified by this file to the set of tests to be run.",
+    )
+    parser.addoption(
+        "--output-dir",
+        "-O",
+        action="store",
+        default=None,
+        help=
+        "Directory to store test output. Should point to a new or existing empty directory.",
+    )
+    parser.addoption(
+        "--test-prefix",
+        "-P",
+        action="store",
+        default=None,
+        help=
+        "It is useful when using such prefix to mapping waive lists for specific GPU, such as 'GH200'",
+    )
+    parser.addoption(
+        "--regexp",
+        "-R",
+        action="store",
+        default=None,
+        help="A regexp to specify which tests to run",
+    )
+    parser.addoption(
+        "--apply-test-list-correction",
+        "-C",
+        action="store_true",
+        help=
+        "Attempt to automatically correct invalid test names in filter files and print the correct name in terminal. "
+        "If the correct name cannot be determined, the invalid test name will be printed to the terminal as well.",
+    )
+    parser.addoption("--perf",
+                     action="store_true",
+                     help="'--perf' will run perf tests")
+    parser.addoption(
+        "--run-ray",
+        action="store_true",
+        default=False,
+        help=
+        "Enable Ray orchestrator path for integration tests (disables MPI).",
+    )
+    parser.addoption(
+        "--unittest-markexpr",
+        action="store",
+        default=None,
+        help="Marker expression forwarded to nested unittest pytest runs.",
+    )
+    parser.addoption(
+        "--perf-log-formats",
+        help=
+        "Supply either 'yaml' or 'csv' as values. Supply multiple same flags for multiple formats.",
+        action="append",
+        default=[],
+    )
+    parser.addoption(
+        "--test-model-suites",
+        action="store",
+        default=None,
+        help=
+        "Specify test model suites separated by semicolons or spaces. Each suite can contain special characters. "
+        "Example: --test-model-suites=suite1;suite2;suite3 or --test-model-suites=suite1 suite2 suite3",
+    )
+    parser.addoption(
+        "--periodic-junit",
+        action="store_true",
+        default=False,
+        help=
+        "Enable periodic JUnit XML reporter. This reporter leverages pytest's built-in junitxml "
+        "for reliable test result handling. Saves progress periodically to prevent data loss on "
+        "interruption. Requires --output-dir to be set.",
+    )
+    parser.addoption(
+        "--periodic-interval",
+        action="store",
+        type=int,
+        default=18000,
+        help=
+        "Time interval in seconds between periodic saves (default: 18000s = 5 hours). "
+        "Only used with --periodic-junit.",
+    )
+    parser.addoption(
+        "--periodic-batch-size",
+        action="store",
+        type=int,
+        default=10,
+        help=
+        "Number of completed tests before triggering a periodic save (default: 10). "
+        "Only used with --periodic-junit.",
+    )
+    parser.addoption(
+        "--periodic-junit-xmlpath",
+        action="store",
+        default=None,
+        help="Path to the output XML file for periodic JUnit XML reporter. "
+        "Only used with --periodic-junit.",
+    )
+    parser.addoption(
+        "--enable-gpu-clock-lock",
+        action="store_true",
+        default=False,
+        help="Enable GPU clock locking during tests. "
+        "By default, GPU clock locking is disabled.",
+    )
+    parser.addoption(
+        "--keep-workspace",
+        action="store_true",
+        default=False,
+        help=
+        "Skip workspace cleanup at session end (useful for inspecting logs after a failure).",
+    )
+    parser.addoption(
+        "--periodic-save-unfinished-test",
+        action="store_true",
+        default=False,
+        help=
+        "Save unfinished test name to unfinished_test.txt during test execution (default: False). "
+        "This helps identify which test was running when a timeout or crash occurs. "
+        "Only used with --periodic-junit.",
+    )
+    parser.addoption(
+        "--periodic-unfinished-test-path",
+        action="store",
+        default=None,
+        help="Override the unfinished_test.txt location (default: alongside "
+        "--periodic-junit-xmlpath). Use this to make a rerun attempt that writes "
+        "its results XML elsewhere still share the original attempt's "
+        "unfinished_test.txt, so a crash during the rerun itself is recorded in "
+        "the same place the caller checks for unresolved crashes. Only used "
+        "with --periodic-save-unfinished-test.",
+    )
+    parser.addoption(
+        "--periodic-hang-traceback",
+        action="store_true",
+        default=False,
+        help=
+        "Dump every thread's stack to hang_traceback.txt when a test overruns its "
+        "timeout or the process is signalled (default: False). This turns an empty "
+        "'Test terminated unexpectedly' record into a diagnosable hang stack. "
+        "Only used with --periodic-junit.",
+    )
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_generate_tests(metafunc: pytest.Metafunc):
+    if metafunc.definition.function.__name__ != "test_unittests_v2":
+        return
+    testlist_path = metafunc.config.getoption("--test-list")
+    if not testlist_path:
+        return
+
+    with open(testlist_path, "r") as f:
+        lines = f.readlines()
+        lines = preprocess_test_list_lines(testlist_path, lines)
+
+    uts = []
+    ids = []
+    for line in lines:
+        if line.startswith("unittest/"):
+            if " TIMEOUT " in line:
+                # Process for marker TIMEOUT
+                case_part, timeout_part = line.split(" TIMEOUT ", 1)
+                case = case_part.strip()
+                timeout_str = timeout_part.strip()
+                timeout_num_match = re.search(r"\(?(\d+)\)?", timeout_str)
+                if timeout_num_match:
+                    timeout_min = int(timeout_num_match.group(1))
+                    timeout_sec = timeout_min * 60
+                else:
+                    raise ValueError(
+                        f"Invalid TIMEOUT format: {timeout_str} in line: {line}"
+                    )
+                mark = pytest.mark.timeout(int(timeout_sec))
+                uts.append(pytest.param(case, marks=mark))
+                # Change back id to include timeout information
+                ids.append(f"{case} TIMEOUT {timeout_str}")
+            else:
+                uts.append(line.strip())
+    metafunc.parametrize("case", uts, ids=lambda x: x)
+
+
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_collection_modifyitems(session, config, items):
+    testlist_path = config.getoption("--test-list")
+    waives_file = config.getoption("--waives-file")
+    test_prefix = config.getoption("--test-prefix")
+    perf_test = config.getoption("--perf")
+    test_model_suites = config.getoption("--test-model-suites")
+
+    if perf_test:
+        global ALL_PYTEST_ITEMS
+        ALL_PYTEST_ITEMS = None
+
+        import copy
+
+        # Do not import at global level since that would create cyclic imports.
+        from .perf.test_perf import generate_perf_tests
+
+        # Perf tests are generated based on the test list to speed up the test collection time.
+        items = generate_perf_tests(session, config, items)
+
+        ALL_PYTEST_ITEMS = copy.copy(items)
+
+    if test_prefix:
+        # Override the internal nodeid of each item to contain the correct test prefix.
+        # This is needed for reporting to correctly process the test name in order to bucket
+        # it into the appropriate test suite.
+        for item in items:
+            item._nodeid = "{}/{}".format(test_prefix, item._nodeid)
+
+    regexp = config.getoption("--regexp")
+
+    if testlist_path:
+        modify_by_test_list(testlist_path, items, config)
+
+    if regexp is not None:
+        deselect_by_regex(regexp, items, test_prefix, config)
+
+    if test_model_suites:
+        deselect_by_test_model_suites(test_model_suites, items, test_prefix,
+                                      config)
+
+    if waives_file:
+        apply_waives(waives_file, items, config)
+
+    # Skip tests with pytest.mark.ray unless --run-ray is passed.
+    if not config.getoption("--run-ray"):
+        skip_marker = pytest.mark.skip(
+            reason="Ray tests skipped; pass --run-ray to enable")
+        for item in items:
+            if item.get_closest_marker("ray") is not None:
+                item.add_marker(skip_marker)
+
+    # We have to remove prefix temporarily before splitting the test list
+    # After that change back the test id.
+    for item in items:
+        if test_prefix and item._nodeid.startswith(f"{test_prefix}/"):
+            item._nodeid = item._nodeid[len(f"{test_prefix}/"):]
+    yield
+    for item in items:
+        if test_prefix:
+            item._nodeid = f"{test_prefix}/{item._nodeid}"
+
+
+def pytest_configure(config):
+    _prefetch_hooks.pytest_configure(config)
+    os.environ.setdefault("TRTLLM_NO_USAGE_STATS", "1")
+
+    # avoid thread leak of tqdm's TMonitor
+    tqdm.tqdm.monitor_interval = 0
+    if config.getoption("--run-ray"):
+        os.environ["TLLM_DISABLE_MPI"] = "1"
+        os.environ["TLLM_RAY_FORCE_LOCAL_CLUSTER"] = "1"
+        os.environ["RAY_raylet_start_wait_time_s"] = "120"
+
+    # xdist worker processes must not register PeriodicJUnitXML: all worker
+    # reports are forwarded to the controller via xdist and processed there,
+    # so registering on workers causes concurrent writers to the same
+    # unfinished_test.txt and races out cleanup entries.
+    if hasattr(config, "workerinput"):
+        return
+
+    # Initialize PeriodicJUnitXML reporter if enabled
+    periodic = config.getoption("--periodic-junit", default=False)
+    output_dir = config.getoption("--output-dir", default=None)
+    periodic_junit_xmlpath = config.getoption("--periodic-junit-xmlpath",
+                                              default=None)
+    if periodic and output_dir:
+        periodic_interval = config.getoption("--periodic-interval")
+        periodic_batch_size = config.getoption("--periodic-batch-size")
+        periodic_save_unfinished_test = config.getoption(
+            "--periodic-save-unfinished-test", default=False)
+        periodic_unfinished_test_path = config.getoption(
+            "--periodic-unfinished-test-path", default=None)
+        periodic_hang_traceback = config.getoption("--periodic-hang-traceback",
+                                                   default=False)
+
+        # Create output directory early (like --junitxml does) to avoid conflicts with other plugins
+        # that may need to write to the same directory (e.g., pytest-split)
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Create the reporter with logger
+        xmlpath = periodic_junit_xmlpath or os.path.join(
+            output_dir, "results.xml")
+        reporter = PeriodicJUnitXML(
+            xmlpath=xmlpath,
+            interval=periodic_interval,
+            batch_size=periodic_batch_size,
+            logger={
+                'info': print_info,
+                'warning': print_warning
+            },
+            save_unfinished_test=periodic_save_unfinished_test,
+            unfinished_test_path=periodic_unfinished_test_path,
+            dump_hang_traceback=periodic_hang_traceback,
+        )
+
+        # Registration replays the historic pytest_configure hook.
+        config.pluginmanager.register(reporter, 'periodic_junit')
+
+        print_info("PeriodicJUnitXML reporter registered")
+        print_info(
+            f"  Interval: {periodic_interval}s ({periodic_interval/60:.1f} min)"
+        )
+        print_info(f"  Batch size: {periodic_batch_size} tests")
+        print_info(f"  Save unfinished test: {periodic_save_unfinished_test}")
+        print_info(f"  Hang traceback: {periodic_hang_traceback}")
+    elif periodic and not output_dir:
+        print_warning(
+            "Warning: --periodic-junit requires --output-dir to be set. "
+            "Periodic reporting disabled.")
+
+
+def deselect_by_test_model_suites(test_model_suites, items, test_prefix,
+                                  config):
+    """Filter tests based on the test model suites specified.
+    If a test matches any of the test model suite names, it is considered selected.
+
+    Args:
+        test_model_suites: String containing test model suite names separated by semicolons
+        items: List of pytest items to filter
+        test_prefix: Test prefix if any
+        config: Pytest config object
+    """
+    if not test_model_suites:
+        return
+
+    # Split by semicolon or space and strip whitespace
+    suite_names = [
+        suite.strip() for suite in test_model_suites.replace(';', ' ').split()
+        if suite.strip()
+    ]
+
+    if not suite_names:
+        return
+
+    selected = []
+    deselected = []
+
+    for item in items:
+        # Get the test name without prefix for comparison
+        test_name = item.nodeid
+        if test_prefix and test_name.startswith(f"{test_prefix}/"):
+            test_name = test_name[len(f"{test_prefix}/"):]
+
+        # Check if any suite name matches the test name
+        found = False
+        for suite_name in suite_names:
+            if suite_name in test_name or test_name.endswith(suite_name):
+                found = True
+                break
+
+        if found:
+            selected.append(item)
+        else:
+            deselected.append(item)
+
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+    items[:] = selected
+
+
+def deselect_by_regex(regexp, items, test_prefix, config):
+    """Filter out tests based on the patterns specified in the given list of regular expressions.
+    If a test matches *any* of the expressions in the list it is considered selected."""
+    compiled_regexes = []
+    regex_list = []
+    r = re.compile(regexp)
+    compiled_regexes.append(r)
+    regex_list.append(regexp)
+
+    selected = []
+    deselected = []
+
+    corrections = get_test_name_corrections_v2(set(regex_list),
+                                               set(it.nodeid for it in items),
+                                               TestCorrectionMode.REGEX)
+    handle_corrections(corrections, test_prefix)
+
+    for item in items:
+        found = False
+        for regex in compiled_regexes:
+            if regex.search(item.nodeid):
+                found = True
+                break
+        if found:
+            selected.append(item)
+        else:
+            deselected.append(item)
+
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+    items[:] = selected
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+
+    if call.when == "call":
+        report.file = str(item.fspath)
+        report.line = str(item.location[1])
+        report.url = ""
+
+
+@pytest.fixture(scope="session")
+def all_pytest_items():
+    """
+    Provides all pytest items available in the current test definitions, before any
+    filtering has been applied.
+    """
+    return ALL_PYTEST_ITEMS
+
+
+@pytest.fixture(scope="session")
+def test_root():
+    return os.path.dirname(os.path.dirname(__file__))
+
+
+@pytest.fixture(scope="function")
+def test_case(request, llm_root):
+    "get test case"
+    test_cases_file = "tests/integration/defs/test_cases.yml"
+    input_file_dir = "tests/integration/test_input_files"
+    test_cases_file_path = os.path.join(llm_root, test_cases_file)
+    case_name = request.param
+
+    with open(test_cases_file_path, "r", encoding="UTF-8") as file:
+        test_cases = yaml.safe_load(file)
+
+    case = test_cases["test_cases"][case_name]
+    input_file = case["input_file"]
+
+    case["input_file"] = os.path.join(llm_root, input_file_dir, input_file)
+
+    return case
+
+
+def check_nvlink():
+    "check nvlink status"
+    with tempfile.TemporaryDirectory() as temp_dirname:
+        try:
+            suffix = ".exe" if is_windows() else ""
+            # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
+            cmd = " ".join(["nvidia-smi" + suffix, "nvlink", "-s", "-i", "0"])
+            output = check_output(cmd, shell=True, cwd=temp_dirname)
+        except sp.CalledProcessError:
+            return False
+
+    if len(output.strip()) == 0:
+        return False
+
+    return "inActive" not in output.strip()
+
+
+skip_nvlink_inactive = pytest.mark.skipif(check_nvlink() is False,
+                                          reason="nvlink is inactive.")
+
+skip_ray = pytest.mark.skipif(
+    os.environ.get("TLLM_DISABLE_MPI") == "1",
+    reason="This test is skipped for Ray orchestrator.")
+
+
+@pytest.fixture(scope="function")
+def eval_venv(llm_venv):
+    "set UCC_TEAM_IDS_POOL_SIZE=1024"
+
+    llm_venv._new_env["UCC_TEAM_IDS_POOL_SIZE"] = "1024"
+
+    yield llm_venv
+
+    llm_venv._new_env.pop("UCC_TEAM_IDS_POOL_SIZE")
+
+
+def get_host_total_memory():
+    "get host memory Mib"
+    memory = psutil.virtual_memory().total
+
+    return int(memory / 1024 / 1024)
+
+
+@pytest.fixture(autouse=True)
+def skip_by_host_memory(request):
+    "fixture for skip less host memory"
+    if request.node.get_closest_marker("skip_less_host_memory"):
+        host_memory = get_host_total_memory()
+        expected_memory = request.node.get_closest_marker(
+            "skip_less_host_memory").args[0]
+        if expected_memory > int(host_memory):
+            pytest.skip(
+                f"Host memory {host_memory} is less than {expected_memory}")
+
+
+IS_UNDER_CI_ENV = "JENKINS_HOME" in os.environ
+
+gpu_warning_threshold = 1024 * 1024 * 1024
+
+
+def get_gpu_memory_wo_pynvml():
+    import psutil
+
+    logger.warning(
+        f"pynvml not available, using fallback commands for memory monitoring")
+
+    gpu_memory = {}
+    system_total_mb = 0
+    system_used_mb = 0
+    try:
+        mem_output = check_output("free -m | awk '/^Mem:/ {print $3, $2}'",
+                                  shell=True)
+        parts = mem_output.strip().split()
+        system_used_mb = int(parts[0])
+        system_total_mb = int(parts[1])
+    except Exception:
+        pass
+
+    # Parse nvidia-smi pmon to get GPU memory usage
+    try:
+        gpu_output = check_output("nvidia-smi pmon -s m -c 1", shell=True)
+        lines = gpu_output.strip().split('\n')
+
+        for line in lines:
+            parts = line.split()
+            try:
+                gpu_idx = int(parts[0])
+
+                # Initialize GPU entry if not exists
+                if gpu_idx not in gpu_memory:
+                    gpu_memory[gpu_idx] = {
+                        "total_used": 0,
+                        "total": system_total_mb,
+                        "process": {}
+                    }
+
+                # Skip if no active process (pid is '-')
+                if parts[1] == '-':
+                    continue
+
+                pid = int(parts[1])
+                mem_mb = int(parts[3])
+                gpu_memory[gpu_idx]["total_used"] += mem_mb
+
+                # Get process info (same as pynvml version)
+                try:
+                    p = psutil.Process(pid)
+                    host_memory_in_mbs = p.memory_full_info(
+                    ).uss // 1024 // 1024
+                    gpu_memory[gpu_idx]["process"][pid] = (
+                        mem_mb,
+                        host_memory_in_mbs,
+                        p.cmdline(),
+                    )
+                except Exception:
+                    pass
+            except (ValueError, IndexError):
+                continue
+    except Exception as gpu_err:
+        logging.warning(f"nvidia-smi pmon error: {gpu_err}")
+
+    # Create default entry for GPU 0 if no GPUs detected
+    if not gpu_memory:
+        gpu_memory[0] = {
+            "total_used": system_used_mb,
+            "total": system_total_mb,
+            "process": {}
+        }
+    return gpu_memory
+
+
+def collect_status(item: pytest.Item):
+    if not IS_UNDER_CI_ENV:
+        return
+
+    import psutil
+
+    gpu_memory = {}
+
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+
+        handles = {
+            idx: pynvml.nvmlDeviceGetHandleByIndex(idx)
+            for idx in range(pynvml.nvmlDeviceGetCount())
+        }
+
+        deadline = time.perf_counter() + 60  # 1 min
+        observed_used = 0
+        global gpu_warning_threshold
+
+        while time.perf_counter() < deadline:
+            observed_used = max(
+                pynvml.nvmlDeviceGetMemoryInfo(device).used
+                for device in handles.values())
+            if observed_used <= gpu_warning_threshold:
+                break
+            time.sleep(1)
+        else:
+            gpu_warning_threshold = max(observed_used, gpu_warning_threshold)
+            warnings.warn(
+                f"Test {item.name} does not free up GPU memory correctly!")
+
+        for idx, device in handles.items():
+            total_used = pynvml.nvmlDeviceGetMemoryInfo(
+                device).used // 1024 // 1024
+            total = pynvml.nvmlDeviceGetMemoryInfo(device).total // 1024 // 1024
+            detail = pynvml.nvmlDeviceGetComputeRunningProcesses(device)
+            process = {}
+
+            for entry in detail:
+                try:
+                    p = psutil.Process(entry.pid)
+                    host_memory_in_mbs = p.memory_full_info(
+                    ).uss // 1024 // 1024
+                    process[entry.pid] = (
+                        entry.usedGpuMemory // 1024 // 1024,
+                        host_memory_in_mbs,
+                        p.cmdline(),
+                    )
+                except Exception:
+                    pass
+
+            gpu_memory[idx] = {
+                "total_used": total_used,
+                "total": total,
+                "process": process
+            }
+    except Exception:
+        gpu_memory = get_gpu_memory_wo_pynvml()
+
+    # Keep command-line payloads (e.g. python -c scripts) out of routine CI logs.
+    summary = ", ".join(f"GPU{idx}={info['total_used']}/{info['total']}"
+                        for idx, info in sorted(gpu_memory.items()))
+    lines = [f"\nGPU memory after {item.name} (used/total MiB): {summary}"]
+    if any(info["process"] for info in gpu_memory.values()):
+        lines.append("GPU  PID      Program       GPU MiB  Host USS MiB")
+    for idx, info in sorted(gpu_memory.items()):
+        for pid, values in sorted(info["process"].items()):
+            gpu_mib, host_mib, cmdline = values
+            program = os.path.basename(cmdline[0]) if cmdline else "<unknown>"
+            lines.append(f"{idx:<4} {pid:<8} {program:<13} "
+                         f"{gpu_mib:>7}  {host_mib:>12}")
+    print("\n".join(lines))
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    ret = yield
+    collect_status(item)
+    return ret
+
+
+@pytest.fixture(scope="function")
+def disaggregated_test_root(llm_root, llm_venv):
+    "Get disaggregated test root"
+    disaggregated_root = os.path.join(llm_root,
+                                      "tests/integration/defs/disaggregated")
+
+    return disaggregated_root
+
+
+@pytest.fixture(scope="function")
+def serve_test_root(llm_root):
+    "Get servetest root"
+    serve_root = os.path.join(llm_root, "tests/integration/defs/examples/serve")
+
+    return serve_root
+
+
+@pytest.fixture(scope="function")
+def tritonserver_test_root(llm_root):
+    "Get tritonserver test root"
+    tritonserver_root = os.path.join(llm_root,
+                                     "tests/integration/defs/triton_server")
+
+    return tritonserver_root
+
+
+@pytest.fixture
+def timeout_from_marker(request):
+    """Get timeout value from pytest timeout marker."""
+    timeout_marker = request.node.get_closest_marker("timeout")
+    if timeout_marker:
+        return timeout_marker.args[0] if timeout_marker.args else None
+    return None
+
+
+@pytest.fixture
+def timeout_from_command_line(request):
+    """Get timeout value from command line --timeout parameter."""
+    # Get timeout from command line argument
+    timeout_arg = request.config.getoption("--timeout", default=None)
+    if timeout_arg is not None:
+        return float(timeout_arg)
+    return None
+
+
+@pytest.fixture
+def timeout_manager(timeout_from_command_line, timeout_from_marker):
+    """Create a TimeoutManager instance with priority: marker > cmdline > config."""
+    from defs.utils.timeout_manager import TimeoutManager
+
+    # Priority: marker > command line
+    timeout_value = None
+
+    if timeout_from_marker is not None:
+        timeout_value = timeout_from_marker
+    elif timeout_from_command_line is not None:
+        timeout_value = timeout_from_command_line
+
+    return TimeoutManager(timeout_value)
+
+
+@pytest.fixture(autouse=True)
+def torch_empty_cache() -> None:
+    """
+    Manually empty the torch CUDA cache before each test, to reduce risk of OOM errors.
+    """
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+        gc.collect()
+
+
+def pytest_runtest_setup(item):
+    _prefetch_hooks.pytest_runtest_setup(item)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    _prefetch_hooks.pytest_sessionfinish(session, exitstatus)

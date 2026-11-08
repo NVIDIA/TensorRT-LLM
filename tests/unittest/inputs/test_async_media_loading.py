@@ -1,0 +1,377 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""Tests for async media loading in tensorrt_llm.inputs.media_io and utils.
+
+Covers:
+- async_load_image / async_load_audio with data URLs and file paths
+- CPU-bound work is offloaded to a thread pool (event loop not blocked)
+- aiohttp session is reused across calls (_get_aiohttp_session)
+- MultimodalDataTracker.retrieve_all_async gathers all modalities concurrently
+"""
+
+import asyncio
+import base64
+import tempfile
+import threading
+from io import BytesIO
+from unittest.mock import Mock, patch
+
+import numpy as np
+import pytest
+import pytest_asyncio
+import soundfile
+import torch
+from PIL import Image
+
+import tensorrt_llm.inputs.media_io as media_io_module
+import tensorrt_llm.inputs.utils as utils_module
+from tensorrt_llm.inputs.media_io import _close_aiohttp_session, _get_aiohttp_session
+from tensorrt_llm.inputs.utils import MultimodalDataTracker, async_load_audio, async_load_image
+
+pytestmark = pytest.mark.cpu_only
+
+
+# ──────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────
+
+
+def _make_image_data_url() -> str:
+    img = Image.new("RGB", (8, 8), color=(100, 150, 200))
+    image_buf = BytesIO()
+    img.save(image_buf, format="JPEG")
+    b64_str = base64.b64encode(image_buf.getvalue()).decode()
+    return f"data:image/jpeg;base64,{b64_str}"
+
+
+def _make_audio_file(tmp_path: str) -> str:
+    """Write a short WAV file and return its path."""
+    sample_rate = 16000
+    time_axis = np.linspace(0, 0.05, int(sample_rate * 0.05), endpoint=False)
+    audio_samples = (np.sin(2 * np.pi * 440 * time_axis) * 0.5).astype(np.float32)
+    soundfile.write(tmp_path, audio_samples, sample_rate)
+    return tmp_path
+
+
+# ──────────────────────────────────────────────────────────────
+# async_load_image
+# ──────────────────────────────────────────────────────────────
+
+
+class TestAsyncLoadImage:
+    @pytest.mark.asyncio
+    async def test_load_image_from_raw_bytes_pil(self):
+        encoded = _make_image_data_url().partition(",")[2]
+        image = await media_io_module.ImageMediaIO(format="pil").async_load_bytes(
+            base64.b64decode(encoded)
+        )
+        assert isinstance(image, Image.Image)
+        assert image.mode == "RGB"
+
+    @pytest.mark.asyncio
+    async def test_load_image_from_data_url_pil(self):
+        url = _make_image_data_url()
+        image = await async_load_image(url, format="pil")
+        assert isinstance(image, Image.Image)
+        assert image.mode == "RGB"
+
+    @pytest.mark.asyncio
+    async def test_load_image_from_data_url_pt(self):
+        url = _make_image_data_url()
+        image_tensor = await async_load_image(url, format="pt")
+        assert isinstance(image_tensor, torch.Tensor)
+        assert image_tensor.shape[0] == 3  # C x H x W
+
+    @pytest.mark.asyncio
+    async def test_load_image_pil_input_passthrough(self):
+        """Already-decoded PIL image should be returned as RGB."""
+        grayscale_img = Image.new("L", (4, 4))
+        rgb_image = await async_load_image(grayscale_img, format="pil")
+        assert isinstance(rgb_image, Image.Image)
+        assert rgb_image.mode == "RGB"
+
+    @pytest.mark.asyncio
+    async def test_cpu_work_runs_in_executor(self):
+        """PIL decoding must not run on the event loop thread."""
+        event_loop_thread_id = threading.current_thread().ident
+        worker_thread_ids = []
+
+        original_load = utils_module._load_and_convert_image
+
+        def tracking_load(*args, **kwargs):
+            worker_thread_ids.append(threading.current_thread().ident)
+            return original_load(*args, **kwargs)
+
+        url = _make_image_data_url()
+        with patch.object(utils_module, "_load_and_convert_image", tracking_load):
+            await async_load_image(url, format="pil")
+
+        assert len(worker_thread_ids) == 1
+        assert worker_thread_ids[0] != event_loop_thread_id, (
+            "PIL decoding ran on the event loop thread — event loop is being blocked"
+        )
+
+
+# ──────────────────────────────────────────────────────────────
+# async_load_audio
+# ──────────────────────────────────────────────────────────────
+
+
+class TestAsyncLoadAudio:
+    @pytest.mark.asyncio
+    async def test_load_audio_from_file(self):
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            wav_path = _make_audio_file(f.name)
+        audio_array, sample_rate = await async_load_audio(wav_path)
+        assert isinstance(audio_array, np.ndarray)
+        assert sample_rate == 16000  # matches the sr=16000 used in _make_audio_file
+
+    @pytest.mark.asyncio
+    async def test_cpu_work_runs_in_executor(self):
+        """soundfile.read must not run on the event loop thread."""
+        event_loop_thread_id = threading.current_thread().ident
+        worker_thread_ids = []
+
+        original_read = soundfile.read
+
+        def tracking_read(*args, **kwargs):
+            worker_thread_ids.append(threading.current_thread().ident)
+            return original_read(*args, **kwargs)
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            wav_path = _make_audio_file(f.name)
+
+        with patch("tensorrt_llm.inputs.utils.soundfile.read", tracking_read):
+            await async_load_audio(wav_path)
+
+        assert len(worker_thread_ids) == 1
+        assert worker_thread_ids[0] != event_loop_thread_id, (
+            "soundfile.read ran on the event loop thread — event loop is being blocked"
+        )
+
+
+# ──────────────────────────────────────────────────────────────
+# Session reuse
+# ──────────────────────────────────────────────────────────────
+
+
+class TestSessionReuse:
+    @pytest_asyncio.fixture(autouse=True)
+    async def reset_loop_session(self):
+        await _close_aiohttp_session()
+        yield
+        await _close_aiohttp_session()
+
+    @pytest.mark.asyncio
+    async def test_same_session_returned_on_repeated_calls(self):
+        first_session = await _get_aiohttp_session()
+        second_session = await _get_aiohttp_session()
+        assert first_session is second_session, (
+            "Expected the same ClientSession object to be returned"
+        )
+        assert isinstance(first_session.connector._resolver, media_io_module._ValidatingResolver)
+
+    @pytest.mark.asyncio
+    async def test_new_session_created_after_close(self):
+        first_session = await _get_aiohttp_session()
+        await first_session.close()
+        second_session = await _get_aiohttp_session()
+        assert first_session is not second_session, (
+            "Expected a fresh session after the old one was closed"
+        )
+        assert not second_session.closed
+
+    @pytest.mark.asyncio
+    async def test_closed_event_loop_sessions_are_disposed_on_next_lookup(self):
+        async def abandoned_session():
+            return asyncio.get_running_loop(), await _get_aiohttp_session()
+
+        loop, session = await asyncio.to_thread(asyncio.run, abandoned_session())
+        assert loop.is_closed()
+        assert loop in media_io_module._aiohttp_sessions
+        assert not session.closed
+        current_session = await _get_aiohttp_session()
+        assert loop not in media_io_module._aiohttp_sessions
+        assert session.closed
+        assert not current_session.closed
+
+    @pytest.mark.asyncio
+    async def test_live_event_loops_keep_independent_sessions(self):
+        first_session = await _get_aiohttp_session()
+        worker_ready = threading.Event()
+        release_worker = threading.Event()
+        worker_sessions = []
+
+        async def use_session_on_worker_loop() -> None:
+            worker_sessions.append(await _get_aiohttp_session())
+            worker_ready.set()
+            await asyncio.to_thread(release_worker.wait, 5)
+            await _close_aiohttp_session()
+
+        worker = asyncio.create_task(asyncio.to_thread(asyncio.run, use_session_on_worker_loop()))
+        try:
+            assert await asyncio.to_thread(worker_ready.wait, 5)
+            assert worker_sessions[0] is not first_session
+            assert not first_session.closed
+        finally:
+            release_worker.set()
+            await worker
+
+
+# ──────────────────────────────────────────────────────────────
+# MultimodalDataTracker.retrieve_all_async — concurrency
+#
+# We bypass add_data (which requires a registry-registered model type)
+# and insert coroutines directly into _data / _embeddings to isolate
+# the gather logic being tested.
+# ──────────────────────────────────────────────────────────────
+
+
+class TestRetrieveAllAsync:
+    def _make_tracker(self) -> MultimodalDataTracker:
+        return MultimodalDataTracker(model_type="test_model")
+
+    def _inject(
+        self,
+        tracker: MultimodalDataTracker,
+        modality: str,
+        values: list,
+        *,
+        is_embedding: bool = False,
+    ):
+        """Directly insert coroutines into the tracker without registry checks."""
+        target = tracker._embeddings if is_embedding else tracker._data
+        for val in values:
+
+            async def _coro(x=val):
+                return x
+
+            target[modality].append(_coro())
+
+    @pytest.mark.asyncio
+    async def test_single_modality_returns_correct_data(self):
+        image_values = [1, 2, 3]
+        tracker = self._make_tracker()
+        self._inject(tracker, "image", image_values)
+
+        data, embeddings = await tracker.retrieve_all_async()
+        assert data == {"image": image_values}
+        assert embeddings is None
+
+    @pytest.mark.asyncio
+    async def test_multiple_modalities_returns_correct_data(self):
+        image_values = ["img1", "img2"]
+        video_values = ["vid1"]
+        tracker = self._make_tracker()
+        self._inject(tracker, "image", image_values)
+        self._inject(tracker, "video", video_values)
+
+        data, _ = await tracker.retrieve_all_async()
+        assert data["image"] == image_values
+        assert data["video"] == video_values
+
+    @pytest.mark.asyncio
+    async def test_embeddings_returned_separately(self):
+        image_data = ["img"]
+        embedding_data = ["emb"]
+        tracker = self._make_tracker()
+        self._inject(tracker, "image", image_data, is_embedding=False)
+        self._inject(tracker, "image", embedding_data, is_embedding=True)
+
+        data, embeddings = await tracker.retrieve_all_async()
+        assert data == {"image": image_data}
+        assert embeddings == {"image": embedding_data}
+
+    @pytest.mark.asyncio
+    async def test_empty_tracker_returns_none(self):
+        tracker = self._make_tracker()
+        data, embeddings = await tracker.retrieve_all_async()
+        assert data is None
+        assert embeddings is None
+
+
+# ──────────────────────────────────────────────────────────────
+# data: URI declared-MIME vs modality check
+# ──────────────────────────────────────────────────────────────
+
+
+class TestDataUriMimeCheck:
+    """Declared-MIME vs modality validation for data URIs.
+
+    A data URI whose declared media type does not match the content part's
+    modality must be rejected, even when the payload bytes would decode.
+    """
+
+    @staticmethod
+    def _jpeg_b64() -> str:
+        img = Image.new("RGB", (8, 8), color=(10, 20, 30))
+        buf = BytesIO()
+        img.save(buf, format="JPEG")
+        return base64.b64encode(buf.getvalue()).decode()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("declared_mime", ["text/plain", "video/mp4", "application/pdf"])
+    async def test_image_rejects_non_image_mime(self, declared_mime):
+        io = media_io_module.ImageMediaIO(format="pil")
+        url = f"data:{declared_mime};base64,{self._jpeg_b64()}"
+        with pytest.raises(ValueError, match="does not.*match"):
+            await io.async_load(url)
+
+    @pytest.mark.asyncio
+    async def test_image_accepts_image_mime(self):
+        io = media_io_module.ImageMediaIO(format="pil")
+        image = await io.async_load(f"data:image/jpeg;base64,{self._jpeg_b64()}")
+        assert isinstance(image, Image.Image)
+
+    @pytest.mark.asyncio
+    async def test_image_accepts_missing_mime_for_backward_compat(self):
+        io = media_io_module.ImageMediaIO(format="pil")
+        image = await io.async_load(f"data:;base64,{self._jpeg_b64()}")
+        assert isinstance(image, Image.Image)
+
+    @pytest.mark.asyncio
+    async def test_audio_rejects_non_audio_mime(self):
+        io = media_io_module.AudioMediaIO()
+        with pytest.raises(ValueError, match="does not.*match"):
+            await io.async_load(f"data:image/jpeg;base64,{self._jpeg_b64()}")
+
+    @pytest.mark.asyncio
+    async def test_audio_accepts_audio_mime(self):
+        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+            _make_audio_file(f.name)
+            wav_b64 = base64.b64encode(open(f.name, "rb").read()).decode()
+        io = media_io_module.AudioMediaIO()
+        audio_array, sample_rate = await io.async_load(f"data:audio/wav;base64,{wav_b64}")
+        assert isinstance(audio_array, np.ndarray)
+        assert sample_rate == 16000
+
+    @pytest.mark.asyncio
+    async def test_video_rejects_non_video_mime(self):
+        io = media_io_module.VideoMediaIO()
+        with pytest.raises(ValueError, match="does not.*match"):
+            await io.async_load(f"data:image/jpeg;base64,{self._jpeg_b64()}")
+
+    @pytest.mark.asyncio
+    async def test_video_accepts_video_mime(self):
+        io = media_io_module.VideoMediaIO()
+        with patch.object(media_io_module.VideoMediaIO, "load_base64", return_value="decoded"):
+            result = await io.async_load("data:video/mp4;base64,AAAA")
+        assert result == "decoded"
+
+
+def test_video_media_io_forwards_decoded_frame_limit():
+    decoded = object()
+    reserver = Mock()
+    io = media_io_module.VideoMediaIO(
+        max_decoded_frame_bytes=123,
+        decoded_memory_reserver=reserver,
+    )
+
+    with (
+        patch.object(media_io_module, "_select_cv2_stream_buffered_backend", return_value=7),
+        patch.object(media_io_module, "_load_video_by_cv2", return_value=decoded) as decode,
+    ):
+        assert io.load_bytes(b"video") is decoded
+
+    assert decode.call_args.kwargs["max_decoded_frame_bytes"] == 123
+    assert decode.call_args.kwargs["decoded_memory_reserver"] is reserver

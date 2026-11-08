@@ -1,0 +1,710 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
+# TensorRT-LLM Perf Sanity Test (`test_perf_sanity.py`)
+
+Performance sanity testing scripts for TensorRT-LLM with configuration-driven test cases supporting single-node, multi-node aggregated, and multi-node disaggregated architectures.
+
+This document serves as a reference for both developers and AI agents working with the perf sanity system.
+
+For the underlying regression pipeline architecture (three-layer design, baseline calculation, how to add new test scripts), see [README_perf_regression_system.md](README_perf_regression_system.md).
+
+## How `test_perf_sanity.py` Uses the Pipeline
+
+`test_perf_sanity.py` is the top layer of the [three-layer perf regression system](README_perf_regression_system.md). It is responsible for:
+
+1. **Parsing YAML configs** into `ServerConfig` / `ClientConfig` objects
+2. **Running benchmarks** and collecting metric outputs
+3. **Assembling `new_data_dict`** — a `Dict[int, dict]` mapping `cmd_idx` to data dicts containing:
+   - Test config fields (`s_gpu_type`, `s_runtime`, `s_model_name`, `l_tp`, `l_concurrency`, etc.)
+   - Metric fields (`d_seq_throughput`, `d_mean_ttft`, etc.)
+   - `s_test_case_name` for human-readable identification
+4. **Building `match_keys`** — the list of fields that uniquely identify a test case
+5. **Calling `process_and_upload_test_results()`** with its own metric definitions
+
+### Metric Definitions
+
+| List | Count | Contents |
+|------|-------|----------|
+| `MAXIMIZE_METRICS` | 5 | Throughputs (`d_seq_throughput`, `d_token_throughput`, `d_total_token_throughput`, `d_user_throughput`) + spec-decoding `d_al` |
+| `MINIMIZE_METRICS` | 17 + 108 | TTFT, ITL, TPOT, E2EL latencies (mean/median/P99 for each) + the five `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` (every mode in `DEVICE_STEP_TIME_MODES`) + the 108 `d_tb_*` lifecycle spans of the `time_breakdown` modifier |
+| `REGRESSION_METRICS` | 2 default | `d_token_throughput`, `d_total_token_throughput` — gate pass/fail for all modes **except disagg gen_only**. `d_al` is appended at runtime when any client runs spec decoding. |
+
+TPOT is time per output token, so lower values are better. Its reported delta is
+negative when latency exceeds the selected baseline. A stored `d_baseline_*`
+override takes precedence; otherwise, the baseline is recalculated as P5 of the
+smoothed history, as for the other latency metrics. Calculated baselines are not
+automatically stored as overrides. Historical TPOT measurements remain valid
+when the comparison direction changes. TPOT is not in `REGRESSION_METRICS`, so
+these statistics are diagnostic and do not determine the default pass/fail verdict.
+
+**Disagg gen_only override**: For `disagg_upload-gen_only-*` tests, regression is gated on `d_mean_gen_worker_per_iter_device_step_time` **and** `d_median_gen_worker_per_iter_device_step_time`. Token-based throughput numbers are dominated by KV-cache transfer time in gen_only mode and are not a useful regression signal there. The two are gated together because they fail on different shapes of slowdown: the mean catches a cost spread thinly across many iterations, the median catches a shift in the typical iteration while ignoring outliers. A real slowdown moves both; a single anomalous iteration moves only the mean. `d_{std,p75,p99}_...` are uploaded for diagnosis but are **not** gated.
+
+A newly added gated metric has no baseline history, and `check_regression` skips any metric whose baseline is absent or non-positive (`continue`), so the median cannot fail a build until enough runs accrue.
+
+**History floor for the gen_only device step time**: in the gen_only modes, the baseline of every `d_*_gen_worker_per_iter_device_step_time` statistic is computed only from rows created at or after `GEN_ONLY_DEVICE_STEP_TIME_HISTORY_FLOOR_MS` (`GEN_ONLY_METRIC_HISTORY_FLOORS_MS`, passed to `process_and_upload_test_results`). That is when the gen_only modes switched from the modal `num_generation_tokens` bucket to the expected steady-state bucket (step 3 below). Where a run has two near-tied buckets -- a full-batch wave and a short tail wave, as when `ceil(concurrency / dp)` exceeds `max_batch_size` -- the two definitions publish values up to ~3x apart for the same run, so mixing them in one baseline flags every current run. `e2e` still uses the modal bucket, so its series is not floored. The floor stops filtering anything on 2026-12-31, when the 90-day window starts after it; remove it then. If the bucket rule changes again, move the floor in the same change.
+
+#### `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` (gen_only, e2e)
+
+Uploaded for every mode in `DEVICE_STEP_TIME_MODES`, but **gated only in `gen_only`** (see the override above). In `e2e` the gen workers do pure decode — the ctx workers do the prefill — so the statistic means the same thing it does in `gen_only`, and it is there to attribute an `e2e` throughput or TTFT regression to the device side rather than to declare one. `ctx_only` is excluded by construction: it runs the *aggregated* runtime from a disagg YAML with no gen worker, so there is no `gen_server_*.log` to read; TTFT is the prefill signal there.
+
+Because `s_test_case_name` is a match key and carries the benchmark mode as its prefix, `e2e` and `gen_only` values share a *column* but never a *baseline series*.
+
+These metrics are parsed from each `gen_server_{i}.log` produced by the disagg run (one per gen worker, in the run's `output_dir`). Lines look like:
+
+```
+[TRT-LLM] [I] [_torch][RANK 0] iter = 5, ..., num_scheduled_requests = 1, ..., host_step_time = 6.79ms, prev_device_step_time = 6.94ms, ...
+```
+
+The device value reported at iter `N` is the device step time of iter `N-1` (device runs async).
+
+**Per-client computation** (DisaggTestCmds.run_cmd, BENCHMARK branch):
+1. Immediately before launching each client, snapshot `os.path.getsize()` of every `gen_server_{i}.log`. That snapshot is the client's `start_offsets` **and** the previous client's `end_offsets`, so each client is parsed from a bounded byte window and gets its own segment of gen-worker iterations rather than sharing a single global average. The last client's window ends at EOF. Taking the end bound from the *next* client's launch rather than from the previous client's return is what makes it safe to defer the parse past teardown: the bound cannot exclude an iteration the previous client drove, however late the gen worker flushed it. A line straddling the bound is dropped. The window is read in binary and decoded per line, so the byte accounting matches the `getsize()` bounds exactly.
+2. Per file (per segment), collect the `prev_device_step_time` of every *usable* iteration. A row is usable when all of the following hold:
+   - `iter >= 5` — iter 0/1 include KV-cache transfer wait time, and iters 2-4 are warmup that has not yet reached steady state. Lines where `prev_device_step_time = N/A` (e.g. iter 1) do not match the parser and are skipped anyway.
+   - Its immediately preceding iteration did **not** report `num_scheduled_requests = 0`. Such an iteration did no GPU work, so its loop period is pure idle (waiting on KV-cache transfer) — and because the device runs async, that idle period is what the *next* row's `prev_device_step_time` reports. One such row inflated this mean by 19% on nvbugs 6627789 while the steady-state iterations were unchanged at ~7.3 ms. The `nsr = 0` row itself is kept: its own value describes the previous iteration, which did do work. The exclusion requires the predecessor's iter number to be exactly `cur_iter - 1`; if it is not adjacent, or did not parse, the row is kept (failing toward inclusion rather than silently dropping real data). "Predecessor" is tracked **per emitting rank** (`global_rank`, read off the same line), so ranks interleaved in one file are never read as each other's predecessor. `py_executor.py` logs only rank 0 unless `TLLM_PROFILE_LOG_RANKS` is set and no lane sets it today — but a single shared predecessor slot would fail in the *wrong* direction on a mixed-rank file, letting a foreign rank's nonzero `num_scheduled_requests` mask the idle iteration so the exclusion quietly stops excluding while still looking armed.
+3. Per file, bucket the usable rows by `num_generation_tokens` and keep one bucket. In the gen_only modes that is the expected steady-state bucket from `expected_gen_only_ngen`, `min(ceil(concurrency / (num_gen_servers * dp)), max_batch_size, max_num_tokens // (1 + max_draft_len)) * (1 + max_draft_len)`, provided it holds at least half as many rows as the mode; otherwise, and in `e2e`, it is the **mode** bucket (ties → the larger token count). Concurrency ramps down at the tail of a run, so the trailing iterations do less work per step and are not comparable to the plateau. A file with no parseable `num_generation_tokens` anywhere falls back to all of its usable rows (nvbugs 6487036 / 6487040: the field rendered as `tensor(256)` and matched nothing).
+4. Compute mean, median, stdev (ddof=1, `0.0` for fewer than two samples), P75 and P99 of that bucket per file, then average each statistic across files (unweighted) → the per-client metric values. Averaging a median across workers is not itself a median of the pooled sample; it is the same unweighted per-file rule the mean has always used, kept for consistency and continuity of baselines.
+5. Because the percentiles and stdev need the whole sample, the scan retains rows rather than streaming; retention is capped per worker (`_MAX_RETAINED_ITER_ROWS`) so a pathological log cannot grow it without bound.
+6. The per-client values are appended to `trtllm-benchmark.{server_idx}.{client_idx}.log`, one statistic per line:
+   ```
+   Average Per Iter Device Step Time (ms): <mean>
+   Median Per Iter Device Step Time (ms): <median>
+   Stdev Per Iter Device Step Time (ms): <std>
+   P75 Per Iter Device Step Time (ms): <p75>
+   P99 Per Iter Device Step Time (ms): <p99>
+   ```
+   Downstream `parse_metrics_from_output` picks them up via `DEVICE_STEP_TIME_LOG_QUERIES`. It breaks out of its regex loop on the first match per line, so each statistic must stay on its own line with a distinct leading word.
+
+If the mean cannot be parsed for a `gen_only` run, `check_test_failure` raises `RuntimeError` and no data is uploaded. Other modes omit the five columns instead of failing: there the family is diagnostic and throughput still gates, so hard-failing would make every `e2e` case on every cluster red on log-scrape plumbing rather than on performance.
+
+### Match Keys
+
+Match keys are the fields that identify a test case when looking up its history to
+build a baseline. They are the same for every deployment mode
+(`get_test_case_match_keys()` in `tests/test_common/perf_sanity_matching.py`):
+
+| Key | Why |
+|-----|-----|
+| `s_test_case_name` | `<server_config.name>-<client_config.name>` for aggregated, `<e2e\|ctx_only\|gen_only>[-<modifier>]-<disagg stem>-<client_config.name>` for disaggregated. Already encodes every fixed parameter of the case: model, parallelism, ISL/OSL, concurrency. |
+| `s_gpu_type` | The same case name runs on more than one GPU type. |
+| `s_runtime` | The same case name runs on both `aggr_server` and `multi_node_aggr_server`. |
+| `s_branch` | Release branches keep their own baseline rather than blending into `main`'s. |
+
+A case is identified by its **name**, not by the config values it happens to run
+with today. Server/client config fields such as `l_max_batch_size`,
+`s_kv_cache_dtype`, `s_spec_decoding_type`, `l_force_num_accepted_tokens` or
+`b_streaming` are *tunables* — they are adjusted to improve perf on the same test.
+Keying on them forked the case and reset its baseline, hiding the very effect the
+tuning was meant to have. They are still recorded on each document for filtering
+and analysis; they just do not participate in matching.
+
+**A value that feeds the case name still forks the case.** Dropping a field from
+the match key only stops it forking if the name does not encode it, and
+`l_iterations` is the one field where that distinction bites:
+
+- Aggregated configs all set an explicit client `name:` (190 of 190 blocks in
+  `tests/scripts/perf-sanity/`), so changing `iterations` there keeps the case and
+  its history. 93 of those names contain a stale `iter<N>` for that reason.
+- Disagg configs set no client name, so `ClientConfig` derives
+  `con<C>_iter<N>_isl<I>_osl<O>`. `benchmark.multi_round` becomes `iterations`,
+  which lands in that name and therefore in `s_test_case_name` — so changing
+  `multi_round` renames the case, and the renamed case starts with no history.
+
+That is intended rather than a gap to close: `iterations` sets how long the
+measurement runs, and a longer run amortizes warmup differently, so `iter10` and
+`iter12` do not measure the same quantity and should not share a baseline. It is
+also not a regression — `l_iterations` was previously a match key in its own
+right, so it forked the case before this change too. What matters is that renaming
+a case silently costs it its history and its next pre-merge regression check, so
+`multi_round` should be treated as a workload parameter, not a knob to sweep.
+
+`s_benchmark_mode` is deliberately excluded: it is null on every aggregated record
+and exactly equals the test case name's prefix on every disaggregated one
+(modifier segment included), so it adds no information while breaking matching
+against records written before the field existed (`benchmark_data_matches` treats
+`None` and `"e2e"` as different).
+
+`match_mode: scenario` in the server yamls is now inert — not forking a case on a
+config change is the default for every case.
+
+**Pre-merge branch substitution.** Since `s_branch` is a match key and history
+queries are restricted to post-merge documents, a pre-merge run (whose `s_branch`
+is `github-pr-<N>`) would match nothing and its regression check would silently
+pass. `process_and_upload_test_results` therefore looks history up against a
+baseline branch — `PERF_BASELINE_BRANCH`, default `main` — using a lookup-only copy
+of the data. The uploaded documents keep their true `s_branch`.
+
+Case identity is keyed on `s_test_case_name` (plus GPU type, runtime and branch), and a
+disaggregated case name embeds its config stem — so an agentx lane, whose stem contains
+`agentx`, already forms its own baseline population without needing an extra match key.
+`s_benchmark_client` is still uploaded, as a reportable record of which load generator
+drove the lane, but it does not participate in matching. The built-in client uploads `""`
+(not `"default"`) so the column reads consistently against records written before the
+field existed.
+
+## Benchmark Clients
+
+A disaggregated `benchmark_config` may select which load generator drives the lane via
+the optional `benchmark_client` key. Any value other than the two below is rejected at
+config-parse time rather than silently falling through to the default client.
+
+| `benchmark_client` | Client | Notes |
+|---|---|---|
+| *(omitted / `""`)* | `tensorrt_llm/serve/scripts/benchmark_serving.py` | Default. Fixed request count from `dataset_file` + `concurrency_list`. |
+| `agentx` | `perf/agentx_client.py` | AgentX agentic multi-turn trace replay (a fork of `aiperf`). |
+
+**AgentX specifics**:
+- Duration-bounded, not count-bounded: the run replays a conversation trace for
+  `AGENTX_DURATION` seconds, so `dataset_file` names an `aiperf` dataset loader (fetched
+  from HF), *not* a path — `get_dataset_dir` must not be applied to it.
+- `concurrency_list` is the whole-cluster total and is passed through un-multiplied.
+- Tunables are passed through `client_env_var` (`AGENTX_MAX_CTX`, `AGENTX_DURATION`,
+  `AGENTX_WARMUP_PER_LANE`). Artifacts land in
+  `{test_output_dir}/agentx.{server_idx}.{client_idx}/concurrency_{N}/`.
+- `al` (Mean Avg Decoded Tokens per Iter) is exempt from the spec-decoding hard-fail for
+  agentx lanes: it derives from a TRT-LLM-specific per-response field that `aiperf` does
+  not propagate. This loses no signal as long as the lane pins the accepted length with
+  `TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS` (set per-yaml), which makes `al` a
+  restatement of a configured constant rather than a measurement.
+
+## Overview
+
+- Run performance sanity benchmarks across multiple model configs
+- Support three deployment architectures: single-node, multi-node aggregated, and multi-node disaggregated
+- Manage test cases through YAML config files
+- Automated resource calculation and job submission via SLURM
+
+## System Architecture
+
+### Key Scripts
+
+| Script | Purpose | SLURM Launch Draft |
+|--------|---------|-------------------|
+| `tests/integration/defs/perf/test_perf_sanity.py` | Main pytest entry point for all perf sanity tests | N/A |
+| `jenkins/scripts/perf/disaggregated/submit.py` | CI submission script (disaggregated tests only) | Uses `jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh` |
+| `jenkins/scripts/perf/local/submit.py` | Local submission script (both aggregated and disaggregated tests) | Uses `jenkins/scripts/perf/aggregated/slurm_launch_draft.sh` or `jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh` |
+| `jenkins/L0_Test.groovy` | Jenkins CI pipeline for test orchestration | N/A |
+
+### SLURM Launch Script Generation
+
+The submit scripts generate `slurm_launch.sh` from draft templates:
+
+| Submit Script | Mode | Draft Template Used |
+|---------------|------|---------------------|
+| `jenkins/scripts/perf/disaggregated/submit.py` | Disaggregated (CI only) | `jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh` |
+| `jenkins/scripts/perf/local/submit.py` | Aggregated (local) | `jenkins/scripts/perf/aggregated/slurm_launch_draft.sh` |
+| `jenkins/scripts/perf/local/submit.py` | Disaggregated (local) | `jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh` |
+
+## Environment Variables
+
+The config folder paths can be overridden via environment variables. Both submit scripts (`local/submit.py` and `disaggregated/submit.py`) propagate these into the pytest execution environment.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AGG_CONFIG_FOLDER` | `tests/scripts/perf-sanity/aggregated` | Path to aggregated config YAML files |
+| `DISAGG_CONFIG_FOLDER` | `tests/scripts/perf-sanity/disaggregated` | Path to disaggregated config YAML files |
+
+**Example**: Run with custom config folders:
+```bash
+AGG_CONFIG_FOLDER=my/custom/agg DISAGG_CONFIG_FOLDER=my/custom/disagg \
+  python jenkins/scripts/perf/local/submit.py ...
+```
+
+## Configuration Files
+
+There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (disagg).
+
+### Aggregated Mode Config Files
+
+**Location**: `tests/scripts/perf-sanity/aggregated`
+
+**File Naming**: `xxx.yaml` where words are connected by `_` (underscore), not `-` (hyphen). The suffix indicates the GPU target:
+- B200 configs: `xxx_blackwell.yaml` (e.g., `deepseek_r1_fp4_v2_blackwell.yaml`)
+- GB200 configs: `xxx_grace_blackwell.yaml` (e.g., `deepseek_r1_fp4_v2_grace_blackwell.yaml`)
+- Multi-node: add `_2_nodes` before the GPU suffix (e.g., `deepseek_r1_fp4_v2_2_nodes_grace_blackwell.yaml`)
+
+**Server Config Rules**:
+- Each `server_config` entry should have exactly **one** `client_config`. Use separate server configs for different ISL/OSL combinations.
+- Server config `name` should include ISL and OSL (e.g., `llama70b_fp4_tp4_512_32`). Do **not** include adjustable parameters like `max_batch_size` or `max_num_tokens` in the name.
+
+**Use Cases**:
+- Single-node: Performance tests on a single server with multiple GPUs
+- Multi-node: Model runs across multiple nodes with unified execution
+
+### Disaggregated Mode Config Files
+
+**Location**: `tests/scripts/perf-sanity/disaggregated`
+
+**File Naming**: `xxx.yaml` (can contain `-` hyphen).
+
+**Example**: `gb200_gpt-oss-120b-fp4_8k1k_con4_ctx1_tp1_gen1_tp4_eplb0_mtp0_ccb-NIXL.yaml`
+
+**Use Case**: Disaggregated architecture where model runs across multiple nodes with separate context (prefill) and generation (decode) servers.
+
+Keep valid default-based settings in both `worker_config.ctx` and
+`worker_config.gen`, for example:
+
+```yaml
+cache_transceiver_config:
+  backend: DEFAULT
+```
+
+The standard PyTorch loading path currently resolves this to NIXL/Python
+under normal defaults. Tests of a specific backend/runtime may select it
+explicitly. Set `max_tokens_in_buffer` only on workers with `pipeline_parallel_size > 1`,
+where the generation executor still uses it as the KV transfer admission window. NIXL may still use
+UCX as its underlying transport; `ccb-NIXL` identifies the transceiver backend.
+
+**Optional `benchmark_config` keys**: `benchmark_client` selects a non-default load
+generator (see [Benchmark Clients](#benchmark-clients)); `client_env_var` passes
+client-side environment variables through to it.
+
+## Test Case Formats
+
+In each test db yml file (with keyword `perf_sanity`), there are four test types:
+
+### 1. Normal Aggregated Test
+
+Uses aggregated config files from `tests/scripts/perf-sanity/aggregated`.
+
+**Format**:
+```
+perf/test_perf_sanity.py::test_e2e[aggr_upload-{agg config file base name}-{test name}]
+```
+
+**Example**:
+```
+perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k1k]
+```
+
+### 2. Aggregated ctx_only Test
+
+Uses disaggregated config files but runs context (prefill) phase only in aggregated mode.
+
+**Format**:
+```
+perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-{disagg config file base name}]
+```
+
+**Example**:
+```
+perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
+```
+
+### 3. Disaggregated gen_only Test
+
+Uses disaggregated config files and runs generation (decode) phase only.
+
+**Format**:
+```
+perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-{disagg config file base name}]
+```
+
+**Example**:
+```
+perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
+```
+
+### 4. Disaggregated e2e Test
+
+Uses disaggregated config files and runs full end-to-end disaggregated flow.
+
+**Format**:
+```
+perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-{disagg config file base name}]
+```
+
+**Example**:
+```
+perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
+```
+
+#### Connection warmup
+
+Before the measured clients, the harness (`DisaggTestCmds._run_connection_warmup`)
+sends `2 x (ctx servers x ctx attention-DP size) x (gen servers x gen attention-DP size)`
+short requests (ISL 100, OSL 10), where a server's attention-DP size is its TP size with
+attention DP and 1 without. They open the ctx<->gen KV-cache transfer connections
+outside the measured window. `examples/disaggregated/slurm/benchmark/submit.py` sizes
+the same warmup as `ucx_warmup_requests`. Without it, each ctx rank loads a gen rank's
+transfer agent the first time that gen rank requests KV from its ctx server, one agent
+at a time on a single listener thread, and the first measured requests wait behind that
+queue (nvbugs/6564113). Notes:
+- e2e only, and skipped when every client is AgentX (which runs its own warmup) or
+  accuracy-only.
+- If only some warmup requests fail, the harness logs a warning and the measured
+  clients still run. The test fails instead, rather than letting the lane run cold or
+  hang, if the warmup's benchmark_serving exits non-zero, runs past
+  `CONNECTION_WARMUP_TIMEOUT` (capped by the test timeout), or every warmup request
+  fails.
+- Client log: `trtllm-connection-warmup.<server_idx>.log`, not parsed for metrics.
+  The servers' perf_metrics records of the warmup requests are excluded from the time
+  breakdown (see below).
+- Iteration-based nsys ranges (`local/submit.py --ctx-nsys-start-stop` /
+  `--gen-nsys-start-stop`) count from server start, so they begin with the
+  connection-warmup iterations; start the range later to profile only measured
+  iterations.
+
+### Warmup pass
+
+Before each measured client of a normal aggregated, `ctx_only` or disaggregated `e2e`
+test, the harness sends one un-measured wave (`concurrency` requests) of the client's
+own `benchmark_serving` command with `--seed` + 1, so JIT kernels for the real prefill
+shapes compile outside the measured window. `gen_only` modes, AgentX and accuracy-only
+clients get none. Its log (`trtllm-benchmark-warmup-pass.*.log`) is not parsed, and its
+records stay out of `d_tb_*` and the device step time; with the time breakdown on, only
+the first measured client gets one. `TRTLLM_PERF_WARMUP_PASS=0` turns it off (locally,
+via `EXTRA_CONTAINER_EXPORTS`).
+
+### The optional instrumentation modifier
+
+The three shapes that read a disaggregated config (2, 3 and 4 above) take one
+**optional** extra segment between the benchmark mode and the config stem:
+
+```text
+perf/test_perf_sanity.py::test_e2e[<prefix>-<mode>[-<modifier>]-<disagg config file base name>]
+```
+
+`<modifier>` comes from a closed vocabulary (`TEST_ID_MODIFIERS` in
+`test_perf_sanity.py`), and the only member today is `time_breakdown`. It is
+generated for shapes 4 (`disagg-e2e`) and 2 (`aggr-ctx_only`):
+
+```text
+perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-time_breakdown-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
+perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-time_breakdown-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
+```
+
+Not for shape 3 (`disagg-gen_only`): its regression signal is the gen-worker
+device step time, and the lifecycle spans describe request admission and prefill,
+which a gen_only run does not perform. The grammar would accept it; the collector
+does not mint it, and `local/submit.py` rejects `--time-breakdown` there rather
+than queueing a job that ends in "no tests ran".
+
+A modifier is **orthogonal to the mode**. It selects extra instrumentation — for
+`time_breakdown`, `return_perf_metrics` plus `num_postprocess_workers: 0` on every
+request-serving process (the ctx and gen workers in `e2e`, the single aggregated
+server in `ctx_only`), `--save-request-time-breakdown` on the client, and the
+`d_tb_*` lifecycle-span fields on the uploaded document — while the mode continues
+to decide *what workload runs*. Which of the 108 fields are populated follows from
+the mode (`MODE_GROUPS` in `time_breakdown_metrics.py`): 108 for `e2e`, 44 for
+`ctx_only`; the rest upload as `0.0` so the column exists on every row of the
+series. Shape 1 has no modifier slot: there, the segment
+after the prefix is the config stem itself and the remainder is the server-config
+name. Anything downstream that needs a benchmark mode
+(notably `run_precheck.py --benchmark-mode`) is handed the bare `<mode>`, which is
+why the modifier does not have to be enumerated in those whitelists.
+
+Two consequences worth knowing:
+
+- **The stem is whatever follows the mode and the optional modifier**, not a fixed
+  segment count. Disagg stems routinely contain `-` (`..._ccb-NIXL`), so the
+  grammar is only decidable because no config file stem begins with a modifier
+  name. `get_disagg_test_cases` raises at import time if a stem collides, so a
+  future colliding filename fails collection loudly instead of resolving to the
+  wrong YAML.
+- **A modified case is its own baseline series.** The modifier is part of
+  `s_test_case_name`, and for `time_breakdown` that is required rather than
+  incidental: `num_postprocess_workers: 0` measurably changes throughput, so its
+  aggregate numbers are deliberately not comparable to the sibling unmodified
+  case.
+
+### Reading the JSONLs without racing the writers
+
+Each request-serving process appends to its own `perf_metrics-*.jsonl` from a
+background writer thread and flushes the tail when it exits, so the aggregation has
+to run after the writers are done. Only the **gen** workers announce that
+(`gen_server_{i}.done`, which the device-step-time path already waits for); the ctx
+workers and the disaggregated server do not. `wait_for_perf_metrics_files` therefore
+polls the discovered set until its total size holds still for
+`PERF_METRICS_SETTLE_SECONDS`, bounded by `PERF_METRICS_SETTLE_TIMEOUT`, before
+anything is read, and then compares the census (the complete records of one server
+role, summed over its files) against the client's `--num-prompts`. Both a
+still-growing set at the timeout and a census
+shortfall are logged as warnings, not failures — a nearly-complete file still yields
+usable statistics, and the numbers are not regression-gated. This matters because a
+truncated read is otherwise **invisible**: all 108 fields are still populated and the
+row uploads green. For the same reason a malformed line (a partial write caught
+mid-record) costs only that line, never the whole file: dropping the disagg server's
+file would silently reroute the per-request groups to same-role worker fallbacks,
+which produce plausible values for the wrong phase.
+
+The servers also append records of the e2e connection warmup's and the warmup pass's
+requests to these files. The harness therefore waits until the census holds a record
+for every successful warmup request and the files hold still, then notes each
+file's line count; the aggregation skips those leading lines and leaves
+them out of the census. Unlike the measured run's census, this one is a failure: if
+the count is not reached within `PERF_METRICS_SETTLE_TIMEOUT`, the test fails rather
+than mixing late warmup records into the breakdown. The log line
+`Time breakdown: excluded warmup records from {...}` prints the counts as
+JSON. To reproduce the uploaded numbers offline, run
+`time_breakdown_metrics.py --mode e2e --output-dir <test output dir>/perf_metrics
+--drop-warmup-request --leading-lines-to-skip '<that JSON>'`.
+
+## CI Test Database
+
+Test lists are defined in `tests/integration/test_lists/test-db/`.
+
+### YAML File Naming Convention
+
+| Test Type | File Pattern | Example |
+|-----------|--------------|---------|
+| Single-node aggregated | `l0_{gpu_type}_multi_gpus_perf_sanity.yml` | `l0_b200_multi_gpus_perf_sanity.yml` |
+| Multi-node aggregated | `l0_{gpu_type}_multi_nodes_perf_sanity_node{node count}_gpu{gpu count per test}.yml` | `l0_gb200_multi_nodes_perf_sanity_node2_gpu8.yml` |
+| Multi-node disaggregated | `l0_{gpu_type}_multi_gpus_perf_sanity_ctx{ctx worker count}node{node count per ctx worker}_gpu{gpu count per ctx worker}_gen{gen worker count}node{node count per gen worker}_gpu{gen gpus per gen worker}.yml` | `l0_b200_multi_gpus_perf_sanity_ctx1node1_gpu8_gen1node1_gpu8.yml` |
+
+### Jenkins Pipeline Configuration
+
+Tests are defined in `jenkins/L0_Test.groovy` under the `launchTestJobs` function:
+
+| Config Variable | Test Type |
+|-----------------|-----------|
+| `x86SlurmTestConfigs` | Single-node aggregated tests |
+| `SBSASlurmTestConfigs` | Multi-node aggregated tests |
+| `multiNodesSBSAConfigs` | Multi-node disaggregated tests |
+
+## CI Stage Rules
+
+### Test Batching Rules
+
+| Test Type | Nodes per Test | Max Tests per Stage | Notes |
+|-----------|----------------|---------------------|-------|
+| Normal aggregated test | 1 | 6 | Multiple tests can share a stage |
+| Aggregated ctx_only test | 1 | 6 | Multiple tests can share a stage |
+| Normal aggregated test | > 1 | 1 | One test per stage |
+| Aggregated ctx_only test | > 1 | 1 | One test per stage |
+| Disaggregated gen_only test | Any | 1 | Always one test per stage |
+| Disaggregated e2e test | Any | 1 | Always one test per stage |
+
+**Important**: Pre-merge and post-merge tests must be in separate stages.
+
+### Pre-merge vs Post-merge Perf-Regression Gating
+
+By default, `test_perf_sanity.py` fails CI on perf regression for pre-merge stages and only warns for post-merge stages. This is auto-detected from the Jenkins job URL (`PostMerge` substring), not the stage name.
+
+**A pre-merge case does not fail when `main` has already regressed.** Both pipelines
+compare against the same post-merge baseline, so once a regression lands on `main`
+every PR measures the same regressed value and every PR fails a test it did not
+break — blocking the whole queue until a fix merges and everyone rebases. To avoid
+that, `prepare_regressive_test_cases` checks the **latest post-merge document** for
+the same test case: if that value misses the same baseline by more than the same
+pre-merge threshold (10%), the pre-merge case is reported as a warning but does not
+raise. Functional failures still fail the stage as usual.
+
+The comparison deliberately re-evaluates `main`'s value rather than reusing the
+`b_is_regression` the post-merge run recorded, because that verdict was computed at
+the tighter post-merge threshold (5%). Re-evaluating keeps the exemption exactly as
+wide as the failure it prevents: if `main` is only 6% down, a PR reproducing that
+value never fails the 10% gate, so the gate stays armed.
+
+Two things to be aware of when you see that warning:
+
+- While a case is exempt it is exempt **entirely**: a genuine new regression the PR
+  adds on top of `main`'s passes silently. The exempt band is only the range where
+  the gate would have fired on `main`'s own value anyway, but inside it there is no
+  coverage.
+- The exemption clears itself as the rolling baseline absorbs the regression, which
+  also means the regression stops being reported. If you land the fix, the baseline
+  recovers and the gate re-arms at the original level; if nobody does, it re-arms at
+  the lowered one. Check the post-merge trend before assuming a green stage means the
+  case is healthy.
+
+See [README_perf_regression_system.md](README_perf_regression_system.md) for the full
+rule and how to force gating back on.
+
+**`FUNCTIONAL-ONLY` stage-name flag**: A pre-merge stage whose name contains `FUNCTIONAL-ONLY` still runs the full perf harness — benchmarks execute, metrics are uploaded to OpenSearch, dashboards update — but perf regressions **do not fail CI**. Only functional failures (build errors, crashes, empty output) fail the stage.
+
+Use this for pre-merge stages whose goal is to catch functional regressions on paths that only had post-merge coverage before. It preserves the data-continuity benefit of running in pre-merge (baselines still update from PR data points) without the flakiness cost of gating on the noisier disagg perf numbers.
+
+**No stage currently sets this flag**, and no perf-sanity stage currently runs in pre-merge. The mechanism is kept for the next pre-merge stage that needs non-gating coverage.
+
+Detection is by substring match on `os.environ["stageName"]` inside `test_perf_sanity.py`; no changes to `perf_regression_utils.py`.
+
+### GPU Hours Calculation
+
+- Each CI stage runtime is approximately **1 hour**
+- GPU hours = (number of stages) x (GPUs per stage) x 1 hour
+
+**Example**: A test configuration with 12 single-node tests (6 tests x 2 stages) using 8 GPUs each = 2 stages x 8 GPUs x 1 hour = 16 GPU hours
+
+## Running Tests
+
+**Important**: Do NOT add `--perf` flag when running pytest. Perf sanity tests are static test cases and do not use perf mode.
+
+### Local Run Examples
+
+```bash
+# Run a normal aggregated test
+pytest perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k1k]
+
+# Run an aggregated ctx_only test
+pytest perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
+
+# Run a disaggregated gen_only test
+pytest perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
+
+# Run a disaggregated e2e test
+pytest perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
+```
+
+### Using Local Submit Script
+
+For local SLURM job submission (supports both aggregated and disaggregated tests):
+
+```bash
+python jenkins/scripts/perf/local/submit.py --help
+```
+
+## Disaggregated Test SLURM Execution
+
+A disaggregated test runs **four srun steps** within a single multi-node SLURM job allocation. Each step has a different role set via `DISAGG_SERVING_TYPE`:
+
+| Step | `DISAGG_SERVING_TYPE` | Needs MPI | Notes |
+|------|-----------------------|-----------|-------|
+| Context worker(s) | `CTX_0`, `CTX_1`, ... | Yes | Launched via `trtllm-llmapi-launch`, multi-GPU |
+| Generation worker(s) | `GEN_0`, `GEN_1`, ... | Yes | Launched via `trtllm-llmapi-launch`, multi-GPU |
+| Disagg server | `DISAGG_SERVER` | No | Runs `trtllm-serve disaggregated`, single process |
+| Benchmark client | `BENCHMARK` | No | Runs benchmark pytest, single process |
+
+All four srun steps share the same `srunArgs` array, but `--mpi=pmix` is added **only** to the CTX/GEN worker srun commands in `slurm_launch_draft.sh` (not in srunArgs). This prevents unwanted MPI initialization in the disagg server and benchmark processes. See the MPI/PMI section in `jenkins/scripts/perf/README.md` for details.
+
+## Quick Reference for AI Agents
+
+When working with perf sanity tests, use these paths:
+
+| Resource | Path |
+|----------|------|
+| Pytest script | `tests/integration/defs/perf/test_perf_sanity.py` |
+| Regression pipeline | `tests/integration/defs/perf/perf_regression_utils.py` |
+| DB utilities | `tests/integration/defs/perf/open_search_db_utils.py` |
+| Aggregated configs | `tests/scripts/perf-sanity/aggregated/*.yaml` |
+| Disaggregated configs | `tests/scripts/perf-sanity/disaggregated/*.yaml` |
+| CI submit (disagg only) | `jenkins/scripts/perf/disaggregated/submit.py` |
+| Local submit (all) | `jenkins/scripts/perf/local/submit.py` |
+| Jenkins pipeline | `jenkins/L0_Test.groovy` |
+| Test database | `tests/integration/test_lists/test-db/` |
+| Test waives | `tests/integration/test_lists/waives.txt` |
+
+## Step-by-Step: Adding or Re-enabling Disaggregated Perf Sanity Tests
+
+When adding a new disaggregated perf sanity test (or uncommenting an existing one), you must update **two files**: the test-db YAML and `jenkins/L0_Test.groovy`. This section describes how to locate and edit each one.
+
+### Step 1: Identify the Disaggregated Config YAML
+
+Config files live in `tests/scripts/perf-sanity/disaggregated/`. The filename encodes the GPU type and test parameters:
+
+```
+{gpu_type}_{model}-{precision}_{ISL}k{OSL}k_con{concurrency}_ctx{ctx_count}_tp{ctx_tp}_gen{gen_count}_{gen_parallelism}_eplb{N}_mtp{N}_ccb-{transport}.yaml
+```
+
+Example: `gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL.yaml`
+
+The **base name** (filename without `.yaml`) is used as the test case ID in the test-db.
+
+### Step 2: Calculate Resource Requirements from Config YAML
+
+Read the config YAML and extract these fields:
+
+```yaml
+hardware:
+  gpus_per_node: 4          # GPUs per physical node
+  num_ctx_servers: 1         # Number of context workers
+  num_gen_servers: 1         # Number of generation workers
+worker_config:
+  ctx:
+    tensor_parallel_size: 1  # GPUs per ctx worker
+  gen:
+    tensor_parallel_size: 8  # GPUs per gen worker
+```
+
+Calculate:
+
+| Value | Formula | Example (ctx_tp=1, gen_tp=8, gpus_per_node=4) |
+|-------|---------|-----------------------------------------------|
+| Nodes per ctx worker | `ceil(ctx_tp / gpus_per_node)` | `ceil(1/4) = 1` |
+| Nodes per gen worker | `ceil(gen_tp / gpus_per_node)` | `ceil(8/4) = 2` |
+| Total nodes | `(nodes_per_ctx * num_ctx) + (nodes_per_gen * num_gen)` | `1*1 + 2*1 = 3` |
+| Total GPUs | `total_nodes * gpus_per_node` | `3 * 4 = 12` |
+
+### Step 3: Find the Test-db YAML File
+
+The test-db file name follows this pattern (all in `tests/integration/test_lists/test-db/`):
+
+```
+l0_{gpu_type}_multi_nodes_perf_sanity_ctx{num_ctx}_node{nodes_per_ctx}_gpu{ctx_tp}_gen{num_gen}_node{nodes_per_gen}_gpu{gen_tp}.yml
+```
+
+Example: for ctx_tp=1, gen_tp=8, 1 ctx worker, 1 gen worker on GB200:
+```
+l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8.yml
+```
+
+The `system_gpu_count` in the test-db condition section equals the total GPUs calculated above.
+
+### Step 4: Add or Uncomment the Test in the Test-db File
+
+Each disagg test line in the test-db file follows one of these formats:
+
+```yaml
+# gen_only test:
+- perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-{config_base_name}] TIMEOUT ({minutes})
+
+# e2e test:
+- perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-{config_base_name}] TIMEOUT ({minutes})
+
+# ctx_only test (placed in aggregated test-db files, not disagg ones):
+- perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-{config_base_name}] TIMEOUT ({minutes})
+```
+
+- If the test line already exists but is **commented out** (prefixed with `# `), remove the `# ` prefix.
+- If the test line does not exist, add it to the `tests` list.
+- Set `TIMEOUT` from the case's measured runtime: the slowest passing run plus 25%
+  (at least 15 minutes), rounded up to a multiple of 5 and no lower than 30 minutes.
+  Take the slowest run from CI (`l_e2e_time_ms` in the `test_info` index) or, for a new
+  case, from its validation run. A fixed large value hides a hang for hours, and the
+  sbatch session also has to hold the install and launch.
+- Count the total number of **active (uncommented) tests** in the file — you will need this count for Step 5.
+
+### Step 5: Update `jenkins/L0_Test.groovy`
+
+Open `jenkins/L0_Test.groovy` and search for the `multiNodesSBSAConfigs` section inside `launchTestJobs()`. Disaggregated perf sanity stages are added via `buildStageConfigs()`:
+
+```groovy
+def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCount, runWithSbatch=false)
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `stageName` | CI stage name prefix (see naming convention below) |
+| `platform` | Hardware platform, e.g., `"auto:gb200-flex"` |
+| `testlist` | Test-db filename **without** `.yml`, e.g., `"l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4"` |
+| `testCount` | Number of **active (uncommented)** tests in the test-db file. Each disagg test gets its own stage, so `testCount` must equal the number of active tests. |
+| `gpuCount` | Total GPUs from Step 2 (= `total_nodes * gpus_per_node`) |
+| `nodeCount` | Total nodes from Step 2 |
+
+**Stage naming convention:**
+
+```
+GB200-{gpuCount}_GPUs-{nodeCount}_Nodes-PyTorch-Disagg-PerfSanity-CTX{num_ctx}-NODE{nodes_per_ctx}-GPU{ctx_tp}-GEN{num_gen}-NODE{nodes_per_gen}-GPU{gen_tp}-Post-Merge
+```
+
+**If a `buildStageConfigs` entry already exists** for the test-db file: update `testCount` to match the new total number of active tests.
+
+**If no entry exists** for the test-db file: add a new `buildStageConfigs` block. Insert it in the correct section sorted by node count (2 Nodes, 3 Nodes, 4 Nodes, etc.).
+
+### Step 6: Check Waives
+
+Search `tests/integration/test_lists/waives.txt` for the exact test case string. If the test is listed there with a `SKIP` directive, remove that line (otherwise the test will be skipped even if present in the test-db).
+
+### Worked Example
+
+Checking the existing `qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL` gen_only test, or re-enabling it if it has been disabled:
+
+1. Config file: `tests/scripts/perf-sanity/disaggregated/gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL.yaml`
+2. From config: `gpus_per_node=4`, `ctx_tp=1`, `gen_tp=4`, `num_ctx=1`, `num_gen=1`
+3. Nodes per ctx = `ceil(1/4)=1`, nodes per gen = `ceil(4/4)=1`, total nodes = 2, total GPUs = 8
+4. Test-db file: `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4.yml`
+5. Locate `perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL]`. It is currently active with `TIMEOUT (30)`; do not add a duplicate. Uncomment it only if it has been disabled.
+6. Recount the active tests after any edits.
+7. In `L0_Test.groovy`, find the `buildStageConfigs` for `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4` and set `testCount` to that count, preserving it if unchanged.
+8. Check `waives.txt` for the exact test ID before enabling the test.

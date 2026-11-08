@@ -1,0 +1,463 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import pickle
+import time
+from datetime import timedelta
+
+import numpy as np
+import pytest
+import torch
+
+import tensorrt_llm.bindings as _tb
+import tensorrt_llm.bindings.executor as _tbe
+from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
+
+
+def test_quant_mode():
+    assert _tb.QuantMode.none().value == 0
+    assert _tb.QuantMode.int4_weights().has_int4_weights
+    assert _tb.QuantMode.int8_weights().has_int8_weights
+    assert _tb.QuantMode.activations().has_activations
+    assert _tb.QuantMode.per_channel_scaling().has_per_channel_scaling
+    assert _tb.QuantMode.per_token_scaling().has_per_token_scaling
+    assert _tb.QuantMode.per_group_scaling().has_per_group_scaling
+    assert _tb.QuantMode.int8_kv_cache().has_int8_kv_cache
+    assert _tb.QuantMode.fp8_kv_cache().has_fp8_kv_cache
+    assert _tb.QuantMode.fp8_qdq().has_fp8_qdq
+
+    quant_mode = _tb.QuantMode.from_description(True, True, True, True, True,
+                                                True, True, True, False, False,
+                                                False, False, False, False,
+                                                False, False)
+    assert quant_mode.has_int4_weights
+    quant_mode -= _tb.QuantMode.int4_weights()
+    assert not quant_mode.has_int4_weights
+    quant_mode += _tb.QuantMode.int4_weights()
+    assert quant_mode.has_int4_weights
+
+    assert _tb.QuantMode.none() == _tb.QuantMode.none()
+
+
+def test_model_config():
+    vocab_size = 10000
+    num_attention_layers = 12
+    num_rnn_layers = 2
+    num_heads = 16
+    hidden_size = 768
+    data_type = _tb.DataType.FLOAT
+    model_config = _tb.ModelConfig(vocab_size,
+                                   num_attention_layers + num_rnn_layers,
+                                   num_attention_layers, num_rnn_layers,
+                                   num_heads, hidden_size, data_type)
+    assert model_config.vocab_size == vocab_size
+    assert model_config.num_attention_layers() == num_attention_layers
+    assert model_config.num_rnn_layers() == num_rnn_layers
+    assert model_config.num_heads == num_heads
+    assert model_config.hidden_size == hidden_size
+    assert model_config.data_type == data_type
+
+    assert model_config.vocab_size_padded(1) is not None
+    assert model_config.size_per_head == hidden_size // num_heads
+
+    num_kv_heads_per_layer = model_config.num_kv_heads_per_layer
+    for layer_idx in range(num_attention_layers):
+        assert model_config.num_kv_heads(layer_idx) == num_heads
+        assert num_kv_heads_per_layer[layer_idx] == num_heads
+
+    num_kv_heads = 1
+    model_config.set_num_kv_heads(num_kv_heads)
+    num_kv_heads_per_layer = model_config.num_kv_heads_per_layer
+    for layer_idx in range(num_attention_layers):
+        assert model_config.num_kv_heads(layer_idx) == num_kv_heads
+        assert num_kv_heads_per_layer[layer_idx] == num_kv_heads
+
+    num_kv_heads_per_layer[-1] = 2
+    model_config.num_kv_heads_per_layer = num_kv_heads_per_layer
+    for nheads, ref in zip(model_config.num_kv_heads_per_layer,
+                           num_kv_heads_per_layer):
+        assert nheads == ref
+
+    assert not model_config.use_gpt_attention_plugin
+    model_config.use_gpt_attention_plugin = True
+    assert model_config.use_gpt_attention_plugin
+
+    assert not model_config.use_packed_input
+    model_config.use_packed_input = True
+    assert model_config.use_packed_input
+
+    assert model_config.kv_cache_type is not None
+    # Test with C++ enums directly
+    for enum_val in [
+            _tb.KVCacheType.CONTINUOUS, _tb.KVCacheType.PAGED,
+            _tb.KVCacheType.DISABLED
+    ]:
+        model_config.kv_cache_type = enum_val
+        assert model_config.kv_cache_type == enum_val
+
+    # Test with Python enums converted to C++
+    for py_enum in [
+            KVCacheType.CONTINUOUS, KVCacheType.PAGED, KVCacheType.DISABLED
+    ]:
+        model_config.kv_cache_type = py_enum.to_cpp()
+        # Verify it was set correctly by comparing with C++ enum
+        assert model_config.kv_cache_type == getattr(_tb.KVCacheType,
+                                                     py_enum.name)
+        # Also verify round-trip conversion works
+        assert KVCacheType.from_cpp(model_config.kv_cache_type) == py_enum
+
+    assert model_config.tokens_per_block == 64
+    tokens_per_block = 1024
+    model_config.tokens_per_block = tokens_per_block
+    assert model_config.tokens_per_block == tokens_per_block
+
+    assert model_config.quant_mode == _tb.QuantMode.none()
+    model_config.quant_mode = _tb.QuantMode.int4_weights()
+    assert model_config.quant_mode.has_int4_weights
+
+    assert model_config.supports_inflight_batching
+
+    assert model_config.max_batch_size == 0
+    max_batch_size = 1000
+    model_config.max_batch_size = max_batch_size
+    assert model_config.max_batch_size == max_batch_size
+
+    assert model_config.max_input_len == 0
+    max_input_len = 2048
+    model_config.max_input_len = max_input_len
+    assert model_config.max_input_len == max_input_len
+
+    assert model_config.max_num_tokens is None
+    max_num_tokens = 10000
+    model_config.max_num_tokens = max_num_tokens
+    assert model_config.max_num_tokens == max_num_tokens
+
+    assert not model_config.compute_context_logits
+    model_config.compute_context_logits = True
+    assert model_config.compute_context_logits
+
+    assert not model_config.compute_generation_logits
+    model_config.compute_generation_logits = True
+    assert model_config.compute_generation_logits
+
+    assert model_config.model_variant == _tb.GptModelVariant.GPT
+    model_variant = _tb.GptModelVariant.GLM
+    model_config.model_variant = model_variant
+    assert model_config.model_variant == model_variant
+
+
+def test_world_config():
+    tensor_parallelism = 2
+    pipeline_parallelism = 4
+    context_parallelism = 1
+    rank = 3
+    gpus_per_node = 10
+    world_config = _tb.WorldConfig(tensor_parallelism, pipeline_parallelism,
+                                   context_parallelism, rank, gpus_per_node)
+    assert world_config.tensor_parallelism == tensor_parallelism
+    assert world_config.pipeline_parallelism == pipeline_parallelism
+    assert world_config.context_parallelism == context_parallelism
+    assert world_config.rank == rank
+    assert world_config.gpus_per_node == gpus_per_node
+    assert world_config.gpus_per_group == gpus_per_node
+    assert world_config.size == tensor_parallelism * pipeline_parallelism * context_parallelism
+    assert world_config.is_pipeline_parallel
+    assert world_config.is_tensor_parallel
+    assert world_config.device == rank % gpus_per_node
+    assert world_config.pipeline_parallel_rank == rank // tensor_parallelism
+    assert world_config.tensor_parallel_rank == rank % tensor_parallelism
+
+    world_config = _tb.WorldConfig.mpi(gpus_per_node)
+    assert world_config.tensor_parallelism == 1
+    assert world_config.pipeline_parallelism == 1
+    assert world_config.context_parallelism == 1
+    assert world_config.gpus_per_node == gpus_per_node
+    assert world_config.rank == 0
+
+    gpus_per_group = gpus_per_node // 2
+    device_ids = list(gpus_per_group + x for x in range(gpus_per_group))
+    assert max(device_ids) < gpus_per_node
+    world_config = _tb.WorldConfig(rank=rank,
+                                   gpus_per_node=gpus_per_node,
+                                   device_ids=device_ids)
+    assert world_config.gpus_per_node == gpus_per_node
+    assert world_config.gpus_per_group == gpus_per_group
+    assert world_config.rank == rank
+    assert world_config.device == rank + gpus_per_group
+
+
+def test_sampling_config():
+    beam_width = 12
+    sampling_config = _tb.SamplingConfig(beam_width)
+    assert sampling_config.beam_width == 12
+
+    def check_empty_then_set(member, value):
+        assert getattr(sampling_config, member) is None
+        setattr(sampling_config, member, value)
+        assert getattr(sampling_config, member) == value
+
+    # Fields are scalars on executor::SamplingConfig, not the one-element
+    # columns the removed runtime type used.
+    check_empty_then_set("temperature", 1.)
+    check_empty_then_set("min_tokens", 1)
+    check_empty_then_set("repetition_penalty", 1.)
+    check_empty_then_set("presence_penalty", 1.)
+    check_empty_then_set("frequency_penalty", 1.)
+    check_empty_then_set("top_k", 1)
+    check_empty_then_set("top_p", 1.)
+    check_empty_then_set("seed", 1)
+    check_empty_then_set("top_p_decay", 1.)
+    check_empty_then_set("top_p_min", 1.)
+    check_empty_then_set("top_p_reset_ids", 1)
+    check_empty_then_set("beam_search_diversity_rate", 1.)
+    check_empty_then_set("length_penalty", 1.)
+    check_empty_then_set("early_stopping", 1)
+
+
+def test_llm_request():
+    beam_width = 2
+    sampling_config = _tb.SamplingConfig(beam_width)
+    kwargs = {
+        "request_id": 0,
+        "max_new_tokens": 5,
+        "sampling_config": sampling_config,
+        "input_tokens": [0, 1, 2],
+        "is_streaming": True,
+    }
+    llm_request = _tb.internal.batch_manager.LlmRequest(**kwargs)
+
+    assert llm_request.request_id == 0
+    assert llm_request.prompt_len == 3
+    assert llm_request.sampling_config.beam_width == sampling_config.beam_width
+    assert llm_request.streaming
+    assert llm_request.seq_slot is None
+
+    assert llm_request.get_num_tokens(0) == 3
+    assert llm_request.max_beam_num_tokens == 3
+    assert llm_request.get_token(1, 2) == 2
+    assert llm_request.get_tokens(1) == [0, 1, 2]
+    assert llm_request.max_num_generated_tokens == 0
+
+    llm_request.add_new_token(42, 0)
+    assert llm_request.get_token(0, 3) == 42
+
+    llm_request.add_new_tokens([43, 44])
+    assert llm_request.get_token(0, 4) == 43
+    assert llm_request.get_token(1, 3) == 44
+
+    llm_request.set_generated_tokens([[10, 11], [12, 13]])
+    assert llm_request.get_tokens(0) == [0, 1, 2, 10, 11]
+    assert llm_request.max_num_generated_tokens == 2
+
+    llm_request.pause(0)
+    assert llm_request.state == _tb.LlmRequestState.CONTEXT_INIT
+
+    llm_request.max_sent_token_len = 1
+    assert llm_request.max_sent_token_len == 1
+
+    assert np.allclose(llm_request.priority(), 0.5)
+    llm_request.set_priority(1.0)
+    assert np.allclose(llm_request.priority(), 1.0)
+    llm_request.set_priority(0.0)
+    assert np.allclose(llm_request.priority(), 0.0)
+
+    assert llm_request.orig_prompt_len == 3
+
+    assert not llm_request.draft_tokens
+    llm_request.draft_tokens = [1, 2, 3]
+    assert llm_request.draft_tokens == [1, 2, 3]
+
+    logits = torch.tensor([-5, -6 - 7], dtype=torch.float)
+    llm_request.draft_logits = logits
+    assert torch.equal(llm_request.draft_logits, logits)
+
+
+def test_generation_only_llm_request_adopts_draft_tokens() -> None:
+    request_id = 42
+    first_gen_tokens = [100]
+    draft_tokens = [101, 102, 103]
+    llm_request_type = _tb.internal.batch_manager.LlmRequestType
+    context_phase_params = _tb.executor.ContextPhaseParams(
+        first_gen_tokens,
+        request_id,
+        None,
+        draft_tokens,
+        None,
+        None,
+    )
+
+    llm_request = _tb.internal.batch_manager.LlmRequest(
+        request_id=request_id,
+        max_new_tokens=10,
+        sampling_config=_tb.SamplingConfig(1),
+        input_tokens=[1, 2, 3],
+        is_streaming=False,
+        llm_request_type=llm_request_type.LLMREQUEST_TYPE_GENERATION_ONLY,
+        context_phase_params=context_phase_params,
+    )
+
+    assert llm_request.is_generation_only_request
+    assert llm_request.has_draft_tokens()
+    assert llm_request.num_draft_tokens == len(draft_tokens)
+    assert llm_request.draft_tokens == draft_tokens
+    assert llm_request.context_phase_params.draft_tokens == draft_tokens
+
+    late_llm_request = _tb.internal.batch_manager.LlmRequest(
+        request_id=request_id,
+        max_new_tokens=10,
+        sampling_config=_tb.SamplingConfig(1),
+        input_tokens=[1, 2, 3],
+        is_streaming=False,
+        llm_request_type=llm_request_type.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+
+    assert late_llm_request.draft_tokens is None
+    assert late_llm_request.num_draft_tokens == 0
+
+    late_llm_request.context_phase_params = context_phase_params
+
+    assert late_llm_request.has_draft_tokens()
+    assert late_llm_request.num_draft_tokens == len(draft_tokens)
+    assert late_llm_request.draft_tokens == draft_tokens
+
+
+@pytest.mark.cpu_only
+def test_llm_request_kv_cache_transfer_metric_bindings():
+    request = _tb.internal.batch_manager.LlmRequest(
+        request_id=0,
+        max_new_tokens=5,
+        sampling_config=_tb.SamplingConfig(1),
+        input_tokens=[0, 1, 2],
+        is_streaming=True,
+    )
+    offset = _tb.internal.batch_manager.LlmRequest.global_steady_clock_offset
+    offset = offset if offset is not None else timedelta()
+    start = timedelta(seconds=1.25)
+    end = timedelta(seconds=2.5)
+
+    request.set_kv_cache_transfer_start(start)
+    request.set_kv_cache_transfer_end(end)
+    request.set_kv_cache_size(128)
+
+    assert request.kv_cache_transfer_start == start + offset
+    assert request.kv_cache_transfer_end == end + offset
+    assert request.kv_cache_size == 128
+
+
+def test_Mpicomm():
+    size1 = _tb.MpiComm.size()
+    rank1 = _tb.MpiComm.rank()
+
+    session_size = (size1 + 1) // 2
+    session_color = rank1 // session_size
+    session_rank = rank1 % session_size
+    _tb.MpiComm.split(session_color, session_rank)
+
+    rank2 = _tb.MpiComm.rank()
+    size2 = _tb.MpiComm.size()
+
+    assert rank2 == session_rank
+    assert size2 == session_size
+
+
+@pytest.mark.cpu_only
+def test_SamplingConfig_is_executor_alias():
+    # `tensorrt_llm.bindings.SamplingConfig` used to be a distinct runtime type whose
+    # fields were one-element lists. It is now an alias of the executor type, which
+    # spells `min_tokens`/`seed` and stores scalars. Pin that contract so the rename
+    # cannot regress silently.
+    assert _tb.SamplingConfig is _tbe.SamplingConfig
+
+    config = _tb.SamplingConfig(beam_width=2)
+    assert config.beam_width == 2
+
+    config.temperature = 0.5  # exactly representable as a C++ float
+    config.top_k = 3
+    assert config.temperature == 0.5
+    assert config.top_k == 3
+
+    assert not hasattr(config, "min_length")
+    assert not hasattr(config, "random_seed")
+    config.min_tokens = 4
+    config.seed = 7
+    assert config.min_tokens == 4
+    assert config.seed == 7
+
+    # LlmRequest construction goes through this copy constructor, which is registered
+    # after the keyword constructor whose first parameter is an int.
+    copied = _tb.SamplingConfig(config)
+    assert copied.beam_width == 2
+    assert copied.temperature == 0.5
+
+    unpickled = pickle.loads(pickle.dumps(config))
+    assert unpickled.beam_width == 2
+    assert unpickled.temperature == 0.5
+    assert unpickled.min_tokens == 4
+    assert unpickled.seed == 7
+
+
+def test_KvCache_events_binding():
+    stream = torch.cuda.Stream()
+    max_sequence_length = 10
+    kwargs = {
+        'num_kv_heads_per_layer': [1, 1],
+        'size_per_head':
+        128,
+        'tokens_per_block':
+        64,
+        'blocks_per_window': {
+            max_sequence_length: (1000, 10000)
+        },
+        'max_num_sequences':
+        1,
+        'max_beam_width':
+        1,
+        'max_attention_window_vec': [max_sequence_length],
+        'dtype':
+        _tb.DataType.FLOAT,
+        'sink_token_length':
+        0,
+        'stream':
+        stream.cuda_stream,
+        'max_sequence_length':
+        max_sequence_length,
+        'chunk_size':
+        max_sequence_length,
+        'enable_block_reuse':
+        True,
+        'cache_type':
+        _tb.internal.batch_manager.CacheType.SELF,
+        'event_manager':
+        _tb.internal.batch_manager.KVCacheEventManager(
+            max_kv_event_entries=1024)
+    }
+
+    kv_cache_manager = _tb.internal.batch_manager.KVCacheManager(**kwargs)
+    kv_cache_manager.flush_iteration_events()
+    time.sleep(0.0001)
+    events = kv_cache_manager.get_latest_events()
+    assert len(events) == 1
+    assert isinstance(events[0], _tb.executor.kv_cache.KVCacheEvent)
+    assert events[0].event_id == 0 and isinstance(
+        events[0].data, _tb.executor.kv_cache.KVCacheCreatedData)
+
+    del stream
+    torch.cuda.empty_cache()
+
+
+def test_ReqIdsSet_pickle():
+    ids = _tb.internal.batch_manager.ReqIdsSet()
+    ids1 = pickle.loads(pickle.dumps(ids))
+    assert ids1 == ids
+
+    ids.insert(0)
+    ids.insert(1)
+    ids.insert(2)
+    ids1 = pickle.loads(pickle.dumps(ids))
+    assert ids1 == ids
+
+    ids1.erase(0)
+    ids2 = _tb.internal.batch_manager.ReqIdsSet()
+    ids2.insert(1)
+    ids2.insert(2)
+    assert ids1 == ids2

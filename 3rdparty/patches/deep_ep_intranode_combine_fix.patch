@@ -1,0 +1,35 @@
+--- a/csrc/kernels/intranode.cu
++++ b/csrc/kernels/intranode.cu
+@@ -844,9 +844,15 @@
+
+ #ifndef DISABLE_SM90_FEATURES
+                     // Wait TMA arrival
++                    // hidden_int4 is not always divisible by a warp. The final tile can have
++                    // only a subset of lanes active, so synchronize only participating lanes.
++                    auto const tile_start = i - lane_id;
++                    auto const active_lanes = min(32, hidden_int4 - tile_start);
++                    auto const sync_mask = active_lanes == 32 ? 0xffffffffu : ((1u << active_lanes) - 1u);
++
+                     if (lane_id == 0)
+                         tma_store_wait<kNumStages - 1>();
+-                    __syncwarp();
++                    __syncwarp(sync_mask);
+
+                     // Write into TMA buffer
+                     auto tma_stage_idx = (i / 32) % kNumStages;
+@@ -854,13 +860,13 @@
+
+                     // Issue TMA
+                     tma_store_fence();
+-                    __syncwarp();
++                    __syncwarp(sync_mask);
+                     if (lane_id == 0) {
+                         auto tma_bytes = min(32, hidden_int4 - i) * static_cast<int>(sizeof(int4));
+                         tma_store_1d(reinterpret_cast<int4*>(tma_buffer) + tma_stage_idx * 32,
+                                      recv_int4 + token_idx * hidden_int4 + i, tma_bytes, false);
+                     }
+-                    __syncwarp();
++                    __syncwarp(sync_mask);
+ #else
+                     recv_int4[token_idx * hidden_int4 + i] = out_int4;
+ #endif

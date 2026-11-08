@@ -1,0 +1,961 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Sparse MLA attention and end-to-end indexer comparisons."""
+
+import math
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+from typing import List
+from unittest.mock import patch
+
+import pytest
+import torch
+from utils.util import skip_pre_blackwell
+
+import tensorrt_llm
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionInputType,
+    MLAParams,
+    PositionalEmbeddingParams,
+    RopeParams,
+)
+from tensorrt_llm._torch.attention.backends.sparse.dsa import (
+    DSABackendForwardArgs,
+    DSACacheManager,
+    DSAVanillaAttention,
+)
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
+from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
+
+
+@dataclass(kw_only=True, frozen=True)
+class Scenario:
+    dtype: torch.dtype = torch.bfloat16
+    kv_cache_dtype: torch.dtype = torch.bfloat16
+    num_layers: int = 1
+    num_heads: int = 128
+    num_kv_heads: int = 1
+    q_lora_rank: int = 1536
+    kv_lora_rank: int = 512
+    qk_nope_head_dim: int = 128
+    qk_rope_head_dim: int = 64
+    v_head_dim: int = 512
+    rope_append: bool = True
+    hidden_size: int = 7168
+    max_position_embeddings: int = 163840
+    rope_theta: float = 10000.0
+    rope_beta_fast: int = 32
+    rope_beta_slow: int = 1
+    rope_factor: float = 40.0
+    rope_mscale: float = 1.0
+    rope_mscale_all_dim: float = 1.0
+    rope_original_max_position_embeddings: int = 4096
+    rope_type: str = "yarn"
+    model_type: str = "deepseek_v3"
+    kv_cache_tokens_per_block: int = 64
+
+
+@dataclass(kw_only=True, frozen=True)
+class RopeConfig:
+    hidden_size: int = 7168
+    num_attention_heads: int = 128
+    rope_scaling: dict = field(
+        default_factory=lambda: {
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "factor": 40.0,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+            "original_max_position_embeddings": 4096,
+            "type": "yarn",
+        }
+    )
+    max_position_embeddings: int = 163840
+    rope_theta: float = 10000.0
+    qk_rope_head_dim: int = 64
+    model_type: str = "deepseek_v3"
+
+
+def _allocate_kv_cache_for_generation(kv_cache_manager, request_ids, num_tokens: int):
+    for request_id in request_ids:
+        for _ in range(num_tokens):
+            kv_cache_manager.impl.add_token(request_id)
+            if hasattr(kv_cache_manager, "indexer_k_cache_manager"):
+                kv_cache_manager.indexer_k_cache_manager.add_tokens(request_id, 1)
+
+
+# Define test data
+context_sequence_lengths = [[10], [3000, 3100], [508, 4399, 9981]]
+# Use MTP by default if seqlen_q > 1.
+generation_seq_len_q = [1, 4]
+num_generation_steps = [2]
+
+tokens_per_block = 64
+
+kv_cache_dtype_list = [torch.bfloat16, torch.float8_e4m3fn]
+# DSA only supports rope_append=True
+rope_append_values = [True]
+scenarios = [
+    Scenario(
+        kv_cache_dtype=kv_cache_dtype,
+        num_layers=num_layers,
+        kv_cache_tokens_per_block=tokens_per_block,
+        rope_append=rope_append,
+    )
+    for kv_cache_dtype in kv_cache_dtype_list
+    for num_layers in [1]
+    for rope_append in rope_append_values
+]
+
+accuracy_dict = {
+    torch.bfloat16: (0.1, 0.01),
+    torch.float8_e4m3fn: (0.12, 0.01),
+}
+MAX_COMPOSED_MEAN_ABS_ERROR = 1.2e-2
+
+SPARSE_TOPK = 2048
+context_topk_cases = [
+    pytest.param([10], SPARSE_TOPK, id="dense-indexer-smoke"),
+    pytest.param([160], 128, id="genuinely-sparse-indexer"),
+    pytest.param([3000, 3100], SPARSE_TOPK, id="long-two-request-attention"),
+    pytest.param([508, 4399, 9981], SPARSE_TOPK, id="long-ragged-attention"),
+]
+
+
+def _assert_indexer_topk_matches(
+    actual: torch.Tensor,
+    golden: torch.Tensor,
+    *,
+    backend_name: str,
+    phase: str,
+    min_row_overlap: float = 0.95,
+) -> None:
+    if actual.shape != golden.shape:
+        raise AssertionError(
+            f"[{backend_name} indexer vs VANILLA golden, {phase}] "
+            f"shape mismatch: {tuple(actual.shape)} != {tuple(golden.shape)}"
+        )
+    for source, topk in (("actual", actual), ("golden", golden)):
+        if (topk < -1).any():
+            raise AssertionError(
+                f"[{backend_name} indexer vs VANILLA golden, {phase}] "
+                f"{source} contains padding below -1"
+            )
+        duplicate = (topk[:, 1:] == topk[:, :-1]) & (topk[:, 1:] >= 0)
+        if duplicate.any():
+            row = int(torch.nonzero(duplicate, as_tuple=False)[0, 0].item())
+            raise AssertionError(
+                f"[{backend_name} indexer vs VANILLA golden, {phase}] "
+                f"{source} contains a duplicate in row {row}"
+            )
+
+    actual_valid = actual >= 0
+    golden_valid = golden >= 0
+    actual_counts = actual_valid.sum(dim=1)
+    golden_counts = golden_valid.sum(dim=1)
+    if not torch.equal(actual_counts, golden_counts):
+        row = int(torch.nonzero(actual_counts != golden_counts, as_tuple=False)[0].item())
+        raise AssertionError(
+            f"[{backend_name} indexer vs VANILLA golden, {phase}] "
+            f"valid count mismatch in row {row}: "
+            f"{int(actual_counts[row].item())} != {int(golden_counts[row].item())}"
+        )
+    if actual.shape[1] == 0:
+        return
+
+    positions = torch.searchsorted(golden, actual)
+    safe_positions = positions.clamp_max(golden.shape[1] - 1)
+    intersection = (
+        actual_valid & (positions < golden.shape[1]) & (golden.gather(1, safe_positions) == actual)
+    ).sum(dim=1)
+    overlap = intersection.float() / golden_counts.clamp_min(1).float()
+    overlap = torch.where(golden_counts == 0, torch.ones_like(overlap), overlap)
+    worst_overlap, worst_row = overlap.min(dim=0)
+    if float(worst_overlap.item()) < min_row_overlap:
+        raise AssertionError(
+            f"[{backend_name} indexer vs VANILLA golden, {phase}] "
+            f"row {int(worst_row.item())} overlap is "
+            f"{float(worst_overlap.item()):.2%}, expected at least {min_row_overlap:.2%}"
+        )
+
+
+def _assert_composed_output_matches(
+    actual: torch.Tensor,
+    golden: torch.Tensor,
+    *,
+    atol: float,
+    rtol: float,
+    backend_name: str,
+    phase: str,
+) -> None:
+    if actual.shape != golden.shape:
+        raise AssertionError(
+            f"[{backend_name} vs VANILLA golden, {phase}] shape mismatch: "
+            f"{tuple(actual.shape)} != {tuple(golden.shape)}"
+        )
+    if actual.dtype != golden.dtype:
+        raise AssertionError(
+            f"[{backend_name} vs VANILLA golden, {phase}] dtype mismatch: "
+            f"{actual.dtype} != {golden.dtype}"
+        )
+    if not torch.isfinite(actual).all() or not torch.isfinite(golden).all():
+        raise AssertionError(f"[{backend_name} vs VANILLA golden, {phase}] non-finite output")
+    close_fraction = torch.isclose(actual, golden, atol=atol, rtol=rtol).float().mean()
+    mean_abs_error = (actual.float() - golden.float()).abs().mean()
+    if (
+        float(close_fraction.item()) < 0.995
+        or float(mean_abs_error.item()) > MAX_COMPOSED_MEAN_ABS_ERROR
+    ):
+        raise AssertionError(
+            f"[{backend_name} vs VANILLA golden, {phase}] composed output drift: "
+            f"close={float(close_fraction.item()):.3%}, "
+            f"mean_abs_error={float(mean_abs_error.item()):.6f}"
+        )
+
+
+def _assert_matches_vanilla(
+    actual: dict[str, torch.Tensor],
+    golden: dict[str, torch.Tensor],
+    kv_cache_dtype: torch.dtype,
+    backend_name: str,
+) -> None:
+    assert actual.keys() == golden.keys(), (
+        f"[{backend_name} vs VANILLA golden] phase mismatch: {list(actual)} != {list(golden)}"
+    )
+    atol, rtol = accuracy_dict[kv_cache_dtype]
+    for phase, golden_output in golden.items():
+        if phase.startswith("indexer_"):
+            _assert_indexer_topk_matches(
+                actual[phase],
+                golden_output,
+                backend_name=backend_name,
+                phase=phase,
+            )
+            continue
+        _assert_composed_output_matches(
+            actual[phase],
+            golden_output,
+            atol=atol,
+            rtol=rtol,
+            backend_name=backend_name,
+            phase=phase,
+        )
+
+
+# Convert parameterized tests to pytest parametrize
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("scenario", scenarios, ids=lambda x: f"scenario: {x}")
+@pytest.mark.parametrize(
+    "context_sequence_lengths,sparse_topk",
+    context_topk_cases,
+)
+@pytest.mark.parametrize(
+    "generation_seq_len_q", generation_seq_len_q, ids=lambda x: f"generation_seq_len_q: {x}"
+)
+@pytest.mark.parametrize(
+    "num_generation_steps", num_generation_steps, ids=lambda x: f"num_generation_steps: {x}"
+)
+def test_sparse_attention_mla(
+    scenario: Scenario,
+    context_sequence_lengths: List[int],
+    sparse_topk: int,
+    generation_seq_len_q: int,
+    num_generation_steps: int,
+):
+    """Compare TRTLLM sparse MLA against Vanilla attention and indexer goldens."""
+    golden = _test_sparse_attention_mla(
+        "VANILLA",
+        scenario,
+        context_sequence_lengths,
+        generation_seq_len_q,
+        num_generation_steps,
+        sparse_topk=sparse_topk,
+    )
+    actual = _test_sparse_attention_mla(
+        "TRTLLM",
+        scenario,
+        context_sequence_lengths,
+        generation_seq_len_q,
+        num_generation_steps,
+        sparse_topk=sparse_topk,
+    )
+    _assert_matches_vanilla(actual, golden, scenario.kv_cache_dtype, "TRTLLM")
+
+
+def _test_sparse_attention_mla(
+    backend_name: str,
+    scenario: Scenario,
+    context_sequence_lengths: List[int],
+    generation_seq_len_q: int,
+    num_generation_steps: int,
+    sparse_topk: int = SPARSE_TOPK,
+    seed: int = 123,
+) -> dict[str, torch.Tensor]:
+    num_heads = scenario.num_heads
+    num_kv_heads = scenario.num_kv_heads
+    q_lora_rank = scenario.q_lora_rank
+    qk_nope_head_dim = scenario.qk_nope_head_dim
+    qk_rope_head_dim = scenario.qk_rope_head_dim
+    v_head_dim = scenario.v_head_dim
+    rope_append = scenario.rope_append
+    if rope_append is False:
+        print("rope_append is False, setting num_heads to 64")
+        num_heads = 64
+    kv_lora_rank = scenario.kv_lora_rank
+    rope_config = RopeConfig(
+        hidden_size=scenario.hidden_size,
+        num_attention_heads=scenario.num_heads,
+        rope_scaling={
+            "beta_fast": scenario.rope_beta_fast,
+            "beta_slow": scenario.rope_beta_slow,
+            "factor": scenario.rope_factor,
+            "mscale": scenario.rope_mscale,
+            "mscale_all_dim": scenario.rope_mscale_all_dim,
+            "original_max_position_embeddings": scenario.rope_original_max_position_embeddings,
+            "type": scenario.rope_type,
+        },
+        max_position_embeddings=scenario.max_position_embeddings,
+        rope_theta=scenario.rope_theta,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        model_type=scenario.model_type,
+    )
+    kv_cache_tokens_per_block = scenario.kv_cache_tokens_per_block
+    num_layers = scenario.num_layers
+    device = torch.device("cuda")
+    dtype = scenario.dtype
+    kv_cache_dtype = scenario.kv_cache_dtype
+
+    assert sparse_topk % 128 == 0
+
+    print(
+        f"--------------------------------Test for scenario: {scenario} start--------------------------------"
+    )
+
+    return _run_test_for_backend(
+        backend_name,
+        num_heads,
+        num_kv_heads,
+        num_layers,
+        q_lora_rank,
+        kv_lora_rank,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        v_head_dim,
+        rope_append,
+        rope_config,
+        kv_cache_tokens_per_block,
+        device,
+        dtype,
+        kv_cache_dtype,
+        context_sequence_lengths,
+        generation_seq_len_q,
+        num_generation_steps,
+        sparse_topk,
+        seed,
+    )
+
+
+def _run_test_for_backend(
+    backend_name,
+    num_heads,
+    num_kv_heads,
+    num_layers,
+    q_lora_rank,
+    kv_lora_rank,
+    qk_nope_head_dim,
+    qk_rope_head_dim,
+    v_head_dim,
+    rope_append,
+    rope_config,
+    kv_cache_tokens_per_block,
+    device,
+    dtype,
+    kv_cache_dtype,
+    context_sequence_lengths,
+    generation_seq_len_q,
+    num_generation_steps,
+    sparse_topk,
+    seed,
+) -> dict[str, torch.Tensor]:
+    sparse_config = DeepSeekSparseAttentionConfig(
+        index_n_heads=64,
+        index_head_dim=128,
+        index_topk=sparse_topk,
+        skip_indexer_for_short_seqs=False,
+    )
+    is_vanilla = backend_name == "VANILLA"
+    AttentionCls = get_attention_backend(backend_name, sparse_config)
+    # When rope_append is False, [448: 512) are used for qk_rope_head_dim
+    kv_lora_rank = kv_lora_rank - qk_rope_head_dim if not rope_append else kv_lora_rank
+    head_dim = kv_lora_rank + qk_rope_head_dim
+
+    # Set seed for reproducibility.
+    torch.manual_seed(seed)
+
+    # Create inputs
+    inputs_per_layer = []
+    for _ in range(num_layers):
+        ctx_compressed_kv = torch.cat(
+            [
+                torch.empty(
+                    [ctx_len, kv_lora_rank],
+                    dtype=dtype,
+                    device=device,
+                ).uniform_(-1, 1)
+                for ctx_len in context_sequence_lengths
+            ]
+        )
+        ctx_k_pe = torch.cat(
+            [
+                torch.empty(
+                    [ctx_len, qk_rope_head_dim],
+                    dtype=dtype,
+                    device=device,
+                ).uniform_(-1, 1)
+                for ctx_len in context_sequence_lengths
+            ]
+        )
+        ctx_q = torch.cat(
+            [
+                torch.empty(
+                    [ctx_len, num_heads, kv_lora_rank],  # sparse MLA uses absorption mode
+                    dtype=dtype,
+                    device=device,
+                ).uniform_(-1, 1)
+                for ctx_len in context_sequence_lengths
+            ]
+        )
+        ctx_q_pe = torch.cat(
+            [
+                torch.empty(
+                    [ctx_len, num_heads, qk_rope_head_dim],
+                    dtype=dtype,
+                    device=device,
+                ).uniform_(-1, 1)
+                for ctx_len in context_sequence_lengths
+            ]
+        )
+        ctx_fused_q = torch.cat([ctx_q, ctx_q_pe], dim=-1).view(-1, num_heads * head_dim)
+
+        gen_compressed_kv_list = [
+            torch.cat(
+                [
+                    torch.empty(
+                        [generation_seq_len_q, kv_lora_rank],
+                        dtype=dtype,
+                        device=device,
+                    ).uniform_(-1, 1)
+                    for _ in context_sequence_lengths
+                ]
+            )
+            for _ in range(num_generation_steps)
+        ]
+        gen_k_pe_list = [
+            torch.cat(
+                [
+                    torch.empty(
+                        [generation_seq_len_q, qk_rope_head_dim],
+                        dtype=dtype,
+                        device=device,
+                    ).uniform_(-1, 1)
+                    for _ in context_sequence_lengths
+                ]
+            )
+            for _ in range(num_generation_steps)
+        ]
+        gen_q_list = [
+            torch.cat(
+                [
+                    torch.empty(
+                        [generation_seq_len_q, num_heads, kv_lora_rank],
+                        dtype=dtype,
+                        device=device,
+                    ).uniform_(-1, 1)
+                    for _ in context_sequence_lengths
+                ]
+            )
+            for _ in range(num_generation_steps)
+        ]
+        gen_q_pe_list = [
+            torch.cat(
+                [
+                    torch.empty(
+                        [generation_seq_len_q, num_heads, qk_rope_head_dim],
+                        dtype=dtype,
+                        device=device,
+                    ).uniform_(-1, 1)
+                    for _ in context_sequence_lengths
+                ]
+            )
+            for _ in range(num_generation_steps)
+        ]
+        gen_fused_q_list = [
+            torch.cat([gen_q_list[i], gen_q_pe_list[i]], dim=-1).view(-1, num_heads * head_dim)
+            for i in range(num_generation_steps)
+        ]
+
+        index_n_heads = sparse_config.index_n_heads
+        index_head_dim = sparse_config.index_head_dim
+        weight_scale = 0.02
+        inputs = {
+            "ctx_compressed_kv": ctx_compressed_kv,
+            "ctx_k_pe": ctx_k_pe,
+            "ctx_q_pe": ctx_q_pe,
+            "ctx_fused_q": ctx_fused_q,
+            "gen_compressed_kv_list": gen_compressed_kv_list,
+            "gen_k_pe_list": gen_k_pe_list,
+            "gen_fused_q_list": gen_fused_q_list,
+            "gen_q_pe_list": gen_q_pe_list,
+            "ctx_qr": torch.empty(
+                [sum(context_sequence_lengths), q_lora_rank], dtype=dtype, device=device
+            ).uniform_(-1, 1),
+            "ctx_hidden_states": torch.empty(
+                [sum(context_sequence_lengths), rope_config.hidden_size],
+                dtype=dtype,
+                device=device,
+            ).uniform_(-1, 1),
+            "gen_qr_list": [
+                torch.empty(
+                    [len(context_sequence_lengths) * generation_seq_len_q, q_lora_rank],
+                    dtype=dtype,
+                    device=device,
+                ).uniform_(-1, 1)
+                for _ in range(num_generation_steps)
+            ],
+            "gen_hidden_states_list": [
+                torch.empty(
+                    [
+                        len(context_sequence_lengths) * generation_seq_len_q,
+                        rope_config.hidden_size,
+                    ],
+                    dtype=dtype,
+                    device=device,
+                ).uniform_(-1, 1)
+                for _ in range(num_generation_steps)
+            ],
+            "indexer_weights": {
+                "wq_b": torch.empty(
+                    [index_n_heads * index_head_dim, q_lora_rank],
+                    dtype=dtype,
+                    device=device,
+                ).uniform_(-weight_scale, weight_scale),
+                "wk": torch.empty(
+                    [index_head_dim, rope_config.hidden_size],
+                    dtype=torch.float32,
+                    device=device,
+                ).uniform_(-weight_scale, weight_scale),
+                "weights_proj": torch.empty(
+                    [index_n_heads, rope_config.hidden_size],
+                    dtype=torch.float32,
+                    device=device,
+                ).uniform_(-weight_scale, weight_scale),
+            },
+        }
+        inputs_per_layer.append(inputs)
+        print(f"context sequence lengths: {context_sequence_lengths}")
+        for key, val in inputs.items():
+            if key.endswith("_list"):
+                print(f"{key}: [{val[0].shape}] * {len(val)}")
+            elif isinstance(val, dict):
+                print(f"{key}: {sorted(val)}")
+            else:
+                print(f"{key}: {val.shape}")
+
+    # Setup attention module and metadata
+    pos_embd_params = PositionalEmbeddingParams(
+        type=PositionEmbeddingType.yarn,
+        rope=RopeParams.from_config(rope_config),
+        is_neox=False,
+    )
+    mla_params = MLAParams(
+        q_lora_rank=q_lora_rank,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        qk_nope_head_dim=qk_nope_head_dim,
+        v_head_dim=v_head_dim,
+        rope_append=rope_append,
+        predicted_tokens_per_seq=1,
+        # Both backends build an indexer, whose projections are hidden-sized.
+        hidden_size=rope_config.hidden_size,
+    )
+
+    def yarn_get_mscale(scale=1, mscale=1):
+        if scale <= 1:
+            return 1.0
+        return 0.1 * mscale * math.log(scale) + 1.0
+
+    mscale_all_dim = pos_embd_params.rope.mscale_all_dim
+    scaling_factor = pos_embd_params.rope.scale
+    mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+    q_scaling = 1.0 / (mscale * mscale)
+
+    quant_config = None
+    if kv_cache_dtype == torch.float8_e4m3fn:
+        quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8.value)
+
+    def create_layer(layer_idx: int, num_kv_heads: int):
+        sparse_kwargs = (
+            {"sparse_params": sparse_config.to_sparse_params(layer_idx=layer_idx)}
+            if is_vanilla
+            else {"sparse_attention_config": sparse_config}
+        )
+        return AttentionCls(
+            layer_idx=layer_idx,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_kv_heads=num_kv_heads,
+            quant_config=quant_config,
+            q_scaling=q_scaling,
+            pos_embd_params=pos_embd_params,
+            mla_params=mla_params,
+            dtype=dtype,
+            **sparse_kwargs,
+        )
+
+    ctx_layers = [create_layer(layer_idx, num_kv_heads) for layer_idx in range(num_layers)]
+    gen_layers = [create_layer(layer_idx, 1) for layer_idx in range(num_layers)]
+    if is_vanilla:
+        assert all(type(layer) is DSAVanillaAttention for layer in ctx_layers + gen_layers)
+    for layer_idx, (ctx_layer, gen_layer) in enumerate(zip(ctx_layers, gen_layers, strict=True)):
+        weights = inputs_per_layer[layer_idx]["indexer_weights"]
+        for layer in (ctx_layer, gen_layer):
+            layer.indexer.to(device)
+            layer.indexer.requires_grad_(False)
+            with torch.no_grad():
+                layer.indexer.wq_b.weight.copy_(weights["wq_b"])
+                layer.indexer.wk.weight.copy_(weights["wk"])
+                layer.indexer.weights_proj.weight.copy_(weights["weights_proj"])
+            layer.indexer.cache_derived_state()
+
+    # NOTE: set up metadata, refer to tensorrt_llm/_torch/pyexecutor/model_engine.py
+    # all layers share the same metadata
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    max_context_sequence_length = max(context_sequence_lengths)
+    max_num_contexts = len(context_sequence_lengths)
+    max_tokens = (
+        (
+            max_context_sequence_length
+            + (num_generation_steps + 1) * generation_seq_len_q
+            + kv_cache_tokens_per_block
+            - 1
+        )
+        // kv_cache_tokens_per_block
+        * kv_cache_tokens_per_block
+        * max_num_contexts
+    )
+    # The static token-sparse context FMHA may load KV rows beyond the selected ones, and its
+    # TMA descriptor does not bound rows to the pool. A pool sized only for these short
+    # sequences (a single 64-token block for context_sequence_lengths=[10]) can therefore be
+    # read past its end, which faults whenever the following address range is unmapped. Keep
+    # at least TopK rows in the pool, as any real deployment does.
+    max_tokens = max(max_tokens, SPARSE_TOPK)
+
+    pretrained_config = SimpleNamespace(
+        rms_norm_eps=1e-6,
+    )
+    model_config = ModelConfig(
+        mapping=mapping,
+        sparse_attention_config=sparse_config,
+        pretrained_config=pretrained_config,
+    )
+    kv_cache_manager = DSACacheManager(
+        KvCacheConfig(
+            max_tokens=max_tokens,
+            enable_block_reuse=False,
+        ),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
+        num_layers=num_layers,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        tokens_per_block=kv_cache_tokens_per_block,
+        max_seq_len=max_context_sequence_length + (num_generation_steps + 1) * generation_seq_len_q,
+        max_batch_size=max_num_contexts,
+        mapping=mapping,
+        dtype=str_dtype_to_binding(torch_dtype_to_str(kv_cache_dtype)),
+        sparse_attn_config=sparse_config,
+        model_config=model_config,
+    )
+    outputs = {}
+    try:
+        request_ids = list(range(max_num_contexts))
+        kv_cache_manager.add_dummy_requests(request_ids, context_sequence_lengths)
+        # Both backends use the DSA metadata: the vanilla backend runs the same
+        # indexer plumbing and only swaps the selection kernels for torch.
+        metadata_sparse_kwargs = {"sparse_attention_config": sparse_config}
+
+        ctx_seq_lens = torch.tensor(context_sequence_lengths, dtype=torch.int)
+        total_ctx_tokens = sum(context_sequence_lengths)
+        attn_metadata = AttentionCls.Metadata(
+            seq_lens=ctx_seq_lens,
+            request_ids=request_ids,
+            max_num_requests=max_num_contexts,
+            num_contexts=max_num_contexts,
+            prompt_lens=context_sequence_lengths,
+            max_num_tokens=total_ctx_tokens,
+            kv_cache_manager=kv_cache_manager,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[0 for _ in context_sequence_lengths],
+            ),
+            mapping=mapping,
+            **metadata_sparse_kwargs,
+        )
+        attn_metadata.prepare()
+
+        # run forward for each step and each layer
+        for step in range(num_generation_steps + 1):
+            if step > 0:
+                _allocate_kv_cache_for_generation(
+                    kv_cache_manager, request_ids, generation_seq_len_q
+                )
+                gen_seq_lens = torch.tensor(
+                    [generation_seq_len_q] * max_num_contexts, dtype=torch.int
+                )
+                total_gen_tokens = max_num_contexts * generation_seq_len_q
+                attn_metadata = AttentionCls.Metadata(
+                    seq_lens=gen_seq_lens,
+                    request_ids=request_ids,
+                    max_num_requests=max_num_contexts,
+                    num_contexts=0,
+                    prompt_lens=context_sequence_lengths,
+                    max_num_tokens=total_gen_tokens,
+                    kv_cache_manager=kv_cache_manager,
+                    kv_cache_params=KVCacheParams(
+                        use_cache=True,
+                        num_cached_tokens_per_seq=[
+                            ctx_len + (step - 1) * generation_seq_len_q
+                            for ctx_len in context_sequence_lengths
+                        ],
+                    ),
+                    mapping=mapping,
+                    enable_flash_mla=torch.cuda.get_device_capability() == (9, 0),
+                    **metadata_sparse_kwargs,
+                )
+                attn_metadata.update_spec_dec_param(
+                    batch_size=max_num_contexts,
+                    is_spec_decoding_enabled=False,
+                    is_spec_dec_tree=False,
+                    is_spec_dec_dynamic_tree=False,
+                    max_draft_len=generation_seq_len_q - 1,
+                    max_total_draft_tokens=generation_seq_len_q - 1,
+                )
+                attn_metadata.prepare()
+                # The executor refreshes device-side metadata after prepare() on
+                # every step; the CuTe DSL paged-MQA atom split reads its
+                # expanded schedule from this refresh.
+                attn_metadata.on_update_kv_lens()
+            for layer_idx in range(num_layers):
+                print(f"---- step {step} layer {layer_idx} start ----")
+                if step == 0:
+                    fused_q = inputs_per_layer[layer_idx]["ctx_fused_q"]
+                    compressed_kv = inputs_per_layer[layer_idx]["ctx_compressed_kv"]
+                    k_pe = inputs_per_layer[layer_idx]["ctx_k_pe"]
+                    latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
+                    q_pe = inputs_per_layer[layer_idx]["ctx_q_pe"]
+                    ctx_fused_q, ctx_latent = fused_q, latent_cache
+                    position_ids = torch.cat(
+                        [
+                            torch.arange(seq_len, dtype=torch.int32, device=device)
+                            for seq_len in context_sequence_lengths
+                        ]
+                    )
+                    with torch.inference_mode():
+                        indexer_intermediates = list(
+                            ctx_layers[layer_idx].indexer.pre_indexer_proj(
+                                inputs_per_layer[layer_idx]["ctx_qr"],
+                                inputs_per_layer[layer_idx]["ctx_hidden_states"],
+                                position_ids,
+                            )
+                        )
+                        ctx_layers[layer_idx].indexer._update_k_cache(
+                            indexer_intermediates[1], indexer_intermediates[2], attn_metadata
+                        )
+                        indexer_topk = (
+                            ctx_layers[layer_idx]
+                            .indexer.forward_from_projected(
+                                attn_metadata,
+                                ctx_fused_q,
+                                indexer_intermediates,
+                                is_generation=False,
+                            )
+                            .detach()
+                            .clone()
+                        )
+                    ctx_sba = DSABackendForwardArgs(indexer_intermediates=indexer_intermediates)
+                    with patch.object(
+                        ctx_layers[layer_idx].indexer,
+                        "forward_from_projected",
+                        return_value=indexer_topk,
+                    ):
+                        result = ctx_layers[layer_idx].forward(
+                            ctx_fused_q.clone(),
+                            None,
+                            None,
+                            attn_metadata,
+                            attention_input_type=AttentionInputType.context_only,
+                            latent_cache=ctx_latent.clone(),
+                            q_pe=q_pe,
+                            sparse_backend_args=ctx_sba,
+                        )
+                else:
+                    fused_q = inputs_per_layer[layer_idx]["gen_fused_q_list"][step - 1]
+                    q_pe = inputs_per_layer[layer_idx]["gen_q_pe_list"][step - 1]
+                    compressed_kv = inputs_per_layer[layer_idx]["gen_compressed_kv_list"][step - 1]
+                    k_pe = inputs_per_layer[layer_idx]["gen_k_pe_list"][step - 1]
+                    latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
+                    cached_lens = [
+                        ctx_len + (step - 1) * generation_seq_len_q
+                        for ctx_len in context_sequence_lengths
+                    ]
+                    position_ids = torch.cat(
+                        [
+                            torch.arange(
+                                cached_len,
+                                cached_len + generation_seq_len_q,
+                                dtype=torch.int32,
+                                device=device,
+                            )
+                            for cached_len in cached_lens
+                        ]
+                    )
+                    with torch.inference_mode():
+                        indexer_intermediates = list(
+                            gen_layers[layer_idx].indexer.pre_indexer_proj(
+                                inputs_per_layer[layer_idx]["gen_qr_list"][step - 1],
+                                inputs_per_layer[layer_idx]["gen_hidden_states_list"][step - 1],
+                                position_ids,
+                            )
+                        )
+                        gen_layers[layer_idx].indexer._update_k_cache(
+                            indexer_intermediates[1], indexer_intermediates[2], attn_metadata
+                        )
+                        indexer_topk = (
+                            gen_layers[layer_idx]
+                            .indexer.forward_from_projected(
+                                attn_metadata,
+                                fused_q,
+                                indexer_intermediates,
+                                is_generation=True,
+                            )
+                            .detach()
+                            .clone()
+                        )
+                    num_tokens = fused_q.size(0)
+                    num_seqs = attn_metadata.kv_lens_cuda_runtime.size(0)
+                    cu_q_seqlens = torch.empty(
+                        num_seqs + 1, dtype=torch.int32, device=fused_q.device
+                    )
+                    cu_kv_seqlens = torch.empty(
+                        num_seqs + 1, dtype=torch.int32, device=fused_q.device
+                    )
+                    fmha_scheduler_counter = torch.empty(
+                        1, dtype=torch.uint32, device=fused_q.device
+                    )
+                    has_fp8_kv_cache = getattr(gen_layers[layer_idx], "has_fp8_kv_cache", False)
+                    if has_fp8_kv_cache:
+                        mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=fused_q.device)
+                        mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=fused_q.device)
+                        quant_q_buffer = torch.empty(
+                            num_tokens,
+                            num_heads * head_dim,
+                            dtype=torch.uint8,
+                            device=fused_q.device,
+                        )
+                    else:
+                        mla_bmm1_scale = None
+                        mla_bmm2_scale = None
+                        quant_q_buffer = None
+
+                    # Exercise the backend entry point on both sides. Vanilla's
+                    # fake-fused implementation uses only torch operations.
+                    gen_layers[layer_idx].mla_rope_generation(
+                        fused_q,
+                        q_pe,
+                        latent_cache,
+                        attn_metadata,
+                        cu_q_seqlens,
+                        cu_kv_seqlens,
+                        fmha_scheduler_counter,
+                        mla_bmm1_scale,
+                        mla_bmm2_scale,
+                        quant_q_buffer,
+                    )
+                    backend_fused_q = fused_q
+                    backend_latent_cache = latent_cache
+                    sparse_backend_args = DSABackendForwardArgs(
+                        indexer_intermediates=indexer_intermediates
+                    )
+                    generation_kwargs = {
+                        "cu_q_seqlens": cu_q_seqlens,
+                        "cu_kv_seqlens": cu_kv_seqlens,
+                        "fmha_scheduler_counter": fmha_scheduler_counter,
+                        "mla_bmm1_scale": mla_bmm1_scale,
+                        "mla_bmm2_scale": mla_bmm2_scale,
+                        "quant_q_buffer": quant_q_buffer,
+                        "sparse_backend_args": sparse_backend_args,
+                    }
+                    with patch.object(
+                        gen_layers[layer_idx].indexer,
+                        "forward_from_projected",
+                        return_value=indexer_topk,
+                    ):
+                        result = gen_layers[layer_idx].forward(
+                            backend_fused_q,
+                            None,
+                            None,
+                            attn_metadata,
+                            attention_input_type=AttentionInputType.generation_only,
+                            latent_cache=backend_latent_cache,
+                            q_pe=q_pe,
+                            **generation_kwargs,
+                        )
+                # Record results for the Vanilla-golden comparison.
+                print(
+                    f"{backend_name} output mean: {result.abs().mean().item()}, max: {result.abs().max().item()}"
+                )
+                print(
+                    f"Test for sparse MLA in {backend_name} backend passed at layer {layer_idx} in step {step}"
+                )
+                print(f"---- step {step} layer {layer_idx} end ----")
+                phase = "context" if step == 0 else f"generation_{step - 1}"
+                outputs[f"{phase}_layer_{layer_idx}"] = result.detach().clone()
+                outputs[f"indexer_{phase}_layer_{layer_idx}"] = torch.sort(
+                    indexer_topk, dim=-1
+                ).values.clone()
+
+        print(f"Test for sparse MLA in {backend_name} backend passed")
+        return outputs
+    finally:
+        kv_cache_manager.shutdown()
+
+
+if __name__ == "__main__":
+    test_sparse_attention_mla(
+        scenario=scenarios[0],
+        context_sequence_lengths=context_sequence_lengths[0],
+        generation_seq_len_q=generation_seq_len_q[0],
+        num_generation_steps=num_generation_steps[0],
+        sparse_topk=SPARSE_TOPK,
+    )

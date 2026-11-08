@@ -1,0 +1,61 @@
+deepseek-ai/DeepSeek-R1:
+  - quant_algo: NVFP4
+    accuracy: 70.45
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 70.06
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 70.45
+deepseek-ai/DeepSeek-V3.2-Exp:
+  - quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    accuracy: 80.0
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 80.0
+  - quant_algo: FP8_BLOCK_SCALES
+    spec_dec_algo: MTP
+    accuracy: 80.0
+  - quant_algo: NVFP4
+    accuracy: 80.0
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 80.0
+GPT-OSS/120B-MXFP4:
+  - accuracy: 65.0
+  - spec_dec_algo: Eagle
+    accuracy: 65.0
+  - spec_dec_algo: Eagle3
+    accuracy: 65.0
+  - quant_algo: W4A8_MXFP4_MXFP8
+    accuracy: 65.0
+  - quant_algo: W4A8_MXFP4_MXFP8
+    spec_dec_algo: Eagle
+    accuracy: 65.0
+  - quant_algo: W4A8_MXFP4_MXFP8
+    spec_dec_algo: Eagle3
+    accuracy: 64.0
+  - quant_algo: W4A8_MXFP4_MXFP8
+    kv_cache_quant_algo: FP8
+    accuracy: 64.0
+  - quant_algo: W4A16_MXFP4
+    accuracy: 65.0
+  - quant_algo: W4A16_MXFP4
+    spec_dec_algo: Eagle
+    accuracy: 65.0
+  - quant_algo: W4A16_MXFP4
+    spec_dec_algo: Eagle3
+    accuracy: 65.0
+  - quant_algo: W4A16_MXFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 65.0
+moonshotai/Kimi-K3:
+  # The official 93.5 result used a 65,536-token output budget, which would make the test take much
+  # longer to complete; CI uses 32,768 output tokens instead as a result.
+  # The below is the official quality reference, not the expected shortened-run score.
+  # The hypothesis harness lowers 93.5 to an 85.234 acceptance threshold; expected accuracy with the
+  # 32K budget is 90.404%. Using that score as the reference would lower the gate even further,
+  # allowing larger regressions. If repeated 32K runs cannot reliably clear 85.234, revisit the
+  # token cap rather than weaken the provider's official quality reference.
+  - accuracy: 93.5

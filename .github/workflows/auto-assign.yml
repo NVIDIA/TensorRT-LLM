@@ -1,0 +1,43 @@
+name: auto-assign
+on:
+  issues:
+    types:
+      - labeled
+
+jobs:
+  assign_issue:
+    # Only run on module label colors.
+    if: ${{ github.event.label.color == '00611d' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Get assignee
+        uses: actions/github-script@v8
+        id: get-assignee
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const fs = require('fs');
+
+            // Read configuration file
+            const config = JSON.parse(fs.readFileSync('.github/workflows/module-owners.json', 'utf8'));
+
+            // Find matching label in config
+            for (const [configLabel, users] of Object.entries(config)) {
+              if (configLabel == "${{ github.event.label.name}}") {
+                // Select Randomly
+                const index = Math.floor(Math.random() * users.length)
+                const assignee = users[index % users.length];
+                return assignee
+              }
+            }
+            // Returning empty string in case a valid assignee is not found.
+            return ""
+          result-encoding: string
+
+      - name: Assign
+        run: gh issue edit ${{ github.event.issue.number }} --add-label "triaged" --add-label "investigating" --add-assignee ${{ steps.get-assignee.outputs.result }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

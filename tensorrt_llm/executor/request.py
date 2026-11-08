@@ -1,0 +1,336 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import warnings
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import List, Optional, Union
+
+import numpy as np
+import torch
+
+from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.kv_hints import KvHintsInput
+from tensorrt_llm.kv_hints.protocol import snapshot_kv_hints
+
+from ..conversation_params import ConversationParams
+from ..disaggregated_params import DisaggregatedParams
+from ..llmapi.llm_utils import KvCacheRetentionConfig
+from ..sampling_params import SamplingParams
+from ..scheduling_params import SchedulingParams
+from .postproc_worker import PostprocParams
+
+__all__ = [
+    "DEFAULT_REQUEST_PRIORITY",
+    "LoRARequest",
+    "PromptAdapterRequest",
+    "GenerationRequest",
+    "TruncateKVCacheRequest",
+    "CancellingRequest",
+    "StartProfileRequest",
+    "StopProfileRequest",
+]
+
+# Mirrors C++ executor.h Request::kDefaultPriority
+DEFAULT_REQUEST_PRIORITY: float = 0.5
+
+
+@dataclass(slots=True)
+class LoRARequest:
+    """ Request for a LoRA adapter. """
+    lora_name: str
+    lora_int_id: int
+    lora_path: str = ""
+    lora_ckpt_source: str = "hf"
+
+    def __post_init__(self):
+        if self.lora_ckpt_source not in ["hf", "nemo"]:
+            raise ValueError(
+                f"lora_ckpt_source must be 'hf' or 'nemo', got '{self.lora_ckpt_source}'"
+            )
+
+    @property
+    def adapter_id(self):
+        return self.lora_int_id
+
+    @property
+    def name(self):
+        return self.lora_name
+
+    @property
+    def path(self):
+        return self.lora_path
+
+    @property
+    def ckpt_source(self):
+        return self.lora_ckpt_source
+
+
+@dataclass(slots=True)
+class PromptAdapterRequest:
+    """
+    Deprecated compatibility container for unsupported prompt adapters.
+    """
+    prompt_adapter_name: str
+    prompt_adapter_id: int
+    prompt_adapter_local_path: str = ""
+
+    def __post_init__(self):
+        if not os.path.exists(self.prompt_adapter_local_path):
+            raise RuntimeError(
+                f"prompt_adapter_local_path ({self.prompt_adapter_local_path}) does not exist."
+            )
+
+    @property
+    def adapter_id(self):
+        return self.prompt_adapter_id
+
+    @property
+    def name(self):
+        return self.prompt_adapter_name
+
+    @property
+    def local_path(self):
+        return self.prompt_adapter_local_path
+
+
+class GenerationRequest:
+    # Mirrors C++ Request::Impl::kMaxCacheSaltLength
+    MAX_CACHE_SALT_LEN: int = 256
+
+    def __init__(
+        self,
+        prompt_token_ids: Union[torch.Tensor, np.ndarray,
+                                Union[List[int], List[List[int]]]],
+        sampling_params: SamplingParams,
+        lora_request: Optional[LoRARequest] = None,
+        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        streaming: bool = False,
+        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
+        disaggregated_params: Optional[DisaggregatedParams] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
+        postproc_params: Optional[PostprocParams] = None,
+        multimodal_params: Optional[MultimodalParams] = None,
+        scheduling_params: Optional[SchedulingParams] = None,
+        conversation_params: Optional[ConversationParams] = None,
+        cache_salt: Optional[str] = None,
+        arrival_time: Optional[float] = None,
+        encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
+                                                list]] = None,
+        priority: float = DEFAULT_REQUEST_PRIORITY,
+        kv_hints: Optional[KvHintsInput] = None,
+    ):
+        if prompt_adapter_request is not None:
+            warnings.warn(
+                "prompt_adapter_request is deprecated and will be removed in a future release. "
+                "Prompt adapters are unsupported; omit this argument or pass None.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if isinstance(prompt_token_ids, list):
+            self.prompt_token_ids = prompt_token_ids
+        elif isinstance(prompt_token_ids, (torch.Tensor, np.ndarray)):
+            if prompt_token_ids.ndim == 1:
+                # A flat array goes straight into the int32 wire buffer that
+                # __setstate__ also produces, so neither this process nor the
+                # pickle path builds one Python int per token; the list is
+                # materialized lazily by the `prompt_token_ids` property.
+                if isinstance(prompt_token_ids, torch.Tensor):
+                    prompt_token_ids = prompt_token_ids.cpu().numpy()
+                self._prompt_token_ids = None
+                # Always a copy: the caller may reuse or mutate its array.
+                self._prompt_token_ids_i32 = np.array(prompt_token_ids,
+                                                      dtype=np.int32,
+                                                      order="C")
+            else:
+                self.prompt_token_ids = prompt_token_ids.tolist()
+        else:
+            raise TypeError(
+                f"prompt_token_ids ({prompt_token_ids}) should be an instance of torch.Tensor, np.ndarray or list"
+            )
+
+        # NOTE: Exercise caution when adding memory intense attributes, because the current implementation might lead to leaks without manual cleanup.
+        # Refer to https://github.com/NVIDIA/TensorRT-LLM/pull/5029#discussion_r2141859873 for details.
+        self.sampling_params = sampling_params
+        self.postproc_params = postproc_params
+        self.lora_request = lora_request
+        self.prompt_adapter_request = prompt_adapter_request
+        self.streaming = streaming
+        self.multimodal_params = multimodal_params
+        self.kv_cache_retention_config = kv_cache_retention_config
+        self.id: Optional[int] = None
+        self.disaggregated_params = disaggregated_params
+        self.trace_headers = trace_headers
+        self.scheduling_params = scheduling_params
+        self.conversation_params = conversation_params
+        self.kv_hints = snapshot_kv_hints(kv_hints)
+        if cache_salt is not None:
+            if not isinstance(cache_salt, str):
+                raise TypeError(
+                    f"cache_salt must be str or None, got {type(cache_salt).__name__}"
+                )
+            # The C++ side validates against UTF-8 byte length, so do the same here
+            # (Python `len()` would count Unicode code points, which can pass this
+            # guard but fail at C++ dispatch for non-ASCII salts).
+            cache_salt_byte_len = len(cache_salt.encode("utf-8"))
+            if cache_salt_byte_len > self.MAX_CACHE_SALT_LEN:
+                raise ValueError(
+                    f"cache_salt UTF-8 byte length ({cache_salt_byte_len}) "
+                    f"exceeds the maximum supported length "
+                    f"({self.MAX_CACHE_SALT_LEN}).")
+        self.cache_salt = cache_salt
+        self.arrival_time = arrival_time
+        self.encoder_input_token_ids = self._normalize_optional_token_ids(
+            encoder_input_token_ids, "encoder_input_token_ids")
+        if not (0.0 <= priority <= 1.0):
+            raise ValueError(
+                f"priority must be a float in [0.0, 1.0], got {priority}")
+        self.priority = priority
+
+    @staticmethod
+    def _normalize_optional_token_ids(token_ids: Optional[Union[torch.Tensor,
+                                                                np.ndarray,
+                                                                list]],
+                                      name: str) -> Optional[list]:
+        if token_ids is None:
+            return None
+        if isinstance(token_ids, list):
+            return token_ids
+        if isinstance(token_ids, (torch.Tensor, np.ndarray)):
+            return token_ids.tolist()
+        raise TypeError(
+            f"{name} ({token_ids}) should be an instance of torch.Tensor, np.ndarray or list"
+        )
+
+    def set_id(self, id):
+        assert self.id is None, f"Request ID is already set: {self.id}"
+        self.id = id
+        return self
+
+    # --- int32 token-id wire serialization + LAZY list materialization ----------
+    # Pickling a flat list[int] on the hot proxy->worker RPC-submit path emits one
+    # PyLong frame per token (O(ISL)). Encode token-ids as int32 bytes for the wire.
+    # On decode we DO NOT eagerly rebuild the list: stash the int32 ndarray in
+    # `_prompt_token_ids_i32` (the C++ Request ctor memcpy's it -- see
+    # base_worker._enqueue_request) and leave the backing `_prompt_token_ids` None.
+    # The list is built lazily (and cached) by the `prompt_token_ids` property below
+    # only if a consumer actually reads it (e.g. prompt-logprobs).
+    # Plain decode never reads it -> the O(ISL) `.tolist()` never runs.
+    #
+    # NOTE: implemented as a *property* (scoped to this one name), NOT a class-level
+    # __getattr__. A __getattr__ is invoked by the interpreter on EVERY missing
+    # attribute access on the object -- hasattr()/getattr(default) probes, copy/
+    # pickle dunder lookups, duck-typing -- each paying a Python frame + an
+    # AttributeError raise. A property has identical lazy-materialize behavior with
+    # zero blast radius on any other attribute.
+    _I32 = "\x00i32be"
+
+    @property
+    def prompt_token_ids(self):
+        ptids = self.__dict__.get("_prompt_token_ids")
+        if ptids is None:
+            buf = self.__dict__.get("_prompt_token_ids_i32")
+            if buf is not None:
+                ptids = buf.tolist()
+                self._prompt_token_ids = ptids  # cache
+        # Callers that mutate this returned list in place must clear
+        # `_prompt_token_ids_i32`; base_worker assumes both forms stay synced.
+        return ptids
+
+    @prompt_token_ids.setter
+    def prompt_token_ids(self, value):
+        self._prompt_token_ids = value
+        # base_worker hands the int32 buffer to the engine when it exists, so a
+        # replaced prompt must not leave the old tokens behind in it.
+        self._prompt_token_ids_i32 = None
+
+    @staticmethod
+    def _enc_tokens(v):
+        # flat list[int] -> (_I32, int32 bytes); leave None / list[list[int]] /
+        # ndarray untouched.
+        if type(v) is list and (len(v) == 0 or type(v[0]) is int):
+            return (GenerationRequest._I32,
+                    np.asarray(v, dtype=np.int32).tobytes())
+        return v
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        buf = state.pop("_prompt_token_ids_i32", None)
+        ptids = state.get("_prompt_token_ids")
+        if ptids is not None:
+            state["_prompt_token_ids"] = GenerationRequest._enc_tokens(ptids)
+        elif buf is not None:
+            # not yet materialized -> encode the buffer's bytes directly
+            state["_prompt_token_ids"] = (GenerationRequest._I32, buf.tobytes())
+        return state
+
+    def __setstate__(self, state):
+        state.setdefault("kv_hints", None)
+        buf = None
+        pt = state.get("_prompt_token_ids")
+        if type(pt) is tuple and len(
+                pt) == 2 and pt[0] == GenerationRequest._I32:
+            buf = np.frombuffer(pt[1], dtype=np.int32)
+            state["_prompt_token_ids"] = None  # leave None -> lazy via property
+        self.__dict__.update(state)
+        self._prompt_token_ids_i32 = buf
+
+
+class TruncateKVCacheRequest:
+
+    def __init__(self, messages_to_retain: List[int], messages: List[int]):
+        self.messages_to_retain = messages_to_retain
+        self.messages = messages
+
+
+class CancellingRequest:
+    """The request to cancel a generation."""
+
+    def __init__(self, id: int):
+        self.id = id
+
+
+class StartProfileRequest:
+    """Request the IPC worker to start runtime profiling.
+
+    Carries the same arguments as ``LLM.start_profile`` / the HTTP
+    ``/start_profile`` endpoint so the worker can forward them to
+    ``PyExecutor.start_profile``.
+    """
+
+    def __init__(self,
+                 output_dir=None,
+                 num_steps=None,
+                 start_step: int = 0,
+                 activities=None,
+                 ack_addr=None):
+        self.output_dir = output_dir
+        self.num_steps = num_steps
+        self.start_step = start_step
+        self.activities = activities
+        # (endpoint, hmac_key) of the proxy's ack channel. The proxy only
+        # binds that socket when profiling is first requested, so the
+        # address travels with the request rather than being handed to the
+        # worker at startup.
+        self.ack_addr = ack_addr
+
+
+class StopProfileRequest:
+    """Request the IPC worker to stop runtime profiling."""
+
+    def __init__(self, ack_addr=None):
+        # See StartProfileRequest.ack_addr.
+        self.ack_addr = ack_addr

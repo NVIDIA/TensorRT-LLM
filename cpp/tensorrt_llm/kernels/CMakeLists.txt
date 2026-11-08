@@ -1,0 +1,187 @@
+#
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
+# AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not
+# use this file except in compliance with the License. You may obtain a copy of
+# the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations under
+# the License.
+#
+
+add_subdirectory(cutlass_kernels)
+add_subdirectory(moe)
+add_subdirectory(flashMLA)
+add_subdirectory(contextFusedMultiHeadAttention)
+add_subdirectory(decoderMaskedMultiheadAttention)
+add_subdirectory(selectiveScan)
+add_subdirectory(userbuffers)
+add_subdirectory(trtllmGenKernels)
+add_subdirectory(fusedLayernormKernels)
+add_subdirectory(groupRmsNormKernels)
+add_subdirectory(llama4MinLatencyKernels)
+add_subdirectory(dsv3MinLatencyKernels)
+add_subdirectory(causalConv1d)
+add_subdirectory(fusedGatedRMSNormQuant)
+add_subdirectory(mamba2MTPSSMCache)
+add_subdirectory(kdaDecode)
+add_subdirectory(kimiK3AttnRes)
+add_subdirectory(mhcKernels)
+add_subdirectory(compressorKernels)
+add_subdirectory(fusedSampling)
+
+file(GLOB_RECURSE SRC_CPP *.cpp)
+file(GLOB_RECURSE SRC_CU *.cu)
+
+list(REMOVE_ITEM SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/kvCachePartialCopy.cu")
+add_library(tllm_kernel_kv_cache_copy STATIC kvCachePartialCopy.cu)
+add_library(tllm::kernel_kv_cache_copy ALIAS tllm_kernel_kv_cache_copy)
+target_link_libraries(tllm_kernel_kv_cache_copy PUBLIC tllm::common_cuda)
+target_compile_features(tllm_kernel_kv_cache_copy PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_kernel_kv_cache_copy PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                       CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_cuda_architectures(tllm_kernel_kv_cache_copy 89)
+
+# Exclude files in the cutlass_kernels, decoderMaskedMultiheadAttention and
+# selectiveScan trtllmGenKernels folder
+list(FILTER SRC_CPP EXCLUDE REGEX "cutlass_kernels/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "cutlass_kernels/.*")
+# Everything under moe/ is that directory's own business: its backend
+# sub-directories build their own targets, and moe/CMakeLists.txt hands the rest
+# back as MOE_KERNELS_SRC, which joins kernels_src below. Anchored on
+# "/kernels/" because the glob above yields absolute paths.
+list(FILTER SRC_CPP EXCLUDE REGEX "/kernels/moe/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "/kernels/moe/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "flashMLA/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "flashMLA/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "contextFusedMultiHeadAttention/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "contextFusedMultiHeadAttention/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "decoderMaskedMultiheadAttention/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "trtllmGenKernels/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "trtllmGenKernels/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "selectiveScan/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "selectiveScan/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "userbuffers/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "userbuffers/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "fusedLayernormKernels/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "fusedGatedRMSNormQuant/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "mamba2MTPSSMCache/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "kdaDecode/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "kdaDecode/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "kimiK3AttnRes/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "kimiK3AttnRes/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "mhcKernels/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "mhcKernels/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "compressorKernels/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "compressorKernels/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "fusedSampling/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "fusedSampling/.*")
+# Marlin is built as its own architecture-scoped OBJECT library below.
+list(FILTER SRC_CPP EXCLUDE REGEX "marlin/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "marlin/.*")
+# The MiniMax-M3 decode attention kernels are built as their own
+# architecture-scoped OBJECT library below.
+list(FILTER SRC_CU EXCLUDE REGEX
+     "minimaxM3/(fusedDecodeAttn|attnMega|attnC1)\\.cu$")
+# The MiniMax-M3 sm_107 decode kernels are built as their own sm_107-only OBJECT
+# library below.
+list(FILTER SRC_CU EXCLUDE REGEX "minimaxM3Sm107(Tp[248])?/.*")
+
+if(NOT ENABLE_MULTI_DEVICE)
+  list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
+endif()
+
+# Lower CUDA optimization level when FAST_BUILD is enabled to speed up
+# compilation. CMake by default adds -O3 to CMAKE_CUDA_FLAGS_RELEASE. We
+# override it here before creating the target to avoid the "incompatible
+# redefinition" warning.
+if(FAST_BUILD)
+  string(REPLACE "-O3" "-O1" CMAKE_CUDA_FLAGS_RELEASE
+                 "${CMAKE_CUDA_FLAGS_RELEASE}")
+  string(REPLACE "-O3" "-O1" CMAKE_CUDA_FLAGS_RELWITHDEBINFO
+                 "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}")
+  message(
+    STATUS "FAST_BUILD enabled for kernels: using -O1 for CUDA compilation")
+endif()
+
+include(kernelComponents.cmake)
+set(TLLM_KERNEL_COMPONENT_TARGETS
+    ${TLLM_KERNEL_COMPONENT_TARGETS}
+    PARENT_SCOPE)
+
+# Marlin NVFP4: build Ada/Hopper kernels and the dense W4A16/repack kernels used
+# on SM12x. Unsupported device passes emit empty kernel stubs.
+file(GLOB_RECURSE MARLIN_SRC "marlin/*.cu" "marlin/*.cpp")
+if(MARLIN_SRC)
+  add_library(marlin_src OBJECT ${MARLIN_SRC})
+  set_property(TARGET marlin_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+  set_property(TARGET marlin_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  target_include_directories(
+    marlin_src
+    PRIVATE
+      $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
+  )
+  target_link_libraries(marlin_src PRIVATE trtllm_gen_fmha_interface)
+  set_cuda_architectures(marlin_src 89 90 120f)
+endif()
+
+# MiniMax-M3 decode attention: block-scaled tcgen05 MMAs (.scale_vec::1X) exist
+# on the arch-specific sm_100a / sm_103a targets only, not on the sm_100f family
+# target the rest of this library builds. Other targets compile kernels that
+# trap.
+add_library(
+  minimax_m3_attn_src OBJECT minimaxM3/fusedDecodeAttn.cu minimaxM3/attnMega.cu
+                             minimaxM3/attnC1.cu)
+set_property(TARGET minimax_m3_attn_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET minimax_m3_attn_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+set_cuda_architectures(minimax_m3_attn_src 100 103)
+
+# MiniMax-M3 sm_107 decode kernels (minimaxM3Sm107Tp{2,4,8}/): written for
+# sm_107 only (PDL griddepcontrol, sm_10x-only PTX), so they are compiled for
+# the sm_10x entries of this build's architectures only (the same targets, e.g.
+# the sm_100f family, that kernels_src compiles its sm_10x code for), not for
+# the older ones. A build without an sm_10x architecture compiles them for
+# sm_107a: their torch ops link against the host launchers, and only the sm_107
+# targets launch them.
+file(GLOB MINIMAX_M3_SM107_SRC minimaxM3Sm107/*.cu minimaxM3Sm107Tp2/*.cu
+     minimaxM3Sm107Tp4/*.cu minimaxM3Sm107Tp8/*.cu)
+add_library(minimax_m3_sm107_src OBJECT ${MINIMAX_M3_SM107_SRC})
+set_property(TARGET minimax_m3_sm107_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET minimax_m3_sm107_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
+                                                  ON)
+target_include_directories(
+  minimax_m3_sm107_src
+  PRIVATE
+    $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
+)
+target_link_libraries(minimax_m3_sm107_src PRIVATE trtllm_gen_fmha_interface)
+set(MINIMAX_M3_SM107_ARCHS ${CMAKE_CUDA_ARCHITECTURES})
+list(FILTER MINIMAX_M3_SM107_ARCHS INCLUDE REGEX "^10[0-9]")
+if(NOT MINIMAX_M3_SM107_ARCHS)
+  set(MINIMAX_M3_SM107_ARCHS 107a-real)
+endif()
+set_property(TARGET minimax_m3_sm107_src PROPERTY CUDA_ARCHITECTURES
+                                                  ${MINIMAX_M3_SM107_ARCHS})
+
+add_library(
+  kernels_src STATIC
+  ${SRC_CPP} ${SRC_CU} ${MOE_KERNELS_SRC}
+  $<$<TARGET_EXISTS:marlin_src>:$<TARGET_OBJECTS:marlin_src>>
+  $<TARGET_OBJECTS:minimax_m3_attn_src> $<TARGET_OBJECTS:minimax_m3_sm107_src>)
+set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+target_include_directories(
+  kernels_src
+  PUBLIC
+    $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
+)
+target_link_libraries(kernels_src PUBLIC trtllm_gen_fmha_interface)
+add_cuda_architectures(kernels_src 89)

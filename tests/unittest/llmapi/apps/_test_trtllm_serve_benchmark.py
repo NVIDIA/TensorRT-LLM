@@ -1,0 +1,97 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import subprocess
+
+import pytest
+
+from .openai_server import RemoteOpenAIServer
+
+__extra_import_path__ = ["..", "~/tests/unittest"]
+from test_llm import get_model_path
+from utils.util import skip_gpu_memory_less_than_80gb, skip_pre_hopper
+
+
+@pytest.fixture(scope="module")
+def model_name(request):
+    return request.param
+
+
+@pytest.fixture(scope="module")
+def model_path(model_name: str):
+    return get_model_path(model_name)
+
+
+@pytest.fixture(scope="module")
+def server(model_path: str):
+    args = ["--kv_cache_free_gpu_memory_fraction", "0.8"]
+    # use dynamic port
+    with RemoteOpenAIServer(model_path, cli_args=args) as remote_server:
+        yield remote_server
+
+
+@pytest.fixture(scope="module")
+def benchmark_root():
+    llm_root = os.getenv("LLM_ROOT")
+    return os.path.join(llm_root, "tensorrt_llm", "serve", "scripts")
+
+
+def dataset_path(dataset_name: str):
+    if dataset_name == "sharegpt":
+        return get_model_path(
+            "datasets/ShareGPT_V3_unfiltered_cleaned_split.json")
+    else:
+        raise ValueError(f"Invalid dataset name: {dataset_name}")
+
+
+@skip_gpu_memory_less_than_80gb
+@pytest.mark.parametrize(
+    "model_name", [pytest.param("gpt_oss/gpt-oss-20b", marks=skip_pre_hopper)],
+    indirect=True)
+def test_trtllm_serve_benchmark(server: RemoteOpenAIServer, benchmark_root: str,
+                                model_path: str):
+    model_name = model_path.split("/")[-1]
+    client_script = os.path.join(benchmark_root, "benchmark_serving.py")
+    dataset = dataset_path("sharegpt")
+    port = server.port
+    benchmark_cmd = [
+        "python3",
+        client_script,
+        "--dataset-name",
+        "sharegpt",
+        "--model",
+        model_name,
+        "--dataset-path",
+        dataset,
+        "--tokenizer",
+        model_path,
+        "--port",
+        str(port),
+        "--temperature",
+        "1.0",
+        "--top-p",
+        "1.0",
+    ]
+
+    # CalledProcessError will be raised if any errors occur
+    result = subprocess.run(benchmark_cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            check=True,
+                            timeout=3600)
+    assert result.returncode == 0
+    assert "Serving Benchmark Result" in result.stdout

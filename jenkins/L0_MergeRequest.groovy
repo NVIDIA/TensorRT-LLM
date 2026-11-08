@@ -1,0 +1,3418 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+
+import java.lang.InterruptedException
+import groovy.transform.Field
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import com.nvidia.bloom.KubernetesManager
+import com.nvidia.bloom.Constants
+import com.nvidia.bloom.Logger
+import com.nvidia.bloom.JobBuilder
+import org.jenkinsci.plugins.workflow.cps.CpsThread
+import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException
+import org.jsoup.Jsoup
+import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
+
+def gitlabParamsFromBot = [:]
+if (env.gitlabTriggerPhrase)
+{
+    gitlabParamsFromBot = readJSON text: env.gitlabTriggerPhrase, returnPojo: true
+}
+runMode = gitlabParamsFromBot.get("run_mode", "full")
+
+// LLM repository configuration
+withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
+    LLM_REPO = env.gitlabSourceRepoHttpUrl ? env.gitlabSourceRepoHttpUrl : "${DEFAULT_LLM_REPO}"
+}
+LLM_ROOT = "llm"
+
+// LLM repository configuration
+withCredentials([string(credentialsId: 'default-scan-repo', variable: 'DEFAULT_SCAN_REPO')]) {
+    SCAN_REPO = "${DEFAULT_SCAN_REPO}"
+}
+SCAN_COMMIT = "main"
+SCAN_ROOT = "scan"
+
+ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
+UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
+
+// Build artifacts (build_info.txt, packaged builds, waive_list/) are published to the
+// primary location and read from it first; LLM_ARTIFACTS_PRIMARY ("aws", the default, or "urm")
+// selects it. Reads fall back to the other location only when a file is absent.
+LLM_ARTIFACTS_LOCATIONS = [
+    aws: [root: "https://artifactory.nvidia.com/artifactory", repo: "sw-tensorrt-llm-generic-local"],
+    urm: [root: "https://urm.nvidia.com/artifactory", repo: "sw-tensorrt-generic"],
+]
+
+def llmArtifactsPrimary()
+{
+    def primary = env.LLM_ARTIFACTS_PRIMARY ?: "aws"
+    if (!(primary in ["aws", "urm"])) {
+        error("LLM_ARTIFACTS_PRIMARY must be 'aws' or 'urm', not '${primary}'")
+    }
+    return primary
+}
+
+def llmArtifactsLayoutPath(String legacyPath)
+{
+    def layoutPath = legacyPath.replaceFirst(/^sw-tensorrt-generic(-local)?\//, "")
+    if (!layoutPath.startsWith("llm-artifacts/")) {
+        error("Not an llm-artifacts path: ${legacyPath}")
+    }
+    return layoutPath
+}
+
+def llmArtifactsRepoPath(String location, String legacyPath)
+{
+    return "${LLM_ARTIFACTS_LOCATIONS[location].repo}/${llmArtifactsLayoutPath(legacyPath)}"
+}
+
+def llmArtifactsUrl(String location, String legacyPath)
+{
+    return "${LLM_ARTIFACTS_LOCATIONS[location].root}/${llmArtifactsRepoPath(location, legacyPath)}"
+}
+
+// GitLab project id for TRT-LLM repo, used to set GitLab status. Only needed when triggering by timer or by hand.
+withCredentials([string(credentialsId: 'gitlab-llm-repo-id', variable: 'GITLAB_PROJECT_ID')]) {
+    GITLAB_PROJECT_ID = env.gitlabProjectId ? env.gitlabProjectId : "${GITLAB_PROJECT_ID}"
+}
+
+// K8s secret in namespace sw-tensorrt for pulling from artifactory.nvidia.com
+ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
+
+// Container configuration
+def getContainerURIs()
+{
+    // available tags can be found in: https://artifactory.nvidia.com/artifactory/sw-tensorrt-llm-docker-local/tensorrt-llm/
+    // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
+    tagProps = readProperties file: "${LLM_ROOT}/jenkins/current_image_tags.properties", interpolate: true
+    uris = [:]
+    keys = [
+        "LLM_DOCKER_IMAGE",
+        "LLM_SBSA_DOCKER_IMAGE",
+        "LLM_SBSA_WHEEL_DOCKER_IMAGE",
+        "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE",
+        "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"
+    ]
+    for (key in keys) {
+        uris[key] = tagProps[key]
+    }
+    return uris
+}
+
+// Stage choices
+STAGE_CHOICE_NORMAL = "normal"
+STAGE_CHOICE_SKIP = "skip"
+STAGE_CHOICE_IGNORE = "ignore"
+
+RELEASE_CHECK_CHOICE = env.releaseCheckChoice ? env.releaseCheckChoice : STAGE_CHOICE_NORMAL
+BUILD_CHECK_CHOICE = env.buildCheckChoice ? env.buildCheckChoice : STAGE_CHOICE_NORMAL
+X86_TEST_CHOICE = env.x86TestChoice ? env.x86TestChoice : STAGE_CHOICE_NORMAL
+SBSA_TEST_CHOICE = env.SBSATestChoice ? env.SBSATestChoice : STAGE_CHOICE_NORMAL
+
+// "Fail Fast" feature is enabled by default for the pre-merge pipeline.
+// "Fail Fast" feature is always disabled for the post-merge pipeline.
+boolean enableFailFast = !(env.JOB_NAME ==~ /.*PostMerge.*/ || env.JOB_NAME ==~ /.*Dependency_Testing_TRT.*/) && !gitlabParamsFromBot.get("disable_fail_fast", false)
+
+boolean isReleaseCheckMode = (runMode == "release_check")
+
+GEN_POST_MERGE_BUILDS_ONLY = (env.JOB_NAME?.contains("GenPostMergeBuilds") ?: false)
+
+BUILD_STATUS_NAME = isReleaseCheckMode ? "Jenkins Release Check" : "Jenkins Full Build"
+
+def trimForStageList(stageNameList)
+{
+    if (stageNameList == null) {
+        return null
+    }
+    trimedList = []
+    stageNameList.each { stageName ->
+        trimedList.add(stageName.trim().replaceAll('\\\\', ''))
+    }
+    return trimedList
+}
+
+def normalizeReleaseTargets(rawReleaseTarget)
+{
+    def supportedTargets = ["wheel", "container"]
+    def releaseTarget = rawReleaseTarget?.toString()?.trim()
+    if (!releaseTarget || releaseTarget.equalsIgnoreCase("all")) {
+        return supportedTargets
+    }
+
+    def requestedTargets = releaseTarget.split(",", -1).collect {
+        it.trim().toLowerCase()
+    }
+    if (requestedTargets.any { !it }) {
+        error "Invalid release_target '${rawReleaseTarget}': empty entries are not allowed"
+    }
+    if (requestedTargets.contains("all")) {
+        error "Invalid release_target '${rawReleaseTarget}': all cannot be combined with other targets"
+    }
+
+    def invalidTargets = requestedTargets.findAll {
+        !supportedTargets.contains(it)
+    }.unique()
+    if (invalidTargets) {
+        error "Invalid release_target '${rawReleaseTarget}': supported values are all, wheel, and container"
+    }
+    return supportedTargets.findAll { requestedTargets.contains(it) }
+}
+
+@Field
+def REUSE_TEST = "reuse_test"   // Determine if the pipeline should reuse test results in a stage from the previous pipelines.
+@Field
+def REUSE_STAGE_LIST = "reuse_stage_list"
+@Field
+def ENABLE_SKIP_TEST = "skip_test"
+@Field
+def TEST_STAGE_LIST = "stage_list"
+@Field
+def GPU_TYPE_LIST = "gpu_type"
+@Field
+def TEST_BACKEND = "test_backend"
+@Field
+def IS_POST_MERGE = "post_merge"
+@Field
+def ADD_MULTI_GPU_TEST = "add_multi_gpu_test"
+@Field
+def ENABLE_MULTI_GPU_TEST = "multi_gpu_test"
+@Field
+def ONLY_MULTI_GPU_TEST = "only_multi_gpu_test"
+@Field
+def DISABLE_MULTI_GPU_TEST = "disable_multi_gpu_test"
+@Field
+def EXTRA_STAGE_LIST = "extra_stage"
+@Field
+def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
+@Field
+def ONLY_ONE_GROUP_CHANGED = "only_one_group_changed"
+@Field
+def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
+@Field
+def DEBUG_MODE = "debug"
+@Field
+def DETAILED_LOG = "detailed_log"
+@Field
+def CBTS_RESULT = "cbts_result"
+@Field
+def CBTS_COVERAGE = "cbts_coverage"
+@Field
+def DISABLE_CBTS = "disable_cbts"
+@Field
+def INFRA_DRY_RUN = "infra_dry_run"
+// Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
+@Field
+def ENABLE_CBTS_COVERAGE = true
+// Version-controlled Tier 2 application policy. Coverage decisions are evaluated
+// for every eligible PR, but only these authors receive coverage-based narrowing.
+// Keep the policy in the infra-owned Groovy boundary so rollout requires infra review.
+@Field
+def CBTS_COVERAGE_PILOT_USERS = [
+    "crazydemo",
+    "QiJune",
+    "sunnyqgg",
+    "Barry-Delaney",
+    "xxi-nv",
+    "leslie-fang25",
+    "rosong11",
+    "tongyuantongyu",
+    "jieli-matrix",
+    "StanleySun639",
+    "xinhe-nv",
+    "ruodil",
+    "fredricz-20070104",
+    "yufeiwu-nv",
+    "yingguo-trt",
+] as Set
+@Field
+def OSS_COMPLIANCE_FILE_CHANGED = "oss_compliance_file_changed"
+// `/bot run` key that opts a single run into BOLT consume.
+@Field
+def BOLT_CONSUME = "bolt_consume"
+// Version-controlled rollout switch for BOLT premerge consume. Kept in the
+// infra-owned Groovy boundary like ENABLE_CBTS_COVERAGE above, so turning consume
+// on for every eligible build is a reviewed code change; a `/bot run` with
+// `"bolt_consume": true` opts in a single run without one. Either way
+// resolveBoltConsume() still applies the post-merge and branch restrictions.
+@Field
+def ENABLE_BOLT_PREMERGE_CONSUME = true
+// Version-controlled rollout switch for post-merge and nightly release BOLT.
+//
+// Post-merge cannot use the pre-merge shape, where the BOLTed build REPLACES the
+// canonical tarball: that tarball is BoltProfileGen's input and must stay
+// un-BOLTed, or the next bundle is generated from already-optimized binaries.
+// So post-merge publishes BOTH -- canonical untouched, plus bolted-<tarName>
+// carrying a bolt.ref property naming the bundle applied.
+//
+// On means post-merge SBSA also runs its tests against bolted-<tarName> instead
+// of only publishing it. Turning it off stops both the extra publish and the
+// test-side switch; the canonical tarball is never touched either way, so a
+// post-merge run with this off is byte-for-byte what it is today.
+//
+// This is deliberately not the pre-merge switch above. Post-merge is scoped to
+// one branch and one arch, and it exercises the same apply-to-tarball path a
+// pre-merge build would, which is what makes it the smoke test for flipping
+// ENABLE_BOLT_PREMERGE_CONSUME afterwards.
+@Field
+def ENABLE_BOLT_POSTMERGE_VARIANT = true
+
+def testFilter = [
+    (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
+    (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
+    (ENABLE_SKIP_TEST): gitlabParamsFromBot.get((ENABLE_SKIP_TEST), false),
+    (TEST_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get((TEST_STAGE_LIST), null)?.tokenize(',')),
+    (GPU_TYPE_LIST): trimForStageList(gitlabParamsFromBot.get((GPU_TYPE_LIST), null)?.tokenize(',')),
+    (TEST_BACKEND): trimForStageList(gitlabParamsFromBot.get((TEST_BACKEND), null)?.tokenize(',')),
+    (IS_POST_MERGE): (env.JOB_NAME ==~ /.*PostMerge.*/) || gitlabParamsFromBot.get((IS_POST_MERGE), false),
+    (ADD_MULTI_GPU_TEST): gitlabParamsFromBot.get((ADD_MULTI_GPU_TEST), false),
+    (ONLY_MULTI_GPU_TEST): gitlabParamsFromBot.get((ONLY_MULTI_GPU_TEST), false) || gitlabParamsFromBot.get((ENABLE_MULTI_GPU_TEST), false),
+    (DISABLE_MULTI_GPU_TEST): gitlabParamsFromBot.get((DISABLE_MULTI_GPU_TEST), false),
+    (EXTRA_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get((EXTRA_STAGE_LIST), null)?.tokenize(',')),
+    (MULTI_GPU_FILE_CHANGED): false,
+    (ONLY_ONE_GROUP_CHANGED): "",
+    (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
+    (AUTO_TRIGGER_TAG_LIST): [],
+    (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
+    (CBTS_RESULT): null,
+    (CBTS_COVERAGE): false,
+    (DISABLE_CBTS): gitlabParamsFromBot.get((DISABLE_CBTS), false),
+    (INFRA_DRY_RUN): (params.InfraDryRun?.toString()?.toBoolean() ?: false),
+]
+
+String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
+
+@Field
+def GITHUB_PR_API_URL = "github_pr_api_url"
+// Used to read the git changes when there is no PR or MR to read the changes from (i.e., when trigger from merge queue):
+// the changes are base_commit..gitlabCommit, read from `git diff` in the internal Git mirror.
+@Field
+def BASE_COMMIT = "base_commit"
+@Field
+def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
+@Field
+def ACTION_INFO = "action_info"
+@Field
+def IMAGE_KEY_TO_TAG = "image_key_to_tag"
+@Field
+def TARGET_BRANCH = "target_branch"
+@Field
+def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
+@Field
+def RUN_MODE = "run_mode"
+@Field
+def BUILD_BRANCH = "build_branch"
+@Field
+def MAINTENANCE_ENTRIES = "maintenance_entries"
+@Field
+def BOLT_CONSUME_BUILD = "bolt_consume_build"
+// The one BOLT profile bundle every consumer in this pipeline applies. Resolved
+// once (see resolveBoltProfileRef) rather than each consumer reading the mutable
+// `latest` pointer whenever it happens to run -- which made two stages in the
+// same pipeline able to disagree about which profiles they used. Empty means
+// unpinned, i.e. today's read-`latest`-per-consumer behaviour.
+@Field
+def BOLT_PROFILE_REF = "bolt_profile_ref"
+// Whether this run's build publishes bolted-<tarName> beside an untouched
+// canonical. Decided once: the build needs it to know what to publish, and the
+// test stages need it to know what to fetch. Two copies of the condition would
+// eventually disagree, and the failure would be tests silently reading the
+// un-BOLTed tarball -- indistinguishable from a healthy run.
+@Field
+def BOLT_PUBLISH_VARIANT = "bolt_publish_variant"
+// The branch whose promote directory holds that bundle. A ref alone does not
+// address an object -- the path is <branch>/<triple>/bolt-profile-<ref>-<triple>
+// -- and consumers used to supply the branch themselves from four different
+// expressions. They agree on post-merge main and nowhere guaranteed else, and a
+// disagreement is a 404, which apply_latest.sh reports as "nothing promoted":
+// indistinguishable from a cold start, so it degrades silently. Carrying the
+// branch with the ref means a pinned consumer never has to guess.
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
+// The one triple with a BOLT profile producer. BoltProfileGen runs aarch64 only,
+// so this is the only triple with a promoted bundle to resolve or apply. Named
+// once because the pin resolver and the consume scope below must not disagree.
+@Field
+def BOLT_PRODUCER_TRIPLE = "aarch64-linux-gnu"
+// The triples BOLT consume applies to. Stated explicitly rather than inferred
+// from the pin: "which bundle" and "which architectures consume BOLT" are
+// independent questions, and answering the second from the first made the
+// x86_64 path behave differently depending on whether the pin happened to
+// resolve -- an unresolvable pin is non-fatal by design, so x86_64 would then
+// go on to stage llvm-bolt and request a bundle that does not exist before
+// giving up. Both consumers are launched for both architectures off this one
+// map, so the scope has to travel with it.
+//
+// Adding a triple here also needs a per-triple pin: BOLT_PROFILE_REF names one
+// bundle under one promote directory, so a second architecture reading it would
+// demand aarch64's bundle. Change the two together.
+@Field
+def BOLT_CONSUME_TRIPLES = "bolt_consume_triples"
+@Field
+def RELEASE_TARGET = "release_target"
+@Field
+def JOB_TYPE = "job_type"
+// The primary location of build artifacts (see llmArtifactsPrimary), passed to every child job.
+// Child jobs run on other Jenkins controllers, whose own LLM_ARTIFACTS_PRIMARY can differ.
+@Field
+def LLM_ARTIFACTS_PRIMARY_KEY = "llm_artifacts_primary"
+// Release scripts repository (nspect.py, kitmaker_wheel.py) as [url: ..., commit: ...],
+// resolved once in setupPipelineEnvironment from the TRTLLM_RELEASE_REPO credential and
+// jenkins/ci_versions.properties.
+@Field
+def TRTLLM_RELEASE_REPO = "TRTLLM_RELEASE_REPO"
+def globalVars = [
+    (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
+    (BASE_COMMIT): gitlabParamsFromBot.get('base_commit', null),
+    (CACHED_CHANGED_FILE_LIST): null,
+    (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
+    (IMAGE_KEY_TO_TAG): [:],
+    (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', 'main'),
+    (TRTLLM_VERSION_OVERRIDE): null,
+    (RUN_MODE): runMode,
+    (MAINTENANCE_ENTRIES): [reason: "", patterns: []],
+    (RELEASE_TARGET): runMode == "nightly_release" ?
+        normalizeReleaseTargets(gitlabParamsFromBot.get(RELEASE_TARGET, null)) : [],
+    (BOLT_PROFILE_REF): "",
+    (BOLT_PUBLISH_VARIANT): isBoltReleasePipeline() && ENABLE_BOLT_POSTMERGE_VARIANT,
+    (BOLT_PROFILE_BRANCH): "",
+    (BOLT_CONSUME_TRIPLES): BOLT_PRODUCER_TRIPLE,
+    (JOB_TYPE): env.JOB_BASE_NAME,
+    (TRTLLM_RELEASE_REPO): null,
+]
+globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
+// Compare against "true" rather than relying on Groovy truthiness: the bot phrase
+// is free-form JSON, and a quoted "false" would otherwise read as opt-in.
+// Scope variant publication to post-merge and nightly releases so pre-merge
+// consumption remains governed by its own rollout switch and explicit opt-in.
+globalVars[BOLT_CONSUME_BUILD] = resolveBoltConsume(
+    ENABLE_BOLT_PREMERGE_CONSUME || globalVars[BOLT_PUBLISH_VARIANT] ||
+        gitlabParamsFromBot.get(BOLT_CONSUME, false).toString() == "true",
+    globalVars[TARGET_BRANCH],
+    globalVars[BOLT_PUBLISH_VARIANT])
+if (runMode == "nightly_release") {
+    globalVars[TRTLLM_VERSION_OVERRIDE] = params.version
+}
+
+// If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
+// GenPostMergeBuilds pipelines do not update GitLab status.
+boolean enableUpdateGitlabStatus =
+    !GEN_POST_MERGE_BUILDS_ONLY &&
+    !testFilter[INFRA_DRY_RUN] &&
+    !testFilter[ENABLE_SKIP_TEST] &&
+    !testFilter[ONLY_MULTI_GPU_TEST] &&
+    !testFilter[DISABLE_MULTI_GPU_TEST] &&
+    !testFilter[DEBUG_MODE] &&
+    testFilter[GPU_TYPE_LIST] == null &&
+    testFilter[TEST_STAGE_LIST] == null &&
+    testFilter[TEST_BACKEND] == null
+
+
+def createKubernetesPodConfig(image, type, arch = "amd64")
+{
+    def targetCould = "kubernetes-cpu"
+    def selectors = """
+                  nvidia.com/node_type: builder
+                  kubernetes.io/os: linux"""
+    def containerConfig = ""
+    def nodeLabelPrefix = ""
+
+    def archSuffix = arch == "arm64" ? "arm" : "amd"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+
+    switch(type)
+    {
+    case "agent":
+        containerConfig = """
+                  - name: alpine
+                    image: artifactory.pdx.nvidia.com/docker-remote/alpine:latest
+                    command: ['cat']
+                    tty: true
+                    resources:
+                      requests:
+                        cpu: '2'
+                        memory: 5Gi
+                        ephemeral-storage: 25Gi
+                      limits:
+                        cpu: '2'
+                        memory: 5Gi
+                        ephemeral-storage: 25Gi
+                    imagePullPolicy: Always"""
+        nodeLabelPrefix = "cpu"
+        break
+    case "package":
+        containerConfig = """
+                  - name: trt-llm
+                    image: ${image}
+                    command: ['cat']
+                    tty: true
+                    resources:
+                      requests:
+                        cpu: '2'
+                        memory: 20Gi
+                        ephemeral-storage: 25Gi
+                      limits:
+                        cpu: '2'
+                        memory: 20Gi
+                        ephemeral-storage: 25Gi
+                    imagePullPolicy: Always"""
+        nodeLabelPrefix = "cpu"
+        break
+    }
+    def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix)
+    def podConfig = [
+        cloud: targetCould,
+        namespace: "sw-tensorrt",
+        label: nodeLabel,
+        yaml: """
+            apiVersion: v1
+            kind: Pod
+            spec:
+                qosClass: Guaranteed
+                affinity:
+                    nodeAffinity:
+                        requiredDuringSchedulingIgnoredDuringExecution:
+                            nodeSelectorTerms:
+                            - matchExpressions:
+                              - key: "tensorrt/taints"
+                                operator: DoesNotExist
+                              - key: "tensorrt/affinity"
+                                operator: NotIn
+                                values:
+                                - "core"
+                                - "qa_only"
+                nodeSelector: ${selectors}
+                imagePullSecrets:
+                  - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
+                containers:
+                  ${containerConfig}
+                    env:
+                    - name: HOST_NODE_NAME
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: spec.nodeName
+                  - name: jnlp
+                    image: ${jnlpImage}
+                    args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
+                    resources:
+                      requests:
+                        cpu: '2'
+                        memory: 5Gi
+                        ephemeral-storage: 25Gi
+                      limits:
+                        cpu: '2'
+                        memory: 5Gi
+                        ephemeral-storage: 25Gi
+                qosClass: Guaranteed
+                volumes:
+                - name: sw-tensorrt-pvc
+                  persistentVolumeClaim:
+                    claimName: sw-tensorrt-pvc
+
+        """.stripIndent(),
+    ]
+
+    return podConfig
+}
+
+def echoNodeAndGpuInfo(pipeline, stageName)
+{
+    String hostNodeName = sh(script: 'echo $HOST_NODE_NAME', returnStdout: true)
+    String gpuUuids = pipeline.sh(script: "nvidia-smi -q | grep \"GPU UUID\" | awk '{print \$4}' | tr '\n' ',' || true", returnStdout: true)
+    pipeline.echo "HOST_NODE_NAME = ${hostNodeName} ; GPU_UUIDS = ${gpuUuids} ; STAGE_NAME = ${stageName}"
+}
+
+def setupPipelineEnvironment(pipeline, testFilter, globalVars)
+{
+    sh "env | sort"
+    echo "Using GitLab repo: ${LLM_REPO}."
+    sh "git config --global --add safe.directory \"*\""
+    // NB: getContainerURIs reads files in ${LLM_ROOT}/jenkins/
+    if (env.gitlabMergeRequestLastCommit) {
+        env.gitlabCommit = env.gitlabMergeRequestLastCommit
+        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    } else {
+        branch = env.gitlabBranch ? env.gitlabBranch : "main"
+        trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
+        checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
+        env.gitlabCommit = checkoutCommit
+    }
+    if (params.program_version_name) {
+        env.NSPECT_RELEASE_VERSION = params.program_version_name
+    } else {
+        def versionFile = readFile("${LLM_ROOT}/tensorrt_llm/version.py")
+        def versionMatcher = versionFile =~ /(?m)^__version__ = "([^"]+)"$/
+        if (!versionMatcher.find()) {
+            error "Unable to read __version__ from ${LLM_ROOT}/tensorrt_llm/version.py"
+        }
+        def nspectReleaseVersionSuffix = "dev"
+        if (runMode == "nightly_release") {
+            nspectReleaseVersionSuffix = "nightly"
+        } else if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+            nspectReleaseVersionSuffix = "postmerge"
+        }
+        env.NSPECT_RELEASE_VERSION = "${versionMatcher.group(1)}_${nspectReleaseVersionSuffix}"
+    }
+    echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
+    echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
+    if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
+        trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, 'running', GITLAB_PROJECT_ID, env.gitlabCommit)
+    }
+    if (testFilter[INFRA_DRY_RUN]) {
+        pipeline.echo("Changed-file analysis is skipped for the infrastructure dry run.")
+        testFilter[(MULTI_GPU_FILE_CHANGED)] = false
+        testFilter[(ONLY_ONE_GROUP_CHANGED)] = ""
+        testFilter[(AUTO_TRIGGER_TAG_LIST)] = []
+        pipeline.echo("CBTS is skipped for the infrastructure dry run.")
+    } else {
+        testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
+        testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
+        testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+        testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
+        // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
+        testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
+    }
+    pipeline.echo("CBTS coverage eligible: ${testFilter[(CBTS_COVERAGE)]}")
+    testFilter[(OSS_COMPLIANCE_FILE_CHANGED)] = getOssComplianceFileChanged(pipeline, globalVars)
+    getContainerURIs().each { k, v ->
+        globalVars[k] = v
+    }
+    globalVars[TRTLLM_RELEASE_REPO] = getReleaseRepo()
+}
+
+def getReleaseRepo()
+{
+    def ciVersions = readProperties file: "${LLM_ROOT}/jenkins/ci_versions.properties"
+    def commit = ciVersions.TRTLLM_RELEASE_REPO
+    def overrideCommit = env."TRTLLM_RELEASE_REPO_OVERRIDE_${commit}"
+    if (overrideCommit) {
+        echo "Overriding TRTLLM_RELEASE_REPO commit with value from environment variable \$TRTLLM_RELEASE_REPO_OVERRIDE_${commit}: ${overrideCommit}"
+        commit = overrideCommit
+    }
+    def url = ""
+    withCredentials([string(credentialsId: "TRTLLM_RELEASE_REPO", variable: "RELEASE_REPO_URL")]) {
+        url = RELEASE_REPO_URL
+    }
+    return [url: url, commit: commit]
+}
+
+def checkoutTargetBranchFile(String targetBranch, String targetCommit, String sourcePath, String outputPrefix)
+{
+    if (targetCommit) {
+        def outputFile = "${outputPrefix}_${targetCommit}.txt"
+        try {
+            sh "wget https://artifactory.pdx.nvidia.com/artifactory/vcs-remote/NVIDIA/TensorRT-LLM/raw/" +
+               "${targetCommit}/${sourcePath} -O ${outputFile}"
+            return outputFile
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            echo "Failed to checkout ${sourcePath} by public target commit. Error: ${e.toString()}"
+        }
+    }
+
+    def outputFile = "${outputPrefix}.txt"
+    try {
+        withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
+            trtllm_utils.checkoutFile(DEFAULT_LLM_REPO, targetBranch, sourcePath, ".")
+        }
+        def sourceFileName = sourcePath.tokenize('/').last()
+        sh "mv ${sourceFileName} ${outputFile}"
+        return outputFile
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "Failed to checkout ${sourcePath} from internal GitLab at ref " +
+             "${targetBranch}. Error: ${e.toString()}"
+    }
+    return ""
+}
+
+def mergeWaiveList(pipeline, globalVars)
+{
+    // Get current waive list
+    sh "git config --global --add safe.directory \"*\""
+    sh "cp ${LLM_ROOT}/tests/integration/test_lists/waives.txt ./waives_CUR_${env.gitlabCommit}.txt"
+    sh "cp ${LLM_ROOT}/jenkins/scripts/mergeWaiveList.py ./"
+
+    // Get TOT waive list
+    LLM_TOT_ROOT = "llm-tot"
+    targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
+    echo "Target branch: ${targetBranch}"
+
+    def targetBranchTOTCommit = ""
+    try {
+        withCredentials([usernamePassword(credentialsId: 'svc_tensorrt_gitlab_api_token', usernameVariable: 'GITHUB_USER', passwordVariable: 'GITHUB_PASSWORD')]) {
+            def apiUrl = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/commits?sha=${targetBranch}&per_page=1"
+            def connection = new URL(apiUrl).openConnection()
+            connection.setRequestProperty("Authorization", "Basic " + "${GITHUB_USER}:${GITHUB_PASSWORD}".bytes.encodeBase64().toString())
+            connection.setRequestMethod("GET")
+            def response = connection.inputStream.text
+            def json = new JsonSlurper().parseText(response)
+            targetBranchTOTCommit = json[0].sha
+        }
+        echo "Target branch TOT commit: ${targetBranchTOTCommit}"
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "Failed to resolve the target branch TOT commit from public GitHub. Error: ${e.toString()}"
+    }
+
+    def waiveTot = checkoutTargetBranchFile(
+        targetBranch, targetBranchTOTCommit, "tests/integration/test_lists/waives.txt", "waives_TOT")
+    if (!waiveTot) {
+        catchError(
+            buildResult: 'SUCCESS',
+            stageResult: 'UNSTABLE') {
+            error "Failed to get TOT waive list. Fallback to use the default test waive list from the PR."
+        }
+        return [targetBranch: targetBranch, targetCommit: targetBranchTOTCommit]
+    }
+
+    try {
+        // Get waive list diff in current MR
+        def diff = getMergeRequestOneFileChanges(pipeline, globalVars, "tests/integration/test_lists/waives.txt")
+
+        // Write diff to a temporary file to avoid shell escaping issues
+        writeFile file: 'diff_content.txt', text: diff
+
+        // Merge waive lists
+        sh """
+            python3 mergeWaiveList.py \
+            --cur-waive-list=waives_CUR_${env.gitlabCommit}.txt \
+            --latest-waive-list=${waiveTot} \
+            --diff-file=diff_content.txt \
+            --output-file=waives.txt
+        """
+        def primary = llmArtifactsPrimary()
+        def waiveListTarget = primary == "aws" ?
+            "${llmArtifactsRepoPath('aws', UPLOAD_PATH)}/waive_list/" : "${UPLOAD_PATH}/waive_list/"
+        trtllm_utils.uploadArtifacts("waives*.txt", waiveListTarget, primary)
+        def waiveListUrl = llmArtifactsUrl(primary, "${UPLOAD_PATH}/waive_list/waives.txt")
+        echo "New merged test waive list: ${waiveListUrl}"
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        catchError(
+            buildResult: 'SUCCESS',
+            stageResult: 'UNSTABLE') {
+            error "Merge test waive list failed. Fallback to use the default test waive list from the PR. Error: ${e.toString()}"
+        }
+    }
+    return [targetBranch: targetBranch, targetCommit: targetBranchTOTCommit]
+}
+
+def getMaintenanceStageList(pipeline, globalVars, Map targetBranchInfo)
+{
+    def maintenanceConfigPath = "jenkins/config/maintenance_stages.txt"
+    def targetBranch = targetBranchInfo.targetBranch
+    def targetBranchTOTCommit = targetBranchInfo.targetCommit
+    def maintenanceSource = "${LLM_ROOT}/${maintenanceConfigPath}"
+    def maintenanceTot = checkoutTargetBranchFile(
+        targetBranch, targetBranchTOTCommit, maintenanceConfigPath, "maintenance_stages_TOT")
+    if (!maintenanceTot) {
+        catchError(
+            buildResult: 'SUCCESS',
+            stageResult: 'UNSTABLE') {
+            error "Failed to get target maintenance config. No maintenance stages will be skipped."
+        }
+        globalVars[MAINTENANCE_ENTRIES] = [reason: "", patterns: []]
+    } else {
+        if (!fileExists(maintenanceSource)) {
+            def changedFileList = getMRChangedFile(pipeline, globalVars, "getChangedFileList")
+            if (changedFileList.contains(maintenanceConfigPath)) {
+                error "Deleting or renaming ${maintenanceConfigPath} is not allowed."
+            }
+        }
+        def maintenanceDiff = ""
+        try {
+            def fetchedMaintenanceDiff = getMergeRequestOneFileChanges(
+                pipeline, globalVars, maintenanceConfigPath)
+            if (fetchedMaintenanceDiff == null) {
+                echo "WARNING: Maintenance config diff is unavailable. Using target TOT entries."
+            } else {
+                maintenanceDiff = fetchedMaintenanceDiff
+            }
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            echo "WARNING: Failed to get maintenance config diff. " +
+                 "Using target TOT entries. Error: ${e.toString()}"
+        }
+        writeFile file: 'maintenance_diff_content.txt', text: maintenanceDiff
+        sh """
+            python3 mergeWaiveList.py \
+            --maintenance-config \
+            --cur-waive-list=${maintenanceSource} \
+            --latest-waive-list=${maintenanceTot} \
+            --diff-file=maintenance_diff_content.txt \
+            --output-file=maintenance_entries.json
+        """
+        globalVars[MAINTENANCE_ENTRIES] = readJSON(
+            file: 'maintenance_entries.json', returnPojo: true)
+    }
+    echo "Effective maintenance entries: ${globalVars[MAINTENANCE_ENTRIES]}"
+}
+
+def preparation(pipeline, testFilter, globalVars)
+{
+    image = "artifactory.pdx.nvidia.com/docker-remote/buildpack-deps:trixie-scm"
+    setupPipelineSpec = createKubernetesPodConfig(image, "package")
+    trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
+        def targetBranchInfo = [:]
+        stage("Setup Environment") {
+            setupPipelineEnvironment(pipeline, testFilter, globalVars)
+        }
+        // Must resolve BEFORE launchStages, not inside any branch of it.
+        // launchStages forks Release-Check, SBSA and x86_64 in parallel and
+        // launchJob serializes globalVars per child job, so a pin assigned in
+        // one branch races the jobs in the others: whichever serializes first
+        // receives an empty pin and resolves `latest` on its own -- the drift
+        // this exists to remove, now with the added property of being
+        // nondeterministic. Release Check is also skippable, which would leave
+        // the whole pipeline unpinned.
+        //
+        // preparation() is the earliest correct home: the script-level BOLT
+        // setup runs outside any node and cannot shell out, while the stage
+        // above has already checked the repo out into ${LLM_ROOT}, which is
+        // where the resolver's script lives.
+        stage("Pin BOLT Profile Bundle") {
+            def pinBranch = globalVars[BUILD_BRANCH]
+            def pinRef = resolveBoltProfileRef(pinBranch, BOLT_PRODUCER_TRIPLE)
+            globalVars[BOLT_PROFILE_REF] = pinRef
+            // The branch is only meaningful alongside a ref, so it is left empty
+            // when the pin does not resolve -- a consumer cannot then half-honour
+            // a pin. Which architectures consume BOLT is unaffected either way;
+            // that is BOLT_CONSUME_TRIPLES, decided independently of this.
+            globalVars[BOLT_PROFILE_BRANCH] = pinRef ? pinBranch : ""
+        }
+        stage("Upload Build Info") {
+            try {
+                def branch = globalVars[BUILD_BRANCH]
+                def buildInfo = "commit=${env.gitlabCommit}\n" +
+                    "branch=${branch}\n" +
+                    "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
+                    "jenkins_url=${env.BUILD_URL}"
+                writeFile file: 'build_info.txt', text: buildInfo
+                def primary = llmArtifactsPrimary()
+                def buildInfoTarget = primary == "aws" ?
+                    "${llmArtifactsRepoPath('aws', UPLOAD_PATH)}/" : "${UPLOAD_PATH}/"
+                trtllm_utils.uploadArtifacts("build_info.txt", buildInfoTarget, primary)
+                def buildInfoUrl = llmArtifactsUrl(primary, "${UPLOAD_PATH}/build_info.txt")
+                pipeline.echo "Build info: ${buildInfoUrl}"
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                pipeline.echo "Upload Build Info failed: ${e.toString()}"
+            }
+        }
+        stage("Merge Test Waive List") {
+            if (testFilter[INFRA_DRY_RUN]) {
+                echo "Skipping Merge Test Waive List for the infrastructure dry run."
+            } else {
+                targetBranchInfo = mergeWaiveList(pipeline, globalVars)
+            }
+        }
+        stage("Get Maintenance Stage List") {
+            if (testFilter[INFRA_DRY_RUN]) {
+                echo "Skipping Get Maintenance Stage List for the infrastructure dry run."
+            } else {
+                getMaintenanceStageList(pipeline, globalVars, targetBranchInfo)
+            }
+        }
+    })
+}
+
+def launchReleaseCheck(pipeline, globalVars)
+{
+    stages = {
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip")
+        sh "pip3 config set global.break-system-packages true"
+        sh "git config --global --add safe.directory \"*\""
+        // Step 1: Clone TRT-LLM source codes
+        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+        sh "cd ${LLM_ROOT} && git config --unset-all core.hooksPath"
+
+        // Step 2: Run guardwords scan
+        def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+        if (isOfficialPostMergeJob || runMode == "nightly_release") {
+            trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, false, true)
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${SCAN_ROOT} && pip3 install -e .")
+            try {
+                ignoreList = [
+                    "*/.git/*",
+                    "*/3rdparty/*",
+                    "*/cpp/tensorrt_llm/deep_ep/nvshmem_src_*.txz",
+                    "*/examples/scaffolding/contrib/mcp/weather/weather.py",
+                    "*/tensorrt_llm_internal_cutlass_kernels_static.tar.xz",
+                    "*/triton_kernels/*.py"
+                ]
+                sh """#!/bin/bash
+                    set -eo pipefail
+                    cd ${LLM_ROOT}
+                    # Batch files below ARG_MAX; pipefail propagates scan failures to prevent false greens.
+                    find . -type f \\
+                        ${ignoreList.collect { "-not -path \"${it}\"" }.join(' ')} \\
+                        -not -path "./scan.log" \\
+                        -exec confidentiality-scan {} + 2>&1 | tee scan.log
+                """.stripIndent()
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    error "Release Check failed (warn-only): ${e.getMessage()}"
+                }
+            } finally {
+                trtllm_utils.uploadArtifacts("${LLM_ROOT}/scan.log", "${UPLOAD_PATH}/guardwords-scan-results/")
+                echo "Guardwords Scan Results: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/guardwords-scan-results/scan.log"
+            }
+        }
+
+        // Step 3: Run pre-commit checks
+        // Post-merge CI runs on all files; pre-merge CI runs only on changed files.
+        def precommitArgs = "-a"
+        if (!isOfficialPostMergeJob) {
+            // Use GitLab/GitHub API to get the exact list of changed files in this MR.
+            // This avoids git history depth issues with shallow clones.
+            def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
+            echo "Changed file count from API: ${changedFileList ? changedFileList.size() : 0}"
+            // GitHub's PR Files API caps out at 3000 entries, silently truncating the
+            // list for huge PRs. Fail closed with a 2500 margin below that cap.
+            if (changedFileList && !changedFileList.isEmpty() && changedFileList.size() < 2500) {
+                def changedFilesPath = "${LLM_ROOT}/changed_files.txt"
+                writeFile file: changedFilesPath, text: changedFileList.unique().join("\n")
+                // Script runs after "cd ${LLM_ROOT}", so use relative path
+                precommitArgs = "--files-from changed_files.txt"
+                echo "Pre-commit will check ${changedFileList.unique().size()} changed file(s)"
+            } else if (changedFileList && changedFileList.size() >= 2500) {
+                echo "Changed file list hit the 2500-file safety margin, falling back to all files"
+            } else {
+                echo "Could not determine changed files, falling back to all files"
+            }
+        }
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py ${precommitArgs} || (git restore . && false)")
+
+        // Step 4: Run license check
+        withEnv(['GONOSUMDB=*.nvidia.com']) {
+            withCredentials([
+                gitUsernamePassword(
+                    credentialsId: 'svc_tensorrt_gitlab_read_api_token',
+                    gitToolName: 'git-tool'
+                ),
+                string(
+                    credentialsId: 'default-git-url',
+                    variable: 'DEFAULT_GIT_URL'
+                )
+            ]) {
+                sh "go install ${DEFAULT_GIT_URL}/TensorRT/Infrastructure/licensechecker/cmd/license_checker@v0.3.0"
+            }
+        }
+        sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
+    }
+
+    def image = "artifactory.pdx.nvidia.com/docker-remote/golang:1.23"
+    stageName = "Release-Check"
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
+        stage("[${stageName}] Run") {
+            if (RELEASE_CHECK_CHOICE == STAGE_CHOICE_SKIP) {
+                echo "Release Check job is skipped due to Jenkins configuration"
+                return
+            }
+            try {
+                echoNodeAndGpuInfo(pipeline, stageName)
+                stages()
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                if (RELEASE_CHECK_CHOICE == STAGE_CHOICE_IGNORE) {
+                    catchError(
+                        buildResult: 'SUCCESS',
+                        stageResult: 'FAILURE') {
+                        error "Release Check failed but ignored due to Jenkins configuration"
+                    }
+                } else {
+                    throw e
+                }
+            }
+        }
+    })
+}
+
+// Inside a parallel branch, pass a nested stage name: Blue Ocean shows a skip marked on the branch's own stage as NOT_BUILT.
+def skipStage(String stageName, String message)
+{
+    stage(stageName) {
+        echo message
+        jUtils.markStageSkippedForConditional(stageName)
+    }
+}
+
+def launchTestListCheck(pipeline, globalVars)
+{
+    def key = "Check-Test-List"
+    def image = globalVars["LLM_DOCKER_IMAGE"]
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
+        stage("[${key}] Run") {
+            echoNodeAndGpuInfo(pipeline, key)
+            sh "git config --global --add safe.directory \"*\""
+            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
+
+            def llmPath = sh(script: "realpath ${LLM_ROOT}", returnStdout: true).trim()
+            sh "NVIDIA_TRITON_SERVER_VERSION=26.09 LLM_ROOT=${llmPath} LLM_BACKEND_ROOT=${llmPath}/triton_backend " +
+               "python3 ${llmPath}/scripts/check_test_list.py --l0 --qa --waive --validate --parity --check-duplicate-waives"
+        }
+    })
+}
+
+def getGitlabMRChangedFile(pipeline, function, filePath="") {
+    def result = null
+    def pageId = 0
+    withCredentials([
+        usernamePassword(
+            credentialsId: 'svc_tensorrt_gitlab_read_api_token',
+            usernameVariable: 'GITLAB_API_USER',
+            passwordVariable: 'GITLAB_API_TOKEN'
+        ),
+        string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
+    ]) {
+        while(true) {
+            pageId += 1
+            def rawDataJson = pipeline.sh(
+                script: """
+                    curl --header "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+                         --url "https://${DEFAULT_GIT_URL}/api/v4/projects/${env.gitlabMergeRequestTargetProjectId}/merge_requests/${env.gitlabMergeRequestIid}/diffs?page=${pageId}&per_page=20"
+                """,
+                returnStdout: true
+            )
+            def rawDataList = readJSON text: rawDataJson, returnPojo: true
+            if (function == "getOneFileChanges") {
+                if (result == null) {
+                    result = ""
+                }
+                rawDataList.find { rawData ->
+                    if (rawData.get("new_path") == filePath || rawData.get("old_path") == filePath) {
+                        result = rawData.get("diff")
+                        return true
+                    }
+                    return false
+                }
+                if (result != "") { break }
+            } else if (function == "getChangedFileList") {
+                if (result == null) {
+                    result = []
+                }
+                rawDataList.each { rawData ->
+                    result += [rawData.get("old_path"), rawData.get("new_path")]
+                }
+            } else if (function == "getFileChanges") {
+                if (result == null) {
+                    result = [:]
+                }
+                rawDataList.each { rawData ->
+                    [rawData.get("old_path"), rawData.get("new_path")]
+                        .findAll { it }
+                        .each { changedFilePath -> result[changedFilePath] = rawData.get("diff") }
+                }
+            }
+            if (!rawDataList) { break }
+        }
+    }
+    return result
+}
+
+def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
+    def result = null
+    def pageId = 0
+    withCredentials([
+        usernamePassword(
+            credentialsId: 'github-cred-trtllm-ci',
+            usernameVariable: 'NOT_USED_YET',
+            passwordVariable: 'GITHUB_API_TOKEN'
+        ),
+    ]) {
+        while(true) {
+            pageId += 1
+            def rawDataJson = pipeline.sh(
+                script: """
+                    curl --header "Authorization: Bearer \${GITHUB_API_TOKEN}" \
+                         --url "${githubPrApiUrl}/files?page=${pageId}&per_page=20"
+                """,
+                returnStdout: true
+            )
+            echo "rawDataJson: ${rawDataJson}"
+            def rawDataList = readJSON text: rawDataJson, returnPojo: true
+            if (function == "getOneFileChanges") {
+                if (result == null) {
+                    result = ""
+                }
+                rawDataList.find { rawData ->
+                    if (rawData.get("filename") == filePath || rawData.get("previous_filename") == filePath) {
+                        result = rawData.get("patch") ?: ""
+                        return true
+                    }
+                    return false
+                }
+                if (result != "") { break }
+            } else if (function == "getChangedFileList") {
+                if (result == null) {
+                    result = []
+                }
+                rawDataList.each { rawData ->
+                    result += [rawData.get("filename"), rawData.get("previous_filename")].findAll { it }
+                }
+            } else if (function == "getFileChanges") {
+                if (result == null) {
+                    result = [:]
+                }
+                rawDataList.each { rawData ->
+                    [rawData.get("filename"), rawData.get("previous_filename")]
+                        .findAll { it }
+                        .each { changedFilePath -> result[changedFilePath] = rawData.get("patch") ?: "" }
+                }
+            }
+            if (!rawDataList) { break }
+        }
+    }
+    return result
+}
+
+def getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath="", filePaths=[]) {
+    def headCommit = env.gitlabCommit?.toString()
+    // The merge queue names the base commit; for a PR, the wrapper pushed the base to the mirror.
+    def baseRef = globalVars[BASE_COMMIT]
+    if (!baseRef) {
+        def wrapperBuildNumber = globalVars[ACTION_INFO]?.get("parents")?.getAt(0)?.get("build_number")?.toString()
+        baseRef = "refs/heads/prjob/${wrapperBuildNumber}/base"
+    }
+    pipeline.withEnv(["GIT_DIFF_BASE_REF=${baseRef}"]) {
+        withCredentials([gitUsernamePassword(credentialsId: 'svc_tensorrt_gitlab_api_token', gitToolName: 'Default'),]) {
+            pipeline.sh "git -C ${LLM_ROOT} fetch --no-tags --depth=1 origin \"\${GIT_DIFF_BASE_REF}\""
+        }
+    }
+    def baseCommit = pipeline.sh(script: "git -C ${LLM_ROOT} rev-parse FETCH_HEAD", returnStdout: true).trim()
+    pipeline.echo("Using internal Git mirror diff: ${baseCommit}...${headCommit}")
+
+    def nameStatus = pipeline.sh(
+        script: "git -C ${LLM_ROOT} -c core.quotepath=false diff --name-status --find-renames ${baseCommit} ${headCommit}",
+        returnStdout: true
+    )
+    def changedFiles = nameStatus.readLines().collect { line ->
+        def fields = line.split('\t', -1)
+        def paths = []
+        for (int index = 1; index < fields.length; index++) {
+            if (fields[index]) {
+                paths.add(fields[index])
+            }
+        }
+        [status: fields[0], paths: paths]
+    }
+    if (function == "getChangedFileList") {
+        return changedFiles.collectMany { changedFile ->
+            changedFile.status.startsWith("R") || changedFile.status.startsWith("C")? changedFile.paths.reverse(): changedFile.paths
+        }
+    }
+
+    def renamePaths = [:]
+    changedFiles.findAll { changedFile ->
+        changedFile.status.startsWith("R") || changedFile.status.startsWith("C")
+    }.each { changedFile ->
+        changedFile.paths.each { changedFilePath -> renamePaths[changedFilePath] = changedFile.paths }
+    }
+    def cachedDiffs = [:]
+    def getFileDiff = { changedFilePath ->
+        if (cachedDiffs.containsKey(changedFilePath)) {
+            return cachedDiffs[changedFilePath]
+        }
+        def diffPaths = renamePaths.get(changedFilePath, [changedFilePath])
+        def rawDiff = ""
+        pipeline.withEnv([
+            "GIT_DIFF_PATH=${diffPaths[0]}",
+            "GIT_DIFF_RENAME_PATH=${diffPaths.size() > 1 ? diffPaths[1] : diffPaths[0]}",
+        ]) {
+            rawDiff = pipeline.sh(
+                script: "git -C ${LLM_ROOT} diff --unified=3 --inter-hunk-context=1 --find-renames ${baseCommit} ${headCommit} -- \":(literal)\${GIT_DIFF_PATH}\" \":(literal)\${GIT_DIFF_RENAME_PATH}\"",
+                returnStdout: true
+            )
+        }
+        def lines = rawDiff.readLines()
+        def firstHunk = lines.findIndexOf { it.startsWith("@@") }
+        def diff = firstHunk < 0 ? "" : lines.drop(firstHunk).join("\n")
+        diffPaths.each { diffPath -> cachedDiffs[diffPath] = diff }
+        return diff
+    }
+
+    if (function == "getOneFileChanges") {
+        return getFileDiff(filePath)
+    }
+    if (function == "getFileChanges") {
+        return filePaths.unique().collectEntries { changedFilePath -> [(changedFilePath): getFileDiff(changedFilePath)] }
+    }
+    pipeline.error("Unsupported PR diff operation: ${function}")
+}
+
+def getGithubMRChangedFileWithFallback(pipeline, globalVars, function, filePath="", filePaths=[]) {
+    try {
+        return getGithubMRChangedFile(pipeline, globalVars[GITHUB_PR_API_URL], function, filePath)
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("WARNING: [PR_DIFF_FALLBACK] GitHub PR files API failed for ${function}; " +
+                      "trying the internal Git mirror. Error: ${e.toString()}")
+        def result = getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath, filePaths)
+        pipeline.echo("WARNING: [PR_DIFF_FALLBACK] Internal Git mirror fallback succeeded for ${function}.")
+        return result
+    }
+}
+
+// Changed files or diffs of this build, from the first source (in `globalVars`):
+//   github_pr_api_url  GitHub PR files API, internal Git mirror with `git diff` as the fallback;
+//   base_commit        internal Git mirror, git diff base_commit..gitlabCommit;
+//   otherwise          GitLab MR diffs API.
+// function:
+//  - getChangedFileList -> list of paths
+//  - getOneFileChanges -> diff of `filePath`
+//  - getFileChanges -> map of path to diff, for the paths in `filePaths`
+def getMRChangedFile(pipeline, globalVars, function, filePath="", filePaths=[]) {
+    def result
+    if (globalVars[GITHUB_PR_API_URL]) {
+        result = getGithubMRChangedFileWithFallback(pipeline, globalVars, function, filePath, filePaths)
+    } else if (globalVars[BASE_COMMIT]) {
+        result = getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath, filePaths)
+    } else {
+        result = getGitlabMRChangedFile(pipeline, function, filePath)
+    }
+    if (function == "getFileChanges") {
+        result = result.findAll { changedFilePath, diff -> changedFilePath in filePaths }
+    }
+    return result
+}
+
+// Gate multi-GPU stages behind 'ci: full pre-merge approved' label.
+// Uses trtllm_utils.validatePRLabelApproval() from the shared lib to verify
+// both label existence and that the labeler is an active team member.
+// Exempt: PostMerge pipelines and GitLab MR builds (no GITHUB_PR_API_URL).
+def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
+    if (!globalVars[GITHUB_PR_API_URL]) {
+        echo "[requireMultiGpuApprovalLabel] Skipping label check: not a GitHub PR (no GITHUB_PR_API_URL)"
+        return false
+    }
+    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+        echo "[requireMultiGpuApprovalLabel] Skipping label check: PostMerge pipeline is exempt"
+        return false
+    }
+
+    def prMatch = (globalVars[GITHUB_PR_API_URL] =~ /\/pulls?\/(\d+)/)
+    if (!prMatch) {
+        echo "[requireMultiGpuApprovalLabel] Could not extract PR number from ${globalVars[GITHUB_PR_API_URL]}. Failing open."
+        return false
+    }
+    def prNumber = prMatch[0][1]
+
+    def result = trtllm_utils.validatePRLabelApproval(pipeline, prNumber, "ci: full pre-merge approved")
+    if (!result.checkCompleted) {
+        // API error — fail-open: do not block CI if the label check itself fails
+        echo "[requireMultiGpuApprovalLabel] Label validation incomplete (${result.error}). Failing open."
+        return false
+    }
+    if (result.labelExists && result.authorized) {
+        return false
+    }
+
+    // Label missing or unauthorized — write description marker for wrapper
+    // to surface in PR comment, and return the block reason string.
+    def existingDesc = currentBuild.description ?: ""
+    currentBuild.description = existingDesc + (existingDesc ? "<br/>" : "") +
+        "<span data-multi-gpu-label-required='true'>" +
+        "Multi-GPU tests require label 'ci: full pre-merge approved'" +
+        "</span>"
+    def reason = !result.labelExists
+        ? "label 'ci: full pre-merge approved' is not present on this PR"
+        : "label 'ci: full pre-merge approved' was applied by '${result.actor}' who is not an active member of NVIDIA/trt-llm-ci-approvers"
+    def blockMsg = "${arch} Multi-GPU tests blocked: ${reason}. " +
+         "Ask a member of NVIDIA/trt-llm-ci-approvers to add the label, then re-trigger CI."
+    echo "[requireMultiGpuApprovalLabel] ${blockMsg}"
+    return blockMsg
+}
+
+def getMergeRequestChangedFileList(pipeline, globalVars) {
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if ((params.InfraDryRun?.toString()?.toBoolean() ?: false) ||
+        isOfficialPostMergeJob ||
+        runMode == "nightly_release") {
+        pipeline.echo("Force set changed file list to empty list.")
+        return []
+    }
+
+    if (globalVars[CACHED_CHANGED_FILE_LIST] != null) {
+        return globalVars[CACHED_CHANGED_FILE_LIST]
+    }
+    try {
+        def changedFileList = getMRChangedFile(pipeline, globalVars, "getChangedFileList")
+        def changedFileListStr = changedFileList.join(",\n")
+        pipeline.echo("The changeset of this MR is: ${changedFileListStr}.")
+        globalVars[CACHED_CHANGED_FILE_LIST] = changedFileList
+        return globalVars[CACHED_CHANGED_FILE_LIST]
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("Get merge request changed file list failed. Error: ${e.toString()}")
+        globalVars[CACHED_CHANGED_FILE_LIST] = []
+        return globalVars[CACHED_CHANGED_FILE_LIST]
+    }
+}
+
+def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
+    // Note: This function intentionally propagates exceptions to the caller.
+    // If there is an error to get the changed file diff, skip merging the waive list.
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if ((params.InfraDryRun?.toString()?.toBoolean() ?: false) ||
+        isOfficialPostMergeJob ||
+        runMode == "nightly_release") {
+        pipeline.echo("Force set changed file diff to empty string.")
+        return ""
+    }
+
+    def diff = getMRChangedFile(pipeline, globalVars, "getOneFileChanges", filePath)
+    pipeline.echo("The change of ${filePath} is: ${diff}")
+    return diff
+}
+
+def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
+    def autoTriggerTagList = []
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (isOfficialPostMergeJob) {
+        pipeline.echo("Force set auto trigger tags to empty list.")
+        return autoTriggerTagList
+    }
+    def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
+    if (!changedFileList || changedFileList.isEmpty()) {
+        return autoTriggerTagList
+    }
+    def specialFileToTagMap = [
+        "tensorrt_llm/_torch/models/modeling_deepseekv3.py": ["-DeepSeek-"],
+        "tests/integration/defs/triton_server/": ["-Triton-"],
+        "triton_backend/": ["-Triton-"],
+        "cpp/kernels/fmha_v2/": ["-FMHA-"],
+        "tensorrt_llm/_torch/models/modeling_gpt_oss.py": ["-GptOss-"],
+    ]
+    for (file in changedFileList) {
+        for (String key : specialFileToTagMap.keySet()) {
+            if (file.startsWith(key)) {
+                autoTriggerTagList += specialFileToTagMap[key]
+            }
+        }
+    }
+    autoTriggerTagList = autoTriggerTagList.unique()
+    if (!autoTriggerTagList.isEmpty()) {
+        pipeline.echo("Auto trigger tags detected: ${autoTriggerTagList.join(', ')}")
+    }
+    return autoTriggerTagList
+}
+
+// ============================================================================
+// CBTS (Change-Based Testing Selection)
+//
+// Calls `cbts.command main` (jenkins/scripts/cbts/cbts/command/main.py) with PR
+// changed_files + diffs and returns a result map (or null = defer to existing
+// filter chain). Result keys: scope, affected_stages, reasons,
+// test_db_dir_override, affected_stage_test_counts, affected_stage_split_counts,
+// coverage_residual_files, coverage_decline_reason.
+// CBTS narrows test cases only — Build always runs. See cbts/README.md.
+//
+// Every `python3 -m cbts.command ...` call below is prefixed with
+// `PYTHONPATH=${LLM_ROOT}/jenkins/scripts/cbts` — the outer vendor dir, so
+// `import cbts.*` resolves without touching the rest of jenkins/scripts/.
+// ============================================================================
+
+def _cbtsEnsureCliDependencies(pipeline)
+{
+    try {
+        // The preparation pod is Debian; requirements.txt includes Click and PyYAML.
+        trtllm_utils.llmExecStepWithRetry(pipeline,
+            script: "apt-get update -qq && apt-get install -y -qq python3-pip")
+        trtllm_utils.llmExecStepWithRetry(pipeline,
+            script: "python3 -m pip install --break-system-packages --disable-pip-version-check " +
+                    "-r ${LLM_ROOT}/jenkins/scripts/cbts/requirements.txt")
+        return true
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("CBTS CLI dependencies unavailable (non-fatal): ${e.message}")
+        return false
+    }
+}
+
+def getCbtsResult(pipeline, testFilter, globalVars)
+{
+    // Explicit kill switch: `/bot run --disable-cbts` forces a full run.
+    if (testFilter[(DISABLE_CBTS)]) {
+        pipeline.echo("CBTS: disabled — user-specified /bot run --disable-cbts")
+        if (_cbtsEnsureCliDependencies(pipeline)) {
+            _cbtsReportDecision(pipeline, globalVars, "disabled", "user flag: disable_cbts", null)
+        }
+        return null
+    }
+
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (isOfficialPostMergeJob) {
+        pipeline.echo("CBTS: deferring — post-merge job")
+        return null
+    }
+
+    // CBTS only activates on bare `/bot run`. If the user specified any
+    // stage-selection flag, defer entirely to their explicit choice.
+    def triggeredFlags = _cbtsTriggeredUserFlags(testFilter)
+    if (!triggeredFlags.isEmpty()) {
+        pipeline.echo("CBTS: deferring — user-specified /bot run flag(s): ${triggeredFlags.join(', ')}")
+        if (_cbtsEnsureCliDependencies(pipeline)) {
+            _cbtsReportDecision(pipeline, globalVars, "deferred",
+                                "user flags: ${triggeredFlags.join(', ')}", null)
+        }
+        return null
+    }
+
+    def changedFiles = getMergeRequestChangedFileList(pipeline, globalVars).unique()
+    if (!changedFiles) {
+        pipeline.echo("CBTS: deferring — no changed files detected")
+        return null
+    }
+
+    try {
+        if (!_cbtsEnsureCliDependencies(pipeline)) {
+            pipeline.echo("CBTS: falling back to full run because CLI dependencies are unavailable")
+            return null
+        }
+        def coveragePilotEligible = false
+        // Ask Python which file patterns need diffs, fetch them.
+        def patternsOut = sh(
+            script: "cd ${LLM_ROOT} && PYTHONPATH=jenkins/scripts/cbts " +
+                    "python3 -m cbts.command main --list-needed-diffs",
+            returnStdout: true,
+        ).trim()
+        def needsDiffFor = patternsOut ? patternsOut.readLines().collect { it.trim() }.findAll { it } : []
+        def filesNeedingDiff = changedFiles.findAll { filePath ->
+            _cbtsMatchesAnyPattern(filePath, needsDiffFor)
+        }
+        def diffs = [:]
+        if (filesNeedingDiff) {
+            def fileChanges = getMRChangedFile(pipeline, globalVars, "getFileChanges", "", filesNeedingDiff)
+            diffs = filesNeedingDiff.collectEntries { filePath ->
+                // Null (patch omitted for binary / rename / too-large diffs) coerces to empty.
+                [(filePath): fileChanges[filePath] ?: ""]
+            }
+        }
+
+        // Write INPUT_JSON; Python reads stages/yaml itself.
+        def inputJson = groovy.json.JsonOutput.toJson([
+            changed_files: changedFiles,
+            diffs: diffs,
+            post_merge: testFilter[(IS_POST_MERGE)] ?: false,
+        ])
+        def inputPath = "${LLM_ROOT}/cbts_input.json"
+        writeFile file: inputPath, text: inputJson
+
+        def mainCmd = "cd ${LLM_ROOT} && PYTHONPATH=jenkins/scripts/cbts " +
+                      "python3 -m cbts.command main cbts_input.json"
+        def output = sh(script: mainCmd, returnStdout: true)
+        def result = _cbtsParseSelectionResult(output)
+
+        // Tier 1 owns the definition of handled files. Only prepare a coverage DB when
+        // its residual is eligible for Tier 2, and scope the compatibility check to it.
+        if (result.scope == null && result.coverage_residual_files &&
+                !result.coverage_decline_reason) {
+            def residualPath = "${LLM_ROOT}/cbts_coverage_residual.json"
+            writeFile file: residualPath,
+                      text: groovy.json.JsonOutput.toJson(result.coverage_residual_files)
+            def coverageContext = _cbtsCoverageAudit(pipeline, globalVars, residualPath)
+            def coverageDb = coverageContext?.db
+            coveragePilotEligible = coverageContext?.pilotEligible ?: false
+            if (coverageDb?.meta) {
+                def coverageCmd = mainCmd + " --coverage-db-meta ${coverageDb.meta}"
+                if (coverageDb.path) {
+                    coverageCmd += " --coverage-db ${coverageDb.path}"
+                }
+                output = sh(script: coverageCmd, returnStdout: true)
+                result = _cbtsParseSelectionResult(output)
+            } else if (coverageDb?.compatibility) {
+                result.coverage_compatibility = coverageDb.compatibility
+                result.coverage_decline_reason = coverageDb.decline_reason ?: ""
+                result.coverage_decline_category = "coverage_unavailable"
+                output = groovy.json.JsonOutput.toJson(result)
+            }
+        }
+
+        if (result.scope == null) {
+            pipeline.echo("CBTS: deferring — Python returned scope=null. " +
+                          "Reasons: ${result.reasons.join('; ')}")
+            _cbtsReportDecision(pipeline, globalVars, "fallback", "", output,
+                                false, false, false, coveragePilotEligible)
+            return null
+        }
+        def runStatus = (testFilter[(IS_POST_MERGE)] ?: false) ? "post_merge" : "pre_merge"
+        def multiGpuRequired = (testFilter[(MULTI_GPU_FILE_CHANGED)] ?: false) as boolean
+        def multiGpuLabelGateOpen = multiGpuRequired &&
+            _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
+        def coverageShadow = result.scope == "coverage" && !coveragePilotEligible
+        // Applied decisions pass the uploaded test DB to L0_Test. Shadow
+        // decisions save the same artifact but return null below, so L0_Test
+        // keeps using the baseline test DB.
+        if (result.test_db_dir_override || coverageShadow) {
+            try {
+                def archiveFiles = []
+                if (result.test_db_dir_override) {
+                    archiveFiles.add(result.test_db_dir_override)
+                }
+                if (coverageShadow) {
+                    writeFile file: "${LLM_ROOT}/cbts_shadow_decision.json", text: output
+                    archiveFiles.add("cbts_shadow_decision.json")
+                }
+                // Tar/upload from the workspace: rtUpload patterns are workspace-relative; /tmp uploads 0 files.
+                sh "tar czf ${LLM_ROOT}/cbts_test_db.tar.gz -C ${LLM_ROOT} ${archiveFiles.join(' ')}"
+                trtllm_utils.uploadArtifacts("${LLM_ROOT}/cbts_test_db.tar.gz", "${UPLOAD_PATH}/cbts/")
+                result.cbts_test_db_artifact_path = "${UPLOAD_PATH}/cbts/cbts_test_db.tar.gz"
+                pipeline.echo("CBTS Layer 3: uploaded cbts_test_db to ${result.cbts_test_db_artifact_path}")
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                pipeline.echo("CBTS Layer 3: artifact upload failed (non-fatal): ${e.message}")
+            }
+        }
+        if (coverageShadow) {
+            if (result.cbts_test_db_artifact_path) {
+                try {
+                    def reportedDecision = new groovy.json.JsonSlurper().parseText(output)
+                    reportedDecision.shadow_selection_artifact_path = result.cbts_test_db_artifact_path
+                    output = groovy.json.JsonOutput.toJson(reportedDecision)
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception e) {
+                    pipeline.echo("CBTS: shadow artifact path annotation failed (non-fatal): ${e.message}")
+                }
+            }
+            pipeline.echo("CBTS: shadow coverage decision — scope=${result.scope}, " +
+                          "stages=${result.affected_stages.size()}; baseline remains active")
+            _cbtsReportDecision(pipeline, globalVars, runStatus, "", output,
+                                multiGpuRequired, multiGpuLabelGateOpen, false,
+                                coveragePilotEligible)
+            return null
+        }
+        pipeline.echo("CBTS: scope=${result.scope}, " +
+                      "stages=${result.affected_stages.size()}")
+        _cbtsReportDecision(pipeline, globalVars, runStatus, "", output,
+                            multiGpuRequired, multiGpuLabelGateOpen, true,
+                            coveragePilotEligible)
+        return result
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("CBTS failed, falling back to full run: ${e}")
+        return null
+    }
+}
+
+// Observe the multi-GPU approval gate at CBTS decision time. This is telemetry
+// only: a later dispatch re-checks the label so this snapshot cannot change CI
+// behavior. Match the dispatch policy and fail open on non-interruption errors.
+def _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
+{
+    try {
+        def blockReason = requireMultiGpuApprovalLabel(
+            pipeline, globalVars, "CBTS telemetry")
+        return !blockReason
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("CBTS: multi-GPU label telemetry check failed (${e.message}); failing open")
+        return true
+    }
+}
+
+def _cbtsCoverageDecline(boolean pilotEligible, String reason)
+{
+    return [
+        db: [
+            compatibility: "unknown",
+            decline_reason: "coverage tier declined: ${reason}",
+        ],
+        pilotEligible: pilotEligible,
+    ]
+}
+
+// Resolve pilot application eligibility, then fetch and audit the touch DB for
+// every Tier-2 residual. Returns {db, pilotEligible}; a compatibility decline
+// remains in db without a path so it is observable in shadow and pilot modes.
+def _cbtsCoverageAudit(pipeline, globalVars, String residualPath)
+{
+    def pilotEligible = false
+    def artifactoryNetrc = ""
+    try {
+        // artifact.py resolves, downloads and merges the x86/SBSA DBs; paths come back
+        // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
+        // The checked-out revision is the PR head; its merge base is what drift is measured against.
+        def prHead = env.gitlabMergeRequestLastCommit ?: ""
+        def prNumber = _cbtsPrNumber(globalVars)
+        if (!(prHead ==~ /[0-9a-fA-F]{40}/) || !(prNumber ==~ /[1-9]\d*/)) {
+            pipeline.echo("CBTS audit: PR number/head unavailable; cannot make coverage DB selection repeatable")
+            return _cbtsCoverageDecline(
+                pilotEligible, "PR identity unavailable for coverage DB pin")
+        }
+
+        // artifact.py reads build_info.txt with jenkins/scripts/fetch_build_artifact.sh, which
+        // looks in the primary location first and authenticates to aws with this netrc. It holds
+        // the publishing credential, the one the pipelines publish build artifacts with.
+        // When artifactory.nvidia.com is the primary location and rejects the credential, the
+        // helper prints a message naming it, artifact.py exits 1, and the coverage tier declines
+        // like after any other failure; a rejection while it is the secondary counts as a failed
+        // read, and artifact.py skips that build.
+        // While artifactory.nvidia.com is the primary location (the default) and is down or
+        // unreachable, every build_info.txt read fails after the helper's retries. artifact.py
+        // skips each build whose read fails, so the coverage tier declines only after
+        // --resolve-pin has tried every recent build that has both coverage archives, or after
+        // --prepare has tried the pinned one. Setup Environment, which runs this before any build
+        // starts, waits for those reads; build_commit in artifact.py says how long each takes and
+        // what changes after a rollback to urm.
+        def artifactoryCredentialId = 'aws-artifactory-credentials'
+        def artifactsPrimary = llmArtifactsPrimary()
+        artifactoryNetrc = "${pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
+        withCredentials([usernamePassword(credentialsId: artifactoryCredentialId,
+                usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
+            withEnv(["ARTIFACTORY_NETRC=${artifactoryNetrc}"]) {
+                sh(label: "Write Artifactory netrc", script: '''
+                    set +x
+                    umask 077
+                    printf 'machine artifactory.nvidia.com login %s password %s\\n' "$ARTIFACTORY_USER" "$ARTIFACTORY_PASSWORD" > "$ARTIFACTORY_NETRC"
+                ''')
+            }
+        }
+        def artifactEnv = [
+            "LLM_ARTIFACTS_PRIMARY=${artifactsPrimary}",
+            "ARTIFACTORY_NETRC=${artifactoryNetrc}",
+            "ARTIFACTORY_CREDENTIAL_ID=${artifactoryCredentialId}",
+        ]
+
+        def readyJson = ""
+        def prAuthor = ""
+        def pinPlanJson = ""
+        withCredentials([usernamePassword(
+            credentialsId: 'github-cred-trtllm-ci',
+            usernameVariable: 'NOT_USED_YET',
+            passwordVariable: 'GITHUB_API_TOKEN'),
+        ]) {
+            prAuthor = sh(
+                script: "cd ${LLM_ROOT} && PYTHONPATH=jenkins/scripts/cbts " +
+                        "python3 -m cbts.command coverage pilot",
+                returnStdout: true,
+            ).trim()
+            pilotEligible = prAuthor && CBTS_COVERAGE_PILOT_USERS.any { it.equalsIgnoreCase(prAuthor) }
+            pipeline.echo("CBTS coverage pilot: pr_author=${prAuthor ?: 'unknown'}, eligible=${pilotEligible}")
+            withEnv(artifactEnv) {
+                pinPlanJson = sh(
+                    script: "cd ${LLM_ROOT} && PYTHONPATH=jenkins/scripts/cbts " +
+                            "python3 -m cbts.command coverage selection artifact " +
+                            "--resolve-pin cbts_db_pin.json --pr-number ${prNumber} " +
+                            "--pr-head ${prHead} || true",
+                    returnStdout: true,
+                ).trim()
+            }
+        }
+        if (!pinPlanJson) {
+            pipeline.echo("CBTS audit: coverage DB pin could not be resolved")
+            return _cbtsCoverageDecline(pilotEligible, "coverage DB pin could not be resolved")
+        }
+        def pinPlan = new groovy.json.JsonSlurper().parseText(pinPlanJson)
+        if (pinPlan.status != "ready") {
+            pipeline.echo("CBTS audit: ${pinPlan.decline_reason ?: 'coverage DB pin declined'}")
+            return [db: pinPlan, pilotEligible: pilotEligible]
+        }
+
+        if (pinPlan.pin_upload_required) {
+            try {
+                trtllm_utils.uploadArtifacts(
+                    "${LLM_ROOT}/${pinPlan.pin_path}", pinPlan.pin_target)
+                pipeline.echo("CBTS audit: pinned coverage DB build ${pinPlan.build} " +
+                              "for PR head ${prHead}")
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                pipeline.echo("CBTS audit: coverage DB pin upload failed (${e.message})")
+                return _cbtsCoverageDecline(pilotEligible, "coverage DB pin upload failed")
+            }
+        } else {
+            pipeline.echo("CBTS audit: reusing pinned coverage DB build ${pinPlan.build}")
+        }
+
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'github-cred-trtllm-ci',
+                usernameVariable: 'NOT_USED_YET',
+                passwordVariable: 'GITHUB_API_TOKEN'),
+        ]) {
+            withEnv(artifactEnv) {
+                readyJson = sh(
+                    script: "cd ${LLM_ROOT} && PYTHONPATH=jenkins/scripts/cbts " +
+                            "python3 -m cbts.command coverage selection artifact " +
+                            "--prepare cbts_cov --paths-json cbts_coverage_residual.json" +
+                            " --pr-head ${prHead}" +
+                            " --build ${pinPlan.build}" +
+                            " --expected-commit ${pinPlan.commit} || true",
+                    returnStdout: true,
+                ).trim()
+            }
+        }
+        if (!readyJson) {
+            pipeline.echo("CBTS audit: no coverage DB could be prepared — Tier 2 decision unavailable")
+            return _cbtsCoverageDecline(pilotEligible, "coverage DB could not be prepared")
+        }
+        def ready = new groovy.json.JsonSlurper().parseText(readyJson)
+        if (!ready.path) {
+            pipeline.echo("CBTS audit: Tier-2 residual compatibility check did not pass")
+            return [db: ready, pilotEligible: pilotEligible]
+        }
+        pipeline.echo("CBTS audit: Tier-2 residual applies cleanly to the selected coverage DB")
+        sh("cd ${LLM_ROOT} && PYTHONPATH=jenkins/scripts/cbts " +
+           "python3 -m cbts.command coverage selection audit --db ${ready.path}")
+        return [db: ready, pilotEligible: pilotEligible]
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("CBTS audit: skipped (non-fatal): ${e.message}")
+        return [db: null, pilotEligible: pilotEligible]
+    } finally {
+        if (artifactoryNetrc) {
+            sh(label: "Remove Artifactory netrc", script: "rm -f '${artifactoryNetrc}'")
+        }
+    }
+}
+
+def _cbtsPrNumber(globalVars)
+{
+    def prUrl = globalVars[GITHUB_PR_API_URL]
+    if (prUrl) {
+        def match = (prUrl =~ /\/pulls?\/(\d+)/)
+        if (match.find()) {
+            return match.group(1)
+        }
+        return ""
+    }
+    return env.gitlabMergeRequestIid ?: ""
+}
+
+// Post one CBTS decision record to OpenSearch (best-effort; never blocks CI).
+// decisionJson null for deferred; reason used only then. Context/creds via env.
+// Multi-GPU enters the pre-merge denominator only when normal CI requires it
+// and the approval-label gate is open at CBTS decision time.
+def _cbtsReportDecision(pipeline, globalVars, String status, String reason, String decisionJson,
+                        boolean multiGpuRequired = false, boolean multiGpuLabelGateOpen = false,
+                        boolean cbtsApplied = false, boolean coveragePilotEligible = false)
+{
+    try {
+        def args = "--status ${status}"
+        if (multiGpuRequired) {
+            args += " --multi-gpu-required"
+        }
+        if (multiGpuLabelGateOpen) {
+            args += " --multi-gpu-label-gate-open"
+        }
+        if (cbtsApplied) {
+            args += " --cbts-applied"
+        }
+        if (coveragePilotEligible) {
+            args += " --coverage-pilot-eligible"
+        }
+        if (decisionJson != null) {
+            pipeline.writeFile(file: "${LLM_ROOT}/cbts_decision.json", text: decisionJson)
+            args += " --decision cbts_decision.json"
+        } else if (reason) {
+            args += " --reason '${reason.replace("'", "")}'"
+        }
+        // PR number for s_pr_number, mirroring perf_regression_utils: GitHub PR
+        // builds carry it in github_pr_api_url (.../pulls/<n>); GitLab MR builds
+        // expose env.gitlabMergeRequestIid. Empty for post-merge/branch builds.
+        def prNumber = _cbtsPrNumber(globalVars)
+        if (prNumber) {
+            args += " --pr-number ${prNumber}"
+        }
+        sh("cd ${LLM_ROOT} && PYTHONPATH=jenkins/scripts/cbts " +
+           "python3 -m cbts.command report-decision ${args}")
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("CBTS: decision telemetry failed (non-fatal): ${e.message}")
+    }
+}
+
+// Translate an Ant-style glob to a regex:
+//   **/  zero or more path segments
+//   **   any chars (including /)
+//   *    any chars except /
+//   ?    single char except /
+def _cbtsGlobToRegex(String glob)
+{
+    def escaped = glob.collect { c ->
+        (c == '*' || c == '?') ? c
+            : ('.+()[]{}|^$\\'.contains(c) ? '\\' + c : c)
+    }.join('')
+    return '^' + escaped
+        .replace('**/', '__CBTSDOUBLESLASH__')
+        .replace('**',  '__CBTSDOUBLESTAR__')
+        .replace('*',   '[^/]*')
+        .replace('?',   '[^/]')
+        .replace('__CBTSDOUBLESLASH__', '(?:.*/)?')
+        .replace('__CBTSDOUBLESTAR__',  '.*') + '$'
+}
+
+def _cbtsMatchesAnyPattern(String filePath, List patterns)
+{
+    return patterns.any { filePath ==~ _cbtsGlobToRegex(it) }
+}
+
+// Returns user-set stage-selection flags that should force CBTS to defer.
+// IS_POST_MERGE and orthogonal flags (REUSE_*, DEBUG_MODE, DETAILED_LOG, ...)
+// are intentionally absent.
+def _cbtsTriggeredUserFlags(testFilter)
+{
+    def deferFlags = [
+        ENABLE_SKIP_TEST, TEST_STAGE_LIST, EXTRA_STAGE_LIST, GPU_TYPE_LIST,
+        TEST_BACKEND, ADD_MULTI_GPU_TEST, ONLY_MULTI_GPU_TEST, DISABLE_MULTI_GPU_TEST,
+    ]
+    return deferFlags.findAll { testFilter[it] }
+                     .collect { "${it}=${testFilter[it]}" }
+}
+
+// Parse CBTS JSON stdout into a map. `scope == null` → no decision; caller
+// logs reasons and defers.
+def _cbtsParseSelectionResult(String text)
+{
+    def data = new groovy.json.JsonSlurper().parseText(text)
+    return [
+        scope: data.scope,
+        affected_stages: data.affected_stages ?: [],
+        reasons: data.reasons ?: [],
+        test_db_dir_override: data.test_db_dir_override,
+        affected_stage_test_counts: data.affected_stage_test_counts ?: [:],
+        affected_stage_split_counts: data.affected_stage_split_counts ?: [:],
+        // The first pass uses these to decide whether Tier 2 should prepare a DB.
+        coverage_residual_files: data.coverage_residual_files ?: [],
+        coverage_decline_reason: data.coverage_decline_reason ?: "",
+        // Explicit null check preserves `false`; default True is safe.
+        sanity_required: data.sanity_required != null ? data.sanity_required : true,
+        perfsanity_required: data.perfsanity_required != null ? data.perfsanity_required : true,
+        // Coverage tier omits multi-GPU stages; L0_Test re-adds them under this flag.
+        enable_multi_gpu: data.enable_multi_gpu ?: false,
+    ]
+}
+
+// Returns true when the PR touches any file that requires @NVIDIA/trt-llm-oss-compliance review
+// (mirrors the patterns in .github/CODEOWNERS under "OSS Compliance & Legal").
+def getOssComplianceFileChanged(pipeline, globalVars)
+{
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (isOfficialPostMergeJob) {
+        pipeline.echo("OSS compliance check: skipped (post-merge).")
+        return false
+    }
+
+    // Exact file matches
+    def exactFiles = [
+        "LICENSE",
+        "setup.py",
+        "pyproject.toml",
+        "requirements.txt",
+        "requirements-dev.txt",
+        "cpp/CMakeLists.txt",
+        ".github/CODEOWNERS",
+        "jenkins/license_cpp.json",
+        "tensorrt_llm/usage/llm_args_golden_manifest.json",
+    ] as Set
+
+    // Prefix matches (directory trees and glob-style prefixes from CODEOWNERS)
+    def prefixes = [
+        "ATTRIBUTIONS-",
+        "cpp/cmake/",
+        "3rdparty/",
+        "triton_kernels/",
+        "docker/common/",
+        "tensorrt_llm/usage/",
+    ]
+
+    def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
+    if (!changedFileList || changedFileList.isEmpty()) {
+        return false
+    }
+
+    def matched = changedFileList.find { file ->
+        exactFiles.contains(file) || prefixes.any { prefix -> file.startsWith(prefix) }
+    }
+    if (matched) {
+        pipeline.echo("OSS compliance file changed: ${matched}")
+        return true
+    }
+    return false
+}
+
+def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
+{
+    if (testFilter[(DISABLE_MULTI_GPU_TEST)]) {
+        pipeline.echo("Force not run multi-GPU testing.")
+        return false
+    }
+    if (testFilter[(ADD_MULTI_GPU_TEST)] || testFilter[(ONLY_MULTI_GPU_TEST)] || testFilter[(IS_POST_MERGE)]) {
+        pipeline.echo("Force run multi-GPU testing.")
+        return true
+    }
+
+    def relatedFileList = [
+        "cpp/include/tensorrt_llm/batch_manager/",
+        "cpp/include/tensorrt_llm/executor/",
+        "cpp/include/tensorrt_llm/runtime/utils/mpiUtils.h",
+        "cpp/include/tensorrt_llm/runtime/utils/multiDeviceUtils.h",
+        "cpp/include/tensorrt_llm/runtime/worldConfig.h",
+        "cpp/tensorrt_llm/batch_manager/",
+        "cpp/tensorrt_llm/executor/",
+        "cpp/tensorrt_llm/kernels/communicationKernels/",
+        "cpp/tensorrt_llm/kernels/customAllReduceKernels.cu",
+        "cpp/tensorrt_llm/kernels/customAllReduceKernels.h",
+        "cpp/tensorrt_llm/kernels/fmhaDispatcher.cpp",
+        "cpp/tensorrt_llm/kernels/fmhaDispatcher.h",
+        "cpp/tensorrt_llm/kernels/gptKernels.cu",
+        "cpp/tensorrt_llm/kernels/gptKernels.h",
+        "cpp/tensorrt_llm/kernels/moe/communication/",
+        "cpp/tensorrt_llm/kernels/moe/loadBalance/",
+        "cpp/tensorrt_llm/kernels/moe/utils/moeAlignKernels",
+        "cpp/tensorrt_llm/kernels/moeCommKernelsCommon.h",
+        "cpp/tensorrt_llm/kernels/moeTopKFuncs.cuh",
+        "cpp/tensorrt_llm/kernels/moe_utils.cuh",
+        "cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/",
+        "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.cu",
+        "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.h",
+        "cpp/tensorrt_llm/kernels/userbuffers/",
+        "cpp/tensorrt_llm/kernels/xqaDispatcher.cpp",
+        "cpp/tensorrt_llm/kernels/xqaDispatcher.h",
+        "cpp/tensorrt_llm/nanobind/",
+        "cpp/tensorrt_llm/runtime/ipcUtils.cpp",
+        "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
+        "cpp/tensorrt_llm/runtime/utils/mpiUtils.cpp",
+        "cpp/tensorrt_llm/runtime/workerPool.h",
+        "cpp/tensorrt_llm/runtime/worldConfig.cpp",
+        "cpp/tensorrt_llm/thop/allgatherOp.cpp",
+        "cpp/tensorrt_llm/thop/allreduceOp.cpp",
+        "cpp/tensorrt_llm/thop/reducescatterOp.cpp",
+        "cpp/tests/unit_tests/multi_gpu/",
+        "jenkins/L0_Test.groovy",
+        "requirements.txt",
+        "security_scanning/pyproject.toml",
+        "tensorrt_llm/_ipc_utils.py",
+        "tensorrt_llm/_torch/compilation/patterns/ar_residual_norm.py",
+        "tensorrt_llm/_torch/compilation/patterns/ub_allreduce.py",
+        "tensorrt_llm/_torch/custom_ops/torch_custom_ops.py",
+        "tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py",
+        "tensorrt_llm/_torch/distributed/",
+        "tensorrt_llm/_torch/models/modeling_llama.py",
+        "tensorrt_llm/_torch/models/modeling_qwen3_next.py",
+        "tensorrt_llm/_torch/moe/",
+        "tensorrt_llm/_torch/pyexecutor/_util.py",
+        "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py",
+        "tensorrt_llm/_torch/pyexecutor/model_engine.py",
+        "tensorrt_llm/_torch/pyexecutor/py_executor.py",
+        "tensorrt_llm/_torch/weight_sharing/",
+        "tensorrt_llm/_torch/visual_gen/attention/backends/parallel.py",
+        "tensorrt_llm/_torch/visual_gen/modules/vae/",
+        "tensorrt_llm/_torch/visual_gen/attention/attention.py",
+        "tensorrt_llm/_torch/visual_gen/parallel/",
+        "tensorrt_llm/_torch/visual_gen/executor.py",
+        "tensorrt_llm/_torch/visual_gen/mapping.py",
+        "tensorrt_llm/_torch/visual_gen/pipeline.py",
+        "tensorrt_llm/_torch/visual_gen/pipeline_loader.py",
+        "tensorrt_llm/_torch/visual_gen/models/wan/parallel_vae.py",
+        "tensorrt_llm/visual_gen/",
+        "tensorrt_llm/bench/benchmark/visual_gen.py",
+        "tensorrt_llm/evaluate/json_mode_eval.py",
+        "tensorrt_llm/evaluate/mmlu.py",
+        "tensorrt_llm/executor/",
+        "tensorrt_llm/functional.py",
+        "tensorrt_llm/inputs/registry.py",
+        "tensorrt_llm/inputs/tokenization.py",
+        "tensorrt_llm/llmapi/disagg_utils.py",
+        "tensorrt_llm/llmapi/mgmn_leader_node.py",
+        "tensorrt_llm/llmapi/mgmn_worker_node.py",
+        "tensorrt_llm/llmapi/mpi_session.py",
+        "tensorrt_llm/llmapi/trtllm-llmapi-launch",
+        "tensorrt_llm/mapping.py",
+        "tensorrt_llm/models/llama/",
+        "tensorrt_llm/parameter.py",
+        "tensorrt_llm/serve/__init__.py",
+        "tensorrt_llm/serve/cluster_storage.py",
+        "tensorrt_llm/serve/disagg_auto_scaling.py",
+        "tensorrt_llm/serve/extensions/",
+        "tensorrt_llm/serve/metadata_server.py",
+        "tensorrt_llm/serve/openai_client.py",
+        "tensorrt_llm/serve/openai_disagg_server.py",
+        "tensorrt_llm/serve/openai_disagg_service.py",
+        "tensorrt_llm/serve/openai_server.py",
+        // The shared prompt-preparation core and its callers (chat, completions,
+        // multimodal-encoder routes, count_tokens, KV-cache governor, Responses, router).
+        "tensorrt_llm/serve/render/",
+        "tensorrt_llm/serve/resource_governor.py",
+        "tensorrt_llm/serve/responses_utils.py",
+        "tensorrt_llm/serve/router.py",
+        "tensorrt_llm/serve/router_utils.py",
+        "tensorrt_llm/serve/serving_extensions.py",
+        "tests/integration/defs/cpp/test_multi_gpu.py",
+        "tests/integration/defs/model_express/",
+        "tests/integration/test_lists/test-db/l0_b200_multi_gpus_perf_sanity.yml",
+        "tests/integration/test_lists/test-db/l0_b200_visual_gen_perf_sanity.yml",
+        "tests/integration/test_lists/test-db/l0_dgx_b200.yml",
+        "tests/integration/test_lists/test-db/l0_dgx_b300.yml",
+        "tests/integration/test_lists/test-db/l0_dgx_b300_efa_multi_nodes.yml",
+        "tests/integration/defs/perf/test_efa_disaggregated.py",
+        "tests/test_common/efa_validation.py",
+        "tests/scripts/perf-sanity/disaggregated/b300_qwen3_0.6b_efa_functional.yaml",
+        "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
+        "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
+        "tests/integration/test_lists/test-db/l0_dgx_h200_perf_sanity.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_gpus.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_gpus_perf_sanity.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node8_gpu32.yml",
+        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_node2_gpu8.yml",
+        "tests/integration/test_lists/test-db/l0_gb300.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_gpus.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_gpus_perf_sanity.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_node2_gpu8.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_node4_gpu16.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8.yml",
+        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node8_gpu32.yml",
+        "tests/integration/test_lists/test-db/l0_model_express.yml",
+        "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
+        "tests/unittest/_torch/multi_gpu/",
+        "tests/unittest/_torch/moe/multi_gpu/",
+        "tests/unittest/_torch/multi_gpu_modeling/",
+        "tests/unittest/_torch/visual_gen/multi_gpu/",
+        "tests/unittest/disaggregated/",
+        "tests/unittest/llmapi/test_llm_multi_gpu.py",
+        "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
+        "tests/integration/defs/accuracy/test_disaggregated_serving.py",
+        "tests/unittest/_torch/ray_orchestrator/multi_gpu/",
+        "tests/integration/defs/examples/test_ray.py",
+        "tests/unittest/llmapi/test_async_llm.py",
+        "docker/common/install_ucx.sh",
+        "docker/common/install_nixl.sh",
+    ]
+
+    def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
+    if (!changedFileList || changedFileList.isEmpty()) {
+        return false
+    }
+
+    def changedFileListStr = ","
+    def relatedFileChanged = false
+    try {
+        changedFileListStr = changedFileList.join(", ")
+        relatedFileChanged = relatedFileList.any { it ->
+            if (changedFileListStr.contains(it)) {
+                return true
+            }
+        }
+    }
+    catch (InterruptedException e)
+    {
+        throw e
+    }
+    catch (Exception e)
+    {
+        pipeline.echo("getMultiGpuFileChanged failed execution. Error: ${e.toString()}")
+    }
+    if (relatedFileChanged) {
+        pipeline.echo("Detect multi-GPU related files changed.")
+    }
+    return relatedFileChanged
+}
+
+def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (isOfficialPostMergeJob) {
+        pipeline.echo("Force set ONLY_ONE_GROUP_CHANGED \"\".")
+        return ""
+    }
+    def groupFileMap = [
+        "Docs": [
+            // Matched by prefix here, plus any "*.md" file anywhere in the repo (handled below).
+            "docs/",
+        ],
+        "PyTorch": [
+            "tensorrt_llm/_torch/",
+            "tensorrt_llm/scaffolding/",
+            "tests/unittest/_torch/",
+            "tests/unittest/scaffolding/",
+            "tests/unittest/llmapi/test_llm_pytorch.py",
+            "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
+            "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
+            "tests/integration/defs/disaggregated/",
+            "examples/disaggregated",
+            "examples/pytorch/",
+            "examples/scaffolding/",
+            "docs/",
+        ],
+        "Triton": [
+            "tests/integration/defs/triton_server/",
+            "triton_backend/",
+        ],
+    ]
+
+    def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
+    if (!changedFileList || changedFileList.isEmpty()) {
+        return ""
+    }
+
+    for (group in groupFileMap.keySet()) {
+        def groupPrefixes = groupFileMap[group]
+        def matchesGroup = { file ->
+            // Any *.md file, anywhere in the repo, counts as Docs-only.
+            if (group == "Docs" && file.endsWith(".md")) {
+                return true
+            }
+            return groupPrefixes.any { prefix -> file.startsWith(prefix) }
+        }
+        def allFilesInGroup = changedFileList.every(matchesGroup)
+
+        if (allFilesInGroup) {
+            pipeline.echo("Only ${group} files changed.")
+            return group
+        } else {
+            def nonGroupFile = changedFileList.find { file -> !matchesGroup(file) }
+            if (nonGroupFile != null) {
+                pipeline.echo("Found non-${group} file: ${nonGroupFile}")
+            }
+        }
+    }
+
+    return ""
+}
+
+// Upload sqlite-only early coverage after single-GPU finishes, before multi-GPU starts; non-fatal.
+def uploadArchCoverage(String arch, pipeline, testFilter) {
+    if (!testFilter[(CBTS_COVERAGE)]) {
+        return
+    }
+    def sbsaPrefixPattern = "^results-(GH200|GB10|GB200|GB300|CPU-Generic-arm)-"
+    def archGrepCmd = (arch == "SBSA")
+        ? "grep -E '${sbsaPrefixPattern}' result_file_names.txt > arch_file_names.txt || true"
+        : "grep -v -E '${sbsaPrefixPattern}' result_file_names.txt > arch_file_names.txt || true"
+    try {
+        timeout(time: 15, unit: 'MINUTES') {
+            def podSpec = createKubernetesPodConfig("", "agent")
+            trtllm_utils.launchKubernetesPod(pipeline, podSpec, "alpine", {
+                stage("Upload Single-GPU Coverage (${arch})") {
+                    def testResultLink = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results"
+                    sh "rm -rf cov && mkdir -p cov"
+                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add --no-cache curl python3 py3-pip")
+                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
+                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget ${testResultLink}/", allowStepFailed: true)
+                    sh "cat index.html | grep \"tar.gz\" | cut -d \"\\\"\" -f 2 > result_file_names.txt"
+                    sh archGrepCmd
+                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cat arch_file_names.txt | xargs -n1 -I {} wget -c -nv ${testResultLink}/{}", allowStepFailed: true)
+                    sh "find . -name 'results-*.tar.gz' -type f -exec tar -zxvf {} \\; || true"
+                    sh "find . -type f -name '.cbtscov.*.sqlite' -exec mv -t cov/ {} + || true"
+                    def fileCount = sh(returnStdout: true, script: 'find cov -name ".cbtscov.*.sqlite" | wc -l').replaceAll("\\s","").toInteger()
+                    if (fileCount > 0) {
+                        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+                        // This is minimal alpine pod, install the libraries needed by CBTS utilities manually
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${LLM_ROOT}/jenkins/scripts/cbts/requirements.txt")
+                        sh """
+                            PYTHONPATH=${LLM_ROOT}/jenkins/scripts/cbts \
+                            python3 -m cbts.command coverage collection pystart-report \
+                                --glob 'cov/.cbtscov.*.sqlite' \
+                                --out-sqlite cov/cbts_touchmap.sqlite
+                        """
+                        sh "cd cov && tar czf cbts_pystart_report_${arch}.tar.gz cbts_touchmap.sqlite"
+                        trtllm_utils.uploadArtifacts("cov/cbts_pystart_report_${arch}.tar.gz", "${UPLOAD_PATH}/cbts-coverage/")
+                        echo "CBTS early coverage (${arch}): https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report_${arch}.tar.gz"
+                    } else {
+                        echo "CBTS early coverage (${arch}): no data files found, skipping."
+                    }
+                }
+            })
+        }
+    } catch (FlowInterruptedException e) {
+        // The 15-minute timeout above is non-fatal; user aborts and upstream
+        // pipeline interruptions must keep propagating.
+        if (e.causes.any { it.class.simpleName == 'ExceededTimeout' }) {
+            echo "CBTS early coverage upload (${arch}) timed out after 15 min (non-fatal): skipping."
+        } else {
+            throw e
+        }
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "CBTS early coverage upload (${arch}) failed (non-fatal): ${e.toString()}"
+    }
+}
+
+def collectTestResults(pipeline, testFilter, globalVars)
+{
+    collectResultPodSpec = createKubernetesPodConfig("", "agent")
+    trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
+        // 1. Serial: download tarballs, extract, and run junit
+        stage ("Collect Test Result") {
+            sh "rm -rf **/*.xml *.tar.gz"
+
+            testResultLink = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results"
+
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add --no-cache curl")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget ${testResultLink}/", allowStepFailed: true)
+            sh "cat index.html | grep \"tar.gz\" | cut -d \"\\\"\" -f 2 > result_file_names.txt"
+            sh "cat result_file_names.txt"
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cat result_file_names.txt | xargs -n1 -I {} wget -c -nv ${testResultLink}/{}", allowStepFailed: true)
+            sh "ls -l | grep \"tar.gz\" || true"
+            resultFileNumber = sh(script: "cat result_file_names.txt | wc -l", returnStdout: true)
+            resultFileDownloadedNumber = sh(script: "ls -l | grep \"tar.gz\" | wc -l", returnStdout: true)
+            echo "Result File Number: ${resultFileNumber}, Downloaded: ${resultFileDownloadedNumber}"
+
+            sh "find . -name results-\\*.tar.gz -type f -exec tar -zxvf {} \\; || true"
+            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+
+            junit(testResults: '**/results*.xml', allowEmptyResults : true)
+
+            // Pre-install shared dependencies for parallel tasks
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
+            // This is minimal alpine pod, install the libraries needed by CBTS utilities manually
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${LLM_ROOT}/jenkins/scripts/cbts/requirements.txt")
+        } // Collect test result stage
+
+        // 2. Parallel: Rerun Report, Test Coverage, and AI Failure Analysis
+        def parallelTasks = [:]
+        parallelTasks["Rerun Report"] = {
+            try {
+            timeout(time: 10, unit: 'MINUTES') {
+            stage("Rerun Report") {
+                sh "rm -rf rerun && mkdir -p rerun"
+                sh "find . -type f -wholename '*/rerun_results.xml' -exec sh -c 'mv \"{}\" \"rerun/\$(basename \$(dirname \"{}\"))_rerun_results.xml\"' \\; || true"
+                sh "find rerun -type f"
+                def rerunFileCount = sh(returnStdout: true, script: 'find rerun -type f | wc -l').replaceAll("\\s","").toInteger()
+                if (rerunFileCount == 0) {
+                    echo "Rerun report is skipped because there is no rerun test data file."
+                    return
+                }
+                def xmlFiles = findFiles(glob: 'rerun/**/*.xml')
+                def xmlFileList = xmlFiles.collect { it.path }
+                def inputfiles = xmlFileList.join(',')
+                echo "inputfiles: ${inputfiles}"
+                sh """
+                    python3 llm/jenkins/scripts/test_rerun.py \
+                    generate_rerun_report \
+                    --output-file=rerun/rerun_report.xml \
+                    --input-files=${inputfiles}
+                """
+                if (fileExists("rerun/rerun_report.html")) {
+                    try {
+                        trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
+                        echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
+                    } catch (Exception e) {
+                        echo "Failed to upload rerun report: ${e.toString()}"
+                    }
+                } else {
+                    echo "No rerun test results found, skipping rerun report upload."
+                }
+                catchError(
+                    buildResult: 'SUCCESS',
+                    stageResult: 'UNSTABLE') {
+                    error "Some failed tests were reruned, please check the rerun report."
+                }
+            } // Rerun report stage
+            } // timeout 10 min
+            } catch (Exception e) {
+                echo "Rerun Report failed or timed out: ${e.toString()}"
+            }
+        }
+        parallelTasks["Test Coverage"] = {
+            try {
+            timeout(time: 10, unit: 'MINUTES') {
+            try {
+                stage("Test Coverage") {
+                    sh "ls"
+                    sh "rm -rf cov && mkdir -p cov"
+                    // Collect the per-process PY_START data files from every stage's results tarball.
+                    sh "find . -type f -name '.cbtscov.*.sqlite' -exec mv -t cov/ {} + || true"
+                    sh "cd cov && ls -la"
+                    def fileCount = sh(returnStdout: true, script: 'find cov -name ".cbtscov.*.sqlite" | wc -l').replaceAll("\\s","").toInteger()
+                    if (fileCount == 0) {
+                        echo "CBTS coverage skipped: no PY_START data files."
+                        return
+                    }
+                    // Merge into the indexed touch DB, a per-file HTML report, and the coverage rate.
+                    sh """
+                        PYTHONPATH=llm/jenkins/scripts/cbts \
+                        python3 -m cbts.command coverage collection pystart-report \
+                            --glob 'cov/.cbtscov.*.sqlite' \
+                            --out-sqlite cov/cbts_touchmap.sqlite \
+                            --out-dir cov/cbts_report \
+                            --source-root llm
+                    """
+                    // Upload compressed only: the guardword scanner byte-matches raw files but not archives.
+                    sh "cd cov && tar czf cbts_pystart_report.tar.gz cbts_touchmap.sqlite cbts_report"
+                    trtllm_utils.uploadArtifacts("cov/cbts_pystart_report.tar.gz", "${UPLOAD_PATH}/cbts-coverage/")
+                    echo "CBTS coverage (touch DB + report): https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report.tar.gz"
+                } // Test coverage
+            }
+            catch (InterruptedException e)
+            {
+                throw e
+            }
+            catch (Exception e)
+            {
+                pipeline.echo("Test coverage failed execution.")
+            }
+            } // timeout 10 min
+            } catch (Exception e) {
+                echo "Test Coverage failed or timed out: ${e.toString()}"
+            }
+        }
+        if (currentBuild.currentResult == 'FAILURE') {
+            parallelTasks["AI Failure Analysis"] = {
+                try {
+                timeout(time: 10, unit: 'MINUTES') {
+                stage("AI Failure Analysis") {
+                    try {
+                        def prNumber = null
+                        if (globalVars[GITHUB_PR_API_URL]) {
+                            def prMatch = (globalVars[GITHUB_PR_API_URL] =~ /\/pulls?\/(\d+)/)
+                            if (prMatch) {
+                                prNumber = prMatch[0][1]
+                            }
+                        }
+                        def analysis = trtllm_utils.analyzePipelineFailureWithAgent(
+                            pipeline, env.JOB_NAME, env.BUILD_NUMBER, prNumber)
+                        if (analysis) {
+                            def bucket = 'sw-tensorrt-ci-analysis'
+                            def key = "${env.JOB_NAME}/${env.BUILD_NUMBER}/failure_analysis.html"
+                            def htmlUrl = "https://pbss.s8k.io/v1/AUTH_svc_tensorrt/${bucket}/${key}"
+                            // Self-rendering HTML page: marked.js parses the analysis at page load
+                            // and DOMPurify sanitises the result before injection into the DOM. The
+                            // analysis text comes from the CI agent which consumes build logs (which
+                            // can include attacker-controlled PR content), so we treat it as untrusted.
+                            // Hardening:
+                            //   1. CDN scripts pinned to specific versions and protected with SRI.
+                            //   2. Analysis embedded in a `<script type="application/json">` data
+                            //      block read via textContent + JSON.parse — never inlined into
+                            //      executable JS source. Every `<` in the JSON is rewritten to its
+                            //      JSON unicode escape so a payload cannot smuggle a `</script>`
+                            //      and break out of the data block.
+                            //   3. marked output is run through DOMPurify before innerHTML assignment
+                            //      to strip event-handler attributes and other XSS vectors.
+                            def jsonAnalysis = groovy.json.JsonOutput.toJson(analysis).replace("<", "\\u003c")
+                            def htmlDoc = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>CI Failure Analysis &middot; ${env.JOB_NAME} #${env.BUILD_NUMBER}</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@14.1.4/marked.min.js" integrity="sha384-lqPzN0kmFw9t2syAMwVPM4VbAyqsz/lPyYWbb2Xt6nSPM0WPNrpSWCUBgdcAdgnC" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js" integrity="sha384-eEu5CTj3qGvu9PdJuS+YlkNi7d2XxQROAFYOr59zgObtlcux1ae1Il3u7jvdCSWu" crossorigin="anonymous"></script>
+<style>body{font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:900px;margin:2em auto;padding:0 1em;color:#24292e}h1,h2,h3{border-bottom:1px solid #eaecef;padding-bottom:.3em}pre{background:#f6f8fa;padding:1em;overflow:auto;border-radius:6px}code{background:#f6f8fa;padding:.2em .4em;border-radius:3px}pre code{background:none;padding:0}a{color:#0366d6}blockquote{border-left:4px solid #dfe2e5;padding:0 1em;color:#6a737d}table{border-collapse:collapse}th,td{border:1px solid #dfe2e5;padding:6px 13px}header{margin-bottom:1.5em;color:#586069}</style>
+</head><body>
+<header><a href="${env.BUILD_URL}">${env.JOB_NAME} #${env.BUILD_NUMBER}</a></header>
+<main id="md"></main>
+<script id="md-source" type="application/json">${jsonAnalysis}</script>
+<script>
+  // Disable marked's strikethrough tokenizer: CI failure-analysis text routinely
+  // contains literal tildes (~/path, ~50ms, regex anchors, etc.) that should not
+  // be interpreted as markup. Other GFM extensions (tables, fences, autolinks,
+  // task lists) stay enabled.
+  marked.use({ tokenizer: { del() { return false; } } });
+  const src = JSON.parse(document.getElementById('md-source').textContent);
+  document.getElementById('md').innerHTML = DOMPurify.sanitize(marked.parse(src));
+</script>
+</body></html>
+"""
+                            writeFile file: 'failure_analysis.html', text: htmlDoc
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: 'apk add --no-cache aws-cli')
+                            // Alpine's musl libc fires A and AAAA queries in parallel; pbss.s8k.io's AAAA
+                            // returns SERVFAIL and musl treats that as a fatal lookup failure (glibc would
+                            // not). Pin the A-record IP in /etc/hosts so getaddrinfo resolves from files.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: '''
+                                if ! grep -q 'pbss.s8k.io' /etc/hosts; then
+                                    ip=$(nslookup -type=A pbss.s8k.io 2>/dev/null | awk '/^Address[: ]/ && $NF !~ /:53$/ && $NF !~ /#53$/ { print $NF; exit }')
+                                    if [ -n "$ip" ]; then
+                                        printf '%s\\n' "$ip pbss.s8k.io" >> /etc/hosts
+                                    fi
+                                fi
+                            ''')
+                            withCredentials([string(
+                                    credentialsId: 'svc_tensorrt-swift-stack-key',
+                                    variable: 'AWS_SECRET_ACCESS_KEY')]) {
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script:
+                                    "AWS_ACCESS_KEY_ID=svc_tensorrt aws s3 cp failure_analysis.html" +
+                                    " 's3://${bucket}/${key}' --endpoint-url https://pbss.s8k.io" +
+                                    " --content-type text/html")
+                            }
+                            // Surface the URL via currentBuild.description so the upstream PR_Github
+                            // wrapper can extract it and include it in the GitHub PR comment.
+                            def existingDesc = currentBuild.description ?: ""
+                            currentBuild.description = existingDesc +
+                                (existingDesc ? "<br/>" : "") +
+                                "<a href='${htmlUrl}'>CI Agent Failure Analysis</a>"
+                            echo "CI Agent Failure Analysis: ${htmlUrl}"
+                        }
+                    } catch (Exception e) {
+                        // Analysis is best-effort; do not fail the pipeline
+                    }
+                }
+                } // timeout 10 min
+                } catch (Exception e) {
+                    echo "AI Failure Analysis failed or timed out: ${e.toString()}"
+                }
+            }
+        }
+        parallel parallelTasks
+    })
+}
+
+def resolveBuildBranch(globalVars)
+{
+    if (globalVars[GITHUB_PR_API_URL]) {
+        return "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+    }
+    return env.gitlabBranch ? env.gitlabBranch : "main"
+}
+
+// Release consumers need an unoptimized canonical tarball and a separate
+// optimized variant. Pin their profiles once so tests and images agree.
+def isBoltReleasePipeline()
+{
+    return (env.JOB_NAME ==~ /.*PostMerge.*/) || runMode == "nightly_release"
+}
+
+// Pick the single BOLT profile bundle this pipeline will use, and pin it.
+//
+// Without a pin every consumer resolves `latest` independently, at whatever
+// moment it happens to run. Post-merge promotes a new bundle mid-pipeline, so a
+// stage that pulls before the promote and one that pulls after legitimately get
+// different profiles -- and parallel post-merge pipelines make it worse. That is
+// invisible: each consumer succeeds, and the run is green having tested
+// something other than what it shipped.
+//
+// Pinning applies to post-merge and nightly releases. Pre-merge reads `latest` (its
+// drift is acceptable and its behaviour must not change), and returning "" leaves
+// every consumer on exactly today's path.
+//
+// Best-effort by design. A branch with nothing promoted, or a bundle too old to
+// carry the label, yields "" and the pipeline runs unpinned rather than failing
+// -- an unresolvable pin is a reason to keep the old behaviour, not to break the
+// build.
+def resolveBoltProfileRef(String branch, String triple = "aarch64-linux-gnu")
+{
+    if (!isBoltReleasePipeline()) {
+        return ""
+    }
+    def ref = ""
+    try {
+        ref = sh(returnStdout: true, script: """
+            bash ${LLM_ROOT}/scripts/bolt/internal/artifactory.sh \
+                 resolve-latest ${branch} ${triple} 2>/dev/null || true
+        """).trim()
+    } catch (InterruptedException e) {
+        // Aborts and timeouts reach here as FlowInterruptedException, which
+        // extends InterruptedException. Letting the catch below swallow one
+        // would turn a cancelled pipeline into an unpinned pipeline that
+        // carries on and launches every build job.
+        throw e
+    } catch (Exception e) {
+        echo "BOLT profile pin: resolve failed (${e.message}); running unpinned."
+        return ""
+    }
+    if (!ref) {
+        echo "BOLT profile pin: nothing promoted for ${branch}/${triple}; running unpinned."
+        return ""
+    }
+    echo "BOLT profile pin: ${branch}/${triple} -> ${ref}. Every consumer in this run uses this bundle."
+    return ref
+}
+
+def resolveBoltConsume(boolean requested, String targetBranch, boolean postMergeVariant = false)
+{
+    if (!requested) {
+        return false
+    }
+    // Post-merge and nightly release consumers require the canonical tarball
+    // to remain unoptimized for profile generation and image-side BOLT.
+    if (isBoltReleasePipeline() && !postMergeVariant) {
+        echo "BOLT consume requested but disabled: post-merge and nightly releases require an un-BOLTed canonical tarball."
+        return false
+    }
+    if (targetBranch != "main") {
+        echo "BOLT consume requested but disabled: no promoted bundle is guaranteed for target branch '${targetBranch}' (main only for now)."
+        return false
+    }
+    echo "BOLT consume enabled: build helpers will re-BOLT their tarball with main's promoted profile bundle."
+    return true
+}
+
+def getCommonParameters()
+{
+    return [
+        'gitlabSourceRepoHttpUrl': LLM_REPO,
+        'gitlabCommit': env.gitlabCommit,
+        'artifactPath': UPLOAD_PATH,
+        'uploadPath': UPLOAD_PATH,
+    ]
+}
+
+def getPLCRepoUrlKey()
+{
+    def repoUrlKey = "tensorrt_llm_github_sync"
+    withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
+        if (LLM_REPO == DEFAULT_LLM_REPO) {
+            repoUrlKey = "tensorrt_llm_internal"
+        } else if (LLM_REPO == "https://github.com/NVIDIA/TensorRT-LLM.git" ||
+                   LLM_REPO == "https://github.com/NVIDIA/TensorRT-LLM") {
+            repoUrlKey = "tensorrt_llm_github"
+        }
+    }
+    return repoUrlKey
+}
+
+def findCachedPLCSourceScanResult(commit) {
+    def plcJobUrl = "${trtllm_utils.resolveCurrentJenkinsBaseUrl(this)}/job/LLM/job/helpers/job/PLCScanningSetup"
+    def exitCode = sh(
+        script: "python3 ${LLM_ROOT}/jenkins/scripts/find_plc_build.py --commit ${commit} --jenkins-base ${plcJobUrl} > find_plc_build.json",
+        returnStatus: true
+    )
+    if (exitCode != 0) {
+        return null
+    }
+    def buildInfo = new JsonSlurper().parseText(readFile("find_plc_build.json"))
+    return [result: buildInfo.result, url: buildInfo.url]
+}
+
+def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, additionalParameters = [:], boolean propagateFailure = true) {
+    def parameters = getCommonParameters()
+    // Build a local copy to avoid racey growth from shared parallel mutations.
+    // In particular, CACHED_CHANGED_FILE_LIST can become very large and may
+    // trigger "Argument list too long" when passed to downstream jobs.
+    def globalVarsToPass = globalVars.findAll { key, value -> key != CACHED_CHANGED_FILE_LIST }
+    globalVarsToPass[LLM_ARTIFACTS_PRIMARY_KEY] = llmArtifactsPrimary()
+    String globalVarsJson = writeJSON returnText: true, json: globalVarsToPass
+    parameters += [
+        'enableFailFast': enableFailFast,
+        'globalVars': globalVarsJson,
+    ] + additionalParameters
+
+    // Preserve an explicit empty phase override from the dry-run helper.
+    if (!additionalParameters.containsKey('testPhase2StageName') && env.testPhase2StageName) {
+        parameters += [
+            'testPhase2StageName': env.testPhase2StageName,
+        ]
+    }
+
+    if (reuseBuild) {
+        parameters['reuseArtifactPath'] = "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${reuseBuild}"
+    }
+
+    if (jobName.startsWith("/")) {
+        jobName = jobName.substring(1)
+    } else {
+        def pos = env.JOB_NAME.lastIndexOf("/")
+        if (pos != -1) {
+            jobDir = env.JOB_NAME.substring(0, pos + 1)
+        } else {
+            jobDir = ""
+        }
+        jobName = "${jobDir}${jobName}"
+    }
+
+    echo "Trigger ${jobName} job, params: ${parameters}"
+
+    def logger = new Logger(pipeline)
+    def (jenkinsURL, buildStatus) = JobBuilder.build(pipeline, logger, jobName, parameters, 1, false)
+    // Infra-scoped fail-fast (parent half). A downstream sub-job returns UNSTABLE
+    // when it saw only infra aborts and no genuine test/build failure (see
+    // runBranchesWithInfraDefer in L0_Test.groovy and Build.groovy). That is incomplete coverage,
+    // not a failure: throwing here is exactly what trips the per-arch failFast and
+    // cancels the healthy sibling architecture, so do NOT throw. Mark the build
+    // UNSTABLE (visible + re-runnable) and let the sibling finish. With default
+    // propagation, FAILURE and ABORTED still throw below; callers opting out
+    // inspect and handle those returned statuses themselves.
+    if (buildStatus == "UNSTABLE") {
+        catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+            error "Downstream job ${jobName} is infra-incomplete (UNSTABLE); sibling not cancelled"
+        }
+        return buildStatus
+    }
+    if (buildStatus != "SUCCESS" && propagateFailure) {
+        error "Downstream job did not succeed"
+    }
+    return buildStatus
+}
+
+def launchInfraDryRunTestJob(pipeline, arch, testFilter, globalVars, imageParameters)
+{
+    String testFilterJson = writeJSON returnText: true, json: testFilter
+    def additionalParameters = [
+        'testFilter': testFilterJson,
+        // Keep all synthetic GPU-count stages in this helper.
+        'testPhase2StageName': '',
+    ] + imageParameters
+    stage("[Test-${arch}-Single-GPU] Remote Run") {
+        launchJob(pipeline, "L0_Test-${arch}-Single-GPU", false, false, globalVars, additionalParameters)
+    }
+}
+
+def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
+{
+    def releaseTargets = globalVars[RELEASE_TARGET] ?: []
+    def wheelSelected = releaseTargets.contains("wheel")
+    def containerSelected = releaseTargets.contains("container")
+    def buildAllDockerImages = false
+    def runContainerScanning = false
+    stages = [
+        "Release-Check": {
+            script {
+                if (testFilter[INFRA_DRY_RUN]) {
+                    echo "Skipping Release-Check for the infrastructure dry run."
+                    return
+                } else if (GEN_POST_MERGE_BUILDS_ONLY) {
+                    echo "Skipping Release-Check (GenPostMergeBuilds mode: builds only)"
+                    return
+                }
+                launchReleaseCheck(this, globalVars)
+            }
+        },
+        "Check-Test-List": {
+            script {
+                if (testFilter[INFRA_DRY_RUN]) {
+                    skipStage("[Check-Test-List] Run", "Skipping Check Test List for the infrastructure dry run.")
+                    return
+                } else if (GEN_POST_MERGE_BUILDS_ONLY) {
+                    skipStage("[Check-Test-List] Run", "Skipping Check Test List (GenPostMergeBuilds mode: builds only)")
+                    return
+                } else if (runMode == "nightly_release") {
+                    skipStage("[Check-Test-List] Run", "Skipping Check Test List for nightly_release.")
+                    return
+                } else if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
+                    skipStage("[Check-Test-List] Run", "Skipping Check Test List for Docs-only changes.")
+                    return
+                } else if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
+                    skipStage("[Check-Test-List] Run", "Skipping Check Test List for BuildDockerImageSanityTest.")
+                    return
+                }
+                launchTestListCheck(this, globalVars)
+            }
+        },
+        "OSS-Compliance-Check": {
+            script {
+                stage("[OSS-Compliance-Check] Run") {
+                    // Nightly releases always scan; merge requests scan only when compliance files change.
+                    def isNightlyRelease = runMode == "nightly_release"
+                    if (!isNightlyRelease && !testFilter[(OSS_COMPLIANCE_FILE_CHANGED)]) {
+                        echo "Skipping OSS Compliance Check: no OSS compliance-related files changed."
+                        jUtils.markStageSkippedForConditional(STAGE_NAME)
+                        return
+                    }
+                    if (GEN_POST_MERGE_BUILDS_ONLY) {
+                        echo "Skipping OSS Compliance Check (GenPostMergeBuilds mode: builds only)"
+                        jUtils.markStageSkippedForConditional(STAGE_NAME)
+                        return
+                    }
+                    def repoUrlKey = getPLCRepoUrlKey()
+                    def logger = new Logger(pipeline)
+                    try {
+                        // find_plc_build.py only needs python3 + network access to Jenkins, but
+                        // the top-level pipeline agent (createKubernetesPodConfig("", "agent")) is
+                        // a bare alpine container with neither, so run the lookup in a "package"
+                        // pod instead (same image used by preparation()'s mergeWaiveList.py call).
+                        def cached
+                        def packageImage = "urm.nvidia.com/docker/buildpack-deps:trixie-scm"
+                        trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(packageImage, "package"), "trt-llm", {
+                            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+                            cached = findCachedPLCSourceScanResult(env.gitlabCommit)
+                        })
+                        def handleResult
+                        if (cached) {
+                            echo "Commit ${env.gitlabCommit} unchanged since a prior PLC source-code scan; reusing its result: ${cached.result}"
+                            echo "Reused PLC scan pipeline: ${cached.url}"
+                            handleResult = cached.result
+                        } else {
+                            echo "Triggering OSS Compliance (PLC) scan for ref: ${env.gitlabCommit}"
+                            def params = [
+                                string(name: 'ref', value: env.gitlabCommit),
+                                string(name: 'repoUrlKey', value: repoUrlKey),
+                                string(name: 'forkOwner', value: ''),
+                                string(name: 'postMergePipelineName', value: ''),
+                                string(name: 'postMergeBuildNumber', value: ''),
+                                string(name: 'scanMode', value: isNightlyRelease ? 'release' : 'pre_merge'),
+                                string(name: 'runSourceCodeScanning', value: 'true'),
+                                string(name: 'runContainerOssScanning', value: 'false'),
+                                string(name: 'runContainerMalwareScanning', value: 'false'),
+                                string(name: 'runSonarQube', value: 'false'),
+                            ]
+                            def handle = build(
+                                job: "/LLM/helpers/PLCScanningSetup",
+                                parameters: params,
+                                propagate: false
+                            )
+                            handleResult = handle.result
+                        }
+                        if (handleResult == "UNSTABLE" && !isNightlyRelease) {
+                            logger.log("OSS Compliance Check downstream job is UNSTABLE, ignoring")
+                        } else if (handleResult != "SUCCESS") {
+                            error "Downstream job did not succeed"
+                        }
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        if (isNightlyRelease) {
+                            throw e
+                        }
+                        catchError(buildResult: 'Failure', stageResult: 'Failure') {
+                            error "OSS Compliance Check failed: ${e.getMessage()}, please rerun."
+                        }
+                    }
+                }
+            }
+        },
+        "x86_64-Linux": {
+            script {
+                // CBTS deliberately does NOT short-circuit at the arch / Build
+                // layer. Build normally runs so a wheel exists for sanity checks
+                // and post-merge consumers; case-level narrowing happens later
+                // in L0_Test.groovy::launchTestJobs (Layer 2) and renderTestDB
+                // (Layer 3).
+                // Nightly publishes the PackageSanityCheck wheel, while this
+                // build still provides the source tar consumed by test runners.
+                def testStageName = "[Build-x86_64] Remote Run"
+                def buildInfraIncomplete = false
+                stage(testStageName) {
+                    def additionalParameters = [
+                        'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                        'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                        'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
+                        // Re-BOLT the packed tarball with the target branch's promoted
+                        // profile bundle so the tests below exercise bolted binaries.
+                        // Off unless resolveBoltConsume() allowed it (pre-merge, main).
+                        'boltConsume': globalVars[BOLT_CONSUME_BUILD],
+                        // Publish the BOLTed build beside an untouched canonical rather
+                        // than replacing it. Post-merge only: canonical is the un-BOLTed
+                        // tarball BoltProfileGen profiles.
+                        'boltPublishVariant': globalVars[BOLT_PUBLISH_VARIANT],
+                    ]
+                    // launchJob returns UNSTABLE (without throwing) when the build
+                    // sub-job was infra-incomplete: only infra aborts, no genuine
+                    // build failure (see runBranchesWithInfraDefer in Build.groovy).
+                    def buildStatus = launchJob(pipeline, "/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, additionalParameters)
+                    buildInfraIncomplete = (buildStatus == "UNSTABLE")
+                }
+
+                if (GEN_POST_MERGE_BUILDS_ONLY) {
+                    echo "Skipping x86_64 tests (GenPostMergeBuilds mode: builds only)"
+                    return
+                }
+                if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+                    echo "Skipping x86_64 tests (PLC container scanning)"
+                    return
+                }
+                if (testFilter[INFRA_DRY_RUN]) {
+                    def imageParameters = [
+                        'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                        'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                        'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
+                    ]
+                    launchInfraDryRunTestJob(pipeline, "x86_64", testFilter, globalVars, imageParameters)
+                    return
+                }
+
+                // Build was infra-incomplete (UNSTABLE): the wheel/tar this arch's
+                // test sub-jobs would consume was never produced, so launching them
+                // can only fail on a missing artifact. Skip them WITHOUT throwing --
+                // throwing is exactly what trips the arch-level failFast and cancels
+                // the healthy sibling architecture and its consumers. Keep the build
+                // UNSTABLE (already set by launchJob); do NOT escalate to FAILURE.
+                // Unlike the single-GPU-infra-incomplete policy below, post-merge
+                // skips too: with no artifact there is no signal to be had.
+                if (buildInfraIncomplete) {
+                    stage("[Test-x86_64] Blocked - build infra-incomplete") {
+                        echo "x86_64 build was infra-incomplete (UNSTABLE); skipping x86_64 test sub-jobs (no artifact to test). Build stays UNSTABLE."
+                    }
+                    return
+                }
+
+                testStageName = "[Test-x86_64-Single-GPU] Remote Run"
+                def singleGpuTestFailed = false
+                def singleGpuInfraIncomplete = false
+                stage(testStageName) {
+                    if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
+                        echo "x86_64 test job is skipped due to Jenkins configuration"
+                        return
+                    }
+                    try {
+                        String testFilterJson = writeJSON returnText: true, json: testFilter
+                        def additionalParameters = [
+                            'testFilter': testFilterJson,
+                            'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                            'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                            'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
+                        ]
+
+                        // launchJob returns UNSTABLE (without throwing) when the single-GPU
+                        // sub-job was infra-incomplete: only infra aborts, no real failure.
+                        def singleGpuStatus = launchJob(pipeline, "L0_Test-x86_64-Single-GPU", false, enableFailFast, globalVars, additionalParameters)
+                        singleGpuInfraIncomplete = (singleGpuStatus == "UNSTABLE")
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        if (X86_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'FAILURE') {
+                                error "x86_64 test failed but ignored due to Jenkins configuration"
+                            }
+                        } else {
+                            catchError(
+                                buildResult: 'FAILURE',
+                                stageResult: 'FAILURE') {
+                                error "x86_64 single-GPU test failed"
+                            }
+                            singleGpuTestFailed = true
+                        }
+                    }
+                }
+                uploadArchCoverage("x86_64", pipeline, testFilter)
+
+                def requireMultiGpuTesting = currentBuild.description?.contains("Require x86_64 Multi-GPU Testing") ?: false
+                echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
+                if (!requireMultiGpuTesting) {
+                    if (singleGpuTestFailed) {
+                        error "x86_64 single-GPU test failed"
+                    }
+                    return
+                }
+
+                if (singleGpuTestFailed) {
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, x86_64 single-GPU test failed, whereas multi-GPU test is still kept running."
+                    } else {
+                        stage("[Test-x86_64-Multi-GPU] Blocked") {
+                            error "This pipeline requires running multi-GPU test, but x86_64 single-GPU test has failed."
+                        }
+                        return
+                    }
+                }
+
+                // Single-GPU was infra-incomplete (UNSTABLE): its coverage is a
+                // prerequisite for multi-GPU. In pre-merge, explicitly block multi-GPU
+                // rather than mark it skipped: it is required but cannot run until the
+                // single-GPU sub-job is re-run. Post-merge keeps running multi-GPU for
+                // maximum signal, mirroring the single-GPU-failed policy.
+                if (singleGpuInfraIncomplete) {
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, x86_64 single-GPU test was infra-incomplete (UNSTABLE); multi-GPU test is still kept running."
+                    } else {
+                        stage("[Test-x86_64-Multi-GPU] Blocked") {
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                                error "This pipeline requires running x86_64 multi-GPU test, but x86_64 single-GPU test is infra-incomplete (UNSTABLE)."
+                            }
+                        }
+                        return
+                    }
+                }
+
+                // Label gate: check before entering the Remote Run stage so a
+                // missing/unauthorized label shows as "Blocked" (not a Remote Run
+                // failure) and does not trigger fail-fast.
+                def x86LabelBlock = requireMultiGpuApprovalLabel(pipeline, globalVars, "x86_64")
+                if (x86LabelBlock) {
+                    stage("[Test-x86_64-Multi-GPU] Blocked") {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            error x86LabelBlock
+                        }
+                    }
+                    return
+                }
+
+                testStageName = "[Test-x86_64-Multi-GPU] Remote Run"
+                stage(testStageName) {
+                    if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
+                        echo "x86_64 test job is skipped due to Jenkins configuration"
+                        return
+                    }
+                    try {
+                        def testFilterJson = writeJSON returnText: true, json: testFilter
+                        def additionalParameters = [
+                            'testFilter': testFilterJson,
+                            'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                            'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                            'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
+                        ]
+
+                        launchJob(pipeline, "L0_Test-x86_64-Multi-GPU", false, enableFailFast, globalVars, additionalParameters)
+
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        if (X86_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'FAILURE') {
+                                error "x86_64 test failed but ignored due to Jenkins configuration"
+                            }
+                        } else {
+                            throw e
+                        }
+                    }
+                }
+            }
+        },
+        "SBSA-Linux": {
+            script {
+                if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
+                    echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
+                    return
+                }
+                // CBTS deliberately does NOT short-circuit the SBSA Build —
+                // see x86 track above for the rationale.
+
+                def testStageName = "[Build-SBSA] Remote Run"
+                def buildInfraIncomplete = false
+                stage(testStageName) {
+                    def additionalParameters = [
+                        "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                        // Off unless resolveBoltConsume() allowed it. Post-merge is
+                        // allowed only together with boltPublishVariant below, which
+                        // keeps canonical -- the BOLT-Profile-Gen input -- un-BOLTed.
+                        'boltConsume': globalVars[BOLT_CONSUME_BUILD],
+                        'boltPublishVariant': globalVars[BOLT_PUBLISH_VARIANT],
+                    ]
+                    // launchJob returns UNSTABLE (without throwing) when the build
+                    // sub-job was infra-incomplete: only infra aborts, no genuine
+                    // build failure (see runBranchesWithInfraDefer in Build.groovy).
+                    def buildStatus = launchJob(pipeline, "/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, additionalParameters)
+                    buildInfraIncomplete = (buildStatus == "UNSTABLE")
+                }
+
+                if (GEN_POST_MERGE_BUILDS_ONLY) {
+                    echo "Skipping SBSA tests (GenPostMergeBuilds mode: builds only)"
+                    return
+                }
+
+                if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+                    echo "Skipping SBSA tests (PLC container scanning)"
+                    return
+                }
+                if (testFilter[INFRA_DRY_RUN]) {
+                    def imageParameters = [
+                        "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                        'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
+                    ]
+                    launchInfraDryRunTestJob(pipeline, "SBSA", testFilter, globalVars, imageParameters)
+                    return
+                }
+
+                // BOLT profile generation (producer): refreshes the branch-keyed
+                // `latest` bundle the BOLT consumers pull, on this pipeline's
+                // cadence. Post-merge only -- it profiles the SBSA build just
+                // built under three multi-hour GPU workloads, so it must never
+                // land on a pre-merge /bot run. Best-effort: the producer depends
+                // on external SLURM health and bundles are drift-tolerant, so a
+                // failure just leaves `latest` where it was; it must not fail
+                // post-merge nor block the tests behind it.
+                if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                    stage("[BOLT-Profile-Gen] Remote Run") {
+                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                            def additionalParameters = [
+                                "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                                'targetArch': "aarch64-linux-gnu",
+                                'branch': globalVars[BUILD_BRANCH],
+                                'promote': "true",
+                                // Exactly ONE writer publishes a BOLTed build per
+                                // commit, and this launch site is where that choice
+                                // is made. The SBSA build stage is that writer (see
+                                // BOLT_PUBLISH_VARIANT): it publishes
+                                // bolted-<tarName> and leaves canonical un-BOLTed on
+                                // purpose, canonical being this job's own input and
+                                // what every consumer not yet migrated still
+                                // fetches. BoltProfileGen's canonical repush is the
+                                // other writer and would overwrite exactly that.
+                                // Already its default, but sent explicitly: the
+                                // default lives in a job config editable outside
+                                // this repo, and a flip there would silently put
+                                // both writers on the same object.
+                                'boltPublishCanonical': "false",
+                            ]
+                            launchJob(pipeline, "/LLM/helpers/BoltProfileGen", false, false, globalVars, additionalParameters)
+                        }
+                    }
+                }
+
+                // Build was infra-incomplete (UNSTABLE): the wheel/tar this arch's
+                // test sub-jobs would consume was never produced, so launching them
+                // can only fail on a missing artifact. Skip them WITHOUT throwing --
+                // throwing is exactly what trips the arch-level failFast and cancels
+                // the healthy sibling architecture and its consumers. Keep the build
+                // UNSTABLE (already set by launchJob); do NOT escalate to FAILURE.
+                // Unlike the single-GPU-infra-incomplete policy below, post-merge
+                // skips too: with no artifact there is no signal to be had.
+                if (buildInfraIncomplete) {
+                    stage("[Test-SBSA] Blocked - build infra-incomplete") {
+                        echo "SBSA build was infra-incomplete (UNSTABLE); skipping SBSA test sub-jobs (no artifact to test). Build stays UNSTABLE."
+                    }
+                    return
+                }
+
+                testStageName = "[Test-SBSA-Single-GPU] Remote Run"
+                def singleGpuTestFailed = false
+                def singleGpuInfraIncomplete = false
+                stage(testStageName) {
+                    if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
+                        echo "SBSA test job is skipped due to Jenkins configuration"
+                        return
+                    }
+                    try {
+                        String testFilterJson = writeJSON returnText: true, json: testFilter
+                        def additionalParameters = [
+                            'testFilter': testFilterJson,
+                            "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                            'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
+                        ]
+
+                        // launchJob returns UNSTABLE (without throwing) when the single-GPU
+                        // sub-job was infra-incomplete: only infra aborts, no real failure.
+                        def singleGpuStatus = launchJob(pipeline, "L0_Test-SBSA-Single-GPU", false, enableFailFast, globalVars, additionalParameters)
+                        singleGpuInfraIncomplete = (singleGpuStatus == "UNSTABLE")
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        if (SBSA_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'FAILURE') {
+                                error "SBSA test failed but ignored due to Jenkins configuration"
+                            }
+                        } else {
+                            catchError(
+                                buildResult: 'FAILURE',
+                                stageResult: 'FAILURE') {
+                                error "SBSA single-GPU test failed"
+                            }
+                            singleGpuTestFailed = true
+                        }
+                    }
+                }
+
+                uploadArchCoverage("SBSA", pipeline, testFilter)
+
+                def requireMultiGpuTesting = currentBuild.description?.contains("Require SBSA Multi-GPU Testing") ?: false
+                echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
+                if (!requireMultiGpuTesting) {
+                    if (singleGpuTestFailed) {
+                        error "SBSA single-GPU test failed"
+                    }
+                    return
+                }
+
+                if (singleGpuTestFailed) {
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
+                    } else {
+                        stage("[Test-SBSA-Multi-GPU] Blocked") {
+                            error "This pipeline requires running SBSA multi-GPU test, but SBSA single-GPU test has failed."
+                        }
+                        return
+                    }
+                }
+
+                // Single-GPU was infra-incomplete (UNSTABLE): its coverage is a
+                // prerequisite for multi-GPU. In pre-merge, explicitly block multi-GPU
+                // rather than mark it skipped: it is required but cannot run until the
+                // single-GPU sub-job is re-run. Post-merge keeps running multi-GPU for
+                // maximum signal, mirroring the single-GPU-failed policy.
+                if (singleGpuInfraIncomplete) {
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, SBSA single-GPU test was infra-incomplete (UNSTABLE); multi-GPU test is still kept running."
+                    } else {
+                        stage("[Test-SBSA-Multi-GPU] Blocked") {
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                                error "This pipeline requires running SBSA multi-GPU test, but SBSA single-GPU test is infra-incomplete (UNSTABLE)."
+                            }
+                        }
+                        return
+                    }
+                }
+
+                def sbsaLabelBlock = requireMultiGpuApprovalLabel(pipeline, globalVars, "SBSA")
+                if (sbsaLabelBlock) {
+                    stage("[Test-SBSA-Multi-GPU] Blocked") {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            error sbsaLabelBlock
+                        }
+                    }
+                    return
+                }
+
+                testStageName = "[Test-SBSA-Multi-GPU] Remote Run"
+                stage(testStageName) {
+                    if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
+                        echo "SBSA test job is skipped due to Jenkins configuration"
+                        return
+                    }
+                    try {
+                        def testFilterJson = writeJSON returnText: true, json: testFilter
+                        def additionalParameters = [
+                            'testFilter': testFilterJson,
+                            "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                            'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
+                        ]
+
+                        launchJob(pipeline, "L0_Test-SBSA-Multi-GPU", false, enableFailFast, globalVars, additionalParameters)
+
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        if (SBSA_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'FAILURE') {
+                                error "SBSA test failed but ignored due to Jenkins configuration"
+                            }
+                        } else {
+                            throw e
+                        }
+                    }
+                }
+            }
+        },
+    ]
+    def dockerBuildJob = [
+        "Build-Docker-Images": {
+            script {
+                def imageBuildStatus
+                // Nightly scans can inspect published images even when later build checks fail.
+                def scanAfterImageBuildFailure = runContainerScanning && runMode == "nightly_release" && !enableFailFast
+                def testStageName = "[Build-Docker-Images] Remote Run"
+                stage(testStageName) {
+                    try {
+                        def branch = globalVars[BUILD_BRANCH]
+
+                        // Force the image tag suffix to be this L0_MergeRequest BUILD_NUMBER
+                        // instead of the BuildDockerImages helper job's own counter.
+                        def shortCommit = env.gitlabCommit ? env.gitlabCommit.substring(0, 7) : "undefined"
+                        def branchTag = branch.replaceAll('/', '_')
+                        def defaultTag = "${shortCommit}-${branchTag}-${env.BUILD_NUMBER}"
+
+                        def additionalParameters = [
+                            'branch': branch,
+                            'action': "push",
+                            'triggerType': runMode == "nightly_release" ?
+                                "nightly-release" :
+                                (env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge"),
+                            'register_images': runMode == "nightly_release" || (env.JOB_NAME ==~ /.*PostMerge.*/),
+                            'useWheelFromBuildStage': (env.JOB_NAME ==~ /.*PostMerge.*/),
+                            'defaultTag': defaultTag,
+                            // Canonical images carry BOLT profiles: the raw build is
+                            // published as <tag>-noprofiles and <tag> is produced by the
+                            // overlay. Both unconditional -- the contract is a property of
+                            // the image, not of what triggered the build, so a bundle that
+                            // cannot be pulled is an error rather than a silent plain
+                            // retag. Left unset, boltProfileBranch resolves LLM_BRANCH ->
+                            // main, so a ref with no promoted bundle still gets profiles.
+                            'boltOverlayEnabled': true,
+                            'boltProfilesRequired': true,
+                            // The overlay above only bakes in the profile bundle; it
+                            // leaves the installed wheel unoptimized. This BOLTs the
+                            // wheel the SBSA release image installs, applying the
+                            // branch's last promoted bundle during the image build.
+                            // Deliberately not this run's profiles: those are not
+                            // published until BoltProfileGen finishes, hours after
+                            // this build starts, so depending on them would serialize
+                            // every release behind a multi-hour GPU job. Inert on
+                            // x86_64 (no promoted bundle) and whenever the wheel is
+                            // built from source rather than downloaded.
+                            'boltOptimizeWheel': true,
+                        ]
+                        if (runMode == "nightly_release") {
+                            additionalParameters += [
+                                'runSanityCheck': true,
+                                'buildInternalRelease': false,
+                                'buildCiImage': false,
+                                'buildNgcRelease': true,
+                                'artifactPath': ARTIFACT_PATH,
+                                'useWheelFromBuildStage': wheelSelected,
+                                'wait_success_seconds': "",
+                                'program_version_name': env.NSPECT_RELEASE_VERSION,
+                            ]
+                        } else if (buildAllDockerImages) {
+                            additionalParameters += [
+                                'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/,
+                                'program_version_name': env.NSPECT_RELEASE_VERSION,
+                            ]
+                        } else {
+                            additionalParameters += [
+                                'runSanityCheck': false,
+                                'buildInternalRelease': false,
+                                'buildCiImage': false,
+                                'artifactPath': ARTIFACT_PATH,
+                                'nspect_id': "",
+                            ]
+                        }
+                        if (params.release_type_id) {
+                            additionalParameters['release_type_id'] = params.release_type_id
+                        }
+                        // Inspect the result before deciding whether nightly scans may continue.
+                        imageBuildStatus = launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, additionalParameters, false)
+                        if (!(imageBuildStatus in ["SUCCESS", "UNSTABLE"])) {
+                            error "Build-Docker-Images job returned ${imageBuildStatus}"
+                        }
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        if (BUILD_CHECK_CHOICE == STAGE_CHOICE_IGNORE) {
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'FAILURE') {
+                                error "Build-Docker-Images job failed but ignored due to Jenkins configuration"
+                            }
+                        } else if (scanAfterImageBuildFailure && imageBuildStatus == "FAILURE") {
+                            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', catchInterruptions: false) {
+                                throw e
+                            }
+                        } else {
+                            throw e
+                        }
+                    }
+                }
+                def canScanImages = imageBuildStatus == "SUCCESS" ||
+                    (scanAfterImageBuildFailure && imageBuildStatus in ["FAILURE", "UNSTABLE"])
+                if (!runContainerScanning || !canScanImages) {
+                    return
+                }
+                stage("[NGC-Container-Compliance-Check] Run") {
+                    def repoUrlKey = getPLCRepoUrlKey()
+                    echo "Triggering OSS Compliance (PLC) container scan for ref: ${env.gitlabCommit}"
+                    try {
+                        def params = [
+                            string(name: 'ref', value: env.gitlabCommit),
+                            string(name: 'repoUrlKey', value: repoUrlKey),
+                            string(name: 'postMergePipelineName', value: env.JOB_NAME),
+                            string(name: 'postMergeBuildNumber', value: env.BUILD_NUMBER),
+                            string(
+                                name: 'scanMode',
+                                value: runMode == "nightly_release" ? 'release' : 'pre_merge'),
+                            string(name: 'runSourceCodeScanning', value: 'false'),
+                            string(name: 'runContainerOssScanning', value: 'true'),
+                            string(name: 'runContainerMalwareScanning', value: 'false'),
+                            string(name: 'runSonarQube', value: 'false'),
+                        ]
+                        def logger = new Logger(pipeline)
+                        def handle = build(
+                            job: "/LLM/helpers/PLCScanningSetup",
+                            parameters: params,
+                            propagate: false
+                        )
+                        if (handle.result != "SUCCESS") {
+                            if (runMode == "nightly_release") {
+                                error "Risks detected on nightly NGC Containers"
+                            } else {
+                                catchError(buildResult: currentBuild.result ?: 'SUCCESS', stageResult: 'UNSTABLE') {
+                                    error "Risks detected on NGC Containers"
+                                }
+                            }
+                        }
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        if (runMode == "nightly_release") {
+                            throw e
+                        } else {
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                                error "OSS Compliance Check failed: ${e.getMessage()}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    ]
+    if (runMode == "nightly_release") {
+        testFilter[TEST_STAGE_LIST] = null
+        testFilter[EXTRA_STAGE_LIST] = null
+        if (!wheelSelected) {
+            stages.remove("x86_64-Linux")
+            stages.remove("SBSA-Linux")
+        }
+        if (containerSelected) {
+            runContainerScanning = true
+        }
+    } else {
+        if ((env.JOB_NAME ==~ /.*PostMerge.*/) &&
+            !GEN_POST_MERGE_BUILDS_ONLY) {
+            buildAllDockerImages = true
+        }
+        if (!GEN_POST_MERGE_BUILDS_ONLY &&
+            (testFilter[(TEST_STAGE_LIST)]?.contains("Build-Docker-Images") ||
+             testFilter[(EXTRA_STAGE_LIST)]?.contains("Build-Docker-Images"))) {
+            buildAllDockerImages = true
+            testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
+            testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
+            echo "Will run Build-Docker-Images job"
+            stages.remove("x86_64-Linux")
+            stages.remove("SBSA-Linux")
+            echo "Build-Docker-Images job is set explicitly. Both x86_64-Linux and SBSA-Linux sub-pipelines will be disabled."
+        }
+        if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+            runContainerScanning = true
+            testFilter[(TEST_STAGE_LIST)]?.remove("NGC-Container-Scanning")
+            echo "Will run job to build ngc containers and running in-pipeline scanning for them"
+        }
+    }
+
+    if (buildAllDockerImages || runContainerScanning) {
+        stages += dockerBuildJob
+    }
+
+    def alwaysFailFastStages = ["Release-Check", "Check-Test-List"] as Set
+    parallelJobs = stages.collectEntries{key, value -> [key, {
+        script {
+            stage(key) {
+                if (enableFailFast || key in alwaysFailFastStages) {
+                    value()
+                } else {
+                    // Avoid interrupting other stages on failure.
+                    catchError(catchInterruptions: false) {
+                        value()
+                    }
+                }
+            }
+        }
+    }]}
+
+    // Preserve both architecture tracks during dry acceptance.
+    def effectiveFailFast = testFilter[INFRA_DRY_RUN] ? false : enableFailFast
+    parallelJobs.failFast = effectiveFailFast
+    pipeline.parallel parallelJobs
+}
+
+pipeline {
+    agent {
+        kubernetes createKubernetesPodConfig("", "agent")
+    }
+    options {
+        // Check the valid options at: https://www.jenkins.io/doc/book/pipeline/syntax/
+        // some step like results analysis stage, does not need to check out source code
+        skipDefaultCheckout()
+        // to better analyze the time for each step/test
+        timestamps()
+        timeout(time: 24, unit: 'HOURS')
+    }
+    environment {
+        // CBTS decision telemetry; auto-exposes _USR/_PSW that open_search_db.py reads.
+        OPEN_SEARCH_DB_BASE_URL=credentials("open_search_db_base_url")
+        OPEN_SEARCH_DB_CREDENTIALS=credentials("open_search_db_credentials")
+    }
+    post {
+        unsuccessful {
+            script {
+                if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
+                    trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "failed", GITLAB_PROJECT_ID, env.gitlabCommit)
+                }
+            }
+        }
+        success {
+            script {
+                if (!testFilter[INFRA_DRY_RUN]) {
+                    if (enableUpdateGitlabStatus) {
+                        trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "success", GITLAB_PROJECT_ID, env.gitlabCommit)
+                    } else if (!GEN_POST_MERGE_BUILDS_ONLY) {
+                        trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, "canceled", GITLAB_PROJECT_ID, env.gitlabCommit)
+                        trtllm_utils.updateGitlabStatus("Custom Jenkins build", "success", GITLAB_PROJECT_ID, env.gitlabCommit)
+                    }
+                }
+            }
+        }
+        aborted {
+            script {
+                if (!GEN_POST_MERGE_BUILDS_ONLY && !testFilter[INFRA_DRY_RUN]) {
+                    trtllm_utils.updateGitlabStatus(BUILD_STATUS_NAME, 'canceled', GITLAB_PROJECT_ID, env.gitlabCommit)
+                }
+            }
+        }
+        always {
+            script {
+                if (!isReleaseCheckMode &&
+                    !GEN_POST_MERGE_BUILDS_ONLY &&
+                    runMode != "nightly_release") {
+                    collectTestResults(this, testFilter, globalVars)
+                }
+            }
+        }
+    }
+    stages {
+        stage("Preparation")
+        {
+            steps
+            {
+                script {
+                    globalVars = trtllm_utils.initializeCiBudget(this, globalVars, 24, 'HOURS', 'L0_MergeRequest')
+                    preparation(this, testFilter, globalVars)
+                    println globalVars
+                    globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
+                    echo "enableFailFast is: ${enableFailFast}"
+                    echo "env.gitlabTriggerPhrase is: ${env.gitlabTriggerPhrase}"
+                    println testFilter
+                    echo "Check the passed GitLab bot testFilter parameters."
+                }
+            }
+        }
+        stage("Build And Test") {
+            steps {
+                script {
+                    if (isReleaseCheckMode) {
+                        def releaseCheckStages = [
+                            "Release-Check": {
+                                stage("Release-Check") {
+                                    if (testFilter[INFRA_DRY_RUN]) {
+                                        echo "Skipping Release-Check for the infrastructure dry run."
+                                    } else {
+                                        launchReleaseCheck(this, globalVars)
+                                    }
+                                }
+                            },
+                            "Check-Test-List": {
+                                stage("Check-Test-List") {
+                                    if (testFilter[INFRA_DRY_RUN]) {
+                                        skipStage("[Check-Test-List] Run", "Skipping Check Test List for the infrastructure dry run.")
+                                    } else if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
+                                        skipStage("[Check-Test-List] Run", "Skipping Check Test List for Docs-only changes.")
+                                    } else {
+                                        launchTestListCheck(this, globalVars)
+                                    }
+                                }
+                            },
+                        ]
+                        releaseCheckStages.failFast = enableFailFast
+                        parallel releaseCheckStages
+                    } else {
+                        // globalVars[CACHED_CHANGED_FILE_LIST] is only used in setupPipelineEnvironment
+                        // Remove it to workaround the "Argument list too long" error
+                        globalVars.remove(CACHED_CHANGED_FILE_LIST)
+                        launchStages(this, reuseBuild, testFilter, enableFailFast, globalVars)
+                    }
+                }
+            }
+        }
+    } // stages
+} // pipeline

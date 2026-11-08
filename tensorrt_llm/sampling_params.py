@@ -1,0 +1,788 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import functools
+import json
+import operator
+import os
+from abc import ABC, abstractmethod
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field, fields, make_dataclass
+from typing import Any, List, NamedTuple, Optional, Tuple, Union
+
+import torch
+from pydantic import BaseModel
+from strenum import StrEnum
+
+from tensorrt_llm.bindings import executor as tllme
+from tensorrt_llm.logger import logger
+
+MAX_TOP_LOGPROBS = 100
+
+_GENERATION_CONFIG_SAMPLING_FIELDS = frozenset(
+    {
+        "early_stopping",
+        "length_penalty",
+        "min_p",
+        "no_repeat_ngram_size",
+        "repetition_penalty",
+        "temperature",
+        "top_k",
+        "top_p",
+    }
+)
+
+
+def validate_thinking_token_budget(value: Optional[Union[int, float, bool]]) -> Optional[int]:
+    """Validate ``thinking_token_budget``; return ``None`` if unset."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("thinking_token_budget must be a non-negative integer or -1 for unlimited")
+    if value == -1:
+        return None
+    if value < 0:
+        raise ValueError("thinking_token_budget must be a non-negative integer or -1 for unlimited")
+    return value
+
+
+def check_logprobs_limit(
+    name: str, value: Optional[int], max_value: int = MAX_TOP_LOGPROBS
+) -> None:
+    if value is None:
+        return
+    if value < 0:
+        raise ValueError(f"{name} must be positive, zero or None")
+    if value > max_value:
+        raise ValueError(f"{name} must be less than or equal to {max_value}")
+
+
+@dataclass(slots=True, kw_only=True)
+class GuidedDecodingParams:
+    """Guided decoding parameters for text generation. Only one of the fields could be effective.
+
+    Args:
+        json (str, pydantic.main.BaseModel, dict, optional): The generated text is amenable to json format with additional user-specified restrictions, namely schema. Defaults to None.
+        regex (str, optional): The generated text is amenable to the user-specified regular expression. Defaults to None.
+        grammar (str, optional): The generated text is amenable to the user-specified extended Backus-Naur form (EBNF) grammar. Defaults to None.
+        json_object (bool): If True, the generated text is amenable to json format. Defaults to False.
+        structural_tag (str, optional): The generated text is amenable to the user-specified structural tag. Structural tag is supported by xgrammar backend only. Defaults to None.
+    """  # noqa: E501
+
+    json: Optional[Union[str, BaseModel, dict]] = None
+    regex: Optional[str] = None
+    grammar: Optional[str] = None
+    json_object: bool = False
+    structural_tag: Optional[str] = None
+
+    def _validate(self):
+        num_guides = 0
+        for _field in fields(self):
+            num_guides += bool(getattr(self, _field.name))
+        if num_guides > 1:
+            raise ValueError(f"Only one guide can be used for a request, but got {num_guides}.")
+
+
+class LogprobParams(NamedTuple):
+    prompt_logprobs: Optional[int] = None
+    # Drop the logits once the logprobs are computed
+    drop_context_logits: bool = False
+    # Return prompt logprobs as `list[float]` instead of the default
+    # `list[dict[int, Logprob]]`. Only valid when prompt_logprobs == 0.
+    prompt_logprobs_simple_format: bool = False
+
+
+class LogprobMode(StrEnum):
+    RAW = "raw"
+    """
+    Return the raw log probabilities, i.e., the log probabilities calculated directly from the model output logits.
+    """
+    PROCESSED = "processed"
+    """
+    Return the processed log probabilities, i.e., the log probabilities after applying sampling parameters,
+    such as temperature, top-k, top-p, etc.
+    """
+
+
+class LogitsProcessor(ABC):
+    """Base class for logits processor.
+
+    The recommended way to create a customized logits processor:
+        * Subclass this class and implement the processing logics in the __call__ method.
+        * Create an instance and pass to SamplingParams.
+    Alternatively, you can create any callable with the same signature with the __call__ method.
+    """
+
+    @abstractmethod
+    def __call__(
+        self,
+        req_id: int,
+        logits: torch.Tensor,
+        token_ids: List[List[int]],
+        stream_ptr: Optional[int],
+        client_id: Optional[int],
+    ) -> None:
+        """Logits processing callback. The callback is expected to inplace modify the logits.
+
+        Args:
+            req_id (int): Request id.
+            logits (torch.Tensor): Logits tensor to be modified.
+            token_ids (List[List[int]]): Token ids produced by the request so far.
+                The shape is beam_width * sequence_length. Under beam search on the
+                PyTorch backend, row ``i`` is the prompt plus the hypothesis held by the
+                beam whose logits are row ``i`` of ``logits``; beams that already
+                finished are not included. With the overlap scheduler the history
+                trails the beam's newest token by one step, as for every request.
+            stream_ptr (int, optional): The operation stream used by the logits tensor.
+                Not required for PyTorch backend.
+            client_id (int, optional): An optional client id.
+        """
+        pass  # noqa
+
+
+class BatchedLogitsProcessor(ABC):
+    """Base class for batched logits processor.
+
+    The recommended way to create a customized batched logits processor:
+        * Subclass this class and implement the processing logics in the __call__ method.
+        * Create an instance and pass to LLM.
+    Alternatively, you can create any callable with the same signature with the __call__ method.
+    """
+
+    @abstractmethod
+    def __call__(
+        self,
+        req_ids: List[int],
+        logits: List[torch.Tensor],
+        token_ids: List[List[List[int]]],
+        stream_ptr: int,
+        client_ids: List[Optional[int]],
+    ) -> None:
+        """Batched logits processing callback. The callback is expected to inplace modify the logits.
+
+        Args:
+            req_ids (List[int]): A batch of request ids.
+            logits (List[torch.Tensor]): A batch of the logits tensors.
+            token_ids (List[List[List[int]]]): A batch of the token ids produced by the requests so far.
+                The shape is batch * beam_width * sequence_length.
+            stream_ptr (int): The operation stream used by the logits tensors.
+            client_ids (List[Optional[int]]): A batch of optional client ids.
+        """
+        pass  # noqa
+
+
+@dataclass(slots=True, kw_only=True)
+class SamplingParams:
+    """Sampling parameters for text generation.
+
+    Usage Examples:
+
+        use_beam_search is False:
+            - best_of is None: (top-p/top-k) sampling n responses and return n generations
+            - best_of is not None: (top-p/top-k) sampling best_of responses and return n generations (best_of >= n must hold)
+        use_beam_search is True:
+            - best_of is None: beam search with beam width of n, return n generations
+            - best_of is not None: beam search with beam width of best_of, return n generations (best_of >= n must hold)
+
+    Args:
+        end_id (int, optional): The end token id. Defaults to None.
+        pad_id (int, optional): The pad token id. Defaults to None.
+        max_tokens (int): The maximum number of tokens to generate. Defaults to 32.
+        bad (str, List[str], optional): A string or a list of strings that redirect the generation when they are generated, so that the bad strings are excluded from the returned output. Defaults to None.
+        bad_token_ids (List[int], optional): A list of token ids that redirect the generation when they are generated, so that the bad ids are excluded from the returned output. Defaults to None.
+        stop (str, List[str], optional): A string or a list of strings that stop the generation when they are generated. The returned output will not contain the stop strings unless include_stop_str_in_output is True. Defaults to None.
+        stop_token_ids (List[int], optional): A list of token ids that stop the generation when they are generated. Defaults to None.
+        include_stop_str_in_output (bool): Whether to include the stop strings in output text. Defaults to False.
+        embedding_bias (torch.Tensor, optional): The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size]. Defaults to None.
+        logits_processor (tensorrt_llm.sampling_params.LogitsProcessor, List[tensorrt_llm.sampling_params.LogitsProcessor], optional): The logits postprocessor callback(s). Defaults to None.
+            If a list, each processor is applied in order during generation (supported in PyTorch backend only).
+        apply_batched_logits_processor (bool): Whether to apply batched logits postprocessor callback. Defaults to False.
+            The BatchedLogitsProcessor class is recommended for callback creation. The callback must be provided when initializing LLM.
+
+        n (int): Number of sequences to generate. Defaults to 1.
+        best_of (int, optional): Number of sequences to consider for best output. Defaults to None.
+        use_beam_search (bool): Whether to use beam search. Defaults to False.
+
+        top_k (int, optional): Controls number of logits to sample from. Can assume non-negative values, where 0 means 'all logits'. Defaults to None.
+            The value None is treated as "not specified" in the following.
+            If neither temperature, top_p, nor top_k are specified, sampling is greedy.
+            If temperature > 0 and/or top_p < 1 are specified, sampling will proceed accordingly and top_k will default to top_k = 0.
+            Setting top_k = 1 results in greedy sampling.
+        top_p (float, optional): Controls the top-P probability to sample from. Can have values between 0 and 1. Defaults to None.
+            The value None is treated as "not specified" in the following.
+            If neither temperature, top_p, nor top_k are specified, sampling is greedy.
+            If temperature > 0 and/or top_k > 1 are specified, sampling will proceed accordingly and top_p will default to top_p = 1.
+            Setting top_p = 0 should result in greedy sampling, but is currently disallowed in the backend.
+        top_p_min (float, optional): Controls decay in the top-P algorithm. topPMin is lower-bound. Must be in (0, 1]; invalid values are rejected. None means using C++ runtime default 1.e-6. Defaults to None.
+        top_p_reset_ids (int, optional): Controls decay in the top-P algorithm. The token id which, when sampled, resets the decayed top-P to its initial value. Must be >= 0; invalid values are rejected. None means using C++ runtime default -1 (which never matches a token). Defaults to None.
+        top_p_decay (float, optional): Controls decay in the top-P algorithm. The decay value. Must be in (0, 1]; invalid values are rejected. None means using C++ runtime default 1.f. Defaults to None.
+        seed (int, optional): Controls the random seed used by the random number generator in sampling. None means using C++ runtime default 0. Defaults to None.
+        temperature (float, optional): Controls the modulation of logits when sampling new tokens. It can have values >= 0.f. Defaults to None.
+            The value None is treated as "not specified" in the following.
+            If neither temperature, top_p, nor top_k are specified, sampling is greedy.
+            If top_p < 1 and/or top_k > 1 are specified, sampling will proceed accordingly and temperature will default to temperature = 1.
+            Setting temperature = 0 results in greedy sampling.
+        min_tokens (int, optional): Lower bound on the number of tokens to generate. Values < 1 have no effect. None means using C++ runtime default 1. Defaults to None.
+        beam_search_diversity_rate (float, optional): Encourages beams to diverge from each other by adding diversity_rate * source_beam_index to each candidate's ranking score during beam expansion, boosting candidates that expand from lower-ranked beams. Here source_beam_index is the rank of the beam a candidate expands from among the current step's input beams, ordered by cumulative log-probability (0 for the strongest beam). None means using C++ runtime default 0.f (disabled). Defaults to None.
+        repetition_penalty (float, optional): Used to penalize tokens based on how often they appear in the sequence. It can have any value > 0.f. Values < 1.f encourages repetition, values > 1.f discourages it. None means using C++ runtime default 1.f. Defaults to None.
+        presence_penalty (float, optional): Used to penalize tokens already present in the sequence (irrespective of the number of appearances). It can have any values. Values < 0.f encourage repetition, values > 0.f discourage it. None means using C++ runtime default 0.f. Defaults to None.
+        frequency_penalty (float, optional): Used to penalize tokens already present in the sequence (dependent on the number of appearances). It can have any values. Values < 0.f encourage repetition, values > 0.f discourage it. None means using C++ runtime default 0.f. Defaults to None.
+        prompt_ignore_length (int, optional): Controls how many tokens to ignore from the prompt for presence and frequency penalties. Values <= 0 have no effect. Values > input (prompt) length will be clamped. None means using C++ runtime default 0. Defaults to None.
+        length_penalty (float, optional): Beam-search length penalty exponent. Beams are ranked by cum_log_prob / length**length_penalty, where length counts generated tokens only; the returned cumulative_logprob stays unnormalized. Must be >= 0. 0 disables the normalization. None means using C++ runtime default 0.f. Defaults to None.
+        early_stopping (int, optional): Three-state, following HuggingFace. 1 stops as soon as best_of finished candidates exist. 0 and 2 are exhaustive: they keep a pool of finished candidates and continue while an unfinished beam could still outscore the worst of them, 0 bounding attainability with the beams' current length and 2 ("never") with max_seq_len when length_penalty > 0. Any other integer is treated as 2. None means using C++ runtime default 1. Defaults to None.
+        no_repeat_ngram_size (int, optional): Forbids repeating any n-gram of this size: a token is excluded from sampling if it would recreate an n-gram that already occurs in the sequence (prompt included). None or 0 disables the restriction. Defaults to None.
+        min_p (float, optional): scale the most likely token to determine the minimum token probability. None means using C++ runtime default 0.0. Defaults to None.
+        beam_width_array (List[int], optional): Per-iteration beam widths for Variable-Beam-Width-Search; decoding past the end of the array holds its last entry. Must be non-decreasing -- a narrowing schedule is rejected. beam_width is raised to the array's maximum, which is the number of beams returned. Defaults to None.
+
+        logprobs (int, optional): Number of log probabilities to return per output token. When set to 0, return only the sampled token's log probability.
+                                  When set to K>0, return top-K log probabilities + the sampled token's log probability (last entry) if it's not in the Top-K. Defaults to None.
+        logprobs_mode (LogprobMode): The mode of log probabilities to return. Defaults to LogprobMode.RAW.
+        logprobs_simple_format (bool): If True (and `logprobs == 0`), return generation logprobs as a flat `list[float]` (one logprob per generated token) instead of the default `list[dict[int, Logprob]]` format. Reduces per-token allocation overhead when only the sampled-token logprob is needed. Incompatible with `logprobs is None or logprobs > 0` and with beam search. Defaults to False.
+        prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. When set to 0, return only the actual prompt token's log probability.
+                                  When set to K>0, return top-K log probabilities + the actual prompt token's log probability (last entry) if it's not in the Top-K. Defaults to None.
+        prompt_logprobs_simple_format (bool): If True (and `prompt_logprobs == 0`), return prompt logprobs as a flat `list[float]` instead of the default `list[dict[int, Logprob]]` format. Incompatible with `prompt_logprobs is None or prompt_logprobs > 0`. Defaults to False.
+        return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
+        return_generation_logits (bool): Controls if Result should contain the generation logits. Defaults to False.
+        exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Defaults to True.
+        return_encoder_output (bool): Controls if Result should contain encoder output hidden states (for encoder-only and encoder-decoder models). Defaults to False.
+        return_perf_metrics (bool): Controls if Result should contain the performance metrics for this request. Defaults to False.
+        return_routed_experts (bool): Router Replay (R3): return per-token pre-EPLB logical top-k MoE expert ids for train/inference routing alignment in MoE reinforcement learning. Requires the engine-level enable_return_routed_experts. Defaults to False.
+        additional_model_outputs (List[str], optional): The additional outputs to gather from the model. Defaults to None.
+
+        guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
+        thinking_token_budget (int, optional): Experimental. Maximum number of tokens allowed inside a reasoning block. Set to -1 or None for unlimited. Defaults to None.
+
+        ignore_eos (bool): Whether to ignore the EOS token and continue generating tokens after the EOS token is generated. Defaults to False.
+        detokenize (bool): Whether to detokenize the output. Defaults to True.
+        add_special_tokens (bool): Whether to add special tokens to the prompt. Defaults to True.
+        truncate_prompt_tokens (int, optional): If set to an integer k, will use only the last k tokens from the prompt (i.e., left truncation). Defaults to None.
+        skip_special_tokens (bool): Whether to skip special tokens in the output. Defaults to True.
+        spaces_between_special_tokens (bool): Whether to add spaces between special tokens in the output. Defaults to True.
+    """  # noqa: E501
+
+    # [TO DEVELOPER] This class provides an interface to LLMAPI users.
+    # Internally, it manages and dispatches fields to Python bindings of C++ objects, currently including:
+    # (1) all fields of tllme.SamplingConfig;
+    # (2) all fields of tllme.OutputConfig;
+    # (3) some fields of tllme.Request.
+    # If you changed the implementation of C++ objects and corresponding Python bindings, please update:
+    # (1) the fields and corresponding docstring of this class, and
+    # (2) the expected_fields defined in _get_xxx_config methods.
+
+    end_id: Optional[int] = None
+    pad_id: Optional[int] = None
+    max_tokens: int = 32
+    bad: Optional[Union[str, List[str]]] = None
+    bad_token_ids: Optional[List[int]] = None
+    _bad_word_ids: Optional[List[List[int]]] = field(default=None, init=False, repr=False)
+    stop: Optional[Union[str, List[str]]] = None
+    stop_token_ids: Optional[List[int]] = None
+    include_stop_str_in_output: bool = False
+    _stop_word_ids: Optional[List[List[int]]] = field(default=None, init=False, repr=False)
+
+    embedding_bias: Optional[torch.Tensor] = None
+    logits_processor: Optional[Union[LogitsProcessor, List[LogitsProcessor]]] = None
+    apply_batched_logits_processor: bool = False
+
+    n: int = 1
+    best_of: Optional[int] = None
+    use_beam_search: bool = False
+    logprobs_mode: LogprobMode = LogprobMode.RAW
+
+    # Keep the below fields in sync with tllme.SamplingConfig or maintin the mapping table.
+    top_k: Optional[int] = None
+    top_p: Optional[float] = None
+    top_p_min: Optional[float] = None
+    top_p_reset_ids: Optional[int] = None
+    top_p_decay: Optional[float] = None
+    seed: Optional[int] = None
+    temperature: Optional[float] = None
+    min_tokens: Optional[int] = None
+    beam_search_diversity_rate: Optional[float] = None
+    repetition_penalty: Optional[float] = None
+    presence_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None
+    prompt_ignore_length: Optional[int] = None
+    length_penalty: Optional[float] = None
+    early_stopping: Optional[int] = None
+    no_repeat_ngram_size: Optional[int] = None
+    min_p: Optional[float] = None
+    beam_width_array: Optional[List[int]] = None
+
+    # Keep the below fields in sync with tllme.OutputConfig
+    logprobs: Optional[int] = None
+    prompt_logprobs: Optional[int] = None
+    logprobs_simple_format: bool = False
+    prompt_logprobs_simple_format: bool = False
+    return_context_logits: bool = False
+    return_generation_logits: bool = False
+    exclude_input_from_output: bool = True
+    return_encoder_output: bool = False
+    return_perf_metrics: bool = False
+    # Router Replay (R3): return per-token pre-EPLB logical top-k MoE expert ids
+    # on this request's output (via additional_generation_outputs["routed_experts"]),
+    # for train/inference routing alignment in MoE reinforcement learning. Requires
+    # the engine-level enable_return_routed_experts. Separated-routing MoE backends
+    # only (fused backends fail closed).
+    return_routed_experts: bool = False
+    additional_model_outputs: Optional[List[str]] = None
+
+    # Decoder tokens moved from generated output into the input prefix. The
+    # result layer restores them to the user-visible output.
+    _decoder_output_token_prefix: Tuple[int, ...] = field(
+        default_factory=tuple, init=False, repr=False
+    )
+
+    # Guided decoding params
+    guided_decoding: Optional[GuidedDecodingParams] = None
+    thinking_token_budget: Optional[int] = None
+
+    # Tokenizer-related configs
+    ignore_eos: bool = False
+    detokenize: bool = True
+    add_special_tokens: bool = True
+    truncate_prompt_tokens: Optional[int] = None
+    skip_special_tokens: bool = True
+    spaces_between_special_tokens: bool = True
+    # Currently, _stream_interval is only used to pass llm.args.stream_interval to tokenizer.
+    # TODO: make this a per-request parameter.
+    _stream_interval: Optional[int] = field(default=None, init=False, repr=False)
+    # None identifies direct LLM API SamplingParams, where non-None values are
+    # request-provided. Serving adapters set this to preserve which fields were
+    # explicitly present before they materialize their protocol defaults.
+    _request_provided_fields: Optional[frozenset[str]] = field(default=None, init=False, repr=False)
+
+    def __post_init__(self):
+        if self.pad_id is None:
+            self.pad_id = self.end_id
+
+        self.best_of = self.best_of or self.n
+
+        if self.embedding_bias is not None:
+            if isinstance(self.embedding_bias, torch.Tensor):
+                self.embedding_bias = self.embedding_bias.detach().clone()
+            else:
+                self.embedding_bias = torch.tensor(self.embedding_bias, dtype=torch.float32)
+
+        self._validate()
+
+    def __reduce_ex__(self, protocol):
+        # Pickle the field values in field order; subclasses may add fields.
+        if type(self) is not SamplingParams:
+            return object.__reduce_ex__(self, protocol)
+        return _restore_sampling_params, (_get_sampling_params_state(self),)
+
+    def _validate(self):
+        """Verify the sampling parameters.
+
+        This function verifies the sampling parameters in the LLM API, which
+        may have stricter requirements than the Executor class of C++ runtime.
+        For instance, while the greedy decoding with n > 1 is capable in the
+        Executor class of C++ runtime, the LLM API disallows such combination.
+        """
+        # These bounds are written as negated range checks rather than as
+        # `value < low or value > high`, so that NaN is rejected too: every
+        # comparison against NaN is False, which lets it slip through the
+        # positive form. The top_p_decay / top_p_min checks below already use
+        # this form.
+        if self.top_p is not None and not 0 <= self.top_p <= 1:
+            raise ValueError(f"require 0 <= top_p <= 1, got top_p={self.top_p}")
+        if self.top_k is not None and self.top_k < 0:
+            raise ValueError(f"require top_k >= 0, got top_k={self.top_k}")
+        if self.min_p is not None and not 0 <= self.min_p <= 1:
+            raise ValueError(f"require 0 <= min_p <= 1, got min_p={self.min_p}")
+        if self.temperature is not None and not self.temperature >= 0:
+            raise ValueError(f"require temperature >= 0, got temperature={self.temperature}")
+
+        # Top-p decay param ranges mirror the hard checks in the
+        # executor::SamplingConfig constructor (samplingConfig.cpp check*
+        # helpers); rejecting here gives a clear, early error instead of a
+        # RuntimeError from the C++ boundary. Note top_p_min > top_p is
+        # intentionally allowed (the runtime top-p may rise toward top_p_min).
+        if self.top_p_decay is not None and not 0.0 < self.top_p_decay <= 1.0:
+            raise ValueError(f"require 0 < top_p_decay <= 1, got top_p_decay={self.top_p_decay}")
+        if self.top_p_min is not None and not 0.0 < self.top_p_min <= 1.0:
+            raise ValueError(f"require 0 < top_p_min <= 1, got top_p_min={self.top_p_min}")
+        if self.top_p_reset_ids is not None and self.top_p_reset_ids < 0:
+            raise ValueError(
+                f"require top_p_reset_ids >= 0, got top_p_reset_ids={self.top_p_reset_ids}"
+            )
+
+        if self.best_of is not None and self.best_of < self.n:
+            raise ValueError(f"best_of ({self.best_of}) cannot be less than n ({self.n})")
+
+        if (
+            self.best_of is not None
+            and self.best_of > 1
+            and self._greedy_decoding
+            and not os.environ.get("TLLM_ALLOW_N_GREEDY_DECODING", None)
+        ):
+            raise ValueError(
+                f"Greedy decoding in the LLM API does not allow multiple "
+                f"returns. Please set to best_of=1, got best_of={self.best_of}. "
+                f"Please set to best_of=1 or set an environment variable "
+                f"TLLM_ALLOW_N_GREEDY_DECODING=1 to allow best_of > 1 "
+                f"under the greedy decoding."
+            )
+
+        self.logprobs_mode = LogprobMode(self.logprobs_mode)
+
+        if self.truncate_prompt_tokens is not None and self.truncate_prompt_tokens < 1:
+            raise ValueError(
+                f"truncate_prompt_tokens must be >= 1, got {self.truncate_prompt_tokens}"
+            )
+
+        if self.guided_decoding is not None:
+            self.guided_decoding._validate()
+        self.thinking_token_budget = validate_thinking_token_budget(self.thinking_token_budget)
+
+        # correct types as users might pass in logprob=True for Top-0 logprobs and logprobs=False for no logprobs
+        if self.logprobs is False:
+            self.logprobs = None
+        if self.logprobs is True:
+            self.logprobs = 0
+        check_logprobs_limit("logprobs", self.logprobs)
+        check_logprobs_limit("prompt_logprobs", self.prompt_logprobs)
+
+        if self.logprobs_simple_format and self.logprobs != 0:
+            raise ValueError(
+                f"logprobs_simple_format=True requires logprobs == 0, got logprobs={self.logprobs}"
+            )
+        if self.prompt_logprobs_simple_format and self.prompt_logprobs != 0:
+            raise ValueError(
+                "prompt_logprobs_simple_format=True requires prompt_logprobs == 0, got "
+                f"prompt_logprobs={self.prompt_logprobs}"
+            )
+        if self.logprobs_simple_format and self.use_beam_search:
+            raise ValueError("logprobs_simple_format is not supported with beam search")
+
+    def _set_request_provided_fields(self, field_names: Iterable[str]) -> None:
+        """Record sampler fields explicitly supplied by a serving request."""
+        self._request_provided_fields = frozenset(field_names) & _GENERATION_CONFIG_SAMPLING_FIELDS
+
+    def _apply_generation_config_defaults(self, generation_config: Mapping[str, Any]) -> None:
+        """Apply compatible model defaults without overriding request values."""
+        for field_name in _GENERATION_CONFIG_SAMPLING_FIELDS:
+            if field_name not in generation_config:
+                continue
+
+            # Direct LLM API calls preserve None as the unset sentinel. Serving
+            # adapters materialize protocol defaults, so they instead record
+            # which fields the request explicitly supplied.
+            if self._request_provided_fields is None:
+                request_provided = getattr(self, field_name) is not None
+            else:
+                request_provided = field_name in self._request_provided_fields
+            if request_provided:
+                continue
+
+            # A JSON null is also unset and must fall through to the existing
+            # TRT-LLM or serving default.
+            value = generation_config[field_name]
+            if value is None:
+                continue
+            # Hugging Face also permits "never", which the TRT-LLM integer
+            # early-stopping setting cannot represent.
+            if field_name == "early_stopping" and not isinstance(value, (bool, int)):
+                logger.warning(
+                    "Ignoring unsupported generation_config.json early_stopping value "
+                    f"{value!r}; TRT-LLM supports only boolean or integer values."
+                )
+                continue
+            setattr(self, field_name, value)
+
+        self._validate()
+
+    # NB: The predicates below are static because downstream code (e.g.
+    #     sampling_resolution.resolve_row_params) only holds instances of
+    #     bindings.SamplingConfig (not SamplingParams). They are the single
+    #     source of truth for the greedy / top-p-decay resolution shared by
+    #     _greedy_decoding and the torch sampler.
+
+    @staticmethod
+    def params_imply_top_p_decay_active(top_p_decay: Optional[float]) -> bool:
+        """Whether dynamic top-p decay is active.
+
+        Active iff ``top_p_decay`` is explicitly set and ``< 1.0``; a decay of
+        ``1.0`` (the C++ default) is a no-op. Values outside ``(0, 1]`` are
+        rejected up front (_validate and the executor::SamplingConfig
+        constructor), so they never reach this predicate.
+        """
+        return top_p_decay is not None and top_p_decay < 1.0
+
+    @staticmethod
+    def params_imply_explicit_greedy(
+        *,
+        temperature: Optional[float],
+        top_p: Optional[float],
+        top_k: Optional[int],
+        min_p: Optional[float],
+    ) -> bool:
+        """Whether the request carries an explicit greedy control.
+
+        Explicit means top_k == 1, top_p == 0.0, min_p == 1.0, or temperature == 0,
+        as opposed to the implicit "all params unset" greedy default. min_p == 1.0
+        keeps only tokens whose probability equals the row maximum, so like
+        top_p == 0.0 it collapses sampling to a single token.
+        """
+        return top_k == 1 or top_p == 0.0 or min_p == 1.0 or temperature == 0
+
+    @staticmethod
+    def params_imply_greedy_decoding(
+        *,
+        temperature: Optional[float],
+        top_p: Optional[float],
+        top_k: Optional[int],
+        use_beam_search: bool | None,
+        min_p: Optional[float] = None,
+        top_p_decay: Optional[float] = None,
+    ) -> bool:
+        """Whether the parameters resolve to greedy decoding.
+
+        An explicit greedy control always wins. The implicit "all params unset"
+        greedy default is overridden by any active sampling knob: an active
+        top-p decay (which implies top-p sampling so the decayed runtime top-p
+        can take effect) or a ``min_p`` in ``(0, 1)`` (which still selects among
+        multiple tokens); callers that do not support decay may omit
+        ``top_p_decay``.
+        """
+        if use_beam_search:
+            return False
+        if SamplingParams.params_imply_explicit_greedy(
+            temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p
+        ):
+            return True
+        implicitly_greedy = temperature is None and top_p is None and top_k is None
+        min_p_active = min_p is not None and min_p > 0.0
+        decay_active = SamplingParams.params_imply_top_p_decay_active(top_p_decay)
+        return implicitly_greedy and not min_p_active and not decay_active
+
+    @property
+    def _greedy_decoding(self) -> bool:
+        return self.params_imply_greedy_decoding(
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            use_beam_search=self.use_beam_search,
+            min_p=self.min_p,
+            top_p_decay=self.top_p_decay,
+        )
+
+    def _setup(
+        self, tokenizer, hf_model_config, generation_config, add_special_tokens: bool = False
+    ) -> "SamplingParams":
+        if self.end_id is None:
+            self.end_id = tokenizer.eos_token_id
+            self.pad_id = tokenizer.pad_token_id
+
+            if self.pad_id is None:
+                self.pad_id = self.end_id
+
+        def _encode(tokenizer, text, add_special_tokens):
+            try:
+                return tokenizer.encode(text, add_special_tokens=add_special_tokens)
+            except TypeError:
+                # For tiktokenizer, the encode method does not have add_special_tokens argument
+                return tokenizer.encode(text)
+
+        if self.bad is not None:
+            strs = [self.bad] if isinstance(self.bad, str) else self.bad
+            self._bad_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
+
+        if self.stop is not None:
+            strs = [self.stop] if isinstance(self.stop, str) else self.stop
+            self._stop_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
+
+        # Add eos_token_id in generation_config to stop_token_ids
+        # The eos_token_id in generation_config are really mean to stop the text generation.
+        if generation_config is not None and generation_config.eos_token_id is not None:
+            if isinstance(generation_config.eos_token_id, int):
+                generation_config.eos_token_id = [generation_config.eos_token_id]
+            # else is always List[int]
+
+            if not self.stop_token_ids:
+                self.stop_token_ids = []
+            for stop_token in generation_config.eos_token_id:
+                if stop_token != self.end_id and stop_token not in self.stop_token_ids:
+                    self.stop_token_ids.append(stop_token)
+            if not self.stop_token_ids:
+                self.stop_token_ids = None
+
+        return self
+
+    def _get_bad_words(self) -> List[List[int]]:
+        words = []
+        if self.bad_token_ids:
+            words = [[i] for i in self.bad_token_ids]
+
+        if self.bad is None:
+            return words
+        else:
+            if self._bad_word_ids is None:
+                raise RuntimeError(
+                    f"{self.__class__.__name__}.bad ({self.bad}) is not processed by tokenizer, "
+                    "please call the setup method."
+                )
+            return words + self._bad_word_ids
+
+    def _get_stop_words(self) -> List[List[int]]:
+        words = []
+        if self.stop_token_ids:
+            words = [[i] for i in self.stop_token_ids]
+
+        if self.stop is None:
+            return words
+        else:
+            if self._stop_word_ids is None:
+                raise RuntimeError(
+                    f"{self.__class__.__name__}.stop ({self.stop}) is not processed by tokenizer, "
+                    "please call the setup method."
+                )
+            return words + self._stop_word_ids
+
+    def _get_stop_reasons_and_words(self) -> List[Tuple[Union[str, int], List[List[int]]]]:
+        stop_reasons = []
+        if self.stop_token_ids is not None:
+            stop_reasons.extend(self.stop_token_ids)
+        if self.stop is not None:
+            if isinstance(self.stop, str):
+                stop_reasons.append(self.stop)
+            else:
+                stop_reasons.extend(self.stop)
+        stop_words = self._get_stop_words()
+        return list(zip(stop_reasons, stop_words))
+
+    def _get_sampling_config(self) -> tllme.SamplingConfig:
+        # A map from the SamplingConfig fields of the LLM API to their
+        # corresponding field names of the Executor of TRT-LLM C++ runtime.
+        # In sampling, there is no parameter that directly matches 'best_of',
+        # so outputs must be trimmed during postprocessing.
+        #               |     LLM API     |    TRT-LLM Executor    |
+        # --------------|-----------------|------------------------|
+        # | Beam search | use_beam_search | beam_width > 1         |
+        # | Beam search | n               | num_return_sequences   |
+        # | Beam search | best_of         | beam_width             |
+        # |-------------|-----------------|------------------------|
+        # | Sampling    | use_beam_search | beam_width == 1        |
+        # | Sampling    | n               | num_return_sequences   |
+        # | Sampling    | best_of         | no corresponding param |
+        fields = _sampling_config_fields()
+        unmatched_params = [
+            "num_return_sequences",
+            "beam_width",
+            "n",
+            "best_of",
+            "use_beam_search",
+        ]
+        llmapi_to_rt_param_map = {f: getattr(self, f) for f in fields if f not in unmatched_params}
+        if self.use_beam_search:
+            llmapi_to_rt_param_map["num_return_sequences"] = self.n
+            llmapi_to_rt_param_map["beam_width"] = self.best_of
+        else:
+            llmapi_to_rt_param_map["num_return_sequences"] = self.best_of
+            llmapi_to_rt_param_map["beam_width"] = 1
+
+        return tllme.SamplingConfig(**llmapi_to_rt_param_map)
+
+    def _get_output_config(self) -> tllme.OutputConfig:
+        fields = _output_config_fields()
+
+        config_kwargs = {f: getattr(self, f) for f in fields}
+
+        config_kwargs["return_log_probs"] = self.logprobs is not None
+        if self.prompt_logprobs is not None and not self.return_context_logits:
+            logger.info(
+                "Since prompt_logprobs is requested but return_context_logits is False, "
+                "internally enabling context logits for prompt logprobs computation. "
+                "context logits will be dropped after computation as the user didn't explicitly request them."
+            )
+            # TODO: Find a more elegant way to do this.
+            # NOTE: This is an internal hack, so we can entirely avoid introducing
+            # `prompt_logprobs` into the executor bindings and further into
+            # model engine / sampler.
+            # This is because, prompt_logprobs is a derived quantity from
+            # context logits, and the capability to post-compute it
+            # already exists in the worker. (see _get_logprobs in base_worker.py)
+            config_kwargs["return_context_logits"] = True
+
+        if config_kwargs.get("additional_model_outputs") is not None:
+            config_kwargs["additional_model_outputs"] = [
+                tllme.AdditionalModelOutput(name=output_name, gather_context=False)
+                for output_name in config_kwargs["additional_model_outputs"]
+            ]
+
+        return tllme.OutputConfig(**config_kwargs)
+
+    def _get_guided_decoding_params(self) -> tllme.GuidedDecodingParams:
+        if self.guided_decoding is None:
+            return None
+
+        if self.guided_decoding.json_object:
+            return tllme.GuidedDecodingParams(tllme.GuidedDecodingParams.GuideType.JSON)
+        elif self.guided_decoding.json is not None:
+            json_schema = self.guided_decoding.json
+            if isinstance(json_schema, BaseModel):
+                json_schema = json_schema.model_json_schema()
+            if isinstance(json_schema, dict):
+                json_schema = json.dumps(json_schema)
+            return tllme.GuidedDecodingParams(
+                tllme.GuidedDecodingParams.GuideType.JSON_SCHEMA, json_schema
+            )
+        elif self.guided_decoding.regex is not None:
+            return tllme.GuidedDecodingParams(
+                tllme.GuidedDecodingParams.GuideType.REGEX, self.guided_decoding.regex
+            )
+        elif self.guided_decoding.grammar is not None:
+            return tllme.GuidedDecodingParams(
+                tllme.GuidedDecodingParams.GuideType.EBNF_GRAMMAR, self.guided_decoding.grammar
+            )
+        elif self.guided_decoding.structural_tag is not None:
+            return tllme.GuidedDecodingParams(
+                tllme.GuidedDecodingParams.GuideType.STRUCTURAL_TAG,
+                self.guided_decoding.structural_tag,
+            )
+        else:
+            return None
+
+
+_SAMPLING_PARAMS_FIELDS = tuple(f.name for f in fields(SamplingParams))
+_get_sampling_params_state = operator.attrgetter(*_SAMPLING_PARAMS_FIELDS)
+# Only its generated ``__init__`` is used: one store per field, no ``__post_init__``.
+_set_sampling_params_state = make_dataclass(
+    "_SamplingParamsState", _SAMPLING_PARAMS_FIELDS, repr=False, eq=False
+).__init__
+
+
+def _restore_sampling_params(state: tuple) -> "SamplingParams":
+    sampling_params = object.__new__(SamplingParams)
+    _set_sampling_params_state(sampling_params, *state)
+    return sampling_params
+
+
+@functools.cache
+def _sampling_config_fields() -> frozenset[str]:
+    """Return the ``tllme.SamplingConfig`` field names.
+
+    They are fixed by the bindings, so the ``dir()`` scan runs once instead of once per request.
+    """
+    return frozenset(f for f in dir(tllme.SamplingConfig) if not f.startswith("__"))
+
+
+@functools.cache
+def _output_config_fields() -> tuple[str, ...]:
+    """Return the ``tllme.OutputConfig`` field names that ``SamplingParams`` also defines."""
+    sampling_param_fields = set(dir(SamplingParams))
+    return tuple(
+        f for f in dir(tllme.OutputConfig) if not f.startswith("__") and f in sampling_param_fields
+    )

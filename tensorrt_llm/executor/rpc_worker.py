@@ -1,0 +1,253 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+from pathlib import Path
+from queue import Queue
+from threading import Event
+from typing import Optional
+
+import nvtx
+
+from tensorrt_llm._utils import mpi_comm
+from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
+
+from .._utils import mpi_rank
+from ..llmapi._load_balance_env import uses_collective_shutdown
+from ..llmapi.llm_args import BaseLlmArgs
+from ..llmapi.tokenizer import TokenizerBase
+from ..logger import set_level
+from .base_worker import BaseWorker
+from .postproc_worker import PostprocWorkerConfig
+from .rpc import RPCServer
+from .rpc_worker_mixin import RpcWorkerMixin
+
+_RPC_SHUTDOWN_RETRY = "retry"
+_RPC_SHUTDOWN_COMMIT = "commit"
+
+
+class RpcWorker(RpcWorkerMixin, BaseWorker):
+    """
+    A RPC wrapper for the BaseWorker class.
+
+    Actions:
+        - `setup_engine`: Setup the engine.
+        - `submit`: Submit a request to the worker.
+        - `fetch_responses`: Fetch the latest responses from engine.
+        - `fetch_stats`: Fetch the latest stats from engine.
+        - `fetch_kv_cache_events`: Fetch the latest kv cache events from engine.
+        - `shutdown`: Shutdown the worker.
+    """
+
+    # Default number of RPC server workers
+    # Increased to handle concurrent requests and prevent thread pool exhaustion
+    # Need enough workers for: submit requests + fetch_responses + other operations
+    # Can be overridden via constructor parameter
+    DEFAULT_NUM_WORKERS = 32
+
+    # Default timeout for fetch_responses in seconds
+    # This is a short timeout to prevent blocking the event loop while still allowing
+    # responses to be fetched efficiently. The value is tuned to balance responsiveness
+    # and CPU usage. Can be overridden via constructor parameter.
+    DEFAULT_FETCH_TIMEOUT = 0.1
+
+    def __init__(
+        self,
+        is_llm_executor: Optional[bool] = None,
+        postproc_worker_config: Optional[PostprocWorkerConfig] = None,
+        hf_model_dir: Optional[Path] = None,
+        tokenizer: Optional[TokenizerBase] = None,
+        llm_args: Optional[BaseLlmArgs] = None,
+        num_workers: Optional[int] = None,
+        fetch_timeout: Optional[float] = None,
+    ) -> None:
+        super().__init__(
+            postproc_worker_config=postproc_worker_config,
+            is_llm_executor=is_llm_executor,
+            hf_model_dir=hf_model_dir,
+            tokenizer=tokenizer,
+            llm_args=llm_args,
+        )
+
+        # Configure number of RPC workers
+        self.num_workers = num_workers if num_workers is not None else self.DEFAULT_NUM_WORKERS
+
+        # Configure fetch timeout
+        self._fetch_timeout = fetch_timeout if fetch_timeout is not None else self.DEFAULT_FETCH_TIMEOUT
+
+        # Extract garbage_collection_gen0_threshold from llm_args if available
+        self.garbage_collection_gen0_threshold = (
+            llm_args.garbage_collection_gen0_threshold if llm_args is not None
+            and hasattr(llm_args, 'garbage_collection_gen0_threshold') else
+            None)
+        self.shutdown_event = Event()
+        self._rpc_collective_shutdown = False
+        self._rpc_shutdown_attempted = False
+        self._rpc_shutdown_ready = False
+        self._rpc_shutdown_committed = False
+
+        self._response_queue = Queue()
+        self.set_result_queue(self._response_queue)
+
+        # Note: We don't create a persistent ThreadPoolExecutor anymore
+        # to avoid thread leaks. Instead, we use asyncio.to_thread() which
+        # manages threads internally.
+
+    def setup_engine(self):
+        # Force all the ranks to wait here, and start creating the executor simultaneously.
+        # Only call barrier if we have multiple ranks to avoid hanging in single-process tests
+        if mpi_comm().Get_size() > 1:
+            mpi_comm().barrier()
+
+        super().setup_engine()
+
+    def shutdown(self):
+        if getattr(self, "_rpc_shutdown_committed", False):
+            return
+
+        logger_debug(f"[worker] RpcWorker #{mpi_rank()} is shutting down",
+                     color="yellow")
+        if not getattr(self, "_rpc_collective_shutdown", False):
+            self.shutdown_event.set()
+            super().shutdown()
+            return
+
+        # Followers wait between attempts. Wake them only when rank zero is
+        # explicitly retrying a failed, fully-converged shutdown attempt.
+        if mpi_rank() == 0 and self._rpc_shutdown_attempted:
+            mpi_comm().bcast(_RPC_SHUTDOWN_RETRY, root=0)
+        self._rpc_shutdown_attempted = True
+        self._rpc_shutdown_ready = False
+
+        local_error = None
+        try:
+            super().shutdown()
+        except BaseException as error:
+            local_error = error
+
+        # Do not acknowledge rank zero until every rank has completed cleanup.
+        # A peer-only failure must be reported to the client as well, otherwise
+        # a shared MPI pool could be reused while that peer is still tearing down.
+        local_failure = (None if local_error is None else
+                         f"{type(local_error).__name__}: {local_error}")
+        failures = mpi_comm().allgather(local_failure)
+        failures = [
+            f"rank {rank}: {failure}" for rank, failure in enumerate(failures)
+            if failure is not None
+        ]
+        if failures:
+            if local_error is not None:
+                raise local_error
+            raise RuntimeError("RPC worker shutdown failed: " +
+                               "; ".join(failures))
+
+        self._rpc_shutdown_ready = True
+        logger_debug(f"[worker] RpcWorker #{mpi_rank()} is shutdown",
+                     color="yellow")
+
+    def commit_shutdown(self) -> None:
+        """Commit an all-rank cleanup after its RPC response was acknowledged."""
+        if self._rpc_shutdown_committed:
+            return
+        if mpi_rank() != 0:
+            raise RuntimeError("Only RPC rank zero may commit shutdown")
+        if not self._rpc_shutdown_ready:
+            raise RuntimeError(
+                "RPC worker cleanup has not completed on every rank")
+        mpi_comm().bcast(_RPC_SHUTDOWN_COMMIT, root=0)
+        self._rpc_shutdown_committed = True
+
+    def _complete_shutdown_commit(self) -> None:
+        """Wake main_task only after RPCServer has sent the commit response."""
+        if not self._rpc_shutdown_committed:
+            raise RuntimeError("RPC worker shutdown was not committed")
+        self.shutdown_event.set()
+
+    def start(self):
+        pass
+
+    @staticmethod
+    def main_task(
+        rpc_addr: str,
+        *,
+        postproc_worker_config: Optional[PostprocWorkerConfig] = None,
+        is_llm_executor: Optional[bool] = None,
+        llm_args: Optional[BaseLlmArgs] = None,
+        hf_model_dir: Optional[Path] = None,
+        tokenizer: Optional[TokenizerBase] = None,
+        **kwargs,
+    ) -> None:
+        nvtx.push_range(f"RpcWorker.main_task_{mpi_rank()}", color="pink")
+
+        if enable_llm_debug():
+            set_level("debug")
+
+        # Step 1: Create the worker instance
+        worker = RpcWorker(
+            is_llm_executor=is_llm_executor,
+            llm_args=llm_args,
+            postproc_worker_config=postproc_worker_config,
+            hf_model_dir=hf_model_dir,
+            tokenizer=tokenizer,
+        )
+        # Only the per-layer dynamic EPLB fabric arena needs the all-rank
+        # two-phase shutdown; other configurations keep rank-local teardown.
+        worker._rpc_collective_shutdown = uses_collective_shutdown(llm_args)
+
+        if mpi_rank() != 0:
+            # The non-leader worker will setup the engine immediately.
+            # The leader worker will wait for the RPC call to propagate the
+            # potential error.
+            logger_debug(
+                f"[worker] Worker {mpi_rank()} is setting up the engine",
+                color="yellow")
+            worker.setup_engine()
+            # Rank zero publishes the shutdown request. Every follower waits
+            # for its broadcast sentinel, then runs the same finalize path so
+            # model-owned EP collectives remain rank-aligned.
+            if worker._rpc_collective_shutdown:
+                worker.engine.wait_shutdown()
+            while worker._rpc_collective_shutdown:
+                shutdown_error = None
+                try:
+                    worker.shutdown()
+                except BaseException as error:
+                    shutdown_error = error
+                command = mpi_comm().bcast(None, root=0)
+                if command == _RPC_SHUTDOWN_COMMIT:
+                    if shutdown_error is not None:
+                        raise shutdown_error
+                    worker._rpc_shutdown_committed = True
+                    worker.shutdown_event.set()
+                    break
+                if command != _RPC_SHUTDOWN_RETRY:
+                    raise RuntimeError(
+                        f"Unexpected RPC shutdown command: {command!r}"
+                    ) from shutdown_error
+
+        else:
+            logger_debug(
+                f"[worker] Worker {mpi_rank()} is creating the RPC service with {worker.num_workers} workers",
+                color="yellow")
+            # Step 2: Create the RPC service, it will expose all the APIs of the worker as remote call to the client
+            # Set num_workers to larger than 1 since there are some streaming tasks runs infinitely, such as await_responses_async.
+            hmac_key: bytes = kwargs["hmac_key"]
+            rpc_server = RPCServer(worker,
+                                   num_workers=worker.num_workers,
+                                   hmac_key=hmac_key)
+            rpc_server.bind(rpc_addr)
+            rpc_server.start()
+            logger_debug(f"[worker] RPC server {mpi_rank()} is started",
+                         color="yellow")
+
+            # Step 3: Wait for the worker to shutdown
+            logger_debug(
+                f"[worker] Worker {mpi_rank()} is waiting for shutdown event",
+                color="yellow")
+            worker.shutdown_event.wait()
+            rpc_server.shutdown()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.shutdown()
+        return True

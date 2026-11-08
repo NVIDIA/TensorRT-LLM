@@ -1,0 +1,6 @@
+models/**/
+data/*/**/*.npy
+data/**/*.csv
+data/**/*.json
+data/*.json
+!data/test_model_lora_config.json

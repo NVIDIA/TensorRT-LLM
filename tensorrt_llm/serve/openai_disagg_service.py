@@ -1,0 +1,768 @@
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+import json
+import os
+import re
+from typing import Callable, Optional
+
+from fastapi import HTTPException
+
+from tensorrt_llm._utils import get_global_steady_clock_now_in_seconds
+from tensorrt_llm.llmapi.disagg_utils import ConditionalDisaggConfig, DisaggServerConfig, ServerRole
+from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.anthropic_protocol import (
+    AnthropicCountTokensRequest,
+    AnthropicCountTokensResponse,
+)
+from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinator
+from tensorrt_llm.serve.openai_client import OpenAIClient
+from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    CompletionRequest,
+    CompletionResponse,
+    DisaggregatedParams,
+    DisaggScheduleStyle,
+    ModelList,
+    PromptTokensDetails,
+    ResponsesRequest,
+    ResponsesResponse,
+    UCompletionRequest,
+    UCompletionResponse,
+    UsageInfo,
+)
+from tensorrt_llm.serve.openai_service import OpenAIService
+from tensorrt_llm.serve.responses_utils import (
+    ResponseHooks,
+    UCompletionResponseOrGenerator,
+    done_generator,
+    responses_done_generator,
+)
+from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, KvCacheAwareRouter, Router
+
+# Finish reasons for which a GEN handoff is still pending; any other reason means
+# the CTX request already completed and the disagg KV-cache handoff was never set up.
+_GEN_PENDING_FINISH_REASONS = ("length", "not_finished")
+
+
+def _ctx_handoff_slots(response: UCompletionResponse) -> list:
+    """The parts of a context response that carry the KV-cache handoff.
+
+    ``choices`` for completions and chat; a Responses response carries it at the
+    top level. Each exposes ``disaggregated_params`` and ``finish_reason``.
+    """
+    if isinstance(response, ResponsesResponse):
+        return [response]
+    return list(response.choices)
+
+
+def _ctx_usage_info(response: UCompletionResponse) -> Optional[UsageInfo]:
+    """The context phase's usage as the ``UsageInfo`` that ``ctx_usage`` expects.
+
+    The Responses API reports ``ResponseUsage``; its cached count is one only
+    the context phase can measure.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None or isinstance(usage, UsageInfo):
+        return usage
+    cached = getattr(usage, "input_tokens_details", None)
+    return UsageInfo(
+        prompt_tokens=usage.input_tokens,
+        completion_tokens=usage.output_tokens,
+        total_tokens=usage.total_tokens,
+        prompt_tokens_details=PromptTokensDetails(
+            cached_tokens=getattr(cached, "cached_tokens", 0) or 0
+        ),
+    )
+
+
+def _drop_ctx_handoff(response: UCompletionResponse) -> None:
+    """Strip the handoff from a context response that goes to the client."""
+    for slot in _ctx_handoff_slots(response):
+        slot.disaggregated_params = None
+    if isinstance(response, ResponsesResponse):
+        response.prompt_token_ids = None
+        response.prompt_token_ids_b64 = None
+        response.finish_reason = None
+
+
+class _SseErrorObserver:
+    """Observe worker error events without changing the forwarded SSE bytes."""
+
+    _EVENT_END = re.compile(rb"\r?\n\r?\n")
+
+    def __init__(self, *, responses_api: bool = False) -> None:
+        """Retain only the incomplete event between network chunks."""
+        self._pending = bytearray()
+        self._scan_from = 0
+        self._responses_api = responses_api
+
+    def feed(self, chunk: str | bytes) -> bool:
+        """Report a complete top-level error event in LF/CRLF worker SSE.
+
+        Args:
+            chunk: Original stream data, possibly splitting an event or UTF-8 character.
+
+        Returns:
+            Whether a complete event contains the worker's JSON error envelope.
+        """
+        self._pending.extend(chunk.encode("utf-8") if isinstance(chunk, str) else chunk)
+        event_start = 0
+        scan_from = self._scan_from
+        found_error = False
+        while match := self._EVENT_END.search(self._pending, scan_from):
+            event = self._pending[event_start : match.start()]
+            event_start = scan_from = match.end()
+            data = b"\n".join(
+                line[5:].removeprefix(b" ")
+                for line in event.splitlines()
+                if line.startswith(b"data:")
+            )
+            try:
+                payload = json.loads(data)
+            except ValueError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            found_error = isinstance(payload.get("error"), dict) or (
+                self._responses_api and payload.get("type") in ("error", "response.failed")
+            )
+            if found_error:
+                break
+        # Compact once per feed, not once per event in a coalesced chunk.
+        del self._pending[:event_start]
+        # An early error leaves the tail unscanned. Otherwise only a split
+        # delimiter needs revisiting; CRLF/CRLF has at most three prior bytes.
+        self._scan_from = 0 if found_error else max(0, len(self._pending) - 3)
+        return found_error
+
+
+class OpenAIDisaggregatedService(OpenAIService):
+    def __init__(
+        self,
+        config: DisaggServerConfig,
+        coordinator: "DisaggCoordinator",
+        client_factory: Callable[[Router, ServerRole], OpenAIClient],
+        req_timeout_secs: int = 180,
+    ):
+        self._config = config
+        # The service drives the coordinator's ctx/gen routers uniformly, so serving
+        # is identical whether the router is the real one (single-process) or a
+        # delegating one that forwards placement to a remote coordinator (worker).
+        self._coordinator = coordinator
+        self._ctx_router = coordinator.ctx_router
+        self._gen_router = coordinator.gen_router
+        self._client_factory = client_factory
+        self._req_timeout_secs = req_timeout_secs
+        # Opt-in body-shrink for generation_only requests; see _get_gen_request.
+        self._strip_gen_message_history = config.gen_strip_message_history
+        # Opt-in: ask context workers to return prompt_token_ids as base64 int32.
+        self._tokids_ctxbytes = config.gen_tokids_ctxbytes
+        self._subagent_affinity_scope = config.subagent_affinity_scope
+
+        self._ctx_client = None
+        self._gen_client = None
+        self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
+        # Token counting is stateless and cheap, so it is spread over the
+        # context workers round-robin rather than going through the router,
+        # which would charge the pick against KV-cache-aware load accounting.
+        self._count_tokens_rr_counter = 0
+
+        match self._config.schedule_style:
+            case "generation_first":
+                self._send_disagg_request = self._send_disagg_request_gen_first
+                self._schedule_style = DisaggScheduleStyle.GENERATION_FIRST
+                logger.info(
+                    f"Using generation first disagg schedule style, schedule_style: {self._config.schedule_style}"
+                )
+            case _:
+                self._send_disagg_request = self._send_disagg_request_ctx_first
+                self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
+                logger.info(
+                    f"Using context first disagg schedule style, schedule_style: {self._config.schedule_style}"
+                )
+
+    async def openai_completion(
+        self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
+    ) -> UCompletionResponseOrGenerator:
+        if not await self.is_ready():
+            raise RuntimeError("Cluster is not ready")
+        if not isinstance(request.prompt, str):
+            # Reject empty prompt lists explicitly so the router does not
+            # index prompt[0] on an empty list.
+            if isinstance(request.prompt, list) and len(request.prompt) == 0:
+                raise ValueError("Disaggregated server does not support empty prompt list")
+            # Check if it's a list and contains integers
+            if type(request.prompt) is list and len(request.prompt) == 1:
+                request.prompt = request.prompt[0]
+            elif not isinstance(request.prompt, list) or not all(
+                isinstance(x, int) for x in request.prompt
+            ):
+                raise ValueError(
+                    "Disaggregated server currently only supports single string prompt or list of integers in request"
+                )
+
+        return await self._send_disagg_request(request, hooks)
+
+    async def openai_chat_completion(
+        self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
+    ) -> UCompletionResponseOrGenerator:
+        if not await self.is_ready():
+            raise RuntimeError("Cluster is not ready")
+        return await self._send_disagg_request(request, hooks)
+
+    async def _next_ctx_server(self) -> str:
+        """A context worker, round-robin, for requests the proxy cannot serve."""
+        if not await self.is_ready():
+            raise RuntimeError("Cluster is not ready")
+        servers = self._ctx_router.servers
+        if not servers:
+            raise RuntimeError("No context servers are available")
+        server = servers[self._count_tokens_rr_counter % len(servers)]
+        self._count_tokens_rr_counter += 1
+        return server
+
+    async def get_model(self) -> ModelList:
+        """Report the model as a worker serves it; the proxy holds none."""
+        return await self._ctx_client.get_json(
+            "v1/models", ModelList, await self._next_ctx_server()
+        )
+
+    async def anthropic_count_tokens(
+        self, request: AnthropicCountTokensRequest
+    ) -> AnthropicCountTokensResponse:
+        """Forward count-tokens to a context worker with the real tokenizer.
+
+        The disaggregated server holds no tokenizer of its own, so counting has
+        to happen on a worker. Context workers are the ones that tokenize
+        prompts, so the count they return is the one that will actually be used.
+        """
+        return await self._ctx_client.post_json(
+            "v1/messages/count_tokens",
+            request,
+            AnthropicCountTokensResponse,
+            await self._next_ctx_server(),
+        )
+
+    async def openai_responses(
+        self, request: ResponsesRequest, hooks: Optional[ResponseHooks] = None
+    ) -> UCompletionResponseOrGenerator:
+        if not await self.is_ready():
+            raise RuntimeError("Cluster is not ready")
+
+        # Stored responses are per worker and unreachable through this proxy.
+        if request.previous_response_id is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "'previous_response_id' is not supported on a disaggregated "
+                    "server: responses are stored per worker and this request "
+                    "may not reach the worker that holds it. Send the prior "
+                    "turns in 'input' instead."
+                ),
+            )
+        if "store" in request.model_fields_set and request.store:
+            logger.warning_once(
+                "'store' is ignored on a disaggregated server; nothing is persisted.",
+                key="disagg_responses_store_ignored",
+            )
+        request.store = False
+        # The generation worker must consume the prompt the context worker
+        # prefilled, so only the context response may supply prompt ids.
+        request.prompt_token_ids = None
+        request.prompt_token_ids_b64 = None
+
+        return await self._send_disagg_request(request, hooks)
+
+    async def _send_disagg_request_ctx_first(
+        self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
+    ) -> UCompletionResponseOrGenerator:
+        # ctx_response contains a http response with ContextPhaseParams attached after prefill compute is done
+
+        arrival_time = self._get_arrival_time(hooks)
+        if hooks:
+            hooks.on_req_begin(request)
+        # empty server means client decides which server to use
+        ctx_server = None
+        disagg_request_id = await self._coordinator.get_disagg_request_id()
+        if hooks:
+            hooks.on_disagg_request_id(disagg_request_id)
+        # reserve a gen_server if conditional disagg is needed
+        gen_server, need_ctx = await self._check_conditional_disagg(request, disagg_request_id)
+        # Context retries may replace disagg_request_id for the KV-transfer
+        # handshake. Keep the ID used to reserve the generation server separate
+        # so its coordinator-side load is released under the original key.
+        gen_reservation_id = disagg_request_id if gen_server else None
+        benchmark_gen_only = await self._check_gen_only_disagg(request)
+        need_ctx = need_ctx and not benchmark_gen_only
+        ctx_response = None
+        gen_req = request
+        if need_ctx:
+            try:
+                # Mark ctx-dispatch start: arrival->here is the pre-ctx wait in the
+                # orchestrator/fleet (accept queue + event loop + pipeline).
+                if hooks:
+                    hooks.on_ctx_dispatch(request)
+                ctx_req = self._get_ctx_request(request, disagg_request_id)
+                # ctx generator is empty
+                ctx_server, _ = await self._ctx_router.get_next_server(
+                    ctx_req, exclude_server=gen_server, req_id=disagg_request_id
+                )
+                ctx_response = await self._ctx_client.send_request(
+                    ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
+                )
+                await self._verify_ctx_response(ctx_response)
+                ctx_response_disagg_params = _ctx_handoff_slots(ctx_response)[
+                    0
+                ].disaggregated_params
+                if ctx_response_disagg_params.disagg_request_id is not None:
+                    disagg_request_id = ctx_response_disagg_params.disagg_request_id
+                    if hooks:
+                        hooks.on_disagg_request_id(disagg_request_id)
+                gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
+            except Exception:
+                if gen_server:
+                    await self._gen_router.finish_request(
+                        request, success=False, req_id=gen_reservation_id
+                    )
+                raise
+        else:
+            # When need_ctx=False the gen server handles full generation and
+            # must not see client-supplied disaggregated handoff params. The
+            # benchmark-only path above is the only trusted source here.
+            if not benchmark_gen_only:
+                gen_req = request.model_copy(update={"disaggregated_params": None})
+        self._strip_gen_subagent_affinity(gen_req)
+        if ctx_response is None or self._need_gen(ctx_response):
+            if not gen_server:
+                gen_server, _ = await self._gen_router.get_next_server(
+                    gen_req, exclude_server=ctx_server, req_id=disagg_request_id
+                )
+                gen_reservation_id = disagg_request_id
+            self._stamp_orig_elapsed(gen_req, arrival_time)
+            gen_response = await self._gen_client.send_request(
+                gen_req, server=gen_server, hooks=hooks, req_id=gen_reservation_id
+            )
+            return gen_response
+        else:
+            if gen_server:
+                await self._gen_router.finish_request(request, req_id=gen_reservation_id)
+            if hooks:
+                hooks.on_resp_done("", request, ctx_response)
+            if request.stream:
+                # ctx client will never return a generator when streaming is requested
+                # make up for this by returning a done generator
+                if isinstance(ctx_response, ResponsesResponse):
+                    # Responses has no "[DONE]"; replay the finished response.
+                    return responses_done_generator(ctx_response)
+                return done_generator()
+            return ctx_response
+
+    @staticmethod
+    def _get_arrival_time(hooks: Optional[ResponseHooks]) -> float:
+        """The HTTP middleware's arrival stamp, else now, on its global steady clock."""
+        arrival_time = getattr(hooks, "request_arrival_time", None)
+        if isinstance(arrival_time, (int, float)) and arrival_time > 0:
+            return float(arrival_time)
+        return get_global_steady_clock_now_in_seconds()
+
+    @staticmethod
+    def _stamp_orig_elapsed(gen_req: UCompletionRequest, arrival_time: float) -> None:
+        """A duration rather than a timestamp, so no cross-host clock sync is needed."""
+        params = gen_req.disaggregated_params
+        if params is None:
+            return
+        params.orig_elapsed_s = max(0.0, get_global_steady_clock_now_in_seconds() - arrival_time)
+
+    def _need_gen(self, response: UCompletionResponse) -> bool:
+        if response:
+            slot = _ctx_handoff_slots(response)[0]
+            params = slot.disaggregated_params
+            if params is not None and params.remote_tail_start is not None:
+                return True
+            if slot.finish_reason not in _GEN_PENDING_FINISH_REASONS:
+                _drop_ctx_handoff(response)
+                return False
+        return True
+
+    def _get_ctx_request(
+        self, request: UCompletionRequest, disagg_request_id: Optional[int]
+    ) -> UCompletionRequest:
+        update = {
+            "disaggregated_params": DisaggregatedParams(
+                request_type="context_only",
+                disagg_request_id=disagg_request_id,
+                schedule_style=self._schedule_style,
+                return_prompt_token_ids_b64=self._tokids_ctxbytes,
+            ),
+            "stream": False,
+            "stream_options": None,
+        }
+        # Isolate context affinity from the generation request's shallow copy.
+        if request.conversation_params is not None:
+            update["conversation_params"] = request.conversation_params.model_copy()
+        ctx_request = request.model_copy(update=update)
+        return ctx_request
+
+    def _strip_gen_subagent_affinity(self, gen_req: UCompletionRequest) -> None:
+        """Keep generation parent affinity only for the "both" scope."""
+        if self._subagent_affinity_scope == "both":
+            return
+        if gen_req.conversation_params is not None:
+            gen_req.conversation_params.subagent_affinity_id = None
+
+    def _get_gen_request(
+        self,
+        request: UCompletionRequest,
+        ctx_response: Optional[UCompletionResponse],
+        disagg_request_id: Optional[int],
+        ctx_server_info: Optional[dict] = None,
+    ) -> UCompletionRequest:
+        if ctx_response:
+            request.disaggregated_params = _ctx_handoff_slots(ctx_response)[0].disaggregated_params
+            request.disaggregated_params.request_type = "generation_only"
+            request.disaggregated_params.schedule_style = self._schedule_style
+            request.disaggregated_params.ctx_usage = _ctx_usage_info(ctx_response)
+            # Replace the string prompt with prompt_tokens_ids
+            if isinstance(request, CompletionRequest):
+                request.prompt = ctx_response.prompt_token_ids
+            elif isinstance(request, (ChatCompletionRequest, ResponsesRequest)):
+                # Relay the base64 token-id string verbatim (no int-list
+                # materialization on the orchestrator loop), else the int array.
+                if ctx_response.prompt_token_ids_b64 is not None:
+                    request.prompt_token_ids_b64 = ctx_response.prompt_token_ids_b64
+                else:
+                    request.prompt_token_ids = ctx_response.prompt_token_ids
+                # Opt-in: drop conversation history so the gen worker doesn't
+                # re-parse the full conversation JSON (dominates its GIL at high
+                # concurrency). It uses prompt_token_ids and only reads the last
+                # message; tools are preserved. Config-gated because it's unsafe
+                # for harmony/multimodal workers (model type is fixed per deploy).
+                if (
+                    self._strip_gen_message_history
+                    and isinstance(request, ChatCompletionRequest)
+                    and request.messages
+                    and len(request.messages) > 1
+                ):
+                    request.messages = request.messages[-1:]
+        else:
+            # no ctx response, it's either a generation-only request or a generation-first disagg request
+            request.disaggregated_params = DisaggregatedParams(
+                request_type="generation_only",
+                ctx_request_id=disagg_request_id,
+                disagg_request_id=disagg_request_id,
+                schedule_style=self._schedule_style,
+            )
+        if ctx_server_info and "server_info" in ctx_server_info:
+            disaggregated_params = ctx_server_info["server_info"].get("disaggregated_params", {})
+            if disaggregated_params:
+                # ctx_info_endpoint from get_disaggregated_params() is a list;
+                # the Pydantic model expects a single str.
+                ep = disaggregated_params.get("ctx_info_endpoint")
+                if isinstance(ep, list) and ep:
+                    disaggregated_params = {**disaggregated_params, "ctx_info_endpoint": ep[0]}
+                request.disaggregated_params = request.disaggregated_params.model_copy(
+                    update=disaggregated_params
+                )
+
+        request.disaggregated_params.disagg_request_id = disagg_request_id
+        return request
+
+    async def _check_conditional_disagg(self, request: UCompletionRequest, req_id: int) -> bool:
+        if self.conditional_disagg_config:
+            local_gen_router = (
+                self._gen_router._local
+                if isinstance(self._gen_router, CoordinatorDelegatingRouter)
+                else self._gen_router
+            )
+            if not isinstance(local_gen_router, KvCacheAwareRouter):
+                raise TypeError(
+                    "conditional disaggregation requires a KV-cache-aware generation router"
+                )
+            # Query kv cache status and select a best gen_server.
+            # The server is reserved for generation request
+            gen_server, info = await self._gen_router.get_next_server(request, req_id=req_id)
+            match_length = info["match_length"]
+            total_length = info["num_tokens"]
+            # V4.1 remote-tail deployments can safely prefill a short cold
+            # request entirely on generation. Preserve the existing cold-miss
+            # policy for every other deployment.
+            cold_miss_requires_context = (
+                match_length == 0 and not self._config.bounded_replay_on_generation
+            )
+            need_ctx_decision = (
+                cold_miss_requires_context
+                or total_length - match_length
+                > self.conditional_disagg_config.max_local_prefill_length
+            )
+            # Visibility hook for verifying bypass triggers in disagg deployments.
+            logger.debug(
+                f"[conditional_disagg] gen={gen_server} match={match_length} "
+                f"total={total_length} residual={total_length - match_length} "
+                f"max_local_prefill_length="
+                f"{self.conditional_disagg_config.max_local_prefill_length} "
+                f"→ need_ctx={need_ctx_decision}"
+            )
+            return gen_server, need_ctx_decision
+        return None, True
+
+    async def _check_gen_only_disagg(self, request: UCompletionRequest) -> bool:
+        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+            # Hard-code first token, ctx_request_id for testing
+            request.disaggregated_params = DisaggregatedParams(
+                request_type="generation_only",
+                first_gen_tokens=[7],
+                ctx_request_id=1,
+                encoded_opaque_state=None,
+                draft_tokens=None,
+            )
+            request.ignore_eos = True
+            return True
+        return False
+
+    async def is_ready(self) -> bool:
+        # Per-request readiness gate for the /v1/ handlers (the server's /health
+        # and /cluster_info hook the coordinator directly). Cluster topology
+        # (cluster_info) is the coordinator's concern, not the request service's.
+        return await self._coordinator.is_ready()
+
+    @property
+    def conditional_disagg_config(self) -> Optional[ConditionalDisaggConfig]:
+        return self._config.conditional_disagg_config
+
+    async def setup(self) -> None:
+        # Build the request-sending clients from the coordinator's routers and share
+        # them with the coordinator service so its readiness checks use the same pool.
+        self._ctx_client = self._client_factory(
+            self._ctx_router, ServerRole.CONTEXT, self._config.max_retries
+        )
+        self._gen_client = self._client_factory(
+            self._gen_router, ServerRole.GENERATION, self._config.max_retries
+        )
+        if hasattr(self._coordinator, "set_clients"):
+            self._coordinator.set_clients(self._ctx_client, self._gen_client)
+        await self._coordinator.start()
+
+    async def teardown(self) -> None:
+        await self._ctx_client.shutdown()
+        await self._gen_client.shutdown()
+        await self._coordinator.stop()
+
+    async def _verify_ctx_response(self, ctx_response: UCompletionResponse) -> None:
+        if ctx_response:
+            for idx, choice in enumerate(_ctx_handoff_slots(ctx_response)):
+                if choice.disaggregated_params is None:
+                    raise ValueError(
+                        f"Context server choice {idx} did not return disaggregated params."
+                        f" finish_reason={choice.finish_reason!r}"
+                    )
+                # A CTX request that finished early (e.g. EOS during prefill) never
+                # sets up the KV-cache handoff, so ctx_request_id/disagg_request_id
+                # stay None. Only enforce them when a GEN handoff is still pending --
+                # mirroring _need_gen, which skips the handoff for these responses.
+                remote_tail = choice.disaggregated_params.remote_tail_start is not None
+                if choice.finish_reason in _GEN_PENDING_FINISH_REASONS or remote_tail:
+                    if choice.disaggregated_params.ctx_request_id is None:
+                        raise ValueError(
+                            f"Invalid disaggregated params: ctx_request_id is None for choice {idx}."
+                            f" finish_reason={choice.finish_reason!r},"
+                            f" disagg_request_id={choice.disaggregated_params.disagg_request_id!r}"
+                        )
+                    if choice.disaggregated_params.disagg_request_id is None:
+                        raise ValueError(
+                            f"Invalid disaggregated params: disagg_request_id is None for choice {idx}."
+                            f" finish_reason={choice.finish_reason!r},"
+                            f" ctx_request_id={choice.disaggregated_params.ctx_request_id!r}"
+                        )
+            return ctx_response
+
+    async def _send_disagg_request_gen_first(
+        self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
+    ) -> UCompletionResponseOrGenerator:
+        if hooks:
+            hooks.on_req_begin(request)
+        # empty server means client decides which server to use
+        need_ctx = not (await self._check_gen_only_disagg(request))
+        ctx_server, gen_server = None, None
+        ctx_server_info = None
+        ctx_req, gen_req = None, None
+        # Single-issuer disagg id (see _send_disagg_request_ctx_first): fetch from
+        # the coordinator so fleet workers never mint colliding ids.
+        disagg_request_id = await self._coordinator.get_disagg_request_id()
+        if hooks:
+            hooks.on_disagg_request_id(disagg_request_id)
+        if need_ctx:
+            # arrival->here = pre-ctx wait in the orchestrator/fleet.
+            if hooks:
+                hooks.on_ctx_dispatch(request)
+            ctx_server, ctx_server_info = await self._ctx_router.get_next_server(
+                request, req_id=disagg_request_id
+            )
+            ctx_req = self._get_ctx_request(request, disagg_request_id)
+        gen_req = self._get_gen_request(
+            request,
+            ctx_response=None,
+            disagg_request_id=disagg_request_id,
+            ctx_server_info=ctx_server_info,
+        )
+        self._strip_gen_subagent_affinity(gen_req)
+        # No orig_elapsed_s before the context phase: GEN admission keeps it FCFS.
+
+        if not need_ctx:
+            return await self._gen_client.send_request(
+                gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
+            )
+
+        if request.stream:
+            # For streaming gen_first requests, the gen client returns a lazy
+            # async generator whose HTTP POST only fires when iterated. The ctx
+            # server blocks waiting for the gen server's rx session (gen_first
+            # protocol). Using asyncio.gather would deadlock: ctx waits for gen
+            # server, but gen POST is deferred until the generator is consumed,
+            # and the generator isn't consumed until gather returns.
+            #
+            # Fix: eagerly start consuming the gen generator in a background
+            # task so the HTTP POST fires, then pipe chunks through a queue.
+            gen_response = await self._gen_client.send_request(
+                gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
+            )
+
+            queue: asyncio.Queue = asyncio.Queue()
+            gen_error: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            error_observer = _SseErrorObserver(responses_api=isinstance(request, ResponsesRequest))
+
+            async def _consume_gen():
+                try:
+                    async for chunk in gen_response:
+                        await queue.put(chunk)
+                        if not gen_error.done() and error_observer.feed(chunk):
+                            gen_error.set_result(None)
+                finally:
+                    queue.put_nowait(None)  # sentinel; the task retains any error
+
+            consume_task: asyncio.Task = asyncio.create_task(_consume_gen())
+            ctx_task = asyncio.create_task(
+                self._ctx_client.send_request(
+                    ctx_req,
+                    server=ctx_server,
+                    hooks=hooks,
+                    req_id=disagg_request_id,
+                )
+            )
+            tasks = (ctx_task, consume_task)
+
+            async def _close_gen_response() -> None:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                try:
+                    # Drain without replacing the error that triggered cleanup.
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                finally:
+                    # Cancellation can occur before _consume_gen ever starts,
+                    # so waiting for its task does not necessarily close GEN.
+                    await gen_response.aclose()
+
+            try:
+                completed, _ = await asyncio.wait(
+                    (*tasks, gen_error), return_when=asyncio.FIRST_COMPLETED
+                )
+                if ctx_task in completed:
+                    ctx_task.result()
+                if consume_task in completed:
+                    consume_task.result()
+                if gen_error.done() and not ctx_task.done():
+                    # In-band failure closes CTX, but the original GEN error
+                    # stream still belongs to the caller, including its [DONE].
+                    ctx_task.cancel()
+                    await asyncio.gather(ctx_task, return_exceptions=True)
+                    if not ctx_task.cancelled():
+                        ctx_task.result()
+                else:
+                    # Normal GEN completion does not replace the CTX result.
+                    await ctx_task
+            except (Exception, asyncio.CancelledError):
+                await _close_gen_response()
+                raise
+            finally:
+                gen_error.cancel()
+
+            async def _yield_from_queue():
+                try:
+                    # Prime the cleanup scope before giving ownership to callers.
+                    yield None
+                    while True:
+                        item = await queue.get()
+                        if item is None:
+                            await consume_task
+                            break
+                        yield item
+                finally:
+                    await _close_gen_response()
+
+            response = _yield_from_queue()
+            await response.__anext__()
+            return response
+        else:
+            ctx_task = asyncio.create_task(
+                self._ctx_client.send_request(
+                    ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
+                )
+            )
+            gen_task = asyncio.create_task(
+                self._gen_client.send_request(
+                    gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
+                )
+            )
+            tasks = (ctx_task, gen_task)
+            try:
+                completed, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                if gen_task in completed and ctx_task not in completed:
+                    # Preserve prompt GEN failure reporting while CTX is still waiting.
+                    gen_task.result()
+                try:
+                    # Keep caller cancellation distinct from a CTX cleanup error.
+                    # The outer finally still cancels and drains pending work.
+                    await asyncio.shield(ctx_task)
+                except Exception as ctx_error:
+                    if (
+                        not gen_task.done()
+                        or gen_task.cancelled()
+                        or gen_task.exception() is not None
+                    ):
+                        raise
+                    gen_response = gen_task.result()
+                    if not isinstance(
+                        gen_response,
+                        (CompletionResponse, ChatCompletionResponse, ResponsesResponse),
+                    ):
+                        raise
+                    # Keep the completed response and its original finish reason;
+                    # HTTP outcome handling does not settle physical KV ownership.
+                    logger.warning(
+                        "CTX request %s failed after GEN returned a complete response: %s",
+                        disagg_request_id,
+                        ctx_error,
+                    )
+                    return gen_response
+                return await gen_task
+            finally:
+                # Closing the HTTP leg requests worker cancellation. It does not
+                # authorize reuse of KV memory still owned by a physical transfer.
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)

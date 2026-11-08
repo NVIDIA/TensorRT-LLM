@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+from dataclasses import replace
+from typing import Generic, Optional, Type
+
+from tensorrt_llm.logger import logger
+
+from .._experimental.modeling_v2._router_index import (ModelingV2Mode, NoTarget,
+                                                       resolved_mode)
+from ..model_config import ModelConfig
+from ..utils import model_extra_attrs
+from .modeling_utils import (DecoderModelForCausalLM, TConfig, TModel,
+                             get_registered_model_class,
+                             get_registered_vision_encoder)
+
+
+class AutoModelForCausalLM(Generic[TModel, TConfig]):
+
+    @staticmethod
+    def _resolve_class(config: ModelConfig) -> Optional[Type]:
+        """Internal: Resolve the model class for a config without instantiating."""
+        pretrained_config = config.pretrained_config
+        if not pretrained_config.architectures:
+            return None
+
+        model_arch = pretrained_config.architectures[0]
+
+        if config.mm_encoder_only:
+            vision_encoder_info = get_registered_vision_encoder(model_arch)
+            if vision_encoder_info is None:
+                return None
+            vision_encoder_cls, _ = vision_encoder_info
+            return vision_encoder_cls
+
+        # Hack to detect eagle3 checkpoints. TODO: should we provide
+        # our own checkpoints with the correct arch? It would let us
+        # avoid nasty stuff like this.
+        if hasattr(pretrained_config, "draft_vocab_size"):
+            model_arch = model_arch.replace("Eagle3",
+                                            "")  # Strip the appended EAGLE3
+            model_arch = "EAGLE3" + model_arch
+
+        # Set by the model loader when a modeling_v2 target claims this
+        # deployment; None leaves the default path unchanged.
+        #
+        # Precedence, since this runs last and would override the rewrite
+        # above: modeling_v2 wins. The decision was made on the *un-rewritten*
+        # architectures[0], so it is about the checkpoint rather than about
+        # what that rewrite made of it, and a target that claims a
+        # configuration carries that configuration's draft path itself. Not
+        # reachable today -- Eagle3 needs draft_vocab_size, and no draft
+        # checkpoint matches a target's shape fingerprint -- so this note is
+        # the contract, not a description of observed behaviour.
+        if config.modeling_v2_target is not None:
+            return config.modeling_v2_target
+
+        return get_registered_model_class(model_arch)
+
+    @staticmethod
+    def from_config(
+        config: ModelConfig[TConfig],
+    ) -> DecoderModelForCausalLM[TModel, TConfig]:
+        if config.mm_encoder_only:
+            model_arch = config.pretrained_config.architectures[0]
+            vision_encoder_info = get_registered_vision_encoder(model_arch)
+            if vision_encoder_info is None:
+                raise ValueError(
+                    f"Unknown architecture for AutoModelForMultimodalEncoder: {model_arch}"
+                )
+            vision_encoder_cls, vlm_base_model = vision_encoder_info
+            return vision_encoder_cls(config, vlm_base_model)
+        cls = AutoModelForCausalLM._resolve_class(config)
+        if cls is None:
+            raise ValueError(
+                f"Unknown architecture for AutoModelForCausalLM: {config.pretrained_config.architectures[0]}"
+            )
+        if issubclass(cls, DecoderModelForCausalLM):
+            config._frozen = False
+            config.skip_create_weights_in_init = True
+            config._frozen = True
+        extra_attrs = config.extra_attrs
+        # What the loader put there, before a target that then refuses could
+        # add to it.
+        loader_attrs = dict(extra_attrs)
+        with model_extra_attrs(extra_attrs):
+            try:
+                model = cls(config)
+            except NoTarget as why:
+                # A modeling_v2 target refuses, at construction, a runtime that
+                # routing does not see (set by engine arguments). Under auto
+                # that falls back to the built-in implementation,
+                # as a refusal in routing does; under require it is the error.
+                target = config.modeling_v2_target
+                if cls is not target or resolved_mode(
+                        target) is ModelingV2Mode.REQUIRE:
+                    raise
+                logger.info(
+                    f"modeling_v2: {target.__name__} refused this runtime ({why}); "
+                    "using the built-in implementation")
+                fallback = replace(config, modeling_v2_target=None)
+                # replace() starts init=False fields afresh; the built-in model
+                # reads the loader's settings (GEMM backends, allreduce sizes)
+                # from extra_attrs.
+                fallback.extra_attrs.update(loader_attrs)
+                return AutoModelForCausalLM.from_config(fallback)
+        model.extra_attrs = extra_attrs
+        return model

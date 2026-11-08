@@ -1,0 +1,2110 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+TensorRT LLM perf tests
+"""
+
+# Serve a lazy import of allowed_configs inside the function body of
+# import_allowed_perf_config() below.
+__extra_import_path__ = ["."]
+
+import json
+import os
+import re
+import shutil
+from typing import Dict, List, NamedTuple, Optional
+
+import pytest
+import yaml
+from defs.trt_test_alternative import (is_linux, is_windows, print_info,
+                                       print_warning)
+
+from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
+
+from ..conftest import get_device_count, llm_models_root, trt_environment
+from ._model_paths import HF_MODEL_PATH, LORA_MODEL_PATH, MODEL_PATH_DICT
+from .pytorch_model_config import PERF_CONFIG_PRESETS, get_model_yaml_config
+from .sampler_options_config import get_sampler_options_config
+from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
+                    PerfMetricType, PerfServeScriptTestCmds,
+                    generate_test_nodes)
+from .warmup_pass import (WarmupPass, build_warmup_pass_cmd, one_wave_requests,
+                          warmup_pass_enabled)
+
+if not hasattr(re, "Pattern"):
+    re.Pattern = type(re.compile(""))
+
+ALLOWED_CONFIGS_CACHE = None  # Cache to avoid modifying sys.path many times.
+MAP_BY_SOCKET = None
+
+TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
+
+# trtllm-bench throughput's --warmup default.
+TRTLLM_BENCH_DEFAULT_WARMUP = 2
+
+
+class NotEnoughSamplesError(ValueError):
+    """A real-text source holds fewer usable articles than a dataset file asks for."""
+
+
+# Models served with the Nemotron reasoning/tool parsers, a long max model len
+# and a longer server-start timeout. "nano-v3" and "nemotron-v3" are two
+# registered names for the same reasoning parser, so Lightning belongs here too.
+NEMOTRON_SUPER_MODELS = {
+    "nemotron_3_super_120b_nvfp4",
+    "nemotron_3_super_120b_nvfp4_mtp",
+    "nemotron_3_ultra_550b_nvfp4",
+    "nemotron_3_nano_omni_nvfp4",
+    "nemotron_3_nano_omni_nvfp4_image",
+    "nemotron_3.5_lightning_30b_nvfp4_mtp",
+    "nemotron_3.5_lightning_30b_bf16_mtp",
+}
+
+KIMI_K3_MODELS = {"kimi_k3"}
+DEEPSEEK_V41_MODELS = {
+    "deepseek_v41_flash_nvfp4",
+    "deepseek_v41_flash_nvfp4_dspark",
+}
+QWEN38_MTP_MODELS = {
+    "qwen3.8_max_fp4_mtp",
+    "qwen3.8_flash_next_fp8_mtp",
+    "qwen3.8_flash_next_fp4_mtp",
+}
+KIMI_K3_SERVER_ENV = {
+    "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING": "1",
+}
+
+TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
+    *DEEPSEEK_V41_MODELS,
+    *QWEN38_MTP_MODELS,
+    "kimi_k2.5_fp4",
+    "kimi_k3",
+    "minimax_m3_fp4",
+    "nemotron_3_super_120b_nvfp4",
+    "nemotron_3_super_120b_nvfp4_mtp",
+    "nemotron_3_ultra_550b_nvfp4",
+    "glm_5.3_fp8",
+    "glm_5.3_flash_fp8",
+    "minimax_m3_mxfp8",
+    "qwen3.6_35b_a3b_fp4",
+    "qwen3.6_35b_a3b_fp4_mtp",
+    "nemotron_3_nano_omni_nvfp4",
+    "nemotron_3_nano_omni_nvfp4_image",
+    "nemotron_3.5_lightning_30b_nvfp4_mtp",
+    "nemotron_3.5_lightning_30b_bf16_mtp",
+    "nemotron_nano_12b_v2",
+}
+
+# Models that use random_image dataset in serve mode benchmarks. Also used by
+# get_fixed_dataset_sequence_length() to exclude variable image-token counts.
+# Maps model name to (width, height, num_images) tuple.
+SERVE_IMAGE_MODELS = {
+    "nemotron_3_nano_omni_nvfp4_image": (1526, 1024, 1),
+}
+
+# Models that require openai-chat backend for benchmark_serving. Also used by
+# get_fixed_dataset_sequence_length() to exclude chat-template tokens.
+# (e.g., reasoning / multimodal models that use chat completions API).
+OPENAI_CHAT_BACKEND_MODELS = {
+    "nemotron_3_nano_omni_nvfp4",
+    "nemotron_3_nano_omni_nvfp4_image",
+}
+
+# Spec-dec models and their non-speculative controls use real text in serve tests.
+SPEC_DEC_REAL_DATASET_MODELS = {
+    **{
+        model: "cnn_dailymail"
+        for model in DEEPSEEK_V41_MODELS
+    },
+    "nemotron_3_super_120b_nvfp4_mtp": "cnn_dailymail",
+    "nemotron_3.5_lightning_30b_nvfp4_mtp": "cnn_dailymail",
+    "nemotron_3.5_lightning_30b_bf16_mtp": "cnn_dailymail",
+    "gpt_oss_120b_eagle3": "cnn_dailymail",
+    "qwen3.6_35b_a3b_fp4_mtp": "cnn_dailymail",
+}
+
+# All spec-decoding models (MTP, Eagle3, etc.). Used to skip --ignore-eos in
+# benchmark client commands and fixed sequence-length inference: forcing
+# generation past EOS produces unstable acceptance rates for spec-dec.
+SPEC_DEC_MODELS = {
+    "glm_5.3_flash_fp8_mtp",
+    "deepseek_v4_pro_base_fp8",
+    *QWEN38_MTP_MODELS,
+    "qwen3_4b_eagle3",
+    "qwen3_235b_a22b_fp4_eagle3",
+    "gpt_oss_120b_eagle3",
+    "gpt_oss_120b_eagle3_throughput",
+    "qwen3.6_35b_a3b_fp4_mtp",
+    *SPEC_DEC_REAL_DATASET_MODELS,
+}
+
+
+def get_model_dir(model_name: str):
+    # HF models use the repo id verbatim (downloaded at runtime, no LLM_MODELS_ROOT prefix).
+    if model_name in HF_MODEL_PATH.keys():
+        return HF_MODEL_PATH[model_name]
+    if model_name in MODEL_PATH_DICT.keys():
+        return os.path.join(llm_models_root(), MODEL_PATH_DICT[model_name])
+    return ""
+
+
+def get_dataset_path():
+    return os.path.join(llm_models_root(), "datasets",
+                        "ShareGPT_V3_unfiltered_cleaned_split.json")
+
+
+def cpu_socket_count_gt_1():
+    global MAP_BY_SOCKET
+    if MAP_BY_SOCKET is not None:
+        return MAP_BY_SOCKET
+    if is_linux():
+        with open('/proc/cpuinfo') as f:
+            cpuinfo = f.read()
+            physical_id_set = set()
+            for line in cpuinfo.splitlines():
+                if line.startswith('physical id'):
+                    _, id_ = line.split(':')
+                    physical_id_set.add(id_.strip())
+        MAP_BY_SOCKET = len(physical_id_set) > 1
+    else:
+        MAP_BY_SOCKET = False
+    return MAP_BY_SOCKET
+
+
+# A helper function to import allowed_configs.py.
+def import_allowed_perf_config():
+    if trt_environment:
+        from llm import allowed_configs
+    else:
+        global ALLOWED_CONFIGS_CACHE
+        if ALLOWED_CONFIGS_CACHE is None:
+            import allowed_configs
+            ALLOWED_CONFIGS_CACHE = allowed_configs
+        else:
+            allowed_configs = ALLOWED_CONFIGS_CACHE
+    return allowed_configs
+
+
+# Covers both the C++ KVCacheManager and the Python KV cache manager v2 log lines.
+KV_CACHE_SIZE_LOG_QUERY = re.compile(
+    r".*Allocated ([\d\.]+) GiB for max tokens in paged KV cache.*"
+    r"|.*KV cache manager v2 device quota set to ([\d\.]+)\s*GiB.*")
+
+# Regex commands used to parse the metric result for the metric type.
+PERF_METRIC_LOG_QUERIES = {
+    PerfMetricType.BUILD_TIME:
+    re.compile(r"Engine generation completed in ([\d\.]+) seconds"),
+    PerfMetricType.INFERENCE_TIME:
+    re.compile(r"\[BENCHMARK\].* (?:total_latency|latency)\(ms\) ([\d\.]+)"),
+    PerfMetricType.FIRST_TOKEN_TIME:
+    re.compile(r"\[BENCHMARK\].* avg_time_to_first_token\(ms\) ([\d\.]+)"),
+    PerfMetricType.SEQ_LATENCY:
+    re.compile(r"\[BENCHMARK\].* avg_sequence_latency\(ms\) ([\d\.]+)"),
+    PerfMetricType.SEQ_THROUGHPUT:
+    re.compile(r"\[BENCHMARK\].* seq_throughput\(seq\/sec\) ([\d\.]+)"),
+    PerfMetricType.TOTAL_OUTPUT_THROUGHPUT:
+    re.compile(
+        r"\[BENCHMARK\].* (?:token_throughput\(token\/sec\)|tokensPerSec|tokens_per_sec) ([\d\.]+)"
+    ),
+    PerfMetricType.INFERENCE_PEAK_GPU_MEMORY:
+    re.compile(r"\[BENCHMARK\].* gpu_peak_mem\(gb\) ([\d\.]+)"),
+    PerfMetricType.BUILD_PEAK_CPU_MEMORY:
+    re.compile(
+        r"Peak memory usage during Engine building and serialization: CPU: ([\d\.]+) .*"
+    ),
+    PerfMetricType.BUILD_PEAK_GPU_MEMORY:
+    re.compile(
+        r"Peak memory usage of TRT CPU/GPU memory allocators: CPU .*, GPU ([\d\.]+) .*"
+    ),
+    PerfMetricType.ENGINE_SIZE:
+    re.compile(r".*Total engine size per GPU is ([\d\.]+) MiB.*"),
+    PerfMetricType.CONTEXT_GPU_MEMORY:
+    re.compile(r".*Allocated ([\d\.]+) MiB for execution context memory.*"),
+    PerfMetricType.KV_CACHE_SIZE:
+    KV_CACHE_SIZE_LOG_QUERY,
+}
+
+BENCH_PERF_METRIC_LOG_QUERIES = {
+    PerfMetricType.BUILD_TIME:
+    re.compile(r"Engine generation completed in ([\d\.]+) seconds"),
+    PerfMetricType.INFERENCE_TIME:
+    re.compile(r"Total Latency \(ms\):\s+([\d\.]+)"),
+    PerfMetricType.TOTAL_OUTPUT_THROUGHPUT:
+    re.compile(r"Total Output Throughput \(tokens\/sec\):\s+([\d\.]+)"),
+    PerfMetricType.TOTAL_TOKEN_THROUGHPUT:
+    re.compile(r"Total Token Throughput \(tokens\/sec\):\s+([\d\.]+)"),
+    PerfMetricType.SEQ_THROUGHPUT:
+    re.compile(r"Request Throughput \(req\/sec\):\s+([\d\.]+)"),
+    PerfMetricType.FIRST_TOKEN_TIME:
+    re.compile(r"Average time-to-first-token \[TTFT\] \(ms\):\s+([\d\.]+)"),
+    PerfMetricType.OUTPUT_TOKEN_TIME:
+    re.compile(r"Average time-per-output-token \[TPOT\] \(ms\):\s+([\d\.]+)"),
+    PerfMetricType.KV_CACHE_SIZE:
+    KV_CACHE_SIZE_LOG_QUERY,
+    PerfMetricType.PER_USER_OUTPUT_THROUGHPUT:
+    re.compile(
+        r"Per User Output Throughput \[w\/ ctx\] \(tps\/user\):\s+([\d\.]+)"),
+    PerfMetricType.PER_GPU_OUTPUT_THROUGHPUT:
+    re.compile(r"Per GPU Output Throughput \(tps\/gpu\):\s+([\d\.]+)"),
+}
+
+AGGR_SERVER_PERF_METRIC_LOG_QUERIES = {
+    PerfMetricType.SEQ_THROUGHPUT:
+    re.compile(r"Request throughput \(req\/s\):\s+(-?[\d\.]+)"),
+    PerfMetricType.TOTAL_OUTPUT_THROUGHPUT:
+    re.compile(r"Output token throughput \(tok\/s\):\s+(-?[\d\.]+)"),
+    PerfMetricType.TOTAL_TOKEN_THROUGHPUT:
+    re.compile(r"Total Token throughput \(tok\/s\):\s+(-?[\d\.]+)"),
+    PerfMetricType.USER_THROUGHPUT:
+    re.compile(r"User throughput \(tok\/s\):\s+(-?[\d\.]+)"),
+    PerfMetricType.FIRST_TOKEN_TIME:
+    re.compile(r"Mean TTFT \(ms\):\s+(-?[\d\.]+)"),
+    PerfMetricType.MEDIAN_FIRST_TOKEN_TIME:
+    re.compile(r"Median TTFT \(ms\):\s+(-?[\d\.]+)"),
+    PerfMetricType.P99_FIRST_TOKEN_TIME:
+    re.compile(r"P99 TTFT \(ms\):\s+(-?[\d\.]+)"),
+    PerfMetricType.INTER_TOKEN_TIME:
+    re.compile(r"Mean ITL \(ms\):\s+(-?[\d\.]+)"),
+    PerfMetricType.MEDIAN_INTER_TOKEN_TIME:
+    re.compile(r"Median ITL \(ms\):\s+(-?[\d\.]+)"),
+    PerfMetricType.P99_INTER_TOKEN_TIME:
+    re.compile(r"P99 ITL \(ms\):\s+(-?[\d\.]+)"),
+    PerfMetricType.OUTPUT_TOKEN_TIME:
+    re.compile(r"Mean TPOT \(ms\):\s+(-?[\d\.]+)"),
+    PerfMetricType.MEDIAN_OUTPUT_TOKEN_TIME:
+    re.compile(r"Median TPOT \(ms\):\s+(-?[\d\.]+)"),
+    PerfMetricType.P99_OUTPUT_TOKEN_TIME:
+    re.compile(r"P99 TPOT \(ms\):\s+(-?[\d\.]+)"),
+    PerfMetricType.INFERENCE_TIME:
+    re.compile(r"Mean E2EL \(ms\):\s+(-?[\d\.]+)"),
+    PerfMetricType.MEDIAN_INFERENCE_TIME:
+    re.compile(r"Median E2EL \(ms\):\s+(-?[\d\.]+)"),
+    PerfMetricType.P99_INFERENCE_TIME:
+    re.compile(r"P99 E2EL \(ms\):\s+(-?[\d\.]+)"),
+    # Printed by the KV cache manager on server startup, same as trtllm-bench.
+    PerfMetricType.KV_CACHE_SIZE:
+    KV_CACHE_SIZE_LOG_QUERY,
+}
+
+# (Relative threshold, Absolute threshold) for all metric types
+PERF_METRIC_THRESHOLD = {
+    PerfMetricType.BUILD_TIME: (0.1, 30),  # Ignore build time regression < 30ms
+    PerfMetricType.INFERENCE_TIME:
+    (0.1, 50),  # Ignore inference time regression < 50ms
+    PerfMetricType.MEDIAN_INFERENCE_TIME:
+    (0.1, 50),  # Ignore median inference time regression < 50ms
+    PerfMetricType.P99_INFERENCE_TIME:
+    (0.1, 50),  # Ignore p99 inference time regression < 50ms
+    PerfMetricType.FIRST_TOKEN_TIME:
+    (0.1, 50),  # Ignore first token time regression < 50ms
+    PerfMetricType.MEDIAN_FIRST_TOKEN_TIME:
+    (0.1, 50),  # Ignore median first token time regression < 50ms
+    PerfMetricType.P99_FIRST_TOKEN_TIME:
+    (0.1, 50),  # Ignore p99 first token time regression < 50ms
+    PerfMetricType.OUTPUT_TOKEN_TIME:
+    (0.1, 50),  # Ignore per output token time regression < 50ms
+    PerfMetricType.MEDIAN_OUTPUT_TOKEN_TIME:
+    (0.1, 50),  # Ignore median output token time regression < 50ms
+    PerfMetricType.P99_OUTPUT_TOKEN_TIME:
+    (0.1, 50),  # Ignore p99 output token time regression < 50ms
+    PerfMetricType.INTER_TOKEN_TIME:
+    (0.1, 50),  # Ignore inter token time regression < 50ms
+    PerfMetricType.MEDIAN_INTER_TOKEN_TIME:
+    (0.1, 50),  # Ignore median inter token time regression < 50ms
+    PerfMetricType.P99_INTER_TOKEN_TIME:
+    (0.1, 50),  # Ignore p99 inter token time regression < 50ms
+    PerfMetricType.SEQ_LATENCY: (0.1, 50),  # Ignore latency regression < 50ms
+    PerfMetricType.TOTAL_OUTPUT_THROUGHPUT: (
+        -0.1, 10
+    ),  # Ignore throughput regression < 10 tokens/s. Negative rel threshold is to indicate that larger is better.
+    PerfMetricType.TOTAL_TOKEN_THROUGHPUT: (-0.1, 10),
+    PerfMetricType.USER_THROUGHPUT: (-0.1, 10),
+    PerfMetricType.PER_USER_OUTPUT_THROUGHPUT: (-0.1, 10),
+    PerfMetricType.PER_GPU_OUTPUT_THROUGHPUT: (-0.1, 10),
+    PerfMetricType.SEQ_THROUGHPUT: (
+        -0.1, 10
+    ),  # Ignore throughput regression < 10 tokens/s. Negative rel threshold is to indicate that larger is better.
+    PerfMetricType.INFERENCE_PEAK_GPU_MEMORY:
+    (0.1, 0.1),  # Ignore inference peak gpu memory regression < 0.1GiB
+    PerfMetricType.BUILD_PEAK_CPU_MEMORY:
+    (0.1, 100),  # Ignore build peak cpu memory regression < 100MiB
+    PerfMetricType.BUILD_PEAK_GPU_MEMORY:
+    (0.1, 100),  # Ignore build peak gpu memory regression < 100MiB
+    PerfMetricType.ENGINE_SIZE: (0.3,
+                                 100),  # Ignore engine size regression < 100MiB
+    PerfMetricType.CONTEXT_GPU_MEMORY:
+    (0.1, 50),  # Ignore context GPU memory < 50MiB
+    PerfMetricType.KV_CACHE_SIZE: (-0.1, 50),  # Ignore value < 50MiB
+}
+
+PERF_METRIC_STRING = {
+    PerfMetricType.BUILD_TIME: "build_time",
+    PerfMetricType.INFERENCE_TIME: "mean_e2el",
+    PerfMetricType.MEDIAN_INFERENCE_TIME: "median_e2el",
+    PerfMetricType.P99_INFERENCE_TIME: "p99_e2el",
+    PerfMetricType.FIRST_TOKEN_TIME: "mean_ttft",
+    PerfMetricType.MEDIAN_FIRST_TOKEN_TIME: "median_ttft",
+    PerfMetricType.P99_FIRST_TOKEN_TIME: "p99_ttft",
+    PerfMetricType.OUTPUT_TOKEN_TIME: "mean_tpot",
+    PerfMetricType.MEDIAN_OUTPUT_TOKEN_TIME: "median_tpot",
+    PerfMetricType.P99_OUTPUT_TOKEN_TIME: "p99_tpot",
+    PerfMetricType.INTER_TOKEN_TIME: "mean_itl",
+    PerfMetricType.MEDIAN_INTER_TOKEN_TIME: "median_itl",
+    PerfMetricType.P99_INTER_TOKEN_TIME: "p99_itl",
+    PerfMetricType.SEQ_LATENCY: "seq_latency",
+    PerfMetricType.TOTAL_OUTPUT_THROUGHPUT: "total_output_throughput",
+    PerfMetricType.TOTAL_TOKEN_THROUGHPUT: "total_token_throughput",
+    PerfMetricType.USER_THROUGHPUT: "user_throughput",
+    PerfMetricType.SEQ_THROUGHPUT: "seq_throughput",
+    PerfMetricType.INFERENCE_PEAK_GPU_MEMORY: "inference_peak_gpu_memory",
+    PerfMetricType.BUILD_PEAK_CPU_MEMORY: "build_peak_cpu_memory",
+    PerfMetricType.BUILD_PEAK_GPU_MEMORY: "build_peak_gpu_memory",
+    PerfMetricType.ENGINE_SIZE: "engine_size",
+    PerfMetricType.CONTEXT_GPU_MEMORY: "context_gpu_memory",
+    PerfMetricType.KV_CACHE_SIZE: "kv_cache_size",
+    PerfMetricType.PER_USER_OUTPUT_THROUGHPUT: "per_user_output_throughput",
+    PerfMetricType.PER_GPU_OUTPUT_THROUGHPUT: "per_gpu_output_throughput",
+}
+
+BUILDER_METRICS = [
+    PerfMetricType.BUILD_TIME, PerfMetricType.BUILD_PEAK_CPU_MEMORY,
+    PerfMetricType.BUILD_PEAK_GPU_MEMORY, PerfMetricType.ENGINE_SIZE
+]
+
+INFERENCE_METRICS = [
+    PerfMetricType.INFERENCE_TIME,
+    PerfMetricType.INFERENCE_PEAK_GPU_MEMORY,
+    PerfMetricType.CONTEXT_GPU_MEMORY,
+]
+
+AGGR_SERVER_METRICS = [
+    PerfMetricType.SEQ_THROUGHPUT,
+    PerfMetricType.TOTAL_OUTPUT_THROUGHPUT,
+    PerfMetricType.TOTAL_TOKEN_THROUGHPUT,
+    PerfMetricType.USER_THROUGHPUT,
+    PerfMetricType.FIRST_TOKEN_TIME,
+    PerfMetricType.MEDIAN_FIRST_TOKEN_TIME,
+    PerfMetricType.P99_FIRST_TOKEN_TIME,
+    PerfMetricType.OUTPUT_TOKEN_TIME,
+    PerfMetricType.MEDIAN_OUTPUT_TOKEN_TIME,
+    PerfMetricType.P99_OUTPUT_TOKEN_TIME,
+    PerfMetricType.INTER_TOKEN_TIME,
+    PerfMetricType.MEDIAN_INTER_TOKEN_TIME,
+    PerfMetricType.P99_INTER_TOKEN_TIME,
+    PerfMetricType.INFERENCE_TIME,
+    PerfMetricType.MEDIAN_INFERENCE_TIME,
+    PerfMetricType.P99_INFERENCE_TIME,
+]
+
+BENCH_INFERENCE_METRICS = [
+    PerfMetricType.INFERENCE_TIME,
+    PerfMetricType.TOTAL_OUTPUT_THROUGHPUT,
+    PerfMetricType.TOTAL_TOKEN_THROUGHPUT,
+    PerfMetricType.PER_GPU_OUTPUT_THROUGHPUT,
+    PerfMetricType.PER_USER_OUTPUT_THROUGHPUT,
+    PerfMetricType.SEQ_THROUGHPUT,
+    PerfMetricType.KV_CACHE_SIZE,
+]
+
+
+class PerfTestMetric(NamedTuple):
+    """
+    Configurations of a test metric.
+    """
+    # The original test name used to run the oraginal perf test.
+    original_test_name: str
+    # The name for this particular metric.
+    metric_name: str
+    # The type of this metric.
+    metric_type: PerfMetricType
+    # The regex used to parse this metric.
+    metric_regex: re.Pattern
+    # The relative threshold to allow for regressions.
+    metric_threshold: float
+    # The absolute threshold to allow for regressions.
+    metric_abs_threshold: float
+    # The index of the command of this metric.
+    # Currently, we run 1 build command plus N benchmark commands.
+    cmd_idx: int
+
+
+class PerfTestConfig:
+    """
+    Configurations defining the LLM perf test.
+    This should hold only the attributes that distinguish different tests.
+    """
+
+    def __init__(
+        self,
+        *,
+        model_name: str = "",
+        runtime: str = "python",
+        api: str = "",
+        streaming: str = "",
+        backend: str = "pytorch",
+        data_type: str = "float16",
+        max_batch_size: int = 512,
+        max_num_tokens: int = 2048,
+        gpu_weights_percent: float = -1,
+        batch_sizes: List[int] = [0],
+        input_lens: List[int] = [8],
+        output_lens: List[int] = [1],
+        num_beams: int = 1,
+        num_loras: int = 0,
+        num_reqs: int = 512,
+        concurrency: int = -1,
+        quantization: str = "",
+        kv_cache_free_gpu_mem_fraction: float = 0.9,
+        kv_cache_dtype: str = "auto",
+        ep_size: int = None,
+        tp_size: int = 1,
+        pp_size: int = 1,
+        num_gpus: int = 1,
+        moe_backend: str | None = None,
+        prefix_len: int = 0,
+        cfg_presets: str | None = None,
+    ):
+        # The model name.
+        self.model_name = model_name
+        # Python, bench, or serve runtime.
+        self.runtime = runtime
+        # API Type: only executor is allowed
+        self.api = api
+        # Backend type: pytorch
+        self.backend = backend
+        # Streaming responses
+        self.streaming = streaming
+        # Activation dtype.
+        self.data_type = data_type
+        # Percentage of weights that resides on GPU.
+        self.gpu_weights_percent = gpu_weights_percent
+        # Max Batch Size to build TRT engine with.
+        self.max_batch_size = max_batch_size
+        # Max number of tokens to build TRT engine with.
+        self.max_num_tokens = max_num_tokens
+        # List of batch sizes to run benchmark with.
+        self.batch_sizes = batch_sizes
+        # List of input lens to run benchmark with.
+        self.input_lens = input_lens
+        # List of output lens to run benchmark with.
+        self.output_lens = output_lens
+        # Number of beams.
+        self.num_beams = num_beams
+        # Number of loras.
+        self.num_loras = num_loras
+        # Number of requests.
+        self.num_reqs = num_reqs
+        # Number of concurrency
+        self.concurrency = concurrency
+        # Quantization type.
+        self.quantization = quantization
+        # KV cache free gpu mem fraction
+        self.kv_cache_free_gpu_mem_fraction = kv_cache_free_gpu_mem_fraction
+        # KV Cache dtype
+        self.kv_cache_dtype = kv_cache_dtype
+        # Multiple Profiles
+        self.multiple_profiles = False
+        # EP Size
+        self.ep_size = ep_size
+        # TP Size
+        self.tp_size = tp_size
+        # PP Size
+        self.pp_size = pp_size
+        # Number of GPUs.
+        self.num_gpus = num_gpus
+        self.moe_backend = moe_backend
+        # Shared random prefix length (serve only), added in front of every prompt.
+        self.prefix_len = prefix_len
+        # "+"-joined names from PERF_CONFIG_PRESETS in pytorch_model_config.py.
+        self.cfg_presets = cfg_presets
+
+    def to_string(self,
+                  custom_server_name: str = None,
+                  custom_client_name: str = None,
+                  custom_bs: int = None,
+                  custom_input_len: int = None,
+                  custom_output_len: int = None) -> str:
+
+        # First, add the model name.
+        entries = [self.model_name]
+
+        if self.runtime == "serve":
+            entries.append("serve")
+            if self.backend == 'pytorch':
+                entries.append("pytorch")
+            if self.streaming == "streaming":
+                entries.append("streaming")
+        elif self.runtime == "bench":
+            entries.append("bench")
+            if self.backend == 'pytorch':
+                entries.append("pytorch")
+            if self.streaming == "streaming":
+                entries.append("streaming")
+
+        # Add dtype.
+        entries.append(self.data_type)
+
+        if self.gpu_weights_percent != -1:
+            entries.append(f"gwp:{self.gpu_weights_percent}")
+
+        if self.multiple_profiles:
+            entries.append(f"mp")
+
+        # Add Max batch size.
+        entries.append(f"maxbs:{self.max_batch_size}")
+
+        # Add Max number of tokens.
+        entries.append(f"maxnt:{self.max_num_tokens}")
+
+        # Add kv cache free gpu mem fraction.
+        if self.kv_cache_free_gpu_mem_fraction != 0.9:
+            entries.append(f"kv_frac:{self.kv_cache_free_gpu_mem_fraction}")
+
+        if self.batch_sizes[0] > 0:
+            # Add batch size(s).
+            if custom_bs is None:
+                bs_label = "+".join([str(x) for x in self.batch_sizes])
+            else:
+                bs_label = str(custom_bs)
+            entries.append(f"bs:{bs_label}")
+
+        # Add input/output lens.
+        if len(self.output_lens) > 0:
+            if custom_input_len is None:
+                io_lens = []
+                for in_len, out_len in zip(self.input_lens, self.output_lens):
+                    io_lens.append(f"{in_len},{out_len}")
+                io_len_label = "+".join(io_lens)
+            else:
+                assert custom_output_len is not None, \
+                    "custom_output_len must be provided if custom_input_len is specified!"
+                io_len_label = f"{custom_input_len},{custom_output_len}"
+            entries.append(f"input_output_len:{io_len_label}")
+        else:
+            if custom_input_len is None:
+                len_label = "+".join([str(x) for x in self.input_lens])
+            else:
+                len_label = custom_input_len
+            entries.append(f"input_len:{len_label}")
+
+        # Add number of beams.
+        if self.num_beams > 1:
+            entries.append(f"beams:{self.num_beams}")
+
+        # Add number of loras.
+        if self.num_loras > 0:
+            entries.append(f"loras:{self.num_loras}")
+
+        # Add quantization type.
+        if self.quantization != "":
+            entries.append(f"quant:{self.quantization}")
+
+        # Add kv cache dtype.
+        if self.kv_cache_dtype != "auto":
+            entries.append(f"kv_cache_dtype:{self.kv_cache_dtype}")
+
+        # Add number of requests.
+        if self.num_reqs != 512:
+            entries.append(f"reqs:{self.num_reqs}")
+
+        #Add number of concurrency
+        if self.concurrency != -1:
+            entries.append(f"con:{self.concurrency}")
+
+        #Add EP Size.
+        if self.ep_size != None:
+            entries.append(f"ep:{self.ep_size}")
+
+        # Add TP Size.
+        if self.tp_size > 1 and self.tp_size != self.num_gpus:
+            entries.append(f"tp:{self.tp_size}")
+
+        # Add PP Size.
+        if self.pp_size > 1:
+            entries.append(f"pp:{self.pp_size}")
+
+        # Add number of GPUs.
+        if self.num_gpus > 1:
+            entries.append(f"gpus:{self.num_gpus}")
+
+        if self.moe_backend is not None:
+            entries.append(f"moe:{self.moe_backend}")
+
+        if self.prefix_len > 0:
+            entries.append(f"prefix:{self.prefix_len}")
+
+        if self.cfg_presets is not None:
+            entries.append(f"cfg:{self.cfg_presets}")
+
+        # Concatenate labels with "-".
+        return "-".join(entries)
+
+    def __str__(self) -> str:
+        return self.to_string()
+
+    def load_from_str(self, test_param_labels) -> None:
+        """
+        Populate the config properties given the test param string.
+        """
+
+        # Extract configs from test param labels.
+        labels = test_param_labels.split("-")
+
+        self.model_name = labels.pop(0)
+
+        assert labels[0] in ["serve", "bench"], \
+            f"Unsupported runtime '{labels[0]}'; only 'serve' and 'bench' are supported."
+        self.runtime = labels.pop(0)
+
+        self.api = labels.pop(0) if labels[0] == "exe" else ""
+        self.backend = labels.pop(0) if labels[0] == "pytorch" else "pytorch"
+        self.streaming = labels.pop(0) if labels[0] == "streaming" else ""
+        self.data_type = labels.pop(0)
+        if labels[0].startswith("gwp"):
+            self.gpu_weights_percent = float(labels.pop(0).replace("gwp:", ""))
+
+        if labels[0] == "mp":
+            self.multiple_profiles = True
+            labels.pop(0)
+
+        if labels[0].startswith("maxbs"):
+            self.max_batch_size = int(labels.pop(0).replace("maxbs:", ""))
+
+        if labels[0].startswith("maxnt"):
+            self.max_num_tokens = int(labels.pop(0).replace("maxnt:", ""))
+
+        if labels[0].startswith("kv_frac"):
+            self.kv_cache_free_gpu_mem_fraction = float(
+                labels.pop(0).replace("kv_frac:", ""))
+
+        if labels[0].startswith("bs:"):
+            self.batch_sizes = [
+                int(x) for x in labels.pop(0).replace("bs:", "").split("+")
+            ]
+        else:
+            self.batch_sizes = [0]
+
+        if labels[0].startswith("input_output_len"):
+            io_lens = labels.pop(0).replace("input_output_len:", "").split("+")
+            self.input_lens = [int(x.split(",")[0]) for x in io_lens]
+            self.output_lens = [int(x.split(",")[1]) for x in io_lens]
+        elif labels[0].startswith("input_len"):
+            self.input_lens = [
+                int(x)
+                for x in labels.pop(0).replace("input_len:", "").split("+")
+            ]
+            self.output_lens = []
+        else:
+            raise RuntimeError(
+                f"Unexpected test name label for seq lens: {labels[0]}!")
+
+        if len(labels) > 0:
+            self.num_beams = 1 if not labels[0].startswith("beams:") else int(
+                labels.pop(0).replace("beams:", ""))
+
+        if len(labels) > 0:
+            self.num_loras = 0 if not labels[0].startswith("loras:") else int(
+                labels.pop(0).replace("loras:", ""))
+
+        if len(labels) > 0:
+            self.quantization = "" if not labels[0].startswith(
+                "quant:") else labels.pop(0).replace("quant:", "")
+
+        if len(labels) > 0:
+            self.kv_cache_dtype = "auto" if not labels[0].startswith(
+                "kv_cache_dtype:") else labels.pop(0).replace(
+                    "kv_cache_dtype:", "")
+
+        if len(labels) > 0:
+            self.num_reqs = 512 if not labels[0].startswith("reqs:") else int(
+                labels.pop(0).replace("reqs:", ""))
+
+        if len(labels) > 0:
+            self.concurrency = -1 if not labels[0].startswith("con:") else int(
+                labels.pop(0).replace("con:", ""))
+
+        if len(labels) > 0:
+            self.ep_size = None if not labels[0].startswith("ep:") else int(
+                labels.pop(0).replace("ep:", ""))
+
+        if len(labels) > 0:
+            self.tp_size = 1 if not labels[0].startswith("tp:") else int(
+                labels.pop(0).replace("tp:", ""))
+
+        if len(labels) > 0:
+            self.pp_size = 1 if not labels[0].startswith("pp:") else int(
+                labels.pop(0).replace("pp:", ""))
+
+        if len(labels) > 0:
+            self.num_gpus = 1 if not labels[0].startswith("gpus:") else int(
+                labels.pop(0).replace("gpus:", ""))
+
+        self.moe_backend = None
+        if labels and labels[0].startswith("moe:"):
+            self.moe_backend = labels.pop(0).removeprefix("moe:")
+
+        self.prefix_len = 0
+        if labels and labels[0].startswith("prefix:"):
+            self.prefix_len = int(labels.pop(0).removeprefix("prefix:"))
+
+        self.cfg_presets = None
+        if labels and labels[0].startswith("cfg:"):
+            self.cfg_presets = labels.pop(0).removeprefix("cfg:")
+
+        assert len(
+            labels
+        ) == 0, f"Invalid test name! Some labels cannot be parsed: {labels}"
+
+        # Validate the parsed config.
+        self.validate()
+
+    def validate(self):
+        """
+        Validate if the config makes sense.
+        """
+        # Validate model name.
+        assert len(self.model_name) > 0, "model_name must not be empty!"
+        assert "-" not in self.model_name, "model_name must not contain '-' character!"
+        if self.model_name not in MODEL_PATH_DICT.keys(
+        ) and self.model_name not in HF_MODEL_PATH.keys():
+            allowed_configs = import_allowed_perf_config()
+            allowed_models = allowed_configs.get_allowed_models()
+            assert self.model_name in allowed_models, f"model_name {self.model_name} is not in allowed_models!"
+
+        VALID_RUNTIMES = ["serve", "bench"]
+        assert self.runtime in VALID_RUNTIMES, \
+            f"Unsupported runtime '{self.runtime}'; only 'serve' and 'bench' are supported."
+        assert self.backend == "pytorch", \
+            f"Unsupported backend '{self.backend}'."
+        if self.runtime == "serve":
+            assert self.backend == "pytorch", \
+                "The serve runtime supports only the pytorch backend."
+
+        if self.moe_backend is not None:
+            assert self.moe_backend, "moe backend must not be empty!"
+            assert self.backend == "pytorch", \
+                "moe backend overrides require the pytorch backend!"
+
+        # Validate dtype.
+        VALID_DTYPES = ["float32", "float16", "bfloat16", "float8", "float4"]
+        assert self.data_type in VALID_DTYPES, f"Invalid data_type {self.data_type}!"
+        VALID_KV_CACHE_DTYPES = ["auto", "fp8"]
+        assert self.kv_cache_dtype in VALID_KV_CACHE_DTYPES, f"Invalid kv_cache_dtype {self.kv_cache_dtype}!"
+
+        if self.prefix_len > 0:
+            assert self.runtime == "serve", \
+                "prefix (shared random prompt prefix) requires the serve runtime!"
+            assert self.model_name not in SPEC_DEC_REAL_DATASET_MODELS \
+                and self.model_name not in SERVE_IMAGE_MODELS, \
+                "prefix applies only to the random text dataset!"
+
+        if self.cfg_presets is not None:
+            unknown_presets = [
+                name for name in self.cfg_presets.split("+")
+                if name not in PERF_CONFIG_PRESETS
+            ]
+            assert not unknown_presets, (
+                f"Unknown cfg preset(s) {unknown_presets}; "
+                f"known presets: {sorted(PERF_CONFIG_PRESETS)}")
+
+        # Validate quantization mode.
+        if self.model_name in MODEL_PATH_DICT.keys():
+            VALID_QUANTS = [
+                "", "nvfp4", "fp8", "int8", "int4_awq", "w4a8_awq", "w4a16_awq",
+                "int4_wo", "full_prec"
+            ]
+        else:
+            VALID_QUANTS = [
+                "",
+                "fp8",
+                "fp8_gemm",
+                "fp8_kv_cache",
+                "int8_sq_per_tensor",
+                "int8_sq_per_token_channel",
+                "int8_weight_only",
+                "int4_weight_only",
+                "int4_weight_only_awq",
+                "int4_weight_only_gptq",
+            ]
+        assert self.quantization in VALID_QUANTS, f"Invalid quantization {self.quantization}!"
+        if self.backend == "pytorch":
+            assert self.quantization == "", f"Not support passing quantization {self.quantization} for pytorch backend!"
+        assert self.num_beams >= 1, f"Invalid num_beams: {self.num_beams}!"
+        assert self.num_loras >= 0, f"Invalid num_loras: {self.num_loras}!"
+        assert self.num_reqs >= 1, f"Invalid num_reqs: {self.num_reqs}!"
+        if self.pp_size > 1:
+            assert self.model_name in MODEL_PATH_DICT.keys(
+            ), f"Invalid model name for pp size {self.pp_size} test"
+        if self.num_gpus > 1 and self.tp_size == 1 and self.pp_size == 1:
+            self.tp_size = self.num_gpus
+
+        if self.tp_size > 1 or self.pp_size > 1 and self.num_gpus == 1:
+            self.num_gpus = self.tp_size * self.pp_size
+
+        assert self.num_gpus == self.tp_size * self.pp_size, f"Num of GPU shall be equal to TP*PP: {self.num_gpus}, {self.tp_size}, {self.pp_size}"
+        if self.gpu_weights_percent != -1:
+            assert 0 <= self.gpu_weights_percent <= 1, f"Invalid gpu_weights_percent: {self.gpu_weights_percent}!"
+        assert len(self.input_lens) > 0, f"Empty input_lens!"
+        if self.is_bert_like():
+            assert len(self.output_lens
+                       ) == 0, f"BERT-like models must not have output_lens!"
+        else:
+            assert len(
+                self.output_lens
+            ) > 0, f"GPT-like models and enc-dec models must have output_lens!"
+
+        # BERT with small BS is very unstable. Try to avoid it.
+        if self.is_bert_like():
+            if self.runtime == "bench":
+                self.batch_sizes[
+                    0] = self.max_batch_size if self.max_batch_size > 0 else 1
+                print(f"batch_sizes: {self.batch_sizes}")
+            assert all(
+                [b >= 32 for b in self.batch_sizes]
+            ), f"BERT with small BS is very unstable! Please increase to at least 32."
+
+        # Skip if not enough GPUs. TRTLLM_TOTAL_GPU_COUNT overrides
+        # auto-detection for multi-node setups.
+        total_gpus = int(os.environ["TRTLLM_TOTAL_GPU_COUNT"]
+                         ) if "TRTLLM_TOTAL_GPU_COUNT" in os.environ else None
+        if total_gpus is None:
+            try:
+                mpi_world_size = get_mpi_world_size()
+            except Exception:
+                mpi_world_size = 1
+            try:
+                device_count = get_device_count()
+            except Exception:
+                device_count = None
+
+            total_gpus = device_count if mpi_world_size == 1 else mpi_world_size
+
+        if total_gpus is not None and self.num_gpus > total_gpus:
+            pytest.skip(
+                f"Test requires {self.num_gpus} GPUs but only {total_gpus} available"
+            )
+
+    def get_model_family(self) -> str:
+        """
+        Get the model family of the current model.
+        """
+        allowed_configs = import_allowed_perf_config()
+        allowed_models = allowed_configs.get_allowed_models()
+        if self.model_name in allowed_models:
+            return allowed_configs.get_model_family(self.model_name)
+        else:
+            return ""
+
+    def is_mamba_family(self) -> bool:
+        """
+        Check if the current model family is Mamba.
+        """
+        return self.get_model_family() == 'mamba'
+
+    def is_moe_family(self) -> bool:
+        """
+        Check if the current model family is MoE.
+        """
+        allowed_configs = import_allowed_perf_config()
+        allowed_models = allowed_configs.get_allowed_models()
+        if self.model_name in allowed_models:
+            model_config = allowed_configs.get_model_config(self.model_name)
+            return model_config['moe_num_experts'] > 0 and model_config[
+                'moe_top_k'] > 0
+        else:
+            return False
+
+    def get_benchmark_type(self) -> str:
+        """
+        Get the benchmark type of the current model.
+        """
+        allowed_configs = import_allowed_perf_config()
+        allowed_models = allowed_configs.get_allowed_models()
+        if self.model_name in allowed_models:
+            return allowed_configs.get_benchmark_type(self.model_name)
+        else:
+            return ""
+
+    def is_bert_like(self) -> bool:
+        """
+        Check if the current benchmark is a BERT benchmark.
+        """
+        return self.get_benchmark_type() == "bert"
+
+    def is_enc_dec(self) -> bool:
+        """
+        Check if the current benchmark is a EncDec benchmark.
+        """
+        return self.get_benchmark_type() == "enc_dec"
+
+    def get_fixed_dataset_sequence_length(self) -> int | None:
+        """Return the common total length when every dataset shape is fixed."""
+        if not self.output_lens:
+            return None
+
+        if len(self.input_lens) != len(self.output_lens):
+            return None
+
+        # LoRA data is generated with nonzero input/output length deviations.
+        if self.num_loras > 0:
+            return None
+
+        # These serve requests may terminate at EOS, add chat-template tokens,
+        # or include image tokens, so their configured text lengths are not
+        # fixed runtime lengths.
+        if self.runtime == "serve" and (self.model_name in SPEC_DEC_MODELS
+                                        or self.model_name in SERVE_IMAGE_MODELS
+                                        or self.model_name
+                                        in OPENAI_CHAT_BACKEND_MODELS):
+            return None
+
+        sequence_lengths = {
+            self.prefix_len + input_len + output_len
+            for input_len, output_len in zip(
+                self.input_lens, self.output_lens, strict=True)
+        }
+        if len(sequence_lengths) != 1:
+            return None
+        return sequence_lengths.pop()
+
+
+class MultiMetricPerfTest(AbstractPerfScriptTestClass):
+    """
+    Base class for perf tests with multiple metrics.
+    """
+
+    def __init__(self, full_test_name: str):
+        # full_test_name is the full test name appearing in test output.
+        self._full_test_name = full_test_name
+        # test_domain_name is the part before "::".
+        self._test_domain_name = "::".join(full_test_name.split("::")[:-1])
+        # short_test_name is the part after "::".
+        self._short_test_name = full_test_name.split("::")[-1]
+        # short_test_name_body is the part before "[" in short_test_name.
+        self._short_test_name_body = self._short_test_name.split("[")[0]
+        # test_param_labels is the part inside "[...]".
+        self._test_param_labels = full_test_name.split("[")[-1][:-1]
+        # Load test config from test name.
+        self._config = PerfTestConfig()
+        self._config.load_from_str(self._test_param_labels)
+        # This will store the currently running metric.
+        self._current_metric = None
+        self.lora_dirs = []
+        # This will store each test's result
+        self._test_results = {}
+
+    def get_test_name(self) -> str:
+        return str(self._config)
+
+    def set_runtime_configs(self,
+                            llm_root,
+                            working_dir,
+                            output_dir,
+                            perf_cache_fpath,
+                            gpu_clock_lock=None) -> None:
+        if self._config.runtime == "serve":
+            benchmark_script = "trtllm-serve"
+        elif self._config.runtime == "bench":
+            benchmark_script = "trtllm-bench"
+        else:
+            raise RuntimeError(f"Invalid runtime {self._config.runtime}.")
+
+        self._benchmark_script = benchmark_script
+        self._working_dir = working_dir
+        self._output_dir = output_dir
+        self._perf_cache_fpath = perf_cache_fpath
+        self._llm_root = llm_root
+        self._gpu_clock_lock = gpu_clock_lock
+
+    def get_trtllm_bench_model(self):
+        return get_model_dir(self._config.model_name)
+
+    def _get_model_yaml_config(self) -> dict:
+        config = get_model_yaml_config(self._config.to_string(),
+                                       lora_dirs=self.lora_dirs)
+        if self._config.moe_backend is not None:
+            config.setdefault('moe_config',
+                              {})['backend'] = self._config.moe_backend
+        uses_pytorch_backend = (self._config.runtime == "serve"
+                                or self._config.backend == "pytorch")
+        fixed_sequence_length = self._config.get_fixed_dataset_sequence_length()
+        if not uses_pytorch_backend or fixed_sequence_length is None:
+            return config
+
+        kv_cache_config = config.get('kv_cache_config')
+        if kv_cache_config is not None and 'avg_seq_len' in kv_cache_config:
+            return config
+
+        configured_max_seq_len = config.get('max_seq_len')
+        if configured_max_seq_len is not None:
+            fixed_sequence_length = min(fixed_sequence_length,
+                                        int(configured_max_seq_len))
+
+        # Perf definitions are sometimes reused with an older wheel during
+        # release walkbacks and bisection. Do not pass a field that its strict
+        # KvCacheConfig schema does not recognize.
+        try:
+            from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+        except ImportError:
+            return config
+        kv_cache_fields = getattr(KvCacheConfig, 'model_fields', None)
+        if kv_cache_fields is None:
+            kv_cache_fields = getattr(KvCacheConfig, '__fields__', {})
+        if 'avg_seq_len' not in kv_cache_fields:
+            return config
+
+        if kv_cache_config is None:
+            kv_cache_config = {}
+            config['kv_cache_config'] = kv_cache_config
+        kv_cache_config.setdefault('avg_seq_len', fixed_sequence_length)
+        return config
+
+    def get_prepare_data_command(self, engine_dir, input_len,
+                                 output_len) -> list:
+        data_cmd = []
+
+        if self._config.model_name in MODEL_PATH_DICT.keys():
+            tokenizer_dir = os.path.join(
+                llm_models_root(), MODEL_PATH_DICT[self._config.model_name])
+        elif self._config.model_name in HF_MODEL_PATH.keys():
+            tokenizer_dir = HF_MODEL_PATH[self._config.model_name]
+        else:
+            tokenizer_dir = os.path.join(llm_models_root(), "Qwen3",
+                                         "Qwen3-0.6B")
+        if not os.path.exists(engine_dir):
+            os.makedirs(engine_dir, exist_ok=True)
+
+        if self._config.num_loras > 0:
+            istdev = 16
+            ostdev = 24
+            nloras = self._config.num_loras
+            dataset_path = os.path.join(engine_dir, "synthetic_data.json")
+
+            if self._config.model_name in LORA_MODEL_PATH.keys(
+            ) and self._config.backend == "pytorch" and self._config.runtime == "bench":
+                actual_lora_paths = LORA_MODEL_PATH[self._config.model_name]
+                if not isinstance(actual_lora_paths, list):
+                    actual_lora_paths = [actual_lora_paths]
+                for i, actual_lora_path in enumerate(actual_lora_paths):
+                    if not actual_lora_path.startswith("/"):
+                        actual_lora_paths[i] = os.path.join(
+                            llm_models_root(), actual_lora_path)
+                lora_dir = os.path.join(engine_dir, "loras")
+                data_cmd += [f"mkdir -p {lora_dir}", ";"]
+                if len(actual_lora_paths) < nloras:
+                    # Replicate paths cyclically to match the requested count
+                    actual_lora_paths = [
+                        actual_lora_paths[i % len(actual_lora_paths)]
+                        for i in range(nloras)
+                    ]
+                elif len(actual_lora_paths) > nloras:
+                    raise ValueError(
+                        f"Number of LoRA paths ({len(actual_lora_paths)}) exceeds requested number of LoRAs ({nloras})"
+                    )
+                for i, lora_path in enumerate(actual_lora_paths):
+                    self.lora_dirs.append(f"{lora_dir}/{i}")
+                    data_cmd += [f"ln -sf {lora_path} {lora_dir}/{i}", ";"]
+                data_cmd += [
+                    "trtllm-bench",
+                    f"--model={tokenizer_dir}",
+                    "prepare-dataset",
+                    "--output",
+                    f"{dataset_path}",
+                    f"--rand-task-id 0 {nloras-1}",
+                    f"--lora-dir={lora_dir}",
+                ]
+                if self._config.model_name in TRUST_REMOTE_CODE_MODELS:
+                    data_cmd += ["--trust-remote-code"]
+                data_cmd += [
+                    f"token-norm-dist",
+                    f"--num-requests={self._config.num_reqs}",
+                    f"--input-mean={input_len}", f"--output-mean={output_len}",
+                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
+                ]
+
+            else:
+                pytest.skip(
+                    f"LoRA config not supported for {self._config.model_name} with the current backend and runtime."
+                )
+        else:
+            istdev = 0
+            ostdev = 0
+            dataset_path = os.path.join(engine_dir, "synthetic_data.json")
+            if self._config.runtime == "bench":
+                data_cmd += [
+                    "trtllm-bench",
+                    f"--model={tokenizer_dir}",
+                    "prepare-dataset",
+                    "--output",
+                    f"{dataset_path}",
+                ]
+                if self._config.model_name in TRUST_REMOTE_CODE_MODELS:
+                    data_cmd += ["--trust-remote-code"]
+                data_cmd += [
+                    "token-norm-dist",
+                    f"--num-requests={self._config.num_reqs}",
+                    f"--input-mean={input_len}", f"--output-mean={output_len}",
+                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
+                ]
+            else:
+                raise RuntimeError(
+                    f"Unsupported runtime {self._config.runtime} for "
+                    "dataset preparation.")
+
+        return data_cmd
+
+    def _get_bench_warmup_requests(self) -> int:
+        """Return trtllm-bench's --warmup for this case, or 0 for its default.
+
+        trtllm-bench runs these requests in its own process before the measured
+        ones, at the same concurrency, and reports none of them. With the warmup
+        pass on, they are one wave of the measured traffic (see warmup_pass.py),
+        and never fewer than without it. They are drawn from the measured
+        dataset, though, so a case whose config reuses KV cache blocks keeps the
+        fewer requests it has without the pass: otherwise its measured requests
+        would hit the warmup's cached prefixes.
+        """
+        without_pass = 2 * self._config.num_gpus if self._config.num_gpus > 1 else 0
+        if not warmup_pass_enabled():
+            return without_pass
+        kv_cache_config = self._get_model_yaml_config().get(
+            'kv_cache_config') or {}
+        if kv_cache_config.get('enable_block_reuse'):
+            return without_pass
+        wave = one_wave_requests(self._config.concurrency,
+                                 self._config.num_reqs,
+                                 self._config.max_batch_size)
+        return max(without_pass or TRTLLM_BENCH_DEFAULT_WARMUP, wave)
+
+    def get_trtllm_bench_command(self, engine_dir):
+        model_dir = self.get_trtllm_bench_model()
+        model_name = self._config.model_name
+        dataset_path = os.path.join(engine_dir, "synthetic_data.json")
+        report_path = os.path.join(engine_dir, "report.json")
+        # Legacy "<name>_hf" label; weights load from --model_path.
+        if not model_name.endswith("_hf"):
+            model_name = model_name + "_hf"
+        tp_pp_str = f"tp_{self._config.tp_size}_pp_{self._config.pp_size}"
+        engine_dir = os.path.join(engine_dir, tp_pp_str)
+        benchmark_cmd = [
+            self._benchmark_script,
+            f"--model={model_name}",
+            f"--model_path={model_dir}",
+            "throughput",
+            f"--dataset={dataset_path}",
+            f"--max_batch_size={self._config.max_batch_size}",
+            f"--max_num_tokens={self._config.max_num_tokens}",
+            f"--report_json={report_path}",
+            f"--kv_cache_free_gpu_mem_fraction={self._config.kv_cache_free_gpu_mem_fraction}",
+        ]
+        benchmark_cmd += [f"--backend={self._config.backend}"]
+        if self._config.num_reqs > 0:
+            benchmark_cmd += [f"--num_requests={self._config.num_reqs}"]
+        if self._config.concurrency != -1:
+            benchmark_cmd += [f"--concurrency={self._config.concurrency}"]
+        if self._config.ep_size != None:
+            benchmark_cmd += [f"--ep={self._config.ep_size}"]
+        if self._config.tp_size > 1:
+            benchmark_cmd += [f"--tp={self._config.tp_size}"]
+        if self._config.pp_size > 1:
+            benchmark_cmd += [f"--pp={self._config.pp_size}"]
+        if self._config.streaming == "streaming":
+            benchmark_cmd += [f"--streaming"]
+        warmup_requests = self._get_bench_warmup_requests()
+        if warmup_requests:
+            benchmark_cmd += [f"--warmup={warmup_requests}"]
+
+        # Add extra-llm-api-config.yml for the PyTorch backend.
+        if self._config.backend == "pytorch":
+            pytorch_config_path = os.path.join(engine_dir,
+                                               "extra-llm-api-config.yml")
+            if not os.path.exists(pytorch_config_path):
+                os.makedirs(os.path.dirname(pytorch_config_path), exist_ok=True)
+            config = self._get_model_yaml_config()
+            if config:
+                print_info(f"PyTorch model config: {config}")
+                with open(pytorch_config_path, 'w') as f:
+                    yaml.dump(config, f, default_flow_style=False)
+                benchmark_cmd += [f"--config={pytorch_config_path}"]
+                # Throughput initializes the dataset tokenizer before loading YAML.
+                if config.get('custom_tokenizer') is not None:
+                    benchmark_cmd += [
+                        f"--custom_tokenizer={config['custom_tokenizer']}"
+                    ]
+                # If guided_decoding_backend is set, we need to initialize tokenizer
+                if config.get('guided_decoding_backend') is not None:
+                    benchmark_cmd += ["--no_skip_tokenizer_init"]
+        # for sampler options
+        sampler_options_path = os.path.join(engine_dir, "sampler_options.yml")
+        if not os.path.exists(sampler_options_path):
+            os.makedirs(os.path.dirname(sampler_options_path), exist_ok=True)
+        sampler_config = get_sampler_options_config(self._config.to_string())
+        if sampler_config:
+            print_info(f"sampler options config: {sampler_config}")
+            with open(sampler_options_path, 'w') as f:
+                yaml.dump(sampler_config, f, default_flow_style=False)
+            benchmark_cmd += [f"--sampler_options={sampler_options_path}"]
+        return benchmark_cmd
+
+    def get_trtllm_serve_server_command(self, engine_dir):
+        model_dir = self.get_trtllm_bench_model()
+        if model_dir == "":
+            pytest.skip("Model Name is not supported by trtllm-serve")
+        server_cmd = [
+            "trtllm-serve",
+            model_dir,
+            "--backend",
+            "pytorch",
+        ]
+
+        config = self._get_model_yaml_config()
+        serve_config = config or {}
+        serve_config.setdefault('max_batch_size', self._config.max_batch_size)
+        serve_config.setdefault('max_num_tokens', self._config.max_num_tokens)
+        kv_cache_cfg = serve_config.setdefault('kv_cache_config', {})
+        kv_cache_cfg.setdefault('free_gpu_memory_fraction',
+                                self._config.kv_cache_free_gpu_mem_fraction)
+        if self._config.tp_size > 1:
+            serve_config.setdefault('tensor_parallel_size',
+                                    self._config.tp_size)
+        if self._config.pp_size > 1:
+            serve_config.setdefault('pipeline_parallel_size',
+                                    self._config.pp_size)
+        if self._config.ep_size is not None:
+            serve_config.setdefault('moe_expert_parallel_size',
+                                    self._config.ep_size)
+        if self._config.model_name in TRUST_REMOTE_CODE_MODELS:
+            serve_config.setdefault('trust_remote_code', True)
+
+        config_path = os.path.join(engine_dir, "extra-llm-api-config.yml")
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        with open(config_path, 'w') as f:
+            yaml.dump(serve_config, f, default_flow_style=False)
+        server_cmd += ["--config", config_path]
+
+        if self._config.model_name in NEMOTRON_SUPER_MODELS:
+            server_cmd += [
+                "--reasoning_parser", "nano-v3", "--tool_parser", "qwen3_coder"
+            ]
+
+        return server_cmd
+
+    def generate_trtllm_custom_dataset(self,
+                                       dst_dataset_path: str,
+                                       input_len: int,
+                                       output_len: int,
+                                       dataset_source: str,
+                                       num_requests: Optional[int] = None,
+                                       skip_requests: int = 0):
+        """Write a real-text dataset of fixed-length prompts.
+
+        Args:
+            num_requests: Samples to write; the case's request count if None.
+            skip_requests: Leading usable articles to skip, so that another
+                file can hold prompts this one does not.
+        """
+        # Currently only support cnn_dailymail dataset source.
+        if dataset_source != "cnn_dailymail":
+            raise ValueError(
+                f"Unsupported real dataset source: {dataset_source}. "
+                "Only 'cnn_dailymail' is supported.")
+        from datasets import load_dataset
+        from transformers import AutoTokenizer
+
+        model_dir = self.get_trtllm_bench_model()
+        model_config = self._get_model_yaml_config()
+        custom_tokenizer = model_config.get('custom_tokenizer')
+        trust_remote_code = self._config.model_name in TRUST_REMOTE_CODE_MODELS
+        if custom_tokenizer:
+            from tensorrt_llm.tokenizer import load_custom_tokenizer
+            tokenizer = load_custom_tokenizer(
+                custom_tokenizer,
+                model_dir,
+                trust_remote_code=trust_remote_code)
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_dir, trust_remote_code=trust_remote_code)
+        dataset = load_dataset(os.path.join(llm_models_root(), "datasets",
+                                            "cnn_dailymail"),
+                               "3.0.0",
+                               split="validation",
+                               streaming=True,
+                               trust_remote_code=True)
+        if not os.path.exists(os.path.dirname(dst_dataset_path)):
+            os.makedirs(os.path.dirname(dst_dataset_path), exist_ok=True)
+
+        num_reqs = self._config.num_reqs if num_requests is None else num_requests
+        req_count = 0
+        num_skipped = 0
+        with open(dst_dataset_path, "w", encoding="utf-8") as f:
+            for req in dataset:
+                article = req.get("article")
+                if not article:
+                    continue
+
+                prompt = f"Summarize: {article}"
+                prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+                if input_len > 0:
+                    if not prompt_ids:
+                        continue
+                    if len(prompt_ids) < input_len:
+                        # Keep strict fixed-length requests for perf coverage
+                        # by extending short real-dataset prompts.
+                        repeats = (input_len + len(prompt_ids) -
+                                   1) // len(prompt_ids)
+                        prompt_ids = (prompt_ids * repeats)[:input_len]
+                    elif len(prompt_ids) > input_len:
+                        prompt_ids = prompt_ids[:input_len]
+                if num_skipped < skip_requests:
+                    num_skipped += 1
+                    continue
+                prompt_text = tokenizer.decode(prompt_ids,
+                                               skip_special_tokens=False)
+                if self._config.model_name in DEEPSEEK_V41_MODELS:
+                    prompt_text = tokenizer.apply_chat_template(
+                        [{
+                            "role": "user",
+                            "content": prompt_text
+                        }],
+                        tokenize=False,
+                        enable_thinking=False,
+                        add_generation_prompt=True,
+                    )
+                    prompt_ids = tokenizer.encode(prompt_text,
+                                                  add_special_tokens=False)
+                    max_seq_len = model_config['max_seq_len']
+                    if len(prompt_ids) + output_len > max_seq_len:
+                        raise ValueError(
+                            "Rendered V4.1 prompt and output cap exceed max_seq_len"
+                        )
+
+                sample = {
+                    "input": {
+                        "messages": [{
+                            "role": "system",
+                            "content": ""
+                        }, {
+                            "role": "user",
+                            "content": prompt_text
+                        }],
+                        "max_tokens":
+                        int(output_len),
+                        "num_tokens":
+                        len(prompt_ids),
+                    }
+                }
+                f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                req_count += 1
+                if req_count >= num_reqs:
+                    break
+
+        if req_count < num_reqs:
+            raise NotEnoughSamplesError(
+                f"Cannot sample enough requests from cnn_dailymail: requested={num_reqs}, sampled={req_count}"
+            )
+        print_info(f"Generated {req_count} samples from {dataset_source} to "
+                   f"{dst_dataset_path}")
+
+    def get_trtllm_serve_client_command(self,
+                                        engine_dir,
+                                        input_len,
+                                        output_len,
+                                        real_dataset_path: str = ""):
+        model_dir = self.get_trtllm_bench_model()
+        client_cmd = [
+            "python",
+            "-m",
+            "tensorrt_llm.serve.scripts.benchmark_serving",
+            "--model",
+            model_dir,
+            "--tokenizer",
+            model_dir,
+            "--num-prompts",
+            str(self._config.num_reqs),
+            "--tokenize-on-client",
+            "--no-test-input",
+            "--percentile-metrics",
+            "ttft,tpot,itl,e2el",
+        ]
+        custom_tokenizer = self._get_model_yaml_config().get('custom_tokenizer')
+        if custom_tokenizer:
+            client_cmd += ["--custom-tokenizer", custom_tokenizer]
+        if self._config.model_name in DEEPSEEK_V41_MODELS:
+            client_cmd += [
+                "--save-result",
+                "--save-detailed",
+                "--result-dir",
+                engine_dir,
+                "--result-filename",
+                f"result_{input_len}_{output_len}.json",
+            ]
+        # --ignore-eos must be off for spec-decoding models: forcing generation
+        # past EOS produces unstable acceptance rates.
+        if self._config.model_name not in SPEC_DEC_MODELS:
+            client_cmd.append("--ignore-eos")
+        if self._config.model_name in OPENAI_CHAT_BACKEND_MODELS:
+            client_cmd += ["--backend", "openai-chat"]
+        if real_dataset_path:
+            client_cmd += [
+                "--dataset-name",
+                "trtllm_custom",
+                "--dataset-path",
+                real_dataset_path,
+            ]
+        elif self._config.model_name in SERVE_IMAGE_MODELS:
+            width, height, num_images = SERVE_IMAGE_MODELS[
+                self._config.model_name]
+            client_cmd += [
+                "--dataset-name",
+                "random_image",
+                "--random-ids",
+                "--random-input-len",
+                str(input_len),
+                "--random-output-len",
+                str(output_len),
+                "--random-range-ratio",
+                "0.0",
+                "--random-image-width",
+                str(width),
+                "--random-image-height",
+                str(height),
+                "--random-num-images",
+                str(num_images),
+            ]
+        else:
+            client_cmd += [
+                "--dataset-name",
+                "random",
+                "--random-ids",
+                "--random-input-len",
+                str(input_len),
+                "--random-output-len",
+                str(output_len),
+                "--random-range-ratio",
+                "0.0",
+            ]
+            if self._config.prefix_len > 0:
+                client_cmd += [
+                    "--random-prefix-len",
+                    str(self._config.prefix_len)
+                ]
+        if self._config.concurrency != -1:
+            client_cmd += ["--max-concurrency", str(self._config.concurrency)]
+        if self._config.streaming == "streaming":
+            pass  # streaming is default
+        else:
+            client_cmd += ["--non-streaming"]
+        if self._config.model_name in TRUST_REMOTE_CODE_MODELS:
+            client_cmd += ["--trust-remote-code"]
+        return client_cmd
+
+    def _get_serve_warmup_pass(self, engine_dir: str, input_len: int,
+                               output_len: int,
+                               client_cmd: List[str]) -> Optional[WarmupPass]:
+        """Return the warmup pass before a serve client, or None; see warmup_pass.py.
+
+        A real-text client gets a prompt file of its own, with the articles
+        after the measured ones. The measured file holds exactly the measured
+        prompts, so another shuffle of it would resend them, and KV cache block
+        reuse would then serve their prefixes to the measured requests. If the
+        source has no articles to spare, the client gets no pass.
+        """
+        if not warmup_pass_enabled():
+            return None
+        num_requests = one_wave_requests(self._config.concurrency,
+                                         self._config.num_reqs,
+                                         self._config.max_batch_size)
+        if num_requests < 1:
+            return None
+        dataset_source = SPEC_DEC_REAL_DATASET_MODELS.get(
+            self._config.model_name)
+        if dataset_source is not None:
+            warmup_dataset_path = os.path.join(
+                engine_dir,
+                f"dataset_custom_{input_len}_{output_len}_warmup_pass.jsonl")
+            try:
+                self.generate_trtllm_custom_dataset(
+                    warmup_dataset_path,
+                    input_len,
+                    output_len,
+                    dataset_source=dataset_source,
+                    num_requests=num_requests,
+                    skip_requests=self._config.num_reqs)
+            except NotEnoughSamplesError as error:
+                print_warning(
+                    f"Warmup pass: none for this client, since {dataset_source} "
+                    f"has no {num_requests} articles to spare after the "
+                    f"{self._config.num_reqs} measured ones: {error}")
+                return None
+            client_cmd = self.get_trtllm_serve_client_command(
+                engine_dir,
+                input_len,
+                output_len,
+                real_dataset_path=warmup_dataset_path)
+        return WarmupPass(build_warmup_pass_cmd(client_cmd, num_requests),
+                          num_requests)
+
+    def get_commands(self):
+        """Build performance commands with per-case server log storage."""
+        num_gpus = self._config.num_gpus
+
+        if is_windows() and num_gpus > 1:
+            pytest.skip(
+                "multi-gpu not supported on Windows yet, skipped for now")
+
+        engine_dir = self._get_engine_dir()
+
+        if self._config.runtime == "serve":
+            server_cmd = self.get_trtllm_serve_server_command(engine_dir)
+            client_cmds = []
+            warmup_passes = []
+            data_cmds = []
+            for bs in self._config.batch_sizes:
+                for len_idx, input_len in enumerate(self._config.input_lens):
+                    output_len = self._config.output_lens[len_idx]
+                    real_dataset_path = ""
+                    if self._config.model_name in SPEC_DEC_REAL_DATASET_MODELS:
+                        dataset_source = SPEC_DEC_REAL_DATASET_MODELS[
+                            self._config.model_name]
+                        print_info(
+                            f"Using real dataset source '{dataset_source}' for "
+                            f"spec-dec model: {self._config.model_name}.")
+                        real_dataset_path = os.path.join(
+                            engine_dir,
+                            f"dataset_custom_{input_len}_{output_len}.jsonl")
+                        self.generate_trtllm_custom_dataset(
+                            real_dataset_path,
+                            input_len,
+                            output_len,
+                            dataset_source=dataset_source)
+                    client_cmd = self.get_trtllm_serve_client_command(
+                        engine_dir,
+                        input_len,
+                        output_len,
+                        real_dataset_path=real_dataset_path)
+                    client_cmds.append(client_cmd)
+                    warmup_passes.append(
+                        self._get_serve_warmup_pass(engine_dir, input_len,
+                                                    output_len, client_cmd))
+            server_env = os.environ.copy()
+            if self._config.model_name.startswith("qwen3.8_flash_next_"):
+                server_env["TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD"] = "1"
+            if self._config.model_name in NEMOTRON_SUPER_MODELS:
+                server_env["TLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+            if self._config.model_name in KIMI_K3_MODELS:
+                server_env.update(KIMI_K3_SERVER_ENV)
+            if self._config.model_name in DEEPSEEK_V41_MODELS:
+                # Compare real acceptance with the same bounded-replay policy.
+                server_env = {
+                    name: value
+                    for name, value in server_env.items()
+                    if not name.startswith("TRTLLM_V41_")
+                }
+                server_env.pop("TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS",
+                               None)
+                server_env["TRTLLM_V41_DECODER_BOUNDED_REPLAY"] = "1"
+            if self._config.model_name in QWEN38_MTP_MODELS:
+                server_timeout = 5400
+            elif self._config.model_name in NEMOTRON_SUPER_MODELS:
+                server_timeout = 3600
+            elif self._config.model_name in KIMI_K3_MODELS:
+                server_timeout = 5400
+            elif self._config.model_name in DEEPSEEK_V41_MODELS:
+                server_timeout = 3600
+            elif self._config.model_name == "deepseek_v4_pro_base_fp8":
+                # Allow time for model loading and executor warmup.
+                server_timeout = 1800
+            elif self._config.model_name == "minimax_m3_fp4":
+                # Cold MSA JIT compilation can exceed the default 10 minutes.
+                server_timeout = 1800
+            elif self._config.model_name == "glm_5.3_fp8":
+                # Allow time for checkpoint loading and cold executor warmup.
+                server_timeout = 1800
+            elif self._config.model_name == "muse_spark_open_nvfp4":
+                # Allow time for NVFP4 checkpoint loading and executor warmup.
+                server_timeout = 3600
+            elif self._config.model_name in {
+                    "glm_5.3_flash_fp8", "glm_5.3_flash_fp8_mtp"
+            }:
+                # Weight loading and executor warmup can exceed 10 minutes.
+                server_timeout = 3600
+            else:
+                server_timeout = 600
+            server_log_dir = None
+            if self._output_dir is not None:
+                server_log_dir = os.path.abspath(
+                    os.path.join(self._output_dir, "detailed_results",
+                                 os.path.basename(engine_dir)))
+            return PerfServeScriptTestCmds(server_cmd=server_cmd,
+                                           client_cmds=client_cmds,
+                                           data_cmds=data_cmds,
+                                           server_env=server_env,
+                                           server_timeout=server_timeout,
+                                           warmup_passes=warmup_passes,
+                                           server_log_dir=server_log_dir)
+
+        # PyTorch loads model checkpoints directly.
+        build_cmd = []
+        if self._config.runtime != "bench":
+            pytest.skip("only support trtllm-bench and serve runtime")
+
+        # Construct prepare synthetic data command
+        data_cmds = []
+
+        # Construct benchmark commands for each bs and seq len combination.
+        benchmark_cmds = []
+        for bs in self._config.batch_sizes:
+            for len_idx, input_len in enumerate(self._config.input_lens):
+                output_len = None if self._config.is_bert_like(
+                ) else self._config.output_lens[len_idx]
+                if self._config.runtime == "bench":
+                    benchmark_cmd = self.get_trtllm_bench_command(engine_dir)
+                else:
+                    pytest.skip("only support trtllm-bench and serve runtime")
+                benchmark_cmds.append(benchmark_cmd)
+                data_cmd = self.get_prepare_data_command(
+                    engine_dir, input_len, output_len)
+                data_cmds.append(data_cmd)
+
+        # Construct MPI command.
+        mpi_cmd = []
+        if num_gpus > 1 and num_gpus <= 8:
+            if self._config.runtime == "bench" and os.getenv(
+                    "TRTLLM_BENCH_USE_MPIRUN"):
+                mpi_cmd = ["mpirun", "-n", f"{num_gpus}"]
+                for var in ["CPATH", "TRITON_PTXAS_PATH", "TRTLLM_LOG_LEVEL"]:
+                    if os.getenv(var):
+                        mpi_cmd.extend(["-x", var])
+                mpi_cmd.append("trtllm-llmapi-launch")
+
+        return PerfBenchScriptTestCmds(data_cmds, build_cmd, benchmark_cmds,
+                                       mpi_cmd)
+
+    def get_perf_result(self, outputs: Dict[int, str]) -> float:
+        """
+        Get perf metric result from test output logs.
+        """
+        metric = self._current_metric
+        cmd_idx = metric.cmd_idx
+        metric_name = metric.metric_name
+        num_gpus = self._config.num_gpus
+
+        # Make sure we have outputs.
+        assert cmd_idx in outputs, f"Output log for command {cmd_idx} does not exist!"
+
+        # Use all applicable regex patterns to go through the log from the N-th command, where N = cmd_idx.
+        print_info(
+            f"Searching for metric {metric_name} from output log of command {cmd_idx} ..."
+        )
+
+        regex_matches = [
+            metric.metric_regex.search(line)
+            for line in outputs[cmd_idx].split("\n")
+        ]
+        metric_values = []
+        for match in regex_matches:
+            if match:
+                # Handle multiple capture groups - use the first non-None group
+                value = None
+                for i in range(1, len(match.groups()) + 1):
+                    if match.group(i) is not None:
+                        value = match.group(i)
+                        break
+                if value is not None:
+                    metric_values.append(float(value))
+
+        if len(metric_values) == 0:
+            if self._config.runtime == "bench" and self._config.num_gpus > 1 and metric.metric_type == PerfMetricType.BUILD_TIME:
+                print_info("skip building process for multi-gpu test"
+                           )  #https://nvbugspro.nvidia.com/bug/5210111
+                metric_values = [0.0]
+            else:
+                raise RuntimeError(
+                    f"Cannot find perf result for {metric_name} from perf script logs!"
+                )
+
+        if metric.metric_type in BUILDER_METRICS and metric.metric_type != PerfMetricType.ENGINE_SIZE:
+            # For enc-dec models, there are 2 builder perf metrics, we add them up.
+            if self._config.is_enc_dec():
+                assert len(
+                    metric_values
+                ) == 2 * num_gpus, f"Enc-Dec models must have num of metrics 2*{num_gpus} but got {len(metric_values)}!"
+
+                enc_metrics = metric_values[:num_gpus]
+                dec_metrics = metric_values[num_gpus:]
+                gather_function = sum
+                # Measure BUILD_PEAK_CPU_MEMORY, BUILD_PEAK_GPU_MEMORY by max function
+                if metric.metric_type in [
+                        PerfMetricType.BUILD_PEAK_CPU_MEMORY,
+                        PerfMetricType.BUILD_PEAK_GPU_MEMORY
+                ]:
+                    gather_function = max
+
+                metric_values = [
+                    gather_function([x, y])
+                    for x, y in zip(enc_metrics, dec_metrics)
+                ]
+                print_info(
+                    f"Combining up enc builder_perf {enc_metrics} and dec builder_perf {dec_metrics} to {metric_values}."
+                )
+            # For other models, builder metric should equal # gpus.
+            elif self._config.runtime != "bench":
+                assert len(
+                    metric_values
+                ) == num_gpus, f"num of metrics: {len(metric_values)} should match num_gpus: {num_gpus}"
+
+        # Use max perf metrics across GPUS
+        if len(metric_values) > 1:
+            metric_value = max(metric_values)
+            print_info(
+                f"Use max value {metric_value} out of {metric_values} for perf metric {metric_name}."
+            )
+        else:
+            metric_value = metric_values[0]
+            print_info(
+                f"Use value {metric_value} for perf metric {metric_name}.")
+
+        return metric_value
+
+    def get_threshold(self) -> float:
+        return self._current_metric.metric_threshold
+
+    def get_absolute_threshold(self) -> float:
+        return self._current_metric.metric_abs_threshold
+
+    def get_metric_type(self) -> PerfMetricType:
+        return self._current_metric.metric_type
+
+    def run_metrics(self, llm_venv, gpu_clock_lock, session_data_writer,
+                    output_dir):
+        """
+        Run through the commands and parse multiple perf metrics from the logs.
+        """
+        self._current_cmd_idx = 0
+        metrics = self._get_metrics()
+        commands = self.get_commands()
+        outputs = {}
+        result_states = {}
+        errors = []
+        copy_error = None
+
+        if self._config.runtime == 'bench':
+            print_info(f"Running command for generating dataset")
+            outputs = self.run_ex(commands=commands,
+                                  cmd_idx=self._current_cmd_idx,
+                                  full_test_name="prepare_dataset",
+                                  metric_type=None,
+                                  venv=llm_venv,
+                                  gpu_clock_lock=gpu_clock_lock,
+                                  session_data_writer=session_data_writer,
+                                  output_dir=output_dir,
+                                  outputs=outputs,
+                                  original_test_name="prepare_dataset")
+            result_state = self.get_result_state()
+            result_states[self._current_cmd_idx] = result_state
+            if result_state != "valid":
+                errors.append(self.get_error())
+
+        # Note: unlike 'bench', 'serve' has no separate setup step here. The
+        # server is started as part of processing the first metric below
+        # (KV_CACHE_SIZE, cmd_idx=0) so that its startup log is captured and
+        # can be parsed, instead of being discarded as a setup command.
+
+        try:
+            for metric in metrics:
+                assert metric.cmd_idx >= self._current_cmd_idx, "Command indices must be in ascending order!"
+                self._current_cmd_idx = metric.cmd_idx
+                self._current_metric = metric
+
+                if self._current_cmd_idx in result_states and result_states[
+                        self._current_cmd_idx] == "failed":
+                    print_warning(
+                        f"Skipped running command for {metric.metric_name} since the previous run failed."
+                    )
+                    continue
+
+                if 0 in result_states and result_states[0] == "failed":
+                    print_warning(
+                        f"Skipped running command for {metric.metric_name} since the server/build command failed."
+                    )
+                    continue
+
+                print_info(f"Running command for {metric.metric_name}")
+                outputs = self.run_ex(
+                    commands=commands,
+                    cmd_idx=self._current_cmd_idx,
+                    full_test_name=metric.metric_name,
+                    metric_type=metric.metric_type,
+                    venv=llm_venv,
+                    gpu_clock_lock=gpu_clock_lock,
+                    session_data_writer=session_data_writer,
+                    output_dir=output_dir,
+                    outputs=outputs,
+                    original_test_name=metric.original_test_name)
+
+                result_state = self.get_result_state()
+                result_states[self._current_cmd_idx] = result_state
+                if result_state != "valid":
+                    errors.append(self.get_error())
+                    if self._current_cmd_idx in self._test_results:
+                        del self._test_results[self._current_cmd_idx]
+
+        finally:
+            if isinstance(commands, PerfServeScriptTestCmds):
+                print_info("Stopping serve server")
+                commands.stop_server()
+            engine_dir = self._get_engine_dir()
+            if (self._config.model_name in DEEPSEEK_V41_MODELS
+                    and os.path.isdir(engine_dir)):
+                # Preserve raw results, prompts and config before workspace cleanup.
+                result_dir = os.path.join(output_dir, "detailed_results",
+                                          os.path.basename(engine_dir))
+                try:
+                    shutil.copytree(engine_dir, result_dir, dirs_exist_ok=True)
+                except OSError as error:
+                    copy_error = error
+                    print_warning(
+                        f"Failed to preserve detailed results in {result_dir}: {error}"
+                    )
+            if copy_error is None:
+                shutil.rmtree(engine_dir, ignore_errors=True)
+
+        if copy_error is not None:
+            errors.append(copy_error)
+
+        def add_myelin_time_pass_to(input_env):
+            time_pass_flag = r" -time_pass=on"
+            old_myelin_env = input_env.get("__LUNOWUD", "")
+            if time_pass_flag not in old_myelin_env:
+                input_env["__LUNOWUD"] = old_myelin_env + time_pass_flag
+            return old_myelin_env
+
+        old_llm_venv = add_myelin_time_pass_to(llm_venv._new_env)
+        llm_venv._new_env["__LUNOWUD"] = old_llm_venv
+
+        # Check if any commands failed.
+        if errors or not all(
+            [result_states[idx] == "valid" for idx in result_states]):
+            # If there is only one error, throw it directly.
+            if len(errors) == 1:
+                raise errors[0]
+
+            # Otherwise, combine all the error messages and re-raise a generic RuntimeError.
+            msg = "Multiple Errors happened:\n"
+            for error_idx, e in enumerate(errors):
+                msg += f"> Error {error_idx+1}/{len(errors)}: {type(e).__name__}: {e}\n"
+
+            raise RuntimeError(msg)
+
+    def _get_engine_dir(self) -> str:
+        """
+        Get the engine directory to store the engine.
+        """
+        escaped_label = self._test_param_labels.replace("+", "_").replace(
+            ":", "_").replace(",", "_")
+        return os.path.join(self._working_dir, "perf_engines", escaped_label)
+
+    def _get_metrics(self) -> List[PerfTestMetric]:
+        """
+        Generate all the metric configs for the current test.
+        """
+        metrics = []
+
+        if self._config.runtime == "serve":
+            cmd_idx = 0
+        elif self._config.runtime == "bench":
+            cmd_idx = 1
+        else:
+            cmd_idx = 0
+
+        if self._config.runtime == "serve":
+            # No engine build step, but the server start command (cmd_idx=0)
+            # still emits the KV cache size, so collect it like trtllm-bench does.
+            builder_metrics = [PerfMetricType.KV_CACHE_SIZE]
+            print_info(
+                f"Skip building process for {self._config.model_name} as serve handles model loading"
+            )
+        elif self._config.runtime == "bench":
+            if self._config.backend == "pytorch":
+                print_info(
+                    f"Skip building process for {self._config.model_name} as it is {self._config.backend} backend"
+                )
+                builder_metrics = []
+            else:
+                builder_metrics = [PerfMetricType.BUILD_TIME]
+        else:
+            builder_metrics = BUILDER_METRICS.copy()
+
+        # Add all builder_perf metrics
+        for metric_type in builder_metrics:
+            metrics.append(
+                PerfTestMetric(
+                    original_test_name=self._full_test_name,
+                    metric_name=self._get_metric_name(metric_type=metric_type),
+                    metric_type=metric_type,
+                    metric_regex=self._get_metric_regex(metric_type),
+                    metric_threshold=self._get_metric_threshold(metric_type),
+                    metric_abs_threshold=self._get_metric_abs_threshold(
+                        metric_type),
+                    cmd_idx=cmd_idx,
+                ))
+
+        # Then, construct inference latency and gpu mem usage metrics, for each
+        # bs and each seq len.
+        for bs in self._config.batch_sizes:
+            for len_idx, input_len in enumerate(self._config.input_lens):
+                cmd_idx += 1
+                output_len = None if self._config.is_bert_like(
+                ) else self._config.output_lens[len_idx]
+
+                # Get list of metrics depending on config.
+                if self._config.runtime == "serve":
+                    metric_types = AGGR_SERVER_METRICS.copy()
+                elif self._config.runtime == "bench":
+                    metric_types = BENCH_INFERENCE_METRICS.copy()
+                    if self._config.streaming == "streaming":
+                        metric_types.append(PerfMetricType.FIRST_TOKEN_TIME)
+                        metric_types.append(PerfMetricType.OUTPUT_TOKEN_TIME)
+                else:
+                    metric_types = INFERENCE_METRICS.copy()
+                for metric_type in metric_types:
+                    metrics.append(
+                        PerfTestMetric(
+                            original_test_name=self._full_test_name,
+                            metric_name=self._get_metric_name(
+                                metric_type=metric_type,
+                                bs=bs,
+                                input_len=input_len,
+                                output_len=output_len),
+                            metric_type=metric_type,
+                            metric_regex=self._get_metric_regex(metric_type),
+                            metric_threshold=self._get_metric_threshold(
+                                metric_type),
+                            metric_abs_threshold=self._get_metric_abs_threshold(
+                                metric_type),
+                            cmd_idx=cmd_idx,
+                        ))
+
+        return metrics
+
+    def _get_metric_name(self,
+                         metric_type: PerfMetricType,
+                         bs: int = None,
+                         input_len: int = None,
+                         output_len: int = None,
+                         server_name: str = None,
+                         client_name: str = None,
+                         disagg_config_name: str = None) -> str:
+        """
+        Construct the metric name for given metric_type, bs, input_len, and output_len.
+        """
+
+        if metric_type in BUILDER_METRICS:
+            # We build one engine for all benchmark runs, so add all bs and seq lens to the metric name.
+            metric_label = self._config.to_string()
+        elif self._config.runtime == "aggr_server":
+            metric_label = self._config.to_string(
+                custom_server_name=server_name,
+                custom_client_name=client_name,
+            )
+        elif self._config.runtime == "multi_node_disagg_server":
+            metric_label = self._config.to_string(
+                custom_server_name=disagg_config_name)
+        else:
+            # Otherwise, generate per-bs and per-seqlen label.
+            metric_label = self._config.to_string(
+                custom_bs=bs,
+                custom_input_len=input_len,
+                custom_output_len=output_len,
+            )
+        metric_name = f"test_perf_metric_{metric_type.lower()}"
+        return self._test_domain_name + "::" + metric_name + "[" + metric_label + "]"
+
+    def _get_metric_regex(self, metric_type: PerfMetricType) -> re.Pattern:
+        """
+        Get the regex used to parse the metric result for the metric type.
+        """
+
+        if self._config.runtime == "serve":
+            if metric_type not in AGGR_SERVER_PERF_METRIC_LOG_QUERIES:
+                raise ValueError(f"Unexpected metric_type: {metric_type}")
+            return AGGR_SERVER_PERF_METRIC_LOG_QUERIES[metric_type]
+        elif self._config.runtime == "bench":
+            if metric_type not in BENCH_PERF_METRIC_LOG_QUERIES:
+                raise ValueError(f"Unexpected metric_type: {metric_type}")
+            return BENCH_PERF_METRIC_LOG_QUERIES[metric_type]
+        elif self._config.runtime == "aggr_server":
+            if metric_type not in AGGR_SERVER_PERF_METRIC_LOG_QUERIES:
+                raise ValueError(f"Unexpected metric_type: {metric_type}")
+            return AGGR_SERVER_PERF_METRIC_LOG_QUERIES[metric_type]
+        elif self._config.runtime == "multi_node_disagg_server":
+            if metric_type not in AGGR_SERVER_PERF_METRIC_LOG_QUERIES:
+                raise ValueError(f"Unexpected metric_type: {metric_type}")
+            return AGGR_SERVER_PERF_METRIC_LOG_QUERIES[metric_type]
+        else:
+            pytest.skip("only support trtllm-bench and serve runtime")
+
+    def _get_metric_threshold(self, metric_type: PerfMetricType) -> float:
+        """
+        Get the threshold for the metric type.
+        """
+
+        if metric_type not in PERF_METRIC_THRESHOLD:
+            raise ValueError(f"Unexpected metric_type: {metric_type}")
+
+        return PERF_METRIC_THRESHOLD[metric_type][0]
+
+    def _get_metric_abs_threshold(self, metric_type: PerfMetricType) -> float:
+        """
+        Get the absolute threshold for the metric type.
+        """
+
+        if metric_type not in PERF_METRIC_THRESHOLD:
+            raise ValueError(f"Unexpected metric_type: {metric_type}")
+
+        return PERF_METRIC_THRESHOLD[metric_type][1]
+
+
+def run_perf_test(perf_case_name, trt_performance_cache_fpath,
+                  trt_gpu_clock_lock, llm_session_data_writer, output_dir,
+                  llm_venv, llm_root):
+    """
+    The actual test definition for TensorRT LLM perf test.
+    """
+    working_dir = llm_venv.get_working_directory()
+    test_runner = MultiMetricPerfTest(perf_case_name)
+    test_runner.set_runtime_configs(llm_root, working_dir, output_dir,
+                                    trt_performance_cache_fpath,
+                                    trt_gpu_clock_lock)
+    test_runner.run_metrics(llm_venv, trt_gpu_clock_lock,
+                            llm_session_data_writer, output_dir)
+
+
+def generate_perf_tests(session, config, items):
+    """
+    Generate all the perf tests based on test lists to speed up the test collection time.
+    """
+
+    print_info(f"Dynamically generating perf tests...")
+    valid_prefixes = [
+        "perf/test_perf.py::test_perf[",
+        # TRT pipeline adds "llm/" prefix, so include it so that TRT-LLM perf tests can run in TRT pipelines.
+        "llm/perf/test_perf.py::test_perf[",
+    ]
+    items = generate_test_nodes(session, config, items, valid_prefixes,
+                                run_perf_test)
+    print_info(f"Completed generating perf tests.")
+
+    return items

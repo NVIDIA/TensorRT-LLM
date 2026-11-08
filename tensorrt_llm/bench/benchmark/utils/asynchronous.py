@@ -1,0 +1,515 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from __future__ import annotations
+
+import asyncio
+import copy
+import time
+from contextlib import asynccontextmanager
+from itertools import chain
+from typing import Dict, List, Optional, Set, Tuple
+
+import tqdm
+from transformers import PreTrainedTokenizer
+from zmq import IMMEDIATE, LINGER, PUSH
+from zmq.asyncio import Context
+
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._utils import EnergyMonitor
+from tensorrt_llm.bench.dataclasses.general import InferenceRequest
+from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, StatsKeeper
+from tensorrt_llm.executor.postproc_worker import PostprocParams
+from tensorrt_llm.llmapi.llm import RequestOutput
+from tensorrt_llm.logger import logger
+
+_ITERATION_STATS_TIMEOUT_SEC = 2.0
+# Shutdown may finish one in-flight stats read and then perform a final read.
+# RPC-backed reads can spend the timeout in both fetch and iteration.
+_ITERATION_LOG_DRAIN_TIMEOUT_SEC = 2 * 2 * _ITERATION_STATS_TIMEOUT_SEC + 1.0
+_ITERATION_LOG_LINGER_MS = 1000
+
+
+class LlmManager:
+    """LLM Manager class for providing a high-level API for running benchmarks."""
+
+    def __init__(self,
+                 llm: LLM,
+                 outbox: asyncio.Queue[PerfItemTuple],
+                 streaming: bool,
+                 concurrency: int = -1,
+                 modality: Optional[str] = None,
+                 tokenizer: Optional[PreTrainedTokenizer] = None,
+                 duration: Optional[int] = None) -> None:
+        self.llm = llm
+        self.duration = duration
+        self.start_time: Optional[float] = None
+        self._inbox: asyncio.Queue[Tuple[InferenceRequest,
+                                         SamplingParams]] = asyncio.Queue()
+        self._outbox = outbox
+
+        self._stop = asyncio.Event()
+        self._running = asyncio.Event()
+        self._tasks: Set[asyncio.Task] = set()
+        self._task_errors: List[BaseException] = []
+        self._backend_task: Optional[asyncio.Task] = None
+        self._iteration_log_task: Optional[asyncio.Task] = None
+        self._concurrency_semaphore = asyncio.Semaphore(
+            concurrency) if concurrency > 0 else None
+        if duration is not None and self._concurrency_semaphore is None:
+            logger.warning(
+                "--duration requires a concurrency limit to take effect; "
+                "without one, all requests are submitted to the engine "
+                "immediately and the full dataset will run.")
+        self.streaming = streaming
+        self.request_seen = asyncio.Event()
+        self.modality = modality
+        self.tokenizer = tokenizer
+
+    def _duration_exceeded(self) -> bool:
+        """Return whether the duration limit has elapsed since the first request."""
+        return (self.duration is not None and self.start_time is not None
+                and time.perf_counter() - self.start_time >= self.duration)
+
+    async def process_request(self, request: InferenceRequest,
+                              sampling_params: SamplingParams,
+                              post_proc_params: PostprocParams):
+        if request.is_multi_turn and self.tokenizer is not None:
+            await self._process_multi_turn_request(request, sampling_params,
+                                                   post_proc_params)
+        else:
+            await self._process_single_request(request, sampling_params,
+                                               post_proc_params)
+
+    async def _process_single_request(self, request: InferenceRequest,
+                                      sampling_params: SamplingParams,
+                                      post_proc_params: PostprocParams):
+        """Process a single inference request."""
+        self.request_seen.set()
+        if self.start_time is None:
+            self.start_time = time.perf_counter()
+        sampling_params = copy.copy(sampling_params)
+        sampling_params.max_tokens = request.output_tokens
+
+        async with semaphore_guard(self._concurrency_semaphore):
+            # The worker dispatches the whole inbox eagerly, so the duration
+            # limit must be enforced here, after a concurrency slot is acquired.
+            if self._duration_exceeded():
+                return
+            request_start_timestamp = time.perf_counter_ns()
+            time_on_first_token = None
+            logger.debug(f"request.lora_request: {request.lora_request}")
+            output: RequestOutput = self.llm.generate_async(
+                request.input_ids if self.modality is None else request.prompt,
+                sampling_params=sampling_params,
+                _postproc_params=post_proc_params,
+                streaming=self.streaming,
+                lora_request=request.lora_request)
+            if self.streaming:
+                async for stream_output in output:
+                    if time_on_first_token is None:
+                        time_on_first_token = time.perf_counter_ns()
+                        response = stream_output
+            else:
+                response: RequestOutput = await output.aresult()
+
+        response_end_timestamp = time.perf_counter_ns()
+
+        tokens = list(chain(*(beam.token_ids for beam in response.outputs)))
+        request_perf_item = PerfItemTuple(
+            start_timestamp=request_start_timestamp,
+            end_timestamp=response_end_timestamp,
+            request_id=response.id,
+            num_input_tokens=len(output.prompt_token_ids),
+            response_is_final=response.finished,
+            error=False,
+            tokens=tokens,
+            decoding_iteration=response.decoding_iter,
+            time_on_first_token=time_on_first_token,
+        )
+
+        await self._outbox.put(request_perf_item)
+
+    async def _process_multi_turn_request(self, request: InferenceRequest,
+                                          sampling_params: SamplingParams,
+                                          post_proc_params: PostprocParams):
+        """Process a multi-turn request by iterating through turns sequentially.
+
+        Each turn builds on the previous conversation context: the model's
+        response from turn N is appended to the messages before encoding
+        turn N+1.  All turns within a single request share one concurrency
+        slot so that the conversation history stays consistent.
+        """
+        self.request_seen.set()
+        if self.start_time is None:
+            self.start_time = time.perf_counter()
+        sampling_params = copy.copy(sampling_params)
+        sampling_params.max_tokens = request.output_tokens
+        tokenizer = self.tokenizer
+        loop = asyncio.get_running_loop()
+
+        messages: List[dict] = []
+        total_input_tokens = 0
+        all_output_tokens: List[int] = []
+
+        async with semaphore_guard(self._concurrency_semaphore):
+            # Enforce the duration limit at execution time (see
+            # _process_single_request).
+            if self._duration_exceeded():
+                return
+            request_start_timestamp = time.perf_counter_ns()
+            time_on_first_token = None
+            last_response = None
+
+            truncated = False
+            for turn_id, question in enumerate(request.turns):
+                if turn_id > 0 and self._duration_exceeded():
+                    truncated = True
+                    break
+                messages.append({"role": "user", "content": question})
+
+                input_ids = await loop.run_in_executor(
+                    None, lambda: tokenizer.apply_chat_template(
+                        messages, add_generation_prompt=True, return_dict=False)
+                )
+
+                output: RequestOutput = self.llm.generate_async(
+                    input_ids,
+                    sampling_params=sampling_params,
+                    _postproc_params=post_proc_params,
+                    streaming=False)
+                response: RequestOutput = await output.aresult()
+
+                if turn_id == 0 and time_on_first_token is None:
+                    time_on_first_token = time.perf_counter_ns()
+
+                turn_tokens = list(
+                    chain(*(beam.token_ids for beam in response.outputs)))
+                all_output_tokens.extend(turn_tokens)
+                total_input_tokens += len(input_ids)
+
+                assistant_text = await loop.run_in_executor(
+                    None, lambda: tokenizer.decode(turn_tokens,
+                                                   skip_special_tokens=True))
+                messages.append({
+                    "role": "assistant",
+                    "content": assistant_text
+                })
+
+                last_response = response
+
+        if truncated:
+            # A conversation cut short by the deadline is not a completed
+            # request: recording it would mix partial and full conversations in
+            # the same statistics. Requests skipped before their first turn are
+            # dropped for the same reason.
+            return
+
+        response_end_timestamp = time.perf_counter_ns()
+
+        request_perf_item = PerfItemTuple(
+            start_timestamp=request_start_timestamp,
+            end_timestamp=response_end_timestamp,
+            request_id=last_response.id,
+            num_input_tokens=total_input_tokens,
+            response_is_final=last_response.finished,
+            error=False,
+            tokens=all_output_tokens,
+            decoding_iteration=last_response.decoding_iter,
+            time_on_first_token=time_on_first_token,
+        )
+
+        await self._outbox.put(request_perf_item)
+
+    def _raise_for_failed_tasks(self):
+        if not self._task_errors:
+            return
+
+        error_counts: Dict[str, int] = {}
+        for error in self._task_errors:
+            error_str = str(error)
+            error_counts[error_str] = error_counts.get(error_str, 0) + 1
+
+        task_errors_str = ", ".join(f"{error} ({count} requests)"
+                                    for error, count in error_counts.items())
+        raise ValueError(f"Requests failed: {task_errors_str}")
+
+    def _task_done_callback(self, task: asyncio.Task):
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self._task_errors.append(error)
+
+    async def worker(self) -> None:
+        """Worker task that pulls requests from inbox and processes them."""
+        # Only a duration-triggered exit lets in-flight requests finish; a stop
+        # signal or a failure cancels them, as the pre-duration code always did.
+        drain_in_flight = False
+        try:
+            while not self._stop.is_set():
+                self._raise_for_failed_tasks()
+
+                # Dispatch below never awaits, so this cannot fire until the
+                # inbox is fully dispatched; enforcement happens in the request
+                # coroutines (see _process_single_request). This exits the idle
+                # loop, and the drain keeps `busy` able to reach False.
+                if self._duration_exceeded():
+                    logger.info("Duration reached. Stopping pulling requests.")
+                    while not self._inbox.empty():
+                        try:
+                            self._inbox.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                    drain_in_flight = True
+                    break
+
+                try:
+                    request, sampling_params, post_proc_params = self._inbox.get_nowait(
+                    )
+                except asyncio.QueueEmpty:
+                    await asyncio.sleep(0)  # yield to concurrent tasks
+                    continue
+                task = asyncio.create_task(
+                    self.process_request(request,
+                                         sampling_params=sampling_params,
+                                         post_proc_params=post_proc_params))
+                task.add_done_callback(self._task_done_callback)
+                self._tasks.add(task)
+        except asyncio.CancelledError:
+            logger.info("Worker task cancelled.")
+        finally:
+            logger.debug("Worker task finishing...")
+            # Snapshot: the done callback removes tasks from the set as they
+            # finish, and asyncio.wait must not race with that.
+            pending = set(self._tasks)
+            if not drain_in_flight:
+                logger.debug("Worker task cancelling remaining requests...")
+                for task in pending:
+                    task.cancel()
+            elif pending:
+                logger.debug(
+                    "Duration reached. Waiting for in-flight requests to complete..."
+                )
+                # Draining preserves the statistics of requests still running at
+                # the deadline, but a failure ends the run regardless, so stop
+                # draining as soon as one occurs. Without this a slow or hung
+                # sibling would hold the error back until it finished.
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_EXCEPTION)
+                if any(not task.cancelled() and task.exception() is not None
+                       for task in done):
+                    logger.debug(
+                        "Request failed during drain. Cancelling the rest...")
+                    for task in pending:
+                        task.cancel()
+            logger.debug("Waiting for requests...")
+            if pending:
+                await asyncio.wait(pending)
+            self._raise_for_failed_tasks()
+
+    # This asynchronous function acts as a worker that logs iteration statistics.
+    # It connects to a given address using a PUSH socket and sends JSON-encoded
+    # statistics data until a stop signal is received.
+    async def iteration_worker(self, iteration_addr: str) -> None:
+        logger.info("Iteration log worker starting up...")
+        context = None
+        socket = None
+
+        try:
+            # Create a ZMQ context and socket for sending data
+            context = Context(io_threads=1)
+            socket = context.socket(PUSH)
+            socket.setsockopt(LINGER, _ITERATION_LOG_LINGER_MS)
+            # Do not queue records until the writer has finished binding. This
+            # prevents a fast producer from losing its tail during shutdown.
+            socket.setsockopt(IMMEDIATE, 1)
+            socket.connect(iteration_addr)
+
+            # Wait until a request is seen before proceeding
+            await self.request_seen.wait()
+            logger.debug(
+                f"Iteration log worker connected to '{iteration_addr}'.")
+
+            # Continuously send statistics data while the stop signal is not set
+            while not self._stop.is_set():
+                async for stats in self.llm.get_stats_async(
+                        _ITERATION_STATS_TIMEOUT_SEC):
+                    await socket.send_json(stats)
+                # NOTE: This is a WAR to force this loop to relinquish control
+                # that was preventing other async tasks from holding the event
+                # loop. If we don't
+                await asyncio.sleep(0)
+
+            # Wrap up by sending any remaining statistics data
+            logger.debug("Iteration log worker wrapping up...")
+            async for stats in self.llm.get_stats_async(
+                    _ITERATION_STATS_TIMEOUT_SEC):
+                await socket.send_json(stats)
+            await socket.send_json({"end": True})
+        except asyncio.CancelledError:
+            logger.debug("Iteration log worker cancelled.")
+            raise
+        finally:
+            if socket is not None:
+                socket.close()
+            if context is not None:
+                # Even finite linger can block; keep the event loop responsive.
+                await asyncio.to_thread(context.term)
+
+        logger.info("Iteration log worker exiting.")
+
+    async def stop(self) -> None:
+        logger.info("Stopping LLM backend.")
+        self._stop.set()
+        if self._iteration_log_task:
+            try:
+                await asyncio.wait_for(self._iteration_log_task,
+                                       timeout=_ITERATION_LOG_DRAIN_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                logger.warning("Iteration logging timed out; the iteration log "
+                               "may be incomplete.")
+        assert self._backend_task is not None
+        await self._backend_task
+        logger.info("LLM Backend stopped.")
+
+    @property
+    def busy(self) -> bool:
+        return not self._inbox.empty() or any(not task.done()
+                                              for task in self._tasks)
+
+    def run(self, iteration_addr: str = None) -> None:
+        self._backend_task = asyncio.create_task(self.worker())
+        if iteration_addr is not None:
+            self._iteration_log_task = asyncio.create_task(
+                self.iteration_worker(iteration_addr))
+
+    async def enqueue(self, request: InferenceRequest,
+                      sampling_params: SamplingParams,
+                      post_proc_params: PostprocParams) -> None:
+        await self._inbox.put((request, sampling_params, post_proc_params))
+
+
+@asynccontextmanager
+async def semaphore_guard(semaphore: Optional[asyncio.Semaphore] = None):
+    if semaphore is not None:
+        await semaphore.acquire()
+    try:
+        yield
+    finally:
+        if semaphore is not None:
+            semaphore.release()
+
+
+async def enqueue_messages(backend: LlmManager,
+                           requests: List[InferenceRequest],
+                           sampling_params: SamplingParams,
+                           post_proc_params: PostprocParams,
+                           submit_finished: asyncio.Event) -> None:
+    num_requests = 0
+    submit_start = time.perf_counter_ns()
+    for request in requests:
+        await backend.enqueue(request, sampling_params, post_proc_params)
+        num_requests += 1
+    submit_time = (time.perf_counter_ns() - submit_start) * 1.0e-9
+    logger.info(
+        "Request submission complete. "
+        f"[count={num_requests}, time={submit_time:.4f}s, rate={num_requests / submit_time:.2f} req/s]"
+    )
+    submit_finished.set()
+
+
+async def async_benchmark(
+    llm: LLM,
+    sampling_params: SamplingParams,
+    post_proc_params: PostprocParams,
+    requests: List[InferenceRequest],
+    streaming: bool,
+    concurrency: int = -1,
+    iteration_log_addr: str = None,
+    modality: Optional[str] = None,
+    tokenizer: Optional[PreTrainedTokenizer] = None,
+    duration: Optional[int] = None,
+) -> StatsKeeper:
+    """Run an asynchronous benchmark.
+
+    Args:
+        llm: The LLM instance to use.
+        sampling_params: Sampling parameters for generation.
+        post_proc_params: Post-processing parameters.
+        requests: List of inference requests.
+        streaming: Whether to use streaming mode.
+        concurrency: Maximum concurrency limit.
+        iteration_log_addr: Address for iteration logging.
+        modality: Modality of requests.
+        tokenizer: Tokenizer for multi-turn requests.
+        duration: Maximum run time in seconds.
+
+    Returns:
+        StatsKeeper containing benchmark statistics.
+    """
+    outbox = asyncio.Queue()
+    statistics = StatsKeeper()
+    submit_finished = asyncio.Event()
+
+    logger.info("Starting benchmarking async task.")
+    backend = LlmManager(llm,
+                         outbox,
+                         streaming,
+                         concurrency=concurrency,
+                         modality=modality,
+                         tokenizer=tokenizer,
+                         duration=duration)
+    enqueue_task: Optional[asyncio.Task] = None
+    try:
+        backend.run(iteration_addr=iteration_log_addr)
+
+        enqueue_task = asyncio.create_task(
+            enqueue_messages(backend, requests, sampling_params,
+                             post_proc_params, submit_finished))
+
+        logger.info("Starting benchmark...")
+        with EnergyMonitor(llm.args.parallel_config.world_size) as monitor:
+            pbar = tqdm.tqdm(total=len(requests), desc="Benchmarking")
+            finished_requests = 0
+
+            while not submit_finished.is_set(
+            ) or backend.busy or not outbox.empty():
+                try:
+                    item: PerfItemTuple = await asyncio.wait_for(outbox.get(),
+                                                                 timeout=1.0)
+                    statistics.register_request_perf_item(item)
+                    pbar.update(1)
+                    finished_requests += 1
+                except asyncio.TimeoutError:
+                    logger.debug("No items in queue. Continuing.")
+
+            if duration is None:
+                assert finished_requests == len(requests), "Benchmark failed"
+            elif finished_requests < len(requests):
+                logger.info(
+                    f"Duration limit reached. Processed {finished_requests}/{len(requests)} requests."
+                )
+
+        statistics.set_energy(monitor.total_energy)
+        logger.info("Benchmark complete.")
+
+        return statistics
+
+    finally:
+        if enqueue_task is not None and not enqueue_task.done():
+            enqueue_task.cancel()
+            await enqueue_task
+        await backend.stop()

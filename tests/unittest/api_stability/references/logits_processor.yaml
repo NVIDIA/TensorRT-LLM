@@ -1,0 +1,20 @@
+methods:
+  __call__:
+    parameters:
+      client_id:
+        annotation: Optional[int]
+        default: inspect._empty
+      logits:
+        annotation: torch.Tensor
+        default: inspect._empty
+      req_id:
+        annotation: int
+        default: inspect._empty
+      stream_ptr:
+        annotation: Optional[int]
+        default: inspect._empty
+      token_ids:
+        annotation: List[List[int]]
+        default: inspect._empty
+    return_annotation: None
+properties: {}

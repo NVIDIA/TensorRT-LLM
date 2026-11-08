@@ -1,0 +1,7 @@
+-c ../constraints.txt
+tensorrt_llm>=0.0.0.dev0
+datasets==3.1.0
+rouge_score
+sentencepiece~=0.1.99
+evaluate
+ordered-set

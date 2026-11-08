@@ -1,0 +1,337 @@
+{
+    "oneOf": [
+        {
+            "$ref": "#/definitions/events/trtllm_initial_report"
+        },
+        {
+            "$ref": "#/definitions/events/trtllm_heartbeat"
+        },
+        {
+            "$ref": "#/definitions/events/trtllm_exit_report"
+        }
+    ],
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "schemaMeta": {
+        "schemaVersion": "0.7",
+        "clientId": "616561816355034",
+        "clientName": "TrtllmTelemetry",
+        "definitionVersion": "2.0"
+    },
+    "description": "TensorRT-LLM usage telemetry events. Collects anonymous session-level deployment data (GPU type, parallelism config, model architecture class) with opt-out via TRTLLM_NO_USAGE_STATS=1. Auto-disabled in CI/test environments.",
+    "definitions": {
+        "types": {
+            "ShortString": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 128
+            },
+            "LongString": {
+                "type": "string",
+                "minLength": 0,
+                "maxLength": 256
+            },
+            "PositiveInt": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4294967295
+            }
+        },
+        "events": {
+            "trtllm_initial_report": {
+                "eventMeta": {
+                    "service": "telemetry",
+                    "gdpr": {
+                        "category": "functional",
+                        "description": "TRT-LLM initial session report with system and config details. No PII collected."
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "properties": {
+                    "trtllmVersion": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "platform": {
+                        "$ref": "#/definitions/types/LongString"
+                    },
+                    "pythonVersion": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "cpuArchitecture": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "cpuCount": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "gpuCount": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "gpuName": {
+                        "$ref": "#/definitions/types/LongString"
+                    },
+                    "gpuMemoryMB": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "cudaVersion": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "architectureClassName": {
+                        "$ref": "#/definitions/types/LongString"
+                    },
+                    "architectureClassHash": {
+                        "$ref": "#/definitions/types/LongString"
+                    },
+                    "backend": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "tensorParallelSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "pipelineParallelSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "contextParallelSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "moeExpertParallelSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "moeTensorParallelSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "dtype": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "quantizationAlgo": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "kvCacheDtype": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "ingressPoint": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "featuresJson": {
+                        "type": "string",
+                        "description": "Legacy JSON-serialized summary of feature flags (lora, speculative_decoding, prefix_caching, cuda_graphs, chunked_context, data_parallel_size)"
+                    },
+                    "llmApiConfigJson": {
+                        "type": "string",
+                        "description": "JSON-serialized sanitized, opt-in subset of effective LLM API configuration"
+                    },
+                    "llmApiConfigMetaJson": {
+                        "type": "string",
+                        "description": "JSON-serialized metadata for LLM API configuration capture, including digests, field counts, capture success, and unsafe-exclusion status"
+                    },
+                    "disaggRole": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "deploymentId": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "llmInitializationAttempts": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "llmInstancesCreated": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "activeLlmInstances": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "maxConcurrentLlmInstances": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "llmInitializationFailures": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    }
+                },
+                "required": [
+                    "trtllmVersion",
+                    "platform",
+                    "pythonVersion",
+                    "cpuArchitecture",
+                    "cpuCount",
+                    "gpuCount",
+                    "gpuName",
+                    "gpuMemoryMB",
+                    "cudaVersion",
+                    "architectureClassName",
+                    "architectureClassHash",
+                    "backend",
+                    "tensorParallelSize",
+                    "pipelineParallelSize",
+                    "contextParallelSize",
+                    "moeExpertParallelSize",
+                    "moeTensorParallelSize",
+                    "dtype",
+                    "quantizationAlgo",
+                    "kvCacheDtype",
+                    "ingressPoint",
+                    "featuresJson",
+                    "llmApiConfigJson",
+                    "llmApiConfigMetaJson",
+                    "disaggRole",
+                    "deploymentId",
+                    "llmInitializationAttempts",
+                    "llmInstancesCreated",
+                    "activeLlmInstances",
+                    "maxConcurrentLlmInstances",
+                    "llmInitializationFailures"
+                ]
+            },
+            "trtllm_heartbeat": {
+                "eventMeta": {
+                    "service": "telemetry",
+                    "gdpr": {
+                        "category": "functional",
+                        "description": "TRT-LLM periodic heartbeat with process correlation and aggregate LLM lifecycle counters."
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "properties": {
+                    "seq": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "ingressPoint": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "disaggRole": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "deploymentId": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "llmInitializationAttempts": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "llmInstancesCreated": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "activeLlmInstances": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "maxConcurrentLlmInstances": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "llmInitializationFailures": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    }
+                },
+                "required": [
+                    "seq",
+                    "ingressPoint",
+                    "disaggRole",
+                    "deploymentId",
+                    "llmInitializationAttempts",
+                    "llmInstancesCreated",
+                    "activeLlmInstances",
+                    "maxConcurrentLlmInstances",
+                    "llmInitializationFailures"
+                ]
+            },
+            "trtllm_exit_report": {
+                "eventMeta": {
+                    "service": "telemetry",
+                    "gdpr": {
+                        "category": "functional",
+                        "description": "TRT-LLM terminal session outcome. Contains only bounded categorical status data and no exception text or PII."
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "properties": {
+                    "exitCodeKnown": {
+                        "type": "boolean"
+                    },
+                    "exitCode": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "signalNumber": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "terminationKind": {
+                        "type": "string",
+                        "enum": [
+                            "clean",
+                            "exception",
+                            "signal",
+                            "worker_failure",
+                            "timeout",
+                            "unknown"
+                        ]
+                    },
+                    "lifecyclePhase": {
+                        "type": "string",
+                        "enum": [
+                            "cli_parsing",
+                            "config_validation",
+                            "model_initialization",
+                            "serving",
+                            "unknown"
+                        ]
+                    },
+                    "component": {
+                        "type": "string",
+                        "enum": [
+                            "llm",
+                            "server",
+                            "engine_worker",
+                            "disagg_worker",
+                            "unknown"
+                        ]
+                    },
+                    "reportingSource": {
+                        "type": "string",
+                        "enum": [
+                            "self",
+                            "supervisor",
+                            "executor_proxy"
+                        ]
+                    },
+                    "ingressPoint": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "disaggRole": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "deploymentId": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "llmInitializationAttempts": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "llmInstancesCreated": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "activeLlmInstances": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "maxConcurrentLlmInstances": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "llmInitializationFailures": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    }
+                },
+                "required": [
+                    "exitCodeKnown",
+                    "exitCode",
+                    "signalNumber",
+                    "terminationKind",
+                    "lifecyclePhase",
+                    "component",
+                    "reportingSource",
+                    "ingressPoint",
+                    "disaggRole",
+                    "deploymentId",
+                    "llmInitializationAttempts",
+                    "llmInstancesCreated",
+                    "activeLlmInstances",
+                    "maxConcurrentLlmInstances",
+                    "llmInitializationFailures"
+                ]
+            }
+        }
+    }
+}

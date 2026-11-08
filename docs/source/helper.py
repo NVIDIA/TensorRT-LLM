@@ -1,0 +1,553 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import importlib.util
+import inspect
+import logging
+import os
+import re
+from dataclasses import dataclass
+from itertools import chain, groupby
+from pathlib import Path
+from typing import TYPE_CHECKING, Optional
+
+import pygit2
+
+if TYPE_CHECKING:
+    from sphinx.application import Sphinx
+
+LLMAPI_REFERENCE_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _is_llmapi_search_entry(name: str, options: object) -> bool:
+    return (name.startswith("tensorrt_llm.llmapi.")
+            and getattr(options, "no_index", False) is True)
+
+
+def compact_llmapi_search_signature(
+        app: "Sphinx", what: str, name: str, obj: object, options: object,
+        signature: Optional[str], return_annotation: Optional[str]
+) -> tuple[Optional[str], Optional[str]]:
+    """Keep only parameter names in the searchable LLM API index."""
+    if not _is_llmapi_search_entry(name, options):
+        return signature, return_annotation
+
+    try:
+        object_signature = inspect.signature(obj)
+    except (TypeError, ValueError):
+        return signature, return_annotation
+
+    empty = inspect.Parameter.empty
+    parameters = [
+        parameter.replace(annotation=empty, default=empty)
+        for parameter in object_signature.parameters.values()
+    ]
+    return str(
+        object_signature.replace(parameters=parameters,
+                                 return_annotation=empty)), None
+
+
+def strip_llmapi_search_docstrings(app: "Sphinx", what: str, name: str,
+                                   obj: object, options: object,
+                                   lines: list[str]) -> None:
+    """Leave full docstrings on detail pages, not the searchable index."""
+    if _is_llmapi_search_entry(name, options):
+        lines.clear()
+
+
+def underline(title: str, character: str = "=") -> str:
+    return f"{title}\n{character * len(title)}"
+
+
+def generate_title(filename: str) -> str:
+    with open(filename) as f:
+        # fine the first line that contains '###'
+        for line in f:
+            if '###' in line:
+                title = line[3:].strip()
+                break
+        assert title is not None, f"No title found in {filename}"
+    return underline(title)
+
+
+@dataclass
+class DocMeta:
+    title: str
+    order: int
+    section: str
+    filename: Path
+
+
+def extract_meta_info(filename: str) -> Optional[DocMeta]:
+    """Extract metadata from file following the pattern ### :[a-zA-Z_]+[0-9]* <value>"""
+    metadata_pattern = re.compile(r'^### :([a-zA-Z_]+[0-9]*)\s+(.+)$')
+
+    with open(filename) as f:
+        metadata = DocMeta(title="",
+                           order=0,
+                           section="",
+                           filename=Path(filename))
+
+        for line in f:
+            line = line.strip()
+            match = metadata_pattern.match(line)
+            if match:
+                key = match.group(1).strip()
+                value = match.group(2).strip()
+                setattr(metadata, key, value)
+            elif not line.startswith('###'):
+                continue
+        if metadata.title == "":
+            return None
+        return metadata
+
+
+# NOTE: Update here to keep consistent with the examples
+LLMAPI_SECTIONS = ["Basics", "Customization", "Slurm"]
+
+
+def generate_examples():
+    root_dir = Path(__file__).parent.parent.parent.resolve()
+    ignore_list = {
+        '__init__.py',
+        'quickstart_example.py',
+        'quickstart_advanced.py',
+        'quickstart_multimodal.py',
+        # Older VisualGen example scripts without ### :title metadata; opt
+        # in by adding the metadata block and removing the entry below.
+        'visual_gen_flux.py',
+        'visual_gen_ltx2.py',
+        'visual_gen_wan_i2v.py',
+        'visual_gen_wan_t2v.py',
+        'visual_gen_mgmn_distributed.sh'
+    }
+    doc_dir = root_dir / "docs/source/examples"
+
+    def collect_script_paths(examples_subdir: str) -> list[Path]:
+        """Collect Python and shell script paths from an examples subdirectory."""
+        script_dir = root_dir / f"examples/{examples_subdir}"
+        script_paths = list(
+            chain(script_dir.glob("*.py"), script_dir.glob("*.sh")))
+        return [
+            path for path in sorted(script_paths)
+            if path.name not in ignore_list
+        ]
+
+    # Collect source paths for LLMAPI examples
+    llmapi_script_paths = collect_script_paths("llm-api")
+    llmapi_doc_paths = [
+        doc_dir / f"{path.stem}.rst" for path in llmapi_script_paths
+    ]
+    repo = pygit2.Repository('.')
+    commit_hash = str(repo.head.target)
+    llmapi_script_base_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/{commit_hash}/examples/llm-api"
+
+    # Collect source paths for trtllm-serve examples
+    serve_script_paths = collect_script_paths("serve")
+    serve_doc_paths = [
+        doc_dir / f"{path.stem}.rst" for path in serve_script_paths
+    ]
+    serve_script_base_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/{commit_hash}/examples/serve"
+
+    # Collect source paths for VisualGen examples
+    visual_gen_script_paths = collect_script_paths("visual_gen")
+    visual_gen_doc_paths = [
+        doc_dir / f"{path.stem}.rst" for path in visual_gen_script_paths
+    ]
+    visual_gen_script_base_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/{commit_hash}/examples/visual_gen"
+
+    def _get_lines_without_metadata(filename: str) -> str:
+        """Get line ranges that exclude metadata lines.
+        Returns a string like "5-10,15-20" for use in :lines: directive.
+        """
+        with open(filename) as f:
+            metadata_pattern = re.compile(r'^### :([a-zA-Z_]+[0-9]*)\s+(.+)$')
+            all_lines = f.readlines()
+
+        # Find line numbers that are NOT metadata (1-indexed)
+        content_lines = []
+        for line_num, line in enumerate(all_lines, 1):
+            line_stripped = line.strip()
+            # Include line if it's not empty and not metadata
+            if not metadata_pattern.match(line_stripped):
+                content_lines.append(line_num)
+
+        if not content_lines:
+            return ""  # No content lines found
+
+        # Group consecutive line numbers into ranges
+        ranges = []
+        start = content_lines[0]
+        end = start
+
+        for line_num in content_lines[1:]:
+            if line_num == end + 1:
+                # Consecutive line, extend current range
+                end = line_num
+            else:
+                # Gap found, close current range and start new one
+                if start == end:
+                    ranges.append(str(start))
+                else:
+                    ranges.append(f"{start}-{end}")
+                start = line_num
+                end = line_num
+
+        # Add the final range
+        if start == end:
+            ranges.append(str(start))
+        else:
+            ranges.append(f"{start}-{end}")
+
+        return ",".join(ranges)
+
+    # Generate the example docs for each example script
+    def write_scripts(base_url: str,
+                      example_script_paths: list[Path],
+                      doc_paths: list[Path],
+                      extra_content="") -> list[DocMeta]:
+        metas = []
+        for script_path, doc_path in zip(example_script_paths, doc_paths):
+            if script_path.name in ignore_list:
+                logging.warning(f"Ignoring file: {script_path.name}")
+                continue
+            script_url = f"{base_url}/{script_path.name}"
+            # Determine language based on file extension
+            language = "python" if script_path.suffix == ".py" else "bash"
+
+            # Make script_path relative to doc_path and call it include_path
+            include_path = '../../..' / script_path.relative_to(root_dir)
+
+            # Extract metadata from the script file
+            if meta := extract_meta_info(str(script_path)):
+                title = underline(meta.title)
+            else:
+                logging.warning(
+                    f"No metadata found for {script_path.name}, using filename as title"
+                )
+                title = script_path.stem.replace('_', ' ').title()
+                meta = DocMeta(title=title,
+                               order=0,
+                               section="",
+                               filename=script_path)
+                title = underline(title)
+            metas.append(meta)
+
+            # Get line ranges excluding metadata
+            lines_without_metadata = _get_lines_without_metadata(
+                str(script_path))
+
+            # Build literalinclude directive
+            literalinclude_lines = [f".. literalinclude:: {include_path}"]
+            if lines_without_metadata:
+                literalinclude_lines.append(
+                    f"    :lines: {lines_without_metadata}")
+            literalinclude_lines.extend(
+                [f"    :language: {language}", f"    :linenos:"])
+
+            content = (f"{title}\n"
+                       f"{extra_content}"
+                       f"Source {script_url}.\n\n"
+                       f"{chr(10).join(literalinclude_lines)}\n")
+            with open(doc_path, "w+") as f:
+                logging.warning(f"Writing {doc_path}")
+                f.write(content)
+
+        return metas
+
+    def write_index(metas: list[DocMeta], doc_template_path: Path,
+                    doc_path: Path, example_name: str,
+                    section_order: list[str]):
+        """Write the index file for the examples.
+
+        Args:
+            metas: The metadata for the examples.
+            doc_template_path: The path to the template file.
+            doc_path: The path to the output file.
+            example_name: The name of the examples.
+            section_order: The order of sections to display.
+
+        The template file is expected to have the following placeholders:
+        - %EXAMPLE_DOCS%: The documentation for the examples.
+        - %EXAMPLE_NAME%: The name of the examples.
+        """
+        with open(doc_template_path) as f:
+            template_content = f.read()
+
+        # Sort metadata by section order and example order
+        sort_key = lambda x: (section_order.index(x.section)
+                              if section_order and x.section in section_order
+                              else 0, int(x.order))
+        metas.sort(key=sort_key)
+
+        content = []
+        for section, group in groupby(metas, key=lambda x: x.section):
+            if section_order and section not in section_order:
+                raise ValueError(
+                    f"Section '{section}' not in section_order {section_order}")
+
+            group_list = list(group)
+            content.extend([
+                section, "_" * len(section), "", ".. toctree::",
+                "   :maxdepth: 2", ""
+            ])
+
+            for meta in group_list:
+                content.append(f"   {meta.filename.stem}")
+            content.append("")
+
+        example_docs = "\n".join(content)
+
+        # Replace placeholders and write to file
+        output_content = template_content.replace("%EXAMPLE_DOCS%",
+                                                  example_docs).replace(
+                                                      "%EXAMPLE_NAME%",
+                                                      example_name)
+        with open(doc_path, "w") as f:
+            f.write(output_content)
+
+    # Generate the toctree for LLMAPI example scripts
+    llmapi_metas = write_scripts(llmapi_script_base_url, llmapi_script_paths,
+                                 llmapi_doc_paths)
+    write_index(metas=llmapi_metas,
+                doc_template_path=doc_dir / "llm_examples_index.template.rst_",
+                doc_path=doc_dir / "llm_api_examples.rst",
+                example_name="LLM Examples",
+                section_order=LLMAPI_SECTIONS)
+
+    # Generate the toctree for trtllm-serve example scripts
+    serve_extra_content = (
+        "Refer to the `trtllm-serve documentation "
+        "<https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ "
+        "for starting a server.\n\n")
+    serve_metas = write_scripts(serve_script_base_url, serve_script_paths,
+                                serve_doc_paths, serve_extra_content)
+    write_index(metas=serve_metas,
+                doc_template_path=doc_dir / "llm_examples_index.template.rst_",
+                doc_path=doc_dir / "trtllm_serve_examples.rst",
+                example_name="Online Serving Examples",
+                section_order=[])
+
+    # Generate the toctree for VisualGen example scripts. No section_order
+    # while the example set is small; add one alongside ### :section
+    # metadata on the scripts once we have enough examples to group.
+    visual_gen_metas = write_scripts(visual_gen_script_base_url,
+                                     visual_gen_script_paths,
+                                     visual_gen_doc_paths)
+    write_index(metas=visual_gen_metas,
+                doc_template_path=doc_dir / "llm_examples_index.template.rst_",
+                doc_path=doc_dir / "visual_gen_examples.rst",
+                example_name="VisualGen Examples",
+                section_order=[])
+
+
+def extract_all_and_eval(file_path):
+    ''' Extract the __all__ variable from a Python file.
+    This is a trick to make the CI happy even the tensorrt_llm lib is not available.
+    NOTE: This requires the __all__ variable to be defined at the end of the file.
+    '''
+    with open(file_path, 'r') as file:
+        content = file.read()
+
+    lines = content.split('\n')
+    filtered_line_begin = 0
+
+    for i, line in enumerate(lines):
+        if line.startswith("__all__"):
+            filtered_line_begin = i
+            break
+
+    code_to_eval = '\n'.join(lines[filtered_line_begin:])
+
+    local_vars = {}
+    exec(code_to_eval, {}, local_vars)
+    return local_vars
+
+
+def get_pydantic_methods() -> list[str]:
+    from pydantic import BaseModel
+
+    class Dummy(BaseModel):
+        pass
+
+    methods = set(
+        [method for method in dir(Dummy) if not method.startswith('_')])
+    methods.discard("__init__")
+    # `Config` comes from our own StrictBaseModel rather than from Pydantic, so
+    # it is absent from `dir(Dummy)`, yet every model inherits it and Sphinx
+    # reports one duplicate object description per reference page.
+    methods.add("Config")
+    return list(methods)
+
+
+def is_pydantic_model(cls_name: str) -> bool:
+    """Whether a public llmapi symbol is a Pydantic model.
+
+    Used to decide whether the inherited Pydantic machinery should be kept out
+    of the generated reference page: it documents no TensorRT-LLM behaviour,
+    and some of its upstream docstrings are not valid reStructuredText.
+    """
+    try:
+        from pydantic import BaseModel
+
+        import tensorrt_llm.llmapi as llmapi
+        cls = getattr(llmapi, cls_name, None)
+        return isinstance(cls, type) and issubclass(cls, BaseModel)
+    except ImportError:
+        # A doc-only build without the wheel still renders, just without the
+        # Pydantic exclusions; any other failure is a real bug and must surface.
+        return False
+
+
+def generate_llmapi():
+    root_dir = Path(__file__).parent.parent.parent.resolve()
+
+    # Set up destination paths
+    doc_dir = root_dir / "docs/source/llm-api"
+    doc_dir.mkdir(exist_ok=True)
+    doc_path = doc_dir / "reference.rst"
+    reference_dir = doc_dir / "reference"
+    reference_dir.mkdir(exist_ok=True)
+
+    # This directory contains generated API pages only. Remove stale pages when
+    # public symbols are renamed or removed between builds.
+    for old_page in reference_dir.glob("*.rst"):
+        old_page.unlink()
+
+    llmapi_all_file = root_dir / "tensorrt_llm/llmapi/__init__.py"
+    public_classes_names = extract_all_and_eval(llmapi_all_file)['__all__']
+
+    content = underline("API Reference", "-") + "\n\n"
+    content += ".. note::\n"
+    content += "    Since version 1.0, we have attached a status label to `LLM`, `LlmArgs` and `TorchLlmArgs` Classes.\n\n"
+    content += "    1. :tag:`stable` - The item is stable and will keep consistent.\n"
+    content += '    2. :tag:`prototype` - The item is a prototype and is subject to change.\n'
+    content += '    3. :tag:`beta` - The item is in beta and approaching stability.\n'
+    content += '    4. :tag:`deprecated` - The item is deprecated and will be removed in a future release.\n'
+    content += "\n"
+    content += """.. raw:: html
+
+    <script>
+      (() => {
+        const prefix = "#tensorrt_llm.llmapi.";
+        if (!window.location.hash.startsWith(prefix)) {
+          return;
+        }
+
+        const symbol = window.location.hash.slice(prefix.length).split(".", 1)[0];
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(symbol)) {
+          return;
+        }
+
+        const target = new URL(
+          `reference/${symbol}.html${window.location.hash}`,
+          window.location.href,
+        );
+        window.location.replace(target);
+      })();
+    </script>
+
+"""
+    content += ".. toctree::\n"
+    content += "    :hidden:\n"
+    content += "    :maxdepth: 1\n\n"
+    search_content = ""
+
+    for cls_name in public_classes_names:
+        cls_name = cls_name.strip()
+        options = [
+            "    :members:",
+            "    :undoc-members:",
+            "    :show-inheritance:",
+            "    :special-members: __init__",
+            "    :member-order: groupwise",
+        ]
+
+        options.append("    :inherited-members:")
+        if is_pydantic_model(cls_name):
+            # exclude tons of methods from Pydantic
+            options.append(
+                f"    :exclude-members: {','.join(get_pydantic_methods())}")
+
+        page_content = underline(cls_name) + "\n\n"
+        page_content += f".. autoclass:: tensorrt_llm.llmapi.{cls_name}\n"
+        page_content += "\n".join(options) + "\n"
+        with open(reference_dir / f"{cls_name}.rst", "w+") as f:
+            f.write(page_content)
+
+        content += f"    reference/{cls_name}\n"
+
+        # Keep compact signatures on the landing page so browser find can
+        # search parameter names. Sphinx callbacks remove class docstrings and
+        # annotations and defaults here; detail pages retain the complete
+        # documentation.
+        search_content += f".. autoclass:: tensorrt_llm.llmapi.{cls_name}\n"
+        search_content += "    :no-index:\n\n"
+        search_content += (
+            f"    :doc:`View the full {cls_name} reference <reference/{cls_name}>`\n\n"
+        )
+
+    content += "\n" + (
+        "This page provides a searchable index of API names and parameters. "
+        "Open an entry's full reference for complete member and inheritance "
+        "documentation.\n\n")
+    content += search_content
+
+    with open(doc_path, "w+") as f:
+        f.write(content)
+
+
+def check_llmapi_reference_size(app: "Sphinx",
+                                exception: Optional[Exception]) -> None:
+    """Prevent the searchable LLM API landing page from growing too large."""
+    if exception is not None or app.builder.name != "html":
+        return
+
+    reference_path = Path(app.outdir) / "llm-api/reference.html"
+    if not reference_path.is_file():
+        return
+
+    reference_size = reference_path.stat().st_size
+    if reference_size > LLMAPI_REFERENCE_MAX_BYTES:
+        raise RuntimeError(
+            f"{reference_path} is {reference_size} bytes; the maximum is "
+            f"{LLMAPI_REFERENCE_MAX_BYTES} bytes")
+
+
+def update_version():
+    """Replace the placeholder container version in all docs source files."""
+    version_path = (Path(__file__).parent.parent.parent / "tensorrt_llm" /
+                    "version.py").resolve()
+    spec = importlib.util.spec_from_file_location("version_module",
+                                                  version_path)
+    version_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(version_module)
+    version = version_module.__version__
+
+    docs_source_dir = Path(__file__).parent.resolve()
+    md_files = list(docs_source_dir.rglob("*.md"))
+
+    # Default is to replace `release:x.y.z` placeholders; set to 0 to disable.
+    if os.environ.get("TRTLLM_DOCS_REPLACE_CONTAINER_TAG", "1") != "1":
+        return
+
+    for file_path in md_files:
+        with open(file_path, "r") as f:
+            content = f.read()
+        updated = content.replace(
+            "nvcr.io/nvidia/tensorrt-llm/release:x.y.z",
+            f"nvcr.io/nvidia/tensorrt-llm/release:{version}",
+        ).replace(
+            "nvcr.io/nvidia/tensorrt-llm/devel:x.y.z",
+            f"nvcr.io/nvidia/tensorrt-llm/devel:{version}",
+        )
+        if updated != content:
+            with open(file_path, "w") as f:
+                f.write(updated)
+
+
+if __name__ == "__main__":
+    import os
+    path = os.environ["TEKIT_ROOT"] + "/examples/llm-api/llm_inference.py"
+    #print(extract_meta_info(path))
+    generate_examples()

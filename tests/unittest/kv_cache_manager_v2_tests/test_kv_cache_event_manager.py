@@ -1,0 +1,2314 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import gc
+import os
+import pickle
+import sys
+import threading
+import time
+import uuid
+from importlib.util import find_spec
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
+from unittest.mock import Mock
+
+import msgspec
+import pytest
+import zmq
+
+from tensorrt_llm._torch.pyexecutor.kv_cache_events import (
+    KVEventBatch,
+    StreamingKVCacheEventManager,
+)
+from tensorrt_llm._utils import KVCacheEventSerializer
+from tensorrt_llm.llmapi.llm_args import KVEventsConfig
+from tensorrt_llm.runtime.kv_cache_hash import (
+    KV_CACHE_HASH_ALGO_V1,
+    KV_CACHE_HASH_ALGO_V2_SHA256_64,
+    hash_v1_block_key,
+    truncate_sha256_hash_to_int64,
+)
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    KVCacheCreatedData,
+    KVCacheEvent,
+    KVCacheEventDiff,
+    KVCacheEventManager,
+    KVCacheRemovedData,
+    KVCacheStoredBlockData,
+    KVCacheStoredData,
+    KVCacheUpdatedData,
+    UniqueToken,
+)
+from tensorrt_llm.serve.router_utils import BlockHashMixin
+
+if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
+    from kv_cache_manager_v2 import (
+        CacheLevel,
+        CudaStream,
+        KVCacheManager,
+        MmItemContext,
+        ReuseScope,
+        TokenId,
+        _introspection,
+        sequence_to_blockchain_keys,
+    )
+else:
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+        CacheLevel,
+        CudaStream,
+        KVCacheManager,
+        MmItemContext,
+        ReuseScope,
+        TokenId,
+        _introspection,
+        sequence_to_blockchain_keys,
+    )
+
+_TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+# cuda_test_utils supplies temporary_sys_path, so its own path entry is added and
+# removed by hand here; every later sibling import goes through that helper.
+_ADDED_TEST_DIR = _TEST_DIR not in sys.path
+if _ADDED_TEST_DIR:
+    sys.path.insert(0, _TEST_DIR)
+try:
+    from cuda_test_utils import CachedCudaStream, init_cuda_once, temporary_sys_path  # noqa: E402
+finally:
+    if _ADDED_TEST_DIR:
+        sys.path.remove(_TEST_DIR)
+
+try:
+    import torch
+except ImportError:
+    torch = None
+
+
+with temporary_sys_path(_TEST_DIR):
+    from test_kv_cache_manager_v2 import create_config
+
+
+def _create_test_manager(
+    event_manager,
+    *,
+    tokens_per_block=4,
+    gpu_quota=16 << 20,
+    host_quota=0,
+    window_size=None,
+    kv_buf_size=8192,
+):
+    return KVCacheManager(
+        create_config(
+            tokens_per_block=tokens_per_block,
+            gpu_quota=gpu_quota,
+            host_quota=host_quota,
+            disk_quota=0,
+            num_layers=2,
+            window_size=window_size,
+            sink_tokens=0,
+            kv_buf_size=kv_buf_size,
+        ),
+        event_manager=event_manager,
+    )
+
+
+@pytest.fixture
+def real_block_factory():
+    init_cuda_once()
+    gc.collect()
+    gc.disable()
+    managers = []
+    blocks = []
+
+    def create(event_manager, *, num_life_cycles=1, tokens_per_block=4):
+        manager = _create_test_manager(
+            event_manager,
+            tokens_per_block=tokens_per_block,
+            window_size=tokens_per_block if num_life_cycles == 2 else None,
+        )
+        managers.append(manager)
+
+        def make(tokens, coverage_per_lc, *, parent=None, reuse_scope=None):
+            block = _introspection.make_test_block(
+                manager, tokens, coverage_per_lc, parent, reuse_scope
+            )
+            blocks.append(block)
+            return block
+
+        return make
+
+    yield create
+
+    for block in blocks:
+        _introspection.close_test_block(block)
+    blocks.clear()
+    gc.collect()
+    for manager in reversed(managers):
+        manager.shutdown()
+    gc.enable()
+
+
+def _block_key(block):
+    return _introspection.test_block_key(block)
+
+
+def _blockchain_keys(tokens_per_block, tokens, reuse_scope=None):
+    """Block keys for a token sequence, without the reuse-scope root the chain starts from."""
+    keys = sequence_to_blockchain_keys(tokens_per_block, reuse_scope or ReuseScope(), tokens)
+    next(keys, None)
+    return [key for _, key in keys]
+
+
+def _add_stored_block(event_manager, block):
+    _introspection.event_manager_add_stored_block(event_manager, block)
+
+
+def _add_stored_life_cycle(event_manager, block, life_cycle_id):
+    _introspection.event_manager_add_stored_life_cycle(event_manager, block, life_cycle_id)
+
+
+def _add_streaming_stored_block(event_sink, block):
+    _introspection.streaming_event_sink_add_stored_block(event_sink, block)
+
+
+def _add_streaming_stored_life_cycle(event_sink, block, life_cycle_id):
+    _introspection.streaming_event_sink_add_stored_life_cycle(event_sink, block, life_cycle_id)
+
+
+def _add_streaming_removed_block(event_sink, block):
+    _introspection.streaming_event_sink_add_removed_block(event_sink, block)
+
+
+def _add_streaming_removed_life_cycle(event_sink, block, life_cycle_id):
+    _introspection.streaming_event_sink_add_removed_life_cycle(event_sink, block, life_cycle_id)
+
+
+def _token_ids(start, end):
+    return [TokenId(token_id) for token_id in range(start, end)]
+
+
+def _flush_serialized_events(event_manager):
+    event_manager.flush_iteration_events()
+    return KVCacheEventSerializer.serialize(event_manager.get_latest_events(0))
+
+
+def _stored_events(events):
+    return [event for event in events if event["data"]["type"] == "stored"]
+
+
+def _stored_block_hashes(events):
+    return [
+        block["block_hash"] for event in _stored_events(events) for block in event["data"]["blocks"]
+    ]
+
+
+def _stored_block_hashes_by_layer_group(events):
+    return {
+        event["layer_group_id"]: [block["block_hash"] for block in event["data"]["blocks"]]
+        for event in _stored_events(events)
+    }
+
+
+def _stored_event_payloads(events):
+    return [event["data"] for event in _stored_events(events)]
+
+
+def _commit_and_close(manager, stream, tokens, *, input_tokens=None, reuse_scope=None):
+    kv_cache = manager.create_kv_cache(input_tokens=input_tokens, reuse_scope=reuse_scope)
+    assert kv_cache.resume(stream)
+    kv_cache.capacity = len(input_tokens or []) + len(tokens)
+    kv_cache.commit(tokens)
+    kv_cache.close()
+    del kv_cache
+    gc.collect()
+
+
+def test_event_manager_queue_and_stored_coalescing():
+    event_manager = KVCacheEventManager(
+        max_kv_event_entries=8,
+        window_size=128,
+        hash_algo="v2_sha256",
+    )
+    event_manager.add_stored_event(
+        None,
+        [
+            KVCacheStoredBlockData(
+                "block0",
+                [UniqueToken(1), UniqueToken(2)],
+                cache_level=0,
+                priority=35,
+            )
+        ],
+    )
+    event_manager.add_stored_event(
+        "block0",
+        [
+            KVCacheStoredBlockData(
+                "block1",
+                [UniqueToken(3), UniqueToken(4)],
+                cache_level=0,
+                priority=35,
+            )
+        ],
+    )
+
+    event_manager.flush_iteration_events()
+    event_objects = pickle.loads(pickle.dumps(event_manager.get_latest_events(0)))
+    events = KVCacheEventSerializer.serialize(event_objects)
+
+    assert len(events) == 1
+    assert events[0]["hash_algo"] == "v2_sha256"
+    assert [block["block_hash"] for block in events[0]["data"]["blocks"]] == [
+        "block0",
+        "block1",
+    ]
+
+
+@pytest.mark.parametrize("lora_id", [None, 0, 7, 2**64 - 1])
+def test_native_streaming_sink_to_python_wire_structs(real_block_factory, lora_id):
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=2,
+        max_window_size=128,
+        max_entries=8,
+    )
+    event_sink = manager.event_sink
+    manager.start()
+    try:
+        manager.set_layer_group_window_sizes({0: 128, 1: 64})
+        published = []
+        manager._publisher.publish = lambda batch: published.append(batch) or True
+        make_block = real_block_factory(event_sink, num_life_cycles=2, tokens_per_block=2)
+
+        first = make_block(_token_ids(1, 3), [2, 2], reuse_scope=ReuseScope(lora_id=lora_id))
+        partial = make_block(_token_ids(5, 7), [1, 2], parent=first)
+        second = make_block(_token_ids(3, 5), [2, 2], parent=first)
+
+        _add_streaming_stored_block(event_sink, first)
+        _add_streaming_stored_block(event_sink, partial)
+        _add_streaming_stored_life_cycle(event_sink, second, 1)
+        _add_streaming_stored_life_cycle(event_sink, second, 0)
+        # Native capture statistics are available before draining or publishing.
+        assert manager.stored_blocks == 2
+        assert manager.partial_blocks_suppressed == 1
+        assert manager.non_target_life_cycles_ignored == 1
+        assert manager.dropped_events == 0
+        assert published == []
+        manager.flush_iteration_events()
+
+        first_hash = int.from_bytes(_block_key(first)[:8], byteorder="big", signed=True)
+        second_hash = int.from_bytes(_block_key(second)[:8], byteorder="big", signed=True)
+        assert len(published) == 1
+        stored = published[0].events
+        assert len(stored) == 1
+        assert stored[0].block_hashes == [first_hash, second_hash]
+        assert stored[0].parent_block_hash is None
+        assert stored[0].token_ids == [1, 2, 3, 4]
+        assert stored[0].lora_id == lora_id
+        assert stored[0].lora_name is None
+        wire_batch = msgspec.msgpack.decode(msgspec.msgpack.encode(published[0]), type=KVEventBatch)
+        assert wire_batch.events[0].lora_id == lora_id
+
+        # Descendants retain the scope after their parent's event has been drained.
+        third = make_block(_token_ids(7, 9), [2, 2], parent=second)
+        _add_streaming_stored_block(event_sink, third)
+        manager.flush_iteration_events()
+        assert published[-1].events[0].parent_block_hash == second_hash
+        assert published[-1].events[0].lora_id == lora_id
+
+        _add_streaming_removed_life_cycle(event_sink, second, 1)
+        _add_streaming_removed_block(event_sink, first)
+        _add_streaming_removed_life_cycle(event_sink, second, 0)
+        assert manager.removed_blocks == 2
+        assert manager.non_target_life_cycles_ignored == 2
+        manager.flush_iteration_events()
+
+        assert len(published) == 3
+        removed = published[2].events
+        assert len(removed) == 1
+        assert removed[0].block_hashes == [first_hash, second_hash]
+        assert manager.stored_blocks == 3
+        assert manager.removed_blocks == 2
+        assert manager.partial_blocks_suppressed == 1
+        assert manager.non_target_life_cycles_ignored == 2
+        assert manager.dropped_events == 0
+        _add_streaming_stored_block(event_sink, first)
+        manager.flush_iteration_events()
+        assert published[-1].events[0].block_hashes == [first_hash]
+        assert published[-1].events[0].lora_id == lora_id
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "failure_stage", [None, "native_clear", "conversation_clear", "sharing_reset"]
+)
+def test_buffered_cache_reset_does_not_start_event_gather(failure_stage):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    gather = Mock(return_value=[[], []])
+    wrapper = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    wrapper.event_manager = KVCacheEventManager(
+        max_kv_event_entries=128,
+        window_size=128,
+        attention_dp_rank=1,
+        attention_dp_gather=gather,
+    )
+    wrapper.impl = SimpleNamespace(clear_reusable_blocks=Mock())
+    wrapper.conversation_manager = SimpleNamespace(clear=Mock())
+    wrapper._sharing = SimpleNamespace(_on_reset=Mock())
+    stages = {
+        "native_clear": wrapper.impl.clear_reusable_blocks,
+        "conversation_clear": wrapper.conversation_manager.clear,
+        "sharing_reset": wrapper._sharing._on_reset,
+    }
+    error = RuntimeError("reset failed on this rank")
+    if failure_stage is not None:
+        stages[failure_stage].side_effect = error
+        with pytest.raises(RuntimeError) as exc_info:
+            wrapper.reset_reuse_state()
+        assert exc_info.value is error
+    else:
+        wrapper.reset_reuse_state()
+
+    # Buffered ADP publication must not introduce a reset-time collective.
+    gather.assert_not_called()
+    assert wrapper.event_manager.get_latest_events(0) == []
+    wrapper.flush_iteration_events()
+    gather.assert_called_once()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("failure_stage", ["native_clear", "conversation_clear"])
+def test_reset_route_state_follows_native_cache_clear(failure_stage):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.route_capture import RouteCapture
+
+    init_cuda_once()
+    native = _create_test_manager(None)
+    stream_holder = CachedCudaStream()
+    tokens = _token_ids(1, 9)
+    _commit_and_close(native, cast(CudaStream, stream_holder.handle), tokens)
+    assert native.probe_reuse(input_tokens=tokens) == len(tokens)
+    held = native.create_kv_cache() if failure_stage == "native_clear" else None
+    wrapper = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    wrapper.impl = native
+    wrapper.event_manager = None
+    wrapper.conversation_manager = Mock()
+    wrapper._sharing = None
+    if failure_stage == "conversation_clear":
+        wrapper.conversation_manager.clear.side_effect = RuntimeError("conversation clear failed")
+    route_capture = RouteCapture(rank=0)
+    route_capture._shared[1] = torch.ones((1, 1), dtype=torch.int16)
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_manager = wrapper
+    executor.enable_joint_kv_cache_reuse = False
+    executor.model_engine = SimpleNamespace(route_capture=route_capture)
+
+    try:
+        expected_error = (
+            r"KV cache\(s\) still open"
+            if failure_stage == "native_clear"
+            else "conversation clear failed"
+        )
+        with pytest.raises(RuntimeError, match=expected_error):
+            PyExecutor.reset_prefix_cache(executor)
+        if failure_stage == "native_clear":
+            assert native.probe_reuse(input_tokens=tokens) == len(tokens)
+            assert 1 in route_capture._shared
+        else:
+            assert native.probe_reuse(input_tokens=tokens) == 0
+            assert not route_capture._shared
+    finally:
+        if held is not None:
+            held.close()
+        native.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("failure_stage", ["native_clear", "conversation_clear"])
+def test_streaming_reset_failure_flushes_pending_events(failure_stage):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    init_cuda_once()
+    events = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+    )
+    events.set_layer_group_window_sizes({0: 128})
+    published = []
+    events._publisher.publish = lambda batch: published.append(batch) or True
+    native = _create_test_manager(events.event_sink)
+    wrapper = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    wrapper.impl = native
+    wrapper.event_manager = events
+    wrapper.conversation_manager = Mock()
+    wrapper._sharing = None
+    stream_holder = CachedCudaStream()
+    _commit_and_close(native, cast(CudaStream, stream_holder.handle), _token_ids(1, 5))
+    held = native.create_kv_cache() if failure_stage == "native_clear" else None
+    if failure_stage == "conversation_clear":
+        wrapper.conversation_manager.clear.side_effect = RuntimeError("conversation clear failed")
+    try:
+        with pytest.raises(RuntimeError):
+            wrapper.reset_reuse_state()
+        assert len(published) == 1
+        wire_events = msgspec.msgpack.decode(msgspec.msgpack.encode(published[0]))[1]
+        assert wire_events[0]["type"] == "BlockStored"
+        assert (wire_events[-1]["type"] == "AllBlocksCleared") == (
+            failure_stage == "conversation_clear"
+        )
+    finally:
+        if held is not None:
+            held.close()
+        native.shutdown()
+        events.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("populated", [False, True])
+def test_streaming_cache_reset_is_published_while_idle_and_replayed(populated):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    init_cuda_once()
+    endpoint = f"inproc://kv-reset-{uuid.uuid4().hex}"
+    events = StreamingKVCacheEventManager(
+        KVEventsConfig(
+            enable_kv_cache_events=True,
+            publisher="zmq",
+            endpoint=endpoint,
+            replay_endpoint=f"{endpoint}-replay",
+        ),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+        max_entries=1,
+    )
+    events.set_layer_group_window_sizes({0: 128})
+    manager = _create_test_manager(events.event_sink)
+    wrapper = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    wrapper.impl = manager
+    wrapper.event_manager = events
+    wrapper.conversation_manager = None
+    wrapper._sharing = None
+    stream_holder = CachedCudaStream()
+    stream = cast(CudaStream, stream_holder.handle)
+    replay = zmq.Context.instance().socket(zmq.DEALER)
+    replay.setsockopt(zmq.RCVTIMEO, 5000)
+    replay.setsockopt(zmq.SNDTIMEO, 5000)
+    subscriber = zmq.Context.instance().socket(zmq.SUB)
+    subscriber.setsockopt(zmq.SUBSCRIBE, b"")
+    subscriber.setsockopt(zmq.RCVTIMEO, 5000)
+    events.start()
+    replay.connect(f"{endpoint}-replay")
+    subscriber.connect(endpoint)
+
+    def replay_through(expected_batches, start_seq):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            replay.send_multipart((b"", start_seq.to_bytes(8, "big")))
+            batches = []
+            while True:
+                _, _, seq, payload = replay.recv_multipart()
+                if seq == events._publisher.END_SEQ:
+                    break
+                batches.append((int.from_bytes(seq, "big"), msgspec.msgpack.decode(payload)))
+            if len(batches) >= expected_batches:
+                return batches
+        pytest.fail("Reset was not published without another inference iteration")
+
+    try:
+        # Establish the SUB subscription using real resets, without relying on a
+        # sleep or on future inference traffic to make the connection usable.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            wrapper.reset_reuse_state()
+            if subscriber.poll(100):
+                _, seq, payload = subscriber.recv_multipart()
+                # A subscription may become ready after an earlier reset was
+                # queued. Consume through this attempt before fixing the cursor.
+                while int.from_bytes(seq, "big") < events.enqueued_batches - 1:
+                    _, seq, payload = subscriber.recv_multipart()
+                assert msgspec.msgpack.decode(payload)[1][-1] == {"type": "AllBlocksCleared"}
+                start_seq = int.from_bytes(seq, "big") + 1
+                break
+        else:
+            pytest.fail("Idle reset did not reach the live subscriber")
+
+        if populated:
+            _commit_and_close(manager, stream, _token_ids(1, 5))
+        # Reset must flush both pending cache changes and the reset itself. No
+        # executor iteration or explicit flush is allowed between reset and replay.
+        wrapper.reset_reuse_state()
+        _, seq, payload = subscriber.recv_multipart()
+        assert int.from_bytes(seq, "big") == start_seq
+        assert msgspec.msgpack.decode(payload)[1][-1] == {"type": "AllBlocksCleared"}
+        batches = replay_through(1, start_seq)
+        first_events = batches[0][1][1]
+        assert first_events[-1] == {"type": "AllBlocksCleared"}
+        if populated:
+            assert first_events[0]["type"] == "BlockStored"
+            assert first_events[0]["token_ids"] == [1, 2, 3, 4]
+
+        # Reusing the same tokens after reset must emit fresh stored data.
+        _commit_and_close(manager, stream, _token_ids(1, 5))
+        events.flush_iteration_events()
+        wrapper.reset_reuse_state()
+        batches = replay_through(3, start_seq)
+        assert [seq for seq, _ in batches] == list(range(start_seq, start_seq + 3))
+        assert batches[1][1][1][0]["type"] == "BlockStored"
+        assert batches[1][1][1][0]["token_ids"] == [1, 2, 3, 4]
+        assert batches[2][1][1][-1] == {"type": "AllBlocksCleared"}
+        assert events.dropped_events == 0
+    finally:
+        replay.close(linger=0)
+        subscriber.close(linger=0)
+        manager.shutdown()
+        events.shutdown()
+
+
+def test_native_streaming_sink_separates_lora_scopes(real_block_factory):
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=2,
+        max_window_size=128,
+    )
+    manager.start()
+    try:
+        manager.set_layer_group_window_sizes({0: 128})
+        published = []
+        manager._publisher.publish = lambda batch: published.append(batch) or True
+        make_block = real_block_factory(manager.event_sink, tokens_per_block=2)
+        for lora_id in (None, 0, 7, 8):
+            first = make_block(_token_ids(1, 3), [2], reuse_scope=ReuseScope(lora_id=lora_id))
+            second = make_block(_token_ids(3, 5), [2], parent=first)
+            _add_streaming_stored_block(manager.event_sink, first)
+            _add_streaming_stored_block(manager.event_sink, second)
+        manager.flush_iteration_events()
+        stored = published[0].events
+        assert [event.lora_id for event in stored] == [None, 0, 7, 8]
+        assert all(event.token_ids == [1, 2, 3, 4] for event in stored)
+        assert all(len(event.block_hashes) == 2 for event in stored)
+        assert len({block_hash for event in stored for block_hash in event.block_hashes}) == 8
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "uuid_a,uuid_b", [(None, None), ("frontend-a", "frontend-b"), ("", None), ("image-图片", None)]
+)
+def test_native_streaming_sink_preserves_multimodal_event_data(real_block_factory, uuid_a, uuid_b):
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+        max_entries=8,
+        mm_token_id_offset=1000,
+    )
+    event_sink = manager.event_sink
+    manager.start()
+    try:
+        manager.set_layer_group_window_sizes({0: 128})
+        published = []
+        manager._publisher.publish = lambda batch: published.append(batch) or True
+        make_block = real_block_factory(event_sink, tokens_per_block=4)
+        digest_a = bytes(range(32))
+        digest_b = bytes(reversed(range(32)))
+        first = make_block([1, MmItemContext(digest_a, uuid_a), 1001, 1002], [4])
+        gap = make_block([2, 3, 4, 5], [4], parent=first)
+        continued = make_block([1003, 7, 1004, 1005], [4], parent=gap)
+        last = make_block([1006, MmItemContext(digest_b, uuid_b), 1001, 9], [4], parent=continued)
+
+        for block in (first, gap, continued, last):
+            _add_streaming_stored_block(event_sink, block)
+        manager.flush_iteration_events()
+
+        assert len(published) == 1
+        assert len(published[0].events) == 1
+        stored = published[0].events[0]
+        assert stored.token_ids == [
+            1,
+            digest_a.hex(),
+            1001,
+            1002,
+            2,
+            3,
+            4,
+            5,
+            1003,
+            7,
+            1004,
+            1005,
+            1006,
+            digest_b.hex(),
+            1001,
+            9,
+        ]
+        assert [
+            [(key.hash, key.start_offset, key.uuid) for key in block_keys]
+            for block_keys in stored.mm_keys
+        ] == [
+            [(digest_a.hex(), 0, uuid_a)],
+            [],
+            [(digest_a.hex(), 3, uuid_a), (digest_a.hex(), 4, uuid_a)],
+            [(digest_a.hex(), 6, uuid_a), (digest_b.hex(), 0, uuid_b)],
+        ]
+        # UUIDs are event metadata, not an additional input to the block-key hash.
+        digest_only_tokens = [
+            bytes.fromhex(token) if isinstance(token, str) else token for token in stored.token_ids
+        ]
+        assert stored.block_hashes == [
+            int.from_bytes(key[:8], byteorder="big", signed=True)
+            for key in _blockchain_keys(4, digest_only_tokens)
+        ]
+        payload = msgspec.msgpack.encode(published[0])
+        assert msgspec.msgpack.decode(payload, type=KVEventBatch) == published[0]
+        wire_keys = msgspec.msgpack.decode(payload)[1][0]["mm_keys"]
+        for actual_keys, expected_keys in zip(wire_keys, stored.mm_keys, strict=True):
+            assert actual_keys == [
+                {
+                    "type": "mm_key",
+                    "hash": key.hash,
+                    "start_offset": key.start_offset,
+                    **({"uuid": key.uuid} if key.uuid is not None else {}),
+                }
+                for key in expected_keys
+            ]
+        assert manager.stored_blocks == 4
+        assert stored.trtllm_image_routing.version == 1
+        assert stored.trtllm_image_routing.token_id_offset == 1000
+        assert [[key.uuid for key in keys] for keys in stored.mm_keys] == [
+            [uuid_a],
+            [],
+            [uuid_a] * 2,
+            [uuid_a, uuid_b],
+        ]
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("overflow", [False, True])
+def test_native_streaming_removals_are_never_dropped_by_the_entry_cap(real_block_factory, overflow):
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=2,
+        max_window_size=128,
+        max_entries=2,
+    )
+    manager.start()
+    try:
+        manager.set_layer_group_window_sizes({0: 128})
+        published = []
+        manager._publisher.publish = lambda batch: published.append(batch) or True
+        event_sink = manager.event_sink
+        make_block = real_block_factory(event_sink, tokens_per_block=2)
+        first = make_block(_token_ids(1, 3), [2])
+        second = make_block(_token_ids(3, 5), [2], parent=first)
+        _add_streaming_stored_block(event_sink, first)
+        _add_streaming_stored_block(event_sink, second)
+        if overflow:
+            third = make_block(_token_ids(5, 7), [2], parent=second)
+            _add_streaming_stored_block(event_sink, third)
+
+        # Both removal entry points must bypass the saturated store cap.
+        _add_streaming_removed_block(event_sink, first)
+        _add_streaming_removed_life_cycle(event_sink, second, 0)
+        manager.flush_iteration_events()
+
+        assert manager.stored_blocks == 2
+        assert manager.removed_blocks == 2
+        assert manager.dropped_events == int(overflow)
+        assert len(published) == 1
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(published[0]))
+        assert [event["type"] for event in decoded[1]] == ["BlockStored", "BlockRemoved"]
+        expected_hashes = [
+            int.from_bytes(_block_key(block)[:8], byteorder="big", signed=True)
+            for block in (first, second)
+        ]
+        assert decoded[1][0]["block_hashes"] == expected_hashes
+        assert decoded[1][1]["block_hashes"] == expected_hashes
+    finally:
+        manager.shutdown()
+
+
+def test_native_streaming_sink_drops_descendants_of_unpublished_parent(real_block_factory):
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=2,
+        max_window_size=128,
+        max_entries=1,
+    )
+    event_sink = manager.event_sink
+    manager.start()
+    try:
+        manager.set_layer_group_window_sizes({0: 128})
+        published = []
+        manager._publisher.publish = lambda batch: published.append(batch) or True
+        make_block = real_block_factory(event_sink, tokens_per_block=2)
+        first = make_block(_token_ids(1, 3), [2])
+        dropped_parent = make_block(_token_ids(3, 5), [2], parent=first)
+        child = make_block(_token_ids(5, 7), [2], parent=dropped_parent)
+
+        _add_streaming_stored_block(event_sink, first)
+        _add_streaming_stored_block(event_sink, dropped_parent)
+        manager.flush_iteration_events()
+        _add_streaming_stored_block(event_sink, child)
+        manager.flush_iteration_events()
+
+        assert len(published) == 1
+        assert published[0].events[0].token_ids == [1, 2]
+        assert manager.stored_blocks == 1
+        assert manager.dropped_events == 2
+    finally:
+        manager.shutdown()
+
+
+def test_native_streaming_sink_rejects_negative_life_cycle_id():
+    manager = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=2,
+        max_window_size=128,
+    )
+    try:
+        with pytest.raises(ValueError, match="lifeCycle must be non-negative"):
+            manager.event_sink.set_target_life_cycle(-1)
+    finally:
+        manager.shutdown()
+
+
+def test_event_manager_attention_dp_gather_callback():
+    gathered_events = []
+
+    def gather(local_events):
+        gathered_events.extend(local_events)
+        return [pickle.loads(pickle.dumps(local_events))]
+
+    event_manager = KVCacheEventManager(
+        max_kv_event_entries=2,
+        window_size=128,
+        attention_dp_rank=0,
+        attention_dp_gather=gather,
+    )
+    event_manager.add_created_event([4])
+
+    events = _flush_serialized_events(event_manager)
+
+    assert len(gathered_events) == 1
+    assert events[0]["attention_dp_rank"] == 0
+    assert events[0]["data"]["num_blocks_per_cache_level"] == [4]
+
+
+def test_event_data_pickle_round_trip_preserves_value_semantics():
+    token = UniqueToken("token", 7)
+    block = KVCacheStoredBlockData(
+        "block",
+        [token],
+        cache_level=1,
+        priority=35,
+        mm_keys=[
+            (b"short-mm-key", 3),
+            (b"another-key", 5, "uuid"),
+            (b"digest-key", 7, "routing-identity", True),
+        ],
+        cache_salt="salt",
+    )
+    diff = KVCacheEventDiff(0, 1)
+    stored = KVCacheStoredData(None, [block])
+    values = [
+        token,
+        KVCacheCreatedData([2, 3]),
+        block,
+        stored,
+        KVCacheRemovedData(["block"]),
+        diff,
+        KVCacheUpdatedData("block", diff, None),
+        KVCacheEvent(4, stored, 128, "same-hash-label", 1, 2),
+    ]
+
+    for value in values:
+        assert pickle.loads(pickle.dumps(value)) == value
+
+
+def test_event_manager_public_methods_drain_queue():
+    manager = KVCacheEventManager(
+        max_kv_event_entries=16,
+        window_size=128,
+        window_size_by_layer_group=None,
+    )
+    manager.set_layer_group_window_sizes({0: 64, 1: 96})
+
+    manager.add_created_event([2, 3], layer_group_ids=[0, 1])
+    manager.add_stored_event(
+        None,
+        [KVCacheStoredBlockData("block-0", [UniqueToken(1)], cache_level=0, priority=35)],
+        layer_group_id=0,
+    )
+    manager.add_stored_event(
+        "block-0",
+        [KVCacheStoredBlockData("block-1", [UniqueToken(2)], cache_level=0, priority=35)],
+        layer_group_id=0,
+    )
+    manager.add_removed_event(block_hash for block_hash in ("removed-0", "removed-1"))
+    manager.add_updated_event(
+        "updated",
+        cache_level=KVCacheEventDiff(0, 1),
+        priority=KVCacheEventDiff(35, 50),
+        layer_group_id=1,
+    )
+
+    assert _flush_serialized_events(manager)
+    assert manager.get_latest_events(0) == []
+    assert manager.get_latest_events(-1) == []
+
+
+def test_event_manager_unknown_raw_keys_are_noops():
+    manager = KVCacheEventManager(max_kv_event_entries=4)
+
+    manager.add_removed_event([b"short", b"still-not-a-radix-key"])
+    manager.add_removed_life_cycle_event(b"short", 0)
+    manager.add_updated_event(b"short")
+    manager.add_updated_event(b"short", cache_level=KVCacheEventDiff(0, 1))
+
+    assert _flush_serialized_events(manager) == []
+
+
+def test_event_manager_disabled_queue_and_blocking_read():
+    disabled = KVCacheEventManager(max_kv_event_entries=0)
+    disabled.add_created_event([1])
+    disabled.flush_iteration_events()
+    assert disabled.get_latest_events(0) == []
+
+    manager = KVCacheEventManager(max_kv_event_entries=1)
+    result = []
+    reader = threading.Thread(target=lambda: result.extend(manager.get_latest_events()))
+    reader.start()
+    time.sleep(0.05)
+    assert reader.is_alive()
+    manager.add_created_event([1])
+    manager.flush_iteration_events()
+    reader.join(timeout=1)
+    assert not reader.is_alive()
+    assert len(result) == 1
+
+
+def test_updated_data_requires_a_cache_level_diff():
+    with pytest.raises(TypeError):
+        KVCacheUpdatedData("block")
+
+
+def test_v2_kv_cache_event_manager_serialization():
+    event_manager = KVCacheEventManager(max_kv_event_entries=4, window_size=128)
+    event_manager.add_created_event([2, 3])
+    event_manager.add_stored_event(
+        parent_hash=None,
+        blocks=[
+            KVCacheStoredBlockData(
+                block_hash="abcd",
+                tokens=[UniqueToken(1), UniqueToken(2)],
+                cache_level=0,
+                priority=0,
+            )
+        ],
+    )
+    event_manager.add_removed_event("abcd")
+
+    event_manager.flush_iteration_events()
+    events = KVCacheEventSerializer.serialize(event_manager.get_latest_events())
+
+    assert [event["event_id"] for event in events] == [0, 1, 2]
+    assert [event["hash_algo"] for event in events] == ["v2_sha256"] * 3
+    assert events[0]["window_size"] == 128
+    assert events[0]["data"] == {
+        "type": "created",
+        "num_blocks_per_cache_level": [2, 3],
+    }
+    assert events[1]["data"]["type"] == "stored"
+    assert events[1]["data"]["parent_hash"] is None
+    assert events[1]["data"]["blocks"][0]["block_hash"] == "abcd"
+    assert events[1]["data"]["blocks"][0]["tokens"][0] == {
+        "type": "unique_token",
+        "token_id": 1,
+        "token_extra_id": 0,
+    }
+    assert events[1]["data"]["blocks"][0]["mm_keys"] == []
+    assert events[2]["data"] == {
+        "type": "removed",
+        "block_hashes": ["abcd"],
+    }
+    assert event_manager.get_latest_events(0) == []
+
+
+def test_v2_kv_cache_event_manager_default_get_latest_events_waits():
+    event_manager = KVCacheEventManager(max_kv_event_entries=4, window_size=128)
+    events = []
+
+    def get_events():
+        events.extend(event_manager.get_latest_events())
+
+    thread = threading.Thread(target=get_events)
+    thread.start()
+    time.sleep(0.05)
+
+    assert thread.is_alive()
+
+    event_manager.add_created_event([1])
+    event_manager.flush_iteration_events()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert len(events) == 1
+    assert events[0].data.num_blocks_per_cache_level == [1]
+
+
+def test_v2_kv_cache_event_manager_uses_layer_group_window_size():
+    event_manager = KVCacheEventManager(
+        max_kv_event_entries=4,
+        window_size=4096,
+        window_size_by_layer_group={
+            0: 128,
+            1: 4096,
+        },
+    )
+
+    event_manager.add_created_event([1], layer_group_ids=[0, 1])
+    event_manager.flush_iteration_events()
+    events = event_manager.get_latest_events(0)
+
+    assert [event.layer_group_id for event in events] == [0, 1]
+    assert [event.window_size for event in events] == [128, 4096]
+
+
+def test_truncate_sha256_hash_to_int64_uses_unsigned_value():
+    assert truncate_sha256_hash_to_int64(b"\x80" + b"\x00" * 31) == 1 << 63
+    assert truncate_sha256_hash_to_int64(b"\xff" * 32) == (1 << 64) - 1
+
+
+def test_v2_kv_cache_event_diff_positional_order_matches_v1():
+    diff = KVCacheEventDiff(3, 5)
+
+    assert diff.old_value == 3
+    assert diff.new_value == 5
+
+
+def test_v2_kv_cache_event_manager_drops_oldest_events():
+    event_manager = KVCacheEventManager(max_kv_event_entries=2, window_size=128)
+    event_manager.add_created_event([1])
+    event_manager.add_stored_event(
+        parent_hash=None,
+        blocks=[
+            KVCacheStoredBlockData(
+                block_hash="stored",
+                tokens=[UniqueToken(1)],
+                cache_level=0,
+                priority=0,
+            )
+        ],
+    )
+    event_manager.add_removed_event("a")
+    event_manager.add_removed_event("b")
+
+    event_manager.flush_iteration_events()
+    events = KVCacheEventSerializer.serialize(event_manager.get_latest_events())
+
+    assert [event["event_id"] for event in events] == [1, 2]
+    assert events[0]["data"]["blocks"][0]["block_hash"] == "stored"
+    assert events[1]["data"]["block_hashes"] == ["a", "b"]
+
+
+def test_v2_kv_cache_event_manager_accepts_removed_iterables():
+    event_manager = KVCacheEventManager(max_kv_event_entries=2, window_size=128)
+    event_manager.add_removed_event(["a", "b"])
+
+    event_manager.flush_iteration_events()
+    events = KVCacheEventSerializer.serialize(event_manager.get_latest_events())
+
+    assert len(events) == 1
+    assert events[0]["data"] == {
+        "type": "removed",
+        "block_hashes": ["a", "b"],
+    }
+
+
+def test_v2_kv_cache_event_manager_coalesces_contiguous_stored_events(
+    real_block_factory,
+):
+    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager, num_life_cycles=2, tokens_per_block=2)
+    block0 = make_block([1, 2], [2, 2])
+    block1 = make_block([3, 4], [2, 2], parent=block0)
+
+    _add_stored_block(event_manager, block0)
+    _add_stored_block(event_manager, block1)
+    events = _flush_serialized_events(event_manager)
+    expected_hashes = [_block_key(block0).hex(), _block_key(block1).hex()]
+
+    assert [event["data"]["type"] for event in events] == ["stored", "stored"]
+    assert [event["layer_group_id"] for event in events] == [0, 1]
+    assert [block["block_hash"] for block in events[0]["data"]["blocks"]] == expected_hashes
+    assert [block["block_hash"] for block in events[1]["data"]["blocks"]] == expected_hashes
+    assert events[0]["data"]["parent_hash"] is None
+    assert events[1]["data"]["parent_hash"] is None
+
+
+def test_v2_kv_cache_event_manager_serializes_layer_group_id():
+    event_manager = KVCacheEventManager(max_kv_event_entries=4, window_size=128)
+    event_manager.add_created_event([2, 3], [0, 1])
+
+    events = _flush_serialized_events(event_manager)
+
+    assert [event["layer_group_id"] for event in events] == [0, 1]
+    assert [event["data"] for event in events] == [
+        {"type": "created", "num_blocks_per_cache_level": [2, 3]},
+        {"type": "created", "num_blocks_per_cache_level": [2, 3]},
+    ]
+
+
+def test_v2_kv_cache_event_manager_sha256_64_compatibility_mode(real_block_factory):
+    event_manager = KVCacheEventManager(
+        max_kv_event_entries=8,
+        window_size=128,
+        hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64,
+    )
+    make_block = real_block_factory(event_manager, tokens_per_block=2)
+    block0 = make_block([1, 2], [2])
+    block1 = make_block([3, 4], [2], parent=block0)
+
+    _add_stored_block(event_manager, block0)
+    _add_stored_block(event_manager, block1)
+    event_manager.add_removed_event(_block_key(block0))
+    events = _flush_serialized_events(event_manager)
+
+    expected_block0_hash = truncate_sha256_hash_to_int64(_block_key(block0))
+    expected_block1_hash = truncate_sha256_hash_to_int64(_block_key(block1))
+    assert [event["hash_algo"] for event in events] == [
+        KV_CACHE_HASH_ALGO_V2_SHA256_64,
+        KV_CACHE_HASH_ALGO_V2_SHA256_64,
+    ]
+    assert events[0]["data"]["type"] == "stored"
+    assert events[0]["data"]["parent_hash"] is None
+    assert [block["block_hash"] for block in events[0]["data"]["blocks"]] == [
+        expected_block0_hash,
+        expected_block1_hash,
+    ]
+    assert events[1]["data"] == {
+        "type": "removed",
+        "block_hashes": [expected_block0_hash],
+    }
+    assert all(isinstance(block_hash, int) for block_hash in events[1]["data"]["block_hashes"])
+
+
+def test_v2_kv_cache_event_manager_v1_hash_algo_matches_v1_block_key_hash(
+    real_block_factory,
+):
+    event_manager = KVCacheEventManager(
+        max_kv_event_entries=8,
+        window_size=128,
+        hash_algo=KV_CACHE_HASH_ALGO_V1,
+    )
+    make_block = real_block_factory(event_manager)
+    block0 = make_block([1, 2, 3, 4], [4])
+    block1 = make_block([5, 6], [2], parent=block0)
+
+    _add_stored_block(event_manager, block0)
+    _add_stored_block(event_manager, block1)
+    events = _flush_serialized_events(event_manager)
+
+    assert events[0]["hash_algo"] == KV_CACHE_HASH_ALGO_V1
+    assert events[0]["data"]["parent_hash"] is None
+    assert [block["block_hash"] for block in events[0]["data"]["blocks"]] == [
+        924206229973855,
+        6875034662206558884,
+    ]
+    assert all(isinstance(block["block_hash"], int) for block in events[0]["data"]["blocks"])
+
+
+def test_v2_root_key_distinguishes_lora_from_cache_salt_id():
+    def root_key(scope):
+        # The first pair a blockchain yields is the reuse-scope root itself.
+        return next(iter(sequence_to_blockchain_keys(1, scope, [])))[1]
+
+    assert root_key(ReuseScope()) != root_key(ReuseScope(lora_id=123))
+    assert root_key(ReuseScope()) != root_key(ReuseScope(salt="123"))
+    assert root_key(ReuseScope(lora_id=123)) != root_key(ReuseScope(salt="123"))
+    assert root_key(ReuseScope(lora_id=123, salt="456")) != root_key(
+        ReuseScope(lora_id=456, salt="123")
+    )
+
+
+def test_v2_kv_cache_event_manager_v1_hash_algo_mixes_cache_salt_id(real_block_factory):
+    event_manager = KVCacheEventManager(
+        max_kv_event_entries=8,
+        window_size=128,
+        hash_algo=KV_CACHE_HASH_ALGO_V1,
+    )
+    make_block = real_block_factory(event_manager)
+    block0 = make_block([1, 2, 3, 4], [4], reuse_scope=ReuseScope(salt="123"))
+    block1 = make_block([5, 6], [2], parent=block0)
+
+    _add_stored_block(event_manager, block0)
+    _add_stored_block(event_manager, block1)
+    events = _flush_serialized_events(event_manager)
+
+    assert events[0]["hash_algo"] == KV_CACHE_HASH_ALGO_V1
+    salt_id = KVCacheEventManager._hash_cache_salt("123")
+    first_hash = hash_v1_block_key([1, 2, 3, 4], cache_salt_id=salt_id)
+    assert [block["block_hash"] for block in events[0]["data"]["blocks"]] == [
+        first_hash,
+        hash_v1_block_key([5, 6], parent_hash=first_hash, cache_salt_id=salt_id),
+    ]
+
+
+def test_v2_kv_cache_event_manager_v1_hash_reads_root_reuse_scope(real_block_factory):
+    def hashes_for(reuse_scope):
+        event_manager = KVCacheEventManager(
+            max_kv_event_entries=8,
+            window_size=128,
+            hash_algo=KV_CACHE_HASH_ALGO_V1,
+        )
+        make_block = real_block_factory(event_manager)
+        block0 = make_block([1, 2, 3, 4], [4], reuse_scope=reuse_scope)
+        block1 = make_block([5, 6], [2], parent=block0)
+        _add_stored_block(event_manager, block0)
+        _add_stored_block(event_manager, block1)
+        return _stored_block_hashes(_flush_serialized_events(event_manager))
+
+    scope_hashes = hashes_for(ReuseScope(lora_id=11, salt="22"))
+    assert scope_hashes != hashes_for(ReuseScope(lora_id=99, salt="22"))
+    assert scope_hashes != hashes_for(ReuseScope())
+
+
+def test_v2_kv_cache_event_manager_v1_hash_recomputes_removed_parent(
+    real_block_factory,
+):
+    event_manager = KVCacheEventManager(
+        max_kv_event_entries=8,
+        window_size=128,
+        hash_algo=KV_CACHE_HASH_ALGO_V1,
+    )
+    make_block = real_block_factory(event_manager)
+    block0 = make_block([1, 2, 3, 4], [4])
+    block1 = make_block([5, 6], [2], parent=block0)
+
+    _add_stored_block(event_manager, block0)
+    event_manager.add_removed_event(_block_key(block0))
+    _add_stored_block(event_manager, block1)
+    stored_events = _stored_events(_flush_serialized_events(event_manager))
+
+    assert stored_events[-1]["data"]["parent_hash"] == 924206229973855
+    assert stored_events[-1]["data"]["blocks"][0]["block_hash"] == 6875034662206558884
+
+
+def test_v2_kv_cache_event_manager_v1_hash_algo_matches_cpp_hasher():
+    _tb = pytest.importorskip("tensorrt_llm.bindings")
+    block_key_type = _tb.internal.batch_manager.BlockKey
+    block_key_hasher = _tb.internal.batch_manager.BlockKeyHasher
+
+    parent_hash = block_key_hasher.hash(block_key_type([1, 2, 3, 4]))
+    child_hash = block_key_hasher.hash(block_key_type([5, 6]), parent_hash)
+    lora_hash = block_key_hasher.hash(block_key_type([1, 2, 3, 4], 123))
+
+    assert KVCacheEventManager._hash_block_key([1, 2, 3, 4], 0, None, None) == parent_hash
+    assert KVCacheEventManager._hash_block_key([5, 6], parent_hash, None, None) == child_hash
+    assert KVCacheEventManager._hash_block_key([1, 2, 3, 4], 0, 123, None) == lora_hash
+
+
+def test_v2_kv_cache_event_manager_v1_hash_events_match_cpp_hasher(real_block_factory):
+    _tb = pytest.importorskip("tensorrt_llm.bindings")
+    block_key_type = _tb.internal.batch_manager.BlockKey
+    block_key_hasher = _tb.internal.batch_manager.BlockKeyHasher
+    event_manager = KVCacheEventManager(
+        max_kv_event_entries=8,
+        window_size=128,
+        hash_algo=KV_CACHE_HASH_ALGO_V1,
+    )
+    make_block = real_block_factory(event_manager)
+    block0 = make_block([1, 2, 3, 4], [4])
+    block1 = make_block([5, 6], [2], parent=block0)
+
+    _add_stored_block(event_manager, block0)
+    _add_stored_block(event_manager, block1)
+    events = _flush_serialized_events(event_manager)
+
+    parent_hash = block_key_hasher.hash(block_key_type([1, 2, 3, 4]))
+    child_hash = block_key_hasher.hash(block_key_type([5, 6]), parent_hash)
+    assert _stored_block_hashes(events) == [parent_hash, child_hash]
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+def test_v1_and_v2_managers_emit_same_v1_hash_stored_events():
+    import tensorrt_llm
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager as KVCacheManagerV1
+    from tensorrt_llm.bindings.internal.testing import (
+        simulate_prefill_completion_only_use_for_testing,
+    )
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    init_cuda_once()
+    gc.collect()
+    gc.disable()
+
+    tokens_per_block = 4
+    max_seq_len = 128
+    prompt_tokens = list(range(1, 2 * tokens_per_block + 2))
+    reusable_tokens = _token_ids(prompt_tokens[0], prompt_tokens[-1])
+    event_buffer_max_size = 16
+    manager_v1 = None
+    manager_v2 = None
+    try:
+        kv_cache_config_v1 = KvCacheConfig(
+            event_buffer_max_size=event_buffer_max_size,
+            enable_block_reuse=True,
+            max_tokens=256,
+            use_kv_cache_manager_v2=False,
+        )
+        manager_v1 = KVCacheManagerV1(
+            kv_cache_config=kv_cache_config_v1,
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=1,
+            mapping=Mapping(),
+        )
+        manager_v1.flush_iteration_events()
+        manager_v1.get_latest_events(10)
+
+        sampling_params = SamplingParams()
+        req = LlmRequest(
+            request_id=0,
+            max_new_tokens=1,
+            input_tokens=prompt_tokens,
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                sampling_params._get_sampling_config()
+            ),
+            is_streaming=False,
+        )
+        manager_v1.impl.add_sequence_batch([(req.py_request_id, req.prompt_len, 1)], [req])
+        simulate_prefill_completion_only_use_for_testing(req)
+        manager_v1.free_resources(req)
+        manager_v1.flush_iteration_events()
+        v1_events = KVCacheEventSerializer.serialize(manager_v1.get_latest_events(10))
+
+        event_manager_v2 = KVCacheEventManager(
+            max_kv_event_entries=event_buffer_max_size,
+            window_size=max_seq_len,
+            hash_algo=KV_CACHE_HASH_ALGO_V1,
+        )
+        manager_v2 = _create_test_manager(
+            event_manager_v2,
+            tokens_per_block=tokens_per_block,
+        )
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        _commit_and_close(manager_v2, stream, reusable_tokens)
+        v2_events = _flush_serialized_events(event_manager_v2)
+
+        assert all(
+            event["hash_algo"] == KV_CACHE_HASH_ALGO_V1 for event in _stored_events(v2_events)
+        )
+        assert _stored_event_payloads(v2_events) == _stored_event_payloads(v1_events)
+    finally:
+        gc.enable()
+        if manager_v1 is not None:
+            manager_v1.shutdown()
+        if manager_v2 is not None:
+            manager_v2.shutdown()
+
+
+def test_v2_kv_cache_event_manager_unknown_hash_algo_raises():
+    with pytest.raises(ValueError, match="Unsupported V2 KV cache event hash algorithm"):
+        KVCacheEventManager(
+            max_kv_event_entries=4,
+            window_size=128,
+            hash_algo="unknown_hash_algo",
+        )
+
+
+def test_v2_kv_cache_event_manager_gathers_attention_dp_events_on_rank_zero():
+    remote_manager = KVCacheEventManager(
+        max_kv_event_entries=4,
+        window_size=128,
+        attention_dp_rank=1,
+    )
+    remote_manager.add_created_event([3])
+    remote_manager.flush_iteration_events()
+    remote_event_objects = remote_manager.get_latest_events()
+    remote_events = KVCacheEventSerializer.serialize(remote_event_objects)
+    assert remote_events[0]["attention_dp_rank"] == 1
+
+    gathered_local_events = []
+
+    def gather(local_events):
+        gathered_local_events.extend(local_events)
+        return [
+            local_events,
+            remote_event_objects,
+        ]
+
+    event_manager = KVCacheEventManager(
+        max_kv_event_entries=4,
+        window_size=128,
+        attention_dp_rank=0,
+        attention_dp_gather=gather,
+    )
+    event_manager.add_created_event([2])
+
+    events = _flush_serialized_events(event_manager)
+
+    assert len(gathered_local_events) == 1
+    assert [event["attention_dp_rank"] for event in events] == [0, 1]
+    assert [event["data"]["num_blocks_per_cache_level"] for event in events] == [
+        [2],
+        [3],
+    ]
+
+
+def test_v2_kv_cache_event_manager_attention_dp_nonzero_rank_sends_without_publishing():
+    gathered_local_events = []
+
+    def gather(local_events):
+        gathered_local_events.extend(local_events)
+        return [
+            [],
+            local_events,
+        ]
+
+    event_manager = KVCacheEventManager(
+        max_kv_event_entries=1,
+        window_size=128,
+        attention_dp_rank=1,
+        attention_dp_gather=gather,
+    )
+    event_manager.add_created_event([2])
+    event_manager.add_created_event([3])
+
+    events = _flush_serialized_events(event_manager)
+
+    assert len(gathered_local_events) == 1
+    assert gathered_local_events[0].attention_dp_rank == 1
+    assert KVCacheEventSerializer.serialize(gathered_local_events)[0]["data"][
+        "num_blocks_per_cache_level"
+    ] == [3]
+    assert events == []
+
+
+def test_v2_kv_cache_event_manager_attention_dp_rank_zero_uses_dp_capacity():
+    remote_manager = KVCacheEventManager(
+        max_kv_event_entries=2,
+        window_size=128,
+        attention_dp_rank=1,
+    )
+    remote_manager.add_created_event([10])
+    remote_manager.add_created_event([11])
+    remote_manager.flush_iteration_events()
+    remote_event_objects = remote_manager.get_latest_events()
+
+    def gather(local_events):
+        return [
+            local_events,
+            remote_event_objects,
+        ]
+
+    event_manager = KVCacheEventManager(
+        max_kv_event_entries=1,
+        window_size=128,
+        attention_dp_rank=0,
+        attention_dp_gather=gather,
+    )
+    event_manager.add_created_event([1])
+    event_manager.add_created_event([2])
+
+    events = _flush_serialized_events(event_manager)
+
+    assert [event["attention_dp_rank"] for event in events] == [0, 1]
+    assert [event["data"]["num_blocks_per_cache_level"] for event in events] == [
+        [2],
+        [11],
+    ]
+
+
+def test_v2_kv_cache_event_manager_serializes_updated_event():
+    event_manager = KVCacheEventManager(max_kv_event_entries=2, window_size=128)
+    event_manager.add_updated_event(
+        "abcd",
+        cache_level=KVCacheEventDiff(old_value=0, new_value=1),
+        priority=KVCacheEventDiff(old_value=1, new_value=2),
+    )
+
+    event_manager.flush_iteration_events()
+    events = KVCacheEventSerializer.serialize(event_manager.get_latest_events())
+
+    assert len(events) == 1
+    assert events[0]["hash_algo"] == "v2_sha256"
+    assert events[0]["data"] == {
+        "type": "updated",
+        "block_hash": "abcd",
+        "cache_level": {
+            "type": "event_diff",
+            "new_value": 1,
+            "old_value": 0,
+        },
+        "priority": {
+            "type": "event_diff",
+            "new_value": 2,
+            "old_value": 1,
+        },
+    }
+
+
+def test_v2_kv_cache_event_manager_uses_stored_registry_for_removed_event(
+    real_block_factory,
+):
+    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager)
+    block = make_block([1, 2], [2])
+    block_hash = _block_key(block).hex()
+
+    _add_stored_block(event_manager, block)
+    event_manager.add_removed_event(_block_key(block))
+    event_manager.add_removed_event(_block_key(block))
+    events = _flush_serialized_events(event_manager)
+
+    assert [event["data"]["type"] for event in events] == ["stored", "removed"]
+    assert [event["layer_group_id"] for event in events] == [0, 0]
+    assert events[0]["data"]["blocks"][0]["block_hash"] == block_hash
+    assert "layer_groups" not in events[0]["data"]["blocks"][0]
+    assert events[1]["data"]["block_hashes"] == [block_hash]
+    assert "layer_groups" not in events[1]["data"]
+
+
+@pytest.mark.parametrize("ancestor_coverage", [1, 4])
+def test_v2_kv_cache_event_manager_derives_mm_keys_across_blocks(
+    real_block_factory, ancestor_coverage
+):
+    event_manager = KVCacheEventManager(
+        max_kv_event_entries=8, window_size=128, mm_token_id_offset=1000
+    )
+    make_block = real_block_factory(event_manager)
+    digest_a = bytes(range(32))
+    digest_b = bytes(reversed(range(32)))
+    uuid_a = "frontend-h-a"
+    first = make_block([1, MmItemContext(digest_a, uuid_a), 1001, 1002], [ancestor_coverage])
+    gap = make_block([2, 3, 4, 5], [ancestor_coverage], parent=first)
+    continued = make_block([1003, 7, 1004, 1005], [4], parent=gap)
+    last = make_block([1006, digest_b, 1001, 9], [4], parent=continued)
+
+    # The digest must survive a text-only block, including ancestors whose
+    # incomplete page coverage prevents them from publishing stored events.
+    for block in (first, gap, continued, last):
+        _add_stored_block(event_manager, block)
+    events = _flush_serialized_events(event_manager)
+    mm_keys_by_hash = {
+        block["block_hash"]: block["mm_keys"]
+        for event in _stored_events(events)
+        for block in event["data"]["blocks"]
+    }
+    expected = {
+        _block_key(continued).hex(): [
+            {
+                "type": "mm_key",
+                "hash": digest_a.hex(),
+                "uuid": uuid_a,
+                "start_offset": 3,
+            },
+            {
+                "type": "mm_key",
+                "hash": digest_a.hex(),
+                "uuid": uuid_a,
+                "start_offset": 4,
+            },
+        ],
+        _block_key(last).hex(): [
+            {
+                "type": "mm_key",
+                "hash": digest_a.hex(),
+                "uuid": uuid_a,
+                "start_offset": 6,
+            },
+            {"type": "mm_key", "hash": digest_b.hex(), "start_offset": 0},
+        ],
+    }
+    if ancestor_coverage == 4:
+        expected[_block_key(first).hex()] = [
+            {
+                "type": "mm_key",
+                "hash": digest_a.hex(),
+                "uuid": uuid_a,
+                "start_offset": 0,
+            }
+        ]
+        expected[_block_key(gap).hex()] = []
+    assert mm_keys_by_hash == expected
+
+
+def test_v2_kv_cache_event_manager_preserves_mm_keys_after_life_cycle_removal(real_block_factory):
+    event_manager = KVCacheEventManager(
+        max_kv_event_entries=8, window_size=128, mm_token_id_offset=1000
+    )
+    make_block = real_block_factory(event_manager, num_life_cycles=2)
+    mm_hash = bytes(range(32))
+    uuid = "frontend-routing-identity-" + "x" * 1024
+    assert uuid != mm_hash.hex()[:16]
+    block = make_block([MmItemContext(mm_hash, uuid), 1001], [2, 2])
+    block_key = _block_key(block)
+
+    _add_stored_block(event_manager, block)
+    events = _flush_serialized_events(event_manager)
+
+    expected_mm_keys = [
+        {
+            "type": "mm_key",
+            "hash": mm_hash.hex(),
+            "uuid": uuid,
+            "start_offset": 0,
+        }
+    ]
+    assert events[0]["data"]["blocks"][0]["mm_keys"] == expected_mm_keys
+    assert events[1]["data"]["blocks"][0]["mm_keys"] == expected_mm_keys
+
+    # Lifecycle removal does not change the block's normalized token stream.
+    event_manager.add_removed_life_cycle_event(block_key, 0)
+    event_manager.add_removed_life_cycle_event(block_key, 1)
+    _flush_serialized_events(event_manager)
+    _add_stored_life_cycle(event_manager, block, 0)
+    events = _flush_serialized_events(event_manager)
+    assert events[0]["data"]["blocks"][0]["mm_keys"] == expected_mm_keys
+
+    event_manager.add_removed_event(block_key)
+    _flush_serialized_events(event_manager)
+    _add_stored_life_cycle(event_manager, block, 1)
+    events = _flush_serialized_events(event_manager)
+    assert events[0]["data"]["blocks"][0]["mm_keys"] == expected_mm_keys
+
+
+def test_v2_kv_cache_event_manager_requires_mm_token_encoding(real_block_factory):
+    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager)
+    mm_hash = bytes(range(32))
+    block = make_block([mm_hash, 1001], [2])
+
+    _add_stored_block(event_manager, block)
+    events = _flush_serialized_events(event_manager)
+    stored_block = events[0]["data"]["blocks"][0]
+    assert stored_block["mm_keys"] == []
+    assert [token["token_id"] for token in stored_block["tokens"]] == [mm_hash.hex(), 1001]
+
+
+def test_v2_kv_cache_event_manager_omits_partial_life_cycle_coverage(
+    real_block_factory,
+):
+    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager, num_life_cycles=2)
+    block = make_block([1, 2], [2, 1])
+
+    _add_stored_block(event_manager, block)
+    events = _flush_serialized_events(event_manager)
+
+    assert [event["layer_group_id"] for event in events] == [0]
+    assert _stored_block_hashes(events) == [_block_key(block).hex()]
+
+    _add_stored_life_cycle(event_manager, block, 1)
+    assert _flush_serialized_events(event_manager) == []
+
+
+def test_v2_kv_cache_event_manager_emits_partial_life_cycle_removed_events(
+    real_block_factory,
+):
+    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager, num_life_cycles=2)
+    block = make_block([1, 2], [2, 2])
+    block_hash = _block_key(block).hex()
+
+    _add_stored_block(event_manager, block)
+    event_manager.add_removed_life_cycle_event(_block_key(block), 0)
+    events = _flush_serialized_events(event_manager)
+
+    assert [event["data"]["type"] for event in events] == [
+        "stored",
+        "stored",
+        "removed",
+    ]
+    assert [event["layer_group_id"] for event in events] == [0, 1, 0]
+    assert events[0]["data"]["blocks"][0]["block_hash"] == block_hash
+    assert events[1]["data"]["blocks"][0]["block_hash"] == block_hash
+    assert events[2]["data"]["block_hashes"] == [block_hash]
+
+    event_manager.add_removed_life_cycle_event(_block_key(block), 1)
+    event_manager.add_removed_life_cycle_event(_block_key(block), 1)
+    events = _flush_serialized_events(event_manager)
+
+    assert [event["data"]["type"] for event in events] == ["removed"]
+    assert events[0]["layer_group_id"] == 1
+    assert events[0]["data"]["block_hashes"] == [block_hash]
+
+
+def test_v2_kv_cache_event_manager_whole_block_removal_clears_life_cycle_state(
+    real_block_factory,
+):
+    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager, num_life_cycles=2)
+    block = make_block([1, 2], [2, 2])
+    block_hash = _block_key(block).hex()
+
+    _add_stored_block(event_manager, block)
+    event_manager.add_removed_life_cycle_event(_block_key(block), 0)
+    event_manager.add_removed_event(_block_key(block))
+    event_manager.add_removed_event(_block_key(block))
+    events = _flush_serialized_events(event_manager)
+
+    assert [event["data"]["type"] for event in events] == [
+        "stored",
+        "stored",
+        "removed",
+        "removed",
+    ]
+    assert [event["layer_group_id"] for event in events] == [0, 1, 0, 1]
+    assert events[2]["data"]["block_hashes"] == [block_hash]
+    assert events[3]["data"]["block_hashes"] == [block_hash]
+
+
+def test_v2_kv_cache_event_manager_readds_life_cycle_emits_stored_event(
+    real_block_factory,
+):
+    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager, num_life_cycles=2)
+    block = make_block([1, 2], [2, 2])
+    key = _block_key(block)
+    block_hash = key.hex()
+
+    _add_stored_block(event_manager, block)
+    event_types = [event["data"]["type"] for event in _flush_serialized_events(event_manager)]
+    assert event_types == ["stored", "stored"]
+
+    event_manager.add_removed_life_cycle_event(key, 0)
+    _add_stored_life_cycle(event_manager, block, 0)
+    event_manager.add_removed_life_cycle_event(key, 1)
+    events = _flush_serialized_events(event_manager)
+
+    assert [event["data"]["type"] for event in events] == [
+        "removed",
+        "stored",
+        "removed",
+    ]
+    assert [event["layer_group_id"] for event in events] == [0, 0, 1]
+    assert events[0]["data"]["block_hashes"] == [block_hash]
+    assert events[1]["data"]["blocks"][0]["block_hash"] == block_hash
+    assert events[2]["data"]["block_hashes"] == [block_hash]
+
+    event_manager.add_removed_life_cycle_event(key, 0)
+    events = _flush_serialized_events(event_manager)
+    assert [event["data"]["type"] for event in events] == ["removed"]
+    assert events[0]["layer_group_id"] == 0
+    assert events[0]["data"]["block_hashes"] == [block_hash]
+
+
+def test_v2_kv_cache_event_manager_serializes_only_fully_covered_life_cycle_tokens(
+    real_block_factory,
+):
+    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager, num_life_cycles=2)
+    block = make_block([1, 2], [2, 1])
+
+    _add_stored_block(event_manager, block)
+    events = _flush_serialized_events(event_manager)
+
+    assert [event["layer_group_id"] for event in events] == [0]
+    assert [token["token_id"] for token in events[0]["data"]["blocks"][0]["tokens"]] == [1, 2]
+
+    _add_stored_life_cycle(event_manager, block, 1)
+    assert _flush_serialized_events(event_manager) == []
+
+
+def test_v2_kv_cache_event_manager_reemits_stored_after_all_life_cycles_were_removed(
+    real_block_factory,
+):
+    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager)
+    block = make_block([1, 2], [2])
+    key = _block_key(block)
+
+    _add_stored_block(event_manager, block)
+    event_manager.add_removed_life_cycle_event(key, 0)
+    event_types = [event["data"]["type"] for event in _flush_serialized_events(event_manager)]
+    assert event_types == ["stored", "removed"]
+
+    _add_stored_life_cycle(event_manager, block, 0)
+    events = _flush_serialized_events(event_manager)
+
+    assert [event["data"]["type"] for event in events] == ["stored"]
+    assert events[0]["layer_group_id"] == 0
+    assert events[0]["data"]["blocks"][0]["block_hash"] == key.hex()
+
+
+def test_v2_kv_cache_event_manager_flushes_removed_before_updated_event(
+    real_block_factory,
+):
+    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager)
+    removed_block = make_block([1, 2], [2])
+    updated_block = make_block([3, 4], [2])
+    removed_key = _block_key(removed_block)
+    updated_key = _block_key(updated_block)
+
+    _add_stored_block(event_manager, removed_block)
+    _add_stored_block(event_manager, updated_block)
+    _flush_serialized_events(event_manager)
+
+    event_manager.add_removed_event(removed_key)
+    event_manager.add_updated_event(
+        updated_key,
+        cache_level=KVCacheEventDiff(old_value=0, new_value=1),
+        layer_group_id=0,
+    )
+    events = _flush_serialized_events(event_manager)
+
+    assert [event["data"]["type"] for event in events] == ["removed", "updated"]
+    assert events[0]["data"]["block_hashes"] == [removed_key.hex()]
+    assert events[1]["data"]["block_hash"] == updated_key.hex()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+def test_v2_stored_events_match_block_hash_chain():
+    init_cuda_once()
+    gc.collect()
+    gc.disable()
+
+    event_manager = KVCacheEventManager(max_kv_event_entries=16, window_size=128)
+    manager = None
+    try:
+        tokens_per_block = 4
+        manager = _create_test_manager(event_manager, tokens_per_block=tokens_per_block)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        tokens = _token_ids(0, 2 * tokens_per_block)
+
+        _commit_and_close(manager, stream, tokens)
+        events = _flush_serialized_events(event_manager)
+
+        stored_events = _stored_events(events)
+        assert len(stored_events) == 1
+
+        chain = _blockchain_keys(tokens_per_block, tokens)
+        expected_hashes = [key.hex() for key in chain]
+
+        assert _stored_block_hashes(stored_events) == expected_hashes
+        assert stored_events[0]["hash_algo"] == "v2_sha256"
+        assert stored_events[0]["data"]["parent_hash"] is None
+        assert [
+            block["block_hash"] for block in stored_events[0]["data"]["blocks"]
+        ] == expected_hashes
+        assert [
+            token["token_id"] for token in stored_events[0]["data"]["blocks"][0]["tokens"]
+        ] == list(range(tokens_per_block))
+        assert [
+            token["token_id"] for token in stored_events[0]["data"]["blocks"][1]["tokens"]
+        ] == list(range(tokens_per_block, 2 * tokens_per_block))
+
+        event_manager.add_updated_event(
+            bytes.fromhex(expected_hashes[0]),
+            cache_level=KVCacheEventDiff(old_value=0, new_value=1),
+            layer_group_id=0,
+        )
+        updated_events = _flush_serialized_events(event_manager)
+        assert updated_events[0]["data"]["block_hash"] == expected_hashes[0]
+    finally:
+        gc.enable()
+        if manager is not None:
+            manager.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+def test_v2_duck_typed_reuse_scope_preserves_string_salt() -> None:
+    init_cuda_once()
+    event_manager = KVCacheEventManager(max_kv_event_entries=16, window_size=128)
+    manager = _create_test_manager(event_manager)
+    try:
+        scopes = [
+            SimpleNamespace(lora_id=None, salt=None),
+            SimpleNamespace(lora_id=None, salt="tenant-中文"),
+        ]
+        for scope in scopes:
+            cache = manager.create_kv_cache(scope)
+            try:
+                assert cache.reuse_scope.salt == scope.salt
+            finally:
+                cache.close()
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("hash_algo", ["v1_block_key", "v2_sha256", "v2_sha256_64"])
+@pytest.mark.parametrize("deduplicate", [False, True])
+def test_event_salt_after_root_destruction_and_reattachment(hash_algo, deduplicate):
+    init_cuda_once()
+    events = KVCacheEventManager(max_kv_event_entries=64, hash_algo=hash_algo)
+    manager = _create_test_manager(events)
+    scope = ReuseScope(salt="tenant-中文\x00scope")
+    blocks = []
+
+    def make(tokens, *, parent=None, reuse_scope=scope):
+        block = _introspection.make_test_block(manager, tokens, [len(tokens)], parent, reuse_scope)
+        blocks.append(block)
+        return block
+
+    try:
+        first = make(_token_ids(1, 5))
+        child = make(_token_ids(5, 9), parent=first)
+        _add_stored_block(events, first)
+        _add_stored_block(events, child)
+
+        manager.clear_reusable_blocks()
+        # Queued payloads own their salt even after the originating root is gone.
+        stored = [
+            event["data"]
+            for event in _flush_serialized_events(events)
+            if event["data"]["type"] == "stored"
+        ]
+        assert [block["cache_salt"] for data in stored for block in data["blocks"]] == [
+            scope.salt
+        ] * 2
+        for block in (first, child):
+            with pytest.raises(RuntimeError, match="orphan"):
+                _add_stored_block(events, block)
+
+        # Occupy another root before recreating the original scope.
+        make(_token_ids(1, 5), reuse_scope=ReuseScope(salt="other-tenant"))
+        if deduplicate:
+            make(_token_ids(1, 5))
+        _introspection.reattach_test_block(manager, first, reuse_scope=scope)
+        _introspection.reattach_test_block(manager, child, parent=first)
+        _flush_serialized_events(events)
+        _add_stored_block(events, first)
+        _add_stored_block(events, child)
+        stored = [
+            event["data"]
+            for event in _flush_serialized_events(events)
+            if event["data"]["type"] == "stored"
+        ]
+        assert [block["cache_salt"] for data in stored for block in data["blocks"]] == [
+            scope.salt
+        ] * 2
+        assert manager.probe_reuse(scope, _token_ids(1, 9)) == 8
+    finally:
+        for block in reversed(blocks):
+            _introspection.close_test_block(block)
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("cache_salt", [None, "", "tenant-A", "tenant-中文", "a\x00b"])
+def test_v2_reuse_matches_string_salt(cache_salt: str | None) -> None:
+    init_cuda_once()
+    event_manager = KVCacheEventManager(max_kv_event_entries=16, window_size=128)
+    manager = _create_test_manager(event_manager)
+    try:
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prefix = _token_ids(1, 9)
+        _commit_and_close(
+            manager,
+            stream,
+            prefix,
+            reuse_scope=ReuseScope(salt=cache_salt),
+        )
+        for other_salt in (None, "", "tenant-A", "tenant-中文", "a\x00b", "a"):
+            assert manager.probe_reuse(ReuseScope(salt=other_salt), prefix) == (
+                len(prefix) if other_salt == cache_salt else 0
+            )
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "hash_algo", [KV_CACHE_HASH_ALGO_V1, "v2_sha256", KV_CACHE_HASH_ALGO_V2_SHA256_64]
+)
+@pytest.mark.parametrize("cache_salt", [None, "", "tenant-A", "tenant-中文", "a\x00b"])
+def test_v2_stored_events_preserve_original_salt_after_request_close(
+    hash_algo: str, cache_salt: str | None
+) -> None:
+    init_cuda_once()
+    event_manager = KVCacheEventManager(
+        max_kv_event_entries=16, window_size=128, hash_algo=hash_algo
+    )
+    manager = _create_test_manager(event_manager)
+    try:
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        scope = ReuseScope(salt=cache_salt)
+        prefix = _token_ids(1, 9)
+        _commit_and_close(manager, stream, prefix, reuse_scope=scope)
+        del scope
+        initial = _flush_serialized_events(event_manager)
+        assert len(_stored_block_hashes(initial)) == 2
+
+        # The cached prefix and salt must survive the first request; only the new tail is stored.
+        _commit_and_close(
+            manager,
+            stream,
+            _token_ids(9, 11),
+            input_tokens=prefix,
+            reuse_scope=ReuseScope(salt=cache_salt),
+        )
+        extension = _flush_serialized_events(event_manager)
+        assert len(_stored_block_hashes(extension)) == 1
+        assert set(_stored_block_hashes(initial)).isdisjoint(_stored_block_hashes(extension))
+        blocks = [
+            block
+            for event in _stored_events(initial + extension)
+            for block in event["data"]["blocks"]
+        ]
+        assert [block["cache_salt"] for block in blocks] == [cache_salt] * 3
+        assert [token["token_id"] for token in blocks[-1]["tokens"]] == [9, 10]
+        router = BlockHashMixin()
+        router._init_block_hashing(tokens_per_block=4)
+        expected_hashes = router._compute_block_hashes(
+            [list(range(1, 12))], hash_algo=hash_algo, cache_salt=cache_salt
+        )[0]
+        assert [block["block_hash"] for block in blocks] == expected_hashes
+
+        assert manager.probe_reuse(ReuseScope(salt=cache_salt), prefix) == len(prefix)
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+def test_v2_v1_hash_events_include_cache_salt_from_kv_cache():
+    init_cuda_once()
+    gc.collect()
+    gc.disable()
+
+    event_manager = KVCacheEventManager(
+        max_kv_event_entries=16,
+        window_size=128,
+        hash_algo=KV_CACHE_HASH_ALGO_V1,
+    )
+    manager = None
+    try:
+        tokens_per_block = 4
+        manager = _create_test_manager(event_manager, tokens_per_block=tokens_per_block)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        _commit_and_close(
+            manager,
+            stream,
+            _token_ids(1, 7),
+            reuse_scope=ReuseScope(salt="123"),
+        )
+        events = _flush_serialized_events(event_manager)
+
+        salt_id = KVCacheEventManager._hash_cache_salt("123")
+        first_hash = hash_v1_block_key([1, 2, 3, 4], cache_salt_id=salt_id)
+        assert _stored_block_hashes(events) == [
+            first_hash,
+            hash_v1_block_key([5, 6], parent_hash=first_hash, cache_salt_id=salt_id),
+        ]
+    finally:
+        gc.enable()
+        if manager is not None:
+            manager.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+def test_v2_reused_prefix_does_not_emit_duplicate_stored_events():
+    init_cuda_once()
+    gc.collect()
+    gc.disable()
+
+    event_manager = KVCacheEventManager(max_kv_event_entries=16, window_size=128)
+    manager = None
+    try:
+        tokens_per_block = 4
+        manager = _create_test_manager(event_manager, tokens_per_block=tokens_per_block)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prefix_tokens = _token_ids(0, 2 * tokens_per_block)
+        new_tokens = _token_ids(2 * tokens_per_block, 3 * tokens_per_block)
+
+        _commit_and_close(manager, stream, prefix_tokens)
+        first_events = _flush_serialized_events(event_manager)
+        prefix_hashes = _stored_block_hashes(first_events)
+        assert len(prefix_hashes) == 2
+
+        _commit_and_close(
+            manager,
+            stream,
+            new_tokens,
+            input_tokens=prefix_tokens,
+        )
+        reuse_events = _flush_serialized_events(event_manager)
+        reused_hashes = _stored_block_hashes(reuse_events)
+
+        block0_key, block1_key, block2_key = _blockchain_keys(
+            tokens_per_block, [*prefix_tokens, *new_tokens]
+        )
+        prefix_keys = [block0_key, block1_key]
+
+        assert prefix_hashes == [key.hex() for key in prefix_keys]
+        assert reused_hashes == [block2_key.hex()]
+        assert not (set(prefix_hashes) & set(reused_hashes))
+    finally:
+        gc.enable()
+        if manager is not None:
+            manager.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+def test_v2_mm_partial_commit_reuses_actual_longer_block():
+    init_cuda_once()
+    gc.collect()
+    gc.disable()
+    event_manager = KVCacheEventManager(
+        max_kv_event_entries=16, window_size=128, mm_token_id_offset=1000
+    )
+    manager = None
+    try:
+        manager = _create_test_manager(event_manager, tokens_per_block=8)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        digest = bytes(range(32))
+        tokens = [0, digest, 1001, 1002, 1003, 5, 6, 7]
+        _commit_and_close(manager, stream, tokens)
+        first_events = _flush_serialized_events(event_manager)
+        first_block = _stored_events(first_events)[0]["data"]["blocks"][0]
+        assert first_block["mm_keys"] == [
+            {"type": "mm_key", "hash": digest.hex(), "start_offset": 0}
+        ]
+
+        # A shorter commit is already covered by the existing longer sibling.
+        # Event metadata follows that actual block, with no partial-key entry.
+        _commit_and_close(manager, stream, tokens[:6])
+        assert _stored_events(_flush_serialized_events(event_manager)) == []
+
+        manager.clear_reusable_blocks()
+        removal_events = _flush_serialized_events(event_manager)
+        assert [
+            block_hash
+            for event in removal_events
+            if event["data"]["type"] == "removed"
+            for block_hash in event["data"]["block_hashes"]
+        ] == [first_block["block_hash"]]
+
+        _commit_and_close(manager, stream, tokens[:6])
+        partial_events = _flush_serialized_events(event_manager)
+        partial_block = _stored_events(partial_events)[0]["data"]["blocks"][0]
+        assert partial_block["block_hash"] != first_block["block_hash"]
+        assert len(partial_block["tokens"]) == 6
+        assert partial_block["mm_keys"] == first_block["mm_keys"]
+    finally:
+        gc.enable()
+        if manager is not None:
+            manager.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+def test_v2_removed_events_match_stored_hashes():
+    init_cuda_once()
+    gc.collect()
+    gc.disable()
+
+    event_manager = KVCacheEventManager(max_kv_event_entries=16, window_size=128)
+    manager = None
+    try:
+        tokens_per_block = 4
+        manager = _create_test_manager(event_manager, tokens_per_block=tokens_per_block)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        tokens = _token_ids(0, 2 * tokens_per_block)
+
+        _commit_and_close(manager, stream, tokens)
+        stored_events = _flush_serialized_events(event_manager)
+        stored_hashes = _stored_block_hashes(stored_events)
+        assert len(stored_hashes) == 2
+
+        manager.clear_reusable_blocks()
+        removal_events = _flush_serialized_events(event_manager)
+        removed_hashes = [
+            block_hash
+            for event in removal_events
+            if event["data"]["type"] == "removed"
+            for block_hash in event["data"]["block_hashes"]
+        ]
+
+        assert set(removed_hashes) == set(stored_hashes)
+        assert len(removed_hashes) == len(stored_hashes)
+    finally:
+        gc.enable()
+        if manager is not None:
+            manager.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+def test_v2_removed_event_emitted_when_last_level_page_is_dropped():
+    init_cuda_once()
+    gc.collect()
+    gc.disable()
+
+    # A small sliding window keeps the SWA worst-case min_slots floor at a few
+    # blocks per pool group so the GPU level can be shrunk below the committed
+    # block count. (The deadlock-safety floor reserves the whole window, so a
+    # large window would make the resize-down infeasible.) With more committed
+    # blocks than fit after the shrink, the surplus reusable pages are dropped.
+    #
+    # Sizing matters for covering both layer groups. create_config alternates
+    # sliding_window_size by layer id, so layer group 0 is SWA and layer group 1 is full
+    # attention, and both share one pool group holding num_blocks * 2 pages. The pool
+    # group's floor is the sum of the two per-lifecycle floors: the SWA floor is
+    # num_sink_blocks + ceil((window - 1) / tokens_per_block) + 1 == 2 (the +1 is
+    # headroom for the slot-count oscillation as the window slides), and a full-attention
+    # lifecycle inherits the largest SWA floor, so the pool group cannot shrink below
+    # 2 + 2 == 4 slots. Eviction drops the stale SWA pages of layer group 0 first, so
+    # num_blocks must exceed the count that layer group 0 alone can absorb
+    # (num_blocks * 2 - 4 > num_blocks, i.e. num_blocks > 4) for the surplus to reach
+    # layer group 1 and exercise removal reporting for both groups.
+    tokens_per_block = 8
+    window_size = 8
+    num_blocks = 6
+    event_manager = KVCacheEventManager(max_kv_event_entries=16, window_size=window_size)
+    manager = None
+    try:
+        manager = _create_test_manager(
+            event_manager,
+            tokens_per_block=tokens_per_block,
+            gpu_quota=24 << 20,
+            window_size=window_size,
+            kv_buf_size=1 << 20,
+        )
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        kv_cache = manager.create_kv_cache()
+        assert kv_cache.resume(stream)
+        kv_cache.capacity = tokens_per_block * num_blocks
+        kv_cache.commit(_token_ids(0, tokens_per_block * num_blocks))
+
+        stored_events = _flush_serialized_events(event_manager)
+        stored_hashes_by_layer_group = _stored_block_hashes_by_layer_group(stored_events)
+        assert set(stored_hashes_by_layer_group) == {0, 1}
+        assert stored_hashes_by_layer_group[0] == stored_hashes_by_layer_group[1]
+
+        kv_cache.close()
+        del kv_cache
+        gc.collect()
+
+        assert manager.resize(CacheLevel(0), 8 << 20)
+        removal_events = _flush_serialized_events(event_manager)
+        removed_hashes_by_layer_group: dict[int, list] = {}
+        for event in removal_events:
+            if event["data"]["type"] == "removed":
+                removed_hashes_by_layer_group.setdefault(event["layer_group_id"], []).extend(
+                    event["data"]["block_hashes"]
+                )
+
+        # The shrink drops 12 - 4 == 8 pages: all 6 stale SWA pages of layer group 0 plus 2
+        # from layer group 1. Both layer groups therefore report removals, every removed
+        # hash must have been stored earlier for that same layer group, and each dropped
+        # page must be reported exactly once (removal is announced either per lifecycle or
+        # via whole-block removal when the last lifecycle page goes, never both).
+        assert set(removed_hashes_by_layer_group) == {0, 1}
+        for layer_group_id, removed_hashes in removed_hashes_by_layer_group.items():
+            assert removed_hashes
+            assert len(removed_hashes) == len(set(removed_hashes))
+            for removed_hash in removed_hashes:
+                assert removed_hash in stored_hashes_by_layer_group[layer_group_id]
+    finally:
+        gc.enable()
+        if manager is not None:
+            manager.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+def test_v2_kv_cache_event_manager_emits_updated_on_level_migration():
+    init_cuda_once()
+    gc.collect()
+    gc.disable()
+
+    # See test_v2_removed_event_emitted_when_last_level_page_is_dropped for why
+    # a small window is used: it keeps the min_slots floor low enough that the
+    # GPU level can be shrunk below the committed block count, forcing surplus
+    # reusable pages to migrate to host.
+    #
+    # More committed blocks and a deeper shrink than the removed-event test are
+    # used here on purpose: the GPU eviction/migration walks the two attention
+    # pool groups in insertion order, so the surplus must exceed the first pool
+    # group's block count for the second pool group to also migrate — only then
+    # do both layer groups emit an "updated" (GPU -> host) event.
+    tokens_per_block = 8
+    window_size = 8
+    num_blocks = 8
+    event_manager = KVCacheEventManager(max_kv_event_entries=64, window_size=window_size)
+    manager = None
+    try:
+        manager = _create_test_manager(
+            event_manager,
+            tokens_per_block=tokens_per_block,
+            gpu_quota=32 << 20,
+            host_quota=32 << 20,
+            window_size=window_size,
+            kv_buf_size=1 << 20,
+        )
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        kv_cache = manager.create_kv_cache()
+        assert kv_cache.resume(stream)
+        kv_cache.capacity = tokens_per_block * num_blocks
+        kv_cache.commit([TokenId(token_id) for token_id in range(tokens_per_block * num_blocks)])
+
+        stored_events = _flush_serialized_events(event_manager)
+        stored_hashes_by_layer_group = _stored_block_hashes_by_layer_group(stored_events)
+        assert set(stored_hashes_by_layer_group) == {0, 1}
+        assert stored_hashes_by_layer_group[0] == stored_hashes_by_layer_group[1]
+
+        kv_cache.close()
+        del kv_cache
+        gc.collect()
+
+        assert manager.resize(CacheLevel(0), 12 << 20)
+
+        event_manager.flush_iteration_events()
+        events = KVCacheEventSerializer.serialize(event_manager.get_latest_events())
+        updated_events = [event for event in events if event["data"]["type"] == "updated"]
+
+        # Pages evicted from GPU under memory pressure migrate to host, emitting
+        # an "updated" event (cache_level 0 -> 1) for each affected layer group.
+        assert updated_events
+        assert {event["layer_group_id"] for event in updated_events} == {0, 1}
+        for event in updated_events:
+            assert event["data"]["cache_level"] == {
+                "type": "event_diff",
+                "old_value": 0,
+                "new_value": 1,
+            }
+            assert event["data"]["priority"] is None
+            assert (
+                event["data"]["block_hash"] in stored_hashes_by_layer_group[event["layer_group_id"]]
+            )
+    finally:
+        gc.enable()
+        if manager is not None:
+            manager.shutdown()

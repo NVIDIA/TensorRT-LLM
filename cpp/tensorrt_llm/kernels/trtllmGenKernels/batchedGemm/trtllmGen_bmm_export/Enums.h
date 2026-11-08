@@ -1,0 +1,268 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
+ * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#pragma once
+
+#include <cstdint>
+
+namespace batchedGemm
+{
+
+namespace gemm
+{
+
+enum class AllReduceAlgo : uint32_t
+{
+    // Does not apply all-reduce.
+    None = 0,
+    // Reduction occurs at L2 cache; pulls N-1 partial outputs from peer devices. Result is
+    // non-deterministic. Potentially lower latency at cost of higher memory traffic.
+    OneShot,
+    // Reduction occurs at switch; pulls 1/Nth of the output from switch (reduce-scatter phase) and
+    // store to multicast mem (all-gather phase). Result is deterministic. Lower memory traffic at
+    // cost of potentially higher latency.
+    TwoShot,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+enum class MatrixLayout
+{
+    // K-major layout (default). [Mn, K]
+    MajorK = 0,
+    // M-major for A and N-major for B. [K, Mn]
+    MajorMn,
+    // Layout is blocked along the K dimension as seen in the diagram below. [K / blockK, Mn, blockK]
+    // where blockK is fixed at 128B
+    //
+    //         ├──────────────  K  ──────────────┤
+    //  ┬  ┬   ├──── K block ───┤
+    //  │  │   │ 0   1   2   3  ║ 32  33  34  35 │
+    //  │ CTA0 │ 4   5   6   7  ║ 36  37  38  39 │
+    //  │  │   │ 8   9   10  11 ║ 40  41  42  43 │
+    //  │  ┴   │ 12  13  14  15 ║ 44  45  46  47 │
+    //  M  ┬   ├────────────────║────────────────┤
+    //  │  │   │ 16  17  18  19 ║ 48  49  50  51 │
+    //  │ CTA1 │ 20  21  22  23 ║ 52  53  54  55 │
+    //  │  │   │ 24  25  26  27 ║ 56  57  58  59 │
+    //  ┴  ┴   │ 28  29  30  31 ║ 60  61  62  63 │
+    BlockMajorK
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+enum class SplitK : uint32_t
+{
+    // No split-k is needed. I.e. mNumSlicesForSplitK == 1.
+    None = 0,
+    // CTAs computing one MN tile save partial results to global memory.
+    // Then wait on the barrier and the last CTA in the group loads partial results from gmem,
+    // sums them up and writes back to gmem.
+    Gmem,
+    // All CTAs in one CGA calculate partial sums. Then send the results to the smem of
+    // the last CTA in the CGA, which sums them up and writes to gmem.
+    Dsmem,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+enum class BiasType : uint32_t
+{
+    // No bias.
+    None = 0,
+    // One bias value per N of the output tensor.
+    M = 1,
+    // One bias value per row M of the output tensor.
+    N = 2,
+    // One bias value for each element of the output tensor.
+    Mn = 3,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+enum class FusedBiasShuffleMode : uint32_t
+{
+    // BiasType::Mn layout is fully prepared by host preprocessing.
+    None = 0,
+    // The host skips only the bias shuffle and the kernel applies it while loading bias.
+    Shuffle,
+    // The host skips both the gated-act bias reorder and the bias shuffle; the kernel applies both
+    // while loading bias.
+    ReorderAndShuffle,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Type of the element-wise activation to apply after the Gemm
+enum class EltwiseActType
+{
+    None = 0,
+    // Gelu is defined as the following operation:
+    // act = x0 * phi(x0)
+    // where x0 is the output of the Gemm
+    // phi is the CDF of standard normal distribution approximated by
+    // phi(x) = 0.5 * (1 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+    Gelu,
+    // Relu2 (also known as squared Relu) is defined as the following operation:
+    // act = relu(x0) ^ 2
+    // where x0 is the output of the Gemm.
+    Relu2,
+    // Silu is defined as the following operation:
+    // act = x0 * sigmoid(x0)
+    // where x0 is the output of the Gemm.
+    Silu,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+enum class TileScheduler
+{
+    // Static scheduler (Non-persistent).
+    Static = 0,
+    // Dynamic persistent scheduler for SM100+.
+    Persistent,
+    // Static persistent scheduler. Launches a fixed grid size based on the number of SMs and uses
+    // the underlying PersistentTileSchedulerSm90 for static work distribution. Each CTA iterates
+    // through tiles and exits the loop by setting is_valid_tile to false when work is exhausted.
+    StaticPersistent,
+    // Dynamic persistent scheduler for SM90+ using atomicAdd on a global counter.
+    // Uses DynamicPersistentPipelinedTileSchedulerSm90 which enables work-stealing among CTAs
+    // by atomically fetching work tile indices from a global counter.
+    PersistentSm90,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Which task to fuse the persistent scheduler with.
+enum class SchedHostTask
+{
+    // The persistent scheduler has its own dedicated task.
+    Self = 0,
+    // The persistent scheduler is fused with the task loading A.
+    LoadA,
+    // The persistent scheduler is fused with the task loading B.
+    LoadB,
+    // The persistent scheduler is fused with the task loading scaling factors for A.
+    LoadSfA,
+    // The persistent scheduler is fused with the task loading scaling factors for B.
+    LoadSfB,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+enum class CtaSwizzleType : uint32_t
+{
+    // Rasterize CTAs along the M dimension.
+    RasterizeAlongM = 0,
+    // Rasterize CTAs along the N dimension.
+    RasterizeAlongN,
+    // Swizzle CTAs in zig-zag pattern along M dimension, Zig-zag width is 2.
+    ZigZagAlongM2,
+    // Swizzle CTAs in zig-zag pattern along N dimension, Zig-zag width is 2.
+    ZigZagAlongN2,
+    // Swizzle CTAs in zig-zag pattern along M dimension, Zig-zag width is 4.
+    ZigZagAlongM4,
+    // Swizzle CTAs in zig-zag pattern along N dimension, Zig-zag width is 4.
+    ZigZagAlongN4,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper functions to check the SplitK type.
+
+#define SPLIT_K_FUNCTION(Mode)                                                                                         \
+    inline bool doesSplitKUse##Mode(SplitK mode)                                                                       \
+    {                                                                                                                  \
+        return (mode == SplitK::Mode);                                                                                 \
+    }
+
+SPLIT_K_FUNCTION(Gmem)
+SPLIT_K_FUNCTION(Dsmem)
+
+#undef SPLIT_K_FUNCTION
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper functions to check the Bias type.
+
+#define BIAS_TYPE_FUNCTION(Mode)                                                                                       \
+    inline bool isBiasType##Mode(BiasType type)                                                                        \
+    {                                                                                                                  \
+        return (type == BiasType::Mode);                                                                               \
+    }
+
+BIAS_TYPE_FUNCTION(None)
+BIAS_TYPE_FUNCTION(N)
+BIAS_TYPE_FUNCTION(M)
+BIAS_TYPE_FUNCTION(Mn)
+
+#undef BIAS_TYPE_FUNCTION
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#define FUSED_BIAS_SHUFFLE_MODE_FUNCTION(Mode)                                                                         \
+    inline bool isFusedBiasShuffleMode##Mode(FusedBiasShuffleMode mode)                                                \
+    {                                                                                                                  \
+        return (mode == FusedBiasShuffleMode::Mode);                                                                   \
+    }
+
+FUSED_BIAS_SHUFFLE_MODE_FUNCTION(None)
+FUSED_BIAS_SHUFFLE_MODE_FUNCTION(Shuffle)
+FUSED_BIAS_SHUFFLE_MODE_FUNCTION(ReorderAndShuffle)
+
+#undef FUSED_BIAS_SHUFFLE_MODE_FUNCTION
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline bool usesFusedBiasShuffle(FusedBiasShuffleMode mode)
+{
+    return !isFusedBiasShuffleModeNone(mode);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline bool usesFusedBiasReorder(FusedBiasShuffleMode mode)
+{
+    return isFusedBiasShuffleModeReorderAndShuffle(mode);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper function to check if a scheduler is persistent.
+inline bool isPersistentScheduler(TileScheduler scheduler)
+{
+    return scheduler == TileScheduler::Persistent || scheduler == TileScheduler::StaticPersistent
+        || scheduler == TileScheduler::PersistentSm90;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Helper function to check if CTA rasterization order is compatible with clean early exit of the
+// kernel. Clean early exit requires CTA indices to increase monotonically along the batch
+// dimension, so when a CTA exits the kernel early, it exits with all valid tiles already done.
+// Zigzag or batch-major patterns are NOT compatible because they may cause valid tiles to be
+// skipped when exiting early.
+inline bool supportsCleanEarlyExit(CtaSwizzleType swizzleType, bool batchM, TileScheduler /* scheduler */)
+{
+    return (
+        batchM ? (swizzleType == CtaSwizzleType::RasterizeAlongN) : (swizzleType == CtaSwizzleType::RasterizeAlongM));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+} // namespace gemm
+
+} // namespace batchedGemm

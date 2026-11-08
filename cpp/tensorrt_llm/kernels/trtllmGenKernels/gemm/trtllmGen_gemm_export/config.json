@@ -1,0 +1,596 @@
+{
+    "_note": "107a kernels use 2x mmaK relative to 100f/100a/103a for FP8 and FP4",
+    "templates": {
+        "GemmFp4LowLatency": {
+            "patchF2fp": false,
+            "dtypeA": "e2m1",
+            "dtypeC": "e2m1",
+            "mmaM": 128,
+            "mmaN": 8,
+            "tileM": 128,
+            "tileN": 8,
+            "tileK": 512,
+            "epilogueTileM": 128,
+            "epilogueTileN": 8,
+            "numStages": 4,
+            "numStagesMma": 1,
+            "numSlicesForSplitK": 1,
+            "useTwoTmaLoadWarps": true,
+            "clusterDimX": 1,
+            "clusterDimY": 1,
+            "clusterDimZ": 1,
+            "transposeMmaOutput": true,
+            "useShuffledMatrix": true,
+            "useDeepSeekFp8": false,
+            "useTmaStore": true,
+            "useCustomMmaSchedule": true,
+            "sfLayoutB": "8x4",
+            "sfLayoutC": "8x4",
+            "gridTriggerSecondaryB": true,
+            "gridWaitForPrimaryA": false,
+            "gridWaitForPrimaryB": true,
+            "usePdl": true
+        },
+        "GemmFp4Throughput": {
+            "patchF2fp": false,
+            "dtypeA": "e2m1",
+            "dtypeC": "e2m1",
+            "mmaM": 128,
+            "mmaN": 128,
+            "tileM": 128,
+            "tileN": 128,
+            "tileK": 256,
+            "epilogueTileM": 128,
+            "epilogueTileN": 128,
+            "numStages": 3,
+            "numStagesMma": 1,
+            "numSlicesForSplitK": 1,
+            "useTwoTmaLoadWarps": true,
+            "clusterDimX": 1,
+            "clusterDimY": 1,
+            "clusterDimZ": 1,
+            "transposeMmaOutput": false,
+            "useShuffledMatrix": false,
+            "useDeepSeekFp8": false,
+            "useTmaStore": true,
+            "useCustomMmaSchedule": true,
+            "sfLayoutB": "128x4",
+            "sfLayoutC": "128x4",
+            "gridTriggerSecondaryA": true,
+            "gridTriggerSecondaryB": false,
+            "gridWaitForPrimaryA": true,
+            "gridWaitForPrimaryB": false,
+            "usePdl": true
+        },
+        "GemmPerTensorScalingFp8Throughput": {
+            "patchF2fp": false,
+            "dtypeA": "e4m3",
+            "dtypeC": "e4m3",
+            "mmaM": 128,
+            "mmaN": 128,
+            "tileM": 128,
+            "tileN": 128,
+            "tileK": 256,
+            "epilogueTileM": 128,
+            "epilogueTileN": 128,
+            "numStages": 3,
+            "numStagesMma": 1,
+            "numSlicesForSplitK": 1,
+            "useTwoTmaLoadWarps": true,
+            "clusterDimX": 1,
+            "clusterDimY": 1,
+            "clusterDimZ": 1,
+            "transposeMmaOutput": false,
+            "useShuffledMatrix": false,
+            "useDeepSeekFp8": false,
+            "useTmaStore": true,
+            "useCustomMmaSchedule": true,
+            "gridTriggerSecondaryA": true,
+            "gridTriggerSecondaryB": false,
+            "gridWaitForPrimaryA": true,
+            "gridWaitForPrimaryB": false,
+            "usePdl": true
+        },
+        "GemmPerTensorScalingFp8LowLatency": {
+            "patchF2fp": false,
+            "dtypeA": "e4m3",
+            "dtypeC": "e4m3",
+            "mmaM": 128,
+            "mmaN": 8,
+            "tileM": 128,
+            "tileN": 8,
+            "tileK": 512,
+            "epilogueTileM": 128,
+            "epilogueTileN": 8,
+            "numStages": 3,
+            "numStagesMma": 1,
+            "useTwoTmaLoadWarps": true,
+            "clusterDimX": 1,
+            "clusterDimY": 1,
+            "transposeMmaOutput": true,
+            "useShuffledMatrix": true,
+            "useDeepSeekFp8": false,
+            "useTmaStore": true,
+            "useCustomMmaSchedule": true,
+            "gridTriggerSecondaryB": true,
+            "gridWaitForPrimaryA": false,
+            "gridWaitForPrimaryB": true,
+            "usePdl": true
+        },
+        "GemmDeepSeekFp8LowLatency": {
+            "patchF2fp": false,
+            "dtypeA": "e4m3",
+            "dtypeC": "e4m3",
+            "mmaM": 64,
+            "mmaN": 8,
+            "tileM": 128,
+            "tileN": 8,
+            "tileK": 128,
+            "epilogueTileM": 64,
+            "epilogueTileN": 8,
+            "numStages": 4,
+            "numSlicesForSplitK": 1,
+            "useTwoTmaLoadWarps": true,
+            "clusterDimX": 1,
+            "clusterDimY": 1,
+            "clusterDimZ": 1,
+            "transposeMmaOutput": true,
+            "useShuffledMatrix": false,
+            "useDeepSeekFp8": true,
+            "useTmaStore": true,
+            "useCustomMmaSchedule": true,
+            "gridTriggerSecondaryB": true,
+            "gridWaitForPrimaryA": false,
+            "gridWaitForPrimaryB": true,
+            "hoistMmaTaskTryWaits": true,
+            "numStagesMma": 2,
+            "numStagesMmaWithinWorkTile": 2,
+            "useTwoMmaWarps": true,
+            "usePdl": true
+        },
+        "GemmDeepSeekFp8Throughput": {
+            "patchF2fp": false,
+            "dtypeA": "e4m3",
+            "dtypeC": "e4m3",
+            "mmaM": 64,
+            "tileM": 128,
+            "tileK": 128,
+            "epilogueTileM": 64,
+            "numStages": 4,
+            "numSlicesForSplitK": 1,
+            "useTwoTmaLoadWarps": true,
+            "clusterDimX": 1,
+            "clusterDimY": 1,
+            "clusterDimZ": 1,
+            "transposeMmaOutput": true,
+            "useShuffledMatrix": false,
+            "useDeepSeekFp8": true,
+            "useTmaStore": true,
+            "useCustomMmaSchedule": true,
+            "hoistMmaTaskTryWaits": true,
+            "numStagesMma": 2,
+            "numStagesMmaWithinWorkTile": 2,
+            "useTwoMmaWarps": true,
+            "usePdl": true,
+            "gridTriggerSecondaryA": true,
+            "gridTriggerSecondaryB": false,
+            "gridWaitForPrimaryA": true,
+            "gridWaitForPrimaryB": false
+        },
+        "GemmMxE2m1MxE4m3LowLatency": {
+            "patchF2fp": false,
+            "dtypeA": "mxe2m1",
+            "dtypeB": "mxe4m3",
+            "dtypeC": "mxe4m3",
+            "mmaM": 128,
+            "mmaN": 8,
+            "tileM": 128,
+            "tileN": 8,
+            "tileK": 512,
+            "epilogueTileM": 128,
+            "epilogueTileN": 8,
+            "numStages": 3,
+            "numStagesMma": 1,
+            "numSlicesForSplitK": 1,
+            "useTwoTmaLoadWarps": true,
+            "clusterDimX": 1,
+            "clusterDimY": 1,
+            "clusterDimZ": 1,
+            "transposeMmaOutput": true,
+            "useShuffledMatrix": true,
+            "useDeepSeekFp8": false,
+            "useTmaStore": true,
+            "useCustomMmaSchedule": true,
+            "sfLayoutB": "8x4",
+            "sfLayoutC": "8x4",
+            "gridTriggerSecondaryB": true,
+            "gridWaitForPrimaryA": false,
+            "gridWaitForPrimaryB": true,
+            "usePdl": true
+        },
+        "GemmFp4xFp8": {
+            "patchF2fp": false,
+            "dtypeA": "e2m1",
+            "dtypeMmaA": "e4m3",
+            "dtypeB": "e4m3",
+            "dtypeC": "fp16",
+            "sfBlockSizeA": 32,
+            "sfLayoutA": "128x4",
+            "mmaM": 128,
+            "tileM": 128,
+            "epilogueTileM": 128,
+            "numStages": 2,
+            "useTwoTmaLoadWarps": true,
+            "transposeMmaOutput": true,
+            "useShuffledMatrix": true,
+            "useCustomMmaSchedule": true,
+            "numStagesMma": 1,
+            "useTwoMmaWarps": false,
+            "usePdl": true,
+            "tileScheduler": "persistent"
+        }
+    },
+    "configs": [
+        {
+            "_comment": "FP4 LowLatency",
+            "_template": "GemmFp4LowLatency",
+            "dtypeC": [
+                "bf16",
+                "fp16",
+                "fp32"
+            ],
+            "mmaK,smVersion": [
+                [
+                    64,
+                    "100f"
+                ],
+                [
+                    64,
+                    "100a"
+                ],
+                [
+                    64,
+                    "103a"
+                ],
+                [
+                    128,
+                    "107a"
+                ]
+            ]
+        },
+        {
+            "_comment": "FP4 Throughput",
+            "_template": "GemmFp4Throughput",
+            "dtypeC": [
+                "bf16",
+                "fp16",
+                "fp32"
+            ],
+            "mmaK,smVersion": [
+                [
+                    64,
+                    "100f"
+                ],
+                [
+                    64,
+                    "100a"
+                ],
+                [
+                    64,
+                    "103a"
+                ],
+                [
+                    128,
+                    "107a"
+                ]
+            ]
+        },
+        {
+            "_comment": "FP8 Per-Tensor Scaling Throughput (e4m3)",
+            "_template": "GemmPerTensorScalingFp8Throughput",
+            "dtypeC": [
+                "e4m3"
+            ],
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ],
+                [
+                    32,
+                    "100a"
+                ],
+                [
+                    32,
+                    "103a"
+                ],
+                [
+                    64,
+                    "107a"
+                ]
+            ]
+        },
+        {
+            "_comment": "FP8 Per-Tensor Scaling Throughput (bf16/fp16)",
+            "_template": "GemmPerTensorScalingFp8Throughput",
+            "dtypeC": [
+                "bf16",
+                "fp16"
+            ],
+            "numStages": 2,
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ],
+                [
+                    32,
+                    "100a"
+                ],
+                [
+                    32,
+                    "103a"
+                ],
+                [
+                    64,
+                    "107a"
+                ]
+            ]
+        },
+        {
+            "_comment": "FP8 Per-Tensor Scaling Low Latency (splitK=2)",
+            "_template": "GemmPerTensorScalingFp8LowLatency",
+            "dtypeC": [
+                "bf16",
+                "fp16",
+                "e4m3"
+            ],
+            "numSlicesForSplitK": 2,
+            "clusterDimZ": 2,
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ],
+                [
+                    32,
+                    "100a"
+                ],
+                [
+                    32,
+                    "103a"
+                ],
+                [
+                    64,
+                    "107a"
+                ]
+            ]
+        },
+        {
+            "_comment": "FP8 Per-Tensor Scaling Low Latency (splitK=1)",
+            "_template": "GemmPerTensorScalingFp8LowLatency",
+            "dtypeC": [
+                "bf16",
+                "fp16",
+                "e4m3"
+            ],
+            "numSlicesForSplitK": 1,
+            "clusterDimZ": 1,
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ],
+                [
+                    32,
+                    "100a"
+                ],
+                [
+                    32,
+                    "103a"
+                ],
+                [
+                    64,
+                    "107a"
+                ]
+            ]
+        },
+        {
+            "_comment": "DeepSeek FP8 Low Latency - mmaK stays 32 on 107a (mmaM=64 does not support mmaK=64)",
+            "_template": "GemmDeepSeekFp8LowLatency",
+            "dtypeC": [
+                "bf16",
+                "fp16",
+                "e4m3"
+            ],
+            "useUnrollLoop2xForMma": [
+                true,
+                false
+            ],
+            "mmaK": 32,
+            "smVersion": [
+                "100f",
+                "100a",
+                "103a",
+                "107a"
+            ]
+        },
+        {
+            "_comment": "DeepSeek FP8 Throughput TileN 16 - mmaK stays 32 on 107a",
+            "_template": "GemmDeepSeekFp8Throughput",
+            "dtypeC": [
+                "bf16",
+                "fp16",
+                "e4m3"
+            ],
+            "useUnrollLoop2xForMma": [
+                true,
+                false
+            ],
+            "mmaN": 16,
+            "tileN": 16,
+            "epilogueTileN": 16,
+            "mmaK": 32,
+            "smVersion": [
+                "100f",
+                "100a",
+                "103a",
+                "107a"
+            ]
+        },
+        {
+            "_comment": "DeepSeek FP8 Throughput TileN 32 - mmaK stays 32 on 107a",
+            "_template": "GemmDeepSeekFp8Throughput",
+            "dtypeC": [
+                "bf16",
+                "fp16",
+                "e4m3"
+            ],
+            "useUnrollLoop2xForMma": [
+                true,
+                false
+            ],
+            "mmaN": 32,
+            "tileN": 32,
+            "epilogueTileN": 32,
+            "mmaK": 32,
+            "smVersion": [
+                "100f",
+                "100a",
+                "103a",
+                "107a"
+            ]
+        },
+        {
+            "_comment": "DeepSeek FP8 Throughput TileN 64 - mmaK stays 32 on 107a",
+            "_template": "GemmDeepSeekFp8Throughput",
+            "dtypeC": [
+                "bf16",
+                "fp16",
+                "e4m3"
+            ],
+            "useUnrollLoop2xForMma": [
+                true,
+                false
+            ],
+            "mmaN": 64,
+            "tileN": 64,
+            "epilogueTileN": 64,
+            "mmaK": 32,
+            "smVersion": [
+                "100f",
+                "100a",
+                "103a",
+                "107a"
+            ]
+        },
+        {
+            "_comment": "DeepSeek FP8 Throughput TileN 128 - mmaK stays 32 on 107a",
+            "_template": "GemmDeepSeekFp8Throughput",
+            "dtypeC": [
+                "bf16",
+                "fp16",
+                "e4m3"
+            ],
+            "useUnrollLoop2xForMma": [
+                true,
+                false
+            ],
+            "mmaN": 128,
+            "tileN": 128,
+            "epilogueTileN": 128,
+            "mmaK": 32,
+            "smVersion": [
+                "100f",
+                "100a",
+                "103a",
+                "107a"
+            ]
+        },
+        {
+            "_comment": "MxFp4 x MxFp8 Low Latency",
+            "_template": "GemmMxE2m1MxE4m3LowLatency",
+            "dtypeC": [
+                "bf16",
+                "fp16",
+                "fp32",
+                "mxe4m3"
+            ],
+            "mmaK,smVersion": [
+                [
+                    32,
+                    "100f"
+                ],
+                [
+                    32,
+                    "100a"
+                ],
+                [
+                    32,
+                    "103a"
+                ],
+                [
+                    64,
+                    "107a"
+                ]
+            ]
+        },
+        {
+            "_comment": "Fp4xFp8 - 100f only",
+            "_template": "GemmFp4xFp8",
+            "dtypeC": [
+                "bf16",
+                "fp16",
+                "e4m3"
+            ],
+            "useUnrollLoop2xForMma": [
+                true,
+                false
+            ],
+            "mmaK": 32,
+            "smVersion": "100f",
+            "mmaN,tileN,epilogueTileN,tileK,numSlicesForSplitK,clusterDimZ": [
+                [
+                    8,
+                    8,
+                    8,
+                    512,
+                    2,
+                    2
+                ],
+                [
+                    16,
+                    16,
+                    16,
+                    512,
+                    2,
+                    2
+                ],
+                [
+                    32,
+                    32,
+                    32,
+                    512,
+                    2,
+                    2
+                ],
+                [
+                    64,
+                    64,
+                    64,
+                    512,
+                    2,
+                    2
+                ],
+                [
+                    128,
+                    128,
+                    128,
+                    256,
+                    1,
+                    1
+                ]
+            ]
+        }
+    ]
+}

@@ -1,0 +1,993 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Test PipelineLoader with VisualGenArgs API."""
+
+import json
+import os
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.nn as nn
+from utils.llm_data import get_checkpoint
+
+from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
+
+# Skip heavy components (text_encoder ~44GB, vae ~300MB) to speed up tests
+# These components are loaded via diffusers and don't need quantization testing
+SKIP_HEAVY_COMPONENTS = [
+    PipelineComponent.TEXT_ENCODER,
+    PipelineComponent.VAE,
+    PipelineComponent.TOKENIZER,
+    PipelineComponent.SCHEDULER,
+]
+
+
+@pytest.fixture
+def checkpoint_path() -> str:
+    return get_checkpoint("Wan2.1-T2V-1.3B-Diffusers")
+
+
+def test_meta_init_mode_creates_meta_tensors(checkpoint_path) -> None:
+    """Test that MetaInitMode creates tensors on meta device (no GPU memory)."""
+    from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm._torch.visual_gen.models import AutoPipeline
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    # Load config directly
+    args = VisualGenArgs(model=checkpoint_path)
+    config = DiffusionPipelineConfig.from_pretrained(
+        checkpoint_path,
+        args=args,
+    )
+
+    # Create pipeline WITH MetaInitMode
+    with MetaInitMode():
+        pipeline = AutoPipeline.from_config(config, checkpoint_path)
+
+    # Verify tensors are on meta device (no GPU memory allocated)
+    param = next(pipeline.transformer.parameters())
+    assert param.device.type == "meta", f"Expected meta device, got {param.device}"
+
+
+def _write_dual_transformer_checkpoint(tmp_path, quant_algos):
+    """Write two Wan component configs with distinguishable architecture and quantization."""
+    (tmp_path / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "WanPipeline",
+                "boundary_ratio": 0.875,
+                "transformer": ["diffusers", "WanTransformer3DModel"],
+                "transformer_2": ["diffusers", "WanTransformer3DModel"],
+            }
+        )
+    )
+    for index, (component_name, num_layers, num_attention_heads) in enumerate(
+        (("transformer", 40, 40), ("transformer_2", 48, 32))
+    ):
+        component_dir = tmp_path / component_name
+        component_dir.mkdir()
+        component_config = {
+            "_class_name": "WanTransformer3DModel",
+            "num_layers": num_layers,
+            "num_attention_heads": num_attention_heads,
+        }
+        if quant_algos[index] is not None:
+            component_config["quantization_config"] = {
+                "quant_algo": quant_algos[index],
+                "ignore": [f"blocks.{index}.*"],
+                "config_groups": {
+                    "default": {
+                        "weights": {"dynamic": index == 0},
+                        "input_activations": {"dynamic": index == 1},
+                    }
+                },
+            }
+        (component_dir / "config.json").write_text(json.dumps(component_config))
+
+
+_NO_QUANT = (None, None, False, False)
+_PRIMARY_FP8 = (QuantAlgo.FP8, ["blocks.0.*"], True, False)
+_SECONDARY_FP8 = (QuantAlgo.FP8, ["blocks.1.*"], False, True)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "quant_algos, user_quant, expected_quant",
+    [
+        pytest.param((None, None), None, (_NO_QUANT, _NO_QUANT), id="bf16_bf16"),
+        pytest.param(("FP8", None), {}, (_PRIMARY_FP8, _NO_QUANT), id="fp8_bf16"),
+        pytest.param((None, "FP8"), None, (_NO_QUANT, _SECONDARY_FP8), id="bf16_fp8"),
+        pytest.param(
+            ("FP8", "FP8"),
+            {"quant_algo": None},
+            (_PRIMARY_FP8, _SECONDARY_FP8),
+            id="fp8_fp8",
+        ),
+        pytest.param(
+            (None, "FP8"),
+            {"quant_algo": "FP8", "dynamic": True, "ignore": ["runtime.*"]},
+            ((QuantAlgo.FP8, ["runtime.*"], True, False),) * 2,
+            id="dict_override",
+        ),
+        pytest.param(
+            ("FP8", None),
+            QuantConfig(quant_algo=QuantAlgo.FP8, exclude_modules=["runtime.*"]),
+            ((QuantAlgo.FP8, ["runtime.*"], False, False),) * 2,
+            id="quant_config_override",
+        ),
+    ],
+)
+def test_dual_transformer_checkpoint_creates_distinct_model_configs(
+    tmp_path, quant_algos, user_quant, expected_quant
+):
+    """Resolve each component's metadata independently unless an explicit user algorithm overrides it."""
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    _write_dual_transformer_checkpoint(tmp_path, quant_algos)
+    config = DiffusionPipelineConfig.from_pretrained(
+        str(tmp_path),
+        args=VisualGenArgs(model=str(tmp_path), quant_config=user_quant),
+        device="cpu",
+    )
+
+    assert set(config.model_configs) == {"transformer", "transformer_2"}
+    transformer_config = config.model_configs["transformer"]
+    transformer_2_config = config.model_configs["transformer_2"]
+    assert transformer_config is not transformer_2_config
+    assert transformer_config.pretrained_config is not transformer_2_config.pretrained_config
+    assert transformer_config.attention is not transformer_2_config.attention
+    assert transformer_config.attention is not config.attention
+    assert transformer_config.pretrained_config.num_layers == 40
+    assert transformer_config.pretrained_config.num_attention_heads == 40
+    assert transformer_2_config.pretrained_config.num_layers == 48
+    assert transformer_2_config.pretrained_config.num_attention_heads == 32
+    assert transformer_config.quant_config is not transformer_2_config.quant_config
+    assert transformer_config.quant_config is not config.quant_config
+    for component_config, expected in zip(
+        (transformer_config, transformer_2_config), expected_quant
+    ):
+        algo, excluded, dynamic_weights, dynamic_activations = expected
+        assert component_config.quant_config.quant_algo == algo
+        assert component_config.quant_config.exclude_modules == excluded
+        assert component_config.quant_config_dict is None
+        assert component_config.dynamic_weight_quant is dynamic_weights
+        assert component_config.force_dynamic_quantization is dynamic_activations
+    assert config.quant_config == transformer_config.quant_config
+    assert config.dynamic_weight_quant is transformer_config.dynamic_weight_quant
+    assert config.force_dynamic_quantization is transformer_config.force_dynamic_quantization
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("target_component", ["transformer", "transformer_2"])
+def test_runtime_lora_checks_target_component_quantization(tmp_path, target_component):
+    """Reject a quantized LoRA target without rejecting an untargeted quantized component."""
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.visual_gen.args import RuntimeLoRAConfig, VisualGenArgs
+
+    _write_dual_transformer_checkpoint(tmp_path, (None, "FP8"))
+    args = VisualGenArgs(
+        model=str(tmp_path),
+        runtime_lora_config=RuntimeLoRAConfig(
+            path=str(tmp_path / "adapter.safetensors"),
+            target_components=[target_component],
+        ),
+    )
+    if target_component == "transformer_2":
+        with pytest.raises(ValueError, match=r"quantization \(transformer_2: FP8\)"):
+            DiffusionPipelineConfig.from_pretrained(str(tmp_path), args=args, device="cpu")
+    else:
+        config = DiffusionPipelineConfig.from_pretrained(str(tmp_path), args=args, device="cpu")
+        assert config.runtime_lora.target_components == [target_component]
+
+
+def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch):
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
+    from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+    from tensorrt_llm.visual_gen.args import RuntimeLoRAConfig, VisualGenArgs
+
+    events = []
+
+    class FakePipeline(nn.Module):
+        transformer_components = []
+
+        def __init__(self, config):
+            super().__init__()
+            self.pipeline_config = config
+            self.offloader = PipelineOffloader(self)
+
+        def to(self, device):
+            return self
+
+        def offload_pipeline_components(self):
+            return {}
+
+        def load_transformer_weights(self, checkpoint_dir):
+            events.append("load_transformer_weights")
+            return {}
+
+        def load_weights(self, weights):
+            events.append("load_weights")
+
+        def load_standard_components(self, checkpoint_dir, device, skip_components=None, **kwargs):
+            events.append("load_standard_components")
+
+        def post_load_weights(self):
+            events.append("post_load_weights")
+
+        def _setup_runtime_lora(self):
+            events.append("runtime_lora")
+
+        def initialize_offload_pipeline(self):
+            self.offloader.initialize()
+
+        def torch_compile(self):
+            pass
+
+        def _setup_cache_acceleration(self):
+            events.append("cache_acceleration")
+
+    args = VisualGenArgs(
+        model="/tmp/model",
+        runtime_lora_config=RuntimeLoRAConfig(path="/tmp/lora.safetensors"),
+    )
+    config = DiffusionPipelineConfig(runtime_lora=args.runtime_lora_config)
+
+    monkeypatch.setattr(PipelineLoader, "_resolve_checkpoint_dir", lambda self, path: path)
+    monkeypatch.setattr(PipelineLoader, "_resolve_pipeline_config", lambda self, path: {})
+    monkeypatch.setattr(
+        DiffusionPipelineConfig,
+        "from_pretrained",
+        staticmethod(lambda checkpoint_dir, args=None, **kwargs: config),
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.visual_gen.pipeline_loader.AutoPipeline.from_config",
+        lambda config, checkpoint_dir: FakePipeline(config),
+    )
+    monkeypatch.setattr(
+        PipelineLoader,
+        "_materialize_meta_tensors",
+        lambda self, pipeline, cpu_offload_modules=None: None,
+    )
+
+    PipelineLoader(args, device="cpu").load(skip_warmup=True)
+
+    assert events.index("runtime_lora") > events.index("post_load_weights")
+
+
+def test_vae_conv_quant_config_is_independent_from_transformer(tmp_path):
+    """VAE and transformer precision can be selected independently."""
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    (tmp_path / "model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "WanPipeline",
+                "transformer": ["diffusers", "WanTransformer3DModel"],
+                "vae": ["diffusers", "AutoencoderKLWan"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    transformer_dir = tmp_path / "transformer"
+    transformer_dir.mkdir()
+    (transformer_dir / "config.json").write_text(
+        json.dumps({"_class_name": "WanTransformer3DModel"}),
+        encoding="utf-8",
+    )
+    vae_dir = tmp_path / "vae"
+    vae_dir.mkdir()
+    (vae_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "AutoencoderKLWan",
+                "quantization_config": {"quant_algo": "NVFP4"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = DiffusionPipelineConfig.from_pretrained(
+        str(tmp_path),
+        args=VisualGenArgs(
+            model=str(tmp_path),
+            quant_config={"quant_algo": "FP8", "dynamic": True},
+            vae_config={
+                "quant_conv_config": {
+                    "ignore": ["decoder.up_blocks.0.*"],
+                    "config_groups": {
+                        "default": {
+                            "weights": {"dynamic": False},
+                            "input_activations": {"dynamic": True},
+                        }
+                    },
+                }
+            },
+        ),
+    )
+
+    assert config.quant_config.quant_algo == QuantAlgo.FP8
+    assert config.primary_model_config.quant_config.quant_algo == QuantAlgo.FP8
+    assert config.vae_conv_quant_config is not None
+    assert config.vae_conv_quant_config.quant_algo == QuantAlgo.NVFP4
+    assert config.vae_conv_quant_config.is_module_excluded_from_quantization(
+        "decoder.up_blocks.0.resnets.0.conv1"
+    )
+    assert config.vae_conv_dynamic_weight_quant is False
+    assert config.vae_conv_dynamic_activation_quant is True
+
+
+@pytest.mark.parametrize(
+    ("vae_conv_quant_config", "checkpoint_quant_config"),
+    [
+        ({"quant_algo": "NVFP4"}, None),
+        (None, {"quant_algo": "NVFP4"}),
+    ],
+)
+def test_auto_pipeline_rejects_nvfp4_vae_for_unsupported_pipeline(
+    monkeypatch,
+    vae_conv_quant_config,
+    checkpoint_quant_config,
+):
+    """Reject explicit and checkpoint-driven NVFP4 before pipeline construction."""
+    from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    monkeypatch.setattr(
+        AutoPipeline,
+        "_detect_from_checkpoint",
+        staticmethod(lambda _: "FluxPipeline"),
+    )
+    explicit_config = (
+        QuantConfig(quant_algo=QuantAlgo.NVFP4) if vae_conv_quant_config is not None else None
+    )
+    vae_model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(quantization_config=checkpoint_quant_config)
+    )
+    config = SimpleNamespace(
+        vae_conv_quant_config=explicit_config,
+        model_configs={"vae": vae_model_config},
+    )
+
+    with pytest.raises(ValueError, match="NVFP4 VAE is not supported by FluxPipeline"):
+        AutoPipeline.from_config(config, "/unused")
+
+
+def test_pipeline_vae_quant_validation_allows_supported_or_disabled_nvfp4():
+    from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    checkpoint_config = SimpleNamespace(
+        model_configs={
+            "vae": SimpleNamespace(
+                pretrained_config=SimpleNamespace(quantization_config={"quant_algo": "NVFP4"})
+            )
+        }
+    )
+    checkpoint_config.vae_conv_quant_config = None
+    AutoPipeline._validate_vae_quantization(
+        checkpoint_config,
+        "WanPipeline",
+        PIPELINE_REGISTRY["WanPipeline"],
+    )
+
+    # A supported pipeline can dequantize a packed checkpoint when FP4 is disabled.
+    checkpoint_config.vae_conv_quant_config = QuantConfig()
+    AutoPipeline._validate_vae_quantization(
+        checkpoint_config,
+        "WanPipeline",
+        PIPELINE_REGISTRY["WanPipeline"],
+    )
+
+    # A disabled VAE config is also valid for an unquantized unsupported family.
+    checkpoint_config.model_configs["vae"].pretrained_config.quantization_config = None
+    AutoPipeline._validate_vae_quantization(
+        checkpoint_config,
+        "FluxPipeline",
+        PIPELINE_REGISTRY["FluxPipeline"],
+    )
+
+
+def test_auto_pipeline_rejects_unsupported_explicit_vae_quant_algo(monkeypatch):
+    from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    monkeypatch.setattr(
+        AutoPipeline,
+        "_detect_from_checkpoint",
+        staticmethod(lambda _: "WanPipeline"),
+    )
+    config = SimpleNamespace(
+        vae_conv_quant_config=QuantConfig(quant_algo=QuantAlgo.FP8),
+        model_configs={},
+    )
+
+    with pytest.raises(ValueError, match="VAE quantization supports only NVFP4"):
+        AutoPipeline.from_config(config, "/unused")
+
+
+def test_auto_pipeline_rejects_unsupported_checkpoint_vae_quant_algo(monkeypatch):
+    from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline
+
+    monkeypatch.setattr(
+        AutoPipeline,
+        "_detect_from_checkpoint",
+        staticmethod(lambda _: "WanPipeline"),
+    )
+    config = SimpleNamespace(
+        vae_conv_quant_config=None,
+        model_configs={
+            "vae": SimpleNamespace(
+                pretrained_config=SimpleNamespace(quantization_config={"quant_algo": "FP8"})
+            )
+        },
+    )
+
+    with pytest.raises(ValueError, match="VAE checkpoint quantization supports only NVFP4"):
+        AutoPipeline.from_config(config, "/unused")
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ({"quant_algo": "NVFP4"}, (None, None)),
+        ({"quant_algo": "NVFP4", "dynamic": True}, (True, True)),
+        ({"quant_algo": "NVFP4", "dynamic": False}, (False, False)),
+        (
+            {
+                "quant_algo": "NVFP4",
+                "config_groups": {
+                    "default": {
+                        "weights": {"dynamic": False},
+                        "input_activations": {"dynamic": True},
+                    }
+                },
+            },
+            (False, True),
+        ),
+        (
+            {
+                "quant_algo": "NVFP4",
+                "config_groups": {"default": {"weights": {"dynamic": True}}},
+            },
+            (True, None),
+        ),
+    ],
+)
+def test_parse_vae_dynamic_quantization_modes(raw, expected):
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    quant_config, dynamic_weight, dynamic_activation = (
+        DiffusionPipelineConfig.load_vae_conv_quant_config(raw)
+    )
+
+    assert quant_config.quant_algo == QuantAlgo.NVFP4
+    assert (dynamic_weight, dynamic_activation) == expected
+
+
+def test_vae_conv_quant_config_dict_inherits_checkpoint_algorithm():
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    quant_config, dynamic_weight, dynamic_activation = (
+        DiffusionPipelineConfig.load_vae_conv_quant_config(
+            {"ignore": ["decoder.conv1"]},
+            {"quant_algo": "NVFP4", "dynamic": False},
+        )
+    )
+
+    assert quant_config.quant_algo == QuantAlgo.NVFP4
+    assert quant_config.is_module_excluded_from_quantization("decoder.conv1")
+    # Checkpoint metadata is authoritative for packed tensors and scales, but
+    # only explicit user dynamic settings override the loader's auto mode.
+    assert dynamic_weight is None
+    assert dynamic_activation is None
+
+    explicit_none, _, _ = DiffusionPipelineConfig.load_vae_conv_quant_config(
+        {"quant_algo": None},
+        {"quant_algo": "NVFP4"},
+    )
+    assert explicit_none.quant_algo == QuantAlgo.NVFP4
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        (
+            {
+                "quant_algo": "NVFP4",
+                "dynamic": True,
+                "config_groups": {"default": {}},
+            },
+            "cannot specify both",
+        ),
+        (
+            {
+                "quant_algo": "NVFP4",
+                "config_groups": {"first": {}, "second": {}},
+            },
+            "exactly one",
+        ),
+        ({"quant_algo": "NVFP4", "config_groups": []}, "exactly one"),
+        (
+            {"quant_algo": "NVFP4", "config_groups": {"default": True}},
+            "must contain a dictionary",
+        ),
+        (
+            {
+                "quant_algo": "NVFP4",
+                "config_groups": {"default": {"weights": True}},
+            },
+            "section 'weights' must contain a dictionary",
+        ),
+        ({"quant_algo": "NVFP4", "dynamic": 1}, "must be a boolean"),
+        ({"quant_algo": "FP8", "dynamic": True}, "require quant_algo='NVFP4'"),
+    ],
+)
+def test_reject_invalid_vae_dynamic_quantization_modes(raw, message):
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+
+    with pytest.raises(ValueError, match=message):
+        DiffusionPipelineConfig.load_vae_conv_quant_config(raw)
+
+
+def test_load_wan_pipeline_basic(checkpoint_path) -> None:
+    """Test basic loading without quantization using VisualGenArgs."""
+    from tensorrt_llm._torch.visual_gen import PipelineLoader
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    # Simple one-liner with VisualGenArgs
+    # Skip text_encoder/vae to speed up test (focus on transformer)
+    args = VisualGenArgs(
+        model=checkpoint_path,
+    )
+    pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_HEAVY_COMPONENTS)
+
+    # Verify pipeline type
+    assert pipeline.__class__.__name__ == "WanPipeline"
+    assert pipeline.transformer is not None
+
+    # Verify text_encoder/vae were skipped
+    assert pipeline.text_encoder is None, "text_encoder should be skipped"
+    assert pipeline.vae is None, "vae should be skipped"
+
+    # Verify weights are loaded (not meta tensors)
+    param = next(pipeline.transformer.parameters())
+    assert param.device.type == "cuda"
+    assert param.dtype in [torch.float32, torch.bfloat16, torch.float16]
+
+
+def test_load_wan_pipeline_with_fp8_dynamic_quant(checkpoint_path) -> None:
+    """Test loading with FP8 dynamic quantization using VisualGenArgs.
+
+    Verifies the dynamic quantization flow:
+    1. Config has dynamic_weight_quant=True when linear.type="trtllm-fp8-per-tensor"
+    2. Model Linear layers have FP8 weight buffers
+    3. BF16 checkpoint weights are quantized on-the-fly
+    4. Quantized weights are in FP8 format
+    """
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm._torch.visual_gen import PipelineLoader
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    # Use VisualGenArgs with FP8 quantization
+    # Skip text_encoder/vae to speed up test (focus on transformer quantization)
+    args = VisualGenArgs(
+        model=checkpoint_path,
+        quant_config={"quant_algo": "FP8", "dynamic": True},
+    )
+    pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_HEAVY_COMPONENTS)
+
+    # Verify model config has dynamic_weight_quant enabled
+    assert pipeline.pipeline_config.dynamic_weight_quant is True, (
+        "dynamic_weight_quant should be True when linear.type specifies FP8"
+    )
+
+    # Verify FP8 weights in transformer Linear layers
+    found_fp8_linear = False
+    for name, module in pipeline.transformer.named_modules():
+        if isinstance(module, Linear):
+            if hasattr(module, "weight") and module.weight is not None:
+                assert module.weight.dtype == torch.float8_e4m3fn, (
+                    f"Linear {name} weight dtype is {module.weight.dtype}, expected float8_e4m3fn"
+                )
+                assert hasattr(module, "weight_scale") and module.weight_scale is not None, (
+                    f"Linear {name} missing weight_scale buffer"
+                )
+                found_fp8_linear = True
+                break
+
+    assert found_fp8_linear, "No FP8 Linear modules found in transformer"
+
+
+def test_load_wan_pipeline_with_fp8_rowwise(checkpoint_path) -> None:
+    """Test loading with FP8 row-wise (per-channel-per-token) dynamic quantization.
+
+    Verifies:
+    1. Config parses FP8_PER_CHANNEL_PER_TOKEN and sets dynamic_weight_quant=True
+    2. Linear weights are FP8 after loading
+    3. weight_scale is 1-D [out_features] — one scale per output row, not a scalar
+    """
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm._torch.visual_gen import PipelineLoader
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    args = VisualGenArgs(
+        model=checkpoint_path,
+        quant_config={"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN", "dynamic": True},
+    )
+    pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_HEAVY_COMPONENTS)
+
+    assert pipeline.pipeline_config.dynamic_weight_quant is True
+
+    found_fp8_linear = False
+    for name, module in pipeline.transformer.named_modules():
+        if isinstance(module, Linear):
+            if hasattr(module, "weight") and module.weight is not None:
+                assert module.weight.dtype == torch.float8_e4m3fn, (
+                    f"Linear {name} weight dtype is {module.weight.dtype}, expected float8_e4m3fn"
+                )
+                assert hasattr(module, "weight_scale") and module.weight_scale is not None, (
+                    f"Linear {name} missing weight_scale"
+                )
+                # Per-channel: one scale per output neuron, not a scalar
+                assert module.weight_scale.dim() == 1, (
+                    f"Linear {name} weight_scale should be 1-D [out_features], "
+                    f"got shape {tuple(module.weight_scale.shape)}"
+                )
+                assert module.weight_scale.shape[0] == module.weight.shape[0], (
+                    f"Linear {name} weight_scale length {module.weight_scale.shape[0]} "
+                    f"!= out_features {module.weight.shape[0]}"
+                )
+                found_fp8_linear = True
+                break
+
+    assert found_fp8_linear, "No FP8 Linear modules found in transformer"
+
+
+def test_load_wan_pipeline_with_fp8_blockwise(checkpoint_path) -> None:
+    """Test loading with FP8 blockwise quantization using VisualGenArgs."""
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm._torch.visual_gen import PipelineLoader
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    # Skip text_encoder/vae to speed up test (focus on transformer quantization)
+    args = VisualGenArgs(
+        model=checkpoint_path,
+        quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
+    )
+    pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_HEAVY_COMPONENTS)
+
+    # Verify FP8 weights
+    for name, module in pipeline.transformer.named_modules():
+        if isinstance(module, Linear):
+            if hasattr(module, "weight") and module.weight is not None:
+                assert module.weight.dtype == torch.float8_e4m3fn, (
+                    f"Linear {name} should have FP8 weight"
+                )
+                break
+
+
+def test_visual_gen_args_to_quant_config():
+    """Test that VisualGenArgs accepts ModelOpt-format quant_config dicts.
+
+    The dict stays a dict on the public schema; DiffusionPipelineConfig
+    parses it (via load_diffusion_quant_config) when a pipeline loads.
+    """
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    parse = DiffusionPipelineConfig.load_diffusion_quant_config
+
+    # Default — no quantization. default_factory creates a QuantConfig
+    # instance with quant_algo=None.
+    args = VisualGenArgs(model="/fake/path")
+    assert isinstance(args.quant_config, QuantConfig)
+    assert args.quant_config.quant_algo is None
+
+    # FP8 per-tensor — dict accepted as-is.
+    args = VisualGenArgs(
+        model="/fake/path",
+        quant_config={"quant_algo": "FP8", "dynamic": True},
+    )
+    qc, _, dwq, _ = parse(args.quant_config)
+    assert qc.quant_algo == QuantAlgo.FP8
+    assert dwq is True
+
+    # FP8 blockwise
+    args = VisualGenArgs(
+        model="/fake/path",
+        quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
+    )
+    qc, _, _, _ = parse(args.quant_config)
+    assert qc.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+
+    # FP8 rowwise (per-token activations, per-channel weights)
+    args = VisualGenArgs(
+        model="/fake/path",
+        quant_config={"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN", "dynamic": True},
+    )
+    qc, _, dwq, _ = parse(args.quant_config)
+    assert qc.quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
+    assert dwq is True
+
+    # NVFP4
+    args = VisualGenArgs(
+        model="/fake/path",
+        quant_config={"quant_algo": "NVFP4", "dynamic": True},
+    )
+    qc, _, _, _ = parse(args.quant_config)
+    assert qc.quant_algo == QuantAlgo.NVFP4
+
+    # With ignore patterns (exclude_modules)
+    args = VisualGenArgs(
+        model="/fake/path",
+        quant_config={
+            "quant_algo": "FP8",
+            "ignore": ["blocks.0.attn1.*", "proj_out"],
+            "config_groups": {
+                "group_0": {
+                    "weights": {"dynamic": True, "num_bits": 8, "type": "float"},
+                    "targets": ["Linear"],
+                }
+            },
+        },
+    )
+    qc, _, dwq, _ = parse(args.quant_config)
+    assert qc.quant_algo == QuantAlgo.FP8
+    assert qc.exclude_modules == ["blocks.0.attn1.*", "proj_out"]
+    assert dwq is True
+
+
+def test_load_without_quant_config_no_fp8(checkpoint_path) -> None:
+    """Test that loading without quant_config does NOT produce FP8 weights."""
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm._torch.visual_gen import PipelineLoader
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    # No quantization specified
+    # Skip text_encoder/vae to speed up test (focus on transformer)
+    args = VisualGenArgs(
+        model=checkpoint_path,
+    )
+    pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_HEAVY_COMPONENTS)
+
+    # Verify dynamic_weight_quant is False
+    assert pipeline.pipeline_config.dynamic_weight_quant is False, (
+        "dynamic_weight_quant should be False when no quant_config"
+    )
+
+    # Verify NO FP8 weights
+    for name, module in pipeline.transformer.named_modules():
+        if isinstance(module, Linear):
+            if hasattr(module, "weight") and module.weight is not None:
+                assert module.weight.dtype != torch.float8_e4m3fn, (
+                    f"Linear {name} should NOT be FP8 without quant_config"
+                )
+                break
+
+
+def test_visual_gen_args_from_dict():
+    """Test VisualGenArgs can be created from a dictionary."""
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    config_dict = {
+        "model": "/path/to/model",
+        "quant_config": {"quant_algo": "FP8", "dynamic": True},
+        "parallel_config": {"ulysses_size": 2},
+    }
+    # ParallelConfig validator requires WORLD_SIZE >= total parallel
+    old_world = os.environ.get("WORLD_SIZE")
+    try:
+        os.environ["WORLD_SIZE"] = "2"
+        args = VisualGenArgs(**config_dict)
+        assert args.model == "/path/to/model"
+        qc, _, dwq, _ = DiffusionPipelineConfig.load_diffusion_quant_config(args.quant_config)
+        assert qc.quant_algo == QuantAlgo.FP8
+        assert dwq is True
+        assert args.parallel_config.ulysses_size == 2
+    finally:
+        if old_world is not None:
+            os.environ["WORLD_SIZE"] = old_world
+        elif "WORLD_SIZE" in os.environ:
+            del os.environ["WORLD_SIZE"]
+
+
+# =============================================================================
+# Memory and Performance Tests
+# =============================================================================
+
+
+def _get_module_memory_gb(module):
+    """Get GPU memory usage of a module in GB."""
+    return sum(p.numel() * p.element_size() for p in module.parameters()) / 1024**3
+
+
+def _get_cuda_memory_gb():
+    """Get current CUDA memory allocated in GB."""
+    return torch.cuda.memory_allocated() / 1024**3
+
+
+def _get_cuda_peak_memory_gb():
+    """Get peak CUDA memory allocated in GB."""
+    return torch.cuda.max_memory_allocated() / 1024**3
+
+
+def test_fp8_vs_bf16_memory_comparison(checkpoint_path) -> None:
+    """Test FP8 dynamic quant uses ~2x less memory than BF16, including peak memory.
+
+    This test verifies that dynamic quantization doesn't create unnecessary
+    intermediate buffers that would negate the memory savings.
+
+    Expected for Wan 1.3B transformer:
+    - BF16: ~2.6 GB model memory, similar peak during loading
+    - FP8:  ~1.3 GB model memory, peak should be < 2x BF16 peak
+    """
+    from tensorrt_llm._torch.visual_gen import PipelineLoader
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    # =========================================================================
+    # Test 1: Load BF16 (no quantization)
+    # =========================================================================
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
+    args_bf16 = VisualGenArgs(
+        model=checkpoint_path,
+    )
+    pipeline_bf16 = PipelineLoader(args_bf16).load(
+        skip_warmup=True, skip_components=SKIP_HEAVY_COMPONENTS
+    )
+
+    bf16_model_mem = _get_module_memory_gb(pipeline_bf16.transformer)
+    bf16_total_mem = _get_cuda_memory_gb()
+    bf16_peak_mem = _get_cuda_peak_memory_gb()
+
+    print(f"\n[BF16] Transformer model memory: {bf16_model_mem:.2f} GB")
+    print(f"[BF16] Total CUDA memory: {bf16_total_mem:.2f} GB")
+    print(f"[BF16] Peak CUDA memory: {bf16_peak_mem:.2f} GB")
+
+    # Cleanup BF16
+    del pipeline_bf16
+    torch.cuda.empty_cache()
+
+    # =========================================================================
+    # Test 2: Load FP8 (dynamic quantization)
+    # =========================================================================
+    torch.cuda.reset_peak_memory_stats()
+
+    args_fp8 = VisualGenArgs(
+        model=checkpoint_path,
+        quant_config={"quant_algo": "FP8", "dynamic": True},
+    )
+    pipeline_fp8 = PipelineLoader(args_fp8).load(
+        skip_warmup=True, skip_components=SKIP_HEAVY_COMPONENTS
+    )
+
+    fp8_model_mem = _get_module_memory_gb(pipeline_fp8.transformer)
+    fp8_total_mem = _get_cuda_memory_gb()
+    fp8_peak_mem = _get_cuda_peak_memory_gb()
+
+    print(f"\n[FP8] Transformer model memory: {fp8_model_mem:.2f} GB")
+    print(f"[FP8] Total CUDA memory: {fp8_total_mem:.2f} GB")
+    print(f"[FP8] Peak CUDA memory: {fp8_peak_mem:.2f} GB")
+
+    # =========================================================================
+    # Verify memory savings
+    # =========================================================================
+    model_mem_ratio = bf16_model_mem / fp8_model_mem
+    peak_mem_ratio = bf16_peak_mem / fp8_peak_mem
+
+    print(f"\n[Comparison] Model memory ratio (BF16/FP8): {model_mem_ratio:.2f}x")
+    print(f"[Comparison] Peak memory ratio (BF16/FP8): {peak_mem_ratio:.2f}x")
+
+    # Model memory should be ~2x smaller for FP8
+    assert model_mem_ratio > 1.8, (
+        f"FP8 model memory should be ~2x smaller than BF16, got {model_mem_ratio:.2f}x"
+    )
+
+    # Peak memory during loading should also show savings
+    # Allow some overhead for dynamic quant, but should still be significantly better
+    assert peak_mem_ratio > 1.5, (
+        f"FP8 peak memory should be significantly smaller than BF16, got {peak_mem_ratio:.2f}x. "
+        f"This may indicate unnecessary intermediate buffers during dynamic quantization."
+    )
+
+    # FP8 peak should not be much higher than FP8 final (no large temp buffers)
+    fp8_peak_overhead = fp8_peak_mem / fp8_total_mem
+    print(f"[FP8 Per-Tensor] Peak/Final memory ratio: {fp8_peak_overhead:.2f}x")
+
+    # Peak should be close to final (< 1.5x overhead during loading)
+    assert fp8_peak_overhead < 2.0, (
+        f"FP8 peak memory ({fp8_peak_mem:.2f} GB) is too high compared to final "
+        f"({fp8_total_mem:.2f} GB). Ratio: {fp8_peak_overhead:.2f}x. "
+        f"This suggests unnecessary buffer allocation during dynamic quantization."
+    )
+
+    # Cleanup
+    del pipeline_fp8
+    torch.cuda.empty_cache()
+
+    # =========================================================================
+    # Test 3: Load FP8 Blockwise (dynamic quantization with block scales)
+    # =========================================================================
+    torch.cuda.reset_peak_memory_stats()
+
+    args_fp8_block = VisualGenArgs(
+        model=checkpoint_path,
+        quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
+    )
+    pipeline_fp8_block = PipelineLoader(args_fp8_block).load(
+        skip_warmup=True, skip_components=SKIP_HEAVY_COMPONENTS
+    )
+
+    fp8_block_model_mem = _get_module_memory_gb(pipeline_fp8_block.transformer)
+    fp8_block_total_mem = _get_cuda_memory_gb()
+    fp8_block_peak_mem = _get_cuda_peak_memory_gb()
+
+    print(f"\n[FP8 Blockwise] Transformer model memory: {fp8_block_model_mem:.2f} GB")
+    print(f"[FP8 Blockwise] Total CUDA memory: {fp8_block_total_mem:.2f} GB")
+    print(f"[FP8 Blockwise] Peak CUDA memory: {fp8_block_peak_mem:.2f} GB")
+
+    # =========================================================================
+    # Verify FP8 Blockwise memory savings
+    # =========================================================================
+    block_model_mem_ratio = bf16_model_mem / fp8_block_model_mem
+    block_peak_mem_ratio = bf16_peak_mem / fp8_block_peak_mem
+
+    print(f"\n[Comparison] Model memory ratio (BF16/FP8-Block): {block_model_mem_ratio:.2f}x")
+    print(f"[Comparison] Peak memory ratio (BF16/FP8-Block): {block_peak_mem_ratio:.2f}x")
+
+    # FP8 Blockwise has additional scale tensors, so slightly less than 2x savings
+    # But should still be significantly better than BF16
+    assert block_model_mem_ratio > 1.5, (
+        f"FP8 Blockwise model memory should be significantly smaller than BF16, got {block_model_mem_ratio:.2f}x"
+    )
+
+    # Peak memory check
+    assert block_peak_mem_ratio > 1.3, (
+        f"FP8 Blockwise peak memory should be smaller than BF16, got {block_peak_mem_ratio:.2f}x"
+    )
+
+    fp8_block_peak_overhead = fp8_block_peak_mem / fp8_block_total_mem
+    print(f"[FP8 Blockwise] Peak/Final memory ratio: {fp8_block_peak_overhead:.2f}x")
+
+    assert fp8_block_peak_overhead < 2.0, (
+        f"FP8 Blockwise peak memory ({fp8_block_peak_mem:.2f} GB) is too high compared to final "
+        f"({fp8_block_total_mem:.2f} GB). Ratio: {fp8_block_peak_overhead:.2f}x."
+    )
+
+    # Cleanup
+    del pipeline_fp8_block
+    torch.cuda.empty_cache()
+
+    # =========================================================================
+    # Summary
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    print(f"BF16:           {bf16_model_mem:.2f} GB model, {bf16_peak_mem:.2f} GB peak")
+    print(
+        f"FP8 Per-Tensor: {fp8_model_mem:.2f} GB model, {fp8_peak_mem:.2f} GB peak "
+        f"({model_mem_ratio:.2f}x savings)"
+    )
+    print(
+        f"FP8 Blockwise:  {fp8_block_model_mem:.2f} GB model, {fp8_block_peak_mem:.2f} GB peak "
+        f"({block_model_mem_ratio:.2f}x savings)"
+    )

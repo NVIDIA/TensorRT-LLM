@@ -1,0 +1,154 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
+# AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not
+# use this file except in compliance with the License. You may obtain a copy of
+# the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations under
+# the License.
+
+add_subdirectory(bounce)
+
+# ============================================================================
+# NIXL Wrapper Library
+# ============================================================================
+if(NIXL_ROOT)
+  find_package(NIXL REQUIRED)
+  # Check if all required packages were found
+  if(NOT NIXL_FOUND)
+    message(
+      FATAL_ERROR "NIXL not found. Please install NIXL or set `NIXL_ROOT`.")
+  endif()
+
+  # Define the NIXL wrapper target
+  set(NIXL_WRAPPER_TARGET "tensorrt_llm_nixl_wrapper")
+
+  # Add the NIXL wrapper target
+  add_library(${NIXL_WRAPPER_TARGET} SHARED transferAgent.cpp)
+  target_compile_options(${NIXL_WRAPPER_TARGET} PRIVATE -Wno-error)
+
+  # Add include directories
+  target_include_directories(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
+  target_include_directories(${NIXL_WRAPPER_TARGET}
+                             PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
+  # Link against all NIXL libraries
+  target_link_libraries(
+    ${NIXL_WRAPPER_TARGET}
+    PRIVATE NIXL::nixl tllm::common_environment tllm::executor_transfer_agent
+            tllm::kv_cache_legacy tllm::runtime_distributed)
+
+  # Link against CUDA runtime (for cudaMemcpy in posix fallback)
+  target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)
+
+  # ------------------------------------------------------------------------
+  # Bounce v2 transport. Its real dependencies are NIXL (data plane, gated by
+  # the NIXL_ROOT block above) + zmq (control plane) — NOT UCX. So compile it
+  # whenever zmq is available, INDEPENDENT of ENABLE_UCX. cppzmq (header-only)
+  # is fetched at the top level when NIXL or UCX is on. Activates the
+  # TLLM_BOUNCE_V2 code paths; runtime use is still opt-in via
+  # CacheTransceiverConfig (kv_cache_bounce_size_mb > 0, Python (v2) transceiver
+  # only).
+  # ------------------------------------------------------------------------
+  if(TARGET tllm_executor_bounce_control)
+    target_sources(${NIXL_WRAPPER_TARGET} PRIVATE bounce/BounceTransport.cpp)
+    target_link_libraries(
+      ${NIXL_WRAPPER_TARGET}
+      PRIVATE
+        $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_executor_bounce_core,tllm_executor_bounce_cuda,tllm_executor_bounce_arena,tllm_executor_bounce_control>
+        ${NIXL_BUILD_LIBRARY})
+    target_compile_definitions(${NIXL_WRAPPER_TARGET} PRIVATE TLLM_BOUNCE_V2=1)
+    # The .cu device symbols must resolve into this shared lib.
+    set_target_properties(${NIXL_WRAPPER_TARGET}
+                          PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+    message(STATUS "NIXL bounce v2: enabled (libzmq and cppzmq found)")
+  else()
+    message(
+      STATUS
+        "NIXL bounce v2: disabled - libzmq or cppzmq unavailable; kv_cache_bounce_size_mb > 0 will fail at startup with this build"
+    )
+  endif()
+
+  set(NIXL_ENABLED TRUE)
+else()
+  set(NIXL_ENABLED FALSE)
+endif()
+
+# ============================================================================
+# Check if Mooncake wrapper is available (built in mooncake_utils)
+# ============================================================================
+if(MOONCAKE_ROOT AND TARGET tensorrt_llm_mooncake_wrapper)
+  set(MOONCAKE_ENABLED TRUE)
+else()
+  set(MOONCAKE_ENABLED FALSE)
+endif()
+
+# ============================================================================
+# TensorRT-LLM Transfer Agent Binding Python Module Build if either NIXL or
+# Mooncake is enabled
+# ============================================================================
+if(NIXL_ENABLED OR MOONCAKE_ENABLED)
+  set(TRANSFER_AGENT_BINDING_TARGET "tensorrt_llm_transfer_agent_binding")
+
+  # Collect binding source files
+  set(AGENT_BINDING_SOURCES "")
+  list(APPEND AGENT_BINDING_SOURCES agentBindings.cpp)
+
+  # NOSTRIP: Disable stripping for BOLT compatibility (requires --emit-relocs)
+  if(ENABLE_BOLT_COMPATIBLE)
+    nanobind_add_module(${TRANSFER_AGENT_BINDING_TARGET} NOSTRIP
+                        ${AGENT_BINDING_SOURCES})
+  else()
+    nanobind_add_module(${TRANSFER_AGENT_BINDING_TARGET}
+                        ${AGENT_BINDING_SOURCES})
+  endif()
+  message(STATUS "Building tensorrt_llm_transfer_agent_binding with nanobind")
+
+  target_compile_options(${TRANSFER_AGENT_BINDING_TARGET} PRIVATE -Wno-error)
+
+  # Add common include directories
+  target_include_directories(${TRANSFER_AGENT_BINDING_TARGET}
+                             PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
+  # Conditionally add NIXL support
+  if(NIXL_ENABLED)
+    target_compile_definitions(${TRANSFER_AGENT_BINDING_TARGET}
+                               PRIVATE ENABLE_NIXL)
+    target_include_directories(${TRANSFER_AGENT_BINDING_TARGET}
+                               PRIVATE NIXL::nixl)
+    target_link_libraries(${TRANSFER_AGENT_BINDING_TARGET}
+                          PRIVATE ${NIXL_WRAPPER_TARGET})
+    target_link_libraries(${TRANSFER_AGENT_BINDING_TARGET} PRIVATE NIXL::nixl)
+    message(STATUS "Transfer agent binding: NIXL support enabled")
+  endif()
+
+  # Conditionally add Mooncake support NOTE: We intentionally do NOT link
+  # against tensorrt_llm_mooncake_wrapper here. The mooncake wrapper (and its
+  # dependency libtransfer_engine.so) is loaded lazily via DynLibLoader::dlopen
+  # in makeTransferAgent("mooncake", ...) at runtime. This allows the binding
+  # module to be imported even when Mooncake is not installed.
+  if(MOONCAKE_ENABLED)
+    target_compile_definitions(${TRANSFER_AGENT_BINDING_TARGET}
+                               PRIVATE ENABLE_MOONCAKE)
+    message(
+      STATUS "Transfer agent binding: Mooncake support enabled (lazy loading)")
+  endif()
+
+  # Common dependencies
+  target_link_libraries(${TRANSFER_AGENT_BINDING_TARGET} PRIVATE CUDA::cudart)
+  target_link_libraries(${TRANSFER_AGENT_BINDING_TARGET}
+                        PRIVATE ${SHARED_TARGET})
+
+  # Set RPATH for the module to find wrapper libraries
+  set_target_properties(
+    ${TRANSFER_AGENT_BINDING_TARGET}
+    PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/libs;$ORIGIN/libs/nixl"
+               INSTALL_RPATH "$ORIGIN;$ORIGIN/libs;$ORIGIN/libs/nixl")
+
+endif()

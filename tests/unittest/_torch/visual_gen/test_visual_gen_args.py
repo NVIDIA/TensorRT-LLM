@@ -1,0 +1,923 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for VisualGenArgs construction, validation, and serialization."""
+
+import itertools
+import pickle
+from unittest.mock import MagicMock, patch
+
+import pytest
+from pydantic import ValidationError
+
+from tensorrt_llm.visual_gen.args import (
+    AttentionConfig,
+    CacheDiTConfig,
+    CompilationConfig,
+    CudaGraphConfig,
+    ParallelConfig,
+    QuantAttentionConfig,
+    RuntimeLoRAConfig,
+    SkipSoftmaxAttentionConfig,
+    TeaCacheConfig,
+    TorchCompileConfig,
+    VAEConfig,
+    VideoSparseAttentionConfig,
+    VisualGenArgs,
+)
+
+pytestmark = pytest.mark.cpu_only
+
+
+class TestVisualGenArgsStrictValidation:
+    """extra='forbid' rejects unknown fields at every nesting level."""
+
+    def test_unknown_top_level_field_rejected(self):
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            VisualGenArgs(model="/tmp/model", unknown_field="bad")
+
+    def test_typo_field_rejected(self):
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            VisualGenArgs(model="/tmp/model", chekpoint_path="/typo")
+
+    def test_nested_parallel_unknown_field_rejected(self):
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            VisualGenArgs(
+                model="/tmp/model",
+                parallel_config={"cfg_size": 1, "nonexistent_param": 42},
+            )
+
+    def test_nested_attention_unknown_field_rejected(self):
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            AttentionConfig(backend="VANILLA", extra_key="bad")
+
+    def test_nested_vae_unknown_field_rejected(self):
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            VisualGenArgs(model="/tmp/model", vae_config={"unknown_field": True})
+
+    def test_nested_teacache_unknown_field_rejected(self):
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            TeaCacheConfig(unknown_opt=True)
+
+    def test_nested_torch_compile_unknown_field_rejected(self):
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            TorchCompileConfig(enable=True, bad_key=1)
+
+    def test_nested_cuda_graph_unknown_field_rejected(self):
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            CudaGraphConfig(enable=False, extra=True)
+
+    def test_nested_warmup_unknown_field_rejected(self):
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            CompilationConfig(resolutions=[(480, 832)], bad_field=True)
+
+    def test_nested_runtime_lora_unknown_field_rejected(self):
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            RuntimeLoRAConfig(path="/tmp/lora.safetensors", unknown_opt=True)
+
+    def test_legacy_linear_field_rejected(self):
+        """The removed 'linear' YAML field must now cause an error."""
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            VisualGenArgs(
+                model="/tmp/model",
+                linear={"type": "default"},
+            )
+
+
+class TestAttentionConfigQuantValidation:
+    """Unsupported quantized-attention recipes are rejected with ValueError."""
+
+    def test_quant_config_rejected_on_unsupported_backend(self):
+        with pytest.raises(ValidationError, match="requires backend in"):
+            AttentionConfig(
+                backend="VANILLA",
+                quant_attention_config=QuantAttentionConfig(),
+            )
+
+    def test_quant_config_rejected_when_unsupported(self):
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+                AttentionConfig(
+                    backend="TRTLLM",
+                    quant_attention_config=QuantAttentionConfig(
+                        qk_dtype="int8", q_block_size=1, k_block_size=127, v_block_size=1
+                    ),
+                )
+
+    def test_vsa_and_quantization_compose_only_on_trtllm(self):
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            sage = QuantAttentionConfig(
+                qk_dtype="fp8", q_block_size=1, k_block_size=1, v_block_size=1
+            )
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=sage,
+                sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
+            )
+            assert attention.quant_attention_config is sage
+
+            with pytest.raises(
+                ValidationError, match="VSA and quant_attention_config are mutually exclusive"
+            ):
+                AttentionConfig(
+                    backend="CUTEDSL",
+                    quant_attention_config=QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8"),
+                    sparse_attention_config=VideoSparseAttentionConfig(vsa_sparsity=0.9),
+                )
+
+    def test_skip_softmax_and_sage_quantization_can_be_combined(self):
+        # int8 Q/K SAGE has a compiled cubin only on SM100; pin the SM so this
+        # combination check is host-independent (CI CPU stages have no GPU).
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype="int8",
+                    q_block_size=1,
+                    k_block_size=4,
+                    v_block_size=1,
+                ),
+                sparse_attention_config=SkipSoftmaxAttentionConfig(threshold_scale_factor=0.3),
+            )
+
+        assert attention.sparse_attention_config is not None
+        assert attention.sparse_attention_config.algorithm == "skip_softmax"
+
+    @pytest.mark.parametrize(
+        ("sm_ver", "qk_dtype", "q_block_size", "k_block_size", "v_block_size"),
+        [
+            (90, "int8", 2, 16, 1),
+            (100, "int8", 1, 1, 1),
+            (100, "int8", 1, 4, 1),
+            (100, "int8", 1, 16, 1),
+            (100, "fp8", 1, 1, 1),
+            (100, "fp8", 1, 4, 1),
+            (100, "fp8", 1, 16, 1),
+            (103, "fp8", 1, 1, 1),
+            (103, "fp8", 1, 4, 1),
+            (103, "fp8", 1, 16, 1),
+            (100, "bf16", 0, 0, 0),
+            (100, "fp8", 0, 0, 0),
+            (103, "bf16", 0, 0, 0),
+            (103, "fp8", 0, 0, 0),
+        ],
+    )
+    def test_supported_quant_config_trtllm(
+        self, sm_ver, qk_dtype, q_block_size, k_block_size, v_block_size
+    ):
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype=qk_dtype,
+                    q_block_size=q_block_size,
+                    k_block_size=k_block_size,
+                    v_block_size=v_block_size,
+                ),
+            )
+
+        assert attention.quant_attention_config is not None
+
+    @pytest.mark.parametrize("sm_ver", [100, 103])
+    @pytest.mark.parametrize("qk_dtype", ["bf16", "fp8"])
+    @pytest.mark.parametrize("vc_repair_budget", [0.0, 0.005])
+    def test_supported_quant_config_vc_attention(self, sm_ver, qk_dtype, vc_repair_budget):
+        """VC-Attention-QK16 and VC-Attention-QK8 validate on Blackwell, with tile means or repair rows."""
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype=qk_dtype, vc_attention=True, vc_repair_budget=vc_repair_budget
+                ),
+            )
+
+        assert attention.quant_attention_config.vc_attention
+        assert attention.quant_attention_config.vc_repair_budget == vc_repair_budget
+        q_config = attention.quant_attention_config
+        assert (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size) == (
+            (0, 0, 1) if qk_dtype == "bf16" else (128, 128, 1)
+        )
+
+    @pytest.mark.parametrize(
+        ("backend", "sm_ver", "quant", "sparse", "match"),
+        [
+            (
+                "TRTLLM",
+                100,
+                dict(qk_dtype="fp8", q_block_size=1, k_block_size=16, v_block_size=1),
+                None,
+                "fixes the block sizes",
+            ),
+            (
+                "TRTLLM",
+                100,
+                dict(qk_dtype="bf16", vc_attention=False, vc_repair_budget=0.005),
+                None,
+                "vc_repair_budget is a VC-Attention",
+            ),
+            ("TRTLLM", 100, dict(qk_dtype="bf16", vc_repair_budget=-0.1), None, "vc_repair_budget"),
+            ("TRTLLM", 100, dict(qk_dtype="bf16", vc_repair_budget=1.0), None, "vc_repair_budget"),
+            (
+                "TRTLLM",
+                100,
+                dict(qk_dtype="bf16", smooth_k=True),
+                None,
+                "are SageAttention options",
+            ),
+            (
+                "TRTLLM",
+                100,
+                dict(qk_dtype="bf16", smooth_v=True),
+                None,
+                "are SageAttention options",
+            ),
+            ("TRTLLM", 90, dict(qk_dtype="bf16"), None, "Supported VC-Attention recipes"),
+            ("TRTLLM", 120, dict(qk_dtype="bf16"), None, "Supported VC-Attention recipes"),
+            (
+                "TRTLLM",
+                100,
+                dict(qk_dtype="bf16"),
+                VideoSparseAttentionConfig(vsa_sparsity=0.9),
+                "does not compose with sparse_attention",
+            ),
+            (
+                "TRTLLM",
+                100,
+                dict(qk_dtype="bf16"),
+                SkipSoftmaxAttentionConfig(threshold_scale_factor=0.3),
+                "does not compose with sparse_attention",
+            ),
+            (
+                "CUTEDSL",
+                100,
+                dict(qk_dtype="bf16"),
+                None,
+                "vc_attention is a TRTLLM backend option",
+            ),
+            ("CUDNN", 100, dict(qk_dtype="bf16"), None, "vc_attention is a TRTLLM backend option"),
+            (
+                "FLASHINFER",
+                100,
+                dict(qk_dtype="bf16"),
+                None,
+                "vc_attention is a TRTLLM backend option",
+            ),
+            (
+                "VANILLA",
+                100,
+                dict(qk_dtype="bf16"),
+                None,
+                "vc_attention is a TRTLLM backend option",
+            ),
+            (
+                "VANILLA",
+                100,
+                dict(qk_dtype="bf16", vc_attention=False, vc_repair_budget=0.005),
+                None,
+                "vc_attention is a TRTLLM backend option",
+            ),
+        ],
+        ids=[
+            "block_sizes",
+            "repair_without_vc",
+            "budget_below_zero",
+            "budget_at_one",
+            "smooth_k",
+            "smooth_v",
+            "sm90",
+            "sm120",
+            "vsa",
+            "skip_softmax",
+            "cutedsl",
+            "cudnn",
+            "flashinfer",
+            "vanilla",
+            "vanilla_repair",
+        ],
+    )
+    def test_vc_attention_rejections(self, backend, sm_ver, quant, sparse, match):
+        """VC-Attention fixes its block sizes, owns the repair budget, is TRTLLM and Blackwell only,
+        and never composes with SageAttention smoothing or a sparse algorithm."""
+        quant = {"vc_attention": True, **quant}
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
+            with pytest.raises(ValidationError, match=match):
+                AttentionConfig(
+                    backend=backend,
+                    quant_attention_config=QuantAttentionConfig(**quant),
+                    sparse_attention_config=sparse,
+                )
+
+    @pytest.mark.parametrize("smoothing", ["smooth_k", "smooth_v"])
+    @pytest.mark.parametrize("backend", ["TRTLLM", "CUTEDSL", "CUDNN", "FLASHINFER", "VANILLA"])
+    def test_smoothing_rejected_without_sage_recipe(self, backend, smoothing):
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            with pytest.raises(ValidationError, match="are SageAttention options"):
+                AttentionConfig(
+                    backend=backend,
+                    quant_attention_config=QuantAttentionConfig(
+                        qk_dtype="bf16", v_dtype="fp8", **{smoothing: True}
+                    ),
+                )
+
+    @pytest.mark.parametrize(
+        ("sm_ver", "qk_dtype", "q_block_size", "accepted"),
+        [(90, "int8", 2, False), (100, "int8", 1, True), (103, "fp8", 1, True)],
+    )
+    def test_smooth_v_requires_primts_architecture(self, sm_ver, qk_dtype, q_block_size, accepted):
+        def build():
+            return AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype=qk_dtype,
+                    q_block_size=q_block_size,
+                    k_block_size=16,
+                    v_block_size=1,
+                    smooth_v=True,
+                ),
+            )
+
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
+            if accepted:
+                assert build().quant_attention_config.smooth_v
+            else:
+                with pytest.raises(ValidationError, match="smooth_v needs the PrimTS kernels"):
+                    build()
+
+    def test_supported_quant_config_cute(self):
+        attention = AttentionConfig(
+            backend="CUTEDSL",
+            quant_attention_config=QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8"),
+        )
+
+        assert attention.quant_attention_config is not None
+
+    @pytest.mark.parametrize("v_block_size", [0, 1])
+    def test_supported_quant_config_cute_mxfp8(self, v_block_size):
+        attention = AttentionConfig(
+            backend="CUTEDSL",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="mxfp8",
+                v_dtype="fp8",
+                v_block_size=v_block_size,
+            ),
+        )
+
+        assert attention.quant_attention_config is not None
+        assert attention.quant_attention_config.v_block_size == v_block_size
+
+    @pytest.mark.parametrize("v_block_size", [0, 1])
+    def test_supported_quant_config_cute_nvfp4(self, v_block_size):
+        attention = AttentionConfig(
+            backend="CUTEDSL",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="nvfp4",
+                v_dtype="fp8",
+                v_block_size=v_block_size,
+            ),
+        )
+
+        assert attention.quant_attention_config is not None
+        assert attention.quant_attention_config.v_block_size == v_block_size
+
+    @pytest.mark.parametrize(
+        ("qk_dtype", "v_dtype"),
+        [("mxfp8", "fp8"), ("nvfp4", "fp8"), ("nvfp4", "nvfp4")],
+    )
+    def test_supported_quant_config_flashinfer(self, qk_dtype: str, v_dtype: str) -> None:
+        attention = AttentionConfig(
+            backend="FLASHINFER",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype=qk_dtype,
+                v_dtype=v_dtype,
+            ),
+        )
+
+        assert attention.quant_attention_config is not None
+
+    @pytest.mark.parametrize("qk_dtype", ("mxfp8", "nvfp4"))
+    @pytest.mark.parametrize("block_field", ("q_block_size", "k_block_size", "v_block_size"))
+    def test_blockscaled_block_size_rejected_on_flashinfer(
+        self, qk_dtype: str, block_field: str
+    ) -> None:
+        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+            AttentionConfig(
+                backend="FLASHINFER",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype=qk_dtype,
+                    v_dtype="fp8",
+                    **{block_field: 1},
+                ),
+            )
+
+    def test_mxfp8_with_nvfp4_v_rejected_on_flashinfer(self) -> None:
+        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+            AttentionConfig(
+                backend="FLASHINFER",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype="mxfp8",
+                    v_dtype="nvfp4",
+                ),
+            )
+
+    def test_fp8_qk_dtype_rejected_on_flashinfer(self) -> None:
+        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+            AttentionConfig(
+                backend="FLASHINFER",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype="fp8",
+                    v_dtype="fp8",
+                ),
+            )
+
+    def test_blockscaled_qk_dtype_rejected_on_trtllm(self):
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+                AttentionConfig(
+                    backend="TRTLLM",
+                    quant_attention_config=QuantAttentionConfig(qk_dtype="nvfp4"),
+                )
+
+    def test_supported_quant_config_cudnn_fp8(self):
+        attention = AttentionConfig(
+            backend="CUDNN",
+            quant_attention_config=QuantAttentionConfig(qk_dtype="fp8", v_dtype="fp8"),
+        )
+
+        assert attention.quant_attention_config is not None
+
+    def test_supported_quant_config_cudnn_mxfp8(self):
+        attention = AttentionConfig(
+            backend="CUDNN",
+            quant_attention_config=QuantAttentionConfig(qk_dtype="mxfp8", v_dtype="mxfp8"),
+        )
+
+        assert attention.quant_attention_config is not None
+        assert attention.quant_attention_config.v_dtype == "mxfp8"
+
+    def test_sage_qk_block_size_rejected_on_cute(self):
+        with pytest.raises(ValidationError, match="Unsupported quant_attention_config"):
+            AttentionConfig(
+                backend="CUTEDSL",
+                quant_attention_config=QuantAttentionConfig(qk_dtype="mxfp8", q_block_size=1),
+            )
+
+
+class TestPipelineRegistryUnique:
+    """Guard against duplicate HF IDs across PIPELINE_REGISTRY entries.
+
+    A single HF model id must dispatch to exactly one entry so
+    ``VisualGen.supported_models()`` doesn't list duplicates and
+    ``VisualGen.pipeline_config(id)`` returns a deterministic
+    defaults dict. When a checkpoint has multiple runtime variants
+    (e.g. LTX2 one-stage vs two-stage), only the user-facing entry
+    should carry the hf_id — variants swap in at load time via
+    ``BasePipeline.resolve_variant()``.
+    """
+
+    def test_no_duplicate_hf_ids(self):
+        from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY
+
+        seen: dict[str, str] = {}
+        for entry_name, entry in PIPELINE_REGISTRY.items():
+            for hf_id in entry.hf_ids:
+                assert hf_id not in seen, (
+                    f"HF id {hf_id!r} registered on both {seen[hf_id]!r} and "
+                    f"{entry_name!r}; only the user-facing entry should carry it."
+                )
+                seen[hf_id] = entry_name
+
+    def test_supported_models_no_duplicates(self):
+        from tensorrt_llm.visual_gen import VisualGen
+
+        ids = VisualGen.supported_models()
+        assert len(ids) == len(set(ids)), f"VisualGen.supported_models() returned duplicates: {ids}"
+
+
+class TestVisualGenArgsCacheBackend:
+    def test_cache_dit_nested_config(self):
+        args = VisualGenArgs(
+            model="/tmp/model",
+            cache_config=CacheDiTConfig(Fn_compute_blocks=2, max_warmup_steps=4),
+        )
+        assert isinstance(args.cache_config, CacheDiTConfig)
+        assert args.cache_dit.Fn_compute_blocks == 2
+        assert args.cache_dit.max_warmup_steps == 4
+
+    def test_cache_union_discriminated_teacache(self):
+        args = VisualGenArgs(
+            model="/tmp/model",
+            cache_config=TeaCacheConfig(teacache_thresh=0.11),
+        )
+        assert args.cache_backend == "teacache"
+        assert isinstance(args.cache_config, TeaCacheConfig)
+        assert args.teacache.teacache_thresh == 0.11
+
+    def test_cache_default_is_none(self):
+        args = VisualGenArgs(model="/tmp/model")
+        assert args.cache_config is None
+        assert args.cache_backend is None
+
+
+class TestVisualGenArgsFromDict:
+    """VisualGenArgs construction from dicts enforces strict validation."""
+
+    def test_vae_config_defaults_to_checkpoint_driven_quantization(self):
+        args = VisualGenArgs(model="/tmp/model")
+
+        assert isinstance(args.vae_config, VAEConfig)
+        assert args.vae_config.quant_conv_config is None
+
+    def test_valid_dict(self):
+        args = VisualGenArgs(
+            **{
+                "model": "/tmp/model",
+                "parallel_config": {"cfg_size": 2, "ulysses_size": 1},
+            }
+        )
+        assert args.model == "/tmp/model"
+        assert args.parallel_config.cfg_size == 2
+
+    def test_unknown_field_raises(self):
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            VisualGenArgs(
+                **{
+                    "model": "/tmp/model",
+                    "bad_key": 123,
+                }
+            )
+
+    def test_nested_dict_auto_coerced(self):
+        args = VisualGenArgs(
+            **{
+                "model": "/tmp/model",
+                "attention_config": {"backend": "TRTLLM"},
+                "vae_config": {"quant_conv_config": {"quant_algo": "NVFP4", "dynamic": True}},
+                "cache_config": {"cache_backend": "teacache", "teacache_thresh": 0.3},
+            }
+        )
+        assert isinstance(args.attention_config, AttentionConfig)
+        assert args.attention_config.backend == "TRTLLM"
+        assert isinstance(args.vae_config, VAEConfig)
+        assert isinstance(args.vae_config.quant_conv_config, dict)
+        assert args.vae_config.quant_conv_config["dynamic"] is True
+        assert isinstance(args.cache_config, TeaCacheConfig)
+        assert args.teacache.teacache_thresh == 0.3
+
+    def test_runtime_lora_nested_dict_auto_coerced(self):
+        args = VisualGenArgs(
+            **{
+                "model": "/tmp/model",
+                "runtime_lora_config": {
+                    "path": "/tmp/lora.safetensors",
+                    "scale": 0.75,
+                    "target_components": ["transformer"],
+                },
+            }
+        )
+        assert isinstance(args.runtime_lora_config, RuntimeLoRAConfig)
+        assert args.runtime_lora_config.path == "/tmp/lora.safetensors"
+        assert args.runtime_lora_config.scale == 0.75
+        assert args.runtime_lora_config.target_components == ["transformer"]
+
+    def test_quant_config_dict_passthrough(self):
+        """ModelOpt-format dicts are accepted as-is — they parse in PipelineLoader."""
+        from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+
+        raw = {"quant_algo": "FP8", "dynamic": True}
+        args = VisualGenArgs(model="/tmp/model", quant_config=raw)
+        # The dict stays a dict on the public schema (no eager coercion to
+        # QuantConfig), so the derived dynamic flags don't leak onto VisualGenArgs.
+        assert isinstance(args.quant_config, dict)
+        assert args.quant_config["quant_algo"] == "FP8"
+        # The same dict is the source of truth for the derived flags; verify
+        # the pipeline-config parser will run on it.
+        qc, _, dwq, _ = DiffusionPipelineConfig.load_diffusion_quant_config(args.quant_config)
+        assert qc.quant_algo is not None
+        assert dwq is True
+
+    def test_quant_config_dict_does_not_leak_dynamic_flags(self):
+        """Dynamic quant flags are not part of the VisualGenArgs schema."""
+        args = VisualGenArgs(
+            model="/tmp/model",
+            quant_config={"quant_algo": "FP8", "dynamic": True},
+            runtime_lora_config=RuntimeLoRAConfig(path="/tmp/lora.safetensors"),
+        )
+        # Negative: removed fields raise ValidationError when set directly.
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            VisualGenArgs(model="/tmp/model", dynamic_weight_quant=True)
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            VisualGenArgs(model="/tmp/model", force_dynamic_quantization=True)
+        # The names do not appear in model_fields or model_dump output.
+        fields = set(args.model_fields)
+        assert "dynamic_weight_quant" not in fields
+        assert "force_dynamic_quantization" not in fields
+        dumped = set(args.model_dump())
+        assert "dynamic_weight_quant" not in dumped
+        assert "force_dynamic_quantization" not in dumped
+
+    def test_runtime_lora_rejects_quantized_visual_gen_config(self, tmp_path):
+        from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+
+        model_dir = tmp_path / "model"
+        transformer_dir = model_dir / "transformer"
+        transformer_dir.mkdir(parents=True)
+        (model_dir / "model_index.json").write_text(
+            '{"transformer": ["diffusers", "WanTransformer3DModel"]}'
+        )
+        (transformer_dir / "config.json").write_text("{}")
+
+        args = VisualGenArgs(
+            model=str(model_dir),
+            quant_config={"quant_algo": "FP8", "dynamic": True},
+            runtime_lora_config=RuntimeLoRAConfig(path="/tmp/lora.safetensors"),
+        )
+
+        with pytest.raises(ValueError, match="runtime_lora_config.*weight quantization"):
+            DiffusionPipelineConfig.from_pretrained(model_dir, args=args)
+
+
+class TestVisualGenArgsFromYaml:
+    """from_yaml round-trips through a YAML file."""
+
+    def test_from_yaml_basic(self, tmp_path):
+        yaml_path = tmp_path / "config.yml"
+        yaml_path.write_text(
+            "model: /tmp/model\nparallel_config:\n  cfg_size: 2\n  ulysses_size: 1\n"
+        )
+        args = VisualGenArgs.from_yaml(yaml_path)
+        assert args.model == "/tmp/model"
+        assert args.parallel_config.cfg_size == 2
+
+    def test_from_yaml_with_overrides(self, tmp_path):
+        yaml_path = tmp_path / "config.yml"
+        yaml_path.write_text("model: /tmp/model\nrevision: original\n")
+        args = VisualGenArgs.from_yaml(yaml_path, revision="override")
+        assert args.revision == "override"
+
+    def test_from_yaml_runtime_lora_config(self, tmp_path):
+        yaml_path = tmp_path / "config.yml"
+        yaml_path.write_text(
+            "model: /tmp/model\nruntime_lora_config:\n  path: /tmp/lora.safetensors\n  scale: 0.5\n"
+        )
+        args = VisualGenArgs.from_yaml(yaml_path)
+        assert isinstance(args.runtime_lora_config, RuntimeLoRAConfig)
+        assert args.runtime_lora_config.scale == 0.5
+
+    def test_from_yaml_unknown_field_raises(self, tmp_path):
+        yaml_path = tmp_path / "bad.yml"
+        yaml_path.write_text("model: /tmp/model\nlinear:\n  type: default\n")
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            VisualGenArgs.from_yaml(yaml_path)
+
+
+class TestParallelConfigValidation:
+    """ParallelConfig no longer checks WORLD_SIZE at construction time."""
+
+    def test_large_parallel_no_env_check(self):
+        pc = ParallelConfig(cfg_size=2, ulysses_size=4)
+        assert pc.total_parallel_size == 8
+        assert pc.n_workers == 8
+
+    def test_validate_world_size_passes(self):
+        pc = ParallelConfig(cfg_size=2, ulysses_size=2)
+        pc.validate_world_size(4)
+
+    def test_validate_world_size_fails(self):
+        pc = ParallelConfig(cfg_size=2, ulysses_size=4)
+        with pytest.raises(ValueError, match="exceeds world_size"):
+            pc.validate_world_size(4)
+
+    def test_attn2d_config_basic(self):
+        pc = ParallelConfig(attn2d_size=(2, 2))
+        assert pc.seq_parallel_size == 4
+        assert pc.total_parallel_size == 4
+        assert pc.n_workers == 4
+
+    def test_attn2d_with_cfg(self):
+        pc = ParallelConfig(cfg_size=2, attn2d_size=(2, 2))
+        assert pc.seq_parallel_size == 4
+        assert pc.total_parallel_size == 8
+        assert pc.n_workers == 8
+
+    def test_attn2d_validate_world_size_passes(self):
+        pc = ParallelConfig(cfg_size=2, attn2d_size=(2, 2))
+        pc.validate_world_size(8)
+
+    def test_attn2d_validate_world_size_fails(self):
+        pc = ParallelConfig(cfg_size=2, attn2d_size=(2, 2))
+        with pytest.raises(ValueError, match="exceeds world_size"):
+            pc.validate_world_size(4)
+
+    def test_attn2d_asymmetric_mesh(self):
+        pc = ParallelConfig(attn2d_size=(1, 4))
+        assert pc.seq_parallel_size == 4
+
+    def test_seq_parallel_size_ulysses(self):
+        pc = ParallelConfig(ulysses_size=4)
+        assert pc.seq_parallel_size == 4
+
+    def test_attn2d_default_is_disabled(self):
+        pc = ParallelConfig()
+        assert pc.seq_parallel_size == 1
+
+    def test_parallel_vae_size_must_be_positive(self):
+        with pytest.raises(ValidationError):
+            ParallelConfig(parallel_vae_size=0)
+
+    def test_text_encoder_tp_size_does_not_change_worker_count(self):
+        pc = ParallelConfig(ulysses_size=2, text_encoder_tp_size=2)
+        assert pc.n_workers == 2
+        pc.validate_world_size(2)
+
+    def test_text_encoder_tp_size_validate_world_size_fails(self):
+        pc = ParallelConfig(text_encoder_tp_size=2)
+        with pytest.raises(ValueError, match="text_encoder_tp_size"):
+            pc.validate_world_size(1)
+
+    def test_attn2d_and_ulysses_seq_parallel_size(self):
+        pc = ParallelConfig(
+            attn2d_size=(2, 2),
+            ulysses_size=2,
+        )
+        assert pc.seq_parallel_size == 8
+
+
+class TestTokenShardedTPConfig:
+    """parallel_config.tp_layout validation and round trips."""
+
+    @pytest.mark.parametrize("tp_size,layout", [(1, None), (1, "replicated"), (2, "replicated")])
+    def test_off_unless_token_sharded(self, tp_size, layout):
+        # "replicated" is a truthy string: callers must test the property, not the field.
+        assert ParallelConfig(tp_size=tp_size, tp_layout=layout).token_sharded_tp is False
+
+    def test_requires_tp(self):
+        with pytest.raises(ValidationError, match=r"requires tp_size > 1 \(got tp_size=1\)"):
+            ParallelConfig(tp_layout="token_sharded")
+
+    @pytest.mark.parametrize(
+        "seq_kwargs",
+        [{"ulysses_size": 2}, {"ring_size": 2}, {"attn2d_size": (2, 1)}],
+        ids=["ulysses", "ring", "attn2d"],
+    )
+    def test_rejects_sequence_sharding(self, seq_kwargs):
+        with pytest.raises(ValidationError, match="cannot be combined with ulysses_size"):
+            ParallelConfig(tp_size=2, tp_layout="token_sharded", **seq_kwargs)
+
+    def test_composes_with_cfg(self):
+        pc = ParallelConfig(cfg_size=2, tp_size=2, tp_layout="token_sharded")
+        assert pc.token_sharded_tp is True
+        assert pc.n_workers == 4
+
+    def test_yaml_roundtrip(self, tmp_path):
+        yaml_path = tmp_path / "config.yml"
+        yaml_path.write_text(
+            "model: /tmp/model\n"
+            "parallel_config:\n"
+            "  cfg_size: 2\n"
+            "  tp_size: 2\n"
+            "  tp_layout: token_sharded\n"
+        )
+        args = VisualGenArgs.from_yaml(yaml_path)
+        assert args.parallel_config.token_sharded_tp is True
+        dumped = args.model_dump()
+        assert dumped["parallel_config"]["tp_layout"] == "token_sharded"
+        assert VisualGenArgs(**dumped).parallel_config == args.parallel_config
+
+
+class TestVisualGenArgsPickle:
+    """VisualGenArgs must survive pickle round-trip (mp.Process spawn)."""
+
+    def test_pickle_roundtrip(self):
+        args = VisualGenArgs(
+            model="/tmp/model",
+            compilation_config=CompilationConfig(skip_warmup=True),
+            parallel_config=ParallelConfig(cfg_size=2, ulysses_size=1),
+            attention_config=AttentionConfig(backend="TRTLLM"),
+            quant_config={"quant_algo": "FP8", "dynamic": True},
+            runtime_lora_config=RuntimeLoRAConfig(path="/tmp/lora.safetensors"),
+        )
+        data = pickle.dumps(args)
+        restored = pickle.loads(data)
+
+        assert restored.model == args.model
+        assert restored.compilation_config.skip_warmup is True
+        assert restored.parallel_config.cfg_size == 2
+        assert restored.attention_config.backend == "TRTLLM"
+        assert restored.runtime_lora_config.path == "/tmp/lora.safetensors"
+        # quant_config is the user dict (lazy-parsed in PipelineLoader)
+        assert restored.quant_config["quant_algo"] == "FP8"
+
+    def test_model_copy_override(self):
+        args = VisualGenArgs(model="/tmp/model")
+        updated = args.model_copy(update={"revision": "v2"})
+        assert updated.revision == "v2"
+        assert args.revision is None
+
+
+# =============================================================================
+# Batch Generation Input Parsing
+# =============================================================================
+
+
+class TestDiffusionRequestBatchPrompt:
+    """DiffusionRequest accepts Union[str, List[str]] for prompt field."""
+
+    def test_single_prompt(self):
+        from tensorrt_llm._torch.visual_gen.executor import DiffusionRequest
+
+        req = DiffusionRequest(request_id=0, prompt="hello")
+        assert req.prompt == "hello"
+
+    def test_list_prompt(self):
+        from tensorrt_llm._torch.visual_gen.executor import DiffusionRequest
+
+        prompts = ["a sunset", "a city"]
+        req = DiffusionRequest(request_id=0, prompt=prompts)
+        assert req.prompt == prompts
+        assert len(req.prompt) == 2
+
+
+class TestVisualGenInputParsing:
+    """Test that VisualGen.generate_async() correctly parses inputs.
+
+    Uses mocking to avoid spawning GPU worker processes.
+    """
+
+    def _make_visual_gen_with_mock_executor(self):
+        """Create a VisualGen instance with a mocked executor."""
+        from tensorrt_llm.visual_gen import VisualGen
+
+        # Patch __init__ to avoid spawning workers
+        with patch.object(VisualGen, "__init__", lambda self, *a, **kw: None):
+            vg = VisualGen.__new__(VisualGen)
+            vg.model = "/tmp/fake"
+            vg.args = VisualGenArgs(model="/tmp/fake")
+            vg._req_counter = itertools.count()
+            vg.executor = MagicMock()
+            return vg
+
+    def test_string_input(self):
+        """String input → single-element list in DiffusionRequest."""
+        vg = self._make_visual_gen_with_mock_executor()
+
+        vg.generate_async(inputs="a cat")
+
+        call_args = vg.executor.enqueue_requests.call_args[0][0]
+        assert len(call_args) == 1
+        assert call_args[0].prompt == ["a cat"]
+
+    def test_list_of_strings_input(self):
+        """List of strings → batch prompt in single DiffusionRequest."""
+        vg = self._make_visual_gen_with_mock_executor()
+
+        vg.generate_async(inputs=["a sunset", "a city"])
+
+        call_args = vg.executor.enqueue_requests.call_args[0][0]
+        assert len(call_args) == 1
+        req = call_args[0]
+        assert req.prompt == ["a sunset", "a city"]
+
+    def test_params_default_materializes_visual_gen_params(self):
+        """Omitting params materializes a fresh ``VisualGenParams`` at the
+        enqueue site, so the executor never sees ``params is None``."""
+        from tensorrt_llm.visual_gen import VisualGenParams
+
+        vg = self._make_visual_gen_with_mock_executor()
+
+        vg.generate_async(inputs="a cat")
+
+        call_args = vg.executor.enqueue_requests.call_args[0][0]
+        req = call_args[0]
+        assert isinstance(req.params, VisualGenParams)
+        # ``seed`` is materialized at the public Python boundary so every
+        # downstream layer sees a concrete int; the other universal fields
+        # stay ``None`` until the executor applies pipeline defaults in
+        # ``DiffusionExecutor._merge_defaults``.
+        assert isinstance(req.params.seed, int)
+        assert req.params.height is None
+
+    def test_negative_prompt_via_params(self):
+        """negative_prompt is passed through params, not inputs."""
+        from tensorrt_llm.visual_gen import VisualGenParams
+
+        vg = self._make_visual_gen_with_mock_executor()
+        params = VisualGenParams(negative_prompt="blurry")
+
+        vg.generate_async(inputs="a cat", params=params)
+
+        call_args = vg.executor.enqueue_requests.call_args[0][0]
+        assert call_args[0].params.negative_prompt == "blurry"
+
+    def test_empty_batch_raises(self):
+        """Empty batch input raises ValueError."""
+        vg = self._make_visual_gen_with_mock_executor()
+
+        with pytest.raises(ValueError, match="at least one item"):
+            vg.generate_async(inputs=[])
+
+    def test_invalid_input_raises(self):
+        """Invalid input type raises ValueError."""
+        vg = self._make_visual_gen_with_mock_executor()
+
+        with pytest.raises(ValueError, match="Invalid inputs type"):
+            vg.generate_async(inputs=12345)

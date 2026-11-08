@@ -1,0 +1,11 @@
+[project]
+name = "e2b"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "e2b-code-interpreter",
+    "mcp[cli]>=1.23.0,<2.0.0",
+    "python-dotenv",
+]

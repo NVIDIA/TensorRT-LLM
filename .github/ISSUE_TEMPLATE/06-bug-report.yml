@@ -1,0 +1,191 @@
+# Adapted from https://github.com/vllm-project/vllm/tree/main/.github/ISSUE_TEMPLATE/400-bug-report.yml
+name: "🐛 Bug Report"
+description: Submit a bug report to help us improve TensorRT-LLM
+title: "[Bug]: "
+labels: [ "bug" ]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue+sort%3Acreated-desc+).
+- type: markdown
+  attributes:
+    value: |
+      ⚠️ **SECURITY WARNING:** Please review any text you paste to ensure it does not contain sensitive information such as:
+      - API tokens or keys (e.g., Hugging Face tokens, OpenAI API keys)
+      - Passwords or authentication credentials
+      - Private URLs or endpoints
+      - Personal or confidential data
+
+      Consider redacting or replacing sensitive values with placeholders like `<YOUR_TOKEN_HERE>` when sharing configuration or code examples.
+- type: textarea
+  id: system-info
+  attributes:
+    label: System Info
+    description: Please share your system info with us.
+    placeholder: |
+      - CPU architecture (e.g., x86_64, aarch64)
+      - CPU/Host memory size (if known)
+      - GPU properties
+        - GPU name (e.g., NVIDIA H100, NVIDIA A100, NVIDIA L40S)
+        - GPU memory size (if known)
+        - Clock frequencies used (if applicable)
+      - Libraries
+        - TensorRT-LLM branch or tag (e.g., main, v0.7.1)
+        - TensorRT-LLM commit (if known)
+        - Versions of TensorRT, Modelopt, CUDA, cuBLAS, etc. used
+        - Container used (if running TensorRT-LLM in a container)
+      - NVIDIA driver version
+      - OS (Ubuntu 24.04, CentOS 8)
+      - Any other information that may be useful in reproducing the bug
+
+      **Commands to gather system information:**
+      ```bash
+      nvidia-smi
+      nvcc --version
+      python --version
+      pip show tensorrt_llm tensorrt torch
+      ```
+  validations:
+    required: true
+
+- type: textarea
+  id: who-can-help
+  attributes:
+    label: Who can help?
+    description: |
+      To expedite the response to your issue, it would be helpful if you could identify the appropriate person
+      to tag using the **@** symbol. Here is a general guideline on **whom to tag**.
+
+      Rest assured that all issues are reviewed by the core maintainers. If you are unsure about whom to tag,
+      you can leave it blank, and a core maintainer will make sure to involve the appropriate person.
+
+      Please tag fewer than 3 people.
+
+      Quantization: @Tracin
+
+      Documentation: @juney-nvidia
+
+      Feature request: @laikhtewari
+
+      Performance: @kaiyux
+
+    placeholder: "@Username ..."
+
+- type: checkboxes
+  id: information-scripts-examples
+  attributes:
+    label: Information
+    description: 'The problem arises when using:'
+    options:
+      - label: "The official example scripts"
+      - label: "My own modified scripts"
+
+- type: checkboxes
+  id: information-tasks
+  attributes:
+    label: Tasks
+    description: "The tasks I am working on are:"
+    options:
+      - label: "An officially supported task in the `examples` folder (such as GLUE/SQuAD, ...)"
+      - label: "My own task or dataset (give details below)"
+
+- type: textarea
+  id: reproduction
+  validations:
+    required: true
+  attributes:
+    label: Reproduction
+    description: |
+      Please provide a clear and concise description of what the bug is and how to reproduce it.
+
+      If relevant, add a minimal example so that we can reproduce the error by running the code. It is very important for the snippet to be as succinct (minimal) as possible, so please take time to trim down any irrelevant code to help us debug efficiently. We are going to copy-paste your code and we expect to get the same result as you did: avoid any external data, and include the relevant imports, etc. For example:
+
+      ```python
+      from tensorrt_llm import LLM
+      from tensorrt_llm.sampling_params import SamplingParams
+
+      prompts = [
+          "Hello, my name is",
+          "The president of the United States is",
+          "The capital of France is",
+          "The future of AI is",
+      ]
+      sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
+
+      llm = LLM(model="meta-llama/Llama-3.1-8B-Instruct")
+
+      outputs = llm.generate(prompts, sampling_params)
+
+      # Print the outputs.
+      for output in outputs:
+          prompt = output.prompt
+          generated_text = output.outputs[0].text
+          print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+      ```
+
+      If the code is too long (hopefully, it isn't), feel free to put it in a public gist and link it in the issue: https://gist.github.com.
+
+      Remember to use code tags to properly format your code. You can refer to the
+      link https://help.github.com/en/github/writing-on-github/creating-and-highlighting-code-blocks#syntax-highlighting for guidance on code formatting.
+
+      Please refrain from using screenshots, as they can be difficult to read and prevent others from copying and pasting your code.
+      It would be most helpful if we could reproduce your issue by simply copying and pasting your scripts and codes.
+
+      Please set the environment variable `export TLLM_DEBUG_MODE=1` to turn on more logging to help debugging potential issues.
+
+    placeholder: |
+      Steps to reproduce the behavior:
+
+        1.
+        2.
+        3.
+
+      ```python
+      # Sample code to reproduce the problem
+      ```
+
+      ```
+      The error message you got, with the full traceback and the error logs.
+      ```
+
+- type: textarea
+  id: expected-behavior
+  validations:
+    required: true
+  attributes:
+    label: Expected behavior
+    description: "Provide a brief summary of the expected behavior of the software. Provide output files or examples if possible."
+
+- type: textarea
+  id: actual-behavior
+  validations:
+    required: true
+  attributes:
+    label: actual behavior
+    description: "Describe the actual behavior of the software and how it deviates from the expected behavior. Provide output files or examples if possible."
+
+- type: textarea
+  id: additional-notes
+  validations:
+    required: true
+  attributes:
+    label: additional notes
+    description: "Provide any additional context here you think might be useful for the TensorRT-LLM team to help debug this issue (such as experiments done, potential things to investigate)."
+
+- type: markdown
+  attributes:
+    value: |
+      ⚠️ Please separate bugs of `transformers`, `pytorch` implementation or usage from bugs of `TensorRT-LLM`.
+
+      - If the error only appears in TensorRT-LLM, please provide the detailed script of how you run `TensorRT-LLM`, also highlight the difference and what you expect.
+
+      Thanks for reporting 🙏!
+- type: checkboxes
+  id: askllm
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: Make sure you already searched for relevant issues, and checked the [documentation](https://nvidia.github.io/TensorRT-LLM/) and [examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples) for answers to frequently asked questions.
+        required: true

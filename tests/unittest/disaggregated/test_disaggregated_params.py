@@ -1,0 +1,285 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+import torch
+
+from tensorrt_llm.bindings import executor as tllm
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
+from tensorrt_llm.executor.result import GenerationResultBase, Logprob
+from tensorrt_llm.sampling_params import SamplingParams
+
+pytestmark = pytest.mark.cpu_only
+
+
+def test_disaggregated_params_ctx_dp_rank():
+    params = DisaggregatedParams()
+    assert params.ctx_dp_rank is None
+
+    params = DisaggregatedParams(ctx_dp_rank=3)
+    assert params.ctx_dp_rank == 3
+
+
+def test_disaggregated_params_ctx_info_endpoint():
+    params = DisaggregatedParams()
+    assert params.ctx_info_endpoint is None
+
+    params = DisaggregatedParams(ctx_info_endpoint=["tcp://10.0.0.1:5000", "tcp://10.0.0.2:5000"])
+    assert params.ctx_info_endpoint == ["tcp://10.0.0.1:5000", "tcp://10.0.0.2:5000"]
+
+
+def test_receiver_ctx_info_endpoint_required():
+    from tensorrt_llm._torch.disaggregation.native.transfer import Receiver
+
+    with pytest.raises(ValueError, match="ctx_info_endpoint is required"):
+        Receiver._extract_info_endpoint(DisaggregatedParams())
+    with pytest.raises(ValueError, match="ctx_info_endpoint is required"):
+        Receiver._extract_info_endpoint(DisaggregatedParams(ctx_info_endpoint=[]))
+    assert (
+        Receiver._extract_info_endpoint(
+            DisaggregatedParams(ctx_info_endpoint="tcp://10.0.0.1:5000")
+        )
+        == "tcp://10.0.0.1:5000"
+    )
+
+
+@patch("tensorrt_llm.disaggregated_params.tllme")
+def test_get_context_phase_params(mock_tllme):
+    mock_ctx_params = MagicMock()
+    mock_tllme.ContextPhaseParams.return_value = mock_ctx_params
+
+    params = DisaggregatedParams(
+        request_type="context_only",
+        first_gen_tokens=[1, 2, 3],
+        ctx_request_id=42,
+        opaque_state=b"\x00\x01",
+        draft_tokens=[10, 20],
+        ctx_dp_rank=1,
+        ctx_info_endpoint=["tcp://10.0.0.1:5000"],
+    )
+    result = params.get_context_phase_params()
+
+    mock_tllme.ContextPhaseParams.assert_called_once_with(
+        [1, 2, 3],  # first_gen_tokens
+        42,  # request_id (ctx_request_id since disagg_request_id is None)
+        b"\x00\x01",  # opaque_state
+        [10, 20],  # draft_tokens
+        1,  # ctx_dp_rank
+        ["tcp://10.0.0.1:5000"],  # ctx_info_endpoint
+    )
+    assert result == mock_ctx_params
+
+
+def test_to_disaggregated_params():
+    from tensorrt_llm.serve.openai_protocol import to_disaggregated_params
+
+    llm_params = DisaggregatedParams(
+        request_type="context_only",
+        first_gen_tokens=[1, 2],
+        ctx_dp_rank=5,
+        ctx_info_endpoint="tcp://10.0.0.1:5000",
+        remote_tail_start=128,
+        ctx_usage={
+            "prompt_tokens": 10,
+            "completion_tokens": 0,
+            "total_tokens": 10,
+            "prompt_tokens_details": {
+                "cached_tokens": 4,
+            },
+        },
+    )
+    openai_params = to_disaggregated_params(llm_params)
+
+    print(f"[usage_check] to_disaggregated_params: ctx_usage={openai_params.ctx_usage}")
+    assert openai_params.request_type == "context_only"
+    assert openai_params.first_gen_tokens == [1, 2]
+    assert openai_params.ctx_dp_rank == 5
+    assert openai_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
+    assert openai_params.remote_tail_start == 128
+    assert openai_params.ctx_usage.prompt_tokens == 10
+    assert openai_params.ctx_usage.prompt_tokens_details.cached_tokens == 4
+
+
+def test_to_llm_disaggregated_params():
+    from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
+    from tensorrt_llm.serve.openai_protocol import (
+        PromptTokensDetails,
+        UsageInfo,
+        to_llm_disaggregated_params,
+    )
+
+    openai_params = OpenAIDisaggregatedParams(
+        request_type="generation_only",
+        ctx_dp_rank=2,
+        ctx_info_endpoint="tcp://10.0.0.1:5000",
+        remote_tail_start=256,
+        ctx_usage=UsageInfo(
+            prompt_tokens=10,
+            completion_tokens=0,
+            total_tokens=10,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=4),
+        ),
+    )
+    llm_params = to_llm_disaggregated_params(openai_params)
+
+    print(f"[usage_check] to_llm_disaggregated_params: ctx_usage={llm_params.ctx_usage}")
+    assert llm_params.request_type == "generation_only"
+    assert llm_params.ctx_dp_rank == 2
+    assert llm_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
+    assert llm_params.remote_tail_start == 256
+    assert llm_params.ctx_usage["prompt_tokens"] == 10
+    assert llm_params.ctx_usage["prompt_tokens_details"]["cached_tokens"] == 4
+
+
+def test_opaque_state_round_trips_through_openai_protocol():
+    from tensorrt_llm.serve.openai_protocol import (
+        to_disaggregated_params,
+        to_llm_disaggregated_params,
+    )
+
+    openai_params = to_disaggregated_params(
+        DisaggregatedParams(request_type="context_only", opaque_state=b"opaque")
+    )
+    assert openai_params.encoded_opaque_state == "b3BhcXVl"
+    assert to_llm_disaggregated_params(openai_params).opaque_state == b"opaque"
+
+
+def test_multimodal_spans_round_trip_through_openai_json():
+    from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
+    from tensorrt_llm.serve.openai_protocol import (
+        to_disaggregated_params,
+        to_llm_disaggregated_params,
+    )
+
+    original = DisaggregatedParams(
+        request_type="context_only",
+        first_gen_tokens=[17],
+        opaque_state=b"opaque",
+        remote_tail_start=128,
+        multimodal_positions=[1, 5],
+        multimodal_lengths=[2, 1],
+    )
+    encoded = to_disaggregated_params(original).model_dump_json()
+    restored = to_llm_disaggregated_params(OpenAIDisaggregatedParams.model_validate_json(encoded))
+    assert restored == original
+
+
+@patch("tensorrt_llm.disaggregated_params.tllme")
+def test_get_context_phase_params_disagg_wins(mock_tllme):
+    """disagg_request_id takes priority over ctx_request_id."""
+    mock_tllme.ContextPhaseParams.return_value = MagicMock()
+
+    params = DisaggregatedParams(
+        request_type="context_only",
+        first_gen_tokens=[1],
+        ctx_request_id=200,
+        disagg_request_id=100,
+    )
+    params.get_context_phase_params()
+
+    # The second arg to ContextPhaseParams should be 100 (disagg), not 200 (ctx)
+    call_args = mock_tllme.ContextPhaseParams.call_args
+    assert call_args[0][1] == 100
+
+
+@patch("tensorrt_llm.disaggregated_params.tllme")
+def test_get_context_phase_params_falls_back_to_ctx(mock_tllme):
+    """When disagg_request_id is None, ctx_request_id is used."""
+    mock_tllme.ContextPhaseParams.return_value = MagicMock()
+
+    params = DisaggregatedParams(
+        request_type="context_only",
+        first_gen_tokens=[1],
+        ctx_request_id=200,
+    )
+    params.get_context_phase_params()
+
+    call_args = mock_tllme.ContextPhaseParams.call_args
+    assert call_args[0][1] == 200
+
+
+@patch("tensorrt_llm.disaggregated_params.tllme")
+def test_get_request_type_valid(mock_tllme):
+    """get_request_type returns the correct enum for all 3 valid strings."""
+    mock_tllme.RequestType.REQUEST_TYPE_CONTEXT_ONLY = "CTX"
+    mock_tllme.RequestType.REQUEST_TYPE_GENERATION_ONLY = "GEN"
+    mock_tllme.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION = "CTX_GEN"
+
+    assert DisaggregatedParams(request_type="context_only").get_request_type() == "CTX"
+    assert DisaggregatedParams(request_type="generation_only").get_request_type() == "GEN"
+    assert (
+        DisaggregatedParams(request_type="context_and_generation").get_request_type() == "CTX_GEN"
+    )
+
+
+def test_get_request_type_invalid():
+    """Invalid request_type raises ValueError at construction time."""
+    with pytest.raises(ValueError, match="Unknown request type"):
+        DisaggregatedParams(request_type="invalid_type")
+
+
+def test_context_only_response_carries_the_first_token_logprobs_and_logits():
+    """A context_only response carries the first token's logprob and logits onward.
+
+    The context worker's response holds the first generated token's logprob and
+    logits. The client folds them into the DisaggregatedParams that travel to the
+    generation worker, which prepends them so its outputs cover every generated
+    token.
+    """
+    result = GenerationResultBase(
+        id=1,
+        sampling_params=SamplingParams(max_tokens=4, logprobs=1, return_generation_logits=True),
+    )
+    first_token_logprob = {7: Logprob(logprob=-0.5, rank=1)}
+    first_logits = torch.arange(6, dtype=torch.float32).reshape(1, 1, 6)
+    context_result = SimpleNamespace(
+        is_final=True,
+        decoding_iter=1,
+        avg_decoded_tokens_per_iter=1.0,
+        context_phase_params=SimpleNamespace(
+            first_gen_tokens=[7],
+            req_id=1,
+            opaque_state=b"",
+            draft_tokens=None,
+            ctx_dp_rank=0,
+            disagg_info_endpoint=None,
+        ),
+        finish_reasons=[tllm.FinishReason.LENGTH],
+        output_token_ids=[[7]],
+        sequence_index=0,
+        cum_log_probs=[-0.5],
+        log_probs=[[first_token_logprob]],
+        generation_logits=first_logits,
+        per_pos_drafted=None,
+        per_pos_accepted=None,
+        spec_dec_totals=None,
+        time_breakdown_metrics=None,
+        context_logits=None,
+        request_perf_metrics=None,
+        additional_context_outputs=None,
+        additional_generation_outputs=None,
+    )
+
+    result._handle_response(SimpleNamespace(result=context_result, has_error=lambda: False))
+
+    params = result.disaggregated_params
+    assert params.request_type == "context_only"
+    assert params.first_gen_tokens == [7]
+    assert params.first_gen_log_probs == [first_token_logprob]
+    (logits,) = params.first_gen_logits
+    assert torch.equal(logits, first_logits[0, :1])

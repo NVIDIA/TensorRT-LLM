@@ -1,0 +1,88 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+// Server identity, deployment capacity, roles, parallelism, and load.
+
+syntax = "proto3";
+
+package openengine.v1;
+
+import "google/protobuf/struct.proto";
+import "openengine/v1/kv.proto";
+
+enum EngineRole {
+  ENGINE_ROLE_UNSPECIFIED = 0;
+  ENGINE_ROLE_AGGREGATED = 1;
+  ENGINE_ROLE_PREFILL = 2;
+  ENGINE_ROLE_DECODE = 3;
+}
+
+message GetServerInfoRequest {}
+
+message ServerInfo {
+  string engine_name = 1; // sglang, vllm, tensorrt_llm, etc.
+  string engine_version = 2;
+  EngineRole engine_role = 3;
+  string instance_id = 4;
+  repeated string supported_models = 5;
+  ParallelismInfo parallelism = 6;
+  KvConnectorInfo kv_connector = 7;
+  uint32 schema_revision = 8; // Contract revision implemented; zero is invalid.
+  uint32 minimum_client_revision = 9; // Oldest compatible contract revision.
+  // Immutable BSR module commit; unpublished builds may use a source commit.
+  string schema_release = 10;
+  DeploymentCapacity capacity = 11; // Configured capacity for this deployed server.
+
+  // Engine-specific server metadata with no portable field (e.g. attention
+  // backend, build flags, experimental capabilities). NOT part of the portable
+  // contract: clients read it opportunistically and never depend on it for
+  // correctness. Carried as a Struct so JSON types survive the wire.
+  google.protobuf.Struct extra = 12;
+}
+
+message DeploymentCapacity {
+  optional uint32 kv_block_size = 1; // Tokens per deployed KV-cache block.
+  optional uint64 total_kv_blocks = 2; // Allocatable KV blocks in the reporting scope.
+  optional uint64 max_running_requests = 3; // Concurrent running-request ceiling.
+  optional uint64 max_batched_tokens = 4; // Scheduler token ceiling per batch.
+  optional uint32 max_loras = 5; // Maximum simultaneously resident LoRA adapters.
+}
+
+message ParallelismInfo {
+  optional uint32 tensor_parallel_size = 1;
+  optional uint32 pipeline_parallel_size = 2;
+  optional uint32 data_parallel_size = 3;
+  optional uint32 data_parallel_rank = 4;
+  optional uint32 data_parallel_start_rank = 5;
+  optional uint32 decode_context_parallel_size = 6; // Ranks per decode-context group; at least 1.
+}
+
+message GetLoadRequest {
+  bool include_per_rank = 1;
+}
+
+message LoadInfo {
+  string instance_id = 1;
+  optional uint64 timestamp_unix_nanos = 2;
+  optional uint32 running_requests = 3;
+  optional uint32 queued_requests = 4;
+  optional uint32 active_kv_sessions = 5;
+  optional uint64 used_kv_blocks = 6;
+  optional uint64 total_kv_blocks = 7;
+  optional uint64 running_tokens = 8;
+  optional uint64 waiting_tokens = 9;
+  optional uint32 prefill_batch_size = 10;
+  optional uint32 decode_batch_size = 11;
+  repeated RankLoadInfo ranks = 20;
+  google.protobuf.Struct attributes = 30;
+}
+
+message RankLoadInfo {
+  optional uint32 data_parallel_rank = 1;
+  optional uint32 running_requests = 2;
+  optional uint32 queued_requests = 3;
+  optional uint64 used_kv_blocks = 4;
+  optional uint64 total_kv_blocks = 5;
+  optional uint32 prefill_batch_size = 6;
+  optional uint32 decode_batch_size = 7;
+}

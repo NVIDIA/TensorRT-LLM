@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="960px" height="560px" viewBox="0 0 960 560"
+     style="background: light-dark(#ffffff, #121212); color-scheme: light dark;
+            font-family: Helvetica, Arial, sans-serif;">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-end">
+      <path d="M0,0 L10,5 L0,10 z" style="fill: light-dark(#495057, #adb5bd);"/>
+    </marker>
+    <marker id="arrowfb" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-end">
+      <path d="M0,0 L10,5 L0,10 z" style="fill: light-dark(#6741d9, #b595ff);"/>
+    </marker>
+  </defs>
+
+  <!-- ============ title ============ -->
+  <text x="480" y="34" text-anchor="middle"
+        style="fill: light-dark(#1b1b1b, #e9ecef); font-size: 17px; font-weight: bold;">
+    Running modeling-bringup with a human in the loop
+  </text>
+
+  <!-- ================= Column A: the run ================= -->
+  <rect x="28" y="62" width="286" height="356" rx="12"
+        style="fill: light-dark(#f8f9fa, #1a1b1d); stroke: light-dark(#adb5bd, #495057);
+               stroke-width: 1.4; stroke-dasharray: 4 4;"/>
+  <text x="42" y="84"
+        style="fill: light-dark(#495057, #ced4da); font-size: 13px; font-weight: bold;">
+    modeling-bringup run
+  </text>
+
+  <!-- Plan phase (blue) -->
+  <rect x="54" y="100" width="234" height="50" rx="8"
+        style="fill: light-dark(rgb(231,245,255), #12283a); stroke: light-dark(#1c7ed6, #469ae6);
+               stroke-width: 1.5;"/>
+  <text x="171" y="122" text-anchor="middle"
+        style="fill: light-dark(#1b1b1b, #e9ecef); font-size: 12px; font-weight: bold;">Plan phase</text>
+  <text x="171" y="139" text-anchor="middle"
+        style="fill: light-dark(#495057, #adb5bd); font-size: 11px;">PlanDrafter &#8646; PlanReviewer</text>
+
+  <line x1="171" y1="150" x2="171" y2="176" style="stroke: light-dark(#495057, #adb5bd); stroke-width: 1.5;" marker-end="url(#arrow)"/>
+
+  <!-- Build loop (green) -->
+  <rect x="54" y="178" width="234" height="94" rx="8"
+        style="fill: light-dark(rgb(235,251,238), #10301b); stroke: light-dark(#2b8a3e, #50a260);
+               stroke-width: 1.5;"/>
+  <text x="171" y="200" text-anchor="middle"
+        style="fill: light-dark(#1b1b1b, #e9ecef); font-size: 12px; font-weight: bold;">Build loop</text>
+  <text x="171" y="224" text-anchor="middle"
+        style="fill: light-dark(#1b1b1b, #e9ecef); font-size: 11.5px;">Coder &#8594; Reviewer &#8594; QA</text>
+  <text x="171" y="243" text-anchor="middle"
+        style="fill: light-dark(#495057, #adb5bd); font-size: 10px;">Coder works one [Doing] Goal / turn</text>
+  <text x="171" y="259" text-anchor="middle"
+        style="fill: light-dark(#495057, #adb5bd); font-size: 10px;">QA APPROVE gate &#183; --min-score</text>
+
+  <line x1="171" y1="272" x2="171" y2="298" style="stroke: light-dark(#495057, #adb5bd); stroke-width: 1.5;" marker-end="url(#arrow)"/>
+
+  <!-- Replan (grape) -->
+  <rect x="54" y="300" width="234" height="62" rx="8"
+        style="fill: light-dark(rgb(243,240,255), #1f1a33); stroke: light-dark(#6741d9, #b595ff);
+               stroke-width: 1.5;"/>
+  <text x="171" y="321" text-anchor="middle"
+        style="fill: light-dark(#1b1b1b, #e9ecef); font-size: 12px; font-weight: bold;">Replan (PlanDrafter)</text>
+  <text x="171" y="338" text-anchor="middle"
+        style="fill: light-dark(#5f3dc4, #b595ff); font-size: 10.5px; font-family: monospace;">--replan-on-qa</text>
+  <text x="171" y="353" text-anchor="middle"
+        style="fill: light-dark(#495057, #adb5bd); font-size: 9.5px;">revises plan.md &#183; acceptance-criteria.md</text>
+
+  <!-- re-plan loop back to build -->
+  <path d="M54,330 C30,322 30,238 54,232" fill="none"
+        style="stroke: light-dark(#868e96, #6e757c); stroke-width: 1.3; stroke-dasharray: 3 3;" marker-end="url(#arrow)"/>
+  <text x="171" y="386" text-anchor="middle"
+        style="fill: light-dark(#868e96, #909296); font-size: 9px;">&#8635; POLISHING &#8594; Coder &#183; DRAFT_READY &#8594; PlanReviewer</text>
+
+  <!-- ================= Column B: workspace ================= -->
+  <rect x="360" y="88" width="250" height="322" rx="12"
+        style="fill: light-dark(#f8fbff, #12181f); stroke: light-dark(#1c7ed6, #469ae6);
+               stroke-width: 1.4; stroke-dasharray: 5 4;"/>
+  <text x="373" y="110"
+        style="fill: light-dark(#1971c2, #74c0fc); font-size: 13px; font-weight: bold;">Workspace</text>
+  <text x="373" y="126"
+        style="fill: light-dark(#868e96, #909296); font-size: 10px; font-family: monospace;">workspace/modeling-bringup/</text>
+
+  <!-- file chips -->
+  <rect x="376" y="136" width="218" height="30" rx="6"
+        style="fill: light-dark(#ffffff, #25262a); stroke: light-dark(#ced4da, #495057); stroke-width: 1.2;"/>
+  <text x="386" y="155" style="fill: light-dark(#1b1b1b, #e9ecef); font-size: 11px; font-family: monospace; font-weight: bold;">plan.md</text>
+  <text x="446" y="155" style="fill: light-dark(#868e96, #909296); font-size: 9.5px;">plan + Stages/Goals</text>
+
+  <rect x="376" y="172" width="218" height="30" rx="6"
+        style="fill: light-dark(#ffffff, #25262a); stroke: light-dark(#ced4da, #495057); stroke-width: 1.2;"/>
+  <text x="386" y="191" style="fill: light-dark(#1b1b1b, #e9ecef); font-size: 11px; font-family: monospace; font-weight: bold;">acceptance-criteria.md</text>
+
+  <rect x="376" y="208" width="218" height="40" rx="6"
+        style="fill: light-dark(#ffffff, #25262a); stroke: light-dark(#ced4da, #495057); stroke-width: 1.2;"/>
+  <text x="386" y="224" style="fill: light-dark(#1b1b1b, #e9ecef); font-size: 11px; font-family: monospace; font-weight: bold;">progress.yaml</text>
+  <text x="386" y="239" style="fill: light-dark(#868e96, #909296); font-size: 9px;">append-only audit log &#183; human_feedback[]</text>
+
+  <!-- status.md with Stages & Goals mini table -->
+  <rect x="376" y="254" width="218" height="104" rx="6"
+        style="fill: light-dark(#fff9f0, #2a231a); stroke: light-dark(#f59f00, #a25800); stroke-width: 1.3;"/>
+  <text x="386" y="270" style="fill: light-dark(#1b1b1b, #e9ecef); font-size: 11px; font-family: monospace; font-weight: bold;">status.md</text>
+  <text x="386" y="284" style="fill: light-dark(#a25800, #e8b04b); font-size: 9px;">## Stages &amp; Goals &#8212; live state machine</text>
+  <text x="390" y="300" style="fill: light-dark(#2b8a3e, #69c07d); font-size: 9.5px; font-family: monospace;">Stage 1  IN_PROGRESS</text>
+  <text x="398" y="313" style="fill: light-dark(#495057, #adb5bd); font-size: 9.5px; font-family: monospace;">Goal 1.1  [Done]</text>
+  <text x="398" y="326" style="fill: light-dark(#1971c2, #74c0fc); font-size: 9.5px; font-family: monospace;">Goal 1.2  [Doing] (iter=3)</text>
+  <text x="390" y="342" style="fill: light-dark(#868e96, #909296); font-size: 9.5px; font-family: monospace;">Stage 2  PENDING</text>
+
+  <rect x="376" y="364" width="218" height="30" rx="6"
+        style="fill: light-dark(#ffffff, #25262a); stroke: light-dark(#ced4da, #495057); stroke-width: 1.2;"/>
+  <text x="386" y="383" style="fill: light-dark(#1b1b1b, #e9ecef); font-size: 11px; font-family: monospace; font-weight: bold;">.agent_team_state.json</text>
+
+  <!-- ================= Column C: human side ================= -->
+  <!-- observer session (yellow) -->
+  <rect x="676" y="104" width="250" height="104" rx="10"
+        style="fill: light-dark(rgb(255,249,219), #33300f); stroke: light-dark(#f59f00, #a25800);
+               stroke-width: 1.5;"/>
+  <text x="801" y="128" text-anchor="middle"
+        style="fill: light-dark(#1b1b1b, #e9ecef); font-size: 11.5px; font-weight: bold;">2nd Claude Code / Codex session</text>
+  <text x="801" y="145" text-anchor="middle"
+        style="fill: light-dark(#a25800, #e8b04b); font-size: 10px;">independent, read-only observer</text>
+  <text x="801" y="171" text-anchor="middle"
+        style="fill: light-dark(#495057, #adb5bd); font-size: 10px;">reads plan.md &#183; progress.yaml &#183; status.md</text>
+  <text x="801" y="187" text-anchor="middle"
+        style="fill: light-dark(#495057, #adb5bd); font-size: 10px;">&#8594; plain-language status on demand</text>
+
+  <!-- human (dark chip) -->
+  <rect x="724" y="256" width="154" height="66" rx="10"
+        style="fill: light-dark(#343a40, #495057); stroke: light-dark(#212529, #ced4da); stroke-width: 1.5;"/>
+  <text x="801" y="284" text-anchor="middle"
+        style="fill: #ffffff; font-size: 14px; font-weight: bold;">Human</text>
+  <text x="801" y="303" text-anchor="middle"
+        style="fill: light-dark(#dee2e6, #dee2e6); font-size: 9.5px;">watches &#183; decides &#183; intervenes</text>
+
+  <!-- observer -> human -->
+  <line x1="801" y1="208" x2="801" y2="256" style="stroke: light-dark(#495057, #adb5bd); stroke-width: 1.5;" marker-end="url(#arrow)"/>
+  <text x="810" y="228" style="fill: light-dark(#868e96, #909296); font-size: 9px;">natural-language</text>
+  <text x="810" y="240" style="fill: light-dark(#868e96, #909296); font-size: 9px;">summary</text>
+
+  <!-- ================= cross-column flows ================= -->
+  <!-- run -> workspace -->
+  <line x1="314" y1="250" x2="360" y2="250" style="stroke: light-dark(#495057, #adb5bd); stroke-width: 1.6;" marker-end="url(#arrow)"/>
+  <text x="337" y="242" text-anchor="middle" style="fill: light-dark(#495057, #adb5bd); font-size: 9.5px;">write each turn</text>
+
+  <!-- workspace -> observer -->
+  <line x1="610" y1="150" x2="676" y2="150" style="stroke: light-dark(#495057, #adb5bd); stroke-width: 1.6;" marker-end="url(#arrow)"/>
+  <text x="643" y="142" text-anchor="middle" style="fill: light-dark(#495057, #adb5bd); font-size: 9.5px;">read</text>
+
+  <!-- human -> run: feedback triggers replan (grape) -->
+  <path d="M801,322 L801,512 L170,512 L170,420" fill="none"
+        style="stroke: light-dark(#6741d9, #b595ff); stroke-width: 2;" marker-end="url(#arrowfb)"/>
+  <text x="480" y="504" text-anchor="middle"
+        style="fill: light-dark(#5f3dc4, #b595ff); font-size: 11.5px; font-weight: bold; font-family: monospace;">--feedback &#183; --trigger-replan-with-feedback</text>
+  <text x="480" y="530" text-anchor="middle"
+        style="fill: light-dark(#5f3dc4, #b595ff); font-size: 10px;">stop (Ctrl-C), resume &#8594; jump straight into the replan sub-cycle</text>
+  <text x="480" y="545" text-anchor="middle"
+        style="fill: light-dark(#868e96, #909296); font-size: 9px;">resume-only &#183; appended to progress.yaml human_feedback[] &#183; folded into plan.md / acceptance-criteria.md</text>
+</svg>

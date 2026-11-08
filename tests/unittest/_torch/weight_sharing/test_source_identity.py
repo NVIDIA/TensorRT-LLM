@@ -1,0 +1,502 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Unit tests for the backend-agnostic SourceIdentity fingerprint.
+
+Mock-based: no real model or weights are touched. Fakes expose only the
+attributes that the fingerprint projection reads.
+"""
+
+import copy
+import re
+from pathlib import Path
+
+import pytest
+from _source_identity_fakes import (
+    FakeMapping,
+    FakeModel,
+    FakeModelConfig,
+    FakePretrainedConfig,
+    FakeQuantConfig,
+    FakeQuantConfigWithPythonOnlyField,
+    identity_from,
+    make_artifact_identity,
+)
+
+import tensorrt_llm._torch.weight_sharing as weight_sharing
+import tensorrt_llm._torch.weight_sharing.post_transform_profiles as post_transform_profiles
+from tensorrt_llm._torch.weight_sharing import (
+    LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    IdentityCheckPolicy,
+    SourceIdentity,
+    SourceIdentityMismatchError,
+    check_weight_sharing_compatibility,
+)
+from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig
+
+pytestmark = pytest.mark.cpu_only
+
+# Constant names of transform-layout ABIs, any version.
+_TRANSFORM_ABI_NAME = re.compile(r".*_POST_TRANSFORM_LAYOUT_ABI_V\d+")
+# Every transform-layout ABI that the package publishes.
+_PUBLISHED_TRANSFORM_ABI_IDS = tuple(
+    getattr(weight_sharing, name)
+    for name in weight_sharing.__all__
+    if _TRANSFORM_ABI_NAME.fullmatch(name)
+)
+
+
+def test_identical_configs_match():
+    a = identity_from(FakeModelConfig())
+    b = identity_from(FakeModelConfig())
+    result = a.matches(b)
+    assert result.matched
+    assert result.mismatched_fields == []
+    assert bool(result) is True
+
+
+def test_from_model_config_derives_artifact_identity(tmp_path: Path) -> None:
+    (tmp_path / "model.safetensors").write_bytes(b"checkpoint")
+    identity = SourceIdentity.from_model_config(FakeModelConfig(), checkpoint_dir=str(tmp_path))
+    assert identity.artifact_identity.scheme == "checkpoint_manifest_sha256"
+
+
+def test_from_model_config_requires_one_artifact_source() -> None:
+    config = FakeModelConfig()
+    with pytest.raises(ValueError, match="Exactly one"):
+        SourceIdentity.from_model_config(config)
+    with pytest.raises(ValueError, match="Exactly one"):
+        SourceIdentity.from_model_config(
+            config,
+            checkpoint_dir="/checkpoint",
+            artifact_identity=make_artifact_identity(),
+        )
+
+
+def test_transform_abi_ids_are_published_and_distinct() -> None:
+    """Every transform-layout ABI constant is published, with its own identifier."""
+    defined_names = {
+        name for name in vars(post_transform_profiles) if _TRANSFORM_ABI_NAME.fullmatch(name)
+    }
+    published_names = {
+        name for name in weight_sharing.__all__ if _TRANSFORM_ABI_NAME.fullmatch(name)
+    }
+    assert defined_names
+    assert published_names == defined_names
+    assert len(set(_PUBLISHED_TRANSFORM_ABI_IDS)) == len(_PUBLISHED_TRANSFORM_ABI_IDS)
+
+
+@pytest.mark.parametrize("transform_abi_id", _PUBLISHED_TRANSFORM_ABI_IDS)
+def test_from_model_config_binds_transform_abi(transform_abi_id: str) -> None:
+    """Each published transform-layout ABI is bound into the generated identity."""
+    identity = SourceIdentity.from_model_config(
+        FakeModelConfig(),
+        artifact_identity=make_artifact_identity(),
+        transform_abi_id=transform_abi_id,
+    )
+
+    assert identity.transform_abi_id == transform_abi_id
+
+
+@pytest.mark.parametrize("transform_abi_id", ["", 1])
+def test_source_identity_rejects_invalid_transform_abi(transform_abi_id: object) -> None:
+    with pytest.raises(ValueError, match="transform_abi_id"):
+        SourceIdentity.from_model_config(
+            FakeModelConfig(),
+            artifact_identity=make_artifact_identity(),
+            transform_abi_id=transform_abi_id,
+        )
+
+
+def test_rank_defaults_from_mapping():
+    cfg = FakeModelConfig(mapping=FakeMapping(rank=3, tp_rank=3))
+    identity = identity_from(cfg)
+    assert identity.rank == 3
+
+
+def test_backend_mismatch_flags_global():
+    a = identity_from(FakeModelConfig(attn_backend="TRTLLM"))
+    b = identity_from(FakeModelConfig(attn_backend="FLASHINFER"))
+    result = a.matches(b)
+    assert not result.matched
+    assert "backend_fingerprint" in result.mismatched_fields
+
+
+def test_moe_load_balancer_config_controls_backend_identity():
+    base = identity_from(FakeModelConfig())
+    standard = identity_from(FakeModelConfig(moe_load_balancer=MoeLoadBalancerConfig(num_slots=64)))
+    per_layer_dynamic = identity_from(
+        FakeModelConfig(moe_load_balancer=MoePerLayerDynamicLoadBalancerConfig(num_slots=72))
+    )
+    same_per_layer_dynamic = identity_from(
+        FakeModelConfig(moe_load_balancer=MoePerLayerDynamicLoadBalancerConfig(num_slots=72))
+    )
+
+    assert not base.matches(standard).matched
+    assert not standard.matches(per_layer_dynamic).matched
+    assert per_layer_dynamic.matches(same_per_layer_dynamic).matched
+
+
+def test_model_layout_field_mismatch_flags_global_and_shard():
+    a = identity_from(FakeModelConfig(pretrained_config=FakePretrainedConfig(hidden_size=4096)))
+    b = identity_from(FakeModelConfig(pretrained_config=FakePretrainedConfig(hidden_size=8192)))
+    result = a.matches(b)
+    assert not result.matched
+    assert "model_fingerprint" in result.mismatched_fields
+    assert "shard_fingerprint" in result.mismatched_fields
+
+
+def test_sliding_window_config_mismatch_flags_global():
+    # The realized sliding-window profile dimension needs no SourceIdentity
+    # change: the checkpoint config already separates windowed checkpoints.
+    a = identity_from(FakeModelConfig(pretrained_config=FakePretrainedConfig(sliding_window=None)))
+    b = identity_from(FakeModelConfig(pretrained_config=FakePretrainedConfig(sliding_window=4096)))
+    result = a.matches(b)
+    assert not result.matched
+    assert "model_fingerprint" in result.mismatched_fields
+
+
+def test_non_layout_model_metadata_does_not_affect_match():
+    a = identity_from(FakeModelConfig(pretrained_config=FakePretrainedConfig(repository_url="old")))
+    b = identity_from(FakeModelConfig(pretrained_config=FakePretrainedConfig(repository_url="new")))
+    assert a.matches(b).matched
+
+
+def test_param_dtype_override_flags_shard():
+    # Same config, but the constructed module realizes a different compute
+    # dtype (a runtime override). A config-only projection would miss this;
+    # the realized-layout fingerprint catches it.
+    cfg = FakeModelConfig()
+    a = SourceIdentity.from_model_config(
+        cfg,
+        FakeModel(cfg.pretrained_config, dtype="torch.bfloat16"),
+        artifact_identity=make_artifact_identity(),
+    )
+    b = SourceIdentity.from_model_config(
+        cfg,
+        FakeModel(cfg.pretrained_config, dtype="torch.float16"),
+        artifact_identity=make_artifact_identity(),
+    )
+    result = a.matches(b)
+    assert not result.matched
+    assert "shard_fingerprint" in result.mismatched_fields
+
+
+def test_cross_architecture_same_shapes_flags_global():
+    # Two models with identical tensor shapes but different architectures must
+    # not be considered layout-compatible (guards against shape collisions).
+    a = identity_from(
+        FakeModelConfig(pretrained_config=FakePretrainedConfig(architectures=("LlamaForCausalLM",)))
+    )
+    b = identity_from(
+        FakeModelConfig(
+            pretrained_config=FakePretrainedConfig(architectures=("MistralForCausalLM",))
+        )
+    )
+    result = a.matches(b)
+    assert not result.matched
+    assert "model_fingerprint" in result.mismatched_fields
+
+
+def test_different_checkpoint_artifacts_flag_global():
+    a = identity_from(FakeModelConfig(), artifact_key="fine-tune-a")
+    b = identity_from(FakeModelConfig(), artifact_key="fine-tune-b")
+    result = a.matches(b)
+    assert not result.matched
+    assert result.mismatched_fields == ["artifact_identity"]
+    assert a.global_fingerprint != b.global_fingerprint
+
+
+def test_no_model_degrades_to_architecture_only():
+    # Without a module, the shard fingerprint has no realized tensor layout,
+    # while matching artifacts and configurations remain comparable.
+    a = SourceIdentity.from_model_config(
+        FakeModelConfig(), None, artifact_identity=make_artifact_identity()
+    )
+    b = SourceIdentity.from_model_config(
+        FakeModelConfig(), None, artifact_identity=make_artifact_identity()
+    )
+    assert a.matches(b).matched
+
+
+def test_quant_mismatch_flags_global():
+    a = identity_from(FakeModelConfig(quant_config=FakeQuantConfig(quant_algo="FP8")))
+    b = identity_from(FakeModelConfig(quant_config=FakeQuantConfig(quant_algo="NVFP4")))
+    result = a.matches(b)
+    assert not result.matched
+    assert "quant_fingerprint" in result.mismatched_fields
+
+
+def test_quant_model_dump_uses_python_mode():
+    identity = identity_from(FakeModelConfig(quant_config=FakeQuantConfigWithPythonOnlyField()))
+    assert identity.quant_fingerprint
+
+
+def test_parallel_size_mismatch_flags_global():
+    a = identity_from(FakeModelConfig(mapping=FakeMapping(tp_size=8)))
+    b = identity_from(FakeModelConfig(mapping=FakeMapping(tp_size=4)))
+    result = a.matches(b)
+    assert not result.matched
+    assert "parallel_fingerprint" in result.mismatched_fields
+
+
+def _moe_finalize_config(*, disable_finalize_fusion: bool) -> FakeModelConfig:
+    config = FakeModelConfig()
+    config.moe_disable_finalize_fusion = disable_finalize_fusion
+    return config
+
+
+@pytest.mark.parametrize(
+    "config_a, config_b, mismatched_field",
+    [
+        pytest.param(
+            FakeModelConfig(mapping=FakeMapping(tp_size=2, moe_tp_size=2, moe_ep_size=1)),
+            FakeModelConfig(mapping=FakeMapping(tp_size=2, moe_tp_size=1, moe_ep_size=2)),
+            "parallel_fingerprint",
+            id="moe-tp-vs-moe-ep",
+        ),
+        pytest.param(
+            FakeModelConfig(
+                mapping=FakeMapping(tp_size=2, moe_tp_size=1, moe_ep_size=1, moe_cluster_size=1)
+            ),
+            FakeModelConfig(
+                mapping=FakeMapping(tp_size=2, moe_tp_size=1, moe_ep_size=1, moe_cluster_size=2)
+            ),
+            "parallel_fingerprint",
+            id="moe-cluster",
+        ),
+        pytest.param(
+            FakeModelConfig(moe_backend="CUTLASS"),
+            FakeModelConfig(moe_backend="TRTLLM"),
+            "backend_fingerprint",
+            id="moe-backend",
+        ),
+        pytest.param(
+            _moe_finalize_config(disable_finalize_fusion=False),
+            _moe_finalize_config(disable_finalize_fusion=True),
+            "backend_fingerprint",
+            id="moe-finalize-fusion",
+        ),
+    ],
+)
+def test_moe_partition_backend_and_finalize_mismatches_flag_global(
+    config_a: FakeModelConfig,
+    config_b: FakeModelConfig,
+    mismatched_field: str,
+) -> None:
+    result = identity_from(config_a).matches(identity_from(config_b))
+
+    assert not result.matched
+    assert mismatched_field in result.mismatched_fields
+
+
+def test_shard_mismatch_only():
+    # Same global layout, different per-rank slice.
+    a = identity_from(FakeModelConfig(mapping=FakeMapping(rank=0, tp_rank=0)))
+    b = identity_from(FakeModelConfig(mapping=FakeMapping(rank=1, tp_rank=1)))
+    result = a.matches(b)
+    assert not result.matched
+    assert result.mismatched_fields == ["shard_fingerprint"]
+    # Global parts still agree.
+    assert a.global_fingerprint == b.global_fingerprint
+
+
+def test_compare_global_only_ignores_shard():
+    a = identity_from(FakeModelConfig(mapping=FakeMapping(rank=0, tp_rank=0)))
+    b = identity_from(FakeModelConfig(mapping=FakeMapping(rank=1, tp_rank=1)))
+    assert a.matches(b, compare_shard=False).matched
+
+
+def test_enforced_sharing_skips_global():
+    # Divergent runs (different model + backend) but enforced sharing trusts
+    # the source by skipping the global comparison.
+    a = identity_from(FakeModelConfig(attn_backend="TRTLLM"))
+    b = identity_from(FakeModelConfig(attn_backend="FLASHINFER"))
+    assert a.matches(b, compare_global=False, compare_shard=False).matched
+
+
+def test_serialization_roundtrip():
+    a = identity_from(
+        FakeModelConfig(),
+        transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    )
+    restored = SourceIdentity.from_dict(a.to_dict())
+    assert restored == a
+    assert a.matches(restored).matched
+    assert restored.artifact_identity == a.artifact_identity
+
+
+def test_deserialization_rejects_missing_artifact_identity():
+    payload = identity_from(FakeModelConfig()).to_dict()
+    payload.pop("artifact_identity")
+    with pytest.raises(KeyError):
+        SourceIdentity.from_dict(payload)
+
+
+def test_deserialization_rejects_missing_transform_abi_field():
+    payload = identity_from(FakeModelConfig()).to_dict()
+    payload.pop("transform_abi_id")
+    with pytest.raises(KeyError):
+        SourceIdentity.from_dict(payload)
+
+
+def test_deserialization_rejects_unknown_format_version():
+    payload = identity_from(FakeModelConfig()).to_dict()
+    payload["format_version"] += 1
+    with pytest.raises(ValueError, match="Unsupported SourceIdentity format version"):
+        SourceIdentity.from_dict(payload)
+
+
+def test_deserialization_rejects_v1_identity_without_artifact_binding():
+    payload = identity_from(FakeModelConfig()).to_dict()
+    payload["format_version"] = 1
+    payload.pop("artifact_identity")
+    with pytest.raises(ValueError, match="Unsupported SourceIdentity format version"):
+        SourceIdentity.from_dict(payload)
+
+
+def test_deserialization_rejects_v2_identity_without_transform_abi_binding():
+    payload = identity_from(FakeModelConfig()).to_dict()
+    payload["format_version"] = 2
+    payload.pop("transform_abi_id")
+    with pytest.raises(ValueError, match="Unsupported SourceIdentity format version"):
+        SourceIdentity.from_dict(payload)
+
+
+def test_check_warn_fallback_on_mismatch():
+    local = identity_from(FakeModelConfig(attn_backend="TRTLLM"))
+    source = identity_from(FakeModelConfig(attn_backend="FLASHINFER"))
+    decision = check_weight_sharing_compatibility(local, source, IdentityCheckPolicy.WARN_FALLBACK)
+    assert decision.should_share is False
+    assert not decision.match_result.matched
+
+
+def test_check_warn_fallback_on_match():
+    local = identity_from(FakeModelConfig())
+    source = identity_from(FakeModelConfig())
+    decision = check_weight_sharing_compatibility(local, source, IdentityCheckPolicy.WARN_FALLBACK)
+    assert decision.should_share is True
+
+
+def test_check_warn_fallback_on_missing_identity():
+    source = identity_from(FakeModelConfig())
+    decision = check_weight_sharing_compatibility(None, source, IdentityCheckPolicy.WARN_FALLBACK)
+    assert decision.should_share is False
+    assert decision.match_result.mismatched_fields == ["local_identity"]
+
+
+def test_check_strict_raises_on_mismatch():
+    local = identity_from(FakeModelConfig(attn_backend="TRTLLM"))
+    source = identity_from(FakeModelConfig(attn_backend="FLASHINFER"))
+    with pytest.raises(SourceIdentityMismatchError):
+        check_weight_sharing_compatibility(local, source, IdentityCheckPolicy.STRICT)
+
+
+def test_check_strict_raises_on_missing_source_identity():
+    local = identity_from(FakeModelConfig())
+    with pytest.raises(SourceIdentityMismatchError):
+        check_weight_sharing_compatibility(local, None, IdentityCheckPolicy.STRICT)
+
+
+def test_check_enforce_shares_despite_mismatch():
+    local = identity_from(FakeModelConfig(attn_backend="TRTLLM"))
+    source = identity_from(FakeModelConfig(attn_backend="FLASHINFER"))
+    decision = check_weight_sharing_compatibility(local, source, IdentityCheckPolicy.ENFORCE)
+    assert decision.should_share is True
+
+
+def test_transform_abi_mismatch_is_never_bypassed():
+    local = identity_from(
+        FakeModelConfig(),
+        transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    )
+    source = identity_from(
+        FakeModelConfig(),
+        transform_abi_id="trtllm-llama-target-layout-v2",
+    )
+
+    result = local.matches(source, compare_global=False, compare_shard=False)
+    decision = check_weight_sharing_compatibility(
+        local,
+        source,
+        IdentityCheckPolicy.ENFORCE,
+    )
+
+    assert not result.matched
+    assert result.mismatched_fields == ["transform_abi_id"]
+    assert decision.should_share is False
+
+
+def test_transform_abi_participates_in_global_fingerprint():
+    without_abi = identity_from(FakeModelConfig())
+    with_abi = identity_from(
+        FakeModelConfig(),
+        transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    )
+
+    result = without_abi.matches(with_abi)
+
+    assert result.mismatched_fields == ["transform_abi_id"]
+    assert without_abi.global_fingerprint != with_abi.global_fingerprint
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [IdentityCheckPolicy.WARN_FALLBACK, IdentityCheckPolicy.ENFORCE],
+    ids=lambda policy: policy.value,
+)
+@pytest.mark.parametrize("source_transform_abi_id", (*_PUBLISHED_TRANSFORM_ABI_IDS, None))
+@pytest.mark.parametrize("local_transform_abi_id", _PUBLISHED_TRANSFORM_ABI_IDS)
+def test_transform_abi_shares_only_with_the_same_abi(
+    local_transform_abi_id: str,
+    source_transform_abi_id: str | None,
+    policy: IdentityCheckPolicy,
+) -> None:
+    """A receiver shares only with a donor of the same published ABI, under either policy."""
+    should_share = source_transform_abi_id == local_transform_abi_id
+    local = identity_from(FakeModelConfig(), transform_abi_id=local_transform_abi_id)
+    source = identity_from(FakeModelConfig(), transform_abi_id=source_transform_abi_id)
+
+    decision = check_weight_sharing_compatibility(local, source, policy)
+
+    assert decision.should_share is should_share
+    assert decision.match_result.mismatched_fields == ([] if should_share else ["transform_abi_id"])
+    assert (local.global_fingerprint == source.global_fingerprint) is should_share
+
+
+def test_format_version_mismatch_never_matches():
+    a = identity_from(FakeModelConfig())
+    b = (
+        copy.replace(a, format_version=a.format_version + 1)
+        if hasattr(copy, "replace")
+        else SourceIdentity(
+            format_version=a.format_version + 1,
+            artifact_identity=a.artifact_identity,
+            model_fingerprint=a.model_fingerprint,
+            quant_fingerprint=a.quant_fingerprint,
+            backend_fingerprint=a.backend_fingerprint,
+            parallel_fingerprint=a.parallel_fingerprint,
+            rank=a.rank,
+            shard_fingerprint=a.shard_fingerprint,
+        )
+    )
+    result = a.matches(b)
+    enforce_decision = check_weight_sharing_compatibility(
+        a,
+        b,
+        IdentityCheckPolicy.ENFORCE,
+    )
+    assert not result.matched
+    assert "format_version" in result.mismatched_fields
+    assert enforce_decision.should_share is False

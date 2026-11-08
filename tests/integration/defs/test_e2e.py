@@ -1,0 +1,1527 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Any, Optional, Tuple
+
+import pytest
+import yaml
+from defs.trt_test_alternative import check_call, check_output
+
+from .conftest import (get_sm_version, llm_models_root, skip_post_blackwell,
+                       skip_pre_ada, skip_pre_blackwell, skip_pre_hopper,
+                       unittest_path)
+
+_MEM_FRACTION_50 = 0.5
+_MEM_FRACTION_80 = 0.8
+_MEM_FRACTION_95 = 0.95
+
+_MINIMAX_M3_EVAL_CONFIG = {
+    # This is required for minimax M3.
+    "sparse_attention_config": {
+        "algorithm": "minimax_m3",
+        "implementation": "msa",
+    },
+    # The below are to prevent OOMs in CI - the model's 1M context length is too large.
+    "kv_cache_config": {
+        "enable_block_reuse": False,
+    },
+    "max_seq_len": 4096,
+}
+
+
+@pytest.mark.parametrize("model_name,model_path", [
+    ("Qwen3/Qwen3-0.6B", "Qwen3/Qwen3-0.6B"),
+])
+def test_qwen_e2e_cpprunner_large_new_tokens(model_name, model_path, llm_venv):
+    """RCCA: https://nvbugs/5238105 - none of n>1 sequences may be empty."""
+    from tensorrt_llm import LLM, SamplingParams
+
+    prompt = r"The operation $\otimes$ is defined for all nonzero numbers by $a \otimes b = \frac{a^{2}}{b}$. Determine $[(1 \otimes 2) \otimes 3] - [1 \otimes (2 \otimes 3)]$. Let's think step by step."
+
+    sampling_params = SamplingParams(
+        max_tokens=1024,
+        n=4,
+        temperature=0.6,
+        top_p=1.0,
+        top_k=1024,
+    )
+
+    with LLM(model=f"{llm_models_root()}/{model_path}",
+             max_batch_size=8,
+             max_seq_len=4224) as llm:
+        prompt = llm.tokenizer.apply_chat_template(
+            [{
+                "role": "user",
+                "content": prompt
+            }],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        outputs = llm.generate([prompt], sampling_params=sampling_params)
+
+    completions = outputs[0].outputs
+    seq_lengths = [len(c.token_ids) for c in completions]
+    assert all(length > 0 for length in seq_lengths), \
+        f"Found zero-length completion: {seq_lengths}"
+
+
+# TODO replace the trtllm_bench_prolog
+class BenchRunner:
+
+    def __init__(self,
+                 llm_root: str,
+                 llm_venv: Any,
+                 model_subdir: str,
+                 model_name: str,
+                 streaming: bool,
+                 tp_size: int,
+                 extra_llm_api_options: Optional[str] = None,
+                 use_mpirun: bool = False,
+                 concurrency: Optional[int] = None,
+                 num_requests: int = 10,
+                 ep_size: Optional[int] = None,
+                 max_batch_size: Optional[int] = None,
+                 max_num_tokens: Optional[int] = None,
+                 warmup: Optional[int] = None,
+                 eos_id: Optional[int] = None,
+                 kv_cache_free_gpu_mem_fraction: Optional[float] = None,
+                 scheduler_policy: Optional[str] = None,
+                 input_mean: int = 128,
+                 output_mean: int = 128,
+                 input_stdev: int = 0,
+                 output_stdev: int = 0):
+
+        llm_models = llm_models_root()
+        assert llm_models is not None
+        self.llm_root = llm_root
+        self.llm_venv = llm_venv
+        self.model_path = Path(llm_models, model_subdir).absolute()
+        self.model_name = model_name
+        self.streaming = streaming
+        self.use_mpirun = use_mpirun
+        self.tp_size = tp_size
+        self.extra_llm_api_options = extra_llm_api_options
+
+        self.work_dir = Path(tempfile.TemporaryDirectory().name)
+
+        self.dataset_path = os.path.join(self.work_dir, "data.txt")
+        if self.use_mpirun:
+            self.mpirun_cmd = f"mpirun --allow-run-as-root -n {self.tp_size} trtllm-llmapi-launch"
+        else:
+            self.mpirun_cmd = ""
+        self.concurrency = concurrency
+        self.num_requests = num_requests
+        self.ep_size = ep_size
+        self.max_batch_size = max_batch_size
+        self.max_num_tokens = max_num_tokens
+        self.warmup = warmup
+        self.eos_id = eos_id
+        self.kv_cache_free_gpu_mem_fraction = kv_cache_free_gpu_mem_fraction
+        self.scheduler_policy = scheduler_policy
+        self.input_mean = input_mean
+        self.output_mean = output_mean
+        self.input_stdev = input_stdev
+        self.output_stdev = output_stdev
+
+    def __call__(self):
+        self.prepare_dataset()
+        return self.run_bench()
+
+    def prepare_dataset(self):
+        # Generate a small dataset to run a test.
+        self.work_dir.mkdir(parents=True)
+        command = [
+            "trtllm-bench",
+            "--model",
+            f"{self.model_path}",
+            "prepare-dataset",
+            "--output",
+            f"{self.dataset_path}",
+            "token-norm-dist",
+            "--input-mean",
+            str(self.input_mean),
+            "--output-mean",
+            str(self.output_mean),
+            "--input-stdev",
+            str(self.input_stdev),
+            "--output-stdev",
+            str(self.output_stdev),
+            "--num-requests",
+            str(self.num_requests),
+        ]
+        print(f"Running command: {' '.join(command)}")
+        check_call(" ".join(command), shell=True, env=self.llm_venv._new_env)
+
+    def run_bench(self):
+        streaming = "--streaming" if self.streaming else ""
+        benchmark_cmd = \
+            f"{self.mpirun_cmd} " \
+            f"trtllm-bench --model {self.model_name} --model_path {self.model_path} " \
+            f"throughput " \
+            f"--tp {self.tp_size} "
+        benchmark_cmd += f" --dataset {self.dataset_path} {streaming}"
+
+        benchmark_cmd += " --backend pytorch"
+
+        if self.extra_llm_api_options:
+            benchmark_cmd += f" --extra_llm_api_options {self.extra_llm_api_options}"
+        if self.concurrency:
+            benchmark_cmd += f" --concurrency {self.concurrency}"
+        if self.num_requests:
+            benchmark_cmd += f" --num_requests {self.num_requests}"
+        if self.ep_size is not None:
+            benchmark_cmd += f" --ep {self.ep_size}"
+        if self.max_batch_size is not None:
+            benchmark_cmd += f" --max_batch_size {self.max_batch_size}"
+        if self.max_num_tokens is not None:
+            benchmark_cmd += f" --max_num_tokens {self.max_num_tokens}"
+        if self.warmup is not None:
+            benchmark_cmd += f" --warmup {self.warmup}"
+        if self.eos_id is not None:
+            benchmark_cmd += f" --eos_id {self.eos_id}"
+        if self.kv_cache_free_gpu_mem_fraction is not None:
+            benchmark_cmd += f" --kv_cache_free_gpu_mem_fraction {self.kv_cache_free_gpu_mem_fraction}"
+        if self.scheduler_policy is not None:
+            benchmark_cmd += f" --scheduler_policy {self.scheduler_policy}"
+
+        benchmark_output = check_output(benchmark_cmd,
+                                        shell=True,
+                                        env=self.llm_venv._new_env)
+        return self.parse_benchmark_output(benchmark_output)
+
+    def parse_benchmark_output(self, output):
+        """Parse the benchmark output to extract key metrics."""
+        result = {
+            'concurrency': self.concurrency,
+            'num_requests': self.num_requests,
+            'throughput': 0,
+            'latency': 0
+        }
+
+        lines = output.split('\n')
+        for line in lines:
+            line = line.strip()
+            if 'total token throughput' in line.lower(
+            ) and 'tokens/sec' in line.lower():
+                try:
+                    throughput = line.split(":")[1].strip()
+                    result['throughput'] = throughput
+                except (IndexError, ValueError) as e:
+                    print(
+                        f"Failed to parse throughput from line: {line}. Error: {e}"
+                    )
+            elif 'total latency' in line.lower() and 'ms' in line.lower():
+                try:
+                    latency = line.split(":")[1].strip()
+                    result['latency'] = latency
+                except (IndexError, ValueError) as e:
+                    print(
+                        f"Failed to parse latency from line: {line}. Error: {e}"
+                    )
+
+        return result
+
+
+def test_trtllm_bench_invalid_token_pytorch(llm_root, llm_venv):
+    model_name = "Qwen3-0.6B"
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    # Prepare dataset with invalid tokens
+    _, dataset_path = trtllm_bench_prolog(llm_root,
+                                          llm_venv,
+                                          model_subdir=qwen_model_root,
+                                          model_name=model_name,
+                                          quant=None,
+                                          streaming=False)
+    with open(dataset_path) as f:
+        dataset = [json.loads(line) for line in f.readlines()]
+    dataset[0]["input_ids"][-1] = -1
+    with open(dataset_path, "w") as f:
+        f.writelines(f"{json.dumps(data)}\n" for data in dataset)
+
+    # Run benchmark
+    extra_options = {
+        "cuda_graph_config": {
+            "enable_padding": True,
+            "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256, 384],
+        },
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        extra_options_path = Path(tmpdir) / "extra-llm-api-options.yml"
+        with open(extra_options_path, "w") as f:
+            yaml.dump(extra_options, f)
+
+        output_path = Path(tmpdir) / "stdout.log"
+        benchmark_cmd = \
+                f"trtllm-bench --model {model_name} " \
+                f"--model_path {qwen_model_root} " \
+                f"throughput " \
+                f"--dataset {str(dataset_path)} --backend pytorch " \
+                f"--config {extra_options_path} " \
+                f"> {output_path} 2>&1"
+        # Check clean shutdown (no hang)
+        with pytest.raises(subprocess.CalledProcessError) as exc_info:
+            check_call(benchmark_cmd, shell=True, env=llm_venv._new_env)
+        # Check non-zero exit code
+        assert exc_info.value.returncode != 0
+        with open(output_path) as f:
+            stdout = f.read()
+
+    # Check that error is reported correctly
+    assert "Requests failed: Token ID out of range (1 requests)" in stdout
+
+
+def trtllm_bench_prolog(llm_root, llm_venv, model_subdir, model_name: str,
+                        quant: str, streaming: bool) -> Tuple[Path, Path]:
+    """Generate dataset for benchmark.
+
+    Returns:
+        Tuple[Path, Path]: model_path and dataset_path.
+    """
+    llm_models = llm_models_root()
+    # skip when llm_models_root is None
+    if llm_models is None:
+        return
+
+    model_path = Path(llm_models, model_subdir).absolute()
+    quant_name = quant if quant is not None else "FP16"
+    stream_mode = "streaming" if streaming else "non-streaming"
+    benchmark_name = f"trtllm-bench-sanity-{quant_name}-{stream_mode}"
+
+    work_dir = Path(tempfile.TemporaryDirectory().name)
+    dataset_path = Path(work_dir, f"{benchmark_name}.txt")
+    # Clean up an existing directory if it exists
+    shutil.rmtree(work_dir, ignore_errors=True)
+    # Generate a small dataset to run a test.
+    work_dir.mkdir(parents=True)
+    dataset_cmd = [
+        "trtllm-bench",
+        "--model",
+        f"{model_path}",
+        "prepare-dataset",
+        "--output",
+        f"{dataset_path}",
+        "token-norm-dist",
+        "--input-mean",
+        "128",
+        "--output-mean",
+        "128",
+        "--input-stdev",
+        "0",
+        "--output-stdev",
+        "0",
+        "--num-requests",
+        "10",
+    ]
+    check_output(" ".join(dataset_cmd), shell=True)
+
+    return model_path, dataset_path
+
+
+@pytest.fixture
+def get_tmp_file():
+    return tempfile.mkstemp()
+
+
+@pytest.fixture
+def temp_extra_llm_api_options_file(request):
+    if request.node.callspec.params['use_extra_config']:
+        temp_dir = tempfile.gettempdir()
+        temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
+        try:
+            extra_llm_api_options_dict = {
+                "enable_chunked_prefill": False,
+                "kv_cache_config": {
+                    "enable_block_reuse": False,
+                    "max_tokens": 40000
+                },
+                "num_postprocess_workers": 2,
+            }
+
+            pytorch_backend_config = {}
+            if request.node.callspec.params['pytorch_backend_config']:
+                pytorch_backend_config = {
+                    "cuda_graph_config": {},
+                    # trtllm-bench will set cuda_max_batch_size to
+                    # max_batch_size, so the cuda_graph_batch_sizes is not
+                    # needed.
+                    # "cuda_graph_batch_sizes": [1, 2, 3],
+                }
+            # Flatten the pytorch_backend_config
+            extra_llm_api_options_dict.update(pytorch_backend_config)
+
+            with open(temp_file_path, 'w') as f:
+                yaml.dump(extra_llm_api_options_dict, f)
+
+            yield temp_file_path
+        finally:
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+    else:
+        assert not request.node.callspec.params['pytorch_backend_config']
+        yield None
+
+
+def test_trtllm_serve_example(llm_root, llm_venv):
+    example_root = Path(os.path.join(llm_root, "examples", "serve"))
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_trtllm_serve_example.py")])
+
+
+def test_trtllm_serve_multimodal_example(llm_root, llm_venv):
+    example_root = Path(os.path.join(llm_root, "examples", "serve"))
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_trtllm_serve_multimodal_example.py")
+    ])
+
+
+def test_trtllm_serve_lora_example(llm_root, llm_venv):
+    example_root = Path(os.path.join(llm_root, "examples", "serve"))
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_trtllm_serve_lora.py")])
+
+
+@pytest.mark.parametrize("backend", ["pytorch"])
+def test_trtllm_serve_top_logprobs(llm_root, llm_venv, backend: str):
+    example_root = Path(os.path.join(llm_root, "examples", "serve"))
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pip", "install", "-r",
+        os.path.join(example_root, "requirements.txt")
+    ])
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_trtllm_serve_top_logprobs.py"), "-k", backend
+    ])
+
+
+@pytest.mark.parametrize("backend", ["pytorch"])
+def test_openai_misc_example(llm_root, llm_venv, backend: str):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_misc.py"), "-k", backend
+    ])
+
+
+@pytest.mark.skip_less_device(4)
+def test_openai_kv_cache_contamination(llm_root, llm_venv):
+    """NVBug 6025177 regression: cross-request KV-cache contamination on cancel-during-chunked-prefill.
+
+    PyTorch backend only — the bug lives in
+    the PyExecutor chunked-prefill / store_context_blocks path.
+    """
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest", "-v",
+        str(test_root / "_test_openai_kv_cache_contamination.py")
+    ])
+
+
+def test_trtllm_serve_profile_example(llm_root, llm_venv):
+    """Wrapper for the CPU-only profile-endpoint smoke tests.
+
+    Runs ``tests/unittest/llmapi/apps/_test_trtllm_serve_profile.py``
+    which binds the ``OpenAIServer.start_profile`` / ``stop_profile``
+    handlers to a mock generator (no GPU, no model) and verifies
+    request parsing, default values, and the asyncio.to_thread
+    event-loop guarantee. Following the existing apps/ wrapper
+    pattern so the file is discovered via
+    ``test_e2e.py::test_trtllm_serve_profile_example`` rather than a
+    direct ``unittest/llmapi/apps/_test_*.py`` entry in the test-db
+    YAML.
+    """
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_trtllm_serve_profile.py")])
+
+
+@pytest.mark.parametrize("backend", ["pytorch"])
+def test_openai_completions_example(llm_root, llm_venv, backend: str):
+    test_root = unittest_path() / "llmapi" / "apps"
+    filter_expr = f"{backend} and not sampler"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_completions.py"), "-k", filter_expr
+    ])
+
+
+@pytest.mark.parametrize("backend", ["pytorch"])
+def test_openai_chat_example(llm_root, llm_venv, backend: str):
+    test_root = unittest_path() / "llmapi" / "apps"
+    filter_expr = f"{backend} and not sampler"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_chat.py"), "-k", filter_expr
+    ])
+
+
+@pytest.mark.parametrize("backend", ["pytorch"])
+def test_openai_reasoning(llm_root, llm_venv, backend: str):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_reasoning.py"), "-k", backend
+    ])
+
+
+def test_openai_tool_call(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_tool_call.py")])
+
+
+def test_openai_post_processor(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_post_processor.py")])
+
+
+def test_openai_completions_with_logit_bias(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_completions.py"), "-k",
+        "logit_bias_effect"
+    ])
+
+
+def test_openai_chat_with_logit_bias(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_chat.py"), "-k", "logit_bias_effect"
+    ])
+
+
+def test_openai_perf_metrics(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_perf_metrics.py")])
+
+
+@skip_pre_hopper
+def test_openai_chat_harmony(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_chat_harmony.py")])
+
+
+@skip_pre_hopper
+def test_openai_chat_harmony_perf_metrics(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_chat_harmony_perf_metrics.py")
+    ])
+
+
+def test_anthropic_messages(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_anthropic_messages.py")])
+
+
+def test_openai_responses(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_responses.py")])
+
+
+def test_openai_responses_entrypoint(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_responses_entrypoint.py")
+    ])
+
+
+def test_openai_health(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_metrics.py"), "-k", "test_health"
+    ])
+
+
+def test_openai_prometheus(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_prometheus.py")])
+
+
+def test_openai_multi_frontend(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_multi_frontend.py")])
+
+
+def test_openai_lora(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_openai_lora.py")])
+
+
+def test_openai_chat_multimodal_example(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m",
+        "pytest",
+        str(test_root / "_test_openai_chat_multimodal.py"),
+        "-m",
+        "not needs_l40s",
+    ])
+
+
+def test_openai_mmencoder_example(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_mmencoder.py")])
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    [pytest.param("openai/gpt-oss-120b", marks=skip_pre_blackwell)])
+def test_openai_chat_guided_decoding(llm_root, llm_venv, model_name: str):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_chat_guided_decoding.py"), "-k",
+        model_name
+    ])
+
+
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize(
+    "model_name", [pytest.param("gpt_oss/gpt-oss-20b", marks=skip_pre_hopper)])
+def test_trtllm_benchmark_serving(llm_venv, model_name):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root /
+            f"_test_trtllm_serve_benchmark.py::test_trtllm_serve_benchmark[{model_name}]"
+            )
+    ])
+
+
+@pytest.mark.skip_less_device_memory(80000)
+def test_trtllm_multimodal_benchmark_serving(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_trtllm_serve_multimodal_benchmark.py")
+    ])
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("service_discovery", ["etcd"])
+def test_openai_disagg_multi_nodes_completion_service_discovery(
+        llm_root, llm_venv, service_discovery):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m",
+        "pytest",
+        str(test_root /
+            f"_test_disagg_serving_multi_nodes_service_discovery.py::test_completion[{service_discovery}]"
+            ),
+    ])
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("gen_config",
+                         ["gen_tp2pp1", "gen_tp1pp2", "gen_tp1pp1"])
+@pytest.mark.parametrize("ctx_config",
+                         ["ctx_tp2pp1", "ctx_tp1pp2", "ctx_tp1pp1"])
+def test_openai_disagg_multi_nodes_completion(llm_root, llm_venv, ctx_config,
+                                              gen_config):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m",
+        "pytest",
+        str(test_root /
+            f"_test_disagg_serving_multi_nodes.py::test_completion[{ctx_config}-{gen_config}]"
+            ),
+    ])
+
+
+### PyTorch examples
+
+
+def parse_output(text):
+    results = []
+    text_lists = re.split(r"\[\d+\] Prompt:", text)
+    for item in text_lists:
+        item = item.replace(os.linesep, "")
+        while True:
+            match = re.search(r'Generated text: ([\'"])(.*?)\1', item,
+                              re.MULTILINE)
+            if match is None:
+                break
+            _, end = match.span(1)
+            results.append(match.group(2))
+            item = item[end:]
+    return results
+
+
+@pytest.mark.parametrize("model_name,model_path", [
+    ("Llama3.2-11B-BF16", "llama-3.2-models/Llama-3.2-11B-Vision"),
+    ("Nemotron4_4B-BF16", "nemotron/Minitron-4B-Base"),
+    pytest.param('Qwen3-30B-A3B',
+                 'Qwen3/Qwen3-30B-A3B',
+                 marks=pytest.mark.skip_less_device_memory(80000)),
+    pytest.param(
+        'Qwen3-30B-A3B_fp8_hf',
+        'Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf',
+        marks=(skip_pre_hopper, pytest.mark.skip_less_device_memory(40000))),
+    pytest.param(
+        'Qwen3-30B-A3B_nvfp4_hf',
+        'Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf',
+        marks=(skip_pre_blackwell, pytest.mark.skip_less_device_memory(20000))),
+    pytest.param('GPT-OSS-20B', 'gpt_oss/gpt-oss-20b',
+                 marks=skip_pre_blackwell),
+    pytest.param(
+        'GPT-OSS-120B', 'gpt_oss/gpt-oss-120b', marks=skip_pre_blackwell),
+    pytest.param(
+        'Qwen3-8b-fp8', 'Qwen3/nvidia-Qwen3-8B-FP8', marks=skip_pre_hopper),
+    pytest.param('Qwen3-8b-nvfp4',
+                 'Qwen3/nvidia-Qwen3-8B-NVFP4',
+                 marks=skip_pre_blackwell),
+    ("Qwen3-8B-bf16", "Qwen3/Qwen3-8B"),
+    pytest.param(
+        'Qwen3-14b-fp8', 'Qwen3/nvidia-Qwen3-14B-FP8', marks=skip_pre_hopper),
+    pytest.param('Qwen3-14b-nvfp4',
+                 'Qwen3/nvidia-Qwen3-14B-NVFP4',
+                 marks=skip_pre_blackwell),
+    ("Qwen3-14B-bf16", "Qwen3/Qwen3-14B"),
+    pytest.param('Qwen3-32b-nvfp4',
+                 'Qwen3/nvidia-Qwen3-32B-NVFP4',
+                 marks=skip_pre_blackwell),
+    ("Qwen3-32B-bf16", "Qwen3/Qwen3-32B"),
+    pytest.param('Nemotron-Nano-9B-v2-nvfp4',
+                 'NVIDIA-Nemotron-Nano-9B-v2-NVFP4',
+                 marks=skip_pre_blackwell),
+    pytest.param('Qwen3.6-35B-A3B-nvfp4',
+                 'Qwen3.6-35B-A3B-NVFP4',
+                 marks=skip_pre_blackwell),
+])
+def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    if model_name == "Nemotron-Nano-9B-v2-nvfp4":
+        llm_venv.run_cmd([
+            str(example_root / "quickstart_advanced.py"),
+            "--disable_kv_cache_reuse",
+            "--trust_remote_code",
+            "--max_batch_size=8",
+            "--model_dir",
+            f"{llm_models_root()}/{model_path}",
+        ])
+    else:
+        mapping = {
+            "Llama3.2-11B-BF16": 18.88,
+            "Nemotron4_4B-BF16": 12.50,
+        }
+        cmds = [
+            str(example_root / "quickstart_advanced.py"),
+            "--enable_chunked_prefill",
+            f"--model_dir={llm_models_root()}/{model_path}",
+        ]
+        if "Qwen3" in model_name:
+            cmds.append("--kv_cache_fraction=0.6")
+        if "Qwen3.6-35B-A3B" in model_name:
+            # Hybrid linear-attention model: the Mamba cache preallocates a
+            # recurrent state per sequence slot, so cap the batch size.
+            cmds.append("--max_batch_size=1")
+        llm_venv.run_cmd(cmds)
+
+
+@pytest.mark.parametrize("model_name,model_path", [
+    ("DeepSeek-V3-Lite-BF16", "DeepSeek-V3-Lite/bf16"),
+])
+def test_ptp_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
+                                     model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--use_cuda_graph",
+        "--spec_decode_max_draft_len",
+        "1",  # test 1 MTP module
+        "--spec_decode_algo",
+        "MTP",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+    ])
+
+
+@pytest.mark.parametrize("model_name,model_path", [
+    ("DeepSeek-V3-Lite-BF16", "DeepSeek-V3-Lite/bf16"),
+])
+def test_ptp_quickstart_advanced_mtp_eagle(llm_root, llm_venv, model_name,
+                                           model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--use_cuda_graph",
+        "--spec_decode_max_draft_len",
+        "3",
+        "--spec_decode_algo",
+        "MTP",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+    ])
+
+
+@pytest.mark.skip_less_device(4)
+def test_ptp_quickstart_advanced_bs1(llm_root, llm_venv):
+    model_name = "DeepSeek-V3-Lite-FP8"
+    model_path = "DeepSeek-V3-Lite/fp8"
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--use_cuda_graph",
+        "--cuda_graph_padding_enabled",
+        "--cuda_graph_batch_sizes",
+        "8",
+        "--disable_overlap_scheduler",
+        "--enable_attention_dp",
+        "--tp_size",
+        "4",
+        "--moe_ep_size",
+        "4",
+        "--prompt",
+        "\"NVIDIA is a great company because\"",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+    ])
+
+
+@pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
+    pytest.param('GPT-OSS-120B-Eagle3',
+                 'gpt_oss/gpt-oss-120b',
+                 'gpt_oss/gpt-oss-120b-Eagle3',
+                 marks=skip_pre_blackwell),
+])
+def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
+                                        model_path, eagle_model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--spec_decode_max_draft_len",
+        "4",
+        "--spec_decode_algo",
+        "eagle3",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--draft_model_dir",
+        f"{llm_models_root()}/{eagle_model_path}",
+        "--disable_kv_cache_reuse",
+        "--disable_overlap_scheduler",
+    ])
+
+
+@skip_post_blackwell
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("model_name,model_path", [
+    pytest.param(
+        'DeepSeek-V3-Lite-FP8', 'DeepSeek-V3-Lite/fp8', marks=skip_pre_hopper),
+])
+def test_ptp_quickstart_advanced_deepseek_v3_lite_4gpus_adp_balance(
+        llm_root, llm_venv, model_name, model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--moe_tp_size=1",
+        "--moe_ep_size=4",
+        "--tp_size=4",
+        "--use_cuda_graph",
+        "--enable_attention_dp",
+        f"--kv_cache_fraction={_MEM_FRACTION_95}",
+        "--max_batch_size=1",
+        "--max_seq_len=3000",
+        "--disable_kv_cache_reuse",
+        "--attention_dp_enable_balance",
+        "--attention_dp_time_out_iters",
+        "10",
+        "--attention_dp_batching_wait_iters",
+        "10",
+    ])
+
+
+@skip_post_blackwell
+@pytest.mark.skip_less_device_memory(110000)
+@pytest.mark.skip_less_mpi_world_size(8)
+@pytest.mark.parametrize("model_name,model_path", [
+    pytest.param(
+        'DeepSeek-R1', 'DeepSeek-R1/DeepSeek-R1', marks=skip_pre_hopper),
+    pytest.param('DeepSeek-R1-0528-FP4',
+                 'DeepSeek-R1/DeepSeek-R1-0528-FP4',
+                 marks=skip_pre_blackwell),
+])
+def test_ptp_quickstart_advanced_deepseek_r1_8gpus(llm_root, llm_venv,
+                                                   model_name, model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--moe_tp_size=1",
+        "--moe_ep_size=8",
+        "--tp_size=8",
+        "--use_cuda_graph",
+        "--enable_attention_dp",
+        f"--kv_cache_fraction={_MEM_FRACTION_95}",
+        "--max_batch_size=1",
+        "--max_seq_len=3000",
+        "--disable_kv_cache_reuse",
+    ])
+
+
+@pytest.mark.skip_less_device_memory(110000)
+@pytest.mark.skip_less_mpi_world_size(8)
+@pytest.mark.parametrize("model_name,model_path", [
+    pytest.param(
+        'DeepSeek-R1', 'DeepSeek-R1/DeepSeek-R1', marks=skip_pre_hopper),
+])
+def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
+        llm_root, llm_venv, model_name, model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    is_blackwell = get_sm_version() > 90
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--moe_tp_size=1",
+        "--moe_ep_size=8",
+        "--tp_size=8",
+        "--use_cuda_graph",
+        f"--kv_cache_fraction={_MEM_FRACTION_50 if is_blackwell else _MEM_FRACTION_95}",
+        "--max_batch_size=1",
+        "--max_seq_len=3000",
+        "--disable_kv_cache_reuse",
+        "--spec_decode_algo",
+        "MTP",
+        "--spec_decode_max_draft_len",
+        "5",
+        "--use_relaxed_acceptance_for_thinking",
+        "--relaxed_topk=10",
+        "--relaxed_delta=0.5",
+        "--enable_attention_dp",
+        "--moe_backend",
+        "DEEPGEMM" if is_blackwell else "CUTLASS",
+    ])
+
+
+@skip_pre_ada
+@skip_post_blackwell
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_mpi_world_size(8)
+@pytest.mark.parametrize("model_name,model_path", [
+    pytest.param('DeepSeek-R1-W4AFP8',
+                 'DeepSeek-R1/DeepSeek-R1-W4AFP8',
+                 marks=skip_pre_hopper),
+])
+def test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus(
+        llm_root, llm_venv, model_name, model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    llm_venv.run_cmd([
+        str(example_root / "quickstart_advanced.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--moe_tp_size=1",
+        "--moe_ep_size=8",
+        "--tp_size=8",
+        "--use_cuda_graph",
+        f"--kv_cache_fraction={_MEM_FRACTION_50}",
+        "--max_batch_size=1",
+        "--max_seq_len=512",
+    ])
+
+
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(140000)
+@pytest.mark.skip_less_mpi_world_size(8)
+def test_deepseek_r1_mtp_bench(llm_root, llm_venv):
+    """Test DeepSeek-R1 FP4 with MTP speculative decoding using BenchRunner.
+
+    The goal is to test the bug fix for https://nvbugs/5670108.
+    Average input sequence length: 1k, average output sequence length: 10k.
+    """
+    model_name = "nvidia/DeepSeek-R1-FP4"
+    model_path = "DeepSeek-R1/DeepSeek-R1-FP4"
+    print(f"Testing {model_name} with MTP speculative decoding.")
+
+    # Create extra_llm_api_options YAML with MTP config
+    extra_config = {
+        "print_iter_log": True,
+        "enable_layerwise_nvtx_marker": False,
+        "disable_overlap_scheduler": False,
+        "enable_iter_perf_stats": True,
+        "enable_chunked_prefill": False,
+        "stream_interval": 20,
+        "scheduler_config": {
+            "capacity_scheduler_policy": "MAX_UTILIZATION",
+            "context_chunking_policy": "FIRST_COME_FIRST_SERVED",
+        },
+        "kv_cache_config": {
+            "free_gpu_memory_fraction": 0.1,
+            "enable_block_reuse": False,
+            "dtype": "fp8",
+        },
+        "enable_attention_dp": True,
+        "moe_config": {
+            "backend": "CUTLASS",
+        },
+        "cuda_graph_config": {
+            "enable_padding": True,
+            "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512],
+        },
+        "attention_dp_config": {
+            "enable_balance": True,
+            "batching_wait_iters": 10,
+            "timeout_iters": 500,
+        },
+        "speculative_config": {
+            "decoding_type": "MTP",
+            "max_draft_len": 1,
+        },
+    }
+
+    temp_dir = tempfile.gettempdir()
+    extra_config_path = os.path.join(temp_dir, "deepseek_r1_mtp_config.yaml")
+    with open(extra_config_path, 'w') as f:
+        yaml.dump(extra_config, f)
+
+    try:
+        runner = BenchRunner(
+            llm_root=llm_root,
+            llm_venv=llm_venv,
+            model_name=model_name,
+            model_subdir=model_path,
+            streaming=False,
+            use_mpirun=False,
+            tp_size=8,
+            ep_size=8,
+            concurrency=512,
+            num_requests=512,
+            max_batch_size=512,
+            max_num_tokens=4608,
+            warmup=0,
+            eos_id=1,
+            kv_cache_free_gpu_mem_fraction=0.6,
+            scheduler_policy="max_utilization",
+            extra_llm_api_options=extra_config_path,
+            input_mean=1000,
+            output_mean=10000,
+            input_stdev=0,
+            output_stdev=0,
+        )
+        result = runner()
+        print(f"Benchmark result: {result}")
+    finally:
+        if os.path.exists(extra_config_path):
+            os.remove(extra_config_path)
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_mpi_world_size(8)
+@pytest.mark.parametrize("cuda_graph", [False, True])
+@pytest.mark.parametrize("model_name,model_path", [
+    ("Llama-4-Maverick-17B-128E-Instruct-FP8",
+     "llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8"),
+])
+def test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k(
+        llm_root, llm_venv, model_name, model_path, cuda_graph):
+    print(f"Testing {model_name} on 8 GPUs.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    cmd = [
+        str(example_root / "quickstart_advanced.py"),
+        "--enable_chunked_prefill",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--tp_size=8",
+        "--moe_ep_size=8",
+        "--max_seq_len=22000",
+        "--kv_cache_fraction=0.6",
+    ]
+    if cuda_graph:
+        cmd.extend([
+            "--use_cuda_graph",
+            "--cuda_graph_padding_enabled",
+        ])
+    llm_venv.run_cmd(cmd)
+
+
+@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize(
+    "model_name,model_path,match_ratio",
+    [
+        pytest.param(
+            "mistral-small-3.1-24b-instruct",
+            "Mistral-Small-3.1-24B-Instruct-2503",
+            # Lower threshold to give some wiggle room for flakiness.
+            0.6,
+            marks=pytest.mark.skip_less_device_memory(80000)),
+    ])
+def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
+                                                  model_name, model_path,
+                                                  modality, match_ratio):
+    # NOTE: individual tests need to be enabled in
+    # tests/integration/test_lists/qa/examples_test_list.txt
+
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
+    print(f"Accuracy test {model_name} {modality} mode with example inputs.")
+    if modality == "video" and model_name == "mistral-small-3.1-24b-instruct":
+        pytest.skip(f"Skipping video modality test for {model_name}")
+
+    num_same_requests = 3  # test kv cache reuse with multiple same requests
+    accuracy_inputs = {
+        "image": {
+            "prompt": [
+                "Describe the natural environment in the image.",
+            ] * num_same_requests,
+            "media": [
+                str(test_data_root / "seashore.png"),
+            ] * num_same_requests,
+        },
+        "video": {
+            "prompt": [
+                "Tell me what you see in the video briefly.",
+            ] * num_same_requests,
+            "media": [
+                str(test_data_root / "OAI-sora-tokyo-walk.mp4"),
+            ] * num_same_requests,
+        },
+    }
+
+    expected_keywords = {
+        "mistral-small-3.1-24b-instruct": {
+            "image": [
+                [
+                    "image", "depicts", "natural", "environment", "ocean",
+                    "water", "waves", "sky"
+                ],
+            ] * num_same_requests,
+        },
+    }
+
+    cmd = [
+        str(example_root / "quickstart_multimodal.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--modality",
+        modality,
+        "--prompt",
+        *accuracy_inputs[modality]["prompt"],
+        "--media",
+        *accuracy_inputs[modality]["media"],
+        "--max_batch_size",  # single request at a time to test kv cache reuse
+        "1",
+    ]
+
+    output = llm_venv.run_cmd(cmd, caller=check_output)
+    for prompt_output, prompt_keywords in zip(
+            parse_output(output), expected_keywords[model_name][modality]):
+        matches = [
+            keyword in prompt_output.lower() for keyword in prompt_keywords
+        ]
+        obs_match_ratio = 1. * sum(matches) / len(matches)
+        print(
+            f"Prompt output: {prompt_output}\nExpected keywords: {prompt_keywords}\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} given threshold {match_ratio}"
+        )
+        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
+    # TODO: Setting max_batch_size=1 and repeating the same request helps test KV cache reuse indirectly,
+    # but does not directly measure the KV cache hit rate. For a more direct test, we would need to enable
+    # return_perf_metrics=True, which is not currently supported by the quickstart example CLI.
+    print("All answers are correct!")
+
+
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("model_name,model_path", [
+    ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
+])
+def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
+                                             model_path):
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
+
+    print(f"Accuracy test {model_name} image mode with example inputs.")
+
+    # Define accuracy inputs for image modality
+    accuracy_inputs = {
+        "image": {
+            "prompt": [
+                "Describe what you see in this image.",
+                "How would you describe the atmosphere of this scene?",
+            ],
+            "media": [
+                str(test_data_root / "inpaint.png"),
+            ],
+        }
+    }
+
+    # Define expected keywords for each model
+    expected_keywords = {
+        "mistral-small-3.1-24b-instruct": {
+            "image": [
+                [
+                    "depicts", "scenic", "landscape", "rock", "formation",
+                    "background"
+                ],
+                ["atmosphere", "serene", "majestic", "clear", "sky", "trees"],
+            ],
+        },
+    }
+    # Build command for image modality
+    cmd = [
+        str(example_root / "quickstart_multimodal.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--modality",
+        "image",
+        "--multiturn",
+        "--prompt",
+        *accuracy_inputs["image"]["prompt"],
+        "--media",
+        *accuracy_inputs["image"]["media"],
+    ]
+
+    # Add model-specific configurations
+    if model_name == "mistral-small-3.1-24b-instruct":
+        # TODO: remove this once kv cache reuse is supported for Mistral
+        cmd.append("--disable_kv_cache_reuse")
+
+    output = llm_venv.run_cmd(cmd, caller=check_output)
+    print("output:", output)
+
+    match_ratio = 4.0 / 5
+
+    # Check output accuracy
+    parsed_outputs = parse_output(output)
+    for prompt_output, prompt_keywords in zip(
+            parsed_outputs, expected_keywords[model_name]["image"]):
+        matches = [
+            keyword in prompt_output.lower() for keyword in prompt_keywords
+        ]
+        obs_match_ratio = 1. * sum(matches) / len(matches)
+        print("prompt_output:", prompt_output)
+        print("prompt_keywords:", prompt_keywords)
+        print("matches:", matches)
+        print("obs_match_ratio:", obs_match_ratio)
+        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}\n\nParsed output for all prompts: {parsed_outputs}"
+
+    print("All answers are correct!")
+
+
+@pytest.mark.parametrize("model_name,model_path", [
+    ("BertForSequenceClassification", "bert/bert-base-uncased-yelp-polarity"),
+])
+@pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM"])
+def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
+                             backend):
+    print(f"Testing {model_name} with {backend} backend.")
+    import torch
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm.sampling_params import SamplingParams
+    prompts = [
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+    model_dir = f"{llm_models_root()}/{model_path}"
+    # NOTE: Bert model return logits for now
+    sampling_param = SamplingParams(max_tokens=32, return_context_logits=True)
+    with LLM(
+            model=model_dir,
+            attn_backend=backend,
+            disable_overlap_scheduler=True,
+    ) as llm:
+
+        outputs = llm.generate(prompts, sampling_params=sampling_param)
+    # Print the outputs.
+    tllm_logits = []
+    for output in outputs:
+        prompt = output.prompt
+        tllm_logit = output.context_logits.cpu()[0, :]
+        print(f"Prompt: {prompt!r}, Context logits: {tllm_logit}")
+        tllm_logits += [tllm_logit]
+    # Stack the output
+    tllm_logits = torch.stack(tllm_logits)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    # NOTE: assume the model is BertForSequenceClassification for now
+    # load BertForSequenceClassification model
+    hf_model = AutoModelForSequenceClassification.from_pretrained(model_dir)
+    hf_model = hf_model.half().to(tllm_logits.device)
+
+    with torch.inference_mode():
+        inputs = tokenizer(prompts, return_tensors="pt",
+                           padding='longest').to(hf_model.device)
+        hf_outputs = hf_model(**inputs)
+        hf_logit = hf_outputs.logits.float()
+
+    torch.testing.assert_close(tllm_logits, hf_logit, rtol=1.5e-2, atol=1.5e-2)
+    # If assert passes, print success message.
+    print("Success: HF model logits match TRTLLM logits!")
+
+
+@pytest.mark.timeout(5400)
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_mpi_world_size(16)
+@pytest.mark.parametrize("eval_task", ["mmlu"])
+@pytest.mark.parametrize("tp_size,pp_size,ep_size", [(16, 1, 16), (8, 2, 8)],
+                         ids=["tp16", "tp8pp2"])
+@pytest.mark.parametrize("model_path,llm_api_config", [
+    pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4',
+                 None,
+                 marks=skip_pre_blackwell,
+                 id='DeepSeek-R1/DeepSeek-R1-0528-FP4'),
+    pytest.param('MiniMax-M3',
+                 _MINIMAX_M3_EVAL_CONFIG,
+                 marks=skip_pre_blackwell,
+                 id='MiniMax-M3'),
+])
+def test_multi_nodes_eval(model_path: str, llm_api_config: Optional[dict[str,
+                                                                         Any]],
+                          tp_size: int, pp_size: int, ep_size: int,
+                          eval_task: str, mmlu_dataset_root: str) -> None:
+    from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm.evaluate import MMLU
+
+    mmlu_threshold = 81.5
+    llm_kwargs = dict(llm_api_config or {})
+    # The LLM is built in the pytest process so it binds to the MPI workers
+    # pre-spawned by trtllm-llmapi-launch; a trtllm-eval subprocess cannot,
+    # because the launcher's IPC HMAC key is consumed by the first in-process
+    # LLM of the session.
+    llm_kwargs["kv_cache_config"] = {
+        "free_gpu_memory_fraction": _MEM_FRACTION_80,
+        **llm_kwargs.get("kv_cache_config", {}),
+    }
+    with LLM(f"{llm_models_root()}/{model_path}",
+             tensor_parallel_size=tp_size,
+             pipeline_parallel_size=pp_size,
+             moe_expert_parallel_size=ep_size,
+             max_batch_size=32,
+             trust_remote_code="MiniMax-M3" in model_path,
+             **llm_kwargs) as llm:
+        sampling_params = SamplingParams(max_tokens=2,
+                                         truncate_prompt_tokens=4094)
+        mmlu_accuracy = MMLU(mmlu_dataset_root).evaluate(llm, sampling_params)
+    assert mmlu_accuracy > mmlu_threshold, f"MMLU accuracy {mmlu_accuracy} is less than threshold {mmlu_threshold}"
+
+
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_mpi_world_size(2)
+@pytest.mark.parametrize("tp_size,pp_size", [(2, 1), (1, 2)],
+                         ids=["tp2", "pp2"])
+@pytest.mark.parametrize("model_path", [
+    pytest.param('Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf',
+                 marks=skip_pre_blackwell),
+])
+def test_ptp_quickstart_advanced_multinode(llm_root, llm_venv, model_path,
+                                           tp_size, pp_size):
+    print(
+        f"Testing quickstart {model_path} with tp_size={tp_size}, pp_size={pp_size}."
+    )
+
+    from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
+
+    model_dir = f"{llm_models_root()}/{model_path}"
+    prompt = "Explain why New York is great city to live in, in 1 short paragraph"
+
+    moe_ep_size = tp_size if ("Llama-4" in model_path
+                              or "Qwen3" in model_path) and tp_size > 1 else -1
+
+    with LLM(
+            model=model_dir,
+            backend='pytorch',
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            max_seq_len=8192 if "Llama-4" in model_path else None,
+            max_num_tokens=4096,
+            max_batch_size=1,
+            cuda_graph_config=CudaGraphConfig(),
+            kv_cache_config=KvCacheConfig(
+                free_gpu_memory_fraction=_MEM_FRACTION_50),
+            moe_expert_parallel_size=moe_ep_size,
+    ) as llm:
+        outputs = llm.generate([prompt], SamplingParams(max_tokens=64))
+
+    for output in outputs:
+        generated_text = output.outputs[0].text
+        print(f"Generated text: {generated_text}")
+        assert generated_text, f"No text generated for {model_path}"
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device_memory(80000)
+@skip_pre_hopper
+@pytest.mark.parametrize("model_dir,draft_model_dir", [
+    ("Qwen3/Qwen3-30B-A3B", "Qwen3/Qwen3-30B-eagle3"),
+    pytest.param("Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
+                 "Qwen3/qwen3-235B-eagle3",
+                 marks=pytest.mark.skip_less_device_memory(90000)),
+    pytest.param("llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8",
+                 "Llama-4-Maverick-17B-128E-Eagle3",
+                 marks=pytest.mark.skip_less_device_memory(140000)),
+    pytest.param("Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
+                 "Qwen3/qwen3-235B-eagle3",
+                 marks=skip_pre_blackwell),
+])
+def test_eagle3_output_repetition_4gpus(model_dir: str, draft_model_dir: str):
+    """RCCA: https://nvbugspro.nvidia.com/bug/5575211
+    """
+    from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
+                                     KvCacheConfig)
+
+    models_path = llm_models_root()
+    target_model_dir = f"{models_path}/{model_dir}"
+    eagle_model_dir = f"{models_path}/{draft_model_dir}"
+
+    # Common configuration matching the bug report
+    llm_common_config = {
+        "model":
+        target_model_dir,
+        "tensor_parallel_size":
+        4,
+        "moe_expert_parallel_size":
+        4,
+        "max_seq_len":
+        4096,
+        "max_batch_size":
+        8,
+        "max_num_tokens":
+        2048,
+        "disable_overlap_scheduler":
+        True,
+        "kv_cache_config":
+        KvCacheConfig(
+            free_gpu_memory_fraction=0.6,
+            enable_block_reuse=False,
+        ),
+        "cuda_graph_config":
+        CudaGraphConfig(),
+    }
+
+    # Test prompt. It has to go through the chat template: a bare string makes
+    # the model continue arbitrary text instead of answering a turn, so it
+    # never emits <|im_end|> and keeps generating until it hits max_tokens --
+    # by which point it is looping over whatever it last said. That
+    # degeneration comes from the prompt, not from Eagle3, and it is what made
+    # this test flaky (nvbugs/6627979).
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(target_model_dir)
+    prompt = tokenizer.apply_chat_template(
+        [{
+            "role": "user",
+            "content": "Who are you?"
+        }],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    sampling_params = SamplingParams(max_tokens=1024, temperature=0)
+
+    # Run with Eagle3
+    spec_config = Eagle3DecodingConfig(
+        max_draft_len=3,
+        speculative_model=eagle_model_dir,
+    )
+    with LLM(**llm_common_config, speculative_config=spec_config) as llm_spec:
+        results_spec = llm_spec.generate([prompt], sampling_params)
+        output_spec = results_spec[0].outputs[0].text
+
+    # Run without Eagle3 (baseline)
+    with LLM(**llm_common_config) as llm_ref:
+        results_ref = llm_ref.generate([prompt], sampling_params)
+        output_ref = results_ref[0].outputs[0].text
+
+    repetitive_pattern = re.compile(
+        r'(.)\1{10,}')  # Check for 10+ repeated chars
+    assert not repetitive_pattern.search(output_spec), (
+        f"Eagle3 output contains repetitive characters: {output_spec[:500]}")
+    assert not repetitive_pattern.search(output_ref), (
+        f"Baseline output contains repetitive characters: {output_ref[:500]}")
+
+
+def test_get_ci_container_port():
+    container_port_start = os.environ.get("CONTAINER_PORT_START", None)
+    container_port_num = os.environ.get("CONTAINER_PORT_NUM", None)
+    assert container_port_start is not None
+    assert container_port_num is not None
+    container_port_start = int(container_port_start)
+    container_port_num = int(container_port_num)
+    assert container_port_start > 0
+    assert container_port_num > 0
+    assert container_port_start + container_port_num <= 60000

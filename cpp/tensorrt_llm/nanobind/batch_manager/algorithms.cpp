@@ -1,0 +1,104 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "algorithms.h"
+#include "tensorrt_llm/batch_manager/agentTree.h"
+#include "tensorrt_llm/batch_manager/capacityScheduler.h"
+#include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/batch_manager/microBatchScheduler.h"
+#include "tensorrt_llm/batch_manager/peftCacheManager.h"
+#include "tensorrt_llm/common/tllmDataType.h"
+#include "tensorrt_llm/nanobind/common/customCasters.h"
+#include "tensorrt_llm/runtime/torch.h"
+#include "tensorrt_llm/runtime/torchView.h"
+
+#include <ATen/core/TensorBody.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/list.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/tuple.h>
+#include <nanobind/stl/vector.h>
+#include <torch/extension.h>
+
+#include <optional>
+
+namespace nb = nanobind;
+
+namespace tr = tensorrt_llm::runtime;
+using namespace tensorrt_llm::batch_manager;
+
+void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_& m)
+{
+    auto agentTreeConfigGetstate = [](batch_scheduler::AgentTreeConfig const& self)
+    { return nb::make_tuple(self.agentPercentage, self.agentTypes, self.agentInflightSeqNum); };
+    auto agentTreeConfigSetstate = [](batch_scheduler::AgentTreeConfig& self, nb::tuple const& state)
+    {
+        if (state.size() != 3)
+        {
+            throw std::runtime_error("Invalid AgentTreeConfig state!");
+        }
+        new (&self) batch_scheduler::AgentTreeConfig();
+        self.agentPercentage = nb::cast<float>(state[0]);
+        self.agentTypes = nb::cast<std::optional<std::vector<std::string>>>(state[1]);
+        self.agentInflightSeqNum = nb::cast<SizeType32>(state[2]);
+    };
+    nb::class_<batch_scheduler::AgentTreeConfig>(m, "AgentTreeConfig")
+        .def(
+            "__init__",
+            [](batch_scheduler::AgentTreeConfig* self, float agentPercentage,
+                std::optional<std::vector<std::string>> agentTypes, SizeType32 agentInflightSeqNum)
+            {
+                new (self) batch_scheduler::AgentTreeConfig();
+                self->agentPercentage = agentPercentage;
+                self->agentTypes = std::move(agentTypes);
+                self->agentInflightSeqNum = agentInflightSeqNum;
+            },
+            nb::arg("agent_percentage") = -1.0f, nb::arg("agent_types") = nb::none(),
+            nb::arg("agent_inflight_seq_num") = std::numeric_limits<SizeType32>::max())
+        .def_rw("agent_percentage", &batch_scheduler::AgentTreeConfig::agentPercentage)
+        .def_rw("agent_types", &batch_scheduler::AgentTreeConfig::agentTypes)
+        .def_rw("agent_inflight_seq_num", &batch_scheduler::AgentTreeConfig::agentInflightSeqNum)
+        .def("__getstate__", agentTreeConfigGetstate)
+        .def("__setstate__", agentTreeConfigSetstate);
+
+    nb::class_<CapacityScheduler>(m, CapacityScheduler::name)
+        .def(nb::init<SizeType32, executor::CapacitySchedulerPolicy, bool, bool, LlmRequestState, LlmRequestState,
+                 bool>(),
+            nb::arg("max_num_requests"), nb::arg("capacity_scheduler_policy"), nb::arg("has_kv_cache_manager"),
+            nb::arg("two_step_lookahead") = false, nb::arg("no_schedule_until_state") = LlmRequestState::kCONTEXT_INIT,
+            nb::arg("no_schedule_after_state") = LlmRequestState::kGENERATION_COMPLETE,
+            nb::arg("enable_prefix_aware_scheduling") = true)
+        .def("__call__", &CapacityScheduler::operator(), nb::arg("active_requests"),
+            nb::arg("kv_cache_manager") = nullptr, nb::arg("peft_cache_manager") = nullptr,
+            nb::arg("cross_kv_cache_manager") = nullptr)
+        .def("set_agent_tree_reorder_policy", &CapacityScheduler::setAgentTreeReorderPolicy,
+            nb::arg("agent_percentage"), nb::arg("agent_types"), nb::arg("agent_inflight_seq_num"))
+        .def("name", [](CapacityScheduler const&) { return CapacityScheduler::name; });
+
+    nb::class_<MicroBatchScheduler>(m, MicroBatchScheduler::name)
+        .def(nb::init<std::optional<batch_scheduler::ContextChunkingConfig>, std::optional<SizeType32>, LlmRequestState,
+                 LlmRequestState>(),
+            nb::arg("ctx_chunk_config") = std::nullopt, nb::arg("max_context_length") = std::nullopt,
+            nb::arg("no_schedule_until_state") = LlmRequestState::kCONTEXT_INIT,
+            nb::arg("no_schedule_after_state") = LlmRequestState::kGENERATION_TO_COMPLETE)
+        .def("__call__", &MicroBatchScheduler::operator(), nb::arg("active_requests"), nb::arg("inflight_req_ids"),
+            nb::arg("max_batch_size_runtime"), nb::arg("max_num_tokens_runtime"))
+        .def("name", [](MicroBatchScheduler const&) { return MicroBatchScheduler::name; });
+}

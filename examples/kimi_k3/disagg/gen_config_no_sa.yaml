@@ -1,0 +1,36 @@
+# Kimi K3 disaggregated serving - GENERATION (decode) server extra LLM-API
+# options WITHOUT speculative decoding
+# (`trtllm-serve <model> --config gen_config_no_sa.yaml`).
+#
+# Default: CUDA graphs ON. Validated end-to-end on GB300 NVL72: GSM8K
+# 96.5 and ~950/2043 output tok/s at c64/c256 on 8k/1k random prompts.
+# For strict token-parity debugging (attribution-clean SA-on/SA-off or
+# disagg-vs-agg comparisons), null out the cuda graph config to match
+# the SA config's eager regime, and place ctx and gen in SEPARATE NVL72
+# domains (co-located placement selects different comm algorithms and
+# diverges token-level on a fixed prompt subset; accuracy-neutral).
+# K3 ships a custom (trust-remote-code) tokenizer; without this the
+# server starts tokenizer-less and 400s every string prompt with
+# "tokenizer is required to tokenize string prompt".
+trust_remote_code: true
+tensor_parallel_size: 16
+moe_expert_parallel_size: 16
+enable_attention_dp: true
+pipeline_parallel_size: 1
+disable_overlap_scheduler: true
+enable_chunked_prefill: false
+cuda_graph_config:
+  max_batch_size: 32
+# No SA SpeculativeState buffer cap here; 32 matches the aggregated
+# non-SA DEP16 eval config.
+max_batch_size: 32
+max_num_tokens: 256
+max_seq_len: 9236
+kv_cache_config:
+  enable_block_reuse: false      # mandatory for K3 (KDA state)
+  tokens_per_block: 64           # historical: older TRTLLM-Gen MLA kernels required 64
+  free_gpu_memory_fraction: 0.25
+cache_transceiver_config:
+  backend: NIXL
+  # Only the Python transceiver can move the KDA state.
+  transceiver_runtime: PYTHON

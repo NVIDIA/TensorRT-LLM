@@ -1,0 +1,162 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Shared utilities for local LLM model paths and HuggingFace download mocking."""
+
+import os
+from functools import wraps
+from pathlib import Path
+from typing import Optional
+from unittest.mock import patch
+
+# Mapping from HuggingFace Hub ID to local subdirectory under LLM_MODELS_ROOT.
+# NOTE: hf_id_to_llm_models_subdir below will fall back to checking if the model name exists
+# in LLM_MODELS_ROOT if not present here, so it's not required to list models that already
+# exist as a top-level directory in LLM_MODELS_ROOT.
+HF_ID_TO_LLM_MODELS_SUBDIR = {
+    "meta-llama/Meta-Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
+    "meta-llama/Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
+    "meta-llama/Llama-3.1-8B": "llama-3.1-model/Meta-Llama-3.1-8B",
+    "nvidia/Llama-3.1-8B-Instruct-FP8": "Llama-3.1-8B-Instruct-FP8",
+    "nvidia/Llama-3.1-8B-Instruct-NVFP4": "Llama-3.1-8B-Instruct-NVFP4",
+    "Qwen/Qwen3-0.6B": "Qwen3/Qwen3-0.6B",
+    "mistralai/Mistral-Small-3.1-24B-Instruct-2503": "Mistral-Small-3.1-24B-Instruct-2503",
+    "Qwen/Qwen3-30B-A3B": "Qwen3/Qwen3-30B-A3B",
+    "deepseek-ai/DeepSeek-V3": "DeepSeek-V3",
+    "deepseek-ai/DeepSeek-R1": "DeepSeek-R1/DeepSeek-R1",
+    "deepseek-ai/DeepSeek-R1-0528": "DeepSeek-R1/DeepSeek-R1-0528",
+    "nvidia/DeepSeek-R1-0528-NVFP4-v2": "DeepSeek-R1/DeepSeek-R1-0528-FP4-v2",
+    "ibm-ai-platform/Bamba-9B-v2": "Bamba-9B-v2",
+    "nvidia/NVIDIA-Nemotron-Nano-12B-v2": "NVIDIA-Nemotron-Nano-12B-v2",
+    "nvidia/NVIDIA-Nemotron-Nano-31B-A3-v3": "NVIDIA-Nemotron-Nano-31B-A3-v3",
+    "nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024": "Nemotron-Nano-3-30B-A3.5B-dev-1024",
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8": "NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4": "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+    "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-012726": "NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-012726",
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726": "NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726",
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-012726": "NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-012726",
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16": "NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8": "NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+    "google/gemma-3n-E2B-it": "gemma/gemma-3n-E2B-it",
+    "google/gemma-4-E2B-it": "gemma/gemma-4-E2B-it",
+    "nvidia/Qwen3.5-397B-A17B-NVFP4": "Qwen3.5-397B-A17B-NVFP4",
+    "mistralai/Ministral-8B-Instruct-2410": "Ministral-8B-Instruct-2410",
+    "google/gemma-4-26B-A4B-it": "gemma/gemma-4-26B-A4B-it",
+    "Qwen/Qwen3.5-35B-A3B": "Qwen3.5-35B-A3B",
+    "Qwen/Qwen3.5-4B": "Qwen3.5-4B",
+    "nvidia/Cosmos3-Nano": "nvidia/Cosmos3-Nano",
+    "nvidia/Cosmos3-Super": "nvidia/Cosmos3-Super",
+    "nvidia/Nemotron-Ultra-V3-NVFP4": "nemotron-ultra-sample-ckpt-old-format-sft_nvfp4_aggressive_03_04_26_nvfp4",
+}
+
+
+def llm_models_root(check: bool = False) -> Optional[Path]:
+    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
+
+    if "LLM_MODELS_ROOT" in os.environ:
+        root = Path(os.environ.get("LLM_MODELS_ROOT"))
+
+    if not root.exists():
+        root = Path("/home/scratch.trt_llm_data/llm-models/")
+
+    if not root.exists():
+        root = Path("/scratch.trt_llm_data/llm-models/")
+
+    if check:
+        assert root.exists(), (
+            "You must set LLM_MODELS_ROOT env or be able to access /home/scratch.trt_llm_data_ci to run this test"
+        )
+
+    return root if root.exists() else None
+
+
+def get_checkpoint(model_subdir: str) -> str:
+    """Resolve a checkpoint under LLM_MODELS_ROOT, or fail loudly if missing."""
+    root = llm_models_root(check=True)
+    path = root / model_subdir
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {path}. Stage '{model_subdir}' under LLM_MODELS_ROOT to run this test."
+        )
+    return str(path)
+
+
+def llm_datasets_root() -> str:
+    return os.path.join(llm_models_root(check=True), "datasets")
+
+
+def hf_id_to_local_model_dir(hf_hub_id: str) -> str | None:
+    """Return the local model directory under LLM_MODELS_ROOT for a given HuggingFace Hub ID.
+
+    Raises ValueError if the model is not found in LLM_MODELS_ROOT. This is meant to ensure that tests do not download
+    models from HuggingFace.
+    """
+    root = llm_models_root()
+    if root is None:
+        return None
+
+    if hf_hub_id in HF_ID_TO_LLM_MODELS_SUBDIR:
+        return str(root / HF_ID_TO_LLM_MODELS_SUBDIR[hf_hub_id])
+
+    # Fall back to checking if the model name exists as a top-level directory in LLM_MODELS_ROOT
+    model_name = hf_hub_id.split("/")[-1]
+    if os.path.isdir(root / model_name):
+        return str(root / model_name)
+
+    raise ValueError(f"HuggingFace model '{hf_hub_id}' not found in LLM_MODELS_ROOT")
+
+
+def mock_snapshot_download(repo_id: str, **kwargs) -> str:
+    """Mock huggingface_hub.snapshot_download that returns an existing local model directory.
+
+    NOTE: This function does not currently handle the revision / allow_patterns / ignore_patterns parameters.
+    """
+    local_path = hf_id_to_local_model_dir(repo_id)
+    if local_path is None:
+        raise ValueError(f"Model '{repo_id}' not found in LLM_MODELS_ROOT")
+    return local_path
+
+
+def with_mocked_hf_download_for_single_gpu(func):
+    """Decorator to mock huggingface_hub.snapshot_download for tests.
+
+    When applied, any calls to snapshot_download will be redirected to use
+    local model paths from LLM_MODELS_ROOT instead of downloading from HuggingFace.
+
+    NOTE: We must patch snapshot_download at the location where it's actually imported
+    with 'from huggingface_hub import snapshot_download', since that creates a
+    local binding that won't be affected by patching huggingface_hub.snapshot_download.
+
+    Additionally sets HF_HUB_OFFLINE=1 to ensure no network requests are made to
+    HuggingFace.
+
+    WARNING: This decorator only works for single-GPU tests. For multi-GPU tests, the
+    mock won't be applied in MPI worker processes.
+    """
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        with (
+            patch.dict(os.environ, {"HF_HUB_OFFLINE": "1"}),
+            patch(
+                "tensorrt_llm.llmapi.utils.snapshot_download", side_effect=mock_snapshot_download
+            ),
+        ):
+            return func(*args, **kwargs)
+
+    return wrapper
