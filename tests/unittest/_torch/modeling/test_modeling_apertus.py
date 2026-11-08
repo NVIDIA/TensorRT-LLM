@@ -42,6 +42,7 @@ from tensorrt_llm._torch.models.modeling_apertus import (
 )
 from tensorrt_llm._torch.modules.xielu import XIELU, xielu_reference
 from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -367,7 +368,7 @@ class TestApertus(unittest.TestCase):
                         attn_metadata=attn_metadata,
                     )
                 else:
-                    key = (1, 0, False)
+                    key = KeyType(batch_size=1, draft_len=0)
                     if graph_metadata is None:
                         graph_metadata = make_metadata(1, num_cached, 0).create_cuda_graph_metadata(
                             1
