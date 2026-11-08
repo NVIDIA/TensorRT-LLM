@@ -19,7 +19,8 @@ tables for the tactic the MoE op runs (``prerouted_table_sizes``) and the NVFP4 
 to the MoE as ``PreroutedRouting``, which skips its routing kernel. The routing is bit-identical to trtllm-gen
 Renormalize (``reduceTopK`` tie order, ``calcSoftmax`` sum order); the row order inside an expert's block may
 differ, which the finalize does not depend on. The kernels serve ``KERNEL_NUM_EXPERTS`` experts and top-k
-``KERNEL_TOP_K`` (``front_eligible``); other steps take the stock path.
+``KERNEL_TOP_K`` (``front_eligible``) and, for steps of up to ``ROUTER_MAX_TOKENS`` tokens, a power-of-two
+hidden size (``router_front_supports``); other steps take the stock path.
 """
 
 from typing import Optional
@@ -841,6 +842,13 @@ class RouteFront:
         return xq, xsf, ids, wts
 
 
+def router_front_supports(hidden: int) -> bool:
+    """Whether the fronts of up to ``ROUTER_MAX_TOKENS`` tokens take hidden size ``hidden``: their Triton launches
+    (``RouterGemm``, ``RouteTables`` with x) quantize whole rows and split K into ``RouterGemm.SPLITK`` slices,
+    all power-of-two blocks. The route front takes any multiple of 16."""
+    return hidden >= RouterGemm.SPLITK * 16 and hidden & (hidden - 1) == 0
+
+
 def front_eligible(moe, x: torch.Tensor, max_tokens: int) -> bool:
     """Whether ``moe`` and ``x`` take the decode front: a ConfigurableMoE over a TRTLLM-gen NVFP4 leaf that
     takes prerouted routing, without communication, load balancer or DWDP, Renormalize routing over
@@ -972,8 +980,8 @@ class DecodeFront:
     """Per MoE layer decode front (module docstring).
 
     ``route_steps``: token counts the route front takes after the stock router GEMM (``route_front_steps``);
-    other counts up to ``ROUTER_MAX_TOKENS`` run the router GEMM in the front, as one launch where the
-    AutoTuner's race of the two (``FrontRunner``) picked it.
+    other counts up to ``ROUTER_MAX_TOKENS`` run the router GEMM in the front (power-of-two hidden sizes only,
+    ``router_front_supports``), as one launch where the AutoTuner's race of the two (``FrontRunner``) picked it.
     """
 
     def __init__(self, route_steps: frozenset):
@@ -1065,6 +1073,8 @@ class DecodeFront:
         route_front = m in self.route_steps
         if not front_eligible(moe, x, ROUTE_FRONT_MAX_TOKENS if route_front else ROUTER_MAX_TOKENS):
             return None
+        if not route_front and not router_front_supports(x.shape[1]):
+            return None
         if AutoTuner.get().is_tuning_mode:
             return self._tune(gate, moe, x, **moe_kwargs)
         backend = moe.backend
@@ -1129,4 +1139,5 @@ __all__ = [
     "prerouted_table_sizes",
     "prerouted_table_views",
     "route_front_steps",
+    "router_front_supports",
 ]

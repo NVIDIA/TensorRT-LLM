@@ -36,13 +36,13 @@ _ROUTER_TACTIC = default_tactic(1, E, H, fp8=False)
 _K_WARPS = _ROUTER_TACTIC[0]
 
 
-def _inputs(m, seed, dup=False, crowd=False):
+def _inputs(m, seed, dup=False, crowd=False, h=H):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    x = (torch.randn((m, H), generator=g, device="cuda") * 0.5).to(torch.bfloat16)
+    x = (torch.randn((m, h), generator=g, device="cuda") * 0.5).to(torch.bfloat16)
     x[0, :32] = 0  # all-zero quant blocks
     if m > 1:
         x[1, 100] = 40.0  # an outlier block
-    w = (torch.randn((E, H), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
+    w = (torch.randn((E, h), generator=g, device="cuda") * 0.02).to(torch.bfloat16)
     if dup:
         w[1::2] = w[0::2]  # identical router row pairs: exact logit ties in every token's top-k
     if crowd:
@@ -50,7 +50,7 @@ def _inputs(m, seed, dup=False, crowd=False):
         base = x[0::2].float().mean(0)
         base = base / base.norm()
         for i in range(12):
-            noise = 0.01 * torch.randn(H, generator=g, device="cuda")
+            noise = 0.01 * torch.randn(h, generator=g, device="cuda")
             w[16 + i] = (base * (3.0 - 0.1 * i) + noise).to(torch.bfloat16)
     gs = torch.tensor(
         [448.0 * 6.0 / x.float().abs().max().item()], dtype=torch.float32, device="cuda"
@@ -127,9 +127,10 @@ def _route_front(x, w, gs, flat, ls, nl, tile):
     return (logits,) + front(fn, logits, x, gs, flat, tile, ls, nl, K)
 
 
-def _ref_route(logits, x, gs, ls, nl, tile):
-    """The Triton per-token route + tables + quant kernel at any token count (RouteTables caps it at 32)."""
-    m = logits.shape[0]
+def _ref_route(logits, x, gs, ls, nl, tile, quant=True):
+    """The Triton per-token route + tables (+ quant, power-of-two H only) kernel at any token count
+    (RouteTables caps it at 32)."""
+    m, h = x.shape
     nlp = triton.next_power_of_2(nl)
     hist = torch.zeros((nlp,), dtype=torch.int32, device="cuda")
     counter = torch.zeros((1,), dtype=torch.int32, device="cuda")
@@ -137,15 +138,15 @@ def _ref_route(logits, x, gs, ls, nl, tile):
     wts = torch.empty((m, K), dtype=torch.bfloat16, device="cuda")
     rank = torch.empty((m * K,), dtype=torch.int32, device="cuda")
     flat = _flat(m, nl, tile)
-    xq = torch.empty((m, H // 2), dtype=torch.uint8, device="cuda")
-    xsf = torch.empty((m, H // 16), dtype=torch.uint8, device="cuda")
-    df._route_tables_kernel[(2 * m,)](
+    xq = torch.empty((m, h // 2), dtype=torch.uint8, device="cuda")
+    xsf = torch.empty((m, h // 16), dtype=torch.uint8, device="cuda")
+    df._route_tables_kernel[(2 * m if quant else m,)](
         logits, ids, wts, hist, rank, counter, *_tables(flat, m, nl, tile), m, ls,
         x, x.stride(0), gs, xq, xsf,
         E=E, K=K, KP=16, TILE=tile, NL=nl, NLP=nlp,
         EXPANDED_PAD=triton.next_power_of_2(m * K),
         MAX_CTAS_PER_EXPERT=triton.cdiv(m, tile),
-        USE_PDL=False, QUANT_H=H, num_warps=4,
+        USE_PDL=False, QUANT_H=h if quant else 0, num_warps=4,
     )  # fmt: skip
     return ids, wts, flat, xq, xsf
 
@@ -328,6 +329,25 @@ def test_route_front_parity(m, nl, ls, tile, dup, crowd):
     for a, b in zip(again, (lg, xq, xsf, ids, wts)):
         assert torch.equal(_bits(a), _bits(b)), (tag, "repeat")
     _check_tables(_tables(flat2, m, nl, tile), _tables(flat, m, nl, tile), tile, (tag, "repeat"))
+
+
+# M = 64: the route-front step of MTP-3 at CUDA-graph batch 16 (perf-sanity qwen3_8_flash_next_fp4_tp1_mtp3_8k1k).
+@pytest.mark.parametrize("m,nl,ls,tile", [(64, 512, 0, 8), (40, 128, 384, 16)])
+def test_route_front_non_pow2_hidden(m, nl, ls, tile, h=2560):
+    """The route front at a hidden size that is not a power of two (Qwen3.8-Flash-Next), which the small-M
+    fronts decline: routing equal to the Triton route kernel, x bytes equal to fp4_quantize."""
+    x, w, gs = _inputs(m, seed=1700 + m + nl, h=h)
+    flat = _flat(m, nl, tile)
+    _, xq, xsf, ids, wts = _route_front(x, w, gs, flat, ls, nl, tile)
+    ids_r, wts_r, flat_r, _, _ = _ref_route(_cublas(x, w), x, gs, ls, nl, tile, quant=False)
+    q_ref, sf_ref = torch.ops.trtllm.fp4_quantize(x, gs, 16, False, False)
+    tag = (m, nl, ls, tile, h)
+    assert torch.equal(ids, ids_r) and torch.equal(_bits(wts), _bits(wts_r)), (tag, "routing")
+    assert torch.equal(xq, q_ref.view(torch.uint8).view(m, h // 2)), (tag, "xq")
+    assert torch.equal(xsf.flatten(), sf_ref.view(torch.uint8).flatten()[: m * h // 16]), tag
+    _check_tables(
+        _tables(flat, m, nl, tile), _tables(flat_r, m, nl, tile), tile, tag, token_order=True
+    )
 
 
 class _Gate:
@@ -595,3 +615,80 @@ def test_decode_front_keeps_token_count_dynamic_under_compile():
     torch._dynamo.mark_dynamic(x, 0)
     out = torch.compile(routed, backend="eager", fullgraph=True)(x)
     torch.testing.assert_close(out, x * 2)
+
+
+class _RecordingMoe:
+    """The routed experts as ``DecodeFront`` calls them (CPU, no kernels), recording into ``calls``."""
+
+    def __init__(self, calls):
+        self.calls = calls
+        self.backend = type(
+            "Backend",
+            (),
+            dict(
+                decode_tactic=lambda _, m: [8, 0],
+                slot_start=0,
+                expert_size_per_partition=E,
+                fc31_input_scale=torch.ones(1),
+            ),
+        )()
+        self.routing_method = type("Routing", (), dict(experts_per_token=K))()
+
+    def __call__(self, x, logits, output_dtype, prerouted, **kwargs):
+        self.calls.append("moe")
+        return "front"
+
+
+# H 4096 / 2048: Qwen3.5-397B / Qwen3-Next-80B; H 2560: Qwen3.8-Flash-Next, whose MTP-3 step at CUDA-graph batch
+# 8 (M 32) hit RouterGemm's power-of-two assertion (nvbugs/7046452) and at batch 16 (M 64) takes the route front.
+@pytest.mark.parametrize(
+    "h,m,route_steps,path",
+    [
+        (4096, 32, (), ["router_gemm", "route", "moe"]),
+        (2048, 8, (), ["router_gemm", "route", "moe"]),
+        (2560, 32, (), None),
+        (2560, 1, (), None),
+        (2560, 64, (64,), ["gate", "route_front", "moe"]),
+    ],
+)
+def test_decode_front_hidden_size(monkeypatch, h, m, route_steps, path):
+    """Steps of up to ROUTER_MAX_TOKENS tokens take the front only with a power-of-two hidden size (its Triton
+    launches span whole rows) and otherwise decline before any launch; the route front takes other sizes."""
+    calls = []
+    xq = torch.zeros((m, h // 2), dtype=torch.uint8)
+    xsf = torch.zeros((m, h // 16), dtype=torch.uint8)
+    ids, wts = torch.zeros((m, K), dtype=torch.int32), torch.zeros((m, K), dtype=torch.bfloat16)
+
+    class Gate:
+        out_dtype = torch.bfloat16
+        weight = torch.zeros((E, h), dtype=torch.bfloat16)
+
+        def __call__(self, x):
+            calls.append("gate")
+            return torch.zeros((x.shape[0], E), dtype=torch.bfloat16)
+
+    class RouteFront:
+        def compiled(self, x, n, tile, num_local, top_k):
+            return "compiled"
+
+        def __call__(self, fn, logits, x, gs, flat, tile, local_start, num_local, top_k):
+            calls.append("route_front")
+            return xq, xsf, ids, wts
+
+    def router_gemm(x, weight, global_scale):
+        calls.append("router_gemm")
+        return torch.zeros((x.shape[0], E), dtype=torch.bfloat16), xq, xsf
+
+    def route(logits, top_k, local_start, num_local, tile, flat=None):
+        calls.append("route")
+        return ids, wts
+
+    monkeypatch.setattr(df, "front_eligible", lambda moe, x, max_tokens: True)
+    monkeypatch.setattr(df, "low_m_gemm_dispatcher", lambda gate: None)
+    front = df.DecodeFront(frozenset(route_steps))
+    front.router_gemm, front.route, front.route_front = router_gemm, route, RouteFront()
+    out = front(Gate(), _RecordingMoe(calls), torch.zeros((m, h), dtype=torch.bfloat16))
+    if path is None:
+        assert out is None and calls == [], calls
+    else:
+        assert out == "front" and calls == path, calls
