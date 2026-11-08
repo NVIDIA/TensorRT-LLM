@@ -3,9 +3,10 @@
 """The MoE selection of the GLM-5.2 sm107 low-latency target's embedded MTP draft follows the
 built-in one's.
 
-``build_mtp_draft`` must apply ``speculative_config.moe_tactic`` / ``moe_backend`` and
-the target's pin exactly as ``_build_mtp_one_model_draft`` does. CPU only: the draft
-class is patched out and the backend resolution is stubbed, so no module is built.
+``build_mtp_draft`` applies ``speculative_config.moe_backend`` and the target's pin as
+``_build_mtp_one_model_draft`` does. The router refuses ``speculative_config.moe_tactic``
+for this target, so the draft never sees one. CPU only: the draft class is patched out and
+the backend resolution is stubbed, so no module is built.
 """
 
 from types import SimpleNamespace
@@ -67,22 +68,6 @@ def _draft_config_of(target_config: ModelConfig, draft_config=None) -> ModelConf
 def test_without_a_request_the_draft_reuses_the_target_config():
     target_config = _target_config()
     assert _draft_config_of(target_config) is target_config
-
-
-def test_a_draft_tactic_pins_the_mtp_layers():
-    target_config = _target_config(spec_moe_tactic="cutlass")
-    with patch.object(ModelConfig, "pinned_moe_backend", return_value="CUTLASS") as pinned:
-        draft_config = _draft_config_of(target_config)
-
-    assert draft_config is not target_config
-    assert draft_config.moe_backend == "CUTLASS"
-    assert draft_config.moe_tactic == "cutlass"
-    assert target_config.moe_backend == "TRTLLM"
-    assert target_config.moe_tactic is None
-    # The family is read from the MTP layer's format alone.
-    pinned.assert_called_once_with(
-        "cutlass", target_config.quant_config_dict[_MTP_EXPERTS], None, architecture=_ARCH
-    )
 
 
 def test_a_draft_backend_selects_the_mtp_layers():

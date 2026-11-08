@@ -372,6 +372,8 @@ def _route_to(monkeypatch, target) -> None:
         (_TrtllmGenNvfp4Target, _TRTLLM_GEN_NVFP4, None, QuantAlgo.NVFP4),
         # The NVFP4 experts narrow the TRTLLM-Gen leaves of this provider to the NVFP4 one.
         (_TrtllmGenNvfp4Target, "trtllm.trtllm_gen", None, QuantAlgo.NVFP4),
+        # Every quantized TRTLLM-Gen format has one leaf, so the technique alone narrows to it.
+        (_TrtllmGenNvfp4Target, "trtllm_gen", None, QuantAlgo.NVFP4),
         # The id is of no format the checkpoint declares, so its one match counts.
         (_TrtllmGenNvfp4Target, _TRTLLM_GEN_NVFP4, None, None),
         (_TrtllmGenNvfp4DraftTarget, None, _TRTLLM_GEN_NVFP4, QuantAlgo.NVFP4),
@@ -384,6 +386,7 @@ def _route_to(monkeypatch, target) -> None:
         "draft_only_draft",
         "honored_id",
         "honored_after_narrowing",
+        "honored_technique_after_narrowing",
         "honored_id_of_another_format",
         "honored_draft_id",
         "neither_set",
@@ -406,8 +409,6 @@ def test_a_target_that_honors_a_tactic_claims_the_deployment(
         (_DraftOnlyTarget, "cutlass", None, "moe_config.tactic='cutlass'"),
         (_TrtllmGenNvfp4Target, "cutlass", None, "moe_config.tactic='cutlass'"),
         (_TrtllmGenNvfp4Target, _CUTLASS_NVFP4, None, f"moe_config.tactic='{_CUTLASS_NVFP4}'"),
-        # FlashInfer's TRTLLM-Gen NVFP4 leaf matches too.
-        (_TrtllmGenNvfp4Target, "trtllm_gen", None, "moe_config.tactic='trtllm_gen'"),
         (
             _TrtllmGenNvfp4Target,
             None,
@@ -434,7 +435,6 @@ def test_a_target_that_honors_a_tactic_claims_the_deployment(
         "draft_only_target",
         "other_technique",
         "other_id",
-        "other_provider_too",
         "empty_draft_set",
         "honored_target_unhonored_draft",
         "draft_not_narrowed",
@@ -453,12 +453,12 @@ def test_a_target_that_does_not_honor_a_tactic_is_refused(
 
 def test_a_refusal_names_what_the_tactic_can_resolve_to(monkeypatch):
     _route_to(monkeypatch, _TrtllmGenNvfp4Target)
-    config = _tactic_config("trtllm_gen")
+    config = _tactic_config("fused_moe")
     with pytest.raises(
         ValueError,
         match=re.escape(
             "runs its experts only as trtllm.trtllm_gen.fused_moe.nvfp4; the tactic can resolve to "
-            "flashinfer.trtllm_gen.fused_moe.nvfp4, trtllm.trtllm_gen.fused_moe.nvfp4"
+            "trtllm.trtllm_gen.fused_moe.nvfp4, marlin.cuda.fused_moe.nvfp4"
         ),
     ):
         modeling_v2_resolve(config, _llm_args("require"))
@@ -1424,7 +1424,11 @@ def test_kimi_k3_targets_take_only_the_tactic_of_the_experts_their_kernels_read(
         _model_config(_k3_config(), **mapping_kwargs),
         quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4),
     )
-    for tactic in ("trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8", "trtllm.trtllm_gen"):
+    for tactic in (
+        "trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8",
+        "trtllm.trtllm_gen",
+        "trtllm_gen",
+    ):
         honored = replace(config, moe_tactic=tactic)
         assert _qualified(modeling_v2_resolve(honored, _llm_args("require"))) == target, tactic
     declined = replace(config, moe_tactic="cutlass")
@@ -1825,7 +1829,7 @@ def _glm52_tp16_config(moe_tactic=None, draft_moe_tactic=None) -> ModelConfig:
 
 
 @pytest.mark.usefixtures("_on_sm107")
-@pytest.mark.parametrize("moe_tactic", [_TRTLLM_GEN_NVFP4, "trtllm.trtllm_gen"])
+@pytest.mark.parametrize("moe_tactic", [_TRTLLM_GEN_NVFP4, "trtllm.trtllm_gen", "trtllm_gen"])
 def test_glm52_tp16_takes_a_tactic_of_the_experts_its_kernels_read(moe_tactic):
     """Decode steps run the target's kernels over the TRTLLM-Gen NVFP4 experts' buffers, so a
     tactic that resolves to that implementation alone keeps the target."""
@@ -1839,12 +1843,10 @@ def test_glm52_tp16_takes_a_tactic_of_the_experts_its_kernels_read(moe_tactic):
     [
         ("cutlass", None, "moe_config.tactic='cutlass'"),
         (_CUTLASS_NVFP4, None, f"moe_config.tactic='{_CUTLASS_NVFP4}'"),
-        # FlashInfer's TRTLLM-Gen NVFP4 leaf matches too.
-        ("trtllm_gen", None, "moe_config.tactic='trtllm_gen'"),
         # The draft's decode MoE runs on a BF16 copy of its weights, not on the draft module.
         (None, _TRTLLM_GEN_NVFP4, f"speculative_config.moe_tactic='{_TRTLLM_GEN_NVFP4}'"),
     ],
-    ids=["cutlass", "cutlass_id", "flashinfer_too", "draft"],
+    ids=["cutlass", "cutlass_id", "draft"],
 )
 def test_glm52_tp16_declines_a_tactic_its_kernels_do_not_read(
     moe_tactic, draft_moe_tactic, refused

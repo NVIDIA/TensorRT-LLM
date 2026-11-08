@@ -2508,7 +2508,7 @@ def test_a_pin_inside_one_family_implies_that_family(tactic, family):
 
 
 @pytest.mark.parametrize(
-    "tactic", ["grouped_gemm.nvfp4", "fp8_block_scales", "cutedsl", "flashinfer.nvfp4"]
+    "tactic", ["grouped_gemm.nvfp4", "fp8_block_scales", "cutedsl", "deepgemm.fp8_block_scales"]
 )
 def test_a_pin_spanning_families_is_refused(tactic):
     """Which family runs is up to each layer's gates, so loading cannot settle it."""
@@ -2521,7 +2521,7 @@ def test_a_pin_spanning_families_is_refused(tactic):
     [
         ("cutedsl", {"nvfp4"}),
         ("grouped_gemm.nvfp4", {"nvfp4"}),
-        ("flashinfer.nvfp4", {"nvfp4"}),
+        ("deepgemm.fp8_block_scales", {"fp8_block_scales"}),
         ("fp8_block_scales", {"fp8_block_scales"}),
         ("nvfp4", {"nvfp4"}),
         ("mega_moe", set()),
