@@ -135,9 +135,13 @@ def test_prims_ts_qwen2_gqa(
 
 
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("kv_dtype", [None, "fp8"], ids=["native-kv", "fp8-kv"])
+@pytest.mark.parametrize("num_cached_tokens", [[0, 0], [32, 64]], ids=["context", "cached-context"])
 def test_prims_ts_context_receives_zeroed_v_tail(
     monkeypatch: pytest.MonkeyPatch,
     use_kv_cache_manager_v2: bool,
+    kv_dtype: str | None,
+    num_cached_tokens: list[int],
 ) -> None:
     import backend_case
 
@@ -145,7 +149,13 @@ def test_prims_ts_context_receives_zeroed_v_tail(
 
     original_build_kv_cache_manager = backend_case._build_kv_cache_manager
     original_run = BatchPrefillPagedTSWrapper.run
-    zeroed_tails: list[tuple[int, int]] = []
+    checked_tails: list[tuple[int, int]] = []
+    plan_flags: list[bool] = []
+    original_plan = BatchPrefillPagedTSWrapper.plan
+
+    def record_plan(self: BatchPrefillPagedTSWrapper, *args, **kwargs) -> None:
+        plan_flags.append(kwargs["paged_v_tail_is_zero"])
+        original_plan(self, *args, **kwargs)
 
     def build_kv_cache_manager_with_nan_v(
         case: BackendCase,
@@ -167,8 +177,8 @@ def test_prims_ts_context_receives_zeroed_v_tail(
         seq_lens_kv: torch.Tensor,
         **kwargs: object,
     ) -> torch.Tensor:
-        # The TRT-LLM producer promises zeroed V tails to PrimTS. Check the
-        # invariant at the handoff, before the PrimTS consumer launches.
+        # Native tails are zeroed by preprocessing. Poison FP8 tails at the
+        # handoff so fresh zero-filled cache allocations cannot mask the bug.
         page_size = v_cache.shape[2]
         seq_lens = seq_lens_kv.cpu().tolist()
         page_indices = block_tables.cpu()
@@ -179,8 +189,12 @@ def test_prims_ts_context_receives_zeroed_v_tail(
                 continue
             physical_page = int(page_indices[batch_idx, logical_last_page].item())
             tail = v_cache[physical_page, :, tail_start:, :]
-            assert torch.count_nonzero(tail).item() == 0
-            zeroed_tails.append((batch_idx, tail_start))
+            if kv_dtype == "fp8":
+                tail.fill_(float("nan"))
+                assert torch.isnan(tail.float()).all()
+            else:
+                assert torch.count_nonzero(tail).item() == 0
+            checked_tails.append((batch_idx, tail_start))
 
         return original_run(
             self,
@@ -204,11 +218,13 @@ def test_prims_ts_context_receives_zeroed_v_tail(
         "run",
         run_with_zeroed_v_tail_check,
     )
+    monkeypatch.setattr(BatchPrefillPagedTSWrapper, "plan", record_plan)
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
     case = BackendCase(
         **_QWEN2_7B,
         seq_lens=[65, 37],
-        num_cached_tokens=[0, 0],
+        num_cached_tokens=num_cached_tokens,
+        kv_dtype=kv_dtype,
         num_contexts=2,
         use_kv_cache_manager_v2=use_kv_cache_manager_v2,
     )
@@ -216,7 +232,9 @@ def test_prims_ts_context_receives_zeroed_v_tail(
     results = run_case(case)
 
     assert "TRTLLM" in results
-    assert zeroed_tails == [(0, 1), (1, 5)]
+    assert torch.isfinite(results["TRTLLM"]).all()
+    assert checked_tails == [(0, 1), (1, 5)]
+    assert plan_flags == [kv_dtype != "fp8"]
 
 
 @pytest.mark.parametrize("kv_dtype", [None, "fp8"], ids=["fp16-kv", "fp8-kv"])

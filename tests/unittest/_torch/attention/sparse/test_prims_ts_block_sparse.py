@@ -241,6 +241,28 @@ def _paged_case():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("sm, expected", [(100, True), (103, True), (107, False)])
+def test_default_block_sparse_selection_keeps_blackwell_scope(monkeypatch, sm, expected) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import prims_ts as prims_ts_fmha
+    from tensorrt_llm._torch.attention.backends.fmha.registry import get_enabled_fmha_lib_classes
+
+    monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
+    monkeypatch.setattr(prims_ts_fmha, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(
+        prims_ts_fmha, "import_module", lambda _: SimpleNamespace(target_version=lambda **_: True)
+    )
+    monkeypatch.setattr(
+        prims_ts_fmha.PrimsTSFmha, "_missing_fused_nanobind_ops", staticmethod(lambda: [])
+    )
+    cls = block_sparse_fmha.PrimsTSBlockSparseFmha
+
+    attention = SimpleNamespace(skip_correction_threshold=0.0, is_mla_enable=False)
+    assert cls in get_enabled_fmha_lib_classes()
+    assert cls.is_available(attention) is expected
+    assert prims_ts_fmha.PrimsTSFmha.is_available(attention)
+
+
+@pytest.mark.cpu_only
 def test_block_sparse_route_mode_is_derived_from_payload() -> None:
     bsr = _bsr_inputs()
     exact = _bitmask_inputs(proxy=False)

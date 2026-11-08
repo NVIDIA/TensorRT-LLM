@@ -230,6 +230,7 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
     here, on a dense plan.
     """
 
+    SUPPORTED_SMS = frozenset({100, 103})
     PLAN_CACHE_KEY = "prims_ts_block_sparse"
 
     supports_block_sparse_inputs = True

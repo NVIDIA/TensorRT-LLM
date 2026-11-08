@@ -736,9 +736,9 @@ class PrimsTSFmha(PhasedFmha):
             window_left=window_left,
             softmax_scale=softmax_scale,
             output_scale=output_scale,
-            # Preprocessing establishes this invariant for every context
-            # request admitted by this adapter.
-            paged_v_tail_is_zero=True,
+            # Preprocessing clears native V tails. Quantized caches rely on
+            # the consumer to clear invalid rows after loading each V tile.
+            paged_v_tail_is_zero=v_cache.dtype in self.SUPPORTED_DTYPES,
         )
         self._context_wrappers[batch_size] = wrapper
         return wrapper

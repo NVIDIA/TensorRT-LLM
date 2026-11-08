@@ -1070,7 +1070,7 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
         "window_left": -1,
         "softmax_scale": bmm1[:1] if fp8 else pytest.approx(1.0 / math.sqrt(attn.head_dim)),
         "output_scale": bmm2[:1] if fp8 else 1.0,
-        "paged_v_tail_is_zero": True,
+        "paged_v_tail_is_zero": not fp8,
     }
     wrapper.run.assert_called_once()
     run_args = wrapper.run.call_args.args
