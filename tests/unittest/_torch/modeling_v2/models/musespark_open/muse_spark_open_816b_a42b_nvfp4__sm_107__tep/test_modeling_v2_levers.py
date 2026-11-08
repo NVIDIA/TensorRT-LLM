@@ -1980,10 +1980,12 @@ def test_context_fp8_dense_on_refuses_a_reachable_decode_step():
 
 def test_a_paged_arena_leaves_the_arena_writing_levers_out():
     lever_table = table((107, 8), 1, "agg", "paged")
-    for name in DENSE | {"incremental_block_offsets", "windowed_commit_parallel"}:
+    for name in DENSE | {"windowed_commit_parallel"}:
         assert lever_table.decisions[name].source == "structural", name
     assert lever_table.on("step_loop_on_execution_stream")
     assert lever_table.on("context_kv_fork")
+    # The drafter's pages are in the target's manager, whose tables the stager copies.
+    assert lever_table.on("incremental_block_offsets")
 
 
 def test_the_window_compaction_needs_a_windowed_arena_and_the_full_context_paths_need_it():
