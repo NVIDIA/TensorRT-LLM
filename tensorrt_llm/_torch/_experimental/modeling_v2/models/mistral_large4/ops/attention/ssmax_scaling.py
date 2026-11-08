@@ -59,7 +59,7 @@ MAX_SEQ_LEN = 32768
 FP8_MAX_SEQ_LEN = 9216
 
 #: The checkpoint's own context (max_position_embeddings), which the tep4, tp4, dep4 and tep8
-#: targets serve with chunked prefill: a step still carries at most MAX_NUM_TOKENS rows per
+#: deployments serve with chunked prefill: a step still carries at most MAX_NUM_TOKENS rows per
 #: rank, a chunk's rows sit at positions cached .. cached + n - 1 behind its request's cached
 #: prefix, and decode rows reach position LONG_MAX_SEQ_LEN - 1, where log(pos + 1) is 13.86
 #: and a bf16 step of it is 0.0625.

@@ -537,9 +537,9 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(shape=(8192, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
         ),
     ),
-    "mistral_large4/mistral_large_4_nvfp4__sm_103__tep4": _ML4_TP,
-    "mistral_large4/mistral_large_4_nvfp4__sm_103__tp4": _ML4_TP,
-    "mistral_large4/mistral_large_4_nvfp4__sm_103__dep4": (*_ML4_TP, *_ML4_DP),
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__tep": _ML4_TP,
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__tp": _ML4_TP,
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__dep": (*_ML4_TP, *_ML4_DP),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)

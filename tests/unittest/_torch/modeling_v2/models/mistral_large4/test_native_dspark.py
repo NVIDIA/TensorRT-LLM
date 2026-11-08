@@ -32,7 +32,7 @@ def native_checkpoint():
     return path, {key: headers[key] for key in keys}
 
 
-@pytest.fixture(params=["tep4", "dep4", "tp4"])
+@pytest.fixture(params=["tep", "dep", "tp"])
 def modeling(request):
     return importlib.import_module(
         "tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4."

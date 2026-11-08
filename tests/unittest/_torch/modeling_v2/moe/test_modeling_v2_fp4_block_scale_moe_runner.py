@@ -310,7 +310,7 @@ def _release_reference_layers() -> Iterator[None]:
 
 
 # The token column certified at the R1 geometry. 8192 is trtllm's default
-# `max_num_tokens`; a dep4 target gathers four ranks' tokens before the expert
+# `max_num_tokens`; a dep4 deployment gathers four ranks' tokens before the expert
 # call, so its own T reaches 4 * 8192 and it must chunk down into calls this
 # column covers.
 _R1_TOKENS = (1, 2, 3, 5, 7, 8, 16, 24, 32, 33, 40, 64, 128, 256, 1024, 4096, 8192)
@@ -2127,7 +2127,7 @@ _ML4 = dict(
 # gathers all four ranks' rows, so every rank's 32-wide window runs over the
 # same 4 x T_max tokens -- up to 4 x max_num_tokens 32768 = 131072, 524288
 # expanded slots -- and decode graphs capture 4 x 1/2/4/8/16 rows.
-# `tune_max_num_tokens` is 4 x max_num_tokens, as the dep4 target passes it.
+# `tune_max_num_tokens` is 4 x max_num_tokens, as the dep4 deployment passes it.
 _ML4_131K = dict(_ML4, tune_max_num_tokens=131072)
 
 # The same routed experts at tp4 (experts tensor parallel over 4 ranks, no
@@ -2138,7 +2138,7 @@ _ML4_131K = dict(_ML4, tune_max_num_tokens=131072)
 # expert at offset 0 and returns this rank's partial sum over its slice.
 # Every rank sees all T tokens; decode is captured at 1..16 tokens and
 # context steps run eager up to max_num_tokens 32768, unchunked.
-# `tune_max_num_tokens` is max_num_tokens, as the tp4 target passes it.
+# `tune_max_num_tokens` is max_num_tokens, as the tp4 deployment passes it.
 _ML4_TP4 = dict(
     hidden=6144,
     intermediate=1536,
@@ -2170,7 +2170,7 @@ _ML4_16 = dict(_ML4, local_num_experts=16)
 # every expert at offset 0 and returns this rank's partial sum over its
 # slice. Every rank sees all T tokens; decode is captured at 1..16 tokens
 # and context steps run eager up to max_num_tokens 32768, unchunked.
-# `tune_max_num_tokens` is max_num_tokens, as the tp8 target passes it.
+# `tune_max_num_tokens` is max_num_tokens, as the tp8 deployment passes it.
 _ML4_TP8 = dict(
     hidden=6144,
     intermediate=768,
@@ -2642,12 +2642,12 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(tokens=8192, **_QWEN4_EXP),
         ),
     ),
-    "mistral_large4/mistral_large_4_nvfp4__sm_103__tep4": (
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__tep": (
         *_ML4_TEP4_CELLS,
         *_ML4_WINDOW16_CELLS,
     ),
-    "mistral_large4/mistral_large_4_nvfp4__sm_103__tp4": (*_ML4_TP4_CELLS, *_ML4_TP8_CELLS),
-    "mistral_large4/mistral_large_4_nvfp4__sm_103__dep4": (
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__tp": (*_ML4_TP4_CELLS, *_ML4_TP8_CELLS),
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__dep": (
         *_ML4_DEP4_CELLS,
         *_ML4_WINDOW16_CELLS,
     ),
@@ -2868,7 +2868,7 @@ def _ml4_padding_rows(spec, tokens: int) -> torch.Tensor:
 
 
 def _ml4_pad(args, ref, pad: torch.Tensor):
-    """Padding rows as the dep4 target hands them to the op: `fp4_quantize` of
+    """Padding rows as the dep4 deployment hands them to the op: `fp4_quantize` of
     an all-zero row -- every code and every block scale 0, read back from that
     op -- routed the way renorm_moe_routing_op routes the all-+0.0 logits the
     router makes of it, to experts 0..top_k-1 at 1/top_k each."""

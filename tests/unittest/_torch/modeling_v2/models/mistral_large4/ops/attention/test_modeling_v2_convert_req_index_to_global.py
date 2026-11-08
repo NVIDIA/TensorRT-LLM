@@ -5,8 +5,8 @@
 The cells are the Mistral Large 4 FP8 target's at its 9216 envelope, the
 Mistral Large 4 NVFP4 targets' at their 32768 envelope (the tep8, tp8 and dep8 ones
 on the fp8_ds_mla pool with page ids from a 147456-block pool), the NVFP4 tep4,
-tp4 and dep4 targets' at max_seq_len 1048576 with chunked prefill, and those
-three targets' and the tep8 target's on the 63-owner fp8_ds_mla pool at that
+tp4 and dep4 deployments' at max_seq_len 1048576 with chunked prefill, and those
+three targets' and the tep8 deployment's on the 63-owner fp8_ds_mla pool at that
 envelope (dep4's under attention DP, tep8's from the 147456-block pool). Every
 value is integer address arithmetic, so each output is gated bitwise against
 the entry's reference.

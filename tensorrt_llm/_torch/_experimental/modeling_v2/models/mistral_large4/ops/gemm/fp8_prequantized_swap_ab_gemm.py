@@ -58,7 +58,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
 #: at tep4 (FP8 and NVFP4 alike), then the NVFP4 target's attention projections at dep4, where
 #: attention data parallel leaves the 64 heads unsplit, and its dense layer-0 MLP at dep4, which
 #: runs replicated on each rank's own tokens; then the shards of the NVFP4 tep8 and tp8
-#: targets, eight ways (their dense gate_up, [6144, 6144], is the tep4 dense down's shape above).
+#: deployments, eight ways (their dense gate_up, [6144, 6144], is the tep4 dense down's shape above).
 PROJECTIONS = (
     ("wq (q_proj, 16 heads x 128)", 2048, 6144),
     ("wo (o_proj, row-parallel K slice of 8192)", 6144, 2048),
@@ -254,7 +254,7 @@ class Fp8PrequantizedSwapAbGemm(OpWrapper):
                         [N/128, K/128], or the FP8 checkpoint's `.qscale_weight`
                         [N/128, K/128]; the cells draw block scales 2^-15..2^-8, the range the
                         NVFP4 checkpoint's 404 FP8 block scales span. The tep4 and dep4
-                        targets' loaders (`_block_sf` in their `weights.py`) assert the stored
+                        deployments' loaders (`_block_sf` in their `weights.py`) assert the stored
                         scales are powers of two and pack them with the same
                         `transform_sf_into_required_layout` call, without the resmooth.
       output            a new [M, N] tensor; DeepGEMM's bf16 output is its fp32 result

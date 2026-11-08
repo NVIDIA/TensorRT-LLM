@@ -25,13 +25,13 @@ KERNEL_HEADS = (64, 128)
 #: scheduler exits the process past 11622 on sm_103 (the note's Hard limits).
 MAX_ROWS = 8192
 
-#: The tp4 target at the 1M envelope: 16 live heads of the 64-head scratch, sequences to
+#: The tp4 deployment at the 1M envelope: 16 live heads of the 64-head scratch, sequences to
 #: 1048576 keys, the fp8_ds_mla pool's 32-token pages of 63 KV-owner rows per block.
 _ML4_1M = dict(h_q=64, h_out=16, topk=2048, kv_len=1048576, page_size=32, owners=63)
-#: The tep4 target at the 1M envelope: 16 live heads of its 64-head scratch, top-2048
+#: The tep4 deployment at the 1M envelope: 16 live heads of its 64-head scratch, top-2048
 #: selections, sequences to 1048576 keys, 32-token pages of 63 KV-owner rows per block.
 _TEP4_1M = dict(h_q=64, h_out=16, topk=2048, kv_len=1048576, page_size=32, owners=63)
-#: The dep4 target at the 1M envelope: all 64 heads of a rank (its scratch is the kernel's
+#: The dep4 deployment at the 1M envelope: all 64 heads of a rank (its scratch is the kernel's
 #: 64 heads, no padding), top-2048 selections, sequences to 1048576 keys, 32-token pages of
 #: 63 KV-owner rows per block.
 _DEP4_1M = dict(h_q=64, h_out=64, topk=2048, kv_len=1048576, page_size=32, owners=63)
@@ -71,7 +71,7 @@ _DEP4_TAIL_SHARE = (
     + (6445, 8096)
     + tuple(range(8175, 8193))
 )
-#: The tep8 target at the 1M envelope: 8 live heads of its 64-head scratch, top-2048
+#: The tep8 deployment at the 1M envelope: 8 live heads of its 64-head scratch, top-2048
 #: selections, sequences to 1048576 keys, 32-token pages of 63 KV-owner rows per block.
 _TEP8_1M = dict(h_q=64, h_out=8, topk=2048, kv_len=1048576, page_size=32, owners=63)
 #: `pages` (blocks x 63) of the 147456-block pool bound, the "1M tep8" cells' far pool (a 1M
@@ -386,7 +386,7 @@ class FlashMlaSparseDecode(OpWrapper):
             )
             for b in (1, 2, 4, 8, 16)
         )
-        # The tp4 target at the 1M envelope. Decode rows (DecodeTarget._attention, captured at
+        # The tp4 deployment at the 1M envelope. Decode rows (DecodeTarget._attention, captured at
         # 1/2/4/8/16 padded; the LLM API's default list reaches every batch 1..16) and a mixed
         # step's generation rows (PrefillTarget._attn_gen) are one query each at kv_len - 1;
         # context rows on the decode path (PrefillTarget._attn_ctx on a step whose context KV
@@ -611,7 +611,7 @@ class FlashMlaSparseDecode(OpWrapper):
                 ),
             ),
         )
-        # The tep4 target at the 1M envelope, its three call sites: DecodeTarget._attention
+        # The tep4 deployment at the 1M envelope, its three call sites: DecodeTarget._attention
         # (captured at 1/2/4/8/16 padded, every batch 1..16 under the LLM API's default list,
         # 72 calls on one sched meta made per step), PrefillTarget._attn_gen (a mixed step's
         # 1..16 generation rows, eager, q and out tail views of the step's scratch, a fresh
@@ -832,7 +832,7 @@ class FlashMlaSparseDecode(OpWrapper):
                 ),
             ),
         )
-        # The dep4 target at the 1M envelope, its three call sites: DecodeTarget._attention
+        # The dep4 deployment at the 1M envelope, its three call sites: DecodeTarget._attention
         # (captured at 1/2/4/8/16 padded, every batch 1..16 under the LLM API's default list,
         # 72 calls on one sched meta made per step; under attention DP every rank replays the
         # largest rank's batch, one live row behind one-key padding dummies; eager at any
@@ -1115,7 +1115,7 @@ class FlashMlaSparseDecode(OpWrapper):
                 ),
             ),
         )
-        # The tep8 target at the 1M envelope, its three call sites: DecodeTarget._attention
+        # The tep8 deployment at the 1M envelope, its three call sites: DecodeTarget._attention
         # (captured at 1/2/4/8/16 padded, every batch 1..16 under the LLM API's default list,
         # 72 calls on one sched meta made per step), PrefillTarget._attn_gen (a mixed step's
         # 1..16 generation rows, eager, q and out tail views of the step's scratch, a fresh
@@ -1408,7 +1408,7 @@ class FlashMlaSparseDecode(OpWrapper):
     Cost: a call that makes a fresh sched meta pays a fixed cost over one that shares the
     step's sched meta.
 
-    The "1M tp4" cells are the Mistral Large 4 NVFP4 tp4 target at max_seq_len 1048576 with
+    The "1M tp4" cells are the Mistral Large 4 NVFP4 tp4 deployment at max_seq_len 1048576 with
     chunked prefill (32768-row steps, up to 16 requests), 16 live heads of its 64-head
     scratch, `kv_cache` the whole latent pool viewed [blocks * 63, 32, 1, 656] (FlashMLA
     requires the cache contiguously valid from its first byte to its last on sm100),
@@ -1434,7 +1434,7 @@ class FlashMlaSparseDecode(OpWrapper):
     5.51e-3 and 2.44e-4 on another. The sweep's 8192 kernel calls make it large; pre-merge
     drives r in 1..65, either side of each power of two to 4096, and 8160..8192.
 
-    The "1M tep4" cells are the Mistral Large 4 NVFP4 tep4 target at max_seq_len 1048576 with
+    The "1M tep4" cells are the Mistral Large 4 NVFP4 tep4 deployment at max_seq_len 1048576 with
     chunked prefill (steps of up to 32768 rows and 16 requests), 16 live heads of its
     64-head scratch, `kv_cache` the whole latent pool viewed [blocks * 63, 32, 1, 656]
     (FlashMLA requires the cache contiguously valid from its first byte to its last on
@@ -1458,7 +1458,7 @@ class FlashMlaSparseDecode(OpWrapper):
     the 8192-row call's (327794 and 327350 at two seeds). Its 8192 calls took 18.2 s, so the
     sweep is large and a pre-merge share runs the 103 row counts of `_RAGGED_SHARE`.
 
-    The "1M dep4" cells are the Mistral Large 4 NVFP4 dep4 target at max_seq_len 1048576 with
+    The "1M dep4" cells are the Mistral Large 4 NVFP4 dep4 deployment at max_seq_len 1048576 with
     chunked prefill (steps of up to 32768 rows and 16 requests per rank) under attention DP:
     a rank calls with all 64 heads of its own rows (q its [*, 64, 576] scratch, no padding
     heads; out [*, 64, 512]), `kv_cache` the whole latent pool viewed [blocks * 63, 32, 1,
@@ -1492,7 +1492,7 @@ class FlashMlaSparseDecode(OpWrapper):
     a pre-merge share runs the 103 row counts of `_DEP4_TAIL_SHARE`; largest first, the sweep
     peaked at 9.44 GiB allocated, 11.10 GiB reserved.
 
-    The "1M tep8" cells are the Mistral Large 4 NVFP4 tep8 target at max_seq_len 1048576 with
+    The "1M tep8" cells are the Mistral Large 4 NVFP4 tep8 deployment at max_seq_len 1048576 with
     chunked prefill (steps of up to 32768 rows and 16 requests), 8 live heads of its
     64-head scratch, `kv_cache` the whole latent pool viewed [blocks * 63, 32, 1, 656]
     (FlashMLA requires the cache contiguously valid from its first byte to its last on

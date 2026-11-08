@@ -109,13 +109,13 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     calls whose outputs sum -- which is what the deepseek default target does
     under moe_ep, one call per rank over its window; qwen4_exp makes one call
     over its whole expert stack, Mistral Large 4's tep4
-    target one call per rank over its 32-wide window, Mistral Large 4's dep4
-    target the same per-rank call over the four ranks' gathered tokens, and
-    Mistral Large 4's dep8 target one call per rank over its 16-wide window for
+    deployment one call per rank over its 32-wide window, Mistral Large 4's dep4
+    deployment the same per-rank call over the four ranks' gathered tokens, and
+    Mistral Large 4's dep8 deployment one call per rank over its 16-wide window for
     each chunk of at most 32768 of the eight ranks' gathered tokens, and its
-    tep8 target one call per rank over its 16-wide window and all of the
+    tep8 deployment one call per rank over its 16-wide window and all of the
     step's tokens.
-    Mistral Large 4's tp4 and tp8 targets split the experts' width instead: one
+    Mistral Large 4's tp4 and tp8 deployments split the experts' width instead: one
     call per rank over all 128 experts, each cut to that rank's 1536-wide
     (tp4) or 768-wide (tp8) slice of its intermediate, and the ranks' outputs
     sum to the layer.
@@ -209,7 +209,7 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     at 32 and 64; 24 of 224 at 128), each inside the test's gate. So the
     cells certify whichever tactic warm-up keeps, while bitwise batch
     invariance holds on the cold path only. Pass `tune_max_num_tokens` =
-    max_num_tokens (32768), as the tep4 target does: the tuner then adds a
+    max_num_tokens (32768), as the tep4 deployment does: the tuner then adds a
     32768 bucket and maps 8193..32768 onto it. Warming at 32768 tokens wrote
     15 cache entries in 14.7 s and left the result bitwise unchanged at every
     count checked. Certified with TLLM_USE_FINE_GRAINED_SYNC unset (the
@@ -232,7 +232,7 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     once: their partials, summed, pass the test's gate against the summed
     window references, while leaving one window out or running one twice
     lands 118-175 rms ulp out.
-    The dep4 target passes `tune_max_num_tokens` = 4 x max_num_tokens =
+    The dep4 deployment passes `tune_max_num_tokens` = 4 x max_num_tokens =
     131072 and `use_dp` False, so the tuner's buckets are 1..8192 and 131072,
     and 8193..131072 map onto 131072. The op offers 8 valid tactics there
     (tiles 128 and 256), 8 at 8193 and 65537 too, and every one is
@@ -271,7 +271,7 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     partials, summed in fp32 and as a bf16 running sum in rank order, pass
     the test's gate against `reference` over all 128 experts at once, while
     leaving one window out or running one twice lands 84-119 rms ulp out.
-    How the tep8 target sums them is its closing all-reduce's
+    How the tep8 deployment sums them is its closing all-reduce's
     (`comm/cute_dsl_allreduce_add_rmsnorm`).
     The tuned path at tep8: the op offers 216 valid tactics at 1..35 tokens
     (tiles 8, 16 and 32), 224 at 36 and 64, 142 at 128, 80 at 256, 16 at 512
@@ -310,8 +310,8 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     partials, summed in fp32 and as a bf16 running sum in rank order, pass
     the test's gate against `reference` over all 128 experts at once, while
     leaving one window out or running one twice lands 83-118 rms ulp out.
-    How the dep8 target sums them is `comm/reducescatter`'s.
-    The dep8 target passes `tune_max_num_tokens` = its chunk, 32768, and
+    How the dep8 deployment sums them is `comm/reducescatter`'s.
+    The dep8 deployment passes `tune_max_num_tokens` = its chunk, 32768, and
     `use_dp` False, so the tuner's buckets are 1..8192 and 32768, and a call
     runs the tactic of the power of two at or below its count (8193..32768
     that of 32768). Every tactic valid at that bucket was run at each decode
@@ -451,7 +451,7 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     slice is a max over a narrower contraction, so the test gates elements
     at 32 ulp there (16 at the whole width) and RMS at 2 as everywhere but the
     decode graph replays; its
-    `_compare` has the derivation and the measurements. How the tp4 target
+    `_compare` has the derivation and the measurements. How the tp4 deployment
     sums the partials is its closing all-reduce's.
 
     Operands at tp4, as a loader builds them for rank r from layer N's
@@ -541,7 +541,7 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     at 16 * sqrt(8) = 45.25 ulp there (16 at the whole width) and RMS at 2 as
     everywhere but the decode graph replays; its `_compare` has the derivation
     and the measurements. How
-    the tp8 target sums the partials is its closing all-reduce's.
+    the tp8 deployment sums the partials is its closing all-reduce's.
 
     Decode at tp8 gates few rows: a step of T tokens is T live rows of 4 x 768
     FC1 outputs, so one FC1 output that kernel and reference round to
@@ -658,7 +658,7 @@ class Fp4BlockScaleMoeRunner(OpWrapper):
     the op holds no cross-rank state, each rank's call is this one at its own
     offset, and the windows' partials were summed in one process, in fp32 and
     as a bf16 running sum in rank order. How the dep4 and dep8 combines sum
-    them is `comm/reducescatter`'s; how the tep8 target's does,
+    them is `comm/reducescatter`'s; how the tep8 deployment's does,
     `comm/cute_dsl_allreduce_add_rmsnorm`'s. At tp4 and tp8: more than 32768
     tokens, graph batches past 16, a width slice other than 1536 and 768
     (moe_tensor_parallel_size other than 4 and 8), and the four or eight width

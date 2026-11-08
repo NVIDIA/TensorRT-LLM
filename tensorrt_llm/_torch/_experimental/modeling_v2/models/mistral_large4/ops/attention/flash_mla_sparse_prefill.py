@@ -17,7 +17,7 @@ from tensorrt_llm.flash_mla import flash_mla_sparse_fwd as _flash_mla_sparse_fwd
 D_NOPE = 512
 D_QK = 576
 KERNEL_HEADS = (64, 128)
-#: The tep4, dep4 and tep8 targets' bounded context workspace at max_seq_len 1048576:
+#: The tep4, dep4 and tep8 deployments' bounded context workspace at max_seq_len 1048576:
 #: B = 2**19 bf16 rows.
 _WS_ROWS = 2**19
 #: The row sweep's pre-merge share of the 32768 query row counts: 1..65, 2**k - 1, 2**k and
@@ -86,7 +86,7 @@ class FlashMlaSparsePrefill(OpWrapper):
     # -1 while p + 1 <= topk, else topk distinct positions spread over [0, p], 0 and p among
     # them, in shuffled order); `dense`: the engine's dense causal index for a skipped indexer
     # (0..p, then -1). Both are offset to the request's run in the workspace, -1 kept. With
-    # `kv_rows`, a "tep4 1M", "dep4 1M" or "tep8 1M" cell is the tep4, dep4 or tep8 target's
+    # `kv_rows`, a "tep4 1M", "dep4 1M" or "tep8 1M" cell is the tep4, dep4 or tep8 deployment's
     # bounded context workspace: kv is the first sum(kv_len) rows of a `kv_rows`-row buffer
     # whose later rows are stale, each request's run at its cumulative offset, and the
     # selections are the indexer's top-`topk` shape (`selection="topk"`, which the "dep4 1M"
@@ -118,7 +118,7 @@ class FlashMlaSparsePrefill(OpWrapper):
             why="tep8: 32768 rows of one request, 8 heads padded to 64",
             spec=dict(rows=32768, kv_len=[32768], h_q=64, h_out=8, topk=2048),
         ),
-        # The tp4 target at the 1M envelope, workspace path (PrefillTarget._attn_ctx, every
+        # The tp4 deployment at the 1M envelope, workspace path (PrefillTarget._attn_ctx, every
         # layer, eager): a step whose context KV (cached + new over its context requests) is
         # at most B = 2**19 rows attends over kv = buf[:N] of one bf16 [B, 576] buffer; q is
         # the context rows of the [T, 64, 576] fused_q scratch, this rank's 16 heads first.

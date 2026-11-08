@@ -73,17 +73,17 @@ _R1_DEFAULT_TARGET = (
 _GLM52_TARGET = (
     "models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.modeling.ModelingV2Glm52Nvfp4Sm103Tep4"
 )
-_MISTRAL_LARGE4_NVFP4_TARGET = (
-    "models.mistral_large4.mistral_large_4_nvfp4__sm_103__tep4.modeling."
-    "ModelingV2MistralLarge4Nvfp4Sm103Tep4"
+_MISTRAL_LARGE4_NVFP4_TEP_TARGET = (
+    "models.mistral_large4.mistral_large_4_nvfp4__sm_103__tep.modeling."
+    "ModelingV2MistralLarge4Nvfp4Sm103Tep"
 )
-_MISTRAL_LARGE4_NVFP4_DEP4_TARGET = (
-    "models.mistral_large4.mistral_large_4_nvfp4__sm_103__dep4.modeling."
-    "ModelingV2MistralLarge4Nvfp4Sm103Dep4"
+_MISTRAL_LARGE4_NVFP4_DEP_TARGET = (
+    "models.mistral_large4.mistral_large_4_nvfp4__sm_103__dep.modeling."
+    "ModelingV2MistralLarge4Nvfp4Sm103Dep"
 )
-_MISTRAL_LARGE4_NVFP4_TP4_TARGET = (
-    "models.mistral_large4.mistral_large_4_nvfp4__sm_103__tp4.modeling."
-    "ModelingV2MistralLarge4Nvfp4Sm103Tp4"
+_MISTRAL_LARGE4_NVFP4_TP_TARGET = (
+    "models.mistral_large4.mistral_large_4_nvfp4__sm_103__tp.modeling."
+    "ModelingV2MistralLarge4Nvfp4Sm103Tp"
 )
 
 
@@ -1720,7 +1720,9 @@ def _mistral_large4_sm(_on_sm10x):
 @pytest.mark.parametrize("mode", ["auto", "require"])
 def test_mistral_large4_nvfp4_tep4_matches(mode):
     config = _model_config(_mistral_large4_nvfp4_config(), **_TEP4)
-    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _MISTRAL_LARGE4_NVFP4_TARGET
+    assert (
+        _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _MISTRAL_LARGE4_NVFP4_TEP_TARGET
+    )
 
 
 def _flip(values, i):
@@ -1738,7 +1740,7 @@ def test_mistral_large4_rope_factor_and_positions_are_not_criteria():
         rope_parameters=dict(_mistral_large4_nvfp4_config().rope_parameters, factor=512.0),
     )
     resolved = modeling_v2_resolve(_model_config(config, **_TEP4), _llm_args("require"))
-    assert _qualified(resolved) == _MISTRAL_LARGE4_NVFP4_TARGET
+    assert _qualified(resolved) == _MISTRAL_LARGE4_NVFP4_TEP_TARGET
 
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
@@ -1875,8 +1877,7 @@ def test_mistral_large4_nvfp4_with_speculative_decoding_does_not_match():
 def test_mistral_large4_nvfp4_dep4_matches(mode):
     config = _model_config(_mistral_large4_nvfp4_config(), **_DEP4)
     assert (
-        _qualified(modeling_v2_resolve(config, _llm_args(mode)))
-        == _MISTRAL_LARGE4_NVFP4_DEP4_TARGET
+        _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _MISTRAL_LARGE4_NVFP4_DEP_TARGET
     )
 
 
@@ -1886,16 +1887,16 @@ def test_mistral_large4_nvfp4_lands_on_its_topologys_target():
     config = _mistral_large4_nvfp4_config()
     tep4 = modeling_v2_resolve(_model_config(config, **_TEP4), _llm_args("require"))
     dep4 = modeling_v2_resolve(_model_config(config, **_DEP4), _llm_args("require"))
-    assert _qualified(tep4) == _MISTRAL_LARGE4_NVFP4_TARGET
-    assert _qualified(dep4) == _MISTRAL_LARGE4_NVFP4_DEP4_TARGET
+    assert _qualified(tep4) == _MISTRAL_LARGE4_NVFP4_TEP_TARGET
+    assert _qualified(dep4) == _MISTRAL_LARGE4_NVFP4_DEP_TARGET
 
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
-def test_mistral_large4_tep4_branch_refuses_attention_dp():
-    """The tep4 target is never returned for an attention-DP mapping."""
+def test_mistral_large4_tep_branch_refuses_attention_dp():
+    """The tep target is never returned for an attention-DP mapping."""
     config = _model_config(_mistral_large4_nvfp4_config(), **_DEP4)
     resolved = modeling_v2_resolve(config, _llm_args("auto"))
-    assert resolved is None or _qualified(resolved) != _MISTRAL_LARGE4_NVFP4_TARGET
+    assert resolved is None or _qualified(resolved) != _MISTRAL_LARGE4_NVFP4_TEP_TARGET
 
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
@@ -1971,7 +1972,7 @@ def test_mistral_large4_nvfp4_dep4_with_speculative_decoding_does_not_match():
 def test_mistral_large4_nvfp4_tp4_matches(mode):
     config = _model_config(_mistral_large4_nvfp4_config(), **_TP4)
     assert (
-        _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _MISTRAL_LARGE4_NVFP4_TP4_TARGET
+        _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _MISTRAL_LARGE4_NVFP4_TP_TARGET
     )
 
 
@@ -1979,12 +1980,12 @@ def test_mistral_large4_nvfp4_tp4_matches(mode):
 def test_mistral_large4_nvfp4_tp4_from_tensor_parallel_size_alone():
     """A deployment that states only tensor_parallel_size 4 leaves both MoE sizes unset; the
     mapping then gives every rank all the experts, tensor parallel (moe_tp 4, moe_ep 1), and
-    that lands on the tp4 target."""
+    that lands on the tp target."""
     mapping = Mapping(world_size=4, tp_size=4)
     assert (mapping.moe_tp_size, mapping.moe_ep_size) == (4, 1)
     config = ModelConfig(pretrained_config=_mistral_large4_nvfp4_config(), mapping=mapping)
     resolved = modeling_v2_resolve(config, _llm_args("require"))
-    assert _qualified(resolved) == _MISTRAL_LARGE4_NVFP4_TP4_TARGET
+    assert _qualified(resolved) == _MISTRAL_LARGE4_NVFP4_TP_TARGET
 
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
@@ -1997,22 +1998,22 @@ def test_mistral_large4_nvfp4_lands_on_each_topologys_target():
         for name, m in (("tep4", _TEP4), ("dep4", _DEP4), ("tp4", _TP4))
     }
     assert landed == {
-        "tep4": _MISTRAL_LARGE4_NVFP4_TARGET,
-        "dep4": _MISTRAL_LARGE4_NVFP4_DEP4_TARGET,
-        "tp4": _MISTRAL_LARGE4_NVFP4_TP4_TARGET,
+        "tep4": _MISTRAL_LARGE4_NVFP4_TEP_TARGET,
+        "dep4": _MISTRAL_LARGE4_NVFP4_DEP_TARGET,
+        "tp4": _MISTRAL_LARGE4_NVFP4_TP_TARGET,
     }
 
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
 def test_mistral_large4_expert_parallel_branches_refuse_tp4():
-    """No expert-parallel target is ever returned for the tp4 mapping, and the tp4 target for
+    """No expert-parallel target is ever returned for the tp4 mapping, and the tp target for
     none of the expert-parallel mappings."""
     config = _mistral_large4_nvfp4_config()
     resolved = modeling_v2_resolve(_model_config(config, **_TP4), _llm_args("auto"))
-    assert resolved is None or _qualified(resolved) == _MISTRAL_LARGE4_NVFP4_TP4_TARGET
+    assert resolved is None or _qualified(resolved) == _MISTRAL_LARGE4_NVFP4_TP_TARGET
     for mapping in (_TEP4, _DEP4):
         resolved = modeling_v2_resolve(_model_config(config, **mapping), _llm_args("auto"))
-        assert resolved is None or _qualified(resolved) != _MISTRAL_LARGE4_NVFP4_TP4_TARGET
+        assert resolved is None or _qualified(resolved) != _MISTRAL_LARGE4_NVFP4_TP_TARGET
 
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
@@ -2096,26 +2097,28 @@ def _resolves_to(config, mapping) -> str | None:
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
 @pytest.mark.parametrize("mode", ["auto", "require"])
-def test_mistral_large4_nvfp4_tep8_matches_the_tep4_target(mode):
+def test_mistral_large4_nvfp4_tep8_matches_the_tep_target(mode):
     config = _model_config(_mistral_large4_nvfp4_config(), **_TEP8)
-    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _MISTRAL_LARGE4_NVFP4_TARGET
+    assert (
+        _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _MISTRAL_LARGE4_NVFP4_TEP_TARGET
+    )
 
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
 def test_mistral_large4_nvfp4_lands_on_its_topologys_target_at_every_world():
     """One checkpoint, three targets, chosen by the topology alone and not by the rank count:
-    the experts split by expert is the tep4 target (attention DP off) or the dep4 target (on),
-    split by width (stated, or tensor_parallel_size 8 alone) the tp4 target, on four ranks and
+    the experts split by expert is the tep target (attention DP off) or the dep target (on),
+    split by width (stated, or tensor_parallel_size 8 alone) the tp target, on four ranks and
     on eight over two nodes of four alike."""
     config = _mistral_large4_nvfp4_config()
     for mapping, target in (
-        (_TEP4, _MISTRAL_LARGE4_NVFP4_TARGET),
-        (_DEP4, _MISTRAL_LARGE4_NVFP4_DEP4_TARGET),
-        (_TP4, _MISTRAL_LARGE4_NVFP4_TP4_TARGET),
-        (_TEP8, _MISTRAL_LARGE4_NVFP4_TARGET),
-        (_TP8, _MISTRAL_LARGE4_NVFP4_TP4_TARGET),
-        (_TP8_BARE, _MISTRAL_LARGE4_NVFP4_TP4_TARGET),
-        (_DEP8, _MISTRAL_LARGE4_NVFP4_DEP4_TARGET),
+        (_TEP4, _MISTRAL_LARGE4_NVFP4_TEP_TARGET),
+        (_DEP4, _MISTRAL_LARGE4_NVFP4_DEP_TARGET),
+        (_TP4, _MISTRAL_LARGE4_NVFP4_TP_TARGET),
+        (_TEP8, _MISTRAL_LARGE4_NVFP4_TEP_TARGET),
+        (_TP8, _MISTRAL_LARGE4_NVFP4_TP_TARGET),
+        (_TP8_BARE, _MISTRAL_LARGE4_NVFP4_TP_TARGET),
+        (_DEP8, _MISTRAL_LARGE4_NVFP4_DEP_TARGET),
     ):
         resolved = modeling_v2_resolve(_model_config(config, **mapping), _llm_args("require"))
         assert _qualified(resolved) == target, mapping
@@ -2173,8 +2176,8 @@ def test_mistral_large4_refusal_states_the_ranks_each_target_serves():
     message = str(excinfo.value)
     assert (
         "the mistral_large4 targets are Mistral-Large-4-1T-A52B-NVFP4 (ModelOpt MIXED_PRECISION: "
-        "NVFP4 routed experts, FP8_PB_WO linears, group 16, its 475-module map) on sm103 at tep4, "
-        "at dep4 and at tp4" in message
+        "NVFP4 routed experts, FP8_PB_WO linears, group 16, its 475-module map) on sm103 in the "
+        "tep, dep and tp layouts" in message
     )
     assert "each target serves 4 ranks on one node or 8 ranks over two nodes of four" in message
     for served in (
@@ -2220,9 +2223,9 @@ def test_mistral_large4_nvfp4_tep8_near_misses_do_not_match(config_kwargs, mappi
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match=missed) as excinfo:
         modeling_v2_resolve(config, _llm_args("require"))
-    # The refusal names the eight-rank deployment the tep4 target serves.
+    # The refusal names the eight-rank deployment the tep target serves.
     message = str(excinfo.value)
-    assert "at tep4" in message
+    assert "tep is tensor-parallel attention, expert-parallel MoE" in message
     assert "world_size=8 tp=8 pp=1 moe_ep=8 moe_tp=1: tep8" in message
 
 
@@ -2250,18 +2253,18 @@ def test_mistral_large4_nvfp4_tep8_with_speculative_decoding_does_not_match():
 @pytest.mark.usefixtures("_mistral_large4_sm")
 @pytest.mark.parametrize("mapping", [_TP8, _TP8_BARE], ids=["stated", "tp_size_8_alone"])
 @pytest.mark.parametrize("mode", ["auto", "require"])
-def test_mistral_large4_nvfp4_tp8_matches_the_tp4_target(mode, mapping):
+def test_mistral_large4_nvfp4_tp8_matches_the_tp_target(mode, mapping):
     model_config = _model_config(_mistral_large4_nvfp4_config(), **mapping)
     assert (model_config.mapping.moe_tp_size, model_config.mapping.moe_ep_size) == (8, 1)
     assert (
         _qualified(modeling_v2_resolve(model_config, _llm_args(mode)))
-        == _MISTRAL_LARGE4_NVFP4_TP4_TARGET
+        == _MISTRAL_LARGE4_NVFP4_TP_TARGET
     )
 
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
-def test_mistral_large4_tp4_target_refuses_every_other_topology_at_eight_ranks():
-    """The tp4 target is returned for no expert-parallel mapping, at four ranks or eight, and
+def test_mistral_large4_tp_target_refuses_every_other_topology_at_eight_ranks():
+    """The tp target is returned for no expert-parallel mapping, at four ranks or eight, and
     for no mixed split of the experts over eight ranks."""
     others = (
         _TEP4,
@@ -2274,7 +2277,7 @@ def test_mistral_large4_tp4_target_refuses_every_other_topology_at_eight_ranks()
     config = _mistral_large4_nvfp4_config()
     for mapping in others:
         resolved = modeling_v2_resolve(_model_config(config, **mapping), _llm_args("auto"))
-        assert resolved is None or _qualified(resolved) != _MISTRAL_LARGE4_NVFP4_TP4_TARGET
+        assert resolved is None or _qualified(resolved) != _MISTRAL_LARGE4_NVFP4_TP_TARGET
 
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
@@ -2322,11 +2325,13 @@ def test_mistral_large4_nvfp4_tp8_near_misses_do_not_match(config_kwargs, mappin
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match=missed) as excinfo:
         modeling_v2_resolve(config, _llm_args("require"))
-    # The refusal names the width-split eight-rank deployment the tp4 target serves, beside the
-    # expert-split one the tep4 target serves.
+    # The refusal names the width-split eight-rank deployment the tp target serves, beside the
+    # expert-split one the tep target serves.
     message = str(excinfo.value)
-    assert "at tp4" in message and "world_size=8 tp=8 pp=1 moe_ep=1 moe_tp=8: tp8" in message
-    assert "at tep4" in message and "world_size=8 tp=8 pp=1 moe_ep=8 moe_tp=1: tep8" in message
+    assert "tp is tensor-parallel attention, tensor-parallel MoE" in message
+    assert "world_size=8 tp=8 pp=1 moe_ep=1 moe_tp=8: tp8" in message
+    assert "tep is tensor-parallel attention, expert-parallel MoE" in message
+    assert "world_size=8 tp=8 pp=1 moe_ep=8 moe_tp=1: tep8" in message
 
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
@@ -2352,47 +2357,46 @@ def test_mistral_large4_nvfp4_tp8_with_speculative_decoding_does_not_match():
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
 @pytest.mark.parametrize("mode", ["auto", "require"])
-def test_mistral_large4_nvfp4_dep8_matches_the_dep4_target(mode):
+def test_mistral_large4_nvfp4_dep8_matches_the_dep_target(mode):
     config = _model_config(_mistral_large4_nvfp4_config(), **_DEP8)
     assert (
-        _qualified(modeling_v2_resolve(config, _llm_args(mode)))
-        == _MISTRAL_LARGE4_NVFP4_DEP4_TARGET
+        _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _MISTRAL_LARGE4_NVFP4_DEP_TARGET
     )
 
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
 def test_mistral_large4_nvfp4_lands_on_its_topologys_target_at_four_and_eight_ranks():
     """One checkpoint, one target per topology: tep4 and dep4 on four ranks, and attention DP
-    over eight ranks is the dep4 target too."""
+    over eight ranks is the dep target too."""
     config = _mistral_large4_nvfp4_config()
     for mapping, target in (
-        (_TEP4, _MISTRAL_LARGE4_NVFP4_TARGET),
-        (_DEP4, _MISTRAL_LARGE4_NVFP4_DEP4_TARGET),
-        (_DEP8, _MISTRAL_LARGE4_NVFP4_DEP4_TARGET),
+        (_TEP4, _MISTRAL_LARGE4_NVFP4_TEP_TARGET),
+        (_DEP4, _MISTRAL_LARGE4_NVFP4_DEP_TARGET),
+        (_DEP8, _MISTRAL_LARGE4_NVFP4_DEP_TARGET),
     ):
         assert _resolves_to(config, mapping) == target, mapping
 
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
-def test_mistral_large4_eight_ranks_without_attention_dp_never_reach_dep4():
+def test_mistral_large4_eight_ranks_without_attention_dp_never_reach_the_dep_target():
     """Eight ranks with attention DP off (tep8), or tensor_parallel_size 8 alone (every expert
     sharded eight ways, moe_tp 8), are other weight layouts: whatever routing returns for them,
-    it is not the dep4 target -- the NVFP4 export lands on tep4 and tp4, and tensor-parallel
-    experts under attention DP on nothing. The dep4 target is returned for no four-rank mapping
+    it is not the dep target -- the NVFP4 export lands on tep4 and tp4, and tensor-parallel
+    experts under attention DP on nothing. The dep target is returned for no four-rank mapping
     without attention DP."""
     config = _mistral_large4_nvfp4_config()
     tep8 = dict(_DEP8, enable_attention_dp=False)
     for mapping, landed in (
-        (tep8, _MISTRAL_LARGE4_NVFP4_TARGET),
-        (dict(tep8, moe_ep_size=1, moe_tp_size=8), _MISTRAL_LARGE4_NVFP4_TP4_TARGET),
+        (tep8, _MISTRAL_LARGE4_NVFP4_TEP_TARGET),
+        (dict(tep8, moe_ep_size=1, moe_tp_size=8), _MISTRAL_LARGE4_NVFP4_TP_TARGET),
         (dict(_DEP8, moe_ep_size=1, moe_tp_size=8), None),
     ):
         resolved = _resolves_to(config, mapping)
-        assert resolved != _MISTRAL_LARGE4_NVFP4_DEP4_TARGET, mapping
+        assert resolved != _MISTRAL_LARGE4_NVFP4_DEP_TARGET, mapping
         assert resolved == landed, mapping
     for mapping in (_TEP4, _TP4):
-        assert _resolves_to(config, mapping) != _MISTRAL_LARGE4_NVFP4_DEP4_TARGET, mapping
-    assert _resolves_to(config, _DEP8) == _MISTRAL_LARGE4_NVFP4_DEP4_TARGET
+        assert _resolves_to(config, mapping) != _MISTRAL_LARGE4_NVFP4_DEP_TARGET, mapping
+    assert _resolves_to(config, _DEP8) == _MISTRAL_LARGE4_NVFP4_DEP_TARGET
 
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
@@ -2432,16 +2436,17 @@ def test_mistral_large4_nvfp4_dep8_near_misses_do_not_match(config_kwargs, mappi
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match=missed) as excinfo:
         modeling_v2_resolve(config, _llm_args("require"))
-    # The refusal names the eight-rank deployment the dep4 target serves.
+    # The refusal names the eight-rank deployment the dep target serves.
     message = str(excinfo.value)
-    assert "at dep4" in message and "8 ranks over two nodes of four" in message
+    assert "dep is attention data parallel" in message
+    assert "8 ranks over two nodes of four" in message
     assert "world_size=8 tp=8 pp=1 moe_ep=8 moe_tp=1: dep8" in message
 
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
-def test_mistral_large4_nvfp4_dep8_with_lm_head_tp_names_the_dep4_target():
+def test_mistral_large4_nvfp4_dep8_with_lm_head_tp_names_the_dep_target():
     """lm_head tensor parallel under attention DP at eight ranks is refused, and the message
-    names the dep4 target's eight-rank deployment and the switch that missed."""
+    names the dep target's eight-rank deployment and the switch that missed."""
     config = _model_config(
         _mistral_large4_nvfp4_config(), **dict(_DEP8, enable_lm_head_tp_in_adp=True)
     )
@@ -2450,7 +2455,7 @@ def test_mistral_large4_nvfp4_dep8_with_lm_head_tp_names_the_dep4_target():
     message = str(excinfo.value)
     assert "world_size=8 tp=8 pp=1 moe_ep=8 moe_tp=1" in message
     assert "lm_head_tp_in_adp=True" in message
-    assert "at dep4" in message and "attention data parallel with lm_head TP off" in message
+    assert "dep is attention data parallel with lm_head TP off" in message
     assert "moe_ep=8 moe_tp=1: dep8" in message
 
 
@@ -2477,9 +2482,9 @@ def test_mistral_large4_nvfp4_dep8_with_speculative_decoding_does_not_match():
 @pytest.mark.parametrize(
     "parallel,target",
     [
-        ("tep", _MISTRAL_LARGE4_NVFP4_TARGET),
-        ("dep", _MISTRAL_LARGE4_NVFP4_DEP4_TARGET),
-        ("tp", _MISTRAL_LARGE4_NVFP4_TP4_TARGET),
+        ("tep", _MISTRAL_LARGE4_NVFP4_TEP_TARGET),
+        ("dep", _MISTRAL_LARGE4_NVFP4_DEP_TARGET),
+        ("tp", _MISTRAL_LARGE4_NVFP4_TP_TARGET),
     ],
 )
 def test_mistral_large4_native_dspark_routes_each_topology(tmp_path, world, parallel, target):
@@ -2552,9 +2557,9 @@ _ML4_VISION = dict(
 @pytest.mark.parametrize(
     "mapping, target",
     [
-        (_TEP4, _MISTRAL_LARGE4_NVFP4_TARGET),
-        (_DEP4, _MISTRAL_LARGE4_NVFP4_DEP4_TARGET),
-        (_TP4, _MISTRAL_LARGE4_NVFP4_TP4_TARGET),
+        (_TEP4, _MISTRAL_LARGE4_NVFP4_TEP_TARGET),
+        (_DEP4, _MISTRAL_LARGE4_NVFP4_DEP_TARGET),
+        (_TP4, _MISTRAL_LARGE4_NVFP4_TP_TARGET),
     ],
     ids=["tep4", "dep4", "tp4"],
 )

@@ -218,7 +218,7 @@ def _replays(spec, seed) -> None:
 # shapes ran at first. cuBLASLt's heuristic picks the kernel by m, at a grain
 # finer than any set of edge cells could follow (see the entry's `note`), so the
 # eager cells drive every m in the range, each as its own call. A 1..32768
-# sweep costs 4-5.5 s on sm_103, the 1..9216 one ~1.3 s. The dep4 target runs
+# sweep costs 4-5.5 s on sm_103, the 1..9216 one ~1.3 s. The dep4 deployment runs
 # the same three attention projections on each rank's own tokens.
 _ML4_PROJECTIONS: tuple[Cell, ...] = (
     Cell(
@@ -555,9 +555,9 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(m=16, k=2880, n=5120, dtype=torch.bfloat16, bias=True, out_dtype=None),
         ),
     ),
-    "mistral_large4/mistral_large_4_nvfp4__sm_103__tep4": (*_ML4_PROJECTIONS, *_ML4_DSPARK),
-    "mistral_large4/mistral_large_4_nvfp4__sm_103__tp4": (*_ML4_PROJECTIONS, *_ML4_DSPARK),
-    "mistral_large4/mistral_large_4_nvfp4__sm_103__dep4": (
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__tep": (*_ML4_PROJECTIONS, *_ML4_DSPARK),
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__tp": (*_ML4_PROJECTIONS, *_ML4_DSPARK),
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__dep": (
         *_ML4_PROJECTIONS,
         *_ML4_DP_ROUTER,
         *_ML4_DSPARK,

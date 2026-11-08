@@ -448,7 +448,7 @@ class CuteDslDsMlaSparseDecode(OpWrapper):
     )
 
     note = """
-    Call sites: the mistral_large4 NVFP4 tp4 and tep4 targets (also run at world 8 as tp8
+    Call sites: the mistral_large4 NVFP4 tp4 and tep4 deployments (also run at world 8 as tp8
     and tep8), the generation rows of every layer, decode and mixed steps. Kernel (sm_103):
     `_ds_mla_sparse_decode_kernel`, one launch, split-K partials merged in the cluster.
     It replaces flash_mla_sparse_decode's head64 kernel on these targets, which needs the

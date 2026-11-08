@@ -517,7 +517,7 @@ class Allgather(OpWrapper):
     no row unwritten, at tc 32768 and 32751. Warm, a ragged split's gather
     costs more than the uniform one beside it.
 
-    The tp4 target makes the same call (its indexer replicated, its TP group
+    The tp4 deployment makes the same call (its indexer replicated, its TP group
     the same four ranks, its split the same: `_split_prefill_queries` agrees on
     its Mapping too, moe_tp_size 4). Measured again on a tp4 session (4 sm_103
     ranks, NCCL 2.31.2) in the target's own form -- each rank's share staged in

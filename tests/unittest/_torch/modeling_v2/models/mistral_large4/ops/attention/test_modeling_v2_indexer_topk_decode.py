@@ -199,7 +199,7 @@ def _assert_guard_untouched(guard) -> None:
 
 
 def _scratch_dep4(spec, rows: int):
-    """The dep4 target's radix scratch (its file's `_scratch`), for its drivers
+    """The dep4 deployment's radix scratch (its file's `_scratch`), for its drivers
     and its own tests: the engine's per-sequence arena when the cell names its
     size (`aux_rows`), else sized for the batch.
 
@@ -293,7 +293,7 @@ def _drive(spec, seq_lens, logits, aux, guard, by_score):
 def _drive_dep4(spec, seq_lens, logits, aux, by_score):
     """One eager call over `seq_lens`, gated against the entry's reference.
 
-    The dep4 target's `_drive`: its scratch armed before the call and its
+    The dep4 deployment's `_drive`: its scratch armed before the call and its
     footprint checked after it, in place of `_drive`'s guard slot.
     """
     next_n, k = spec["next_n"], spec["index_topk"]
@@ -373,7 +373,7 @@ def _drive_graph_dep4(spec, g, aux, by_score):
     is gated as a set, against an eager call on the same data and against the
     entry's reference.
 
-    The dep4 target's `_drive_graph`: its scratch armed before the warm-up and
+    The dep4 deployment's `_drive_graph`: its scratch armed before the warm-up and
     each replay and its footprint checked after them, in place of
     `_drive_graph`'s guard slot. The engine's warm-up call ahead of each capture runs eagerly on the
     capture's own rows (at boot, the long-family dummy) and is gated too. With
@@ -440,8 +440,8 @@ def _is_dep4(spec) -> bool:
 
 def _cell_id(cell) -> str:
     """`why[:44]`, as each target's file named its cells. Five of the dep4
-    target's whys share their first 44 characters with the tp4 target's 1M
-    cells, so the dep4 target's cells carry a ` (dep4)` suffix."""
+    deployment's whys share their first 44 characters with the tp4 deployment's 1M
+    cells, so the dep4 deployment's cells carry a ` (dep4)` suffix."""
     return cell.why[:44] + (" (dep4)" if _is_dep4(cell.spec) and cell.spec["next_n"] == 1 else "")
 
 
@@ -452,7 +452,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     g = torch.Generator().manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
     by_score = spec.get("scores") == "ties"
     rows = len(spec["seq_lens"]) * spec["next_n"]
-    # The dep4 target's cells take its scratch and drivers (armed scratch,
+    # The dep4 deployment's cells take its scratch and drivers (armed scratch,
     # footprint and split checked at every call); every other cell the guard
     # slot's.
     dep4 = _is_dep4(spec)
@@ -543,7 +543,7 @@ def test_the_op_refuses_int64_seq_lens_itself() -> None:
 
 
 #: The Mistral Large 4 targets' scorer widths: the FP8 target's 9216, the NVFP4
-#: target's 32768 and its 1M envelope's 1048576, the dep4 target's at the
+#: target's 32768 and its 1M envelope's 1048576, the dep4 deployment's at the
 #: checkpoint's own context (10 blocks per row at the two rows the guards below
 #: pass, at both NVFP4 widths).
 ML4_WIDTHS = [9216, 32768, 1048576]

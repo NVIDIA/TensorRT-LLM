@@ -117,7 +117,7 @@ class DsMlaDequantGather(OpWrapper):
                 cached=[0] * 16, new=[2048] * 16, blocks=550, owners=63, tokens_per_block=64, row=0
             ),
         ),
-        # The tp4 target at the 1M envelope, workspace path: a step whose context KV (cached +
+        # The tp4 deployment at the 1M envelope, workspace path: a step whose context KV (cached +
         # new over its context requests) is at most B = 2**19 rows gathers it into rows [0, N)
         # of one bf16 [B, 576] buffer, out = buf[:N]; md.block_table is [16, 32772].
         Cell(
@@ -252,7 +252,7 @@ class DsMlaDequantGather(OpWrapper):
             )
             for n in (1, 2, 7)
         ),
-        # The Mistral Large 4 NVFP4 tep4 target's workspace path at max_seq_len 1048576 with
+        # The Mistral Large 4 NVFP4 tep4 deployment's workspace path at max_seq_len 1048576 with
         # chunked prefill: a step whose context KV (cached + new over its context requests) is
         # at most B = 2**19 rows gathers it into rows [0, N) of one bf16 [B, 576] buffer,
         # out = buf[:N], through md.block_table [16, 32772]; owners 63, 32 tokens per block.
@@ -351,7 +351,7 @@ class DsMlaDequantGather(OpWrapper):
                 large=True,
             ),
         ),
-        # The Mistral Large 4 NVFP4 dep4 target's workspace path at max_seq_len 1048576 with
+        # The Mistral Large 4 NVFP4 dep4 deployment's workspace path at max_seq_len 1048576 with
         # chunked prefill, under attention DP (a rank's own context requests, up to 16): a step
         # whose context KV on the rank (cached + new over its context requests) is at most
         # B = 2**19 rows gathers it into rows [0, N) of one bf16 [B, 576] buffer, out = buf[:N],
@@ -451,7 +451,7 @@ class DsMlaDequantGather(OpWrapper):
                 large=True,
             ),
         ),
-        # The Mistral Large 4 NVFP4 tep8 target's workspace path at max_seq_len 1048576 with
+        # The Mistral Large 4 NVFP4 tep8 deployment's workspace path at max_seq_len 1048576 with
         # chunked prefill: a step whose context KV (cached + new over its context requests) is
         # at most B = 2**19 rows gathers it into rows [0, N) of one bf16 [B, 576] buffer,
         # out = buf[:N], through md.block_table [16, 32772]; owners 63, 32 tokens per block.
@@ -560,7 +560,7 @@ class DsMlaDequantGather(OpWrapper):
     peaks at 185.65 GiB allocated.
 
     The "1M tp4", "1M tep4", "1M dep4" and "1M tep8" cells are the Mistral Large 4 NVFP4 tp4,
-    tep4, dep4 and tep8 targets' workspace path at max_seq_len 1048576 with chunked
+    tep4, dep4 and tep8 deployments' workspace path at max_seq_len 1048576 with chunked
     prefill (steps of up to 32768 new rows and 16 requests; under dep4's attention DP, a
     rank's own requests): a step whose context KV (on the rank), cached + new summed over
     its context requests, is at most B = 2**19 rows gathers it into rows [0, N) of one

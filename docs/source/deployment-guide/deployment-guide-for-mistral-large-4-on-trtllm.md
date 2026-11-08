@@ -522,8 +522,8 @@ The accuracy tests in `tests/integration/defs/accuracy/modeling_v2/test_mistral_
 cd tests/integration/defs
 export LLM_MODELS_ROOT=/path/to/models
 
-# GSM8K on the NVFP4 TEP4 target, without speculative decoding.
-pytest -v "accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep4::test_gsm8k"
+# GSM8K on the NVFP4 TEP4 deployment, without speculative decoding.
+pytest -v "accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_gsm8k"
 
 # The quick profile on TEP4 with DSpark: GSM8K, RULER, image and acceptance-length checks.
 pytest -v "accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Accuracy::test_accuracy[quick-tep4]"

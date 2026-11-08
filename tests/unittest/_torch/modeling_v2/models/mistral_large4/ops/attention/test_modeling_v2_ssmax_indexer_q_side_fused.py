@@ -354,7 +354,7 @@ def checkpoint_indexer() -> list:
         pytest.skip(f"none of {CHECKPOINTS} is under LLM_MODELS_ROOT ({llm_models_root()})")
     from safetensors import safe_open
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_103__tep4 import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.mistral_large_4_nvfp4__sm_103__tep import (  # noqa: E501
         modeling as M,
     )
     from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import MistralConfigLoader

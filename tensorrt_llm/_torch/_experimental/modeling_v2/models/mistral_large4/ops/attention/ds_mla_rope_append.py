@@ -24,19 +24,19 @@ FP8_MAX = 448.0
 #: The floor on a tile's amax / 448 before it is rounded up to a power of two.
 SCALE_FLOOR = 1e-4
 
-#: What every `_ML4_1M` cell shares: the tep4 and tp4 targets at max_seq_len 1048576 -- 16 query
+#: What every `_ML4_1M` cell shares: the tep4 and tp4 deployments at max_seq_len 1048576 -- 16 query
 #: heads (the first of the 64-head fused-query scratch), the 63 KV-owner rows of
 #: MistralLarge4CacheManager's latent pool, 32-token pages, the 1048576-row `_rope.indexer`
 #: table and md.block_table's 32772 columns (the V2 manager's max_blocks_per_seq at 1M).
 _ML4_1M = dict(heads=16, owners=63, tokens_per_block=32, max_pos=1048576, table_width=32772)
 
-#: What every `_ML4_1M_DEP4` cell shares: the dep4 target at max_seq_len 1048576 -- all 64
+#: What every `_ML4_1M_DEP4` cell shares: the dep4 deployment at max_seq_len 1048576 -- all 64
 #: query heads of a rank's fused-query scratch (attention DP, no padding heads), 63 KV
 #: owners, 32-token pages, the 1048576-row `_rope.indexer` table and the V2 manager's
 #: 32772-column `md.block_table`.
 _ML4_1M_DEP4 = dict(heads=64, owners=63, tokens_per_block=32, max_pos=1048576, table_width=32772)
 
-#: What every `_ML4_1M_TEP8` cell shares: the tep8 target at max_seq_len 1048576 -- 8 query
+#: What every `_ML4_1M_TEP8` cell shares: the tep8 deployment at max_seq_len 1048576 -- 8 query
 #: heads (the first of its 64-head fused-query scratch), 63 KV owners, 32-token pages, the
 #: 1048576-row `_rope.indexer` table and the V2 manager's 32772-column `md.block_table`.
 _ML4_1M_TEP8 = dict(heads=8, owners=63, tokens_per_block=32, max_pos=1048576, table_width=32772)
@@ -1050,7 +1050,7 @@ class DsMlaRopeAppend(OpWrapper):
     rows in one call, before the layer's attention reads the pool. A sharing layer
     (NoPE) writes nothing and its query tail is zero.
 
-    The Mistral Large 4 NVFP4 tp4 target at max_seq_len 1048576 (chunked prefill,
+    The Mistral Large 4 NVFP4 tp4 deployment at max_seq_len 1048576 (chunked prefill,
     max_num_tokens 32768, max_batch_size 16, decode captured at 1/2/4/8/16 padded):
     PrefillTarget._attention (eager) and DecodeTarget._attention (captured) on the 63 KV
     owners, one call per owner layer over every row of the step. `q` is the first 16
@@ -1071,7 +1071,7 @@ class DsMlaRopeAppend(OpWrapper):
     it Triton's first compile of a specialization (the 32-call sweep, compiled already,
     1.6 s); the large cells 1.2 s and 0.2 s.
 
-    The Mistral Large 4 NVFP4 tep4 target at max_seq_len 1048576 (chunked prefill,
+    The Mistral Large 4 NVFP4 tep4 deployment at max_seq_len 1048576 (chunked prefill,
     max_num_tokens 32768, max_batch_size 16, decode captured at 1/2/4/8/16 padded):
     PrefillTarget._attention (eager) and DecodeTarget._attention (captured) on the 63 KV
     owners, one call per owner layer over every row of the step, a step's context chunk
@@ -1090,13 +1090,13 @@ class DsMlaRopeAppend(OpWrapper):
     table rows 0..15, column 32767 of rows 3, 8 and 15); decode graphs captured at every
     batch 1..16 with a row at 1048575, each replay bitwise equal to an eager call on the
     same inputs; and, large, a pool of 74183 blocks with its last row written, by a
-    decode graph and by a last chunk. 74183 is above the tep4 target's 1M boot pool (72757
+    decode graph and by a last chunk. 74183 is above the tep4 deployment's 1M boot pool (72757
     blocks per rank, 2328224 tokens, as the target's boot measured it on this
     pool). Cost on sm_103: 0.03 to 1.7 s per pre-merge `_ML4_1M` cell (the first
     one builds the 1048576-row table; the 32-call sweep 1.7 s), pools to 2.9 GB; the two
     large cells 1.4 s together on a 98.1 GB pool.
 
-    The Mistral Large 4 NVFP4 dep4 target at max_seq_len 1048576 (attention DP over 4
+    The Mistral Large 4 NVFP4 dep4 deployment at max_seq_len 1048576 (attention DP over 4
     ranks, each running all 64 heads on its own requests; chunked prefill,
     max_num_tokens 32768 and max_batch_size 16 per rank, decode captured at
     1/2/4/8/16 padded): PrefillTarget._attention (eager) and DecodeTarget._attention
@@ -1146,7 +1146,7 @@ class DsMlaRopeAppend(OpWrapper):
     write in any of them, its code tiles, scales and rope bytes coming from several
     rows, and its rope bytes were themselves a byte mix of rows in 32.
 
-    The Mistral Large 4 NVFP4 tep8 target at max_seq_len 1048576 (chunked prefill,
+    The Mistral Large 4 NVFP4 tep8 deployment at max_seq_len 1048576 (chunked prefill,
     max_num_tokens 32768, max_batch_size 16, decode captured at 1/2/4/8/16 padded):
     PrefillTarget._attention (eager) and DecodeTarget._attention (captured) on the 63 KV
     owners, one call per owner layer over every row of the step, a step's context chunk

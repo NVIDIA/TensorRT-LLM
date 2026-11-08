@@ -47,7 +47,7 @@ __extra_import_path__ = ["../.."]
 from _precision import true_fp32_matmul  # noqa: E402
 
 
-@pytest.fixture(autouse=True, params=["tep4", "tp4", "dep4"])
+@pytest.fixture(autouse=True, params=["tep", "tp", "dep"])
 def target(request):
     global modeling, weights
     module = (

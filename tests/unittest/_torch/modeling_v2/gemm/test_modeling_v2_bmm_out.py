@@ -135,7 +135,7 @@ def _build(spec, seed, m=None):
     of token-major `[M, B, row]` buffers, as the targets pass them: `a` is the
     first `k` columns of each row, `out` the first `n`. With `out_heads`, `out`'s
     parent is `[M, out_heads, out_row]` and `out` its first B heads, as the tep4,
-    tp4 and tep8 targets' fused query is. Both parents come back too: `a`'s so a
+    tp4 and tep8 deployments' fused query is. Both parents come back too: `a`'s so a
     captured graph can be fed new rows, `out`'s because "did it land there, and
     only there" is the thing worth asserting. `out`'s parent starts as the
     sentinel, so an element the op did not write shows.
@@ -767,9 +767,9 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(batch=64, m=2048, k=128, n=512, dtype=torch.bfloat16, transposed_out=True),
         ),
     ),
-    "mistral_large4/mistral_large_4_nvfp4__sm_103__tep4": (*_ML4_TP4_CELLS, *_ML4_TP8_CELLS),
-    "mistral_large4/mistral_large_4_nvfp4__sm_103__tp4": (*_ML4_TP4_CELLS, *_ML4_TP8_CELLS),
-    "mistral_large4/mistral_large_4_nvfp4__sm_103__dep4": _ML4_DP_CELLS,
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__tep": (*_ML4_TP4_CELLS, *_ML4_TP8_CELLS),
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__tp": (*_ML4_TP4_CELLS, *_ML4_TP8_CELLS),
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__dep": _ML4_DP_CELLS,
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)
