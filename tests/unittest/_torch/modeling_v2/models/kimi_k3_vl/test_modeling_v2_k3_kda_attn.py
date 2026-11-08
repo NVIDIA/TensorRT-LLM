@@ -66,17 +66,23 @@ def slots(mgr):
     return kc.request_slots(mgr, 4, first_id=400)
 
 
+@pytest.fixture(scope="module")
+def draft_slots(mgr, slots):
+    """The requests' slots in the draft-record pools, apart from their state slots."""
+    return kc.draft_slots_apart(kc.layer_pools(mgr, 0), slots)
+
+
 def _layers(mgr) -> list:
     return [kc.layer_pools(mgr, layer) for layer in range(LAYERS)]
 
 
-def _fused(wt, pools, x_src, slot, bufs) -> torch.Tensor:
+def _fused(wt, pools, x_src, slot, draft_slot, bufs) -> torch.Tensor:
     """One launch, after a plain copy kernel (the input)."""
     x = x_src.clone()
     return k3_kda_attn(
         x, wt["w"], wt["w_fb"], wt["w_q"], wt["w_k"], wt["w_v"], wt["a_log"], wt["dt_bias"], wt["onorm_w"],
-        pools["cs_q"], pools["cs_k"], pools["cs_v"], pools["ssm"], pools["state_tok"], slot, pools["pending"], bufs,
-        kc.NUM_SPEC, kc.LOWER_BOUND, kc.SCALE, kc.EPS,
+        pools["cs_q"], pools["cs_k"], pools["cs_v"], pools["ssm"], pools["state_tok"], slot, draft_slot,
+        pools["pending"], bufs, kc.NUM_SPEC, kc.LOWER_BOUND, kc.SCALE, kc.EPS,
     )  # fmt: skip
 
 
@@ -92,12 +98,12 @@ class _Unfused:
         k3_kda_qkvg(x, w, self.bufs)
         return kc.decode_rows(self.bufs.p1, self.bufs.part, buf, x.shape[0])
 
-    def __call__(self, wt, pools, x, slot) -> torch.Tensor:
+    def __call__(self, wt, pools, x, slot, draft_slot) -> torch.Tensor:
         self.last_rows = self.rows(wt["w"], x)
         return k3_kda_verify(
             self.last_rows, wt["w_fb"], wt["w_q"], wt["w_k"], wt["w_v"], wt["a_log"], wt["dt_bias"], wt["onorm_w"],
-            pools["cs_q"], pools["cs_k"], pools["cs_v"], pools["ssm"], pools["state_tok"], slot, pools["pending"],
-            kc.NUM_SPEC, kc.LOWER_BOUND, kc.SCALE, kc.EPS, None,
+            pools["cs_q"], pools["cs_k"], pools["cs_v"], pools["ssm"], pools["state_tok"], slot, draft_slot,
+            pools["pending"], kc.NUM_SPEC, kc.LOWER_BOUND, kc.SCALE, kc.EPS, None,
         )  # fmt: skip
 
 
@@ -105,17 +111,19 @@ def _x(gen: torch.Generator) -> torch.Tensor:
     return torch.randn(kc.NT, kc.K_IN, generator=gen, device="cuda").bfloat16()
 
 
-def _accept(pools_list, slot: int, accepted: int) -> None:
-    """The sampler's record of the drafts it accepted: one count per slot, shared by every layer of a pool set."""
+def _accept(pools_list, draft_slot: int, accepted: int) -> None:
+    """The sampler's record of the drafts it accepted: one count per draft slot, shared by every layer of a pool
+    set."""
     for pools in pools_list:
-        pools["pending"][slot] = accepted
+        pools["pending"][draft_slot] = accepted
 
 
 @pytest.mark.parametrize("cell", k3_kda_attn.CELLS, ids=[c.why[:40] for c in k3_kda_attn.CELLS])
-def test_attn_on_manager_pools(mgr, slots, cell) -> None:
-    """Two requests, one after the other, each on its slot for nine rounds of every layer (pending through
-    0..7), all launches on one set: outputs and pools bit for bit the unfused path's on a copy; the other slots
-    untouched; layer 0's outputs also within fp32 tolerance of float64 over the committed history."""
+def test_attn_on_manager_pools(mgr, slots, draft_slots, cell) -> None:
+    """Two requests, one after the other, each on its state slot and a draft slot apart from it for nine rounds of
+    every layer (pending through 0..7), all launches on one set: outputs and pools bit for bit the unfused path's on
+    a copy; the other slots untouched; layer 0's outputs also within fp32 tolerance of float64 over the committed
+    history."""
     seed = zlib.crc32(cell.why.encode()) % 2**31
     requests, rounds = cell.spec["requests"], cell.spec["rounds"]
     pools = _layers(mgr)
@@ -133,15 +141,15 @@ def test_attn_on_manager_pools(mgr, slots, cell) -> None:
         ref = _Unfused()
         gen = torch.Generator(device="cuda").manual_seed(seed)
         for req in range(requests):
-            s = int(slots[req])
-            slot = slots[req : req + 1]
-            f64 = kc.F64Verify(wts[0], pools[0], slot, kc.NUM_SPEC)
+            s, d = int(slots[req]), int(draft_slots[req])
+            slot, draft_slot = slots[req : req + 1], draft_slots[req : req + 1]
+            f64 = kc.F64Verify(wts[0], pools[0], slot, kc.NUM_SPEC, draft_slot)
             for rnd in range(rounds):
                 for layer, (p, c) in enumerate(zip(pools, copies)):
                     before = kc.snapshot(p)
                     x = _x(gen)
-                    got = _fused(wts[layer], p, x, slot, bufs)
-                    want = ref(wts[layer], c, x, slot)
+                    got = _fused(wts[layer], p, x, slot, draft_slot, bufs)
+                    want = ref(wts[layer], c, x, slot, draft_slot)
                     rp, wt = reference_pools[layer], wts[layer]
                     out_reference = k3_kda_attn.reference(
                         x,
@@ -159,6 +167,7 @@ def test_attn_on_manager_pools(mgr, slots, cell) -> None:
                         rp["ssm"],
                         rp["state_tok"],
                         slot,
+                        draft_slot,
                         rp["pending"],
                         bufs,
                         kc.NUM_SPEC,
@@ -171,26 +180,25 @@ def test_attn_on_manager_pools(mgr, slots, cell) -> None:
                     torch.cuda.synchronize()
                     assert torch.equal(got, want), (req, rnd, layer)
                     assert kc.rel(got, out_reference) <= kc.TOL_OUT, (req, rnd, layer)
-                    assert kc.same_rows(p, c, [s], POOL_NAMES), (req, rnd, layer)
-                    others = kc.other_slots(p["ssm"].shape[0], [s])
-                    assert kc.same_rows(p, before, others, POOL_NAMES), (req, rnd, layer)
+                    assert kc.same_request_rows(p, c, [s], [d]), (req, rnd, layer)
+                    assert kc.same_other_rows(p, before, [s], [d]), (req, rnd, layer)
                     if layer == 0:
                         assert kc.rel(got, out_f64) <= kc.TOL_OUT, (req, rnd, kc.rel(got, out_f64))
                 accepted = kc.pending_schedule(1, kc.NUM_SPEC, rnd)[0]
-                _accept([pools[0], copies[0], reference_pools[0]], s, accepted)
+                _accept([pools[0], copies[0], reference_pools[0]], d, accepted)
                 f64.commit([accepted])
         assert bool((bufs.epoch == (requests * rounds * LAYERS) % 3).all()), (
             bufs.epoch.unique().tolist()
         )
 
 
-def test_rounds_share_one_buffer_set_and_replay(mgr, slots) -> None:
+def test_rounds_share_one_buffer_set_and_replay(mgr, slots, draft_slots) -> None:
     """LAYERS layers x ROUNDS rounds of one request: one set for every launch, a set per layer, and one round of every
     layer captured once and replayed (the inputs rewritten in place, the record written between replays) give the
     same outputs and pools bit for bit."""
     rounds = 5
-    s = int(slots[2])
-    slot = slots[2:3]
+    d = int(draft_slots[2])
+    slot, draft_slot = slots[2:3], draft_slots[2:3]
     pools = _layers(mgr)
     with torch.inference_mode():
         for layer, p in enumerate(pools):
@@ -208,12 +216,18 @@ def test_rounds_share_one_buffer_set_and_replay(mgr, slots) -> None:
         got, want = [], []
         for rnd in range(rounds):
             for layer in range(LAYERS):
-                got.append(_fused(wts[layer], pools[layer], xs[rnd][layer], slot, shared).clone())
+                got.append(
+                    _fused(
+                        wts[layer], pools[layer], xs[rnd][layer], slot, draft_slot, shared
+                    ).clone()
+                )
                 want.append(
-                    _fused(wts[layer], own_pools[layer], xs[rnd][layer], slot, own[layer]).clone()
+                    _fused(
+                        wts[layer], own_pools[layer], xs[rnd][layer], slot, draft_slot, own[layer]
+                    ).clone()
                 )
             accepted = kc.pending_schedule(1, kc.NUM_SPEC, rnd)[0]
-            _accept([pools[0], own_pools[0]], s, accepted)
+            _accept([pools[0], own_pools[0]], d, accepted)
         torch.cuda.synchronize()
         # Compiles outside capture (already compiled above; kept for running this test alone).
         bufs = K3KdaBuffers.create("cuda")
@@ -223,7 +237,8 @@ def test_rounds_share_one_buffer_set_and_replay(mgr, slots) -> None:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
             outs = [
-                _fused(wts[li], graph_pools[li], static[li], slot, bufs) for li in range(LAYERS)
+                _fused(wts[li], graph_pools[li], static[li], slot, draft_slot, bufs)
+                for li in range(LAYERS)
             ]
         torch.cuda.current_stream().wait_stream(stream)
         replayed = []
@@ -232,7 +247,7 @@ def test_rounds_share_one_buffer_set_and_replay(mgr, slots) -> None:
                 static[layer].copy_(xs[rnd][layer])
             graph.replay()
             replayed.extend(o.clone() for o in outs)
-            _accept([graph_pools[0]], s, kc.pending_schedule(1, kc.NUM_SPEC, rnd)[0])
+            _accept([graph_pools[0]], d, kc.pending_schedule(1, kc.NUM_SPEC, rnd)[0])
         torch.cuda.synchronize()
     assert all(torch.equal(a, b) for a, b in zip(got, want))
     assert all(torch.equal(a, b) for a, b in zip(replayed, want))
@@ -260,11 +275,11 @@ def test_qkvg_rows_match_the_projection(tokens) -> None:
     assert bool((bufs.epoch == 1).all()), bufs.epoch.unique().tolist()
 
 
-def test_epoch_wrap_on_the_object(mgr, slots) -> None:
+def test_epoch_wrap_on_the_object(mgr, slots, draft_slots) -> None:
     """The set's per-CTA indices preset to 2^31 - 2, as after 2^31 launches on a device (one set serves every KDA
     layer): four launches give the bits of a fresh set's and leave every index in 0..2."""
-    s = int(slots[3])
-    slot = slots[3:4]
+    d = int(draft_slots[3])
+    slot, draft_slot = slots[3:4], draft_slots[3:4]
     p = kc.layer_pools(mgr, 0)
     with torch.inference_mode():
         kc.fill_pools(p, 1200)
@@ -277,22 +292,22 @@ def test_epoch_wrap_on_the_object(mgr, slots) -> None:
         wrapped.epoch.fill_(2**31 - 2)
         got, want = [], []
         for rnd, x in enumerate(xs):
-            want.append(_fused(wt, fresh_pools, x, slot, fresh).clone())
+            want.append(_fused(wt, fresh_pools, x, slot, draft_slot, fresh).clone())
             torch.cuda.synchronize()  # the same pools again next: one launch at a time
-            got.append(_fused(wt, p, x, slot, wrapped).clone())
+            got.append(_fused(wt, p, x, slot, draft_slot, wrapped).clone())
             torch.cuda.synchronize()
             accepted = kc.pending_schedule(1, kc.NUM_SPEC, rnd)[0]
-            _accept([p, fresh_pools], s, accepted)
+            _accept([p, fresh_pools], d, accepted)
     assert all(torch.equal(a, b) for a, b in zip(got, want))
     assert all(torch.equal(p[n], fresh_pools[n]) for n in POOL_NAMES)
     assert bool(((wrapped.epoch >= 0) & (wrapped.epoch < 3)).all()), wrapped.epoch.unique().tolist()
 
 
-def test_swapped_rounds_are_silently_wrong(mgr, slots) -> None:
+def test_swapped_rounds_are_silently_wrong(mgr, slots, draft_slots) -> None:
     """Negative control: two rounds of one request in swapped order raise nothing and give the second round's
     outputs and the slot's state of a different history."""
-    s = int(slots[3])
-    slot = slots[3:4]
+    s, d = int(slots[3]), int(draft_slots[3])
+    slot, draft_slot = slots[3:4], draft_slots[3:4]
     p = kc.layer_pools(mgr, 0)
     with torch.inference_mode():
         kc.fill_pools(p, 1300)
@@ -301,15 +316,15 @@ def test_swapped_rounds_are_silently_wrong(mgr, slots) -> None:
         gen = torch.Generator(device="cuda").manual_seed(54)
         a, b = _x(gen), _x(gen)
         bufs = K3KdaBuffers.create("cuda")
-        _fused(wt, p, a, slot, bufs)
+        _fused(wt, p, a, slot, draft_slot, bufs)
         torch.cuda.synchronize()
-        _accept([p], s, 2)
-        right = _fused(wt, p, b, slot, bufs).clone()
+        _accept([p], d, 2)
+        right = _fused(wt, p, b, slot, draft_slot, bufs).clone()
         torch.cuda.synchronize()
-        _fused(wt, swapped, b, slot, bufs)
+        _fused(wt, swapped, b, slot, draft_slot, bufs)
         torch.cuda.synchronize()
-        _accept([swapped], s, 2)
-        wrong = _fused(wt, swapped, a, slot, bufs).clone()
+        _accept([swapped], d, 2)
+        wrong = _fused(wt, swapped, a, slot, draft_slot, bufs).clone()
         torch.cuda.synchronize()
     print(f"swapped rounds: second output rel diff {kc.rel(wrong, right):.3e}, "
           f"state rel diff {kc.rel(swapped['ssm'][s], p['ssm'][s]):.3e}")  # fmt: skip
@@ -317,9 +332,9 @@ def test_swapped_rounds_are_silently_wrong(mgr, slots) -> None:
     assert not torch.equal(wrong, right)
 
 
-def test_qkvg_set_is_refused(mgr, slots) -> None:
+def test_qkvg_set_is_refused(mgr, slots, draft_slots) -> None:
     """A set made for k3_kda_qkvg's 104 CTAs is refused by k3_kda_attn before anything is written."""
-    slot = slots[3:4]
+    slot, draft_slot = slots[3:4], draft_slots[3:4]
     p = kc.layer_pools(mgr, 0)
     with torch.inference_mode():
         kc.fill_pools(p, 1400)
@@ -327,27 +342,84 @@ def test_qkvg_set_is_refused(mgr, slots) -> None:
         wt = kc.make_weights(550)
         x = _x(torch.Generator(device="cuda").manual_seed(55))
         with pytest.raises(ValueError, match=f"epoch {CTAS}"):
-            _fused(wt, p, x, slot, K3KdaBuffers.create("cuda", ctas=CTAS))
+            _fused(wt, p, x, slot, draft_slot, K3KdaBuffers.create("cuda", ctas=CTAS))
         torch.cuda.synchronize()
     assert all(torch.equal(p[n], before[n]) for n in POOL_NAMES)
 
 
-@pytest.mark.parametrize("misuse", ("pending", "conv_layout"))
-def test_guard_rejects_silent_misuse(mgr, slots, misuse) -> None:
+@pytest.mark.parametrize("misuse", ("pending", "draft_slot_outside", "conv_layout"))
+def test_guard_rejects_silent_misuse(mgr, slots, draft_slots, misuse) -> None:
     p = kc.layer_pools(mgr, 0)
-    slot = slots[:1]
+    slot, draft_slot = slots[:1], draft_slots[:1]
     with torch.inference_mode():
         kc.fill_pools(p, 1500)
         before = kc.snapshot(p)
         wt = kc.make_weights(560)
         x = _x(torch.Generator(device="cuda").manual_seed(56))
+        bad = p
         if misuse == "pending":
             bad = dict(p, pending=p["pending"].clone())
-            bad["pending"][slot.long()] = kc.NUM_SPEC + 1
+            bad["pending"][draft_slot.long()] = kc.NUM_SPEC + 1
             match = "pending must be in"
+        elif misuse == "draft_slot_outside":
+            draft_slot = torch.full_like(draft_slot, p["state_tok"].shape[0])
+            match = "draft slot must be inside"
         else:
             bad = dict(p, cs_k=p["cs_k"].contiguous())
             match = "channel-contiguous"
         with pytest.raises(AssertionError, match=match), validating(k3_kda_attn):
-            _fused(wt, bad, x, slot, K3KdaBuffers.create("cuda"))
+            _fused(wt, bad, x, slot, draft_slot, K3KdaBuffers.create("cuda"))
         assert all(torch.equal(p[n], before[n]) for n in POOL_NAMES)
+
+
+def test_draft_slot_apart_matches_equal_slot(mgr, slots, draft_slots) -> None:
+    """The draft records, conv windows and pending count at a draft slot apart from the state slot give bit for bit
+    the outputs, state and draft rows of the same request with its draft rows at its state slot: a captured round of
+    every layer replayed against eager rounds."""
+    rounds = 5
+    s, d = int(slots[1]), int(draft_slots[1])
+    slot, draft_slot = slots[1:2], draft_slots[1:2]
+    pools = _layers(mgr)
+    with torch.inference_mode():
+        for layer, p in enumerate(pools):
+            kc.fill_pools(p, 1600 + layer)
+        equal = [kc.clone_pools(p) for p in pools]
+        for c in equal[1:]:
+            c["pending"] = equal[0]["pending"]
+        for p, e in zip(pools, equal):
+            for name in kc.DRAFT_POOLS:
+                e[name][s] = p[name][d]
+        wts = [kc.make_weights(570 + layer) for layer in range(LAYERS)]
+        gen = torch.Generator(device="cuda").manual_seed(57)
+        xs = [[_x(gen) for _ in range(LAYERS)] for _ in range(rounds)]
+        warm = kc.clone_pools(pools[0])
+        _fused(wts[0], warm, xs[0][0], slot, draft_slot, K3KdaBuffers.create("cuda"))
+        torch.cuda.synchronize()  # compiles outside capture
+        bufs, equal_bufs = K3KdaBuffers.create("cuda"), K3KdaBuffers.create("cuda")
+        static = [x.clone() for x in xs[0]]
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+            outs = [
+                _fused(wts[li], pools[li], static[li], slot, draft_slot, bufs)
+                for li in range(LAYERS)
+            ]
+        torch.cuda.current_stream().wait_stream(stream)
+        for rnd in range(rounds):
+            for layer in range(LAYERS):
+                static[layer].copy_(xs[rnd][layer])
+            graph.replay()
+            want = [
+                _fused(wts[li], equal[li], xs[rnd][li], slot, slot, equal_bufs)
+                for li in range(LAYERS)
+            ]
+            torch.cuda.synchronize()
+            for layer, (p, e) in enumerate(zip(pools, equal)):
+                assert torch.equal(outs[layer], want[layer]), (rnd, layer)
+                assert torch.equal(p["ssm"], e["ssm"]), (rnd, layer)
+                for name in kc.DRAFT_POOLS:
+                    assert torch.equal(p[name][d], e[name][s]), (rnd, layer, name)
+            accepted = kc.pending_schedule(1, kc.NUM_SPEC, rnd)[0]
+            _accept([pools[0]], d, accepted)
+            _accept([equal[0]], s, accepted)

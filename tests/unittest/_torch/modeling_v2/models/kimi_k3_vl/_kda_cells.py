@@ -102,9 +102,10 @@ def request_slots(mgr, count: int, first_id: int) -> torch.Tensor:
 
 def layer_pools(mgr, layer: int) -> dict:
     """The manager's views of one KDA layer's pools: ``conv`` bf16 [slots, 3 HK, W - 1] (q | k | v channels) and
-    ``ssm`` fp32 [slots, H, V, K] (plain decode); with the replay caches also ``cs_q`` / ``cs_k`` / ``cs_v`` fp32
-    [slots, HK, W - 1 + num_spec] (dim-contiguous), ``state_tok`` fp32 [slots, 3, num_spec, H, K] and ``pending``,
-    the accepted-draft record every layer shares (``prev_num_accepted_tokens``)."""
+    ``ssm`` fp32 [slots, H, V, K] (plain decode); with the replay caches also, over the replay region's own slots,
+    ``cs_q`` / ``cs_k`` / ``cs_v`` fp32 [replay slots, HK, W - 1 + num_spec] (dim-contiguous), ``state_tok`` fp32
+    [replay slots, 3, num_spec, H, K] and ``pending``, the accepted-draft record every layer shares
+    (``prev_num_accepted_tokens``)."""
     pools = {"conv": mgr.get_conv_states(layer), "ssm": mgr.get_ssm_states(layer)}
     if mgr.use_kda_replay_update:
         cache = mgr.mamba_layer_cache(layer)
@@ -158,6 +159,33 @@ def same_rows(a: dict, b: dict, rows, names) -> bool:
 def other_slots(num_slots: int, used) -> list:
     used = set(int(s) for s in used)
     return [s for s in range(num_slots) if s not in used]
+
+
+# The pools a request reads and writes at its draft slot; ``ssm`` is at its state slot.
+DRAFT_POOLS = ("cs_q", "cs_k", "cs_v", "state_tok")
+
+
+def draft_slots_apart(pools: dict, slots: torch.Tensor) -> torch.Tensor:
+    """Each request's slot in the draft-record pools, from the top of those pools down, none equal to a state slot in
+    ``slots``: a kernel that addresses the draft pools by a state slot then reads and writes other rows."""
+    num_draft_slots = pools["state_tok"].shape[0]
+    drafts = [num_draft_slots - 1 - n for n in range(slots.numel())]
+    assert min(drafts) >= 0 and not set(drafts) & set(slots.tolist()), (drafts, slots.tolist())
+    return torch.tensor(drafts, dtype=torch.int32, device=slots.device)
+
+
+def same_request_rows(a: dict, b: dict, slots, draft_slots) -> bool:
+    """Bit equality of the requests' rows: the state at ``slots``, the draft pools at ``draft_slots``."""
+    return same_rows(a, b, list(slots), ("ssm",)) and same_rows(
+        a, b, list(draft_slots), DRAFT_POOLS
+    )
+
+
+def same_other_rows(a: dict, b: dict, slots, draft_slots) -> bool:
+    """Bit equality of every row no request owns: the state pool's other slots and the draft pools' other slots."""
+    return same_rows(a, b, other_slots(a["ssm"].shape[0], slots), ("ssm",)) and same_rows(
+        a, b, other_slots(a["state_tok"].shape[0], draft_slots), DRAFT_POOLS
+    )
 
 
 def rel(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -268,17 +296,19 @@ def _conv_silu(win, raw, c, w):
 class F64Verify:
     """The speculative verify in float64 over each request's committed history (raw conv inputs and the state after
     the last committed token): every request's 1 + num_spec tokens from the state after its accepted drafts. The
-    conv caches start with pending 0, so their window columns 0..2 are the committed raw inputs."""
+    conv caches, at each request's slot in ``draft_slots`` (``slots`` when None), start with pending 0, so their
+    window columns 0..2 are the committed raw inputs."""
 
-    def __init__(self, wt: dict, pools: dict, slots, num_spec: int):
+    def __init__(self, wt: dict, pools: dict, slots, num_spec: int, draft_slots=None):
         self.wt, self.num_spec = wt, num_spec
         self.slots = slots.tolist()
+        drafts = self.slots if draft_slots is None else draft_slots.tolist()
         self.seq = [
             [
-                torch.stack([pools[c][s, :, i].double() for c in ("cs_q", "cs_k", "cs_v")])
+                torch.stack([pools[c][d, :, i].double() for c in ("cs_q", "cs_k", "cs_v")])
                 for i in range(3)
             ]
-            for s in self.slots
+            for d in drafts
         ]
         self.state = [pools["ssm"][s].double().clone() for s in self.slots]
         self.last = None

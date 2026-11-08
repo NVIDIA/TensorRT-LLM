@@ -26,8 +26,9 @@ from .k3_kda_verify import k3_kda_verify
 
 class K3KdaAttn(OpWrapper):
     """Return the gated-norm core output bf16 [8, 6, 128] of one request's golden token and 7 drafts ``x`` bf16
-    [8, 7168]: the projection ``x w^T`` and the verify of ``ssm/k3_kda_verify`` on it, in one launch. Updates the
-    slot's conv caches, state and per-draft states in place; advances ``buffers`` by one launch."""
+    [8, 7168]: the projection ``x w^T`` and the verify of ``ssm/k3_kda_verify`` on it, in one launch. Updates in
+    place the state at the request's slot and its conv caches and per-draft states at its draft slot; advances
+    ``buffers`` by one launch."""
 
     ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS = (
@@ -76,8 +77,11 @@ class K3KdaAttn(OpWrapper):
     Shared, per-layer, alternating and decode/verify-interleaved sets give
     identical bits; captured rounds replay identically to eager rounds.
 
-    Head CTAs read slots, pending, state, records and conv windows before
-    their grid-dependency wait. Metadata must be written before graph replay,
+    The state is read and written at slots, the records, conv windows and
+    pending at draft_slots, as k3_kda_verify does; the two may differ.
+
+    Head CTAs read slots, draft_slots, pending, state, records and conv windows
+    before their grid-dependency wait. Metadata must be written before graph replay,
     not by a kernel of the same step ahead of this launch. No concurrent
     request may use the same slot, and launches on the same pools need an
     intervening kernel that waits, or a non-PDL kernel. An attn/decode_attn
@@ -112,6 +116,7 @@ class K3KdaAttn(OpWrapper):
         ssm: torch.Tensor,
         state_tok: torch.Tensor,
         slots: torch.Tensor,
+        draft_slots: torch.Tensor,
         pending: torch.Tensor,
         buffers: K3KdaBuffers,
         num_spec: int,
@@ -135,6 +140,7 @@ class K3KdaAttn(OpWrapper):
             ssm,
             state_tok,
             slots,
+            draft_slots,
             pending,
             buffers.p1,
             buffers.part,
@@ -162,6 +168,7 @@ class K3KdaAttn(OpWrapper):
         ssm: torch.Tensor,
         state_tok: torch.Tensor,
         slots: torch.Tensor,
+        draft_slots: torch.Tensor,
         pending: torch.Tensor,
         buffers: K3KdaBuffers,
         num_spec: int,
@@ -186,6 +193,7 @@ class K3KdaAttn(OpWrapper):
             ssm,
             state_tok,
             slots,
+            draft_slots,
             pending,
             num_spec,
             lower_bound,
@@ -210,6 +218,7 @@ class K3KdaAttn(OpWrapper):
         ssm: torch.Tensor,
         state_tok: torch.Tensor,
         slots: torch.Tensor,
+        draft_slots: torch.Tensor,
         pending: torch.Tensor,
         buffers: K3KdaBuffers,
         num_spec: int,
@@ -233,17 +242,19 @@ class K3KdaAttn(OpWrapper):
         for cache in (cs_k, cs_v):
             assert cache.shape[-1] == 3 + num_spec, "conv caches must cover every replay column"
         assert pending.ndim == 1 and pending.stride(0) > 0, "pending must be a strided vector"
-        slot = int(slots.item())
-        pool_size = min(
-            ssm.shape[0],
+        slot, draft_slot = int(slots.item()), int(draft_slots.item())
+        assert 0 <= slot < ssm.shape[0], "slot must be inside the state pool"
+        draft_pool_size = min(
             state_tok.shape[0],
             cs_q.shape[0],
             cs_k.shape[0],
             cs_v.shape[0],
             pending.numel(),
         )
-        assert 0 <= slot < pool_size, "slot must be inside every pool and pending"
-        assert 0 <= int(pending[slot].item()) <= num_spec, "pending must be in 0..num_spec"
+        assert 0 <= draft_slot < draft_pool_size, (
+            "draft slot must be inside every draft-record pool and pending"
+        )
+        assert 0 <= int(pending[draft_slot].item()) <= num_spec, "pending must be in 0..num_spec"
 
 
 k3_kda_attn = K3KdaAttn()

@@ -149,6 +149,7 @@ def k3_kda_attn(
     ssm: torch.Tensor,
     state_tok: torch.Tensor,
     slots: torch.Tensor,
+    draft_slots: torch.Tensor,
     pending: torch.Tensor,
     p1: torch.Tensor,
     part: torch.Tensor,
@@ -160,10 +161,11 @@ def k3_kda_attn(
 ) -> torch.Tensor:
     """Stage B2: the fused projection of ``x`` (bf16 [8, 7168], one request's golden token and 7 drafts) and the KDA
     verify of ``trtllm::k3_kda_verify`` on it, in one launch; returns the gated-norm core output bf16 [8, 6, 128].
-    Weights, pools and state contract as ``k3_kda_verify`` (``slots`` int32 [1]); ``p1``, ``part`` and ``epoch``
-    from :func:`make_buffers` with ``FUSED_CTAS``, persistent across launches. The head CTAs read the slot's pools
-    before the grid-dependency wait, so a launch must not follow another launch on the same pools directly in the
-    stream: a kernel that waits (or a non-PDL one) in between, as the model's other layers are."""
+    Weights, pools and state contract as ``k3_kda_verify`` (``slots`` and ``draft_slots`` int32 [1]); ``p1``,
+    ``part`` and ``epoch`` from :func:`make_buffers` with ``FUSED_CTAS``, persistent across launches. The head CTAs
+    read the slots' pools before the grid-dependency wait, so a launch must not follow another launch on the same
+    pools directly in the stream: a kernel that waits (or a non-PDL one) in between, as the model's other layers
+    are."""
     import cuda.bindings.driver as cuda_driver
 
     from ..k3_kda_verify._pool_layout import replay_pools_supported, slots_view
@@ -186,6 +188,8 @@ def k3_kda_attn(
         or ssm.stride()[1:] != (128 * 128, 128, 1)
         or slots.numel() != 1
         or slots.dtype != torch.int32
+        or draft_slots.numel() != 1
+        or draft_slots.dtype != torch.int32
         or pending.dtype != torch.int32
         or p1.numel() != P1_NUMEL
         or part.numel() != PART_NUMEL
@@ -198,7 +202,8 @@ def k3_kda_attn(
             f"k3_kda_attn: unsupported call x {tuple(x.shape)} {x.dtype}, w {tuple(w.shape)}, "
             f"w_fb {tuple(w_fb.shape)}, ssm {tuple(ssm.shape)}, state_tok {tuple(state_tok.shape)}, "
             f"cs_q {tuple(cs_q.shape)}, "
-            f"num_spec {num_spec}, slots {tuple(slots.shape)} {slots.dtype}, epoch {epoch.numel()}"
+            f"num_spec {num_spec}, slots {tuple(slots.shape)} {slots.dtype}, "
+            f"draft_slots {tuple(draft_slots.shape)} {draft_slots.dtype}, epoch {epoch.numel()}"
         )
     out = torch.empty(NT, 6, 128, dtype=torch.bfloat16, device=x.device)
     args = (
@@ -208,7 +213,7 @@ def k3_kda_attn(
         _arg(slots_view(cs_q.transpose(1, 2)), align=4 * cs_q.element_size()),
         _arg(slots_view(cs_k.transpose(1, 2)), align=4 * cs_k.element_size()),
         _arg(slots_view(cs_v.transpose(1, 2)), align=4 * cs_v.element_size()),
-        _arg(slots_view(ssm)), _arg(slots_view(state_tok)), _index_arg(slots),
+        _arg(slots_view(ssm)), _arg(slots_view(state_tok)), _index_arg(slots), _index_arg(draft_slots),
         _index_arg(pending.unsqueeze(-1)),
         _arg(_flat(out)),
     )  # fmt: skip
@@ -253,8 +258,8 @@ def k3_kda_attn(
 
 
 @k3_kda_attn.register_fake
-def _(x, w, w_fb, w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v, ssm, state_tok, slots, pending, p1, part,
-      epoch, num_spec, lower_bound, scale, eps):  # fmt: skip
+def _(x, w, w_fb, w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v, ssm, state_tok, slots, draft_slots,
+      pending, p1, part, epoch, num_spec, lower_bound, scale, eps):  # fmt: skip
     return x.new_empty((NT, 6, 128), dtype=torch.bfloat16)
 
 

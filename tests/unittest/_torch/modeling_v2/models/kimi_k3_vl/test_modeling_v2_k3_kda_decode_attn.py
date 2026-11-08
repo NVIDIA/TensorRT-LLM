@@ -270,6 +270,7 @@ def test_shared_with_k3_kda_attn(mgr, slots, spec_mgr) -> None:
     vslot = kc.request_slots(spec_mgr, 1, first_id=300)
     dpools = kc.layer_pools(mgr, 0)
     vpools = kc.layer_pools(spec_mgr, 0)
+    vdraft = kc.draft_slots_apart(vpools, vslot)
     with torch.inference_mode():
         kc.fill_pools(dpools, 900)
         kc.fill_pools(vpools, 901)
@@ -285,7 +286,7 @@ def test_shared_with_k3_kda_attn(mgr, slots, spec_mgr) -> None:
             return k3_kda_attn(
                 x.clone(), wt["w"], wt["w_fb"], wt["w_q"], wt["w_k"], wt["w_v"], wt["a_log"], wt["dt_bias"],
                 wt["onorm_w"], pools["cs_q"], pools["cs_k"], pools["cs_v"], pools["ssm"], pools["state_tok"], slot,
-                pools["pending"], bufs, kc.NUM_SPEC, kc.LOWER_BOUND, kc.SCALE, kc.EPS,
+                vdraft, pools["pending"], bufs, kc.NUM_SPEC, kc.LOWER_BOUND, kc.SCALE, kc.EPS,
             )  # fmt: skip
 
         own_bufs = {"decode": K3KdaBuffers.create("cuda"), "verify": K3KdaBuffers.create("cuda")}

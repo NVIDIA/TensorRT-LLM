@@ -445,7 +445,8 @@ def clone_verify_pools(p: dict) -> dict:
 
 
 class VerifyPath:
-    """``trtllm::k3_kda_attn``: the same projection and the speculative verify of one request's NUM_SPEC + 1 tokens."""
+    """``trtllm::k3_kda_attn``: the same projection and the speculative verify of one request's NUM_SPEC + 1 tokens.
+    The state and the drafts' records share one pool size here, so the request's state slot is its draft slot too."""
 
     def __init__(self, wt, pools, bufs):
         self.wt, self.p, self.bufs = wt, pools, bufs
@@ -454,8 +455,8 @@ class VerifyPath:
         wt, p = self.wt, self.p
         return torch.ops.trtllm.k3_kda_attn(
             x, wt["w"], wt["w_fb"], wt["w_q"], wt["w_k"], wt["w_v"], wt["a_log"], wt["dt_bias"], wt["onorm_w"],
-            p["cs_q"], p["cs_k"], p["cs_v"], p["state"], p["state_tok"], slot, p["pending"], *self.bufs, NUM_SPEC,
-            LOWER_BOUND, SCALE, EPS,
+            p["cs_q"], p["cs_k"], p["cs_v"], p["state"], p["state_tok"], slot, slot, p["pending"], *self.bufs,
+            NUM_SPEC, LOWER_BOUND, SCALE, EPS,
         )  # fmt: skip
 
 

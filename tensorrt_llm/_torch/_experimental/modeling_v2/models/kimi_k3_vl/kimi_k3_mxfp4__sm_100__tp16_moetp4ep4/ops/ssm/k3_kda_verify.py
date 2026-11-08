@@ -21,7 +21,8 @@ from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_kda_mtp_ops  # noqa:
 
 class K3KdaVerify(OpWrapper):
     """Return the gated-norm core output bf16 [N (1 + num_spec), H, 128] of the verify tokens whose fused
-    projection rows are ``proj``; updates the slots' conv caches, state and per-draft states in place."""
+    projection rows are ``proj``; updates in place the state at each request's slot in ``slots`` and the conv
+    caches and per-draft states at its slot in ``draft_slots``."""
 
     ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS = (
@@ -51,8 +52,12 @@ class K3KdaVerify(OpWrapper):
     kda_mtp_decode on the same gate and accepted-draft records. The grid is
     (H, N, 8), with each CTA owning 16 V rows.
 
-    slots and pending, the initial state and the conv window are read before
-    the grid-dependency wait. Metadata must be written before a CUDA graph
+    A request's slot in slots indexes the state pool ssm, and its slot in
+    draft_slots indexes state_tok, pending and the conv caches; the two may
+    differ, and the pools may differ in size.
+
+    slots, draft_slots and pending, the initial state and the conv window are
+    read before the grid-dependency wait. Metadata must be written before a CUDA graph
     runs, never by a kernel of the same step ahead of this launch. Dependents
     are released before this wait, so successive launches on the same pools
     need an intervening kernel that waits, or a non-PDL kernel. Another verify
@@ -62,7 +67,8 @@ class K3KdaVerify(OpWrapper):
 
     First use of each H, num_spec, lower_bound, scale, eps, g_ext mode and PDL
     configuration compiles outside graph capture; capture raises RuntimeError.
-    slots and pending may start at any element offset (0..3 are certified).
+    slots, draft_slots and pending may start at any element offset (0..3 are
+    certified).
     Pool offsets are 64-bit, including pools beyond 2 GiB, covered by
     test_k3_kda_pools_past_2g.py. Repeated schedules and graph replays are
     bit-identical; stateful tests drive changing acceptance through the next
@@ -86,6 +92,7 @@ class K3KdaVerify(OpWrapper):
         ssm: torch.Tensor,
         state_tok: torch.Tensor,
         slots: torch.Tensor,
+        draft_slots: torch.Tensor,
         pending: torch.Tensor,
         num_spec: int,
         lower_bound: float,
@@ -108,6 +115,7 @@ class K3KdaVerify(OpWrapper):
             ssm,
             state_tok,
             slots,
+            draft_slots,
             pending,
             num_spec,
             lower_bound,
@@ -132,6 +140,7 @@ class K3KdaVerify(OpWrapper):
         ssm: torch.Tensor,
         state_tok: torch.Tensor,
         slots: torch.Tensor,
+        draft_slots: torch.Tensor,
         pending: torch.Tensor,
         num_spec: int,
         lower_bound: float,
@@ -150,14 +159,16 @@ class K3KdaVerify(OpWrapper):
             )
         weights = torch.stack((w_q, w_k, w_v)).float()
         out = torch.empty(rows.shape[0], heads, width, dtype=torch.float32, device=proj.device)
-        for n, slot in enumerate(slots.tolist()):
-            accepted = int(pending[slot].item())
+        for n, (slot, draft_slot) in enumerate(
+            zip(slots.tolist(), draft_slots.tolist(), strict=True)
+        ):
+            accepted = int(pending[draft_slot].item())
             state = ssm[slot].float().clone()
             for draft in range(accepted):
-                vn, beta_k, decay = state_tok[slot, :, draft].float().unbind(0)
+                vn, beta_k, decay = state_tok[draft_slot, :, draft].float().unbind(0)
                 state = state * decay[:, None, :] + vn[:, :, None] * beta_k[:, None, :]
             window = torch.stack(
-                [cache[slot, :, accepted : accepted + 3] for cache in (cs_q, cs_k, cs_v)]
+                [cache[draft_slot, :, accepted : accepted + 3] for cache in (cs_q, cs_k, cs_v)]
             ).float()
             raw_rows = rows[n * steps : (n + 1) * steps, : 3 * hk].reshape(steps, 3, hk)
             history = torch.cat((window[:, :, 1:], raw_rows.permute(1, 2, 0)), dim=-1)
@@ -185,10 +196,10 @@ class K3KdaVerify(OpWrapper):
                 if token == 0:
                     ssm[slot].copy_(state)
                 else:
-                    state_tok[slot, :, token - 1].copy_(torch.stack((vn, beta_k, decay)))
+                    state_tok[draft_slot, :, token - 1].copy_(torch.stack((vn, beta_k, decay)))
                 window = u[:, :, 1:]
             for channel, cache in enumerate((cs_q, cs_k, cs_v)):
-                cache[slot].copy_(history[channel])
+                cache[draft_slot].copy_(history[channel])
         return out.to(proj.dtype)
 
     def is_valid(
@@ -207,6 +218,7 @@ class K3KdaVerify(OpWrapper):
         ssm: torch.Tensor,
         state_tok: torch.Tensor,
         slots: torch.Tensor,
+        draft_slots: torch.Tensor,
         pending: torch.Tensor,
         num_spec: int,
         lower_bound: float,
@@ -231,21 +243,29 @@ class K3KdaVerify(OpWrapper):
         for cache in (cs_k, cs_v):
             assert cache.shape[-1] == 3 + num_spec, "conv caches must cover every replay column"
         assert slots.ndim == 1 and slots.is_contiguous(), "slots must be a contiguous vector"
+        assert draft_slots.shape == slots.shape and draft_slots.is_contiguous(), (
+            "draft_slots must be a contiguous vector of one slot per request"
+        )
         assert pending.ndim == 1 and pending.stride(0) > 0, "pending must be a strided vector"
-        indices = slots.long()
+        indices, draft_indices = slots.long(), draft_slots.long()
         assert indices.unique().numel() == indices.numel(), "a call must name each slot once"
-        pool_size = min(
-            ssm.shape[0],
+        assert draft_indices.unique().numel() == draft_indices.numel(), (
+            "a call must name each draft slot once"
+        )
+        assert bool(((indices >= 0) & (indices < ssm.shape[0])).all()), (
+            "slots must be inside the state pool"
+        )
+        draft_pool_size = min(
             state_tok.shape[0],
             cs_q.shape[0],
             cs_k.shape[0],
             cs_v.shape[0],
             pending.numel(),
         )
-        assert bool(((indices >= 0) & (indices < pool_size)).all()), (
-            "slots must be inside every pool and pending"
+        assert bool(((draft_indices >= 0) & (draft_indices < draft_pool_size)).all()), (
+            "draft_slots must be inside every draft-record pool and pending"
         )
-        accepted = pending[indices]
+        accepted = pending[draft_indices]
         assert bool(((accepted >= 0) & (accepted <= num_spec)).all()), (
             "pending must be in 0..num_spec"
         )
