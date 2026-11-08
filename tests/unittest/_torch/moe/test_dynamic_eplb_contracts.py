@@ -242,21 +242,24 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
     torch = SimpleNamespace(
         ops=SimpleNamespace(trtllm=SimpleNamespace(moe_rebalance_tma_submit_fused=submit_fused)),
     )
-    event_handle = _extract_function(source, "_event_handle", {})
+    lease_source = _TORCH_ROOT / "moe/kernels/megamoe_scheduler/sami/lease.py"
+    event_handle = _extract_function(lease_source, "event_handle", {})
+    # The lease bookkeeping is shared with HALO-R's endpoint; HALO-Q supplies its hooks.
+    lease_cls = _extract_class(lease_source, "LiveBankLease", None, {"event_handle": event_handle})
     broadcast_cls = _extract_class(
         source,
         "HierarchicalSamiWeightBroadcast",
         {
             "submit_fused",
-            "release_generation_after",
-            "_require_live_bank_reusable",
-            "mark_collective_reuse_safe",
+            "_require_operational",
+            "_wait_for_consumer",
         },
         {
             "torch": torch,
-            "_event_handle": event_handle,
+            "LiveBankLease": lease_cls,
             "check_cuda": lambda result, operation: result,
         },
+        bases=("LiveBankLease",),
     )
     outputs = object()
 
@@ -324,6 +327,20 @@ def test_hierarchical_fused_submit_launches_bound_scheduler_and_copy():
     assert native == [("wait", 19, 23)]
     with pytest.raises(ValueError, match="positive CUDA event"):
         broadcast.release_generation_after(3, SimpleNamespace(cuda_event=0))
+
+    # A failed consumer wait aborts the handoff, as HALO-R's endpoint does: the
+    # copy stream is no longer ordered after the consumer.
+    broadcast._local_release_generation = 1
+
+    def failed_wait(stream, event, flags):
+        raise RuntimeError("cuStreamWaitEvent(live-bank consumer) failed")
+
+    broadcast.cuda = SimpleNamespace(cuStreamWaitEvent=failed_wait)
+    with pytest.raises(RuntimeError, match="live-bank consumer"):
+        broadcast.release_generation_after(2, SimpleNamespace(cuda_event=23))
+    assert broadcast._handoff_aborted
+    with pytest.raises(RuntimeError, match="quiesced group rebuild required"):
+        broadcast.submit_fused(outputs, "routes", 16, spin_cycles=12345)
 
 
 @pytest.mark.parametrize(

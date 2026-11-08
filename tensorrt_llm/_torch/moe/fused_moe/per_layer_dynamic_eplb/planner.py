@@ -32,6 +32,7 @@ __all__ = [
     "RebalanceSlotSchedulerGroup",
     "SchedulerSpinBound",
     "build_rebalance_slot_scheduler_group",
+    "build_scheduler_group_from_manager",
 ]
 
 
@@ -139,9 +140,6 @@ class RebalanceSlotSchedulerGroup:
         )
         from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.cuda_scheduler.runtime import (
             symmetric_buffer_ints,
-        )
-        from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami import (
-            HierarchicalSamiWeightBroadcast,
         )
 
         ep_size = int(mapping.moe_ep_size)
@@ -253,28 +251,43 @@ class RebalanceSlotSchedulerGroup:
         # whose HALO-Q exchange writes into its peers' buffers.
         ep_comm.barrier()
 
-        # The provider must return the existing arena with identical bundle geometry.
-        # A second allocation would separate the loader aliases from the copy target.
-        bundle = arena.bundle
-        self.broadcaster = HierarchicalSamiWeightBroadcast(
-            comm=ep_comm,
-            device=self.device,
-            bundle=bundle,
-            helper_count=self.helper_slots,
-            global_expert_count=logical_expert_count,
-            arena_provider=arena.provider,
-            tma_sm_count=self.auxiliary_sms,
-            tma_warps=7,
-            tma_route="plan",
-            helper_residency=bool(helper_residency),
-        )
-        self.broadcaster.bind_scheduler(self.scheduler, self.scheduler_stream, self._route_epoch)
+        self._bind_copy_endpoint(arena=arena, helper_residency=bool(helper_residency))
 
         # The previous consumer precedes the next HALO-Q EP rendezvous.
         self.lease = _LiveBankLeaseProvider(self)
         self.broadcaster.bind_generation_reuse_authority(self.lease)
 
         logger.debug("[MegaMoECuteDsl] layer=%s rebalance producer initialized", layer_idx)
+
+    def _bind_copy_endpoint(self, *, arena: Any, helper_residency: bool) -> None:
+        """Build this layer's copy endpoint as ``self.broadcaster`` and bind it to the scheduler.
+
+        ``__init__`` calls it once every rank has connected the scheduler's
+        peers, before the lease binds; a producer with another copy endpoint
+        overrides it. It sets ``self.broadcaster`` before binding, so that the
+        pool's collective shutdown can close a partially bound endpoint.
+        HALO-Q's endpoint is the hierarchical TMA broadcast.
+        """
+        from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami import (
+            HierarchicalSamiWeightBroadcast,
+        )
+
+        # The provider must return the existing arena with identical bundle geometry.
+        # A second allocation would separate the loader aliases from the copy target.
+        bundle = arena.bundle
+        self.broadcaster = HierarchicalSamiWeightBroadcast(
+            comm=self._ep_comm,
+            device=self.device,
+            bundle=bundle,
+            helper_count=self.helper_slots,
+            global_expert_count=self.home_experts * self.ep_size,
+            arena_provider=arena.provider,
+            tma_sm_count=self.auxiliary_sms,
+            tma_warps=7,
+            tma_route="plan",
+            helper_residency=helper_residency,
+        )
+        self.broadcaster.bind_scheduler(self.scheduler, self.scheduler_stream, self._route_epoch)
 
     def close(self) -> None:
         """Release this layer after the owning pool has drained device work."""
@@ -470,8 +483,40 @@ def build_rebalance_slot_scheduler_group(
     auxiliary SM budget, helper-slot mode and scheduler spin bound; the
     communicator is resolved before the stream.
     """
+    return build_scheduler_group_from_manager(
+        RebalanceSlotSchedulerGroup,
+        arena=arena,
+        manager=manager,
+        mapping=mapping,
+        ep_process_group=ep_process_group,
+        home_experts=home_experts,
+        helper_slots=helper_slots,
+        topk=topk,
+        max_tokens_per_rank=max_tokens_per_rank,
+        layer_idx=layer_idx,
+    )
+
+
+def build_scheduler_group_from_manager(
+    group_cls: type,
+    *,
+    arena: Any,
+    manager: Any,
+    mapping: Any,
+    ep_process_group: Any,
+    home_experts: int,
+    helper_slots: int,
+    topk: int,
+    max_tokens_per_rank: int,
+    layer_idx: Optional[int],
+) -> Any:
+    """Build one layer's ``group_cls``, a ``RebalanceSlotSchedulerGroup``, from its manager.
+
+    Every planner's builder takes these keywords and the same manager
+    resources; the communicator is resolved before the stream.
+    """
     device = int(mapping.local_rank)
-    return RebalanceSlotSchedulerGroup(
+    return group_cls(
         arena=arena,
         mapping=mapping,
         ep_comm=manager.get_ep_comm(ep_process_group),

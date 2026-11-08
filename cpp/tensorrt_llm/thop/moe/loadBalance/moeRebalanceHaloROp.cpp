@@ -16,6 +16,8 @@
  */
 
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloR.h"
+#include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloRPlanner.h"
+#include "tensorrt_llm/thop/moe/loadBalance/moeRebalanceOpChecks.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -42,29 +44,16 @@ namespace
 //! Every launch publishes this READY generation; the kernel drains the READY row before each exchange instead.
 constexpr std::uint64_t kReadyGeneration = 1;
 //! Plan words of the shared per-layer dynamic EPLB layout and its per-field entry count.
-constexpr std::int64_t kPlanWords = 2 + 6 * 384;
-constexpr std::int64_t kPlanFieldStride = 384;
+constexpr std::int64_t kPlanWords = kernels::halo_r::kPlanWords;
+constexpr std::int64_t kPlanFieldStride = kernels::halo_r::kPlanFieldStride;
+
+using moe_rebalance_op::checkCudaResult;
+using moe_rebalance_op::checkedInt;
 
 void checkCudaTensor(torch::Tensor const& tensor, c10::Device const& device, c10::ScalarType dtype,
     std::int64_t minElements, char const* name)
 {
-    TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
-    TORCH_CHECK(tensor.device() == device, name, " must be on the plan's CUDA device");
-    TORCH_CHECK(tensor.scalar_type() == dtype, name, " has an invalid dtype");
-    TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
-    TORCH_CHECK(tensor.numel() >= minElements, name, " is too small: expected at least ", minElements,
-        " elements, got ", tensor.numel());
-}
-
-void checkCudaResult(cudaError_t error, char const* operation)
-{
-    TORCH_CHECK(error == cudaSuccess, operation, " failed: ", cudaGetErrorString(error));
-}
-
-int checkedInt(std::int64_t value, char const* name)
-{
-    TORCH_CHECK(value >= INT_MIN && value <= INT_MAX, name, " does not fit in int32");
-    return static_cast<int>(value);
+    moe_rebalance_op::checkCudaTensor(tensor, device, dtype, minElements, name, "the plan's CUDA device");
 }
 
 template <typename T>
@@ -106,9 +95,8 @@ public:
         torch::Tensor relaySources, torch::Tensor relayDestinations, torch::Tensor relayPlaneBytes,
         torch::Tensor relayCompletedCtas, torch::Tensor relayCounters, std::optional<torch::Tensor> residency,
         std::int64_t readyFlagsPtr, std::int64_t readyFlagMcPtr, std::int64_t epValue, std::int64_t expertsValue,
-        std::int64_t helpersValue, std::int64_t sendCountValue, std::int64_t sendWeightValue,
-        std::int64_t localRankValue, std::int64_t topkValue, std::int64_t routeCapacityValue, std::int64_t ctasValue,
-        std::int64_t copyStream)
+        std::int64_t helpersValue, std::int64_t sendCountValue, std::int64_t localRankValue, std::int64_t topkValue,
+        std::int64_t routeCapacityValue, std::int64_t ctasValue, std::int64_t copyStream)
     {
         int const ep = checkedInt(epValue, "ep");
         int const experts = checkedInt(expertsValue, "experts");
@@ -116,11 +104,14 @@ public:
         int const topk = checkedInt(topkValue, "topk");
         int const routeCapacity = checkedInt(routeCapacityValue, "route_capacity");
         int const ctas = checkedInt(ctasValue, "ctas");
-        TORCH_CHECK(ep >= 2 && ep <= 32, "ep must be in [2, 32]");
+        TORCH_CHECK(ep >= kernels::kHaloRMinEp && ep <= kernels::halo_r::kMaxRanks, "ep must be in [",
+            kernels::kHaloRMinEp, ", ", kernels::halo_r::kMaxRanks, "]");
         TORCH_CHECK(experts > 0 && experts <= kPlanFieldStride && experts % ep == 0,
             "experts must be positive, no greater than ", kPlanFieldStride, ", and divisible by ep");
-        TORCH_CHECK(helpers >= 1 && helpers <= 4, "helpers must be in [1, 4]");
-        TORCH_CHECK(ctas >= 2 && ctas <= 128, "ctas must be in [2, 128]");
+        TORCH_CHECK(helpers >= 1 && helpers <= kernels::halo_r::kMaxHelperSlots, "helpers must be in [1, ",
+            kernels::halo_r::kMaxHelperSlots, "]");
+        TORCH_CHECK(ctas >= kernels::kHaloRMinCtas && ctas <= kernels::kHaloRMaxCtas, "ctas must be in [",
+            kernels::kHaloRMinCtas, ", ", kernels::kHaloRMaxCtas, "]");
         TORCH_CHECK(topk > 0 && routeCapacity > 0 && routeCapacity % topk == 0,
             "route_capacity must be a positive multiple of topk");
         TORCH_CHECK(copyStream != 0, "copy_stream must be a non-default CUDA stream");
@@ -180,7 +171,6 @@ public:
             .experts = experts,
             .helpers = helpers,
             .sendCount = checkedInt(sendCountValue, "send_count"),
-            .sendWeight = checkedInt(sendWeightValue, "send_weight"),
             .localRank = checkedInt(localRankValue, "local_rank"),
             .routeCapacity = routeCapacity,
             .validRouteCount = 0,
@@ -291,8 +281,8 @@ public:
         poisonOnError(cudaStreamWaitEvent(execution, mCopyIdle, 0), "cudaStreamWaitEvent(HALO-R copy idle)");
     }
 
-    //! Waits for COPY and returns the diagnostic counters (launches, receiver copies, receiver skips). For tests and
-    //! teardown only.
+    //! Waits for COPY and returns the diagnostic counters (launches, receiver copies, receiver skips). For tests
+    //! only.
     std::vector<std::int64_t> relayCounts()
     {
         std::lock_guard<std::mutex> lock(mMutex);
@@ -307,7 +297,7 @@ public:
             counters[kernels::kHaloRCounterReceiverSkips]};
     }
 
-    //! Releases the event and the bound tensors; the caller has drained the device work that uses them.
+    //! Releases the events and the bound tensors; the caller has drained the device work that uses them.
     void destroy()
     {
         std::lock_guard<std::mutex> lock(mMutex);
@@ -382,15 +372,15 @@ MoeRebalanceHaloRStatePtr moeRebalanceHaloRCreate(torch::Tensor outSlots, torch:
     torch::Tensor relaySources, torch::Tensor relayDestinations, torch::Tensor relayPlaneBytes,
     torch::Tensor relayCompletedCtas, torch::Tensor relayCounters, std::optional<torch::Tensor> residency,
     std::int64_t readyFlagsPtr, std::int64_t readyFlagMcPtr, std::int64_t ep, std::int64_t experts,
-    std::int64_t helpers, std::int64_t sendCount, std::int64_t sendWeight, std::int64_t localRank, std::int64_t topk,
-    std::int64_t routeCapacity, std::int64_t ctas, std::int64_t copyStream)
+    std::int64_t helpers, std::int64_t sendCount, std::int64_t localRank, std::int64_t topk, std::int64_t routeCapacity,
+    std::int64_t ctas, std::int64_t copyStream)
 {
     return c10::make_intrusive<MoeRebalanceHaloRState>(std::move(outSlots), std::move(outIds), std::move(outOwners),
         std::move(peerBases), std::move(status), std::move(partial), std::move(routeAux), std::move(gridSync),
         std::move(plan), std::move(routePrefix), std::move(routeCounter), std::move(relaySources),
         std::move(relayDestinations), std::move(relayPlaneBytes), std::move(relayCompletedCtas),
         std::move(relayCounters), std::move(residency), readyFlagsPtr, readyFlagMcPtr, ep, experts, helpers, sendCount,
-        sendWeight, localRank, topk, routeCapacity, ctas, copyStream);
+        localRank, topk, routeCapacity, ctas, copyStream);
 }
 
 // The per-layer op takes this handle instead of the custom class, whose conversion costs several microseconds of
@@ -451,7 +441,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor status, Tensor partial, Tensor route_aux, Tensor grid_sync, Tensor plan, Tensor route_prefix, "
         "Tensor route_counter, Tensor relay_sources, Tensor relay_destinations, Tensor relay_plane_bytes, "
         "Tensor relay_completed_ctas, Tensor relay_counters, Tensor? residency, int ready_flags_ptr, "
-        "int ready_flag_mc_ptr, int ep, int experts, int helpers, int send_count, int send_weight, int local_rank, int "
+        "int ready_flag_mc_ptr, int ep, int experts, int helpers, int send_count, int local_rank, int "
         "topk, int route_capacity, "
         "int ctas, int copy_stream) -> "
         "__torch__.torch.classes.trtllm.MoeRebalanceHaloRState");

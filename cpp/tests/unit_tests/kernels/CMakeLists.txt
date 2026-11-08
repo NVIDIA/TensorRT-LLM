@@ -131,7 +131,11 @@ add_tllm_gtest(
   tllm::common_headers
   Threads::Threads
   LABELS
-  "unit;kernels;moe-load-balance;host")
+  "unit;kernels;moe-load-balance;host"
+  # A lane that skips a collective deadlocks the host warp; fail instead of
+  # stalling the kernels group.
+  TIMEOUT
+  120)
 
 add_gtest(
   gemmSwigluRunnerTest

@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/thop/moe/loadBalance/moeRebalanceHaloQOp.h"
+#include "tensorrt_llm/thop/moe/loadBalance/moeRebalanceOpChecks.h"
 
 #include <torch/extension.h>
 
@@ -30,21 +31,12 @@ namespace torch_ext
 namespace
 {
 
+using moe_rebalance_op::checkedInt;
+
 void checkCudaTensor(torch::Tensor const& tensor, c10::Device const& device, c10::ScalarType dtype,
     std::int64_t minElements, char const* name)
 {
-    TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
-    TORCH_CHECK(tensor.device() == device, name, " must be on the routes CUDA device");
-    TORCH_CHECK(tensor.scalar_type() == dtype, name, " has an invalid dtype");
-    TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
-    TORCH_CHECK(tensor.numel() >= minElements, name, " is too small: expected at least ", minElements,
-        " elements, got ", tensor.numel());
-}
-
-int checkedInt(std::int64_t value, char const* name)
-{
-    TORCH_CHECK(value >= INT_MIN && value <= INT_MAX, name, " does not fit in int32");
-    return static_cast<int>(value);
+    moe_rebalance_op::checkCudaTensor(tensor, device, dtype, minElements, name, "the routes CUDA device");
 }
 
 } // namespace

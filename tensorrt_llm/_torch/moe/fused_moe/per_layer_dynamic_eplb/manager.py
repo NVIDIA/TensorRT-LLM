@@ -48,9 +48,13 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
             raise ValueError(f"unknown helper_slot_mode {helper_slot_mode!r}")
         # Resident helper experts need helper rows that only their layer writes.
         self.helper_residency = helper_slot_mode == "per_layer_resident"
+        from tensorrt_llm.llmapi.llm_args import _PER_LAYER_DYNAMIC_PLANNERS
+
         self.planner = str(getattr(config, "planner", "halo_q"))
-        if self.planner not in ("halo_q", "halo_r"):
+        if self.planner not in _PER_LAYER_DYNAMIC_PLANNERS:
             raise ValueError(f"unknown per-layer dynamic EPLB planner {self.planner!r}")
+        # The planner's scheduler group builder and capabilities.
+        self.planner_spec = _PER_LAYER_DYNAMIC_PLANNERS[self.planner]
 
         # State read by the shared lifecycle and by the engine.
         self._previous_balancer = None
@@ -173,12 +177,12 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
         """Create a per-layer provider scoped to this model manager."""
         from .arena import SharedSlotArenaProvider
 
-        # HALO-R writes helper rows with unicast stores only, so its helper
-        # sets need no multicast object; HALO-Q's copy stores through them.
+        # Only a copy that stores through multicast (HALO-Q's) needs its
+        # helper sets bound to multicast objects; HALO-R's relay is unicast.
         provider = SharedSlotArenaProvider(
             self,
             per_layer_helper_sets=self.helper_residency,
-            helper_multicast=self.planner == "halo_q",
+            helper_multicast=self.planner_spec.helper_multicast,
         )
         self._arena_providers.append(provider)
         return provider

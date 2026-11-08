@@ -28,6 +28,8 @@
  * The copy runs as the second phase of one kernel whose first phase is the
  * HALO-Q scheduler that produces its plan.
  */
+#include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceCompletion.cuh"
+#include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceFusedLaunch.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloQ.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloQKernel.cuh"
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalancePlanPolicy.h"
@@ -178,21 +180,6 @@ __device__ __forceinline__ void wait_all_writes()
     asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
 }
 
-__device__ __forceinline__ void system_publish_fence()
-{
-    asm volatile("fence.proxy.alias;" ::: "memory");
-    asm volatile("fence.release.sys;" ::: "memory");
-}
-
-__device__ __forceinline__ void multicast_generation(uint64_t flag_mc, uint64_t generation)
-{
-    // The notification uses the same MC backing/UC acquire protocol as the
-    // former copy-engine terminal. Publish only after all issuers' writes.
-    system_publish_fence();
-    asm volatile("multimem.st.release.sys.global.u64 [%0], %1;" ::"l"(flag_mc), "l"(generation) : "memory");
-    asm volatile("fence.proxy.alias;" ::: "memory");
-}
-
 /* Helper residency of one layer: the expert that each rank's helper slot holds,
  * int32 [world][helper_count], -1 when unknown. Every rank keeps an identical
  * table because it changes only from the replicated HALO-Q placement. */
@@ -228,16 +215,12 @@ __device__ __forceinline__ void update_helper_residency(HelperResidency const& r
 __device__ __forceinline__ void finish_cta_and_notify(
     unsigned* completed_ctas, uint64_t flag_mc, uint64_t generation, HelperResidency const* residency = nullptr)
 {
-    unsigned previous;
     // A release/acquire RMW chain combines the completed payload of all CTAs.
-    // No CTA waits for another: oversubscribed grids cannot deadlock here.
-    asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(previous) : "l"(completed_ctas) : "memory");
-    if (previous == gridDim.x - 1)
+    if (tensorrt_llm::kernels::moeRebalanceArriveLastCta(completed_ctas))
     {
-        // All RMWs are done. The next launch is ordered after this kernel, so
-        // the last CTA can rearm the counter without a host memset each time.
-        asm volatile("st.relaxed.gpu.global.u32 [%0], 0;" ::"l"(completed_ctas) : "memory");
-        multicast_generation(flag_mc, generation);
+        tensorrt_llm::kernels::moeRebalanceRearmCtaCounter(completed_ctas);
+        // Publish only after all issuers' writes.
+        tensorrt_llm::kernels::moeRebalancePublishReady(flag_mc, generation);
         // Every CTA read the table before joining the chain; the next copy of
         // this layer is a later kernel on the same stream.
         if (residency != nullptr)
@@ -527,7 +510,9 @@ __device__ __forceinline__ void tma_copy_body(MegamoeTmaCopySegment const* segme
         // Empty source ranks still publish READY. One tiny CTA, same kernel;
         // no descriptor upload or additional host-side notification launch.
         if (threadIdx.x == 0 && flag_mc)
-            multicast_generation(flag_mc, generation);
+        {
+            tensorrt_llm::kernels::moeRebalancePublishReady(flag_mc, generation);
+        }
         return;
     }
     extern __shared__ __align__(128) unsigned char smem[];
@@ -815,13 +800,7 @@ cudaError_t prepare_fused_launch(MegamoeTmaCopyState& state)
     auto const& plan = state.direct.config;
     void const* kernel = reinterpret_cast<void const*>(&halo_q_tma_fused_kernel);
     cudaFuncAttributes attributes{};
-    cudaError_t error = cudaFuncGetAttributes(&attributes, kernel);
-    if (error != cudaSuccess)
-        return error;
-    size_t stack = 0;
-    error = cudaDeviceGetLimit(&stack, cudaLimitStackSize);
-    if (error == cudaSuccess && stack < attributes.localSizeBytes)
-        error = cudaDeviceSetLimit(cudaLimitStackSize, attributes.localSizeBytes);
+    cudaError_t error = tensorrt_llm::kernels::loadMoeRebalanceFusedKernel(kernel, attributes);
     if (error != cudaSuccess)
         return error;
     int const static_bytes = static_cast<int>(attributes.sharedSizeBytes);
@@ -834,13 +813,8 @@ cudaError_t prepare_fused_launch(MegamoeTmaCopyState& state)
     if (attributes.maxThreadsPerBlock < kFusedThreads || slots < 2 * c.warps
         || bytes + static_bytes > c.device_optin_shared_bytes)
         return cudaErrorInvalidConfiguration;
-    error = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
-    if (error == cudaSuccess)
-        error = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
     int active = 0;
-    if (error == cudaSuccess)
-        error = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, kernel, kFusedThreads, bytes);
+    error = tensorrt_llm::kernels::sizeMoeRebalanceFusedKernel(kernel, kFusedThreads, bytes, active);
     if (error != cudaSuccess)
         return error;
     if (active != 1)
@@ -848,18 +822,9 @@ cudaError_t prepare_fused_launch(MegamoeTmaCopyState& state)
     state.fused_kernel = kernel;
     state.fused_total_slots = slots;
     state.fused_dynamic_bytes = bytes;
-    // The copy's NVLink traffic runs in the remote memory-sync domain, so fences
-    // and completions of kernels in the default domain do not wait for it.
-    int domains = 0;
-    if (cudaDeviceGetAttribute(&domains, cudaDevAttrMemSyncDomainCount, c.device) == cudaSuccess && domains >= 2)
-    {
-        state.fused_attributes[0].id = cudaLaunchAttributeMemSyncDomain;
-        state.fused_attributes[0].val.memSyncDomain = cudaLaunchMemSyncDomainRemote;
-        state.fused_attributes[1].id = cudaLaunchAttributeMemSyncDomainMap;
-        state.fused_attributes[1].val.memSyncDomainMap.default_ = 0;
-        state.fused_attributes[1].val.memSyncDomainMap.remote = 1;
-        state.fused_attribute_count = 2;
-    }
+    // The copy's NVLink traffic runs in the remote memory-sync domain.
+    state.fused_attribute_count
+        = tensorrt_llm::kernels::setMoeRebalanceRemoteSyncDomain(c.device, state.fused_attributes);
     return cudaSuccess;
 }
 
@@ -1209,7 +1174,7 @@ extern "C" int megamoe_tma_copy_bind_gpu_direct(MegamoeTmaCopyState* state, uint
         if (error == cudaSuccess)
             error = cudaMemset(d.resident, 0xFF, bytes); // -1: no expert is known to be resident.
         if (error == cudaSuccess)
-            error = cudaStreamSynchronize(nullptr);      // Cold initialization only.
+            error = cudaStreamSynchronize(nullptr); // Cold initialization only.
         if (error != cudaSuccess)
             return error;
     }

@@ -51,8 +51,9 @@ constexpr int kMaxRanks = 32;
 constexpr int kMaxSendsPerRank = 16;
 //! The helper index of a receiver is stored as two bits split over two rank masks.
 constexpr int kMaxHelperSlots = 4;
-//! Exported experts are ordered by an index below kOrderOpen, so at most this many experts are exported.
-constexpr int kMaxBroadcasts = 128;
+//! Exported experts are ordered by an index below kOrderOpen, so at most this many experts are exported. Smaller than
+//! HALO-Q's kMaxBroadcasts, which is the plan field stride (kPlanFieldStride).
+constexpr int kMaxHaloRBroadcasts = 128;
 //! The plan uses the shared per-layer dynamic EPLB layout: six fields with one entry per possible expert.
 constexpr int kPlanFieldStride = 384;
 constexpr int kPlanFieldCount = 6;
@@ -63,23 +64,21 @@ constexpr int kPlanWords = kPlanHeaderWords + kPlanFieldCount * kPlanFieldStride
 constexpr int kOrderBits = 8;
 constexpr int kOrderOpen = 1 << (kOrderBits - 1);
 constexpr int kOrderMax = (1 << kOrderBits) - 1;
-//! The weighted row count of a candidate occupies the key bits above the order.
-constexpr long long kMaxWeightedRows = 1LL << (32 - kOrderBits);
+//! The row count of a candidate occupies the key bits above the order.
+constexpr long long kMaxCandidateRows = 1LL << (32 - kOrderBits);
 //! The room key keeps the lane in its low five bits.
 constexpr int kLaneBits = 5;
-//! Largest supported extra weight of a fan-out of an already exported expert over opening a new one.
-constexpr int kMaxSendWeight = 32;
-//! Each greedy step records one move and adds one receiver to an eligible rank, so a valid run makes at most
-//! kMaxRanks * kMaxHelperSlots moves; the next step finds no candidate.
+//! Each greedy step records one move and adds one receiver to an eligible rank, so a run makes at most
+//! kMaxRanks * kMaxHelperSlots moves and the next step finds no candidate: the bound is never reached.
 constexpr int kMaxPlannerIterations = kMaxRanks * kMaxHelperSlots + 1;
 
-static_assert(kMaxRanks * kMaxHelperSlots <= kMaxBroadcasts, "every move must fit the move table");
-static_assert(kMaxBroadcasts <= kOrderOpen, "exported experts must fit the order field");
-static_assert(kMaxBroadcasts <= kPlanFieldStride, "the plan fields must hold every exported expert");
+static_assert(kMaxRanks * kMaxHelperSlots <= kMaxHaloRBroadcasts, "every move must fit the move table");
+static_assert(kMaxHaloRBroadcasts <= kOrderOpen, "exported experts must fit the order field");
+static_assert(kMaxHaloRBroadcasts <= kPlanFieldStride, "the plan fields must hold every exported expert");
 
 //! Plan fields after the [epoch, broadcast count] header. A broadcast b sends expert[b] from owner[b] to every rank in
 //! destinationMask[b]; rank d stores it in helper slot (helperHighMask bit d) << 1 | (helperLowMask bit d).
-enum class PlanField : int
+enum class HaloRPlanField : int
 {
     kExpert = 0,
     kOwner = 1,
@@ -89,15 +88,6 @@ enum class PlanField : int
     kHelperHighMask = 5,
 };
 
-enum class PlanStatus : int
-{
-    kOk = 0,
-    kNoDestination = 1,
-    kOverBudget = 2,
-    kIterationCap = 3,
-    kBadConfig = 4,
-};
-
 //! Shared scratch of the planner warp.
 struct PlannerScratch
 {
@@ -105,12 +95,12 @@ struct PlannerScratch
     int received[kMaxRanks];
     int sent[kMaxRanks];
     int hottest[kMaxRanks * kMaxSendsPerRank];
-    int exportExpert[kMaxBroadcasts];
-    int exportRemaining[kMaxBroadcasts];
-    int moveExpert[kMaxBroadcasts];
-    int moveDestination[kMaxBroadcasts];
-    int moveRows[kMaxBroadcasts];
-    int broadcastExpert[kMaxBroadcasts];
+    int exportExpert[kMaxHaloRBroadcasts];
+    int exportRemaining[kMaxHaloRBroadcasts];
+    int moveExpert[kMaxHaloRBroadcasts];
+    int moveDestination[kMaxHaloRBroadcasts];
+    int moveRows[kMaxHaloRBroadcasts];
+    int broadcastExpert[kMaxHaloRBroadcasts];
     int hot[kMaxRanks * kMaxHelperSlots];
 };
 
@@ -120,19 +110,17 @@ struct PlannerConfig
     int experts;
     int helperSlots;
     int sendCount;
-    int sendWeight;
     int localRank;
 };
 
 struct PlannerOutputs
 {
-    int* plan;       //!< kPlanWords words; the planner writes plan[1] and every field, not the epoch plan[0].
-    int* quota;      //!< [broadcast][rank] rows routed to each rank, kMaxBroadcasts * ep entries.
-    int* outIds;     //!< This rank's helper slots: the expert held in each slot, or -1.
-    int* outOwners;  //!< This rank's helper slots: the owner of that expert, or -1.
-    int* hotTable;   //!< Optional [rank][helper slot] experts of every rank.
-    int* loadAfter;  //!< Optional per-rank load after the moves.
-    int* iterations; //!< Optional greedy step count.
+    int* plan;      //!< kPlanWords words; the planner writes plan[1] and every field, not the epoch plan[0].
+    int* quota;     //!< [broadcast][rank] rows routed to each rank, kMaxHaloRBroadcasts * ep entries.
+    int* outIds;    //!< This rank's helper slots: the expert held in each slot, or -1.
+    int* outOwners; //!< This rank's helper slots: the owner of that expert, or -1.
+    int* hotTable;  //!< Optional [rank][helper slot] experts of every rank.
+    int* loadAfter; //!< Optional per-rank load after the moves.
 };
 
 TLLM_HALO_R_HOST_DEVICE inline int planMin(int a, int b)
@@ -140,12 +128,12 @@ TLLM_HALO_R_HOST_DEVICE inline int planMin(int a, int b)
     return a < b ? a : b;
 }
 
-TLLM_HALO_R_HOST_DEVICE inline int* planField(int* plan, PlanField field)
+TLLM_HALO_R_HOST_DEVICE inline int* planField(int* plan, HaloRPlanField field)
 {
     return plan + kPlanHeaderWords + static_cast<int>(field) * kPlanFieldStride;
 }
 
-TLLM_HALO_R_HOST_DEVICE inline int const* planField(int const* plan, PlanField field)
+TLLM_HALO_R_HOST_DEVICE inline int const* planField(int const* plan, HaloRPlanField field)
 {
     return plan + kPlanHeaderWords + static_cast<int>(field) * kPlanFieldStride;
 }
@@ -154,9 +142,8 @@ TLLM_HALO_R_HOST_DEVICE inline bool validPlannerConfig(PlannerConfig const& cfg)
 {
     return cfg.ep >= 1 && cfg.ep <= kMaxRanks && cfg.experts > 0 && cfg.experts % cfg.ep == 0
         && cfg.experts <= kPlanFieldStride && cfg.helperSlots >= 1 && cfg.helperSlots <= kMaxHelperSlots
-        && cfg.sendCount >= 1 && cfg.sendCount <= kMaxSendsPerRank && cfg.ep * cfg.sendCount <= kMaxBroadcasts
-        && cfg.sendCount <= cfg.experts / cfg.ep && cfg.sendWeight >= 0 && cfg.sendWeight <= kMaxSendWeight
-        && cfg.localRank >= 0 && cfg.localRank < cfg.ep;
+        && cfg.sendCount >= 1 && cfg.sendCount <= kMaxSendsPerRank && cfg.ep * cfg.sendCount <= kMaxHaloRBroadcasts
+        && cfg.sendCount <= cfg.experts / cfg.ep && cfg.localRank >= 0 && cfg.localRank < cfg.ep;
 }
 
 //! Helper slot of `rank` for a broadcast with the given helper masks.
@@ -181,23 +168,10 @@ TLLM_HALO_R_HOST_DEVICE inline int selectedRouteSlot(int expert, int destination
     return -1;
 }
 
-//! Candidate key: weighted rows above the inverted candidate order.
-TLLM_HALO_R_HOST_DEVICE inline unsigned candidateKey(int weightedRows, int order)
+//! Candidate key: rows above the inverted candidate order.
+TLLM_HALO_R_HOST_DEVICE inline unsigned candidateKey(int rows, int order)
 {
-    return (static_cast<unsigned>(weightedRows) << kOrderBits) | static_cast<unsigned>(kOrderMax - order);
-}
-
-//! The two ranks with the most room below the target. Ties go to the lower rank.
-struct ReceiverRooms
-{
-    int bestRank;
-    int bestRoom;
-    int secondRoom;
-};
-
-TLLM_HALO_R_HOST_DEVICE inline int roomExcluding(ReceiverRooms const& rooms, int rank)
-{
-    return rooms.bestRank == rank ? rooms.secondRoom : rooms.bestRoom;
+    return (static_cast<unsigned>(rows) << kOrderBits) | static_cast<unsigned>(kOrderMax - order);
 }
 
 //! The planner's view of one greedy step.
@@ -250,23 +224,21 @@ TLLM_HALO_R_HOST_DEVICE inline int prepareRankLoads(int const* histogram, Planne
     return load;
 }
 
-//! Warp collective: the best and second-best room among eligible ranks.
+//! Warp collective: the most room among eligible ranks, 0 when none is eligible. A candidate's owner is never
+//! eligible: it has a candidate only while its load exceeds the target, so its room is negative.
 template <typename Warp>
-TLLM_HALO_R_HOST_DEVICE inline ReceiverRooms findReceiverRooms(bool eligible, int room)
+TLLM_HALO_R_HOST_DEVICE inline int bestReceiverRoom(bool eligible, int room)
 {
     int const lane = Warp::lane();
     unsigned const key = eligible ? (static_cast<unsigned>(room) << kLaneBits) | static_cast<unsigned>(31 - lane) : 0U;
-    unsigned const best = Warp::reduceMax(key);
-    int const bestRank = best ? 31 - static_cast<int>(best & 31U) : -1;
-    unsigned const second = Warp::reduceMax(lane == bestRank ? 0U : key);
-    return ReceiverRooms{bestRank, static_cast<int>(best >> kLaneBits), static_cast<int>(second >> kLaneBits)};
+    return static_cast<int>(Warp::reduceMax(key) >> kLaneBits);
 }
 
 //! This lane's best candidate: fan-outs of exported experts (strided over lanes) and the next hottest expert of the
 //! lane's own rank when it is still overloaded.
 template <typename Warp>
-TLLM_HALO_R_HOST_DEVICE inline unsigned bestLaneCandidate(int const* histogram, PlannerConfig const& cfg, int target,
-    int exports, ReceiverRooms const& rooms, PlannerScratch const* s)
+TLLM_HALO_R_HOST_DEVICE inline unsigned bestLaneCandidate(
+    int const* histogram, PlannerConfig const& cfg, int target, int exports, int bestRoom, PlannerScratch const* s)
 {
     int const lane = Warp::lane();
     int const home = cfg.experts / cfg.ep;
@@ -280,12 +252,12 @@ TLLM_HALO_R_HOST_DEVICE inline unsigned bestLaneCandidate(int const* histogram, 
         {
             continue;
         }
-        int const rows = planMin(planMin(roomExcluding(rooms, owner), remaining), excess);
+        int const rows = planMin(planMin(bestRoom, remaining), excess);
         if (rows <= 0)
         {
             continue;
         }
-        unsigned const key = candidateKey(rows * (1 + cfg.sendWeight), j);
+        unsigned const key = candidateKey(rows, j);
         best = key > best ? key : best;
     }
     if (lane < cfg.ep)
@@ -297,7 +269,7 @@ TLLM_HALO_R_HOST_DEVICE inline unsigned bestLaneCandidate(int const* histogram, 
             int const mass = histogram[lane * home + s->hottest[lane * kMaxSendsPerRank + sent]];
             if (mass > 0)
             {
-                int const rows = planMin(planMin(roomExcluding(rooms, lane), mass), excess);
+                int const rows = planMin(planMin(bestRoom, mass), excess);
                 if (rows > 0)
                 {
                     unsigned const key = candidateKey(rows, kOrderOpen + lane);
@@ -314,51 +286,39 @@ TLLM_HALO_R_HOST_DEVICE inline Move decodeWinner(
 {
     int const home = cfg.experts / cfg.ep;
     int const order = kOrderMax - static_cast<int>(winner & static_cast<unsigned>(kOrderMax));
-    unsigned const weightedRows = winner >> kOrderBits;
+    int const rows = static_cast<int>(winner >> kOrderBits);
     if (order < kOrderOpen)
     {
         int const expert = s->exportExpert[order];
-        return Move{expert, expert / home, static_cast<int>(weightedRows / static_cast<unsigned>(1 + cfg.sendWeight)),
-            order, false};
+        return Move{expert, expert / home, rows, order, false};
     }
     int const owner = order - kOrderOpen;
     int const expert = owner * home + s->hottest[owner * kMaxSendsPerRank + s->sent[owner]];
-    return Move{expert, owner, static_cast<int>(weightedRows), exports, true};
+    return Move{expert, owner, rows, exports, true};
 }
 
-//! Greedy moves until no candidate remains. Returns the status; the export and move counts are written back.
+//! Greedy moves until no candidate remains; the export and move counts are written back. The winner's rows fit the
+//! best receiver's room and that receiver is not the owner (bestReceiverRoom), so every winner has a receiver.
 template <typename Warp>
-TLLM_HALO_R_HOST_DEVICE inline PlanStatus runGreedyMoves(int const* histogram, PlannerConfig const& cfg, int target,
-    PlannerScratch* s, int* exportCount, int* moveCount, int* iterations)
+TLLM_HALO_R_HOST_DEVICE inline void runGreedyMoves(
+    int const* histogram, PlannerConfig const& cfg, int target, PlannerScratch* s, int* exportCount, int* moveCount)
 {
     int const lane = Warp::lane();
     bool const active = lane < cfg.ep;
     int exports = 0;
     int moves = 0;
-    int steps = 0;
-    PlanStatus status = PlanStatus::kOk;
-    for (;;)
+    for (int step = 0; step < kMaxPlannerIterations; ++step)
     {
-        if (++steps > kMaxPlannerIterations)
-        {
-            status = PlanStatus::kIterationCap;
-            break;
-        }
         int const room = target - (active ? s->load[lane] : 0);
         bool const eligible = active && s->received[lane] < cfg.helperSlots && room > 0;
-        ReceiverRooms const rooms = findReceiverRooms<Warp>(eligible, room);
-        unsigned const winner = Warp::reduceMax(bestLaneCandidate<Warp>(histogram, cfg, target, exports, rooms, s));
+        int const bestRoom = bestReceiverRoom<Warp>(eligible, room);
+        unsigned const winner = Warp::reduceMax(bestLaneCandidate<Warp>(histogram, cfg, target, exports, bestRoom, s));
         if (!winner)
         {
             break;
         }
         Move const move = decodeWinner(winner, cfg, exports, s);
         unsigned const receivers = Warp::ballot(eligible && lane != move.owner && room >= move.rows);
-        if (!receivers)
-        {
-            status = PlanStatus::kNoDestination;
-            break;
-        }
         int const destination = static_cast<int>(Warp::findFirstSet(receivers)) - 1;
         Warp::sync();
         if (lane == 0)
@@ -383,21 +343,18 @@ TLLM_HALO_R_HOST_DEVICE inline PlanStatus runGreedyMoves(int const* histogram, P
     }
     *exportCount = exports;
     *moveCount = moves;
-    *iterations = steps;
-    return status;
 }
 
 //! Each rank's distinct received experts, one per helper slot. With a residency table [rank][helper slot] (`resident`,
 //! -1 for unknown), a received expert that a slot of the rank already holds keeps the lowest such slot, so its copy is
 //! skipped; the other received experts, in ascending order, fill the remaining slots in ascending order. Without a
-//! table, or with nothing resident, the experts fill the slots in ascending order. Returns kOverBudget on any rank
-//! that would receive more distinct experts than it has helper slots.
+//! table, or with nothing resident, the experts fill the slots in ascending order. A rank receives a move only while
+//! it has received fewer moves than it has helper slots, so its distinct experts always fit them.
 template <typename Warp>
-TLLM_HALO_R_HOST_DEVICE inline PlanStatus buildHelperTable(
+TLLM_HALO_R_HOST_DEVICE inline void buildHelperTable(
     PlannerConfig const& cfg, int moves, int const* resident, PlannerScratch* s)
 {
     int const lane = Warp::lane();
-    bool overBudget = false;
     if (lane < cfg.ep)
     {
         int received[kMaxHelperSlots];
@@ -414,68 +371,60 @@ TLLM_HALO_R_HOST_DEVICE inline PlanStatus buildHelperTable(
             {
                 duplicate |= received[q] == expert;
             }
-            if (duplicate)
+            if (!duplicate)
             {
-                continue;
+                received[used++] = expert;
             }
-            if (used >= cfg.helperSlots)
-            {
-                overBudget = true;
-                break;
-            }
-            received[used++] = expert;
         }
-        if (!overBudget)
+        for (int a = 1; a < used; ++a)
         {
-            for (int a = 1; a < used; ++a)
+            for (int q = a; q > 0 && received[q] < received[q - 1]; --q)
             {
-                for (int q = a; q > 0 && received[q] < received[q - 1]; --q)
-                {
-                    int const t = received[q];
-                    received[q] = received[q - 1];
-                    received[q - 1] = t;
-                }
+                int const t = received[q];
+                received[q] = received[q - 1];
+                received[q - 1] = t;
             }
-            int* hot = s->hot + lane * kMaxHelperSlots;
-            for (int q = 0; q < cfg.helperSlots; ++q)
+        }
+        int* hot = s->hot + lane * kMaxHelperSlots;
+        for (int q = 0; q < cfg.helperSlots; ++q)
+        {
+            hot[q] = -1;
+        }
+        // Resident experts first: each keeps the lowest slot that holds it.
+        bool placed[kMaxHelperSlots] = {};
+        if (resident != nullptr)
+        {
+            int const* row = resident + lane * cfg.helperSlots;
+            for (int r = 0; r < used; ++r)
             {
-                hot[q] = -1;
-            }
-            // Resident experts first: each keeps the lowest slot that holds it.
-            bool placed[kMaxHelperSlots] = {};
-            if (resident != nullptr)
-            {
-                int const* row = resident + lane * cfg.helperSlots;
-                for (int r = 0; r < used; ++r)
+                for (int q = 0; q < cfg.helperSlots; ++q)
                 {
-                    for (int q = 0; q < cfg.helperSlots; ++q)
+                    if (hot[q] < 0 && row[q] == received[r])
                     {
-                        if (hot[q] < 0 && row[q] == received[r])
-                        {
-                            hot[q] = received[r];
-                            placed[r] = true;
-                            break;
-                        }
+                        hot[q] = received[r];
+                        placed[r] = true;
+                        break;
                     }
                 }
             }
-            // The others in ascending order into the free slots in ascending order.
-            int q = 0;
-            for (int r = 0; r < used; ++r)
+        }
+        // The others in ascending order into the free slots in ascending order.
+        int q = 0;
+        for (int r = 0; r < used; ++r)
+        {
+            if (placed[r])
             {
-                if (placed[r])
-                {
-                    continue;
-                }
-                while (hot[q] >= 0)
-                {
-                    ++q;
-                }
-                hot[q] = received[r];
+                continue;
             }
+            while (hot[q] >= 0)
+            {
+                ++q;
+            }
+            hot[q] = received[r];
         }
     }
-    return Warp::ballot(overBudget) ? PlanStatus::kOverBudget : PlanStatus::kOk;
+    // Other lanes read this row in writeBroadcastTables.
+    Warp::sync();
 }
 
 //! Distinct moved experts in ascending order, one broadcast each. Returns the broadcast count.
@@ -484,7 +433,7 @@ TLLM_HALO_R_HOST_DEVICE inline int collectBroadcastExperts(int moves, PlannerScr
 {
     int const lane = Warp::lane();
     int broadcasts = 0;
-    for (int base = 0; base < kMaxBroadcasts; base += 32)
+    for (int base = 0; base < kMaxHaloRBroadcasts; base += 32)
     {
         int const m = base + lane;
         bool first = false;
@@ -570,12 +519,12 @@ TLLM_HALO_R_HOST_DEVICE inline void writeBroadcastTables(int const* histogram, P
             highMask |= static_cast<unsigned>((slot >> 1) & 1) << destination;
         }
         quota[b * cfg.ep + owner] = histogram[expert] - rows;
-        planField(plan, PlanField::kExpert)[b] = expert;
-        planField(plan, PlanField::kOwner)[b] = owner;
-        planField(plan, PlanField::kDestinationMask)[b] = static_cast<int>(destinationMask);
-        planField(plan, PlanField::kHelperLowMask)[b] = static_cast<int>(lowMask);
-        planField(plan, PlanField::kRows)[b] = rows;
-        planField(plan, PlanField::kHelperHighMask)[b] = static_cast<int>(highMask);
+        planField(plan, HaloRPlanField::kExpert)[b] = expert;
+        planField(plan, HaloRPlanField::kOwner)[b] = owner;
+        planField(plan, HaloRPlanField::kDestinationMask)[b] = static_cast<int>(destinationMask);
+        planField(plan, HaloRPlanField::kHelperLowMask)[b] = static_cast<int>(lowMask);
+        planField(plan, HaloRPlanField::kRows)[b] = rows;
+        planField(plan, HaloRPlanField::kHelperHighMask)[b] = static_cast<int>(highMask);
     }
     if (lane == 0)
     {
@@ -585,17 +534,11 @@ TLLM_HALO_R_HOST_DEVICE inline void writeBroadcastTables(int const* histogram, P
 
 //! Plan one layer from the global routed-token histogram and, optionally, the residency table [rank][helper slot] of
 //! the layer's helper slots (`resident`, -1 for unknown), which only decides which helper slot receives an expert.
-//! Called by all 32 lanes of one warp; returns a warp-uniform status. On a non-OK status the plan and outputs are
-//! unspecified. A valid configuration always plans: the receiver ballot excludes kNoDestination and kOverBudget, and
-//! each move fills one of at most kMaxRanks * kMaxHelperSlots receive slots, which excludes kIterationCap.
+//! Called by all 32 lanes of one warp, with a configuration that validPlannerConfig accepts (the caller checks it).
 template <typename Warp>
-TLLM_HALO_R_HOST_DEVICE inline PlanStatus planHaloR(int const* histogram, PlannerConfig const& cfg, PlannerScratch* s,
+TLLM_HALO_R_HOST_DEVICE inline void planHaloR(int const* histogram, PlannerConfig const& cfg, PlannerScratch* s,
     PlannerOutputs const& out, int const* resident = nullptr)
 {
-    if (!validPlannerConfig(cfg))
-    {
-        return PlanStatus::kBadConfig;
-    }
     int const lane = Warp::lane();
     int const myLoad = prepareRankLoads<Warp>(histogram, cfg, s);
     int const total = Warp::reduceAdd(lane < cfg.ep ? myLoad : 0);
@@ -604,21 +547,8 @@ TLLM_HALO_R_HOST_DEVICE inline PlanStatus planHaloR(int const* histogram, Planne
 
     int exports = 0;
     int moves = 0;
-    int iterations = 0;
-    PlanStatus status = runGreedyMoves<Warp>(histogram, cfg, target, s, &exports, &moves, &iterations);
-    if (out.iterations != nullptr && lane == 0)
-    {
-        *out.iterations = iterations;
-    }
-    if (status != PlanStatus::kOk)
-    {
-        return status;
-    }
-    status = buildHelperTable<Warp>(cfg, moves, resident, s);
-    if (status != PlanStatus::kOk)
-    {
-        return status;
-    }
+    runGreedyMoves<Warp>(histogram, cfg, target, s, &exports, &moves);
+    buildHelperTable<Warp>(cfg, moves, resident, s);
     int const broadcasts = collectBroadcastExperts<Warp>(moves, s);
     writeBroadcastTables<Warp>(histogram, cfg, moves, broadcasts, s, out.plan, out.quota);
 
@@ -644,7 +574,6 @@ TLLM_HALO_R_HOST_DEVICE inline PlanStatus planHaloR(int const* histogram, Planne
         out.outOwners[lane] = expert >= 0 ? expert / home : -1;
     }
     Warp::sync();
-    return PlanStatus::kOk;
 }
 
 } // namespace halo_r

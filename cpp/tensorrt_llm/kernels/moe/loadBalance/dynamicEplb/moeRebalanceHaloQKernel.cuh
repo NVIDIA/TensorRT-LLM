@@ -1613,11 +1613,19 @@ __device__ void pre_materialize_and_compact_worker_routes(int const* routes, int
         shared[warp * bins + experts] = hot_count;
 }
 
-/* The final epoch only has to resolve selected routes.  Stable ordinal
- * cursors remain in the per-warp shared histogram from the initial pass. */
-__device__ void materialize_worker_hot_routes(int const* routes, int* output, int const* route_prefix, int const* plan,
-    int* route_aux, int* status, int route_count, int ep, int experts, int helpers, int worker, int workers,
-    Epoch epoch)
+/* The final epoch only has to resolve the selected routes that
+ * pre_materialize_and_compact_worker_routes compacted into route_aux.  Stable
+ * ordinal cursors remain in the per-warp shared histogram from the initial
+ * pass.  slotOf(b, expert, destination, slot) sets the slot of a route of
+ * broadcast b that the route prefix assigned to destination and returns true,
+ * or returns false when the plan gives destination no slot for b, after
+ * setting slot to anything; such a route records unmappedStatus and keeps
+ * the value slotOf left.  HALO-Q and HALO-R share
+ * this pass and differ only in slotOf. */
+template <typename SlotOf>
+__device__ __forceinline__ void materializeCompactedSelectedRoutes(int const* routes, int* output,
+    int const* route_prefix, int* route_aux, int* unmappedStatus, int route_count, int ep, int experts, int worker,
+    int workers, Epoch epoch, SlotOf const& slotOf)
 {
     extern __shared__ int shared[];
     int const lane = threadIdx.x & 31;
@@ -1626,12 +1634,6 @@ __device__ void materialize_worker_hot_routes(int const* routes, int* output, in
     int const bins = experts + 1;
     int* expert_lut = worker_expert_lut(experts);
     int* hot_indices = route_aux + 2 + workers * bins;
-    int const home = experts / ep;
-    int const local_slots = home + helpers;
-    int const* p_begin = plan + 2 + kPlanGroupBegin * kMaxBroadcasts;
-    int const* p_size = plan + 2 + kPlanGroupSize * kMaxBroadcasts;
-    int const* p_owner = plan + 2 + kPlanOwner * kMaxBroadcasts;
-    int const* p_helper = plan + 2 + kPlanHelper * kMaxBroadcasts;
 
     int const worker_span = (route_count + workers - 1) / workers;
     int const worker_begin = worker * worker_span;
@@ -1667,26 +1669,59 @@ __device__ void materialize_worker_hot_routes(int const* routes, int* output, in
         for (int step = 0; step < kHotBatch; ++step)
         {
             if (index[step] < 0)
+            {
                 continue;
+            }
             int b = expert_lut[expert[step]];
             int const* prefix = route_prefix + b * (ep + 1);
             int destination = route_destination(prefix, ordinal[step] + shared[warp * bins + expert[step]], ep);
             int slot = -1;
-            if (group_contains(destination, p_begin[b], p_size[b]))
+            if (!slotOf(b, expert[step], destination, slot))
             {
-                slot = destination * local_slots + home + p_helper[b];
-            }
-            else if (destination == p_owner[b])
-            {
-                slot = destination * local_slots + expert[step] - p_owner[b] * home;
-            }
-            else
-            {
-                record_status(status + 5, epoch);
+                record_status(unmappedStatus, epoch);
             }
             output[index[step]] = slot;
         }
     }
+}
+
+/* HALO-Q's slot of a selected route: the destination's helper slot when the
+ * destination is in the broadcast's team, else the owner's home slot. */
+struct HaloQSelectedRouteSlot
+{
+    int const* p_begin;
+    int const* p_size;
+    int const* p_owner;
+    int const* p_helper;
+    int home;
+    int local_slots;
+
+    __device__ __forceinline__ bool operator()(int b, int expert, int destination, int& slot) const
+    {
+        if (group_contains(destination, p_begin[b], p_size[b]))
+        {
+            slot = destination * local_slots + home + p_helper[b];
+            return true;
+        }
+        if (destination == p_owner[b])
+        {
+            slot = destination * local_slots + expert - p_owner[b] * home;
+            return true;
+        }
+        return false;
+    }
+};
+
+__device__ void materialize_worker_hot_routes(int const* routes, int* output, int const* route_prefix, int const* plan,
+    int* route_aux, int* status, int route_count, int ep, int experts, int helpers, int worker, int workers,
+    Epoch epoch)
+{
+    int const home = experts / ep;
+    HaloQSelectedRouteSlot const slotOf{plan + 2 + kPlanGroupBegin * kMaxBroadcasts,
+        plan + 2 + kPlanGroupSize * kMaxBroadcasts, plan + 2 + kPlanOwner * kMaxBroadcasts,
+        plan + 2 + kPlanHelper * kMaxBroadcasts, home, home + helpers};
+    materializeCompactedSelectedRoutes(
+        routes, output, route_prefix, route_aux, status + 5, route_count, ep, experts, worker, workers, epoch, slotOf);
 }
 
 __device__ void materialize_worker_routes(int const* routes, int* output, int const* route_prefix, int const* plan,

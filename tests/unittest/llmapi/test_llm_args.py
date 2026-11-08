@@ -391,32 +391,44 @@ class TestMoeConfigPerLayerDynamicEplb:
     # The planner rejection tests build the config directly: MoeConfig
     # re-raises a load-balancer error with only the input dictionary in its
     # message, which would hide the reason these tests check.
-    @pytest.mark.parametrize("planner, auxiliary_sms, valid", [
-        pytest.param("halo_q", 0, False, id="halo-q-0"),
-        pytest.param("halo_q", 1, True, id="halo-q-1"),
-        pytest.param("halo_q", 4, True, id="halo-q-4"),
-        pytest.param("halo_q", 8, True, id="halo-q-8"),
-        pytest.param("halo_q", 9, False, id="halo-q-9"),
-        pytest.param("halo_q", 16, False, id="halo-q-16"),
-        pytest.param("halo_r", 0, False, id="halo-r-0"),
-        pytest.param("halo_r", 2, True, id="halo-r-2"),
-        pytest.param("halo_r", 4, True, id="halo-r-4"),
-        pytest.param("halo_r", 12, True, id="halo-r-12"),
-        pytest.param("halo_r", 16, True, id="halo-r-16"),
-        pytest.param("halo_r", 17, False, id="halo-r-17"),
+    _AT_LEAST_1 = "Input should be greater than or equal to 1"
+    _AT_MOST_16 = "Input should be less than or equal to 16"
+
+    @pytest.mark.parametrize("planner, auxiliary_sms, error", [
+        pytest.param("halo_q", 0, _AT_LEAST_1, id="halo-q-0"),
+        pytest.param("halo_q", 1, None, id="halo-q-1"),
+        pytest.param("halo_q", 4, None, id="halo-q-4"),
+        pytest.param("halo_q", 8, None, id="halo-q-8"),
+        pytest.param(
+            "halo_q",
+            9,
+            "`planner: halo_q` supports `auxiliary_sms` up to 8; got 9.",
+            id="halo-q-9"),
+        pytest.param(
+            "halo_q",
+            16,
+            "`planner: halo_q` supports `auxiliary_sms` up to 8; got 16.",
+            id="halo-q-16"),
+        pytest.param("halo_r", 0, _AT_LEAST_1, id="halo-r-0"),
+        pytest.param("halo_r", 2, None, id="halo-r-2"),
+        pytest.param("halo_r", 4, None, id="halo-r-4"),
+        pytest.param("halo_r", 12, None, id="halo-r-12"),
+        pytest.param("halo_r", 16, None, id="halo-r-16"),
+        pytest.param("halo_r", 17, _AT_MOST_16, id="halo-r-17"),
     ])
     def test_auxiliary_sm_limit_follows_the_planner(self, planner: str,
                                                     auxiliary_sms: int,
-                                                    valid: bool) -> None:
+                                                    error: str | None) -> None:
         values = self._per_layer_dynamic()
         values.update(planner=planner,
                       helper_slot_mode="shared_banks",
                       auxiliary_sms=auxiliary_sms)
-        if valid:
+        if error is None:
             config = MoePerLayerDynamicLoadBalancerConfig(**values)
             assert config.auxiliary_sms == auxiliary_sms
         else:
-            with pytest.raises(ValidationError, match="auxiliary_sms"):
+            # The full reason, not the field name that pydantic echoes with any input.
+            with pytest.raises(ValidationError, match=re.escape(error)):
                 MoePerLayerDynamicLoadBalancerConfig(**values)
 
     def test_halo_r_requires_two_auxiliary_sms(self) -> None:

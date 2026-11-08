@@ -73,7 +73,6 @@ def plan_halo_r(
     ep: int,
     helper_slots: int,
     send_count: int,
-    send_weight: int = 0,
     residency: Sequence[Sequence[int]] | None = None,
 ) -> Plan:
     """Plan one layer from the global routed-token count of every expert.
@@ -101,12 +100,8 @@ def plan_halo_r(
         keys = [
             (room[rank] << LANE_BITS) | (31 - rank) if eligible[rank] else 0 for rank in range(ep)
         ]
-        best_key = max(keys)
-        best_rank = 31 - (best_key & 31) if best_key else -1
-        second_key = max(0 if rank == best_rank else keys[rank] for rank in range(ep))
-
-        def room_excluding(rank: int) -> int:
-            return (second_key if rank == best_rank else best_key) >> LANE_BITS
+        # A candidate's owner is overloaded, so never eligible: no candidate excludes the best receiver.
+        best_room = max(keys) >> LANE_BITS
 
         winner_key, winner = 0, None
         for index, (expert, remaining) in enumerate(exports):
@@ -114,10 +109,10 @@ def plan_halo_r(
             excess = load[owner] - target
             if remaining <= 0 or excess <= 0:
                 continue
-            rows = min(room_excluding(owner), remaining, excess)
+            rows = min(best_room, remaining, excess)
             if rows <= 0:
                 continue
-            key = ((rows * (1 + send_weight)) << ORDER_BITS) | (ORDER_MAX - index)
+            key = (rows << ORDER_BITS) | (ORDER_MAX - index)
             if key > winner_key:
                 winner_key, winner = key, (expert, owner, rows, index, False)
         for rank in range(ep):
@@ -127,7 +122,7 @@ def plan_halo_r(
             expert = rank * home + hottest[rank][sent[rank]]
             if histogram[expert] <= 0:
                 continue
-            rows = min(room_excluding(rank), histogram[expert], excess)
+            rows = min(best_room, histogram[expert], excess)
             if rows <= 0:
                 continue
             key = (rows << ORDER_BITS) | (ORDER_MAX - (ORDER_OPEN + rank))

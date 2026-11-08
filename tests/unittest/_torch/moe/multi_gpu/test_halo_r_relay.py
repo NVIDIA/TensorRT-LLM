@@ -30,12 +30,17 @@ After the launches since the previous check, every rank compares:
 before the route release, a READY cell that never arrives, or a CTA that
 cannot become resident. The failing rank must trap in that call, and its
 peers in that call or the next, at their wait for it. These cases fault
-every GPU of the node on purpose, so the CI test lists do not run them.
+every GPU of the node on purpose, so they run only when HALO_R_TEST_TRAPS=1;
+a directory-level test list entry skips them.
 
 The ranks run on one node through an MPIPoolExecutor, or on any number of
 nodes under ``trtllm-llmapi-launch`` through the MPI session it serves.
 HALO_R_TEST_EP sets the EP size (default 4) and HALO_R_TEST_SEEDS the number
-of seeds per case (default 1).
+of seeds per case (default 1). On an SM100-family GPU with CUDA 13.1 or
+later, a build without the HALO-R kernels fails every case instead of
+skipping it; HALO_R_TEST_ALLOW_SKIP=1 makes it skip. HALO_R_TEST_NO_SKIP=1
+turns every skip (too few GPUs, no MNNVL, a case built for another EP size)
+into a failure, for runs that must exercise every case.
 """
 
 import ctypes
@@ -143,9 +148,27 @@ def _routes(step: int, rank: int, num_tokens: int, experts: int, device: int) ->
 
 
 def _uniform_routes(rank: int, num_tokens: int, experts: int, device: int) -> torch.Tensor:
-    """Every expert gets the same routed-token count on every rank, so the plan moves nothing."""
-    rows = [[(token * _TOPK + k) % experts for k in range(_TOPK)] for token in range(num_tokens)]
-    return torch.tensor(rows, dtype=torch.int32, device=f"cuda:{device}").reshape(-1, _TOPK)
+    """Every rank owns the same routed-token count summed over all ranks, so the plan moves nothing.
+
+    Rank ``rank`` sends its i-th route to owner ``(i + rank) % ep``: over all
+    ranks, each owner receives ``num_tokens * topk`` routes, for any EP size.
+    A token's routes go to consecutive owners, so they are distinct experts.
+    """
+    ep = experts // _HOME_EXPERTS
+    flat = [
+        ((i + rank) % ep) * _HOME_EXPERTS + (i // ep) % _HOME_EXPERTS
+        for i in range(num_tokens * _TOPK)
+    ]
+    return torch.tensor(flat, dtype=torch.int32, device=f"cuda:{device}").reshape(-1, _TOPK)
+
+
+def _any_rank(failures: list) -> bool:
+    """Whether any rank has failed, so that every rank leaves a step loop together.
+
+    A rank that left alone would leave its peers in the next step's count
+    exchange, and a real mismatch would show up as their trap instead.
+    """
+    return MPI.COMM_WORLD.allreduce(bool(failures), op=MPI.LOR)
 
 
 _KERNEL_SOURCE = r"""
@@ -332,11 +355,6 @@ def _init_process_group(rank: int, world: int) -> None:
 def _skip_reason() -> str | None:
     if torch.cuda.get_device_capability()[0] != 10:
         return "HALO-R requires an SM100-family GPU"
-    # Resolve the op namespace by name: this module is pickled by value into
-    # the workers, and a direct `torch.ops` reference would make cloudpickle
-    # try to serialize torch's op-namespace object.
-    if not hasattr(getattr(getattr(torch, "ops"), "trtllm"), "moe_rebalance_halo_r_create"):
-        return "HALO-R ops are not built"
     MnnvlMemory.initialize()
     if not MnnvlMemory.supports_mnnvl():
         return "HALO-R requires an NVLink fabric with multicast"
@@ -345,6 +363,13 @@ def _skip_reason() -> str | None:
 
 # A build without the SM100 + CUDA 13.1 kernels registers the ops but throws on use.
 _PLACEHOLDER_MESSAGE = "HALO-R requires CUDA 13.1+"
+# A skip reason that means this GPU and CUDA should run HALO-R but the build cannot.
+_BUILD_SKIP = "the build has no HALO-R kernels: "
+
+
+def _cuda_at_least(major: int, minor: int) -> bool:
+    version = torch.version.cuda or "0.0"
+    return tuple(int(part) for part in version.split(".")[:2]) >= (major, minor)
 
 
 class _Layers:
@@ -564,7 +589,7 @@ class _Layers:
         histogram = [sum(c) for c in zip(*MPI.COMM_WORLD.allgather(counts))]
         table = self.tables[layer]
         plan = halo_r_reference.plan_halo_r(
-            histogram, self.ep, _HELPER_SLOTS, send_count=4, send_weight=0, residency=table
+            histogram, self.ep, _HELPER_SLOTS, send_count=4, residency=table
         )
         copies = 0
         for b in plan.broadcasts:
@@ -812,7 +837,7 @@ def _case_resident_sequence(layers: _Layers) -> list:
         routes = layers.routes(step, tokens)
         layers.call(0, routes, main)
         failures += layers.check(0, routes)
-        if failures:
+        if _any_rank(failures):
             break
     if layers.receiver_skips[0] == 0:
         failures.append(f"rank {rank}: no receiver was ever skipped")
@@ -842,11 +867,12 @@ def _case_resident_reload(layers: _Layers) -> list:
 
 
 def _case_shared_banks(layers: _Layers) -> list:
-    """Shared banks keep no table and copy every receiver every time."""
-    failures = _case_alternating_layers(layers)
-    if any(layers.receiver_skips):
-        failures.append(f"rank {layers.rank}: shared banks skipped receivers")
-    return failures
+    """Shared banks keep no table and copy every receiver every time.
+
+    check() compares the kernel's receiver-skip counter with the model's,
+    which never skips without a table.
+    """
+    return _case_alternating_layers(layers)
 
 
 def _case_stable_slot(layers: _Layers) -> list:
@@ -1025,8 +1051,17 @@ def _case_graphs_interleaved(layers: _Layers) -> list:
     streams = layers.eager
     # Replays run on the group's current MAIN, as the runner replays on the
     # execution stream that its eager calls use; only eager calls change MAIN.
+    # MAIN is still the capture stream, so an eager call first makes it
+    # streams[0]: a replay there before it would not be fenced from the next
+    # eager call, whatever the seed.
     main = 0
     replays = 0
+    first = layers.routes(999, layers.max_tokens)
+    with torch.cuda.stream(streams[main]):
+        layers.layer_call(0, first)
+    torch.cuda.synchronize()
+    MPI.COMM_WORLD.Barrier()
+    failures += layers.check(0, [first])
     for step in range(200):
         launches = []
         for _ in range(1 + rng.randrange(3)):
@@ -1046,7 +1081,7 @@ def _case_graphs_interleaved(layers: _Layers) -> list:
         torch.cuda.synchronize()
         MPI.COMM_WORLD.Barrier()
         failures += layers.check(0, launches)
-        if failures:
+        if _any_rank(failures):
             break
     failures += _replay_counts(layers, replays=replays)
     graph.reset()
@@ -1328,7 +1363,7 @@ def _case_graphs_serialized(layers: _Layers) -> list:
         MPI.COMM_WORLD.Barrier()
         for layer in range(count):
             failures += layers.check(layer, routes[layer])
-        if failures:
+        if _any_rank(failures):
             break
     _driver_call(driver.cuGraphExecDestroy(executable))
     _driver_call(driver.cuGraphDestroy(clone))
@@ -1481,7 +1516,8 @@ def _run_worker(case: str):
         except RuntimeError as error:
             # Every rank reaches the native context creation together, so every rank skips.
             if _PLACEHOLDER_MESSAGE in str(error):
-                return f"placeholder build: {error}", []
+                prefix = _BUILD_SKIP if _cuda_at_least(13, 1) else "placeholder build: "
+                return f"{prefix}{error}", []
             raise
         try:
             return None, function(layers)
@@ -1521,10 +1557,10 @@ def _run_on_every_rank(monkeypatch, case: str) -> list:
             names = {"worker": cloudpickle.dumps(_run_worker), "case": case}
             return client.submit_sync(eval, expression, names)  # nosec B307
         if torch.cuda.device_count() < _EP_SIZE:
-            pytest.skip(f"Requires {_EP_SIZE} GPUs, or trtllm-llmapi-launch across nodes")
-        # Per-layer dynamic EPLB needs the larger launch queues from CUDA initialization on.
-        monkeypatch.setenv("CUDA_SCALE_LAUNCH_QUEUES", "4x")
-        with MPIPoolExecutor(_EP_SIZE) as executor:
+            _skip(f"Requires {_EP_SIZE} GPUs, or trtllm-llmapi-launch across nodes")
+        # Per-layer dynamic EPLB needs the larger launch queues from CUDA initialization on;
+        # the workers get them explicitly rather than by inheriting this process's environment.
+        with MPIPoolExecutor(_EP_SIZE, env={"CUDA_SCALE_LAUNCH_QUEUES": "4x"}) as executor:
             return list(executor.map(_run_worker, [case] * _EP_SIZE))
     finally:
         faulthandler.cancel_dump_traceback_later()
@@ -1533,7 +1569,16 @@ def _run_on_every_rank(monkeypatch, case: str) -> list:
 def _skip_if_any(results: list) -> None:
     skips = {skip for skip, _ in results if skip}
     if skips:
-        pytest.skip("; ".join(sorted(skips)))
+        _skip("; ".join(sorted(skips)))
+
+
+def _skip(reason: str) -> None:
+    if os.environ.get("HALO_R_TEST_NO_SKIP") == "1":
+        pytest.fail(f"HALO_R_TEST_NO_SKIP=1 but the case would skip: {reason}")
+    if _BUILD_SKIP in reason and os.environ.get("HALO_R_TEST_ALLOW_SKIP") != "1":
+        # On SM100 with CUDA 13.1+, a placeholder build is a broken build, not a reason to skip.
+        pytest.fail(f"{reason} (set HALO_R_TEST_ALLOW_SKIP=1 to skip)")
+    pytest.skip(reason)
 
 
 @pytest.mark.parametrize("case", [case for case in _CASES if not case.startswith("trap_")])
@@ -1544,6 +1589,10 @@ def test_halo_r(monkeypatch, case) -> None:
     assert not failures, "\n".join(failures[:20])
 
 
+@pytest.mark.skipif(
+    os.environ.get("HALO_R_TEST_TRAPS") != "1",
+    reason="faults every GPU of the node; set HALO_R_TEST_TRAPS=1 to run",
+)
 @pytest.mark.parametrize("kind", _TRAPS)
 def test_halo_r_traps(monkeypatch, kind) -> None:
     """A broken launch on rank 0 traps it in that call; every peer traps in that call or the next."""

@@ -1969,6 +1969,48 @@ _HALO_R_DEFAULT_AUXILIARY_SMS = _HALO_R_MAX_AUXILIARY_SMS
 # HALO-Q's in-switch TMA copy runs on at most 8 SMs.
 _HALO_Q_MAX_AUXILIARY_SMS = 8
 
+_PER_LAYER_DYNAMIC_EPLB = "tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb"
+
+
+@dataclass(frozen=True)
+class _PerLayerDynamicPlanner:
+    """What one per-layer dynamic EPLB replica planner supports.
+
+    ``_PER_LAYER_DYNAMIC_PLANNERS`` is the one place that maps a ``planner``
+    value to its scheduler group and capabilities; the load balancer, its
+    layers and the ``TorchLlmArgs`` validator read it.
+
+    Attributes:
+        group_builder: ``module:function`` that builds one layer's scheduler
+            group from its manager's resources.
+        helper_multicast: Whether its copy stores through NVLink multicast
+            objects bound to the helper sets.
+        breakable_prefill_cuda_graphs: Whether breakable prefill CUDA graphs
+            can capture its layer calls.
+    """
+
+    group_builder: str
+    helper_multicast: bool
+    breakable_prefill_cuda_graphs: bool
+
+
+_PER_LAYER_DYNAMIC_PLANNERS: Dict[str, _PerLayerDynamicPlanner] = {
+    "halo_q":
+    _PerLayerDynamicPlanner(
+        group_builder=
+        f"{_PER_LAYER_DYNAMIC_EPLB}.planner:build_rebalance_slot_scheduler_group",
+        helper_multicast=True,
+        breakable_prefill_cuda_graphs=False,
+    ),
+    "halo_r":
+    _PerLayerDynamicPlanner(
+        group_builder=
+        f"{_PER_LAYER_DYNAMIC_EPLB}.halo_r_planner:build_halo_r_slot_scheduler_group",
+        helper_multicast=False,
+        breakable_prefill_cuda_graphs=True,
+    ),
+}
+
 
 class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
     """Configure per-layer dynamic EPLB with HALO-Q or HALO-R scheduling."""
@@ -8332,16 +8374,18 @@ class TorchLlmArgs(BaseLlmArgs):
     def validate_per_layer_dynamic_eplb_cuda_graph(self) -> 'TorchLlmArgs':
         """Restrict CUDA graphs with per-layer dynamic EPLB.
 
-        Only the HALO-R planner hands the device constant values in every
-        layer call, so only it can be captured, and only in breakable prefill
-        graphs, whose eager breaks leave the MoE layers in captured segments.
+        Only a planner that hands the device constant values in every layer
+        call (HALO-R) can be captured, and only in breakable prefill graphs,
+        whose eager breaks leave the MoE layers in captured segments.
         """
         load_balancer = self.moe_config.load_balancer
         if getattr(load_balancer, "mode", None) != "per_layer_dynamic":
             return self
         if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED:
-            capturable = (getattr(load_balancer, "planner", "halo_q")
-                          == "halo_r" and self.prefill_cuda_graph_backend
+            planner = _PER_LAYER_DYNAMIC_PLANNERS[getattr(
+                load_balancer, "planner", "halo_q")]
+            capturable = (planner.breakable_prefill_cuda_graphs
+                          and self.prefill_cuda_graph_backend
                           == PrefillCudaGraphBackend.BREAKABLE)
             if not capturable:
                 raise ValueError(

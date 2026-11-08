@@ -29,6 +29,12 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
+//! Supported geometry of the HALO-R kernel: EP sizes from kHaloRMinEp (the planner covers up to halo_r::kMaxRanks),
+//! and from kHaloRMinCtas CTAs (CTA 0 plans while the others map routes) to kHaloRMaxCtas.
+constexpr int kHaloRMinEp = 2;
+constexpr int kHaloRMinCtas = 2;
+constexpr int kHaloRMaxCtas = 128;
+
 //! Status words of the HALO-R kernel. Each word holds the epoch of its most recent failure, or 0. A launch traps
 //! before it releases any route once any word is nonzero, so a nonzero word never outlives the launch that set it.
 enum MoeRebalanceHaloRStatus : int
@@ -38,12 +44,11 @@ enum MoeRebalanceHaloRStatus : int
     kHaloRStatusPlanWaitTimeout = 2,
     kHaloRStatusInvalidRoute = 3,
     kHaloRStatusSlotOutsideMask = 5,
-    kHaloRStatusPlanner = 6,
-    //! Words of the status buffer, the CUDA scheduler's: the words above and two unused ones.
+    //! Words of the status buffer, the CUDA scheduler's: the words above and three unused ones.
     kHaloRStatusWords = 8,
 };
 
-//! Diagnostic counters of one layer, int64 each; read only by tests and at teardown.
+//! Diagnostic counters of one layer, int64 each; read only by tests.
 enum MoeRebalanceHaloRCounter : int
 {
     kHaloRCounterLaunches = 0,       //!< Launches of the layer's kernel, eager and replayed.
@@ -67,12 +72,14 @@ enum MoeRebalanceHaloRCounter : int
 //!   4. Completion. The last CTA to finish its copies records the plan's helper experts in the residency table and
 //!      publishes `readyValue` into this rank's READY cell on every rank.
 //!
-//! Any failure traps before the failing CTA releases its routes, so a consumer never reads routes of a failed launch
-//! and no READY is published for it.
+//! A failure before the route release traps before the failing CTA releases its routes, so a consumer never reads
+//! routes of a failed launch. A failure after it, in the relay or at completion, traps before READY, so no READY is
+//! published for the launch.
 //!
 //! READY and the route counter take constant values, so that a captured launch replays without host bookkeeping:
-//! every launch publishes READY 1 and, from its second epoch on, first waits for every rank's previous READY in this
-//! rank's row and zeroes it; the route consumer waits for the counter to reach `ctas` and then resets it to 0.
+//! every launch publishes READY 1 and first waits for every rank's previous READY in this rank's row and zeroes it.
+//! The caller must therefore fill the row with 1 before the first launch, as a previous launch would leave it. The
+//! route consumer waits for the counter to reach `ctas` and then resets it to 0.
 struct MoeRebalanceHaloRParams
 {
     int const* routes;                //!< [validRouteCount] global logical expert ids, -1 for padding.
@@ -104,7 +111,6 @@ struct MoeRebalanceHaloRParams
     int experts;
     int helpers;
     int sendCount;
-    int sendWeight;
     int localRank;
     int routeCapacity;
     int validRouteCount;
@@ -125,7 +131,7 @@ struct MoeRebalanceHaloRLaunch
 std::int64_t getMoeRebalanceHaloRRouteAuxEntries(int experts, int ctas, int routeCapacity);
 
 //! Throws unless the bound arguments of `params` describe a geometry the kernel supports. Routes, the valid route
-//! count, the spin bound and the READY value are per launch and not checked.
+//! count and the spin bound are per launch and not checked.
 void checkMoeRebalanceHaloRParams(MoeRebalanceHaloRParams const& params, int ctas);
 
 //! Loads the fused kernel on the current device, reserves its local memory and sizes its shared memory, so that the

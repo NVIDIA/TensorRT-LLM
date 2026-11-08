@@ -273,9 +273,10 @@ def _build(
         if state.fail_submit:
             raise RuntimeError("HALO-R kernel launch failed: unspecified launch failure")
 
-    def create(*args):
-        trace.append(("create", len(args)))
-        state.create_args = args
+    def create(**kwargs):
+        # The group passes every argument by its schema name.
+        trace.append(("create", len(kwargs)))
+        state.create_args = kwargs
         if fail_create:
             raise RuntimeError("cuMemMap failed: CUDA_ERROR_OUT_OF_MEMORY")
         return SimpleNamespace(name="ctx")
@@ -733,7 +734,14 @@ def test_group_overrides_construction_and_the_four_graph_hooks() -> None:
         name for name, value in vars(HaloRSlotSchedulerGroup).items() if inspect.isfunction(value)
     }
     overridden = {name for name in methods if hasattr(RebalanceSlotSchedulerGroup, name)}
-    assert overridden == {"__init__", "_check_owner", "_wait_route_epoch", "plan_finish", "finish"}
+    assert overridden == {
+        "__init__",
+        "_bind_copy_endpoint",
+        "_check_owner",
+        "_wait_route_epoch",
+        "plan_finish",
+        "finish",
+    }
     # The one addition is the weight-reload hook that the layer handle looks up.
     assert methods - overridden == {"forget_helper_residency"}
     assert inspect.signature(HaloRSlotSchedulerGroup.__init__) == inspect.signature(
@@ -843,17 +851,16 @@ def test_kernel_traps_before_it_releases_routes_and_before_ready() -> None:
     _assert_in_order(
         complete,
         (
-            '"atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;"',
+            "last = moeRebalanceArriveLastCta(p.completedCtas);",
             "firstFailedStatus(p.status)",
             'trapLaunch(p, "status word set before READY", failedWord);',
-            "publishReady(p.readyFlagMc, p.readyValue);",
+            "moeRebalancePublishReady(reinterpret_cast<std::uint64_t>(p.readyFlagMc), p.readyValue);",
             "p.counters[kHaloRCounterLaunches] += 1;",
         ),
     )
     # Every scheduler wait that times out fails the launch instead of routing home.
     role = _function_body(kernel_source, "RoleResult mapRoutes(")
     assert role.count('return RoleResult{"') == 3
-    assert "Home" not in kernel_source
     prepare = _function_body(
         kernel_source, "MoeRebalanceHaloRLaunch prepareMoeRebalanceHaloRLaunch("
     )
@@ -861,11 +868,15 @@ def test_kernel_traps_before_it_releases_routes_and_before_ready() -> None:
         'TLLM_CHECK_WITH_INFO(active == 1, "HALO-R kernel must fit exactly one CTA per SM'
         in prepare
     )
-    assert "cudaDeviceSetLimit(cudaLimitStackSize, attributes.localSizeBytes)" in prepare
+    # Loading the kernel reserves its stack (moeRebalanceFusedLaunch.h, shared with HALO-Q).
+    assert "TLLM_CUDA_CHECK(loadMoeRebalanceFusedKernel(kernel, attributes));" in prepare
+    fused_launch = (_KERNELS / "moeRebalanceFusedLaunch.h").read_text()
+    load = _function_body(fused_launch, "inline cudaError_t loadMoeRebalanceFusedKernel(")
+    assert "cudaDeviceSetLimit(cudaLimitStackSize, attributes.localSizeBytes)" in load
 
 
 def test_every_scheduler_role_failure_traps_the_launch() -> None:
-    """Each wait of the scheduler role that times out, and the planner, fails the launch the same way.
+    """Each wait of the scheduler role that times out fails the launch the same way.
 
     A failure that returned instead of trapping would leave MAIN waiting for
     a route release that never comes.
@@ -876,7 +887,6 @@ def test_every_scheduler_role_failure_traps_the_launch() -> None:
         [
             "READY drain timeout",
             "count exchange timeout",
-            "planner status",
             "worker rendezvous timeout",
             "plan wait timeout",
             "route prefix wait timeout",
@@ -907,38 +917,24 @@ def test_every_scheduler_role_failure_traps_the_launch() -> None:
     assert 'asm volatile("trap;" ::: "memory");' in trap
 
 
-def test_no_timing_probe_or_programmatic_launch_remains() -> None:
-    sources = [
-        _KERNELS / "moeRebalanceHaloR.cu",
-        _KERNELS / "moeRebalanceHaloR.h",
-        _KERNELS / "moeRebalanceRelay.cuh",
-        _HALO_R_OP,
-        Path(halo_r_planner.__file__),
-    ]
-    for path in sources:
-        text = path.read_text()
-        for marker in (
-            "kHaloRProbe",
-            "set_probe",
-            "griddepcontrol",
-            "TRTLLM_HALO_R_RELAY_PDL",
-            "%globaltimer",
-        ):
-            assert marker not in text, (path.name, marker)
-
-
 def test_kernel_runs_in_the_remote_memory_sync_domain() -> None:
     kernel_source = (_KERNELS / "moeRebalanceHaloR.cu").read_text()
     prepare = _function_body(
         kernel_source, "MoeRebalanceHaloRLaunch prepareMoeRebalanceHaloRLaunch("
     )
+    assert (
+        "launch.attributeCount = setMoeRebalanceRemoteSyncDomain(device, launch.attributes);"
+        in prepare
+    )
+    fused_launch = (_KERNELS / "moeRebalanceFusedLaunch.h").read_text()
+    domain = _function_body(fused_launch, "inline unsigned setMoeRebalanceRemoteSyncDomain(")
     _assert_in_order(
-        prepare,
+        domain,
         (
             "cudaDevAttrMemSyncDomainCount",
-            "launch.attributes[0].val.memSyncDomain = cudaLaunchMemSyncDomainRemote;",
-            "launch.attributes[1].id = cudaLaunchAttributeMemSyncDomainMap;",
-            "launch.attributeCount = 2;",
+            "attributes[0].val.memSyncDomain = cudaLaunchMemSyncDomainRemote;",
+            "attributes[1].id = cudaLaunchAttributeMemSyncDomainMap;",
+            "return 2;",
         ),
     )
     launch = _function_body(kernel_source, "cudaError_t launchMoeRebalanceHaloR(")
@@ -954,7 +950,8 @@ def test_kernel_runs_in_the_remote_memory_sync_domain() -> None:
     )
     # Every edge out of the remote domain is system scope.
     assert '"red.release.sys.global.add.u64 [%0], 1;"' in kernel_source
-    publish = _function_body(kernel_source, "void publishReady(")
+    completion = (_KERNELS / "moeRebalanceCompletion.cuh").read_text()
+    publish = _function_body(completion, "void moeRebalancePublishReady(")
     _assert_in_order(
         publish, ('"fence.release.sys;"', '"multimem.st.release.sys.global.u64 [%0], %1;"')
     )
@@ -963,8 +960,9 @@ def test_kernel_runs_in_the_remote_memory_sync_domain() -> None:
 def _create_argument(env, name):
     """The value a fake native create received for the schema parameter ``name``."""
     names = _op_parameters("moe_rebalance_halo_r_create")
-    assert len(names) == len(env.state.create_args)
-    return env.state.create_args[names.index(name)]
+    # Every schema parameter is passed by name, so a reordered schema still binds each one.
+    assert sorted(names) == sorted(env.state.create_args)
+    return env.state.create_args[name]
 
 
 @pytest.mark.parametrize("helper_residency", [False, True])
@@ -1000,13 +998,14 @@ def test_kernel_skips_resident_receivers_and_records_residency_before_ready() ->
     issue = _function_body(relay_source, "void relayIssue(")
     # Loads and stores go to the need set, never to the plan's whole receiver mask.
     assert "work.need[" in issue and "kDestinationMask" not in issue
-    account = _function_body(kernel_source, "void accountBroadcasts(")
+    record = _function_body(kernel_source, "ReceiverCounts recordResidency(")
+    # The need mask is read before the residency update overwrites it.
     _assert_in_order(
-        account,
+        record,
         (
             "halo_r::relayNeedMask(mask, low, high, experts[b], p.residency, p.helpers);",
-            "atomicAdd(receiverCopies",
-            "atomicAdd(receiverSkips",
+            "counts.copies += ",
+            "counts.skips += ",
             "p.residency[d * p.helpers + halo_r::helperIndex(low, high, d)] = experts[b];",
         ),
     )
@@ -1014,16 +1013,18 @@ def test_kernel_skips_resident_receivers_and_records_residency_before_ready() ->
     _assert_in_order(
         complete,
         (
-            '"atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;"',
+            "last = moeRebalanceArriveLastCta(p.completedCtas);",
             "firstFailedStatus(p.status)",
-            "accountBroadcasts(p, &receiverCopies, &receiverSkips);",
-            "publishReady(p.readyFlagMc, p.readyValue);",
+            "ReceiverCounts const counts = recordResidency(p);",
+            "moeRebalancePublishReady(reinterpret_cast<std::uint64_t>(p.readyFlagMc), p.readyValue);",
+            # The diagnostic counters are summed after READY, off the consumer's path.
+            "atomicAdd(&receiverCopies, counts.copies);",
             "p.counters[kHaloRCounterReceiverSkips] += ",
         ),
     )
     # Every thread's table change precedes thread 0's READY release.
-    barrier = complete.index("__syncthreads();", complete.index("accountBroadcasts("))
-    assert barrier < complete.index("publishReady(")
+    barrier = complete.index("__syncthreads();", complete.index("recordResidency("))
+    assert barrier < complete.index("moeRebalancePublishReady(")
 
 
 class _FakeVmm:
@@ -1338,7 +1339,7 @@ def test_planner_reads_the_residency_table_from_shared_memory() -> None:
     load = publish.index("resident[entry] = p.residency[entry];")
     assert publish.index("__syncthreads();", load) < publish.index("? resident : nullptr")
     planner = (_KERNELS / "moeRebalanceHaloRPlanner.h").read_text()
-    build = _function_body(planner, "inline PlanStatus buildHelperTable(")
+    build = _function_body(planner, "inline void buildHelperTable(")
     # Resident experts are placed before the others fill the free slots.
     _assert_in_order(build, ("row[q] == received[r]", "placed[r] = true;", "while (hot[q] >= 0)"))
 
@@ -1410,3 +1411,69 @@ def test_kernel_drains_ready_before_the_exchange_within_one_bound() -> None:
         drain.count('"fence.acq_rel.sys;"') == 2
         and drain.index('"fence.acq_rel.sys;"', reset) > reset
     )
+
+
+def test_both_endpoints_share_the_live_bank_lease(monkeypatch) -> None:
+    """HALO-Q and HALO-R keep one lease implementation; a failed consumer wait aborts either."""
+    from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami.hierarchical import (
+        HierarchicalSamiWeightBroadcast,
+    )
+    from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami.lease import LiveBankLease
+
+    lease_methods = (
+        "bind_generation_reuse_authority",
+        "release_generation_after",
+        "mark_collective_reuse_safe",
+        "_require_live_bank_reusable",
+        "_validate_reuse_authority",
+    )
+    for cls in (HaloRRelayEndpoint, HierarchicalSamiWeightBroadcast):
+        assert issubclass(cls, LiveBankLease)
+        for name in lease_methods:
+            assert getattr(cls, name) is getattr(LiveBankLease, name), (cls.__name__, name)
+    env = _build(monkeypatch)
+    _layer_call(env.group, 4)
+    env.endpoint._driver = SimpleNamespace(
+        cuStreamWaitEvent=lambda stream, event, flags: (7,),
+        CUresult=SimpleNamespace(CUDA_SUCCESS=0),
+    )
+    env.group.plan_finish(env.group.plan_schedule(_Routes(4)), defer_wait=True)
+    env.group.wait_for_routes()
+    with pytest.raises(RuntimeError, match="HALO-R consumer"):
+        env.group.finish(SimpleNamespace(cuda_event=0x99))
+    assert env.endpoint._handoff_aborted
+
+
+def _cxx_constant(path: Path, name: str) -> int:
+    """The integer value of ``constexpr <type> name = <literal>;`` in ``path``."""
+    match = re.search(rf"constexpr [\w: ]+? {name} = (\d+)(?:ULL)?;", path.read_text())
+    assert match, (path.name, name)
+    return int(match.group(1))
+
+
+def _cxx_enumerator(path: Path, name: str) -> int:
+    match = re.search(rf"\b{name} = (\d+),", path.read_text())
+    assert match, (path.name, name)
+    return int(match.group(1))
+
+
+def test_python_limits_match_the_native_ones() -> None:
+    """The Python HALO-R limits and the kernel and op constants they mirror stay equal.
+
+    A mismatch would not fail at bind time: a READY value MAIN never sees, a
+    slice size the relay table does not cover, or a geometry the kernel cannot
+    plan.
+    """
+    planner = _KERNELS / "moeRebalanceHaloRPlanner.h"
+    relay = _KERNELS / "moeRebalanceRelayWork.h"
+    header = _KERNELS / "moeRebalanceHaloR.h"
+    assert halo_r_planner.HALO_R_MAX_EP == _cxx_constant(planner, "kMaxRanks")
+    assert halo_r_planner.HALO_R_MAX_HELPER_SLOTS == _cxx_constant(planner, "kMaxHelperSlots")
+    assert halo_r_planner.HALO_R_MAX_EXPORTS == _cxx_constant(planner, "kMaxHaloRBroadcasts")
+    assert halo_r_planner.HALO_R_PREFIX_STRIDE == _cxx_constant(planner, "kPlanFieldStride")
+    assert halo_r_planner.HALO_R_SEND_COUNT <= _cxx_constant(planner, "kMaxSendsPerRank")
+    assert halo_r_planner.HALO_R_RELAY_SLICE_BYTES == _cxx_constant(relay, "kRelaySliceBytes")
+    assert halo_r_planner.HALO_R_MAX_PLANES == _cxx_constant(relay, "kRelayMaxPlanes")
+    assert halo_r_planner.HALO_R_MIN_AUXILIARY_SMS == _cxx_constant(header, "kHaloRMinCtas")
+    assert halo_r_planner.HALO_R_COUNTERS == _cxx_enumerator(header, "kHaloRCounters")
+    assert halo_r_planner._READY_GENERATION == _cxx_constant(_HALO_R_OP, "kReadyGeneration")

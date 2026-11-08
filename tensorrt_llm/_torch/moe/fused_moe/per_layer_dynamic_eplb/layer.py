@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import importlib
 import weakref
 from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
@@ -245,10 +246,8 @@ class PerLayerDynamicMoeLayerLoadBalancer:
             return
 
         backend_ref = weakref.ref(backend)
-        if self.manager.planner == "halo_r":
-            from .halo_r_planner import build_halo_r_slot_scheduler_group as build_scheduler_group
-        else:
-            from .planner import build_rebalance_slot_scheduler_group as build_scheduler_group
+        module_name, _, function_name = self.manager.planner_spec.group_builder.partition(":")
+        build_scheduler_group = getattr(importlib.import_module(module_name), function_name)
 
         if bool(getattr(backend, "tactic_autotune", False)):
             # Synthetic profiling may visit every helper row before a real

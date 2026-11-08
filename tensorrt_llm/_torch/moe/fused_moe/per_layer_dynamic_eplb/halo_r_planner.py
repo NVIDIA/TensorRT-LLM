@@ -5,8 +5,9 @@
 HALO-R is a second producer behind HALO-Q's scheduler-group contract
 (``planner.RebalanceSlotSchedulerGroup``): the same generations, route hold,
 deferred route wait, lent routes, lease and spin bound, over the same CUDA
-scheduler buffers. Only the copy endpoint differs. Its one kernel runs on the
-``auxiliary_sms`` CTAs on the shared copy stream (COPY):
+scheduler buffers. The copy endpoint differs, and so do the four hooks that
+make a layer call capturable (see ``HaloRSlotSchedulerGroup``). Its one
+kernel runs on the ``auxiliary_sms`` CTAs on the shared copy stream (COPY):
 
     MAIN: ... routes -> record input_ready
     COPY: wait input_ready -> HALO-R: READY drain -> scheduler -> route release -> relay -> READY 1
@@ -44,9 +45,14 @@ from typing import Any, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami.lease import LiveBankLease
 from tensorrt_llm.logger import logger
 
-from .planner import RebalanceSlotSchedulerGroup, SchedulerSpinBound, _LiveBankLeaseProvider
+from .planner import (
+    RebalanceSlotSchedulerGroup,
+    SchedulerSpinBound,
+    build_scheduler_group_from_manager,
+)
 
 __all__ = [
     "HaloRRelayEndpoint",
@@ -57,9 +63,6 @@ __all__ = [
 
 #: Overloaded ranks offer this many of their hottest experts to the planner.
 HALO_R_SEND_COUNT = 4
-#: Extra weight of extending an already replicated expert over replicating a
-#: new one; 0 ranks both by the routed tokens they move.
-HALO_R_SEND_WEIGHT = 0
 #: The helper slot index is two bits wide.
 HALO_R_MAX_HELPER_SLOTS = 4
 #: One warp plans for every EP rank.
@@ -150,18 +153,17 @@ def _relay_tables(arena: Any, pool: Any, *, ep_rank: int, home_experts: int) -> 
     return sources, destinations, plane_bytes, int(bound.terminal_local_ptr), flag_mc
 
 
-class HaloRRelayEndpoint:
+class HaloRRelayEndpoint(LiveBankLease):
     """One layer's native HALO-R context: the copy endpoint of its scheduler group.
 
     It has the surface of ``HierarchicalSamiWeightBroadcast`` that
     ``RebalanceSlotSchedulerGroup`` and ``_LiveBankLeaseProvider`` call, and
-    mirrors its lease bookkeeping: a launch may overwrite the helper slots only
-    after the bound reuse authority has proven, for the previous generation,
-    that every rank's consumer precedes the next launch. An exception in any
-    native call aborts the handoff for good; the owner then rebuilds the group.
+    shares its lease bookkeeping (``LiveBankLease``): a launch may overwrite
+    the helper slots only after the bound reuse authority has proven, for the
+    previous generation, that every rank's consumer precedes the next launch.
+    An exception in any native call aborts the handoff for good; the owner
+    then rebuilds the group.
     """
-
-    live_bank_count = 1
 
     def __init__(
         self,
@@ -232,36 +234,36 @@ class HaloRRelayEndpoint:
             torch.cuda.synchronize(self.device)
         # Binds every argument the per-layer launches share and prepares the
         # launch, so a layer call is one native call on the context's handle.
+        # Passed by schema name: many neighbours share a type.
         ctx = torch.ops.trtllm.moe_rebalance_halo_r_create(
-            out_slots,
-            out_ids,
-            out_owners,
-            peer_bases,
-            status,
-            partial,
-            route_aux,
-            grid_sync,
-            plan,
-            route_prefix,
-            route_counter,
-            self.relay_sources,
-            self.relay_destinations,
-            self.relay_plane_bytes,
-            self.completed_ctas,
-            self.counters,
-            self.residency,
-            ready_row,
-            flag_mc,
-            ep,
-            experts,
-            helpers,
-            HALO_R_SEND_COUNT,
-            HALO_R_SEND_WEIGHT,
-            local_rank,
-            topk,
-            route_capacity,
-            ctas,
-            self._copy_handle,
+            out_slots=out_slots,
+            out_ids=out_ids,
+            out_owners=out_owners,
+            peer_bases=peer_bases,
+            status=status,
+            partial=partial,
+            route_aux=route_aux,
+            grid_sync=grid_sync,
+            plan=plan,
+            route_prefix=route_prefix,
+            route_counter=route_counter,
+            relay_sources=self.relay_sources,
+            relay_destinations=self.relay_destinations,
+            relay_plane_bytes=self.relay_plane_bytes,
+            relay_completed_ctas=self.completed_ctas,
+            relay_counters=self.counters,
+            residency=self.residency,
+            ready_flags_ptr=ready_row,
+            ready_flag_mc_ptr=flag_mc,
+            ep=ep,
+            experts=experts,
+            helpers=helpers,
+            send_count=HALO_R_SEND_COUNT,
+            local_rank=local_rank,
+            topk=topk,
+            route_capacity=route_capacity,
+            ctas=ctas,
+            copy_stream=self._copy_handle,
         )
         try:
             # The per-layer op takes this handle of ctx; passing the
@@ -276,10 +278,7 @@ class HaloRRelayEndpoint:
 
         self._lock = threading.Lock()
         self._generation = 1
-        self._reuse_authority: object | None = None
-        self._active_generation = 0
-        self._local_release_generation = 0
-        self._collective_safe_generation = 0
+        self._init_lease()
         self._handoff_aborted = False
         self._launch_captured = False
 
@@ -287,85 +286,17 @@ class HaloRRelayEndpoint:
         if self._handoff_aborted or self.ctx is None:
             raise RuntimeError("HALO-R relay handoff aborted; quiesced group rebuild required")
 
-    def _validate_reuse_authority(self, authority: object) -> None:
-        if authority is None:
-            raise TypeError("generation reuse authority cannot be None")
-        if getattr(authority, "collective_safe", False) is not True:
-            raise ValueError("generation reuse authority lacks collective safety")
-        if getattr(authority, "producer_reuse_guarded", False) is not True:
-            raise ValueError("generation reuse authority does not guard producer reuse")
-        if getattr(authority, "live_bank_count", None) != self.live_bank_count:
-            raise ValueError("generation reuse authority must target one live bank")
-        if getattr(authority, "bound_copy_module", None) is not self:
+    def _require_bindable(self) -> None:
+        self._require_operational()
+
+    def _validate_bound_copy_module(self, copy_module: object) -> None:
+        if copy_module is not self:
             raise ValueError("generation reuse authority is not bound to this HALO-R endpoint")
 
-    def bind_generation_reuse_authority(self, authority: object) -> None:
-        """Bind the exact collective single-bank lease provider once."""
-        self._validate_reuse_authority(authority)
-        with self._lock:
-            self._require_operational()
-            if self._reuse_authority is not None:
-                raise RuntimeError("generation reuse authority is single-assignment")
-            if self._active_generation:
-                raise RuntimeError("generation reuse authority must bind before submit")
-            self._reuse_authority = authority
-
-    def release_generation_after(
-        self, generation: int, completion_event: object | None = None
-    ) -> None:
-        """Register this rank's consumer of ``generation``.
-
-        The consumer is ``completion_event``, or without it the work already
-        queued on the current stream, which the next launch follows; only an
-        event queues a device wait. The bound reuse authority must still prove
-        the all-rank ordering before the next launch.
-        """
-        if type(generation) is not int or generation <= 0:
-            raise ValueError("generation must be a positive exact int")
-        event_handle = 0
-        if completion_event is not None:
-            event_handle = int(getattr(completion_event, "cuda_event", completion_event))
-            if event_handle <= 0:
-                raise ValueError("completion_event must expose a positive CUDA event")
-        with self._lock:
-            self._require_operational()
-            if generation != self._active_generation:
-                raise ValueError("generation is not the active live bank")
-            if self._local_release_generation >= generation:
-                raise RuntimeError("generation already has a local release event")
-            if completion_event is not None:
-                try:
-                    (error,) = self._driver.cuStreamWaitEvent(self._copy_handle, event_handle, 0)
-                    if error != self._driver.CUresult.CUDA_SUCCESS:
-                        raise RuntimeError(f"cuStreamWaitEvent(HALO-R consumer) failed: {error!r}")
-                except BaseException:
-                    self._handoff_aborted = True
-                    raise
-            self._local_release_generation = generation
-
-    def mark_collective_reuse_safe(self, authority: object, generation: int) -> None:
-        """Accept the bound provider's all-rank proof for one generation."""
-        if type(generation) is not int or generation <= 0:
-            raise ValueError("generation must be a positive exact int")
-        with self._lock:
-            self._require_operational()
-            # bind_generation_reuse_authority() validated this authority once,
-            # so identity suffices per layer call.
-            if authority is not self._reuse_authority:
-                raise PermissionError("generation reuse authority identity mismatch")
-            if generation != self._active_generation:
-                raise ValueError("generation is not the active live bank")
-            if self._local_release_generation != generation:
-                raise RuntimeError("local consumer release is not registered")
-            if self._collective_safe_generation >= generation:
-                raise RuntimeError("generation is already collectively reusable")
-            self._collective_safe_generation = generation
-
-    def _require_live_bank_reusable(self) -> None:
-        if self._reuse_authority is None:
-            raise RuntimeError("single live bank has no bound collective reuse authority")
-        if self._active_generation and self._collective_safe_generation < self._active_generation:
-            raise RuntimeError("single live bank is still leased by the previous generation")
+    def _wait_for_consumer(self, handle: int) -> None:
+        (error,) = self._driver.cuStreamWaitEvent(self._copy_handle, handle, 0)
+        if error != self._driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"cuStreamWaitEvent(HALO-R consumer) failed: {error!r}")
 
     def submit_fused(
         self, outputs: object, routes: torch.Tensor, route_target: int, *, spin_cycles: int
@@ -375,8 +306,10 @@ class HaloRRelayEndpoint:
         The current stream must have produced ``routes``. ``route_target`` is
         not used: the kernel only adds one per CTA to the bound route counter
         and never reads it. ``spin_cycles`` bounds every cross-rank and
-        cross-CTA wait of the launch. Returns the launched generation, which
-        is also the READY value the launch publishes.
+        cross-CTA wait of the launch. Returns the launched lease generation
+        (1, 2, 3, ...). It is not the READY value: every launch publishes
+        READY 1, which ``HaloRSlotSchedulerGroup.plan_finish`` lends to
+        MegaMoE instead.
 
         Inside a breakable CUDA graph region, the first eager launch at each
         routed-token count (a bucket's warmup before its capture) waits at
@@ -496,9 +429,9 @@ class HaloRRelayEndpoint:
 class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
     """One layer's HALO-R producer behind HALO-Q's scheduler-group contract.
 
-    HALO-Q's ``__init__`` builds the TMA copy endpoint, so this one sets the
-    same attributes in the same collective order and builds a
-    ``HaloRRelayEndpoint`` instead. For CUDA graphs it overrides four more:
+    HALO-Q's ``__init__`` sets up the scheduler and its peers; this group
+    checks HALO-R's geometry first and overrides ``_bind_copy_endpoint`` to
+    build a ``HaloRRelayEndpoint``. For CUDA graphs it overrides four more:
     ``plan_finish`` lends the constant READY generation, ``_wait_route_epoch``
     waits for the constant route target and resets the counter,
     ``_check_owner`` lets MAIN change between layer calls behind a MAIN-to-MAIN
@@ -551,139 +484,51 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
         spin_bound: SchedulerSpinBound,
         layer_idx: Optional[int],
     ) -> None:
-        from cuda.bindings import driver
-
-        from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.cuda_scheduler import (
-            CudaPhysicalSlotScheduler,
-            CudaSchedulerConfig,
-        )
-        from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.cuda_scheduler.multirank_dist import (
-            FabricSymmetricBuffer,
-        )
-        from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.cuda_scheduler.runtime import (
-            symmetric_buffer_ints,
-        )
-
-        ep_size = int(mapping.moe_ep_size)
-        ep_rank = int(mapping.moe_ep_rank)
         validate_halo_r_geometry(
-            ep_size=ep_size,
+            ep_size=int(mapping.moe_ep_size),
             home_experts=int(home_experts),
             helper_slots=int(helper_slots),
             auxiliary_sms=int(auxiliary_sms),
         )
-        self.layer_idx = layer_idx
-        self.device = int(device)
-        self.ep_size = ep_size
-        self.ep_rank = ep_rank
-        self.home_experts = int(home_experts)
-        self.helper_slots = int(helper_slots)
-        self.topk = int(topk)
-        self.max_tokens_per_rank = int(max_tokens_per_rank)
-        self.auxiliary_sms = int(auxiliary_sms)
-        self._spin_bound = spin_bound
-        if copy_stream.device.index != self.device:
-            raise ValueError("copy stream device does not match scheduler device")
-        self.arena = arena
-        self.plan_calls = 0
-        self._plan_part: tuple[Any, int] | None = None
-        self._generation = 0
-        self._pending_release: tuple[int, Any] | None = None
-        self._finished_generation = 0
-        self._scheduled_generation = 0
-        self._route_wait_generation = 0
-        self._routes_in_flight: torch.Tensor | None = None
-        self._lent_rows = -1
-        self._lent_routes: torch.Tensor | None = None
-        self._execution_stream_handle: int | None = None
         # Every stream validated as MAIN, kept alive with its handle.
         self._main_streams: dict[int, torch.cuda.Stream] = {}
         self._residency_resets = 0
-        self._closed = False
-        self.scheduler = None
-        self.symmetric = None
-        self.broadcaster = None
-        self.lease = None
-
-        # Register before any collective so the pool's collective shutdown
-        # can close a partially initialized group.
-        ep_comm.validate_geometry(expected_rank=ep_rank, expected_world=ep_size)
-        self._ep_comm = ep_comm
-        pool = getattr(arena.provider, "pool", None)
-        if pool is None or pool.comm is not ep_comm:
-            raise RuntimeError("rebalance arena and scheduler must use the same EP ProcessGroup")
-        arena.provider.register_producer(self)
-
-        logical_expert_count = self.home_experts * ep_size
-        # HALO-R's scheduler and relay run in the same CTAs, one per auxiliary SM.
-        cfg = CudaSchedulerConfig(
-            ep_size=ep_size,
-            logical_expert_count=logical_expert_count,
-            extra_slots_per_rank=self.helper_slots,
-            max_tokens_per_rank=self.max_tokens_per_rank,
-            topk=self.topk,
-            local_rank=ep_rank,
-            ctas=self.auxiliary_sms,
+        super().__init__(
+            arena=arena,
+            mapping=mapping,
+            ep_comm=ep_comm,
+            device=device,
+            home_experts=home_experts,
+            helper_slots=helper_slots,
+            topk=topk,
+            max_tokens_per_rank=max_tokens_per_rank,
+            copy_stream=copy_stream,
+            auxiliary_sms=auxiliary_sms,
+            helper_residency=helper_residency,
+            spin_bound=spin_bound,
+            layer_idx=layer_idx,
         )
-        cfg.validate()
-        self.cfg = cfg
-        self.scheduler = CudaPhysicalSlotScheduler(cfg, device=f"cuda:{self.device}")
 
-        self.copy_stream = copy_stream
-        self.scheduler_stream = self.copy_stream
-        self._stream_handle = int(self.copy_stream.cuda_stream)
-        self._driver = driver
-        self._wait_value_geq = driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ
-        self._cuda_success = driver.CUresult.CUDA_SUCCESS
-        error, cu_device = driver.cuDeviceGet(self.device)
-        supported = 0
-        if error == driver.CUresult.CUDA_SUCCESS:
-            error, supported = driver.cuDeviceGetAttribute(
-                driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS,
-                cu_device,
-            )
-        if error != driver.CUresult.CUDA_SUCCESS or not supported:
-            raise RuntimeError("MoE rebalance requires 64-bit CUDA stream memory operations")
-        # Each CTA of a launch adds one once its routes are written.
-        self._route_epoch = torch.zeros(1, dtype=torch.int64, device=f"cuda:{self.device}")
-        self._route_epoch_ptr = int(self._route_epoch.data_ptr())
-        self._route_target = 0
+    def _bind_copy_endpoint(self, *, arena: Any, helper_residency: bool) -> None:
+        """Build the ``HaloRRelayEndpoint`` and set this layer's READY row, on every rank or none.
 
-        # Every peer address must be connected before the first launch, whose
-        # count exchange writes into every peer's buffer.
-        self.symmetric = FabricSymmetricBuffer(
-            4 * symmetric_buffer_ints(ep_size, logical_expert_count), self.device
-        )
-        handles = list(ep_comm.allgather(self.symmetric.shareable))
-        if len(handles) != ep_size or len(set(handles)) != ep_size:
-            raise RuntimeError(
-                f"MoE rebalance requires {ep_size} unique EP fabric handles; "
-                f"received {len(handles)} handles with {len(set(handles))} unique values."
-            )
-        self.scheduler.connect_peer_bases(
-            [
-                self.symmetric.ptr if r == ep_rank else self.symmetric.import_peer(handles[r])
-                for r in range(ep_size)
-            ]
-        )
-        ep_comm.barrier()
-
-        # Each rank maps every peer's helper chunks and builds its native
-        # context; either can fail on one rank only (VMM resources, for
-        # example). The ranks exchange the outcome where they would meet at a
-        # barrier, so every rank raises the root cause instead of waiting for
-        # a failed peer.
+        Each rank maps every peer's helper chunks and builds its native
+        context; either can fail on one rank only (VMM resources, for
+        example). The ranks exchange the outcome where HALO-Q's endpoint needs
+        no meeting point, so every rank raises the root cause instead of
+        waiting for a failed peer.
+        """
         error: Exception | None = None
         try:
             self.broadcaster = HaloRRelayEndpoint(
                 scheduler=self.scheduler,
                 route_counter=self._route_epoch,
                 arena=arena,
-                pool=pool,
+                pool=arena.provider.pool,
                 home_experts=self.home_experts,
                 copy_stream=self.copy_stream,
-                helper_residency=bool(helper_residency),
-                first_run_spin_cycles=int(spin_bound.warmup_cycles),
+                helper_residency=helper_residency,
+                first_run_spin_cycles=int(self._spin_bound.warmup_cycles),
             )
             # Set this layer's READY row to 1, as a launch before the first
             # would leave it, so that every launch drains it before its count
@@ -696,23 +541,18 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
         except Exception as exc:  # noqa: BLE001 - shared with the peers, then raised
             error = exc
         outcomes = list(
-            ep_comm.allgather(None if error is None else f"{type(error).__name__}: {error}")
+            self._ep_comm.allgather(None if error is None else f"{type(error).__name__}: {error}")
         )
         failures = [f"rank {rank}: {outcome}" for rank, outcome in enumerate(outcomes) if outcome]
-        if failures or len(outcomes) != ep_size:
+        if failures or len(outcomes) != self.ep_size:
             raise RuntimeError(
-                f"HALO-R producer setup of layer {layer_idx} failed on {len(failures)} of "
-                f"{ep_size} EP ranks: " + "; ".join(failures)
+                f"HALO-R producer setup of layer {self.layer_idx} failed on {len(failures)} of "
+                f"{self.ep_size} EP ranks: " + "; ".join(failures)
             ) from error
-
-        # The previous consumer precedes the next launch's EP count exchange.
-        self.lease = _LiveBankLeaseProvider(self)
-        self.broadcaster.bind_generation_reuse_authority(self.lease)
-
-        logger.info(
-            "[MegaMoECuteDsl] layer=%s planner=halo_r producer initialized: ep=%d helpers=%d ctas=%d",
-            layer_idx,
-            ep_size,
+        logger.debug(
+            "[MegaMoECuteDsl] layer=%s planner=halo_r endpoint bound: ep=%d helpers=%d ctas=%d",
+            self.layer_idx,
+            self.ep_size,
             self.helper_slots,
             self.auxiliary_sms,
         )
@@ -816,19 +656,15 @@ def build_halo_r_slot_scheduler_group(
     It takes the keywords of ``build_rebalance_slot_scheduler_group`` and the
     same manager resources.
     """
-    device = int(mapping.local_rank)
-    return HaloRSlotSchedulerGroup(
+    return build_scheduler_group_from_manager(
+        HaloRSlotSchedulerGroup,
         arena=arena,
+        manager=manager,
         mapping=mapping,
-        ep_comm=manager.get_ep_comm(ep_process_group),
-        home_experts=int(home_experts),
-        helper_slots=int(helper_slots),
-        max_tokens_per_rank=int(max_tokens_per_rank),
-        topk=int(topk),
-        device=device,
-        copy_stream=manager.get_copy_stream(device),
-        auxiliary_sms=int(manager.auxiliary_sms),
-        helper_residency=bool(manager.helper_residency),
-        spin_bound=manager.get_scheduler_spin_bound(),
+        ep_process_group=ep_process_group,
+        home_experts=home_experts,
+        helper_slots=helper_slots,
+        topk=topk,
+        max_tokens_per_rank=max_tokens_per_rank,
         layer_idx=layer_idx,
     )

@@ -96,6 +96,18 @@ __device__ __forceinline__ uint64_t mbarrier_arrive_expect_tx(uint64_t* addr, co
 #endif
 }
 
+// Arrives with an expected transaction count and discards the arrival state. The asm is volatile so that the arrival
+// is kept although no output is used.
+__device__ __forceinline__ void mbarrier_arrive_expect_tx_no_state(uint64_t* addr, const uint32_t txCount)
+{
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
+    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+                 :
+                 : "r"(__as_ptr_smem(addr)), "r"(txCount)
+                 : "memory");
+#endif
+}
+
 __device__ __forceinline__ bool mbarrier_try_wait_parity(uint64_t* addr, uint32_t const& phaseParity)
 {
 #if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
