@@ -39,6 +39,13 @@ def has_unsupported_batch_quantization(
     if attention_quant is not None and (
         (attention_config.backend == "CUDNN" and attention_quant.qk_dtype == "fp8")
         or attention_config.backend == "FLASHINFER"
+        or (
+            attention_config.backend == "TRTLLM"
+            and (
+                (attention_quant.qk_dtype == "fp8" and attention_quant.q_block_size == 0)
+                or (attention_quant.v_dtype == "fp8" and attention_quant.v_block_size == 0)
+            )
+        )
     ):
         # These attention recipes derive global scales from the merged Q/K/V.
         return True

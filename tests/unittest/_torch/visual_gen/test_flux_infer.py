@@ -78,6 +78,7 @@ def test_batching_quantization_eligibility(
         ("FLASHINFER", "mxfp8", "fp8", False),
         ("FLASHINFER", "nvfp4", "fp8", False),
         ("FLASHINFER", "nvfp4", "nvfp4", False),
+        ("TRTLLM", None, None, True),
     ],
 )
 def test_batching_attention_quantization_eligibility(
@@ -96,6 +97,44 @@ def test_batching_attention_quantization_eligibility(
             quant_attention_config=(
                 {"qk_dtype": qk_dtype, "v_dtype": v_dtype} if qk_dtype is not None else None
             ),
+        )
+    )
+    assert pipeline.supports_dynamic_batching is expected
+
+
+@pytest.mark.parametrize("pipeline_cls", [FluxPipeline, Flux2Pipeline])
+@pytest.mark.parametrize(
+    "qk_dtype,block_sizes,expected",
+    [
+        ("bf16", (0, 0, 0), False),
+        ("fp8", (0, 0, 0), False),
+        ("int8", (1, 4, 1), True),
+        ("fp8", (1, 4, 1), True),
+    ],
+    ids=["per-tensor-v", "per-tensor-qkv", "sage-int8", "sage-fp8"],
+)
+def test_batching_trtllm_attention_recipe_eligibility(
+    pipeline_cls: type[FluxPipeline] | type[Flux2Pipeline],
+    qk_dtype: str,
+    block_sizes: tuple[int, int, int],
+    expected: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Recipe validation is hardware-specific; these are valid SM100 recipes.
+    monkeypatch.setattr("tensorrt_llm.visual_gen.args.get_sm_version", lambda: 100)
+    pipeline = pipeline_cls.__new__(pipeline_cls)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = torch.nn.Linear(2, 2)
+    pipeline.transformer.model_config = SimpleNamespace(
+        attention=AttentionConfig(
+            backend="TRTLLM",
+            quant_attention_config={
+                "qk_dtype": qk_dtype,
+                "v_dtype": "fp8",
+                "q_block_size": block_sizes[0],
+                "k_block_size": block_sizes[1],
+                "v_block_size": block_sizes[2],
+            },
         )
     )
     assert pipeline.supports_dynamic_batching is expected

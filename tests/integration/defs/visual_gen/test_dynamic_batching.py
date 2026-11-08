@@ -130,8 +130,13 @@ def test_dynamic_batching_multi_gpu(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize(
     "backend,qk_dtype,v_dtype",
-    [("CUDNN", "fp8", "fp8"), ("FLASHINFER", "mxfp8", "fp8")],
-    ids=["cudnn-fp8", "flashinfer-mxfp8"],
+    [
+        ("CUDNN", "fp8", "fp8"),
+        ("FLASHINFER", "mxfp8", "fp8"),
+        ("TRTLLM", "bf16", "fp8"),
+        ("TRTLLM", "fp8", "fp8"),
+    ],
+    ids=["cudnn-fp8", "flashinfer-mxfp8", "trtllm-v-fp8", "trtllm-qkv-fp8"],
 )
 def test_dynamic_batching_quantized_attention_fallback(
     backend: str,
@@ -143,6 +148,8 @@ def test_dynamic_batching_quantized_attention_fallback(
 ) -> None:
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("These quantized attention recipes require SM100/SM103")
+    if backend == "TRTLLM":
+        monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
     args = VisualGenArgs(
         attention_config={
             "backend": backend,
