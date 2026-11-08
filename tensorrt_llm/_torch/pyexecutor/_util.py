@@ -1318,7 +1318,10 @@ class KvCacheCreator:
             self._kv_cache_manager_cls,
             model_config,
             kv_cache_config,
-            use_separate_draft_kv_cache=use_separate_draft_kv_cache)
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+            **_kda_draft_records_kwargs(self._model_engine,
+                                        self._kv_cache_manager_cls,
+                                        self._speculative_config))
         if include_cross and self._is_encoder_decoder():
             total += CacheCost.from_raw(self._get_cross_kv_size_per_token())
         draft_cost = self._get_draft_cache_cost(
@@ -2735,7 +2738,10 @@ class KvCacheCreator:
             self._model_engine.model.model_config,
             target_kv_cache_config,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache,
-            include_request_cost=include_request_cost)
+            include_request_cost=include_request_cost,
+            **_kda_draft_records_kwargs(self._model_engine,
+                                        self._kv_cache_manager_cls,
+                                        self._speculative_config))
         # Estimate the draft component directly so its independently modelled
         # affine intercept is preserved exactly.
         draft_kv = self._get_draft_cache_cost(
@@ -3583,6 +3589,22 @@ def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
     return {"model_type": model_type}
 
 
+def _kda_draft_records_kwargs(model_engine: Optional[ModelEngine],
+                              kv_cache_manager_cls: type,
+                              spec_config: Optional[SpeculativeConfig]) -> dict:
+    """``kda_draft_records`` for a KDA manager whose model keeps the drafts' records.
+
+    The manager and its cost estimate both take it: the records set the layout of
+    the fixed replay pool, which the estimate prices.
+    """
+    backbone = getattr(getattr(model_engine, "model", None), "model", None)
+    if (spec_config is not None and isinstance(kv_cache_manager_cls, type)
+            and issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
+            and getattr(backbone, "kda_draft_records", False)):
+        return {"kda_draft_records": True}
+    return {}
+
+
 def _create_kv_cache_manager(
         model_engine: Optional[ModelEngine],
         kv_cache_manager_cls,
@@ -3840,11 +3862,9 @@ def _create_kv_cache_manager(
         # it), so the params pass through unscaled.
         kda_extra_kwargs = _mamba_conv_layout_kwargs(kv_cache_manager_cls,
                                                      "kimi_linear")
-        backbone = getattr(getattr(model_engine, "model", None), "model", None)
-        if (spec_config is not None
-                and issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
-                and getattr(backbone, "kda_draft_records", False)):
-            kda_extra_kwargs["kda_draft_records"] = True
+        kda_extra_kwargs.update(
+            _kda_draft_records_kwargs(model_engine, kv_cache_manager_cls,
+                                      spec_config))
         if (not is_glm5_next and issubclass(kv_cache_manager_cls,
                                             MambaHybridCacheManagerV2)):
             # The V2 manager reads the MLA geometry and the per-layer KV

@@ -32,7 +32,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping as ParallelMapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole, _KVCache
+from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole, _KVCache
 
 if TYPE_CHECKING:
     from .cache_manager import KDAReplayState
@@ -68,7 +68,7 @@ class KDAReplayRegion:
         }
         self.roles = frozenset(role for layout in self.layouts.values() for role in layout)
         self.region: Region | None = None
-        if self.layouts and not state.replay_shares_state_slot:
+        if self.layouts:
             self.region = Region(
                 name=REPLAY_STATE_REGION,
                 life_cycle=RegionLifeCycle(AllocationUnit.REQUEST, HandOff.NEVER),
@@ -99,15 +99,6 @@ class KDAReplayRegion:
 
     def declare_regions(self) -> Sequence[Region]:
         return (self.region,) if self.region is not None else ()
-
-    def shared_buffers(self, global_layer: int) -> list[BufferConfig]:
-        """Buffers addressed by the recurrent slot in draft-records mode."""
-        if not self.state.replay_shares_state_slot:
-            return []
-        return [
-            BufferConfig(role=role, size=dtype.itemsize * math.prod(shape))
-            for role, (dtype, shape) in self.layouts.get(global_layer, {}).items()
-        ]
 
     def bind(
         self,
@@ -141,7 +132,7 @@ class KDAReplayRegion:
             )
 
     def cuda_indices(self, state_indices: torch.Tensor) -> torch.Tensor:
-        """Return the stable replay vector, or the shared recurrent vector."""
+        """Return the stable replay vector; the recurrent vector without a declared region."""
         return self._indices.tensor if self._indices is not None else state_indices
 
     def request_indices(self, request_ids: Sequence[int]) -> list[int]:
@@ -234,13 +225,12 @@ class KDAReplayRegion:
         """Bytes of the fixed replay pool, as the manager will allocate it.
 
         The pool holds ``replay_slot_count`` slots, the same count the region declares,
-        times the bytes of one slot. Beam width is 1 for KDA; beam search would scale the
-        count, and so this estimate, by the beam width.
+        times the bytes of one slot, whose layout follows ``kda_draft_records`` as the
+        manager's does. Beam width is 1 for KDA; beam search would scale the count, and so
+        this estimate, by the beam width.
         """
         from .cache_manager import KDAReplayState
 
-        if kwargs.get("kda_draft_records", False):
-            return 0
         bytes_per_slot = KDAReplayState.estimate_bytes_per_slot(model_config, mapping, **kwargs)
         if not bytes_per_slot:
             return 0

@@ -47,6 +47,7 @@ HISTORY = DataRole("history")
 COUNT = DataRole("count")
 
 PRIVATE_SLOT = RegionLifeCycle(AllocationUnit.REQUEST, HandOff.NEVER)
+SNAPSHOTTED_SLOT = RegionLifeCycle(AllocationUnit.REQUEST, HandOff.DECLARED_POINTS)
 
 
 def _layers():
@@ -126,6 +127,60 @@ def test_lowered_regions_validate_in_the_native_config():
         )
 
 
+def _recurrent(layers=(1, 2)):
+    """The recurrent state of ``layers`` as one region snapshotted at declared points."""
+    return Region(
+        "recurrent",
+        SNAPSHOTTED_SLOT,
+        tuple(RegionLayer(layer, (Plane(SSM, 4096), Plane(CONV, 1024))) for layer in layers),
+    )
+
+
+def _region_only_layers():
+    """``_layers()`` with the recurrent layers' buffers left to regions."""
+    return [
+        _layers()[0],
+        *(SsmLayerConfig(layer_id=LayerId(layer), buffers=[]) for layer in (1, 2)),
+    ]
+
+
+def test_snapshotted_region_lays_out_as_the_required_recurrent_state():
+    """A region handed off at declared points lowers to a REQUIRED native region. It can hold the whole recurrent
+    state of layers that keep no buffers of their own, beside a PRIVATE region, and the native config accepts both."""
+    regions = [_recurrent(), _replay()]
+    configs, layout = lay_out_regions(regions, _region_only_layers())
+    assert [(config.name, config.reuse_policy) for config in configs] == [
+        ("recurrent", ReusePolicy.REQUIRED),
+        ("replay", ReusePolicy.PRIVATE),
+    ]
+    assert configs[0].fixed_slot_count is None
+    assert [(int(b.layer_id), str(b.buffer.role)) for b in configs[0].buffers] == [
+        (1, "ssm_state"),
+        (1, "conv_state"),
+        (2, "ssm_state"),
+        (2, "conv_state"),
+    ]
+    assert layout.owner(2, SSM).name == "recurrent"
+    assert layout.region("recurrent").bytes_per_slot() == 2 * (4096 + 1024)
+    config = KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=1 << 24)],
+        layers=_region_only_layers(),
+        commit_min_snapshot=True,
+        regions=configs,
+    )
+    assert [region.name for region in config.regions] == ["recurrent", "replay"]
+
+
+def test_storing_finds_regions_by_their_declared_planes():
+    """Before lay-out, when no buffer has an owner yet, the layout still answers which regions store a role."""
+    layout = RegionLayout(regions=(_recurrent(), _replay()))
+    assert not layout.owners
+    assert layout.storing(SSM) == (_recurrent(),)
+    assert layout.storing(HISTORY) == (_replay(),)
+    assert layout.storing(KEY) == ()
+
+
 def test_lay_out_rejects_what_it_cannot_store():
     with pytest.raises(ValueError, match="unique"):
         lay_out_regions([_replay(), _replay()], _layers())
@@ -137,13 +192,15 @@ def test_lay_out_rejects_what_it_cannot_store():
         )
     with pytest.raises(ValueError, match="already stores"):
         lay_out_regions([_replay(), _replay(name="other")], _layers())
-    snapshotted = Region(
-        "snapshotted",
-        RegionLifeCycle(AllocationUnit.REQUEST, HandOff.DECLARED_POINTS),
+    with pytest.raises(ValueError, match="already stores"):
+        lay_out_regions([_recurrent()], _layers())
+    per_block = Region(
+        "per_block",
+        RegionLifeCycle(AllocationUnit.TOKEN_BLOCK, HandOff.BLOCK_BOUNDARIES),
         (RegionLayer(1, (Plane(HISTORY, 64),)),),
     )
-    with pytest.raises(ValueError, match="never handed off"):
-        lay_out_regions([snapshotted], _layers())
+    with pytest.raises(ValueError, match="only request regions"):
+        lay_out_regions([per_block], _layers())
 
 
 def test_region_declarations_are_checked():
@@ -163,6 +220,7 @@ def test_region_declarations_are_checked():
         with pytest.raises(ValueError, match="fixed_slot_count"):
             _replay(fixed_slot_count=count)
     assert PRIVATE_SLOT.reuse_policy == ReusePolicy.PRIVATE
+    assert SNAPSHOTTED_SLOT.reuse_policy == ReusePolicy.REQUIRED
 
 
 def test_renumbered_follows_the_compacted_layers():

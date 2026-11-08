@@ -18,6 +18,7 @@
 #include "kvCacheManagerV2TestUtils.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/storage/config.h"
+#include "tensorrt_llm/common/tllmException.h"
 
 #include <gtest/gtest.h>
 
@@ -419,10 +420,8 @@ TEST(KvCacheManagerV2ConfigTest, InvalidRegionsAreRejected)
     expectRejected("empty name", [](KVCacheManagerConfig& c) { c.regions[0].name.clear(); });
     expectRejected("token-block region",
         [](KVCacheManagerConfig& c) { c.regions[0].allocationUnit = RegionAllocationUnit::kTokenBlock; });
-    for (auto const policy : {ReusePolicy::REQUIRED, ReusePolicy::OPTIONAL, ReusePolicy::SINK_REQUIRED_ONLY})
-    {
-        expectRejected("non-PRIVATE policy", [policy](KVCacheManagerConfig& c) { c.regions[0].reusePolicy = policy; });
-    }
+    expectRejected("attention-only policy",
+        [](KVCacheManagerConfig& c) { c.regions[0].reusePolicy = ReusePolicy::SINK_REQUIRED_ONLY; });
     expectRejected("no buffers", [](KVCacheManagerConfig& c) { c.regions[0].buffers.clear(); });
     for (std::int64_t const count : {0, -1})
     {
@@ -455,6 +454,73 @@ TEST(KvCacheManagerV2ConfigTest, InvalidRegionsAreRejected)
             other.buffers = {RegionBuffer{.layerId = 1, .buffer = BufferConfig{.role = "count", .size = 64}}};
             c.regions.push_back(std::move(other));
         });
+}
+
+TEST(KvCacheManagerV2ConfigTest, RequiredRegionIsTheOnlyRequiredSsmLifecycle)
+{
+    // The replay-region layout with the SSM layers' state and conv buffers moved into a REQUIRED region declared
+    // first: the SSM layers keep no buffers of their own.
+    auto config = makeReplayRegionConfig(32 << 20, 4);
+    RegionConfig recurrent{.name = "recurrent", .reusePolicy = ReusePolicy::REQUIRED};
+    for (auto& layer : config.layers)
+    {
+        if (auto* ssm = std::get_if<SsmLayerConfig>(&layer))
+        {
+            for (auto const& buffer : ssm->buffers)
+            {
+                recurrent.buffers.push_back(RegionBuffer{.layerId = ssm->layerId, .buffer = buffer});
+            }
+            ssm->buffers.clear();
+        }
+    }
+    config.regions.insert(config.regions.begin(), std::move(recurrent));
+    ASSERT_NO_THROW(config.validate());
+
+    // Layer lifecycles 0 (full attention) and 1 (PRIVATE windowed attention), then the regions in declaration
+    // order. Prefix matching gates on the REQUIRED region.
+    LifeCycleRegistry const registry(config);
+    LifeCycleId const recurrentLc{2};
+    LifeCycleId const replayLc{3};
+    ASSERT_EQ(registry.size(), LifeCycleId{4});
+    EXPECT_EQ(registry.regionLifeCycleId(std::string{"recurrent"}), recurrentLc);
+    EXPECT_EQ(registry[recurrentLc], (LifeCycle{SsmLifeCycle{ReusePolicy::REQUIRED, 0}}));
+    EXPECT_EQ(registry.ssmLifeCycleIds(), (std::vector<LifeCycleId>{recurrentLc, replayLc}));
+    EXPECT_EQ(registry.requiredSsmLifeCycleId(), recurrentLc);
+    auto const storage = createStorageConfig(config);
+    auto const attributes = storage.bufferAttributes();
+    for (LayerId const layerId : {1, 2})
+    {
+        SCOPED_TRACE(layerId);
+        EXPECT_EQ(storage.layerToLifeCycleIds().at(layerId), (std::vector<LifeCycleId>{recurrentLc, replayLc}));
+        EXPECT_EQ(attributes.at(BufferId{layerId, "state"}).lifeCycleId, recurrentLc);
+        EXPECT_EQ(attributes.at(BufferId{layerId, "conv"}).lifeCycleId, recurrentLc);
+        EXPECT_EQ(attributes.at(BufferId{layerId, "old_x"}).lifeCycleId, replayLc);
+    }
+
+    // Beside it, an SSM layer buffer or a second region may take any policy but REQUIRED.
+    for (auto const policy : {ReusePolicy::PRIVATE, ReusePolicy::OPTIONAL, ReusePolicy::REQUIRED})
+    {
+        SCOPED_TRACE(static_cast<int>(policy));
+        bool const admitted = policy != ReusePolicy::REQUIRED;
+        auto withLayerBuffer = config;
+        std::get<SsmLayerConfig>(withLayerBuffer.layers[1])
+            .buffers.push_back(BufferConfig{.role = "extra", .size = 64, .reusePolicy = policy});
+        ASSERT_NO_THROW(withLayerBuffer.validate());
+        auto withRegion = config;
+        withRegion.regions[1].reusePolicy = policy;
+        ASSERT_NO_THROW(withRegion.validate());
+        for (auto const* candidate : {&withLayerBuffer, &withRegion})
+        {
+            if (admitted)
+            {
+                EXPECT_NO_THROW(LifeCycleRegistry{*candidate});
+            }
+            else
+            {
+                EXPECT_THROW(LifeCycleRegistry{*candidate}, tensorrt_llm::common::TllmException);
+            }
+        }
+    }
 }
 
 } // namespace

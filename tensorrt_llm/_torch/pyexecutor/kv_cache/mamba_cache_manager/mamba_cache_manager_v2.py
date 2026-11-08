@@ -674,11 +674,19 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return self.max_batch_size * self.mapping.pp_size
 
     def _mamba_state_bytes_per_slot(self) -> int:
-        """Return persistent bytes per recurrent-state slot allocated by the native pools."""
-        return sum(
+        """Return persistent bytes per recurrent-state slot allocated by the native pools.
+
+        A declared region that stores ``SSM_STATE`` holds the recurrent state, so
+        its slot is the recurrent-state slot. The budget is costed before the
+        regions are laid out, so the region is found by its declared planes.
+        """
+        layer_bytes = sum(
             buffer.size
             for layer_id in self.mamba_pp_layers
             for buffer in self._get_recurrent_buffer_configs(layer_id)
+        )
+        return layer_bytes + sum(
+            region.bytes_per_slot() for region in self.region_layout.storing(MambaRole.SSM_STATE)
         )
 
     def _num_ssm_snapshots_for_capacity(

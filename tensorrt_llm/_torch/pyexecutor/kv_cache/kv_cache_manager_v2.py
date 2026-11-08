@@ -4130,9 +4130,19 @@ class KVCacheManagerV2(BaseResourceManager):
         return self.region_layout.fixed_bytes()
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
-        """Exclude empty buffers before creating the runtime storage pools."""
+        """Exclude empty buffers before creating the runtime storage pools.
+
+        A layer a declared region covers stays even with no buffers of its own:
+        the region's buffers sit on it once laid out.
+        """
+        region_layers = {
+            region_layer.model_layer
+            for region in self.region_layout.regions
+            for region_layer in region.layers
+        }
         if config.layers and all(
-            layer.buffers and all(buffer.size != 0 for buffer in layer.buffers)
+            all(buffer.size != 0 for buffer in layer.buffers)
+            and (layer.buffers or int(layer.layer_id) in region_layers)
             for layer in config.layers
         ):
             return config
@@ -4143,7 +4153,7 @@ class KVCacheManagerV2(BaseResourceManager):
         retained_layer_ids = []
         for layer in config.layers:
             buffers = [buffer for buffer in layer.buffers if buffer.size != 0]
-            if buffers:
+            if buffers or int(layer.layer_id) in region_layers:
                 retained_layer_ids.append(int(layer.layer_id))
                 layer_id = LayerId(len(layers))
                 if isinstance(layer, AttentionLayerConfig):

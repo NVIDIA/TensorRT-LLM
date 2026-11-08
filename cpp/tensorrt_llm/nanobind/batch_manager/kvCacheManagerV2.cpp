@@ -1844,7 +1844,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     nb::class_<kv::RegionConfig>(m, "RegionConfig",
         "Buffers that share a life cycle of the region's own, never merged with another life cycle. Only "
-        "REQUEST regions with the PRIVATE reuse policy are supported, on layers that have an SsmLayerConfig.")
+        "REQUEST regions are supported, on layers that have an SsmLayerConfig; layer buffers and regions "
+        "together have at most one REQUIRED SSM life cycle.")
         .def(
             "__init__",
             [](kv::RegionConfig* cfg, std::string name, std::vector<kv::RegionBuffer> buffers,

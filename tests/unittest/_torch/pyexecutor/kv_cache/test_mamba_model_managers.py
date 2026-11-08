@@ -542,17 +542,16 @@ def test_model_owns_speculative_state_lifecycle(monkeypatch, manager_cls, mode):
 
 
 @pytest.mark.parametrize(
-    "state, shares_state_slot, shared_row",
+    "state, shared_row",
     [
-        (KDAReplayState(2), False, "prev_num_accepted_tokens"),
-        (KDAReplayState(2, draft_records=True), True, "prev_num_accepted_tokens"),
+        (KDAReplayState(2), "prev_num_accepted_tokens"),
+        (KDAReplayState(2, draft_records=True), "prev_num_accepted_tokens"),
     ],
     ids=["kda", "kda_draft_records"],
 )
-def test_replay_states_declare_their_buffers_to_the_manager(state, shares_state_slot, shared_row):
+def test_replay_states_declare_their_buffers_to_the_manager(state, shared_row):
     """KDA declares its planes and the shared accepted-draft row from its model geometry."""
     layout = _layout()
-    assert state.replay_shares_state_slot == shares_state_slot
     first, second = state.replay_layout(layout, 0), state.replay_layout(layout, 1)
     # The first local layer also holds the per-request row every layer shares.
     assert set(first) - set(second) == {DataRole(shared_row)}
@@ -585,11 +584,14 @@ def test_states_without_replay_declare_no_replay_buffers(manager_cls):
 
 
 @pytest.mark.cpu_only
-def test_kda_region_declares_storage_without_a_hybrid_manager():
+@pytest.mark.parametrize("draft_records", [False, True])
+def test_kda_region_declares_storage_without_a_hybrid_manager(draft_records):
+    """The replay state is a fixed PRIVATE region with or without the drafts' records, which then replace the
+    per-draft caches among its planes."""
     from tensorrt_llm._torch.pyexecutor.kv_cache.regions import lay_out_regions
     from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy, SsmLayerConfig
 
-    state = KDAReplayState(2)
+    state = KDAReplayState(2, draft_records=draft_records)
     context = _layout(layers=(4, 7))
     provider = KDAReplayRegion(state, context, {4: 0, 7: 1}, 5, 0.8)
     configs, layout = lay_out_regions(
@@ -620,6 +622,8 @@ def test_kda_region_declares_storage_without_a_hybrid_manager():
         )
         == provider.roles
     )
+    assert (DataRole("kda_state_tok") in provider.roles) == draft_records
+    assert (DataRole("kda_k_cache") in provider.roles) != draft_records
     assert provider.region.fixed_bytes() == 7 * provider.bytes_per_slot
     assert MambaHybridCacheManagerV2._region_providers is KVCacheManagerV2._region_providers
     assert not hasattr(MambaHybridCacheManagerV2, "declare_regions")

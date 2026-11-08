@@ -471,9 +471,12 @@ class RegionBuffer:
 class RegionConfig:
     """Buffers that share a life cycle of the region's own, never merged with another one.
 
-    Only REQUEST regions with the PRIVATE reuse policy are supported: one slot per living
-    KV cache and beam, never published for reuse, returned when the cache closes. Each
-    buffer sits on a layer that has an SsmLayerConfig and sets no reuse policy of its own.
+    Only REQUEST regions are supported: one slot per living KV cache and beam, returned when
+    the cache closes. The region's life cycle is an SSM life cycle with its reuse policy: a
+    PRIVATE region is never published for reuse, and a REQUIRED one is snapshotted at commit
+    and restored at a matched prefix. Layer buffers and regions together have at most one
+    REQUIRED SSM life cycle. Each buffer sits on a layer that has an SsmLayerConfig, which may
+    have no buffers of its own, and sets no reuse policy of its own.
 
     ``fixed_slot_count`` set gives the region a pool group of its own with exactly that many
     GPU slots, which ratio-based sizing (construction, resize(), adjust() and the tuner)

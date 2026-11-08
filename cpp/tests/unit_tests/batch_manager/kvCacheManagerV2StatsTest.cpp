@@ -19,6 +19,7 @@
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/blockRadixTree.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCache.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/page.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/pendingStats.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/stats.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/storageManager.h"
@@ -453,6 +454,9 @@ enum class SplitSsmReplay
     kBufferOverrides, //!< BufferConfig::reusePolicy on each SSM layer.
     kRegion,          //!< One request region named "replay", sized by ratio.
     kFixedRegion,     //!< The same region with kSplitSsmFixedSlots slots.
+    //! The fixed region, declared after the REQUIRED request region "recurrent", which holds the
+    //! state and conv buffers; the SSM layers keep no buffers of their own.
+    kRecurrentRegion,
 };
 
 constexpr std::int64_t kSplitSsmFixedSlots = 8;
@@ -464,6 +468,7 @@ std::string toString(SplitSsmReplay replay)
     case SplitSsmReplay::kBufferOverrides: return "buffer overrides";
     case SplitSsmReplay::kRegion: return "region";
     case SplitSsmReplay::kFixedRegion: return "fixed region";
+    case SplitSsmReplay::kRecurrentRegion: return "recurrent region";
     }
     return "unknown";
 }
@@ -478,8 +483,10 @@ KVCacheManagerConfig makeSplitSsmConfig(bool withHostTier, SplitSsmReplay replay
         config.cacheTiers.emplace_back(HostCacheTierConfig{4 << 20});
     }
     bool const asRegion = replay != SplitSsmReplay::kBufferOverrides;
+    bool const recurrentAsRegion = replay == SplitSsmReplay::kRecurrentRegion;
+    RegionConfig recurrent{.name = "recurrent", .reusePolicy = ReusePolicy::REQUIRED};
     RegionConfig region{.name = "replay"};
-    if (replay == SplitSsmReplay::kFixedRegion)
+    if (replay == SplitSsmReplay::kFixedRegion || recurrentAsRegion)
     {
         region.fixedSlotCount = kSplitSsmFixedSlots;
     }
@@ -488,10 +495,11 @@ KVCacheManagerConfig makeSplitSsmConfig(bool withHostTier, SplitSsmReplay replay
     {
         auto& layer = layers[buffer.layer];
         layer.layerId = buffer.layer;
-        if (buffer.isPrivate && asRegion)
+        if (buffer.isPrivate ? asRegion : recurrentAsRegion)
         {
-            region.buffers.push_back(RegionBuffer{
-                .layerId = buffer.layer, .buffer = BufferConfig{.role = buffer.role, .size = buffer.size}});
+            (buffer.isPrivate ? region : recurrent)
+                .buffers.push_back(RegionBuffer{
+                    .layerId = buffer.layer, .buffer = BufferConfig{.role = buffer.role, .size = buffer.size}});
             continue;
         }
         layer.buffers.push_back(BufferConfig{.role = buffer.role,
@@ -501,6 +509,10 @@ KVCacheManagerConfig makeSplitSsmConfig(bool withHostTier, SplitSsmReplay replay
     for (auto& [layerId, layer] : layers)
     {
         config.layers.emplace_back(std::move(layer));
+    }
+    if (recurrentAsRegion)
+    {
+        config.regions.push_back(std::move(recurrent));
     }
     if (asRegion)
     {
@@ -695,6 +707,108 @@ TEST_F(ReplayCacheTest, PrivateSsmBuffersStayOutOfSnapshotsAndFollowBeams)
     }
 }
 
+TEST_F(ReplayCacheTest, RequiredRegionIsRestoredAtAnExactCheckpointEndpoint)
+{
+    // The SSM layers keep no buffers: the REQUIRED region "recurrent" is the only REQUIRED SSM lifecycle, and
+    // the replay buffers are the PRIVATE region "replay".
+    auto manager = std::make_shared<KvCacheManager>(
+        makeSplitSsmConfig(/*withHostTier=*/false, SplitSsmReplay::kRecurrentRegion));
+    auto const attention = manager->getLayerGroupId(0);
+    auto const recurrent = manager->getRegionGroupId("recurrent");
+    auto const replay = manager->getRegionGroupId("replay");
+    ASSERT_EQ(manager->lifeCycles().requiredSsmLifeCycleId(), recurrent);
+    for (auto const& buffer : splitSsmBuffers())
+    {
+        ASSERT_EQ(manager->getBufferGroupId(buffer.layer, buffer.role), buffer.isPrivate ? replay : recurrent);
+    }
+    auto const tokens = makeTokens(10);
+    auto fill = [&](KvCache const& cache, int salt)
+    {
+        for (auto const& buffer : splitSsmBuffers())
+        {
+            EXPECT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(ssmBufferAddress(*manager, cache, buffer, 0)),
+                          splitSsmPattern(buffer, salt), buffer.size, mStream),
+                cudaSuccess);
+        }
+    };
+
+    // Two commits leave recurrent checkpoints at tokens 8 and 10, each holding what was written before it.
+    // The live state then moves on.
+    auto source = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(source->resume(mStream));
+    ASSERT_TRUE(source->resize(10));
+    fill(*source, 0);
+    source->commit(TokenSpan{tokens.data(), 8});
+    fill(*source, 1);
+    source->commit(TokenSpan{tokens.data() + 8, 2});
+    fill(*source, 2);
+    auto const tree = manager->radixTree().match({}, TokenSpan{tokens.data(), 10}, false, true);
+    ASSERT_EQ(tree.numTokens, 10);
+    ASSERT_EQ(tree.blocks.size(), BlockOrdinal{3});
+    for (auto const* block : tree.blocks)
+    {
+        EXPECT_EQ(block->getPage(replay), nullptr);
+    }
+
+    // A reader of `length` tokens reuses `expected` of them and restores the checkpoint written with `salt`;
+    // without a salt it restores none. Its replay buffers are a PRIVATE slot of its own.
+    int nextId = 2;
+    auto expectReuse = [&](int length, int expected, std::optional<int> salt)
+    {
+        SCOPED_TRACE(::testing::Message() << "length=" << length << " expected=" << expected);
+        auto reader = manager->createKvCache({}, TokenSpan{tokens.data(), length}, nextId++);
+        EXPECT_EQ(reader->numCommittedTokens(), expected);
+        EXPECT_EQ(reader->reuseStatus()[recurrent.value()].complete, salt.has_value());
+        EXPECT_FALSE(reader->reuseStatus()[replay.value()].complete);
+        ASSERT_TRUE(reader->resume(mStream));
+        EXPECT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+        for (auto const& buffer : splitSsmBuffers())
+        {
+            if (buffer.isPrivate)
+            {
+                EXPECT_NE(
+                    ssmBufferAddress(*manager, *source, buffer, 0), ssmBufferAddress(*manager, *reader, buffer, 0));
+                continue;
+            }
+            if (!salt.has_value())
+            {
+                continue;
+            }
+            std::vector<uint8_t> data(buffer.size);
+            EXPECT_EQ(
+                cudaMemcpy(data.data(), reinterpret_cast<void const*>(ssmBufferAddress(*manager, *reader, buffer, 0)),
+                    data.size(), cudaMemcpyDeviceToHost),
+                cudaSuccess);
+            auto const pattern = splitSsmPattern(buffer, *salt);
+            EXPECT_TRUE(std::all_of(data.begin(), data.end(), [pattern](uint8_t value) { return value == pattern; }))
+                << buffer.layer << "/" << buffer.role;
+        }
+        reader->close();
+    };
+    // Takes a page out of the tree as Block::releasePages does. A page only the tree kept is scheduled for
+    // eviction; leaving it there after the unlink would keep its slot until the manager is destroyed.
+    auto dropTreePage = [](Block& block, LifeCycleId lifeCycle)
+    {
+        CommittedPage* page = block.unlinkPage(lifeCycle);
+        ASSERT_NE(page, nullptr);
+        if (page->status() == PageStatus::DROPPABLE && page->scheduledForEviction())
+        {
+            page->manager->excludeFromEviction(*page);
+        }
+    };
+    expectReuse(10, 10, 1);
+    // No checkpoint at token 9: back off to the one at 8.
+    expectReuse(9, 8, 0);
+    // Without the attention page of tokens 8-9, the checkpoint at 10 lacks its attention prefix.
+    dropTreePage(*tree.blocks[BlockOrdinal{2}], attention);
+    expectReuse(10, 8, 0);
+    // Without the checkpoint at 8 as well, no endpoint is left.
+    dropTreePage(*tree.blocks[BlockOrdinal{1}], recurrent);
+    expectReuse(10, 0, std::nullopt);
+    source->close();
+    manager->shutdown();
+}
+
 // Suspends a cache, hands its former GPU slots to other owners, and checks that resume restores every
 // SSM and replay buffer elsewhere.
 void checkSuspendedSsmStateSurvivesOffloadAndSlotChange(
@@ -790,7 +904,8 @@ void checkSuspendedSsmStateSurvivesOffloadAndSlotChange(
 
 TEST_F(ReplayCacheTest, SuspendedSsmStateSurvivesOffloadAndSlotChange)
 {
-    for (auto const replay : {SplitSsmReplay::kBufferOverrides, SplitSsmReplay::kRegion, SplitSsmReplay::kFixedRegion})
+    for (auto const replay : {SplitSsmReplay::kBufferOverrides, SplitSsmReplay::kRegion, SplitSsmReplay::kFixedRegion,
+             SplitSsmReplay::kRecurrentRegion})
     {
         checkSuspendedSsmStateSurvivesOffloadAndSlotChange(replay, mStream, makeTokens(8));
     }

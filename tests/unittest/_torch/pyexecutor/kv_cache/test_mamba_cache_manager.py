@@ -47,6 +47,7 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KimiK3HybridCacheManager,
     _kda_replay_layout,
 )
+from tensorrt_llm._torch.modules.kimi_kda.recurrent_region import RECURRENT_STATE_REGION
 from tensorrt_llm._torch.modules.kimi_kda.replay_region import REPLAY_STATE_REGION
 from tensorrt_llm._torch.modules.mamba.cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
@@ -99,6 +100,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
     Plane,
     Region,
     RegionLayer,
+    RegionLayout,
     RegionLifeCycle,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -141,6 +143,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheDesc,
     KVCacheManagerConfig,
     LayerId,
+    ReusePolicy,
     SsmLayerConfig,
     _introspection,
 )
@@ -609,6 +612,34 @@ def test_kimi_explicit_v2_manager_kda_draft_records_follow_the_model(
 
     assert "kda_replay_num_spec" not in kwargs
     assert kwargs.get("kda_draft_records", False) is backbone_asks
+
+
+@pytest.mark.parametrize("backbone_asks", [True, False])
+def test_kimi_kda_draft_records_reach_the_cost_estimate(backbone_asks: bool) -> None:
+    """Both estimates of the target manager's cost receive ``kda_draft_records`` exactly when the manager's
+    construction does, so they price the replay layout the manager allocates."""
+    backbone = SimpleNamespace(kda_draft_records=True) if backbone_asks else SimpleNamespace()
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(
+        model=SimpleNamespace(model=backbone, model_config=SimpleNamespace())
+    )
+    creator._kv_cache_manager_cls = KimiK3HybridCacheManager
+    creator._speculative_config = MTPDecodingConfig(max_draft_len=3)
+    creator._kv_cache_config = KvCacheConfig()
+    creator._should_create_separate_draft_kv_cache = lambda: False
+    creator._get_draft_cache_cost = lambda *args, **kwargs: None
+    estimates = []
+
+    def per_manager_cache_cost(manager_cls, model_config, kv_cache_config=None, **kwargs):
+        estimates.append(kwargs)
+        return SimpleNamespace(slope=1, intercept=0)
+
+    creator._per_manager_cache_cost = per_manager_cache_cost
+    creator._get_kv_size_per_token(include_cross=False)
+    assert creator._get_target_and_draft_cache_costs() is None
+    assert len(estimates) == 2
+    for kwargs in estimates:
+        assert kwargs.get("kda_draft_records", False) is backbone_asks
 
 
 @pytest.mark.parametrize("max_draft_len, replay_enabled", [(7, True), (8, False)])
@@ -2600,7 +2631,11 @@ def _configure_fp4_mla_hybrid(mgr, pretrained_config) -> KVCacheManagerConfig:
         layers=_base_attention_layer_configs(4),
         initial_pool_ratio=[1.0],
     )
-    return MambaHybridCacheManagerV2._build_cache_config(mgr, mgr._lay_out_regions(base_config))
+    # The manager's own order: the regions are declared before the layers are built (Kimi K3's KDA layers then
+    # keep no buffers of their own) and laid out on the final layer list.
+    mgr._declare_regions()
+    config = MambaHybridCacheManagerV2._build_cache_config(mgr, base_config)
+    return mgr._lay_out_regions(mgr._remove_zero_size_buffers(config))
 
 
 def test_v2_hybrid_composes_fp4_mla_layout_with_ssm_layers(
@@ -6303,19 +6338,16 @@ def test_v2_kda_replay_suspend_resume_matches_an_unsuspended_run(slot_taken):
 )
 def test_v2_kda_replay_state_follows_a_suspended_request(monkeypatch, manager_cls, kwargs):
     """While a request is suspended, another cache takes its SSM slot and the runtime moves its SSM page to the host
-    tier. Its KDA replay state, pending drafts included, lives in PRIVATE pages, or with the drafts' records in its SSM
-    page, and follows it: after the resume its states, replay buffers and accepted-draft count are bit for bit those
+    tier. Its KDA replay state, pending drafts and the drafts' records included, lives in PRIVATE pages of the replay
+    group and follows it: after the resume its states, replay buffers and accepted-draft count are bit for bit those
     it was suspended with, and nothing was seeded on the way."""
     mgr = _v2_kda_replay_manager_with_large_slots(manager_cls, **kwargs)
     others = []
     request = None
     try:
-        if kwargs.get("kda_draft_records", False):
-            assert mgr.replay_layer_group_id is None
-            replay_group = mgr.ssm_layer_group_id
-        else:
-            assert mgr.replay_layer_group_id not in (None, mgr.ssm_layer_group_id)
-            replay_group = mgr.replay_layer_group_id
+        assert mgr.replay_layer_group_id not in (None, mgr.ssm_layer_group_id)
+        replay_group = mgr.replay_layer_group_id
+        assert (DataRole("kda_state_tok") in mgr._kda_replay_region.roles) == bool(kwargs)
         monkeypatch.setattr(
             mgr._kda_replay, "seed_transferred_slots", MagicMock(side_effect=AssertionError)
         )
@@ -6401,8 +6433,10 @@ def test_v2_kda_replay_policy_seeds_disaggregated_generation_slots():
 
 
 def test_v2_kda_draft_records_seed_disaggregated_generation_slots():
-    """Without the per-draft replay caches, seeding a transferred request's slot sets its conv caches and clears its
-    draft count; its drafts' records stay as they are, since with no pending drafts none of them is read."""
+    """Without the per-draft replay caches, seeding a transferred request sets the conv caches at its replay slot from
+    the conv state at its recurrent-state slot and clears its draft count there; its drafts' records stay as they are,
+    since with no pending drafts none of them is read. The replay slots differ from the state slots and come from a
+    pool of another size, and the other replay slots are left alone."""
     mgr = object.__new__(KimiK3HybridCacheManager)
     mgr._kda_replay = KDAReplayState(2, draft_records=True)
     mgr._speculative_state = mgr._kda_replay
@@ -6410,14 +6444,18 @@ def test_v2_kda_draft_records_seed_disaggregated_generation_slots():
     mgr.conv_state_shape = [6, 4]
     mgr.conv_section_dims = [2, 2, 2]
     mgr._request_id_to_state_index = {101: 1, 202: 3}
-    mgr._kda_replay.prev_num_accepted_tokens = torch.full((4,), 5, dtype=torch.int32)
+    replay_slots = {101: 4, 202: 0}
+    mgr._kda_replay_region = SimpleNamespace(
+        group_id=1, request_indices=lambda request_ids: [replay_slots[rid] for rid in request_ids]
+    )
+    mgr._kda_replay.prev_num_accepted_tokens = torch.full((5,), 5, dtype=torch.int32)
     mgr.all_conv_states = [
         torch.arange(4 * 6 * 4, dtype=torch.float32).reshape(4, 6, 4),
         torch.arange(4 * 6 * 4, dtype=torch.float32).reshape(4, 6, 4) + 1000,
     ]
 
     def dim_contiguous_conv_cache() -> torch.Tensor:
-        return torch.full((2, 4, 6, 2), 7.0).transpose(-1, -2)
+        return torch.full((2, 5, 6, 2), 7.0).transpose(-1, -2)
 
     mgr._kda_replay.kda_conv_q = dim_contiguous_conv_cache()
     mgr._kda_replay.kda_conv_k = dim_contiguous_conv_cache()
@@ -6426,27 +6464,30 @@ def test_v2_kda_draft_records_seed_disaggregated_generation_slots():
     mgr._kda_replay.kda_g_cache = None
     mgr._kda_replay.kda_v_cache = None
     mgr._kda_replay.kda_beta_cache = None
-    mgr._kda_replay.kda_state_tok = torch.full((2, 4, 3, 2, 1, 2), 7.0)
+    mgr._kda_replay.kda_state_tok = torch.full((2, 5, 3, 2, 1, 2), 7.0)
 
     mgr._kda_replay._conv_states = tuple(mgr.all_conv_states)
     mgr._kda_replay._conv_section_dims = tuple(mgr.conv_section_dims)
     mgr._kda_replay._committed_window = mgr.conv_state_shape[1]
     mgr.on_state_transfer_complete([101, 202])
 
+    windows = (
+        (mgr._kda_replay.kda_conv_q, 0),
+        (mgr._kda_replay.kda_conv_k, 2),
+        (mgr._kda_replay.kda_conv_v, 4),
+    )
     for layer_offset, conv_state in enumerate(mgr.all_conv_states):
-        for slot in (1, 3):
-            for replay_buffer, start in (
-                (mgr._kda_replay.kda_conv_q, 0),
-                (mgr._kda_replay.kda_conv_k, 2),
-                (mgr._kda_replay.kda_conv_v, 4),
-            ):
+        for request_id, state_slot in mgr._request_id_to_state_index.items():
+            replay_slot = replay_slots[request_id]
+            for replay_buffer, start in windows:
                 torch.testing.assert_close(
-                    replay_buffer[layer_offset, slot, :, :4],
-                    conv_state[slot, start : start + 2, :],
+                    replay_buffer[layer_offset, replay_slot, :, :4],
+                    conv_state[state_slot, start : start + 2, :],
                 )
-                assert torch.count_nonzero(replay_buffer[layer_offset, slot, :, 4:]) == 0
-            assert mgr._kda_replay.prev_num_accepted_tokens[slot] == 0
-    assert mgr._kda_replay.prev_num_accepted_tokens.tolist() == [5, 0, 5, 0]
+                assert torch.count_nonzero(replay_buffer[layer_offset, replay_slot, :, 4:]) == 0
+        for replay_buffer, _ in windows:
+            assert (replay_buffer[layer_offset, 1:4] == 7.0).all()
+    assert mgr._kda_replay.prev_num_accepted_tokens.tolist() == [0, 5, 5, 5, 0]
     assert (mgr._kda_replay.kda_state_tok == 7.0).all()
 
 
@@ -7344,11 +7385,11 @@ def test_v2_kda_draft_records_replace_the_replay_caches(kda_replay_num_spec):
 
 
 @skip_no_cuda
-def test_v2_kda_draft_records_count_in_the_state_slot_budget():
+def test_v2_kda_draft_records_count_in_the_fixed_replay_pool():
     """The capacity math sees the drafts' records in place of the per-draft replay caches: per draft and layer, vn,
-    beta * k and the decay, fp32 [H, K] each, instead of the k / g / v / beta entries. With the records the replay
-    buffers share the recurrent-state slot, so each recurrent-state slot holds them and no replay slot is
-    reserved; without them they take PRIVATE replay slots."""
+    beta * k and the decay, fp32 [H, K] each, instead of the k / g / v / beta entries. With or without the records the
+    replay buffers take PRIVATE replay slots in the fixed replay pool, the same number of them, and a recurrent-state
+    slot holds the state and conv planes alone."""
     kwargs = dict(
         num_mamba_layers=2,
         spec_config=MTPDecodingConfig(max_draft_len=2),
@@ -7363,6 +7404,7 @@ def test_v2_kda_draft_records_count_in_the_state_slot_budget():
     try:
         plain_state_bytes = plain._mamba_state_bytes_per_slot()
         plain_bytes = plain._kda_replay_region.bytes_per_slot
+        plain_slots = plain.region_layout.region(REPLAY_STATE_REGION).fixed_slot_count
     finally:
         plain.shutdown()
     with_states = _build_v2_hybrid_with_mamba_layer(kda_draft_records=True, **kwargs)
@@ -7374,14 +7416,22 @@ def test_v2_kda_draft_records_count_in_the_state_slot_budget():
             for name, (dtype, shape) in _kda_replay_layout(2, num_heads, head_dim, 4).items()
             if name in _KDA_REPLAY_BUFFERS[3:]
         )
+        records_bytes = plain_bytes - replay_caches + per_token
         assert plain_bytes > 0
-        assert with_states.replay_layer_group_id is None
-        assert not with_states.kv_cache_manager_py_config.regions
-        assert with_states._kda_replay_region.bytes_per_slot == 0
+        assert with_states.replay_layer_group_id not in (None, with_states.ssm_layer_group_id)
+        assert [region.name for region in with_states.kv_cache_manager_py_config.regions] == [
+            RECURRENT_STATE_REGION,
+            REPLAY_STATE_REGION,
+        ]
+        assert with_states._kda_replay_region.bytes_per_slot == records_bytes
         assert (
             with_states._mamba_state_bytes_per_slot()
-            == plain_state_bytes + plain_bytes - replay_caches + per_token
+            == plain_state_bytes
+            == 2 * (with_states.ssm_bytes + with_states.conv_bytes)
         )
+        region = with_states.region_layout.region(REPLAY_STATE_REGION)
+        assert region.fixed_slot_count == plain_slots
+        assert with_states._fixed_region_quota() == plain_slots * records_bytes
     finally:
         with_states.shutdown()
 
@@ -7510,12 +7560,11 @@ def _kda_draft_record_build_config(quota, initial_pool_ratio=None):
 
 
 @pytest.mark.parametrize("pool_sizing", ["typical_step", "block_reuse", "pool_ratio"])
-def test_v2_kda_draft_records_share_the_state_slot(pool_sizing):
-    """The drafts' records replace the k / g / v / beta caches, and the kernels that read them address every replay
-    buffer by the recurrent-state slot. Those replay buffers therefore inherit the SSM layer's policy and count in
-    every recurrent-state slot, while without the records they are PRIVATE, in the fixed replay pool. However the SSM
-    pool is sized (by the typical step, with block reuse, or by a pool_ratio), the build leaves the whole GPU quota to
-    the pools and does not bound the living caches."""
+def test_v2_kda_draft_records_take_private_replay_slots(pool_sizing):
+    """The drafts' records replace the k / g / v / beta caches in the replay region: PRIVATE slots of the fixed replay
+    pool, as many as without the records. The REQUIRED recurrent region beside it holds the state and conv planes
+    alone. However the recurrent pool is sized (by the typical step, with block reuse, or by a pool_ratio), the build
+    keeps the GPU quota and lays both regions out on the KDA layer, which keeps no buffers of its own."""
     enable_block_reuse = pool_sizing == "block_reuse"
     mgr = _v2_kda_draft_record_manager(
         kda_draft_records=True, enable_block_reuse=enable_block_reuse
@@ -7523,52 +7572,175 @@ def test_v2_kda_draft_records_share_the_state_slot(pool_sizing):
     plain = _v2_kda_draft_record_manager(
         kda_draft_records=False, enable_block_reuse=enable_block_reuse
     )
-    assert mgr._kda_replay.replay_shares_state_slot
-    assert not plain._kda_replay.replay_shares_state_slot
-    # With the records, the replay buffers are buffers of the recurrent-state layer configs.
-    assert REPLAY_STATE_REGION not in mgr.region_layout
-    assert REPLAY_STATE_REGION in plain.region_layout
+    fixed_slots = math.ceil(mgr._index_mapper_capacity / mgr.kv_cache_config.max_util_for_resume)
+    for manager in (mgr, plain):
+        assert [region.name for region in manager.region_layout.regions] == [
+            RECURRENT_STATE_REGION,
+            REPLAY_STATE_REGION,
+        ]
+        assert manager._mamba_state_bytes_per_slot() == manager.ssm_bytes + manager.conv_bytes
+        region = manager.region_layout.region(REPLAY_STATE_REGION)
+        assert region.fixed_slot_count == fixed_slots
+        assert manager._fixed_region_quota() == fixed_slots * region.bytes_per_slot()
     records = 3 * 2 * 8 * 256 * 4
-    replay_bytes = sum(
-        dtype.itemsize * math.prod(shape)
-        for dtype, shape in mgr._kda_replay_region.layouts[0].values()
-    )
-    assert records < replay_bytes
-    assert mgr._mamba_state_bytes_per_slot() - plain._mamba_state_bytes_per_slot() == replay_bytes
-    assert mgr._kda_replay_region.bytes_per_slot == 0
-    assert mgr._fixed_region_quota() == 0
-    assert plain._fixed_region_quota() > 0
+    replay_planes = {
+        str(plane.role): plane.page_bytes
+        for layer in mgr.region_layout.region(REPLAY_STATE_REGION).layers
+        for plane in layer.planes
+    }
+    assert replay_planes["kda_state_tok"] == records
+    assert not set(replay_planes) & set(_KDA_REPLAY_BUFFERS[3:])
+    assert mgr._kda_replay_region.bytes_per_slot == sum(replay_planes.values())
 
     quota = 128 << 20
-    pool_ratio = [0.5, 0.5] if pool_sizing == "pool_ratio" else None
-    built = mgr._build_cache_config(_kda_draft_record_build_config(quota, pool_ratio))
+    # One weight per layer group: the attention layer's, then the regions'. The fixed region's is ignored.
+    pool_ratio = [0.5, 0.5, 0.5] if pool_sizing == "pool_ratio" else None
+    built = mgr._lay_out_regions(
+        mgr._build_cache_config(_kda_draft_record_build_config(quota, pool_ratio))
+    )
     assert built.cache_tiers[0].quota == quota
-    assert not built.regions
-    ssm_buffers = {str(buffer.role): buffer for buffer in built.layers[0].buffers}
-    assert ssm_buffers["kda_state_tok"].size == records
-    assert not set(ssm_buffers) & set(_KDA_REPLAY_BUFFERS[3:])
-    for role in mgr._kda_replay_region.layouts[0]:
-        assert ssm_buffers[role].reuse_policy is None
+    assert isinstance(built.layers[0], SsmLayerConfig) and not built.layers[0].buffers
+    regions = {region.name: region for region in built.regions}
+    recurrent = regions[RECURRENT_STATE_REGION]
+    assert recurrent.reuse_policy == ReusePolicy.REQUIRED
+    assert recurrent.fixed_slot_count is None
+    assert [(int(b.layer_id), str(b.buffer.role)) for b in recurrent.buffers] == [
+        (0, "ssm_state"),
+        (0, "conv_state"),
+    ]
+    assert regions[REPLAY_STATE_REGION].reuse_policy == ReusePolicy.PRIVATE
+    assert regions[REPLAY_STATE_REGION].fixed_slot_count == fixed_slots
     with pytest.raises(ValueError, match="too small for live recurrent states"):
         mgr._build_cache_config(_kda_draft_record_build_config(mgr._minimum_live_gpu_quota() - 1))
 
 
 @skip_no_cuda
 @pytest.mark.parametrize("enable_block_reuse", [False, True])
-def test_v2_kda_draft_records_leave_the_quota_to_the_pools(enable_block_reuse):
-    """With the drafts' records inside the SSM pool, the runtime pools take the whole GPU quota (rounded up to whole
-    2 MiB grains) with or without block reuse: nothing is set aside beside them."""
+def test_v2_kda_draft_records_fixed_pool_comes_out_of_the_quota(enable_block_reuse):
+    """With the drafts' records in the fixed replay pool, the runtime gives that pool exactly its declared slots and
+    the recurrent pool at least its live floor, and the pools together take the whole GPU quota (rounded up to whole
+    2 MiB grains) with or without block reuse."""
     mgr = _v2_kda_draft_record_manager(
         kda_draft_records=True, enable_block_reuse=enable_block_reuse
     )
     runtime_manager = RuntimeKVCacheManager(
-        mgr._build_cache_config(_kda_draft_record_build_config(128 << 20))
+        mgr._lay_out_regions(mgr._build_cache_config(_kda_draft_record_build_config(128 << 20)))
     )
     try:
         pool_bytes = runtime_manager.get_quota(GPU_LEVEL)
+        pools = runtime_manager.get_life_cycle_pool_group_indices(GPU_LEVEL)
+        stats = runtime_manager.get_storage_statistics(GPU_LEVEL)
+        replay = stats[pools[int(runtime_manager.get_region_group_id(REPLAY_STATE_REGION))]]
+        recurrent = stats[pools[int(runtime_manager.get_region_group_id(RECURRENT_STATE_REGION))]]
     finally:
         runtime_manager.shutdown()
+    assert replay.total == mgr.region_layout.region(REPLAY_STATE_REGION).fixed_slot_count
+    assert recurrent.total >= mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots
     assert 128 << 20 <= pool_bytes < (128 << 20) + (2 << 20)
+
+
+def test_v2_region_only_layers_leave_the_layer_list_alone():
+    """A layer whose buffers all belong to a declared region is complete without buffers of its own. With nothing
+    else empty, config preparation keeps the config and the per-layer views as they are, virtual layers past the
+    model's own (such as the FP4 MLA HP ring) included; an empty layer no region covers is still dropped."""
+    recurrent = Region(
+        "recurrent",
+        RegionLifeCycle(AllocationUnit.REQUEST, HandOff.DECLARED_POINTS),
+        (RegionLayer(0, (Plane(MambaRole.SSM_STATE, 64),)),),
+    )
+    layers = [
+        SsmLayerConfig(layer_id=LayerId(0), buffers=[]),
+        AttentionLayerConfig(layer_id=LayerId(1), buffers=[BufferConfig(role="key", size=256)]),
+        AttentionLayerConfig(layer_id=LayerId(2), buffers=[BufferConfig(role="hp", size=256)]),
+    ]
+    config = KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+        layers=layers,
+        commit_min_snapshot=True,
+    )
+    mgr = object.__new__(KVCacheManagerV2)
+    mgr._region_layout = RegionLayout(regions=(recurrent,))
+    mgr.pp_layers = [5, 6]
+    assert mgr._remove_zero_size_buffers(config) is config
+    assert mgr.pp_layers == [5, 6]
+
+    mgr._region_layout = RegionLayout()
+    mgr.num_kv_heads_per_layer, mgr.head_dim_per_layer = [0, 4, 4], [64, 64, 64]
+    mgr.max_attention_window_vec = [128, 128, 128]
+    mgr.pp_layers = [5, 6, 7]
+    compacted = mgr._remove_zero_size_buffers(config)
+    assert [int(layer.layer_id) for layer in compacted.layers] == [0, 1]
+    assert mgr.pp_layers == [6, 7]
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("rank_layers", ["kda_and_attention", "kda_only", "no_kda"])
+@pytest.mark.parametrize("mode", ["draft_records", "replay", "no_speculation", "disagg_context"])
+def test_v2_kimi_k3_recurrent_region_survives_config_preparation(monkeypatch, mode, rank_layers):
+    """Every Kimi K3 rank with KDA layers declares their recurrent state as the REQUIRED recurrent region, whatever the
+    speculation and disaggregation mode. The KDA layers stay in the layer list as SSM layer configs without buffers of
+    their own, the recurrent-state group is the region's, and the recurrent pool still gets its live floor. A rank
+    without KDA layers declares no region."""
+    kwargs = {}
+    if mode != "no_speculation":
+        kwargs.update(spec_config=MTPDecodingConfig(max_draft_len=2), kda_replay_num_spec=2)
+    if mode == "draft_records":
+        kwargs["kda_draft_records"] = True
+    if mode == "disagg_context":
+        monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
+        kwargs["is_disagg"] = True
+    if rank_layers == "no_kda":
+        # The second pipeline rank holds only the attention layer.
+        kwargs["mapping"] = Mapping(world_size=2, rank=1, tp_size=1, pp_size=2)
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=2,
+        num_mamba_layers=1 if rank_layers == "no_kda" else 2,
+        num_attention_layers=0 if rank_layers == "kda_only" else 1,
+        conv_state_layout="q_k_v",
+        mamba_num_heads=6,
+        mamba_n_groups=6,
+        mamba_ssm_cache_dtype=torch.float32,
+        model_manager_cls=KimiK3HybridCacheManager,
+        **kwargs,
+    )
+    try:
+        config = mgr.kv_cache_manager_py_config
+        region_names = [region.name for region in config.regions]
+        assert len(config.layers) == mgr.num_local_layers
+        if rank_layers == "no_kda":
+            assert mgr.local_num_mamba_layers == 0
+            assert region_names == []
+            assert mgr.ssm_layer_group_id is None
+            return
+        has_replay = mode in ("draft_records", "replay")
+        assert region_names == [
+            RECURRENT_STATE_REGION,
+            *([REPLAY_STATE_REGION] if has_replay else []),
+        ]
+        assert (mgr.replay_layer_group_id is not None) == has_replay
+        (recurrent_group,) = mgr.get_region_group_ids(RECURRENT_STATE_REGION)
+        assert mgr.ssm_layer_group_id == recurrent_group
+        assert mgr.local_num_mamba_layers == 2
+        for layer in mgr.mamba_pp_layers:
+            local_layer = mgr.layer_offsets[layer]
+            layer_config = config.layers[local_layer]
+            assert isinstance(layer_config, SsmLayerConfig) and not layer_config.buffers
+            for role in (MambaRole.SSM_STATE, MambaRole.CONV_STATE):
+                assert int(mgr.impl.get_buffer_group_id(LayerId(local_layer), role)) == (
+                    recurrent_group
+                )
+        live_floor = mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots
+        assert any(
+            len(batch.kv_caches) == live_floor
+            and all(desc.capacity == 0 for desc in batch.kv_caches)
+            for batch in config.constraints
+        )
+        pools = mgr.impl.get_life_cycle_pool_group_indices(GPU_LEVEL)
+        recurrent = mgr.impl.get_storage_statistics(GPU_LEVEL)[pools[recurrent_group]]
+        assert recurrent.total >= math.ceil(live_floor / mgr.kv_cache_config.max_util_for_resume)
+    finally:
+        mgr.shutdown()
 
 
 def _build_kda_replay_manager(**kwargs):
@@ -7613,8 +7785,14 @@ def test_v2_kda_replay_buffers_are_private_kvcm_buffers(manager_cls):
         fixed_slots = math.ceil(
             mgr._index_mapper_capacity / mgr.kv_cache_config.max_util_for_resume
         )
-        (region,) = mgr.kv_cache_manager_py_config.regions
-        assert region.name == REPLAY_STATE_REGION
+        # Kimi K3 declares its recurrent state as a region of its own, ahead of the replay region.
+        regions = mgr.kv_cache_manager_py_config.regions
+        assert [region.name for region in regions] == (
+            [RECURRENT_STATE_REGION, REPLAY_STATE_REGION]
+            if manager_cls is KimiK3HybridCacheManager
+            else [REPLAY_STATE_REGION]
+        )
+        region = regions[-1]
         assert region.fixed_slot_count == fixed_slots
         assert int(mgr.impl.get_region_group_id(REPLAY_STATE_REGION)) == replay_group
         pools = mgr.impl.get_life_cycle_pool_group_indices(GPU_LEVEL)
@@ -7703,23 +7881,38 @@ def test_v2_kda_replay_region_holds_every_living_cache(max_util_for_resume):
 
 
 @skip_no_cuda
-@pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
-def test_v2_kda_replay_estimate_reserves_the_fixed_pool(manager_cls):
-    """The cost estimate reserves exactly the bytes the replay region's fixed pool takes, and the GPU quota adds those
-    bytes as they are beside the ratio-sized pools, which alone are scaled by 1 / max_util_for_resume."""
+@pytest.mark.parametrize(
+    "manager_cls, kwargs",
+    [
+        (KimiK3HybridCacheManager, {}),
+        (KimiK3HybridCacheManager, {"kda_draft_records": True}),
+        (Glm5NextCacheManager, {}),
+    ],
+    ids=["kimi_k3", "kimi_k3_draft_records", "glm5_next"],
+)
+def test_v2_kda_replay_estimate_reserves_the_fixed_pool(manager_cls, kwargs):
+    """The cost estimate costs each payload where the built manager stores it: a recurrent-state slot holds the state
+    and conv planes, and the replay region's fixed pool holds the replay buffers, the drafts' records included, so the
+    estimate reserves exactly that pool's bytes. The GPU quota adds those bytes as they are beside the ratio-sized
+    pools, which alone are scaled by 1 / max_util_for_resume. The native replay pool holds the fixed count, and the
+    recurrent pool at least the live floor."""
     from tensorrt_llm._torch.configs.glm5_next import Glm5NextTextConfig
     from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.models.modeling_utils import QuantConfig
 
     max_util_for_resume = 0.8
     mgr = _build_kda_replay_manager(
-        model_manager_cls=manager_cls, max_batch_size=2, max_util_for_resume=max_util_for_resume
+        model_manager_cls=manager_cls,
+        max_batch_size=2,
+        max_util_for_resume=max_util_for_resume,
+        **kwargs,
     )
     try:
         region = mgr.region_layout.region(REPLAY_STATE_REGION)
         fixed_bytes = region.fixed_slot_count * region.bytes_per_slot()
         assert fixed_bytes > 0
         assert mgr._fixed_region_quota() == fixed_bytes
-        # The manager's geometry: two KDA layers of 6 heads, K = V = 8, and a 4-tap convolution.
+        # The manager's geometry: two KDA layers of 6 heads, K = V = 8, a 4-tap convolution and an fp32 SSM state.
         config = Glm5NextTextConfig(
             num_hidden_layers=3,
             layer_types=["linear_attention", "linear_attention", "deepseek_sparse_attention"],
@@ -7728,20 +7921,87 @@ def test_v2_kda_replay_estimate_reserves_the_fixed_pool(manager_cls):
             dtype="bfloat16",
             linear_attn_config={"num_heads": 6, "head_dim": 8, "short_conv_kernel_size": 4},
         )
+        model_config = ModelConfig(
+            pretrained_config=config, quant_config=QuantConfig(mamba_ssm_cache_dtype="float32")
+        )
+        spec_config = MTPDecodingConfig(max_draft_len=2)
+        estimate_kwargs = dict(spec_config=spec_config, kda_replay_num_spec=2, **kwargs)
         estimate = manager_cls._estimate_fixed_region_bytes(
-            ModelConfig(pretrained_config=config),
+            model_config,
             mgr.mapping,
             max_batch_size=2,
             kv_cache_config=mgr.kv_cache_config,
-            spec_config=MTPDecodingConfig(max_draft_len=2),
-            kda_replay_num_spec=2,
+            **estimate_kwargs,
         )
         assert estimate == fixed_bytes
+        params, local_layers, _ = _get_local_mamba_cache_layout(
+            model_config, mgr.mapping, spec_config=spec_config
+        )
+        estimated_state_bytes = local_layers * params.get_states_bytes_per_layer(
+            mgr.mapping
+        ) + manager_cls._extra_state_bytes_per_rank(model_config, mgr.mapping, **estimate_kwargs)
+        assert estimated_state_bytes == mgr._mamba_state_bytes_per_slot()
+        assert mgr._mamba_state_bytes_per_slot() == 2 * (mgr.ssm_bytes + mgr.conv_bytes)
         ratio_sized_quota = mgr._get_quota_from_max_tokens(mgr.kv_cache_config.max_tokens)
         assert mgr.kv_cache_manager_py_config.cache_tiers[0].quota == (
             math.ceil(ratio_sized_quota / max_util_for_resume) + fixed_bytes
         )
+        pools = mgr.impl.get_life_cycle_pool_group_indices(GPU_LEVEL)
+        stats = mgr.impl.get_storage_statistics(GPU_LEVEL)
+        assert stats[pools[mgr.replay_layer_group_id]].total == region.fixed_slot_count
+        live_floor = mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots
+        assert stats[pools[mgr.ssm_layer_group_id]].total >= math.ceil(
+            live_floor / max_util_for_resume
+        )
     finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_kda_draft_records_retained_snapshots_leave_the_replay_pool_alone():
+    """Retained recurrent snapshots take recurrent slots only. Once finished prompts have filled the recurrent pool
+    with their snapshots, every resident sequence and reserved dummy still gets a recurrent slot and a replay slot of
+    its own, and the replay pool keeps its declared size."""
+    mgr = _build_kda_replay_manager(
+        kda_draft_records=True,
+        max_batch_size=2,
+        enable_block_reuse=True,
+        additional_snapshot_offsets_from_end=[0],
+    )
+    live = []
+    try:
+        pools = mgr.impl.get_life_cycle_pool_group_indices(GPU_LEVEL)
+
+        def pool_stats(group):
+            return mgr.impl.get_storage_statistics(GPU_LEVEL)[pools[group]]
+
+        replay_slots = mgr.region_layout.region(REPLAY_STATE_REGION).fixed_slot_count
+        recurrent_slots = pool_stats(mgr.ssm_layer_group_id).total
+        for request_id in range(1, recurrent_slots + 1):
+            request = _make_v2_conversation_request(
+                request_id, [request_id] * 64, f"snapshot{request_id}"
+            )
+            _run_v2_hybrid_context(mgr, request)
+            mgr.free_resources(request)
+        recurrent = pool_stats(mgr.ssm_layer_group_id)
+        assert recurrent.free < recurrent.total
+        replay = pool_stats(mgr.replay_layer_group_id)
+        assert (replay.total, replay.free) == (replay_slots, replay_slots)
+
+        live_ids = list(
+            range(1000, 1000 + mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots)
+        )
+        live = mgr.add_dummy_requests(
+            live_ids, token_nums=[8] * len(live_ids), is_gen=True, max_num_draft_tokens=2
+        )
+        assert len(live) == len(live_ids)
+        assert len(set(mgr.get_state_indices(live_ids, [False] * len(live_ids)))) == len(live_ids)
+        assert len(set(mgr.get_replay_state_indices(live_ids))) == len(live_ids)
+        assert pool_stats(mgr.ssm_layer_group_id).total == recurrent_slots
+        assert pool_stats(mgr.replay_layer_group_id).total == replay_slots
+    finally:
+        for request in live:
+            mgr.free_resources(request)
         mgr.shutdown()
 
 
@@ -7860,6 +8120,8 @@ def test_v2_kda_worker_role_cache(monkeypatch, role, is_disagg, manager_cls):
     else:
         monkeypatch.setenv("TRTLLM_DISAGG_ROLE", role)
     mgr = _build_kda_replay_manager(is_disagg=is_disagg, model_manager_cls=manager_cls)
+    # Kimi K3 declares its recurrent state as a region on every worker.
+    recurrent_regions = [RECURRENT_STATE_REGION] if manager_cls is KimiK3HybridCacheManager else []
     try:
         req = _make_v2_conversation_request(123, list(range(8)), "role")
         _run_v2_hybrid_context(mgr, req)
@@ -7875,7 +8137,9 @@ def test_v2_kda_worker_role_cache(monkeypatch, role, is_disagg, manager_cls):
             assert mgr.intermediate_conv_states is None
             # A context server declares no replay buffers.
             assert mgr.replay_layer_group_id is None
-            assert not mgr.kv_cache_manager_py_config.regions
+            assert [
+                region.name for region in mgr.kv_cache_manager_py_config.regions
+            ] == recurrent_regions
             assert not mgr.get_disagg_ignored_roles() & {
                 DataRole(name) for name in _KDA_REPLAY_FIELDS
             }
@@ -7886,7 +8150,8 @@ def test_v2_kda_worker_role_cache(monkeypatch, role, is_disagg, manager_cls):
         else:
             assert mgr.replay_layer_group_id is not None
             assert [region.name for region in mgr.kv_cache_manager_py_config.regions] == [
-                REPLAY_STATE_REGION
+                *recurrent_regions,
+                REPLAY_STATE_REGION,
             ]
             slot = mgr.get_replay_state_indices([123])[0]
             assert cache.prev_num_accepted_tokens[slot].item() == 0

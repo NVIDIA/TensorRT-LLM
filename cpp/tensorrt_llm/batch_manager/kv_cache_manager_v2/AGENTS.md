@@ -131,11 +131,15 @@ and use `requiredSsmLifeCycleId()` only for prefix pruning.
 its own: the region index is part of the `SsmLifeCycle` key, so a region never
 merges with a layer lifecycle or another region of equal policy. Region
 lifecycles are registered after every layer lifecycle, in declaration order, so
-declaring one never renumbers the layer groups. Only request regions with the
-`PRIVATE` policy are supported, on layers that have an `SsmLayerConfig`; a
-`(layer, role)` pair belongs to one layer config or one region. A region is an
-`SsmLifeCycle`, so every kind-dispatch site treats it as SSM state: one slot per
-cache and beam. `getRegionGroupId(name)` (`get_region_group_id`) resolves it.
+declaring one never renumbers the layer groups. Only request regions are
+supported, on layers that have an `SsmLayerConfig` (which may hold no buffers of
+its own); a `(layer, role)` pair belongs to one layer config or one region. A
+region is an `SsmLifeCycle` with the region's reuse policy, so every
+kind-dispatch site treats it as SSM state: one slot per cache and beam, and a
+`REQUIRED` region is snapshotted at commit and restored at a matched prefix like
+an SSM layer's state. Layer buffers and regions together have at most one
+`REQUIRED` SSM lifecycle, which `LifeCycleRegistry` checks at construction.
+`getRegionGroupId(name)` (`get_region_group_id`) resolves it.
 Optional SSM checkpoints require an exact endpoint match, including partial
 blocks. Fresh or unselected recurrent state must be initialized or reconstructed
 by the caller before inference. A pool-group index is a storage-layout index and is

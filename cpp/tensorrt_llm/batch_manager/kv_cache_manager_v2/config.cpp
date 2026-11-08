@@ -66,11 +66,11 @@ void RegionConfig::validate() const
     {
         fail("only request regions are supported");
     }
-    // A request region with any other policy would be a second snapshotted per-request life
-    // cycle beside the SSM layers' own, and reuse matching assumes there is one.
-    if (reusePolicy != ReusePolicy::PRIVATE)
+    // A request region is an SSM life cycle. How many SSM life cycles may be REQUIRED is checked
+    // by the LifeCycleRegistry, which sees the layer life cycles as well.
+    if (reusePolicy == ReusePolicy::SINK_REQUIRED_ONLY)
     {
-        fail("a request region must use the PRIVATE reuse policy");
+        fail("SINK_REQUIRED_ONLY is only supported for attention layers");
     }
     if (buffers.empty())
     {

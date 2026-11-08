@@ -38,6 +38,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole
 
+from .recurrent_region import KDARecurrentRegion
 from .replay_region import REPLAY_STATE_REGION, KDAReplayRegion, ReplayLayout
 
 _MAMBA_SSM_SEED_MASK = (1 << 62) - 1
@@ -481,18 +482,6 @@ class KDAReplayState:
             context.conv_state_shape[1],
             draft_records=self.draft_records,
         )
-
-    @property
-    def replay_shares_state_slot(self) -> bool:
-        """Whether the replay buffers live in the recurrent-state slot.
-
-        Without the drafts' records the replay buffers have replay slots of
-        their own. The kernels that read and write the records (the
-        experimental Kimi K3 engine's ``k3_kda_verify`` and ``k3_kda_attn``)
-        address the replay caches by the recurrent-state slot, so with the
-        records they share it.
-        """
-        return self.draft_records
 
     @staticmethod
     def replay_slot_count(max_living_caches: int, max_util_for_resume: float) -> int:
@@ -1002,6 +991,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     """KDA/MLA cache layout and K3-only replay lifecycle handling."""
 
     kda_context_only = False
+    _kda_recurrent_region: KDARecurrentRegion | None = None
     _kda_replay_region: KDAReplayRegion | None = None
 
     @override
@@ -1020,6 +1010,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         self._requested_num_spec = kda_replay_num_spec
         self._requested_draft_records = kda_draft_records
         self._kda_replay: KDAReplayState | None = None
+        self._kda_recurrent_region: KDARecurrentRegion | None = None
         self._kda_replay_region: KDAReplayRegion | None = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
@@ -1066,8 +1057,19 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
 
     @override
     def _region_providers(self) -> Sequence[RegionProvider]:
+        """The recurrent region on every rank with local KDA layers, then the replay region.
+
+        Region groups are numbered in declaration order, so declaring the recurrent region
+        first keeps its group id the same with and without replay state.
+        """
         providers = super()._region_providers()
-        if self._kda_replay is None or not self.mamba_pp_layers:
+        if not self.mamba_pp_layers:
+            return providers
+        self._kda_recurrent_region = KDARecurrentRegion(
+            self.mamba_pp_layers, self.layer_offsets, self.ssm_bytes, self.conv_bytes
+        )
+        providers = (self._kda_recurrent_region, *providers)
+        if self._kda_replay is None:
             return providers
         self._kda_replay_region = KDAReplayRegion(
             self._kda_replay,
@@ -1080,10 +1082,10 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
 
     @override
     def _get_recurrent_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
-        buffers = super()._get_recurrent_buffer_configs(global_layer_id)
-        if self._kda_replay_region is not None:
-            buffers += self._kda_replay_region.shared_buffers(global_layer_id)
-        return buffers
+        # The recurrent region stores the layer's recurrent state.
+        if self._kda_recurrent_region is not None:
+            return []
+        return super()._get_recurrent_buffer_configs(global_layer_id)
 
     @override
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
@@ -1126,7 +1128,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
             return self.cuda_replay_state_indices
         region = self._kda_replay_region
         if region is None or region.group_id is None:
-            # The replay buffers share the recurrent-state slots.
+            # Without a replay region there are no replay slots; the state slots stand in.
             return [self._request_id_to_state_index[rid] for rid in request_ids]
         return region.request_indices(request_ids)
 
@@ -1300,14 +1302,9 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     @classmethod
     @override
     def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
-        seed_bytes = KDAReplayState.estimate_seed_bytes_per_slot(model_config, mapping, **kwargs)
-        if kwargs.get("kda_draft_records", False):
-            # With the records, the replay state shares every recurrent-state slot
-            # (KDAReplayState.replay_shares_state_slot).
-            return seed_bytes + KDAReplayState.estimate_bytes_per_slot(
-                model_config, mapping, **kwargs
-            )
-        return seed_bytes
+        # Only the seeds scale with the recurrent-state slots. The replay state, the drafts'
+        # records included, is the fixed replay region's (_estimate_fixed_region_bytes).
+        return KDAReplayState.estimate_seed_bytes_per_slot(model_config, mapping, **kwargs)
 
     @override
     def _on_state_slots_relocated(self, old_slots: list[int], new_slots: list[int]) -> None:

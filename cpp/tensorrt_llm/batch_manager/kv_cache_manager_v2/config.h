@@ -410,9 +410,12 @@ struct RegionBuffer
 //! Buffers that share a life cycle of the region's own. The life cycle is never merged
 //! with another one, even one whose parameters are equal.
 //!
-//! Only request regions with the PRIVATE reuse policy are supported: one slot per living
-//! KV cache and beam, never published for reuse, returned when the cache closes. Each
-//! buffer sits on a layer that has an SsmLayerConfig.
+//! Only request regions are supported: one slot per living KV cache and beam, returned when
+//! the cache closes. The region's life cycle is an SSM life cycle with the region's reuse
+//! policy: a PRIVATE region is never published for reuse, and a REQUIRED one is snapshotted at
+//! commit and restored at a matched prefix like an SSM layer's state. A manager has at most one
+//! REQUIRED SSM life cycle, from SSM layer buffers or a region. Each buffer sits on a layer that
+//! has an SsmLayerConfig, which may have no buffers of its own.
 struct RegionConfig
 {
     std::string name;
