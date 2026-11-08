@@ -261,12 +261,17 @@ class KvCacheAwareServerState(ServerState):
             self._poll_pending = False
             await self.poll_and_update(self._poll_session)
 
-    async def cancel_poll_task(self) -> None:
-        # Cancel and await the background poll so shutdown leaves no orphaned
-        # task polling a closed session.
+    def request_poll_stop(self) -> None:
+        """Request cancellation without waiting while a router lock is held."""
         self._poll_pending = False
         if self._poll_task is not None and not self._poll_task.done():
             self._poll_task.cancel()
+
+    async def cancel_poll_task(self) -> None:
+        # Cancel and await the background poll so shutdown leaves no orphaned
+        # task polling a closed session.
+        self.request_poll_stop()
+        if self._poll_task is not None and not self._poll_task.done():
             try:
                 await self._poll_task
             except asyncio.CancelledError:
@@ -295,6 +300,7 @@ class LoadBalancingMixin:
         self._use_tokens = use_tokens
         self._server_state: dict[str, ServerState] = {}
         self._req_routing_table: dict[int, str] = {}
+        self._request_load_state: dict[int, ServerState] = {}
         self._rr_counter = 0
         for server in servers or []:
             self._server_state[server] = self._create_server_state(server)
@@ -325,15 +331,18 @@ class LoadBalancingMixin:
                 raise ValueError(f"No {self._server_role} servers available")
 
     async def _register_request(self, server: str, request: OpenAIRequest):
-        await self._server_state[server].increment_load(request)
+        state = self._server_state[server]
+        await state.increment_load(request)
         self._req_routing_table[id(request)] = server
+        self._request_load_state[id(request)] = state
 
     async def _unregister_request(self, request: OpenAIRequest) -> str:
         server = self._req_routing_table.pop(id(request), None)
         if server is None:
             return ""
-        if server in self._server_state:
-            await self._server_state[server].decrement_load(request)
+        state = self._request_load_state.pop(id(request), None)
+        if state is not None:
+            await state.decrement_load(request)
         return server
 
     def _select_least_loaded(
@@ -358,6 +367,14 @@ class LoadBalancingMixin:
         return server
 
 
+class ContextCancellationCapabilityError(RuntimeError):
+    """A reachable CTX worker does not support the requested cancellation contract."""
+
+
+class ServerPreparationPending(RuntimeError):
+    """Required worker metadata is not yet available for preparation."""
+
+
 class Router(ABC):
 
     # True for a router whose placement may wait for capacity (a generation seat). The coordinator
@@ -373,6 +390,7 @@ class Router(ABC):
             metadata_server: Optional[JsonDictionary],
             server_preparation_func: Optional[Callable[[str],
                                                        Awaitable[None]]] = None,
+            require_context_cancellation: bool = False,
             **kwargs):
         self._servers = servers or []
         self._metadata_server = metadata_server
@@ -384,6 +402,8 @@ class Router(ABC):
         self._health_check_timeout = metadata_server_cfg.health_check_timeout if metadata_server_cfg else None
         self._server_preparation_func = server_preparation_func
         self._prepared_ready_servers: set[str] = set()
+        self._require_context_cancellation = require_context_cancellation
+        self._server_registration_ids: dict[str, str] = {}
 
     async def close(self):
         """Close the shared HTTP session."""
@@ -424,6 +444,17 @@ class Router(ABC):
     def server_role(self) -> ServerRole:
         return self._server_role
 
+    def server_registration_id(self, server: str) -> Optional[str]:
+        """Return the accepted registration for an address.
+
+        Args:
+            server: Worker address.
+
+        Returns:
+            The validated registration, or None for an unregistered address.
+        """
+        return self._server_registration_ids.get(server)
+
     def server_infos(self) -> dict[str, dict]:
         """The ``/server_info`` of every prepared server, by server."""
         return self._server_info
@@ -437,6 +468,7 @@ class Router(ABC):
             url = self._ensure_url(server)
             async with self.session.get(f"{url}/server_info",
                                         timeout=timeout) as response:
+                response.raise_for_status()
                 return await response.json()
         except Exception as e:
             logger.warning(
@@ -452,10 +484,25 @@ class Router(ABC):
                 await self._server_preparation_func(server)
             server_info = await self._fetch_server_info(
                 server, self._health_check_timeout)
+            if (self._require_context_cancellation
+                    and "supports_logical_context_cancellation" in server_info
+                    and server_info["supports_logical_context_cancellation"]
+                    is None):
+                raise ServerPreparationPending(
+                    f"CTX server {server} cancellation capability is temporarily unavailable"
+                )
+            if (self._require_context_cancellation
+                    and server_info.get("supports_logical_context_cancellation")
+                    is not True):
+                raise ContextCancellationCapabilityError(
+                    f"CTX server {server} does not advertise supported logical context cancellation"
+                )
             self._server_info[server] = server_info
             logger.info(
                 f"server is ready with info: {self._server_info[server]}")
             self._prepared_ready_servers.add(server)
+        except ContextCancellationCapabilityError:
+            raise
         except RuntimeError as e:
             # swallow the error, if the server becomes ready or is added later, it will be prepared again
             logger.warning(f"Error preparing server {server}: {e}")
@@ -466,6 +513,12 @@ class Router(ABC):
             if server not in self._servers:
                 continue
             await self._prepare_server(server)
+        if self._require_context_cancellation:
+            unprepared = set(targets) - self._prepared_ready_servers
+            if unprepared:
+                raise ServerPreparationPending(
+                    f"CTX servers lack verified logical context cancellation: {sorted(unprepared)}"
+                )
 
     def _stage_server(self, server: str) -> None:
         pass
@@ -473,29 +526,66 @@ class Router(ABC):
     def _unstage_server(self, server: str) -> None:
         pass
 
-    async def add_server(self, server: str) -> bool:
+    async def add_server(self,
+                         server: str,
+                         *,
+                         registration_id: Optional[str] = None,
+                         raise_on_capability_error: bool = False) -> bool:
+        """Validate a worker before making it available for placement.
+
+        Args:
+            server: Worker address.
+            registration_id: Observed process registration, if available.
+            raise_on_capability_error: Distinguish permanent rejection from
+                transient preparation failure for an admission retry owner.
+
+        Returns:
+            Whether the worker is admitted. A rejected replacement stays unroutable.
+
+        Raises:
+            ContextCancellationCapabilityError: The worker is incompatible and
+                raise_on_capability_error is enabled.
+        """
         if server in self._servers:
-            logger.warning(f"Server {server} already exists")
-            return True
+            if (self._require_context_cancellation
+                    and registration_id is not None
+                    and self._server_registration_ids.get(server)
+                    != registration_id):
+                # An observed replacement must be validated before this address is routable.
+                await self.remove_server(server)
+            else:
+                logger.warning(f"Server {server} already exists")
+                return not self._require_context_cancellation or server in self._prepared_ready_servers
         async with self._lock:
             self._stage_server(server)
         try:
             await self._prepare_server(server)
-        except Exception:
+            if server not in self._prepared_ready_servers:
+                async with self._lock:
+                    self._unstage_server(server)
+                logger.warning(
+                    f"Server {server} was not added because preparation failed")
+                return False
             async with self._lock:
+                if server not in self._servers:
+                    old_servers = self._servers.copy()
+                    self._servers = [*old_servers, server]
+                    self._on_servers_updated(old_servers, self._servers)
+                if self._require_context_cancellation and registration_id is not None:
+                    self._server_registration_ids[server] = registration_id
+        except ContextCancellationCapabilityError as error:
+            async with self._lock:
+                self._unstage_server(server)
+            logger.warning(f"Server {server} was not added: {error}")
+            if raise_on_capability_error:
+                raise
+            return False
+        except (Exception, asyncio.CancelledError):
+            async with self._lock:
+                self._prepared_ready_servers.discard(server)
+                self._server_info.pop(server, None)
                 self._unstage_server(server)
             raise
-        if server not in self._prepared_ready_servers:
-            async with self._lock:
-                self._unstage_server(server)
-            logger.warning(
-                f"Server {server} was not added because preparation failed")
-            return False
-        async with self._lock:
-            if server not in self._servers:
-                old_servers = self._servers.copy()
-                self._servers = [*old_servers, server]
-                self._on_servers_updated(old_servers, self._servers)
         logger.debug(
             f"Added server {server}, {self._server_role.name} current server list: {self._servers}"
         )
@@ -513,6 +603,7 @@ class Router(ABC):
             self._on_servers_updated(old_servers, self._servers)
         self._prepared_ready_servers.discard(server)
         self._server_info.pop(server, None)
+        self._server_registration_ids.pop(server, None)
         logger.debug(
             f"Removed server {server}, current server list: {self._servers}")
 
@@ -579,6 +670,10 @@ class Router(ABC):
     async def _monitor_servers(self, poll_interval: float = 10.0):
         while True:
             try:
+                if self._require_context_cancellation:
+                    await self.refresh_protected_context_servers()
+                    await asyncio.sleep(poll_interval)
+                    continue
                 # Get servers from metadata
                 server_key_map = await self.fetch_live_servers()
 
@@ -586,8 +681,8 @@ class Router(ABC):
                 live_servers = await self.check_servers_health(server_key_map)
 
                 # Filter by server role if needed
-                role_specific_servers = self._filter_servers_by_role(
-                    live_servers, server_key_map)
+                role_specific_servers = (self._filter_servers_by_role(
+                    live_servers, server_key_map) if live_servers else [])
 
                 # Use filtered servers if available
                 final_servers = role_specific_servers
@@ -626,6 +721,42 @@ class Router(ABC):
             # Wait before next poll
             await asyncio.sleep(poll_interval)
 
+    async def refresh_protected_context_servers(self,
+                                                *,
+                                                startup: bool = False) -> None:
+        """Refresh the authoritative metadata set before protected placement.
+
+        Empty discovery removes unavailable addresses but does not stop future
+        polling. Each new worker must pass the existing capability gate.
+
+        Args:
+            startup: Preserve registrations while workers become ready and fail
+                immediately on an incompatible worker.
+
+        Raises:
+            RuntimeError: A worker is incompatible during strict startup validation.
+        """
+        server_key_map = await self.fetch_live_servers()
+        live_servers = await self.check_servers_health(server_key_map,
+                                                       remove_dead=not startup)
+        servers = (self._filter_servers_by_role(live_servers, server_key_map)
+                   if live_servers else [])
+        registrations = {url: key for key, url in server_key_map.items()}
+        for server in list(self._servers):
+            if server not in servers:
+                await self.remove_server(server)
+        for server in servers:
+            try:
+                await self.add_server(server,
+                                      registration_id=registrations.get(server),
+                                      raise_on_capability_error=startup)
+            except RuntimeError as error:
+                if startup:
+                    raise
+                logger.warning(
+                    f"CTX server {server} remains excluded after preparation: {error}"
+                )
+
     def _filter_servers_by_role(self, servers, server_key_map):
         """Filter servers by role (context or generation)"""
         if not servers:
@@ -657,7 +788,7 @@ class Router(ABC):
 
     async def fetch_live_servers(self) -> Dict[str, str]:
         """Fetch all servers from metadata service and return {key: url} mapping"""
-        if not self._metadata_server:
+        if self._metadata_server is None:
             raise RuntimeError("Metadata server is not initialized")
 
         # If metadata server is available, ignore static server list entirely
@@ -679,7 +810,7 @@ class Router(ABC):
                 logger.debug(
                     f"Using {len(server_key_map)} servers from metadata service"
                 )
-            else:
+            elif not self._require_context_cancellation:
                 raise ValueError("No servers found in metadata service")
 
         except Exception as e:
@@ -689,8 +820,19 @@ class Router(ABC):
         return server_key_map
 
     async def check_servers_health(self,
-                                   server_key_map: Dict[str, str]) -> List[str]:
-        """Check health of servers and remove dead ones from metadata service"""
+                                   server_key_map: Dict[str, str],
+                                   *,
+                                   remove_dead: bool = True) -> List[str]:
+        """Probe registered workers, optionally removing unhealthy registrations.
+
+        Args:
+            server_key_map: Metadata registration keys mapped to worker addresses.
+            remove_dead: Whether two failed probes may delete a registration.
+                Startup keeps registrations so workers can finish initialization.
+
+        Returns:
+            Addresses that passed a health probe.
+        """
         live_servers = []
         dead_servers = []
 
@@ -717,6 +859,8 @@ class Router(ABC):
 
         # Remove dead servers from etcd
         for key, dead_server in dead_servers:
+            if not remove_dead:
+                continue
             try:
                 logger.info(
                     f"Removing dead server {dead_server} from metadata server")
@@ -871,6 +1015,7 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
                     f"No available servers after excluding {exclude_server}")
             await self._server_state[server].increment_load_by(num_tokens)
             self._req_routing_table[req_id] = server
+            self._request_load_state[req_id] = self._server_state[server]
             self._coord_request_tokens[req_id] = num_tokens
         return server, {
             "server_info": self._server_info.get(server, {})
@@ -881,10 +1026,11 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
         if req_id is None:
             return
         async with self._lock:
-            server = self._req_routing_table.pop(req_id, None)
+            self._req_routing_table.pop(req_id, None)
             num_tokens = self._coord_request_tokens.pop(req_id, 0)
-            if server is not None and server in self._server_state:
-                await self._server_state[server].decrement_load_by(num_tokens)
+            state = self._request_load_state.pop(req_id, None)
+            if state is not None:
+                await state.decrement_load_by(num_tokens)
 
 
 class PooledLoadBalancingRouter(LoadBalancingRouter):
@@ -1552,10 +1698,12 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                     f"Selected server {server} is no longer available")
             await server_states[server].increment_load(request)
             self._req_routing_table[key] = server
+            self._request_load_state[key] = server_states[server]
             try:
                 self._stash_routed_blocks(key, block_hashes, hash_algo)
             except Exception:
                 self._req_routing_table.pop(key, None)
+                self._request_load_state.pop(key, None)
                 await server_states[server].decrement_load(request)
                 raise
         return server, {
@@ -1589,10 +1737,11 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         async with self._lock:
             server = self._req_routing_table.pop(key, None)
             pending = self._pending_routed_blocks.pop(key, None)
-            if server is not None and server in self._server_state:
-                await self._server_state[server].decrement_load(request)
+            state = self._request_load_state.pop(key, None)
+            if state is not None:
+                await state.decrement_load(request)
         if (success and pending is not None and server is not None
-                and server in self._server_state):
+                and self._server_state.get(server) is state):
             block_hashes, hash_algo = pending
             self._server_state[server].add_blocks(block_hashes,
                                                   hash_algo=hash_algo)
@@ -1646,6 +1795,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         for server in new_servers:
             new_state[server] = (self._server_state.get(server)
                                  or self._create_server_state(server))
+        for server, state in self._server_state.items():
+            if server not in new_state:
+                state.request_poll_stop()
         self._server_state = new_state
 
 
@@ -2924,6 +3076,7 @@ def create_router(
     metadata_server: Optional[JsonDictionary] = None,
     server_preparation_func: Optional[Callable[[str], Awaitable[None]]] = None,
     disagg_node_id: int = 0,
+    require_context_cancellation: bool = False,
 ) -> Router:
     """Factory function to create different types of router instances.
 
@@ -2952,13 +3105,14 @@ def create_router(
     if router_class is None:
         raise ValueError(f"Unsupported router type: {router_type}. "
                          f"Supported types are: {list(router_map.keys())}")
-    extra_args = router_config.args if router_config else {}
+    extra_args = dict(router_config.args) if router_config else {}
     if extra_args.get("max_requests_per_server") is not None:
         if router_class is not LoadBalancingRouter:
             raise ValueError("max_requests_per_server needs the load_balancing "
                              f"router, not {router_type}")
         router_class = PooledLoadBalancingRouter
     extra_args["disagg_node_id"] = disagg_node_id
+    extra_args["require_context_cancellation"] = require_context_cancellation
 
     return router_class(router_config.server_role if router_config else None,
                         servers,
@@ -2977,6 +3131,7 @@ def build_disagg_routers(
     metadata_server: Optional[JsonDictionary] = None,
     server_preparation_func: Optional[Callable[[str], Awaitable[None]]] = None,
     disagg_node_id: int = 0,
+    require_context_cancellation: bool = False,
 ) -> tuple[Router, Router]:
     """Build the ctx and gen routers for one disagg process.
 
@@ -2987,9 +3142,14 @@ def build_disagg_routers(
     :class:`CoordinatorDelegatingRouter` so placement is delegated to the
     coordinator. Round-robin placement stays local.
     """
-    ctx_router = create_router(ctx_router_config, ctx_servers,
-                               metadata_server_cfg, metadata_server,
-                               server_preparation_func, disagg_node_id)
+    ctx_router = create_router(
+        ctx_router_config,
+        ctx_servers,
+        metadata_server_cfg,
+        metadata_server,
+        server_preparation_func,
+        disagg_node_id,
+        require_context_cancellation=require_context_cancellation)
     gen_router = create_router(gen_router_config, gen_servers,
                                metadata_server_cfg, metadata_server,
                                server_preparation_func, disagg_node_id)

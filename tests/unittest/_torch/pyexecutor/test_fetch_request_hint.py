@@ -68,6 +68,10 @@ def _make_stub_executor(rank=0, queued_items=None):
         PyExecutor._has_pending_context_retirement, stub
     )
     stub._fetch_drain_cancellations = MethodType(PyExecutor._fetch_drain_cancellations, stub)
+    stub._context_cancellation_targets = MethodType(PyExecutor._context_cancellation_targets, stub)
+    stub.supports_logical_context_cancellation = MethodType(
+        PyExecutor.supports_logical_context_cancellation, stub
+    )
     # No generation-side receive is retiring.
     stub.disagg = SimpleNamespace(
         has_retiring_gen_receives=False, supports_logical_context_cancellation=lambda req: False
@@ -144,7 +148,9 @@ def test_pending_control_with_draining_connector_ignores_hint():
     future = RequestQueueItem(12, Mock())
     stub = _with_connector(_make_stub_executor(queued_items=[cancel, future]), draining_loads=True)
     stub.control_requests = [RequestQueueItem(CONTROL_REQUEST_ID)]
-    stub.active_requests = [SimpleNamespace(py_request_id=11, is_child=False)]
+    stub.active_requests = [
+        SimpleNamespace(py_request_id=11, is_child=False, py_disaggregated_params=None)
+    ]
     stub._handle_special_queue_items = MethodType(PyExecutor._handle_special_queue_items, stub)
     waiting_queue = FCFSWaitingQueue()
 

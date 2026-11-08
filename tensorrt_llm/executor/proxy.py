@@ -724,6 +724,56 @@ class GenerationExecutorProxy(GenerationExecutor):
     def resource_governor_queue(self):
         return self._resource_governor_queue
 
+    def supports_logical_context_cancellation(self) -> bool:
+        """Report the running executor's independent context-retirement capability.
+
+        Returns:
+            True only when the executor owner supports this cancellation contract.
+        """
+        if self.rpc_client is None:
+            return False
+        return self.rpc_client.supports_logical_context_cancellation().remote(
+            timeout=5.0) is True
+
+    def reserve_context_cancellation(self, request_id: int,
+                                     authorization_id: str,
+                                     authorization_expires_at_ms: int) -> str:
+        """Reserve one native context admission at the shared rank-zero worker.
+
+        Args:
+            request_id: Immutable pairing identity for the context request.
+            authorization_id: Signed nonce shared by duplicate HTTP delivery.
+            authorization_expires_at_ms: Signed UTC authorization expiry.
+
+        Returns:
+            An opaque worker-issued token, shared across HTTP frontend lanes.
+
+        Raises:
+            RPCError: The worker RPC endpoint is unavailable.
+        """
+        if self.rpc_client is None:
+            raise RPCError("Context cancellation requires worker RPC")
+        return self.rpc_client.reserve_context_cancellation(
+            request_id, authorization_id,
+            authorization_expires_at_ms).remote(timeout=5.0)
+
+    def cancel_context_cancellation(self, token: str) -> str:
+        """Forward cancellation and return only its routing receipt.
+
+        Args:
+            token: Worker-issued context admission token.
+
+        Returns:
+            ``not_submitted`` or ``queued``; neither means physical retirement.
+
+        Raises:
+            RPCError: The worker RPC endpoint is unavailable.
+        """
+        if self.rpc_client is None:
+            raise RPCError("Context cancellation requires worker RPC")
+        return self.rpc_client.cancel_context_cancellation(token).remote(
+            timeout=5.0)
+
     def abort_request(self, request_id: int) -> None:
         """Abort a request by sending a cancelling request to the request queue.
 

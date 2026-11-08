@@ -45,6 +45,8 @@ PER_FRONTEND_SAFE = {
     ("GET", "/v1/responses/{response_id}"): "store is off with several frontends",
     ("DELETE", "/v1/responses/{response_id}"): "store is off with several frontends",
     ("POST", "/_internal/tokenize"): "tokenizer only",
+    ("POST", "/internal/context-cancellation/reserve"): "reservation in the shared worker via RPC",
+    ("POST", "/internal/context-cancellation/cancel"): "cancellation in the shared worker via RPC",
     ("GET", "/energy_metrics"): "the same GPUs from every process",
     ("GET", "/v1/data_transceiver_state"): "read from the shared executor",
     ("GET", "/steady_clock_offset"): "every frontend reads the same host clock",
