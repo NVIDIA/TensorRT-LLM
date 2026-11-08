@@ -173,10 +173,17 @@ class HaloRRelayEndpoint:
         home_experts: int,
         copy_stream: torch.cuda.Stream,
         helper_residency: bool,
+        first_run_spin_cycles: int,
     ) -> None:
         from cuda.bindings import driver
 
+        from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
+
         self._driver = driver
+        # The bound of each breakable bucket's first eager launch; see submit_fused.
+        self._in_breakable_cuda_graph = is_in_breakable_cuda_graph
+        self._first_run_spin_cycles = int(first_run_spin_cycles)
+        self._breakable_token_counts: set[int] = set()
         self.device = int(scheduler.device.index)
         self._copy_stream = copy_stream
         self._copy_handle = int(copy_stream.cuda_stream)
@@ -370,18 +377,38 @@ class HaloRRelayEndpoint:
         and never reads it. ``spin_cycles`` bounds every cross-rank and
         cross-CTA wait of the launch. Returns the launched generation, which
         is also the READY value the launch publishes.
+
+        Inside a breakable CUDA graph region, the first eager launch at each
+        routed-token count (a bucket's warmup before its capture) waits at
+        least the warmup bound. The breakable runner runs that pass under the
+        serving timeouts, so that the captured graphs keep them, and a peer's
+        one-time work on the breakable path (JIT compilation, module loading)
+        can delay a bucket's first run by minutes. A captured launch keeps
+        ``spin_cycles``, which its replays reuse, and does not count as a
+        run: its kernel runs only on replay. Launches outside a breakable
+        region keep ``spin_cycles``.
         """
         del route_target
+        rows = int(routes.shape[0])
         with self._lock:
             self._require_operational()
             if outputs is not self._outputs:
                 raise RuntimeError("outputs are not from the bound CUDA scheduler")
             self._require_live_bank_reusable()
             self._launch_captured = torch.cuda.is_current_stream_capturing()
+            first_run = (
+                not self._launch_captured
+                and rows not in self._breakable_token_counts
+                and self._in_breakable_cuda_graph()
+            )
+            if first_run:
+                spin_cycles = max(int(spin_cycles), self._first_run_spin_cycles)
             try:
                 torch.ops.trtllm.moe_rebalance_halo_r_submit_fused(
                     self._handle, routes, spin_cycles
                 )
+                if first_run:
+                    self._breakable_token_counts.add(rows)
                 self._active_generation = self._generation
             except BaseException:
                 self._handoff_aborted = True
@@ -649,6 +676,7 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
             home_experts=self.home_experts,
             copy_stream=self.copy_stream,
             helper_residency=bool(helper_residency),
+            first_run_spin_cycles=int(spin_bound.warmup_cycles),
         )
 
         # Set this layer's READY row to 1, as a launch before the first would

@@ -43,6 +43,7 @@ _SCHEDULER_RUNTIME = (
     _ROOT / "tensorrt_llm/_torch/moe/kernels/megamoe_scheduler/cuda_scheduler/runtime.py"
 )
 _SCHEDULER_PACKAGE = "tensorrt_llm._torch.moe.kernels.megamoe_scheduler.cuda_scheduler"
+_BREAKABLE_PACKAGE = "tensorrt_llm._torch.pyexecutor.breakable_cuda_graph"
 
 _MAIN = 44
 _OTHER_MAIN = 45
@@ -154,6 +155,7 @@ def _build(
         fail_submit=False,
         counters=[0, 0, 0],
         capturing=False,
+        breakable=False,
         peer_reset=None,
     )
     priorities = {_MAIN: 0, _OTHER_MAIN: 0, _COPY: -1}
@@ -182,6 +184,12 @@ def _build(
     cuda_package.bindings = bindings
     monkeypatch.setitem(sys.modules, "cuda", cuda_package)
     monkeypatch.setitem(sys.modules, "cuda.bindings", bindings)
+    breakable = ModuleType(_BREAKABLE_PACKAGE)
+    breakable.is_in_breakable_cuda_graph = lambda: state.breakable
+    monkeypatch.setitem(
+        sys.modules, "tensorrt_llm._torch.pyexecutor", ModuleType("tensorrt_llm._torch.pyexecutor")
+    )
+    monkeypatch.setitem(sys.modules, _BREAKABLE_PACKAGE, breakable)
 
     class Config:
         def __init__(self, **values):
@@ -330,7 +338,9 @@ def _build(
         terminal_flags_tensor=lambda: ready_row,
     )
     if spin_bound is None:
-        spin_bound = SimpleNamespace(cycles=lambda: _SERVING_SPIN_CYCLES)
+        spin_bound = SimpleNamespace(
+            cycles=lambda: _SERVING_SPIN_CYCLES, warmup_cycles=_WARMUP_SPIN_CYCLES
+        )
     copy = SimpleNamespace(cuda_stream=_COPY, priority=-1, device=SimpleNamespace(index=0))
     group = HaloRSlotSchedulerGroup(
         arena=arena,
@@ -531,14 +541,18 @@ def test_each_launch_takes_the_spin_bound_of_its_moment(
 ):
     guard = moe_comm_timeout_guard.MoECommTimeoutGuard(environ=environ, is_capturing=lambda: False)
     tuning = [False]
-    env = _build(monkeypatch, spin_bound=SimpleNamespace(cycles=lambda: bound.cycles()))
+    env = _build(
+        monkeypatch,
+        spin_bound=SimpleNamespace(cycles=lambda: bound.cycles(), warmup_cycles=warmup_cycles),
+    )
     bound = SchedulerSpinBound(
         warmup_seconds=guard.budgets().warmup_seconds, is_tuning=lambda: tuning[0]
     )
+    assert bound.warmup_cycles == warmup_cycles
     guard.register(bound)
 
-    def launched_cycles():
-        _layer_call(env.group, 4)
+    def launched_cycles(rows=4):
+        _layer_call(env.group, rows)
         return next(entry[3] for entry in reversed(env.trace) if entry[0] == "submit")
 
     assert launched_cycles() == serving_cycles
@@ -551,6 +565,42 @@ def test_each_launch_takes_the_spin_bound_of_its_moment(
     guard.set_warmup(False)
     tuning[0] = True
     assert launched_cycles() == warmup_cycles
+    tuning[0] = False
+
+
+def test_a_breakable_buckets_first_eager_launch_waits_the_warmup_bound(monkeypatch) -> None:
+    """The breakable capture pass runs each bucket first, eagerly, under the serving timeouts."""
+    env = _build(monkeypatch)
+    state = env.state
+
+    def launched_cycles(rows):
+        _layer_call(env.group, rows)
+        return next(entry[3] for entry in reversed(env.trace) if entry[0] == "submit")
+
+    # Eager launches outside a breakable region keep the serving bound and are not
+    # counted, as the warmups before the capture pass run 4 tokens here.
+    assert launched_cycles(4) == _SERVING_SPIN_CYCLES
+    state.breakable = True
+    # A bucket's warmup: its first eager launch waits the warmup bound, the next ones do not.
+    assert launched_cycles(4) == _WARMUP_SPIN_CYCLES
+    assert launched_cycles(4) == _SERVING_SPIN_CYCLES
+    # A captured launch keeps the serving bound, which its replays reuse, and is not a run.
+    state.capturing = True
+    assert launched_cycles(8) == _SERVING_SPIN_CYCLES
+    state.capturing = False
+    assert launched_cycles(8) == _WARMUP_SPIN_CYCLES
+    # A failed submission does not count as a run.
+    state.fail_submit = True
+    with pytest.raises(RuntimeError, match="launch failed"):
+        env.group.plan_schedule(_Routes(16))
+    assert 16 not in env.endpoint._breakable_token_counts
+    # Each layer's endpoint keeps its own counts.
+    other = _build(monkeypatch)
+    other.state.breakable = True
+    _layer_call(other.group, 4)
+    assert next(entry[3] for entry in reversed(other.trace) if entry[0] == "submit") == (
+        _WARMUP_SPIN_CYCLES
+    )
 
 
 def test_finish_joins_copy_every_call_and_waits_for_a_caller_event(monkeypatch):
