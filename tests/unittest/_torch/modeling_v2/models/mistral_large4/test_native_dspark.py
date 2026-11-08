@@ -294,6 +294,21 @@ def test_rotary_positions_match_complex_rotation(modeling, layout, dtype):
     torch.testing.assert_close(actual, expected)
 
 
+def test_draft_logits_are_soft_capped_once(modeling):
+    # The worker passes the output of logits_processor through
+    # apply_draft_logit_transform, and requires a plain logits processor only
+    # from a drafter that declares logit_multiplier or logit_softcap.
+    draft = _draft(modeling, SimpleNamespace(w={}, heads=1, lat_dim=4))
+    draft._shell.softcap = 2.0
+    draft._shell.logits_processor = lambda hidden, lm_head, attn_metadata, gather: hidden
+    hidden = torch.linspace(-8.0, 8.0, 12).reshape(3, 4)
+    capped = draft.logits_processor(hidden, None, None, True)
+    torch.testing.assert_close(capped, 2.0 * torch.tanh(hidden / 2.0))
+    assert draft.apply_draft_logit_transform(capped) is capped
+    assert getattr(draft, "logit_multiplier", 1.0) == 1.0
+    assert getattr(draft, "logit_softcap", None) is None
+
+
 @pytest.mark.parametrize("phase", ["PrefillTarget", "DecodeTarget"])
 def test_block_attention_matches_explicit_kv_and_obeys_window(modeling, monkeypatch, phase):
     # Compare the absorbed latent path with ordinary per-head K/V attention.
