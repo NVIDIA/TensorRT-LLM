@@ -38,6 +38,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence
+from uuid import uuid4
 
 from tensorrt_llm.logger import logger
 
@@ -522,9 +523,10 @@ def _published_manifest(manifest: PoolManifest, paths: Sequence[str]) -> Iterato
             if directory:
                 os.makedirs(directory, exist_ok=True)
             # Renamed into place so a reader never sees a partial manifest.
-            staging = f"{path}.partial"
+            staging = os.path.join(directory, f".pool-manifest-{uuid4().hex}.partial")
+            handle = open(staging, "x")
             try:
-                with open(staging, "w") as handle:
+                with handle:
                     handle.write(f"{record}\n")
                 os.replace(staging, path)
                 published.append(path)

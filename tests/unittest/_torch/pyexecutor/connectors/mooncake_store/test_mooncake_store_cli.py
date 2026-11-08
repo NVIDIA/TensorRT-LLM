@@ -29,7 +29,7 @@ import json
 import os
 import signal
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -265,18 +265,20 @@ def test_partial_manifest_publication_is_retracted(tmp_path):
     occupied.mkdir()
     sentinel = occupied / "keep"
     sentinel.write_text("unrelated")
+    other_staging = tmp_path / "occupied.partial"
+    other_staging.write_text("another publisher")
     manifest = PoolManifest(master_server_address="127.0.0.1:50051")
 
     with patch.object(os, "replace", wraps=os.replace) as replace, pytest.raises(OSError):
         with _published_manifest(manifest, [str(published), str(occupied)]):
             pytest.fail("publishing over a directory should not have yielded")
 
-    assert replace.call_args_list == [
-        call(f"{published}.partial", str(published)),
-        call(f"{occupied}.partial", str(occupied)),
+    assert [attempt.args[1] for attempt in replace.call_args_list] == [
+        str(published),
+        str(occupied),
     ]
-    assert not published.exists()
-    assert not (tmp_path / "occupied.partial").exists()
+    assert set(tmp_path.iterdir()) == {occupied, other_staging}
+    assert other_staging.read_text() == "another publisher"
     assert sentinel.read_text() == "unrelated"
 
 
@@ -292,7 +294,8 @@ def test_failed_manifest_publication_preserves_unvisited_paths(tmp_path):
         with _published_manifest(manifest, [str(occupied), str(untouched)]):
             pytest.fail("publishing over a directory should not have yielded")
 
-    replace.assert_called_once_with(f"{occupied}.partial", str(occupied))
+    assert replace.call_count == 1
+    assert replace.call_args.args[1] == str(occupied)
     assert untouched.read_text() == contents
     assert occupied.is_dir()
-    assert not (tmp_path / "occupied.partial").exists()
+    assert set(tmp_path.iterdir()) == {occupied, untouched}
