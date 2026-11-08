@@ -142,6 +142,11 @@ class KVCacheV2IterationStatsReport:
     # this iteration. They sit on no cache level, so cached_tokens_by_level does not count them.
     # None when no connector can serve tokens.
     connector_cached_tokens: int | None = None
+    # Hybrid recurrent models: prefix tokens that matched in the attention cache for requests
+    # admitted during this iteration, and how many of them were recomputed because no recurrent
+    # state snapshot covered them. None for models without recurrent layers.
+    prefix_matched_tokens: int | None = None
+    prefix_snapshot_lost_tokens: int | None = None
 
 
 def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = None) -> dict:
@@ -239,6 +244,9 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
         stats_dict["kvCacheLevelTiers"] = list(kv_iter_stats.cache_level_tiers)
     if kv_iter_stats.connector_cached_tokens is not None:
         stats_dict["iterConnectorCachedTokens"] = kv_iter_stats.connector_cached_tokens
+    if kv_iter_stats.prefix_matched_tokens is not None:
+        stats_dict["iterPrefixMatchedTokens"] = kv_iter_stats.prefix_matched_tokens
+        stats_dict["iterPrefixSnapshotLostTokens"] = kv_iter_stats.prefix_snapshot_lost_tokens
 
     stats_dict["kvCacheIterationStatsByPoolGroup"] = {
         str(pool_group_id): {
