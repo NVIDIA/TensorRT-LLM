@@ -2356,13 +2356,14 @@ def test_share_jit_builds_sets_aside_profiles_built_elsewhere(
     assert not tuner.stats.failed_profiling_count[op]
     assert len(tuner.profiling_cache.get_specific_custom_op(op)) == 4
     assert jit_share._DEFER_ENV not in os.environ
+    assert jit_share._DEADLINE_ENV not in os.environ
 
 
 def test_deep_gemm_jit_share_builds_each_kernel_once(tmp_path):
     """DeepGEMM's compiler wrapper builds a kernel in the process that claims
     it. Others copy the published cubin, report busy while it is being built if
-    asked to defer, and build it themselves when the claimant never publishes
-    or its claim is stale."""
+    asked to defer, and build it themselves when the claimant does not publish
+    it within their wait, which an enclosing deadline cuts short."""
     calls = tmp_path / "calls"
     compiler = tmp_path / "fake_nvcc"
     compiler.write_text(
@@ -2405,11 +2406,10 @@ def test_deep_gemm_jit_share_builds_each_kernel_once(tmp_path):
     def builds() -> int:
         return calls.read_text().count("--cubin") if calls.exists() else 0
 
-    def claim(argv: List[str], age_s: float = 0.0) -> None:
+    def claim(argv: List[str]) -> None:
         kernels.mkdir(parents=True, exist_ok=True)
         path = kernels / f"{jit_share._kernel_key(argv[0], argv)}.claim"
         path.write_text("another process\n")
-        os.utime(path, (path.stat().st_mtime - age_s, ) * 2)
 
     assert "release 13.0" in run(["--version"]).stdout
 
@@ -2428,8 +2428,9 @@ def test_deep_gemm_jit_share_builds_each_kernel_once(tmp_path):
     assert builds() == 2
 
     argv = kernel("d", "kernel three")
-    claim(argv, age_s=3600)
-    assert run(argv, **{jit_share._DEFER_ENV: "1"}).returncode == 0
+    claim(argv)
+    past = {jit_share._WAIT_ENV: "600", jit_share._DEADLINE_ENV: repr(0.0)}
+    assert run(argv, **past).returncode == 0
     assert builds() == 3
 
 
@@ -2498,6 +2499,26 @@ def test_shared_kernel_cache_marks_a_raised_compile_failed(
         assert (2, "tile") not in here  # claimed; tuning ends before a store
     assert waits == [True]
     assert len(list((tmp_path / "cute").glob("*.failed"))) == 2
+
+
+def test_jit_share_waits_end_at_the_deadline(monkeypatch, tmp_path):
+    """A wait for another process's sweep item or kernel ends at the deadline
+    of an enclosing wait_until, however long the wait setting, so that a
+    claimant that hangs delays the others by one wait at most."""
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(jit_share._WAIT_ENV, "600")
+    monkeypatch.setattr(jit_share, "_cute_identity", lambda: "test")
+    sweep = jit_share.SharedSweep("sweep")
+    assert sweep.claim(0) and not sweep.claim(0)
+    cache = jit_share.SharedKernelCache("Runner")
+    (tmp_path / "cute").mkdir()
+    open(cache._paths((1, "tile"))[2], "w").close()  # claimed elsewhere
+    with jit_share.sharing_kernels(), jit_share.wait_until(0.0):
+        assert not sweep.wait_done(0)
+        assert (1, "tile") not in cache
+    assert jit_share._DEADLINE_ENV not in os.environ
+    sweep.done(0)
+    assert sweep.wait_done(0)
 
 
 def test_build_across_ranks_runs_only_claimed_items(monkeypatch, tmp_path):

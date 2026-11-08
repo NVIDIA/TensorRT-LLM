@@ -1297,8 +1297,13 @@ class AutoTuner:
                     self._profile_sharing_jit_builds(custom_op, profiles,
                                                      profile_one, is_pending)
                 else:
-                    for p in profiles:
-                        profile_one(p)
+                    # Profiling waits for the kernels other processes still build in
+                    # the build pass, all of them together for one wait at most.
+                    with (jit_share.wait_until(time.time() +
+                                               jit_share.wait_seconds())
+                          if share_builds else contextlib.nullcontext()):
+                        for p in profiles:
+                            profile_one(p)
 
         self._maybe_sync_cache_data(tuning_config.distributed_tuning_strategy,
                                     custom_op)
@@ -1430,6 +1435,9 @@ class AutoTuner:
         goes on to kernels nobody has claimed, and runs the set-aside profiles after
         the others. Last, it runs the profiles other processes claimed, each once that
         process has run it, when the profile's kernel is in DeepGEMM's shared cache.
+        The set-aside and other processes' profiles wait for other processes at most
+        one wait in total (:func:`jit_share.wait_seconds`); past it, this process runs
+        each profile left and builds its kernel itself.
         """
         profiles = list(profiles)
         pending = [i for i, p in enumerate(profiles) if is_pending(p)]
@@ -1458,15 +1466,17 @@ class AutoTuner:
                 claimed.append(i)
                 sweep.done(i)
         aside_begin = time.perf_counter()
-        for i in set_aside:
-            try:
+        late = 0
+        with jit_share.wait_until(time.time() + jit_share.wait_seconds()):
+            for i in set_aside:
+                try:
+                    profile_one(profiles[i])
+                finally:
+                    sweep.done(i)
+            others_begin = time.perf_counter()
+            for i in others:
+                late += not sweep.wait_done(i)
                 profile_one(profiles[i])
-            finally:
-                sweep.done(i)
-        others_begin = time.perf_counter()
-        for i in others:
-            sweep.wait_done(i)
-            profile_one(profiles[i])
         pending_set = set(pending)
         for i, p in enumerate(profiles):
             if i not in pending_set:
@@ -1476,7 +1486,8 @@ class AutoTuner:
             f"ran {len(claimed) + len(set_aside)} claimed in {others_begin - begin:.1f}s "
             f"({len(set_aside)} set aside while another process built their kernel, "
             f"{others_begin - aside_begin:.1f}s), then {len(others)} claimed elsewhere in "
-            f"{time.perf_counter() - others_begin:.1f}s")
+            f"{time.perf_counter() - others_begin:.1f}s ({late} not run there in time)"
+        )
 
     def _prime_cached_tactics(
         self,

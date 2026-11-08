@@ -38,11 +38,15 @@ reuse the result. Two kinds of kernels are shared:
   stored in it is exported there.
 
 Either way, a process that finds a kernel claimed by another waits for it (at
-most ``TLLM_JIT_SHARE_WAIT_S`` seconds, default 300) or, inside
-:class:`defer_busy_builds`, fails at once with :data:`BUSY_MARK` in its error
-so that the caller can do other work first. It builds the kernel itself when
-the claimant failed, the wait ran out, or the claim is older than
-``TLLM_JIT_SHARE_CLAIM_TTL_S`` seconds (default 600).
+most ``TLLM_JIT_SHARE_WAIT_S`` seconds, default 60, and not past the deadline
+of an enclosing :class:`wait_until`) or, inside :class:`defer_busy_builds`,
+fails at once with :data:`BUSY_MARK` in its error so that the caller can do
+other work first. It builds the kernel itself when the claimant failed or the
+wait ran out, so a claimant that died or hangs (for instance in I/O to the
+shared file system) delays the others by one wait at most. A process never
+reads the files another process claimed with, only checks whether results
+exist: on a network file system, reading a file another client wrote can block
+for as long as that client is unreachable.
 
 A DeepGEMM key hashes the kernel source, the compiler arguments with the
 temporary directory left out, and the contents of the compiler and of
@@ -77,7 +81,7 @@ _REAL_COMPILER_ENV = "TLLM_JIT_SHARE_NVCC"
 _SALT_ENV = "TLLM_JIT_SHARE_SALT"
 _DEFER_ENV = "TLLM_JIT_SHARE_DEFER"
 _WAIT_ENV = "TLLM_JIT_SHARE_WAIT_S"
-_CLAIM_TTL_ENV = "TLLM_JIT_SHARE_CLAIM_TTL_S"
+_DEADLINE_ENV = "TLLM_JIT_SHARE_DEADLINE"
 _LOG_ENV = "TLLM_JIT_SHARE_LOG"
 _PROCESS_ENV = "TLLM_JIT_SHARE_PROCESS"
 # Linux reads at most this much of a script's "#!" line on older kernels.
@@ -125,6 +129,42 @@ class defer_busy_builds:
         return False
 
 
+class wait_until:
+    """Within the block, no wait for another process's build lasts past ``deadline``
+    (a :func:`time.time` value), so that a block that waits for many builds waits at
+    most until then in total; after it, the process builds what it still needs.
+
+    The setting is process-wide: it reaches DeepGEMM's compiler through the environment.
+    """
+
+    def __init__(self, deadline: float):
+        self._deadline = deadline
+
+    def __enter__(self):
+        self._previous = os.environ.get(_DEADLINE_ENV)
+        os.environ[_DEADLINE_ENV] = repr(self._deadline)
+        return self
+
+    def __exit__(self, *exc_info):
+        if self._previous is None:
+            os.environ.pop(_DEADLINE_ENV, None)
+        else:
+            os.environ[_DEADLINE_ENV] = self._previous
+        return False
+
+
+def wait_seconds() -> float:
+    """How long a process waits at most for a build of another process."""
+    return float(os.environ.get(_WAIT_ENV, "60"))
+
+
+def _wait_deadline() -> float:
+    deadline = time.time() + wait_seconds()
+    if os.environ.get(_DEADLINE_ENV):
+        deadline = min(deadline, float(os.environ[_DEADLINE_ENV]))
+    return deadline
+
+
 def start_fraction() -> float:
     """Where this process starts a pass over a list of builds, as a fraction of it.
 
@@ -158,19 +198,22 @@ class SharedSweep:
         os.makedirs(self.dir, exist_ok=True)
 
     def claim(self, index: int) -> bool:
-        """Claim item ``index``; False if another process claimed it (and the claim is not stale)."""
-        path = os.path.join(self.dir, f"{index}.claim")
-        return _claim(path) or (_claim_is_stale(path) and not self._is_done(index))
+        """Claim item ``index``; False if another process claimed it."""
+        return _claim(os.path.join(self.dir, f"{index}.claim"))
 
     def done(self, index: int) -> None:
         """Record that item ``index`` has run, so its builds are published."""
         os.close(os.open(os.path.join(self.dir, f"{index}.done"), os.O_CREAT | os.O_WRONLY, 0o644))
 
-    def wait_done(self, index: int) -> None:
-        """Wait until the process that claimed item ``index`` has run it, or its claim is stale."""
-        claim = os.path.join(self.dir, f"{index}.claim")
-        while not self._is_done(index) and not _claim_is_stale(claim):
+    def wait_done(self, index: int) -> bool:
+        """Wait until the process that claimed item ``index`` has run it, or the wait runs
+        out (see :func:`wait_seconds` and :class:`wait_until`); True if it has run."""
+        deadline = _wait_deadline()
+        while not self._is_done(index):
+            if time.time() >= deadline:
+                return False
             time.sleep(0.02)
+        return True
 
     def _is_done(self, index: int) -> bool:
         return os.path.exists(os.path.join(self.dir, f"{index}.done"))
@@ -263,8 +306,6 @@ class SharedKernelCache(dict):
             if _claim(claim):
                 _unstored.claim = (claim, failed)
                 return False  # This process compiles it; the store exports it.
-            if _claim_is_stale(claim):
-                return False
             if os.environ.get(_DEFER_ENV) == "1" and not os.path.exists(failed):
                 _log(os.environ[SHARE_DIR_ENV], start, "cute-busy", name)
                 raise KernelBusy(f"{BUSY_MARK} {name}")
@@ -553,17 +594,9 @@ def _claim(claim: str) -> bool:
     return True
 
 
-def _claim_is_stale(claim: str) -> bool:
-    try:
-        age = time.time() - os.stat(claim).st_mtime
-    except FileNotFoundError:
-        return True
-    return age > float(os.environ.get(_CLAIM_TTL_ENV, "600"))
-
-
 def _wait(result: str, failed: str) -> bool:
-    deadline = time.monotonic() + float(os.environ.get(_WAIT_ENV, "300"))
-    while time.monotonic() < deadline and not os.path.exists(failed):
+    deadline = _wait_deadline()
+    while time.time() < deadline and not os.path.exists(failed):
         if os.path.exists(result):
             return True
         time.sleep(0.02)
@@ -599,8 +632,6 @@ def main(argv: list[str]) -> int:
         action, returncode = "copied", _copy(cubin, output)
     elif _claim(claim):
         action, returncode = "built", _build(compiler, argv, output, cubin, failed)
-    elif _claim_is_stale(claim):
-        action, returncode = "stale", _build(compiler, argv, output, cubin, failed)
     elif os.environ.get(_DEFER_ENV) == "1" and not os.path.exists(failed):
         print(f"{BUSY_MARK} {key}", flush=True)
         action, returncode = "busy", BUSY_EXIT_CODE
