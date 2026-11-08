@@ -139,8 +139,7 @@ def build_manager(mode: str, max_batch_size: int = 8, num_layers: int = 1):
         mode,
         type(cache),
     )
-    # Only kda_mtp_decode's replay caches have slots of their own; the draft records share the state slot.
-    assert (mgr.replay_layer_group_id is not None) == (mode == "replay"), mode
+    assert (mgr.replay_layer_group_id is not None) == has_replay, mode
     if mode == "sequential":
         assert cache.intermediate_conv_window is not None, "no sequential-verify buffers"
     return mgr
