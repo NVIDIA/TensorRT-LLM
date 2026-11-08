@@ -1490,7 +1490,8 @@ def c55_plan(key, max_batch_size, arena) -> set:
     that carries the half window, and the drafter arena's: over a windowed arena on an
     architecture other than sm107, ``context_kv_fork`` and ``verify_fold`` only with the
     window compaction; any other arena leaves the compaction out. No served path builds on
-    one of these names there, so each rule removes the name alone."""
+    one of these names there, so each rule removes the name alone. Then the base paths added
+    since, beside the path it builds on: ``draft_head_sampled`` (``draft_head``)."""
     paths = set(C55_SERVED[key])
     if max_batch_size is None or max_batch_size > 8:
         paths.discard("half_window_experts")
@@ -1501,6 +1502,9 @@ def c55_plan(key, max_batch_size, arena) -> set:
             paths -= {"context_kv_fork", "verify_fold"}
     else:
         paths.discard("drafter_window_compact")
+    for added, base in (("draft_head_sampled", "draft_head"),):
+        if base in paths:
+            paths.add(added)
     return paths
 
 

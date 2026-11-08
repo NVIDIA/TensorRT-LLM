@@ -365,6 +365,12 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("draft_head",),
     ),
     FastPath(
+        "draft_head_sampled",
+        "sampled drafts (rejection sampling) on the draft head's lattice, walked in one launch",
+        "draft",
+        ("draft_head",),
+    ),
+    FastPath(
         "drafter_hops",
         "drafter all-reduce hops, releasing dependents early",
         "draft",
@@ -1656,7 +1662,7 @@ PRECONDITIONS: Tuple[Precondition, ...] = (
     Precondition(
         "ninja and nvcc for the head sampler's build (torch.utils.cpp_extension)",
         _head_sampler_toolchain,
-        ("split_sampler",),
+        ("split_sampler", "draft_head_sampled"),
     ),
 )
 
