@@ -451,8 +451,6 @@ def _hybrid_reuse_ctx_chunk_config(
             f"scheduler_config.context_chunking_policy={configured_policy} "
             "with FORCE_CHUNK.",
             key="hybrid_reuse_replaces_chunking_policy")
-    # Snapshot boundaries come from expect_snapshot_points.  The unit is
-    # only used to align chunks shortened by the scheduling budget.
     return (ContextChunkingPolicy.FORCE_CHUNK, tokens_per_block)
 
 
@@ -1121,6 +1119,8 @@ def _create_py_executor(
         ctx_chunk_config = None
 
     if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
+        # Snapshot boundaries come from expect_snapshot_points.  The unit is
+        # only used to align chunks shortened by the scheduling budget.
         ctx_chunk_config = _hybrid_reuse_ctx_chunk_config(
             ctx_chunk_config, tokens_per_block,
             scheduler_config.context_chunking_policy)
