@@ -55,7 +55,6 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
-from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 from .fused_moe_cutlass import raise_moe_lora_multichunk_unsupported
 from .impl_contract import MoECommPlan, MoERunContext, MoESortTables, PreroutedRouting
 from .interface import FORCE_SEPARATED_ROUTING, MoESchedulerKind
@@ -285,7 +284,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
     # NVLink-specific EPLB stat-gather paths)
     # ------------------------------------------------------------------
     def _is_using_nvlink_two_sided(self) -> bool:
-        return isinstance(self.moe.comm, (NVLinkTwoSided, NVLinkTwoSidedFlashinfer))
+        return isinstance(self.moe.comm, NVLinkTwoSided)
 
     def _is_using_nvlink_one_sided(self) -> bool:
         return isinstance(self.moe.comm, NVLinkOneSided)
