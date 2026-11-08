@@ -137,17 +137,60 @@ def test_prims_ts_qwen2_gqa(
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
 @pytest.mark.parametrize("kv_dtype", [None, "fp8"], ids=["native-kv", "fp8-kv"])
 @pytest.mark.parametrize("num_cached_tokens", [[0, 0], [32, 64]], ids=["context", "cached-context"])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("preprocessing", ["cached-rope", "computed-rope"])
+@pytest.mark.parametrize("head_dim", [128, 256])
 def test_prims_ts_context_receives_zeroed_v_tail(
     monkeypatch: pytest.MonkeyPatch,
     use_kv_cache_manager_v2: bool,
     kv_dtype: str | None,
     num_cached_tokens: list[int],
+    dtype: str,
+    preprocessing: str,
+    head_dim: int,
 ) -> None:
     import backend_case
 
+    from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
     from tensorrt_llm._torch.attention.backends.prims_ts.context import BatchPrefillPagedTSWrapper
 
+    original_run_context = PrimsTSFmha.run_context
+
+    def run_context_with_selected_preprocessing(self, params):
+        # An absent cosine/sine table selects the preprocessing kernel that
+        # computes RoPE coefficients, with the same RoPE semantics.
+        with monkeypatch.context() as context_patch:
+            if preprocessing == "computed-rope":
+                context_patch.setattr(self.attn, "rotary_cos_sin", None)
+            return original_run_context(self, params)
+
     original_build_kv_cache_manager = backend_case._build_kv_cache_manager
+    original_fill_kv_cache = backend_case.fill_kv_cache_logical
+    original_generate_inputs = backend_case.generate_inputs
+    trt_managers: set[int] = set()
+    inputs_for_check: dict = {}
+
+    def generate_inputs(*args, **kwargs):
+        inputs = original_generate_inputs(*args, **kwargs)
+        # Bound RoPE operands so FP8 rounding at a bin boundary stays within
+        # the cache oracle's tolerance. Valid V values remain unmodified.
+        for tensor in (inputs["q"], inputs["new_k"], *inputs["cached_k"]):
+            tensor.clamp_(-1, 1)
+        inputs_for_check.update(inputs)
+        return inputs
+
+    def fill_cache_and_poison_tail(manager, layer_idx, request_ids, *args, **kwargs):
+        original_fill_kv_cache(manager, layer_idx, request_ids, *args, **kwargs)
+        if id(manager) not in trt_managers:
+            return
+        pool = manager.get_buffers(layer_idx, kv_layout="HND")
+        page_size = pool.shape[3]
+        block_indices = manager.get_batch_cache_indices(list(request_ids), layer_idx)
+        for batch_idx, seq_len in enumerate(case.token_nums):
+            tail_start = (seq_len - 1) % page_size + 1
+            physical_page = int(block_indices[batch_idx][(seq_len - 1) // page_size])
+            pool[physical_page, 1, :, tail_start:, :].fill_(float("nan"))
+
     original_run = BatchPrefillPagedTSWrapper.run
     checked_tails: list[tuple[int, int]] = []
     plan_flags: list[bool] = []
@@ -164,7 +207,7 @@ def test_prims_ts_context_receives_zeroed_v_tail(
     ) -> object:
         manager = original_build_kv_cache_manager(case, backend, kv_dtype)
         if backend == "TRTLLM":
-            manager.get_buffers(0, kv_layout="HND")[:, 1].fill_(float("nan"))
+            trt_managers.add(id(manager))
         return manager
 
     def run_with_zeroed_v_tail_check(
@@ -177,8 +220,8 @@ def test_prims_ts_context_receives_zeroed_v_tail(
         seq_lens_kv: torch.Tensor,
         **kwargs: object,
     ) -> torch.Tensor:
-        # Native tails are zeroed by preprocessing. Poison FP8 tails at the
-        # handoff so fresh zero-filled cache allocations cannot mask the bug.
+        # Check the producer's zero-tail contract before the consumer runs,
+        # including preservation of every valid V element in the last page.
         page_size = v_cache.shape[2]
         seq_lens = seq_lens_kv.cpu().tolist()
         page_indices = block_tables.cpu()
@@ -189,11 +232,18 @@ def test_prims_ts_context_receives_zeroed_v_tail(
                 continue
             physical_page = int(page_indices[batch_idx, logical_last_page].item())
             tail = v_cache[physical_page, :, tail_start:, :]
-            if kv_dtype == "fp8":
-                tail.fill_(float("nan"))
-                assert torch.isnan(tail.float()).all()
-            else:
-                assert torch.count_nonzero(tail).item() == 0
+            assert torch.count_nonzero(tail.float()).item() == 0
+            new_v_start = sum(case.seq_lens[:batch_idx])
+            new_v = inputs_for_check["new_v"][new_v_start : new_v_start + case.seq_lens[batch_idx]]
+            logical_v = torch.cat(
+                (
+                    inputs_for_check["cached_v"][batch_idx],
+                    new_v.view(-1, case.num_kv_heads, case.head_dim),
+                )
+            )
+            expected = logical_v[logical_last_page * page_size :].to(v_cache.dtype)
+            actual = v_cache[physical_page, :, :tail_start, :].transpose(0, 1)
+            torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
             checked_tails.append((batch_idx, tail_start))
 
         return original_run(
@@ -208,6 +258,9 @@ def test_prims_ts_context_receives_zeroed_v_tail(
         )
 
     monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
+    monkeypatch.setattr(PrimsTSFmha, "run_context", run_context_with_selected_preprocessing)
+    monkeypatch.setattr(backend_case, "generate_inputs", generate_inputs)
+    monkeypatch.setattr(backend_case, "fill_kv_cache_logical", fill_cache_and_poison_tail)
     monkeypatch.setattr(
         backend_case,
         "_build_kv_cache_manager",
@@ -220,8 +273,10 @@ def test_prims_ts_context_receives_zeroed_v_tail(
     )
     monkeypatch.setattr(BatchPrefillPagedTSWrapper, "plan", record_plan)
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
+    rope = dict(_QWEN2_7B["rope"])
+    rope["dim"] = head_dim
     case = BackendCase(
-        **_QWEN2_7B,
+        **{**_QWEN2_7B, "head_dim": head_dim, "dtype": dtype, "rope": rope},
         seq_lens=[65, 37],
         num_cached_tokens=num_cached_tokens,
         kv_dtype=kv_dtype,
@@ -234,7 +289,35 @@ def test_prims_ts_context_receives_zeroed_v_tail(
     assert "TRTLLM" in results
     assert torch.isfinite(results["TRTLLM"]).all()
     assert checked_tails == [(0, 1), (1, 5)]
-    assert plan_flags == [kv_dtype != "fp8"]
+    assert plan_flags == [True]
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("kv_dtype", [None, "fp8"], ids=["native-kv", "fp8-kv"])
+def test_prims_ts_decode_with_computed_rope(
+    monkeypatch: pytest.MonkeyPatch, dtype: str, kv_dtype: str | None
+) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
+
+    original_run_generation = PrimsTSFmha.run_generation
+
+    def run_generation_without_rope_table(self, params):
+        with monkeypatch.context() as context_patch:
+            context_patch.setattr(self.attn, "rotary_cos_sin", None)
+            return original_run_generation(self, params)
+
+    monkeypatch.setattr(PrimsTSFmha, "run_generation", run_generation_without_rope_table)
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
+    run_case(
+        BackendCase(
+            **{**_QWEN2_7B, "dtype": dtype},
+            seq_lens=[1, 1],
+            num_cached_tokens=[65, 37],
+            num_contexts=0,
+            kv_dtype=kv_dtype,
+            use_kv_cache_manager_v2=True,
+        )
+    )
 
 
 @pytest.mark.parametrize("kv_dtype", [None, "fp8"], ids=["fp16-kv", "fp8-kv"])
