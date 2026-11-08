@@ -2281,7 +2281,9 @@ def test_cutedsl_fc12_survives_autotune_warmup():
     # The singleton outlives the test; fresh statistics keep the positive
     # control below from being satisfied by an earlier test.
     autotuner.stats = AutoTunerStatistics()
-    autotuner.warmup, autotuner.repeat, autotuner.stream_delay_micro_secs = 0, 1, 10
+    # One eager warmup per tactic, as in serving: the nested fused op tunes there, since its
+    # tuning pre-hook copies host routing to the GPU, which the outer op's graph capture rejects.
+    autotuner.warmup, autotuner.repeat, autotuner.stream_delay_micro_secs = 1, 1, 10
     try:
         # No cache_path: a shared on-disk cache would turn a cold miss into a
         # hit and skip the branch under test.
