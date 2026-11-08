@@ -106,7 +106,12 @@ def test_actual_context_staging_uses_guarded_bound_projection_on_inference_view(
     request = types.SimpleNamespace(
         py_return_context_logits=True,
         context_chunk_size=2,
-        py_result=types.SimpleNamespace(append_context_logits=context.append),
+        context_current_position=0,
+        orig_prompt_len=2,
+        py_client_id=17,
+        py_result=types.SimpleNamespace(
+            append_context_logits=lambda rows, _origin: context.append(rows)
+        ),
     )
     scheduled = types.SimpleNamespace(context_requests=[request])
     sampler = SpecSampler.__new__(SpecSampler)

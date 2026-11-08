@@ -1682,6 +1682,18 @@ def _compute_pytorch_prompt_logprobs(
         # cached streaming logprobs above, but do not invent them for queued work.
         return None
     assert context_logits is not None, "context_logits must not be None when prompt_logprobs is requested."
+    prompt_length = len(generation_result._generation_request.prompt_token_ids)
+    origins = response.result.context_logits_origins
+    if (not origins or len(origins) != 1
+            or origins[0].client_id != response.client_id
+            or origins[0].client_id != generation_result._generation_request.id
+            or origins[0].prompt_length != prompt_length
+            or (origins[0].start, origins[0].end) != (0, prompt_length)):
+        raise ValueError(
+            "prompt logprobs require complete original prompt-row origins")
+    if context_logits.ndim != 2 or context_logits.size(0) != prompt_length:
+        raise ValueError(
+            "prompt logprobs require one context-logit row per prompt token")
     # Single element list
     first_generation_token = result.output_token_ids[0][:1]
     assert first_generation_token, "first generation token must not be empty when prompt_logprobs is requested."

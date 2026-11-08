@@ -11,7 +11,7 @@ from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForC
 from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.llm_request import ContextLogitsOrigin, LlmRequestState
 from tensorrt_llm._torch.speculative import spec_sampler_base as sampler_ops
 from tensorrt_llm._torch.speculative.logprobs import (
     GATHER_IDS_KEY,
@@ -242,10 +242,19 @@ def test_staging_selects_original_context_chunks_and_requested_target_rows() -> 
 
     sampler.logit_projection = project
     context_chunks = []
+    context_origins = []
+
+    def record_context(rows: torch.Tensor, origin: ContextLogitsOrigin) -> None:
+        context_chunks.append(rows)
+        context_origins.append(origin)
+
     first = _request(
         py_return_context_logits=True,
         context_chunk_size=2,
-        py_result=types.SimpleNamespace(append_context_logits=context_chunks.append),
+        context_current_position=0,
+        orig_prompt_len=2,
+        py_client_id=17,
+        py_result=types.SimpleNamespace(append_context_logits=record_context),
     )
     final = _request(context_chunk_size=3, py_return_log_probs=True)
     generation = _request(py_return_log_probs=True, py_num_logprobs=2)
@@ -265,6 +274,7 @@ def test_staging_selects_original_context_chunks_and_requested_target_rows() -> 
     assert indices == [0, 2]
     assert len(context_chunks) == 1
     assert torch.equal(context_chunks[0], hidden[:2])
+    assert context_origins == [ContextLogitsOrigin(17, 2, 0, 2)]
     assert torch.equal(projections[1], hidden[torch.tensor([4, 4, 4, 8, 9, 10])])
     expected = hidden[[4, 8, 9]].log_softmax(-1)
     torch.testing.assert_close(scores.sampled[0, 0], expected[0, 3])

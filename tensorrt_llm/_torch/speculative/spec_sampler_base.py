@@ -32,7 +32,12 @@ from ..._device_copy import DeviceCopyBuffer
 from ..._utils import prefer_pinned
 from ...sampling_params import LogprobMode, SamplingParams
 from ..kernels.spec_step_copies import op as spec_step_copies
-from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from ..pyexecutor.llm_request import (
+    ContextLogitsOrigin,
+    LlmRequest,
+    LlmRequestState,
+    get_draft_token_length,
+)
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.runtime_hooks import SpecStepFold
 from ..pyexecutor.sampler import (
@@ -770,9 +775,20 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         for request in scheduled.context_requests:
             end = context_offset + request.context_chunk_size
             if request.py_return_context_logits:
-                request.py_result.append_context_logits(
-                    self.logit_projection(hidden_states[context_offset:end])
-                )
+                start = request.context_current_position
+                original_end = min(start + request.context_chunk_size, request.orig_prompt_len)
+                if start < original_end:
+                    request.py_result.append_context_logits(
+                        self.logit_projection(
+                            hidden_states[context_offset : context_offset + original_end - start]
+                        ),
+                        ContextLogitsOrigin(
+                            client_id=request.py_client_id,
+                            prompt_length=request.orig_prompt_len,
+                            start=start,
+                            end=original_end,
+                        ),
+                    )
             context_offset = end
         if not requested:
             return None, []
