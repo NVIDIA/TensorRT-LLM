@@ -1197,6 +1197,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         )
         return config
 
+    @override
     def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
         super()._log_kv_cache_pool_lifecycle_mapping()
         self._log_pool_group_slots()
