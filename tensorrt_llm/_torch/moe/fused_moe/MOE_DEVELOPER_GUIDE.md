@@ -746,7 +746,7 @@ Kimi K3 targets `trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8`.
 `modeling_v2_resolve` declines a target (`require` raises) unless every
 implementation the tactic can resolve to, narrowed to the formats the experts
 run as on the architecture (`_declared_moe_quants`), is listed. So
-`trtllm.trtllm_gen` reaches the Kimi K3 targets.
+`trtllm_gen` reaches the Kimi K3 targets, and `cutlass` does not.
 
 A config copy that re-points `moe_backend` at one literal (a draft's own
 backend, Qwen3-Next's bf16 expert layers, MuseSpark Open's bf16 layers,

@@ -489,8 +489,8 @@ def _load_with_tactic(
         pytest.param(None, "CUTLASS", None, id="no_tactic"),
         pytest.param("trtllm_gen", "TRTLLM", _TRTLLM_FP8_BLOCK_EXCLUDES, id="one_family"),
         pytest.param("deepgemm.cuda.grouped_gemm.fp8_block_scales", "DEEPGEMM", None, id="full_id"),
-        # CuteDSL and TRTLLM-gen leaves; the FP8 block-scales format leaves one.
-        pytest.param("flashinfer", "TRTLLM", _TRTLLM_FP8_BLOCK_EXCLUDES, id="narrowed_family"),
+        # TRTLLM-gen and Marlin leaves; the FP8 block-scales format leaves one.
+        pytest.param("fused_moe", "TRTLLM", _TRTLLM_FP8_BLOCK_EXCLUDES, id="narrowed_family"),
     ],
 )
 def test_a_tactic_sets_the_backend_the_checkpoint_is_read_for(
