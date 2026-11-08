@@ -22,10 +22,15 @@ shared prefix index. The cache manager lays each region out as a native
 from the life cycles the manager derives from its layer configs, even when the
 two have equal parameters.
 
-Only per-request regions that are never handed off are supported: one slot per
-living KV cache and beam, released when the cache closes. Such a region may
-supply a fixed slot count; its buffers then get a pool group of exactly that
-many GPU slots, which the manager's ratio-based sizing leaves alone.
+Only per-request regions are supported: one slot per living KV cache and beam,
+released when the cache closes. One that is never handed off stays private to
+its request. One handed off at declared points is snapshotted into the prefix
+index at the request's commit boundaries and restored for a request that
+matches the prefix, like a recurrent layer's state; a manager holds at most one
+such snapshotted state, whether a region or its layer configs declare it. A
+region may supply a fixed slot count; its
+buffers then get a pool group of exactly that many GPU slots, which the
+manager's ratio-based sizing leaves alone.
 """
 
 from __future__ import annotations
@@ -246,6 +251,17 @@ class RegionLayout:
                 return region
         raise KeyError(f"No region named {name!r}")
 
+    def storing(self, role: DataRole) -> Tuple[Region, ...]:
+        """The declared regions with a ``role`` plane on any layer, in declaration order.
+
+        Reads the declarations, so it answers before the regions are laid out.
+        """
+        return tuple(
+            region
+            for region in self.regions
+            if any(plane.role == role for layer in region.layers for plane in layer.planes)
+        )
+
     def owner(self, layer_id: int, role: DataRole) -> Optional[Region]:
         """Return the region storing ``role`` on ``layer_id``; None for a layer-config buffer."""
         name = self.owners.get((int(layer_id), role))
@@ -320,7 +336,8 @@ def lay_out_regions(
     Raises:
         ValueError: If region names repeat, a region covers a layer this rank
             does not have, a region stores a role the layer's config already
-            stores, or a region's life cycle has no native region yet.
+            stores, or a region is allocated per token block, which no native
+            region supports yet.
     """
     regions = tuple(regions)
     names = [region.name for region in regions]
@@ -333,11 +350,10 @@ def lay_out_regions(
     owners: Dict[Tuple[int, DataRole], str] = {}
     for region in regions:
         life_cycle = region.life_cycle
-        if (life_cycle.allocation, life_cycle.hand_off) != (AllocationUnit.REQUEST, HandOff.NEVER):
+        if life_cycle.allocation != AllocationUnit.REQUEST:
             raise ValueError(
                 f"Region {region.name!r} is a {life_cycle.allocation} region handed off at "
-                f"{life_cycle.hand_off}; only request regions that are never handed off are "
-                "supported"
+                f"{life_cycle.hand_off}; only request regions are supported"
             )
         buffers = []
         for region_layer in region.layers:

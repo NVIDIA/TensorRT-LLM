@@ -149,13 +149,6 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         return (*providers, self._kda_replay_region)
 
     @override
-    def _get_recurrent_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
-        buffers = super()._get_recurrent_buffer_configs(global_layer_id)
-        if self._kda_replay_region is not None:
-            buffers += self._kda_replay_region.shared_buffers(global_layer_id)
-        return buffers
-
-    @override
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
         roles = super().get_disagg_ignored_roles()
         if self._kda_replay_region is not None:
