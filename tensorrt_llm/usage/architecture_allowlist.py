@@ -86,6 +86,7 @@ PUBLIC_MODEL_ARCHITECTURES = frozenset(
         "MistralForCausalLM",
         "MistralLarge3EagleForCausalLM",
         "MistralLarge3ForCausalLM",
+        "MistralLarge4ForCausalLM",
         "MixtralForCausalLM",
         "MllamaForConditionalGeneration",
         "NemotronForCausalLM",

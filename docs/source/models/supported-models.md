@@ -38,6 +38,7 @@ The following is a table of supported models for the PyTorch backend:
 | `MiniCPMV4_6ForConditionalGeneration` [^14]| MiniCPM-V 4.6                    | `openbmb/MiniCPM-V-4.6`                      |
 | `MiniMaxM3SparseForConditionalGeneration` [^12]| MiniMax-M3                       | `MiniMaxAI/MiniMax-M3`                      |
 | `MistralForCausalLM`                 | Mistral                            | `mistralai/Mistral-7B-v0.1`                  |
+| `MistralLarge4ForCausalLM` [^24]     | Mistral Large 4                    | `mistralai/Mistral-Large-4-1T-A52B-NVFP4`    |
 | `MixtralForCausalLM`                 | Mixtral                            | `mistralai/Mixtral-8x7B-v0.1`                |
 | `MllamaForConditionalGeneration`     | Llama 3.2                          | `meta-llama/Llama-3.2-11B-Vision`            |
 | `NemotronForCausalLM`                | Nemotron-3, Nemotron-4, Minitron   | `nvidia/Minitron-8B-Base`                    |
@@ -107,6 +108,7 @@ statuses for the same architecture in the two matrices.
 | `Gemma4UnifiedForConditionalGeneration` | Yes                | Yes        | Yes                        | No                    | Yes             | No                         | Yes           | No             | Yes                      | Yes                   | Yes             |
 | `Step3p7ForConditionalGeneration`| Yes               | Yes        | Yes                        | Untested              | Untested        | MTP                        | Yes           | No             | Yes                      | Yes                   | Yes             |
 | `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Yes                        | Untested              | Untested        | EAGLE-3 (Linear), DSpark [^21] | Yes           | No             | N/A                      | Yes                   | Yes             |
+| `MistralLarge4ForCausalLM` [^24] | Yes               | Yes        | Yes                        | Yes [^25]             | Yes             | DSpark                     | Yes           | Yes            | N/A                      | Untested              | Yes             |
 
 [^1]: Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM107/SM120.
 [^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM107/SM120/SM121 and in BF16/FP8 KV cache dtype.
@@ -127,6 +129,8 @@ statuses for the same architecture in the two matrices.
 [^21]: MiniMax-M3.1-Flash ships a standalone DSpark drafter in its `dspark/` directory (architecture `DSparkMiniMaxDraftModel`). Load it with `speculative_config: {decoding_type: DSpark, speculative_model: <checkpoint>/dspark, max_draft_len: 7}` (the drafter's block size is 7 and `max_draft_len` must match it). Keep KV cache block reuse enabled (the default): with `kv_cache_config.enable_block_reuse: false`, or on a disaggregated generation server, prompts of about 131k tokens or more fail with `Draft KV cache context resize failed`.
 [^22]: Text input only. The image and audio tokenizers of the checkpoint are not run, and the model generates only text tokens.
 [^23]: Text-only decision model. `trtllm-serve embeddings` detects the native checkpoint and selects the FlashInfer attention backend automatically. Python `LLM.encode` callers must set `model_kwargs.architectures` to `[PplxDeciderForDecision]`. The embedding vector contains the 255 raw decision logits; apply the checkpoint's calibration and candidate normalization in the caller.
+[^24]: Mistral Large 4 runs only on NVIDIA GB300 (`SM103`) from the NVFP4 checkpoint in the Mistral format (`checkpoint_format: mistral_large_4`); the FP8 checkpoint and the Hugging Face format are not supported. The architecture name is the one TensorRT LLM assigns when it reads the checkpoint's `params.json`. It is served by three modeling_v2 targets, tensor-parallel attention with expert-parallel experts, attention data parallelism with expert-parallel experts, and tensor parallelism, each on 4 GPUs or on 8 GPUs over two nodes, with contexts of up to 1,048,576 tokens. Speculative decoding uses the DSpark draft in the checkpoint (3 draft tokens). See the [Mistral Large 4 deployment guide](../deployment-guide/deployment-guide-for-mistral-large-4-on-trtllm.md).
+[^25]: Validated for one TEP4 context server and one TEP4 generation server at a 32K-token context, without speculative decoding.
 
 # Encoder-Decoder Feature Support Matrix (PyTorch Backend)
 
@@ -176,6 +180,7 @@ not used to mark a feature as supported here.
 | `Qwen3_5ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | No             | Untested              | Yes                       | L + I + V |
 | `Qwen3_5MoeForConditionalGeneration` | Yes               | Yes        | Untested        | Yes           | No             | Untested              | Yes                       | L + I + V |
 | `Qwen4ExpForConditionalGeneration`   | Untested          | Untested   | Untested        | Yes           | Untested       | Yes                   | No                        | L + I     |
+| `MistralLarge4ForCausalLM` [^24]     | Yes               | Yes        | Yes             | Yes           | Yes            | Untested              | Untested                  | L + I     |
 
 Note:
 - L: Language
