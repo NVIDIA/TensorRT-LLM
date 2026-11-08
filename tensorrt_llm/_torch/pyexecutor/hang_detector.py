@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import faulthandler
 import math
 import os
 import signal
@@ -20,7 +21,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Iterator, Optional, TextIO
 
 from tensorrt_llm._utils import ENABLE_MULTI_DEVICE, mpi_comm, mpi_disabled, print_all_stacks
 from tensorrt_llm.logger import logger
@@ -39,6 +40,48 @@ _RANK_CRASH_KILL_GRACE_DEFAULT = 10.0
 _SYMMETRIC_CRASH_PROBE_POLL_S = 0.05
 
 
+@contextmanager
+def _hang_report_file(message: str) -> Iterator[Optional[TextIO]]:
+    """Preserve a failure report independently of captured or broken log streams."""
+    directory = os.environ.get("TLLM_HANG_DIAGNOSTICS_DIR")
+    if not directory:
+        yield None
+        return
+    output = None
+    report_ready = False
+    try:
+        os.makedirs(directory, exist_ok=True)
+        pid = os.getpid()
+        timestamp = time.time_ns()
+        path = os.path.join(directory, f"worker-{pid}-{timestamp}.txt")
+        try:
+            with open(
+                os.path.join(directory, "current-test"), encoding="utf-8", errors="replace"
+            ) as current_test:
+                nodeid = current_test.read().strip()
+        except OSError:
+            nodeid = "unknown"
+        output = open(path, "x", encoding="utf-8")
+        rank = os.environ.get("OMPI_COMM_WORLD_RANK", "unknown")
+        output.write(f"Hang diagnostics: pid={pid}, rank={rank}, timestamp_ns={timestamp}\n")
+        output.write(f"test={nodeid}\n")
+        output.write(message + "\n")
+        output.flush()
+        faulthandler.dump_traceback(file=output, all_threads=True)
+        report_ready = True
+    except (OSError, RuntimeError, ValueError):
+        # File diagnostics must not interfere with reporting or hard-kill propagation.
+        pass
+    try:
+        yield output if report_ready else None
+    finally:
+        if output is not None:
+            try:
+                output.close()
+            except OSError:
+                pass
+
+
 def _best_effort_flush_streams() -> None:
     """Flush stdout/stderr without ever raising; diagnostics must not block hard kill."""
     for stream in (sys.stderr, sys.stdout):
@@ -53,6 +96,14 @@ def _best_effort_log_error(message: str) -> None:
     try:
         logger.error(message)
     except Exception:  # noqa: BLE001 - diagnostics must not block hard kill
+        pass
+
+
+def _log_hang_stacks(message: str) -> None:
+    _best_effort_log_error(message)
+    try:
+        print_all_stacks()
+    except Exception:  # noqa: BLE001 - stack dump must not block hard kill
         pass
 
 
@@ -549,21 +600,32 @@ class HangDetector:
                 f"{self.report_context}: no checkpoint for {self.timeout} seconds; "
                 "dumping all thread stacks."
             )
-        _best_effort_log_error(report_message)
-        try:
-            print_all_stacks()
-        except Exception:  # noqa: BLE001 - stack dump must not block hard kill
-            pass
-
-        for provider in status_providers:
-            try:
-                status = provider()
+        # Preserve stacks in the report file before logging or querying status:
+        # CUDA queries and logging locks can themselves stall. The file is written
+        # on context entry, so logging below cannot cost the durable copy. The
+        # outer runner collects the files.
+        statuses = []
+        with _hang_report_file(report_message) as output:
+            # Log before the providers run: one that never returns must not also
+            # suppress the stderr report.
+            _log_hang_stacks(report_message)
+            for provider in status_providers:
+                try:
+                    status = provider()
+                except Exception as error:  # noqa: BLE001 - isolate diagnostic providers
+                    status = (
+                        f"HangDetector: status provider failed with {type(error).__name__}: {error}"
+                    )
                 if status:
-                    _best_effort_log_error(status)
-            except Exception as error:  # noqa: BLE001 - isolate diagnostic providers
-                _best_effort_log_error(
-                    f"HangDetector: status provider failed with {type(error).__name__}: {error}"
-                )
+                    statuses.append(status)
+                    if output is not None:
+                        try:
+                            output.write(status + "\n")
+                            output.flush()
+                        except (OSError, ValueError):
+                            pass
+        for status in statuses:
+            _best_effort_log_error(status)
 
         # Set _detected last so observers (and tests) see it only once
         # diagnostics are done and on_detected is about to fire.
