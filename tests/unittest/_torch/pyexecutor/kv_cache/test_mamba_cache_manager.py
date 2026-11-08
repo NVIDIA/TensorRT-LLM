@@ -4764,6 +4764,12 @@ def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
 
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.mapping = SimpleNamespace(rank=rank)
+    mgr.local_num_mamba_layers = 1
+    mgr._prefix_matched_tokens_total = 0
+    mgr._prefix_snapshot_lost_tokens_total = 0
+    mgr._iter_prefix_matched_tokens = 0
+    mgr._iter_prefix_snapshot_lost_tokens = 0
+    mgr._snapshot_loss_warned = False
     mgr._stats_life_cycle_metadata = MagicMock(
         return_value={
             0: (4, 4096, "attention"),
@@ -5150,10 +5156,15 @@ def _branch_snapshot_manager(
             additional_snapshot_offsets_from_end=list(additional_snapshot_offsets_from_end or []),
         ),
     )
+    mgr.is_estimating_kv_cache = False
     mgr._branch_snapshot_points = {}
     mgr._context_fork_hints = {}
     mgr._snapshot_pruned_tokens_total = 0
     mgr._page_pruned_tokens_total = 0
+    mgr._prefix_matched_tokens_total = 0
+    mgr._prefix_snapshot_lost_tokens_total = 0
+    mgr._iter_prefix_matched_tokens = 0
+    mgr._iter_prefix_snapshot_lost_tokens = 0
     mgr._branch_snapshots_taken_total = 0
     mgr._branch_snapshots_skipped_total = {}
     return mgr
@@ -10313,5 +10324,39 @@ def test_v2_hybrid_mixed_precision_beside_private_mamba2_replay():
         for group, layer_ids in enumerate(mgr._layer_ids_by_group):
             ids.update(zip(layer_ids, _compute_global_layer_ids(mgr, group)))
         assert ids == {0: 0, 1: 2, 2: 4, 3: 5}
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_iteration_stats_report_prefix_lost_to_missing_snapshot():
+    """Attention pages can match deeper than any recurrent-state snapshot; the gap is recomputed."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        enable_block_reuse=True, additional_snapshot_offsets_from_end=[0], enable_stats=True
+    )
+    # The only snapshot of the first prompt is at its end, token 64.
+    first = _make_v2_prompt_request(1, list(range(64)))
+    # Shares 48 tokens with it, then diverges: no snapshot covers the shared part.
+    diverged = _make_v2_prompt_request(2, list(range(48)) + list(range(1000, 1016)))
+    # Extends it: its end snapshot covers the whole match.
+    extended = _make_v2_prompt_request(3, list(range(64)) + list(range(2000, 2016)))
+    try:
+        _run_v2_hybrid_context(mgr, first)
+        mgr.free_resources(first)
+        mgr.get_iteration_stats()
+
+        _run_v2_hybrid_context(mgr, diverged)
+        report = mgr.get_iteration_stats()
+        assert diverged.prepopulated_prompt_len == 0
+        assert report.prefix_matched_tokens > 0
+        assert report.prefix_snapshot_lost_tokens == report.prefix_matched_tokens
+        mgr.free_resources(diverged)
+
+        _run_v2_hybrid_context(mgr, extended)
+        report = mgr.get_iteration_stats()
+        assert extended.prepopulated_prompt_len == 64
+        assert report.prefix_matched_tokens == 64
+        assert report.prefix_snapshot_lost_tokens == 0
+        mgr.free_resources(extended)
     finally:
         mgr.shutdown()
