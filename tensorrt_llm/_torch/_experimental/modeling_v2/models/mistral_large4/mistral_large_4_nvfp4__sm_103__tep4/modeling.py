@@ -1951,6 +1951,15 @@ class DraftModel(nn.Module):
         # The shared-head logits are soft-capped before the RNN bias is added.
         return tanh_softcap(logits, self._shell.softcap)
 
+    def apply_draft_logit_transform(self, logits):
+        """Return ``logits`` unchanged: :meth:`logits_processor` already soft-caps them.
+
+        The worker calls this on the block logits after ``logits_processor``.
+        This drafter declares no ``logit_multiplier`` or ``logit_softcap``, so the
+        cap is applied once, in ``logits_processor``.
+        """
+        return logits
+
     def _build_fused_kv_buffers(self):
         # The worker calls this before sizing its cache. Take views once after
         # materialization; context projection is explicit per layer here.
