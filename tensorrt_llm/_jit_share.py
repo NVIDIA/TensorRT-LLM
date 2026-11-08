@@ -12,48 +12,55 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Build each DeepGEMM JIT kernel once across the processes of a launch.
+"""Build each JIT kernel once across the processes of a launch.
 
-DeepGEMM compiles a kernel the first time a shape selects it: it writes
-``<tmp>/kernel.cu``, runs its compiler (``DG_JIT_NVCC_COMPILER``, by default
-``$CUDA_HOME/bin/nvcc``) as ``nvcc <tmp>/kernel.cu --cubin --output-file
-<tmp>/kernel.cubin <flags>``, then renames ``<tmp>`` into its disk cache
-(``DG_JIT_CACHE_DIR``). The ranks of a launch select the same kernels, so each
-rank compiles every kernel on its own.
+The ranks of a launch compile the same kernels, each on its own. With
+``TLLM_JIT_SHARE_DIR`` set to a directory that every process of the launch
+can see (on a multi-node launch, a shared file system; use a fresh directory
+per launch), the first process to claim a kernel builds it and the others
+reuse the result. Two kinds of kernels are shared:
 
-``TLLM_DEEP_GEMM_JIT_SHARE_DIR`` names a directory that every process of the
-launch can see (on a multi-node launch, a shared file system; use a fresh
-directory per launch). When it is set, :func:`install`, which runs at
-``import tensorrt_llm``, makes this file DeepGEMM's compiler and, unless
-``DG_JIT_CACHE_DIR`` is set, moves DeepGEMM's disk cache to
-``<dir>/deep_gemm`` so that a kernel one process published is a cache hit for
-the others. For each kernel, the compiler then
+* DeepGEMM's. DeepGEMM compiles a kernel the first time a shape selects it:
+  it writes ``<tmp>/kernel.cu``, runs its compiler (``DG_JIT_NVCC_COMPILER``,
+  by default ``$CUDA_HOME/bin/nvcc``) as ``nvcc <tmp>/kernel.cu --cubin
+  --output-file <tmp>/kernel.cubin <flags>``, then renames ``<tmp>`` into its
+  disk cache (``DG_JIT_CACHE_DIR``). :func:`install`, which runs at ``import
+  tensorrt_llm``, makes this file DeepGEMM's compiler and, unless
+  ``DG_JIT_CACHE_DIR`` is set, moves DeepGEMM's disk cache to
+  ``<dir>/deep_gemm``, so that a kernel one process published is a cache hit
+  for the others. The compiler claims a kernel as ``<dir>/kernels/<key>.claim``
+  and publishes its cubin as ``<dir>/kernels/<key>.cubin``.
+* CuTe DSL's. A runner compiles a kernel with ``cute.compile`` and keeps it in
+  its class's ``kernel_cache`` dict. :func:`share_kernel_caches` makes that
+  dict a :class:`SharedKernelCache`: while :class:`sharing_kernels` is active
+  (the autotuner turns it on while it tunes), a lookup that misses loads the
+  kernel another process exported as ``<dir>/cute/<name>.o``, and a kernel
+  stored in it is exported there.
 
-* builds it in the first process that claims it (exclusive create of
-  ``<dir>/kernels/<key>.claim``) and publishes the cubin as
-  ``<dir>/kernels/<key>.cubin``;
-* in a process that finds it claimed, waits for that cubin and copies it
-  (at most ``TLLM_DEEP_GEMM_JIT_SHARE_WAIT_S`` seconds, default 300), or,
-  inside :class:`defer_busy_builds`, fails at once with :data:`BUSY_MARK` in
-  its output so that the caller can do other work first;
-* builds it itself when the claimant failed, the wait ran out, or the claim is
-  older than ``TLLM_DEEP_GEMM_JIT_SHARE_CLAIM_TTL_S`` seconds (default 600).
+Either way, a process that finds a kernel claimed by another waits for it (at
+most ``TLLM_JIT_SHARE_WAIT_S`` seconds, default 300) or, inside
+:class:`defer_busy_builds`, fails at once with :data:`BUSY_MARK` in its error
+so that the caller can do other work first. It builds the kernel itself when
+the claimant failed, the wait ran out, or the claim is older than
+``TLLM_JIT_SHARE_CLAIM_TTL_S`` seconds (default 600).
 
-The key hashes the kernel source, the compiler arguments with the temporary
-directory left out, and the identity of the compiler and of DeepGEMM's
-headers. Every other compiler invocation (``--version`` and the like) runs the
-real compiler unchanged. With ``TLLM_DEEP_GEMM_JIT_SHARE_LOG=1`` each kernel
-adds a line ``<start> <seconds> <action> <key>`` to
-``<dir>/log/<host>-<pid>.txt``.
+A DeepGEMM key hashes the kernel source, the compiler arguments with the
+temporary directory left out, and the contents of the compiler and of
+DeepGEMM's headers. A CuTe DSL name hashes the runner class, the ``repr`` of
+the cache key (keys whose ``repr`` holds an object address are not shared),
+the TensorRT-LLM and CuTe DSL versions, and the GPU's compute capability.
+Every other compiler invocation (``--version`` and the like) runs the real
+compiler unchanged. With ``TLLM_JIT_SHARE_LOG=1`` each kernel adds a line
+``<start> <seconds> <action> <key>`` to ``<dir>/log/<host>-<pid>.txt``.
 
-A caller that runs a list of builds (the autotuner's swap-AB GEMM sweeps)
-splits the list across the processes with :class:`SharedSweep` claims, and
-starts at an offset of its own (:func:`start_fraction`).
+A caller that runs a list of builds (the autotuner) splits the list across
+the processes with :class:`SharedSweep` claims, and starts at an offset of its
+own (:func:`start_fraction`).
 
-Only the standard library may be imported here: :func:`install` runs before
-``torch`` is imported, and the compiler runs this file in a bare interpreter.
-Modules that only some paths need are imported where they are used, to keep
-the compiler's start-up short.
+Only the standard library may be imported at module scope: :func:`install`
+runs before ``torch`` is imported, and the compiler runs this file in a bare
+interpreter. Modules that only some paths need are imported where they are
+used, to keep the compiler's start-up short.
 """
 
 import hashlib
@@ -61,31 +68,37 @@ import os
 import sys
 import time
 
-SHARE_DIR_ENV = "TLLM_DEEP_GEMM_JIT_SHARE_DIR"
-BUSY_MARK = "TLLM_DEEP_GEMM_JIT_BUSY"
+SHARE_DIR_ENV = "TLLM_JIT_SHARE_DIR"
+BUSY_MARK = "TLLM_JIT_SHARE_BUSY"
 BUSY_EXIT_CODE = 75  # EX_TEMPFAIL
 
-_REAL_COMPILER_ENV = "TLLM_DEEP_GEMM_JIT_SHARE_NVCC"
-_SALT_ENV = "TLLM_DEEP_GEMM_JIT_SHARE_SALT"
-_DEFER_ENV = "TLLM_DEEP_GEMM_JIT_SHARE_DEFER"
-_WAIT_ENV = "TLLM_DEEP_GEMM_JIT_SHARE_WAIT_S"
-_CLAIM_TTL_ENV = "TLLM_DEEP_GEMM_JIT_SHARE_CLAIM_TTL_S"
-_LOG_ENV = "TLLM_DEEP_GEMM_JIT_SHARE_LOG"
-_PROCESS_ENV = "TLLM_DEEP_GEMM_JIT_SHARE_PROCESS"
+_REAL_COMPILER_ENV = "TLLM_JIT_SHARE_NVCC"
+_SALT_ENV = "TLLM_JIT_SHARE_SALT"
+_DEFER_ENV = "TLLM_JIT_SHARE_DEFER"
+_WAIT_ENV = "TLLM_JIT_SHARE_WAIT_S"
+_CLAIM_TTL_ENV = "TLLM_JIT_SHARE_CLAIM_TTL_S"
+_LOG_ENV = "TLLM_JIT_SHARE_LOG"
+_PROCESS_ENV = "TLLM_JIT_SHARE_PROCESS"
 # Linux reads at most this much of a script's "#!" line on older kernels.
 _SHEBANG_LIMIT = 127
 
 _installed = False
 _slot: int | None = None
+_kernel_sharing_depth = 0
+_cute_salt: str | None = None
+
+
+class KernelBusy(RuntimeError):
+    """A build refused because another process is building that kernel (see :class:`defer_busy_builds`)."""
 
 
 def enabled() -> bool:
-    """True when this process builds DeepGEMM kernels through the shared directory."""
+    """True when this process builds JIT kernels through the shared directory."""
     return _installed
 
 
 def is_busy(error: BaseException) -> bool:
-    """True for a DeepGEMM build refused because another process is building that kernel."""
+    """True for a build refused because another process is building that kernel."""
     return BUSY_MARK in str(error)
 
 
@@ -93,7 +106,7 @@ class defer_busy_builds:
     """Within the block, a build of a kernel that another process is building fails at
     once (see :func:`is_busy`) instead of waiting for that process.
 
-    The setting is process-wide: it reaches the compiler through the environment.
+    The setting is process-wide: it reaches DeepGEMM's compiler through the environment.
     """
 
     def __enter__(self):
@@ -160,8 +173,168 @@ class SharedSweep:
         return os.path.exists(os.path.join(self.dir, f"{index}.done"))
 
 
+class sharing_kernels:
+    """While active, :class:`SharedKernelCache` lookups and stores go through the
+    shared directory; otherwise those caches are plain dicts."""
+
+    def __enter__(self):
+        global _kernel_sharing_depth
+        _kernel_sharing_depth += 1
+        return self
+
+    def __exit__(self, *exc_info):
+        global _kernel_sharing_depth
+        _kernel_sharing_depth -= 1
+        return False
+
+
+def _kernel_sharing_active() -> bool:
+    return _kernel_sharing_depth > 0 and bool(os.environ.get(SHARE_DIR_ENV))
+
+
+class SharedKernelCache(dict):
+    """A runner class's ``kernel_cache`` whose CuTe DSL kernels are shared through the directory.
+
+    The runner's code is unchanged: it tests ``key in kernel_cache``, compiles
+    on a miss, stores the result, and reads it back. Here a miss loads the
+    kernel when another process exported it, waits for it when another process
+    is compiling it (or, inside :class:`defer_busy_builds`, raises
+    :class:`KernelBusy`), and otherwise claims it, so that the store that
+    follows exports it.
+    """
+
+    def __init__(self, owner: str, entries=()):
+        super().__init__(entries)
+        self.owner = owner
+
+    def _paths(self, key):
+        text = repr(key)
+        if " at 0x" in text:
+            return None
+        name = (
+            "k"
+            + hashlib.sha256(f"{_cute_identity()}|{self.owner}|{text}".encode()).hexdigest()[:32]
+        )
+        base = os.path.join(os.environ[SHARE_DIR_ENV], "cute", name)
+        return name, base + ".o", base + ".claim", base + ".failed", base + ".json"
+
+    def __contains__(self, key) -> bool:
+        if dict.__contains__(self, key):
+            return True
+        if not _kernel_sharing_active():
+            return False
+        paths = self._paths(key)
+        if paths is None:
+            return False
+        name, obj, claim, failed, meta = paths
+        start = time.time()
+        os.makedirs(os.path.dirname(obj), exist_ok=True)
+        action = "cute-loaded"
+        if not os.path.exists(obj):
+            if _claim(claim):
+                return False  # This process compiles it; the store exports it.
+            if _claim_is_stale(claim):
+                return False
+            if os.environ.get(_DEFER_ENV) == "1" and not os.path.exists(failed):
+                _log(os.environ[SHARE_DIR_ENV], start, "cute-busy", name)
+                raise KernelBusy(f"{BUSY_MARK} {name}")
+            if not _wait(obj, failed):
+                return False
+            action = "cute-waited"
+        try:
+            kernel = _load_kernel(obj, name, meta)
+        except Exception:  # noqa: BLE001 - a kernel that does not load is compiled here instead
+            return False
+        dict.__setitem__(self, key, kernel)
+        _log(os.environ[SHARE_DIR_ENV], start, action, name)
+        return True
+
+    def __setitem__(self, key, kernel) -> None:
+        dict.__setitem__(self, key, kernel)
+        if not _kernel_sharing_active():
+            return
+        paths = self._paths(key)
+        if paths is None:
+            return
+        name, obj, claim, failed, meta = paths
+        if os.path.exists(obj):
+            return
+        start = time.time()
+        try:
+            _export_kernel(kernel, obj, name, meta)
+        except Exception as e:  # noqa: BLE001 - the kernel works here; the others compile it
+            with open(failed, "w") as f:
+                f.write(f"{type(e).__name__}: {e}\n")
+            return
+        _log(os.environ[SHARE_DIR_ENV], start, "cute-built", name)
+
+
+def share_kernel_caches(runners) -> None:
+    """Make the ``kernel_cache`` dict of each runner's class a :class:`SharedKernelCache`."""
+    for runner in runners:
+        for cls in type(runner).__mro__:
+            cache = cls.__dict__.get("kernel_cache")
+            if cache is None:
+                continue
+            if isinstance(cache, dict) and not isinstance(cache, SharedKernelCache):
+                setattr(
+                    cls,
+                    "kernel_cache",
+                    SharedKernelCache(f"{cls.__module__}.{cls.__qualname__}", cache),
+                )
+            break
+
+
+def _cute_identity() -> str:
+    """The TensorRT-LLM and CuTe DSL versions and the GPU's compute capability, which a kernel depends on."""
+    global _cute_salt
+    if _cute_salt is None:
+        import importlib.metadata
+
+        import torch
+
+        from tensorrt_llm.version import __version__
+
+        try:
+            dsl = importlib.metadata.version("nvidia-cutlass-dsl")
+        except importlib.metadata.PackageNotFoundError:
+            dsl = ""
+        _cute_salt = f"{__version__}|{dsl}|{torch.cuda.get_device_capability()}"
+    return _cute_salt
+
+
+def _export_kernel(kernel, obj: str, name: str, meta: str) -> None:
+    """Write a compiled CuTe DSL kernel to ``obj`` as an object file with entry symbol ``name``."""
+    import json
+
+    tvm_ffi = any(c.__name__.startswith("TVMFFI") for c in type(kernel).__mro__)
+    part = f"{obj[:-2]}.{os.getpid()}.part.o"  # Ends in ".o": the TVM-FFI export picks its format by suffix.
+    if tvm_ffi:
+        # TVM-FFI functions export their entry as __tvm_ffi_<name>, which a TVM-FFI load looks up by name.
+        kernel.export_to_c(part, function_name=name)
+    else:
+        with open(part, "wb") as f:
+            f.write(kernel.dump_to_object(name))
+    with open(f"{meta}.{os.getpid()}.part", "w") as f:
+        json.dump({"tvm_ffi": tvm_ffi}, f)
+    os.replace(f"{meta}.{os.getpid()}.part", meta)
+    _fsync(part)
+    os.replace(part, obj)
+
+
+def _load_kernel(obj: str, name: str, meta: str):
+    """Load the kernel another process exported with :func:`_export_kernel`."""
+    import json
+
+    import cutlass.runtime
+
+    with open(meta) as f:
+        tvm_ffi = json.load(f)["tvm_ffi"]
+    return cutlass.runtime.load_module(obj, enable_tvm_ffi=tvm_ffi)[name]
+
+
 def install() -> bool:
-    """Make this file DeepGEMM's compiler if ``TLLM_DEEP_GEMM_JIT_SHARE_DIR`` is set.
+    """Make this file DeepGEMM's compiler if ``TLLM_JIT_SHARE_DIR`` is set.
 
     Must run before the process's first DeepGEMM call, which reads
     ``DG_JIT_NVCC_COMPILER``. Returns whether sharing is active.
@@ -189,7 +362,7 @@ def install() -> bool:
     wrapper = None
     for bin_dir in (
         os.path.join(share_dir, "bin"),
-        os.path.join(tempfile.gettempdir(), f"tllm_deep_gemm_jit_{os.getuid()}"),
+        os.path.join(tempfile.gettempdir(), f"tllm_jit_share_{os.getuid()}"),
     ):
         try:
             wrapper = _write_wrapper(bin_dir)
@@ -200,7 +373,8 @@ def install() -> bool:
     if wrapper is None:
         return False
     os.environ[_REAL_COMPILER_ENV] = compiler
-    os.environ.setdefault(_SALT_ENV, _salt(compiler))
+    if not os.environ.get(_SALT_ENV):
+        os.environ[_SALT_ENV] = _salt(compiler)
     os.environ[_PROCESS_ENV] = f"{os.uname().nodename}-{os.getpid()}"
     os.environ["DG_JIT_NVCC_COMPILER"] = wrapper
     os.environ.setdefault("DG_JIT_CACHE_DIR", os.path.join(share_dir, "deep_gemm"))
@@ -256,22 +430,34 @@ def _write_wrapper(bin_dir: str) -> str | None:
 
 
 def _salt(compiler: str) -> str:
-    """Identity of the compiler and of the headers DeepGEMM compiles against."""
-    parts = []
+    """Hash of the contents of the compiler and of the headers DeepGEMM compiles against.
+
+    Contents, not file times: each node installs its own copy, at its own time.
+    """
+    digest = hashlib.sha256()
     for path in (
         compiler,
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "deep_gemm", "include"),
     ):
-        count, size, newest = 0, 0, 0
-        for root, _, files in os.walk(path) if os.path.isdir(path) else [("", [], [path])]:
-            for name in files:
-                try:
-                    st = os.stat(os.path.join(root, name))
-                except OSError:
-                    continue
-                count, size, newest = count + 1, size + st.st_size, max(newest, st.st_mtime_ns)
-        parts.append(f"{path}:{count}:{size}:{newest}")
-    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+        if os.path.isdir(path):
+            for root, dirs, files in os.walk(path):
+                dirs.sort()
+                for name in sorted(files):
+                    file = os.path.join(root, name)
+                    digest.update(os.path.relpath(file, path).encode() + b"\0")
+                    _update_with_file(digest, file)
+        elif os.path.isfile(path):
+            _update_with_file(digest, path)
+    return digest.hexdigest()
+
+
+def _update_with_file(digest, path: str) -> None:
+    try:
+        with open(path, "rb") as f:
+            while chunk := f.read(1 << 20):
+                digest.update(chunk)
+    except OSError:
+        pass
 
 
 def _log(share_dir: str, start: float, action: str, key: str) -> None:
@@ -284,6 +470,14 @@ def _log(share_dir: str, start: float, action: str, key: str) -> None:
             f.write(f"{start:.3f} {time.time() - start:.3f} {action} {key}\n")
     except OSError:
         pass
+
+
+def _fsync(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _copy_file(source: str, destination: str) -> None:
@@ -299,11 +493,7 @@ def _copy(cubin: str, output: str) -> int:
 def _publish(output: str, cubin: str) -> None:
     part = f"{os.path.dirname(cubin)}/.{os.path.basename(cubin)}.{os.getpid()}.part"
     _copy_file(output, part)
-    fd = os.open(part, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    _fsync(part)
     os.replace(part, cubin)
 
 
@@ -337,10 +527,10 @@ def _claim_is_stale(claim: str) -> bool:
     return age > float(os.environ.get(_CLAIM_TTL_ENV, "600"))
 
 
-def _wait(cubin: str, failed: str) -> bool:
+def _wait(result: str, failed: str) -> bool:
     deadline = time.monotonic() + float(os.environ.get(_WAIT_ENV, "300"))
     while time.monotonic() < deadline and not os.path.exists(failed):
-        if os.path.exists(cubin):
+        if os.path.exists(result):
             return True
         time.sleep(0.02)
     return False

@@ -33,7 +33,7 @@ import torch
 from cuda.bindings import driver
 
 import tensorrt_llm
-from tensorrt_llm import _deep_gemm_jit_share as deep_gemm_jit_share
+from tensorrt_llm import _jit_share as jit_share
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.nccl_window_graph import (
     abandon_nccl_window_graph_owner, nccl_window_allocation_suppressed,
@@ -148,12 +148,16 @@ class TuningConfig:
         exclude_from_cache (bool): Skip disk persistence of tuning results for this op.
             Use for JIT-driven ops where caching the tactic across processes would skip
             the JIT warmup. In-process cache still works.
-        share_jit_builds (bool): For a runner with one tactic whose first call per shape
-            builds a DeepGEMM kernel. When the processes of the launch share DeepGEMM's
-            builds (TLLM_DEEP_GEMM_JIT_SHARE_DIR, see tensorrt_llm._deep_gemm_jit_share),
-            they split the profiles not yet tuned through claims in that directory: each
-            rank runs the profiles it claims first, setting aside one whose kernel another
-            rank is building, then the profiles other ranks claimed once those have run.
+        share_jit_builds (bool): For runners whose kernels are DeepGEMM builds or CuTe DSL
+            kernels kept in their class's ``kernel_cache``. When the processes of the launch
+            share their JIT builds (TLLM_JIT_SHARE_DIR, see tensorrt_llm._jit_share), each
+            kernel is built by one process and loaded by the others. They split the profiles
+            not yet tuned through claims in that directory: for a single tactic, each rank
+            runs the profiles it claims first, setting aside one whose kernel another rank is
+            building, then the profiles other ranks claimed once those have run; for several
+            tactics under INDEPENDENT tuning, a build pass first runs each (profile, runner,
+            tactic) once on the rank that claims it, and the profiling that follows finds the
+            kernels built.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -346,8 +350,13 @@ def autotune(tune_mode: bool = True,
     if autotune_enabled:
         torch.ops.trtllm.set_fine_grained_sync_disabled_override(True)
 
+    # While tuning, CuTe DSL kernels in shared runner caches go through the
+    # directory of TLLM_JIT_SHARE_DIR (see tensorrt_llm._jit_share).
+    kernel_sharing = (jit_share.sharing_kernels() if tune_required
+                      and jit_share.enabled() else contextlib.nullcontext())
     try:
-        yield
+        with kernel_sharing:
+            yield
     finally:
         autotuner.is_tuning_mode = old_mode
         autotuner.skip_dynamic_tuning_buckets = old_skip
@@ -1262,18 +1271,31 @@ class AutoTuner:
                             **kwargs)
                     new_tuning_failure_occurred = new_tuning_failure_occurred or has_tuning_failure_occurred
 
+            share_builds = (tuning_config.share_jit_builds
+                            and jit_share.enabled())
+
+            def is_pending(p: OptimizationProfile) -> bool:
+                return not self.profiling_cache.search_cache(
+                    custom_op,
+                    runners,
+                    p.get_opt_shapes(),
+                    tuning_config,
+                    apply_map_to_tuning_buckets=False,
+                )[0]
+
+            one_pair = share_builds and self._one_pair_per_profile(
+                runners, profiles, inputs, tuning_config, is_pending, **kwargs)
+            if share_builds:
+                jit_share.share_kernel_caches(runners)
+                if (not one_pair and tuning_config.distributed_tuning_strategy
+                        == DistributedTuningStrategy.INDEPENDENT):
+                    self._build_across_ranks(custom_op, runners, profiles,
+                                             inputs, tuning_config, is_pending,
+                                             **kwargs)
             with self._shared_profile_graph_pool():
-                if (tuning_config.share_jit_builds
-                        and deep_gemm_jit_share.enabled()):
-                    self._profile_sharing_jit_builds(
-                        custom_op, profiles, profile_one,
-                        lambda p: not self.profiling_cache.search_cache(
-                            custom_op,
-                            runners,
-                            p.get_opt_shapes(),
-                            tuning_config,
-                            apply_map_to_tuning_buckets=False,
-                        )[0])
+                if one_pair:
+                    self._profile_sharing_jit_builds(custom_op, profiles,
+                                                     profile_one, is_pending)
                 else:
                     for p in profiles:
                         profile_one(p)
@@ -1305,6 +1327,97 @@ class AutoTuner:
                 custom_op, 0) + tuning_end_time - tuning_start_time
         return (runners[runner_id], tactic)
 
+    def _tuning_tensors(self, profile: OptimizationProfile,
+                        inputs: List[torch.Tensor],
+                        tuning_config: TuningConfig) -> List[torch.Tensor]:
+        tensors = self._prepare_input_tensors(profile, inputs)
+        if tuning_config.inputs_pre_hook is not None:
+            tensors = tuning_config.inputs_pre_hook(tensors)
+        return tensors
+
+    def _one_pair_per_profile(self, runners: List[TunableRunner],
+                              profiles: List[OptimizationProfile],
+                              inputs: List[torch.Tensor],
+                              tuning_config: TuningConfig,
+                              is_pending: Callable[[OptimizationProfile],
+                                                   bool], **kwargs) -> bool:
+        """Whether the op profiles one (runner, tactic) per profile, judged on its first
+        profile not yet tuned: the single-pair shortcut, where profiling a profile is the
+        call that builds its kernel."""
+        if tuning_config.distributed_tuning_strategy in (
+                DistributedTuningStrategy.MERGE,
+                DistributedTuningStrategy.PARALLEL):
+            return False
+        first = next((p for p in profiles if is_pending(p)), None)
+        if first is None:
+            return True
+        tensors = self._tuning_tensors(first, inputs, tuning_config)
+        return sum(
+            len(r.get_valid_tactics(tensors, first, **kwargs))
+            for r in runners) == 1
+
+    def _build_across_ranks(self, custom_op: str, runners: List[TunableRunner],
+                            profiles: List[OptimizationProfile],
+                            inputs: List[torch.Tensor],
+                            tuning_config: TuningConfig,
+                            is_pending: Callable[[OptimizationProfile],
+                                                 bool], **kwargs) -> None:
+        """Build the kernels that profiling the pending profiles needs, split across the
+        processes that share JIT builds.
+
+        Each (profile, runner, tactic) runs once, on the process that claims it, so its
+        kernels are built there and published for the others; one whose kernel another
+        process is still building is skipped. Results are discarded and failures are left
+        to the profiling that follows, which loads each kernel built here or elsewhere, or
+        waits for one still being built.
+        """
+        pending = [p for p in profiles if is_pending(p)]
+        items = []
+        for i, p in enumerate(pending):
+            tensors = self._tuning_tensors(p, inputs, tuning_config)
+            for r, runner in enumerate(runners):
+                items.extend((i, r, tactic)
+                             for tactic in runner.get_valid_tactics(
+                                 tensors, p, **kwargs))
+        if not items:
+            return
+        sweep = jit_share.SharedSweep(
+            repr((custom_op, [p.get_opt_shapes() for p in pending], items)))
+        start = int(jit_share.start_fraction() * len(items))
+        ran = busy = 0
+        current, tensors, prepared = None, None, set()
+        begin = time.perf_counter()
+        with jit_share.defer_busy_builds():
+            for k in list(range(start, len(items))) + list(range(start)):
+                if not sweep.claim(k):
+                    continue
+                i, r, tactic = items[k]
+                if i != current:
+                    current, prepared = i, set()
+                    tensors = self._tuning_tensors(pending[i], inputs,
+                                                   tuning_config)
+                runner = runners[r]
+                try:
+                    if r not in prepared and "do_preparation" in inspect.signature(
+                            runner.forward).parameters:
+                        runner(tensors,
+                               tactic=-1,
+                               do_preparation=True,
+                               **kwargs)
+                    prepared.add(r)
+                    runner(tensors, tactic=tactic, **kwargs)
+                    torch.cuda.current_stream().synchronize()
+                    ran += 1
+                except Exception as e:  # noqa: BLE001 - profiling reports failures
+                    busy += jit_share.is_busy(e)
+                finally:
+                    sweep.done(k)
+        self._debug_logger(
+            f"[Autotuner] {custom_op}: shared JIT builds over {len(items)} (profile, "
+            f"runner, tactic) items of {len(pending)} profiles: ran {ran} claimed here and "
+            f"skipped {busy} whose kernel another process was building, in "
+            f"{time.perf_counter() - begin:.1f}s")
+
     def _profile_sharing_jit_builds(
             self, custom_op: str, profiles: List[OptimizationProfile],
             profile_one: Callable[[OptimizationProfile], None],
@@ -1324,12 +1437,12 @@ class AutoTuner:
             for p in profiles:
                 profile_one(p)
             return
-        sweep = deep_gemm_jit_share.SharedSweep(
+        sweep = jit_share.SharedSweep(
             repr((custom_op, [profiles[i].get_opt_shapes() for i in pending])))
-        start = int(deep_gemm_jit_share.start_fraction() * len(pending))
+        start = int(jit_share.start_fraction() * len(pending))
         claimed, set_aside, others = [], [], []
         begin = time.perf_counter()
-        with deep_gemm_jit_share.defer_busy_builds():
+        with jit_share.defer_busy_builds():
             for i in pending[start:] + pending[:start]:
                 if not sweep.claim(i):
                     others.append(i)
@@ -1337,7 +1450,7 @@ class AutoTuner:
                 try:
                     profile_one(profiles[i])
                 except Exception as e:
-                    if not deep_gemm_jit_share.is_busy(e):
+                    if not jit_share.is_busy(e):
                         sweep.done(i)
                         raise
                     set_aside.append(i)
@@ -1522,7 +1635,7 @@ class AutoTuner:
                 # timing.
                 min_time = 0.0
             except Exception as e:
-                if deep_gemm_jit_share.is_busy(e):
+                if jit_share.is_busy(e):
                     raise  # Not a failure: the caller runs this profile later.
                 shapes = self._get_input_sizes(input_tensors)
                 logger.warning_once(

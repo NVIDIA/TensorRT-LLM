@@ -2243,7 +2243,7 @@ class fp8SwapABGemmRunner(TunableRunner):
     # `exclude_from_cache=True` keeps the in-process cache working but
     # ensures the tuning (and the JIT warmup it triggers) repeats on
     # every process startup. `share_jit_builds=True` lets the ranks split
-    # those builds when they share DeepGEMM's (TLLM_DEEP_GEMM_JIT_SHARE_DIR).
+    # those builds when they share JIT builds (TLLM_JIT_SHARE_DIR).
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, deep_gemm_jit_warmup_buckets), ),

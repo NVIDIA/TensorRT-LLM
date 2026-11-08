@@ -33,7 +33,7 @@ from mpi4py import MPI
 
 import tensorrt_llm
 import tensorrt_llm._torch.autotuner as autotuner
-from tensorrt_llm import _deep_gemm_jit_share as jit_share
+from tensorrt_llm import _jit_share as jit_share
 from tensorrt_llm._torch.autotuner import (AutoTuner, DistributedTuningStrategy,
                                            DynamicDim, DynamicTensorSpec,
                                            FakeTensor, OptimizationProfile,
@@ -2379,9 +2379,7 @@ def test_deep_gemm_jit_share_builds_each_kernel_once(tmp_path):
     kernels = tmp_path / "share" / "kernels"
     env = {
         k: v
-        for k, v in os.environ.items()
-        if not k.startswith(("TLLM_DEEP_GEMM_JIT_SHARE_",
-                             jit_share.SHARE_DIR_ENV))
+        for k, v in os.environ.items() if not k.startswith("TLLM_JIT_SHARE_")
     }
     env.update({
         jit_share.SHARE_DIR_ENV: str(tmp_path / "share"),
@@ -2433,3 +2431,109 @@ def test_deep_gemm_jit_share_builds_each_kernel_once(tmp_path):
     claim(argv, age_s=3600)
     assert run(argv, **{jit_share._DEFER_ENV: "1"}).returncode == 0
     assert builds() == 3
+
+
+def test_shared_kernel_cache_exports_and_loads(monkeypatch, tmp_path):
+    """A CuTe DSL kernel stored in a shared runner cache is exported, and the
+    cache of another process (a second instance here) loads it instead of
+    compiling it. A kernel claimed but not yet exported is busy inside
+    defer_busy_builds, and a miss once the wait runs out otherwise."""
+    exported = {}
+
+    def export(kernel, obj, name, meta):
+        exported[name] = kernel
+        for path in (meta, obj):
+            with open(path, "w") as f:
+                f.write(name)
+
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(jit_share._WAIT_ENV, "0.1")
+    monkeypatch.setattr(jit_share, "_cute_identity", lambda: "test")
+    monkeypatch.setattr(jit_share, "_export_kernel", export)
+    monkeypatch.setattr(jit_share, "_load_kernel", lambda obj, name, meta:
+                        ("loaded", exported[name]))
+    first, second = (jit_share.SharedKernelCache("Runner") for _ in range(2))
+
+    def claims() -> int:
+        return len(list((tmp_path / "cute").glob("*.claim")))
+
+    with jit_share.sharing_kernels():
+        assert (1, "tile") not in first  # claimed: this process compiles it
+        first[(1, "tile")] = "kernel"
+        assert (1, "tile") in second
+        assert second[(1, "tile")] == ("loaded", "kernel")
+        assert (2, "tile") not in first  # claimed, never exported
+        with jit_share.defer_busy_builds(), pytest.raises(jit_share.KernelBusy):
+            _ = (2, "tile") in second
+        assert (2, "tile") not in second
+        before = claims()
+        assert object() not in first  # its repr holds an address: not shared
+        assert claims() == before
+    assert (1, "tile") not in jit_share.SharedKernelCache("Runner")
+
+
+def test_build_across_ranks_runs_only_claimed_items(monkeypatch, tmp_path):
+    """With several tactics under INDEPENDENT tuning, a build pass runs each
+    (profile, runner, tactic) this process claims once, before profiling, and
+    leaves the items other processes claimed to them; profiling then times
+    every pair."""
+    ran: List[tuple] = []
+    timed: List[tuple] = []
+
+    class TwoTacticRunner(TunableRunner):
+
+        def unique_id(self):
+            return ()
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0, 1]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1,
+                    **kwargs) -> torch.Tensor:
+            ran.append((inputs[0].shape[0], tactic))
+            return inputs[0]
+
+    def time_pair(self, runner, inputs, tactic, tuning_config, **kwargs):
+        timed.append((inputs[0].shape[0], tactic))
+        return 1.0 + tactic
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", time_pair)
+    monkeypatch.setattr(jit_share, "enabled", lambda: True)
+    monkeypatch.setattr(jit_share, "start_fraction", lambda: 0.0)
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    real_claim = jit_share.SharedSweep.claim
+    # Other processes hold the odd items.
+    monkeypatch.setattr(jit_share.SharedSweep, "claim",
+                        lambda self, k: k % 2 == 0 and real_claim(self, k))
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(0, 0,
+                                                                  (2, 4)), ),
+                          share_jit_builds=True)
+    with autotune():
+        tuner.choose_one("autotuner_test::build_across_ranks",
+                         [TwoTacticRunner()], config,
+                         [torch.zeros(4, 64, device="cuda")])
+    # Items: (2, 0), (2, 1), (4, 0), (4, 1); this process holds 0 and 2.
+    assert ran == [(2, 0), (4, 0)], ran
+    assert sorted(timed) == [(2, 0), (2, 1), (4, 0), (4, 1)], timed
+
+
+def test_jit_share_salt_ignores_file_times(tmp_path):
+    """Copies of the same files installed at different times give the same
+    salt, as each node installs its own copy; different contents do not."""
+    for name, stamp in (("a", 1_000_000), ("b", 2_000_000)):
+        (tmp_path / name).mkdir()
+        compiler = tmp_path / name / "nvcc"
+        compiler.write_text("compiler")
+        os.utime(compiler, (stamp, stamp))
+    salt_a = jit_share._salt(str(tmp_path / "a" / "nvcc"))
+    assert salt_a == jit_share._salt(str(tmp_path / "b" / "nvcc"))
+    (tmp_path / "b" / "nvcc").write_text("another compiler")
+    assert salt_a != jit_share._salt(str(tmp_path / "b" / "nvcc"))

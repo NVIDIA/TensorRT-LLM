@@ -101,15 +101,15 @@ def _setup_unified_cache() -> None:
         os.environ.setdefault(_TRTLLM_DG_DUMP_CUBIN_ENV, "1")
 
 
-def _setup_deep_gemm_jit_share() -> None:
-    """Share DeepGEMM's JIT builds across processes (``TLLM_DEEP_GEMM_JIT_SHARE_DIR``).
+def _setup_jit_share() -> None:
+    """Share JIT kernel builds across processes (``TLLM_JIT_SHARE_DIR``).
 
     Runs before :func:`_setup_unified_cache`, so that DeepGEMM's disk cache
     defaults to the shared directory rather than to ``TRTLLM_CACHE_DIR``.
     """
-    from . import _deep_gemm_jit_share
+    from . import _jit_share
 
-    _deep_gemm_jit_share.install()
+    _jit_share.install()
 
 
 def _set_numexpr_thread_default() -> None:
@@ -298,7 +298,7 @@ def _prepare_environment() -> None:
     """Phase 1: environment and library preparation, before the Torch import."""
     _set_numexpr_thread_default()
     _keep_inductor_compile_pool_alive()
-    _setup_deep_gemm_jit_share()
+    _setup_jit_share()
     _setup_unified_cache()
     _add_trt_llm_dll_directory()
     _preload_python_lib()
