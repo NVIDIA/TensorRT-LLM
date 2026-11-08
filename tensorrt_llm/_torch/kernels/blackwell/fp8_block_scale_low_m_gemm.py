@@ -3124,9 +3124,28 @@ def _num_sms() -> int:
     return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
 
 
+def _ensure_current_context(device: int) -> None:
+    """Make ``device``'s primary context current on this thread if none is. HardwareInfo loads
+    its probe kernel through the driver API, which needs one; torch makes it current only on
+    the thread's first device work, and a host-only tactic query can come before that."""
+
+    def check(result, name):
+        if result[0] != cuda.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"{name} failed: {result[0]}")
+        return result[1] if len(result) > 1 else None
+
+    if int(check(cuda.cuCtxGetCurrent(), "cuCtxGetCurrent")):
+        return
+    handle = check(cuda.cuDeviceGet(device), "cuDeviceGet")
+    ctx = check(cuda.cuDevicePrimaryCtxRetain(handle), "cuDevicePrimaryCtxRetain")
+    check(cuda.cuCtxSetCurrent(ctx), "cuCtxSetCurrent")
+
+
 @functools.cache
 def _max_active_clusters(cluster_size: int) -> int:
-    return utils.HardwareInfo().get_max_active_clusters(cluster_size)
+    device = torch.cuda.current_device()
+    _ensure_current_context(device)
+    return utils.HardwareInfo(device).get_max_active_clusters(cluster_size)
 
 
 def mma_n_for(m: int) -> int:
