@@ -491,7 +491,8 @@ def test_generate_warmup_dataset_salts_copies():
 
 
 @pytest.mark.asyncio
-async def test_llm_manager_forwards_cache_salt():
+@pytest.mark.parametrize("turns", [None, ["q1", "q2"]], ids=["single_turn", "multi_turn"])
+async def test_llm_manager_forwards_cache_salt(turns):
     mock_llm = MagicMock(spec=LLM)
     mock_output = MagicMock()
     mock_output.prompt_token_ids = [1, 2, 3]
@@ -503,8 +504,16 @@ async def test_llm_manager_forwards_cache_salt():
     mock_output.aresult = mock_aresult
     mock_llm.generate_async.return_value = mock_output
 
-    manager = LlmManager(llm=mock_llm, outbox=asyncio.Queue(), streaming=False)
-    request = InferenceRequest(task_id=0, input_ids=[1, 2, 3], output_tokens=1, cache_salt="warmup")
+    tokenizer = MagicMock()
+    tokenizer.apply_chat_template.return_value = [1, 2, 3]
+    tokenizer.decode.return_value = "answer"
+
+    manager = LlmManager(llm=mock_llm, outbox=asyncio.Queue(), streaming=False, tokenizer=tokenizer)
+    request = InferenceRequest(
+        task_id=0, input_ids=[1, 2, 3], output_tokens=1, turns=turns, cache_salt="warmup"
+    )
     await manager.process_request(request, SamplingParams(), PostprocParams())
 
-    assert mock_llm.generate_async.call_args.kwargs["cache_salt"] == "warmup"
+    calls = mock_llm.generate_async.call_args_list
+    assert len(calls) == len(turns or [None])
+    assert all(call.kwargs["cache_salt"] == "warmup" for call in calls)
