@@ -1914,6 +1914,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 self.lm_head if draft_lm_head is None else draft_lm_head,
                 self.model_config.mapping, self.spec_worker.key_exchange)
 
+    @torch.no_grad()
     def project_speculative_logits(self,
                                    hidden_states: torch.Tensor) -> torch.Tensor:
         """Project original target states for requested output scores after replay."""
