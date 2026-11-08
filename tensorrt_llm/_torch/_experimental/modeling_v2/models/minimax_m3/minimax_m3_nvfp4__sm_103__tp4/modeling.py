@@ -78,6 +78,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    ANY_MOE_IMPL,
     ModelingV2Mode,
     NoTarget,
     resolved_mode,
@@ -4452,7 +4453,9 @@ def _build_speculation(shell, model_config: ModelConfig):
         spec.speculative_model,
         trust_remote_code=True,
         attn_backend=model_config.attn_backend,
-        **_draft_loader_moe_kwargs(model_config, _draft_moe_selection(model_config, spec)),
+        **_draft_loader_moe_kwargs(
+            model_config, _draft_moe_selection(model_config, spec, load_balancer=None)
+        ),
         mapping=model_config.mapping,
         spec_config=model_config.spec_config,
         max_num_tokens=model_config.max_num_tokens,
@@ -4523,7 +4526,7 @@ class ModelingV2MiniMaxM3Nvfp4Sm103Tp4(
     # The drafter config loads through _draft_loader_moe_kwargs, so speculative_config.moe_tactic
     # selects the drafter as it does built-in. The trunk runs its own expert kernels, which no
     # moe_config.tactic names, so it declares no moe_impls_honored.
-    draft_moe_impls_honored = frozenset({"*"})
+    draft_moe_impls_honored = frozenset({ANY_MOE_IMPL})
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]) -> None:
         assert torch.cuda.get_device_capability() == _SM, (

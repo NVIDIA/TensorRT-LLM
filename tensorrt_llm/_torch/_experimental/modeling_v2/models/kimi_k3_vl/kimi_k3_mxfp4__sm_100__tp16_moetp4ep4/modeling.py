@@ -94,6 +94,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import ANY_MOE_IMPL
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla.decode_view import (
     k3_mla_decode_view,
 )
@@ -3320,7 +3321,7 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4(KimiLinearForCausalLM):
     # (decode_moe.py). Any draft comes from the inherited one-engine construction, whose
     # draft config the draft tactic selects; the drafter fast path has dense MLPs only.
     moe_impls_honored = frozenset({"trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8"})
-    draft_moe_impls_honored = frozenset({"*"})
+    draft_moe_impls_honored = frozenset({ANY_MOE_IMPL})
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:

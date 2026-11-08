@@ -352,6 +352,22 @@ def test_nvfp4_plus_override_selects_only_the_cutedsl_moe(monkeypatch: pytest.Mo
         read_modelopt_quant_config({"quantization": {"quant_algo": "NVFP4_PLUS"}})
 
 
+@pytest.mark.parametrize(
+    "tactic, names_the_override",
+    [("nvfp4_plus", True), ("trtllm.cutlass.grouped_gemm.nvfp4", False)],
+    ids=["nvfp4_plus_without_override", "nvfp4"],
+)
+def test_an_mxfp4_checkpoint_refuses_a_tactic_naming_none_of_its_run_formats(
+    monkeypatch: pytest.MonkeyPatch, tactic: str, names_the_override: bool
+) -> None:
+    """MXFP4 experts run as one of three formats, so a tactic naming none of them fails as the
+    checkpoint is read, and an NVFP4_PLUS one is told the override that selects its format."""
+    monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
+    with pytest.raises(ValueError, match="names no implementation of a format MXFP4") as error:
+        ModelConfig.get_mxfp4_quant_algo("AUTO", moe_tactic=tactic)
+    assert ("OVERRIDE_QUANT_ALGO=NVFP4_PLUS" in str(error.value)) is names_the_override
+
+
 def test_deepseek_v4_mxfp4_experts_take_the_nvfp4_plus_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

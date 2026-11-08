@@ -198,6 +198,16 @@ def _any_case(token: str) -> str:
     return "".join(f"[{char}{char.upper()}]" if char.isalpha() else char for char in token)
 
 
+def _stripped_whitespace() -> str:
+    r"""A pattern class of the characters ``str.strip()`` removes.
+
+    ``\s`` is not that set: it also matches U+FEFF, which ``strip()`` keeps,
+    and misses U+001C-U+001F and U+0085, which it removes.
+    """
+    spaces = (char for char in map(chr, range(0x10000)) if char.isspace())
+    return "[" + "".join(f"\\u{ord(char):04x}" for char in spaces) + "]"
+
+
 def _moe_tactic_schema() -> dict:
     """The MoE tactics the runtime accepts, as far as patterns can tell.
 
@@ -213,10 +223,11 @@ def _moe_tactic_schema() -> dict:
     values = "|".join(_any_case(token) for token in sorted(MOE_IMPL_REGISTRY.known_tokens()))
     segment = rf"(\*|{values})"
     more = len(fields(MoEImplId)) - 1
+    space = _stripped_whitespace()
     return {
         "type": "string",
-        "pattern": rf"^\s*{segment}(\.{segment}){{0,{more}}}\s*$",
-        "not": {"pattern": rf"^\s*\*(\.\*){{0,{more}}}\s*$"},
+        "pattern": rf"^{space}*{segment}(\.{segment}){{0,{more}}}{space}*$",
+        "not": {"pattern": rf"^{space}*\*(\.\*){{0,{more}}}{space}*$"},
     }
 
 

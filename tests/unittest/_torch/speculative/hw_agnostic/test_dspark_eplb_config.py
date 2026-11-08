@@ -38,6 +38,8 @@ from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
 
+pytestmark = pytest.mark.cpu_only
+
 NUM_HIDDEN_LAYERS = 61
 NUM_STAGES = 3
 NUM_EXPERTS = 384

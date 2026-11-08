@@ -28,6 +28,7 @@ The things worth proving:
 
 from __future__ import annotations
 
+import importlib
 import re
 from dataclasses import replace
 
@@ -49,8 +50,9 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
 )
 from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
-from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.model_config import KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO, ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
+from tensorrt_llm._torch.moe.fused_moe.impl_identity import MoEImplId
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig,
     KvCacheConfig,
@@ -1408,33 +1410,63 @@ def test_kimi_k3_on_another_sm_does_not_match(monkeypatch):
         modeling_v2_resolve(config, _llm_args("require"))
 
 
-@pytest.mark.usefixtures("_on_sm100")
-@pytest.mark.parametrize(
+_K3_TARGETS = pytest.mark.parametrize(
     "mapping_kwargs, target",
     [(_TP16_MOETP4EP4, _K3_TARGET), (_TP16_MOETP16EP1, _K3_TARGET_B)],
     ids=["tp16_moetp4ep4", "tp16_moetp16ep1"],
 )
-def test_kimi_k3_targets_take_only_the_tactic_of_the_experts_their_kernels_read(
-    mapping_kwargs, target
+
+
+def _k3_model_config(mapping_kwargs, moe_tactic) -> ModelConfig:
+    """K3 as the model config reads the checkpoint, W4A16_MXFP4, with ``moe_tactic``."""
+    return replace(
+        _model_config(_k3_config(), **mapping_kwargs),
+        quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4),
+        moe_tactic=moe_tactic,
+    )
+
+
+@pytest.mark.usefixtures("_on_sm100")
+@pytest.mark.parametrize(
+    "tactic", ["trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8", "trtllm.trtllm_gen", "trtllm_gen"]
+)
+@_K3_TARGETS
+def test_kimi_k3_targets_take_the_tactic_of_the_experts_their_kernels_read(
+    mapping_kwargs, target, tactic
 ):
     """Decode steps run k3_moe over the TRTLLM-Gen W4A8_MXFP4_MXFP8 experts' buffers. The model
     config reads the checkpoint as W4A16_MXFP4, but K3 runs experts the checkpoint does not list
     as W4A8_MXFP4_MXFP8, so a tactic is narrowed to that format."""
-    config = replace(
-        _model_config(_k3_config(), **mapping_kwargs),
-        quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4),
-    )
-    for tactic in (
-        "trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8",
-        "trtllm.trtllm_gen",
-        "trtllm_gen",
-    ):
-        honored = replace(config, moe_tactic=tactic)
-        assert _qualified(modeling_v2_resolve(honored, _llm_args("require"))) == target, tactic
-    declined = replace(config, moe_tactic="cutlass")
-    assert modeling_v2_resolve(declined, _llm_args("auto")) is None
+    config = _k3_model_config(mapping_kwargs, tactic)
+    assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == target
+
+
+@pytest.mark.usefixtures("_on_sm100")
+@_K3_TARGETS
+def test_kimi_k3_targets_decline_the_tactic_of_other_experts(mapping_kwargs, target):
+    config = _k3_model_config(mapping_kwargs, "cutlass")
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match=rf"moe_config.tactic='cutlass' .*{target.split('.')[-1]}"):
-        modeling_v2_resolve(declined, _llm_args("require"))
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+@_K3_TARGETS
+def test_kimi_k3_targets_build_and_honor_the_format_loading_reads_unlisted_experts_as(
+    mapping_kwargs, target
+):
+    """Three places spell the format K3 runs the experts a checkpoint does not list in: the
+    loader's ``KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO``, which the router narrows a tactic by, each
+    target's own copy, which it builds the experts in, and the quant of the ids it honors."""
+    module_path, class_name = target.rsplit(".", 1)
+    module = importlib.import_module(f"tensorrt_llm._torch._experimental.modeling_v2.{module_path}")
+    assert module._K3_DEFAULT_ROUTED_QUANT_ALGO == KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO
+    loaded = ModelConfig._declared_moe_quants(
+        QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4),
+        None,
+        architecture="KimiK3ForConditionalGeneration",
+    )
+    honored = getattr(module, class_name).moe_impls_honored
+    assert {MoEImplId.parse(impl_id).quant for impl_id in honored} == loaded
 
 
 # --- qwen4_exp: one-model MTP-Eagle over a linear chain, one rank ---------------

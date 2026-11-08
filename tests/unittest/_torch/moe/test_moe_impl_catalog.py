@@ -23,6 +23,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_catalog import (
     CATALOG_END,
     splice_moe_impl_catalog,
 )
+from tensorrt_llm._torch.moe.fused_moe.moe_resolution import moe_impl_request
 
 pytestmark = pytest.mark.cpu_only
 
@@ -50,3 +51,27 @@ def test_the_perf_guide_embeds_the_current_catalog():
 def test_splicing_refuses_a_document_without_one_ordered_block(document):
     with pytest.raises(ValueError, match="marker|must follow"):
         splice_moe_impl_catalog(document)
+
+
+@pytest.mark.parametrize(
+    "tactic, quant, families",
+    [
+        ("trtllm_gen", "nvfp4", {"TRTLLM": ("trtllm.trtllm_gen.fused_moe.nvfp4",)}),
+        ("cutedsl", "nvfp4", {"CUTEDSL", "CUTEDSL_FC12", "DENSEGEMM", "MEGAMOE_CUTEDSL"}),
+        ("grouped_gemm.nvfp4", "nvfp4", {"CUTLASS", "CUTEDSL"}),
+        ("cutlass.grouped_gemm.nvfp4", "nvfp4", {"CUTLASS"}),
+        ("mega_moe", "nvfp4", {"MEGAMOE_CUTEDSL": ("trtllm.cutedsl.mega_moe.nvfp4",)}),
+        (
+            "mega_moe",
+            "w4a8_mxfp4_mxfp8",
+            {"MEGAMOE_DEEPGEMM": ("deepgemm.cuda.mega_moe.w4a8_mxfp4_mxfp8",)},
+        ),
+    ],
+)
+def test_the_perf_guide_examples_resolve_as_it_says(tactic, quant, families):
+    """The tactic section of moe-perf-guide.md quotes these resolutions; update it with them."""
+    resolved = moe_impl_request(tactic=tactic).narrowed_to({quant}).families()
+    if isinstance(families, dict):
+        assert resolved == families
+    else:
+        assert set(resolved) == families

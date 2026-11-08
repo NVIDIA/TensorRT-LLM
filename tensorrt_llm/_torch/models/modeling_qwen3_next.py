@@ -446,18 +446,26 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 raise ValueError(
                     "speculative_config.draft_moe_dtype='nvfp4' runs the "
                     f"draft experts of layer {layer_idx} on the TRTLLM-gen "
-                    f"MoE, but the MoE tactic {model_config.moe_tactic!r} "
-                    "pinned for them selects backend family "
-                    f"{model_config.moe_backend}. Drop the tactic, or name a "
-                    "TRTLLM-gen implementation such as "
+                    "MoE, but speculative_config.moe_tactic="
+                    f"{model_config.moe_tactic!r} selects backend family "
+                    f"{model_config.moe_backend}. Unset "
+                    "speculative_config.moe_tactic, or name a TRTLLM-gen "
+                    "implementation such as "
                     "'trtllm.trtllm_gen.fused_moe.nvfp4'.")
         elif _experts_excluded_from_quant(model_config, layer_idx):
-            # These experts end up bf16 whatever the per-layer entry says, so
-            # build them on CUTLASS, the only backend that serves bf16
-            # unconditionally.
+            # These experts end up bf16 whatever the per-layer entry says.
             expert_quant_config = QuantConfig(kv_cache_quant_algo=model_config.
                                               quant_config.kv_cache_quant_algo)
-            if (model_config.moe_backend != "CUTLASS"
+            # An MTP layer's tactic can only be speculative_config.moe_tactic,
+            # which pins these experts: MoE resolution runs it or refuses it.
+            # Otherwise build them on CUTLASS, the only backend that serves
+            # bf16 unconditionally.
+            draft_tactic_pins_them = (model_config.moe_tactic is not None
+                                      and layer_idx is not None
+                                      and n_hidden is not None
+                                      and layer_idx >= n_hidden)
+            if not draft_tactic_pins_them and (
+                    model_config.moe_backend != "CUTLASS"
                     or model_config.moe_tactic is not None):
                 moe_model_config = _with_moe_backend(model_config, "CUTLASS")
                 dropped_tactic = (

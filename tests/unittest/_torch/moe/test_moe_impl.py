@@ -134,7 +134,7 @@ from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
     find_trtllm_gen_leaf,
 )
 from tensorrt_llm._torch.utils import ActivationType
-from tensorrt_llm.llmapi.llm_args import MoeConfig
+from tensorrt_llm.llmapi.llm_args import MoeConfig, auto_moe_backend_for_load_balancer
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 # Everything here is a declaration; the one test that reaches a constructor
@@ -2424,6 +2424,37 @@ def test_a_refused_layer_format_is_named_with_what_serves_it(
 
 
 @pytest.mark.parametrize(
+    "checkpoint_algo, suggestion",
+    [
+        (
+            QuantAlgo.W4A16_NVFP4,
+            "tactics of one family that serve every format here (['none', 'w4a16_nvfp4']) "
+            "are 'cutlass'",
+        ),
+        (
+            QuantAlgo.NVFP4,
+            "no tactic of one family serves every format here (['none', 'nvfp4']), so select "
+            "these MoE layers by moe_config.backend",
+        ),
+    ],
+    ids=["cutlass_serves_both", "no_family_serves_both"],
+)
+def test_a_layer_in_another_format_is_told_a_tactic_of_one_family_serving_every_format(
+    checkpoint_algo, suggestion
+):
+    """A checkpoint that excludes some experts from quantization runs them in BF16 next to its
+    own format. On SM90 Marlin serves NVFP4 and W4A16_NVFP4 but not BF16, and CUTLASS serves
+    W4A16_NVFP4 and BF16 but NVFP4 only from SM100."""
+    config = _tactic_model_config("marlin", "MARLIN")
+    config.quant_config = QuantConfig(quant_algo=checkpoint_algo)
+    with override_moe_environment(MoEEnvironment(sm=90)):
+        with pytest.raises(ValueError, match="names no implementation of quant=none") as error:
+            resolve_moe_impl(config, override_quant_config=QuantConfig())
+
+    assert suggestion in str(error.value)
+
+
+@pytest.mark.parametrize(
     "tactic, quants, widened",
     [
         ("trtllm.trtllm_gen.fused_moe.nvfp4", {"nvfp4", "none"}, ("trtllm_gen.fused_moe",)),
@@ -2792,6 +2823,18 @@ def test_per_layer_dynamic_eplb_admits_a_tactic_one_match_of_which_consumes_its_
     assert any(impl.capabilities.supports_per_layer_dynamic_eplb for impl in impls) == accepted
     load_balancer = {"mode": "per_layer_dynamic", "num_slots": 72}
     assert _config_accepts(tactic=tactic, load_balancer=load_balancer) == accepted
+
+
+def test_auto_under_per_layer_dynamic_eplb_picks_the_family_that_consumes_its_plans() -> None:
+    """A tactic reads the capability itself; a literal and ``AUTO`` rely on
+    ``auto_moe_backend_for_load_balancer`` naming the family that declares it."""
+    consumers = {
+        backend_family_of(impl_cls)
+        for impl_cls in IMPL_PRIORITY
+        if impl_cls.capabilities.supports_per_layer_dynamic_eplb
+    }
+    load_balancer = MoeConfig(load_balancer={"mode": "per_layer_dynamic", "num_slots": 72})
+    assert consumers == {auto_moe_backend_for_load_balancer(load_balancer.load_balancer)}
 
 
 @pytest.mark.parametrize(

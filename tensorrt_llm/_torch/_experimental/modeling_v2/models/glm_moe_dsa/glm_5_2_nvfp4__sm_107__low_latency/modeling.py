@@ -1751,7 +1751,9 @@ class ModelingV2Glm52Nvfp4Sm107LowLatency(
 
     # Decode steps run this target's fused kernels over the routed experts' TRTLLM-Gen NVFP4
     # buffers (DecodeTarget), and the MTP draft's MoE over a BF16 copy of its checkpoint
-    # weights (weights.py), not the draft module a draft tactic selects.
+    # weights (weights.py), not the draft module a draft tactic selects. So no draft tactic is
+    # honored: it would pin nothing decode runs. speculative_config.moe_backend still selects
+    # that module, which the steps with context requests run (PrefillTarget).
     moe_impls_honored = frozenset({"trtllm.trtllm_gen.fused_moe.nvfp4"})
     draft_moe_impls_honored = frozenset()
 

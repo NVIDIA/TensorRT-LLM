@@ -323,6 +323,33 @@ def test_an_excluded_layer_names_the_tactic_it_drops(monkeypatch):
     assert any(f"MoE tactic {_NVFP4_TACTIC!r}" in message for message in warnings)
 
 
+def test_an_excluded_mtp_layer_keeps_the_draft_tactic():
+    """An MTP layer's tactic is speculative_config.moe_tactic, which pins its BF16 experts."""
+    captured = _build_moe_block(
+        "CUTLASS",
+        [f"model.layers.{MTP_LAYER_IDX}*"],
+        MTP_LAYER_IDX,
+        sm=100,
+        moe_tactic="cutlass.none",
+    )
+
+    assert captured["moe_backend"] == "CUTLASS"
+    assert captured["moe_tactic"] == "cutlass.none"
+    assert captured["moe_cls"] == "TrtllmCutlassUnquantizedImpl"
+
+
+def test_an_excluded_mtp_layer_refuses_a_draft_tactic_of_another_format():
+    """A draft tactic with no BF16 implementation fails instead of being replaced."""
+    with pytest.raises(ValueError, match="names no implementation of quant=none"):
+        _build_moe_block(
+            "CUTLASS",
+            [f"model.layers.{MTP_LAYER_IDX}*"],
+            MTP_LAYER_IDX,
+            sm=100,
+            moe_tactic="trtllm.cutlass.grouped_gemm.nvfp4",
+        )
+
+
 def _nvfp4_draft_spec_config():
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
