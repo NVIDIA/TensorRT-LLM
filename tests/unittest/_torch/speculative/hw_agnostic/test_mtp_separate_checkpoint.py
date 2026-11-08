@@ -425,11 +425,11 @@ def test_nemotron_embedded_multimodal_mtp_uses_language_config() -> None:
     [{"moe_backend": "CUTLASS"}, {"moe_tactic": "cutlass"}],
     ids=["moe_backend", "moe_tactic"],
 )
-def test_mtp_moe_selection_allowed_for_shared_kv_replacement_heads(moe_selection) -> None:
+def test_mtp_moe_selection_allowed_for_shared_kv_replacement_heads(tmp_path, moe_selection) -> None:
     """Replacement heads load through their own weight mapper, so they select for themselves."""
     spec_config = MTPDecodingConfig(
         max_draft_len=1,
-        speculative_model="/tmp/assistant",
+        speculative_model=str(tmp_path),
         **moe_selection,
     )
     model_config = SimpleNamespace(
