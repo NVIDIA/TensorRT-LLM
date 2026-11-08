@@ -126,6 +126,8 @@ LAGUNA_TOP_K = 8
 SHAPES = [
     MoeShape("tiny", num_tokens=64, hidden=256, intermediate=512, num_experts=8, top_k=2),
     MoeShape("tiny_topk1", num_tokens=64, hidden=256, intermediate=512, num_experts=8, top_k=1),
+    # Enough rows per expert for the prefill block size
+    MoeShape("tiny_prefill", num_tokens=256, hidden=256, intermediate=512, num_experts=8, top_k=2),
     # DeepSeek-V3-Lite routes over 72 experts, which is not a power of 2.
     MoeShape("experts_72", num_tokens=64, hidden=256, intermediate=512, num_experts=72, top_k=6),
     MoeShape(
