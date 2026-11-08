@@ -25,6 +25,7 @@ FAMILY_DIR = (
 #: asks about and its logger.
 _NON_COMPUTE_IMPORTS = frozenset(
     {
+        "ANY_MOE_IMPL",
         "AllReduceStrategy",
         "AttentionMetadata",
         "AuxStreamType",

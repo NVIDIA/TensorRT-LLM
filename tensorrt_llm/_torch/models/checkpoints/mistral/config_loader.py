@@ -385,13 +385,8 @@ class MistralConfigLoader(BaseConfigLoader):
         kwargs.pop("trust_remote_code", None)  # ModelConfig does not have this input parameter
         if kwargs.get("moe_tactic") is not None:
             # As from_pretrained does: build the model for the family the tactic implies.
-            # TODO: Drop this derivation once moe_backend is removed. The tactic alone
-            # selects the MoE implementation; the literal is derived only because model
-            # code outside MoE selection still branches on it (gate and router dtypes,
-            # checkpoint weight mappers, weight preloading), often before any layer is
-            # resolved. Those branches have to read the resolved implementation's
-            # descriptor instead, and the same derivation in
-            # ModelConfig.from_pretrained goes with this one.
+            # The literal model code is built for, derived from the tactic as
+            # ModelConfig.from_pretrained derives it (see MoEImplRequest.backend_for).
             architectures = pretrained_config.architectures
             kwargs["moe_backend"] = ModelConfig.pinned_moe_backend(
                 kwargs["moe_tactic"],

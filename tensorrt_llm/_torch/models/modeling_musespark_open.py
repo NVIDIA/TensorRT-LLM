@@ -607,6 +607,50 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
         )
 
 
+def _is_quant_excluded_layer(model_config: ModelConfig, layer_idx: int) -> bool:
+    """Whether the checkpoint leaves layer ``layer_idx`` unquantized; it
+    quant-excludes whole layers ("layers.0." in exclude_modules)."""
+    quant_config = model_config.quant_config
+    return bool(
+        quant_config is not None
+        and quant_config.exclude_modules
+        and quant_config.is_module_excluded_from_quantization(f"model.layers.{layer_idx}")
+    )
+
+
+def _quant_excluded_layer_moe_backend(model_config: ModelConfig) -> str:
+    """The ``moe_backend`` the experts of a quant-excluded layer run under.
+
+    The MegaMoE families have no BF16 implementation, so under them such a
+    layer runs the TRTLLM backend.
+    """
+    moe_backend = str(getattr(model_config, "moe_backend", "")).upper()
+    if moe_backend in ("MEGAMOE_CUTEDSL", "MEGAMOE_DEEPGEMM"):
+        return "TRTLLM"
+    return model_config.moe_backend
+
+
+def _warn_tactic_skips_quant_excluded_layers(model_config: ModelConfig) -> None:
+    """Warn once, listing them, that the MoE tactic does not apply to the
+    quant-excluded layers: it pins implementations of the checkpoint's format,
+    and their experts are BF16."""
+    moe_tactic = getattr(model_config, "moe_tactic", None)
+    if moe_tactic is None:
+        return
+    excluded = [
+        layer_idx
+        for layer_idx in range(model_config.pretrained_config.num_hidden_layers)
+        if _is_quant_excluded_layer(model_config, layer_idx)
+    ]
+    if excluded:
+        logger.warning_once(
+            f"MoE layers {excluded} are excluded from quantization; the MoE tactic "
+            f"{moe_tactic!r} does not apply to them, and they use "
+            f"moe_backend={_quant_excluded_layer_moe_backend(model_config)}.",
+            key=("musespark_open_tactic_skips_excluded_layers", moe_tactic, tuple(excluded)),
+        )
+
+
 class MuseSparkOpenMoE(nn.Module):
     """Router + pooled experts + per-expert post-norm combine + unpooler.
 
@@ -717,34 +761,20 @@ class MuseSparkOpenMoE(nn.Module):
         # has; it then resolves the TRTLLM-Gen BF16 implementation, which
         # returns the unfinalized output the per-expert norm needs. A tactic
         # pins implementations of the checkpoint's format, so it does not apply
-        # to such a layer. The MegaMoE families have no BF16 implementation, so
-        # under them the layer falls back to the TRTLLM backend.
+        # to such a layer (MuseSparkOpenModel warns once, listing the layers).
         layer_model_config = model_config
         layer_quant_config = None
-        global_quant_config = model_config.quant_config
-        if (
-            global_quant_config is not None
-            and global_quant_config.exclude_modules
-            and global_quant_config.is_module_excluded_from_quantization(
-                f"model.layers.{layer_idx}"
-            )
-        ):
+        if _is_quant_excluded_layer(model_config, layer_idx):
             layer_quant_config = QuantConfig(
-                kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo
+                kv_cache_quant_algo=model_config.quant_config.kv_cache_quant_algo
             )
-            moe_backend = str(getattr(model_config, "moe_backend", "")).upper()
-            moe_tactic = getattr(model_config, "moe_tactic", None)
-            under_mega_moe = moe_backend in ("MEGAMOE_CUTEDSL", "MEGAMOE_DEEPGEMM")
-            if moe_tactic is not None or under_mega_moe:
+            moe_backend = _quant_excluded_layer_moe_backend(model_config)
+            if (
+                getattr(model_config, "moe_tactic", None) is not None
+                or moe_backend != model_config.moe_backend
+            ):
                 layer_model_config = model_config.copy_with(
-                    moe_backend="TRTLLM" if under_mega_moe else model_config.moe_backend,
-                    moe_tactic=None,
-                )
-            if moe_tactic is not None:
-                logger.warning(
-                    f"Layer {layer_idx} MoE experts are excluded from quantization; "
-                    f"the MoE tactic {moe_tactic!r} does not apply to them, and this "
-                    f"layer uses moe_backend={layer_model_config.moe_backend}."
+                    moe_backend=moe_backend, moe_tactic=None
                 )
         self.experts = create_moe(
             routing_method=MuseSparkOpenRoutingMethod(
@@ -1217,6 +1247,7 @@ class MuseSparkOpenModel(DecoderModel):
             has_weights=False,
         )
         self.m_emb = config.m_emb
+        _warn_tactic_skips_quant_excluded_layers(model_config)
         self.layers = nn.ModuleList(
             [
                 MuseSparkOpenDecoderLayer(model_config, layer_idx, self.aux_stream)

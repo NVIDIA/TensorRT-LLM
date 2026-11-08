@@ -631,13 +631,17 @@ A tactic never degrades, and that includes the layer's format: a layer whose
 `resolve_moe_impl` raise, because selecting it by the `moe_backend` literal
 would run something the tactic does not name. An `impl_id` argument is a
 caller's measurement and pins every layer; a layer it cannot serve gets a
-failed report rather than an exception. A tactic pins implementations of the
-checkpoint's quantized expert format, so a layer whose experts the checkpoint
-excludes from quantization runs without it, and model code warns that the
-tactic does not apply there: Qwen3-Next's excluded (bf16) expert layers run on
+failed report rather than an exception. That holds for a layer whose experts
+the checkpoint excludes from quantization too: the tactic must cover its bf16
+format as well, within one family, and the refusal names the tactics of one
+family that serve every format the checkpoint's layers run as on the GPU
+(`_family_tactics_serving`), or says that only `moe_config.backend` can.
+Model code may re-point layers it knows are special, and warns that the tactic
+does not apply there: Qwen3-Next's excluded (bf16) target expert layers run on
 CUTLASS (`modeling_qwen3_next`), and MuseSpark Open's on the model's literal,
 TRTLLM under a MegaMoE family, which has no bf16 implementation
-(`modeling_musespark_open`).
+(`modeling_musespark_open`). An excluded MTP layer is a draft layer, so
+Qwen3-Next keeps its `speculative_config.moe_tactic`.
 
 A checkpoint's quantization is not uniform across the target and its draft:
 the MTP layer of an NVFP4 DeepSeek-R1 checkpoint is unquantized (its

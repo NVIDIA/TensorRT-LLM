@@ -181,8 +181,9 @@ def backend_family_of(impl_cls: MoEImplClass) -> Optional[str]:
     """The ``moe_backend`` literal whose family contains ``impl_cls``.
 
     The families above are disjoint, so at most one name matches. ``None``
-    means the class is reachable only through a pinned identity, never through
-    the coarse literal.
+    means the class is reachable only through a caller's ``impl_id`` (see
+    ``resolve_moe_impl``), never through a literal or a tactic, which
+    ``MoEImplRequest.backend_for`` refuses.
     """
     for name, family in BACKEND_FAMILY.items():
         if impl_cls in family:
@@ -455,6 +456,67 @@ def _covering_tactics(query: MoEImplQuery, quants: Collection[str]) -> Tuple[str
     return ()
 
 
+def _problem_in_format(problem: MoEProblem, quant: str) -> MoEProblem:
+    """``problem`` with its experts in the format MoE identities spell ``quant``."""
+    if quant == "none":
+        return replace(problem, quant=None)
+    for algo in QuantAlgo:
+        if normalize_quant(canonical_quant(algo)) == quant:
+            return replace(problem, quant=algo.value)
+    raise ValueError(f"no quantization algorithm runs MoE experts as {quant!r}")
+
+
+def _family_tactics_serving(
+    quants: Collection[str], problem: MoEProblem, deployment: MoEDeployment
+) -> Tuple[str, ...]:
+    """Tactics, one per backend family, that name an implementation of every
+    format in ``quants`` able to serve ``problem`` in that format on
+    ``deployment``, and no implementation of another family.
+
+    For a checkpoint whose MoE layers run in several formats, such as one that
+    excludes some experts from quantization, when no tactic made by dropping
+    segments of the configured one covers them all. Each tactic is the fewest
+    shared segments of those implementations, ``technique`` first.
+    """
+    variants = {quant: _problem_in_format(problem, quant) for quant in quants}
+    tactics = []
+    for family, leaves in BACKEND_FAMILY.items():
+        serving: Dict[str, MoEImplClass] = {}
+        for impl_cls in IMPL_PRIORITY:
+            quant = _published_quant(impl_cls)
+            if (
+                impl_cls in leaves
+                and quant in variants
+                and quant not in serving
+                and impl_cls.can_implement(variants[quant], deployment).eligible
+            ):
+                serving[quant] = impl_cls
+        if set(serving) != set(variants):
+            continue
+        identities = [impl_cls.descriptor.identity for impl_cls in serving.values()]
+        shared = [
+            name
+            for name in ("technique", "kernel_name", "provider")
+            if len({getattr(identity, name) for identity in identities}) == 1
+        ]
+        for size in range(1, len(shared) + 1):
+            found = None
+            for names in itertools.combinations(shared, size):
+                query = MoEImplQuery(**{name: getattr(identities[0], name) for name in names})
+                matched = [
+                    impl_cls
+                    for _, impl_cls in MOE_IMPL_REGISTRY.find(query)
+                    if _published_quant(impl_cls) in variants
+                ]
+                if all(backend_family_of(impl_cls) == family for impl_cls in matched):
+                    found = query.compact()
+                    break
+            if found is not None:
+                tactics.append(found)
+                break
+    return tuple(tactics)
+
+
 def _one_family_tactics(
     query: MoEImplQuery, impls: Collection[MoEImplClass]
 ) -> Dict[str, Tuple[str, ...]]:
@@ -509,7 +571,7 @@ class MoEImplRequest:
     one request. A tactic is a pin: its matches and nothing else, and when none
     of them can serve the layer resolution fails with the rejection trail. A
     literal names its family and may degrade to ``fallback``, a legacy behavior
-    that is deprecated together with ``moe_backend``.
+    that goes together with ``moe_backend``.
 
     Attributes:
         label: The request as diagnostics and ``MoEResolutionReport.requested``
@@ -576,14 +638,15 @@ class MoEImplRequest:
         families are disjoint. Family membership is a declaration, so this
         asks no gate.
 
-        TODO: Remove together with ``moe_backend``. This is a transitional
-        bridge, not part of selection: a tactic alone selects the
+        TODO: Remove together with ``moe_backend``; the other derivations of
+        the literal from a tactic point here. A tactic alone selects the
         implementations, and the literal is derived only for the model code
-        that still branches on it (gate and router dtypes, checkpoint weight
-        mappers, weight preloading, quant-config defaults). Once those
-        branches read the resolved implementation's descriptor, no caller
-        needs a literal. The refusal of a request spanning several families
-        exists for the same reason, since that model code is built for one.
+        that still branches on it: gate and router dtypes, finalize fusion,
+        checkpoint weight mappers, weight preloading and quant-config
+        defaults. Once those branches read the resolved implementation's
+        descriptor, no caller needs a literal. The refusal of a request
+        spanning several families exists for the same reason, since that
+        model code is built for one.
 
         Args:
             quants: The checkpoint's formats, spelled as identities spell them.
@@ -873,13 +936,31 @@ def resolve_moe_impl(
                 else "no registered implementation serves that format"
             )
             covering = _covering_tactics(request.query, pinned_quants | {problem.identity_quant})
-            widen = (
-                "Widen it so that it names that format too, for example to "
-                + " or ".join(repr(tactic) for tactic in covering)
-                if covering
-                else "No tactic made by dropping its segments names that format too "
-                "within one backend family"
-            )
+            if covering:
+                widen = "Widen it so that it names that format too, for example to " + " or ".join(
+                    repr(tactic) for tactic in covering
+                )
+            else:
+                architectures = getattr(model_config.pretrained_config, "architectures", None)
+                checkpoint_quants = ModelConfig._declared_moe_quants(
+                    model_config.quant_config,
+                    model_config.quant_config_dict,
+                    architecture=architectures[0] if architectures else "",
+                ) | {problem.identity_quant}
+                serving_tactics = _family_tactics_serving(checkpoint_quants, problem, deployment)
+                widen = (
+                    "No tactic made by dropping its segments names that format too "
+                    "within one backend family; "
+                    + (
+                        f"tactics of one family that serve every format here "
+                        f"({sorted(checkpoint_quants)}) are "
+                        + " or ".join(repr(tactic) for tactic in serving_tactics)
+                        if serving_tactics
+                        else f"no tactic of one family serves every format here "
+                        f"({sorted(checkpoint_quants)}), so select these MoE layers "
+                        f"by moe_config.backend"
+                    )
+                )
             raise ValueError(
                 f"MoE tactic {request.label} names no implementation of "
                 f"quant={problem.identity_quant} (it names {sorted(pinned_quants)}), so "

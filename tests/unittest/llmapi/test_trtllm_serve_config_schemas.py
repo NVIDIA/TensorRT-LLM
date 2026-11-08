@@ -1025,6 +1025,9 @@ def _schema_verdict(runtime_valid: bool, runtime_only: str | None) -> bool:
     [
         ({"tactic": "Grouped_GEMM.NVFP4"}, None),
         ({"tactic": " cutlass "}, None),
+        # str.strip() removes U+001C and U+0085 and keeps U+FEFF; a \s pattern does the opposite.
+        ({"tactic": "\x1ccutlass\x85"}, None),
+        ({"tactic": "\ufeffcutlass"}, None),
         ({"tactic": "*.cutlass.*.nvfp4"}, None),
         ({"tactic": "nosuchprovider"}, None),
         ({"tactic": "cutlas"}, None),

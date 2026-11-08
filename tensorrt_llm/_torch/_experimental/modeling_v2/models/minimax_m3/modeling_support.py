@@ -265,7 +265,7 @@ def _build_speculation(state: ModelingSupport, /, shell: Any, model_config: Mode
         trust_remote_code=True,
         attn_backend=model_config.attn_backend,
         **state._draft_loader_moe_kwargs(
-            model_config, state._draft_moe_selection(model_config, spec)
+            model_config, state._draft_moe_selection(model_config, spec, load_balancer=None)
         ),
         mapping=model_config.mapping,
         spec_config=model_config.spec_config,

@@ -70,7 +70,7 @@ def moe_impl_catalog_markdown() -> str:
     ]
     for rank, impl_cls, identity in sorted(_ranked_impls(), key=family_then_rank):
         family = backend_family_of(impl_cls)
-        family_cell = f"`{family}`" if family is not None else "none (tactic only)"
+        family_cell = f"`{family}`" if family is not None else "none (impl_id only)"
         shortest = MOE_IMPL_REGISTRY.shortest_query(identity).compact()
         lines.append(
             f"| `{identity}` | `{shortest}` | {family_cell} | {rank} "

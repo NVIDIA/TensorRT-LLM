@@ -215,8 +215,9 @@ def engine_kv_cache_quant_algo(config: "ModelConfig", llm_args: "TorchLlmArgs"):
     return {"fp8": QuantAlgo.FP8, "nvfp4": QuantAlgo.NVFP4}.get(dtype, dtype)
 
 
-#: The implementation id that honors any tactic: ``create_moe`` builds the experts and only that
-#: module runs them, so whatever a tactic resolves to is what runs.
+#: The wildcard a target lists in ``moe_impls_honored`` / ``draft_moe_impls_honored`` to honor any
+#: tactic: ``create_moe`` builds the experts and only that module runs them, so whatever a tactic
+#: resolves to is what runs.
 ANY_MOE_IMPL = "*"
 
 
@@ -228,8 +229,9 @@ def _refuse_unhonored_moe_tactics(config: "ModelConfig", target: type, architect
     ``speculative_config.moe_tactic``; :data:`ANY_MOE_IMPL` honors any, undeclared honors none.
     A target whose own kernels read the expert buffers lists only the id whose layout they
     read. A tactic is honored when every implementation it can resolve to (narrowed to the
-    formats the target's experts run as on ``architecture``) is listed; otherwise the built-in
-    model runs it.
+    formats the target's experts run as on ``architecture``) is listed; otherwise the target
+    does not claim the deployment: ``modeling_v2='auto'`` builds the built-in model and
+    ``'require'`` fails.
     """
     from tensorrt_llm._torch.model_config import ModelConfig
 

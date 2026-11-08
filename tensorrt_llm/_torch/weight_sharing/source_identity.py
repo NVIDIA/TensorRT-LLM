@@ -143,6 +143,15 @@ def _pretrained_config_payload(pretrained: Any) -> Any:
     return payload
 
 
+def _canonical_moe_tactic(tactic: str) -> str:
+    """``tactic`` in one spelling. Segment order and case do not change which
+    implementations a tactic names, so they must not change the fingerprint."""
+    # Importing resolution registers every implementation, and with them the segment values.
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import MOE_IMPL_REGISTRY
+
+    return MOE_IMPL_REGISTRY.parse_query(tactic).compact()
+
+
 def _canonical_hash(obj: Any) -> str:
     """Compute a stable SHA-256 hash of an arbitrary JSON-able object.
 
@@ -407,9 +416,9 @@ class SourceIdentity:
         Returns:
             A hex digest covering attention/MoE backends, allowed GEMM
             backends, fusion flags, the all-reduce strategy, and -- only when
-            one is configured -- the MoE load-balancer config and the MoE
+            one is configured -- the MoE load-balancer config, the MoE
             tactics of the target and of its draft, which pin implementations
-            within the ``moe_backend`` family.
+            within the ``moe_backend`` family, and the draft's ``moe_backend``.
         """
         payload = {
             "attn_backend": getattr(model_config, "attn_backend", None),
@@ -439,10 +448,14 @@ class SourceIdentity:
             payload["moe_load_balancer"] = load_balancer.model_dump(mode="python")
         moe_tactic = getattr(model_config, "moe_tactic", None)
         if moe_tactic is not None:
-            payload["moe_tactic"] = moe_tactic
-        draft_moe_tactic = getattr(getattr(model_config, "spec_config", None), "moe_tactic", None)
+            payload["moe_tactic"] = _canonical_moe_tactic(moe_tactic)
+        spec_config = getattr(model_config, "spec_config", None)
+        draft_moe_tactic = getattr(spec_config, "moe_tactic", None)
         if draft_moe_tactic is not None:
-            payload["draft_moe_tactic"] = draft_moe_tactic
+            payload["draft_moe_tactic"] = _canonical_moe_tactic(draft_moe_tactic)
+        draft_moe_backend = getattr(spec_config, "moe_backend", None)
+        if draft_moe_backend is not None:
+            payload["draft_moe_backend"] = draft_moe_backend
         return _canonical_hash(payload)
 
     @staticmethod

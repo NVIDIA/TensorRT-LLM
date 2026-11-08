@@ -155,6 +155,7 @@ class FakeModelConfig:
         moe_load_balancer=None,
         moe_tactic: Optional[str] = None,
         draft_moe_tactic: Optional[str] = None,
+        draft_moe_backend: Optional[str] = None,
     ):
         self.mapping = mapping or FakeMapping()
         self.pretrained_config = (
@@ -168,7 +169,9 @@ class FakeModelConfig:
         self.moe_load_balancer = moe_load_balancer
         self.moe_tactic = moe_tactic
         self.spec_config = (
-            None if draft_moe_tactic is None else SimpleNamespace(moe_tactic=draft_moe_tactic)
+            None
+            if draft_moe_tactic is None and draft_moe_backend is None
+            else SimpleNamespace(moe_tactic=draft_moe_tactic, moe_backend=draft_moe_backend)
         )
         self.nvfp4_gemm_allowed_backends = ["cutlass", "cublaslt", "cuda_core"]
         self.moe_disable_finalize_fusion = False

@@ -2201,24 +2201,31 @@ class MoeConfig(StrictBaseModel):
     backend: _MoeBackend = Field(
         default='AUTO',
         description="MoE backend to use. "
-        "Choosing a backend other than AUTO is planned for deprecation; tactic is the "
-        "recommended way to pin a MoE implementation. "
+        "Choosing a backend other than AUTO is planned for deprecation where tactic can "
+        "replace it; which tactic does depends on the checkpoint's format (see tactic). "
         "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
     )
 
     tactic: Optional[str] = Field(
         default=None,
         status="prototype",
-        description="MoE implementation to run for the target model. The "
-        "recommended interface for choosing it, replacing backend values other "
-        "than AUTO. Takes an id 'provider.technique.kernel_name.quant' (e.g. "
+        description=
+        "MoE implementation to run for the target model; unrelated to "
+        "the autotuner's kernel tactics. The recommended interface for choosing it. "
+        "Takes an id 'provider.technique.kernel_name.quant' (e.g. "
         "'trtllm.cutlass.grouped_gemm.nvfp4') or any dotted subset of its segments "
-        "(e.g. 'cutlass', 'mega_moe'); case-insensitive. The highest-priority match "
-        "for the checkpoint's expert format runs, with no fallback; the matches must "
-        "belong to one backend family. Requires backend AUTO. Drafts and MTP layers "
-        "are selected by speculative_config.moe_tactic. The ids, the shortest tactic "
-        f"naming each, and the segment values are listed in {_MOE_IMPL_CATALOG}; a "
-        "run logs the id of each MoE implementation it builds.")
+        "(e.g. 'cutlass', 'mega_moe'); case-insensitive. The first match in catalog "
+        "order that can serve a layer of the checkpoint's expert format runs, with no "
+        "fallback; the matches must belong to one backend family. Requires backend "
+        "AUTO. A backend family can span several techniques, so the tactic that "
+        "replaces a backend depends on the format (CUTLASS also covers the "
+        "hopper_grouped_gemm and triton FP8 block-scale implementations); VANILLA has "
+        "none. Drafts and MTP layers are selected by speculative_config.moe_tactic; "
+        "with both draft fields unset, a target tactic makes a draft resolve AUTO for "
+        "its own weights instead of inheriting the target's backend. The ids, the "
+        "shortest tactic naming each, and the segment values are listed in "
+        f"{_MOE_IMPL_CATALOG}; a run logs the id of each MoE implementation it builds."
+    )
 
     max_num_tokens: Optional[int] = Field(
         default=None,
@@ -2255,14 +2262,10 @@ class MoeConfig(StrictBaseModel):
 
     @model_validator(mode="after")
     def validate_tactic_excludes_backend(self) -> "MoeConfig":
-        # TODO: Drop this check together with backend. Until then it is a
-        # transitional compromise: backend predates tactic and defaults to
-        # AUTO, and defaulting it to None would change what existing configs
-        # and callers read back. So AUTO stands in for "no backend chosen"
-        # here, although as a request on its own it means the heuristic.
-        # Keyed on the value rather than on ``model_fields_set``: model
-        # defaults are applied by rebuilding the config from a full
-        # ``model_dump()``, which marks every field as set.
+        # AUTO doubles as "no backend chosen" here. The check reads the value
+        # rather than ``model_fields_set``: model defaults are applied by
+        # rebuilding the config from a full ``model_dump()``, which marks every
+        # field as set. It goes with backend (see MoEImplRequest.backend_for).
         if self.tactic is not None and self.backend != "AUTO":
             raise ValueError(
                 f"moe_config.backend={self.backend!r} and moe_config.tactic="
@@ -2660,17 +2663,18 @@ class DecodingBaseConfig(StrictBaseModel):
 
     moe_backend: Optional[_MoeBackend] = Field(
         default=None,
-        description=(
-            "MoE backend for a neural draft model or embedded MTP layers "
-            "(PyTorch backend); ignored without a neural draft model. Legacy "
-            "interface: values other than AUTO are planned for deprecation, "
-            "and moe_tactic is the recommended replacement. "
-            "With this and moe_tactic unset, the draft inherits the target's "
-            "backend, or resolves AUTO for its own weights when "
-            "moe_config.tactic pins the target. AUTO is MEGAMOE_CUTEDSL when "
-            "the draft shares the target's per-layer dynamic EPLB. Nemotron-H "
-            "embedded MTP layers must run VANILLA exactly when the target "
-            "does."))
+        description=
+        ("MoE backend for a neural draft model or embedded MTP layers "
+         "(PyTorch backend); ignored without a neural draft model. Values "
+         "other than AUTO are planned for deprecation where moe_tactic can "
+         "replace them. "
+         "With this and moe_tactic unset, the draft inherits the target's "
+         "backend, or resolves AUTO for its own weights when "
+         "moe_config.tactic pins the target; set this to the target's "
+         "former backend to keep the draft on that family. AUTO is MEGAMOE_CUTEDSL when "
+         "the draft shares the target's per-layer dynamic EPLB. Nemotron-H "
+         "embedded MTP layers must run VANILLA exactly when the target "
+         "does."))
 
     moe_tactic: Optional[str] = Field(
         default=None,
@@ -2678,8 +2682,8 @@ class DecodingBaseConfig(StrictBaseModel):
         description=(
             "MoE implementation to run for a neural draft model or embedded "
             "MTP layers (PyTorch backend); ignored without a neural draft "
-            "model. The recommended interface for choosing it, replacing "
-            "moe_backend values other than AUTO. Takes the values of "
+            "model. The recommended interface for choosing it. Takes the "
+            "values of "
             "moe_config.tactic: an id 'provider.technique.kernel_name.quant' "
             "or any dotted subset of its segments. The ids, the shortest "
             "tactic naming each, and the segment values are listed in "

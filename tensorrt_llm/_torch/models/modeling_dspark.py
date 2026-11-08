@@ -1493,11 +1493,11 @@ class DSv4DSparkDraftModel(nn.Module):
 
         The draft MoE layers inherit ``model_config``'s selection unless
         ``draft_moe_selection`` is set, which replaces it, dropping any tactic
-        ``model_config.moe_tactic`` pins. ``draft_moe_selection`` is resolved after the
-        draft-specific quantization normalization below, against the draft stages'
-        entries only, so its backend follows the draft weights rather than the
-        target's. The draft
-        ``mtp.*`` stages are full V4 blocks, so they share the target's MXFP4
+        ``model_config.moe_tactic`` pins. ``draft_moe_selection`` is resolved
+        after the draft-specific quantization normalization below, against the
+        draft stages' entries only, so its backend follows the draft weights
+        rather than the target's. The draft ``mtp.*`` stages are full V4
+        blocks, so they share the target's MXFP4
         ``n_routed_experts=384`` / ``n_group=8`` (= 48 experts/group) layout
         and therefore the same backend constraints: select a backend that
         supports it (CUTLASS today, DeepGEMM megaMoE once available). The
@@ -1521,13 +1521,12 @@ class DSv4DSparkDraftModel(nn.Module):
                     draft_moe_selection.backend, "speculative_config.moe_backend"
                 )
             architectures = getattr(model_config.pretrained_config, "architectures", None) or []
-            qcd = new_qcd if new_qcd is not None else model_config.quant_config_dict
             # Only the draft stages' entries describe the draft's experts, so
             # the target layers' formats must not widen a tactic's family.
             stage_prefixes = tuple(f"model.layers.{base + s}." for s in range(num_stages))
             stage_qcd = {
                 name: quant_config
-                for name, quant_config in (qcd or {}).items()
+                for name, quant_config in draft_qcd.items()
                 if name.startswith(stage_prefixes)
             }
             resolved_moe_backend = draft_moe_selection.resolve_backend(

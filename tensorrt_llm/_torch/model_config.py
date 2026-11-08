@@ -273,7 +273,8 @@ class MoESelection:
     value and asks it, instead of passing ``moe_backend`` and ``moe_tactic``
     and weighing one against the other.
 
-    TODO: Reduce to the tactic once ``moe_backend`` is removed.
+    TODO: Reduce to the tactic once ``moe_backend`` is removed (see
+    ``MoEImplRequest.backend_for``).
 
     Attributes:
         backend: A ``moe_backend`` literal, ``AUTO`` included.
@@ -406,10 +407,13 @@ class ModelConfig(Generic[TConfig]):
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
     # The backend the user requested, before AUTO resolution.
     moe_backend_requested: str = 'AUTO'
-    # ``moe_config.tactic``: an implementation id, or a dotted subset of one,
-    # that ``resolve_moe_impl`` pins in place of selecting by ``moe_backend``
-    # on the MoE layers whose format it names. Loading sets ``moe_backend`` to
-    # the one family it implies for the checkpoint (``pinned_moe_backend``).
+    # ``moe_config.tactic`` on a target, ``speculative_config.moe_tactic`` on a
+    # draft or MTP copy: an implementation id, or a dotted subset of one, that
+    # ``resolve_moe_impl`` pins for every MoE layer built from this config. A
+    # layer in a format it names no implementation of fails to build, unless
+    # model code re-points the layer (Qwen3-Next and MuseSpark Open do for
+    # quant-excluded target experts). Loading sets ``moe_backend`` to the one
+    # family it implies for the checkpoint (``pinned_moe_backend``).
     moe_tactic: Optional[str] = None
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
     moe_disable_finalize_fusion: bool = False
@@ -510,7 +514,7 @@ class ModelConfig(Generic[TConfig]):
                     f"Cannot modify ModelConfig.'{key}' - instance is frozen")
         super().__setattr__(key, value)
 
-    def copy_with(self, **changes) -> "ModelConfig":
+    def copy_with(self, **changes: object) -> "ModelConfig":
         """A shallow copy with ``changes`` applied, frozen as this config is.
 
         ``moe_backend`` and ``moe_tactic`` are one MoE selection, so a copy
@@ -890,11 +894,13 @@ class ModelConfig(Generic[TConfig]):
         return quants
 
     @staticmethod
-    def load_modelopt_quant_config(quant_config_file,
-                                   checkpoint_dir,
-                                   moe_backend,
-                                   moe_tactic: Optional[str] = None,
-                                   architecture: str = ""):
+    def load_modelopt_quant_config(
+        quant_config_file,
+        checkpoint_dir,
+        moe_backend,
+        moe_tactic: Optional[str] = None,
+        architecture: str = ""
+    ) -> Tuple[QuantConfig, Optional[Dict[str, QuantConfig]]]:
         with open(quant_config_file) as f:
             quant_config_dict = json.load(f)
         return ModelConfig._build_modelopt_quant_config(
@@ -934,9 +940,10 @@ class ModelConfig(Generic[TConfig]):
                 "only supported by the dense W4A16_NVFP4 Linear path).")
 
     @staticmethod
-    def _build_modelopt_quant_config(json_quant_configs, checkpoint_dir,
-                                     moe_request: Optional["MoEImplRequest"], *,
-                                     architecture: str):
+    def _build_modelopt_quant_config(
+        json_quant_configs, checkpoint_dir,
+        moe_request: Optional["MoEImplRequest"], *, architecture: str
+    ) -> Tuple[QuantConfig, Optional[Dict[str, QuantConfig]]]:
         """Build (quant_config, layer_quant_config) from a normalized modelopt 'quantization' inner dict.
 
         ``json_quant_configs`` should be a dict as produced by
@@ -1088,17 +1095,31 @@ class ModelConfig(Generic[TConfig]):
                     "names no NVFP4_PLUS implementation.")
         if quant_algo is not None or is_dynamic_quant:
             return quant_algo
+        if moe_request is not None and moe_request.pinned:
+            published = moe_request.identity_quants()
+            if not published & {
+                    "w4a8_mxfp4_mxfp8", "w4a8_mxfp4_fp8", "w4a16_mxfp4"
+            }:
+                hint = (" Set OVERRIDE_QUANT_ALGO=NVFP4_PLUS to run them as "
+                        "NVFP4_PLUS." if "nvfp4_plus" in published else "")
+                raise ValueError(
+                    f"The MoE tactic {moe_request.label} names no "
+                    "implementation of a format MXFP4 experts run as "
+                    "(W4A8_MXFP4_MXFP8, W4A8_MXFP4_FP8 or W4A16_MXFP4); it "
+                    f"names {sorted(published)}.{hint}")
         from tensorrt_llm._torch.moe.fused_moe.moe_resolution import \
             mxfp4_quant_algo
 
         return mxfp4_quant_algo(moe_request, get_sm_version())
 
     @staticmethod
-    def load_hf_quant_config(hf_quant_config,
-                             moe_backend,
-                             checkpoint_dir=None,
-                             moe_tactic: Optional[str] = None,
-                             architecture: str = ""):
+    def load_hf_quant_config(
+        hf_quant_config,
+        moe_backend,
+        checkpoint_dir=None,
+        moe_tactic: Optional[str] = None,
+        architecture: str = ""
+    ) -> Tuple[QuantConfig, Optional[Dict[str, QuantConfig]]]:
         return ModelConfig._load_hf_quant_config(hf_quant_config,
                                                  MoESelection.of(
                                                      moe_backend,
@@ -1107,11 +1128,13 @@ class ModelConfig(Generic[TConfig]):
                                                  architecture=architecture)
 
     @staticmethod
-    def _load_hf_quant_config(hf_quant_config,
-                              moe_request: Optional["MoEImplRequest"],
-                              checkpoint_dir=None,
-                              *,
-                              architecture: str):
+    def _load_hf_quant_config(
+        hf_quant_config: Dict[str, Any],
+        moe_request: Optional["MoEImplRequest"],
+        checkpoint_dir: Optional[str] = None,
+        *,
+        architecture: str
+    ) -> Tuple[QuantConfig, Optional[Dict[str, QuantConfig]]]:
         quant_config = QuantConfig()
         layer_quant_config = None
 
@@ -1307,7 +1330,7 @@ class ModelConfig(Generic[TConfig]):
             moe_request: Optional["MoEImplRequest"],
             layer_quant_config,
             spec_config=None,
-            require_layout: bool = False):
+            require_layout: bool = False) -> Optional[Dict[str, QuantConfig]]:
         layout = ModelConfig._detect_deepseek_v4_routed_moe_layout(
             checkpoint_dir)
         if layout not in ("mxfp4", "nvfp4"):
@@ -1590,16 +1613,19 @@ class ModelConfig(Generic[TConfig]):
         return quant_config, layer_quant_config
 
     @staticmethod
-    def load_quant_config_from_dtypes_json(dtypes_json_file,
-                                           moe_backend: str,
-                                           moe_tactic: Optional[str] = None):
+    def load_quant_config_from_dtypes_json(
+        dtypes_json_file,
+        moe_backend: str,
+        moe_tactic: Optional[str] = None
+    ) -> Tuple[QuantConfig, Optional[Dict[str, QuantConfig]]]:
         return ModelConfig._load_quant_config_from_dtypes_json(
             dtypes_json_file,
             MoESelection.of(moe_backend, moe_tactic).request())
 
     @staticmethod
     def _load_quant_config_from_dtypes_json(
-            dtypes_json_file, moe_request: Optional["MoEImplRequest"]):
+        dtypes_json_file: str, moe_request: Optional["MoEImplRequest"]
+    ) -> Tuple[QuantConfig, Optional[Dict[str, QuantConfig]]]:
         quant_config = QuantConfig()
         layer_quant_config = None
 
@@ -2104,9 +2130,11 @@ class ModelConfig(Generic[TConfig]):
         if moe_tactic is None:
             moe_backend = moe_selection.resolve_backend(architecture,
                                                         quant_config)
+            moe_request = MoESelection(backend=moe_backend).request()
         else:
-            # Settled below, once the routed experts' format is known too.
-            moe_backend = moe_backend_hint
+            # A tactic is the whole request; its literal is settled below,
+            # once the routed experts' format is known too.
+            moe_request = moe_selection.request()
 
         # V4.1 names the routed experts exactly as V4 does and encodes MXFP4 the
         # same way (I8 storage), so the detector and setter apply verbatim.
@@ -2115,7 +2143,7 @@ class ModelConfig(Generic[TConfig]):
             layer_quant_config = cls._set_deepseek_v4_routed_moe_quant_config(
                 pretrained_config,
                 checkpoint_dir,
-                MoESelection.of(moe_backend, moe_tactic).request(),
+                moe_request,
                 layer_quant_config,
                 kwargs.get('spec_config', None),
                 require_layout=require_deepseek_v4_routed_moe_layout)
@@ -2125,11 +2153,8 @@ class ModelConfig(Generic[TConfig]):
                 pretrained_config, quant_config, layer_quant_config)
 
         if moe_tactic is not None:
-            # TODO: Drop this derivation once moe_backend is removed. The tactic
-            # alone selects the MoE implementation; model code outside MoE
-            # selection still branches on the literal, so it has to name the
-            # tactic's family until those branches read the resolved
-            # implementation's descriptor. The Mistral config loader
+            # The literal model code is built for, derived from the tactic
+            # (see MoEImplRequest.backend_for). The Mistral config loader
             # (checkpoints/mistral/config_loader.py) repeats this derivation.
             moe_backend = moe_selection.resolve_backend(architecture,
                                                         quant_config,

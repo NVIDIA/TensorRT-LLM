@@ -34,6 +34,7 @@ from tensorrt_llm._torch.models.modeling_speculative import (
     _build_mtp_one_model_draft,
     _copy_model_config_with_moe_selection,
     _draft_moe_selection,
+    _get_mtp_moe_quant_config,
     _replacement_mtp_model_config,
     _set_draft_kv_cache_quant_algo,
     external_drafter_config_kwargs,
@@ -792,6 +793,7 @@ def test_internal_mtp_auto_resolves_from_layer_quantization() -> None:
     assert target_config.moe_backend == "CUTEDSL"
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "target_backend,draft_backend", [("CUTLASS", "VANILLA"), ("VANILLA", "CUTLASS")]
 )
@@ -935,6 +937,78 @@ def _build_mtp_draft_config(
     ) as mtp_cls:
         _build_mtp_one_model_draft(target_config, draft_config, sentinel.lm_head, target_model)
     return mtp_cls.call_args.args[0]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "global_algo, exclude_modules, entries, unquantized",
+    [
+        pytest.param(QuantAlgo.NVFP4, ["model.layers.2*"], {}, True, id="excluded_layer"),
+        pytest.param(
+            QuantAlgo.NVFP4, ["model.layers.2.mlp.experts"], {}, True, id="excluded_experts"
+        ),
+        # Exclusion wins over a per-layer entry, as in moe_experts_quant_config.
+        pytest.param(
+            QuantAlgo.NVFP4,
+            ["model.layers.2*"],
+            {"model.layers.2.mlp.experts": QuantAlgo.NVFP4},
+            True,
+            id="excluded_despite_an_entry",
+        ),
+        # MIXED_PRECISION lists every quantized module.
+        pytest.param(QuantAlgo.MIXED_PRECISION, None, {}, True, id="mixed_precision_unlisted"),
+        pytest.param(
+            QuantAlgo.MIXED_PRECISION,
+            None,
+            {"model.layers.2.mlp.experts": QuantAlgo.FP8_BLOCK_SCALES},
+            False,
+            id="mixed_precision_listed",
+        ),
+        pytest.param(QuantAlgo.NVFP4, None, {}, False, id="global_format"),
+    ],
+)
+def test_the_mtp_experts_format_follows_what_the_checkpoint_quantizes(
+    global_algo, exclude_modules, entries, unquantized
+) -> None:
+    config = _draft_backend_test_model_config()
+    config.quant_config = QuantConfig(
+        quant_algo=global_algo, kv_cache_quant_algo=QuantAlgo.FP8, exclude_modules=exclude_modules
+    )
+    config.quant_config_dict = {
+        name: QuantConfig(quant_algo=algo) for name, algo in entries.items()
+    } or None
+
+    quant_config = _get_mtp_moe_quant_config(config, 2)
+
+    if unquantized:
+        assert quant_config.quant_algo is None
+        assert quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    elif entries:
+        assert quant_config is config.quant_config_dict["model.layers.2.mlp.experts"]
+    else:
+        assert quant_config is config.quant_config
+
+
+@pytest.mark.cpu_only
+def test_a_draft_tactic_resolves_against_the_excluded_mtp_layers_format() -> None:
+    """DeepSeek-R1 NVFP4 excludes its MTP layer through exclude_modules, so it runs BF16.
+
+    ``fused_moe`` names TRTLLM-Gen and Marlin implementations of NVFP4 but only the TRTLLM-Gen
+    one of BF16, so the family read from the MTP layer's real format is TRTLLM.
+    """
+    target_config = _draft_backend_test_model_config("TRTLLM")
+    target_config.pretrained_config.num_nextn_predict_layers = 1
+    target_config.quant_config = QuantConfig(
+        quant_algo=QuantAlgo.NVFP4,
+        kv_cache_quant_algo=QuantAlgo.FP8,
+        exclude_modules=["model.layers.2*"],
+    )
+    target_config.spec_config = SimpleNamespace(moe_backend=None, moe_tactic="fused_moe")
+
+    mtp_model_config = _build_mtp_draft_config(target_config)
+
+    assert mtp_model_config.moe_backend == "TRTLLM"
+    assert mtp_model_config.moe_tactic == "fused_moe"
 
 
 @pytest.mark.cpu_only

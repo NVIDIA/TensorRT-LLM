@@ -116,10 +116,6 @@ _LAYER_0_EXCLUDED = QuantConfig(quant_algo=QuantAlgo.NVFP4, exclude_modules=["mo
 def test_a_quant_excluded_layer_runs_bf16_without_the_tactic(monkeypatch, moe_backend, moe_tactic):
     """A tactic pins implementations of the checkpoint's format, which the layer is not in."""
     captured = _capture_create_moe(monkeypatch)
-    warnings = []
-    monkeypatch.setattr(
-        modeling_musespark_open.logger, "warning", lambda message: warnings.append(message)
-    )
     config = _moe_model_config(
         quant_config=_LAYER_0_EXCLUDED, moe_backend=moe_backend, moe_tactic=moe_tactic
     )
@@ -132,9 +128,40 @@ def test_a_quant_excluded_layer_runs_bf16_without_the_tactic(monkeypatch, moe_ba
     assert layer_config.moe_tactic is None
     assert captured["override_quant_config"].quant_algo is None
     assert (config.moe_backend, config.moe_tactic) == (moe_backend, moe_tactic)
-    assert [repr(moe_tactic) in message for message in warnings] == (
-        [] if moe_tactic is None else [True]
+
+
+@pytest.mark.parametrize(
+    "moe_tactic, expected",
+    [
+        pytest.param("mega_moe", ["[0, 2]", "'mega_moe'", "moe_backend=TRTLLM"], id="tactic"),
+        pytest.param(None, None, id="no_tactic"),
+    ],
+)
+def test_one_warning_lists_the_quant_excluded_layers_a_tactic_skips(
+    monkeypatch, moe_tactic, expected
+):
+    warnings = []
+    monkeypatch.setattr(
+        modeling_musespark_open.logger,
+        "warning_once",
+        lambda message, key: warnings.append(message),
     )
+    config = _moe_model_config(
+        pretrained_config=SimpleNamespace(num_hidden_layers=4),
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.NVFP4, exclude_modules=["model.layers.0.*", "model.layers.2.*"]
+        ),
+        moe_backend="MEGAMOE_CUTEDSL",
+        moe_tactic=moe_tactic,
+    )
+
+    modeling_musespark_open._warn_tactic_skips_quant_excluded_layers(config)
+
+    if expected is None:
+        assert warnings == []
+    else:
+        assert len(warnings) == 1
+        assert all(part in warnings[0] for part in expected), warnings[0]
 
 
 def test_a_quantized_layer_keeps_the_tactic(monkeypatch):

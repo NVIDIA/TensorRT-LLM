@@ -1849,35 +1849,6 @@ def test_mtp_moe_backend_allowed_for_full_external_assistant(
     assert spec_config.moe_backend == "CUTLASS"
 
 
-@pytest.mark.parametrize(
-    "moe_selection",
-    [{"moe_backend": "CUTLASS"}, {"moe_tactic": "cutlass"}],
-    ids=["moe_backend", "moe_tactic"],
-)
-def test_mtp_moe_selection_allowed_for_shared_kv_replacement_heads(moe_selection) -> None:
-    """Replacement heads load through their own weight mapper, so they select for themselves."""
-
-    class ReplacementHeadTarget:
-        pass
-
-    spec_config = MTPDecodingConfig(
-        max_draft_len=1,
-        speculative_model="/tmp/assistant",
-        **moe_selection,
-    )
-    model_config = SimpleNamespace(
-        architectures=["Gemma4ForCausalLM"],
-        num_nextn_predict_layers=1,
-    )
-
-    update_spec_config_from_model_config(spec_config, model_config, ReplacementHeadTarget)
-
-    assert spec_config.uses_replacement_heads
-    assert spec_config._use_shared_kv_cache
-    for field, value in moe_selection.items():
-        assert getattr(spec_config, field) == value
-
-
 def test_mtp_shared_kv_draft_inputs():
     spec_config = MTPDecodingConfig(
         max_draft_len=3,

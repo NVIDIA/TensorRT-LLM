@@ -114,16 +114,9 @@ def test_replacement_heads_of_a_pinned_target_resolve_auto():
     )
 
 
-@pytest.mark.parametrize(
-    "moe_tactic, spec_moe_backend",
-    [("trtllm.cutedsl.mega_moe.nvfp4", None), (None, "AUTO")],
-    ids=["pinned_target", "explicit_auto"],
-)
-def test_the_mtp_layers_resolve_auto_under_per_layer_dynamic_eplb(moe_tactic, spec_moe_backend):
+def test_the_mtp_layers_resolve_auto_under_per_layer_dynamic_eplb():
     """The MTP layers register into the target's balancer, which only MegaMoE CuteDSL serves."""
-    target_config = _target_config(
-        moe_backend="MEGAMOE_CUTEDSL", moe_tactic=moe_tactic, spec_moe_backend=spec_moe_backend
-    )
+    target_config = _target_config(moe_backend="MEGAMOE_CUTEDSL", spec_moe_backend="AUTO")
     target_config.moe_load_balancer = MoePerLayerDynamicLoadBalancerConfig(num_slots=72)
 
     draft_config = _draft_config_of(target_config)

@@ -1544,7 +1544,7 @@ def _draft_moe_selection(
     model_config: ModelConfig,
     spec_config: object,
     *,
-    load_balancer: Optional[MoeLoadBalancerConfigType] = None,
+    load_balancer: Optional[MoeLoadBalancerConfigType],
 ) -> Optional[MoESelection]:
     """The MoE selection a draft model or MTP layers make for themselves, or
     None when they inherit the target's.
@@ -1565,7 +1565,8 @@ def _draft_moe_selection(
         load_balancer: The EPLB config the draft's MoE layers register into
             when they share the target's balancer, else None. An AUTO
             selection resolves under it as the target's does
-            (``auto_moe_backend_for_load_balancer``).
+            (``auto_moe_backend_for_load_balancer``). Every caller passes it,
+            so that each draft path states whether it shares the balancer.
     """
     moe_tactic = getattr(spec_config, "moe_tactic", None)
     if moe_tactic is not None:
@@ -1586,9 +1587,10 @@ def _draft_loader_moe_kwargs(
 ) -> Dict[str, Optional[str]]:
     """The MoE kwargs that load a separate draft checkpoint for ``draft_moe_selection``.
 
-    Inheriting the target's selection means its resolved literal: a separate
-    checkpoint never inherits a tactic, which names the target's
-    implementations, and then ``draft_moe_selection`` is not None.
+    With ``draft_moe_selection`` None the draft inherits the target's resolved
+    literal. A separate checkpoint never inherits a tactic, which names the
+    target's implementations: when ``moe_config.tactic`` is set,
+    ``_draft_moe_selection`` returns an AUTO selection instead of None.
     """
     selection = draft_moe_selection or MoESelection(
         backend=model_config.moe_backend)
@@ -1670,8 +1672,19 @@ def _get_mtp_moe_quant_config(model_config: ModelConfig,
     """Return the routed-expert quant config for an embedded MTP layer.
 
     The first constructed MTP layer represents all MTP layers when resolving
-    AUTO because they share one backend setting.
+    AUTO because they share one backend setting. Experts the checkpoint
+    excludes from quantization, or a MIXED_PRECISION checkpoint lists no entry
+    for, are unquantized, as the MTP layers build them.
     """
+    global_quant_config = model_config.quant_config
+    unquantized = QuantConfig(
+        kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo)
+    # Exclusion wins over a per-layer entry, as in moe_experts_quant_config.
+    for module in (f"model.layers.{layer_idx}",
+                   f"model.layers.{layer_idx}.mlp.experts"):
+        if global_quant_config.is_module_excluded_from_quantization(module):
+            return unquantized
+
     layer_quant_configs = model_config.quant_config_dict or {}
     prefixes = [f"model.layers.{layer_idx}."]
     num_hidden_layers = getattr(model_config.pretrained_config,
@@ -1687,7 +1700,10 @@ def _get_mtp_moe_quant_config(model_config: ModelConfig,
         for name, quant_config in layer_quant_configs.items():
             if name.startswith(prefix) and ".experts" in name:
                 return quant_config
-    return model_config.quant_config
+    if global_quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
+        # MIXED_PRECISION lists every quantized module.
+        return unquantized
+    return global_quant_config
 
 
 def _is_mtp_experts_entry(name: str, start_layer_idx: int) -> bool:
@@ -2027,7 +2043,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         attn_backend=model_config.attn_backend,
                         **_draft_loader_moe_kwargs(
                             model_config,
-                            _draft_moe_selection(model_config, spec_config)),
+                            _draft_moe_selection(model_config,
+                                                 spec_config,
+                                                 load_balancer=None)),
                         mapping=model_config.mapping.mapping_for_full_rows(),
                         spec_config=None,
                         max_num_tokens=model_config.max_num_tokens,

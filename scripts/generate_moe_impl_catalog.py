@@ -60,7 +60,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     stale = False
     for path, generated in _generated().items():
-        committed = path.read_text(encoding="utf-8") if path.is_file() else ""
+        committed = path.read_text(encoding="utf-8")
         if generated == committed:
             continue
         if args.check:
