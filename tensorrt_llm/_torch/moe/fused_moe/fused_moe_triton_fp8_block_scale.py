@@ -10,6 +10,17 @@ import triton.language as tl
 
 _BLOCK_SHAPE = [128, 128]  # [group_k, group_n] for FP8 block-scale
 _BLOCK_SIZE_M = 16
+# Used when experts average at least _LARGE_M_MIN_ROWS rows (prefill), so each
+# weight tile is loaded once per 64 rows instead of once per 16.
+_BLOCK_SIZE_M_LARGE = 64
+_LARGE_M_MIN_ROWS = 32
+
+
+def _block_size_m(num_tokens: int, top_k: int, num_experts: int) -> int:
+    """BLOCK_SIZE_M for both GEMMs and the alignment of one MoE call."""
+    if num_tokens * top_k >= _LARGE_M_MIN_ROWS * num_experts:
+        return _BLOCK_SIZE_M_LARGE
+    return _BLOCK_SIZE_M
 
 
 @triton.jit
@@ -182,12 +193,12 @@ def _build_moe_gemm_autotune_configs():
     """Config grid for `_fused_moe_bf16act_fp8w_kernel`.
 
     Constraints:
-        - BLOCK_SIZE_M is FIXED at 16. The MoE alignment kernels
-          (`_moe_expert_ids_kernel` etc.) lay out `expert_ids_out` with one
-          expert per 16-token chunk (the `_BLOCK_SIZE_M` constant). The GEMM
-          loads `expert_ids[pid_m]` assuming the same chunk size, so
-          mismatched values produce wrong outputs (autotune cannot detect
-          this; it benchmarks runtime, not numerics).
+        - BLOCK_SIZE_M is not tuned: the caller passes the block size used by
+          `moe_align_block_size`, which lays out `expert_ids_out` with one
+          expert per BLOCK_SIZE_M-token chunk. The GEMM loads
+          `expert_ids[pid_m]` assuming the same chunk size, so mismatched
+          values produce wrong outputs (autotune cannot detect this; it
+          benchmarks runtime, not numerics). It is part of the autotune key.
         - BLOCK_SIZE_K <= group_k (=128): the kernel loads ONE scale per
           K-tile, so larger K-tiles would alias multiple block scales.
     """
@@ -200,7 +211,6 @@ def _build_moe_gemm_autotune_configs():
                         configs.append(
                             triton.Config(
                                 {
-                                    "BLOCK_SIZE_M": 16,
                                     "BLOCK_SIZE_N": BN,
                                     "BLOCK_SIZE_K": BK,
                                     "GROUP_SIZE_M": GROUP_M,
@@ -214,7 +224,7 @@ def _build_moe_gemm_autotune_configs():
 
 @triton.autotune(
     configs=_build_moe_gemm_autotune_configs(),
-    key=["N", "K"],
+    key=["N", "K", "BLOCK_SIZE_M"],
     # FUSE_TOPK_REDUCE uses atomic_add into c_ptr, so autotune trials must start
     # from zero instead of accumulating on the previous trial's output.
     reset_to_zero=["c_ptr"],
@@ -361,6 +371,7 @@ def _invoke_bf16act_fp8w_moe_kernel(
     top_k: int,
     fuse_topk_reduce: bool = False,
     reduce_topk: int = 1,
+    block_size_m: int = _BLOCK_SIZE_M,
 ) -> None:
     """
     Launch _fused_moe_bf16act_fp8w_kernel.
@@ -422,6 +433,7 @@ def _invoke_bf16act_fp8w_moe_kernel(
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         FUSE_TOPK_REDUCE=fuse_topk_reduce,
         REDUCE_TOPK=reduce_topk,
+        BLOCK_SIZE_M=block_size_m,
     )
 
 
@@ -559,8 +571,9 @@ def run_triton_fp8_block_scale_moe(
     silu = int(ActivationType.Silu)
     gelu = int(ActivationType.Gelu)
 
+    block_size_m = _block_size_m(num_tokens, top_k, num_experts)
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        token_selected_experts, _BLOCK_SIZE_M, num_experts
+        token_selected_experts, block_size_m, num_experts
     )
 
     ic1 = torch.empty((num_tokens, top_k, gate_up_size), dtype=torch.bfloat16, device=device)
@@ -575,6 +588,7 @@ def run_triton_fp8_block_scale_moe(
         num_tokens_post_padded,
         mul_routed_weight=False,
         top_k=top_k,
+        block_size_m=block_size_m,
     )
 
     if act_int in (swiglu, silu):
@@ -620,6 +634,7 @@ def run_triton_fp8_block_scale_moe(
         top_k=1,
         fuse_topk_reduce=fuse_topk_reduce,
         reduce_topk=top_k,
+        block_size_m=block_size_m,
     )
 
     if not fuse_topk_reduce:

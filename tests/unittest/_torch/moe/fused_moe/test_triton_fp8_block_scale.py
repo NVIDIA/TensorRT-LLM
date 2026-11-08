@@ -118,6 +118,8 @@ LAGUNA_TOP_K = 8
 SHAPES = [
     MoeShape("tiny", num_tokens=64, hidden=256, intermediate=512, num_experts=8, top_k=2),
     MoeShape("tiny_topk1", num_tokens=64, hidden=256, intermediate=512, num_experts=8, top_k=1),
+    # Enough rows per expert for the prefill block size
+    MoeShape("tiny_prefill", num_tokens=256, hidden=256, intermediate=512, num_experts=8, top_k=2),
     MoeShape(
         "laguna_corr",
         num_tokens=64,
