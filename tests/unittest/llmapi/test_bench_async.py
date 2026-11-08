@@ -21,6 +21,7 @@ import pytest
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.bench.benchmark.utils.asynchronous import LlmManager
+from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.dataclasses.general import InferenceRequest
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 
@@ -477,3 +478,33 @@ async def test_async_benchmark_duration():
     # and finish before the deadline, which is why the CLI rejects that
     # combination.
     assert 1 <= len(stats.requests) < 3
+
+
+def test_generate_warmup_dataset_salts_copies():
+    requests = [InferenceRequest(task_id=i, input_ids=[i], output_tokens=1) for i in range(3)]
+
+    warmup = generate_warmup_dataset(requests, 4)
+
+    assert len(warmup) == 4
+    assert all(request.cache_salt == "warmup" for request in warmup)
+    assert all(request.cache_salt is None for request in requests)
+
+
+@pytest.mark.asyncio
+async def test_llm_manager_forwards_cache_salt():
+    mock_llm = MagicMock(spec=LLM)
+    mock_output = MagicMock()
+    mock_output.prompt_token_ids = [1, 2, 3]
+    mock_output.outputs = [MagicMock(token_ids=[4])]
+
+    async def mock_aresult():
+        return mock_output
+
+    mock_output.aresult = mock_aresult
+    mock_llm.generate_async.return_value = mock_output
+
+    manager = LlmManager(llm=mock_llm, outbox=asyncio.Queue(), streaming=False)
+    request = InferenceRequest(task_id=0, input_ids=[1, 2, 3], output_tokens=1, cache_salt="warmup")
+    await manager.process_request(request, SamplingParams(), PostprocParams())
+
+    assert mock_llm.generate_async.call_args.kwargs["cache_salt"] == "warmup"
