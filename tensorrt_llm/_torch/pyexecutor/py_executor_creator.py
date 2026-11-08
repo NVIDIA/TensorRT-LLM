@@ -433,6 +433,29 @@ def _branch_snapshot_ctx_chunk_config(
     return (ContextChunkingPolicy.FORCE_CHUNK, chunk_unit_size)
 
 
+def _hybrid_reuse_ctx_chunk_config(
+        ctx_chunk_config: Optional[tuple],
+        tokens_per_block: int,
+        configured_policy: Optional[ContextChunkingPolicy] = None) -> tuple:
+    """Force chunk boundaries at recurrent-state snapshot points."""
+    if ctx_chunk_config is None:
+        logger.warning_once(
+            "enable_block_reuse on a hybrid linear-attention model turns on "
+            "chunked prefill with the FORCE_CHUNK policy, although "
+            "enable_chunked_prefill is False.",
+            key="hybrid_reuse_enables_chunking")
+    elif (configured_policy is not None
+          and configured_policy != ContextChunkingPolicy.FORCE_CHUNK):
+        logger.warning_once(
+            "enable_block_reuse on a hybrid linear-attention model replaces "
+            f"scheduler_config.context_chunking_policy={configured_policy} "
+            "with FORCE_CHUNK.",
+            key="hybrid_reuse_replaces_chunking_policy")
+    # Snapshot boundaries come from expect_snapshot_points.  The unit is
+    # only used to align chunks shortened by the scheduling budget.
+    return (ContextChunkingPolicy.FORCE_CHUNK, tokens_per_block)
+
+
 def _check_no_kv_execution(llm_args: TorchLlmArgs, mapping: Mapping,
                            is_generation: bool) -> None:
     """Reject the settings a non-generation model cannot run with; warn on those it ignores."""
@@ -1098,9 +1121,9 @@ def _create_py_executor(
         ctx_chunk_config = None
 
     if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
-        # Snapshot boundaries come from expect_snapshot_points.  The unit is
-        # only used to align chunks shortened by the scheduling budget.
-        ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK, tokens_per_block)
+        ctx_chunk_config = _hybrid_reuse_ctx_chunk_config(
+            ctx_chunk_config, tokens_per_block,
+            scheduler_config.context_chunking_policy)
     if is_mla(config):
         _validate_fp4_mla_chunk_unit(model_engine.model.model_config,
                                      ctx_chunk_config)
