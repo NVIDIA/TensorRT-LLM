@@ -171,7 +171,11 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
 
 def generate_warmup_dataset(requests, steps) -> List[InferenceRequest]:
     """Warm up the benchmarker."""
-    warm_up_dataset = choices(requests, k=steps)
+    # Salted so that the measured requests cannot reuse the warmup's KV cache.
+    warm_up_dataset = [
+        request.model_copy(update={"cache_salt": "warmup"})
+        for request in choices(requests, k=steps)
+    ]
     shuffle(warm_up_dataset)
     return warm_up_dataset
 
