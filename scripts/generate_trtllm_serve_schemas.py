@@ -121,6 +121,9 @@ def generate_serve_schema() -> dict:
     """Describe the YAML fragment merged with ordinary serving CLI arguments."""
     from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, InternalRequestAuthKey
     from tensorrt_llm.llmapi.llm_args import (
+        _HALO_Q_MAX_AUXILIARY_SMS,
+        _HALO_R_DEFAULT_AUXILIARY_SMS,
+        _HALO_R_MIN_AUXILIARY_SMS,
         SERVE_CONFIG_ALIASES,
         MoeLoadBalancerConfig,
         MoePerLayerDynamicLoadBalancerConfig,
@@ -153,12 +156,20 @@ def generate_serve_schema() -> dict:
         {**per_layer_dynamic, "required": ["mode"]},
         {"type": ["string", "null"]},
     ]
-    # Mirror MoePerLayerDynamicLoadBalancerConfig.validate_planner_auxiliary_sms().
+    # Mirror MoePerLayerDynamicLoadBalancerConfig.validate_planner_auxiliary_sms(),
+    # including the default that an unset auxiliary_sms resolves to with halo_r.
     schema["$defs"][MoePerLayerDynamicLoadBalancerConfig.__name__].update(
         {
             "if": {"properties": {"planner": {"const": "halo_r"}}, "required": ["planner"]},
-            "then": {"properties": {"auxiliary_sms": {"minimum": 2}}},
-            "else": {"properties": {"auxiliary_sms": {"maximum": 8}}},
+            "then": {
+                "properties": {
+                    "auxiliary_sms": {
+                        "default": _HALO_R_DEFAULT_AUXILIARY_SMS,
+                        "minimum": _HALO_R_MIN_AUXILIARY_SMS,
+                    }
+                }
+            },
+            "else": {"properties": {"auxiliary_sms": {"maximum": _HALO_Q_MAX_AUXILIARY_SMS}}},
         }
     )
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.

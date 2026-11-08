@@ -40,7 +40,7 @@ count exchange, which every rank enters after its own consumers.
 from __future__ import annotations
 
 import threading
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 
@@ -226,7 +226,7 @@ class HaloRRelayEndpoint:
         # The expert each rank's helper slot holds, identical on every rank:
         # every rank starts at -1 (unknown) and applies the same plans. Only a
         # layer's own helper slots can hold it, so shared banks keep no table.
-        self.residency: Optional[torch.Tensor] = None
+        self.residency: torch.Tensor | None = None
         if helper_residency:
             self.residency = torch.full((ep, helpers), -1, dtype=torch.int32, device=self.device)
             torch.cuda.synchronize(self.device)
@@ -276,7 +276,7 @@ class HaloRRelayEndpoint:
 
         self._lock = threading.Lock()
         self._generation = 1
-        self._reuse_authority: Optional[object] = None
+        self._reuse_authority: object | None = None
         self._active_generation = 0
         self._local_release_generation = 0
         self._collective_safe_generation = 0
@@ -452,7 +452,7 @@ class HaloRRelayEndpoint:
                 self._handoff_aborted = True
                 raise
 
-    def relay_counts(self) -> Tuple[int, int, int]:
+    def relay_counts(self) -> tuple[int, int, int]:
         """Return ``(launches, receiver_copies, receiver_skips)`` once COPY is idle.
 
         The counts cover every launch of the layer, eager and replayed, and
@@ -586,18 +586,18 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
             raise ValueError("copy stream device does not match scheduler device")
         self.arena = arena
         self.plan_calls = 0
-        self._plan_part: Optional[Tuple[Any, int]] = None
+        self._plan_part: tuple[Any, int] | None = None
         self._generation = 0
-        self._pending_release: Optional[Tuple[int, Any]] = None
+        self._pending_release: tuple[int, Any] | None = None
         self._finished_generation = 0
         self._scheduled_generation = 0
         self._route_wait_generation = 0
-        self._routes_in_flight: Optional[torch.Tensor] = None
+        self._routes_in_flight: torch.Tensor | None = None
         self._lent_rows = -1
-        self._lent_routes: Optional[torch.Tensor] = None
-        self._execution_stream_handle: Optional[int] = None
+        self._lent_routes: torch.Tensor | None = None
+        self._execution_stream_handle: int | None = None
         # Every stream validated as MAIN, kept alive with its handle.
-        self._main_streams: Dict[int, torch.cuda.Stream] = {}
+        self._main_streams: dict[int, torch.cuda.Stream] = {}
         self._residency_resets = 0
         self._closed = False
         self.scheduler = None
@@ -809,7 +809,7 @@ def build_halo_r_slot_scheduler_group(
     helper_slots: int,
     topk: int,
     max_tokens_per_rank: int,
-    layer_idx: Optional[int],
+    layer_idx: int | None,
 ) -> HaloRSlotSchedulerGroup:
     """Build one layer's HALO-R group from its manager's resources.
 

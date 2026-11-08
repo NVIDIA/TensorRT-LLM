@@ -401,7 +401,7 @@ def _self_attributes(cls, method):
     return names
 
 
-def test_construction_follows_halo_q_collective_order_and_sets_its_attributes(monkeypatch):
+def test_construction_follows_halo_q_collective_order_and_sets_its_attributes(monkeypatch) -> None:
     env = _build(monkeypatch)
     order = [entry[0] for entry in env.trace]
     expected = [
@@ -471,7 +471,9 @@ def test_a_local_setup_failure_reaches_every_peer_before_it_raises(monkeypatch) 
 
 
 @pytest.mark.parametrize("auxiliary_sms", [2, 4, 8, 16])
-def test_constant_ready_and_route_target_with_the_route_wait_deferred(monkeypatch, auxiliary_sms):
+def test_constant_ready_and_route_target_with_the_route_wait_deferred(
+    monkeypatch, auxiliary_sms
+) -> None:
     env = _build(monkeypatch, auxiliary_sms=auxiliary_sms)
     group, trace = env.group, env.trace
     lent = {}
@@ -502,7 +504,7 @@ def test_constant_ready_and_route_target_with_the_route_wait_deferred(monkeypatc
         assert env.endpoint._collective_safe_generation == generation - 1
 
 
-def test_main_may_change_between_layer_calls_behind_a_fence(monkeypatch):
+def test_main_may_change_between_layer_calls_behind_a_fence(monkeypatch) -> None:
     env = _build(monkeypatch)
     group, trace, state = env.group, env.trace, env.state
     state.stream = _COPY
@@ -562,7 +564,7 @@ def test_main_may_change_between_layer_calls_behind_a_fence(monkeypatch):
 )
 def test_each_launch_takes_the_spin_bound_of_its_moment(
     monkeypatch, environ, warmup_cycles, serving_cycles
-):
+) -> None:
     guard = moe_comm_timeout_guard.MoECommTimeoutGuard(environ=environ, is_capturing=lambda: False)
     tuning = [False]
     env = _build(
@@ -627,7 +629,7 @@ def test_a_breakable_buckets_first_eager_launch_waits_the_warmup_bound(monkeypat
     )
 
 
-def test_finish_joins_copy_every_call_and_waits_for_a_caller_event(monkeypatch):
+def test_finish_joins_copy_every_call_and_waits_for_a_caller_event(monkeypatch) -> None:
     env = _build(monkeypatch)
     _layer_call(env.group, 8)
     assert not any(entry[0] == "wait_event" for entry in env.trace)
@@ -651,7 +653,7 @@ def test_finish_joins_copy_every_call_and_waits_for_a_caller_event(monkeypatch):
         _layer_call(env.group, 8, event=SimpleNamespace(cuda_event=0))
 
 
-def test_failed_submit_holds_its_routes_and_aborts_the_endpoint(monkeypatch):
+def test_failed_submit_holds_its_routes_and_aborts_the_endpoint(monkeypatch) -> None:
     env = _build(monkeypatch)
     _layer_call(env.group, 8)
     env.state.fail_submit = True
@@ -679,7 +681,7 @@ def test_failed_submit_holds_its_routes_and_aborts_the_endpoint(monkeypatch):
     assert ("destroy",) in env.trace and ("symmetric_close",) in env.trace
 
 
-def test_endpoint_refuses_a_launch_while_the_previous_generation_is_leased(monkeypatch):
+def test_endpoint_refuses_a_launch_while_the_previous_generation_is_leased(monkeypatch) -> None:
     env = _build(monkeypatch)
     endpoint = env.endpoint
     assert endpoint.submit_fused(endpoint._outputs, _Routes(4), 0, spin_cycles=1) == 1
@@ -698,7 +700,7 @@ def test_endpoint_refuses_a_launch_while_the_previous_generation_is_leased(monke
     ] * 2
 
 
-def test_endpoint_accepts_only_its_own_lease_once(monkeypatch):
+def test_endpoint_accepts_only_its_own_lease_once(monkeypatch) -> None:
     env = _build(monkeypatch)
     endpoint = env.endpoint
     with pytest.raises(RuntimeError, match="single-assignment"):
@@ -720,13 +722,13 @@ def test_endpoint_accepts_only_its_own_lease_once(monkeypatch):
             endpoint._validate_reuse_authority(authority)
 
 
-def test_relay_counts_come_from_the_native_context(monkeypatch):
+def test_relay_counts_come_from_the_native_context(monkeypatch) -> None:
     env = _build(monkeypatch)
     env.state.counters = [3, 12, 0]
     assert env.endpoint.relay_counts() == (3, 12, 0)
 
 
-def test_group_overrides_construction_and_the_four_graph_hooks():
+def test_group_overrides_construction_and_the_four_graph_hooks() -> None:
     methods = {
         name for name, value in vars(HaloRSlotSchedulerGroup).items() if inspect.isfunction(value)
     }
@@ -747,7 +749,7 @@ def test_group_overrides_construction_and_the_four_graph_hooks():
     )
 
 
-def test_endpoint_has_the_copy_surface_the_group_and_lease_call():
+def test_endpoint_has_the_copy_surface_the_group_and_lease_call() -> None:
     for name in (
         "submit_fused",
         "release_generation_after",
@@ -783,7 +785,7 @@ def _op_parameters(name: str) -> list:
     return [parameter.split()[-1] for parameter in parameters.split(",")]
 
 
-def test_native_submit_orders_copy_after_main_and_poisons_on_any_cuda_error():
+def test_native_submit_orders_copy_after_main_and_poisons_on_any_cuda_error() -> None:
     assert _op_parameters("moe_rebalance_halo_r_submit_fused") == [
         "handle",
         "routes",
@@ -816,7 +818,7 @@ def test_native_submit_orders_copy_after_main_and_poisons_on_any_cuda_error():
     assert "mLaunch = kernels::prepareMoeRebalanceHaloRLaunch(ep, experts, ctas);" in create
 
 
-def test_kernel_traps_before_it_releases_routes_and_before_ready():
+def test_kernel_traps_before_it_releases_routes_and_before_ready() -> None:
     kernel_source = (_KERNELS / "moeRebalanceHaloR.cu").read_text()
     kernel = _function_body(kernel_source, "void haloRFusedKernel(")
     _assert_in_order(
@@ -862,7 +864,7 @@ def test_kernel_traps_before_it_releases_routes_and_before_ready():
     assert "cudaDeviceSetLimit(cudaLimitStackSize, attributes.localSizeBytes)" in prepare
 
 
-def test_every_scheduler_role_failure_traps_the_launch():
+def test_every_scheduler_role_failure_traps_the_launch() -> None:
     """Each wait of the scheduler role that times out, and the planner, fails the launch the same way.
 
     A failure that returned instead of trapping would leave MAIN waiting for
@@ -905,7 +907,7 @@ def test_every_scheduler_role_failure_traps_the_launch():
     assert 'asm volatile("trap;" ::: "memory");' in trap
 
 
-def test_no_timing_probe_or_programmatic_launch_remains():
+def test_no_timing_probe_or_programmatic_launch_remains() -> None:
     sources = [
         _KERNELS / "moeRebalanceHaloR.cu",
         _KERNELS / "moeRebalanceHaloR.h",
@@ -925,7 +927,7 @@ def test_no_timing_probe_or_programmatic_launch_remains():
             assert marker not in text, (path.name, marker)
 
 
-def test_kernel_runs_in_the_remote_memory_sync_domain():
+def test_kernel_runs_in_the_remote_memory_sync_domain() -> None:
     kernel_source = (_KERNELS / "moeRebalanceHaloR.cu").read_text()
     prepare = _function_body(
         kernel_source, "MoeRebalanceHaloRLaunch prepareMoeRebalanceHaloRLaunch("
@@ -966,7 +968,9 @@ def _create_argument(env, name):
 
 
 @pytest.mark.parametrize("helper_residency", [False, True])
-def test_residency_table_exists_only_for_per_layer_helper_slots(monkeypatch, helper_residency):
+def test_residency_table_exists_only_for_per_layer_helper_slots(
+    monkeypatch, helper_residency
+) -> None:
     env = _build(monkeypatch, helper_residency=helper_residency)
     table = _create_argument(env, "residency")
     if not helper_residency:
@@ -980,7 +984,7 @@ def test_residency_table_exists_only_for_per_layer_helper_slots(monkeypatch, hel
     )
 
 
-def test_kernel_skips_resident_receivers_and_records_residency_before_ready():
+def test_kernel_skips_resident_receivers_and_records_residency_before_ready() -> None:
     kernel_source = (_KERNELS / "moeRebalanceHaloR.cu").read_text()
     relay_source = (_KERNELS / "moeRebalanceRelay.cuh").read_text()
     prepare = _function_body(relay_source, "void prepareRelayWork(")
@@ -1068,7 +1072,7 @@ def _pool(trace, *, rank, sets, gathered):
 
 
 @pytest.mark.parametrize("sets", [2, 5], ids=["shared-banks", "per-layer"])
-def test_peer_helper_chunks_are_mapped_once_per_set(sets):
+def test_peer_helper_chunks_are_mapped_once_per_set(sets) -> None:
     trace = []
     world = 4
 
@@ -1095,7 +1099,7 @@ def test_peer_helper_chunks_are_mapped_once_per_set(sets):
         pool.peer_helper_bases(0)
 
 
-def test_peer_helper_mapping_refuses_mismatched_chunks():
+def test_peer_helper_mapping_refuses_mismatched_chunks() -> None:
     trace = []
     gathered = [
         [{"w13": "a", "w2": "b"}, {"w13": "c"}, {"w13": "e", "w2": "f"}, {"w13": "g", "w2": "h"}]
@@ -1135,7 +1139,7 @@ def _set_pool(trace, *, helper_multicast):
 
 
 @pytest.mark.parametrize("count", [1, 2], ids=["per-layer", "shared-banks"])
-def test_halo_q_helper_sets_keep_a_multicast_object_per_level(monkeypatch, count):
+def test_halo_q_helper_sets_keep_a_multicast_object_per_level(monkeypatch, count) -> None:
     from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import arena as arena_module
 
     calls = []
@@ -1166,7 +1170,7 @@ def test_halo_q_helper_sets_keep_a_multicast_object_per_level(monkeypatch, count
 
 
 @pytest.mark.parametrize("count", [1, 2], ids=["per-layer", "shared-banks"])
-def test_halo_r_helper_sets_get_no_multicast_object(monkeypatch, count):
+def test_halo_r_helper_sets_get_no_multicast_object(monkeypatch, count) -> None:
     from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import arena as arena_module
 
     def create_multicast(*args):
@@ -1230,7 +1234,7 @@ def _live_arena(world, slots, unicast_planes):
 
 
 @pytest.mark.parametrize("unicast_planes", [0, 2], ids=["multicast", "unicast-helpers"])
-def test_live_arena_binds_planes_without_a_multicast_alias(unicast_planes):
+def test_live_arena_binds_planes_without_a_multicast_alias(unicast_planes) -> None:
     world, rank, home, helpers = 2, 1, 4, 2
     arena, bundle = _live_arena(world, home + helpers, unicast_planes)
     bound = arena.bind(
@@ -1244,7 +1248,7 @@ def test_live_arena_binds_planes_without_a_multicast_alias(unicast_planes):
     assert len(bound.destination_ptrs) == expected
 
 
-def test_hierarchical_arena_refuses_planes_without_a_multicast_alias():
+def test_hierarchical_arena_refuses_planes_without_a_multicast_alias() -> None:
     from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami import (
         HierarchicalLiveWeightArena,
         hierarchy_group_sizes,
@@ -1266,7 +1270,7 @@ def test_hierarchical_arena_refuses_planes_without_a_multicast_alias():
         )
 
 
-def test_weight_reload_forgets_residency_between_layer_calls(monkeypatch):
+def test_weight_reload_forgets_residency_between_layer_calls(monkeypatch) -> None:
     env = _build(monkeypatch, helper_residency=True)
     table = env.endpoint.residency
     group = env.group
@@ -1294,7 +1298,7 @@ def test_weight_reload_forgets_residency_between_layer_calls(monkeypatch):
 
 
 @pytest.mark.parametrize("peer_reset", [(5, 2), (6, 1), (None, 1)])
-def test_weight_reload_raises_when_ranks_reset_differently(monkeypatch, peer_reset):
+def test_weight_reload_raises_when_ranks_reset_differently(monkeypatch, peer_reset) -> None:
     """A rank that reset another layer, or this one another number of times, fails every rank."""
     env = _build(monkeypatch, helper_residency=True)
     _layer_call(env.group, 8)
@@ -1306,7 +1310,7 @@ def test_weight_reload_raises_when_ranks_reset_differently(monkeypatch, peer_res
     assert env.trace == [("allgather",)]
 
 
-def test_weight_reload_without_residency_is_free(monkeypatch):
+def test_weight_reload_without_residency_is_free(monkeypatch) -> None:
     env = _build(monkeypatch)
     _layer_call(env.group, 8)
     env.trace.clear()
@@ -1320,7 +1324,7 @@ def test_weight_reload_without_residency_is_free(monkeypatch):
         env.group.forget_helper_residency()
 
 
-def test_planner_reads_the_residency_table_from_shared_memory():
+def test_planner_reads_the_residency_table_from_shared_memory() -> None:
     kernel_source = (_KERNELS / "moeRebalanceHaloR.cu").read_text()
     publish = _function_body(kernel_source, "RoleResult planAndPublish(")
     _assert_in_order(
@@ -1339,7 +1343,7 @@ def test_planner_reads_the_residency_table_from_shared_memory():
     _assert_in_order(build, ("row[q] == received[r]", "placed[r] = true;", "while (hot[q] >= 0)"))
 
 
-def test_native_route_wait_and_join_are_constant_and_poisoned_together():
+def test_native_route_wait_and_join_are_constant_and_poisoned_together() -> None:
     assert _op_parameters("moe_rebalance_halo_r_wait_routes") == ["handle", "stream"]
     assert _op_parameters("moe_rebalance_halo_r_join") == ["handle"]
     source = _HALO_R_OP.read_text()
@@ -1373,7 +1377,7 @@ def test_native_route_wait_and_join_are_constant_and_poisoned_together():
     assert "mPoison == cudaSuccess" in operational
 
 
-def test_kernel_drains_ready_before_the_exchange_within_one_bound():
+def test_kernel_drains_ready_before_the_exchange_within_one_bound() -> None:
     kernel_source = (_KERNELS / "moeRebalanceHaloR.cu").read_text()
     publish = _function_body(kernel_source, "RoleResult planAndPublish(")
     _assert_in_order(

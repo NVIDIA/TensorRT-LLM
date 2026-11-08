@@ -9,8 +9,8 @@ equal the kernel's word for word.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
 
 ORDER_BITS = 8
 ORDER_OPEN = 1 << (ORDER_BITS - 1)
@@ -26,8 +26,8 @@ class Broadcast:
 
     expert: int
     owner: int
-    rows: Dict[int, int] = field(default_factory=dict)
-    helper: Dict[int, int] = field(default_factory=dict)
+    rows: dict[int, int] = field(default_factory=dict)
+    helper: dict[int, int] = field(default_factory=dict)
 
     @property
     def destination_mask(self) -> int:
@@ -36,12 +36,12 @@ class Broadcast:
 
 @dataclass
 class Plan:
-    broadcasts: List[Broadcast]
-    helper_table: List[List[int]]
-    load_after: List[int]
+    broadcasts: list[Broadcast]
+    helper_table: list[list[int]]
+    load_after: list[int]
     target: int
 
-    def quota(self, histogram: Sequence[int], ep: int) -> List[List[int]]:
+    def quota(self, histogram: Sequence[int], ep: int) -> list[list[int]]:
         """Routes of each broadcast's expert kept by each rank, owner included."""
         quota = []
         for b in self.broadcasts:
@@ -52,7 +52,7 @@ class Plan:
             quota.append(row)
         return quota
 
-    def plan_words(self, epoch: int = 0) -> List[int]:
+    def plan_words(self, epoch: int = 0) -> list[int]:
         """The kernel's plan words: [epoch, broadcasts] then six fields of 384 entries."""
         words = [epoch, len(self.broadcasts)] + [0] * (len(PLAN_FIELDS) * PLAN_FIELD_STRIDE)
         for index, b in enumerate(self.broadcasts):
@@ -74,7 +74,7 @@ def plan_halo_r(
     helper_slots: int,
     send_count: int,
     send_weight: int = 0,
-    residency: Optional[Sequence[Sequence[int]]] = None,
+    residency: Sequence[Sequence[int]] | None = None,
 ) -> Plan:
     """Plan one layer from the global routed-token count of every expert.
 
@@ -93,7 +93,7 @@ def plan_halo_r(
     target = -(-sum(load) // ep)
     received = [0] * ep
     sent = [0] * ep
-    exports: List[List[int]] = []
+    exports: list[list[int]] = []
     moves = []
     while True:
         room = [target - load[rank] for rank in range(ep)]

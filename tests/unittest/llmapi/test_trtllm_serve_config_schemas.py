@@ -377,6 +377,22 @@ def test_load_balancer_schema_matches_runtime(
             MoeConfig(load_balancer=load_balancer)
 
 
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize("planner", ["halo_q", "halo_r"])
+def test_load_balancer_schema_defaults_match_runtime(
+    schemas: dict[str, dict], filename: str, planner: str
+) -> None:
+    """An editor completes the auxiliary_sms default that the runtime resolves for each planner."""
+    from tensorrt_llm.llmapi.llm_args import MoePerLayerDynamicLoadBalancerConfig
+
+    definition = schemas[filename]["$defs"][MoePerLayerDynamicLoadBalancerConfig.__name__]
+    default = definition["properties"]["auxiliary_sms"]["default"]
+    if planner == "halo_r":
+        default = definition["then"]["properties"]["auxiliary_sms"]["default"]
+    runtime = MoePerLayerDynamicLoadBalancerConfig(num_slots=320, planner=planner)
+    assert default == runtime.auxiliary_sms
+
+
 def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:
     """Check literal top-level config accesses, without tracing aliases or dynamic keys."""
     function = next(

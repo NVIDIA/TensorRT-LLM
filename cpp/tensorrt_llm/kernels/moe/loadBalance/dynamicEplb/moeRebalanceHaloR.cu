@@ -629,7 +629,9 @@ cudaError_t launchMoeRebalanceHaloR(MoeRebalanceHaloRLaunch const& launch, MoeRe
     config.stream = stream;
     config.attrs = attributes;
     config.numAttrs = launch.attributeCount + 1;
-    void* arguments[] = {const_cast<MoeRebalanceHaloRParams*>(&params)};
+    // cudaLaunchKernelExC takes non-const argument pointers; pass a copy instead of casting const away.
+    MoeRebalanceHaloRParams kernelParams = params;
+    void* arguments[] = {&kernelParams};
     return cudaLaunchKernelExC(&config, reinterpret_cast<void const*>(&haloRFusedKernel), arguments);
 }
 

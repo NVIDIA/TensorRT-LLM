@@ -1537,7 +1537,7 @@ def _skip_if_any(results: list) -> None:
 
 
 @pytest.mark.parametrize("case", [case for case in _CASES if not case.startswith("trap_")])
-def test_halo_r(monkeypatch, case):
+def test_halo_r(monkeypatch, case) -> None:
     results = _run_on_every_rank(monkeypatch, case)
     _skip_if_any(results)
     failures = [failure for _, rank_failures in results for failure in rank_failures]
@@ -1545,7 +1545,7 @@ def test_halo_r(monkeypatch, case):
 
 
 @pytest.mark.parametrize("kind", _TRAPS)
-def test_halo_r_traps(monkeypatch, kind):
+def test_halo_r_traps(monkeypatch, kind) -> None:
     """A broken launch on rank 0 traps it in that call; every peer traps in that call or the next."""
     results = _run_on_every_rank(monkeypatch, f"trap_{kind}")
     _skip_if_any(results)

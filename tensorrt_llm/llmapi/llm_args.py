@@ -8349,8 +8349,8 @@ class TorchLlmArgs(BaseLlmArgs):
                     "graphs except with planner='halo_r' and "
                     "prefill_cuda_graph_backend='breakable'")
         if self.cuda_graph_config is not None:
-            logger.warning("per-layer dynamic EPLB does not support CUDA "
-                           "graphs; setting cuda_graph_config to None.")
+            logger.warning("per-layer dynamic EPLB does not support decode "
+                           "CUDA graphs; setting cuda_graph_config to None.")
             self.cuda_graph_config = None
         return self
 

@@ -5870,6 +5870,7 @@
       "then": {
         "properties": {
           "auxiliary_sms": {
+            "default": 16,
             "minimum": 2
           }
         }

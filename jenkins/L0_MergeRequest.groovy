@@ -1903,6 +1903,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/runtime/worldConfig.cpp",
         "cpp/tensorrt_llm/thop/allgatherOp.cpp",
         "cpp/tensorrt_llm/thop/allreduceOp.cpp",
+        "cpp/tensorrt_llm/thop/moe/loadBalance/",
         "cpp/tensorrt_llm/thop/reducescatterOp.cpp",
         "cpp/tests/unit_tests/multi_gpu/",
         "jenkins/L0_Test.groovy",

@@ -27,7 +27,7 @@ WORKED_EXAMPLE = [300, 40, 30, 30, 0, 0, 0, 0, 40, 30, 20, 10, 40, 30, 20, 10]
 WORKED_EXAMPLE += [0, 0, 0, 0, 0, 0, 0, 0, 40, 30, 20, 10, 40, 30, 20, 10]
 
 
-def test_worked_example_replicates_hot_expert_to_idle_ranks():
+def test_worked_example_replicates_hot_expert_to_idle_ranks() -> None:
     plan = plan_halo_r(WORKED_EXAMPLE, ep=8, helper_slots=2, send_count=4)
     assert plan.target == 100
     assert len(plan.broadcasts) == 1
@@ -39,7 +39,7 @@ def test_worked_example_replicates_hot_expert_to_idle_ranks():
     assert plan.load_after == [100] * 8
 
 
-def test_receivers_fill_helper_slots_in_expert_order():
+def test_receivers_fill_helper_slots_in_expert_order() -> None:
     histogram = [0, 0, 80, 10, 40, 200, 40, 10, 10, 80, 200, 0, 0, 80, 0, 200]
     plan = plan_halo_r(histogram, ep=4, helper_slots=4, send_count=4)
     assert [b.expert for b in plan.broadcasts] == [5, 10, 15]
@@ -53,7 +53,7 @@ def test_receivers_fill_helper_slots_in_expert_order():
 
 
 @pytest.mark.parametrize("seed", range(4))
-def test_plans_respect_helper_budget_and_conserve_routes(seed):
+def test_plans_respect_helper_budget_and_conserve_routes(seed) -> None:
     rng = random.Random(seed)
     for _ in range(50):
         ep = rng.choice([2, 4, 8, 16, 32])
@@ -91,7 +91,7 @@ def test_plans_respect_helper_budget_and_conserve_routes(seed):
 )
 def test_geometry_validation_rejects_unsupported_shapes(
     ep_size, home_experts, helper_slots, auxiliary_sms, message
-):
+) -> None:
     def validate():
         validate_halo_r_geometry(
             ep_size=ep_size,
@@ -107,7 +107,7 @@ def test_geometry_validation_rejects_unsupported_shapes(
             validate()
 
 
-def test_geometry_validation_accepts_ep32_two_helper_slots():
+def test_geometry_validation_accepts_ep32_two_helper_slots() -> None:
     validate_halo_r_geometry(ep_size=32, home_experts=12, helper_slots=2, auxiliary_sms=2)
 
 
@@ -165,7 +165,7 @@ class _Backend:
         self.layer_idx = 3
 
 
-def test_halo_r_planner_builds_the_halo_r_group(monkeypatch):
+def test_halo_r_planner_builds_the_halo_r_group(monkeypatch) -> None:
     from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import planner
 
     manager = PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=_Config("halo_r"))
@@ -197,7 +197,7 @@ def test_halo_r_planner_builds_the_halo_r_group(monkeypatch):
     assert repr(manager).endswith("planner=halo_r)")
 
 
-def test_default_planner_builds_the_halo_q_group(monkeypatch):
+def test_default_planner_builds_the_halo_q_group(monkeypatch) -> None:
     from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import planner
 
     config = _Config("halo_q")
@@ -217,7 +217,7 @@ def test_default_planner_builds_the_halo_q_group(monkeypatch):
     assert manager.planner == "halo_q"
 
 
-def test_rebinding_the_backend_forgets_helper_residency(monkeypatch):
+def test_rebinding_the_backend_forgets_helper_residency(monkeypatch) -> None:
     """Loaders bind the layer again after they rewrite its weights."""
     manager = PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=_Config("halo_r"))
     layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
@@ -239,12 +239,12 @@ def test_rebinding_the_backend_forgets_helper_residency(monkeypatch):
     layer.bind_backend(backend)
 
 
-def test_manager_rejects_unknown_planner():
+def test_manager_rejects_unknown_planner() -> None:
     with pytest.raises(ValueError, match="unknown per-layer dynamic EPLB planner"):
         PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=_Config("halo_m"))
 
 
-def test_manager_keeps_halo_r_helper_slots_resident_per_layer():
+def test_manager_keeps_halo_r_helper_slots_resident_per_layer() -> None:
     config = _Config("halo_r")
     config.helper_slot_mode = "per_layer_resident"
     manager = PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=config)
@@ -253,7 +253,7 @@ def test_manager_keeps_halo_r_helper_slots_resident_per_layer():
 
 @pytest.mark.parametrize("helper_slot_mode", ["per_layer_resident", "shared_banks"])
 @pytest.mark.parametrize(("planner_name", "multicast"), [("halo_q", True), ("halo_r", False)])
-def test_only_halo_q_helper_sets_get_multicast(planner_name, multicast, helper_slot_mode):
+def test_only_halo_q_helper_sets_get_multicast(planner_name, multicast, helper_slot_mode) -> None:
     config = _Config(planner_name)
     config.helper_slot_mode = helper_slot_mode
     manager = PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=config)
@@ -262,7 +262,7 @@ def test_only_halo_q_helper_sets_get_multicast(planner_name, multicast, helper_s
     assert provider._per_layer_helper_sets is (helper_slot_mode == "per_layer_resident")
 
 
-def test_reference_keeps_resident_experts_in_their_slots():
+def test_reference_keeps_resident_experts_in_their_slots() -> None:
     histogram = [0, 0, 80, 10, 40, 200, 40, 10, 10, 80, 200, 0, 0, 80, 0, 200]
     ascending = plan_halo_r(histogram, ep=4, helper_slots=4, send_count=4)
     assert ascending.helper_table[0] == [5, 10, 15, -1]
@@ -280,7 +280,7 @@ def test_reference_keeps_resident_experts_in_their_slots():
     assert plan.load_after == ascending.load_after
 
 
-def test_reference_plan_words_have_the_kernel_layout():
+def test_reference_plan_words_have_the_kernel_layout() -> None:
     plan = plan_halo_r(WORKED_EXAMPLE, ep=8, helper_slots=2, send_count=4)
     words = plan.plan_words(epoch=7)
     assert len(words) == 2 + 6 * 384
