@@ -203,9 +203,14 @@ add_tllm_gtest(
   kernel
   SOURCES
   fmhaHead104Test.cpp
-  FULL_STACK
+  ${PROJECT_SOURCE_DIR}/tensorrt_llm/kernels/fmhaDispatcher.cpp
+  LINK_LIBRARIES
+  context_attention_src
+  trtllm_gen_fmha
+  tllm::common_environment
+  CUDA::cuda_driver
   LABELS
-  "unit;kernels;fmha;full-stack;gpu")
+  "unit;kernels;fmha;gpu")
 
 add_tllm_gtest(
   nvfp4ColdPageKernelsTest
