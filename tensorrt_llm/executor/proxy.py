@@ -713,6 +713,40 @@ class GenerationExecutorProxy(GenerationExecutor):
     def resource_governor_queue(self):
         return self._resource_governor_queue
 
+    def reserve_context_cancellation(self, request_id: int) -> str:
+        """Reserve one native context admission at the shared rank-zero worker.
+
+        Args:
+            request_id: Immutable pairing identity for the context request.
+
+        Returns:
+            An opaque worker-issued token, shared across HTTP frontend lanes.
+
+        Raises:
+            RuntimeError: The worker RPC endpoint is unavailable.
+        """
+        if self.rpc_client is None:
+            raise RuntimeError("Context cancellation requires worker RPC")
+        return self.rpc_client.reserve_context_cancellation(request_id).remote(
+            timeout=5.0)
+
+    def cancel_context_cancellation(self, token: str) -> str:
+        """Forward cancellation and return only its routing receipt.
+
+        Args:
+            token: Worker-issued context admission token.
+
+        Returns:
+            ``not_submitted`` or ``queued``; neither means physical retirement.
+
+        Raises:
+            RuntimeError: The worker RPC endpoint is unavailable.
+        """
+        if self.rpc_client is None:
+            raise RuntimeError("Context cancellation requires worker RPC")
+        return self.rpc_client.cancel_context_cancellation(token).remote(
+            timeout=5.0)
+
     def abort_request(self, request_id: int) -> None:
         """Abort a request by sending a cancelling request to the request queue.
 

@@ -23,6 +23,8 @@ configs:
     - GET /steady_clock_offset _MsgspecRoute
     - POST /steady_clock_offset _MsgspecRoute
     - POST /kv_cache_events _MsgspecRoute
+    - POST /internal/context-cancellation/reserve _MsgspecRoute
+    - POST /internal/context-cancellation/cancel _MsgspecRoute
     - POST /v1/completions _MsgspecRoute
     - POST /v1/chat/completions _MsgspecRoute
     - POST /v1/messages _MsgspecRoute
@@ -57,6 +59,8 @@ configs:
     - GET /steady_clock_offset _MsgspecRoute
     - POST /steady_clock_offset _MsgspecRoute
     - POST /kv_cache_events _MsgspecRoute
+    - POST /internal/context-cancellation/reserve _MsgspecRoute
+    - POST /internal/context-cancellation/cancel _MsgspecRoute
     - POST /v1/completions _MsgspecRoute
     - POST /v1/chat/completions _MsgspecRoute
     - POST /v1/messages _MsgspecRoute
@@ -91,6 +95,8 @@ configs:
     - GET /steady_clock_offset _MsgspecRoute
     - POST /steady_clock_offset _MsgspecRoute
     - POST /kv_cache_events _MsgspecRoute
+    - POST /internal/context-cancellation/reserve _MsgspecRoute
+    - POST /internal/context-cancellation/cancel _MsgspecRoute
     - POST /v1/completions _MsgspecRoute
     - POST /v1/chat/completions _MsgspecRoute
     - POST /v1/messages _MsgspecRoute
@@ -125,6 +131,8 @@ configs:
     - GET /steady_clock_offset _MsgspecRoute
     - POST /steady_clock_offset _MsgspecRoute
     - POST /kv_cache_events _MsgspecRoute
+    - POST /internal/context-cancellation/reserve _MsgspecRoute
+    - POST /internal/context-cancellation/cancel _MsgspecRoute
     - POST /v1/completions _MsgspecRoute
     - POST /v1/chat/completions _MsgspecRoute
     - POST /v1/responses _MsgspecRoute
@@ -151,6 +159,8 @@ configs:
     - GET /steady_clock_offset _MsgspecRoute
     - POST /steady_clock_offset _MsgspecRoute
     - POST /kv_cache_events _MsgspecRoute
+    - POST /internal/context-cancellation/reserve _MsgspecRoute
+    - POST /internal/context-cancellation/cancel _MsgspecRoute
     - POST /v1/completions _MsgspecRoute
     - POST /v1/chat/completions _MsgspecRoute
     - POST /v1/messages _MsgspecRoute
@@ -185,6 +195,8 @@ configs:
     - GET /steady_clock_offset _MsgspecRoute
     - POST /steady_clock_offset _MsgspecRoute
     - POST /kv_cache_events _MsgspecRoute
+    - POST /internal/context-cancellation/reserve _MsgspecRoute
+    - POST /internal/context-cancellation/cancel _MsgspecRoute
     - POST /_resource_governor/truncate _MsgspecRoute
     - POST /_control/kv_cache/truncate _MsgspecRoute
     - POST /_control/kv_cache/truncate_tokens _MsgspecRoute
@@ -222,6 +234,8 @@ configs:
     - GET /steady_clock_offset _MsgspecRoute
     - POST /steady_clock_offset _MsgspecRoute
     - POST /kv_cache_events _MsgspecRoute
+    - POST /internal/context-cancellation/reserve _MsgspecRoute
+    - POST /internal/context-cancellation/cancel _MsgspecRoute
     - POST /v1/completions _MsgspecRoute
     - POST /v1/chat/completions _MsgspecRoute
     - POST /v1/messages _MsgspecRoute
@@ -259,6 +273,8 @@ configs:
     - GET /steady_clock_offset _MsgspecRoute
     - POST /steady_clock_offset _MsgspecRoute
     - POST /kv_cache_events _MsgspecRoute
+    - POST /internal/context-cancellation/reserve _MsgspecRoute
+    - POST /internal/context-cancellation/cancel _MsgspecRoute
     - POST /v1/completions _MsgspecRoute
     - POST /v1/chat/completions _MsgspecRoute
     - POST /v1/messages _MsgspecRoute
@@ -299,6 +315,8 @@ configs:
     - GET /steady_clock_offset _MsgspecRoute
     - POST /steady_clock_offset _MsgspecRoute
     - POST /kv_cache_events _MsgspecRoute
+    - POST /internal/context-cancellation/reserve _MsgspecRoute
+    - POST /internal/context-cancellation/cancel _MsgspecRoute
     - POST /v1/completions _MsgspecRoute
     - POST /v1/chat/completions _MsgspecRoute
     - POST /v1/messages _MsgspecRoute
@@ -334,6 +352,8 @@ configs:
     - GET /steady_clock_offset _MsgspecRoute
     - POST /steady_clock_offset _MsgspecRoute
     - POST /kv_cache_events _MsgspecRoute
+    - POST /internal/context-cancellation/reserve _MsgspecRoute
+    - POST /internal/context-cancellation/cancel _MsgspecRoute
     - POST /v1/completions _MsgspecRoute
     - POST /v1/chat/completions _MsgspecRoute
     - POST /v1/messages _MsgspecRoute
@@ -370,6 +390,8 @@ configs:
     - GET /steady_clock_offset _MsgspecRoute
     - POST /steady_clock_offset _MsgspecRoute
     - POST /kv_cache_events _MsgspecRoute
+    - POST /internal/context-cancellation/reserve _MsgspecRoute
+    - POST /internal/context-cancellation/cancel _MsgspecRoute
     - POST /v1/completions _MsgspecRoute
     - POST /v1/chat/completions _MsgspecRoute
     - POST /v1/messages _MsgspecRoute
@@ -405,6 +427,8 @@ configs:
     - GET /steady_clock_offset _MsgspecRoute
     - POST /steady_clock_offset _MsgspecRoute
     - POST /kv_cache_events _MsgspecRoute
+    - POST /internal/context-cancellation/reserve _MsgspecRoute
+    - POST /internal/context-cancellation/cancel _MsgspecRoute
     - POST /v1/completions _MsgspecRoute
     - POST /v1/chat/completions _MsgspecRoute
     - POST /v1/messages _MsgspecRoute
@@ -451,6 +475,8 @@ configs:
     - GET /steady_clock_offset _MsgspecRoute
     - 'POST /steady_clock_offset _MsgspecRoute #set_steady_clock_offset'
     - 'POST /kv_cache_events _MsgspecRoute #get_kv_cache_events'
+    - POST /internal/context-cancellation/reserve _MsgspecRoute
+    - POST /internal/context-cancellation/cancel _MsgspecRoute
     - POST /v1/completions _MsgspecRoute
     - POST /v1/chat/completions _MsgspecRoute
     - POST /v1/messages _MsgspecRoute

@@ -28,6 +28,7 @@ from tensorrt_llm.serve.conversation_id import (
 from tensorrt_llm.serve.openai_protocol import UCompletionRequest
 
 INTERNAL_DISAGG_AUTH_HEADER = "x-trtllm-disagg-auth"
+CONTEXT_CANCELLATION_AUTH_HEADER = "x-trtllm-context-cancellation-auth"
 SUBAGENT_AFFINITY_AUTH_HEADER = "x-trtllm-subagent-affinity-auth"
 _SIGNATURE_PREFIX = "sha256="
 _INTERNAL_DISAGG_AUTH_FIELDS = ("encoded_opaque_state", "ctx_info_endpoint")
@@ -109,6 +110,91 @@ def validate_internal_disagg_request(
         provided.encode("utf-8"), expected.encode("utf-8")
     ):
         raise ValueError("Invalid internal disaggregated request authentication")
+
+
+def build_context_cancellation_headers(
+    key: str | None, action: str, payload: Mapping[str, str | int | None]
+) -> dict[str, str]:
+    """Authenticate a context control action without permissive legacy fallback.
+
+    Args:
+        key: Required internal coordinator/worker secret.
+        action: Reserve, submit, or cancel purpose of this message.
+        payload: Exact fields authorized by the signature.
+
+    Returns:
+        The purpose-bound authentication header.
+
+    Raises:
+        ValueError: No internal key is configured.
+    """
+    if not key:
+        raise ValueError("Context cancellation requires internal_request_auth_key")
+    encoded = json.dumps(
+        {"purpose": "context-cancellation-v1", "action": action, "payload": dict(payload)},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signature = hmac.new(key.encode("utf-8"), encoded, hashlib.sha256).hexdigest()
+    return {CONTEXT_CANCELLATION_AUTH_HEADER: f"{_SIGNATURE_PREFIX}{signature}"}
+
+
+def validate_context_cancellation_auth(
+    key: str | None,
+    action: str,
+    payload: Mapping[str, str | int | None],
+    headers: Mapping[str, str] | None,
+) -> None:
+    """Reject missing credentials or a signature for another action/identity.
+
+    Args:
+        key: Required internal coordinator/worker secret.
+        action: The action being authorized.
+        payload: Exact request fields to authenticate.
+        headers: Incoming HTTP headers.
+
+    Raises:
+        ValueError: The key or signature is missing or invalid.
+    """
+    expected = build_context_cancellation_headers(key, action, payload)[
+        CONTEXT_CANCELLATION_AUTH_HEADER
+    ]
+    provided = None if headers is None else headers.get(CONTEXT_CANCELLATION_AUTH_HEADER)
+    if provided is None or not hmac.compare_digest(provided.encode(), expected.encode()):
+        raise ValueError("Invalid context cancellation authentication")
+
+
+def context_cancellation_submission_payload(
+    request: UCompletionRequest,
+) -> dict[str, str | int | None] | None:
+    """Bind the reserved token to this exact context-first submission.
+
+    Args:
+        request: Worker-bound completion, chat, or Responses request.
+
+    Returns:
+        The signed identity fields, or None for a request without a token.
+
+    Raises:
+        ValueError: A token is attached to a non-context-first request.
+    """
+    params = request.disaggregated_params
+    if params is None or params.context_cancellation_token is None:
+        return None
+    from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
+
+    if (
+        params.request_type != "context_only"
+        or params.schedule_style != DisaggScheduleStyle.CONTEXT_FIRST
+        or type(params.disagg_request_id) is not int
+        or params.disagg_request_id < 0
+    ):
+        raise ValueError("Context cancellation requires a context-first request identity")
+    return {
+        "token": params.context_cancellation_token,
+        "model": request.model,
+        "disagg_request_id": params.disagg_request_id,
+    }
 
 
 def _sign_subagent_affinity(

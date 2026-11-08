@@ -24,6 +24,7 @@ CONTROL_REQUEST_ID = -2
 PROFILE_START_REQUEST_ID = -3
 PROFILE_STOP_REQUEST_ID = -4
 PREFIX_LOAD_COMPLETION_REQUEST_ID = -5
+CONTEXT_TOKEN_CANCEL_REQUEST_ID = -6
 
 
 class RequestAdmissionState(enum.Enum):
@@ -46,6 +47,10 @@ class RequestQueueItem:
     # A completed frontend result may no longer map its client identity to an
     # engine request. Resolve this only against retained CTX transfers.
     cancel_context_client_id: Optional[int] = None
+    cancel_context_token: Optional[str] = None
+    # Keep identity on the envelope: raw Python request fields are attached
+    # after special-item handling on receiving ranks.
+    context_cancellation_token: Optional[str] = None
     # Only meaningful for control requests. True = drain active/waiting
     # queues before firing the action. False = fire at the next scheduler
     # step boundary with in-flight requests still in the engine.
@@ -258,9 +263,13 @@ class ExecutorRequestQueue:
                     self.start_times[req_id] = start_time
                 child_req_ids = self._generate_child_request_ids(request)
 
+                params = getattr(request, "py_disaggregated_params", None)
                 item = RequestQueueItem(req_id,
                                         request,
-                                        child_req_ids=child_req_ids)
+                                        child_req_ids=child_req_ids,
+                                        context_cancellation_token=getattr(
+                                            params,
+                                            "context_cancellation_token", None))
                 if self._stamp_admission_times is not None:
                     self._stamp_admission_times(item, time.monotonic())
                 self.request_queue.put(item)
@@ -305,9 +314,29 @@ class ExecutorRequestQueue:
         with self.request_queue.mutex:
             return {
                 item.id
-                for item in self.request_queue.queue if item.is_canceled_request
-                and item.cancel_context_client_id is None
+                for item in self.request_queue.queue
+                if item.is_canceled_request and item.cancel_context_client_id is
+                None and item.cancel_context_token is None
             }
+
+    def enqueue_context_token_cancel(self, token: str) -> bool:
+        """Queue cancellation of one authenticated context request instance.
+
+        Args:
+            token: The worker-validated, single-use admission identity.
+
+        Returns:
+            Whether intent was queued, not whether the worker handled it or
+            physical access ended.
+        """
+        with self.enqueue_lock:
+            if not self._can_enqueue_cancellation():
+                return False
+            self.request_queue.put(
+                RequestQueueItem(CONTEXT_TOKEN_CANCEL_REQUEST_ID,
+                                 is_canceled_request=True,
+                                 cancel_context_token=token))
+            return True
 
     def enqueue_control_request(self,
                                 drain: bool = True,

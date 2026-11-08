@@ -879,6 +879,68 @@ def test_submit_cleans_up_failed_enqueue(
         assert worker._client_id_to_request_id == {7: 70, 8: 80}
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("case", ["cancel_first", "submitted", "malformed"])
+def test_context_token_worker_admission_and_late_cancel(case: str) -> None:
+    """Use the real submit/cancel boundaries, retaining an unrelated request."""
+    from tensorrt_llm.disaggregated_params import (DisaggregatedParams,
+                                                   DisaggScheduleStyle)
+    from tensorrt_llm.executor.context_cancellation import \
+        ContextCancellationReservations
+
+    engine = Mock(kv_connector_manager=None)
+    engine.kv_cache_transceiver.supports_logical_context_cancellation.return_value = True
+    engine._can_enqueue_cancellation.return_value = True
+    engine.can_enqueue_requests.return_value = True
+    worker = MagicMock(rank=0,
+                       engine=engine,
+                       _results={8: "healthy"},
+                       _client_id_to_request_id={8: 80})
+    worker._context_cancellation_reservations = ContextCancellationReservations(
+    )
+    worker._check_context_cancellation_capability = MethodType(
+        BaseWorker._check_context_cancellation_capability, worker)
+    worker._handle_background_error = MethodType(lambda self: None, worker)
+    worker._get_logprob_params.return_value = None
+    worker._enqueue_request.return_value = 17
+    token = BaseWorker.reserve_context_cancellation(worker, 17)
+    request = GenerationRequest(
+        prompt_token_ids=[10, 11],
+        sampling_params=SamplingParams(max_tokens=1),
+        disaggregated_params=DisaggregatedParams(
+            request_type="context_only",
+            disagg_request_id=17,
+            schedule_style=DisaggScheduleStyle.CONTEXT_FIRST,
+            context_cancellation_token=token))
+    request.set_id(7)
+    if case == "malformed":
+        request.disaggregated_params.context_cancellation_token = "x.\u00e9"
+        with pytest.raises(RequestError,
+                           match="Invalid context cancellation token"):
+            BaseWorker.submit(worker, request)
+        worker._enqueue_request.assert_not_called()
+        assert worker._results == {8: "healthy"}
+        assert worker._client_id_to_request_id == {8: 80}
+    elif case == "cancel_first":
+        assert BaseWorker.cancel_context_cancellation(worker,
+                                                      token) == "not_submitted"
+        with pytest.raises(RequestError, match="admission is closed"):
+            BaseWorker.submit(worker, request)
+        worker._enqueue_request.assert_not_called()
+        assert worker._results == {8: "healthy"}
+        assert worker._client_id_to_request_id == {8: 80}
+    else:
+        BaseWorker.submit(worker, request)
+        worker._enqueue_request.assert_called_once_with(request)
+        # The completed HTTP result no longer owns routing; the exact token
+        # still reaches the executor's retained request via its normal queue.
+        BaseWorker._pop_result(worker, 7)
+        assert BaseWorker.cancel_context_cancellation(worker, token) == "queued"
+        engine._cancel_context_instance.assert_called_once_with(token)
+        assert worker._results == {8: "healthy"}
+        assert worker._client_id_to_request_id == {8: 80}
+
+
 def _load_ray_executor(monkeypatch: pytest.MonkeyPatch) -> type:
     """Load the real Ray executor with cluster-only imports stubbed."""
     importlib.import_module("tensorrt_llm.executor.ray.utils")
