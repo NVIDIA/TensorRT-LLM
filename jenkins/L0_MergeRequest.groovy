@@ -954,9 +954,18 @@ def launchReleaseCheck(pipeline, globalVars)
     })
 }
 
+// Inside a parallel branch, pass a nested stage name: Blue Ocean shows a skip marked on the branch's own stage as NOT_BUILT.
+def skipStage(String stageName, String message)
+{
+    stage(stageName) {
+        echo message
+        jUtils.markStageSkippedForConditional(stageName)
+    }
+}
+
 def launchTestListCheck(pipeline, globalVars)
 {
-    def key = "Check Test List"
+    def key = "Check-Test-List"
     def image = globalVars["LLM_DOCKER_IMAGE"]
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
         stage("[${key}] Run") {
@@ -1970,6 +1979,10 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_b200_visual_gen_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_dgx_b200.yml",
         "tests/integration/test_lists/test-db/l0_dgx_b300.yml",
+        "tests/integration/test_lists/test-db/l0_dgx_b300_efa_multi_nodes.yml",
+        "tests/integration/defs/perf/test_efa_disaggregated.py",
+        "tests/test_common/efa_validation.py",
+        "tests/scripts/perf-sanity/disaggregated/b300_qwen3_0.6b_efa_functional.yaml",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200_perf_sanity.yml",
@@ -2488,7 +2501,7 @@ def findCachedPLCSourceScanResult(commit) {
     return [result: buildInfo.result, url: buildInfo.url]
 }
 
-def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, additionalParameters = [:]) {
+def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, additionalParameters = [:], boolean propagateFailure = true) {
     def parameters = getCommonParameters()
     // Build a local copy to avoid racey growth from shared parallel mutations.
     // In particular, CACHED_CHANGED_FILE_LIST can become very large and may
@@ -2533,15 +2546,16 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, additio
     // runBranchesWithInfraDefer in L0_Test.groovy and Build.groovy). That is incomplete coverage,
     // not a failure: throwing here is exactly what trips the per-arch failFast and
     // cancels the healthy sibling architecture, so do NOT throw. Mark the build
-    // UNSTABLE (visible + re-runnable) and let the sibling finish. FAILURE and
-    // ABORTED still throw below, so real failures fail-fast exactly as before.
+    // UNSTABLE (visible + re-runnable) and let the sibling finish. With default
+    // propagation, FAILURE and ABORTED still throw below; callers opting out
+    // inspect and handle those returned statuses themselves.
     if (buildStatus == "UNSTABLE") {
         catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
             error "Downstream job ${jobName} is infra-incomplete (UNSTABLE); sibling not cancelled"
         }
         return buildStatus
     }
-    if (buildStatus != "SUCCESS") {
+    if (buildStatus != "SUCCESS" && propagateFailure) {
         error "Downstream job did not succeed"
     }
     return buildStatus
@@ -2580,22 +2594,22 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 launchReleaseCheck(this, globalVars)
             }
         },
-        "Check Test List": {
+        "Check-Test-List": {
             script {
                 if (testFilter[INFRA_DRY_RUN]) {
-                    echo "Skipping Check Test List for the infrastructure dry run."
+                    skipStage("[Check-Test-List] Run", "Skipping Check Test List for the infrastructure dry run.")
                     return
                 } else if (GEN_POST_MERGE_BUILDS_ONLY) {
-                    echo "Skipping Check Test List (GenPostMergeBuilds mode: builds only)"
+                    skipStage("[Check-Test-List] Run", "Skipping Check Test List (GenPostMergeBuilds mode: builds only)")
                     return
                 } else if (runMode == "nightly_release") {
-                    echo "Skipping Check Test List for nightly_release."
+                    skipStage("[Check-Test-List] Run", "Skipping Check Test List for nightly_release.")
                     return
                 } else if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
-                    echo "Skipping Check Test List for Docs-only changes."
+                    skipStage("[Check-Test-List] Run", "Skipping Check Test List for Docs-only changes.")
                     return
                 } else if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
-                    echo "Skipping Check Test List for BuildDockerImageSanityTest."
+                    skipStage("[Check-Test-List] Run", "Skipping Check Test List for BuildDockerImageSanityTest.")
                     return
                 }
                 launchTestListCheck(this, globalVars)
@@ -3087,6 +3101,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         "Build-Docker-Images": {
             script {
                 def imageBuildStatus
+                // Nightly scans can inspect published images even when later build checks fail.
+                def scanAfterImageBuildFailure = runContainerScanning && runMode == "nightly_release" && !enableFailFast
                 def testStageName = "[Build-Docker-Images] Remote Run"
                 stage(testStageName) {
                     try {
@@ -3156,7 +3172,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         if (params.release_type_id) {
                             additionalParameters['release_type_id'] = params.release_type_id
                         }
-                        imageBuildStatus = launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, additionalParameters)
+                        // Inspect the result before deciding whether nightly scans may continue.
+                        imageBuildStatus = launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, additionalParameters, false)
+                        if (!(imageBuildStatus in ["SUCCESS", "UNSTABLE"])) {
+                            error "Build-Docker-Images job returned ${imageBuildStatus}"
+                        }
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -3166,12 +3186,18 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 stageResult: 'FAILURE') {
                                 error "Build-Docker-Images job failed but ignored due to Jenkins configuration"
                             }
+                        } else if (scanAfterImageBuildFailure && imageBuildStatus == "FAILURE") {
+                            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', catchInterruptions: false) {
+                                throw e
+                            }
                         } else {
                             throw e
                         }
                     }
                 }
-                if (!runContainerScanning || imageBuildStatus != "SUCCESS") {
+                def canScanImages = imageBuildStatus == "SUCCESS" ||
+                    (scanAfterImageBuildFailure && imageBuildStatus in ["FAILURE", "UNSTABLE"])
+                if (!runContainerScanning || !canScanImages) {
                     return
                 }
                 stage("[NGC-Container-Compliance-Check] Run") {
@@ -3258,7 +3284,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         stages += dockerBuildJob
     }
 
-    def alwaysFailFastStages = ["Release-Check", "Check Test List"] as Set
+    def alwaysFailFastStages = ["Release-Check", "Check-Test-List"] as Set
     parallelJobs = stages.collectEntries{key, value -> [key, {
         script {
             stage(key) {
@@ -3365,16 +3391,12 @@ pipeline {
                                     }
                                 }
                             },
-                            "Check Test List": {
-                                stage("Check Test List") {
+                            "Check-Test-List": {
+                                stage("Check-Test-List") {
                                     if (testFilter[INFRA_DRY_RUN]) {
-                                        echo "Skipping Check Test List for the infrastructure dry run."
-                                    } else if (runMode == "nightly_release") {
-                                        echo "Skipping Check Test List for nightly_release."
+                                        skipStage("[Check-Test-List] Run", "Skipping Check Test List for the infrastructure dry run.")
                                     } else if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
-                                        echo "Skipping Check Test List for Docs-only changes."
-                                    } else if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
-                                        echo "Skipping Check Test List for BuildDockerImageSanityTest."
+                                        skipStage("[Check-Test-List] Run", "Skipping Check Test List for Docs-only changes.")
                                     } else {
                                         launchTestListCheck(this, globalVars)
                                     }

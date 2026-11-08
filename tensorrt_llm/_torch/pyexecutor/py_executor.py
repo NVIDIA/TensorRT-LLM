@@ -76,6 +76,7 @@ from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
+from ..modules.dwdp.dense.manager import DenseDwdpManager
 from ..moe.expert_statistic import ExpertStatistic
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SpecSampler
@@ -117,7 +118,7 @@ from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
                        make_mpi_progress_exit_hook, make_mpi_progress_pump)
 from .profiling import PROFILE_START_STOP_ENV_VAR_NAME, PyExecutorProfileManager
 from .profiling import load_iteration_indexes as _load_iteration_indexes
-from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
+from .request_utils import (RequestBroadcaster,
                             derive_attention_dp_per_rank_request_cap,
                             get_from_waiting_queue, merge_requests)
 from .resource_manager import (NoFreeSlotsError, ResourceManager,
@@ -235,6 +236,19 @@ def _validate_dspark_exact_bucket(*, exact_shape, bucket) -> None:
         raise RuntimeError(
             "DSpark exact policy did not publish its selected captured "
             f"verifier bucket V={expected_bucket}; got {bucket}")
+
+
+def _dspark_tp_shared_ragged_lens(dist, ragged_lens: List[int]) -> List[int]:
+    """Use TP rank 0's verify rows on every rank.
+
+    Without attention DP every TP rank runs one token layout, but each rank
+    ranks rows from its own confidence snapshot, so rank-local choices can
+    differ and the next collective stalls. Every rank holds the same batch,
+    so the vectors have one length.
+    """
+    return [
+        int(value) for value in dist.tp_cp_broadcast_int64(ragged_lens, root=0)
+    ]
 
 
 def _classify_dspark_exact_generation_rows(
@@ -623,6 +637,7 @@ class PyExecutorResources:
     virtual_memory_pools: Optional[dict]
     kv_connector_manager: Optional[KvCacheConnectorManager]
     dwdp_manager: Optional[DwdpManager]
+    dense_dwdp_manager: Optional[DenseDwdpManager]
     max_seq_len: Optional[int]
     max_num_sequences: int
     waiting_queue_policy: WaitingQueuePolicy
@@ -695,6 +710,7 @@ class PyExecutor:
         waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
         adp_router: Optional[ADPRouter] = None,
         dwdp_manager: Optional[DwdpManager] = None,
+        dense_dwdp_manager: Optional[DenseDwdpManager] = None,
         enable_kv_pool_rebalance: bool = False,
         kv_pool_rebalance_check_interval: int = KV_POOL_REBALANCE_CHECK_INTERVAL,
         enable_adp_dummy_fixes: bool = False,
@@ -728,6 +744,10 @@ class PyExecutor:
         # events, re-recorded every step: a wait captures the record current at
         # the time of the wait.
         self._stream_ordering_events = (torch.cuda.Event(), torch.cuda.Event())
+        # Phase teardown joins users and synchronizes CUDA before rebinding.
+        # Sampling synchronization resources therefore live with the executor.
+        self.sample_stream = torch.cuda.Stream()
+        self.finish_sample_event = torch.cuda.Event()
         logger.info(
             f"[PyExecutor] execution_stream initialized: {self.execution_stream}; "
             f"encoder_stream initialized: {self.encoder_stream}.")
@@ -809,6 +829,7 @@ class PyExecutor:
                 virtual_memory_pools=virtual_memory_pools,
                 kv_connector_manager=kv_connector_manager,
                 dwdp_manager=dwdp_manager,
+                dense_dwdp_manager=dense_dwdp_manager,
                 max_seq_len=max_seq_len,
                 max_num_sequences=max_num_sequences,
                 waiting_queue_policy=waiting_queue_policy,
@@ -830,6 +851,7 @@ class PyExecutor:
         virtual_memory_pools = resources.virtual_memory_pools
         kv_connector_manager = resources.kv_connector_manager
         dwdp_manager = resources.dwdp_manager
+        dense_dwdp_manager = resources.dense_dwdp_manager
         max_seq_len = resources.max_seq_len
         max_num_sequences = resources.max_num_sequences
         waiting_queue_policy = resources.waiting_queue_policy
@@ -845,6 +867,10 @@ class PyExecutor:
         hang_detection_timeout = self._execution_config.hang_detection_timeout
         enable_kv_pool_rebalance = self._execution_config.enable_kv_pool_rebalance
         transfer_budget_is_explicit = self._execution_config.transfer_budget_is_explicit
+        # Before anything is bound or warmed up, so that a combination this
+        # executor cannot drive fails before the warmup forwards.
+        self._validate_dwdp_managers(dwdp_manager, dense_dwdp_manager,
+                                     disable_overlap_scheduler)
         self.peft_cache_config = peft_cache_config
         self.iter_counter = 0
         # profile config
@@ -863,6 +889,7 @@ class PyExecutor:
         self.resource_manager = resource_manager
         self.kv_connector_manager = kv_connector_manager
         self.dwdp_manager = dwdp_manager
+        self.dense_dwdp_manager = dense_dwdp_manager
         # Compatibility checks and MultimodalScheduler wrapping live in
         # `create_py_executor_instance`; the executor only keeps the flag
         # its loop paths branch on.
@@ -1242,8 +1269,6 @@ class PyExecutor:
                 "TLLM_HELIX_AGG_CHECK_SCHEDULE=1 is ignored: the schedule check "
                 "only runs with aggregated helix context parallelism "
                 "and pipeline parallelism disabled.")
-        self.sample_stream = torch.cuda.Stream()
-        self.finish_sample_event = torch.cuda.Event()
         # Set of request IDs that are currently in flight across all micro batches
         # or waiting for synchronized PP resource teardown. The scheduler avoids
         # these requests until their prior execution state is safe to reuse.
@@ -1531,11 +1556,6 @@ class PyExecutor:
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
             self.event_loop = trace_func(self.event_loop)
 
-        if dwdp_manager is not None and not self.disable_overlap_scheduler:
-            raise ValueError(
-                "DWDP requires disable_overlap_scheduler=True. "
-                "Overlap scheduler is not yet supported with DWDP.")
-
         if self.drafter is not None:
             if self.event_loop.__name__ == self._executor_loop_pp.__name__:
                 raise NotImplementedError(
@@ -1615,6 +1635,32 @@ class PyExecutor:
         """
         connector = getattr(self, "kv_connector_manager", None)
         return connector is not None and not connector.capacity_only
+
+    @staticmethod
+    def _validate_dwdp_managers(dwdp_manager: Optional[DwdpManager],
+                                dense_dwdp_manager: Optional[DenseDwdpManager],
+                                disable_overlap_scheduler: bool) -> None:
+        """Reject DWDP managers this executor cannot drive.
+
+        Expert DWDP (``dwdp_manager``) runs only with the overlap scheduler
+        off. A standalone dense DWDP manager runs with either loop: the
+        non-overlap loop primes it before each forward, and in the overlap loop
+        the model's forward entry (H0) primes it. With expert DWDP,
+        ``DwdpManager`` drives dense DWDP itself, so only one of the two
+        managers may be given.
+
+        Raises:
+            ValueError: ``dwdp_manager`` with the overlap scheduler on, or both
+                managers given.
+        """
+        if dwdp_manager is not None and not disable_overlap_scheduler:
+            raise ValueError(
+                "DWDP requires disable_overlap_scheduler=True. "
+                "Overlap scheduler is not yet supported with DWDP.")
+        if dwdp_manager is not None and dense_dwdp_manager is not None:
+            raise ValueError(
+                "pass dense_dwdp_manager only without DWDP: with dwdp_manager, "
+                "DwdpManager drives dense DWDP")
 
     def _maybe_init_kv_connector_manager(self) -> None:
         if self.kv_connector_manager is not None:
@@ -2595,6 +2641,9 @@ class PyExecutor:
         if self.dwdp_manager is not None:
             self.dwdp_manager.__exit__(None, None, None)
             self.dwdp_manager = None
+        if self.dense_dwdp_manager is not None:
+            self.dense_dwdp_manager.__exit__(None, None, None)
+            self.dense_dwdp_manager = None
         # Released in full: the next release, after a rebind or of resources a
         # failed rebind bound, starts over.
         self._shutdown_runtime_complete = False
@@ -4804,6 +4853,10 @@ class PyExecutor:
                                 graph_batch_size=common_graph_batch_size,
                                 verifier_budget=selected_verifier_budget,
                             ))
+                        if (is_distributed
+                                and not self.dist.mapping.enable_attention_dp):
+                            ragged_lens = _dspark_tp_shared_ragged_lens(
+                                self.dist, ragged_lens)
                         if exact_local.num_requests == 0:
                             if not exact_zero_real_adp_dummy:
                                 raise RuntimeError(
@@ -5158,6 +5211,17 @@ class PyExecutor:
         if spec_resource_manager is not None:
             spec_resource_manager.free_resources(dummy_request)
         self.kv_cache_manager.free_resources(dummy_request)
+        # The V2 scheduler also admits the draft pool's mirror while it
+        # schedules the dummy (KVCacheV2Scheduler._admit_unpaired_draft), so
+        # that pool holds an empty cache under the dummy ID too. Left behind,
+        # it outlives this dummy, and the deferred previous batch -- which
+        # still holds the earlier, finished dummy with the same ID -- resizes
+        # it to that dummy's history in update_resources ("History length
+        # cannot exceed capacity").
+        draft_kv_cache_manager = getattr(self, "draft_kv_cache_manager", None)
+        if (getattr(self, "_is_kv_manager_v2", False)
+                and draft_kv_cache_manager is not None):
+            draft_kv_cache_manager.free_resources(dummy_request)
         self.active_requests.remove(dummy_request)
 
     def _revert_ctx_alloc(self, dropped_context_requests):
@@ -6110,6 +6174,24 @@ class PyExecutor:
         return torch.profiler.record_function(
             self._build_step_scope_label(scheduled_batch, phase))
 
+    def _prime_dwdp(self) -> None:
+        """Start DWDP for the next forward of the non-overlap loop.
+
+        Expert DWDP starts its prefetch (``DwdpManager.start_forward``): the
+        first MoE layers, unless the previous forward already prefetched them,
+        each after the layer's dense weights when dense DWDP is attached. A
+        standalone dense DWDP manager enqueues the dense weights of the first
+        two layers. Dense DWDP skips what is primed already and leaves the
+        recovery after an aborted forward to the model's forward entry (H0).
+        The overlap and pipeline-parallel loops do not call this: expert DWDP
+        refuses the overlap scheduler, and a standalone dense DWDP manager is
+        primed by H0 in every forward there.
+        """
+        if self.dwdp_manager is not None:
+            self.dwdp_manager.start_forward()
+        elif self.dense_dwdp_manager is not None:
+            self.dense_dwdp_manager.prefetch_first_layers()
+
     def _executor_loop(self) -> None:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -6279,8 +6361,7 @@ class PyExecutor:
                         with self.perf_manager.record_perf_events(
                                 gpu_forward_start,
                                 gpu_forward_end) as fwd_timing:
-                            if self.dwdp_manager is not None:
-                                self.dwdp_manager.start_forward()
+                            self._prime_dwdp()
                             batch_outputs = self._forward_step(scheduled_batch)
 
                         # None: _forward_step hit an exception and
@@ -7920,7 +8001,7 @@ class PyExecutor:
             first_token_timer.observe(self.active_requests, time.monotonic())
             self.request_broadcaster.aux = first_token_timer.value
 
-        # Broadcast requests and handle Python objects. RequestBroadcaster probes
+        # Broadcast self-contained request envelopes. RequestBroadcaster probes
         # the request count first and can skip the heavy payload broadcast on
         # empty iterations.
         # prefer_cpu=idle: on the idle path non-root ranks park in the probe
@@ -7929,8 +8010,8 @@ class PyExecutor:
         # The transport choice must be identical on every rank, so `idle` has
         # to be too: it follows the all-rank live-request count and the
         # replicated waiting queue.
-        new_requests, py_request_objects = self.request_broadcaster.broadcast(
-            new_requests, prefer_cpu=idle)
+        new_requests = self.request_broadcaster.broadcast(new_requests,
+                                                          prefer_cpu=idle)
         if isinstance(waiting_queue, GenAdmissionWaitingQueue):
             if self._gen_admission.needs_clock:
                 waiting_queue.set_now(self.request_broadcaster.rank0_now,
@@ -7940,12 +8021,6 @@ class PyExecutor:
 
         # Validate and filter requests
         new_requests = self._handle_special_queue_items(new_requests)
-
-        # Attach Python objects to requests
-        if py_request_objects and (self.dist.tp_size > 1 or self.dist.has_pp
-                                   or self.dist.cp_size
-                                   > 1) and self.dist.rank > 0:
-            attach_py_objects_to_requests(new_requests, py_request_objects)
 
         waiting_queue.add_requests(new_requests)
 

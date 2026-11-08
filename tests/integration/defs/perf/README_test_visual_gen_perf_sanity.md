@@ -228,8 +228,6 @@ Important:
 
 - VisualGen perf sanity uses static pytest cases, like `test_perf_sanity.py`
 - Do **not** add pytest `--perf` for VisualGen perf sanity runs
-- VisualGen `PerfSanity` stages should not be routed through the legacy
-  `perfMode` path used by `test_perf.py`
 
 ## How to Add a Test Case
 
