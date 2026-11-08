@@ -523,10 +523,10 @@ cd tests/integration/defs
 export LLM_MODELS_ROOT=/path/to/models
 
 # GSM8K on the NVFP4 TEP4 deployment, without speculative decoding.
-pytest -v "accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_gsm8k"
+pytest -v "accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_gsm8k[tep4]"
 
 # The quick profile on TEP4 with DSpark: GSM8K, RULER, image and acceptance-length checks.
-pytest -v "accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Accuracy::test_accuracy[quick-tep4]"
+pytest -v "accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_accuracy[tep4-quick]"
 ```
 
 `test_accuracy` is parameterized by profile and deployment, as `test_accuracy[<profile>-<deployment>]`:
