@@ -5087,7 +5087,8 @@ def instantiate_sampler(
         runtime_hooks = runtime_hooks_of(engine.model)
         if isinstance(sampler, SpecSampler):
             if (engine.spec_config.spec_dec_mode.is_dspark()
-                    and mapping.pp_size == 1 and not mapping.enable_attention_dp
+                    and mapping.pp_size == 1 and mapping.cp_size == 1
+                    and not mapping.enable_attention_dp
                     and llm_args.modeling_v2 == "off"
                     and isinstance(engine.model, SpecDecOneEngineForCausalLM)
                     and engine.model.supports_speculative_output_scores()):

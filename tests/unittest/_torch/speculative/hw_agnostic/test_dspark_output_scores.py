@@ -11,6 +11,7 @@ from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForC
 from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
+from tensorrt_llm._torch.pyexecutor import _util as executor_util
 from tensorrt_llm._torch.pyexecutor.llm_request import ContextLogitsOrigin, LlmRequestState
 from tensorrt_llm._torch.speculative import spec_sampler_base as sampler_ops
 from tensorrt_llm._torch.speculative.logprobs import (
@@ -25,6 +26,7 @@ from tensorrt_llm._torch.speculative.spec_sampler_base import (
     SampleStateTensorsSpec,
     SpecSampler,
 )
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import LogprobMode
 
 pytestmark = pytest.mark.cpu_only
@@ -128,6 +130,74 @@ def test_capability_rejects_sharded_or_omitted_heads_before_projection(
         assert sampler.logit_projection is None
         with pytest.raises(ValueError, match="logprobs"):
             sampler.validate_request(_request(py_return_log_probs=True))
+
+
+@pytest.mark.parametrize("cp_size", [1, 2])
+def test_score_projection_binding_requires_original_context_rows(cp_size, monkeypatch) -> None:
+    # Exercise the actual construction gate and request validator. Only the GPU
+    # sampler allocation and hardware confidential-compute query are controlled.
+    mapping = Mapping(
+        world_size=4 * cp_size,
+        rank=0,
+        tp_size=4,
+        cp_size=cp_size,
+        cp_config={"cp_type": "HELIX"},
+    )
+    head = LMHead.__new__(LMHead)
+    torch.nn.Module.__init__(head)
+    head.tp_size = mapping.tp_size
+    head.tp_mode = TensorParallelMode.COLUMN
+    head.gather_output = True
+    model = SpecDecOneEngineForCausalLM.__new__(SpecDecOneEngineForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.lm_head = head
+    model.logits_processor = LogitsProcessor()
+    assert model.supports_speculative_output_scores()
+    mode = types.SimpleNamespace(has_spec_decoder=lambda: True, is_dspark=lambda: True)
+    spec_config = types.SimpleNamespace(spec_dec_mode=mode, max_draft_len=2, tokens_per_gen_step=3)
+    engine = types.SimpleNamespace(model=model, spec_config=spec_config, max_seq_len=64)
+    llm_args = types.SimpleNamespace(
+        sampler_force_async_worker=False,
+        disable_overlap_scheduler=True,
+        enable_speculative_beam_history_d2h=False,
+        modeling_v2="off",
+    )
+    sampler = _sampler()
+    sampler.logit_projection = None
+
+    def allocate_sampler(args, config):
+        assert isinstance(args, executor_util.TorchSampler.Args)
+        assert args.max_num_sequences == 2
+        assert config is spec_config
+        return sampler
+
+    monkeypatch.setattr(executor_util, "confidential_compute_enabled", lambda: False)
+    monkeypatch.setattr(executor_util, "get_spec_decoder", allocate_sampler)
+    actual = executor_util.instantiate_sampler(
+        engine,
+        llm_args,
+        mapping,
+        max_batch_size=2,
+        max_beam_width=1,
+        mm_encoder_only=False,
+        speculative_config=spec_config,
+        max_num_sequences=2,
+    )
+    assert actual is sampler
+    # Ordinary speculative generation remains allowed for either CP topology.
+    actual.validate_request(_request())
+    if cp_size == 1:
+        assert actual.logit_projection.__self__ is model
+        assert actual.logit_projection.__func__ is (
+            SpecDecOneEngineForCausalLM.project_speculative_logits
+        )
+        actual.validate_request(_request(py_return_log_probs=True))
+        actual.validate_request(_request(py_return_context_logits=True))
+    else:
+        assert actual.logit_projection is None
+        for flag in ("py_return_log_probs", "py_return_context_logits"):
+            with pytest.raises(ValueError, match="not supported with speculative decoding"):
+                actual.validate_request(_request(**{flag: True}))
 
 
 @pytest.mark.parametrize("ragged", [False, True])
