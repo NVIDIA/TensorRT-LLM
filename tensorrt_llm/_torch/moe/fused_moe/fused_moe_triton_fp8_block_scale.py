@@ -10,14 +10,22 @@ import triton.language as tl
 
 _BLOCK_SHAPE = [128, 128]  # [group_k, group_n] for FP8 block-scale
 _BLOCK_SIZE_M = 16
-# Used when experts average at least _LARGE_M_MIN_ROWS rows, so that each
-# weight tile is loaded once per 64 rows instead of once per 16.
+# Used when experts average at least one full large tile, so that each weight
+# tile is loaded once per 64 rows instead of once per 16. Below that, with the
+# 64-row config tuned at max_num_tokens as in serving, the padding costs more
+# than the loads save. Measured on RTX PRO 6000 (SM120); SM121 is unmeasured.
 _BLOCK_SIZE_M_LARGE = 64
-_LARGE_M_MIN_ROWS = 32
+_LARGE_M_MIN_ROWS = _BLOCK_SIZE_M_LARGE
 
 
 def _block_size_m(num_tokens: int, top_k: int, num_experts: int) -> int:
-    """BLOCK_SIZE_M for both GEMMs and the alignment of one MoE call."""
+    """BLOCK_SIZE_M for both GEMMs and the alignment of one MoE call.
+
+    Counts the rows this call computes per local expert slot. Under expert
+    parallelism they include the pairs of other ranks' experts, which
+    ``_local_slot_ids`` clamps onto the edge slots with a zero scale, and any
+    dispatch padding: those piles favor the large tile as real rows do.
+    """
     if num_tokens * top_k >= _LARGE_M_MIN_ROWS * num_experts:
         return _BLOCK_SIZE_M_LARGE
     return _BLOCK_SIZE_M
@@ -224,12 +232,36 @@ def _build_moe_gemm_autotune_configs():
     return configs
 
 
+def _prune_moe_gemm_configs(configs, named_args, **kwargs):
+    """Drop the configs whose pipelined tiles cannot fit in shared memory.
+
+    Counts num_stages - 1 buffers of the BF16 A tile and the FP8 B tile only,
+    a lower bound, so no config that could fit is dropped. The configs it
+    drops would otherwise fail only after compiling, once per tile height.
+    """
+    del named_args
+    block_size_m = kwargs["BLOCK_SIZE_M"]
+    props = triton.runtime.driver.active.utils.get_device_properties(torch.cuda.current_device())
+
+    def min_shared_mem(config):
+        block_k = config.kwargs["BLOCK_SIZE_K"]
+        block_n = config.kwargs["BLOCK_SIZE_N"]
+        return (config.num_stages - 1) * (block_size_m * block_k * 2 + block_k * block_n)
+
+    fitting = [c for c in configs if min_shared_mem(c) <= props["max_shared_mem"]]
+    return fitting or configs
+
+
 @triton.autotune(
     configs=_build_moe_gemm_autotune_configs(),
     key=["N", "K", "BLOCK_SIZE_M"],
+    prune_configs_by={"early_config_prune": _prune_moe_gemm_configs},
     # FUSE_TOPK_REDUCE uses atomic_add into c_ptr, so autotune trials must start
     # from zero instead of accumulating on the previous trial's output.
     reset_to_zero=["c_ptr"],
+    # Each tile height sweeps every config; keep the winners in the Triton
+    # cache so that a restart does not repeat the sweeps.
+    cache_results=True,
 )
 @triton.jit
 def _fused_moe_bf16act_fp8w_kernel(
@@ -373,10 +405,15 @@ def _invoke_bf16act_fp8w_moe_kernel(
     top_k: int,
     fuse_topk_reduce: bool = False,
     reduce_topk: int = 1,
-    block_size_m: int = _BLOCK_SIZE_M,
+    *,
+    block_size_m: int,
 ) -> None:
     """
     Launch _fused_moe_bf16act_fp8w_kernel.
+
+    `block_size_m` must equal the block size `moe_align_block_size` laid out
+    `sorted_token_ids` and `expert_ids` with: the kernel reads one expert id
+    per BLOCK_SIZE_M rows, so a mismatch silently produces wrong outputs.
 
     Tensor layouts (default, fuse_topk_reduce=False):
         A       : (num_tokens_or_expanded, K)  BF16, contiguous
