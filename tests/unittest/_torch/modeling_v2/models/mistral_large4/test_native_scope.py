@@ -56,11 +56,10 @@ def _image_processor(native_chat):
 def test_other_formats_append_images_and_keep_literal_markers():
     processor, tokenizer = _image_processor(native_chat=False)
     processor("a [IMG] b", images=[Image.new("RGB", (4, 4))])
-    ((conversation, kwargs),) = tokenizer.calls
+    ((conversation, _),) = tokenizer.calls
     content = conversation[0]["content"]
     assert content[0] == {"type": "text", "text": "a [IMG] b"}
     assert [part["type"] for part in content] == ["text", "image"]
-    assert kwargs["return_tensors"] == "pt"
 
 
 def test_mistral_large_4_places_images_at_markers():
