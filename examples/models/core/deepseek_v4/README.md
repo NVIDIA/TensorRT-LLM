@@ -36,6 +36,7 @@ for how to build TensorRT LLM from source and start a TRT-LLM Docker container.
     - [Sparse attention](#sparse-attention)
     - [KV cache](#kv-cache)
     - [Quantized checkpoints](#quantized-checkpoints)
+  - [DSpark confidence scheduling (prototype)](#dspark-confidence-scheduling-prototype)
   - [Notes and Troubleshooting](#notes-and-troubleshooting)
 
 
@@ -471,6 +472,101 @@ TensorRT LLM detects supported quantization metadata from the checkpoint directo
 MXFP4 routed MoE expert weights, TensorRT LLM automatically applies the routed-expert quantization
 configuration.
 
+On Rubin (SM107), the MXFP4 routed experts can also run as NVFP4_PLUS (E2M1 values with one UE5M3
+scale per 32 values and no global scale): the MXFP4 weights load unchanged and the expert
+activations are quantized to FP4 as well. Set `OVERRIDE_QUANT_ALGO=NVFP4_PLUS` and use the CuteDSL
+MoE backend (`moe_config.backend: CUTEDSL`, which `AUTO` selects under this override). See
+[NVFP4_PLUS MoE from MXFP4 Checkpoints](../../../../docs/source/features/quantization.md#nvfp4_plus-moe-from-mxfp4-checkpoints).
+
+
+## DSpark confidence scheduling (prototype)
+
+DSpark always drafts a block of `K` tokens. With confidence scheduling on, a trained confidence head
+scores each drafted position, and in decode-only steps the runtime may verify fewer than all
+`G * (K + 1)` rows (`G` = requests per rank, `V` = verified rows). It picks `V` from a **cost table**
+of measured step times, and only when the predicted accepted tokens per millisecond beat full
+verification by `confidence_min_predicted_gain`. Target verification and the acceptance rule are
+unchanged; mixed prefill/decode steps always verify every row. The feature is off by default.
+
+### Enable it
+
+```yaml
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes: [16, 32, 64, 128]        # rank-local G; the cost table must cover every entry
+speculative_config:
+  decoding_type: DSpark
+  max_draft_len: 5
+  enable_confidence_scheduling: true
+  confidence_cost_table_path: /path/to/dspark-costs.json
+  confidence_calibration_path: /path/to/calibration.json   # optional
+  confidence_min_predicted_gain: 0.04                      # default
+```
+
+A static baseline can reuse the same file with `enable_confidence_scheduling: false`; the other
+confidence fields are then ignored. `max_draft_len: 1` has no smaller tier and always runs static.
+
+### Get a cost table
+
+Step costs depend on the GPU, parallel layout and kernels, so generate the table on the system
+and with the runtime YAML you serve with. One file can hold several `K`; the runtime uses the entry
+for `max_draft_len`:
+
+```bash
+python -m tensorrt_llm.tools.dspark_profile_costs \
+  --model <YOUR_MODEL_DIR> --config runtime.yaml --k 3 5 --output dspark-costs.json
+```
+
+The tool loads the model once per `K`. For every captured `G` it runs a short wave of requests
+(another one while a budget has too few samples), cycles the full and four compact budgets through
+steady decode steps, and records the median whole-step time (draft and verify included). Running it
+again adds or replaces the profiled `K` and `G` rows in the same file, so `--k 4` or
+`--graph-batch-sizes 512` extends an existing table. `--graph-batch-sizes`, `--tier-fractions` and
+`--dataset` override the defaults; see `--help`.
+
+To reproduce the published DeepSeek-V4-Pro results, or to reuse the 8x B300 cost table and
+calibration, see [CONFIDENCE_REPRODUCTION.md](CONFIDENCE_REPRODUCTION.md).
+
+At startup the runtime checks the table against the engine and fails with the command above when:
+
+- the file is missing, or has no entry for `max_draft_len`;
+- a captured `cuda_graph_config.batch_sizes` entry has no row (extra rows are ignored);
+- it was measured on another GPU model, world size, TP/EP size or attention-DP setting.
+
+A table from another TensorRT LLM version only warns. Tables in the earlier single-`K` format
+(`schema_version: 2`) still load.
+
+### Calibration
+
+`confidence_calibration_path` points to per-position temperatures (`{"sts_temperatures": [...]}`).
+A vector longer than `K` is truncated, so one file fitted at the checkpoint's block size serves
+every `K`. Without it the raw sigmoid confidence is used.
+
+### Device re-ranking
+
+The host chooses the verifier budget from a copy of the previous step's confidence, so it never
+waits for the GPU. The GPU then re-ranks which drafted positions to verify, using the confidence of
+the block being verified. This is on by default with confidence scheduling; it costs compact steps
+a full input rebuild and a small extra GPU pass. It needs the overlap scheduler, so with
+`disable_overlap_scheduler: true` ranking stays on the host. To rank on the host only:
+
+```yaml
+speculative_config:
+  enable_confidence_scheduling: true
+  enable_fused_confidence_scheduler: false   # host ranking only
+```
+
+On DeepSeek-V4-Pro (8x B300) with attention DP, re-ranking raised throughput over host ranking in
+13 of 15 dataset and batch-size settings, by up to 5.5%, without changing GSM8K accuracy; the larger
+of its two losses (-2.2%) measured +0.4% when repeated on a later main. With TP8 attention and no
+attention DP it raised throughput in 14 of 16 settings at batch sizes 8 to 64, by up to 6.4%.
+
+### Limitations
+
+Confidence scheduling requires the embedded DeepSeek-V4 DSpark drafter, padded CUDA graphs,
+PP=1 and CP=1. Guided decoding, LoRA, per-request logits post-processors, per-layer dynamic EPLB,
+heuristic sparse top-k, the acceptance-rate gate (`acceptance_rate_window_size` /
+`acceptance_rate_threshold`) and non-greedy rejection draft sampling are rejected.
 
 ## Notes and Troubleshooting
 

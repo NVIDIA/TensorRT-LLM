@@ -19,7 +19,6 @@ import pytest
 from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import BindKvCacheTransceiver
-from tensorrt_llm._torch.disaggregation.native.bounce.impl import NoBounceTransport
 from tensorrt_llm._torch.disaggregation.native.extent import Cancelled, Chunk, Failed
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
 from tensorrt_llm._torch.disaggregation.native.retirement import RetirementWatchdog
@@ -45,6 +44,10 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggSchedul
 from tensorrt_llm.executor.base_worker import BaseWorker
 
 pytestmark = pytest.mark.cpu_only
+
+# The receiver mints one report token per writer; a KV result is trusted
+# only if it echoes that token. See RxSession.process_kv_agent_result.
+_KV_RESULT_REPORT_TOKEN = b"report-token-123"
 
 
 def _request(request_id: int, *, context: bool = False) -> LlmRequest:
@@ -611,7 +614,6 @@ def _published_receive(
     aux.alloc_slot.return_value = SimpleNamespace(id=0)
     receiver = SimpleNamespace(
         _enforce_physical_ownership=True,
-        _bounce=NoBounceTransport(),
         _registrar=SimpleNamespace(
             self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0)
         ),
@@ -631,6 +633,7 @@ def _published_receive(
     def publish(task: KVRecvTask) -> None:
         """Seal one writer and record publication of the receive task."""
         task.expected_transfers = 1
+        task._kv_result_report_tokens[0] = _KV_RESULT_REPORT_TOKEN
         published: set[int] = set()
         assert session.try_begin_transfer(
             task.slice_id,
@@ -687,7 +690,7 @@ def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
             executor._handle_canceled_requests()
 
     if failure_first:
-        session.process_kv_agent_result(0, 0, True, AgentResult.FAILED)
+        session.process_kv_agent_result(0, 0, True, AgentResult.FAILED, _KV_RESULT_REPORT_TOKEN)
     _abort(executor, request)
     cancel()
     assert not session.resources_drained()
@@ -695,7 +698,7 @@ def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
     executor.resource_manager.free_resources.assert_not_called()
     aux.free_slot.assert_not_called()
     if not failure_first:
-        session.process_kv_agent_result(0, 0, True, AgentResult.FAILED)
+        session.process_kv_agent_result(0, 0, True, AgentResult.FAILED, _KV_RESULT_REPORT_TOKEN)
 
     expected_status = SessionStatus.ERROR if failure_first else SessionStatus.CANCELLED
     expected_outcome = Failed if failure_first else Cancelled
@@ -755,7 +758,9 @@ def test_worker_cancel_retains_published_kv_and_aux_until_both_settle(
     def complete(resource: str) -> None:
         """Deliver terminal evidence for one of the session's two resources."""
         if resource == "kv":
-            session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS)
+            session.process_kv_agent_result(
+                0, 0, True, AgentResult.SUCCESS, _KV_RESULT_REPORT_TOKEN
+            )
         else:
             session.process_aux_agent_result(0, AgentResult.SUCCESS)
 

@@ -306,6 +306,9 @@ def test_disaggregated_mpi_worker_does_not_mutate_built_llm_args(monkeypatch):
         serve_module.DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT, "1"
     )
     monkeypatch.setenv(serve_module.DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX, "0")
+    # The worker resolves the shared draft KV mode into the environment; the
+    # test restores it afterwards.
+    monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", "auto")
     built = {"model": "m", "router": {"type": "round_robin"}}
     snapshot = copy.deepcopy(built)
     launched = {}
@@ -314,7 +317,7 @@ def test_disaggregated_mpi_worker_does_not_mutate_built_llm_args(monkeypatch):
         launched["llm_args"] = llm_args
 
     stub_cfg = SimpleNamespace(
-        server_configs=[SimpleNamespace(other_args={})], ctx_frontend_affinity=None
+        server_configs=[SimpleNamespace(type="ctx", other_args={})], ctx_frontend_affinity=None
     )
     with (
         mock.patch.object(serve_module._command_telemetry, "apply_disaggregated_telemetry_config"),

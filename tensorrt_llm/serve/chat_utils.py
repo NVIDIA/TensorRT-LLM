@@ -18,7 +18,8 @@ from typing_extensions import Required
 from tensorrt_llm.inputs import (ContentFormat, ConversationMessage,
                                  MultimodalData, MultimodalDataTracker,
                                  load_base64_image_embeds)
-from tensorrt_llm.inputs.media_io import MEDIA_IO_REGISTRY, BaseMediaIO
+from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY, BaseMediaIO,
+                                          is_local_media_url)
 from tensorrt_llm.inputs.model_config import resolve_top_level_model_type
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
@@ -111,6 +112,21 @@ def _make_media_io(
     )
 
 
+async def _load_request_media(media_io: BaseMediaIO, url: str) -> Any:
+    """Load one media URL taken from a request.
+
+    A local reference (`file://` URI or bare path) is read only from the
+    directory allowed by `TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`, through
+    `BaseMediaIO.async_load_allowed_local_file`: the file is opened once on
+    the media executor and decoded through that open descriptor. The check
+    runs when the load is awaited, so a request whose media is discarded
+    unread is unaffected.
+    """
+    if is_local_media_url(url):
+        return await media_io.async_load_allowed_local_file(url)
+    return await media_io.async_load(url)
+
+
 def _parse_chat_message_content_mm_part(
     part: ChatCompletionContentPartParam
 ) -> tuple[str, Union[str, dict[str, str], None]]:
@@ -152,7 +168,7 @@ def parse_chat_message_content_part(
                                   mm_data_tracker._multimodal_server_config,
                                   mm_data_tracker.request_media_io_kwargs)
         return MultimodalData(modality="image",
-                              data=image_io.async_load(str_content),
+                              data=_load_request_media(image_io, str_content),
                               is_embedding=False)
 
     if part_type == "image_embeds":
@@ -171,7 +187,7 @@ def parse_chat_message_content_part(
                                   mm_data_tracker._multimodal_server_config,
                                   mm_data_tracker.request_media_io_kwargs)
         return MultimodalData(modality="video",
-                              data=video_io.async_load(str_content),
+                              data=_load_request_media(video_io, str_content),
                               is_embedding=False)
 
     if part_type == "audio_url":
@@ -180,7 +196,7 @@ def parse_chat_message_content_part(
                                   mm_data_tracker._multimodal_server_config,
                                   mm_data_tracker.request_media_io_kwargs)
         return MultimodalData(modality="audio",
-                              data=audio_io.async_load(str_content),
+                              data=_load_request_media(audio_io, str_content),
                               is_embedding=False)
 
     if part_type == "input_audio":

@@ -4,7 +4,7 @@
 
 This article provides a general overview of the components used for device-to-device transmission of KV cache, which is relied upon by disaggregated serving. It is intended as a reference for users who wish to understand the internal implementation or develop extended functionalities. For configuring a deployment, see [Disaggregated Serving](../features/disagg-serving.md) instead.
 
-The implementation described here is the Python transceiver, which lives under [`tensorrt_llm/_torch/disaggregation/`](source:tensorrt_llm/_torch/disaggregation). `cache_transceiver_config.transceiver_runtime` defaults to `auto`, which selects it on the supported NIXL path and otherwise falls back to the older C++ transceiver (`cpp/tensorrt_llm/batch_manager/cacheTransceiver.cpp` and friends). That C++ implementation is deprecated and will be removed in a future release; new work should target the Python path.
+The implementation described here is the Python transceiver, which lives under [`tensorrt_llm/_torch/disaggregation/`](source:tensorrt_llm/_torch/disaggregation). `cache_transceiver_config.transceiver_runtime` defaults to `PYTHON`, which selects it. `CPP` or `None`, or `auto` when it falls back, selects the older C++ transceiver (`cpp/tensorrt_llm/batch_manager/cacheTransceiver.cpp` and friends). That C++ implementation is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period; new work should target the Python path.
 
 ## Table of Contents
 
@@ -27,7 +27,7 @@ The control plane — discovery, per-request metadata, and completion notices �
 1. Context phase completes computation, KV cache stays in device memory awaiting transmission. The context worker publishes only the endpoint where it can be reached, on `ContextPhaseParams.disagg_info_endpoint`.
 2. On first contact with a context instance, the generation worker fetches that instance's `RankInfo` — topology, attention geometry, serialized page table, transfer agent descriptor — from the context rank 0, then registers its own `RankInfo` with every context rank. The result is cached per endpoint, so only the first request pays for the round trip.
 3. Generation phase requests KV cache for specific tokens, sending its destination block IDs to each overlapping context rank.
-4. Context computes both source and destination addresses locally and submits a one-sided NIXL transfer. On the default path that transfer carries one descriptor per cache fragment; only the optional bounce path coalesces a request into a single contiguous buffer and a single write. All address arithmetic happens on the context side; the generation worker's CPU is not involved.
+4. Context computes both source and destination addresses locally and submits a one-sided NIXL write with one descriptor per cache fragment. On this default path all address arithmetic happens on the context side and the generation worker's CPU is not involved. With `kv_cache_bounce_size_mb > 0`, the C++ NIXL agents may route an eligible write through their bounce buffers instead: the context agent gathers the fragments and writes them in chunks into the generation agent's buffer, and the generation agent scatters them into its KV cache.
 5. Context reports completion over the control plane. The receive session completes once every expected writer has reported.
 6. Generation phase resumes computation, context releases KV cache. Both sides run an allgather first, so every rank agrees on the outcome before any state transition.
 

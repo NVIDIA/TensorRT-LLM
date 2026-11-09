@@ -102,6 +102,8 @@ class OpenEngineServer:
         llm: Initialized TensorRT-LLM LLM instance.
         model: Model name accepted by Generate requests.
         subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
+        max_media_preparations: Concurrent media preparation requests. Defaults to
+            TRTLLM_OPENENGINE_MEDIA_PREPARATION_LIMIT, or four when unset.
     """
 
     def __init__(
@@ -114,8 +116,15 @@ class OpenEngineServer:
         frontend: FrontendClient | None = None,
         instance_id: str | None = None,
         subagent_affinity_auth_key: str | None = None,
+        max_media_preparations: int | None = None,
         metrics: OpenEngineMetrics | None = None,
     ) -> None:
+        if max_media_preparations is None:
+            max_media_preparations = int(
+                os.getenv("TRTLLM_OPENENGINE_MEDIA_PREPARATION_LIMIT", "4")
+            )
+        if type(max_media_preparations) is not int or max_media_preparations < 1:
+            raise ValueError("max_media_preparations must be a positive integer")
         self.host = host
         self.port = port
         self._llm = llm
@@ -149,6 +158,7 @@ class OpenEngineServer:
             metrics=metrics,
             input_executor=self._input_executor,
             media_executor=self._media_executor,
+            max_media_preparations=max_media_preparations,
         )
         openengine_pb2_grpc.add_InferenceServicer_to_server(inference, self._server)
         # Control shares the inference servicer's in-flight request table so

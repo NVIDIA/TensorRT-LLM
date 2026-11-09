@@ -27,17 +27,20 @@ from transformers import PretrainedConfig
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.model_loader import validate_encoder_decoder_kv_cache_config
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, KvCacheConfig, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
 
@@ -120,14 +123,15 @@ def _make_model_config(
     return ModelConfig(pretrained_config=PretrainedConfig(**pretrained_kwargs))
 
 
-def _make_mock_model_engine(model_config):
+def _make_mock_model_engine(model_config: ModelConfig) -> Mock:
     """Mock ModelEngine shell; a real engine needs GPU + loaded weights."""
-    engine = Mock()
+    engine = Mock(spec=ModelEngine, model=Mock())
     engine.model.model_config = model_config
-    engine.model.config.torch_dtype = torch.bfloat16
+    engine.model.config.torch_dtype = model_config.torch_dtype
     engine.input_processor = SimpleNamespace(requires_encoder_features=False)
     engine.cuda_graph_batch_sizes = []
     engine.cuda_graph_padding_enabled = False
+    engine.max_cuda_graph_batch_size = None
     return engine
 
 
@@ -158,6 +162,9 @@ def _make_creator(
     creator._mapping = mapping if mapping is not None else Mapping()
     creator._kv_cache_config = kv_cache_config
     creator._max_kv_tokens_in = kv_cache_config.max_tokens
+    creator._max_gpu_total_bytes_in = kv_cache_config.max_gpu_total_bytes
+    creator._pool_ratio_in = kv_cache_config.pool_ratio
+    creator._avg_seq_len_in = kv_cache_config.avg_seq_len
     creator._max_num_tokens = 4096
     creator._max_beam_width = 1
     creator._kv_connector_manager = None
@@ -173,6 +180,7 @@ def _make_creator(
     creator._dummy_reqs = None
     creator._profiling_stage_data = None
     creator._kv_cache_manager_cls = manager_cls
+    creator._is_kv_cache_manager_v2 = issubclass(manager_cls, KVCacheManagerV2)
     creator._execution_stream = None
     creator._draft_config = None
     creator._skip_est = True
@@ -187,6 +195,125 @@ def _make_creator(
 
 class TestSplitKvCacheBudgetForCross:
     """Test the budget splitting method directly."""
+
+    @pytest.mark.parametrize(
+        "kv_quant,self_bytes_per_token,self_dtype",
+        [
+            (None, 12288, tensorrt_llm.bindings.DataType.BF16),
+            (QuantAlgo.FP8, 6144, tensorrt_llm.bindings.DataType.FP8),
+            (QuantAlgo.NVFP4, 3456, tensorrt_llm.bindings.DataType.NVFP4),
+        ],
+    )
+    @pytest.mark.parametrize("cross_fraction", [0.25, 0.5, 0.75])
+    @pytest.mark.parametrize("user_max_tokens", [None, 1024, 6144])
+    @pytest.mark.parametrize("byte_limit", [None, 64 * (1 << 20)])
+    def test_v1_pool_capacity_uses_each_byte_share(
+        self,
+        kv_quant: QuantAlgo | None,
+        self_bytes_per_token: int,
+        self_dtype: tensorrt_llm.bindings.DataType,
+        cross_fraction: float,
+        user_max_tokens: int | None,
+        byte_limit: int | None,
+    ) -> None:
+        """Size both V1 pools from one memory snapshot, including NVFP4 scales."""
+        free_memory = 128 * (1 << 20)
+        config = _make_kv_cache_config(
+            cross_kv_cache_fraction=cross_fraction,
+            max_gpu_total_bytes=byte_limit,
+            max_tokens=user_max_tokens,
+            free_gpu_memory_fraction=0.75,
+            use_kv_cache_manager_v2=False,
+        )
+        model_config = _make_model_config(is_encoder_decoder=True)
+        model_config.quant_config = QuantConfig(kv_cache_quant_algo=kv_quant)
+        creator = _make_creator(config, model_config=model_config, manager_cls=KVCacheManager)
+
+        with (
+            patch.object(torch.cuda, "empty_cache"),
+            patch.object(torch.cuda, "reset_peak_memory_stats"),
+            patch.object(torch.cuda, "mem_get_info", return_value=(free_memory, free_memory)),
+            patch.object(
+                torch.cuda, "memory_stats", return_value={"allocated_bytes.all.current": 0}
+            ),
+            patch.object(creator, "_get_multimodal_encoder_memory_reserve", return_value=0),
+            patch.object(creator, "_get_penalty_workspace_reserve", return_value=0),
+            patch(
+                "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_fixed_bytes",
+                return_value=0,
+            ),
+            patch(
+                "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_bytes_per_token",
+                return_value=0,
+            ),
+        ):
+            creator.configure_kv_cache_capacity()
+
+        configured_state = config.model_dump()
+        self_config, cross_config = creator._split_kv_cache_budget_for_cross()
+        cross_bytes_per_token = 12288  # 6 layers * K/V * 8 heads * 64 elements * 2 bytes
+        expected_budget = int(free_memory * 0.75)
+        if user_max_tokens is not None:
+            expected_budget = min(
+                expected_budget, (self_bytes_per_token + cross_bytes_per_token) * user_max_tokens
+            )
+        if byte_limit is not None:
+            expected_budget = min(expected_budget, byte_limit)
+        cross_budget = int(expected_budget * cross_fraction)
+        self_budget = expected_budget - cross_budget
+
+        remaining_memory = free_memory
+        for pool_config, budget, bytes_per_token, dtype in (
+            (self_config, self_budget, self_bytes_per_token, self_dtype),
+            (
+                cross_config,
+                cross_budget,
+                cross_bytes_per_token,
+                tensorrt_llm.bindings.DataType.BF16,
+            ),
+        ):
+            expected_tokens = budget // bytes_per_token
+            if user_max_tokens is not None:
+                expected_tokens = min(expected_tokens, user_max_tokens)
+            assert pool_config.max_gpu_total_bytes == budget
+            assert pool_config.max_tokens == expected_tokens
+
+            # Run V1's block sizing without allocating GPU storage. The cross
+            # pool sees less free memory after the self pool is allocated.
+            manager = KVCacheManager.__new__(KVCacheManager)
+            manager.kv_factor = 2
+            manager.num_kv_heads_per_layer = [8] * 6
+            manager.head_dim = 64
+            manager.dtype = dtype
+            with patch.object(
+                torch.cuda, "mem_get_info", return_value=(remaining_memory, free_memory)
+            ):
+                blocks, host_blocks = manager.calculate_max_num_blocks(
+                    pool_config, 64, creator._tokens_per_block, creator._mapping, dtype
+                )
+            assert blocks == expected_tokens // creator._tokens_per_block
+            assert host_blocks == 0
+            remaining_memory -= blocks * creator._tokens_per_block * bytes_per_token
+
+        assert config.model_dump() == configured_state
+        assert model_config.quant_config.kv_cache_quant_algo == kv_quant
+
+    @pytest.mark.parametrize("user_max_tokens", [None, 1024])
+    def test_v2_preserves_user_token_cap(self, user_max_tokens: int | None) -> None:
+        config = _make_kv_cache_config(
+            cross_kv_cache_fraction=0.5,
+            max_gpu_total_bytes=96 * (1 << 20),
+            max_tokens=user_max_tokens,
+        )
+        model_config = _make_model_config(is_encoder_decoder=True)
+        model_config.quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8)
+        creator = _make_creator(config, model_config=model_config)
+
+        self_config, cross_config = creator._split_kv_cache_budget_for_cross()
+
+        assert self_config.max_tokens == cross_config.max_tokens == user_max_tokens
+        assert self_config.max_gpu_total_bytes == cross_config.max_gpu_total_bytes == 48 * (1 << 20)
+        assert self_config.free_gpu_memory_fraction == cross_config.free_gpu_memory_fraction == 0.45
 
     def test_split_50_50(self):
         total = 10 * (1 << 30)  # 10 GiB
@@ -235,15 +362,21 @@ class TestSplitKvCacheBudgetForCross:
         with pytest.raises(ValueError, match="cross_kv_cache_fraction"):
             creator._split_kv_cache_budget_for_cross()
 
-    def test_split_free_fraction_when_budget_is_none(self):
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+    def test_split_free_fraction_when_budget_is_none(self, use_kv_cache_manager_v2: bool) -> None:
         config = _make_kv_cache_config(
             cross_kv_cache_fraction=0.5,
             max_gpu_total_bytes=None,
             max_tokens=1000,
             free_gpu_memory_fraction=0.8,
+            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         )
 
-        creator = _make_creator(config, is_enc_dec=True)
+        creator = _make_creator(
+            config,
+            is_enc_dec=True,
+            manager_cls=KVCacheManagerV2 if use_kv_cache_manager_v2 else KVCacheManager,
+        )
         self_config, cross_config = creator._split_kv_cache_budget_for_cross()
 
         assert cross_config.max_tokens == 1000
@@ -252,15 +385,21 @@ class TestSplitKvCacheBudgetForCross:
         assert self_config.free_gpu_memory_fraction == pytest.approx(0.4)
         assert config.free_gpu_memory_fraction == pytest.approx(0.8)
 
-    def test_split_free_fraction_when_budget_is_zero(self):
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+    def test_split_free_fraction_when_budget_is_zero(self, use_kv_cache_manager_v2: bool) -> None:
         config = _make_kv_cache_config(
             cross_kv_cache_fraction=0.5,
             max_gpu_total_bytes=0,
             max_tokens=1000,
             free_gpu_memory_fraction=0.8,
+            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         )
 
-        creator = _make_creator(config, is_enc_dec=True)
+        creator = _make_creator(
+            config,
+            is_enc_dec=True,
+            manager_cls=KVCacheManagerV2 if use_kv_cache_manager_v2 else KVCacheManager,
+        )
         self_config, cross_config = creator._split_kv_cache_budget_for_cross()
 
         assert cross_config.max_tokens == 1000
@@ -374,6 +513,75 @@ class TestResourceManagerType:
 class TestCrossKvCacheConstruction:
     """Exercise the Steps 4 and 5 construction path beyond helper math."""
 
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+    @pytest.mark.parametrize("kv_quant", [None, QuantAlgo.FP8, QuantAlgo.NVFP4])
+    @pytest.mark.parametrize("model_dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("estimating_kv_cache", [False, True])
+    def test_cross_cache_uses_model_dtype(
+        self, use_kv_cache_manager_v2, kv_quant, model_dtype, estimating_kv_cache
+    ):
+        config = _make_kv_cache_config(
+            cross_kv_cache_fraction=0.5,
+            max_gpu_total_bytes=8 * (1 << 30),
+            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+        )
+        model_config = _make_model_config(is_encoder_decoder=True, torch_dtype=model_dtype)
+        original_quant = QuantConfig(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=kv_quant)
+        model_config.quant_config = original_quant
+        model_config.quant_config_dict = {"attention": original_quant}
+        original_mode = original_quant.quant_mode
+        original_layer_mode = original_quant.layer_quant_mode
+        original_state = original_quant.model_dump()
+        creator = _make_creator(
+            config,
+            model_config=model_config,
+            manager_cls=KVCacheManagerV2 if use_kv_cache_manager_v2 else KVCacheManager,
+        )
+        creator._skip_est = False
+        manager_cls = creator._kv_cache_manager_cls
+
+        # Run the shared allocator, replacing only the GPU-owning constructor.
+        with patch.object(manager_cls, "__init__", return_value=None) as init:
+            creator._create_cross_kv_cache_manager(config, estimating_kv_cache)
+        kwargs = init.call_args.kwargs
+        expected_dtype = (
+            tensorrt_llm.bindings.DataType.HALF
+            if model_dtype == torch.float16
+            else tensorrt_llm.bindings.DataType.BF16
+        )
+        assert kwargs["dtype"] == expected_dtype
+        assert kwargs["is_estimating_kv_cache"] == estimating_kv_cache
+        assert (
+            CacheCost.from_raw(creator._get_cross_kv_size_per_token()).slope == 6 * 2 * 8 * 64 * 2
+        )
+        assert model_config.quant_config is original_quant
+        assert model_config.quant_config_dict["attention"] is original_quant
+        assert original_quant.model_dump() == original_state
+        assert original_quant.quant_mode is original_mode
+        assert original_quant.layer_quant_mode is original_layer_mode
+
+    @pytest.mark.parametrize("frozen", [False, True])
+    def test_unquantized_pool_config_preserves_weights_and_frozen_state(self, frozen):
+        model_config = _make_model_config(is_encoder_decoder=True)
+        model_config.quant_config = QuantConfig(
+            quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8
+        )
+        assert model_config.quant_config.quant_mode.has_fp8_kv_cache()
+        assert model_config.quant_config.layer_quant_mode.has_fp8_kv_cache()
+        model_config._frozen = frozen
+
+        pool_config = KvCacheCreator._get_unquantized_kv_model_config(model_config)
+
+        assert pool_config is not model_config
+        assert pool_config._frozen == frozen
+        assert pool_config.pretrained_config is model_config.pretrained_config
+        assert pool_config.quant_config.quant_algo == QuantAlgo.FP8
+        assert pool_config.quant_config.kv_cache_quant_algo is None
+        assert not pool_config.quant_config.quant_mode.has_kv_cache_quant()
+        assert not pool_config.quant_config.layer_quant_mode.has_kv_cache_quant()
+        assert model_config.quant_config.quant_mode.has_fp8_kv_cache()
+        assert model_config.quant_config.layer_quant_mode.has_fp8_kv_cache()
+
     def test_create_cross_kv_cache_manager_uses_encoder_geometry(self):
         config = _make_kv_cache_config(
             cross_kv_cache_fraction=0.5,
@@ -444,7 +652,6 @@ class TestCrossKvCacheConstruction:
         )
         creator._skip_est = False
         creator._execution_stream = _FakeCudaStream()
-        creator._model_engine.max_cuda_graph_batch_size = None
 
         distributed = Mock()
         distributed.allreduce.side_effect = lambda value, op: value
