@@ -564,6 +564,17 @@ class TestPriorityWaitingQueue:
         assert len(q) == 6
         assert [q.pop_request().id for _ in range(6)] == [1, 4, 5, 2, 3, 0]
 
+    @pytest.mark.parametrize("size,k", [(1, 1), (63, 16), (1000, 32), (1000, 250), (1000, 2000)])
+    def test_peek_requests_matches_sorted_snapshot(self, size, k):
+        q = PriorityWaitingQueue()
+        for i in range(size):
+            q.add_request(create_priority_request_item(i, priority=((i * 37) % 101) - 50))
+
+        heap_before = q._heap.copy()
+        expected = [item.id for item in q][:k]
+        assert [item.id for item in q.peek_requests(k)] == expected
+        assert q._heap == heap_before
+
     def test_peek_requests_does_not_sort_the_heap(self, monkeypatch):
         """peek_requests does not go through __iter__, which sorts a copy of
         the whole heap."""
