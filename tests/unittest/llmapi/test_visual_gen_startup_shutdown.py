@@ -110,6 +110,19 @@ def test_missing_previous_sigterm_handler_restores_default(
     ]
 
 
+def test_a_retired_path_response_variable_is_refused_before_the_model_loads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def load_model(*args, **kwargs) -> None:
+        raise AssertionError("the model was loaded")
+
+    monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
+    monkeypatch.setattr(visual_gen, "VisualGen", load_model)
+
+    with pytest.raises(ValueError, match="renamed"):
+        serve.launch_visual_gen_server("127.0.0.1", 0, "test-model")
+
+
 def test_the_media_load_pool_size_reaches_the_server(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
