@@ -2411,7 +2411,7 @@ def _make_low_varlen_case(
     elif pattern == "fp16max":
         # fp16 rounds the finite construction to the 65k binade; 70000 casts to +inf (finite in bf16)
         arena.copy_(torch.randn((rows, stride), generator=generator, device=_DEV) * 8.0 + 65400.0)
-        arena[:, :5] = 70000.0
+        arena[:, :5] = torch.tensor(70000.0, dtype=torch.float32, device=_DEV).to(dtype)
         arena[:, 5 : 5 + top_k + top_k // 4] = 65504.0
     else:
         raise ValueError(f"unknown test pattern: {pattern}")
