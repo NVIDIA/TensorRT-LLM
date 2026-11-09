@@ -854,6 +854,22 @@ def test_agg_tep8_mbs1_dense():
     assert base_off(lever_table) == set()
 
 
+#: The single-request levers built on a dense-arena lever (``DENSE``).
+SINGLE_ON_DENSE = {"context_kv_fork_last_layer", "drafter_preamble_late_join"}
+
+
+def test_agg_tep8_mbs1_paged():
+    lever_table = table((107, 8), 1, "agg", "paged")
+    assert rule_levers_on(lever_table) == LL | (SINGLE - SINGLE_ON_DENSE) | VR_SINGLE
+    for name in DENSE:
+        assert lever_table.decisions[name].source == "structural", name
+    for name in SINGLE_ON_DENSE:
+        assert lever_table.decisions[name].source == "dependency", name
+    assert rule_levers_on(rs_table(arena="paged")) == (
+        LL | (SINGLE - SINGLE_ON_DENSE) | VR_SINGLE | SINGLE_TAIL | SINGLE_RS
+    )
+
+
 @pytest.mark.parametrize(
     "transform, expected",
     [(None, set()), (True, set()), (False, SINGLE_TAIL)],
@@ -885,7 +901,6 @@ def test_the_draft_head_tail_waits_for_a_drafter_without_a_logit_transform(trans
     [
         ((107, 8), 2, "agg", "dense"),
         ((107, 8), 1, "gen", "dense"),
-        ((107, 8), 1, "agg", "paged"),
         ((107, 8), 1, "agg", "windowed"),
         ((107, 4), 1, "agg", "windowed"),
     ],

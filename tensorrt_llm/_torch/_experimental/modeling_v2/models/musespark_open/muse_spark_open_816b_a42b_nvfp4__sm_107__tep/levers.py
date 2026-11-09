@@ -944,15 +944,22 @@ def _decode_qkv_excluded(d: Deployment, t: Resolving) -> Optional[str]:
     return None
 
 
-#: The deployment the single-request decode schedule of sm107 TEP8 was measured on.
+#: The deployments the single-request decode schedule of sm107 TEP8 was measured on. Over a
+#: paged arena the levers that write a dense one (``dispatch.DENSE_ARENA_LEVERS``) and the
+#: levers built on them stay out by their structural rule.
 _SINGLE_REQUEST = (
-    "aggregated sm107 tep8 servers of max_batch_size 1 over a dense drafter context arena"
+    "aggregated sm107 tep8 servers of max_batch_size 1 over a dense or paged drafter context arena"
 )
 
 
 def _single_request_tep8(d: Deployment) -> bool:
-    """Whether ``d`` is the deployment the single-request decode schedule was measured on."""
-    return d.tp == 8 and d.role is Role.AGG and d.max_batch_size == 1 and d.arena is Arena.DENSE
+    """Whether ``d`` is a deployment the single-request decode schedule was measured on."""
+    return (
+        d.tp == 8
+        and d.role is Role.AGG
+        and d.max_batch_size == 1
+        and d.arena in (Arena.DENSE, Arena.PAGED)
+    )
 
 
 def _on_single_request(what: str) -> RuleFn:
