@@ -16,12 +16,14 @@ per rank over a ``FakeDistGroup``.
 """
 
 import copy
+import datetime
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
+import torch
 from _torch.pyexecutor.llm_request_factory import make_llm_request
 from coordinator_harness import CoordinatorHarness, TransferRequest
 from fake_dist import FakeDistGroup
@@ -38,6 +40,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.bindings.executor import FinishReason, IterationStats, RequestStage
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
 pytestmark = pytest.mark.cpu_only
 
@@ -836,6 +839,8 @@ def _closing_executor(
     executor.dist = SimpleNamespace(rank=0, cp_size=cp_size)
     executor.canceled_req_ids = []
     executor.enable_iter_perf_stats = False
+    executor._is_kv_manager_v2 = False
+    executor.is_benchmark_disagg = False
     executor.iter_counter = 7
     executor.perf_manager = Mock()
     executor.sampler = SimpleNamespace(max_seq_len=max_seq_len)
@@ -1150,6 +1155,88 @@ def test_close_out_of_a_native_request_responds_and_releases_once(
     assert h.transceiver.call_log == ["commit_blocks_for_reuse:1"]
     executor.sampler.release_request.assert_called_once_with(request)
     executor.resource_manager.free_resources.assert_called_once_with(request)
+
+
+def _closed_out_response(request: LlmRequest):
+    """The single response a native ``request`` gets when its first token ends it."""
+    executor = _flushing_executor(CoordinatorHarness().coordinator, [request])
+    executor._close_out_gen_receives_at_first_token()
+    executor._flush_pending_transfer_responses()
+    (response,) = executor.responses[request.py_request_id]
+    return response
+
+
+def test_close_out_reports_when_the_request_was_scheduled() -> None:
+    """A scheduled request gets its first scheduled time at seq slot
+    assignment; a request finished at its first token gets one too, so serving
+    can compute its queue and inference times."""
+    request = _native_received_request(
+        1, max_tokens=1, output_config=trtllm.OutputConfig(return_perf_metrics=True)
+    )
+
+    response = _closed_out_response(request)
+
+    timing = response.result.get_result().request_perf_metrics.timing_metrics
+    assert timing.first_scheduled_time > datetime.timedelta(0)
+
+
+def test_close_out_returns_the_first_token_logits_without_a_forward() -> None:
+    """Non-streaming generation logits are moved to host storage after a
+    forward; with none following, the first token's logits prepended from the
+    context server still reach the client."""
+    first_gen_logits = torch.arange(8, dtype=torch.float32).reshape(1, 8)
+    request = _native_received_request(
+        1, max_tokens=1, output_config=trtllm.OutputConfig(return_generation_logits=True)
+    )
+    request.py_disaggregated_params = DisaggregatedParams(first_gen_logits=[first_gen_logits])
+
+    response = _closed_out_response(request)
+
+    assert torch.equal(response.result.generation_logits.reshape(-1), first_gen_logits.reshape(-1))
+
+
+def test_close_out_commits_kv_cache_stats_before_the_response() -> None:
+    """KV cache manager V2 commits a request's allocation stats from its
+    scheduled batch; a request finished at its first token is never scheduled,
+    so they are committed before its response, which reports them."""
+    h = CoordinatorHarness()
+    events = []
+    req = _ClosingRequest(1)
+    executor = _closing_executor(h.coordinator, [req])
+    executor._is_kv_manager_v2 = True
+    executor.kv_cache_manager = SimpleNamespace(
+        commit_scheduled_kv_cache_stats=lambda batch: events.append(
+            ("commit_stats", [request.py_request_id for request in batch.all_requests()])
+        )
+    )
+    create_response = executor._create_first_token_terminal_response
+
+    def create_and_record(request, batch_token_time):
+        events.append(("response", request.py_request_id))
+        return create_response(request, batch_token_time)
+
+    executor._create_first_token_terminal_response = create_and_record
+
+    executor._close_out_gen_receives_at_first_token()
+
+    assert events == [("commit_stats", [1]), ("response", 1)]
+
+
+def test_first_token_finishes_count_as_benchmark_fill_progress() -> None:
+    """In benchmark-disagg fill, a completed receive whose first token ends
+    the request leaves active_requests before the fill gate looks for
+    completed receives; it still counts as progress, once."""
+    h = CoordinatorHarness()
+    executor = _closing_executor(h.coordinator, [_ClosingRequest(1)])
+    executor.is_benchmark_disagg = True
+    executor._benchmark_first_token_finished_ids = set()
+    executor._benchmark_completed_gen_transfer_ids = set()
+
+    executor._close_out_gen_receives_at_first_token()
+
+    assert executor.active_requests == []
+    assert executor._benchmark_gen_transfer_made_progress() is True
+    assert executor._benchmark_gen_transfer_made_progress() is False
 
 
 def _stats_executor(coordinator: DisaggTransferCoordinator, active) -> PyExecutor:

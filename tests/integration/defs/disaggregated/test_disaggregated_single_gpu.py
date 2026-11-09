@@ -1076,6 +1076,24 @@ def test_disaggregated_logits(model, generation_overlap):
                 ("First streaming chunk should have generation_logits "
                  "(first_gen_logits from prefill), but got None")
 
+            # --- generation_only that its first token ends (max_tokens=1) ---
+            # No decode step runs, so the response carries exactly the
+            # transferred first token and its logits.
+            ctx_responses3 = send_requests_to_worker(ctx_requests, 0, intercomm)
+            dp3 = ctx_responses3[0][0].disaggregated_params
+            dp3.request_type = "generation_only"
+            single_sp = SamplingParams(max_tokens=1,
+                                       ignore_eos=True,
+                                       return_generation_logits=True)
+            single_responses = send_requests_to_worker(
+                [(prompt, single_sp, dp3)], 1, intercomm)
+            single_output = single_responses[0][0]
+            assert list(single_output.token_ids) == list(dp3.first_gen_tokens)
+            assert single_output.finish_reason == "length"
+            assert single_output.generation_logits is not None, \
+                "max_tokens=1 generation_only should return the first token's logits"
+            assert single_output.generation_logits.shape[0] == 1
+
         except Exception as e:
             print(f"Exception encountered: {e}", flush=True)
             raise e

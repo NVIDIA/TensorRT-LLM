@@ -271,6 +271,67 @@ def test_executor_loop_overlap_transcript(monkeypatch) -> None:
     assert calls == idle_pass + _SHUTDOWN_PASS
 
 
+def test_executor_loop_publishes_kv_events_after_the_flush_on_every_pass(monkeypatch) -> None:
+    """Publishing KV-cache events is an attention-DP allgather, so idle passes
+    enter it too; it follows the response flush, which terminates requests
+    finished without a batch, so their events go out in the same pass."""
+    calls = []
+    executor = _idle_executor(monkeypatch, calls)
+    executor.dist = Mock(tp_size=1, world_size=1)
+    executor.enable_kv_cache_events = True
+    executor._add_kv_cache_events = lambda: calls.append(("add_kv_cache_events",))
+
+    PyExecutor._executor_loop(executor)
+
+    idle_pass = _SCHEDULE_HEAD + [
+        ("handle_timeouts_synced",),
+        ("check_transfer_timeouts", "only_with_context_sends=True"),
+        ("flush_pending_transfer_responses",),
+        ("add_kv_cache_events",),
+        ("pace_idle",),
+    ]
+    assert calls == idle_pass + _SHUTDOWN_PASS
+
+
+@pytest.mark.parametrize("previous_batch", ["absent", "deferred"])
+def test_overlap_close_out_stats_wait_for_a_deferred_previous_batch(
+    monkeypatch, previous_batch: str
+) -> None:
+    """Under attention DP a rank defers its previous batch while a peer cannot
+    queue. Close-outs are then recorded by that batch's record: a record of
+    this iteration queued first would make the stats fanout drop the peers'
+    payloads for the deferred iteration."""
+    calls = []
+    executor = _idle_executor(monkeypatch, calls)
+    executor.enable_attention_dp = True
+    executor.dist = Mock(rank=0, tp_size=2, world_size=2)
+    executor.model_engine = SimpleNamespace(
+        attn_metadata=None, kv_cache_dtype_byte_size=None, is_spec_decode=False
+    )
+    executor.enable_kv_pool_rebalance = False
+    executor.speculation_gate = None
+    executor.use_spec_decode = False
+    executor._pause_recompute_paused_requests = Mock()
+    executor.enable_iter_perf_stats = True
+    iter_stats = object()
+    executor._init_iter_stats_if_sampled = Mock(return_value=iter_stats)
+    executor._flush_iter_stats_synced = Mock()
+    executor._process_close_out_iter_stats = lambda stats, _start_time: calls.append(
+        ("process_close_out_iter_stats", stats)
+    )
+    deferred = previous_batch == "deferred"
+    if deferred:
+        executor.previous_batch = SimpleNamespace(
+            scheduled_requests=ScheduledRequests(), sample_state=Mock()
+        )
+    executor._can_queue.return_value = (False, deferred)
+
+    PyExecutor._executor_loop_overlap(executor)
+
+    recorded = [call for call in calls if call[0] == "process_close_out_iter_stats"]
+    assert recorded == ([] if deferred else [("process_close_out_iter_stats", iter_stats)])
+
+
 @pytest.mark.parametrize(
     "states",
     [("absent", "processed"), ("processed", "deferred"), ("deferred", "absent")],

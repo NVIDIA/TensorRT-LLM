@@ -1676,6 +1676,9 @@ class PyExecutor:
         # that stays in TRANS_COMPLETE across gate checks resets the fill
         # watchdog only once.
         self._benchmark_completed_gen_transfer_ids: set[int] = set()
+        # Completed receives whose first token finished the request; they
+        # leave active_requests before the fill gate can see them.
+        self._benchmark_first_token_finished_ids: set[int] = set()
         # Slow-start admission cap for benchmark disagg fill (see
         # _pop_from_waiting_queue).  0 = uninitialised; first throttled iter
         # seeds it to tp_size and each subsequent iter doubles it.
@@ -6328,13 +6331,17 @@ class PyExecutor:
         Both transceiver runtimes leave a completed receive in
         DISAGG_GENERATION_TRANS_COMPLETE until the gate opens and the request
         is promoted to generation, so scanning request state here observes
-        every completion regardless of how the runtime reported it.
+        every completion regardless of how the runtime reported it. Receives
+        whose first token finished the request have left active_requests;
+        the first-token check records them instead.
         """
         completed_ids = {
             get_unique_rid(req)
             for req in self.active_requests
             if req.is_disagg_generation_transmission_complete
         }
+        completed_ids |= self._benchmark_first_token_finished_ids
+        self._benchmark_first_token_finished_ids.clear()
         new_completed_ids = (completed_ids -
                              self._benchmark_completed_gen_transfer_ids)
         self._benchmark_completed_gen_transfer_ids.update(new_completed_ids)
@@ -6968,8 +6975,6 @@ class PyExecutor:
                             attn_metadata,
                             kv_cache_dtype_byte_size,
                             skip_kv_cache_manager=self._is_kv_manager_v2)
-                        if self.enable_kv_cache_events:
-                            self._add_kv_cache_events()
                     else:
                         # Healthy attention-DP peers still enter the
                         # _handle_responses gather this rank just skipped, and
@@ -7001,6 +7006,13 @@ class PyExecutor:
                 # the same order. Keep it after all per-pass error handling
                 # so a response is not needlessly delayed to the next pass.
                 self._flush_pending_transfer_responses()
+
+                # KV-cache event flushing performs an attention-DP allgather,
+                # so every rank enters it on every pass. After the flush, so
+                # the events of requests it terminated (including those
+                # finished without a batch) are published this pass.
+                if self.enable_kv_cache_events:
+                    self._add_kv_cache_events()
 
                 if self.enable_iter_perf_stats and sample_state is not None:
                     iter_stats = self._take_pending_new_active_requests(
@@ -8147,7 +8159,11 @@ class PyExecutor:
                 # drained by the next loop-head exchange instead.
                 if not self._packed_sync_enabled:
                     self.disagg.handle_timeouts_synced()
-                if self.enable_iter_perf_stats and not can_queue:
+                # A previous batch deferred on this rank records them instead,
+                # in iteration order.
+                if (self.enable_iter_perf_stats and not can_queue
+                        and (self.previous_batch is None
+                             or should_process_previous_batch)):
                     self._process_close_out_iter_stats(iter_stats,
                                                        iter_start_time)
                 self._flush_iter_stats_synced()
@@ -10706,21 +10722,39 @@ class PyExecutor:
         for req, reason in closing:
             if not self.disagg.try_finish_gen_receive(req):
                 continue
+            if req.return_perf_metrics:
+                # Set at seq slot assignment on the scheduled path.
+                req.set_first_scheduled_time()
             req.decoding_iter = 1
             req.py_decoding_iter = 1
             req.py_draft_tokens = []
             _import_first_gen_tokens(req, 1)
-            self._maybe_prepend_logprobs_and_logits(req, 1)
+            # No forward follows to move the prepended logits to host
+            # storage, so prepend them on the host and flush them now.
+            self._maybe_prepend_logprobs_and_logits(
+                req, 1, logits_device=torch.device("cpu"))
+            if (req.py_return_generation_logits
+                    and req.py_use_chunked_generation_logits):
+                req.py_result.transfer_remaining_device_logits()
             req.finish_by(reason, 0)
+            finished.append(req)
+        if not finished:
+            return
+        # A scheduled request's KV stats are committed from its batch.
+        closed_batch = ScheduledRequests()
+        closed_batch.generation_requests = finished
+        self._commit_kv_cache_stats(closed_batch)
+        for req in finished:
             response = self._create_first_token_terminal_response(
                 req, batch_token_time)
             if response is not None:
                 self._pending_transfer_responses.append(
                     (req.py_request_id, response))
             self._pending_response_terminations.append(req)
-            finished.append(req)
-        if not finished:
-            return
+        if self.is_benchmark_disagg:
+            # The fill gate counts completed receives as progress.
+            self._benchmark_first_token_finished_ids.update(
+                get_unique_rid(req) for req in finished)
         finished_ids = {id(req) for req in finished}
         self.active_requests[:] = [
             req for req in self.active_requests if id(req) not in finished_ids
@@ -10962,9 +10996,16 @@ class PyExecutor:
         adopts the context-side prompt/cached token accounting."""
         attach_ctx_usage(request, response)
 
-    def _maybe_prepend_logprobs_and_logits(self, req, beam_width):
+    def _maybe_prepend_logprobs_and_logits(
+            self,
+            req,
+            beam_width,
+            logits_device: Optional[torch.device] = None) -> None:
         """Prepend logprobs and generation logits for first_gen_tokens
-        if transferred from prefill."""
+        if transferred from prefill.
+
+        The logits go to ``logits_device``, this rank's GPU by default.
+        """
         disagg_params = getattr(req, 'py_disaggregated_params', None)
         if disagg_params is None:
             return
@@ -10983,7 +11024,7 @@ class PyExecutor:
                     "request %s: beam_width=%s is not supported.",
                     req.py_request_id, beam_width)
             else:
-                device = torch.device('cuda', self.device_id)
+                device = logits_device or torch.device('cuda', self.device_id)
                 for logits_tensor in disagg_params.first_gen_logits:
                     req.py_result.append_generation_logits(
                         logits_tensor.to(device))
