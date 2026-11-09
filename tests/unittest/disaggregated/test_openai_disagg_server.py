@@ -406,6 +406,8 @@ class _Workers:
         self.generation_cancelled = asyncio.Event()
         # Set once the generation worker's stream has ended, however it ended.
         self.generation_closed = asyncio.Event()
+        # The disaggregated request id of each context request answered.
+        self.context_request_ids = []
 
     async def send_context_request(self, request, server=None, hooks=None, req_id=None):
         try:
@@ -415,6 +417,7 @@ class _Workers:
             raise
         self.context_done.set()
         disagg_request_id = request.disaggregated_params.disagg_request_id
+        self.context_request_ids.append(disagg_request_id)
         return ChatCompletionResponse(
             model=_MODEL,
             usage=UsageInfo(prompt_tokens=3, completion_tokens=1),
@@ -464,6 +467,36 @@ class _WorkersStillGenerating(_Workers):
     async def generation_stream(self):
         yield _generation_frames()[0]
         await asyncio.Event().wait()
+
+
+class _WorkersRetryingContext(_Workers):
+    """Workers whose first context attempt lasts ``first_attempt`` and is then retried.
+
+    As the HTTP client does, the retry goes out under a new disaggregated request
+    id, which it records in the request hooks; the retry is answered at once.
+    """
+
+    _RETRY_ID = 9_000_000_000_000_017
+
+    def __init__(self, first_attempt):
+        async def no_wait():
+            pass
+
+        super().__init__(no_wait)
+        self.first_attempt = first_attempt
+        self.first_attempt_ids = []
+
+    async def send_context_request(self, request, server=None, hooks=None, req_id=None):
+        params = request.disaggregated_params
+        self.first_attempt_ids.append(params.disagg_request_id)
+        try:
+            await self.first_attempt()
+        except asyncio.CancelledError:
+            self.context_cancelled.set()
+            raise
+        params.disagg_request_id = self._RETRY_ID
+        hooks.on_disagg_request_id(self._RETRY_ID)
+        return await super().send_context_request(request, server, hooks, req_id)
 
 
 def _messages_server(schedule_style: str, workers: _Workers) -> OpenAIDisaggServer:
@@ -637,6 +670,46 @@ async def test_messages_stream_after_a_fast_context_phase_is_the_reframed_genera
     assert _status(sent) == 200
     assert "event: ping" not in _body(sent)
     assert without_message_id(_body(sent)) == without_message_id(expected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+@pytest.mark.parametrize("starts_early", [True, False], ids=["early_start", "fast_context"])
+@pytest.mark.parametrize("context_retried", [False, True], ids=["once", "ctx_retried"])
+async def test_messages_stream_is_named_after_the_disagg_request(
+    monkeypatch, schedule_style, starts_early, context_retried
+):
+    """message_start carries the disaggregated request id the context phase ended with.
+
+    A retried context request gets a new id. With an early start, the retry
+    comes after the stream has started and pinged, so the message is named only
+    when it starts.
+    """
+    pinged = asyncio.Event()
+    if starts_early:
+        _short_waits(monkeypatch)
+        context_phase = _waits_for(pinged)
+    else:
+
+        async def context_phase():
+            pass
+
+    workers = (_WorkersRetryingContext if context_retried else _Workers)(context_phase)
+
+    def on_send(message):
+        if message.get("body", b"").startswith(b"event: ping\n"):
+            pinged.set()
+
+    sent = await _post_messages(_messages_app(schedule_style, workers), on_send=on_send)
+
+    assert _status(sent) == 200
+    events = _sse_events(sent)
+    assert (events[0][0] == "ping") == starts_early
+    message_id = next(data["message"]["id"] for event, data in events if event == "message_start")
+    (disagg_request_id,) = workers.context_request_ids
+    if context_retried:
+        assert workers.first_attempt_ids != [disagg_request_id]
+    assert re.fullmatch(rf"msg_{disagg_request_id}_[0-9a-f]{{16}}", message_id)
 
 
 @pytest.mark.asyncio

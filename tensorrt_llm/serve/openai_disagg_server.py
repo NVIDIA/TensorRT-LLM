@@ -15,6 +15,7 @@
 
 # yapf: disable
 import asyncio
+import functools
 import json
 import os
 import signal
@@ -226,6 +227,17 @@ def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
     # Not a body this server recognises. Report the status only: anything else
     # in `raw` may still carry the upstream URL.
     return f"context worker rejected the request with status {error.status}"
+
+
+def _disagg_request_id(raw_request: Request) -> Optional[int]:
+    """The disaggregated request id the request hooks recorded, None before any.
+
+    An Anthropic reply is named after it rather than after a worker's own id for
+    the request (see anthropic_message_id). The pipeline records it before it
+    dispatches the context request and again when a retried context request
+    gets a new one, so it is final once the pipeline has answered.
+    """
+    return getattr(raw_request.state, "disagg_request_id", None)
 
 
 class _MessagesStreamingResponse(ClosingStreamingResponse):
@@ -515,6 +527,10 @@ class OpenAIDisaggServer:
 
         chat = self._wrap_entry_point(self._service.openai_chat_completion)(
             chat_request, raw_request)
+        # A stream's message is named when message_start goes out, at the
+        # first chunk of the pipeline's stream: the pipeline has answered by
+        # then, so the id is final even for a stream started before it was.
+        stream_request_id = functools.partial(_disagg_request_id, raw_request)
         if request.stream:
             chat = asyncio.ensure_future(chat)
             try:
@@ -530,19 +546,16 @@ class OpenAIDisaggServer:
                     chat=chat,
                     content=reframe_openai_stream(
                         self._openai_stream_when_done(chat, raw_request),
-                        model=request.model),
+                        model=request.model,
+                        request_id=stream_request_id),
                 )
 
         answer = await self._messages_answer(chat, raw_request)
         if isinstance(answer, StreamingResponse):
-            # The reply is named after the disaggregated request rather than
-            # the worker's own id for it (see anthropic_message_id).
             return StreamingResponse(
-                content=reframe_openai_stream(
-                    answer.body_iterator,
-                    model=request.model,
-                    request_id=getattr(raw_request.state, "disagg_request_id",
-                                       None)),
+                content=reframe_openai_stream(answer.body_iterator,
+                                              model=request.model,
+                                              request_id=stream_request_id),
                 media_type="text/event-stream",
             )
         return answer
@@ -580,12 +593,8 @@ class OpenAIDisaggServer:
         try:
             chat_response = ChatCompletionResponse(
                 **json.loads(openai_response.body))
-            # The reply is named after the disaggregated request rather than
-            # the worker's own id for it (see anthropic_message_id).
             anthropic_response = convert_chat_response(
-                chat_response,
-                request_id=getattr(raw_request.state, "disagg_request_id",
-                                   None))
+                chat_response, request_id=_disagg_request_id(raw_request))
         except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
             logger.error(
                 "Invalid response from OpenAI chat pipeline:\n"
