@@ -1,17 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+
 from .._torch.async_llm import AsyncLLM
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from ..executor import CompletionOutput, LoRARequest, RequestError
+from ..kv_hints import KvHintAction, KvHintsEnvelope, KvHintsInput
 from ..sampling_params import GuidedDecodingParams, SamplingParams
 from ..scheduling_params import SchedulingParams
 from .llm import LLM, RequestOutput
 # yapf: disable
 from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BlockReuseConfig,
                        CacheTransceiverConfig, CalibConfig,
-                       CapacitySchedulerPolicy,
+                       CapacitySchedulerPolicy, CheckpointIOPolicy,
                        ColdPageQuantizationCompressionConfig,
                        ContextChunkingPolicy, CudaGraphConfig,
                        DecodeCudaGraphConfig, DeepSeekSparseAttentionConfig,
@@ -49,6 +52,9 @@ __all__ = [
     'RequestOutput',
     'GuidedDecodingParams',
     'SamplingParams',
+    'KvHintAction',
+    'KvHintsEnvelope',
+    'KvHintsInput',
     'DisaggregatedParams',
     'ConversationParams',
     'DisaggScheduleStyle',
@@ -67,6 +73,8 @@ __all__ = [
     'MTPDecodingConfig',
     'SchedulerConfig',
     'CapacitySchedulerPolicy',
+    'CheckpointIOPolicy',
+    'CheckpointFormat',
     'QuantConfig',
     'QuantAlgo',
     'CalibConfig',

@@ -31,8 +31,10 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
+from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
 
@@ -571,8 +573,7 @@ class BaseLLM:
             if getattr(self, "_encoder_executor", None) is not None:
                 try:
                     runtime_pretrained_config = (
-                        self._encoder_executor.model_engine.model.model_config.
-                        pretrained_config)
+                        self._encoder_executor.pretrained_config)
                     if runtime_pretrained_config is not None:
                         pretrained_config = runtime_pretrained_config
                 except AttributeError:
@@ -722,6 +723,8 @@ class BaseLLM:
                                             List[ConversationParams]]] = None,
         cache_salt: Optional[Union[str, Sequence[str]]] = None,
         priority: Union[float, List[float]] = DEFAULT_REQUEST_PRIORITY,
+        kv_hints: Optional[Union[KvHintsInput,
+                                 List[Optional[KvHintsInput]]]] = None,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -746,6 +749,7 @@ class BaseLLM:
                 Conversation parameters. Defaults to None.
             cache_salt (str, Sequence[str], optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
             priority (float, List[float]): The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
+            kv_hints (tensorrt_llm.kv_hints.protocol.KvHintsInput, List[Optional[tensorrt_llm.kv_hints.protocol.KvHintsInput]], optional): Prototype typed or raw JSON KV hint metadata. A scalar repeats the same envelope and message_id for every prompt; an aligned list supplies per-prompt hints. Unknown versions, oversized envelopes and malformed hints are ignored at admission. Transporting hints does not execute actions. Defaults to None.
 
         Returns:
             Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]: The output data of the completion request to the LLM.
@@ -762,6 +766,11 @@ class BaseLLM:
             request_inputs_list = [None]
         else:
             request_inputs_list = [prompt_inputs(i) for i in inputs]
+
+        if isinstance(kv_hints,
+                      list) and len(kv_hints) != len(request_inputs_list):
+            raise ValueError(
+                "kv_hints list length must match the number of prompts")
 
         if isinstance(priority, list):
             if len(priority) != len(request_inputs_list):
@@ -791,6 +800,7 @@ class BaseLLM:
                 conversation_params=self._item_at(conversation_params, i),
                 cache_salt=self._item_at(cache_salt, i),
                 priority=self._item_at(priority, i),
+                kv_hints=self._item_at(kv_hints, i),
                 streaming=False,
             )
             futures.append(future)
@@ -822,6 +832,7 @@ class BaseLLM:
         conversation_params: Optional[ConversationParams] = None,
         cache_salt: Optional[str] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        kv_hints: Optional[KvHintsInput] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -840,6 +851,7 @@ class BaseLLM:
             conversation_params (tensorrt_llm.conversation_params.ConversationParams, optional): Conversation parameters. Defaults to None.
             cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
             priority (float): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
+            kv_hints (tensorrt_llm.kv_hints.protocol.KvHintsInput, optional): Prototype typed or raw JSON KV hint metadata from a trusted caller. Unknown versions, oversized envelopes and malformed hints are ignored at admission. Payloads are transported without executing actions or selecting a source. Defaults to None.
 
         Returns:
             tensorrt_llm.llmapi.llm.RequestOutput: The output data of the completion request to the LLM.
@@ -912,6 +924,7 @@ class BaseLLM:
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
             priority=priority,
+            kv_hints=kv_hints,
         )
 
         if sampling_params.return_perf_metrics:
@@ -1229,10 +1242,10 @@ class BaseLLM:
         if unbatched:
             inputs = [inputs]
 
-        engine = self._encoder_executor.model_engine
-        max_seq_len = engine.max_seq_len
-        max_num_tokens = engine.max_num_tokens
-        max_batch_size = engine.batch_size
+        executor = self._encoder_executor
+        max_seq_len = executor.max_seq_len
+        max_num_tokens = executor.max_num_tokens
+        max_batch_size = executor.max_batch_size
 
         if len(inputs) > max_batch_size:
             raise ValueError(
@@ -2065,8 +2078,8 @@ class _TorchLLM(BaseLLM):
         # "consumes packed tokens" wording would only confuse there.
         if (config is None or not self._is_encoder_decoder_model()
                 or self.args.model_kwargs is not None
-                or self.args.checkpoint_loader is not None
-                or self.args.checkpoint_format not in (None, "HF")):
+                or self.args.checkpoint_loader is not None or
+                self.args.checkpoint_format not in (None, CheckpointFormat.HF)):
             return
         bucket_config_error = validate_token_encoder_bucket_config(
             config.num_tokens, config.seq_lens)
@@ -2106,6 +2119,8 @@ class _TorchLLM(BaseLLM):
         video_pruning_rate = self.args.multimodal_config.video_pruning_rate
         if video_pruning_rate is not None:
             input_processor_kwargs['video_pruning_rate'] = video_pruning_rate
+        if self.args.multimodal_config.vision_gpu_normalize:
+            input_processor_kwargs['vision_gpu_normalize'] = True
         self.input_processor = create_input_processor(
             self._hf_model_dir,
             self.tokenizer,
@@ -2133,7 +2148,7 @@ class _TorchLLM(BaseLLM):
             return  # Skip _executor creation
 
         # Hint: if this looks like an encoder model, suggest encode()
-        if self.args.encode_only is None and not self.args.mm_encoder_only:
+        if not self.args.encode_only and not self.args.mm_encoder_only:
             from tensorrt_llm._torch.model_config import ModelConfig
             architectures = getattr(self._hf_model_config, 'architectures',
                                     None) if self._hf_model_config else None

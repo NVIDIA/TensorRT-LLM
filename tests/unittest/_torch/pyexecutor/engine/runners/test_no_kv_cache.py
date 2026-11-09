@@ -23,7 +23,6 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import (
     NoKVCacheRunner,
     NoKVCacheRunnerConfig,
 )
-from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm.inputs.multimodal import MultimodalParams
@@ -97,7 +96,7 @@ def _prepare(
         position_ids_cuda=position_ids_cuda,
     )
     with patch.object(InputBuffers, "allocate", return_value=buffers):
-        runner = PoolingRunner(
+        runner = MultimodalEncoderRunner(
             model or SimpleNamespace(),
             NoKVCacheRunnerConfig(
                 max_batch_size=4,
@@ -114,7 +113,6 @@ def _prepare(
             mapping=SimpleNamespace(has_cp_helix=lambda: False),
             dist=dist,
             moe_load_balancer=None,
-            model_caller=Mock(),
             attention_runtime_features=AttentionRuntimeFeatures(),
         )
     monkeypatch.setattr(
@@ -241,7 +239,7 @@ def test_no_kv_cache_runner_prepare_inputs_gathers_attention_dp_token_counts(
 
 
 def test_no_kv_cache_runner_rejects_kv_manager_before_preparation() -> None:
-    runner = _make_runner(PoolingRunner, _model(is_generation=False))
+    runner = _make_runner(MultimodalEncoderRunner, _model(is_generation=False))
     runner._prepare_inputs = Mock()
     resource_manager = Mock()
     resource_manager.get_resource_manager.return_value = object()
@@ -265,16 +263,13 @@ def test_no_kv_cache_runner_exposes_only_forward_step_as_abstract() -> None:
     assert NoKVCacheRunner.__abstractmethods__ == frozenset({"_forward_step"})
 
 
-@pytest.mark.parametrize("runner_type", [PoolingRunner, MultimodalEncoderRunner])
-def test_concrete_runners_implement_no_kv_cache_forward_step(
-    runner_type: type[NoKVCacheRunner],
-) -> None:
-    assert issubclass(runner_type, NoKVCacheRunner)
-    assert runner_type._forward_step is not NoKVCacheRunner._forward_step
+def test_mm_encoder_runner_implements_no_kv_cache_forward_step() -> None:
+    assert issubclass(MultimodalEncoderRunner, NoKVCacheRunner)
+    assert MultimodalEncoderRunner._forward_step is not NoKVCacheRunner._forward_step
 
 
 def test_no_kv_cache_runner_owns_and_reuses_attention_metadata() -> None:
-    runner = _make_runner(PoolingRunner, _model(is_generation=False))
+    runner = _make_runner(MultimodalEncoderRunner, _model(is_generation=False))
 
     first = runner._setup_attn_metadata()
     second = runner._setup_attn_metadata()
@@ -288,11 +283,8 @@ def test_no_kv_cache_runner_owns_and_reuses_attention_metadata() -> None:
     assert first.kv_block_ids_per_seq is None
 
 
-@pytest.mark.parametrize("runner_type", [PoolingRunner, MultimodalEncoderRunner])
-def test_no_kv_cache_runner_default_lifecycle_with_no_kv_resources(
-    runner_type: type[PoolingRunner] | type[MultimodalEncoderRunner],
-) -> None:
-    runner = _make_runner(runner_type, _model(is_generation=False))
+def test_no_kv_cache_runner_default_lifecycle_with_no_kv_resources() -> None:
+    runner = _make_runner(MultimodalEncoderRunner, _model(is_generation=False))
     resource_manager = SimpleNamespace(get_resource_manager=Mock(return_value=None))
 
     assert runner.warmup(resource_manager) is None
@@ -303,13 +295,14 @@ def test_no_kv_cache_runner_default_lifecycle_with_no_kv_resources(
 def test_no_kv_forward_enters_model_context() -> None:
     model = _model(is_generation=False)
 
-    def model_forward(**kwargs: object) -> dict[str, object]:
+    def forward_step(*args: object, **kwargs: object) -> dict[str, object]:
         assert torch.is_inference_mode_enabled()
         assert get_model_extra_attrs() is model.extra_attrs
         return {"hidden_states": object()}
 
-    caller = Mock(side_effect=model_forward)
-    runner = _make_runner(PoolingRunner, model, model_caller=caller)
+    caller = Mock(side_effect=forward_step)
+    runner = _make_runner(MultimodalEncoderRunner, model)
+    runner._forward_step = caller
     runner._prepare_inputs = Mock(return_value=PreparedInputs({}))
     resources = SimpleNamespace(get_resource_manager=Mock(return_value=None))
 
@@ -321,8 +314,8 @@ def test_no_kv_forward_enters_model_context() -> None:
 
 def test_no_kv_forward_preserves_model_output_dictionary_without_length_update() -> None:
     outputs = {"hidden_states": object()}
-    caller = Mock(return_value=outputs)
-    runner = _make_runner(PoolingRunner, _model(is_generation=False), model_caller=caller)
+    runner = _make_runner(MultimodalEncoderRunner, _model(is_generation=False))
+    runner._forward_step = Mock(return_value=outputs)
     runner._prepare_inputs = Mock(return_value=PreparedInputs({}))
     inputs = ScheduledInputs(batch=ScheduledRequests(), runtime_draft_len=3)
     resources = SimpleNamespace(get_resource_manager=Mock(return_value=None))
