@@ -8839,6 +8839,32 @@ class PyExecutor:
                 return context_requests[:i]
         return context_requests
 
+    def _fit_encoder_requests_to_encoder_step(
+            self, encoder_requests: list[LlmRequest]) -> list[LlmRequest]:
+        """Trim encoder requests to what one encoder step can run.
+
+        The schedulers pack encoder requests against max_num_tokens and
+        max_batch_size, while the encoder step runs at most
+        encoder_max_num_tokens tokens of at most encoder_max_batch_size
+        requests (each falls back to the decoder-side value when unset). Keep
+        the longest prefix within both limits. Deferred requests stay in
+        ENCODER_INIT and are scheduled again next iteration. Admission rejects
+        an encoder input longer than encoder_max_num_tokens, so the first
+        request always fits.
+        """
+        max_requests = self.model_engine.encoder_batch_size
+        max_tokens = self.model_engine.encoder_max_num_tokens
+        num_tokens = 0
+        for i, request in enumerate(encoder_requests):
+            num_tokens += request.encoder_output_len
+            if i == max_requests or num_tokens > max_tokens:
+                logger.debug(
+                    f"Deferring {len(encoder_requests) - i} encoder "
+                    f"request(s): one encoder step runs at most "
+                    f"{max_requests} requests and {max_tokens} tokens.")
+                return encoder_requests[:i]
+        return encoder_requests
+
     @nvtx_range("_schedule")
     def _schedule(self):
         self._maybe_record_hang_diagnostic_phase("scheduling",
@@ -8859,6 +8885,8 @@ class PyExecutor:
                 scheduler_output.encoder_requests,
                 scheduler_output.context_requests,
                 scheduler_output.generation_requests)
+        scheduled_encoder_requests = self._fit_encoder_requests_to_encoder_step(
+            scheduled_encoder_requests)
 
         scheduled_context_requests = scheduler_output.context_requests
         if self.enable_attention_dp and self.attention_dp_enable_balance:

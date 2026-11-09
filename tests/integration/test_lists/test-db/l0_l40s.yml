@@ -63,6 +63,9 @@ l0_l40s:
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_transcribe_end_to_end
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_block_reuse_requested
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v2-encoder-graphs-on-greedy]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_concurrent_requests_encoder_step_limits[token-limit]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_concurrent_requests_encoder_step_limits[request-limit]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_concurrent_requests_encoder_step_limits[within-limits]
 - condition:
     ranges:
       system_gpu_count:

@@ -242,6 +242,94 @@ def test_whisper_pytorch_transcribe_end_to_end(monkeypatch):
         assert generated[: len(expected)] == expected
 
 
+_CONCURRENT_REQUESTS = 8
+
+
+@pytest.mark.parametrize(
+    "encoder_limits,requests_per_encoder_step",
+    [
+        # One request's encoder output fills encoder_max_num_tokens.
+        pytest.param({"encoder_max_num_tokens": _ENCODER_OUTPUT_LEN}, 1, id="token-limit"),
+        pytest.param({"encoder_max_batch_size": 2}, 2, id="request-limit"),
+        # All requests' encoder outputs fit both limits together.
+        pytest.param(
+            {
+                "encoder_max_num_tokens": _CONCURRENT_REQUESTS * _ENCODER_OUTPUT_LEN,
+                "encoder_max_batch_size": _CONCURRENT_REQUESTS,
+            },
+            None,
+            id="within-limits",
+        ),
+    ],
+)
+def test_whisper_pytorch_concurrent_requests_encoder_step_limits(
+    monkeypatch: pytest.MonkeyPatch,
+    encoder_limits: dict,
+    requests_per_encoder_step: int | None,
+) -> None:
+    """Concurrent requests are encoded within encoder_max_num_tokens and encoder_max_batch_size.
+
+    max_num_tokens and max_batch_size let the scheduler admit every request's
+    encoder work in one iteration. Each encoder step must stay within the
+    encoder limits, requests within the limits share a step, and every request
+    must transcribe exactly.
+    """
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+
+    model_path = _get_whisper_model_path()
+    wave, sample_rate = soundfile.read(_get_audio_path())
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=_MAX_NEW_TOKENS)
+
+    with LLM(
+        model_path,
+        attn_backend="TRTLLM",
+        cuda_graph_config=None,
+        disable_overlap_scheduler=True,
+        enable_chunked_prefill=False,
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
+            cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
+        ),
+        max_batch_size=_CONCURRENT_REQUESTS,
+        max_input_len=_ENCODER_OUTPUT_LEN,
+        max_num_tokens=_CONCURRENT_REQUESTS * _ENCODER_OUTPUT_LEN,
+        **encoder_limits,
+    ) as llm:
+        executor = llm._executor.engine
+        schedule_request = executor.scheduler.schedule_request
+        forward_encoder = executor.model_engine.forward_encoder
+        scheduled_encoder_batch_sizes = []
+        encoder_step_batch_sizes = []
+
+        def recording_schedule_request(*args, **kwargs):
+            scheduler_output = schedule_request(*args, **kwargs)
+            scheduled_encoder_batch_sizes.append(len(scheduler_output.encoder_requests))
+            return scheduler_output
+
+        def recording_forward_encoder(encoder_requests, *args, **kwargs):
+            encoder_step_batch_sizes.append(len(encoder_requests))
+            return forward_encoder(encoder_requests, *args, **kwargs)
+
+        executor.scheduler.schedule_request = recording_schedule_request
+        executor.model_engine.forward_encoder = recording_forward_encoder
+        # Preprocess first so that the requests reach the executor together.
+        prompts = [
+            llm.preprocess(_audio_prompt(wave, sample_rate), sampling_params)
+            for _ in range(_CONCURRENT_REQUESTS)
+        ]
+        futures = [llm.generate_async(prompt, sampling_params) for prompt in prompts]
+        for future in futures:
+            assert list(future.result().outputs[0].token_ids) == _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS
+
+    if requests_per_encoder_step is None:
+        assert max(encoder_step_batch_sizes) > 1
+    else:
+        # The scheduler offered more encoder work than one encoder step holds.
+        assert max(scheduled_encoder_batch_sizes) > requests_per_encoder_step
+        assert max(encoder_step_batch_sizes) <= requests_per_encoder_step
+
+
 # The bf16 graphs-on cases capture decode graphs over
 # batch_size * beam_width sequences.
 _BEAM_SEARCH_CASES = [
