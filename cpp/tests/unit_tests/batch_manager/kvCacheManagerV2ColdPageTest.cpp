@@ -1126,7 +1126,7 @@ TEST(KvCacheManagerV2ColdPageTest, MaxQuotaBelowTheStructuralMinimumIsRejected)
         config.cacheTiers[1] = HostCacheTierConfig{kOneUnit, maxQuota};
         return config;
     };
-    // Cold pool groups are keyed by (poolReusePolicy, cold page bytes), so the split
+    // Cold pool groups are keyed by (effectivePoolReusePolicy, cold page bytes), so the split
     // comes from the codec reporting different page sizes, not from the config
     // alone. Without it both lifecycles share one group and one unit suffices.
     auto build = [&makeConfig](std::optional<size_t> maxQuota) {
