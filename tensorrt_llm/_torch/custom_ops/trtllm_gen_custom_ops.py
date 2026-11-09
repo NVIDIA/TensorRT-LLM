@@ -361,18 +361,16 @@ def prepare_dummy_topk_and_hook(
         assert topk_weights_for_tuner is None
         assert topk_ids_for_tuner is None
 
-    # Define hook to recreate dummy tensors when shape changes during profiling
+    # Define hook to recreate dummy tensors for every profiled bucket
     def recreate_dummy_topk_if_needed(
             inputs: List[torch.Tensor]) -> List[torch.Tensor]:
-        """Recreate dummy topk tensors if token count changed during profiling."""
+        """Give every profiled bucket its own dummy routing: the AutoTuner fills a
+        bucket's int top-k by repeating the tuned call's rows."""
         current_num_tokens = inputs[hidden_states_index].shape[0]
 
         # Only recreate if we originally created dummies
         if need_dummy_topk:
-            # Check if shape changed
-            if inputs[-1] is not None and inputs[-1].shape[
-                    0] != current_num_tokens:
-                # Recreate with new shape
+            if inputs[-1] is not None:
                 topk_weights_for_tuner, topk_ids_for_tuner = make_selected_dummy_topk(
                     current_num_tokens, inputs[hidden_states_index].device,
                     None)

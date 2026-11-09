@@ -1709,6 +1709,42 @@ def test_trtllm_gen_moe_dummy_topk_local_experts_less_than_topk(
         assert all(0 <= x < num_experts for x in row), row
 
 
+def test_trtllm_gen_moe_dummy_topk_is_redrawn_at_every_bucket():
+    """Buckets larger than the tuned call get their own dummy routing, not the
+    tuned call's rows repeated."""
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import (
+        FP8BlockScaleMoERunner, prepare_dummy_topk_and_hook)
+
+    num_tokens, top_k, hidden, num_experts = 8, 10, 256, 512
+    hidden_states = torch.zeros(num_tokens, hidden, device="cuda")
+    topk_ids = torch.randn(num_tokens, num_experts,
+                           device="cuda").topk(top_k).indices.to(torch.int32)
+    topk_weights = torch.ones(num_tokens, top_k, device="cuda")
+    tuner = AutoTuner.get()
+    with autotune():
+        logits, weights, ids, config = prepare_dummy_topk_and_hook(
+            topk_weights, topk_ids, hidden_states, None, 1,
+            FP8BlockScaleMoERunner.get_tuning_config(1), top_k, num_experts,
+            num_experts, None, None, None)
+    # FP8 block-scale runner input layout; the expert weights keep their shape.
+    scale = torch.ones(hidden // 128, num_tokens, device="cuda")
+    weights_stack = [torch.zeros(1, device="cuda")] * 4
+    inputs = [logits, None, hidden_states, scale, *weights_stack, weights, ids]
+    larger = 0
+    for profile in tuner._optimization_profiles(config, inputs):
+        tensors = config.inputs_pre_hook(
+            tuner._prepare_input_tensors(profile, inputs))
+        rows = tensors[2].shape[0]
+        assert tensors[-1].shape == tensors[-2].shape == (rows, top_k)
+        if rows > num_tokens:
+            larger += 1
+            distinct = len({tuple(r) for r in tensors[-1].tolist()})
+            assert distinct > num_tokens, (
+                f"{rows}-row bucket profiled with {distinct} distinct routing "
+                f"rows (the tuned call had {num_tokens})")
+    assert larger
+
+
 def test_fp4_moe_tunes_on_dummy_topk_and_runs_on_runtime_topk(monkeypatch):
     """With precomputed top-k (attention DP), the tuner gets the local-shard dummy top-k and the
     kernel the runtime top-k: restoring the runtime tensors must not reach the tuner's inputs."""
