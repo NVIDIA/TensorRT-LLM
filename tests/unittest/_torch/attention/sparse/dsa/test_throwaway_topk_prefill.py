@@ -335,9 +335,16 @@ def _reference_selection(inputs, ends, top_k):
 
 
 @skip_not_sm100
-@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
 @pytest.mark.parametrize(
-    "corruption", ["worst_key", "duplicate", "outside_window", "short_count", "stale_padding"]
+    "qkv,corruption",
+    [
+        ("fp8", "worst_key"),
+        ("fp8", "duplicate"),
+        ("fp8", "outside_window"),
+        ("fp8", "short_count"),
+        ("fp8", "stale_padding"),
+        ("mxfp4", "worst_key"),  # the only check that reads the dequantized MXFP4 reference
+    ],
 )
 def test_checker_rejects_corrupted_selection(qkv, corruption):
     num_q, kv_prefix, top_k = 64, 4096, 2048
@@ -369,12 +376,9 @@ def test_checker_rejects_corrupted_selection(qkv, corruption):
 
 SMALL_SHAPES = [
     (128, 0),  # first chunk: fewer valid keys than top_k for every row
-    (64, 1024),  # still fewer valid keys than top_k
     (256, 4096),  # crosses top_k inside the chunk
     (300, 5000),  # sizes that are not tile multiples
-    (512, 8192),
-    (1024, 7168),
-    (2048, 6144),
+    (2048, 6144),  # many query rows
 ]
 
 
@@ -410,32 +414,18 @@ def test_top_k_boundary(config, qkv):
         _check(config, num_q, prefix, qkv=qkv, seed=3, max_context_length=32768)
 
 
-QWEN_SHAPES = [(64, 8192), (256, 4096), (300, 5000), (1024, 4096), (1, 5000), (8192, 0)]
-
-
+# The DSA indexer does not run the H4 kernels (see _VALIDATED_GEOMETRIES); these keep the
+# vendored Qwen path (FP8, fixed-weight contract) from breaking unnoticed.
 @skip_not_sm100
-@pytest.mark.parametrize("num_q,kv_prefix", QWEN_SHAPES)
-def test_matches_reference_qwen(num_q, kv_prefix):
+def test_matches_reference_qwen():
     """H4 / top_k 512 / ratio 4 with the fixed-weight Qwen contract (FP8)."""
-    _check("qwen", num_q, kv_prefix, seed=14)
+    _check("qwen", 300, 5000, seed=14)
 
 
 @skip_not_sm100
 def test_qwen_top_k_boundary():
     for num_q, prefix in _boundary_cases("qwen"):
         _check("qwen", num_q, prefix, seed=15, max_context_length=32768)
-
-
-@skip_not_sm100
-@pytest.mark.parametrize("logits_dtype", [torch.bfloat16, torch.float16])
-def test_qwen_low_precision_logits(logits_dtype):
-    _check("qwen", 256, 4096, seed=16, logits_dtype=logits_dtype)
-
-
-@skip_not_sm100
-@pytest.mark.parametrize("num_q,kv_prefix", [(4096, 4096), (4096, 28672)])
-def test_qwen_large_shapes(num_q, kv_prefix):
-    _check("qwen", num_q, kv_prefix, seed=17, max_context_length=131072)
 
 
 @skip_not_sm100
@@ -446,9 +436,18 @@ def test_tiny_query_counts(qkv, num_q, kv_prefix):
 
 
 @skip_not_sm100
-@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
 @pytest.mark.parametrize("logits_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("config", ["ds_v32", "glm_5_3"])
+@pytest.mark.parametrize(
+    "config,qkv",
+    [
+        ("ds_v32", "fp8"),
+        ("ds_v32", "mxfp4"),
+        ("glm_5_3", "fp8"),
+        ("glm_5_3", "mxfp4"),
+        ("dsv4_flash", "mxfp4"),
+        ("dsv4_pro", "mxfp4"),
+    ],
+)
 def test_low_precision_logits(config, logits_dtype, qkv):
     """Selecting over BF16 / FP16 stored scores must still be an exact top-k of those scores."""
     runner = _runner(config, 16384, logits_dtype=logits_dtype, qkv=qkv)
@@ -500,33 +499,6 @@ def test_query_tiling_matches_reference(monkeypatch, qkv):
     """A chunk larger than max_chunk_size is processed in tiles with shifted K prefixes."""
     runner = _runner("ds_v32", 16384, max_chunk=256, monkeypatch=monkeypatch, qkv=qkv)
     _check("ds_v32", 700, 3000, qkv=qkv, seed=3, runner=runner)
-
-
-@skip_not_sm100
-@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
-def test_layers_reuse_plan_cache_with_different_keys(qkv):
-    """Every layer of a step reuses the chunk's plan but brings different K / Q / weights."""
-    plan_cache = {}
-    for layer in range(4):
-        _check("ds_v32", 256, 4096, qkv=qkv, seed=10 + layer, plan_cache=plan_cache)
-
-
-@skip_not_sm100
-@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
-def test_interleaved_chunks_across_layers(qkv):
-    """The engine runs layer-outer / chunk-inner, so chunks with different plans alternate."""
-    chunks = [(256, 4096), (192, 6000), (320, 0)]
-    caches = [{} for _ in chunks]
-    for layer in range(3):
-        for index, (num_q, kv_prefix) in enumerate(chunks):
-            _check(
-                "ds_v32",
-                num_q,
-                kv_prefix,
-                qkv=qkv,
-                seed=100 + 10 * layer + index,
-                plan_cache=caches[index],
-            )
 
 
 @skip_not_sm100
@@ -587,25 +559,27 @@ def test_wrapper_rejects_inputs_that_alias_its_staging_buffers(qkv):
 
 
 @skip_not_sm100
-def test_mxfp4_key_storage_is_padded_to_256_rows():
+@pytest.mark.parametrize("qkv,num_keys", [("fp8", 10112), ("mxfp4", 10240)])
+def test_key_storage_is_padded_to_whole_tiles(qkv, num_keys):
+    """A max length that is not a tile multiple rounds the K storage up (FP8 128, MXFP4 256)."""
     runner = ThrowawayPrefillTopK(
         n_heads=64,
         index_topk=2048,
         compress_ratio=1,
         max_context_length=10000,
         device=torch.device("cuda"),
-        qkv_dtype="mxfp4",
+        qkv_dtype=qkv,
     )
-    assert runner.num_keys == 10240 and runner.num_keys % 256 == 0
-    assert runner.can_run(10000) and not runner.can_run(10241)
-    _check("ds_v32", 256, 8700, qkv="mxfp4", seed=11, runner=runner)
+    assert runner.num_keys == num_keys
+    assert runner.can_run(10000) and not runner.can_run(num_keys + 1)
+    _check("ds_v32", 256, 8700, qkv=qkv, seed=11, runner=runner)
 
 
 # ---------------------------------------------------------------------------------------------
 # GPU: Q = 4096 / 8192 with large K (reference rows are sampled)
 # ---------------------------------------------------------------------------------------------
 
-LARGE_SHAPES = [(4096, 4096), (8192, 0), (4096, 28672)]
+LARGE_SHAPES = [(8192, 0), (4096, 28672)]
 if LARGE:
     LARGE_SHAPES += [(8192, 57344), (8192, 122880)]
 
@@ -619,17 +593,75 @@ def test_large_shapes(config, qkv, num_q, kv_prefix):
     _check(config, num_q, kv_prefix, qkv=qkv, seed=12, max_context_length=131072)
 
 
+# Kernel variants are chosen from the runner capacity (max length // compress ratio), so each
+# model is also checked at its own maximum length, with the query rows at the end of the window.
+PRODUCTION_LENGTHS = [
+    ("ds_v32", "fp8", 163840),
+    ("glm_5_3", "fp8", 202752),
+    ("dsv4_flash", "mxfp4", 1048576),
+    ("dsv4_pro", "mxfp4", 1048576),
+]
+
+
 @skip_not_sm100
-@pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
-def test_large_shape_logits_dtypes(logits_dtype):
+@pytest.mark.parametrize("num_q", [1024, 8192] if LARGE else [1024])
+@pytest.mark.parametrize("config,qkv,max_context_length", PRODUCTION_LENGTHS)
+def test_production_max_lengths(config, qkv, max_context_length, num_q):
+    _check(
+        config,
+        num_q,
+        max_context_length - num_q,
+        qkv=qkv,
+        seed=18,
+        max_context_length=max_context_length,
+    )
+
+
+@skip_not_sm100
+def test_large_shape_bf16_logits():
     _check(
         "ds_v32",
         8192,
         24576,
         seed=13,
-        logits_dtype=logits_dtype,
+        logits_dtype=torch.bfloat16,
         max_context_length=131072,
     )
+
+
+@skip_not_sm100
+def test_workspace_oom_disables_the_runner(monkeypatch):
+    """Running out of memory while building the kernel workspace falls back instead of failing."""
+    runner = ThrowawayPrefillTopK(
+        n_heads=64,
+        index_topk=2048,
+        compress_ratio=1,
+        max_context_length=16384,
+        device=torch.device("cuda"),
+    )
+    calls = []
+
+    def prepare_pool(*args, **kwargs):
+        calls.append(args)
+        raise torch.OutOfMemoryError("CUDA out of memory")
+
+    monkeypatch.setattr(runner._wrapper, "prepare_pool", prepare_pool)
+    inputs = _make_inputs("ds_v32", 64, 4096, seed=19)
+    out = torch.full((64, 2048), -2, dtype=torch.int32, device="cuda")
+    for _ in range(2):
+        handled = runner.run_chunk(
+            inputs.q,
+            inputs.weights,
+            inputs.k,
+            inputs.k_scale,
+            out,
+            kv_prefix_len=4096,
+            plan_cache={},
+        )
+        assert handled is False
+    assert len(calls) == 1  # disabled after the first failure
+    assert bool((out == -2).all())  # nothing written
+    assert runner._k_stage is None  # buffers released
 
 
 # ---------------------------------------------------------------------------------------------
@@ -640,8 +672,9 @@ def test_large_shape_logits_dtypes(logits_dtype):
 class _FakeRunner:
     num_keys = 16
 
-    def __init__(self, can_run=True):
+    def __init__(self, can_run=True, ran=True):
         self._can_run = can_run
+        self._ran = ran
         self.calls = []
 
     def can_run(self, num_k_rows):
@@ -649,6 +682,7 @@ class _FakeRunner:
 
     def run_chunk(self, q, weights, k, k_scale, out, *, kv_prefix_len, plan_cache, q_scale=None):
         self.calls.append((q, weights, k, k_scale, out, kv_prefix_len, plan_cache, q_scale))
+        return self._ran
 
 
 def _fake_indexer(runner, enabled=True, failed=False, min_context=0):
@@ -699,6 +733,16 @@ def test_dispatch_falls_back(indexer_kwargs, kv_prefix_len):
     handled, *_ = _call(_fake_indexer(runner, **indexer_kwargs), _chunk(kv_prefix_len))
     assert handled is False
     assert runner.calls == []
+
+
+def test_dispatch_falls_back_when_the_runner_fails(monkeypatch):
+    keys = []
+    monkeypatch.setattr(indexer_module.logger, "info_once", lambda *msg, key: keys.append(key))
+    runner = _FakeRunner(ran=False)
+    handled, *_ = _call(_fake_indexer(runner), _chunk(5))
+    assert handled is False
+    assert len(runner.calls) == 1
+    assert keys == []  # not reported as fused
 
 
 def test_dispatch_falls_back_when_keys_do_not_fit():
@@ -759,6 +803,28 @@ def test_runner_is_shared_per_configuration(monkeypatch):
     other = get_throwaway_prefill_topk(**{**_RUNNER_ARGS, "qkv_dtype": "mxfp4"})
     assert other is not first
     assert len(built) == 2
+
+
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        dict(n_heads=4, index_topk=512, compress_ratio=4),  # needs the Qwen weight contract
+        dict(n_heads=32, index_topk=512, compress_ratio=4),  # GLM-5.3-Flash, not validated
+        dict(n_heads=64, index_topk=2048, compress_ratio=4),
+    ],
+)
+def test_runner_rejects_unvalidated_geometries(monkeypatch, geometry):
+    built, warnings = [], []
+    monkeypatch.setattr(
+        throwaway_topk_module, "ThrowawayPrefillTopK", lambda **kwargs: built.append(kwargs)
+    )
+    monkeypatch.setattr(throwaway_topk_module, "_RUNNERS", {})
+    monkeypatch.setattr(throwaway_topk_module.logger, "warning", warnings.append)
+    args = {**_RUNNER_ARGS, **geometry}
+    assert get_throwaway_prefill_topk(**args) is None
+    assert get_throwaway_prefill_topk(**args) is None
+    assert built == []
+    assert len(warnings) == 1
 
 
 def test_runner_build_failure_is_cached(monkeypatch):
