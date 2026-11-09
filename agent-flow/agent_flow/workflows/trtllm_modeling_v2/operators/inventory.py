@@ -5,8 +5,10 @@
 
 :func:`run_inventory_probe` runs one read-only process under the run's own
 interpreter and reports the catalog entries (certified on this architecture,
-still wired, kept by another target) and the registered ``torch.ops.trtllm``
-ops no entry wraps. What the checkpoint demands is the surveyor's to read,
+still wired, kept by another target), the registered ``torch.ops.trtllm``
+ops no entry wraps, and the ModelingV2 native ops: what each family's and
+target's ``csrc/`` declares, whether this installation built and registered
+it, and which entries wrap it. What the checkpoint demands is the surveyor's to read,
 from ``config.json`` and the HuggingFace code; joining the two is its
 judgement.
 """
@@ -36,6 +38,40 @@ RECEIPT_PASSED = "passed"
 #: This architecture is not in ``ARCHS`` (or the entry declares none): unknown.
 RECEIPT_ABSENT = "absent"
 
+#: Why an entry's ``impl`` does not resolve here. ``missing``: the build has no
+#: such op (renamed, removed, or a native library built from older source);
+#: ``broken``: its native library is installed but does not load.
+IMPL_MISSING = "missing"
+IMPL_BROKEN = "broken"
+#: A native op whose family library or target this installation did not build
+#: (its ``ARCHS`` miss the build's): absent here, not rotted.
+IMPL_UNBUILT = "unbuilt"
+
+#: A native op a wrapper or a model queries before its real op (capability,
+#: workspace sizing): never a candidate to wrap.
+NATIVE_HELPER = re.compile(r"(_supported|_workspace_info|built_targets)$")
+
+#: A native op the family library registered in this installation.
+NATIVE_REGISTERED = "registered"
+#: A native op ``csrc/`` declares, on a host where the probe could not load torch.
+NATIVE_DECLARED = "declared"
+
+
+@dataclass(frozen=True)
+class NativeOp:
+    """A ModelingV2 native op: ``torch.ops.<namespace>.<name>`` of a family or target library."""
+
+    namespace: str
+    name: str
+    #: ``registered``, ``unbuilt``, ``missing``, ``broken``, or ``declared`` when unmeasured.
+    state: str
+    #: Where ``csrc/`` declares it (``path:line``); empty for an op only the library registers.
+    source: str = ""
+
+    @property
+    def impl(self) -> str:
+        return f"torch.ops.{self.namespace}.{self.name}"
+
 
 @dataclass(frozen=True)
 class CatalogEntry:
@@ -49,6 +85,8 @@ class CatalogEntry:
     impl: str = ""
     receipt: str = RECEIPT_ABSENT
     impl_resolves: bool = True
+    #: Why ``impl`` does not resolve (``IMPL_*``); empty when it does.
+    impl_state: str = ""
     scope: str = ""
     #: How many ``Cell`` s the entry certifies; 0 when it states none.
     cells: int = 0
@@ -82,6 +120,9 @@ class Inventory:
     arch: str = ""
     trtllm_ops: tuple[str, ...] = ()
     catalog: tuple[CatalogEntry, ...] = ()
+    native_ops: tuple[NativeOp, ...] = ()
+    #: Family -> ``loaded`` (with the targets it carries), ``unbuilt`` or ``broken: <why>``.
+    native_libraries: dict[str, str] = field(default_factory=dict)
     versions: dict[str, str] = field(default_factory=dict)
     error: str = ""
 
@@ -107,21 +148,42 @@ class Inventory:
 
     @property
     def rotted(self) -> tuple[CatalogEntry, ...]:
-        """Entries whose ``impl`` does not resolve in this build."""
-        return tuple(e for e in self.catalog if not e.impl_resolves)
+        """Entries whose ``impl`` does not resolve in this build (an unbuilt native op is not)."""
+        return tuple(
+            e for e in self.catalog if not e.impl_resolves and e.impl_state != IMPL_UNBUILT
+        )
+
+    @property
+    def unbuilt(self) -> tuple[CatalogEntry, ...]:
+        """Entries wrapping a native op this installation did not build."""
+        return tuple(e for e in self.catalog if e.impl_state == IMPL_UNBUILT)
 
     @property
     def unwrapped_ops(self) -> tuple[str, ...]:
-        """Registered ops that no catalog entry wraps."""
-        wrapped = {e.impl.rsplit(".", 1)[-1] for e in self.catalog if e.impl}
+        """Registered ``torch.ops.trtllm`` ops that no catalog entry wraps."""
+        wrapped = {
+            e.impl.rsplit(".", 1)[-1]
+            for e in self.catalog
+            if e.impl.startswith("torch.ops.trtllm.")
+        }
         return tuple(op for op in self.trtllm_ops if op not in wrapped)
+
+    @property
+    def unwrapped_native_ops(self) -> tuple[NativeOp, ...]:
+        """Native family and target ops no entry wraps (capability and workspace queries aside)."""
+        wrapped = {e.impl for e in self.catalog if e.impl}
+        return tuple(
+            op
+            for op in self.native_ops
+            if op.impl not in wrapped and not NATIVE_HELPER.search(op.name)
+        )
 
 
 #: Runs on the host, inside the run's own interpreter. Kept as a string
 #: rather than a module so it can be shipped through any transport that
 #: carries a shell command — a spool file, or a direct invocation.
 PROBE_SOURCE = r"""
-import ast, json, os, re, sys
+import ast, importlib, json, os, re, sys
 from pathlib import Path
 
 out = {"trtllm_ops": [], "catalog": [], "versions": {}, "error": ""}
@@ -205,6 +267,81 @@ def resolves(dotted, entry_path=None):
         return True
     return False
 
+MODELS_PKG = "tensorrt_llm._torch._experimental.modeling_v2.models"
+models = repo / "tensorrt_llm/_torch/_experimental/modeling_v2/models"
+
+def native_namespace(family, target=None):
+    # Mirrors `_native._namespace`: `mv2_<family>`, or `mv2_<family>_<target>` with `__` collapsed.
+    if target is None:
+        return "mv2_" + family
+    return "mv2_%s_%s" % (family, re.sub("_{2,}", "_", target))
+
+def owner(py):
+    # (family, target) of a file under models/; target is None for the family's own code.
+    parts = py.relative_to(models).parts
+    target = parts[1] if len(parts) > 2 and "__" in parts[1] else None
+    return parts[0], target
+
+def native_bindings(py, tree, depth=0):
+    # Module-level names bound to a native library's ops, and their namespace:
+    # `x = load_family_ops(__name__)`, `x = load_target_ops(__name__)`, or a name
+    # imported from a package whose `__init__.py` binds one (`from ... import native_ops`).
+    try:
+        family, target = owner(py)
+    except ValueError:
+        return {}
+    names = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+            func = node.value.func
+            called = getattr(func, "id", None) or getattr(func, "attr", None)
+            for t in node.targets:
+                if not isinstance(t, ast.Name):
+                    continue
+                if called == "load_family_ops":
+                    names[t.id] = native_namespace(family)
+                elif called == "load_target_ops" and target:
+                    names[t.id] = native_namespace(family, target)
+        elif isinstance(node, ast.ImportFrom) and depth < 3:
+            if node.level:
+                pkg = py.parent
+                for _ in range(node.level - 1):
+                    pkg = pkg.parent
+                if node.module:
+                    pkg = pkg.joinpath(*node.module.split("."))
+            elif (node.module or "").startswith(MODELS_PKG + "."):
+                pkg = models.joinpath(*node.module[len(MODELS_PKG) + 1:].split("."))
+            else:
+                continue
+            init = pkg / "__init__.py"
+            try:
+                bound = native_bindings(init, ast.parse(init.read_text(encoding="utf-8")), depth + 1)
+            except (OSError, SyntaxError, ValueError):
+                continue
+            for alias in node.names:
+                if alias.name in bound:
+                    names[alias.asname or alias.name] = bound[alias.name]
+    return names
+
+# Queries a wrapper makes before its op (capability and workspace sizing), not its op.
+HELPER = re.compile(r"(_supported|_workspace_info|built_targets)$")
+
+def wrapped_call(call, bindings):
+    # The op `__call__` makes: the first call into torch.ops (trtllm or a native
+    # namespace), a name bound to native ops, or FlashInfer.
+    found = []
+    for match in re.finditer(r"torch\.ops\.(trtllm|mv2_[A-Za-z0-9_]+)\.([A-Za-z0-9_]+)", call):
+        found.append((match.start(), "torch.ops.%s.%s" % match.groups()))
+    for name, namespace in bindings.items():
+        for match in re.finditer(r"\b%s\.([A-Za-z_][A-Za-z0-9_]*)\s*\(" % re.escape(name), call):
+            found.append((match.start(), "torch.ops.%s.%s" % (namespace, match.group(1))))
+    library = re.search(r"\b(flashinfer(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\s*\(", call)
+    if library:
+        found.append((library.start(), library.group(1)))
+    found.sort()
+    main = [impl for _, impl in found if not HELPER.search(impl)]
+    return (main or [impl for _, impl in found] or [""])[0]
+
 def entry_certification(py_path):
     # An entry is an OpWrapper subclass whose class attributes are its
     # contract: `ARCHS = frozenset({Arch.SM_103})` names the architectures
@@ -216,6 +353,7 @@ def entry_certification(py_path):
         tree = ast.parse(text)
     except (OSError, SyntaxError):
         return [], 0, ""
+    bindings = native_bindings(py_path, tree)
     archs, cells, call = set(), 0, ""
     for node in ast.walk(tree):
         if not isinstance(node, ast.ClassDef):
@@ -252,13 +390,11 @@ def entry_certification(py_path):
                         cells += 1
     # The op `__call__` makes, not the first op the file mentions: an entry's
     # docstring and reference routinely name its neighbours. A tier-3 entry
-    # calls a FlashInfer callable instead of a trtllm op.
-    match = re.search(r"torch\.ops\.trtllm\.([A-Za-z0-9_]+)", call)
-    if match:
-        return sorted(archs), cells, "torch.ops.trtllm." + match.group(1)
-    library = re.search(r"\b(flashinfer(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\s*\(", call)
-    if library:
-        return sorted(archs), cells, library.group(1)
+    # calls a FlashInfer callable instead of a trtllm op; a family's or a
+    # target's entry may call its native library.
+    impl = wrapped_call(call, bindings)
+    if impl:
+        return sorted(archs), cells, impl
     match = re.search(r"torch\.ops\.trtllm\.([A-Za-z0-9_]+)", text)
     return sorted(archs), cells, ("torch.ops.trtllm." + match.group(1)) if match else ""
 
@@ -274,7 +410,6 @@ for py in sorted(catalog.glob("*/*.py")) if catalog.is_dir() else ():
         "impl": entry_certification(py)[2],
     })
 # A target's own ops: certified for that target, prior art for another.
-models = repo / "tensorrt_llm/_torch/_experimental/modeling_v2/models"
 scoped_ops = sorted({*models.glob("*/*/ops/*/*.py"), *models.glob("*/ops/*/*.py")})
 for py in scoped_ops if models.is_dir() else ():
     if py.name == "__init__.py":
@@ -285,6 +420,104 @@ for py in scoped_ops if models.is_dir() else ():
         "impl": entry_certification(py)[2],
         "scope": target_dir.relative_to(models).as_posix(),
     })
+# ModelingV2 native ops: what each family's and target's csrc/ declares
+# (`TRTLLM_MV2_LIBRARY_FRAGMENT(m) { m.def("op(...) -> ...") }`), then what this
+# installation's family libraries register. Loading a library is the public
+# `load_family_ops`, which routing calls too; it runs no kernel.
+DEF = re.compile(r'm\.def\(\s*"([A-Za-z_][A-Za-z0-9_]*)\s*[(.]')
+declared, targets_of = {}, {}
+for csrc in sorted([*models.glob("*/csrc"), *models.glob("*/*/csrc")]) if models.is_dir() else ():
+    parts = csrc.relative_to(models).parts
+    family, target = parts[0], (parts[1] if len(parts) == 3 else None)
+    namespace = native_namespace(family, target)
+    targets_of.setdefault(family, {})
+    if target:
+        targets_of[family][namespace] = target
+    for src in sorted(csrc.rglob("*")):
+        if src.suffix not in (".cpp", ".cc", ".cu", ".h", ".cuh"):
+            continue
+        try:
+            text = src.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for match in DEF.finditer(text):
+            line = text.count("\n", 0, match.start()) + 1
+            declared.setdefault((namespace, match.group(1)),
+                                "%s:%d" % (src.relative_to(repo).as_posix(), line))
+# A family or a target can also register an op of its namespace in Python:
+# `@torch.library.custom_op(f"{_NS}::name")`, `_NS` being `namespace_of(__name__)`.
+CUSTOM_OP = re.compile(r'''custom_op\(\s*f?["'](?:\{[^}]*\}|(mv2_[A-Za-z0-9_]+))::([A-Za-z0-9_]+)''')
+for py in sorted(models.rglob("*.py")) if models.is_dir() else ():
+    try:
+        text = py.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        continue
+    if "custom_op(" not in text:
+        continue
+    family, target = owner(py)
+    for match in CUSTOM_OP.finditer(text):
+        namespace = match.group(1) or native_namespace(family, target)
+        line = text.count("\n", 0, match.start()) + 1
+        targets_of.setdefault(family, {})
+        if target:
+            targets_of[family][native_namespace(family, target)] = target
+        declared.setdefault((namespace, match.group(2)), "%s:%d" % (py.relative_to(repo).as_posix(), line))
+out["native_libraries"] = {}
+registered = set()
+if not out["error"]:
+    try:
+        import importlib
+        native = importlib.import_module("tensorrt_llm._torch._experimental.modeling_v2._native")
+    except Exception as exc:
+        native = None
+        out["versions"]["modeling_v2_native"] = "no: %s" % type(exc).__name__
+    for family in sorted(targets_of):
+        if native is None:
+            break
+        try:
+            native.load_family_ops("%s.%s" % (MODELS_PKG, family))
+            built = getattr(torch.ops, native_namespace(family)).built_targets()
+            out["native_libraries"][family] = "loaded: %s" % (built or "no targets")
+        except Exception as exc:
+            kind = type(exc).__name__
+            if kind == "NoTarget":
+                out["native_libraries"][family] = "unbuilt: %s" % exc
+            else:
+                out["native_libraries"][family] = "broken: %s: %s" % (kind, exc)
+
+def refresh_registered():
+    if out["error"]:
+        return
+    try:
+        for schema in torch._C._jit_get_all_schemas():
+            namespace, _, name = schema.name.partition("::")
+            if namespace.startswith("mv2_") and name != "built_targets":
+                registered.add((namespace, name.split(".", 1)[0]))
+    except Exception:
+        pass
+
+refresh_registered()
+
+def native_state(namespace, name):
+    # registered, unbuilt (the library or the target is not in this build),
+    # missing (built, but no such op), broken, or declared (not measured).
+    if out["error"]:
+        return "declared"
+    if (namespace, name) in registered:
+        return "registered"
+    family = next((f for f in targets_of if namespace == native_namespace(f)
+                   or namespace in targets_of[f]), None)
+    library = out["native_libraries"].get(family, "")
+    if library.startswith("broken"):
+        return "broken"
+    if not library.startswith("loaded"):
+        return "unbuilt"
+    target = targets_of[family].get(namespace)
+    built = [t for t in library.split(": ", 1)[1].split(",") if t]
+    if target and target not in built:
+        return "unbuilt"
+    return "missing"
+
 for entry in out["catalog"]:
     if entry.get("scope"):
         py = models / entry["scope"] / "ops" / entry["path"]
@@ -298,7 +531,28 @@ for entry in out["catalog"]:
     entry["receipt"] = "passed" if arch in archs and cells else "absent"
     # Only claim an entry is unwired when the op inventory was actually
     # taken.
-    entry["impl_resolves"] = True if out["error"] else bool(resolves(entry["impl"], module))
+    if out["error"]:
+        entry["impl_resolves"] = True
+    elif entry["impl"].startswith("torch.ops.mv2_"):
+        # An op the module registers in Python exists once the module is imported;
+        # importing a target's module also loads its library (`load_target_ops`).
+        try:
+            importlib.import_module(module)
+        except Exception:
+            pass
+        refresh_registered()
+        state = native_state(*entry["impl"].split(".")[2:4])
+        entry["impl_resolves"] = state == "registered"
+        entry["impl_state"] = "" if state == "registered" else state
+    else:
+        entry["impl_resolves"] = bool(resolves(entry["impl"], module))
+        entry["impl_state"] = "" if entry["impl_resolves"] else "missing"
+
+refresh_registered()
+out["native_ops"] = [
+    {"namespace": ns, "name": name, "state": native_state(ns, name), "source": declared.get((ns, name), "")}
+    for ns, name in sorted(set(declared) | registered)
+]
 
 print("__SURVEY_JSON__" + json.dumps(out))
 """
@@ -331,15 +585,27 @@ def parse_inventory(stdout: str, *, arch: str = "") -> Inventory:
             impl=str(e.get("impl", "")),
             receipt=str(e.get("receipt", RECEIPT_ABSENT)),
             impl_resolves=bool(e.get("impl_resolves", True)),
+            impl_state=str(e.get("impl_state", "") or ""),
             scope=str(e.get("scope", "") or ""),
             cells=int(e.get("cells", 0) or 0),
         )
         for e in data.get("catalog", ())
     )
+    native = tuple(
+        NativeOp(
+            namespace=str(o.get("namespace", "")),
+            name=str(o.get("name", "")),
+            state=str(o.get("state", NATIVE_DECLARED)),
+            source=str(o.get("source", "") or ""),
+        )
+        for o in data.get("native_ops", ())
+    )
     return Inventory(
         arch=arch,
         trtllm_ops=tuple(str(o) for o in data.get("trtllm_ops", ())),
         catalog=entries,
+        native_ops=native,
+        native_libraries={str(k): str(v) for k, v in (data.get("native_libraries") or {}).items()},
         versions={str(k): str(v) for k, v in (data.get("versions") or {}).items()},
         error=str(data.get("error", "")),
     )
@@ -362,7 +628,7 @@ def run_inventory_probe(
     # A payload that landed is kept whatever the exit code says. The probe
     # catches its own import failures and still prints what it read off
     # disk.
-    landed = bool(inventory.catalog or inventory.trtllm_ops)
+    landed = bool(inventory.catalog or inventory.trtllm_ops or inventory.native_ops)
     if not landed and not getattr(result, "ok", True):
         return Inventory(
             arch=arch,
@@ -430,13 +696,44 @@ def format_surface(
     )
     listed(
         "Rotted: the entry's `impl` does not resolve in this build; do not spend these",
-        [f"{e.category}/{e.name} -> {e.impl}" for e in inventory.rotted],
+        [
+            f"{_entry_name(e)} -> {e.impl}" + (f" ({e.impl_state})" if e.impl_state else "")
+            for e in inventory.rotted
+        ],
+    )
+    listed(
+        "Native ops this installation did not build (the family library or the target is not "
+        "in it): absent on this host, not rotted",
+        [f"{_entry_name(e)} -> {e.impl}" for e in inventory.unbuilt],
     )
     listed(
         "Registered `torch.ops.trtllm` ops no entry wraps: tier 1, a wrapper and its cells",
         list(inventory.unwrapped_ops),
     )
+    listed(
+        "ModelingV2 native ops no entry wraps (a family's or a target's own library; within "
+        "the family, wrap one before reusing it)",
+        [_native_name(op) for op in inventory.unwrapped_native_ops],
+    )
+    if inventory.native_libraries:
+        lines.extend(["", "**ModelingV2 native libraries on this host:**", ""])
+        lines.extend(
+            f"- `{family}`: {state}" for family, state in sorted(inventory.native_libraries.items())
+        )
     return "\n".join(lines) + "\n"
+
+
+def _entry_name(entry: CatalogEntry) -> str:
+    return (
+        f"{entry.scope}/ops/{entry.category}/{entry.name}"
+        if entry.scope
+        else f"{entry.category}/{entry.name}"
+    )
+
+
+def _native_name(op: NativeOp) -> str:
+    where = f" ({op.source})" if op.source else ""
+    return f"{op.namespace}::{op.name} [{op.state}]{where}"
 
 
 def surface_names(inventory: Inventory) -> list[str]:
@@ -445,6 +742,7 @@ def surface_names(inventory: Inventory) -> list[str]:
         *(f"{e.category}/{e.name}" for e in inventory.catalog if not e.scope),
         *(f"{e.scope}/ops/{e.category}/{e.name}" for e in inventory.other_targets),
         *inventory.unwrapped_ops,
+        *(_native_name(op) for op in inventory.unwrapped_native_ops),
     ]
 
 
@@ -461,8 +759,14 @@ def write_surface_file(
 
 __all__ = [
     "CatalogEntry",
+    "IMPL_BROKEN",
+    "IMPL_MISSING",
+    "IMPL_UNBUILT",
     "INVENTORY_TIMEOUT_S",
     "Inventory",
+    "NATIVE_DECLARED",
+    "NATIVE_REGISTERED",
+    "NativeOp",
     "PROBE_SOURCE",
     "RECEIPT_ABSENT",
     "RECEIPT_PASSED",

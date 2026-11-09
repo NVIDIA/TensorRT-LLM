@@ -356,6 +356,132 @@ def test_family_shared_ops_are_discovered_alongside_target_ops(tmp_path):
     )
 
 
+def _native_repo(tmp_path):
+    """Two families with native libraries: `fam` (a target and shared code), `other` (a target)."""
+    repo = _fake_repo(tmp_path, [])
+    models = repo / "tensorrt_llm/_torch/_experimental/modeling_v2/models"
+    op_head = "from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper\n"
+
+    def wrapper(path, binding, calls):
+        body = "".join(f"        native_ops.{call}(x)\n" for call in calls)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"{op_head}{binding}\n\nclass Entry(OpWrapper):\n    ARCHS = frozenset({{Arch.SM_103}})\n"
+            f"    CELLS = (Cell(why='c', spec={{}}),)\n\n    def __call__(self, x):\n{body}\n"
+            "    def reference(self, x):\n        return x\n",
+            encoding="utf-8",
+        )
+
+    for target, family in (("ckpt__sm_103__tp1", "fam"), ("big__sm_100__tp8", "other")):
+        (models / family / target).mkdir(parents=True)
+        (models / family / target / "__init__.py").write_text(
+            "native_ops = load_target_ops(__name__)\n", encoding="utf-8"
+        )
+    csrc = models / "fam" / "ckpt__sm_103__tp1" / "csrc" / "stepOp.cpp"
+    csrc.parent.mkdir()
+    csrc.write_text(
+        'TRTLLM_MV2_LIBRARY_FRAGMENT(m)\n{\n    m.def(\n        "fused_step(Tensor x) -> Tensor");\n'
+        '    m.def("fused_step_supported() -> bool");\n    m.def("lonely(Tensor x) -> Tensor");\n}\n',
+        encoding="utf-8",
+    )
+    (models / "fam" / "csrc").mkdir()
+    (models / "fam" / "csrc" / "normOp.cpp").write_text(
+        'TRTLLM_MV2_LIBRARY_FRAGMENT(m)\n{\n    m.def("shared_norm(Tensor x) -> Tensor");\n}\n',
+        encoding="utf-8",
+    )
+    (models / "other" / "big__sm_100__tp8" / "csrc").mkdir()
+    (models / "other" / "big__sm_100__tp8" / "csrc" / "bigOp.cpp").write_text(
+        'TRTLLM_MV2_LIBRARY_FRAGMENT(m)\n{\n    m.def("big_op(Tensor x) -> Tensor");\n}\n',
+        encoding="utf-8",
+    )
+    # The capability query comes first; the op is what follows it.
+    wrapper(
+        models / "fam" / "ckpt__sm_103__tp1" / "ops" / "moe" / "step.py",
+        "from ... import native_ops",
+        ["fused_step_supported", "fused_step"],
+    )
+    wrapper(
+        models / "fam" / "ops" / "norm" / "shared.py",
+        "native_ops = load_family_ops(__name__)",
+        ["shared_norm"],
+    )
+    wrapper(
+        models / "other" / "big__sm_100__tp8" / "ops" / "gemm" / "big.py",
+        "from ... import native_ops",
+        ["big_op"],
+    )
+    return repo
+
+
+_STEP = "torch.ops.mv2_fam_ckpt_sm_103_tp1.fused_step"
+
+
+def test_native_ops_are_found_from_their_wrappers_and_csrc_without_torch(tmp_path):
+    inventory = _run_probe(_native_repo(tmp_path))
+    impls = {entry.name: entry.impl for entry in inventory.other_targets}
+    assert impls == {
+        "step": _STEP,
+        "shared": "torch.ops.mv2_fam.shared_norm",
+        "big": "torch.ops.mv2_other_big_sm_100_tp8.big_op",
+    }
+    assert {op.state for op in inventory.native_ops} == {"declared"}
+    assert [op.name for op in inventory.unwrapped_native_ops] == ["lonely"]
+    lonely = inventory.unwrapped_native_ops[0]
+    assert lonely.source.endswith("ckpt__sm_103__tp1/csrc/stepOp.cpp:6")
+    assert not inventory.rotted and not inventory.unbuilt
+
+
+_NATIVE_TORCH = """
+import sys, types
+class _Schema:
+    def __init__(self, name):
+        self.name = name
+_REGISTERED = ["trtllm::x", "mv2_fam_ckpt_sm_103_tp1::fused_step", "mv2_fam::built_targets"]
+torch = types.ModuleType("torch")
+torch.__version__ = "0"
+torch._C = types.SimpleNamespace(_jit_get_all_schemas=lambda: [_Schema(n) for n in _REGISTERED])
+torch.ops = types.SimpleNamespace(
+    trtllm=types.SimpleNamespace(), mv2_fam=types.SimpleNamespace(built_targets=lambda: "ckpt__sm_103__tp1")
+)
+sys.modules["torch"] = torch
+for name in ("tensorrt_llm", "tensorrt_llm._torch", "tensorrt_llm._torch.custom_ops"):
+    sys.modules[name] = types.ModuleType(name)
+native = types.ModuleType("tensorrt_llm._torch._experimental.modeling_v2._native")
+class NoTarget(Exception):
+    pass
+def load_family_ops(module):
+    if module.endswith(".other"):
+        raise NoTarget("this installation has no libth_modeling_v2_other.so")
+    return torch.ops.mv2_fam
+native.load_family_ops = load_family_ops
+sys.modules[native.__name__] = native
+"""
+
+
+def test_native_ops_are_registered_missing_or_unbuilt_on_the_host_that_runs_the_build(tmp_path):
+    inventory = _run_probe(_native_repo(tmp_path), prelude=_NATIVE_TORCH)
+    assert inventory.ok, inventory.error
+    assert inventory.native_libraries["fam"] == "loaded: ckpt__sm_103__tp1"
+    assert inventory.native_libraries["other"].startswith("unbuilt: this installation has no")
+    states = {op.name: op.state for op in inventory.native_ops}
+    assert states == {
+        "fused_step": "registered",
+        "fused_step_supported": "missing",
+        "lonely": "missing",
+        "shared_norm": "missing",
+        "big_op": "unbuilt",
+    }
+    entries = {entry.name: entry for entry in inventory.other_targets}
+    assert entries["step"].impl_resolves
+    # Built and loaded but without the op: rotted. Not built here at all: absent, not rotted.
+    assert [(e.name, e.impl_state) for e in inventory.rotted] == [("shared", "missing")]
+    assert [e.name for e in inventory.unbuilt] == ["big"]
+    surface = format_surface(inventory)
+    assert "did not build" in surface and "other/big__sm_100__tp8/ops/gemm/big" in surface
+    assert "`mv2_fam_ckpt_sm_103_tp1::lonely [missing]" in surface
+    assert "- `other`: unbuilt: this installation has no" in surface
+
+
 ANCHORS = tree_anchors.ANCHORS
 
 
