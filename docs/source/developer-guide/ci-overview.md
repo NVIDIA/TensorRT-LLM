@@ -122,8 +122,26 @@ accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[Fals
 
 Blank lines and `#` comments are ignored. The examples below use illustrative
 test names and reasons; replace them with the actual test and tracking reference.
-These rules describe `SKIP` waives. An `XFAIL` marker uses the same name matching,
-but marks an expected failure rather than skipping execution.
+These rules describe `SKIP` waives.
+
+### Test names and test-list metadata
+
+For both ordinary integration tests and `unittest/` entries, copy the test path
+and command-line options into the waive name, but omit test-list metadata such
+as `ISOLATION`. Jenkins removes `ISOLATION` before pytest collects the tests;
+the waive parser does not remove it. For example, these YAML entries:
+
+```yaml
+- test_fmha.py::test_fmha ISOLATION
+- unittest/executor/test_base_worker.py ISOLATION
+```
+
+need these waives, without `ISOLATION`:
+
+```text
+test_fmha.py::test_fmha SKIP (Known issue in this test)
+unittest/executor/test_base_worker.py SKIP (Known issue in this file)
+```
 
 ### Two matching layers for unit tests
 
@@ -144,7 +162,7 @@ file/class/function matching described below.
 
 The parser converts a `unittest/` entry into a wrapper node ID, preserving the
 test path and command-line options such as `-k`, `-m`, and `--ignore` inside the
-brackets. Test-list metadata such as `ISOLATION` is not part of the node ID:
+brackets:
 
 ```text
 unittest/_torch/modeling
@@ -157,19 +175,8 @@ unittest/_torch/modeling -k "modeling_llama"
 The outer waive lookup compares the complete node IDs. It does not interpret
 the waive name as a directory prefix, glob, or regular expression, and it does
 not normalize equivalent shell arguments. Copy the entry exactly, including
-option order, internal spaces, and quotes, but omit test-list metadata such as
-`ISOLATION`. Jenkins removes that marker before pytest collects the tests;
-the waive parser does not remove it. For example, this YAML entry:
-
-```yaml
-- unittest/executor/test_base_worker.py ISOLATION
-```
-
-needs this waive, without `ISOLATION`:
-
-```text
-unittest/executor/test_base_worker.py SKIP (Known issue in this file)
-```
+option order, internal spaces, and quotes, after omitting test-list metadata as
+described above.
 
 For this waive:
 
