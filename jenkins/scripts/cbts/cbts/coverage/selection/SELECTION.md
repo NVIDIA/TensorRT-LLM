@@ -259,7 +259,8 @@ GET Artifactory pin at <PR number>/<PR head>:
 when no pin:
    Jenkins REST lastBuild                        → newest build number N
    for b in N .. N-49:                            (_MAX_PROBE)
-      ranged GET both architecture tarballs      → skip b unless both exist
+      read helper --exists, both tarballs         → skip b unless both exist,
+                                                    or when a read fails in transfer
       GET build_info.txt, parse `commit=`         → sha; skip when absent
       first complete pair with a known sha        → latest coverage DB
    Python writes the build/commit pin locally
@@ -338,8 +339,8 @@ large DB artifacts are downloaded. If it passes, Tier 2 uses the original forge 
 After Tier 1 computes the residual, `--resolve-pin FILE` returns a reuse/create/decline plan.
 Groovy uploads `FILE` only for a create plan, before any large download. `--prepare DIR --build
 BUILD --paths-json PATH` then resolves the PR base, validates the pinned pair's residual
-compatibility, streams both tarballs down, unpacks their identically named SQLite files
-separately, and unions them with `compact_db.merge_databases`.
+compatibility, downloads both tarballs with the read helper, unpacks their identically named
+SQLite files separately, and unions them with `compact_db.merge_databases`.
 It writes the selection JSON
 beside the merged SQLite as `cbts_coverage_db.json` and prints `{path, meta}`. Groovy binds the
 credentials, logs the successful compatibility check, and runs `coverage_audit.py` over the result.
