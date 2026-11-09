@@ -1471,8 +1471,10 @@ class KVCacheManager(BaseResourceManager):
         without changing the ``max_num_draft_tokens`` proposal length.
 
         Returns:
-            Requests in ``request_ids`` order, or ``None`` if the target cache
-            has no free blocks at entry. Allocation exceptions trigger an
+            Requests in ``request_ids`` order, or ``None`` if, at entry, the
+            target cache has no free block or, for ``max_beam_width > 1`` on a
+            self-attention cache, fewer free blocks than the beams need;
+            nothing is allocated then. Allocation exceptions trigger an
             attempt to release all sequences registered by this call, then
             propagate (a cleanup exception takes precedence if cleanup fails).
 
@@ -1486,23 +1488,37 @@ class KVCacheManager(BaseResourceManager):
         if available_blocks < 1:
             return None
 
+        # Resolve each dummy's token count once, so that the capacity check,
+        # the native allocation and the generation state below agree. Here
+        # 1+max_num_draft_tokens is used to extend the prompt length to a
+        # non-zero number to skip illegal memory access issue in MLA kernel
+        # during warmup. Helix active rank sets past_seen_token_num =
+        # seqlen_this_rank_cp - 1 in _pack_generation_requests; need
+        # token_num >= 2 so that doesn't go negative.
+        resolved_token_nums = []
+        for i in range(len(request_ids)):
+            token_num = (token_nums[i] if token_nums is not None else 1 +
+                         max_num_draft_tokens)
+            if self.mapping.has_cp_helix():
+                token_num = max(token_num, 2)
+            resolved_token_nums.append(token_num)
+
         beam_width = max_beam_width
-        if beam_width > 1:
-            # Each beam owns a copy of the partial last block and its new
-            # tokens, so a beam dummy can need several blocks. Report the
-            # shortage like the check above instead of failing the native
-            # allocation. Only the target cache is counted: speculative
-            # decoding requires beam width 1 (SpecSampler asserts it), so a
-            # draft cache never receives beam dummies.
+        if beam_width > 1 and self.kv_cache_type != CacheTypeCpp.CROSS:
+            # In a self-attention cache each beam owns a copy of the partial
+            # last block and its new tokens, so a beam dummy can need several
+            # blocks. Report the shortage like the check above instead of
+            # failing the native allocation. Cross blocks are shared by every
+            # beam (isShareLastContextBlock in kvCacheManager.cpp), so a cross
+            # dummy needs only its shared blocks and keeps the one-block check.
+            # Only the target cache is counted: speculative decoding requires
+            # beam width 1 (SpecSampler asserts it), so a draft cache never
+            # receives beam dummies.
             new_tokens = self.num_extra_kv_tokens + (_kv_draft if is_gen else 0)
-            needed_blocks = 0
-            for i in range(len(request_ids)):
-                token_num = (token_nums[i] if token_nums is not None else 1 +
-                             max_num_draft_tokens)
-                if self.mapping.has_cp_helix():
-                    token_num = max(token_num, 2)
-                needed_blocks += self._num_blocks_to_completion(
-                    token_num, new_tokens, beam_width)
+            needed_blocks = sum(
+                self._num_blocks_to_completion(token_num, new_tokens,
+                                               beam_width)
+                for token_num in resolved_token_nums)
             if available_blocks < needed_blocks:
                 return None
         requests = []
@@ -1525,15 +1541,7 @@ class KVCacheManager(BaseResourceManager):
                 min_p=capture_sampling_params.min_p
                 if capture_sampling_params is not None else None,
             )
-            # Here 1+max_num_draft_tokens is used to extend the prompt length to
-            # a non-zero number to skip illegal memory access issue in MLA kernel
-            # during warmup.
-            token_num = token_nums[
-                i] if token_nums is not None else 1 + max_num_draft_tokens
-            # Helix active rank sets past_seen_token_num = seqlen_this_rank_cp - 1
-            # in _pack_generation_requests; need token_num >= 2 so that doesn't go negative.
-            if self.mapping.has_cp_helix():
-                token_num = max(token_num, 2)
+            token_num = resolved_token_nums[i]
             encoder_output_len = (encoder_output_lens[i]
                                   if encoder_output_lens is not None else None)
             encoder_input_tokens = ([1] * encoder_output_len
@@ -1581,11 +1589,7 @@ class KVCacheManager(BaseResourceManager):
             # Set is_gen state after add_sequence_batch to avoid modifying
             # prompt_len before the C++ side reads it.
             if is_gen:
-                for i, req in enumerate(requests):
-                    token_num = token_nums[
-                        i] if token_nums is not None else 1 + max_num_draft_tokens
-                    if self.mapping.has_cp_helix():
-                        token_num = max(token_num, 2)
+                for req, token_num in zip(requests, resolved_token_nums):
                     req.state = LlmRequestState.GENERATION_IN_PROGRESS
                     req.prompt_len = token_num - 1
                     req.py_prompt_len = req.prompt_len

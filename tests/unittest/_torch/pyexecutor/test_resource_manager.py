@@ -1170,12 +1170,12 @@ class TestResourceManager(unittest.TestCase):
         finally:
             kv_cache_manager.shutdown()
 
-    def test_beam_dummy_returns_none_when_its_beams_do_not_fit(self):
-        """A beam dummy needs one private block per beam; with fewer free
-        blocks V1 returns None, as for an empty pool, instead of failing the
-        native allocation."""
-        kv_cache_manager = KVCacheManager(
-            kv_cache_config=KvCacheConfig(max_tokens=64,
+    def _beam_dummy_manager(self, total_blocks: int,
+                            max_batch_size: int) -> KVCacheManager:
+        """A V1 self-attention manager with eight-token blocks and beam width
+        four over ``total_blocks`` blocks."""
+        return KVCacheManager(
+            kv_cache_config=KvCacheConfig(max_tokens=total_blocks * 8,
                                           enable_block_reuse=False),
             kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
             CacheType.SELF,
@@ -1183,72 +1183,153 @@ class TestResourceManager(unittest.TestCase):
             num_kv_heads=2,
             head_dim=128,
             tokens_per_block=8,
-            max_seq_len=64,
-            max_batch_size=2,
+            max_seq_len=total_blocks * 8,
+            max_batch_size=max_batch_size,
             max_beam_width=4,
             mapping=Mapping(),
         )
+
+    def test_beam_dummy_shares_full_blocks_and_copies_the_partial_one(
+            self) -> None:
+        """A width-four dummy shares its full prompt blocks across the beams
+        and gives each beam its own copy of a partial last block: 16 tokens
+        need two blocks, 17 tokens need six. With fewer free blocks V1
+        returns None without allocating, as for an empty pool."""
+        kv_cache_manager = self._beam_dummy_manager(total_blocks=8,
+                                                    max_batch_size=2)
         try:
             total_free = kv_cache_manager.get_num_free_blocks()
-            # Leave two free blocks.
-            filler = kv_cache_manager.add_dummy_requests(
-                [0], token_nums=[(total_free - 2) * 8])
-            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 2)
+            self.assertGreaterEqual(total_free, 6)
 
-            self.assertIsNone(
-                kv_cache_manager.add_dummy_requests([1],
-                                                    is_gen=True,
-                                                    max_beam_width=4))
-            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 2)
+            def leave_free(free_blocks):
+                return kv_cache_manager.add_dummy_requests(
+                    [0], token_nums=[(total_free - free_blocks) * 8])
 
-            kv_cache_manager.free_resources(filler[0])
+            filler = leave_free(2)
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 2)
             requests = kv_cache_manager.add_dummy_requests([1],
+                                                           token_nums=[16],
                                                            is_gen=True,
                                                            max_beam_width=4)
             self.assertIsNotNone(requests)
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 0)
             kv_cache_manager.free_resources(requests[0])
+
+            self.assertIsNone(
+                kv_cache_manager.add_dummy_requests([1],
+                                                    token_nums=[17],
+                                                    is_gen=True,
+                                                    max_beam_width=4))
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 2)
+            kv_cache_manager.free_resources(filler[0])
+
+            filler = leave_free(5)
+            self.assertIsNone(
+                kv_cache_manager.add_dummy_requests([1],
+                                                    token_nums=[17],
+                                                    is_gen=True,
+                                                    max_beam_width=4))
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 5)
+            kv_cache_manager.free_resources(filler[0])
+
+            filler = leave_free(6)
+            requests = kv_cache_manager.add_dummy_requests([1],
+                                                           token_nums=[17],
+                                                           is_gen=True,
+                                                           max_beam_width=4)
+            self.assertIsNotNone(requests)
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 0)
+            kv_cache_manager.free_resources(requests[0])
+            kv_cache_manager.free_resources(filler[0])
             self.assertEqual(kv_cache_manager.get_num_free_blocks(), total_free)
         finally:
             kv_cache_manager.shutdown()
 
-    def test_beam_dummy_capacity_counts_draft_blocks_of_every_request(self):
-        """Two width-4 generation dummies with four draft tokens each need two
-        blocks per beam (5 + 4 tokens), 16 in total; with 15 free blocks V1
-        returns None without allocating any."""
-        kv_cache_manager = KVCacheManager(
-            kv_cache_config=KvCacheConfig(max_tokens=192,
-                                          enable_block_reuse=False),
-            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
-            CacheType.SELF,
-            num_layers=2,
-            num_kv_heads=2,
-            head_dim=128,
-            tokens_per_block=8,
-            max_seq_len=128,
-            max_batch_size=3,
-            max_beam_width=4,
-            mapping=Mapping(),
-        )
+    def test_beam_dummy_capacity_counts_every_request(self) -> None:
+        """Two width-four dummies of 17 tokens need six blocks each. With
+        eleven free blocks V1 returns None without allocating any; with
+        twelve it allocates both."""
+        kv_cache_manager = self._beam_dummy_manager(total_blocks=24,
+                                                    max_batch_size=3)
         try:
             total_free = kv_cache_manager.get_num_free_blocks()
             filler = kv_cache_manager.add_dummy_requests(
-                [0], token_nums=[(total_free - 15) * 8])
-            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 15)
-
+                [0], token_nums=[(total_free - 11) * 8])
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 11)
             self.assertIsNone(
                 kv_cache_manager.add_dummy_requests([1, 2],
+                                                    token_nums=[17, 17],
                                                     is_gen=True,
-                                                    max_num_draft_tokens=4,
                                                     max_beam_width=4))
-            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 15)
-
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 11)
             kv_cache_manager.free_resources(filler[0])
-            requests = kv_cache_manager.add_dummy_requests(
-                [1, 2], is_gen=True, max_num_draft_tokens=4, max_beam_width=4)
+
+            filler = kv_cache_manager.add_dummy_requests(
+                [0], token_nums=[(total_free - 12) * 8])
+            requests = kv_cache_manager.add_dummy_requests([1, 2],
+                                                           token_nums=[17, 17],
+                                                           is_gen=True,
+                                                           max_beam_width=4)
             self.assertIsNotNone(requests)
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 0)
             for request in requests:
                 kv_cache_manager.free_resources(request)
+            kv_cache_manager.free_resources(filler[0])
             self.assertEqual(kv_cache_manager.get_num_free_blocks(), total_free)
+        finally:
+            kv_cache_manager.shutdown()
+
+    def test_v2_beam_dummy_supplies_a_block_table_row_per_beam(self) -> None:
+        """TRTLLM attention copies ``beam_width`` block-table rows for every
+        generation request and sizes the copy by the rows the batch exposes
+        (``AttentionMetadata.num_seqs``). A width-four V2 generation dummy
+        fills four rows, each beam with its own tail block. A width-one
+        dummy exposes one row while the width-four copy builds four, the
+        mismatch a narrow attention-DP padding dummy used to reach, and the
+        row-count assertion fires."""
+        kv_cache_manager = KVCacheManagerV2(
+            KvCacheConfig(max_tokens=256, enable_block_reuse=False),
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=64,
+            tokens_per_block=8,
+            max_seq_len=64,
+            max_batch_size=2,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+            max_beam_width=4,
+        )
+        try:
+            block_offsets = torch.full((kv_cache_manager.num_pools, 2 * 4, 2,
+                                        kv_cache_manager.max_blocks_per_seq),
+                                       -1,
+                                       dtype=torch.int32,
+                                       device="cuda")
+            wide = kv_cache_manager.add_dummy_requests([0],
+                                                       is_gen=True,
+                                                       max_beam_width=4)
+            self.assertIsNotNone(wide)
+            self.assertEqual(wide[0].py_beam_width, 4)
+            kv_cache_manager.copy_batch_block_offsets(block_offsets, [0],
+                                                      beam_width=4,
+                                                      num_contexts=0,
+                                                      num_seqs=4)
+            torch.cuda.synchronize()
+            tail_blocks = block_offsets[0, :4, 0, 0].tolist()
+            self.assertTrue(all(block >= 0 for block in tail_blocks),
+                            tail_blocks)
+            self.assertEqual(len(set(tail_blocks)), 4, tail_blocks)
+            kv_cache_manager.free_resources(wide[0])
+
+            narrow = kv_cache_manager.add_dummy_requests([1], is_gen=True)
+            self.assertIsNotNone(narrow)
+            self.assertEqual(narrow[0].py_beam_width, 1)
+            with self.assertRaises(AssertionError):
+                kv_cache_manager.copy_batch_block_offsets(block_offsets, [1],
+                                                          beam_width=4,
+                                                          num_contexts=0,
+                                                          num_seqs=1)
+            kv_cache_manager.free_resources(narrow[0])
         finally:
             kv_cache_manager.shutdown()
 
