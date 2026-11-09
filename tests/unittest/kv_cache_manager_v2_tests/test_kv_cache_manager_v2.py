@@ -11608,6 +11608,59 @@ class TestNoBatchingDiskOptions(TestNoBatching):
             cache.close()
         self.manager.clear_reusable_blocks()
 
+    def test_held_pages_take_kept_copy_slots_on_a_full_disk(self) -> None:
+        # Held pages of a suspended request and droppable pages whose disk copies are kept fall into a disk tier
+        # filled with exactly those copies. A kept copy only saves a write, so the held pages must get its slot.
+        self.disk_tier_options = {"num_io_threads": 4, "keep_copy_after_restore": True}
+        self.prepare(8 << 20, 0, 2 << 20, 1, None, 0, kv_buf_size=8192)
+        gpu_pages = self.manager.get_storage_statistics(CacheLevel(0))[0].total
+        disk_pages = self.manager.get_storage_statistics(CacheLevel(1))[0].total
+        self.assertGreaterEqual(gpu_pages, 2 * disk_pages)
+        req_ids = itertools.count()
+
+        def tokens(num_blocks: int) -> list:
+            return [self.next_token() for _ in range(32 * num_blocks)]
+
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            # A fills the disk tier once it is pushed down.
+            first = self.new_request(next(req_ids), None, 32 * disk_pages, 0)
+            self.assertTrue(first.kv_cache.resume(stream))
+            self.run_request(first, 32, False)
+            first.kv_cache.close()
+            # An uncommitted request takes the whole GPU, pushing A to disk, and frees its pages on close.
+            filler = self.manager.create_kv_cache(None, tokens(gpu_pages))
+            self.assertTrue(filler.resume(stream))
+            self.assertTrue(filler.resize(32 * gpu_pages))
+            filler.close()
+            # Restoring A keeps every disk slot as a copy of one of its pages.
+            prompt = first.kv_cache.committed_tokens
+            restored = self.Request(
+                next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 0
+            )
+            self.assertTrue(restored.kv_cache.resume(stream))
+            self.run_request(restored, 32, False)
+            restored.kv_cache.close()
+            self.assertEqual(
+                _introspection.disk_copy_counters(self.manager)["retained"], disk_pages
+            )
+            # A suspended request holds as many GPU pages as the disk has.
+            held = self.manager.create_kv_cache(None, tokens(disk_pages))
+            self.assertTrue(held.resume(stream))
+            self.assertTrue(held.resize(32 * disk_pages))
+            held.suspend()
+            # Taking the whole GPU pushes A and the held pages to disk together.
+            last = self.manager.create_kv_cache(None, tokens(gpu_pages))
+            try:
+                self.assertTrue(last.resume(stream))
+                self.assertTrue(last.resize(32 * gpu_pages))
+            finally:
+                last.close()
+            self.assertTrue(held.resume(stream))
+            held.close()
+        s.take_finish_event()
+        self.manager.clear_reusable_blocks()
+
 
 class TestResizeQuotaDiskOptions(TestResizeQuota):
     disk_tier_options = _ALL_DISK_OPTIONS

@@ -1439,6 +1439,53 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
                 releaseRetainedCopies(lvlId, pgIdx, required - available);
             }
         }
+        if (isLast)
+        {
+            // Held pages must fit at the last level. A pinned copy of a droppable page only saves that page a
+            // write, so when held pages need the room, give the copy up: the page then falls like any other
+            // droppable page and is placed only if a slot is left.
+            bool movedKeptPages = false;
+            for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(lvlId); ++pgIdx)
+            {
+                SlotCount heldNeed = goals.at(lvlId).at(pgIdx);
+                for (LifeCycleId lifeCycle : grouping.lifeCycles(pgIdx))
+                {
+                    for (auto const& page : fallenPages.at(lifeCycle))
+                    {
+                        if (page->status() == PageStatus::HELD)
+                        {
+                            ++heldNeed;
+                        }
+                    }
+                }
+                SlotCount room = storage.numFreeSlots(pgIdx) + ctrl.numEvictablePages(pgIdx);
+                for (LifeCycleId lifeCycle : grouping.lifeCycles(pgIdx))
+                {
+                    auto& kept = keptPages.at(lifeCycle);
+                    for (auto it = kept.begin(); it != kept.end() && room < heldNeed;)
+                    {
+                        if ((*it)->status() == PageStatus::HELD)
+                        {
+                            ++it;
+                            continue;
+                        }
+                        if (auto found = mRetainedByPage.find(it->get()); found != mRetainedByPage.end())
+                        {
+                            eraseRetainedCopy(found->second);
+                            ++mKeepCopyStats.reclaimed;
+                            ++room;
+                        }
+                        fallenPages.at(lifeCycle).push_back(std::move(*it));
+                        it = kept.erase(it);
+                        movedKeptPages = true;
+                    }
+                }
+            }
+            if (movedKeptPages)
+            {
+                sortFallenPagesByPriority(fallenPages);
+            }
+        }
     }
 
     TypedVec<PoolGroupIndex, SlotCount> numToEvict(numPoolGroups(lvlId), 0);
