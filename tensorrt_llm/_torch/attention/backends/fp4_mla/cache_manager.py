@@ -75,6 +75,10 @@ def is_fp4_mla_context_only_cache(is_disagg: bool) -> bool:
     return bool(is_disagg) and os.getenv(_DISAGG_ROLE_ENV) == "context"
 
 
+# An FP4 MLA latent cache: token-major, one latent head every tensor rank holds whole.
+_FP4_MLA_LATENT = ByHead(token_major=True, total=1)
+
+
 @dataclass(frozen=True)
 class Fp4MlaPageTableSpec:
     """Stable page-table conversion contract consumed by FP4 MLA kernels."""
@@ -1023,9 +1027,9 @@ class Fp4MlaV2CacheLayoutPolicy:
         """Latents token-major by head, as the FP4 MLA kernels write them, and the policy's other
         roles (``_fp4_mla_disagg_page_table_spec``). The cache is K-only: any other role it
         registers is a latent cache too."""
-        spec = KVCacheManagerV2.page_table_spec(self)
+        spec = super().page_table_spec()
         return self._fp4_mla_disagg_page_table_spec(
-            replace(spec, role_layouts={}, default_layout=ByHead(token_major=True, total=1))
+            replace(spec, role_layouts={}, default_layout=_FP4_MLA_LATENT)
         )
 
     def _disagg_layer_names(self) -> dict[int, tuple[int, int]]:
@@ -1068,11 +1072,11 @@ class Fp4MlaV2CacheLayoutPolicy:
             spec,
             role_layouts={
                 **spec.role_layouts,
-                Role.KEY: ByHead(token_major=True, total=1),
-                Role.KEY_BLOCK_SCALE: ByHead(token_major=True, total=1),
+                Role.KEY: _FP4_MLA_LATENT,
+                Role.KEY_BLOCK_SCALE: _FP4_MLA_LATENT,
                 Role.MLA_HP_TAIL: RingSlots(self._fp4_mla_hp_pool_size, dtype="bfloat16"),
             },
-            derived_roles=spec.derived_roles | {Role.MLA_V_SCALE, Role.MLA_V_PACKED},
+            derived_roles=spec.derived_roles | Fp4MlaV2CacheLayoutPolicy.DISAGG_IGNORED_ROLES,
         )
 
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import ClassVar
 
+import msgpack
 import pytest
 
 from tensorrt_llm._torch.disaggregation.base.role_layout import (
@@ -32,8 +33,12 @@ from tensorrt_llm._torch.disaggregation.base.role_layout import (
     Sectioned,
     check_pieces,
     grid_place,
+    recurrent_state_split,
     role_layout_from_dict,
 )
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
+from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 
 pytestmark = pytest.mark.cpu_only
 
@@ -219,9 +224,6 @@ def test_ring_keeps_the_latest_positions_of_its_page():
 )
 def test_layouts_read_back_what_they_write(layout):
     assert role_layout_from_dict(layout.to_dict()) == layout
-    # The element type does not name the layout.
-    assert "dtype" not in layout.document()
-    assert layout.document()["layout"] == layout.name
 
 
 def test_unknown_layout_name_is_refused():
@@ -240,6 +242,17 @@ def test_layout_fields_are_checked():
         Sectioned((8,), split=("tp", "tp"))
     with pytest.raises(ValueError, match="distinct dims"):
         Own(("pp",))
+    with pytest.raises(ValueError, match="token_major must be a bool"):
+        role_layout_from_dict({"name": "by_head", "token_major": "false"})
+
+
+def test_layouts_name_element_types_by_name_or_torch_type():
+    class _BindingsLikeDtype:
+        def __str__(self):
+            return "DataType.BF16"
+
+    with pytest.raises(ValueError, match="name or a torch type"):
+        RingSlots(4, dtype=_BindingsLikeDtype())
 
 
 def test_positional_layout_must_say_where_its_positions_lie():
@@ -254,7 +267,7 @@ def test_positional_layout_must_say_where_its_positions_lie():
 def test_pieces_that_leave_a_gap_are_refused():
     @dataclass(frozen=True)
     class Gapped(RoleLayoutV2):
-        name: ClassVar[str] = "test_gapped"
+        """Unnamed, so it stays out of the registry peers read layouts from."""
 
         def pieces(self, size, ranks, rank):
             # Byte size // 2 of the buffer lies in no piece.
@@ -330,4 +343,79 @@ def test_rank_topology_checks_its_ranks():
         RankTopology(tp_size=2, tp_rank=2)
     with pytest.raises(ValueError, match="positive"):
         RankTopology(pp_size=0)
-    assert RankTopology.unchecked(tp_size=2, tp_rank=1).tp_rank == 1
+
+
+@pytest.mark.parametrize("attention_dp", [False, True])
+@pytest.mark.parametrize("cp_size", [1, 2])
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_recurrent_state_splits_as_the_native_transfer_shards_it(tp_size, cp_size, attention_dp):
+    for tp_rank in range(tp_size):
+        for cp_rank in range(cp_size):
+            topology = RankTopology(
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                dp_size=tp_size if attention_dp else 1,
+                dp_rank=tp_rank if attention_dp else 0,
+                attention_dp=attention_dp,
+            )
+            rank_info = SimpleNamespace(
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                attention=SimpleNamespace(enable_attention_dp=attention_dp),
+            )
+
+            split = recurrent_state_split(topology)
+
+            assert grid_place(topology, split) == MambaPolicy._mamba_tp(rank_info), topology
+
+
+@pytest.mark.parametrize(
+    "attention_dp, tp_place",
+    [
+        (None, (4, 3)),  # an attention-free stage: the TP ranks split it
+        (False, (4, 3)),
+        # Under attention data parallelism each TP rank holds its buffers whole.
+        (True, (1, 0)),
+    ],
+)
+def test_rank_info_gives_its_parallel_place(attention_dp, tp_place):
+    attention = None
+    if attention_dp is not None:
+        attention = AttentionInfo(
+            kv_heads_per_rank=2,
+            tokens_per_block=32,
+            dims_per_head=128,
+            element_bytes=2,
+            enable_attention_dp=attention_dp,
+            is_mla=False,
+        )
+    rank_info = RankInfo(
+        instance_name="gen_0",
+        instance_rank=3,
+        tp_size=4,
+        tp_rank=3,
+        pp_size=2,
+        pp_rank=1,
+        layer_num_per_pp=[16, 16],
+        sender_endpoints=[],
+        self_endpoint="tcp://10.0.0.1:5001",
+        transfer_engine_info=b"",
+        dp_size=4 if attention_dp else 1,
+        dp_rank=3 if attention_dp else 0,
+        cp_size=2,
+        cp_rank=1,
+        attention=attention,
+    )
+
+    topology = rank_info.topology
+
+    assert (topology.tp_size, topology.tp_rank) == (4, 3)
+    assert (topology.pp_size, topology.pp_rank, topology.cp_size, topology.cp_rank) == (2, 1, 2, 1)
+    assert topology.attention_dp is bool(attention_dp)
+    assert grid_place(topology, ("tp",)) == tp_place
+    # `topology` is a property, so `to_bytes()` does not serialize it.
+    assert "topology" not in msgpack.unpackb(rank_info.to_bytes(), strict_map_key=False)

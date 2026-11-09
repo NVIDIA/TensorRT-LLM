@@ -1105,6 +1105,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
             buffers += self._kda_replay_region.shared_buffers(global_layer_id)
         return buffers
 
+    @override
     def page_table_spec(self) -> PageTableSpec:
         """The KDA replay caches are generation-local and never move."""
         spec = super().page_table_spec()

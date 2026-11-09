@@ -1102,15 +1102,17 @@ class CSA2CacheManager(KVCacheManagerV2):
     def page_table_spec(self) -> PageTableSpec:
         """Every CSA2 cache holds the same bytes on every rank. Under bounded replay on generation
         the generation worker rebuilds the sliding-window caches past a request's split, which a
-        context-only worker keeps none of (``remote_tail_excluded_pool_views``)."""
+        context-only worker keeps none of (``remote_tail_excluded_pool_views``). The persistent
+        caches hold fixed packed FP8/FP4 records whatever the staging type
+        (``kv_cache_config.dtype``) is, so the spec quantizes them as ``"csa2_packed"``."""
         spec = super().page_table_spec()
-        replay = getattr(self, "bounded_replay_on_generation", False)
-        rebuilt = {CSA2CacheRole.SWA.role} if replay else set()
+        rebuilt = {CSA2CacheRole.SWA.role} if self.bounded_replay_on_generation else set()
         return replace(
             spec,
             role_layouts={},
             default_layout=Replicated(),
             request_rebuilt_roles=spec.request_rebuilt_roles | rebuilt,
+            quant_mode="csa2_packed",
         )
 
     def get_disagg_role_mapper_kinds(self):

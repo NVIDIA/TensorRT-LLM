@@ -609,6 +609,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Estimate the per-slot bytes of the replay-state region this class declares."""
         return 0
 
+    @override
     def page_table_spec(self) -> PageTableSpec:
         """Lay out the recurrent roles as well.
 
@@ -623,29 +624,20 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """
         spec = super().page_table_spec()
         if self.local_num_mamba_layers > 0:
-            d_conv_m1 = int(self.conv_state_shape[1])
-            _, head_dim, d_state = self.ssm_state_shape
+            section_bytes, head_bytes = self._recurrent_state_bytes()
             spec = replace(
                 spec,
                 role_layouts={
                     **spec.role_layouts,
-                    MambaRole.CONV_STATE: Sectioned(
-                        tuple(
-                            int(dim) * d_conv_m1 * self.conv_state_dtype.itemsize
-                            for dim in self.conv_section_dims
-                        ),
-                        dtype=self.conv_state_dtype,
-                    ),
-                    MambaRole.SSM_STATE: ByHead(
-                        head_bytes=int(head_dim) * int(d_state) * self.ssm_state_dtype.itemsize,
-                        dtype=self.ssm_state_dtype,
-                    ),
+                    MambaRole.CONV_STATE: Sectioned(section_bytes, dtype=self.conv_state_dtype),
+                    MambaRole.SSM_STATE: ByHead(head_bytes=head_bytes, dtype=self.ssm_state_dtype),
                 },
             )
         if self._attention_cache_layout_policy is not None:
             spec = self._fp4_mla_disagg_page_table_spec(spec)
         return spec
 
+    @override
     def _disagg_layer_names(self) -> dict[int, tuple[int, int]]:
         """With the FP4 MLA cache layout, the policy's names, recurrent layers ``2 * L`` beside
         the MLA layers' ``2 * L`` and ``2 * L + 1`` (``_fp4_mla_disagg_layer_names``); else the
@@ -725,22 +717,24 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             layouts.update(self._fp4_mla_disagg_role_layouts())
         if self.local_num_mamba_layers == 0:
             return layouts
-        d_conv_m1 = int(self.conv_state_shape[1])
-        _, head_dim, d_state = self.ssm_state_shape
+        section_bytes, head_bytes = self._recurrent_state_bytes()
         layouts.update(
             {
-                MambaRole.CONV_STATE: RoleLayout(
-                    section_bytes=tuple(
-                        int(dim) * d_conv_m1 * self.conv_state_dtype.itemsize
-                        for dim in self.conv_section_dims
-                    )
-                ),
-                MambaRole.SSM_STATE: RoleLayout(
-                    bytes_per_head=int(head_dim) * int(d_state) * self.ssm_state_dtype.itemsize
-                ),
+                MambaRole.CONV_STATE: RoleLayout(section_bytes=section_bytes),
+                MambaRole.SSM_STATE: RoleLayout(bytes_per_head=head_bytes),
             }
         )
         return layouts
+
+    def _recurrent_state_bytes(self) -> tuple[tuple[int, ...], int]:
+        """The bytes of each convolution-state section and of one SSM-state head on this rank,
+        which the page table spec and the disaggregation hooks both state."""
+        d_conv_m1 = int(self.conv_state_shape[1])
+        _, head_dim, d_state = self.ssm_state_shape
+        section_bytes = tuple(
+            int(dim) * d_conv_m1 * self.conv_state_dtype.itemsize for dim in self.conv_section_dims
+        )
+        return section_bytes, int(head_dim) * int(d_state) * self.ssm_state_dtype.itemsize
 
     def _extra_scratch_bytes_per_slot(self) -> int:
         return 0

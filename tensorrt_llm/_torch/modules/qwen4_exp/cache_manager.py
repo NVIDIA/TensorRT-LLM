@@ -66,6 +66,9 @@ QSA_SIDE_PLANES = DataRole("qsa_side_planes")
 
 PLE_CONV_STATE = DataRole("ple_conv_state")
 PLE_NGRAM_CONTEXT = DataRole("ple_ngram_context")
+# Side roles every tensor rank holds alike: PLE state computed from replicated inputs,
+# request-wide QSA positions and the packed side planes.
+_REPLICATED_SIDE_ROLES = (PLE_CONV_STATE, PLE_NGRAM_CONTEXT, QSA_INDEX_POSITION, QSA_SIDE_PLANES)
 
 
 def get_qwen4_exp_ple_layer_mask(config: transformers.PretrainedConfig) -> list[bool]:
@@ -185,32 +188,22 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
     # Its QSA side buffers and get_buffers override do not support mixed-precision KV.
     _supports_mixed_precision_kv = False
 
+    @override
     def page_table_spec(self) -> PageTableSpec:
         """PLE state is computed from replicated inputs and index positions are request-wide
-        coordinates, so every rank holds the same bytes; so do the packed side planes and the index
-        keys, which project one head alike on every rank. They carry no head axis, which splitting
-        them by the rank's KV heads would assume."""
+        coordinates, so every rank holds the same bytes; so do the packed side planes
+        (``_REPLICATED_SIDE_ROLES``). They carry no head axis, which splitting them by the
+        rank's KV heads would assume."""
         spec = super().page_table_spec()
-        roles = (
-            PLE_CONV_STATE,
-            PLE_NGRAM_CONTEXT,
-            QSA_INDEX_POSITION,
-            QSA_SIDE_PLANES,
-            Role.INDEX_KEY,
-        )
-        return replace(
-            spec, role_layouts={**spec.role_layouts, **{role: Replicated() for role in roles}}
-        )
+        replicated = {role: Replicated() for role in _REPLICATED_SIDE_ROLES}
+        return replace(spec, role_layouts={**spec.role_layouts, **replicated})
 
     @override
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """PLE state and request-wide QSA positions are replicated across TP."""
         return {
             **super().get_disagg_role_mapper_kinds(),
-            PLE_CONV_STATE: MapperKind.REPLICATED,
-            PLE_NGRAM_CONTEXT: MapperKind.REPLICATED,
-            QSA_INDEX_POSITION: MapperKind.REPLICATED,
-            QSA_SIDE_PLANES: MapperKind.REPLICATED,
+            **{role: MapperKind.REPLICATED for role in _REPLICATED_SIDE_ROLES},
         }
 
     @override

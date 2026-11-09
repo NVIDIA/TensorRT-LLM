@@ -140,6 +140,7 @@ from ..resource_manager import (
 )
 from ..scheduler import ScheduledRequests
 from .page_table import ByHead, PageTableSpec, kv_dtype_name, layer_groups
+from .page_table import ByHead, PageTableSpec, Replicated, kv_dtype_name, layer_groups
 from .regions import RegionLayout, RegionProvider, lay_out_regions
 from .sparse_offload_memory import (
     HostHistoryReservations,
@@ -358,7 +359,7 @@ _HEAD_SPLIT_ROLES = frozenset(
 )
 
 
-def _unmixed_layer_names(manager) -> dict[int, tuple[int, int]]:
+def _unmixed_layer_names(manager: "KVCacheManagerV2") -> dict[int, tuple[int, int]]:
     """Internal layer id -> (global layer id, model layer) of every layer of ``manager`` as
     disaggregated transfer names it without mixed-precision KV (``_compute_global_layer_ids``):
     by its model layer (``pp_layers``) or, keeping several caches per model layer, by model layer
@@ -2069,6 +2070,8 @@ class KVCacheManagerV2(BaseResourceManager):
     mixed_precision_low_dtype: DataType | None = None
     mixed_precision_high_layers: dict[int, int] = {}
     mixed_precision_high_dtype: DataType | None = None
+    # Per-layer KV geometry, None when every layer shares the manager's (set by __init__).
+    layer_specs: Optional[tuple[KVCacheLayerSpec, ...]] = None
     # A subclass opts in, and its own subclasses inherit that; the base class always supports it.
     _supports_mixed_precision_kv = False
     # True when the manager's own pool already holds the history in the mixed-precision low format.
@@ -5216,17 +5219,31 @@ class KVCacheManagerV2(BaseResourceManager):
         per request, how its layers are named and how its KV data is quantized.
 
         The base manager lays out the roles it registers itself: K/V and their block scales
-        split by KV head, head-major (HND), as the TRTLLM attention kernels write them; a K-only
-        (MLA) cache holds one latent head, which every tensor rank holds whole. The cache type is
-        the manager's (``kv_factor``); layers that differ in it (``layer_specs`` mixing K-only and
-        K/V caches) are not laid out apart. It names every layer its storage holds
-        (``_disagg_layer_names``). A manager registering other roles (``Role.INDEX_KEY``
-        included) or laying these out otherwise returns its own, usually this one with some fields
-        replaced (``dataclasses.replace``). A role that moves and that its spec does not lay out
-        has no layout (``PageTableSpec.layout_of``)."""
+        split by KV head, head-major (HND), as the TRTLLM attention kernels write them, a K-only
+        (MLA) cache holding one latent head, which every tensor rank holds whole; and index-K,
+        which every tensor rank projects alike. It names every layer its storage holds
+        (``_disagg_layer_names``). A manager registering other roles or laying these out
+        otherwise returns its own, usually this one with some fields replaced
+        (``dataclasses.replace``). A role that moves and that its spec does not lay out has no
+        layout (``PageTableSpec.layout_of``).
+
+        Raises:
+            NotImplementedError: If its layers mix K-only and K/V caches (``layer_specs``),
+                which the spec cannot lay out apart yet.
+            ValueError: If its storage holds a layer it does not name.
+        """
+        if self.layer_specs is not None and len({s.kv_factor for s in self.layer_specs}) > 1:
+            raise NotImplementedError(
+                "a page table spec cannot lay out layers mixing K-only and K/V caches yet"
+            )
         head_split = ByHead(total=1) if self.kv_factor == 1 else ByHead()
         names = self._disagg_layer_names()
-        layer_ids = {layer: names[layer] for layers in layer_groups(self) for layer in layers}
+        layer_ids = {}
+        for layers in layer_groups(self):
+            for layer in layers:
+                if layer not in names:
+                    raise ValueError(f"the manager names no layer {layer} its storage holds")
+                layer_ids[layer] = names[layer]
         mixed_precision = None
         if self.mixed_precision_low_dtype is not None:
             mixed_precision = (
@@ -5234,7 +5251,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 str(self.mixed_precision_high_dtype.name).lower(),
             )
         return PageTableSpec(
-            role_layouts={role: head_split for role in _HEAD_SPLIT_ROLES},
+            role_layouts={
+                **{role: head_split for role in _HEAD_SPLIT_ROLES},
+                Role.INDEX_KEY: Replicated(),
+            },
             layer_ids=layer_ids,
             quant_mode={"FP8": "fp8", "NVFP4": "nvfp4"}.get(kv_dtype_name(self)),
             mixed_precision=mixed_precision,

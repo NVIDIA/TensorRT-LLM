@@ -216,6 +216,43 @@ def test_base_manager_names_mixed_precision_layers_as_its_hooks_do():
     assert spec.quant_mode is None
 
 
+def test_virtual_layer_manager_names_its_layers_as_the_transfer_does():
+    """Model layer 3 keeps its sliding-window and compressed caches in internal layers 0 and 1."""
+    swa, compress = DeepseekV4AttentionType.SWA, DeepseekV4AttentionType.COMPRESS
+    layer_grouping = [[LayerId(0)], [LayerId(1)]]
+    manager = _stub(
+        DeepseekV4CacheManager,
+        dtype=DataType.BF16,
+        kv_factor=1,
+        _disagg_ignored_roles=frozenset(),
+        use_fp8_ds_mla=False,
+        _use_nvfp4_compress=False,
+        pp_layers=[3],
+        _layer_attn_to_layer_id={(3, swa): 0, (3, compress): 1},
+        impl=SimpleNamespace(
+            layer_grouping=layer_grouping,
+            buffer_grouping=_mixed_precision_buffers(layer_grouping),
+        ),
+    )
+    num_types = len(DeepseekV4AttentionType)
+
+    spec = assert_spec_matches_disagg_hooks(manager, ())
+
+    # Model layer x attention types + attention type, as the transfer encodes them.
+    assert dict(spec.layer_ids) == {
+        0: (3 * num_types + swa.value, 3),
+        1: (3 * num_types + compress.value, 3),
+    }
+
+
+def test_base_manager_refuses_layers_mixing_k_only_and_k_v_caches():
+    layer_specs = (SimpleNamespace(kv_factor=1), SimpleNamespace(kv_factor=2))
+    manager = _stub(KVCacheManagerV2, layer_specs=layer_specs)
+
+    with pytest.raises(NotImplementedError, match="K-only and K/V"):
+        manager.page_table_spec()
+
+
 def test_virtual_layer_manager_names_mixed_precision_layers_as_its_hooks_do():
     """Model layer 3 keeps its sliding-window and compressed caches in internal layers 0 and 1,
     the high layer of its local layer in internal layer 2."""
@@ -325,6 +362,8 @@ def test_csa2_caches_are_alike_on_every_rank(bounded_replay):
     spec = assert_spec_matches_disagg_hooks(manager, roles)
 
     assert all(spec.layout_of(str(role)) == Replicated() for role in roles)
+    # The persistent caches are packed records whatever the staging type.
+    assert spec.quant_mode == "csa2_packed"
     # The sliding-window caches a generation worker rebuilds under bounded replay are the ones
     # the hooks keep in transfer views of their own.
     for role in roles:

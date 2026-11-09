@@ -20,10 +20,8 @@ import numpy as np
 import pytest
 
 from tensorrt_llm import bindings
-from tensorrt_llm._torch.disaggregation.base.role_layout import grid_place
 from tensorrt_llm._torch.disaggregation.native import rank_info as rank_info_module
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.rank_info import (
     _LEGACY_PROTOCOL_VERSION,
@@ -53,54 +51,6 @@ def test_rank_info_construction():
     assert ri.layer_num_per_pp == [32]
     assert ri.sender_endpoints == ["tcp://10.0.0.1:5000"]
     assert ri.bounded_replay_on_generation is False
-
-
-@pytest.mark.parametrize(
-    "attention_dp, tp_place",
-    [
-        (None, (4, 3)),  # no attention: the TP ranks split it
-        (False, (4, 3)),
-        # Under attention data parallelism each TP rank holds its buffers whole.
-        (True, (1, 0)),
-    ],
-)
-def test_rank_info_topology_is_its_parallel_place(attention_dp, tp_place):
-    attention = None
-    if attention_dp is not None:
-        attention = AttentionInfo(
-            kv_heads_per_rank=2,
-            tokens_per_block=32,
-            dims_per_head=128,
-            element_bytes=2,
-            enable_attention_dp=attention_dp,
-            is_mla=False,
-        )
-    ri = RankInfo(
-        instance_name="gen_0",
-        instance_rank=3,
-        tp_size=4,
-        tp_rank=3,
-        pp_size=2,
-        pp_rank=1,
-        layer_num_per_pp=[16, 16],
-        sender_endpoints=[],
-        self_endpoint="tcp://10.0.0.1:5001",
-        transfer_engine_info=b"",
-        dp_size=4 if attention_dp else 1,
-        dp_rank=3 if attention_dp else 0,
-        cp_size=2,
-        cp_rank=1,
-        attention=attention,
-    )
-
-    topology = ri.topology
-
-    assert (topology.tp_size, topology.tp_rank) == (4, 3)
-    assert (topology.pp_size, topology.pp_rank, topology.cp_size, topology.cp_rank) == (2, 1, 2, 1)
-    assert topology.attention_dp is bool(attention_dp)
-    assert grid_place(topology, ("tp",)) == tp_place
-    # Not a field: a peer receives the same bytes as before.
-    assert "topology" not in msgpack.unpackb(ri.to_bytes(), strict_map_key=False)
 
 
 @pytest.mark.parametrize("bounded_replay_on_generation", [False, True])
