@@ -510,6 +510,7 @@ def _normalize_qwen35_exclude_modules(model_config, keep_lm_head_quant=False):
         # Drop vision tensors (not part of the language model graph)
         if name.startswith("model.visual"):
             continue
+        # Only dense _DenseMlpAdapter paths match; MoE expert paths are unchanged.
         name = re.sub(
             r"(\.layers\.[^.]+\.mlp)\.(gate_proj|up_proj|down_proj|gate_up_proj)(\b|\*)",
             r"\1.mlp.\2\3",
