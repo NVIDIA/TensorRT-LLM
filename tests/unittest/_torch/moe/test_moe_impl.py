@@ -40,6 +40,7 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     MoEActivationSupport,
     SwigluActivation,
 )
+from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
     TrtllmCutedslDenseGemmNvfp4Impl,
@@ -1745,6 +1746,59 @@ def test_llama4_min_latency_experts_keep_the_layer_quant_config(monkeypatch):
     assert base_experts["override_quant_config"] is None
     fused_moe = modeling_llama_min_latency.Llama4MinLatencyFusedMoE
     assert fused_moe.call_args.kwargs["override_quant_config"] is nvfp4
+
+
+@pytest.mark.parametrize(
+    "tactic, accepted",
+    [
+        (None, True),
+        ("cutlass", True),
+        ("trtllm.cutlass.grouped_gemm.nvfp4", True),
+        ("nvfp4", True),
+        ("cutedsl.grouped_gemm", False),
+        ("trtllm_gen", False),
+    ],
+)
+def test_llama4_min_latency_experts_refuse_a_tactic_not_naming_cutlass(
+    monkeypatch, tactic, accepted
+):
+    """The min-latency experts always run the CUTLASS leaf of their format and
+    skip MoE resolution, so a tactic that does not name that leaf is refused
+    instead of being ignored."""
+    from tensorrt_llm._torch.models import modeling_llama_min_latency
+
+    class _Built(Exception):
+        pass
+
+    built = []
+
+    def configurable_moe_init(self, *, moe_cls, **kwargs):
+        built.append(moe_cls)
+        raise _Built
+
+    monkeypatch.setattr(ConfigurableMoE, "__init__", configurable_moe_init)
+    model_config = ModelConfig(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4), moe_tactic=tactic
+    )
+
+    def build():
+        modeling_llama_min_latency.Llama4MinLatencyFusedMoE(
+            routing_method=MagicMock(),
+            num_experts=4,
+            hidden_size=8,
+            intermediate_size=16,
+            model_config=model_config,
+            apply_router_weight_on_input=True,
+        )
+
+    if accepted:
+        with pytest.raises(_Built):
+            build()
+        assert built == [TrtllmCutlassNvfp4Impl]
+    else:
+        with pytest.raises(ValueError, match=r"enable_min_latency.*moe_config\.tactic"):
+            build()
+        assert built == []
 
 
 def test_gpt_oss_translates_exclusions_before_building_its_layers(monkeypatch):
