@@ -22,7 +22,7 @@ At small batch the trtllm-gen in-kernel split-KV reduction dominates. Instead:
 """
 
 import math
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 import triton
@@ -48,6 +48,9 @@ _SOFTMAX_STATS_GUARD_BYTES = 1 << 20
 
 # device index -> workspace of the segment attention calls, shared by every layer: the calls are ordered on one stream.
 _WORKSPACES: Dict[int, torch.Tensor] = {}
+# Workspaces replaced by a larger reservation, kept for the process lifetime: a CUDA graph captured before the growth
+# still reads and writes them on replay.
+_RETIRED_WORKSPACES: List[torch.Tensor] = []
 
 
 def segment_attention_softmax_bytes(num_requests: int, num_heads: int) -> int:
@@ -62,7 +65,8 @@ def _device_index(device: torch.device) -> int:
 
 def reserve_segment_attention_workspace(device: torch.device, nbytes: int) -> None:
     """Grow this device's segment attention workspace to at least nbytes. Only outside CUDA graph capture: callers
-    reserve their largest call before capture, so captured graphs keep valid addresses."""
+    reserve their largest call before capture. A replaced workspace stays allocated, so graphs captured on it remain
+    valid."""
     idx = _device_index(device)
     workspace = _WORKSPACES.get(idx)
     if workspace is None or workspace.numel() < nbytes:
@@ -70,6 +74,8 @@ def reserve_segment_attention_workspace(device: torch.device, nbytes: int) -> No
             raise RuntimeError(
                 "The segmented decode workspace must be allocated before CUDA graph capture."
             )
+        if workspace is not None:
+            _RETIRED_WORKSPACES.append(workspace)
         _WORKSPACES[idx] = torch.empty(nbytes, dtype=torch.uint8, device=torch.device("cuda", idx))
 
 

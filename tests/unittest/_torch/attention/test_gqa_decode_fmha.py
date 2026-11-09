@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import functools
+import weakref
 from typing import Optional
 
 import backend_case
@@ -24,6 +25,7 @@ from kv_cache_utils import fill_kv_cache_logical
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention.backends.fmha import gqa_kv_replica_fused as F
+from tensorrt_llm._torch.attention.backends.fmha import gqa_segmented_decode
 from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
     _get_generation_workspace_layout,
 )
@@ -63,6 +65,13 @@ pytestmark = pytest.mark.skipif(
 
 HIDDEN, HEADS, HEAD_DIM, PAGE = 512, 4, 256, 64
 CP = 4
+
+
+@pytest.fixture(autouse=True)
+def _isolated_segment_workspaces(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give each test its own segment attention workspace registry."""
+    monkeypatch.setattr(gqa_segmented_decode, "_WORKSPACES", {})
+    monkeypatch.setattr(gqa_segmented_decode, "_RETIRED_WORKSPACES", [])
 
 
 @pytest.mark.parametrize(
@@ -370,7 +379,7 @@ def _prefix_partial_ref(q_all, kv_pool, tables, seq_lens, q_len, page, bmm1):
 @pytest.mark.parametrize(
     "max_batch,tokens_per_gen_step,softmax_bytes",
     [
-        # Qwen3.5-397B FP4 TP4, batch 512 (nvbugs/7046451): 1024 FMHA requests of 16 folded heads
+        # Qwen3.5-397B FP4 TP4, batch 512: 1024 FMHA requests of 16 folded heads
         (512, 1, 34603008),
         # with three draft tokens: 512 requests of 64 folded heads
         (512, 4, 68157440),
@@ -380,7 +389,7 @@ def test_kv_replica_segment_workspace_holds_largest_call(
     max_batch: int, tokens_per_gen_step: int, softmax_bytes: int
 ) -> None:
     """GqaKvReplicaFmha's reserved workspace takes its largest segment attention call, whose softmax stats overflow
-    the trtllm-gen decode's own FMHA workspace (nvbugs/7046451)."""
+    the trtllm-gen decode's own FMHA workspace."""
     cp, hq, page, max_kv_len = 2, 8, 32, 262144  # KV group of two TP ranks, 8 local q heads
     group_heads = cp * hq
     largest = GqaKvReplicaFmha._largest_segment_call(max_batch, tokens_per_gen_step, group_heads)
@@ -454,3 +463,18 @@ def test_kv_replica_segment_workspace_holds_largest_call(
     rel = ((merged_o - rf).abs() / rf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-3)).amax()
     assert rel.item() < 0.07, rel.item()
     assert (merged_lse - ref_lse).abs().amax().item() < 0.05
+
+
+def test_segment_workspace_growth_keeps_replaced_buffer() -> None:
+    """A larger reservation leaves the replaced workspace allocated at its address; a smaller one changes nothing."""
+    dev = torch.device("cuda", 0)
+    reserve_segment_attention_workspace(dev, 1 << 20)
+    small = weakref.ref(segment_attention_workspace(dev))
+    small_ptr = small().data_ptr()
+    reserve_segment_attention_workspace(dev, 2 << 20)
+    large = segment_attention_workspace(dev)
+    assert large.numel() == 2 << 20
+    assert small() is not None and small().data_ptr() == small_ptr
+    assert large.data_ptr() != small_ptr
+    reserve_segment_attention_workspace(dev, 1 << 20)
+    assert segment_attention_workspace(dev) is large
