@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Resolve a tune task into its workloads and serving configuration."""
+"""Resolve the tune stage's perf block into its workloads and serving configuration."""
 
 from __future__ import annotations
 

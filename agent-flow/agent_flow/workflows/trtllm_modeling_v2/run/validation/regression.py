@@ -43,7 +43,7 @@ from ...infra.compute.sessions import GATE_ROLES
 from ...infra.git import git_output
 from ...operators.coverage import CATALOG_TESTS_DIR, MODELING_V2_PACKAGE
 
-#: The declared list a regression check runs: the package's source-level gates,
+#: The declared list the delivery's package tests come from: the package's source-level gates,
 #: the catalog's entries and every target's own.
 PACKAGE_TESTS: tuple[str, ...] = (CATALOG_TESTS_DIR,)
 #: Where a check's selections go, under the workspace: ``<this>/<task id>/``.

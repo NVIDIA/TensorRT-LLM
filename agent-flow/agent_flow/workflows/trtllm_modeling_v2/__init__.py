@@ -1,13 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""trtllm_modeling_v2: the ModelingV2 onboarding and tuning workflow, built on ``agent_flow.AgentLayer``.
+"""trtllm_modeling_v2: the ModelingV2 onboarding workflow, and its tune command, built on ``agent_flow.AgentLayer``.
 
 Brings one deployment target — a ``(checkpoint, GPU arch, parallel
 config)`` triple — from a HuggingFace checkpoint to a gated
 ``tensorrt_llm/_torch/_experimental/modeling_v2`` target::
 
-    preflight -> execution stage (planner + workers; a tune task joins) -> delivery
+    preflight -> execution stage (planner + workers) -> delivery
+
+and, as a command of its own on a delivered target, ``trtllm-modeling-v2 tune``.
 
 See ``README.md`` for usage and architecture, and ``task.example.yaml`` for configuration.
 """
