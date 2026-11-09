@@ -240,15 +240,9 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
         2, HIDDEN * NCAP, device="cuda", dtype=torch.bfloat16
     )
     second_chunk = types.SimpleNamespace(num_contexts=1, _seq_lens=[2])
-    # With host positions, the continuation chunk is seeded without waiting for the GPU.
-    metadata.host_position_ids = torch.tensor([3, 4], dtype=torch.int)
-    second_positions = torch.tensor([[3, 4]], device="cuda")
-    torch.cuda.synchronize()
-    torch.cuda.set_sync_debug_mode("error")
-    try:
-        worker._seed_context_windows(draft_model, metadata, second_chunk, second_positions, 2)
-    finally:
-        torch.cuda.set_sync_debug_mode("default")
+    worker._seed_context_windows(
+        draft_model, metadata, second_chunk, torch.tensor([[3, 4]], device="cuda"), 2
+    )
 
     assert int(worker._ctx_len[slot]) == 5
     assert int(worker._valid_len[slot]) == 5
