@@ -521,3 +521,74 @@ def test_sm103_tep8_hop_direct128_switch_and_scatter_addresses(monkeypatch):
                         dst = origin + bidx * ((slots - 1) * cta_m) + p * PS + s * cta_m + fchunk * 8
                         stored[(dst // PS, dst % PS)] = (row0 + tok, bidx * cta_m + fchunk * 8)
         assert stored == polled, max_rows
+
+
+def test_sm103_tep8_hop128_producer_switch_and_wide_tile_addresses(monkeypatch):
+    """``MUSESPARK_OPEN_SM103_TEP8_HOP128_PRODUCER`` (default ``chunks``, in no defaults table, read only with
+    the hop128 switch) picks the 65..128-row o_proj producer; ``grid`` / ``tile128`` publish the whole call in one
+    launch whose stores land exactly where the direct consumer polls (host model of the wide-tile epilogue: token tile
+    y of cta_n tokens, warp / lane / j map, every token and feature at 128 rows / 16 slots)."""
+    name = DEFAULTS.SM103_TEP8_HOP128_PRODUCER_ENV
+    assert name == "MUSESPARK_OPEN_SM103_TEP8_HOP128_PRODUCER"
+    assert name not in DEFAULTS.SM103_TEP8_DEFAULTS and name not in DEFAULTS.SM107_DEFAULTS
+    for value, want in (("", ("chunks", 7)), ("chunks", ("chunks", 7)), ("grid", ("grid", 3)), ("grid:4", ("grid", 4)),
+                        ("tile128", ("tile128", 4)), ("tile128:3", ("tile128", 3))):
+        monkeypatch.setenv(name, value)
+        assert DEFAULTS.sm103_tep8_hop128_producer() == want, value
+    for bad in ("chunks:3", "grid:0", "grid:x", "tile64", "tile128:13"):
+        monkeypatch.setenv(name, bad)
+        with pytest.raises(ValueError):
+            DEFAULTS.sm103_tep8_hop128_producer()
+    monkeypatch.delenv(name)
+
+    wide = (_TARGET / "ops/allreduce/post_attn_hop_wide.py").read_text()
+    assert 'DIRECT128_PRODUCER = _sm103_tep8_hop128_producer() if DIRECT128 else ("chunks", 7)' in wide
+    # The image's scatter build is unchanged: whole-capacity request, the 64-token fb loop, the view at (bidx, n_idx).
+    assert 'self.scatter_smem = utils.get_smem_capacity_in_bytes("sm_100")' in wide
+    assert "cute.local_tile(mC, c_tiler_mn, (bidx, 0 if self.wide_tiles else n_idx, l_idx))" in wide
+    assert "p = warp + 4 * (j // 2)\n" in wide and "s = 4 * (j % 2) + lane // chunks\n" in wide
+    dispatcher = (_TARGET / "kernels/dense_gemms/dispatcher.py").read_text()
+    assert 'mode, stages = _wide.DIRECT128_PRODUCER\n        if mode != "chunks":' in dispatcher
+
+    ranks, cta_m, hidden, PS, max_rows = 8, 64, 8192, 1 << 24, 128
+    slots = max_rows // ranks
+    for rows in (65, 96, 127, 128):
+        polled = {}
+        for row in range(rows):
+            for offset in range(0, hidden, 8):
+                polled[(row % ranks, (offset // 64) * (slots * 64) + (row // ranks) * 64 + offset % 64)] = (row, offset)
+        for cta_n in (64, 128):
+            stored = {}
+            for y in range((rows + cta_n - 1) // cta_n):
+                t0 = y * cta_n
+                for bidx in range(hidden // cta_m):
+                    origin = bidx * cta_m  # local_tile(mC, ..., (bidx, 0, l)): the view of token 0
+                    for epi_tid in range(128):
+                        warp, lane = epi_tid // 32, epi_tid % 32
+                        fchunk = lane % (cta_m // 8)
+                        for j in range(cta_n // 16):
+                            p = warp + 4 * ((j // 2) % 2)
+                            s = 4 * (j % 2) + lane // (cta_m // 8) + 8 * (j // 4)
+                            tok = p + 8 * s
+                            if t0 + tok < rows:
+                                dst = origin + bidx * ((slots - 1) * cta_m) + p * PS + (t0 // 8 + s) * cta_m + fchunk * 8
+                                key = (dst // PS, dst % PS)
+                                assert key not in stored, (rows, cta_n, key)
+                                stored[key] = (t0 + tok, bidx * cta_m + fchunk * 8)
+            assert stored == polled, (rows, cta_n)
+
+
+def test_sm103_tep8_publish_wide_one_switch():
+    """``MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE_ONE`` (default off, environment only, in no defaults table) takes
+    the split_k-1 publication of a 65..128-row slice in one launch compiled as the 64-row launch (same producer key);
+    off, ``_publish_chunked`` keeps the forked 64-row launches."""
+    src = (_TARGET / "ops/comm/projection_publish.py").read_text()
+    name = "MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE_ONE"
+    assert name not in DEFAULTS.SM103_TEP8_DEFAULTS and name not in DEFAULTS.SM107_DEFAULTS
+    assert f'WIDE_ONE_ENV = "{name}"' in src and "_WIDE_ONE = os.environ.get(WIDE_ONE_ENV, \"\").strip()" in src
+    assert ("    if WIDE_ONE and table is TP8_PUBLISH_SPLITK1_TACTICS and rows <= 2 * SPLITK_MAX_ROWS:\n"
+            "        _run_splitk1_one(hidden, weight, slot, tactic)\n") in src
+    assert '"publish in one launch", key="musespark_open.t8r4.publish_wide_one")\n        return True\n' \
+        "    main = torch.cuda.current_stream(hidden.device)\n" in src
+    assert "**sk._launch_options(SPLITK_MAX_ROWS, tactic.split_k)," in src
+    assert "sk.validate_tactic(tactic, SPLITK_MAX_ROWS, n, k)" in src

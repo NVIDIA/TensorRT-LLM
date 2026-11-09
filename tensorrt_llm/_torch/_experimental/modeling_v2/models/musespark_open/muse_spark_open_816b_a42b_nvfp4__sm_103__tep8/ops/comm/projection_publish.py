@@ -974,6 +974,11 @@ def _publish_chunked(hidden, weight, slot, table) -> bool:
             run_splitk_dense(hidden[a:b], weight.t(), None, slot[a:b], _SPLITK_PDL, splitk_tactic(*tactic))
         return True
     tactic = splitk_tactic(*table[(hidden.shape[1], weight.shape[0])])
+    if WIDE_ONE and table is TP8_PUBLISH_SPLITK1_TACTICS and rows <= 2 * SPLITK_MAX_ROWS:
+        _run_splitk1_one(hidden, weight, slot, tactic)
+        logger.info_once(f"[musespark_open] projection_publish: {WIDE_ONE_ENV}=1: 65..128-row split_k-1 slices "
+                         "publish in one launch", key="musespark_open.t8r4.publish_wide_one")
+        return True
     main = torch.cuda.current_stream(hidden.device)
     side = _chunk_streams.get(hidden.device)
     if side is None:
@@ -993,6 +998,40 @@ def _publish_chunked(hidden, weight, slot, table) -> bool:
     # launches; ``weight`` is a parameter and ``slot`` transport memory.
     main.wait_stream(side)
     return True
+
+
+#: ``MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE_ONE=1`` (with ``PUBLISH_WIDE=splitk1``; default off, the environment
+#: only) publishes a 65..128-row slice as ONE launch of the split_k-1 kernel over every row (its grid's second dimension
+#: takes the row tiles) on the current stream (PDL), instead of 64-row launches forked onto a side stream and joined
+#: back. Same tactic, same compile options as the 64-row launch (one producer key), split_k 1: every element one
+#: full-K FP32 accumulation in K order, rounded once, so the bits do not depend on the launch (device-checked).
+#: Without the fork / join the post-FFN join and the next consumer stay
+#: programmatic dependents of the publication, and every CTA stages its weight before the dependency wait.
+WIDE_ONE_ENV = "MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE_ONE"
+_WIDE_ONE = os.environ.get(WIDE_ONE_ENV, "").strip()
+if _WIDE_ONE not in ("", "0", "1"):
+    raise ValueError(f"{WIDE_ONE_ENV}={_WIDE_ONE!r}: expected 0 or 1")
+WIDE_ONE = _WIDE_ONE == "1"
+
+
+def _run_splitk1_one(hidden: torch.Tensor, weight: torch.Tensor, slot: torch.Tensor, tactic) -> None:
+    """``WIDE_ONE``: ``run_splitk_dense`` of all ``rows`` (65..128) in one launch, compiled exactly as the
+    64-row launch (``_launch_options(SPLITK_MAX_ROWS, 1)``); the tactic is validated at the 64-row launch's M (tile,
+    K partition, shared memory), the kernel itself tiles any M."""
+    from ..gemm import splitk_gemm as sk
+
+    a, b = hidden, weight.t()
+    m, n, k = sk._validate_runtime_tensors(a, b, None, slot)
+    if tactic.split_k != 1 or not SPLITK_MAX_ROWS < m <= 2 * SPLITK_MAX_ROWS:
+        raise ValueError(f"publish WIDE_ONE: split_k 1 at {SPLITK_MAX_ROWS + 1}..{2 * SPLITK_MAX_ROWS} rows, got "
+                         f"{tactic} at {m}")
+    sk.validate_tactic(tactic, SPLITK_MAX_ROWS, n, k)
+    cute_tensors = sk._to_cute_swap(a, b, slot, None)
+    compiled = sk._get_compiled_splitk_kernel(
+        dtype=a.dtype, tactic=tactic, use_pdl=_SPLITK_PDL, has_bias=False, leading_dims=cute_tensors[4],
+        **sk._launch_options(SPLITK_MAX_ROWS, tactic.split_k),
+    )
+    compiled(*cute_tensors[:3], sk._cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream))
 
 
 #: SM counts where the split_k-1 producer passed the census (single store, every row 33..128 in 64-row launches, both

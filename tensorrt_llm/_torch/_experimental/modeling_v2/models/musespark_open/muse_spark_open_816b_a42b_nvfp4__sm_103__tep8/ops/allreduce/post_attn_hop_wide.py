@@ -99,6 +99,7 @@ from __future__ import annotations
 
 from ...sm107_defaults import env as _sm107_env
 from ...sm107_defaults import sm103_tep8_hop_direct128 as _sm103_tep8_hop_direct128
+from ...sm107_defaults import sm103_tep8_hop128_producer as _sm103_tep8_hop128_producer
 
 import functools
 import os
@@ -2454,6 +2455,10 @@ DIRECT128_MAX_ROWS = 128
 DIRECT128_PAD_ROWS = (0, 64)
 if DIRECT128:
     SERVED_DIRECT_ROWS = (SERVED_DIRECT_ROWS[0], max(SERVED_DIRECT_ROWS[1], DIRECT128_MAX_ROWS))
+#: sm107_defaults.sm103_tep8_hop128_producer: ``(mode, ab_stages)`` of the 65..128-row o_proj producer --
+#: ``chunks`` (two serial 64-row launches), ``grid`` (one launch, a 64-row token tile per blockIdx.y) or
+#: ``tile128`` (one launch of 128-token tiles). Same bits in every mode (split_k 1).
+DIRECT128_PRODUCER = _sm103_tep8_hop128_producer() if DIRECT128 else ("chunks", 7)
 #: The direct consumer's grid: two rows per 512-thread CTA from this many (even) rows; its SMEM pad (bytes, 0 off).
 SERVED_DIRECT_WIDE_MIN_ROWS = int(_sm107_env("MUSESPARK_OPEN_TEP8_HOP_DIRECT_WIDE_MIN_ROWS", "41"))
 SERVED_DIRECT_PAD = int(_sm107_env("MUSESPARK_OPEN_TEP8_HOP_DIRECT_PAD", "177408"))
@@ -2788,6 +2793,9 @@ try:
         _store_shared_remote_v4,
         _to_cute_swap,
         _validate_runtime_tensors,
+        _smem_bytes,
+        _SMEM_CAPACITY_BYTES,
+        _CTA_K,
         validate_tactic,
     )
 
@@ -2804,10 +2812,23 @@ if HAS_SCATTER_GEMM:
         the same values; only the addresses of the final stores differ. Defined here (not in the kernel file) so the
         kernel's device code -- and the TP8 publish certification keyed on it (``producer_key``) -- stays the stack's."""
 
-        def __init__(self, *, tactic: SplitKTactic, use_pdl: bool, fb_layout: bool = False, slots: int = 8) -> None:
+        def __init__(self, *, tactic: SplitKTactic, use_pdl: bool, fb_layout: bool = False, slots: int = 8,
+                     wide_tiles: bool = False) -> None:
             super().__init__(tactic=tactic, use_pdl=use_pdl, has_bias=False, mailbox_v4=True)
-            if tactic.split_k != 1 or (fb_layout and (tactic.mma_m != 64 or tactic.mma_n != 64)):
+            #: hop128 producer (``grid`` / ``tile128``): the call's token tiles (blockIdx.y, cta_n 64 or 128) store
+            #: through one view, each tile's slots offset by its first token; fb layout only.
+            self.wide_tiles = bool(wide_tiles)
+            if self.wide_tiles:
+                if tactic.split_k != 1 or not fb_layout or tactic.mma_m != 64 or tactic.mma_n not in (64, 128):
+                    raise ValueError(f"the wide-tile scatter epilogue serves split_k 1, fb layout, 64 x (64 | 128) "
+                                     f"tiles only, got {tactic} fb_layout={fb_layout}")
+                # The exact allocation (sm107's allocator mirror) plus 1 KiB, so a grid-mode build at few stages keeps
+                # two CTAs per SM resident; the image's scatter build keeps requesting the whole capacity.
+                self.scatter_smem = ((_smem_bytes(tactic, tactic.ab_stages) + 1023) // 1024) * 1024 + 1024
+            elif tactic.split_k != 1 or (fb_layout and (tactic.mma_m != 64 or tactic.mma_n != 64)):
                 raise ValueError(f"the scatter epilogue serves split_k 1 (fb layout: 64 x 64 tiles) only, got {tactic}")
+            else:
+                self.scatter_smem = utils.get_smem_capacity_in_bytes("sm_100")
             if slots < 8 or slots % 8:
                 raise ValueError(f"the scatter epilogue's slots per source are a multiple of 8, got {slots}")
             self.scatter = True
@@ -2834,7 +2855,7 @@ if HAS_SCATTER_GEMM:
                 ),
                 block=(self.threads_per_cta, 1, 1),
                 cluster=self.cluster_shape,
-                smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
+                smem=cute.Int64(self.scatter_smem),
                 stream=stream,
                 use_pdl=self.use_pdl,
             )
@@ -3018,7 +3039,8 @@ if HAS_SCATTER_GEMM:
                     bar_tmem_alloc,
                     tmem_base_ptr,
                     acc_layout,
-                    cute.local_tile(mC, c_tiler_mn, (bidx, n_idx, l_idx)),
+                    # Wide tiles: the view's origin (token 0); scatter_store offsets the tile's slots itself.
+                    cute.local_tile(mC, c_tiler_mn, (bidx, 0 if self.wide_tiles else n_idx, l_idx)),
                     cute.local_tile(mBias, c_tiler_mn, (bidx, n_idx, l_idx)),
                     cute.arch.thread_idx()[0] - 128,
                     mC.element_type,
@@ -3208,7 +3230,35 @@ if HAS_SCATTER_GEMM:
             chunks = self.cta_m // 8
             atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), c_dtype, num_bits_per_copy=128)
             vec = cute.make_rmem_tensor(cute.make_layout((8,)), c_dtype)
-            if cutlass.const_expr(self.fb_layout):
+            if cutlass.const_expr(self.wide_tiles):
+                # The fb layout for a token tile of cta_n (64 | 128) tokens starting at token t0 = blockIdx.y
+                # cta_n: tile token tok (owner p = tok % 8, tile slot s = tok // 8) goes to slot t0 / 8 + s of owner p;
+                # each warp instruction still writes 4 consecutive slots (4 x 128 B) of one owner.
+                warp = epi_tid // 32
+                lane = epi_tid % 32
+                fchunk = lane % chunks
+                t0 = cutlass.Int32(cute.arch.block_idx()[1]) * self.cta_n
+                for j in cutlass.range_constexpr(self.cta_n // 16):
+                    p = warp + 4 * ((j // 2) % 2)
+                    s = 4 * (j % 2) + lane // chunks + 8 * (j // 4)
+                    tok = p + 8 * s
+                    if t0 + tok < rows:
+                        cute.copy(
+                            atom,
+                            cute.make_tensor(
+                                (sT.iterator + tok * pitch + fchunk * 8).align(16), cute.make_layout((8,))
+                            ),
+                            vec,
+                        )
+                        dst = (
+                            gD_tile.iterator
+                            + cutlass.Int64(bidx) * ((self.slots - 1) * self.cta_m)
+                            + cutlass.Int64(p) * peer_stride_el
+                            + cutlass.Int64(t0 // 8 + s) * self.cta_m
+                            + fchunk * 8
+                        )
+                        cute.copy(atom, vec, cute.make_tensor(dst.align(16), cute.make_layout((8,))))
+            elif cutlass.const_expr(self.fb_layout):
                 # Feature-block-major slots: owner p's area holds [feature block of cta_m][8 slots][cta_m features],
                 # so this CTA's 8 tokens for owner p are one contiguous (8 * cta_m * 2)-byte run, and each warp
                 # instruction writes 4 consecutive slots (4 x 128 B, contiguous) of one owner.
@@ -3236,7 +3286,7 @@ if HAS_SCATTER_GEMM:
                         )
                         cute.copy(atom, vec, cute.make_tensor(dst.align(16), cute.make_layout((8,))))
             for j in cutlass.range_constexpr(
-                0 if self.fb_layout else (self.cta_m * self.cta_n) // 8 // self.epilog_threads
+                0 if (self.fb_layout or self.wide_tiles) else (self.cta_m * self.cta_n) // 8 // self.epilog_threads
             ):
                 idx = epi_tid + j * self.epilog_threads
                 tok = idx // chunks
@@ -3281,8 +3331,9 @@ if HAS_SCATTER_GEMM:
 
     @functools.cache
     def _get_compiled_scatter_kernel(dtype, tactic: SplitKTactic, use_pdl: bool, leading_dims, fb_layout: bool = False,
-                                     slots: int = 8):
-        kernel = SplitKScatterKernel(tactic=tactic, use_pdl=use_pdl, fb_layout=fb_layout, slots=slots)
+                                     slots: int = 8, wide_tiles: bool = False):
+        kernel = SplitKScatterKernel(tactic=tactic, use_pdl=use_pdl, fb_layout=fb_layout, slots=slots,
+                                     wide_tiles=wide_tiles)
         a_rep, b_rep, c_rep, _ = _make_compile_repr_tensors(dtype, False, *leading_dims)
         stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
         return cute_ext.compile(_bmm_scatter, kernel, a_rep, b_rep, c_rep, cutlass.Int64(0), cutlass.Int32(0), stream)
@@ -3301,6 +3352,35 @@ if HAS_SCATTER_GEMM:
             raise ValueError(f"scatter epilogue: rows <= mma_n, 8192 columns; got {m} x {n}")
         cute_tensors = _to_cute_swap(a, b, out, None)
         compiled = _get_compiled_scatter_kernel(a.dtype, tactic, pdl, cute_tensors[4], bool(fb_layout), int(slots))
+        stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
+        compiled(*cute_tensors[:3], cutlass.Int64(peer_stride_bytes // 2), cutlass.Int32(m), stream)
+        return out
+
+
+    def hop128_tactic(mode: str, stages: int) -> SplitKTactic:
+        """The one-launch producer's tactic: ``grid`` 64 x 64 tiles, ``tile128`` 64 x 128 tiles, split_k 1."""
+        if mode not in ("grid", "tile128"):
+            raise ValueError(f"hop128 one-launch producer: mode grid or tile128, got {mode!r}")
+        return SplitKTactic(64, 64 if mode == "grid" else 128, 1, int(stages))
+
+
+    def run_splitk_scatter_wide(a, b, out, pdl: bool, tactic: SplitKTactic, peer_stride_bytes: int, slots: int):
+        """hop128 (``MUSESPARK_OPEN_SM103_TEP8_HOP128_PRODUCER=grid|tile128``): ``run_splitk_scatter`` of a whole
+        65..128-row call in ONE launch (fb layout): token tile y (``tactic.mma_n`` tokens from y mma_n) stores token t
+        at owner t % 8, slot t // 8 of ``out`` (the producer view of token 0), exactly where the 64-row chunks stored it.
+        split_k 1: every element one full-K FP32 accumulation in K order, rounded once (the chunks' and cuBLAS's
+        bits); the tile width and stage count change only the launch."""
+        m, n, k = _validate_runtime_tensors(a, b, None, out)
+        if tactic.split_k != 1 or tactic.mma_m != 64 or tactic.mma_n not in (64, 128):
+            raise ValueError(f"wide scatter: split_k 1, 64 x (64 | 128) tiles; got {tactic}")
+        if not 1 <= m <= 128 or n != 8192 or k <= 0 or k % _CTA_K or peer_stride_bytes % 16:
+            raise ValueError(f"wide scatter: 1..128 rows, 8192 columns, K a multiple of {_CTA_K}; got {m} x {n} x {k}")
+        if slots * 8 < m or slots % 8:
+            raise ValueError(f"wide scatter: {slots} slots per source do not hold {m} rows")
+        if _smem_bytes(tactic, tactic.ab_stages) + 2048 > _SMEM_CAPACITY_BYTES:
+            raise ValueError(f"wide scatter: {tactic} does not fit {_SMEM_CAPACITY_BYTES} B of shared memory")
+        cute_tensors = _to_cute_swap(a, b, out, None)
+        compiled = _get_compiled_scatter_kernel(a.dtype, tactic, pdl, cute_tensors[4], True, int(slots), True)
         stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
         compiled(*cute_tensors[:3], cutlass.Int64(peer_stride_bytes // 2), cutlass.Int32(m), stream)
         return out

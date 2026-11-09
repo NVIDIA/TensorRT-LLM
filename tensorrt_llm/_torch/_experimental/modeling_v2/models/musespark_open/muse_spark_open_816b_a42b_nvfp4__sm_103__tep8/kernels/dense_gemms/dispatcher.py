@@ -1076,8 +1076,21 @@ class DenseGemmDispatcher:
             plan.join_role(site.role)
         a = input_tensor.view(-1, k)
         b = weight.t()
-        tactic = _wide.SplitKTactic(*fields)
         slots = publication.target_slots()
+        mode, stages = _wide.DIRECT128_PRODUCER
+        if mode != "chunks":
+            # MUSESPARK_OPEN_SM103_TEP8_HOP128_PRODUCER=grid|tile128: the whole call in one launch, same bits.
+            if not fb_layout:
+                raise RuntimeError(f"[musespark_open] hop128 producer {mode}: needs the fb-layout workspace")
+            _wide.run_splitk_scatter_wide(
+                a, b, publication.chunk_view(view, 0, rows), plan.enable_pdl, _wide.hop128_tactic(mode, stages),
+                peer_stride, slots,
+            )
+            logger.info_once(
+                f"[musespark_open] hop128 producer: o_proj of {TEP8_WIDE64_MAX_ROWS + 1}..128-row steps in one "
+                f"{mode} launch ({stages} stages)", key="musespark_open.t8r4.hop128_producer")
+            return view.view(*input_tensor.shape[:-1], int(weight.shape[0]))
+        tactic = _wide.SplitKTactic(*fields)
         for row0 in range(0, rows, TEP8_WIDE64_MAX_ROWS):
             n = min(TEP8_WIDE64_MAX_ROWS, rows - row0)
             _wide.run_splitk_scatter(

@@ -274,6 +274,30 @@ def sm103_tep8_hop_direct128() -> bool:
     return value == "1"
 
 
+#: hop128 producer: ``MUSESPARK_OPEN_SM103_TEP8_HOP128_PRODUCER`` (with ``..._HOP_DIRECT128=1``; default
+#: ``chunks``, in no defaults table) picks how o_proj of a 65..128-row armed step publishes into the direct workspace:
+#:   * ``chunks``: the two 64-row launches of the served scatter kernel, one after the other (PDL-chained);
+#:   * ``grid[:S]``: one launch over the whole call, a 64-row token tile per ``blockIdx.y`` (each tile's slots offset by
+#:     its first token), ``S`` stages (default 3: two CTAs per SM, so both token tiles' 2 x 128 CTAs are resident);
+#:   * ``tile128[:S]``: one launch of 128-token tiles (one CTA per 64 features streams the weight once), ``S`` stages
+#:     (default 4).
+#: Every mode is split_k 1 (one full-K FP32 accumulation in K order, rounded once: the per-element bits do not depend
+#: on the tile width, the row count or the stage count), so all three store the same bits; only the launch differs.
+SM103_TEP8_HOP128_PRODUCER_ENV = "MUSESPARK_OPEN_SM103_TEP8_HOP128_PRODUCER"
+_HOP128_PRODUCER_STAGES = {"chunks": 7, "grid": 3, "tile128": 4}
+
+
+def sm103_tep8_hop128_producer() -> tuple:
+    """``(mode, ab_stages)`` of ``MUSESPARK_OPEN_SM103_TEP8_HOP128_PRODUCER`` (``chunks`` when unset; the environment
+    only). ``chunks`` keeps the served tactic's stages."""
+    value = os.environ.get(SM103_TEP8_HOP128_PRODUCER_ENV, "").strip() or "chunks"
+    mode, _, stages = value.partition(":")
+    if mode not in _HOP128_PRODUCER_STAGES or (stages and (mode == "chunks" or not stages.isdigit()
+                                                           or not 1 <= int(stages) <= 12)):
+        raise ValueError(f"{SM103_TEP8_HOP128_PRODUCER_ENV}={value!r}: expected chunks, grid[:S] or tile128[:S]")
+    return mode, int(stages) if stages else _HOP128_PRODUCER_STAGES[mode]
+
+
 def env(name: str, default: Optional[str] = None) -> Optional[str]:
     """``os.environ.get(name, default)``, except that an unset switch reads ``SM107_DEFAULTS[name]`` on sm_107 and
     ``SM103_TEP8_DEFAULTS[name]`` on sm_103 under ``MUSESPARK_OPEN_SM103_TEP8_F11=1``."""
