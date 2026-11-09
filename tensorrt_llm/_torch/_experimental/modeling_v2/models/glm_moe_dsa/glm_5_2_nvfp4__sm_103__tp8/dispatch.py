@@ -1036,7 +1036,7 @@ NUMERICAL_VARIANTS: Dict[str, Tuple[Optional[str], Tuple[str, ...]]] = {
 #: Prefixes of the set variables the record line lists (``side_selectors``).
 SIDE_SELECTOR_PREFIXES = (KNOB_PREFIX,)
 #: Shared TensorRT-LLM switches that the kernels also read.
-SHARED_ENV = ("TLLM_TEST_MNNVL", "TRTLLM_ENABLE_PDL", "TRTLLM_FORCE_MNNVL_AR")
+SHARED_ENV = ("TRTLLM_ENABLE_PDL",)
 
 
 def feature_variants(

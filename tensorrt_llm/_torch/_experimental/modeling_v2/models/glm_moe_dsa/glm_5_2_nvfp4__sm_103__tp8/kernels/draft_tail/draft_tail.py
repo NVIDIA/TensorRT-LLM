@@ -226,14 +226,13 @@ class DraftTailRunner:
         from tensorrt_llm._torch.distributed.ops import (
             _get_mnnvl_workspace_comm,
             _make_mnnvl_mcast_buffer,
+            use_mnnvl_fabric_handle,
         )
 
         if self.mapping is None:
             raise ValueError("draft_tail: exchange needs the TP mapping")
         self._comm = _get_mnnvl_workspace_comm(self.mapping)
-        use_fabric = (
-            self.mapping.is_multi_node() or os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
-        )
+        use_fabric = use_mnnvl_fabric_handle(self.mapping)
         self._mcast = _make_mnnvl_mcast_buffer(
             self._comm, EXCHANGE_WORDS * 8, self.mapping, use_fabric
         )
