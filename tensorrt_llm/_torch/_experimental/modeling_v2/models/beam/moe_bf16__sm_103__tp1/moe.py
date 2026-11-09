@@ -48,7 +48,7 @@ SUPPORTED_CONFIG = {
     "hidden_act": "silu",
     "routed_scaling_factor": 2.5,
 }
-SUPPORTED_LAYER_IDX = 3
+DEFAULT_LAYER_IDX = 3
 
 _SM = (10, 3)
 
@@ -120,7 +120,7 @@ class BeamMoeBf16Sm103Tp1(nn.Module):
     """
 
     def __init__(
-        self, config, layer_idx: int = SUPPORTED_LAYER_IDX, device: str | torch.device = "cuda"
+        self, config, layer_idx: int = DEFAULT_LAYER_IDX, device: str | torch.device = "cuda"
     ):
         super().__init__()
         check_config(config, layer_idx)

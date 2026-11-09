@@ -67,7 +67,7 @@ SUPPORTED_CONFIG = {
     "attention_dropout": 0.0,
     "sliding_window": 512,
 }
-SUPPORTED_LAYER_IDX = 0
+DEFAULT_LAYER_IDX = 0
 #: The dense blocks of the checkpoint's schedule; ``layer_idx`` fixes the residual coefficients.
 SUPPORTED_LAYER_INDICES = (0, 1, 2)
 SUPPORTED_ROPE = {"rope_type": "default", "rope_theta": 10000.0}
@@ -152,7 +152,7 @@ class BeamDenseBlockBf16Sm103Tp1(nn.Module):
     """
 
     def __init__(
-        self, config, layer_idx: int = SUPPORTED_LAYER_IDX, device: str | torch.device = "cuda"
+        self, config, layer_idx: int = DEFAULT_LAYER_IDX, device: str | torch.device = "cuda"
     ):
         super().__init__()
         check_config(config, layer_idx)

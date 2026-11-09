@@ -80,7 +80,7 @@ SUPPORTED_CONFIG = {
     "attention_dropout": 0.0,
     "sliding_window": 512,
 }
-SUPPORTED_LAYER_IDX = 3
+DEFAULT_LAYER_IDX = 3
 #: The sparse blocks of the checkpoint's schedule and the attention each one runs.
 ATTENTION_TYPES = {3: "sliding_attention", 4: "sliding_attention", 5: "full_attention"}
 SUPPORTED_LAYER_INDICES = tuple(ATTENTION_TYPES)
@@ -169,7 +169,7 @@ class BeamSparseBlockBf16Sm103Tp1(nn.Module):
     """
 
     def __init__(
-        self, config, layer_idx: int = SUPPORTED_LAYER_IDX, device: str | torch.device = "cuda"
+        self, config, layer_idx: int = DEFAULT_LAYER_IDX, device: str | torch.device = "cuda"
     ):
         super().__init__()
         check_config(config, layer_idx)

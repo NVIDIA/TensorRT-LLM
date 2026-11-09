@@ -40,7 +40,7 @@ SUPPORTED_CONFIG = {
     "topk_group": 4,
     "norm_topk_prob": True,
 }
-SUPPORTED_LAYER_IDX = 3
+DEFAULT_LAYER_IDX = 3
 #: The sparse blocks this router has been built for: the checkpoint's first three.
 SUPPORTED_LAYER_INDICES = (3, 4, 5)
 
@@ -87,7 +87,7 @@ class BeamMoeRouterBf16Sm103Tp1(nn.Module):
     """
 
     def __init__(
-        self, config, layer_idx: int = SUPPORTED_LAYER_IDX, device: str | torch.device = "cuda"
+        self, config, layer_idx: int = DEFAULT_LAYER_IDX, device: str | torch.device = "cuda"
     ):
         super().__init__()
         check_config(config, layer_idx)
