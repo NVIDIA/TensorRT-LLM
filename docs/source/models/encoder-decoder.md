@@ -485,7 +485,10 @@ llm = LLM(
 ```
 
 `max_batch_size` controls the total decoder concurrency, while
-`encoder_max_batch_size` controls encoder microbatch admission. For better
+`encoder_max_batch_size` controls encoder microbatch admission. One encoder
+step runs at most `encoder_max_batch_size` requests and `encoder_max_num_tokens`
+encoder tokens; encoder requests beyond either limit wait for later encoder
+steps, oldest first, so limits set too low reduce encoder throughput. For better
 performance, tune `encoder_max_batch_size`, `encoder_max_num_tokens`, and the
 encoder CUDA graph buckets together for the production workload. Start with
 `encoder_max_batch_size` smaller than `max_batch_size`, such as 2 versus 8,

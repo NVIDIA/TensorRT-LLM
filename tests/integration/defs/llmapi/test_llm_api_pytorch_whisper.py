@@ -23,13 +23,17 @@ the forced task-token prefix. Expected outputs below were pinned from
 transcript.
 """
 
+import threading
 from pathlib import Path
 
 import pytest
 import soundfile
+import torch
 
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.scheduler import SchedulerOutput
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
@@ -243,36 +247,50 @@ def test_whisper_pytorch_transcribe_end_to_end(monkeypatch):
 
 
 _CONCURRENT_REQUESTS = 8
+# How long the first scheduling iteration waits for the other requests to be queued.
+_SUBMIT_TIMEOUT_S = 60
 
 
 @pytest.mark.parametrize(
-    "encoder_limits,requests_per_encoder_step",
+    "llm_kwargs,requests_per_encoder_step",
     [
         # One request's encoder output fills encoder_max_num_tokens.
         pytest.param({"encoder_max_num_tokens": _ENCODER_OUTPUT_LEN}, 1, id="token-limit"),
         pytest.param({"encoder_max_batch_size": 2}, 2, id="request-limit"),
-        # All requests' encoder outputs fit both limits together.
+        # All requests' encoder outputs fit both limits together, exactly.
         pytest.param(
             {
                 "encoder_max_num_tokens": _CONCURRENT_REQUESTS * _ENCODER_OUTPUT_LEN,
                 "encoder_max_batch_size": _CONCURRENT_REQUESTS,
             },
-            None,
+            _CONCURRENT_REQUESTS,
             id="within-limits",
+        ),
+        # With batch waiting on, encoder requests that fill one encoder step run
+        # at once, although their tokens stay below its threshold
+        # (0.5 * max_num_tokens) while decoder work is in flight.
+        pytest.param(
+            {
+                "encoder_max_num_tokens": _ENCODER_OUTPUT_LEN,
+                "batch_wait_timeout_iters": 10,
+                "batch_wait_max_tokens_ratio": 0.5,
+            },
+            1,
+            id="token-limit-batch-waiting",
         ),
     ],
 )
 def test_whisper_pytorch_concurrent_requests_encoder_step_limits(
     monkeypatch: pytest.MonkeyPatch,
-    encoder_limits: dict,
-    requests_per_encoder_step: int | None,
+    llm_kwargs: dict[str, int | float],
+    requests_per_encoder_step: int,
 ) -> None:
     """Concurrent requests are encoded within encoder_max_num_tokens and encoder_max_batch_size.
 
-    max_num_tokens and max_batch_size let the scheduler admit every request's
-    encoder work in one iteration. Each encoder step must stay within the
-    encoder limits, requests within the limits share a step, and every request
-    must transcribe exactly.
+    max_num_tokens and max_batch_size let the scheduler offer every request's
+    encoder work in one iteration. Each iteration that offers encoder requests
+    runs one encoder step with as many of them as the encoder limits allow, and
+    every request transcribes exactly.
     """
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
 
@@ -294,40 +312,53 @@ def test_whisper_pytorch_concurrent_requests_encoder_step_limits(
         max_batch_size=_CONCURRENT_REQUESTS,
         max_input_len=_ENCODER_OUTPUT_LEN,
         max_num_tokens=_CONCURRENT_REQUESTS * _ENCODER_OUTPUT_LEN,
-        **encoder_limits,
+        **llm_kwargs,
     ) as llm:
         executor = llm._executor.engine
         schedule_request = executor.scheduler.schedule_request
         forward_encoder = executor.model_engine.forward_encoder
-        scheduled_encoder_batch_sizes = []
-        encoder_step_batch_sizes = []
+        offered_encoder_batch_sizes: list[int] = []
+        encoder_step_batch_sizes: list[int] = []
+        all_submitted = threading.Event()
 
-        def recording_schedule_request(*args, **kwargs):
+        def recording_schedule_request(*args: object, **kwargs: object) -> SchedulerOutput:
+            # The first iteration waits until every request is queued, so the
+            # next one offers all the requests that the first did not take.
+            all_submitted.wait(timeout=_SUBMIT_TIMEOUT_S)
             scheduler_output = schedule_request(*args, **kwargs)
-            scheduled_encoder_batch_sizes.append(len(scheduler_output.encoder_requests))
+            offered_encoder_batch_sizes.append(len(scheduler_output.encoder_requests))
             return scheduler_output
 
-        def recording_forward_encoder(encoder_requests, *args, **kwargs):
+        def recording_forward_encoder(
+            encoder_requests: list[LlmRequest], *args: object, **kwargs: object
+        ) -> tuple[torch.Tensor, list[int]]:
             encoder_step_batch_sizes.append(len(encoder_requests))
             return forward_encoder(encoder_requests, *args, **kwargs)
 
-        executor.scheduler.schedule_request = recording_schedule_request
-        executor.model_engine.forward_encoder = recording_forward_encoder
-        # Preprocess first so that the requests reach the executor together.
+        monkeypatch.setattr(executor.scheduler, "schedule_request", recording_schedule_request)
+        monkeypatch.setattr(executor.model_engine, "forward_encoder", recording_forward_encoder)
         prompts = [
             llm.preprocess(_audio_prompt(wave, sample_rate), sampling_params)
             for _ in range(_CONCURRENT_REQUESTS)
         ]
-        futures = [llm.generate_async(prompt, sampling_params) for prompt in prompts]
+        try:
+            futures = [llm.generate_async(prompt, sampling_params) for prompt in prompts]
+        finally:
+            all_submitted.set()
         for future in futures:
             assert list(future.result().outputs[0].token_ids) == _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS
 
-    if requests_per_encoder_step is None:
-        assert max(encoder_step_batch_sizes) > 1
+    assert encoder_step_batch_sizes == [
+        min(num_offered, requests_per_encoder_step)
+        for num_offered in offered_encoder_batch_sizes
+        if num_offered
+    ]
+    if requests_per_encoder_step < _CONCURRENT_REQUESTS:
+        # Some iteration offered more encoder requests than one step holds.
+        assert max(offered_encoder_batch_sizes) > requests_per_encoder_step
     else:
-        # The scheduler offered more encoder work than one encoder step holds.
-        assert max(scheduled_encoder_batch_sizes) > requests_per_encoder_step
-        assert max(encoder_step_batch_sizes) <= requests_per_encoder_step
+        # Requests within the limits share an encoder step.
+        assert max(encoder_step_batch_sizes) > 1
 
 
 # The bf16 graphs-on cases capture decode graphs over
