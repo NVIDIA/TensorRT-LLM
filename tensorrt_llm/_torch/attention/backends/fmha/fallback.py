@@ -200,6 +200,7 @@ class FallbackFmha(PhasedFmha):
     NEEDS_BLOCK_EXTENT = False
     supports_skip_correction = True
     supports_workspace_reclamation = True
+    supports_variable_window = True
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)

@@ -441,6 +441,11 @@ class GatedMLP(nn.Module):
         return (is_sm_100f() and not self.down_proj.use_cute_dsl_blockscaling_mm
                 and not self.down_proj.disable_deep_gemm)
 
+    def _can_fuse_swiglu_nvfp4_quant(self) -> bool:
+        return (get_sm_version() >= 100 and self.activation == F.silu
+                and self._is_plain_swiglu() and self.swiglu_limit is None
+                and is_static_nvfp4_input_eligible(self.down_proj))
+
     def _fused_gate_up_swiglu(self, x, fp4_out=False):
         """Fused FC1 GEMM + SwiGLU using CuteDSL dense kernel.
 
@@ -563,6 +568,13 @@ class GatedMLP(nn.Module):
                 use_r128c4_layout = get_sm_version() == 107
                 h2 = torch.ops.trtllm.silu_and_mul_fp8_quantize_1x128_packed_ue8m0(
                     h1, self.swiglu_limit, use_r128c4_layout)
+            elif self._can_fuse_swiglu_nvfp4_quant():
+                if h1.dim() > 2:
+                    fused_output_shape = h1.shape[:-1]
+                    h1 = h1.reshape(-1, h1.shape[-1])
+                h2_fp4, h2_sf = torch.ops.trtllm.swiglu_nvfp4_quantize(
+                    h1, self.down_proj.input_scale)
+                h2 = Fp4QuantizedTensor(h2_fp4.view(torch.uint8), h2_sf)
             else:
                 h2 = self._apply_activation(h1)
 

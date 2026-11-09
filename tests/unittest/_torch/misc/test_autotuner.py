@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import enum
 import itertools
 import json
@@ -1994,3 +1995,279 @@ def test_deep_gemm_jit_warmup_buckets():
     assert max(deep_gemm_jit_warmup_buckets(32)) < 128
     assert deep_gemm_jit_warmup_buckets(16384) == deep_gemm_jit_warmup_buckets(
         8192)
+
+
+def _record_profile_graph_pools(monkeypatch):
+    """Record the pool of every profiling capture and of every owner release / abandon."""
+    events = {"capture": [], "release": [], "abandon": []}
+    real_capture = autotuner.nccl_window_graph_capture
+    real_release = autotuner.release_nccl_window_graph_owner
+    real_abandon = autotuner.abandon_nccl_window_graph_owner
+
+    @contextlib.contextmanager
+    def capture(graph, pool, **kwargs):
+        events["capture"].append(pool)
+        with real_capture(graph, pool, **kwargs):
+            yield
+
+    def release(pool):
+        events["release"].append(pool)
+        real_release(pool)
+
+    def abandon(pool):
+        events["abandon"].append(pool)
+        real_abandon(pool)
+
+    monkeypatch.setattr(autotuner, "nccl_window_graph_capture", capture)
+    monkeypatch.setattr(autotuner, "release_nccl_window_graph_owner", release)
+    monkeypatch.setattr(autotuner, "abandon_nccl_window_graph_owner", abandon)
+    return events
+
+
+def test_profiling_captures_share_one_graph_pool_per_tuning_pass(monkeypatch):
+    """All profiling captures of one choose_one() tuning pass capture into one
+    CUDA graph memory pool, each capture still releases its NCCL-window owner,
+    and the pool is dropped when the pass ends."""
+    events = _record_profile_graph_pools(monkeypatch)
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    x = torch.randn(M, 64, device="cuda")
+    w = torch.randn(64, 128, device="cuda")
+    config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, (4, 8, 16, 32)), ))
+
+    pools_per_pass = []
+    for op in ("autotuner_test::shared_pool_a",
+               "autotuner_test::shared_pool_b"):
+        for v in events.values():
+            v.clear()
+        with autotune():
+            tuner.choose_one(op, [GemmRunner()], config, [x, w])
+        # 4 profiles x 3 tactics, at least one capture each.
+        assert len(events["capture"]) >= 12, events["capture"]
+        assert len(set(events["capture"])) == 1, (
+            f"one tuning pass must use one pool; got {set(events['capture'])}")
+        assert events["release"] == events["capture"]
+        assert events["abandon"] == []
+        assert tuner._profile_graph_pool is None
+        assert tuner._profile_graph_pool_depth == 0
+        pools_per_pass.append(events["capture"][0])
+    assert pools_per_pass[0] != pools_per_pass[1], (
+        "a new tuning pass must not reuse the dropped pool")
+
+
+def test_failed_profiling_capture_moves_to_a_fresh_graph_pool(monkeypatch):
+    """A capture that fails abandons its owner, and the captures after it use a
+    new pool rather than the one the failed capture used."""
+
+    class CaptureFailingRunner(GemmRunner):
+
+        def forward(self, /, inputs, *, tactic=-1, **kwargs):
+            if tactic == 0 and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("tactic 0 fails under capture")
+            return super().forward(inputs, tactic=tactic, **kwargs)
+
+    events = _record_profile_graph_pools(monkeypatch)
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    x = torch.randn(M, 64, device="cuda")
+    w = torch.randn(64, 128, device="cuda")
+    with autotune():
+        tuner.choose_one("autotuner_test::fresh_pool_after_failure",
+                         [CaptureFailingRunner()], TuningConfig(), [x, w])
+
+    captures = events["capture"]
+    assert len(events["abandon"]) == 1, events
+    failed_pool = events["abandon"][0]
+    # The failed capture is the last one in its pool.
+    failed_at = len(captures) - 1 - captures[::-1].index(failed_pool)
+    assert captures[:failed_at + 1] == [failed_pool] * (failed_at + 1)
+    after = captures[failed_at + 1:]
+    assert after, "tactic 1 must still be profiled after tactic 0 fails"
+    assert len(set(after)) == 1 and after[0] != failed_pool, captures
+    assert events["release"] == captures[:failed_at] + after
+    assert tuner._profile_graph_pool is None
+
+
+def test_parallel_split_deals_pairs_across_runners(monkeypatch):
+    """PARALLEL shares the (runner, tactic) pairs of all runners evenly.
+
+    Each rank of the group profiles only its share of a profile's pairs.
+    Splitting each runner's tactics on its own would put the first tactic of
+    every runner on group rank 0, so ranks with low indices would build and
+    time most of the candidates while the others wait at the merge. With fewer
+    pairs than ranks, a rank dealt none logs no warning: the merge brings it
+    the winner.
+    """
+
+    class ListedTacticsRunner(TunableRunner):
+
+        def __init__(self, name: str, num_tactics: int):
+            self.name, self.num_tactics = name, num_tactics
+
+        def unique_id(self):
+            return (self.name, )
+
+        def get_valid_tactics(self, inputs, profile, **kwargs) -> List[int]:
+            return list(range(self.num_tactics))
+
+        def forward(self, /, inputs, *, tactic: int = -1, **kwargs):
+            return inputs[0]
+
+    timed = {}
+
+    def record_pair(self, runner, inputs, tactic, **kwargs):
+        timed.setdefault(self._tuning_group()[1], []).append(
+            (runner.name, tactic))
+        return 1.0
+
+    warnings = []
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record_pair)
+    monkeypatch.setattr(autotuner.logger, "warning_once",
+                        lambda *args, **kwargs: warnings.append(args))
+    group_size = 4
+    op = "autotuner_test::parallel_deal"
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
+    profile = OptimizationProfile([[StaticDim(8), StaticDim(64)]])
+    x = torch.zeros(8, 64)
+
+    def deal(runners):
+        timed.clear()
+        for rank in range(group_size):
+            tuner = autotuner.AutoTuner()
+            tuner.setup_distributed_state(Mapping(world_size=group_size,
+                                                  rank=rank,
+                                                  tp_size=group_size),
+                                          dist=object())
+            # choose_one sets these up before it profiles.
+            tuner.stats.tuned_op_profiled_configs[op] = 0
+            tuner.stats.failed_profiling_count[op] = set()
+            tuner._profile_runners_impl(op, runners, [x], profile, config)
+        return tuner, [timed.get(rank, []) for rank in range(group_size)]
+
+    runners = [
+        ListedTacticsRunner("cublas", 1),
+        ListedTacticsRunner("direct", 7),
+        ListedTacticsRunner("splitk", 3)
+    ]
+    tuner, shares = deal(runners)
+    # Every pair is timed on exactly one rank, and the shares differ by at most one.
+    assert sorted(pair for share in shares for pair in share) == sorted(
+        (r.name, t) for r in runners for t in range(r.num_tactics))
+    assert max(map(len, shares)) - min(map(len, shares)) <= 1, shares
+    # The deal starts at the profile's start rank.
+    start = tuner._parallel_deal_start(op, profile,
+                                       DistributedTuningStrategy.PARALLEL)
+    assert shares[start][0] == ("cublas", 0), (start, shares)
+    # Two pairs on four ranks: two ranks are dealt none and do not warn.
+    _, shares = deal([ListedTacticsRunner("direct", 2)])
+    assert sorted(map(len, shares)) == [0, 0, 1, 1], shares
+    assert warnings == [], warnings
+
+
+def test_parallel_rank_dealt_no_pair_runs_the_merged_winner(monkeypatch):
+    """choose_one on a PARALLEL rank that profiles nothing returns the winner
+    the group found: with one (runner, tactic) pair on two ranks, the rank the
+    deal skips gets it from the merge."""
+
+    class SingleTacticRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs, profile, **kwargs) -> List[int]:
+            return [7]
+
+        def forward(self, /, inputs, *, tactic: int = -1, **kwargs):
+            return inputs[0]
+
+    profiled = []
+
+    def record_pair(self, runner, inputs, tactic, **kwargs):
+        profiled.append((self._tuning_group()[1], tactic))
+        return 1.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record_pair)
+    gathered = {}
+
+    class _AllgatherDist:
+        """tp_cp_allgather of the ranks run so far, in rank order."""
+
+        def __init__(self, rank):
+            self.rank = rank
+
+        def tp_cp_allgather(self, obj):
+            gathered[self.rank] = obj
+            return [gathered[r] for r in sorted(gathered)]
+
+    op = "autotuner_test::parallel_rank_without_pairs"
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
+    runner = SingleTacticRunner()
+    inputs = [torch.zeros(8, 64), torch.zeros(64, 32)]
+
+    def tuner_for(rank):
+        tuner = autotuner.AutoTuner()
+        tuner.setup_distributed_state(Mapping(world_size=2,
+                                              rank=rank,
+                                              tp_size=2),
+                                      dist=_AllgatherDist(rank))
+        tuner.is_tuning_mode = True
+        return tuner
+
+    profile = tuner_for(0)._optimization_profiles(config, inputs)[0]
+    profiling_rank = tuner_for(0)._parallel_deal_start(
+        op, profile, DistributedTuningStrategy.PARALLEL)
+    results = {}
+    for rank in (profiling_rank, 1 - profiling_rank):
+        results[rank] = tuner_for(rank).choose_one(op, [runner], config, inputs)
+    assert profiled == [(profiling_rank, 7)], profiled
+    assert results[0] == results[1] == (runner, 7), results
+
+
+def test_parallel_search_cache_picks_fastest_runner():
+    """After a PARALLEL merge a shape can hold one entry per runner.
+
+    The lookup must return the fastest of them; other strategies keep one
+    entry per shape and return the first runner found.
+    """
+    runners = [
+        GemmRunner(),
+        GemmRunnerWithAttributes(block_size=128, num_warps=4)
+    ]
+    shapes = (torch.Size([M, 64]), torch.Size([64, 128]))
+    for strategy, expected in ((DistributedTuningStrategy.PARALLEL, 1),
+                               (DistributedTuningStrategy.INDEPENDENT, 0)):
+        config = TuningConfig(distributed_tuning_strategy=strategy)
+        cache = autotuner.AutoTunerProfilingCache()
+        for runner, tactic, ms in ((runners[0], 0, 2.0), (runners[1], 1, 1.0)):
+            cache[cache.get_cache_key("autotuner_test::parallel_lookup", runner,
+                                      shapes, config)] = (0, tactic, ms)
+        hit, runner_id, tactic, _ = cache.search_cache(
+            "autotuner_test::parallel_lookup", runners, shapes, config)
+        assert hit and runner_id == expected, (strategy, runner_id)
+
+
+def test_parallel_deal_start_is_stable_and_spread():
+    """Each profile's PARALLEL deal starts at a rank derived from the op and
+    the shapes: the same on every rank and in every process, and spread over
+    the group so a runner's costly tactics do not land on the same ranks."""
+    group_size = 16
+    starts = []
+    for m in range(1, 129):
+        profile = autotuner.OptimizationProfile(
+            [[autotuner.StaticDim(m),
+              autotuner.StaticDim(7168)],
+             [autotuner.StaticDim(7168),
+              autotuner.StaticDim(2048)]])
+        per_rank = set()
+        for rank in range(group_size):
+            tuner = autotuner.AutoTuner()
+            tuner.setup_distributed_state(Mapping(world_size=group_size,
+                                                  rank=rank,
+                                                  tp_size=group_size),
+                                          dist=object())
+            per_rank.add(
+                tuner._parallel_deal_start("autotuner_test::deal", profile,
+                                           DistributedTuningStrategy.PARALLEL))
+        assert len(per_rank) == 1, (m, per_rank)
+        starts.append(per_rank.pop())
+    assert set(starts) == set(range(group_size)), sorted(set(starts))

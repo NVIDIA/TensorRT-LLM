@@ -676,6 +676,7 @@ void MHA::enqueueFusedContext(
         sageQuantParams.vStage = 1;
         tc::invokeSageQuant(sageQuantParams);
 
+<<<<<<< HEAD
         // Quantize into K, SfsK, V
         sageQuantParams.sumSeqLensQk = p.total_kv_len;
         sageQuantParams.batchSize = p.batch_size;
@@ -688,6 +689,230 @@ void MHA::enqueueFusedContext(
         sageQuantParams.ptrQkScale = workspaceViews.sageKScale;
         sageQuantParams.vStage = 2;
         tc::invokeSageQuant(sageQuantParams);
+=======
+        // Scalars
+        preprocessingParams.batch_size = p.batch_size;
+        preprocessingParams.max_input_seq_len = p.input_seq_length;
+        preprocessingParams.max_kv_seq_len = p.max_past_kv_length;
+        preprocessingParams.cyclic_kv_cache_len = p.cyclic_attention_window_size;
+        preprocessingParams.token_num = p.num_tokens;
+        preprocessingParams.remove_padding = remove_padding;
+        preprocessingParams.head_num = mNumAttnHeads;
+        preprocessingParams.kv_head_num = mNumAttnKVHeads;
+        preprocessingParams.qheads_per_kv_head = mNumAttnHeads / mNumAttnKVHeads;
+        preprocessingParams.size_per_head = getHeadSize();
+        preprocessingParams.cache_type = cache_type;
+        preprocessingParams.separate_q_kv_output = enablePagedKVContextFMHA;
+        preprocessingParams.quantized_fp8_output = mFP8ContextFMHA;
+        preprocessingParams.generation_phase = false;
+        preprocessingParams.multi_processor_count = mMultiProcessorCount;
+
+        preprocessingParams.is_last_chunk
+            = !p.attn.attention_chunk_size.has_value() || (p.input_seq_length == p.max_past_kv_length);
+        applyFeatures(preprocessingParams);
+
+        {
+            std::string const beforeRopeStr = "ctx attention before RoPE at layer " + std::to_string(p.attn.layer_idx);
+            TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasInvalid(p.num_tokens,
+                                           (local_hidden_units_qo + 2 * local_hidden_units_kv), p.getType(),
+                                           const_cast<T*>(attention_input), stream, beforeRopeStr)
+                    == false,
+                "Found invalid number (NaN or Inf) in " + beforeRopeStr);
+        }
+
+        if (useSageAttnSeparateQkv)
+        {
+            TLLM_CHECK_WITH_INFO(mask_type == AttentionMaskType::PADDING,
+                "SageAttention only supports dense (padding) mask, got mask type %d.", static_cast<int>(mask_type));
+            TLLM_CHECK_WITH_INFO(sage_attn_num_elts_per_blk_q > 0 && sage_attn_num_elts_per_blk_k > 0
+                    && sage_attn_num_elts_per_blk_v == 1,
+                "SageQuant requires positive block sizes for Q and K while the block size for V must be 1.");
+            // A zero stride means no quantizer kernel supports this block size.
+            TLLM_CHECK_WITH_INFO(q_max_n_blk > 0 && k_max_n_blk > 0,
+                "No SageQuant kernel on sm_%d for block sizes (q, k, v) = (%d, %d, %d) with qk_int8=%s. SM90 "
+                "requires (2, 16, 1) together with INT8 Q/K; other architectures require q/k block sizes of 1, 4, 16, "
+                "or 32.",
+                mSM, static_cast<int>(sage_attn_num_elts_per_blk_q), static_cast<int>(sage_attn_num_elts_per_blk_k),
+                static_cast<int>(sage_attn_num_elts_per_blk_v), sage_attn_qk_int8 ? "true" : "false");
+            TLLM_CHECK_WITH_INFO(!p.fwd.kv_scale_quant_orig,
+                "SageAttention disregards the configured p.fwd.kv_scale_quant_orig, invalidating the result.");
+
+            // Common p for sageQuant
+            tc::SageQuantParams sageQuantParams{};
+            sageQuantParams.headDim = getHeadSize();
+            sageQuantParams.inputType = std::is_same_v<T, __nv_bfloat16> ? DATA_TYPE_BF16 : DATA_TYPE_FP16;
+            sageQuantParams.quantType = sage_attn_qk_int8 ? DATA_TYPE_INT8 : DATA_TYPE_E4M3;
+            sageQuantParams.vStage = 0;
+            sageQuantParams.sumSeqLensV = p.total_kv_len;
+            sageQuantParams.numHeadsV = mNumAttnKVHeads;
+            sageQuantParams.kSmooth = sage_attn_smooth_k;
+            sageQuantParams.ptrV = p.getV<T>();
+            sageQuantParams.ptrVQuant = workspaceViews.fp8VBuf;
+            sageQuantParams.ptrVScale = workspaceViews.sageVScale;
+            sageQuantParams.ptrKForMean = p.getK<T>();
+            sageQuantParams.ptrKMeanSum = workspaceViews.sageKMeanSum;
+            sageQuantParams.ptrKMean = workspaceViews.sageKMean;
+            sageQuantParams.smCount = mMultiProcessorCount;
+            sageQuantParams.stream = stream;
+
+            // Quantize into Q, SfsQ, SfsV
+            sageQuantParams.sumSeqLensQk = p.num_tokens;
+            sageQuantParams.batchSize = p.batch_size;
+            sageQuantParams.numHeads = mNumAttnHeads;
+            sageQuantParams.partition = tc::getSageQPartition(hopperSage);
+            sageQuantParams.tokenBlockSize = sage_attn_num_elts_per_blk_q;
+            sageQuantParams.ptrCuSeqLensQk = contextCuQSeqlens;
+            sageQuantParams.ptrQk = attention_input;
+            sageQuantParams.ptrQkQuant = workspaceViews.fp8QBuf;
+            sageQuantParams.ptrQkScale = workspaceViews.sageQScale;
+            sageQuantParams.vStage = 1;
+            tc::invokeSageQuant(sageQuantParams);
+
+            // Quantize into K, SfsK, V
+            sageQuantParams.sumSeqLensQk = p.total_kv_len;
+            sageQuantParams.batchSize = p.batch_size;
+            sageQuantParams.numHeads = mNumAttnKVHeads;
+            sageQuantParams.partition = tc::getSageKPartition(hopperSage);
+            sageQuantParams.tokenBlockSize = sage_attn_num_elts_per_blk_k;
+            sageQuantParams.ptrCuSeqLensQk = contextCuKvSeqlens;
+            sageQuantParams.ptrQk = p.getK<T>();
+            sageQuantParams.ptrQkQuant = workspaceViews.fp8KBuf;
+            sageQuantParams.ptrQkScale = workspaceViews.sageKScale;
+            sageQuantParams.vStage = 2;
+            tc::invokeSageQuant(sageQuantParams);
+        }
+        else
+        {
+            invokeQKVPreprocessing(preprocessingParams, stream);
+        }
+        sync_check_cuda_error(stream);
+        {
+            std::string const afterRopeStr = "ctx attention after RoPE at layer " + std::to_string(p.attn.layer_idx);
+            TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasInvalid(p.num_tokens,
+                                           (local_hidden_units_qo + 2 * local_hidden_units_kv), p.getType(),
+                                           const_cast<T*>(attention_input), stream, afterRopeStr)
+                    == false,
+                "Found invalid number (NaN or Inf) in " + afterRopeStr);
+            sync_check_cuda_error(stream);
+        }
+
+        // Unified FMHA runner interface for both packed QKV FMHA, contiguous Q_KV, paged KV FMHA, and separate QKV
+        // FMHA.
+        // Page KV input layout:
+        //    - q_ptr: [B, S, H, D], which supports variable sequence length
+        //    - paged_kv_cache: paged kv buffer
+        //    - cu_q_seqlens: the cumulative query sequence lengths, needed for variable sequence length.
+        //    - cu_kv_seqlens: the cumulative kv sequence lengths, needed for variable sequence length.
+        //
+        // Contiguous KV input layout:
+        //    - q_ptr: [B, S, H, D], which supports variable sequence length
+        //    - kv_ptr: [B, S, 2, H, D], which supports variable sequence length
+        //    - cu_q_seqlens: the cumulative query sequence lengths, needed for variable sequence length.
+        //    - cu_kv_seqlens: the cumulative kv sequence lengths, needed for variable sequence length.
+        //
+        // Separate QKV input layout (SageAttention):
+        //    - q_ptr: [B, S, H, D], which supports variable sequence length
+        //    - k_ptr: [B, S, H_kv, D], which supports variable sequence length
+        //    - v_ptr: [B, S, H_kv, D_v], which supports variable sequence length
+        //    - cu_q_seqlens: the cumulative query sequence lengths, needed for variable sequence length.
+        //    - cu_kv_seqlens: the cumulative kv sequence lengths, needed for variable sequence length.
+        //    - total_kv_len: the total kv sequence length, needed for variable sequence length.
+
+        // Construct the fmha p for running kernels.
+        MHARunnerParams fmhaParams{};
+        fmhaParams.b = p.batch_size;
+        fmhaParams.qSeqLen = p.input_seq_length;
+        fmhaParams.kvSeqLen = p.max_past_kv_length;
+        // Disable sliding window attention when it is not needed.
+        fmhaParams.slidingWindowSize = dense_context_fmha ? p.max_past_kv_length : p.cyclic_attention_window_size;
+        fmhaParams.totalQSeqLen = p.num_tokens;
+        fmhaParams.totalKvSeqLen = p.total_kv_len;
+        // Device buffer pointers.
+        if (useSageAttnSeparateQkv)
+        {
+            // SageAttention: use quantized FP8/INT8 Q/K/V buffers as separate inputs.
+            TLLM_CHECK_WITH_INFO(
+                mFmhaDispatcher->isSeparateQAndKvInput(), "Separate QKV input is required for sage attention FMHA");
+            fmhaParams.qkvPtr = nullptr;
+            fmhaParams.qPtr = reinterpret_cast<void const*>(workspaceViews.fp8QBuf);
+            fmhaParams.kPtr = reinterpret_cast<void const*>(workspaceViews.fp8KBuf);
+            fmhaParams.vPtr = reinterpret_cast<void const*>(workspaceViews.fp8VBuf);
+        }
+        else
+        {
+            fmhaParams.qkvPtr = mFP8ContextFMHA ? reinterpret_cast<void const*>(workspaceViews.fp8QkvBuf)
+                                                : reinterpret_cast<void const*>(attention_input);
+            fmhaParams.qPtr = reinterpret_cast<void const*>(workspaceViews.qBuf);
+        }
+        if (useSageAttnSeparateQkv)
+        {
+            fmhaParams.qScalePtr = workspaceViews.sageQScale;
+            fmhaParams.kScalePtr = workspaceViews.sageKScale;
+            fmhaParams.vScalePtr = workspaceViews.sageVScale;
+            fmhaParams.qMaxNBlock = q_max_n_blk;
+            fmhaParams.kMaxNBlock = k_max_n_blk;
+            fmhaParams.vMaxNBlock = v_max_n_blk;
+        }
+        fmhaParams.kvPtr = nullptr;
+        // Only use [totalLength, h / cpSize, Dh].
+        fmhaParams.outputPtr = p.getOutput();
+        fmhaParams.attentionSinksPtr = p.getAttentionSinks();
+        if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
+        {
+            fmhaParams.pagedKvCache = kv_cache_buffer;
+            fmhaParams.pagedKvSfCache = kv_scale_cache_buffer;
+        }
+        fmhaParams.cuQSeqLenPtr = contextCuQSeqlens;
+        fmhaParams.kvSeqLenPtr = decoder_params.seqKVLengths;
+        fmhaParams.cuKvSeqLenPtr = contextCuKvSeqlens;
+        fmhaParams.cuMaskRowsPtr = workspaceViews.cuMaskRows;
+        fmhaParams.variableWindowTokenStartsPtr = p.getVariableWindowTokenStarts();
+        fmhaParams.variableWindowTokenEndsPtr = p.getVariableWindowTokenEnds();
+        fmhaParams.tileCounterPtr = workspaceViews.fmhaTileCounter;
+        fmhaParams.scaleBmm1Ptr = workspaceViews.fmhaBmm1Scale;
+        fmhaParams.scaleBmm2Ptr = workspaceViews.fmhaBmm2Scale;
+        fmhaParams.stream = stream;
+        fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
+        fmhaParams.softmaxStatsPtr = p.getSoftmaxStatsTensor();
+        fmhaParams.trtllmGenJITWarmup = p.meta.trtllm_gen_jit_warmup;
+        fmhaParams.trtllmGenJITWarmupMaxNumRequests = p.meta.max_num_requests;
+        fmhaParams.trtllmGenJITWarmupMaxSeqLenQ = p.meta.max_context_length;
+        fmhaParams.trtllmGenJITWarmupMaxSeqLenKv = p.meta.max_seq_len;
+
+        if (useTllmGenSparseAttention())
+        {
+            // Sparse context reuses generation-style trtllm-gen kernels; provide the scratch pool
+            // and per-CTA counter so the autotuner can select MultiCtasKv variants.
+            fmhaParams.multiCtasKvScratchPtr = workspaceViews.fmhaMultiCtasKvScratch;
+            fmhaParams.multiCtasKvCounterPtr
+                = getMultiCtasKvCounter(p.getMaxNumSequences(), p.getQueryInput().device());
+        }
+        applyFeatures(fmhaParams);
+
+        // Skip-softmax attention parameters
+        fmhaParams.skipSoftmaxThresholdScaleFactor = p.fwd.sparse_runtime_params.threshold_scale_factor_prefill;
+#ifdef SKIP_SOFTMAX_STAT
+        fmhaParams.skipSoftmaxTotalBlocks = p.getSkipSoftmaxStat();
+        fmhaParams.skipSoftmaxSkippedBlocks = p.getSkipSoftmaxStat() + 1;
+#else
+        if (tensorrt_llm::common::getEnvPrintSkipSoftmaxStat())
+        {
+            TLLM_THROW("To print skip softmax stat, please run build_wheel.py with -DSKIP_SOFTMAX_STAT");
+        }
+#endif
+
+        if (p.attn.attention_chunk_size)
+        {
+            fmhaParams.chunkedAttentionSize = *p.attn.attention_chunk_size;
+        }
+
+        // Run the fmha kernel.
+        mFmhaDispatcher->run(fmhaParams);
+        sync_check_cuda_error(stream);
+
+        invokeKvCachePostprocessing(preprocessingParams, stream);
+        sync_check_cuda_error(stream);
+>>>>>>> origin/main
     }
     else
     {
@@ -1020,7 +1245,13 @@ void MHA::initContext()
 #ifdef SKIP_SOFTMAX_STAT
     if (!mDefaultSkipSoftmaxStat.defined())
     {
+<<<<<<< HEAD
         mDefaultSkipSoftmaxStat = at::zeros({2}, at::TensorOptions().dtype(at::kUInt32).device(at::kCUDA));
+=======
+        TLLM_CHECK_WITH_INFO(
+            !use_variable_window, "Variable-window attention requires a supported context FMHA kernel configuration.");
+        return;
+>>>>>>> origin/main
     }
 #endif
 }
@@ -1084,7 +1315,15 @@ MHARunnerFixedParams MHA::contextFixedParams() const
     fmhaParams.forceFp32Acc = false;
 
     // setting attention mask type based on the mask type
-    fmhaParams.setAttentionMaskType(static_cast<std::int8_t>(mask_type));
+    if (use_variable_window)
+    {
+        TLLM_CHECK_WITH_INFO(mSM == 100 || mSM == 103, "Variable-window attention requires SM100 or SM103.");
+        fmhaParams.attentionMaskType = ContextAttentionMaskType::VARIABLE_WINDOW;
+    }
+    else
+    {
+        fmhaParams.setAttentionMaskType(static_cast<std::int8_t>(mask_type));
+    }
 
     if (cross_attention)
     {
@@ -1117,10 +1356,34 @@ MHARunnerFixedParams MHA::contextFixedParams() const
     {
         fmhaParams.dataTypeOut = DATA_TYPE_E4M3;
     }
+<<<<<<< HEAD
     return fmhaParams;
 }
 
 bool MHA::isSeparateQAndKvInput() const
+=======
+
+    // Load kernels from the pre-compiled cubins.
+    mFmhaDispatcher.reset(new FmhaDispatcher(fmhaParams));
+
+    // Fall back to unfused MHA kernels if not supported.
+    mEnableContextFMHA = mFmhaDispatcher->isSupported();
+    TLLM_CHECK_WITH_INFO(!use_variable_window || mEnableContextFMHA,
+        "Variable-window attention requires a supported context FMHA kernel configuration.");
+
+    // Only FMHA supports custom mask currently.
+    TLLM_CHECK_WITH_INFO(
+        !useCustomMask() || mEnableContextFMHA, "Only Context FMHA supports custom mask input currently.");
+}
+
+bool MHA::supportsVariableWindow()
+{
+    initContext();
+    return use_variable_window && mEnableContextFMHA;
+}
+
+void MHA::initGeneration()
+>>>>>>> origin/main
 {
     return contextFixedParams().attentionInputLayout != AttentionInputLayout::PACKED_QKV;
 }
@@ -1138,6 +1401,22 @@ bool MHA::supportsNvFp4Output()
 
 void MHA::prepareInputs(FmhaParams& p, bool isGen)
 {
+    TORCH_CHECK(!isGen || !use_variable_window, "variable-window bounds are supported only for context attention");
+    if (!isGen && use_variable_window)
+    {
+        TORCH_CHECK(!p.is_cross && !p.use_spec_decoding && !sageAttnRequested(),
+            "Variable-window attention requires non-cross, non-speculative context attention without SageAttention.");
+        for (auto const& tensor :
+            {p.fwd.variable_window_token_starts.value(), p.fwd.variable_window_token_ends.value()})
+        {
+            TORCH_CHECK(tensor.is_cuda() && tensor.device() == p.getQueryInput().device(),
+                "variable-window bounds must be on the same device as qkv_or_q");
+            TORCH_CHECK(tensor.scalar_type() == at::kInt && tensor.dim() == 1 && tensor.is_contiguous(),
+                "variable-window bounds must be contiguous 1-D int32 tensors");
+            TORCH_CHECK(tensor.numel() == p.token_offset + p.num_tokens,
+                "variable-window bounds must have one element per packed context query token");
+        }
+    }
     TLLM_CHECK_WITH_INFO(p.fwd.is_fused_qkv || sageAttnRequested() || p.is_cross,
         "For non-cross, non-SageAttention attention, only fused QKV is supported now.");
 
@@ -2126,6 +2405,9 @@ AttentionBase AttentionBase::getCacheKey(FmhaParams const& p)
     c.cross_attention = p.is_cross;
     c.tokens_per_block = p.tokens_per_block;
     c.mask_type = static_cast<AttentionMaskType>(fwd.mask_type);
+    TORCH_CHECK(fwd.variable_window_token_starts.has_value() == fwd.variable_window_token_ends.has_value(),
+        "variable_window_token_starts and variable_window_token_ends must be provided together");
+    c.use_variable_window = fwd.variable_window_token_starts.has_value() && p.seq_offset == 0;
     c.position_embedding_type = attn.position_embedding_type;
     c.num_heads = attn.num_heads;
     c.num_kv_heads = attn.num_kv_heads;
@@ -2146,6 +2428,7 @@ AttentionBase AttentionBase::getCacheKey(FmhaParams const& p)
     c.use_tllm_gen_sparse_attention = hasAttnIndices && !hasPagedIndices;
 
     c.is_mla_enable = attn.is_mla_enable;
+    TORCH_CHECK(!c.use_variable_window || !c.is_mla_enable, "Variable-window attention does not support MLA.");
     c.q_lora_rank = attn.q_lora_rank.value_or(0);
     c.kv_lora_rank = attn.kv_lora_rank.value_or(0);
     c.qk_nope_head_dim = attn.qk_nope_head_dim.value_or(0);
@@ -2178,6 +2461,7 @@ std::string AttentionBase::toString() const
     TRTLLM_DUMP_FIELD(use_kv_cache)
     TRTLLM_DUMP_FIELD(cross_attention)
     TRTLLM_DUMP_FIELD(tokens_per_block)
+    TRTLLM_DUMP_FIELD(use_variable_window)
     ss << "mask_type=" << static_cast<int>(mask_type) << " ";
     ss << "position_embedding_type=" << static_cast<int>(position_embedding_type) << " ";
     TRTLLM_DUMP_FIELD(num_heads)
@@ -2258,6 +2542,50 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     bool const supported = op.supportsNvFp4Output();
     cache.emplace(key, supported);
     return supported;
+}
+
+bool attention_supports_variable_window(c10::ScalarType const dtype, c10::ScalarType const output_dtype,
+    int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
+    std::optional<int64_t> const tokens_per_block, int64_t const quant_mode, int64_t const /*max_num_requests*/,
+    int64_t const /*max_context_length*/, int64_t const /*max_seq_len*/,
+    std::optional<int64_t> const /*attention_chunk_size*/, bool const use_kv_cache, bool const use_paged_context_fmha)
+{
+    auto const sm = common::getSMVersion();
+    if ((sm != 100 && sm != 103)
+        || (output_dtype != dtype && output_dtype != at::kFloat8_e4m3fn && output_dtype != at::kByte))
+    {
+        return false;
+    }
+    AttentionBase cfg;
+    cfg.device = at::cuda::current_device();
+    cfg.type = runtime::TorchUtils::dataType(dtype);
+    cfg.num_heads = num_heads;
+    cfg.num_kv_heads = num_kv_heads;
+    cfg.head_size = head_size;
+    cfg.is_fp8_out = output_dtype == at::kFloat8_e4m3fn;
+    cfg.is_fp4_out = output_dtype == at::kByte;
+    cfg.use_kv_cache = use_kv_cache;
+    cfg.tokens_per_block = tokens_per_block.value_or(64);
+    cfg.quant_mode = common::QuantMode(static_cast<uint32_t>(quant_mode));
+    cfg.paged_context_fmha = use_paged_context_fmha;
+    cfg.use_variable_window = true;
+    // The phased runner's fixed configuration determines kernel availability.
+    static thread_local std::unordered_map<AttentionBase, bool> cache;
+    if (auto it = cache.find(cfg); it != cache.end())
+    {
+        return it->second;
+    }
+    bool supported = false;
+    try
+    {
+        MHA op{cfg};
+        supported = op.supportsVariableWindow();
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_DEBUG("Variable-window FMHA probe rejected the configuration: %s", e.what());
+    }
+    return cache.emplace(cfg, supported).first->second;
 }
 
 int64_t spec_dec_tree_custom_mask_capacity(
@@ -2453,18 +2781,19 @@ std::size_t std::hash<tensorrt_llm::torch_ext::AttentionBase>::operator()(
     tensorrt_llm::torch_ext::AttentionBase const& c) const noexcept
 {
     std::size_t h = 0;
-    for (auto const v : {static_cast<std::int64_t>(c.device), static_cast<std::int64_t>(c.type),
-             std::int64_t{c.is_fp8_out}, std::int64_t{c.is_fp4_out}, std::int64_t{c.use_kv_cache},
-             std::int64_t{c.cross_attention}, c.tokens_per_block, static_cast<std::int64_t>(c.mask_type),
-             static_cast<std::int64_t>(c.position_embedding_type), c.num_heads, c.num_kv_heads, c.head_size,
-             c.rotary_embedding_dim, static_cast<std::int64_t>(c.quant_mode.value()), std::int64_t{c.uses_spcompress},
-             std::int64_t{c.paged_context_fmha}, std::int64_t{c.is_spec_decoding_enabled},
-             c.spec_decoding_target_max_gen_len, std::int64_t{c.fuses_dsv4_inv_rope_fp8_quant},
-             std::int64_t{c.use_sparse_attention}, std::int64_t{c.use_tllm_gen_sparse_attention},
-             std::int64_t{c.use_nvfp4_mla_kv_cache}, std::int64_t{c.is_mla_enable}, c.q_lora_rank, c.kv_lora_rank,
-             c.qk_nope_head_dim, c.qk_rope_head_dim, c.v_head_dim, c.predicted_tokens_per_seq, c.mla_layer_num,
-             std::int64_t{c.rope_append}, c.sage_attn_num_elts_per_blk_q, c.sage_attn_num_elts_per_blk_k,
-             c.sage_attn_num_elts_per_blk_v, std::int64_t{c.sage_attn_qk_int8}, std::int64_t{c.sage_attn_smooth_k}})
+    for (auto const v :
+        {static_cast<std::int64_t>(c.device), static_cast<std::int64_t>(c.type), std::int64_t{c.is_fp8_out},
+            std::int64_t{c.is_fp4_out}, std::int64_t{c.use_kv_cache}, std::int64_t{c.cross_attention},
+            c.tokens_per_block, static_cast<std::int64_t>(c.mask_type), std::int64_t{c.use_variable_window},
+            static_cast<std::int64_t>(c.position_embedding_type), c.num_heads, c.num_kv_heads, c.head_size,
+            c.rotary_embedding_dim, static_cast<std::int64_t>(c.quant_mode.value()), std::int64_t{c.uses_spcompress},
+            std::int64_t{c.paged_context_fmha}, std::int64_t{c.is_spec_decoding_enabled},
+            c.spec_decoding_target_max_gen_len, std::int64_t{c.fuses_dsv4_inv_rope_fp8_quant},
+            std::int64_t{c.use_sparse_attention}, std::int64_t{c.use_tllm_gen_sparse_attention},
+            std::int64_t{c.use_nvfp4_mla_kv_cache}, std::int64_t{c.is_mla_enable}, c.q_lora_rank, c.kv_lora_rank,
+            c.qk_nope_head_dim, c.qk_rope_head_dim, c.v_head_dim, c.predicted_tokens_per_seq, c.mla_layer_num,
+            std::int64_t{c.rope_append}, c.sage_attn_num_elts_per_blk_q, c.sage_attn_num_elts_per_blk_k,
+            c.sage_attn_num_elts_per_blk_v, std::int64_t{c.sage_attn_qk_int8}, std::int64_t{c.sage_attn_smooth_k}})
     {
         h = hashCombine(h, v);
     }
@@ -2476,5 +2805,6 @@ std::size_t std::hash<tensorrt_llm::torch_ext::AttentionBase>::operator()(
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("attention_supports_nvfp4_output", &tensorrt_llm::torch_ext::attention_supports_nvfp4_output);
+    m.def("attention_supports_variable_window", &tensorrt_llm::torch_ext::attention_supports_variable_window);
     m.def("spec_dec_tree_custom_mask_capacity", &tensorrt_llm::torch_ext::spec_dec_tree_custom_mask_capacity);
 }

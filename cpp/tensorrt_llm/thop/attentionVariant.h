@@ -305,6 +305,8 @@ public:
     /// Whether the fused context and generation kernels for this configuration exist;
     /// builds the runners if they have not been built yet.
     [[nodiscard]] bool supportsNvFp4Output();
+    /// Whether a variable-window context kernel exists for this configuration.
+    [[nodiscard]] bool supportsVariableWindow();
 
     /// The op's own derived state, for debugging a dispatch decision.
     [[nodiscard]] std::string toString() const;
