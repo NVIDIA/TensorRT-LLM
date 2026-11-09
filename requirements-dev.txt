@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 -r requirements.txt
 # Pin the exact diffusers version VisualGen LPIPS tests run against; install it
 # before pytest collection so already-imported Diffusers modules match the
@@ -25,7 +39,8 @@ einops
 flash-linear-attention==0.5.2
 lpips
 graphviz
-mypy==1.19.1
+pyrefly==1.4.0
+tomli>=2; python_version < "3.11"
 mako
 oyaml
 parameterized
@@ -40,7 +55,7 @@ pytest-csv
 pytest-env
 pytest-forked
 pytest-xdist
-pytest-timeout
+pytest-timeout==2.4.0
 pytest-split
 pytest-mock
 pytest-threadleak
@@ -65,7 +80,7 @@ opentelemetry-semantic-conventions-ai>=0.4.1
 rapidfuzz==3.14.5
 aiperf==0.8.0
 nanobind>=2.9.0
-nixl-cu13==1.4.0
+nixl-cu13==1.5.2
 cupti-python>=13.0,<13.5
 nvidia-cuda-cupti>=13.0,<13.5
 cxxfilt

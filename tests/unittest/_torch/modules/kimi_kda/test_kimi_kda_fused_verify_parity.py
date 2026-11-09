@@ -28,9 +28,8 @@ Simulates two chained speculative-verification rounds through
 Identical hidden states are fed to both worlds; the fused world additionally
 uses fused QKV(G) and full- or low-rank gate projections with multi-stream overlap. With mixed
 per-request acceptance between rounds, matching round-2 outputs proves the
-projection fusion and replay bookkeeping (shifted ``cu_seqlens`` layout,
-conv-window seeding, pending-count plumbing) reproduce the promoted-state
-semantics.
+projection fusion, packed row/slot bookkeeping, conv-window seeding and the
+in-kernel gated RMSNorm epilogue reproduce the promoted-state semantics.
 
 Requires 1 Blackwell GPU, fla-core, nvidia-cutlass-dsl. Skips otherwise.
 """
@@ -60,12 +59,12 @@ def _is_blackwell():
     if not torch.cuda.is_available():
         return False
     prop = torch.cuda.get_device_properties(0)
-    return prop.major * 10 + prop.minor in (100, 103)
+    return prop.major * 10 + prop.minor in (100, 103, 107)
 
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"),
-    pytest.mark.skipif(not _is_blackwell(), reason="needs sm100/sm103"),
+    pytest.mark.skipif(not _is_blackwell(), reason="needs sm100/sm103/sm107"),
     pytest.mark.skipif(not _HAVE_DEPS, reason=f"deps: {_DEP_ERR}"),
 ]
 
@@ -155,17 +154,19 @@ def _make_fused_layer_cache(B, conv_pool, *, num_heads=H):
     S = W - 1 + M
 
     def _conv_cache(section):
-        cache = torch.zeros(B, S, d, device="cuda", dtype=torch.float32).transpose(-1, -2)
-        cache[:, :, : W - 1] = conv_pool[:, section * d : (section + 1) * d].float()
+        # Raw bf16 projection inputs, dim-contiguous.
+        cache = torch.zeros(B, S, d, device="cuda", dtype=torch.bfloat16).transpose(-1, -2)
+        cache[:, :, : W - 1] = conv_pool[:, section * d : (section + 1) * d]
         return cache
 
     return SimpleNamespace(
         kda_conv_q=_conv_cache(0),
         kda_conv_k=_conv_cache(1),
         kda_conv_v=_conv_cache(2),
-        kda_qkg_cache=torch.zeros(B, M, 3, d, device="cuda", dtype=torch.float32),
-        kda_v_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.float32),
-        kda_beta_cache=torch.zeros(B, M, num_heads, device="cuda", dtype=torch.float32),
+        kda_k_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.bfloat16),
+        kda_g_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.float32),
+        kda_v_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.bfloat16),
+        kda_beta_cache=torch.zeros(B, M, num_heads, device="cuda", dtype=torch.bfloat16),
         prev_num_accepted_tokens=torch.zeros(B, dtype=torch.int32, device="cuda"),
         has_kda_replay_caches=True,
         intermediate_conv_window=None,
@@ -176,7 +177,7 @@ def _make_fused_layer_cache(B, conv_pool, *, num_heads=H):
 def _make_seq_layer_cache(B, *, num_heads=H):
     d = num_heads * K
     return SimpleNamespace(
-        kda_qkg_cache=None,
+        kda_k_cache=None,
         has_kda_replay_caches=False,
         intermediate_conv_window=torch.zeros(
             B, M + 1, 3 * d, W - 1, device="cuda", dtype=torch.bfloat16
@@ -193,6 +194,37 @@ def _promote_sequential(layer_cache, conv_pool, ssm_pool, accept):
     ssm_pool.copy_(layer_cache.intermediate_ssm[rows, accept])
 
 
+def _capture_mtp_verify(runtime):
+    """Record the kwargs of every fused verify launch, then run it."""
+    calls = []
+    mtp_verify = runtime._dispatch.mtp_verify
+
+    def _capturing_mtp_verify(**kwargs):
+        calls.append(kwargs)
+        return mtp_verify(**kwargs)
+
+    runtime._dispatch.mtp_verify = _capturing_mtp_verify
+    return calls
+
+
+def _assert_fused_epilogue_call(call, runtime, use_full_rank_gate):
+    """The fused verify ran with the in-kernel output norm on packed rows."""
+    assert call["fuse_output_norm"]
+    assert call["packed_token_layout"]
+    assert call["cu_seqlens"] is None
+    assert not call["mxfp8_output"]
+    onorm_g = call["onorm_g"]
+    assert onorm_g.stride(-1) == 1 and onorm_g.stride(-2) == K
+    if use_full_rank_gate:
+        # The gate and q/k/v stay strided views of the fused QKVG output.
+        row_stride = 4 * runtime.proj_size
+        assert onorm_g.stride(1) == row_stride
+        for name in ("x_q", "x_k", "x_v"):
+            assert call[name].stride(1) == row_stride
+            assert call[name].stride(-1) == 1
+    assert call["beta"].stride(-1) == 1
+
+
 def _rep(name, a, b):
     a, b = a.float(), b.float()
     cos = torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), dim=0).item()
@@ -201,21 +233,102 @@ def _rep(name, a, b):
     return cos > 0.999 and rel < 3e-2
 
 
+def _make_kvcm_replay_manager(num_heads):
+    """A V2 hybrid manager whose KVCM pools hold the KDA states and replay caches, with a host tier to offload to."""
+    from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
+    from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
+    from tensorrt_llm.mapping import Mapping
+
+    return KimiK3HybridCacheManager(
+        mamba_d_state=K,
+        mamba_d_conv=W,
+        mamba_num_heads=num_heads,
+        mamba_n_groups=num_heads,
+        mamba_head_dim=K,
+        mamba_num_layers=2,
+        mamba_layer_mask=[True, True],
+        mamba_cache_dtype=torch.bfloat16,
+        mamba_ssm_cache_dtype=torch.float32,
+        kv_cache_config=KvCacheConfig(
+            max_tokens=128, host_cache_size=64 << 20, enable_block_reuse=False
+        ),
+        kv_cache_type=CacheTypeCpp.SELF,
+        num_layers=0,
+        num_kv_heads=0,
+        head_dim=K,
+        tokens_per_block=32,
+        max_seq_len=64,
+        max_batch_size=4,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.BF16,
+        spec_config=MTPDecodingConfig(max_draft_len=M),
+        layer_mask=[False, False],
+        conv_state_layout="q_k_v",
+        kda_replay_num_spec=M,
+    )
+
+
+def _offload_and_resume(manager, request_ids):
+    """Suspend the requests' KV caches, push their pages to the host tier with newer caches, and resume them; returns
+    the slots they resume in."""
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import CACHE_LEVEL1, LayerId, _introspection
+
+    stream = torch.cuda.current_stream().cuda_stream
+    caches = [manager.kv_cache_map[rid] for rid in request_ids]
+    for cache in caches:
+        cache.suspend()
+    group = manager.impl.get_layer_group_id(LayerId(0))
+    pool = next(
+        pool
+        for pool in manager.impl.pool_group_descs
+        if any(variant.layer_group_id == group for variant in pool.slot_desc.variants)
+    )
+    pressure = []
+    try:
+        for _ in range(pool.num_slots + len(caches)):
+            other = manager.impl.create_kv_cache()
+            pressure.append(other)
+            assert other.resume(stream)
+            other.suspend()
+    finally:
+        for other in pressure:
+            other.close()
+    # The suspended requests' pages must have been evicted to the host tier, or
+    # the resume below would not exercise the offload path at all.
+    assert max(_introspection.storage_utilization(manager.impl, CACHE_LEVEL1)) > 0
+    new_slots = []
+    for cache in reversed(caches):
+        assert cache.resume(stream)
+        new_slots.append(cache.get_ssm_block_base_index(group))
+    return torch.tensor(list(reversed(new_slots)), dtype=torch.int32, device="cuda")
+
+
 @torch.no_grad()
 @pytest.mark.parametrize(
-    ("num_heads", "use_full_rank_gate", "checkpoint_fp8", "large_state_stride"),
+    ("num_heads", "use_full_rank_gate", "checkpoint_fp8", "large_state_stride", "kvcm_replay"),
     [
-        (H, True, False, False),
-        (H, True, True, False),
-        (16, False, False, False),
-        (64, False, False, False),
-        (64, False, False, True),
+        (H, True, False, False, False),
+        (H, True, True, False, False),
+        (16, False, False, False, False),
+        (64, False, False, False, False),
+        (64, False, False, True, False),
+        (H, True, False, False, True),
     ],
-    ids=["full-rank-bf16", "full-rank-fp8", "low-rank-h16", "low-rank-h64", "large-state-stride"],
+    ids=[
+        "full-rank-bf16",
+        "full-rank-fp8",
+        "low-rank-h16",
+        "low-rank-h64",
+        "large-state-stride",
+        "full-rank-bf16-kvcm-offload",
+    ],
 )
 def test_fused_vs_sequential_two_rounds(
-    num_heads, use_full_rank_gate, checkpoint_fp8, large_state_stride
+    request, num_heads, use_full_rank_gate, checkpoint_fp8, large_state_stride, kvcm_replay
 ):
+    """With ``kvcm_replay``, the fused world keeps its states and replay caches in a V2 manager's KVCM pools, and
+    the requests are offloaded to the host tier and resumed in other slots between the two rounds."""
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
     torch.manual_seed(0)
@@ -247,6 +360,8 @@ def test_fused_vs_sequential_two_rounds(
     else:
         assert rt_fused._qkvg_proj_weight is not None
         assert rt_fused._bfa_proj_weight is not None
+    assert rt_fused._onorm_w_f32 is not None
+    mtp_calls = _capture_mtp_verify(rt_fused)
     slot_indices = torch.arange(B, dtype=torch.int32, device="cuda")
 
     conv_pool_seq, ssm_pool_seq = _make_pools(B, seed=2, num_heads=num_heads)
@@ -266,6 +381,21 @@ def test_fused_vs_sequential_two_rounds(
         ssm_pool_fused = ssm_pool_seq.clone()
     cache_seq = _make_seq_layer_cache(B, num_heads=num_heads)
     cache_fused = _make_fused_layer_cache(B, conv_pool_fused, num_heads=num_heads)
+    fused_slots = slot_indices
+    replay_manager = _make_kvcm_replay_manager(num_heads) if kvcm_replay else None
+    if replay_manager is not None:
+        request.addfinalizer(replay_manager.shutdown)
+        request_ids = list(range(101, 101 + B))
+        replay_manager.add_dummy_requests(request_ids, token_nums=[32] * B, is_gen=False)
+        fused_slots = torch.tensor(
+            replay_manager.get_state_indices(request_ids), dtype=torch.int32, device="cuda"
+        )
+        cache_fused = replay_manager.mamba_layer_cache(0)
+        conv_pool_fused = cache_fused.conv
+        ssm_pool_fused = cache_fused.temporal
+        conv_pool_fused.index_copy_(0, fused_slots.long(), conv_pool_seq)
+        ssm_pool_fused.index_copy_(0, fused_slots.long(), ssm_pool_seq)
+        replay_manager.on_state_transfer_complete(request_ids)
 
     gen = torch.Generator(device="cuda").manual_seed(3)
 
@@ -285,16 +415,19 @@ def test_fused_vs_sequential_two_rounds(
     with with_multi_stream(True):
         out1_fused = rt_fused._project_output(
             rt_fused.forward_verify(
-                x1, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
+                x1, T, cache_fused, conv_pool_fused, ssm_pool_fused, fused_slots
             )
         )
+    _assert_fused_epilogue_call(mtp_calls[-1], rt_fused, use_full_rank_gate)
     print("round 1:")
     ok &= _rep("out", out1_fused, out1_seq)
 
     # ---- Acceptance: 0, 1, 2, 0 drafts across the 4 requests ----
     accept = torch.tensor([0, 1, 2, 0], dtype=torch.long, device="cuda")
     _promote_sequential(cache_seq, conv_pool_seq, ssm_pool_seq, accept)
-    cache_fused.prev_num_accepted_tokens.copy_(accept.to(torch.int32))
+    cache_fused.prev_num_accepted_tokens.index_copy_(0, fused_slots.long(), accept.to(torch.int32))
+    if replay_manager is not None:
+        fused_slots = _offload_and_resume(replay_manager, request_ids)
 
     # ---- Round 2 (fused path replays the accepted drafts) ----
     x2 = tokens()
@@ -311,10 +444,12 @@ def test_fused_vs_sequential_two_rounds(
             cache_fused,
             conv_pool_fused,
             ssm_pool_fused,
-            slot_indices,
+            fused_slots,
             output=core2_fused,
         )
     assert result2_fused is core2_fused
+    assert len(mtp_calls) == 2
+    _assert_fused_epilogue_call(mtp_calls[-1], rt_fused, use_full_rank_gate)
     out2_fused = rt_fused._project_output(core2_fused)
     print("round 2 (mixed replay):")
     ok &= _rep("out", out2_fused, out2_seq)
@@ -325,6 +460,181 @@ def test_fused_vs_sequential_two_rounds(
     _promote_sequential(
         cache_seq, conv_pool_seq, ssm_pool_seq, torch.zeros(B, dtype=torch.long, device="cuda")
     )
-    ok &= _rep("committed ssm", ssm_pool_fused, ssm_pool_seq)
+    ok &= _rep("committed ssm", ssm_pool_fused.index_select(0, fused_slots.long()), ssm_pool_seq)
 
     assert ok
+
+
+def _run_one_verify_round(runtime, x, batch, seed, **verify_kwargs):
+    conv_pool, ssm_pool = _make_pools(batch, seed=seed)
+    layer_cache = _make_fused_layer_cache(batch, conv_pool)
+    slot_indices = torch.arange(batch, dtype=torch.int32, device="cuda")
+    return runtime.forward_verify(
+        x, M + 1, layer_cache, conv_pool, ssm_pool, slot_indices, **verify_kwargs
+    )
+
+
+@torch.no_grad()
+def test_fused_verify_falls_back_without_output_norm_weights():
+    """Without finalized o_norm weights the verify keeps the Python output gate."""
+    batch = 2
+    runtime = _make_runtime(seed=5)
+    runtime.finalize_decode_weights()
+    x = (torch.randn(batch * (M + 1), HIDDEN, device="cuda") * 0.5).to(torch.bfloat16)
+    fused_out = runtime._project_output(_run_one_verify_round(runtime, x, batch, seed=6))
+
+    runtime._onorm_w_f32 = None
+    calls = _capture_mtp_verify(runtime)
+    fallback_out = runtime._project_output(_run_one_verify_round(runtime, x, batch, seed=6))
+
+    assert len(calls) == 1
+    assert "fuse_output_norm" not in calls[0]
+    assert calls[0]["cu_seqlens"] is not None
+    assert _rep("fallback vs fused epilogue", fallback_out, fused_out)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_fused_verify_multi_wave_runs_two_cta_kernel(monkeypatch, state_dtype):
+    """A verify grid of more (head, request) tiles than SMs runs the two-CTAs-per-SM kernel, with
+    bitwise the outputs, state and replay caches of ``kda_decode_mtp_kernel``, over two rounds
+    with mixed acceptance."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_kda_mtp_ops as mtp_ops
+
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    batch = num_sms // H + 4
+    steps = M + 1
+    runtime = _make_runtime(seed=1)
+    runtime.finalize_decode_weights()
+    conv_pool, ssm_pool = _make_pools(batch, seed=2)
+    cache = _make_fused_layer_cache(batch, conv_pool)
+    worlds = []
+    for _ in range(2):
+        worlds.append(
+            (
+                ssm_pool.to(state_dtype, copy=True),
+                SimpleNamespace(
+                    **{
+                        key: value.clone() if isinstance(value, torch.Tensor) else value
+                        for key, value in vars(cache).items()
+                    }
+                ),
+            )
+        )
+    select = mtp_ops._select_verify_kernel
+    selected = []
+
+    def v1_reference(**kwargs):
+        selected.append(select(**kwargs))
+        return "v1"
+
+    slots = torch.arange(batch, dtype=torch.int32, device="cuda")
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    for rnd in range(2):
+        x = (torch.randn(batch * steps, HIDDEN, generator=gen, device="cuda") * 0.5).bfloat16()
+        with monkeypatch.context() as patch:
+            patch.setattr(mtp_ops, "_select_verify_kernel", v1_reference)
+            ref = runtime.forward_verify_fused(x, steps, worlds[0][1], worlds[0][0], slots)
+        out = runtime.forward_verify_fused(x, steps, worlds[1][1], worlds[1][0], slots)
+        assert selected[-1] == "two_cta"
+        assert torch.equal(out, ref), f"round {rnd} out"
+        assert torch.equal(worlds[1][0], worlds[0][0]), f"round {rnd} state"
+        for key in (
+            "kda_conv_q",
+            "kda_conv_k",
+            "kda_conv_v",
+            "kda_k_cache",
+            "kda_g_cache",
+            "kda_v_cache",
+            "kda_beta_cache",
+        ):
+            assert torch.equal(getattr(worlds[1][1], key), getattr(worlds[0][1], key)), key
+        accept = torch.randint(0, M + 1, (batch,), generator=gen, device="cuda", dtype=torch.int32)
+        for _, world_cache in worlds:
+            world_cache.prev_num_accepted_tokens.copy_(accept)
+
+
+class _PrequantizedProjectionStub(torch.nn.Module):
+    """o_proj stand-in that records the prequantized pair it receives."""
+
+    supports_prequantized_input = True
+
+    def __init__(self, out_features):
+        super().__init__()
+        self.out_features = out_features
+        self.calls = []
+
+    def forward(self, x):
+        return x.new_zeros(x.shape[0], self.out_features)
+
+    def forward_prequantized(self, activation, activation_scale):
+        self.calls.append((activation, activation_scale))
+        return torch.zeros(
+            activation.shape[0], self.out_features, dtype=torch.bfloat16, device="cuda"
+        )
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("allow, with_output", [(True, False), (False, False), (True, True)])
+def test_fused_verify_mxfp8_output_gating(allow, with_output):
+    """MXFP8 output only when allowed, unbuffered and accepted by o_proj."""
+    batch = 2
+    rows = batch * (M + 1)
+    runtime = _make_runtime(seed=9)
+    runtime.finalize_decode_weights()
+    stub = _PrequantizedProjectionStub(HIDDEN)
+    runtime.o_proj = stub
+    calls = []
+
+    def _fake_mtp_verify(**kwargs):
+        calls.append(kwargs)
+        if kwargs["mxfp8_output"]:
+            activation = torch.zeros(rows, H * K, device="cuda").to(torch.float8_e4m3fn)
+            return activation, torch.zeros(128 * H * 4, dtype=torch.uint8, device="cuda")
+        return torch.zeros(1, rows, H, K, dtype=torch.bfloat16, device="cuda")
+
+    runtime._dispatch.mtp_verify = _fake_mtp_verify
+    x = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device="cuda")
+    output = x.new_empty(rows, H, K) if with_output else None
+    core = _run_one_verify_round(
+        runtime, x, batch, seed=10, output=output, allow_prequantized_output=allow
+    )
+    out = runtime._project_output(core)
+
+    expect_mxfp8 = allow and not with_output
+    assert calls[-1]["fuse_output_norm"]
+    assert calls[-1]["mxfp8_output"] is expect_mxfp8
+    assert len(stub.calls) == int(expect_mxfp8)
+    assert out.shape == (rows, HIDDEN)
+    if with_output:
+        assert core is output
+
+
+@torch.no_grad()
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (10, 7),
+    reason="the MXFP8 verify epilogue feeds the Rubin (SM107) CuTe MXFP8 GEMM",
+)
+def test_fused_verify_mxfp8_output_matches_bf16_projection():
+    """SM107: epilogue-quantized o_proj input matches the BF16 core path."""
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+
+    if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        pytest.skip("needs the Rubin CuTe DSL")
+    batch = 4
+    runtime = _make_runtime(seed=11)
+    runtime.finalize_decode_weights()
+    runtime.o_proj = _Fp8BlockScaleWeightReadLinear.from_linear(runtime.o_proj)
+    assert runtime.o_proj.supports_prequantized_input
+    calls = _capture_mtp_verify(runtime)
+    x = (torch.randn(batch * (M + 1), HIDDEN, device="cuda") * 0.5).to(torch.bfloat16)
+
+    bf16_out = runtime._project_output(_run_one_verify_round(runtime, x, batch, seed=12))
+    mxfp8_core = _run_one_verify_round(runtime, x, batch, seed=12, allow_prequantized_output=True)
+    mxfp8_out = runtime._project_output(mxfp8_core)
+
+    assert [call["mxfp8_output"] for call in calls] == [False, True]
+    assert mxfp8_core.activation.dtype is torch.float8_e4m3fn
+    assert mxfp8_core.scale.dtype is torch.uint8
+    assert _rep("mxfp8 vs bf16 o_proj input", mxfp8_out, bf16_out)

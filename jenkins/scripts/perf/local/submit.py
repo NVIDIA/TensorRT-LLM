@@ -32,6 +32,10 @@ from benchmark_utils import (  # noqa: E402
     DISAGG_BENCHMARK_MODES,
     DISAGG_CONFIG_MODES,
     GEN_ONLY_NO_CONTEXT_MODE,
+    add_eplb_shm_mount,
+    ctx_only_world_size,
+    dwdp_ctx_layout,
+    dwdp_ctx_size,
     gen_only_no_context_server_counts,
     gen_only_no_context_world_size,
     is_gen_only_no_context,
@@ -250,11 +254,7 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, test_name=None):
             gpus_per_server = gen_only_no_context_world_size(config)
         else:
             # Use ctx worker config to determine hardware
-            ctx_config = worker_config.get("ctx", {})
-            ctx_tp = ctx_config.get("tensor_parallel_size", 1)
-            ctx_pp = ctx_config.get("pipeline_parallel_size", 1)
-            ctx_cp = ctx_config.get("context_parallel_size", 1)
-            gpus_per_server = ctx_tp * ctx_pp * ctx_cp
+            gpus_per_server = ctx_only_world_size(config)
 
         nodes_per_server = (gpus_per_server + gpus_per_node - 1) // gpus_per_node
         total_nodes = nodes_per_server
@@ -334,9 +334,12 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, test_name=None):
         gpus_per_node_per_ctx_server = min(gpus_per_ctx_server, gpus_per_node)
         gpus_per_node_per_gen_server = min(gpus_per_gen_server, gpus_per_node)
 
-        total_nodes = (
-            num_ctx_servers * nodes_per_ctx_server + num_gen_servers * nodes_per_gen_server
-        )
+        ctx_nodes = num_ctx_servers * nodes_per_ctx_server
+        dwdp_size = 0 if is_gen_only_no_context(benchmark_mode, config) else dwdp_ctx_size(config)
+        if dwdp_size:
+            # One MPI step hosts every single-GPU ctx server, packed per node.
+            _, ctx_nodes, _ = dwdp_ctx_layout(config)
+        total_nodes = ctx_nodes + num_gen_servers * nodes_per_gen_server
         total_gpus = total_nodes * gpus_per_node
 
         return {
@@ -349,6 +352,8 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, test_name=None):
             "nodes_per_gen_server": nodes_per_gen_server,
             "gpus_per_node_per_ctx_server": gpus_per_node_per_ctx_server,
             "gpus_per_node_per_gen_server": gpus_per_node_per_gen_server,
+            "dwdp_size": dwdp_size,
+            "ctx_nodes": ctx_nodes,
             "total_nodes": total_nodes,
             "total_gpus": total_gpus,
         }
@@ -569,7 +574,9 @@ def generate_sbatch_params(args, hardware_config, work_dir):
     return lines
 
 
-def generate_srun_args(args, runtime_mode, timestamp, llm_src="", hardware_config=None):
+def generate_srun_args(
+    args, runtime_mode, timestamp, llm_src="", hardware_config=None, config=None
+):
     """Generate srun arguments."""
     is_aggr = runtime_mode == "aggregated"
     container_name = f"{'aggr' if is_aggr else 'disagg'}_test-{timestamp}"
@@ -587,6 +594,7 @@ def generate_srun_args(args, runtime_mode, timestamp, llm_src="", hardware_confi
     if llm_src and llm_src not in mounts:
         llm_src_mount = f"{llm_src}:{llm_src}"
         mounts = f"{mounts},{llm_src_mount}" if mounts else llm_src_mount
+    mounts = add_eplb_shm_mount(mounts, config, llm_src)
     if mounts:
         lines.append(f"--container-mounts={mounts}")
 
@@ -957,7 +965,9 @@ def main():
     sbatch_lines = generate_sbatch_params(args, hardware_config, work_dir)
 
     # Generate srun args
-    srun_args_lines = generate_srun_args(args, runtime_mode, timestamp, llm_src, hardware_config)
+    srun_args_lines = generate_srun_args(
+        args, runtime_mode, timestamp, llm_src, hardware_config, config
+    )
 
     # Generate pytest command
     pytest_command, test_list_content, test_list_path = generate_pytest_command(
@@ -1007,15 +1017,10 @@ def main():
         if _kv:
             script_prefix_lines.append(f"export {_kv}")
 
-    # Also splice EXTRA_CONTAINER_EXPORTS *inline* into the per-role env prefixes
-    # built below. Aggregated ranks inherit these from the container env, but
-    # disaggregated ctx/gen/benchmark workers are launched with a curated inline
-    # env prefix (TLLM_PROFILE_START_STOP, FLASHINFER_JIT_DIR, HF_HOME, ...) and
-    # anything not on that prefix -- nor in the srun --container-env allowlist --
-    # is dropped at the worker boundary. Putting the same KEY=VALUE pairs inline
-    # guarantees opt-in passthroughs (e.g. cache-dir overrides, BOLT
-    # clear-counters env, BOLT_ITER_MULT) reach every disagg role. Values here are
-    # simple (no spaces); generic and a no-op when EXTRA_CONTAINER_EXPORTS unset.
+    # Repeat EXTRA_CONTAINER_EXPORTS in each role's command prefix so these
+    # values are applied immediately before launching the command. Other exported
+    # variables still inherit normally; an inline prefix is not an allowlist.
+    # Values here are simple (no spaces); unset means no additional assignments.
     _extra_inline_exports = " ".join(
         _kv.strip()
         for _kv in os.environ.get("EXTRA_CONTAINER_EXPORTS", "").split(";")
@@ -1127,6 +1132,13 @@ def main():
 
         ucx_tls_cmd = get_ucx_tls_cmd(cluster_name, gpu_type)
         print(f"UCX env: cluster={cluster_name!r} gpu={gpu_type!r} -> {ucx_tls_cmd!r}")
+        # Every DWDP ctx rank runs pytest itself (trtllm-llmapi-launch would run
+        # it on rank 0 only), so those ranks use the per-rank launcher instead.
+        ctx_launcher = (
+            f"bash {llm_src}/jenkins/scripts/perf/disaggregated/dwdp_ctx_rank.sh"
+            if hardware_config.get("dwdp_size")
+            else "$LLM_API_LAUNCH"
+        )
         script_prefix_lines.extend(
             [
                 f'export CTX_WORKER_ENV_VARS="{ctx_worker_env_vars}"',
@@ -1136,7 +1148,7 @@ def main():
                 (
                     f'export pytestCommandCTXWorker="{ucx_tls_cmd}'
                     " $CTX_WORKER_ENV_VARS $PYTEST_COMMON_VARS"
-                    " $NSYS_PREFIX $LLM_API_LAUNCH"
+                    f" $NSYS_PREFIX {ctx_launcher}"
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
                 (
@@ -1162,6 +1174,8 @@ def main():
                 f"export nodesPerGenServer={hardware_config.get('nodes_per_gen_server', '')}",
                 f"export gpusPerNodePerCtxServer={hardware_config.get('gpus_per_node_per_ctx_server', '')}",
                 f"export gpusPerNodePerGenServer={hardware_config.get('gpus_per_node_per_gen_server', '')}",
+                f"export dwdpCtxSize={hardware_config.get('dwdp_size', 0)}",
+                f"export dwdpCtxNodes={hardware_config.get('ctx_nodes', '')}",
                 f"export totalNodes={hardware_config.get('total_nodes', '')}",
                 f"export totalGpus={hardware_config.get('total_gpus', '')}",
                 f"export testOutputDir={test_output_dir}",
@@ -1237,9 +1251,8 @@ def main():
                 f"export testOutputDir={test_output_dir}",
             ]
         )
-        # Forward pytestCommand into the pyxis container on every rank (matches the
-        # disagg branch's --container-env=pytestCommand). Without this, exports
-        # in the launch script don't survive the container boundary on multi-node.
+        # Exported job variables inherit by default. This requests priority for
+        # pytestCommand over a same-named container value; it is not an allowlist.
         srun_args_lines.append("--container-env=pytestCommand")
 
     # Export accuracy config to BENCHMARK node (disagg only)

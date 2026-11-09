@@ -46,6 +46,7 @@ from ..helpers.schedule import (
 )
 from ..helpers.stage import MlaStage
 from ..helpers.tile import (
+    runtime_split_count,
     runtime_base_seq_len_kv,
     runtime_local_kv_tiles,
     runtime_seq_len_kv_from_task_cache,
@@ -58,6 +59,7 @@ class MlaDecodeTask(Task):
     def __init__(self, **kwargs):
         """Initialize MLA-specific task parameters and cached thread indices."""
         self.cfg = kwargs.pop("cfg", None)
+        self.runtime_split_kv = kwargs.pop("runtime_split_kv", None)
         self.seqlens_kv = kwargs.pop("seqlens_kv", None)
         self.cu_seqlens_q = kwargs.pop("cu_seqlens_q", None)
         self.domain_bias = kwargs.pop("domain_bias", 0)
@@ -67,6 +69,7 @@ class MlaDecodeTask(Task):
         self._local_warp_idx = Int32(0)
         self._lane_idx = Int32(0)
         self._seq_len_kv = Int32(0)
+        self._local_kv_tiles = Int32(1)
 
     @cute.jit
     def init_variables(self, context=None):
@@ -80,7 +83,7 @@ class MlaDecodeTask(Task):
         self._local_warp_idx = self._warp_grp_thread_idx >> Int32(WARP_LANE_SHIFT)
         self._lane_idx = self._warp_grp_thread_idx & Int32(WARP_LANE_MASK)
         if context is not None and context.tmem_ptr_i32 is not None:
-            loaded = Int32(context.tmem_ptr_i32.load())
+            loaded = self._load_allocated_tmem_base(context.tmem_ptr_i32)
             self._tmem_base_offset = cute.arch.make_warp_uniform(
                 prims.shfl_sync(
                     thread_mask=0xFFFFFFFF,
@@ -92,6 +95,22 @@ class MlaDecodeTask(Task):
             )
 
     @cute.jit
+    def _load_allocated_tmem_base(self, pointer):
+        # TaskManager initializes every task before dispatch. Sparse loaders
+        # may already be running while the MMA warp allocates TMEM, so only
+        # the warps participating in the readiness barrier may read its result.
+        if cutlass.const_expr(self.cfg is not None and self.cfg.sparse_direct):
+            warp = cute.arch.warp_idx()
+            base = Int32(0)
+            if warp < Int32(
+                self.cfg.correction_warp_idx + self.cfg.correction_num_warps
+            ) or warp == Int32(self.cfg.mma_warp_idx):
+                base = Int32(pointer.load(is_volatile=True))
+            return base
+        else:
+            return Int32(pointer.load())
+
+    @cute.jit
     def make_task_cache(self):
         """Return the compact tuple of cached per-task thread values."""
         return (
@@ -100,7 +119,7 @@ class MlaDecodeTask(Task):
             self._local_warp_idx,
             self._lane_idx,
             self._seq_len_kv,
-            Int32(0),
+            self._local_kv_tiles,
             Int32(0),
             Int32(0),
         )
@@ -109,6 +128,9 @@ class MlaDecodeTask(Task):
     def get_domain(self, tile_coord):
         """Return the runtime loop domain for the current 1CTA work tile."""
         if cutlass.const_expr(self.cfg is None):
+            return self.domain
+        if cutlass.const_expr(self.seqlens_kv is None and self.cfg.seq_len_kv is None):
+            # Padding and scheduler tasks have no K/V metadata or mainloop.
             return self.domain
 
         # Persistent 1CTA coordinates combine batch and head tile in z;
@@ -129,13 +151,23 @@ class MlaDecodeTask(Task):
         # raw batch length for causal can move an all-masked tile into tail and
         # replace a real loop accumulator at a tile boundary.
         cta_idx_q = tile_coord[0]
-        if cutlass.const_expr(self.cfg.use_persistent_scheduler != 1):
-            # Nonpersistent grid X combines (head tile, Q tile, KV split), with
-            # KV split innermost. Persistent work queues already expose Q as
-            # tile coordinate 0 and must not be decoded a second time.
-            cta_idx_q = (tile_coord[0] // Int32(self.cfg.num_ctas_per_seq_kv)) % Int32(
-                self.cfg.num_ctas_per_seq_q
-            )
+        if cutlass.const_expr(
+            self.cfg.fixed_seqlen
+            and self.cfg.use_persistent_scheduler != 1
+            and self.cfg.num_ctas_per_seq_q == 1
+        ):
+            cta_idx_q = Int32(0)
+        elif cutlass.const_expr(self.cfg.use_persistent_scheduler != 1):
+            grid_splits = Int32(self.cfg.num_ctas_per_seq_kv)
+            if cutlass.const_expr(
+                self.runtime_split_kv is not None
+                and self.cfg.use_cluster_reduction != 1
+            ):
+                grid_splits = runtime_split_count(self.runtime_split_kv)
+            # Heads are already flattened into Q; grid-X packs Q and KV split.
+            cta_idx_q = tile_coord[0] // grid_splits
+            if cutlass.const_expr(self.cfg.fixed_seqlen):
+                cta_idx_q = cta_idx_q % Int32(self.cfg.num_ctas_per_seq_q)
         # Cache the raw batch length once per task/work tile. Resource work
         # methods derive their CTA-visible length from this task cache instead
         # of independently reloading cache_seqs throughout the hot loop.
@@ -151,7 +183,12 @@ class MlaDecodeTask(Task):
             self.cu_seqlens_q,
             batch_idx,
         )
-        total_kv_tiles = runtime_local_kv_tiles(self.cfg, seq_len_kv)
+        if cutlass.const_expr(self.cfg.fixed_sparse_kv_tiles > 0):
+            return Int32(self.domain_bias)
+        total_kv_tiles = runtime_local_kv_tiles(
+            self.cfg, seq_len_kv, requested_splits=self.runtime_split_kv
+        )
+        self._local_kv_tiles = total_kv_tiles
         remaining_kv_tiles = cute.math.max(
             total_kv_tiles - Int32(self.cfg.num_insts_kv), Int32(0)
         )
@@ -305,6 +342,63 @@ def create_throughput_latency_softmax_task_impl(
         schedule=captured_schedule,
         num_registers=cfg.softmax_regs,
         name=task_name or f"Softmax{inst_id}Task",
+        **kw,
+    )
+
+
+def create_short_merged_softmax_task(s0, s1, l0, l1, p0, p1, g0, g1, cfg, **kw):
+    @schedule
+    def merged(s0, s1, l0, l1, p0, p1, g0, g1):
+        def process(s, local, p, global_stats):
+            old, total, maximum, local_sum, scores = s.init_softmax_state()
+            p.init_materialize_state()
+            s.wait()
+            old, total, maximum, local_sum, scores = s.update_softmax(
+                old_max_arr=old,
+                sum_arr=total,
+                new_max_arr=maximum,
+                local_sum_arr=local_sum,
+                s_arr=scores,
+                section=MlaStage.Loop,
+            )
+            s.release()
+            p.acquire()
+            p.materialize_p(new_max_arr=maximum, s_arr=scores, local_sum_arr=local_sum)
+            p.commit()
+            global_stats.track_global()
+            old, total, maximum, local_sum, scores = s.update_softmax_sum(
+                old_max_arr=old,
+                sum_arr=total,
+                new_max_arr=maximum,
+                local_sum_arr=local_sum,
+                s_arr=scores,
+            )
+            return old, maximum, total
+
+        def publish_final(local, state):
+            old, maximum, total = state
+            local.acquire()
+            local.store_loop_stats(
+                old_max_arr=old, new_max_arr=maximum, sum_arr=total, inst_idx=1
+            )
+            local.commit()
+
+        with domain_loop(0, 1, 1):
+            state0 = process(s0, l0, p0, g0)
+            state1 = process(s1, l1, p1, g1)
+            publish_final(l0, state0)
+            publish_final(l1, state1)
+
+    return MlaDecodeTask(
+        src_resources=[s0, s1],
+        dst_resources=[l0, l1, p0, p1, g0, g1],
+        cfg=cfg,
+        warp_idx=0,
+        num_warps=4,
+        num_registers=cfg.softmax_regs,
+        schedule=merged(s0, s1, l0, l1, p0, p1, g0, g1),
+        name="ShortMergedSoftmaxTask",
+        domain_bias=1,
         **kw,
     )
 
@@ -830,8 +924,15 @@ def create_throughput_latency_correction_task(
                     tail_o_stage_idx_0,
                     tail_o_stage_idx_1,
                 ) = work_tile_state
-            local0_state = load_initial_local_stats(tmem_softmax_local0, local0_state)
-            local1_state = load_initial_local_stats(tmem_softmax_local1, local1_state)
+            # With only one tile per stream there is no correction loop;
+            # consume only final statistics, published after both P tiles.
+            if not cfg.short_merged_softmax:
+                local0_state = load_initial_local_stats(
+                    tmem_softmax_local0, local0_state
+                )
+                local1_state = load_initial_local_stats(
+                    tmem_softmax_local1, local1_state
+                )
 
             with domain_loop(0, domain, 1):
                 (
@@ -1014,7 +1115,8 @@ def create_load_page_offsets_task(
         smem_page_offsets.init_load_state()
 
         with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
-            if cfg.kernel_variant == "keeps_mma_ab":
+            smem_page_offsets.bind_sparse_request()
+            if cfg.single_kv_pipe:
                 page_offsets_produce(
                     smem_page_offsets, "load_k0", section=MlaStage.Head
                 )
@@ -1022,11 +1124,27 @@ def create_load_page_offsets_task(
                     page_offsets_produce(
                         smem_page_offsets, "load_k0", section=MlaStage.Loop
                     )
+                    if not cfg.sparse_reuse_kv:
+                        page_offsets_produce(
+                            smem_page_offsets, "load_v0", section=MlaStage.Loop
+                        )
+                if not cfg.sparse_reuse_kv:
                     page_offsets_produce(
-                        smem_page_offsets, "load_v0", section=MlaStage.Loop
+                        smem_page_offsets, "load_v0", section=MlaStage.Tail
+                    )
+            elif cfg.serial_swap_reuse:
+                page_offsets_produce(
+                    smem_page_offsets, "load_k0", section=MlaStage.Head
+                )
+                with domain_loop(0, domain, 1):
+                    page_offsets_produce(
+                        smem_page_offsets, "load_k1", section=MlaStage.Loop
+                    )
+                    page_offsets_produce(
+                        smem_page_offsets, "load_k0", section=MlaStage.Loop
                     )
                 page_offsets_produce(
-                    smem_page_offsets, "load_v0", section=MlaStage.Tail
+                    smem_page_offsets, "load_k1", section=MlaStage.Tail
                 )
             else:
                 page_offsets_produce(
@@ -1132,7 +1250,7 @@ def create_throughput_latency_load_task(
         else:
             cached_page_ids = None
         reuse_delayed_v_page_ids = (
-            smem_page_offsets is not None and cfg.kernel_variant != "keeps_mma_ab"
+            smem_page_offsets is not None and not cfg.single_kv_pipe
         )
 
         def load_kv(
@@ -1146,6 +1264,7 @@ def create_throughput_latency_load_task(
             """Select the native paged swaps cache or the existing load path."""
             nonlocal cached_page_ids
             if reuse_delayed_v_page_ids:
+                assert not cfg.early_raw_snapshot
                 cached_page_ids = _staged_kv_load_with_reused_page_ids(
                     smem_kv,
                     head_dim_stages=head_dim_stages,
@@ -1159,6 +1278,13 @@ def create_throughput_latency_load_task(
             else:
                 cached_page_ids = staged_kv_load(
                     smem_kv,
+                    whole_kv=cfg.whole_kv_tile,
+                    pre_acquire_label=(
+                        "snapshot_raw_record"
+                        if cfg.early_raw_snapshot
+                        and producer_label.startswith("load_k")
+                        else None
+                    ),
                     head_dim_stages=head_dim_stages,
                     producer_label=producer_label,
                     section=section,
@@ -1171,75 +1297,106 @@ def create_throughput_latency_load_task(
             smem_q.acquire()
             smem_q.load_q()
             smem_q.commit()
-            load_kv(
-                head_dim_stages=cfg.qk_head_dim_stages,
-                producer_label="load_k0",
-                section=MlaStage.Head,
-                page_id_slot=0,
-            )
-            if cfg.kernel_variant != "keeps_mma_ab":
+            if cfg.serial_swap_reuse:
                 load_kv(
                     head_dim_stages=cfg.qk_head_dim_stages,
-                    producer_label="load_k1",
+                    producer_label="load_k0",
                     section=MlaStage.Head,
-                    page_id_slot=1,
+                    page_id_slot=0,
                 )
-
-            with domain_loop(0, domain, 1):
-                if cfg.kernel_variant == "keeps_mma_ab":
-                    load_kv(
-                        head_dim_stages=cfg.qk_head_dim_stages,
-                        producer_label="load_k0",
-                        section=MlaStage.Loop,
-                    )
-                    load_kv(
-                        head_dim_stages=cfg.v_head_dim_stages,
-                        producer_label="load_v0",
-                        section=MlaStage.Loop,
-                    )
-                else:
-                    load_kv(
-                        head_dim_stages=cfg.v_head_dim_stages,
-                        producer_label="load_v0",
-                        section=MlaStage.Loop,
-                        page_id_slot=0,
-                        reuse_cached_page_ids=True,
-                    )
-                    load_kv(
-                        head_dim_stages=cfg.qk_head_dim_stages,
-                        producer_label="load_k0",
-                        section=MlaStage.Loop,
-                        page_id_slot=0,
-                    )
-                    load_kv(
-                        head_dim_stages=cfg.v_head_dim_stages,
-                        producer_label="load_v1",
-                        section=MlaStage.Loop,
-                        page_id_slot=1,
-                        reuse_cached_page_ids=True,
-                    )
+                with domain_loop(0, domain, 1):
                     load_kv(
                         head_dim_stages=cfg.qk_head_dim_stages,
                         producer_label="load_k1",
                         section=MlaStage.Loop,
                         page_id_slot=1,
                     )
-
-            load_kv(
-                head_dim_stages=cfg.v_head_dim_stages,
-                producer_label="load_v0",
-                section=MlaStage.Tail,
-                page_id_slot=0,
-                reuse_cached_page_ids=True,
-            )
-            if cfg.kernel_variant != "keeps_mma_ab":
+                    load_kv(
+                        head_dim_stages=cfg.qk_head_dim_stages,
+                        producer_label="load_k0",
+                        section=MlaStage.Loop,
+                        page_id_slot=0,
+                    )
                 load_kv(
-                    head_dim_stages=cfg.v_head_dim_stages,
-                    producer_label="load_v1",
+                    head_dim_stages=cfg.qk_head_dim_stages,
+                    producer_label="load_k1",
                     section=MlaStage.Tail,
                     page_id_slot=1,
-                    reuse_cached_page_ids=True,
                 )
+            else:
+                load_kv(
+                    head_dim_stages=cfg.qk_head_dim_stages,
+                    producer_label="load_k0",
+                    section=MlaStage.Head,
+                    page_id_slot=0,
+                )
+                if not cfg.single_kv_pipe:
+                    load_kv(
+                        head_dim_stages=cfg.qk_head_dim_stages,
+                        producer_label="load_k1",
+                        section=MlaStage.Head,
+                        page_id_slot=1,
+                    )
+
+                with domain_loop(0, domain, 1):
+                    if cfg.single_kv_pipe:
+                        load_kv(
+                            head_dim_stages=cfg.qk_head_dim_stages,
+                            producer_label="load_k0",
+                            section=MlaStage.Loop,
+                        )
+                        if not cfg.sparse_reuse_kv:
+                            load_kv(
+                                head_dim_stages=cfg.v_head_dim_stages,
+                                producer_label="load_v0",
+                                section=MlaStage.Loop,
+                            )
+                    else:
+                        if not cfg.sparse_reuse_kv:
+                            load_kv(
+                                head_dim_stages=cfg.v_head_dim_stages,
+                                producer_label="load_v0",
+                                section=MlaStage.Loop,
+                                page_id_slot=0,
+                                reuse_cached_page_ids=True,
+                            )
+                        load_kv(
+                            head_dim_stages=cfg.qk_head_dim_stages,
+                            producer_label="load_k0",
+                            section=MlaStage.Loop,
+                            page_id_slot=0,
+                        )
+                        if not cfg.sparse_reuse_kv:
+                            load_kv(
+                                head_dim_stages=cfg.v_head_dim_stages,
+                                producer_label="load_v1",
+                                section=MlaStage.Loop,
+                                page_id_slot=1,
+                                reuse_cached_page_ids=True,
+                            )
+                        load_kv(
+                            head_dim_stages=cfg.qk_head_dim_stages,
+                            producer_label="load_k1",
+                            section=MlaStage.Loop,
+                            page_id_slot=1,
+                        )
+
+                if not cfg.sparse_reuse_kv:
+                    load_kv(
+                        head_dim_stages=cfg.v_head_dim_stages,
+                        producer_label="load_v0",
+                        section=MlaStage.Tail,
+                        page_id_slot=0,
+                        reuse_cached_page_ids=True,
+                    )
+                if not cfg.single_kv_pipe and not cfg.sparse_reuse_kv:
+                    load_kv(
+                        head_dim_stages=cfg.v_head_dim_stages,
+                        producer_label="load_v1",
+                        section=MlaStage.Tail,
+                        page_id_slot=1,
+                        reuse_cached_page_ids=True,
+                    )
 
     @schedule
     def load_schedule(smem_q, smem_kv):
@@ -1363,7 +1520,7 @@ def create_throughput_latency_load_task(
         warp_idx=cfg.load_warp_idx if warp_idx is None else warp_idx,
         num_warps=cfg.load_num_warps if num_warps is None else num_warps,
         schedule=captured_schedule,
-        num_registers=cfg.mma_load_regs,
+        num_registers=cfg.kv_load_regs,
         name="LoadTmaTask",
         **kw,
     )
@@ -1504,6 +1661,8 @@ def create_throughput_latency_mma_task(
         smem_kv.init_descriptor_state()
         smem_p0.init_descriptor_state()
         smem_p1.init_descriptor_state()
+        tmem_s0.init_descriptor_state()
+        tmem_s1.init_descriptor_state()
         tmem_o.init_mma_state()
 
         with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
@@ -1514,67 +1673,158 @@ def create_throughput_latency_mma_task(
             q_desc, q_desc_rope = smem_q.q_desc()
             tmem_s0.set_q_desc(q_desc=q_desc, q_desc_rope=q_desc_rope)
             tmem_s1.set_q_desc(q_desc=q_desc, q_desc_rope=q_desc_rope)
-            staged_qk_mma(
-                smem_kv,
-                tmem_s0,
-                head_dim_stages=cfg.qk_head_dim_stages,
-                consumer_label="k_desc_0",
-            )
-            staged_qk_mma(
-                smem_kv,
-                tmem_s1,
-                head_dim_stages=cfg.qk_head_dim_stages,
-                consumer_label="k_desc_1",
-            )
-            with domain_loop(0, domain, 1):
-                tmem_s0.acquire()
-                staged_pv_mma(
-                    smem_kv,
-                    smem_p0,
-                    tmem_o,
-                    head_dim_stages=cfg.v_head_dim_stages,
-                    consumer_label="v_desc_0",
-                    producer_label="pv_mma_loop_0",
-                )
+            if cfg.serial_swap_reuse:
                 staged_qk_mma(
                     smem_kv,
                     tmem_s0,
                     head_dim_stages=cfg.qk_head_dim_stages,
                     consumer_label="k_desc_0",
-                    include_acquire=False,
+                    release_k=False,
                 )
-                tmem_s1.acquire()
+                with domain_loop(0, domain, 1):
+                    staged_pv_mma(
+                        smem_kv,
+                        smem_p0,
+                        tmem_o,
+                        head_dim_stages=cfg.v_head_dim_stages,
+                        consumer_label="v_desc_reused_0",
+                        reuse_k=True,
+                        retained_k_stages=cfg.qk_head_dim_stages,
+                        producer_label="pv_mma_loop_0",
+                    )
+                    staged_qk_mma(
+                        smem_kv,
+                        tmem_s1,
+                        head_dim_stages=cfg.qk_head_dim_stages,
+                        consumer_label="k_desc_1",
+                        release_k=False,
+                    )
+                    staged_pv_mma(
+                        smem_kv,
+                        smem_p1,
+                        tmem_o,
+                        head_dim_stages=cfg.v_head_dim_stages,
+                        consumer_label="v_desc_reused_1",
+                        reuse_k=True,
+                        retained_k_stages=cfg.qk_head_dim_stages,
+                        producer_label="pv_mma_loop_1",
+                    )
+                    staged_qk_mma(
+                        smem_kv,
+                        tmem_s0,
+                        head_dim_stages=cfg.qk_head_dim_stages,
+                        consumer_label="k_desc_0",
+                        release_k=False,
+                    )
                 staged_pv_mma(
                     smem_kv,
-                    smem_p1,
+                    smem_p0,
                     tmem_o,
                     head_dim_stages=cfg.v_head_dim_stages,
-                    consumer_label="v_desc_1",
-                    producer_label="pv_mma_loop_1",
+                    consumer_label="v_desc_reused_0",
+                    reuse_k=True,
+                    retained_k_stages=cfg.qk_head_dim_stages,
+                    producer_label="pv_mma_tail_0",
                 )
                 staged_qk_mma(
                     smem_kv,
                     tmem_s1,
                     head_dim_stages=cfg.qk_head_dim_stages,
                     consumer_label="k_desc_1",
-                    include_acquire=False,
+                    release_k=False,
                 )
-            staged_pv_mma(
-                smem_kv,
-                smem_p0,
-                tmem_o,
-                head_dim_stages=cfg.v_head_dim_stages,
-                consumer_label="v_desc_0",
-                producer_label="pv_mma_tail_0",
-            )
-            staged_pv_mma(
-                smem_kv,
-                smem_p1,
-                tmem_o,
-                head_dim_stages=cfg.v_head_dim_stages,
-                consumer_label="v_desc_1",
-                producer_label="pv_mma_tail_1",
-            )
+                staged_pv_mma(
+                    smem_kv,
+                    smem_p1,
+                    tmem_o,
+                    head_dim_stages=cfg.v_head_dim_stages,
+                    consumer_label="v_desc_reused_1",
+                    reuse_k=True,
+                    retained_k_stages=cfg.qk_head_dim_stages,
+                    producer_label="pv_mma_tail_1",
+                )
+            else:
+                staged_qk_mma(
+                    smem_kv,
+                    tmem_s0,
+                    head_dim_stages=cfg.qk_head_dim_stages,
+                    consumer_label="k_desc_0",
+                    release_k=not cfg.sparse_reuse_kv,
+                )
+                staged_qk_mma(
+                    smem_kv,
+                    tmem_s1,
+                    head_dim_stages=cfg.qk_head_dim_stages,
+                    consumer_label="k_desc_1",
+                    release_k=not cfg.sparse_reuse_kv,
+                )
+                with domain_loop(0, domain, 1):
+                    tmem_s0.acquire()
+                    staged_pv_mma(
+                        smem_kv,
+                        smem_p0,
+                        tmem_o,
+                        head_dim_stages=cfg.v_head_dim_stages,
+                        consumer_label=(
+                            "v_desc_reused" if cfg.sparse_reuse_kv else "v_desc_0"
+                        ),
+                        reuse_k=cfg.sparse_reuse_kv,
+                        retained_k_stages=cfg.qk_head_dim_stages,
+                        producer_label="pv_mma_loop_0",
+                    )
+                    staged_qk_mma(
+                        smem_kv,
+                        tmem_s0,
+                        head_dim_stages=cfg.qk_head_dim_stages,
+                        consumer_label="k_desc_0",
+                        release_k=not cfg.sparse_reuse_kv,
+                        include_acquire=False,
+                    )
+                    tmem_s1.acquire()
+                    staged_pv_mma(
+                        smem_kv,
+                        smem_p1,
+                        tmem_o,
+                        head_dim_stages=cfg.v_head_dim_stages,
+                        consumer_label=(
+                            "v_desc_reused" if cfg.sparse_reuse_kv else "v_desc_1"
+                        ),
+                        reuse_k=cfg.sparse_reuse_kv,
+                        retained_k_stages=cfg.qk_head_dim_stages,
+                        producer_label="pv_mma_loop_1",
+                    )
+                    staged_qk_mma(
+                        smem_kv,
+                        tmem_s1,
+                        head_dim_stages=cfg.qk_head_dim_stages,
+                        consumer_label="k_desc_1",
+                        release_k=not cfg.sparse_reuse_kv,
+                        include_acquire=False,
+                    )
+                staged_pv_mma(
+                    smem_kv,
+                    smem_p0,
+                    tmem_o,
+                    head_dim_stages=cfg.v_head_dim_stages,
+                    consumer_label=(
+                        "v_desc_reused" if cfg.sparse_reuse_kv else "v_desc_0"
+                    ),
+                    reuse_k=cfg.sparse_reuse_kv,
+                    retained_k_stages=cfg.qk_head_dim_stages,
+                    producer_label="pv_mma_tail_0",
+                )
+                staged_pv_mma(
+                    smem_kv,
+                    smem_p1,
+                    tmem_o,
+                    head_dim_stages=cfg.v_head_dim_stages,
+                    consumer_label=(
+                        "v_desc_reused" if cfg.sparse_reuse_kv else "v_desc_1"
+                    ),
+                    reuse_k=cfg.sparse_reuse_kv,
+                    retained_k_stages=cfg.qk_head_dim_stages,
+                    producer_label="pv_mma_tail_1",
+                )
             smem_q.release()
 
     captured_schedule = (
@@ -1615,11 +1865,11 @@ def create_throughput_latency_mma_task(
     )
 
 
-def create_keeps_mma_ab_mma_task(
+def create_single_kv_pipe_mma_task(
     smem_q,
     smem_kv,
     tmem_s,
-    tmem_p,
+    p_resource,
     tmem_o,
     work_queue: WorkQueue | None,
     cfg,
@@ -1628,33 +1878,53 @@ def create_keeps_mma_ab_mma_task(
     task_class=MlaDecodeTask,
     **kw,
 ) -> Task:
-    """Create the keeps-MMA-AB single-pipe MMA task.
+    """Schedule one QK/PV stream with SMEM P (swap) or TMEM P (keep).
 
-    HEAD computes QK for K[0]. LOOP computes QK for K[n] before PV for
-    K[n-1], and TAIL drains PV for K[last].
+    HEAD computes the first QK; TAIL drains the last PV. Retaining one BF16
+    BK128 tile requires PV-before-next-QK; two retained tiles permit overlap.
     """
 
     work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
+    swap = cfg.one_insts_kv_swap
+    pv_mma = staged_pv_mma if swap else staged_pv_mma_tmem_p
+    pv_kwargs = {"whole_kv": cfg.whole_kv_tile}
+    if not swap:
+        pv_kwargs["ws_pair"] = cfg.ws_pv
+    pv_loop = "pv_mma_loop_0" if swap else "pv_mma_loop_tmem_p"
+    pv_tail = "pv_mma_tail_0" if swap else "pv_mma_tail_tmem_p"
+    v_desc = "v_desc_reused_0" if swap else "v_desc_reused"
+    if not cfg.sparse_reuse_kv:
+        v_desc = "v_desc_0"
+    pv_before_qk = (
+        cfg.sparse_reuse_kv
+        and not cfg.whole_kv_tile
+        and cfg.kv_stages < 2 * cfg.qk_head_dim_stages
+    )
 
     @schedule
     def mma_schedule(
         smem_q,
         smem_kv,
         tmem_s,
-        tmem_p,
+        p_resource,
         tmem_o,
         work_queue=None,
     ):
-        """Captured keeps-MMA-AB schedule with TMEM P."""
+        """Capture identical pipeline ownership for the two P layouts."""
         smem_q.init_descriptor_state()
         smem_kv.init_descriptor_state()
+        tmem_s.init_descriptor_state()
         tmem_o.init_mma_state()
-        tmem_p.init_stage_state()
+        if swap:
+            p_resource.init_descriptor_state()
+        else:
+            p_resource.init_stage_state()
 
         with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
             if work_queue is not None:
                 tmem_s.reset_softmax_work_tile_state()
-                tmem_p.init_stage_work_tile_state()
+                if not swap:
+                    p_resource.init_stage_work_tile_state()
             smem_q.wait()
             q_desc, q_desc_rope = smem_q.q_desc()
             tmem_s.set_q_desc(q_desc=q_desc, q_desc_rope=q_desc_rope)
@@ -1662,39 +1932,62 @@ def create_keeps_mma_ab_mma_task(
                 smem_kv,
                 tmem_s,
                 head_dim_stages=cfg.qk_head_dim_stages,
+                whole_kv=cfg.whole_kv_tile,
                 consumer_label="k_desc_0",
+                release_k=not cfg.sparse_reuse_kv,
             )
             with domain_loop(0, domain, 1):
+                if pv_before_qk:
+                    pv_mma(
+                        smem_kv,
+                        p_resource,
+                        tmem_o,
+                        head_dim_stages=cfg.v_head_dim_stages,
+                        consumer_label=v_desc,
+                        reuse_k=True,
+                        retained_k_stages=cfg.qk_head_dim_stages,
+                        producer_label=pv_loop,
+                        **pv_kwargs,
+                    )
                 staged_qk_mma(
                     smem_kv,
                     tmem_s,
                     head_dim_stages=cfg.qk_head_dim_stages,
+                    whole_kv=cfg.whole_kv_tile,
                     consumer_label="k_desc_0",
+                    release_k=not cfg.sparse_reuse_kv,
                 )
-                staged_pv_mma_tmem_p(
-                    smem_kv,
-                    tmem_p,
-                    tmem_o,
-                    head_dim_stages=cfg.v_head_dim_stages,
-                    consumer_label="v_desc_0",
-                    producer_label="pv_mma_loop_tmem_p",
-                )
-            staged_pv_mma_tmem_p(
+                if not pv_before_qk:
+                    pv_mma(
+                        smem_kv,
+                        p_resource,
+                        tmem_o,
+                        head_dim_stages=cfg.v_head_dim_stages,
+                        consumer_label=v_desc,
+                        reuse_k=cfg.sparse_reuse_kv,
+                        retained_k_stages=cfg.qk_head_dim_stages,
+                        producer_label=pv_loop,
+                        **pv_kwargs,
+                    )
+            pv_mma(
                 smem_kv,
-                tmem_p,
+                p_resource,
                 tmem_o,
                 head_dim_stages=cfg.v_head_dim_stages,
-                consumer_label="v_desc_0",
-                producer_label="pv_mma_tail_tmem_p",
+                consumer_label=v_desc,
+                reuse_k=cfg.sparse_reuse_kv,
+                retained_k_stages=cfg.qk_head_dim_stages,
+                producer_label=pv_tail,
+                **pv_kwargs,
             )
             smem_q.release()
 
     schedule_result = (
-        mma_schedule(smem_q, smem_kv, tmem_s, tmem_p, tmem_o)
+        mma_schedule(smem_q, smem_kv, tmem_s, p_resource, tmem_o)
         if work_queue is None
-        else mma_schedule(smem_q, smem_kv, tmem_s, tmem_p, tmem_o, work_queue)
+        else mma_schedule(smem_q, smem_kv, tmem_s, p_resource, tmem_o, work_queue)
     )
-    src = [smem_q, smem_kv, tmem_p]
+    src = [smem_q, smem_kv, p_resource]
     if work_queue is not None:
         src.append(work_queue)
     return task_class(

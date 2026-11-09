@@ -26,10 +26,10 @@ import pytest
 import torch
 from test_common.llm_data import with_mocked_hf_download_for_single_gpu
 from utils.llm_data import llm_models_root
-from utils.util import (skip_blackwell, skip_num_gpus_less_than,
-                        skip_pre_blackwell)
+from utils.util import skip_num_gpus_less_than, skip_pre_blackwell
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.sparse.dsa import (
     DSACacheManagerV2, DSAtrtllmAttentionMetadata)
 from tensorrt_llm._torch.attention.backends.trtllm import \
@@ -474,6 +474,71 @@ def test_mtp_eagle_dynamic_tree_context_input_uses_prompt_lookahead() -> None:
     )
 
 
+@skip_num_gpus_less_than(1)
+def test_eagle3_prepare_skipped_uploads_keep_slot_ids_current() -> None:
+    slots = {5: 2, 6: 0, 7: 3}
+    md = object.__new__(Eagle3OneModelSpecMetadata)
+    md.use_rejection_sampling = False
+    md.use_dynamic_tree = False
+    md.num_tokens = 0
+    md.num_generations = 0
+    md.batch_indices_cuda = torch.full((8, ),
+                                       -1,
+                                       dtype=torch.int,
+                                       device="cuda")
+    md.slot_ids = torch.full((8, ), -1, dtype=torch.long, device="cuda")
+    md._batch_indices_upload = DeviceCopyBuffer(md.batch_indices_cuda)
+    md._slot_ids_upload = DeviceCopyBuffer(md.slot_ids)
+    md.spec_resource_manager = SimpleNamespace(slot_manager=SimpleNamespace(
+        get_slot=lambda rid: slots[rid]))
+    md.spec_dec_mode = SimpleNamespace(is_mtp_eagle_one_model=lambda: True)
+
+    # Repeated and prefix batches may skip the upload; a reassigned slot may not.
+    for request_ids, reassign in [([5, 6], None), ([5, 6], None), ([5], None),
+                                  ([5, 6, 7], None), ([5, 6, 7], (6, 4))]:
+        if reassign is not None:
+            slots[reassign[0]] = reassign[1]
+        md.request_ids = request_ids
+        md.prepare()
+        torch.cuda.synchronize()
+        n = len(request_ids)
+        assert md.batch_indices_cuda[:n].tolist() == list(range(n))
+        assert md.slot_ids[:n].tolist() == [slots[r] for r in request_ids]
+
+
+def test_external_shared_target_kv_step_prepares_next_new_tokens() -> None:
+    accepted = torch.tensor([[11, 12, 13]], dtype=torch.int32)
+    num_accepted = torch.tensor([2], dtype=torch.int32)
+    drafts = torch.tensor([[21, 22]], dtype=torch.int32)
+    worker = SimpleNamespace(
+        _execute_guided_decoder_if_present=lambda logits: None,
+        sample_and_accept_draft_tokens=lambda *args: (accepted, num_accepted),
+        _is_mamba_hybrid_cache=False,
+        sa_enhancer=None,
+        _uses_external_shared_target_kv=True,
+        _forward_external_shared_target_kv_draft_loop=lambda **kwargs: drafts,
+        _prepare_next_new_tokens=lambda *args: "next new tokens",
+        _auxiliary_state_handlers=[],
+    )
+    spec_metadata = SimpleNamespace(runtime_draft_len=2,
+                                    spec_resource_manager=None,
+                                    batch_indices_cuda=torch.tensor([0]),
+                                    sharded_target_logits=False)
+    attn_metadata = SimpleNamespace(num_seqs=1, num_contexts=0)
+
+    out = MTPEagleWorker._forward_impl(worker,
+                                       torch.tensor([1, 2, 3]),
+                                       torch.arange(3),
+                                       torch.zeros(3, 8),
+                                       torch.zeros(3, 16),
+                                       attn_metadata,
+                                       spec_metadata,
+                                       draft_model=None)
+
+    assert out["next_draft_tokens"] is drafts
+    assert out["next_new_tokens"] == "next new tokens"
+
+
 @pytest.fixture(scope="function")
 def enforce_single_worker(monkeypatch):
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
@@ -618,38 +683,20 @@ def test_block_offsets_staging_width_spec_gate(spec_signal):
 
 
 @pytest.mark.parametrize(
-    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,multi_batch,attention_dp,use_hf_speculative_model",
+    "use_cuda_graph,disable_overlap_scheduler,enable_block_reuse,enable_chunked_prefill,use_hf_speculative_model",
     [
-        [True, "TRTLLM", True, False, False, False, False, False, False],
-        [False, "TRTLLM", True, False, False, False, False, False, False],
-        [True, "FLASHINFER", True, False, False, False, False, False, False],
-        [False, "FLASHINFER", True, False, False, False, False, False, False],
-        [False, "TRTLLM", False, True, True, False, False, False, False],
-        [True, "TRTLLM", False, True, True, False, False, False, False],
-        [True, "TRTLLM", True, False, True, True, False, False, False],
-        [True, "TRTLLM", True, False, True, False, False, False, False],
-        [True, "TRTLLM", True, False, False, True, False, False, False],
-        [True, "TRTLLM", False, False, False, False, False, False, False],
-        [False, "TRTLLM", False, False, False, False, False, False, False],
-        [True, "TRTLLM", False, False, False, False, True, False, False],
-        [True, "TRTLLM", False, False, False, False, True, True, False],
-        [False, "TRTLLM", False, False, False, False, True, False, False],
-        [True, "TRTLLM", False, False, False, True, False, False, False],
-        [True, "FLASHINFER", False, False, False, False, False, False, False],
-        [False, "FLASHINFER", False, False, False, False, False, False, False],
+        [False, False, True, False, False],
+        [True, False, True, False, False],
+        [True, True, False, True, False],
+        [True, True, False, False, False],
         # Tests (mocked) speculative model auto-download from HuggingFace
-        [False, "TRTLLM", True, False, False, False, False, False, True],
+        [False, True, False, False, True],
     ])
 @pytest.mark.high_cuda_memory
 @with_mocked_hf_download_for_single_gpu
-def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
-                      disable_overlap_scheduler: bool, enable_block_reuse: bool,
-                      use_one_model: bool, enable_chunked_prefill: bool,
-                      multi_batch: bool, attention_dp: bool,
+def test_llama_eagle3(use_cuda_graph: bool, disable_overlap_scheduler: bool,
+                      enable_block_reuse: bool, enable_chunked_prefill: bool,
                       use_hf_speculative_model: bool):
-    if not use_one_model:
-        pytest.skip("Two model Eagle3 is deprecated")
-
     # Eagle3 one model works with overlap scheduler and block reuse.
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
@@ -665,7 +712,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
 
     # bs > 1 gives non-deterministic when doing IFB. There are slight chances
     # that ref and spec does not match 100%
-    max_batch_size = 4 if multi_batch else 1
+    max_batch_size = 1
     max_draft_len = 4
     kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
                                     max_tokens=8192)
@@ -675,12 +722,10 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
 
     llm_common_config = dict(
         model=target_model_dir,
-        attn_backend=attn_backend,
         disable_overlap_scheduler=disable_overlap_scheduler,
         cuda_graph_config=cuda_graph_config,
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
-        enable_attention_dp=attention_dp,
         # This max_seq_len is larger than the one specified
         # in the llama 3 8B eagle's config. We want to make sure
         # that the draft model won't go above its max in warmup
@@ -695,7 +740,6 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
     spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
-        # Llama 3 does not support one model eagle.
     )
 
     # Create the LLM instance
@@ -714,11 +758,6 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
             "The president of the United States is",
         ]
         tok_ids = [llm_spec.tokenizer.encode("The future of AI is")]
-        if multi_batch:
-            # encode each prompt individually (encode(list) returns nested
-            # lists in transformers 5.x which prompt_inputs can't handle)
-            for p in prompts:
-                tok_ids.append(llm_spec.tokenizer.encode(p))
 
     sampling_params = SamplingParams(max_tokens=128, temperature=0)
 
@@ -755,8 +794,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         assert text_spec == text_ref
 
 
-@pytest.mark.parametrize("eagle3_one_model", [True])
-def test_eagle3_spec_decoding_stats(eagle3_one_model):
+def test_eagle3_spec_decoding_stats():
     """Test that specDecodingStats are correctly populated in metrics endpoint"""
     models_path = llm_models_root()
     eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
@@ -769,7 +807,7 @@ def test_eagle3_spec_decoding_stats(eagle3_one_model):
 
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                     free_gpu_memory_fraction=0.6,
-                                    use_kv_cache_manager_v2=eagle3_one_model)
+                                    use_kv_cache_manager_v2=True)
     spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle_model_dir,
@@ -993,8 +1031,7 @@ def test_deepseek_mla_eagle3():
             pass
 
 
-@pytest.mark.parametrize("use_one_model", [True])
-def test_multi_eagle3(use_one_model: bool):
+def test_multi_eagle3():
     use_cuda_graph = True
     attn_backend = "TRTLLM"
     disable_overlap_scheduler = False
@@ -1061,7 +1098,7 @@ def test_multi_eagle3(use_one_model: bool):
         max_draft_len = 3
         kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
                                         free_gpu_memory_fraction=0.5,
-                                        use_kv_cache_manager_v2=use_one_model)
+                                        use_kv_cache_manager_v2=True)
         cuda_graph_config = CudaGraphConfig(
             batch_sizes=[1]) if use_cuda_graph else None
 
@@ -1095,7 +1132,6 @@ def test_multi_eagle3(use_one_model: bool):
                          ids=["no_dynamic_tree", "dynamic_tree"])
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 @pytest.mark.high_cuda_memory
-@skip_blackwell
 # Opt out of MPI session reuse: the XQA JIT cubin registry is process-global
 # (DecoderXQARunner::getResourceGlobal) and its lookup key does not include
 # q_seq_len / is_spec_dec_tree, so running the dynamic-tree and non-dynamic-tree
@@ -1302,10 +1338,21 @@ def test_eagle3_lora(use_cuda_graph: bool):
 
 @pytest.mark.parametrize("disable_overlap_scheduler", [False])
 @pytest.mark.parametrize("use_cuda_graph", [True])
+# dl3_k4_dt12_bs1 covers one request against a mask buffer sized for one request on the Blackwell SwapsMmaAb kernel.
+@pytest.mark.parametrize(
+    "max_draft_len,dynamic_tree_max_topK,max_total_draft_tokens,max_batch_size,kv_cache_max_tokens",
+    [
+        pytest.param(6, 10, 30, 4, 2048, id="dl6_k10_dt30"),
+        pytest.param(
+            3, 4, 12, 1, 4096, id="dl3_k4_dt12_bs1", marks=skip_pre_blackwell),
+    ])
 @pytest.mark.high_cuda_memory
 @with_mocked_hf_download_for_single_gpu
-def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
-                                   disable_overlap_scheduler: bool):
+def test_llama_eagle3_dynamic_tree(
+        use_cuda_graph: bool, disable_overlap_scheduler: bool,
+        max_draft_len: int, dynamic_tree_max_topK: int,
+        max_total_draft_tokens: int, max_batch_size: int,
+        kv_cache_max_tokens: int):
     """Test EAGLE3 dynamic tree speculative decoding with one-model architecture."""
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
@@ -1315,12 +1362,8 @@ def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
     target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
     eagle_model = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
 
-    max_batch_size = 4
-    max_draft_len = 6
-    dynamic_tree_max_topK = 10
-    max_total_draft_tokens = 30
     kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                    max_tokens=2048,
+                                    max_tokens=kv_cache_max_tokens,
                                     free_gpu_memory_fraction=0.5)
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=[i for i in range(1, max_batch_size +

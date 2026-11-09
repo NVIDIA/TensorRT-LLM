@@ -31,6 +31,23 @@ _FULL_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@"
 _COMMENT_BODY_RE = re.compile(r"^\s*#")
 
 
+def block_filters_for_stem(
+    yaml_index: YAMLIndex, yaml_stem: str
+) -> dict[tuple[str, int], dict[str, set[str]]]:
+    """Keep every entry in a test-db stem, preserving its options and annotations."""
+    filters: dict[tuple[str, int], dict[str, set[str]]] = {}
+    for block in yaml_index.blocks:
+        if block.yaml_stem != yaml_stem:
+            continue
+        entries: dict[str, set[str]] = {}
+        for entry in block.tests:
+            target = _entry_target(entry)
+            if target:
+                entries.setdefault(target, set()).add(entry)
+        filters[(block.yaml_stem, block.block_index)] = entries
+    return filters
+
+
 def strip_noop_diff_lines(diff: str) -> str:
     """Normalize a unified diff so blank- and comment-only edits don't count.
 
@@ -82,8 +99,8 @@ def stages_by_yaml_stem(stages: dict[str, Stage]) -> dict[str, list[tuple[str, S
 
 
 def is_perf_stem(stem: str) -> bool:
-    """Return whether a test-db stem belongs to perf or perf-sanity."""
-    return stem == "l0_perf" or "perf_sanity" in stem
+    """Return whether a test-db stem belongs to perf-sanity."""
+    return "perf_sanity" in stem
 
 
 def iter_diff_changes(diff: str) -> Iterator[tuple[str, str]]:

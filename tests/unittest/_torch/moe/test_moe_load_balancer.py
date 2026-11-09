@@ -480,8 +480,8 @@ def test_nemotron_vl_decoder_inherits_eplb_and_registers_moe(
                                                    SimpleActivation)
     from tensorrt_llm._torch.moe.fused_moe.configurable_moe import \
         ConfigurableMoE
-    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import \
-        CutlassFusedMoE
+    from tensorrt_llm._torch.moe.fused_moe.cutlass import \
+        TrtllmCutlassW4a16Nvfp4Impl
     from tensorrt_llm._torch.utils import ActivationType
 
     text_config = PretrainedConfig(architectures=["NemotronHForCausalLM"],
@@ -524,7 +524,7 @@ def test_nemotron_vl_decoder_inherits_eplb_and_registers_moe(
             intermediate_size=128,
             dtype=torch.bfloat16,
             model_config=decoder_config,
-            moe_cls=CutlassFusedMoE,
+            moe_cls=TrtllmCutlassW4a16Nvfp4Impl,
             activation=SimpleActivation(ActivationType.Relu2),
             layer_idx=0,
         )

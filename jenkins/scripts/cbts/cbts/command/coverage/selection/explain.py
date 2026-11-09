@@ -38,7 +38,6 @@ import click
 
 from cbts.coverage.selection.python_change_analysis import (
     analyze_python_changes,
-    closure_attributed_qualnames,
     import_executed_qualnames,
     qualnames_for_lines,
 )
@@ -114,13 +113,15 @@ def _run(args: _Args) -> int:
         for ln in _git(repo, "show", "--name-only", "--pretty=format:", args.sha).splitlines()
         if ln.strip()
     ]
-    core = [f for f in files if f.endswith(".py") and canon(f).startswith("tensorrt_llm/")]
-    non_core = [f for f in files if f not in core]
+    python_files = [f for f in files if f.endswith(".py")]
+    non_python = [f for f in files if f not in python_files]
 
     # Delegate the decision itself so the gates cannot drift from the selector.
-    diffs = {f: _git(repo, "diff", f"{args.sha}^", args.sha, "--", f, check=False) for f in core}
+    diffs = {
+        f: _git(repo, "diff", f"{args.sha}^", args.sha, "--", f, check=False) for f in python_files
+    }
     selector = CoverageSelector(db, repo, read_source=lambda f: _src_at(repo, args.sha, f))
-    res = selector.decide(core, diffs)
+    res = selector.decide(python_files, diffs)
     if not res.ok:
         print(f"commit {args.sha[:12]} — coverage selection REFUSES this change:")
         print(f"  {res.reason}")
@@ -132,7 +133,7 @@ def _run(args: _Args) -> int:
     impact_files: set[str] = set()
     changed_files: set[str] = set()
     caller_bounded = set(res.caller_bounded_funcs)
-    for f in core:
+    for f in python_files:
         cf = canon(f)
         changed_files.add(cf)
         lines = iter_diff_post_line_numbers(diffs.get(f, ""))
@@ -148,7 +149,6 @@ def _run(args: _Args) -> int:
             pre_source=reconstruct_diff_pre_image(src, diffs.get(f, "")),
         )
         import_executed = import_executed_qualnames(src)
-        closures = closure_attributed_qualnames(src, lines)
 
         def record_impact(q: str) -> None:
             if db.tests_touching_func(cf, q):
@@ -165,13 +165,11 @@ def _run(args: _Args) -> int:
             if q in import_executed:
                 for consumer in dependencies.binding_consumers:
                     record_impact(consumer)
-            elif q in closures:
-                impact_files.add(cf)
             else:
                 record_impact(q)
     no_data = res.no_data_funcs
 
-    print(f"commit {args.sha[:12]} — {len(core)} core file(s), impact set:")
+    print(f"commit {args.sha[:12]} — {len(python_files)} Python file(s), impact set:")
     for cf, q in sorted(impact_funcs):
         print(f"  {cf} :: {q}")
     for cf in sorted(impact_files):
@@ -185,12 +183,12 @@ def _run(args: _Args) -> int:
         for s in sorted(no_data):
             bound = "caller-bound" if s in caller_bounded else "file-level"
             print(f"    no-data ({bound}): {s}")
-    if non_core:
+    if non_python:
         print(
-            f"\n  NOTE: {len(non_core)} non-core file(s) in this commit are not evaluated here. "
+            f"\n  NOTE: {len(non_python)} non-Python file(s) in this commit are not evaluated here. "
             "Tier-1 rules claim them; any left as residual makes the coverage tier refuse."
         )
-        for f in sorted(non_core):
+        for f in sorted(non_python):
             print(f"    {f}")
 
     untrusted_fam = selector.untrusted_families()

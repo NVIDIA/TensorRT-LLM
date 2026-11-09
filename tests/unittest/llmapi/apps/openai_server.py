@@ -1,6 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/baaedfdb2d3f1d70b7dbcde08b083abfe6017a92/tests/utils.py
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -13,6 +17,45 @@ import yaml
 
 from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
+
+
+def run_command_with_output(
+        command: list[str],
+        *,
+        timeout: float,
+        env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    """Run a test client and print its captured output, including on failure."""
+    print(f"Running command: {shlex.join(command)}", flush=True)
+    try:
+        result = subprocess.run(command,
+                                capture_output=True,
+                                text=True,
+                                check=True,
+                                timeout=timeout,
+                                env=env)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        print(f"Command failed: {exc}", flush=True)
+        for name, output in (("stdout", exc.stdout), ("stderr", exc.stderr)):
+            if isinstance(output, bytes):
+                output = output.decode(errors="replace")
+            print(f"Command {name}:\n{output or ''}", flush=True)
+        raise
+    print(f"Command stdout:\n{result.stdout}", flush=True)
+    print(f"Command stderr:\n{result.stderr}", flush=True)
+    return result
+
+
+def _picks_num_frontends(cli_args: List[str],
+                         extra_config: Optional[dict]) -> bool:
+    """Whether a test sets num_serve_frontends (a --set override wins anyway)."""
+    configs = [extra_config or {}]
+    for arg, value in zip(cli_args, cli_args[1:] + [""]):
+        if arg.split("=")[0] == "--num_serve_frontends":
+            return True
+        if arg in ("--config", "--extra_llm_api_options") and value:
+            with open(value) as f:
+                configs.append(yaml.safe_load(f) or {})
+    return any("num_serve_frontends" in config for config in configs)
 
 
 class RemoteOpenAIServer:
@@ -51,12 +94,20 @@ class RemoteOpenAIServer:
                 f.write(yaml.dump(extra_config))
                 self.extra_config_file = f.name
             args += ["--extra_llm_api_options", self.extra_config_file]
+        # trtllm-serve defaults to several frontend processes; test servers
+        # run one unless the test picks a count.
+        if not _picks_num_frontends(cli_args or [], extra_config):
+            args += ["--num_serve_frontends", "1"]
         launch_cmd = ["trtllm-serve"] + [model] + args
         if llmapi_launch:
             # start server with llmapi-launch on multi nodes
             launch_cmd = ["trtllm-llmapi-launch"] + launch_cmd
         if not env:
             env = os.environ.copy()
+        print(
+            f"Starting server: {shlex.join(launch_cmd)}; "
+            f"log output: {self.log_path or 'stdout'}",
+            flush=True)
         self.proc = subprocess.Popen(launch_cmd,
                                      env=env,
                                      stdout=self._get_output(),
@@ -117,14 +168,18 @@ class RemoteOpenAIServer:
             except Exception as err:
                 result = self.proc.poll()
                 if result is not None and result != 0:
-                    raise RuntimeError("Server exited unexpectedly.") from err
+                    raise RuntimeError(
+                        f"Server exited unexpectedly with code {result} while "
+                        f"waiting for {url} after {time.time() - start:.1f}s. "
+                        f"Log output: {self.log_path or 'stdout'}.") from err
 
                 time.sleep(0.5)
                 if time.time() - start > timeout:
                     # Terminate the server to avoid the process keeping running in background after timeout
                     self.terminate()
                     raise RuntimeError(
-                        "Server failed to start in time.") from err
+                        f"Server failed to start within {timeout}s at {url}. "
+                        f"Log output: {self.log_path or 'stdout'}.") from err
 
     @property
     def url_root(self) -> str:

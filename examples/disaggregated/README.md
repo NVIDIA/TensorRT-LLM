@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # Disaggregated Serving
 
 The execution method of disaggregated serving relies on the `trtllm-serve` command. Specifically, compared to the standard usage of `trtllm-serve`, serving requires running this command multiple times to separately start the router and workers (including context and generation) serving components. This document focuses on this approach and provides a detailed guide on how to use it.
@@ -27,22 +30,35 @@ cache_transceiver_config:
   backend: NIXL
 ```
 
+These examples omit `max_tokens_in_buffer` and leave the runtime at `auto`.
+On the standard PyTorch model-loading path, `backend: DEFAULT` with runtime
+`auto` normally selects NIXL/Python when no legacy backend selector or
+incompatible configuration intervenes. Keep `DEFAULT`/`auto` when the test
+or recipe should follow the supported defaults rather than exercise a
+particular implementation.
+
 Keep `cache_transceiver_config` identical in the two files. For the remaining fields, see
 [Disaggregated Serving](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disagg-serving.md).
 
 ## NIXL Backend Configuration
 
-NIXL supports multiple underlying communication backends for KV cache exchange. The backend can be configured using the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable.
+With `cache_transceiver_config.backend: NIXL`, the `TRTLLM_NIXL_KVCACHE_BACKEND` environment variable selects the underlying NIXL backend for KV cache exchange. The NIXL UCX backend is distinct from TRT-LLM's direct UCX backend, selected with `cache_transceiver_config.backend: UCX`.
 
 **Supported NIXL backends:**
 - **UCX** (default)
 - **LIBFABRIC** (available from v0.16.0)
 
-If an unsupported backend is specified, NIXL will automatically fall back to UCX.
+If an unsupported NIXL backend is specified, TRT-LLM selects the NIXL UCX backend.
 
 ### LIBFABRIC Backend Setup
 
-**Important Note:** The TensorRT LLM container does not include libfabric or the NIXL-LIBFABRIC plugin by default. You must either rebuild NIXL with libfabric support or provide a pre-compiled plugin.
+**Container builds:** `docker/common/install_nixl.sh` builds NIXL 1.5.2 and its LIBFABRIC plugin against a temporary libfabric 1.21.0 installation, matching the NIXL upstream wheel's ABI baseline. That installation is removed after the build. Ubuntu builds through `docker/Dockerfile.multi`, including NGC PyTorch images, install the official EFA Installer 1.51.0 userspace libraries under `/opt/amazon/efa/lib` while preserving the existing MPI and rdma-core.
+
+EFA Installer 1.51.0 supports `--build-ngc` only on Ubuntu. On other distributions it falls back to standard installation, which may change system RDMA dependencies. These container builds therefore skip EFA installation on non-Ubuntu images. Rocky Linux 8 builds retain the GDRCopy and hwloc build dependencies for wheel compilation; they do not provision an EFA runtime. Non-Ubuntu runtime environments must provide a compatible libfabric and the appropriate provider separately.
+
+Set `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` to select the NIXL LIBFABRIC backend; the NIXL UCX backend remains the default.
+
+**KV cache V2 over EFA:** Use NIXL 1.5.2 and EFA Installer 1.51.0 or later. These releases include the CUDA VMM context and synchronization fixes, plus EFA completion fixes. The libfabric 1.21.0 build baseline is an ABI compatibility choice, not a guarantee that older runtime libraries support CUDA VMM. `NIXL_DISABLE_CUDA_ADDR_WA=1` is not required for the context-independent allocation fix in NIXL 1.5.2. See the [NIXL release notes](https://github.com/ai-dynamo/nixl/releases/tag/v1.5.2) and [libfabric CUDA VMM fix](https://github.com/ofiwg/libfabric/pull/12918).
 
 #### Prerequisites
 
@@ -51,42 +67,48 @@ If an unsupported backend is specified, NIXL will automatically fall back to UCX
 **Required Dependencies:**
 
 **Libfabric**
-- Custom libfabric installation is available via [https://ofiwg.github.io/libfabric/](https://ofiwg.github.io/libfabric/)
-- **Minimum required version:** v1.21.0
-- For EFA-enabled AWS instances, install through the [AWS EFA installer](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-start.html) (recommend using the latest version)
+- On AWS, use the EFA installation at `/opt/amazon/efa`, updated by Ubuntu container builds as described above.
+- For a custom libfabric installation, see [https://ofiwg.github.io/libfabric/](https://ofiwg.github.io/libfabric/)
+- **Minimum ABI baseline:** v1.21.0; the required runtime version also depends on the provider and memory type.
+- For EFA-enabled AWS instances using a non-bundled version, install through the [AWS EFA installer](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-start.html) (recommend using the latest version)
 
 **hwloc**
-- hwloc is used to understand the underlying architecture to optimize application performance
-- **Suggested version:** 2.10.0 or newer
+- The source build requires the `pkg-config` command to discover hwloc. Ubuntu container base setup installs the `pkg-config` package; standalone builds must provide it as well.
+- NIXL's LIBFABRIC build requires development files for hwloc 2.3 or later.
+- NGC PyTorch 26.09 builds reuse HPC-X hwloc 2.7.1 under `/usr/local/mpi`, with `/usr/local/mpi/lib/pkgconfig` prepended to `PKG_CONFIG_PATH`. Non-NGC SBSA Ubuntu 24.04 builds reuse system hwloc 2.10.0. Neither configuration rebuilds hwloc when these development files are present.
+- If `pkg-config` cannot find a suitable version, the installer builds and retains hwloc 2.12.2 under `/opt/nvidia/nixl-deps/hwloc`, exposing it to the NIXL build through `PKG_CONFIG_PATH`. This applies to Rocky 8's older hwloc 2.2.0. The fallback does not change the system hwloc installation or global runtime library search configuration. Running the NIXL LIBFABRIC backend requires a compatible hwloc runtime supplied separately.
+- Custom installations must provide compatible development and runtime libraries and expose `hwloc.pc` through `PKG_CONFIG_PATH`.
+
+**GDRCopy (for the source-build installer)**
+- The temporary libfabric build enables GDRCopy and requires its userspace library and headers. `docker/Dockerfile.multi` runs `docker/common/install_gdrcopy.sh` to install version 2.5.1 when absent, preserving complete existing installations. Standalone users of `install_nixl.sh` must also provide these dependencies; the GDRCopy helper installs no kernel module.
+
+**NUMA**
+- Provide NUMA development files: `libnuma-dev` on Ubuntu or `numactl-devel` on Rocky Linux. The container base setup installs these packages.
 
 **Network Hardware Requirements:**
-- Validated compatibility with AWS EFA (Elastic Fabric Adapter)
+- AWS EFA (Elastic Fabric Adapter), with compatible KV cache settings and dependency versions as described above
 
-##### For UCX Backend
+##### For the NIXL UCX Backend
 
 UCX is typically pre-installed in NVIDIA GPU containers. No additional installation is usually required.
 
-#### Installation Options
+#### Installation Options (missing plugin or custom libfabric)
 
-##### Option 1: Rebuild NIXL with LIBFABRIC Support (Recommended)
+Skip these steps if your container already includes the NIXL LIBFABRIC plugin for the libfabric installation you intend to use.
+
+##### Option 1: Rebuild NIXL with a Custom LIBFABRIC Installation
 
 1. **Install libfabric dependencies:**
    - Follow the installation instructions from the links above based on your system
 
-2. **Install hwloc:**
-   - Use your package manager or build from source
+2. **Provide source-build dependencies:**
+   - Provide the hwloc, GDRCopy and NUMA development files described above. Reuse suitable hwloc from your MPI installation when available, and ensure its `hwloc.pc` is discoverable through `PKG_CONFIG_PATH`.
 
 3. **Reinstall NIXL after installing libfabric:**
-   - After installing libfabric and hwloc, you must rebuild NIXL to generate the LIBFABRIC plugin
-   - You can base your installation on the TensorRT LLM NIXL installation script located at `docker/common/install_nixl.sh`
-   - Modify the meson setup command in the script to include the libfabric path:
-     ```bash
-     meson setup builddir \
-         ...
-         -Dlibfabric_path=/path/to/libfabric \  # Add this line
-         --buildtype=release
-     ```
-   - For more details, see the [NIXL LIBFABRIC Plugin documentation](https://github.com/ai-dynamo/nixl/tree/6ee64753605b3110f8ef96c7cfc2f1315675c9c7/src/plugins/libfabric#nixl-libfabric-plugin)
+   - To compile the plugin against your custom installation, adapt a local copy of `docker/common/install_nixl.sh`. The unmodified script always builds a temporary libfabric 1.21.0 installation for the plugin.
+   - Inside `build_and_install_nixl()`, set `LIBFABRIC_BUILD_PATH=/path/to/libfabric` immediately before `meson setup`, which passes `-Dlibfabric_path="${LIBFABRIC_BUILD_PATH}"`. Keep the other Meson options unchanged. Setting the variable only in the environment before launching the script does not override its initialization.
+   - Keep the custom installation outside `WORK_DIR`, which is deleted on exit. `LIBFABRIC_BUILD_PATH` selects the build dependency only; configure runtime library lookup separately, for example by adding the custom prefix's `lib` or `lib64` directory to `LD_LIBRARY_PATH`, and provide its required fabric provider.
+   - For more details, see the [NIXL v1.5.2 LIBFABRIC Plugin documentation](https://github.com/ai-dynamo/nixl/blob/v1.5.2/src/plugins/libfabric/README.md#nixl-libfabric-plugin).
 
 ##### Option 2: Use Pre-compiled LIBFABRIC Plugin
 
@@ -95,10 +117,11 @@ If you have a pre-compiled `libplugin_LIBFABRIC.so` that matches your NIXL versi
 1. Place the plugin file in a directory of your choice
 2. Set the environment variable to point to the plugin directory:
    ```bash
-   export NIXL_PLUGINS_DIR=/path/to/plugin/directory
+   export NIXL_PLUGIN_DIR=/path/to/plugin/directory
    export TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC
    ```
 3. Ensure the plugin was built with the same NIXL version as in your container
+4. Ensure the runtime loader can find a compatible libfabric and its provider libraries. `NIXL_PLUGIN_DIR` selects the plugin directory; it does not configure dependency-library lookup.
 
 ### NIXL Configuration Examples
 
@@ -110,7 +133,6 @@ To use NIXL for KV cache exchange, configure the `cache_transceiver_config` with
 disable_overlap_scheduler: True
 cache_transceiver_config:
   backend: NIXL
-  max_tokens_in_buffer: 2048
 ```
 
 **Generation server configuration:**
@@ -118,7 +140,6 @@ cache_transceiver_config:
 # gen_config_nixl.yml
 cache_transceiver_config:
   backend: NIXL
-  max_tokens_in_buffer: 2048
 ```
 
 #### Example 1: Using NIXL with UCX backend (default)
@@ -149,7 +170,7 @@ CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
 export TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC
 
 # If using pre-compiled plugin:
-# export NIXL_PLUGINS_DIR=/path/to/plugin/directory
+# export NIXL_PLUGIN_DIR=/path/to/plugin/directory
 
 # For AWS EFA (optional):
 # export FI_PROVIDER=efa
@@ -186,7 +207,7 @@ CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
 - Standard UCX environment variables apply
 
 **For LIBFABRIC backend:**
-- `NIXL_PLUGINS_DIR`: Directory containing the NIXL LIBFABRIC plugin (`libplugin_LIBFABRIC.so`) if using pre-compiled plugin
+- `NIXL_PLUGIN_DIR`: Directory containing the NIXL LIBFABRIC plugin (`libplugin_LIBFABRIC.so`) if using pre-compiled plugin
 - `FI_PROVIDER`: Specifies the libfabric provider to use (e.g., `efa` for AWS EFA)
 - `FI_EFA_USE_DEVICE_RDMA`: Set to `1` to enable GPU Direct RDMA on AWS EFA (if supported)
 - `FI_LOG_LEVEL`: Controls libfabric logging verbosity (e.g., `warn`, `info`, `debug`)
@@ -341,7 +362,7 @@ Therefore, the command can be written as follows:
 
 ```bash
 # The `container_image` must have the TensorRT-LLM wheel package pre-installed.
-# Once the task is successfully launched, an API service will be available externally at http://host_ip:PORT.
+# After launch, use the server node's IP address and the configured PORT to reach the API service.
 # Launch a context with `tp_size=8` using two 4-GPU nodes.
 srun -A <account> -p <partition> -t <time> \
     -N 2 --ntasks-per-node=4 \
@@ -393,29 +414,31 @@ resources:
     vpc.amazonaws.com/efa: 4    # Number of EFA network interfaces
 ```
 
-##### 2. Install EFA Libraries in Container
+##### 2. Install or Update EFA Libraries
 
-AWS EFA library must be installed in the container for LIBFABRIC to work:
-
-```bash
-# Install AWS EFA library (required for LIBFABRIC with EFA)
-curl -O https://efa-installer.amazonaws.com/aws-efa-installer-latest.tar.gz
-tar -xf aws-efa-installer-latest.tar.gz
-cd aws-efa-installer && ./efa_installer.sh --yes --skip-kmod
-```
-
-##### 3. Rebuild NIXL with EFA Support
-
-Follow the NIXL rebuild instructions from the LIBFABRIC Backend Setup section, ensuring the libfabric path points to the EFA installation:
+For Ubuntu containers, skip this step if EFA Installer 1.51.0 or later is already installed. Otherwise, download the installer. The commands below preserve MPI and rdma-core, which must already be installed:
 
 ```bash
-meson setup builddir \
-    -Ducx_path=/usr/local/ucx \
-    -Dlibfabric_path=/opt/amazon/efa \  # EFA libfabric installation path
-    -Dcudapath_lib=/usr/local/cuda/lib64 \
-    -Dcudapath_inc=/usr/local/cuda/include \
-    --buildtype=release
+curl -fLO https://efa-installer.amazonaws.com/aws-efa-installer-1.51.0.tar.gz
+tar -xf aws-efa-installer-1.51.0.tar.gz
+cd aws-efa-installer
 ```
+
+For Ubuntu containers:
+
+```bash
+./efa_installer.sh --skip-mpi --skip-rdma-core --build-ngc
+printf '%s\n' /opt/amazon/efa/lib > /etc/ld.so.conf.d/000_efa.conf
+ldconfig
+```
+
+These commands use the Ubuntu-only `--build-ngc` mode. For non-Ubuntu environments, provision a compatible libfabric and EFA provider separately; the container build does not install the EFA runtime. The EFA driver and host limits must be configured on the host.
+
+##### 3. Rebuild NIXL with EFA Support if Needed
+
+Skip this step if the container already includes NIXL 1.5.2 or later with a LIBFABRIC plugin compatible with the runtime libfabric. The build-time and runtime libfabric versions do not need to be identical.
+
+Otherwise, follow [Option 1: Rebuild NIXL with a Custom LIBFABRIC Installation](#option-1-rebuild-nixl-with-a-custom-libfabric-installation) above, including its build dependencies and runtime library lookup configuration.
 
 ##### 4. Configure and Launch Services
 
@@ -431,11 +454,9 @@ data:
     disable_overlap_scheduler: true
     cache_transceiver_config:
       backend: NIXL
-      max_tokens_in_buffer: 2048
   generation.yaml: |
     cache_transceiver_config:
       backend: NIXL
-      max_tokens_in_buffer: 2048
 ```
 
 Launch services:
@@ -577,10 +598,29 @@ trtllm-serve disaggregated -c disagg_config.yaml -m ./metadata_config.yaml
 
 The metadata_config file looks like
 ```yaml
+server_type: etcd
 hostname: "localhost"
 port: 2379
 health_check_timeout: 5.0
-refersh_interval: 10.0
+refresh_interval: 10.0
+```
+
+To use an ETCD server with TLS, add ```ca_cert``` (with optional ```cert_key``` and ```cert_cert``` for client certificates) to the metadata_config file. To use ETCD authentication, add ```user``` and ```password``` together with ```ca_cert```: the etcd client sends its authentication token only over a TLS connection, and the config is rejected if ```user``` and ```password``` are set without ```ca_cert```. The ETCD user needs read and write permission on the ```trtllm/``` key prefix only. The etcd client logs in once, when the server starts, and does not renew its token: after ETCD stops accepting the token, for example following an ETCD restart, restart the context, generation and disaggregated servers so that they log in again. Set ```record_auth_key``` to the same non-empty secret in the metadata_config file of every context, generation and disaggregated server: servers then sign the records they register, and the disaggregated server ignores records without a valid signature.
+
+Without these fields the connection to the ETCD server is anonymous and unencrypted, and the disaggregated server uses every ```trtllm/*``` record found in the store. When the ETCD server is reachable from hosts other than the context, generation and disaggregated servers, enable ETCD authentication with TLS together with ```record_auth_key```. The signature is checked only by readers, so access control of the store itself still comes from the ETCD server. A metadata_config file with all optional fields looks like
+
+```yaml
+server_type: etcd
+hostname: "etcd.internal"
+port: 2379
+health_check_timeout: 5.0
+refresh_interval: 10.0
+user: "trtllm"
+password: "<etcd user credential>"
+ca_cert: "/etc/trtllm/etcd-ca.pem"
+cert_key: "/etc/trtllm/etcd-client-key.pem"
+cert_cert: "/etc/trtllm/etcd-client.pem"
+record_auth_key: "<shared secret, identical on every server>"
 ```
 
 The ```hostname``` and ```port``` must match those used when starting the ETCD server. The ```health_check_timeout``` parameter specifies how long a server will be considered dead if no healthy response is received. By default, trtllm will perform two checks before marking a server as dead. The ```refresh_interval``` parameter determines how often the latest server list is fetched from the ETCD server.
@@ -608,7 +648,10 @@ When removing servers, special attention is required in the current version. You
 
 **Q: Why does NIXL fail to use LIBFABRIC backend even when `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` is set?**
 
-A: The TensorRT-LLM container doesn't include the NIXL LIBFABRIC plugin by default. You need to either:
+A: Check that the container includes the NIXL LIBFABRIC plugin and the dependencies for your fabric:
 
-1. **Rebuild NIXL**: Install libfabric and hwloc first, then rebuild NIXL following the installation instructions above
-2. **Use a pre-compiled plugin**: If you have a compatible `libplugin_LIBFABRIC.so`, set `NIXL_PLUGINS_DIR` to point to its directory
+1. **Missing plugin**: Older or custom images without libfabric development files at build time may not include the plugin. Follow [LIBFABRIC Backend Setup](#libfabric-backend-setup) to install it.
+2. **EFA devices unavailable**: If using EFA, confirm the instance supports it and the devices are passed through to the container.
+3. **Custom libfabric version mismatch**: Ensure the loaded runtime libfabric satisfies the plugin's ABI requirements. The container plugin is built against the 1.21.0 baseline; custom plugins built against newer libraries can require newer runtime symbols.
+4. **Using a pre-compiled plugin**: If you have a compatible `libplugin_LIBFABRIC.so`, set `NIXL_PLUGIN_DIR` to point to its directory.
+5. **KV cache V2 with CUDA VMM**: Plugin loading alone does not establish transfer compatibility. For EFA, check both the NIXL and EFA runtime versions against [LIBFABRIC Backend Setup](#libfabric-backend-setup), including the libraries actually loaded by the workers.

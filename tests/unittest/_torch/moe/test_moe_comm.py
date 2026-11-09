@@ -16,7 +16,7 @@
 Unified Communication Strategy Tests for MoE
 
 Tests all Communication subclasses (AllGatherReduceScatter, DeepEP,
-DeepEPLowLatency, NVLinkOneSided, NVLinkTwoSided, NVLinkTwoSidedFlashinfer) via the public
+DeepEPLowLatency, NVLinkOneSided, NVLinkTwoSided, NcclEP) via the public
 dispatch() and combine() interfaces defined in Communication base class.
 
 Each test runs the full pipeline: dispatch -> verify dispatch -> simple_moe
@@ -80,15 +80,13 @@ from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import (
     MnnvlMoe,
     NVLinkTwoSided,
 )
-from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided_flashinfer import (
-    NVLinkTwoSidedFlashinfer,
-)
 from tensorrt_llm._torch.moe.fused_moe.deep_ep_utils import deep_ep_installed
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import (
     is_nccl_ep_installed,
     nccl_ep_supports_version,
 )
+from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
 from tensorrt_llm.deep_ep.buffer import Buffer
 from tensorrt_llm.mapping import Mapping
 
@@ -108,7 +106,6 @@ COMM_DEEP_EP = "DeepEP"
 COMM_DEEP_EP_LL = "DeepEPLowLatency"
 COMM_NVLINK_ONE_SIDED = "NVLinkOneSided"
 COMM_NVLINK_TWO_SIDED = "NVLinkTwoSided"
-COMM_NVLINK_TWO_SIDED_FLASHINFER = "NVLinkTwoSidedFlashinfer"
 COMM_NCCL_EP = "NcclEP"
 
 ALL_COMM_TYPES = [
@@ -117,7 +114,6 @@ ALL_COMM_TYPES = [
     COMM_DEEP_EP_LL,
     COMM_NVLINK_ONE_SIDED,
     COMM_NVLINK_TWO_SIDED,
-    COMM_NVLINK_TWO_SIDED_FLASHINFER,
     COMM_NCCL_EP,
 ]
 
@@ -610,17 +606,6 @@ def create_comm_object(
             alltoall_result_do_sum=True,
         )
 
-    elif comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER:
-        # FlashInfer requires reduced combine output and does not support the
-        # low-precision combine path.
-        return NVLinkTwoSidedFlashinfer(
-            mapping=mapping,
-            num_experts=num_experts,
-            num_slots=num_slots,
-            top_k=config.top_k,
-            alltoall_result_do_sum=True,
-        )
-
     elif comm_type == COMM_NCCL_EP:
         return NcclEP(
             mapping=mapping,
@@ -698,14 +683,6 @@ def _comm_reuse_key(config: CommTestConfig) -> Tuple:
             config.use_low_precision_combine,
         )
 
-    if config.comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER:
-        return (
-            config.comm_type,
-            config.ep_size,
-            config.num_experts,
-            config.top_k,
-        )
-
     return (config.comm_type,)
 
 
@@ -753,17 +730,6 @@ def _check_mnnvl_support() -> Optional[str]:
 
 
 @lru_cache(maxsize=None)
-def _check_flashinfer_mnnvl_support() -> Optional[str]:
-    """Return skip reason if FlashInfer MNNVL is not supported, else None."""
-    try:
-        if not NVLinkTwoSidedFlashinfer.is_platform_supported():
-            return "FlashInfer MNNVL not supported"
-    except Exception:
-        return "FlashInfer MNNVL initialization failed"
-    return None
-
-
-@lru_cache(maxsize=None)
 def check_platform_support(comm_type: str) -> Optional[str]:
     """Return skip reason string if comm type is unsupported, else None."""
     if comm_type == COMM_ALLGATHER_RS:
@@ -779,9 +745,6 @@ def check_platform_support(comm_type: str) -> Optional[str]:
 
     if comm_type == COMM_NVLINK_TWO_SIDED:
         return _check_mnnvl_support()
-
-    if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER:
-        return _check_flashinfer_mnnvl_support()
 
     if comm_type == COMM_NCCL_EP:
         if not is_nccl_ep_installed():
@@ -848,16 +811,6 @@ def check_feasibility(comm_type: str, config: CommTestConfig) -> Optional[str]:
             return f"NcclEP does not support quant_mode={config.quant_mode}"
         if config.top_k > NCCL_EP_MAX_TOP_K:
             return f"NcclEP MAX_TOP_K={NCCL_EP_MAX_TOP_K}, got top_k={config.top_k}"
-
-    if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER:
-        # FlashInfer alltoallv requires every 2D payload row to be 16-byte aligned.
-        # This test dispatches both int32 slots [N, top_k] and bf16 scales
-        # [N, top_k], so top_k must satisfy both alignments.
-        if config.top_k % 8 != 0:
-            return (
-                "NVLinkTwoSidedFlashinfer requires top_k to be a multiple of 8 "
-                f"for 16-byte row alignment, got top_k={config.top_k}"
-            )
 
     # W4AFP8: encode_source_info writes token_idx into fp8 low byte.
     # token_idx >= 127 can create fp8 NaN which may not survive bf16 roundtrip.
@@ -1063,7 +1016,7 @@ def _run_worker_dispatch(
     config: CommTestConfig,
 ) -> DispatchOutputs:
     """Prepare dispatch metadata if needed, then run dispatch()."""
-    if config.comm_type in (COMM_NVLINK_TWO_SIDED, COMM_NVLINK_TWO_SIDED_FLASHINFER):
+    if config.comm_type == COMM_NVLINK_TWO_SIDED:
         comm.prepare_dispatch(worker_inputs.slots, config.all_num_tokens)
 
     recv_hs, recv_sf, recv_slots, recv_scales = comm.dispatch(
@@ -1174,63 +1127,67 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
         comm = _get_worker_comm(mapping, config)
 
         worker_inputs = _prepare_worker_inputs(rank, config)
-        dispatch_outputs = _run_worker_dispatch(comm, worker_inputs, config)
+        # Keep dispatch buffers alive through combine and the CPU result copies.
+        with nccl_window_tensor_scope(worker_inputs.hs):
+            dispatch_outputs = _run_worker_dispatch(comm, worker_inputs, config)
 
-        # ----- decode routing + dequant + MoE + combine -----
-        # Decode source info from raw dispatch output (before dequant) so we
-        # know which original (src_rank, token_idx) each dispatched row maps to.
-        # Using recv_hs.dtype and recv_hs.shape[1] ensures correct byte layout
-        # regardless of quant format (bf16, fp8, nvfp4, w4afp8-as-bf16).
-        recv_source_info = decode_source_info(
-            dispatch_outputs.recv_hs,
-            dispatch_outputs.recv_hs.dtype,
-            dispatch_outputs.recv_hs.shape[1],
-        )
+            # ----- decode routing + dequant + MoE + combine -----
+            # Decode source info from raw dispatch output (before dequant) so we
+            # know which original (src_rank, token_idx) each dispatched row maps to.
+            # Using recv_hs.dtype and recv_hs.shape[1] ensures correct byte layout
+            # regardless of quant format (bf16, fp8, nvfp4, w4afp8-as-bf16).
+            recv_source_info = decode_source_info(
+                dispatch_outputs.recv_hs,
+                dispatch_outputs.recv_hs.dtype,
+                dispatch_outputs.recv_hs.shape[1],
+            )
 
-        recv_hs_bf16 = _to_bf16(
-            dispatch_outputs.recv_hs,
-            dispatch_outputs.recv_sf,
-            worker_inputs.global_scale,
-            config.quant_mode,
-        )
+            recv_hs_bf16 = _to_bf16(
+                dispatch_outputs.recv_hs,
+                dispatch_outputs.recv_sf,
+                worker_inputs.global_scale,
+                config.quant_mode,
+            )
 
-        # Use ceil/floor partitioning so the slot range is correct for both
-        # uniform and non-divisible EP (num_experts % ep_size != 0).
-        _, local_slot_start, local_slot_end = _compute_ep_partition(
-            config.num_experts, config.ep_size, rank
-        )
-        # Run a minimal local-expert compute step before combine(). This keeps
-        # the test aligned with the real MoE pipeline, where combine() consumes
-        # per-rank expert outputs rather than raw dispatch payloads.
-        moe_output = simple_moe(
-            recv_hs_bf16,
-            dispatch_outputs.recv_slots,
-            dispatch_outputs.recv_scales,
-            local_slot_start,
-            local_slot_end,
-        )
+            # Use ceil/floor partitioning so the slot range is correct for both
+            # uniform and non-divisible EP (num_experts % ep_size != 0).
+            _, local_slot_start, local_slot_end = _compute_ep_partition(
+                config.num_experts, config.ep_size, rank
+            )
+            # Run a minimal local-expert compute step before combine(). This keeps
+            # the test aligned with the real MoE pipeline, where combine() consumes
+            # per-rank expert outputs rather than raw dispatch payloads.
+            moe_output = simple_moe(
+                recv_hs_bf16,
+                dispatch_outputs.recv_slots,
+                dispatch_outputs.recv_scales,
+                local_slot_start,
+                local_slot_end,
+            )
 
-        combined = comm.combine(
-            moe_output,
-            all_rank_max_num_tokens=max(config.all_num_tokens),
-        )
+            combined = comm.combine(
+                moe_output,
+                all_rank_max_num_tokens=max(config.all_num_tokens),
+            )
 
-        # Save recv_hs_bf16 for DeepEPLL combine reference (weighted reduce
-        # needs raw dispatched hidden_states, not accumulated moe_output).
-        saved_recv_hs_bf16 = recv_hs_bf16.clone() if config.comm_type == COMM_DEEP_EP_LL else None
-        moe_output_for_ref = _prepare_moe_output_for_combine_reference(moe_output, config)
+            # Save recv_hs_bf16 for DeepEPLL combine reference (weighted reduce
+            # needs raw dispatched hidden_states, not accumulated moe_output).
+            saved_recv_hs_bf16 = (
+                recv_hs_bf16.clone() if config.comm_type == COMM_DEEP_EP_LL else None
+            )
+            moe_output_for_ref = _prepare_moe_output_for_combine_reference(moe_output, config)
 
-        return _build_worker_result(
-            rank,
-            worker_inputs,
-            dispatch_outputs,
-            combined,
-            moe_output,
-            recv_source_info,
-            config,
-            recv_hs_bf16=saved_recv_hs_bf16,
-            moe_output_for_ref=moe_output_for_ref,
-        )
+            return _build_worker_result(
+                rank,
+                worker_inputs,
+                dispatch_outputs,
+                combined,
+                moe_output,
+                recv_source_info,
+                config,
+                recv_hs_bf16=saved_recv_hs_bf16,
+                moe_output_for_ref=moe_output_for_ref,
+            )
     except Exception:
         traceback.print_exc()
         raise
@@ -1291,49 +1248,52 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
             experts_per_rank=experts_per_rank,
         )
 
-        # Initialize the context and handle eagerly. Capture is intentionally
-        # rejected before this point, matching production graph setup.
-        comm.dispatch(
-            hidden_states,
-            None,
-            local_routes,
-            weights,
-            all_rank_num_tokens,
-        )
-        torch.cuda.synchronize()
-
-        static_routes = local_routes.clone()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            recv_hs, _, recv_slots, recv_scales = comm.dispatch(
+        with nccl_window_tensor_scope(hidden_states):
+            # Initialize the context and handle eagerly. Capture is intentionally
+            # rejected before this point, matching production graph setup.
+            comm.dispatch(
                 hidden_states,
                 None,
-                static_routes,
+                local_routes,
                 weights,
                 all_rank_num_tokens,
             )
-        torch.cuda.synchronize()
-
-        assert recv_scales.dtype == routing_dtype
-
-        def replay_and_check(expected_sender: int, expected_weight: float) -> dict:
-            graph.replay()
             torch.cuda.synchronize()
-            valid = recv_slots[:, 0] >= 0
-            received = recv_hs[valid, 0].to(torch.float32).round().to(torch.int64)
-            return {
-                "valid_count": int(valid.sum().item()),
-                "sender_matches": bool(torch.all(received == expected_sender + 1).item()),
-                "weights_match": bool(torch.all(recv_scales[valid, 0] == expected_weight).item()),
-            }
 
-        static_routes.copy_(local_routes)
-        weights.fill_(0.5)
-        local_result = replay_and_check(rank, 0.5)
-        static_routes.copy_(peer_routes)
-        weights.fill_(0.25)
-        peer_result = replay_and_check(peer_rank, 0.25)
-        return {"rank": rank, "local": local_result, "peer": peer_result}
+            static_routes = local_routes.clone()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                recv_hs, _, recv_slots, recv_scales = comm.dispatch(
+                    hidden_states,
+                    None,
+                    static_routes,
+                    weights,
+                    all_rank_num_tokens,
+                )
+            torch.cuda.synchronize()
+
+            assert recv_scales.dtype == routing_dtype
+
+            def replay_and_check(expected_sender: int, expected_weight: float) -> dict:
+                graph.replay()
+                torch.cuda.synchronize()
+                valid = recv_slots[:, 0] >= 0
+                received = recv_hs[valid, 0].to(torch.float32).round().to(torch.int64)
+                return {
+                    "valid_count": int(valid.sum().item()),
+                    "sender_matches": bool(torch.all(received == expected_sender + 1).item()),
+                    "weights_match": bool(
+                        torch.all(recv_scales[valid, 0] == expected_weight).item()
+                    ),
+                }
+
+            static_routes.copy_(local_routes)
+            weights.fill_(0.5)
+            local_result = replay_and_check(rank, 0.5)
+            static_routes.copy_(peer_routes)
+            weights.fill_(0.25)
+            peer_result = replay_and_check(peer_rank, 0.25)
+            return {"rank": rank, "local": local_result, "peer": peer_result}
     except Exception:
         traceback.print_exc()
         raise
@@ -1731,7 +1691,7 @@ def verify_dispatch_alltoall(
     """Verify AllToAll dispatch: slot validity, content integrity, completeness.
 
     Slot semantics differ by communication backend:
-      - NVLinkOneSided / NVLinkTwoSided / NVLinkTwoSidedFlashinfer:
+      - NVLinkOneSided / NVLinkTwoSided:
         valid tokens keep global expert IDs
         [0, num_experts), padding tokens are set to -1 by sanitize kernel.
       - DeepEP: valid tokens keep global expert IDs [0, num_experts), empty-
@@ -2082,7 +2042,6 @@ POSTQUANT_COMM_MAP: Dict[str, List[str]] = {
         COMM_NCCL_EP,
         COMM_NVLINK_ONE_SIDED,
         COMM_NVLINK_TWO_SIDED,
-        COMM_NVLINK_TWO_SIDED_FLASHINFER,
         COMM_DEEP_EP_LL,
         COMM_ALLGATHER_RS,
     ],
@@ -2090,7 +2049,6 @@ POSTQUANT_COMM_MAP: Dict[str, List[str]] = {
         COMM_NCCL_EP,
         COMM_NVLINK_ONE_SIDED,
         COMM_NVLINK_TWO_SIDED,
-        COMM_NVLINK_TWO_SIDED_FLASHINFER,
         COMM_DEEP_EP,
         COMM_DEEP_EP_LL,
         COMM_ALLGATHER_RS,
@@ -2099,7 +2057,7 @@ POSTQUANT_COMM_MAP: Dict[str, List[str]] = {
 }
 """Only valid (quant_mode, comm_type) combinations for post-quant tests.
 
- - fp8: NVLink (payload-agnostic, including FlashInfer variant) + DeepEP LL
+ - fp8: NVLink (payload-agnostic) + DeepEP LL
    (fp8 branch) + AllGatherRS.
   DeepEP normal only supports nvfp4 post-quant, NOT fp8.
  - nvfp4: All tested COMM types except w4afp8-only branches support nvfp4
@@ -2197,7 +2155,6 @@ def _make_boundary_test_params():
     configs = []
     for target_ep_size in [2, 4]:
         for comm_type in ALL_COMM_TYPES:
-            aligned_top_k = 8 if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER else 2
             boundary_cases = []
             if comm_type == COMM_NVLINK_ONE_SIDED:
                 # DSpark routes to three experts; include an idle ADP peer.
@@ -2215,21 +2172,20 @@ def _make_boundary_test_params():
                         f"{comm_type}_topk3",
                     )
                 )
-            if comm_type != COMM_NVLINK_TWO_SIDED_FLASHINFER:
-                boundary_cases.append(
-                    (
-                        2,
-                        CommTestConfig(
-                            comm_type=comm_type,
-                            ep_size=2,
-                            num_experts=FIXED_NUM_EXPERTS,
-                            top_k=1,
-                            hidden_size=DEFAULT_HIDDEN_SIZE,
-                            all_num_tokens=[8, 8],
-                        ),
-                        f"{comm_type}_topk1",
-                    )
+            boundary_cases.append(
+                (
+                    2,
+                    CommTestConfig(
+                        comm_type=comm_type,
+                        ep_size=2,
+                        num_experts=FIXED_NUM_EXPERTS,
+                        top_k=1,
+                        hidden_size=DEFAULT_HIDDEN_SIZE,
+                        all_num_tokens=[8, 8],
+                    ),
+                    f"{comm_type}_topk1",
                 )
+            )
             boundary_cases.extend(
                 [
                     (
@@ -2238,7 +2194,7 @@ def _make_boundary_test_params():
                             comm_type=comm_type,
                             ep_size=2,
                             num_experts=FIXED_NUM_EXPERTS,
-                            top_k=aligned_top_k,
+                            top_k=2,
                             hidden_size=2048,
                             all_num_tokens=[16, 16],
                         ),
@@ -2250,7 +2206,7 @@ def _make_boundary_test_params():
                             comm_type=comm_type,
                             ep_size=4,
                             num_experts=FIXED_NUM_EXPERTS,
-                            top_k=aligned_top_k,
+                            top_k=2,
                             hidden_size=DEFAULT_HIDDEN_SIZE,
                             all_num_tokens=[1, 1, 1, 1],
                         ),
@@ -2268,7 +2224,7 @@ def _make_boundary_test_params():
                             comm_type=comm_type,
                             ep_size=4,
                             num_experts=FIXED_NUM_EXPERTS,
-                            top_k=aligned_top_k,
+                            top_k=2,
                             hidden_size=DEFAULT_HIDDEN_SIZE,
                             all_num_tokens=[32, 0, 16, 0],
                         ),
@@ -2344,8 +2300,7 @@ def _make_postquant_test_params():
     configs = []
     for quant_mode, comm_types in POSTQUANT_COMM_MAP.items():
         for comm_type in comm_types:
-            top_ks = [8] if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER else [2, 16]
-            for top_k in top_ks:
+            for top_k in [2, 16]:
                 for use_low_precision_combine in [False, True]:
                     config = CommTestConfig(
                         comm_type=comm_type,

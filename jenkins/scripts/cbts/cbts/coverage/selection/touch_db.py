@@ -28,9 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 from cbts.blocks import normalize_test_id
-
-# Canonicalize an absolute co_filename to the DB `file` form (`tensorrt_llm/...`).
-_CANON_RE = re.compile(r"(tensorrt_llm/.*)$")
+from cbts.coverage.collection.compact_db import canonicalize_path
 
 # A DB test value is `<stage>/<nodeid>`; unit tests wrap the inner entry.
 _UNITTEST_WRAP_RE = re.compile(r"::test_unittests_v2\[(?P<inner>.+)\]$")
@@ -48,7 +46,7 @@ _SERVING_PATH_MARKERS: tuple[str, ...] = ("disaggregated/",)
 # Stage-name markers whose GPU worker is uninstrumented, so capture is partial.
 _UNTRUSTED_STAGE_MARKERS: tuple[str, ...] = ("-Ray-",)
 _MIN_FUNCS = 30
-_SCHEMA_VERSION = "4"
+_SCHEMA_VERSION = "5"
 _STORAGE_SCHEMA = "compact-v1"
 
 _QUALIFIED_TEST_SQL = (
@@ -59,9 +57,8 @@ _QUALIFIED_TEST_SQL = (
 
 
 def canon(path: str) -> str:
-    """Canonicalize a path to the DB's `file` form (`tensorrt_llm/...`)."""
-    m = _CANON_RE.search(path)
-    return m.group(1) if m else path
+    """Use collection's file identity, preserving repository-relative paths."""
+    return canonicalize_path(path)
 
 
 def split_stage(test: str) -> tuple[str, str]:
@@ -136,8 +133,6 @@ class TouchDB:
                 "test",
                 "stage",
                 "outcome",
-                "expected_workers",
-                "saved_procs",
                 "tainted",
             }
             <= test_meta_cols
@@ -299,22 +294,20 @@ class TouchDB:
         ]
 
     def incomplete_capture_tests(self) -> set[str]:
-        """Tests not safe to skip, for any of three independent reasons.
+        """Tests not safe to skip, for either of two independent reasons.
 
-        Only the latter two are actually about capture reliability; ``outcome`` is not,
-        and is included here purely because it has the same effect on the skip decision --
-        a test that failed outright still needs to keep running regardless of how
-        trustworthy its (possibly perfectly complete) coverage is.
+        Only the latter is actually about capture reliability; ``outcome`` is not, and is
+        included here purely because it has the same effect on the skip decision -- a test
+        that failed outright still needs to keep running regardless of how trustworthy its
+        (possibly perfectly complete) coverage is.
 
         - ``outcome``: the test did not pass (or has no recorded outcome at all).
-        - ``saved_procs < expected_workers + 1``: a spawned process never saved.
         - ``tainted``: a process saved, but the context channel could not confirm it was
           recording against the right test.
         """
         rows = self._conn.execute(
             "SELECT test FROM test_case_meta WHERE test != '' AND "
-            "(outcome IS NULL OR outcome != 'passed' "
-            "OR saved_procs < expected_workers + 1 OR tainted != 0)"
+            "(outcome IS NULL OR outcome != 'passed' OR tainted != 0)"
         )
         # Tests that recorded nothing are not selection candidates.
         return {row[0] for row in rows} & self.known_tests()

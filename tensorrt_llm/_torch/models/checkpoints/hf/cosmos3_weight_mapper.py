@@ -5,9 +5,10 @@ import re
 
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 
-@register_mapper("HF", "Cosmos3ForConditionalGeneration")
+@register_mapper(CheckpointFormat.HF, "Cosmos3ForConditionalGeneration")
 class Cosmos3HfWeightMapper(Qwen3VLHfWeightMapper):
     """
     Cosmos3 unified checkpoints store the Reasoner LLM with the old `model.` prefix

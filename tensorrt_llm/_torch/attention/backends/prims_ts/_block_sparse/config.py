@@ -23,13 +23,16 @@ import torch
 from flashinfer.utils import ceil_div
 
 from ..decode import _cutlass_dtype, _dtype_key, _validate_mask, _validate_positive_int
-from ..sage import SageAttentionConfig
+from ..kernels.fmha_decode.fmha_decode_constants import SOFTMAX_RESCALE_THRESHOLD_LOG2
+from ..sage.config import SageAttentionConfig, validate_sage_recipe
 from .common import (
     _PREPARED_KV_ROUTE_SIZE,
     _SIGNED_INT32_MAX,
+    _resolve_plan_block_sizes,
     _select_block_sparse_q_tile_size,
     _validate_sparse_kv_block_size,
 )
+from ..sage.layout import _SageScaleLayout
 from .prepared import _BlockSparseRouteLayout
 
 if TYPE_CHECKING:
@@ -92,6 +95,8 @@ class _BlockSparseCompileKey:
     # A dense key ignores the routing fields above.
     use_block_sparse: bool = True
     sage: SageAttentionConfig | None = None
+    softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2
+    scale_types: tuple[bool, bool] = (False, False)
 
 
 @dataclass(frozen=True)
@@ -103,6 +108,10 @@ class _BlockSparseLaunchSpec:
     # Whether prepared routes carry K32 score-validity words; the decode
     # config owns this rule and the plan sizes its route storage from it.
     prepares_score_words: bool
+    # The layout of a Sage plan's prepared scales, which the plan allocates
+    # and the Sage prepare writes before every attention launch; ``None``
+    # otherwise.
+    sage_scales: _SageScaleLayout | None = None
 
 
 _CAPACITY_UNSET = object()
@@ -136,6 +145,7 @@ class _BlockSparseStaticProfile:
     share_pattern_across_kv_heads: bool = False
     sage: SageAttentionConfig | None = None
     use_block_sparse: bool = True
+    softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2
 
 
 def _select_block_sparse_kv_route_size(
@@ -377,7 +387,7 @@ def _resolve_plan_dtypes(
     """Return ``(kv_dtype, v_dtype, output_dtype, dtype_key)`` of one plan.
 
     K defaults to Q and V to K. The output defaults to Q, or to bfloat16 with
-    Sage; the decode configuration validates the Sage dtype recipe.
+    Sage, whose recipe ``validate_sage_recipe`` checks.
     """
 
     if kv_dtype is None:
@@ -393,12 +403,15 @@ def _resolve_plan_dtypes(
             output_dtype,
             _validate_matching_dtypes(q_dtype, kv_dtype, v_dtype, output_dtype),
         )
-    if not isinstance(sage, SageAttentionConfig):
-        raise TypeError("sage must be a SageAttentionConfig instance")
-    if q_dtype != kv_dtype:
-        raise ValueError("Sage attention requires Q and K in one dtype")
     if output_dtype is None:
         output_dtype = torch.bfloat16
+    validate_sage_recipe(
+        sage,
+        q_dtype=q_dtype,
+        k_dtype=kv_dtype,
+        v_dtype=v_dtype,
+        output_dtype=output_dtype,
+    )
     return kv_dtype, v_dtype, output_dtype, _plan_dtype_key(q_dtype)
 
 
@@ -410,8 +423,8 @@ def _validate_block_sparse_static_profile(
     num_qo_heads: int,
     num_kv_heads: int,
     head_dim: int,
-    q_block_size: int,
-    kv_block_size: int,
+    q_block_size: int | None,
+    kv_block_size: int | None,
     use_kv_valid_bits: bool,
     mask_type: Literal["dense", "causal"],
     q_dtype: torch.dtype,
@@ -423,6 +436,7 @@ def _validate_block_sparse_static_profile(
     share_pattern_across_kv_heads: bool = False,
     sage: SageAttentionConfig | None = None,
     use_block_sparse: bool = True,
+    softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
 ) -> _BlockSparseStaticProfile:
     """Validate static policy before any device work or BSR inspection."""
 
@@ -452,6 +466,9 @@ def _validate_block_sparse_static_profile(
             )
     if not isinstance(use_kv_valid_bits, bool):
         raise TypeError("use_kv_valid_bits must be a bool")
+    q_block_size, kv_block_size = _resolve_plan_block_sizes(
+        q_block_size, kv_block_size, use_block_sparse=use_block_sparse
+    )
     kv_block_size = _validate_sparse_kv_block_size(kv_block_size)
     if num_qo_heads % num_kv_heads != 0:
         raise ValueError("num_qo_heads must be divisible by num_kv_heads")
@@ -517,13 +534,17 @@ def _validate_block_sparse_static_profile(
         share_pattern_across_kv_heads=share_pattern_across_kv_heads,
         sage=sage,
         use_block_sparse=use_block_sparse,
+        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
     )
 
 
 def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig":
     """Build one decode configuration from its exact compile cache key."""
 
-    from ..kernels.fmha_decode.fmha_decode_config import make_decode_config
+    from ..kernels.fmha_decode.fmha_decode_config import (
+        arch_config_args,
+        make_decode_config,
+    )
 
     dtype = _cutlass_dtype(key.dtype_key)
     out_dtype = _cutlass_dtype(key.out_dtype_key)
@@ -535,11 +556,15 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
     )
     use_keeps_mma_ab = q_tile_size >= 64
     config_args: dict[str, object] = {
+        **arch_config_args(torch.cuda.get_device_capability(key.device_index)),
         "use_keeps_mma_ab": use_keeps_mma_ab,
         "tile_size_q": q_tile_size,
         "tile_size_kv": key.kv_route_size,
         "groups_tokens_heads_q": True,
         "use_block_sparse": key.use_block_sparse,
+        "softmax_rescale_threshold_log2": key.softmax_rescale_threshold_log2,
+        # Block-sparse and Sage plans compile for their exact lengths.
+        "fixed_seqlen": True,
     }
     if key.use_block_sparse:
         config_args.update(
@@ -622,6 +647,8 @@ def _resolve_block_sparse_launch_spec(
     out_dtype_key: str,
     v_dtype_key: str,
     sage: SageAttentionConfig | None = None,
+    softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
+    scale_types: tuple[bool, bool] = (False, False),
 ) -> _BlockSparseLaunchSpec:
     """Resolve and cache one validated static or CLC launch.
 
@@ -686,6 +713,8 @@ def _resolve_block_sparse_launch_spec(
         out_dtype_key=out_dtype_key,
         v_dtype_key=v_dtype_key,
         sage=sage,
+        scale_types=scale_types,
+        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
     )
     try:
         config = _make_block_sparse_config(compile_key)
@@ -735,6 +764,9 @@ def _resolve_block_sparse_launch_spec(
         policy=tuple(policy_entries),
         compile_key=compile_key,
         prepares_score_words=config.uses_prepared_score_keep_words,
+        sage_scales=(
+            config.sage_scale_layout(seq_len_kv) if config.use_sage_attention else None
+        ),
     )
 
 
