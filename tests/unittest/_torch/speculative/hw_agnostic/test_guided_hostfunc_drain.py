@@ -195,6 +195,7 @@ def test_add_batch_activates_for_cuda_graphs_and_constrained_batches(is_cuda_gra
     decoder = object.__new__(CapturableGuidedDecoder)
     decoder.max_num_draft_tokens = 1
     decoder.queue = Queue()
+    decoder._num_added_batches = 0
     snapshot = MagicMock(name="guided_requests")
     snapshot.valid_requests.side_effect = lambda: iter([object()] if constrained else [])
 
