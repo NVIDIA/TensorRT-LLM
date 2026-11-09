@@ -304,8 +304,17 @@ def test_rejection_sampling_still_gated_on_context_parallel():
 @pytest.mark.parametrize("backend",
                          ["DEFAULT", "UCX", "NIXL", "MOONCAKE", "MPI"])
 @pytest.mark.parametrize("dict_config", [False, True])
+@pytest.mark.parametrize("shared", ["0", None])
 def test_dflash_disagg_warns_about_degraded_acceptance(
-        tmp_path: Path, backend: str, dict_config: bool) -> None:
+        tmp_path: Path, backend: str, dict_config: bool, shared: str | None,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    # Warns only when the draft KV is not shared with the target's manager
+    # (disagg_shares_draft_kv): unset, an AUTO/TRTLLM drafter shares it, so its
+    # prompt window travels with the target KV and acceptance is not degraded.
+    if shared is None:
+        monkeypatch.delenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", shared)
     speculative_config = DFlashDecodingConfig(max_draft_len=2,
                                               use_rejection_sampling=False)
     cache_transceiver_config = CacheTransceiverConfig(backend=backend)
@@ -322,8 +331,9 @@ def test_dflash_disagg_warns_about_degraded_acceptance(
     # Accepted, not rejected: the configuration runs, only acceptance suffers.
     assert isinstance(args.speculative_config, DFlashDecodingConfig)
     assert args.cache_transceiver_config.backend == backend
-    assert any("DFlash acceptance is degraded" in call.args[0]
-               for call in warning.call_args_list)
+    degraded = any("DFlash acceptance is degraded" in call.args[0]
+                   for call in warning.call_args_list)
+    assert degraded == (shared == "0")
 
 
 @pytest.mark.cpu_only
