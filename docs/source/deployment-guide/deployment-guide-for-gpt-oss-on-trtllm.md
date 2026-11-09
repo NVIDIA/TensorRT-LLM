@@ -132,7 +132,14 @@ These options provide control over TensorRT LLM's behavior and are set within th
 
 * **Description:** Sets the **expert-parallel size** for Mixture-of-Experts (MoE) models. Like `tensor_parallel_size`, this should generally match the number of GPUs you're using. This setting has no effect on non-MoE models.
 
-#### `kv_cache_free_gpu_memory_fraction`
+#### `kv_cache_config.free_gpu_memory_fraction`
+
+Set this nested field in the YAML configuration:
+
+```yaml
+kv_cache_config:
+  free_gpu_memory_fraction: 0.7
+```
 
 * **Description:** A value between `0.0` and `1.0` that specifies the fraction of free GPU memory to reserve for the KV cache after the model is loaded. Since memory usage can fluctuate, this buffer helps prevent out-of-memory (OOM) errors.
 * **Recommendation:** If you experience OOM errors, try reducing this value to `0.7` or lower.
