@@ -20,6 +20,7 @@ import sys
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
+from functools import cached_property
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -1498,6 +1499,15 @@ class KVCacheManagerV2(BaseResourceManager):
     _defer_close_armed: bool = False
     _defer_close_scope: bool = False
     _deferred_closes: Tuple[Tuple[int, _KVCache], ...] = ()
+
+    @cached_property
+    def _step_draft_lens(self) -> dict[int, deque[int]]:
+        # Draft width of every generation step grown but not yet passed to
+        # update_resources, oldest first. The overlap loop schedules step N+1
+        # (overwriting _allocated_draft_lens) before it updates step N, so
+        # update_resources reclaims each step's slots from this queue instead.
+        # A cached property so it exists without running __init__.
+        return {}
 
     def __init__(
         self,
@@ -4207,6 +4217,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # same step instead of skipping one.
             req.py_helix_decode_group_index += 1
         self._allocated_draft_lens[request_id] = draft_slots
+        self._step_draft_lens.setdefault(request_id, deque()).append(draft_slots)
         return True
 
     def revert_allocate_generation(self, req: LlmRequest) -> None:
@@ -4226,6 +4237,9 @@ class KVCacheManagerV2(BaseResourceManager):
         draft_slots = self._allocated_draft_lens.pop(request_id, None)
         if draft_slots is None:
             return
+        step_widths = self._step_draft_lens.get(request_id)
+        if step_widths:
+            step_widths.pop()
         kv_cache = self.kv_cache_map.get(request_id)
         if kv_cache is None or not kv_cache.is_active:
             return
@@ -4648,6 +4662,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"(target capacity {new_capacity})"
             )
         self._allocated_draft_lens[request.py_request_id] = current_draft_len
+        step_widths = self._step_draft_lens.get(request.py_request_id)
+        if step_widths:
+            step_widths[-1] = current_draft_len
 
     def suspend_request(self, req: LlmRequest) -> None:
         """Suspend a request's KV cache, allowing pages to migrate to a secondary tier."""
@@ -6392,6 +6409,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
+        self._step_draft_lens.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
         # The next owner of these pages fills them again; keeping the set would
         # both leak and let a recycled page skip its fill.
@@ -7221,6 +7239,11 @@ class KVCacheManagerV2(BaseResourceManager):
             if req.py_request_id not in self.kv_cache_map:
                 continue
             kv_cache = self.kv_cache_map[req.py_request_id]
+            # This step's own width: under the overlap scheduler
+            # _allocated_draft_lens already holds step N+1's, and reclaiming
+            # with it double-counts whenever consecutive widths differ.
+            step_widths = self._step_draft_lens.get(req.py_request_id)
+            step_draft_slots = step_widths.popleft() if step_widths else None
             # In the overlap scheduler, the scheduler for iteration N+1
             # may suspend a gen request's KV cache (via self-eviction or
             # victim eviction) while iteration N's update_resources still
@@ -7232,11 +7255,15 @@ class KVCacheManagerV2(BaseResourceManager):
             runtime_draft_len = req.py_rewind_len + accepted_draft_len
             # No entry: this manager did not grow through the scheduler (e.g.
             # disagg), so fall back to _generation_draft_slots' width.
-            allocated_draft_slots = self._allocated_draft_lens.get(
-                req.py_request_id,
-                max(runtime_draft_len, self._kv_reserve_draft_tokens)
-                if self.is_draft
-                else runtime_draft_len,
+            allocated_draft_slots = (
+                step_draft_slots
+                if step_draft_slots is not None
+                else self._allocated_draft_lens.get(
+                    req.py_request_id,
+                    max(runtime_draft_len, self._kv_reserve_draft_tokens)
+                    if self.is_draft
+                    else runtime_draft_len,
+                )
             )
             # Reclaim every reserved slot that was not occupied by an accepted
             # draft token.
