@@ -10,7 +10,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.sw
     swiglu_fp32 as op,
 )
 
-__extra_import_path__ = ["../../moe_expert_bf16__sm_103__tp1", "../../../.."]
+__extra_import_path__ = ["../../_components/moe_expert_bf16__sm_103__tp1", "../../../.."]
 import _expert_cases as cases  # noqa: E402
 from _cells import certified_cells  # noqa: E402
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name

@@ -526,3 +526,16 @@ def test_component_constructor_uses_format_storage(monkeypatch, packed: bool) ->
     assert obj.local_heads == 12 and obj.local_kv_heads == 2
     if packed:
         assert obj.expert_names == [] and obj._shared_fc1 == {}
+
+
+def test_bringup_helpers_and_tensor_captures_are_not_runtime_apis():
+    family = Path(next(iter(beam.__path__)))
+    assert not list(family.glob("*_bf16__sm_103__tp1"))
+    for source in family.rglob("*.py"):
+        tree = ast.parse(source.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                names = {a.arg for a in (*node.args.args, *node.args.kwonlyargs)}
+                assert not names.intersection({"capture", "layer_capture"}), source
+            elif isinstance(node, ast.ImportFrom):
+                assert not (node.module or "").startswith("_components"), source

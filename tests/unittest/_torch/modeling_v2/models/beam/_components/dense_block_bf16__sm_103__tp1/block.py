@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Beam decoder blocks 0-2 / sm_103 / tp1: one dense, sliding-attention block, constructed directly.
 
-This TP1 component uses FlashInfer normalization/activation kernels; see the family
-README for its numerical differences from the TP4 serving model.
+This TP1 component uses FlashInfer normalization/activation kernels; see ``../README.md``
+for its numerical differences from the TP4 serving model.
 
 A component, not a routed target. There is no ``routing.py``, no router-index entry and
 no ``ForCausalLM``: nothing in the engine builds this class, and it serves no request.
@@ -12,7 +12,7 @@ A caller constructs it from the checkpoint's configuration for one of the dense 
 it -- a context step after any cached prefix, or a one-token generation step -- with the
 attention batch state prepared on a ``KVCacheManagerV2``. The forward is
 assembled from catalog entries, with the attention sublayer shared with the sparse block
-component in ``../_attention.py``, and it does not call the built-in Beam modeling.
+component in the production family ``_attention.py``, and it does not call the built-in Beam modeling.
 
 The block, with block 0's residual coefficients (block i's are in ``depth_scales``)::
 
@@ -45,14 +45,13 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam import _attention
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam._constants import SM as _SM
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.residual.beam_depth_residual import (
     beam_depth_residual,
     depth_scales,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-
-from .. import _attention
-from .._constants import SM as _SM
 
 #: The configuration this component computes, as the checkpoint's config.json states it.
 #: Anything else is rejected at construction rather than computed approximately.

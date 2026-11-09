@@ -413,7 +413,6 @@ def attention(
     eps: float,
     rope_theta: float | None,
     window: int,
-    capture: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Normalized input [T, hidden] -> attention output [T, hidden], before post_attention_layernorm.
 
@@ -451,20 +450,4 @@ def attention(
     )
     gated = beam_output_gate(core.view(T, heads, d), g.view(T, heads, d), gate_bias)
     part = cublas_mm(gated.reshape(T, heads * d), o_proj.t())
-    if capture is not None:
-        values = {
-            "q_proj": q,
-            "k_proj": k,
-            "v_proj": v,
-            "gate_proj": g,
-            "q_norm": qn,
-            "k_norm": kn,
-            ("q_rope" if sliding else "q_scaled"): qa,
-            **({"k_rope": ka} if sliding else {}),
-            "q_attn": qa,
-            "k_attn": ka,
-            "attn_core": core.view(T, heads, d),
-            "gated": gated,
-        }
-        capture.update({name: tensor.detach().clone() for name, tensor in values.items()})
     return part

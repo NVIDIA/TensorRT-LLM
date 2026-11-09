@@ -26,12 +26,13 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam._constants import (
+    ROUTER_EPS as NORM_EPS,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam._constants import SM as _SM
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (
     beam_grouped_topk_router,
 )
-
-from .._constants import ROUTER_EPS as NORM_EPS
-from .._constants import SM as _SM
 
 #: The configuration this component computes, as the checkpoint's config.json states it.
 #: Anything else is rejected at construction rather than computed approximately.

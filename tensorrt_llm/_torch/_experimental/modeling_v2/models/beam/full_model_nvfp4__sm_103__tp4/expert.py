@@ -29,7 +29,7 @@ combination or the reduction.
 
 from __future__ import annotations
 
-from typing import Mapping, Optional
+from typing import Mapping
 
 import torch
 
@@ -82,14 +82,12 @@ def nvfp4_swiglu_expert(
     bank: Mapping[str, Mapping[str, torch.Tensor]],
     expert: int,
     shared_fc1: bool,
-    record: Optional[list] = None,
 ) -> torch.Tensor:
     """Expert ``expert``'s rank partial for ``rows`` ``[n, 5120]`` bf16 -> ``[n, 5120]`` bf16.
 
     ``bank`` maps ``"gate"``, ``"up"``, ``"down"`` to the layer's banks (``weight``,
     ``weight_scale``, ``g``, ``alpha``, each indexed by global expert id); ``shared_fc1`` says
-    the gate and up input scales of this expert are bitwise equal. With ``record`` (a list) the
-    call's operands and intermediates are appended as one dict.
+    the gate and up input scales of this expert are bitwise equal.
     """
     gate_p, up_p, down_p = bank["gate"], bank["up"], bank["down"]
     fc1, sf1 = _quantize(rows, gate_p, expert)
@@ -99,33 +97,4 @@ def nvfp4_swiglu_expert(
     act = swiglu_fp32(gate, up)
     fc2, sf2 = _quantize(act["act"], down_p, expert)
     y = _gemm(fc2, sf2, down_p, expert)
-    if record is not None:
-        record.append(
-            {
-                "expert": expert,
-                "rows": rows,
-                "fc1": fc1,
-                "sf1": sf1,
-                "fc1_up": None if shared_fc1 else fc1_up,
-                "sf1_up": None if shared_fc1 else sf1_up,
-                "gate": gate,
-                "up": up,
-                "silu": act["silu"],
-                "product": act["product"],
-                "act": act["act"],
-                "fc2": fc2,
-                "sf2": sf2,
-                "y": y,
-                "scalars": torch.stack(
-                    [
-                        gate_p["g"][expert],
-                        up_p["g"][expert],
-                        gate_p["alpha"][expert],
-                        up_p["alpha"][expert],
-                        down_p["g"][expert],
-                        down_p["alpha"][expert],
-                    ]
-                ),
-            }
-        )
     return y

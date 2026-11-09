@@ -38,7 +38,7 @@ agreement per sparse layer. Expert dispatch synchronizes per sparse layer in all
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Literal, Mapping, Sequence
 
 import torch
 
@@ -239,13 +239,11 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
         attn_metadata: TrtllmAttentionMetadata,
         *,
         logit_rows: LogitRows = None,
-        layer_capture: Callable[[int], dict | None] | None = None,
         trace: list[dict] | None = None,
     ) -> torch.Tensor:
         """One engine step through all 52 layers; FP32 softcapped logits ``[R, vocab]``.
 
-        ``layer_capture(layer)`` may return a dict that receives that block's named
-        intermediates (``block``'s capture); ``trace``, when a list, receives one record per
+        ``trace``, when a list, receives one record per
         executed stage in execution order (embedding with the step's request spans, each
         logical layer with its kind and window, final norm, head).
         """
@@ -257,8 +255,7 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
         if trace is not None:
             trace.append({"stage": "embed", "tokens": num_tokens, "requests": spans})
         for layer in range(NUM_LAYERS):
-            capture = layer_capture(layer) if layer_capture is not None else None
-            x = self.block(layer, x, positions, attn_metadata, capture, call_checked=True)
+            x = self.block(layer, x, positions, attn_metadata, call_checked=True)
             if trace is not None:
                 sliding = self.schedule.is_sliding(layer)
                 trace.append(

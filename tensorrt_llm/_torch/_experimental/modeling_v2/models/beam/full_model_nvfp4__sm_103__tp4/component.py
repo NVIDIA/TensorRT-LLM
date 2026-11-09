@@ -45,7 +45,7 @@ from torch import nn
 
 from .. import dispatch_combine
 from . import expert as nvfp4_expert
-from .component_bf16 import BeamCheckpointLayoutBf16Sm103Tp4, LoadError, _attr, _rec
+from .component_bf16 import BeamCheckpointLayoutBf16Sm103Tp4, LoadError, _attr
 from .layout import (
     PROJECTIONS,
     QuantSpec,
@@ -276,7 +276,7 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
     # ------------------------------------------------------------------ computations
 
     @torch.no_grad()
-    def moe(self, layer: int, h: torch.Tensor, capture: Optional[dict] = None) -> torch.Tensor:
+    def moe(self, layer: int, h: torch.Tensor) -> torch.Tensor:
         """Normalized input ``[T, hidden]`` -> MoE output after the one all-reduce.
 
         The replicated FP32 router, the diagnostic-mode all-rank agreement on its input, ids
@@ -286,82 +286,18 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         """
         routing = self.route(layer, h)
         ids, weights = routing["ids"], routing["weights"]
-        digests = self._digests_agree((h, ids, weights)) if self.diagnostics else None
+        if self.diagnostics:
+            self._digests_agree((h, ids, weights))
         bank = self.expert_bank(layer)
         shared = self._shared_fc1[layer]
-        calls = [] if capture is not None else None
 
         def provider(expert_id: int, rows: torch.Tensor) -> torch.Tensor:
-            return nvfp4_expert.nvfp4_swiglu_expert(rows, bank, expert_id, shared[expert_id], calls)
+            return nvfp4_expert.nvfp4_swiglu_expert(rows, bank, expert_id, shared[expert_id])
 
         local = dispatch_combine.beam_dispatch_combine(h, ids, weights, provider)
         # The four BF16 rank partials are summed once in FP32 and the sum is rounded once.
         out = self.all_reduce(local.float()).to(torch.bfloat16)
-        if capture is not None:
-            _rec(capture, _moe_capture(routing, calls, local, out))
-            if digests is not None:
-                capture["moe.agreement_sha256"] = digests
         return out
-
-
-def _flat_with_offsets(parts: list) -> tuple:
-    offsets = [0]
-    for p in parts:
-        offsets.append(offsets[-1] + p.numel())
-    return torch.cat([p.reshape(-1) for p in parts]), torch.tensor(offsets, dtype=torch.int64)
-
-
-def _moe_capture(routing: dict, calls: list, local: torch.Tensor, out: torch.Tensor) -> dict:
-    """Routing intermediates and every expert call's operands, in call (ascending expert) order."""
-    ids = routing["ids"]
-    tokens = [(ids == c["expert"]).any(-1).nonzero().reshape(-1) for c in calls]
-    fc1_sf, fc1_off = _flat_with_offsets([c["sf1"] for c in calls])
-    fc2_sf, fc2_off = _flat_with_offsets([c["sf2"] for c in calls])
-    items = {
-        "moe.logits": routing["logits"],
-        "moe.scores": routing["scores"],
-        "moe.selection": routing["selection_scores"],
-        "moe.group_scores": routing["group_scores"],
-        "moe.groups": routing["groups"],
-        "moe.masked": routing["masked_selection_scores"],
-        "moe.ids": ids,
-        "moe.weights": routing["weights"],
-        "moe.call_expert": torch.cat(
-            [torch.full((c["rows"].shape[0],), c["expert"], dtype=torch.int64) for c in calls]
-        ),
-        "moe.call_token": torch.cat(tokens),
-        "moe.call_rows": torch.tensor([c["rows"].shape[0] for c in calls], dtype=torch.int64),
-        "moe.call_shared_fc1": torch.tensor([c["fc1_up"] is None for c in calls]),
-        "moe.call_scalars": torch.stack([c["scalars"] for c in calls]),
-        "moe.expert_in": torch.cat([c["rows"] for c in calls]),
-        "moe.fc1_fp4": torch.cat([c["fc1"] for c in calls]),
-        "moe.fc1_sf_swizzled": fc1_sf,
-        "moe.fc1_sf_offsets": fc1_off,
-        "moe.gate": torch.cat([c["gate"] for c in calls]),
-        "moe.up": torch.cat([c["up"] for c in calls]),
-        "moe.silu": torch.cat([c["silu"] for c in calls]),
-        "moe.product": torch.cat([c["product"] for c in calls]),
-        "moe.act": torch.cat([c["act"] for c in calls]),
-        "moe.fc2_fp4": torch.cat([c["fc2"] for c in calls]),
-        "moe.fc2_sf_swizzled": fc2_sf,
-        "moe.fc2_sf_offsets": fc2_off,
-        "moe.tp.y": torch.cat([c["y"] for c in calls]),
-        "moe.tp.local_out": local,
-        "moe.output": out,
-        "mlp_out": out,
-    }
-    unshared = [c for c in calls if c["fc1_up"] is not None]
-    if unshared:
-        sf, off = _flat_with_offsets([c["sf1_up"] for c in unshared])
-        items.update(
-            {
-                "moe.fc1_up_expert": torch.tensor([c["expert"] for c in unshared]),
-                "moe.fc1_up_fp4": torch.cat([c["fc1_up"] for c in unshared]),
-                "moe.fc1_up_sf_swizzled": sf,
-                "moe.fc1_up_sf_offsets": off,
-            }
-        )
-    return items
 
 
 __all__ = [

@@ -68,6 +68,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam import _attention
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam._constants import SM as _SM
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.beam_logit_softcap import (
     beam_logit_softcap,
 )
@@ -80,8 +82,6 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, LayerId, PageIndexMode
 
-from .. import _attention
-from .._constants import SM as _SM
 from ..dense_block_bf16__sm_103__tp1 import block as dense_block
 from ..moe_bf16__sm_103__tp1.moe import check_weights
 from ..moe_bf16__sm_103__tp1.moe import weight_shapes as moe_weight_shapes

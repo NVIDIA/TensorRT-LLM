@@ -29,8 +29,6 @@ boundary, on the TRT-LLM NCCL all-reduce or all-gather::
     head           final norm, local vocabulary logits, one all-gather along the
                    vocabulary in rank order, fp32 softcap once
 
-Every method accepts ``capture``, a dict that receives the named intermediates of the call
-(clones); with ``capture=None`` nothing is recorded.
 """
 
 from __future__ import annotations
@@ -424,7 +422,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
     # ------------------------------------------------------------------ computations
 
     @torch.no_grad()
-    def embed(self, token_ids: torch.Tensor, capture: Optional[dict] = None) -> torch.Tensor:
+    def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Global token ids ``[T]`` int64 -> replicated embeddings ``[T, hidden]`` bf16."""
         self._check_usable()
         _check_ids(token_ids, self.config["vocab_size"], self.device, self.max_tokens)
@@ -435,7 +433,6 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         )
         part = torch.where(inside.unsqueeze(-1), local, torch.zeros_like(local))
         out = self.all_reduce(part)
-        _rec(capture, {"tp.embed_part": part, "embed": out})
         return out
 
     @torch.no_grad()
@@ -445,7 +442,6 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         h: torch.Tensor,
         positions: torch.Tensor,
         md: TrtllmAttentionMetadata,
-        capture: Optional[dict] = None,
         *,
         call_checked: bool = False,
     ) -> torch.Tensor:
@@ -489,16 +485,12 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
             eps=self.eps,
             rope_theta=self.rope_theta if sliding else None,
             window=self.window if sliding else step["max_seq_len"],
-            capture=capture,
         )
         out = self.all_reduce(part)
-        _rec(capture, {"tp.o_part": part, "attn_out": out})
         return out
 
     @torch.no_grad()
-    def dense_ffn(
-        self, layer: int, h: torch.Tensor, capture: Optional[dict] = None
-    ) -> torch.Tensor:
+    def dense_ffn(self, layer: int, h: torch.Tensor) -> torch.Tensor:
         """Normalized input ``[T, hidden]`` -> dense SwiGLU output after the one down all-reduce."""
         self._check_usable(layer)
         _check_hidden(h, self.hidden, self.device, self.max_tokens)
@@ -507,21 +499,10 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         gate = cublas_mm(h, self._layer(layer, "mlp.gate_proj.weight").t())
         up = cublas_mm(h, self._layer(layer, "mlp.up_proj.weight").t())
         act = swiglu_fp32(gate, up)
-        _rec(
-            capture,
-            {
-                "mlp.gate": gate,
-                "mlp.up": up,
-                "mlp.silu": act["silu"],
-                "mlp.product": act["product"],
-                "mlp.act": act["act"],
-            },
-        )
         activation = act["act"]
         del gate, up, act
         part = cublas_mm(activation, self._layer(layer, "mlp.down_proj.weight").t())
         out = self.all_reduce(part)
-        _rec(capture, {"tp.mlp_part": part, "mlp_out": out})
         return out
 
     @torch.no_grad()
@@ -542,60 +523,27 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         )
 
     @torch.no_grad()
-    def moe(self, layer: int, h: torch.Tensor, capture: Optional[dict] = None) -> torch.Tensor:
+    def moe(self, layer: int, h: torch.Tensor) -> torch.Tensor:
         """Normalized input ``[T, hidden]`` -> MoE output after the one all-reduce.
 
         In diagnostic mode, before any expert runs, every rank's router input bytes, ordered
-        expert ids and FP32 weights must be identical (one all-gather of their digests, also
-        recorded in ``capture``).
+        expert ids and FP32 weights must be identical (one all-gather of their digests).
         """
         routing = self.route(layer, h)
         ids, weights = routing["ids"], routing["weights"]
-        digests = self._digests_agree((h, ids, weights)) if self.diagnostics else None
+        if self.diagnostics:
+            self._digests_agree((h, ids, weights))
         gate_bank, up_bank, down_bank = (self._bank(layer, w) for w in ("gate", "up", "down"))
-        calls = []
 
         def local_expert(expert_id: int, rows: torch.Tensor) -> torch.Tensor:
             g = cublas_mm(rows, gate_bank[expert_id].t())
             u = cublas_mm(rows, up_bank[expert_id].t())
             act = swiglu_fp32(g, u)
             y = cublas_mm(act["act"], down_bank[expert_id].t())
-            if capture is not None:
-                calls.append((expert_id, rows, g, u, act, y))
             return y
 
         local = dispatch_combine.beam_dispatch_combine(h, ids, weights, local_expert)
         out = self.all_reduce(local)
-        if capture is not None:
-            _rec(
-                capture,
-                {
-                    "moe.logits": routing["logits"],
-                    "moe.scores": routing["scores"],
-                    "moe.selection": routing["selection_scores"],
-                    "moe.group_scores": routing["group_scores"],
-                    "moe.groups": routing["groups"],
-                    "moe.masked": routing["masked_selection_scores"],
-                    "moe.ids": ids,
-                    "moe.weights": weights,
-                    "moe.call_expert": torch.tensor(
-                        [e for e, rows, *_ in calls for _ in range(rows.shape[0])],
-                        dtype=torch.int64,
-                    ),
-                    "moe.expert_in": torch.cat([c[1] for c in calls]),
-                    "moe.gate": torch.cat([c[2] for c in calls]),
-                    "moe.up": torch.cat([c[3] for c in calls]),
-                    "moe.silu": torch.cat([c[4]["silu"] for c in calls]),
-                    "moe.product": torch.cat([c[4]["product"] for c in calls]),
-                    "moe.act": torch.cat([c[4]["act"] for c in calls]),
-                    "moe.tp.y": torch.cat([c[5] for c in calls]),
-                    "moe.tp.local_out": local,
-                    "moe.output": out,
-                    "mlp_out": out,
-                },
-            )
-            if digests is not None:
-                capture["moe.agreement_sha256"] = digests
         return out
 
     @torch.no_grad()
@@ -605,7 +553,6 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         md: TrtllmAttentionMetadata,
-        capture: Optional[dict] = None,
         *,
         call_checked: bool = False,
     ) -> torch.Tensor:
@@ -624,43 +571,25 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
             h,
             positions,
             md,
-            capture,
             call_checked=call_checked,
         )
         pa = flashinfer_rmsnorm(a, self.tensor(p + "post_attention_layernorm.weight"), self.eps)
         x1 = beam_depth_residual(pa, x, *depth_scales(layer, is_attention=True))
         pf = flashinfer_rmsnorm(x1, self.tensor(p + "pre_feedforward_layernorm.weight"), self.eps)
-        m = (
-            self.moe(layer, pf, capture)
-            if self.schedule.is_sparse(layer)
-            else self.dense_ffn(layer, pf, capture)
-        )
+        m = self.moe(layer, pf) if self.schedule.is_sparse(layer) else self.dense_ffn(layer, pf)
         pm = flashinfer_rmsnorm(m, self.tensor(p + "post_feedforward_layernorm.weight"), self.eps)
         out = beam_depth_residual(pm, x1, *depth_scales(layer, is_attention=False))
-        _rec(
-            capture,
-            {
-                "input": x,
-                "input_norm": h,
-                "post_attn_norm": pa,
-                "attn_residual": x1,
-                "pre_ff_norm": pf,
-                "post_ff_norm": pm,
-                "block_output": out,
-            },
-        )
         return out
 
     @torch.no_grad()
-    def final_norm(self, h: torch.Tensor, capture: Optional[dict] = None) -> torch.Tensor:
+    def final_norm(self, h: torch.Tensor) -> torch.Tensor:
         self._check_usable()
         _check_hidden(h, self.hidden, self.device, self.max_tokens)
         out = flashinfer_rmsnorm(h, self.tensor(FINAL_NORM), self.eps)
-        _rec(capture, {"final_norm": out})
         return out
 
     @torch.no_grad()
-    def head(self, n: torch.Tensor, capture: Optional[dict] = None) -> torch.Tensor:
+    def head(self, n: torch.Tensor) -> torch.Tensor:
         """Final-norm output ``[T, hidden]`` -> softcapped fp32 logits over the full vocabulary.
 
         The rank's vocabulary rows give local logits; one all-gather along the vocabulary
@@ -671,19 +600,11 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         local = cublas_mm(n, self.tensor(HEAD).t())
         gathered = allgather(local, self.mapping, dim=-1)
         logits = beam_logit_softcap(gathered, self.softcap)
-        _rec(capture, {"tp.head_part": local, "head": gathered, "logits": logits})
         return logits
 
 
 def _attr(name: str) -> str:
     return name.replace(".", "__")
-
-
-def _rec(capture: Optional[dict], items: dict) -> None:
-    if capture is None:
-        return
-    for name, tensor in items.items():
-        capture[name] = tensor.detach().clone()
 
 
 def _check_hidden(

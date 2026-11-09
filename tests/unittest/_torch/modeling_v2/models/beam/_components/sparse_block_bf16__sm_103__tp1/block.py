@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Beam decoder blocks 3-5 / sm_103 / tp1: one sparse (MoE) block, constructed directly.
 
-This TP1 component uses FlashInfer normalization/activation kernels; see the family
-README for its numerical differences from the TP4 serving model.
+This TP1 component uses FlashInfer normalization/activation kernels; see ``../README.md``
+for its numerical differences from the TP4 serving model.
 
 A component, not a routed target. There is no ``routing.py``, no router-index entry and
 no ``ForCausalLM``: nothing in the engine builds this class, and it serves no request.
@@ -57,14 +57,14 @@ from torch import nn
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam import _attention
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam._constants import SM as _SM
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.residual.beam_depth_residual import (
     beam_depth_residual,
     depth_scales,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
-from .. import _attention
-from .._constants import SM as _SM
 from ..moe_bf16__sm_103__tp1.moe import BeamMoeBf16Sm103Tp1, check_weights
 from ..moe_bf16__sm_103__tp1.moe import check_config as check_moe_config
 
