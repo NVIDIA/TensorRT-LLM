@@ -197,7 +197,11 @@ class _MsgspecRoute(APIRoute):
         return route_handler
 
 
-TIMEOUT_KEEP_ALIVE = 5  # seconds.
+# HTTP keep-alive of the trtllm-serve uvicorn server, seconds. Default 5 (unchanged);
+# TRTLLM_SERVE_KEEP_ALIVE_S overrides it (e.g. 900 for long agentic benchmark
+# sessions whose idle gaps exceed 5 s, so the client does not hit connection
+# resets on reused connections).
+TIMEOUT_KEEP_ALIVE = int(os.environ.get("TRTLLM_SERVE_KEEP_ALIVE_S", "5"))
 
 _warned_unresolvable_thinking = False
 
