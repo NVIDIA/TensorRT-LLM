@@ -217,8 +217,22 @@ public:
         kDescending, //!< from end downward: the begin edge is the one that moves
     };
 
+    //! Which free slot allocate() hands out.
+    enum class Recycling
+    {
+        //! A recycled slot whose ready event has completed, else a fresh id, else the oldest recycled slot.
+        //! Avoids waiting on pending work, but which id comes back depends on GPU timing.
+        kReadyFirst,
+        //! The oldest recycled slot, ready or not (the caller waits on its event); fresh ids only once none is
+        //! recycled. The slot layout then depends only on the sequence of allocations and releases, so ranks
+        //! that process the same requests (tensor parallelism) end up with identical layouts. Copy-based
+        //! rebalancing needs this: a window shrink vacates slots by position, so different layouts would
+        //! become different cache contents on different ranks.
+        kReleaseOrder,
+    };
+
     explicit SlotAllocator(SlotCount capacity);
-    SlotAllocator(SlotWindow window, Growth growth);
+    SlotAllocator(SlotWindow window, Growth growth, Recycling recycling = Recycling::kReadyFirst);
     ~SlotAllocator();
 
     [[nodiscard]] SlotCount numFreeSlots() const noexcept;
@@ -243,6 +257,11 @@ public:
     [[nodiscard]] Growth growth() const noexcept
     {
         return mGrowth;
+    }
+
+    [[nodiscard]] Recycling recycling() const noexcept
+    {
+        return mRecycling;
     }
 
     // SlotId is signed, so a bare `slot < numSlots()` admits negatives. Both ends are checked
@@ -317,6 +336,7 @@ private:
     //! Ids issued at least once that lie outside the target window (shrink in progress).
     SlotCount mNumIssuedOutsideTarget = 0;
     Growth mGrowth = Growth::kAscending;
+    Recycling mRecycling = Recycling::kReadyFirst;
     SlotCount mNumReadyRecycledSlots;
     std::deque<Slot> mRecycledSlots;
     std::vector<Slot> mOverflowSlots;
