@@ -551,6 +551,7 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
         ends = torch.tensor([0, 2, 2, 3], dtype=torch.int32)
         attn_metadata = SimpleNamespace(
             num_tokens=4,
+            kv_cache_manager=None,
             mixed_precision_kv_staging=lambda _: nullcontext(),
         )
 

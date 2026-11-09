@@ -53,6 +53,7 @@ accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_a
 accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[nemotron_nano_v3_omni_fp8]
 accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[nemotron_nano_v3_omni_nvfp4]
 accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[qwen3vl_2b_instruct]
+accuracy/test_gemma3_swa_scratch_default.py::TestGemma3SwaScratchDefault::test_default_scratch_matches_opt_out
 accuracy/test_glm52.py::TestGLM52NVFP4::test_dep[tp_size=8-ep_size=8]
 accuracy/test_glm52.py::TestGLM52NVFP4::test_mtp_index_share[tp_size=8-ep_size=8]
 accuracy/test_glm52.py::TestGLM52NVFP4::test_runtime

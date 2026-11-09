@@ -1035,16 +1035,15 @@ def test_forced_device_page_table_matches_non_cc_per_layer(monkeypatch, heteroge
                     num_contexts=num_contexts,
                     num_seqs=num_seqs,
                 )
-                if has_scratch:
-                    native_copy.assert_not_called()
-                else:
+                if manager.enable_swa_scratch_reuse:
                     native_copy.assert_called_once()
                     # Staging hands the kernel the device copy, never the host table.
                     assert native_copy.call_args.args[0].is_cuda is (setting == "1")
+                else:
+                    native_copy.assert_not_called()
             torch.cuda.synchronize()
             if setting == "1":
                 assert manager._page_table_materializer._device_base_page_rows is None
-            if setting == "1" or has_scratch:
                 torch.testing.assert_close(
                     manager._device_kv_cache_block_offsets_input.cpu(),
                     manager.host_kv_cache_block_offsets,

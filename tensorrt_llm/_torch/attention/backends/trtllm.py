@@ -516,12 +516,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def __post_init__(self) -> None:
         if (isinstance(self.kv_cache_manager, KVCacheManagerV2)
-                and self.kv_cache_manager.enable_swa_scratch_reuse
-                and not trtllm_supports_swa_scratch_reuse()):
-            raise ValueError(
-                "TRTLLM attention supports SWA scratch reuse only on SM90 and "
-                "SM100-family GPUs. Set "
-                "kv_cache_config.enable_swa_scratch_reuse=False.")
+                and self.kv_cache_manager.enable_swa_scratch_reuse):
+            self._validate_swa_scratch_reuse()
         super().__post_init__()
         self.enable_helix = self.mapping.has_cp_helix(
         ) if self.mapping is not None else False
@@ -538,6 +534,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
+
+    def _validate_swa_scratch_reuse(self) -> None:
+        """Require context kernels that safely read per-layer scratch page tables."""
+        if not trtllm_supports_swa_scratch_reuse():
+            raise ValueError(
+                "TRTLLM attention supports SWA scratch reuse only on SM90 and "
+                "SM100-family GPUs. Set "
+                "kv_cache_config.enable_swa_scratch_reuse=False.")
 
     def _post_init_with_buffers(self, buffers) -> None:
 

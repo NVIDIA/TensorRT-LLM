@@ -3,6 +3,7 @@
 
 from collections.abc import Callable
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -274,7 +275,13 @@ def test_final_physical_slot_is_inside_attention_extent_after_resize(
         groups = manager.impl.get_life_cycle_pool_group_indices(GPU_LEVEL)
         assert requests and any(s.free == 0 for s in stats), "The test must fill a physical pool."
         ids = [request.py_request_id for request in reversed(requests)]
-        actual = _copy(manager, ids, len(ids))
+        with patch(
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2."
+            "copy_per_layer_block_offsets_to_device",
+            wraps=copy_per_layer_block_offsets_to_device,
+        ) as copy_kernel:
+            actual = _copy(manager, ids, len(ids))
+        assert copy_kernel.call_count == int(scratch)
         saw_final_slot_with_offset = False
         for layer in range(manager.num_local_layers):
             converter = manager.impl.get_page_index_converter(layer, Role.KEY)
