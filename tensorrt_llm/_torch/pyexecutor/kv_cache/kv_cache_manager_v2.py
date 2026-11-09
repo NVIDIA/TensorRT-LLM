@@ -595,6 +595,28 @@ def _sync_host_tier_quota(host_quota: int, mapping: Mapping) -> int:
     return host_quota
 
 
+def bound_pool_ids(impl: KVCacheManagerPy) -> List[Tuple[int, int]]:
+    """Pools that copy-based rebalancing addresses with slot ids of their own ("bound pools").
+
+    With ``copy_based_rebalancing``, a pool group whose buffers have several sizes gets one arena
+    window per pool. Pool 0 uses the group's slot ids (the base page indices); every other pool has
+    its own ids, so a buffer there is addressed through
+    ``impl.get_page_index_bindings(layer_id, role)[base_page_index]``, never through the base page
+    index itself. Returns ``(layer group id, pool index)`` per bound pool; empty without
+    copy-based rebalancing or without multi-pool groups.
+    """
+    bound = []
+    for pool_group in impl.pool_group_descs:
+        for variant in pool_group.slot_desc.variants:
+            for pool_idx, coalesced in enumerate(variant.coalesced_buffers):
+                if not coalesced.buffer_ids:
+                    continue
+                buffer_id = coalesced.buffer_ids[0]
+                if impl.get_page_index_bindings(buffer_id.layer_id, buffer_id.role) is not None:
+                    bound.append((int(variant.layer_group_id), pool_idx))
+    return bound
+
+
 class _KVCacheManagerInitStatus(IntEnum):
     # The numeric order is part of the allreduce(MAX) protocol: more severe
     # outcomes must have larger values.
@@ -1901,6 +1923,10 @@ class KVCacheManagerV2(BaseResourceManager):
     # need snapshotted (request_prefix_snapshot); kept apart from the request's
     # own expect_snapshot_points, which other code rewrites. Created on first use.
     _waiter_snapshot_points: Optional[Dict[int, set[int]]] = None
+    # Whether this manager builds its page tables for bound pools through
+    # get_page_index_bindings (see bound_pool_ids). Copy-based rebalancing with
+    # multi-pool pool groups is rejected for managers that do not.
+    _translates_bound_pools = False
 
     def __init__(
         self,
@@ -2570,6 +2596,17 @@ class KVCacheManagerV2(BaseResourceManager):
                 raise RuntimeError("KV cache manager initialization failed on another rank")
 
         assert candidate is not None
+        if not self._translates_bound_pools:
+            bound = bound_pool_ids(candidate)
+            if bound:
+                candidate.shutdown()
+                raise ValueError(
+                    "kv_pool_rebalance_config.copy_based_rebalancing: pool groups with several "
+                    f"pools give each pool its own block ids (bound pools {bound}, as (layer group, "
+                    f"pool)), but {type(self).__name__} does not translate them through "
+                    "get_page_index_bindings and would read the wrong pages. Disable "
+                    "copy_based_rebalancing for this model."
+                )
         if self._get_external_cache_bytes(candidate):
             config = replace(
                 config,
