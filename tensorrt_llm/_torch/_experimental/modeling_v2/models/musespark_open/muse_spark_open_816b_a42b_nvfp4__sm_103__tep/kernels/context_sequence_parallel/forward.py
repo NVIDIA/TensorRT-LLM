@@ -147,6 +147,34 @@ SHARD_PARTS_BY_SM = {
     103: ("moe", "shard_routing", "router_input", "ce_gather"),
 }
 
+#: Opt-in (this tree has no sm107_defaults module, so the variable is read directly):
+#: ``MUSESPARK_OPEN_SP_DROP_PARTS`` = comma list of parts to leave out on every SM, e.g. ``ce_gather`` on a
+#: disaggregated context worker, whose KV writes otherwise queue behind a step's copy-engine gather. Unset, ``""`` or
+#: ``0`` leaves the image's sets. ``moe`` cannot be dropped. Read once at import.
+def _sp_drop_parts_env() -> frozenset:
+    import os as _os
+
+    value = _os.environ.get("MUSESPARK_OPEN_SP_DROP_PARTS", "").strip()
+    if value in ("", "0"):
+        return frozenset()
+    return frozenset(v.strip() for v in value.split(",") if v.strip())
+
+
+_SP_DROP = _sp_drop_parts_env()
+if _SP_DROP:
+    if "moe" in _SP_DROP:
+        raise ValueError("MUSESPARK_OPEN_SP_DROP_PARTS: 'moe' is the sequence-parallel path itself and cannot be dropped")
+    _known = set().union(*SHARD_PARTS_BY_SM.values())
+    _unknown = sorted(set(_SP_DROP) - _known)
+    if _unknown:
+        raise ValueError(f"MUSESPARK_OPEN_SP_DROP_PARTS: unknown parts {_unknown} (of {sorted(_known)})")
+    SHARD_PARTS_BY_SM.update({_sm: tuple(_p for _p in _parts if _p not in _SP_DROP)
+                              for _sm, _parts in SHARD_PARTS_BY_SM.items()})
+    import sys as _sys
+
+    print(f"[musespark_open] context_sequence_parallel (SP_DROP_PARTS): dropped {sorted(_SP_DROP)}; parts "
+          f"{SHARD_PARTS_BY_SM}", file=_sys.stderr, flush=True)
+
 
 def install(model: MuseSparkOpenModel, sm: Optional[int]) -> "ContextSequenceParallel":
     """The path's forward for ``model``, with every layer's MoE re-classed (``moe.install``).
