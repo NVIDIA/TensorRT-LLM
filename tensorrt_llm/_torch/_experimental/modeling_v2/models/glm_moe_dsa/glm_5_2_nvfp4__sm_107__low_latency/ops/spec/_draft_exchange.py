@@ -14,7 +14,6 @@ op and nothing else.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
@@ -141,12 +140,11 @@ class DraftExchangeWorkspace:
     def for_mapping(cls, mapping: Mapping, buffer_size_bytes: int) -> "DraftExchangeWorkspace":
         """The workspace over ``mapping``'s TP group, with the MNNVL all-reduce workspace's communicator.
 
-        Fabric handles across nodes or under ``TRTLLM_FORCE_MNNVL_AR``, NVLS handles within a node, as the MNNVL
-        all-reduce workspace takes them.
+        Transport follows the TP group placement, as for MNNVL all-reduce.
         """
-        use_fabric_handle = (
-            os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1" or mapping.is_multi_node()
-        )
+        from tensorrt_llm._torch.distributed.ops import use_mnnvl_fabric_handle
+
+        use_fabric_handle = use_mnnvl_fabric_handle(mapping)
         return cls(
             buffer_size_bytes,
             mapping.tp_size,

@@ -14,7 +14,6 @@
 # limitations under the License.
 import math
 import os
-import platform
 import threading
 import typing
 from dataclasses import dataclass
@@ -103,7 +102,7 @@ def _get_mnnvl_dispatch_plan(
     mapping: Mapping,
     dtype: Optional[torch.dtype],
 ) -> _MnnvlDispatchPlan:
-    """Resolve mapping policy only; runtime qualification belongs to C++."""
+    """Resolve dispatch policy; allocation collectively qualifies local hardware."""
     if dtype not in _MNNVL_SUPPORTED_DTYPES:
         return _MnnvlDispatchPlan(
             unsupported_reason=
@@ -111,9 +110,6 @@ def _get_mnnvl_dispatch_plan(
     if mapping.has_cp():
         return _MnnvlDispatchPlan(
             unsupported_reason="context parallelism is not supported")
-    if mapping.enable_attention_dp:
-        return _MnnvlDispatchPlan(
-            unsupported_reason="attention data parallelism is not supported")
     if mapping.tp_size not in _MNNVL_SUPPORTED_GROUP_SIZES:
         return _MnnvlDispatchPlan(
             unsupported_reason=
@@ -129,12 +125,14 @@ def _get_mnnvl_dispatch_plan(
             f"TP group {tp_group} is inconsistent with TP size {mapping.tp_size} and rank {mapping.rank}"
         )
 
-    group_node_ranks = {mapping.get_node_rank(rank) for rank in tp_group}
-    force_fabric = (os.environ.get("TRTLLM_FORCE_MNNVL_AR_FABRIC", "0") == "1"
-                    or os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1")
-    transport = (MnnvlTransport.FABRIC if force_fabric
-                 or len(group_node_ranks) > 1 else MnnvlTransport.POSIX_FD)
+    transport = (MnnvlTransport.FABRIC if use_mnnvl_fabric_handle(mapping) else
+                 MnnvlTransport.POSIX_FD)
     return _MnnvlDispatchPlan(transport=transport)
+
+
+def _mnnvl_hardware_supported() -> bool:
+    """Local capability predicate; allocation must agree this result across the TP group."""
+    return MnnvlMemory.supports_mnnvl()
 
 
 # Mirrored by the autotune context so Dynamo can guard this branch without
@@ -307,10 +305,8 @@ def _mnnvl_device_index(mapping: Mapping) -> int:
 
 
 def use_mnnvl_fabric_handle(mapping: Mapping) -> bool:
-    """Whether MNNVL multicast buffers of ``mapping`` use fabric handles (else POSIX FD IPC)."""
-    return (os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1"
-            or os.environ.get("TRTLLM_FORCE_MNNVL_AR_FABRIC", "0") == "1"
-            or mapping.is_multi_node())
+    """Select transport for the TP group, independently of the world's other PP/DP groups."""
+    return len({mapping.get_node_rank(rank) for rank in mapping.tp_group}) > 1
 
 
 def _make_mnnvl_mcast_buffer(comm, workspace_size_bytes: int, mapping: Mapping,
@@ -339,6 +335,17 @@ def _make_mnnvl_mcast_buffer(comm, workspace_size_bytes: int, mapping: Mapping,
 
 def _make_mnnvl_workspace(comm, workspace_size_bytes: int, mapping: Mapping,
                           transport: MnnvlTransport) -> MnnvlWorkspace:
+    # A local NVLink failure must not let one rank skip the native handle exchange alone.
+    local_error = None
+    supported = False
+    try:
+        supported = _mnnvl_hardware_supported()
+    except Exception as error:  # Every ordinary probe failure must reach the TP group vote.
+        local_error = error
+    if not _mnnvl_workspace_all_succeeded(comm, supported):
+        raise _MnnvlUnavailableError(
+            "MNNVL hardware qualification failed on one or more TP ranks"
+        ) from local_error
     if mpi_disabled():
         return MnnvlWorkspace(workspace_size_bytes,
                               transport,
@@ -509,6 +516,9 @@ def _get_or_scale_allreduce_mnnvl_workspace(
                                                      mapping, transport)
             if not mcast_buf_handle.is_available:
                 raise _MnnvlUnavailableError(mcast_buf_handle.reason)
+            # Both FABRIC and IPC/NVLS allocators round to CUDA allocation/multicast granularity.
+            # Reuse their actual usable capacity (excluding the signal pad); an extra Python
+            # growth increment could cross a granularity boundary and allocate another unit.
             usable_size = mcast_buf_handle.get_workspace_size()
             buffer_size_bytes = min(usable_size // NUM_LAMPORT_BUFFERS,
                                     _MNNVL_MAX_BUFFER_SIZE_BYTES)
@@ -1090,26 +1100,16 @@ class MNNVLAllReduce(nn.Module):
     def is_mnnvl(mapping: Mapping,
                  dtype: torch.dtype,
                  explicitly_requested: bool = False) -> bool:
-        """Whether MNNVL AllReduce can and should be used for this mapping.
+        """Noncollective eligibility query using the allocation path's policy and capability checks.
 
-        Args:
-            explicitly_requested: True when the caller asked for AllReduceStrategy.MNNVL by name
-                rather than letting AUTO decide. AUTO only opts in when the group spans nodes,
-                where MNNVL is the clear win; an explicit request is honoured on a single node too,
-                as long as the hardware supports it.
+        The allocator agrees the local hardware result across the TP group before entering
+        native preflight. Callers querying eligibility must not use a local failure to skip
+        a collective workspace construction on only one rank.
         """
-        from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
-
-        arch = platform.machine().lower()
-        is_on_aarch64 = "aarch64" in arch
-        # Add a bypass so that we can run the unittest on single-node
-        is_testing = os.environ.get("TLLM_TEST_MNNVL", "0") == "1"
-        if is_testing:
-            return True
-        supported = (dtype in MNNVLAllReduce.get_supported_dtypes()
-                     and not mapping.has_cp() and MnnvlMemory.supports_mnnvl()
-                     and is_on_aarch64)
-        return supported and (explicitly_requested or mapping.is_multi_node())
+        # Retain the keyword for callers; AUTO and explicit MNNVL share eligibility.
+        del explicitly_requested
+        plan = _get_mnnvl_dispatch_plan(mapping, dtype)
+        return plan.is_supported and _mnnvl_hardware_supported()
 
     @staticmethod
     def get_required_workspace_size(num_tokens: int, hidden_dim: int,
@@ -1440,8 +1440,9 @@ class AllReduce(nn.Module):
 
                 - MIN_LATENCY: AllReduce uses MIN_LATENCY mode kernel.
 
-                - AUTO: AUTO chooses the best available strategy. Will try MNNVL,
-                  then choose between NCCL and MIN_LATENCY based on a heuristic policy.
+                - AUTO: AUTO chooses the best available strategy. Tries MNNVL for
+                  both node-local and cross-node TP groups on supported hardware, then chooses
+                  between NCCL and MIN_LATENCY based on a heuristic policy.
 
                 - LOWPRECISION: AllReduce quantizes data to lower precision for transmission.
                   Should only be used on topologies with PCIe switches and without NVLink.

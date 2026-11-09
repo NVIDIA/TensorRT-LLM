@@ -127,6 +127,7 @@ class _FakeWorld:
 
 def _patch_workspace_dependencies(monkeypatch: pytest.MonkeyPatch) -> _FakeWorld:
     world = _FakeWorld()
+    monkeypatch.setattr(ops_module, "_mnnvl_hardware_supported", lambda: True)
     cpu_device = torch.device("cpu")
     monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_workspaces", {})
     monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_pending_comms", {})

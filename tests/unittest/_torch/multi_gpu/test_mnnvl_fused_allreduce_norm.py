@@ -16,7 +16,6 @@
 all ranks' inputs: the slot (one-shot) and two-shot launches, the shared-expert gate fold (with or
 without the in-kernel MoE finalize), the FP8 output, and the FP8 GEMM + all-reduce + norm launch."""
 
-import os
 import pickle
 import sys
 import traceback
@@ -73,7 +72,6 @@ def _check(got, ref, tag, rtol=2e-2):
 def _mnnvl(tp, hidden=H):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
-    os.environ["TLLM_TEST_MNNVL"] = "1"
     MPI.COMM_WORLD.barrier()
     mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
     ar = MNNVLAllReduce(mapping, torch.bfloat16, max_num_tokens=max(ROWS), hidden_size=hidden)
@@ -89,8 +87,6 @@ def _worker(fn, tp):
     except Exception:
         traceback.print_exc()
         raise
-    finally:
-        os.environ.pop("TLLM_TEST_MNNVL", None)
     return True
 
 

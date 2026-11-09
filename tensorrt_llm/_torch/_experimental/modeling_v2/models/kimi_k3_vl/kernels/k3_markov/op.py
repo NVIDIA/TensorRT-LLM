@@ -110,6 +110,7 @@ def markov_workspace(mapping, push_copies: int = 1) -> dict:
         _get_mnnvl_workspace_comm,
         _make_mnnvl_mcast_buffer,
         _mnnvl_workspace_all_succeeded,
+        use_mnnvl_fabric_handle,
     )
 
     kern = _kernel_module()
@@ -117,9 +118,7 @@ def markov_workspace(mapping, push_copies: int = 1) -> dict:
     slots = world * push_copies
     buf_words = kern.buffer_words(WORKSPACE_MAX_BLOCK, kern.MAX_BATCH, slots, WORKSPACE_MAX_GRID)
     comm = _get_mnnvl_workspace_comm(mapping)
-    use_fabric_handle = (
-        os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1" or mapping.is_multi_node()
-    )
+    use_fabric_handle = use_mnnvl_fabric_handle(mapping)
     error: Optional[Exception] = None
     try:
         words = kern.BUFFERS * buf_words
