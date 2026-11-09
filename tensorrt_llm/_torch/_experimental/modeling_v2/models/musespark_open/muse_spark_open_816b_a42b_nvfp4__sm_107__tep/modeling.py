@@ -353,7 +353,8 @@ order:
 * ``context_kv_fork``, which re-classes the worker on top of those, binds the
   fork point on the LM head's GEMM call and is armed per decode step by
   ``DecodeTarget`` (with ``paged_context_commit``, a paged context's commit is one
-  launch, and with ``paged_ctx_block_tables`` its page table's decode is two);
+  launch, with ``paged_ctx_block_tables`` its page table's decode is two, and with
+  ``paged_ctx_kv_store`` its K/V store is one);
 * ``verify_fold`` (with ``rejection_fold``, also on rejection-sampled steps) and
   ``path_walk_tail`` on top of that (on a folded step its prepare takes the context-K/V
   fork's side chain);
@@ -1244,6 +1245,7 @@ _TEP4_BITWISE_PATHS = frozenset(
         "context_kv_fork",
         "paged_context_commit",
         "paged_ctx_block_tables",
+        "paged_ctx_kv_store",
         "split_sampler",
     }
 )

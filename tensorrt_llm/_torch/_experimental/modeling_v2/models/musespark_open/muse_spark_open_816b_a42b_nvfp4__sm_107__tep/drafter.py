@@ -98,6 +98,7 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
             declined=plan.declined,
             paged_commit=plan.enabled("paged_context_commit"),
             paged_tables=plan.enabled("paged_ctx_block_tables"),
+            paged_store=plan.enabled("paged_ctx_kv_store"),
         )
     verify_fold = plan.enabled("verify_fold")
     path_walk_tail = plan.enabled("path_walk_tail")

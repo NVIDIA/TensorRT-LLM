@@ -371,6 +371,12 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("context_kv_fork",),
     ),
     FastPath(
+        "paged_ctx_kv_store",
+        "a paged drafter context's K/V store of every drafter layer in one launch",
+        "draft",
+        ("context_kv_fork",),
+    ),
+    FastPath(
         "rejection_fold",
         "a rejection-sampled step's bookkeeping folded into one launch after the rejection sampler",
         "draft",

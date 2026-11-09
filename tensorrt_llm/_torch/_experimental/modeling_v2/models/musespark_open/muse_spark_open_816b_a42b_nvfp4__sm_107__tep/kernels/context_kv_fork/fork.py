@@ -91,6 +91,8 @@ from ...ops.spec.context_kv_commit_paged import context_kv_commit_paged
 from ...ops.spec.context_kv_commit_windowed import context_kv_commit_windowed
 from ...ops.spec.ctx_block_tables_paged import MAX_REQUESTS as TABLES_MAX_REQUESTS
 from ...ops.spec.ctx_block_tables_paged import ctx_block_tables_paged
+from ...ops.spec.ctx_kv_store_paged import MAX_LAYERS as STORE_MAX_LAYERS
+from ...ops.spec.ctx_kv_store_paged import ctx_kv_store_paged
 
 #: ``drafter_kv_glue`` (``ContextKvFork.glue_on``): the side chain's index math and its arena
 #: stores run as two Triton launches instead of ~11 torch kernels: the slots / columns /
@@ -298,6 +300,7 @@ FORK_METHODS = (
     "_lazy_init_ctx_buffers",
     "_ensure_spec_dec_state_restored",
     "_refresh_ctx_block_tables",
+    "_store_context_kv_paged",
     "_forward_impl",
 )
 
@@ -415,6 +418,9 @@ class ContextKvFork:
         #: ``paged_ctx_block_tables``: the side chain decodes a paged context's page table with
         #: ``ctx_block_tables_paged``.
         self.paged_tables_on = False
+        #: ``paged_ctx_kv_store``: the worker stores a paged context's K/V of every drafter layer
+        #: with ``ctx_kv_store_paged``.
+        self.paged_store_on = False
         #: Reports a step a lever left to the path below it (``dispatch.Plan.declined``), or None.
         self.declined: Optional[Callable[..., None]] = None
 
@@ -1169,6 +1175,23 @@ class ContextKvForkDFlashWorker(DFlashWorker):
             return self._ctx_block_tables is not None
         return super()._refresh_ctx_block_tables(attn_metadata, num_seqs)
 
+    def _store_context_kv_paged(self, k, v, rows, positions) -> None:
+        fork: Optional[ContextKvFork] = self.__dict__.get("_kv_fork")
+        if (
+            fork is not None
+            and fork.paged_store_on
+            and _paged_store_fits(self, k, v, rows, positions)
+        ):
+            # ``paged_ctx_kv_store``: every drafter layer in one launch.
+            table = (
+                self._ctx_block_tables
+                if self._ctx_block_tables is not None
+                else self._ctx_page_table
+            )
+            ctx_kv_store_paged(k, v, rows, positions, table, self._ctx_page_size, self._ctx_kv_buf)
+            return
+        super()._store_context_kv_paged(k, v, rows, positions)
+
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
         fork: Optional[ContextKvFork] = self.__dict__.get("_kv_fork")
         if fork is not None:
@@ -1357,6 +1380,47 @@ PAGED_COMMIT_METHODS = (
 )
 
 
+def _paged_store_fits(worker, k, v, rows, positions) -> bool:
+    """Whether ``ctx_kv_store_paged`` takes this paged K/V store (``paged_ctx_kv_store``)."""
+    # The manager-bound pool's per-layer views (a list), or the private pool ([layers, ...]).
+    caches = worker._ctx_kv_buf
+    table = (
+        worker._ctx_block_tables if worker._ctx_block_tables is not None else worker._ctx_page_table
+    )
+    if v is None or table is None or caches is None or len(caches) == 0:
+        return False
+    if k.dim() != 4 or v.shape != k.shape:
+        return False
+    n, layers, heads, head_dim = k.shape
+    first = caches[0]
+    return (
+        1 <= layers <= STORE_MAX_LAYERS
+        and len(caches) == layers
+        and heads & (heads - 1) == 0
+        and head_dim & (head_dim - 1) == 0
+        and k.stride(3) == 1
+        and v.stride(3) == 1
+        and v.dtype == k.dtype
+        and rows.dtype == torch.int64
+        and positions.dtype == torch.int64
+        and rows.shape == (n,)
+        and positions.shape == (n,)
+        and rows.is_contiguous()
+        and positions.is_contiguous()
+        and table.dtype == torch.int32
+        and table.dim() == 2
+        and table.stride(1) == 1
+        and all(
+            cache.dim() == 5
+            and cache.dtype == k.dtype
+            and cache.shape[1:] == (2, heads, worker._ctx_page_size, head_dim)
+            and cache.stride() == first.stride()
+            for cache in caches
+        )
+        and first.stride(4) == 1
+    )
+
+
 def paged_commit_unsupported_reason(spec_worker) -> Optional[str]:
     """Why ``context_kv_commit_paged`` cannot stand in for this worker's paged commit, or None."""
     cls = type(spec_worker)
@@ -1437,6 +1501,7 @@ def install(
     declined: Optional[Callable[..., None]] = None,
     paged_commit: bool = False,
     paged_tables: bool = False,
+    paged_store: bool = False,
 ) -> None:
     """Install the fork on the DFlash worker, the target core and the LM head (``POINT``).
 
@@ -1449,9 +1514,10 @@ def install(
     (``windowed_commit_parallel``'s MIN_REQUESTS, None for off), ``late_join``
     (``context_kv_late_join``), ``declined`` (``dispatch.Plan.declined``) and ``paged_commit``
     (``paged_context_commit``: a paged context's commit in one launch; refused when the
-    worker's class overrides one of the methods it stands in for, ``PAGED_COMMIT_METHODS``)
-    and ``paged_tables`` (``paged_ctx_block_tables``: the side chain's decode of a paged
-    context's page table in two launches).
+    worker's class overrides one of the methods it stands in for, ``PAGED_COMMIT_METHODS``),
+    ``paged_tables`` (``paged_ctx_block_tables``: the side chain's decode of a paged
+    context's page table in two launches) and ``paged_store`` (``paged_ctx_kv_store``: a paged
+    context's K/V store of every drafter layer in one launch).
 
     Raises:
         ValueError: if the fork cannot be installed (the reason), so the
@@ -1486,6 +1552,7 @@ def install(
     fork.declined = declined
     fork.paged_commit_on = bool(paged_commit)
     fork.paged_tables_on = bool(paged_tables)
+    fork.paged_store_on = bool(paged_store)
     core._context_kv_fork = fork
     if point == "head":
         lm_head = llm.lm_head

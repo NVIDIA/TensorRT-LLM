@@ -1507,8 +1507,8 @@ def c55_plan(key, max_batch_size, arena) -> set:
     window compaction; any other arena leaves the compaction out. No served path builds on
     one of these names there, so each rule removes the name alone. Then the base paths added
     since, each beside the path it builds on: ``draft_head_sampled`` (``draft_head``),
-    ``rejection_fold`` (``verify_fold``), ``paged_context_commit`` and
-    ``paged_ctx_block_tables`` (``context_kv_fork``)."""
+    ``rejection_fold`` (``verify_fold``), ``paged_context_commit``,
+    ``paged_ctx_block_tables`` and ``paged_ctx_kv_store`` (``context_kv_fork``)."""
     paths = set(C55_SERVED[key])
     if max_batch_size is None or max_batch_size > 8:
         paths.discard("half_window_experts")
@@ -1524,6 +1524,7 @@ def c55_plan(key, max_batch_size, arena) -> set:
         ("rejection_fold", "verify_fold"),
         ("paged_context_commit", "context_kv_fork"),
         ("paged_ctx_block_tables", "context_kv_fork"),
+        ("paged_ctx_kv_store", "context_kv_fork"),
     ):
         if base in paths:
             paths.add(added)
