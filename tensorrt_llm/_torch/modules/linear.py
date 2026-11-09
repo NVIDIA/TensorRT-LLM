@@ -3182,23 +3182,27 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
         elm_packing = 2 if module.tp_mode == TensorParallelMode.COLUMN else 1
         load_weights_vanilla_helper(module, weights, elm_packing=elm_packing)
 
-        # Use the same device as the weight tensor
-        # as we register pre_quant_scale after sharded model weights are moved to respective gpus
-        device = module.weight.device
-        pre_quant_scale = module.load_shard(
-            weights[0]["pre_quant_scale"],
-            # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
-            flip_tp=True,
-            device=device,
-        )
+        pre_quant_scale = weights[0].get("pre_quant_scale")
+        if pre_quant_scale is not None:
+            # Use the device of the loaded weight for the activation scale.
+            device = module.weight.device
+            pre_quant_scale = module.load_shard(
+                pre_quant_scale,
+                # Activation scales shard along the input dimension.
+                flip_tp=True,
+                device=device,
+            )
 
-        module.pre_quant_scale = Parameter(
-            torch.ones((module.in_features, ), dtype=pre_quant_scale.dtype),
-            requires_grad=False).to(device=device)
+            module.pre_quant_scale = Parameter(
+                torch.ones((module.in_features, ), dtype=pre_quant_scale.dtype),
+                requires_grad=False).to(device=device)
+
+            copy_weight(module.pre_quant_scale, pre_quant_scale)
+        else:
+            module.pre_quant_scale = None
 
         weight_scale = self.load_weight_scales(module, weights)[0]
 
-        copy_weight(module.pre_quant_scale, pre_quant_scale)
         copy_weight(module.weight_scale, weight_scale.T.contiguous())
 
     def load_weights_fused_qkv_linear(self, module: Linear,
@@ -5187,18 +5191,19 @@ def is_static_nvfp4_input_eligible(linear) -> bool:
     eligible to have its input-quantize folded into a producing RMSNorm.
 
     Eligible iff the Linear quantizes activations to NVFP4, has a calibrated
-    (static) `input_scale`, has no AWQ `pre_quant_scale`, and is not forced to
-    dynamic quantization. This is the single canonical definition shared by
-    every NVFP4-fold site (the layer-boundary / dense folds in
-    modeling_deepseekv3.py and the q_a_layernorm -> q_b_proj fold in
-    attention.py's MLA) so the gate cannot drift between them.
+    (static) `input_scale`, has no AWQ `pre_quant_scale`, is not forced to
+    dynamic quantization, and accepts a pre-quantized input. This is the single
+    canonical definition shared by every NVFP4-fold site (the layer-boundary /
+    dense folds in modeling_deepseekv3.py and the q_a_layernorm -> q_b_proj fold
+    in attention.py's MLA) so the gate cannot drift between them.
     """
     if linear is None:
         return False
     return (getattr(linear, "has_nvfp4_activation_quantization", False)
             and not getattr(linear, "force_dynamic_quantization", False)
             and getattr(linear, "input_scale", None) is not None
-            and getattr(linear, "pre_quant_scale", None) is None)
+            and getattr(linear, "pre_quant_scale", None) is None
+            and not getattr(linear, "requires_unquantized_activation", False))
 
 
 def is_dynamic_nvfp4_input_eligible(linear) -> bool:
@@ -5215,6 +5220,7 @@ def is_dynamic_nvfp4_input_eligible(linear) -> bool:
 class NVFP4ARCLinearMethod(NVFP4LinearMethod):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
+    requires_unquantized_activation: ClassVar[bool] = True
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):

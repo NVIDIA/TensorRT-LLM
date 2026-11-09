@@ -520,36 +520,13 @@ void invokeMinimaxM3RouterGemv(__nv_bfloat16 const* x, int32_t ldx, int32_t m, i
     launchGemv<1>(x, ldx, m, k, w, e, out, qOut, sfOut, sfScale, pdl, stream);
 }
 
-void invokeMinimaxM3RouterTc(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int32_t k, float const* w, float* out,
-    uint8_t* qOut, uint8_t* sfOut, float const* sfScale, bool pdl, cudaStream_t stream)
+int minimaxM3RouterTcCluster(int32_t k)
 {
-    int64_t const M = m, K = k;
-    TLLM_CHECK_WITH_INFO(
-        M >= 1 && M <= kTcMaxM && K % (kTcSlices * 64) == 0, "unsupported router shape M=%d K=%d", m, k);
-    int const ks = K / kTcSlices;
-    auto launch_tc = [&](auto kernel, int cl) -> cudaError_t
-    {
-        int const kc = (kTcSlices / cl) * ks;
-        size_t const smem = static_cast<size_t>(kTcExperts) * (kc + 4) * 4 + static_cast<size_t>(M) * (kc + 8) * 2;
-        cudaLaunchConfig_t cfg = {};
-        cfg.gridDim = dim3(8 * cl);
-        cfg.blockDim = dim3(256);
-        cfg.dynamicSmemBytes = smem;
-        cfg.stream = stream;
-        cudaLaunchAttribute attr[2];
-        attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attr[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
-        attr[1].id = cudaLaunchAttributeClusterDimension;
-        attr[1].val.clusterDim.x = cl;
-        attr[1].val.clusterDim.y = 1;
-        attr[1].val.clusterDim.z = 1;
-        cfg.attrs = attr;
-        cfg.numAttrs = 2;
-        return cudaLaunchKernelEx(
-            &cfg, kernel, x, ldx, w, out, static_cast<int>(M), static_cast<int>(K), qOut, sfOut, sfScale);
-    };
-    // 16-CTA clusters (128 CTAs, one K slice each) when the device co-schedules all 8, else 8-CTA clusters.
-    static int const cluster = [&]()
+    // 16-CTA clusters (128 CTAs, one K slice each) when the device co-schedules all 8, else 8-CTA clusters; decided
+    // once per process (device-static, for the first K seen: MiniMax-M3 has one hidden size) and configures both
+    // kernels.
+    int const ks = k / kTcSlices;
+    static int const cluster = [ks]()
     {
         int device = 0, max_optin = 0;
         cudaGetDevice(&device);
@@ -592,6 +569,38 @@ void invokeMinimaxM3RouterTc(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int
         }
         return clusters >= 8 ? 16 : 8;
     }();
+    return cluster;
+}
+
+void invokeMinimaxM3RouterTc(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int32_t k, float const* w, float* out,
+    uint8_t* qOut, uint8_t* sfOut, float const* sfScale, bool pdl, cudaStream_t stream)
+{
+    int64_t const M = m, K = k;
+    TLLM_CHECK_WITH_INFO(
+        M >= 1 && M <= kTcMaxM && K % (kTcSlices * 64) == 0, "unsupported router shape M=%d K=%d", m, k);
+    int const ks = K / kTcSlices;
+    auto launch_tc = [&](auto kernel, int cl) -> cudaError_t
+    {
+        int const kc = (kTcSlices / cl) * ks;
+        size_t const smem = static_cast<size_t>(kTcExperts) * (kc + 4) * 4 + static_cast<size_t>(M) * (kc + 8) * 2;
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = dim3(8 * cl);
+        cfg.blockDim = dim3(256);
+        cfg.dynamicSmemBytes = smem;
+        cfg.stream = stream;
+        cudaLaunchAttribute attr[2];
+        attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
+        attr[1].id = cudaLaunchAttributeClusterDimension;
+        attr[1].val.clusterDim.x = cl;
+        attr[1].val.clusterDim.y = 1;
+        attr[1].val.clusterDim.z = 1;
+        cfg.attrs = attr;
+        cfg.numAttrs = 2;
+        return cudaLaunchKernelEx(
+            &cfg, kernel, x, ldx, w, out, static_cast<int>(M), static_cast<int>(K), qOut, sfOut, sfScale);
+    };
+    int const cluster = minimaxM3RouterTcCluster(k);
     cudaError_t const err
         = cluster == 16 ? launch_tc(m3_router_tc_kernel<16>, 16) : launch_tc(m3_router_tc_kernel<8>, 8);
     if (err != cudaSuccess)

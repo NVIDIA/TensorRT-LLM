@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
+from agent_flow.workflows.trtllm_modeling_v2.checks import test_results
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.sessions import SessionSpec
 from agent_flow.workflows.trtllm_modeling_v2.run import graph as g
@@ -584,23 +586,59 @@ def test_a_regression_check_waits_while_the_gates_are_busy(tmp_path):
     assert order[-1] == "r1" and len(order) >= 2
 
 
-def test_regression_runner_preserves_test_command_with_admissible_budget(tmp_path, monkeypatch):
+def test_regression_jobs_fit_the_gate_sessions_and_keep_the_test_budget(tmp_path, monkeypatch):
+    # Two-hour allocations handing over 30 min before their end: a two-hour job never starts.
     sessions = (
-        SessionSpec("gates", "/g", time_limit_s=7200, scheduler={"default_wall": "90m"}),
+        SessionSpec("gates", "/g", time_limit_s=7200, handover_lead_s=1800),
         SessionSpec("work", "/w", role="work", scheduler={"default_wall": "5m"}),
     )
-    env = RunEnvironment("session_spool", "python", sessions=sessions)
+    env = RunEnvironment("session_spool", "python", spool="/g", sessions=sessions)
     observed = []
 
     class Executor:
         def execute(self, request):
             observed.append(request)
-            return SimpleNamespace(returncode=0, stdout="complete", stderr="")
+            return SimpleNamespace(
+                returncode=0, stdout="MV2FLOW_TEST_ENV 0123456789abcdef\n", stderr=""
+            )
 
     monkeypatch.setattr(regression, "select_command_executor", lambda *args, **kwargs: Executor())
     wf = SimpleNamespace(task_data={"trtllm_repo_path": str(tmp_path)}, _gate_env=lambda: env)
-    _, run, _ = regression.job_runner(wf, "regression")
-    command = "python test_driver.py --selection full-package.txt"
-    assert run(command, tmp_path) == (0, "complete")
-    assert observed[0].argv == command and observed[0].timeout_s == 5400
-    assert regression.PACKAGE_TESTS and regression.MAX_JOBS == 3
+    tree_at, run, python = regression.job_runner(wf, "regression")
+    files = [f"tests/test_{i}.py" for i in range(6)]
+
+    def recorded(cache, commit, env_digest=""):
+        # Each test job finishes one file before its wall limit.
+        done = files[: max(0, len(observed) - 1)]
+        return test_results.Results(commit, env_digest, {f: {"outcome": "passed"} for f in done})
+
+    monkeypatch.setattr(test_results, "recorded", recorded)
+    results, jobs, _, _ = regression.record_at(
+        "c0ffee",
+        files,
+        cache_dir=tmp_path,
+        out=tmp_path,
+        tree_at=tree_at,
+        run_job=run,
+        python=python,
+    )
+    # The probe is short, and the three two-hour jobs' budget is four 90-minute ones.
+    assert [r.timeout_s for r in observed] == [regression.PROBE_TIMEOUT_S, *[5400] * 4]
+    assert jobs == 4 and results.unrun(files) == files[4:]
+    assert "--selection" in observed[1].argv
+    # A shorter declared default wall bounds the window; off a spool a job runs two hours.
+    walled = SessionSpec(
+        "g", "/g", time_limit_s=7200, handover_lead_s=1800, scheduler={"default_wall": "75m"}
+    )
+    walled_env = RunEnvironment("session_spool", "p", spool="/g", sessions=(walled,))
+    assert regression.job_timeout(walled_env) == 4500
+    assert regression.job_timeout(RunEnvironment("local", "p")) == regression.JOB_TIMEOUT_S
+    # Only the sessions gate jobs reach size them: a longer `work` session on another spool
+    # never receives one, while an `any` session on its own spool does.
+    longer = SessionSpec("other", "/o", role="work", time_limit_s=4 * 3600, handover_lead_s=600)
+    both = RunEnvironment("session_spool", "p", spool="/g", sessions=(walled, longer))
+    assert regression.job_timeout(both) == 4500
+    shared = replace(longer, role="any")
+    pooled = RunEnvironment("session_spool", "p", spool="/g", sessions=(walled, shared))
+    assert regression.job_timeout(pooled) == regression.JOB_TIMEOUT_S
+    assert regression.max_jobs(regression.JOB_TIMEOUT_S) == 3
