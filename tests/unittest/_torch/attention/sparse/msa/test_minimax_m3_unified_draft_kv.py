@@ -408,6 +408,55 @@ def test_unified_target_capacity_matches_a_separate_draft_pool() -> None:
     assert unified_tokens >= 0.95 * whole_quota_tokens
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+def test_max_tokens_quota_pays_for_the_index_k_pages() -> None:
+    """The profiling pass's max_tokens buys the warmup's longest request with hosted draft specs.
+
+    Specs carry K/V and scales only; the sparse layer's index-K shares its pages, so a quota that
+    left it out would cut the longest CUDA-graph warmup request short of max_seq_len.
+    """
+    torch.cuda.init()
+    tokens_per_block, max_seq_len, max_batch_size = 128, 1 << 16, 2
+    # _get_token_num_for_estimation: one max_seq_len request plus one block per other request.
+    blocks = -(-(max_seq_len + 1) // tokens_per_block) + max_batch_size - 1
+    manager = MiniMaxM3KVCacheManagerV2(
+        KvCacheConfig(
+            max_tokens=blocks * tokens_per_block,
+            max_gpu_total_bytes=1 << 30,
+            avg_seq_len=max_seq_len,
+            host_cache_size=0,
+            enable_block_reuse=False,
+            enable_swa_scratch_reuse=False,
+        ),
+        CacheType.SELF,
+        num_layers=NUM_TARGET,
+        num_kv_heads=HEADS,
+        head_dim=HEAD_DIM,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        max_num_tokens=256,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.NVFP4,
+        vocab_size=16,
+        sparse_attention_config=MiniMaxM3SparseAttentionConfig(
+            implementation="msa", indexer_kv_dtype="fp8"
+        ),
+        layer_specs=_specs(),
+        is_disagg=True,
+    )
+    try:
+        assert manager.sparse_layer_ids  # Index-K pages exist.
+        assert (
+            manager.get_num_available_tokens(
+                token_num_upper_bound=max_seq_len, batch_size=max_batch_size
+            )
+            == max_seq_len
+        )
+    finally:
+        manager.shutdown()
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("pp_size", [1, 2])
 def test_window_sized_draft_ratio(pp_size: int) -> None:

@@ -3388,8 +3388,18 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_runtime_cache_size_layer_components(self) -> tuple[List[int], List[Optional[int]]]:
         if self.layer_specs is not None:
+            # A spec covers K/V and scales; the manager's extra buffers (e.g. MiniMax-M3's
+            # index-K) share the layer's pages, so they cost the same tokens.
+            extra_buffers = (
+                self._extra_buffers_per_layer(tokens_per_block=self.tokens_per_block) or {}
+            )
             return (
-                [layer.bytes_per_token() for layer in self.layer_specs],
+                [
+                    layer.bytes_per_token()
+                    + sum(buffer.size for buffer in extra_buffers.get(local_layer_id, ()))
+                    // self.tokens_per_block
+                    for local_layer_id, layer in enumerate(self.layer_specs)
+                ],
                 list(self.max_attention_window_vec),
             )
         layer_sizes = []

@@ -2206,12 +2206,14 @@ def _fp8_target_bf16_draft_specs(*, draft_window):
     ]
 
 
-def test_unified_fp8_target_bf16_draft_scales_by_combined_pool_groups():
-    """The V2 pool-group count comes from the combined target and draft layout.
+@pytest.mark.parametrize("target_window", [None, 64])
+def test_unified_estimation_scales_by_target_pool_groups_only(target_window: int | None) -> None:
+    """Hosted draft layers do not scale the dummy workload; the target's own groups do.
 
-    The FP8 target and the windowed BF16 draft differ in life cycle and slot
-    size, so they land in two pool groups; counting the target's model config
-    alone gives one.
+    The FP8 target and the windowed BF16 draft land in two pool groups, but the
+    quota from max_tokens already charges the draft lifecycle its pages, as a
+    separate draft pool's quota would. A windowed target layer is a second
+    target group and still doubles the workload.
     """
     tpb = 32
     spec_config = SimpleNamespace(
@@ -2224,10 +2226,17 @@ def test_unified_fp8_target_bf16_draft_scales_by_combined_pool_groups():
     unified = _make_creator(tpb, [_make_mock_request(128)], False, 1)
     unified._speculative_config = spec_config
     specs = _fp8_target_bf16_draft_specs(draft_window=128)
+    specs[0] = replace(specs[0], sliding_window_size=target_window)
+    # Fewer draft heads keep the draft pages apart from either target group's.
+    specs[-1] = replace(specs[-1], num_kv_heads=2)
     unified._build_unified_dflash_layer_specs = lambda kv_cache_config: tuple(specs)
+    target_groups = 1 if target_window is None else 2
 
-    assert _get_num_storage_pool_groups(specs, tpb) == 2
-    assert unified._get_token_num_for_estimation() == 2 * baseline._get_token_num_for_estimation()
+    assert _get_num_storage_pool_groups(specs, tpb) == target_groups + 1
+    assert (
+        unified._get_token_num_for_estimation()
+        == target_groups * baseline._get_token_num_for_estimation()
+    )
 
 
 def test_unified_fp8_target_bf16_draft_in_one_life_cycle_is_one_pool_group():

@@ -1741,10 +1741,14 @@ class KvCacheCreator:
             unified_layer_specs = self._build_unified_dflash_layer_specs(
                 self._kv_cache_config)
             if unified_layer_specs:
-                # Target and draft layers can differ in page size and life
-                # cycle, so the group count comes from the combined layout.
-                num_pool_groups = _get_num_storage_pool_groups(
-                    unified_layer_specs, self._tokens_per_block)
+                # The dummy workload is the target's. The quota from max_tokens
+                # already charges the draft lifecycles their own pages (a window
+                # per request, or every token), as a separate draft pool's quota
+                # would, so only the target's groups scale it.
+                num_pool_groups = _get_num_storage_pool_groups([
+                    spec for spec in unified_layer_specs
+                    if spec.owner is KVCacheLayerOwner.TARGET
+                ], self._tokens_per_block)
             else:
                 model_cfg = self._model_engine.model.model_config
                 num_pool_groups = _get_num_pool_groups_for_estimation(
