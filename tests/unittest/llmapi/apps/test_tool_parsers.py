@@ -7888,6 +7888,12 @@ _GLM_SCHEMAS.update({
     "$ref array index, past the end": {
         "$ref": "#/$defs/Choices/anyOf/-"
     },
+    "$ref array index, superscript digit": {
+        "$ref": "#/$defs/Choices/anyOf/²"
+    },
+    "$ref array index, non-ASCII decimal digit": {
+        "$ref": "#/$defs/Choices/anyOf/٠"
+    },
 })
 
 # Declared strings, and values with no resolvable type, are delivered verbatim,
@@ -7957,6 +7963,8 @@ _GLM_TYPED_VALUES += [
     ('{"a": 1}', "$ref array index, leading zero", '{"a": 1}'),
     ('{"a": 1}', "$ref array index, out of range", '{"a": 1}'),
     ('{"a": 1}', "$ref array index, past the end", '{"a": 1}'),
+    ('{"a": 1}', "$ref array index, superscript digit", '{"a": 1}'),
+    ('{"a": 1}', "$ref array index, non-ASCII decimal digit", '{"a": 1}'),
 ]
 
 _GLM_VALUES = sorted({row[0] for row in _GLM_TYPED_VALUES})

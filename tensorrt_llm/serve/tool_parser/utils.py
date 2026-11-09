@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import itertools
 import json
+import re
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Dict, Iterator, Optional
@@ -64,6 +65,9 @@ def is_complete_json(input_str: str) -> bool:
 # cycle, or fanning out, still resolve in bounded time.
 _MAX_REFS_FOLLOWED = 32
 
+# A JSON pointer token that indexes an array (RFC 6901, section 4).
+_ARRAY_INDEX = re.compile(r"0|[1-9][0-9]*")
+
 
 def _resolve_local_ref(ref: Any, root: Any) -> Any:
     """The subschema of `root` named by a local reference like ``#/$defs/X``.
@@ -94,9 +98,10 @@ def _resolve_local_ref(ref: Any, root: Any) -> Any:
                 return None
             node = node[token]
         elif isinstance(node, list):
-            # An array index is "0" or digits without a leading zero (RFC 6901,
-            # section 4); "-" and out-of-range indices name nothing.
-            if not (token == "0" or (token.isdigit() and token[0] != "0")):
+            # An array index is "0" or ASCII digits without a leading zero
+            # (RFC 6901, section 4); "-", other digit characters such as "²",
+            # and out-of-range indices name nothing.
+            if not _ARRAY_INDEX.fullmatch(token):
                 return None
             index = int(token)
             if index >= len(node):
