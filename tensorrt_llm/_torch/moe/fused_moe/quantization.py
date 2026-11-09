@@ -5421,8 +5421,7 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         """Hand MegaMoE-format CPU staging tensors to the load balancer,
         then drop the module attrs so they do not double-keep the host memory.
 
-        Per the trtllm-moe-develop "CPU shared-staging buffer family"
-        rules, each per-expert ``nn.Parameter`` on the module must have
+        Each per-expert ``nn.Parameter`` on the module must have
         a corresponding CPU staging tensor in the ``weight_fns`` dict
         passed to ``register_all_parameter_slot_and_to_fix_weight_fns``;
         otherwise the load balancer either crashes on the first

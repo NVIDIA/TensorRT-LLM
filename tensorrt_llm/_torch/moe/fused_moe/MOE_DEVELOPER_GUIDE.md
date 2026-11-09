@@ -380,6 +380,14 @@ being replaced: do not add tests there. A test that needs no GPU carries the
 `cpu_only` mark, which is what the CPU stage collects; `tests/AGENTS.md` says
 which CI list runs a test.
 
+Selection as a model configures it is tested outside this directory, under
+`tests/unittest/_torch/`: `test_model_config.py` (the literal a tactic settles,
+`ModelConfig.copy_with`), `modeling/test_modeling_speculative.py` (draft
+selection), `modeling_v2/test_modeling_v2_routing.py` (`moe_impls_honored`),
+and the tests of the models that re-point layers
+(`models/test_qwen3_next_moe_quant.py`,
+`modeling/test_musespark_open_moe_finalize_hook.py`).
+
 ## Implementation Families
 
 A `moe_backend` literal names one family (`BACKEND_FAMILY`); a tactic can pin
@@ -1147,6 +1155,15 @@ set wrong has a test that catches it:
 - `FUSED_COMM` backends (`DeepgemmCudaW4a8Mxfp4Mxfp8Impl`, `TrtllmCutedslMegaMoeNvfp4Impl`) **must not** layer host-side `Communication.dispatch` / `.combine` on top of the fused kernel — `ConfigurableMoE._create_comm_strategy_auto` returns `None` for them.
 - `FusedCommMoEScheduler` calls `backend.quantize_input(...)` for every chunk including zero-token chunks (so peer ranks can cross the in-kernel NVLink barrier). Each fused-comm backend therefore MUST make `quantize_input` tolerate `x.shape[0] == 0` and return its own empty tensor layout; the scheduler does NOT synthesize backend-specific empty tensors.
 - Dynamic EPLB requires backend and quantization-method support; backends gate wrapper-level constraints in `validate_configurable_moe`. `MegaMoEDeepGemm` routes to slot IDs and migrates the transformed DG weights its quantization method registers (`num_slots % ep_size == 0`). `TrtllmCutedslMegaMoeNvfp4Impl` declares `supports_eplb=True`; its quantization method registers the MegaMoE-format derived params and `fc1_norm_const` with the load balancer alongside the raw NVFP4 family, so per-slot migration stays byte-consistent.
+- Online EPLB migrates an expert from a host copy, so an EPLB-supporting
+  quantization method keeps one for every per-expert tensor its kernels read,
+  scales and alphas included. The copy covers
+  `layer_load_balancer.get_load_expert_ids()` and is indexed by position in that
+  list, which on a multi-node run can be longer than the local slots, and it is
+  registered in the `weight_fns` passed to
+  `register_all_parameter_slot_and_to_fix_weight_fns`. A tensor left out keeps
+  the previous expert's values after a migration, with no error; extend
+  `tests/unittest/_torch/moe/test_w4a16_nvfp4_eplb.py` for a new one.
 - `FUSED_COMM` backends use `ignore_allreduce=False` for EPLB statistic update because the fused kernel AllReduces routing stats internally.
 - Per-layer dynamic EPLB uses `MoeConfig.load_balancer.mode=per_layer_dynamic` with
   `num_slots` greater than the model expert count. Backend resolution selects
@@ -1338,7 +1355,8 @@ their real class name.
 - **Do NOT skip `can_implement()` checks** — Every backend must declare what it supports; an unsupported combination returns `MoEEligibility.no(MoERejectReason.<CODE>, detail)`, never a bare `False` and never a free-form string a test would have to pattern-match
 - **Do NOT probe the machine inside `can_implement()`** — No `get_sm_version()`, no `import` as a presence test, no `os.environ`. Read `d.env`; add the probe to `impl_environment.py` if it does not exist yet
 - **Do NOT gate an activation on a class name** — No `isinstance`, no `moe_cls in [...]`, no ad-hoc `swiglu_gptoss_style` branch in a factory. A backend states what its kernels execute in `activation_support`; `_reject_unsupported_activation` reads that declaration for every candidate, and `materialize_activation_params` enforces it again at construction
-- **Do NOT add a second selection entry point** — `resolve_moe_impl` is the only one. A helper that picks a class on the side is how `get_moe_cls` and the old `resolve_moe_cls` drifted apart in the first place
+- **Do NOT add a second selection entry point** — `resolve_moe_impl` is the only one; `resolve_moe_cls` just returns the class of its winner. A helper that picks a class on the side is how `get_moe_cls` and an earlier `resolve_moe_cls` drifted apart in the first place
+- **Do NOT branch new model code on the `moe_backend` literal** — Under a tactic the literal is only the family the tactic settles for the whole checkpoint, not what a given layer runs, and settling it per layer needs every reader to move to the resolved implementation (see [Backend Selection](#backend-selection)). Ask `resolve_moe_cls` with the arguments the layer passes to `create_moe`, and test a family with `issubclass`
 - **Do NOT substitute a backend without recording it** — A degradation must be visible in the `MoEResolutionReport`, not only in a log line
 - **Do NOT pick `scheduler_kind` opportunistically** — Use `EXTERNAL_COMM` (default) unless your backend's fused kernel genuinely owns cross-rank exchange via SymmBuffer / equivalent in-kernel collective; `FUSED_COMM` brings hard invariants (no host comm, lockstep launches, no multi-stream overlap)
 - **Schedulers MUST NOT write `moe.repeat_idx`** — `repeat_idx` is wrapper state advanced once per `forward_impl` regardless of chunk count
