@@ -1104,6 +1104,11 @@ def is_local_media_url(url: str) -> bool:
 # memory and decoded from bytes.
 _DESCRIPTOR_DIR = next((d for d in ("/proc/self/fd", "/dev/fd") if os.path.isdir(d)), None)
 
+# A directory where ``readlink`` on a descriptor's entry gives the location of
+# the open file. ``None`` where the platform has none; `open_allowed_local_media`
+# then skips its post-open location check.
+_FD_LINK_DIR = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else None
+
 
 def open_allowed_local_media(url: str) -> int:
     """Open a request-supplied local media reference; return its read-only descriptor.
@@ -1158,17 +1163,19 @@ def open_allowed_local_media(url: str) -> int:
         raise ValueError(f"Local media file could not be read: {url!r}") from exc
     try:
         stat = os.fstat(fd)
-        if not S_ISREG(stat.st_mode):
-            raise ValueError(f"Local media path is not a regular file: {url!r}")
-        _check_media_size(stat.st_size, _MAX_RESPONSE_BYTES)
         # The containment check above looked at the path; this one looks at
         # the file that was opened. O_NOFOLLOW guards only the last component,
         # so a directory on the path that became a symlink in between was
-        # followed, and the open file then lies outside the root.
-        if _DESCRIPTOR_DIR == "/proc/self/fd":
-            opened = os.readlink(f"{_DESCRIPTOR_DIR}/{fd}")
+        # followed, and the open file then lies outside the root. It runs
+        # before the type and size checks, so a file outside the root gets the
+        # same refusal whatever it is.
+        if _FD_LINK_DIR is not None:
+            opened = os.readlink(f"{_FD_LINK_DIR}/{fd}")
             if not os.path.isabs(opened) or os.path.commonpath([root, opened]) != root:
                 raise refused
+        if not S_ISREG(stat.st_mode):
+            raise ValueError(f"Local media path is not a regular file: {url!r}")
+        _check_media_size(stat.st_size, _MAX_RESPONSE_BYTES)
     except OSError as exc:
         os.close(fd)
         raise ValueError(f"Local media file could not be read: {url!r}") from exc

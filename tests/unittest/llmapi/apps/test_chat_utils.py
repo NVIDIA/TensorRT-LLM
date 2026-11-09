@@ -1093,6 +1093,42 @@ class TestRequestLocalMediaPaths:
             await self._load(f"file://{sub}/img.png")
 
     @pytest.mark.asyncio
+    @pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="the check reads /proc/self/fd")
+    @pytest.mark.parametrize("descriptor_dir", ["/proc/self/fd", None])
+    async def test_a_non_regular_file_outside_the_root_gets_the_location_refusal(
+        self, monkeypatch, media_dirs, descriptor_dir
+    ):
+        """A file reached through a swapped directory is refused for its location.
+
+        The refusal is the same whatever the file is, and whichever way decoders
+        reach the descriptor.
+        """
+        import posixpath
+
+        from tensorrt_llm.inputs import media_io
+
+        allowed, other = media_dirs
+        monkeypatch.setenv(self._ENV, str(allowed))
+        monkeypatch.setattr(media_io, "_DESCRIPTOR_DIR", descriptor_dir)
+        sub = allowed / "sub"
+        sub.mkdir()
+        (sub / "pipe.png").write_bytes(b"")
+        os.mkfifo(other / "pipe.png")
+        target = os.path.realpath(sub / "pipe.png")
+        real_realpath = os.path.realpath
+
+        def realpath_then_swap(path, *args, **kwargs):
+            resolved = real_realpath(path, *args, **kwargs)
+            if resolved == target and not sub.is_symlink():
+                os.rename(sub, allowed / "sub.moved")
+                os.symlink(other, sub)
+            return resolved
+
+        monkeypatch.setattr(posixpath, "realpath", realpath_then_swap)
+        with pytest.raises(ValueError, match="Local media paths are not accepted"):
+            await self._load(f"file://{sub}/pipe.png")
+
+    @pytest.mark.asyncio
     async def test_fifo_refused_without_blocking(self, monkeypatch, media_dirs):
         allowed, _ = media_dirs
         monkeypatch.setenv(self._ENV, str(allowed))
