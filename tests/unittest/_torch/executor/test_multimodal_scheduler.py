@@ -617,6 +617,7 @@ def test_terminate_request_releases_partial_multimodal_encoder_state():
     executor._disagg_coordinator = Mock()
     executor.gather_all_responses = False
     executor.dist = SimpleNamespace(rank=1)
+    executor.enable_attention_dp = False
 
     executor._do_terminate_request(request)
 
