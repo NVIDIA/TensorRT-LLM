@@ -40,7 +40,7 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MTPDecodingConfig
 
 from ...conftest import llm_models_root
-from ..accuracy_core import GSM8K, LlmapiAccuracyTestHarness
+from ..accuracy_core import GSM8K, LlmapiAccuracyTestHarness, assert_acceptance_length_for_llm
 from ._env import scoped_env_overrides
 
 _MODEL_NAME = "zai-org/GLM-5.3-Flash"
@@ -48,7 +48,7 @@ _MODEL_PATH = f"{llm_models_root()}/GLM-5.3-Flash-NVFP4"
 
 
 @contextmanager
-def _llm(model_path: str, speculative_config=None) -> Iterator[LLM]:
+def _llm(model_path: str, speculative_config=None, **llm_kwargs) -> Iterator[LLM]:
     """The engine at TP4/EP4, with the targets' step contract checked on the ranks."""
     with (
         scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
@@ -67,6 +67,7 @@ def _llm(model_path: str, speculative_config=None) -> Iterator[LLM]:
             disable_mm_encoder=True,
             speculative_config=speculative_config,
             env_overrides=rank_env,
+            **llm_kwargs,
         ) as llm,
     ):
         yield llm
@@ -114,5 +115,15 @@ class TestModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused(LlmapiAccuracyTestHarnes
     MODEL_PATH = _MODEL_PATH
 
     def test_gsm8k_mtp(self) -> None:
-        with _llm(self.MODEL_PATH, MTPDecodingConfig(max_draft_len=3)) as llm:
+        # Strict acceptance keeps GSM8K unchanged even when every draft is rejected, so the
+        # acceptance length is what shows the draft chain works.
+        with _llm(
+            self.MODEL_PATH,
+            MTPDecodingConfig(max_draft_len=3),
+            max_stats_len=-1,
+            enable_iter_perf_stats=True,
+        ) as llm:
             GSM8K(self.MODEL_NAME).evaluate(llm)
+            assert_acceptance_length_for_llm(
+                "TestModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused::test_gsm8k_mtp", llm
+            )

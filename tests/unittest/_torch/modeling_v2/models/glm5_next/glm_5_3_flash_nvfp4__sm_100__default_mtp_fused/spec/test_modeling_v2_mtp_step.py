@@ -67,7 +67,6 @@ class _Metadata:
         self.padded_num_tokens = None
         self.spec_decoding_packed_mask = None
         self.spec_decoding_position_offsets = None
-        self.spec_decoding_position_offsets_cpp = None
         self.spec_decoding_generation_lengths = None
         self.use_spec_decoding = True
         self.enable_flash_mla = False
