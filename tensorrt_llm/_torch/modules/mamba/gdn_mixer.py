@@ -774,8 +774,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         layer_cache = kv_cache_manager.mamba_layer_cache(self.layer_idx)
         if layer_cache is None or layer_cache.intermediate_conv_window is None:
             return None
-        state_indices = attn_metadata.mamba_metadata.state_indices[:num_decodes]
-        replay_indices = attn_metadata.mamba_metadata.replay_state_indices[:num_decodes]
+        mamba_metadata = attn_metadata.mamba_metadata
+        state_indices = mamba_metadata.state_indices[:num_decodes]
+        # Metadata without replay slots of their own addresses the history by the state slots.
+        replay_indices = getattr(
+            mamba_metadata, "replay_state_indices", mamba_metadata.state_indices
+        )[:num_decodes]
         if not (
             _FUSED_VERIFY_MIN_TOKENS <= draft_token_num <= _FUSED_VERIFY_MAX_TOKENS
             and replay_metadata.replay_history_size == _FUSED_VERIFY_HISTORY
@@ -1737,9 +1741,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         ssm_states = layer_cache.temporal
 
         state_indices_p, state_indices_d = torch.split(state_indices, batch_split_size)
-        replay_state_indices_d = mamba_metadata.replay_state_indices[
-            num_prefills : num_prefills + num_decodes
-        ]
+        # Metadata without replay slots of their own addresses the history by the state slots.
+        replay_state_indices_d = getattr(
+            mamba_metadata, "replay_state_indices", mamba_metadata.state_indices
+        )[num_prefills : num_prefills + num_decodes]
         if num_prefills > 0:
             # PyExecutor guarantees prefill requests are placed before decode requests
             has_initial_states_p = has_initial_states[:num_prefills]
