@@ -755,6 +755,7 @@ class MockPadDummyExecutor:
         self.num_fetch_requests = num_fetch_requests
         self.benchmark_req_queues_size = benchmark_req_queues_size
         self.max_total_draft_tokens = 0
+        self.max_beam_width = 1
         self._adp_dummy_is_gen = True
         self._pending_adp_dummy_request = None
         self._enable_adp_dummy_fixes = True
