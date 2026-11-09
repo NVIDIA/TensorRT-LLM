@@ -1,7 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import pytest
 import torch
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi import serialization
+from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy
 
 pytestmark = pytest.mark.cpu_only
 
@@ -10,6 +15,22 @@ class TestClass:
 
     def __init__(self, name: str):
         self.name = name
+
+
+@pytest.mark.parametrize("policy", list(CheckpointIOPolicy))
+def test_checkpoint_enums_round_trip(policy: CheckpointIOPolicy) -> None:
+    # Each CheckpointIOPolicy member, plus one CheckpointFormat member to check
+    # that CheckpointFormat is an approved class too.
+    payload = {
+        "checkpoint_io_policy": policy,
+        "checkpoint_format": CheckpointFormat.MISTRAL,
+    }
+    restored = serialization.loads(
+        serialization.dumps(payload),
+        approved_imports=serialization.BASE_EXAMPLE_CLASSES,
+    )
+    assert restored["checkpoint_io_policy"] is policy
+    assert restored["checkpoint_format"] is CheckpointFormat.MISTRAL
 
 
 def test_serialization_allowed_class():

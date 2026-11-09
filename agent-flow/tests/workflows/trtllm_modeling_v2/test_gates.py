@@ -61,6 +61,9 @@ from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as c
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import regression
 from agent_flow.workflows.trtllm_modeling_v2.run.validation.check_runner import CheckRunner
 from agent_flow.workflows.trtllm_modeling_v2.run.validation.completion import (
+    target_test_modules_check as target_tests,
+)
+from agent_flow.workflows.trtllm_modeling_v2.run.validation.completion import (
     tests_check as delivered_tests,
 )
 from agent_flow.workflows.trtllm_modeling_v2.spec import task_schema
@@ -1515,6 +1518,25 @@ def test_delivery_runs_the_delivered_tests_at_head_and_holds_on_their_passing(
     assert not check.passed and check.detail.startswith("FAILING")
 
 
+def test_delivery_counts_the_targets_test_modules_and_warns_past_twenty(tmp_path):
+    """An onboarded target arrived with 35 test modules, past what a reviewer accepts."""
+    target = f"{catalog_paths.MODELING_V2_PACKAGE}/models/fam/target"
+    tests = tmp_path / catalog_paths.model_ops_tests_dir(target)
+    (tests / "attention").mkdir(parents=True)
+    (tests / "_helpers.py").write_text("x = 1\n")
+    for n in range(20):
+        (tests / "attention" / f"test_modeling_v2_op{n}.py").write_text("def test_a():\n    pass\n")
+    check = target_tests(tmp_path, target)
+    assert check.passed and check.detail.startswith("20 test module(s), 40 lines")
+    assert "WARNING" not in check.detail
+    (tests / "test_forward.py").write_text("def test_b():\n    pass\n")
+    check = target_tests(tmp_path, target)
+    assert check.passed, "the budget never blocks delivery"
+    assert check.detail.startswith("21 test module(s)")
+    assert "WARNING: more than the 20 a reviewer accepts" in check.detail
+    assert target_tests(tmp_path, f"{catalog_paths.MODELING_V2_PACKAGE}/models/fam/other") is None
+
+
 _requires_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not available")
 
 
@@ -1599,7 +1621,7 @@ def _check(repo: Path, workspace: Path, head: str, root: Path):
         finally:
             _git(repo, "worktree", "remove", "--force", str(tree))
 
-    def run_job(command, tree):
+    def run_job(command, tree, timeout_s=None):
         ran.append(command)
         return _run(command)
 
@@ -1635,11 +1657,34 @@ def test_environment_change_cannot_reuse_a_pass_and_probe_failure_is_incomplete(
         cache_dir=workspace / tc.CACHE_DIRNAME,
         out=tmp_path / "failed-probe",
         tree_at=lambda commit: contextlib.nullcontext(repo),
-        run_job=lambda command, tree: (1, "unavailable"),
+        run_job=lambda command, tree, timeout_s=None: (1, "unavailable"),
         python=sys.executable,
     )
     assert not results.env_digest and results.unrun(["tests/test_a.py"])
     assert jobs == 0 and code == 1 and "environment probe failed" in tail
+
+
+@_requires_git
+def test_a_test_that_fails_at_the_base_is_not_run_at_a_later_head(tmp_path):
+    """Kimi-K3's 4-GPU cases time out at the base too: each head paid 54 min for no signal."""
+    repo, workspace, base = _regression_repo(tmp_path)
+    cache = workspace / tc.CACHE_DIRNAME
+    _run(f"{sys.executable} {drv.__file__} run --cache {cache} --repo {repo} tests/test_broken.py "
+         "-- -q -p no:cacheprovider")  # fmt: skip
+    (repo / "pkg" / "mod.py").write_text(
+        "def f():\n    return 1  # same answer\n", encoding="utf-8"
+    )
+    _git(repo, "commit", "-qam", "shared change")
+    head = _git(repo, "rev-parse", "HEAD")
+
+    result, ran = _check(repo, workspace, head, tmp_path)
+
+    assert result.verdict == "CLEAN", result.failures
+    assert "1 test(s) failing at the base not run" in result.scope
+    at_head = tc.recorded(cache, head)
+    assert at_head.result("tests/test_a.py::test_f").outcome == "passed"
+    assert at_head.result("tests/test_broken.py::test_broken") is None
+    assert len(ran) == 2, "the probe and one test job at the head; nothing at the base"
 
 
 @_requires_git
@@ -1681,6 +1726,100 @@ def test_a_change_reaches_the_tests_that_import_it_through_other_files(tmp_path)
         f"{tests}/test_modeling_v2_claims.py",
     ]
     assert why == "4 of 5 test files reach what changed"
+
+
+@_requires_git
+def test_a_target_init_reaches_its_importers_and_integration_changes_reach_none(tmp_path):
+    """A target's ``__init__.py`` reaches the tests importing its modules, not the package."""
+    repo = tmp_path / "repo"
+    models, tests = f"{regression.MODELING_V2_PACKAGE}/models", regression.CATALOG_TESTS_DIR
+    dotted = models.replace("/", ".")
+    files = {
+        f"{models}/fam/__init__.py": "",
+        f"{models}/fam/tgt/__init__.py": '"""A target."""\n',
+        f"{models}/fam/tgt/modeling.py": "X = 1\n",
+        f"{models}/other/__init__.py": "",
+        f"{models}/other/tgt/__init__.py": "",
+        f"{models}/other/tgt/modeling.py": "Y = 1\n",
+        f"{tests}/models/fam/tgt/test_modeling.py": f"import {dotted}.fam.tgt.modeling\n",
+        f"{tests}/models/other/tgt/test_modeling.py": f"from {dotted}.other.tgt import modeling\n",
+        f"{tests}/test_modeling_v2_claims.py": "",
+        "tests/integration/defs/test_fam.py": "Z = 1\n",
+    }
+    for path, content in files.items():
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(content, encoding="utf-8")
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    listed = sorted(p for p in files if p.startswith(tests) and "/test_" in p)
+    head = _commit(
+        repo,
+        base,
+        {
+            f"{models}/fam/tgt/__init__.py": '"""The target."""\n',
+            f"{tests}/models/fam/tgt/__init__.py": "",
+        },
+    )
+    picked, why = regression.affected_files(repo, base, head, listed)
+    assert picked == [
+        f"{tests}/models/fam/tgt/test_modeling.py",
+        f"{tests}/test_modeling_v2_claims.py",
+    ]
+    assert why == "2 of 3 test files reach what changed"
+    only_integration = _commit(repo, head, {"tests/integration/defs/test_fam.py": "Z = 2\n"})
+    picked, why = regression.affected_files(repo, head, only_integration, listed)
+    assert picked == [f"{tests}/test_modeling_v2_claims.py"]
+    assert "no unit test reaches what changed" in why
+    shared = _commit(repo, only_integration, {f"{models}/__init__.py": "W = 1\n"})
+    picked, why = regression.affected_files(repo, only_integration, shared, listed)
+    assert picked == listed and "is shared by the package" in why
+
+
+@_requires_git
+def test_a_target_imported_in_a_function_reaches_its_routing_tests_not_the_package(tmp_path):
+    """``models/__init__`` imports every routing; a routing imports its targets when called."""
+    repo = tmp_path / "repo"
+    models, tests = f"{regression.MODELING_V2_PACKAGE}/models", regression.CATALOG_TESTS_DIR
+    dotted = models.replace("/", ".")
+    files = {
+        f"{models}/__init__.py": "from .fam import routing\nfrom .other import routing as o\n",
+        f"{models}/fam/__init__.py": "",
+        f"{models}/fam/routing.py": (
+            "import torch\n\n\ndef pick():\n    from .tgt.modeling import Model\n    return Model\n"
+        ),
+        f"{models}/fam/tgt/__init__.py": "",
+        f"{models}/fam/tgt/modeling.py": "class Model:\n    pass\n",
+        f"{models}/other/__init__.py": "",
+        f"{models}/other/routing.py": "X = 1\n",
+        f"{models}/other/tgt/__init__.py": "",
+        f"{models}/other/tgt/modeling.py": "Y = 1\n",
+        f"{tests}/models/fam/test_routing.py": f"from {dotted}.fam import routing\n",
+        f"{tests}/models/fam/tgt/test_modeling.py": f"from {dotted}.fam.tgt.modeling import Model\n",
+        f"{tests}/models/other/tgt/test_modeling.py": f"from {dotted}.other.tgt import modeling\n",
+        f"{tests}/test_modeling_v2_claims.py": "",
+    }
+    for path, content in files.items():
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(content, encoding="utf-8")
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    listed = sorted(p for p in files if p.startswith(tests) and "/test_" in p)
+    head = _commit(repo, base, {f"{models}/fam/tgt/modeling.py": "class Model:\n    x = 1\n"})
+    picked, why = regression.affected_files(repo, base, head, listed)
+    assert picked == [
+        f"{tests}/models/fam/test_routing.py",
+        f"{tests}/models/fam/tgt/test_modeling.py",
+        f"{tests}/test_modeling_v2_claims.py",
+    ]
+    assert why == "3 of 4 test files reach what changed"
 
 
 @_requires_git

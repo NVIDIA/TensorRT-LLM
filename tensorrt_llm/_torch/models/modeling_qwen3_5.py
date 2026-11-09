@@ -61,25 +61,28 @@ _MTP_TOP_TO_TRTLLM = {
 }
 
 
-def _get_qwen35_moe_model_defaults(llm_args: "TorchLlmArgs") -> dict:
-    """Return Marlin defaults for Qwen3.5 MoE with NVFP4 experts on Ada/Hopper."""
-    defaults = Qwen3NextForCausalLM.get_model_defaults(llm_args)
+def _use_nvfp4_marlin(llm_args: "TorchLlmArgs") -> bool:
     quant_config = getattr(llm_args, "quant_config", None)
-    if getattr(quant_config, "quant_algo", None) in (
+    return getattr(quant_config, "quant_algo", None) in (
         QuantAlgo.NVFP4,
         QuantAlgo.MIXED_PRECISION,
-    ) and is_nvfp4_marlin_supported_sm(get_sm_version()):
+    ) and is_nvfp4_marlin_supported_sm(get_sm_version())
+
+
+def _get_qwen35_dense_model_defaults(llm_args: "TorchLlmArgs") -> dict:
+    """Return Marlin defaults for dense Qwen3.5 with NVFP4 linears on Ada/Hopper."""
+    defaults = Qwen3NextForCausalLM.get_model_defaults(llm_args)
+    if _use_nvfp4_marlin(llm_args):
         # CUTLASS W4A4 requires Blackwell; use Marlin's W4A16 path instead.
-        defaults.update(
-            {
-                "moe_config": {
-                    "backend": "MARLIN",
-                },
-                "nvfp4_gemm_config": {
-                    "allowed_backends": ["marlin"],
-                },
-            }
-        )
+        defaults["nvfp4_gemm_config"] = {"allowed_backends": ["marlin"]}
+    return defaults
+
+
+def _get_qwen35_moe_model_defaults(llm_args: "TorchLlmArgs") -> dict:
+    """Return Marlin defaults for Qwen3.5 MoE with NVFP4 experts on Ada/Hopper."""
+    defaults = _get_qwen35_dense_model_defaults(llm_args)
+    if _use_nvfp4_marlin(llm_args):
+        defaults["moe_config"] = {"backend": "MARLIN"}
     return defaults
 
 
@@ -717,6 +720,10 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
         _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=keep_lm_head_quant)
         super().__init__(model_config)
 
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        return _get_qwen35_dense_model_defaults(llm_args)
+
 
 # Shared placeholder metadata for both Qwen3.5 VLM variants. The image/video
 # placeholder layout is identical for MoE and dense; only the registration
@@ -750,12 +757,8 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
     @classmethod
     def get_model_defaults(cls, llm_args):
         # `ModelLoader` applies `get_model_defaults()` on the resolved outer
-        # model class (this VLM wrapper), not on the inner decoder. Both
-        # inner LMs (`Qwen3_5MoeForCausalLM` / `Qwen3_5ForCausalLM`) inherit
-        # `Qwen3NextForCausalLM`'s defaults unchanged, so delegate to it to
-        # keep block reuse disabled until a recurrent-state snapshot policy is
-        # configured.
-        return Qwen3NextForCausalLM.get_model_defaults(llm_args)
+        # model class (this VLM wrapper), not on the inner decoder.
+        return _get_qwen35_dense_model_defaults(llm_args)
 
     @classmethod
     def get_preferred_kv_cache_manager_version(

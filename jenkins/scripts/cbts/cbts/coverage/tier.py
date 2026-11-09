@@ -31,9 +31,8 @@ from cbts.blocks import (
     YAMLIndex,
     _avg_duration,
     _entry_applies_to_waive,
-    _entry_target,
+    _entry_in_filter_subtree,
     _estimate_entries_seconds,
-    _target_in_filter_subtree,
     block_matches_stage,
 )
 from cbts.coverage.selection.selector import (  # noqa: F401
@@ -72,10 +71,9 @@ def _rule_kept_entries(block, prefix_to_waives: dict[str, set[str]]) -> set[str]
     """Entries a rule's block_filters would keep."""
     kept: set[str] = set()
     for t in block.tests:
-        target = _entry_target(t)
         matched: set[str] = set()
         for prefix, waives in prefix_to_waives.items():
-            if _target_in_filter_subtree(target, prefix):
+            if _entry_in_filter_subtree(t, prefix):
                 matched |= waives
         if matched and any(_entry_applies_to_waive(t, w) for w in matched):
             kept.add(t)
@@ -185,8 +183,8 @@ def coverage_preflight(
     if not residual:
         return residual, "coverage tier skipped: no residual (all files handled by rules)"
     for path in residual:
-        if not (path.endswith(".py") and path.startswith("tensorrt_llm/")):
-            return residual, f"coverage tier declined: non-core-Python residual file: {path}"
+        if not path.endswith(".py"):
+            return residual, f"coverage tier declined: non-Python residual file: {path}"
     return residual, ""
 
 
