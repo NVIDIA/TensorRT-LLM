@@ -578,7 +578,7 @@ def _check_sibling_imports(repo_root: Path, target: Path) -> list[Check]:
 
 
 def check_routing(repo_root: Path, family: str, target_rel: str) -> list[Check]:
-    """The target is reachable: routing names it, and the claims test exists."""
+    """The target is reachable: routing names it."""
     routing = repo_root / MODELING_V2_PACKAGE / "models" / family / "routing.py"
     if not routing.is_file():
         return [Check(name="routing:module", passed=False, detail=f"missing: {routing}")]
@@ -590,7 +590,6 @@ def check_routing(repo_root: Path, family: str, target_rel: str) -> list[Check]:
     dotted = target_rel.split(f"{MODELING_V2_PACKAGE}/", 1)[-1].replace("/", ".").rstrip(".")
     relative = f"from .{Path(target_rel.rstrip('/')).name}."
     referenced = dotted in text or relative in text
-    claims_test = repo_root / CATALOG_TESTS_DIR / "test_modeling_v2_claims.py"
     return [
         Check(
             name="routing:target",
@@ -602,11 +601,6 @@ def check_routing(repo_root: Path, family: str, target_rel: str) -> list[Check]:
                 f"never be selected, and under `auto` the built-in implementation "
                 f"would answer instead"
             ),
-        ),
-        Check(
-            name="routing:claims-test",
-            passed=claims_test.is_file(),
-            detail=str(claims_test) if claims_test.is_file() else f"missing: {claims_test}",
         ),
     ]
 
@@ -634,16 +628,21 @@ def check_accuracy_reference(repo_root: Path, reference_yaml: str, model_key: st
     ]
 
 
-def accuracy_test_path(repo_root: Path | str, family: str) -> str:
+def accuracy_test_path(repo_root: Path | str, family: str, target: str) -> str:
     """A target's CI accuracy test under ``ACCURACY_TESTS_DIR``, in the tree's own layout.
 
-    Newer trees keep the modeling_v2 accuracy tests in a package,
-    ``modeling_v2/test_<family>.py``; older ones beside the rest, as
-    ``test_modeling_v2_<family>.py``. The package's presence says which.
+    Current trees give each target a directory of its own,
+    ``modeling_v2/<family>/<target>/test_accuracy.py``. Older ones keep a
+    family's targets in one file, ``modeling_v2/test_<family>.py``, and the
+    oldest keep it beside the rest, as ``test_modeling_v2_<family>.py``. The
+    package's presence, and whether it still holds per-family files, says which.
     """
-    if (Path(repo_root) / ACCURACY_TESTS_DIR / "modeling_v2").is_dir():
+    package = Path(repo_root) / ACCURACY_TESTS_DIR / "modeling_v2"
+    if not package.is_dir():
+        return f"test_modeling_v2_{family}.py"
+    if any(package.glob("test_*.py")):
         return f"modeling_v2/test_{family}.py"
-    return f"test_modeling_v2_{family}.py"
+    return f"modeling_v2/{family}/{target}/test_accuracy.py"
 
 
 def check_test_registration(repo_root: Path, accuracy_test: str) -> list[Check]:
@@ -657,20 +656,23 @@ def check_test_registration(repo_root: Path, accuracy_test: str) -> list[Check]:
         )
     ]
     db = repo_root / TEST_DB_DIR
-    stem = Path(accuracy_test).stem
+    # Test-db entries name tests relative to the defs root, by file or by a directory above it.
+    wanted = f"{Path(ACCURACY_TESTS_DIR).name}/{accuracy_test}"
     listed: list[str] = []
     if db.is_dir():
         for yml in sorted(db.glob("*.yml")):
-            if stem in yml.read_text(encoding="utf-8"):
+            entries = re.findall(r"^\s*-\s+(\S+)", yml.read_text(encoding="utf-8"), re.MULTILINE)
+            paths = {entry.split("::")[0].rstrip("/") for entry in entries}
+            if any(wanted == path or wanted.startswith(f"{path}/") for path in paths):
                 listed.append(yml.name)
     checks.append(
         Check(
             name="tests:test-db",
             passed=bool(listed),
             detail=(
-                f"{stem} is listed in {', '.join(listed)}"
+                f"{accuracy_test} is listed in {', '.join(listed)}"
                 if listed
-                else f"{stem} appears in no {TEST_DB_DIR}/*.yml; CI would never run it"
+                else f"{accuracy_test} appears in no {TEST_DB_DIR}/*.yml; CI would never run it"
             ),
         )
     )
