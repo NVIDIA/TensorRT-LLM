@@ -24,6 +24,7 @@ l0_cpu_musespark:
   - unittest/_torch/speculative/hw_agnostic/test_dflash_ctx_block_tables.py
   - unittest/_torch/executor/kv_cache/test_dflash_unified_kv_gate.py
   - unittest/llmapi/test_disagg_dflash_guard.py
+  - unittest/disaggregated/test_disagg_draft_window.py
   - unittest/disaggregated/test_kv_transfer.py
   - unittest/disaggregated/test_peer.py
   - unittest/disaggregated/test_rank_info.py

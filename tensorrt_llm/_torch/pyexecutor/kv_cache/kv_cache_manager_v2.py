@@ -4588,8 +4588,8 @@ class KVCacheManagerV2(BaseResourceManager):
         # Deliberately no claim cap here: a disagg generation-init request
         # receives its prompt KV from the context worker and never runs a
         # prefill forward on this engine, so there is no drafter hidden state
-        # to recover. Spec decode on a disagg engine is guard-refused anyway
-        # (disagg_dflash_error).
+        # to recover. A DFlash drafter's prompt window arrives in the same
+        # pages when its draft layers share this manager (disagg draft window).
         if self.enable_block_reuse:
             _settle_context_cursor(req, reused, self.tokens_per_block)
 

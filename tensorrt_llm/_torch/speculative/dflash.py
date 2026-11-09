@@ -27,6 +27,14 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import AttentionMetadata
+from ..disaggregation.draft_kv import (
+    FALLBACK_CTX_OVERFLOW,
+    FALLBACK_NO_FREE_SLOT,
+    SEED_DUMMY,
+    SEED_WINDOW,
+    DraftWindowCounters,
+    gen_window_seed,
+)
 from ..pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
@@ -635,13 +643,23 @@ class DFlashSpecMetadata(SpecMetadata):
                             f"DFlash: no free drafter slot for generation request {rid}; "
                             "it shares the dummy slot and will draft poorly."
                         )
-                    elif worker._ctx_unified_cache:
-                        # New requests have no in-flight predecessor. Subsequent
-                        # accepted tokens advance the device length during replay.
-                        token_offset = sum(self.seq_lens[:request_idx])
-                        assigned[slot] = min(
-                            int(self.host_position_ids[token_offset]), worker._max_ctx
+                        worker._draft_window_counters_get().record_seed(SEED_DUMMY)
+                    else:
+                        # On the unified cache the drafter's prompt K/V arrived in the
+                        # request's own pages with the target's KV (disagg draft window):
+                        # number the context to the prompt end. New requests have no
+                        # in-flight predecessor; subsequent accepted tokens advance the
+                        # device length during replay. Elsewhere the window starts empty.
+                        position = 0
+                        if worker._ctx_unified_cache:
+                            token_offset = sum(self.seq_lens[:request_idx])
+                            position = int(self.host_position_ids[token_offset])
+                        ctx_len, seed = gen_window_seed(
+                            worker._ctx_unified_cache, position, worker._max_ctx
                         )
+                        if seed == SEED_WINDOW:
+                            assigned[slot] = ctx_len
+                        worker._draft_window_counters_get().record_seed(seed, ctx_len)
             worker._write_ctx_len(assigned)
 
             # Route unknown request IDs (cuda graph padding or warmup dummies)
@@ -814,6 +832,8 @@ class DFlashWorker(SpecWorkerBase):
         # _lazy_init_ctx_buffers; read by _store_prefill_context.
         self._ctx_reuse_addressable = False
         self._dflash_attention_backend = spec_config.attention_backend
+        # Disagg draft-window evidence (disaggregation/draft_kv.py), created on first use.
+        self._draft_window_counters = None
 
         # Slot management (Python, updated in prepare() and eager mode)
         self._req_to_slot = {}  # request_id -> slot index
@@ -1490,6 +1510,13 @@ class DFlashWorker(SpecWorkerBase):
             if all(cache is not None for cache in caches):
                 return [-(-cache.capacity // page) * page for cache in caches]
         return (self._ctx_block_counts[: len(request_ids)] * page).tolist()
+    def _draft_window_counters_get(self) -> DraftWindowCounters:
+        """This worker's draft-window counters (``disaggregation/draft_kv.py``)."""
+        counters = getattr(self, "_draft_window_counters", None)
+        if counters is None:
+            counters = DraftWindowCounters(role="unified" if self._ctx_unified_cache else "private")
+            self._draft_window_counters = counters
+        return counters
 
     def _assign_slot(self, req_id: int, reset: bool = False, updates: Optional[dict] = None):
         """Get (or refresh) this request's context slot; None when none is free.
@@ -1915,6 +1942,9 @@ class DFlashWorker(SpecWorkerBase):
             reset = prev_pos != first_pos
             if self._assign_slot(req_id, reset=reset, updates=ctx_len_updates) is None:
                 logger.warning("DFlash: no free slots, skipping context store")
+                self._draft_window_counters_get().record_fallback(
+                    FALLBACK_NO_FREE_SLOT, f"request={req_id}"
+                )
                 self._req_ctx_pos.pop(req_id, None)
                 offset += slen
                 continue
@@ -1935,6 +1965,9 @@ class DFlashWorker(SpecWorkerBase):
                     f"DFlash: ctx overflow on slot {slot} "
                     f"({cur} + {slen} > {cap}); skipping its context "
                     "store, so this request drafts nothing."
+                )
+                self._draft_window_counters_get().record_fallback(
+                    FALLBACK_CTX_OVERFLOW, f"request={req_id} cur={cur} len={slen} cap={cap}"
                 )
                 self._req_to_slot.pop(req_id, None)
                 self._req_ctx_pos.pop(req_id, None)
