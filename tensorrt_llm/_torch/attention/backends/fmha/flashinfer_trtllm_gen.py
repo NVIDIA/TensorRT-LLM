@@ -62,6 +62,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
+from . import multi_instance_context as _multi_instance_context
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
 from .utils import (
@@ -1126,29 +1127,48 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if params.is_cross
             else AttentionMaskType(fwd.mask_type) == AttentionMaskType.causal
         )
-        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
-            query=q_processed,
-            kv_cache=(kv_pool, kv_pool),
-            workspace_buffer=fmha_workspace,
-            block_tables=block_tables,
-            seq_lens=params.sequence_lengths,
-            max_q_len=max_q_len,
-            max_kv_len=max_kv_len,
-            bmm1_scale=ctx_bmm1_scale,
-            bmm2_scale=ctx_bmm2_scale,
-            batch_size=params.batch_size,
-            cum_seq_lens_q=cu_q_seqlens,
-            cum_seq_lens_kv=cu_kv_seqlens,
-            window_left=window_left,
-            out=params.output,
-            kv_layout=self._layout,
-            enable_pdl=self._enable_pdl,
-            sinks=fwd.attention_sinks,
-            kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
-            uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
-            causal=causal,
-            multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
+        # TRTLLM_MULTI_INSTANCE_CONTEXT_FMHA=1 (off by default): a full-attention context call the
+        # multi-instance context FMHA serves runs there; every other call runs flashinfer's below.
+        ran_multi_instance = _multi_instance_context.requested() and (
+            _multi_instance_context.maybe_run_context(
+                params,
+                q_processed,
+                kv_pool,
+                block_tables,
+                bmm1_scale,
+                bmm2_scale,
+                cu_q_seqlens,
+                window_left,
+                fp8_context_fmha,
+                attention_chunk_size,
+                causal,
+                self._multi_processor_count,
+            )
         )
+        if not ran_multi_instance:
+            flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+                query=q_processed,
+                kv_cache=(kv_pool, kv_pool),
+                workspace_buffer=fmha_workspace,
+                block_tables=block_tables,
+                seq_lens=params.sequence_lengths,
+                max_q_len=max_q_len,
+                max_kv_len=max_kv_len,
+                bmm1_scale=ctx_bmm1_scale,
+                bmm2_scale=ctx_bmm2_scale,
+                batch_size=params.batch_size,
+                cum_seq_lens_q=cu_q_seqlens,
+                cum_seq_lens_kv=cu_kv_seqlens,
+                window_left=window_left,
+                out=params.output,
+                kv_layout=self._layout,
+                enable_pdl=self._enable_pdl,
+                sinks=fwd.attention_sinks,
+                kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
+                uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
+                causal=causal,
+                multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
+            )
 
         if params.is_cross:
             return
