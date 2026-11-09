@@ -332,6 +332,12 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
                 "FP8_BLOCK_SCALES": QuantAlgo.FP8_BLOCK_SCALES,
                 "FP8_PER_CHANNEL_PER_TOKEN": QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
                 "NVFP4": QuantAlgo.NVFP4,
+                # ModelOpt SVDQuant: NVFP4 weights and activations plus an
+                # AWQ-style pre_quant_scale and a low-rank residual per Linear
+                # (``svdquant_lora_a`` / ``svdquant_lora_b`` in the checkpoint).
+                # The Linear method picks those tensors up from the checkpoint,
+                # so the recipe maps to NVFP4 with ``pre_quant_scale`` set.
+                "NVFP4_SVD": QuantAlgo.NVFP4,
                 "W4A16_AWQ": QuantAlgo.W4A16_AWQ,
                 "W4A8_AWQ": QuantAlgo.W4A8_AWQ,
                 "W8A8_SQ_PER_CHANNEL": QuantAlgo.W8A8_SQ_PER_CHANNEL,
@@ -344,11 +350,13 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         group_size = None
         dynamic_weight_quant = False
         dynamic_activation_quant = False
+        pre_quant_scale = quant_algo_str == "NVFP4_SVD"
         for group_config in quant_config_dict.get("config_groups", {}).values():
             weights_config = group_config.get("weights", {})
             activations_config = group_config.get("input_activations", {})
             dynamic_weight_quant = weights_config.get("dynamic", False)
             dynamic_activation_quant = activations_config.get("dynamic", False)
+            pre_quant_scale = bool(group_config.get("pre_quant_scale", pre_quant_scale))
             # Extract group_size from weights config (e.g., NVFP4: group_size=16)
             if group_size is None:
                 group_size = weights_config.get("group_size")
@@ -382,6 +390,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             quant_algo=quant_algo,
             group_size=group_size,
             exclude_modules=quant_config_dict.get("ignore"),
+            pre_quant_scale=pre_quant_scale,
         )
 
         # TODO: Per-layer config (None for now - future: parse mixed precision settings)
