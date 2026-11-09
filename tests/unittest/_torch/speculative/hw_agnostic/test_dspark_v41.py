@@ -269,44 +269,23 @@ def test_v41_draft_rejects_fp8_attention_projections(monkeypatch: pytest.MonkeyP
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "tactic, quant_algo",
-    [(None, QuantAlgo.W4A8_MXFP4_MXFP8), ("trtllm_gen.w4a8_mxfp4_fp8", QuantAlgo.W4A8_MXFP4_FP8)],
-    ids=["no_tactic", "w4a8_fp8"],
+    "tactic, quant_algo, moe_backend",
+    [
+        # No draft selection: the stages run as the loaded config's literal picks.
+        (None, QuantAlgo.W4A8_MXFP4_MXFP8, "TRTLLM"),
+        # One family over the MXFP4 stages, CUTLASS and CuteDSL over the NVFP4 main experts.
+        ("grouped_gemm", QuantAlgo.W4A8_MXFP4_MXFP8, "CUTLASS"),
+        # The stages run as the MXFP4 format the tactic names, not the one the load picked.
+        ("trtllm_gen.w4a8_mxfp4_fp8", QuantAlgo.W4A8_MXFP4_FP8, "TRTLLM"),
+        ("mega_moe", QuantAlgo.W4A8_MXFP4_MXFP8, "MEGAMOE_DEEPGEMM"),
+    ],
+    ids=["no_tactic", "grouped_gemm", "w4a8_fp8", "mega_moe"],
 )
-def test_v41_mxfp4_draft_experts_run_as_the_format_the_tactic_names(
-    monkeypatch, tactic, quant_algo
+def test_v41_draft_tactic_resolves_against_the_draft_stages_only(
+    monkeypatch, tactic, quant_algo, moe_backend
 ):
-    """The embedded MTP experts read MXFP4 weights by the same rule the target's do."""
-    monkeypatch.setattr(
-        modeling_dspark.DSv4DSparkDraftModel,
-        "_draft_quant_config_dict",
-        staticmethod(lambda model_config, base, num_stages: None),
-    )
-    # A 2-D I8 expert weight is how the checkpoint marks MXFP4 draft experts.
-    monkeypatch.setattr(
-        ModelConfig,
-        "_get_safetensors_header_for_tensor",
-        staticmethod(lambda checkpoint_dir, name: {"dtype": "I8", "shape": [8, 8]}),
-    )
-    monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 100)
-    monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
-    model_config = SimpleNamespace(
-        pretrained_config=SimpleNamespace(_name_or_path="/unused"),
-        quant_config_dict=None,
-        moe_backend="TRTLLM",
-        moe_tactic=tactic,
-    )
-
-    quant_configs = DSv41DSparkDraftModel._draft_quant_config_dict(
-        model_config, base=4, num_stages=1
-    )
-
-    assert quant_configs["model.layers.4.mlp.experts"].quant_algo is quant_algo
-
-
-@pytest.mark.cpu_only
-def test_v41_draft_tactic_resolves_against_the_draft_stages_only(monkeypatch):
-    """NVFP4 main experts must not widen ``mega_moe`` over the MXFP4 draft stages."""
+    """The target checkpoint is loaded without the draft tactic, as the embedded draft's loader
+    kwargs do, and the tactic is resolved against the MXFP4 draft stages alone."""
     # A 2-D I8 expert weight is how the checkpoint marks MXFP4 draft experts.
     monkeypatch.setattr(
         ModelConfig,
@@ -317,6 +296,7 @@ def test_v41_draft_tactic_resolves_against_the_draft_stages_only(monkeypatch):
     monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
     main_experts = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
     quant_config_dict = {f"model.layers.{i}.mlp.experts": main_experts for i in range(4)}
+    # As ModelConfig.from_pretrained loads it for an AUTO draft selection on SM100.
     model_config = ModelConfig(
         pretrained_config=SimpleNamespace(
             _name_or_path="/unused", architectures=["DeepseekV41ForCausalLM"]
@@ -324,27 +304,25 @@ def test_v41_draft_tactic_resolves_against_the_draft_stages_only(monkeypatch):
         sparse_attention_config=None,
         quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
         quant_config_dict=dict(quant_config_dict),
-        moe_backend="MEGAMOE_CUTEDSL",
-        moe_tactic="mega_moe",
+        moe_backend="TRTLLM",
     )
+    selection = None if tactic is None else MoESelection(tactic=tactic)
 
-    draft_config = DSv41DSparkDraftModel._derive_draft_model_config(
-        model_config, 4, 1, MoESelection(tactic="mega_moe")
-    )
+    draft_config = DSv41DSparkDraftModel._derive_draft_model_config(model_config, 4, 1, selection)
 
     stage_experts = draft_config.quant_config_dict["model.layers.4.mlp.experts"]
-    assert stage_experts.quant_algo is QuantAlgo.W4A8_MXFP4_MXFP8
-    assert draft_config.moe_backend == "MEGAMOE_DEEPGEMM"
-    assert draft_config.moe_tactic == "mega_moe"
+    assert stage_experts.quant_algo is quant_algo
+    assert (draft_config.moe_backend, draft_config.moe_tactic) == (moe_backend, tactic)
     assert model_config.quant_config_dict == quant_config_dict
-    # The draft config keeps the whole map, over which mega_moe spans two families.
-    with pytest.raises(ValueError, match="several backend families"):
-        ModelConfig.pinned_moe_backend(
-            "mega_moe",
-            model_config.quant_config,
-            draft_config.quant_config_dict,
-            architecture="DeepseekV41ForCausalLM",
-        )
+    if tactic in ("grouped_gemm", "mega_moe"):
+        # Over the whole map, NVFP4 main experts included, the tactic spans two families.
+        with pytest.raises(ValueError, match="several backend families"):
+            ModelConfig.pinned_moe_backend(
+                tactic,
+                model_config.quant_config,
+                draft_config.quant_config_dict,
+                architecture="DeepseekV41ForCausalLM",
+            )
 
 
 def test_v41_draft_uses_smaller_expert_bank_without_changing_target(monkeypatch):

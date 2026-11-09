@@ -737,7 +737,11 @@ not read the SM; an `AUTO` literal not resolved yet (`llm_utils`) names no
 implementation and takes the SM's first choice. `OVERRIDE_QUANT_ALGO` still
 takes precedence. Checkpoint parsing writes the target selection's format for
 the MTP layers too, so an MTP copy that selects for itself picks the format
-again (`_mxfp4_run_quant_config`) in a `quant_config_dict` of its own.
+again (`_mxfp4_run_quant_config`) in a `quant_config_dict` of its own. The
+embedded DSpark draft loads the target checkpoint, whose expert map describes
+the main layers, so `external_drafter_config_kwargs` loads it without the
+draft tactic, and `_derive_draft_model_config` picks the stages' format the
+same way before resolving the tactic against the stages alone.
 
 A modeling_v2 target declares the implementation ids it honors, since routes
 read no tactic: `moe_impls_honored` for `moe_config.tactic` and

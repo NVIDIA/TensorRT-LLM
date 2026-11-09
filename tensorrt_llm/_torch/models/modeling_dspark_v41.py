@@ -242,9 +242,9 @@ class DSv41DSparkDraftModel(DSv4DSparkDraftModel):
                 continue
             dtype = tensor_info.get("dtype")
             if dtype == "I8" and len(tensor_info.get("shape", [])) == 2:
-                quant_algo = ModelConfig.get_mxfp4_quant_algo(
-                    model_config.moe_backend, moe_tactic=model_config.moe_tactic
-                )
+                # The format the loaded config's literal picks; a draft tactic
+                # picks again in _derive_draft_model_config.
+                quant_algo = ModelConfig.get_mxfp4_quant_algo(model_config.moe_backend)
                 group_size = 32
             elif dtype == "U8":
                 quant_algo = QuantAlgo.NVFP4

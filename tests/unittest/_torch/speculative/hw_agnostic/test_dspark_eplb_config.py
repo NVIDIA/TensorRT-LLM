@@ -218,6 +218,38 @@ def test_standalone_dspark_draft_auto_ignores_the_targets_eplb():
     assert kwargs["moe_backend"] == "AUTO"
 
 
+@pytest.mark.parametrize(
+    "lb_config, moe_backend",
+    [
+        (None, "AUTO"),
+        (MoePerLayerDynamicLoadBalancerConfig(num_slots=NUM_EXPERTS + 8), "MEGAMOE_CUTEDSL"),
+    ],
+    ids=["no_eplb", "per_layer_dynamic"],
+)
+def test_embedded_dspark_loads_the_target_checkpoint_without_the_draft_tactic(
+    lb_config, moe_backend
+):
+    # That checkpoint's expert map describes the main layers. The draft model
+    # resolves the tactic against its stages (test_dspark_v41.py).
+    spec_config = _spec_config(SpeculativeDecodingMode.DSPARK)
+    spec_config.moe_backend = None
+    spec_config.moe_tactic = "grouped_gemm"
+
+    kwargs = external_drafter_config_kwargs(_model_config(lb_config), spec_config)
+
+    assert (kwargs["moe_backend"], kwargs["moe_tactic"]) == (moe_backend, None)
+
+
+def test_standalone_dspark_drafter_loads_its_own_checkpoint_with_the_draft_tactic():
+    spec_config = _spec_config(SpeculativeDecodingMode.DSPARK, embedded=False)
+    spec_config.moe_backend = None
+    spec_config.moe_tactic = "grouped_gemm"
+
+    kwargs = external_drafter_config_kwargs(_model_config(), spec_config)
+
+    assert (kwargs["moe_backend"], kwargs["moe_tactic"]) == ("AUTO", "grouped_gemm")
+
+
 def test_embedded_dspark_builder_selects_under_the_targets_eplb(monkeypatch):
     model_config = _per_layer_dynamic_model_config("trtllm.cutedsl.mega_moe.nvfp4")
     model_config.spec_config = SimpleNamespace(

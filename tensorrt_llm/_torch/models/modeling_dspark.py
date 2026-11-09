@@ -127,6 +127,7 @@ from .modeling_speculative import (
     DSparkConfidenceHead,
     SpecDecOneEngineForCausalLM,
     _draft_moe_selection,
+    _mxfp4_run_quant_config,
     build_markov_head,
 )
 from .modeling_utils import (
@@ -1496,7 +1497,8 @@ class DSv4DSparkDraftModel(nn.Module):
         ``model_config.moe_tactic`` pins. ``draft_moe_selection`` is resolved
         after the draft-specific quantization normalization below, against the
         draft stages' entries only, so its backend follows the draft weights
-        rather than the target's. The draft ``mtp.*`` stages are full V4
+        rather than the target's; a tactic also picks the format the stages'
+        MXFP4 experts run as. The draft ``mtp.*`` stages are full V4
         blocks, so they share the target's MXFP4
         ``n_routed_experts=384`` / ``n_group=8`` (= 48 experts/group) layout
         and therefore the same backend constraints: select a backend that
@@ -1511,6 +1513,19 @@ class DSv4DSparkDraftModel(nn.Module):
         resolved_moe_backend = None
         if draft_moe_selection is not None:
             draft_qcd = new_qcd if new_qcd is not None else model_config.quant_config_dict or {}
+            if draft_moe_selection.tactic is not None:
+                # The embedded draft's checkpoint is loaded without the draft
+                # tactic (external_drafter_config_kwargs), so the stages' MXFP4
+                # experts carry the format that load picked; run them in the
+                # one the tactic names.
+                stage_keys = [f"model.layers.{base + s}.mlp.experts" for s in range(num_stages)]
+                run_qcd = {
+                    key: _mxfp4_run_quant_config(model_config, draft_moe_selection, draft_qcd[key])
+                    for key in stage_keys
+                    if key in draft_qcd
+                }
+                if any(run_qcd[key] is not draft_qcd[key] for key in run_qcd):
+                    draft_qcd = new_qcd = {**draft_qcd, **run_qcd}
             # A draft tactic that names no NVFP4_PLUS implementation is refused by resolution.
             if draft_moe_selection.tactic is None and any(
                 getattr(draft_qcd.get(f"model.layers.{base + s}.mlp.experts"), "quant_algo", None)
