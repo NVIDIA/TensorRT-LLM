@@ -1487,17 +1487,23 @@ class PyExecutor:
         self.request_accumulated: List[RequestQueueItem] = []
         self.new_active_requests_queue_latency_ms = 0.0
         self._disable_mpi = mpi_disabled()
-        # Under attention DP a rank needs only the prompts of the requests it
-        # owns, unless routing reads every prompt's tokens.
-        self.request_broadcaster = RequestBroadcaster(
-            self.dist,
-            self.hang_detector,
-            sync_clock=self._gen_admission.needs_clock,
-            prompts_to_owners=(self.enable_attention_dp
-                               and not self._disable_mpi
-                               and self.dist.tp_size > 1
-                               and self.dist.world_size == self.dist.tp_size
-                               and not self.adp_router.reads_prompt_tokens))
+        if model_hooks.prompts_to_owners:
+            # Under attention DP a rank needs only the prompts of the requests
+            # it owns, unless routing reads every prompt's tokens.
+            self.request_broadcaster = RequestBroadcaster(
+                self.dist,
+                self.hang_detector,
+                sync_clock=self._gen_admission.needs_clock,
+                prompts_to_owners=(self.enable_attention_dp
+                                   and not self._disable_mpi
+                                   and self.dist.tp_size > 1
+                                   and self.dist.world_size == self.dist.tp_size
+                                   and not self.adp_router.reads_prompt_tokens))
+        else:
+            self.request_broadcaster = RequestBroadcaster(
+                self.dist,
+                self.hang_detector,
+                sync_clock=self._gen_admission.needs_clock)
 
         # Waiting queue for requests that have been fetched but not yet scheduled
         self.waiting_queue: WaitingQueue = create_waiting_queue(
@@ -3503,11 +3509,8 @@ class PyExecutor:
                 continue
             try:
                 # input_token_ids would copy the whole prompt into a list.
-                token_count = item.request.num_input_tokens
-                trimmed_prefix = getattr(item.request,
-                                         "py_prompt_trimmed_prefix", 0)
-                if isinstance(trimmed_prefix, int):
-                    token_count += trimmed_prefix
+                token_count = (item.request.num_input_tokens +
+                               item.request.py_prompt_trimmed_prefix)
             except (AttributeError, TypeError) as e:
                 # Unusual request shape with no usable token payload;
                 # exclude from all queued counters so downstream consumers

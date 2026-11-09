@@ -3078,6 +3078,7 @@ class DeepseekV4Model(DecoderModel):
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
+            use_masked_embedding_kernel=True,
         )
 
         self.hc_head = HCHead(config.hc_mult, config.hidden_size) if self.uses_hc_head else None
@@ -3510,9 +3511,14 @@ class DeepseekV4Model(DecoderModel):
 
 
 # The step-loop hooks validated on DeepSeek-V4 and V4.1.
-_DEEPSEEK_V4_RUNTIME_HOOKS = RuntimeHooks(stage_decode_inputs=True, prioritize_decode_graphs=True)
+_DEEPSEEK_V4_RUNTIME_HOOKS = RuntimeHooks(
+    stage_decode_inputs=True, prioritize_decode_graphs=True, prompts_to_owners=True
+)
 _DEEPSEEK_V4_SPEC_RUNTIME_HOOKS = RuntimeHooks(
-    stage_decode_inputs=True, prioritize_decode_graphs=True, loop_on_execution_stream=True
+    stage_decode_inputs=True,
+    prioritize_decode_graphs=True,
+    loop_on_execution_stream=True,
+    prompts_to_owners=True,
 )
 
 

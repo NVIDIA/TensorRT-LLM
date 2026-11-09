@@ -38,7 +38,16 @@ def test_vocab_slice_lookup_sums_to_full_embedding(tp_size, tokens, hidden):
         start, end = rank * slice_width, min((rank + 1) * slice_width, vocab)
         rows = table[start:end].contiguous()
         out = pre_comm_embedding_ops(
-            ids, rows, tp_size, rank, TensorParallelMode.COLUMN, start, end, False, 0
+            ids,
+            rows,
+            tp_size,
+            rank,
+            TensorParallelMode.COLUMN,
+            start,
+            end,
+            False,
+            0,
+            use_masked_embedding_kernel=True,
         )
         local = ids - start
         inside = (local >= 0) & (local < end - start)
@@ -63,7 +72,9 @@ def test_lookup_of_table_past_int32_offsets():
     ids = torch.tensor([0, vocab // 2, vocab - 65, vocab - 2, vocab - 1, -1], device="cuda")
     rows = ids[ids >= 0]
     table[rows] = torch.randn(rows.numel(), hidden, dtype=torch.bfloat16, device="cuda")
-    out = pre_comm_embedding_ops(ids, table, 1, 0, None, 0, vocab, False, 0)
+    out = pre_comm_embedding_ops(
+        ids, table, 1, 0, None, 0, vocab, False, 0, use_masked_embedding_kernel=True
+    )
     expected = table[ids.clamp(min=0)]
     expected[ids < 0] = 0
     assert torch.equal(out, expected)
