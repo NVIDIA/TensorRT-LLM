@@ -25,6 +25,7 @@ modeling-bringup = "agent_flow.workflows.modeling_bringup.cli:main"
 perf-analyze = "agent_flow.workflows.perf_analyze.cli:main"
 perf-optimize = "agent_flow.workflows.perf_optimize.cli:main"
 trtllm-modeling-v2 = "agent_flow.workflows.trtllm_modeling_v2.cli:main"
+trtllm-wiki = "agent_flow.trtllm_wiki.cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
