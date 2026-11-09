@@ -1282,6 +1282,52 @@ def test_indexer_two_level_gvr_dispatch(
 
 
 @skip_pre_hopper
+@pytest.mark.parametrize("hidden_size", [6144, 7168])
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize(
+    "deterministic_flag", ["FORCE_DETERMINISTIC", "FORCE_ATTENTION_KERNEL_DETERMINISTIC"]
+)
+def test_indexer_projection_is_batch_invariant(
+    monkeypatch, hidden_size, weight_dtype, deterministic_flag
+):
+    monkeypatch.delenv("FORCE_DETERMINISTIC", raising=False)
+    monkeypatch.delenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", raising=False)
+    monkeypatch.delenv("TRTLLM_DSA_INDEXER_BF16", raising=False)
+    monkeypatch.setenv(deterministic_flag, "1")
+    if weight_dtype == torch.bfloat16:
+        monkeypatch.setenv("TRTLLM_DSA_INDEXER_BF16", "1")
+    torch.manual_seed(32)
+    indexer = create_indexer(
+        DeepSeekSparseAttentionConfig(index_head_dim=128, index_n_heads=32, index_topk=128)
+    )
+    weight = (torch.randn(160, hidden_size, device="cuda") / hidden_size**0.5).bfloat16()
+    weight = weight.to(weight_dtype)
+    indexer._fused_wk_wp_weight = weight
+    # A strided row view also covers hidden states sharing a larger activation buffer.
+    hidden = torch.randn(34, hidden_size, dtype=torch.bfloat16, device="cuda")[::2]
+    expected = (hidden.double() @ weight.double().T).to(weight_dtype)
+    actual = indexer._project_k_and_weights(hidden)
+    for batch_size in (1, 2, 3, 8):
+        chunks = [
+            indexer._project_k_and_weights(hidden[start : start + batch_size])
+            for start in range(0, hidden.shape[0], batch_size)
+        ]
+        torch.testing.assert_close(torch.cat(chunks), actual, atol=0, rtol=0)
+    permutation = torch.randperm(hidden.shape[0], device="cuda")
+    reordered = indexer._project_k_and_weights(hidden[permutation])
+    torch.testing.assert_close(reordered, actual[permutation], atol=0, rtol=0)
+    tolerance = (1e-6, 1e-5) if weight_dtype == torch.float32 else (1e-3, 1e-2)
+    torch.testing.assert_close(actual, expected, atol=tolerance[0], rtol=tolerance[1])
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = indexer._project_k_and_weights(hidden)
+    hidden.neg_()
+    graph.replay()
+    torch.testing.assert_close(replayed, indexer._project_k_and_weights(hidden), atol=0, rtol=0)
+
+
+@skip_pre_hopper
 @pytest.mark.parametrize(
     "flag_value,expected_dtype",
     [

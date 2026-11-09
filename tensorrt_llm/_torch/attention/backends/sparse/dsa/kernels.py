@@ -7,6 +7,65 @@ import torch
 import triton
 import triton.language as tl
 
+
+@triton.jit
+def _deterministic_indexer_projection_kernel(
+    hidden_ptr,
+    weight_ptr,
+    output_ptr,
+    hidden_stride,
+    weight_stride,
+    HIDDEN_SIZE: tl.constexpr,
+    OUT_FEATURES: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    columns = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    k = tl.arange(0, BLOCK_K)
+    hidden = tl.load(hidden_ptr + row * hidden_stride + k, k < HIDDEN_SIZE, other=0)
+    weights = tl.load(
+        weight_ptr + columns[:, None] * weight_stride + k[None, :],
+        (columns[:, None] < OUT_FEATURES) & (k[None, :] < HIDDEN_SIZE),
+        other=0,
+    )
+    # Each output has the same FP32 reduction tree regardless of batch size or row order.
+    output = tl.sum(hidden[None, :].to(tl.float32) * weights.to(tl.float32), axis=1)
+    tl.store(output_ptr + row * OUT_FEATURES + columns, output, columns < OUT_FEATURES)
+
+
+def deterministic_indexer_projection(
+    hidden_states: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """Project [tokens, hidden] by [features, hidden] with a fixed FP32 reduction.
+
+    The result has the weight dtype. Row-independent reductions keep the
+    precision-sensitive indexer scores stable as requests enter or leave a batch.
+    """
+    assert hidden_states.ndim == weight.ndim == 2
+    assert hidden_states.shape[1] == weight.shape[1]
+    assert hidden_states.stride(1) == weight.stride(1) == 1
+    num_tokens, hidden_size = hidden_states.shape
+    out_features = weight.shape[0]
+    output = torch.empty(
+        (num_tokens, out_features), dtype=weight.dtype, device=hidden_states.device
+    )
+    if num_tokens:
+        _deterministic_indexer_projection_kernel[(num_tokens, triton.cdiv(out_features, 4))](
+            hidden_states,
+            weight,
+            output,
+            hidden_states.stride(0),
+            weight.stride(0),
+            hidden_size,
+            out_features,
+            triton.next_power_of_2(hidden_size),
+            4,
+            num_warps=8,
+        )
+    return output
+
+
 ########################################################
 # Index gather kernel
 ########################################################

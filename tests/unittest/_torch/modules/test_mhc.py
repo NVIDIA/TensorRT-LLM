@@ -1559,17 +1559,23 @@ def _make_fused_hc_runner_case(n: int, hidden_size: int, hc_mult: int, seed: int
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("fuse_norm", [False, True])
 @pytest.mark.parametrize("lagged", [False, True])
+@pytest.mark.parametrize(
+    "deterministic_env", ["FORCE_DETERMINISTIC", "FORCE_MHC_KERNEL_DETERMINISTIC"]
+)
 def test_mhc_fused_hc_force_deterministic(
     monkeypatch: pytest.MonkeyPatch,
     num_tokens: int,
     hidden_size: int,
     fuse_norm: bool,
     lagged: bool,
+    deterministic_env: str,
 ) -> None:
     """Deterministic dispatch must bypass autotuning and remain stable across graph replay."""
     from tensorrt_llm._torch.modules.mhc import mhc_cuda
 
-    monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "0")
+    monkeypatch.setenv("FORCE_MHC_KERNEL_DETERMINISTIC", "0")
+    monkeypatch.setenv(deterministic_env, "1")
     runner, inputs = _make_fused_hc_runner_case(num_tokens, hidden_size, 4, seed=73)
     inputs[0].mul_(hidden_size)
     inputs[1].mul_(hidden_size)

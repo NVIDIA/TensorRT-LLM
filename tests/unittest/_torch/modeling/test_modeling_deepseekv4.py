@@ -1292,7 +1292,10 @@ def test_deepseek_v4_model_config_preserves_sparse_offload(tmp_path, monkeypatch
 
     assert resolved.enable_kv_cache_offload is enable_offload
     assert resolved.kv_cache_offload_config == sparse_config.kv_cache_offload_config
+    # The checkpoint's eight-layer list overrides the shorter seven-layer default;
+    # its 0 ratios (uncompressed/SWA-only layers) are normalized to 1.
     assert resolved.compress_ratios == [1, 1, 4, 128, 4, 128, 4, 128]
+    # Resolution creates a new config, leaving the input's seven-layer default unchanged.
     assert sparse_config.compress_ratios == [1, 1, 4, 128, 4, 128, 4]
 
 
