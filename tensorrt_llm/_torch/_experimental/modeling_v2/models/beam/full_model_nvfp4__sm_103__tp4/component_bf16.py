@@ -86,6 +86,7 @@ from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 
 from .. import _attention, dispatch_combine
+from .._load import load_failure_details
 from .layout_bf16 import (
     EMBED,
     FINAL_NORM,
@@ -283,11 +284,6 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
 
     # ------------------------------------------------------------------ loading
 
-    def _agree(self, ok: bool) -> bool:
-        """All-rank AND of ``ok`` through one all-reduce; every rank must call it."""
-        flag = torch.tensor([0.0 if ok else 1.0], dtype=torch.float32, device=self.device)
-        return float(self._allreduce(flag).item()) == 0.0
-
     @torch.no_grad()
     def load(self, checkpoint_dir: str, *, record_digests: bool = True) -> dict:
         """Stream the selected tensors of a caller-supplied checkpoint into rank-local storage.
@@ -317,9 +313,9 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
             catalog.validate(tensor_specs(self.config), complete=True)
         except Exception as exc:  # Keep rank-local failures inside the collective protocol.
             error = exc
-        if not self._agree(error is None):
+        if failure := load_failure_details(self.mapping, error is None, error):
             raise LoadError(
-                f"rank {self.rank}: checkpoint rejected before loading: {error!r}"
+                f"rank {self.rank}: checkpoint rejected before loading: {failure}"
             ) from error
 
         self.usable = False
@@ -356,9 +352,9 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
                     if error is None:
                         error = exc
         complete = error is None and list(coverage) == [s.name for s in order]
-        if not self._agree(complete):
+        if failure := load_failure_details(self.mapping, complete, error):
             raise LoadError(
-                f"rank {self.rank}: load did not complete on every rank: {error!r}"
+                f"rank {self.rank}: load did not complete on every rank: {failure}"
             ) from error
         self.load_record = {
             "rank": self.rank,

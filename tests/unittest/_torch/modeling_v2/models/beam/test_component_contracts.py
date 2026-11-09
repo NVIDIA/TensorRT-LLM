@@ -252,3 +252,30 @@ def test_components_do_not_import_full_model_internals():
                 assert module != target_module and not module.startswith(target_module + "."), (
                     f"{source.relative_to(family)} imports target-private code: {module}"
                 )
+
+
+@pytest.mark.parametrize("local_rank", range(4))
+def test_load_failures_identify_remote_rank_on_every_rank(monkeypatch, local_rank):
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._load import load_failure_details
+    from tensorrt_llm._torch.distributed.communicator import Distributed
+
+    outcomes = [
+        (True, ""),
+        (False, "ValueError('bad block scale')"),
+        (True, ""),
+        (False, "short read"),
+    ]
+    monkeypatch.setattr(Distributed, "get", lambda mapping: NS(allgather=lambda outcome: outcomes))
+    error = ValueError("bad block scale") if local_rank == 1 else None
+    detail = load_failure_details(
+        NS(world_size=4, rank=local_rank), local_rank not in (1, 3), error
+    )
+    assert detail == "rank 1: ValueError('bad block scale'); rank 3: short read"
+
+
+def test_local_load_success_and_incomplete_coverage():
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._load import load_failure_details
+
+    mapping = NS(world_size=1)
+    assert load_failure_details(mapping, True, None) is None
+    assert load_failure_details(mapping, False, None) == "rank 0: incomplete tensor coverage"
