@@ -39,6 +39,7 @@ from tensorrt_llm._torch.models.modeling_speculative import (
     _set_draft_kv_cache_quant_algo,
     external_drafter_config_kwargs,
 )
+from tensorrt_llm._torch.models.modeling_utils import layerwise_moe_quant_config
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig
@@ -1307,3 +1308,56 @@ def test_internal_mtp_mxfp4_experts_run_as_the_draft_selection_picks(
     assert mtp_model_config.quant_config_dict["model.layers.0.mlp.experts"] is experts
     assert target_config.quant_config_dict == target_quant_config_dict
     assert experts.quant_algo == stored_algo
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "mtp_key, written, resolved_algo",
+    [
+        # A per-expert key: the run format is written as the module's own entry, which the
+        # layer reads first, and the selection is resolved against it.
+        ("model.layers.2.mlp.experts.0.w1", True, QuantAlgo.W4A16_MXFP4),
+        # A key no layer looks up: nothing carries the run format, so the selection is
+        # resolved against the stored one.
+        ("mtp.layers.0.mlp.experts", False, QuantAlgo.W4A8_MXFP4_MXFP8),
+    ],
+    ids=["per_expert_key", "mtp_namespace_key"],
+)
+def test_internal_mtp_selection_resolves_against_the_run_format_only_where_it_is_written(
+    monkeypatch, mtp_key, written, resolved_algo
+) -> None:
+    monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 100)
+    monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
+    resolved_against = []
+    pinned_moe_backend = ModelConfig.pinned_moe_backend
+
+    def spy(moe_tactic, quant_config=None, quant_config_dict=None, *, architecture):
+        resolved_against.append(quant_config.quant_algo)
+        return pinned_moe_backend(
+            moe_tactic, quant_config, quant_config_dict, architecture=architecture
+        )
+
+    monkeypatch.setattr(ModelConfig, "pinned_moe_backend", staticmethod(spy))
+    target_config = _draft_backend_test_model_config("TRTLLM")
+    target_config.pretrained_config.num_nextn_predict_layers = 1
+    target_config.spec_config = SimpleNamespace(
+        moe_backend=None, moe_tactic="trtllm.trtllm_gen.fused_moe.w4a16_mxfp4"
+    )
+    stored = QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8, group_size=32)
+    target_config.quant_config_dict = {
+        "model.layers.0.mlp.experts": stored,
+        "model.layers.1.mlp.experts": stored,
+        mtp_key: stored,
+    }
+
+    mtp_model_config = _build_mtp_draft_config(target_config)
+
+    built = layerwise_moe_quant_config(
+        mtp_model_config.quant_config_dict, "model.layers.2.mlp.experts"
+    )
+    if written:
+        assert built.quant_algo == QuantAlgo.W4A16_MXFP4
+    else:
+        assert "model.layers.2.mlp.experts" not in mtp_model_config.quant_config_dict
+    assert resolved_against == [resolved_algo]
+    assert mtp_model_config.quant_config_dict["model.layers.0.mlp.experts"] is stored

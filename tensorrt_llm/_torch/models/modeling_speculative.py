@@ -1706,13 +1706,23 @@ def _get_mtp_moe_quant_config(model_config: ModelConfig,
     return global_quant_config
 
 
-def _is_mtp_experts_entry(name: str, start_layer_idx: int) -> bool:
-    """Whether ``name`` is the ``model.layers.<i>.mlp.experts`` entry of an MTP
-    layer, numbered from ``start_layer_idx``."""
-    parts = name.split(".")
-    return (len(parts) == 5 and parts[0] == "model" and parts[1] == "layers"
-            and parts[2].isdigit() and int(parts[2]) >= start_layer_idx
-            and parts[3:] == ["mlp", "experts"])
+def _mtp_experts_modules(quant_config_dict: Dict[str, QuantConfig],
+                         start_layer_idx: int) -> List[str]:
+    """The experts modules of MTP layers, numbered from ``start_layer_idx``,
+    that ``quant_config_dict`` has entries for, by the module name the layers
+    look their experts up by (``layerwise_moe_quant_config``): an entry of the
+    module itself or of a per-expert key below it."""
+    modules = []
+    for name in quant_config_dict:
+        segments = name.split(".")
+        if (len(segments) > 3 and segments[:2] == ["model", "layers"]
+                and segments[2].isdigit()
+                and int(segments[2]) >= start_layer_idx
+                and "experts" in segments[3:]):
+            module = ".".join(segments[:segments.index("experts") + 1])
+            if module not in modules:
+                modules.append(module)
+    return modules
 
 
 def _copy_mtp_model_config_with_moe_selection(
@@ -1723,7 +1733,9 @@ def _copy_mtp_model_config_with_moe_selection(
 
     MXFP4 experts run in the format ``selection`` picks
     (``_mxfp4_run_quant_config``), which the copy's own ``quant_config_dict``
-    records for every MTP layer; any other format is the checkpoint's.
+    records for the experts module of every MTP layer it has entries for; any
+    other format is the checkpoint's. ``selection`` is resolved against the
+    format the layers are then built in.
     """
     mtp_quant_config = _get_mtp_moe_quant_config(mtp_model_config,
                                                  start_layer_idx)
@@ -1734,12 +1746,15 @@ def _copy_mtp_model_config_with_moe_selection(
         run_quant_config = _mxfp4_run_quant_config(mtp_model_config, selection,
                                                    mtp_quant_config)
         if run_quant_config is not mtp_quant_config:
+            # An entry of the module itself is what a layer reads first, so it
+            # overrides per-expert entries below it too.
             layer_quant_overrides = {
-                name: run_quant_config
-                for name in mtp_model_config.quant_config_dict
-                if _is_mtp_experts_entry(name, start_layer_idx)
+                module: run_quant_config
+                for module in _mtp_experts_modules(
+                    mtp_model_config.quant_config_dict, start_layer_idx)
             }
-            mtp_quant_config = run_quant_config
+            if layer_quant_overrides:
+                mtp_quant_config = run_quant_config
     return _copy_model_config_with_moe_selection(
         mtp_model_config,
         selection,
