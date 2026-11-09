@@ -671,6 +671,36 @@ def _take_tree_map(workflow) -> str:
     return f"tree map ({'; '.join(parts)}): `{TREE_MAP_FILENAME}`" if parts else ""
 
 
+#: The checkout's wiki pack (:mod:`agent_flow.trtllm_wiki`): facts every role can look up.
+WIKI_DIRNAME = "wiki"
+
+
+def _take_wiki(workflow) -> str:
+    """Build (or reuse) ``wiki/`` in the workspace for the checkout under test.
+
+    The pack is keyed by the checkout's commit and uncommitted state, so a
+    resumed run on an unchanged tree reuses it. Returns a line for the journal.
+    **Never fatal**: a checkout it cannot read leaves no pack.
+    """
+    from agent_flow.trtllm_wiki import pack as wiki_pack
+
+    repo = workflow.task_data.get("trtllm_repo_path")
+    if not repo:
+        return ""
+    try:
+        manifest, rebuilt = wiki_pack.ensure(Path(str(repo)), workflow.workspace / WIKI_DIRNAME)
+    except (OSError, ValueError) as exc:
+        return f"wiki: not built ({exc})"
+    counts = manifest["counts"]
+    summary = (
+        f"{counts['config']} LLM API fields, {counts['families']} families, {counts['ops']} ops, "
+        f"{counts['test_lists']} test-list entries, {counts['recipes']} serving configs"
+    )
+    how = f"built in {manifest['build_s']} s" if rebuilt else "reused"
+    empty = f"; empty: {', '.join(manifest['empty'])}" if manifest["empty"] else ""
+    return f"wiki ({summary}; {how}{empty}): `{WIKI_DIRNAME}/index.md`"
+
+
 def _take_survey(workflow, result, log) -> None:
     """Measure what the build supplies, for the surveyor and in ``surface.md``.
 
@@ -689,7 +719,9 @@ def _take_survey(workflow, result, log) -> None:
     workflow._surface_block = format_surface(inventory, rank=rank)
     write_surface_file(workflow.workspace / "surface.md", inventory, rank=rank)
     _take_prior_art(workflow, config)
-    tree_note = _take_tree_map(workflow)
+    tree_note = "\n\n".join(
+        note for note in (_take_tree_map(workflow), _take_wiki(workflow)) if note
+    )
 
     headline = (
         f"{len(inventory.spendable)}/{len(inventory.catalog)} entries certified on "

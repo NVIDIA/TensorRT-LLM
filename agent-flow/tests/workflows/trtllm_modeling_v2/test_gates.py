@@ -473,6 +473,20 @@ def test_inherited_weights_need_no_local_file_but_present_python_is_validated(tm
     assert any("weights.py" in check.detail for check in _verify(root).failures)
 
 
+def test_a_test_list_counts_only_when_it_runs_the_accuracy_file(tmp_path):
+    root = _build_repo(tmp_path)
+    db = root / delivery.TEST_DB_DIR / "l0_gb300.yml"
+    # A longer name that contains the file's stem is another file.
+    db.write_text(
+        "- condition: {}\n  tests:\n  - accuracy/test_modeling_v2_gpt_oss_extra.py::T::t\n",
+        encoding="utf-8",
+    )
+    (failed,) = _verify(root).failures
+    assert failed.name == "tests:test-db"
+    db.write_text("- condition: {}\n  tests:\n  - accuracy\n", encoding="utf-8")
+    assert _verify(root).passed
+
+
 @pytest.mark.parametrize("location", ["helper", "family", "catalog_reexport"])
 @pytest.mark.parametrize("defect", ["cells", "archs", "test"])
 def test_indirect_entries_must_have_contracts_and_collected_tests(tmp_path, location, defect):

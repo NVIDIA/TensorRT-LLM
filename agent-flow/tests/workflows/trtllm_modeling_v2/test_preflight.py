@@ -91,6 +91,34 @@ def test_run_preflight_resolves_identity(tmp_path):
     assert result.checkpoint_config["architectures"] == ["Qwen3MoeForCausalLM"]
 
 
+def test_an_option_the_checkouts_llm_api_lacks_is_refused_with_the_closest_field(tmp_path):
+    task = _task(tmp_path)
+    options = tmp_path / "core.llm_api.yaml"
+    options.write_text("kv_cache_config:\n  enable_blok_reuse: false\n", encoding="utf-8")
+    task["accuracy"] = {"benchmark": "gsm8k", "llm_api_options": {"core": str(options)}}
+    assert "unchecked" in preflight.check_llm_api_fields(task)[0]
+    schema = {
+        "properties": {"kv_cache_config": {"$ref": "#/$defs/Kv"}},
+        "$defs": {"Kv": {"properties": {"enable_block_reuse": {"type": "boolean"}}}},
+    }
+    target = tmp_path / "tensorrt_llm" / "schemas" / "trtllm-serve-config.schema.json"
+    target.parent.mkdir(parents=True)
+    target.write_text(json.dumps(schema), encoding="utf-8")
+    with pytest.raises(
+        preflight.UnknownLlmApiFieldError, match="did you mean `kv_cache_config.enable_block_reuse`"
+    ):
+        preflight.check_llm_api_fields(task)
+    options.write_text("kv_cache_config:\n  enable_block_reuse: false\n", encoding="utf-8")
+    assert preflight.check_llm_api_fields(task) == []
+    # A field the LLM API removed but still takes is a note, not a refusal.
+    llm_args = tmp_path / "tensorrt_llm" / "llmapi" / "llm_args.py"
+    llm_args.parent.mkdir(parents=True)
+    llm_args.write_text("_TORCH_LLMARGS_REMOVED_ARG_CHECKS = {'sampler_type': check}\n")
+    options.write_text("sampler_type: auto\n", encoding="utf-8")
+    (note,) = preflight.check_llm_api_fields(task)
+    assert "core sets sampler_type, removed from the LLM API" in note
+
+
 def test_a_routed_architecture_takes_the_directory_of_the_family_that_routes_it(tmp_path):
     family = tmp_path / MODELING_V2_PACKAGE / "models" / "kimi_k3_vl"
     family.mkdir(parents=True)

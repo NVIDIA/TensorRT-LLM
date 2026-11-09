@@ -28,6 +28,9 @@ from typing import Any, Callable, Mapping, Sequence
 
 import yaml
 
+from agent_flow.trtllm_wiki import config as wiki_config
+from agent_flow.trtllm_wiki.modeling_v2 import routed_architectures
+
 from ...checks import accuracy as accuracy_checks
 from ...checks import boot as boot_checks
 from ...checks import check_config, check_runtime
@@ -633,6 +636,48 @@ def llm_api_decoding_types(path: Path | str) -> set[str] | None:
     return set(literals.values())
 
 
+class UnknownLlmApiFieldError(SpecInconsistencyError):
+    """An options file or runtime flag names a field this checkout's LLM API does not have."""
+
+
+def check_llm_api_fields(task_data: Mapping[str, Any]) -> list[str]:
+    """Every option a unit or variant hands the engine is a field of this checkout's LLM API.
+
+    The fields are the checkout's generated serve schema
+    (:mod:`agent_flow.trtllm_wiki.config`); the engine refuses an unknown one
+    when it is constructed, so it is refused here before any GPU waits on it.
+    """
+    repo = Path(str(task_data.get("trtllm_repo_path") or "."))
+    extracted = wiki_config.extract_config_fields(repo)
+    fields, removed = extracted["fields"], extracted["removed"]
+    if not fields:
+        return [
+            f"llm api fields: {repo / wiki_config.SERVE_SCHEMA_REL} unavailable; option "
+            "names unchecked until the engine is constructed"
+        ]
+    problems, notes = [], []
+    for name, source, options in check_config.launch_options(task_data):
+        dropped = sorted(set(options) & set(removed))
+        if dropped:
+            notes.append(
+                f"llm api fields: {name} sets {', '.join(dropped)}, removed from the LLM API; "
+                "the engine drops it (or refuses some values) when it is constructed"
+            )
+        for path in wiki_config.unknown_fields(fields, options, removed=removed):
+            close = wiki_config.suggest(fields, path)
+            problems.append(
+                f"{name}: `{path}` ({source})" + (f", did you mean `{close}`" if close else "")
+            )
+    if problems:
+        raise UnknownLlmApiFieldError(
+            "not fields of this checkout's LLM API ("
+            + wiki_config.SERVE_SCHEMA_REL
+            + "): "
+            + "; ".join(problems)
+        )
+    return notes
+
+
 def check_speculation_support(task_data: Mapping[str, Any]) -> list[str]:
     """Every requested speculation type is accepted by the public LLM config union."""
     repo = Path(str(task_data.get("trtllm_repo_path") or "."))
@@ -1062,6 +1107,7 @@ def run_preflight(
     notes.extend(check_launch_settings(task_data))
     notes.extend(check_disagg_placement(task_data))
     notes.extend(check_gate_budgets(task_data))
+    notes.extend(check_llm_api_fields(task_data))
     notes.extend(check_speculation_support(task_data))
     notes.extend(check_capture_lists(task_data))
     notes.extend(check_kv_cache_configs(task_data, checkpoint_config))
@@ -1114,17 +1160,8 @@ def routed_family(repo: Path, architecture: str) -> str | None:
             tree = ast.parse(routing.read_text(encoding="utf-8"))
         except (OSError, SyntaxError, UnicodeDecodeError):
             continue
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for decorator in node.decorator_list:
-                func = decorator.func if isinstance(decorator, ast.Call) else None
-                name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-                if name == "routes" and any(
-                    isinstance(arg, ast.Constant) and arg.value == architecture
-                    for arg in decorator.args
-                ):
-                    return routing.parent.name
+        if any(arch == architecture for arch, _ in routed_architectures(tree)):
+            return routing.parent.name
     return None
 
 
@@ -1191,12 +1228,14 @@ __all__ = [
     "PreflightError",
     "PreflightResult",
     "SpecInconsistencyError",
+    "UnknownLlmApiFieldError",
     "UnsupportedSpeculationError",
     "check_capture_lists",
     "check_disagg_placement",
     "check_gate_budgets",
     "check_variant_anchors",
     "check_kv_cache_configs",
+    "check_llm_api_fields",
     "check_speculation_support",
     "llm_api_decoding_types",
     "check_accuracy_anchors",

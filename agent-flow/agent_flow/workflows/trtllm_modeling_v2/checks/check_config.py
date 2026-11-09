@@ -709,6 +709,18 @@ def launch_kv_caches(task_data: Mapping[str, Any]) -> list[LaunchKvCache]:
     return launches
 
 
+def launch_options(task_data: Mapping[str, Any]) -> list[tuple[str, str, dict[str, Any]]]:
+    """``(name, source, options)``: what each unit, then each variant, names for the engine.
+
+    Its options file merged with the LLM API fields its runtime flags spell.
+    """
+    launches = []
+    for name, _, options, runtime, source in _launch_configurations(task_data):
+        extra, _, _ = parse_runtime_flags(runtime.get("extra_flags") or ())
+        launches.append((name, source, merge_options(options, extra)))
+    return launches
+
+
 def engine_declaration(config: Mapping[str, Any], *, mode: str | None) -> dict[str, Any]:
     """The exact public options sent to the engine, separate from actual facts."""
     options = dict(config["llm"])

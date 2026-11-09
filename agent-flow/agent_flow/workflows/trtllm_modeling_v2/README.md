@@ -110,7 +110,10 @@ must change before that.
 
 1. **Specify and prepare:** derive or validate `task.yaml`, check the environment and agent access,
    survey available operators, and compile a contract of required checks. A unit is core or a
-   feature; a member is a parallel configuration; their pairing defines a coverage cell.
+   feature; a member is a parallel configuration; their pairing defines a coverage cell. Preflight
+   builds `wiki/` in the workspace from the checkout ([`agent_flow.trtllm_wiki`](../../trtllm_wiki)):
+   the LLM API fields every option is held to, the family that routes the checkpoint, and the
+   facts roles look up with `trtllm-modeling-v2 wiki --workspace <ws> <question>`.
 2. **Plan and execute:** the planner proposes a dependency graph; Python admits and schedules it.
    Workers use separate worktrees. Kernel tasks certify or add operators; assemblers build the
    target. Commits are audited and integrated; shared-code changes require regression coverage.
@@ -150,6 +153,7 @@ must change before that.
 | `cli.py`, `spec/` | Entry point; task schema, derivation and configuration variants |
 | `agents/` | Role/model routing, turns, slots, decision protocols, prompts and entry skill |
 | `operators/` | Inventory and operator coverage (`vocabulary.yaml`) |
+| `../../trtllm_wiki/` | The checkout's facts (`wiki/` in the workspace, `trtllm-modeling-v2 wiki`) |
 | `run/workflow.py`, `orchestrator.py`, `graph.py`, `inbox.py` | Lifecycle; scheduling; graph rules; operator input |
 | `run/startup/` | Bootstrap, preflight, agent probes and role primers |
 | `run/execution/` | Task dispatch, kernel-specific preparation and decision/receipt handoffs |

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -19,6 +20,8 @@ import yaml
 from agent_flow.trtllm_wiki import accuracy, cli, config, env, features, modeling_v2, pack, recipes
 from agent_flow.trtllm_wiki import tests as test_lists
 from agent_flow.trtllm_wiki.query import Wiki
+from agent_flow.workflows.trtllm_modeling_v2 import cli as flow_cli
+from agent_flow.workflows.trtllm_modeling_v2.run.startup import bootstrap
 
 _CHECKOUT = Path(__file__).resolve().parents[2]
 _MV2 = modeling_v2.MODELING_V2_REL
@@ -302,6 +305,11 @@ def test_a_pack_is_reused_until_the_checkout_changes_and_the_cli_answers_from_it
     options.write_text(yaml.safe_dump({"kv_cache_config": {"dtyp": "fp8"}}))
     assert cli.main(["--pack", str(out), "validate", str(options)]) == cli.NOT_FOUND
     assert "not a field: kv_cache_config.dtyp" in capsys.readouterr().out
+    # The workflow's own entry points: its preflight step and `trtllm-modeling-v2 wiki`.
+    workflow = SimpleNamespace(task_data={"trtllm_repo_path": str(repo)}, workspace=tmp_path / "ws")
+    assert "reused" in bootstrap._take_wiki(workflow)
+    assert flow_cli._wiki(["family", "toy_vl", "--workspace", str(tmp_path / "ws")]) == 0
+    assert "toy_fp8__sm_100__tp4" in capsys.readouterr().out
 
 
 @pytest.mark.skipif(

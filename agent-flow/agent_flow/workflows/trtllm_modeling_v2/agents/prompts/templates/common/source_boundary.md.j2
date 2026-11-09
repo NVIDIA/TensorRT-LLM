@@ -18,6 +18,11 @@ how others did it, and say in your report what you used:
 `tree_map.md` in the workspace says where each part of this tree is in the
 checkout under test. A path you were given that is not there has moved: find
 what it defined by name (`git grep`), and trust the tree over any prompt.
+`wiki/index.md` in the workspace holds this checkout's facts, each with its
+file and line: LLM API fields and defaults, ModelingV2 families and ops, the
+CI lists that run a test, accuracy references and shipped serving configs.
+Ask it before a broad search: `trtllm-modeling-v2 wiki --workspace <workspace>
+feature|field|family|op|ci|accuracy|recipe <question>`.
 - **Other inference engines** (vLLM, SGLang, ...), from a checkout, an
   installed package or the web where you have one: often the first to serve
   a new architecture, so their model, kernel and deployment code is a map of
