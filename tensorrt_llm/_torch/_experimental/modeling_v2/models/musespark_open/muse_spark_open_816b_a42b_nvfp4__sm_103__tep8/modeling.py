@@ -1285,8 +1285,16 @@ _SM103_TEP8_F11_EXCLUDED_PATHS = (
 #: sm107 TEP8 composition (F11) on GB300, less ``_SM103_TEP8_F11_EXCLUDED_PATHS``, with the sm107 levers (each lever's
 #: rule treats this deployment as sm107's, ``levers.f11_tep8``) and without the sm107 built-in fused-kernel
 #: precondition (sm_103's built-in kernels are the ones that precondition asks sm107 for).
+#: ``MUSESPARK_OPEN_SM103_TEP8_F11_EXTRA_PATHS`` (comma list, empty by default; the F11 analogue of
+#: ``MUSESPARK_OPEN_TEP8_EXTRA_PATHS``) adds fast paths to the sm_103 F11 TEP8 composition; ``TargetPaths`` still refuses
+#: unknown names and a set not closed under ``depends_on``. Its use: ``finalize_two_shot`` (the TP8 enablement,
+#: ``kernels/finalize_two_shot/install.band``): the expert finalize and all-reduce of decode steps from above the
+#: finalize transport's token cap to 152 rows (``TRTLLM_MUSESPARK_TEP8_FINALIZE_TWO_SHOT_MAX_ROWS`` lowers the end) as
+#: one two-shot kernel over the trays' fabric, bitwise the built-in fused kernel up to 128 rows.
+_SM103_TEP8_F11_EXTRA_PATHS = _paths_from_env("MUSESPARK_OPEN_SM103_TEP8_F11_EXTRA_PATHS")
 _SM103_TEP8_F11_TARGET = _dispatch.TargetPaths(
     served=(_SM107_TEP8_PATHS - _SM103_TEP8_F11_EXCLUDED_PATHS)
+    | _SM103_TEP8_F11_EXTRA_PATHS
     | _PREFETCH_LEVERS
     | _SM107_LEVERS
     | _SM107_TEP8_LEVERS,

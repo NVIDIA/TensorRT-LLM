@@ -612,7 +612,7 @@ def test_sm103_tep8_publish_wide_one_k4_switch():
 def test_sm103_tep8_prerouted_128_switch():
     """``MUSESPARK_OPEN_TEP8_PREROUTED_MAX_ROWS`` (64 default, or 128; in no defaults table) extends the
     prerouted two-window calls to 65..128 rows at tile 16 (the stock call's fallback tile there) and keeps tile 8 up to
-    64 rows; ring_buddy_assign's one program covers 1024 slots (128 rows)."""
+    64 rows; ring_buddy_assign covers 2048 slots (1024 before the wide program)."""
     src = (_TARGET / "kernels/replicated_experts/ring_buddy.py").read_text()
     asg = (_TARGET / "ops/moe/ring_buddy_assign.py").read_text()
     name = "MUSESPARK_OPEN_TEP8_PREROUTED_MAX_ROWS"
@@ -624,4 +624,22 @@ def test_sm103_tep8_prerouted_128_switch():
     assert "    return _PREROUTED_TILE if rows <= 64 else 2 * _PREROUTED_TILE\n" in src
     assert "meta_tile=_prerouted_tile(router_logits.shape[0])," in src
     assert 'or meta.get("tile") != _prerouted_tile(rows)' in src and "if tile != _prerouted_tile(rows):" in src
-    assert "\nMAX_SLOTS = 1024\n" in asg
+    assert "\nMAX_SLOTS = 2048\n" in asg  # widened for the 129..256-row wide program
+
+
+def test_sm103_tep8_f11_two_shot_and_wide_switches():
+    """``MUSESPARK_OPEN_SM103_TEP8_F11_EXTRA_PATHS`` (e.g. ``finalize_two_shot``) adds paths to the F11 TEP8
+    composition only, through ``_paths_from_env`` (so the composition tables stay exec-able here); ``MUSESPARK_OPEN_TEP8_WIDE_BALANCE_ROWS`` takes 129..256 and only widens NVFP4 balanced layers;
+    the staged router GEMM switch keeps 129..256 rows. None of them is in a defaults table."""
+    model = (_TARGET / "modeling.py").read_text()
+    rb = (_TARGET / "kernels/replicated_experts/ring_buddy.py").read_text()
+    rg = (_TARGET / "ops/moe/router_gemm.py").read_text()
+    for name in ("MUSESPARK_OPEN_SM103_TEP8_F11_EXTRA_PATHS", "MUSESPARK_OPEN_TEP8_WIDE_BALANCE_ROWS",
+                 "TRTLLM_MUSESPARK_ROUTER_STAGED_GEMM"):
+        assert name not in DEFAULTS.SM103_TEP8_DEFAULTS and name not in DEFAULTS.SM107_DEFAULTS
+    assert '_SM103_TEP8_F11_EXTRA_PATHS = _paths_from_env("MUSESPARK_OPEN_SM103_TEP8_F11_EXTRA_PATHS")' in model
+    assert "    | _SM103_TEP8_F11_EXTRA_PATHS\n" in model
+    assert "if _TEP8_WIDE_BALANCE_ROWS and not 129 <= _TEP8_WIDE_BALANCE_ROWS <= 256:" in rb
+    assert 'if _TEP8_WIDE_BALANCE_ROWS and kind == "nvfp4" and windows >= 2 and balance:' in rb
+    assert '**({"wide": True} if router_logits.shape[0] > 128 else {}),' in rb
+    assert "STAGED_MIN_ROWS = ROW_TILE + 1\nSTAGED_MAX_ROWS = 2 * ROW_TILE\n" in rg

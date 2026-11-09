@@ -97,8 +97,14 @@ def block_of(ranks: int) -> int:
 #: K = 7 verify steps). Opt-in: 64 rows (eight requests), so ring-buddy balance
 #: (``MUSESPARK_OPEN_TEP8_RING_BUDDY_MAX_ROWS=64``) also places the 33..64-row TEP8 steps; the kernel is the
 #: same [SLOTS, RANKS] program at a 512-slot tile. 128 rows (16 requests,
-#: ``MUSESPARK_OPEN_TEP8_RING_BUDDY_MAX_ROWS=128``) at a 1024-slot tile; smaller calls keep their tile.
-MAX_SLOTS = 1024
+#: ``MUSESPARK_OPEN_TEP8_RING_BUDDY_MAX_ROWS=128``) at a 1024-slot tile; smaller calls keep their tile. 256 rows
+#: (``MUSESPARK_OPEN_TEP8_WIDE_BALANCE_ROWS``) on the wide program (``wide=True``).
+MAX_SLOTS = 2048
+#: Tiles above this many slots (more than 128 rows) run the balanced tep8 placement on the wide program when the
+#: caller asks for it (``wide=True``; no routing tables). Per-expert program:
+#: per-expert instead of ``[SLOTS, RANKS]`` work, about 2 us at 1024 / 2048 slots on GB300.
+WIDE_MIN_SLOTS = 1024
+WIDE_NUM_WARPS = 8
 
 #: The half window (``half_window_experts``, tep4): a block's upper half starts at this
 #: local index, and the stack ``[own block | the predecessor's upper half]`` holds
@@ -469,6 +475,63 @@ def balance_ring(load: List[int]) -> Tuple[int, List[int]]:
     return t, x
 
 
+@triton.jit
+def _ring_buddy_assign_wide_kernel(
+    selected_ptr,  # [num_slots] int32 global expert ids
+    weights_ptr,  # [num_slots] float32 routing weights
+    local_ids_ptr,  # [num_slots] int32 out
+    weights_bf16_ptr,  # [num_slots] bfloat16 out
+    stats_ptr,  # [2 * RANKS] int32 out: per-rank loads before, after
+    rank,
+    num_slots,
+    SLOTS: tl.constexpr,
+    EXPERTS: tl.constexpr,
+    RANKS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Wide program: ``_ring_buddy_assign_kernel``'s balanced two-window
+    tep8 placement with per-expert instead of ``[SLOTS, RANKS]`` work. The census is a histogram of the step's ids, the
+    move decision is made once per expert, and each slot gathers its expert's local id: every output is the same
+    integer function of ``selected`` and ``rank`` (device gate: == ``reference``)."""
+    tl.static_assert(BLOCK == 32 and RANKS * BLOCK == EXPERTS, "the tep8 ring of 32-expert blocks")
+    s = tl.arange(0, SLOTS)
+    smask = s < num_slots
+    g = tl.load(selected_ptr + s, mask=smask, other=0)
+    w = tl.load(weights_ptr + s, mask=smask, other=0.0)
+    experts = tl.arange(0, EXPERTS)
+    ranks = tl.arange(0, RANKS)
+    # Census: per-expert slot counts (the masked-off slots load expert 0); a block's presence word sets bit i for each
+    # of its selected experts.
+    counts = tl.histogram(g, EXPERTS) - tl.where(experts == 0, SLOTS - num_slots, 0)
+    i_e = experts % BLOCK
+    bit_e = tl.where(counts > 0, tl.full([EXPERTS], 1, tl.uint32) << i_e.to(tl.uint32),
+                     tl.zeros([EXPERTS], dtype=tl.uint32))
+    word = tl.reduce(tl.reshape(bit_e, [RANKS, BLOCK]), 1, _bit_or)  # [RANKS] uint32
+    load = _popc(word, False)  # [RANKS]
+    # The balanced placement's smallest maximum T and smallest flow x (as the narrow program).
+    span = ranks + 1
+    back = (ranks[:, None] - ranks[None, :] + RANKS) % RANKS  # [r, k]
+    inarc = back[:, None, :] < span[None, :, None]  # [r, n, k]
+    arc = tl.sum(tl.where(inarc, load[None, None, :], 0), axis=2)  # [r, n]
+    need = tl.where(span[None, :] == RANKS, (arc + RANKS - 1) // RANKS, (arc + span[None, :]) // (span[None, :] + 1))
+    t = tl.max(tl.max(need, axis=1), axis=0)
+    x = tl.max(tl.maximum(arc - span[None, :] * t, 0), axis=1)  # [RANKS]
+    # Per expert: it moves to its block's successor when fewer than x[b] selected experts of its block sit above it.
+    word_e = tl.reshape(tl.broadcast_to(word[:, None], [RANKS, BLOCK]), [EXPERTS])
+    x_e = tl.reshape(tl.broadcast_to(x[:, None], [RANKS, BLOCK]), [EXPERTS])
+    blk_e = experts // BLOCK
+    above_e = _popc((word_e >> i_e.to(tl.uint32)) >> 1, False)
+    er_e = (blk_e + (above_e < x_e).to(tl.int32)) % RANKS
+    local_e = tl.where(er_e == rank, tl.where(blk_e == rank, i_e, BLOCK + i_e), 2 * BLOCK + experts % (EXPERTS - 2 * BLOCK))
+    local = tl.gather(local_e, g, 0)  # [SLOTS]
+    tl.store(local_ids_ptr + s, local, mask=smask)
+    tl.store(weights_bf16_ptr + s, w.to(tl.bfloat16), mask=smask)
+    from_prev = ((ranks[:, None] + RANKS - 1) % RANKS) == ranks[None, :]
+    x_prev = tl.sum(tl.where(from_prev, x[None, :], 0), axis=1)
+    tl.store(stats_ptr + ranks, load)
+    tl.store(stats_ptr + RANKS + ranks, load - x + x_prev)
+
+
 class RingBuddyAssign(OpWrapper):
     """Place one step's selected experts on owner or successor; rewrite ids for one rank.
 
@@ -515,6 +578,7 @@ class RingBuddyAssign(OpWrapper):
         ranks: int = RANKS,
         half: bool = False,
         meta_tile: Optional[int] = None,
+        wide: bool = False,
     ):
         block = block_of(ranks)
         static_from = block if static_from is None else static_from
@@ -523,6 +587,14 @@ class RingBuddyAssign(OpWrapper):
         weights_bf16 = torch.empty(selected.shape, dtype=torch.bfloat16, device=selected.device)
         stats = torch.empty(2 * ranks, dtype=torch.int32, device=selected.device)
         slots = max(16, triton.next_power_of_2(num_slots))
+        if (wide and meta_tile is None and slots > WIDE_MIN_SLOTS and ranks == 8 and balance and not half
+                and static_from == block):
+            # The balanced tep8 placement of a > 128-row call on the per-expert program.
+            _ring_buddy_assign_wide_kernel[(1,)](
+                selected, weights, local_ids, weights_bf16, stats, rank, num_slots,
+                SLOTS=slots, EXPERTS=EXPERTS, RANKS=ranks, BLOCK=block, num_warps=WIDE_NUM_WARPS,
+            )
+            return local_ids, weights_bf16, stats
         meta = None
         ctas = 16
         if meta_tile is not None:
@@ -590,6 +662,7 @@ class RingBuddyAssign(OpWrapper):
         ranks: int = RANKS,
         half: bool = False,
         meta_tile: Optional[int] = None,
+        wide: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The placement in plain Python over the host copy of ``selected``
         (``ring_windows.place_half`` with ``half``)."""
@@ -650,6 +723,7 @@ class RingBuddyAssign(OpWrapper):
         ranks: int = RANKS,
         half: bool = False,
         meta_tile: Optional[int] = None,
+        wide: bool = False,
     ) -> None:
         """Inputs the kernel would read past or misplace without an error."""
         assert meta_tile is None or (not half and meta_tile in (8, 16, 32, 64)), (

@@ -150,6 +150,16 @@ if _TEP8_PREROUTED_MAX_ROWS not in (64, 128):
 _TEP8_PREROUTED_ROWS = range(9, _TEP8_PREROUTED_MAX_ROWS + 1)
 
 
+#: ``MUSESPARK_OPEN_TEP8_WIDE_BALANCE_ROWS=<129..256>`` (default unset = off; the wide balance
+#: program) raises the NVFP4 layers' ring-buddy cap to that many rows: above
+#: 128 rows each step's balanced placement runs on ring_buddy_assign's per-expert wide program and the stacked
+#: two-window call keeps the runner's routed default (no prerouted tables). The BF16 layers keep their cap. Not
+#: bitwise vs the owner-only path (the finalize partials round per rank), like every balanced placement.
+_TEP8_WIDE_BALANCE_ROWS = int(_sm107_env("MUSESPARK_OPEN_TEP8_WIDE_BALANCE_ROWS", "") or 0)
+if _TEP8_WIDE_BALANCE_ROWS and not 129 <= _TEP8_WIDE_BALANCE_ROWS <= 256:
+    raise ValueError(f"MUSESPARK_OPEN_TEP8_WIDE_BALANCE_ROWS={_TEP8_WIDE_BALANCE_ROWS}: 129..256")
+
+
 def _prerouted_tile(rows: int) -> int:
     """The token tile of the prerouted tables of a ``rows``-row two-window call: 8 up to 64 rows, 16 above
     (the fallback tile of the 64-expert window at 65..128 rows)."""
@@ -438,6 +448,10 @@ class _State:
             # tep8 (32-expert blocks): serve 17..32-row steps (3-4 requests) on the balanced
             # stack too; ring_buddy_assign covers M <= 32 (MAX_SLOTS). Default keeps the image's 16.
             self.max_rows = int(_sm107_env("MUSESPARK_OPEN_TEP8_RING_BUDDY_MAX_ROWS", MAX_ROWS))
+            if _TEP8_WIDE_BALANCE_ROWS and kind == "nvfp4" and windows >= 2 and balance:
+                # The NVFP4 layers' balanced two-window placement also serves the 129.._ROWS-row decode steps
+                # (17..32 requests at K = 7), placed by ring_buddy_assign's wide program (no prerouted tables there).
+                self.max_rows = max(self.max_rows, _TEP8_WIDE_BALANCE_ROWS)
         if half:
             self.default_window = self.block
             self.by_window = {
@@ -591,6 +605,7 @@ def _patch_routing(moe, state: _State) -> None:
                     state.static_from,
                     ranks=state.ranks,
                     half=state.half,
+                    **({"wide": True} if router_logits.shape[0] > 128 else {}),
                 )
             state.placement = (
                 router_logits,

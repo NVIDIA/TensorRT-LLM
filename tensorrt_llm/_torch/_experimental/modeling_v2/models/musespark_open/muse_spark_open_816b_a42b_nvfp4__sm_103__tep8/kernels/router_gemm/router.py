@@ -109,7 +109,11 @@ class RouterGemmCall:
             return
         self._reported.add((rows, served))
         if served:
-            logger.info(f"[musespark_open] router_gemm: a {rows}-row decode step runs the op")
+            build = _op.staged() if _op.staged_takes(rows) else None
+            logger.info(
+                f"[musespark_open] router_gemm: a {rows}-row decode step runs the op"
+                + (f" ({_op.STAGED_ENV}={build}: the staged GEMM)" if build is not None else "")
+            )
         else:
             logger.warning(
                 f"[musespark_open] router_gemm: an armed {rows}-row router call keeps the built-in "
@@ -236,4 +240,15 @@ def install(model: torch.nn.Module, min_rows: int = _op.MIN_ROWS) -> RouterGemmC
         f"(2 x 128-row tiles)) in {len(layers)} MoE layers; other steps keep the built-in "
         "router"
     )
+    build = _op.staged()
+    if build is not None:
+        # Every rank logs it: the switch is read per process (TRTLLM_MUSESPARK_ROUTER_STAGED_GEMM).
+        epilogue, prewait = _op.STAGED_BUILDS[build]
+        logger.info(
+            f"[musespark_open] router_gemm: {_op.STAGED_ENV}={build}: calls of "
+            f"{max(min_rows, _op.STAGED_MIN_ROWS)}..{_op.STAGED_MAX_ROWS} rows run the staged GEMM "
+            f"({epilogue} epilogue through shared memory"
+            + (", weight tiles loaded before griddepcontrol.wait" if prewait else "")
+            + "; same partials bit for bit)"
+        )
     return call
