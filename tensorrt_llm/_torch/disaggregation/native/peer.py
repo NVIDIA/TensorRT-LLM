@@ -202,20 +202,6 @@ class PeerRegistrar:
                 "both peers must use the same speculative decoding KV cache layout; "
                 "set TRTLLM_DISAGG_SHARED_DRAFT_KV identically on both workers."
             )
-        if self._ri.num_draft_layers:
-            if self._ri.tp_size != peer_ri.tp_size:
-                raise ValueError(
-                    "PeerRegistrar: a shared draft KV cache needs equal tp_size "
-                    f"(local={self._ri.tp_size}, peer={peer_ri.tp_size}); "
-                    "unset TRTLLM_DISAGG_SHARED_DRAFT_KV or use the same TP on both workers."
-                )
-            if self._ri.attention.enable_attention_dp != peer_ri.attention.enable_attention_dp:
-                raise ValueError(
-                    "PeerRegistrar: a shared draft KV cache needs the same attention DP "
-                    f"setting (local={self._ri.attention.enable_attention_dp}, "
-                    f"peer={peer_ri.attention.enable_attention_dp}); unset "
-                    "TRTLLM_DISAGG_SHARED_DRAFT_KV or match it on both workers."
-                )
         self.validate_view_head_geometry(peer_ri)
 
         self_layers = sum(self._ri.layer_num_per_pp)
