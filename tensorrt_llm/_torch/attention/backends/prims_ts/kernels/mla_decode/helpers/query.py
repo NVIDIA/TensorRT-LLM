@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64
+from cutlass.experimental import primitives as prims
 
 
 @dataclass(frozen=True)
@@ -75,7 +76,7 @@ class FlatQueryTileLayout:
 def query_batch_bounds(
     cu_seqlens_q,
     batch_idx,
-    logical_seq_len_q: cutlass.Constexpr[int],
+    logical_seq_len_q: Int32,
 ):
     """Return the compact-storage offset and logical Q length for a batch.
 
@@ -97,7 +98,7 @@ def runtime_flat_query_tile_valid_rows(
     query_tile_idx,
     tile_size_q: cutlass.Constexpr[int],
     logical_num_heads_q: cutlass.Constexpr[int],
-    logical_seq_len_q: cutlass.Constexpr[int],
+    logical_seq_len_q: Int32,
     cu_seqlens_q=None,
     batch_idx=None,
 ):
@@ -122,7 +123,7 @@ def runtime_flat_query_tile_has_rows(
     query_tile_idx,
     tile_size_q: cutlass.Constexpr[int],
     logical_num_heads_q: cutlass.Constexpr[int],
-    logical_seq_len_q: cutlass.Constexpr[int],
+    logical_seq_len_q: Int32,
     cu_seqlens_q=None,
     batch_idx=None,
 ):
@@ -144,7 +145,7 @@ def flat_query_row_state(
     query_tile_idx,
     tile_size_q: cutlass.Constexpr[int],
     logical_num_heads_q: cutlass.Constexpr[int],
-    logical_seq_len_q: cutlass.Constexpr[int],
+    logical_seq_len_q: Int32,
     cu_seqlens_q=None,
     batch_idx=None,
 ):
@@ -158,8 +159,24 @@ def flat_query_row_state(
     local_flat_query_row = Int32(query_tile_idx) * Int32(tile_size_q) + Int32(
         row_in_tile
     )
-    logical_q_idx = local_flat_query_row // Int32(logical_num_heads_q)
-    logical_head_idx = local_flat_query_row - logical_q_idx * Int32(logical_num_heads_q)
+    if cutlass.const_expr(
+        not isinstance(logical_seq_len_q, int)
+        and tile_size_q % logical_num_heads_q == 0
+    ):
+        # Runtime Q benefits from factoring the tile/head ratio. Static Q keeps
+        # the shared flat-coordinate quotient/remainder to limit live values
+        # in the fused RoPE/quantization epilogue.
+        row_q_idx = Int32(row_in_tile) // Int32(logical_num_heads_q)
+        logical_q_idx = (
+            Int32(query_tile_idx) * Int32(tile_size_q // logical_num_heads_q)
+            + row_q_idx
+        )
+        logical_head_idx = Int32(row_in_tile) - row_q_idx * Int32(logical_num_heads_q)
+    else:
+        logical_q_idx = local_flat_query_row // Int32(logical_num_heads_q)
+        logical_head_idx = local_flat_query_row - logical_q_idx * Int32(
+            logical_num_heads_q
+        )
     q_start, q_len = query_batch_bounds(
         cu_seqlens_q,
         batch_idx,
@@ -208,31 +225,50 @@ def split_o_element_offset(
 ):
     """Return a batch-dynamic partial-O offset with 64-bit-safe products.
 
-    Batch size is intentionally absent from the compile signature, so the
-    complete workspace extent cannot prove that every offset fits in Int32.
-    The within-batch layout is still compile-time constant, however. Keep that
-    common bounded part in 32-bit arithmetic and widen only the batch-stride
-    product. Use fully widened arithmetic when a profile's per-batch layout
-    alone exceeds Int32.
+    Batch and Q extents are runtime values. Widen their tile index, but keep
+    the bounded head/split offset in 32-bit arithmetic to avoid carrying wide
+    intermediates through the output epilogue.
     """
 
-    elements_per_batch = (
-        cfg.seq_len_q * cfg.num_heads_q * cfg.num_ctas_per_seq_kv * cfg.head_dim_v
-    )
-    if cutlass.const_expr(elements_per_batch <= (1 << 31) - 1):
-        within_batch_offset = (
-            (Int32(q_idx) * Int32(cfg.num_heads_q) + Int32(head_idx))
-            * Int32(cfg.num_ctas_per_seq_kv)
-            + Int32(split_idx)
+    elements_per_tile = cfg.num_heads_q * cfg.num_ctas_per_seq_kv * cfg.head_dim_v
+    tile_idx = Int64(batch_idx) * Int64(cfg.seq_len_q) + Int64(q_idx)
+    if cutlass.const_expr(elements_per_tile <= (1 << 31) - 1):
+        within_tile_offset = (
+            Int32(head_idx) * Int32(cfg.num_ctas_per_seq_kv) + Int32(split_idx)
         ) * Int32(cfg.head_dim_v) + Int32(dim_idx)
-        return Int64(batch_idx) * Int64(elements_per_batch) + Int64(within_batch_offset)
+        return tile_idx * Int64(elements_per_tile) + Int64(within_tile_offset)
 
     return (
-        (
-            (Int64(batch_idx) * Int64(cfg.seq_len_q) + Int64(q_idx))
-            * Int64(cfg.num_heads_q)
-            + Int64(head_idx)
-        )
+        (tile_idx * Int64(cfg.num_heads_q) + Int64(head_idx))
         * Int64(cfg.num_ctas_per_seq_kv)
         + Int64(split_idx)
     ) * Int64(cfg.head_dim_v) + Int64(dim_idx)
+
+
+@cute.jit
+def copy_q_fp8_to_tmem(source, tmem_base, *, cta_group: cutlass.Constexpr[int]):
+    """Copy64x512 E4M3 Q values to Layout E(1CTA) or Layout B(2CTA).
+
+    Source consists of four SW128 panels. Callers own source lifetime and
+    copy-to-consumer ordering; this helper adds no synchronization.
+    """
+    assert cta_group in (1, 2)
+    group = prims.CTAGroup.CTA_1 if cta_group == 1 else prims.CTAGroup.CTA_2
+    base_desc = Int64(
+        prims.Tcgen05SmemDesc.build(
+            source,
+            leading_byte_offset=16,
+            stride_byte_offset=1024,
+            layout=2,
+        )
+    )
+    for part in cutlass.range_constexpr(32):
+        # The aligned start-address field stays inside the256KiB SMEM range.
+        descriptor = base_desc + Int64((part // 8) * 512 + part % 8)
+        prims.tcgen05_cp(
+            prims.Tcgen05CpShape.SHAPE_64X128B,
+            prims.make_tmem_ptr(tmem_base + Int32(part * 4), Int32),
+            descriptor,
+            group=group,
+            multicast=prims.Tcgen05CpMulticast.WARPX2_02_13,
+        )

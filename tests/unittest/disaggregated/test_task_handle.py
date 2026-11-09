@@ -56,6 +56,15 @@ from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 pytestmark = pytest.mark.cpu_only
 
 
+_KV_RESULT_REPORT_TOKEN = b"report-token-123"
+
+
+def _publish_report_tokens(session, ranks=range(16)):
+    """Publish the per-writer report tokens that Receiver.dispatch_task mints."""
+    for task in getattr(session, "_kv_tasks", []):
+        task._kv_result_report_tokens = {int(r): _KV_RESULT_REPORT_TOKEN for r in ranks}
+
+
 def _owes_a_report(outcome) -> bool:
     """No conclusion yet, or one that is still owed a report.
 
@@ -112,12 +121,14 @@ def _report(
     is_last_slice: bool = True,
     transfer_size: int = 0,
 ):
+    _publish_report_tokens(session)
     session.process_kv_agent_result(
         peer_rank=peer_rank,
         receiver_slice_id=0,
         is_last_slice=is_last_slice,
         status=status,
         transfer_size=transfer_size,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
 
 
@@ -713,6 +724,8 @@ def test_a_send_session_reads_a_parked_cancel_as_the_peers_too():
     outcome = TaskHandle(session, task, TOKENS).poll()
     assert isinstance(outcome, Cancelled)
     assert outcome.by_peer is True
+    assert session.close() is True
+    assert sender._sessions == {}
 
 
 # ---------------------------------------------------------------------------
@@ -837,6 +850,7 @@ def test_queued_sender_abort_preserves_the_committed_cancellation(
         peer_rank=0,
         peer_endpoint="tcp://receiver:1234",
         task=task,
+        kv_result_report_token=b"",
     )
 
     sender._deliver_kv_to_agent(write_meta)
