@@ -262,6 +262,8 @@ l0_b200:
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_router_logits_kernel_matches_router_gemm
   - unittest/_torch/moe/test_megamoe_streaming_load.py
+  # Unquantized BF16 MegaMoE CuteDSL against a float32 reference and CUTLASS BF16.
+  - unittest/_torch/moe/test_megamoe_cute_dsl_bf16.py -k "ep1 or cutlass"
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics

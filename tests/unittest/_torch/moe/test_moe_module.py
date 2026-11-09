@@ -1233,7 +1233,7 @@ def should_skip_MegaMoECuteDsl(
     """Check MegaMoECuteDsl constraints for module-level multi-GPU tests.
 
     Mirrors :func:`should_skip_MegaMoEDeepGemm` but applies to the
-    NVFP4 CuteDSL variant: the kernel owns cross-rank exchange via
+    CuteDSL leaves (NVFP4, unquantized BF16): the kernel owns cross-rank exchange via
     ``MegaMoeSymmMemProvider``, so any forced host comm method is
     rejected. Multi-GPU coverage is limited to EP-shard routing
     (``DEP`` / ``TEP``) and routing methods exercised elsewhere in
@@ -1854,6 +1854,14 @@ MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
     comm_methods=[MEGAMOE_IGNORE_COMM_METHOD],
     should_skip_fn=should_skip_MegaMoECuteDsl,
 )
+# The unquantized BF16 leaf of the same backend (SM100/SM103).
+MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
+    backend_type=MoeBackendType.MEGAMOE_CUTEDSL,
+    quant_algo=None,
+    parallel_modes=MEGAMOE_PARALLEL_MODES,
+    comm_methods=[MEGAMOE_IGNORE_COMM_METHOD],
+    should_skip_fn=should_skip_MegaMoECuteDsl,
+)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs to run this test")
@@ -2304,7 +2312,9 @@ def _generate_megamoe_eplb_test_params(
     shared-staging tensors registered by their quantization method, so slot
     migration replaces all derived state atomically alongside the raw
     weights + scales. Only the backend/quant enum and capability skip hook
-    differ between DeepGemm (W4A8_MXFP4_MXFP8) and CuteDsl (NVFP4).
+    differ between DeepGemm (W4A8_MXFP4_MXFP8) and CuteDsl (NVFP4, and
+    unquantized BF16, whose kernel reads the standard ``w3_w1_weight`` /
+    ``w2_weight`` the unquantized method stages for migration).
 
     The comm method is hardcoded to the ``IGNORE`` sentinel: the fused
     kernel owns dispatch/combine, so the harness must pop
@@ -2408,6 +2418,12 @@ EPLB_TEST_PARAMS = (
     + _generate_megamoe_eplb_test_params(
         backend_type=MoeBackendType.MEGAMOE_CUTEDSL,
         quant_algo=QuantAlgo.NVFP4,
+        should_skip_fn=should_skip_MegaMoECuteDsl,
+    )
+    # The unquantized BF16 leaf declares EPLB support too (SM100/SM103).
+    + _generate_megamoe_eplb_test_params(
+        backend_type=MoeBackendType.MEGAMOE_CUTEDSL,
+        quant_algo=None,
         should_skip_fn=should_skip_MegaMoECuteDsl,
     )
 )

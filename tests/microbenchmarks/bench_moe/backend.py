@@ -124,8 +124,8 @@ def find_backend_class(backend_type: MoeBackendType, quant_algo=None):
 
     For a caller enumerating combinations to decide which are worth running,
     "no leaf publishes this format" is an answer and not a failure. Only the
-    TRTLLM, CUTLASS and CUTEDSL branches can give it, so the rest is delegated
-    rather than restated.
+    TRTLLM, CUTLASS, CUTEDSL and MEGAMOE_CUTEDSL branches can give it, so the
+    rest is delegated rather than restated.
 
     Names one class. A caller deciding whether a configuration is *runnable*
     wants :func:`find_backend_classes` instead, because for CUTLASS
@@ -143,6 +143,17 @@ def find_backend_class(backend_type: MoeBackendType, quant_algo=None):
         from tensorrt_llm._torch.moe.fused_moe.cutedsl import find_cutedsl_grouped_gemm_leaf
 
         return find_cutedsl_grouped_gemm_leaf(quant_algo)
+    if backend_type == MoeBackendType.MEGAMOE_CUTEDSL:
+        # One leaf per format (NVFP4, unquantized BF16) behind the one literal,
+        # looked up the way the leaves' quant gates read the format, so the
+        # NVFP4 calibration aliases land on the NVFP4 leaf. Importing
+        # ``mega_moe`` registers both.
+        from tensorrt_llm._torch.moe.fused_moe import mega_moe  # noqa: F401
+        from tensorrt_llm._torch.moe.fused_moe.impl_contract import canonical_quant, normalize_quant
+        from tensorrt_llm._torch.moe.fused_moe.impl_identity import MOE_IMPL_REGISTRY, MoEImplId
+
+        quant = normalize_quant(canonical_quant(quant_algo))
+        return MOE_IMPL_REGISTRY.lookup(MoEImplId("trtllm", "cutedsl", "mega_moe", quant))
     return get_backend_class(backend_type, quant_algo)
 
 
@@ -165,9 +176,9 @@ def find_backend_classes(backend_type: MoeBackendType, quant_algo=None) -> tuple
 def get_backend_class(backend_type: MoeBackendType, quant_algo=None):
     """Import and return the concrete backend class for ``backend_type`` lazily.
 
-    ``quant_algo`` is only consulted for ``TRTLLM``, ``CUTLASS`` and
-    ``CUTEDSL``, whose leaves are keyed by quantization format; every other
-    backend is one class. Raises when no leaf publishes the format -- see
+    ``quant_algo`` is only consulted for ``TRTLLM``, ``CUTLASS``, ``CUTEDSL``
+    and ``MEGAMOE_CUTEDSL``, whose leaves are keyed by quantization format;
+    every other backend is one class. Raises when no leaf publishes the format -- see
     :func:`find_backend_class` for the lookup that reports absence instead.
     """
     if backend_type == MoeBackendType.CUTLASS:
@@ -198,7 +209,8 @@ def get_backend_class(backend_type: MoeBackendType, quant_algo=None):
 
         return MegaMoEDeepGemm
     if backend_type == MoeBackendType.MEGAMOE_CUTEDSL:
-        from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl
-
-        return MegaMoECuteDsl
+        cls = find_backend_class(backend_type, quant_algo)
+        if cls is None:
+            raise ValueError(f"no MEGAMOE_CUTEDSL implementation for quant_algo={quant_algo!r}")
+        return cls
     raise ValueError(f"unknown MoE backend {backend_type!r}")

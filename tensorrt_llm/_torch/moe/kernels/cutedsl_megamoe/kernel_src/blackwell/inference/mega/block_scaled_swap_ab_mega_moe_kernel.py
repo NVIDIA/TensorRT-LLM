@@ -14,9 +14,15 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cutlass_dsl import Boolean, Int32, Int64
 
+from .....activation_def import ExpertActivation
 from .....api import ImplDesc, KernelClass, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from .....communication.nvlink_domain.token_comm import TokenCommArgs, TokenCommNonDeterministic
-from .....helpers.cute_py_helpers import Tcgen05MmaInstruction, make_tcgen05_tmem_plan, tcgen05_block_scaled_acc_dtype
+from .....helpers.cute_py_helpers import (
+    Tcgen05MmaInstruction,
+    make_tcgen05_tmem_plan,
+    tcgen05_block_scaled_acc_dtype,
+    tcgen05_dense_acc_dtype,
+)
 from .....helpers.device_workspace import DeviceWorkspace
 from .....helpers.dlb_expert_count import resolve_dlb_expert_counts
 from .....helpers.iket_compat import iket
@@ -58,7 +64,17 @@ _aot_symbol_prefix = "blackwell_mega_moe_aot"
 
 
 class BlockScaledSwapAbMegaMoeKernel(KernelClass):
-    """Compose pull dispatch, persistent FC12, token-back, and reduction."""
+    """Compose pull dispatch, persistent FC12, token-back, and reduction.
+
+    ``quant_kind`` selects a block-scaled kind (scale factors travel with the activation and the
+    weights, and FC1 re-quantizes its output) or the unquantized ``bf16`` kind (dense kind::f16
+    MMAs, bf16 dispatch and FC1 output, and every scale-factor argument None).
+
+    ``expert_activation`` (``activation_def.ExpertActivation``; absent or None infers SiTU from
+    ``situ_beta``, else SwiGLU) selects the elementwise function between FC1 and FC2. A gated kind
+    folds FC1's [gate, up] row pairs, so FC2's K is half of ``intermediate_gateup_size``; the
+    non-gated ``relu2`` (bf16 only) keeps one feature per FC1 row, so the two extents are equal.
+    """
 
     fc1_output_region: ClassVar[str] = "blackwell.mega_moe.fc1_output"
     fc1_output_sf_region: ClassVar[str] = "blackwell.mega_moe.fc1_output_sf"
@@ -88,6 +104,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "gate_up_clamp": Optional[float],
             "situ_beta": OptionalRequirement(Optional[float]),
             "situ_linear_beta": OptionalRequirement(Optional[float]),
+            # An ExpertActivation value; see from_problem_desc for the inference when absent.
+            "expert_activation": OptionalRequirement(Optional[str]),
             # "swiglu" (default) or "quick_geglu"; validated by the epilogue, keyed in name().
             "gate_activation": OptionalRequirement(str),
             "swiglu_alpha": OptionalRequirement(Optional[float]),
@@ -153,9 +171,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.quant_kind = QuantKind(problem_desc["quant_kind"])
         self.a_dtype = self.quant_kind.weight_dtype
         self.b_dtype = self.quant_kind.activation_dtype
-        self.sf_dtype = self.quant_kind.sf_dtype
-        self.sf_vec_size = self.quant_kind.sf_vec_size
-        self.acc_dtype = tcgen05_block_scaled_acc_dtype
+        self.is_block_scaled = self.quant_kind.is_block_scaled
+        # None for bf16, which also makes the MMA instruction below a dense (no-SF) one.
+        self.sf_dtype = self.quant_kind.sf_dtype if self.is_block_scaled else None
+        self.sf_vec_size = self.quant_kind.sf_vec_size if self.is_block_scaled else None
+        self.acc_dtype = tcgen05_block_scaled_acc_dtype if self.is_block_scaled else tcgen05_dense_acc_dtype
         self.a_major_mode = problem_desc["a_major_mode"]
         self.b_major_mode = problem_desc["b_major_mode"]
         self.combine_format = problem_desc["combine_format"]
@@ -170,6 +190,21 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.topk_index_dtype = problem_desc["topk_index_dtype"]
         self.max_tokens_per_rank = problem_desc["max_tokens_per_rank"]
         self.apply_topk_at_fc1 = problem_desc["apply_topk_at_fc1"]
+        # Resolved once here and written explicitly into the descriptor the FC12 components get
+        # (fc12_problem_desc below), so no component can infer a different kind.
+        self.expert_activation = ExpertActivation.from_problem_desc(problem_desc)
+        if not self.expert_activation.is_gated and self.is_block_scaled:
+            raise NotImplementedError(
+                f"The non-gated {self.expert_activation} activation runs only on the unquantized "
+                f"bf16 kind; the {self.quant_kind} FC1 epilogue re-quantizes gated outputs only."
+            )
+        # FC2's K, which is also the width of the FC1 output FC2 reads. _validate_geometry reads
+        # it, and rejects the runtime extents that leave it None.
+        self.intermediate_downproj = (
+            self.expert_activation.intermediate_downproj(self.intermediate_gateup_size)
+            if isinstance(self.intermediate_gateup_size, int)
+            else None
+        )
         self.fc1_activation_per_token_scale = bool(problem_desc.get("fc1_activation_per_token_scale", False))
 
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
@@ -317,7 +352,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.other_warp_register_count = 64 if wide_layout else 72
         self.max_tokens = self.token_comm.worst_case_token_count
 
-        fc12_problem_desc = ProblemDesc({**problem_desc, "expert_count": self.local_expert_count})
+        fc12_problem_desc = ProblemDesc(
+            {**problem_desc, "expert_count": self.local_expert_count, "expert_activation": str(self.expert_activation)}
+        )
         resolved_impl_desc = ImplDesc(
             {
                 **impl_desc,
@@ -352,6 +389,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.epilogue = SwapABGatedActEpilogue(fc12_problem_desc, resolved_impl_desc)
         if self.epilogue.fc1_output_dtype is not self.b_dtype:
             raise ValueError("Epilogue FC1 output dtype must match the Mainloop B dtype.")
+        # Both are None for bf16: FC1 then writes no scale plane and FC2 loads none.
         if self.epilogue.fc1_output_sf_dtype is not self.sf_dtype:
             raise ValueError("Epilogue FC1 output scale dtype must match the Mainloop scale dtype.")
         if self.epilogue.sf_vec_size != self.sf_vec_size:
@@ -410,8 +448,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             raise ValueError(f"topk_index_dtype must be Int32 or Int64, got {self.topk_index_dtype}.")
         if self.reduce_topk_in_kernel and not self.apply_topk_at_fc1:
             raise ValueError("In-kernel top-k reduction requires apply_topk_at_fc1=True.")
-        if self.intermediate_gateup_size % 2 != 0:
-            raise ValueError("The SwiGLU intermediate dimension must be even.")
+        if self.expert_activation.is_gated and self.intermediate_gateup_size % 2 != 0:
+            raise ValueError(f"The gated {self.expert_activation} intermediate dimension must be even.")
         if self.max_tokens_per_rank <= 0:
             raise ValueError("max_tokens_per_rank must be positive.")
         if self.token_padding_block <= 0:
@@ -432,7 +470,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             raise ValueError("epi_flag_batches must contain FC1 and FC2 batch sizes.")
         if any(batch < 1 or batch > 32 for batch in self.epi_flag_batches):
             raise ValueError("epi_flag_batches values must be in [1, 32].")
-        if self.sf_vec_size <= 0:
+        if self.is_block_scaled and self.sf_vec_size <= 0:
             raise ValueError("sf_vec_size must be positive.")
         if self.quant_kind.needs_unpack_tma(self.architecture):
             # The fp4 weight reaches SMEM through the unpacking TMA, whose inner tensor dimension
@@ -442,7 +480,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             # gets intermediate_downproj to a multiple of 64.
             for name, extent in (
                 ("hidden_size", self.hidden_size),
-                ("intermediate_downproj", self.intermediate_gateup_size // 2),
+                ("intermediate_downproj", self.intermediate_downproj),
             ):
                 if extent % 128 != 0:
                     raise ValueError(
@@ -456,10 +494,39 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             raise ValueError(f"mma_tiler M must be {expected_mma_m}, got {mma_m}.")
         if mma_n not in (64, 128, 256):
             raise ValueError(f"mma_tiler N must be 64, 128, or 256, got {mma_n}.")
-        if mma_k % (self.sf_vec_size * 4) != 0:
-            raise ValueError("mma_tiler K must be divisible by four scale-factor vectors.")
-        if self.intermediate_gateup_size % (self.sf_vec_size * 4) != 0:
-            raise ValueError("The intermediate dimension must be divisible by four scale-factor vectors.")
+        if self.is_block_scaled:
+            if mma_k % (self.sf_vec_size * 4) != 0:
+                raise ValueError("mma_tiler K must be divisible by four scale-factor vectors.")
+            if self.intermediate_gateup_size % (self.sf_vec_size * 4) != 0:
+                raise ValueError("The intermediate dimension must be divisible by four scale-factor vectors.")
+        else:
+            # Without scale blocks the only K granule is the instruction itself. A gated kind's FC1
+            # weight rows arrive as [gate 16, up 16] groups (SwapABGatedActEpilogue), so the gate/up
+            # extent must hold whole groups; partial FC1 / FC2 tiles beyond it are TMA zero-fill and
+            # clipped stores, and whole groups also keep every bf16 row 16 B aligned for TMA.
+            instruction_k = self.quant_kind.instruction_k("1x")
+            if mma_k % instruction_k != 0:
+                raise ValueError(
+                    f"{self.quant_kind} mma_tiler K must be a multiple of the kind::f16 "
+                    f"instruction K {instruction_k}, got {mma_k}."
+                )
+            gate_up_group = 2 * SwapABGatedActEpilogue._EpilogueFc1GateUpInterleave
+            if self.expert_activation.is_gated:
+                if self.intermediate_gateup_size % gate_up_group != 0:
+                    raise ValueError(
+                        f"{self.quant_kind} requires intermediate_gateup_size to hold whole "
+                        f"[gate, up] row groups, i.e. be a multiple of {gate_up_group}, got "
+                        f"{self.intermediate_gateup_size}."
+                    )
+            elif self.intermediate_downproj % instruction_k != 0:
+                # A non-gated FC1 row is one FC2 input, so the gated rule's implied FC2 K granule
+                # (half a [gate, up] group: one instruction K) applies to the FC1 rows directly.
+                # TMA alone would accept any 16 B-aligned row, i.e. a multiple of 8.
+                raise ValueError(
+                    f"{self.quant_kind} {self.expert_activation} requires intermediate_gateup_size "
+                    f"(FC2's K) to be a multiple of the kind::f16 instruction K {instruction_k}, "
+                    f"got {self.intermediate_gateup_size}."
+                )
         if cluster_n != 1:
             raise ValueError(f"The swap-AB FC12 path requires cluster N=1, got {cluster_n}.")
         if cluster_m <= 0 or cluster_m > 16 or cluster_m & (cluster_m - 1):
@@ -502,9 +569,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             )
 
     def _build_device_workspace(self) -> DeviceWorkspace:
-        intermediate_downproj = self.intermediate_gateup_size // 2
-        sf_column_count = round_up(ceil_div(intermediate_downproj, self.sf_vec_size), 4)
-        max_sf_rows = self.token_comm.worst_case_sf_token_count
+        intermediate_downproj = self.intermediate_downproj
         counter_slot_count = self.token_comm.max_fc1_ready_slot_count
 
         device_workspace = DeviceWorkspace()
@@ -516,14 +581,18 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             mem_order=(1, 0),
             byte_alignment=128,
         )
-        device_workspace.register(
-            self.fc1_output_sf_region,
-            self.epilogue.fc1_output_sf_dtype,
-            (max_sf_rows, sf_column_count),
-            buffer_space="local",
-            mem_order=(1, 0),
-            byte_alignment=128,
-        )
+        # FC1 re-quantizes for a block-scaled FC2 only; the bf16 FC1 output carries no scale plane.
+        if self.is_block_scaled:
+            sf_column_count = round_up(ceil_div(intermediate_downproj, self.sf_vec_size), 4)
+            max_sf_rows = self.token_comm.worst_case_sf_token_count
+            device_workspace.register(
+                self.fc1_output_sf_region,
+                self.epilogue.fc1_output_sf_dtype,
+                (max_sf_rows, sf_column_count),
+                buffer_space="local",
+                mem_order=(1, 0),
+                byte_alignment=128,
+            )
         device_workspace.register(
             self.fc1_done_counter_region,
             cutlass.Int32,
@@ -600,10 +669,15 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             else "x".join(str(dimension) for dimension in self.fallback_cluster_shape_mn)
         )
         epi_flags = "x".join(str(batch) for batch in self.epi_flag_batches)
+        # "none" for bf16; the block-scaled names (and so their cache entries) are unchanged.
+        sf_vec = "none" if self.sf_vec_size is None else self.sf_vec_size
+        # Only a non-gated kind adds a token, so every SwiGLU / SiTU name (and cache entry) is
+        # unchanged; SiTU is already told apart by its betas below.
+        activation = "" if self.expert_activation.is_gated else f"_act{self.expert_activation}"
         return (
             f"sm100_block_scaled_swap_ab_mega_moe_{self.quant_kind}_"
             f"{dtype_name(self.a_dtype)}_{dtype_name(self.b_dtype)}_{dtype_name(self.acc_dtype)}_"
-            f"sfvec{self.sf_vec_size}_a{self.a_major_mode.name.lower()}_b{self.b_major_mode.name.lower()}_"
+            f"sfvec{sf_vec}_a{self.a_major_mode.name.lower()}_b{self.b_major_mode.name.lower()}_"
             f"e{self.expert_count}_ep{self.world_size}_topk{self.topk}_"
             f"helpers{self.helper_expert_count}_"
             f"topkidx{dtype_name(self.topk_index_dtype)}_"
@@ -630,6 +704,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             # Off / SwiGLU keep the historical name so existing compiled-kernel caches stay valid.
             + ("_fc1actscale" if self.fc1_activation_per_token_scale else "")
             + (f"_act{self.gate_activation}" if self.gate_activation != "swiglu" else "")
+            + activation
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -659,31 +734,33 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         tokens = self.max_tokens_per_rank
         hidden = self.hidden_size
         intermediate_gateup = self.intermediate_gateup_size
-        intermediate_downproj = intermediate_gateup // 2
+        intermediate_downproj = self.intermediate_downproj
         experts = self.local_expert_count
-        sf_vec_size = self.sf_vec_size
-        # Weight SF is atom-swizzled and opaque, so its extent is whatever the caller staged, not a kernel choice.
-        fc1_weight_sf_columns = round_up(intermediate_gateup, 128) * round_up(hidden // sf_vec_size, 4)
-        fc2_weight_sf_columns = round_up(hidden, 128) * round_up(intermediate_downproj // sf_vec_size, 4)
+        fc1_weight_sf_columns = fc2_weight_sf_columns = None
+        if self.is_block_scaled:
+            sf_vec_size = self.sf_vec_size
+            # Weight SF is atom-swizzled and opaque, so its extent is whatever the caller staged, not a kernel choice.
+            fc1_weight_sf_columns = round_up(intermediate_gateup, 128) * round_up(hidden // sf_vec_size, 4)
+            fc2_weight_sf_columns = round_up(hidden, 128) * round_up(intermediate_downproj // sf_vec_size, 4)
         # TopkReduce and the in-kernel REDG both take their output dtype from this tensor.
         output_dtype = cutlass.BFloat16
+
+        def scale_factor_tensor(dtype, shape):
+            # The bf16 kind has no scale-factor tensors at all: its three SF arguments are None.
+            return fake_tensor(dtype, shape, (1, 0), {0}, 16) if self.is_block_scaled else None
 
         fake_arguments = dict(
             # Swap-AB puts the weights on the MMA A operand, so the token wire dtype is TokenComm's, not a_dtype.
             activation=fake_tensor(self.token_comm.activation_dtype, (tokens, hidden), (1, 0), {0}, 16),
-            activation_sf=fake_tensor(
-                self.token_comm.activation_sf_dtype,
-                (tokens, self.token_comm.activation_sf_hidden_padded),
-                (1, 0),
-                {0},
-                16,
+            activation_sf=scale_factor_tensor(
+                self.token_comm.activation_sf_dtype, (tokens, self.token_comm.activation_sf_hidden_padded)
             ),
             topk_indices=fake_tensor(self.topk_index_dtype, (tokens, self.topk), (1, 0), {0}, 16),
             topk_scores=fake_tensor(cutlass.Float32, (tokens, self.topk), (1, 0), {0}, 4),
             fc1_weight=fake_tensor(self.a_dtype, (experts, hidden, intermediate_gateup), (2, 0, 1), {0, 2}, 16),
-            fc1_weight_sf=fake_tensor(self.sf_dtype, (experts, fc1_weight_sf_columns), (1, 0), {0}, 16),
+            fc1_weight_sf=scale_factor_tensor(self.sf_dtype, (experts, fc1_weight_sf_columns)),
             fc2_weight=fake_tensor(self.a_dtype, (experts, intermediate_downproj, hidden), (2, 0, 1), {0, 2}, 16),
-            fc2_weight_sf=fake_tensor(self.sf_dtype, (experts, fc2_weight_sf_columns), (1, 0), {0}, 16),
+            fc2_weight_sf=scale_factor_tensor(self.sf_dtype, (experts, fc2_weight_sf_columns)),
             output_activation=fake_tensor(output_dtype, (tokens, hidden), (1, 0), {0}, 16),
             # Opaque byte workspaces: a bare base pointer, like to_cute_ptr. The 128-byte promise matches the
             # alignment the registered regions assume, so the caller must hand over 128-byte-aligned bases.
@@ -772,13 +849,16 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
     def __call__(
         self,
         activation: cute.Tensor,  # (tokens, hidden)
-        activation_sf: cute.Tensor,  # (tokens, hidden // activation_sf_vector_size)
+        # (tokens, hidden // activation_sf_vector_size); None for bf16
+        activation_sf: Optional[cute.Tensor],
         topk_indices: cute.Tensor,  # (tokens, topk)
         topk_scores: cute.Tensor,  # (tokens, topk)
         fc1_weight: cute.Tensor,  # (local_experts, hidden, intermediate_gateup)
-        fc1_weight_sf: cute.Tensor,  # (local_experts, packed_fc1_scale_factors)
+        # (local_experts, packed_fc1_scale_factors); None for bf16
+        fc1_weight_sf: Optional[cute.Tensor],
         fc2_weight: cute.Tensor,  # (local_experts, intermediate_downproj, hidden)
-        fc2_weight_sf: cute.Tensor,  # (local_experts, packed_fc2_scale_factors)
+        # (local_experts, packed_fc2_scale_factors); None for bf16
+        fc2_weight_sf: Optional[cute.Tensor],
         output_activation: cute.Tensor,  # (tokens, hidden)
         local_workspace: cute.Pointer,  # local GMEM byte workspace
         shared_workspace: cute.Pointer,  # symmetric GMEM byte workspace
@@ -800,7 +880,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         # Caller-owned int32[1] live-token count for persistent finalization.
         num_valid_tokens: Optional[cute.Tensor] = None,
     ) -> None:
-        """Launch router, fused MegaMoE compute, and optional TopK reduce."""
+        """Launch router, fused MegaMoE compute, and optional TopK reduce.
+
+        The three scale-factor tensors are required for a block-scaled kind and must be None for
+        bf16; they keep their positions so the block-scaled ABI is unchanged.
+        """
         # One constexpr bool: the DSL preprocessor only treats a plain ``const_expr(...)`` test as
         # static, so a ``raise`` under ``const_expr(a) or const_expr(b)`` is rejected as an early exit.
         gin_argument_mismatch: cutlass.Constexpr = ((gin_dev_comm is None) != (gin_window is None)) or (
@@ -868,6 +952,16 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
 
         if cutlass.const_expr(topk_indices.element_type is not self.topk_index_dtype):
             raise TypeError(f"topk_indices must be the declared {self.topk_index_dtype}, got {topk_indices.dtype}.")
+        for operand_name, operand in (
+            ("activation_sf", activation_sf),
+            ("fc1_weight_sf", fc1_weight_sf),
+            ("fc2_weight_sf", fc2_weight_sf),
+        ):
+            if cutlass.const_expr((operand is None) == self.is_block_scaled):
+                raise ValueError(
+                    f"{self.quant_kind} requires {operand_name} to be "
+                    f"{'given' if self.is_block_scaled else 'None: it has no scale factors'}."
+                )
         for operand_name, operand, expected_dtype in (
             ("activation", activation, self.b_dtype),
             ("activation_sf", activation_sf, self.sf_dtype),
@@ -876,7 +970,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             ("fc2_weight", fc2_weight, self.a_dtype),
             ("fc2_weight_sf", fc2_weight_sf, self.sf_dtype),
         ):
-            if cutlass.const_expr(operand.element_type is not expected_dtype):
+            if cutlass.const_expr(operand is not None and operand.element_type is not expected_dtype):
                 raise TypeError(
                     f"{self.quant_kind} requires {operand_name} to be {expected_dtype}, got {operand.element_type}."
                 )
@@ -887,10 +981,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 ("fc1_norm_const", fc1_norm_const),
             ):
                 if cutlass.const_expr(scalar is not None):
-                    raise ValueError(
-                        f"{self.quant_kind} folds its rescale into the e8m0 scale factors, "
-                        f"so {scalar_name} must be None."
-                    )
+                    reason = "folds its rescale into the e8m0 scale factors" if self.is_block_scaled else "is unscaled"
+                    raise ValueError(f"{self.quant_kind} {reason}, so {scalar_name} must be None.")
 
         router_topk_scores = topk_scores if cutlass.const_expr(self.apply_topk_at_fc1) else None
         # The internode router packs the Stage 1 relay messages from the caller's FP4 rows and scale
@@ -926,9 +1018,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 stream,
             )
         activation_pool = self.token_comm.fc1_activation_tensor(self._device_workspace)
-        activation_sf_pool = self.token_comm.fc1_activation_sf_tensor(self._device_workspace)
+        if cutlass.const_expr(self.is_block_scaled):
+            activation_sf_pool = self.token_comm.fc1_activation_sf_tensor(self._device_workspace)
         fc1_output = self._device_workspace.tensor(self.fc1_output_region)
-        fc1_output_sf = self._device_workspace.tensor(self.fc1_output_sf_region)
+        if cutlass.const_expr(self.is_block_scaled):
+            fc1_output_sf = self._device_workspace.tensor(self.fc1_output_sf_region)
 
         topk_reduce_counters = (
             self._device_workspace.tensor(self.topk_reduce_counter_region)
@@ -939,7 +1033,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         experts = self.local_expert_count
         hidden = self.hidden_size
         intermediate_gateup = self.intermediate_gateup_size
-        intermediate_downproj = intermediate_gateup // 2
+        intermediate_downproj = self.intermediate_downproj
         fc1_weight = rewrite_tensor_shape(fc1_weight, (experts, hidden, intermediate_gateup))
         fc2_weight = rewrite_tensor_shape(fc2_weight, (experts, intermediate_downproj, hidden))
 
@@ -968,29 +1062,32 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             ),
         )
 
-        sf_vec_size = self.sf_vec_size
-        padded_token_rows = self.token_comm.worst_case_sf_token_count
-        padded_hidden = hidden
-        fc1_sfb = cute.make_tensor(
-            activation_sf_pool.iterator,
-            blockscaled_utils.tile_atom_to_shape_SF(
-                (padded_token_rows, cutlass.Int32(padded_hidden), singleton), sf_vec_size
-            ),
-        )
-        padded_intermediate_gateup = cute.round_up(intermediate_gateup, 128)
-        expected_fc1_weight_sf_columns = padded_intermediate_gateup * cute.round_up(hidden // sf_vec_size, 4)
-        if cutlass.const_expr(
-            isinstance(fc1_weight_sf.shape[1], int) and isinstance(expected_fc1_weight_sf_columns, int)
-        ):
-            if cutlass.const_expr(fc1_weight_sf.shape[1] != expected_fc1_weight_sf_columns):
-                raise ValueError("fc1_weight_sf has an incompatible column count.")
-        fc1_sfa = cute.make_tensor(
-            fc1_weight_sf.iterator,
-            blockscaled_utils.tile_atom_to_shape_SF(
-                (cutlass.Int32(padded_intermediate_gateup), cutlass.Int32(padded_hidden), cutlass.Int32(experts)),
-                sf_vec_size,
-            ),
-        )
+        # Scale-factor views exist only for a block-scaled kind; bf16 hands None to the mainloop.
+        fc1_sfa = fc1_sfb = fc2_sfa = fc2_sfb = None
+        if cutlass.const_expr(self.is_block_scaled):
+            sf_vec_size = self.sf_vec_size
+            padded_token_rows = self.token_comm.worst_case_sf_token_count
+            padded_hidden = hidden
+            fc1_sfb = cute.make_tensor(
+                activation_sf_pool.iterator,
+                blockscaled_utils.tile_atom_to_shape_SF(
+                    (padded_token_rows, cutlass.Int32(padded_hidden), singleton), sf_vec_size
+                ),
+            )
+            padded_intermediate_gateup = cute.round_up(intermediate_gateup, 128)
+            expected_fc1_weight_sf_columns = padded_intermediate_gateup * cute.round_up(hidden // sf_vec_size, 4)
+            if cutlass.const_expr(
+                isinstance(fc1_weight_sf.shape[1], int) and isinstance(expected_fc1_weight_sf_columns, int)
+            ):
+                if cutlass.const_expr(fc1_weight_sf.shape[1] != expected_fc1_weight_sf_columns):
+                    raise ValueError("fc1_weight_sf has an incompatible column count.")
+            fc1_sfa = cute.make_tensor(
+                fc1_weight_sf.iterator,
+                blockscaled_utils.tile_atom_to_shape_SF(
+                    (cutlass.Int32(padded_intermediate_gateup), cutlass.Int32(padded_hidden), cutlass.Int32(experts)),
+                    sf_vec_size,
+                ),
+            )
 
         experts_fc2, intermediate_fc2, hidden_fc2 = fc2_weight.shape
         fc2_a = cute.make_tensor(
@@ -1001,27 +1098,33 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             ),
         )
         fc2_b = fc1_output_gemm
-        padded_fc2_hidden = cute.round_up(hidden_fc2, 128)
-        padded_fc2_intermediate = cute.round_up(intermediate_fc2, sf_vec_size * 4)
-        expected_fc2_weight_sf_columns = padded_fc2_hidden * padded_fc2_intermediate // sf_vec_size
-        if cutlass.const_expr(
-            isinstance(fc2_weight_sf.shape[1], int) and isinstance(expected_fc2_weight_sf_columns, int)
-        ):
-            if cutlass.const_expr(fc2_weight_sf.shape[1] != expected_fc2_weight_sf_columns):
-                raise ValueError("fc2_weight_sf has an incompatible column count.")
-        fc2_sfa = cute.make_tensor(
-            fc2_weight_sf.iterator,
-            blockscaled_utils.tile_atom_to_shape_SF(
-                (cutlass.Int32(padded_fc2_hidden), cutlass.Int32(padded_fc2_intermediate), cutlass.Int32(experts_fc2)),
-                sf_vec_size,
-            ),
-        )
-        fc2_sfb = cute.make_tensor(
-            fc1_output_sf.iterator,
-            blockscaled_utils.tile_atom_to_shape_SF(
-                (fc1_output_sf.shape[0], cutlass.Int32(fc1_output_sf.shape[1] * sf_vec_size), singleton), sf_vec_size
-            ),
-        )
+        if cutlass.const_expr(self.is_block_scaled):
+            padded_fc2_hidden = cute.round_up(hidden_fc2, 128)
+            padded_fc2_intermediate = cute.round_up(intermediate_fc2, sf_vec_size * 4)
+            expected_fc2_weight_sf_columns = padded_fc2_hidden * padded_fc2_intermediate // sf_vec_size
+            if cutlass.const_expr(
+                isinstance(fc2_weight_sf.shape[1], int) and isinstance(expected_fc2_weight_sf_columns, int)
+            ):
+                if cutlass.const_expr(fc2_weight_sf.shape[1] != expected_fc2_weight_sf_columns):
+                    raise ValueError("fc2_weight_sf has an incompatible column count.")
+            fc2_sfa = cute.make_tensor(
+                fc2_weight_sf.iterator,
+                blockscaled_utils.tile_atom_to_shape_SF(
+                    (
+                        cutlass.Int32(padded_fc2_hidden),
+                        cutlass.Int32(padded_fc2_intermediate),
+                        cutlass.Int32(experts_fc2),
+                    ),
+                    sf_vec_size,
+                ),
+            )
+            fc2_sfb = cute.make_tensor(
+                fc1_output_sf.iterator,
+                blockscaled_utils.tile_atom_to_shape_SF(
+                    (fc1_output_sf.shape[0], cutlass.Int32(fc1_output_sf.shape[1] * sf_vec_size), singleton),
+                    sf_vec_size,
+                ),
+            )
         if cutlass.const_expr(self.reduce_topk_in_kernel):
             pre_reduced_activation = cute.make_tensor(
                 output_activation.iterator,
@@ -1176,20 +1279,20 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self,
         fc1_tma_a_tensor: cute.Tensor,
         fc1_tma_a_atom: cute.CopyAtom,
-        fc1_tma_sfa_tensor: cute.Tensor,
-        fc1_tma_sfa_atom: cute.CopyAtom,
+        fc1_tma_sfa_tensor: Optional[cute.Tensor],
+        fc1_tma_sfa_atom: Optional[cute.CopyAtom],
         fc2_tma_a_tensor: cute.Tensor,
         fc2_tma_a_atom: cute.CopyAtom,
-        fc2_tma_sfa_tensor: cute.Tensor,
-        fc2_tma_sfa_atom: cute.CopyAtom,
+        fc2_tma_sfa_tensor: Optional[cute.Tensor],
+        fc2_tma_sfa_atom: Optional[cute.CopyAtom],
         fc1_tma_b_tensor: cute.Tensor,
         fc1_tma_b_atom_or_pair: TmaAtomOrPair,
-        fc1_tma_sfb_tensor: cute.Tensor,
-        fc1_tma_sfb_atom_or_pair: TmaAtomOrPair,
+        fc1_tma_sfb_tensor: Optional[cute.Tensor],
+        fc1_tma_sfb_atom_or_pair: Optional[TmaAtomOrPair],
         fc2_tma_b_tensor: cute.Tensor,
         fc2_tma_b_atom_or_pair: TmaAtomOrPair,
-        fc2_tma_sfb_tensor: cute.Tensor,
-        fc2_tma_sfb_atom_or_pair: TmaAtomOrPair,
+        fc2_tma_sfb_tensor: Optional[cute.Tensor],
+        fc2_tma_sfb_atom_or_pair: Optional[TmaAtomOrPair],
         fc1_output_tma_atom: cute.CopyAtom,
         fc1_output_tma_tensor: cute.Tensor,
         fc2_output_tma_atom: Optional[cute.CopyAtom],
@@ -1198,7 +1301,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         fc2_output_sf: Optional[cute.Tensor],
         actual_expert_shape: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
         activation: cute.Tensor,
-        activation_sf: cute.Tensor,
+        activation_sf: Optional[cute.Tensor],
         pre_reduced_activation: cute.Tensor,
         pre_reduced_activation_sf: Optional[cute.Tensor],
         peer_rank_ptr_mapper,
@@ -1225,7 +1328,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         smem_base = storage.buffer.data_ptr()
         self._device_workspace.assign_device_members(local_workspace, shared_workspace)
         fc1_done_counter = self._device_workspace.tensor(self.fc1_done_counter_region)
-        fc1_output_sf_storage = self._device_workspace.tensor(self.fc1_output_sf_region)
+        if cutlass.const_expr(self.is_block_scaled):
+            fc1_output_sf_storage = self._device_workspace.tensor(self.fc1_output_sf_region)
         if cutlass.const_expr(isinstance(self.hidden_size, int)):
             hidden = self.hidden_size
         else:
@@ -1234,12 +1338,20 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             intermediate_gateup = self.intermediate_gateup_size
         else:
             intermediate_gateup = actual_expert_shape[1]
-        fc1_output_sf = cute.make_tensor(
-            fc1_output_sf_storage.iterator,
-            blockscaled_utils.tile_atom_to_shape_SF(
-                (fc1_output_sf_storage.shape[0], intermediate_gateup // 2, cutlass.Int32(1)), self.epilogue.sf_vec_size
-            ),
-        )
+        # bf16 writes no FC1 scale plane, so the epilogue gets None.
+        fc1_output_sf = None
+        if cutlass.const_expr(self.is_block_scaled):
+            fc1_output_sf = cute.make_tensor(
+                fc1_output_sf_storage.iterator,
+                blockscaled_utils.tile_atom_to_shape_SF(
+                    (
+                        fc1_output_sf_storage.shape[0],
+                        self.expert_activation.intermediate_downproj(intermediate_gateup),
+                        cutlass.Int32(1),
+                    ),
+                    self.epilogue.sf_vec_size,
+                ),
+            )
 
         thread_idx, _, _ = cute.arch.thread_idx()
         warp_idx = thread_idx // 32
@@ -1301,6 +1413,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         )
         scheduler = self.scheduler
 
+        # FC2 of one (expert, token tile) waits until every in-bound FC1 CTA tile of that pair has
+        # signalled, so this counts 128-row FC1 CTA tiles, not features: each covers 64 features
+        # of a gated kind and 128 of a non-gated one (80 gated / 40 relu2 tiles at I = 5120).
         fc2_spin_threshold = (intermediate_gateup + self._mainloop.cta_tile_m - 1) // self._mainloop.cta_tile_m
         helper_weight_ready_gate = None
         if cutlass.const_expr(self.helper_expert_count > 0):

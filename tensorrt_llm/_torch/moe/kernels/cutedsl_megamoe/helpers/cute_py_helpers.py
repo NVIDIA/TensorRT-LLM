@@ -12,6 +12,9 @@ from .smem_workspace import SmemRegion
 # Every block-scaled tcgen05 MMA kind accumulates in F32 and no other accumulator is legal, so
 # this belongs to the instruction family rather than being a caller choice.
 tcgen05_block_scaled_acc_dtype = cutlass.Float32
+# The dense kind::f16 also admits an F16 accumulator, but the MegaMoE epilogues consume F32 (the
+# gated activation and the FC2 combine read F32 TMEM), so the dense bf16 path pins F32 as well.
+tcgen05_dense_acc_dtype = cutlass.Float32
 
 
 @dataclass(frozen=True)
@@ -513,5 +516,6 @@ __all__ = [
     "make_smem_layouts",
     "make_tcgen05_tmem_plan",
     "tcgen05_block_scaled_acc_dtype",
+    "tcgen05_dense_acc_dtype",
     "tcgen05_smem_alloc_type",
 ]
