@@ -187,6 +187,18 @@ void sortFallenPagesByPriority(TypedVec<LifeCycleId, std::deque<SharedPtr<Page>>
     }
 }
 
+//! Whether a page's bytes can no longer change, so a disk copy of it stays valid. A committed page is final only
+//! once its block is full: a request that commits a partial tail keeps decoding into the same slot.
+bool hasFinalContent(Page const& page) noexcept
+{
+    if (!page.isCommitted())
+    {
+        return false;
+    }
+    auto const& committed = static_cast<CommittedPage const&>(page);
+    return committed.block != nullptr && committed.numTokensInBlock >= committed.block->tokensPerBlock();
+}
+
 } // namespace
 
 template <typename Submit>
@@ -1036,7 +1048,7 @@ void StorageManager::writeThroughToDisk(
     std::map<LayerGroupId, std::vector<SharedPtr<Page>>> batches;
     for (auto const& page : pages)
     {
-        if (page->cacheLevel == hostLevel && page->isCommitted()
+        if (page->cacheLevel == hostLevel && hasFinalContent(*page)
             && mRetainedByPage.find(page.get()) == mRetainedByPage.end())
         {
             batches[getMigrationBatchingLayerGroupId(diskLevel, hostLevel, page->lifeCycle)].push_back(page);
@@ -1806,9 +1818,9 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                         srcSlot.readyEvent = mergeEvents(events);
                     }
                 }
-                if (retainSrcCopy && srcPages.at(i)->isCommitted())
+                if (retainSrcCopy && hasFinalContent(*srcPages.at(i)))
                 {
-                    // Committed pages are immutable, so the disk data stays valid while the page lives above.
+                    // The page's bytes are final, so the disk data stays valid while the page lives above.
                     addRetainedCopy(*srcPages.at(i), srcLevel, srcPgIdx, std::move(srcSlot));
                 }
                 else

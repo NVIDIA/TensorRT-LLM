@@ -11549,7 +11549,6 @@ class TestNoBatchingDiskOptions(TestNoBatching):
         self._run_and_close(again)
         self.manager.clear_reusable_blocks()
 
-
     def test_full_disk_evicts_lru_pages_before_retained_copies(self) -> None:
         # The disk holds only a few requests, so it fills with pages whose only copy is on disk. Further
         # evictions must drop the least recently used of those before reclaiming any retained copy.
@@ -11573,6 +11572,42 @@ class TestNoBatchingDiskOptions(TestNoBatching):
         self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
         self._run_and_close(reuse)
         self.manager.clear_reusable_blocks()
+
+    def test_partial_tail_decoded_after_restore_reads_back_correctly(self) -> None:
+        # A request that stops committing keeps decoding into its partially committed tail page. Each suspend
+        # pushes its pages to disk and each resume restores them; a disk copy of the tail made on an earlier trip
+        # must not stand in for the tokens decoded since.
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        req_ids = itertools.count()
+        prompt = [self.next_token() for _ in range(32 * 10 + 7)]
+        cache = self.manager.create_kv_cache(None, prompt)
+        try:
+            with TemporaryCudaStream([]) as s:
+                stream = cast(CudaStream, s.handle)
+                self.assertTrue(cache.resume(stream))
+                self.assertTrue(cache.resize(round_up(len(prompt) + 24, 32)))
+                self.engine.execute([Step(cache, prompt, [])], stream)
+                cache.commit(prompt)
+                cache.stop_committing()
+                history = list(prompt)
+                for _ in range(3):
+                    for _ in range(8):
+                        token = self.next_token()
+                        self.engine.execute([Step(cache, [token], history)], stream)
+                        history.append(token)
+                    cache.suspend()
+                    # GPU and host each hold about one request, so these push the suspended pages to disk.
+                    for _ in range(3):
+                        self._run_and_close(
+                            self.new_request(next(req_ids), None, 256, 32 * 22 - 256)
+                        )
+                    self.assertTrue(cache.resume(stream))
+                    self.engine.execute([Step(cache, [], history)], stream)
+            s.take_finish_event()
+        finally:
+            cache.close()
+        self.manager.clear_reusable_blocks()
+
 
 class TestResizeQuotaDiskOptions(TestResizeQuota):
     disk_tier_options = _ALL_DISK_OPTIONS
