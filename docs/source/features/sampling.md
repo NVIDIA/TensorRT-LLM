@@ -267,6 +267,41 @@ spec_config = MTPDecodingConfig(
 )
 ```
 
+### Rejection sampling options
+
+With `use_rejection_sampling=True`, a one-model speculative config verifies the drafts of a
+non-greedy batch by rejection sampling, which keeps the output distribution of the target with
+the request's sampling parameters. Two prototype options on `DecodingBaseConfig` change how the
+drafts are drawn and judged; both require `use_rejection_sampling=True`.
+
+* `rejection_sample_method`: `standard` (default) is token-level rejection sampling. `block`
+  is block verification ([Sun et al., 2024](https://arxiv.org/abs/2403.10444)), which judges the
+  drafted block jointly. It is also lossless and accepts at least as many tokens in expectation,
+  at the cost of a few more kernels per verification step.
+* `draft_temperature_only`: drafts are drawn from the temperature-scaled draft distribution
+  without the request's top-k / top-p / min-p filters. Verification divides by the
+  distribution each draft was drawn from, so the output distribution is unchanged; only the
+  acceptance rate moves, in either direction depending on the model pair.
+
+Neither option is supported with the dynamic tree (`use_dynamic_tree=True`), with relaxed
+thinking-phase acceptance (`use_relaxed_acceptance_for_thinking=True`, which accepts drafts
+without the rejection rule) or with DSpark confidence scheduling (which admits only greedy
+requests under rejection sampling); those combinations are rejected when the config is built.
+
+With a DSpark drafter that has a Markov head, sampled drafts are drawn ancestrally: each
+position is sampled from the drafter's distribution given the token drawn before it, so the
+stored proposals are the drafter's own joint distribution.
+
+```python
+from tensorrt_llm.llmapi import MTPDecodingConfig
+
+spec_config = MTPDecodingConfig(
+    max_draft_len=3,
+    use_rejection_sampling=True,
+    rejection_sample_method="block",
+)
+```
+
 ## Beam search
 
 Beam search is a decoding strategy that maintains multiple candidate sequences (beams) during text generation, exploring different possible continuations to find higher quality outputs. Unlike greedy decoding or sampling, beam search considers multiple hypotheses simultaneously.
