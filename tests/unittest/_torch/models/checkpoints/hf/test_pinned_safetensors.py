@@ -168,6 +168,39 @@ def test_partial_header_reads_are_resumed(tmp_path, monkeypatch):
         assert torch.equal(shard.get_tensor("a"), ints)
 
 
+@pytest.mark.cpu_only
+def test_eof_during_header_read_raises(tmp_path):
+    path = str(tmp_path / "shard.safetensors")
+    with open(path, "wb") as f:
+        f.write(b"\x00" * 7)
+    with pytest.raises(OSError, match="truncated SafeTensors header"):
+        PinnedSafetensorsFile(path).__enter__()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "entries, error",
+    [
+        ({"a": [0, 64], "b": [0, 64]}, "overlapping"),
+        ({"a": [0, 64], "b": [32, 96]}, "overlapping"),
+        ({"a": [0, 60], "b": [60, 124]}, "does not match"),
+    ],
+    ids=["duplicate", "overlap", "length_mismatch"],
+)
+def test_inconsistent_data_offsets_are_rejected_at_open(tmp_path, entries, error):
+    path = str(tmp_path / "shard.safetensors")
+    header = {
+        key: {"dtype": "I32", "shape": [16], "data_offsets": offsets}
+        for key, offsets in entries.items()
+    }
+    encoded = json.dumps(header).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(encoded)) + encoded + bytes(128))
+    with pytest.raises(ValueError, match=error):
+        PinnedSafetensorsFile(path).__enter__()
+
+
 @pytest.mark.skipif(not prefer_pinned(), reason="pinned host memory needs CUDA")
 def test_large_tensors_are_pinned_and_exact_under_concurrent_reads(tmp_path):
     path = str(tmp_path / "shard.safetensors")

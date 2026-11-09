@@ -70,7 +70,21 @@ class PinnedSafetensorsFile:
                 begin, end = info["data_offsets"]
                 if not 0 <= begin <= end <= file_size - data_start:
                     raise ValueError(f"{self._path}: {key!r} data_offsets outside the file")
+                dtype = getattr(torch, _DTYPE_ATTRS.get(info["dtype"], ""), None)
+                if isinstance(dtype, torch.dtype):
+                    numel = 1
+                    for dim in info["shape"]:
+                        numel *= dim
+                    if end - begin != numel * dtype.itemsize:
+                        raise ValueError(
+                            f"{self._path}: {key!r} data_offsets length does not match "
+                            "its dtype and shape"
+                        )
                 self._entries[key] = (info["dtype"], info["shape"], data_start + begin, end - begin)
+            ranges = sorted((offset, offset + n) for _, _, offset, n in self._entries.values())
+            for (_, prev_end), (begin, _) in zip(ranges, ranges[1:]):
+                if begin < prev_end:
+                    raise ValueError(f"{self._path}: overlapping tensor data_offsets")
         except BaseException:  # KeyboardInterrupt included: always release the fd
             os.close(self._fd)
             self._fd = -1

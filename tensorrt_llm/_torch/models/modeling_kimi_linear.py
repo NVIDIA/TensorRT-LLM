@@ -4006,6 +4006,14 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             # Lazy source mappings are load-scoped; finish nonblocking H2D
             # work before the caller can release the weights container.
             torch.cuda.synchronize(device)
+            # With the copies done, return the expert stream's cached pinned
+            # blocks to the OS so the rank does not keep its peak page-locked
+            # footprint after load.
+            hec = getattr(torch.cuda, "host_empty_cache", None) or getattr(
+                torch._C, "_host_emptyCache", None
+            )
+            if hec is not None:
+                hec()
 
     def _validate_checkpoint_keys(
         self, weights: Dict[str, torch.Tensor], expected_keys: Set[str], prefix: str
