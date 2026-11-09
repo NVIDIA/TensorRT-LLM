@@ -1,72 +1,87 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Stop-criteria helpers shared by the sampler and the disaggregated
-generation server's first-token close-out."""
+"""``first_stop_reason``, the stop check of a token outside the per-step
+sampler path, against the sampler's ``handle_stop_criteria``."""
 
 from types import SimpleNamespace
 
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_features import (
-    meet_max_token_stop_criteria,
-    meet_max_token_stop_criteria_at,
-    meet_stop_token_criteria,
-    stop_words_match,
+    first_stop_reason,
+    handle_stop_criteria,
 )
 
 pytestmark = pytest.mark.cpu_only
 
+_PROMPT = [1, 2, 3]
 
-def _request(tokens, *, stop_words=None):
-    return SimpleNamespace(
-        py_orig_prompt_len=3,
+
+def _request(tokens: list, *, end_id: int = -1, stop_words=None) -> SimpleNamespace:
+    """A request holding ``tokens`` with max_new_tokens 4."""
+    request = SimpleNamespace(
+        py_orig_prompt_len=len(_PROMPT),
         py_max_new_tokens=4,
+        py_end_id=end_id,
         py_stop_words_list=stop_words,
-        get_num_tokens=lambda beam: len(tokens),
-        get_tokens=lambda beam: list(tokens),
+        finished=None,
     )
+    request.get_num_tokens = lambda beam: len(tokens)
+    request.get_tokens = lambda beam: list(tokens)
+    request.finish_by = lambda reason, beam: setattr(request, "finished", reason)
+    return request
 
 
 @pytest.mark.parametrize(
-    ("num_tokens", "max_seq_len", "expected"),
+    ("generated", "new_token", "options", "max_seq_len"),
     [
-        pytest.param(6, 64, False, id="below_both_limits"),
-        pytest.param(7, 64, True, id="max_new_tokens"),
-        pytest.param(5, 5, True, id="max_seq_len"),
+        pytest.param([], 9, {}, 64, id="continues"),
+        pytest.param([], 7, {"end_id": 7}, 64, id="end_id"),
+        pytest.param([5, 6, 8], 7, {"end_id": 7}, 64, id="end_id_before_length"),
+        pytest.param([5, 6, 8], 9, {}, 64, id="max_new_tokens"),
+        pytest.param([], 9, {}, 4, id="max_seq_len"),
+        pytest.param([5, 6, 8], 9, {"stop_words": [[9]]}, 64, id="length_before_stop_words"),
+        pytest.param([], 9, {"stop_words": [[4], [9]]}, 64, id="single_token_stop_word"),
+        pytest.param([5], 9, {"stop_words": [[4], [5, 9]]}, 64, id="multi_token_stop_word"),
+        pytest.param([], 9, {"stop_words": [[3, 9]]}, 64, id="stop_word_spanning_the_prompt"),
+        pytest.param(
+            [], 9, {"stop_words": [[0, 1, 2, 3, 9]]}, 64, id="stop_word_beyond_the_sequence"
+        ),
     ],
 )
-def test_max_token_criteria_at_a_length_matches_the_request_check(
-    num_tokens, max_seq_len, expected
+def test_first_stop_reason_matches_the_sampler(
+    generated: list, new_token: int, options: dict, max_seq_len: int
 ) -> None:
-    request = _request(list(range(num_tokens)))
-    num_new_tokens = num_tokens - request.py_orig_prompt_len
+    """For the same sequence the check gives the sampler's verdict, so a token
+    checked off the sampler path ends a request exactly when sampling it would."""
+    before = _PROMPT + generated
+    sampled = _request(before + [new_token], **options)
+    handle_stop_criteria(sampled, new_token, max_seq_len=max_seq_len, beam_idx=0)
 
-    assert (
-        meet_max_token_stop_criteria_at(request, num_new_tokens, num_tokens, max_seq_len)
-        is expected
+    reason = first_stop_reason(
+        _request(before, **options),
+        new_token,
+        num_generated_tokens=len(generated) + 1,
+        num_tokens=len(before) + 1,
+        max_seq_len=max_seq_len,
+        stop_word_history=lambda count: before[-count:],
     )
-    assert meet_max_token_stop_criteria(request, max_seq_len) is expected
+
+    assert reason == sampled.finished
 
 
-@pytest.mark.parametrize(
-    ("stop_words", "expected"),
-    [
-        pytest.param([[9], [4]], True, id="single_token_word"),
-        pytest.param([[9], [3]], False, id="single_token_miss"),
-        pytest.param([[2, 4], [9]], True, id="multi_token_word"),
-        pytest.param([[1, 4]], False, id="multi_token_miss"),
-        pytest.param([[0, 1, 2, 3, 4, 5]], False, id="word_longer_than_history"),
-    ],
-)
-def test_stop_words_match_agrees_with_the_request_check(stop_words, expected) -> None:
-    """The history is read only when a multi-token stop word needs it."""
-    tokens = [1, 2, 4]  # ends with the new token 4
-    history_reads = []
+def test_first_stop_reason_can_leave_max_seq_len_unchecked() -> None:
+    """A caller whose sequence length does not match the engine limit's basis
+    (a Helix CP rank's slice) leaves that limit to the decode steps."""
+    request = _request(_PROMPT)
 
-    def history():
-        history_reads.append(True)
-        return tokens
+    reason = first_stop_reason(
+        request,
+        9,
+        num_generated_tokens=1,
+        num_tokens=len(_PROMPT) + 1,
+        max_seq_len=None,
+        stop_word_history=lambda count: _PROMPT[-count:],
+    )
 
-    assert stop_words_match(stop_words, 4, history) is expected
-    assert meet_stop_token_criteria(_request(tokens, stop_words=stop_words), 4) is expected
-    assert bool(history_reads) == any(len(word) > 1 for word in stop_words)
+    assert reason is None
