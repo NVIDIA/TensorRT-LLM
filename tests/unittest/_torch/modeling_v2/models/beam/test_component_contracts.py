@@ -117,6 +117,30 @@ def test_nested_partial_rope_is_rejected():
         layout.check_config(cfg)
 
 
+@pytest.mark.parametrize(
+    "field", ["factor", "attention_factor", "original_max_position_embeddings", "unknown"]
+)
+def test_unknown_sliding_rope_options_are_rejected(field: str) -> None:
+    cfg = config()
+    cfg["rope_parameters"]["sliding_attention"][field] = 1.0
+    with pytest.raises(ValueError, match="rope_parameters"):
+        layout.check_config(cfg)
+
+
+@pytest.mark.parametrize("field", ["factor", "global_attention", "unknown"])
+def test_unknown_rope_groups_are_rejected(field: str) -> None:
+    cfg = config()
+    cfg["rope_parameters"][field] = None
+    with pytest.raises(ValueError, match="rope_parameters"):
+        layout.check_config(cfg)
+
+
+def test_explicit_full_head_rope_is_supported() -> None:
+    cfg = config()
+    cfg["rope_parameters"]["sliding_attention"]["partial_rotary_factor"] = 1.0
+    assert layout.check_config(cfg).num_layers == 52
+
+
 def test_benign_config_metadata_and_supported_optional_values():
     cfg = dict(
         config(),
