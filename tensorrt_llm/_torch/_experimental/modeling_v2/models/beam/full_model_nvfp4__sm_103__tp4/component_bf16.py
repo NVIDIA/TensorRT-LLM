@@ -514,8 +514,6 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         gate = cublas_mm(h, self._layer(layer, "mlp.gate_proj.weight").t())
         up = cublas_mm(h, self._layer(layer, "mlp.up_proj.weight").t())
         act = swiglu_fp32(gate, up)
-        part = cublas_mm(act["act"], self._layer(layer, "mlp.down_proj.weight").t())
-        out = self.all_reduce(part)
         _rec(
             capture,
             {
@@ -524,10 +522,13 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
                 "mlp.silu": act["silu"],
                 "mlp.product": act["product"],
                 "mlp.act": act["act"],
-                "tp.mlp_part": part,
-                "mlp_out": out,
             },
         )
+        activation = act["act"]
+        del gate, up, act
+        part = cublas_mm(activation, self._layer(layer, "mlp.down_proj.weight").t())
+        out = self.all_reduce(part)
+        _rec(capture, {"tp.mlp_part": part, "mlp_out": out})
         return out
 
     @torch.no_grad()
