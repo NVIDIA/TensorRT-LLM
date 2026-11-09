@@ -48,6 +48,7 @@ from .hang_detector import (
 )
 from .llm_request import LlmRequest, LlmRequestState, LlmResponse
 from .perf_metrics_manager import PerfMetricsManager
+from .profiling import ProfileController
 from .request_delivery import ResponseChannel
 from .request_utils import RequestBroadcaster, drain_queued_items, merge_requests_to_llm_requests
 from .scheduler import ScheduledRequests
@@ -103,8 +104,8 @@ class ScheduledEncoderExecutor:
     and publishes responses; every rank runs the same batches. Settings that only tune
     generation are ignored: the overlap scheduler, chunked prefill, guided decoding,
     ``scheduler_config``, the waiting-queue policy and the iteration-based batch waits.
-    Iteration statistics and KV cache events are always empty, and profiling
-    (``start_profile``/``stop_profile``) is not supported.
+    Iteration statistics and KV cache events are always empty, and ``print_iter_log``
+    prints nothing.
     """
 
     is_generation_model = False
@@ -164,6 +165,13 @@ class ScheduledEncoderExecutor:
         self._perf_manager = PerfMetricsManager(enabled=llm_args.return_perf_metrics)
         self._response_channel = ResponseChannel()
         self._iter_counter = 0
+        self._profiler = ProfileController(
+            rank=dist.rank,
+            current_iteration=lambda: self._iter_counter,
+            is_warmup=lambda: False,
+            broadcast_start=self._request_queue.enqueue_profile_start_request,
+            broadcast_stop=self._request_queue.enqueue_profile_stop_request,
+        )
 
         if llm_args.enable_iter_perf_stats:
             logger.warning(
@@ -347,6 +355,25 @@ class ScheduledEncoderExecutor:
         """
         self._request_queue.enqueue_cancel_request(id)
 
+    def start_profile(
+        self,
+        output_dir: str | None = None,
+        num_steps: int | None = None,
+        start_step: int = 0,
+        activities: list[str] | None = None,
+    ) -> None:
+        """Profile a window of loop iterations on every rank; see ``ProfileController.start_profile``."""
+        self._profiler.start_profile(
+            output_dir=output_dir,
+            num_steps=num_steps,
+            start_step=start_step,
+            activities=activities,
+        )
+
+    def stop_profile(self) -> None:
+        """Stop the profile window at the next loop iteration and wait for its trace."""
+        self._profiler.stop_profile()
+
     def can_enqueue_requests(self) -> bool:
         """Whether the request queue still accepts requests."""
         return self._request_queue.can_enqueue_request()
@@ -384,6 +411,7 @@ class ScheduledEncoderExecutor:
                 logger.error("Hang detected, shutting down immediately.")
                 return
             self._worker_thread.join()
+        self._profiler.cleanup()
         self._model_loader.cleanup()
         self._runner.release_graphs()
         del self._runner, self._model_loader
@@ -434,9 +462,11 @@ class ScheduledEncoderExecutor:
         torch.cuda.set_device(self._device_id)
         # Create the context before any MPI call.
         CUASSERT(cudart.cudaSetDevice(self._device_id))
-        with self._hang_detector:
+        with self._profiler.iterations(), self._hang_detector:
             while True:
                 self._hang_detector.checkpoint()
+                self._profiler.end_iteration()
+                self._profiler.begin_iteration()
                 self._receive()
                 if self.is_shutdown and not self._waiting_queue:
                     self._loop_completed = True
@@ -448,6 +478,8 @@ class ScheduledEncoderExecutor:
                 )
                 if count:
                     self._run([self._waiting_queue.pop_request() for _ in range(count)])
+                # Every pass counts, idle ones too, so a stop requested while idle fires.
+                self._iter_counter += 1
 
     def _receive(self) -> None:
         """Fetch on rank 0, broadcast, then apply shutdown, cancellations and admission."""
@@ -469,6 +501,10 @@ class ScheduledEncoderExecutor:
                 break
             if item.is_canceled_request:
                 canceled_ids.add(item.id)
+            elif item.is_profile_start_request:
+                self._profiler.apply_start_config(item.profile_config or {})
+            elif item.is_profile_stop_request:
+                self._profiler.apply_stop_config()
             elif not item.is_normal_request:
                 raise RuntimeError(f"Unsupported request queue item with id {item.id}.")
             else:
@@ -522,7 +558,6 @@ class ScheduledEncoderExecutor:
 
     def _run(self, items: list[RequestQueueItem]) -> None:
         """Run one forward over ``items`` and publish one final response per request."""
-        self._iter_counter += 1
         requests = merge_requests_to_llm_requests(items, exclude_last_generation_logits=False)
         for request in requests:
             if request.return_perf_metrics:

@@ -8,6 +8,7 @@ executor's queue, admission, batching, completion and delivery are real.
 """
 
 import threading
+import time
 from contextlib import contextmanager
 from datetime import timedelta
 from types import SimpleNamespace
@@ -291,6 +292,23 @@ def test_shutdown_runs_queued_requests_first():
         assert not stopper.is_alive()
         for request_id in ids:
             h.result(request_id)
+
+
+def test_profiling_writes_a_trace_of_the_window(tmp_path):
+    with _harness() as h:
+        h.executor.start_worker()
+        h.executor.start_profile(output_dir=str(tmp_path), activities=["CPU"])
+        deadline = time.monotonic() + 30
+        while not h.executor._profiler.enabled:
+            assert time.monotonic() < deadline, "the profile window never opened"
+            time.sleep(0.01)
+
+        h.result(h.submit())
+        h.executor.stop_profile()
+
+        assert not h.executor._profiler.enabled
+        (trace,) = tmp_path.glob("trtllm-trace-*-rank-0.json")
+        assert trace.stat().st_size > 0
 
 
 def test_a_crashed_loop_wakes_waiters_with_its_error():
