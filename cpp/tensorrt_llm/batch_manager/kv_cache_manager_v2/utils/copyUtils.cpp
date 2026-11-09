@@ -349,8 +349,13 @@ struct DiskTransfer
         }
         if (ticket != 0)
         {
-            // The data written by pread must be visible before the device observes the flag.
+            // The data written by pread must be visible before the device observes the flag. On aarch64 the C++
+            // fence only orders stores for inner-shareable observers; a PCIe-attached GPU is outer-shareable, so
+            // publish the data with an outer-shareable store barrier first, as Linux's dma_wmb() does.
             std::atomic_thread_fence(std::memory_order_seq_cst);
+#if defined(__aarch64__)
+            asm volatile("dmb oshst" ::: "memory");
+#endif
             completionFlags()->host[ticket % kFlagSlots].store(ticket, std::memory_order_release);
         }
     }
