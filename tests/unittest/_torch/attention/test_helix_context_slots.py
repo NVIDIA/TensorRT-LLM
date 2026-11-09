@@ -139,3 +139,51 @@ def test_helix_context_slots_metadata_reuse(phase: str) -> None:
     metadata.kv_cache_manager.mapping = mapping
     metadata.enable_context_mla_with_cached_kv = True
     check_slots(torch.tensor([15, 16, 33, 5, 7], dtype=torch.int32))
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+def test_helix_mla_chunk_plans(cp_size: int) -> None:
+    page = 64
+    lengths = torch.tensor([[192, 1, 0, 64], [64, 0, 65, 0]], dtype=torch.int64)
+    offsets = torch.cat((torch.zeros((1, 4), dtype=torch.int64), lengths.cumsum(0))) + torch.tensor(
+        [0, 63, 64, 129]
+    )
+    metadata = SimpleNamespace(
+        helix_context_local_slots=object(),
+        kv_cache_manager=SimpleNamespace(
+            tokens_per_block=page,
+            mapping=SimpleNamespace(cp_size=cp_size, cp_rank=cp_size - 1),
+        ),
+        host_chunked_global_offset=offsets,
+        host_chunked_seq_len=lengths,
+        num_contexts=4,
+        chunked_loop_num=2,
+        seq_lens_cuda=torch.empty(0),
+    )
+    TrtllmAttentionMetadata._prepare_helix_mla_chunks(metadata)
+    assert len(metadata.helix_mla_chunk_plans) == 2
+    for loop, plan in enumerate(metadata.helix_mla_chunk_plans):
+        expected_cu, expected_starts = [], []
+        for rank in range(cp_size):
+            cu, starts = [0], []
+            for start, length in zip(offsets[loop].tolist(), lengths[loop].tolist()):
+                starts.append(sum(g // page % cp_size == rank for g in range(start)))
+                cu.append(
+                    cu[-1] + sum(g // page % cp_size == rank for g in range(start, start + length))
+                )
+            expected_cu.append(cu)
+            expected_starts.append(starts)
+        cu = torch.tensor(expected_cu, dtype=torch.int64)
+        sizes = cu[:, -1]
+        torch.testing.assert_close(plan.cu_seq_lens, cu)
+        torch.testing.assert_close(
+            plan.local_offsets, torch.tensor(expected_starts, dtype=torch.int64)
+        )
+        torch.testing.assert_close(
+            plan.rank_offsets, torch.cat((sizes.new_zeros(1), sizes.cumsum(0)))
+        )
+        assert plan.rank_sizes == sizes.tolist()
+        assert plan.max_local_seq_len == (cu[-1, 1:] - cu[-1, :-1]).max().item()
+    metadata.helix_context_local_slots = None
+    TrtllmAttentionMetadata._prepare_helix_mla_chunks(metadata)
+    assert metadata.helix_mla_chunk_plans is None

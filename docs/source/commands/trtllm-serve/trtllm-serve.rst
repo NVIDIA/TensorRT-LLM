@@ -92,6 +92,18 @@ At high concurrency a single serving process is host-bound: one asyncio event lo
    * ``SO_REUSEPORT`` would also let a second server of the same user join the port and take part of its traffic, so the launcher refuses a port that another server already uses.
    * Every extra frontend is a full Python process that imports TensorRT LLM and loads the tokenizer, so budget host memory accordingly.
 
+.. _bounding-the-graceful-stop:
+
+Bounding the Graceful Stop
+--------------------------
+
+A server can still have request handlers running when it is told to stop, for example when a benchmark client leaves while its last requests are in flight. By default the OpenAI HTTP server waits for every one of them. The prototype setting ``serve_graceful_shutdown_timeout_s: N`` in the ``--config`` YAML bounds that wait: after a shutdown signal, the server waits at most ``N`` seconds for running request handlers (uvicorn's ``timeout_graceful_shutdown``), then cancels them and shuts down as usual. It is off by default.
+
+.. note::
+
+   * It applies to the LLM, embedding and multimodal-encoder servers of ``trtllm-serve``, in every frontend process.
+   * The gRPC servers (``--grpc``) and the VisualGen server do not use it, and the disaggregated router keeps its own ``--request_timeout`` for the requests it forwards.
+
 Inference Endpoints
 -------------------
 

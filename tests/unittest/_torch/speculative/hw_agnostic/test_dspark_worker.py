@@ -97,11 +97,12 @@ def test_metadata_prepare_batch_indices():
     assert meta.batch_indices_cuda[:3].tolist() == [0, 1, 2]
 
 
-def _make_worker(enable_confidence_scheduling=False):
+def _make_worker(enable_confidence_scheduling=False, enable_fused_confidence_scheduler=False):
     cfg = types.SimpleNamespace(
         max_draft_len=5,
         spec_dec_mode=SpeculativeDecodingMode.DSPARK,
         enable_confidence_scheduling=enable_confidence_scheduling,
+        enable_fused_confidence_scheduler=enable_fused_confidence_scheduler,
         confidence_cost_table_path=None,
         confidence_calibration_path=None,
     )
@@ -1177,6 +1178,16 @@ def test_recycled_confidence_slot_is_reset_to_neutral():
     slot = worker._assign_slot(100, reset=False)
 
     assert torch.sigmoid(worker._confidence_logits[slot]).min().item() > 0.999
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_verify_planner_device_windows_follow_the_config(fused):
+    worker = _make_worker(
+        enable_confidence_scheduling=True, enable_fused_confidence_scheduler=fused
+    )
+    worker._lazy_init(_fake_draft_model(), _make_metadata(max_num_requests=8))
+
+    assert worker.verify_planner.device_windows is fused
 
 
 def test_confidence_state_is_absent_when_scheduling_is_disabled():
