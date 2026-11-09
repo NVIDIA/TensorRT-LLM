@@ -25,7 +25,7 @@ block tables start with identical pages form a group; the group's common full pa
 for all of its queries (``Fa4Prefix``, FlashAttention-4, no mask: every shared token precedes every
 query), and every row attends its own remaining pages (``Fa4Tail``, causal). The step's K/V is
 written into the row's own pages at ``kv_len - q_len + j``, exactly as the regular kernel does, so
-the two paths are interchangeable step by step. Kernels: ``sampling_shared_prefix_fa4``.
+the two paths are interchangeable step by step. Kernels: ``shared_prefix_fa4``.
 
 Scope: generation-only batches with a linear draft (``q_len = 1 + K`` tokens per row, ``q_len >=
 MIN_Q_LEN``) of a dense GQA/MHA model on SM90, bf16 paged KV cache of KV cache manager V2, no
@@ -79,12 +79,14 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
-from .sampling_shared_prefix_fa4 import (
+from .shared_prefix_fa4 import (
     Fa4Prefix,
     Fa4Tail,
+    PrefixGroups,
     fa4_prefix_splits,
-    fa4_sampling_attention,
+    fa4_shared_prefix_attention,
     fa4_supported,
+    prefix_request_tables,
 )
 
 if TYPE_CHECKING:
@@ -372,7 +374,7 @@ def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
 # Grouping
 # --------------------------------------------------------------------------- #
 @dataclass
-class _Grouping:
+class _Grouping(PrefixGroups):
     """Row grouping of one batch composition and the prefix tables derived from it.
 
     Rows whose block tables start with the same full pages form a sharing group
@@ -404,8 +406,6 @@ class _Grouping:
     """Query tokens per row: 1 + draft tokens."""
     last_pages: np.ndarray
     """[rows] int64: index of the page holding the row's last token of this step."""
-    num_groups: int
-    """Groups handed to the prefix call, placeholder and padding groups included."""
     num_sharing: int
     """Groups that share at least one page."""
     num_placeholder_rows: int
@@ -426,14 +426,6 @@ class _Grouping:
     """[keys] int64: smallest full-page count of each key's rows."""
     shared_g: np.ndarray
     """[rows] int64, grouped order: shared pages of the row's group."""
-    qo_indptr: np.ndarray
-    """[num_groups + 1] int32: query-token range of each group."""
-    prefix_indptr: np.ndarray
-    """[num_groups + 1] int32: page range of each group in ``prefix_indices``."""
-    prefix_indices: np.ndarray
-    """int32: the groups' shared pages, then one placeholder page per non-sharing group."""
-    prefix_last_page_len: np.ndarray
-    """[num_groups] int32: tokens in each group's last prefix page."""
     prefix_empty: np.ndarray
     """[rows] bool, grouped order: the row sits in the placeholder group."""
 
@@ -610,68 +602,6 @@ def _advance(
     return dataclasses.replace(grouping, private_from=private_from, last_pages=last_pages)
 
 
-def _prefix_tables(
-    grouping: _Grouping,
-    tokens_per_block: int,
-    chunk_tokens: int,
-    num_requests: int,
-    max_pages: int,
-    splits: int = 1,
-) -> tuple:
-    """Request tables of the prefix call (``Fa4Prefix``).
-
-    Every group with query rows becomes one request per ``chunk_tokens`` query tokens, each
-    over the group's shared pages; the rest of the ``num_requests`` entries are empty. With
-    ``splits`` > 1 the queries are replicated ``splits`` times (copy ``s`` at query offset
-    ``s * tokens``) and copy ``s`` of a request attends only the ``s``-th of ``splits``
-    near-equal runs of the group's pages (possibly empty).
-    Returns ``(block_tables, seq_lens, cum_q, cum_kv)`` as int32 arrays.
-    """
-    from .flash_attn4_generation import MIN_SPLIT_TOKENS
-
-    qo = grouping.qo_indptr
-    pages_ptr = grouping.prefix_indptr
-    pages = grouping.prefix_indices
-    last = grouping.prefix_last_page_len
-    block_tables = np.zeros((num_requests, max_pages), dtype=np.int32)
-    seq_lens = np.zeros((num_requests,), dtype=np.int32)
-    cum_q = np.zeros((num_requests + 1,), dtype=np.int32)
-    cum_kv = np.zeros((num_requests + 1,), dtype=np.int32)
-    request = 0
-    tokens = int(qo[grouping.num_groups])
-    for split in range(splits):
-        for group in range(grouping.num_groups):
-            q0, q1 = int(qo[group]), int(qo[group + 1])
-            if q1 == q0:
-                continue
-            first, stop = int(pages_ptr[group]), int(pages_ptr[group + 1])
-            count = stop - first
-            kv_len = (count - 1) * tokens_per_block + int(last[group]) if count else 0
-            if splits > 1:
-                # Runs of at least MIN_SPLIT_TOKENS: a short prompt uses fewer (non-empty) runs.
-                per = max(-(-count // splits), -(-MIN_SPLIT_TOKENS // tokens_per_block))
-                lo = min(split * per, count)
-                hi = min(lo + per, count)
-                first, stop = first + lo, first + hi
-                # Only the group's last page may be partly filled.
-                kv_len = max(min(kv_len - lo * tokens_per_block, (hi - lo) * tokens_per_block), 0)
-                count = hi - lo
-            for start in range(q0, q1, chunk_tokens):
-                if request >= num_requests:
-                    raise RuntimeError(
-                        f"{LIB_NAME}: the step needs more prefix requests than the "
-                        f"{num_requests} its buffers hold."
-                    )
-                block_tables[request, :count] = pages[first:stop]
-                seq_lens[request] = kv_len
-                cum_q[request + 1] = split * tokens + min(start + chunk_tokens, q1)
-                cum_kv[request + 1] = cum_kv[request] + kv_len
-                request += 1
-    cum_q[request + 1 :] = cum_q[request]
-    cum_kv[request + 1 :] = cum_kv[request]
-    return block_tables, seq_lens, cum_q, cum_kv
-
-
 @dataclass
 class _StepBuffers:
     """Fixed-address step inputs of one batch size.
@@ -768,7 +698,7 @@ class _StepBuffers:
             grouping.perm,
             grouping.shared_g,
             grouping.prefix_empty,
-            *_prefix_tables(
+            *prefix_request_tables(
                 grouping,
                 prefix.tokens_per_block,
                 prefix.chunk_tokens,
@@ -1310,7 +1240,7 @@ class SamplingSharedPrefixFmha(PhasedFmha):
         output = params.output
         if output is None:
             raise RuntimeError(f"{type(self).__name__} requires an output tensor.")
-        fa4_sampling_attention(
+        fa4_shared_prefix_attention(
             pool,
             qkv[:, : num_heads * head_dim].view(tokens, num_heads, head_dim),
             None,

@@ -36,7 +36,7 @@ from tensorrt_llm._torch.attention.backends.fmha import sampling_shared_prefix a
 def _fa4_available():
     if not torch.cuda.is_available():
         return False
-    from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_fa4 import fa4_supported
+    from tensorrt_llm._torch.attention.backends.fmha.shared_prefix_fa4 import fa4_supported
 
     return fa4_supported(128, torch.bfloat16)
 
@@ -829,14 +829,17 @@ def _spec_case(num_heads, num_kv_heads, head_dim, q_len, shuffled, placeholder_r
 
 
 def _make_prefix(case, num_heads, head_dim, q_len, splits=1):
-    from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_fa4 import Fa4Prefix
+    from tensorrt_llm._torch.attention.backends.fmha.shared_prefix_fa4 import (
+        Fa4Prefix,
+        prefix_request_tables,
+    )
 
     groups = case["grouping"].num_groups
     requests = Fa4Prefix.num_requests_for(groups + 1, case["ntok"], q_len) * splits
     max_pages = 8
     prefix = Fa4Prefix(case["ntok"], num_heads, head_dim, q_len, requests, max_pages,
                        torch.bfloat16, torch.device("cuda"), case["tpb"], splits=splits)  # fmt: skip
-    tables = lib._prefix_tables(
+    tables = prefix_request_tables(
         case["grouping"], case["tpb"], prefix.chunk_tokens, requests, max_pages, splits=splits
     )
     for dst, host in zip(prefix.table_arrays(), tables):
@@ -847,7 +850,7 @@ def _make_prefix(case, num_heads, head_dim, q_len, splits=1):
 def _make_tail(case, num_heads, head_dim, q_len, kv_factor=2, splits=1):
     """``Fa4Tail`` of a case with its step tables built from a device block-offset table (batch
     order, ``kv_factor`` entries per pool-view page, a row's shared pages first)."""
-    from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_fa4 import Fa4Tail
+    from tensorrt_llm._torch.attention.backends.fmha.shared_prefix_fa4 import Fa4Tail
 
     device = torch.device("cuda")
     rows, tpb, prefix_pages = case["rows"], case["tpb"], case["prefix_pages"]
@@ -886,11 +889,11 @@ def _make_tail(case, num_heads, head_dim, q_len, kv_factor=2, splits=1):
 
 
 def _run(case, pool, q, k, v, out, prefix, tail, head_dim):
-    from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_fa4 import (
-        fa4_sampling_attention,
+    from tensorrt_llm._torch.attention.backends.fmha.shared_prefix_fa4 import (
+        fa4_shared_prefix_attention,
     )
 
-    fa4_sampling_attention(pool, q, k, v, out, perm=case["perm"], prefix_empty=case["empty"],
+    fa4_shared_prefix_attention(pool, q, k, v, out, perm=case["perm"], prefix_empty=case["empty"],
                            prefix=prefix, tail=tail, sm_scale=1.0 / math.sqrt(head_dim))  # fmt: skip
 
 
@@ -909,7 +912,7 @@ def _run(case, pool, q, k, v, out, prefix, tail, head_dim):
     "prefix_splits,tail_splits,min_split_tokens",
     [(1, 1, 512), (3, 1, 32), (8, 1, 32), (1, 4, 32), (8, 16, 32), (8, 16, 512)],
 )
-def test_fa4_sampling_attention_matches_dense_and_writes_kv(
+def test_fa4_shared_prefix_attention_matches_dense_and_writes_kv(
     num_heads, num_kv_heads, head_dim, q_len, shuffled, placeholder_rows, overshoot, massive,
     prefix_splits, tail_splits, min_split_tokens, monkeypatch,
 ):  # fmt: skip
@@ -952,7 +955,7 @@ def test_fa4_sampling_attention_matches_dense_and_writes_kv(
 
 @needs_fa4
 @pytest.mark.parametrize("q_len", [9])
-def test_fa4_sampling_attention_graph_replay_is_bit_exact(q_len):
+def test_fa4_shared_prefix_attention_graph_replay_is_bit_exact(q_len):
     """One CUDA graph of a layer, replayed on new inputs, equals eager calls on the same buffers bit
     for bit."""
     device = torch.device("cuda")
@@ -982,9 +985,7 @@ def test_fa4_sampling_attention_graph_replay_is_bit_exact(q_len):
 
 
 def test_fa4_prefix_splits_follow_the_grid():
-    from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_fa4 import (
-        fa4_prefix_splits,
-    )
+    from tensorrt_llm._torch.attention.backends.fmha.shared_prefix_fa4 import fa4_prefix_splits
 
     assert fa4_prefix_splits(120, 9, 28, 4, 132) == 1  # 60 tiles x 4 KV heads
     assert fa4_prefix_splits(60, 4, 28, 4, 132) == 3  # 14 tiles x 4 KV heads
