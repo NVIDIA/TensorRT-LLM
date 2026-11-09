@@ -46,6 +46,7 @@ from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import MpiTopology
 
+from .heun_scheduler import MiniMaxH3HeunScheduler
 from .packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
     MINIMAX_H3_CANVAS_MULTIPLE,
@@ -412,18 +413,21 @@ class MiniMaxH3Pipeline(BasePipeline):
         }
 
     @property
+    def supported_samplers(self) -> tuple[str, ...]:
+        return ("euler", "heun")
+
+    @property
     def extra_param_specs(self) -> dict[str, ExtraParamSchema]:
-        if self.workflow != "ref2va":
-            return {}
-        return {
-            "reference_order": ExtraParamSchema(
+        specs = self.sampler_param_specs()
+        if self.workflow == "ref2va":
+            specs["reference_order"] = ExtraParamSchema(
                 type="list",
                 default=None,
                 validator=validate_reference_order,
                 description="Ordered image:N/video:N/audio:N references (zero-based); "
                 "defaults to images, videos, then audio, preserving each slot's order.",
             )
-        }
+        return specs
 
     def load_transformer_weights(self, checkpoint_dir: str) -> dict:
         if self.workflow == "ref2va":
@@ -699,6 +703,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             num_inference_steps=req.params.num_inference_steps,
             keyframes=keyframes,
             keyframe_anchors=keyframe_anchors,
+            sampler=(req.params.extra_params or {}).get("sampler") or self.supported_samplers[0],
         )
 
     def _validate_request(
@@ -1123,6 +1128,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         keyframes: Optional[list[Image.Image]] = None,
         keyframe_anchors: Optional[tuple[str, ...]] = None,
         references: Optional[list] = None,
+        sampler: str = "euler",
     ) -> PipelineOutput:
         manager = getattr(self, "_sleep_manager", None)
         with manager.generation() if manager is not None else nullcontext():
@@ -1137,7 +1143,31 @@ class MiniMaxH3Pipeline(BasePipeline):
                 keyframes=keyframes,
                 keyframe_anchors=keyframe_anchors,
                 references=references,
+                sampler=sampler,
             )
+
+    def _request_schedulers(self, sampler: str) -> tuple[MiniMaxH3Scheduler, MiniMaxH3Scheduler]:
+        """Return the (video, audio) schedulers that run one request's ``sampler``."""
+        if sampler == "euler":
+            return self.scheduler, self.audio_scheduler
+        if sampler != "heun":
+            raise ValueError(
+                f"Unsupported MiniMax-H3 sampler {sampler!r}; expected one of "
+                f"{list(self.supported_samplers)}."
+            )
+        cache_accelerator = getattr(self, "cache_accelerator", None)
+        if cache_accelerator is not None and cache_accelerator.is_enabled():
+            raise ValueError(
+                "MiniMax-H3 'heun' sampling does not support cache acceleration: "
+                "cached steps assume one transformer evaluation per step."
+            )
+        schedulers = []
+        for base in (self.scheduler, self.audio_scheduler):
+            # Fresh per request: Heun keeps state between a step's two evaluations.
+            scheduler = MiniMaxH3HeunScheduler.from_config(base.config)
+            scheduler.set_shift(base.shift)
+            schedulers.append(scheduler)
+        return schedulers[0], schedulers[1]
 
     def _forward(
         self,
@@ -1152,6 +1182,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         keyframes: Optional[list[Image.Image]] = None,
         keyframe_anchors: Optional[tuple[str, ...]] = None,
         references: Optional[list] = None,
+        sampler: str = "euler",
     ) -> PipelineOutput:
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
@@ -1165,6 +1196,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             num_frames,
             frame_rate,
         )
+        video_scheduler, audio_scheduler = self._request_schedulers(sampler)
         if keyframe_anchors is None:
             keyframe_anchors = ("first", "last")[: len(keyframes)]
         keyframes = self._prepare_keyframes(
@@ -1222,17 +1254,21 @@ class MiniMaxH3Pipeline(BasePipeline):
             condition_latents=condition_latents,
         )
 
-        self.scheduler.set_timesteps(num_inference_steps, device=self.device)
-        self.audio_scheduler.set_timesteps(num_inference_steps, device=self.device)
+        video_scheduler.set_timesteps(num_inference_steps, device=self.device)
+        audio_scheduler.set_timesteps(num_inference_steps, device=self.device)
         # The denoise loop indexes both schedules with one counter, and
         # set_timesteps collapses float32 duplicates, so unequal lengths would
         # silently truncate a stream instead of failing.
-        if len(self.scheduler.timesteps) != len(self.audio_scheduler.timesteps):
+        if len(video_scheduler.timesteps) != len(audio_scheduler.timesteps):
             raise RuntimeError(
                 "MiniMax-H3 video and audio schedules disagree: "
-                f"{len(self.scheduler.timesteps)} vs "
-                f"{len(self.audio_scheduler.timesteps)} steps."
+                f"{len(video_scheduler.timesteps)} vs "
+                f"{len(audio_scheduler.timesteps)} steps."
             )
+        logger.info(
+            f"MiniMax-H3 sampler={sampler}: {video_scheduler.num_inference_steps} steps, "
+            f"{len(video_scheduler.timesteps)} transformer evaluations"
+        )
         row_timestep_plan = [
             tuple(
                 tensor.to(self.device)
@@ -1245,8 +1281,8 @@ class MiniMaxH3Pipeline(BasePipeline):
                 )
             )
             for video_timestep, audio_timestep in zip(
-                self.scheduler.timesteps,
-                self.audio_scheduler.timesteps,
+                video_scheduler.timesteps,
+                audio_scheduler.timesteps,
             )
         ]
         with self.offloader.context_if_requested("transformer"):
@@ -1265,7 +1301,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         # H3's native time increases toward clean. Attention and graph-phase
         # scheduling use descending normalized noise, protecting both streams.
         attention_timesteps = 1.0 - torch.minimum(
-            self.scheduler.timesteps, self.audio_scheduler.timesteps
+            video_scheduler.timesteps, audio_scheduler.timesteps
         )
 
         def forward_fn(
@@ -1309,12 +1345,12 @@ class MiniMaxH3Pipeline(BasePipeline):
         with self.offloader.context_if_requested("transformer"):
             generated_latents, extra_latents = self.denoise(
                 latents=latents[condition_rows:][None],
-                scheduler=self.scheduler,
+                scheduler=video_scheduler,
                 prompt_embeds=prompt_embeds,
                 guidance_scale=1.0,
                 forward_fn=forward_fn,
-                extra_streams={"audio": (audio_latents[None], self.audio_scheduler)},
-                extra_stream_timesteps={"audio": self.audio_scheduler.timesteps},
+                extra_streams={"audio": (audio_latents[None], audio_scheduler)},
+                extra_stream_timesteps={"audio": audio_scheduler.timesteps},
             )
         latents = torch.cat((condition_prefix, generated_latents), dim=1)[0]
         audio_latents = extra_latents["audio"][0]
