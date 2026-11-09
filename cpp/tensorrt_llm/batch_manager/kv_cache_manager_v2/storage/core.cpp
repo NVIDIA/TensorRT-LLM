@@ -119,7 +119,13 @@ Slot SlotAllocator::allocate()
     {
         throw OutOfPagesError("SlotAllocator: no free slots");
     }
-    scrubEvents();
+    // Readiness only decides between a fresh id and the front recycled slot, so scan (one
+    // cuEventQuery per call) only while a fresh id is left and no recycled slot is known ready.
+    bool const freshAvailable = mNumActiveSlots < std::min(mCapacity, mTargetCapacity);
+    if (freshAvailable && mNumReadyRecycledSlots == 0)
+    {
+        scrubEvents();
+    }
     return takeFreeSlot();
 }
 
@@ -214,7 +220,7 @@ void SlotAllocator::prepareForShrink(SlotCount newNumSlots)
     TLLM_CHECK_DEBUG(check());
     TLLM_CHECK_DEBUG(mTargetCapacity == mCapacity);
     TLLM_CHECK_DEBUG(newNumSlots < mCapacity);
-    std::deque<Slot> newRecycled;
+    decltype(mRecycledSlots) newRecycled;
     SlotCount newNumReady = 0;
     SlotCount const oldNumReady = mNumReadyRecycledSlots;
     SlotCount idx = 0;

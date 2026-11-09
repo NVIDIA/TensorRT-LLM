@@ -40,6 +40,7 @@
 
 #pragma once
 
+#include "kv_cache_manager_v2/utils/smallObjectPool.h"
 #include "tensorrt_llm/common/assert.h"
 #include <atomic>
 #include <cstddef>
@@ -126,6 +127,35 @@ struct InplaceControlBlock final : ControlBlockBase
     void deallocate() noexcept override
     {
         delete this;
+    }
+
+    // Pages, page holders and page locks come and go by the thousand per claim and release.
+    static void* operator new(size_t size)
+    {
+        if constexpr (poolServes(sizeof(InplaceControlBlock), alignof(InplaceControlBlock)))
+            return poolAllocate(size);
+        else
+            return ::operator new(size);
+    }
+
+    static void operator delete(void* ptr, size_t size) noexcept
+    {
+        if constexpr (poolServes(sizeof(InplaceControlBlock), alignof(InplaceControlBlock)))
+            poolDeallocate(ptr, size);
+        else
+            ::operator delete(ptr);
+    }
+
+    // Over-aligned control blocks (a tree block's digest key) are not pooled. The class-scope
+    // operator new above hides the global aligned forms, so restore them.
+    static void* operator new(size_t size, std::align_val_t align)
+    {
+        return ::operator new(size, align);
+    }
+
+    static void operator delete(void* ptr, size_t size, std::align_val_t align) noexcept
+    {
+        ::operator delete(ptr, size, align);
     }
 };
 

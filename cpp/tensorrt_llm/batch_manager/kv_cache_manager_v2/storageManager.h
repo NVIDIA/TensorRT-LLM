@@ -138,6 +138,12 @@ public:
 
     void destroy();
 
+    //! A fresh Page::visitStamp value; callers hold the manager's exclusive API lock.
+    uint64_t nextVisitStamp() noexcept
+    {
+        return ++mVisitStamp;
+    }
+
     // ---- Allocation -------------------------------------------------------
 
     // Allocate slots for all life cycles at the given cache level.
@@ -353,7 +359,8 @@ public:
     friend class KvCacheIntrospection;
 
 private:
-    using PageQueue = std::deque<SharedPtr<Page>>;
+    uint64_t mVisitStamp = 0;
+    using PageQueue = std::deque<SharedPtr<Page>, PoolAllocator<SharedPtr<Page>>>;
     using PagesByLifeCycle = TypedVec<LifeCycleId, PageQueue>;
     using MigrationBatchKey = std::pair<CacheLevel, LayerGroupId>;
 

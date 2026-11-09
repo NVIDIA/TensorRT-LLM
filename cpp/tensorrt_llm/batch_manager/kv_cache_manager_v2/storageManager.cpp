@@ -176,7 +176,8 @@ TypedVec<LifeCycleId, TypedVec<PoolIndex, int>> computeSlotToPageIndices(Storage
     return result;
 }
 
-void sortFallenPagesByPriority(TypedVec<LifeCycleId, std::deque<SharedPtr<Page>>>& fallenPages)
+void sortFallenPagesByPriority(
+    TypedVec<LifeCycleId, std::deque<SharedPtr<Page>, PoolAllocator<SharedPtr<Page>>>>& fallenPages)
 {
     for (auto& pages : fallenPages)
     {
@@ -1491,13 +1492,14 @@ void StorageManager::batchedMigrate(
     CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages, MigrationRecorder const& migrationRecorder)
 {
     std::map<MigrationBatchKey, std::vector<SharedPtr<Page>>> groups;
-    std::set<Page*> seen;
+    uint64_t const visit = nextVisitStamp();
     for (auto const& page : pages)
     {
-        if (page->cacheLevel == dstLevel || !seen.insert(page.get()).second)
+        if (page->cacheLevel == dstLevel || page->visitStamp == visit)
         {
             continue;
         }
+        page->visitStamp = visit;
         CacheLevel const srcLevel = page->cacheLevel;
         groups[{srcLevel, getMigrationBatchingLayerGroupId(dstLevel, srcLevel, page->lifeCycle)}].push_back(page);
     }

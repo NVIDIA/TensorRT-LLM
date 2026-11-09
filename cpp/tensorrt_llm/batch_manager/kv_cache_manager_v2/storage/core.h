@@ -24,6 +24,7 @@
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/utils/math.h"
+#include "kv_cache_manager_v2/utils/smallObjectPool.h"
 #include "tensorrt_llm/common/assert.h"
 
 #include <deque>
@@ -198,7 +199,7 @@ private:
     SlotCount mTargetCapacity;
     SlotCount mNumActiveSlots;
     SlotCount mNumReadyRecycledSlots;
-    std::deque<Slot> mRecycledSlots;
+    std::deque<Slot, PoolAllocator<Slot>> mRecycledSlots;
     std::vector<Slot> mOverflowSlots;
     DynamicBitset mOccupiedMask;
 };

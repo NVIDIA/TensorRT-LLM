@@ -7040,6 +7040,52 @@ class TestNoBatching(TestKVCacheManagerV2):
         commit_prompt(prompt)
         self.assertEqual(self.manager.probe_reuse(None, prompt_np), len(prompt))
 
+    def test_token_scan_walk_matches_exact_prefixes(self) -> None:
+        """Digest-free walks match exactly the committed blocks, by token scan or by key.
+
+        Nodes of up to eight children are scanned by tokens; wider nodes are looked up by key.
+        """
+        import numpy as np
+
+        tpb = 8
+        self.prepare(16 << 20, 0, 0, 2, None, 0, tokens_per_block=tpb)
+        prompt = np.arange(1000, 1000 + 16 * tpb, dtype=np.int32)
+
+        def commit_prompt(tokens: "np.ndarray") -> None:
+            kv_cache = self.manager.create_kv_cache(None, tokens)
+            with TemporaryCudaStream([]) as stream_holder:
+                self.assertTrue(kv_cache.resume(cast(CudaStream, stream_holder.handle)))
+                self.assertTrue(kv_cache.resize(len(tokens)))
+                if kv_cache.num_committed_tokens < len(tokens):
+                    kv_cache.commit(tokens[kv_cache.num_committed_tokens :])
+                kv_cache.stop_committing()
+            _ = stream_holder.take_finish_event()
+            kv_cache.close()
+
+        def probe(tokens: "np.ndarray") -> int:
+            return self.manager.probe_reuse(None, tokens)
+
+        commit_prompt(prompt)
+        changed = prompt.copy()
+        changed[10 * tpb] = 7
+        self.assertEqual(probe(changed), 10 * tpb)
+        self.assertEqual(probe(prompt[: 9 * tpb]), 9 * tpb)
+        self.assertEqual(probe(np.concatenate([prompt, prompt[:tpb]])), len(prompt))
+
+        # Ten more children after block 4 put that node past the scan limit.
+        branches = [prompt.copy() for _ in range(10)]
+        for i, branch in enumerate(branches):
+            branch[4 * tpb :] += 100000 * (i + 1)
+            commit_prompt(branch)
+        for branch in [prompt, *branches]:
+            self.assertEqual(probe(branch), len(branch))
+        branches[3][6 * tpb] = 3
+        self.assertEqual(probe(branches[3]), 6 * tpb)
+        unseen = prompt.copy()
+        unseen[4 * tpb :] += 5000000
+        self.assertEqual(probe(unseen), 4 * tpb)
+        self.assertEqual(self.manager.probe_reuse(ReuseScope(lora_id=7, salt="11"), prompt), 0)
+
     def test_reuse_scope_isolates_reuse(self) -> None:
         self.prepare(16 << 20, 0, 0, 2, None, 0, tokens_per_block=8)
         tokens = [TokenId(i) for i in range(64)]
