@@ -116,8 +116,7 @@ from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
                        make_mpi_progress_exit_hook, make_mpi_progress_pump)
-from .profiling import PROFILE_START_STOP_ENV_VAR_NAME, PyExecutorProfileManager
-from .profiling import load_iteration_indexes as _load_iteration_indexes
+from .profiling import ProfileController, PyExecutorProfileManager
 from .request_delivery import ResponseChannel
 from .request_utils import (RequestBroadcaster,
                             derive_attention_dp_per_rank_request_cap,
@@ -756,43 +755,17 @@ class PyExecutor:
 
         self.peft_cache_config = peft_cache_config
 
-        # Runtime-configurable profiling state. Populated by start_profile()
-        # when triggered via HTTP endpoints (e.g. trtllm-serve /start_profile)
-        # or API calls. When these are None/False the _profiler() context
-        # falls back to the environment-variable driven configuration.
-        self._runtime_profile_trace_path: Optional[str] = None
-        self._runtime_profile_activities: Optional[List[str]] = None
-        self._runtime_profile_cuda_only: bool = False
-        # Iteration markers added by the most recent runtime start_profile().
-        # Tracked so stop_profile() can cancel a start that has not fired
-        # yet (e.g. the caller stops before sending any requests) without
-        # leaking a pending profile window that would start later.
-        self._runtime_profile_pending_start_iter: Optional[int] = None
-        self._runtime_profile_pending_stop_iter: Optional[int] = None
-
-        # Mirrors the in-loop profile window state (maintained by
-        # ``_profiler()``) so external callers can query whether a profile
-        # is currently active. torch.profiler is not thread-safe so we do
-        # NOT call .stop() from other threads; ``stop_profile()`` schedules
-        # the iteration-scoped stop and (when triggered via an HTTP
-        # handler) the server tickles the executor loop so the stop fires
-        # even when the engine is otherwise idle.
-        #
-        # ``_profile_state_lock`` guards every read and write of
-        # ``_profile_enabled`` AND of the pending markers /
-        # ``_runtime_profile_*`` window fields above. Both the
-        # re-entrancy guard in ``start_profile()`` and the
-        # cancel-vs-schedule decision in ``apply_stop_config()`` depend
-        # on that combined state, and they race against the executor
-        # thread flipping the same fields inside ``profile_step``.
-        self._profile_state_lock = threading.Lock()
-        self._profile_enabled: bool = False
-
-        # The profile-state machine (start/stop scheduling, broadcast
-        # apply, per-iteration torch.profiler driver) lives in the
-        # ``PyExecutorProfileManager``. ``PyExecutor`` keeps the state
-        # fields above on ``self`` for backward-compat introspection;
-        # the manager operates on those fields via a weakref.
+        # Profile windows (runtime start_profile()/stop_profile() and the
+        # TLLM_PROFILE_START_STOP environment variable) live in the
+        # controller; the manager adds per-iteration timing and the
+        # iteration log around them.
+        self._profile_controller = ProfileController(
+            rank=self.global_rank,
+            current_iteration=lambda: self.iter_counter,
+            is_warmup=lambda: self.is_warmup,
+            broadcast_start=self._broadcast_profile_start,
+            broadcast_stop=self._broadcast_profile_stop,
+        )
         self._profile_manager = PyExecutorProfileManager(self)
 
         self.model_engine = model_engine
@@ -875,14 +848,7 @@ class PyExecutor:
                                      disable_overlap_scheduler)
         self.peft_cache_config = peft_cache_config
         self.iter_counter = 0
-        # profile config
-        _env_start_iters, _env_stop_iters = _load_iteration_indexes(
-            PROFILE_START_STOP_ENV_VAR_NAME)
-        # Convert to mutable sets so start_profile()/stop_profile() can
-        # .add() runtime-configured iteration indices.
-        # _load_iteration_indexes returns frozensets.
-        self.profile_start_iters = set(_env_start_iters)
-        self.profile_stop_iters = set(_env_stop_iters)
+        self._profile_controller.reset_iterations()
 
         self._metrics = {}
         self._disagg_coordinator = None
@@ -2929,10 +2895,10 @@ class PyExecutor:
                 starts (relative to the current iteration counter).
             activities: Subset of ``["CPU", "GPU", "CUDA_PROFILER"]``.
 
-        See ``PyExecutorProfileManager.start_profile`` for the full
+        See ``ProfileController.start_profile`` for the full
         state-machine contract.
         """
-        return self._profile_manager.start_profile(
+        return self._profile_controller.start_profile(
             output_dir=output_dir,
             num_steps=num_steps,
             start_step=start_step,
@@ -2943,29 +2909,35 @@ class PyExecutor:
         """Schedule the in-progress runtime profiling to stop on the
         next executor iteration.
 
-        See ``PyExecutorProfileManager.stop_profile`` for details.
+        See ``ProfileController.stop_profile`` for details.
         """
-        return self._profile_manager.stop_profile()
+        return self._profile_controller.stop_profile()
+
+    def _broadcast_profile_start(self, config: Dict) -> None:
+        self.executor_request_queue.enqueue_profile_start_request(config)
+
+    def _broadcast_profile_stop(self) -> None:
+        self.executor_request_queue.enqueue_profile_stop_request()
 
     def _apply_profile_start_config(self, config: Dict) -> None:
         """Apply a broadcasted profile-start config on this rank.
 
-        Forwards to ``PyExecutorProfileManager.apply_start_config``.
+        Forwards to ``ProfileController.apply_start_config``.
         Kept on ``PyExecutor`` so ``_handle_special_queue_items`` and
         unit tests that patch this name continue to work unchanged.
         """
-        return self._profile_manager.apply_start_config(config)
+        return self._profile_controller.apply_start_config(config)
 
     def _apply_profile_stop_config(self) -> bool:
         """Apply a broadcasted profile-stop on this rank.
 
-        Forwards to ``PyExecutorProfileManager.apply_stop_config``.
+        Forwards to ``ProfileController.apply_stop_config``.
 
         Returns:
             ``True`` when a pending start was cancelled before it
             fired, ``False`` when a stop iteration was scheduled.
         """
-        return self._profile_manager.apply_stop_config()
+        return self._profile_controller.apply_stop_config()
 
     # _wake_executor_loop_for_profile was previously used to enqueue a
     # sentinel cancel-request to unblock the idle executor loop.  It is
@@ -6153,7 +6125,7 @@ class PyExecutor:
         its offset from a single round trip, so a few milliseconds of added
         latency there skews every timestamp the server reports afterwards.
 
-        ``_profile_enabled`` is read without ``_profile_state_lock`` on
+        ``ProfileController.enabled`` is read without its lock on
         purpose: this is a per-iteration fast path, and the worst case is
         that a window that just opened or closed is reflected one
         iteration late in the trace. Taking the lock here would put a
@@ -6163,7 +6135,7 @@ class PyExecutor:
             A context manager -- ``nullcontext()`` when no profile window
             is active, otherwise a ``record_function`` for this iteration.
         """
-        if not self._profile_enabled:
+        if not self._profile_controller.enabled:
             return nullcontext()
         return torch.profiler.record_function(
             self._build_step_scope_label(scheduled_batch, phase))
