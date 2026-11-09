@@ -29,6 +29,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionResponse,
+    ChatCompletionResponseChoice,
+    ChatMessage,
+    UsageInfo,
+)
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
 from .openai_server_stub import make_stub_openai_server
@@ -112,8 +118,20 @@ def test_rendered_image_request_reaches_the_engine_marked_templated(tmp_path):
         tmp_path, "test-vlm", _StubModelConfig(), generate_async, tokenizer=tokenizer
     )
     server.await_disconnected = AsyncMock()
+    # The chat handler serializes a ChatCompletionResponse and streams anything
+    # else, so the stubbed response is a real one.
     server._create_chat_response = AsyncMock(
-        return_value=SimpleNamespace(model_dump=lambda: {"ok": True})
+        return_value=ChatCompletionResponse(
+            model="test-vlm",
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(role="assistant", content="ok"),
+                    finish_reason="stop",
+                )
+            ],
+            usage=UsageInfo(prompt_tokens=2, completion_tokens=1, total_tokens=3),
+        )
     )
     app = FastAPI()
     app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])

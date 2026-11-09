@@ -2064,6 +2064,10 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/models/llama/",
         "tensorrt_llm/parameter.py",
         "tensorrt_llm/serve/__init__.py",
+        // _MsgspecRoute decodes the disaggregated frontend's msgpack bodies.
+        "tensorrt_llm/serve/_base/",
+        // /health is the disaggregated readiness probe.
+        "tensorrt_llm/serve/api/ops/",
         "tensorrt_llm/serve/cluster_storage.py",
         "tensorrt_llm/serve/disagg_auto_scaling.py",
         "tensorrt_llm/serve/extensions/",

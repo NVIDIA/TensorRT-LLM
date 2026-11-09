@@ -731,9 +731,9 @@ def test_http_ingress_policy_before_nested_validation(
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
+    from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
     from tensorrt_llm.serve.kv_hints import KvHintsRoute
     from tensorrt_llm.serve.openai_protocol import CompletionRequest, ResponsesRequest
-    from tensorrt_llm.serve.openai_server import _MsgspecRoute
 
     hints = _wire()
     if hint_kind == "unknown":
@@ -824,9 +824,9 @@ def test_ignored_hints_do_not_relax_http_request_validation(
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
+    from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
     from tensorrt_llm.serve.kv_hints import KvHintsRoute
     from tensorrt_llm.serve.openai_protocol import CompletionRequest
-    from tensorrt_llm.serve.openai_server import _MsgspecRoute
 
     app = FastAPI()
     app.state.trust_kv_hints = True
