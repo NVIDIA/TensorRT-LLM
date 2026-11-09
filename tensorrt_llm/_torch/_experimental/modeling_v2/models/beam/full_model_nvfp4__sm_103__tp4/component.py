@@ -30,8 +30,8 @@ the checkpoint's BF16/FP32 tensors copied byte for byte. The experts stay packed
 Loading streams bounded tiles straight into that storage and is a transaction: metadata
 (config.json, hf_quant_config.json, every index/header entry) is validated against the whole
 model before any storage changes, and the component is usable only after every rank loaded
-every selected tensor. Every parameter, bank and derived scalar is a registered parameter, so
-``weight_state`` covers packed codes, block scales and scalars.
+every selected tensor. Packed codes, block scales and derived scalars are all registered
+parameters.
 """
 
 from __future__ import annotations

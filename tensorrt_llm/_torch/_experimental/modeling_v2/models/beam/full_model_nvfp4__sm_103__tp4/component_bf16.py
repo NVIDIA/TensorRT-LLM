@@ -118,18 +118,6 @@ def _check_mapping(mapping: ParallelMapping) -> None:
         raise ValueError(f"the TP group must be ranks 0..3, got {mapping.tp_group}")
 
 
-def _tensor_state(tensor: torch.Tensor) -> tuple:
-    return (
-        id(tensor),
-        tensor._version,
-        tensor.data_ptr(),
-        tuple(tensor.shape),
-        tuple(tensor.stride()),
-        tensor.dtype,
-        tensor.device,
-    )
-
-
 class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
     """Rank-local real-checkpoint weights of the Beam model on one of four TP ranks.
 
@@ -244,24 +232,6 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
     def bank(self, bank: str) -> torch.Tensor:
         """The current ``[256, ...]`` storage of one sparse layer's expert bank."""
         return getattr(self, _attr(bank))
-
-    def weight_state(self) -> tuple:
-        """Identity of every current parameter and bank: object, version, storage, geometry.
-
-        Equal states mean no parameter was replaced or modified in place since the state
-        was taken; a holder of derived state (a cache) binds it and checks it before use.
-        """
-        return tuple((name, _tensor_state(p)) for name, p in self.named_parameters())
-
-    def check_weight_state(self, state: tuple) -> None:
-        """Raise RuntimeError unless the weights are exactly those ``state`` was taken from."""
-        if not self.usable:
-            raise RuntimeError("the component is not usable: no complete load")
-        if self.weight_state() != state:
-            raise RuntimeError(
-                "the weights changed after the state was bound (in place or by replacement); "
-                "derived state such as a KV cache no longer matches them"
-            )
 
     # ------------------------------------------------------------------ loading
 
