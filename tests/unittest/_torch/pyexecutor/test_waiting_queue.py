@@ -22,6 +22,7 @@ This module tests the waiting queue functionality including:
 - create_waiting_queue factory function
 """
 
+import heapq
 from unittest.mock import Mock
 
 import pytest
@@ -575,19 +576,19 @@ class TestPriorityWaitingQueue:
         assert [item.id for item in q.peek_requests(k)] == expected
         assert q._heap == heap_before
 
-    def test_peek_requests_does_not_sort_the_heap(self, monkeypatch):
-        """peek_requests does not go through __iter__, which sorts a copy of
-        the whole heap."""
+    def test_small_peek_does_not_scan_the_heap(self, monkeypatch):
+        """A bounded peek does not sort or scan the full heap."""
         q = PriorityWaitingQueue()
         for i in range(1000):
             q.add_request(create_priority_request_item(i, priority=(i % 7) / 10))
 
-        def _no_full_sort(self):
-            raise AssertionError("peek_requests must not sort the whole heap")
+        def _no_full_scan(*args, **kwargs):
+            raise AssertionError("a bounded peek must not scan the whole heap")
 
-        monkeypatch.setattr(PriorityWaitingQueue, "__iter__", _no_full_sort)
-        peeked = [item.id for item in q.peek_requests(4)]
-        assert peeked == [6, 13, 20, 27]
+        monkeypatch.setattr(PriorityWaitingQueue, "__iter__", _no_full_scan)
+        monkeypatch.setattr(heapq, "nsmallest", _no_full_scan)
+        peeked = [item.id for item in q.peek_requests(32)]
+        assert peeked == list(range(6, 230, 7))
 
     def test_iter_does_not_consume_items(self):
         """Iterating over the queue does not remove items."""
