@@ -213,27 +213,35 @@ def tail_pipeline(layer, residual: torch.Tensor, split) -> Tuple[torch.Tensor, t
             )
         chunk_in = next_input[rows]
         prepared = moe.prepare_expert_input(moe.pooler(chunk_in))
-        if not isinstance(prepared, Fp4QuantizedTensor) or prepared.is_sf_swizzled:
-            raise RuntimeError(
-                "[musespark_open] MUSESPARK_OPEN_SP_TAIL_PIPELINE: the pre-expert quantization of a "
-                "chunk did not return an unswizzled NVFP4 tensor"
-            )
-        payload.append(prepared.fp4_tensor)
-        scales.append(prepared.scaling_factor)
+        if isinstance(prepared, Fp4QuantizedTensor):
+            if prepared.is_sf_swizzled:
+                raise RuntimeError(
+                    "[musespark_open] MUSESPARK_OPEN_SP_TAIL_PIPELINE: the pre-expert quantization of "
+                    "a chunk returned swizzled scales"
+                )
+            payload.append(prepared.fp4_tensor)
+            scales.append(prepared.scaling_factor)
+        else:
+            # BF16 expert layers (and any layer the fused quantization declines): the
+            # pre-expert norm output, per row, gathered in BF16 by the MoE as before.
+            payload.append(prepared)
+            scales.append(None)
+    if any(sc is None for sc in scales) and not all(sc is None for sc in scales):
+        raise RuntimeError(
+            "[musespark_open] MUSESPARK_OPEN_SP_TAIL_PIPELINE: the chunks of one shard were "
+            "prepared in different formats"
+        )
     split.release(main)
     # The router GEMM is not row-split invariant (FP32/TF32 accumulation differs between
     # row counts on sm103), so it runs once on the whole shard, in the MoE as before, from
     # the join's FP32 rows.
     moe.sp_router_input = (next_input, router_input)
-    moe.sp_pre = (
-        next_input,
-        None,
-        Fp4QuantizedTensor(
-            torch.cat(payload, 0) if len(payload) > 1 else payload[0],
-            torch.cat(scales, 0) if len(scales) > 1 else scales[0],
-            is_sf_swizzled=False,
-        ),
-    )
+    cat = lambda parts: torch.cat(parts, 0) if len(parts) > 1 else parts[0]  # noqa: E731
+    if scales[0] is None:
+        prepared = cat(payload)
+    else:
+        prepared = Fp4QuantizedTensor(cat(payload), cat(scales), is_sf_swizzled=False)
+    moe.sp_pre = (next_input, None, prepared)
     logger.info_once(
         f"[musespark_open] MUSESPARK_OPEN_SP_TAIL_PIPELINE: attention-side join and pooled NVFP4 "
         f"expert input prepared in {len(payload)} chunks behind the output projection's reduce-scatters",
