@@ -98,6 +98,7 @@ kernel with the capacity's scatter and gather strides and grid step.
 from __future__ import annotations
 
 from ...sm107_defaults import env as _sm107_env
+from ...sm107_defaults import sm103_tep8_hop_direct128 as _sm103_tep8_hop_direct128
 
 import functools
 import os
@@ -2444,6 +2445,15 @@ class WideDirectWorkspace:
 SERVED_DIRECT = _sm107_env("MUSESPARK_OPEN_TEP8_HOP_DIRECT", "0") == "1"
 _DIRECT_ROWS = _sm107_env("MUSESPARK_OPEN_TEP8_HOP_DIRECT_ROWS", "33-64").split("-")
 SERVED_DIRECT_ROWS = (int(_DIRECT_ROWS[0]), int(_DIRECT_ROWS[1]))
+#: hop128 (sm107_defaults.sm103_tep8_hop_direct128, default off): the direct hop also takes 65..128 rows. Its
+#: workspace holds 128 rows (16 slots per source; same values in the same order, only the slot addresses move) and
+#: o_proj publishes 65..128 rows as two 64-row split_k-1 scatter chunks. The consumer at 65..128 rows keeps no SMEM pad
+#: (``DIRECT128_PAD_ROWS``), as the served two-shot hop it replaces (HOP_PAD_ROWS 9-40), so its 2-row CTAs all fit.
+DIRECT128 = _sm103_tep8_hop_direct128()
+DIRECT128_MAX_ROWS = 128
+DIRECT128_PAD_ROWS = (0, 64)
+if DIRECT128:
+    SERVED_DIRECT_ROWS = (SERVED_DIRECT_ROWS[0], max(SERVED_DIRECT_ROWS[1], DIRECT128_MAX_ROWS))
 #: The direct consumer's grid: two rows per 512-thread CTA from this many (even) rows; its SMEM pad (bytes, 0 off).
 SERVED_DIRECT_WIDE_MIN_ROWS = int(_sm107_env("MUSESPARK_OPEN_TEP8_HOP_DIRECT_WIDE_MIN_ROWS", "41"))
 SERVED_DIRECT_PAD = int(_sm107_env("MUSESPARK_OPEN_TEP8_HOP_DIRECT_PAD", "177408"))
@@ -2477,6 +2487,23 @@ class DirectPublication:
         if parity is None:
             return None
         return self.views[parity][:rows], self.workspace.peer_stride, self.workspace.fb_layout
+
+    def target_slots(self) -> int:
+        """Slots per source of the workspace (the scatter producer's fb-layout feature-block stride)."""
+        return self.workspace.max_rows // self.workspace.ranks
+
+    def chunk_view(self, view: torch.Tensor, row0: int, rows: int) -> torch.Tensor:
+        """hop128: the producer view of the ``rows``-row chunk starting at token ``row0`` (a multiple of 8) of
+        the armed step: ``view``'s origin advanced by ``row0 // 8`` slots (64 elements per slot in the fb layout, one
+        8192-wide row otherwise), shaped ``[rows, 8192]`` (only its address and shape are used)."""
+        if row0 % 8:
+            raise ValueError(f"direct hop chunk at token {row0}: chunks start at multiples of 8")
+        step = 64 if self.workspace.fb_layout else HIDDEN
+        off = (row0 // 8) * step
+        if off + rows * HIDDEN > self.workspace.max_rows * HIDDEN:
+            raise ValueError(f"direct hop chunk of {rows} rows at token {row0} overruns the {self.workspace.max_rows}-row slab")
+        full = torch.as_strided(view, (self.workspace.max_rows * HIDDEN,), (1,), view.storage_offset())
+        return full[off : off + rows * HIDDEN].view(rows, HIDDEN)
 
     def arm(self, rows: int) -> None:
         if self.poisoned is not None:
@@ -2777,12 +2804,17 @@ if HAS_SCATTER_GEMM:
         the same values; only the addresses of the final stores differ. Defined here (not in the kernel file) so the
         kernel's device code -- and the TP8 publish certification keyed on it (``producer_key``) -- stays the stack's."""
 
-        def __init__(self, *, tactic: SplitKTactic, use_pdl: bool, fb_layout: bool = False) -> None:
+        def __init__(self, *, tactic: SplitKTactic, use_pdl: bool, fb_layout: bool = False, slots: int = 8) -> None:
             super().__init__(tactic=tactic, use_pdl=use_pdl, has_bias=False, mailbox_v4=True)
             if tactic.split_k != 1 or (fb_layout and (tactic.mma_m != 64 or tactic.mma_n != 64)):
                 raise ValueError(f"the scatter epilogue serves split_k 1 (fb layout: 64 x 64 tiles) only, got {tactic}")
+            if slots < 8 or slots % 8:
+                raise ValueError(f"the scatter epilogue's slots per source are a multiple of 8, got {slots}")
             self.scatter = True
             self.fb_layout = bool(fb_layout)
+            #: hop128: slots per source of the workspace (max_rows / 8): 8 at 64 rows (the image's constant), 16 at
+            #: 128 rows. Only the feature-block stride of the fb layout depends on it.
+            self.slots = int(slots)
 
         @cute.experimental.jit
         def __call__(
@@ -3197,7 +3229,7 @@ if HAS_SCATTER_GEMM:
                         )
                         dst = (
                             gD_tile.iterator
-                            + cutlass.Int64(bidx) * (7 * self.cta_m)
+                            + cutlass.Int64(bidx) * ((self.slots - 1) * self.cta_m)
                             + cutlass.Int64(p) * peer_stride_el
                             + s * self.cta_m
                             + fchunk * 8
@@ -3248,23 +3280,27 @@ if HAS_SCATTER_GEMM:
 
 
     @functools.cache
-    def _get_compiled_scatter_kernel(dtype, tactic: SplitKTactic, use_pdl: bool, leading_dims, fb_layout: bool = False):
-        kernel = SplitKScatterKernel(tactic=tactic, use_pdl=use_pdl, fb_layout=fb_layout)
+    def _get_compiled_scatter_kernel(dtype, tactic: SplitKTactic, use_pdl: bool, leading_dims, fb_layout: bool = False,
+                                     slots: int = 8):
+        kernel = SplitKScatterKernel(tactic=tactic, use_pdl=use_pdl, fb_layout=fb_layout, slots=slots)
         a_rep, b_rep, c_rep, _ = _make_compile_repr_tensors(dtype, False, *leading_dims)
         stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
         return cute_ext.compile(_bmm_scatter, kernel, a_rep, b_rep, c_rep, cutlass.Int64(0), cutlass.Int32(0), stream)
 
 
-    def run_splitk_scatter(a, b, out, pdl: bool, tactic: SplitKTactic, peer_stride_bytes: int, fb_layout: bool = False):
+    def run_splitk_scatter(a, b, out, pdl: bool, tactic: SplitKTactic, peer_stride_bytes: int, fb_layout: bool = False,
+                           slots: int = 8):
         """Direct hop: ``A @ B`` stored as the hop's direct scatter: ``out`` [M, N] is a view whose origin is
         this rank's scatter slab on rank 0 of the window (only its address is used); token row t lands at
-        ``out`` + (t % 8) * peer_stride_bytes + (t // 8) * N * 2."""
+        ``out`` + (t % 8) * peer_stride_bytes + (t // 8) * N * 2 (fb layout: feature block f of ``slots`` slots at
+        ``out`` + f * slots * 64 elements, token t at slot t // 8 of it). hop128: a 64-row chunk starting at token
+        64 c stores through ``out`` advanced by 8 c slots (``direct_chunk_view``)."""
         m, n, k = _validate_runtime_tensors(a, b, None, out)
         validate_tactic(tactic, m, n, k)
         if m > tactic.mma_n or n != 8192 or peer_stride_bytes % 16:
             raise ValueError(f"scatter epilogue: rows <= mma_n, 8192 columns; got {m} x {n}")
         cute_tensors = _to_cute_swap(a, b, out, None)
-        compiled = _get_compiled_scatter_kernel(a.dtype, tactic, pdl, cute_tensors[4], bool(fb_layout))
+        compiled = _get_compiled_scatter_kernel(a.dtype, tactic, pdl, cute_tensors[4], bool(fb_layout), int(slots))
         stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
         compiled(*cute_tensors[:3], cutlass.Int64(peer_stride_bytes // 2), cutlass.Int32(m), stream)
         return out

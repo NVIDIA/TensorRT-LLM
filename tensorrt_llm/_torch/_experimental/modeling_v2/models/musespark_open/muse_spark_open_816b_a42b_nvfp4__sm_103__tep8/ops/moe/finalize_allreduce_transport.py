@@ -84,7 +84,7 @@ the layout's (``grid_step``): 128 for ``MAX_TOKENS``, 256 for
 shared memory, resident at once on the devices served), and 128, 256 or 512
 for a TP8 layout of ``TP8_MAX_TOKENS`` = 16, 32 or 64 tokens (a 64-token call
 is 512 CTAs in 64 clusters of 8, all resident at once on the devices
-served). The two builds of a TP8
+served), and 1024 for the 128-token TP8 layout. The two builds of a TP8
 workspace share its receive area and counter: a call of either advances the
 counter by the layout's ``grid_step``, and both map a ``(token, column
 vector)`` slot to the same thread, so the arguments above hold across builds.
@@ -129,7 +129,7 @@ per token above 16 tokens, which the cluster-8 order is not, so the wide
 layout is TP4-only. A TP8 workspace instead takes its calls of
 17..``TP8_MAX_TOKENS`` itself, on its own layout of that many tokens and the
 flat build (flat finalize: ``TP8_MAX_TOKENS`` is
-``MUSESPARK_OPEN_TEP8_FINALIZE_TRANSPORT_TOKENS``, 16, 32 or 64, 16 unset; no
+``MUSESPARK_OPEN_TEP8_FINALIZE_TRANSPORT_TOKENS``, 16, 32, 64 or 128, 16 unset; no
 TP4 workspace uses it).
 """
 
@@ -173,7 +173,10 @@ TP8_MAX_TOKENS = int(
         "32" if _sm107_env("MUSESPARK_OPEN_TEP8_FINALIZE_TRANSPORT_32", "0") == "1" else "16",
     )
 )
-assert TP8_MAX_TOKENS in (16, 32, 64), f"finalize transport token cap {TP8_MAX_TOKENS}: 16, 32 or 64"
+#: GB300 TEP8 at 16 requests: 128 = the built-in TP8 kernel's own bound (``_MAX_TOKENS``), whose 17..128-token calls all
+#: run one CTA per token, the flat build's order; a 128-token call is 1024 CTAs of 64 threads in 128 clusters of 8
+#: (grid_step 1024). Without it a 65..128-token TP8 step (9..16 requests at K = 7) falls back to the built-in kernel.
+assert TP8_MAX_TOKENS in (16, 32, 64, 128), f"finalize transport token cap {TP8_MAX_TOKENS}: 16, 32, 64 or 128"
 #: CTAs per token (one cluster), threads per CTA, BF16 values per thread.
 CLUSTER = 8
 VECTOR = 8

@@ -416,6 +416,7 @@ from __future__ import annotations
 
 from .sm107_defaults import env as _sm107_env
 from .sm107_defaults import sm103_tep8_f11 as _sm103_tep8_f11
+from .sm107_defaults import sm103_tep8_wide_gemm_sites as _sm103_tep8_wide_gemm_sites
 
 import contextlib
 import os
@@ -1272,9 +1273,14 @@ TARGET_PATHS = {
     ),
 }
 
-#: The F11 TEP8 paths sm_103 leaves out: ``wide_dense_gemms`` (9..32-row projections), whose installer has an sm107
-#: table only (``dense_gemms.install`` refuses other devices); those rows keep ``dense_gemms`` / cuBLAS.
-_SM103_TEP8_F11_EXCLUDED_PATHS = frozenset({"wide_dense_gemms"})
+#: The F11 TEP8 paths sm_103 leaves out: ``wide_dense_gemms`` (9..32-row projections), whose table is sm107's
+#: (``dense_gemms.install`` refuses other devices); those rows keep ``dense_gemms`` / cuBLAS. With
+#: ``MUSESPARK_OPEN_SM103_TEP8_WIDE_GEMMS`` naming sites (``sm107_defaults.sm103_tep8_wide_gemm_sites``) the path is
+#: served for those sites on sm_103 too (``dense_gemms.install``: same split_k as the sm103 8-row cells, stages fitted
+#: to GB300's shared memory).
+_SM103_TEP8_F11_EXCLUDED_PATHS = (
+    frozenset() if _sm103_tep8_wide_gemm_sites() else frozenset({"wide_dense_gemms"})
+)
 #: sm_103 TEP8 under ``MUSESPARK_OPEN_SM103_TEP8_F11=1`` (``sm107_defaults.SM103_TEP8_F11_ENV``, off by default): the
 #: sm107 TEP8 composition (F11) on GB300, less ``_SM103_TEP8_F11_EXCLUDED_PATHS``, with the sm107 levers (each lever's
 #: rule treats this deployment as sm107's, ``levers.f11_tep8``) and without the sm107 built-in fused-kernel

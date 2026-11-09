@@ -137,6 +137,18 @@ CERTIFIED_PRODUCERS = frozenset(
 #: (a device census, 33..448 rows, both sites) certified
 #: (two-tray TP8). Same key as above.
 CERTIFIED_PRODUCERS_TP8 = frozenset({('2.14.0a0+b2c75dd062.nv26.09', 130800, 212)})
+#: The GB300 (152-SM) TP8 cuBLAS producer census (pool / unpool slices, 33..448 rows, eager module loading).
+#: Consulted only by ``MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE
+#: =cublas`` (kernels/projection_publish), so the default sm103 TP8 build keeps refusing exactly as before.
+CERTIFIED_PRODUCERS_TP8_SM103_WIDE = frozenset({("2.14.0a0+b2c75dd062.nv26.09", 130800, 152)})
+#: ``MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE=splitk1``: split_k 1 (no K split: every element one full-K FP32
+#: accumulation in K order, rounded once) at the certified tiles with the most stages that fit. On GB300 its slices are
+#: bitwise equal to the replicated full-weight cuBLAS GEMM the built-in runs at 64..128 rows (no split-K): device
+#: probe, every multiple of 8 and odd rows in 64..128, both sites, 0 differing elements.
+TP8_PUBLISH_SPLITK1_TACTICS = {
+    (UNPOOL_HIDDEN, POOL_HIDDEN // 8): (64, 16, 1, 11),  # pool
+    (POOL_HIDDEN, UNPOOL_HIDDEN // 8): (64, 32, 1, 9),  # unpool
+}
 #: Environment variables that resize torch's cuBLAS workspaces, which changes cuBLAS's choice
 #: of split-K kernels; the census ran with none set.
 CUBLAS_WORKSPACE_ENV = ("CUBLAS_WORKSPACE_CONFIG", "CUBLASLT_WORKSPACE_SIZE")
@@ -172,10 +184,20 @@ TP8_PUBLISH_SPLITK_TACTICS = {
 #: carried over to ``ops/gemm/splitk_gemm.py``: under the F11 env (MUSESPARK_OPEN_SPLITK_RS unset) that kernel traces
 #: the same code for these two bias-free tactics (its reduce-scatter branches are compile-time out) at the same
 #: launch (opt-in shared memory, mailbox v4, owner store, PDL). A census rerun on the unified file confirms it.
+#: The same producer keys on GB300 (152 SMs, sm_103 under MUSESPARK_OPEN_SM103_TEP8_F11=1, whose module
+#: defaults give the same mailbox / opt-in / PDL launch): census on device, every row count 33..64 of both sites,
+#: concurrent poller + sentinel read-back check, and each 8-row block bitwise equal to sm_103's TP8 8-row pool /
+#: unpool cell (split-K 4). Served there through
+#: kernels/projection_publish's MUSESPARK_OPEN_SM103_TEP8_PUBLISH_SPLITK_ONLY (the TP8 cuBLAS census is Rubin's).
 CERTIFIED_SPLITK_PRODUCERS_TP8 = frozenset(
     {
         (
             212,
+            ("95e7ff00cb4507f61ead2ef332c6e22c", (64, 16, 4, 10), "owner", "v4", "opt-in", True),
+            ("95e7ff00cb4507f61ead2ef332c6e22c", (64, 32, 4, 8), "owner", "v4", "opt-in", True),
+        ),
+        (
+            152,
             ("95e7ff00cb4507f61ead2ef332c6e22c", (64, 16, 4, 10), "owner", "v4", "opt-in", True),
             ("95e7ff00cb4507f61ead2ef332c6e22c", (64, 32, 4, 8), "owner", "v4", "opt-in", True),
         ),
@@ -894,6 +916,114 @@ def producer_refusal(device: torch.device, world: int = WORLD) -> Optional[str]:
     if overrides:
         return f"{', '.join(overrides)} resize the cuBLAS workspaces the producer census ran with"
     return None
+
+
+def wide_producer_refusal(device: torch.device) -> Optional[str]:
+    """``producer_refusal`` for the GB300 TP8 cuBLAS publication (``CERTIFIED_PRODUCERS_TP8_SM103_WIDE``)."""
+    torch.cuda.init()
+    key = (
+        str(torch.__version__),
+        cublaslt_version(),
+        torch.cuda.get_device_properties(device).multi_processor_count,
+    )
+    if key not in CERTIFIED_PRODUCERS_TP8_SM103_WIDE:
+        return f"the GB300 TP8 cuBLAS producer census does not cover {key}"
+    overrides = [name for name in CUBLAS_WORKSPACE_ENV if _sm107_env(name)]
+    if overrides:
+        return f"{', '.join(overrides)} resize the cuBLAS workspaces the producer census ran with"
+    return None
+
+
+def publish_projection_chunked(hidden: torch.Tensor, weight: torch.Tensor, slot: torch.Tensor) -> bool:
+    """Publish a 65..448-row TP8 slice from the certified split-K producer, one launch per 64 rows.
+
+    Rows are independent in a GEMM, so every row carries the bits the producer gives it in a 33..64-row call
+    (split_k 4 = sm_103's TP8 8-row cell: each row's one-request bits), and each launch stores its rows of the slot
+    once (the producer census). The launches run in stream order with PDL; a launch's dependency wait implies its
+    predecessor's. Returns False (nothing launched) when the producer is not selected or a chunk does not fit it.
+    """
+    return _publish_chunked(hidden, weight, slot, None)
+
+
+_chunk_streams: dict = {}
+
+
+def publish_projection_chunked_k1(hidden: torch.Tensor, weight: torch.Tensor, slot: torch.Tensor) -> bool:
+    """``splitk1``: ``publish_projection_chunked`` at split_k 1 (``TP8_PUBLISH_SPLITK1_TACTICS``): bitwise equal
+    to the built-in replicated GEMM's columns of this rank. A split_k-1 launch has one CTA per (64-column, row) tile
+    streaming the whole K, so the 64-row chunks run concurrently: the first on the current stream (PDL), the others
+    forked onto a side stream (plain launches) and joined back before the slot's consumer is enqueued."""
+    return _publish_chunked(hidden, weight, slot, TP8_PUBLISH_SPLITK1_TACTICS)
+
+
+def _publish_chunked(hidden, weight, slot, table) -> bool:
+    rows = hidden.shape[0] if hidden.dim() == 2 else 0
+    if rows <= SPLITK_MAX_ROWS or slot.dim() != 2 or slot.shape[0] != rows:
+        return False
+    # 64-row launches, the last one the remainder (1..64 rows): the chunked producer's census and bits ran on exactly
+    # these launches (every call of 33..128 rows, device-checked).
+    starts = list(range(0, rows, SPLITK_MAX_ROWS))
+    bounds = list(zip(starts, starts[1:] + [rows]))
+    head = _splitk_tactic(hidden[:SPLITK_MAX_ROWS], weight, slot[:SPLITK_MAX_ROWS])
+    if head is None or not (hidden.is_contiguous() and slot.is_contiguous()):
+        return False
+    tactics = [head] * len(bounds)
+    run_splitk_dense, splitk_tactic = _splitk_publisher()
+    if table is None:
+        for (a, b), tactic in zip(bounds, tactics):
+            run_splitk_dense(hidden[a:b], weight.t(), None, slot[a:b], _SPLITK_PDL, splitk_tactic(*tactic))
+        return True
+    tactic = splitk_tactic(*table[(hidden.shape[1], weight.shape[0])])
+    main = torch.cuda.current_stream(hidden.device)
+    side = _chunk_streams.get(hidden.device)
+    if side is None:
+        # A stream of its own, never one of PyTorch's pool (a pooled stream can be the capturing stream itself, or
+        # another fast path's side stream, whose in-order work -- a spinning consumer among it -- the chunk would
+        # queue behind).
+        from ...kernels.dense_gemms.dispatcher import dedicated_stream
+
+        side = _chunk_streams.setdefault(hidden.device, dedicated_stream(hidden.device))
+    side.wait_stream(main)
+    (a0, b0), rest = bounds[0], bounds[1:]
+    with torch.cuda.stream(side):
+        for a, b in rest:
+            run_splitk_dense(hidden[a:b], weight.t(), None, slot[a:b], False, tactic)
+    run_splitk_dense(hidden[a0:b0], weight.t(), None, slot[a0:b0], _SPLITK_PDL, tactic)
+    # The join orders every later use (and the allocator's reuse of ``hidden``, allocated on ``main``) after the side
+    # launches; ``weight`` is a parameter and ``slot`` transport memory.
+    main.wait_stream(side)
+    return True
+
+
+#: SM counts where the split_k-1 producer passed the census (single store, every row 33..128 in 64-row launches, both
+#: sites) with the split-K census's device code.
+SPLITK1_CERTIFIED_SMS = frozenset({152})
+
+
+def splitk1_refusal() -> Optional[str]:
+    """Why the split_k-1 producer may not publish here, or None: same device code as a certified split-K producer
+    (``CERTIFIED_SPLITK_PRODUCERS_TP8``), owner-store epilogue, an SM count its census ran on."""
+    try:
+        from ..gemm import splitk_gemm as splitk
+
+        keys = splitk1_producer_keys(splitk)
+    except Exception as error:  # noqa: BLE001
+        return f"split_k-1 producer unavailable ({error!r})"
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    md5s = {entry[1][0] for entry in CERTIFIED_SPLITK_PRODUCERS_TP8 if entry[0] == sms}
+    if sms not in SPLITK1_CERTIFIED_SMS:
+        return f"no split_k-1 census on {sms} SMs"
+    if any(k is None or k[0] not in md5s or k[2] != "owner" for k in keys):
+        return f"split_k-1 producer keys {keys} not covered by the split-K census device code {sorted(md5s)}"
+    return None
+
+
+def splitk1_producer_keys(splitk) -> Tuple:
+    """(pool key, unpool key) of the split_k-1 producer (``splitk_gemm.producer_key`` at 33 and 64 rows), else None."""
+    keys = []
+    for kn in ((UNPOOL_HIDDEN, POOL_HIDDEN // 8), (POOL_HIDDEN, UNPOOL_HIDDEN // 8)):
+        keys.append(_splitk_site_key(splitk, TP8_PUBLISH_SPLITK1_TACTICS[kn]))
+    return tuple(keys)
 
 
 def publish_projection(hidden: torch.Tensor, weight: torch.Tensor, slot: torch.Tensor) -> None:

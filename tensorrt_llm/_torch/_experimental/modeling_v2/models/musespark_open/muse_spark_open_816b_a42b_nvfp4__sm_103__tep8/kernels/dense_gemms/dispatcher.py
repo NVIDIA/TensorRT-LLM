@@ -60,6 +60,8 @@ work outside it.
 from __future__ import annotations
 
 from ...sm107_defaults import env as _sm107_env
+from ...sm107_defaults import SM103_TEP8_WIDE_GEMMS_ENV as _SM103_WIDE_ENV
+from ...sm107_defaults import sm103_tep8_wide_gemm_sites as _sm103_tep8_wide_gemm_sites
 
 import json
 import os
@@ -1015,6 +1017,10 @@ class DenseGemmDispatcher:
             return None
         k = int(weight.shape[1])
         rows = input_tensor.numel() // k
+        if TEP8_WIDE64_MAX_ROWS < rows <= 2 * TEP8_WIDE64_MAX_ROWS and site.role == "o_proj":
+            # hop128: only a step the direct publication armed (MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT128=1);
+            # every other 65..128-row call keeps cuBLAS, as before.
+            return self._direct128(input_tensor, weight, rows, k)
         if not TEP8_WIDE64_MIN_ROWS <= rows <= TEP8_WIDE64_MAX_ROWS:
             return None
         plan.join()
@@ -1038,11 +1044,47 @@ class DenseGemmDispatcher:
                     )
                 _wide.run_splitk_scatter(
                     input_tensor.view(-1, k), weight.t(), view, plan.enable_pdl, _wide.SplitKTactic(*fields),
-                    peer_stride, fb_layout,
+                    peer_stride, fb_layout, publication.target_slots(),
                 )
                 return view.view(*input_tensor.shape[:-1], int(weight.shape[0]))
         out = dense_gemm(input_tensor.view(-1, k), weight, TEP8_WIDE64_KERNELS[site.role], plan.enable_pdl)
         return out.view(*input_tensor.shape[:-1], int(weight.shape[0]))
+
+    def _direct128(self, input_tensor: torch.Tensor, weight: torch.Tensor, rows: int, k: int) -> Optional[torch.Tensor]:
+        """hop128: o_proj of a 65..128-row step the direct publication armed, as 64-row chunks of the split_k-1
+        scatter kernel (each chunk's tokens land in their own slots: chunk c through the view advanced by 8 c slots),
+        in token order on the current stream (PDL chains them); ``None`` (cuBLAS, as before) when not armed."""
+        from ...ops.allreduce import post_attn_hop_wide as _wide
+
+        site = self.site
+        plan = site.plan
+        publication = getattr(_wide, "_DIRECT_PUBLICATION", None)
+        if publication is None or not getattr(_wide, "DIRECT128", False):
+            return None
+        target = publication.target(self, rows)
+        if target is None:
+            return None
+        view, peer_stride, fb_layout = target
+        family, fields = parse_kernel(TEP8_WIDE64_KERNELS[site.role])
+        if family != "splitk" or fields[2] != 1:
+            raise RuntimeError(
+                f"[musespark_open] hop128: o_proj runs {TEP8_WIDE64_KERNELS[site.role]}, not a split_k 1 "
+                "split-K kernel"
+            )
+        plan.join()
+        if plan.named_forks:
+            plan.join_role(site.role)
+        a = input_tensor.view(-1, k)
+        b = weight.t()
+        tactic = _wide.SplitKTactic(*fields)
+        slots = publication.target_slots()
+        for row0 in range(0, rows, TEP8_WIDE64_MAX_ROWS):
+            n = min(TEP8_WIDE64_MAX_ROWS, rows - row0)
+            _wide.run_splitk_scatter(
+                a[row0 : row0 + n], b, publication.chunk_view(view, row0, n), plan.enable_pdl, tactic, peer_stride,
+                fb_layout, slots,
+            )
+        return view.view(*input_tensor.shape[:-1], int(weight.shape[0]))
 
     def _launches_itself(self, input_tensor, weight, bias) -> bool:
         """Whether this call launches the plan's kernel itself: it fits, and when a transport slot is armed
@@ -1251,13 +1293,25 @@ def install(
         )
     wide_table = {}
     if wide:
-        if tuple(capability) != (10, 7) or tp_size not in (4, 8) or not sharded:
+        # sm_103 TEP8 for the sites MUSESPARK_OPEN_SM103_TEP8_WIDE_GEMMS names (sm107's TP8 tiles, the stages
+        # fitted to GB300's opt-in by ``wide_steps``; the split_k check below holds against sm103's own 8-row cells).
+        sm103_sites = (
+            _sm103_tep8_wide_gemm_sites() if tuple(capability) == (10, 3) and tp_size == 8 and sharded else frozenset()
+        )
+        if not sm103_sites and (tuple(capability) != (10, 7) or tp_size not in (4, 8) or not sharded):
             raise ValueError(
                 "[musespark_open] wide_dense_gemms is measured for sm107 at TP4 and TP8 with the sharded "
-                f"pooler and unpooler; got SM {tuple(capability)} at TP{tp_size}, "
-                f"{'sharded' if sharded else 'replicated'} projections"
+                f"pooler and unpooler (sm103 TP8 with {_SM103_WIDE_ENV}); got SM {tuple(capability)} at "
+                f"TP{tp_size}, {'sharded' if sharded else 'replicated'} projections"
             )
         wide_table = wide_kernels(tp_size)
+        if sm103_sites:
+            wide_table = {role: cells for role, cells in wide_table.items() if role in sm103_sites}
+            logger.info(
+                f"[musespark_open] dense_gemms: {_SM103_WIDE_ENV}: sm103 TP8 9..32-row calls of "
+                + ", ".join(f"{role}={'|'.join(sorted(set(cells)))}" for role, cells in sorted(wide_table.items()))
+                + " (flashinfer split-K, the 8-row cells' split_k)"
+            )
         pool8 = _sm107_env(POOL_SPLITK8_ENV, "0") == "1"
         if pool8:
             logger.info(
@@ -1270,7 +1324,16 @@ def install(
                 wide_family, wide_fields = parse_kernel(kernel)
                 if pool8 and role == "pool" and wide_family == SPLITK and wide_fields[2] == 8:
                     continue
-                if family != SPLITK or wide_family != SPLITK or wide_fields[2] != fields[2]:
+                # A cuBLAS 8-row cell measured bitwise equal to split_k 1 (TEP8_WIDE64_CUBLAS_CELLS: sm103's
+                # TP8 o_proj) takes a split_k-1 wide kernel, as the wide64 sites do.
+                cublas_cell = (
+                    family == CUBLAS
+                    and wide_family == SPLITK
+                    and wide_fields[2] == 1
+                    and tp_size == 8
+                    and (role, tuple(capability)) in TEP8_WIDE64_CUBLAS_CELLS
+                )
+                if not cublas_cell and (family != SPLITK or wide_family != SPLITK or wide_fields[2] != fields[2]):
                     raise ValueError(
                         f"[musespark_open] wide_dense_gemms: {role} kernel {kernel} does not sum "
                         f"the K slices of the {MAX_ROWS}-row kernel {kernels[role][MAX_ROWS - 1]}"

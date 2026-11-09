@@ -60,7 +60,10 @@ Wide transport (TP4, ``max_rows=WIDE_MAX_ROWS``): the decode steps of two to fou
 requests (16..32 rows, ``wide_prologue``) take a separate workspace whose slots hold 32
 rows (``3 buffers x 4 source ranks x 32 rows x 2048``), with its own buffer sequence;
 the kernel is the gather boundary's at those row counts (a cluster of 4 CTAs, one per
-peer slice) with the slot stride of 32 rows. The 8-row layout is unchanged.
+peer slice) with the slot stride of 32 rows. The 8-row layout is unchanged. unpool-fuse:
+the same wide layout at TP8 (``3 x 8 x 32 x 1024``), whose 4-CTA clusters span two peers'
+slices each, as in the TP8 wide gather boundary: every thread still polls
+the 16 bytes of the one peer its own columns belong to.
 
 PDL memory order: before ``griddepcontrol.wait`` the kernel touches shared
 memory and the cluster barrier only (and, with ``trigger="entry"``, releases
@@ -115,11 +118,14 @@ def workspace_bytes(max_rows: int = MAX_ROWS) -> int:
 
 
 def check_layout(world: int, max_rows: int) -> None:
-    """Raise unless ``(world, max_rows)`` is a served layout: 8 rows at TP4 or TP8, 32 rows at TP4."""
+    """Raise unless ``(world, max_rows)`` is a served layout: 8 or 32 rows at TP4 or TP8.
+
+    unpool-fuse: the 32-row layout at TP8 (``sm107_defaults.SM103_TEP8_UNPOOL_DIRECT_WIDE_ENV``). Its kernel is
+    the TP8 wide gather boundary's (four CTAs a row, each spanning two peers' slices, every thread
+    picking its one peer from its own columns), so each thread still polls 16 bytes of exactly one peer's slot.
+    """
     if world not in WORLDS or max_rows not in (MAX_ROWS, WIDE_MAX_ROWS):
         raise ValueError(f"no direct unpool layout for TP{world} and {max_rows} rows")
-    if max_rows == WIDE_MAX_ROWS and world != 4:
-        raise ValueError("the wide direct unpool layout is TP4 only")
 
 
 #: Per-rank control words, in pinned host memory the kernel stores to at system scope:

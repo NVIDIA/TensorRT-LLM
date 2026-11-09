@@ -912,10 +912,11 @@ def _build_wide_direct(model: MuseSparkOpenModel, call: PostAttnHopCall, variant
         multicast=True,
         variants=variants,
         early_launch=True,
-        max_rows=64,
+        # hop128 (MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT128=1): a 128-row workspace, the pad only up to 64 rows.
+        max_rows=_wide.DIRECT128_MAX_ROWS if _wide.DIRECT128 else 64,
         wide_min_rows=_wide.SERVED_DIRECT_WIDE_MIN_ROWS,
         smem_pad=_wide.SERVED_DIRECT_PAD,
-        pad_rows=(0, 1024),
+        pad_rows=_wide.DIRECT128_PAD_ROWS if _wide.DIRECT128 else (0, 1024),
         wait_first=True,
         fb_layout=True,
     )

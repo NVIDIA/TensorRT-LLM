@@ -41,6 +41,12 @@ What this module does:
   same layers), and a captured forward of 16, 24 or 32 rows arms that one: the unpool
   GEMM (``wide_dense_gemms``' split-K) writes the layer's wide slot and the join runs the
   boundary at that row count.
+* TEP8 on sm_103 (unpool-fuse, ``MUSESPARK_OPEN_SM103_TEP8_UNPOOL_DIRECT_WIDE=1``): when every
+  fused join holds projection_gathers' TP8 wide unpool inbox, the group gets
+  the same 32-row transport at TP8 (``3 x 8 x 32 x 1024`` BF16) and arms it at 16, 24 or 32
+  rows. The unpool GEMM is the one those rows run anyway: cuBLAS (its product copied into the
+  slot by ``PUBLISH_POLICY``) or, with ``MUSESPARK_OPEN_SM103_TEP8_WIDE_GEMMS`` naming unpool,
+  flashinfer's split-K storing the slot from its epilogue.
 * Eager steps, other row counts and the last layer (no fused boundary) keep
   the projection gathers' tagged inbox and path; the transports never share memory.
 
@@ -57,6 +63,7 @@ from typing import FrozenSet, Optional, Sequence, Tuple
 import torch
 
 from ... import dispatch as _tp_agreement
+from ...sm107_defaults import sm103_tep8_unpool_direct_wide as _sm103_tep8_unpool_direct_wide
 from ...ops.comm import unpool_direct_boundary as _direct
 from ...ops.comm import unpool_gather_boundary as _unpool
 from ...ops.comm.projection_inbox import WIDE_MAX_ROWS
@@ -324,9 +331,14 @@ def install(
     # The wide layout when wide_prologue gave every fused join its wide unpool inbox and
     # the layers the wide_direct_transports lever (TP4; construction-time state agreed
     # over the TP group by wide_prologue.install, the same on every rank).
+    # Unpool-fuse: at TP8 (sm_103 F11) the wide layout when MUSESPARK_OPEN_SM103_TEP8_UNPOOL_DIRECT_WIDE=1 and
+    # every fused join holds the TP8 wide unpool inbox (projection_gathers). Environment and inboxes
+    # are process-wide, the same on every rank.
+    tep8_wide = int(layers[0].mapping.tp_size) == 8 and _sm103_tep8_unpool_direct_wide()
     wide = None
     if all(
-        join._gather_inbox_wide is not None and getattr(layer.feed_forward, "_wide_direct", False)
+        join._gather_inbox_wide is not None
+        and (tep8_wide or getattr(layer.feed_forward, "_wide_direct", False))
         for _, layer, join, _ in fused
     ):
         wide = _direct.shared_workspace(layers[0].mapping, max_rows=WIDE_MAX_ROWS)

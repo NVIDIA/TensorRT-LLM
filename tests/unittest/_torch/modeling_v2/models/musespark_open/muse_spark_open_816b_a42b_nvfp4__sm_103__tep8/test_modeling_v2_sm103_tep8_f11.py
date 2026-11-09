@@ -44,7 +44,7 @@ def _defaults():
 DEFAULTS = _defaults()
 
 
-def _compositions(switch_on: bool):
+def _compositions(switch_on: bool, wide_sites=frozenset()):
     """``modeling.py``'s composition statements over ``dispatch`` (as the levers test runs them), then the module's
     ``if _sm103_tep8_f11(): TARGET_PATHS[(103, 8)] = ...`` statement with the switch ``switch_on``."""
     path = _TARGET / "modeling.py"
@@ -61,6 +61,7 @@ def _compositions(switch_on: bool):
         "_dispatch": DISPATCH,
         "_paths_from_env": lambda name: frozenset(),
         "_sm103_tep8_f11": lambda: switch_on,
+        "_sm103_tep8_wide_gemm_sites": lambda: frozenset(wide_sites) if switch_on else frozenset(),
     }
     exec(compile(ast.Module(body=body + switch, type_ignores=[]), str(path), "exec"), namespace)
     return namespace["TARGET_PATHS"], namespace
@@ -285,3 +286,238 @@ def test_sm103_wide64_sites_keep_the_bits_of_sm103s_8_row_cells():
             assert cell.split(",")[2] == wide[site].split(",")[2], (site, cell, wide[site])
         else:
             assert cell == "cublas" and wide[site].split(",")[2] == "1" and (site, (10, 3)) in cublas_ok, site
+
+
+def test_sm103_tep8_finalize_transport_takes_128_tokens():
+    """The TP8 finalize transport's token cap admits 128 (the built-in TP8 kernel's bound; one CTA per token at
+    17..128, the flat build's order), and SM103_TEP8_DEFAULTS keeps 64 (128 is set per deployment)."""
+    src = (_TARGET / "ops/moe/finalize_allreduce_transport.py").read_text()
+    assert "assert TP8_MAX_TOKENS in (16, 32, 64, 128)" in src
+    legacy = (_TARGET.parents[4] / "models/musespark_open_finalize_ar.py").read_text()
+    assert "_MAX_TOKENS = 128" in legacy and "8: ((16, 8), (_MAX_TOKENS, 1))" in legacy
+    assert DEFAULTS.SM103_TEP8_DEFAULTS["MUSESPARK_OPEN_TEP8_FINALIZE_TRANSPORT_TOKENS"] == "64"
+
+
+def test_sm103_tep8_wide_gemms_switch_serves_wide_dense_gemms_for_the_named_sites(monkeypatch):
+    """``MUSESPARK_OPEN_SM103_TEP8_WIDE_GEMMS`` (default off, in no defaults table) adds ``wide_dense_gemms`` to the
+    sm103 F11 TEP8 composition, which is then sm107's TEP8 composition exactly; ``1`` names the sites whose sm103 8-row
+    cell is split-K; an unknown site is refused; the F11 switch off leaves it inert."""
+    wide_on, _ = _compositions(True, {"unpool"})
+    assert wide_on[(103, 8)].served == ON[(107, 8)].served
+    wide_off_switch, _ = _compositions(False, {"unpool"})
+    assert wide_off_switch == OFF
+    name = DEFAULTS.SM103_TEP8_WIDE_GEMMS_ENV
+    assert name == "MUSESPARK_OPEN_SM103_TEP8_WIDE_GEMMS"
+    assert name not in DEFAULTS.SM103_TEP8_DEFAULTS and name not in DEFAULTS.SM107_DEFAULTS
+    monkeypatch.setenv(ENV, "1")
+    for value, sites in (("", set()), ("0", set()), ("1", {"qkv", "pool", "unpool"}), ("unpool", {"unpool"}),
+                         ("qkv, unpool", {"qkv", "unpool"}), ("o_proj,pool", {"o_proj", "pool"})):
+        monkeypatch.setenv(name, value)
+        assert DEFAULTS.sm103_tep8_wide_gemm_sites() == sites, value
+    monkeypatch.setenv(name, "lm_head")
+    with pytest.raises(ValueError):
+        DEFAULTS.sm103_tep8_wide_gemm_sites()
+    monkeypatch.setenv(name, "1")
+    monkeypatch.setenv(ENV, "0")
+    assert DEFAULTS.sm103_tep8_wide_gemm_sites() == frozenset()
+
+
+def test_sm103_tep8_wide_gemm_tiles_keep_the_8_row_split_and_fit_gb300():
+    """sm107's TP8 wide tiles keep sm103's 8-row split_k (4 for qkv / pool / unpool; o_proj split_k 1 over
+    sm103's cuBLAS cell, TEP8_WIDE64_CUBLAS_CELLS), and fit GB300's opt-in once ``wide_steps`` lowers the stages."""
+    src = (_TARGET / "kernels/dense_gemms/dispatcher.py").read_text()
+    wide = eval(  # noqa: S307 - the module's own literal
+        re.search(r"^SM107_TP8_WIDE_KERNELS: Mapping\[.*?\] = (\{.*?^\})", src, re.S | re.M).group(1),
+        {"WIDE_MAX_ROWS": 32},
+    )
+    m = re.search(r"^DEFAULT_KERNELS: Mapping\[.*?\] = (\{.*?^\})", src, re.S | re.M)
+    cells = eval(m.group(1), {"MAX_ROWS": 8, "CUBLAS": "cublas"})  # noqa: S307 - the module's own literal
+    for site, steps in wide.items():
+        cell = cells[site][-1][1]
+        for _, kernel in steps:
+            tactic = tuple(int(v) for v in kernel.split(":")[1].split(","))
+            if cell.startswith("splitk:"):
+                assert tactic[2] == int(cell.split(",")[2]) == 4, (site, kernel, cell)
+            else:
+                assert site == "o_proj" and cell == "cublas" and tactic[2] == 1, (site, kernel, cell)
+            stages = tactic[3]
+            while stages > 2 and _smem((*tactic[:3], stages)) > 232448:
+                stages -= 1
+            assert _smem((*tactic[:3], stages)) <= 232448 and stages >= 6, (site, kernel, stages)
+    assert "_sm103_tep8_wide_gemm_sites() if tuple(capability) == (10, 3) and tp_size == 8 and sharded" in src
+
+
+def test_sm103_tep8_unpool_direct_wide_switch(monkeypatch):
+    """Unpool-fuse: ``MUSESPARK_OPEN_SM103_TEP8_UNPOOL_DIRECT_WIDE`` (default off, in no defaults table) is read
+    only under the F11 switch, takes 0 / 1 only; the direct transport accepts the 32-row layout at TP8 and
+    ``unpool_into_boundary.install`` builds the wide workspace at TP8 only through it (TP4 keeps ``_wide_direct``)."""
+    name = DEFAULTS.SM103_TEP8_UNPOOL_DIRECT_WIDE_ENV
+    assert name == "MUSESPARK_OPEN_SM103_TEP8_UNPOOL_DIRECT_WIDE"
+    assert name not in DEFAULTS.SM103_TEP8_DEFAULTS and name not in DEFAULTS.SM107_DEFAULTS
+    assert DEFAULTS.SM103_TEP8_DEFAULTS["MUSESPARK_OPEN_TEP8_WIDE_UNPOOL_GATHER"] == "1"
+    monkeypatch.setenv(ENV, "1")
+    for value, on in (("", False), ("0", False), ("1", True)):
+        monkeypatch.setenv(name, value)
+        assert DEFAULTS.sm103_tep8_unpool_direct_wide() is on, value
+    monkeypatch.setenv(name, "yes")
+    with pytest.raises(ValueError):
+        DEFAULTS.sm103_tep8_unpool_direct_wide()
+    monkeypatch.setenv(name, "1")
+    monkeypatch.setenv(ENV, "0")
+    assert DEFAULTS.sm103_tep8_unpool_direct_wide() is False
+    direct = (_TARGET / "ops/comm/unpool_direct_boundary.py").read_text()
+    assert "TP4 only" not in direct.split("def check_layout", 1)[1].split("\ndef ", 1)[0]
+    install = (_TARGET / "kernels/unpool_into_boundary/boundary.py").read_text()
+    assert "tep8_wide = int(layers[0].mapping.tp_size) == 8 and _sm103_tep8_unpool_direct_wide()" in install
+    assert '(tep8_wide or getattr(layer.feed_forward, "_wide_direct", False))' in install
+
+
+def test_sm103_tep8_publish_splitk_only_keeps_the_8_row_cells_bits_and_is_opt_in():
+    """``MUSESPARK_OPEN_SM103_TEP8_PUBLISH_SPLITK_ONLY=1`` arms GB300's TP8 pool / unpool publication for the
+    split-K producer's rows only (the TP8 cuBLAS census covers Rubin's 212 SMs). The producer's tactics keep the
+    ``split_k`` of sm103's TP8 sharded 8-row pool / unpool cells (one-request bits), fit GB300's opt-in shared memory,
+    the split-K census holds a 152-SM (GB300) key, and the switch is opt-in (not among the F11 defaults)."""
+    src = (_TARGET / "ops/comm/projection_publish.py").read_text()
+    tactics = re.search(r"TP8_PUBLISH_SPLITK_TACTICS = \{(.*?)\n\}", src, re.S).group(1)
+    published = [tuple(int(v) for v in t) for t in re.findall(r"\((\d+), (\d+), (\d+), (\d+)\)", tactics)]
+    assert len(published) == 2
+    dispatcher = (_TARGET / "kernels/dense_gemms/dispatcher.py").read_text()
+    m = re.search(r"^DEFAULT_KERNELS: Mapping\[.*?\] = (\{.*?^\})", dispatcher, re.S | re.M)
+    cells = eval(m.group(1), {"MAX_ROWS": 8, "CUBLAS": "cublas"})  # noqa: S307 - the module's own literal
+    for site in ("pool", "unpool"):
+        cell = cells[site][-1][1]
+        assert cell.startswith("splitk:"), (site, cell)
+        assert {t[2] for t in published} == {int(cell.split(",")[2])}, (site, cell, published)
+    for tactic in published:
+        assert _smem(tactic) <= 232448, tactic
+    certified = re.search(r"CERTIFIED_SPLITK_PRODUCERS_TP8 = frozenset\((.*?)\n\)", src, re.S).group(1)
+    assert re.search(r"^\s*152,$", certified, re.M), "no GB300 (152 SM) split-K producer census entry"
+    publish = (_TARGET / "kernels/projection_publish/publish.py").read_text()
+    assert 'SPLITK_ONLY_ENV = "MUSESPARK_OPEN_SM103_TEP8_PUBLISH_SPLITK_ONLY"' in publish
+    assert 'SPLITK_ONLY = _sm107_env(SPLITK_ONLY_ENV, "0") == "1"' in publish
+    assert "MUSESPARK_OPEN_SM103_TEP8_PUBLISH_SPLITK_ONLY" not in DEFAULTS.SM103_TEP8_DEFAULTS
+    assert DEFAULTS.SM103_TEP8_DEFAULTS["MUSESPARK_OPEN_TEP8_PUBLISH_SPLITK"] == "1"
+
+
+@pytest.mark.parametrize(
+    "value, expect", [(None, 5), ("5", 5), ("2", 2), ("4", 4), ("1", 2), ("0", 2), ("9", 5), ("", 5)]
+)
+def test_tep8_cl8_min_requests_defaults_to_5_and_clamps_to_2_5(value, expect):
+    """MUSESPARK_OPEN_TEP8_SWA_CL8_MIN_REQUESTS (unset = 5, the pre-knob band) is clamped to 2..5."""
+    path = _TARGET / "ops" / "attention" / "swa_block.py"
+    tree = ast.parse(path.read_text())
+    node = [
+        n
+        for n in tree.body
+        if isinstance(n, ast.Assign) and [getattr(t, "id", "") for t in n.targets] == ["_CL8_TEP8_MIN_REQUESTS"]
+    ]
+    assert len(node) == 1
+    env = {} if value is None else {"MUSESPARK_OPEN_TEP8_SWA_CL8_MIN_REQUESTS": value}
+    expr = compile(ast.Expression(node[0].value), str(path), "eval")
+    got = eval(expr, {"_sm107_env": lambda name, default=None: env.get(name, default), "min": min, "max": max, "int": int})
+    assert got == expect
+
+
+def test_tep8_cl8_2cta_build_is_opt_in_and_fits_its_smem():
+    """MUSESPARK_OPEN_TEP8_SWA_CL8_2CTA is off unless set to "1"; the two-CTA build only rewrites the one
+    ``__launch_bounds__(NT, 1)`` of the source; its dynamic SMEM covers the kernel's layout and two CTAs fit GB300."""
+    path = _TARGET / "ops" / "attention" / "swa_block.py"
+    text = path.read_text()
+    tree = ast.parse(text)
+    assigns = {
+        t.id: n.value for n in tree.body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name)
+    }
+    for value, expect in ((None, False), ("0", False), ("1", True)):
+        env = {} if value is None else {"MUSESPARK_OPEN_TEP8_SWA_CL8_2CTA": value}
+        expr = compile(ast.Expression(assigns["_CL8_2CTA"]), str(path), "eval")
+        assert eval(expr, {"_sm107_env": lambda n, d=None: env.get(n, d)}) is expect
+    src = ast.literal_eval(assigns["_CL8_SRC"])
+    assert src.count("__launch_bounds__(NT, 1)") == 1
+    defines = dict(re.findall(r"^#define (\w+) (.+?)(?:\s*//.*)?$", src, re.M))
+    def val(name):
+        expr = defines[name]
+        for _ in range(20):
+            for k in defines:
+                expr = re.sub(rf"\b{k}\b", f"({defines[k]})", expr)
+        return eval(expr)
+    end = val("BAR_OFF") + 8
+    smem2 = eval(compile(ast.Expression(assigns["_CL8_SMEM_2CTA"]), str(path), "eval"))
+    assert end <= smem2 and 2 * (smem2 + 1024) <= 233472
+
+
+def test_sm103_tep8_publish_wide_is_opt_in_and_chunks_into_certified_rows():
+    """``MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE=splitk|splitk1|cublas`` arms GB300's TP8 pool / unpool
+    publication for 65..WIDE_MAX_ROWS-row steps (bs16 = 128 rows); opt-in (not among the F11 defaults), 33..64 rows
+    only with SPLITK_ONLY, every 64-row chunk inside the split-K producer's certified 33..64 band, split_k-1 tactics on
+    the certified tiles, and the GB300 cuBLAS key consulted only by the WIDE build."""
+    publish = (_TARGET / "kernels/projection_publish/publish.py").read_text()
+    assert 'WIDE_ENV = "MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE"' in publish
+    assert 'WIDE_MAX_ROWS = int(_sm107_env(WIDE_MAX_ROWS_ENV, "") or 128)' in publish
+    assert "self._min_rows = MIN_ROWS if SPLITK_ONLY else _publish.SPLITK_MAX_ROWS + 1" in publish
+    for env in ("MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE", "MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE_MAX_ROWS"):
+        assert env not in DEFAULTS.SM103_TEP8_DEFAULTS
+    src = (_TARGET / "ops/comm/projection_publish.py").read_text()
+    k4 = re.search(r"TP8_PUBLISH_SPLITK_TACTICS = \{(.*?)\n\}", src, re.S).group(1)
+    k1 = re.search(r"TP8_PUBLISH_SPLITK1_TACTICS = \{(.*?)\n\}", src, re.S).group(1)
+    t4 = [tuple(int(v) for v in t) for t in re.findall(r"\((\d+), (\d+), (\d+), (\d+)\)", k4)]
+    t1 = [tuple(int(v) for v in t) for t in re.findall(r"\((\d+), (\d+), (\d+), (\d+)\)", k1)]
+    assert [t[:2] for t in t1] == [t[:2] for t in t4] and {t[2] for t in t1} == {1}
+    for tactic in t1:
+        assert _smem(tactic) <= 232448, tactic
+    assert "CERTIFIED_PRODUCERS_TP8 = frozenset({('2.14.0a0+b2c75dd062.nv26.09', 130800, 212)})" in src
+    assert re.search(r"CERTIFIED_PRODUCERS_TP8_SM103_WIDE = frozenset\(\{\(.*, 152\)\}\)", src)
+    # The chunking of _publish_chunked: 64-row launches, the remainder last.
+    assert "starts = list(range(0, rows, SPLITK_MAX_ROWS))" in src
+    assert "head = _splitk_tactic(hidden[:SPLITK_MAX_ROWS], weight, slot[:SPLITK_MAX_ROWS])" in src
+
+
+def test_sm103_tep8_hop_direct128_switch_and_scatter_addresses(monkeypatch):
+    """hop128: ``MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT128`` (default off, in no defaults table) is read only under
+    the F11 switch and takes 0 / 1; off, the direct hop keeps its 64-row workspace, its pad rule and the scatter
+    kernel's 8-slot stride (the image's code paths); on, 65..128-row o_proj calls publish as 64-row chunks whose
+    stores land exactly where the consumer polls (a host model of both address formulas, every token and feature)."""
+    name = DEFAULTS.SM103_TEP8_HOP_DIRECT128_ENV
+    assert name == "MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT128"
+    assert name not in DEFAULTS.SM103_TEP8_DEFAULTS and name not in DEFAULTS.SM107_DEFAULTS
+    monkeypatch.setenv(ENV, "1")
+    for value, on in (("", False), ("0", False), ("1", True)):
+        monkeypatch.setenv(name, value)
+        assert DEFAULTS.sm103_tep8_hop_direct128() is on, value
+    monkeypatch.setenv(name, "2")
+    with pytest.raises(ValueError):
+        DEFAULTS.sm103_tep8_hop_direct128()
+    monkeypatch.setenv(name, "1")
+    monkeypatch.setenv(ENV, "0")
+    assert DEFAULTS.sm103_tep8_hop_direct128() is False
+
+    layers = (_TARGET / "layers.py").read_text()
+    assert "max_rows=_wide.DIRECT128_MAX_ROWS if _wide.DIRECT128 else 64," in layers
+    assert "pad_rows=_wide.DIRECT128_PAD_ROWS if _wide.DIRECT128 else (0, 1024)," in layers
+    wide = (_TARGET / "ops/allreduce/post_attn_hop_wide.py").read_text()
+    assert "+ cutlass.Int64(bidx) * ((self.slots - 1) * self.cta_m)" in wide
+    assert "* (7 * self.cta_m)" not in wide
+    assert "DIRECT128_PAD_ROWS = (0, 64)" in wide and "DIRECT128_MAX_ROWS = 128" in wide
+    assert "if DIRECT128:\n    SERVED_DIRECT_ROWS = (SERVED_DIRECT_ROWS[0], max(SERVED_DIRECT_ROWS[1], DIRECT128_MAX_ROWS))" in wide
+    dispatcher = (_TARGET / "kernels/dense_gemms/dispatcher.py").read_text()
+    assert 'if TEP8_WIDE64_MAX_ROWS < rows <= 2 * TEP8_WIDE64_MAX_ROWS and site.role == "o_proj":' in dispatcher
+    assert 'if publication is None or not getattr(_wide, "DIRECT128", False):' in dispatcher
+
+    # Host model of the fb-layout addresses (elements, BF16), ranks 8, cta_m 64, one rank's window peer stride PS.
+    ranks, cta_m, hidden, PS = 8, 64, 8192, 1 << 24
+    for max_rows in (64, 128):
+        slots = max_rows // ranks
+        polled = {}
+        for row in range(max_rows):  # the consumer: owner row % 8 polls source slab p at its receive base
+            for offset in range(0, hidden, 8):
+                polled[(row % ranks, (offset // 64) * (slots * 64) + (row // ranks) * 64 + offset % 64)] = (row, offset)
+        stored = {}
+        for row0 in range(0, max_rows, 64):  # the producer: chunk at token row0 through the view advanced row0 // 8 slots
+            base = (row0 // 8) * 64
+            for bidx in range(hidden // cta_m):
+                origin = base + bidx * cta_m  # gD_tile's origin: feature m0 = bidx * cta_m
+                for tok in range(64):
+                    p, s = tok % 8, tok // 8
+                    for fchunk in range(cta_m // 8):
+                        dst = origin + bidx * ((slots - 1) * cta_m) + p * PS + s * cta_m + fchunk * 8
+                        stored[(dst // PS, dst % PS)] = (row0 + tok, bidx * cta_m + fchunk * 8)
+        assert stored == polled, max_rows

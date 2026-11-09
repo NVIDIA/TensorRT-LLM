@@ -142,7 +142,20 @@ _SWA_CL8 = _sm107_env("MUSESPARK_OPEN_SWA_CL8", "0")
 #: first eager call per device (a call inside a capture before that keeps the ONE2 path and warns once).
 _TEP8_SWA_CL8 = _sm107_env("MUSESPARK_OPEN_TEP8_SWA_CL8", "0")
 #: Requests per step the TEP8 CL8 path takes (the ONE2 range at 2 KV heads).
-_CL8_TEP8_MIN_REQUESTS, _CL8_TEP8_MAX_REQUESTS = 5, 8
+#: MUSESPARK_OPEN_TEP8_SWA_CL8_MIN_REQUESTS (default 5 = unchanged): the smallest TEP8 multi-request step CL8
+#: takes (2..5). CL8 computes each (request, KV head) in its own 8-CTA cluster, so a request's output and K/V bytes do
+#: not depend on the other requests of the step (device-checked: 2 / 4 requests == the same requests inside an
+#: 8-request call); lowering it gives 2..4-request steps the per-request bits they already get in 5..8-request steps.
+_CL8_TEP8_MIN_REQUESTS = min(5, max(2, int(_sm107_env("MUSESPARK_OPEN_TEP8_SWA_CL8_MIN_REQUESTS", "5") or 5)))
+_CL8_TEP8_MAX_REQUESTS = 8
+#: MUSESPARK_OPEN_TEP8_SWA_CL8_2CTA=1 (default off): a TEP8 CL8 step whose (request, KV head) clusters do not
+#: all fit one wave at one CTA per SM (GB300: at most 15 8-CTA clusters co-resident, so 8 requests x 2 KV heads = 16
+#: run in two waves) launches a second build of the same source with ``__launch_bounds__(320, 2)`` (ptxas caps it at
+#: 96 registers) and 100 KB of dynamic SMEM (the layout ends at 97,544 B), two CTAs per SM. Same statements, so the
+#: same bits (device-checked on GB300: output and K/V bytes equal at 2..8 requests). Steps that fit one wave keep the
+#: one-CTA build (the capped build spills and is slower there). Unset or "0" = unchanged.
+_CL8_2CTA = _sm107_env("MUSESPARK_OPEN_TEP8_SWA_CL8_2CTA", "0") == "1"
+_CL8_SMEM_2CTA = 100 * 1024
 #: CL8 debug knobs (engine failure): MUSESPARK_OPEN_SWA_CL8_PDL=0 launches CL8 without PDL;
 #: MUSESPARK_OPEN_SWA_CL8_TRIGGER=end lets dependents launch only after the output store (default: right after the wait).
 _CL8_PDL = _sm107_env("MUSESPARK_OPEN_SWA_CL8_PDL", "1") != "0"
@@ -733,11 +746,11 @@ def _cl8_check(r):
     return r[1] if len(r) == 2 else r[1:]
 
 
-def _cl8_function(device: torch.device, pos64: bool, hkv: int):
+def _cl8_function(device: torch.device, pos64: bool, hkv: int, ctas: int = 1):
     """The compiled CL8 kernel of ``device`` (int64 or int32 position ids: two compile-time builds; ``hkv`` KV heads
     per rank: 4 at tep4, 2 at tep8); ``None`` if it is not compiled yet and a capture is running."""
     index = device.index if device.index is not None else torch.cuda.current_device()
-    key = (index, bool(pos64), int(hkv))
+    key = (index, bool(pos64), int(hkv)) if ctas == 1 else (index, bool(pos64), int(hkv), int(ctas))
     fn = _CL8_FN.get(key)
     if fn is not None:
         return fn
@@ -751,7 +764,9 @@ def _cl8_function(device: torch.device, pos64: bool, hkv: int):
     from cuda.bindings import nvrtc
 
     major, minor = torch.cuda.get_device_capability(index)
-    prog = _cl8_check(nvrtc.nvrtcCreateProgram(_CL8_SRC.encode(), b"swa_cl8.cu", 0, [], []))
+    src = _CL8_SRC if ctas == 1 else _CL8_SRC.replace("__launch_bounds__(NT, 1)", f"__launch_bounds__(NT, {int(ctas)})")
+    smem = _CL8_SMEM if ctas == 1 else _CL8_SMEM_2CTA
+    prog = _cl8_check(nvrtc.nvrtcCreateProgram(src.encode(), b"swa_cl8.cu", 0, [], []))
     opts = [f"--gpu-architecture=sm_{major}{minor}".encode(), b"-std=c++17", b"-default-device"]
     if hkv != 4:
         # The source's HKV defaults to 4 (the tep4 build, same options); the TEP8 build uses -DHKV=2 here.
@@ -781,10 +796,11 @@ def _cl8_function(device: torch.device, pos64: bool, hkv: int):
         mod = _cl8_check(cu.cuModuleLoadData(cubin))
         f = _cl8_check(cu.cuModuleGetFunction(mod, b"swa_cl8"))
         _cl8_check(cu.cuFuncSetAttribute(f, cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                         _CL8_SMEM))
+                                         smem))
     regs = int(_cl8_check(cu.cuFuncGetAttribute(cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS, f)))
     lmem = int(_cl8_check(cu.cuFuncGetAttribute(cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, f)))
-    _CL8_FN[key] = (f, mod)
+    clusters = _cl8_max_clusters(f, smem, hkv) if hkv != 4 else 0
+    _CL8_FN[key] = (f, mod, smem, clusters)
     # Each build keeps its own install line: TEP4's, and TEP8's (gate name, KV heads).
     if hkv == 4:
         head, heads = f"[musespark_open] swa_block CL8: MUSESPARK_OPEN_SWA_CL8={_SWA_CL8}", ""
@@ -792,13 +808,45 @@ def _cl8_function(device: torch.device, pos64: bool, hkv: int):
         head = f"[musespark_open] swa_block CL8 (TEP8): MUSESPARK_OPEN_TEP8_SWA_CL8={_TEP8_SWA_CL8}"
         heads = f"{int(hkv)} KV heads per rank, "
     _cl8_log(f"{head} compiled for sm_{major}{minor} on "
-             f"device {index} (regs {regs}, local {lmem} B, smem {_CL8_SMEM // 1024} KB, cluster 8, 320 threads, "
+             f"device {index} (regs {regs}, local {lmem} B, smem {smem // 1024} KB, {ctas} CTA/SM build, "
+             f"{clusters} co-resident 8-CTA clusters, cluster 8, 320 threads, "
              f"{heads}{'int64' if pos64 else 'int32'} positions, PDL {'on' if _CL8_PDL else 'off'}, trigger "
              f"{'at the end' if _CL8_TRIGGER_END else 'after the wait'}, pre-wait loads "
              f"{'off' if _CL8_NO_PREWAIT else ('at L2 (cg)' if _CL8_PREWAIT_CG else 'on')}"
              f"{', DEBUG re-reads' if _CL8_DEBUG else ''}"
              f"{', qkv/gate __restrict__ (A/B only)' if _CL8_RESTRICT_PRODUCED else ''})")
     return _CL8_FN[key]
+
+
+def _cl8_max_clusters(f, smem: int, hkv: int) -> int:
+    """The 8-CTA clusters of the CL8 build ``f`` the device keeps co-resident (cuOccupancyMaxActiveClusters); 0 when
+    the query fails (the 2-CTA build is then never chosen)."""
+    try:
+        from cuda.bindings import driver as cu
+
+        cfg = cu.CUlaunchConfig()
+        cfg.gridDimX, cfg.gridDimY, cfg.gridDimZ = 8, hkv, _CL8_TEP8_MAX_REQUESTS
+        cfg.blockDimX, cfg.blockDimY, cfg.blockDimZ = 320, 1, 1
+        cfg.sharedMemBytes = smem
+        a = cu.CUlaunchAttribute()
+        a.id = cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+        a.value.clusterDim.x, a.value.clusterDim.y, a.value.clusterDim.z = 8, 1, 1
+        cfg.attrs = [a]
+        cfg.numAttrs = 1
+        return int(_cl8_check(cu.cuOccupancyMaxActiveClusters(f, cfg)))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _cl8_tep8_function(device: torch.device, pos64: bool, hkv: int, reqs: int):
+    """The TEP8 CL8 build for a ``reqs``-request step: the one-CTA build, or under MUSESPARK_OPEN_TEP8_SWA_CL8_2CTA the
+    two-CTA build when the step's ``reqs * hkv`` clusters exceed what the one-CTA build keeps co-resident (and the
+    two-CTA build is compiled: inside a capture before that, the one-CTA build, same bits)."""
+    fn = _cl8_function(device, pos64, hkv)
+    if fn is None or not _CL8_2CTA or reqs * hkv <= fn[3]:
+        return fn
+    fn2 = _cl8_function(device, pos64, hkv, 2)
+    return fn2 if fn2 is not None and fn2[3] >= reqs * hkv else fn
 
 
 def _cl8_eligible(qkv, kv_pool, num_q_heads, num_kv_heads, window, rows, q_fp8, fused_prep, gate, cos_sin,
@@ -861,7 +909,7 @@ def _cl8_launch(fn, qkv, kv_pool, bt, seq_lens, kv_scale, cos_sin, positions, pr
     cfg = cu.CUlaunchConfig()
     cfg.gridDimX, cfg.gridDimY, cfg.gridDimZ = 8, hkv, reqs
     cfg.blockDimX, cfg.blockDimY, cfg.blockDimZ = 320, 1, 1
-    cfg.sharedMemBytes = _CL8_SMEM
+    cfg.sharedMemBytes = fn[2]
     cfg.hStream = cu.CUstream(torch.cuda.current_stream(qkv.device).cuda_stream)
     a1 = cu.CUlaunchAttribute()
     a1.id = cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
@@ -2440,7 +2488,7 @@ class SwaBlockMultiAttention(OpWrapper):
                               cos_sin, position_ids, 2)
         ):
             # The one-cluster SWA block at TEP8 (MUSESPARK_OPEN_TEP8_SWA_CL8=1).
-            fn = _cl8_function(qkv.device, rope and positions.dtype == torch.int64, num_kv_heads)
+            fn = _cl8_tep8_function(qkv.device, rope and positions.dtype == torch.int64, num_kv_heads, reqs)
             if fn is not None:
                 out = torch.empty((total, num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device)
                 return _cl8_launch(fn, qkv, kv_pool, block_tables, seq_lens, kv_scale_orig_quant, cos_sin, positions,

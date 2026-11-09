@@ -58,12 +58,50 @@ from tensorrt_llm.logger import logger
 from ... import dispatch as _tp_agreement
 from ...ops.comm import pool_publish_fp4quant as _pool
 from ...ops.comm import projection_publish as _publish
+from ...sm107_defaults import env as _sm107_env
 from ..projection_gathers.gathers import MuseSparkOpenTepGatedResidual, MuseSparkOpenTepGatherMoE
 
 #: The rows of the decode steps this path arms. Above 448 rows the published join costs more
 #: than the slice GEMMs save (generation-worker decode steps of 57..64 requests), so those
 #: steps keep the built-in projections; the transports are sized to this bound.
 MIN_ROWS, MAX_ROWS = _publish.MIN_ROWS, 448
+
+#: GB300 TEP8 F11: ``MUSESPARK_OPEN_SM103_TEP8_PUBLISH_SPLITK_ONLY=1`` arms a TP8 build that the cuBLAS
+#: producer census does not cover (``producer_refusal``: GB300's 152 SMs, the TP8 census ran on Rubin's 212) for the
+#: rows the split-K producer serves alone, when that producer is selected and certified on this device
+#: (``projection_publish._splitk_publisher``: ``MUSESPARK_OPEN_TEP8_PUBLISH_SPLITK=1``, wide64, and the
+#: ``CERTIFIED_SPLITK_PRODUCERS_TP8`` key with this SM count). Steps of 33..64 rows (5..8 requests at K = 7) then
+#: publish both slices from split-K 4 -- sm_103's 8-row pool / unpool cell's split_k, so every row keeps its
+#: one-request bits -- and every larger step keeps the built-in replicated projections, as the build refusal gives
+#: today; no cuBLAS publication ever runs. A 33..64-row call the split-K producer does not take raises on every rank
+#: alike (never an uncertified cuBLAS publication). Unset: the build refuses exactly as before. Read at import;
+#: rank-uniform (every rank reads the same env, files and device type).
+SPLITK_ONLY_ENV = "MUSESPARK_OPEN_SM103_TEP8_PUBLISH_SPLITK_ONLY"
+SPLITK_ONLY = _sm107_env(SPLITK_ONLY_ENV, "0") == "1"
+
+#: GB300 TEP8 F11, 128-row steps = bs16 at K = 7: ``MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE=splitk|cublas``
+#: (opt-in, default off) arms the same TP8 build for the 65..``WIDE_MAX_ROWS``-row steps
+#: (``MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE_MAX_ROWS``, default 128 = 16 requests), which otherwise multiply the
+#: whole replicated pool and unpool weights on every rank (64 MiB per site per layer):
+#:   * ``splitk``: each slice publishes from the certified split-K producer in 64-row launches
+#:     (``projection_publish.publish_projection_chunked``): every row keeps sm_103's TP8 8-row cell bits
+#:     (split_k 4), i.e. the bits it gets at bs1..4; one launch per 64 rows, each element stored once;
+#:   * ``splitk1``: the same launches at split_k 1 (``projection_publish.TP8_PUBLISH_SPLITK1_TACTICS``), the 64-row
+#:     launches concurrent: every element one full-K accumulation in K order, bitwise equal to the built-in
+#:     replicated cuBLAS GEMM (non-split-K nvjet at these rows on GB300); certified by the split-K census key;
+#:   * ``cublas``: cuBLAS (``torch.mm`` into the slot) publishes, only when the GB300 TP8 cuBLAS census key
+#:     (``projection_publish.CERTIFIED_PRODUCERS_TP8_SM103_WIDE``) covers this process.
+#: 33..64-row steps publish only with ``SPLITK_ONLY`` also set (else they keep today's built-in path), so a
+#: recipe can move its 128-row steps alone. Read at import; rank-uniform.
+WIDE_ENV = "MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE"
+WIDE = _sm107_env(WIDE_ENV, "").strip().lower()
+if WIDE not in ("", "0", "splitk", "splitk1", "cublas"):
+    raise ValueError(f"{WIDE_ENV} must be splitk, splitk1 or cublas, got {WIDE!r}")
+WIDE = "" if WIDE == "0" else WIDE
+WIDE_MAX_ROWS_ENV = "MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE_MAX_ROWS"
+WIDE_MAX_ROWS = int(_sm107_env(WIDE_MAX_ROWS_ENV, "") or 128)
+if not 65 <= WIDE_MAX_ROWS <= MAX_ROWS:
+    raise ValueError(f"{WIDE_MAX_ROWS_ENV} must be in 65..{MAX_ROWS}, got {WIDE_MAX_ROWS}")
 
 
 def _pool_args(moe) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
@@ -171,6 +209,13 @@ class PublishedProjections:
         self.unpool_layers: Tuple[int, ...] = ()
         self._built = False
         self._refused: Optional[str] = None
+        #: The largest step the build armed (``SPLITK_ONLY`` lowers it to the split-K producer's rows).
+        self._max_rows = MAX_ROWS
+        self._splitk_only = False
+        #: The smallest step the build armed (``WIDE`` without ``SPLITK_ONLY`` raises it to 65).
+        self._min_rows = MIN_ROWS
+        #: The producer of the 65..``_max_rows``-row slices under ``WIDE`` ("splitk" | "cublas" | "").
+        self._wide = ""
         self._armed = False
         self._rows = 0
         self._reported = set()
@@ -188,7 +233,7 @@ class PublishedProjections:
         eager armed forward built the transports (every rank captures the same graphs, so
         every rank answers alike).
         """
-        if not MIN_ROWS <= rows <= MAX_ROWS or self._refused is not None:
+        if not self._min_rows <= rows <= self._max_rows or self._refused is not None:
             return False
         if not self._built and (
             torch.cuda.is_current_stream_capturing() or torch.compiler.is_compiling()
@@ -213,7 +258,9 @@ class PublishedProjections:
         """
         if not self._built:
             self._build()
-        if self._refused is not None:
+        if self._refused is not None or not self._min_rows <= rows <= self._max_rows:
+            # Refused, or above a split-K-only build's rows (only the building forward can get here so: takes()
+            # answers by the build afterwards): the built-in projections, on every rank alike.
             yield
             return
         self._armed = True
@@ -268,7 +315,24 @@ class PublishedProjections:
             reason = _publish.producer_refusal(
                 torch.device("cuda", torch.cuda.current_device()), self.mapping.tp_size
             )
+            if reason is not None and WIDE and self.mapping.tp_size == 8:
+                reason = self._arm_wide(reason)
+            elif reason is not None and SPLITK_ONLY and self.mapping.tp_size == 8:
+                if _publish._splitk_publisher() is not None:
+                    logger.info(
+                        f"[musespark_open] projection_publish: {SPLITK_ONLY_ENV}=1: the cuBLAS producer is "
+                        f"not certified here ({reason}); {MIN_ROWS}..{_publish.SPLITK_MAX_ROWS}-row steps "
+                        "publish from the certified split-K producer only, larger steps keep the built-in "
+                        "projections"
+                    )
+                    reason = None
+                    self._max_rows = _publish.SPLITK_MAX_ROWS
+                    self._splitk_only = True
+                else:
+                    reason = f"{reason}; {SPLITK_ONLY_ENV}=1 but the split-K producer is not certified here"
         reason = _tp_agreement.agreed_refusal(self.mapping, reason)
+        if reason is not None:
+            self._max_rows, self._splitk_only, self._min_rows, self._wide = MAX_ROWS, False, MIN_ROWS, ""
         if reason is None:
             try:
                 self.pool = _publish.PublishTransport(
@@ -312,6 +376,39 @@ class PublishedProjections:
             f"{(self.pool.allocated + self.unpool.allocated) / 2**20:.1f} MiB of device memory)"
         )
 
+    def _arm_wide(self, reason: str) -> Optional[str]:
+        """``WIDE``: lift the TP8 cuBLAS census refusal for 65..``WIDE_MAX_ROWS``-row steps (and 33..64 with
+        ``SPLITK_ONLY``) when the chosen producer is certified here; else the refusal, extended. Same answer on every
+        rank (same env, files and device type); agreed by the caller."""
+        splitk = _publish._splitk_publisher() is not None
+        if WIDE in ("splitk", "splitk1") and not splitk:
+            return f"{reason}; {WIDE_ENV}={WIDE} but the split-K producer is not certified here"
+        if WIDE == "splitk1":
+            k1_reason = _publish.splitk1_refusal()
+            if k1_reason is not None:
+                return f"{reason}; {WIDE_ENV}=splitk1: {k1_reason}"
+        if WIDE == "cublas":
+            wide_reason = _publish.wide_producer_refusal(torch.device("cuda", torch.cuda.current_device()))
+            if wide_reason is not None:
+                return f"{reason}; {WIDE_ENV}=cublas: {wide_reason}"
+        if SPLITK_ONLY and not splitk:
+            return f"{reason}; {SPLITK_ONLY_ENV}=1 but the split-K producer is not certified here"
+        self._wide = WIDE
+        self._max_rows = WIDE_MAX_ROWS
+        self._min_rows = MIN_ROWS if SPLITK_ONLY else _publish.SPLITK_MAX_ROWS + 1
+        self._splitk_only = False
+        logger.info(
+            f"[musespark_open] projection_publish: {WIDE_ENV}={WIDE}: the TP8 cuBLAS census does not cover "
+            f"this device ({reason}); {self._min_rows}..{self._max_rows}-row steps publish "
+            + (f"(33..64 from split-K, {SPLITK_ONLY_ENV}=1) " if SPLITK_ONLY else "")
+            + f"65..{self._max_rows} from "
+            + {"splitk": "the certified split-K producer in 64-row launches",
+               "splitk1": "split_k-1 64-row launches (bitwise = the built-in replicated GEMM)",
+               "cublas": "GB300-certified cuBLAS"}[WIDE]
+            + "; other steps keep the built-in projections"
+        )
+        return None
+
     def _report(self, site: str, rows: int) -> None:
         if (site, rows) in self._reported:
             return
@@ -349,6 +446,35 @@ class PublishedProjections:
         begin = self.mapping.tp_rank * columns
         _join_named_forks(module)
         weight = module.weight[begin : begin + columns]
+        if self._splitk_only and _publish._splitk_tactic(hidden_states, weight, slot) is None:
+            raise RuntimeError(
+                f"[musespark_open] projection_publish: {SPLITK_ONLY_ENV}=1 armed a {rows}-row step whose {site} "
+                f"slice the split-K producer does not take (hidden {tuple(hidden_states.shape)}, weight "
+                f"{tuple(weight.shape)}); the cuBLAS producer is not certified here"
+            )
+        if self._wide and rows > _publish.SPLITK_MAX_ROWS:
+            if self._wide in ("splitk", "splitk1"):
+                chunked = (
+                    _publish.publish_projection_chunked
+                    if self._wide == "splitk"
+                    else _publish.publish_projection_chunked_k1
+                )
+                if not chunked(hidden_states, weight, slot):
+                    raise RuntimeError(
+                        f"[musespark_open] projection_publish: {WIDE_ENV}={self._wide} armed a {rows}-row step whose "
+                        f"{site} slice the split-K producer does not take (hidden {tuple(hidden_states.shape)}, "
+                        f"weight {tuple(weight.shape)})"
+                    )
+            else:
+                torch.mm(hidden_states, weight.t(), out=slot)
+            self._unconsumed += 1
+            self._report(site, rows)
+            return slot
+        if self._wide and _publish._splitk_tactic(hidden_states, weight, slot) is None:
+            raise RuntimeError(
+                f"[musespark_open] projection_publish: {WIDE_ENV}={self._wide} with {SPLITK_ONLY_ENV}=1 armed a "
+                f"{rows}-row step whose {site} slice the split-K producer does not take"
+            )
         if site == "pool" and getattr(_publish, "TEP8_POOL_PROGRAMMATIC", False):
             self._programmatic_pool_fork(moe, hidden_states, weight, slot)
         _publish.publish_projection(hidden_states, weight, slot)

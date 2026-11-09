@@ -208,6 +208,72 @@ def on_sm103_tep8_f11() -> bool:
     return sm103_tep8_f11() and _capability() == (10, 3)
 
 
+#: ``MUSESPARK_OPEN_SM103_TEP8_WIDE_GEMMS`` (default off, in no defaults table) serves ``wide_dense_gemms`` -- the
+#: 9..32-row dense projections (decode steps of 2..4 requests at K = 7) on flashinfer's split-K with the ``split_k`` of
+#: the site's 8-row cell -- on sm_103 TEP8 under the F11 switch, for the sites it names: a comma list of qkv, o_proj,
+#: pool, unpool, or ``1`` for qkv,pool,unpool (the sites whose sm103 8-row cell is split-K). Without it those rows run
+#: cuBLAS (nvjet split-K + a separate splitKreduce, and no weight load before the dependency wait). Read from the
+#: environment only (``modeling`` decides the composition at import).
+SM103_TEP8_WIDE_GEMMS_ENV = "MUSESPARK_OPEN_SM103_TEP8_WIDE_GEMMS"
+SM103_TEP8_WIDE_GEMMS_DEFAULT_SITES = ("qkv", "pool", "unpool")
+_WIDE_GEMM_SITES = ("qkv", "o_proj", "pool", "unpool")
+
+
+def sm103_tep8_wide_gemm_sites() -> frozenset:
+    """The sites ``MUSESPARK_OPEN_SM103_TEP8_WIDE_GEMMS`` names (empty when unset, ``0`` or the F11 switch is off)."""
+    value = os.environ.get(SM103_TEP8_WIDE_GEMMS_ENV, "").strip()
+    if not sm103_tep8_f11() or value in ("", "0"):
+        return frozenset()
+    sites = SM103_TEP8_WIDE_GEMMS_DEFAULT_SITES if value == "1" else tuple(v.strip() for v in value.split(",") if v.strip())
+    unknown = sorted(set(sites) - set(_WIDE_GEMM_SITES))
+    if unknown:
+        raise ValueError(f"{SM103_TEP8_WIDE_GEMMS_ENV}={value!r}: unknown sites {unknown} (of {_WIDE_GEMM_SITES})")
+    return frozenset(sites)
+
+
+#: Unpool-fuse: ``MUSESPARK_OPEN_SM103_TEP8_UNPOOL_DIRECT_WIDE=1`` (default off, in no defaults table) gives
+#: sm_103 TEP8 under the F11 switch the wide (32-row) layout of ``unpool_into_boundary``'s direct transport, which
+#: otherwise is TP4 only: a captured decode step of 16, 24 or 32 rows (2..4 requests at K = 7) has each layer's unpool
+#: GEMM store its ``[rows, 1024]`` slice straight into every rank's copy of a multicast slot, and the post-FFN boundary
+#: only polls and computes (``ops/comm/unpool_direct_boundary``), instead of reloading the slice and publishing it to
+#: its seven peers through the tagged wide inbox. Same bits as the gather boundary on the same
+#: slices: the GEMM is the one the step runs anyway -- cuBLAS today (its product is copied into the slot), or with
+#: ``MUSESPARK_OPEN_SM103_TEP8_WIDE_GEMMS`` naming ``unpool`` flashinfer's split-K, whose epilogue stores the slot.
+#: Needs ``MUSESPARK_OPEN_TEP8_WIDE_UNPOOL_GATHER`` (on in ``SM103_TEP8_DEFAULTS``). Read from the environment only.
+SM103_TEP8_UNPOOL_DIRECT_WIDE_ENV = "MUSESPARK_OPEN_SM103_TEP8_UNPOOL_DIRECT_WIDE"
+
+
+def sm103_tep8_unpool_direct_wide() -> bool:
+    """Whether ``MUSESPARK_OPEN_SM103_TEP8_UNPOOL_DIRECT_WIDE=1`` asks for the TP8 wide direct unpool transport
+    (only with the F11 switch on; the environment only)."""
+    if not sm103_tep8_f11():
+        return False
+    value = os.environ.get(SM103_TEP8_UNPOOL_DIRECT_WIDE_ENV, "").strip()
+    if value not in ("", "0", "1"):
+        raise ValueError(f"{SM103_TEP8_UNPOOL_DIRECT_WIDE_ENV}={value!r}: expected 0 or 1")
+    return value == "1"
+
+
+#: hop128: ``MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT128=1`` (default off, in no defaults table) extends the TEP8 direct
+#: post-attention hop (the direct hop: o_proj's split-K scatter epilogue + the direct consumer) from 33..64 to
+#: 33..128 rows (decode steps of 5..16 requests at K = 7) on sm_103 under the F11 switch. Rows 65..128 run o_proj as
+#: 64-row split_k-1 chunks of the same scatter kernel (each element one full-K FP32 accumulation, rounded once: the bits
+#: of the cuBLAS GEMM the built-in runs there, device-checked) into a 128-row workspace (16 slots per source), and the
+#: consumer sums the eight partials in rank order, as the two-shot hop it replaces. Read from the environment only.
+SM103_TEP8_HOP_DIRECT128_ENV = "MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT128"
+
+
+def sm103_tep8_hop_direct128() -> bool:
+    """Whether ``MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT128=1`` asks for the 65..128-row direct hop (only with the F11
+    switch on; the environment only)."""
+    if not sm103_tep8_f11():
+        return False
+    value = os.environ.get(SM103_TEP8_HOP_DIRECT128_ENV, "").strip()
+    if value not in ("", "0", "1"):
+        raise ValueError(f"{SM103_TEP8_HOP_DIRECT128_ENV}={value!r}: expected 0 or 1")
+    return value == "1"
+
+
 def env(name: str, default: Optional[str] = None) -> Optional[str]:
     """``os.environ.get(name, default)``, except that an unset switch reads ``SM107_DEFAULTS[name]`` on sm_107 and
     ``SM103_TEP8_DEFAULTS[name]`` on sm_103 under ``MUSESPARK_OPEN_SM103_TEP8_F11=1``."""
