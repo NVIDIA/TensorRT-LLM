@@ -10,7 +10,7 @@ import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from itertools import accumulate, chain
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import torch
@@ -129,6 +129,25 @@ class CSA2SharedKVPlan:
 
 
 @dataclass
+class CSA2PrimsTSMainBank:
+    """MAIN rows of an eager PrimTS context phase, decoded once per layer into E4M3.
+
+    Context request ``r`` owns bank rows ``[offsets[r] - base, offsets[r + 1] - base)``,
+    which hold its logical MAIN rows ``0, 1, ...`` resolved through ``pages[r]``. The
+    offsets are the native shared tables' main offsets; ``base`` is their first value.
+    With ``selected_only``, only the bank rows the phase's selections keep are decoded.
+    """
+
+    offsets: torch.Tensor  # int64 [num_requests + 1]
+    base: int
+    rows: int
+    pages: torch.Tensor  # int [num_requests, columns] owner GLOBAL page table
+    page_size: int
+    num_requests: int
+    selected_only: bool = False
+
+
+@dataclass
 class CSA2IndexerGroup:
     """One packed indexer MQA call over query rows ``[first, last)``.
 
@@ -228,14 +247,15 @@ class _CoalescedUploads:
 
 
 class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
-    """Manager-backed request metadata with bounded native query staging.
+    """Manager-backed request metadata with optional native query staging.
 
     Normal prepare resolves manager pages for the packed model forward.
-    for_query_tile creates a separate compute-only metadata object.
-    Eager context retains real query groups with virtual staged KV lengths.
-    Generation and captured context use independent one-query generation rows.
-    Source causality, request isolation and windows are encoded in selections;
-    these bounded compute pools are separate from persistent manager caches.
+    for_query_tile creates a separate compute-only metadata object. PrimTS
+    packed tiles retain query geometry without allocating decoded KV banks; an
+    eager PrimTS context phase may plan a decoded MAIN bank its helper stores.
+    Native eager context retains real groups with virtual staged KV lengths;
+    generation and captured context use independent one-query generation rows.
+    Source causality, request isolation and windows are encoded in selections.
     """
 
     indexer_max_chunk_size: int = 32768
@@ -243,6 +263,10 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
     # Compute-tile metadata only: the shared converted-KV plan of an eager
     # context phase, or None for independent-query staging.
     shared_plan: CSA2SharedKVPlan | None = None
+    # Compute-tile metadata only: the decoded MAIN bank of an eager PrimTS
+    # context phase, or None to decode each selected row inside the kernel.
+    prims_ts_main_bank: CSA2PrimsTSMainBank | None = None
+    kv_input_mode: Literal["staged", "packed"] = "staged"
     _csa2_defer_decode_outputs: bool = False
     _csa2_deferred_decode_outputs: bool = False
     _csa2_pending_owner_tables: tuple | None = None
@@ -355,6 +379,14 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         # CSA2 never reads the generic MLA chunked-context tables.
         self.enable_context_mla_with_cached_kv = False
         super().__post_init__()
+        # Shallow graph clones share fixed-address query tiles, the native scratch of
+        # tiles whose owner released its bank, and provider arenas.
+        if not hasattr(self, "_csa2_query_tiles"):
+            self._csa2_query_tiles = {}
+        if not hasattr(self, "_csa2_family_workspaces"):
+            self._csa2_family_workspaces = {}
+        if not hasattr(self, "_csa2_prims_ts_arenas"):
+            self._csa2_prims_ts_arenas = {}
 
     @property
     def tokens_per_block(self) -> int:
@@ -399,10 +431,23 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         staging_dtype: torch.dtype = torch.bfloat16,
         shared_rows: int | None = None,
         one_bank: bool = False,
+        *,
+        kv_input_mode: Literal["staged", "packed"] = "staged",
     ) -> None:
+        if kv_input_mode not in ("staged", "packed"):
+            raise ValueError("CSA2 KV input mode must be staged or packed")
         if staging_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
             raise ValueError("CSA2 native staging requires BF16 or E4M3")
+        self.kv_input_mode = kv_input_mode
         self.staging_dtype = staging_dtype
+        self._csa2_device = device
+        self.num_sparse_topk = _SWA_TILE + extra_capacity
+        self.max_seq_len = self.num_sparse_topk
+        self._csa2_context_geometry = None
+        if kv_input_mode == "packed":
+            if shared_rows is not None or staging_dtype != torch.bfloat16:
+                raise ValueError("CSA2 packed KV inputs cannot request native KV staging")
+            return
         if staging_dtype == torch.float8_e4m3fn:
             self.mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=device)
             self.mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=device)
@@ -422,7 +467,6 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             self.latent_placeholder = torch.empty(
                 capacity, _HEAD_DIM, dtype=torch.bfloat16, device=device
             )
-        self._csa2_context_geometry = None
         self.gen_fmha_bank = None
         if one_bank:
             # Both pools in one allocation, the extra pool after the primary one: the ``gen_fmha``
@@ -454,8 +498,6 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             [[self.swa_pool.data_ptr(), 0]], dtype=torch.int64, device="cpu"
         )
         self.pool_mapping = torch.zeros((1, 2), dtype=torch.int32, device="cpu")
-        self.num_sparse_topk = _SWA_TILE + extra_capacity
-        self.max_seq_len = self.num_sparse_topk
         self.kv_cache_params = KVCacheParams(use_cache=True)
         self.kv_cache_block_offsets = torch.zeros(
             (1, capacity, 2, (self.num_sparse_topk + _SWA_TILE - 1) // _SWA_TILE),
@@ -489,16 +531,17 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         q: torch.Tensor,
         extra_width: int,
         *,
-        staging_dtype=torch.bfloat16,
+        staging_dtype: torch.dtype = torch.bfloat16,
         context_lengths: list[int] | None = None,
         shared_rows: int | None = None,
+        kv_input_mode: Literal["staged", "packed"] = "staged",
     ) -> CSA2TrtllmMetadata:
-        """Prepare fixed geometry before TrtllmAttention.forward allocates output.
+        """Prepare a fixed query geometry and optional native KV staging.
 
         q is BF16 [queries, heads, 512]. Extra capacity is a selected-main-row
-        bound, not the persistent cache size. Callers retain one metadata object
-        per geometry and warm it with the normal forward before graph capture.
-        As with TrtllmAttentionMetadata, set is_cuda_graph for captured calls.
+        bound, not the persistent cache size. Packed consumers retain only the
+        query geometry; their plans own compact source metadata and reduction
+        scratch. Callers must warm each geometry before CUDA Graph capture.
         """
         count, heads, dim = q.shape
         if context_lengths and (
@@ -526,13 +569,19 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 q.device,
                 staging_dtype,
                 shared_rows,
-                one_bank=cls.gen_fmha_tile(
-                    heads, _SWA_TILE + extra_capacity, staging_dtype, q.device
-                )
+                one_bank=kv_input_mode == "staged"
+                and cls.gen_fmha_tile(heads, _SWA_TILE + extra_capacity, staging_dtype, q.device)
                 and shared_rows is None
                 and not context_lengths,
+                kv_input_mode=kv_input_mode,
             )
         metadata.num_query_heads = heads
+        if kv_input_mode == "packed":
+            metadata._num_tokens = count
+            metadata._num_contexts = len(context_lengths) if context_lengths else 0
+            metadata._num_ctx_tokens = count if context_lengths else 0
+            metadata._num_generations = 0 if context_lengths else count
+            return metadata
         metadata._seq_lens = metadata.query_lens_host
         metadata._seq_lens_cuda = metadata.query_lens_device
         metadata._num_contexts = metadata._num_ctx_tokens = 0
@@ -751,16 +800,59 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             and gen_fmha_device_supported(device.index)
         )
 
+    def _prims_ts_main_bank(
+        self, q: torch.Tensor, extra_width: int, layer_idx: int | None
+    ) -> CSA2PrimsTSMainBank | None:
+        """The MAIN bank of a whole eager context phase.
+
+        In-kernel decoding converts every query's selected MAIN rows; the bank
+        converts each row once. A phase that selects at least as many rows as its
+        requests own decodes all of them; one that selects fewer, such as a
+        bounded-replay tile of a long context, decodes only the rows its
+        selections keep. Without logical provenance, or beyond the reserved bank
+        capacity, keep in-kernel decoding.
+        """
+        from ._prims_ts_bank import main_bank_rows_limit
+
+        if (
+            layer_idx is None
+            or extra_width <= 0
+            or not hasattr(self, "_csa2_shared_tables")
+            or q.shape[0] != self.num_ctx_tokens
+        ):
+            return None
+        requests = self.csa2_num_context_requests
+        lengths = self.csa2_request_lengths[:requests]
+        if not lengths or sum(lengths) != q.shape[0]:
+            return None
+        owner = self.kv_cache_manager.layout.layer(layer_idx).kv_source
+        if owner is None or owner not in self._csa2_shared_tables:
+            return None
+        _, _, main_offsets, swa_rows, main_rows = self._csa2_shared_tables[owner]
+        if not 0 < main_rows <= main_bank_rows_limit():
+            return None
+        return CSA2PrimsTSMainBank(
+            offsets=main_offsets,
+            # The native tables place main rows after row zero and the SWA rows.
+            base=1 + swa_rows,
+            rows=main_rows,
+            pages=self.csa2_global_page_tables[owner][:requests],
+            page_size=self.csa2_global_page_sizes[owner],
+            num_requests=requests,
+            selected_only=q.shape[0] * extra_width < main_rows,
+        )
+
     def get_query_tile_metadata(
         self,
         q: torch.Tensor,
         extra_width: int,
         query_start: int | None = None,
         *,
-        staging_dtype=torch.bfloat16,
+        staging_dtype: torch.dtype = torch.bfloat16,
         layer_idx: int | None = None,
+        kv_input_mode: Literal["staged", "packed"] = "staged",
     ) -> CSA2TrtllmMetadata:
-        """Share bounded staging, retaining real request groups for context."""
+        """Retain query geometry, staging mode and graph-stable provider plans."""
         # An eager forward asks for a layer's tile more than once. Until the next prepare, a
         # repeat reuses the first call's key, plan and groups while that key's cached tile is
         # unreserved: the full path would return that tile without evicting anything.
@@ -771,7 +863,15 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         )
         if memo is not None and torch.cuda.is_current_stream_capturing():
             memo = None
-        memo_key = (q.device, q.shape, extra_width, query_start, staging_dtype, layer_idx)
+        memo_key = (
+            q.device,
+            q.shape,
+            extra_width,
+            query_start,
+            staging_dtype,
+            layer_idx,
+            kv_input_mode,
+        )
         memo_key += (self.num_ctx_tokens,)
         resolved = None if memo is None else memo.get(memo_key)
         if resolved is not None:
@@ -780,7 +880,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             if metadata is not None and not metadata._csa2_graph_reserved:
                 metadata.shared_plan = shared_plan
                 metadata.is_cuda_graph = False
-                if context_lengths:
+                if context_lengths and kv_input_mode == "staged":
                     metadata._bind_context_tile(context_lengths)
                 return metadata
         context_lengths = []
@@ -803,16 +903,25 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             context_lengths = []
         shared_plan = (
             self._shared_context_plan(q, extra_width, layer_idx)
-            if context_lengths and query_start == 0
+            if kv_input_mode == "staged" and context_lengths and query_start == 0
             else None
         )
         shared_rows = (
             None if shared_plan is None else 1 + shared_plan.swa_rows + shared_plan.main_rows
         )
+        # Captured contexts cleared context_lengths above and decode in the kernel.
+        main_bank = (
+            self._prims_ts_main_bank(q, extra_width, layer_idx)
+            if kv_input_mode == "packed" and context_lengths and query_start == 0
+            else None
+        )
         if not hasattr(self, "_csa2_query_tiles"):
             self._csa2_query_tiles = {}
+        if not hasattr(self, "_csa2_family_workspaces"):
             # The native scratch of tiles whose owner released its bank (below).
             self._csa2_family_workspaces = {}
+        if not hasattr(self, "_csa2_prims_ts_arenas"):
+            self._csa2_prims_ts_arenas = {}
         owner = None if shared_plan is None else self.csa2_kv_sources.get(layer_idx)
         key = (
             q.device,
@@ -824,6 +933,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             shared_rows,
             len(context_lengths),
             owner,
+            kv_input_mode,
         )
         workspace = None
         # Retain only the latest eager shape per phase, family and owner.
@@ -836,7 +946,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         ):
             if previous == key or tile._csa2_graph_reserved:
                 continue
-            if previous[:2] == key[:2] and previous[3:6] == key[3:6] and previous[8] == key[8]:
+            if previous[:2] == key[:2] and previous[3:6] == key[3:6] and previous[8:] == key[8:]:
                 # Eager tiles run sequentially on the model stream. Keep their
                 # native scratch high-water mark without retaining old pools;
                 # graph-owned workspaces must never be borrowed or resized.
@@ -844,7 +954,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             elif shared_rows is not None and previous[6] is not None and previous[8] != owner:
                 # A forward stages one KV owner at a time: another owner's bank goes before
                 # this one is allocated, and its scratch waits for that owner's next tile.
-                family = (*previous[:2], *previous[3:6], previous[8])
+                family = (*previous[:2], *previous[3:6], *previous[8:])
                 self._csa2_family_workspaces[family] = self._csa2_query_tiles.pop(
                     previous
                 ).workspace
@@ -858,20 +968,24 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                     staging_dtype=staging_dtype,
                     context_lengths=context_lengths,
                     shared_rows=shared_rows,
+                    kv_input_mode=kv_input_mode,
                 )
                 if workspace is None:
                     workspace = self._csa2_family_workspaces.pop(
-                        (*key[:2], *key[3:6], key[8]), None
+                        (*key[:2], *key[3:6], *key[8:]), None
                     )
                 if workspace is not None:
                     metadata.workspace = metadata.cuda_graph_workspace = workspace
                 self._csa2_query_tiles[key] = metadata
+                metadata.fmha_plan_caches["csa2_prims_ts_arenas"] = self._csa2_prims_ts_arenas
+                metadata._csa2_prims_ts_max_queries = max(self.max_num_tokens, q.shape[0])
             metadata.shared_plan = shared_plan
+            metadata.prims_ts_main_bank = main_bank
             metadata._csa2_graph_reserved |= self.is_cuda_graph or capturing
             metadata.is_cuda_graph = capturing
             if capturing:
                 self._csa2_replay_capture_signature = getattr(self, "csa2_replay_signature", None)
-            if context_lengths:
+            if context_lengths and kv_input_mode == "staged":
                 metadata._bind_context_tile(context_lengths)
         if memo is not None:
             memo[memo_key] = (key, shared_plan, context_lengths)
@@ -887,7 +1001,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         groups = self.__dict__.get("_csa2_stage_groups", {})
         for key in [k for k, t in tiles.items() if k[4] and not t._csa2_graph_reserved]:
             tile = tiles.pop(key)
-            families[(*key[:2], *key[3:6], key[8])] = tile.workspace
+            families[(*key[:2], *key[3:6], *key[8:])] = tile.workspace
             for group, scratch in tuple(groups.items()):
                 if group[1:] == (key[2], tile.num_sparse_topk) and not scratch["graph_reserved"]:
                     del groups[group]
@@ -1019,14 +1133,12 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Derive this forward's range-aware staging KV scale from the packed pools.
 
-        Staging expands the persistent per-group scales back to real magnitudes,
-        so a unit per-tensor scale silently clamps every channel above the E4M3
-        maximum of 448 -- the saturation that keeps native FP8 staging opt-in.
-        Both persistent encoders clamp their payload, so the largest group scale
-        of the selected rows yields an exact ceiling on what staging can decode,
-        and the smallest power of two mapping that ceiling onto 448 is the tightest
-        non-saturating scale. Reading only the scale bytes costs one extra pass
-        over 32 or 16 bytes per row rather than its full payload.
+        Packed group scales bound decoded magnitudes, while ordinary FP8 SWA
+        has a unit persistent scale and needs no footer scan. Together with MAIN,
+        the selected sources determine a ceiling on the staging magnitude. The
+        smallest power of two mapping that ceiling onto 448 avoids saturation
+        without reading full payloads. These forward-local scales do not change
+        the encoding or persistent scale of any previously written cache row.
 
         Returns ``(kv_scale_orig_quant, kv_scale_quant_orig)`` as metadata-owned
         device buffers. ``minimum`` and ``maximum`` bound the exponent, and the
@@ -1053,7 +1165,8 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             raise ValueError("CSA2 staging KV scales require an E4M3 staging pool")
         if inputs.swa_pool is None or inputs.swa_indices is None:
             raise ValueError("CSA2 requires selected SWA pool inputs")
-        sources = [(inputs.swa_pool, inputs.swa_indices, "swa")]
+        swa_cache_format = inputs.swa_cache_format or "swa"
+        sources = [(inputs.swa_pool, inputs.swa_indices, swa_cache_format)]
         if inputs.topk_indices is not None:
             if inputs.main_pool is None:
                 raise ValueError("CSA2 selected main indices require a main pool")
@@ -1134,6 +1247,8 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         """
         from .quantization import _fused_gather_supported, gather_rows, row_bytes
 
+        if self.kv_input_mode != "staged":
+            raise ValueError("CSA2 packed KV inputs cannot materialize selected KV staging")
         count = self.num_tokens
         fp8 = self.swa_pool.dtype == torch.float8_e4m3fn
         if fp8:
@@ -1179,7 +1294,8 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 raise ValueError("CSA2 selected main indices exceed metadata geometry")
         # Preserve gather_rows validation even for zero-width selections; an
         # absent main selection continues to ignore an unused main pool.
-        sources = [(inputs.swa_pool, inputs.swa_indices, "swa")]
+        swa_cache_format = inputs.swa_cache_format or "swa"
+        sources = [(inputs.swa_pool, inputs.swa_indices, swa_cache_format)]
         if inputs.topk_indices is not None:
             sources.append((inputs.main_pool, inputs.topk_indices, "main"))
         for pool, slots, cache_format in sources:
@@ -1223,6 +1339,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             if source is not None and inputs.stage_group is not None:
                 serial = (
                     inputs.stage_group,
+                    swa_cache_format,
                     id(source.csa2_indices),
                     getattr(source, "_csa2_stage_epoch", 0),
                     count,
@@ -1238,6 +1355,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 main_logical,
                 self,
                 self.shared_plan,
+                swa_cache_format=swa_cache_format,
                 main_mapping=mapping,
                 kv_scale_orig_quant=kv_scale_orig_quant,
                 kv_scale_quant_orig=kv_scale_quant_orig,
@@ -1258,6 +1376,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
 
             source = inputs.state.metadata if inputs.state is not None else None
             scratch, compact = self._stage_scratch(source or self, inputs.stage_group, count)
+            self._csa2_selected_counts = scratch["counts"][:count]
             main_slots = inputs.topk_indices
             if mapping is not None and main_slots is not None:
                 main_slots = scratch["main_slots"][:count, : main_slots.shape[1]]
@@ -1268,6 +1387,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 main_slots,
                 self,
                 scratch,
+                swa_cache_format=swa_cache_format,
                 compact=compact,
                 main_logical=inputs.topk_indices if mapping is not None else None,
                 main_mapping=mapping,
@@ -1286,7 +1406,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             topk_indices = self._map_global_slots(
                 topk_indices, requests.long(), table, visible, page_size, max_positions
             )
-        swa = gather_rows(inputs.swa_pool, inputs.swa_indices, _HEAD_DIM, "swa")
+        swa = gather_rows(inputs.swa_pool, inputs.swa_indices, _HEAD_DIM, swa_cache_format)
         swa_valid = (inputs.swa_indices >= 0) & (inputs.swa_indices < inputs.swa_pool.shape[0])
         extra = extra_valid = None
         if topk_indices is not None:
@@ -1314,6 +1434,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         order = torch.where(valid, positions, width).argsort(dim=1, stable=True)
         packed = rows.gather(1, order[..., None].expand(-1, -1, _HEAD_DIM))
         lengths = valid.sum(1, dtype=torch.int32)
+        self._csa2_selected_counts = lengths
         packed = torch.where((positions < lengths[:, None])[..., None], packed, 0)
         # Zero selected rows reduce to the sink's zero value. Give TG one
         # zero KV row so it always launches a defined (nonempty) reduction.
@@ -2641,6 +2762,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         shared = {
             "_csa2_query_tiles",
             "_csa2_family_workspaces",
+            "_csa2_prims_ts_arenas",
             "_csa2_indexer_workspaces",
             "_csa2_manager_states",
         }
@@ -3558,7 +3680,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 if key not in seen:
                     seen.add(key)
                     total += storage.nbytes()
-            elif isinstance(value, (CSA2SharedKVPlan, CSA2IndexerGroup)):
+            elif isinstance(value, (CSA2SharedKVPlan, CSA2PrimsTSMainBank, CSA2IndexerGroup)):
                 for item in vars(value).values():
                     visit(item)
             elif isinstance(value, dict):
@@ -3582,6 +3704,8 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         for name in (
             "workspace",
             "cuda_graph_workspace",
+            "fmha_plan_caches",
+            "_csa2_prims_ts_arenas",
             "_csa2_buffers",
             "_csa2_indexer_workspaces",
             "_csa2_family_workspaces",

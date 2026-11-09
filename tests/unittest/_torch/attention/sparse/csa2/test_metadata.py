@@ -443,8 +443,21 @@ def test_odd_prefix_reuse_compression_matches_fresh():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("start", [127, 128, 129])
 @pytest.mark.parametrize("accepted_drafts", [0, 1, 4])
-@torch.inference_mode()
 def test_chain_rewind_preserves_compressor_and_swa(start, accepted_drafts):
+    _check_chain_rewind_preserves_compressor_and_swa(start, accepted_drafts, "fp8_ds_mla")
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("start,accepted_drafts", [(127, 0), (128, 1), (129, 4)])
+def test_chain_rewind_preserves_ordinary_fp8_swa(start: int, accepted_drafts: int) -> None:
+    _check_chain_rewind_preserves_compressor_and_swa(start, accepted_drafts, "fp8")
+
+
+@torch.inference_mode()
+def _check_chain_rewind_preserves_compressor_and_swa(
+    start: int, accepted_drafts: int, kv_cache_dtype: str
+) -> None:
     from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
     from tensorrt_llm._torch.attention.backends.sparse.csa2.compressor import CSA2Compressor
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
@@ -464,7 +477,11 @@ def test_chain_rewind_preserves_compressor_and_swa(start, accepted_drafts):
 
     spec = DraftTargetDecodingConfig(max_draft_len=4, speculative_model="attention-test-draft")
     manager = CSA2CacheManager(
-        KvCacheConfig(max_gpu_total_bytes=128 << 20, enable_swa_scratch_reuse=True, dtype="fp8"),
+        KvCacheConfig(
+            max_gpu_total_bytes=128 << 20,
+            enable_swa_scratch_reuse=True,
+            dtype=kv_cache_dtype,
+        ),
         CacheType.SELFKONLY,
         layout=CSA2Layout((2,), (0,), (0,)),
         num_layers=1,
@@ -553,9 +570,23 @@ def test_chain_rewind_preserves_compressor_and_swa(start, accepted_drafts):
         retained = torch.cat(
             (projected_swa[0], projected_swa[1][: 1 + accepted_drafts], projected_swa[2][:1])
         )[-128:]
-        swa_reference = unpack_rows(pack_rows(retained, "swa"), 512, "swa")
+        pool = manager.get_swa_buffer(0)
         slots = _swa(metadata, 0)[0][0]
-        gathered = gather_rows(manager.get_swa_buffer(0), slots, 512, "swa")
+        if kv_cache_dtype == "fp8":
+            assert manager.swa_cache_format == "swa_fp8"
+            assert pool.shape[1] == 512
+            expected_bytes = (
+                retained.float().clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
+            )
+            retained_slots = slots[-len(retained) :]
+            assert (retained_slots >= 0).all()
+            torch.testing.assert_close(pool[retained_slots.long()], expected_bytes, atol=0, rtol=0)
+            swa_reference = expected_bytes.view(torch.float8_e4m3fn).bfloat16()
+        else:
+            assert manager.swa_cache_format == "swa"
+            assert pool.shape[1] == 528
+            swa_reference = unpack_rows(pack_rows(retained, "swa"), 512, "swa")
+        gathered = gather_rows(pool, slots, 512, manager.swa_cache_format)
         torch.testing.assert_close(gathered[-len(retained) :], swa_reference, atol=0, rtol=0)
     finally:
         manager.free_resources(request)
@@ -641,6 +672,231 @@ def test_retained_metadata_buffers_and_workspace_accounting(manager_requests):
     table_bytes = 8 if is_blackwell_datacenter() else 4
     expected = 4 * (1 * (table_bytes + 1) + 12 + 80 * 32) + (148 + 1) * 8
     assert metadata.workspace_reservation_bytes(2, 4, 64, 32, 148) == expected
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="CSA2 PrimTS requires SM100, SM103 or SM107",
+)
+@torch.inference_mode()
+def test_prims_ts_metadata_plan_cache_reuse_and_workspace(
+    manager_requests: tuple[CSA2CacheManager, list[LlmRequest]],
+) -> None:
+    from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
+    from tensorrt_llm._torch.attention.backends.sparse.csa2._prims_ts_metadata import (
+        prepare_prims_ts_metadata,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.prims_ts import (
+        CSA2PrimsTS,
+        _PrimsTSMetadata,
+    )
+
+    from .test_backend import _backend, _cache_tensors, _decoded_reference, _inputs
+
+    rows, width = 4, 17
+    source_rows = [
+        [7, 0, -1, 4, 0, 7, -1, 16, 24, 31, 26] + [-1] * 6,
+        [0, 8] * 8 + [0],
+        [64, 2**32, 2**40, -4] + list(range(13)),
+        [-1, 0, 1] + [-1] * 14,
+    ]
+    page_rows = [[1, 0, 2**61, -1], [0, -1, 2, 3]]
+    request_rows, visible_rows = [0, 1, -1, 2], [27, 13, 17, 17]
+    for mapped in (False, True):
+        selection_storage = torch.full((rows, width + 5), -1, device="cuda", dtype=torch.int64)
+        selection = selection_storage[:, :width]
+        selection.copy_(torch.tensor(source_rows, device="cuda", dtype=torch.int64))
+        storages = [
+            torch.full((rows, width + 7), 91, device="cuda", dtype=torch.int32) for _ in range(2)
+        ]
+        compact = _PrimsTSMetadata(
+            storages[0][:, :width],
+            torch.full((rows,), -91, device="cuda", dtype=torch.int32),
+            storages[1][:, :width],
+            torch.full((rows,), -91, device="cuda", dtype=torch.int32),
+        )
+        inputs = CSA2BackendForwardArgs(
+            swa_pool=torch.empty(64, 528, device="cuda", dtype=torch.uint8),
+            swa_indices=selection,
+            main_pool=torch.empty(64, 288, device="cuda", dtype=torch.uint8),
+            topk_indices=selection,
+            main_mapping=(
+                torch.tensor(page_rows, device="cuda", dtype=torch.int64),
+                8,
+                25,
+                torch.tensor(request_rows, device="cuda"),
+                torch.tensor(visible_rows, device="cuda"),
+            )
+            if mapped
+            else None,
+        )
+        prepare_prims_ts_metadata(inputs, compact)
+        for is_main, indices, lengths in (
+            (False, compact.indices, compact.lengths),
+            (True, compact.extra_indices, compact.extra_lengths),
+        ):
+            selected = []
+            for row, values in enumerate(source_rows):
+                physical = []
+                for index in values:
+                    if is_main and mapped:
+                        request = request_rows[row]
+                        if not (
+                            0 <= request < len(page_rows)
+                            and 0 <= index < min(visible_rows[row], 25)
+                        ):
+                            continue
+                        page = page_rows[request][index // 8]
+                        if page < 0:
+                            continue
+                        index = page * 8 + index % 8
+                    if 0 <= index < 64:
+                        physical.append(index)
+                selected.append(physical)
+            expected = torch.tensor(
+                [values + [-1] * (width - len(values)) for values in selected], dtype=torch.int32
+            )
+            torch.testing.assert_close(indices.cpu(), expected, atol=0, rtol=0)
+            assert lengths.tolist() == [len(values) for values in selected]
+        selection.fill_(-1)
+        inputs.main_pool = inputs.topk_indices = inputs.main_mapping = None
+        prepare_prims_ts_metadata(inputs, compact)
+        assert compact.lengths.tolist() == compact.extra_lengths.tolist() == [0] * rows
+        assert bool((compact.indices == -1).all()) and bool((compact.extra_indices == -1).all())
+        assert all(bool((storage[:, width:] == 91).all()) for storage in storages)
+
+    torch.manual_seed(493)
+    manager, requests = manager_requests
+    source = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=8, kv_cache_manager=manager)
+    graph_clones = [source.create_cuda_graph_metadata(batch_size) for batch_size in (2, 1)]
+    query_tiles = source._csa2_query_tiles
+    arenas = source._csa2_prims_ts_arenas
+    assert not query_tiles and not arenas
+    assert not source.is_cuda_graph
+    assert graph_clones[0] is not graph_clones[1]
+    for clone in graph_clones:
+        assert clone is not source and clone.is_cuda_graph
+        assert clone._csa2_query_tiles is query_tiles
+        assert clone._csa2_prims_ts_arenas is arenas
+    _prepare(source, requests, [0, 0], [1, 1])
+    _prepare(graph_clones[0], requests, [0, 0], [1, 1])
+    _prepare(graph_clones[1], requests[:1], [0], [1])
+    q = torch.randn(2, 64, 512, device="cuda", dtype=torch.bfloat16)
+    swa = torch.randn(2, 128, 512, device="cuda", dtype=torch.bfloat16)
+    main = torch.randn(2, 512, 512, device="cuda", dtype=torch.bfloat16)
+    swa_valid = torch.ones(2, 128, device="cuda", dtype=torch.bool)
+    main_valid = torch.ones(2, 512, device="cuda", dtype=torch.bool)
+    sink = torch.linspace(-1, 1, 64, device="cuda")
+    args = _inputs(q, swa, main, swa_valid, main_valid, sink)
+    args.output = torch.empty_like(q).flatten(1)
+    frame = graph_clones[0].get_query_tile_metadata(q, 512, kv_input_mode="packed")
+    assert next(iter(query_tiles.values())) is frame
+    assert frame.fmha_plan_caches["csa2_prims_ts_arenas"] is arenas
+    baseline = source.get_workspace_bytes()
+    attn = _backend(64, compute_backend="prims_ts")
+    CSA2PrimsTS(attn).forward_generation(q.flatten(1), frame, args)
+    cache = frame.fmha_plan_caches["csa2_prims_ts"]
+    assert len(cache) == 1
+    record = next(iter(cache.values()))
+    assert record["metadata"]._fields == ("indices", "lengths", "extra_indices", "extra_lengths")
+    assert not any(hasattr(frame, name) for name in ("swa_pool", "extra_pool", "shared_pool"))
+    arena = record["arena"]
+    arena_bytes = frame._workspace_storage_bytes([arena])
+    assert arena_bytes == (
+        arena["workspace"].untyped_storage().nbytes()
+        + 4 * arena["capacity"] * (frame.num_sparse_topk + 2)
+    )
+    assert frame._workspace_storage_bytes([record]) == arena_bytes
+    pointers = tuple(tensor.data_ptr() for tensor in _cache_tensors(cache))
+    assert pointers and frame._workspace_storage_bytes([cache]) > 0
+    retained = source.get_workspace_bytes()
+    assert retained > baseline
+    # A new helper must reuse metadata-owned plans rather than plan again.
+    helper = CSA2PrimsTS(attn)
+    output = helper.forward_generation(q.flatten(1), frame, args)
+    assert next(iter(cache.values())) is record
+    assert tuple(tensor.data_ptr() for tensor in _cache_tensors(cache)) == pointers
+    assert source.get_workspace_bytes() == retained
+    torch.testing.assert_close(
+        output.view_as(q),
+        _decoded_reference(q, args, swa_valid, main_valid, sink),
+        atol=0.03,
+        rtol=0.03,
+    )
+    # Count plan aliases once across the root and its retained query frames.
+    root_cache = source.fmha_plan_caches["csa2_prims_ts"] = {"tile_alias": cache}
+    assert source.get_workspace_bytes() == retained
+    extra = torch.empty(129, device="cuda", dtype=torch.uint8)
+    root_cache["extra"] = extra
+    assert source.get_workspace_bytes() == retained + extra.untyped_storage().nbytes()
+    root_cache["extra_alias"] = extra.view(-1)
+    assert source.get_workspace_bytes() == retained + extra.untyped_storage().nbytes()
+
+    other_frame = graph_clones[1].get_query_tile_metadata(q[:1], 512, kv_input_mode="packed")
+    assert other_frame is not frame
+    assert other_frame.fmha_plan_caches["csa2_prims_ts_arenas"] is arenas
+    other_args = _inputs(q[:1], swa[:1], main[:1], swa_valid[:1], main_valid[:1], sink)
+    other_args.output = torch.empty_like(q[:1]).flatten(1)
+    helper.forward_generation(q[:1].flatten(1), other_frame, other_args)
+    other_record = next(iter(other_frame.fmha_plan_caches["csa2_prims_ts"].values()))
+    assert other_record["arena"] is record["arena"]
+    assert len(arenas) == 1
+    assert next(iter(arenas.values())) is record["arena"]
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        assert graph_clones[0].get_query_tile_metadata(q, 512, kv_input_mode="packed") is frame
+        captured = helper.forward_generation(q.flatten(1), frame, args)
+    torch.cuda.current_stream().wait_stream(stream)
+    assert captured.data_ptr() == args.output.data_ptr()
+    assert not source.is_cuda_graph
+    _prepare(source, requests, [0, 0], [2, 1])
+    eager_q = torch.randn(3, 64, 512, device="cuda", dtype=torch.bfloat16)
+    eager = source.get_query_tile_metadata(eager_q, 512, query_start=0, kv_input_mode="packed")
+    eager_swa = torch.randn(3, 128, 512, device="cuda", dtype=torch.bfloat16)
+    eager_main = torch.randn(3, 512, 512, device="cuda", dtype=torch.bfloat16)
+    eager_args = _inputs(
+        eager_q,
+        eager_swa,
+        eager_main,
+        torch.ones(3, 128, device="cuda", dtype=torch.bool),
+        torch.ones(3, 512, device="cuda", dtype=torch.bool),
+        sink,
+    )
+    eager_args.attention_input_type = AttentionInputType.context_only
+    helper.forward_context(eager_q.flatten(1), eager, eager_args)
+    eager_record = next(iter(eager.fmha_plan_caches["csa2_prims_ts"].values()))
+    assert eager_record["arena"] is record["arena"]
+    assert any(tile is frame for tile in query_tiles.values())
+    assert frame._csa2_graph_reserved
+
+    # Target/draft field restores retain shared owner tables and their children.
+    target_fields = source._cache_dependent_fields()
+    assert "_csa2_query_tiles" not in target_fields
+    assert "_csa2_prims_ts_arenas" not in target_fields
+    retained_tiles = dict(query_tiles)
+    for fields in ({}, target_fields):
+        source._restore_cache_fields(fields)
+        for metadata in (source, *graph_clones):
+            assert metadata._csa2_query_tiles is query_tiles
+            assert metadata._csa2_prims_ts_arenas is arenas
+        assert query_tiles.keys() == retained_tiles.keys()
+        assert all(query_tiles[key] is tile for key, tile in retained_tiles.items())
+        assert len(arenas) == 1
+        assert next(iter(arenas.values())) is record["arena"]
+    graph.replay()
+    torch.testing.assert_close(
+        captured.view_as(q),
+        _decoded_reference(q, args, swa_valid, main_valid, sink),
+        atol=0.03,
+        rtol=0.03,
+    )
+    assert frame.fmha_plan_caches["csa2_prims_ts"] is cache
+    assert tuple(tensor.data_ptr() for tensor in _cache_tensors(cache)) == pointers
 
 
 @skip_pre_blackwell
@@ -892,13 +1148,16 @@ def test_temporal_prefill_seeds_first_decode(manager_requests, monkeypatch):
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
-def test_graph_workspace_is_independent_of_context_gather_cap(manager_requests, monkeypatch):
+def test_graph_workspace_is_independent_of_context_gather_cap(
+    manager_requests: tuple[CSA2CacheManager, list[LlmRequest]], monkeypatch: pytest.MonkeyPatch
+) -> None:
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.attention.backends.sparse.dsa import indexer as dsa_indexer
     from tensorrt_llm._torch.metadata import KVCacheParams
 
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("Native FP4 paged descriptors require SM100-family GPUs")
+    monkeypatch.setenv("TRTLLM_CSA2_COMPUTE_BACKEND", "trtllm")
     manager, requests = manager_requests
     metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=8, kv_cache_manager=manager)
     metadata.is_cuda_graph = True
@@ -925,7 +1184,9 @@ def test_graph_workspace_is_independent_of_context_gather_cap(manager_requests, 
     layout = vars(manager.layout).copy()
     layout["sliding_window"] = layout.pop("window_size")
     model_config = SimpleNamespace(
-        pretrained_config=SimpleNamespace(**layout, kv_lora_rank=448, qk_rope_head_dim=64),
+        pretrained_config=SimpleNamespace(
+            **layout, kv_lora_rank=448, qk_rope_head_dim=64, num_attention_heads=64
+        ),
         sparse_attention_config=SimpleNamespace(algorithm="csa2", indexer_max_chunk_size=None),
         attn_backend="TRTLLM",
         quant_config=None,
@@ -952,6 +1213,87 @@ def test_graph_workspace_is_independent_of_context_gather_cap(manager_requests, 
             enable_cuda_graph=True,
         ) == 2 * expected + 4 * (logits + logits // 8)
         assert get_attention_workspace_bytes_per_token(model_config, Mapping()) == rate
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("swa_only", [False, True])
+@pytest.mark.parametrize("attention_dp", [False, True])
+@pytest.mark.parametrize("enable_cuda_graph", [False, True])
+def test_prims_ts_workspace_reservation_honors_packed_sources_and_head_sharding(
+    monkeypatch: pytest.MonkeyPatch,
+    swa_only: bool,
+    attention_dp: bool,
+    enable_cuda_graph: bool,
+) -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import backend, prims_ts
+    from tensorrt_llm._torch.attention.backends.sparse.csa2._prims_ts_bank import (
+        main_bank_rows_limit,
+        main_records_rows_limit,
+    )
+
+    monkeypatch.setenv("TRTLLM_CSA2_COMPUTE_BACKEND", "auto")
+    monkeypatch.setattr(backend, "is_sm_100f", lambda: True)
+    monkeypatch.setattr(backend, "get_sm_version", lambda: 100)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=148),
+    )
+    calls = []
+    reserve = prims_ts.workspace_reservation_bytes
+    monkeypatch.setattr(prims_ts, "_workspace_capacity", lambda *_: 4096)
+
+    def provider_reserve(
+        device: torch.device,
+        heads: int,
+        width: int,
+        queries: int,
+        generation_queries: int = 0,
+    ) -> int:
+        calls.append((device, heads, width, queries, generation_queries))
+        arena_bytes = 4096 + 4 * queries * (width + 2)
+        # Widths with MAIN rows also retain the device's bounded context MAIN bank and its
+        # one-byte row marks, and the selection bank of the largest generation tile.
+        bank_bytes = 0
+        if width > 128:
+            selections = generation_queries * (width - 128)
+            bank_bytes = main_bank_rows_limit() * 513 + 512 * min(
+                max(selections, main_bank_rows_limit()), main_records_rows_limit()
+            )
+        assert (
+            reserve(device, heads, width, queries, generation_queries=generation_queries)
+            == arena_bytes + bank_bytes
+        )
+        return 101
+
+    monkeypatch.setattr(prims_ts, "workspace_reservation_bytes", provider_reserve)
+    layout = CSA2Layout((0,), (), ()) if swa_only else CSA2Layout((0, 1), (1,), (1,))
+    config_layout = vars(layout).copy()
+    config_layout["sliding_window"] = config_layout.pop("window_size")
+    config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(**config_layout, num_attention_heads=128),
+        sparse_attention_config=SimpleNamespace(use_fp8_staging=None),
+        spec_config=None,
+    )
+    mapping = SimpleNamespace(enable_attention_dp=attention_dp, tp_size=2)
+    kwargs = dict(
+        max_batch_size=2, max_num_tokens=8, max_seq_len=512, enable_cuda_graph=enable_cuda_graph
+    )
+    automatic = backend.CSA2TrtllmAttention.runtime_workspace_fixed_bytes(config, mapping, **kwargs)
+    widths = {128} if swa_only else {128, 640}
+    assert {call[2] for call in calls} == widths
+    assert len(calls) == len(widths)
+    for device, heads, _, queries, generation_queries in calls:
+        assert device == torch.device("cuda", 0)
+        assert heads == (128 if attention_dp else 64)
+        assert queries == 8
+        # One generation step of max_batch_size requests, one token each without drafts.
+        assert generation_queries == 2
+    config.sparse_attention_config.use_fp8_staging = True
+    native = backend.CSA2TrtllmAttention.runtime_workspace_fixed_bytes(config, mapping, **kwargs)
+    assert automatic == native + 101 * len(widths)
+    assert len(calls) == len(widths)
 
 
 @pytest.fixture
@@ -1072,24 +1414,39 @@ def test_replay_graph_updates_values_but_rejects_shape_or_mode_change(replay_met
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
-def test_replay_requires_first_window_row_to_be_physically_writable(monkeypatch):
-    # Explicit replay must reject allocations missing the first recovery row.
-    monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "0")
+@pytest.mark.parametrize(
+    "decoder_replay,encoder_replay,replay_start",
+    [(False, False, 127), (True, False, 127), (True, True, 115)],
+)
+def test_replay_requires_first_window_row_to_be_physically_writable(
+    monkeypatch, decoder_replay, encoder_replay, replay_start
+):
+    monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", str(int(decoder_replay)))
+    monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", str(int(encoder_replay)))
+    monkeypatch.setenv("TRTLLM_V41_BOUNDED_REPLAY_TOKENS", "140")
     manager = _manager(128)
     try:
         cache = manager._create_kv_cache(71, None, [])
         assert manager._resume_and_restore(71, cache)
         cache.enable_swa_scratch_reuse = False
-        # Ordinary next-query retention at C255 keeps128..254, while replay
-        # requires127..254. Page0 is genuinely absent in the real allocator.
+        # Layer 0 keeps128..254 without Encoder replay; bounded Encoder replay
+        # retains115..254, including the first writable recovery row.
         assert cache.resize(255, 255)
         manager._stream.synchronize()
+        first_page = manager.get_cache_indices(71, 0, CSA2CacheRole.SWA)[0]
+        assert (first_page >= 0) == encoder_replay
         metadata = CSA2TrtllmMetadata(
-            max_num_requests=1, max_num_tokens=128, kv_cache_manager=manager
+            max_num_requests=1, max_num_tokens=140, kv_cache_manager=manager
         )
-        assert manager.get_swa_replay_ranges([255]) == ((127, 255),)
-        with pytest.raises(ValueError, match="reserve the complete replay range"):
+        assert manager.get_swa_replay_ranges([255]) == ((replay_start, 255),)
+        if encoder_replay:
             _prepare_replay(metadata, [255])
+            assert metadata.csa2_positions[0].item() == replay_start
+            _, write_slots, _ = _swa(metadata, 0)
+            assert write_slots[0].item() == first_page * 128 + replay_start
+        else:
+            with pytest.raises(ValueError, match="reserve the complete replay range"):
+                _prepare_replay(metadata, [255])
     finally:
         for request_id in list(manager.kv_cache_map):
             manager.free_resources(SimpleNamespace(py_request_id=request_id))
@@ -2155,13 +2512,14 @@ def test_shared_context_covers_upward_live_endpoint_inside_published_pages(manag
     assert shared.shared_plan is not None
     assert shared.shared_plan.main_rows > 2 * (200 // 2)
     selected = CSA2TrtllmMetadata.for_query_tile(q, 512, context_lengths=[2, 1])
-    backend = _backend(8)
+    backend = _backend(8, kv_cache_dtype="fp8", fp8_staging=False)
 
     def arguments():
         return AttentionForwardArgs(
             attention_input_type=AttentionInputType.context_only,
             attention_sinks=torch.zeros(8, device="cuda"),
             sparse_backend_args=CSA2BackendForwardArgs(
+                swa_cache_format=manager.swa_cache_format,
                 swa_pool=manager.get_swa_buffer(1),
                 swa_indices=_swa(source, 1)[0],
                 main_pool=manager.get_main_buffer(1),
@@ -3062,3 +3420,157 @@ def test_selected_decode_prepare_controls_indexer_dispatch(
     metadata.on_update_kv_lens()
     metadata.prepare_indexer(1)
     assert calls == [True, False, False]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_prims_ts_metadata_main_bank_rows() -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.csa2._prims_ts_metadata import (
+        prepare_prims_ts_metadata,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2PrimsTSMainBank
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.prims_ts import _PrimsTSMetadata
+
+    rows, width, page_size, max_positions, pool_rows = 4, 17, 8, 25, 64
+    source_rows = [
+        [7, 0, -1, 4, 0, 7, -1, 16, 24, 31, 26] + [-1] * 6,
+        [0, 8] * 8 + [0],
+        [64, 2**32, 2**40, -4] + list(range(13)),
+        [-1, 0, 1] + [-1] * 14,
+    ]
+    page_rows = [[1, 0, 2**61, -1], [0, -1, 2, 3]]
+    request_rows, visible_rows = [0, 1, -1, 2], [27, 13, 17, 17]
+    # Request 0 owns fewer bank rows than its visible selections reach.
+    base, counts = 3, [6, 13]
+    bank = CSA2PrimsTSMainBank(
+        offsets=torch.tensor([base, base + 6, base + 19], device="cuda", dtype=torch.int64),
+        base=base,
+        rows=sum(counts),
+        pages=torch.tensor(page_rows, device="cuda", dtype=torch.int64),
+        page_size=page_size,
+        num_requests=len(counts),
+    )
+    selection = torch.tensor(source_rows, device="cuda", dtype=torch.int64)
+
+    def compact(
+        main_bank: CSA2PrimsTSMainBank | None, marks: torch.Tensor | None = None
+    ) -> _PrimsTSMetadata:
+        prepared = _PrimsTSMetadata(
+            torch.full((rows, width), 91, device="cuda", dtype=torch.int32),
+            torch.full((rows,), -91, device="cuda", dtype=torch.int32),
+            torch.full((rows, width), 91, device="cuda", dtype=torch.int32),
+            torch.full((rows,), -91, device="cuda", dtype=torch.int32),
+        )
+        inputs = CSA2BackendForwardArgs(
+            swa_pool=torch.empty(pool_rows, 528, device="cuda", dtype=torch.uint8),
+            swa_indices=selection,
+            main_pool=torch.empty(pool_rows, 288, device="cuda", dtype=torch.uint8),
+            topk_indices=selection,
+            main_mapping=(
+                bank.pages,
+                page_size,
+                max_positions,
+                torch.tensor(request_rows, device="cuda"),
+                torch.tensor(visible_rows, device="cuda"),
+            ),
+        )
+        prepare_prims_ts_metadata(inputs, prepared, main_bank, marks)
+        return prepared
+
+    physical, banked = compact(None), compact(bank)
+    # SWA rows are physical either way.
+    torch.testing.assert_close(banked.indices, physical.indices, atol=0, rtol=0)
+    torch.testing.assert_close(banked.lengths, physical.lengths, atol=0, rtol=0)
+    expected = []
+    for row, values in enumerate(source_rows):
+        bank_rows = []
+        request = request_rows[row]
+        for index in values:
+            # Exactly the selections the physical path keeps, within the request's rows.
+            if not (0 <= request < len(page_rows) and 0 <= index < min(visible_rows[row], 25)):
+                continue
+            page = page_rows[request][index // page_size]
+            if page < 0 or not page * page_size + index % page_size < pool_rows:
+                continue
+            if index < counts[request]:
+                bank_rows.append(sum(counts[:request]) + index)
+        expected.append(bank_rows)
+    assert banked.extra_lengths.tolist() == [len(values) for values in expected]
+    torch.testing.assert_close(
+        banked.extra_indices.cpu(),
+        torch.tensor(
+            [values + [-1] * (width - len(values)) for values in expected], dtype=torch.int32
+        ),
+        atol=0,
+        rtol=0,
+    )
+    # The truncated request drops its selection of logical row 7.
+    assert banked.extra_lengths[0] < physical.extra_lengths[0]
+
+    # Marks set exactly the bank rows some selection keeps; other bytes keep their value.
+    kept = sorted({row for values in expected for row in values})
+    untouched = next(row for row in range(bank.rows) if row not in kept)
+    marks = torch.zeros(bank.rows, device="cuda", dtype=torch.uint8)
+    marks[untouched] = 7
+    marked = compact(bank, marks)
+    torch.testing.assert_close(marked.extra_indices, banked.extra_indices, atol=0, rtol=0)
+    torch.testing.assert_close(marked.extra_lengths, banked.extra_lengths, atol=0, rtol=0)
+    want = torch.zeros(bank.rows, dtype=torch.uint8)
+    want[kept] = 1
+    want[untouched] = 7
+    torch.testing.assert_close(marks.cpu(), want, atol=0, rtol=0)
+    for bad in ((None, marks), (bank, marks[:-1]), (bank, marks.to(torch.int32))):
+        with pytest.raises(ValueError, match="marks"):
+            compact(*bad)
+
+    with pytest.raises(ValueError, match="logical selections"):
+        inputs = CSA2BackendForwardArgs(
+            swa_pool=torch.empty(pool_rows, 528, device="cuda", dtype=torch.uint8),
+            swa_indices=selection,
+            main_pool=torch.empty(pool_rows, 288, device="cuda", dtype=torch.uint8),
+            topk_indices=selection,
+        )
+        prepare_prims_ts_metadata(inputs, compact(None), bank)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_prims_ts_main_bank_plan(manager_requests):
+    manager, requests = manager_requests
+    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager)
+    _prepare(metadata, requests, [0, 0], [3, 2])
+    # A MAIN layer's forward first resolves the deferred context owner tables.
+    assert metadata._csa2_pending_owner_tables is not None
+    metadata.get_compression_batch(1)
+    q = torch.zeros(5, 8, 512, device="cuda", dtype=torch.bfloat16)
+
+    def bank(tile: torch.Tensor, width: int, layer_idx: int | None, **kwargs) -> object:
+        return metadata.get_query_tile_metadata(
+            tile, width, layer_idx=layer_idx, **kwargs
+        ).prims_ts_main_bank
+
+    for layer_idx in (1, 2, 3):
+        owner = manager.layout.layer(layer_idx).kv_source
+        plan = bank(q, 512, layer_idx, query_start=0, kv_input_mode="packed")
+        assert plan is not None
+        _, _, offsets, swa_rows, main_rows = metadata._csa2_shared_tables[owner]
+        assert plan.offsets is offsets and plan.base == 1 + swa_rows
+        assert plan.rows == main_rows == sum(metadata._csa2_main_domain_counts[owner]) > 0
+        assert offsets[0].item() == plan.base and offsets[-1].item() == plan.base + plan.rows
+        assert plan.num_requests == 2 and plan.pages.shape[0] == 2
+        assert plan.page_size == metadata.csa2_global_page_sizes[owner]
+        # Its queries select at least as many rows as the requests own.
+        assert q.shape[0] * 512 >= plan.rows and not plan.selected_only
+    # A tile selecting fewer rows than its requests own decodes only those rows.
+    narrow = bank(q, 1, 1, query_start=0, kv_input_mode="packed")
+    owner_rows = metadata._csa2_shared_tables[manager.layout.layer(1).kv_source][4]
+    assert narrow is not None and narrow.selected_only and narrow.rows == owner_rows > q.shape[0]
+    # SWA-only layers, MAIN-free widths, staged tiles and partial or unknown tiles
+    # keep decoding in the kernel.
+    assert bank(q, 512, 0, query_start=0, kv_input_mode="packed") is None
+    assert bank(q, 0, 1, query_start=0, kv_input_mode="packed") is None
+    assert bank(q, 512, 1, query_start=0) is None
+    assert bank(q[:3], 512, 1, query_start=0, kv_input_mode="packed") is None
+    assert bank(q, 512, None, query_start=0, kv_input_mode="packed") is None

@@ -252,8 +252,8 @@ def _backend(heads, layout=None, layer_idx=20):
         qk_rope_head_dim=64,
         v_head_dim=512,
         rope_append=False,
-        sparse_params=CSA2Params(layout=layout),
-        kv_cache_dtype="fp8",
+        sparse_params=CSA2Params(layout=layout, compute_backend="trtllm"),
+        kv_cache_dtype="fp8_ds_mla",
     )
 
 

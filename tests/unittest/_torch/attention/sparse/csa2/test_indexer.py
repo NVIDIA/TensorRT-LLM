@@ -1810,10 +1810,11 @@ def test_full_reuse_reindex_private_swa_and_shared_sink():
     layout = CSA2Layout((1, 1), (0,), (0,))
     with pytest.raises(ValueError, match="across forwards"):
         routing.enter_layer(layout.layer(0))
-    q = torch.zeros(1, 1, 128, dtype=torch.bfloat16)
+    device = batch.csa2_token_requests.device
+    q = torch.zeros(1, 1, 128, dtype=torch.bfloat16, device=device)
     with pytest.raises(ValueError, match="source did not run"):
         batch.reset_routing()
-        _prediction_reference(layout, 1, q, q[:, 0], torch.zeros(1), batch)
+        _prediction_reference(layout, 1, q, q[:, 0], torch.zeros(1, device=device), batch)
 
 
 @pytest.mark.skipif(

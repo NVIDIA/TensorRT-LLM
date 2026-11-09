@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """CSA2 cache encodings, including the quantized RoPE channels.
 
-Rows contain packed values followed by scale bytes. Main KV uses E2M1/E4M3
-with groups of 16; index Q/K use E2M1/UE8M0 with groups of 32. Neither format
-uses the tensor-wide scaling factor of the generic NVFP4 weight quantizer.
+Main KV uses E2M1/E4M3 with groups of 16; index Q/K use E2M1/UE8M0 with
+groups of 32. Legacy SWA uses E4M3/UE8M0 with groups of 32; ordinary FP8 SWA
+stores only E4M3 payload bytes with persistent unit scale. None uses the
+tensor-wide scaling factor of the generic NVFP4 weight quantizer.
 """
 
 from __future__ import annotations
@@ -14,13 +15,17 @@ from typing import Literal
 
 import torch
 
-CacheFormat = Literal["main", "index", "swa"]
+from .params import SwaCacheFormat
+
+CacheFormat = Literal["main", "index", "swa", "swa_fp8"]
 
 
 def row_bytes(head_dim: int, cache_format: CacheFormat) -> int:
     group = 16 if cache_format == "main" else 32
-    if cache_format not in ("main", "index", "swa") or head_dim % group:
+    if cache_format not in ("main", "index", "swa", "swa_fp8") or head_dim % group:
         raise ValueError("Invalid CSA2 cache format or head dimension")
+    if cache_format == "swa_fp8":
+        return head_dim
     return (head_dim if cache_format == "swa" else head_dim // 2) + head_dim // group
 
 
@@ -37,6 +42,11 @@ def pack_rows(x: torch.Tensor, cache_format: CacheFormat) -> torch.Tensor:
     """Encode floating rows [..., head_dim] as uint8 [..., row_bytes]."""
     dim = x.shape[-1]
     row_bytes(dim, cache_format)
+    if cache_format == "swa_fp8":
+        # Native unit-scale E4M3 conversion saturates infinities and preserves
+        # signed zero, but canonicalizes either NaN sign to 0x7F.
+        values = x.float().clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
+        return torch.where(torch.isnan(x), 127, values)
     group = 16 if cache_format == "main" else 32
     blocks = x.float().reshape(*x.shape[:-1], dim // group, group)
     maximum = blocks.abs().amax(-1)
@@ -78,6 +88,8 @@ def unpack_rows(
     """Decode uint8 rows after gathering from a paged or contiguous pool."""
     if rows.dtype != torch.uint8 or rows.shape[-1] != row_bytes(head_dim, cache_format):
         raise ValueError("CSA2 packed cache has the wrong row shape or dtype")
+    if cache_format == "swa_fp8":
+        return rows.contiguous().view(torch.float8_e4m3fn).to(dtype)
     data_bytes = head_dim if cache_format == "swa" else head_dim // 2
     data = rows[..., :data_bytes].contiguous()
     scale_bytes = rows[..., data_bytes:].contiguous()
@@ -162,6 +174,18 @@ def apply_row_transform(values: torch.Tensor, transform) -> torch.Tensor:
     return x
 
 
+def _check_publication_devices(pool, slots, values, transform=None) -> None:
+    """Validate actual tensor devices before packing or mutating cache storage."""
+    tensors = [slots, values]
+    if transform is not None:
+        if transform.norm is not None:
+            tensors.append(transform.norm[0])
+        if transform.rope is not None:
+            tensors.extend(transform.rope[:2])
+    if any(tensor.device != pool.device for tensor in tensors):
+        raise ValueError("CSA2 publication tensors must share a device")
+
+
 def store_rows(
     pool: torch.Tensor,
     slots: torch.Tensor,
@@ -180,6 +204,7 @@ def store_rows(
         values.shape[1], cache_format
     ):
         raise ValueError("CSA2 publication requires one slot per packed row")
+    _check_publication_devices(pool, slots, values, transform)
     if _fused_rows(pool, slots, values):
         from .kernel import quantize_scatter_rows
 
@@ -229,6 +254,7 @@ def read_index_rows(pages: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
 
 def write_packed_index_rows(pages: torch.Tensor, slots: torch.Tensor, packed: torch.Tensor) -> None:
     """Scatter already packed ``[n, 68]`` index rows; padding slots never write."""
+    _check_publication_devices(pages, slots, packed)
     flat = pages.view(-1)
     if slots.is_cuda:
         # Device slots stay on the device: no host sync, graph-capturable.
@@ -289,6 +315,7 @@ def store_layer_rows(
     swa_values: torch.Tensor,
     swa_transform=None,
     *,
+    swa_cache_format: SwaCacheFormat = "swa",
     main=None,
     index=None,
     index_q: torch.Tensor | None = None,
@@ -299,8 +326,20 @@ def store_layer_rows(
     ``main`` / ``index`` are ``(pool_or_pages, slots, values, transform)`` for a
     Full layer's compressed rows; ``index_q`` ``[count, heads, 128]`` queries are
     packed in the same launch and returned as ``(data int8, scales uint8)``.
-    Inputs the fused kernel cannot take fall back to the separate stores.
+    ``swa_cache_format`` selects the persistent SWA encoding independently of
+    staging. Inputs the fused kernel cannot take fall back to separate stores.
     """
+    if swa_cache_format not in ("swa", "swa_fp8"):
+        raise ValueError("Invalid CSA2 SWA cache format")
+    _check_publication_devices(swa_pool, swa_slots, swa_values, swa_transform)
+    # Preflight every job before the fallback can publish its first cache row.
+    for rows in (main, index):
+        if rows is not None:
+            _check_publication_devices(*rows)
+            if rows[0].device != swa_pool.device:
+                raise ValueError("CSA2 layer publication tensors must share a device")
+    if index_q is not None and index_q.device != swa_pool.device:
+        raise ValueError("CSA2 layer publication tensors must share a device")
     fused = _fused_rows(swa_pool, swa_slots, swa_values)
     for rows in (main, index):
         if rows is not None:
@@ -308,7 +347,7 @@ def store_layer_rows(
     if index_q is not None:
         fused = fused and _fused_queries(index_q)
     if not fused:
-        store_rows(swa_pool, swa_slots, swa_values, "swa", swa_transform)
+        store_rows(swa_pool, swa_slots, swa_values, swa_cache_format, swa_transform)
         if main is not None:
             store_rows(main[0], main[1], main[2], "main", main[3])
         if index is not None:
@@ -316,7 +355,11 @@ def store_layer_rows(
         return None if index_q is None else pack_index_queries_split(index_q)
     from .kernel import footer_job, quantize_scatter_jobs, row_job, split_job
 
-    jobs = [row_job(swa_pool, swa_slots, swa_values, "swa", **_transform_kwargs(swa_transform))]
+    jobs = [
+        row_job(
+            swa_pool, swa_slots, swa_values, swa_cache_format, **_transform_kwargs(swa_transform)
+        )
+    ]
     if main is not None:
         jobs.append(row_job(main[0], main[1], main[2], "main", **_transform_kwargs(main[3])))
     if index is not None:
@@ -377,6 +420,7 @@ def store_index_rows(
         raise ValueError("CSA2 index publication requires one slot per row and uint8 pages")
     if pages.numel() % INDEX_PAGE_BYTES:
         raise ValueError("CSA2 native index pages must be whole 64-row pages")
+    _check_publication_devices(pages, slots, values, transform)
     if _fused_rows(pages, slots, values):
         from .kernel import quantize_scatter_index_pages
 

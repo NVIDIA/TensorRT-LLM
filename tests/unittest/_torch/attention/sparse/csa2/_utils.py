@@ -13,6 +13,7 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
     CSA2ForwardState,
     CSA2Layout,
     CSA2Mode,
+    SwaCacheFormat,
 )
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
     INDEX_PAGE_BYTES,
@@ -36,7 +37,7 @@ def _index_pages(rows: int, device="cpu") -> torch.Tensor:
     )
 
 
-def _test_pools(swa, main, index):
+def _test_pools(swa, main, index, *, swa_cache_format: SwaCacheFormat = "swa"):
     """Synthetic byte pools for pure prediction tests; lifecycle has real-manager tests."""
 
     def write_global(owner, slots, values, keys, main_transform=None, index_transform=None):
@@ -53,21 +54,64 @@ def _test_pools(swa, main, index):
         index_q=None,
         release_after_wait=False,
     ):
-        store_rows(swa[layer], slots, values, "swa", transform)
+        store_rows(swa[layer], slots, values, swa_cache_format, transform)
         if global_rows is not None:
             write_global(*global_rows)
         return None if index_q is None else pack_index_queries_split(index_q)
 
     return SimpleNamespace(
+        swa_cache_format=swa_cache_format,
         write_layer_rows=write_layer_rows,
         get_swa_buffer=lambda layer: swa[layer],
         get_main_buffer=lambda owner: main[owner],
         get_index_pages=lambda owner: index[owner],
         write_swa=lambda layer, slots, values, transform=None: store_rows(
-            swa[layer], slots, values, "swa", transform
+            swa[layer], slots, values, swa_cache_format, transform
         ),
         write_global=write_global,
         indexers={},
+    )
+
+
+def _assert_fp8_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """Bound per-query FP8 pointwise error at the reference scale and relative L2 error."""
+    assert actual.shape == expected.shape, f"Shape mismatch: {actual.shape} != {expected.shape}"
+    assert actual.dtype == expected.dtype, f"Dtype mismatch: {actual.dtype} != {expected.dtype}"
+    assert actual.device == expected.device, (
+        f"Device mismatch: {actual.device} != {expected.device}"
+    )
+    actual_fp32, expected_fp32 = actual.float(), expected.float()
+    assert torch.isfinite(actual_fp32).all(), "FP8 output must be finite"
+    assert torch.isfinite(expected_fp32).all(), "FP8 reference must be finite"
+    actual_rows, expected_rows = actual_fp32.flatten(1), expected_fp32.flatten(1)
+    reference_scale = expected_rows.abs().amax(dim=1, keepdim=True).clamp_min(1.0)
+    error = actual_rows - expected_rows
+    error_norm = error.norm(dim=1)
+    reference_norm = expected_rows.norm(dim=1)
+    relative_l2 = torch.where(
+        reference_norm == 0,
+        torch.where(error_norm == 0, 0.0, torch.inf),
+        error_norm / reference_norm,
+    )
+    diagnostic = (
+        f"max_abs={error.abs().max().item()}, "
+        f"per_query_reference_scale={reference_scale.flatten().tolist()}, "
+        f"per_query_relative_l2={relative_l2.tolist()}; "
+        "normalized_atol=0.12, rtol=0.04, relative_l2_limit=0.05"
+    )
+    torch.testing.assert_close(
+        actual_rows / reference_scale,
+        expected_rows / reference_scale,
+        atol=0.12,
+        rtol=0.04,
+        msg=lambda message: f"FP8 pointwise error: {message}\n{diagnostic}",
+    )
+    zero_reference = (expected_rows == 0).all(dim=1)
+    assert (~zero_reference | (actual_rows == 0).all(dim=1)).all(), (
+        f"FP8 zero-reference queries must remain exactly zero: {diagnostic}"
+    )
+    assert (error_norm <= 0.05 * reference_norm).all(), (
+        f"FP8 per-query L2 error exceeds 0.05: {diagnostic}"
     )
 
 
@@ -166,7 +210,9 @@ def _prediction_reference(layout, layer, q, swa, sink, meta, **kwargs):
     logical = _run_indexer(layout, layer, state)
     manager = meta.kv_cache_manager
     swa_slots = meta.csa2_swa_indices[layer]
-    kv = gather_rows(manager.get_swa_buffer(layer), swa_slots, q.shape[-1], "swa")
+    kv = gather_rows(
+        manager.get_swa_buffer(layer), swa_slots, q.shape[-1], manager.swa_cache_format
+    )
     valid = swa_slots >= 0
     slots = meta.global_slot_tile(layer, 0, q.shape[0], logical)
     kv = torch.cat(

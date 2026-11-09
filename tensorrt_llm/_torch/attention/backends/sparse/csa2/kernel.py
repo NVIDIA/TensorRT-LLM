@@ -52,7 +52,7 @@ Sections:
   references in ``metadata.py`` (floor division/modulo, ``-1`` padding,
   ``INT_MAX`` sort sentinels).
 * Packed-cache kernels: byte-exact quantized publication, gather/dequantization
-  and native staging for the ``main`` / ``index`` / ``swa`` row formats of
+  and native staging for the ``main`` / ``index`` / ``swa`` / ``swa_fp8`` row formats of
   ``quantization.py``.
 * Index-Q projection and packed sparse attention (native CuTe GEMM/attention).
 
@@ -66,7 +66,7 @@ no package modules at import time.
 import dataclasses
 import functools
 import math
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -2280,22 +2280,35 @@ def _launch(key: tuple, factory, *args) -> None:
     between int32 and int64 tensors gets one specialization per type instead
     of reusing a function compiled for the other.
     """
-    signature = tuple(arg[1] if type(arg) is tuple else None for arg in args)
-    key = (key, signature)
+    # One pass splits pointer arguments into their address and signature; launches
+    # are host-bound, and two generator passes cost more than one loop.
+    signature = [None] * len(args)
+    launch_args = list(args)
+    for position, arg in enumerate(args):
+        kind = type(arg)
+        if kind is tuple:
+            launch_args[position], signature[position] = arg
+        elif kind is _Stream:
+            launch_args[position] = int(arg)
+    key = (key, tuple(signature))
     compiled = _COMPILED.get(key)
     if compiled is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm up CSA2 CuTe kernels before CUDA Graph capture")
         compiled = _COMPILED[key] = _compile(factory, args)
-    launch_args = tuple(
-        arg[0] if type(arg) is tuple else int(arg) if type(arg) is _Stream else arg for arg in args
-    )
     compiled(*launch_args)
 
 
 def _check(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
+
+
+def _check_cuda_devices(first: torch.Tensor, *others: torch.Tensor) -> None:
+    _check(
+        first.is_cuda and all(tensor.device == first.device for tensor in others),
+        "CSA2 cache tensors must share a CUDA device",
+    )
 
 
 def _pdl() -> bool:
@@ -3166,7 +3179,7 @@ def expand_candidates_(
 # Packed-cache kernels: publication, gathering and staging
 # =============================================================================
 
-_FORMATS = ("main", "index", "swa")
+_FORMATS = ("main", "index", "swa", "swa_fp8")
 
 
 def _format_geometry(cache_format: str, head_dim: int) -> tuple[int, int, int]:
@@ -3176,6 +3189,8 @@ def _format_geometry(cache_format: str, head_dim: int) -> tuple[int, int, int]:
     group = 16 if cache_format == "main" else 32
     if head_dim % group:
         raise ValueError("CSA2 head dimension must be a multiple of the quantization group")
+    if cache_format == "swa_fp8":
+        return group, head_dim, 0
     data_bytes = head_dim if cache_format == "swa" else head_dim // 2
     return group, data_bytes, head_dim // group
 
@@ -3494,7 +3509,10 @@ def _cache_kernels():
             channel = first_channel + j
             value = Float32(0.0)
             if valid:
-                if cutlass.const_expr(cache_format == "swa"):
+                if cutlass.const_expr(cache_format == "swa_fp8"):
+                    payload = Int32(bytes_t[row_base + Int64(channel)]) & 255
+                    value = e4m3_to_f32(payload)
+                elif cutlass.const_expr(cache_format == "swa"):
                     payload = Int32(bytes_t[row_base + Int64(channel)]) & 255
                     scale_byte = (
                         Int32(bytes_t[row_base + Int64(head_dim) + Int64(channel // 32)]) & 255
@@ -3518,15 +3536,33 @@ def _cache_kernels():
             result[j] = value
 
     @dsl_user_op
-    def load_row_x16(payload: Int64, scale: Int64, kind: Int32, *, loc=None, ip=None):
-        """Predicated loads of sixteen channels of a packed row and their scale byte.
+    def load_row_x16(
+        payload: Int64,
+        scale: Int64,
+        kind: Int32,
+        swa_cache_format: str,
+        swa_aligned: bool,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        """Predicated loads of sixteen channels; invalid kinds load nothing.
 
-        ``kind`` 1 loads sixteen SWA payload bytes, 2 eight main payload bytes, and
-        either also loads the scale byte at ``scale``; any other kind loads nothing
-        and returns zeros. Returns four payload words and the scale byte. The loads
-        are predicated rather than branched over, so callers can issue several rows'
-        loads before the first result is needed.
+        Kind 1 loads sixteen SWA bytes, kind 2 eight main bytes. Ordinary SWA
+        has no scale load and ignores the returned scale. Unaligned SWA rows
+        use byte loads, while aligned rows retain vector loads.
         """
+        swa_load = "@s ld.global.v4.u32 {$0, $1, $2, $3}, [$5];\n"
+        if not swa_aligned:
+            swa_load = ""
+            for word in range(4):
+                swa_load += f"@s ld.global.u8 ${word}, [$5+{word * 4}];\n"
+                for byte in range(1, 4):
+                    swa_load += (
+                        f"@s ld.global.u8 v, [$5+{word * 4 + byte}];\n"
+                        f"@s shl.b32 v, v, {byte * 8};\n@s or.b32 ${word}, ${word}, v;\n"
+                    )
+        swa_scale = "" if swa_cache_format == "swa_fp8" else "@s ld.global.u8 $4, [$6];\n"
         out = llvm.inline_asm(
             llvm.StructType.get_literal([T.i32()] * 5),
             [
@@ -3534,10 +3570,14 @@ def _cache_kernels():
                 Int64(scale).ir_value(loc=loc, ip=ip),
                 Int32(kind).ir_value(loc=loc, ip=ip),
             ],
-            "{\n.reg .pred s, m, any;\nsetp.eq.s32 s, $7, 1;\nsetp.eq.s32 m, $7, 2;\n"
-            "or.pred any, s, m;\nmov.b32 $0, 0;\nmov.b32 $1, 0;\nmov.b32 $2, 0;\n"
-            "mov.b32 $3, 0;\nmov.b32 $4, 0;\n@s ld.global.v4.u32 {$0, $1, $2, $3}, [$5];\n"
-            "@m ld.global.v2.u32 {$0, $1}, [$5];\n@any ld.global.u8 $4, [$6];\n}",
+            "{\n.reg .pred s, m;\n.reg .b32 v;\n"
+            "setp.eq.s32 s, $7, 1;\nsetp.eq.s32 m, $7, 2;\n"
+            "mov.b32 $0, 0;\nmov.b32 $1, 0;\nmov.b32 $2, 0;\n"
+            "mov.b32 $3, 0;\nmov.b32 $4, 0;\n"
+            + swa_load
+            + "@m ld.global.v2.u32 {$0, $1}, [$5];\n@m ld.global.u8 $4, [$6];\n"
+            + swa_scale
+            + "}",
             "=r,=r,=r,=r,=r,l,l,r",
             has_side_effects=False,
             is_align_stack=False,
@@ -3552,12 +3592,16 @@ def _cache_kernels():
         Hardware pair conversions; SWA values are rounded to BF16, and main values
         (E2M1 times an E4M3 scale) are exact in BF16.
         """
-        if cutlass.const_expr(cache_format == "swa"):
-            factor = ue8m0_to_f32(scale_byte)
+        if cutlass.const_expr(cache_format in ("swa", "swa_fp8")):
+            if cutlass.const_expr(cache_format == "swa"):
+                factor = ue8m0_to_f32(scale_byte)
             for pair in cutlass.range_constexpr(8):
                 a, b = e4m3x2_to_f32(Int32(words[pair // 2] >> (16 * (pair % 2))) & 65535)
-                result[2 * pair] = Float32(cutlass.BFloat16(mul_rn(a, factor)))
-                result[2 * pair + 1] = Float32(cutlass.BFloat16(mul_rn(b, factor)))
+                if cutlass.const_expr(cache_format == "swa"):
+                    a = Float32(cutlass.BFloat16(mul_rn(a, factor)))
+                    b = Float32(cutlass.BFloat16(mul_rn(b, factor)))
+                result[2 * pair] = a
+                result[2 * pair + 1] = b
         else:
             factor, _ = e4m3x2_to_f32(scale_byte)
             for pair in cutlass.range_constexpr(8):
@@ -3625,12 +3669,21 @@ def _cache_kernels():
                     store_u32x4(target, Int64(chunk) * 16, words[k])
 
     @cute.jit
-    def load_rows_x16(kind: Int32, row_base: Int64, rows: cutlass.Constexpr, kinds, scales, words):
+    def load_rows_x16(
+        kind: Int32,
+        row_base: Int64,
+        rows: cutlass.Constexpr,
+        kinds,
+        scales,
+        words,
+        swa_cache_format: cutlass.Constexpr,
+        swa_aligned: cutlass.Constexpr,
+    ):
         """Load the lane's sixteen channels of each of the warp's first ``rows`` rows.
 
         Lane ``r`` holds row ``r``'s ``load_row_x16`` kind and packed row address. A
-        lane reads sixteen SWA bytes or eight main bytes, and the one group-scale byte
-        they share. Every row's loads are issued before any of them is converted.
+        lane reads sixteen SWA bytes or eight main bytes, plus their group-scale
+        byte except for ordinary SWA. Every row's loads precede its conversion.
         """
         tid, _, _ = cute.arch.thread_idx()
         first = tid % 32 * 16
@@ -3640,13 +3693,17 @@ def _cache_kernels():
                 cute.arch.shuffle_sync(Int32(row_base & Int64(0xFFFFFFFF)), Int32(row))
             ) & Int64(0xFFFFFFFF)
             base = base | (Int64(cute.arch.shuffle_sync(Int32(row_base >> 32), Int32(row))) << 32)
-            payload = base + Int64(first // 2)
-            scale_byte = base + Int64(256 + first // 16)
+            payload = Int64(0)
+            scale_address = Int64(0)
             if row_kind == 1:
                 payload = base + Int64(first)
-                scale_byte = base + Int64(512 + first // 32)
+                if cutlass.const_expr(swa_cache_format == "swa"):
+                    scale_address = base + Int64(512 + first // 32)
+            elif row_kind == 2:
+                payload = base + Int64(first // 2)
+                scale_address = base + Int64(256 + first // 16)
             kinds[row] = row_kind
-            loaded = load_row_x16(payload, scale_byte, row_kind)
+            loaded = load_row_x16(payload, scale_address, row_kind, swa_cache_format, swa_aligned)
             for word in cutlass.range_constexpr(4):
                 words[row][word] = loaded[word]
             scales[row] = Int32(loaded[4])
@@ -3687,6 +3744,7 @@ def _cache_kernels():
         element: Int64,
         result,
         packed,
+        swa_cache_format: cutlass.Constexpr,
     ):
         """Convert one row's sixteen loaded channels to the bank format and store them at
         ``element`` of ``target``; ``quant_state`` comes from ``staging_quant``."""
@@ -3702,23 +3760,29 @@ def _cache_kernels():
                             words[word // 2] >> (16 * (word % 2)), group_scale, quant_pair
                         )
             elif kind == 1:
-                exponent = scale_byte - 127 + quant_exponent
-                if (
-                    quant_pow2
-                    & (scale_byte >= 10)
-                    & (scale_byte <= 245)
-                    & (exponent >= -24)
-                    & (exponent <= 15)
-                ):
-                    generic = cutlass.Boolean(False)
-                    scale = f16x2_splat(ue8m0_to_f32(scale_byte) * quant)
-                    for word in cutlass.range_constexpr(4):
-                        packed[word] = scaled_e4m3x4(words[word], scale)
+                if cutlass.const_expr(swa_cache_format == "swa_fp8"):
+                    if quant_pow2:
+                        generic = cutlass.Boolean(False)
+                        for word in cutlass.range_constexpr(4):
+                            packed[word] = scaled_e4m3x4(words[word], quant_pair)
+                else:
+                    exponent = scale_byte - 127 + quant_exponent
+                    if (
+                        quant_pow2
+                        & (scale_byte >= 10)
+                        & (scale_byte <= 245)
+                        & (exponent >= -24)
+                        & (exponent <= 15)
+                    ):
+                        generic = cutlass.Boolean(False)
+                        scale = f16x2_splat(ue8m0_to_f32(scale_byte) * quant)
+                        for word in cutlass.range_constexpr(4):
+                            packed[word] = scaled_e4m3x4(words[word], scale)
         if generic:
             for j in cutlass.range_constexpr(16):
                 result[j] = Float32(0.0)
             if kind == 1:
-                decode_channels_x16(words, scale_byte, "swa", result)
+                decode_channels_x16(words, scale_byte, swa_cache_format, result)
             elif kind == 2:
                 decode_channels_x16(words, scale_byte, "main", result)
             if cutlass.const_expr(fp8):
@@ -3798,10 +3862,10 @@ def _cache_kernels():
     def staged_exponent(bitmap: cute.Pointer, cached: cute.Pointer | None = None) -> Int32:
         """Smallest power-of-two exponent mapping the bitmaps' decode ceiling onto 448, or 0.
 
-        Both encoders clamp their payload -- ``main`` codes at the E2M1 maximum of
-        6, ``swa`` values at +-448 -- so ``6 * e4m3(byte)`` and ``448 * 2**(byte -
-        127)`` are exact ceilings on what a row can decode to, whichever way the
-        encoder rounded its group scale. Bitmaps without a byte keep the unit scale.
+        MAIN's E2M1 maximum is 6 and SWA's E4M3 maximum is 448, so
+        ``6 * e4m3(byte)`` and ``448 * 2**(byte - 127)`` bound their decoded
+        magnitudes. Ordinary SWA records byte 127 for its unit ceiling without
+        reading a footer. Bitmaps without a byte keep the unit scale.
         ``cached`` is a staging group's recorded main bitmap, which
         stands in for main rows that were not reduced.
         """
@@ -4381,90 +4445,103 @@ def _cache_kernels():
                             b = x[2 * k + 1]
                             x[2 * k] = Float32(cutlass.BFloat16(fma_rn(c, a, -mul_rn(sn, b))))
                             x[2 * k + 1] = Float32(cutlass.BFloat16(fma_rn(sn, a, mul_rn(c, b))))
-                local_max = Float32(0.0)
-                for j in cutlass.range_constexpr(4):
-                    v = x[j]
-                    local_max = max_nan(local_max, cute.arch.fmax(v, -v))
-                offset = 1
-                while offset < job.group_lanes:
-                    local_max = max_nan(
-                        local_max, cute.arch.shuffle_sync_bfly(local_max, offset=offset)
-                    )
-                    offset = offset * 2
-                group_nan = local_max != local_max
-                # Destination addressing.
-                data_base = Int64(0)
-                scale_base = Int64(0)
-                if cutlass.const_expr(job.mode == "row"):
-                    data_base = slot * pool_stride
-                    scale_base = data_base + Int64(job.data_bytes)
-                elif cutlass.const_expr(job.mode == "footer"):
-                    page = slot // page_rows
-                    position = slot % page_rows
-                    base = page * page_rows * Int64(job.data_bytes + job.scale_bytes)
-                    data_base = base + position * Int64(job.data_bytes)
-                    scale_base = (
-                        base + page_rows * Int64(job.data_bytes) + position * Int64(job.scale_bytes)
-                    )
-                else:
-                    data_base = slot * Int64(job.data_bytes)
-                    scale_base = slot * Int64(job.scale_bytes)
-                pool_t = tensor1d(pool, Int64(2**62))
-                scale_t = tensor1d(scale_pool, Int64(2**62))
-                scale_byte = Int32(0)
-                scale = Float32(1.0)
-                # Power-of-two scales divide exactly as a multiply by their reciprocal.
-                inv_scale = Float32(1.0)
-                if cutlass.const_expr(job.cache_format == "main"):
-                    pre = local_max
-                    if pre < Float32(6.0 * 2.0**-9):
-                        pre = Float32(6.0 * 2.0**-9)
-                    scale_byte = f32_to_e4m3_byte(div_rn(pre, Float32(6.0)))
-                    scale = e4m3_to_f32(scale_byte)
-                    if group_nan:
-                        scale_byte = Int32(127)
-                else:
-                    floor = Float32(6.0 * 2.0**-126)
-                    divisor = Float32(6.0)
-                    if cutlass.const_expr(job.cache_format == "swa"):
-                        floor = Float32(1.0e-4)
-                        divisor = Float32(448.0)
-                    clamped = local_max
-                    if clamped < floor:
-                        clamped = floor
-                    exponent = ceil_log2_bits(div_rn(clamped, divisor))
-                    scale_byte = (exponent + 127) & 255
-                    if exponent > 128:
-                        scale_byte = Int32(255)
-                    scale = ue8m0_to_f32(exponent + 127)
-                    inv_scale = ue8m0_to_f32((127 - exponent) & 255)
-                    if exponent >= 128:
-                        inv_scale = Float32(0.0)
-                    if group_nan:
-                        scale_byte = Int32(0)
-                if active:
-                    scaled = cute.make_rmem_tensor((4,), Float32)
-                    for j in cutlass.range_constexpr(4):
-                        if cutlass.const_expr(job.cache_format == "main"):
-                            scaled[j] = div_rn(x[j], scale)
-                        else:
-                            scaled[j] = mul_rn(x[j], inv_scale)
-                    if cutlass.const_expr(job.cache_format == "swa"):
-                        word = f32x2_to_e4m3x2(scaled[0], scaled[1]) | (
-                            f32x2_to_e4m3x2(scaled[2], scaled[3]) << Uint32(16)
+                if cutlass.const_expr(job.cache_format == "swa_fp8"):
+                    if active:
+                        word = f32x2_to_e4m3x2(x[0], x[1]) | (
+                            f32x2_to_e4m3x2(x[2], x[3]) << Uint32(16)
                         )
-                        if group_nan:
-                            word = Uint32(0x7F7F7F7F)
+                        pool_t = tensor1d(pool, Int64(2**62))
                         for j in cutlass.range_constexpr(4):
-                            pool_t[data_base + Int64(first + j)] = Uint8(word >> Uint32(8 * j))
+                            pool_t[slot * pool_stride + Int64(first + j)] = Uint8(
+                                word >> Uint32(8 * j)
+                            )
+                else:
+                    local_max = Float32(0.0)
+                    for j in cutlass.range_constexpr(4):
+                        v = x[j]
+                        local_max = max_nan(local_max, cute.arch.fmax(v, -v))
+                    offset = 1
+                    while offset < job.group_lanes:
+                        local_max = max_nan(
+                            local_max, cute.arch.shuffle_sync_bfly(local_max, offset=offset)
+                        )
+                        offset = offset * 2
+                    group_nan = local_max != local_max
+                    # Destination addressing.
+                    data_base = Int64(0)
+                    scale_base = Int64(0)
+                    if cutlass.const_expr(job.mode == "row"):
+                        data_base = slot * pool_stride
+                        scale_base = data_base + Int64(job.data_bytes)
+                    elif cutlass.const_expr(job.mode == "footer"):
+                        page = slot // page_rows
+                        position = slot % page_rows
+                        base = page * page_rows * Int64(job.data_bytes + job.scale_bytes)
+                        data_base = base + position * Int64(job.data_bytes)
+                        scale_base = (
+                            base
+                            + page_rows * Int64(job.data_bytes)
+                            + position * Int64(job.scale_bytes)
+                        )
                     else:
-                        nibbles = f32x4_to_e2m1x4(scaled[0], scaled[1], scaled[2], scaled[3])
+                        data_base = slot * Int64(job.data_bytes)
+                        scale_base = slot * Int64(job.scale_bytes)
+                    pool_t = tensor1d(pool, Int64(2**62))
+                    scale_t = tensor1d(scale_pool, Int64(2**62))
+                    scale_byte = Int32(0)
+                    scale = Float32(1.0)
+                    # Power-of-two scales divide exactly as a multiply by their reciprocal.
+                    inv_scale = Float32(1.0)
+                    if cutlass.const_expr(job.cache_format == "main"):
+                        pre = local_max
+                        if pre < Float32(6.0 * 2.0**-9):
+                            pre = Float32(6.0 * 2.0**-9)
+                        scale_byte = f32_to_e4m3_byte(div_rn(pre, Float32(6.0)))
+                        scale = e4m3_to_f32(scale_byte)
                         if group_nan:
-                            nibbles = Uint32(0x7777)
-                        pool_t[data_base + Int64(first // 2)] = Uint8(nibbles)
-                        pool_t[data_base + Int64(first // 2) + 1] = Uint8(nibbles >> Uint32(8))
-                    if tid % job.group_lanes == 0:
-                        scale_t[scale_base + Int64(first // job.group)] = Uint8(scale_byte)
+                            scale_byte = Int32(127)
+                    else:
+                        floor = Float32(6.0 * 2.0**-126)
+                        divisor = Float32(6.0)
+                        if cutlass.const_expr(job.cache_format == "swa"):
+                            floor = Float32(1.0e-4)
+                            divisor = Float32(448.0)
+                        clamped = local_max
+                        if clamped < floor:
+                            clamped = floor
+                        exponent = ceil_log2_bits(div_rn(clamped, divisor))
+                        scale_byte = (exponent + 127) & 255
+                        if exponent > 128:
+                            scale_byte = Int32(255)
+                        scale = ue8m0_to_f32(exponent + 127)
+                        inv_scale = ue8m0_to_f32((127 - exponent) & 255)
+                        if exponent >= 128:
+                            inv_scale = Float32(0.0)
+                        if group_nan:
+                            scale_byte = Int32(0)
+                    if active:
+                        scaled = cute.make_rmem_tensor((4,), Float32)
+                        for j in cutlass.range_constexpr(4):
+                            if cutlass.const_expr(job.cache_format == "main"):
+                                scaled[j] = div_rn(x[j], scale)
+                            else:
+                                scaled[j] = mul_rn(x[j], inv_scale)
+                        if cutlass.const_expr(job.cache_format == "swa"):
+                            word = f32x2_to_e4m3x2(scaled[0], scaled[1]) | (
+                                f32x2_to_e4m3x2(scaled[2], scaled[3]) << Uint32(16)
+                            )
+                            if group_nan:
+                                word = Uint32(0x7F7F7F7F)
+                            for j in cutlass.range_constexpr(4):
+                                pool_t[data_base + Int64(first + j)] = Uint8(word >> Uint32(8 * j))
+                        else:
+                            nibbles = f32x4_to_e2m1x4(scaled[0], scaled[1], scaled[2], scaled[3])
+                            if group_nan:
+                                nibbles = Uint32(0x7777)
+                            pool_t[data_base + Int64(first // 2)] = Uint8(nibbles)
+                            pool_t[data_base + Int64(first // 2) + 1] = Uint8(nibbles >> Uint32(8))
+                        if tid % job.group_lanes == 0:
+                            scale_t[scale_base + Int64(first // job.group)] = Uint8(scale_byte)
 
     @dsl_user_op
     def ld_global_bf16x8(address, *, loc=None, ip=None):
@@ -4724,7 +4801,16 @@ def _cache_kernels():
                     else:
                         scaled[j] = mul_rn(x[j], inv_scale)
                 destination = pool.toint() + data_base
-                if cutlass.const_expr(job.cache_format == "swa"):
+                if cutlass.const_expr(job.cache_format == "swa_fp8"):
+                    # Unit-scale E4M3 rows carry no scale footer.
+                    words = []
+                    for quad in cutlass.range_constexpr(4):
+                        words.append(
+                            f32x2_to_e4m3x2(x[4 * quad], x[4 * quad + 1])
+                            | (f32x2_to_e4m3x2(x[4 * quad + 2], x[4 * quad + 3]) << Uint32(16))
+                        )
+                    st_global_b32x4(destination + Int64(first), *words)
+                elif cutlass.const_expr(job.cache_format == "swa"):
                     words = []
                     for quad in cutlass.range_constexpr(4):
                         word = f32x2_to_e4m3x2(scaled[4 * quad], scaled[4 * quad + 1]) | (
@@ -4752,9 +4838,10 @@ def _cache_kernels():
                         halves[0] | (halves[1] << Uint32(16)),
                         halves[2] | (halves[3] << Uint32(16)),
                     )
-                scale_t = tensor1d(scale_pool, Int64(2**62))
-                if (lane * 16) % job.group == 0:
-                    scale_t[scale_base + Int64(first // job.group)] = Uint8(scale_byte)
+                if cutlass.const_expr(job.cache_format != "swa_fp8"):
+                    scale_t = tensor1d(scale_pool, Int64(2**62))
+                    if (lane * 16) % job.group == 0:
+                        scale_t[scale_base + Int64(first // job.group)] = Uint8(scale_byte)
 
     # ----------------------------------------------------- K8: gather rows
 
@@ -5337,9 +5424,14 @@ def _cache_kernels():
             grouped: bool,
             early_trigger: bool = False,
             q_fixup: bool = False,
+            swa_cache_format: str = "swa",
+            swa_aligned: bool = True,
         ):
             self.early_trigger = early_trigger
             self.q_fixup = q_fixup
+            _format_geometry(swa_cache_format, 512)
+            self.swa_cache_format = swa_cache_format
+            self.swa_aligned = swa_aligned
             self.fp8 = fp8
             self.rows_per_cta = rows_per_cta
             self.dedup = dedup
@@ -5581,7 +5673,16 @@ def _cache_kernels():
             kinds = cute.make_rmem_tensor((per_warp,), Int32)
             scales = cute.make_rmem_tensor((per_warp,), Int32)
             words = [cute.make_rmem_tensor((4,), Uint32) for _ in range(per_warp)]
-            load_rows_x16(kind, row_base, per_warp, kinds, scales, words)
+            load_rows_x16(
+                kind,
+                row_base,
+                per_warp,
+                kinds,
+                scales,
+                words,
+                self.swa_cache_format,
+                self.swa_aligned,
+            )
             quant_state = staging_quant(quant_scale, self.fp8)
             result = cute.make_rmem_tensor((16,), Float32)
             packed = cute.make_rmem_tensor((4,), Uint32)
@@ -5606,6 +5707,7 @@ def _cache_kernels():
                         element,
                         result,
                         packed,
+                        self.swa_cache_format,
                     )
 
         @cute.jit
@@ -6261,9 +6363,11 @@ def _cache_kernels():
         ROWS_PER_WARP = 4
         ROWS = THREADS // 32 * ROWS_PER_WARP
 
-        def __init__(self, fp8: bool):
-            _format_geometry("swa", 512)
+        def __init__(self, fp8: bool, swa_cache_format: str = "swa", swa_aligned: bool = True):
+            _format_geometry(swa_cache_format, 512)
             _format_geometry("main", 512)
+            self.swa_cache_format = swa_cache_format
+            self.swa_aligned = swa_aligned
             self.fp8 = fp8
 
         @cute.jit
@@ -6378,7 +6482,7 @@ def _cache_kernels():
             slot = Int64(-1)
             if request < request_count:
                 logical = row - Int64(offsets_t[request])
-                if cutlass.const_expr(cache_format == "swa"):
+                if cutlass.const_expr(cache_format in ("swa", "swa_fp8")):
                     logical = logical + Int64(tensor1d(starts, Int64(request_count))[request])
                 # Bank rows and their logical positions fit 32-bit division.
                 if (logical >= 0) & (logical < Int64(2**31 - 1)):
@@ -6498,7 +6602,7 @@ def _cache_kernels():
                             swa_page_stride,
                             swa_page_size,
                             request_count,
-                            "swa",
+                            self.swa_cache_format,
                         )
                         if slot >= 0:
                             kind = Int32(1)
@@ -6507,7 +6611,16 @@ def _cache_kernels():
             kinds = cute.make_rmem_tensor((self.ROWS_PER_WARP,), Int32)
             scales = cute.make_rmem_tensor((self.ROWS_PER_WARP,), Int32)
             words = [cute.make_rmem_tensor((4,), Uint32) for _ in range(self.ROWS_PER_WARP)]
-            load_rows_x16(kind, row_base, self.ROWS_PER_WARP, kinds, scales, words)
+            load_rows_x16(
+                kind,
+                row_base,
+                self.ROWS_PER_WARP,
+                kinds,
+                scales,
+                words,
+                self.swa_cache_format,
+                self.swa_aligned,
+            )
             quant_state = staging_quant(quant_scale, self.fp8)
             result = cute.make_rmem_tensor((16,), Float32)
             packed = cute.make_rmem_tensor((4,), Uint32)
@@ -6524,6 +6637,7 @@ def _cache_kernels():
                         element,
                         result,
                         packed,
+                        self.swa_cache_format,
                     )
 
     class SharedRowScaleKernel(SharedDecodeKernel):
@@ -6622,9 +6736,10 @@ def _cache_kernels():
                 tensor1d(selected, Int64(2**62))[row] = word
 
     class SharedScaleKernel(SharedDecodeKernel):
-        """Reduce the group-scale bytes of every marked SWA bank row, and the main rows'
-        byte that the group's compaction folded into ``selected[0]``, into the staging bitmap.
+        """Reduce marked SWA rows' ceilings and the main fold into the staging bitmap.
 
+        Ordinary SWA contributes byte 127 without a footer read; legacy SWA
+        reads its group scales. The main fold is held in ``selected[0]``.
         The marked rows are the ones ``SharedDecodeKernel`` decodes, resolved
         through the same ``_slot``, so the scale bounds exactly what staging
         writes while each row is read once. One thread per SWA bank row; marks
@@ -6633,7 +6748,9 @@ def _cache_kernels():
 
         THREADS = 256
 
-        def __init__(self):
+        def __init__(self, swa_cache_format: str = "swa"):
+            _format_geometry(swa_cache_format, _STAGE_HEAD_DIM)
+            self.swa_cache_format = swa_cache_format
             self.limits = (_SCALE_BYTE_LIMITS["swa"], _SCALE_BYTE_LIMITS["main"])
             self.indices = (_SCALE_SOURCE_SLOTS["swa"], _SCALE_SOURCE_SLOTS["main"])
 
@@ -6749,12 +6866,15 @@ def _cache_kernels():
                         swa_page_stride,
                         swa_page_size,
                         request_count,
-                        "swa",
+                        self.swa_cache_format,
                     )
                     if slot >= 0:
-                        largest[0] = largest_scale_byte(
-                            swa_pool, slot * swa_stride + 512, 4, self.limits[0]
-                        )
+                        if cutlass.const_expr(self.swa_cache_format == "swa_fp8"):
+                            largest[0] = Int32(127)
+                        else:
+                            largest[0] = largest_scale_byte(
+                                swa_pool, slot * swa_stride + 512, 4, self.limits[0]
+                            )
             for source in cutlass.range_constexpr(2):
                 value = warp_max(largest[source])
                 if tid % 32 == 0:
@@ -6780,11 +6900,11 @@ def _cache_kernels():
         Blocks ``[0, q_blocks)`` raise Q's amax word, and each following block
         reduces 128 selected ``swa`` and then ``main`` columns of one query into
         that format's bitmap; ``StageScaleFinalizeKernel`` turns them into the
-        scale. Both persistent encodings store non-negative group scales in the
-        tail of each packed row, so the largest scale byte of the selected rows
-        bounds every magnitude staging can decode; reading only that tail costs 32
-        or 16 bytes per row. The reduction records which byte values occur rather
-        than their maximum, so blocks combine with ``atomic_or``. A BF16 with its
+        scale. Legacy SWA and MAIN store non-negative group scales in each row's
+        tail, which bounds its decoded magnitude and costs 16 or 32 bytes to read.
+        Ordinary SWA instead records byte 127 only for selected valid rows,
+        without reading payload or a footer. The bitmaps combine with ``atomic_or``.
+        A BF16 with its
         sign bit cleared orders as an integer, NaN above infinity above every
         finite magnitude, so the integer maximum of Q's sign-cleared halves,
         shifted into FP32 position, is exactly ``torch.linalg.vector_norm(q, inf)``.
@@ -6804,6 +6924,7 @@ def _cache_kernels():
             cached_main: bool = False,
             mapped: bool = False,
             pdl: bool = False,
+            swa_cache_format: str = "swa",
         ):
             self.has_swa = has_swa
             self.has_main = has_main
@@ -6814,12 +6935,12 @@ def _cache_kernels():
             self.pdl = pdl
             # Per format: scale tail offset, its 4-byte words and the exclusive byte limit.
             self.geometry = {}
-            for cache_format in ("swa", "main"):
+            for source, cache_format in (("swa", swa_cache_format), ("main", "main")):
                 _, data_bytes, scale_bytes = _format_geometry(cache_format, _STAGE_HEAD_DIM)
-                self.geometry[cache_format] = (
+                self.geometry[source] = (
                     data_bytes,
                     scale_bytes // 4,
-                    _SCALE_BYTE_LIMITS[cache_format],
+                    _SCALE_BYTE_LIMITS[source],
                 )
 
         @cute.jit
@@ -6932,9 +7053,13 @@ def _cache_kernels():
                         visible=Int64(tensor1d(visible, Int64(2**62))[query]),
                     )
                 if (slot >= 0) & (slot < capacity):
-                    largest = largest_scale_byte(
-                        pool, slot * pool_stride + scale_base, words, limit
-                    )
+                    if cutlass.const_expr(words == 0):
+                        # Ordinary SWA has a unit ceiling, but no scale bytes.
+                        largest = Int32(127)
+                    else:
+                        largest = largest_scale_byte(
+                            pool, slot * pool_stride + scale_base, words, limit
+                        )
             return largest
 
         @cute.kernel
@@ -7170,7 +7295,7 @@ def _cache_kernels():
                 bitmap_t[tid] = Int32(0)
 
     class StageQueryKernel:
-        """Quantize generation Q with the staging scale (``static_quantize_e4m3_per_tensor``).
+        """Quantize BF16 Q with a live descale (``static_quantize_e4m3_per_tensor``).
 
         Each value is widened to FP32, multiplied by ``1 / scale`` and rounded with
         ``cvt.rn.satfinite``, byte for byte as the native op. A thread converts
@@ -7187,7 +7312,7 @@ def _cache_kernels():
             q: cute.Pointer,  # BF16 [chunks * 16], 16-byte aligned
             output: cute.Pointer,  # E4M3 [chunks * 16], 16-byte aligned
             scale: cute.Pointer,  # float32 [1]
-            chunks: Int32,
+            chunks: Int64,
             blocks: Int32,
             stream: cuda.CUstream,
         ):
@@ -7201,18 +7326,17 @@ def _cache_kernels():
             q: cute.Pointer,
             output: cute.Pointer,
             scale: cute.Pointer,
-            chunks: Int32,
+            chunks: Int64,
             blocks: Int32,
         ):
             tid, _, _ = cute.arch.thread_idx()
             block, _, _ = cute.arch.block_idx()
             factor = div_rn(Float32(1.0), Float32(tensor1d(scale, Int64(1))[0]))
-            step = blocks * Int32(self.THREADS)
+            step = Int64(blocks) * Int64(self.THREADS)
             words = [cute.make_rmem_tensor((8,), Uint32) for _ in range(self.UNROLL)]
             packed = cute.make_rmem_tensor((4,), Uint32)
-            for first in cutlass.range(
-                block * Int32(self.THREADS) + Int32(tid), chunks, step * self.UNROLL
-            ):
+            first = Int64(block) * Int64(self.THREADS) + Int64(tid)
+            while first < chunks:
                 for u in cutlass.range_constexpr(self.UNROLL):
                     chunk = first + u * step
                     if chunk < chunks:
@@ -7235,6 +7359,7 @@ def _cache_kernels():
                                 value = value | (f32x2_to_e4m3x2(low, high) << (16 * half))
                             packed[word] = value
                         store_u32x4(output, Int64(chunk) * 16, packed)
+                first = first + step * self.UNROLL
 
     class Namespace:
         pass
@@ -7280,7 +7405,9 @@ class QuantizeJobSpec:
 
     def __post_init__(self):
         group, data_bytes, scale_bytes = _format_geometry(self.cache_format, self.head_dim)
-        if self.mode not in ("row", "footer", "split"):
+        if self.mode not in ("row", "footer", "split") or (
+            self.cache_format == "swa_fp8" and self.mode != "row"
+        ):
             raise ValueError("Unsupported CSA2 scatter mode")
         if self.rope_dim < 0 or self.rope_dim > self.head_dim or self.rope_dim % 4:
             raise ValueError("CSA2 RoPE width must be a multiple of four channels")
@@ -7289,6 +7416,19 @@ class QuantizeJobSpec:
         object.__setattr__(self, "data_bytes", data_bytes)
         object.__setattr__(self, "scale_bytes", scale_bytes)
         object.__setattr__(self, "threads", max(32, -(-(self.head_dim // 4) // 32) * 32))
+
+
+@functools.cache
+def _job_spec(
+    cache_format: str,
+    head_dim: int,
+    mode: str,
+    identity: bool = False,
+    norm: bool = False,
+    rope_dim: int = 0,
+) -> QuantizeJobSpec:
+    """Interned job specs: they are immutable, and building one validates its geometry."""
+    return QuantizeJobSpec(cache_format, head_dim, mode, identity, norm, rope_dim)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -7332,6 +7472,8 @@ def _fusion_args(values: torch.Tensor, norm, rope):
     rows, head_dim = values.shape
     weight, eps = (None, 0.0) if norm is None else norm
     positions, cos_sin, rope_dim = (None, None, 0) if rope is None else rope
+    transforms = (tensor for tensor in (weight, positions, cos_sin) if tensor is not None)
+    _check_cuda_devices(values, *transforms)
     if weight is not None:
         _check(weight.dtype == torch.bfloat16 and weight.numel() == head_dim, "norm weight")
         weight = weight.contiguous()
@@ -7363,6 +7505,7 @@ def row_job(
     ``norm=(weight, eps)`` normalizes and ``rope=(positions, cos_sin, rope_dim)``
     rotates the rows inside the launch. ``None`` when there are no rows.
     """
+    _check_cuda_devices(pool, slots, values)
     rows, head_dim = values.shape
     _, data_bytes, scale_bytes = _format_geometry(cache_format, head_dim)
     if rows == 0:
@@ -7375,7 +7518,7 @@ def row_job(
         values, norm, rope
     )
     return QuantizeJob(
-        QuantizeJobSpec(cache_format, head_dim, "row", norm=has_norm, rope_dim=rope_dim),
+        _job_spec(cache_format, head_dim, "row", norm=has_norm, rope_dim=rope_dim),
         (
             _ptr(pool, align=1),
             _ptr(pool, align=1),
@@ -7407,6 +7550,7 @@ def footer_job(
     rope=None,
 ) -> QuantizeJob | None:
     """Job publishing BF16 128D index rows into native page-footer pages (optionally norm + RoPE)."""
+    _check_cuda_devices(pages, slots, values)
     rows, head_dim = values.shape
     _, data_bytes, scale_bytes = _format_geometry("index", head_dim)
     if rows == 0:
@@ -7420,7 +7564,7 @@ def footer_job(
         values, norm, rope
     )
     return QuantizeJob(
-        QuantizeJobSpec("index", head_dim, "footer", norm=has_norm, rope_dim=rope_dim),
+        _job_spec("index", head_dim, "footer", norm=has_norm, rope_dim=rope_dim),
         (
             _ptr(flat, align=1),
             _ptr(flat, align=1),
@@ -7445,6 +7589,7 @@ def footer_job(
 
 def split_job(values: torch.Tensor, data: torch.Tensor, scales: torch.Tensor) -> QuantizeJob | None:
     """Job quantizing ``values[rows, 128]`` into separate ``data[rows, 64]`` and ``scales[rows, 4]`` bytes."""
+    _check_cuda_devices(values, data, scales)
     rows, head_dim = values.shape
     _, data_bytes, scale_bytes = _format_geometry("index", head_dim)
     if rows == 0:
@@ -7464,7 +7609,7 @@ def split_job(values: torch.Tensor, data: torch.Tensor, scales: torch.Tensor) ->
     # slot array, so the slot / norm / rope pointers are unread placeholders.
     values_ptr = _ptr(values, align=2)
     return QuantizeJob(
-        QuantizeJobSpec("index", head_dim, "split", identity=True),
+        _job_spec("index", head_dim, "split", identity=True),
         (
             _ptr(data, align=1),
             _ptr(scales, align=1),
@@ -7494,7 +7639,10 @@ def quantize_scatter_jobs(jobs, *, release_after_wait: bool = False) -> None:
     if not jobs:
         return
     device = jobs[0].device
-    _check(all(job.device == device for job in jobs), "quantize jobs must share a device")
+    _check(
+        device.type == "cuda" and all(job.device == device for job in jobs),
+        "quantize jobs must share a CUDA device",
+    )
     ns = _cache_kernels()
     args = []
     for slot in range(_MAX_QUANTIZE_JOBS):
@@ -7578,6 +7726,7 @@ def gather_dequant_rows(
 
 def scatter_packed_rows(pool: torch.Tensor, slots: torch.Tensor, rows: torch.Tensor) -> None:
     """Copy packed byte rows into ``pool[slot, :]``; padding slots never write."""
+    _check_cuda_devices(pool, slots, rows)
     if rows.shape[0] == 0:
         return
     _check(
@@ -7614,6 +7763,7 @@ def scatter_packed_index_rows(
     scale_bytes: int,
 ) -> None:
     """Scatter packed ``[n, data + scale]`` index rows into flat page-footer pages."""
+    _check_cuda_devices(flat, slots, rows)
     if rows.shape[0] == 0:
         return
     _check(rows.stride(1) == 1 and rows.shape[1] == data_bytes + scale_bytes, "packed index rows")
@@ -7776,11 +7926,11 @@ def derive_stage_kv_scales(
     """Fill ``dequant``/``quant`` with a range-aware power-of-two staging KV scale.
 
     ``sources`` holds the ``(pool, slots, cache_format)`` triples whose rows the
-    staging pass will decode. Staging expands the persistent per-group scales back
-    to real magnitudes, so a unit per-tensor scale saturates every channel above
-    448; the bound here is read from those same group-scale bytes, which makes it
-    track the forward's actual range instead of a calibrated constant. ``bitmap``
-    is a 17-word int32 scratch holding one presence bitmap per format and Q's
+    staging pass will decode. Legacy SWA and MAIN bounds come from their
+    persistent group-scale bytes. Selected valid ordinary SWA rows instead
+    contribute a unit ceiling, without reading payload or a footer. The combined
+    bound tracks the live selections instead of a calibrated constant. ``bitmap``
+    is a 17-word int32 scratch holding one presence bitmap per source and Q's
     amax bits, zeroed unless a caller filled the bitmaps beforehand; the finalize
     kernel clears it again once read. Both outputs are written in place on the
     device, so CUDA Graph replay observes the live value. When ``main_mapping``
@@ -7809,6 +7959,7 @@ def derive_stage_kv_scales(
     stream waits for ``q_ready`` (the event of Q's producer) only before that finalize,
     so the row reduction does not wait for Q.
     """
+
     _check(minimum <= maximum, "CSA2 staging scale bounds must not be inverted")
     _check(
         q_word is None
@@ -7862,17 +8013,23 @@ def derive_stage_kv_scales(
     )
     mapping_args = unmapped_args
     mapped = False
+    swa_cache_format = "swa"
     for pool, slots, cache_format in sources:
+        _check(cache_format in ("swa", "swa_fp8", "main"), "CSA2 staging scale source format")
+        if cache_format != "main":
+            swa_cache_format = cache_format
         if reuse_main and cache_format == "main":
             continue
         _, data_bytes, scale_bytes = _format_geometry(cache_format, _STAGE_HEAD_DIM)
         _check(
             pool.ndim == 2
+            and pool.dtype == torch.uint8
             and pool.shape[1] == data_bytes + scale_bytes
             and pool.stride(1) == 1
-            and pool.data_ptr() % 4 == 0
-            and pool.stride(0) % 4 == 0,
-            "CSA2 staging scale sources must be 4-byte aligned packed rows with unit column stride",
+            and (
+                cache_format == "swa_fp8" or (pool.data_ptr() % 4 == 0 and pool.stride(0) % 4 == 0)
+            ),
+            "CSA2 staging scale sources need packed rows with aligned scale bytes",
         )
         rows = int(slots.shape[0])
         width = int(slots.shape[1]) if slots.ndim > 1 else 0
@@ -7883,7 +8040,7 @@ def derive_stage_kv_scales(
             mapped = True
             mapping_args = (_ptr(requests, align=8), _ptr(visible, align=8), *table_args)
         column_blocks = -(-width // threads)
-        args[cache_format] = (
+        args["main" if cache_format == "main" else "swa"] = (
             _ptr(pool, align=1),
             _ptr(slots, align=8 if slots.dtype == torch.int64 else 4),
             rows * column_blocks,
@@ -7913,9 +8070,25 @@ def derive_stage_kv_scales(
     if (q_blocks if row_q else 0) + swa_geometry[0] + main_geometry[0]:
         q_cached = cached and not (has_swa or has_main)
         _launch(
-            ("stage_scales", has_swa, has_main, mapped, row_q, q_cached, pdl, device.index),
+            (
+                "stage_scales",
+                has_swa,
+                has_main,
+                mapped,
+                row_q,
+                q_cached,
+                pdl,
+                swa_cache_format,
+                device.index,
+            ),
             lambda: ns.StageScalesKernel(
-                has_swa, has_main, row_q, q_cached, mapped=mapped, pdl=pdl
+                has_swa,
+                has_main,
+                row_q,
+                q_cached,
+                mapped=mapped,
+                pdl=pdl,
+                swa_cache_format=swa_cache_format,
             ),
             _ptr(words, align=16),
             swa_pool,
@@ -7935,8 +8108,20 @@ def derive_stage_kv_scales(
     if gate:
         pool, slots, *geometry = (*placeholder, 0, 1, 0, 0, 0, 0, 0)
         _launch(
-            ("stage_scales", False, False, False, True, cached, pdl, device.index),
-            lambda: ns.StageScalesKernel(False, False, True, cached, pdl=pdl),
+            (
+                "stage_scales",
+                False,
+                False,
+                False,
+                True,
+                cached,
+                pdl,
+                swa_cache_format,
+                device.index,
+            ),
+            lambda: ns.StageScalesKernel(
+                False, False, True, cached, pdl=pdl, swa_cache_format=swa_cache_format
+            ),
             _ptr(words, align=16),
             pool,
             slots,
@@ -8006,6 +8191,7 @@ def stage_selected_rows(
     metadata,
     scratch,
     *,
+    swa_cache_format: Literal["swa", "swa_fp8"] = "swa",
     compact=True,
     main_logical=None,
     main_mapping=None,
@@ -8016,7 +8202,7 @@ def stage_selected_rows(
     dedup=False,
     bank_extra=0,
     q_fixup=None,
-):
+) -> None:
     """Compact selections (once per staging group) and decode them into the staging pools.
 
     Main selections are either physical ``main_slots`` or ``main_logical``
@@ -8033,6 +8219,15 @@ def stage_selected_rows(
     ``q_fixup = (unit-scale E4M3 Q, scale)``: the staging launch also runs
     ``rescale_fp8_query`` of that Q.
     """
+    _check(swa_cache_format in ("swa", "swa_fp8"), "CSA2 SWA cache format")
+    _, data_bytes, scale_bytes = _format_geometry(swa_cache_format, _STAGE_HEAD_DIM)
+    _check(
+        swa_pool.ndim == 2
+        and swa_pool.dtype == torch.uint8
+        and swa_pool.shape[1] == data_bytes + scale_bytes
+        and swa_pool.stride(1) == 1,
+        "CSA2 SWA pool must match its persistent format",
+    )
     count = metadata.num_tokens
     capacity = metadata.num_sparse_topk
     fp8 = metadata.swa_pool.dtype == torch.float8_e4m3fn
@@ -8116,12 +8311,11 @@ def stage_selected_rows(
                 _stream(device),
             )
     extra_rows = int(metadata.extra_pool.shape[1])
+    swa_aligned = swa_pool.data_ptr() % 16 == 0 and swa_pool.stride(0) % 16 == 0
     _check(
-        swa_pool.data_ptr() % 16 == 0
-        and swa_pool.stride(0) % 16 == 0
-        and main_pool.data_ptr() % 8 == 0
-        and main_pool.stride(0) % 8 == 0,
-        "CSA2 staging needs 16-byte aligned SWA rows and 8-byte aligned main rows",
+        (swa_aligned or swa_cache_format == "swa_fp8")
+        and (not has_main or (main_pool.data_ptr() % 8 == 0 and main_pool.stride(0) % 8 == 0)),
+        "CSA2 staging needs aligned scaled SWA rows and 8-byte aligned main rows",
     )
     # A warp stages rows_per_cta / 4 rows. Batch eight rows per warp only when the grid
     # still covers every SM several times over; small decode batches keep one row per warp
@@ -8132,7 +8326,7 @@ def stage_selected_rows(
     # The layers of a staging group stage the same main rows. While this tile's pools
     # still hold the rows an earlier layer of the group staged in this forward, only
     # the first 128 rows, which hold every SWA row, are staged again.
-    token = (id(scratch), scratch.get("serial"))
+    token = (id(scratch), scratch.get("serial"), swa_cache_format)
     reuse = has_main and not compact and metadata.__dict__.get("_csa2_staged_group") == token
     metadata._csa2_staged_group = token
     staged, slot = placeholder, 0
@@ -8165,8 +8359,30 @@ def stage_selected_rows(
             fixup_q.numel() // 16,
         )
     _launch(
-        ("stage_dequant", fp8, rows_per_cta, dedup, reuse, grouped, early, fixup, device.index),
-        lambda: ns.StageDequantKernel(fp8, rows_per_cta, dedup, reuse, grouped, early, fixup),
+        (
+            "stage_dequant",
+            swa_cache_format,
+            swa_aligned,
+            fp8,
+            rows_per_cta,
+            dedup,
+            reuse,
+            grouped,
+            early,
+            fixup,
+            device.index,
+        ),
+        lambda: ns.StageDequantKernel(
+            fp8,
+            rows_per_cta,
+            dedup,
+            reuse,
+            grouped,
+            early_trigger=early,
+            q_fixup=fixup,
+            swa_cache_format=swa_cache_format,
+            swa_aligned=swa_aligned,
+        ),
         _ptr(swa_pool, align=1),
         _ptr(main_pool, align=1),
         _ptr(swa_slots, align=8),
@@ -8216,6 +8432,7 @@ def stage_shared_rows(
     metadata,
     plan,
     *,
+    swa_cache_format: Literal["swa", "swa_fp8"] = "swa",
     main_mapping=None,
     kv_scale_orig_quant=None,
     kv_scale_quant_orig=None,
@@ -8224,7 +8441,7 @@ def stage_shared_rows(
     scale=None,
     compact=True,
     parity=0,
-):
+) -> None:
     """Decode selected logical rows once into a shared native KV bank.
 
     ``plan`` supplies per-request logical domains/page tables and per-query
@@ -8242,6 +8459,15 @@ def stage_shared_rows(
     compaction folded, then Q's amax when they need more than ``minimum``, are reduced before
     decode into ``metadata``'s staging-scale buffers.
     """
+    _check(swa_cache_format in ("swa", "swa_fp8"), "CSA2 SWA cache format")
+    _, data_bytes, scale_bytes = _format_geometry(swa_cache_format, _STAGE_HEAD_DIM)
+    _check(
+        swa_pool.ndim == 2
+        and swa_pool.dtype == torch.uint8
+        and swa_pool.shape[1] == data_bytes + scale_bytes
+        and swa_pool.stride(1) == 1,
+        "CSA2 SWA pool must match its persistent format",
+    )
     count = metadata.num_tokens
     capacity = metadata.num_sparse_topk
     bank = metadata.shared_pool
@@ -8275,12 +8501,11 @@ def stage_shared_rows(
     placeholder = metadata.prepared_counter
     q_dequant = q_scale_quant_orig if fp8 else placeholder
     quant = kv_scale_orig_quant if fp8 else placeholder
+    swa_aligned = swa_pool.data_ptr() % 16 == 0 and swa_pool.stride(0) % 16 == 0
     _check(
-        swa_pool.data_ptr() % 16 == 0
-        and swa_pool.stride(0) % 16 == 0
-        and main_pool.data_ptr() % 8 == 0
-        and main_pool.stride(0) % 8 == 0,
-        "CSA2 shared staging needs 16-byte aligned SWA rows and 8-byte aligned main rows",
+        (swa_aligned or swa_cache_format == "swa_fp8")
+        and (not has_main or (main_pool.data_ptr() % 8 == 0 and main_pool.stride(0) % 8 == 0)),
+        "CSA2 shared staging needs aligned scaled SWA rows and 8-byte aligned main rows",
     )
     for pages in (plan.swa_pages, plan.main_pages):
         if pages is not None:
@@ -8408,8 +8633,8 @@ def stage_shared_rows(
         q, q_shared, minimum, maximum = scale
         bitmap = metadata._csa2_stage_scale_bitmap
         _launch(
-            ("shared_scale", device.index),
-            ns.SharedScaleKernel,
+            ("shared_scale", swa_cache_format, device.index),
+            lambda: ns.SharedScaleKernel(swa_cache_format),
             *row_args,
             _ptr(bitmap),
             *geometry_args,
@@ -8426,8 +8651,8 @@ def stage_shared_rows(
             maximum=maximum,
         )
     _launch(
-        ("shared_decode", fp8, device.index),
-        lambda: ns.SharedDecodeKernel(fp8),
+        ("shared_decode", swa_cache_format, swa_aligned, fp8, device.index),
+        lambda: ns.SharedDecodeKernel(fp8, swa_cache_format, swa_aligned),
         *row_args,
         _ptr(bank, align=8),
         _ptr(quant),
@@ -8703,9 +8928,12 @@ def supports_packed_attention(
     sink,
     scale,
     *,
+    swa_cache_format: Literal["swa", "swa_fp8"] = "swa",
     position_ids=None,
     rotary_cos_sin=None,
-):
+) -> bool:
+    if swa_cache_format not in ("swa", "swa_fp8"):
+        return False
     if not isinstance(q, torch.Tensor) or not q.is_cuda or q.ndim != 3:
         return False
     no_main = main_pool is None and main_indices is None
@@ -8744,7 +8972,7 @@ def supports_packed_attention(
             p.dtype == torch.uint8 and p.ndim == 2 and p.shape[0] > 0 and p.stride(1) == 1
             for p in pools
         )
-        and swa_pool.shape[1] == 528
+        and swa_pool.shape[1] == (512 if swa_cache_format == "swa_fp8" else 528)
         and (no_main or main_pool.shape[1] == 288)
         and all(
             i.dtype in (torch.int32, torch.int64)
@@ -8783,6 +9011,9 @@ def _packed_attention_kernel_type():
     from cutlass.cute.nvgpu import warp
 
     class PackedAttention:
+        def __init__(self, swa_cache_format: str = "swa") -> None:
+            self.swa_cache_format = swa_cache_format
+
         @cute.jit
         def __call__(
             self,
@@ -8876,10 +9107,10 @@ def _packed_attention_kernel_type():
                     if column < si.shape[1]:
                         slot = cutlass.Int64(si[row, column])
                         if (slot >= 0) & (slot < swa.shape[0]):
-                            exponent = cutlass.Int32(swa[slot, 512 + d // 32]) - 127
-                            value = cutlass.Float32(swa_fp8[slot, d]) * cute.exp2(
-                                cutlass.Float32(exponent)
-                            )
+                            value = cutlass.Float32(swa_fp8[slot, d])
+                            if cutlass.const_expr(self.swa_cache_format == "swa"):
+                                exponent = cutlass.Int32(swa[slot, 512 + d // 32]) - 127
+                                value = value * cute.exp2(cutlass.Float32(exponent))
                     elif column < si.shape[1] + mi.shape[1]:
                         slot = cutlass.Int64(mi[row, column - si.shape[1]])
                         if (slot >= 0) & (slot < main.shape[0]):
@@ -9012,11 +9243,12 @@ def packed_sparse_attention(
     sink,
     scale,
     *,
+    swa_cache_format: Literal["swa", "swa_fp8"] = "swa",
     output=None,
     workspace=None,
     position_ids=None,
     rotary_cos_sin=None,
-):
+) -> torch.Tensor:
     """Run direct packed attention; invalid indices have zero probability.
 
     Optional CUDA positions[Q] and FP32 cosine/sine[max_position,2,32]
@@ -9031,6 +9263,7 @@ def packed_sparse_attention(
         main_indices,
         sink,
         scale,
+        swa_cache_format=swa_cache_format,
         position_ids=position_ids,
         rotary_cos_sin=rotary_cos_sin,
     ):
@@ -9087,6 +9320,7 @@ def packed_sparse_attention(
     )
     key = (
         q.device.index,
+        swa_cache_format,
         tuple(None if t is None else (tuple(t.shape), tuple(t.stride()), t.dtype) for t in tensors),
     )
     views = tuple(None if t is None else from_dlpack(t.detach(), assumed_align=1) for t in tensors)
@@ -9095,7 +9329,10 @@ def packed_sparse_attention(
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm CSA2 packed attention before CUDA Graph capture")
         _PACKED_ATTENTION_COMPILED[key] = cute.compile(
-            _packed_attention_kernel_type()(), *views, cutlass.Float32(scale), stream
+            _packed_attention_kernel_type()(swa_cache_format),
+            *views,
+            cutlass.Float32(scale),
+            stream,
         )
     _PACKED_ATTENTION_COMPILED[key](*views, cutlass.Float32(scale), stream)
     return output

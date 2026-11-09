@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # KV Cache System
 
 The KV cache stores previously computed key-value pairs for reuse during generation in order to avoid redundant calculations. The TensorRT LLM KV cache system also supports reuse across requests and uses a suite of tools like offloading and prioritized eviction to increase reuse. It supports variable attention window sizes and Multi-Head Attention (MHA) optimization techniques such as MQA and GQA.
@@ -376,6 +379,20 @@ only the currently validated image-routing support. See the
 [OpenEngine image routing contract](source:tensorrt_llm/grpc/openengine/README.md#image-routing-metadata)
 for capability requirements and consumer handling.
 
+
+### DeepSeek v4.1 SWA Cache Dtype
+
+DeepSeek v4.1 CSA2 selects persistent sliding-window attention (SWA) storage from
+`KvCacheConfig.dtype`. With explicit `fp8`, each 512-dimensional SWA row contains
+512 E4M3 bytes with a unit persistent scale and no scale footer. With
+`fp8_ds_mla`, SWA retains the MXFP8 layout: 512 E4M3 payload bytes and 16 UE8M0
+scale bytes (one per 32 channels). Omitted / `auto` and `bfloat16` retain that
+legacy 528-byte SWA layout.
+
+This choice does not change the NVFP4 MAIN cache or INDEX layout. Attention
+compute/staging precision and MXFP8 projection quantization are independent of
+the persistent SWA encoding. Disaggregated context and generation instances must
+use matching SWA layouts; transfers do not convert between them.
 
 ### Enable Offloading to Host Memory
 

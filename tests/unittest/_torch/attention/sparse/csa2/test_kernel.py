@@ -5,6 +5,7 @@
 import math
 import subprocess
 import sys
+from bisect import bisect_left
 from pathlib import Path
 
 import pytest
@@ -30,10 +31,15 @@ skip_pre_blackwell = pytest.mark.skipif(
 )
 
 
-def _inputs(main_count=73, dtype=torch.int64):
+def _inputs(main_count=73, dtype=torch.int64, *, swa_cache_format="swa"):
     torch.manual_seed(7401)
     q = torch.randn(2, 32, 512, device="cuda", dtype=torch.bfloat16)
-    swa = pack_rows(torch.randn(141, 512, device="cuda", dtype=torch.bfloat16), "swa")
+    swa_values = torch.randn(141, 512, device="cuda", dtype=torch.bfloat16)
+    swa = (
+        _e4m3_expected_bytes(swa_values)
+        if swa_cache_format == "swa_fp8"
+        else pack_rows(swa_values, "swa")
+    )
     owner = torch.empty(103, 356, device="cuda", dtype=torch.uint8)
     main = owner[:, :288]
     main.copy_(pack_rows(torch.randn(103, 512, device="cuda", dtype=torch.bfloat16), "main"))
@@ -49,11 +55,14 @@ def _inputs(main_count=73, dtype=torch.int64):
     return q, swa, main, si, mi, sink, 512**-0.5
 
 
-def _reference(q, swa, main, si, mi, sink, scale):
+def _reference(q, swa, main, si, mi, sink, scale, *, swa_cache_format="swa"):
     parts, masks = [], []
-    for pool, indices, fmt in ((swa, si, "swa"), (main, mi, "main")):
+    for pool, indices, fmt in ((swa, si, swa_cache_format), (main, mi, "main")):
         valid = (indices >= 0) & (indices < pool.shape[0])
-        values = unpack_rows(pool[indices.clamp(0, pool.shape[0] - 1).long()], 512, fmt)
+        selected = pool[indices.clamp(0, pool.shape[0] - 1).long()]
+        values = (
+            _e4m3_expected_values(selected) if fmt == "swa_fp8" else unpack_rows(selected, 512, fmt)
+        )
         parts.append(torch.where(valid[..., None], values, 0))
         masks.append(valid)
     kv = torch.cat(parts, 1).float()
@@ -69,12 +78,15 @@ def _reference(q, swa, main, si, mi, sink, scale):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("main_count", [0, 73])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_packed_attention_parity(main_count, dtype):
+@pytest.mark.parametrize("swa_cache_format", ["swa", "swa_fp8"])
+def test_packed_attention_parity(main_count, dtype, swa_cache_format):
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("SM100 packed attention")
-    args = _inputs(main_count, dtype)
-    actual = packed_sparse_attention(*args)
-    torch.testing.assert_close(actual, _reference(*args), atol=0.016, rtol=0.016)
+    args = _inputs(main_count, dtype, swa_cache_format=swa_cache_format)
+    actual = packed_sparse_attention(*args, swa_cache_format=swa_cache_format)
+    torch.testing.assert_close(
+        actual, _reference(*args, swa_cache_format=swa_cache_format), atol=0.016, rtol=0.016
+    )
 
 
 @skip_pre_blackwell
@@ -113,6 +125,45 @@ def test_packed_attention_graph_refresh():
     args[4][1].fill_(0)
     graph.replay()
     torch.testing.assert_close(output, _reference(*args), atol=0.016, rtol=0.016)
+    assert torch.count_nonzero(output[0]) == 0
+
+
+@skip_pre_blackwell
+def test_packed_attention_format_specializations_and_live_payload():
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import supports_packed_attention
+
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100 packed attention")
+    q, _, main, si, mi, sink, scale = _inputs()
+    storage = torch.full((141, 529), 213, dtype=torch.uint8, device="cuda")
+    values = (torch.arange(141 * 512, device="cuda").reshape(141, 512) % 17 - 8) / 16
+    storage[:, :512].copy_(_e4m3_expected_bytes(values))
+    storage[:, 512:528] = 128
+    si.fill_(-1)
+    si[:, :6] = torch.tensor([0, -1, 140, 140, -1, 2**40], device="cuda")
+    output = torch.empty_like(q)
+    for swa_cache_format in ("swa", "swa_fp8"):
+        width = row_bytes(512, swa_cache_format)
+        args = (q, storage[:, :width], main, si, mi, sink, scale)
+        assert supports_packed_attention(*args, swa_cache_format=swa_cache_format)
+        assert not supports_packed_attention(
+            *args, swa_cache_format="swa_fp8" if swa_cache_format == "swa" else "swa"
+        )
+        packed_sparse_attention(*args, swa_cache_format=swa_cache_format, output=output)
+        torch.testing.assert_close(
+            output, _reference(*args, swa_cache_format=swa_cache_format), atol=0.016, rtol=0.016
+        )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        packed_sparse_attention(*args, swa_cache_format="swa_fp8", output=output)
+    storage[:, 512:].fill_(254)
+    storage[140, :512].bitwise_xor_(128)
+    si[0].fill_(-1)
+    mi.fill_(-1)
+    graph.replay()
+    torch.testing.assert_close(
+        output, _reference(*args, swa_cache_format="swa_fp8"), atol=0.016, rtol=0.016
+    )
     assert torch.count_nonzero(output[0]) == 0
 
 
@@ -253,8 +304,231 @@ def _expected(storage, pool, slots, x, cache_format):
     offset = pool.storage_offset() - storage.storage_offset()
     target = expected[:, offset : offset + pool.shape[1]]
     valid = (slots >= 0) & (slots < pool.shape[0])
-    target.index_copy_(0, slots[valid].long(), pack_rows(x, cache_format)[valid])
+    packed = _e4m3_expected_bytes(x) if cache_format == "swa_fp8" else pack_rows(x, cache_format)
+    target.index_copy_(0, slots[valid].long(), packed[valid])
     return expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("swa_cache_format", ["swa", "swa_fp8"])
+def test_publication_preserves_cpu_reference(swa_cache_format):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import quantization
+
+    slots = torch.tensor([0, 2], dtype=torch.int64)
+    swa_values = torch.ones(2, 512, dtype=torch.bfloat16)
+    main_values = swa_values * 2
+    index_values = torch.ones(2, 128, dtype=torch.bfloat16)
+    queries = index_values[:, None, :]
+    swa = torch.zeros(3, row_bytes(512, swa_cache_format), dtype=torch.uint8)
+    main = torch.zeros(3, 288, dtype=torch.uint8)
+    pages = torch.zeros(INDEX_PAGE_BYTES, dtype=torch.uint8)
+    data, scales = quantization.store_layer_rows(
+        swa,
+        slots,
+        swa_values,
+        swa_cache_format=swa_cache_format,
+        main=(main, slots, main_values, None),
+        index=(pages, slots, index_values, None),
+        index_q=queries,
+    )
+    for actual, values, cache_format in (
+        (swa[slots], swa_values, swa_cache_format),
+        (main[slots], main_values, "main"),
+        (quantization.read_index_rows(pages, slots), index_values, "index"),
+    ):
+        expected = (
+            _e4m3_expected_bytes(values)
+            if cache_format == "swa_fp8"
+            else pack_rows(values, cache_format)
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    packed_queries = pack_rows(queries, "index")
+    torch.testing.assert_close(data.view(torch.uint8), packed_queries[..., :64], rtol=0, atol=0)
+    torch.testing.assert_close(scales, packed_queries[..., 64:], rtol=0, atol=0)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("cache_format", ["swa", "swa_fp8", "main", "index", "packed_index"])
+@pytest.mark.parametrize("bad_input", [0, 1, 2], ids=["pool", "slots", "values"])
+def test_publication_rejects_mixed_devices_before_pack_or_launch(
+    monkeypatch, cache_format, bad_input
+):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel, quantization
+
+    dim = 128 if "index" in cache_format else 512
+    values = torch.ones(2, dim, dtype=torch.bfloat16, device="cuda")
+    slots = torch.tensor([0, 1], dtype=torch.int64, device="cuda")
+    pool = torch.full(
+        (INDEX_PAGE_BYTES,) if "index" in cache_format else (3, row_bytes(dim, cache_format)),
+        7,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    if cache_format == "packed_index":
+        values = pack_rows(values, "index")
+
+    def publish(args):
+        if cache_format == "packed_index":
+            quantization.write_packed_index_rows(*args)
+        elif cache_format == "index":
+            quantization.store_index_rows(*args)
+        else:
+            quantization.store_rows(*args, cache_format)
+
+    invalid = [pool, slots, values]
+    invalid[bad_input] = invalid[bad_input].cpu()
+    before, invalid_before = pool.clone(), invalid[0].clone()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Invalid publication reached packing or a CUDA launch")
+
+    with monkeypatch.context() as guard:
+        guard.setattr(quantization, "pack_rows", forbidden)
+        guard.setattr(kernel, "_launch", forbidden)
+        with pytest.raises(ValueError, match="share a device"):
+            publish(invalid)
+    torch.testing.assert_close(pool, before, rtol=0, atol=0)
+    torch.testing.assert_close(invalid[0], invalid_before, rtol=0, atol=0)
+    # A rejected host pointer must not poison subsequent legal CUDA work.
+    publish((pool, slots, values))
+    torch.cuda.synchronize()
+    actual = quantization.read_index_rows(pool, slots) if "index" in cache_format else pool[slots]
+    expected = values if cache_format == "packed_index" else pack_rows(values, cache_format)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "entry", ["row", "row_fp8", "footer", "split", "packed_row", "packed_index"]
+)
+@pytest.mark.parametrize("count", [0, 2])
+def test_cuda_publication_rejects_host_payload_even_when_empty(monkeypatch, entry, count):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+
+    values = torch.ones(count, 128, dtype=torch.bfloat16)
+    slots = torch.arange(count, dtype=torch.int64, device="cuda")
+    cache_format = "swa_fp8" if entry == "row_fp8" else "index"
+    pool = torch.full((3, row_bytes(128, cache_format)), 7, dtype=torch.uint8, device="cuda")
+    pages = torch.full((INDEX_PAGE_BYTES,), 7, dtype=torch.uint8, device="cuda")
+    before, pages_before = pool.clone(), pages.clone()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Invalid publication reached a CUDA launch")
+
+    monkeypatch.setattr(kernel, "_launch", forbidden)
+    with pytest.raises(ValueError, match="share a CUDA device"):
+        if entry in ("row", "row_fp8"):
+            kernel.quantize_scatter_rows(pool, slots, values, cache_format)
+        elif entry == "footer":
+            kernel.quantize_scatter_index_pages(pages, slots, values, INDEX_PAGE_ROWS)
+        elif entry == "split":
+            kernel.quantize_index_queries(values, pool[:, :64], pool[:, :4])
+        elif entry == "packed_row":
+            kernel.scatter_packed_rows(pool, slots, pack_rows(values, "index"))
+        else:
+            kernel.scatter_packed_index_rows(
+                pages, slots, pack_rows(values, "index"), INDEX_PAGE_ROWS, 64, 4
+            )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(pool, before, rtol=0, atol=0)
+    torch.testing.assert_close(pages, pages_before, rtol=0, atol=0)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("bad_input", ["norm", "positions", "cos_sin"])
+@pytest.mark.parametrize("swa_cache_format", ["swa", "swa_fp8"])
+def test_publication_rejects_host_transform_before_pack_or_launch(
+    monkeypatch, bad_input, swa_cache_format
+):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel, quantization
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import RowTransform
+
+    pool = torch.full((1, row_bytes(512, swa_cache_format)), 7, dtype=torch.uint8, device="cuda")
+    slots = torch.zeros(1, dtype=torch.int64, device="cuda")
+    values = torch.ones(1, 512, dtype=torch.bfloat16, device="cuda")
+    tensors = {
+        "norm": torch.ones(1024, dtype=torch.bfloat16, device="cuda")[::2],
+        "positions": torch.zeros(1, dtype=torch.int32, device="cuda"),
+        "cos_sin": torch.zeros(1, 64, dtype=torch.float32, device="cuda"),
+    }
+    tensors[bad_input] = tensors[bad_input].cpu()
+    transform = RowTransform(
+        norm=(tensors["norm"], 1e-6),
+        rope=(tensors["positions"], tensors["cos_sin"], 64),
+    )
+    before = pool.clone()
+    contiguous = torch.Tensor.contiguous
+
+    def checked_contiguous(tensor, *args, **kwargs):
+        if tensor is tensors["norm"]:
+            pytest.fail("Invalid publication copied a transform before device preflight")
+        return contiguous(tensor, *args, **kwargs)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Invalid publication reached packing or a CUDA launch")
+
+    monkeypatch.setattr(torch.Tensor, "contiguous", checked_contiguous)
+    monkeypatch.setattr(quantization, "pack_rows", forbidden)
+    monkeypatch.setattr(kernel, "_launch", forbidden)
+    with pytest.raises(ValueError, match="share a device"):
+        quantization.store_rows(pool, slots, values, swa_cache_format, transform)
+    with pytest.raises(ValueError, match="share a CUDA device"):
+        kernel.quantize_scatter_rows(
+            pool, slots, values, swa_cache_format, norm=transform.norm, rope=transform.rope
+        )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(pool, before, rtol=0, atol=0)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("force_fallback", [False, True])
+@pytest.mark.parametrize("bad_job", ["main", "index", "index_q", "foreign_main", "index_norm"])
+@pytest.mark.parametrize("swa_cache_format", ["swa", "swa_fp8"])
+def test_layer_publication_preflights_all_devices(
+    monkeypatch, force_fallback, bad_job, swa_cache_format
+):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel, quantization
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import RowTransform
+
+    slots = torch.zeros(1, dtype=torch.int64, device="cuda")
+    values = torch.ones(1, 512, dtype=torch.bfloat16, device="cuda")
+    swa = torch.full((1, row_bytes(512, swa_cache_format)), 7, dtype=torch.uint8, device="cuda")
+    main = torch.full((1, 288), 7, dtype=torch.uint8, device="cuda")
+    pages = torch.full((INDEX_PAGE_BYTES,), 7, dtype=torch.uint8, device="cuda")
+    main_job = (main, slots, values, None)
+    index_job = (pages, slots, values[:, :128], None)
+    queries = values[:, None, :128]
+    if bad_job == "main":
+        main_job = (main, slots, values.cpu(), None)
+    elif bad_job == "foreign_main":
+        main_job = (main.cpu(), slots.cpu(), values.cpu(), None)
+    elif bad_job == "index":
+        index_job = (pages, slots, values[:, :128].cpu(), None)
+    elif bad_job == "index_norm":
+        transform = RowTransform(norm=(torch.ones(128, dtype=torch.bfloat16), 1e-6))
+        index_job = (pages, slots, values[:, :128], transform)
+    else:
+        queries = queries.cpu()
+    before = [pool.clone() for pool in (swa, main, pages)]
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("A layer published rows before validating every job")
+
+    monkeypatch.setattr(quantization, "pack_rows", forbidden)
+    monkeypatch.setattr(kernel, "_launch", forbidden)
+    with pytest.raises(ValueError, match="share a device"):
+        quantization.store_layer_rows(
+            swa,
+            slots,
+            values.float() if force_fallback else values,
+            swa_cache_format=swa_cache_format,
+            main=main_job,
+            index=index_job,
+            index_q=queries,
+        )
+    torch.cuda.synchronize()
+    for pool, expected in zip((swa, main, pages), before):
+        torch.testing.assert_close(pool, expected, rtol=0, atol=0)
 
 
 @skip_pre_blackwell
@@ -265,9 +539,11 @@ def _expected(storage, pool, slots, x, cache_format):
         ("main", 512),
         ("index", 128),
         ("swa", 512),
+        ("swa_fp8", 512),
         ("main", 48),
         ("index", 96),
         ("swa", 96),
+        ("swa_fp8", 96),
     ],
 )
 @torch.inference_mode()
@@ -288,8 +564,9 @@ def test_fused_store_exact_bytes(cache_format, dim):
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("swa_cache_format", ["swa", "swa_fp8"])
 @torch.inference_mode()
-def test_fused_store_jobs_match_separate_launches():
+def test_fused_store_jobs_match_separate_launches(swa_cache_format):
     """One four-job launch (SWA, main, index footer, index-query split) writes the same bytes."""
     from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import (
         footer_job,
@@ -326,7 +603,9 @@ def test_fused_store_jobs_match_separate_launches():
 
     def run(fused):
         pools = {
-            "swa": torch.full((41, 528), 7, dtype=torch.uint8, device="cuda"),
+            "swa": torch.full(
+                (41, row_bytes(512, swa_cache_format)), 7, dtype=torch.uint8, device="cuda"
+            ),
             "main": torch.full((23, 288), 7, dtype=torch.uint8, device="cuda"),
             "index": torch.zeros(INDEX_PAGE_BYTES, dtype=torch.uint8, device="cuda"),
             "data": torch.zeros(queries, 64, dtype=torch.uint8, device="cuda"),
@@ -334,7 +613,12 @@ def test_fused_store_jobs_match_separate_launches():
         }
         jobs = [
             row_job(
-                pools["swa"], slots["swa"], values["swa"], "swa", transform.norm, transform.rope
+                pools["swa"],
+                slots["swa"],
+                values["swa"],
+                swa_cache_format,
+                transform.norm,
+                transform.rope,
             ),
             row_job(
                 pools["main"], slots["main"], values["main"], "main", None, index_transform.rope
@@ -363,9 +647,87 @@ def test_fused_store_jobs_match_separate_launches():
 
 
 @skip_pre_blackwell
+@pytest.mark.parametrize("force_fallback", [False, True])
+@pytest.mark.parametrize("transformed", [False, True])
+def test_swa_fp8_layer_publication_exact_bytes(monkeypatch, force_fallback, transformed):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel, quantization
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import RowTransform
+
+    _sm100()
+    values = torch.ones(4, 512, dtype=torch.bfloat16, device="cuda")
+    values[:, 1::2].neg_()
+    values *= torch.tensor([1, 2, 4, 8], device="cuda")[:, None]
+    transform = None
+    if transformed:
+        table = torch.zeros(2, 64, device="cuda")
+        table[0, 32:], table[1, :32] = 1, 1
+        transform = RowTransform(
+            norm=(torch.full((512,), 2, dtype=torch.bfloat16, device="cuda"), 0.0),
+            rope=(torch.tensor([0, 1, 0, 1], dtype=torch.int32, device="cuda"), table, 64),
+        )
+    else:
+        values[0, :8] = torch.tensor(
+            [0.0, -0.0, float("nan"), -float("nan"), float("inf"), -float("inf"), 464, -464],
+            device="cuda",
+        )
+    slots = torch.tensor([0, 2, -1, 4], dtype=torch.int64, device="cuda")
+    storage = torch.full((5, 529), 213, dtype=torch.uint8, device="cuda")
+    swa = storage[:, 1:513]
+    main = torch.full((5, 288), 7, dtype=torch.uint8, device="cuda")
+    pages = torch.full((INDEX_PAGE_BYTES,), 7, dtype=torch.uint8, device="cuda")
+    main_values = torch.full_like(values, 4)
+    index_values = torch.full((4, 128), 2, dtype=torch.bfloat16, device="cuda")
+    queries = index_values[:, None, :].repeat(1, 2, 1)
+    expected = _expected(
+        storage, swa, slots, quantization.apply_row_transform(values, transform), "swa_fp8"
+    )
+    launches = []
+    quantize = kernel.quantize_scatter_jobs
+
+    def tracked(jobs, **kwargs):
+        launches.append(tuple((job.spec.cache_format, job.spec.mode) for job in jobs))
+        return quantize(jobs, **kwargs)
+
+    monkeypatch.setattr(kernel, "quantize_scatter_jobs", tracked)
+    if force_fallback:
+        monkeypatch.setattr(quantization, "_fused_rows", lambda *args: False)
+        monkeypatch.setattr(quantization, "_fused_queries", lambda *args: False)
+    data, scales = quantization.store_layer_rows(
+        swa,
+        slots,
+        values,
+        transform,
+        swa_cache_format="swa_fp8",
+        main=(main, slots, main_values, None),
+        index=(pages, slots, index_values, None),
+        index_q=queries,
+    )
+    assert launches == (
+        []
+        if force_fallback
+        else [(("swa_fp8", "row"), ("main", "row"), ("index", "footer"), ("index", "split"))]
+    )
+    torch.testing.assert_close(storage, expected, atol=0, rtol=0)
+    valid = slots >= 0
+    torch.testing.assert_close(
+        main[slots[valid]], pack_rows(main_values[valid], "main"), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        quantization.read_index_rows(pages, slots[valid]),
+        pack_rows(index_values[valid], "index"),
+        atol=0,
+        rtol=0,
+    )
+    packed_q = pack_rows(queries, "index")
+    torch.testing.assert_close(data.view(torch.uint8), packed_q[..., :64], atol=0, rtol=0)
+    torch.testing.assert_close(scales, packed_q[..., 64:], atol=0, rtol=0)
+
+
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
-    "cache_format,dim,norm", [("main", 512, False), ("index", 128, True), ("swa", 512, True)]
+    "cache_format,dim,norm",
+    [("main", 512, False), ("index", 128, True), ("swa", 512, True), ("swa_fp8", 512, True)],
 )
 @torch.inference_mode()
 def test_fused_store_norm_rope(cache_format, dim, norm):
@@ -400,7 +762,7 @@ def test_fused_store_norm_rope(cache_format, dim, norm):
     torch.testing.assert_close(
         unpack_rows(pool[slots[slots >= 0]], dim, cache_format).float(),
         reference[slots >= 0].float(),
-        atol=0.25 if cache_format == "swa" else 1.5,
+        atol=0.25 if cache_format in ("swa", "swa_fp8") else 1.5,
         rtol=0.1,
     )
     if not norm:
@@ -437,7 +799,9 @@ def test_fused_store_norm_rope(cache_format, dim, norm):
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("cache_format,dim", [("main", 512), ("index", 128), ("swa", 512)])
+@pytest.mark.parametrize(
+    "cache_format,dim", [("main", 512), ("index", 128), ("swa", 512), ("swa_fp8", 512)]
+)
 @torch.inference_mode()
 def test_fused_store_graph_changes_padding(cache_format, dim):
     _sm100()
@@ -467,7 +831,11 @@ def _gather_reference(pool, slots, dim, cache_format):
     if pool.shape[0] == 0:
         return torch.zeros((*slots.shape, dim), dtype=torch.bfloat16, device=pool.device)
     selected = pool[torch.where(valid, slots, 0).long()]
-    decoded = unpack_rows(selected, dim, cache_format)
+    decoded = (
+        _e4m3_expected_values(selected)
+        if cache_format == "swa_fp8"
+        else unpack_rows(selected, dim, cache_format)
+    )
     return torch.where(valid[..., None], decoded, 0)
 
 
@@ -487,9 +855,11 @@ def _assert_bf16_decode(actual, expected):
         ("main", 512, torch.int64, 2),
         ("index", 128, torch.int32, 1),
         ("swa", 512, torch.int64, 2),
+        ("swa_fp8", 512, torch.int64, 2),
         ("main", 48, torch.int32, 1),
         ("index", 96, torch.int64, 2),
         ("swa", 96, torch.int32, 1),
+        ("swa_fp8", 96, torch.int32, 1),
     ],
 )
 def test_fused_gather_strided_exact(cache_format, dim, slot_dtype, rank):
@@ -524,6 +894,141 @@ def _fp8_python(code):
     if exponent == 0:
         return sign * mantissa * 2.0**-9
     return sign * (1.0 + mantissa / 8.0) * 2.0 ** (exponent - 7)
+
+
+def _e4m3_expected_bytes(values):
+    """Independent scalar E4M3 RN/satfinite oracle, without float8 casts."""
+    levels = [_fp8_python(code) for code in range(127)]
+    encoded = []
+    for value in values.float().cpu().reshape(-1).tolist():
+        if math.isnan(value):
+            encoded.append(127)
+            continue
+        magnitude = min(abs(value), 448.0)
+        code = bisect_left(levels, magnitude)
+        if code:
+            lower, upper = magnitude - levels[code - 1], levels[code] - magnitude
+            if lower < upper or (lower == upper and code % 2):
+                code -= 1
+        encoded.append(code | (128 if math.copysign(1.0, value) < 0 else 0))
+    return torch.tensor(encoded, dtype=torch.uint8, device=values.device).reshape(values.shape)
+
+
+def _e4m3_expected_values(rows):
+    levels = torch.tensor(
+        [_fp8_python(code) for code in range(256)], dtype=torch.bfloat16, device=rows.device
+    )
+    return levels[rows.long()]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_swa_fp8_reference_exact_bytes_and_publication(dtype):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
+        gather_rows,
+        store_rows,
+    )
+
+    pattern = torch.tensor(
+        [
+            0.0,
+            -0.0,
+            2.0**-10,
+            -(2.0**-10),
+            3 * 2.0**-10,
+            -3 * 2.0**-10,
+            1.0625,
+            1.1875,
+            -1.0625,
+            -1.1875,
+            432,
+            -432,
+            448,
+            -448,
+            464,
+            -464,
+            float("inf"),
+            -float("inf"),
+            float("nan"),
+            -float("nan"),
+            2.0**-133,
+            -(2.0**-133),
+            2.0**-9,
+            -(2.0**-9),
+        ],
+        dtype=dtype,
+    )
+    values = pattern.repeat(5, 22)[:, :512]
+    expected = _e4m3_expected_bytes(values)
+    assert expected[0, :24].tolist() == [
+        0,
+        128,
+        0,
+        128,
+        2,
+        130,
+        56,
+        58,
+        184,
+        186,
+        126,
+        254,
+        126,
+        254,
+        126,
+        254,
+        126,
+        254,
+        127,
+        127,
+        0,
+        128,
+        1,
+        129,
+    ]
+    packed = pack_rows(values, "swa_fp8")
+    assert packed.shape == (5, 512)
+    torch.testing.assert_close(packed, expected, atol=0, rtol=0)
+    _assert_bf16_decode(unpack_rows(packed, 512, "swa_fp8"), _e4m3_expected_values(expected))
+    storage = torch.full((5, 529), 213, dtype=torch.uint8)
+    pool = storage[:, 1:513]
+    slots = torch.tensor([0, 4, -1, 5, 2**40], dtype=torch.int64)
+    expected_storage = _expected(storage, pool, slots, values, "swa_fp8")
+    store_rows(pool, slots, values, "swa_fp8")
+    torch.testing.assert_close(storage, expected_storage, atol=0, rtol=0)
+    selected = torch.tensor([[0, -1, 4, 0, 5, 2**40]], dtype=torch.int64)
+    _assert_bf16_decode(
+        gather_rows(pool, selected, 512, "swa_fp8"),
+        _gather_reference(pool, selected, 512, "swa_fp8"),
+    )
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("padding", [0, 17])
+def test_swa_fp8_gather_payload_only(monkeypatch, padding):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel, quantization
+
+    _sm100()
+    storage = torch.full((3, 512 + padding), 255, dtype=torch.uint8, device="cuda")
+    pool = storage[:, 1:513] if padding else storage
+    payload = torch.arange(512, device="cuda").to(torch.uint8)
+    pool.copy_(payload)
+    backing = torch.full((2, 14), -1, dtype=torch.int64, device="cuda")
+    slots = backing[:, ::2]
+    slots.copy_(torch.tensor([[0, -1, 2, 2, 3, 2**40, 0], [-1] * 7], device="cuda"))
+    expected = _gather_reference(pool, slots, 512, "swa_fp8")
+    before = storage.clone()
+    _assert_bf16_decode(kernel.gather_dequant_rows(pool, slots, 512, "swa_fp8"), expected)
+    torch.testing.assert_close(storage, before, atol=0, rtol=0)
+    if padding:
+        storage[:, :1].zero_()
+        storage[:, 513:].zero_()
+        _assert_bf16_decode(kernel.gather_dequant_rows(pool, slots, 512, "swa_fp8"), expected)
+    monkeypatch.setattr(quantization, "_fused_gather_supported", lambda _: False)
+    _assert_bf16_decode(quantization.gather_rows(pool, slots, 512, "swa_fp8"), expected)
+    empty = pool[:0]
+    assert torch.count_nonzero(kernel.gather_dequant_rows(empty, slots, 512, "swa_fp8")) == 0
+    assert kernel.gather_dequant_rows(pool, slots[:, :0], 512, "swa_fp8").shape == (2, 0, 512)
 
 
 @skip_pre_blackwell
@@ -580,7 +1085,9 @@ def test_fused_gather_all_scale_bytes(cache_format, dim):
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("cache_format,dim", [("main", 512), ("index", 128), ("swa", 512)])
+@pytest.mark.parametrize(
+    "cache_format,dim", [("main", 512), ("index", 128), ("swa", 512), ("swa_fp8", 512)]
+)
 def test_fused_gather_graph_refresh(cache_format, dim):
     from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import gather_rows
 
@@ -630,12 +1137,12 @@ import sys
 import torch
 import triton
 
-class RejectOptional(importlib.abc.MetaPathFinder):
+class RejectKernelImports(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path, target=None):
-        if fullname.split('.')[0] in {'cutlass', 'cuda'}:
-            raise AssertionError('Unexpected optional import: ' + fullname)
+        if fullname.split('.')[0] in {'cutlass', 'cuda', 'tensorrt_llm'}:
+            raise AssertionError('Unexpected package import: ' + fullname)
 
-sys.meta_path.insert(0, RejectOptional())
+sys.meta_path.insert(0, RejectKernelImports())
 assert not torch.cuda.is_initialized()
 spec = importlib.util.spec_from_file_location('csa2_import_probe', sys.argv[1])
 module = importlib.util.module_from_spec(spec)
@@ -643,11 +1150,24 @@ spec.loader.exec_module(module)
 assert not torch.cuda.is_initialized()
 assert hasattr(torch.ops.trtllm, 'csa2_indexer_q_gemm_rope_fp4')
 """
-    subprocess.run([sys.executable, "-c", program, str(kernel)], check=True, timeout=60)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", program, str(kernel)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired as error:
+        pytest.fail(
+            f"Kernel import probe timed out.\nstdout:\n{error.stdout!r}\nstderr:\n{error.stderr!r}"
+        )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(
-    "cache_format,dim,expected_bytes", [("main", 512, 288), ("index", 128, 68), ("swa", 512, 528)]
+    "cache_format,dim,expected_bytes",
+    [("main", 512, 288), ("index", 128, 68), ("swa", 512, 528), ("swa_fp8", 512, 512)],
 )
 def test_quantized_row_layout(cache_format, dim, expected_bytes):
     x = torch.zeros(2, dim, dtype=torch.bfloat16)
@@ -656,7 +1176,10 @@ def test_quantized_row_layout(cache_format, dim, expected_bytes):
     assert rows.shape == (2, expected_bytes)
     assert row_bytes(dim, cache_format) == expected_bytes
     torch.testing.assert_close(unpack_rows(rows, dim, cache_format), x, atol=0, rtol=0)
-    assert torch.all(rows[0, dim if cache_format == "swa" else dim // 2 :] != 0)
+    if cache_format == "swa_fp8":
+        assert torch.count_nonzero(rows[0]) == 0
+    else:
+        assert torch.all(rows[0, dim if cache_format == "swa" else dim // 2 :] != 0)
 
 
 def test_fp4_midpoint_rounding_and_rope_tail():
@@ -690,7 +1213,9 @@ def test_quantization_cuda_graph_changed_values():
         torch.testing.assert_close(restored, x, atol=0, rtol=0)
 
 
-def _stage_fixture(queries, swa_width, main_width, *, empty_pool=False, extra_width=None):
+def _stage_fixture(
+    queries, swa_width, main_width, *, empty_pool=False, extra_width=None, swa_cache_format="swa"
+):
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
 
@@ -700,15 +1225,21 @@ def _stage_fixture(queries, swa_width, main_width, *, empty_pool=False, extra_wi
         q, (main_width or 0) if extra_width is None else extra_width
     )
     rows = 0 if empty_pool else 23
-    swa = pack_rows(torch.randn(rows, 512, device="cuda", dtype=torch.bfloat16), "swa")
+    swa_values = torch.randn(rows, 512, device="cuda", dtype=torch.bfloat16)
+    swa = (
+        _e4m3_expected_bytes(swa_values)
+        if swa_cache_format == "swa_fp8"
+        else pack_rows(swa_values, "swa")
+    )
     main_storage = torch.empty(rows, 360, dtype=torch.uint8, device="cuda")
     main = main_storage[:, :288]
     main.copy_(pack_rows(torch.randn(rows, 512, device="cuda", dtype=torch.bfloat16), "main"))
     if rows:
-        # Finite edge payloads include negative zero and the smallest SWA scale.
+        # Finite edge payloads include negative zero and the smallest legacy SWA scale.
         swa[0, :512] = 128
-        swa[0, 512:] = 0
-        swa[0, 0], swa[0, 1] = 56, 184  # E4M3 +1/-1 produce nonzero subnormals.
+        if swa_cache_format == "swa":
+            swa[0, 512:] = 0
+        swa[0, 0], swa[0, 1] = 56, 184  # Legacy +1/-1 decode to nonzero subnormals.
         main[0, :256] = 136
         main[0, 256:] = 1
     dtype = torch.int32 if main_width is None else torch.int64
@@ -728,12 +1259,16 @@ def _stage_fixture(queries, swa_width, main_width, *, empty_pool=False, extra_wi
     if queries > 1:
         si[1].fill_(-1)  # Main selections must fill the primary pool first.
     return metadata, CSA2BackendForwardArgs(
-        swa_pool=swa, swa_indices=si, main_pool=main, topk_indices=mi
+        swa_pool=swa,
+        swa_indices=si,
+        main_pool=main,
+        topk_indices=mi,
+        swa_cache_format=swa_cache_format,
     )
 
 
 def _stage_oracle(metadata, inputs):
-    sources = [(inputs.swa_pool, inputs.swa_indices, "swa")]
+    sources = [(inputs.swa_pool, inputs.swa_indices, inputs.swa_cache_format or "swa")]
     if inputs.topk_indices is not None:
         sources.append((inputs.main_pool, inputs.topk_indices, "main"))
     # Independent BF16 decode reference: never the CuTe dequant under test.
@@ -797,7 +1332,10 @@ def _check_stage(metadata, expected):
         (1, 17, 17, False, 4096),
     ],
 )
-def test_native_staging_exact(queries, swa_width, main_width, empty_pool, extra_width, monkeypatch):
+@pytest.mark.parametrize("swa_cache_format", ["swa", "swa_fp8"])
+def test_native_staging_exact(
+    queries, swa_width, main_width, empty_pool, extra_width, monkeypatch, swa_cache_format
+):
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
 
     _sm100()
@@ -810,7 +1348,12 @@ def test_native_staging_exact(queries, swa_width, main_width, empty_pool, extra_
 
     monkeypatch.setattr(kernel, "stage_selected_rows", stage)
     metadata, inputs = _stage_fixture(
-        queries, swa_width, main_width, empty_pool=empty_pool, extra_width=extra_width
+        queries,
+        swa_width,
+        main_width,
+        empty_pool=empty_pool,
+        extra_width=extra_width,
+        swa_cache_format=swa_cache_format,
     )
     expected = _stage_oracle(metadata, inputs)
     metadata.swa_pool.fill_(13)
@@ -876,9 +1419,10 @@ def test_staging_group_reuse_validates_each_layers_own_slots():
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_native_staging_graph_refresh():
+@pytest.mark.parametrize("swa_cache_format", ["swa", "swa_fp8"])
+def test_native_staging_graph_refresh(swa_cache_format):
     _sm100()
-    metadata, inputs = _stage_fixture(8, 128, 17)
+    metadata, inputs = _stage_fixture(8, 128, 17, swa_cache_format=swa_cache_format)
     metadata.stage_selected(inputs)
     tensor_names = ("swa_pool", "extra_pool", "prepared_indices", "prepared_lens")
     pointers = [getattr(metadata, name).data_ptr() for name in tensor_names]
@@ -899,6 +1443,67 @@ def test_native_staging_graph_refresh():
         _check_stage(metadata, expected)
     assert pointers == [getattr(metadata, name).data_ptr() for name in tensor_names]
     assert retained == metadata.get_workspace_bytes()
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("padding", [0, 17])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_swa_fp8_staging_payload_only(padding, dtype):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import stage_selected_rows
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+
+    _sm100()
+    control, inputs = _stage_fixture(3, 17, None, swa_cache_format="swa_fp8")
+    storage = torch.full((23, 512 + padding), 255, dtype=torch.uint8, device="cuda")
+    pool = storage[:, 1:513] if padding else storage
+    pool.copy_(inputs.swa_pool)
+    inputs.swa_pool = pool
+    inputs.swa_indices.fill_(-1)
+    inputs.swa_indices[1, :5] = torch.tensor([0, 22, 22, -1, 2**30], device="cuda")
+    metadata = CSA2TrtllmMetadata.for_query_tile(
+        torch.zeros(3, 64, 512, dtype=torch.bfloat16, device="cuda"), 0, staging_dtype=dtype
+    )
+    scratch = {
+        "tags": torch.empty(3, metadata.num_sparse_topk, dtype=torch.int32, device="cuda"),
+        "counts": torch.empty(3, dtype=torch.int32, device="cuda"),
+        "row_slots": torch.empty(3, metadata.num_sparse_topk, dtype=torch.int32, device="cuda"),
+    }
+    dequant = torch.tensor([3.0], device="cuda")
+    quant = dequant.reciprocal()
+    for active in (True, False, True):
+        inputs.swa_indices[2].fill_(22 if active else -1)
+        pool[22, -1].bitwise_xor_(128)
+        if padding:
+            storage[:, :1].bitwise_xor_(255)
+            storage[:, 513:].bitwise_xor_(255)
+        before = storage.clone()
+        expected = _stage_oracle(control, inputs)
+        stage_selected_rows(
+            pool,
+            inputs.swa_indices,
+            pool,
+            None,
+            metadata,
+            scratch,
+            swa_cache_format="swa_fp8",
+            kv_scale_orig_quant=quant,
+            kv_scale_quant_orig=dequant,
+            q_scale_quant_orig=dequant,
+        )
+        if dtype == torch.bfloat16:
+            _check_stage(metadata, expected)
+        else:
+            for actual, decoded in zip((metadata.swa_pool, metadata.extra_pool), expected[:2]):
+                torch.testing.assert_close(
+                    actual.view(torch.uint8),
+                    _e4m3_expected_bytes(decoded.float() * quant),
+                    atol=0,
+                    rtol=0,
+                )
+            torch.testing.assert_close(metadata.prepared_lens, expected[2], atol=0, rtol=0)
+            torch.testing.assert_close(metadata.prepared_indices, expected[3], atol=0, rtol=0)
+            assert metadata.prepared_counter.item() == 0
+        torch.testing.assert_close(storage, before, atol=0, rtol=0)
 
 
 @skip_pre_blackwell
@@ -1202,19 +1807,21 @@ def test_fused_store_changed_row_counts(cache_format, dim):
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dequant,q_dequant", [(1.0, 1.0), (3.0, 2.0)])
+@pytest.mark.parametrize("swa_cache_format", ["swa", "swa_fp8"])
 @torch.inference_mode()
-def test_native_fp8_staging_exact_bytes(dequant, q_dequant, monkeypatch):
+def test_native_fp8_staging_exact_bytes(dequant, q_dequant, monkeypatch, swa_cache_format):
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 
     _sm100()
-    control, inputs = _stage_fixture(3, 128, 17)
-    # All E4M3 codes, both zero signs, subnormals and NaNs; scale255 also
-    # yields infinities after decode. Other rows retain random finite values.
+    control, inputs = _stage_fixture(3, 128, 17, swa_cache_format=swa_cache_format)
+    # All E4M3 codes, both zero signs, subnormals and NaNs; legacy scale255
+    # also yields infinities after decode. Other rows retain random finite values.
     inputs.swa_pool[2, :512] = torch.arange(512, device="cuda").to(torch.uint8)
-    inputs.swa_pool[2, 512:] = torch.tensor(
-        [127, 126, 128, 136, 255, 0, 127, 127] * 2, device="cuda", dtype=torch.uint8
-    )
+    if swa_cache_format == "swa":
+        inputs.swa_pool[2, 512:] = torch.tensor(
+            [127, 126, 128, 136, 255, 0, 127, 127] * 2, device="cuda", dtype=torch.uint8
+        )
     inputs.swa_indices[2, :4] = torch.tensor([2, 2, 0, 1], device="cuda")
     # Main payload/scales include FP4 midpoint reconstruction and saturated
     # E4M3 outputs while retaining the padded 360-byte row stride.
@@ -1249,7 +1856,10 @@ def test_native_fp8_staging_exact_bytes(dequant, q_dequant, monkeypatch):
     )
     assert calls == [True]
     for actual, decoded in zip((metadata.swa_pool, metadata.extra_pool), expected[:2]):
-        quantized, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(decoded, dq)
+        if swa_cache_format == "swa_fp8":
+            quantized = _e4m3_expected_bytes(decoded.float() * multiplier)
+        else:
+            quantized, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(decoded, dq)
         torch.testing.assert_close(
             actual.view(torch.uint8), quantized.view(torch.uint8), atol=0, rtol=0
         )
@@ -1270,18 +1880,20 @@ def test_native_fp8_staging_exact_bytes(dequant, q_dequant, monkeypatch):
 def _stage_scale_reference(inputs):
     """Independent ceiling on the magnitudes the selected rows can decode to.
 
-    Both persistent encoders clamp their payload -- ``main`` codes at the E2M1
-    maximum of 6, ``swa`` values at +-448 -- so a row's group scale alone bounds
-    it, whichever way the encoder rounded that scale.
+    MAIN's E2M1 maximum is 6; SWA's E4M3 maximum is 448. Group scales bound
+    legacy rows; ordinary SWA contributes its persistent unit scale.
     """
     ceiling = 0.0
-    sources = [(inputs.swa_pool, inputs.swa_indices, "swa")]
+    sources = [(inputs.swa_pool, inputs.swa_indices, inputs.swa_cache_format or "swa")]
     if inputs.topk_indices is not None:
         sources.append((inputs.main_pool, inputs.topk_indices, "main"))
     for pool, slots, cache_format in sources:
         groups = 16 if cache_format == "swa" else 32
         valid = (slots >= 0) & (slots < pool.shape[0])
         if not valid.any():
+            continue
+        if cache_format == "swa_fp8":
+            ceiling = max(ceiling, 448.0)
             continue
         observed = pool[torch.where(valid, slots, 0).long()][valid][:, -groups:].flatten()
         if cache_format == "swa":
@@ -1295,6 +1907,71 @@ def _stage_scale_reference(inputs):
         if bound.numel():
             ceiling = max(ceiling, bound.max().item())
     return ceiling
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("padding", [0, 17])
+def test_swa_fp8_stage_scale_unit_ceiling_and_empty_selection(padding):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import derive_stage_kv_scales
+
+    _sm100()
+    storage = torch.full((1, 512 + padding), 255, dtype=torch.uint8, device="cuda")
+    swa = storage[:, 1:513] if padding else storage
+    main = torch.zeros(1, 288, dtype=torch.uint8, device="cuda")
+    main[:, 256:] = 1
+    slots = torch.full((1, 129), -1, dtype=torch.int64, device="cuda")
+    slots[0, -1] = 0
+    main_slots = torch.zeros(1, 1, dtype=torch.int64, device="cuda")
+    bitmap = torch.zeros(17, dtype=torch.int32, device="cuda")
+    dequant, quant = (torch.empty(1, device="cuda") for _ in range(2))
+
+    def derive():
+        derive_stage_kv_scales(
+            [(swa, slots, "swa_fp8"), (main, main_slots, "main")],
+            bitmap,
+            dequant,
+            quant,
+            minimum=-126,
+        )
+
+    derive()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        derive()
+    # MAIN alone can require a subunit scale. Invalid SWA must not invent a unit
+    # ceiling; valid ordinary SWA must, while high-range MAIN can still exceed it.
+    for swa_slot, main_slot, main_scale, exponent in (
+        (0, 0, 1, 0),
+        (1, 0, 1, -15),
+        (-1, -1, 1, 0),
+        (0, 0, 126, 3),
+    ):
+        slots.fill_(-1)
+        slots[0, 64], slots[0, -1] = 2**40, swa_slot
+        main_slots.fill_(main_slot)
+        main[:, 256:].fill_(main_scale)
+        if padding:
+            storage[:, 513:].bitwise_xor_(255)
+        for replay in (False, True):
+            dequant.fill_(float("nan"))
+            quant.fill_(float("nan"))
+            if replay:
+                graph.replay()
+            else:
+                derive()
+            assert dequant.item() == 2.0**exponent
+            assert quant.item() == 2.0**-exponent
+            assert torch.count_nonzero(bitmap) == 0
+    main[:, 256:] = 1
+    main_slots.zero_()
+    derive_stage_kv_scales(
+        [(swa[:0], slots, "swa_fp8"), (main, main_slots, "main")],
+        bitmap,
+        dequant,
+        quant,
+        minimum=-126,
+    )
+    assert dequant.item() == 2.0**-15
 
 
 @skip_pre_blackwell
@@ -1655,6 +2332,124 @@ def test_unfused_fp8_staging_matches_fused_bytes(monkeypatch):
         )
     for fused_tensor, unfused in zip(*staged):
         torch.testing.assert_close(unfused, fused_tensor, atol=0, rtol=0)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("padding", [0, 17])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_swa_fp8_shared_staging_unit_ceiling_and_live_mapping(padding, dtype):
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import stage_shared_rows
+
+    _sm100()
+    storage = torch.full((3, 512 + padding), 255, dtype=torch.uint8, device="cuda")
+    swa = storage[:, 1:513] if padding else storage
+    swa.copy_(torch.tensor([0, 128, 1, 129, 56, 184, 126, 254], device="cuda").repeat(64))
+    main = torch.full((1, 288), 119, dtype=torch.uint8, device="cuda")  # E2M1 +6/+6
+    main[:, 256:] = 1
+    swa_slots = torch.tensor([[0, -1, 2]], dtype=torch.int64, device="cuda")
+    main_slots = torch.zeros(1, 1, dtype=torch.int64, device="cuda")
+    logical = main_slots.clone()
+    plan = SimpleNamespace(
+        query_requests=torch.zeros(1, dtype=torch.int64, device="cuda"),
+        query_positions=torch.tensor([2], dtype=torch.int32, device="cuda"),
+        swa_starts=torch.zeros(1, dtype=torch.int64, device="cuda"),
+        swa_offsets=torch.tensor([1, 4], dtype=torch.int64, device="cuda"),
+        main_offsets=torch.tensor([4, 5], dtype=torch.int64, device="cuda"),
+        swa_pages=torch.tensor([[0, 1, 2]], dtype=torch.int32, device="cuda"),
+        main_pages=torch.zeros(1, 1, dtype=torch.int32, device="cuda"),
+        swa_page_size=1,
+        main_page_size=1,
+        num_requests=1,
+        swa_rows=3,
+        main_rows=1,
+        swa_first=torch.zeros(1, dtype=torch.int64, device="cuda"),
+        swa_floors=torch.zeros(1, dtype=torch.int64, device="cuda"),
+        window=3,
+    )
+    bank = torch.full((5, 512), 7, dtype=dtype, device="cuda")
+    dequant, quant = (torch.ones(1, device="cuda") for _ in range(2))
+    unit = torch.ones(1, device="cuda")
+    bitmap = torch.zeros(17, dtype=torch.int32, device="cuda")
+    metadata = SimpleNamespace(
+        num_tokens=1,
+        num_sparse_topk=128,
+        shared_pool=bank,
+        _csa2_shared_selected=torch.zeros(5, dtype=torch.int32, device="cuda"),
+        _csa2_shared_main_scales=torch.zeros(2, dtype=torch.int32, device="cuda"),
+        _csa2_stage_scale_bitmap=bitmap,
+        _csa2_stage_kv_dequant=dequant,
+        _csa2_stage_kv_quant=quant,
+        prepared_indices=torch.empty(1, 128, dtype=torch.int32, device="cuda"),
+        prepared_lens=torch.empty(1, dtype=torch.int32, device="cuda"),
+        prepared_counter=torch.empty(1, dtype=torch.uint32, device="cuda"),
+        mla_bmm1_scale=torch.empty(2, device="cuda"),
+        mla_bmm2_scale=torch.empty(1, device="cuda"),
+    )
+
+    def stage():
+        stage_shared_rows(
+            swa,
+            swa_slots,
+            main,
+            main_slots,
+            logical,
+            metadata,
+            plan,
+            swa_cache_format="swa_fp8",
+            kv_scale_orig_quant=quant,
+            kv_scale_quant_orig=dequant,
+            q_scale_quant_orig=unit,
+            scale=(None, False, -126, 126),
+        )
+
+    stage()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        stage()
+    for selected, main_slot, scale_byte, last_page, exponent, ids in (
+        ([0, -1, 2], 0, 1, 2, 0, [1, 3, 4]),
+        ([3, -1, 2**40], 0, 1, 2, -15, [4]),
+        ([-1, -1, -1], -1, 1, 2, 0, [0]),
+        ([0, -1, 0], 0, 126, 0, 3, [1, 3, 4]),
+    ):
+        swa_slots.copy_(torch.tensor([selected], device="cuda"))
+        main_slots.fill_(main_slot)
+        main[:, 256:].fill_(scale_byte)
+        plan.swa_pages[0, 2] = last_page
+        swa[0, -1].bitwise_xor_(128)
+        if padding:
+            storage[:, 513:].bitwise_xor_(255)
+        expected = torch.full_like(bank, 7)
+        decoded = {0: torch.zeros(512, dtype=torch.bfloat16, device="cuda")}
+        if 1 in ids:
+            decoded[1] = _e4m3_expected_values(swa[0])
+            decoded[3] = _e4m3_expected_values(swa[last_page])
+        decoded[4] = unpack_rows(main, 512, "main")[0]
+        for row, values in decoded.items():
+            if dtype == torch.float8_e4m3fn:
+                expected.view(torch.uint8)[row] = _e4m3_expected_bytes(
+                    values.float() * 2.0**-exponent
+                )
+            else:
+                expected[row] = values
+        indices = torch.full_like(metadata.prepared_indices, -1)
+        indices[0, : len(ids)] = torch.tensor(ids, device="cuda")
+        for replay in (False, True):
+            bank.fill_(7)
+            if replay:
+                graph.replay()
+            else:
+                stage()
+            assert dequant.item() == 2.0**exponent
+            assert quant.item() == 2.0**-exponent
+            assert metadata.prepared_lens.item() == len(ids)
+            torch.testing.assert_close(metadata.prepared_indices, indices, atol=0, rtol=0)
+            torch.testing.assert_close(
+                bank.view(torch.uint8), expected.view(torch.uint8), atol=0, rtol=0
+            )
+            assert torch.count_nonzero(bitmap) == 0
 
 
 @skip_pre_blackwell
@@ -2701,7 +3496,11 @@ def _qs_jobs(which, gen):
     )
     table = torch.cat((angles.cos(), angles.sin()), dim=1).float().cuda()
     jobs, outputs = [], []
-    for cache_format, rows, capacity in (("swa", 4099, 5000), ("main", 1031, 1200)):
+    for cache_format, rows, capacity in (
+        ("swa", 4099, 5000),
+        ("swa_fp8", 2051, 2500),
+        ("main", 1031, 1200),
+    ):
         if cache_format not in which:
             continue
         pool = torch.full(
@@ -2745,7 +3544,9 @@ def _qs_jobs(which, gen):
 
 
 @skip_pre_blackwell
-@pytest.mark.parametrize("which", ["swa+main+index", "main+index+split"])
+@pytest.mark.parametrize(
+    "which", ["swa+main+index", "swa_fp8+main+index+split", "main+index+split"]
+)
 @torch.inference_mode()
 def test_vectorized_quantize_scatter_writes_the_same_bytes(monkeypatch, which):
     """Sixteen channels per thread (large launches of aligned 128/512-channel rows) write the

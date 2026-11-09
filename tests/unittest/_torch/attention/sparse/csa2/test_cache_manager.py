@@ -14,9 +14,13 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     CSA2CacheRole,
 )
 from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
-from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
+from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
+    CSA2Layout,
+    resolve_swa_cache_format,
+)
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
     read_index_rows,
+    row_bytes,
     write_packed_index_rows,
 )
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import _CacheReuseAdapterV2
@@ -101,8 +105,13 @@ def test_disabled_layer_mask_rejected_before_allocation():
         )
 
 
+@pytest.fixture(params=["fp8", "fp8_ds_mla"])
+def swa_dtype(request):
+    return request.param
+
+
 @pytest.fixture
-def manager(request, monkeypatch):
+def manager(request, monkeypatch, swa_dtype):
     if not torch.cuda.is_available():
         pytest.skip("CSA2 runtime cache storage requires CUDA")
     guard_page = getattr(request, "param", None)
@@ -117,7 +126,7 @@ def manager(request, monkeypatch):
             enable_partial_reuse=True,
             enable_swa_scratch_reuse=True,
             block_reuse_config=BlockReuseConfig(policy="all_reusable"),
-            dtype="fp8",
+            dtype=swa_dtype,
         ),
         CacheType.SELFKONLY,
         num_layers=5,
@@ -191,11 +200,26 @@ def test_warmup_cache_cleanup_preserves_swa_guards(manager) -> None:
 
 
 @skip_pre_blackwell
-def test_owner_views_and_lifecycle(manager):
+def test_owner_views_and_lifecycle(manager, swa_dtype):
     cache = allocate(manager, 10, [], 513)
-    assert (
-        len({manager.get_cache_indices(10, layer, CSA2CacheRole.SWA)[0] for layer in range(5)}) == 5
-    )
+    expected_width = 512 if swa_dtype == "fp8" else 528
+    assert manager.swa_row_bytes == expected_width
+    assert manager.swa_cache_format == ("swa_fp8" if swa_dtype == "fp8" else "swa")
+    swa_pages = []
+    for layer in range(5):
+        buffer = manager.get_buffers(layer, CSA2CacheRole.SWA)
+        assert buffer.dtype == torch.uint8
+        assert buffer.shape[1:] == (manager.tokens_per_block, expected_width)
+        assert manager.get_swa_buffer(layer).stride() == (expected_width, 1)
+        page = manager.get_cache_indices(10, layer, CSA2CacheRole.SWA)[0]
+        assert 0 <= page < buffer.shape[0]
+        swa_pages.append(buffer[page])
+    # Page numbers are pool-relative; the addressed storage must be private.
+    assert len({page.data_ptr() for page in swa_pages}) == 5
+    for layer, page in enumerate(swa_pages):
+        page.fill_(layer + 11)
+    for layer, page in enumerate(swa_pages):
+        torch.testing.assert_close(page, torch.full_like(page, layer + 11), rtol=0, atol=0)
     for owner in (1, 3):
         main, index = manager.get_main_buffer(owner), manager.get_index_pages(owner)
         ratio = manager.layout.compress_ratios[owner]
@@ -227,6 +251,24 @@ def test_owner_views_and_lifecycle(manager):
             torch.full((68,), 91, dtype=torch.uint8, device=main.device),
         )
     sizes, windows = manager._get_runtime_cache_size_layer_components()
+    assert sizes.count(expected_width) == 5
+    for context in (True, False):
+        request = SimpleNamespace(is_context_init_state=context, prompt_len=513, max_new_tokens=257)
+        tokens = 513 + manager.num_extra_kv_tokens + (0 if context else 257)
+        pages = (tokens + manager.tokens_per_block - 1) // manager.tokens_per_block
+        expected = sum(
+            size
+            * manager.tokens_per_block
+            * (
+                pages
+                if context or window is None
+                else min(
+                    pages, (window + manager.tokens_per_block - 1) // manager.tokens_per_block + 1
+                )
+            )
+            for size, window in zip(sizes, windows)
+        )
+        assert manager.get_needed_resource_to_completion(request) == expected
     assert sum(size for size, window in zip(sizes, windows) if window is None) == 534
     assert sizes.count(4096) == 1
     quota = manager._get_quota_from_max_tokens(512)
@@ -242,6 +284,39 @@ def test_owner_views_and_lifecycle(manager):
     assert 10 not in manager.kv_cache_map
     allocate(manager, 11, [], 129)
     assert manager.get_cache_indices(11, 1, CSA2CacheRole.GLOBAL)
+
+
+@skip_pre_blackwell
+def test_swa_publication_matches_persistent_dtype_bytes(manager, swa_dtype):
+    allocate(manager, 12, [], 128)
+    pool = manager.get_swa_buffer(0)
+    page = manager.get_cache_indices(12, 0, CSA2CacheRole.SWA)[0]
+    first = page * manager.tokens_per_block
+    target = pool[first : first + manager.tokens_per_block]
+    target.fill_(0x55)
+    pattern = torch.tensor(
+        [448.0, -448.0, 0.0, -0.0, 1.0625, -1.0625, 1.1875, -1.1875],
+        dtype=torch.bfloat16,
+        device=pool.device,
+    )
+    values = pattern.repeat(2, 64)
+    values[1].neg_()
+    slots = torch.tensor([first, first + manager.tokens_per_block - 1], device=pool.device)
+    manager.write_swa(0, slots[:1], values[:1])
+    manager.write_layer_rows(0, slots[1:], values[1:])
+    payload = values.float().clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
+    expected = torch.full_like(target, 0x55)
+    if swa_dtype == "fp8":
+        assert pool.shape[1] == 512
+        expected[0] = payload[0]
+        expected[-1] = payload[1]
+    else:
+        assert pool.shape[1] == 528
+        # Every group contains magnitude 448, so its UE8M0 scale is exactly one.
+        expected[0, :512] = payload[0]
+        expected[-1, :512] = payload[1]
+        expected[[0, -1], 512:] = 127
+    torch.testing.assert_close(target, expected, rtol=0, atol=0)
 
 
 @skip_pre_blackwell
@@ -626,8 +701,10 @@ def _context_only_layout() -> CSA2Layout:
     )
 
 
-def _declarative_manager(limit: int | None) -> CSA2CacheManager:
+def _declarative_manager(limit: int | None, kv_cache_dtype: str = "auto") -> CSA2CacheManager:
     manager = object.__new__(CSA2CacheManager)
+    manager.swa_cache_format = resolve_swa_cache_format(kv_cache_dtype)
+    manager.swa_row_bytes = row_bytes(512, manager.swa_cache_format)
     manager.context_swa_layer_limit = limit
     manager.layout = _context_only_layout()
     manager.pp_layers = list(range(40))
@@ -656,8 +733,9 @@ def test_invalid_context_swa_limit_fails_before_allocation(limit) -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("limit", [None, 20])
-def test_prune_only_physical_swa_groups(limit: int | None) -> None:
-    manager = _declarative_manager(limit)
+@pytest.mark.parametrize("kv_dtype,swa_bytes", [("fp8", 512), ("fp8_ds_mla", 528)])
+def test_prune_only_physical_swa_groups(limit: int | None, kv_dtype: str, swa_bytes: int) -> None:
+    manager = _declarative_manager(limit, kv_dtype)
     built = manager._build_cache_config(SimpleNamespace(swa_scratch_reuse=None))
     retained = 40 if limit is None else limit
     assert manager.pp_layers == list(range(40))
@@ -683,7 +761,8 @@ def test_prune_only_physical_swa_groups(limit: int | None) -> None:
             (14, 2),
         }
     sizes, windows = manager._get_runtime_cache_size_layer_components()
-    assert sizes.count(528) == retained
+    assert sizes.count(swa_bytes) == retained
+    assert manager.swa_row_bytes == swa_bytes
     assert sum(size for size, window in zip(sizes, windows) if window is None) == 890
     assert sizes.count(4096) == 3
     assert (
@@ -694,8 +773,9 @@ def test_prune_only_physical_swa_groups(limit: int | None) -> None:
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("tokens_per_block", [128, 256])
 @pytest.mark.parametrize("remote_tail", [False, True])
+@pytest.mark.parametrize("kv_dtype,swa_bytes", [("fp8", 512), ("fp8_ds_mla", 528)])
 def test_static_sizing_removes_only_swa_reservation(
-    tokens_per_block: int, remote_tail: bool
+    tokens_per_block: int, remote_tail: bool, kv_dtype: str, swa_bytes: int
 ) -> None:
     layout = _context_only_layout()
     text_config = SimpleNamespace(
@@ -709,26 +789,57 @@ def test_static_sizing_removes_only_swa_reservation(
         sliding_window=layout.window_size,
     )
     model = SimpleNamespace(pretrained_config=text_config, get_num_attention_layers=lambda: 40)
+    config = KvCacheConfig(dtype=kv_dtype)
     ordinary = CSA2CacheManager.get_cache_size_per_token(
-        model, Mapping(), tokens_per_block=tokens_per_block, max_batch_size=32
+        model,
+        Mapping(),
+        tokens_per_block=tokens_per_block,
+        max_batch_size=32,
+        kv_cache_config=config,
     )
     model.extra_attrs = {"bounded_replay_on_generation": remote_tail}
     full = CSA2CacheManager.get_cache_size_per_token(
-        model, Mapping(), tokens_per_block=tokens_per_block, max_batch_size=32
+        model,
+        Mapping(),
+        tokens_per_block=tokens_per_block,
+        max_batch_size=32,
+        kv_cache_config=config,
+    )
+    model.extra_attrs["kv_cache_dtype"] = kv_dtype
+    assert (
+        CSA2CacheManager.get_cache_size_per_token(
+            model, Mapping(), tokens_per_block=tokens_per_block, max_batch_size=32
+        )
+        == full
+    )
+    model.extra_attrs["kv_cache_dtype"] = "fp8_ds_mla" if kv_dtype == "fp8" else "fp8"
+    assert (
+        CSA2CacheManager.get_cache_size_per_token(
+            model,
+            Mapping(),
+            tokens_per_block=tokens_per_block,
+            max_batch_size=32,
+            kv_cache_config=config,
+        )
+        == full
     )
     # Remote-tail retention adds a 128-row lookback to the 141-row replay window.
     extra_pages = int(remote_tail)
     assert full[0] == ordinary[0]
-    assert full[1] - ordinary[1] == 20 * extra_pages * tokens_per_block * 528 * 32
+    assert full[1] - ordinary[1] == 20 * extra_pages * tokens_per_block * swa_bytes * 32
     model.extra_attrs["csa2_context_swa_layer_limit"] = 20
     pruned = CSA2CacheManager.get_cache_size_per_token(
-        model, Mapping(), tokens_per_block=tokens_per_block, max_batch_size=32
+        model,
+        Mapping(),
+        tokens_per_block=tokens_per_block,
+        max_batch_size=32,
+        kv_cache_config=config,
     )
     # The GLOBAL token slope stays fixed. Replay pages include headroom for
     # the worst page alignment, including three pages for 128-token blocks.
     assert full[0] == pruned[0] == 890
     decoder_pages = 3 if tokens_per_block == 128 else 2
-    assert full[1] - pruned[1] == 20 * decoder_pages * tokens_per_block * 528 * 32
+    assert full[1] - pruned[1] == 20 * decoder_pages * tokens_per_block * swa_bytes * 32
 
 
 @pytest.mark.cpu_only
@@ -875,7 +986,7 @@ def _host_tier_manager() -> CSA2CacheManager:
             host_cache_size=512 << 20,
             enable_block_reuse=True,
             block_reuse_config=BlockReuseConfig(policy="all_reusable"),
-            dtype="fp8",
+            dtype="fp8_ds_mla",
         ),
         CacheType.SELFKONLY,
         num_layers=5,

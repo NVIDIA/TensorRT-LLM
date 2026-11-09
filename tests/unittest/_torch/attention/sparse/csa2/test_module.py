@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """CSA2 module, configuration, checkpoint projections and native compressor contracts."""
 
+from __future__ import annotations
+
 from collections import Counter
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
@@ -18,6 +21,7 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
     CSA2Layout,
     CSA2Mode,
     CSA2Params,
+    resolve_swa_cache_format,
     select_csa2_backend,
 )
 from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
@@ -28,6 +32,18 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.weights import load_atte
 from tensorrt_llm._torch.attention.backends.sparse.registry import get_sparse_attn_kv_cache_manager
 from tensorrt_llm._torch.utils import MxFp8QuantizedTensor
 from tensorrt_llm.llmapi.llm_args import CSA2SparseAttentionConfig, SparseAttentionConfig
+
+from ._utils import _assert_fp8_close
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention.backends.interface import (
+        AttentionForwardArgs,
+        AttentionInputType,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
+    from tensorrt_llm._torch.distributed import AllReduceStrategy
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm.mapping import Mapping
 
 skip_pre_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
@@ -59,16 +75,20 @@ def _norm(x, weight, eps):
 
 @pytest.mark.cpu_only
 # flash_mla and flashinfer share the module-side helper dispatch; one Flash case suffices.
-@pytest.mark.parametrize("implementation", ["trtllm", "flashinfer"])
+@pytest.mark.parametrize("implementation", ["trtllm", "flashinfer", "prims_ts"])
+@pytest.mark.parametrize(
+    "contexts,generations", [(263, 257), (263, 0), (0, 257)], ids=["mixed", "context", "generation"]
+)
 @torch.inference_mode()
-def test_module_sends_whole_context_and_generation_phases(monkeypatch, implementation):
+def test_module_sends_whole_context_and_generation_phases(
+    monkeypatch: pytest.MonkeyPatch, implementation: str, contexts: int, generations: int
+) -> None:
     """Exercise module orchestration and real publication/slicing, without FMHA."""
     from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
     from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
     from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
     from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Params
 
-    contexts, generations = 263, 257
     count = contexts + generations
     hidden = (torch.arange(count * 512).reshape(count, 512) % 31 - 15).bfloat16()
     positions = torch.cat((torch.arange(contexts), torch.arange(generations) + 1024)).int()
@@ -104,6 +124,7 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
         return None
 
     manager = SimpleNamespace(
+        swa_cache_format="swa",
         write_layer_rows=write_layer_rows,
         get_swa_buffer=lambda layer: torch.empty(count, 528, dtype=torch.uint8),
         get_main_buffer=lambda layer: torch.empty(count, 288, dtype=torch.uint8),
@@ -116,6 +137,11 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
         csa2_main_write_slots={0: row_ids},
         csa2_swa_indices={0: row_ids[:, None]},
         csa2_visible_lengths={0: row_ids + 1},
+        csa2_kv_sources={0: 0},
+        csa2_global_page_tables={0: torch.arange((count + 127) // 128).int().reshape(1, -1)},
+        csa2_global_page_sizes={0: 128},
+        csa2_global_max_positions={0: count},
+        csa2_token_requests=torch.zeros(count, dtype=torch.int64),
         csa2_indices={},
         get_compression_batch=lambda layer: None,
         get_compressed_positions=lambda layer: positions,
@@ -123,15 +149,24 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
         enter_layer=lambda layer: entered.append(layer.layer_idx),
     )
 
-    def phase_metadata(query, extra_width, query_start, *, staging_dtype, layer_idx=None):
+    def phase_metadata(
+        query, extra_width, query_start, *, staging_dtype, layer_idx=None, kv_input_mode
+    ):
         stop = query_start + query.shape[0]
         assert stop <= (contexts if query_start < contexts else count)
+        assert kv_input_mode == ("packed" if implementation == "prims_ts" else "staged")
         torch.testing.assert_close(query.flatten(1), hidden[query_start:stop], atol=0, rtol=0)
         return SimpleNamespace(
             num_contexts=int(query_start < contexts),
             num_tokens=query.shape[0],
             num_query_heads=1,
-            swa_pool=torch.empty(0, dtype=staging_dtype),
+            kv_input_mode=kv_input_mode,
+            _csa2_device=query.device,
+            **(
+                {"swa_pool": torch.empty(0, dtype=staging_dtype)}
+                if kv_input_mode == "staged"
+                else {}
+            ),
         )
 
     def map_indices(layer, start, end, logical, *, visible_lengths):
@@ -148,8 +183,11 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
         source.csa2_indices[0] = row_ids[:, None]
 
     backend = SimpleNamespace(
+        swa_cache_format="swa",
+        compute_backend=implementation,
         sparse_params=CSA2Params(layout=layout, compute_backend=implementation),
         staging_dtype=torch.bfloat16,
+        kv_input_mode="packed" if implementation == "prims_ts" else "staged",
         native_fp8=False,
         fused_decode=False,
         gen_fmha_serves=lambda *args: False,
@@ -172,6 +210,10 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
         start = forward_args.sparse_backend_args.query_start
         calls.append((forward_args.attention_input_type, start, query.shape[0]))
         selected = CSA2TrtllmAttention.prepare_sparse_inputs(backend, query, metadata, forward_args)
+        assert (selected.main_mapping is not None) == (implementation == "prims_ts")
+        if implementation == "prims_ts":
+            assert selected.main_mapping[0] is source.csa2_global_page_tables[0]
+            assert selected.topk_indices.data_ptr() == source.csa2_indices[0][start:].data_ptr()
         torch.testing.assert_close(
             selected.swa_indices[:, 0], row_ids[start : start + query.shape[0]], atol=0, rtol=0
         )
@@ -190,10 +232,15 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
         # Ignore provider return values: output ownership is carried by the args.
         return None
 
-    def unexpected_native(*args, **kwargs):
-        pytest.fail("Flash helper fell through to native forward")
+    def unexpected_native(*args: object, **kwargs: object) -> None:
+        pytest.fail("Compute helper fell through to native forward")
 
-    def flash_compute(phase, query, metadata, args):
+    def helper_compute(
+        phase: AttentionInputType,
+        query: torch.Tensor,
+        metadata: SimpleNamespace,
+        args: AttentionForwardArgs,
+    ) -> None:
         assert args.attention_input_type == phase
         return compute(query, None, None, metadata, forward_args=args)
 
@@ -206,17 +253,19 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
     model.wq_a = model.wq_b = model.wkv = nn.Identity()
     model.compressor = nn.Identity()
     model.q_norm = model.kv_norm = nn.Identity()
+    # Decode steps project through the identity modules above, not the fused small-M GEMM.
+    model._lowm_qkv_projection = False
     # Neox RoPE keeps the explicit norm / RoPE calls this test patches out of the cache writes.
     model.rotary_emb = SimpleNamespace(is_neox=True)
     model.attn_sink = torch.zeros(1)
-    model._flash_attention = (
+    model._compute_helper = (
         None
         if implementation == "trtllm"
         else SimpleNamespace(
-            forward_context=lambda query, metadata, args: flash_compute(
+            forward_context=lambda query, metadata, args: helper_compute(
                 AttentionInputType.context_only, query, metadata, args
             ),
-            forward_generation=lambda query, metadata, args: flash_compute(
+            forward_generation=lambda query, metadata, args: helper_compute(
                 AttentionInputType.generation_only, query, metadata, args
             ),
         )
@@ -231,13 +280,18 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
     model._project_output = lambda output, position, inverse_rope_applied, rotated_back: (
         output.flatten(1)
     )
+    assert model.supports_row_split is (implementation == "trtllm")
     actual = model(hidden, positions, source)
     expected = hidden + (row_ids[:, None].remainder(7) + 1).to(hidden.dtype)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     assert actual.data_ptr() == phase_outputs[0].data_ptr()
     assert calls == [
-        (AttentionInputType.context_only, 0, contexts),
-        (AttentionInputType.generation_only, contexts, generations),
+        (phase, start, rows)
+        for phase, start, rows in (
+            (AttentionInputType.context_only, 0, contexts),
+            (AttentionInputType.generation_only, contexts, generations),
+        )
+        if rows
     ]
     assert published == [("swa", 0), ("global", 0)]
     assert index_calls == [(0, count)] and entered == [0]
@@ -253,7 +307,8 @@ def module_cache(request):
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
     from tensorrt_llm.mapping import Mapping
 
-    compress_ratio = getattr(request, "param", 2)
+    params = getattr(request, "param", 2)
+    compress_ratio, kv_cache_dtype = params if isinstance(params, tuple) else (params, "fp8_ds_mla")
     # Ratio 0 makes the single layer SWA-only, without global KV or index sources.
     sources = () if compress_ratio == 0 else (0,)
     manager = CSA2CacheManager(
@@ -261,7 +316,7 @@ def module_cache(request):
             enable_block_reuse=False,
             max_gpu_total_bytes=128 << 20,
             enable_swa_scratch_reuse=True,
-            dtype="fp8",
+            dtype=kv_cache_dtype,
         ),
         CacheType.SELFKONLY,
         num_layers=1,
@@ -369,7 +424,19 @@ def test_ced_owner_is_written_once_before_narrowed_query(monkeypatch, module_cac
 
 
 @torch.inference_mode()
-def _check_ratio2_module_partial_groups(monkeypatch, module_cache, overlap, implementation):
+def _check_ratio2_module_partial_groups(
+    monkeypatch: pytest.MonkeyPatch,
+    module_cache: tuple[CSA2CacheManager, LlmRequest],
+    overlap: bool,
+    implementation: str,
+) -> None:
+    if implementation == "prims_ts" and torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+        (10, 7),
+    ):
+        pytest.skip("CSA2 PrimTS requires SM100, SM103 or SM107")
+
     from tensorrt_llm._torch.attention.backends.interface import (
         PositionalEmbeddingParams,
         RopeParams,
@@ -411,6 +478,7 @@ def _check_ratio2_module_partial_groups(monkeypatch, module_cache, overlap, impl
             num_groups=2,
             index_heads=2,
             compute_backend=implementation,
+            kv_cache_dtype="fp8" if manager.swa_cache_format == "swa_fp8" else "auto",
             aux_stream=torch.cuda.Stream() if overlap else None,
         )
         for name, parameter in model.named_parameters():
@@ -434,14 +502,17 @@ def _check_ratio2_module_partial_groups(monkeypatch, module_cache, overlap, impl
         return original_prepare(*args, **kwargs)
 
     monkeypatch.setattr(model.backend, "prepare_sparse_inputs", record_prepare)
-    if implementation != "auto":
+    if implementation != "trtllm":
         from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 
         def unexpected_native(*args, **kwargs):
-            pytest.fail("Module Flash helper fell through to native attention")
+            pytest.fail("Module compute helper fell through to native attention")
 
         monkeypatch.setattr(FallbackFmha, "forward", unexpected_native)
-        assert model._flash_attention is not None
+        assert model._compute_helper is not None
+        assert not model.backend.native_fp8 and not model.backend.fused_context
+    else:
+        assert model._compute_helper is None
     native_rope = torch.ops.trtllm.mla_rope_inplace
     rope_rows = []
 
@@ -492,7 +563,11 @@ def _check_ratio2_module_partial_groups(monkeypatch, module_cache, overlap, impl
             F.linear(hidden[: token + 1], model.wkv.weight), model.kv_norm.weight, model.eps
         )
         swa = _rotate(swa.unsqueeze(1), prefix_positions, cos_sin).squeeze(1)
-        selected = unpack_rows(pack_rows(swa, "swa"), 512, "swa")
+        selected = (
+            swa.float().clamp(-448, 448).to(torch.float8_e4m3fn).bfloat16()
+            if manager.swa_cache_format == "swa_fp8"
+            else unpack_rows(pack_rows(swa, "swa"), 512, "swa")
+        )
         if completed:
             source = hidden[: completed * 2]
             values, gates = (
@@ -513,44 +588,75 @@ def _check_ratio2_module_partial_groups(monkeypatch, module_cache, overlap, impl
         output = _rotate(output, positions, cos_sin, inverse=True).reshape(1, 2, -1)
         projected = torch.einsum("qgd,grd->qgr", output, model.o_a_proj).flatten(1)
         expected = F.linear(projected, model.o_b_proj.weight)
-        torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+        if implementation == "prims_ts" or (
+            implementation == "trtllm" and model.backend.native_fp8
+        ):
+            _assert_fp8_close(actual, expected)
+        else:
+            torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
         assert len(preparation_calls) == token + 1
 
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("overlap", [False, True])
-def test_ratio2_module_partial_groups(monkeypatch, module_cache, overlap):
-    _check_ratio2_module_partial_groups(monkeypatch, module_cache, overlap, "auto")
+def test_ratio2_module_partial_groups(
+    monkeypatch: pytest.MonkeyPatch,
+    module_cache: tuple[CSA2CacheManager, LlmRequest],
+    overlap: bool,
+) -> None:
+    _check_ratio2_module_partial_groups(monkeypatch, module_cache, overlap, "trtllm")
 
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
-    "implementation", [pytest.param("flash_mla", marks=skip_blackwell_geforce), "flashinfer"]
+    "implementation",
+    [pytest.param("flash_mla", marks=skip_blackwell_geforce), "flashinfer", "prims_ts"],
 )
-def test_module_composed_flash_helper(monkeypatch, module_cache, implementation):
+def test_module_composed_flash_helper(
+    monkeypatch: pytest.MonkeyPatch,
+    module_cache: tuple[CSA2CacheManager, LlmRequest],
+    implementation: str,
+) -> None:
+    _check_ratio2_module_partial_groups(monkeypatch, module_cache, False, implementation)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("module_cache", [pytest.param((2, "fp8"), id="fp8")], indirect=True)
+@pytest.mark.parametrize("implementation", ["trtllm", "prims_ts"])
+def test_module_ordinary_fp8_publication_and_attention(
+    monkeypatch: pytest.MonkeyPatch,
+    module_cache: tuple[CSA2CacheManager, LlmRequest],
+    implementation: str,
+) -> None:
+    """The module writes footer-free SWA and reads it alongside unchanged NVFP4 MAIN."""
+    manager, _ = module_cache
+    assert manager.swa_cache_format == "swa_fp8"
+    assert manager.get_swa_buffer(0).shape[1] == 512
+    assert manager.get_main_buffer(0).shape[1] == 288
     _check_ratio2_module_partial_groups(monkeypatch, module_cache, False, implementation)
 
 
 def _native_model(
     *,
-    grouped_block=32,
-    fused=False,
-    aux_stream=None,
-    layout=None,
-    attention_heads=8,
-    projection_quantization="mxfp8",
-    sparse_options=None,
-    mapping=None,
-    num_groups=2,
-    q_lora_rank=128,
-    allreduce_strategy=None,
-    kv_cache_dtype="auto",
-    layer_idx=0,
-    max_positions=32,
-    hidden_size=128,
-):
+    grouped_block: int = 32,
+    fused: bool = False,
+    aux_stream: torch.cuda.Stream | None = None,
+    layout: CSA2Layout | None = None,
+    attention_heads: int = 8,
+    projection_quantization: str = "mxfp8",
+    sparse_options: dict[str, bool | str] | None = None,
+    mapping: Mapping | None = None,
+    num_groups: int = 2,
+    q_lora_rank: int = 128,
+    allreduce_strategy: AllReduceStrategy | None = None,
+    kv_cache_dtype: str = "auto",
+    layer_idx: int = 0,
+    max_positions: int = 32,
+    hidden_size: int = 128,
+) -> tuple[DeepseekV41Attention, dict[str, torch.Tensor]]:
     from tensorrt_llm._torch.attention.backends.interface import (
         PositionalEmbeddingParams,
         RopeParams,
@@ -562,7 +668,7 @@ def _native_model(
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("Native MXFP8 projections require SM100/SM103/SM107")
     layout = layout or CSA2Layout((1,), (0,), (0,), index_topk=32)
-    options = {"fuse_index_q": fused}
+    options = {"compute_backend": "trtllm", "fuse_index_q": fused}
     options.update(sparse_options or {})
     with torch.device("cuda"):
         model = DeepseekV41Attention(
@@ -946,6 +1052,44 @@ def test_native_grouped_output_paths_and_replay(monkeypatch, block, path):
         assert error < 0.12
 
 
+@pytest.mark.parametrize("offset", [-1, 7], ids=["below", "above"])
+@torch.inference_mode()
+def test_grouped_mxfp8_output_o_b_cute_gemm(monkeypatch, offset):
+    """From the dense O-B threshold on, the MXFP8 output projection's O-B is the CuTe GEMM,
+    byte for byte."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import projection
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.module import _DENSE_O_B_MIN_ROWS
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import native_mxfp8_gemm
+
+    rows = _DENSE_O_B_MIN_ROWS + offset
+    torch.manual_seed(947)
+    model, _ = _native_model(grouped_block=128, hidden_size=256)
+    # Without a TP reduction O-B takes the latent quantized by the O-A epilogue.
+    model.o_b_proj.reduce_output = False
+    calls = []
+    original = projection.dense_mxfp8_gemm
+
+    def dense(*args, **kwargs):
+        calls.append(args[0].shape[0])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(projection, "dense_mxfp8_gemm", dense)
+    values = torch.randn(rows, 8 * 512, device="cuda", dtype=torch.bfloat16)
+    positions = torch.randint(0, 32, (rows,), device="cuda", dtype=torch.int32)
+    projected = model._project_output_mxfp8(values, positions)
+    assert calls == ([rows] if offset >= 0 else [])
+    latent = projection.grouped_output_mxfp8(
+        values,
+        positions,
+        model.inverse_rotary_emb.rotary_cos_sin,
+        model.o_a_proj,
+        model._o_a_mxfp8_scale,
+        model._fp8_alpha,
+        quantize_output=True,
+    )
+    assert torch.equal(projected, native_mxfp8_gemm(model.o_b_proj, *latent))
+
+
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
@@ -1148,7 +1292,7 @@ def test_index_query_pack_publishes_rows_beside_index_chain(monkeypatch, module_
 
     manager, request = module_cache
     model, _ = _native_model(
-        aux_stream=torch.cuda.Stream(), layout=manager.layout, kv_cache_dtype="fp8"
+        aux_stream=torch.cuda.Stream(), layout=manager.layout, kv_cache_dtype="fp8_ds_mla"
     )
     for linear in (model.wq_a, model.wq_b, model.wkv):
         linear.quant_method.tune_mxfp8_backends = True
@@ -1256,7 +1400,7 @@ def test_small_step_query_amax_word_decode_and_graph(monkeypatch, module_cache, 
     model, _ = _native_model(
         aux_stream=torch.cuda.Stream() if overlap else None,
         layout=manager.layout,
-        kv_cache_dtype="fp8",
+        kv_cache_dtype="fp8_ds_mla",
     )
     assert model.backend.native_fp8
     for linear in (model.wq_a, model.wq_b, model.wkv):
@@ -1319,7 +1463,11 @@ def test_small_step_query_amax_word_decode_and_graph(monkeypatch, module_cache, 
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("overlap,module_cache", [(True, 0), (False, 2)], indirect=["module_cache"])
+@pytest.mark.parametrize(
+    "overlap,module_cache",
+    [(True, 0), (False, 2), pytest.param(False, (2, "fp8"), id="False-2-fp8")],
+    indirect=["module_cache"],
+)
 @torch.inference_mode()
 def test_fp8_query_projection_decode_and_graph(monkeypatch, module_cache, overlap):
     """Decode Q projected straight to E4M3 matches staging's own BF16 Q quantization.
@@ -1349,9 +1497,10 @@ def test_fp8_query_projection_decode_and_graph(monkeypatch, module_cache, overla
     model, _ = _native_model(
         aux_stream=torch.cuda.Stream() if overlap else None,
         layout=manager.layout,
-        kv_cache_dtype="fp8",
+        kv_cache_dtype="fp8" if manager.swa_cache_format == "swa_fp8" else "fp8_ds_mla",
     )
     assert model.backend.native_fp8
+    assert model.backend.swa_cache_format == manager.swa_cache_format
     model._fp8_q_min_tokens = 1
     # The BF16 comparison Q comes from the same MXFP8 GEMM, not the small-M kernel.
     monkeypatch.setattr(model, "_lowm_projects", lambda linear, rows: False)
@@ -1830,7 +1979,7 @@ def test_two_rank_module_projection_parity(monkeypatch, quantization):
                 enable_block_reuse=False,
                 max_gpu_total_bytes=128 << 20,
                 enable_swa_scratch_reuse=True,
-                dtype="fp8",
+                dtype="fp8_ds_mla",
             ),
             CacheType.SELFKONLY,
             num_layers=1,
@@ -1889,7 +2038,7 @@ def test_two_rank_module_projection_parity(monkeypatch, quantization):
 
 
 @pytest.fixture
-def replay_module_factory():
+def replay_module_factory(monkeypatch):
     from tensorrt_llm._torch.attention.backends.interface import (
         PositionalEmbeddingParams,
         RopeParams,
@@ -1905,6 +2054,9 @@ def replay_module_factory():
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
     from tensorrt_llm.mapping import Mapping
 
+    # The replay checks compare with a BF16 reference of the native provider's attention;
+    # PrimTS's E4M3 attention has its own accuracy tests.
+    monkeypatch.setenv("TRTLLM_CSA2_COMPUTE_BACKEND", "trtllm")
     resources = []
 
     def create(ratio, input_length=8):
@@ -1914,7 +2066,7 @@ def replay_module_factory():
                 enable_block_reuse=False,
                 max_gpu_total_bytes=128 << 20,
                 enable_swa_scratch_reuse=True,
-                dtype="fp8",
+                dtype="fp8_ds_mla",
             ),
             CacheType.SELFKONLY,
             num_layers=1,
@@ -2374,25 +2526,120 @@ def test_invalid_layout(ratios, kv, index, candidate):
         CSA2Layout(ratios, kv, index, candidate)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "sm,backend",
     [
         (90, "flash_mla"),
-        (100, "trtllm"),
-        (103, "trtllm"),
-        (107, "trtllm"),
+        (100, "prims_ts"),
+        (103, "prims_ts"),
+        (107, "prims_ts"),
         (120, "flashinfer"),
         (121, "flashinfer"),
     ],
 )
-def test_hardware_policy(sm, backend):
+def test_hardware_policy(monkeypatch: pytest.MonkeyPatch, sm: int, backend: str) -> None:
+    monkeypatch.delenv("TRTLLM_CSA2_COMPUTE_BACKEND", raising=False)
     assert select_csa2_backend(sm) == backend
+    assert select_csa2_backend(sm, CSA2Params()) == backend
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("sm", [80, 89, 110, 130])
-def test_unsupported_hardware(sm):
+def test_unsupported_hardware(monkeypatch: pytest.MonkeyPatch, sm: int) -> None:
+    monkeypatch.delenv("TRTLLM_CSA2_COMPUTE_BACKEND", raising=False)
     with pytest.raises(ValueError, match="unsupported"):
         select_csa2_backend(sm)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "internal,environment,expected",
+    [
+        ("trtllm", "prims_ts", "trtllm"),
+        ("prims_ts", "trtllm", "prims_ts"),
+        ("flashinfer", "prims_ts", "flashinfer"),
+        ("flash_mla", "invalid", "flash_mla"),
+        ("auto", "trtllm", "trtllm"),
+        ("auto", "flashinfer", "flashinfer"),
+        ("auto", "prims_ts", "prims_ts"),
+        ("auto", "auto", "prims_ts"),
+        ("auto", None, "prims_ts"),
+    ],
+)
+def test_backend_selector_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+    internal: str,
+    environment: str | None,
+    expected: str,
+) -> None:
+    if environment is None:
+        monkeypatch.delenv("TRTLLM_CSA2_COMPUTE_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_CSA2_COMPUTE_BACKEND", environment)
+    assert select_csa2_backend(100, CSA2Params(compute_backend=internal)) == expected
+    if internal == "auto":
+        assert select_csa2_backend(100) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm", [100, 103, 107])
+@pytest.mark.parametrize("option", ["use_packed_sparse_attention", "use_fp8_staging"])
+def test_auto_native_only_options(monkeypatch: pytest.MonkeyPatch, sm: int, option: str) -> None:
+    monkeypatch.setenv("TRTLLM_CSA2_COMPUTE_BACKEND", "auto")
+    assert select_csa2_backend(sm, CSA2Params(**{option: True})) == "trtllm"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("source", ["internal", "environment"])
+@pytest.mark.parametrize(
+    "sm,option,error",
+    [
+        (
+            100,
+            "use_packed_sparse_attention",
+            "cannot select the separate custom packed attention kernel",
+        ),
+        (
+            103,
+            "use_packed_sparse_attention",
+            "cannot select the separate custom packed attention kernel",
+        ),
+        (
+            107,
+            "use_packed_sparse_attention",
+            "cannot select the separate custom packed attention kernel",
+        ),
+        (100, "use_fp8_staging", "FP8 staging requires trtllm-gen without packed attention"),
+        (103, "use_fp8_staging", "FP8 staging requires trtllm-gen without packed attention"),
+        (107, "use_fp8_staging", "FP8 staging requires trtllm-gen without packed attention"),
+        (90, None, "requires SM100, SM103 or SM107"),
+        (110, None, "requires SM100, SM103 or SM107"),
+        (120, None, "requires SM100, SM103 or SM107"),
+        (121, None, "requires SM100, SM103 or SM107"),
+    ],
+)
+def test_prims_ts_rejects_unsupported_options(
+    monkeypatch: pytest.MonkeyPatch, source: str, sm: int, option: str | None, error: str
+) -> None:
+    monkeypatch.setenv("TRTLLM_CSA2_COMPUTE_BACKEND", "prims_ts")
+    params = CSA2Params(
+        compute_backend="prims_ts" if source == "internal" else "auto",
+        **({option: True} if option is not None else {}),
+    )
+    with pytest.raises(ValueError, match=error):
+        select_csa2_backend(sm, params)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("source", ["internal", "environment"])
+def test_backend_selector_rejects_unknown_provider(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    monkeypatch.setenv("TRTLLM_CSA2_COMPUTE_BACKEND", "invalid")
+    params = CSA2Params(compute_backend="invalid" if source == "internal" else "auto")
+    with pytest.raises(ValueError, match="Unknown CSA2 attention backend: invalid"):
+        select_csa2_backend(100, params)
 
 
 def _reference(kv_score, ratio, dim):
@@ -2689,16 +2936,8 @@ def test_dense_fp8_requantized_scale_blocks_preserve_tp_slices(block, name):
         torch.testing.assert_close(module.o_b_proj.weight, expanded[:, 128:])
 
 
-@skip_pre_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@torch.inference_mode()
-def test_hf_factory_selects_native_fp8_for_both_fp8_cache_spellings():
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
-    from tensorrt_llm._utils import is_sm_100f
-
-    if not is_sm_100f():
-        pytest.skip("Native FP8 sparse MLA requires SM100-family")
-    config = SimpleNamespace(
+def _swa_hf_config() -> SimpleNamespace:
+    return SimpleNamespace(
         model_type="deepseek_v41",
         compress_ratios=(0,),
         kv_source_layer_ids=(),
@@ -2721,11 +2960,23 @@ def test_hf_factory_selects_native_fp8_for_both_fp8_cache_spellings():
         rope_theta=160000,
         max_position_embeddings=8,
     )
-    with torch.device("cuda"):
-        reference = DeepseekV41Attention.from_hf_config(config, 0, kv_cache_dtype="auto")
-    # Either FP8 spelling reaches native E4M3 staging on its own, because this
-    # factory builds the trtllm-gen path that serves it. ``auto`` requests no FP8
-    # at all, and an explicit ``False`` still pins BF16 against an FP8 KV dtype.
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_hf_factory_selects_native_fp8_for_both_fp8_cache_spellings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
+    from tensorrt_llm._utils import is_sm_100f
+
+    if not is_sm_100f():
+        pytest.skip("Native FP8 sparse MLA requires SM100-family")
+    monkeypatch.setenv("TRTLLM_CSA2_COMPUTE_BACKEND", "prims_ts")
+    config = _swa_hf_config()
+    # An explicit native provider takes priority over the environment. Either
+    # FP8 spelling stages E4M3 unless staging is explicitly disabled.
     for requested, staging, fp8 in (
         ("fp8", None, True),
         ("fp8_ds_mla", None, True),
@@ -2733,19 +2984,68 @@ def test_hf_factory_selects_native_fp8_for_both_fp8_cache_spellings():
         ("fp8", True, True),
         ("fp8", False, False),
     ):
-        params = (
-            None
-            if staging is None
-            else CSA2Params(layout=reference.layout, use_fp8_staging=staging)
+        params = CSA2Params(
+            layout=CSA2Layout.from_hf_config(config),
+            compute_backend="trtllm",
+            use_fp8_staging=staging,
         )
         with torch.device("cuda"):
             model = DeepseekV41Attention.from_hf_config(
                 config, 0, kv_cache_dtype=requested, sparse_params=params
             )
+        assert model.layout.index_heads == config.index_n_heads
+        assert model.layout.index_head_dim == config.index_head_dim
         assert model.backend.compute_backend == "trtllm"
         assert model.backend.native_fp8 is fp8
+        assert model.backend.swa_cache_format == resolve_swa_cache_format(requested)
         assert model.backend.staging_dtype == (torch.float8_e4m3fn if fp8 else torch.bfloat16)
         assert model.backend.has_fp8_kv_cache == fp8
+        assert model._compute_helper is None
+        assert model.supports_row_split
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("requested", ["fp8", "fp8_ds_mla"])
+@pytest.mark.parametrize("staging", [None, False, True])
+@torch.inference_mode()
+def test_hf_factory_auto_backend_and_staging(
+    monkeypatch: pytest.MonkeyPatch, requested: str, staging: bool | None
+) -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.prims_ts import CSA2PrimsTS
+    from tensorrt_llm._utils import get_sm_version, is_sm_100f
+
+    if not is_sm_100f():
+        pytest.skip("CSA2 auto staging comparison requires an SM100-family GPU")
+    monkeypatch.delenv("TRTLLM_CSA2_COMPUTE_BACKEND", raising=False)
+    config = _swa_hf_config()
+    params = (
+        None
+        if staging is None
+        else CSA2Params(layout=CSA2Layout.from_hf_config(config), use_fp8_staging=staging)
+    )
+    with torch.device("cuda"):
+        model = DeepseekV41Attention.from_hf_config(
+            config, 0, kv_cache_dtype=requested, sparse_params=params
+        )
+    prims_ts = get_sm_version() in (100, 103, 107) and staging is not True
+    fp8 = not prims_ts and staging is not False
+    assert model.layout.index_heads == config.index_n_heads
+    assert model.layout.index_head_dim == config.index_head_dim
+    assert model.backend.compute_backend == ("prims_ts" if prims_ts else "trtllm")
+    assert model.backend.kv_input_mode == ("packed" if prims_ts else "staged")
+    assert model.backend.native_fp8 is fp8
+    assert model.backend.swa_cache_format == resolve_swa_cache_format(requested)
+    assert model.backend.staging_dtype == (torch.float8_e4m3fn if fp8 else torch.bfloat16)
+    assert model.backend.has_fp8_kv_cache == fp8
+    if prims_ts:
+        assert isinstance(model._compute_helper, CSA2PrimsTS)
+        assert not model.backend.fused_context
+        assert not model.supports_row_split
+    else:
+        assert model._compute_helper is None
+        assert model.supports_row_split
 
 
 @pytest.fixture
@@ -2757,14 +3057,15 @@ def fused_context_cache(request):
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
     from tensorrt_llm.mapping import Mapping
 
-    ratio = request.param
+    params = request.param
+    ratio, kv_cache_dtype = params if isinstance(params, tuple) else (params, "fp8_ds_mla")
     layout = CSA2Layout((0, ratio, ratio), (1,), (1,), index_topk=512, window_size=128)
     manager = CSA2CacheManager(
         KvCacheConfig(
             enable_block_reuse=False,
             max_tokens=16384,
             enable_swa_scratch_reuse=True,
-            dtype="fp8",
+            dtype=kv_cache_dtype,
         ),
         CacheType.SELFKONLY,
         layout=layout,
@@ -2797,7 +3098,9 @@ def fused_context_cache(request):
     manager.shutdown()
 
 
-def _fused_context_layers(layout):
+def _fused_context_layers(
+    layout: CSA2Layout, kv_cache_dtype: str = "fp8_ds_mla"
+) -> list[DeepseekV41Attention]:
     from tensorrt_llm._torch.attention.backends.interface import (
         PositionalEmbeddingParams,
         RopeParams,
@@ -2824,9 +3127,9 @@ def _fused_context_layers(layout):
                 o_lora_rank=128,
                 num_groups=8,
                 index_heads=32,
-                sparse_params=CSA2Params(layout=layout),
+                sparse_params=CSA2Params(layout=layout, compute_backend="trtllm"),
                 projection_quantization="bf16",
-                kv_cache_dtype="fp8",
+                kv_cache_dtype=kv_cache_dtype,
             )
             for name, parameter in model.named_parameters():
                 if name.endswith("norm.weight"):
@@ -2870,13 +3173,19 @@ def _prefill_attention(layers, manager, requests, hidden):
 
 
 @skip_no_fused_context
-@pytest.mark.parametrize("fused_context_cache", [1, 2], indirect=True)
+@pytest.mark.parametrize(
+    "fused_context_cache", [1, 2, pytest.param((2, "fp8"), id="2-fp8")], indirect=True
+)
 @torch.inference_mode()
 def test_context_prefill_runs_fused_kernel(monkeypatch, fused_context_cache):
     """A prefill of SWA-only, Full and Reuse layers runs every layer's context tile on the fused
     kernel and matches the trtllm-gen context FMHA."""
     manager, requests = fused_context_cache
-    layers = _fused_context_layers(manager.layout)
+    layers = _fused_context_layers(
+        manager.layout,
+        "fp8" if manager.swa_cache_format == "swa_fp8" else "fp8_ds_mla",
+    )
+    assert all(model.backend.swa_cache_format == manager.swa_cache_format for model in layers)
     hidden = torch.randn(
         sum(request.prompt_len for request in requests), 128, device="cuda", dtype=torch.bfloat16
     )
@@ -2915,7 +3224,7 @@ def long_chunk_cache():
             enable_block_reuse=False,
             max_tokens=length + 1024,
             enable_swa_scratch_reuse=True,
-            dtype="fp8",
+            dtype="fp8_ds_mla",
         ),
         CacheType.SELFKONLY,
         layout=layout,
@@ -2977,10 +3286,11 @@ def test_ratio2_compression_of_a_long_chunk(long_chunk_cache):
     assert not latent[length // 2 :].any()
 
 
-def _native_context_layers(layout, kv_cache_dtype="fp8", weights=None):
+def _native_context_layers(layout, kv_cache_dtype="fp8_ds_mla", weights=None, sparse_options=None):
     """Native MXFP8 layers with 64 heads and grouped 128-block O-A, one per layout layer.
 
     Returns the layers and their checkpoint weights; ``weights`` loads given ones instead.
+    ``sparse_options`` overrides CSA2 parameters, such as the compute backend.
     """
     layers, checkpoints = [], []
     for layer_idx in range(len(layout.compress_ratios)):
@@ -2993,6 +3303,7 @@ def _native_context_layers(layout, kv_cache_dtype="fp8", weights=None):
             kv_cache_dtype=kv_cache_dtype,
             max_positions=4096,
             hidden_size=256,
+            sparse_options=sparse_options,
         )
         if weights is not None:
             checkpoint = weights[layer_idx]
@@ -3068,6 +3379,68 @@ def test_context_query_stays_unit_scale_fp8(monkeypatch, fused_context_cache, kv
         error = (actual.float() - expected.float()).norm() / expected.float().norm()
         previous_error = (previous.float() - expected.float()).norm() / expected.float().norm()
         assert error <= max(previous_error * 1.01, 0.02), (error, previous_error)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="CSA2 PrimTS requires SM100, SM103 or SM107",
+)
+@pytest.mark.parametrize("fused_context_cache", [2], indirect=True)
+@torch.inference_mode()
+def test_prims_ts_context_reads_projected_unit_scale_query(monkeypatch, fused_context_cache):
+    """PrimTS context reads the fused Q-B projection's unit-scale E4M3 Q.
+
+    That Q is the projection's BF16 Q rounded exactly as PrimTS's own quantization rounds
+    it, so every way of handing PrimTS this projection's Q gives identical outputs.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import (
+        _prims_ts_quantization,
+        prims_ts,
+        query_projection,
+    )
+
+    manager, requests = fused_context_cache
+    torch.manual_seed(83)
+    layers, _ = _native_context_layers(
+        manager.layout, sparse_options={"compute_backend": "prims_ts"}
+    )
+    assert all(model.backend.compute_backend == "prims_ts" for model in layers)
+    hidden = torch.randn(
+        sum(request.prompt_len for request in requests), 256, device="cuda", dtype=torch.bfloat16
+    )
+    calls = []
+    for owner, name in (
+        (query_projection, "fp8_query_gemm"),
+        (query_projection, "query_gemm_rope"),
+        (_prims_ts_quantization.UnitScaleQuery, "run"),
+    ):
+
+        def spy(*args, _original=getattr(owner, name), _name=name, **kwargs):
+            calls.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, spy)
+    # A context-only prefill projects Q to unit-scale E4M3 only, and PrimTS quantizes none.
+    unit = _prefill_outputs(layers, manager, requests, hidden)
+    assert calls == ["fp8_query_gemm"] * len(layers)
+    calls.clear()
+    # Writing the BF16 Q as well, the projection hands PrimTS the same E4M3 Q.
+    for model in layers:
+        model._unit_scale_context_query = False
+    both = _prefill_outputs(layers, manager, requests, hidden)
+    assert calls == ["query_gemm_rope"] * len(layers)
+    calls.clear()
+    # Ignoring the projected Q, PrimTS rounds that projection's BF16 Q itself.
+    monkeypatch.setattr(
+        prims_ts.CSA2PrimsTS, "_context_query", staticmethod(lambda q, raw, forward_args: q)
+    )
+    own = _prefill_outputs(layers, manager, requests, hidden)
+    assert calls == ["query_gemm_rope", "run"] * len(layers)
+    for actual, written, quantized in zip(unit, both, own, strict=True):
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, written, atol=0, rtol=0)
+        torch.testing.assert_close(actual, quantized, atol=0, rtol=0)
 
 
 @skip_no_fused_context
@@ -3680,6 +4053,95 @@ def test_grouped_output_mxfp8_matches_reference(rows, groups, heads, rank):
         atol=0,
         rtol=0,
     )
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("module_cache", [pytest.param((2, "fp8"), id="fp8")], indirect=True)
+@torch.inference_mode()
+def test_prims_ts_decode_unit_scale_query_matches_bf16(monkeypatch, module_cache):
+    """PrimTS decode reading the projection's RoPE'd unit-scale E4M3 Q matches its own quantization.
+
+    The Q-B GEMM writes E4M3 Q straight away; PrimTS then neither applies the query RoPE nor
+    quantizes Q itself, and the attention output is bit-identical, eagerly and in a graph.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import (
+        _prims_ts_quantization,
+        query_projection,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.metadata import KVCacheParams
+    from tensorrt_llm._torch.modules.linear import (
+        flashinfer_mxfp8_autotune,
+        flashinfer_mxfp8_decode_graph_capture,
+    )
+
+    torch.manual_seed(948)
+    manager, request = module_cache
+    model, _ = _native_model(
+        layout=manager.layout,
+        kv_cache_dtype="fp8",
+        sparse_options={"compute_backend": "prims_ts"},
+    )
+    assert model.backend.compute_backend == "prims_ts" and model._compute_helper is not None
+    model._fp8_q_min_tokens = 1
+    # The BF16 comparison Q comes from the same MXFP8 GEMM, not the small-M kernel.
+    monkeypatch.setattr(model, "_lowm_projects", lambda linear, rows: False)
+    for linear in (model.wq_a, model.wq_b, model.wkv):
+        linear.quant_method.tune_mxfp8_backends = True
+    calls = []
+    for owner, name in (
+        (query_projection, "fp8_query_gemm"),
+        (_prims_ts_quantization.UnitScaleQuery, "run"),
+    ):
+
+        def spy(*args, _original=getattr(owner, name), _name=name, **kwargs):
+            calls.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, spy)
+    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager)
+    metadata.request_ids = [request.py_request_id]
+    metadata.num_contexts = 1
+    metadata.prompt_lens = [4]
+    metadata.seq_lens = torch.tensor([1], dtype=torch.int32, device="cpu")
+    hidden = torch.randn(1, 128, device="cuda", dtype=torch.bfloat16)
+    metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0])
+    metadata.prepare()
+    model(hidden, metadata.csa2_positions, metadata)
+    metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[1])
+    metadata.num_contexts = 0
+    metadata.is_cuda_graph = True
+    metadata.prepare()
+    positions = metadata.csa2_positions
+
+    def run(fp8_query):
+        model._fp8_q_projection = fp8_query
+        metadata.reset_routing()
+        return model(hidden, positions, metadata)
+
+    with flashinfer_mxfp8_decode_graph_capture():
+        with flashinfer_mxfp8_autotune():
+            run(False)
+        for _ in range(2):
+            hidden.normal_()
+            calls.clear()
+            expected = run(False)
+            assert calls == ["run"]
+            calls.clear()
+            actual = run(True)
+            assert calls == ["fp8_query_gemm"]
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run(True)
+        for sign in (-1.0, 1.0):
+            hidden.mul_(sign)
+            graph.replay()
+            actual = captured.clone()
+            expected = run(False)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.cuda.synchronize()
 
 
 @skip_pre_blackwell
