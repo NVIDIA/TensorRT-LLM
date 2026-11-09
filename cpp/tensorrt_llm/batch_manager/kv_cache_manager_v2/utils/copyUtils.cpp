@@ -564,20 +564,22 @@ void releaseDiskFile(int fd) noexcept
 
 void configureAsyncDiskIo(size_t numThreads) noexcept
 {
-    if (numThreads == 0)
-    {
-        return;
-    }
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
+    // The pool is process-wide and lives until exit: a later request cannot resize it or turn it off.
     if (size_t const current = gAsyncDiskIoThreads.load(); current != 0)
     {
         if (current != numThreads)
         {
             TLLM_LOG_WARNING(
-                "[kvCacheManagerV2Utils] async disk I/O already uses %zu threads; ignoring a request for %zu", current,
-                numThreads);
+                "[kvCacheManagerV2Utils] async disk I/O already uses %zu threads for this process; ignoring a request "
+                "for %zu",
+                current, numThreads);
         }
+        return;
+    }
+    if (numThreads == 0)
+    {
         return;
     }
     auto* pool = gDiskIoPool.load();

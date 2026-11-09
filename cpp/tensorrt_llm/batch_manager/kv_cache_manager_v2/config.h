@@ -100,7 +100,8 @@ struct DiskCacheTierConfig
     size_t quota = 0; // bytes
     std::string path; // directory for temp files
 
-    // Worker threads for asynchronous disk I/O (process-wide pool); 0 = synchronous.
+    // Worker threads for asynchronous disk I/O. Process-wide: the first nonzero value starts the pool for the life
+    // of the process, and later values, including 0, do not change it. Without a pool, disk I/O is synchronous.
     int numIoThreads = 0;
 
     // Keep a committed page's disk copy after a restore, so its next eviction to disk writes nothing.
