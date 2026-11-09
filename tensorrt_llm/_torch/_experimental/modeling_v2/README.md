@@ -130,12 +130,12 @@ A target does not import, subclass or call Modeling V1 model code: the model
 classes in `_torch/models/`, the layers in `_torch/modules/`, MLA and the
 attention backends in `_torch/attention/`, and fused MoE in `_torch/moe/`.
 This applies to every path in the target: prefill, decode, the shapes a fast
-path does not cover, and weight loading. A change to Modeling V1 model code
-then cannot change a Modeling V2 target. The
+path does not cover, and weight loading. To use shared TensorRT-LLM kernels,
+call them through catalog operations. The
 [DeepSeek R1 target](models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/) is an
-example: besides its own code, it uses only `DecoderModel`,
-`DecoderModelForCausalLM`, attention metadata and the engine's speculative
-worker.
+example: besides its own code and catalog operations, it uses only
+`DecoderModel`, `DecoderModelForCausalLM`, attention metadata and the engine's
+speculative worker.
 
 ## Adding a family or a target
 
