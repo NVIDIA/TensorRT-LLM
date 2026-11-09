@@ -1328,14 +1328,23 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
     _data_uri_mime_prefix: ClassVar[Optional[str]] = None
 
     @classmethod
-    def set_executor(cls, executor: Optional[Executor]) -> None:
+    def set_executor(cls, executor: Executor) -> None:
         """Publish a shared executor for blocking decode work.
 
         Affects every existing and future subclass instance. Calling more
-        than once replaces the previously configured executor; ``None``
-        selects the loop's default executor again.
+        than once replaces the previously configured executor.
         """
         BaseMediaIO._executor = executor
+
+    @classmethod
+    def clear_executor(cls, executor: Executor) -> None:
+        """Stop publishing ``executor``; later decode work uses the loop's default.
+
+        Does nothing when another executor has been published since, as
+        another server in the same process may have done.
+        """
+        if BaseMediaIO._executor is executor:
+            BaseMediaIO._executor = None
 
     @classmethod
     @contextmanager
