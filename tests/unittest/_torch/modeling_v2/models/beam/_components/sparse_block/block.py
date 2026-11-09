@@ -13,7 +13,7 @@ A caller constructs it from the checkpoint's configuration for one of the sparse
 attention batch state prepared on a ``KVCacheManagerV2`` that holds the block's logical
 layer. The forward is assembled from catalog entries, the attention sublayer
 shared with the dense block component (``../_attention.py``) and the MoE component
-(``../moe_bf16__sm_103__tp1``); it does not call the built-in Beam modeling and owns no
+(``../moe``); it does not call the built-in Beam modeling and owns no
 dense MLP.
 
 The block, with block 3's residual coefficients (block i's are in ``depth_scales``)::
@@ -65,8 +65,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.residual.beam
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
-from ..moe_bf16__sm_103__tp1.moe import BeamMoeBf16Sm103Tp1, check_weights
-from ..moe_bf16__sm_103__tp1.moe import check_config as check_moe_config
+from ..moe.moe import BeamMoeBf16Sm103Tp1, check_weights
+from ..moe.moe import check_config as check_moe_config
 
 #: The configuration this component computes, as the checkpoint's config.json states it.
 #: Anything else is rejected at construction rather than computed approximately; the

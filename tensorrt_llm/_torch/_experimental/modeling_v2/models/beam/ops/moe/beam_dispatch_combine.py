@@ -129,4 +129,4 @@ class BeamDispatchCombine(OpWrapper):
         return (acc * routed_scaling_factor).to(torch.bfloat16)
 
 
-beam_dispatch_combine_op = BeamDispatchCombine()
+beam_dispatch_combine = BeamDispatchCombine()

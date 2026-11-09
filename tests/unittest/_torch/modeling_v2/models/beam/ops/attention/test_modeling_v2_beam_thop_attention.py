@@ -67,7 +67,7 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ("decode across window", (511, 512, 513), (1, 1, 1), 0),
         )
     ),
-    "beam/small_model_prefill_bf16__sm_103__tp1": (
+    "beam/six_layer_model": (
         *(
             Cell(
                 why=f"beam dense block: GQA 48q/8kv d128, fresh {tokens}-row context",

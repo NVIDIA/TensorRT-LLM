@@ -31,3 +31,6 @@ Normal runtime validation and rank-consistency diagnostics remain available.
 
 The TP4 checkpoint layout, expert provider and full-model execution remain in this
 library. Public serving integration uses `LLM()` and `trtllm-serve`.
+
+Shared BF16 TP4 layout, loading and component base modules live in `_tp4/`; the
+`full_model_nvfp4__sm_103__tp4/` package adds NVFP4 expert storage and execution.

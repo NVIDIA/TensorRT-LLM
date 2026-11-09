@@ -50,8 +50,8 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
         )
         for m in (1, 17, 129)
     ),
-    "beam/dense_block_bf16__sm_103__tp1": _BEAM_DENSE_BLOCK,
-    "beam/small_model_prefill_bf16__sm_103__tp1": _BEAM_HEAD,
+    "beam/dense_block": _BEAM_DENSE_BLOCK,
+    "beam/six_layer_model": _BEAM_HEAD,
 }
 
 # A shared shape used by multiple components needs only one kernel comparison.

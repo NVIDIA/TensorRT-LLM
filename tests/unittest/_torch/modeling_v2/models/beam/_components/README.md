@@ -3,8 +3,8 @@
 # Local bring-up components
 
 These TP1 components are checkout-only test helpers, not supported serving APIs or a
-reference for TP4 bitwise results. Their target-style names describe the tested device
-and geometry; they do not register ModelingV2 targets. The six-layer prefill helper also
+reference for TP4 bitwise results. Their names describe the isolated component; device and geometry contracts are
+documented in each helper. They do not register ModelingV2 targets. The six-layer prefill helper also
 supports the local cached-generation tests. Use `LLM()` or `trtllm-serve` for serving.
 
 Run tests through pytest with the repository's test import plugin. Existing L0 selectors

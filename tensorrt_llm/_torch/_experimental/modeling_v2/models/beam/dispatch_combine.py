@@ -35,7 +35,7 @@ from typing import Callable
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_dispatch_combine import (
-    beam_dispatch_combine_op,
+    beam_dispatch_combine,
 )
 
 from ._constants import SM as _SM
@@ -126,7 +126,7 @@ def _checked_expert_output(
 
 
 @torch.no_grad()
-def beam_dispatch_combine(
+def dispatch_and_combine(
     hidden_states: torch.Tensor,
     expert_ids: torch.Tensor,
     mixing_weights: torch.Tensor,
@@ -147,7 +147,7 @@ def beam_dispatch_combine(
     weight still calls its expert.
     """
     _check_inputs(hidden_states, expert_ids, mixing_weights, expert_provider)
-    return beam_dispatch_combine_op(
+    return beam_dispatch_combine(
         hidden_states,
         expert_ids,
         mixing_weights,

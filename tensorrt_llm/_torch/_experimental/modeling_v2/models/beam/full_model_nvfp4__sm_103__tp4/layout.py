@@ -48,8 +48,8 @@ from typing import Any, Mapping, Optional
 
 from tensorrt_llm.quantization.modelopt_config import read_modelopt_quant_config
 
-from . import layout_bf16 as bf16_layout
-from .layout_bf16 import (
+from .._tp4 import layout_bf16 as bf16_layout
+from .._tp4.layout_bf16 import (
     BF16,
     EMBED,
     F32,

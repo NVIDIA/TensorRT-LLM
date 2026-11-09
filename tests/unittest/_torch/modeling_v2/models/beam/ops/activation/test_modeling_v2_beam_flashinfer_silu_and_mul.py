@@ -14,7 +14,7 @@ __extra_import_path__ = ["../../../../activation", "../../../.."]
 import test_modeling_v2_flashinfer_silu_and_mul as shared  # noqa: E402
 
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
-    "beam/dense_block_bf16__sm_103__tp1": tuple(
+    "beam/dense_block": tuple(
         (
             Cell(
                 why=f"beam dense block, {tokens} tokens: 2 x 20480",

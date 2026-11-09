@@ -512,7 +512,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
             y = cublas_mm(act["act"], down_bank[expert_id].t())
             return y
 
-        local = dispatch_combine.beam_dispatch_combine(h, ids, weights, local_expert)
+        local = dispatch_combine.dispatch_and_combine(h, ids, weights, local_expert)
         out = self.all_reduce(local)
         return out
 

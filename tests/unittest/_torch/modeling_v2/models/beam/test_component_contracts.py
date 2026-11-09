@@ -10,12 +10,8 @@ from types import SimpleNamespace as NS
 import pytest
 
 from tensorrt_llm._torch._experimental.modeling_v2.models import beam
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
-    layout_bf16 as layout,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
-    loader_bf16 as loader,
-)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import layout_bf16 as layout
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import loader_bf16 as loader
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.model import (
     BeamFullModelNvfp4Sm103Tp4 as Component,
 )
@@ -369,11 +365,11 @@ def test_checkpoint_load_transaction(
     import torch
     from safetensors.torch import save_file
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
-        component as nvfp4,
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import (
+        component_bf16 as bf16,
     )
     from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
-        component_bf16 as bf16,
+        component as nvfp4,
     )
 
     cls = (
@@ -487,11 +483,11 @@ def test_stored_entry_validation_is_shared(dtype: str, itemsize: int) -> None:
 def test_component_constructor_uses_format_storage(monkeypatch, packed: bool) -> None:
     import torch
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
-        component as nvfp4,
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._tp4 import (
+        component_bf16 as bf16,
     )
     from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
-        component_bf16 as bf16,
+        component as nvfp4,
     )
 
     cls = (

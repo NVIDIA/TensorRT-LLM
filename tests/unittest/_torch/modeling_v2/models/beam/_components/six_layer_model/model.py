@@ -82,10 +82,10 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, LayerId, PageIndexMode
 
-from ..dense_block_bf16__sm_103__tp1 import block as dense_block
-from ..moe_bf16__sm_103__tp1.moe import check_weights
-from ..moe_bf16__sm_103__tp1.moe import weight_shapes as moe_weight_shapes
-from ..sparse_block_bf16__sm_103__tp1 import block as sparse_block
+from ..dense_block import block as dense_block
+from ..moe.moe import check_weights
+from ..moe.moe import weight_shapes as moe_weight_shapes
+from ..sparse_block import block as sparse_block
 
 NUM_LAYERS = 6
 DENSE_LAYERS = (0, 1, 2)
@@ -466,7 +466,7 @@ def prefill_context(num_tokens: int, request_id: int = 0) -> Iterator[TrtllmAtte
         mgr.shutdown()
 
 
-class BeamSmallModelPrefillBf16Sm103Tp1(nn.Module):
+class BeamSixLayerBf16Sm103Tp1(nn.Module):
     """Beam six-block model: token ids in, every token's FP32 vocabulary logits out.
 
     State: ``embed_tokens`` ``[151936, 5120]`` and ``lm_head`` ``[151936, 5120]``, two

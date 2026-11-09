@@ -10,10 +10,10 @@ feed-forward sublayer; ``layer_idx`` (3, 4 or 5, as the router accepts) names th
 and each block owns its own router and experts. It composes three accepted components and
 adds no arithmetic of its own::
 
-    weights, ids = router(hidden)                  ../moe_router_bf16__sm_103__tp1
+    weights, ids = router(hidden)                  ../moe_router
     out = dispatch_combine(hidden, ids, weights,   ../dispatch_combine.py
                            lambda e, rows: experts[e](rows))
-                                                   ../moe_expert_bf16__sm_103__tp1, 256 of them
+                                                   ../moe_expert, 256 of them
 
 That is, as the source model computes it: fp32 grouped sigmoid top-k routing with a
 selection-only correction bias (8 of 256 experts per token, from 4 of 8 groups) and
@@ -39,10 +39,10 @@ from torch import nn
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam import dispatch_combine
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam._constants import SM as _SM
 
-from ..moe_expert_bf16__sm_103__tp1.expert import WEIGHT_SHAPES as EXPERT_WEIGHT_SHAPES
-from ..moe_expert_bf16__sm_103__tp1.expert import BeamMoeExpertBf16Sm103Tp1
-from ..moe_router_bf16__sm_103__tp1.router import BeamMoeRouterBf16Sm103Tp1
-from ..moe_router_bf16__sm_103__tp1.router import check_config as check_router_config
+from ..moe_expert.expert import WEIGHT_SHAPES as EXPERT_WEIGHT_SHAPES
+from ..moe_expert.expert import BeamMoeExpertBf16Sm103Tp1
+from ..moe_router.router import BeamMoeRouterBf16Sm103Tp1
+from ..moe_router.router import check_config as check_router_config
 
 #: Fields of the checkpoint's configuration this component reads beyond the router's.
 SUPPORTED_CONFIG = {
@@ -207,6 +207,6 @@ class BeamMoeBf16Sm103Tp1(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         self._check_input(hidden_states)
         mixing_weights, expert_ids = self.gate(hidden_states)
-        return dispatch_combine.beam_dispatch_combine(
+        return dispatch_combine.dispatch_and_combine(
             hidden_states, expert_ids, mixing_weights, self._expert
         )

@@ -44,8 +44,8 @@ import torch
 from torch import nn
 
 from .. import dispatch_combine
+from .._tp4.component_bf16 import BeamCheckpointLayoutBf16Sm103Tp4, LoadError, _attr
 from . import expert as nvfp4_expert
-from .component_bf16 import BeamCheckpointLayoutBf16Sm103Tp4, LoadError, _attr
 from .layout import (
     PROJECTIONS,
     QuantSpec,
@@ -294,7 +294,7 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         def provider(expert_id: int, rows: torch.Tensor) -> torch.Tensor:
             return nvfp4_expert.nvfp4_swiglu_expert(rows, bank, expert_id, shared[expert_id])
 
-        local = dispatch_combine.beam_dispatch_combine(h, ids, weights, provider)
+        local = dispatch_combine.dispatch_and_combine(h, ids, weights, provider)
         # The four BF16 rank partials are summed once in FP32 and the sum is rounded once.
         out = self.all_reduce(local.float()).to(torch.bfloat16)
         return out

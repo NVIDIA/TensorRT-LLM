@@ -24,14 +24,14 @@ from typing import Mapping, Optional
 
 import torch
 
-from .layout import E4M3, F32, U8
-from .loader_bf16 import (
+from .._tp4.loader_bf16 import (
     TILE_BYTES,
     CheckpointFormatError,
     SafetensorsCatalog,
     TileReader,
     read_slice_into,
 )
+from .layout import E4M3, F32, U8
 
 __all__ = [
     "TILE_BYTES",

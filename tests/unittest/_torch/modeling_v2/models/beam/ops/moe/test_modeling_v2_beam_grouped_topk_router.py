@@ -9,7 +9,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_grou
     beam_grouped_topk_router as op,
 )
 
-__extra_import_path__ = ["../../_components/moe_router_bf16__sm_103__tp1", "../../../.."]
+__extra_import_path__ = ["../../_components/moe_router", "../../../.."]
 import _router_cases as cases  # noqa: E402
 from _precision import true_fp32_matmul  # noqa: E402
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name

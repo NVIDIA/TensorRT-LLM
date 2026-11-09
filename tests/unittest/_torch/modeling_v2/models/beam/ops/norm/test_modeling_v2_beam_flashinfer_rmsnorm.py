@@ -40,7 +40,7 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ("k_norm", tokens * 2, 128),
         )
     ),
-    "beam/dense_block_bf16__sm_103__tp1": _BEAM_DENSE_BLOCK,
+    "beam/dense_block": _BEAM_DENSE_BLOCK,
 }
 
 # A shared shape used by multiple components needs only one kernel comparison.

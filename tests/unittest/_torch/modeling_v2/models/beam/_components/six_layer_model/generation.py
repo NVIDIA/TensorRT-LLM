@@ -3,7 +3,7 @@
 """Stateful greedy generation for the Beam six-block model / sm_103 / tp1.
 
 A thin serial controller that drives the stateless six-block model
-(``BeamSmallModelPrefillBf16Sm103Tp1``) through TensorRT-LLM's own request, cache and
+(``BeamSixLayerBf16Sm103Tp1``) through TensorRT-LLM's own request, cache and
 sampler objects: one ``LlmRequest`` per request, one long-lived ``KVCacheManagerV2`` with
 block reuse for all of them, a ``SeqSlotManager`` for sampler slots and the existing
 ``TorchSampler``. It owns no cache allocator, prefix table or sampler of its own; it calls
@@ -101,7 +101,7 @@ from tensorrt_llm.bindings.executor import SamplingConfig as ExecutorSamplingCon
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 
-from .model import ATTENTION_WINDOWS, MAX_TOKENS, NUM_LAYERS, BeamSmallModelPrefillBf16Sm103Tp1
+from .model import ATTENTION_WINDOWS, MAX_TOKENS, NUM_LAYERS, BeamSixLayerBf16Sm103Tp1
 
 #: The generator's cache: bf16, 32-token pages, a 1024-token sequence capacity, two live
 #: requests, block reuse of whole pages (partial reuse off), no host tier and no
@@ -297,18 +297,16 @@ class BeamSmallModelGenerator:
     """Greedy cached generation and cross-request prefix reuse for one loaded six-block model.
 
     See the module docstring for the lifecycle, semantics and limits. ``model`` must be a
-    loaded ``BeamSmallModelPrefillBf16Sm103Tp1``; the generator builds its own
+    loaded ``BeamSixLayerBf16Sm103Tp1``; the generator builds its own
     ``KVCacheManagerV2`` (``GENERATOR_CACHE``), ``SeqSlotManager`` and ``TorchSampler``
     (``SAMPLER_ARGS``) and releases them in ``close``.
     """
 
     _request_ids = itertools.count(1)
 
-    def __init__(self, model: BeamSmallModelPrefillBf16Sm103Tp1):
-        if not isinstance(model, BeamSmallModelPrefillBf16Sm103Tp1):
-            raise TypeError(
-                f"model must be BeamSmallModelPrefillBf16Sm103Tp1, got {type(model).__name__}"
-            )
+    def __init__(self, model: BeamSixLayerBf16Sm103Tp1):
+        if not isinstance(model, BeamSixLayerBf16Sm103Tp1):
+            raise TypeError(f"model must be BeamSixLayerBf16Sm103Tp1, got {type(model).__name__}")
         if not model._loaded:
             raise ValueError("load_weights must complete before a generator binds the model")
         self.model = model
