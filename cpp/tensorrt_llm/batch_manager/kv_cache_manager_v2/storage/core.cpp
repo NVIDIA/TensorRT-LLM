@@ -72,11 +72,12 @@ SlotAllocator::SlotAllocator(SlotCount capacity)
 {
 }
 
-SlotAllocator::SlotAllocator(SlotWindow window, Growth growth)
+SlotAllocator::SlotAllocator(SlotWindow window, Growth growth, Recycling recycling)
     : mWindow(window)
     , mTarget(window)
     , mIssued{window.begin, window.begin}
     , mGrowth(growth)
+    , mRecycling(recycling)
     , mNumReadyRecycledSlots(0)
     , mOccupiedMask(slotCountToSizeT(window.end.value()))
 {
@@ -169,7 +170,19 @@ Slot SlotAllocator::allocate()
     scrubEvents();
 
     Slot slot;
-    if (mNumReadyRecycledSlots > 0)
+    if (mRecycling == Recycling::kReleaseOrder && !mRecycledSlots.empty())
+    {
+        // Ready slots form a prefix of the deque, so the front is ready iff any is.
+        bool const frontIsReady = mNumReadyRecycledSlots > 0;
+        slot = std::move(mRecycledSlots.front());
+        mRecycledSlots.pop_front();
+        TLLM_CHECK_DEBUG_WITH_INFO(slot.hasValidSlot(), "recycled slot has no valid id");
+        if (frontIsReady)
+        {
+            --mNumReadyRecycledSlots;
+        }
+    }
+    else if (mNumReadyRecycledSlots > 0)
     {
         TLLM_CHECK_DEBUG_WITH_INFO(!mRecycledSlots.empty(), "ready recycled slots > 0 but deque is empty");
         slot = std::move(mRecycledSlots.front());
@@ -702,8 +715,10 @@ PoolGroupBase::PoolGroupBase(SlotCount numSlots)
 {
 }
 
+// Window-based groups are the arena's (copy-based rebalancing), whose shrinks vacate slots by position: recycle in
+// release order so that TP ranks keep identical layouts.
 PoolGroupBase::PoolGroupBase(SlotWindow window, SlotAllocator::Growth growth)
-    : mSlotAllocator(window, growth)
+    : mSlotAllocator(window, growth, SlotAllocator::Recycling::kReleaseOrder)
 {
 }
 

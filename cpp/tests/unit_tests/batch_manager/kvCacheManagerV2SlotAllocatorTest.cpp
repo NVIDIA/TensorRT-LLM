@@ -24,6 +24,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -248,6 +249,69 @@ TEST(KvCacheManagerV2SlotAllocatorTest, ExpandWindowAtBegin)
 
     releaseSlots(allocator, slots);
     releaseSlots(allocator, more);
+}
+
+// Copy-based rebalancing vacates slots by position, so TP ranks must reach identical slot layouts. With
+// Recycling::kReleaseOrder, which slot comes back must not depend on whether a recycled slot's event has
+// completed: a recycled slot whose event is still pending is handed out before a fresh id. kReadyFirst (the
+// default) issues a fresh id instead. Arena pool groups are constructed with kReleaseOrder.
+TEST(KvCacheManagerV2SlotAllocatorTest, ReleaseOrderRecyclingIgnoresEventReadiness)
+{
+    ASSERT_EQ(cudaFree(nullptr), cudaSuccess);
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    // Hold the stream on a host function until the checks are done, so events recorded behind it stay pending.
+    std::atomic<bool> go{false};
+    ASSERT_EQ(cudaLaunchHostFunc(
+                  stream,
+                  [](void* flag)
+                  {
+                      while (!static_cast<std::atomic<bool>*>(flag)->load())
+                      {
+                      }
+                  },
+                  &go),
+        cudaSuccess);
+
+    SlotAllocator readyFirst{window(0, 8), SlotAllocator::Growth::kAscending};
+    SlotAllocator releaseOrder{
+        window(0, 8), SlotAllocator::Growth::kAscending, SlotAllocator::Recycling::kReleaseOrder};
+    EXPECT_EQ(readyFirst.recycling(), SlotAllocator::Recycling::kReadyFirst);
+    EXPECT_EQ(releaseOrder.recycling(), SlotAllocator::Recycling::kReleaseOrder);
+
+    std::vector<Slot> held;
+    for (SlotAllocator* allocator : {&readyFirst, &releaseOrder})
+    {
+        auto slots = allocateSlots(*allocator, 2); // ids 0, 1
+        EXPECT_EQ(idsOf(slots), (std::vector<SlotCount>{0, 1}));
+        slots[0].readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
+        ASSERT_FALSE(slots[0].queryReady());
+        releaseSlots(*allocator, slots, 0, 1); // id 0 recycled with its event pending
+        held.push_back(allocator->allocate());
+        held.push_back(std::move(slots[1]));
+    }
+    EXPECT_EQ(held[0].slotId(), SlotId{2}); // kReadyFirst: a fresh id rather than wait
+    EXPECT_EQ(held[2].slotId(), SlotId{0}); // kReleaseOrder: the pending recycled slot
+
+    go.store(true);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    std::vector<Slot> readyFirstSlots;
+    std::vector<Slot> releaseOrderSlots;
+    readyFirstSlots.push_back(std::move(held[0]));
+    readyFirstSlots.push_back(std::move(held[1]));
+    releaseOrderSlots.push_back(std::move(held[2]));
+    releaseOrderSlots.push_back(std::move(held[3]));
+    releaseSlots(readyFirst, readyFirstSlots);
+    releaseSlots(releaseOrder, releaseOrderSlots);
+    readyFirst.synchronize();
+    releaseOrder.synchronize();
+    // readyFirst still recycles slot 0 (its event has completed now) before issuing another fresh id.
+    Slot again = readyFirst.allocate();
+    EXPECT_EQ(again.slotId(), SlotId{0});
+    std::vector<Slot> last;
+    last.push_back(std::move(again));
+    releaseSlots(readyFirst, last);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
 
 // ---------------------------------------------------------------------------
