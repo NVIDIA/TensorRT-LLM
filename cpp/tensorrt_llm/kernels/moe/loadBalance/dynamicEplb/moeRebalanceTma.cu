@@ -59,12 +59,13 @@ constexpr unsigned kSlotControlBytes = MEGAMOE_TMA_COPY_SLOT_CONTROL_BYTES;
 constexpr unsigned kSlotDataBytes = MEGAMOE_TMA_COPY_SLOT_DATA_BYTES;
 constexpr unsigned kCoalesced = 4U;
 constexpr unsigned kFallbackBulk = 8U;
+constexpr unsigned kUnicast = 16U;
 
 struct alignas(16) SlotControl
 {
     unsigned long long barrier;
     unsigned phase;
-    unsigned reserved; // head=1, tail=2, coalesced=4, fallback-has-bulk=8
+    unsigned reserved; // head=1, tail=2, coalesced=4, fallback-has-bulk=8, unicast=16
     uint64_t fast_dst;
     unsigned fast_bytes;
     unsigned fast_padding; // first slot in each bank: even=free, odd=ready ticket
@@ -77,7 +78,7 @@ static_assert(kSlotDataBytes == kSlice + 16, "one aligned edge of slot padding")
 static_assert(sizeof(SlotControl) == kSlotControlBytes, "shared slot control ABI");
 static_assert(kSlotDataBytes % 16 == 0, "TMA slot alignment");
 static_assert(sizeof(MegamoeTmaCopySegment) == 4 * sizeof(uint64_t), "segment ABI");
-static_assert(sizeof(MegamoeTmaCopyRange) == 9 * sizeof(uint64_t), "range ABI");
+static_assert(sizeof(MegamoeTmaCopyRange) == 10 * sizeof(uint64_t), "range ABI");
 static_assert(sizeof(MegamoeTmaCopyConfig) == 88, "configuration ABI");
 
 __device__ __forceinline__ unsigned shared_address(void const* p)
@@ -158,6 +159,54 @@ __device__ __forceinline__ void multicast_edge(uint64_t dst, unsigned char const
     // coalesced_copy_flags() is zero on these targets; never use .cp_mask on SM90.
     asm volatile("trap;" ::: "memory");
 #endif
+}
+
+// Owner-direct unicast: the same bulk group, into one peer's mapped row.
+__device__ __forceinline__ void unicast_slice(uint64_t dst, unsigned char const* buffer, unsigned bytes)
+{
+    unsigned smem = shared_address(buffer);
+    asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(dst), "r"(smem), "r"(bytes)
+                 : "memory");
+}
+
+__device__ __forceinline__ void unicast_edge(uint64_t dst, unsigned char const* buffer, uint16_t mask)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    unsigned smem = shared_address(buffer);
+    asm volatile(
+        "cp.async.bulk.global.shared::cta.bulk_group.cp_mask "
+        "[%0], [%1], 16, %2;" ::"l"(dst),
+        "r"(smem), "h"(mask)
+        : "memory");
+#else
+    // coalesced_copy_flags() is zero on these targets; never use .cp_mask on SM90.
+    asm volatile("trap;" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void store_slice(uint64_t dst, unsigned char const* buffer, unsigned bytes, bool unicast)
+{
+    if (unicast)
+        unicast_slice(dst, buffer, bytes);
+    else
+        multicast_slice(dst, buffer, bytes);
+}
+
+__device__ __forceinline__ void store_edge(uint64_t dst, unsigned char const* buffer, uint16_t mask, bool unicast)
+{
+    if (unicast)
+        unicast_edge(dst, buffer, mask);
+    else
+        multicast_edge(dst, buffer, mask);
+}
+
+// Exact 32-bit stores; the final full-write wait and READY fences cover both kinds.
+__device__ __forceinline__ void store_word(uint64_t dst, unsigned value, bool unicast)
+{
+    if (unicast)
+        asm volatile("st.global.u32 [%0], %1;" ::"l"(dst), "r"(value) : "memory");
+    else
+        asm volatile("multimem.st.relaxed.sys.global.u32 [%0], %1;" ::"l"(dst), "r"(value) : "memory");
 }
 
 __device__ __forceinline__ void wait_older_reads()
@@ -251,6 +300,7 @@ struct Slice
     uint64_t end;
     uint64_t segment_begin;
     uint64_t segment_end;
+    bool unicast; // The slice's range stores to unicast destinations.
 };
 
 struct Fragment
@@ -299,7 +349,7 @@ __device__ __forceinline__ Slice locate_slice(
         else
             hi = mid;
     }
-    return Slice{begin, end, lo, segment_end};
+    return Slice{begin, end, lo, segment_end, (range.flags & MEGAMOE_TMA_COPY_RANGE_UNICAST) != 0};
 }
 
 __device__ __forceinline__ Fragment locate_fragment(Slice const& slice, MegamoeTmaCopySegment const& segment)
@@ -374,7 +424,8 @@ __device__ __forceinline__ void prefetch_bank(MegamoeTmaCopySegment const* segme
         {
             // ONE aligned TMA load supplies head, body and tail. The only extra
             // storage is the final 16B of this physical slot; logical RR remains 8KiB.
-            slot->reserved = fast;
+            // Consume reuses the cached destination, so it also caches the store kind.
+            slot->reserved = fast | (slice.unicast ? kUnicast : 0U);
             slot->fast_dst = first.dst;
             slot->fast_bytes = first.bytes;
             unsigned const load_bytes = (static_cast<unsigned>(first.src & 15U) + first.bytes + 15U) & ~15U;
@@ -402,18 +453,18 @@ __device__ __forceinline__ void prefetch_bank(MegamoeTmaCopySegment const* segme
     }
 }
 
-__device__ __forceinline__ void scalar_words(Fragment const& f, unsigned begin, unsigned end)
+__device__ __forceinline__ void scalar_words(Fragment const& f, unsigned begin, unsigned end, bool unicast)
 {
     for (unsigned off = begin; off < end; off += 4)
     {
         unsigned value;
         // UC means unicast. .cg avoids a stale read-only (.nc) cache.
         asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(value) : "l"(f.src + off) : "memory");
-        asm volatile("multimem.st.relaxed.sys.global.u32 [%0], %1;" ::"l"(f.dst + off), "r"(value) : "memory");
+        store_word(f.dst + off, value, unicast);
     }
 }
 
-__device__ __forceinline__ void multicast_shared_words(Fragment const& f, unsigned char const* buffer)
+__device__ __forceinline__ void staged_words(Fragment const& f, unsigned char const* buffer, bool unicast)
 {
     // The slot mbarrier has completed: TMA data is visible to generic shared
     // loads. Only the source-aligned body is staged; no rounded overread.
@@ -421,14 +472,14 @@ __device__ __forceinline__ void multicast_shared_words(Fragment const& f, unsign
     {
         unsigned value;
         asm volatile("ld.shared.u32 %0, [%1];" : "=r"(value) : "r"(shared_address(buffer + off)) : "memory");
-        asm volatile("multimem.st.relaxed.sys.global.u32 [%0], %1;" ::"l"(f.dst + f.scalar_prefix + off), "r"(value)
-                     : "memory");
+        store_word(f.dst + f.scalar_prefix + off, value, unicast);
     }
 }
 
 __device__ __forceinline__ void consume_bank(MegamoeTmaCopySegment const* segments, MegamoeTmaCopyRange const* ranges,
     uint64_t range_count, uint64_t ordinal_base, uint64_t ordinal_stride, uint64_t sequence, unsigned char* warp_buffer,
-    SlotControl* warp_control, int slot_start, int count, int bank, bool* pending, int& outstanding)
+    SlotControl* warp_control, int slot_start, int count, int bank, bool* pending, int& outstanding,
+    bool& unicast_issued)
 {
     bool issued = false;
     for (int i = 0; i < count; ++i)
@@ -442,6 +493,7 @@ __device__ __forceinline__ void consume_bank(MegamoeTmaCopySegment const* segmen
             // No range search, segment search, or descriptor reload on consume.
             const uint64_t dst = slot->fast_dst;
             unsigned const bytes = slot->fast_bytes;
+            bool const unicast = (flags & kUnicast) != 0;
             unsigned const shift = static_cast<unsigned>(dst & 15U);
             unsigned prefix = (16U - shift) & 15U;
             if (prefix > bytes)
@@ -452,12 +504,13 @@ __device__ __forceinline__ void consume_bank(MegamoeTmaCopySegment const* segmen
             const uint16_t tail_mask = edge_byte_mask(0, bytes - tail_offset);
             await_slice(slot);
             if (bulk)
-                multicast_slice(dst + prefix, slot_buffer + shift + prefix, bulk);
+                store_slice(dst + prefix, slot_buffer + shift + prefix, bulk, unicast);
             if (flags & 1U)
-                multicast_edge(dst & ~uint64_t(15), slot_buffer, head_mask);
+                store_edge(dst & ~uint64_t(15), slot_buffer, head_mask, unicast);
             if (flags & 2U)
-                multicast_edge(dst + tail_offset, slot_buffer + shift + tail_offset, tail_mask);
+                store_edge(dst + tail_offset, slot_buffer + shift + tail_offset, tail_mask, unicast);
             issued = true;
+            unicast_issued |= unicast;
             continue;
         }
         const Slice slice = locate_slice(segments, ranges, range_count, ordinal_base + ordinal_stride * (sequence + i));
@@ -465,6 +518,7 @@ __device__ __forceinline__ void consume_bank(MegamoeTmaCopySegment const* segmen
         // no duplicate fragment scan or second range lookup for scalar edges.
         if (flags & kFallbackBulk)
             await_slice(slot);
+        unicast_issued |= slice.unicast;
         for (uint64_t index = slice.segment_begin;
              index < slice.segment_end && segments[index].virtual_begin < slice.end; ++index)
         {
@@ -473,20 +527,20 @@ __device__ __forceinline__ void consume_bank(MegamoeTmaCopySegment const* segmen
             {
                 if (((f.dst + f.scalar_prefix) & 15U) == 0)
                 {
-                    multicast_slice(f.dst + f.scalar_prefix, slot_buffer + f.smem_offset, f.bulk_bytes);
+                    store_slice(f.dst + f.scalar_prefix, slot_buffer + f.smem_offset, f.bulk_bytes, slice.unicast);
                     issued = true;
                 }
                 else
                 {
-                    // Different UC/MC alignment cannot use a bulk MC store.
+                    // Different UC/destination alignment cannot use a bulk store.
                     // Reuse the prefetched bytes instead of serial remote loads.
-                    multicast_shared_words(f, slot_buffer + f.smem_offset);
+                    staged_words(f, slot_buffer + f.smem_offset, slice.unicast);
                 }
             }
             // These exact scalar intervals are disjoint from ALL TMA writes.
             // No intermediate group drain: the final full-write wait and fence cover them.
-            scalar_words(f, 0, f.scalar_prefix);
-            scalar_words(f, f.scalar_prefix + f.bulk_bytes, f.bytes);
+            scalar_words(f, 0, f.scalar_prefix, slice.unicast);
+            scalar_words(f, f.scalar_prefix + f.bulk_bytes, f.bytes, slice.unicast);
         }
     }
     if (issued)
@@ -582,6 +636,7 @@ __device__ __forceinline__ void tma_copy_body(MegamoeTmaCopySegment const* segme
         else
         {
             bool pending[2] = {false, false};
+            bool unicast_issued = false;
             int outstanding = 0;
             int held_bank = -1;
             for (int bank = 0; next_sequence < tasks; bank ^= 1)
@@ -592,7 +647,7 @@ __device__ __forceinline__ void tma_copy_body(MegamoeTmaCopySegment const* segme
                 unsigned* handshake = &warp_control[start[bank]].fast_padding;
                 wait_bank_ticket(handshake, ticket[bank]);
                 consume_bank(segments, ranges, range_count, ordinal_base, ordinal_stride, next_sequence, warp_buffer,
-                    warp_control, start[bank], count, bank, pending, outstanding);
+                    warp_control, start[bank], count, bank, pending, outstanding, unicast_issued);
                 if (held_bank >= 0)
                 {
                     // Consume both banks before releasing the older one. The
@@ -623,6 +678,10 @@ __device__ __forceinline__ void tma_copy_body(MegamoeTmaCopySegment const* segme
             }
             // READY still covers destination completion, not merely SMEM reads.
             wait_all_writes();
+            // Completed unicast bulk writes reached peer rows through the async
+            // proxy; order them before the generic-proxy chain that publishes READY.
+            if (unicast_issued)
+                asm volatile("fence.proxy.async.global;" ::: "memory");
             // Every issuer joins through the CTA barrier and the acq_rel
             // counter chain before the final CTA publishes READY.
         }
@@ -679,12 +738,35 @@ __device__ __forceinline__ void tma_copy_gpu_direct_body(GpuDirectStorage const&
     int const cap = direct.capacity;
     tensorrt_llm::kernels::sami_copy::PlacementView placement{direct.workspace[1], cap, fields, fields + cap,
         fields + 2 * cap, fields + 3 * cap, fields + 4 * cap, fields + 5 * cap};
+    bool const balanced = (c.route_features & MEGAMOE_TMA_GPU_PLAN_ROUTE_BALANCED) != 0;
     // Private routing scratch, not a CPU channel: no SYS publication, extra
     // CUDA operation or scheduler-side copy of the placement outputs.
-    tensorrt_llm::kernels::sami_copy::publish_plan_channel_warp<false>(plan, direct.ids, direct.levels, direct.owners,
-        placement, c.helper_count, c.world, c.rank, c.global_experts, c.plan_abi_version, c.route_features);
+    if (!balanced)
+        tensorrt_llm::kernels::sami_copy::publish_plan_channel_warp(plan, direct.ids, direct.levels, direct.owners,
+            placement, c.helper_count, c.world, c.rank, c.global_experts, c.plan_abi_version, c.route_features);
     __syncthreads();
-    if (threadIdx.x == 0)
+    if (balanced)
+    {
+        if (threadIdx.x < 32)
+        {
+            // The split of every copy is global: the first warp of each CTA derives it from the placement. The
+            // copy body has not claimed the dynamic shared memory yet, so it holds the builder's records.
+            extern __shared__ __align__(128) unsigned char balanced_scratch[];
+            int const count = placement.count < 0 ? 0 : placement.count;
+            int const error = megamoe_tma_build_balanced_plan_warp(&c, count, cap, fields, direct.resident,
+                balanced_scratch, megamoe_tma_balanced_scratch_bytes(), segments, direct.max_segments, ranges,
+                direct.max_segments, result);
+            if (error)
+            {
+                if (threadIdx.x == 0)
+                    printf("GPU-direct in-switch copy: invalid balanced plan, error=%d; no READY published\n", error);
+                asm volatile("trap;" ::: "memory");
+            }
+            // TMA loads reuse this shared memory: order the records' generic-proxy writes before them.
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        }
+    }
+    else if (threadIdx.x == 0)
     {
         megamoe_tma_build_gpu_plan(&c, plan, plan + c.plan_words, segments, direct.max_segments, ranges,
             direct.max_segments, result, direct.resident);
@@ -752,7 +834,7 @@ __global__ void __launch_bounds__(512, 1) halo_q_tma_fused_kernel(FusedScheduler
         scheduler.out_levels, scheduler.out_owners, scheduler.peer_bases, scheduler.status, scheduler.partial,
         scheduler.route_aux, scheduler.grid_sync, scheduler.plan, scheduler.route_prefix, scheduler.ep,
         scheduler.experts, scheduler.helpers, scheduler.local_rank, scheduler.route_capacity,
-        static_cast<int>(gridDim.x), scheduler.spin_cycles, scheduler.capacity, scheduler.route_count);
+        static_cast<int>(gridDim.x), scheduler.spin_cycles, scheduler.capacity, scheduler.route_count, direct.resident);
     // Orders every thread's scheduler writes before thread 0's release.
     __syncthreads();
     if (threadIdx.x == 0)
@@ -826,11 +908,14 @@ cudaError_t prepare_fused_launch(MegamoeTmaCopyState& state)
         return error;
     int const static_bytes = static_cast<int>(attributes.sharedSizeBytes);
     int const slots = megamoe_tma_copy_total_slots(c.device_optin_shared_bytes - static_bytes);
-    int const capacity = tensorrt_llm::kernels::broadcast_capacity(plan.world, plan.global_experts, plan.helper_count);
     int const scheduler_bytes = static_cast<int>(sizeof(int))
-        * tensorrt_llm::kernels::halo_q_shared_ints(plan.world, plan.global_experts, capacity, kFusedThreads);
+        * tensorrt_llm::kernels::halo_q_shared_ints(plan.world, plan.global_experts, plan.helper_count, kFusedThreads);
     int const slot_bytes = static_cast<int>((slots * (kSlotDataBytes + kSlotControlBytes) + 127) & ~127U);
-    int const bytes = std::max(slot_bytes, scheduler_bytes);
+    // The balanced builder keeps its records there too, before the copy claims the slots.
+    int const balanced_bytes = (plan.route_features & MEGAMOE_TMA_GPU_PLAN_ROUTE_BALANCED)
+        ? static_cast<int>(megamoe_tma_balanced_scratch_bytes())
+        : 0;
+    int const bytes = std::max(std::max(slot_bytes, scheduler_bytes), balanced_bytes);
     if (attributes.maxThreadsPerBlock < kFusedThreads || slots < 2 * c.warps
         || bytes + static_bytes > c.device_optin_shared_bytes)
         return cudaErrorInvalidConfiguration;
@@ -1051,28 +1136,43 @@ extern "C" int megamoe_tma_copy_configure_gpu_plan(MegamoeTmaCopyState* state, M
         return cudaErrorInvalidValue;
     auto& d = state->direct;
     auto const& c = *input;
+    constexpr int external = MEGAMOE_TMA_GPU_PLAN_ROUTE_EXTERNAL;
+    constexpr int unicast = MEGAMOE_TMA_GPU_PLAN_ROUTE_OWNER_UNICAST;
+    constexpr int pair = MEGAMOE_TMA_GPU_PLAN_ROUTE_PAIR_MULTICAST;
+    constexpr int balanced = MEGAMOE_TMA_GPU_PLAN_ROUTE_BALANCED;
     if (c.world < 2 || c.world > 32 || (c.world & 1) || c.rank < 0 || c.rank >= c.world || c.global_experts % c.world
-        || c.home_count != c.global_experts / c.world || c.plan_abi_version != 6
-        || (c.route_features != 0 && c.route_features != 1) || c.tma_route < 0 || c.tma_route > 2
+        || c.home_count != c.global_experts / c.world || c.plan_abi_version != MEGAMOE_TMA_GPU_PLAN_ABI_VERSION
+        || (c.route_features & ~MEGAMOE_TMA_GPU_PLAN_ROUTE_MASK) || c.tma_route < 0 || c.tma_route > 2
         || c.tma_source_load_percent < 1 || c.tma_source_load_percent > 199 || c.helper_count <= 0
         || c.helper_count > (INT32_MAX - 25) / 7 || c.global_experts <= 0 || c.global_experts > 384 || c.planes <= 0
         || c.planes > 32 || c.level_count <= 0 || c.level_count > 4 || c.target_count < 0 || c.target_count > 32
-        || !c.src_table || !c.dst_table || !c.plane_bytes || (c.route_features && !c.foreign_dst_table))
+        || !c.src_table || !c.dst_table || !c.plane_bytes || ((c.route_features & external) && !c.foreign_dst_table)
+        || (bool(c.route_features & unicast) != (c.uc_dst_table != nullptr))
+        || (bool(c.route_features & pair) != (c.pair_dst_table != nullptr))
+        || ((c.route_features & pair) && !(c.route_features & (unicast | balanced))))
         return cudaErrorInvalidValue;
-    if (c.owner_stride != ((c.helper_count + 3) & ~3) || c.plan_words != 4 + 7 * c.owner_stride)
+    if (c.owner_stride != megamoe_tma_gpu_plan_stride(c.helper_count) || c.plan_words != 4 + 7 * c.owner_stride)
         return cudaErrorInvalidValue;
     int expected_targets = 0;
+    // Below level 0 groups hold 4+ ranks, or 2 for a power-of-two world up to 16 (pair ladder).
+    int const min_group = (c.world & (c.world - 1)) == 0 && c.world <= 16 ? 2 : 4;
     for (int level = 0; level < c.level_count; ++level)
     {
         int group = c.group_sizes[level];
-        if (group < (level ? 4 : 2) || group > c.world || c.world % group || (!level && group != c.world)
+        if (group < (level ? min_group : 2) || group > c.world || c.world % group || (!level && group != c.world)
             || (level && (group >= c.group_sizes[level - 1] || c.group_sizes[level - 1] % group)))
             return cudaErrorInvalidValue;
         if (level)
             expected_targets += c.world / group;
     }
-    if (c.target_count != expected_targets || (c.route_features && !expected_targets)
-        || (!c.route_features && c.foreign_dst_table))
+    if (c.target_count != expected_targets || ((c.route_features & external) && !expected_targets)
+        || (!(c.route_features & external) && c.foreign_dst_table))
+        return cudaErrorInvalidValue;
+    // The balanced split needs a ladder that ends in pairs, at most 16 + 1 issuers per copy and a layer's copies
+    // (at most world * helpers / 2) in the builder's records; anything else would trap in every launch.
+    if ((c.route_features & balanced)
+        && (c.world > 16 || c.group_sizes[c.level_count - 1] != 2
+            || int64_t(c.world) * c.helper_count > 2 * megamoe_gpu_plan_detail::kBalancedMaxCopies))
         return cudaErrorInvalidValue;
     uint64_t total_bytes = 0;
     for (int plane = 0; plane < c.planes; ++plane)
@@ -1090,7 +1190,7 @@ extern "C" int megamoe_tma_copy_configure_gpu_plan(MegamoeTmaCopyState* state, M
     for (uint64_t i = 0; i < uint64_t(c.level_count) * c.helper_count * c.planes; ++i)
         if (!valid_address(c.dst_table[i], i % c.planes))
             return cudaErrorInvalidValue;
-    if (c.route_features)
+    if (c.route_features & external)
     {
         uint64_t index = 0;
         for (int level = 1; level < c.level_count; ++level)
@@ -1107,6 +1207,20 @@ extern "C" int megamoe_tma_copy_configure_gpu_plan(MegamoeTmaCopyState* state, M
                     }
         }
     }
+    // Owner-direct unicast: every rank's helper rows as this rank maps them.
+    if (c.route_features & unicast)
+    {
+        for (uint64_t i = 0; i < uint64_t(c.world) * c.helper_count * c.planes; ++i)
+            if (!valid_address(c.uc_dst_table[i], i % c.planes))
+                return cudaErrorInvalidValue;
+    }
+    // Pair multicast: a pair team's address per pair, helper and plane, or 0.
+    if (c.route_features & pair)
+    {
+        for (uint64_t i = 0; i < uint64_t(c.world / 2) * c.helper_count * c.planes; ++i)
+            if (c.pair_dst_table[i] && !valid_address(c.pair_dst_table[i], i % c.planes))
+                return cudaErrorInvalidValue;
+    }
     int device = -1;
     cudaError_t error = cudaGetDevice(&device);
     if (error != cudaSuccess)
@@ -1121,8 +1235,10 @@ extern "C" int megamoe_tma_copy_configure_gpu_plan(MegamoeTmaCopyState* state, M
     d.config = c;
     const uint64_t sources = uint64_t(c.global_experts) * c.planes;
     const uint64_t destinations = uint64_t(c.level_count) * c.helper_count * c.planes;
-    const uint64_t foreign = c.route_features ? uint64_t(c.target_count) * c.helper_count * c.planes : 0;
-    const uint64_t words = sources + destinations + foreign + c.planes;
+    const uint64_t foreign = (c.route_features & external) ? uint64_t(c.target_count) * c.helper_count * c.planes : 0;
+    const uint64_t unicast_count = (c.route_features & unicast) ? uint64_t(c.world) * c.helper_count * c.planes : 0;
+    const uint64_t pair_count = (c.route_features & pair) ? uint64_t(c.world / 2) * c.helper_count * c.planes : 0;
+    const uint64_t words = sources + destinations + foreign + unicast_count + pair_count + c.planes;
     if (words > SIZE_MAX / sizeof(uint64_t))
         return cudaErrorInvalidValue;
     error = cudaMalloc(reinterpret_cast<void**>(&state->direct_tables), words * sizeof(uint64_t));
@@ -1139,6 +1255,8 @@ extern "C" int megamoe_tma_copy_configure_gpu_plan(MegamoeTmaCopyState* state, M
     if ((error = upload(c.src_table, sources, &d.config.src_table)) != cudaSuccess
         || (error = upload(c.dst_table, destinations, &d.config.dst_table)) != cudaSuccess
         || (error = upload(c.foreign_dst_table, foreign, &d.config.foreign_dst_table)) != cudaSuccess
+        || (error = upload(c.uc_dst_table, unicast_count, &d.config.uc_dst_table)) != cudaSuccess
+        || (error = upload(c.pair_dst_table, pair_count, &d.config.pair_dst_table)) != cudaSuccess
         || (error = upload(c.plane_bytes, c.planes, &d.config.plane_bytes)) != cudaSuccess)
         return fail(error);
     auto const& config = state->config;
@@ -1209,7 +1327,7 @@ extern "C" int megamoe_tma_copy_bind_gpu_direct(MegamoeTmaCopyState* state, uint
         if (error == cudaSuccess)
             error = cudaMemset(d.resident, 0xFF, bytes); // -1: no expert is known to be resident.
         if (error == cudaSuccess)
-            error = cudaStreamSynchronize(nullptr);      // Cold initialization only.
+            error = cudaStreamSynchronize(nullptr); // Cold initialization only.
         if (error != cudaSuccess)
             return error;
     }

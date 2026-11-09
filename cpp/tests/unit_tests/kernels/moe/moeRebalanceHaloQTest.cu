@@ -15,8 +15,8 @@
  */
 
 /* The HALO-Q rebalance plan (placement, quota repair, helper-slot coloring) on routing counts given directly to one
- * CTA, without the cross-rank count exchange or the copy.  Each case checks the plan's invariants and pins the plan of
- * fixed inputs, so a change to the policy shows up here first. */
+ * CTA, without the cross-rank count exchange or the copy.  Each case checks the plan's invariants, recomputes the
+ * coloring on the host, and pins the placement of fixed inputs, so a change to the policy shows up here first. */
 
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloQKernel.cuh"
 
@@ -42,10 +42,12 @@ int planField(std::vector<int> const& plan, int field, int b)
     return plan[2 + field * kMaxBroadcasts + b];
 }
 
-/* halo_q_scheduler_body's planning phase after the count exchange.  Coloring then runs once per local rank, each on a
- * fresh copy of the plan; colors holds per rank the helper of every broadcast and the rank's out ids/levels/owners. */
+/* halo_q_scheduler_body's planning phase after the count exchange, on its shared-memory layout: prepare,
+ * place_halo_q, then warp 8 colors for local rank 0 while the quota repair runs.  The test only adds a snapshot of
+ * the placement's quota rows before the repair, and colors again for every other local rank, each on a fresh copy of
+ * the plan.  colors holds per rank the helper of every broadcast and the rank's out ids/levels/owners. */
 __global__ void __launch_bounds__(kThreads, 1) planKernel(int const* allCounts, int ep, int experts, int helpers,
-    int capacity, int* plan, int* quotaPre, int* quotaPost, int* planCopy, int* colors, int* status)
+    int capacity, int sharedInts, int* plan, int* quotaPre, int* quotaPost, int* planCopy, int* colors, int* status)
 {
     extern __shared__ int shared[];
     int offset = ep * experts;
@@ -56,16 +58,10 @@ __global__ void __launch_bounds__(kThreads, 1) planKernel(int const* allCounts, 
     offset += ep;
     int* quota = shared + offset;
     offset += capacity * ep;
-    int* candidates = shared + offset;
+    int* selectedFlags = shared + offset;
     offset += experts;
     int* recvUsed = shared + offset;
     offset += ep * kHelperMaskWords;
-    int* sendUsed = shared + offset;
-    offset += ep;
-    int* nextIndex = shared + offset;
-    offset += ep;
-    int* frozen = shared + offset;
-    offset += ep;
     int* ring = shared + offset;
     offset += ep;
     int* order = shared + offset;
@@ -73,41 +69,39 @@ __global__ void __launch_bounds__(kThreads, 1) planKernel(int const* allCounts, 
     int* hostMask = shared + offset;
     offset += capacity;
     int* schedule = shared + offset;
+    offset += kScheduleInts;
+    int* running = shared + offset;
 
+    /* The planner CTA's shared memory holds whatever ran before it, so every word starts poisoned; exchange_counts
+     * then fills the counts and ends at a block barrier. */
+    for (int i = threadIdx.x; i < sharedInts; i += blockDim.x)
+        shared[i] = -1;
+    __syncthreads();
     for (int i = threadIdx.x; i < ep * experts; i += blockDim.x)
         counts[i] = allCounts[i];
-    for (int i = threadIdx.x; i < capacity * ep; i += blockDim.x)
-        quota[i] = 0;
     __syncthreads();
     if (uses_register_prepare(ep, experts))
-        prepare_halo_m_register(
-            counts, histogram, load, candidates, recvUsed, sendUsed, nextIndex, frozen, ep, experts, helpers);
+        prepare_halo_m_register(counts, histogram, load, selectedFlags, ep, experts, helpers);
     else
-        prepare_halo_m(
-            counts, histogram, load, candidates, recvUsed, sendUsed, nextIndex, frozen, ep, experts, helpers);
-    if (threadIdx.x < (ep <= 8 ? 8 : 32))
-    {
-        int broadcasts;
-        if (ep <= 8 && helpers <= 15 && helpers * ep <= experts)
-            broadcasts = plan_halo_m_register8(histogram, load, quota, candidates, plan, ep, helpers);
-        else
-            broadcasts = plan_halo_m_warp(
-                histogram, load, quota, candidates, recvUsed, sendUsed, nextIndex, frozen, plan, ep, experts, helpers);
-        if (threadIdx.x == 0)
-            plan[1] = broadcasts;
-    }
-    __syncthreads();
-    int const broadcasts = plan[1];
+        prepare_halo_m(counts, histogram, load, selectedFlags, ep, experts, helpers);
+    int const broadcasts = place_halo_q(histogram, load, quota, selectedFlags, running, plan, ep, experts, helpers);
+    // place_halo_q ends at a block barrier.
     for (int i = threadIdx.x; i < broadcasts * ep; i += blockDim.x)
         quotaPre[i] = quota[i];
     __syncthreads();
+    if (threadIdx.x >> 5 == 8)
+        color_and_publish_local(plan, broadcasts, ep, helpers, 0, recvUsed, colors + kMaxBroadcasts,
+            colors + kMaxBroadcasts + helpers, colors + kMaxBroadcasts + 2 * helpers, status, 1, nullptr);
     run_halo_q(counts, quota, plan, broadcasts, ep, experts, ring, order, hostMask, schedule);
     __syncthreads();
     for (int i = threadIdx.x; i < broadcasts * ep; i += blockDim.x)
         quotaPost[i] = quota[i];
+    for (int i = threadIdx.x; i < broadcasts; i += blockDim.x)
+        colors[i] = plan[2 + kPlanHelper * kMaxBroadcasts + i];
+    __syncthreads();
 
     int const stride = kMaxBroadcasts + 3 * helpers;
-    for (int rank = 0; rank < ep; ++rank)
+    for (int rank = 1; rank < ep; ++rank)
     {
         for (int i = threadIdx.x; i < kPlanInts; i += blockDim.x)
             planCopy[i] = plan[i];
@@ -115,7 +109,7 @@ __global__ void __launch_bounds__(kThreads, 1) planKernel(int const* allCounts, 
         int* out = colors + rank * stride;
         if (threadIdx.x >> 5 == 8)
             color_and_publish_local(planCopy, broadcasts, ep, helpers, rank, recvUsed, out + kMaxBroadcasts,
-                out + kMaxBroadcasts + helpers, out + kMaxBroadcasts + 2 * helpers, status, 1);
+                out + kMaxBroadcasts + helpers, out + kMaxBroadcasts + 2 * helpers, status, 1, nullptr);
         __syncthreads();
         for (int i = threadIdx.x; i < broadcasts; i += blockDim.x)
             out[i] = planCopy[2 + kPlanHelper * kMaxBroadcasts + i];
@@ -129,8 +123,9 @@ struct Case
     int ep;
     int experts;
     int helpers;
-    bool hotHalf; // the first half of the ranks is three times as loaded, else hot experts are spread at random
-    uint64_t golden;
+    bool hotHalf;    // the first half of the ranks is three times as loaded, else hot experts are spread at random
+    int broadcasts;  // of the placement
+    uint64_t golden; // placementHash() of the placement
 };
 
 /* 8192 tokens x top-8 per source rank, with +-25% noise per source rank.  An expert's share follows 1 / (1 + j) for a
@@ -163,12 +158,27 @@ std::vector<int> makeCounts(Case const& c)
     return counts;
 }
 
-uint64_t fnv1a(uint64_t hash, std::vector<int> const& values, size_t count)
+uint64_t fnv1a(uint64_t hash, int const* values, size_t count)
 {
     for (size_t i = 0; i < count; ++i)
         for (int byte = 0; byte < 4; ++byte)
             hash = (hash ^ ((static_cast<uint32_t>(values[i]) >> (8 * byte)) & 0xffu)) * 0x100000001b3ull;
     return hash;
+}
+
+/* FNV-1a over the broadcast count, each broadcast's expert, level, group begin, group size and owner, then the
+ * placement's quota rows: the plan before repair and coloring. */
+uint64_t placementHash(std::vector<int> const& plan, std::vector<int> const& pre, int ep)
+{
+    int const broadcasts = plan[1];
+    uint64_t hash = fnv1a(0xcbf29ce484222325ull, &broadcasts, 1);
+    for (int b = 0; b < broadcasts; ++b)
+        for (int field : {kPlanExpert, kPlanLevel, kPlanGroupBegin, kPlanGroupSize, kPlanOwner})
+        {
+            int const value = planField(plan, field, b);
+            hash = fnv1a(hash, &value, 1);
+        }
+    return fnv1a(hash, pre.data(), static_cast<size_t>(broadcasts) * ep);
 }
 
 class HaloQPlannerTest : public ::testing::TestWithParam<Case>
@@ -189,7 +199,8 @@ TEST_P(HaloQPlannerTest, PlanInvariantsAndGolden)
     int const helpers = c.helpers;
     int const home = experts / ep;
     int const capacity = broadcast_capacity(ep, experts, helpers);
-    int const sharedBytes = halo_q_shared_ints(ep, experts, capacity, kThreads) * static_cast<int>(sizeof(int));
+    int const sharedInts = halo_q_shared_ints(ep, experts, helpers, kThreads);
+    int const sharedBytes = sharedInts * static_cast<int>(sizeof(int));
     int maxShared = 0;
     ASSERT_EQ(cudaDeviceGetAttribute(&maxShared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device), cudaSuccess);
     if (sharedBytes > maxShared)
@@ -206,12 +217,12 @@ TEST_P(HaloQPlannerTest, PlanInvariantsAndGolden)
     ASSERT_EQ(cudaMalloc(&dColors, ep * stride * sizeof(int)), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&dStatus, 8 * sizeof(int)), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(dCounts, counts.data(), counts.size() * sizeof(int), cudaMemcpyHostToDevice), cudaSuccess);
-    ASSERT_EQ(cudaMemset(dPlan, 0, kPlanInts * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMemset(dPlan, 0xff, kPlanInts * sizeof(int)), cudaSuccess);
     ASSERT_EQ(cudaMemset(dColors, 0xff, ep * stride * sizeof(int)), cudaSuccess);
     ASSERT_EQ(cudaMemset(dStatus, 0, 8 * sizeof(int)), cudaSuccess);
     ASSERT_EQ(cudaFuncSetAttribute(planKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sharedBytes), cudaSuccess);
     planKernel<<<1, kThreads, sharedBytes>>>(
-        dCounts, ep, experts, helpers, capacity, dPlan, dPre, dPost, dPlanCopy, dColors, dStatus);
+        dCounts, ep, experts, helpers, capacity, sharedInts, dPlan, dPre, dPost, dPlanCopy, dColors, dStatus);
     ASSERT_EQ(cudaGetLastError(), cudaSuccess);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
@@ -230,6 +241,10 @@ TEST_P(HaloQPlannerTest, PlanInvariantsAndGolden)
     for (int word : status)
         EXPECT_EQ(word, 0) << "helper coloring failed";
 
+    /* Levels: the multicast ladder ep >> level, then, for EP >= 4, aligned rank pairs.  A rank sends at most
+     * candidate_count() = min(S, home, 32) experts; a multicast group may include its owner or not. */
+    int const depth = planner_depth(ep);
+    int const pairLevel = pair_level_of(ep);
     std::vector<int64_t> mass(experts, 0), resident(ep, 0), loadPre(ep, 0), loadPost(ep, 0);
     for (int rank = 0; rank < ep; ++rank)
         for (int e = 0; e < experts; ++e)
@@ -249,9 +264,9 @@ TEST_P(HaloQPlannerTest, PlanInvariantsAndGolden)
         ASSERT_TRUE(e >= 0 && e < experts) << "broadcast " << b;
         EXPECT_EQ(seen[e]++, 0) << "expert " << e << " broadcast twice";
         EXPECT_EQ(owner, e / home) << "broadcast " << b;
-        EXPECT_LE(++exports[owner], std::min(helpers, home)) << "owner " << owner;
-        ASSERT_TRUE(
-            level >= 0 && level < hierarchy_depth(ep) && size == ep >> level && begin % size == 0 && begin + size <= ep)
+        EXPECT_LE(++exports[owner], candidate_count(ep, experts, helpers)) << "owner " << owner;
+        ASSERT_TRUE(level >= 0 && level < depth && size == (level == pairLevel ? 2 : ep >> level) && begin % size == 0
+            && begin + size <= ep)
             << "broadcast " << b << " group [" << begin << ", " << begin + size << ") at level " << level;
         loadPre[owner] -= mass[e];
         loadPost[owner] -= mass[e];
@@ -277,22 +292,31 @@ TEST_P(HaloQPlannerTest, PlanInvariantsAndGolden)
     EXPECT_LE(*std::max_element(loadPre.begin(), loadPre.end()), *std::max_element(resident.begin(), resident.end()))
         << "placement raised the busiest rank's load";
 
-    /* Every rank colors alike; broadcasts whose groups share a rank use different slots; each rank's slots name the
-     * broadcasts that cover it. */
-    for (int b = 0; b < broadcasts; ++b)
-    {
-        int const helper = colors[b];
-        EXPECT_TRUE(helper >= 0 && helper < helpers) << "broadcast " << b << " helper " << helper;
-        for (int rank = 1; rank < ep; ++rank)
-            EXPECT_EQ(colors[rank * stride + b], helper) << "broadcast " << b << " rank " << rank;
-        for (int other = 0; other < b; ++other)
+    /* Coloring without a residency table: levels coarse first, then broadcasts in order, each takes the lowest slot
+     * free on its whole group.  Every rank colors alike, and each rank's slots name the broadcasts that cover it. */
+    std::vector<char> taken(static_cast<size_t>(ep) * helpers, 0);
+    std::vector<int> expected(broadcasts, -1);
+    for (int level = 0; level < depth; ++level)
+        for (int b = 0; b < broadcasts; ++b)
         {
-            int const lo = std::max(planField(plan, kPlanGroupBegin, b), planField(plan, kPlanGroupBegin, other));
-            int const hi = std::min(planField(plan, kPlanGroupBegin, b) + planField(plan, kPlanGroupSize, b),
-                planField(plan, kPlanGroupBegin, other) + planField(plan, kPlanGroupSize, other));
-            EXPECT_FALSE(lo < hi && colors[other] == helper) << "broadcasts " << other << " and " << b;
+            if (planField(plan, kPlanLevel, b) != level)
+                continue;
+            int const begin = planField(plan, kPlanGroupBegin, b);
+            int const end = begin + planField(plan, kPlanGroupSize, b);
+            for (int slot = 0; slot < helpers && expected[b] < 0; ++slot)
+            {
+                bool open = true;
+                for (int rank = begin; rank < end; ++rank)
+                    open = open && !taken[rank * helpers + slot];
+                expected[b] = open ? slot : -1;
+            }
+            ASSERT_GE(expected[b], 0) << "broadcast " << b << " finds no free slot";
+            for (int rank = begin; rank < end; ++rank)
+                taken[rank * helpers + expected[b]] = 1;
         }
-    }
+    for (int b = 0; b < broadcasts; ++b)
+        for (int rank = 0; rank < ep; ++rank)
+            EXPECT_EQ(colors[rank * stride + b], expected[b]) << "broadcast " << b << " local rank " << rank;
     for (int rank = 0; rank < ep; ++rank)
         for (int slot = 0; slot < helpers; ++slot)
         {
@@ -300,7 +324,7 @@ TEST_P(HaloQPlannerTest, PlanInvariantsAndGolden)
             for (int b = 0; b < broadcasts; ++b)
             {
                 int const begin = planField(plan, kPlanGroupBegin, b);
-                if (colors[b] == slot && rank >= begin && rank < begin + planField(plan, kPlanGroupSize, b))
+                if (expected[b] == slot && rank >= begin && rank < begin + planField(plan, kPlanGroupSize, b))
                 {
                     id = planField(plan, kPlanExpert, b);
                     level = planField(plan, kPlanLevel, b);
@@ -313,29 +337,35 @@ TEST_P(HaloQPlannerTest, PlanInvariantsAndGolden)
             EXPECT_EQ(out[2 * helpers + slot], owner) << "rank " << rank << " slot " << slot;
         }
 
-    /* The exact plan of these inputs.  An intended policy change updates the golden value printed below. */
-    uint64_t hash = 0xcbf29ce484222325ull;
-    hash = fnv1a(hash, plan, 2 + 6 * kMaxBroadcasts);
-    hash = fnv1a(hash, pre, broadcasts * ep);
-    hash = fnv1a(hash, post, broadcasts * ep);
-    hash = fnv1a(hash, colors, colors.size());
+    /* The exact placement of these inputs, from the Python reference of the planner (haloq3_ref.place_best with
+     * pairs="both" and planner_targets() targets).  The repair is checked by its invariants, the coloring by the host
+     * recomputation above.  An intended policy change updates the values printed below. */
+    uint64_t const hash = placementHash(plan, pre, ep);
     char hex[32];
     std::snprintf(hex, sizeof(hex), "0x%016llx", static_cast<unsigned long long>(hash));
-    EXPECT_EQ(hash, c.golden) << c.name << ": plan hash " << hex << " (" << broadcasts << " broadcasts)";
+    EXPECT_EQ(broadcasts, c.broadcasts) << c.name << ": placement hash " << hex;
+    EXPECT_EQ(hash, c.golden) << c.name << ": placement hash " << hex << " (" << broadcasts << " broadcasts)";
 }
 
-/* EP <= 8 with few helpers takes the 8-lane register planner and pair repair; more helpers, larger EP and non-powers
- * of two take the 32-lane planner and the scheduled repair; fewer experts than the repair schedule; more than 32
- * broadcasts and 32 helpers take the generic repair and serial coloring. */
+/* Inputs make 1 to 69 broadcasts.  EP8/16/32 at S = 2 and 3 take the compile-time placement shapes: four dense
+ * plans, except at EP32 S3, where warp 0 writes its plan directly and three dense plans stand behind it.  EP2 (no pair
+ * level), EP4 S4, EP8 S16 and EP12 (not a power of two) take the runtime-shape placement with dense plans, EP32 S40
+ * with two compact plans.  EP <= 8 prepares in registers (homes up to 64 experts), except EP2 (a 192-expert home).
+ * Up to 32 broadcasts take the scheduled pair repair and the warp coloring; EP32 S40 (69 broadcasts, 40 helpers)
+ * takes the generic repair and the serial coloring. */
 INSTANTIATE_TEST_SUITE_P(HaloQ, HaloQPlannerTest,
-    ::testing::Values(Case{"ep4_e96_s4_hot_half", 4, 96, 4, true, 0x7db396a2e3b3435aull},
-        Case{"ep8_e384_s3", 8, 384, 3, false, 0x51289f6ecdd78fe2ull},
-        Case{"ep8_e384_s16", 8, 384, 16, false, 0x6849100d88b04170ull},
-        Case{"ep12_e384_s3", 12, 384, 3, false, 0x3b0f445dd222dfa0ull},
-        Case{"ep16_e384_s3", 16, 384, 3, false, 0x8bfb8ef3a26b54eaull},
-        Case{"ep32_e384_s3", 32, 384, 3, false, 0x78c7529ce5f2f0baull},
-        Case{"ep32_e96_s3", 32, 96, 3, false, 0xf59361f1320337fcull},
-        Case{"ep32_e384_s40_hot_half", 32, 384, 40, true, 0x9930d2f5211d1099ull}),
+    ::testing::Values(Case{"ep2_e384_s2", 2, 384, 2, false, 1, 0x6289361b7d1c018aull},
+        Case{"ep4_e96_s4_hot_half", 4, 96, 4, true, 4, 0x20ef4247f37f6409ull},
+        Case{"ep8_e384_s2", 8, 384, 2, false, 4, 0x5a329ac8c069c55cull},
+        Case{"ep8_e384_s3", 8, 384, 3, false, 4, 0xb782d125f316ad9eull},
+        Case{"ep8_e384_s16", 8, 384, 16, false, 5, 0xf46a992ac17e401eull},
+        Case{"ep12_e384_s3", 12, 384, 3, false, 7, 0xf302a409d0dcf032ull},
+        Case{"ep16_e384_s2", 16, 384, 2, false, 2, 0xe6e786693a67baf7ull},
+        Case{"ep16_e384_s3", 16, 384, 3, false, 7, 0x62fc8a7e4f55da36ull},
+        Case{"ep32_e384_s2", 32, 384, 2, false, 12, 0x2a8aa6ecb253137cull},
+        Case{"ep32_e384_s3", 32, 384, 3, false, 13, 0x0d5cf5f85749022dull},
+        Case{"ep32_e96_s3", 32, 96, 3, false, 12, 0x9cbc33c7e91f9ab2ull},
+        Case{"ep32_e384_s40_hot_half", 32, 384, 40, true, 69, 0xda1f5369e873e662ull}),
     [](::testing::TestParamInfo<Case> const& info) { return std::string(info.param.name); });
 
 } // namespace tensorrt_llm::tests::kernels::haloq
