@@ -238,7 +238,7 @@ There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (
 
 **File Naming**: `xxx.yaml` (can contain `-` hyphen).
 
-**Example**: `gb200_deepseek-r1-fp4_1k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL.yaml`
+**Example**: `gb200_gpt-oss-120b-fp4_8k1k_con4_ctx1_tp1_gen1_tp4_eplb0_mtp0_ccb-NIXL.yaml`
 
 **Use Case**: Disaggregated architecture where model runs across multiple nodes with separate context (prefill) and generation (decode) servers.
 
@@ -516,7 +516,7 @@ rule and how to force gating back on.
 
 Use this for pre-merge stages whose goal is to catch functional regressions on paths that only had post-merge coverage before. It preserves the data-continuity benefit of running in pre-merge (baselines still update from PR data points) without the flakiness cost of gating on the noisier disagg perf numbers.
 
-**No stage currently sets this flag.** Pre-merge perf-sanity is single-node `ctx_only` only, and every `ctx_only` case gates on perf; the multi-node disagg cases that used it are post-merge only. The mechanism is kept for the next pre-merge stage that needs non-gating coverage.
+**No stage currently sets this flag**, and no perf-sanity stage currently runs in pre-merge. The mechanism is kept for the next pre-merge stage that needs non-gating coverage.
 
 Detection is by substring match on `os.environ["stageName"]` inside `test_perf_sanity.py`; no changes to `perf_regression_utils.py`.
 

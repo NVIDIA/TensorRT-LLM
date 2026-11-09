@@ -16,7 +16,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
 class K3CtmGemvLong(OpWrapper):
     """Return `bf16(x @ weight.T)`, columns >= `sig_col0` (if >= 0) as `bf16(sigmoid(.))`, in one call."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="MLA fused W_a/W_g, sigmoid gate columns and split 6",

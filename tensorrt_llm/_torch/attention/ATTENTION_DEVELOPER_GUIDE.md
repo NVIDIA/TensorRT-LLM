@@ -233,6 +233,11 @@ routes, and optional token-validity bits mask ragged KV tails. Plans contain
 only static format, proxy, geometry, and capacity choices; every run receives
 the live routes, summaries, validity bits, page tables, and sequence lengths.
 
+Both `k_summary` and `v_summary` are arithmetic means over the tokens present
+in each KV block, excluding padding in a partial final block. The kernel
+weights each proxy by its represented token count; do not pass V sums or
+pre-weight the summaries.
+
 The contiguous block-sparse path also consumes the SageAttention recipe in
 `AttentionForwardArgs`. Prediction sees the original Q/K/V. The attention core
 then quantizes the Q/K/V of a block-sparse call before FMHA selection, with
@@ -475,6 +480,24 @@ starting with an empty selection cache. `TrtllmAttention` prepares the complete
 per-forward state, passes itself to the manager for selection, and then executes
 the selected library.
 
+`FallbackFmha` hands the Python `FmhaParams` to `thop.run_context` or
+`thop.run_generation`; the native carrier behind them is per host thread and
+never visible to Python. Generated nanobind readers
+(`scripts/generate_fmha_params.py`) copy the fields C++ reads from `attn`,
+`meta` and `fwd` into the native struct, build an `AttentionConfig` key, and
+resolve the op from a per-thread C++ cache keyed by that configuration; the op
+is built outside CUDA graph capture on first use and its kernel runners are
+created lazily per phase. Workspace sizing, growth and the multi-CTA counter
+live in C++; `prepare_workspace()` is empty. After each launch the holder drops
+every tensor reference so cached parameters never pin a layer's activations.
+Streams are not part of the key so CUDA graph capture reuses runners
+initialized during warmup.
+
+`FallbackFmha._is_supported()` accepts separate Q/K/V only for MLA, cross
+attention, or SageAttention; self-attention requires KV-cache updates. It rejects
+raw FP8 E4M3 query input and custom masks. Keep this admission contract aligned
+with the native `AttentionOp` input requirements.
+
 `TLLM_FMHA_LIBS` controls the ordered selection. Dense PrimTS is opt-in because
 it may add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the
 defaults or `TLLM_FMHA_LIBS=fallback` to force the fallback path. Generic
@@ -489,20 +512,22 @@ preserves the user-specified order. Each FMHA library exposes `is_available()`
 for module/static environment checks and `is_supported()` for per-forward
 request checks. `AttentionForwardArgs.sparse_runtime_params` is the sole
 per-call lowered sparse runtime carrier and defaults to an empty
-`SparseRuntimeParams()`. The core forward overwrites that field with the carrier
-that `prepare_sparse_runtime_params` builds from the caller's carrier plus the
-hook results. The carrier holds both flat `AttentionOp` parameters and optional
+`SparseRuntimeParams()`. The core forward installs the predicted carrier in a new arguments object,
+leaving the caller's `sparse_runtime_params` unchanged. The carrier holds both flat `AttentionOp` parameters and optional
 `BlockSparseForwardInputs` in its nested `block_sparse_inputs` field.
 `Fmha.is_supported()` rejects a request that carries routes for every library
 that does not declare `supports_block_sparse_inputs`, so no dense kernel can
-silently drop the routing semantics.
+silently drop the routing semantics. Likewise a generation call whose
+QK-norm / RoPE / KV-append prologue the attention module deferred
+(`AttentionForwardArgs.kv_append.fold`, query = raw QKV projection) reaches only
+libraries that declare `supports_deferred_prologue`.
 For mixed non-MLA batches, the manager checks each active phase
 independently with `is_supported(..., phase=...)`; a phased library accepts only
 phases backed by its corresponding `run_*()` entry point.
 
 `Fmha` owns both entry points. Libraries declare shared capabilities through
 class attributes, such as `supports_skip_correction`, `supports_block_sparse_inputs`,
-and `supports_fp4_mla`, and override only
+`supports_fp4_mla` and `supports_deferred_prologue`, and override only
 `_is_available()` and `_is_supported()` for implementation-specific checks.
 `is_available()` rejects unsupported static capabilities before calling
 `_is_available()`. `is_supported()` provides the same boundary for shared
@@ -633,9 +658,17 @@ The FMHA package is split by role:
   MiniMax-M3 decode kernels for the generation phase.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
+- `fmha/gqa_decode.py` serves the layers built with a `GqaDecodeSetup`:
+  `gqa_decode` is trtllm-gen that also consumes the module's FP8 KV append and
+  deferred prologue, and `gqa_kv_replica_fused`, `gqa_kv_replica`,
+  `gqa_split_kv` and `gqa_segmented` take the generation calls their
+  `_is_supported` declares with dedicated kernels (`fmha/gqa_*.py`). Their
+  size conditions are evaluated at the upper bound of the selection-cache
+  cell (`generation_selection_cell`).
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
-- `fmha/fallback.py` implements the regular `thop.attention` fallback library.
+- `fmha/fallback.py` implements the fallback library on the native phased
+  `thop.run_context` / `thop.run_generation` entry points.
 - `fmha/registry.py` owns `TLLM_FMHA_LIBS` parsing and library ordering.
 
 Use `PhasedFmha` for libraries that implement one or more phase-specific entry
@@ -674,7 +707,7 @@ prefill, KV block reuse or speculative draft tokens are configured. Those
 features all require the context phase to attend to KV that is already in the
 cache, and only the fused context FMHA kernel can do that.
 
-`AttentionOp::initialize()` ends with
+`MHA::initContext()` ends with
 `mEnableContextFMHA = mIsGenerationMLA || mFmhaDispatcher->isSupported()`, so a
 configuration with no compiled kernel silently clears the flag and the context
 phase runs the unfused path instead. That path builds K and V from the current
@@ -682,17 +715,17 @@ chunk alone: the cached prefix is dropped from attention and then overwritten
 by the chunk's write-back, which turns a missing kernel into a plausible wrong
 answer rather than an error.
 
-`get_attention_op` in `thop/attentionOp.cpp` therefore refuses a non-MLA,
-non-cross paged-context configuration whose initialization produced no context
-FMHA kernel. The check runs after `initialize()`, because only the initialized
-op reflects the exact Q/KV/output precision, mask type and page size, and
-outside `initialize()` itself, which is `noexcept`.
+`MHA::prepareInputs()` refuses a non-MLA, non-cross paged-context request whose
+initialized op has no context FMHA kernel, so an unsupported configuration fails
+when the first context call prepares its workspace (normally during warmup), not
+at op construction. The check uses the exact Q/KV/output precision, mask type and
+page size.
 
 The refusal has three distinct causes, each with its own message, and the
 distinction matters when triaging:
 
-- Relative position embedding (T5-style self attention). `initialize()` clears
-  `mEnableContextFMHA` for it before the kernel table is consulted, so no
+- Relative position embedding (T5-style self attention). The `MHA` constructor
+  clears `mEnableContextFMHA` for it before the kernel table is consulted, so no
   build carries a fused kernel for it. This is an unsupported feature
   combination: disable chunked prefill, KV block reuse and speculative
   decoding for the model. The message says so and does not point at the
@@ -709,7 +742,7 @@ distinction matters when triaging:
 The last two share one message ("requires a fused context FMHA kernel, and this
 build has none").
 
-Cross attention is exempt from the op-construction check. Its unfused path
+Cross attention is exempt from this self-attention check. Its unfused path
 builds K and V from the encoder output (`params.cross_kv`) rather than from a
 cached prefix, so it is correct whenever the encoder output is supplied, which
 is the case on the first decoder context step and on every generation step.
@@ -732,7 +765,7 @@ family, or head size 72) rather than trip that runner's Q/KV precision
 assertion. It is a diagnostic aid: the output dtype is an explicit
 argument because the runtime chooses it independently of the KV cache dtype,
 and the probe fixes the mask, layout and head ratio, so its answer does not by
-itself describe the configuration a given model will run. The op-level refusal
+itself describe the configuration a given model will run. The context preparation check
 above is the authoritative check.
 
 ## 4. Evaluating New Attention

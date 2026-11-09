@@ -138,9 +138,11 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor._mm_encoder_item_scheduling_enabled = False
     executor.enable_early_first_token_response = False
     executor.drafter = None
+    executor.capturable_guided_decoder = None
     executor.model_engine = None
     executor.previous_batch = None
     executor.active_requests = []
+    executor.canceled_req_ids = []
     executor.waiting_queue = []
     executor.inflight_req_ids = set()
     executor.is_shutdown = False
@@ -331,7 +333,10 @@ def test_overlap_kv_events_keep_adp_collectives_aligned(
         executor.resource_manager.update_resources.side_effect = update_resources
         if state != "absent":
             executor.previous_batch = SimpleNamespace(
-                scheduled_requests=ScheduledRequests(), sample_state=Mock()
+                scheduled_requests=ScheduledRequests(),
+                sample_state=Mock(),
+                guided_batch_id=None,
+                guided_failures=None,
             )
         # A locally ready rank defers its previous batch while a peer cannot queue.
         executor._can_queue.return_value = (False, state == "deferred")

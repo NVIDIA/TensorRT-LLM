@@ -64,6 +64,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
@@ -1122,7 +1123,7 @@ bool attnResPersistentFusedSupported(AttnResFwdParams const& params)
         && params.seqLen >= 1;
 }
 
-void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_t stream)
+void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, int smReserve, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(attnResPersistentFusedSupported(params),
         "attn_res persistent fused: unsupported shape (H=%d, B=%d, N=%d, T=%d) or a required tensor is null",
@@ -1138,6 +1139,7 @@ void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_
     int num_sm = 0;
     TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev));
     TLLM_CHECK_WITH_INFO(num_sm > 0, "attn_res persistent fused: failed to query the SM count of device %d", dev);
+    num_sm -= std::clamp(smReserve, 0, num_sm - 1);
 
     using namespace sm100::fwd_prod_v2;
 
