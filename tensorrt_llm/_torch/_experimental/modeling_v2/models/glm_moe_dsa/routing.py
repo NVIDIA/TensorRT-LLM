@@ -188,13 +188,18 @@ def route(
     # draft tokens per step: a generation step carries D + 1 query rows per sequence,
     # and the decode attention's grid is compiled for that width. The specialised MLA
     # rope kernel and the base-row index kind are built for width 2 and, at MTP3 /
-    # MTP5, also for D + 1 (4 / 6). A dynamic tree is a different forward. The engine
-    # resolves an unset draft length to 1 before this runs.
+    # MTP5, also for D + 1 (4 / 6). A dynamic tree is a different forward: its tree
+    # masks and position offsets are consumed by neither the MLA / RoPE path nor the
+    # top-k, which assume a linear chain. That holds even when the tree is capped at
+    # the chain length (max_total_draft_tokens == max_draft_len), so the flag itself
+    # is declined. The engine resolves an unset draft length to 1 before this runs.
     draft_len = getattr(spec_config, "max_draft_len", None) or 1
     draft_tokens = getattr(spec_config, "max_total_draft_tokens", None) or draft_len
+    dynamic_tree = bool(getattr(spec_config, "use_dynamic_tree", False))
     mtp_linear_or_none = spec_config is None or (
         isinstance(spec_config, MTPDecodingConfig)
         and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+        and not dynamic_tree
         and draft_len in (1, 3, 5)
         and draft_tokens == draft_len
     )
@@ -254,7 +259,8 @@ def route(
         "off"
         if spec_config is None
         else f"{spec_config.spec_dec_mode.name} (max_draft_len={draft_len}, "
-        f"max_total_draft_tokens={draft_tokens})"
+        f"max_total_draft_tokens={draft_tokens}"
+        f"{', dynamic tree' if dynamic_tree else ''})"
     )
     raise NoTarget(
         f"compute capability {compute_capability}, config shape {shape}, "
@@ -268,7 +274,8 @@ def route(
         "tensor-parallel attention and experts, no attention DP), with one-model "
         "MTP-Eagle as a linear chain or no speculative decoding; GLM-5.2-NVFP4 "
         "on sm103, tep4 (4 ranks, tensor-parallel attention, expert-parallel MoE), "
-        "with one-model MTP-Eagle at max_draft_len 1, 3 or 5 or no speculative decoding, both "
+        "with one-model MTP-Eagle as a linear chain at max_draft_len 1, 3 or 5 (no dynamic "
+        "tree) or no speculative decoding, both "
         "with an fp8 latent KV cache (not the packed fp8_ds_mla layout); and the "
         "GLM-5.2 modelopt NVFP4 checkpoint (bf16 MTP layer) on sm103, tp8 (8 ranks, "
         "tensor-parallel attention and experts, no attention DP), with one-model "

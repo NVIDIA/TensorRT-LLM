@@ -1348,15 +1348,42 @@ def test_glm52_tep4_with_mtp_matches(max_draft_len):
         (MTPDecodingConfig(max_draft_len=4), r"max_draft_len=4, max_total_draft_tokens=4"),
         (
             MTPDecodingConfig(max_draft_len=1, use_dynamic_tree=True, dynamic_tree_max_topK=2),
-            r"max_draft_len=1, max_total_draft_tokens=2",
+            r"max_draft_len=1, max_total_draft_tokens=2, dynamic tree",
+        ),
+        # A dynamic tree capped at its chain length has the row count of a certified
+        # linear chain, but still carries tree masks and position offsets.
+        (
+            MTPDecodingConfig(
+                max_draft_len=3,
+                max_total_draft_tokens=3,
+                use_dynamic_tree=True,
+                dynamic_tree_max_topK=2,
+            ),
+            r"max_draft_len=3, max_total_draft_tokens=3, dynamic tree",
+        ),
+        (
+            MTPDecodingConfig(
+                max_draft_len=5,
+                max_total_draft_tokens=5,
+                use_dynamic_tree=True,
+                dynamic_tree_max_topK=2,
+            ),
+            r"max_draft_len=5, max_total_draft_tokens=5, dynamic tree",
         ),
     ],
-    ids=["draft2", "draft4", "dynamic_tree"],
+    ids=[
+        "draft2",
+        "draft4",
+        "dynamic_tree",
+        "capped_dynamic_tree_mtp3",
+        "capped_dynamic_tree_mtp5",
+    ],
 )
 def test_glm52_tep4_with_uncertified_draft_chain_does_not_match(spec_config, missed):
     """The target is certified on linear chains of 1, 3 and 5 draft tokens (the decode
-    attention's grid is compiled for D + 1 rows per sequence); other chain lengths and
-    a tree, which puts more rows on a sequence than its chain length, route nowhere."""
+    attention's grid is compiled for D + 1 rows per sequence); other chain lengths route
+    nowhere, and so does a dynamic tree, even one capped at a certified chain length:
+    the MLA / RoPE and top-k paths do not consume its tree masks or position offsets."""
     config = _model_config(_glm52_config(), spec_config=spec_config, **_TEP4)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match=missed):
