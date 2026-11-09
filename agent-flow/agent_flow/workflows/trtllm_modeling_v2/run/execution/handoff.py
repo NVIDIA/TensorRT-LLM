@@ -279,7 +279,6 @@ MAX_COMMITS = 12
 RENDER_CHARS = 12_000
 
 #: A full or abbreviated commit id.
-_COMMIT = re.compile(r"^[0-9a-f]{7,64}$")
 
 
 @dataclass
@@ -350,13 +349,8 @@ def build(
     result: TaskResult,
     attempt: int = 1,
     commits: Sequence[str] = (),
-    cleared: str = "",
 ) -> dict[str, Any]:
-    """The receipt of task ``task_id``, from the dispatch that actually ran.
-
-    ``cleared`` is the commit a regression check found clean, the next one's
-    base (``checks/test_results.default_base``).
-    """
+    """The receipt of task ``task_id``, from the dispatch that actually ran."""
     raw = result.data
     receipt: dict[str, Any] = {
         "task": task_id,
@@ -377,9 +371,6 @@ def build(
         receipt["entry"] = entry
     if tests:
         receipt["tests"] = tests
-    cleared = str(cleared or raw.get("cleared") or "").strip().lower()
-    if _COMMIT.match(cleared):
-        receipt["cleared"] = cleared
     if result.decision_file is not None:
         receipt["decision_file"] = str(result.decision_file)
     if result.result_file is not None:

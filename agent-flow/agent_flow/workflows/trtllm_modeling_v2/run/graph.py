@@ -15,15 +15,14 @@ tasks that declare the same file, and nothing beside an ``exclusive`` task.
 
 A soft dependency (``depends_on_soft``) lets a task start once the task it
 names has started; it is held back only at its integration (:func:`ready`).
-A ``check`` task's work is only contract checks, run with no agent turn. A
-regression check is a ``check`` task with ``regression: true``: it runs the
-modeling_v2 package tests after the changes to shared code it covers
-(:func:`regression_batch`).
+A ``check`` task's work is only contract checks, run with no agent turn.
+A task touches only the run's own paths (:func:`own_paths`); code other models
+run is not the run's to change, unless the operator lists it in
+``commit_policy.allowed_paths``.
 """
 
 from __future__ import annotations
 
-import copy
 import posixpath
 import re
 from dataclasses import asdict, dataclass, field
@@ -83,18 +82,10 @@ class Task:
     #: The task runs alone: no other task runs beside it. For work that needs a
     #: stable tree, such as a native rebuild every worktree's build links to.
     exclusive: bool = False
-    #: A ``check`` the orchestrator adds after changes to shared code: it runs the
-    #: modeling_v2 package tests on them (:func:`add_regression_check`).
-    regression: bool = False
-    #: Of a regression check that has started, the changes to shared code it
-    #: covers: those that had landed, uncovered, when it started
-    #: (:func:`regression_batch`). The orchestrator's to write; ``None`` until then.
-    covers: list[str] | None = None
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Task":
         resources = dict(data.get("resources") or {})
-        covers = data.get("covers")
         return cls(
             id=str(data.get("id", "")),
             kind=str(data.get("kind", "")),
@@ -111,15 +102,11 @@ class Task:
             tags=[str(s) for s in data.get("tags") or []],
             ref=str(data.get("ref", "")),
             exclusive=_flag(data.get("exclusive", False)),
-            regression=_flag(data.get("regression", False)),
-            covers=None if covers is None else [str(c) for c in covers],
         )
 
     def as_dict(self) -> dict[str, Any]:
         out = asdict(self)
         out["resources"] = {"gpus": out.pop("gpus"), "est_minutes": out.pop("est_minutes")}
-        if out["covers"] is None:
-            del out["covers"]
         if not out["tags"]:
             del out["tags"]
         return out
@@ -199,37 +186,33 @@ def touches_conflict(a: Task, b: Task) -> bool:
     return bool(_files(a) & _files(b))
 
 
-def own_paths(target_rel: str) -> tuple[str, ...]:
-    """The run's own paths: its target's directory, and the one its tests mirror it in.
+#: Where a run's integration tests, their lists and the accuracy references live: data and
+#: tests no other model's code runs.
+INTEGRATION_TESTS_DIR = "tests/integration"
 
-    Every other path a task may change is shared: code another model runs too.
-    None without a target.
+
+def own_paths(target_rel: str) -> tuple[str, ...]:
+    """The run's own paths: its target's family, the tests that mirror it, the integration tests.
+
+    The family's directory (its targets and the ``ops/`` they share) and its
+    tests' directory, the two registries a new family adds a line to
+    (``models/__init__.py``, ``_router_index.py``), and the integration tests
+    (:data:`INTEGRATION_TESTS_DIR`: the accuracy test, its test list entry and
+    its reference). Every other path is shared: code other models run, which a
+    run does not change. None without a target.
     """
     if not target_rel.strip():
         return ()
-    target = posixpath.normpath(target_rel)
-    return (target, model_ops_tests_dir(target))
-
-
-def shared_touches(task: Task, own: Sequence[str]) -> list[str]:
-    """The paths of ``task``'s ``touches`` outside ``own``, the run's own paths (:func:`own_paths`).
-
-    A directory that holds an own path, such as the target's family, is outside it.
-    """
-    roots = [posixpath.normpath(o) for o in own]
-    return [p for p in task.touches if not any(_within(posixpath.normpath(p), r) for r in roots)]
-
-
-def _ancestors(tasks: Mapping[str, Task], tid: str) -> set[str]:
-    """Every task ``tid`` depends on, directly or through others."""
-    seen: set[str] = set()
-    stack = list(tasks[tid].depends_on)
-    while stack:
-        dep = stack.pop()
-        if dep in tasks and dep not in seen:
-            seen.add(dep)
-            stack.extend(tasks[dep].depends_on)
-    return seen
+    family = posixpath.dirname(posixpath.normpath(target_rel))
+    models = posixpath.dirname(family)
+    package = posixpath.dirname(models)
+    return (
+        family,
+        model_ops_tests_dir(family),
+        f"{models}/__init__.py",
+        f"{package}/_router_index.py",
+        INTEGRATION_TESTS_DIR,
+    )
 
 
 def builds_on(tasks: Mapping[str, Task], tid: str, roots: Iterable[str]) -> bool:
@@ -247,149 +230,6 @@ def builds_on(tasks: Mapping[str, Task], tid: str, roots: Iterable[str]) -> bool
                 seen.add(dep)
                 stack.append(dep)
     return False
-
-
-#: The statuses of a task whose change is on the target, or will be.
-_LIVE = ("pending", "running", "done")
-
-
-def is_regression_check(task: Task) -> bool:
-    """Whether ``task`` is a required regression check that has not failed."""
-    return (
-        task.kind == CHECK_KIND
-        and task.regression
-        and task.priority == "required"
-        and task.status in _LIVE
-    )
-
-
-def changes_shared_code(task: Task, own: Sequence[str]) -> bool:
-    """Whether ``task``'s commits land on the target and its ``touches`` reach outside ``own``."""
-    return task.kind in INTEGRATED_KINDS and bool(shared_touches(task, own))
-
-
-def landing(task: Task) -> str:
-    """How a regression check's batch names ``task``'s latest run: ``<id>@<attempt>``.
-
-    A retry that lands again is a change no earlier check covered.
-    """
-    return f"{task.id}@{task.attempts}"
-
-
-def regression_batch(
-    graph: Graph, own: Sequence[str], landed: Mapping[str, int] | None = None
-) -> list[str]:
-    """The changes to shared code a regression check starting now would cover, as task ids.
-
-    Every task that changes shared code (:func:`changes_shared_code`) and
-    has landed, in graph order, whose landing no regression check that has
-    started and not failed covers, whatever its ``depends_on``. A done task
-    has landed, and so has any other whose ``landed`` attempt (task id to
-    attempt, the orchestrator's record) is its latest.
-    """
-    landed = landed or {}
-    covered: set[str] = set()
-    for review in graph.tasks:
-        if is_regression_check(review) and review.status != "pending":
-            covered |= set(review.covers or ())
-    return [
-        t.id
-        for t in graph.tasks
-        if (t.status == "done" or landed.get(t.id) == t.attempts)
-        and landing(t) not in covered
-        and changes_shared_code(t, own)
-    ]
-
-
-def unreviewed_shared_changes(graph: Graph, own: Sequence[str]) -> dict[str, list[str]]:
-    """Per task that changes shared code with no regression check after it, its shared paths.
-
-    A regression check follows a task:
-
-    - when it has not started and depends on the task, directly or through
-      other tasks;
-    - when the task is done and the check has started and covers its
-      landing (its batch, :attr:`Task.covers`);
-    - when the task is done and the check has not started: whatever its
-      ``depends_on``, its batch takes every change landed before it starts.
-
-    A failed task is not counted: whatever of it landed is in the batch of the
-    next regression check (:func:`regression_batch`).
-    """
-    tasks = graph.by_id()
-    followed: set[str] = set()
-    covered: set[str] = set()
-    waiting = False
-    for review in graph.tasks:
-        if not is_regression_check(review):
-            continue
-        if review.status == "pending":
-            followed |= _ancestors(tasks, review.id)
-            waiting = True
-        else:
-            covered |= set(review.covers or ())
-    unreviewed: dict[str, list[str]] = {}
-    for task in graph.tasks:
-        if task.kind not in INTEGRATED_KINDS or task.status not in _LIVE:
-            continue
-        if task.id in followed:
-            continue
-        if task.status == "done" and (waiting or landing(task) in covered):
-            continue
-        shared = shared_touches(task, own)
-        if shared:
-            unreviewed[task.id] = shared
-    return unreviewed
-
-
-#: The id of the first regression check the orchestrator adds; later ones are numbered.
-REGRESSION_CHECK_ID = "regression"
-
-
-def add_regression_check(graph: Graph, own: Sequence[str]) -> Task | None:
-    """Make every change to shared code followed by a regression check; the task added, or ``None``.
-
-    The orchestrator's, not the planner's: a pending regression check takes,
-    in its ``depends_on``, each task that changes shared code and has not
-    landed yet; with none pending and a change no check follows, one is
-    added. Without ``own`` paths nothing is shared, and nothing is added.
-    After a regression check failed, nothing is added for what already landed:
-    the same tree would fail the same way.
-    """
-    if not own:
-        return None
-    unreviewed = unreviewed_shared_changes(graph, own)
-    if not unreviewed:
-        return None
-    tasks = graph.by_id()
-    later = [tid for tid in unreviewed if tasks[tid].status != "done"]
-    for check in graph.tasks:
-        if is_regression_check(check) and check.status == "pending":
-            check.depends_on += [tid for tid in later if tid not in check.depends_on]
-            return None
-    failed = any(
-        t.kind == CHECK_KIND and t.regression and t.status == "failed" for t in graph.tasks
-    )
-    if failed and not later:
-        return None
-    number = 1 + sum(1 for t in graph.tasks if t.regression)
-    tid = REGRESSION_CHECK_ID if number == 1 else f"{REGRESSION_CHECK_ID}-{number}"
-    while tid in tasks:
-        number += 1
-        tid = f"{REGRESSION_CHECK_ID}-{number}"
-    task = Task(
-        id=tid,
-        kind=CHECK_KIND,
-        goal=(
-            "run every modeling_v2 package test on the landed changes to shared code "
-            "(source-level gates, the catalog's and the other targets' GPU tests), against the "
-            "results at the base"
-        ),
-        depends_on=later,
-        regression=True,
-    )
-    graph.tasks.append(task)
-    return task
 
 
 def _cycle(tasks: Mapping[str, Task]) -> list[str]:
@@ -428,11 +268,12 @@ def validate(
     allowed_paths: Sequence[str] = (),
     max_gpus: int | None = None,
     known_checks: Iterable[str] | None = None,
+    own_paths: Sequence[str] = (),
 ) -> list[str]:
     """Every reason ``graph`` is not admissible, batched.
 
     ``known_checks`` are the contract's checks: a ``check`` task names only those, as it has nothing
-    else to run, unless it is a regression check.
+    else to run. With ``own_paths`` (:func:`own_paths`) a task touches nothing outside them.
     """
     errors: list[str] = []
     ids = [t.id for t in graph.tasks]
@@ -464,13 +305,15 @@ def validate(
         for path in t.touches:
             if not inside(path, allowed_paths):
                 errors.append(f"{where}: touches {path!r}, outside {list(allowed_paths)}")
+            elif own_paths and not inside(path, own_paths):
+                errors.append(
+                    f"{where}: touches {path!r}, code other models run, outside the run's own "
+                    f"paths {list(own_paths)}: a shared kernel lands as a local variant under the "
+                    "target's `ops/`; any other shared change is escalated, for a pull request "
+                    "of its own"
+                )
         if max_gpus is not None and t.gpus > max_gpus:
             errors.append(f"{where}: asks for {t.gpus} GPUs; the site has {max_gpus}")
-        if t.regression and t.kind != CHECK_KIND:
-            errors.append(
-                f"{where}: `regression: true` marks a regression check, and a {t.kind!r} task "
-                "is not a `check`"
-            )
     cycle = _cycle(tasks)
     if cycle:
         errors.append("dependency cycle: " + " -> ".join(cycle))
@@ -488,16 +331,15 @@ def _gating_errors(task: Task, tasks: Mapping[str, Task]) -> list[str]:
     never waits for an ``investigate`` task or a ``nice_to_have`` one: an
     investigation informs the checks, it does not gate them, and a strict
     diagnosis held as a precondition kept every benchmark of a run from running.
-    A regression check owes none: it waits for the shared code it reviews, a
-    ``nice_to_have`` task's included. A ``kernel`` task never waits for a
+    A ``kernel`` task never waits for a
     ``check``: kernel certification runs on its own, whatever an integration
     check is doing.
     """
     errors = []
-    owes = (task.kind == CHECK_KIND and not task.regression) or bool(task.satisfies)
+    owes = task.kind == CHECK_KIND or bool(task.satisfies)
     for dep in task.depends_on:
         other = tasks.get(dep)
-        if other is None or other.regression:
+        if other is None:
             continue
         if owes and (other.kind == "investigate" or other.priority == "nice_to_have"):
             what = "an `investigate`" if other.kind == "investigate" else "a nice_to_have"
@@ -546,12 +388,7 @@ def _soft_errors(task: Task, tasks: Mapping[str, Task]) -> list[str]:
 def _check_task_errors(task: Task, known_checks: Iterable[str] | None) -> list[str]:
     """Why a ``check`` task is not admissible: it runs contract checks and nothing else."""
     errors = []
-    if task.regression and task.satisfies:
-        errors.append(
-            "a regression check runs the package tests on its batch, not contract "
-            "checks: its `satisfies` stays empty"
-        )
-    if not task.satisfies and not task.regression:
+    if not task.satisfies:
         errors.append("a `check` task runs the contract checks in its `satisfies`, and names none")
     if known_checks is not None:
         known = set(known_checks)
@@ -601,9 +438,7 @@ def ready(graph: Graph, receipts_landed: Mapping[str, int] | None = None) -> lis
 
     A dependency is met once it is done, or once it failed with a receipt
     whose commits landed on the target: ``receipts_landed`` maps such a task
-    to the attempt that landed them, and only its latest attempt counts. A
-    regression check's dependency is met once it failed at all: what it
-    landed is there to review, and a task that landed nothing left nothing.
+    to the attempt that landed them, and only its latest attempt counts.
 
     A soft dependency that is running, has landed or has ended without
     landing lets its dependent start; one still pending, or no longer in
@@ -612,18 +447,17 @@ def ready(graph: Graph, receipts_landed: Mapping[str, int] | None = None) -> lis
     tasks = graph.by_id()
     landed = receipts_landed or {}
 
-    def met(dep: str, reviews: bool) -> bool:
+    def met(dep: str) -> bool:
         task = tasks.get(dep)
         return task is not None and (
-            task.status == "done"
-            or (task.status == "failed" and (reviews or landed.get(dep) == task.attempts))
+            task.status == "done" or (task.status == "failed" and landed.get(dep) == task.attempts)
         )
 
     return [
         t
         for t in graph.tasks
         if t.status == "pending"
-        and all(met(d, t.regression) for d in t.depends_on)
+        and all(met(d) for d in t.depends_on)
         and all(d not in tasks or tasks[d].status != "pending" for d in t.depends_on_soft)
     ]
 
@@ -648,8 +482,7 @@ def next_to_start(
     (:func:`ready`).
 
     ``held(task)`` is what a task takes of them while it runs (its ``gpus`` without it).
-    ``held_back`` are ready tasks the caller keeps waiting, such as a regression
-    check whose batch is still open; they claim nothing.
+    ``held_back`` are ready tasks the caller keeps waiting; they claim nothing.
 
     Tasks in ``resumed``, those running when the last process stopped, go
     first; one that cannot start yet keeps its claim: nothing that conflicts
@@ -730,9 +563,7 @@ def apply_revision(
 
     Statuses the orchestrator owns are carried over: a task that is running,
     done or failed stays so whatever the planner wrote, and a running task the
-    proposal drops is kept, and so is a started regression check's batch
-    (:attr:`Task.covers`); a pending regression check the proposal leaves out
-    is kept too. A planner that writes one of those three statuses for any
+    proposal drops is kept. A planner that writes one of those three statuses for any
     other task gets ``pending``, as a task marked running that no worker runs
     never finishes.
 
@@ -766,20 +597,9 @@ def apply_revision(
             task.status = owned[task.id].status
         elif task.status in ORCHESTRATOR_STATUSES:
             task.status = "pending"
-        # What a regression check covered is recorded as it starts; a retry records anew.
-        task.covers = before.covers if before is not None and task.status != "pending" else None
         merged.append(task)
     kept = {t.id for t in merged}
     merged += [t for tid, t in owned.items() if t.status == "running" and tid not in kept]
-    merged += [
-        copy.deepcopy(t)
-        for t in current.tasks
-        if is_regression_check(t) and t.status == "pending" and t.id not in kept
-    ]
-    ids = {t.id for t in merged}
-    for task in merged:
-        if is_regression_check(task):
-            task.depends_on = [d for d in task.depends_on if d in ids]
     candidate = Graph(
         tasks=merged,
         revisions=[*current.revisions, Revision(len(current.revisions) + 1, reason.strip())],
@@ -817,26 +637,18 @@ __all__ = [
     "Graph",
     "KINDS",
     "MAX_GOAL_CHARS",
-    "REGRESSION_CHECK_ID",
     "Revision",
     "Task",
     "WORKER_TAGS",
-    "add_regression_check",
     "apply_revision",
     "builds_on",
-    "changes_shared_code",
     "critical_path_minutes",
     "inside",
-    "is_regression_check",
-    "landing",
     "long_goals",
     "next_to_start",
     "own_paths",
     "ready",
-    "regression_batch",
-    "shared_touches",
     "stalled",
     "touches_conflict",
-    "unreviewed_shared_changes",
     "validate",
 ]

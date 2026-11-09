@@ -48,8 +48,8 @@ DECISIONS: dict[str, tuple[Decision, ...]] = {
             "`engine_defect` block",
             f"{_TO_PLANNER}. Commits that change only the entry's own files are integrated "
             "as they stand, the rest stay on the task's branch for its next attempt; an "
-            "`engine_defect` goes to the planner, which plans its fix and retries this task once "
-            "the fix lands",
+            "`engine_defect` goes to the planner, which works around it in the target or "
+            "escalates it (a shared fix is a pull request of its own)",
             False,
         ),
         Decision(

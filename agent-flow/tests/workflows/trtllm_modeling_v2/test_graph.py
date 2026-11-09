@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Modeling-v2 graph behavior and regression checks."""
+"""Modeling-v2 graph behavior and the run's own paths."""
 
 from __future__ import annotations
 
@@ -68,24 +68,6 @@ def test_an_investigation_never_gates_a_check_and_a_check_never_gates_a_kernel()
     ]
 
 
-def test_a_regression_check_may_wait_for_a_nice_to_have_task_and_not_for_ever():
-    extra = g.Task(id="extra", kind="feature", goal="nice", priority="nice_to_have",
-                   touches=["tensorrt_llm/_torch/shared.py"])  # fmt: skip
-    review = g.Task(id="regression-2", kind="check", goal="run the package tests",
-                    regression=True, depends_on=["extra"])  # fmt: skip
-    graph = g.Graph(tasks=[extra, review])
-    assert not [e for e in g.validate(graph) if "informs" in e]
-    assert [t.id for t in g.ready(graph)] == ["extra"]
-    # Ended without landing: nothing of it to review, so the check is not held for ever.
-    extra.status, extra.attempts = "failed", 1
-    assert [t.id for t in g.ready(graph)] == ["regression-2"]
-    # Any other check still may not wait for it.
-    review.regression = False
-    assert any("'regression-2': depends on 'extra', a nice_to_have task" in e
-               for e in g.validate(graph))  # fmt: skip
-    assert g.ready(graph) == []
-
-
 def test_a_campaign_waits_for_the_cores_required_checks_only():
     """A failing variant or feature does not hold the core's tuning back; delivery owes it."""
     contract = c.Contract(
@@ -121,3 +103,34 @@ def test_round_trip_preserves_every_field_and_an_unknown_version_is_rejected(tmp
     path.write_text(json.dumps({"version": 1, "task_path": "t", "stage": "plan"}))
     with pytest.raises(ValueError, match="Unsupported checkpoint version"):
         load_state(path)
+
+
+def test_a_task_touches_only_the_runs_own_paths_and_its_commits_are_held_to_them():
+    """Code other models run is not the run's: a shared kernel lands as a local variant."""
+    from agent_flow.workflows.trtllm_modeling_v2.infra.git import CommitPolicy
+
+    package = "tensorrt_llm/_torch/_experimental/modeling_v2"
+    target = f"{package}/models/fam/tgt"
+    own = g.own_paths(target)
+    assert own == (
+        f"{package}/models/fam",
+        "tests/unittest/_torch/modeling_v2/models/fam",
+        f"{package}/models/__init__.py",
+        f"{package}/_router_index.py",
+        "tests/integration",
+    )
+    assert g.own_paths("") == ()
+    allowed = ("tensorrt_llm/", "tests/")
+    inside = _t("sibling", touches=[f"{package}/models/fam/ops/gemm/mm__r1.py"])
+    shared = _t("runtime", "feature", touches=["tensorrt_llm/_torch/pyexecutor/py_executor.py"])
+    errors = g.validate(_graph(inside, shared), allowed_paths=allowed, own_paths=own)
+    assert len(errors) == 1 and "task 'runtime': touches" in errors[0]
+    assert "code other models run" in errors[0]
+    # The operator's own allowed paths decide alone: no own-path rule then.
+    assert g.validate(_graph(inside, shared), allowed_paths=allowed) == []
+    policy = CommitPolicy(allowed_paths=allowed).within(own)
+    assert policy.path_problem(f"{package}/models/fam/tgt/modeling.py") == ""
+    assert policy.path_problem(f"{package}/models/__init__.py") == ""
+    assert policy.path_problem(f"{package}/models/family_two/x.py")
+    assert policy.path_problem("tensorrt_llm/_torch/pyexecutor/py_executor.py")
+    assert CommitPolicy(allowed_paths=allowed).within(()) == CommitPolicy(allowed_paths=allowed)

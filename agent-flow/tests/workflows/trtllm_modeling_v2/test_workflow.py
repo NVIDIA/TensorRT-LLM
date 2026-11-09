@@ -16,13 +16,11 @@ import yaml
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import prior_art
 from agent_flow.workflows.trtllm_modeling_v2.run import orchestrator as orchestrator_mod
-from agent_flow.workflows.trtllm_modeling_v2.run.execution.tasks import ExecutionStage
 from agent_flow.workflows.trtllm_modeling_v2.run.records.state import STAGE_EXECUTION
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import bootstrap
 from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
 
 from ._helpers import (
-    TARGET_REL,
     Script,
     _install,
     _state,
@@ -31,8 +29,6 @@ from ._helpers import (
     _write_vocabulary,
     passing_shell,
     plan_every_unit,
-    unit_tasks,
-    write_graph,
 )
 
 
@@ -171,41 +167,3 @@ def test_a_survey_that_writes_what_the_tree_has_is_sent_back_once(tmp_path, task
     assert (workspace / "survey_review.md").is_file()
     assert "survey review: sent back with 1 finding(s)" in (workspace / "journal.md").read_text()
     assert _state(tmp_path).verdict == "delivered"
-
-
-def test_a_shared_change_is_followed_by_a_regression_check_with_no_turn(
-    tmp_path, task_file, monkeypatch
-):
-    def planner(turn, prompt):
-        if turn == 1:
-            assert "## Shared code" in prompt and TARGET_REL in prompt
-            core = {
-                **unit_tasks(tmp_path / "ws")[0],
-                "touches": ["tensorrt_llm/_torch/_experimental/modeling_v2/catalog/norm/rms.py"],
-            }
-            write_graph(prompt, [core, *unit_tasks(tmp_path / "ws")[1:]])
-            return {"decision": "GRAPH_UPDATED", "summary": "core changes a shared entry"}
-        return {"decision": "DONE", "summary": "done"}
-
-    checked = []
-    workflow = _workflow(tmp_path)
-    monkeypatch.setattr(
-        ExecutionStage,
-        "_run_regression_check",
-        lambda self, task: checked.append((task.id, task.covers)) or [],
-    )
-    calls = _install(monkeypatch, workflow, Script(None, planner=planner))
-    with workflow:
-        workflow.run(task_file)
-    assert _state(tmp_path).verdict == "delivered"
-    # It covered what core landed.
-    assert checked == [("regression", ["core@1"])]
-    graph = yaml.safe_load((tmp_path / "ws" / "graph.yaml").read_text())
-    check = next(t for t in graph["tasks"] if t["id"] == "regression")
-    assert check["kind"] == "check" and check["regression"] and check["status"] == "done"
-    assert check["depends_on"] == ["core"]
-    # No agent turn ran for it, and the graph says who added it.
-    assert [name for name, _ in calls] == ["planner", "assembler"]
-    assert any(
-        r["reason"].startswith("orchestrator: regression checks") for r in graph["revisions"]
-    )

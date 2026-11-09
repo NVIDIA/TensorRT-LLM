@@ -11,8 +11,8 @@ Each task's worker runs in a thread of its own, every check on one bounded
 pool, and the planner's turn in a thread beside them, one turn at a time.
 Only the loop's own thread changes the graph or writes it: a planner's
 revision is applied when its turn returns, against the graph as it is by
-then. Work whose shape no planner turn decides (the survey's kernel tasks,
-regression checks) the loop adds itself.
+then. Work whose shape no planner turn decides (the survey's kernel tasks) the
+loop adds itself.
 
 The workflow's services arrive as callables (:class:`Services`), so the loop
 runs under fakes on CPU exactly as it runs under the workflow.
@@ -89,9 +89,6 @@ class PlannerTurn:
     refusals: list[str] = field(default_factory=list)
     #: The state of the target ``evaluation`` was read on.
     marker: str = ""
-    #: Where the regression checks stand: the batch the next one takes, and the
-    #: checks running and waiting. Empty when the run has no shared code to check.
-    regression: str = ""
 
 
 @dataclass
@@ -175,10 +172,6 @@ class Services:
     #: What the stage has for the planner outside any task since last asked (the
     #: operator's messages): each an event of the next turn.
     stage_notes: Callable[[], list[str]] | None = None
-    #: One regression check (no agent turn): run the package tests after its batch of
-    #: changes to shared code and return what failed, one line each (blocking; on the check
-    #: pool). ``None``: a regression check passes with nothing run.
-    regression: Callable[[graph_mod.Task], list[str]] | None = None
 
 
 #: What a ``check`` task ends with once its checks are in; no worker writes it.
@@ -247,6 +240,7 @@ class GraphOrchestrator:
         max_gpus: int | None = None,
         after_core: tuple[Iterable[str], Iterable[str]] = ((), ()),
         own_paths: Iterable[str] = (),
+        target_rel: str = "",
         repo_root: str | Path = "",
     ) -> None:
         self.s = services
@@ -298,6 +292,8 @@ class GraphOrchestrator:
         self._check_locks_guard = threading.Lock()
         #: The checkout a kernel task's files are named from: a multi-rank entry's op matrix.
         self.repo_root = str(repo_root)
+        #: The target's path in the checkout, where the survey's kernel tasks land their variants.
+        self.target_rel = str(target_rel)
         self.validation = {
             "required_checks": [c.key for c in contract.required()],
             "allowed_paths": tuple(allowed_paths),
@@ -327,8 +323,7 @@ class GraphOrchestrator:
             for k, v in (saved.get("not_started_attempts") or {}).items()
         }
         #: Per task whose commits landed on the target, when its latest landing was (in
-        #: seconds since the epoch) and which attempt it was: a failed task's landing joins
-        #: a regression check's batch too, and the planner hears how long the batch waited.
+        #: seconds since the epoch) and which attempt it was.
         self._landings: dict[str, tuple[float, int]] = {
             str(k): (float(v[0]), int(v[1])) for k, v in (saved.get("landings") or {}).items()
         }
@@ -616,7 +611,6 @@ class GraphOrchestrator:
         result = assess(
             evaluation,
             files=missing,
-            unreviewed=self._unreviewed_landings(),
             required_open=self._required_open(),
             unread_reports=self.unread_reports,
         )
@@ -634,7 +628,7 @@ class GraphOrchestrator:
         return result
 
     def completion(self, files: Sequence[str]) -> Completion:
-        """Final delivery re-evaluates current verdicts, graph and regression coverage."""
+        """Final delivery re-evaluates current verdicts and the graph."""
         return self._completion(*self._evaluated(), files=files)
 
     def _correctness(
@@ -771,7 +765,6 @@ class GraphOrchestrator:
             [event.text for event in self.events],
             list(refusals),
             marker=marker,
-            regression=self._regression_standing(),
         )
         self._planner = pool.submit(run_at, Priority.PLANNER, self.s.plan, turn)
 
@@ -779,9 +772,7 @@ class GraphOrchestrator:
         """Apply what the planner's thread returned; a final answer is the run's verdict.
 
         A refused graph goes back at once, up to :data:`MAX_REFUSALS` turns.
-        An admissible graph is adopted at once, and the regression checks its
-        changes to shared code need are added to it (:meth:`_follow_shared_changes`).
-        The tasks the orchestrator added while the turn ran, which its graph
+        An admissible graph is adopted at once. The tasks the orchestrator added while the turn ran, which its graph
         could not name, are kept (:meth:`_added_during`). An adopted revision
         answers the events of its turn that it re-planned (:meth:`_drop_answered`).
         """
@@ -828,7 +819,7 @@ class GraphOrchestrator:
                 answer.summary,
                 not_started_attempts=self.not_started_attempts,
                 max_attempts=self.max_attempts,
-                **self._admission(),
+                **self.validation,
             )
             if not refusals:
                 self._consume_turn_events()
@@ -1223,24 +1214,8 @@ class GraphOrchestrator:
         The future holds what a worker's thread returns, :data:`CHECKED` and
         the keys that failed, once every check is in. A delivery-tier check it
         names runs now too: the planner may rehearse delivery before the final
-        round. A regression check runs the package tests instead
-        (``Services.regression``), and what failed is named the same way.
+        round.
         """
-        if task.regression:
-            outcome = Future()
-            if self.s.regression is None:
-                outcome.set_result((CHECKED, []))
-                return outcome
-            ran = self._check_pool.submit(self.s.regression, copy.deepcopy(task))
-
-            def tests_in(done: Future) -> None:
-                try:
-                    outcome.set_result((CHECKED, list(done.result())))
-                except Exception as exc:  # no verdict: the loop starts the task again, once
-                    outcome.set_exception(exc)
-
-            ran.add_done_callback(tests_in)
-            return outcome
         submitted = self._submit_checks(self._check_pool, task.satisfies)
         outcome: Future = Future()
         if not submitted:
@@ -1265,132 +1240,6 @@ class GraphOrchestrator:
             future.add_done_callback(one_in)
         return outcome
 
-    # ------------------------------------------------------------- regression
-    def _regression_step(self) -> set[str]:
-        """The ready regression checks to keep waiting; those with nothing to check close.
-
-        Only while the run has shared code to check (its own paths are
-        known). A regression check runs when the gates are idle: while a
-        task that owes contract checks (a check task, or one that ``satisfies``
-        some) runs or is ready to, it waits, so it never holds the devices a
-        gate needs. One regression check runs at a time: while one
-        runs, the others wait and what lands meanwhile joins the next batch.
-        With none running, a check whose batch is empty closes at once
-        (:meth:`_close_reviewed`), and of the rest the one on the longest
-        chain starts.
-        """
-        own = self.validation["own_paths"]
-        if not own:
-            return set()
-        ready_now = graph_mod.ready(self.graph, self._receipts_landed)
-        reviews = [t for t in ready_now if graph_mod.is_regression_check(t)]
-        if not reviews:
-            return set()
-        held = {t.id for t in reviews}
-        if any(
-            t.status == "running" and graph_mod.is_regression_check(t) for t in self.graph.tasks
-        ):
-            return held
-        gating = [
-            t
-            for t in [*ready_now, *(t for t in self.graph.tasks if t.status == "running")]
-            if (t.kind == graph_mod.CHECK_KIND or t.satisfies)
-            and not graph_mod.is_regression_check(t)
-        ]
-        if gating:
-            return held
-        batch = graph_mod.regression_batch(self.graph, own, self._landed_attempts())
-        if not batch:
-            for review in reviews:
-                self._close_reviewed(review)
-            return set()
-        path = graph_mod.critical_path_minutes(self.graph)
-        first = max(reviews, key=lambda t: path.get(t.id, 0))  # the first of equals, in graph order
-        return held - {first.id}
-
-    def _landed_attempts(self) -> dict[str, int]:
-        """Per task whose commits landed, the attempt that landed them last."""
-        return {tid: attempt for tid, (_, attempt) in self._landings.items()}
-
-    def _record_batch(self, review: graph_mod.Task) -> None:
-        """Record, as a regression check starts, the batch it covers (:attr:`~.graph.Task.covers`)."""
-        own = self.validation["own_paths"]
-        if not own or not graph_mod.is_regression_check(review):
-            return
-        tasks = self.graph.by_id()
-        batch = graph_mod.regression_batch(self.graph, own, self._landed_attempts())
-        review.covers = [graph_mod.landing(tasks[tid]) for tid in batch]
-        self.s.log(
-            f"[regression] {review.id} starts on the changes to shared code landed since the "
-            f"last check: {', '.join(batch) or 'none'}"
-        )
-
-    def _close_reviewed(self, review: graph_mod.Task) -> None:
-        """Close a regression check whose batch is empty: earlier ones covered everything.
-
-        Every change to shared code it follows landed and was covered by a
-        regression check that ran and passed; nothing runs for it.
-        """
-        tasks = self.graph.by_id()
-        follows = {graph_mod.landing(tasks[d]) for d in review.depends_on if d in tasks}
-        by = sorted(
-            t.id
-            for t in self.graph.tasks
-            if graph_mod.is_regression_check(t)
-            and t.status == "done"
-            and set(t.covers or ()) & follows
-        )
-        review.status, review.covers = "done", []
-        covered = f": {', '.join(by)} covered what it follows" if by else ""
-        self._note(
-            f"task {review.id} (regression check) closed: no change to shared code was left "
-            f"for it to check{covered}",
-            outcome=_Outcome(review.id, review.attempts, "done"),
-        )
-        self.revisions_since_progress = 0
-        self._save_graph()
-        self._save_events()
-        self._persist("state", self.s.checkpoint)
-        self.s.finished(review)
-        self._wake_soft_waiters()
-
-    def _regression_standing(self) -> str:
-        """Where the regression checks stand, for the planner; "" without own paths."""
-        own = self.validation["own_paths"]
-        if not own:
-            return ""
-        batch = graph_mod.regression_batch(self.graph, own, self._landed_attempts())
-        reviews = [t for t in self.graph.tasks if graph_mod.is_regression_check(t)]
-        running = [t.id for t in reviews if t.status == "running"]
-        waiting = [t.id for t in reviews if t.status == "pending"]
-        said = []
-        if batch:
-            landed = [self._landings[tid][0] for tid in batch if tid in self._landings]
-            minutes = (time.time() - min(landed)) / 60 if landed else None
-            since = f", the first landed {minutes:.0f} min ago" if minutes is not None else ""
-            said.append(
-                f"Landed changes to shared code no regression check covers yet, the batch the "
-                f"next one takes: {', '.join(batch)}{since}."
-            )
-        else:
-            said.append("Every landed change to shared code is covered by a regression check.")
-        if running:
-            said.append(f"Running: {', '.join(running)}; the others wait for it.")
-        if waiting:
-            said.append(
-                f"Not started: {', '.join(waiting)}. A regression check starts once its "
-                f"dependencies are done and no other runs; one whose batch is empty closes at "
-                f"once. The orchestrator adds and wires them: leave them as they are."
-            )
-        return " ".join(said)
-
-    def _unreviewed_landings(self) -> list[str]:
-        """The landed changes to shared code no regression check covers (none without own paths)."""
-        own = self.validation["own_paths"]
-        if not own:
-            return []
-        return graph_mod.regression_batch(self.graph, own, self._landed_attempts())
-
     def _add_kernel_tasks(self, survey: graph_mod.Task) -> None:
         """One kernel task per queue row of the vocabulary the survey wrote, with no planner turn.
 
@@ -1406,8 +1255,7 @@ class GraphOrchestrator:
         except vocab_mod.VocabularyError as exc:
             self.s.log(f"[survey] no kernel tasks added: {exc}")
             return
-        own = self.validation["own_paths"]
-        target = survey.ref or (own[0] if own else "")
+        target = survey.ref or self.target_rel
         kernels = {t.ref: t.id for t in self.graph.tasks if t.kind == "kernel"}
         taken = {t.id for t in self.graph.tasks}
         units = {c.unit for c in self.contract.checks}
@@ -1464,7 +1312,6 @@ class GraphOrchestrator:
             )
             if self._planner is not None:
                 self._added_in_turn |= {t.id for t in added}
-        shared = [t.id for t in added if graph_mod.shared_touches(t, own)] if own else []
         said = [f"task {survey.id} wrote {len(queue)} vocabulary queue row(s)"]
         if added:
             said.append(
@@ -1476,55 +1323,8 @@ class GraphOrchestrator:
                 f"rows {', '.join(unplaced)} name an entry it could not place (under a target "
                 f"it does not know, or outside the paths the run may change): give them tasks"
             )
-        if shared:
-            self._follow_shared_changes()
-            said.append(
-                f"{', '.join(shared)} change code other models run: a regression check follows them"
-            )
         # What asks the planner for nothing is answered by a revision that holds the tasks.
         self._note("; ".join(said), added=() if unplaced else tuple(t.id for t in added))
-
-    def _admission(self) -> dict[str, Any]:
-        """What a planner's graph is validated against; its shared code is the loop's to follow."""
-        return {k: v for k, v in self.validation.items() if k != "own_paths"}
-
-    def _follow_shared_changes(self) -> None:
-        """Follow every change to shared code with a regression check (:func:`~.graph.add_regression_check`).
-
-        The loop's, not the planner's: a task that changes code other models
-        run is added to the pending regression check, or a new one is added
-        when none is pending. The planner hears of a check it did not write.
-        """
-
-        def wiring() -> list[tuple[str, tuple[str, ...]]]:
-            return [
-                (t.id, tuple(t.depends_on))
-                for t in self.graph.tasks
-                if graph_mod.is_regression_check(t)
-            ]
-
-        before = wiring()
-        added = graph_mod.add_regression_check(self.graph, self.validation["own_paths"])
-        if added is None:
-            if wiring() != before:
-                self._save_graph()
-            return
-        if self._planner is not None:
-            self._added_in_turn.add(added.id)
-        self.graph.revisions.append(
-            graph_mod.Revision(
-                len(self.graph.revisions) + 1,
-                f"orchestrator: {added.id} checks the changes to shared code "
-                f"{', '.join(added.depends_on) or 'that landed'} make",
-            )
-        )
-        self._note(
-            f"the orchestrator added {added.id}, a regression check with no agent turn: once "
-            f"{', '.join(added.depends_on) or 'it can'} land(s), it runs the modeling_v2 package "
-            f"tests on the changed shared code; a failure comes back to you",
-            added=(added.id,),
-        )
-        self._save_graph()
 
     def _timeout(self) -> float | None:
         """How long to wait for something in flight to end before looking again (None: until then)."""
@@ -1647,8 +1447,7 @@ class GraphOrchestrator:
             # One agent slot stays free for the planner (agents/slots.py).
             slots = max(AgentGate(self.max_parallel).task_slots - workers, 0)
             self._resumed &= {t.id for t in self.graph.tasks if t.status == "pending"}
-            self._follow_shared_changes()
-            waiting = self._regression_step() | self._closing_holds() | self._waiting_for_core()
+            waiting = self._closing_holds() | self._waiting_for_core()
             ready_now = {t.id for t in graph_mod.ready(self.graph, self._receipts_landed)}
             now = time.monotonic()
             self._ready_since = {tid: self._ready_since.get(tid, now) for tid in ready_now}
@@ -1665,7 +1464,6 @@ class GraphOrchestrator:
                 t for t in chosen if t.kind != graph_mod.CHECK_KIND
             ][:slots]
             for task in started:
-                self._record_batch(task)
                 task.status = "running"
                 self._resumed.discard(task.id)
                 if task.kind == graph_mod.CHECK_KIND:
@@ -1694,20 +1492,12 @@ class GraphOrchestrator:
                 holds = evaluation.holds and not self._required_open()
                 completion = self._completion(marker, evaluation)
                 self._correctness(marker, evaluation, completion)
-                unreviewed, gaps = completion.unreviewed, completion.gaps
+                gaps = completion.gaps
                 # A message the operator left is read before the run is delivered.
                 if completion.ready and not self._operator_waiting():
                     return "delivered"
                 # Standing complaints wake no turn while an escalation waits on the operator.
-                if unreviewed and not self._escalated:
-                    self.revisions_since_progress += 1
-                    self._note(
-                        "every required check holds, but no regression check covers "
-                        f"{', '.join(unreviewed)}, which landed changes to code other models "
-                        "run: the run is not delivered before one has passed",
-                        urgent=True,
-                    )
-                elif self._done_said and not holds:
+                if self._done_said and not holds:
                     self.revisions_since_progress += 1
                     self._note(
                         "planner said DONE, but the contract does not hold:\n"
@@ -1829,18 +1619,6 @@ def _kernel_task_id(item: vocab_mod.QueueItem, taken: Iterable[str]) -> str:
 
 def _check_task_event(task: graph_mod.Task, failed: Sequence[str]) -> str:
     """What the planner hears of a ``check`` task: its checks ran, with no agent turn."""
-    if task.regression:
-        said = (
-            f"task {task.id} (regression check) ran the package tests after the changes to "
-            f"shared code it covers ({', '.join(task.covers or ()) or 'none'})"
-        )
-        if not failed:
-            return f"{said}; they passed"
-        return (
-            f"{said}; what failed: {'; '.join(failed)}. No agent has looked: an `investigate` "
-            "task finds why; a fix that changes shared code is followed by the next regression "
-            "check, or retry this one (`status: pending`) once what it ran on has changed"
-        )
     said = f"task {task.id} (check) ran its checks with no agent turn"
     if not failed:
         return f"{said}; they passed"

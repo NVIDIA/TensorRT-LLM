@@ -523,62 +523,6 @@ def _wait_for(predicate):
         time.sleep(0.01)
 
 
-def test_one_check_runs_at_a_time_and_the_next_takes_what_landed_meanwhile(tmp_path):
-    orchestrator, reviewed = None, []
-
-    def work(task):
-        if task.id == "k2":
-            # k2 lands while r1 runs: it is r1's to leave for the next check.
-            _wait_for(lambda: orchestrator.graph.by_id()["r1"].status == "running")
-        return "LANDED" if task.kind == "kernel" else "UNIT_READY"
-
-    def regression(task):
-        if task.id == "r1":
-            _wait_for(lambda: orchestrator.graph.by_id()["k2"].status == "done")
-        reviewed.append(task.id)
-        return []
-
-    plan = _plan(_graph(_shared("k1"), _shared("k2"), _core(), _review("r1", ["k1"]),
-                        _review("r2", ["k2"]), _review("r3", ["k2"])))  # fmt: skip
-    orchestrator = _regression_batches_orchestrator(tmp_path, plan, work, regression=regression)
-    assert orchestrator.run() == "delivered"
-    by_id = orchestrator.graph.by_id()
-    assert reviewed == ["r1", "r2"]
-    assert by_id["r1"].covers == ["k1@1"] and by_id["r2"].covers == ["k2@1"]
-    assert by_id["r3"].status == "done" and by_id["r3"].covers == []
-    events = [
-        *(e for t in plan.turns for e in t.events),
-        *(event.text for event in orchestrator.events),
-    ]
-    said = [e for e in events if e.startswith("task r3")]
-    assert said == [
-        "task r3 (regression check) closed: no change to shared code was left for it to "
-        "check: r2 covered what it follows"
-    ]
-
-
-def test_a_regression_check_waits_while_the_gates_are_busy(tmp_path):
-    orchestrator, order = None, []
-
-    def check(chk):
-        _wait_for(lambda: orchestrator.graph.by_id()["k1"].status == "done")
-        time.sleep(0.2)  # long enough for a regression check to have started beside it
-        assert orchestrator.graph.by_id()["r1"].status == "pending"
-        order.append(chk.key if hasattr(chk, "key") else "gate")
-        return SimpleNamespace(name=chk.gate, member=chk.member, passed=True, detail="")
-
-    def regression(task):
-        order.append(task.id)
-        return []
-
-    plan = _plan(_graph(_shared("k1"), _core(), _review("r1", ["k1"])))
-    orchestrator = _regression_batches_orchestrator(tmp_path, plan, lambda task: "LANDED" if task.kind == "kernel"
-                                 else "UNIT_READY", regression=regression)  # fmt: skip
-    orchestrator.s.check = check
-    assert orchestrator.run() == "delivered"
-    assert order[-1] == "r1" and len(order) >= 2
-
-
 def test_regression_jobs_fit_the_gate_sessions_and_keep_the_test_budget(tmp_path, monkeypatch):
     # Two-hour allocations handing over 30 min before their end: a two-hour job never starts.
     sessions = (

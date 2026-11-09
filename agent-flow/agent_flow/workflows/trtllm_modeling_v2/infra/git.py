@@ -33,7 +33,7 @@ import os
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -221,6 +221,17 @@ class CommitPolicy:
             allow_co_authors=bool(block.get("allow_co_authors", False)),
             base_ref=str(block.get("base_ref") or ""),
         )
+
+    def within(self, paths: Sequence[str]) -> "CommitPolicy":
+        """This policy, its commits held to ``paths`` (repo-relative files or directories) as well."""
+        if not paths:
+            return self
+        narrowed = tuple(_as_prefix(str(p)) for p in paths)
+        if self.allowed_paths:
+            narrowed = tuple(
+                p for p in narrowed if any(p.startswith(a) for a in self.allowed_paths)
+            )
+        return replace(self, allowed_paths=narrowed)
 
     def path_problem(self, path: str) -> str:
         """Why ``path`` (repo-relative) may not be committed under this policy, or ``""``."""

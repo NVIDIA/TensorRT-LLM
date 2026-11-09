@@ -271,11 +271,9 @@ def head_results(results: Results, files: Iterable[str]) -> HeadResults:
 
 
 def default_base(workspace: str | Path, repo: str | Path, head: str) -> str | None:
-    """The commit a regression check last cleared, else the run's starting commit.
+    """The run's starting commit: the parent of the oldest commit a receipt says its task integrated.
 
-    The first is the newest ``cleared`` among the receipts in
-    ``<workspace>/tasks/`` that is an ancestor of ``head``; the second, the
-    parent of the oldest commit any receipt says its task integrated.
+    Of the receipts in ``<workspace>/tasks/``, only commits that are ancestors of ``head``.
     """
 
     def resolve(rev: str) -> str | None:
@@ -293,13 +291,6 @@ def default_base(workspace: str | Path, repo: str | Path, head: str) -> str | No
             continue
         if isinstance(data, dict):
             receipts.append(data)
-    cleared = []
-    for receipt in receipts:
-        commit = resolve(str(receipt["cleared"])) if receipt.get("cleared") else None
-        if commit and ancestor(commit, head):
-            cleared.append((str(receipt.get("written_at") or ""), commit))
-    if cleared:
-        return max(cleared)[1]
     integrated = []
     for receipt in receipts:
         for line in receipt.get("commits") or ():

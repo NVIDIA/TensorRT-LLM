@@ -56,7 +56,6 @@ from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
     resolve_environment,
 )
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as catalog_paths
-from agent_flow.workflows.trtllm_modeling_v2.run.execution import handoff as handoff_mod
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as contract_mod
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import regression
 from agent_flow.workflows.trtllm_modeling_v2.run.validation.check_runner import CheckRunner
@@ -1493,6 +1492,7 @@ class _Delivery:
         self.workspace = tmp_path / "ws"
         self._preflight = SimpleNamespace(target_rel="pkg/models/fam/target")
         self._git = lambda repo, *args: head + "\n"
+        self.journal = SimpleNamespace(event=lambda what, detail: None)
 
 
 def test_delivery_runs_the_delivered_tests_at_head_and_holds_on_their_passing(
@@ -1620,15 +1620,10 @@ def _regression_repo(root: Path) -> tuple[Path, Path, str]:
     cache = workspace / tc.CACHE_DIRNAME
     _run(f"{sys.executable} {drv.__file__} run --cache {cache} --repo {repo} tests/test_a.py "
          "tests/test_b.py -- -q -p no:cacheprovider")  # fmt: skip
-    # The last check cleared the base: the next one compares against it.
-    handoff_mod.write(
-        workspace / "tasks",
-        {"task": "regression", "kind": "check", "cleared": base, "written_at": "1"},
-    )
     return repo, workspace, base
 
 
-def _check(repo: Path, workspace: Path, head: str, root: Path):
+def _check(repo: Path, workspace: Path, head: str, root: Path, base: str):
     ran = []
 
     @contextlib.contextmanager
@@ -1651,8 +1646,9 @@ def _check(repo: Path, workspace: Path, head: str, root: Path):
         tree_at=tree_at,
         run_job=run_job,
         python=sys.executable,
-        name="regression-2",
+        name="delivery",
         paths=["tests"],
+        base=base,
     )
     return result, ran
 
@@ -1663,11 +1659,11 @@ def test_environment_change_cannot_reuse_a_pass_and_probe_failure_is_incomplete(
 ):
     repo, workspace, base = _regression_repo(tmp_path)
     monkeypatch.setenv("TRTLLM_TEST_CACHE_ENV", "A")
-    first, _ = _check(repo, workspace, base, tmp_path)
+    first, _ = _check(repo, workspace, base, tmp_path, base)
     assert first.verdict == "CLEAN"
     a = tc.recorded(workspace / tc.CACHE_DIRNAME, base).env_digest
     monkeypatch.setenv("TRTLLM_TEST_CACHE_ENV", "B")
-    second, ran = _check(repo, workspace, base, tmp_path)
+    second, ran = _check(repo, workspace, base, tmp_path, base)
     assert second.verdict == "CLEAN" and len(ran) == 2
     assert tc.recorded(workspace / tc.CACHE_DIRNAME, base).env_digest != a
     results, jobs, code, tail = regression.record_at(
@@ -1696,7 +1692,7 @@ def test_a_test_that_fails_at_the_base_is_not_run_at_a_later_head(tmp_path):
     _git(repo, "commit", "-qam", "shared change")
     head = _git(repo, "rev-parse", "HEAD")
 
-    result, ran = _check(repo, workspace, head, tmp_path)
+    result, ran = _check(repo, workspace, head, tmp_path, base)
 
     assert result.verdict == "CLEAN", result.failures
     assert "1 test(s) failing at the base not run" in result.scope
@@ -1707,61 +1703,20 @@ def test_a_test_that_fails_at_the_base_is_not_run_at_a_later_head(tmp_path):
 
 
 @_requires_git
-def test_a_change_reaches_the_tests_that_import_it_through_other_files(tmp_path):
-    """``catalog/_op.py`` reaches a test through the entry that imports it, or the helper that does."""
-    repo = tmp_path / "repo"
-    catalog, tests = regression.CATALOG_DIR, regression.CATALOG_TESTS_DIR
-    dotted = catalog.replace("/", ".")
-    files = {
-        f"{catalog}/_op.py": "class OpWrapper:\n    pass\n",
-        f"{catalog}/gemm/mm.py": "from .._op import OpWrapper\n",
-        f"{catalog}/norm/rms.py": "X = 1\n",
-        f"{tests}/_validating.py": f"from {dotted}._op import OpWrapper\n",
-        f"{tests}/gemm/test_mm.py": f"from {dotted}.gemm import mm\n",
-        f"{tests}/norm/test_rms.py": f"from _validating import validating\nfrom {dotted}.norm.rms import X\n",
-        f"{tests}/norm/test_untouched.py": f"from {dotted}.norm.rms import X\n",
-        # A rank matrix the test starts by file path, through a launcher it imports.
-        f"{tests}/comm/_rank_job.py": "import subprocess\n",
-        f"{tests}/comm/_mm_matrix.py": f"def body():\n    from {dotted}.gemm import mm\n",
-        f"{tests}/comm/test_mm_matrix.py": "import _rank_job\n",
-        f"{tests}/test_modeling_v2_claims.py": "",
-    }
-    for path, content in files.items():
-        (repo / path).parent.mkdir(parents=True, exist_ok=True)
-        (repo / path).write_text(content, encoding="utf-8")
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.email", "t@example.com")
-    _git(repo, "config", "user.name", "t")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    base = _git(repo, "rev-parse", "HEAD")
-    listed = sorted(p for p in files if "/test_" in p)
-    head = _commit(repo, base, {f"{catalog}/_op.py": "class OpWrapper:\n    x = 1\n"})
-    picked, why = regression.affected_files(repo, base, head, listed)
-    assert picked == [
-        f"{tests}/comm/test_mm_matrix.py",
-        f"{tests}/gemm/test_mm.py",
-        f"{tests}/norm/test_rms.py",
-        f"{tests}/test_modeling_v2_claims.py",
-    ]
-    assert why == "4 of 5 test files reach what changed"
-
-
-@_requires_git
-def test_a_target_init_reaches_its_importers_and_integration_changes_reach_none(tmp_path):
-    """A target's ``__init__.py`` reaches the tests importing its modules, not the package."""
+def test_a_change_reaches_its_familys_tests_and_shared_code_reaches_every_file(tmp_path):
+    """By directory, as a run's own paths are laid out: its family, the tests it changed."""
     repo = tmp_path / "repo"
     models, tests = f"{regression.MODELING_V2_PACKAGE}/models", regression.CATALOG_TESTS_DIR
-    dotted = models.replace("/", ".")
     files = {
-        f"{models}/fam/__init__.py": "",
-        f"{models}/fam/tgt/__init__.py": '"""A target."""\n',
+        f"{models}/__init__.py": "",
         f"{models}/fam/tgt/modeling.py": "X = 1\n",
-        f"{models}/other/__init__.py": "",
-        f"{models}/other/tgt/__init__.py": "",
         f"{models}/other/tgt/modeling.py": "Y = 1\n",
-        f"{tests}/models/fam/tgt/test_modeling.py": f"import {dotted}.fam.tgt.modeling\n",
-        f"{tests}/models/other/tgt/test_modeling.py": f"from {dotted}.other.tgt import modeling\n",
+        f"{regression.MODELING_V2_PACKAGE}/catalog/gemm/mm.py": "Z = 1\n",
+        f"{tests}/models/fam/tgt/test_modeling.py": "",
+        f"{tests}/models/fam/sibling/test_modeling.py": "",
+        f"{tests}/models/other/tgt/test_modeling.py": "",
+        f"{tests}/gemm/_helper.py": "",
+        f"{tests}/gemm/test_mm.py": "",
         f"{tests}/test_modeling_v2_claims.py": "",
         "tests/integration/defs/test_fam.py": "Z = 1\n",
     }
@@ -1779,23 +1734,26 @@ def test_a_target_init_reaches_its_importers_and_integration_changes_reach_none(
         repo,
         base,
         {
-            f"{models}/fam/tgt/__init__.py": '"""The target."""\n',
-            f"{tests}/models/fam/tgt/__init__.py": "",
+            f"{models}/fam/tgt/modeling.py": "X = 2\n",
+            f"{models}/__init__.py": "from .fam import routing\n",
+            f"{tests}/gemm/_helper.py": "H = 1\n",
+            "tests/integration/defs/test_fam.py": "Z = 2\n",
         },
     )
     picked, why = regression.affected_files(repo, base, head, listed)
     assert picked == [
+        f"{tests}/gemm/test_mm.py",
+        f"{tests}/models/fam/sibling/test_modeling.py",
         f"{tests}/models/fam/tgt/test_modeling.py",
         f"{tests}/test_modeling_v2_claims.py",
     ]
-    assert why == "2 of 3 test files reach what changed"
-    only_integration = _commit(repo, head, {"tests/integration/defs/test_fam.py": "Z = 2\n"})
-    picked, why = regression.affected_files(repo, head, only_integration, listed)
-    assert picked == [f"{tests}/test_modeling_v2_claims.py"]
-    assert "no unit test reaches what changed" in why
-    shared = _commit(repo, only_integration, {f"{models}/__init__.py": "W = 1\n"})
-    picked, why = regression.affected_files(repo, only_integration, shared, listed)
-    assert picked == listed and "is shared by the package" in why
+    assert why == "4 of 5 test files reach what changed"
+    assert regression.affected_files(repo, None, head, listed)[0] == listed
+    shared = _commit(
+        repo, head, {f"{regression.MODELING_V2_PACKAGE}/catalog/gemm/mm.py": "Z = 2\n"}
+    )
+    picked, why = regression.affected_files(repo, head, shared, listed)
+    assert picked == listed and "is code other models run" in why
 
 
 @_requires_git

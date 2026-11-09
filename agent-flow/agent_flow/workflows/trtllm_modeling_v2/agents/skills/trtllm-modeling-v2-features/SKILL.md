@@ -126,12 +126,11 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
   launcher, a server or a transport. What the test keeps for after it (HTTP
   records, continuations, transfer logs) goes under `$MV2FLOW_GATE_ARTIFACTS`:
   the snapshot the gate runs in is pruned once it ends.
-- A change outside the target is allowed where the target truly needs it (a
-  runtime, executor or serving file of the tree): follow the ModelingV2 design,
-  keep model-specific logic at the narrowest target or family scope that uses
-  it, and make a shared runtime change the smallest general one, never a
-  branch on this model. Name each such file and
-  why in your report; the regression check follows it.
+- Keep model-specific logic at the narrowest target or family scope that uses
+  it. Code other models run (a runtime, executor or serving file, a shared
+  catalog entry, C++) is not the run's to change: when the target truly needs
+  such a change, stop, name the file and why in your report, and the planner
+  escalates it for a pull request of its own.
 - A stock-path control (`--mode off`, `modeling_v2: off`) splits a target bug
   from an engine bug. A new architecture has none; say so instead of guessing.
 - Report each feature as *verified* (its proof passed), *configured* (on, not

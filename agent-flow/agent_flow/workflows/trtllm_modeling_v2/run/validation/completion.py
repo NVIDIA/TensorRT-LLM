@@ -3,9 +3,10 @@
 
 """Delivery: the gate findings, the checks on disk, the delivered tests, and the contract.
 
-The delivered tests run here, at the checkout's ``HEAD``, as one job with no
-agent turn. The contract's journal section also says where correctness stands
-delivered (``contract.Milestone``).
+The delivered tests and the package tests the run's change reaches run here, at the
+checkout's ``HEAD``, compared with the run's base (``regression.py``), with no agent
+turn. The contract's journal section also says where correctness stands delivered
+(``contract.Milestone``).
 """
 
 from __future__ import annotations
@@ -40,11 +41,10 @@ from . import requirements as requirements_mod
 
 @dataclass(frozen=True)
 class Completion:
-    """One assessment for milestones, campaign wrap-up, and final delivery."""
+    """One assessment for milestones and final delivery."""
 
     evaluation: contract_mod.Evaluation
     files: tuple[str, ...] = ()
-    unreviewed: tuple[str, ...] = ()
     required_open: bool = False
     unread_reports: bool = False
 
@@ -53,8 +53,6 @@ class Completion:
         if not self.evaluation.holds:
             return ["the contract does not hold"]
         gaps = []
-        if self.unreviewed:
-            gaps.append(f"no regression check covers {', '.join(self.unreviewed)}")
         if self.files:
             gaps.append("delivery files: " + "; ".join(self.files))
         return gaps
@@ -72,7 +70,7 @@ class Completion:
         return (
             self.evaluation.holds
             and bool(self.files)
-            and not (self.unreviewed or self.required_open or self.unread_reports)
+            and not (self.required_open or self.unread_reports)
         )
 
 
@@ -80,11 +78,10 @@ def assess(
     evaluation: contract_mod.Evaluation,
     *,
     files: Sequence[str] = (),
-    unreviewed: Sequence[str] = (),
     required_open: bool = False,
     unread_reports: bool = False,
 ) -> Completion:
-    return Completion(evaluation, tuple(files), tuple(unreviewed), required_open, unread_reports)
+    return Completion(evaluation, tuple(files), required_open, unread_reports)
 
 
 def run_deliver_phase(
@@ -230,16 +227,16 @@ def target_test_modules_check(repo_root: str | Path, target_rel: str) -> Deliver
 
 
 def tests_check(workflow, report: DeliveryReport, *, run: bool = False) -> DeliveryCheck | None:
-    """The delivered tests pass at the checkout's HEAD.
+    """The delivered tests, and the package tests the run's change reaches, at ``HEAD``.
 
-    The target's own tests, and the catalog entries' tests it is delivered
-    with (the report's ``test:`` checks), each by its result at ``HEAD``
-    (``checks/test_results.py``). With ``run``, those with no result there run
-    first (``regression.record_at``), and the check holds only on none
-    failing, none left unrun and one at least passed. Without, it reads
-    what is recorded and fails only on a test that fails there: a test
-    that has not run at ``HEAD`` yet runs at delivery. ``None`` when there
-    is no such test, or nothing to say without running it.
+    The delivered tests are the target's own and the catalog entries' tests it is
+    delivered with (the report's ``test:`` checks). With ``run``, they and every
+    package test file the change since the run's base reaches (its family's, the
+    tests it changed, the claims gates: ``regression.affected_files``) run
+    where they have no result at ``HEAD``, a failure counted only when the test
+    did not fail at the base (``regression.run_regression_check``). Without, it
+    reads what is recorded of the delivered tests and fails only on one that fails
+    there. ``None`` when there is no such test, or nothing to say without running.
     """
     repo = Path(str(workflow.task_data["trtllm_repo_path"]))
     paths = [model_ops_tests_dir(workflow._preflight.target_rel)]
@@ -250,33 +247,31 @@ def tests_check(workflow, report: DeliveryReport, *, run: bool = False) -> Deliv
             except (OSError, ValueError):
                 continue
     head = (workflow._git(str(repo), "rev-parse", "HEAD") or "").strip()
-    files = test_results.list_test_files(repo, head, paths) if head else []
-    if not files:
+    if not head:
         return None
-    cache_dir = workflow.workspace / test_results.CACHE_DIRNAME
-    ran = ""
     if run:
         tree_at, run_job, python = regression_mod.job_runner(workflow, "delivery-tests")
-        results, jobs, code, tail = regression_mod.record_at(
-            head,
-            files,
-            cache_dir=cache_dir,
-            out=workflow.workspace / regression_mod.SELECTIONS_DIRNAME / "delivery",
+        result = regression_mod.run_regression_check(
+            workspace=workflow.workspace,
+            repo=repo,
+            head=head,
             tree_at=tree_at,
             run_job=run_job,
             python=python,
+            name="delivery",
+            always=paths,
         )
+        workflow.journal.event("tests", result.summary())
         if (workflow._git(str(repo), "rev-parse", "HEAD") or "").strip() != head:
-            return DeliveryCheck("tests", False, "HEAD changed while delivered tests ran")
-        if not results.env_digest:
-            return DeliveryCheck("tests", False, f"INCOMPLETE (exit {code}): {tail}")
-        ran = f"; delivery ran {jobs} test job(s) at {head[:10]}" if jobs else ""
-    else:
-        # Historical failures can block progress; historical passes do not verify this environment.
-        results = test_results.recorded(cache_dir, head)
-    found = test_results.head_results(results, files)
-    if not run and found.verdict != "FAILING":
+            return DeliveryCheck("tests", False, "HEAD changed while the tests ran")
+        detail = result.summary() + "".join(f"\n- {line}" for line in result.failures)
+        return DeliveryCheck("tests", result.passed, detail)
+    files = test_results.list_test_files(repo, head, paths)
+    if not files:
         return None
-    if found.verdict == "CLEAN":
-        return DeliveryCheck("tests", True, found.describe() + ran)
-    return DeliveryCheck("tests", False, found.describe() + ran)
+    # Historical failures can block progress; historical passes do not verify this environment.
+    results = test_results.recorded(workflow.workspace / test_results.CACHE_DIRNAME, head)
+    found = test_results.head_results(results, files)
+    if found.verdict != "FAILING":
+        return None
+    return DeliveryCheck("tests", False, found.describe())

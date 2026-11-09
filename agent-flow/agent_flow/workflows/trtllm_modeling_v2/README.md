@@ -92,7 +92,7 @@ a container runtime, a shell). The run needs:
   directory, checkout and checkpoints at the same paths as every session.
 
 `trtllm-modeling-v2 monitor status` shows each session, and raises `SESSION_ENDING` while one is in
-hand-over with no newer session on its spool. A gate, substrate or regression job the run has
+hand-over with no newer session on its spool. A gate, substrate or delivery test job the run has
 waited on for 15 minutes writes a `waiting` event: the job, its spool, queued or running and since
 when, why the session holds it when its `status.json` says, and for a queued job what runs on its
 spool meanwhile; then at most one every 15 minutes while the wait lasts. The tune campaign's jobs
@@ -113,13 +113,14 @@ must change before that.
    feature; a member is a parallel configuration; their pairing defines a coverage cell.
 2. **Plan and execute:** the planner proposes a dependency graph; Python admits and schedules it.
    Workers use separate worktrees. Kernel tasks certify or add operators; assemblers build the
-   target. Commits are audited and integrated; shared-code changes require regression coverage.
-   A regression check runs only when no contract check runs or waits, and only on the test files
-   the change can reach (those it changed, those importing a module it changed, the claims
-   gates; every file when it touches code the whole package shares). A test that already fails
-   at the check's base cannot regress, so the head does not run it. A kernel task on a shared
-   catalog entry lands a local variant in the target's own `ops/`, and the target is delivered
-   with it: the run never changes a shared entry, so other models are not disturbed mid-run.
+   target. Commits are audited and integrated. A run changes only its own paths: the target's
+   family, the tests that mirror it and the integration tests; a task touching, or a commit
+   changing, code other models run is refused (unless the spec's `commit_policy.allowed_paths`
+   says otherwise). A kernel task on a shared catalog entry lands a local variant in the
+   target's own `ops/`, and any other shared change is escalated for a pull request of its own.
+   At delivery, the delivered tests and the package tests the change reaches (the family's, the
+   tests it changed, the claims gates) run once against the run's base; a test that already
+   fails at the base cannot regress, so the head does not run it.
 3. **Prove and deliver:** checks measure fixed-commit snapshots against framework-owned references.
    A verdict counts only on the tree it measured: the same gate-relevant files, native libraries
    and inputs. Checks run as the work that claims them lands and as the planner asks; once the
@@ -154,7 +155,7 @@ must change before that.
 | `run/workflow.py`, `orchestrator.py`, `graph.py`, `inbox.py` | Lifecycle; scheduling; graph rules; operator input |
 | `run/startup/` | Bootstrap, preflight, agent probes and role primers |
 | `run/execution/` | Task dispatch, kernel-specific preparation and decision/receipt handoffs |
-| `run/validation/` | Contract, check runner, regression, completion and verified runtime summaries |
+| `run/validation/` | Contract, check runner, delivery tests, completion and verified runtime summaries |
 | `run/workspace/`, `run/records/` | Worktrees/snapshots; recovery state, journal and metrics |
 | `checks/`, `checks/harness/` | Verdict rules and evidence; programs executed in the measured environment |
 | `infra/compute/`, `infra/monitor/` | Execution, sessions, scheduler and provenance; status and heartbeat |

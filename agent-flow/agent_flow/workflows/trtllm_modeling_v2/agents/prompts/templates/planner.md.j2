@@ -77,12 +77,13 @@ It refuses a graph that breaks any of these, and tells you why:
 
 - every required check in the contract is in some task's `satisfies`;
 - ids are unique, dependencies exist and form no cycle;
-- `touches` stays inside the paths the commit policy allows, and no task asks
-  for more devices than the site has. Within them, a task may reach any file
-  of the tree the target truly needs (the runtime, the executor, serving, a
-  test): widen its `touches` to that file when a worker reports the need, for
-  the smallest general change by the ModelingV2 design; a regression check
-  follows every change outside the target;
+- `touches` stays inside the run's own paths, which your request lists (the
+  target's family, its tests, the integration tests), and no task asks for
+  more devices than the site has. Code other models run (the runtime, the
+  executor, serving, a shared catalog entry, C++) is not the run's to change:
+  a shared kernel lands as a local variant (below), and any other shared
+  change a worker reports the target needs is escalated, for a pull request of
+  its own;
 - `tags` are kinds of worker work, never on a `check` task;
 - a revision states its reason;
 - a failed task runs at most the worker runs per task your request states; a
@@ -95,8 +96,7 @@ It refuses a graph that breaks any of these, and tells you why:
   `depends_on` a `check`: investigations and integration checks inform, they do
   not gate;
 - a `check` task names contract checks in `satisfies`, an empty `touches`
-  and `resources.gpus: 0`. A `check` with `regression: true` is the
-  orchestrator's: it adds one after changes to shared code (below).
+  and `resources.gpus: 0`.
 
 ## What the orchestrator starts without you
 
@@ -121,14 +121,9 @@ add on a shared entry does the same: `ref: verify:<category>/<name>@<site>`,
 touching those two files with a site of its own. The target is delivered with
 its variants; the run never changes the shared catalog entry.
 
-Changes to shared code (any path outside the target's own paths, which your
-request lists) are followed by regression checks the orchestrator adds and
-wires itself: `check` tasks with `regression: true` that run, with no agent
-turn, every modeling_v2 package test. One runs at a time, and one that starts
-covers every change landed that no earlier one covered; what lands while it
-runs joins the next. Leave them as they are: only a failure reaches you. A
-task that changes shared code runs only its own tests and those of the files
-it touches.
+The package tests the run's change reaches (its family's tests, the tests it
+changed, the claims gates) run once, at delivery, against the run's base; a
+task runs only its own tests and those of the files it touches.
 
 ## What reaches a task without you
 
@@ -212,7 +207,7 @@ task can use.
 unblocks it; the features `task.yaml` asks for. Performance work is not the
 onboarding's: `trtllm-modeling-v2 tune` does it on the delivered target, in a
 process of its own. Nothing else: no task to
-show a shared change harmless to other models (the regression checks and the
+show the change harmless to other models (delivery's package tests and the
 pull request's CI do that), no extra reports, no polishing of finished work.
 **A suspected defect that does not affect delivering this model is recorded,
 never chased**: one a worker met in another model, or in a path this target
@@ -278,8 +273,7 @@ is still being debugged; a fix that lands later reaches it through
 integration.
 
 Once full support holds (every required check, the delivery files on disk,
-every landed change to shared code through a regression check, no local
-variant waiting), the orchestrator records that commit and the run is
+no local variant waiting), the orchestrator records that commit and the run is
 delivered at once. So plan the delivery files as a task of their own once the
 first unit's assembly is done: the CI accuracy test, its entry on a test list and,
 when the accuracy anchor is written, the accuracy reference entry.

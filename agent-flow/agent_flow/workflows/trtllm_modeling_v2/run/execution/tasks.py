@@ -58,7 +58,6 @@ from ..orchestrator import (
 from ..records.state import WorkflowState
 from ..validation import completion as deliver
 from ..validation import contract as contract_mod
-from ..validation import regression as regression_mod
 from ..validation import runtime_facts
 from ..validation.check_runner import CheckRunner
 from ..workspace import snapshots as snapshots_mod
@@ -123,7 +122,6 @@ class ExecutionStage:
         self._turn_lock = threading.Lock()
         self._turns_by_key = {}
         self._tasks_dispatched = set()
-        self._regression_cleared = {}
         self._landed_attempts = {}
         self._merged = {}
         self._tls = workflow._tls
@@ -156,9 +154,8 @@ class ExecutionStage:
             bringup=getattr(self.workflow, "_mark_bringup", None),
             delivery_files=lambda: deliver.delivery_failures(self.workflow),
             stage_notes=self._take_stage_notes,
-            regression=self._run_regression_check,
         )
-        self._own_paths = self._regression_paths()
+        self._own_paths = self._shared_code_rule()
         orchestrator = GraphOrchestrator(
             services,
             contract,
@@ -179,6 +176,7 @@ class ExecutionStage:
             event_window_s=self.workflow.event_window_s,
             after_core=(feature_refs, core_boots),
             own_paths=self._own_paths,
+            target_rel=self._target_rel(),
             repo_root=self.workflow.task_data.get("trtllm_repo_path") or "",
         )
 
@@ -245,11 +243,7 @@ class ExecutionStage:
         """
         self.workflow._turns.consume([task.id])
         if task.kind == graph_mod.CHECK_KIND and task.status == "done":
-            cleared = self._regression_cleared.get(task.id, "")
-            if task.regression:
-                note = "the package tests passed after the changes to shared code it covers"
-            else:
-                note = f"its checks passed, with no agent turn: {', '.join(task.satisfies)}"
+            note = f"its checks passed, with no agent turn: {', '.join(task.satisfies)}"
             try:
                 handoff_mod.write(
                     self.workflow.workspace / TASKS_DIRNAME,
@@ -258,7 +252,6 @@ class ExecutionStage:
                         task.kind,
                         result=TaskResult(CHECKED, note),
                         attempt=task.attempts,
-                        cleared=cleared,
                     ),
                 )
             except OSError as exc:
@@ -335,34 +328,6 @@ class ExecutionStage:
         self.workflow.journal.record_result(report, result)
         return TaskResult.answered(role, Path(target), report)
 
-    # ------------------------------------------------------- regression checks
-    def _run_regression_check(self, task: graph_mod.Task) -> list[str]:
-        """Run one regression check, with no agent turn; what failed, one line each.
-
-        In a read-only snapshot of the commit the checkout is at, as test jobs
-        on the run's devices (``run/validation/regression.py``). The head it finds clean
-        is the receipt's ``cleared``, the next check's base.
-        """
-        repo = Path(str(self.workflow.task_data.get("trtllm_repo_path") or ""))
-        head = self.workflow._head()
-        if not head:
-            return [f"{repo} has no commit to check"]
-        tree_at, run_job, python = regression_mod.job_runner(self.workflow, f"regression-{task.id}")
-        result = regression_mod.run_regression_check(
-            workspace=self.workflow.workspace,
-            repo=repo,
-            head=head,
-            tree_at=tree_at,
-            run_job=run_job,
-            python=python,
-            name=task.id,
-        )
-        self.workflow.journal.event("regression", f"{task.id}: {result.summary()}")
-        if result.passed:
-            with self._turn_lock:
-                self._regression_cleared[task.id] = head
-        return result.failures
-
     # ------------------------------------------------------ worktrees, devices
     def _make_integration(self, state: WorkflowState) -> Integration | None:
         """Per-task worktrees on a git checkout; on anything else tasks share the tree."""
@@ -370,7 +335,10 @@ class ExecutionStage:
         if not (repo / ".git").exists():
             self.workflow.journal.event("integration", f"tasks share the checkout {repo}")
             return None
-        policy = CommitPolicy.from_task(self.workflow.task_data, workspace=self.workflow.workspace)
+        # Commits outside the run's own paths are refused at integration, as their tasks are.
+        policy = CommitPolicy.from_task(
+            self.workflow.task_data, workspace=self.workflow.workspace
+        ).within(self._shared_code_rule())
         env = {}
         if policy.identity is not None:
             # The rebase's committer; each commit keeps its author.
@@ -455,10 +423,21 @@ class ExecutionStage:
         return capacity if live else None
 
     # ---------------------------------------------------------------- planner
-    def _regression_paths(self) -> tuple[str, ...]:
-        """The target's own paths (:func:`~..graph.own_paths`); none before preflight names it."""
+    def _target_rel(self) -> str:
+        """The target's path in the checkout; "" before preflight names it."""
         preflight = getattr(self.workflow, "_preflight", None)
-        return graph_mod.own_paths(str(getattr(preflight, "target_rel", "") or ""))
+        return str(getattr(preflight, "target_rel", "") or "")
+
+    def _shared_code_rule(self) -> tuple[str, ...]:
+        """The paths a task may touch (:func:`~..graph.own_paths`); none: the commit policy's.
+
+        A spec whose ``commit_policy.allowed_paths`` the operator wrote decides on
+        its own what the run may change; else the run changes only its own paths.
+        """
+        policy = self.workflow.task_data.get("commit_policy") or {}
+        if policy.get("allowed_paths") is not None:
+            return ()
+        return graph_mod.own_paths(self._target_rel())
 
     def _assembler_prompt(self, unit: str) -> str:
         if variants_mod.is_variant(self.workflow.task_data, unit):
@@ -582,13 +561,13 @@ class ExecutionStage:
                 "",
                 "## Shared code",
                 "",
-                "The target's own paths: "
+                "The run's own paths: "
                 + ", ".join(f"`{p}`" for p in own)
-                + ". Any other path a task touches is shared code; the orchestrator follows "
-                "every change to it with a regression check of its own, which you leave as it is.",
+                + ". A task touches nothing else: code other models run is not the run's to "
+                "change. A shared kernel the target needs changed lands as a local variant under "
+                "the target's `ops/`; any other shared change (the runtime, a catalog entry, "
+                "C++) is escalated, for a pull request of its own.",
             ]
-            if turn.regression:
-                lines += ["", turn.regression]
         messages = _newest([e for e in turn.events if inbox_mod.is_message(e)], "messages")
         if messages:
             lines[:0] = [
@@ -660,8 +639,7 @@ class ExecutionStage:
         """Whether ``task``'s latest attempt landed commits though its turn did not finish.
 
         A failed receipt's guard tests do (``_land_failed_receipt``): they are a
-        change to the code they guard like any other, and a regression check
-        covers them.
+        change to the code they guard like any other.
         """
         return self._landed_attempts.get(task.id) == task.attempts
 
