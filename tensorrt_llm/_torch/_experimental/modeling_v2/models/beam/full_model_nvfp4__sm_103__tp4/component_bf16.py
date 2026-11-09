@@ -87,6 +87,7 @@ from tensorrt_llm.mapping import Mapping as ParallelMapping
 
 from .. import _attention, dispatch_combine
 from .._load import load_failure_details
+from .._validation import check_positions, explicit_device
 from .layout_bf16 import (
     EMBED,
     FINAL_NORM,
@@ -168,11 +169,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         self.max_tokens = check_max_tokens(max_tokens)
         self.schedule = check_config(config)
         _check_mapping(mapping)
-        device = (
-            torch.device("cuda", torch.cuda.current_device())
-            if device is None
-            else torch.device(device)
-        )
+        device = explicit_device(device)
         if device.type != "cuda" or torch.cuda.get_device_capability(device) != _SM:
             raise ValueError(
                 f"this component is built for sm_{_SM[0]}{_SM[1]} CUDA devices, got {device}"
@@ -449,6 +446,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         self._check_usable(layer)
         _check_hidden(h, self.hidden, self.device, self.max_tokens)
         T = h.shape[0]
+        check_positions(positions, (T,), self.device)
         if not call_checked or self.diagnostics:
             _attention.check_batch_metadata(
                 md,

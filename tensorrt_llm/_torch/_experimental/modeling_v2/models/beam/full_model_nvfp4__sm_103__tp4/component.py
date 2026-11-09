@@ -52,6 +52,7 @@ from tensorrt_llm.mapping import Mapping as ParallelMapping
 
 from .. import dispatch_combine
 from .._load import load_failure_details
+from .._validation import explicit_device
 from . import expert as nvfp4_expert
 from .component_bf16 import (
     MAX_TOKENS,
@@ -121,11 +122,7 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         self.max_tokens = check_max_tokens(max_tokens)
         self.schedule = check_config(config)
         _check_mapping(mapping)
-        device = (
-            torch.device("cuda", torch.cuda.current_device())
-            if device is None
-            else torch.device(device)
-        )
+        device = explicit_device(device)
         if device.type != "cuda" or torch.cuda.get_device_capability(device) != _SM:
             raise ValueError(
                 f"this component is built for sm_{_SM[0]}{_SM[1]} CUDA devices, got {device}"

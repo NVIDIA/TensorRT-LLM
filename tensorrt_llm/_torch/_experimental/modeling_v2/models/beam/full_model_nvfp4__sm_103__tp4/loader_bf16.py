@@ -118,6 +118,8 @@ class SafetensorsCatalog:
                     raise CheckpointFormatError(
                         f"{name} is stored in {filename} but the index maps it to {weight_map.get(name)!r}"
                     )
+                if type(begin) is not int or type(end) is not int:
+                    raise CheckpointFormatError(f"{filename}: {name} offsets must be integers")
                 if not 0 <= begin <= end or data_start + end > size:
                     raise CheckpointFormatError(
                         f"{filename}: {name} spans [{begin}, {end}) outside the file"

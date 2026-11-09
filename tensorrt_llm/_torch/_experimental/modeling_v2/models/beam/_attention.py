@@ -77,6 +77,8 @@ from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm.bindings import DataType
 
+from ._validation import check_positions, metadata_values
+
 #: thop_attention arguments that do not change with the step on these blocks: packed q|k|v,
 #: append-and-attend, causal, bf16 pool, no quantization, and any position transform
 #: applied before the call -- the rope_* values are inert placeholders the op requires,
@@ -202,15 +204,7 @@ def check_step(
     num_tokens = hidden_states.shape[1]
     if not 1 <= num_tokens <= max_tokens:
         raise ValueError(f"supported token counts per call are 1..{max_tokens}, got {num_tokens}")
-    if (
-        not isinstance(position_ids, torch.Tensor)
-        or position_ids.is_floating_point()
-        or tuple(position_ids.shape) != (1, num_tokens)
-        or position_ids.device != hidden_states.device
-    ):
-        raise ValueError(
-            f"position_ids must be an integer [1, {num_tokens}] tensor on the block's device"
-        )
+    check_positions(position_ids, (1, num_tokens), device)
     past = check_metadata(
         md, num_tokens, layer_idx=layer_idx, num_kv_heads=num_kv_heads, head_dim=head_dim
     )
@@ -292,10 +286,14 @@ def check_batch_metadata(
         raise ValueError(
             f"the call has {num_tokens} tokens; the metadata holds {md.max_num_tokens} per call"
         )
-    new_tokens = [int(n) for n in md.seq_lens[:num_seqs]]
-    kv_lens = [int(n) for n in md.kv_lens_runtime[:num_seqs]]
-    request_types = [int(t) for t in md.host_request_types_runtime[:num_seqs]]
-    context_lens = [int(n) for n in md.prompt_lens_cpu_runtime[:num_contexts]]
+    new_tokens = metadata_values(md.seq_lens, num_seqs, "seq_lens")
+    kv_lens = metadata_values(md.kv_lens_runtime, num_seqs, "kv_lens_runtime")
+    request_types = metadata_values(
+        md.host_request_types_runtime, num_seqs, "host_request_types_runtime"
+    )
+    context_lens = metadata_values(
+        md.prompt_lens_cpu_runtime, num_contexts, "prompt_lens_cpu_runtime"
+    )
     if sum(new_tokens) != num_tokens or md.num_ctx_tokens != sum(new_tokens[:num_contexts]):
         raise ValueError(
             f"the requests' new tokens {new_tokens} ({md.num_ctx_tokens} in contexts) do not "

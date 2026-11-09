@@ -180,8 +180,12 @@ def check_config(config: Any) -> Schedule:
         if actual is not None and actual != expected:
             raise ValueError(f"unsupported {field}={actual!r}; this layout computes {expected!r}")
     layers = SUPPORTED_CONFIG["num_hidden_layers"]
-    attention = tuple(_get(config, "layer_types") or ())
-    mlp = tuple(_get(config, "mlp_layer_types") or ())
+    for field in ("layer_types", "mlp_layer_types"):
+        values = _get(config, field)
+        if not isinstance(values, (list, tuple)) or not all(isinstance(v, str) for v in values):
+            raise ValueError(f"{field} must be a list of layer names")
+    attention = tuple(_get(config, "layer_types"))
+    mlp = tuple(_get(config, "mlp_layer_types"))
     if len(attention) != layers or set(attention) - {"sliding_attention", "full_attention"}:
         raise ValueError(f"layer_types must name {layers} sliding/full layers, got {attention!r}")
     if len(mlp) != layers or set(mlp) - {"dense", "sparse"}:

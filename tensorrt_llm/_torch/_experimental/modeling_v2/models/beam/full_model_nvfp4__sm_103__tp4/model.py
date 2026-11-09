@@ -191,8 +191,7 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
         num_tokens = input_ids.shape[0]
         if (
             not isinstance(position_ids, torch.Tensor)
-            or position_ids.is_floating_point()
-            or position_ids.dtype == torch.bool
+            or position_ids.dtype not in (torch.int32, torch.int64)
             or position_ids.numel() != num_tokens
             or position_ids.device != self.device
         ):

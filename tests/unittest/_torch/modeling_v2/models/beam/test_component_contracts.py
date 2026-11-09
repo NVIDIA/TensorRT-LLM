@@ -279,3 +279,56 @@ def test_local_load_success_and_incomplete_coverage():
     mapping = NS(world_size=1)
     assert load_failure_details(mapping, True, None) is None
     assert load_failure_details(mapping, False, None) == "rank 0: incomplete tensor coverage"
+
+
+@pytest.mark.parametrize("field", ["layer_types", "mlp_layer_types"])
+@pytest.mark.parametrize("value", [1, "dense", None, [[]]])
+def test_malformed_layer_schedule_is_value_error(field, value):
+    cfg = config()
+    cfg[field] = value
+    with pytest.raises(ValueError, match=field):
+        layout.check_config(cfg)
+
+
+def test_direct_call_device_and_metadata_admission(monkeypatch):
+    import torch
+
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam._validation import (
+        check_positions,
+        explicit_device,
+        metadata_values,
+    )
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    assert explicit_device("cuda") == torch.device("cuda:2")
+    assert explicit_device(None) == torch.device("cuda:2")
+    assert explicit_device("cuda:1") == torch.device("cuda:1")
+    for dtype in (torch.int32, torch.int64):
+        check_positions(torch.arange(3, dtype=dtype), (3,), torch.device("cpu"))
+    for dtype in (torch.uint8, torch.int16, torch.bool, torch.float32):
+        with pytest.raises(ValueError, match="int32/int64"):
+            check_positions(torch.ones(3, dtype=dtype), (3,), torch.device("cpu"))
+    with pytest.raises(ValueError, match="shape"):
+        check_positions(torch.ones(1, dtype=torch.int64), (3,), torch.device("cpu"))
+    for values in ([2, 3], torch.tensor([2, 3])):
+        assert metadata_values(values, 2, "seq_lens") == [2, 3]
+        with pytest.raises(ValueError, match="seq_lens needs 3"):
+            metadata_values(values, 3, "seq_lens")
+
+
+@pytest.mark.parametrize("offset", [0.0, False, "0"])
+def test_safetensors_offsets_must_be_integers(tmp_path, monkeypatch, offset):
+    import json
+
+    (tmp_path / loader.INDEX_FILE).write_text(json.dumps({"weight_map": {"w": "shard"}}))
+    (tmp_path / "shard").write_bytes(bytes(8))
+    monkeypatch.setattr(
+        loader,
+        "_read_header",
+        lambda path: (
+            {"w": {"dtype": "F32", "shape": [1], "data_offsets": [offset, 4]}},
+            0,
+        ),
+    )
+    with pytest.raises(loader.CheckpointFormatError, match="offsets must be integers"):
+        loader.SafetensorsCatalog(str(tmp_path))
