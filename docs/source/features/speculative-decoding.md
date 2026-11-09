@@ -4,7 +4,7 @@ Speculative decoding is a technique for accelerating LLM inference at low batch 
 
 ## Quick Start
 
-For all speculation algorithms, when speculation is enabled, a single sequence of draft tokens with length `max_draft_len` is created for every request. There is currently no way to dynamically disable speculation, thus speed ups are only observable at low batch sizes.
+The maximum draft length is controlled by `max_draft_len`; EAGLE 3 can optionally generate a draft tree. On the PyTorch backend, modes that support dynamic draft lengths can use `max_concurrency` to disable speculation above a batch-size threshold, or `draft_len_schedule` to adjust draft length as the active batch size changes. These options are mutually exclusive and are configured at startup; the runtime then adapts automatically to the active batch size.
 
 
 ### Draft/Target
