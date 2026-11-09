@@ -168,7 +168,7 @@ class EncoderCache:
             raise ValueError("unsupported encoder cache reference")
         try:
             value = json.loads(reference.opaque_state)
-        except (ValueError, UnicodeError) as error:
+        except (ValueError, UnicodeError, RecursionError) as error:
             raise ValueError("invalid encoder cache reference") from error
         if (
             not isinstance(value, dict)
