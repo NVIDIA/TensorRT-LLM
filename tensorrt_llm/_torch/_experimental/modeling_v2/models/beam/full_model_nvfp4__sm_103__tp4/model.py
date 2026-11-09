@@ -27,12 +27,12 @@ indices.
 The cache must be a BF16 ``KVCacheManagerV2`` holding all 52 logical layers in logical order
 with 2 kv heads of 128 per rank, a 512-token window on every sliding layer and the whole
 sequence (``max_seq_len``) on the full-attention layers 5, 11, 17, 23, 29, 35, 41, 47 and 51
-(``attention_windows``). Inputs, positions, metadata and cache are validated before any kernel
-runs; a call with T above ``max_tokens`` is rejected (the default ``MAX_NUM_TOKENS`` matches
+(``attention_windows``). Input geometry, metadata and cache are validated before execution; absolute position
+values are compared with the request spans only in diagnostic mode; a call with T above ``max_tokens`` is rejected (the default ``MAX_NUM_TOKENS`` matches
 the supported deployment's native ``max_num_tokens``).
 
-Host synchronization: the position check reads one device comparison back per call; the
-component's router agreement and expert dispatch synchronize per sparse layer.
+Host synchronization: diagnostic mode checks position values once per call and router
+agreement per sparse layer. Expert dispatch synchronizes per sparse layer in all modes.
 """
 
 from __future__ import annotations
@@ -174,8 +174,8 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
         device, 1 <= T <= ``max_tokens``; ``attn_metadata``: one prepared step of its requests
         on a manager that passes ``check_cache_manager``; ``position_ids``: an integer tensor
         of T positions, each request's ``past .. past + n - 1`` in request order. Returns the
-        spans ``[(past, n), ...]`` of ``_attention.check_batch_metadata``. Raises ValueError
-        otherwise.
+        spans ``[(past, n), ...]`` of ``_attention.check_batch_metadata``. Position values are
+        compared with those spans only in diagnostic mode; callers otherwise supply them.
         """
         if not isinstance(input_ids, torch.Tensor) or input_ids.dtype != torch.int64:
             raise ValueError("input_ids must be a torch.int64 tensor")

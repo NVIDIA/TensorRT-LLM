@@ -11,7 +11,7 @@ and each block owns its own router and experts. It composes three accepted compo
 adds no arithmetic of its own::
 
     weights, ids = router(hidden)                  ../moe_router_bf16__sm_103__tp1
-    out = dispatch_combine(hidden, ids, weights,   ../moe_dispatch_combine_bf16__sm_103__tp1
+    out = dispatch_combine(hidden, ids, weights,   ../dispatch_combine.py
                            lambda e, rows: experts[e](rows))
                                                    ../moe_expert_bf16__sm_103__tp1, 256 of them
 

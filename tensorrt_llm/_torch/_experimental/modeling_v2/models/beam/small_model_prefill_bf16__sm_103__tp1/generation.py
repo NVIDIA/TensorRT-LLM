@@ -44,7 +44,8 @@ Semantics.
   manager commits it (``update_context_resources``), so later requests can reuse it,
   also after this request is released. ``reuse=False`` claims nothing
   (``prepare_context_cache(reuse_limit=0)``) and computes the whole prompt: the
-  reuse-disabled control. Generated tokens are not committed for reuse.
+  reuse-disabled control. Under the default ``all_reusable`` policy,
+  ``update_resources`` also commits computed generated tokens for reuse.
 * Sampling is greedy: ``temperature=0``, ``top_k=1``, beam width 1, no penalties, stop
   words, logits processors or draft tokens. ``TorchSampler`` chooses each token from the
   step's FP32 logits (the lowest vocabulary index among exact maxima).

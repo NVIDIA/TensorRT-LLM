@@ -13,7 +13,7 @@ This is the BF16 layout component (``component_bf16``) with NVFP4 expert
 storage and execution. Everything outside the routed experts -- ownership, the embedding,
 attention on TRTLLM attention and KVCacheManagerV2 metadata, the dense feed-forward, the
 replicated FP32 router with its diagnostic-mode all-rank agreement check, dispatch/combine, the
-norms, depth residuals, head and every collective -- is that component's code, unchanged, on
+norms, depth residuals and head -- uses that component's code on
 the checkpoint's BF16/FP32 tensors copied byte for byte. The experts stay packed:
 
     storage   per sparse layer and projection kind, banks indexed by global expert id: packed
