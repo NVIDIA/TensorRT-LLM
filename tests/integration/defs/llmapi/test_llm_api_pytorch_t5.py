@@ -1235,8 +1235,9 @@ def test_t5_encoder_steps_take_requests_in_arrival_order(
         all_submitted = threading.Event()
 
         def recording_schedule_request(*args: object, **kwargs: object) -> SchedulerOutput:
-            # The first iteration waits until every request is queued, so the
-            # next one offers all the requests that the first did not take.
+            """Hold the first scheduling iteration, then record what the scheduler offered."""
+            # The first iteration waits until every request is queued, so that
+            # the next request fetch takes all the others at once.
             all_submitted.wait(timeout=_SUBMIT_TIMEOUT_S)
             scheduler_output = schedule_request(*args, **kwargs)
             offered_encoder_batch_sizes.append(len(scheduler_output.encoder_requests))
@@ -1245,6 +1246,7 @@ def test_t5_encoder_steps_take_requests_in_arrival_order(
         def recording_forward_encoder(
             encoder_requests: list[LlmRequest], *args: object, **kwargs: object
         ) -> tuple[torch.Tensor, list[int]]:
+            """Record which requests the encoder step runs, in its order."""
             encoder_steps.append([request.py_client_id for request in encoder_requests])
             return forward_encoder(encoder_requests, *args, **kwargs)
 
