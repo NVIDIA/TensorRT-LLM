@@ -5,13 +5,18 @@
 Every layer owns its home-expert storage and maps a helper-slot set directly
 after it in virtual address space: either its own set, which lets helper experts
 stay resident across forwards, or one of two banks that all layers alternate
-between. Per-layer READY terminals and small planes remain independent.
+between. The owner of a pair-level record multicasts its large planes into the
+aligned rank pair through layer-spanning pair and team objects, and writes the
+small planes of each receiver's helper row through the peer views, which map
+every peer's home and helper rows.
+Per-layer READY terminals and small planes remain independent.
 Allocation and binding are collective across the EP group; vendor imports stay
 lazy until the rebalance path is enabled.
 """
 
 import math
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -210,6 +215,12 @@ _RECORD_PLANE_ALIGNMENT = 256
 
 
 _HELPER_BANK_COUNT = 2
+
+#: Helper sets that one pair-multicast object spans when every layer has its
+#: own set. The pool is built by its first layer and never learns the model's
+#: MoE layer count, so this bounds it (DeepSeek-V4-Pro has 61 MoE layers).
+_PAIR_SPAN_LAYERS_ENV = "TRTLLM_HALOQ_PAIR_SPAN_LAYERS"
+_PAIR_SPAN_LAYERS_DEFAULT = 128
 
 
 class _ViewSpec:
@@ -497,12 +508,41 @@ def _create_multicast(vmm: _Vmm, comm: Any, rank: int, specs: List[_MulticastSpe
 @dataclass
 class _HelperSet:
     """One physical helper-slot set: a chunk per large plane, one multicast
-    object per hierarchy level, and that object's view base per plane."""
+    object per hierarchy level, that object's view base per plane, and every
+    peer's imported chunk per plane (None for this rank)."""
 
     chunks: Dict[str, Any]
     level_bases: Tuple[Dict[str, int], ...]
     level_specs: Tuple[_MulticastSpec, ...]
     zeroed: bool = False
+    peer_chunks: Dict[str, Tuple[Any, ...]] = field(default_factory=dict)
+
+
+@dataclass
+class _PairObjects:
+    """Layer-spanning multicast objects through which owners write rank pairs.
+
+    The owner of a pair-level record multicasts it into the aligned pair
+    ``[2j, 2j + 1]``: through the pair's own object when it is a member (both
+    members bind their helper chunks; two aliases as in ``_create_multicast``),
+    else through its team object ``{owner, 2j, 2j + 1}``, which only the owner
+    maps and to which it binds a dummy chunk for its own replica. Each object
+    spans ``span`` helper sets ``set_bytes`` apart and binds a set when the pool
+    creates it, so the count does not grow with the layers: at EP8 a GPU holds
+    2 pair aliases and 9 team objects, against 15 per layer (915 for 61 layers)
+    with per-layer objects, close to the roughly 960 that a GPU can bind.
+    """
+
+    span: int
+    #: ``[pair]`` base address of the object this rank maps for that pair.
+    bases: Tuple[int, ...]
+    #: Objects this rank binds its helper chunks to: both aliases of its own
+    #: pair and the team of every owner outside it.
+    member_handles: Tuple[Any, ...]
+    #: Team objects this rank owns; they bind its dummy chunks.
+    owner_handles: Tuple[Any, ...]
+    #: Plane name -> dummy chunk that receives this rank's own replica.
+    dummies: Dict[str, Any]
 
 
 @dataclass
@@ -538,6 +578,10 @@ class _SharedSlotPool:
 
     READY terminals stay per layer because one forward shares its generation
     across layers. They and the fp32 planes live in per-layer records.
+
+    For EP >= 4 whose ladder stops above pairs, the pool also owns the pair
+    and team objects of HALO-Q's pair level (``_PairObjects``); every helper
+    set it creates is bound into them.
     """
 
     def __init__(
@@ -572,7 +616,26 @@ class _SharedSlotPool:
             tuple(range(rank // size * size, rank // size * size + size))
             for size in self.group_sizes
         )
-        self.vmm = _Vmm(device, self.group_sizes)
+        # Pair objects have two members and team objects three.  A ladder that
+        # ends in pairs copies pair records like any multicast level; its pair
+        # level lives in the layer-spanning pair objects (no teams), so it
+        # costs two multicast objects per GPU instead of two per helper set.
+        # EP2's one level is the whole world, an ordinary multicast level.
+        self.pair_ladder = len(self.group_sizes) > 1 and self.group_sizes[-1] == 2
+        # The balanced copy route lets an owner outside a pair write part of a
+        # pair copy itself, so a ladder then also needs the team objects.
+        from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.geometry import (
+            balanced_copy_enabled,
+        )
+
+        self.balanced_pairs = balanced_copy_enabled(world, helper_count)
+        if world < 4:
+            pair_members = ()
+        elif self.pair_ladder:
+            pair_members = (3,) if self.balanced_pairs else ()
+        else:
+            pair_members = (2, 3)
+        self.vmm = _Vmm(device, self.group_sizes + pair_members)
         granularity = self.vmm.granularity
 
         self.large = tuple(p for p in bundle.planes if p.nbytes * self.slots > _RECORD_PLANE_BYTES)
@@ -605,11 +668,18 @@ class _SharedSlotPool:
         self.layer_count = 0
         self.sets: Tuple[_HelperSet, ...] = ()
         self.per_layer_sets = per_layer_sets
+        self.pair_objects: Optional[_PairObjects] = None
         self._construction_complete = False
         self._owner_registry = owner_registry
         self._owner_registry.append(self)
+        if world >= 4 and self.large:
+            self.pair_objects = self._create_pair_objects(
+                self._pair_span(comm), comm, teams=not self.pair_ladder or self.balanced_pairs
+            )
         if not per_layer_sets:
-            self.sets = self._create_sets(_HELPER_BANK_COUNT, comm)
+            self.sets = self._create_sets(_HELPER_BANK_COUNT, comm, 0)
+            for index, helper_set in enumerate(self.sets):
+                self._bind_pair_set(index, helper_set, comm)
         self._construction_complete = True
 
     def register_producer(self, producer: Any) -> None:
@@ -630,6 +700,7 @@ class _SharedSlotPool:
             self.layer_count,
             len(self.pages),
             len(self.sets),
+            self.pair_objects.span if self.pair_objects is not None else 0,
             tuple((plane.name, int(plane.nbytes)) for plane in self.bundle.planes),
             tuple(
                 (
@@ -716,19 +787,37 @@ class _SharedSlotPool:
             if self in self._owner_registry:
                 self._owner_registry.remove(self)
             self.sets = ()
+            self.pair_objects = None
             self.pages.clear()
             return True
         finally:
             self._closing = False
 
-    def _create_sets(self, count: int, comm: Any) -> Tuple[_HelperSet, ...]:
+    def _create_sets(self, count: int, comm: Any, first_index: int) -> Tuple[_HelperSet, ...]:
         if not self.large:
             return tuple(_HelperSet({}, tuple({} for _ in self.groups), ()) for _ in range(count))
-        sets, specs = [], []
-        for _ in range(count):
-            chunks = {p.name: self.vmm.create(self.helper_bytes[p.name])[0] for p in self.large}
+        sets, specs, exports = [], [], []
+        for k in range(count):
+            created = {p.name: self.vmm.create(self.helper_bytes[p.name]) for p in self.large}
+            chunks = {name: handle for name, (handle, _) in created.items()}
+            exports.append(tuple(created[p.name][1] for p in self.large))
             level_bases, level_specs = [], []
             for members in self.groups:
+                if self.pair_ladder and len(members) == 2:
+                    # Set i of the pair level sits i * set_bytes into this
+                    # rank's pair object; _bind_pair_set binds it.
+                    pair_set = (
+                        self.pair_objects.bases[self.rank // 2]
+                        + (first_index + k) * self.set_bytes
+                    )
+                    level_bases.append(
+                        {
+                            p.name: pair_set + self.mc_offsets[p.name] - self.home_count * p.nbytes
+                            for p in self.large
+                        }
+                    )
+                    level_specs.append(self.pair_objects)
+                    continue
                 bases: Dict[str, int] = {}
                 mappings: List[int] = []
                 for plane in self.large:
@@ -756,7 +845,156 @@ class _SharedSlotPool:
                 level_bases.append(bases)
             sets.append(_HelperSet(chunks, tuple(level_bases), tuple(level_specs)))
         _create_multicast(self.vmm, comm, self.rank, specs)
+        # Import every peer's chunk of each new set once; each layer on the set
+        # maps it behind that peer's home rows (build_layer).
+        shareables = comm.allgather(tuple(exports))
+        if len(shareables) != self.world or any(
+            len(peer_sets) != count or any(len(row) != len(self.large) for row in peer_sets)
+            for peer_sets in shareables
+        ):
+            raise RuntimeError("shared-slot helper exchange returned an incomplete EP")
+        for index, helper_set in enumerate(sets):
+            helper_set.peer_chunks = {
+                plane.name: tuple(
+                    None
+                    if peer == self.rank
+                    else self.vmm.import_(shareables[peer][index][large_index])
+                    for peer in range(self.world)
+                )
+                for large_index, plane in enumerate(self.large)
+            }
         return tuple(sets)
+
+    def _pair_span(self, comm: Any) -> int:
+        """Helper sets one pair object spans: the two banks, or a layer bound."""
+        if not self.per_layer_sets:
+            return _HELPER_BANK_COUNT
+        value = os.environ.get(_PAIR_SPAN_LAYERS_ENV, str(_PAIR_SPAN_LAYERS_DEFAULT))
+        try:
+            span = int(value)
+        except ValueError:
+            span = 0
+        if span <= 0:
+            raise ValueError(f"{_PAIR_SPAN_LAYERS_ENV} must be a positive int; got {value!r}")
+        # Every member must bind the same offsets, so the span must agree.
+        spans = comm.allgather(span)
+        if any(item != span for item in spans):
+            raise ValueError(f"{_PAIR_SPAN_LAYERS_ENV} differs across the EP group: {spans}")
+        return span
+
+    def _create_pair_objects(self, span: int, comm: Any, teams: bool = True) -> _PairObjects:
+        """Collectively create and map the pair and team objects of
+        ``_PairObjects``; ``_bind_pair_set`` binds each helper set later.
+
+        Every rank lists the objects in the same order: pair ``j``'s object,
+        with one alias per member, then (with ``teams``) the team of every
+        owner outside pair ``j``, created by the pair's first rank and imported
+        by the others.  A member maps the alias that it did not create, as in
+        ``_create_multicast``; a team is mapped only by its owner.  Each mapping
+        follows a reserved prefix, so a view whose row 0 sits H rows before a
+        set stays inside this rank's reservation.
+        """
+        vmm, world, rank = self.vmm, self.world, self.rank
+        cuda, check = vmm.cuda, vmm.check
+        nbytes = span * self.set_bytes
+        objects = []
+        for j in range(world // 2):
+            pair = (2 * j, 2 * j + 1)
+            objects.append((pair, pair))
+            if teams:
+                objects.extend(
+                    ((owner,) + pair, (pair[0],)) for owner in range(world) if owner not in pair
+                )
+        created: Dict[Tuple[int, int], Any] = {}
+        exported: Dict[Tuple[int, int], bytes] = {}
+        for index, (members, creators) in enumerate(objects):
+            for alias, creator in enumerate(creators):
+                if rank == creator:
+                    handle = check(
+                        cuda.cuMulticastCreate(vmm.multicast_properties(len(members), nbytes)),
+                        "cuMulticastCreate(pair multicast)",
+                    )
+                    vmm.register_created_multicast(handle)
+                    created[(index, alias)] = handle
+                    exported[(index, alias)] = bytes(
+                        check(
+                            cuda.cuMemExportToShareableHandle(handle, vmm.fabric, 0),
+                            "cuMemExportToShareableHandle(pair multicast)",
+                        ).data
+                    )
+        gathered = comm.allgather(exported)
+        joined = []
+        for index, (members, creators) in enumerate(objects):
+            if rank not in members:
+                continue
+            handles = []
+            for alias, creator in enumerate(creators):
+                handle = created.get((index, alias))
+                if handle is None:
+                    handle = vmm.import_multicast(gathered[creator][(index, alias)])
+                check(
+                    cuda.cuMulticastAddDevice(handle, vmm.device),
+                    "cuMulticastAddDevice(pair multicast)",
+                )
+                handles.append(handle)
+            joined.append((members, handles))
+        comm.barrier()
+        # An object is mapped before any set is bound into it; binds follow
+        # when the pool creates each set (validated on VR200).
+        bases = [0] * (world // 2)
+        prefix = max(self.home_bytes.values())
+        member_handles: List[Any] = []
+        owner_handles: List[Any] = []
+        for members, handles in joined:
+            if len(members) == 2:
+                member_handles.extend(handles)
+                selected = handles[1 if rank == members[0] else 0]
+            elif rank == members[0]:
+                owner_handles.append(handles[0])
+                selected = handles[0]
+            else:
+                member_handles.append(handles[0])
+                continue
+            address = vmm.reserve(prefix + nbytes) + prefix
+            vmm.map(address, nbytes, selected)
+            bases[members[-1] // 2] = address
+        comm.barrier()
+        if not all(bases) if teams else not bases[rank // 2]:
+            raise RuntimeError("pair multicast setup left a pair without a mapped object")
+        dummies = (
+            {p.name: vmm.create(self.helper_bytes[p.name])[0] for p in self.large} if teams else {}
+        )
+        return _PairObjects(span, tuple(bases), tuple(member_handles), tuple(owner_handles), dummies)
+
+    def _bind_pair_set(self, index: int, helper_set: _HelperSet, comm: Any) -> None:
+        """Bind helper set ``index`` into every pair and team object this rank
+        joins: its own chunks as a pair member, its dummies as a team owner."""
+        pairs = self.pair_objects
+        if pairs is None:
+            return
+        if index >= pairs.span:
+            raise RuntimeError(
+                f"helper set {index} exceeds the pair multicast span of {pairs.span} sets; "
+                f"raise {_PAIR_SPAN_LAYERS_ENV} to at least the MoE layer count"
+            )
+        cuda, check = self.vmm.cuda, self.vmm.check
+        for handles, chunks in (
+            (pairs.member_handles, helper_set.chunks),
+            (pairs.owner_handles, pairs.dummies),
+        ):
+            for handle in handles:
+                for plane in self.large:
+                    offset = index * self.set_bytes + self.mc_offsets[plane.name]
+                    nbytes = self.helper_bytes[plane.name]
+                    check(
+                        cuda.cuMulticastBindMem_v2(
+                            handle, self.vmm.device, offset, chunks[plane.name], 0, nbytes, 0
+                        ),
+                        "cuMulticastBindMem_v2(pair multicast)",
+                    )
+                    self.vmm.record_multicast_bind(handle, offset, nbytes)
+        # No rank may write a range before every member has bound it.
+        comm.barrier()
 
     def _create_page(self, comm: Any) -> _RecordPage:
         handle, shareable = self.vmm.create(self.page_bytes)
@@ -805,7 +1043,8 @@ class _SharedSlotPool:
         page = self.pages[-1]
         record = (index % self.records_per_page) * self.record_stride
         if self.per_layer_sets:
-            self.sets += self._create_sets(1, comm)
+            self.sets += self._create_sets(1, comm, index)
+            self._bind_pair_set(index, self.sets[-1], comm)
         helper_set = self.sets[index % len(self.sets)]
         layer = _SharedLayer(self, index % len(self.sets))
         self.layer_count += 1
@@ -837,13 +1076,19 @@ class _SharedSlotPool:
                     if peer == rank:
                         uc_ptrs.append(address + pad)
                         continue
-                    # Peers expose only home rows; the reservation keeps the
-                    # view's helper tail clear of every other mapping.
+                    # A peer view maps its home rows and, right after them, the
+                    # peer's helper chunk of this set: the owner of a pair-level
+                    # record writes the receivers' small-plane rows through it.
                     peer_address = self.vmm.reserve(home_bytes + helper_bytes)
                     self.vmm.map(
                         peer_address,
                         home_bytes,
                         self.vmm.import_(peer_handles[peer][large_index]),
+                    )
+                    self.vmm.map(
+                        peer_address + home_bytes,
+                        helper_bytes,
+                        helper_set.peer_chunks[plane.name][peer],
                     )
                     uc_ptrs.append(peer_address + pad)
                 level_ptrs = tuple(bases[plane.name] for bases in helper_set.level_bases)
@@ -880,12 +1125,34 @@ class _SharedSlotPool:
             aliases_same_backing=True,
             backing_owner=layer,
         )
+        # [pair][helper][plane]: where this rank multicasts helper row h of a
+        # large plane into both ranks of pair j; 0 for the record-page planes,
+        # which the owner writes per receiver.
+        pair_ptrs: Tuple[int, ...] = ()
+        if self.pair_objects is not None and (not self.pair_ladder or self.balanced_pairs):
+            set_offset = layer.helper_set * self.set_bytes
+            pair_ptrs = tuple(
+                self.pair_objects.bases[pair]
+                + set_offset
+                + self.mc_offsets[plane.name]
+                + helper * plane.nbytes
+                if plane.name in self.home_bytes
+                else 0
+                for pair in range(world // 2)
+                for helper in range(self.helper_count)
+                for plane in self.bundle.planes
+            )
         arena = HierarchicalLiveWeightArena(
             base=LiveWeightArena(planes=tuple(planes), terminals=terminals),
             group_sizes=self.group_sizes,
             group_mc_views=tuple(group_views),
             group_mc_owners=tuple(group_owners),
             aliases_same_backing=True,
+            # Large planes map every peer's helper chunk above; small planes
+            # live in record pages that every rank maps whole.  A pair ladder
+            # has no pair-level records, so no owner-direct rows.
+            peer_helper_rows_mapped=not self.pair_ladder,
+            pair_destination_ptrs=pair_ptrs,
         )
         return arena, tekit_views, layer, sum(self.home_bytes.values())
 

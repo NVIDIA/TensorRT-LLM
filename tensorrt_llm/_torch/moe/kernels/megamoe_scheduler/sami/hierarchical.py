@@ -14,7 +14,7 @@ from cuda.bindings import driver as cuda
 
 from .arena import BoundLiveWeightArena, LiveWeightArena, _TensorIdentity
 from ._util import check_cuda
-from ..geometry import hierarchy_group_sizes
+from ..geometry import balanced_copy_enabled, hierarchy_group_sizes
 from .geometry import BundleLayout
 
 @dataclass(frozen=True)
@@ -31,6 +31,14 @@ class BoundHierarchicalLiveWeightArena:
     group_mc_owners: tuple[tuple[object, ...], ...] = field(
         repr=False, compare=False
     )
+    #: ``[receiver][helper][plane]`` unicast rows the owner of a pair-level
+    #: record writes, this rank's own included; empty without owner-direct
+    #: unicast.
+    unicast_destination_ptrs: tuple[int, ...] = ()
+    #: ``[pair][helper][plane]`` multicast address through which this rank
+    #: writes row ``H + helper`` on both ranks of aligned pair ``[2j, 2j + 1]``,
+    #: 0 for a plane written per receiver; empty without pair multicast.
+    pair_destination_ptrs: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -41,6 +49,14 @@ class HierarchicalLiveWeightArena:
     ``[plane][level]``.  At a given level, each rank exposes only the alias and
     strong VMM owner token for its own aligned group.  Level zero is the
     full-world alias already present in ``base.planes[*].mc_view``.
+    ``peer_helper_rows_mapped`` attests that every peer UC view also maps that
+    peer's helper rows, so the owner of a pair-level record can write each
+    receiver's helper row with unicast stores.  ``pair_destination_ptrs``
+    (``[pair][helper][plane]``, only with ``peer_helper_rows_mapped``) are the
+    provider's multicast addresses into each aligned rank pair: the pair's own
+    alias for a member, else this rank's team alias ``{rank, pair}``, whose
+    replica on this rank lands in a dummy.  A 0 entry leaves that plane to the
+    unicast rows.
     """
 
     base: LiveWeightArena
@@ -52,6 +68,8 @@ class HierarchicalLiveWeightArena:
         repr=False, compare=False
     )
     aliases_same_backing: bool = False
+    peer_helper_rows_mapped: bool = False
+    pair_destination_ptrs: tuple[int, ...] = ()
 
     def bind(
         self,
@@ -65,6 +83,24 @@ class HierarchicalLiveWeightArena:
     ) -> BoundHierarchicalLiveWeightArena:
         if self.aliases_same_backing is not True:
             raise ValueError("hierarchical multicast aliases are not provider-attested")
+        if type(self.peer_helper_rows_mapped) is not bool:
+            raise TypeError("peer_helper_rows_mapped must be a bool")
+        pair_destinations = self.pair_destination_ptrs
+        if type(pair_destinations) is not tuple or any(
+            type(pointer) is not int or pointer < 0 for pointer in pair_destinations
+        ):
+            raise TypeError("pair_destination_ptrs must be a tuple of non-negative ints")
+        # A pair ladder copies pair records as a multicast level; its pair
+        # destinations (team objects) serve the balanced route without peer rows.
+        if pair_destinations and (
+            not (self.peer_helper_rows_mapped or self.group_sizes[-1:] == (2,))
+            or world < 4
+            or len(pair_destinations) != (world // 2) * helper_count * len(bundle.planes)
+        ):
+            raise ValueError(
+                "pair_destination_ptrs needs mapped peer helper rows, EP >= 4 and "
+                "one entry per pair, helper and plane"
+            )
         expected_sizes = hierarchy_group_sizes(world)
         if self.group_sizes != expected_sizes:
             raise ValueError(
@@ -141,6 +177,10 @@ class HierarchicalLiveWeightArena:
             group_destination_ptrs=tuple(destinations),
             group_mc_views=self.group_mc_views,
             group_mc_owners=self.group_mc_owners,
+            unicast_destination_ptrs=(
+                base.helper_uc_ptrs if self.peer_helper_rows_mapped else ()
+            ),
+            pair_destination_ptrs=pair_destinations,
         )
 
 # runtime_checkable because __init__ isinstance()-checks the provider below.
@@ -162,6 +202,26 @@ class HierarchicalLiveWeightArenaProvider(Protocol):
         comm: object,
     ) -> HierarchicalLiveWeightArena:
         """Construct the external live bank and all aligned-group aliases."""
+
+
+# The fused copy's plan channel (moeRebalanceTmaGpuPlan.h). Its stride holds
+# the S helper rows and the owner's outgoing records, at most HALO-Q's
+# candidate count min(4 * S, H, 32) per plan. ABI 8: a pair-level record names
+# an aligned pair, which may hold its owner.
+_PLAN_ABI_VERSION = 8
+# Balanced route: the cost of a pulled slice, in percent of an owner's local
+# one (GB200, 4 copy SMs, every rank copying: 101 vs 72.5 ns per 8 KiB slice).
+_BALANCED_PULL_COST = 140
+_MAX_OWNER_RECORDS = 32
+
+
+def _owner_records(helper_count: int, home_count: int) -> int:
+    return min(4 * helper_count, home_count, _MAX_OWNER_RECORDS)
+
+
+def _plan_stride(helper_count: int) -> int:
+    rows = max(helper_count, min(4 * helper_count, _MAX_OWNER_RECORDS))
+    return (rows + 3) // 4 * 4
 
 
 def _stream_handle(stream: object) -> int:
@@ -243,7 +303,7 @@ class HierarchicalSamiWeightBroadcast:
             raise ValueError("helper_count must be a positive exact int")
         if global_expert_count + world * helper_count > (1 << 31) - 1:
             raise ValueError("physical slots exceed public int32 indexing")
-        if 4 + 7 * ((helper_count + 3) // 4 * 4) > (1 << 31) - 1:
+        if 4 + 7 * _plan_stride(helper_count) > (1 << 31) - 1:
             raise ValueError("PlanChannel word count exceeds native int32 indexing")
         if not isinstance(arena_provider, HierarchicalLiveWeightArenaProvider):
             raise TypeError("arena_provider lacks the hierarchical arena protocol")
@@ -303,23 +363,44 @@ class HierarchicalSamiWeightBroadcast:
 
         # GPU-direct consumes the scheduler's device storage through the
         # statically linked THOP; no mapped channel or runtime compilation exists.
-        plan_stride = (helper_count + 3) // 4 * 4
+        plan_stride = _plan_stride(helper_count)
         plan_words = 4 + 7 * plan_stride
         planes = len(bundle.planes)
+        # Pair-level records (level len(group_sizes)) are copied by their
+        # owner: the large planes with one multicast into the aligned pair,
+        # the others with unicast stores into each receiver's helper row.
+        unicast_destinations = self.arena.unicast_destination_ptrs
+        pair_destinations = self.arena.pair_destination_ptrs
+        # Balanced route: with a pair ladder, every copy is split between its
+        # owner and its destination members, levelled over all ranks per layer.
+        balanced_copy = balanced_copy_enabled(world, helper_count)
+        route_features = (
+            (2 if unicast_destinations else 0)
+            | (4 if pair_destinations else 0)
+            | (8 if balanced_copy else 0)
+        )
+        # A rank copies at most its own S helper rows plus, as an owner, at
+        # most min(4 * S, H, 32) outgoing records of up to two receivers each.
+        outgoing_rows = (
+            2 * _owner_records(helper_count, self.home_count) if route_features else 0
+        )
         ctx = torch.ops.trtllm.moe_rebalance_tma_create(
-            helper_count * planes, tma_sm_count or 0, tma_warps or 0
+            (helper_count + outgoing_rows) * planes, tma_sm_count or 0, tma_warps or 0
         )
         try:
             target_count = sum(world // size for size in self.arena.group_sizes[1:])
             torch.ops.trtllm.moe_rebalance_tma_configure_gpu_plan(
                 ctx, world, rank, helper_count, planes,
                 global_expert_count, self.home_count, plan_stride,
-                len(self.arena.group_sizes), target_count, 6, plan_words, 0,
+                len(self.arena.group_sizes), target_count, _PLAN_ABI_VERSION, plan_words,
+                route_features,
                 {"plan": 0, "source": 1, "scatter": 2}[tma_route],
-                round(100 * self.tma_source_load_factor),
+                _BALANCED_PULL_COST if balanced_copy else round(100 * self.tma_source_load_factor),
                 list(self.arena.group_sizes),
                 list(self.arena.base.scatter_source_ptrs),
                 list(self.arena.group_destination_ptrs), [],
+                list(unicast_destinations),
+                list(pair_destinations),
                 [plane.nbytes for plane in bundle.planes],
             )
             config_names = (

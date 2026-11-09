@@ -128,6 +128,7 @@ public:
         int64_t planWords, int64_t routeFeatures, int64_t tmaRoute, int64_t tmaSourceLoadPercent,
         std::vector<int64_t> const& groupSizes, std::vector<int64_t> const& sourceTable,
         std::vector<int64_t> const& destinationTable, std::vector<int64_t> const& foreignDestinationTable,
+        std::vector<int64_t> const& unicastDestinationTable, std::vector<int64_t> const& pairDestinationTable,
         std::vector<int64_t> const& planeBytes)
     {
         std::lock_guard<std::mutex> lock(mMutex);
@@ -149,7 +150,7 @@ public:
             helperCountValue <= (std::numeric_limits<int>::max() - 25) / 7, "helper_count exceeds the GPU plan ABI");
         TORCH_CHECK(levelCountValue > 0 && targetCountValue >= 0,
             "level_count must be positive and target_count must be nonnegative");
-        TORCH_CHECK(targetCountValue <= 32 && (routeFeaturesValue == 0 || routeFeaturesValue == 1),
+        TORCH_CHECK(targetCountValue <= 32 && (routeFeaturesValue & ~MEGAMOE_TMA_GPU_PLAN_ROUTE_MASK) == 0,
             "target_count or route_features exceeds the GPU plan ABI");
         TORCH_CHECK(levelCountValue <= MEGAMOE_TMA_GPU_PLAN_MAX_LEVELS, "level_count exceeds the GPU plan ABI");
         TORCH_CHECK(
@@ -163,11 +164,26 @@ public:
 
         uint64_t const sourceCount = static_cast<uint64_t>(globalExpertsValue) * planesValue;
         uint64_t const destinationCount = static_cast<uint64_t>(levelCountValue) * helperCountValue * planesValue;
-        uint64_t const foreignCount
-            = routeFeaturesValue ? static_cast<uint64_t>(targetCountValue) * helperCountValue * planesValue : 0;
+        uint64_t const foreignCount = (routeFeaturesValue & MEGAMOE_TMA_GPU_PLAN_ROUTE_EXTERNAL)
+            ? static_cast<uint64_t>(targetCountValue) * helperCountValue * planesValue
+            : 0;
+        // Owner-direct unicast destinations: [receiver][helper][plane], 0 for this rank.
+        uint64_t const unicastCount = (routeFeaturesValue & MEGAMOE_TMA_GPU_PLAN_ROUTE_OWNER_UNICAST)
+            ? static_cast<uint64_t>(worldValue) * helperCountValue * planesValue
+            : 0;
         auto sources = checkedU64Vector(sourceTable, sourceCount, "source_table");
         auto destinations = checkedU64Vector(destinationTable, destinationCount, "destination_table");
         auto foreign = checkedU64Vector(foreignDestinationTable, foreignCount, "foreign_destination_table");
+        auto unicast = checkedU64Vector(unicastDestinationTable, unicastCount, "unicast_destination_table");
+        // Pair multicast destinations: [pair][helper][plane], 0 for a plane without a pair team.
+        TORCH_CHECK(!(routeFeaturesValue & MEGAMOE_TMA_GPU_PLAN_ROUTE_PAIR_MULTICAST)
+                || (routeFeaturesValue
+                    & (MEGAMOE_TMA_GPU_PLAN_ROUTE_OWNER_UNICAST | MEGAMOE_TMA_GPU_PLAN_ROUTE_BALANCED)),
+            "pair multicast needs owner-direct unicast or the balanced route");
+        uint64_t const pairCount = (routeFeaturesValue & MEGAMOE_TMA_GPU_PLAN_ROUTE_PAIR_MULTICAST)
+            ? static_cast<uint64_t>(worldValue / 2) * helperCountValue * planesValue
+            : 0;
+        auto pairs = checkedU64Vector(pairDestinationTable, pairCount, "pair_destination_table");
         auto bytes = checkedU64Vector(planeBytes, planesValue, "plane_bytes");
 
         MegamoeTmaGpuPlanConfig config{};
@@ -192,6 +208,8 @@ public:
         config.src_table = sources.data();
         config.dst_table = destinations.data();
         config.foreign_dst_table = foreign.empty() ? nullptr : foreign.data();
+        config.uc_dst_table = unicast.empty() ? nullptr : unicast.data();
+        config.pair_dst_table = pairs.empty() ? nullptr : pairs.data();
         config.plane_bytes = bytes.data();
 
         c10::cuda::CUDAGuard const deviceGuard(c10::Device(c10::DeviceType::CUDA, mDevice));
@@ -484,12 +502,13 @@ void moeRebalanceTmaConfigureGpuPlan(MoeRebalanceTmaStatePtr const& state, int64
     int64_t levelCount, int64_t targetCount, int64_t planAbiVersion, int64_t planWords, int64_t routeFeatures,
     int64_t tmaRoute, int64_t tmaSourceLoadPercent, std::vector<int64_t> const& groupSizes,
     std::vector<int64_t> const& sourceTable, std::vector<int64_t> const& destinationTable,
-    std::vector<int64_t> const& foreignDestinationTable, std::vector<int64_t> const& planeBytes)
+    std::vector<int64_t> const& foreignDestinationTable, std::vector<int64_t> const& unicastDestinationTable,
+    std::vector<int64_t> const& pairDestinationTable, std::vector<int64_t> const& planeBytes)
 {
     TORCH_CHECK(state, "moe rebalance TMA state is null");
     state->configureGpuPlan(world, rank, helperCount, planes, globalExperts, homeCount, ownerStride, levelCount,
         targetCount, planAbiVersion, planWords, routeFeatures, tmaRoute, tmaSourceLoadPercent, groupSizes, sourceTable,
-        destinationTable, foreignDestinationTable, planeBytes);
+        destinationTable, foreignDestinationTable, unicastDestinationTable, pairDestinationTable, planeBytes);
 }
 
 void moeRebalanceTmaBindGpuDirect(MoeRebalanceTmaStatePtr const& state, torch::Tensor ids, torch::Tensor levels,
@@ -584,7 +603,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int planes, int global_experts, int home_count, int owner_stride, int level_count, int target_count, "
         "int plan_abi_version, int plan_words, int route_features, int tma_route, int tma_source_load_percent, "
         "int[] group_sizes, int[] source_table, int[] destination_table, int[] foreign_destination_table, "
-        "int[] plane_bytes) -> ()");
+        "int[] unicast_destination_table, int[] pair_destination_table, int[] plane_bytes) -> ()");
     m.def(
         "moe_rebalance_tma_bind_gpu_direct("
         "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state, Tensor ids, Tensor levels, Tensor owners, "
