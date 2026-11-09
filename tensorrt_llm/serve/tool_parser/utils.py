@@ -14,6 +14,7 @@ from partial_json_parser.core.options import Allow
 
 
 def find_common_prefix(s1: str, s2: str) -> str:
+    """Return the longest common prefix of s1 and s2."""
     # Binary search on slice comparisons, which run in C, instead of building
     # the prefix one character at a time. Invariant: s1[:low] == s2[:low].
     low, high = 0, min(len(s1), len(s2))

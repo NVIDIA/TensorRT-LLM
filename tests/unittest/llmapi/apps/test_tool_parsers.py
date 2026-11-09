@@ -8388,6 +8388,7 @@ def test_parse_base_json_reports_the_name_as_emitted(sample_tools):
     ("abc", "abcdef", "abc"),
     ("abcdef", "abc", "abc"),
     ("abcx", "abcy", "abc"),
+    ("abcxxxx", "abcyyyy", "abc"),
     ("xabc", "yabc", ""),
     ('{"a": "\u00e9\u4e2d', '{"a": "\u00e9\u4e2d\U0001F600"}',
      '{"a": "\u00e9\u4e2d'),
