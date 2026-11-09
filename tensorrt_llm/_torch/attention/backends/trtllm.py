@@ -327,6 +327,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     num_sparse_topk: int = 0
 
     @property
+    def helix_spec_tokens_valid(self) -> bool:
+        return self._helix_spec_tokens_valid
+
+    @property
+    def uses_trtllm_gen_only_page_size(self) -> bool:
+        """Whether the KV page size is one only the trtllm-gen kernels outside the native op read."""
+        return self.tokens_per_block in getattr(
+            self.kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ())
+
+    @property
     def effective_workspace(self) -> Optional[torch.Tensor]:
         """Attention-kernel workspace, switching to the CUDA-graph copy under capture."""
         return self.cuda_graph_workspace if self.is_cuda_graph else self.workspace
@@ -1870,7 +1880,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                          quant_config, **kwargs)
         self.sparse_params = sparse_params
         self.kv_cache_dtype = kv_cache_dtype
-        self.use_fp8_ds_mla = kv_cache_dtype == "fp8_ds_mla"
+        self.use_fp8_ds_mla: bool = kv_cache_dtype == "fp8_ds_mla"
         self.is_mla_enable = mla_params is not None
         sparse_algorithm = getattr(self.sparse_params, "algorithm", None)
         if (self.is_mla_enable and sparse_algorithm in ("deepseek_v4", "dsa")
@@ -1953,6 +1963,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self._context_plan_counter_rows = 0
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
+
+    @property
+    def uses_dsa_sparse_mla(self) -> bool:
+        return getattr(self.sparse_params, "algorithm",
+                       None) in ("deepseek_v4", "dsa")
 
     @property
     def uses_fp4_mla_attention(self) -> bool:

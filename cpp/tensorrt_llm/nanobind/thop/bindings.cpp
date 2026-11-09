@@ -192,8 +192,16 @@ bool trtllmGenIsSupported(nb::handle source, bool isGen)
         {
             if (p.attn.is_mla_enable)
             {
+                if (!torch_ext::MLA::checkParams(p, isGen))
+                {
+                    return false;
+                }
                 auto& op = getOp<torch_ext::MLA>(p);
                 return op.isFmhaSupported(op.trtllmGen(), p, isGen);
+            }
+            if (!torch_ext::MHA::checkParams(p, isGen))
+            {
+                return false;
             }
             auto& op = getOp<torch_ext::MHA>(p);
             return op.isFmhaSupported(op.trtllmGen(), p, isGen);
@@ -243,8 +251,16 @@ bool fmhaV2IsSupported(nb::handle source, bool isGen)
         {
             if (p.attn.is_mla_enable)
             {
+                if (!torch_ext::MLA::checkParams(p, isGen))
+                {
+                    return false;
+                }
                 auto& op = getOp<torch_ext::MLA>(p);
                 return op.isFmhaSupported(op.fmhaV2(), p, isGen);
+            }
+            if (!torch_ext::MHA::checkParams(p, isGen))
+            {
+                return false;
             }
             auto& op = getOp<torch_ext::MHA>(p);
             return op.isFmhaSupported(op.fmhaV2(), p, isGen);
@@ -294,8 +310,16 @@ bool xqaIsSupported(nb::handle source, bool isGen)
         {
             if (p.attn.is_mla_enable)
             {
+                if (!torch_ext::MLA::checkParams(p, isGen))
+                {
+                    return false;
+                }
                 auto& op = getOp<torch_ext::MLA>(p);
                 return op.isFmhaSupported(op.xqa(), p, isGen);
+            }
+            if (!torch_ext::MHA::checkParams(p, isGen))
+            {
+                return false;
             }
             auto& op = getOp<torch_ext::MHA>(p);
             return op.isFmhaSupported(op.xqa(), p, isGen);
@@ -325,7 +349,7 @@ bool flashMlaIsSupported(nb::handle source, bool isGen)
     return callFmha(source,
         [isGen](torch_ext::FmhaParams& p)
         {
-            if (!p.attn.is_mla_enable)
+            if (!p.attn.is_mla_enable || !torch_ext::MLA::checkParams(p, isGen))
             {
                 return false;
             }
@@ -353,7 +377,7 @@ bool mmhaIsSupported(nb::handle source, bool isGen)
     return callFmha(source,
         [isGen](torch_ext::FmhaParams& p)
         {
-            if (p.attn.is_mla_enable)
+            if (p.attn.is_mla_enable || !torch_ext::MHA::checkParams(p, isGen))
             {
                 return false;
             }
@@ -381,7 +405,7 @@ bool unfusedIsSupported(nb::handle source, bool isGen)
     return callFmha(source,
         [isGen](torch_ext::FmhaParams& p)
         {
-            if (p.attn.is_mla_enable)
+            if (p.attn.is_mla_enable || !torch_ext::MHA::checkParams(p, isGen))
             {
                 return false;
             }

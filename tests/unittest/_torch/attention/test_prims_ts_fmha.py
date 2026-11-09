@@ -28,8 +28,8 @@ import tensorrt_llm._torch.attention.backends.prims_ts as prims_ts_package
 import tensorrt_llm._torch.attention.backends.prims_ts.context as prims_context_module
 import tensorrt_llm._torch.attention.backends.prims_ts.decode as prims_decode_module
 import tensorrt_llm._torch.attention.backends.prims_ts.mla_decode as prims_mla_module
+from tensorrt_llm._torch.attention.backends.fmha.fallback import NATIVE_FMHA_LIBS
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
-from tensorrt_llm._torch.attention.backends.fmha.native import NativeFmha
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
 from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
 from tensorrt_llm._torch.attention.backends.fmha.registry import get_enabled_fmha_lib_classes
@@ -785,7 +785,7 @@ def test_unsupported_cutlass_compiler_excludes_prims_ts_from_fmha_selection(
     ]
 
     assert available_classes
-    assert all(issubclass(fmha_cls, NativeFmha) for fmha_cls in available_classes)
+    assert all(fmha_cls in NATIVE_FMHA_LIBS for fmha_cls in available_classes)
     target_version.assert_called_once_with(min_version="13.3")
 
 

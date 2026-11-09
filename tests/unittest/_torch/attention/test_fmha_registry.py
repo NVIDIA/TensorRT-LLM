@@ -141,6 +141,7 @@ def test_registry_order_matches_native_priority(is_mla: bool, is_gen: bool) -> N
             and not (lib is FmhaV2Fmha and is_gen and not is_mla)
         ]
 
-    native_priority = fallback._MLA_LIBRARIES if is_mla else fallback._MHA_LIBRARIES
+    native_libraries = fallback._MLA_LIBRARIES if is_mla else fallback._MHA_LIBRARIES
+    native_priority = [library for library, _ in native_libraries]
     registry_order = [registry.FMHA_LIBS[name] for name in registry.FMHA_LIB_GROUPS["fallback"]]
     assert serving(registry_order) == serving(native_priority)

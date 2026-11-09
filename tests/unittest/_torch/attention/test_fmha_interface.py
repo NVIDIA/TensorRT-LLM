@@ -14,21 +14,20 @@
 # limitations under the License.
 
 from contextlib import nullcontext
-from types import SimpleNamespace
 from typing import cast
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from fmha_test_utils import FakeAttention
+from fmha_test_utils import FakeAttention, native_batch, native_forward_args
 
-from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+from tensorrt_llm._torch.attention.backends.fmha.fallback import NATIVE_FMHA_LIBS, FallbackFmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha, FmhaPhase
-from tensorrt_llm._torch.attention.backends.fmha.native import NativeFmha
 from tensorrt_llm._torch.attention.backends.fmha.registry import FMHA_LIBS
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
+    CustomAttentionMask,
 )
 from tensorrt_llm._torch.attention.backends.sparse.params import (
     BlockSparseForwardInputs,
@@ -49,43 +48,32 @@ class _MinimalFmha(Fmha):
         pass
 
 
+_NEEDS_GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+
+
+@_NEEDS_GPU
 @pytest.mark.parametrize(
-    "is_cross,update_kv_cache,expected",
-    [(False, False, False), (False, True, True), (True, False, True)],
+    "overrides,expected",
+    [
+        ({}, True),
+        ({"update_kv_cache": False}, False),
+        ({"is_fused_qkv": False}, False),
+        ({"attention_mask": CustomAttentionMask.CUSTOM}, False),
+    ],
+    ids=["fused", "no_kv_update", "separate_qkv", "custom_mask"],
 )
-def test_fallback_support_matches_thop_kv_update_contract(
-    is_cross: bool, update_kv_cache: bool, expected: bool
-) -> None:
-    attn = FakeAttention()
-    fmha = FallbackFmha(attn)
-    metadata = SimpleNamespace(is_cross=is_cross, helix_position_offsets=None, num_contexts=0)
-    forward_args = AttentionForwardArgs(is_fused_qkv=True, update_kv_cache=update_kv_cache)
-    assert fmha._is_call_supported(None, None, None, metadata, forward_args) is expected
+def test_fallback_support_follows_native_input_requirements(overrides, expected) -> None:
+    with native_batch(torch.bfloat16, num_contexts=1, num_generations=1) as (attn, metadata, qkv):
+        forward_args = native_forward_args(attn, metadata, qkv, **overrides)
+        assert FallbackFmha(attn).is_supported(qkv, None, None, metadata, forward_args) is expected
 
 
+@_NEEDS_GPU
 def test_fallback_rejects_raw_fp8_input() -> None:
-    attn = FakeAttention()
-    fmha = FallbackFmha(attn)
-    metadata = SimpleNamespace(is_cross=False, helix_position_offsets=None, num_contexts=0)
-    q = torch.empty((1, 128), dtype=torch.float8_e4m3fn)
-    assert not fmha._is_call_supported(
-        q, None, None, metadata, AttentionForwardArgs(is_fused_qkv=True)
-    )
-
-
-@pytest.mark.parametrize("mode", ["ordinary", "mla", "cross", "sage"])
-def test_fallback_separate_qkv_support(mode: str) -> None:
-    attn = FakeAttention()
-    attn.is_mla_enable = mode == "mla"
-    fmha = FallbackFmha(attn)
-    metadata = SimpleNamespace(
-        is_cross=mode == "cross", helix_position_offsets=None, num_contexts=0
-    )
-    forward_args = AttentionForwardArgs(
-        is_fused_qkv=False, sage_attn_num_elts_per_blk_q=2 if mode == "sage" else 0
-    )
-    q = torch.empty((1, 128), dtype=torch.bfloat16)
-    assert fmha._is_call_supported(q, q, q, metadata, forward_args) is (mode != "ordinary")
+    with native_batch(torch.bfloat16, num_contexts=1, num_generations=1) as (attn, metadata, qkv):
+        forward_args = native_forward_args(attn, metadata, qkv)
+        q = qkv.to(torch.float8_e4m3fn)
+        assert not FallbackFmha(attn).is_supported(q, None, None, metadata, forward_args)
 
 
 @pytest.mark.parametrize("initial_fused_qkv", [False, True])
@@ -176,7 +164,7 @@ def test_availability_checks_capabilities_before_implementation(
 ) -> None:
     attn = cast(TrtllmAttention, FakeAttention())
     attn.skip_correction_threshold = threshold
-    capability_supported = threshold == 0.0 or issubclass(fmha_cls, NativeFmha)
+    capability_supported = threshold == 0.0 or fmha_cls in NATIVE_FMHA_LIBS
 
     with patch.object(fmha_cls, "_is_available", return_value=implementation_available) as hook:
         assert fmha_cls.is_available(attn) is (capability_supported and implementation_available)

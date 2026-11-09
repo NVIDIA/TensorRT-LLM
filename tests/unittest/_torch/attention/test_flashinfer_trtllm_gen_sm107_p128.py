@@ -29,7 +29,7 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen as fi_mod
-from tensorrt_llm._torch.attention.backends.fmha import native
+from tensorrt_llm._torch.attention.backends.fmha.fallback import NATIVE_FMHA_LIBS
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionRuntimeFeatures,
     PredefinedAttentionMask,
@@ -100,7 +100,7 @@ def served(monkeypatch):
     for cls, name, key in (
         (fi_mod.FlashInferTrtllmGenFmha, "run_context", "fi_ctx"),
         (fi_mod.FlashInferTrtllmGenFmha, "run_generation", "fi_gen"),
-        (native.NativeFmha, "forward", "fallback"),
+        *((native_cls, "forward", "fallback") for native_cls in NATIVE_FMHA_LIBS),
     ):
         original = getattr(cls, name)
 

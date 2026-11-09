@@ -31,7 +31,7 @@ import torch
 from utils.block_causal_reference import exact_reference as _exact_reference
 from utils.block_causal_reference import reference_attention
 
-from tensorrt_llm._torch.attention.backends.fmha import NativeFmha
+from tensorrt_llm._torch.attention.backends.fmha import NATIVE_FMHA_LIBS
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention
@@ -258,7 +258,7 @@ def record_fmha_libraries(attn, served):
 
     def recording_select(*args, **kwargs):
         fmha = select(*args, **kwargs)
-        served.add("native" if isinstance(fmha, NativeFmha) else type(fmha).__name__)
+        served.add("native" if isinstance(fmha, NATIVE_FMHA_LIBS) else type(fmha).__name__)
         return fmha
 
     manager.select = recording_select

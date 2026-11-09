@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import fields
 from types import SimpleNamespace
-from typing import Mapping, Optional
+from typing import TYPE_CHECKING, Callable, Mapping, Optional
 
 import torch
 
@@ -27,17 +27,100 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PredefinedAttentionMask,
     RopeParams,
 )
+from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.logger import logger
 
 from ..sparse.params import SparseRuntimeParams
 from .flash_mla import FlashMlaFmha
 from .fmha_v2 import FmhaV2Fmha
+from .interface import FmhaPhase
 from .mmha import MmhaFmha
-from .native import NativeFmha
-from .phased import FmhaParams
+from .phased import FmhaParams, PhasedFmha
 from .trtllm_gen import TrtllmGenFmha
 from .unfused import UnfusedFmha
 from .xqa import XqaFmha
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention.backends.trtllm import (
+        TrtllmAttention,
+        TrtllmAttentionMetadata,
+    )
+
+
+def is_native_op_available(attn: "TrtllmAttention", *, serves_mha: bool, serves_mla: bool) -> bool:
+    """Whether a library of the native op serves this layer's attention variant."""
+    return serves_mla if attn.is_mla_enable else serves_mha
+
+
+def is_native_call_supported(
+    fmha: PhasedFmha,
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
+    metadata: "TrtllmAttentionMetadata",
+    forward_args: AttentionForwardArgs,
+    *,
+    phase: Optional[FmhaPhase],
+    serves_context: bool,
+    serves_generation: bool,
+    is_supported: Callable[[FmhaParams, bool], bool],
+) -> bool:
+    """Whether a library of the native op serves the call, or its requested phase.
+
+    Builds the parameters of each phase the call checks and asks ``is_supported`` about them;
+    the op checks its input requirements there.
+    """
+    if forward_args.output is None:
+        raise RuntimeError(f"{type(fmha).__name__} requires output.")
+    input_type = forward_args.attention_input_type
+    is_gen_only = input_type == AttentionInputType.generation_only
+    has_context = metadata.num_contexts > 0 and not is_gen_only
+    has_generation = metadata.num_generations > 0 and input_type != AttentionInputType.context_only
+    check_context = has_context and phase != FmhaPhase.GENERATION
+    check_generation = has_generation and phase != FmhaPhase.CONTEXT
+    if not (check_context or check_generation):
+        return False
+    if (check_context and not serves_context) or (check_generation and not serves_generation):
+        return False
+    workspace = metadata.effective_workspace
+    num_tokens = q.shape[0]
+    num_gen_tokens = num_tokens if is_gen_only else num_tokens - metadata.num_ctx_tokens
+    phase_num_gen_tokens = num_gen_tokens if has_generation else 0
+    if check_context:
+        num_contexts = metadata.num_contexts
+        params = fmha.context_params(
+            q,
+            k,
+            v,
+            metadata,
+            forward_args,
+            workspace,
+            0,
+            max_q_len=int(metadata.prompt_lens_cpu_runtime[:num_contexts].max()),
+            max_kv_len=int(metadata.kv_lens_runtime[:num_contexts].max()),
+            num_gen_tokens=phase_num_gen_tokens,
+        )
+        if not is_supported(params, False):
+            return False
+    if check_generation:
+        params = fmha.generation_params(
+            q, k, v, metadata, forward_args, workspace, 0, num_gen_tokens
+        )
+        if not is_supported(params, True):
+            return False
+    return True
+
+
+def warn_unsupported_sage_smoothing(forward_args: AttentionForwardArgs) -> None:
+    """The native op sizes and grows its workspace itself; it only lacks SageAttention V smoothing."""
+    if forward_args.sage_attn_smooth_v:
+        logger.warning_once(
+            "The attention op quantizes V without the V smoothing this SageAttention "
+            "recipe requests.",
+            key="fallback_fmha_sage_attn_smooth_v",
+        )
+
 
 _FORWARD_ARG_NAMES = frozenset(field.name for field in fields(AttentionForwardArgs))
 _SPARSE_ARG_NAMES = frozenset(field.name for field in fields(SparseRuntimeParams))
@@ -74,34 +157,34 @@ def _legacy_forward_args(
 
 # The native op's library priorities. They agree phase by phase with the registry order,
 # which serves both variants: fmha_v2 serves no MHA generation and XQA no context phase.
-_MHA_LIBRARIES: tuple[type[NativeFmha], ...] = (
-    TrtllmGenFmha,
-    FmhaV2Fmha,
-    XqaFmha,
-    MmhaFmha,
-    UnfusedFmha,
+_NativeLibrary = tuple[type[PhasedFmha], Callable[[FmhaParams, bool], bool]]
+_MHA_LIBRARIES: tuple[_NativeLibrary, ...] = (
+    (TrtllmGenFmha, thop.trtllm_gen_is_supported),
+    (FmhaV2Fmha, thop.fmha_v2_is_supported),
+    (XqaFmha, thop.xqa_is_supported),
+    (MmhaFmha, thop.mmha_is_supported),
+    (UnfusedFmha, thop.unfused_is_supported),
 )
-_MLA_LIBRARIES: tuple[type[NativeFmha], ...] = (
-    TrtllmGenFmha,
-    FlashMlaFmha,
-    XqaFmha,
-    FmhaV2Fmha,
+_MLA_LIBRARIES: tuple[_NativeLibrary, ...] = (
+    (TrtllmGenFmha, thop.trtllm_gen_is_supported),
+    (FlashMlaFmha, thop.flash_mla_is_supported),
+    (XqaFmha, thop.xqa_is_supported),
+    (FmhaV2Fmha, thop.fmha_v2_is_supported),
 )
 
 
-def _select_native_library(params: FmhaParams, is_gen: bool) -> type[NativeFmha]:
-    """The first native library that serves this phase call."""
-    libraries = _MLA_LIBRARIES if params.attn.is_mla_enable else _MHA_LIBRARIES
-    for library in libraries:
-        serves_phase = library.SERVES_GENERATION if is_gen else library.SERVES_CONTEXT
-        if serves_phase and library.native_is_supported(params, is_gen):
-            return library
-    raise RuntimeError(
-        f"No native FMHA library supports this {'generation' if is_gen else 'context'} call."
-    )
+class _FlatAttention(SimpleNamespace):
+    """The flat arguments of `FallbackFmha.attention` under the attention layer's attribute names."""
+
+    def out_head_size(self, is_gen_only: bool) -> int:
+        if not self.is_mla_enable:
+            return self.head_dim
+        if not is_gen_only:
+            return self.v_head_dim
+        return self.kv_lora_rank if self.rope_append else self.kv_lora_rank + self.qk_rope_head_dim
 
 
-class FallbackFmha(NativeFmha):
+class FallbackFmha(PhasedFmha):
     """The native libraries as one library: each phase call runs the first that serves it.
 
     The order is the native op's own priority for the layer's attention variant.
@@ -109,22 +192,82 @@ class FallbackFmha(NativeFmha):
 
     SERVES_CONTEXT = True
     SERVES_GENERATION = True
+    SERVES_MHA = True
+    SERVES_MLA = True
+    REQUIRES_PAGED_KV = False
+    # The native op consumes pool pointers directly; sparse managers may have
+    # no Role.KEY buffer from which to query a dense block extent.
+    NEEDS_BLOCK_EXTENT = False
+    supports_skip_correction = True
+    supports_workspace_reclamation = True
 
-    @staticmethod
-    def native_is_supported(params: FmhaParams, is_gen: bool) -> bool:
-        try:
-            _select_native_library(params, is_gen)
-        except RuntimeError:
-            return False
-        return True
+    def __init__(self, attn: "TrtllmAttention"):
+        super().__init__(attn)
+        libraries = _MLA_LIBRARIES if attn.is_mla_enable else _MHA_LIBRARIES
+        self._libraries = tuple(
+            (library(attn), is_supported) for library, is_supported in libraries
+        )
 
-    @staticmethod
-    def native_run_context(params: FmhaParams) -> None:
-        _select_native_library(params, False).native_run_context(params)
+    def _first_library(self, params: FmhaParams, is_gen: bool) -> Optional[PhasedFmha]:
+        """The first native library that serves this phase call, or None."""
+        for library, is_supported in self._libraries:
+            serves_phase = library.SERVES_GENERATION if is_gen else library.SERVES_CONTEXT
+            if serves_phase and is_supported(params, is_gen):
+                return library
+        return None
 
-    @staticmethod
-    def native_run_generation(params: FmhaParams) -> None:
-        _select_native_library(params, True).native_run_generation(params)
+    @classmethod
+    def _is_available(cls, attn: "TrtllmAttention") -> bool:
+        return is_native_op_available(attn, serves_mha=cls.SERVES_MHA, serves_mla=cls.SERVES_MLA)
+
+    def _is_supported(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        *,
+        phase: Optional[FmhaPhase] = None,
+    ) -> bool:
+        return is_native_call_supported(
+            self,
+            q,
+            k,
+            v,
+            metadata,
+            forward_args,
+            phase=phase,
+            serves_context=self.SERVES_CONTEXT,
+            serves_generation=self.SERVES_GENERATION,
+            is_supported=lambda params, is_gen: self._first_library(params, is_gen) is not None,
+        )
+
+    def prepare_workspace(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        workspace: torch.Tensor,
+    ) -> None:
+        warn_unsupported_sage_smoothing(forward_args)
+
+    def run_context(self, params: FmhaParams) -> None:
+        library = self._first_library(params, False)
+        if library is None:
+            raise RuntimeError("No native FMHA library supports this context call.")
+        library.run_context(params)
+
+    def run_generation(self, params: FmhaParams) -> None:
+        library = self._first_library(params, True)
+        if library is None:
+            raise RuntimeError("No native FMHA library supports this generation call.")
+        library.run_generation(params)
+
+    run_mla_context = run_context
+    run_mla_generation = run_generation
 
     @classmethod
     def attention(
@@ -301,7 +444,7 @@ class FallbackFmha(NativeFmha):
 
         # The native reader walks `attn` and `meta` by attribute name, so the flat
         # arguments are presented under the names the attention layer and metadata use.
-        attn = SimpleNamespace(
+        attn = _FlatAttention(
             layer_idx=local_layer_idx,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
@@ -334,6 +477,8 @@ class FallbackFmha(NativeFmha):
             quant_mode=quant_mode,
             attention_chunk_size=attention_chunk_size,
             get_local_layer_idx=lambda metadata: local_layer_idx,
+            uses_dsa_sparse_mla=False,
+            use_fp8_ds_mla=False,
         )
         meta = SimpleNamespace(
             max_num_requests=max_num_requests,
@@ -349,6 +494,8 @@ class FallbackFmha(NativeFmha):
             max_total_draft_tokens=spec_decoding_target_max_draft_tokens,
             trtllm_gen_jit_warmup=trtllm_gen_jit_warmup,
             helix_position_offsets=helix_position_offsets,
+            helix_spec_tokens_valid=False,
+            uses_trtllm_gen_only_page_size=False,
             helix_is_inactive_rank=helix_is_inactive_rank,
             kv_cache_block_offsets=kv_cache_block_offsets,
             block_ids_per_seq=block_ids_per_seq,
@@ -367,6 +514,8 @@ class FallbackFmha(NativeFmha):
             arguments,
             chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size or 1,
         )
+
+        fallback = cls(attn)
 
         def phase_params(token_lo: int, token_hi: int, seq_lo: int, seq_hi: int) -> FmhaParams:
             return FmhaParams(
@@ -417,7 +566,7 @@ class FallbackFmha(NativeFmha):
             params.max_past_kv_length = max_past_kv_len
             # The context call reserves the generation phase's workspace as well.
             params.num_gen_tokens = num_gen_tokens if has_generation else 0
-            cls.native_run_context(params)
+            fallback.run_context(params)
 
         if has_generation:
             params = phase_params(num_ctx_tokens, num_tokens, num_contexts, total_seqs)
@@ -429,4 +578,16 @@ class FallbackFmha(NativeFmha):
             )
             params.num_requests = num_generations // effective_beam_width
             params.num_gen_tokens = num_gen_tokens
-            cls.native_run_generation(params)
+            fallback.run_generation(params)
+
+
+# The libraries that run in the native attention op.
+NATIVE_FMHA_LIBS: tuple[type[PhasedFmha], ...] = (
+    FallbackFmha,
+    TrtllmGenFmha,
+    FlashMlaFmha,
+    XqaFmha,
+    FmhaV2Fmha,
+    MmhaFmha,
+    UnfusedFmha,
+)

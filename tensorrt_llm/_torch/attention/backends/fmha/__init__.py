@@ -15,7 +15,7 @@
 
 from .combined import CombinedFmha
 from .cute_dsl_mla import CuteDslMlaFmha
-from .fallback import FallbackFmha
+from .fallback import NATIVE_FMHA_LIBS, FallbackFmha
 from .flash_mla import FlashMlaFmha
 from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
@@ -26,7 +26,6 @@ from .interface import Fmha, FmhaPhase
 from .mmha import MmhaFmha
 from .msa_decode import MsaDecodeFmha
 from .msa_prefill import MsaPrefillFmha
-from .native import NativeFmha
 from .phased import FmhaParams, PhasedFmha
 from .prims_ts import PrimsTSFmha
 from .prims_ts_sparse_mla import PrimsTSSparseMlaFmha
@@ -62,7 +61,7 @@ __all__ = [
     "MmhaFmha",
     "MsaDecodeFmha",
     "MsaPrefillFmha",
-    "NativeFmha",
+    "NATIVE_FMHA_LIBS",
     "PhasedFmha",
     "PrimsTSFmha",
     "PrimsTSSparseMlaFmha",

@@ -31,13 +31,17 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-/// A feature: constructed from the key, prepared on every forward phase, and mapped onto
-/// a backend's parameter structs through `apply(KernelStruct&) const` overloads it
-/// declares for the structs it affects.
+/// A feature: checks a call's inputs before the op for its key is built, is constructed
+/// from the key, prepared on every forward phase, and mapped onto a backend's parameter
+/// structs through `apply(KernelStruct&) const` overloads it declares for the structs it
+/// affects.
 template <typename F>
 concept AttentionFeature
     = std::constructible_from<F, AttentionBase const&> && requires(F f, F const cf, FmhaParams const& p)
 {
+    {
+        F::checkParams(p, bool{})
+    } -> std::same_as<bool>;
     {
         f.prepare(p, bool{})
     } -> std::same_as<void>;
@@ -77,6 +81,21 @@ public:
         , mElemBits(kvElemBits(c))
         , mMla(c.is_mla_enable)
     {
+    }
+
+    /// Self-attention writes this call's K/V into the cache. Throws for a paged prefill on a
+    /// page size only the trtllm-gen kernels outside this op read.
+    [[nodiscard]] static bool checkParams(FmhaParams const& p, bool isGen)
+    {
+        if (!p.fwd.update_kv_cache && !p.is_cross)
+        {
+            return false;
+        }
+        TLLM_CHECK_WITH_INFO(isGen || !p.meta.use_paged_context_fmha || !p.meta.uses_trtllm_gen_only_page_size,
+            "The native attention op cannot serve paged prefill with %d-token KV pages. Use a supported TRTLLM-Gen "
+            "configuration or disable chunked prefill, KV reuse and speculative decoding.",
+            static_cast<int>(p.tokens_per_block));
+        return true;
     }
 
     void prepare(FmhaParams const& p, bool /*isGen*/)
@@ -238,6 +257,11 @@ public:
     {
     }
 
+    [[nodiscard]] static bool checkParams(FmhaParams const& p, bool /*isGen*/)
+    {
+        return static_cast<kernels::AttentionMaskType>(p.fwd.mask_type) != kernels::AttentionMaskType::CUSTOM_MASK;
+    }
+
     void prepare(FmhaParams const& /*p*/, bool isGen)
     {
         mActive = mEnabled && !isGen;
@@ -288,6 +312,17 @@ public:
         , mHopperLayout(mEnabled && tensorrt_llm::common::getSMVersion() == kernels::kSM_90 && mQkInt8 && mBlockQ == 2
               && mBlockK == 16 && mBlockV == 1)
     {
+    }
+
+    [[nodiscard]] static bool checkParams(FmhaParams const& /*p*/, bool /*isGen*/)
+    {
+        return true;
+    }
+
+    [[nodiscard]] static bool isRequested(FmhaParams const& p)
+    {
+        return p.fwd.sage_attn_num_elts_per_blk_q > 0 || p.fwd.sage_attn_num_elts_per_blk_k > 0
+            || p.fwd.sage_attn_num_elts_per_blk_v > 0;
     }
 
     void prepare(FmhaParams const& p, bool isGen)
@@ -368,6 +403,11 @@ public:
     {
     }
 
+    [[nodiscard]] static bool checkParams(FmhaParams const& /*p*/, bool /*isGen*/)
+    {
+        return true;
+    }
+
     void prepare(FmhaParams const& p, bool /*isGen*/)
     {
         TORCH_CHECK(!mFp4Out || p.fwd.output_sf.has_value(), "NVFP4 output requires output_sf.");
@@ -432,6 +472,11 @@ public:
         , mDim(static_cast<int>(c.rotary_embedding_dim))
         , mType(c.position_embedding_type)
     {
+    }
+
+    [[nodiscard]] static bool checkParams(FmhaParams const& /*p*/, bool /*isGen*/)
+    {
+        return true;
     }
 
     void prepare(FmhaParams const& p, bool /*isGen*/)
@@ -537,6 +582,11 @@ public:
     {
     }
 
+    [[nodiscard]] static bool checkParams(FmhaParams const& /*p*/, bool /*isGen*/)
+    {
+        return true;
+    }
+
     void prepare(FmhaParams const& p, bool /*isGen*/)
     {
         mBias = nullptr;
@@ -618,6 +668,11 @@ public:
         : mEnabled(c.cross_attention)
         , mKvCache(c.use_kv_cache)
     {
+    }
+
+    [[nodiscard]] static bool checkParams(FmhaParams const& /*p*/, bool /*isGen*/)
+    {
+        return true;
     }
 
     void prepare(FmhaParams const& p, bool /*isGen*/)
@@ -751,6 +806,15 @@ public:
     {
     }
 
+    /// A helix verify group may straddle a page boundary onto two CP ranks, so its KV
+    /// ownership is per token; the spec-dec mask and the per-sequence inactive-rank gate
+    /// assume the new entries are the trailing slots of one rank's history.
+    [[nodiscard]] static bool checkParams(FmhaParams const& p, bool isGen)
+    {
+        return !(isGen && p.meta.helix_position_offsets.has_value() && p.meta.helix_spec_tokens_valid
+            && p.num_tokens > p.batch_size);
+    }
+
     void prepare(FmhaParams const& p, bool isGen)
     {
         mIsSpecDecTree = p.meta.is_spec_dec_tree;
@@ -865,6 +929,11 @@ public:
     {
     }
 
+    [[nodiscard]] static bool checkParams(FmhaParams const& /*p*/, bool /*isGen*/)
+    {
+        return true;
+    }
+
     void prepare(FmhaParams const& p, bool /*isGen*/)
     {
         mActive = mEnabled;
@@ -922,6 +991,13 @@ public:
         : mRequested(c.use_sparse_attention)
         , mEnabled(c.use_sparse_attention && isTllmGenDevice())
     {
+    }
+
+    /// DSA sparse MLA with an fp8_ds_mla cache, or on SM120f, runs outside this op.
+    [[nodiscard]] static bool checkParams(FmhaParams const& p, bool /*isGen*/)
+    {
+        return !p.attn.uses_dsa_sparse_mla
+            || !(p.attn.use_fp8_ds_mla || tensorrt_llm::common::isSM120Family(tensorrt_llm::common::getSMVersion()));
     }
 
     void prepare(FmhaParams const& p, bool /*isGen*/)

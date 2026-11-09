@@ -477,15 +477,19 @@ the selected library.
 
 The native attention op exposes each of its kernel libraries as its own FMHA
 library: `TrtllmGenFmha`, `FlashMlaFmha`, `XqaFmha`, `FmhaV2Fmha`, `MmhaFmha`
-and `UnfusedFmha` (`fmha/trtllm_gen.py` and siblings, on the `NativeFmha` base
-in `fmha/native.py`). Each calls only its own entry points:
+and `UnfusedFmha` (`fmha/trtllm_gen.py` and siblings), each a `PhasedFmha` of
+its own; the checks they share are functions in `fmha/fallback.py`. Each calls
+only its own entry points:
 `thop.<library>_is_supported(params, is_gen)` and
 `thop.<library>_run_context` / `thop.<library>_run_generation` for the phases
 it serves. `FmhaManager` selects among them like any other library; one
 registry order serves MHA and MLA, because FMHA-v2 serves no MHA generation and
-XQA no context phase. `FallbackFmha` remains as a proxy that runs each phase on
-the first native library that serves it, in the op's original per-variant
-priority, for direct callers such as `FallbackFmha.attention`. The native
+XQA no context phase. `FallbackFmha` wraps them as one library that runs each
+phase on the first native library that serves it, in the op's original
+per-variant priority, for direct callers such as `FallbackFmha.attention`.
+`NATIVE_FMHA_LIBS` lists the wrapper and the libraries. `XqaFmha` judges its
+generation support at `max_seq_len`, so the choice holds for every KV history
+length that shares a selection cache key. The native
 carrier behind the entry points is per host thread and never visible to
 Python. Generated nanobind readers
 (`scripts/generate_fmha_params.py`) copy the fields C++ reads from `attn`,
@@ -501,10 +505,18 @@ every tensor reference so cached parameters never pin a layer's activations.
 Streams are not part of the key so CUDA graph capture reuses runners
 initialized during warmup.
 
-`NativeFmha._is_call_supported()` accepts separate Q/K/V only for MLA, cross
-attention, or SageAttention; self-attention requires KV-cache updates. It rejects
-raw FP8 E4M3 query input and custom masks. Keep this admission contract aligned
-with the native `AttentionOp` input requirements.
+The native op checks a call's inputs in the static `MHA::checkParams()` or
+`MLA::checkParams()`, which every `thop.<library>_is_supported` runs before it
+builds the op for the call's key; Python adds no checks of its own. `MHA`
+accepts separate Q/K/V only for cross attention or SageAttention, and `MLA`
+declines custom masks. Both then call `TrtllmAttention::checkFeatureParams()`,
+which declines raw FP8 E4M3 query input and runs the static `checkParams()`
+every `AttentionFeature` declares: `CustomMaskFeature` declines custom masks,
+`PagedKVCacheFeature` requires self-attention to update the KV cache and raises
+for a paged prefill on a page size the KV manager lists in
+`trtllm_gen_extra_tokens_per_block`, `SpecDecodingFeature` declines a helix
+verify group whose KV straddles CP ranks, and `SparseMlaFeature` declines DSA
+and DeepSeek-V4 sparse MLA with an `fp8_ds_mla` KV cache or on SM120f.
 
 `TLLM_FMHA_LIBS` controls the ordered selection. Dense PrimTS is opt-in because
 it may add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the
@@ -557,10 +569,9 @@ returning False. A False would let selection fall through to the generic
 no-library error (or, for a library that is not last in the registry, hand
 the request to a library that masks the broken configuration), while the
 raise names the cause and the remedy at dispatch. `Fp4MlaFmha` raises this
-way for FP4 MLA configurations only it can serve, and the native libraries
-raise to refuse paged-context FMHA on (SM, head_dim) combinations whose fused
-context kernel is proven absent, where selection would fall back to unfused
-attention and corrupt the cached prefix.
+way for FP4 MLA configurations only it can serve, and `UnfusedFmha` raises to
+refuse a paged-context call that no fused context kernel serves, which would
+otherwise corrupt the cached prefix.
 
 The FMHA package is split by role:
 
@@ -676,9 +687,9 @@ The FMHA package is split by role:
   cell (`generation_selection_cell`).
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
-- `fmha/native.py` holds the shared base of the native op's libraries, one per
-  module (`fmha/trtllm_gen.py`, `flash_mla.py`, `xqa.py`, `fmha_v2.py`,
-  `mmha.py`, `unfused.py`); `fmha/fallback.py` holds the proxy over them.
+- The native op's libraries live one per module (`fmha/trtllm_gen.py`,
+  `flash_mla.py`, `xqa.py`, `fmha_v2.py`, `mmha.py`, `unfused.py`);
+  `fmha/fallback.py` holds the checks they share and the wrapper over them.
 - `fmha/registry.py` owns `TLLM_FMHA_LIBS` parsing and library ordering.
 
 Use `PhasedFmha` for libraries that implement one or more phase-specific entry
@@ -724,9 +735,9 @@ chunk alone: the cached prefix is dropped from attention and then overwritten
 by the chunk's write-back, which turns a missing kernel into a plausible wrong
 answer rather than an error.
 
-`UnfusedFmha::runContext()` refuses a non-cross paged-context request, so an
-unsupported configuration fails at the first context call (normally during
-warmup), not at op construction. The check uses the exact Q/KV/output precision, mask type and
+`UnfusedFmha::isSupported()` refuses a non-cross paged-context request with an
+error, so an unsupported configuration fails when the first context call is
+selected (normally during warmup), not at op construction. The check uses the exact Q/KV/output precision, mask type and
 page size.
 
 The refusal has three distinct causes, each with its own message, and the

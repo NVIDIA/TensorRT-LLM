@@ -32,7 +32,9 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-/// The shared algorithm of a TensorRT-LLM attention op. `Derived` supplies four hooks:
+/// The shared algorithm of a TensorRT-LLM attention op. `Derived` supplies the static
+/// `checkParams(p, isGen)`, checked before the op for a call's key is built, which ends with
+/// `checkFeatureParams()`, and four hooks:
 /// `initContext()` and `initGeneration()`, run once before that phase's first launch;
 /// `prepareInputs(p, isGen)`, `enqueueContext(p, fmha)` and `enqueueGeneration(p, fmha)`,
 /// run every call. It also holds one member per FMHA library it can use, built with
@@ -105,6 +107,12 @@ protected:
     [[nodiscard]] Derived const& derived() const
     {
         return static_cast<Derived const&>(*this);
+    }
+
+    /// The checks every variant shares: the query dtype, then every feature's `checkParams()`.
+    [[nodiscard]] static bool checkFeatureParams(FmhaParams const& p, bool isGen)
+    {
+        return p.getQueryInput().scalar_type() != torch::kFloat8_e4m3fn && (Features::checkParams(p, isGen) && ...);
     }
 
     template <AttentionFeature F>
@@ -277,6 +285,14 @@ public:
     using PositionEmbeddingType = tensorrt_llm::kernels::PositionEmbeddingType;
     using AttentionMaskType = tensorrt_llm::kernels::AttentionMaskType;
 
+    /// Whether this op serves the call's inputs. Static, so a call it declines builds no op.
+    /// Separate Q/K/V input is read only by cross attention and SageAttention.
+    [[nodiscard]] static bool checkParams(FmhaParams const& p, bool isGen)
+    {
+        return (p.fwd.is_fused_qkv || p.is_cross || torch_ext::SageAttnFeature::isRequested(p))
+            && checkFeatureParams(p, isGen);
+    }
+
     // ---- hooks called by TrtllmAttention ----
     void initContext();
     /// Resolves the multi-block mode from the environment.
@@ -429,6 +445,13 @@ public:
     explicit MLA(AttentionBase const& key);
 
     using AttentionMaskType = tensorrt_llm::kernels::AttentionMaskType;
+
+    /// Whether this op serves the call's inputs. Static, so a call it declines builds no op.
+    [[nodiscard]] static bool checkParams(FmhaParams const& p, bool isGen)
+    {
+        return static_cast<AttentionMaskType>(p.fwd.mask_type) != AttentionMaskType::CUSTOM_MASK
+            && checkFeatureParams(p, isGen);
+    }
 
     // ---- hooks called by TrtllmAttention ----
     void initContext();

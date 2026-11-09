@@ -2440,7 +2440,20 @@ bool UnfusedFmha::isAvailable(AttentionBase const& key)
 
 bool UnfusedFmha::isSupported(FmhaParams const& p, bool isGen) const
 {
-    return !isGen;
+    if (isGen)
+    {
+        return false;
+    }
+    // Unfused self-attention cannot read a cached prefix. This library comes last, so the
+    // call has no fused context kernel: refuse it instead of dropping the prefix.
+    auto const& op = this->attention;
+    bool const needsFusedPagedContext = op.paged_context_fmha && op.use_kv_cache && !op.cross_attention;
+    TLLM_CHECK_WITH_INFO(!needsFusedPagedContext,
+        "Paged-context attention requires a fused context FMHA kernel, and this build has none for this "
+        "configuration. The unfused fallback cannot attend to cached KV. If the device's SM is not named in the "
+        "build's --cuda_architectures then the build carries no kernels for it at all; check that first. Otherwise "
+        "use another attention backend, or disable chunked prefill, KV cache reuse and speculative decoding.");
+    return true;
 }
 
 void UnfusedFmha::initContext(MHA const& op)
@@ -2494,13 +2507,6 @@ void UnfusedFmha::runContext(MHA const& op, FmhaParams const& p, cudaStream_t st
         "Cross attention without encoder K/V input requires a fused context FMHA kernel to read the "
         "cached cross KV, and this build has none for this configuration. Disable chunked prefill for "
         "this model, or use a build whose --cuda_architectures includes this device's SM.");
-    // Unfused self-attention cannot read a cached prefix.
-    bool const needsFusedPagedContext = op.paged_context_fmha && op.use_kv_cache && !op.cross_attention;
-    TLLM_CHECK_WITH_INFO(!needsFusedPagedContext,
-        "Paged-context attention requires a fused context FMHA kernel, and this build has none for this "
-        "configuration. The unfused fallback cannot attend to cached KV. If the device's SM is not named in the "
-        "build's --cuda_architectures then the build carries no kernels for it at all; check that first. Otherwise "
-        "use another attention backend, or disable chunked prefill, KV cache reuse and speculative decoding.");
     TLLM_CHECK_WITH_INFO(!op.sageAttnRequested() || op.useSageAttn(),
         "SageAttention requires the FP8 context FMHA path without KV caching and does not apply to MLA.");
     TLLM_CHECK_WITH_INFO(!op.useSageAttn(),
