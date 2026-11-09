@@ -787,6 +787,16 @@ def test_qwen3_5_vl_profile_ignores_moe_only_runtime_dimensions(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_version", [None, -1, 90, 100, 103, 120])
+def test_qwen3_5_vl_profile_qualifies_on_any_sm_version(sm_version: int | None) -> None:
+    """The BF16 profile pins no SM version, so the device architecture never blocks it."""
+    decision = _qualify_registry(runtime_config=_qwen3_5_vl_runtime_config(sm_version=sm_version))
+
+    assert decision.qualified
+    assert decision.profile.runtime_constraints.sm_versions is None
+
+
+@pytest.mark.cpu_only
 def test_qwen3_5_vl_config_realizes_mrope_rope_type(tmp_path: Path) -> None:
     """The production config normalizer leaves a text config that realizes `mrope`.
 

@@ -20,6 +20,8 @@ from tensorrt_llm._torch.distributed.allreduce_helper import force_all_reduce_de
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm.mapping import Mapping
 
+from ... import native_ops
+
 
 @dataclass(frozen=True)
 class IpcWorkspace:
@@ -109,12 +111,12 @@ def _bind_local(
         plain = frozenset(
             m
             for m in range(1, max_rows + 1)
-            if torch.ops.trtllm.glm_intra_node_reduce_supported(m, hidden, 4, False)
+            if native_ops.glm_intra_node_reduce_supported(m, hidden, 4, False)
         )
         finalize = frozenset(
             m
             for m in range(1, max_rows + 1)
-            if torch.ops.trtllm.glm_intra_node_reduce_supported(m, hidden, 4, True)
+            if native_ops.glm_intra_node_reduce_supported(m, hidden, 4, True)
         )
     if not plain or not finalize:
         raise ValueError("owned IPC kernels have no supported launch on this device")

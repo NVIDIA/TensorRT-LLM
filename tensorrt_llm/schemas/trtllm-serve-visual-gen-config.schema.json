@@ -46,13 +46,22 @@
               },
               "oneOf": [
                 {
-                  "$ref": "#/$defs/SkipSoftmaxAttentionConfig"
+                  "$ref": "#/$defs/SkipSoftmaxAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/VideoSparseAttentionConfig"
+                  "$ref": "#/$defs/VideoSparseAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 },
                 {
-                  "$ref": "#/$defs/SolAttentionConfig"
+                  "$ref": "#/$defs/SolAttentionConfig",
+                  "required": [
+                    "algorithm"
+                  ]
                 }
               ]
             },
@@ -1044,10 +1053,16 @@
           },
           "oneOf": [
             {
-              "$ref": "#/$defs/TeaCacheConfig"
+              "$ref": "#/$defs/TeaCacheConfig",
+              "required": [
+                "cache_backend"
+              ]
             },
             {
-              "$ref": "#/$defs/CacheDiTConfig"
+              "$ref": "#/$defs/CacheDiTConfig",
+              "required": [
+                "cache_backend"
+              ]
             }
           ]
         },

@@ -52,9 +52,6 @@ class MoEDep(str, Enum):
 class MoEEnvFlag(str, Enum):
     """Environment variables that MoE selection is allowed to read."""
 
-    #: Opt-in to the FlashInfer provider for quantized TRTLLM-Gen. Changes the
-    #: routing split, which is why load-balancer eligibility depends on it.
-    TRTLLM_GEN_USE_FLASHINFER = "TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER"
     #: Opt-in to folding the shared experts into the routed grouped GEMM.
     #: Collected rather than read from ``os.environ`` because it changes how
     #: many expert slots the GEMM builds: two ranks disagreeing on it would
@@ -143,12 +140,25 @@ _DEP_PROBES: Dict[MoEDep, DepProbe] = {
 
 # Preserve prior defaults when environment variables are unset.
 _ENV_FLAG_DEFAULTS: Dict[MoEEnvFlag, str] = {
-    MoEEnvFlag.TRTLLM_GEN_USE_FLASHINFER: "0",
     MoEEnvFlag.SHARED_EXPERT_FUSION: "0",
 }
 
+#: Removed in 1.4 (TRTLLM-17328); kept only to warn deployments that still
+#: export it, since setting it no longer changes which TRTLLM-Gen leaf runs.
+_REMOVED_TRTLLM_GEN_USE_FLASHINFER = "TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER"
+
 _CACHED_ENVIRONMENT: Optional[MoEEnvironment] = None
 _OVERRIDE_ENVIRONMENT: Optional[MoEEnvironment] = None
+
+
+def _warn_on_removed_env_flags() -> None:
+    if _REMOVED_TRTLLM_GEN_USE_FLASHINFER in os.environ:
+        logger.warning_once(
+            f"{_REMOVED_TRTLLM_GEN_USE_FLASHINFER} was removed and has no effect: "
+            "quantized TRTLLM-Gen MoE always runs the native TRT-LLM leaf, and the "
+            "unquantized FlashInfer leaf uses the native NVLinkTwoSided all-to-all.",
+            key=f"removed_env_{_REMOVED_TRTLLM_GEN_USE_FLASHINFER}",
+        )
 
 
 def _run_probe(dep: MoEDep, probe: DepProbe) -> bool:
@@ -186,6 +196,7 @@ def collect_moe_environment(force: bool = False) -> MoEEnvironment:
 
     from tensorrt_llm._utils import get_sm_version
 
+    _warn_on_removed_env_flags()
     available = tuple(
         sorted(dep.value for dep, probe in _DEP_PROBES.items() if _run_probe(dep, probe))
     )
