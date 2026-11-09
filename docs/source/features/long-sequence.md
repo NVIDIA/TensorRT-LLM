@@ -37,7 +37,7 @@ With chunked attention, the tokens in context requests are split into chunks of 
 
 Currently TensorRT LLM can only support chunked attention in llama4 model with TRTLLM attention backend. TensorRT LLM will read `attention_chunk_size` from the model config. If it is not None, the chunked attention will be enabled with chunk size `attention_chunk_size`. If you want to enable chunked attention to other models, you can set the `attention_chunk_size` in attention API to a valid value.
 
-Note that chunked attention can only be applied to context requests.
+On supported TRTLLM generation paths, chunked attention also applies during generation: generated tokens attend only within their current attention chunk.
 
 ## Sliding Window Attention
 
