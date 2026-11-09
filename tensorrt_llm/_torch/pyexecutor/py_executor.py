@@ -2488,12 +2488,12 @@ class PyExecutor:
 
         Call collectively after consuming profiling responses. Graph destruction
         precedes workspace release. Transfers drain before cache release, while
-        NIXL registrations remain until after the pools are unmapped. Model
+        deferred registrations are released after the pools are unmapped. Model
         engines, weights and the execution stream remain valid.
         """
         if self._closed or self._resources_released:
             raise RuntimeError("Executor resources are already released")
-        if not self._release_execution_resources(for_cache_replacement=True):
+        if not self._release_execution_resources():
             raise RuntimeError(
                 "Cannot release resources after an executor hang")
         self.resource_manager = None
@@ -2557,11 +2557,10 @@ class PyExecutor:
         if self.draft_model_engine is not None:
             del self.draft_model_engine
 
-    def _release_execution_resources(
-            self,
-            *,
-            release_model_owned_graphs: bool = False,
-            for_cache_replacement: bool = False) -> bool:
+    def _release_execution_resources(self,
+                                     *,
+                                     release_model_owned_graphs: bool = False
+                                     ) -> bool:
         """Stop execution and release GPU resources; retain model ownership."""
         if getattr(self, "_shutdown_runtime_complete", False):
             return self._release_execution_pools()
@@ -2654,18 +2653,13 @@ class PyExecutor:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         if self.kv_cache_transceiver is not None:
-            if for_cache_replacement:
-                self.kv_cache_transceiver.prepare_shutdown()
-            else:
-                self.kv_cache_transceiver.shutdown()
+            self.kv_cache_transceiver.prepare_shutdown()
         if self.resource_manager is not None:
             for manager in self.resource_manager.resource_managers.values():
                 if manager:
                     manager.shutdown()
-        if for_cache_replacement and self.kv_cache_transceiver is not None:
-            # Unmap pools before deregistration so the last registration
-            # reference immediately unpins them. UCX's shared GDRCopy cache
-            # otherwise defers unpinning until a later registration.
+        if self.kv_cache_transceiver is not None:
+            # Backends that defer deregistration release it after the pools.
             self.kv_cache_transceiver.shutdown()
         # Retry a later failure without repeating request publication, graph
         # release, or resource-manager shutdown.

@@ -532,12 +532,17 @@ class KvCacheTransceiver(ABC):
         """Stop transfers before cache release; keep registrations when supported.
 
         Backends without separate drain and deregistration phases shut down
-        completely here. A failure must leave the cache owned by the caller.
+        completely here. Raise if transfers may still access the cache; the caller
+        retains the cache and may retry.
         """
         self.shutdown()
 
     def shutdown(self) -> None:
-        """Shut down the transceiver and release registered resources."""
+        """Idempotently stop the transceiver and release registered resources.
+
+        May follow prepare_shutdown() after cache release, so completed
+        preparation must prevent further cache-memory access during shutdown.
+        """
 
 
 class BindKvCacheTransceiver(KvCacheTransceiver):

@@ -434,6 +434,7 @@ def test_transfer_drain_failure_keeps_cache_owned(executor):
 
     with pytest.raises(RuntimeError, match="DMA still active"):
         ex.release_resources()
+    assert "unregister" not in events
     assert "cache" not in events
     assert ex.resource_manager is manager
     assert slots.slot_manager.get_slot(17) is not None
@@ -461,3 +462,11 @@ def test_release_stops_pipeline_progress_before_gpu_teardown(executor):
     assert ex._pp_mpi_progress_quiesced.is_set()
     assert ex._mpi_progress_thread is None
     assert ex._mpi_progress_thread_exit_hook is None
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_both_release_paths_unmap_before_deregistration(executor, terminal):
+    """Profiling and terminal release must use the same two-phase order."""
+    ex, events = executor
+    assert ex._release_execution_resources(release_model_owned_graphs=terminal)
+    assert events.index("drain") < events.index("cache") < events.index("unregister")
