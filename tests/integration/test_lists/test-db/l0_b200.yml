@@ -279,7 +279,9 @@ l0_b200:
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL and not MEGAMOE_CUTEDSL"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM and not MEGAMOE_DEEPGEMM"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DENSEGEMM"
-  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_CUTEDSL"
+  # File-level -k: also runs test_configurable_moe_single_gpu_megamoe_cutedsl_chunked
+  # (NVFP4 forwards split by moe_max_num_tokens) in the same process.
+  - unittest/_torch/moe/test_moe_module.py -k "test_configurable_moe_single_gpu and MEGAMOE_CUTEDSL"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_DEEPGEMM"
   # ------------- MoE: FlashInfer & TRTLLM symbol collision tests ---------------
   - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
