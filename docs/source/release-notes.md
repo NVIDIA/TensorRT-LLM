@@ -35,6 +35,16 @@ All published functionality in the Release Notes has been fully tested and verif
   Grouped encoders must also include item metadata with exact output row counts
   in `get_dummy_mm_data()` results used for startup profiling. See the
   [multimodal developer guide](developer-guide/multimodal.md).
+- <span style="color: red">**[BREAKING CHANGE] One local media input policy for chat and VisualGen, and renamed variables.**</span>
+  A VisualGen reference sent over HTTP with `format="path"` is now read only when the server is
+  started with `TRTLLM_MEDIA_ALLOWED_INPUT_DIR=<directory>`, and only if it is a regular file inside
+  that directory, of at most 200 MiB, with at most 512 MiB across the `path` references of one
+  request; send a larger file as a multipart upload. Chat requests follow the same variable.
+  `TRTLLM_MEDIA_ALLOWED_LOCAL_PATH` is renamed to `TRTLLM_MEDIA_ALLOWED_INPUT_DIR`; the former
+  name is no longer read, so local paths are refused until the new one is set.
+  `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH` is renamed to `TRTLLM_MEDIA_DISABLE_PATH_RESPONSE`, which
+  accepts only `1`, `0` or empty. A VisualGen server refuses to start while `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH`
+  is set to anything other than `0` or empty; set `TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1` instead.
 
 ### Fixed Issues
 
