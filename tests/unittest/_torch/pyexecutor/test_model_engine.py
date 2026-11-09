@@ -42,7 +42,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
-from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
@@ -777,7 +777,7 @@ class ModelEngineTestCase(unittest.TestCase):
 
     @pytest.mark.cpu_only
     def test_runner_engine_shared_entries_skip_decoder_state(self) -> None:
-        runner = Mock(spec=NoKVCacheRunner)
+        runner = Mock(spec=MultimodalEncoderRunner)
         engine = object.__new__(ModelEngine)
         engine._runner = runner
         engine._torch_compile_backend = None
@@ -1128,10 +1128,10 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
         model_engine.moe_load_balancer = None
         model_engine._warmup_depth = 0
-        model_engine._runner = Mock(spec=NoKVCacheRunner)
+        model_engine._runner = Mock(spec=MultimodalEncoderRunner)
         runner = model_engine._runner
-        runner._validate_resources = NoKVCacheRunner._validate_resources.__get__(runner)
-        runner.warmup.side_effect = NoKVCacheRunner.warmup.__get__(runner)
+        runner._validate_resources = MultimodalEncoderRunner._validate_resources.__get__(runner)
+        runner.warmup.side_effect = MultimodalEncoderRunner.warmup.__get__(runner)
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = object()
 
@@ -1233,7 +1233,7 @@ def test_engine_passes_call_state_and_returns_length_update(
     is_dummy: bool,
     enable_spec_decode: bool,
 ) -> None:
-    runner = Mock(spec=NoKVCacheRunner)
+    runner = Mock(spec=MultimodalEncoderRunner)
     outputs = {"logits": object()}
     if effective_length is not None:
         outputs["runtime_draft_len"] = effective_length
@@ -1415,7 +1415,7 @@ def test_layerwise_nvtx_flag_controls_real_forward_markers(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("fails", [False, True])
 def test_warmup_restores_serving_state_after_success_or_failure(fails: bool) -> None:
-    runner = Mock(spec=NoKVCacheRunner)
+    runner = Mock(spec=MultimodalEncoderRunner)
     engine, resources = _model_engine_with_runner(runner, kv_cache_manager=None)
     engine._metrics = {}
     balancer = engine.moe_load_balancer = Mock()
