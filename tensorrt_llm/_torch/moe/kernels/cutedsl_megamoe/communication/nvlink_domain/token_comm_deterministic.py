@@ -565,6 +565,9 @@ class _MetadataPushRouter(KernelComponent):
             iket.range_pop()
 
             iket.range_push("router.prefix_and_publish")
+            # Ordinary stores wrote the counts; the bulk copy that publishes them reads them through the async proxy.
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.sync_threads()
             publish_sizes = self._broadcast_sizes_to_peers(
                 cute.make_tensor(totals.iterator, cute.make_layout((self.expert_count_padded,)))
             )
@@ -730,6 +733,8 @@ class _MetadataPushRouter(KernelComponent):
                     cta_histograms[cta_idx, expert] = running
                     running = running + count
                 totals[expert] = running
+        # Ordinary stores wrote the counts; the bulk copy that publishes them reads them through the async proxy.
+        cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.sync_threads()
 
         publish_sizes = self._broadcast_sizes_to_peers(totals)
@@ -939,6 +944,9 @@ class _MetadataPushRouter(KernelComponent):
         if self._router_thread_idx == Int32(0):
             while cute.arch.load(sizes_ready, Int32, sem="acquire", scope="sys") != Int32(self.raw_sizes_ready_target):
                 nanosleep(150)
+            # The acquire orders the peers' rows for the generic proxy only; the TMA load below reads them through the
+            # async proxy, so the issuing thread fences the two proxies in between.
+            cute.arch.fence_proxy("async.global")
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
         iket.range_pop()
@@ -2174,6 +2182,8 @@ class TokenCommDeterministic(KernelComponent):
 
         iket.range_push("token_in.wait_metadata_ready")
         self._router.wait_for_metadata_ready(self._device_workspace)
+        # The peers' token rows that this flag publishes are pulled with TMA (async proxy) by any lane of the warp.
+        cute.arch.fence_proxy("async.global")
         iket.range_pop()
 
         cute.arch.cp_async_wait_group(0)
@@ -2494,6 +2504,8 @@ class TokenCommDeterministic(KernelComponent):
                 iket.range_push("token_back.wait_fc2")
                 while cute.arch.load(fc2_done + local_expert, Int32, sem="acquire", scope="gpu") < completion_target:
                     nanosleep(500)
+                # The FC2 rows this counter publishes are read back with TMA (async proxy).
+                cute.arch.fence_proxy("async.global")
                 iket.range_pop()
 
             while next_dense_token < expert_valid_end:
