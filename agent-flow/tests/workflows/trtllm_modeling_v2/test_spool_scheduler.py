@@ -74,6 +74,7 @@ from agent_flow.workflows.trtllm_modeling_v2.run.startup import bootstrap as pre
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as c
 from agent_flow.workflows.trtllm_modeling_v2.run.validation.check_runner import CheckRunner
 from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
+from agent_flow.workflows.trtllm_modeling_v2.tune.measure import SpoolRunner
 
 from ._helpers import Script, _install, _state, healthy_smi
 
@@ -402,6 +403,83 @@ def test_a_cancelled_job_measured_nothing_and_says_so(_spool_scheduler_spool, se
     (result,) = results
     assert result.returncode == RC_CANCELLED and not result.timed_out
     assert result.infrastructure.startswith(CANCELLED)
+
+
+def _hold(root: Path, name: str, reason: str) -> None:
+    """``name`` queued on ``root``, held by its scheduler for ``reason`` (its ``status.json``)."""
+    (root / "pending" / f"{name}.sh").write_text("true\n")
+    snapshot = json.loads(SpoolPaths(root).snapshot.read_text())
+    snapshot["pending"] = [{"name": name, "reason": reason}]
+    _spool_sessions_write_json_atomic(SpoolPaths(root).snapshot, snapshot)
+
+
+@pytest.mark.usefixtures("_no_ambient_spool")
+def test_a_long_wait_on_a_gate_job_is_said_once_per_period(tmp_path):
+    """A gate queued past the period says so once, with the session's hold reason."""
+    gates = session(tmp_path, "gates-1")
+    hold = "the allocation ends in 4974s, too soon for a job allowed 7200s"
+    _hold(gates, "gate-core", hold)
+    lines: list[str] = []
+    waiting = threading.Thread(
+        target=spoolctl.wait_for_job,
+        args=(gates, "gate-core"),
+        kwargs={"poll_s": 0.01, "submitted_at": time.time() - 16 * 60, "note": lines.append},
+        daemon=True,
+    )
+    waiting.start()
+    deadline = time.time() + 10
+    while not lines and time.time() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.1)  # further polls inside the period say nothing more
+    (gates / "done" / "gate-core.rc").write_text("0\n")
+    waiting.join(timeout=10)
+    assert len(lines) == 1
+    assert lines[0].startswith(f"gate-core on {gates} queued since ")
+    assert lines[0].endswith(f"; held: {hold}")
+    # A wait shorter than the period says nothing; a status record that does not read, no line.
+    _hold(gates, "gate-quick", hold)
+    (gates / "done" / "gate-quick.rc").write_text("0\n")
+    spoolctl.wait_for_job(gates, "gate-quick", submitted_at=time.time() - 14 * 60, note=pytest.fail)
+    SpoolPaths(gates).snapshot.write_text('{"pending": [{"reason": "no name"}]}')
+    assert spoolctl.waiting_line(gates, "gate-core", time.time()) == ""
+
+
+@pytest.mark.usefixtures("_no_ambient_spool")
+def test_a_queued_job_names_what_runs_ahead_of_it_on_its_spool(tmp_path):
+    """A tune step sat 20 min behind a profiling job an agent had launched, and nothing said so."""
+    work = session(tmp_path, "work-1")
+    hold = "waiting for the whole node to drain"
+    _hold(work, "tune-t-sol", hold)
+    running = SpoolPaths(work).running
+    (running / "sol-profile.sh").write_text("true\n")
+    line = spoolctl.waiting_line(work, "tune-t-sol", time.time())
+    assert line.endswith(f"; held: {hold}; running there: sol-profile")
+    for name in ("a", "b", "c"):
+        (running / f"{name}.sh").write_text("true\n")
+    line = spoolctl.waiting_line(work, "tune-t-sol", time.time())
+    assert line.endswith("; running there: a, b, c and 1 more")
+
+
+@pytest.mark.usefixtures("_no_ambient_spool")
+def test_the_tune_runner_says_its_long_waits_at_most_once_per_period(tmp_path, monkeypatch):
+    monkeypatch.setattr(spoolctl, "WAIT_NOTE_S", 0.2)
+    work = session(tmp_path, "work-1")
+    lines: list[str] = []
+    runner = SpoolRunner([str(work)], prefix="tune", note=lines.append)
+    runner.submit(str(work), "t-sol", "true")
+    _hold(work, "tune-t-sol", "waiting for the whole node to drain")
+    runner.poll()
+    assert lines == []
+    time.sleep(0.25)
+    runner.poll()
+    runner.poll()
+    assert len(lines) == 1 and lines[0].startswith(f"tune-t-sol on {work} queued since ")
+    assert lines[0].endswith("; held: waiting for the whole node to drain")
+    (work / "done" / "tune-t-sol.rc").write_text("0\n")
+    assert [label for label, _, _ in runner.poll()] == ["t-sol"]
+    time.sleep(0.25)
+    runner.poll()
+    assert len(lines) == 1
 
 
 def _task(tmp_path):
@@ -958,6 +1036,22 @@ def test_the_gate_pool_skips_a_session_in_hand_over_for_one_that_can_take_the_jo
     executor = SpoolCommandExecutor(ending, pool=[ending, busy])
     gate = placement.JobNeeds(gpus=None, wall_s=None, holds_gpus=True)
     assert executor._pick(gate) == busy
+
+
+def test_gate_jobs_reach_any_sessions_but_not_work_ones():
+    """An `any` session on another spool shares the gates; a `work` one keeps to its workers."""
+    env = RunEnvironment(
+        "session_spool",
+        "/p",
+        spool="/s/main",
+        sessions=(
+            sessions.SessionSpec("shared", "/s/shared"),
+            sessions.SessionSpec("gates", "/s/gates", role="gates"),
+            sessions.SessionSpec("work", "/s/work", role="work"),
+        ),
+    )
+    executor = priority.select_command_executor(env)
+    assert executor.pool == [Path("/s/main"), Path("/s/shared"), Path("/s/gates")]
 
 
 def test_a_fresh_inode_leaves_a_mapped_library_untouched(tmp_path):

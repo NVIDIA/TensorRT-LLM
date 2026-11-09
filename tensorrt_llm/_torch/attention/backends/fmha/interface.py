@@ -49,6 +49,7 @@ class Fmha(ABC):
     # Serves a generation call whose QK-norm / RoPE / KV-append prologue the attention module deferred to the
     # library (``AttentionForwardArgs.kv_append.fold``): the query input is then the raw QKV projection.
     supports_deferred_prologue: ClassVar[bool] = False
+    supports_variable_window: ClassVar[bool] = False
 
     def __init__(self, attn: "TrtllmAttention"):
         self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)
@@ -139,6 +140,13 @@ class Fmha(ABC):
             return False
         if getattr(forward_args, "vc_attention", False) and not self.supports_vc_attention:
             logger.debug(f"{type(self).__name__} does not support VC-Attention.")
+            return False
+        has_variable_window = (
+            forward_args.variable_window_token_starts is not None
+            or forward_args.variable_window_token_ends is not None
+        )
+        if has_variable_window and not self.supports_variable_window:
+            logger.debug(f"{type(self).__name__} does not support variable-window attention.")
             return False
         return self._is_supported(q, k, v, metadata, forward_args, phase=phase)
 
