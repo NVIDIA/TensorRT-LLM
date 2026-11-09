@@ -57,7 +57,8 @@ def _video_content_type(suffix: str) -> str:
 # /v1/videos/{id} routes try when the stored output_path is missing.
 _KNOWN_VIDEO_OUTPUT_SUFFIXES = (".mp4", ".avi", ".safetensors", ".pt")
 
-# Reference fields whose multipart text form is a JSON object, not a scalar.
+# The reference fields of a video request. Their multipart text form is a JSON
+# object, not a scalar.
 _REFERENCE_FIELDS = ("image_reference", "video_reference", "audio_reference")
 
 
@@ -129,6 +130,16 @@ def _path_json_video_response(
     return JSONResponse(content={"id": video_id, "output_path": str(path)}, headers=headers)
 
 
+def _release_references(params: VisualGenParams) -> None:
+    """Drop the route's reference payloads once the engine holds its own copy.
+
+    ``generate_async`` snapshots ``params`` before it returns, so a job that
+    runs for minutes does not also keep the route's copy of its media.
+    """
+    for field in _REFERENCE_FIELDS:
+        setattr(params, field, None)
+
+
 class _VideoRoutesMixin:
     """Mixin providing the eight video-generation endpoints.
 
@@ -185,6 +196,7 @@ class _VideoRoutesMixin:
                 handle = await asyncio.to_thread(
                     self.generator.generate_async, request.prompt, params
                 )
+                _release_references(params)
                 output = await handle.aresult()
             except ValidationError as exc:
                 return self._render_pydantic_validation_error(exc)
@@ -446,6 +458,7 @@ class _VideoRoutesMixin:
             # Awaited before the 202, so bad media / unknown extra_params are a
             # 400 rather than a queued job that later fails.
             handle = await asyncio.to_thread(self.generator.generate_async, request.prompt, params)
+            _release_references(params)
 
             # Persist the queued job before scheduling the background task so
             # that a fast-completing task can always look it up in VIDEO_STORE.

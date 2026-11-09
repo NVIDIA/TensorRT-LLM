@@ -234,8 +234,11 @@ class MockVisualGen:
         self._req_counter = 0
         # Captured arguments of the most recent generate / generate_async call,
         # used by tests to assert forwarded VisualGenParams fields.
+        # ``last_params`` is the engine's snapshot; ``last_route_params`` is the
+        # object the route passed in, which the route may change afterwards.
         self.last_inputs = None
         self.last_params = None
+        self.last_route_params = None
         # Resolved reference bytes per slot, recorded at generation time.
         self.last_ref_bytes = {}
         # Stand-in for the coordinator-side executor proxy. The async video
@@ -294,6 +297,10 @@ class MockVisualGen:
 
     def generate_async(self, inputs=None, params=None) -> "MockVisualGenResult":
         self.last_inputs = inputs
+        self.last_route_params = params
+        # Mirror the engine: work on a snapshot, not the caller's object.
+        if params is not None:
+            params = params.model_copy(deep=True)
         self.last_params = params
         if self._validation_error is not None:
             raise self._validation_error
@@ -3622,6 +3629,58 @@ async def _wait_for(condition, timeout: float = 10.0):
     while not condition() and time.monotonic() < deadline:
         await asyncio.sleep(0.01)
     assert condition()
+
+
+def _path_reference_video_body(path: Path) -> dict:
+    return {
+        "prompt": "cat",
+        "size": "64x64",
+        "seconds": 1.0,
+        "fps": 8,
+        "image_reference": {"content": str(path), "format": "path"},
+    }
+
+
+def _write_reference_png(directory: Path) -> Path:
+    path = directory / "ref.png"
+    Image.new("RGB", (4, 4), (64, 64, 64)).save(str(path))
+    return path
+
+
+class TestPathReferenceRoutes:
+    """``format='path'`` references on the video routes."""
+
+    @pytest.fixture
+    def client(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        return _create_server(MockVisualGen(video_output=_make_dummy_video_tensor()))
+
+    @pytest.mark.parametrize("route", ["/v1/videos", "/v1/videos/sync"])
+    def test_a_path_reference_is_refused_without_an_input_dir(
+        self, client, tmp_path, monkeypatch, route
+    ):
+        monkeypatch.delenv("TRTLLM_MEDIA_ALLOWED_INPUT_DIR", raising=False)
+
+        resp = client.post(route, json=_path_reference_video_body(_write_reference_png(tmp_path)))
+
+        assert resp.status_code == 400, resp.text
+        assert client.mock_gen.last_inputs is None
+
+    @pytest.mark.parametrize("route", ["/v1/videos", "/v1/videos/sync"])
+    def test_a_path_reference_reaches_the_engine_as_bytes(
+        self, client, tmp_path, monkeypatch, route
+    ):
+        """The route reads the file and hands the engine its bytes, then drops
+        its own copy once the engine holds a snapshot."""
+        monkeypatch.setenv("TRTLLM_MEDIA_ALLOWED_INPUT_DIR", str(tmp_path))
+        path = _write_reference_png(tmp_path)
+
+        resp = client.post(route, json=_path_reference_video_body(path))
+
+        assert resp.status_code in (200, 202), resp.text
+        assert client.mock_gen.last_params.image_reference[0].format == "bytes"
+        assert client.mock_gen.last_ref_bytes["image_reference"] == [path.read_bytes()]
+        assert client.mock_gen.last_route_params.image_reference is None
 
 
 @pytest.mark.asyncio
