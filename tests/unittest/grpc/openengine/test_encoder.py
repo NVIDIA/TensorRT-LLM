@@ -321,3 +321,24 @@ def test_discard_rejects_foreign_and_malformed_references(tmp_path):
             cache.discard(malformed)
         assert len(list(tmp_path.glob("*.safetensors"))) == 1
     assert cache.discard(ref)
+
+
+@pytest.mark.parametrize("operation", ["discard", "prepare"])
+def test_recursive_decode_is_invalid_without_consuming_handoff(tmp_path, monkeypatch, operation):
+    cache = oe.EncoderCache(str(tmp_path))
+    llm, _ = model()
+    ref = cache.publish(native_result()[0], request(), llm)
+    malformed = pb.EncoderCacheRef(transfer_backend=oe.BACKEND, opaque_state=b"[" * 1024)
+
+    def fail_decode(_):
+        raise RecursionError("maximum recursion depth exceeded while decoding JSON")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(oe.json, "loads", fail_decode)
+        with pytest.raises(ValueError, match="invalid encoder cache reference"):
+            if operation == "discard":
+                cache.discard(malformed)
+            else:
+                cache.prepare(malformed, request(), llm, None)
+    assert len(list(tmp_path.glob("*.safetensors"))) == 1
+    assert cache.discard(ref)

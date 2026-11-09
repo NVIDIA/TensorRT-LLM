@@ -1050,6 +1050,10 @@ class AttentionForwardArgs:
     # consume the per-phase slice in ``FmhaParams.output``, not this full buffer.
     output: Optional[torch.Tensor] = None
     output_sf: Optional[torch.Tensor] = None
+    variable_window_token_starts: Optional[torch.Tensor] = cpp_field(
+        dtype=torch.int32)
+    variable_window_token_ends: Optional[torch.Tensor] = cpp_field(
+        dtype=torch.int32)
     kv_scale_orig_quant: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     kv_scale_quant_orig: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     out_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)

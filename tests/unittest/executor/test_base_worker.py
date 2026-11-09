@@ -19,9 +19,9 @@ from torch.multiprocessing.reductions import StorageWeakRef
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import \
     ExecutorRequestQueue
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.request_inputs import ExecutorRequest
 from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 from tensorrt_llm.bindings.executor import FinishReason
-from tensorrt_llm.bindings.executor import Request as ExecutorRequest
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
@@ -940,8 +940,9 @@ def test_enqueue_transfers_media_ownership(
     request_id = worker._enqueue_request(request)
     item = queue.request_queue.get_nowait()
     assert item.id == request_id
-    native = item.request
-    delta = native.py_multimodal_data["mrope_config"]["mrope_position_deltas"]
+    envelope = item.request
+    delta = envelope.inputs.multimodal_data["mrope_config"][
+        "mrope_position_deltas"]
     tensor_ref = weakref.ref(delta)
     storage_ref = StorageWeakRef(delta.untyped_storage())
     del delta
@@ -949,7 +950,7 @@ def test_enqueue_transfers_media_ownership(
     assert result._generation_request.multimodal_params is None
     assert torch.equal(tensor_ref(), torch.tensor([[7]], dtype=torch.int32))
     assert not storage_ref.expired()
-    native.py_multimodal_data = None
+    envelope.inputs.multimodal_data = None
     assert tensor_ref() is None
     assert storage_ref.expired()
 
@@ -964,9 +965,9 @@ def test_failed_enqueue_preserves_media_ownership(
     worker, request, queue = multimodal_enqueue_case
     original_params = request.multimodal_params
 
-    def failing_enqueue(native: ExecutorRequest) -> None:
+    def failing_enqueue(envelope: ExecutorRequest) -> None:
         if accept_first:
-            queue.enqueue_request(native)
+            queue.enqueue_request(envelope)
         raise RuntimeError("enqueue failed")
 
     worker.engine.enqueue_request = failing_enqueue
@@ -981,3 +982,61 @@ def test_failed_enqueue_preserves_media_ownership(
             original_params.multimodal_data)
     else:
         assert queue.request_queue.empty()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("ignore_eos", [False, True])
+@pytest.mark.parametrize("simple", [False, True])
+def test_worker_enqueues_serializable_python_input_envelope(
+        ignore_eos: bool, simple: bool) -> None:
+    import pickle
+
+    from tensorrt_llm._torch.pyexecutor.llm_request import \
+        executor_request_to_llm_request
+    from tensorrt_llm._torch.pyexecutor.request_inputs import ExecutorRequest
+    from tensorrt_llm.inputs.multimodal import MultimodalParams
+    from tensorrt_llm.sampling_params import LogprobMode
+
+    captured = []
+    worker = object.__new__(BaseWorker)
+    worker.doing_shutdown = True
+    worker._lora_manager = None
+    worker.max_seq_len = 20
+    worker.engine = SimpleNamespace(
+        is_generation_model=True,
+        enqueue_request=lambda request: captured.append(request) or 42)
+    request = GenerationRequest(
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(
+            max_tokens=2,
+            end_id=7,
+            ignore_eos=ignore_eos,
+            n=3,
+            top_k=10,
+            logprobs=0 if simple else 2,
+            logprobs_mode=LogprobMode.PROCESSED,
+            logprobs_simple_format=simple,
+            return_routed_experts=True,
+        ),
+        multimodal_params=MultimodalParams(
+            multimodal_data={"embedding": torch.ones(2, 4)}),
+        arrival_time=123.0,
+    ).set_id(11)
+
+    assert worker._enqueue_request(request) == 42
+    assert len(captured) == 1
+    envelope = captured[0]
+    assert isinstance(envelope, ExecutorRequest)
+    assert not hasattr(envelope.request, "py_logprobs_mode")
+    restored = pickle.loads(pickle.dumps(envelope))
+    parent = executor_request_to_llm_request(42, restored, [43, 44], False)
+    for translated in (parent, *parent.child_requests):
+        assert translated.py_client_id == 11
+        assert translated.py_original_end_id == 7
+        assert translated.py_end_id == (-1 if ignore_eos else 7)
+        assert translated.py_logprobs_mode == LogprobMode.PROCESSED
+        assert translated.py_logprobs_simple_format is simple
+        assert translated.py_num_logprobs == (0 if simple else 2)
+        assert translated.py_return_routed_experts
+        torch.testing.assert_close(translated.py_multimodal_data["embedding"],
+                                   torch.ones(2, 4))

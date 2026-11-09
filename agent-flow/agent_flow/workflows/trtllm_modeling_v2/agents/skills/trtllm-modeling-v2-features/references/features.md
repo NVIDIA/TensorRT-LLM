@@ -153,7 +153,7 @@ MLA entries `mla_rope_append_paged_kv_assign_q` and
 - `tests/unittest/_torch/pyexecutor/test_overlap_scheduler.py` (chunked prefill
   on with a 128-token budget, so one long request splits).
 - `tests/unittest/_torch/multimodal/test_multimodal_runtime.py::TestFindInputMmEmbed::test_chunked_prefill_scenario`.
-- `accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill`:
+- `accuracy/modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill`:
   the pattern -- a `max_num_tokens` below the few-shot prompt length, so every
   benchmark prompt splits.
 - `accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_chunked_prefill`.
@@ -490,7 +490,7 @@ statistics (`numAcceptedTokens`).
 
 **Tests to imitate.**
 - `tests/unittest/_torch/speculative/` (`test_eagle3.py`, `hw_agnostic/`).
-- `accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_mtp3_acceptance`:
+- `accuracy/modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_mtp3_acceptance`:
   one workload under `modeling_v2` `require` and `off`, iteration statistics on,
   `compute_acceptance_length` / `assert_acceptance_length`
   (`accuracy/accuracy_core.py`) against `accuracy/references/acceptance_length.yaml`,
