@@ -48,6 +48,15 @@ pytestmark = pytest.mark.cpu_only
 # ---------------------------------------------------------------------------
 
 
+_KV_RESULT_REPORT_TOKEN = b"report-token-123"
+
+
+def _publish_report_tokens(session, ranks=range(16)):
+    """Publish the per-writer report tokens that Receiver.dispatch_task mints."""
+    for task in getattr(session, "_kv_tasks", []):
+        task._kv_result_report_tokens = {int(r): _KV_RESULT_REPORT_TOKEN for r in ranks}
+
+
 def _make_params(rid: int = 42) -> DisaggregatedParams:
     return DisaggregatedParams(disagg_request_id=rid)
 
@@ -326,12 +335,14 @@ def test_process_kv_agent_result_resolves_task_by_receiver_slice_id():
     """The receiver resolves the task using its own slice id."""
     session = _make_rx_session(1)
     session._kv_tasks[0].expected_transfers = 1
+    _publish_report_tokens(session)
 
     session.process_kv_agent_result(
         peer_rank=0,
         receiver_slice_id=0,
         is_last_slice=True,
         status=AgentResult.SUCCESS,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
 
     assert session._kv_tasks[0].status == TaskStatus.TRANSFERRED
@@ -341,7 +352,7 @@ def test_process_kv_agent_result_rejects_unknown_receiver_slice_id():
     """Indexing is bounded by the receiver's own task count."""
     session = _make_rx_session(1)
 
-    with pytest.raises(AssertionError, match=r"receiver_slice_id=2"):
+    with pytest.raises(ValueError, match=r"receiver_slice_id=2"):
         session.process_kv_agent_result(
             peer_rank=0,
             receiver_slice_id=2,
