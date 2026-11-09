@@ -496,6 +496,42 @@ class TestCopyBasedRebalancing(unittest.TestCase):
         finally:
             arena.close()
 
+    def test_unreachable_target_is_attempted_once_per_recompute(self):
+        """One adjust() per target, also when the arena's clamping stops it.
+
+        The SWA group cannot shrink below the pages its active requests hold, so the target is not
+        reached; need_adjustment must still stay false (cooldown passed) until the target is
+        recomputed or set again.
+        """
+        arena = _Arena(drop_unreferenced=False, ratio=[0.4, 0.6], in_place=True)
+        try:
+            for seed in range(300, 360):
+                arena.live[seed] = (arena.add_request(seed, commit=False), _tokens(seed))
+            torch.cuda.synchronize()
+            pg_full = arena.pg_of_lc[arena.lcs[FULL_LAYER]]
+            target = [0.0, 0.0]
+            target[pg_full], target[1 - pg_full] = 0.99, 0.01
+            intro.set_num_sampled_kv_caches(arena.mgr, 1 << 20)
+            intro.set_last_adjustment_time(arena.mgr, 0.0)
+            intro.set_target_ratio_list_gpu(arena.mgr, target)
+            self.assertTrue(arena.mgr.need_adjustment)
+            arena.mgr.adjust()
+            torch.cuda.synchronize()
+            # The target was not reached: the SWA window still holds far more than 1% of the arena.
+            b, e = arena.windows()[1 - pg_full]
+            swa_lc = arena.lcs[SWA_LAYER]
+            self.assertGreater((e - b) * arena.slot_bytes[swa_lc] / QUOTA, 0.01 * 1.1)
+            intro.set_last_adjustment_time(arena.mgr, 0.0)  # cooldown passed
+            self.assertFalse(
+                arena.mgr.need_adjustment, "the same unreachable target was attempted again"
+            )
+            # A recompute, even to the same values, allows one more attempt.
+            intro.set_target_ratio_list_gpu(arena.mgr, target)
+            self.assertTrue(arena.mgr.need_adjustment)
+            arena.check_live(self)
+        finally:
+            arena.close()
+
     def test_drop_unreferenced(self):
         self._check_drop(in_place=False)
 
