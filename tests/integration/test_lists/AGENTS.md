@@ -24,12 +24,13 @@ Before editing `waives.txt` or changing a waived test-list entry, read the
 [waive matching rules](../../../docs/source/developer-guide/ci-overview.md#waiving-tests).
 
 - Whole-entry waives match exactly, including command-line arguments such as `-k`.
+  Omit `ISOLATION`, `TIMEOUT (N)`, and YAML comments from waive names.
   Recheck the corresponding waive when changing those arguments.
 - Inner unittest waives support case, function, class, and file matching, but
   not directory matching. A directory waive does not recursively skip its tests.
 - Choose platform scope explicitly: no `full:` prefix applies across platforms;
   `full:<platform>/` targets a CI test-prefix namespace; `full:sm<version>/`
   depends on the current pytest process detecting that SM on visible CUDA device 0.
-  For standard CPU stages use `full:CPU/`, not `full:sm0/`: an unavailable GPU or
-  failed device query also returns `0`. List multiple platforms on separate lines.
+  Use the actual stage prefix: `H100` is not an alias for `DGX_H100` or `H100_PCIe`.
+  For standard CPU stages use `full:CPU/`. List multiple platforms on separate lines.
 - Use the narrowest matching scope and include a bug link or brief reason.
