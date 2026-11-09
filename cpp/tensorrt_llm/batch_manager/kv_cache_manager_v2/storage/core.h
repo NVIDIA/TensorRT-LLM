@@ -775,12 +775,14 @@ public:
 
     // Addresses for all pools at a given slot id.
     TypedVec<PoolIndex, Address> slotAddress(SlotId slotId) const;
+
     // Address in one pool at a given slot id. A bound pool resolves the binding, which only this
     // overload leaves unrequested when the caller needs another pool (the id may not be bound).
     Address slotAddress(SlotId slotId, PoolIndex poolIdx) const
     {
         return mPools.at(poolIdx)->slotAddress(slotId);
     }
+
     // Sizes per pool.
     TypedVec<PoolIndex, size_t> slotSize() const;
 
@@ -890,12 +892,12 @@ public:
         PooledPhysMemAllocator& physMemAllocator, TypedVec<PoolIndex, bool> sparsity = {},
         HostMemBackingOptions const& hostOptions = {}, std::optional<size_t> sparseReservation = std::nullopt);
 
-
     //! Arena-backed group: each pool is a window into the arena at [arenaBase, arenaBase + arenaBytes).
     //! Pool 0's window is the group's; the others, all the same size, are bound pools. Device pools
     //! only; sparse (host-backed) pools are rejected by ArenaGpuCacheLevelStorage.
     GpuPoolGroup(TypedVec<PoolIndex, SlotWindow> const& poolWindows, SlotAllocator::Growth growth,
-        TypedVec<PoolIndex, size_t> const& slotSizeList, MemAddress arenaBase, size_t arenaBytes, size_t arenaGranularity);
+        TypedVec<PoolIndex, size_t> const& slotSizeList, MemAddress arenaBase, size_t arenaBytes,
+        size_t arenaGranularity);
 
     [[nodiscard]] CacheTier cacheTier() const noexcept override
     {

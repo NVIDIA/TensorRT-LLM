@@ -614,7 +614,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
 
         return convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
 
-    def _buffer_page_range(self, layer_idx: int, attn_type: DeepseekV4AttentionType) -> tuple[int, int]:
+    def _buffer_page_range(
+        self, layer_idx: int, attn_type: DeepseekV4AttentionType
+    ) -> tuple[int, int]:
         """Rows [first, last) of get_buffers(layer_idx, attn_type) that lie in its pool's current window.
 
         The view extends to get_page_index_upper_bound, which under copy-based rebalancing is the arena end,

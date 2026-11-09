@@ -142,7 +142,12 @@ class _Arena:
 
     def block_intact(self, seed: int, ordinal: int, layer: int, base_index: int) -> str | None:
         for role in BUFFERS[layer]:
-            if not bool((self.buffer_view(layer, role, base_index) == _pattern(seed, ordinal, layer, role)).all()):
+            if not bool(
+                (
+                    self.buffer_view(layer, role, base_index)
+                    == _pattern(seed, ordinal, layer, role)
+                ).all()
+            ):
                 return role
         return None
 
@@ -151,7 +156,9 @@ class _Arena:
     def add_request(self, seed: int, commit: bool) -> object:
         tokens = _tokens(seed)
         kv = self.mgr.create_kv_cache(input_tokens=tokens, id=seed)
-        self.bufs[seed] = {lc: np.full(BLOCKS_PER_REQUEST, -2, dtype=np.int32) for lc in self.lcs.values()}
+        self.bufs[seed] = {
+            lc: np.full(BLOCKS_PER_REQUEST, -2, dtype=np.int32) for lc in self.lcs.values()
+        }
         self.bind_bufs(seed, kv)
         assert kv.resume(self.stream), f"resume failed for request {seed}"
         assert kv.resize(len(tokens)), f"resize failed for request {seed}"
@@ -169,8 +176,10 @@ class _Arena:
             kv.set_base_page_index_buf(0, lc, memoryview(buf))
 
     def rebalance(self, target_ratio: list[float]):
-        """Force a rebalance to target_ratio (pool-group order): live requests are suspended
-        around adjust(), or stay active with in-place relocation."""
+        """Force a rebalance to target_ratio (pool-group order).
+
+        Live requests are suspended around adjust(), or stay active with in-place relocation.
+        """
         torch.cuda.synchronize()  # the executor's quiescence point
         if not self.in_place:
             for kv, _ in self.live.values():
@@ -190,7 +199,9 @@ class _Arena:
     def check_layout(self, tc: unittest.TestCase):
         spans = []
         for pg, pools in enumerate(intro.gpu_pool_windows(self.mgr)):
-            tc.assertEqual(len({e - b for b, e in pools}), 1, f"group {pg}: pools differ in slot count")
+            tc.assertEqual(
+                len({e - b for b, e in pools}), 1, f"group {pg}: pools differ in slot count"
+            )
             for pool, (b, e) in enumerate(pools):
                 s = self.pool_bytes[pg][pool]
                 spans.append((b * s, e * s, pg, pool))
@@ -212,8 +223,10 @@ class _Arena:
                 ids = [bindings[s] for s in range(b, e)]
                 tc.assertEqual(len(set(ids)), len(ids), f"layer {layer} {role}: duplicate bindings")
                 own = [w for w in pool_windows[pg] if w[0] <= ids[0] < w[1]]
-                tc.assertTrue(own and all(own[0][0] <= i < own[0][1] for i in ids),
-                              f"layer {layer} {role}: bound outside its pool's window")
+                tc.assertTrue(
+                    own and all(own[0][0] <= i < own[0][1] for i in ids),
+                    f"layer {layer} {role}: bound outside its pool's window",
+                )
 
     def page_range(self, layer: int, role: str) -> tuple[int, int]:
         """get_page_index_range, shifted for a PER_LAYER view as the DeepSeek-V4 cache manager does."""
@@ -233,28 +246,44 @@ class _Arena:
             for role in BUFFERS[layer]:
                 first, last = self.page_range(layer, role)
                 tc.assertLessEqual(last, self.mgr.get_page_index_upper_bound(layer, role))
-                pool = 0 if self.bindings(layer, role) is None else 1  # two pools per group; the second is bound
+                pool = (
+                    0 if self.bindings(layer, role) is None else 1
+                )  # two pools per group; the second is bound
                 b, e = pool_windows[pg][pool]
                 per_slot = self.pool_bytes[pg][pool] // self.mgr.get_page_stride(layer, role)
-                tc.assertLessEqual(last - first, (e - b) * per_slot, f"layer {layer} {role}: range wider than the window")
+                tc.assertLessEqual(
+                    last - first,
+                    (e - b) * per_slot,
+                    f"layer {layer} {role}: range wider than the window",
+                )
                 converter = self.mgr.get_page_index_converter(layer, role)
                 for seed, (kv, _) in self.live.items():
                     for slot in self.indices(kv)[lc]:
                         bindings = self.bindings(layer, role)
                         index = bindings[slot] if bindings is not None else slot
                         page = converter([index], PER_LAYER)[0]
-                        tc.assertTrue(first <= page < last,
-                                      f"layer {layer} {role}: page {page} outside the scanned range [{first}, {last})")
+                        tc.assertTrue(
+                            first <= page < last,
+                            f"layer {layer} {role}: page {page} outside the scanned range [{first}, {last})",
+                        )
         for seed, (kv, _) in self.live.items():
             for layer, lc in self.lcs.items():
                 idx = self.indices(kv)[lc]
-                tc.assertEqual(self.bufs[seed][lc].tolist(), idx[:BLOCKS_PER_REQUEST],
-                               f"req {seed} lc {lc}: bound page-index buffer is stale")
+                tc.assertEqual(
+                    self.bufs[seed][lc].tolist(),
+                    idx[:BLOCKS_PER_REQUEST],
+                    f"req {seed} lc {lc}: bound page-index buffer is stale",
+                )
                 b, e = windows[self.pg_of_lc[lc]]
                 for ordinal, slot in enumerate(idx):
-                    tc.assertTrue(b <= slot < e, f"req {seed} lc {lc} block {ordinal}: {slot} not in [{b}, {e})")
+                    tc.assertTrue(
+                        b <= slot < e,
+                        f"req {seed} lc {lc} block {ordinal}: {slot} not in [{b}, {e})",
+                    )
                     bad = self.block_intact(seed, ordinal, layer, slot)
-                    tc.assertIsNone(bad, f"req {seed} layer {layer} block {ordinal} at {slot}: {bad} corrupted")
+                    tc.assertIsNone(
+                        bad, f"req {seed} layer {layer} block {ordinal} at {slot}: {bad} corrupted"
+                    )
 
     def check_cached(self, tc: unittest.TestCase) -> int:
         """Count the cached blocks still matched; reuse them and check every buffer."""
@@ -275,7 +304,9 @@ class _Arena:
                     idx = self.indices(kv)[lc]
                     for ordinal in range(n):
                         bad = self.block_intact(seed, ordinal, layer, idx[ordinal])
-                        tc.assertIsNone(bad, f"cached req {seed} layer {layer} block {ordinal}: {bad} corrupted")
+                        tc.assertIsNone(
+                            bad, f"cached req {seed} layer {layer} block {ordinal}: {bad} corrupted"
+                        )
                 self.verified_cached_blocks += n
                 torch.cuda.synchronize()
             finally:
@@ -322,18 +353,24 @@ class TestCopyBasedRebalancingMultiPool(unittest.TestCase):
                 arena.check_live(self)
                 cached = arena.check_cached(self)
                 history.append((full_share, after, cached))
-                print(f"  full={full_share:.2f}: pool windows {after}, {cached} cached blocks matched")
-            print(f"  cached blocks read back: {arena.verified_cached_blocks}, "
-                  f"matched but not admitted: {arena.unverified_cached_blocks}")
+                print(
+                    f"  full={full_share:.2f}: pool windows {after}, {cached} cached blocks matched"
+                )
+            print(
+                f"  cached blocks read back: {arena.verified_cached_blocks}, "
+                f"matched but not admitted: {arena.unverified_cached_blocks}"
+            )
             self.assertGreater(arena.verified_cached_blocks, 20 * BLOCKS_PER_REQUEST)
             return history
         finally:
             arena.close()
 
     def test_bound_pools_reported(self):
-        """bound_pool_ids finds the pools that need get_page_index_bindings; the PyTorch KV cache
-        manager rejects copy-based rebalancing when they exist and the model's cache manager does
-        not translate them."""
+        """bound_pool_ids finds the pools that need get_page_index_bindings.
+
+        The PyTorch KV cache manager rejects copy-based rebalancing when they exist and the model's
+        cache manager does not translate them.
+        """
         from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
             KVCacheManagerV2,
             bound_pool_ids,
@@ -386,7 +423,9 @@ class TestCopyBasedRebalancingMultiPool(unittest.TestCase):
             for seed in range(3000, 3020):
                 arena.live[seed] = (arena.add_request(seed, commit=True), _tokens(seed))
             torch.cuda.synchronize()
-            host_used = sum(s.total - s.free for s in arena.mgr.get_storage_statistics(kvm.CACHE_LEVEL1))
+            host_used = sum(
+                s.total - s.free for s in arena.mgr.get_storage_statistics(kvm.CACHE_LEVEL1)
+            )
             self.assertGreater(host_used, 0, "nothing was offloaded to the host tier")
 
             # GPU rebalances move the bound pools (their bindings change), then one host rebalance.
@@ -413,15 +452,21 @@ class TestCopyBasedRebalancingMultiPool(unittest.TestCase):
                 for seed, (kv, _) in arena.live.items():
                     assert kv.resume(arena.stream)
                     arena.bind_bufs(seed, kv)
-            self.assertNotEqual(host_before, intro.slot_windows(arena.mgr, 1), "host windows did not move")
+            self.assertNotEqual(
+                host_before, intro.slot_windows(arena.mgr, 1), "host windows did not move"
+            )
             arena.check_live(self)
 
             # Onboarding the offloaded prefixes decodes into every pool, bound pools at their own ids.
             arena.mgr.get_and_reset_iteration_stats()
             matched = arena.check_cached(self)
-            onboarded = sum(d.iter_onboard_blocks for d in arena.mgr.get_and_reset_iteration_stats().values())
-            print(f"  host used {host_used}, matched {matched}, read back {arena.verified_cached_blocks}, "
-                  f"onboarded {onboarded}, not admitted {arena.unverified_cached_blocks}")
+            onboarded = sum(
+                d.iter_onboard_blocks for d in arena.mgr.get_and_reset_iteration_stats().values()
+            )
+            print(
+                f"  host used {host_used}, matched {matched}, read back {arena.verified_cached_blocks}, "
+                f"onboarded {onboarded}, not admitted {arena.unverified_cached_blocks}"
+            )
             self.assertGreater(onboarded, 0, "no block was onboarded from the host tier")
             self.assertGreater(arena.verified_cached_blocks, 0)
         finally:

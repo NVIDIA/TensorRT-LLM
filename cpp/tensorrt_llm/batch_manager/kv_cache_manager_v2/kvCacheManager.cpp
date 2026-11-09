@@ -16,7 +16,6 @@
  */
 
 #include "kv_cache_manager_v2/kvCacheManager.h"
-#include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/batch.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/exceptions.h"
@@ -24,6 +23,7 @@
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
 #include "kv_cache_manager_v2/utils/cudaContextScope.h"
+#include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/math.h"
 
 #include "tensorrt_llm/common/assert.h"
