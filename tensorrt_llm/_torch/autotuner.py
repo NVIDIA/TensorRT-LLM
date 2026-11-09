@@ -1103,6 +1103,8 @@ class AutoTuner:
         self._dist: Optional[Distributed] = None
         self._has_received_cache: bool = False
         self.mapping: Mapping = Mapping()
+        # Depth of this rank's _profile_runners_impl calls, which may run on this rank alone.
+        self._profiling_depth = 0
 
     @classmethod
     def get(cls):
@@ -1686,8 +1688,13 @@ class AutoTuner:
             scope.escape(input_tensors)
             if tuning_config.inputs_pre_hook is not None:
                 input_tensors = tuning_config.inputs_pre_hook(input_tensors)
-            return self._profile_runners_impl(custom_op, runners, input_tensors,
-                                              profile, tuning_config, **kwargs)
+            self._profiling_depth += 1
+            try:
+                return self._profile_runners_impl(custom_op, runners,
+                                                  input_tensors, profile,
+                                                  tuning_config, **kwargs)
+            finally:
+                self._profiling_depth -= 1
 
     def _profile_runners_impl(
         self,
@@ -2677,9 +2684,14 @@ class AutoTuner:
 
     def _needs_rank_agreement(self,
                               strategy: DistributedTuningStrategy) -> bool:
-        """Whether ranks must agree on cache hits under ``strategy``."""
+        """Whether ranks must agree on cache hits under ``strategy``.
+
+        Never for a choose_one() reached from a runner this rank is profiling:
+        under BROADCAST rank 0 profiles alone, so a collective there never
+        completes.
+        """
         return (strategy != DistributedTuningStrategy.INDEPENDENT
-                and self._is_distributed())
+                and self._is_distributed() and not self._profiling_depth)
 
     def _hit_on_all_ranks(self, is_cache_hit: bool) -> bool:
         """Whether ``is_cache_hit`` holds on every rank (host all-gather)."""
