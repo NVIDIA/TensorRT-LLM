@@ -1757,25 +1757,6 @@ def _update_kv_cache_draft_token_location(
 
 
 @maybe_compile(options={"max-autotune": True})
-def _copy_per_layer_block_offsets_compiled(
-    block_offsets: torch.Tensor,
-    copy_idx: torch.Tensor,
-    pool_ids: torch.Tensor,
-    scales: torch.Tensor,
-    layer_offsets: torch.Tensor,
-    output: torch.Tensor,
-) -> None:
-    """Write pool-root page indices for a batch without scratch slots."""
-    base = block_offsets[pool_ids[:, :, None], copy_idx[None, None, :], 0, :]
-    converted = torch.where(
-        base == BAD_PAGE_INDEX,
-        BAD_PAGE_INDEX,
-        base * scales[:, :, None, None] + layer_offsets[:, :, None, None],
-    )
-    output.copy_(converted.permute(0, 2, 1, 3))
-
-
-@maybe_compile(options={"max-autotune": True})
 def _copy_swa_block_offsets_with_scratch_compiled(
     block_offsets: torch.Tensor,
     copy_idx: torch.Tensor,
@@ -4546,9 +4527,18 @@ class KVCacheManagerV2(BaseResourceManager):
                 layer_offsets[local_layer_idx, role_idx] = int(converter.layer_offset)
                 scratch_pages[local_layer_idx, role_idx] = int(converter.scratch_pages_per_block)
 
+        # Lane ``layer * 2 + role`` of the attention-op tables, grouped by the
+        # base-table pool it reads: pool p owns
+        # pool_lanes[pool_lane_offsets[p] : pool_lane_offsets[p + 1]].
+        lane_pools = pool_ids.reshape(-1)
+        pool_lanes = torch.argsort(lane_pools, stable=True).to(dtype=torch.int32)
+        pool_lane_offsets = torch.zeros(self.num_pools + 1, dtype=torch.int32)
+        pool_lane_offsets[1:] = torch.cumsum(
+            torch.bincount(lane_pools, minlength=self.num_pools), dim=0
+        )
+
         staging_capacity = index_mapper_capacity * self.max_copy_beam_width
         device = torch.device("cuda", torch.cuda.current_device())
-        self._per_layer_host_tables_pinned = self.host_kv_cache_block_offsets.is_pinned()
         self._device_kv_cache_block_offsets_input = torch.empty_like(
             self.host_kv_cache_block_offsets,
             device=device,
@@ -4566,6 +4556,11 @@ class KVCacheManagerV2(BaseResourceManager):
             dtype=torch.long,
             device=device,
         )
+        self._device_copy_idx_int32_staging = torch.zeros(
+            staging_capacity,
+            dtype=torch.int32,
+            device=device,
+        )
         self._device_num_contexts = torch.empty((), dtype=torch.int32, device=device)
         self._device_attention_op_pool_ids = pool_ids.to(device=device)
         self._device_attention_op_scales = scales.to(device=device)
@@ -4573,6 +4568,8 @@ class KVCacheManagerV2(BaseResourceManager):
         self._device_attention_op_converters = torch.stack(
             (pool_ids.to(dtype=torch.int32), scales, layer_offsets), dim=-1
         ).to(device=device)
+        self._device_attention_op_pool_lanes = pool_lanes.to(device=device)
+        self._device_attention_op_pool_lane_offsets = pool_lane_offsets.to(device=device)
         self._device_attention_op_scratch_pages = scratch_pages.to(device=device)
         self._device_block_positions = torch.arange(
             self.max_blocks_per_seq,
@@ -4677,6 +4674,43 @@ class KVCacheManagerV2(BaseResourceManager):
             self._device_scratch_slots_staging,
         )
 
+    def _copy_per_layer_block_offsets(
+        self,
+        dst_tensor: torch.Tensor,
+        copy_idx: torch.Tensor,
+        num_seqs: int,
+        max_blocks: Optional[int],
+    ) -> None:
+        """Write the batch's per-layer tables for a step without scratch slots."""
+        num_blocks = self.max_blocks_per_seq if max_blocks is None else max_blocks
+        if self._page_table_materializer.uses_device_staging:
+            # The kernel cannot read the host table here, so it reads a device copy.
+            # Upload and kernel run on the current stream, where the scratch path
+            # also refills that device copy.
+            stream = torch.cuda.current_stream()
+            self._device_kv_cache_block_offsets_input.copy_(
+                self.host_kv_cache_block_offsets,
+                non_blocking=True,
+            )
+            source = self._device_kv_cache_block_offsets_input
+            rows = self._device_copy_idx_int32_staging[:num_seqs]
+            rows.copy_(copy_idx, non_blocking=True)
+        else:
+            # Both the table and IndexMapper's int32 row map are pinned host buffers.
+            stream = self._stream
+            source = self.host_kv_cache_block_offsets
+            rows = copy_idx
+        copy_per_layer_block_offsets_to_device(
+            source,
+            dst_tensor[: self.num_attention_op_pools],
+            rows,
+            self._device_attention_op_converters,
+            self._device_attention_op_pool_lane_offsets,
+            self._device_attention_op_pool_lanes,
+            num_blocks,
+            stream.cuda_stream,
+        )
+
     def _copy_batch_block_offsets_per_layer(
         self,
         dst_tensor: torch.Tensor,
@@ -4686,44 +4720,22 @@ class KVCacheManagerV2(BaseResourceManager):
         num_seqs: int,
         max_blocks: Optional[int],
     ) -> None:
-        has_scratch = num_contexts > 0 and any(
-            self.kv_cache_map[request_id].has_scratch_slots
-            for request_id in request_ids[:num_contexts]
-        )
-        if (
-            not has_scratch
-            and self._per_layer_host_tables_pinned
-            and not self._page_table_materializer.uses_device_staging
-        ):
-            # Both the table and IndexMapper's int32 row map are pinned host buffers.
-            # Gather only the batch's columns directly into the per-layer device table.
-            num_blocks = self.max_blocks_per_seq if max_blocks is None else max_blocks
-            if dst_tensor.shape[0] != self.num_attention_op_pools:
-                dst_tensor = dst_tensor[: self.num_attention_op_pools]
-            copy_per_layer_block_offsets_to_device(
-                self.host_kv_cache_block_offsets,
-                dst_tensor,
-                copy_idx,
-                self._device_attention_op_converters,
-                num_blocks,
-                self._stream.cuda_stream,
+        has_scratch = (
+            self.enable_swa_scratch_reuse
+            and num_contexts > 0
+            and any(
+                self.kv_cache_map[request_id].has_scratch_slots
+                for request_id in request_ids[:num_contexts]
             )
+        )
+        if not has_scratch:
+            self._copy_per_layer_block_offsets(dst_tensor, copy_idx, num_seqs, max_blocks)
             return
         device_copy_idx = self._copy_idx_to_device(copy_idx)
         self._device_kv_cache_block_offsets_input.copy_(
             self.host_kv_cache_block_offsets,
             non_blocking=True,
         )
-        if not has_scratch:
-            _copy_per_layer_block_offsets_compiled(
-                self._device_kv_cache_block_offsets_input[..., :max_blocks],
-                device_copy_idx[:num_seqs],
-                self._device_attention_op_pool_ids,
-                self._device_attention_op_scales,
-                self._device_attention_op_layer_offsets,
-                dst_tensor[: self.num_attention_op_pools, :num_seqs, :, :max_blocks],
-            )
-            return
         scratch_begs, scratch_ends, scratch_slots = self._copy_scratch_metadata_to_device(
             request_ids,
             num_contexts,

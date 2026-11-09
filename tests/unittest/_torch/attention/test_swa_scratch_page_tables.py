@@ -14,6 +14,9 @@ from tensorrt_llm._torch.memory_buffer_utils import Buffers
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
+from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
+    copy_per_layer_block_offsets_to_device,
+)
 from tensorrt_llm.llmapi.llm_args import EagleDecodingConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, GPU_LEVEL, PageIndexMode
@@ -212,8 +215,10 @@ def test_scratch_tables_match_core_converter_for_mixed_reordered_rows(
     assert saw_wraparound == long_context
     assert saw_invalid_scratch == long_context
     if not long_context:
-        for direct_host_copy in (manager._per_layer_host_tables_pinned, False):
-            manager._per_layer_host_tables_pinned = direct_host_copy
+        materializer = manager._page_table_materializer
+        native_staging = materializer.uses_device_staging
+        for staging in (native_staging, True):
+            materializer._use_device_staging = staging
             bounded = torch.full(
                 (
                     manager.num_attention_op_pools + 1,
@@ -233,6 +238,7 @@ def test_scratch_tables_match_core_converter_for_mixed_reordered_rows(
             assert torch.all(bounded[..., 3:] == -123)
             assert torch.all(bounded[manager.num_attention_op_pools :] == -123)
             assert torch.all(bounded[:, len(ids) :] == -123)
+        materializer._use_device_staging = native_staging
 
 
 @pytest.mark.parametrize("scratch, short", [(True, False), (False, True), (False, False)])
@@ -293,3 +299,86 @@ def test_final_physical_slot_is_inside_attention_extent_after_resize(
         assert saw_final_slot_with_offset
         for request in requests:
             manager.free_resources(request)
+
+
+def _group_lanes_by_pool(
+    lane_pools: torch.Tensor, num_pools: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    lanes = torch.argsort(lane_pools, stable=True).to(dtype=torch.int32)
+    offsets = torch.zeros(num_pools + 1, dtype=torch.int32)
+    offsets[1:] = torch.cumsum(torch.bincount(lane_pools, minlength=num_pools), dim=0)
+    return offsets, lanes
+
+
+@pytest.mark.parametrize("source_on_device", [False, True], ids=["pinned_host", "device"])
+def test_per_layer_copy_kernel_matches_reference(source_on_device: bool) -> None:
+    torch.manual_seed(0)
+    num_pools, rows, width, num_layers, max_blocks = 3, 7, 12, 5, 9
+    # Lane ``layer * 2 + role``: layer 3 keeps K and V in different pools, and
+    # pool 2 serves a single lane.
+    lane_pools = torch.tensor([0, 0, 1, 1, 0, 0, 1, 2, 0, 0])
+    source = torch.randint(0, 50, (num_pools, rows, 2, width), dtype=torch.int32)
+    source[torch.rand(source.shape) < 0.2] = BAD_PAGE_INDEX
+    copy_index = torch.tensor([5, 0, 3, 3], dtype=torch.int32)
+    scales = torch.randint(1, 4, (num_layers, 2), dtype=torch.int32)
+    layer_offsets = torch.randint(0, 3, (num_layers, 2), dtype=torch.int32)
+    converters = torch.stack(
+        (lane_pools.view(num_layers, 2).to(dtype=torch.int32), scales, layer_offsets), dim=-1
+    )
+    lane_offsets, lanes = _group_lanes_by_pool(lane_pools, num_pools)
+    output = torch.full((num_layers, 6, 2, width), -123, dtype=torch.int32, device="cuda")
+    copy_per_layer_block_offsets_to_device(
+        source.cuda() if source_on_device else source.pin_memory(),
+        output,
+        copy_index.cuda() if source_on_device else copy_index.pin_memory(),
+        converters.cuda(),
+        lane_offsets.cuda(),
+        lanes.cuda(),
+        max_blocks,
+        torch.cuda.current_stream().cuda_stream,
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.full((num_layers, 6, 2, width), -123, dtype=torch.int32)
+    for lane, pool in enumerate(lane_pools.tolist()):
+        layer, role = divmod(lane, 2)
+        base = source[pool, copy_index.long(), 0, :max_blocks]
+        expected[layer, : len(copy_index), role, :max_blocks] = torch.where(
+            base == BAD_PAGE_INDEX,
+            BAD_PAGE_INDEX,
+            base * scales[layer, role] + layer_offsets[layer, role],
+        )
+    assert (expected == BAD_PAGE_INDEX).any()
+    assert torch.equal(output.cpu(), expected)
+
+
+def test_per_layer_copy_kernel_rejects_malformed_inputs() -> None:
+    def tensor(*values_or_shape, shape=None) -> torch.Tensor:
+        if shape is not None:
+            return torch.zeros(shape, dtype=torch.int32, device="cuda")
+        return torch.tensor(values_or_shape, dtype=torch.int32, device="cuda")
+
+    well_formed = dict(
+        input=tensor(shape=(1, 2, 2, 4)),
+        output=tensor(shape=(1, 2, 2, 4)),
+        copy_index=tensor(0, 1),
+        converters=tensor(shape=(1, 2, 3)),
+        pool_lane_offsets=tensor(0, 2),
+        pool_lanes=tensor(0, 1),
+        max_blocks=4,
+        stream=torch.cuda.current_stream().cuda_stream,
+    )
+    copy_per_layer_block_offsets_to_device(**well_formed)
+    torch.cuda.synchronize()
+
+    malformed = [
+        ({"copy_index": tensor(0, 1).long()}, "copy_index must contain int32"),
+        ({"max_blocks": 5}, "max_blocks 5 exceeds the table width"),
+        ({"output": tensor(shape=(1, 2, 2, 8))}, "block widths must match"),
+        ({"pool_lanes": tensor(0)}, "pool_lanes must list every output K/V lane"),
+        ({"pool_lane_offsets": tensor(0)}, "pool_lane_offsets must hold"),
+        ({"output": tensor(shape=(1, 1, 2, 4))}, "at least one row per copy_index entry"),
+    ]
+    for overrides, message in malformed:
+        with pytest.raises(RuntimeError, match=message):
+            copy_per_layer_block_offsets_to_device(**{**well_formed, **overrides})
