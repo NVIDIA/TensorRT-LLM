@@ -690,3 +690,25 @@ def test_build_managers_legacy_estimation_keeps_whole_v2_profiling_budget(monkey
     ]
     assert target.max_gpu_total_bytes == draft.max_gpu_total_bytes == 10 * GB
     assert target.host_cache_size == draft.host_cache_size == 2 * GB
+
+
+def test_estimation_drops_the_host_tier():
+    """The estimation managers do not get the host_cache_size split, so they get no host tier.
+
+    configure_kv_cache_capacity() restores the user's value for the final managers.
+    """
+    c = object.__new__(KvCacheCreator)
+    c._kv_cache_config = KvCacheConfig(host_cache_size=64 * GB)
+    c._skip_est = False
+    c._mapping = Mock(cp_config={})
+    c._model_engine = Mock()
+    c._model_engine.model.model_config = SimpleNamespace(
+        attn_backend="TRTLLM", is_encoder_decoder=False
+    )
+    c._get_token_num_for_estimation = Mock(return_value=4096)
+    c._max_seq_len = 1024
+    c._is_kv_cache_manager_v2 = False
+
+    assert c.try_prepare_estimation()
+    assert c._kv_cache_config.host_cache_size == 0
+    assert c._kv_cache_config.max_tokens == 4096

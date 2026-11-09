@@ -654,6 +654,7 @@ class KvCacheCreator:
         self._max_kv_tokens_in = self._kv_cache_config.max_tokens
         self._max_gpu_total_bytes_in = self._kv_cache_config.max_gpu_total_bytes
         self._pool_ratio_in = self._kv_cache_config.pool_ratio
+        self._host_cache_size_in = self._kv_cache_config.host_cache_size
         self._avg_seq_len_in = self._kv_cache_config.avg_seq_len
         self._max_num_tokens = max_num_tokens
         self._max_beam_width = max_beam_width
@@ -1249,6 +1250,12 @@ class KvCacheCreator:
             # for estimation, then restore it in configure_kv_cache_capacity().
             self._kv_cache_config.pool_ratio = None
             self._kv_cache_config.avg_seq_len = self._max_seq_len
+            # The estimation pass sizes GPU memory only. Its temporary target and
+            # draft managers do not get the host_cache_size split, so each would
+            # pin the full host tier (2x per rank with a separate draft pool) and
+            # can exhaust node RAM. No host tier during estimation;
+            # configure_kv_cache_capacity() restores it.
+            self._kv_cache_config.host_cache_size = 0
             if self._is_kv_cache_manager_v2:
                 free_mem, _ = torch.cuda.mem_get_info()
                 max_gpu_total_bytes = int(
@@ -1434,6 +1441,7 @@ class KvCacheCreator:
         # user-provided configuration.
         self._kv_cache_config.pool_ratio = self._pool_ratio_in
         self._kv_cache_config.avg_seq_len = self._avg_seq_len_in
+        self._kv_cache_config.host_cache_size = self._host_cache_size_in
 
         sparse_algorithm = getattr(self._sparse_attention_config, 'algorithm',
                                    None)
