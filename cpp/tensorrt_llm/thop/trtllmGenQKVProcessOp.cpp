@@ -25,6 +25,7 @@
 #include "tensorrt_llm/thop/attentionOp.h"
 #include "tensorrt_llm/thop/trtllmGenFusedOps.h"
 #include <ATen/cuda/CUDAContext.h>
+#include <bit>
 #include <optional>
 #include <torch/extension.h>
 #include <tuple>
@@ -414,16 +415,16 @@ trtllmGenContextPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, tor
         {
         case tensorrt_llm::DataType::kFLOAT:
             tensorrt_llm::kernels::invokeQKVPreprocessing(
-                reinterpret_cast<QKVPreprocessingParams<float, KVBlockArray>&>(qkvParams), stream);
+                std::bit_cast<QKVPreprocessingParams<float, KVBlockArray>>(qkvParams), stream);
             break;
         case tensorrt_llm::DataType::kHALF:
             tensorrt_llm::kernels::invokeQKVPreprocessing(
-                reinterpret_cast<QKVPreprocessingParams<half, KVBlockArray>&>(qkvParams), stream);
+                std::bit_cast<QKVPreprocessingParams<half, KVBlockArray>>(qkvParams), stream);
             break;
 #ifdef ENABLE_BF16
         case tensorrt_llm::DataType::kBF16:
             tensorrt_llm::kernels::invokeQKVPreprocessing(
-                reinterpret_cast<QKVPreprocessingParams<__nv_bfloat16, KVBlockArray>&>(qkvParams), stream);
+                std::bit_cast<QKVPreprocessingParams<__nv_bfloat16, KVBlockArray>>(qkvParams), stream);
             break;
 #endif
         default: TORCH_CHECK(false, "Unsupported data type for QKV preprocessing.");
@@ -566,16 +567,16 @@ void trtllmGenContextPostprocess(torch::Tensor qkv_input, torch::Tensor workspac
         {
         case tensorrt_llm::DataType::kFLOAT:
             tensorrt_llm::kernels::invokeKvCachePostprocessing(
-                reinterpret_cast<QKVPreprocessingParams<float, KVBlockArray>&>(qkvParams), stream);
+                std::bit_cast<QKVPreprocessingParams<float, KVBlockArray>>(qkvParams), stream);
             break;
         case tensorrt_llm::DataType::kHALF:
             tensorrt_llm::kernels::invokeKvCachePostprocessing(
-                reinterpret_cast<QKVPreprocessingParams<half, KVBlockArray>&>(qkvParams), stream);
+                std::bit_cast<QKVPreprocessingParams<half, KVBlockArray>>(qkvParams), stream);
             break;
 #ifdef ENABLE_BF16
         case tensorrt_llm::DataType::kBF16:
             tensorrt_llm::kernels::invokeKvCachePostprocessing(
-                reinterpret_cast<QKVPreprocessingParams<__nv_bfloat16, KVBlockArray>&>(qkvParams), stream);
+                std::bit_cast<QKVPreprocessingParams<__nv_bfloat16, KVBlockArray>>(qkvParams), stream);
             break;
 #endif
         default: TORCH_CHECK(false, "Unsupported data type for KV cache postprocessing.");
@@ -752,16 +753,16 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
         {
         case tensorrt_llm::DataType::kFLOAT:
             tensorrt_llm::kernels::invokeQKVPreprocessing(
-                reinterpret_cast<QKVPreprocessingParams<float, KVBlockArray>&>(qkvParams), stream);
+                std::bit_cast<QKVPreprocessingParams<float, KVBlockArray>>(qkvParams), stream);
             break;
         case tensorrt_llm::DataType::kHALF:
             tensorrt_llm::kernels::invokeQKVPreprocessing(
-                reinterpret_cast<QKVPreprocessingParams<half, KVBlockArray>&>(qkvParams), stream);
+                std::bit_cast<QKVPreprocessingParams<half, KVBlockArray>>(qkvParams), stream);
             break;
 #ifdef ENABLE_BF16
         case tensorrt_llm::DataType::kBF16:
             tensorrt_llm::kernels::invokeQKVPreprocessing(
-                reinterpret_cast<QKVPreprocessingParams<__nv_bfloat16, KVBlockArray>&>(qkvParams), stream);
+                std::bit_cast<QKVPreprocessingParams<__nv_bfloat16, KVBlockArray>>(qkvParams), stream);
             break;
 #endif
         default: TORCH_CHECK(false, "Unsupported data type for QKV preprocessing.");
