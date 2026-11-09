@@ -108,3 +108,15 @@ def test_cancelling_a_queued_request_finishes_it(monkeypatch):
         finished = [future.result(timeout=60).outputs[0].finish_reason for future in futures]
 
     assert finished == ["length"] * 49 + ["cancelled"]
+
+
+def test_startup_metrics_report_model_loading_and_executor_phases():
+    with _llm() as llm:
+        metrics = llm.startup_metrics
+
+    assert {
+        "scheduled_encoder_creation_seconds",
+        "worker_start_seconds",
+        "total_py_executor_creation_seconds",
+    } <= metrics["py_executor"].keys()
+    assert metrics["model_loader"]

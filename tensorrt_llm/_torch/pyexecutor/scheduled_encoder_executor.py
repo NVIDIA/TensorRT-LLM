@@ -23,18 +23,8 @@ from tensorrt_llm.executor.utils import check_prompt_capacity
 from tensorrt_llm.llmapi.utils import _reapply_current_thread_affinity_to_all_threads
 from tensorrt_llm.logger import logger
 
-from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
-from .engine.cuda_graph import plan_cuda_graphs
-from .engine.model_setup import (
-    compile_model,
-    create_model_loader,
-    init_process_setup,
-    prepare_loaded_model,
-    resolve_attention_backend,
-    resolve_max_num_tokens,
-    resolve_max_seq_len,
-)
+from .engine.model_setup import build_encoder_runner
 from .engine.runners.encoder import EncoderRunner, resolve_scheduled_encoder_args
 from .engine.runners.interface import ScheduledInputs
 from .error_classification import ErrorBudget
@@ -206,70 +196,32 @@ class ScheduledEncoderExecutor:
             The executor, warmed up; its loop starts with ``start_worker``.
         """
         llm_args = resolve_scheduled_encoder_args(llm_args)
-        init_process_setup(mapping, dist)
-        max_beam_width, max_num_tokens, max_seq_len, max_batch_size = llm_args.get_runtime_sizes()
-        model_loader = create_model_loader(
+        with build_encoder_runner(
             llm_args,
-            mapping,
-            spec_config=None,
-            max_num_tokens=max_num_tokens,
-            max_seq_len=max_seq_len,
-        )
-        try:
-            model, _ = model_loader.load(
-                checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader
-            )
-            if model.model_config.is_generation:
+            model_path=model_path,
+            checkpoint_loader=checkpoint_loader,
+            mapping=mapping,
+            dist=dist,
+        ) as built:
+            if built.model_config.is_generation:
                 raise RuntimeError(
-                    f"{type(model).__name__} is a generation model; it runs on PyExecutor."
+                    "The checkpoint holds a generation model; it runs on PyExecutor."
                 )
-            prepare_loaded_model(model, llm_args)
-            max_seq_len = resolve_max_seq_len(model, max_seq_len)
-            max_num_tokens = resolve_max_num_tokens(
-                max_num_tokens, max_seq_len=max_seq_len, max_batch_size=max_batch_size
-            )
-            plan = plan_cuda_graphs(
-                llm_args.cuda_graph_config,
-                llm_args.prefill_capture_num_tokens,
-                max_batch_size=max_batch_size,
-                max_num_tokens=max_num_tokens,
-                max_seq_len=max_seq_len,
-                decode_tokens_per_request=1,
-            )
-            compiled = compile_model(
-                model,
-                llm_args=llm_args,
-                mapping=mapping,
-                dist=dist,
-                max_num_tokens=max_num_tokens,
-                prefill_capture_num_tokens=plan.prefill_num_tokens,
-            )
-            runner = EncoderRunner.create(
-                compiled.model,
-                llm_args=llm_args,
-                mapping=mapping,
-                dist=dist,
-                max_batch_size=max_batch_size,
-                max_num_tokens=max_num_tokens,
-                max_seq_len=max_seq_len,
-                max_beam_width=max_beam_width,
-                model_caller=compiled.caller,
-                attention_backend=resolve_attention_backend(compiled.model, llm_args),
-                attention_runtime_features=AttentionRuntimeFeatures(),
-            )
             return cls(
-                runner,
-                model_loader=model_loader,
+                built.runner,
+                model_loader=built.model_loader,
                 llm_args=llm_args,
                 mapping=mapping,
                 dist=dist,
-                max_batch_size=max_batch_size,
-                max_num_tokens=max_num_tokens,
-                max_seq_len=max_seq_len,
+                max_batch_size=built.max_batch_size,
+                max_num_tokens=built.max_num_tokens,
+                max_seq_len=built.max_seq_len,
             )
-        except BaseException:
-            model_loader.cleanup()
-            raise
+
+    @property
+    def model_loader(self) -> ModelLoader:
+        """The loader that loaded the model; the worker reports its load metrics at startup."""
+        return self._model_loader
 
     def _warmup(self, mapping: Mapping) -> None:
         self.dist.barrier()

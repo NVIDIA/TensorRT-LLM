@@ -486,17 +486,28 @@ def _check_scheduled_encoder_support(llm_args: TorchLlmArgs,
 
 def _create_scheduled_encoder_executor(
         llm_args: TorchLlmArgs, checkpoint_dir: Optional[str],
-        checkpoint_loader: "BaseCheckpointLoader") -> ScheduledEncoderExecutor:
+        checkpoint_loader: "BaseCheckpointLoader", startup_timer: _StartupTimer,
+        creation_metrics: dict[str, float]) -> ScheduledEncoderExecutor:
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
     _check_scheduled_encoder_support(llm_args, mapping)
-    executor = ScheduledEncoderExecutor.create(
-        llm_args,
-        model_path=checkpoint_dir,
-        checkpoint_loader=checkpoint_loader,
-        mapping=mapping,
-        dist=Distributed.get(mapping),
-    )
-    executor.start_worker()
+    dist = Distributed.get(mapping)
+    startup_timer.mark_initialization("configuration_and_distributed_init")
+    with startup_timer.phase("scheduled_encoder_creation",
+                             metrics=creation_metrics,
+                             metric_name="scheduled_encoder_creation_seconds"):
+        executor = ScheduledEncoderExecutor.create(
+            llm_args,
+            model_path=checkpoint_dir,
+            checkpoint_loader=checkpoint_loader,
+            mapping=mapping,
+            dist=dist,
+        )
+    if mapping.rank == 0:
+        logger.info(f"LLM Args:\n{llm_args}")
+    with startup_timer.phase("executor_start_worker",
+                             metrics=creation_metrics,
+                             metric_name="worker_start_seconds"):
+        executor.start_worker()
     return executor
 
 
@@ -692,7 +703,9 @@ def _create_py_executor(
 
     if not llm_args.mm_encoder_only and not is_generation:
         return _create_scheduled_encoder_executor(llm_args, checkpoint_dir,
-                                                  checkpoint_loader)
+                                                  checkpoint_loader,
+                                                  _startup_timer,
+                                                  creation_metrics)
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
