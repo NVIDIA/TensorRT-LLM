@@ -99,7 +99,7 @@ class SlotMap:
         """``selected`` (int32 expert ids, any shape) mapped to slots, same shape and dtype."""
         dev = self.dev
         if dev is None or dev.device != selected.device:
-            if torch.cuda.is_current_stream_capturing():
+            if selected.is_cuda and torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "[musespark_open] expert placement: the slot map was first needed while "
                     "capturing a CUDA graph; it must be built on an eager step first"
