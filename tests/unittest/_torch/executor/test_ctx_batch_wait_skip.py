@@ -96,7 +96,17 @@ def test_the_skip_is_off_at_import():
         if isinstance(node, ast.Assign)
         and [getattr(t, "id", None) for t in node.targets] == ["_CTX_BATCH_WAIT_SKIP"]
     ]
-    assert len(defaults) == 1 and ast.literal_eval(defaults[0]) is False
+    assert len(defaults) == 1
+    default = defaults[0]
+    if isinstance(default, ast.Constant):
+        assert default.value is False
+        return
+    # MSO arms it from the environment (no target arms it yet): the default must be
+    # `os.environ.get("TRTLLM_CTX_BATCH_WAIT_SKIP", "0") == "1" and not <kill switch>`,
+    # i.e. off when the variable is unset.
+    assert isinstance(default, ast.BoolOp) and isinstance(default.op, ast.And)
+    env_check = default.values[0]
+    assert ast.unparse(env_check) == "os.environ.get('TRTLLM_CTX_BATCH_WAIT_SKIP', '0') == '1'"
 
 
 def test_the_executor_installs_the_predicate_only_when_armed():
