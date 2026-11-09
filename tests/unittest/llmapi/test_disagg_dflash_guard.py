@@ -1,15 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The config-time guard refusing DFlash speculation on a disaggregated engine.
+"""DFlash speculation on a disaggregated engine: the config-time contract.
 
-The DFlash drafter's pooled-context K/V is filled only by a local prefill
-forward, in worker-local buffers the KV-cache transceiver never transfers. On
-a disaggregated generation engine no request ever runs a context forward, so
-every request falls back to the drafter's single shared dummy slot and
-acceptance length silently collapses while the drafter overhead is still paid.
-Because the ctx/gen role is decided per request, not per config, the guard
-refuses DFlash on ANY engine configured with a cache transceiver backend; a
-context-side engine loses nothing, since it never runs generation steps.
+DFlash is no longer refused on a disaggregated engine. The drafter's prompt
+window (its context K/V, written by the context worker's prefill) reaches the
+generation worker when the draft KV shares the target's KV cache manager: the
+draft layers then travel with the target's in the transceiver's session
+(``_torch/disaggregation/draft_kv.py``). That sharing is the default for the
+AUTO and TRTLLM drafter backends (``disagg_shares_draft_kv``);
+``TRTLLM_DISAGG_SHARED_DRAFT_KV=0`` or a VANILLA drafter keeps the draft KV
+private, and validation then only warns that acceptance is degraded, since the
+target still verifies every draft.
+
+The old ``disagg_dflash_error`` refusal (the drafter's context was worker-local,
+so every generation request fell back to one shared dummy slot) is gone; the
+tests here pin its replacement.
 """
 
 import pytest
@@ -18,11 +23,10 @@ from tensorrt_llm.llmapi import (
     CacheTransceiverConfig,
     DFlashDecodingConfig,
     DSparkDecodingConfig,
-    NGramDecodingConfig,
     TorchLlmArgs,
     llm_args,
 )
-from tensorrt_llm.llmapi.llm_args import disagg_dflash_error, disagg_shares_draft_kv
+from tensorrt_llm.llmapi.llm_args import disagg_shares_draft_kv
 
 pytestmark = pytest.mark.cpu_only
 
@@ -35,33 +39,9 @@ def _transceiver_config():
     return CacheTransceiverConfig(backend="NIXL")
 
 
-class TestDisaggDFlashError:
-    """The message-producing predicate, over the four config quadrants."""
-
-    def test_disagg_plus_dflash_is_refused(self):
-        message = disagg_dflash_error(_dflash_config(), _transceiver_config())
-        assert message is not None
-        # The message must name both settings and both workarounds.
-        assert "DFlash" in message
-        assert "cache_transceiver_config" in message
-        assert "without speculation" in message
-        assert "aggregated" in message
-
-    def test_aggregated_dflash_is_allowed(self):
-        assert disagg_dflash_error(_dflash_config(), None) is None
-
-    def test_disagg_without_speculation_is_allowed(self):
-        assert disagg_dflash_error(None, _transceiver_config()) is None
-
-    def test_disagg_with_non_dflash_speculation_is_allowed(self):
-        ngram = NGramDecodingConfig(max_draft_len=4)
-        assert disagg_dflash_error(ngram, _transceiver_config()) is None
-
-    def test_transceiver_without_backend_is_not_disagg(self):
-        # Matches the existing is_disagg idiom: a CacheTransceiverConfig with
-        # no backend selected does not configure disaggregation.
-        config = CacheTransceiverConfig(backend=None)
-        assert disagg_dflash_error(_dflash_config(), config) is None
+def test_the_old_refusal_is_gone():
+    """DFlash on a disaggregated engine is validated, not refused, so the refusal helper is gone."""
+    assert not hasattr(llm_args, "disagg_dflash_error")
 
 
 class TestTorchLlmArgsValidation:
@@ -103,7 +83,12 @@ class TestTorchLlmArgsValidation:
             cache_transceiver_config=_transceiver_config(),
             **self._SHAPE,
         )
-        assert any("DFlash acceptance is degraded" in str(w) for w in warnings) == warns
+        degraded = [str(w) for w in warnings if "DFlash acceptance is degraded" in str(w)]
+        assert bool(degraded) == warns
+        for message in degraded:
+            # The warning names the fix, not a benchmarking overlay.
+            assert "TRTLLM_DISAGG_SHARED_DRAFT_KV" in message
+            assert "overlay" not in message
 
     def test_aggregated_dflash_config_is_allowed(self):
         args = TorchLlmArgs(model="dummy", speculative_config=_dflash_config(), **self._SHAPE)
