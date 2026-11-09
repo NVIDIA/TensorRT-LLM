@@ -556,7 +556,7 @@ def test_experimental_workspaces_share_transport_policy(monkeypatch, kind, cross
     prefix = "tensorrt_llm._torch._experimental.modeling_v2.models."
     if kind == "draft_exchange":
         module = importlib.import_module(
-            prefix + "glm_moe_dsa.glm_5_2_nvfp4__sm_107__tp16.ops.spec._draft_exchange"
+            prefix + "glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec._draft_exchange"
         )
     else:
         module = importlib.import_module(prefix + f"kimi_k3_vl.kernels.{kind}.op")

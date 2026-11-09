@@ -66,7 +66,6 @@ _MNNVL_MAX_BUFFER_SIZE_BYTES = (
     (2**32 - 1) //
     _MNNVL_BUFFER_ALIGNMENT_BYTES) * _MNNVL_BUFFER_ALIGNMENT_BYTES
 
-
 # Allocating these workspaces is a TP-wide collective, so whether a rank
 # allocates must not depend on which thread builds its model: RpcWorker builds
 # rank 0 on an RPC executor thread and the other ranks on their main thread.

@@ -45,7 +45,6 @@ see ``health.check_health`` for the host-side report.
 
 import contextlib
 import os
-import platform
 from typing import Optional, Tuple
 
 import torch
@@ -104,15 +103,13 @@ def _local_capability(
     major, _ = torch.cuda.get_device_capability()
     if major < 9:
         return False, f"SM {major}x < 90"
-    if "aarch64" not in platform.machine().lower() and os.environ.get("TLLM_TEST_MNNVL") != "1":
-        return False, "MNNVL multicast workspace requires an aarch64 NVLink domain"
     try:
         import triton  # noqa: F401
 
         from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
     except ImportError as exc:
         return False, f"import failed: {exc}"
-    if not MnnvlMemory.supports_mnnvl() and os.environ.get("TLLM_TEST_MNNVL") != "1":
+    if not MnnvlMemory.supports_mnnvl():
         return False, "MNNVL not supported on this device"
     return True, ""
 
