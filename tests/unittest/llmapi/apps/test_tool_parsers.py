@@ -1645,6 +1645,23 @@ class TestQwen3CoderRequiredTools:
             args, [text], "length")
         assert streamed[-1]["choices"][0]["finish_reason"] == "length"
 
+    @pytest.mark.parametrize("finish_reason", ["timeout", "cancelled"])
+    def test_cut_off_output_counts_as_truncated(self, sample_tools,
+                                                finish_reason):
+        """A deadline or abort cuts the output off like max_tokens does."""
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        text = self._call("get_weather", "location", "Denver")[:-12]
+        args = TestForcedToolChoicePostprocessing._make_args(
+            sample_tools, tool_parser="qwen3_coder")
+        args.tool_choice = "required"
+        whole = chat_response_post_processor(
+            TestForcedToolChoicePostprocessing._fake_response(
+                text, finish_reason), args)
+        assert whole.choices[0].finish_reason == finish_reason
+        assert not whole.choices[0].message.tool_calls
+
     def test_eos_after_function_returns_the_call(self, sample_tools):
         """EOS between </function> and </tool_call>: whole and streamed agree."""
         from tensorrt_llm.serve.postprocess_handlers import \

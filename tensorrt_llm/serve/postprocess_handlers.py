@@ -56,7 +56,8 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               ResponsesResponse, SpeculativeDecodingStats,
                               StreamOptions, ToolCall, UsageInfo,
                               to_disaggregated_params)
-from .tool_parser.base_tool_parser import (BaseToolParser,
+from .tool_parser.base_tool_parser import (TRUNCATED_FINISH_REASONS,
+                                           BaseToolParser,
                                            warn_if_tool_call_unparsed)
 from .tool_parser.core_types import StreamingParseResult, ToolCallItem
 from .tool_parser.tool_parser_factory import ToolParserFactory
@@ -711,12 +712,12 @@ def chat_response_post_processor(
             # The parser extracts the forced call from the model's native
             # markup; any free-text preamble becomes content per OpenAI
             # semantics.
-            text, calls = apply_tool_parser(
-                args,
-                output.index,
-                text or "",
-                False,
-                truncated=output.finish_reason == "length")
+            text, calls = apply_tool_parser(args,
+                                            output.index,
+                                            text or "",
+                                            False,
+                                            truncated=output.finish_reason
+                                            in TRUNCATED_FINISH_REASONS)
             if calls:
                 forced_name = _forced_call_name(calls,
                                                 forced_tool.function.name)
@@ -741,12 +742,12 @@ def chat_response_post_processor(
                                       content=text,
                                       reasoning_content=reasoning_text)
         else:
-            text, calls = apply_tool_parser(
-                args,
-                output.index,
-                text,
-                False,
-                truncated=output.finish_reason == "length")
+            text, calls = apply_tool_parser(args,
+                                            output.index,
+                                            text,
+                                            False,
+                                            truncated=output.finish_reason
+                                            in TRUNCATED_FINISH_REASONS)
             tool_calls = [
                 ToolCall(function=FunctionCall(name=call.name or "",
                                                arguments=call.parameters))

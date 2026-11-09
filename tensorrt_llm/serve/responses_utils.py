@@ -94,7 +94,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
 from tensorrt_llm.serve.render import RenderResources, render_conversation
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
 from tensorrt_llm.serve.tool_parser.base_tool_parser import (
-    BaseToolParser, warn_if_tool_call_unparsed)
+    TRUNCATED_FINISH_REASONS, BaseToolParser, warn_if_tool_call_unparsed)
 from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.web_search import load_web_search_config
@@ -1731,8 +1731,8 @@ def _whole_text_tool_calls(
                                             content,
                                             False,
                                             truncated=getattr(
-                                                output, "finish_reason",
-                                                None) == "length")
+                                                output, "finish_reason", None)
+                                            in TRUNCATED_FINISH_REASONS)
     streamed = "".join(item.text for item in helper.emitted_item_ids
                        if item.item_type == "message")
     if normal_text.startswith(streamed):
@@ -1900,8 +1900,8 @@ def _create_output_content(
                                              text,
                                              False,
                                              truncated=getattr(
-                                                 output, "finish_reason",
-                                                 None) == "length")
+                                                 output, "finish_reason", None)
+                                             in TRUNCATED_FINISH_REASONS)
 
         stored_text: Optional[str] = None
         stored_reasoning: Optional[str] = None

@@ -25,6 +25,11 @@ _QUALIFIED_NAME = re.compile(
 # or `</arg_value>`, which models sometimes emit unbalanced into a tool name.
 _MARKUP_TAG = re.compile(r"</?[A-Za-z_][A-Za-z0-9_-]*>")
 
+# ``finish_reason`` values of a generation that was cut off rather than
+# ended by the model: max_tokens ("length"), the request deadline ("timeout")
+# or an abort ("cancelled").
+TRUNCATED_FINISH_REASONS = frozenset({"length", "timeout", "cancelled"})
+
 
 def warn_if_tool_call_unparsed(parser_name: str, tool_parser: "BaseToolParser",
                                text: str, calls: List[ToolCallItem]) -> None:
@@ -217,7 +222,7 @@ class BaseToolParser(ABC):
         """Parse the whole text of a generation that has finished.
 
         ``truncated`` is set when generation was cut off (``finish_reason``
-        "length"). Parsers whose ``finish`` recovers a call the stream ended
+        in ``TRUNCATED_FINISH_REASONS``). Parsers whose ``finish`` recovers a call the stream ended
         inside override this so the whole-text parse recovers the same call.
         The default is ``detect_and_parse``.
         """
