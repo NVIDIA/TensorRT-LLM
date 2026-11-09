@@ -33,7 +33,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 )
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader as TorchModelLoader
 from tensorrt_llm._torch.pyexecutor.model_loader import (
-    _construct_checkpoint_loader,
+    construct_checkpoint_loader,
     validate_and_set_mamba_ssm_cache_dtype,
 )
 from tensorrt_llm.inputs import ContentFormat
@@ -345,7 +345,7 @@ def test_qwen38_nvfp4_checkpoint_load_applies_hopper_defaults(
     assert ModelLoader(llm_args)._update_from_hf_quant_config() is True
     assert llm_args.quant_config.quant_algo == hf_quant_config["quantization"]["quant_algo"]
 
-    checkpoint_loader = _construct_checkpoint_loader(
+    checkpoint_loader = construct_checkpoint_loader(
         llm_args.checkpoint_loader,
         llm_args.checkpoint_format,
         mx_config=llm_args.mx_config,
