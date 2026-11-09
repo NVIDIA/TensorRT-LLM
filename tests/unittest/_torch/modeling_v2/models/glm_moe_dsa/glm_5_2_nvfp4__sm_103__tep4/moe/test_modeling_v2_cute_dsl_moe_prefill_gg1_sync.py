@@ -33,6 +33,7 @@ _ISSUING_WARP = "warp_idx == epilog_warp_id[0]"
 
 
 def _kernel() -> ast.FunctionDef:
+    """The kernel function's AST, parsed from the installed source file."""
     module = ast.parse(_KERNEL.read_text(), filename=str(_KERNEL))
     for node in module.body:
         if isinstance(node, ast.FunctionDef) and node.name == _KERNEL_FN:
@@ -50,10 +51,12 @@ def _statement_lists(fn: ast.FunctionDef):
 
 
 def _calls(node: ast.AST, callee: str) -> list[ast.Call]:
+    """Every call to ``callee`` under ``node``."""
     return [n for n in ast.walk(node) if isinstance(n, ast.Call) and ast.unparse(n.func) == callee]
 
 
 def _is_epilogue_barrier(stmt: ast.stmt) -> bool:
+    """``prims.barrier_cta_sync(epilog_sync_bar_id, ...)`` as a statement."""
     return (
         isinstance(stmt, ast.Expr)
         and isinstance(stmt.value, ast.Call)
@@ -77,6 +80,7 @@ def _is_full_drain(call: ast.Call) -> bool:
 
 
 def test_issuing_warp_drains_the_last_tma_store_before_the_exit_barrier() -> None:
+    """The issuing warp waits for group count 0 between the persistent loop and the exit barrier."""
     kernel = _kernel()
     matches = []
     for stmts in _statement_lists(kernel):
@@ -97,7 +101,13 @@ def test_issuing_warp_drains_the_last_tma_store_before_the_exit_barrier() -> Non
                 for s in before_barrier
                 if isinstance(s, ast.If)
                 and ast.unparse(s.test) == _ISSUING_WARP
-                and any(_is_full_drain(c) for c in _calls(s, "prims.cp_async_bulk_wait_group"))
+                # A direct statement of the issuing warp's body, not one nested in an else branch.
+                and any(
+                    isinstance(stmt, ast.Expr)
+                    and isinstance(stmt.value, ast.Call)
+                    and _is_full_drain(stmt.value)
+                    for stmt in s.body
+                )
             ]
             matches.append((loop, barriers[0], drains))
 

@@ -50,10 +50,12 @@ _HELPER = "_mbarrier_wait_acquire_cluster"
 
 @pytest.fixture(scope="module")
 def module() -> ast.Module:
+    """The kernel module's AST, parsed once from the installed source file."""
     return ast.parse(_KERNEL.read_text(), filename=str(_KERNEL))
 
 
 def _method(module: ast.Module, cls: str, name: str) -> ast.FunctionDef:
+    """The method ``name`` of class ``cls``."""
     for node in module.body:
         if isinstance(node, ast.ClassDef) and node.name == cls:
             for item in node.body:
@@ -63,6 +65,7 @@ def _method(module: ast.Module, cls: str, name: str) -> ast.FunctionDef:
 
 
 def _function(module: ast.Module, name: str) -> ast.FunctionDef:
+    """The module-level function ``name``."""
     for node in module.body:
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return node
@@ -76,10 +79,12 @@ def _calls(node: ast.AST) -> list[ast.Call]:
 
 
 def _callee(call: ast.Call) -> str:
+    """The called expression as source text."""
     return ast.unparse(call.func)
 
 
 def _first_arg(call: ast.Call) -> str:
+    """The first positional argument as source text, or an empty string."""
     return ast.unparse(call.args[0]) if call.args else ""
 
 
@@ -98,6 +103,7 @@ def _barrier_events(fn: ast.FunctionDef, barrier: str) -> list[tuple]:
 
 
 def _only(calls: list[ast.Call], what: str) -> ast.Call:
+    """The single call in ``calls``, failing with ``what`` otherwise."""
     assert len(calls) == 1, f"expected exactly one {what}, found {len(calls)}"
     return calls[0]
 
@@ -185,6 +191,7 @@ def test_split_k_mailbox_wait_acquires_at_cluster_scope(module) -> None:
 
 
 def test_cluster_acquire_helper_emits_the_cluster_scope_try_wait(module) -> None:
+    """The helper's inline PTX is the cluster-scope acquire try-wait with a memory clobber."""
     helper = _function(module, _HELPER)
     asm = _only([c for c in _calls(helper) if _callee(c) == "llvm.inline_asm"], "llvm.inline_asm")
 
