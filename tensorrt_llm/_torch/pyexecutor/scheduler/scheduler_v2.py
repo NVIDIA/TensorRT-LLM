@@ -410,11 +410,17 @@ class ShortestPrefillFirstOrder:
     per request and only when there is something to reorder.
     """
 
-    def __init__(self, max_wait_passes: int):
+    def __init__(self, max_wait_passes: int, store_aware: bool = True):
         self.max_wait_passes = max_wait_passes
+        # Also count the prefix the KV connector's store (Mooncake) can supply, so
+        # a store hit is not ranked as a cold prompt.
+        # TLLM_CTX_SRPT_STORE_AWARE=0 ranks on the local cache only.
+        self.store_aware = store_aware
         self._pass = 0
         self._waiting_since: dict[int, int] = {}
         self._uncached_estimate: dict[int, int] = {}
+        self._store_probe_counts = [0, 0, 0]  # probes, hits, store-only tokens
+        self._store_probe_last_log = time.monotonic()
 
     def _uncached_tokens(self, req: LlmRequest, kv_cache_manager) -> int:
         if not req.is_first_context_chunk:
@@ -423,12 +429,54 @@ class ShortestPrefillFirstOrder:
         estimate = self._uncached_estimate.get(request_id)
         if estimate is None:
             reusable = kv_cache_manager.probe_context_reuse(req)
+            if self.store_aware:
+                store_end = self._store_prefix_end(req, reusable, kv_cache_manager)
+                if store_end is not None and (reusable is None or store_end > reusable):
+                    reusable = store_end
             if reusable is None:
                 estimate = req.context_remaining_length
             else:
                 estimate = max(req.prompt_len - reusable, 1)
             self._uncached_estimate[request_id] = estimate
         return estimate
+
+    def _store_prefix_end(
+        self, req: LlmRequest, local_reusable: Optional[int], kv_cache_manager
+    ) -> Optional[int]:
+        """End of the prompt prefix the KV connector's store can supply *req*, or None.
+
+        Probed once per request (the estimate is cached), from the local depth.
+        The probe is side-effect free; without attention DP it is a leader
+        broadcast, which holds because every TP rank ranks the same pending
+        requests in the same order. Blocks stored later leave the rank
+        conservative, never ahead of what the allocation-time query will offer.
+        """
+        connector = getattr(kv_cache_manager, "kv_connector_manager", None)
+        may_serve = getattr(kv_cache_manager, "_connector_may_serve", None)
+        if (
+            connector is None
+            or may_serve is None
+            or getattr(req, "py_connector_allocation_reported", False)
+            or not may_serve(req)
+        ):
+            return None
+        local_end = max(local_reusable or 0, req.context_current_position)
+        offered = connector.probe_num_matched_tokens(req, local_end)
+        counts = self._store_probe_counts
+        counts[0] += 1
+        store_end = None
+        if offered:
+            store_end = min(local_end + offered, req.prompt_len - 1)
+            counts[1] += 1
+            counts[2] += store_end - local_end
+        now = time.monotonic()
+        if now - self._store_probe_last_log >= 60.0:
+            self._store_probe_last_log = now
+            logger.info(
+                f"ctx-srpt store probes: probed={counts[0]} with_hit={counts[1]} "
+                f"store_tokens={counts[2]}"
+            )
+        return store_end
 
     def order(
         self,
@@ -484,6 +532,11 @@ class KVCacheV2Scheduler(RequestScheduler):
     Merges capacity checking (KV cache allocation via resize()) and token budget
     assignment into one unified loop.
     """
+
+    # Per-request context chunk cap (TLLM_CTX_REQUEST_CHUNK_CAP); see __init__.
+    _ctx_request_chunk_cap: Optional[int] = None
+    _ctx_chunk_cap_eligible_share = False
+    _ctx_chunk_cap_this_pass: Optional[int] = None
 
     # Scheduling passes between two summaries of the prefill-decode interval.
     _CONTEXT_ADMISSION_LOG_PASSES = 4096
@@ -610,7 +663,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._shortest_prefill_first = None
         if os.environ.get("TRTLLM_SCHED_SHORTEST_PREFILL_FIRST", "0") == "1":
             self._shortest_prefill_first = ShortestPrefillFirstOrder(
-                _read_non_negative_int_env("TRTLLM_SCHED_SPF_MAX_WAIT_PASSES", 128)
+                _read_non_negative_int_env("TRTLLM_SCHED_SPF_MAX_WAIT_PASSES", 128),
+                store_aware=os.environ.get("TLLM_CTX_SRPT_STORE_AWARE", "1").strip() != "0",
             )
         self._context_admission_stats: Counter = Counter()
 
@@ -645,11 +699,59 @@ class KVCacheV2Scheduler(RequestScheduler):
                 "shortest_prefill_first="
                 f"{self._shortest_prefill_first is not None}"
                 + (
-                    f" (max_wait_passes={self._shortest_prefill_first.max_wait_passes})"
+                    f" (max_wait_passes={self._shortest_prefill_first.max_wait_passes}, "
+                    f"store_aware={self._shortest_prefill_first.store_aware})"
                     if self._shortest_prefill_first is not None
                     else ""
                 )
             )
+
+        # Opt-in (default off): while several
+        # context requests can take a chunk, cap each one's chunk at
+        # max(TLLM_CTX_REQUEST_CHUNK_CAP, its even share of the budget still left among
+        # the requests still able to take a chunk this pass), so long prompts interleave
+        # with shorter ones instead of taking the whole step. A lone eligible request
+        # keeps the full budget; forced (snapshot) chunking is not capped.
+        # TLLM_CTX_CHUNK_CAP_ELIGIBLE_SHARE=0 divides the whole budget over every
+        # candidate instead.
+        self._ctx_request_chunk_cap = self._resolve_ctx_request_chunk_cap(
+            os.environ.get("TLLM_CTX_REQUEST_CHUNK_CAP", "")
+        )
+        self._ctx_chunk_cap_eligible_share = (
+            self._ctx_request_chunk_cap is not None
+            and os.environ.get("TLLM_CTX_CHUNK_CAP_ELIGIBLE_SHARE", "1").strip() != "0"
+        )
+        self._ctx_chunk_cap_this_pass: Optional[int] = None
+
+    def _resolve_ctx_request_chunk_cap(self, raw: str) -> Optional[int]:
+        try:
+            cap = int(raw) if raw.strip() else 0
+        except ValueError:
+            raise ValueError(f"TLLM_CTX_REQUEST_CHUNK_CAP must be an integer, got {raw!r}")
+        if cap <= 0:
+            return None
+        if not self.chunking_enabled:
+            logger.warning("TLLM_CTX_REQUEST_CHUNK_CAP is ignored: chunked prefill is disabled")
+            return None
+        unit = max(self.chunk_unit_size, 1)
+        cap = max(unit, cap // unit * unit)
+        logger.info(
+            f"KVCacheV2Scheduler: per-request context chunk cap {cap} tokens while other "
+            "context requests are pending (TLLM_CTX_REQUEST_CHUNK_CAP)"
+        )
+        return cap
+
+    def _ctx_chunk_cap_for_share(
+        self, remaining_budget: Optional[int], num_eligible: int
+    ) -> Optional[int]:
+        """The chunk cap of the next request, given the budget it shares with *num_eligible*."""
+        if self._ctx_request_chunk_cap is None or num_eligible <= 1:
+            return None
+        if remaining_budget is None:
+            return self._ctx_request_chunk_cap
+        unit = max(self.chunk_unit_size, 1)
+        share = remaining_budget // num_eligible // unit * unit
+        return max(self._ctx_request_chunk_cap, share)
 
     def set_async_transfer_manager(self, mgr) -> None:
         """Register the AsyncTransferManager the deadlock detector consults.
@@ -902,6 +1004,18 @@ class KVCacheV2Scheduler(RequestScheduler):
         # is itself the progress in that case.
         deferred_behind_contributor = False
 
+        # Per-request chunk cap (TLLM_CTX_REQUEST_CHUNK_CAP); None when unset.
+        ctx_left = None
+        if self._ctx_request_chunk_cap is not None:
+            ctx_left = sum(
+                req.state_value == self._context_init_state_value for req in ctx_candidates
+            )
+            if not self._ctx_chunk_cap_eligible_share:
+                self._ctx_chunk_cap_this_pass = self._ctx_chunk_cap_for_share(
+                    self.max_num_tokens, ctx_left
+                )
+                ctx_left = None
+
         for req in ctx_candidates:
             if budget.requests_full:
                 break
@@ -970,6 +1084,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             else:
                 if diag is not None:
                     diag.count("attempts")
+                if ctx_left is not None:
+                    self._ctx_chunk_cap_this_pass = self._ctx_chunk_cap_for_share(
+                        budget.remaining_tokens, ctx_left
+                    )
+                    ctx_left -= 1
                 action, tokens, chunking_flag = self._try_schedule_context(
                     req, budget, preempt_for_pages
                 )
@@ -994,6 +1113,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if first_new_block is not None:
                     contributed_blocks.add(first_new_block)
 
+        self._ctx_chunk_cap_this_pass = None
         if backoff is not None:
             backoff.record_pass(has_generation, self._ctx_page_refused)
         if diag is not None:
@@ -1412,6 +1532,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if remaining_budget is not None
                 else budget_context_remaining
             )
+            if self._ctx_chunk_cap_this_pass is not None:
+                chunk_size = min(chunk_size, self._ctx_chunk_cap_this_pass)
 
         if self.max_context_length is not None:
             chunk_size = min(chunk_size, self.max_context_length)

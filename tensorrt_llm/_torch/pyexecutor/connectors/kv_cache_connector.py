@@ -391,6 +391,21 @@ class KvCacheConnectorScheduler(ABC):
             Whether the tokens will be loaded asynchronously.
         """
 
+    def probe_num_matched_tokens(
+        self, request: LlmRequest, num_computed_tokens: int
+    ) -> Optional[int]:
+        """Estimate what ``get_num_new_matched_tokens`` would offer, without its effects.
+
+        Ranks queued context requests, so it may run long before the request's
+        query or for a request that is never queried. It must not start a
+        transfer, record an offer, or change what a later query answers.
+
+        Returns:
+            Tokens beyond ``num_computed_tokens`` the connector could supply now,
+            or None when it cannot tell without querying.
+        """
+        return None
+
     def reserve_prefix(
         self, request: LlmRequest, num_computed_tokens: int, reservation_id: int
     ) -> Tuple[int, bool]:
@@ -1064,6 +1079,34 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             raise RuntimeError("load_kv_async must be False when num_tokens is 0!")
 
         return num_tokens, load_kv_async
+
+    def probe_num_matched_tokens(
+        self, request: LlmRequest, num_computed_tokens: int
+    ) -> Optional[int]:
+        """The leader's side-effect-free store estimate for ranking.
+
+        See ``KvCacheConnectorScheduler.probe_num_matched_tokens``. Without
+        attention DP this is a broadcast, so every TP rank must call it for the
+        same requests in the same order. A leader-side failure answers
+        None rather than raising: raising on the leader alone would leave the
+        other ranks waiting in the broadcast.
+        """
+        if self.enable_attention_dp and request.is_dummy_request:
+            return None
+        if self.capacity_only:
+            return None
+
+        def probe() -> Optional[int]:
+            try:
+                return self.scheduler.probe_num_matched_tokens(request, num_computed_tokens)
+            except Exception as error:
+                logger.warning(
+                    f"KV connector store probe failed for request {request.request_id}; "
+                    f"ranking it on the local cache only: {type(error).__name__}: {error}"
+                )
+                return None
+
+        return self._run_on_leader(probe)
 
     def commit_new_matched_tokens(
         self, request: LlmRequest, num_tokens: int, load_kv_async: bool
