@@ -669,6 +669,7 @@ def test_shutdown_drains_save_before_loop_exit(
         executor.virtual_memory_pools = {}
         executor.sampler = None
         executor.dwdp_manager = None
+        executor.dense_dwdp_manager = None
         executor.resource_manager = MagicMock()
         resource = MagicMock()
         executor.resource_manager.resource_managers = {"kv": resource}
@@ -1237,7 +1238,7 @@ def test_idle_fleet_polls_saves_without_new_traffic(outcome: str) -> None:
         executor.waiting_queue = MagicMock()
         executor.waiting_queue.__len__.return_value = 0
         executor.request_broadcaster = MagicMock()
-        executor.request_broadcaster.broadcast.return_value = ([], {})
+        executor.request_broadcaster.broadcast.return_value = []
         executor._pop_from_waiting_queue = MagicMock(return_value=([], None))
         executor.executor_request_queue.get_from_request_queue = MagicMock(return_value=[])
         executor._enable_non_overlap_adp_forward_intent = True

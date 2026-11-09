@@ -206,6 +206,21 @@ add_tllm_gtest(
   FULL_STACK
   LABELS
   "unit;kernels;fmha;full-stack;gpu")
+add_tllm_gtest(
+  fmhaDispatcherTest
+  OWNER
+  kernel
+  SOURCES
+  fmhaDispatcherTest.cpp
+  LINK_LIBRARIES
+  kernels_src
+  context_attention_src
+  trtllm_gen_fmha
+  ${CUDA_DRV_LIB}
+  tllm::common_environment
+  tllm::common_logging
+  LABELS
+  "unit;kernel;host")
 
 add_tllm_gtest(
   nvfp4ColdPageKernelsTest

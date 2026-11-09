@@ -40,9 +40,9 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     DecoderInputPreparer,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
-from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
@@ -749,13 +749,13 @@ class ModelEngineTestCase(unittest.TestCase):
                         tuple(runner._buffers.cache_indirection.shape), (4, 2, engine.max_seq_len)
                     )
                 else:
-                    self.assertIsInstance(runner, PoolingRunner)
+                    self.assertIsInstance(runner, EncoderRunner)
                     self.assertIsNone(engine.cuda_graph_runner)
                 self.assertEqual(isinstance(runner._buffers, DecoderInputBuffers), is_generation)
 
     def test_no_kv_cache_runners_reject_speculative_config(self) -> None:
         for mm_encoder_only, runner_name in (
-            (False, "PoolingRunner"),
+            (False, "EncoderRunner"),
             (True, "MultimodalEncoderRunner"),
         ):
             with self.subTest(runner=runner_name):
@@ -1015,6 +1015,7 @@ def test_pcg_fx_fallback_policy_is_model_specific(
         pretrained_config=SimpleNamespace(torch_dtype=torch.float32, hidden_size=4),
         mapping=mapping,
         sparse_attention_config=None,
+        is_generation=True,
     )
     eager = torch.nn.Linear(4, 4)
     model.model = eager

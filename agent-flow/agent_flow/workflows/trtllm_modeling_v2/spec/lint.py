@@ -11,8 +11,9 @@ axis, a member too narrow for one engine, a disaggregated member wider than a
 session), accuracy that
 cannot judge anything (a placeholder anchor, a chat-template protocol cut off
 early), boot probes that fail on near ties, a launch the environment cannot
-start, and notes that tell the roles what not to read but nothing about the
-model. Each finding names its rule, why it costs time and the usual fix.
+start, a compute session no gate reaches, and notes that tell the roles what
+not to read but nothing about the model. Each finding names its rule, why it
+costs time and the usual fix.
 
 Every rule reads the spec and the checkpoint's ``config.json``, never a model
 name: a :data:`RULES` entry is a function of a :class:`LintContext` yielding
@@ -38,6 +39,7 @@ import yaml
 
 from ..checks import accuracy_policy, check_config
 from ..checks import disagg as disagg_checks
+from ..infra.compute.sessions import GATE_ROLES
 from ..operators import prior_art, tree_anchors
 from ..tune.schema import REMOVED_PERF_KEYS
 from . import variants as variants_mod
@@ -308,7 +310,7 @@ def _session_nodes(task: Mapping[str, Any]) -> int:
     nodes = [
         s.get("nodes") or 1
         for s in sessions
-        if isinstance(s, Mapping) and s.get("role", "any") in ("gates", "any")
+        if isinstance(s, Mapping) and s.get("role", "any") in GATE_ROLES
     ]
     return max([n for n in nodes if isinstance(n, int)] or [1])
 
@@ -939,15 +941,25 @@ def tree_rules(ctx: LintContext) -> Iterator[Finding]:
 
 #: Every rule, in report order. A new feature, scope or launch check adds its function here.
 def perf_rules(ctx: LintContext) -> Iterator[Finding]:
-    """A ``perf`` key the campaign no longer reads: it runs without it."""
+    """A ``perf`` key the campaign no longer reads, and a perf config whose decode runs eager.
+
+    A config with CUDA graphs off, or whose largest captured batch is below the live requests a
+    rank holds (``tune.spec.capture_shortfalls``), measures eager steps for the whole campaign.
+    """
+    from ..tune.spec import capture_shortfalls, serving_options
+
     perf = ctx.task.get("perf")
-    for key in sorted(set(perf) & set(REMOVED_PERF_KEYS)) if isinstance(perf, Mapping) else ():
+    if not isinstance(perf, Mapping):
+        return
+    for key in sorted(set(perf) & set(REMOVED_PERF_KEYS)):
         yield Finding(
             "perf-removed-key",
             WARN,
             f"`perf.{key}` is ignored: {REMOVED_PERF_KEYS[key]}",
             f"drop `perf.{key}`",
         )
+    for why, fix in capture_shortfalls(serving_options(ctx.task)):
+        yield Finding("perf-cuda-graph-coverage", WARN, why, fix)
 
 
 RULES: tuple[Rule, ...] = (

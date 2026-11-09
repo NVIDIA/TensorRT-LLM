@@ -5,10 +5,15 @@
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2._native import NoTarget
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec._draft_token_table import (  # noqa: E501
-    build_draft_token_table,
-)
+
+try:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.spec._draft_token_table import (  # noqa: E501
+        build_draft_token_table,
+    )
+except NoTarget as exc:
+    pytest.skip(str(exc), allow_module_level=True)
 from tensorrt_llm._utils import get_sm_version
 
 __extra_import_path__ = ["../../../.."]
