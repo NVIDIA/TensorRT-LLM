@@ -203,6 +203,17 @@ curl http://localhost:8000/server_info
 }
 ```
 
+### Kernel builds ahead of first use
+
+During the warmup, an op that compiles its kernels on first use lists them the first time
+it runs, and worker threads build them in parallel. Supported ops: MiniMax-M3's MSA
+attention (`fmha_sm100`).
+
+| Environment variable | Default | Effect |
+|----------------------|---------|--------|
+| `TLLM_KERNEL_BUILDER` | `1` | `0` compiles each kernel on its first use instead. |
+| `TLLM_KERNEL_BUILDER_THREADS` | `8` | Worker threads per process. |
+
 ## Unified Cache for Compiled Artifacts
 
 Set `TRTLLM_CACHE_DIR` before importing TensorRT-LLM to place its compiled
