@@ -72,8 +72,14 @@ def _scratch_pattern(seed: int, j: int, lc: int) -> int:
 class _Arena:
     """A manager plus the bookkeeping needed to check its arena."""
 
-    def __init__(self, drop_unreferenced: bool, ratio: list[float], in_place: bool = False, scratch: bool = False,
-                 host_quota: int = 0):
+    def __init__(
+        self,
+        drop_unreferenced: bool,
+        ratio: list[float],
+        in_place: bool = False,
+        scratch: bool = False,
+        host_quota: int = 0,
+    ):
         torch.zeros(1, device="cuda")  # the manager needs a current CUDA context
         self.in_place = in_place
         self.scratch = scratch
@@ -110,9 +116,7 @@ class _Arena:
         )
         self.mgr = kvm.KVCacheManager(config)
         self.stream = torch.cuda.current_stream().cuda_stream
-        self.lcs = {
-            layer: self.mgr.get_layer_group_id(layer) for layer in (FULL_LAYER, SWA_LAYER)
-        }
+        self.lcs = {layer: self.mgr.get_layer_group_id(layer) for layer in (FULL_LAYER, SWA_LAYER)}
         self.pg_of_lc = list(self.mgr.get_life_cycle_pool_group_indices())
         self.slot_bytes = {
             self.lcs[FULL_LAYER]: 2 * FULL_BUF_BYTES,
@@ -155,7 +159,9 @@ class _Arena:
     def add_request(self, seed: int, commit: bool, scratch: bool = False) -> object:
         tokens = _tokens(seed)
         kv = self.mgr.create_kv_cache(input_tokens=tokens, id=seed)
-        self.bufs[seed] = {lc: np.full(BLOCKS_PER_REQUEST, -2, dtype=np.int32) for lc in self.lcs.values()}
+        self.bufs[seed] = {
+            lc: np.full(BLOCKS_PER_REQUEST, -2, dtype=np.int32) for lc in self.lcs.values()
+        }
         self.bind_bufs(seed, kv)
         assert kv.resume(self.stream), f"resume failed for request {seed}"
         if scratch:
@@ -191,8 +197,10 @@ class _Arena:
             self.bind_bufs(seed, kv)  # suspend() unbinds them, as in the PyTorch flow
 
     def rebalance(self, target_ratio: list[float]):
-        """Force a rebalance to target_ratio (pool-group order): live requests are suspended
-        around adjust(), or stay active with in-place relocation."""
+        """Force a rebalance to target_ratio (pool-group order).
+
+        Live requests are suspended around adjust(), or stay active with in-place relocation.
+        """
         if self.in_place:
             torch.cuda.synchronize()  # the executor's quiescence point
         else:
@@ -208,7 +216,9 @@ class _Arena:
     # ---- checks ---------------------------------------------------------------------------
 
     def check_layout(self, tc: unittest.TestCase):
-        tc.assertEqual(self.base(FULL_LAYER), self.base(SWA_LAYER), "pools must share the arena base")
+        tc.assertEqual(
+            self.base(FULL_LAYER), self.base(SWA_LAYER), "pools must share the arena base"
+        )
         spans = []
         for lc, pg in enumerate(self.pg_of_lc):
             b, e = self.windows()[pg]
@@ -225,13 +235,19 @@ class _Arena:
         for seed, (kv, _) in self.live.items():
             for lc, idx in self.indices(kv).items():
                 # What a kernel would read must match the cache's own view.
-                tc.assertEqual(self.bufs[seed][lc].tolist(), idx[:BLOCKS_PER_REQUEST],
-                               f"req {seed} lc {lc}: bound page-index buffer is stale")
+                tc.assertEqual(
+                    self.bufs[seed][lc].tolist(),
+                    idx[:BLOCKS_PER_REQUEST],
+                    f"req {seed} lc {lc}: bound page-index buffer is stale",
+                )
                 b, e = windows[self.pg_of_lc[lc]]
                 for ordinal, slot in enumerate(idx):
                     if self.scratch and slot == kvm.BAD_PAGE_INDEX:
                         continue  # stale SWA block: written to a scratch slot, checked below
-                    tc.assertTrue(b <= slot < e, f"req {seed} lc {lc} block {ordinal}: {slot} not in [{b}, {e})")
+                    tc.assertTrue(
+                        b <= slot < e,
+                        f"req {seed} lc {lc} block {ordinal}: {slot} not in [{b}, {e})",
+                    )
                     expected = _pattern(seed, ordinal, lc)
                     view = self.slot_view(lc, slot)
                     tc.assertTrue(
@@ -242,21 +258,32 @@ class _Arena:
                         old = before[seed][lc][ordinal]
                         if old != slot:
                             moved += 1
-                            tc.assertFalse(b <= old < e, f"block at {old} moved although still inside its window")
+                            tc.assertFalse(
+                                b <= old < e,
+                                f"block at {old} moved although still inside its window",
+                            )
         return moved
 
     def check_scratch(self, tc: unittest.TestCase, before: dict | None = None) -> int:
-        """Check every live request's scratch slots (inside the window, data intact); return how many
-        changed slot since `before` ({seed: {lc: slot ids}})."""
+        """Check every live request's scratch slots (inside the window, data intact).
+
+        Returns how many changed slot since `before` ({seed: {lc: slot ids}}).
+        """
         moved = 0
         windows = self.windows()
         for seed, (kv, _) in self.live.items():
             for lc, slots in self.scratch_slots(kv).items():
                 b, e = windows[self.pg_of_lc[lc]]
                 if before is not None:
-                    tc.assertEqual(len(slots), len(before[seed][lc]), f"req {seed} lc {lc}: scratch slot count changed")
+                    tc.assertEqual(
+                        len(slots),
+                        len(before[seed][lc]),
+                        f"req {seed} lc {lc}: scratch slot count changed",
+                    )
                 for j, slot in enumerate(slots):
-                    tc.assertTrue(b <= slot < e, f"req {seed} lc {lc} scratch {j}: {slot} not in [{b}, {e})")
+                    tc.assertTrue(
+                        b <= slot < e, f"req {seed} lc {lc} scratch {j}: {slot} not in [{b}, {e})"
+                    )
                     tc.assertTrue(
                         bool((self.slot_view(lc, slot) == _scratch_pattern(seed, j, lc)).all()),
                         f"req {seed} lc {lc} scratch {j} at slot {slot}: data corrupted",
@@ -264,12 +291,18 @@ class _Arena:
                     if before is not None and before[seed][lc][j] != slot:
                         moved += 1
                         old = before[seed][lc][j]
-                        tc.assertFalse(b <= old < e, f"scratch slot {old} moved although still inside its window")
+                        tc.assertFalse(
+                            b <= old < e,
+                            f"scratch slot {old} moved although still inside its window",
+                        )
         return moved
 
     def check_cached(self, tc: unittest.TestCase) -> int:
-        """Count the cached blocks still matched; reuse them and check their data where the pools
-        have room to admit a request (resume refuses above max_util_for_resume)."""
+        """Count the cached blocks still matched.
+
+        Reuses them and checks their data where the pools have room to admit a request (resume
+        refuses above max_util_for_resume).
+        """
         matched_blocks = 0
         for seed in self.cached:
             tokens = _tokens(seed)
@@ -340,7 +373,9 @@ class TestCopyBasedRebalancing(unittest.TestCase):
                 before = {seed: arena.indices(kv) for seed, (kv, _) in arena.live.items()}
                 arena.rebalance(target)
                 after_windows = arena.windows()
-                self.assertNotEqual(before_windows, after_windows, f"rebalance to {target} did nothing")
+                self.assertNotEqual(
+                    before_windows, after_windows, f"rebalance to {target} did nothing"
+                )
                 arena.check_layout(self)
                 moved = arena.check_live(self, before)
                 cached = arena.check_cached(self)
@@ -352,10 +387,15 @@ class TestCopyBasedRebalancing(unittest.TestCase):
     def test_rebalance_copies_live_blocks(self):
         history = self._run(drop_unreferenced=False)
         for full_share, wb, wa, moved, cached in history:
-            print(f"  full={full_share:.2f} windows {wb} -> {wa}: moved {moved} live blocks, {cached} cached blocks matched")
+            print(
+                f"  full={full_share:.2f} windows {wb} -> {wa}: moved {moved} live blocks, "
+                f"{cached} cached blocks matched"
+            )
         self.assertGreater(sum(h[3] for h in history), 0, "no live block was ever copied")
 
-    def _drop_scenario(self, drop_unreferenced: bool, in_place: bool = False) -> tuple[int, int, list, list]:
+    def _drop_scenario(
+        self, drop_unreferenced: bool, in_place: bool = False
+    ) -> tuple[int, int, list, list]:
         """Cached blocks next to the SWA group's moving edge, with free holes to copy them into.
 
         SWA ids are issued from the top of its window down, so allocation order maps to distance
@@ -397,27 +437,38 @@ class TestCopyBasedRebalancing(unittest.TestCase):
         # bound page-index buffers rewritten (check_live compares them on every rebalance).
         suspended = self._run(drop_unreferenced=False)
         in_place = self._run(drop_unreferenced=False, in_place=True)
-        for (fs, wb, wa, moved_s, cached_s), (_, wb_i, wa_i, moved_i, cached_i) in zip(suspended, in_place):
-            print(f"  full={fs:.2f}: windows {wa} / in place {wa_i}; moved {moved_s} / {moved_i}; "
-                  f"cached matched {cached_s} / {cached_i}")
+        for (fs, wb, wa, moved_s, cached_s), (_, wb_i, wa_i, moved_i, cached_i) in zip(
+            suspended, in_place
+        ):
+            print(
+                f"  full={fs:.2f}: windows {wa} / in place {wa_i}; moved {moved_s} / {moved_i}; "
+                f"cached matched {cached_s} / {cached_i}"
+            )
         self.assertGreater(sum(h[3] for h in in_place), 0, "no live block was relocated in place")
 
     def test_in_place_rebalance_moves_scratch_slots(self):
-        """SWA scratch reuse with in-place relocation: active prefills hold scratch slots outside the
-        page machinery; those outside the SWA group's new window are copied into it and the caches'
-        scratch descriptors report the new slots. SWA ids are issued from the top of the window
-        down: placeholders first (closed afterwards, leaving holes at the top), then the live
-        requests, nearer the moving edge."""
+        """SWA scratch reuse with in-place relocation.
+
+        Active prefills hold scratch slots outside the page machinery; those outside the SWA group's
+        new window are copied into it and the caches' scratch descriptors report the new slots. SWA
+        ids are issued from the top of the window down: placeholders first (closed afterwards,
+        leaving holes at the top), then the live requests, nearer the moving edge.
+        """
         arena = _Arena(drop_unreferenced=False, ratio=[0.4, 0.6], in_place=True, scratch=True)
         try:
             placeholders = [arena.add_request(seed, commit=False) for seed in range(200, 240)]
             for seed in range(300, 330):
-                arena.live[seed] = (arena.add_request(seed, commit=False, scratch=True), _tokens(seed))
+                arena.live[seed] = (
+                    arena.add_request(seed, commit=False, scratch=True),
+                    _tokens(seed),
+                )
             for kv in placeholders:
                 kv.close()
             torch.cuda.synchronize()
             swa_lc = arena.lcs[SWA_LAYER]
-            num_scratch = sum(len(arena.scratch_slots(kv).get(swa_lc, [])) for kv, _ in arena.live.values())
+            num_scratch = sum(
+                len(arena.scratch_slots(kv).get(swa_lc, [])) for kv, _ in arena.live.values()
+            )
             self.assertGreater(num_scratch, 0, "the live requests hold no scratch slots")
             arena.check_live(self)
             arena.check_scratch(self)
@@ -429,14 +480,18 @@ class TestCopyBasedRebalancing(unittest.TestCase):
                 target[pg_full], target[1 - pg_full] = full_share, 1.0 - full_share
                 windows_before = arena.windows()
                 before = {seed: arena.indices(kv) for seed, (kv, _) in arena.live.items()}
-                before_scratch = {seed: arena.scratch_slots(kv) for seed, (kv, _) in arena.live.items()}
+                before_scratch = {
+                    seed: arena.scratch_slots(kv) for seed, (kv, _) in arena.live.items()
+                }
                 arena.rebalance(target)
                 arena.check_layout(self)
                 moved_pages += arena.check_live(self, before)
                 n = arena.check_scratch(self, before_scratch)
                 moved_scratch += n
-                print(f"  full={full_share:.2f} windows {windows_before} -> {arena.windows()}: "
-                      f"{num_scratch} scratch slots, {n} moved")
+                print(
+                    f"  full={full_share:.2f} windows {windows_before} -> {arena.windows()}: "
+                    f"{num_scratch} scratch slots, {n} moved"
+                )
             self.assertGreater(moved_scratch, 0, "no scratch slot was relocated")
         finally:
             arena.close()
@@ -451,12 +506,20 @@ class TestCopyBasedRebalancing(unittest.TestCase):
         before_k, after_k, wb, wa = self._drop_scenario(drop_unreferenced=False, in_place=in_place)
         before_d, after_d, _, _ = self._drop_scenario(drop_unreferenced=True, in_place=in_place)
         print(f"  windows {wb} -> {wa}")
-        print(f"  cached blocks matched: copy {before_k} -> {after_k}, drop {before_d} -> {after_d}")
+        print(
+            f"  cached blocks matched: copy {before_k} -> {after_k}, drop {before_d} -> {after_d}"
+        )
         self.assertEqual(before_k, 40 * BLOCKS_PER_REQUEST)
         # There was room to copy every cached block out of the region given up ...
-        self.assertEqual(after_k, before_k, "without the drop flag, cached blocks with room to move must be copied")
+        self.assertEqual(
+            after_k,
+            before_k,
+            "without the drop flag, cached blocks with room to move must be copied",
+        )
         # ... but with the flag they are dropped instead.
-        self.assertLess(after_d, before_d, "the drop flag did not drop the cached blocks that had to move")
+        self.assertLess(
+            after_d, before_d, "the drop flag did not drop the cached blocks that had to move"
+        )
 
 
 if __name__ == "__main__":

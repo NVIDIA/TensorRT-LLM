@@ -229,8 +229,7 @@ private:
         {
             return group != nullptr;
         }
-        if (group == nullptr || perPoolIndices == nullptr
-            || (numPools != 0 && numPools != group->copyPlans.stdSize()))
+        if (group == nullptr || perPoolIndices == nullptr || (numPools != 0 && numPools != group->copyPlans.stdSize()))
         {
             return false;
         }
