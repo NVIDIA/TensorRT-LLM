@@ -63,7 +63,7 @@ from tensorrt_llm._torch.modules.fla.cached_replay import (
 )
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import _build_replay_work_items_triton
 
-__extra_import_path__ = ["../../.."]
+__extra_import_path__ = ["../../../.."]
 from _validating import ULP, certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), (

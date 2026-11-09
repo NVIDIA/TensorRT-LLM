@@ -15,7 +15,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4
     qwen4_exp_post_inject as op,
 )
 
-__extra_import_path__ = ["../../.."]
+__extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "qwen4_exp_post_inject requires a CUDA device"

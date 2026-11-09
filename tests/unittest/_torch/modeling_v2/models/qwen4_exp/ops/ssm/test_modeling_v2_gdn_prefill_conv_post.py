@@ -37,7 +37,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.gdn_
     gdn_prefill_conv_post as op,
 )
 
-__extra_import_path__ = ["../../.."]
+__extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "gdn_prefill_conv_post requires a CUDA device"

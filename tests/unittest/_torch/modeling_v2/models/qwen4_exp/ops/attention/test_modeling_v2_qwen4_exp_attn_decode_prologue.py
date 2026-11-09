@@ -21,7 +21,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attentio
     qwen4_exp_attn_decode_prologue as op,
 )
 
-__extra_import_path__ = ["../../.."]
+__extra_import_path__ = ["../../../.."]
 from _validating import certifying  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "qwen4_exp_attn_decode_prologue requires a CUDA device"

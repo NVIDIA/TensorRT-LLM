@@ -18,7 +18,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.gemm.bf1
     bf16_gemv_pdl as op,
 )
 
-__extra_import_path__ = ["../../.."]
+__extra_import_path__ = ["../../../.."]
 from _validating import (  # noqa: E402,F401 — path above; fixture by name
     ULP,
     assert_within_ulp,

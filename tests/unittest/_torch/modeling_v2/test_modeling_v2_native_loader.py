@@ -16,11 +16,14 @@ a child process.
 
 from __future__ import annotations
 
+import ast
+import importlib.util
 import json
 import subprocess
 import sys
 import textwrap
 import types
+from pathlib import Path
 
 import pytest
 
@@ -57,17 +60,43 @@ def libs(monkeypatch, tmp_path):
     return types.SimpleNamespace(install=install)
 
 
-def test_names():
+def test_names(monkeypatch):
     assert namespace_of(_TARGET) == _TARGET_NS
     assert namespace_of(f"{_TARGET}.fake_ops") == _TARGET_NS
+    assert namespace_of(f"{_TARGET}.ops.moe.entry") == _TARGET_NS
+    assert namespace_of(_FAMILY) == "mv2_gpt_oss"
     assert namespace_of(f"{_FAMILY}.fake_ops") == "mv2_gpt_oss"
+    # A family directory route does not return from is family code, at any depth.
+    assert namespace_of(f"{_FAMILY}.ops.moe.entry") == "mv2_gpt_oss"
+    assert namespace_of(f"{_FAMILY}.kernels.fake_ops") == "mv2_gpt_oss"
+    # A target is what route returns, whatever its name.
+    monkeypatch.setattr(_native, "_routed_targets", lambda family: frozenset({"any_name"}))
     assert namespace_of(f"{_FAMILY}.any_name.fake_ops") == "mv2_gpt_oss_any_name"
     with pytest.raises(ValueError):
         namespace_of("tensorrt_llm._torch.models")
-    with pytest.raises(ValueError, match="fake_ops module"):
-        namespace_of(f"{_TARGET}.ops.moe.entry")
     with pytest.raises(ValueError, match="models.<family>.<target>"):
         load_target_ops(f"{_TARGET}.weights")
+
+
+def _cbts_source_parser():
+    """The routing reader CBTS and the CPU checks share, loaded by path: jenkins/ is no package."""
+    path = (
+        Path(__file__).resolve().parents[4]
+        / "jenkins/scripts/cbts/cbts/rules/modeling_v2_source.py"
+    )
+    spec = importlib.util.spec_from_file_location("_cbts_modeling_v2_source", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_targets_agree_with_cbts():
+    """The loader and CBTS tell a target from family code the same way."""
+    source = _cbts_source_parser()
+    models = Path(_native.__file__).resolve().parent / "models"
+    for routing in sorted(models.glob("*/routing.py")):
+        cbts = source.routed_targets(ast.parse(routing.read_text())) or set()
+        assert _native._routed_targets(routing.parent.name) == cbts, routing.parent.name
 
 
 def test_a_target_loads_whatever_its_name(libs, monkeypatch):

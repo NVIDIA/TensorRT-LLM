@@ -15,7 +15,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attentio
     qwen4_exp_qk_norm_rope as op,
 )
 
-__extra_import_path__ = ["../../.."]
+__extra_import_path__ = ["../../../.."]
 from _validating import (  # noqa: E402,F401 — path above; fixture by name
     assert_within_ulp,
     certifying,

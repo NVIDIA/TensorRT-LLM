@@ -20,7 +20,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attentio
 )
 from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 
-__extra_import_path__ = ["../../.."]
+__extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401
 
 assert torch.cuda.is_available(), "qsa_paged_kv_store_nvfp4 requires a CUDA device"

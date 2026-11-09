@@ -16,7 +16,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.activati
     silu_and_mul_rows as op,
 )
 
-__extra_import_path__ = ["../../.."]
+__extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "silu_and_mul_rows requires a CUDA device"

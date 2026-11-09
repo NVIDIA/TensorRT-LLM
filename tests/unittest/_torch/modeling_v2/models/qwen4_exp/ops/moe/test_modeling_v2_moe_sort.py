@@ -16,7 +16,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.moe_
     moe_sort as op,
 )
 
-__extra_import_path__ = ["../../.."]
+__extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "moe_sort requires a CUDA device"
