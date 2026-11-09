@@ -446,7 +446,7 @@ lengths. Paused requests are excluded from KV eviction. Disaggregated GEN cannot
 recompute context locally, and Helix CP raises on decode allocation failure.
 Reduce concurrency or increase the KV budget when both slots and pages are full.
 
-Pool sizing assumes one executor per process. Configuring preemption on a context
+Pool headroom belongs to each executor. Configuring preemption on a context
 worker also reserves headroom. `target_output_tps` has simulation coverage only;
 GPU validation is limited to `tpot_budget`.
 

@@ -7730,6 +7730,10 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_gen_preemption(self) -> 'TorchLlmArgs':
+        # PP has multiple in-flight microbatches, so removing a request needs
+        # stage-coordinated draining. Attention DP routes independent request
+        # sets across ranks, so a rank-0 clock alone cannot synchronize victims
+        # and admission capacity. The controller supports one shared batch.
         if self.scheduler_config.gen_preemption.enabled and (
                 self.pipeline_parallel_size > 1 or self.enable_attention_dp):
             raise ValueError(

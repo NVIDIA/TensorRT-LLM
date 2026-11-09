@@ -655,8 +655,6 @@ def _create_py_executor(
     if headroom_reason:
         logger.warning(
             f"[gen_preempt] GEN slot preemption disabled: {headroom_reason}")
-    gen_preemption.configure(
-        None if headroom_reason else scheduler_config.gen_preemption)
 
     # Since peft_cache_config may be subject to change, avoid these changes propagate back
     # to llm_args.peft_cache_config
@@ -1322,6 +1320,8 @@ def _create_py_executor(
             sparse_attention_config=sparse_attention_config,
             execution_stream=execution_stream,
             draft_config=draft_config,
+            gen_preemption_headroom=getattr(model_engine,
+                                            "gen_preemption_headroom", 0),
             skip_est=skip_est,
             is_disagg=is_disagg,
         )

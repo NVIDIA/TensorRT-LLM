@@ -1912,7 +1912,7 @@ class TestGenSlotPreemption:
     def test_forced_resume_precedes_first_token(self, first_token_first, monkeypatch):
         from tensorrt_llm._torch.pyexecutor.scheduler.gen_preemption import (
             GenPreemption,
-            GenPreemptionSettings,
+            GenPreemptionConfig,
         )
 
         monkeypatch.setenv("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", str(int(first_token_first)))
@@ -1927,7 +1927,7 @@ class TestGenSlotPreemption:
         waiter.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
         waiter.state_value = waiter.state.value
         waiter.is_generation_in_progress_state = False
-        p = GenPreemption(GenPreemptionSettings(tpot_budget=0.1), 1)
+        p = GenPreemption(GenPreemptionConfig(tpot_budget=0.1), 1)
         p.observe([resident], 0.0)
         p._pause(resident)
         assert p.step([waiter, resident], 11.0, 1, 2, None) == 2

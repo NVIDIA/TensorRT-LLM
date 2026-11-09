@@ -20,7 +20,6 @@ from tensorrt_llm._torch.pyexecutor.scheduler.gen_admission_queue import (
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.gen_preemption import (
     GenPreemption,
-    GenPreemptionSettings,
     _Req,
     create_gen_preemption,
 )
@@ -28,8 +27,8 @@ from tensorrt_llm.llmapi.llm_args import GenPreemptionConfig
 
 pytestmark = pytest.mark.cpu_only
 GEN = LlmRequestState.GENERATION_IN_PROGRESS
-ON = GenPreemptionSettings(tpot_budget=0.25)
-SLO = GenPreemptionSettings(target_output_tps=8.0)
+ON = GenPreemptionConfig(tpot_budget=0.25)
+SLO = GenPreemptionConfig(target_output_tps=8.0)
 AUTO = GenAdmissionConfig(ttft_percentile=90.0)
 
 
@@ -86,19 +85,46 @@ def complete(p, tokens=1000, paused=0.0, target_ready=True, sacrificed=False):
     )
 
 
-@pytest.mark.parametrize("settings,extra", [(GenPreemptionSettings(), 0), (ON, 48), (SLO, 48)])
-def test_pool_headroom(settings, extra, monkeypatch):
-    monkeypatch.setattr(gen_preemption, "_active_settings", GenPreemptionSettings())
-    gen_preemption.configure(GenPreemptionConfig(**vars(settings)))
+@pytest.mark.parametrize("settings,extra", [(GenPreemptionConfig(), 0), (ON, 48), (SLO, 48)])
+def test_pool_headroom(settings, extra):
+    assert gen_preemption.resident_headroom(128, settings) == extra
     mapping = Mock(pp_size=1)
     mapping.has_pp.return_value = False
     mamba = object.__new__(MambaHybridCacheManagerV2)
     mamba.max_batch_size, mamba.mapping = 128, mapping
-    assert compute_max_num_sequences(mapping, 128, False) == 128 + extra
+    mamba.gen_preemption_headroom = extra
     assert (
-        compute_max_num_sequences(mapping, 128, False, enable_overlap_headroom=True) == 256 + extra
+        compute_max_num_sequences(mapping, 128, False, gen_preemption_headroom=extra) == 128 + extra
     )
+    assert (
+        compute_max_num_sequences(
+            mapping, 128, False, enable_overlap_headroom=True, gen_preemption_headroom=extra
+        )
+        == 256 + extra
+    )
+    other = object.__new__(MambaHybridCacheManagerV2)
+    other.max_batch_size, other.mapping = 128, mapping
+    other.gen_preemption_headroom = 0
+    assert other._max_resident_sequences() == 128
     assert mamba._max_resident_sequences() == 128 + extra
+
+
+def test_headroom_follows_each_executor_configuration(monkeypatch):
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SchedulerConfig
+
+    monkeypatch.setenv("TLLM_GEN_ADMISSION_TTFT_PERCENTILE", "90")
+    enabled = SimpleNamespace(
+        scheduler_config=SchedulerConfig(gen_preemption=ON),
+        kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
+        max_beam_width=1,
+        sleep_config=None,
+    )
+    disabled = SimpleNamespace(scheduler_config=SchedulerConfig())
+    for args, expected in ((enabled, 48), (disabled, 0), (enabled, 48)):
+        assert gen_preemption.headroom_for_args(128, args) == expected
+    monkeypatch.setenv("TLLM_GEN_ADMISSION_TTFT_PERCENTILE", "100")
+    assert gen_preemption.headroom_for_args(128, enabled) == 0
+    assert enabled.scheduler_config.gen_preemption.enabled
 
 
 @pytest.mark.parametrize(
@@ -313,7 +339,7 @@ def test_decisions_are_rank_identical(settings):
 
 
 @pytest.mark.parametrize(
-    "failure", [None, "off", "pp", "scheduler", "admission", "dp", "slots", "draft", "recurrent"]
+    "failure", [None, "off", "scheduler", "admission", "slots", "draft", "recurrent"]
 )
 def test_startup(failure):
     slots = Mock()
@@ -330,17 +356,10 @@ def test_startup(failure):
             resource_managers={ResourceManagerType.SEQ_SLOT_MANAGER: slots}
         ),
     )
-    if failure == "pp":
-        ex.dist.has_pp = True
-        with pytest.raises(ValueError, match="pipeline parallelism"):
-            create_gen_preemption(ex, ON)
-        return
     if failure == "scheduler":
         ex.scheduler = object()
     elif failure == "admission":
         ex._gen_admission = GenAdmissionConfig(ttft_percentile=100)
-    elif failure == "dp":
-        ex.enable_attention_dp = True
     elif failure == "slots":
         slots.get_max_resource_count.return_value = 175
     elif failure == "draft":
@@ -348,7 +367,7 @@ def test_startup(failure):
     elif failure == "recurrent":
         ex.kv_cache_manager._max_resident_sequences = lambda: 175
     with patch.object(gen_preemption, "logger") as log:
-        result = create_gen_preemption(ex, GenPreemptionSettings() if failure == "off" else ON)
+        result = create_gen_preemption(ex, GenPreemptionConfig() if failure == "off" else ON)
     assert (result is not None) == (failure is None)
     assert log.warning.called == (failure not in (None, "off"))
 
@@ -406,6 +425,22 @@ def drafter(kind, num_slots=4):
     return worker, prepare
 
 
+def executor_for_preemption(p, reqs, scheduler):
+    return SimpleNamespace(
+        _gen_preemption=p,
+        scheduler=scheduler,
+        active_requests=reqs,
+        inflight_req_ids=set(),
+        kv_cache_manager=Mock(spec=[]),
+        kv_cache_transceiver=None,
+        is_encoder_decoder=False,
+        enable_attention_dp=False,
+        enable_batch_waiting=False,
+        _cap_context_by_total_kv_len=lambda requests: requests,
+        _maybe_record_hang_diagnostic_phase=Mock(),
+    )
+
+
 @pytest.mark.parametrize("kind", ["dflash", "dspark"])
 @pytest.mark.parametrize("settings", [ON, SLO])
 def test_forced_resume_accounting_and_drafter_lifecycle(kind, settings):
@@ -420,21 +455,14 @@ def test_forced_resume_accounting_and_drafter_lifecycle(kind, settings):
     assert p.step(reqs, 108.0, 1, 2, queue()) == 2  # forced resume blocks admission
     scheduler = Mock()
     scheduler.schedule_request.side_effect = lambda requests, _: SchedulerOutput(
-        [], [], requests[:1], [], [], 1
+        [],
+        [],
+        sorted(requests, key=lambda req: req.py_request_id not in p.resumed_ids)[:1],
+        [],
+        [],
+        1,
     )
-    ex = SimpleNamespace(
-        _gen_preemption=p,
-        scheduler=scheduler,
-        active_requests=reqs,
-        inflight_req_ids=set(),
-        kv_cache_manager=Mock(spec=[]),
-        kv_cache_transceiver=None,
-        is_encoder_decoder=False,
-        enable_attention_dp=False,
-        enable_batch_waiting=False,
-        _cap_context_by_total_kv_len=lambda requests: requests,
-        _maybe_record_hang_diagnostic_phase=Mock(),
-    )
+    ex = executor_for_preemption(p, reqs, scheduler)
     worker, prepare = drafter(kind)
     prepare([1, 2])
     slots = dict(worker._req_to_slot)
@@ -451,6 +479,8 @@ def test_forced_resume_accounting_and_drafter_lifecycle(kind, settings):
         assert scheduled.paused_in_place_ids == p.paused_ids == paused
         assert next(req for req in reqs if req.py_request_id in paused).py_batch_idx is None
         prepare(expected, paused)
+        for batch_idx, rid in enumerate(expected):
+            next(req for req in reqs if req.py_request_id == rid).py_batch_idx = batch_idx
         assert worker._req_to_slot == slots and int(worker._ctx_len[slots[2]]) == 77
         if now < 116.0:
             assert p._reqs[2].paused_t == 108.0 and p._reqs[2].pauses == 1
@@ -466,3 +496,34 @@ def test_forced_resume_accounting_and_drafter_lifecycle(kind, settings):
     prepare([1, 2, 3])
     assert worker._req_to_slot[2] == slots[2] and int(worker._ctx_len[slots[2]]) == 77
     assert 4 not in worker._req_to_slot and len(worker._free_slots) == 1
+
+
+@pytest.mark.parametrize("settings", [ON, SLO])
+@pytest.mark.parametrize("force_resume", [False, True])
+@pytest.mark.parametrize("replay_only", [False, True])
+def test_unrelated_unscheduled_decodes_keep_pause_budget(settings, force_resume, replay_only):
+    """Replay-only batches must not turn skipped decodes into preemption victims."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import SchedulerOutput
+
+    p = policy(settings)
+    reqs = running(p, start_id=1)
+    if force_resume:
+        p._pause(reqs[0])
+        assert p.step(reqs, 108.0, 1, 2, queue()) == 2
+        assert p.forced_resumed_ids == {1}
+    scheduler = Mock()
+    reqs[1].py_batch_idx = None
+    generation = [] if replay_only else reqs[:1]
+    scheduler.schedule_request.return_value = SchedulerOutput(
+        [], [], generation, [], [], len(generation)
+    )
+    ex = executor_for_preemption(p, reqs, scheduler)
+    before = {rid: r.pauses for rid, r in p._reqs.items()}
+    for now in (108.0, 110.0):
+        p.observe(reqs, now)
+        scheduled, _, _ = PyExecutor._schedule(ex)
+        assert not scheduled.paused_in_place_ids
+        assert not p.paused_ids
+    assert {rid: r.pauses for rid, r in p._reqs.items()} == before
+    assert p._victim(reqs, 1) is not None

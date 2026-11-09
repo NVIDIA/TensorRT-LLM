@@ -603,9 +603,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
             # window. Previously such IDs aliased to slot 0 and corrupted whichever
             # real request occupied it. The scratch row is never handed out through
             # ``_free_slots`` and its contents are throwaway.
-            from ..pyexecutor.scheduler.gen_preemption import resident_headroom
-
-            num_slots = max_batch + resident_headroom(max_batch)
+            cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
+            num_slots = max_batch + getattr(cache_manager, "gen_preemption_headroom", 0)
             self._scratch_slot = num_slots
             num_rows = num_slots + 1
 

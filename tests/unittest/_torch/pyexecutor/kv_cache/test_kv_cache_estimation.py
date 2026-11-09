@@ -984,15 +984,7 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
 
 
 @pytest.mark.parametrize("preemption", [False, True])
-def test_v2_cache_size_per_token_models_generation_swa_cost(preemption, monkeypatch):
-    from tensorrt_llm._torch.pyexecutor.scheduler import gen_preemption
-
-    monkeypatch.setattr(
-        gen_preemption,
-        "_active_settings",
-        gen_preemption.GenPreemptionSettings(tpot_budget=0.1 if preemption else None),
-    )
-
+def test_v2_cache_size_per_token_models_generation_swa_cost(preemption):
     class FakeModelConfig:
         quant_config = None
         pretrained_config = SimpleNamespace(
@@ -1014,6 +1006,7 @@ def test_v2_cache_size_per_token_models_generation_swa_cost(preemption, monkeypa
             tokens_per_block=64,
             max_seq_len=4096,
             max_batch_size=3,
+            gen_preemption_headroom=1 if preemption else 0,
             kv_cache_config=KvCacheConfig(
                 max_attention_window=[2048, 2048, 4096], enable_swa_scratch_reuse=False
             ),
@@ -1026,6 +1019,7 @@ def test_v2_cache_size_per_token_models_generation_swa_cost(preemption, monkeypa
             tokens_per_block=64,
             max_seq_len=4096,
             max_batch_size=3,
+            gen_preemption_headroom=1 if preemption else 0,
             kv_cache_config=KvCacheConfig(
                 max_attention_window=[2048, 2048, 4096], enable_swa_scratch_reuse=True
             ),
@@ -1407,14 +1401,7 @@ def test_v2_resolved_draft_width_does_not_change_target_only_headroom(
 
 
 @pytest.mark.parametrize("preemption", [False, True])
-def test_v2_quota_from_max_tokens_models_context_swa_scratch(preemption, monkeypatch):
-    from tensorrt_llm._torch.pyexecutor.scheduler import gen_preemption
-
-    monkeypatch.setattr(
-        gen_preemption,
-        "_active_settings",
-        gen_preemption.GenPreemptionSettings(tpot_budget=0.1 if preemption else None),
-    )
+def test_v2_quota_from_max_tokens_models_context_swa_scratch(preemption):
     manager = object.__new__(KVCacheManagerV2)
     manager.layer_specs = None
     manager._has_cp_helix = False
@@ -1423,6 +1410,7 @@ def test_v2_quota_from_max_tokens_models_context_swa_scratch(preemption, monkeyp
     manager.max_attention_window_vec = [128, 128, None]
     manager.tokens_per_block = 64
     manager.max_batch_size = 4
+    manager.gen_preemption_headroom = 2 if preemption else 0
     manager.max_num_tokens = 1000
     manager._generation_kv_capacity_headroom = 1
     manager.get_layer_bytes_per_token = lambda local_layer_idx, data_role: [10, 10, 20][

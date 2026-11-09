@@ -526,11 +526,7 @@ def test_build_cache_config_long_decode_constraint(
 
 
 @pytest.mark.parametrize("preemption", [False, True])
-def test_cache_size_estimation_uses_model_attention_layer_count(preemption, monkeypatch):
-    from tensorrt_llm._torch.pyexecutor.scheduler import gen_preemption
-
-    monkeypatch.setattr(gen_preemption, "_active_settings", gen_preemption.GenPreemptionSettings())
-
+def test_cache_size_estimation_uses_model_attention_layer_count(preemption):
     class FakeModelConfig:
         sparse_attention_config = SimpleNamespace(
             index_head_dim=128,
@@ -557,11 +553,6 @@ def test_cache_size_estimation_uses_model_attention_layer_count(preemption, monk
     cost = CacheCost.from_raw(size_per_token)
     assert cost.slope > 0
     assert cost.intercept == 0
-    monkeypatch.setattr(
-        gen_preemption,
-        "_active_settings",
-        gen_preemption.GenPreemptionSettings(tpot_budget=0.1 if preemption else None),
-    )
     config = FakeModelConfig()
     cost = CacheCost.from_raw(
         DeepseekV4CacheManager.get_cache_size_per_token(
@@ -569,6 +560,7 @@ def test_cache_size_estimation_uses_model_attention_layer_count(preemption, monk
             Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
             tokens_per_block=128,
             max_batch_size=4,
+            gen_preemption_headroom=2 if preemption else 0,
         )
     )
     _, per_request = deepseek_v4_cache._estimate_swa_cache_size(
@@ -587,10 +579,7 @@ def test_cache_size_estimation_uses_model_attention_layer_count(preemption, monk
 
 
 @pytest.mark.parametrize("preemption", [False, True])
-def test_quota_from_max_tokens_models_context_swa_scratch(preemption, monkeypatch):
-    from tensorrt_llm._torch.pyexecutor.scheduler import gen_preemption
-
-    monkeypatch.setattr(gen_preemption, "_active_settings", gen_preemption.GenPreemptionSettings())
+def test_quota_from_max_tokens_models_context_swa_scratch(preemption):
     manager = object.__new__(DeepseekV4CacheManager)
     manager.pp_layers = [0, 1]
     manager._compress_ratios = [4, 4]
@@ -624,11 +613,7 @@ def test_quota_from_max_tokens_models_context_swa_scratch(preemption, monkeypatc
     assert no_scratch_small_quota < no_scratch_large_quota
     assert no_scratch_delta > scratch_delta
     assert manager._get_max_tokens_from_quota(no_scratch_large_quota) == 4096
-    monkeypatch.setattr(
-        gen_preemption,
-        "_active_settings",
-        gen_preemption.GenPreemptionSettings(tpot_budget=0.1 if preemption else None),
-    )
+    manager.gen_preemption_headroom = 1 if preemption else 0
     _, per_request = deepseek_v4_cache._estimate_swa_cache_size(
         576,
         128,

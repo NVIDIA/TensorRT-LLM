@@ -13,47 +13,36 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+from tensorrt_llm.llmapi.llm_args import GenPreemptionConfig
 from tensorrt_llm.logger import logger
 
 from ..llm_request import LlmRequest, LlmRequestState
 from .gen_admission_queue import STATS_LOG_PERIOD_S, GenAdmissionConfig, GenAdmissionWaitingQueue
 
 
-@dataclass(frozen=True)
-class GenPreemptionSettings:
-    """``scheduler_config.gen_preemption``: at most one bound; neither is off."""
-
-    tpot_budget: Optional[float] = None
-    target_output_tps: Optional[float] = None
-
-    @classmethod
-    def from_config(cls, config) -> "GenPreemptionSettings":
-        return cls(config.tpot_budget, config.target_output_tps) if config else cls()
-
-    @property
-    def enabled(self) -> bool:
-        return self.tpot_budget is not None or self.target_output_tps is not None
-
-
 def paused_cap(max_num_active_requests: int) -> int:
-    """Requests paused at once, also the pools' resident headroom."""
+    """Bound paused residency to three requests per eight active slots.
+
+    The prototype reserves this fixed memory budget for TTFT rescue: batch 128
+    keeps at most 48 paused residents. A larger cap would retain more KV and
+    recurrent/drafter state; a smaller cap would admit fewer at-risk waiters.
+    """
     return max(1, int(round(0.375 * max_num_active_requests)))
 
 
-# Settings of the executor being created; pools are sized from them.
-_active_settings = GenPreemptionSettings()
+def resident_headroom(max_batch_size: int, config: Optional[GenPreemptionConfig]) -> int:
+    """Entries each resident pool reserves for this executor's paused requests."""
+    return paused_cap(max_batch_size) if config is not None and config.enabled else 0
 
 
-def configure(config) -> None:
-    """Install ``scheduler_config.gen_preemption`` for pool sizing."""
-    global _active_settings
-    _active_settings = GenPreemptionSettings.from_config(config)
-
-
-def resident_headroom(max_batch_size: int, settings: Optional[GenPreemptionSettings] = None) -> int:
-    """Entries a pool with one per resident request adds for paused requests."""
-    settings = settings or _active_settings
-    return paused_cap(max_batch_size) if settings.enabled else 0
+def headroom_for_args(max_batch_size: int, llm_args) -> int:
+    """Resolve headroom from this executor's validated configuration."""
+    config = getattr(getattr(llm_args, "scheduler_config", None), "gen_preemption", None)
+    return (
+        0
+        if unsupported_headroom_reason(config, llm_args)
+        else resident_headroom(max_batch_size, config)
+    )
 
 
 def unsupported_headroom_reason(config, llm_args) -> Optional[str]:
@@ -62,14 +51,10 @@ def unsupported_headroom_reason(config, llm_args) -> Optional[str]:
     An unresolved V2 ``"auto"`` keeps headroom until the runtime check; explicit
     V1 or settings that demote V2 do not reserve it.
     """
-    if config is None or not GenPreemptionSettings.from_config(config).enabled:
+    if config is None or not config.enabled:
         return None
     if llm_args is None:
         return None
-    if getattr(llm_args, "pipeline_parallel_size", 1) > 1:
-        return "not supported with pipeline parallelism"
-    if getattr(llm_args, "enable_attention_dp", False):
-        return "not supported with attention DP"
     if not GenAdmissionConfig.from_env().needs_clock:
         return "needs the auto GEN admission policy (0 < TLLM_GEN_ADMISSION_TTFT_PERCENTILE < 99)"
     kv_cache_config = getattr(llm_args, "kv_cache_config", None)
@@ -126,13 +111,14 @@ class GenPreemption:
     laxity_min_frac, laxity_resume_frac = 0.02, 0.01  # x D
     laxity_max_pauses, below_target_max_pauses = 8, 3
 
-    def __init__(self, settings: GenPreemptionSettings, max_num_active_requests: int) -> None:
+    def __init__(self, settings: GenPreemptionConfig, max_num_active_requests: int) -> None:
         self.settings = settings
         self.slo = settings.target_output_tps is not None
         self.max_paused = paused_cap(max_num_active_requests)
         self._reqs: dict[int, _Req] = {}
         self._paused: dict = {}  # req_id -> request, in pause order
         self._resumed_ids: set[int] = set()
+        self._forced_resumed_ids: set[int] = set()
         self._order = 0
         self._now: Optional[float] = None
         self.theta = 0.0  # log g
@@ -149,6 +135,10 @@ class GenPreemption:
     @property
     def resumed_ids(self) -> frozenset[int]:
         return frozenset(self._resumed_ids)
+
+    @property
+    def forced_resumed_ids(self) -> frozenset[int]:
+        return frozenset(self._forced_resumed_ids)
 
     @property
     def gain(self) -> float:
@@ -177,6 +167,7 @@ class GenPreemption:
         """Track, resume, then pause; returns the admission count (paused
         requests hold no slot)."""
         self._resumed_ids.clear()
+        self._forced_resumed_ids.clear()
         gen_queue = isinstance(waiting_queue, GenAdmissionWaitingQueue)
         self.observe(active_requests, now, gen_queue and waiting_queue.target_s is not None)
         num_active -= len(self._paused)
@@ -187,10 +178,6 @@ class GenPreemption:
                 self._pause(victim)
                 num_active -= 1
         return num_active
-
-    def scheduling_order(self, active_requests) -> list:
-        """Give resumed requests the first available batch slots."""
-        return sorted(active_requests, key=lambda req: req.py_request_id not in self._resumed_ids)
 
     def record_displaced(self, req) -> None:
         """Charge an unscheduled live decode interval as a bounded pause."""
@@ -289,6 +276,7 @@ class GenPreemption:
                 if self._now < self._resume_at(r):
                     continue
                 self.stats["forced"] += 1
+                self._forced_resumed_ids.add(rid)
             n += 1
             del self._paused[rid]
             self._resumed_ids.add(rid)
@@ -403,8 +391,6 @@ def _unsupported(ex) -> Optional[str]:
         return "needs the KV cache manager V2 scheduler"
     if not ex._gen_admission.needs_clock:
         return "needs the auto GEN admission policy (0 < TLLM_GEN_ADMISSION_TTFT_PERCENTILE < 99)"
-    if ex.enable_attention_dp:
-        return "not supported with attention DP"
     from ..resource_manager import ResourceManagerType
 
     # Every pool with one entry per resident request must hold the paused ones.
@@ -423,12 +409,10 @@ def _unsupported(ex) -> Optional[str]:
     return None
 
 
-def create_gen_preemption(executor, settings: Optional[GenPreemptionSettings]):
+def create_gen_preemption(executor, settings: Optional[GenPreemptionConfig]):
     """The executor's GenPreemption, or None (off, or unsupported: a warning)."""
     if settings is None or not settings.enabled:
         return None
-    if executor.dist.has_pp:
-        raise ValueError("GEN slot preemption is not supported with pipeline parallelism")
     reason = _unsupported(executor)
     if executor.dist.rank == 0:
         if reason is None:

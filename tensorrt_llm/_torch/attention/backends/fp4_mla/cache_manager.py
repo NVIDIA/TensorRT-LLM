@@ -1100,9 +1100,7 @@ class Fp4MlaV2CacheLayoutPolicy:
         # resident sequence needs one native HP ring page per local layer.
         # GEN slot preemption pauses residents in place, so the paused cap
         # stays resident too.
-        from tensorrt_llm._torch.pyexecutor.scheduler.gen_preemption import resident_headroom
-
-        return self.max_batch_size * self.mapping.pp_size + resident_headroom(self.max_batch_size)
+        return self.max_batch_size * self.mapping.pp_size + self.gen_preemption_headroom
 
     def get_cache_bytes_per_token(self) -> int:
         sizes, _ = self._get_runtime_cache_size_layer_components()
@@ -1169,12 +1167,12 @@ class Fp4MlaV2CacheLayoutPolicy:
             * torch.empty((), dtype=torch.float8_e4m3fn).element_size()
             * num_fp8_layers
         )
-        from tensorrt_llm._torch.pyexecutor.scheduler.gen_preemption import resident_headroom
-
         # Every resident sequence keeps one native HP ring page per local
         # layer across pipeline stages; GEN slot preemption pauses residents
         # in place, so the paused cap stays resident too.
-        resident_capacity = max_batch_size * mapping.pp_size + resident_headroom(max_batch_size)
+        resident_capacity = max_batch_size * mapping.pp_size + int(
+            kwargs.get("gen_preemption_headroom", 0)
+        )
         return cache_bytes, hp_bytes * resident_capacity
 
 

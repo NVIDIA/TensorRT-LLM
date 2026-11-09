@@ -48,7 +48,8 @@ from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.multimodal import (get_multimodal_item_metadata,
                                             strip_mm_data_for_generation)
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
-                                          ExecutorMemoryType, PeftCacheConfig,
+                                          ExecutorMemoryType,
+                                          GenPreemptionConfig, PeftCacheConfig,
                                           PrefillCudaGraphBackend,
                                           WaitingQueuePolicy)
 from tensorrt_llm.llmapi.utils import \
@@ -134,8 +135,7 @@ from .scheduler.adp_router import (ADPRouter, RankIterStatsPayload, RankState,
                                    count_retiring_requests)
 from .scheduler.gen_admission_queue import (GenAdmissionConfig,
                                             GenAdmissionWaitingQueue)
-from .scheduler.gen_preemption import (GenPreemptionSettings,
-                                       create_gen_preemption)
+from .scheduler.gen_preemption import create_gen_preemption
 from .scheduler.scheduler import RemoteTailPhase
 from .scheduler.scheduler_v2 import KVCacheV2Scheduler
 
@@ -718,7 +718,7 @@ class PyExecutor:
         enable_adp_dummy_fixes: bool = False,
         enable_scheduler_aware_adp_dummy: bool = False,
         enable_non_overlap_adp_forward_intent: bool = False,
-        gen_preemption: Optional[GenPreemptionSettings] = None,
+        gen_preemption: Optional[GenPreemptionConfig] = None,
         transfer_budget_is_explicit: bool = False,
     ) -> None:
         if kv_pool_rebalance_check_interval <= 0:
@@ -8865,12 +8865,8 @@ class PyExecutor:
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
-        requests_to_schedule = self.active_requests
-        if getattr(self, "_gen_preemption", None) is not None:
-            requests_to_schedule = self._gen_preemption.scheduling_order(
-                requests_to_schedule)
         scheduler_output = self.scheduler.schedule_request(
-            requests_to_schedule, self.inflight_req_ids)
+            self.active_requests, self.inflight_req_ids)
 
         scheduled_encoder_requests = scheduler_output.encoder_requests
         should_batch_encoder_requests = (self.is_encoder_decoder
@@ -8938,15 +8934,21 @@ class PyExecutor:
                 for req in (scheduled_requests.paused_requests +
                             scheduled_requests.recompute_paused_requests)
             }
+            num_displaced = len(scheduled_ids
+                                & self._gen_preemption.forced_resumed_ids)
             for req in self.active_requests:
-                if (req.state == LlmRequestState.GENERATION_IN_PROGRESS
+                if (num_displaced > 0
+                        and req.state == LlmRequestState.GENERATION_IN_PROGRESS
+                        and req.py_batch_idx is not None
                         and req.py_request_id not in scheduled_ids
+                        and req.py_request_id not in retained_ids
                         and req.py_request_id not in evicted_ids):
                     # Forced resumes may displace another live decode request.
                     # Its previous sample is harvested without a new forward.
                     req.py_batch_idx = None
                     self._gen_preemption.record_displaced(req)
                     retained_ids.add(req.py_request_id)
+                    num_displaced -= 1
             scheduled_requests.paused_in_place_ids = frozenset(retained_ids)
 
         self._maybe_record_hang_diagnostic_phase("scheduled",

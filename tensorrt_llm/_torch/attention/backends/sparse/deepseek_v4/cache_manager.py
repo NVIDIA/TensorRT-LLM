@@ -2075,11 +2075,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             use_fp8_ds_mla=use_fp8_ds_mla,
         )
         max_batch_size = int(kwargs.get("max_batch_size") or 0)
-        from tensorrt_llm._torch.pyexecutor.scheduler.gen_preemption import resident_headroom
-
         # Paused decode requests keep their SWA caches; the static cost
         # covers every resident request, not just the active ones.
-        resident_capacity = max_batch_size + resident_headroom(max_batch_size)
+        resident_capacity = max_batch_size + int(kwargs.get("gen_preemption_headroom", 0))
         return (
             non_sliding_attn_size_per_token + swa_size_per_token,
             swa_size_per_request * resident_capacity,

@@ -638,10 +638,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return super()._get_pool_roles(pool_id)
 
     def _max_resident_sequences(self) -> int:
-        from ...scheduler.gen_preemption import resident_headroom
-
         # Plus the requests paused in place by GEN slot preemption.
-        return self.max_batch_size * self.mapping.pp_size + resident_headroom(self.max_batch_size)
+        return self.max_batch_size * self.mapping.pp_size + self.gen_preemption_headroom
 
     def _mamba_state_bytes_per_slot(self) -> int:
         """Return persistent bytes per slot allocated by the native pools."""
