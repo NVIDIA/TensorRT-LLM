@@ -22,6 +22,7 @@ from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor.utils import check_prompt_capacity
 from tensorrt_llm.llmapi.utils import _reapply_current_thread_affinity_to_all_threads
 from tensorrt_llm.logger import logger
+from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import host_profiler_context
 
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
 from .engine.model_setup import build_encoder_runner
@@ -374,7 +375,10 @@ class ScheduledEncoderExecutor:
     def _loop_wrapper(self) -> None:
         crashed = False
         try:
-            with customized_gc_thresholds(self._gc_gen0_threshold):
+            with (
+                host_profiler_context(enable=bool(os.environ.get("TLLM_LINE_PROFILER_PATH"))),
+                customized_gc_thresholds(self._gc_gen0_threshold),
+            ):
                 self._loop()
         except Exception as error:
             # A raise after the loop's own exit is teardown; peers are only

@@ -45,7 +45,7 @@ import time
 import uuid
 import weakref
 from contextlib import contextmanager
-from typing import Callable, Dict, Iterator, List, Optional, Set
+from typing import Callable, Dict, Iterator, List, Optional
 
 import torch
 
@@ -128,7 +128,7 @@ class ProfileController:
         rank: int,
         current_iteration: Callable[[], int],
         is_warmup: Callable[[], bool],
-        broadcast_start: Callable[[Dict], None],
+        broadcast_start: Callable[[dict], None],
         broadcast_stop: Callable[[], None],
     ) -> None:
         self.rank = rank
@@ -161,8 +161,8 @@ class ProfileController:
         self._profile_state_lock = threading.Lock()
         self._profile_enabled: bool = False
 
-        self.profile_start_iters: Set[int] = set()
-        self.profile_stop_iters: Set[int] = set()
+        self.profile_start_iters: set[int] = set()
+        self.profile_stop_iters: set[int] = set()
         self.reset_iterations()
 
         # Window state owned by the executor thread inside ``iterations()``.

@@ -7,6 +7,7 @@ reused output buffer, as a captured graph does, and can hold or fail a forward. 
 executor's queue, admission, batching, completion and delivery are real.
 """
 
+import re
 import threading
 import time
 from contextlib import contextmanager
@@ -309,6 +310,20 @@ def test_profiling_writes_a_trace_of_the_window(tmp_path):
         assert not h.executor._profiler.enabled
         (trace,) = tmp_path.glob("trtllm-trace-*-rank-0.json")
         assert trace.stat().st_size > 0
+
+
+def test_line_profiler_profiles_the_loop_by_default(tmp_path, monkeypatch):
+    output = tmp_path / "line_profile.txt"
+    monkeypatch.setenv("TLLM_LINE_PROFILER_PATH", str(output))
+    with _harness() as h:
+        h.executor.start_worker()
+        h.result(h.submit())
+
+    timed = re.search(
+        r"Total time:\s*([\d.e+-]+)\s*s\nFile:.*?\nFunction:.*ScheduledEncoderExecutor\._run\s",
+        output.read_text(),
+    )
+    assert timed and float(timed.group(1)) > 0
 
 
 def test_a_crashed_loop_wakes_waiters_with_its_error():
