@@ -24,6 +24,7 @@ the built-in stores.
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -32,6 +33,7 @@ import triton.language as tl
 
 from tensorrt_llm._torch.models import modeling_musespark_open as _builtin
 from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenGatedResidual
+from tensorrt_llm.logger import logger
 
 #: Rows at or below which the built-in join may take its cluster boundary kernel instead
 #: of the Triton one; a sequence-parallel shard always has more.
@@ -100,8 +102,13 @@ def join_with_router_input(
     eps: float,
     next_norm,
     gain: Optional[torch.Tensor] = None,
+    out: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """``(updated, next_input, next_input.float())`` from one launch, or None.
+
+    ``out``: contiguous ``(updated, next_input, router_input)`` buffers of the call's
+    shape to write instead of fresh ones (row slices of whole-shard buffers; the kernel
+    is one program per row, so a slice's rows are the whole-shard call's bit for bit).
 
     None wherever the built-in ``_add_after_rmsnorm_and_norm`` would not launch its
     Triton kernel with this call's operands (its unfused or cluster-boundary arms); the
@@ -125,9 +132,21 @@ def join_with_router_input(
     ):
         return None
     alpha, beta = join.coefficients()
-    updated = torch.empty_like(residual)
-    next_input = torch.empty_like(branch)
-    router_input = torch.empty_like(residual)
+    if out is None:
+        updated = torch.empty_like(residual)
+        next_input = torch.empty_like(branch)
+        router_input = torch.empty_like(residual)
+    else:
+        updated, next_input, router_input = out
+        if not (
+            updated.shape == residual.shape
+            and router_input.shape == residual.shape
+            and next_input.shape == branch.shape
+            and updated.is_contiguous()
+            and next_input.is_contiguous()
+            and router_input.is_contiguous()
+        ):
+            return None
     hidden_size = residual.shape[-1]
     _join_with_router_input_kernel[(residual.shape[0],)](
         updated,
@@ -148,6 +167,81 @@ def join_with_router_input(
         num_warps=_builtin._RESIDUAL_NUM_WARPS,
     )
     return updated, next_input, router_input
+
+
+def tail_pipeline(layer, residual: torch.Tensor, split) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The attention-side join and the MoE input preparation, chunk by chunk (``MUSESPARK_OPEN_SP_TAIL_PIPELINE``).
+
+    ``split`` is the overlapped output projection's ``SplitProjection``: chunk ``c``
+    holds rows ``[lo, hi)`` of this rank's shard, reduced on the projection stream. For
+    each chunk in turn, after its reduce-scatter's event, the main stream runs the join
+    (``join_with_router_input`` into row slices of whole-shard buffers), the router GEMM
+    on the join's FP32 rows and the pooler GEMM + pre-expert NVFP4 quantization on its
+    BF16 rows, while the later chunks are still being reduced. The router logits and the
+    NVFP4 payload and scales are concatenated and handed to the layer's MoE
+    (``moe.sp_pre``), whose sequence-parallel arm then routes and gathers them as before.
+
+    Numerics: the join, the quantization and the routing are per row. The router and
+    pooler GEMMs run on row chunks of the shard; their rows equal the whole-shard GEMM's
+    only where the GEMM library computes each row alike at both row counts (checked per
+    shape), otherwise this is an accumulation-order
+    change.
+    """
+    from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+
+    from .moe import _fp32_router_input_takes
+
+    moe = layer.feed_forward
+    join = layer.add_attn
+    eps = layer.post_attn_norm.variance_epsilon
+    next_norm = layer.pre_ffn_norm
+    main = torch.cuda.current_stream()
+    hidden = residual.shape[1]
+    updated = torch.empty_like(residual)
+    next_input = torch.empty((residual.shape[0], hidden), dtype=split.results[0].dtype, device=residual.device)
+    router_input = torch.empty_like(residual)
+    logits, payload, scales = [], [], []
+    for (lo, hi), reduced, event in split.chunks():
+        main.wait_event(event)
+        rows = slice(lo, hi)
+        joined = join_with_router_input(
+            join, residual[rows], reduced, eps, next_norm, None,
+            out=(updated[rows], next_input[rows], router_input[rows]),
+        )
+        if joined is None:
+            raise RuntimeError(
+                "[musespark_open] MUSESPARK_OPEN_SP_TAIL_PIPELINE: the attention-side join of a "
+                "chunk would not run its fused kernel"
+            )
+        chunk_in = next_input[rows]
+        if _fp32_router_input_takes(moe, chunk_in):
+            logits.append(moe.router(router_input[rows]) * moe.metap_multiplier)
+        else:
+            logits.append(moe.router_logits(chunk_in))
+        prepared = moe.prepare_expert_input(moe.pooler(chunk_in))
+        if not isinstance(prepared, Fp4QuantizedTensor) or prepared.is_sf_swizzled:
+            raise RuntimeError(
+                "[musespark_open] MUSESPARK_OPEN_SP_TAIL_PIPELINE: the pre-expert quantization of a "
+                "chunk did not return an unswizzled NVFP4 tensor"
+            )
+        payload.append(prepared.fp4_tensor)
+        scales.append(prepared.scaling_factor)
+    split.release(main)
+    moe.sp_pre = (
+        next_input,
+        torch.cat(logits, 0) if len(logits) > 1 else logits[0],
+        Fp4QuantizedTensor(
+            torch.cat(payload, 0) if len(payload) > 1 else payload[0],
+            torch.cat(scales, 0) if len(scales) > 1 else scales[0],
+            is_sf_swizzled=False,
+        ),
+    )
+    logger.info_once(
+        f"[musespark_open] MUSESPARK_OPEN_SP_TAIL_PIPELINE: attention-side join and MoE input "
+        f"prepared in {len(logits)} chunks behind the output projection's reduce-scatters",
+        key="musespark_open.sp_tail_pipeline",
+    )
+    return updated, next_input
 
 
 class SequenceParallelStep:
@@ -223,4 +317,6 @@ def install(model, step: SequenceParallelStep) -> int:
         # ``_sp_moe = None`` first, and the module tree would hold the MoE twice.
         object.__setattr__(join, "_sp_step", step)
         object.__setattr__(join, "_sp_moe", layer.feed_forward)
+        if os.getenv("MUSESPARK_OPEN_SP_TAIL_PIPELINE", "0") == "1":
+            layer._sp_tail_pipeline = tail_pipeline
     return changed

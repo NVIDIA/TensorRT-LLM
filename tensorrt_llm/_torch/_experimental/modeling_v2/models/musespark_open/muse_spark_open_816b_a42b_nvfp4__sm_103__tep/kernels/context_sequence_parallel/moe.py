@@ -252,6 +252,9 @@ class ContextSequenceParallelMoE:
     #: ``(norm output, its FP32 widening)`` left by the layer's attention-side join for
     #: the next sequence-parallel call (``router_input``); consumed or dropped by it.
     sp_router_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    #: ``(norm output, router logits, NVFP4 expert input)`` of the shard, prepared by the
+    #: attention-side tail pipeline (``router_input.tail_pipeline``); consumed or dropped.
+    sp_pre = None
     #: Whether a sequence-parallel call routes the shard's rows and gathers their ids and
     #: weights (``shard_routing``); otherwise it gathers the router logits (``install``).
     _sp_shard_routing: bool = True
@@ -278,14 +281,21 @@ class ContextSequenceParallelMoE:
             or rows > getattr(experts, "moe_max_num_tokens", rows)
         ):
             self.sp_router_input = None
+            self.sp_pre = None
             return super().forward(hidden_states, attn_metadata, *args, **kwargs)
         mapping = self.mapping
         shard = hidden_states.shape[0]
         routing_method = experts.routing_method
-        with self.nvtx("router"):
-            router_logits = self._sp_router_logits(hidden_states)
+        pre, self.sp_pre = self.sp_pre, None
+        if pre is not None and pre[0] is hidden_states:
+            self.sp_router_input = None
+            router_logits, prepared = pre[1], pre[2]
+        else:
+            with self.nvtx("router"):
+                router_logits = self._sp_router_logits(hidden_states)
+            with self.nvtx("pool"):
+                prepared = self.prepare_expert_input(self.pooler(hidden_states))
         with self.nvtx("pool"):
-            prepared = self.prepare_expert_input(self.pooler(hidden_states))
             if isinstance(prepared, Fp4QuantizedTensor):
                 fp4, scale = prepared.fp4_tensor, prepared.scaling_factor
                 if prepared.is_sf_swizzled or fp4.shape[0] != shard or scale.numel() % shard:

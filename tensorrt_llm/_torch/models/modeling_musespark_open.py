@@ -1715,6 +1715,35 @@ def _fused_preattention_enabled() -> bool:
     )
 
 
+class SplitProjection:
+    """The overlapped output projection's reduced chunks, not yet joined (``_sp_tail_split``).
+
+    ``chunks()`` yields ``((lo, hi), reduced rows, event)``: rows ``[lo, hi)`` of this
+    rank's shard and the event of their reduce-scatter on ``stream``. The consumer waits
+    each event on its stream before reading the rows, and calls ``release`` once every
+    read is enqueued: that orders the next reuse of the reduced buffers (allocated on
+    ``stream``) after their consumption and drops the projection partials, which the
+    reduce-scatters read, only after the main stream has waited for all of them.
+    """
+
+    def __init__(self, results, events, partials, stream, bounds) -> None:
+        self.results = results
+        self.events = events
+        self._partials = partials
+        self.stream = stream
+        self.bounds = bounds
+
+    def chunks(self):
+        for index, (reduced, event) in enumerate(zip(self.results, self.events)):
+            yield (self.bounds[index], self.bounds[index + 1]), reduced, event
+
+    def release(self, main: torch.cuda.Stream) -> None:
+        for event in self.events:
+            main.wait_event(event)
+        self.stream.wait_stream(main)
+        self._partials = None
+
+
 class MuseSparkOpenAttention(QKNormRoPEAttention):
     """Attention with weightless per-head Q/K norms, a query pre-scale, an
     output norm+gate fused into the QKV projection, and a per-layer scope.
@@ -1919,7 +1948,13 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
         return reducescatter(partial, self.mapping, dim=0)
 
     def _overlap_sp_output_projection(self, attention_output: torch.Tensor) -> torch.Tensor:
-        """Project two chunks while reducing the preceding chunk to its token owners."""
+        """Project two chunks while reducing the preceding chunk to its token owners.
+
+        With ``_sp_tail_split`` set (by the decoder layer, for one call) the reduced
+        chunks are returned unjoined as a ``SplitProjection``: each with the event of its
+        reduce-scatter, so the caller can start on chunk ``c``'s rows while later chunks
+        are still being reduced.
+        """
         main = torch.cuda.current_stream(attention_output.device)
         if self._sp_projection_stream is None:
             self._sp_projection_stream = torch.cuda.Stream(device=attention_output.device)
@@ -1932,6 +1967,8 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
         bounds = [-(-shard * c // chunks) for c in range(chunks + 1)]
         results = []
         partials = []
+        events = []
+        split = getattr(self, "_sp_tail_split", False)
         for begin, end in zip(bounds[:-1], bounds[1:]):
             # Each collective must see owner-major rows. Splitting the original
             # tensor in half would send rows to the wrong rank.
@@ -1946,11 +1983,17 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
             stream.wait_stream(main)
             with torch.cuda.stream(stream):
                 reduced = reducescatter(partial, self.mapping, dim=0)
+                if split:
+                    event = torch.cuda.Event()
+                    event.record(stream)
+                    events.append(event)
             # Keep main-stream allocations alive through the final join. Their
             # next reuse on main is then ordered after the collective, without
             # record_stream delaying allocator reuse until CPU event polling.
             partials.append(partial)
             results.append(reduced)
+        if split:
+            return SplitProjection(results, events, partials, stream, bounds)
         main.wait_stream(stream)
         output = torch.cat(results, dim=0)
         # Results were allocated on stream but consumed by cat on main. Order
@@ -2703,6 +2746,11 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
     #: rows``; None (the default) runs the NCCL all-gather. A model-specific path may set it
     #: on a layer, together with a QKV projection that consumes what it returns.
     _sp_attn_input_gather = None
+    #: The sequence-parallel arm's attention-side tail, ``(layer, residual, SplitProjection)
+    #: -> (residual, ffn_input)``: joins and prepares the MoE input chunk by chunk while
+    #: the output projection's later chunks are still being reduced. None (the default)
+    #: joins the whole shard once the projection is reduced.
+    _sp_tail_pipeline = None
 
     def __init__(
         self,
@@ -2837,14 +2885,19 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
                 else:
                     attn_input = gather(attn_input, sp_num_tokens)
                 kwargs = dict(kwargs, all_reduce_params=AllReduceParams(enable_allreduce=False))
-            attn_out = self.self_attn(
-                position_ids=position_ids,
-                hidden_states=attn_input,
-                attn_metadata=attn_metadata,
-                overlap_sp_output_projection=overlap_projection,
-                pad_sp_output_projection=pad_projection,
-                **kwargs,
-            )
+            tail = self._sp_tail_pipeline if overlap_projection else None
+            self.self_attn._sp_tail_split = tail is not None
+            try:
+                attn_out = self.self_attn(
+                    position_ids=position_ids,
+                    hidden_states=attn_input,
+                    attn_metadata=attn_metadata,
+                    overlap_sp_output_projection=overlap_projection,
+                    pad_sp_output_projection=pad_projection,
+                    **kwargs,
+                )
+            finally:
+                self.self_attn._sp_tail_split = False
             if sp_num_tokens is not None and not (overlap_projection or pad_projection):
                 attn_out = reducescatter(
                     _pad_sequence_parallel_tokens(attn_out, self.mapping.tp_size),
@@ -2858,9 +2911,12 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
         # prep branch's separate post_attn_norm and add_attn, because there is
         # no longer a boundary between them to annotate.
         with self.nvtx("norm_add_attn"):
-            hidden_states, ffn_input = self.add_attn._add_after_rmsnorm_and_norm(
-                hidden_states, attn_out, self.post_attn_norm.variance_epsilon, self.pre_ffn_norm
-            )
+            if isinstance(attn_out, SplitProjection):
+                hidden_states, ffn_input = self._sp_tail_pipeline(self, hidden_states, attn_out)
+            else:
+                hidden_states, ffn_input = self.add_attn._add_after_rmsnorm_and_norm(
+                    hidden_states, attn_out, self.post_attn_norm.variance_epsilon, self.pre_ffn_norm
+                )
         with self.nvtx("moe"):
             if sp_num_tokens is None:
                 ffn_out = self.feed_forward(ffn_input, attn_metadata)
