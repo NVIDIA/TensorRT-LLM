@@ -55,7 +55,9 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 #: Logical decoder layers, all executed by every call.
-NUM_LAYERS = 52
+from .._constants import SUPPORTED_CONFIG
+
+NUM_LAYERS = SUPPORTED_CONFIG["num_hidden_layers"]
 #: Tokens per call of the supported deployment (its native ``max_num_tokens``).
 MAX_NUM_TOKENS = 8192
 

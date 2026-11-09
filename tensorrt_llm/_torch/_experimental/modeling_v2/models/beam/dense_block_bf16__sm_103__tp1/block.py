@@ -52,6 +52,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.residual.beam
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
 from .. import _attention
+from .._constants import SM as _SM
 
 #: The configuration this component computes, as the checkpoint's config.json states it.
 #: Anything else is rejected at construction rather than computed approximately.
@@ -75,8 +76,6 @@ SUPPORTED_ROPE = {"rope_type": "default", "rope_theta": 10000.0}
 #: The most tokens one call may append: the six-layer model's sequence capacity. Longer
 #: calls are rejected; the request's whole KV length is bounded by its cache's capacity.
 MAX_TOKENS = 1024
-
-_SM = (10, 3)
 
 
 def weight_shapes(config) -> "OrderedDict[str, tuple[int, ...]]":

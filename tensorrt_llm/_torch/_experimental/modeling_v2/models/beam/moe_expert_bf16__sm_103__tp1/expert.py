@@ -34,6 +34,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.sw
     swiglu_fp32,
 )
 
+from .._constants import SM as _SM
+
 HIDDEN_SIZE = 5120
 INTERMEDIATE_SIZE = 2560
 
@@ -45,8 +47,6 @@ WEIGHT_SHAPES = OrderedDict(
         ("down_proj.weight", (HIDDEN_SIZE, INTERMEDIATE_SIZE)),
     ]
 )
-
-_SM = (10, 3)
 
 
 def _attribute(name: str) -> str:

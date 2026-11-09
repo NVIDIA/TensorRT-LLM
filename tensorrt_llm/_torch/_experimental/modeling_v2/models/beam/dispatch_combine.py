@@ -38,14 +38,15 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_disp
     beam_dispatch_combine_op,
 )
 
-HIDDEN_SIZE = 5120
-EXPERTS_PER_TOKEN = 8
-ROUTED_SCALING_FACTOR = 2.5
+from ._constants import SM as _SM
+from ._constants import SUPPORTED_CONFIG
+
+HIDDEN_SIZE = SUPPORTED_CONFIG["hidden_size"]
+EXPERTS_PER_TOKEN = SUPPORTED_CONFIG["num_experts_per_tok"]
+ROUTED_SCALING_FACTOR = SUPPORTED_CONFIG["routed_scaling_factor"]
 
 #: ``expert_provider(expert_id, rows) -> output``; see the module docstring.
 ExpertProvider = Callable[[int, torch.Tensor], torch.Tensor]
-
-_SM = (10, 3)
 
 
 def _check_tensor(name: str, tensor, dtype: torch.dtype) -> None:

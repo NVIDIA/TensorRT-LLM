@@ -75,6 +75,7 @@ from tensorrt_llm.mapping import Mapping as ParallelMapping
 
 from .. import _attention, dispatch_combine
 from .._constants import ROUTER_EPS
+from .._constants import SM as _SM
 from .._load import load_failure_details
 from .._validation import check_positions, explicit_device
 from .layout_bf16 import (
@@ -90,7 +91,6 @@ from .layout_bf16 import (
 )
 from .loader_bf16 import CheckpointFormatError, SafetensorsCatalog, TileReader, read_slice_into
 
-_SM = (10, 3)
 #: Default tokens per call; the representative cases use at most 129. A caller that runs longer
 #: calls (a full-model prefill) passes its own ``max_tokens`` at construction.
 MAX_TOKENS = 1024

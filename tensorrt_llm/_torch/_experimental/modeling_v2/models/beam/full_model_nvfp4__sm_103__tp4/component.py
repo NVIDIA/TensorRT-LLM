@@ -67,7 +67,6 @@ from .loader import (
     validate,
 )
 
-_SM = (10, 3)
 #: Bank fields of one projection kind of one sparse layer.
 BANK_FIELDS = ("weight", "weight_scale", "input_scale", "weight_scale_2", "g", "alpha")
 _KINDS = tuple(p.removesuffix("_proj") for p in PROJECTIONS)
