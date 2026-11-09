@@ -289,10 +289,10 @@ def test_text_decoder_scratch_prefill_and_retained_decode(
         )
         for scratch in (False, True)
     ]
-    tolerance = {"bf16": 0.005, "fp8": 0.02, "nvfp4": 0.05}[kv_dtype]
+    # Scratch changes only where pages live: the same kernels read the same KV.
     for actual_group, reference_group in zip(results[1], results[0], strict=True):
         for observed, expected in zip(actual_group, reference_group, strict=True):
-            torch.testing.assert_close(observed, expected, atol=tolerance, rtol=tolerance)
+            torch.testing.assert_close(observed, expected, atol=0, rtol=0)
 
 
 def _run_reused_prefix(
@@ -369,4 +369,4 @@ def test_text_decoder_scratch_preserves_cached_prefix(
     reference = _run_reused_prefix(model, config, False)
     actual = _run_reused_prefix(model, config, True)
     for observed, expected in zip(actual, reference, strict=True):
-        torch.testing.assert_close(observed, expected, atol=0.005, rtol=0.005)
+        torch.testing.assert_close(observed, expected, atol=0, rtol=0)
