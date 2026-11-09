@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
     # whole visual_gen tree into every LLM serving process.
     from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
+    from tensorrt_llm.visual_gen.params import MediaRef
 
 IMAGE_EDIT_MAX_IMAGES = 16
 IMAGE_EDIT_MAX_IMAGE_BYTES = 50 * 1024 * 1024
@@ -118,10 +119,7 @@ def _merge_extra_params(
 
 
 _PATH_RESPONSE_DISABLED_ENV = "TRTLLM_MEDIA_DISABLE_PATH_RESPONSE"
-# The switch's former name. A VisualGen server started with it set to turn path
-# responses off refuses to start (`check_path_response_policy`) rather than
-# reading it as an alias or ignoring it: a deployment that relied on it must not
-# come back up with path responses on.
+# The switch's former name, no longer read; see `check_path_response_policy`.
 _FORMER_PATH_RESPONSE_DISABLED_ENV = "TRTLLM_DISALLOW_LOCAL_MEDIA_PATH"
 
 
@@ -143,10 +141,10 @@ def path_response_is_disabled() -> bool:
 def check_path_response_policy() -> None:
     """Check the path-response switch when a VisualGen server starts.
 
-    Refuses an unrecognized value of the switch, since reading it either way
-    could be wrong, and refuses the former name when it is set to turn path
-    responses off, since ignoring it would turn them back on. The former name
-    set to ``0`` or empty asked for the default, so it only logs a warning.
+    Raises ``ValueError`` when the switch holds a value other than ``1``,
+    ``0`` or empty, or when ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH`` is set to a
+    value other than ``0`` or empty. Logs a warning when the latter is ``0`` or
+    empty, and logs when path responses are disabled.
     """
     former = os.environ.get(_FORMER_PATH_RESPONSE_DISABLED_ENV)
     if former in ("", "0"):
@@ -235,7 +233,7 @@ def _validate_video_reference_counts(request: VideoGenerationRequest, generator:
                 raise ValueError(f"'{field}' accepts at most {limit} references, got {count}.")
 
 
-def _build_reference_lists(request: Any) -> Dict[str, list]:
+def _build_reference_lists(request: VideoGenerationRequest) -> Dict[str, List[MediaRef]]:
     """Normalize the HTTP reference fields into lists of ``MediaRef`` objects.
 
     Each of ``image_reference`` / ``video_reference`` / ``audio_reference`` is
@@ -253,7 +251,7 @@ def _build_reference_lists(request: Any) -> Dict[str, list]:
     # process, and this keeps it out of every plain-LLM process (see TYPE_CHECKING).
     from tensorrt_llm.visual_gen.params import MediaRef
 
-    lists: Dict[str, list] = {}
+    lists: Dict[str, List[MediaRef]] = {}
     path_bytes = 0
     for field in ("image_reference", "video_reference", "audio_reference"):
         value = getattr(request, field, None)
@@ -513,6 +511,10 @@ def parse_visual_gen_params(
     errors (400 via ``ValueError``), and the executor's
     ``validate_visual_gen_params`` for ``extra_params``
     strict-key/type/range checks (400 via ``ValueError``).
+
+    Reads every multipart upload and every ``format='path'`` reference (under
+    ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR``), so it blocks for a request for which
+    `request_reads_files` is true; run that one off the event loop.
     """
     params = generator.default_params
 

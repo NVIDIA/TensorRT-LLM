@@ -14,7 +14,7 @@
 # limitations under the License.
 import ast
 import base64
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 from pydantic import Field, field_validator, model_validator
 from typing_extensions import Literal
@@ -84,9 +84,10 @@ class MediaRef(StrictBaseModel):
             )
         return self
 
-    def __repr_args__(self):
-        # A ``bytes`` payload is shown by size only, so a log line that prints a
-        # whole ``VisualGenParams`` does not carry the media itself.
+    def __repr_args__(self) -> Iterator[Tuple[Optional[str], Any]]:
+        # A ``bytes`` payload (an upload or a ``path`` reference read by serve)
+        # is shown by size only. A ``url`` or ``base64`` reference is still its
+        # string here and is shown as is.
         for name, value in super().__repr_args__():
             if name == "content" and isinstance(value, bytes):
                 value = f"<{len(value)} bytes>"
@@ -494,11 +495,12 @@ def _validate_reference_payload(payload: bytes, *, modality: str) -> None:
 def prepare_reference_slots(params: Any) -> None:
     """Resolve every reference to raw bytes, in place.
 
-    The single reference choke point, used by the engine (``generate_async``)
-    so serve and the standalone Python API share one path. Dispatch is on each
-    reference's declared ``format``, never on the shape of its content: the
-    declared form is resolved to bytes, content-validated against the slot's
-    modality, and written back with ``format`` set to ``"bytes"``.
+    Used by the engine (``generate_async``) for every request. Serve reads
+    ``path`` references to bytes before this, so for serve it resolves only
+    ``url`` and ``base64``; for the Python API it resolves all three. Dispatch
+    is on each reference's declared ``format``, never on the shape of its
+    content: the declared form is resolved to bytes, content-validated against
+    the slot's modality, and written back with ``format`` set to ``"bytes"``.
 
     ``format`` is rewritten alongside ``content`` because the mutated params
     object is what gets broadcast to the workers; a stale format would tell a

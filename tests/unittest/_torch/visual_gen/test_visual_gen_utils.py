@@ -37,9 +37,9 @@ from tensorrt_llm.visual_gen.params import prepare_reference_slots
 def _parse_and_prepare(request, generator):
     """Run the production reference flow: serve transport, then engine resolve.
 
-    ``parse_visual_gen_params`` only normalizes transport (upload -> bytes,
-    strings pass through with their declared format); resolution to bytes
-    happens at the engine choke point, so tests that assert on the resolved
+    ``parse_visual_gen_params`` reads uploads and allowed ``path`` references to
+    bytes and passes ``url`` and ``base64`` through with their declared format;
+    the engine resolves those to bytes, so tests that assert on the resolved
     payload drive both stages.
     """
     params = parse_visual_gen_params(request, generator)
