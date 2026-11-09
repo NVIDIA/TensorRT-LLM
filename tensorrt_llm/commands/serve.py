@@ -953,6 +953,7 @@ def launch_visual_gen_server(
         visual_gen_args: Optional["VisualGenArgs"] = None,
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         middleware: Sequence[str] = (),
+        media_load_workers: int = 8,
 ):
     """Launch a VISUAL_GEN model server for image/video generation.
 
@@ -962,6 +963,8 @@ def launch_visual_gen_server(
         model: Model path or HuggingFace Hub model ID.
         visual_gen_args: Optional validated VisualGenArgs for model configuration.
         metadata_server_cfg: Optional metadata server configuration.
+        media_load_workers: Size of the pool that reads uploads and
+            ``format='path'`` references.
     """
     # Refuse a misconfigured path-response switch before the model loads.
     check_path_response_policy()
@@ -1019,7 +1022,8 @@ def launch_visual_gen_server(
                                   model=model,
                                   server_role=ServerRole.VISUAL_GEN,
                                   metadata_server_cfg=metadata_server_cfg,
-                                  tool_parser=None)
+                                  tool_parser=None,
+                                  media_load_workers=media_load_workers)
             _apply_fastapi_middlewares(server.app, middleware)
             uvloop.run(server(host, port, sockets=[s]))
         except _VisualGenStartupTermination as e:
@@ -1207,7 +1211,8 @@ def launch_visual_gen_server(
                   default=8,
                   help="Size of the dedicated thread pool that decodes media "
                   "payloads (image / video / audio) for multimodal "
-                  "requests.",
+                  "requests. A VisualGen server reads uploads and "
+                  "format='path' references on it.",
                   status="prototype")
 @stability_option("--trust_remote_code",
                   is_flag=True,
@@ -1823,8 +1828,13 @@ def serve(
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
 
-        launch_visual_gen_server(host, port, model, parsed_visual_gen_args,
-                                 metadata_server_cfg, middleware)
+        launch_visual_gen_server(host,
+                                 port,
+                                 model,
+                                 parsed_visual_gen_args,
+                                 metadata_server_cfg,
+                                 middleware,
+                                 media_load_workers=num_media_load_workers)
 
     # Only the OpenAI HTTP path publishes the bound address. Fail loudly rather
     # than leaving a launcher waiting forever on a file nobody writes.

@@ -108,3 +108,26 @@ def test_missing_previous_sigterm_handler_restores_default(
         (signal.SIGTERM, serve._terminate_visual_gen_startup),
         (signal.SIGTERM, signal.SIG_DFL),
     ]
+
+
+def test_the_media_load_pool_size_reaches_the_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ServerBuilt(Exception):
+        pass
+
+    server_kwargs = {}
+
+    def build_server(*args, **kwargs) -> None:
+        server_kwargs.update(kwargs)
+        raise _ServerBuilt
+
+    model = MagicMock()
+    model.args.parallel_config = SimpleNamespace(n_workers=1, cfg_size=1, ulysses_size=1)
+    monkeypatch.setattr(visual_gen, "VisualGen", lambda **_: model)
+    monkeypatch.setattr(serve, "OpenAIServer", build_server)
+
+    with pytest.raises(_ServerBuilt):
+        serve.launch_visual_gen_server("127.0.0.1", 0, "test-model", media_load_workers=3)
+
+    assert server_kwargs["media_load_workers"] == 3

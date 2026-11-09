@@ -3687,14 +3687,14 @@ class TestPathReferenceRoutes:
 async def test_a_cancelled_request_keeps_its_parse_worker_until_the_parse_ends(
     tmp_path, monkeypatch
 ):
-    """Request parsing, which may read ``format='path'`` references, runs on the
-    media-load pool: its size bounds the parses in flight, and a parse whose
-    request was cancelled holds its worker until it returns."""
-    from tensorrt_llm.serve import openai_video_routes
+    """A request that reads files is parsed on the media-load pool: its size
+    bounds the parses in flight, and a parse whose request was cancelled holds
+    its worker until it returns."""
+    from tensorrt_llm.serve import openai_server
 
-    routes = openai_video_routes._VideoRoutesMixin
-    submit = routes._parse_visual_gen_params
-    parse = openai_video_routes.parse_visual_gen_params
+    server_cls = openai_server.OpenAIServer
+    submit = server_cls._parse_visual_gen_params
+    parse = openai_server.parse_visual_gen_params
     release = threading.Event()
     submitted, started = [], []
 
@@ -3709,28 +3709,51 @@ async def test_a_cancelled_request_keeps_its_parse_worker_until_the_parse_ends(
             release.wait(10)
         return parse(request, generator)
 
-    monkeypatch.setattr(routes, "_parse_visual_gen_params", counting_submit)
-    monkeypatch.setattr(openai_video_routes, "parse_visual_gen_params", blocking_parse)
+    monkeypatch.setattr(server_cls, "_parse_visual_gen_params", counting_submit)
+    monkeypatch.setattr(openai_server, "parse_visual_gen_params", blocking_parse)
     monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
-    generator = MockVisualGen(image_output=_make_dummy_image_tensor())
-    body = {"prompt": "cat", "response_format": "b64_json", "size": "64x64"}
+    monkeypatch.setenv("TRTLLM_MEDIA_ALLOWED_INPUT_DIR", str(tmp_path))
+    body = _path_reference_video_body(_write_reference_png(tmp_path))
+    generator = MockVisualGen(video_output=_make_dummy_video_tensor())
     try:
         async with _create_async_client(generator, media_load_workers=1) as client:
-            first = asyncio.create_task(client.post("/v1/images/generations", json=body))
+            first = asyncio.create_task(client.post("/v1/videos", json=body))
             await _wait_for(lambda: started)
             first.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await first
 
-            second = asyncio.create_task(client.post("/v1/images/generations", json=body))
+            second = asyncio.create_task(client.post("/v1/videos", json=body))
             await _wait_for(lambda: len(submitted) == 2)
-            assert len(started) == 1
             release.set()
             resp = await second
     finally:
         release.set()
+    assert resp.status_code == 202, resp.text
+    assert started == ["trtllm_media_load_0"] * 2
+
+
+@pytest.mark.asyncio
+async def test_a_request_that_reads_no_file_is_parsed_inline(tmp_path, monkeypatch):
+    """Only parses that read files take a media-load worker, so a request
+    without one does not wait behind slow reads."""
+    from tensorrt_llm.serve import openai_server
+
+    parse = openai_server.parse_visual_gen_params
+    started = []
+
+    def recording_parse(request, generator):
+        started.append(threading.current_thread().name)
+        return parse(request, generator)
+
+    monkeypatch.setattr(openai_server, "parse_visual_gen_params", recording_parse)
+    monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+    generator = MockVisualGen(image_output=_make_dummy_image_tensor())
+    body = {"prompt": "cat", "response_format": "b64_json", "size": "64x64"}
+    async with _create_async_client(generator) as client:
+        resp = await client.post("/v1/images/generations", json=body)
     assert resp.status_code == 200, resp.text
-    assert all(name.startswith("trtllm_media_load") for name in started)
+    assert started == [threading.current_thread().name]
 
 
 def test_server_shutdown_stops_the_media_load_pool(tmp_path, monkeypatch):

@@ -192,6 +192,22 @@ def _reference_transport(ref: Any) -> tuple[Any, str, Optional[str]]:
     return content, ref.format, getattr(ref, "role", None)
 
 
+def request_reads_files(
+    request: ImageGenerationRequest | ImageEditRequest | VideoGenerationRequest,
+) -> bool:
+    """Whether `parse_visual_gen_params` reads a file for ``request``.
+
+    It reads each multipart upload and each ``format='path'`` reference.
+    """
+    fields = ("image_reference", "video_reference", "audio_reference", "input_reference")
+    for field in (*fields, "image", "mask"):
+        value = getattr(request, field, None)
+        for item in value if isinstance(value, list) else [value]:
+            if hasattr(item, "file") or getattr(item, "format", None) == "path":
+                return True
+    return False
+
+
 def _validate_video_reference_counts(request: VideoGenerationRequest, generator: VisualGen) -> None:
     """Reject unsupported or oversized explicit slots before reading uploads.
 

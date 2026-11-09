@@ -35,7 +35,7 @@ from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings,
     build_visual_gen_timing_headers,
 )
-from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE, parse_visual_gen_params
+from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
 
 if TYPE_CHECKING:
     # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
@@ -145,20 +145,9 @@ class _VideoRoutesMixin:
 
     Concrete subclasses (``OpenAIServer``) supply ``self.generator``,
     ``self.media_storage_path``, ``self.video_gen_tasks``, ``self.model``,
-    ``self._adjusted_steady_clock``, ``self._media_load_executor``, and
-    ``self.create_error_response`` from their own initializer.
+    ``self._adjusted_steady_clock``, ``self._parse_visual_gen_params``, and
+    ``self.create_error_response``.
     """
-
-    async def _parse_visual_gen_params(self, request):
-        """Run `parse_visual_gen_params` on the media-load pool.
-
-        Parsing may read ``format='path'`` references from disk. The pool bounds
-        how many requests read at once, and a read keeps its worker until it
-        finishes, even after its request is cancelled.
-        """
-        return await asyncio.get_running_loop().run_in_executor(
-            self._media_load_executor, parse_visual_gen_params, request, self.generator
-        )
 
     async def openai_video_generation_sync(self, raw_request: Request) -> Response:
         """Synchronous video generation endpoint.
