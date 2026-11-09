@@ -149,7 +149,7 @@ class MoERunner(TunableRunner):
         instance_key = (x_dtype, weight_dtype, output_dtype,
                         use_deepseek_fp8_block_scale, use_w4_group_scaling,
                         use_int8_woq_per_channel, use_mxfp8_act_scaling,
-                        use_mxfp8_weight_scaling)
+                        use_mxfp8_weight_scaling, use_fused_finalize)
 
         if instance_key not in MoERunner.runner_dict:
             MoERunner.runner_dict[

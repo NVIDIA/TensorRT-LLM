@@ -6895,3 +6895,40 @@ def test_configurable_moe_exposes_the_backend_lora_state():
     assert getattr(moe, "_moe_lora_enabled", False) is True
     moe.backend = SimpleNamespace()
     assert getattr(moe, "_moe_lora_enabled", False) is False
+
+
+def _make_bf16_policy_runner(use_fused_finalize):
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
+    return MoERunner(
+        x_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        top_k=8,
+        tp_size=1,
+        tp_rank=0,
+        ep_size=1,
+        ep_rank=0,
+        cluster_size=1,
+        cluster_rank=0,
+        use_deepseek_fp8_block_scale=False,
+        use_w4_group_scaling=False,
+        use_int8_woq_per_channel=False,
+        use_mxfp8_act_scaling=False,
+        min_latency_mode=False,
+        use_fused_finalize=use_fused_finalize,
+        activation_type=ActivationType.Swiglu,
+    )
+
+
+@pytest.mark.parametrize("first_fused", [False, True])
+def test_cutlass_runner_cache_preserves_finalize_policy(monkeypatch, first_fused):
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
+    if get_sm_version() not in (100, 103):
+        pytest.skip("The BF16 fused finalize tactic family requires Blackwell")
+    monkeypatch.setattr(MoERunner, "runner_dict", {})
+    first = _make_bf16_policy_runner(first_fused)
+    second = _make_bf16_policy_runner(not first_fused)
+    fused, unfused = (first, second) if first_fused else (second, first)
+    assert fused.fused_moe_runner.get_tactic_num(2) > unfused.fused_moe_runner.get_tactic_num(2)
