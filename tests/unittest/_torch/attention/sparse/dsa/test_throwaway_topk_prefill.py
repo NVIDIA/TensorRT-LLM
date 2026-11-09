@@ -31,6 +31,7 @@ from typing import Optional
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.dsa import indexer as indexer_module
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
     Indexer,
     IndexerPrefillChunkMetadata,
@@ -631,6 +632,8 @@ def test_large_shape_logits_dtypes(logits_dtype):
 
 
 class _FakeRunner:
+    num_keys = 16
+
     def __init__(self, can_run=True):
         self._can_run = can_run
         self.calls = []
@@ -712,6 +715,21 @@ def test_dispatch_slices_rows_and_shifts_prefix():
     assert prefix == 100 + 2
     assert plan_cache is chunk.throwaway_plans
     assert q_scale_arg is None
+
+
+def test_dispatch_logs_each_outcome_once(monkeypatch):
+    keys = []
+    monkeypatch.setattr(indexer_module.logger, "info_once", lambda *msg, key: keys.append(key))
+    _call(_fake_indexer(_FakeRunner(), enabled=False), _chunk(5))  # not opted in: silent
+    assert keys == []
+    _call(_fake_indexer(_FakeRunner()), _chunk(None))
+    _call(_fake_indexer(_FakeRunner(can_run=False)), _chunk(5))
+    _call(_fake_indexer(_FakeRunner()), _chunk(5))
+    assert keys == [
+        "throwaway_topk_multi_request",
+        "throwaway_topk_too_many_keys",
+        "throwaway_topk_fused",
+    ]
 
 
 def test_dispatch_slices_fp4_query_scales_with_the_rows():

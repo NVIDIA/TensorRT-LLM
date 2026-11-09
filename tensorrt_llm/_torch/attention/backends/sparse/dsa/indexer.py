@@ -47,6 +47,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ..params import get_indexer_mqa_logits_elem_budget, use_self_sampling_gvr
 from .params import DSAParams
 from .throwaway_topk import (
+    THROWAWAY_TOPK_ENV,
     PlanCache,
     ThrowawayPrefillTopK,
     create_throwaway_prefill_topk,
@@ -1034,6 +1035,14 @@ class Indexer(nn.Module):
             and is_sm_100f()
             and throwaway_topk_supported(self.n_heads, self.head_dim)
         )
+        if throwaway_topk_requested() and not self._use_throwaway_topk:
+            logger.warning_once(
+                f"{THROWAWAY_TOPK_ENV}=1 but the fused throwaway Top-K needs SM100/SM103 and an "
+                f"indexer with head_dim 128 and 4/32/64 heads (got SM{get_sm_version()}, "
+                f"heads={self.n_heads}, head_dim={self.head_dim}); "
+                "using the unfused indexer + Top-K path",
+                key="throwaway_topk_unsupported",
+            )
         self._throwaway_topk: Optional[ThrowawayPrefillTopK] = None
         self._throwaway_topk_failed = False
 
@@ -1715,11 +1724,14 @@ class Indexer(nn.Module):
         Returns:
             True if the rows were written; False if the caller must use the unfused path.
         """
-        if (
-            not self._use_throwaway_topk
-            or self._throwaway_topk_failed
-            or chunk.kv_prefix_len is None
-        ):
+        if not self._use_throwaway_topk or self._throwaway_topk_failed:
+            return False
+        if chunk.kv_prefix_len is None:
+            logger.info_once(
+                "Throwaway Top-K: prefill chunks that hold several requests use the unfused "
+                "indexer + Top-K path",
+                key="throwaway_topk_multi_request",
+            )
             return False
         if self._throwaway_topk is None:
             compress_ratio = _effective_compress_ratio_divisor(
@@ -1737,6 +1749,12 @@ class Indexer(nn.Module):
             if self._throwaway_topk_failed:
                 return False
         if not self._throwaway_topk.can_run(chunk_k_fp8.shape[0]):
+            logger.info_once(
+                f"Throwaway Top-K: a chunk with {chunk_k_fp8.shape[0]} keys exceeds the staging "
+                f"buffer ({self._throwaway_topk.num_keys} keys); such chunks use the unfused "
+                "indexer + Top-K path",
+                key="throwaway_topk_too_many_keys",
+            )
             return False
         g_begin = chunk.token_start + q_begin
         g_end = chunk.token_start + q_end
@@ -1749,6 +1767,10 @@ class Indexer(nn.Module):
             kv_prefix_len=chunk.kv_prefix_len + q_begin,
             plan_cache=chunk.throwaway_plans,
             q_scale=None if q_scale is None else q_scale[g_begin:g_end],
+        )
+        logger.info_once(
+            "Throwaway Top-K: using the fused indexer + Top-K for prefill",
+            key="throwaway_topk_fused",
         )
         return True
 
