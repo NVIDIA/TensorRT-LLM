@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from typing import (Any, Callable, List, Literal, Optional, OrderedDict, Tuple,
                     Union)
 
+import anyio
+from fastapi.responses import StreamingResponse
 from jinja2.exceptions import TemplateError
 from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseContentPartAddedEvent,
@@ -77,6 +79,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 ChatCompletionToolsParam,
                                                 FunctionDefinition,
                                                 InputTokensDetails,
+                                                NamespacedFunctionToolParam,
                                                 OpenAIBaseModel,
                                                 OutputTokensDetails,
                                                 ReasoningAssistantMessage,
@@ -119,6 +122,10 @@ ENABLE_RESPONSES_DEBUG_MSG = os.environ.get("TRTLLM_RESPONSES_DEBUG") == "1"
 # The parameter a freeform custom tool is described with; see
 # _get_chat_completion_function_tools and _tool_call_output_item.
 CUSTOM_TOOL_INPUT_ARG = "input"
+
+# Each spelling of a declared tool's name -> (namespace, bare name, custom);
+# see _tool_resolution.
+_ToolResolution = dict[str, Tuple[Optional[str], str, bool]]
 
 
 @dataclass
@@ -655,7 +662,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                 summary=[],
                 type="reasoning",
                 content=[Content(text=content.text, type="reasoning_text")],
-                status=None,
+                status="completed",
             )
             output_items.append(reasoning_item)
     elif message.channel == "commentary":
@@ -670,6 +677,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                     type="function_call",
                     name=function_name,
                     id=f"fc_{_random_uuid()}",
+                    status="completed",
                 )
                 output_items.append(response_item)
         elif message.recipient.startswith(
@@ -680,7 +688,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                     summary=[],
                     type="reasoning",
                     content=[Content(text=content.text, type="reasoning_text")],
-                    status=None,
+                    status="completed",
                 )
                 output_items.append(reasoning_item)
         else:
@@ -765,16 +773,29 @@ def _warn_once(message: str) -> None:
         logger.warning(message)
 
 
-def _qualified_tool_name(item: dict) -> str:
+def _qualified_tool_name(item: dict,
+                         tool_resolution: Optional[_ToolResolution] = None
+                         ) -> str:
     """The name a replayed tool call is known by.
 
     A namespaced call is reported with its namespace in a separate field,
     but the model was offered the qualified name. Replaying the bare name
     shows it a tool that was never on its list, so it cannot match the call
     to the result that follows.
+
+    A client may echo a call back without its namespace. The namespace is then
+    taken from ``tool_resolution``, the request's declared tools, when exactly
+    one namespaced tool and no top-level tool has that bare name; otherwise
+    the name is replayed as received.
     """
     name = item.get("name") or ""
     namespace = item.get("namespace")
+    if not namespace and tool_resolution:
+        declared_namespace, bare, _ = tool_resolution.get(
+            name, (None, name, False))
+        # Any other spelling already names the tool in full.
+        if bare == name:
+            namespace = declared_namespace
     return f"{namespace}.{name}" if namespace else name
 
 
@@ -953,8 +974,14 @@ def _template_renders(template: str, role: str) -> bool:
 
 
 def _response_output_item_to_chat_completion_message(
-    item: Union[dict, ResponseInputOutputItem]
+    item: Union[dict, ResponseInputOutputItem],
+    tool_resolution: Optional[_ToolResolution] = None,
 ) -> Optional[ChatCompletionMessageParam]:
+    """Convert one Responses input item to a chat message.
+
+    ``tool_resolution`` holds the request's declared tools; a tool call is
+    replayed under the name they offered the model (see _qualified_tool_name).
+    """
     if not isinstance(item, dict):
         item = item.model_dump()
 
@@ -1025,7 +1052,7 @@ def _response_output_item_to_chat_completion_message(
                     "id": item.get("call_id") or item.get("id") or "",
                     "type": "function",
                     "function": {
-                        "name": _qualified_tool_name(item),
+                        "name": _qualified_tool_name(item, tool_resolution),
                         "arguments": item.get("arguments") or "",
                     },
                 }],
@@ -1053,7 +1080,7 @@ def _response_output_item_to_chat_completion_message(
                     "type": "function",
                     "function": {
                         "name":
-                        _qualified_tool_name(item),
+                        _qualified_tool_name(item, tool_resolution),
                         "arguments":
                         json.dumps(
                             {CUSTOM_TOOL_INPUT_ARG: item.get("input") or ""}),
@@ -1166,8 +1193,10 @@ def chat_messages_from_responses_input(
         messages.append({"role": "user", "content": request.input})
     else:
         turn_start = len(messages)
+        tool_resolution = _tool_resolution(request.tools)
         for inp in request.input:
-            message = _response_output_item_to_chat_completion_message(inp)
+            message = _response_output_item_to_chat_completion_message(
+                inp, tool_resolution)
             if message is None:
                 continue
             if _fold_tool_calls_into_open_assistant_turn(
@@ -1269,21 +1298,24 @@ def _get_chat_completion_function_tools(
     if tools is None:
         return function_tools
 
+    def definition(name: str, description: Optional[str],
+                   parameters: Optional[Any]) -> FunctionDefinition:
+        return FunctionDefinition(
+            name=name,
+            description=description,
+            # A tool with no schema still has to present an object schema,
+            # or the chat template renders a call the model cannot fill in.
+            parameters=parameters if parameters is not None else {
+                "type": "object",
+                "properties": {},
+            },
+        )
+
     def as_function(name: str, description: Optional[str],
                     parameters: Optional[Any]) -> ChatCompletionToolsParam:
-        return ChatCompletionToolsParam(
-            type="function",
-            function=FunctionDefinition(
-                name=name,
-                description=description,
-                # A tool with no schema still has to present an object schema,
-                # or the chat template renders a call the model cannot fill in.
-                parameters=parameters if parameters is not None else {
-                    "type": "object",
-                    "properties": {},
-                },
-            ),
-        )
+        return ChatCompletionToolsParam(type="function",
+                                        function=definition(
+                                            name, description, parameters))
 
     def custom_parameters() -> dict[str, Any]:
         # A custom tool takes one freeform string rather than JSON arguments -
@@ -1318,7 +1350,9 @@ def _get_chat_completion_function_tools(
             # Skipping it drops every tool inside, which is most of an agentic
             # client's toolset: the model then has nothing to call, announces
             # an action and does nothing. Names are qualified with the
-            # namespace so two namespaces can define the same tool name.
+            # namespace so two namespaces can define the same tool name. The
+            # declaration is kept beside the flattened function, for a model
+            # whose renderer shows namespaces itself.
             for inner in getattr(tool, "tools", None) or []:
                 inner_name = getattr(inner, "name", None)
                 if not inner_name:
@@ -1333,11 +1367,18 @@ def _get_chat_completion_function_tools(
                     inner_parameters = custom_parameters()
                 else:
                     inner_parameters = getattr(inner, "parameters", None)
+                inner_description = getattr(inner, "description", None)
                 function_tools.append(
-                    as_function(
-                        f"{tool.name}.{inner_name}",
-                        getattr(inner, "description", None) or tool.description,
-                        inner_parameters,
+                    NamespacedFunctionToolParam(
+                        function=definition(
+                            f"{tool.name}.{inner_name}",
+                            inner_description or tool.description,
+                            inner_parameters,
+                        ),
+                        namespace=tool.name,
+                        namespace_description=tool.description,
+                        declared_name=inner_name,
+                        declared_description=inner_description,
                     ))
         elif tool_type in ("custom", ):
             function_tools.append(
@@ -1353,15 +1394,14 @@ def _get_chat_completion_function_tools(
             # chat template cannot describe anything else, and the call is
             # intercepted server-side rather than returned to the client.
             #
-            # A request that reaches here still carrying web_search should
-            # already have been refused by the endpoint - see
-            # web_search_rejection_reason and its caller in openai_server.py -
-            # because answering without the search the client asked for is a
-            # wrong answer the client cannot detect. This branch is the
-            # fallback for any other caller of this function: drop the tool
-            # rather than describe it, since nothing on this path executes the
-            # call yet and the model would emit one the client has no
-            # implementation for ("unsupported call: web_search").
+            # Unless TRTLLM_WEB_SEARCH_UNAVAILABLE=reject makes the endpoint
+            # refuse it (see web_search_rejection_reason and its caller in
+            # openai_server.py), a request whose web_search the server cannot
+            # honour is served, and this is where the tool is dropped for a
+            # chat-template model; other callers of this function drop it the
+            # same way. It is dropped rather than described because nothing on
+            # this path executes the call yet, and the model would emit one the
+            # client has no implementation for ("unsupported call: web_search").
             #
             # Warn once per process rather than per request: what it reports is
             # a server-configuration fact, not a property of the request, so
@@ -1596,11 +1636,17 @@ def reasoning_chat_template_kwargs(request) -> dict:
     raw = getattr(request, "chat_template_kwargs", None)
     kwargs = dict(raw) if isinstance(raw, Mapping) else {}
     reasoning = getattr(request, "reasoning", None)
-    effort = getattr(reasoning, "effort",
-                     None) if reasoning is not None else None
+    if reasoning is None:
+        return kwargs
+    effort = getattr(reasoning, "effort", None)
+    if effort == "none":
+        kwargs.setdefault("thinking", False)
+        return kwargs
     if isinstance(effort, str) and effort:
         kwargs.setdefault("reasoning_effort", effort)
-        kwargs.setdefault("thinking", True)
+    # A `reasoning` object asks a reasoning model to reason; without an
+    # effort it reasons at the model's default effort.
+    kwargs.setdefault("thinking", True)
     return kwargs
 
 
@@ -1849,7 +1895,9 @@ def _create_output_content(
                             content=[
                                 Content(text=record.text, type="reasoning_text")
                             ],
-                            status=None,
+                            # The stream closed this item as completed; the
+                            # snapshot reports the same status.
+                            status="completed",
                         ))
                 else:
                     output_items.append(
@@ -1882,7 +1930,7 @@ def _create_output_content(
                         content=[
                             Content(text=reasoning_text, type="reasoning_text")
                         ],
-                        status=None,
+                        status="completed",
                     ))
                 stored_reasoning = reasoning_text
 
@@ -1909,8 +1957,12 @@ def _create_output_content(
             tool_calls_item = list(streamed_tool_calls)
         else:
             tool_resolution = _tool_resolution(tools)
+            # As streamed: the stream delivers every call it announces as
+            # completed.
             tool_calls_item = [
-                _tool_call_output_item(call, tool_resolution) for call in calls
+                _tool_call_output_item(call,
+                                       tool_resolution,
+                                       status="completed") for call in calls
             ]
         output_items.extend(tool_calls_item)
 
@@ -1951,25 +2003,29 @@ def _create_output_content_harmony(
     return output_content, output_messages
 
 
-def _tool_resolution(
-        tools: Optional[list[Tool]]
-) -> dict[str, Tuple[Optional[str], str, bool]]:
+def _tool_resolution(tools: Optional[list[Tool]]) -> _ToolResolution:
     """Every spelling a parsed call may carry -> (namespace, bare name, custom).
 
     A chat template can only describe a flat list of functions, so a namespaced
     tool is offered to the model as "namespace.tool" and has to be reported back
     with the two parts separated again - that is how the client identifies it.
-    Models write the name back both ways, so the bare name resolves too, but
-    only when exactly one declared tool answers to it.
+    Models write the name back in other spellings too. "namespace::tool", the
+    separator some models are trained on (DeepSeek-V4.1), names the same tool
+    as the dotted spelling. The bare name resolves as well, but only when
+    exactly one declared tool answers to it. Neither spelling displaces a name
+    a tool was declared under.
     """
-    resolved: dict[str, Tuple[Optional[str], str, bool]] = {}
+    resolved: _ToolResolution = {}
     bare_claims: dict[str, list[str]] = {}
+    # "namespace::tool" -> the dotted name it stands for.
+    separator_spellings: dict[str, str] = {}
 
     def claim(exposed: str, namespace: Optional[str], bare: str,
               is_custom: bool) -> None:
         resolved[exposed] = (namespace, bare, is_custom)
         if exposed != bare:
             bare_claims.setdefault(bare, []).append(exposed)
+            separator_spellings[f"{namespace}::{bare}"] = exposed
 
     for tool in tools or []:
         tool_type = getattr(tool, "type", None)
@@ -1992,12 +2048,14 @@ def _tool_resolution(
             continue
         if len(exposed_names) == 1:
             resolved[bare] = resolved[exposed_names[0]]
+    for spelling, exposed in separator_spellings.items():
+        resolved.setdefault(spelling, resolved[exposed])
     return resolved
 
 
 def _tool_call_output_item(
     call,
-    tool_resolution: dict[str, Tuple[Optional[str], str, bool]],
+    tool_resolution: _ToolResolution,
     item_id: Optional[str] = None,
     status: Optional[str] = None,
 ) -> Union[ResponseFunctionToolCall, ResponseCustomToolCall]:
@@ -2108,6 +2166,9 @@ def _create_usage(
     originating request, so its prompt tokens are only reachable that way.
     """
     if num_prompt_tokens is None:
+        # Unadjusted: counts the whole rendered prompt, ignoring
+        # num_prompt_tokens_offset. Callers that want chat parity pass
+        # ResponsesAPIPostprocArgs.usage_num_prompt_tokens().
         prompt_token_ids = getattr(final_res, "prompt_token_ids", None)
         if prompt_token_ids is None:
             return None
@@ -2126,6 +2187,10 @@ def _create_usage(
     if ctx_prompt_tokens is not None:
         input_tokens = ctx_prompt_tokens
         cached_tokens = ctx_cached_tokens
+    # The engine counts cached tokens over the whole rendered prompt, which can
+    # be longer than the prompt usage reports (see
+    # PostprocArgs.num_prompt_tokens_offset).
+    cached_tokens = min(cached_tokens, input_tokens)
 
     return ResponseUsage(
         input_tokens=input_tokens,
@@ -3233,6 +3298,194 @@ async def guard_responses_stream(
         for frame in frames:
             yield frame
         raise
+
+
+# --------------------------------------------------------------------------
+# Keepalive while a stream is silent
+# --------------------------------------------------------------------------
+
+# Seconds a stream may stay silent before its response.in_progress event is
+# sent again. Clients and proxies cut a stream that sends nothing for long
+# enough, and a stream is silent until its first token (queueing and prefill)
+# and for as long as the model writes a tool call, which is sent only once
+# complete.
+RESPONSES_STREAM_KEEPALIVE_INTERVAL_S = 15.0
+
+_IN_PROGRESS_FRAME_START = "event: response.in_progress\n"
+# The response is over once one of these has gone out.
+_FINAL_FRAME_STARTS = ("event: error\n", "event: response.completed\n",
+                       "event: response.incomplete\n",
+                       "event: response.failed\n")
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _top_level_member(payload: str, key: str) -> Optional[Tuple[int, int, Any]]:
+    """Where the value of ``key`` starts and ends in a compact JSON object, and the value.
+
+    Only a member of the object itself counts: each member is decoded to find
+    where it ends, so the same key nested in a value, or written inside a
+    string, is passed over. None when ``key`` is not a member.
+    """
+    if not payload.startswith("{"):
+        return None
+    pos = 1
+    try:
+        while True:
+            name, pos = _JSON_DECODER.raw_decode(payload, pos)
+            if payload[pos] != ":":
+                return None
+            start = pos + 1
+            value, pos = _JSON_DECODER.raw_decode(payload, start)
+            if name == key:
+                return start, pos, value
+            if payload[pos] != ",":
+                return None
+            pos += 1
+    except (ValueError, IndexError):
+        return None
+
+
+def _stamp_sequence_number(frame: str, sequence_number: int) -> str:
+    """``frame`` with ``sequence_number`` as its event's sequence number.
+
+    Only the digits of the event's own number change: the payload is not
+    serialized again, and a ``sequence_number`` inside the response or the
+    model's output is left alone. A frame without a number of its own is
+    returned unchanged.
+    """
+    head, sep, rest = frame.partition("\ndata: ")
+    payload, newline, tail = rest.partition("\n")
+    member = _top_level_member(payload, "sequence_number") if sep else None
+    if member is None or type(member[2]) is not int:
+        return frame
+    start, end, _ = member
+    return (f"{head}{sep}{payload[:start]}{sequence_number}{payload[end:]}"
+            f"{newline}{tail}")
+
+
+async def _with_ticks(
+        source: AsyncGenerator[Any, None],
+        timeout: Callable[[], Optional[float]]) -> AsyncGenerator[Any, None]:
+    """Yield the items of ``source``, and None each time ``timeout()`` seconds pass first.
+
+    ``timeout()`` is asked before every wait; None waits for the next item. One
+    task reads ``source`` to its end, so a tick never interrupts a read and the
+    source is never resumed from another task; that task is cancelled, and the
+    source closed, when the consumer stops.
+    """
+    # One item at a time: the reader waits for the consumer, so a slow client
+    # holds back the source as reading it directly would.
+    items: asyncio.Queue = asyncio.Queue(maxsize=1)
+    end = object()
+    consumer_stopped = False
+
+    async def read_all() -> None:
+        try:
+            async for item in source:
+                await items.put(item)
+        except asyncio.CancelledError:
+            # Stopped while handing over an item, the reader leaves the source
+            # suspended at its yield, so it closes the source itself.
+            aclose = getattr(source, "aclose", None)
+            if aclose is not None:
+                await aclose()
+            if not consumer_stopped:
+                # Not stopped by the consumer, which still waits for the end.
+                await items.put(end)
+            raise
+        except Exception:
+            await items.put(end)
+            raise
+        await items.put(end)
+
+    reader = asyncio.create_task(read_all())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(items.get(), timeout())
+            except asyncio.TimeoutError:
+                yield None
+                continue
+            if item is end:
+                # Raises what reading the source raised.
+                await reader
+                return
+            yield item
+    finally:
+        consumer_stopped = True
+        reader.cancel()
+        # Return only once the reader has stopped and closed the source.
+        await asyncio.gather(reader, return_exceptions=True)
+
+
+class ClosingStreamingResponse(StreamingResponse):
+    """A streaming response that closes its body iterator however it ends.
+
+    A client that disconnects while a frame is being sent leaves the iterator
+    suspended at its yield: on ASGI 2.3 the send is cancelled, on 2.4 it raises
+    and Starlette raises ``ClientDisconnect``, skipping any background task. The
+    iterator, and the generation stream it reads, would then be closed only when
+    garbage-collected.
+    """
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await self.body_iterator.aclose()
+
+
+async def keep_responses_stream_alive(
+        frames: AsyncGenerator[str, None]) -> AsyncGenerator[str, None]:
+    """Send ``frames``, repeating ``response.in_progress`` while they are silent.
+
+    ``frames`` yields one SSE event per item, numbered from 0, the first two
+    being ``response.created`` and ``response.in_progress``. Until the response
+    ends, the ``response.in_progress`` event is sent again whenever no event has
+    gone out for ``RESPONSES_STREAM_KEEPALIVE_INTERVAL_S`` seconds, before the
+    first token too. It is part of the stream format and carries the same
+    response as at the start, which clients already hold.
+
+    Events are numbered here, where they leave the server. The processor that
+    makes them cannot do it: postprocess workers each format events with their
+    own copy of it, and when a keepalive is due the reader may already hold the
+    next numbered event. A repeated event takes the next number, and every event
+    after it is renumbered to its place in the stream. Until then each event
+    already carries its place and goes out as it came.
+    """
+    in_progress: Optional[str] = None
+    ended = False
+    renumber = False
+    sent = 0
+    loop = asyncio.get_running_loop()
+    last_sent = loop.time()
+
+    def until_keepalive() -> Optional[float]:
+        if in_progress is None or ended:
+            return None
+        return max(
+            0.0,
+            RESPONSES_STREAM_KEEPALIVE_INTERVAL_S - (loop.time() - last_sent))
+
+    items = _with_ticks(frames, until_keepalive)
+    try:
+        async for frame in items:
+            if frame is None:
+                frame = in_progress
+                renumber = True
+            elif in_progress is None and frame.startswith(
+                    _IN_PROGRESS_FRAME_START):
+                in_progress = frame
+            if renumber:
+                frame = _stamp_sequence_number(frame, sent)
+            ended = ended or frame.startswith(_FINAL_FRAME_STARTS)
+            yield frame
+            sent += 1
+            last_sent = loop.time()
+    finally:
+        # Stops the task reading ``frames`` when this stream ends early.
+        await items.aclose()
 
 
 class ServerArrivalTimeMiddleware:

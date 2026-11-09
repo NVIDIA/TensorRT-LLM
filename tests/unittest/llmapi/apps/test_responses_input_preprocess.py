@@ -520,6 +520,35 @@ def test_a_malformed_additional_tools_item_is_not_hoisted():
     assert ResponsesRequest.hoist_additional_tools(request) is request
 
 
+def test_calls_echoed_without_their_namespace_replay_under_the_offered_names():
+    """The Codex CLI may echo a namespaced call back without its namespace."""
+    functions = {
+        "type": "namespace",
+        "name": "functions",
+        "description": "",
+        "tools": [{"type": "custom", "name": "exec", "description": "Run code."}],
+    }
+    messages = _messages(
+        {
+            "input": [
+                _additional_tools_item([functions, _namespace("collaboration", "spawn_agent")]),
+                _message_item("user", "go"),
+                {"type": "custom_tool_call", "call_id": "call_1", "name": "exec", "input": "ls"},
+                {"type": "custom_tool_call_output", "call_id": "call_1", "output": "a.txt"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "spawn_agent",
+                    "arguments": "{}",
+                },
+                {"type": "function_call_output", "call_id": "call_2", "output": "started"},
+            ]
+        }
+    )
+    calls = [call["function"]["name"] for m in messages for call in m.get("tool_calls") or []]
+    assert calls == ["functions.exec", "collaboration.spawn_agent"]
+
+
 # ---------------------------------------------------------------------------
 # developer messages
 # ---------------------------------------------------------------------------

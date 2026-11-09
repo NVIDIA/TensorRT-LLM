@@ -9,6 +9,7 @@ import threading
 import time
 from typing import Iterable, List, Optional
 
+from tensorrt_llm.bindings.executor import Request
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
 from ..distributed import Distributed
@@ -58,6 +59,11 @@ class RequestQueueItem:
     # original arrival on the same clock.
     admit_arrival: Optional[float] = None
     admit_orig_arrival: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        # Normalize bound inputs before any queue, ADP, or broadcast handoff.
+        if isinstance(self.request, Request):
+            self.request = ExecutorRequest.adapt(self.request)
 
     @property
     def is_shutdown_request(self):
@@ -274,6 +280,14 @@ class ExecutorRequestQueue:
         with self.enqueue_lock:
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
+
+    def pending_cancellation_ids(self) -> set[int]:
+        """Inspect cancellation sentinels without consuming queued requests."""
+        with self.request_queue.mutex:
+            return {
+                item.id
+                for item in self.request_queue.queue if item.is_canceled_request
+            }
 
     def enqueue_control_request(self,
                                 drain: bool = True,

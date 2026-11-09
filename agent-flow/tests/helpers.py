@@ -18,8 +18,10 @@ class FakeClient(BackendClient):
         skills: list[str] | None = None,
         turns: list[dict] | None = None,
         context_usage: UsageInfo | None = None,
+        session_id: str | None = None,
     ) -> None:
         self.text = text
+        self.session_id = session_id
         self.tool_calls = tool_calls or []
         self.error = error
         self.usage = usage
@@ -50,6 +52,7 @@ class FakeClient(BackendClient):
             usage=turn.get("usage", self.usage),
             is_error=turn.get("is_error", False),
             errors=turn.get("errors", []),
+            session_id=turn.get("session_id", self.session_id),
         )
 
 
@@ -79,6 +82,7 @@ class FakeBackend(Backend):
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict | None = None,
         cwd: Path | None = None,
+        fork_from: str | None = None,
     ):
         plan = self.plans[min(self.create_client_calls, len(self.plans) - 1)]
         self.create_client_calls += 1
@@ -90,6 +94,7 @@ class FakeBackend(Backend):
             skills=plan.get("skills"),
             turns=plan.get("turns"),
             context_usage=plan.get("context_usage"),
+            session_id=plan.get("session_id"),
         )
         client.system_prompt = system_prompt
         client.model = model
@@ -98,6 +103,7 @@ class FakeBackend(Backend):
         client.disallowed_tools = disallowed_tools
         client.extra_mcp_servers = extra_mcp_servers
         client.cwd = cwd
+        client.fork_from = fork_from
         self.clients.append(client)
         try:
             yield client

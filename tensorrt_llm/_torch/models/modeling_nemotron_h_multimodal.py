@@ -1152,6 +1152,13 @@ class NemotronHMultimodalInputProcessor(
 ):
     supports_token_id_mm_expansion: ClassVar[bool] = True
 
+    @property
+    def supported_modalities(self) -> frozenset[str]:
+        modalities = super().supported_modalities
+        if getattr(self, "_audio_extractor", None) is None:
+            return modalities - {"audio"}
+        return modalities
+
     def get_mm_item_metadata(
         self,
         prompt_token_ids: List[int],

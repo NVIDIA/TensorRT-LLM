@@ -159,8 +159,6 @@ slurm_wait_all_ranks
 set +e
 
 pytest_exit_code=0
-perf_check_exit_code=0
-perf_report_exit_code=0
 
 eval $pytestCommand
 pytest_exit_code=$?
@@ -170,55 +168,5 @@ if [ "${SLURM_PROCID:-0}" -eq 0 ]; then
         --drain-spool "$jobWorkspace" || true
 fi
 
-# DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
-# Remove this after the issue is resolved
-if [ $pytest_exit_code -eq 4 ]; then
-    echo "DEBUG: Pytest failed with usage error (exit code 4)"
-    echo "DEBUG: Directory state at $(pwd):"
-    ls -l
-    echo "DEBUG: Directory state at $llmSrcNode/tests/integration/defs:"
-    ls -l $llmSrcNode/tests/integration/defs
-
-    echo "DEBUG: conftest.py content:"
-    md5sum $llmSrcNode/tests/integration/defs/conftest.py
-
-    echo "DEBUG: pytest.ini content:"
-    md5sum $llmSrcNode/tests/integration/defs/pytest.ini
-
-    echo "DEBUG: Check importability of conftest.py"
-    python3 -c "import sys; sys.path.insert(0, '.'); import conftest; print('DEBUG: conftest imported successfully')"
-fi
-
-if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then
-    # Only PyTorch perf stages remain; the TensorRT perf baseline was removed.
-    basePerfFilename="base_perf_pytorch.csv"
-    basePerfPath="$llmSrcNode/tests/integration/defs/perf/$basePerfFilename"
-    echo "Check Perf Result"
-    python3 $llmSrcNode/tests/integration/defs/perf/sanity_perf_check.py \
-        $stageName/perf_script_test_results.csv \
-        $basePerfPath
-    perf_check_exit_code=$?
-
-    echo "Create Perf Report"
-    python3 $llmSrcNode/tests/integration/defs/perf/create_perf_comparison_report.py \
-        --output_path $stageName/report.pdf \
-        --files $stageName/perf_script_test_results.csv \
-        $basePerfPath
-    perf_report_exit_code=$?
-    echo "Rank${SLURM_PROCID} Perf report finished execution with exit code $perf_report_exit_code"
-
-    if [ "$perf_check_exit_code" -eq 0 ] && [ "$perf_report_exit_code" -ne 0 ]; then
-        perf_check_exit_code=$perf_report_exit_code
-    fi
-    echo "Rank${SLURM_PROCID} Perf check finished execution with exit code $perf_check_exit_code"
-fi
-
-if [ "$pytest_exit_code" -ne 0 ]; then
-    final_exit_code=$pytest_exit_code
-elif [ "$perf_check_exit_code" -ne 0 ]; then
-    final_exit_code=$perf_check_exit_code
-else
-    final_exit_code=0
-fi
-echo "Rank${SLURM_PROCID} Final Slurm run finished execution with exit code $final_exit_code"
-exit $final_exit_code
+echo "Rank${SLURM_PROCID} Final Slurm run finished execution with exit code $pytest_exit_code"
+exit $pytest_exit_code
