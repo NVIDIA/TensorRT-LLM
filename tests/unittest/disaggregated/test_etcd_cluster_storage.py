@@ -90,6 +90,35 @@ async def test_etcd_storage_passes_credentials_and_tls_files_and_keeps_them_for_
     client.return_value.close.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    "create",
+    [cluster_storage.create_cluster_storage, cluster_storage.create_cluster_storage_client],
+)
+def test_storage_with_an_unreadable_tls_file_is_not_created(create, tmp_path):
+    files = {}
+    for name in ("ca_cert", "cert_key", "cert_cert"):
+        files[name] = str(tmp_path / f"{name}.pem")
+        (tmp_path / f"{name}.pem").write_text("pem")
+    with mock.patch.object(Etcd3ClusterStorage, "_connect") as connect:
+        assert isinstance(create(ETCD_URI, "c", **files), Etcd3ClusterStorage)
+    connect.assert_not_called()
+    for name in files:
+        for path in (str(tmp_path / "missing.pem"), str(tmp_path)):
+            with pytest.raises(ValueError) as excinfo:
+                create(ETCD_URI, "c", **{**files, name: path})
+            assert str(excinfo.value) == f"disagg_cluster {name} is not a readable file: {path!r}"
+
+
+@pytest.mark.asyncio
+async def test_connect_warning_names_the_file_that_cannot_be_read():
+    missing = FileNotFoundError(2, "No such file or directory", "/tls/ca.pem")
+    with _connect(missing), mock.patch.object(cluster_storage.logger, "warning") as warning:
+        storage = Etcd3ClusterStorage(ETCD_URI, "c", **LOGIN)
+        assert await storage.set("k", "v") is False
+    (message,), _ = warning.call_args
+    assert message.endswith("FileNotFoundError: [Errno 2] No such file or directory: '/tls/ca.pem'")
+
+
 @pytest.mark.asyncio
 async def test_login_runs_on_the_first_call_off_the_event_loop():
     loop_thread = threading.get_ident()

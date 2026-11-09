@@ -6,6 +6,7 @@ import importlib.metadata as importlib_metadata
 import importlib.util
 import ipaddress
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -183,7 +184,7 @@ def create_cluster_storage(cluster_uri, cluster_name, **kwargs):
     if cluster_uri.startswith("http://") or cluster_uri.startswith("https://"):
         return HttpClusterStorageServer(cluster_uri, cluster_name, **kwargs)
     elif cluster_uri.startswith("etcd://"):
-        return Etcd3ClusterStorage(cluster_uri, cluster_name, **kwargs)
+        return _create_etcd_storage(cluster_uri, cluster_name, **kwargs)
     raise ValueError(f"Invalid cluster storage URI: {cluster_uri}")
 
 
@@ -191,8 +192,24 @@ def create_cluster_storage_client(cluster_uri, cluster_name, **kwargs):
     if cluster_uri.startswith("http://") or cluster_uri.startswith("https://"):
         return HttpClusterStorageClient(cluster_uri, cluster_name, **kwargs)
     elif cluster_uri.startswith("etcd://"):
-        return Etcd3ClusterStorage(cluster_uri, cluster_name, **kwargs)
+        return _create_etcd_storage(cluster_uri, cluster_name, **kwargs)
     raise ValueError(f"Invalid cluster storage URI: {cluster_uri}")
+
+
+def _create_etcd_storage(cluster_uri: str, cluster_name: str,
+                         **kwargs) -> "Etcd3ClusterStorage":
+    """Create an etcd storage once its TLS files are readable.
+
+    The storage reads the files when it connects, on its first call; checking them here
+    reports a wrong path when the server starts.
+    """
+    for name in ("ca_cert", "cert_key", "cert_cert"):
+        path = kwargs.get(name)
+        if path is not None and not (os.path.isfile(path)
+                                     and os.access(path, os.R_OK)):
+            raise ValueError(
+                f"disagg_cluster {name} is not a readable file: {path!r}")
+    return Etcd3ClusterStorage(cluster_uri, cluster_name, **kwargs)
 
 
 # All Http endpoints return {"result": <result>} and status code 400
@@ -680,9 +697,15 @@ def _rejects_token(error: grpc.RpcError) -> bool:
 
 
 def _describe_error(error: Exception) -> str:
-    """Describe ``error`` for a log message; a gRPC error by its status and details."""
+    """Describe ``error`` for a log message.
+
+    A gRPC error is described by its status and details, and an OS error by its message,
+    which names the file.
+    """
     if isinstance(error, grpc.RpcError):
         return f"{error.code().name}: {error.details()}"
+    if isinstance(error, OSError):
+        return f"{type(error).__name__}: {error}"
     return repr(error)
 
 
