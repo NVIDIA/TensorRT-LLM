@@ -2166,23 +2166,31 @@ def test_horizontal_producer_plan_caches_unsupported_layout(
 ) -> None:
     """An unsupported layout resolves to ``None`` once and stays ``None`` without re-validating."""
     layer, main, index, scales = _make_horizontal_producer_layer(kv_dtype)
-    slots = torch.zeros(4, dtype=torch.int32, device="cuda")
+    # The supported slot table is the head of a larger allocation, so the strided view below shares
+    # its address and shape and differs only in stride.
+    backing = torch.zeros(8, dtype=torch.int32, device="cuda")
+    slots = backing[:4]
     supported = (main, index, scales if kv_dtype == "nvfp4" else None, slots)
     if layout == "int64_slots":
         unsupported = (*supported[:3], slots.to(torch.int64))
     elif layout == "strided_slots":
-        unsupported = (*supported[:3], torch.zeros(8, dtype=torch.int32, device="cuda")[::2])
+        strided = backing[::2]
+        assert (strided.data_ptr(), strided.shape) == (slots.data_ptr(), slots.shape)
+        unsupported = (*supported[:3], strided)
     else:
         # Rows padded past 128 per head: valid HND geometry the packed producer cannot write.
         padded = torch.zeros((2, 2, 2, 129, 64), dtype=torch.uint8, device="cuda")[:, :, :, :128]
         unsupported = (padded, *supported[1:])
     calls = _count_plan_resolutions(monkeypatch, layer)
 
-    assert layer._fused_producer_plan(*unsupported) is None
-    assert layer._fused_producer_plan(*unsupported) is None
+    # The same layer accepts its supported views, so the rejection below is the layout's alone.
+    plan = layer._fused_producer_plan(*supported)
+    assert plan is not None
     assert calls[0] == 1
-    # The same layer accepts its supported views, so the rejection is the layout's.
-    assert layer._fused_producer_plan(*supported) is not None
+    assert layer._fused_producer_plan(*unsupported) is None
+    assert layer._fused_producer_plan(*unsupported) is None
+    assert calls[0] == 2
+    assert layer._fused_producer_plan(*supported) is plan
     assert calls[0] == 2
 
 
