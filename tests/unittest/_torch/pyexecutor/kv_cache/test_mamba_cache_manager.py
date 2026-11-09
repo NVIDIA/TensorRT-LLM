@@ -3914,6 +3914,8 @@ def _build_v2_hybrid_with_mamba_layer(
     mamba_d_state: int = 8,
     mamba_head_dim: int = 8,
     max_num_tokens: int = 8192,
+    is_draft: bool = False,
+    joint_kv_cache_reuse: bool = False,
 ) -> MambaHybridCacheManagerV2:
     """Construct a real MambaHybridCacheManagerV2."""
     # Draft layers of a combined speculative manager follow the model's layers in both masks.
@@ -4012,6 +4014,8 @@ def _build_v2_hybrid_with_mamba_layer(
         conv_state_layout=conv_state_layout,
         is_disagg=is_disagg,
         enable_stats=enable_stats,
+        is_draft=is_draft,
+        joint_kv_cache_reuse=joint_kv_cache_reuse,
         **(
             {"kda_draft_records": kda_draft_records}
             if issubclass(model_cls, KimiK3HybridCacheManager)
@@ -4097,6 +4101,34 @@ def _make_v2_prompt_request(request_id: int, tokens: list[int]) -> LlmRequest:
         sampling_config=SamplingConfig(),
         is_streaming=False,
     )
+
+
+@skip_no_cuda
+def test_v2_paired_draft_pool_publishes_its_blocks():
+    """A paired draft pool commits its context blocks, so a later request reuses them.
+
+    The draft pool holds no recurrent state, so it commits on the base class's
+    block cadence rather than at the target's snapshot points.
+    """
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        num_mamba_layers=0,
+        enable_block_reuse=True,
+        is_draft=True,
+        joint_kv_cache_reuse=True,
+    )
+    prompt_len = 2 * mgr.tokens_per_block
+    request = _make_v2_prompt_request(1, list(range(prompt_len)))
+    probe = _make_v2_prompt_request(2, list(range(prompt_len + 1)))
+    try:
+        _run_v2_hybrid_context(mgr, request)
+        mgr.free_resources(request)
+
+        mgr.prepare_expect_snapshot_points([probe])
+        assert mgr.prepare_context(probe)
+        assert probe.prepopulated_prompt_len == prompt_len
+        mgr.free_resources(probe)
+    finally:
+        mgr.shutdown()
 
 
 @skip_no_cuda
