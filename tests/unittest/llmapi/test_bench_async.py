@@ -481,17 +481,21 @@ async def test_async_benchmark_duration():
 
 
 def test_generate_warmup_dataset_salts_copies():
-    requests = [InferenceRequest(task_id=i, input_ids=[i], output_tokens=1) for i in range(3)]
+    requests = [InferenceRequest(task_id=i, input_ids=[i], output_tokens=i + 1) for i in range(3)]
+    originals = {request.task_id: request.model_dump() for request in requests}
 
     warmup = generate_warmup_dataset(requests, 4)
 
     assert len(warmup) == 4
-    assert all(request.cache_salt == "warmup" for request in warmup)
-    assert all(request.cache_salt is None for request in requests)
+    assert {request.task_id: request.model_dump() for request in requests} == originals
+    for request in warmup:
+        assert request.model_dump() == {**originals[request.task_id], "cache_salt": "warmup"}
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("cache_salt", [None, "warmup"], ids=["unsalted", "salted"])
+@pytest.mark.parametrize(
+    "cache_salt", [None, "warmup", "other"], ids=["unsalted", "warmup", "other"]
+)
 @pytest.mark.parametrize("turns", [None, ["q1", "q2"]], ids=["single_turn", "multi_turn"])
 async def test_llm_manager_forwards_cache_salt(turns, cache_salt):
     mock_llm = MagicMock(spec=LLM)
