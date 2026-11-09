@@ -1,0 +1,1390 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""``dense_gemms`` / ``dense_gemm_prefetch``: the dense projections through ``ops/gemm/dense_gemm``.
+
+Where the built-in model chooses the GEMM: the built-in ``Linear`` (QKV and attention
+output projections) and ``MuseSparkOpenMoE._replicated_projection`` (the rank's
+pooler and unpooler slices) both end in ``apply_low_m_gemm(module, x, weight,
+bias)``, which asks ``module._low_m_gemm_dispatcher`` -- an autotuner race whose
+winner each rank keeps for itself. The engine assigns that attribute to every
+``Linear`` after the weights are loaded (``prepare_low_m_gemm``), which is after
+this target is built.
+
+So ``install`` re-classes the four projections of every layer as
+``MuseSparkOpenTepDenseLinear``, whose ``_low_m_gemm_dispatcher`` slot always
+yields a ``DenseGemmDispatcher`` and keeps whatever the engine assigns to it as
+that dispatcher's fallback. A call that fits -- BF16, no bias, at most 8 rows,
+the site's shape -- runs ``dense_gemm`` with the kernel this fast path names for
+the site and row count, the same on every rank; any other call goes to the built-in dispatcher
+unchanged. A fast path may also give the plan a table for 9..32 rows
+(``DenseGemmPlan.set_wide_kernels``, ``wide_projection_gathers``): while it arms
+the plan (``wide_armed``, one decode forward), a call of those rows at a site the
+table names runs that table's kernel. Nothing else in the layer changes, so the other fast paths
+that re-class the attention, the decoder layer or the MoE compose with this one:
+their GEMM calls still land in these dispatchers.
+
+Above 32 rows the built-in ``Linear`` never asks a low-M dispatcher, so a fast path
+that acts on larger decode steps arms the plan instead (``DenseGemmPlan.batch``, set
+for one decode forward by ``batch_dense_gemms``): while it is set, a re-classed
+projection's ``apply_linear`` hands the call to it with the built-in GEMM as a callable.
+
+With ``dense_gemm_prefetch`` a projection that ran also forks a side stream that asks the L2 to
+fetch the next projection's weight (QKV -> the same layer's attention output ->
+the same layer's pooler slice; the unpooler -> the next layer's QKV), so the
+next GEMM finds its weight in L2 after the latency-bound kernels in between
+(prep and attention; the all-reduce and cluster boundary; the unpool gather and
+boundary). The unpooler's own weight is not prefetched: between the pooler and
+the unpooler the experts stream far more than the L2 holds. ``dense_gemm_prefetch`` therefore
+needs the sharded projections, whose pooler GEMM reads only the rank's slice.
+
+Named forks (``NamedFork``, ``DenseGemmPlan.add_fork``): side-stream work other
+fast paths register under a name, each on a CUDA stream of its own, joined by the
+dispatchers of one named site only (``join_role``) -- e.g. a prefetch forked
+after a layer's expert kernel that the next layer's QKV dispatcher joins and the
+unpooler's dispatcher in between does not -- and by the target at the end of
+its forward. With no named fork registered the dispatchers join nothing by name.
+
+The fork and its join (``DenseGemmPlan``): the next projection's dispatcher
+joins the outstanding fork before anything else, and the target joins whatever
+is still outstanding at the end of its forward, so a fork made inside a CUDA
+graph capture is joined inside that capture, as the capture requires. A fork
+records the capture it was made in (none when eager); a join waits for it only
+from the same capture state. A fork from another state -- an eager step that
+ended between a fork and its consumer, a capture that was abandoned, or a
+breakable graph's segment that already joined it at its end -- is dropped
+instead: the prefetch reads an immutable weight and writes nothing anyone
+reads, so nothing depends on its completion, and a capture may not wait on
+work outside it.
+"""
+
+from __future__ import annotations
+
+from ...sm107_defaults import env as _sm107_env
+
+import json
+import os
+from dataclasses import dataclass
+from typing import Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
+
+import torch
+from cuda.bindings import runtime as _cudart
+
+from tensorrt_llm._torch.modules import low_m_gemm as _low_m_gemm
+from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._utils import CUASSERT
+from tensorrt_llm.logger import logger
+
+from ...dispatch import LAUNCH_PDL
+from ...ops.gemm.dense_gemm import (
+    CUBLAS,
+    DIRECT,
+    MAX_ROWS,
+    O_PROJ_SHAPE,
+    POOL_SHAPE,
+    QKV_SHAPE,
+    SPLITK,
+    UNPOOL_SHAPE,
+    WIDE_MAX_ROWS,
+    dense_gemm,
+    kernel_error,
+    l2_prefetch,
+    parse_kernel,
+)
+
+#: The first row count of a plan's wide table (``DenseGemmPlan.set_wide_kernels``).
+WIDE_MIN_ROWS = MAX_ROWS + 1
+
+#: Env replacing tep4 sites' 1..8-row steps (``kernel_steps``).
+NARROW_GEMMS_ENV = "MUSESPARK_OPEN_TEP4_NARROW_GEMMS"
+
+#: The four projections of a layer, in the order a step runs them.
+SITES = ("qkv", "o_proj", "pool", "unpool")
+
+#: ``MUSESPARK_OPEN_POOL_SPLITK8=1`` lets the pooler's ``wide_dense_gemms`` kernels
+#: (9..32 rows) sum K in 8 slices (split_k 8, served by the split-K kernel only with its reduce-scatter epilogue,
+#: ``MUSESPARK_OPEN_SPLITK_RS=1``) instead of the 8-row cell's 4: a wide call's pool rows then no longer get their
+#: one-request bits (numerics-gated, not bitwise). Every other site, and the pooler without the gate, keeps ``install``'s
+#: same-split_k check. Unset = unchanged. Read at install.
+POOL_SPLITK8_ENV = "MUSESPARK_OPEN_POOL_SPLITK8"
+#: ``MUSESPARK_OPEN_POOL_SPLITK8_SHADOW=<file.jsonl>``: on eager (not capturing) pool calls whose kernel is a split-K 8
+#: one, also run ``MUSESPARK_OPEN_POOL_SPLITK8_SHADOW_REF`` (default the 24-row production kernel ``splitk:64,16,4,10``)
+#: and an fp64 product on the same operands, and append each call's errors vs fp64 (abs and in BF16 ulps of the
+#: reference) and the share of BF16 outputs that differ to the file; at most ``..._SHADOW_N`` calls (default 4000).
+#: Side outputs only: the call's own output is untouched.
+POOL_SPLITK8_SHADOW_ENV = "MUSESPARK_OPEN_POOL_SPLITK8_SHADOW"
+_SHADOW_STATE = {"n": 0}
+
+
+def _pool_splitk8_shadow(site, x, weight, out, kernel, enable_pdl) -> None:
+    path = _sm107_env(POOL_SPLITK8_SHADOW_ENV, "")
+    if not path or site.role != "pool" or torch.cuda.is_current_stream_capturing():
+        return
+    family, fields = parse_kernel(kernel)
+    if family != SPLITK or fields[2] != 8:
+        return
+    if _SHADOW_STATE["n"] >= int(_sm107_env(POOL_SPLITK8_SHADOW_ENV + "_N", "4000")):
+        return
+    _SHADOW_STATE["n"] += 1
+    ref_kernel = _sm107_env(POOL_SPLITK8_SHADOW_ENV + "_REF", "splitk:64,16,4,10")
+    with torch.no_grad():
+        o4 = dense_gemm(x, weight, ref_kernel, enable_pdl)
+        ref = x.double() @ weight.double().t()
+        ulp = (ref.abs().clamp(min=1e-30).log2().floor() - 7).exp2()
+        rec = {"layer": int(site.layer_idx), "rows": int(x.shape[0]), "kernel": kernel, "ref_kernel": ref_kernel,
+               "diff_frac": float((o4 != out.view_as(o4)).float().mean())}
+        for nm, o in (("s8", out.view_as(o4)), ("s4", o4)):
+            e = (o.double() - ref).abs()
+            eu = e / ulp
+            rec[nm] = [float(e.max()), float(e.mean()), float(eu.max()), float(eu.mean())]
+    rank = int(_sm107_env("RANK", _sm107_env("OMPI_COMM_WORLD_RANK", "0")))
+    with open(f"{path}.rank{rank}", "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+#: Kernel per site by row count on sm103 at tep8 (two trays, sharded pooler and
+#: unpooler), as ``(last row count, kernel)`` steps, chosen in
+#: 62-layer chains of cold weights behind predecessors that release at exit: the
+#: direct kernel is the fastest for every shape at 1-2 rows and for the pooler and
+#: unpooler slices at 3-4 rows; split-K 4 for QKV from 3 rows, and it ties with
+#: the direct kernel on the pooler and beats it on the unpooler at 8 rows;
+#: cuBLAS for the attention output projection from 3 rows. Rows 5-7 follow the
+#: built-in autotuner's crossover. At 8 rows the pooler and unpooler run the
+#: split-K-4 family every rank's autotuner picks, so their bits match the built-in's.
+DEFAULT_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
+    "qkv": ((2, "direct:256,1"), (MAX_ROWS, "splitk:64,8,4,12")),
+    "o_proj": ((2, "direct:64,4"), (MAX_ROWS, CUBLAS)),
+    "pool": ((2, "direct:256,1"), (6, "direct:128,2"), (MAX_ROWS, "splitk:64,8,4,12")),
+    "unpool": ((2, "direct:256,1"), (5, "direct:64,2"), (MAX_ROWS, "splitk:64,8,4,12")),
+}
+
+#: The same table for sm107 (212 SMs) at tep8, chosen the same way: the direct kernel at two or
+#: four outputs per CTA for QKV at 1-3 rows and for the unpooler slice at 1-7 rows;
+#: split-K 4 for QKV from 4 rows (36 x 4 CTAs is the widest split-K grid at its width);
+#: flashinfer's split-K ``(64, 8, 1, 12)`` for the attention output projection from 3 rows,
+#: where it is faster than cuBLAS on this arch. The pooler keeps the sm103 cells, which
+#: are within the measurement spread of the fastest here.
+SM107_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
+    "qkv": (
+        (1, "direct:256,2"),
+        (2, "direct:128,4"),
+        (3, "direct:64,2"),
+        (MAX_ROWS, "splitk:64,8,4,12"),
+    ),
+    "o_proj": ((2, "direct:64,4"), (MAX_ROWS, "splitk:64,8,1,12")),
+    "pool": DEFAULT_KERNELS["pool"],
+    "unpool": ((1, "direct:256,2"), (7, "direct:128,2"), (MAX_ROWS, "splitk:64,8,4,12")),
+}
+
+#: The same on sm103 at tep4 (one tray), per-rank shapes QKV ``[4608, 8192]``, o_proj
+#: ``[8192, 2048]`` and the sharded pooler / unpooler slices ``[1024, 8192]`` /
+#: ``[2048, 4096]``, chosen the same way (``TP4_REPLICATED_PROJECTION_KERNELS``
+#: replaces the pooler and unpooler entries when they are replicated). The direct
+#: kernel is the fastest for every shape at 1-2 rows and for the pooler and
+#: unpooler slices up to 5 and 4 rows; from 3 rows QKV runs split-K 2 (its N of
+#: 4608 already fills the GPU with 72 column tiles), the slices split-K 4, and the
+#: attention output projection cuBLAS, as at tep8.
+TP4_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
+    "qkv": ((2, "direct:256,2"), (MAX_ROWS, "splitk:64,8,2,10")),
+    "o_proj": ((2, "direct:128,4"), (MAX_ROWS, CUBLAS)),
+    "pool": ((2, "direct:256,2"), (5, "direct:256,4"), (MAX_ROWS, "splitk:64,8,4,10")),
+    "unpool": ((2, "direct:128,2"), (4, "direct:128,4"), (MAX_ROWS, "splitk:64,8,4,10")),
+}
+
+#: The tep4 pooler and unpooler on the whole replicated weights ``[4096, 8192]`` /
+#: ``[8192, 4096]``: the built-in model's tep4 projections, which it shards only at
+#: tep8. Direct at 1-2 rows; from 3 rows split-K 2 for the pooler, cuBLAS for the
+#: unpooler (K = 4096 leaves split-K no slices to spread).
+TP4_REPLICATED_PROJECTION_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
+    "pool": ((2, "direct:256,2"), (MAX_ROWS, "splitk:64,8,2,10")),
+    "unpool": ((2, "direct:128,2"), (MAX_ROWS, CUBLAS)),
+}
+
+#: The tep4 table on sm107 (212 SMs), the tep4 shapes chosen the same way: the direct
+#: kernel at 1-3 rows for QKV, 1-2 for the attention output projection, 1-6 for the
+#: pooler slice and 1-5 for the unpooler slice; then split-K 2 for QKV, flashinfer's
+#: split-K ``(64, 8, 1, 11)`` for the attention output projection (faster than cuBLAS
+#: here) and split-K 4 for the slices.
+SM107_TP4_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
+    "qkv": (
+        (1, "direct:256,2"),
+        (2, "direct:64,4"),
+        (3, "direct:32,2"),
+        (MAX_ROWS, "splitk:64,8,2,12"),
+    ),
+    "o_proj": ((2, "direct:128,4"), (MAX_ROWS, "splitk:64,8,1,11")),
+    "pool": ((1, "direct:256,2"), (6, "direct:128,2"), (MAX_ROWS, "splitk:64,8,4,11")),
+    "unpool": ((3, "direct:128,2"), (5, "direct:64,2"), (MAX_ROWS, "splitk:64,8,4,10")),
+}
+
+#: The tep4 pooler and unpooler on the whole replicated weights on sm107: direct at 1-3
+#: and 1-2 rows, then split-K 2 for the pooler and flashinfer's split-K ``(64, 8, 1, 12)``
+#: for the unpooler.
+SM107_TP4_REPLICATED_PROJECTION_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
+    "pool": (
+        (1, "direct:256,2"),
+        (2, "direct:64,4"),
+        (3, "direct:32,2"),
+        (MAX_ROWS, "splitk:64,8,2,11"),
+    ),
+    "unpool": ((2, "direct:128,2"), (MAX_ROWS, "splitk:64,8,1,12")),
+}
+
+#: ``wide_dense_gemms``: the sm107 tep4 kernels of the 9..32-row calls of a decode step of 2..4
+#: requests, as ``(last row count, kernel)`` steps from 9 rows. Each is flashinfer's split-K with
+#: the ``split_k`` of the site's 8-row cell in ``SM107_TP4_KERNELS``, so it sums the same K slices
+#: in the same order and every row of a wide call gets the bits that row gets in a one-request
+#: step (``install`` checks this). Among those tactics, the fastest in 62-layer chains of cold
+#: weights; each beats cuBLAS on its site up to 32 rows, except the attention output projection
+#: at 9..16 rows, where cuBLAS is measured slightly faster.
+SM107_TP4_WIDE_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
+    "qkv": ((16, "splitk:64,16,2,11"), (WIDE_MAX_ROWS, "splitk:64,32,2,9")),
+    "o_proj": ((16, "splitk:64,16,1,10"), (WIDE_MAX_ROWS, "splitk:64,32,1,9")),
+    "pool": ((16, "splitk:64,8,4,11"), (WIDE_MAX_ROWS, "splitk:64,16,4,10")),
+    "unpool": ((16, "splitk:64,16,4,9"), (WIDE_MAX_ROWS, "splitk:64,32,4,8")),
+}
+
+
+#: ``wide_dense_gemms`` at sm107 tep8: the 9..32-row calls of a decode step of 2..4 requests on
+#: flashinfer's split-K with the ``split_k`` of the site's 8-row cell in ``SM107_KERNELS`` (4 for QKV
+#: and the pooler and unpooler slices, 1 for the attention output projection), so every row of a
+#: wide call keeps the bits it gets in a one-request step. Tile widths and stages follow the tep4
+#: table; ``MUSESPARK_OPEN_TEP8_WIDE_GEMMS`` (JSON, site -> [[last row count, kernel], ...])
+#: replaces sites for tactic sweeps.
+SM107_TP8_WIDE_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
+    "qkv": ((16, "splitk:64,16,4,11"), (WIDE_MAX_ROWS, "splitk:64,32,4,9")),
+    "o_proj": ((16, "splitk:64,16,1,10"), (WIDE_MAX_ROWS, "splitk:64,32,1,9")),
+    "pool": ((16, "splitk:64,8,4,11"), (WIDE_MAX_ROWS, "splitk:64,16,4,10")),
+    "unpool": ((16, "splitk:64,16,4,9"), (WIDE_MAX_ROWS, "splitk:64,32,4,8")),
+}
+
+
+def wide_steps(tp_size: int = 4) -> Dict[str, Tuple[Tuple[int, str], ...]]:
+    """The ``(last row count, kernel)`` steps of each ``wide_dense_gemms`` site at ``tp_size``."""
+    if tp_size == 4:
+        steps = dict(SM107_TP4_WIDE_KERNELS)
+        # Opt-in: ``MUSESPARK_OPEN_TEP4_WIDE_GEMMS`` (JSON, site -> [[last row count,
+        # kernel], ...]) replaces tep4 sites, as ``MUSESPARK_OPEN_TEP8_WIDE_GEMMS`` does at tep8; unset is the
+        # table above. ``install`` still checks each kernel's split_k against the site's 8-row cell (same bits).
+        override = _sm107_env("MUSESPARK_OPEN_TEP4_WIDE_GEMMS", "").strip()
+        if override:
+            for site, cells in json.loads(override).items():
+                if site not in SITES:
+                    raise ValueError(f"[musespark_open] MUSESPARK_OPEN_TEP4_WIDE_GEMMS: unknown site {site!r}")
+                steps[site] = tuple((int(last), str(kernel)) for last, kernel in cells)
+        return steps
+    steps = dict(SM107_TP8_WIDE_KERNELS)
+    override = _sm107_env("MUSESPARK_OPEN_TEP8_WIDE_GEMMS", "").strip()
+    if override:
+        for site, cells in json.loads(override).items():
+            if site not in SITES:
+                raise ValueError(f"[musespark_open] MUSESPARK_OPEN_TEP8_WIDE_GEMMS: unknown site {site!r}")
+            steps[site] = tuple((int(last), str(kernel)) for last, kernel in cells)
+    # The deepest pipeline each tactic's shared memory allows on this device (split_k 4 holds
+    # more partials than the tep4 cells' split_k 2, so the tep4 stage counts can overflow).
+    return {
+        site: tuple((last, _fit_stages(kernel, last, *_TP8_SHAPES[site])) for last, kernel in cells)
+        for site, cells in steps.items()
+    }
+
+
+#: The per-rank ``(K, N)`` of each site at tep8 (``ops/gemm/dense_gemm``).
+_TP8_SHAPES = {"qkv": QKV_SHAPE, "o_proj": O_PROJ_SHAPE, "pool": POOL_SHAPE, "unpool": UNPOOL_SHAPE}
+
+
+def _fit_stages(kernel: str, rows: int, k: int, n: int) -> str:
+    """``kernel`` with its split-K ``stages`` lowered until flashinfer accepts it at ``rows x K -> N``."""
+    family, fields = parse_kernel(kernel)
+    if family != SPLITK:
+        return kernel
+    mma_m, mma_n, split_k, stages = fields
+    while stages > 2 and kernel_error(f"splitk:{mma_m},{mma_n},{split_k},{stages}", rows, k, n) is not None:
+        stages -= 1
+    return f"splitk:{mma_m},{mma_n},{split_k},{stages}"
+
+
+def wide_kernels(tp_size: int = 4) -> Dict[str, Tuple[str, ...]]:
+    """The kernel of each ``wide_dense_gemms`` site for rows 9..32 (index ``rows - 9``)."""
+    out = {}
+    for site, steps in wide_steps(tp_size).items():
+        kernels, first = [], MAX_ROWS + 1
+        for last, kernel in steps:
+            kernels += [kernel] * (last - first + 1)
+            first = last + 1
+        assert len(kernels) == WIDE_MAX_ROWS - MAX_ROWS, steps
+        out[site] = tuple(kernels)
+    return out
+
+
+#: The measured table of each ``(compute capability, TP size)``, with the pooler and
+#: unpooler on the rank's slices (``kernel_steps`` swaps in the replicated tep4 cells).
+KERNELS_BY_SM_TP: Mapping[
+    Tuple[Tuple[int, int], int], Mapping[str, Tuple[Tuple[int, str], ...]]
+] = {
+    ((10, 3), 8): DEFAULT_KERNELS,
+    ((10, 3), 4): TP4_KERNELS,
+    ((10, 7), 8): SM107_KERNELS,
+    ((10, 7), 4): SM107_TP4_KERNELS,
+}
+
+#: The pooler and unpooler cells of each tep4 table on the whole replicated weights.
+TP4_REPLICATED_PROJECTION_KERNELS_BY_SM: Mapping[
+    Tuple[int, int], Mapping[str, Tuple[Tuple[int, str], ...]]
+] = {
+    (10, 3): TP4_REPLICATED_PROJECTION_KERNELS,
+    (10, 7): SM107_TP4_REPLICATED_PROJECTION_KERNELS,
+}
+
+
+def _by_rows(steps: Tuple[Tuple[int, str], ...]) -> List[str]:
+    kernels, first = [], 1
+    for last, kernel in steps:
+        kernels += [kernel] * (last - first + 1)
+        first = last + 1
+    assert len(kernels) == MAX_ROWS, steps
+    return kernels
+
+
+def kernel_steps(
+    capability: Tuple[int, int], tp_size: int, sharded: bool
+) -> Mapping[str, Tuple[Tuple[int, str], ...]]:
+    """The ``(last row count, kernel)`` steps of each site on ``capability`` at ``tp_size``.
+
+    ``sharded``: whether the pooler and unpooler GEMMs read the rank's slice
+    (``sharded_projections``) rather than the whole replicated weight.
+
+    Raises:
+        ValueError: if ``KERNELS_BY_SM_TP`` has no table for ``(capability, tp_size)``.
+    """
+    key = (tuple(capability), int(tp_size))
+    table = KERNELS_BY_SM_TP.get(key)
+    if table is None:
+        raise ValueError(
+            f"[musespark_open] dense_gemms: no kernel table for SM {key[0]} at TP {key[1]} "
+            f"(supported: {sorted(KERNELS_BY_SM_TP)})"
+        )
+    if key[1] == 4 and not sharded:
+        table = {**table, **TP4_REPLICATED_PROJECTION_KERNELS_BY_SM[key[0]]}
+    # Opt-in: ``MUSESPARK_OPEN_TEP4_NARROW_GEMMS`` (JSON, site -> [[last row count, kernel], ...]
+    # covering rows 1..8) replaces tep4 sites' 1..8-row steps, as ``MUSESPARK_OPEN_TEP4_WIDE_GEMMS`` does for 9..32 rows:
+    # deeper split-K stages under MUSESPARK_OPEN_SPLITK_OVERSIZED_SMEM (same split_k, same bits). Unset = unchanged.
+    narrow = _sm107_env(NARROW_GEMMS_ENV, "").strip() if key[1] == 4 else ""
+    if narrow:
+        table = dict(table)
+        for site, cells in json.loads(narrow).items():
+            if site not in SITES:
+                raise ValueError(f"[musespark_open] {NARROW_GEMMS_ENV}: unknown site {site!r}")
+            steps = tuple((int(last), str(kernel)) for last, kernel in cells)
+            if not steps or steps[-1][0] != MAX_ROWS:
+                raise ValueError(f"[musespark_open] {NARROW_GEMMS_ENV}: {site} steps must end at {MAX_ROWS} rows")
+            old_k = [parse_kernel(k) for _, k in table[site]]
+            for _, kernel in steps:
+                family, fields = parse_kernel(kernel)
+                if family == SPLITK and not any(f == SPLITK and o[2] == fields[2] for f, o in old_k):
+                    raise ValueError(f"[musespark_open] {NARROW_GEMMS_ENV}: {site} {kernel} changes the split_k of "
+                                     "the table's split-K cells (bits)")
+            table[site] = steps
+    return table
+
+
+def default_kernels(
+    tp_size: int = 8, sharded: bool = True, capability: Tuple[int, int] = (10, 3)
+) -> Dict[str, Tuple[str, ...]]:
+    """The kernel of each site for rows 1..8 on ``capability`` at ``tp_size`` (``kernel_steps``)."""
+    return {
+        site: tuple(_by_rows(steps))
+        for site, steps in kernel_steps(capability, tp_size, sharded).items()
+    }
+
+
+def device_capability() -> Tuple[int, int]:
+    """The compute capability whose kernel table ``install`` uses: the current CUDA device's.
+
+    On a host without CUDA, where no kernel launches (the wiring's unit tests), the
+    target's own sm103.
+    """
+    if not torch.cuda.is_available():
+        return (10, 3)
+    return tuple(torch.cuda.get_device_capability())
+
+
+def sharded_projections(model: torch.nn.Module) -> bool:
+    """Whether the built-in model runs the sharded pooler and unpooler projections.
+
+    The built-in constructor gives every MoE its projection-gather workspaces
+    exactly when it shards them.
+    """
+    return all(
+        getattr(layer.feed_forward, "_pool_gather_workspace", None) is not None
+        and getattr(layer.feed_forward, "_unpool_gather_workspace", None) is not None
+        for layer in model.layers
+    )
+
+
+def describe(kernels: Mapping[str, Tuple[str, ...]]) -> str:
+    """``site=kernel@a-b,...`` for a log line."""
+    parts = []
+    for site in SITES:
+        runs, first = [], 1
+        for row in range(2, MAX_ROWS + 2):
+            if row > MAX_ROWS or kernels[site][row - 1] != kernels[site][first - 1]:
+                span = f"{first}" if first == row - 1 else f"{first}-{row - 1}"
+                runs.append(f"{kernels[site][first - 1]}@{span}")
+                first = row
+        parts.append(f"{site}=" + "|".join(runs))
+    return ", ".join(parts)
+
+
+def current_capture_id() -> Optional[int]:
+    """The id of the CUDA graph capture the current stream belongs to, or ``None`` when eager.
+
+    A stream that joined a capture (by waiting on a capturing stream) reports the
+    id of that capture, so the main stream and a side stream it forked agree.
+    """
+    if not torch.cuda.is_current_stream_capturing():
+        return None
+    _, capture_id, *_ = CUASSERT(
+        _cudart.cudaStreamGetCaptureInfo(torch.cuda.current_stream().cuda_stream)
+    )
+    return int(capture_id)
+
+
+def dedicated_stream(device: torch.device) -> torch.cuda.ExternalStream:
+    """A CUDA stream of its own (non-blocking, default priority), never one of PyTorch's pool.
+
+    PyTorch hands out its pooled streams round robin, and a CUDA graph capture
+    takes its capturing stream from the same pool, so a pooled side stream can be
+    the capturing stream itself; a fork and join on it are then in-order work on
+    one stream. A stream made here can never be that stream. It lives as long as
+    the process.
+    """
+    with torch.cuda.device(device):
+        handle = CUASSERT(_cudart.cudaStreamCreateWithFlags(_cudart.cudaStreamNonBlocking))[0]
+    return torch.cuda.ExternalStream(int(handle), device=device)
+
+
+class NamedFork:
+    """Side-stream work the critical path waits for only at one named consumer.
+
+    ``fork(launch)`` makes the fork's own stream wait for the current stream's
+    work so far and calls ``launch()`` with that stream current; ``join()`` makes
+    the current stream wait for everything forked since the last join. A fork
+    names the dense projection site whose dispatcher joins it before its GEMM
+    (``join_role``, one of ``SITES``; ``DenseGemmPlan.join_role``), so a fork made
+    after, say, a layer's expert kernel is joined by the next layer's QKV
+    dispatcher and by no dispatcher in between; ``join_role=None`` leaves the
+    join to its owner (``join()``). The target joins every fork still outstanding
+    at the end of its forward (``DenseGemmPlan.join_all``), so a fork made inside
+    a CUDA graph capture is joined inside it.
+
+    The capture rules are ``DenseGemmPlan``'s for the prefetch fork: a fork
+    records the capture state it was made in, a join waits for it only from the
+    same state and otherwise drops it (``dropped``); work forked from another
+    state cannot be waited on, so a fork may carry only work nothing reads
+    (an L2 prefetch, for one). A fork while a fork from another capture state
+    is still outstanding drops that one first. Forks made one after another
+    without a join are ordered by the side stream itself and covered by the
+    next join. The stream and ``sink`` (an int32 scratch word the launch may
+    use) are made at the first fork outside a capture -- the engine's eager
+    warm-up -- and a fork made inside a capture before that launches nothing
+    (``skipped``).
+
+    In a captured graph the join is a dependency of the consumer's kernel: a
+    full edge in front of a plain launch, a programmatic edge in front of a
+    kernel launched with programmatic dependent launch, so the
+    consumer launches once every CTA of the forked kernels has exited or
+    triggered, and its ``griddepcontrol.wait`` returns once they completed.
+    """
+
+    def __init__(self, name: str, join_role: Optional[str]) -> None:
+        if join_role is not None and join_role not in SITES:
+            raise ValueError(f"fork {name!r}: join_role {join_role!r} is not one of {SITES}")
+        self.name = name
+        self.join_role = join_role
+        self.pending = False
+        self.forks = 0
+        self.joins = 0
+        self.dropped = 0
+        self.skipped = 0
+        self._fork_capture: Optional[int] = None
+        self._stream: Optional[torch.cuda.ExternalStream] = None
+        self.sink: Optional[torch.Tensor] = None
+
+    @property
+    def stream(self) -> Optional[torch.cuda.ExternalStream]:
+        """The fork's own stream, or ``None`` before the first fork outside a capture."""
+        return self._stream
+
+    def fork(self, launch: Callable[[], None], device: Optional[torch.device] = None) -> bool:
+        """Run ``launch()`` on the fork's stream after the current stream's work so far.
+
+        Returns whether it ran (False: inside a capture before the stream exists).
+        """
+        capture = current_capture_id()
+        if self._stream is None:
+            if capture is not None:
+                # A stream and the sink cannot be made inside a capture; the
+                # engine's eager warm-up makes them before it captures.
+                self.skipped += 1
+                return False
+            if device is None:
+                device = torch.device("cuda", torch.cuda.current_device())
+            self._stream = dedicated_stream(device)
+            self.sink = torch.zeros(1, dtype=torch.int32, device=device)
+        if self.pending and self._fork_capture != capture:
+            self.pending = False
+            self.dropped += 1
+        self._stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(self._stream):
+            launch()
+        self._fork_capture = capture
+        self.pending = True
+        self.forks += 1
+        return True
+
+    def join(self) -> None:
+        """Make the current stream wait for the outstanding forks made in the same capture
+        state; drop them if they were made in another."""
+        if not self.pending:
+            return
+        self.pending = False
+        if current_capture_id() == self._fork_capture:
+            torch.cuda.current_stream().wait_stream(self._stream)
+            self.joins += 1
+        else:
+            self.dropped += 1
+
+
+class DenseGemmPlan:
+    """What every site of one model shares: the kernel per site and row count, PDL, the
+    prefetch stream.
+
+    ``kernels[site][rows - 1]`` is the kernel of a call of ``rows`` rows.
+    ``wide_kernels[site][rows - WIDE_MIN_ROWS]`` is the kernel of a call of 9..32 rows
+    while ``wide_armed`` (only for the sites the wide table names; none by default).
+    ``pending`` is True between a prefetch fork and the join that follows it: the
+    next projection's dispatcher, or the target's at the end of its forward.
+    ``dropped`` counts the forks a join dropped because they were made in another
+    capture state (see the module docstring).
+    """
+
+    def __init__(
+        self,
+        kernels: Mapping[str, Tuple[str, ...]],
+        prefetch: bool,
+        enable_pdl: bool,
+        capability: Optional[Tuple[int, int]] = None,
+        wide: Optional[Mapping[str, Tuple[str, ...]]] = None,
+    ) -> None:
+        self.kernels = dict(kernels)
+        #: ``wide_dense_gemms``: the kernel of a site's 9..32-row calls (``wide[site][rows - 9]``);
+        #: a site it does not name keeps the built-in dispatch at those rows.
+        self.wide = dict(wide or {})
+        #: The 9..32-row table (``set_wide_kernels``) and whether the current forward arms it.
+        self.wide_kernels: Dict[str, Tuple[str, ...]] = {}
+        self.wide_armed = False
+        #: The fast path armed for the current decode forward above 32 rows (``batch_dense_gemms``'s
+        #: ``BatchDenseGemms``), whose ``projection`` every re-classed projection's
+        #: ``apply_linear`` calls; ``None`` otherwise.
+        self.batch = None
+        self.prefetch = prefetch
+        self.enable_pdl = enable_pdl
+        #: The compute capability of the device the plan serves (``install`` reads it once);
+        #: what an arch-specific producer policy keys on.
+        self.capability = None if capability is None else tuple(capability)
+        #: The model's TP size (``install`` sets it); the TP8 wide64 path keys on it.
+        self.tp_size: Optional[int] = None
+        #: Named forks by name (``add_fork``), each joined by its role's dispatcher.
+        self.named_forks: Dict[str, NamedFork] = {}
+        self.pending = False
+        self.dropped = 0
+        self._fork_capture: Optional[int] = None
+        self._stream: Optional[torch.cuda.Stream] = None
+        self._sink: Optional[torch.Tensor] = None
+        #: Whether the side stream was the capturing stream at the first fork made in a
+        #: capture (None before one). PyTorch hands out pooled streams round robin, and
+        #: the capture may take the same one: the fork and join are then in-order work on
+        #: one stream, the same result with the prefetch on the critical path.
+        self.side_stream_is_capture_stream: Optional[bool] = None
+
+    def kernel_for(self, role: str, rows: int) -> Optional[str]:
+        """The kernel of a ``rows``-row call at site ``role``, or None where the plan has none
+        (the built-in dispatch): ``kernels`` at 1..8 rows; at 9..32 rows the construction's
+        ``wide`` table (``wide_dense_gemms``) for the sites it names, else ``wide_kernels``
+        while ``wide_armed`` (``wide_projection_gathers``)."""
+        if 1 <= rows <= MAX_ROWS:
+            return self.kernels[role][rows - 1]
+        if not WIDE_MIN_ROWS <= rows <= WIDE_MAX_ROWS:
+            return None
+        wide = self.wide.get(role)
+        if wide is not None:
+            return wide[rows - WIDE_MIN_ROWS]
+        if self.wide_armed:
+            wide = self.wide_kernels.get(role)
+            return None if wide is None else wide[rows - WIDE_MIN_ROWS]
+        return None
+
+    def kernel(self, role: str, rows: int) -> Optional[str]:
+        """``kernel_for``: the kernel of a ``role`` call of ``rows`` rows, or ``None``."""
+        return self.kernel_for(role, rows)
+
+    def set_wide_kernels(self, kernels: Mapping[str, Tuple[str, ...]]) -> None:
+        """Give sites a kernel per row count 9..32 (``kernels[site][rows - WIDE_MIN_ROWS]``).
+
+        Raises:
+            ValueError: for an unknown site or a table that does not cover 9..32 rows.
+        """
+        rows = WIDE_MAX_ROWS - WIDE_MIN_ROWS + 1
+        for role, table in kernels.items():
+            if role not in SITES or len(table) != rows:
+                raise ValueError(
+                    f"[musespark_open] dense_gemms: a wide table names {rows} kernels per site of "
+                    f"{SITES}, got {role!r} with {len(table)}"
+                )
+            for kernel in table:
+                parse_kernel(kernel)
+        self.wide_kernels = {role: tuple(table) for role, table in kernels.items()}
+
+    def fork_prefetch(self, weight: torch.Tensor) -> None:
+        """Ask the L2 for ``weight`` on the side stream, after the current stream's work so far."""
+        capture = current_capture_id()
+        if self._stream is None:
+            if capture is not None:
+                # A stream and the sink cannot be made inside a capture; the
+                # engine's eager warm-up makes them before it captures.
+                return
+            self._stream = torch.cuda.Stream(device=weight.device)
+            self._sink = torch.zeros(1, dtype=torch.int32, device=weight.device)
+        current = torch.cuda.current_stream(weight.device)
+        if capture is not None and self.side_stream_is_capture_stream is None:
+            self.side_stream_is_capture_stream = self._stream.cuda_stream == current.cuda_stream
+            if self.side_stream_is_capture_stream:
+                logger.warning(
+                    "[musespark_open] dense_gemm_prefetch: the prefetch side stream is the capturing stream; its forks "
+                    "and joins are in-order work on that stream"
+                )
+            else:
+                logger.info(
+                    "[musespark_open] dense_gemm_prefetch: the prefetch side stream is not the capturing stream"
+                )
+        self._stream.wait_stream(current)
+        with torch.cuda.stream(self._stream):
+            l2_prefetch(weight, self._sink)
+        self._fork_capture = capture
+        self.pending = True
+
+    def join(self) -> None:
+        """Make the current stream wait for an outstanding prefetch fork made in the same
+        capture state; drop one made in another."""
+        if not self.pending:
+            return
+        self.pending = False
+        if current_capture_id() == self._fork_capture:
+            torch.cuda.current_stream().wait_stream(self._stream)
+        else:
+            self.dropped += 1
+
+    def add_fork(self, name: str, join_role: Optional[str]) -> NamedFork:
+        """Register a named fork joined by the ``join_role`` site's dispatchers (see ``NamedFork``).
+
+        Raises:
+            ValueError: if ``name`` is taken or ``join_role`` is not a site.
+        """
+        if name in self.named_forks:
+            raise ValueError(f"a fork named {name!r} is already registered")
+        fork = NamedFork(name, join_role)
+        self.named_forks[name] = fork
+        return fork
+
+    def join_role(self, role: str) -> None:
+        """Join every named fork whose consumer is the ``role`` site; the others stay outstanding."""
+        for fork in self.named_forks.values():
+            if fork.join_role == role:
+                fork.join()
+
+    def join_all(self) -> None:
+        """Join the prefetch fork and every named fork (a target's end of forward)."""
+        self.join()
+        for fork in self.named_forks.values():
+            fork.join()
+
+
+@dataclass
+class _Site:
+    plan: DenseGemmPlan
+    role: str
+    layer_idx: int
+    #: ``(K, N)`` of the weight the site's GEMM is handed.
+    shape: Tuple[int, int]
+    #: The weight to prefetch after this site's GEMM (``dense_gemm_prefetch``), read at call time.
+    next_weight: Optional[Callable[[], torch.Tensor]]
+    #: Row counts whose call forks no prefetch: there the next GEMM streams its weight
+    #: another way (``boundary_early_release``: launched early by its predecessor, it loads the weight
+    #: before its own dependency wait), or the fork's join would gate the next GEMM
+    #: (``direct_publish``: o_proj publishes into the hop, which then ends before the pool weight's
+    #: prefetch does).
+    skip_prefetch_rows: FrozenSet[int] = frozenset()
+
+
+#: Opt-in: ``MUSESPARK_OPEN_DROP_WEIGHT_PREFETCH`` names the consumer sites
+#: (``qkv``, ``o_proj``, ``pool``; ``all``) whose ``dense_gemm_prefetch`` fork is not made. The fork's join
+#: makes the prefetch kernel a predecessor of the consumer GEMM, and that kernel never triggers early, so
+#: the GEMM launches only once every prefetch CTA has exited; at 9..32 rows the prefetch of the next QKV
+#: weight (after the unpooler) and of the o_proj weight (after QKV) ends right before the GEMM starts (nsys,
+#: TEP4 bs2-3 and TEP8 bs4), so the GEMM's early launch by its predecessor (the boundary's ``entry``
+#: trigger, the combine's after-wait trigger) buys nothing. Dropped only where the consumer's kernel at
+#: the call's row count is flashinfer's split-K, which loads its weight before its own wait, and with
+#: programmatic dependent launch on -- elsewhere the prefetch is the only early stream of that weight.
+#: The prefetch reads an immutable weight and writes nothing anyone reads: same bits either way.
+DROP_WEIGHT_PREFETCH_ENV = "MUSESPARK_OPEN_DROP_WEIGHT_PREFETCH"
+#: The site whose weight a site's fork prefetches (the dispatcher's ``next_of``; unpool -> the next layer's QKV).
+PREFETCH_CONSUMER = {"qkv": "o_proj", "o_proj": "pool", "unpool": "qkv"}
+
+
+def dropped_prefetch_consumers() -> FrozenSet[str]:
+    """The consumer sites ``MUSESPARK_OPEN_DROP_WEIGHT_PREFETCH`` names (empty when unset).
+
+    Raises:
+        ValueError: for a name that is not ``qkv``, ``o_proj``, ``pool`` or ``all``.
+    """
+    raw = _sm107_env(DROP_WEIGHT_PREFETCH_ENV, "").strip()
+    if not raw:
+        return frozenset()
+    names = {name.strip() for name in raw.split(",") if name.strip()}
+    if "all" in names:
+        return frozenset(PREFETCH_CONSUMER.values())
+    unknown = names - set(PREFETCH_CONSUMER.values())
+    if unknown:
+        raise ValueError(
+            f"[musespark_open] {DROP_WEIGHT_PREFETCH_ENV}: unknown sites {sorted(unknown)}; "
+            f"expected a comma list of {sorted(set(PREFETCH_CONSUMER.values()))} or 'all'"
+        )
+    return frozenset(names)
+
+
+#: Read once at import, as the engine's other switches are.
+DROPPED_PREFETCH_CONSUMERS = dropped_prefetch_consumers()
+
+#: Opt-in: ``MUSESPARK_OPEN_PREFETCH_JOIN=after`` keeps every ``dense_gemm_prefetch`` fork but joins
+#: it right after the consumer GEMM's launch instead of before it, wherever this dispatcher itself launches the
+#: kernel (its own fast path, or the direct publish into a transport slot): the GEMM no longer waits for the
+#: prefetch kernel's exit (it launches at its predecessor's trigger and stages its weight before its wait) and
+#: the prefetch still warms the L2 for its post-wait k-tiles; the kernel after the GEMM waits for the prefetch
+#: instead. Calls that take any other path join before, as the module does. ``before`` (unset) is the module.
+PREFETCH_JOIN_ENV = "MUSESPARK_OPEN_PREFETCH_JOIN"
+_join = _sm107_env(PREFETCH_JOIN_ENV, "before").strip() or "before"
+if _join not in ("before", "after"):
+    raise ValueError(f"[musespark_open] {PREFETCH_JOIN_ENV} must be 'before' or 'after', got {_join!r}")
+PREFETCH_JOIN_AFTER = _join == "after"
+
+
+def _keeps_prefetch(site: "_Site", rows: int) -> bool:
+    """Whether ``site``'s call of ``rows`` rows forks its prefetch (the module's rule plus the drop list)."""
+    plan = site.plan
+    if not (plan.prefetch and site.next_weight is not None and rows not in site.skip_prefetch_rows):
+        return False
+    consumer = PREFETCH_CONSUMER.get(site.role)
+    if consumer is None or consumer not in DROPPED_PREFETCH_CONSUMERS or not plan.enable_pdl:
+        return True
+    kernel = plan.kernel_for(consumer, rows)
+    return kernel is None or parse_kernel(kernel)[0] != SPLITK
+
+
+#: Opt-in (TP8 wide64): ``MUSESPARK_OPEN_TEP8_WIDE64_SPLITK=1`` runs the 33..64-row TP8 decode calls of the
+#: QKV and attention output projections (5..8 requests at K = 7), which the built-in ``Linear`` sends to cuBLAS
+#: (``nvjet`` plus a ``splitKreduce`` launch for QKV), on flashinfer's split-K with the ``split_k`` of each site's
+#: 8-row cell in ``SM107_KERNELS`` (QKV 4, o_proj 1): every row gets the bits it gets in a one-request step, and the
+#: kernel stages its weight before its dependency wait. Needs the split-K kernel with the same env (64-wide
+#: tiles, up to 64 rows, conflict-free mailbox). ``MUSESPARK_OPEN_TEP8_WIDE64_SITES`` (default ``qkv,o_proj``) names
+#: the sites; the pool and unpool slices at these rows stay with ``projection_publish``, whose census certified
+#: cuBLAS (``torch.mm`` into the transport slot) as their producer. ``MUSESPARK_OPEN_TEP8_WIDE64_KERNELS`` (JSON,
+#: site -> kernel) replaces a site's tactic; it must keep that site's ``split_k``.
+TEP8_WIDE64_ENV = "MUSESPARK_OPEN_TEP8_WIDE64_SPLITK"
+TEP8_WIDE64_MIN_ROWS, TEP8_WIDE64_MAX_ROWS = WIDE_MAX_ROWS + 1, 64
+#: Tactic per site for 33..64 rows (split_k of the 8-row cells); stages are what shared memory holds at 64-wide tiles.
+#: The fastest measured at 40 and 64 rows behind a predecessor that releases early (64-row tiles keep 144 CTAs and
+#: stream each weight slab once).
+SM107_TP8_WIDE64_KERNELS: Mapping[str, str] = {"qkv": "splitk:64,64,4,5", "o_proj": "splitk:64,64,1,7"}
+#: The (site, capability) whose 8-row cell is cuBLAS and whose wide64 split-K tactic with ``split_k`` 1 was measured
+#: bitwise equal to it row by row: sm103 TP8 o_proj ``[8192, 1024]`` (cuBLAS ``nvjet`` 64x8 at 8 rows) vs
+#: ``splitk:64,64,1,7`` at 33..64 rows, 48/48 random cases equal to each 8-row block and to the whole-call cuBLAS
+#: (GB300). One K pass per tile, FP32 accumulation in K order, one
+#: BF16 rounding on both sides.
+TEP8_WIDE64_CUBLAS_CELLS: FrozenSet[Tuple[str, Tuple[int, int]]] = frozenset({("o_proj", (10, 3))})
+
+
+def _tep8_wide64_sites() -> FrozenSet[str]:
+    if _sm107_env(TEP8_WIDE64_ENV, "0") != "1":
+        return frozenset()
+    names = {n.strip() for n in _sm107_env("MUSESPARK_OPEN_TEP8_WIDE64_SITES", "qkv,o_proj").split(",") if n.strip()}
+    unknown = names - {"qkv", "o_proj"}
+    if unknown:
+        raise ValueError(f"[musespark_open] MUSESPARK_OPEN_TEP8_WIDE64_SITES: unknown sites {sorted(unknown)} "
+                         "(qkv, o_proj; the pool and unpool slices stay with projection_publish)")
+    return frozenset(names)
+
+
+def _tep8_wide64_kernels() -> Dict[str, str]:
+    kernels = dict(SM107_TP8_WIDE64_KERNELS)
+    override = _sm107_env("MUSESPARK_OPEN_TEP8_WIDE64_KERNELS", "").strip()
+    if override:
+        for site, kernel in json.loads(override).items():
+            if site not in kernels:
+                raise ValueError(f"[musespark_open] MUSESPARK_OPEN_TEP8_WIDE64_KERNELS: unknown site {site!r}")
+            kernels[site] = str(kernel)
+    return kernels
+
+
+#: Read once at import, as the engine's other switches are.
+TEP8_WIDE64_SITES = _tep8_wide64_sites()
+TEP8_WIDE64_KERNELS = _tep8_wide64_kernels() if TEP8_WIDE64_SITES else {}
+
+#: The kernel families of ``ops/gemm/dense_gemm``.
+KERNEL_FAMILIES = frozenset({CUBLAS, SPLITK, DIRECT})
+#: flashinfer's families: split-K (the owner CTA of each cluster reduces the K slices
+#: through DSMEM and stores the rounded tile once) and the direct SIMT kernel (thread 0
+#: of each CTA stores each of its outputs once), both from the epilogue, after the
+#: kernel's dependency wait.
+FLASHINFER_FAMILIES = frozenset({SPLITK, DIRECT})
+
+
+@dataclass(frozen=True)
+class PublishPolicy:
+    """How a site's GEMM fills a direct-transport slot: one policy per site, claimed at install.
+
+    A fast path that has a projection publish into a collective's transport claims that
+    site's dispatcher with its policy (``claim_publish``) when it installs, and arms the
+    dispatcher per forward by setting ``DenseGemmDispatcher.publish`` to the rank's slot.
+    ``unpool_direct`` claims the unpool sites (flashinfer's kernels store into the slot, cuBLAS is
+    copied); ``direct_publish`` claims the attention output sites with the device's producer
+    families storing into the slot (cuBLAS on sm103, flashinfer's split-K and direct kernels on
+    sm107) and everything else copied.
+
+    Attributes:
+        owner: the claiming policy's name (messages, and the one-owner-per-site check).
+        direct: kernel families whose call stores straight into the slot: each must store
+            every element exactly once, after its dependency wait, as the owner certified.
+        copy: ``copy(slot, product)`` stores a product computed elsewhere into the slot
+            from an SM kernel, one store per element (never the copy engine).
+    """
+
+    owner: str
+    direct: FrozenSet[str]
+    copy: Callable[[torch.Tensor, torch.Tensor], None]
+
+
+def claim_publish(dispatcher, policy: PublishPolicy) -> None:
+    """Give ``dispatcher``'s site the producer ``policy``; at install, before any arming.
+
+    Raises:
+        ValueError: if another feature already claimed the site (one producer contract
+            per slot writer), or the policy names an unknown kernel family.
+    """
+    unknown = sorted(policy.direct - KERNEL_FAMILIES)
+    if unknown:
+        raise ValueError(f"[musespark_open] {policy.owner}: unknown kernel families {unknown}")
+    held = getattr(dispatcher, "publish_policy", None)
+    if held is not None and held.owner != policy.owner:
+        site = getattr(dispatcher, "site", None)
+        where = f"layer {site.layer_idx} {site.role}" if site is not None else repr(dispatcher)
+        raise ValueError(
+            f"[musespark_open] {policy.owner}: the {where} GEMM already publishes for {held.owner}; "
+            "a site has one producer policy, so the two features cannot share it"
+        )
+    dispatcher.publish_policy = policy
+
+
+class DenseGemmDispatcher:
+    """Sits in a projection's ``_low_m_gemm_dispatcher`` slot; same ``apply`` signature.
+
+    ``builtin`` is the engine's per-model ``LowMGemmDispatcher`` (or ``None`` until
+    the engine assigns it, when the module-level fallback dispatcher serves, as
+    ``apply_low_m_gemm`` would).
+    """
+
+    def __init__(self, site: _Site) -> None:
+        self.site = site
+        self.builtin = None
+        #: While set (by an armed transport, for one decode forward), a call writes the
+        #: product into this tensor -- the rank's slot of a multicast transport -- and
+        #: returns it, instead of a fresh output, following ``publish_policy``. ``None``
+        #: otherwise.
+        self.publish: Optional[torch.Tensor] = None
+        #: The producer policy the feature that owns this site's slot claimed at install
+        #: (``claim_publish``); ``None`` while no feature publishes from this site.
+        self.publish_policy: Optional[PublishPolicy] = None
+
+    @staticmethod
+    def is_decode_call(input_tensor: torch.Tensor) -> bool:
+        """A BF16 inference call of 1-8 rows on the GPU: a call this feature exists to serve."""
+        rows = input_tensor.numel() // max(int(input_tensor.shape[-1]), 1)
+        return (
+            input_tensor.is_cuda
+            and input_tensor.dtype == torch.bfloat16
+            and 1 <= rows <= MAX_ROWS
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        )
+
+    def fits(self, input_tensor: torch.Tensor, weight: torch.Tensor, bias) -> bool:
+        """Whether ``dense_gemm`` serves this call: BF16, no bias, the site's shape, a row count
+        the plan has a kernel for (``DenseGemmPlan.kernel_for``)."""
+        if bias is not None or torch.is_grad_enabled() or torch.compiler.is_compiling():
+            return False
+        if not (
+            input_tensor.is_cuda
+            and input_tensor.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and weight.dim() == 2
+            and input_tensor.dim() >= 1
+            and (int(weight.shape[1]), int(weight.shape[0])) == self.site.shape
+            and int(input_tensor.shape[-1]) == int(weight.shape[1])
+            and input_tensor.is_contiguous()
+            and weight.is_contiguous()
+        ):
+            return False
+        rows = input_tensor.numel() // int(weight.shape[1])
+        # The split-K kernel's TMA needs 32-byte aligned operands.
+        return (
+            self.site.plan.kernel_for(self.site.role, rows) is not None
+            and input_tensor.data_ptr() % 32 == 0
+            and weight.data_ptr() % 32 == 0
+        )
+
+    def apply(
+        self,
+        module: torch.nn.Module,
+        input_tensor: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        force_active: bool = False,
+    ) -> Optional[torch.Tensor]:
+        plan = self.site.plan
+        deferred = PREFETCH_JOIN_AFTER and self._launches_itself(input_tensor, weight, bias)
+        if not deferred:
+            plan.join()
+        if plan.named_forks:
+            plan.join_role(self.site.role)
+        if self.publish is not None:
+            return self._apply_publish(module, input_tensor, weight, bias, force_active, deferred)
+        if not self.fits(input_tensor, weight, bias):
+            if input_tensor.dim() >= 1 and self.is_decode_call(input_tensor):
+                # The built-in dispatch picks its kernel per rank: say so once.
+                logger.warning_once(
+                    f"[musespark_open] dense_gemms: a {self.site.role} call of layer {self.site.layer_idx} did not "
+                    f"fit dense_gemm (input {tuple(input_tensor.shape)} "
+                    f"contiguous={input_tensor.is_contiguous()}, weight {tuple(weight.shape)} "
+                    f"{weight.dtype}, bias={bias is not None}); it runs the built-in low-M "
+                    "dispatch, whose kernel is chosen per rank",
+                    key=f"musespark_open.dense_gemms.decline_{self.site.role}",
+                )
+            builtin = self.builtin if self.builtin is not None else _low_m_gemm._DISPATCHER
+            return builtin.apply(module, input_tensor, weight, bias, force_active=force_active)
+        k = int(weight.shape[1])
+        x = input_tensor.view(-1, k)
+        rows = int(x.shape[0])
+        kernel = plan.kernel_for(self.site.role, rows)
+        out = dense_gemm(x, weight, kernel, plan.enable_pdl)
+        _pool_splitk8_shadow(self.site, x, weight, out, kernel, plan.enable_pdl)
+        if deferred:
+            plan.join()
+        if _keeps_prefetch(self.site, rows):
+            plan.fork_prefetch(self.site.next_weight())
+        return out.view(*input_tensor.shape[:-1], int(weight.shape[0]))
+
+    def wide64(self, input_tensor: torch.Tensor, weight: torch.Tensor, bias) -> Optional[torch.Tensor]:
+        """A 33..64-row TP8 decode call of a ``TEP8_WIDE64_SITES`` site on flashinfer's split-K, or ``None``
+        (the caller then runs the built-in ``Linear.apply_linear``, i.e. cuBLAS)."""
+        site = self.site
+        plan = site.plan
+        if site.role not in TEP8_WIDE64_SITES or plan.tp_size != 8 or bias is not None:
+            return None
+        if torch.is_grad_enabled() or torch.compiler.is_compiling():
+            return None
+        if not (
+            input_tensor.is_cuda
+            and input_tensor.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and weight.dim() == 2
+            and input_tensor.dim() >= 1
+            and (int(weight.shape[1]), int(weight.shape[0])) == site.shape
+            and int(input_tensor.shape[-1]) == int(weight.shape[1])
+            and input_tensor.is_contiguous()
+            and weight.is_contiguous()
+            and input_tensor.data_ptr() % 32 == 0
+            and weight.data_ptr() % 32 == 0
+        ):
+            return None
+        k = int(weight.shape[1])
+        rows = input_tensor.numel() // k
+        if not TEP8_WIDE64_MIN_ROWS <= rows <= TEP8_WIDE64_MAX_ROWS:
+            return None
+        plan.join()
+        if plan.named_forks:
+            plan.join_role(site.role)
+        if site.role == "o_proj":
+            # Direct hop: on a decode step whose wide post-attention hop runs the direct transport,
+            # this layer's o_proj stores its partial straight into the owners' scatter slots
+            # (post_attn_hop_wide.DirectPublication): the scatter epilogue of the same split-K kernel, same bits.
+            from ...ops.allreduce import post_attn_hop_wide as _wide
+
+            publication = getattr(_wide, "_DIRECT_PUBLICATION", None)
+            target = publication.target(self, rows) if publication is not None else None
+            if target is not None:
+                view, peer_stride, fb_layout = target
+                family, fields = parse_kernel(TEP8_WIDE64_KERNELS[site.role])
+                if family != "splitk" or fields[2] != 1:
+                    raise RuntimeError(
+                        f"[musespark_open] direct hop: o_proj runs {TEP8_WIDE64_KERNELS[site.role]}, "
+                        "not a split_k 1 split-K kernel"
+                    )
+                _wide.run_splitk_scatter(
+                    input_tensor.view(-1, k), weight.t(), view, plan.enable_pdl, _wide.SplitKTactic(*fields),
+                    peer_stride, fb_layout,
+                )
+                return view.view(*input_tensor.shape[:-1], int(weight.shape[0]))
+        out = dense_gemm(input_tensor.view(-1, k), weight, TEP8_WIDE64_KERNELS[site.role], plan.enable_pdl)
+        return out.view(*input_tensor.shape[:-1], int(weight.shape[0]))
+
+    def _launches_itself(self, input_tensor, weight, bias) -> bool:
+        """Whether this call launches the plan's kernel itself: it fits, and when a transport slot is armed
+        the kernel's family stores into it (``_apply_publish``'s direct branch)."""
+        if not self.fits(input_tensor, weight, bias):
+            return False
+        if self.publish is None:
+            return True
+        policy = self.publish_policy
+        k = int(weight.shape[1])
+        rows = input_tensor.numel() // max(k, 1)
+        kernel = self.site.plan.kernel_for(self.site.role, rows)
+        return (
+            policy is not None
+            and kernel is not None
+            and rows == int(self.publish.shape[0])
+            and parse_kernel(kernel)[0] in policy.direct
+        )
+
+    def _apply_publish(
+        self,
+        module: torch.nn.Module,
+        input_tensor: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        force_active: bool,
+        deferred: bool = False,
+    ) -> torch.Tensor:
+        """``apply`` with the product written into ``self.publish``, by the site's policy.
+
+        Every rank's consumer polls the slot, so this call must fill it whatever
+        this rank's layout: a call that fits runs the plan's kernel for its rows
+        with the slot as its output when ``publish_policy.direct`` names that
+        kernel's family (its epilogue stores are the publication, one store per
+        element); any other call -- a family the policy does not let store into
+        the slot, or a rank-local layout ``fits`` declines -- runs ``apply``
+        disarmed and the policy's ``copy`` stores the product into the slot. Same
+        bits either way. The prefetch fork follows ``apply``'s rule,
+        ``skip_prefetch_rows`` included.
+
+        Raises:
+            RuntimeError: if no fast path claimed the site (``claim_publish``), or the
+                call's shape is not the slot's (a transport is armed for the step's
+                row count only).
+        """
+        publish = self.publish
+        policy = self.publish_policy
+        if policy is None:
+            raise RuntimeError(
+                f"[musespark_open] layer {self.site.layer_idx} {self.site.role} was armed to publish, but "
+                "no fast path claimed the site's producer policy (claim_publish at install)"
+            )
+        k = int(weight.shape[1])
+        rows = input_tensor.numel() // max(k, 1)
+        if rows != int(publish.shape[0]) or int(weight.shape[0]) != int(publish.shape[1]):
+            raise RuntimeError(
+                f"[musespark_open] {policy.owner}: layer {self.site.layer_idx} {self.site.role} was armed "
+                f"to publish {tuple(publish.shape)} but got {rows} rows x {int(weight.shape[0])}"
+            )
+        plan = self.site.plan
+        kernel = plan.kernel_for(self.site.role, rows)
+        if self.fits(input_tensor, weight, bias) and parse_kernel(kernel)[0] in policy.direct:
+            dense_gemm(input_tensor.view(-1, k), weight, kernel, plan.enable_pdl, out=publish)
+            _pool_splitk8_shadow(self.site, input_tensor.view(-1, k), weight, publish, kernel, plan.enable_pdl)
+            if deferred:
+                plan.join()
+            if _keeps_prefetch(self.site, rows):
+                plan.fork_prefetch(self.site.next_weight())
+        else:
+            logger.warning_once(
+                f"[musespark_open] {policy.owner}: a {self.site.role} call (layer {self.site.layer_idx}, "
+                f"kernel {kernel}, input {tuple(input_tensor.shape)} "
+                f"contiguous={input_tensor.is_contiguous()}) does not store into the transport "
+                f"slot itself (stores: {sorted(policy.direct)}); its product is copied there",
+                key=f"musespark_open.{policy.owner}_copy_{self.site.role}",
+            )
+            self.publish = None
+            try:
+                out = self.apply(module, input_tensor, weight, bias, force_active=force_active)
+            finally:
+                self.publish = publish
+            if out is None:
+                out = torch.nn.functional.linear(input_tensor, weight)
+            policy.copy(publish, out)
+        return publish.view(*input_tensor.shape[:-1], int(weight.shape[0]))
+
+
+class MuseSparkOpenTepDenseLinear(Linear):
+    """A built-in ``Linear`` whose low-M dispatcher slot always yields this feature's dispatcher.
+
+    Never constructed directly: ``adopt`` re-classes a built-in ``Linear`` in
+    place and adds one plain attribute. What the engine assigns to the slot
+    becomes the dispatcher's fallback for the calls it does not serve.
+    """
+
+    @property
+    def _low_m_gemm_dispatcher(self) -> DenseGemmDispatcher:
+        return self.__dict__["_low_m_dispatcher"]
+
+    @_low_m_gemm_dispatcher.setter
+    def _low_m_gemm_dispatcher(self, builtin) -> None:
+        self.__dict__["_low_m_dispatcher"].builtin = builtin
+
+    def apply_linear(self, input, bias, lora_params=None, layer_idx=None):
+        """The built-in ``apply_linear``; while a fast path arms the plan (``DenseGemmPlan.batch``)
+        the call goes through that path's ``projection`` with the built-in call as a callable
+        and this module (when the call carries no bias)."""
+        dispatcher = self.__dict__["_low_m_dispatcher"]
+        batch = dispatcher.site.plan.batch
+        lora = getattr(self, "lora", None) is not None and bool(lora_params)
+        if batch is None or lora:
+            if TEP8_WIDE64_SITES and not lora:
+                out = dispatcher.wide64(input, self.weight, bias)
+                if out is not None:
+                    return out
+            return Linear.apply_linear(self, input, bias, lora_params, layer_idx)
+        return batch.projection(
+            dispatcher.site,
+            input,
+            lambda: Linear.apply_linear(self, input, bias, lora_params, layer_idx),
+            self if bias is None else None,
+        )
+
+    @classmethod
+    def check(cls, linear: torch.nn.Module, site: str) -> None:
+        """Whether ``adopt`` may re-class this module; changes nothing.
+
+        Raises:
+            TypeError: if ``linear`` is not exactly the built-in ``Linear``.
+            ValueError: if its calls cannot reach the low-M dispatch (a custom
+                cuBLAS GEMM) or carry a bias (``dense_gemm`` has none).
+        """
+        if type(linear) is not Linear:
+            raise TypeError(
+                f"dense_gemms re-classes the built-in Linear of {site}, got {type(linear).__name__}"
+            )
+        if getattr(linear, "use_custom_cublas_mm", False):
+            raise ValueError(f"{site} runs a custom cuBLAS GEMM, which skips the low-M dispatch")
+        if getattr(linear, "bias", None) is not None:
+            raise ValueError(f"{site} carries a bias")
+
+    @classmethod
+    def adopt(
+        cls, linear: Linear, dispatcher: DenseGemmDispatcher
+    ) -> "MuseSparkOpenTepDenseLinear":
+        builtin = linear.__dict__.pop("_low_m_gemm_dispatcher", None)
+        linear.__class__ = cls
+        linear.__dict__["_low_m_dispatcher"] = dispatcher
+        dispatcher.builtin = builtin
+        return linear
+
+
+def _projection_weight(moe, linear: Linear, sharded: bool) -> Callable[[], torch.Tensor]:
+    """The weight a pooler / unpooler GEMM is handed: the rank's row slice when sharded."""
+    if not sharded:
+        return lambda: linear.weight
+
+    def rank_slice() -> torch.Tensor:
+        columns = linear.weight.shape[0] // moe.mapping.tp_size
+        begin = moe.mapping.tp_rank * columns
+        return linear.weight[begin : begin + columns]
+
+    return rank_slice
+
+
+def install(
+    model: torch.nn.Module,
+    prefetch: bool,
+    kernels: Optional[Mapping[str, Tuple[str, ...]]] = None,
+    wide: bool = False,
+) -> DenseGemmPlan:
+    """Route every layer's four projections through ``dense_gemm``; return the shared plan.
+
+    ``kernels`` is the kernel of each site per row count; when None, the table of the
+    device's compute capability (``device_capability``, read once here), the model's TP
+    size and its projection layout (``default_kernels``). ``wide`` (``wide_dense_gemms``,
+    sm107 tep4 with the sharded projections) adds ``wide_kernels`` for the 9..32-row calls. Every module is checked
+    before any is re-classed, so a refusal
+    leaves the model as it was. Only the weights' shapes are read, so this runs
+    on a model whose weights are still on the meta device.
+
+    Raises:
+        ValueError: if the low-M dispatch is off (``TRTLLM_LOW_M_GEMM_BACKEND``), so
+            the built-in ``Linear`` never asks a dispatcher; if no ``kernels`` are given
+            and the device and TP size have no table (``kernel_steps``); if ``prefetch`` is asked
+            without the sharded projections (``sharded_projections``), whose
+            pooler GEMM would read the whole replicated weight; if a
+            projection cannot be re-classed (see
+            ``MuseSparkOpenTepDenseLinear.check``); or if a named kernel cannot
+            serve its site's shape.
+        TypeError: if a projection is not the built-in ``Linear``.
+    """
+    if not _low_m_gemm.LOW_M_GEMM_ACTIVE:
+        raise ValueError(
+            "dense_gemms serves the low-M GEMM dispatch, which TRTLLM_LOW_M_GEMM_BACKEND leaves off"
+        )
+    capability = device_capability()
+    sharded = sharded_projections(model)
+    tp_size = int(model.layers[0].feed_forward.mapping.tp_size)
+    kernels = default_kernels(tp_size, sharded, capability) if kernels is None else dict(kernels)
+    if prefetch and not sharded:
+        raise ValueError(
+            "dense_gemm_prefetch prefetches the rank's pooler slice and needs the sharded projections "
+            "(MUSESPARK_OPEN_SHARDED_PROJECTIONS=1); without them the pooler GEMM reads the "
+            "whole replicated weight"
+        )
+    wide_table = {}
+    if wide:
+        if tuple(capability) != (10, 7) or tp_size not in (4, 8) or not sharded:
+            raise ValueError(
+                "[musespark_open] wide_dense_gemms is measured for sm107 at TP4 and TP8 with the sharded "
+                f"pooler and unpooler; got SM {tuple(capability)} at TP{tp_size}, "
+                f"{'sharded' if sharded else 'replicated'} projections"
+            )
+        wide_table = wide_kernels(tp_size)
+        pool8 = _sm107_env(POOL_SPLITK8_ENV, "0") == "1"
+        if pool8:
+            logger.info(
+                f"[musespark_open] dense_gemms: {POOL_SPLITK8_ENV}=1: pool wide kernels "
+                f"{sorted(set(wide_table.get('pool', ())))} may sum K in 8 slices (not the 8-row cell's bits)"
+            )
+        for role, wide_cells in wide_table.items():
+            family, fields = parse_kernel(kernels[role][MAX_ROWS - 1])
+            for kernel in wide_cells:
+                wide_family, wide_fields = parse_kernel(kernel)
+                if pool8 and role == "pool" and wide_family == SPLITK and wide_fields[2] == 8:
+                    continue
+                if family != SPLITK or wide_family != SPLITK or wide_fields[2] != fields[2]:
+                    raise ValueError(
+                        f"[musespark_open] wide_dense_gemms: {role} kernel {kernel} does not sum "
+                        f"the K slices of the {MAX_ROWS}-row kernel {kernels[role][MAX_ROWS - 1]}"
+                    )
+    plan = DenseGemmPlan(
+        kernels, prefetch=prefetch, enable_pdl=LAUNCH_PDL, capability=capability, wide=wide_table
+    )
+    plan.tp_size = tp_size
+    if TEP8_WIDE64_SITES and tp_size == 8:
+        cells = default_kernels(8, sharded, capability)
+        for role in sorted(TEP8_WIDE64_SITES):
+            kernel = TEP8_WIDE64_KERNELS[role]
+            family, fields = parse_kernel(kernel)
+            cell_family, cell_fields = parse_kernel(cells[role][MAX_ROWS - 1])
+            same_bits = family == SPLITK and (
+                (cell_family == SPLITK and fields[2] == cell_fields[2])
+                or (cell_family == CUBLAS and fields[2] == 1 and (role, tuple(capability)) in TEP8_WIDE64_CUBLAS_CELLS)
+            )
+            if not same_bits:
+                raise ValueError(
+                    f"[musespark_open] {TEP8_WIDE64_ENV}: {role} kernel {kernel} does not sum the K slices of "
+                    f"the 8-row kernel {cells[role][MAX_ROWS - 1]}"
+                )
+            shape = {"qkv": QKV_SHAPE, "o_proj": O_PROJ_SHAPE}[role]
+            for rows in (TEP8_WIDE64_MIN_ROWS, TEP8_WIDE64_MAX_ROWS):
+                error = kernel_error(kernel, rows, *shape)
+                if error is not None:
+                    raise ValueError(
+                        f"[musespark_open] {TEP8_WIDE64_ENV}: {role} kernel {kernel} cannot serve {rows} rows: "
+                        f"{error} (ops/gemm/splitk_gemm.py validates it under the same env)"
+                    )
+        logger.info(
+            f"[musespark_open] {TEP8_WIDE64_ENV}: TP8 calls of {TEP8_WIDE64_MIN_ROWS}..{TEP8_WIDE64_MAX_ROWS} rows of "
+            + ", ".join(f"{r}={TEP8_WIDE64_KERNELS[r]}" for r in sorted(TEP8_WIDE64_SITES))
+            + " (flashinfer split-K, the 8-row cells' split_k); pool/unpool stay with projection_publish"
+        )
+
+    layers = list(model.layers)
+    planned = []
+    for index, layer in enumerate(layers):
+        attention, moe = layer.self_attn, layer.feed_forward
+        weights = {
+            "qkv": lambda a=attention: a.qkv_proj.weight,
+            "o_proj": lambda a=attention: a.o_proj.weight,
+            "pool": _projection_weight(moe, moe.pooler, sharded),
+            "unpool": _projection_weight(moe, moe.unpooler, sharded),
+        }
+        modules = {
+            "qkv": attention.qkv_proj,
+            "o_proj": attention.o_proj,
+            "pool": moe.pooler,
+            "unpool": moe.unpooler,
+        }
+        for role in SITES:
+            where = f"layer {index} {role}"
+            MuseSparkOpenTepDenseLinear.check(modules[role], where)
+            # Shapes only: the loader builds the model under MetaInitMode, whose meta
+            # weights refuse any other operation (a slice among them).
+            n, k = (int(d) for d in modules[role].weight.shape)
+            if sharded and role in ("pool", "unpool"):
+                n //= moe.mapping.tp_size
+            shape = (k, n)
+            for rows, kernel in enumerate(kernels[role], start=1):
+                error = kernel_error(kernel, rows, *shape)
+                if error is not None:
+                    raise ValueError(
+                        f"{where}: kernel {kernel} cannot serve {rows} x {shape}: {error}"
+                    )
+            for rows, kernel in enumerate(wide_table.get(role, ()), start=MAX_ROWS + 1):
+                error = kernel_error(kernel, rows, *shape)
+                if error is not None:
+                    raise ValueError(
+                        f"{where}: kernel {kernel} cannot serve {rows} x {shape}: {error}"
+                    )
+            planned.append((index, role, modules[role], shape, weights))
+
+    next_of = {"qkv": "o_proj", "o_proj": "pool"}
+    for index, role, linear, shape, weights in planned:
+        if role in next_of:
+            next_weight = weights[next_of[role]]
+        elif role == "unpool" and index + 1 < len(layers):
+            following = layers[index + 1].self_attn
+            next_weight = lambda a=following: a.qkv_proj.weight  # noqa: E731
+        else:
+            next_weight = None
+        site = _Site(plan, role, index, shape, next_weight)
+        MuseSparkOpenTepDenseLinear.adopt(linear, DenseGemmDispatcher(site))
+
+    # The calls no table here takes -- the LM head's, and any declined call above -- run the built-in low-M
+    # dispatcher, whose race imports flashinfer's split-K module by path; a mounted split-K file used to
+    # replace it. With a split-K gate set, that path now resolves to ops/gemm/splitk_gemm.py (no flashinfer patch).
+    from ...ops.gemm import splitk_gemm as _splitk_gemm
+
+    _splitk_gemm.serve_flashinfer_path()
+
+    if prefetch and DROPPED_PREFETCH_CONSUMERS:
+        logger.info(
+            f"[musespark_open] dense_gemm_prefetch: {DROP_WEIGHT_PREFETCH_ENV} drops the weight prefetch of "
+            f"{sorted(DROPPED_PREFETCH_CONSUMERS)} wherever that GEMM runs split-K (weight loads before its wait)"
+        )
+    logger.info(
+        f"[musespark_open] dense_gemms: dense projections of all {len(layers)} layers (SM {capability}, "
+        f"TP{tp_size}, "
+        f"{'sharded' if sharded else 'replicated'} pooler/unpooler) on calls of at most "
+        f"{MAX_ROWS} rows by {describe(kernels)}; "
+        f"L2 prefetch of the next weight {'on' if prefetch else 'off'}"
+    )
+    if wide_table:
+        steps = "; ".join(
+            f"{site}=" + ", ".join(f"{k}@..{last}" for last, k in cells)
+            for site, cells in wide_steps(tp_size).items()
+        )
+        logger.info(
+            f"[musespark_open] wide_dense_gemms: calls of {MAX_ROWS + 1}..{WIDE_MAX_ROWS} rows by "
+            f"{steps}; each row gets the bits of its {MAX_ROWS}-row kernel"
+        )
+    return plan
