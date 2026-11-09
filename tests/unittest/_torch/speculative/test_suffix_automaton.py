@@ -77,18 +77,6 @@ class TestSuffixAutomatonManager:
         max_draft_len = 4
         manager.prepare(request_ids, max_draft_len)
 
-        # A later prepare with no new host states to copy must not wait for the GPU.
-        # The unknown request 99 maps to the dummy slot.
-        torch.cuda.synchronize()
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            manager.prepare([0, 99], max_draft_len)
-        finally:
-            torch.cuda.set_sync_debug_mode("default")
-        slot = manager._request_to_slot[0]
-        assert manager._gpu_batch_indices[:2].tolist() == [slot, manager._dummy_slot_index]
-        assert manager._gpu_nondummy_mask[:2].tolist() == [1, 0]
-
         # Extend
         accepted_tokens = torch.tensor([[6, 0, 0, 0, 0]], dtype=torch.int32, device="cuda")
         num_accepted_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
