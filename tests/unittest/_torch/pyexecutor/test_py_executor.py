@@ -4601,6 +4601,7 @@ class TestPendingTransferResponseFlush:
         executor._mm_encoder_item_scheduling_enabled = False
         executor.is_benchmark_disagg = False
         executor.previous_batch = None
+        executor.enable_kv_cache_events = False
         executor._flush_pending_transfer_responses = Mock()
         executor._packed_sync_enabled = False
         executor._stage_timing = False
