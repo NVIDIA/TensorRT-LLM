@@ -33,6 +33,11 @@ def get_sparse_attn_kv_cache_manager(
     from .minimax_m3 import MiniMaxM3KVCacheManagerV2
     from .rocket import RocketKVCacheManager
 
+    if getattr(sparse_attention_config, "uses_dense_kv_cache", False):
+        # The algorithm keeps the dense KV cache. get_kv_cache_manager_cls
+        # routes such models through the dense manager selection; this maps an
+        # already chosen version to its class.
+        return KVCacheManagerV2 if use_kv_cache_manager_v2 else KVCacheManager
     if sparse_attention_config.algorithm == "csa2":
         from .csa2.cache_manager import CSA2CacheManager
 
@@ -43,11 +48,6 @@ def get_sparse_attn_kv_cache_manager(
         return DSACacheManagerV2 if use_kv_cache_manager_v2 else DSACacheManager
     elif sparse_attention_config.algorithm == "deepseek_v4":
         return DeepseekV4CacheManager
-    elif sparse_attention_config.algorithm == "skip_softmax":
-        # Skip Softmax changes only the attention kernel and keeps the dense
-        # KV cache. get_kv_cache_manager_cls routes models through the dense
-        # manager selection; this maps an already chosen version to its class.
-        return KVCacheManagerV2 if use_kv_cache_manager_v2 else KVCacheManager
     elif sparse_attention_config.algorithm == "minimax_m3":
         return MiniMaxM3KVCacheManagerV2
     elif sparse_attention_config.algorithm == "qsa":

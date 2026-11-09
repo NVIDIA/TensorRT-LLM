@@ -424,6 +424,20 @@ def test_skip_softmax_uses_the_dense_kv_cache_manager(use_kv_cache_manager_v2: b
     assert manager_cls is (KVCacheManagerV2 if use_kv_cache_manager_v2 else KVCacheManager)
 
 
+def test_only_skip_softmax_keeps_the_dense_kv_cache() -> None:
+    """Manager selection keys off the class flag, which is not a user-facing field."""
+    from typing import get_args
+
+    from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig, SparseAttentionConfig
+
+    config_classes = get_args(get_args(SparseAttentionConfig)[0])
+
+    assert {cls for cls in config_classes if cls.uses_dense_kv_cache} == {
+        SkipSoftmaxAttentionConfig
+    }
+    assert "uses_dense_kv_cache" not in SkipSoftmaxAttentionConfig.model_fields
+
+
 @pytest.mark.parametrize("variable_geometry", [False, True])
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [True, False])
 def test_skip_softmax_model_selects_its_dense_kv_cache_manager(

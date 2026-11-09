@@ -973,6 +973,10 @@ class BaseSparseAttentionConfig(StrictBaseModel):
     """Configuration for sparse attention."""
     algorithm: str
 
+    uses_dense_kv_cache: ClassVar[bool] = False
+    """Whether the algorithm changes only the attention kernel and keeps the
+    dense KV cache, so it gets the KV cache manager a dense model would get."""
+
     def supports_backend(self, backend: str) -> bool:
         """Override if the sparse attention algorithm does not support
         a subset of the possible backends.
@@ -1849,6 +1853,7 @@ class CSA2SparseAttentionConfig(BaseSparseAttentionConfig):
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     """Configuration for skip softmax attention."""
     algorithm: Literal["skip_softmax"] = Field(default="skip_softmax")
+    uses_dense_kv_cache: ClassVar[bool] = True
     threshold_scale_factor: Optional[Union[float, Dict[str, float]]] = Field(
         default=None,
         description="The threshold scale factor for skip softmax attention.")
