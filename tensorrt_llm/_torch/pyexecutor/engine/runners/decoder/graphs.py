@@ -66,7 +66,7 @@ from .warmup import WarmupAgreement
 _BREAK_GRAPH_NUM_CONTEXTS = (1, 2)
 
 # "1": the final executor captures its graphs in one pass when every rank can keep them.
-SKIP_WARMUP_PASS_ENV = "TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS"
+SKIP_WARMUP_CAPTURE_ENV = "TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS"
 
 
 def _make_single_token_context_graph_batch(
@@ -380,7 +380,7 @@ class DecoderCudaGraphs:
         if not self.cuda_graph_runner.enabled:
             return False
         # Every rank joins, so a rank without the switch keeps all ranks on two passes.
-        wanted = os.environ.get(SKIP_WARMUP_PASS_ENV, "0") == "1"
+        wanted = os.environ.get(SKIP_WARMUP_CAPTURE_ENV, "0") == "1"
         if not self._agreement.agree_flag(wanted and self._single_pass_supported()):
             return False
         self._captured_tensor_ptrs = []
