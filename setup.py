@@ -214,6 +214,13 @@ package_data += [
     'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/ops/spec/_head_sampler/*.cuh',
     '_torch/_experimental/modeling_v2/models/musespark_open/'
     'muse_spark_open_816b_a42b_nvfp4__sm_103__tep/ops/spec/_head_sampler/*.h',
+    # the GB300 TEP8 F11 target (sm_103__tep8, opt-in MUSESPARK_OPEN_SM103_TEP8_F11=1)
+    '_torch/_experimental/modeling_v2/models/musespark_open/'
+    'muse_spark_open_816b_a42b_nvfp4__sm_103__tep8/ops/spec/_head_sampler/*.cu',
+    '_torch/_experimental/modeling_v2/models/musespark_open/'
+    'muse_spark_open_816b_a42b_nvfp4__sm_103__tep8/ops/spec/_head_sampler/*.cuh',
+    '_torch/_experimental/modeling_v2/models/musespark_open/'
+    'muse_spark_open_816b_a42b_nvfp4__sm_103__tep8/ops/spec/_head_sampler/*.h',
     '_torch/_experimental/modeling_v2/models/musespark_open/'
     'muse_spark_open_816b_a42b_nvfp4__sm_107__tep/ops/spec/_head_sampler/*.cu',
     '_torch/_experimental/modeling_v2/models/musespark_open/'
