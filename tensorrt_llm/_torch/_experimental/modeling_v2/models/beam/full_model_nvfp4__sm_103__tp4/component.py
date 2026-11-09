@@ -37,38 +37,19 @@ every selected tensor. Every parameter, bank and derived scalar is a registered 
 from __future__ import annotations
 
 import hashlib
-import json
-import os
 import struct
-from collections import OrderedDict
-from typing import Any, Mapping, Optional, Sequence
+from typing import Optional
 
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.distributed import AllReduce
-from tensorrt_llm.functional import AllReduceStrategy
-from tensorrt_llm.mapping import Mapping as ParallelMapping
-
 from .. import dispatch_combine
-from .._load import load_failure_details
-from .._validation import explicit_device
 from . import expert as nvfp4_expert
-from .component_bf16 import (
-    MAX_TOKENS,
-    BeamCheckpointLayoutBf16Sm103Tp4,
-    LoadError,
-    _attr,
-    _check_mapping,
-    _rec,
-    check_max_tokens,
-)
+from .component_bf16 import BeamCheckpointLayoutBf16Sm103Tp4, LoadError, _attr, _rec
 from .layout import (
-    EMBED,
     PROJECTIONS,
-    WORLD_SIZE,
     QuantSpec,
-    check_config,
+    TensorSpec,
     check_partition,
     check_recipe,
     read_quant_config,
@@ -83,7 +64,6 @@ from .loader import (
     check_block_scales,
     read_packed_into,
     read_scalars,
-    read_slice_into,
     validate,
 )
 
@@ -108,44 +88,13 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
     validates the configuration and layout; it reads no checkpoint data.
     """
 
-    def __init__(
-        self,
-        config: Mapping[str, Any],
-        mapping: ParallelMapping,
-        layers: Optional[Sequence[int]] = None,
-        device: Optional[torch.device] = None,
-        *,
-        max_tokens: int = MAX_TOKENS,
-    ):
-        nn.Module.__init__(self)
-        self.max_tokens = check_max_tokens(max_tokens)
-        self.schedule = check_config(config)
-        _check_mapping(mapping)
-        device = explicit_device(device)
-        if device.type != "cuda" or torch.cuda.get_device_capability(device) != _SM:
-            raise ValueError(
-                f"this component is built for sm_{_SM[0]}{_SM[1]} CUDA devices, got {device}"
-            )
-        self.config = dict(config)
-        self.mapping = mapping
-        self.rank = mapping.rank
-        self.device = device
-        self.layers = tuple(sorted(range(self.schedule.num_layers) if layers is None else layers))
-        self.specs = tensor_specs(config, self.layers)
-        check_partition(self.specs)
-        self.hidden = config["hidden_size"]
-        self.head_dim = config["head_dim"]
-        self.local_heads = config["num_attention_heads"] // WORLD_SIZE
-        self.local_kv_heads = config["num_key_value_heads"] // WORLD_SIZE
-        self.eps = config["rms_norm_eps"]
-        self.window = config["sliding_window"]
-        self.rope_theta = config["rope_parameters"]["sliding_attention"]["rope_theta"]
-        self.softcap = config["final_logit_softcapping"]
-        self.routed_scaling_factor = config["routed_scaling_factor"]
-        self.vocab_interval = self.specs[EMBED].interval(self.rank)[1:]
+    _tensor_specs = staticmethod(tensor_specs)
+    _check_partition = staticmethod(check_partition)
+
+    def _allocate_storage(self) -> None:
         self.bank_names: list = []
         self.expert_names: list = []
-        experts = config["num_experts"]
+        experts = self.config["num_experts"]
         for spec in self.specs.values():
             if isinstance(spec, QuantSpec):
                 self.expert_names.append(spec.name)
@@ -165,21 +114,17 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
                     self.register_parameter(
                         _attr(f"{spec.bank}.{field}"),
                         nn.Parameter(
-                            torch.empty(shape, dtype=dtype, device=device), requires_grad=False
+                            torch.empty(shape, dtype=dtype, device=self.device), requires_grad=False
                         ),
                     )
                 self.bank_names.append(spec.bank)
                 continue
             dtype = torch.bfloat16 if spec.effective_dtype == "BF16" else torch.float32
             param = nn.Parameter(
-                torch.empty(spec.local_shape(self.rank), dtype=dtype, device=device),
+                torch.empty(spec.local_shape(self.rank), dtype=dtype, device=self.device),
                 requires_grad=False,
             )
             self.register_parameter(_attr(spec.name), param)
-        self._allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL)
-        self.usable = False
-        self.load_record: Optional[dict] = None
-        self._init_diagnostics()
         #: Per sparse layer, per global expert: gate and up input scales bitwise equal.
         self._shared_fc1: dict = {}
 
@@ -287,112 +232,47 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         self._shared_fc1[layer] = shared
         return {"scalars": len(values), "gate_up_input_scales_shared": sum(shared)}
 
-    @torch.no_grad()
-    def load(self, checkpoint_dir: str, *, record_digests: bool = True) -> dict:
-        """Stream the selected tensors of a caller-supplied checkpoint into rank-local storage.
-
-        Collective: every rank calls it. config.json must equal the constructed configuration,
-        hf_quant_config.json must be the NVFP4 recipe (``layout.check_recipe``), and every
-        stored tensor of the whole model must be exactly what the layout needs before any
-        storage changes. Expert codes and block-scale bytes are copied unchanged (block scales
-        then swizzled), scalars must be finite and positive, block scales finite and
-        non-negative. The component is unusable from the first write until every rank reports a
-        complete load; a failure on any rank raises ``LoadError`` on all ranks. Returns the
-        load record (recipe, coverage, source digests, bytes read).
-        """
-        self._check_diagnostics_agree()
-        error: Optional[BaseException] = None
-        catalog = None
-        recipe = None
-        try:
-            with open(os.path.join(checkpoint_dir, "config.json")) as f:
-                stored = json.load(f)
-            if stored != self.config:
-                differing = sorted(
-                    k for k in set(stored) | set(self.config) if stored.get(k) != self.config.get(k)
-                )
-                raise CheckpointFormatError(
-                    f"config.json differs from the constructed configuration: {differing[:8]}"
-                )
-            quant = read_quant_config(checkpoint_dir, stored)
-            full = tensor_specs(self.config)
-            recipe = check_recipe(quant, full)
-            catalog = SafetensorsCatalog(checkpoint_dir)
-            validate(catalog, stored_entries(full), complete=True)
-        except Exception as exc:  # Keep rank-local failures inside the collective protocol.
-            error = exc
-        if failure := load_failure_details(self.mapping, error is None, error):
-            raise LoadError(
-                f"rank {self.rank}: checkpoint rejected before loading: {failure}"
-            ) from error
-
-        self.usable = False
-        self.load_record = None
-        self._shared_fc1 = {}
-        coverage = OrderedDict()
-        scalars = OrderedDict()
-        reader = None
-        bytes_read = reads = 0
-
-        def first_entry(spec):
-            return catalog.entries[
-                spec.name + ".weight" if isinstance(spec, QuantSpec) else spec.name
-            ]
-
-        try:
-            reader = TileReader()
-            order = sorted(
-                self.specs.values(), key=lambda s: (first_entry(s).path, first_entry(s).begin)
-            )
-            sparse = [layer for layer in self.layers if self.schedule.is_sparse(layer)]
-            for spec in order:
-                digest = hashlib.sha256() if record_digests else None
-                if isinstance(spec, QuantSpec):
-                    coverage[spec.name] = self._load_expert(catalog, reader, spec, digest)
-                    continue
-                dst = self.tensor(spec.name)
-                read_slice_into(catalog, reader, spec, self.rank, dst, digest=digest)
-                coverage[spec.name] = {
-                    "interval": spec.interval(self.rank),
-                    "local_shape": list(dst.shape),
-                    "dtype": str(dst.dtype),
-                    "source_sha256": digest.hexdigest() if digest is not None else None,
-                }
-            for layer in sparse:
-                scalars[layer] = self._load_scalars(catalog, reader, layer)
-        except Exception as exc:  # Every rank must reach the completion agreement.
-            error = exc
-        finally:
-            if reader is not None:
-                bytes_read, reads = reader.bytes_read, reader.reads
-                try:
-                    reader.close()
-                except Exception as exc:  # Cleanup failure must also reach the agreement.
-                    if error is None:
-                        error = exc
-        complete = (
-            error is None and list(coverage) == [s.name for s in order] and list(scalars) == sparse
-        )
-        if failure := load_failure_details(self.mapping, complete, error):
-            self._shared_fc1 = {}
-            raise LoadError(
-                f"rank {self.rank}: load did not complete on every rank: {failure}"
-            ) from error
-        self.load_record = {
-            "rank": self.rank,
-            "checkpoint_dir": os.fspath(checkpoint_dir),
-            "layers": list(self.layers),
+    def _validate_catalog(
+        self, checkpoint_dir: str, catalog: SafetensorsCatalog, stored: dict
+    ) -> dict:
+        full = tensor_specs(self.config)
+        recipe = check_recipe(read_quant_config(checkpoint_dir, stored), full)
+        validate(catalog, stored_entries(full), complete=True)
+        return {
             "recipe": recipe,
             "contract": dict(nvfp4_expert.CONTRACT),
-            "tensors": len(coverage),
             "expert_projections": len(self.expert_names),
-            "scalars": dict(scalars),
-            "bytes_read": bytes_read,
-            "reads": reads,
-            "coverage": coverage,
         }
-        self.usable = True
-        return self.load_record
+
+    def _reset_loaded_state(self) -> None:
+        self._shared_fc1 = {}
+
+    @staticmethod
+    def _entry_name(spec: TensorSpec | QuantSpec) -> str:
+        return spec.name + ".weight" if isinstance(spec, QuantSpec) else spec.name
+
+    def _load_tensor(
+        self,
+        catalog: SafetensorsCatalog,
+        reader: TileReader,
+        spec: TensorSpec | QuantSpec,
+        digest: Optional["hashlib._Hash"],
+    ) -> dict:
+        if isinstance(spec, QuantSpec):
+            return self._load_expert(catalog, reader, spec, digest)
+        record = super()._load_tensor(catalog, reader, spec, digest)
+        # Packed expert ownership is recorded by _load_expert; dense tensors are unbanked.
+        record.pop("bank")
+        record.pop("slot")
+        return record
+
+    def _load_extra(self, catalog: SafetensorsCatalog, reader: TileReader) -> dict:
+        scalars = {
+            layer: self._load_scalars(catalog, reader, layer)
+            for layer in self.layers
+            if self.schedule.is_sparse(layer)
+        }
+        return {"scalars": scalars}
 
     # ------------------------------------------------------------------ computations
 

@@ -413,6 +413,7 @@ def attention(
     eps: float,
     rope_theta: float | None,
     window: int,
+    capture: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Normalized input [T, hidden] -> attention output [T, hidden], before post_attention_layernorm.
 
@@ -422,21 +423,22 @@ def attention(
     is the attention window the op applies: the sliding window, or the metadata's
     ``max_seq_len`` for a full layer.
     """
-    num_tokens = h.shape[0]
+    T = h.shape[0]
     heads, kv_heads, d = num_heads, num_kv_heads, head_dim
     q = cublas_mm(h, q_proj.t())
     k = cublas_mm(h, k_proj.t())
     v = cublas_mm(h, v_proj.t())
-    gate = cublas_mm(h, gate_proj.t())
-    q = flashinfer_rmsnorm(q.view(num_tokens * heads, d), q_norm, eps)
-    k = flashinfer_rmsnorm(k.view(num_tokens * kv_heads, d), k_norm, eps)
-    q, k = q.view(num_tokens, heads, d), k.view(num_tokens, kv_heads, d)
-    if rope_theta is None:
-        q = beam_nope_query_scale(q, positions)
+    g = cublas_mm(h, gate_proj.t())
+    qn = flashinfer_rmsnorm(q.view(T * heads, d), q_norm, eps)
+    kn = flashinfer_rmsnorm(k.view(T * kv_heads, d), k_norm, eps)
+    qn, kn = qn.view(T, heads, d), kn.view(T, kv_heads, d)
+    sliding = rope_theta is not None
+    if sliding:
+        qa, ka = beam_neox_rope(qn, kn, positions, rope_theta, 1.0)
     else:
-        q, k = beam_neox_rope(q, k, positions, rope_theta, 1.0)
-    qkv = torch.cat((q.view(num_tokens, heads * d), k.view(num_tokens, kv_heads * d), v), dim=-1)
-    core = torch.empty(num_tokens, heads * d, dtype=h.dtype, device=h.device)
+        qa, ka = beam_nope_query_scale(qn, positions), kn
+    qkv = torch.cat((qa.reshape(T, heads * d), ka.reshape(T, kv_heads * d), v), dim=-1)
+    core = torch.empty(T, heads * d, dtype=h.dtype, device=h.device)
     core = thop_attention(
         q=qkv,
         output=core,
@@ -447,7 +449,22 @@ def attention(
         **step,
         **CALL_CONSTANTS,
     )
-    gated = beam_output_gate(
-        core.view(num_tokens, heads, d), gate.view(num_tokens, heads, d), gate_bias
-    )
-    return cublas_mm(gated.view(num_tokens, heads * d), o_proj.t())
+    gated = beam_output_gate(core.view(T, heads, d), g.view(T, heads, d), gate_bias)
+    part = cublas_mm(gated.reshape(T, heads * d), o_proj.t())
+    if capture is not None:
+        values = {
+            "q_proj": q,
+            "k_proj": k,
+            "v_proj": v,
+            "gate_proj": g,
+            "q_norm": qn,
+            "k_norm": kn,
+            ("q_rope" if sliding else "q_scaled"): qa,
+            **({"k_rope": ka} if sliding else {}),
+            "q_attn": qa,
+            "k_attn": ka,
+            "attn_core": core.view(T, heads, d),
+            "gated": gated,
+        }
+        capture.update({name: tensor.detach().clone() for name, tensor in values.items()})
+    return part

@@ -48,9 +48,6 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     MODELING_V2_VALIDATE_ENV,
     step_contract_enabled,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
-    thop_attention,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
@@ -60,15 +57,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.be
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (
     swiglu_fp32,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_neox_rope import (
-    beam_neox_rope,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_nope_query_scale import (  # noqa: E501
-    beam_nope_query_scale,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_output_gate import (
-    beam_output_gate,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (
     beam_grouped_topk_router,
@@ -155,6 +143,9 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
     validates the configuration and layout; it reads no checkpoint data.
     """
 
+    _tensor_specs = staticmethod(tensor_specs)
+    _check_partition = staticmethod(check_partition)
+
     def __init__(
         self,
         config: Mapping[str, Any],
@@ -163,7 +154,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         device: Optional[torch.device] = None,
         *,
         max_tokens: int = MAX_TOKENS,
-    ):
+    ) -> None:
         super().__init__()
         self.max_tokens = check_max_tokens(max_tokens)
         self.schedule = check_config(config)
@@ -178,8 +169,8 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         self.rank = mapping.rank
         self.device = device
         self.layers = tuple(sorted(range(self.schedule.num_layers) if layers is None else layers))
-        self.specs = tensor_specs(config, self.layers)
-        check_partition(self.specs)
+        self.specs = self._tensor_specs(config, self.layers)
+        self._check_partition(self.specs)
         self.hidden = config["hidden_size"]
         self.head_dim = config["head_dim"]
         self.local_heads = config["num_attention_heads"] // WORLD_SIZE
@@ -188,8 +179,14 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         self.window = config["sliding_window"]
         self.rope_theta = config["rope_parameters"]["sliding_attention"]["rope_theta"]
         self.softcap = config["final_logit_softcapping"]
-        self.routed_scaling_factor = config["routed_scaling_factor"]
         self.vocab_interval = self.specs[EMBED].interval(self.rank)[1:]
+        self._allocate_storage()
+        self._allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL)
+        self.usable = False
+        self.load_record: Optional[dict] = None
+        self._init_diagnostics()
+
+    def _allocate_storage(self) -> None:
         #: Storage is always resolved from the currently registered parameters, never from
         #: references taken here, so a replaced parameter or bank is what every call uses.
         self.bank_names: list = []
@@ -198,7 +195,9 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
                 if spec.bank not in self.bank_names:
                     local = spec.local_shape(self.rank)
                     bank = torch.empty(
-                        (config["num_experts"], *local), dtype=torch.bfloat16, device=device
+                        (self.config["num_experts"], *local),
+                        dtype=torch.bfloat16,
+                        device=self.device,
                     )
                     self.register_parameter(
                         _attr(spec.bank), nn.Parameter(bank, requires_grad=False)
@@ -207,14 +206,10 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
                 continue
             dtype = torch.bfloat16 if spec.effective_dtype == "BF16" else torch.float32
             param = nn.Parameter(
-                torch.empty(spec.local_shape(self.rank), dtype=dtype, device=device),
+                torch.empty(spec.local_shape(self.rank), dtype=dtype, device=self.device),
                 requires_grad=False,
             )
             self.register_parameter(_attr(spec.name), param)
-        self._allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL)
-        self.usable = False
-        self.load_record: Optional[dict] = None
-        self._init_diagnostics()
 
     # ------------------------------------------------------------------ diagnostics
 
@@ -298,7 +293,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
                     f"config.json differs from the constructed configuration: {differing[:8]}"
                 )
             catalog = SafetensorsCatalog(checkpoint_dir)
-            catalog.validate(tensor_specs(self.config), complete=True)
+            metadata = self._validate_catalog(checkpoint_dir, catalog, stored)
         except Exception as exc:  # Keep rank-local failures inside the collective protocol.
             error = exc
         if failure := load_failure_details(self.mapping, error is None, error):
@@ -308,6 +303,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
 
         self.usable = False
         self.load_record = None
+        self._reset_loaded_state()
         coverage = OrderedDict()
         reader = None
         bytes_read = reads = 0
@@ -315,20 +311,15 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
             reader = TileReader()
             order = sorted(
                 self.specs.values(),
-                key=lambda s: (catalog.entries[s.name].path, catalog.entries[s.name].begin),
+                key=lambda s: (
+                    catalog.entries[self._entry_name(s)].path,
+                    catalog.entries[self._entry_name(s)].begin,
+                ),
             )
             for spec in order:
                 digest = hashlib.sha256() if record_digests else None
-                dst = self.tensor(spec.name)
-                read_slice_into(catalog, reader, spec, self.rank, dst, digest=digest)
-                coverage[spec.name] = {
-                    "interval": spec.interval(self.rank),
-                    "local_shape": list(dst.shape),
-                    "dtype": str(dst.dtype),
-                    "source_sha256": digest.hexdigest() if digest is not None else None,
-                    "bank": spec.bank,
-                    "slot": spec.expert,
-                }
+                coverage[spec.name] = self._load_tensor(catalog, reader, spec, digest)
+            extra = self._load_extra(catalog, reader)
         except Exception as exc:  # Every rank must reach the completion agreement.
             error = exc
         finally:
@@ -341,6 +332,7 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
                         error = exc
         complete = error is None and list(coverage) == [s.name for s in order]
         if failure := load_failure_details(self.mapping, complete, error):
+            self._reset_loaded_state()
             raise LoadError(
                 f"rank {self.rank}: load did not complete on every rank: {failure}"
             ) from error
@@ -352,9 +344,45 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
             "bytes_read": bytes_read,
             "reads": reads,
             "coverage": coverage,
+            **metadata,
+            **extra,
         }
         self.usable = True
         return self.load_record
+
+    def _validate_catalog(
+        self, checkpoint_dir: str, catalog: SafetensorsCatalog, stored: dict
+    ) -> dict:
+        catalog.validate(self._tensor_specs(self.config), complete=True)
+        return {}
+
+    def _reset_loaded_state(self) -> None:
+        """Clear format-specific state after storage changes or a failed transaction."""
+
+    @staticmethod
+    def _entry_name(spec: TensorSpec) -> str:
+        return spec.name
+
+    def _load_tensor(
+        self,
+        catalog: SafetensorsCatalog,
+        reader: TileReader,
+        spec: TensorSpec,
+        digest: Optional["hashlib._Hash"],
+    ) -> dict:
+        dst = self.tensor(spec.name)
+        read_slice_into(catalog, reader, spec, self.rank, dst, digest=digest)
+        return {
+            "interval": spec.interval(self.rank),
+            "local_shape": list(dst.shape),
+            "dtype": str(dst.dtype),
+            "source_sha256": digest.hexdigest() if digest is not None else None,
+            "bank": spec.bank,
+            "slot": spec.expert,
+        }
+
+    def _load_extra(self, catalog: SafetensorsCatalog, reader: TileReader) -> dict:
+        return {}
 
     # ------------------------------------------------------------------ helpers
 
@@ -442,61 +470,29 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
                 head_dim=self.head_dim,
             )
         step = _attention.step_args(md, layer)
-        heads, kv_heads, d = self.local_heads, self.local_kv_heads, self.head_dim
-        q = cublas_mm(h, self._layer(layer, "self_attn.q_proj.weight").t())
-        k = cublas_mm(h, self._layer(layer, "self_attn.k_proj.weight").t())
-        v = cublas_mm(h, self._layer(layer, "self_attn.v_proj.weight").t())
-        g = cublas_mm(h, self._layer(layer, "self_attn.gate_proj.weight").t())
-        qn = flashinfer_rmsnorm(
-            q.view(T * heads, d), self._layer(layer, "self_attn.q_norm.weight"), self.eps
-        )
-        kn = flashinfer_rmsnorm(
-            k.view(T * kv_heads, d), self._layer(layer, "self_attn.k_norm.weight"), self.eps
-        )
-        qn, kn = qn.view(T, heads, d), kn.view(T, kv_heads, d)
         sliding = self.schedule.is_sliding(layer)
-        if sliding:
-            qa, ka = beam_neox_rope(qn, kn, positions, self.rope_theta, 1.0)
-        else:
-            qa, ka = beam_nope_query_scale(qn, positions), kn
-        qkv = torch.cat((qa.reshape(T, heads * d), ka.reshape(T, kv_heads * d), v), dim=-1)
-        core = torch.empty(T, heads * d, dtype=h.dtype, device=h.device)
-        core = thop_attention(
-            q=qkv,
-            output=core,
-            num_heads=heads,
-            num_kv_heads=kv_heads,
-            head_size=d,
-            attention_window_size=self.window if sliding else step["max_seq_len"],
-            **step,
-            **_attention.CALL_CONSTANTS,
-        )
-        gated = beam_output_gate(
-            core.view(T, heads, d), g.view(T, heads, d), self._layer(layer, "self_attn.gate_bias")
-        )
-        part = cublas_mm(
-            gated.reshape(T, heads * d), self._layer(layer, "self_attn.o_proj.weight").t()
+        part = _attention.attention(
+            h,
+            positions,
+            step,
+            q_proj=self._layer(layer, "self_attn.q_proj.weight"),
+            k_proj=self._layer(layer, "self_attn.k_proj.weight"),
+            v_proj=self._layer(layer, "self_attn.v_proj.weight"),
+            gate_proj=self._layer(layer, "self_attn.gate_proj.weight"),
+            o_proj=self._layer(layer, "self_attn.o_proj.weight"),
+            q_norm=self._layer(layer, "self_attn.q_norm.weight"),
+            k_norm=self._layer(layer, "self_attn.k_norm.weight"),
+            gate_bias=self._layer(layer, "self_attn.gate_bias"),
+            num_heads=self.local_heads,
+            num_kv_heads=self.local_kv_heads,
+            head_dim=self.head_dim,
+            eps=self.eps,
+            rope_theta=self.rope_theta if sliding else None,
+            window=self.window if sliding else step["max_seq_len"],
+            capture=capture,
         )
         out = self.all_reduce(part)
-        _rec(
-            capture,
-            {
-                "q_proj": q,
-                "k_proj": k,
-                "v_proj": v,
-                "gate_proj": g,
-                "q_norm": qn,
-                "k_norm": kn,
-                ("q_rope" if sliding else "q_scaled"): qa,
-                **({"k_rope": ka} if sliding else {}),
-                "q_attn": qa,
-                "k_attn": ka,
-                "attn_core": core.view(T, heads, d),
-                "gated": gated,
-                "tp.o_part": part,
-                "attn_out": out,
-            },
-        )
+        _rec(capture, {"tp.o_part": part, "attn_out": out})
         return out
 
     @torch.no_grad()

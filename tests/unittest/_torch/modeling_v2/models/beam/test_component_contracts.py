@@ -356,3 +356,173 @@ def test_safetensors_offsets_must_be_integers(tmp_path, monkeypatch, offset):
     )
     with pytest.raises(loader.CheckpointFormatError, match="offsets must be integers"):
         loader.SafetensorsCatalog(str(tmp_path))
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("failure", [None, "metadata", "copy", "close", "remote"])
+def test_checkpoint_load_transaction(
+    tmp_path, monkeypatch, packed: bool, failure: str | None
+) -> None:
+    """Real CPU tensor reads preserve load atomicity and propagate every failure phase."""
+    import json
+
+    import torch
+    from safetensors.torch import save_file
+
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+        component as nvfp4,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+        component_bf16 as bf16,
+    )
+
+    cls = (
+        nvfp4.BeamCheckpointLayoutNvfp4Sm103Tp4 if packed else bf16.BeamCheckpointLayoutBf16Sm103Tp4
+    )
+    obj = cls.__new__(cls)
+    torch.nn.Module.__init__(obj)
+    # CPU copies are synchronous; omit only the CUDA stream synchronization.
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: NS(synchronize=lambda: None))
+    source = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    spec = layout.TensorSpec("weight", (4, 2), layout.F32, "dense", None, None, None)
+    obj.config = {"test": True}
+    obj.specs = {spec.name: spec}
+    obj.mapping = NS(world_size=1, rank=0)
+    obj.rank, obj.layers, obj.device = 0, (), torch.device("cpu")
+    obj.schedule = NS(is_sparse=lambda layer: False)
+    obj.expert_names, obj._shared_fc1 = [], {3: [True]}
+    obj.usable, obj.load_record = True, {"previous": True}
+    obj.register_parameter(
+        bf16._attr(spec.name), torch.nn.Parameter(torch.zeros_like(source), requires_grad=False)
+    )
+    obj._check_diagnostics_agree = lambda: None
+    monkeypatch.setattr(cls, "_tensor_specs", staticmethod(lambda *args: obj.specs))
+    if packed:
+        monkeypatch.setattr(nvfp4, "tensor_specs", lambda *args: obj.specs)
+        monkeypatch.setattr(nvfp4, "read_quant_config", lambda *args: {})
+        monkeypatch.setattr(nvfp4, "check_recipe", lambda *args: {"verified": True})
+    (tmp_path / "config.json").write_text(json.dumps(obj.config))
+    save_file({"weight": source}, str(tmp_path / "weights.safetensors"))
+    (tmp_path / loader.INDEX_FILE).write_text(
+        json.dumps({"weight_map": {"weight": "weights.safetensors"}})
+    )
+    if failure == "metadata":
+        (tmp_path / "config.json").write_text("{}")
+    reader = loader.TileReader(tile_bytes=16, pin=False)
+    monkeypatch.setattr(bf16, "TileReader", lambda: reader)
+    closed = []
+    real_close = reader.close
+
+    def close() -> None:
+        real_close()
+        closed.append(True)
+        if failure == "close":
+            raise OSError("close failed")
+
+    monkeypatch.setattr(reader, "close", close)
+    if failure == "copy":
+
+        def copy_failed(*args, **kwargs) -> None:
+            raise OSError("copy failed")
+
+        monkeypatch.setattr(bf16, "read_slice_into", copy_failed)
+    phases = []
+
+    def agree(mapping, ok, error):
+        phases.append(ok)
+        if failure == "remote" and len(phases) == 2:
+            return "rank 2: remote copy failed"
+        return None if ok else str(error)
+
+    monkeypatch.setattr(bf16, "load_failure_details", agree)
+    try:
+        if failure is not None:
+            with pytest.raises(
+                bf16.LoadError,
+                match={
+                    "metadata": "checkpoint rejected before loading",
+                    "copy": "copy failed",
+                    "close": "close failed",
+                    "remote": "rank 2",
+                }[failure],
+            ):
+                obj.load(str(tmp_path), record_digests=False)
+            if failure == "metadata":
+                assert obj.usable and obj.load_record == {"previous": True}
+                assert torch.count_nonzero(obj.tensor("weight")) == 0
+                assert phases == [False] and not closed
+            else:
+                assert not obj.usable and obj.load_record is None
+                assert len(phases) == 2 and closed == [True]
+                if packed:
+                    assert obj._shared_fc1 == {}
+        else:
+            record = obj.load(str(tmp_path), record_digests=False)
+            assert torch.equal(obj.tensor("weight"), source)
+            assert obj.usable and record is obj.load_record
+            assert record["tensors"] == 1 and record["bytes_read"] == 32
+            assert record["coverage"]["weight"]["source_sha256"] is None
+            assert phases == [True, True] and closed == [True]
+            if packed:
+                assert record["recipe"] == {"verified": True} and record["scalars"] == {}
+    finally:
+        real_close()
+
+
+@pytest.mark.parametrize("dtype,itemsize", [("BF16", 2), ("F32", 4), ("F8_E4M3", 1), ("U8", 1)])
+def test_stored_entry_validation_is_shared(dtype: str, itemsize: int) -> None:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.loader import (
+        validate,
+    )
+
+    catalog = loader.SafetensorsCatalog.__new__(loader.SafetensorsCatalog)
+    catalog.entries = {"weight": loader.Entry("weight", "unused", dtype, (2, 4), 0, 8 * itemsize)}
+    validate(catalog, {"weight": (dtype, (2, 4))})
+    catalog.entries["weight"].end -= 1
+    with pytest.raises(loader.CheckpointFormatError, match="byte span"):
+        validate(catalog, {"weight": (dtype, (2, 4))})
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_component_constructor_uses_format_storage(monkeypatch, packed: bool) -> None:
+    import torch
+
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+        component as nvfp4,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+        component_bf16 as bf16,
+    )
+
+    cls = (
+        nvfp4.BeamCheckpointLayoutNvfp4Sm103Tp4 if packed else bf16.BeamCheckpointLayoutBf16Sm103Tp4
+    )
+    spec = layout.TensorSpec(layout.EMBED, (8, 2), layout.BF16, "embedding", None, None, 0)
+    monkeypatch.setattr(cls, "_tensor_specs", staticmethod(lambda *args: {spec.name: spec}))
+    monkeypatch.setattr(bf16, "AllReduce", lambda **kwargs: NS())
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 3))
+    real_empty = torch.empty
+
+    def empty_on_cpu(*args, **kwargs):
+        kwargs["device"] = "cpu"
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", empty_on_cpu)
+    mapping = NS(
+        rank=0,
+        world_size=4,
+        tp_size=4,
+        pp_size=1,
+        moe_tp_size=4,
+        moe_ep_size=1,
+        cp_size=1,
+        enable_attention_dp=False,
+        tp_group=list(range(4)),
+    )
+    obj = cls(config(), mapping, layers=[], device=torch.device("cuda:0"), max_tokens=17)
+    assert obj.tensor(layout.EMBED).shape == (2, 2)
+    assert obj.vocab_interval == (0, 2) and obj.max_tokens == 17
+    assert not obj.usable and obj.load_record is None
+    assert obj.local_heads == 12 and obj.local_kv_heads == 2
+    if packed:
+        assert obj.expert_names == [] and obj._shared_fc1 == {}

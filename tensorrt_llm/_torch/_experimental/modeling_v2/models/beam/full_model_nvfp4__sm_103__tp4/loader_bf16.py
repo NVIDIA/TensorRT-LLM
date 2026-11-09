@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import struct
 import threading
@@ -34,7 +35,7 @@ from .layout_bf16 import BF16, F32, FP8, TensorSpec
 
 INDEX_FILE = "model.safetensors.index.json"
 TILE_BYTES = 16 << 20
-_ITEMSIZE = {FP8: 1, BF16: 2, F32: 4}
+_ITEMSIZE = {"U8": 1, FP8: 1, BF16: 2, F32: 4}
 _TORCH_DTYPE = {FP8: torch.float8_e4m3fn, BF16: torch.bfloat16, F32: torch.float32}
 _MAX_HEADER = 256 << 20
 
@@ -150,6 +151,12 @@ class SafetensorsCatalog:
             expected[spec.name] = (spec.stored_dtype, tuple(spec.shape))
             if spec.scale_name is not None:
                 expected[spec.scale_name] = (BF16, (spec.shape[0], 1))
+        self.validate_entries(expected, complete=complete)
+
+    def validate_entries(
+        self, expected: Mapping[str, tuple[str, tuple[int, ...]]], *, complete: bool = True
+    ) -> None:
+        """Check stored names, dtypes, shapes and byte spans for any supported weight format."""
         missing = sorted(set(expected) - set(self.entries))
         if missing:
             raise CheckpointFormatError(
@@ -165,10 +172,7 @@ class SafetensorsCatalog:
                 raise CheckpointFormatError(
                     f"{name} is stored as {entry.dtype}{list(entry.shape)}; expected {dtype}{list(shape)}"
                 )
-            numel = 1
-            for d in shape:
-                numel *= d
-            if entry.end - entry.begin != numel * _ITEMSIZE[dtype]:
+            if entry.end - entry.begin != math.prod(shape) * _ITEMSIZE[dtype]:
                 raise CheckpointFormatError(
                     f"{name}: byte span does not match {dtype}{list(shape)}"
                 )

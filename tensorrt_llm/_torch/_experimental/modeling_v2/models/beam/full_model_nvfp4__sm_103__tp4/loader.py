@@ -19,13 +19,12 @@ bounded read per contiguous run.
 from __future__ import annotations
 
 import hashlib
-import math
 import struct
 from typing import Mapping, Optional
 
 import torch
 
-from .layout import BF16, E4M3, F32, U8
+from .layout import E4M3, F32, U8
 from .loader_bf16 import (
     TILE_BYTES,
     CheckpointFormatError,
@@ -46,7 +45,6 @@ __all__ = [
     "validate",
 ]
 
-_ITEMSIZE = {U8: 1, E4M3: 1, BF16: 2, F32: 4}
 #: Scalar runs read in one request when they are at most this many bytes apart end to end.
 _SCALAR_RUN_BYTES = 1 << 20
 
@@ -72,21 +70,7 @@ def validate(catalog: SafetensorsCatalog, expected: Mapping[str, tuple], *, comp
     ``expected`` maps each stored name to ``(dtype, shape)`` (``layout.stored_entries``). With
     ``complete`` any other stored tensor is rejected.
     """
-    missing = sorted(set(expected) - set(catalog.entries))
-    if missing:
-        raise CheckpointFormatError(f"{len(missing)} expected tensors are missing: {missing[:8]}")
-    if complete:
-        extra = sorted(set(catalog.entries) - set(expected))
-        if extra:
-            raise CheckpointFormatError(f"{len(extra)} unsupported tensors: {extra[:8]}")
-    for name, (dtype, shape) in expected.items():
-        entry = catalog.entries[name]
-        if entry.dtype != dtype or tuple(entry.shape) != tuple(shape):
-            raise CheckpointFormatError(
-                f"{name} is stored as {entry.dtype}{list(entry.shape)}; expected {dtype}{list(shape)}"
-            )
-        if entry.end - entry.begin != math.prod(shape) * _ITEMSIZE[dtype]:
-            raise CheckpointFormatError(f"{name}: byte span does not match {dtype}{list(shape)}")
+    catalog.validate_entries(expected, complete=complete)
 
 
 def _sync(device: torch.device) -> None:
