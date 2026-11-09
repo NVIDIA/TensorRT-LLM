@@ -1024,7 +1024,8 @@ CachedCudaEvent StorageManager::pendingDiskWrite(Page const& page) const
     return CachedCudaEvent::makeNull();
 }
 
-void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<SharedPtr<Page>> const& pages)
+void StorageManager::writeThroughToDisk(
+    CacheLevel hostLevel, std::vector<SharedPtr<Page>> const& pages, DropRecorder const& dropRecorder)
 {
     CacheLevel const diskLevel = hostLevel + 1;
     if (diskLevel >= numCacheLevels() || cacheTier(hostLevel) != CacheTier::HOST_MEM
@@ -1046,9 +1047,23 @@ void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<Shared
         PoolGroupIndex const pgIdx = getPoolGroupIndex(diskLevel, batchingLayerGroupId);
         SlotCount const wanted = slotCountValueFromSize(batch.size());
         SlotCount free = poolGroup(diskLevel, pgIdx).numFreeSlots();
+        if (free < wanted && isLastLevel(diskLevel))
+        {
+            // The pages being written were just used, so they are newer than any page that lives only on disk.
+            // Dropping the least recently used disk pages costs no I/O; do that before reclaiming retained copies.
+            SlotCount const evictable = mLevels.at(diskLevel).controller.numEvictablePages(pgIdx);
+            SlotCount const numToEvict = std::min(wanted - free, evictable);
+            if (numToEvict > 0)
+            {
+                TypedVec<PoolGroupIndex, SlotCount> minNumPages(numPoolGroups(diskLevel), 0);
+                minNumPages.at(pgIdx) = numToEvict;
+                forceEvict(diskLevel, minNumPages, dropRecorder);
+                free = poolGroup(diskLevel, pgIdx).numFreeSlots();
+            }
+        }
         if (free < wanted)
         {
-            // Recycle older retained copies (duplicates); never evict live disk pages for this.
+            // Then recycle the oldest retained copies (duplicates).
             releaseRetainedCopies(diskLevel, pgIdx, wanted - free);
             free = poolGroup(diskLevel, pgIdx).numFreeSlots();
         }
@@ -1364,7 +1379,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     };
 
     // Keep-disk-copy: a fallen page whose copy is retained at this level takes that slot back, so it needs no free
-    // slot here. Pin those copies, then reclaim other retained copies (duplicates) before evicting real pages.
+    // slot here. Pin those copies, then reclaim other retained copies only for what eviction cannot cover.
     PagesByLifeCycle keptPages(numLifeCycles());
     auto unpinKeptPages = FuncGuard(
         [&]()
@@ -1401,10 +1416,15 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(lvlId); ++pgIdx)
         {
             SlotCount const required = goals.at(lvlId).at(pgIdx) + countPages(pgIdx, fallenPages);
-            SlotCount const free = storage.numFreeSlots(pgIdx);
-            if (required > free)
+            // A retained copy belongs to a page that still lives in a hotter level, so it is more recently used than
+            // any page whose only copy is here. At the last level, evicting such a page drops it without any I/O, so
+            // evict those first (LRU) and reclaim retained copies only for the shortfall. At other levels evicting a
+            // page means migrating it down, which costs more than reclaiming a duplicate.
+            SlotCount const available
+                = storage.numFreeSlots(pgIdx) + (isLast ? ctrl.numEvictablePages(pgIdx) : SlotCount{0});
+            if (required > available)
             {
-                releaseRetainedCopies(lvlId, pgIdx, required - free);
+                releaseRetainedCopies(lvlId, pgIdx, required - available);
             }
         }
     }
@@ -1589,7 +1609,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             _batchedMigrate(lvlId, srcLevel, pages, /*updateSrc=*/true, migrationRecorder);
             if (mDiskWriteThrough && srcLevel == kHotLevel)
             {
-                writeThroughToDisk(lvlId, pages);
+                writeThroughToDisk(lvlId, pages, dropRecorder);
             }
             for (auto const& page : pages)
             {

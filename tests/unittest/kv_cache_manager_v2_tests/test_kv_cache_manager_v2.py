@@ -11550,6 +11550,30 @@ class TestNoBatchingDiskOptions(TestNoBatching):
         self.manager.clear_reusable_blocks()
 
 
+    def test_full_disk_evicts_lru_pages_before_retained_copies(self) -> None:
+        # The disk holds only a few requests, so it fills with pages whose only copy is on disk. Further
+        # evictions must drop the least recently used of those before reclaiming any retained copy.
+        self.prepare(32 << 20, 32 << 20, 96 << 20, 36, 128, 1, kv_buf_size=32768)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        last = None
+        for _ in range(24):
+            last = self.new_request(next(req_ids), None, 256, seq_len - 256)
+            self._run_and_close(last)
+        counters = _introspection.disk_copy_counters(self.manager)
+        disk = self.manager.get_storage_statistics(CacheLevel(2))
+        self.assertGreaterEqual(max(1 - stats.free / stats.total for stats in disk), 0.9)
+        self.assertGreater(counters["write_through_pages"], 0)
+        self.assertGreater(counters["reused"], 0)
+        self.assertEqual(counters["reclaimed"], 0)
+
+        # The most recent request's prefix is still cached and restores correctly (refcheck).
+        prompt = last.kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
+        self.manager.clear_reusable_blocks()
+
 class TestResizeQuotaDiskOptions(TestResizeQuota):
     disk_tier_options = _ALL_DISK_OPTIONS
 

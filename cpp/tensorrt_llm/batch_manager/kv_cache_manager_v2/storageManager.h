@@ -350,8 +350,9 @@ public:
     }
 
     // Keep-disk-copy: a committed page restored from disk keeps its (immutable) disk slot as a retained copy and
-    // takes it back on its next eviction there, skipping the write. Retained copies are reclaimed oldest first,
-    // before any real page is evicted.
+    // takes it back on its next eviction there, skipping the write. At the last level, pages whose only copy is there
+    // are evicted first (least recently used first): retained copies belong to more recently used pages. Retained
+    // copies are then reclaimed oldest first.
 
     [[nodiscard]] bool keepDiskCopyEnabled() const noexcept;
 
@@ -603,7 +604,8 @@ private:
     KeepCopyStats mKeepCopyStats;
 
     // Write-through: pages evicted GPU -> host are also copied to free disk slots as retained copies.
-    void writeThroughToDisk(CacheLevel hostLevel, std::vector<SharedPtr<Page>> const& pages);
+    void writeThroughToDisk(
+        CacheLevel hostLevel, std::vector<SharedPtr<Page>> const& pages, DropRecorder const& dropRecorder);
     // Completion event of a write-through still reading this host page, or a null event.
     [[nodiscard]] CachedCudaEvent pendingDiskWrite(Page const& page) const;
     bool mDiskWriteThrough{false};
