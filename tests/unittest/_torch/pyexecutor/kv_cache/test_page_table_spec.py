@@ -32,7 +32,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 class _Role(str):
-    """A role as the runtime names one: a string subclass."""
+    """A str subclass, to check that a spec keeps roles as plain strings."""
 
 
 def test_spec_names_roles_and_layer_ids_by_plain_values():
@@ -57,6 +57,28 @@ def test_spec_names_mixed_precision_types_as_a_pair():
     assert PageTableSpec().mixed_precision is None
     with pytest.raises(ValueError, match="low and a high type"):
         PageTableSpec(mixed_precision=("nvfp4",))
+
+
+def test_spec_refuses_what_it_cannot_mean():
+    with pytest.raises(ValueError, match="quant_mode"):
+        PageTableSpec(quant_mode="fp8-ds-mla")
+    with pytest.raises(ValueError, match="both untransferred and derived"):
+        PageTableSpec(untransferred_roles={"v_scale"}, derived_roles={"v_scale"})
+    with pytest.raises(ValueError, match="share a global layer id"):
+        PageTableSpec(layer_ids={0: (2, 1), 1: (2, 1)})
+    with pytest.raises(TypeError, match="RoleLayoutV2"):
+        PageTableSpec(role_layouts={"k": "by_head"})
+    with pytest.raises(TypeError, match="RoleLayoutV2"):
+        PageTableSpec(default_layout=object())
+    with pytest.raises(TypeError, match="collection of roles"):
+        PageTableSpec(untransferred_roles="pad")
+
+
+def test_specs_with_equal_fields_are_equal():
+    spec = PageTableSpec(role_layouts={"k": ByHead()}, quant_mode="fp8")
+
+    assert spec == PageTableSpec(role_layouts={"k": ByHead()}, quant_mode="fp8")
+    assert PageTableSpec(quant_mode="fp8") != PageTableSpec(quant_mode="nvfp4")
 
 
 def test_spec_is_immutable():

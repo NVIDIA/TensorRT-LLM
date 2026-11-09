@@ -46,6 +46,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     _host_slots_to_device,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec, Replicated
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -162,17 +163,16 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             buffers += self._kda_replay_region.shared_buffers(global_layer_id)
         return buffers
 
+    @override
     def page_table_spec(self) -> PageTableSpec:
-        """The indexer rows are as wide on every tensor rank and hold the same bytes. The KDA
-        replay caches are generation-local and never move."""
+        """The KDA replay caches are generation-local and never move."""
         spec = super().page_table_spec()
-        untransferred = spec.untransferred_roles
-        if self._kda_replay is not None:
-            untransferred |= self._kda_replay.disagg_ignored_roles(self._state_layout)
+        if self._kda_replay is None:
+            return spec
         return replace(
             spec,
-            role_layouts={**spec.role_layouts, Role.INDEX_KEY: Replicated()},
-            untransferred_roles=untransferred,
+            untransferred_roles=spec.untransferred_roles
+            | self._kda_replay.disagg_ignored_roles(self._state_layout),
         )
 
     @override

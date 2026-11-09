@@ -15,7 +15,7 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec, Replicated
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec
 from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import sparse_cache_config
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import (
@@ -604,14 +604,9 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
         return self._primary_pool_page_index_params[local_layer_idx]
 
     def page_table_spec(self) -> PageTableSpec:
-        """The indexer-K cache projects one head alike on every tensor rank. Pages carrying their
-        own scales are quantized as ``"fp8_ds_mla"``."""
+        """Pages carrying their own scales are quantized as ``"fp8_ds_mla"``."""
         spec = super().page_table_spec()
-        return replace(
-            spec,
-            role_layouts={**spec.role_layouts, Role.INDEX_KEY: Replicated()},
-            quant_mode="fp8_ds_mla" if self.use_fp8_ds_mla else spec.quant_mode,
-        )
+        return replace(spec, quant_mode="fp8_ds_mla" if self.use_fp8_ds_mla else spec.quant_mode)
 
     def _extra_buffers_per_layer(self, *, tokens_per_block: int) -> dict[int, List[BufferConfig]]:
         return {

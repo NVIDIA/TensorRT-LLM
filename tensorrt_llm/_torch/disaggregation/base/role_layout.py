@@ -39,10 +39,11 @@ import dataclasses
 import numbers
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, ClassVar, Mapping
+from typing import ClassVar, Mapping, Protocol, TypeVar
 
 __all__ = [
     "GRID_DIMENSIONS",
+    "BufferSite",
     "ByHead",
     "Own",
     "Piece",
@@ -53,6 +54,7 @@ __all__ = [
     "Sectioned",
     "check_pieces",
     "grid_place",
+    "recurrent_state_split",
     "role_layout_from_dict",
 ]
 
@@ -84,6 +86,48 @@ def grid_place(topology: RankTopology, dims: Sequence[str]) -> tuple[int, int]:
             raise ValueError(f"{dim!r} is no grid dimension; one of {GRID_DIMENSIONS}")
         size, rank = size * n, rank * n + r
     return size, rank
+
+
+def recurrent_state_split(topology: RankTopology) -> tuple[str, ...]:
+    """The parallel dimensions recurrent state splits over, outer to inner, so that
+    ``grid_place(topology, recurrent_state_split(topology))`` is the shard grid the native transfer
+    and the pool sizing give recurrent state (``MambaPolicy._mamba_tp``,
+    ``mamba_effective_tp_size``). Without attention data parallelism: over tensor then context
+    ranks, CP minor, or over tensor ranks alone without context parallelism. Under attention data
+    parallelism: over context ranks at one tensor rank, else held whole ("tp" counts this rank
+    alone)."""
+    if topology.cp_size > 1:
+        if topology.attention_dp:
+            return ("cp",) if topology.tp_size == 1 else ("tp",)
+        return ("tp", "cp")
+    return ("tp",)
+
+
+_Positions = TypeVar("_Positions")
+
+
+class BufferSite(Protocol):
+    """The facts of one rank's buffer of a role that a layout in a manager's spec resolves
+    against (``RoleLayoutV2.resolve``).
+
+    Attributes:
+        size: The buffer's bytes on this rank.
+        kv_heads: For attention, (the layer's KV heads on this rank, the layer's KV heads over all
+            ranks of the split or None if unknown); the total counts each head once, however many
+            ranks hold it.
+        state: Whether the buffer is recurrent state rather than attention.
+        split: The parallel dimensions the buffer's layer group splits over, outer to inner
+            (``GRID_DIMENSIONS``).
+        ranks: The ranks of that split, ``grid_place(topology, split)[0]``.
+        tokens: The token positions of a page.
+    """
+
+    size: int
+    kv_heads: tuple[int, int | None]
+    state: bool
+    split: tuple[str, ...]
+    ranks: int
+    tokens: int
 
 
 _ROLE_LAYOUTS: dict[str, type[RoleLayoutV2]] = {}
@@ -197,22 +241,9 @@ class RoleLayoutV2:
         spec as a whole (``quant_mode``, ``mixed_precision``) and peers' byte sizes."""
         return None
 
-    def resolve(self, site: Any) -> RoleLayoutV2:
+    def resolve(self, site: BufferSite) -> RoleLayoutV2:
         """The layout of one buffer, filling what a manager's spec leaves to each buffer from its
-        facts: this layout itself by default.
-
-        ``site`` carries the facts of one rank's buffer of the role:
-
-        - ``size``: the buffer's bytes on this rank.
-        - ``kv_heads``: for attention, ``(the layer's KV heads on this rank, the layer's KV heads
-          over all ranks of the split or None if unknown)``; the total counts each head once,
-          however many ranks hold it.
-        - ``state``: whether the buffer is recurrent state rather than attention.
-        - ``split``: the parallel dimensions the buffer's layer group splits over, outer to
-          inner (``GRID_DIMENSIONS``).
-        - ``ranks``: the ranks of that split, ``grid_place(topology, split)[0]``.
-        - ``tokens``: the token positions of a page.
-        """
+        facts (``BufferSite``): this layout itself by default."""
         return self
 
     def check(self, size: int) -> None:
@@ -242,9 +273,9 @@ class RoleLayoutV2:
         the request has written every position below ``end``."""
         raise NotImplementedError(f"role layout {self.name!r} holds no token positions")
 
-    def index_of(self, positions, tokens_per_page: int):
+    def index_of(self, positions: _Positions, tokens_per_page: int) -> _Positions:
         """For a positional layout: the index holding each of ``positions`` (an integer or an
-        integer array; the result is the same) in pages of ``tokens_per_page`` positions."""
+        integer array; the result is of the same kind) in pages of ``tokens_per_page`` positions."""
         raise NotImplementedError(f"role layout {self.name!r} holds no token positions")
 
     def stride(self, size: int) -> int:
@@ -255,13 +286,6 @@ class RoleLayoutV2:
     def to_dict(self) -> dict:
         """The layout as plain values for a peer, which ``role_layout_from_dict`` reads back."""
         return {"name": self.name, **_sparse(self)}
-
-    def document(self) -> dict:
-        """The layout apart from its element type, for an identity that names the element type on
-        its own: its name and its fields not at their defaults."""
-        fields = _sparse(self)
-        fields.pop("dtype", None)
-        return {"layout": self.name, **fields}
 
 
 def role_layout_from_dict(data: Mapping) -> RoleLayoutV2:
@@ -279,9 +303,18 @@ def role_layout_from_dict(data: Mapping) -> RoleLayoutV2:
 
 def _dtype(layout: RoleLayoutV2) -> None:
     """Name the layout's element type as torch does, without its module: ``"bfloat16"`` for
-    ``torch.bfloat16``."""
-    if layout.dtype is not None:
-        object.__setattr__(layout, "dtype", str(layout.dtype).removeprefix("torch."))
+    ``torch.bfloat16``.
+
+    Raises:
+        ValueError: If the element type is neither a name nor a torch type.
+    """
+    dtype = layout.dtype
+    if dtype is None or isinstance(dtype, str):
+        return
+    name = str(dtype)
+    if not name.startswith("torch."):
+        raise ValueError(f"an element type is a name or a torch type, not {dtype!r}")
+    object.__setattr__(layout, "dtype", name.removeprefix("torch."))
 
 
 def _typed(layout: RoleLayoutV2, space: tuple) -> tuple:
@@ -324,7 +357,7 @@ class Own(RoleLayoutV2):
     def __post_init__(self) -> None:
         object.__setattr__(self, "split", _split(self.split, "an owned layout"))
 
-    def resolve(self, site: Any) -> RoleLayoutV2:
+    def resolve(self, site: BufferSite) -> RoleLayoutV2:
         return dataclasses.replace(self, split=site.split)
 
     def pieces(self, size: int, ranks: int, rank: int) -> tuple[Piece, ...]:
@@ -350,8 +383,9 @@ class Sectioned(RoleLayoutV2):
         dtype: The type of the elements by name, or None.
 
     Raises:
-        ValueError: If there is no section, a section is not a positive integer, or split is empty
-            or names a dimension twice or one outside ``GRID_DIMENSIONS``.
+        ValueError: If there is no section, a section is not a positive integer, split is empty or
+            names a dimension twice or one outside ``GRID_DIMENSIONS``, or the element type is
+            neither a name nor a torch type.
     """
 
     name: ClassVar[str] = "sectioned"
@@ -367,7 +401,7 @@ class Sectioned(RoleLayoutV2):
         object.__setattr__(self, "split", _split(self.split, "a sectioned layout"))
         _dtype(self)
 
-    def resolve(self, site: Any) -> RoleLayoutV2:
+    def resolve(self, site: BufferSite) -> RoleLayoutV2:
         return dataclasses.replace(self, split=site.split)
 
     def check(self, size: int) -> None:
@@ -422,8 +456,9 @@ class ByHead(RoleLayoutV2):
         dtype: The type of the elements by name, or None.
 
     Raises:
-        ValueError: If a count is not a positive integer, or split is empty or names a dimension
-            twice or one outside ``GRID_DIMENSIONS``.
+        ValueError: If a count is not a positive integer, ``token_major`` is not a bool, split is
+            empty or names a dimension twice or one outside ``GRID_DIMENSIONS``, or the element
+            type is neither a name nor a torch type.
     """
 
     name: ClassVar[str] = "by_head"
@@ -435,14 +470,15 @@ class ByHead(RoleLayoutV2):
     dtype: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "token_major", bool(self.token_major))
+        if not isinstance(self.token_major, bool):
+            raise ValueError(f"token_major must be a bool, got {self.token_major!r}")
         for name in ("head_bytes", "total", "tokens"):
             if getattr(self, name) is not None:
                 object.__setattr__(self, name, _integer(getattr(self, name), name, 1))
         object.__setattr__(self, "split", _split(self.split, "a head split"))
         _dtype(self)
 
-    def resolve(self, site: Any) -> RoleLayoutV2:
+    def resolve(self, site: BufferSite) -> RoleLayoutV2:
         head_bytes, total = self.head_bytes, self.total
         if head_bytes is None and not site.state:
             kv_heads, kv_total = site.kv_heads
@@ -530,7 +566,8 @@ class RingSlots(RoleLayoutV2):
         dtype: The type of the elements by name, or None.
 
     Raises:
-        ValueError: If slots is not a positive integer.
+        ValueError: If slots is not a positive integer, or the element type is neither a name
+            nor a torch type.
     """
 
     name: ClassVar[str] = "ring"
@@ -557,7 +594,7 @@ class RingSlots(RoleLayoutV2):
         written = min(end, first + tokens_per_page)
         return range(max(first, written - self.slots), written)
 
-    def index_of(self, positions, tokens_per_page: int):
+    def index_of(self, positions: _Positions, tokens_per_page: int) -> _Positions:
         return positions % self.slots
 
     def stride(self, size: int) -> int:
@@ -629,32 +666,3 @@ class RankTopology:
                 raise ValueError(f"{name} rank {rank} of {size}")
             object.__setattr__(self, f"{name}_size", size)
             object.__setattr__(self, f"{name}_rank", rank)
-
-    @classmethod
-    def unchecked(
-        cls,
-        tp_size: int = 1,
-        tp_rank: int = 0,
-        pp_size: int = 1,
-        pp_rank: int = 0,
-        cp_size: int = 1,
-        cp_rank: int = 0,
-        dp_size: int = 1,
-        dp_rank: int = 0,
-        attention_dp: bool = False,
-    ) -> RankTopology:
-        """The constructor's topology of these values, without its checks and conversions, for
-        values already checked."""
-        topology = object.__new__(cls)
-        topology.__dict__.update(
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            pp_size=pp_size,
-            pp_rank=pp_rank,
-            cp_size=cp_size,
-            cp_rank=cp_rank,
-            dp_size=dp_size,
-            dp_rank=dp_rank,
-            attention_dp=attention_dp,
-        )
-        return topology
