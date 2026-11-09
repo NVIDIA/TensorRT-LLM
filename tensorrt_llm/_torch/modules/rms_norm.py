@@ -15,7 +15,7 @@
 
 import enum
 from types import EllipsisType  # https://stackoverflow.com/a/66636313
-from typing import Optional, Tuple, TypeAlias, Union, cast
+from typing import NamedTuple, Optional, Tuple, TypeAlias, Union, cast
 
 import torch
 from torch import nn
@@ -39,6 +39,14 @@ _WS_MAX_N = 16384
 # Measured at N=7168 on GB200 (ws first overtakes at M=4096, ~6% faster;
 # M<=3072 favors reduce_fusion).
 _WS_M_THRESHOLD = 4096
+
+
+class Fp8NormOutput(NamedTuple):
+    """A norm's output with its E4M3 copy at the static input scale of the FP8
+    Linear it feeds."""
+
+    fp8: torch.Tensor
+    hidden_states: torch.Tensor
 
 
 class RMSNorm(nn.Module):
@@ -116,7 +124,7 @@ class RMSNorm(nn.Module):
         # carries the BF16/FP16 normed output.
         self.fp8_per_token_out = False
         # Static FP8 input scale of the Linear this norm feeds, attached by the
-        # model. When set, the residual path returns ((fp8, output), residual).
+        # model. When set, the residual path returns (Fp8NormOutput, residual).
         self.fp8_scale: Optional[torch.Tensor] = None
 
     def forward(
@@ -129,8 +137,8 @@ class RMSNorm(nn.Module):
         return_norm_out: bool = False,
     ) -> Union[torch.Tensor, Fp4QuantizedTensor, Tuple[Union[
             torch.Tensor, Fp4QuantizedTensor], Optional[torch.Tensor]], Tuple[
-                Fp4QuantizedTensor, torch.Tensor, torch.Tensor], Tuple[Tuple[
-                    torch.Tensor, torch.Tensor], torch.Tensor]]:
+                Fp4QuantizedTensor, torch.Tensor, torch.Tensor], Tuple[
+                    Fp8NormOutput, torch.Tensor]]:
         has_residual = residual is not self._ARGUMENT_NOT_SPECIFIED_SENTINEL
         if not has_residual:
             residual = None
@@ -169,7 +177,7 @@ class RMSNorm(nn.Module):
             fp8 = add_rmsnorm_fp8_quant(hidden_states, residual, self.weight,
                                         self.fp8_scale, self.variance_epsilon,
                                         self.use_gemma)
-            return (fp8, hidden_states), residual
+            return Fp8NormOutput(fp8, hidden_states), residual
 
         if self.return_hp_output:
             raise ValueError(
