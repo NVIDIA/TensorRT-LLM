@@ -296,6 +296,9 @@ def _get_index_mode(attn_type: DeepseekV4AttentionType) -> PageIndexMode:
 
 class DeepseekV4CacheManager(KVCacheManagerV2):
     _supports_reuse_match_backoff = False
+    # Page tables of bound pools are translated in _init_page_index_bindings /
+    # _refresh_page_index_bindings.
+    _translates_bound_pools = True
 
     # This tensor is for compatibility with AttentionOp, it only contains swa attention.
     # kv_cache_pool_pointers contains one virtual attention-op pool per local

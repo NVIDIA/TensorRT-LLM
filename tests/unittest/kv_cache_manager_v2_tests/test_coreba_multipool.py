@@ -330,6 +330,44 @@ class TestCopyBasedRebalancingMultiPool(unittest.TestCase):
         finally:
             arena.close()
 
+    def test_bound_pools_reported(self):
+        """bound_pool_ids finds the pools that need get_page_index_bindings; the PyTorch KV cache
+        manager rejects copy-based rebalancing when they exist and the model's cache manager does
+        not translate them."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+            KVCacheManagerV2,
+            bound_pool_ids,
+        )
+
+        self.assertFalse(KVCacheManagerV2._translates_bound_pools)
+        arena = _Arena(ratio=[0.4, 0.6])
+        try:
+            self.assertEqual(
+                sorted(bound_pool_ids(arena.mgr)), sorted((lc, 1) for lc in arena.lcs.values())
+            )
+        finally:
+            arena.close()
+        # The same layers without copy-based rebalancing: one VMM pool per buffer size, no bindings.
+        layers = [
+            kvm.AttentionLayerConfig(
+                layer_id=layer,
+                buffers=[kvm.BufferConfig(role=role, size=size) for role, size in buffers.items()],
+                sliding_window_size=SWA_WINDOW if layer == SWA_LAYER else None,
+            )
+            for layer, buffers in BUFFERS.items()
+        ]
+        mgr = kvm.KVCacheManager(
+            kvm.KVCacheManagerConfig(
+                tokens_per_block=TOKENS_PER_BLOCK,
+                cache_tiers=[kvm.GpuCacheTierConfig(quota=QUOTA)],
+                layers=layers,
+            )
+        )
+        try:
+            self.assertEqual(bound_pool_ids(mgr), [])
+        finally:
+            mgr.shutdown()
+
     def test_rebalance_suspended(self):
         self._run(in_place=False)
 
