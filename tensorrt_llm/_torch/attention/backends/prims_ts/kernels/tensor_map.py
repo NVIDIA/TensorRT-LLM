@@ -22,6 +22,7 @@ orchestrate DSL/IR-level work and delegate to the tensor-map primitives in
 from typing import Sequence, Tuple, Type
 
 import cutlass.cute as cute
+from cutlass import Pointer, Uint64
 from cutlass.cute import depth, leading_dim
 from cutlass.cute.testing import assert_ as runtime_assert
 from cutlass.cutlass_dsl import (
@@ -280,6 +281,7 @@ def create_tensor_map_ragged_from_tensor(
     swizzle: TensorMapSwizzle | None = None,
     l2_promotion: TensorMapL2Promotion | None = None,
     oob_fill: TensorMapFloatOOBFill | None = None,
+    use_blackwell_tma_oob_workaround: bool = False,
     tma_format: TensorMapDataType | None = None,
     loc=None,
     ip=None,
@@ -316,6 +318,8 @@ def create_tensor_map_ragged_from_tensor(
     :param l2_promotion: L2 promotion hint, defaults to ``none``.
     :param oob_fill: OOB fill mode; see
         :func:`create_tensor_map_ragged` for the format-aware default.
+    :param use_blackwell_tma_oob_workaround: Disable speculative OOB addressing
+        when the ragged view cannot establish a mapped 128 KiB prefix.
     :param tma_format: Override the element data type, defaults to
         auto-detect from ``tensor.element_type``.
     :raises ValueError: For unsupported rank (``R ∉ {2, 3}``),
@@ -418,7 +422,7 @@ def create_tensor_map_ragged_from_tensor(
         else get_dsl_type_to_tensormap_type(tensor.element_type)
     )
 
-    return create_tensor_map_ragged(
+    descriptor = create_tensor_map_ragged(
         global_address=tensor.iterator.toint(),
         tma_format=fmt,
         global_dims=tma_dims,
@@ -432,6 +436,11 @@ def create_tensor_map_ragged_from_tensor(
         loc=loc,
         ip=ip,
     )
+    if use_blackwell_tma_oob_workaround:
+        # Match context's Blackwell descriptor-bit-85 workaround for short views.
+        word = Pointer(descriptor.get_ptr(), dtype=Uint64) + 1
+        word.store(word.load() & ~Uint64(1 << 21))
+    return descriptor
 
 
 def transform_ragged_coords(
