@@ -19,6 +19,7 @@ import yaml
 
 from agent_flow.trtllm_wiki import accuracy, cli, config, env, features, modeling_v2, pack, recipes
 from agent_flow.trtllm_wiki import tests as test_lists
+from agent_flow.trtllm_wiki.changes import diff_packs
 from agent_flow.trtllm_wiki.query import Wiki
 from agent_flow.workflows.trtllm_modeling_v2 import cli as flow_cli
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import bootstrap
@@ -93,7 +94,11 @@ def _checkout(root: Path) -> Path:
         family / "routing.py", '@routes("ToyForConditionalGeneration")\ndef route(c, a, cc): ...\n'
     )
     target = family / "toy_fp8__sm_100__tp4"
-    _write(target / "modeling.py", "class ModelingV2ToyFp8Sm100Tp4: ...\n")
+    _write(
+        target / "modeling.py",
+        "from ....catalog.norm.rms import RmsNorm\nfrom .ops.moe.router import Router\n\n"
+        "class ModelingV2ToyFp8Sm100Tp4: ...\n",
+    )
     _write(target / "ops" / "moe" / "router.py", _OP.format(name="Router", call="toy_router"))
     _write(root / _MV2 / "catalog" / "norm" / "rms.py", _OP.format(name="RmsNorm", call="rms_norm"))
     _write(
@@ -102,7 +107,7 @@ def _checkout(root: Path) -> Path:
     )
     _write(
         root / modeling_v2.MV2_ACCURACY_TESTS_REL / "test_toy_vl.py",
-        "class TestToy:\n    def test_gsm8k(self): ...\n",
+        'class TestToy:\n    MODEL_NAME = "org/Toy"\n\n    def test_gsm8k(self): ...\n',
     )
     lists = {
         "l0_b200": [
@@ -201,7 +206,7 @@ def test_families_targets_and_ops_are_read_from_source(tmp_path):
     (target,) = family["targets"]
     assert (target["checkpoint"], target["sm"], target["parallel"]) == ("toy_fp8", "sm_100", "tp4")
     assert family["accuracy_tests"]["classes"] == [
-        {"name": "TestToy", "line": 1, "tests": ["test_gsm8k"]}
+        {"name": "TestToy", "line": 1, "tests": ["test_gsm8k"], "model": "org/Toy"}
     ]
     ops = {op["name"]: op for op in modeling_v2.extract_ops(repo)}
     assert (ops["Router"]["scope"], ops["Router"]["target"], ops["Router"]["category"]) == (
@@ -215,6 +220,9 @@ def test_families_targets_and_ops_are_read_from_source(tmp_path):
         f"{modeling_v2.MODELING_V2_TESTS_REL}/norm/test_modeling_v2_rms.py"
     ]
     assert ops["Router"]["tests"] == []
+    # The target that imports an operation uses it, wherever the operation lives.
+    used = [f"{_MV2}/models/toy_vl/toy_fp8__sm_100__tp4"]
+    assert ops["Router"]["used_by"] == used and ops["RmsNorm"]["used_by"] == used
 
 
 def test_a_list_runs_a_test_by_node_file_or_directory_never_by_a_similar_name(tmp_path):
@@ -265,14 +273,22 @@ def test_accuracy_recipes_and_environment_are_indexed(tmp_path):
     ]
 
 
+def _commit(repo: Path) -> str:
+    if not (repo / ".git").exists():
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c"],
+        check=True,
+    )
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
 def test_a_pack_is_reused_until_the_checkout_changes_and_the_cli_answers_from_it(tmp_path, capsys):
     repo = _checkout(tmp_path / "repo")
-    for args in (
-        ["init", "-q"],
-        ["add", "-A"],
-        ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c"],
-    ):
-        subprocess.run(["git", "-C", str(repo), *args], check=True)
+    _commit(repo)
     out = tmp_path / "ws" / "wiki"
     manifest, rebuilt = pack.ensure(repo, out)
     assert rebuilt and manifest["counts"]["families"] == 1 and "ci_stages" in manifest["empty"]
@@ -310,6 +326,73 @@ def test_a_pack_is_reused_until_the_checkout_changes_and_the_cli_answers_from_it
     assert "reused" in bootstrap._take_wiki(workflow)
     assert flow_cli._wiki(["family", "toy_vl", "--workspace", str(tmp_path / "ws")]) == 0
     assert "toy_fp8__sm_100__tp4" in capsys.readouterr().out
+
+
+def test_what_changed_since_a_commit_is_scoped_to_the_target_and_written_when_the_run_resumes(
+    tmp_path, capsys
+):
+    repo = _checkout(tmp_path / "repo")
+    before = _commit(repo)
+    workspace = tmp_path / "ws"
+    workflow = SimpleNamespace(task_data={"trtllm_repo_path": str(repo)}, workspace=workspace)
+    target = f"{_MV2}/models/toy_vl/toy_fp8__sm_100__tp4"
+    assert "built in" in bootstrap._take_wiki(workflow, target)
+
+    schema = json.loads((repo / config.SERVE_SCHEMA_REL).read_text())
+    schema["properties"]["max_seq_len"] = {"type": "integer"}
+    (repo / config.SERVE_SCHEMA_REL).write_text(json.dumps(schema))
+    _write(
+        repo / _MV2 / "models/toy_vl/toy_fp8__sm_100__tp4/ops/moe/gate.py",
+        _OP.format(name="Gate", call="gate"),
+    )
+    other = repo / _MV2 / "models" / "other"
+    _write(other / "routing.py", '@routes("OtherForCausalLM")\ndef route(): ...\n')
+    _write(other / "ops" / "mix.py", _OP.format(name="Mix", call="mix"))
+    _write(
+        repo / accuracy.REFERENCES_REL / "gsm8k.yaml",
+        yaml.safe_dump({"org/Toy": [{"accuracy": 92.5}]}),
+    )
+    after = _commit(repo)
+
+    old = tmp_path / "old"
+    assert pack.build_at(repo, before, old)["commit"] == before
+    assert (
+        pack.build_at(repo, before[:10], old)["build_s"] == Wiki(old).manifest["build_s"]
+    )  # cached
+    new = tmp_path / "new"
+    pack.ensure(repo, new)
+    scoped = diff_packs(Wiki(old), Wiki(new), target="toy_vl/toy_fp8__sm_100__tp4")
+    assert [f["path"] for f in scoped["fields"]["added"]] == ["max_seq_len"]
+    assert [op["name"] for op in scoped["ops"]["added"]] == ["Gate"]
+    assert scoped["families"] == []  # the other family is out of scope
+    assert scoped["references"] == [
+        {
+            "benchmark": "gsm8k",
+            "model": "org/Toy",
+            "old": [{"accuracy": 91.0}],
+            "new": [{"accuracy": 92.5}],
+        }
+    ]
+    whole = diff_packs(Wiki(old), Wiki(new))
+    assert {op["name"] for op in whole["ops"]["added"]} == {"Gate", "Mix"}
+    assert whole["families"] == [{"family": "other", "status": "added"}]
+    with pytest.raises(ValueError, match="no target"):
+        diff_packs(Wiki(old), Wiki(new), target="toy_vl/missing")
+
+    argv = ["--pack", str(new), "changes", "--since", before, "--target", "toy_fp8__sm_100__tp4"]
+    assert cli.main(argv) == 0
+    text = capsys.readouterr().out
+    assert (
+        f"changes {before[:12]} -> {after[:12]}" in text and "+ Gate" in text and "Mix" not in text
+    )
+    assert (tmp_path / f"new-at-{before[:12]}" / "manifest.json").is_file()
+
+    # A resumed run on the moved checkout keeps the previous pack and says what changed.
+    note = bootstrap._take_wiki(workflow, target)
+    assert "the checkout moved" in note and "`wiki/changes.md`" in note
+    assert Wiki(workspace / "wiki-previous").manifest["commit"] == before
+    assert "+ Gate" in (workspace / "wiki" / "changes.md").read_text()
+    assert "moved" not in bootstrap._take_wiki(workflow, target)
 
 
 @pytest.mark.skipif(

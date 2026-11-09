@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -673,13 +674,17 @@ def _take_tree_map(workflow) -> str:
 
 #: The checkout's wiki pack (:mod:`agent_flow.trtllm_wiki`): facts every role can look up.
 WIKI_DIRNAME = "wiki"
+WIKI_PREVIOUS_DIRNAME = "wiki-previous"
 
 
-def _take_wiki(workflow) -> str:
+def _take_wiki(workflow, target: str = "") -> str:
     """Build (or reuse) ``wiki/`` in the workspace for the checkout under test.
 
     The pack is keyed by the checkout's commit and uncommitted state, so a
-    resumed run on an unchanged tree reuses it. Returns a line for the journal.
+    resumed run on an unchanged tree reuses it. When the checkout moved to
+    another commit since the pack was built, the previous pack is kept in
+    ``wiki-previous/`` and what changed for ``target`` is written to
+    ``wiki/changes.md``. Returns a line for the journal.
     **Never fatal**: a checkout it cannot read leaves no pack.
     """
     from agent_flow.trtllm_wiki import pack as wiki_pack
@@ -687,8 +692,11 @@ def _take_wiki(workflow) -> str:
     repo = workflow.task_data.get("trtllm_repo_path")
     if not repo:
         return ""
+    out = workflow.workspace / WIKI_DIRNAME
+    previous = workflow.workspace / WIKI_PREVIOUS_DIRNAME
     try:
-        manifest, rebuilt = wiki_pack.ensure(Path(str(repo)), workflow.workspace / WIKI_DIRNAME)
+        moved = _set_aside_moved_pack(Path(str(repo)), out, previous)
+        manifest, rebuilt = wiki_pack.ensure(Path(str(repo)), out)
     except (OSError, ValueError) as exc:
         return f"wiki: not built ({exc})"
     counts = manifest["counts"]
@@ -698,7 +706,44 @@ def _take_wiki(workflow) -> str:
     )
     how = f"built in {manifest['build_s']} s" if rebuilt else "reused"
     empty = f"; empty: {', '.join(manifest['empty'])}" if manifest["empty"] else ""
-    return f"wiki ({summary}; {how}{empty}): `{WIKI_DIRNAME}/index.md`"
+    note = f"wiki ({summary}; {how}{empty}): `{WIKI_DIRNAME}/index.md`"
+    if moved:
+        note += "\n\n" + _write_wiki_changes(previous, out, target)
+    return note
+
+
+def _set_aside_moved_pack(repo: Path, out: Path, previous: Path) -> bool:
+    """Move the pack in ``out`` to ``previous`` when the checkout is now at another commit."""
+    from agent_flow.trtllm_wiki import pack as wiki_pack
+
+    manifest = wiki_pack.read_manifest(out)
+    if not manifest or manifest.get("schema") != wiki_pack.WIKI_SCHEMA:
+        return False
+    if manifest.get("commit") == wiki_pack.source_state(repo)["commit"]:
+        return False
+    shutil.rmtree(previous, ignore_errors=True)
+    out.rename(previous)
+    return True
+
+
+def _write_wiki_changes(previous: Path, out: Path, target: str) -> str:
+    """Write ``changes.md`` in ``out`` (what changed since ``previous``) and return a journal line."""
+    from agent_flow.trtllm_wiki.changes import diff_packs, render_changes
+    from agent_flow.trtllm_wiki.query import Wiki
+
+    old, new = Wiki(previous), Wiki(out)
+    try:
+        diff = diff_packs(old, new, target=target or None)
+    except ValueError:
+        # A target neither checkout holds yet: every change may concern it.
+        diff = diff_packs(old, new)
+    (out / "changes.md").write_text(
+        "# What changed in the checkout since the previous session\n\n"
+        f"```text\n{render_changes(diff, limit=40)}```\n",
+        encoding="utf-8",
+    )
+    span = f"{old.manifest['commit'][:12]} -> {new.manifest['commit'][:12]}"
+    return f"wiki: the checkout moved ({span}); what changed for this target: `{WIKI_DIRNAME}/changes.md`"
 
 
 def _take_survey(workflow, result, log) -> None:
@@ -720,7 +765,7 @@ def _take_survey(workflow, result, log) -> None:
     write_surface_file(workflow.workspace / "surface.md", inventory, rank=rank)
     _take_prior_art(workflow, config)
     tree_note = "\n\n".join(
-        note for note in (_take_tree_map(workflow), _take_wiki(workflow)) if note
+        note for note in (_take_tree_map(workflow), _take_wiki(workflow, result.target_rel)) if note
     )
 
     headline = (

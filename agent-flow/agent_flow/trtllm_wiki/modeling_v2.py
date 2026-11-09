@@ -101,7 +101,20 @@ def _accuracy_tests(repo: Path, family: str) -> dict[str, Any]:
                 if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and m.name.startswith("test_")
             ]
-            classes.append({"name": node.name, "line": node.lineno, "tests": methods})
+            model = next(
+                (
+                    item.value.value
+                    for item in node.body
+                    if isinstance(item, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "MODEL_NAME" for t in item.targets)
+                    and isinstance(item.value, ast.Constant)
+                    and isinstance(item.value.value, str)
+                ),
+                "",
+            )
+            classes.append(
+                {"name": node.name, "line": node.lineno, "tests": methods, "model": model}
+            )
     return {"path": _rel(repo, path), "classes": classes}
 
 
@@ -229,8 +242,49 @@ def _op_records(repo: Path, path: Path, package: Path) -> Iterable[dict[str, Any
         }
 
 
+def _imported_modules(repo: Path, path: Path) -> set[str]:
+    """The dotted modules (and ``module.name`` of each ``from`` import) the file at ``path`` imports."""
+    tree = _parse(path)
+    if tree is None:
+        return set()
+    module = _rel(repo, path)[: -len(".py")].replace("/", ".")
+    package = (
+        module[: -len(".__init__")] if module.endswith(".__init__") else module.rpartition(".")[0]
+    )
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                parts = package.split(".")
+                parts = parts[: len(parts) - (node.level - 1)]
+                base = ".".join([*parts, node.module] if node.module else parts)
+            else:
+                base = node.module or ""
+            found.add(base)
+            found.update(f"{base}.{alias.name}" for alias in node.names)
+    return found
+
+
+def _target_imports(repo: Path) -> dict[str, set[str]]:
+    """Target path -> every module its files import."""
+    models = repo / MODELING_V2_REL / "models"
+    imports: dict[str, set[str]] = {}
+    for modeling in sorted(models.glob("*/*/modeling.py")):
+        target = modeling.parent
+        imports[_rel(repo, target)] = set().union(
+            *(_imported_modules(repo, py) for py in sorted(target.rglob("*.py")))
+        )
+    return imports
+
+
 def extract_ops(repo: Path) -> list[dict[str, Any]]:
-    """Every ``OpWrapper`` class in the package, with the unit tests that name it."""
+    """Every ``OpWrapper`` class in the package.
+
+    Each carries the unit tests that name it and the targets whose files import it
+    (``used_by``).
+    """
     repo = Path(repo)
     package = repo / MODELING_V2_REL
     files = [*package.glob("catalog/*/**/*.py"), *package.glob("models/*/**/*.py")]
@@ -246,8 +300,12 @@ def extract_ops(repo: Path) -> list[dict[str, Any]]:
             texts[_rel(repo, test)] = test.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
+    target_imports = _target_imports(repo)
     for op in ops:
         module = op["module"]
+        op["used_by"] = sorted(
+            target for target, imported in target_imports.items() if module in imported
+        )
         stem = module.rsplit(".", 1)[1]
         op["tests"] = [
             rel

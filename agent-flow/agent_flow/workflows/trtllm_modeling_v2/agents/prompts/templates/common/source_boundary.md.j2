@@ -22,7 +22,9 @@ what it defined by name (`git grep`), and trust the tree over any prompt.
 file and line: LLM API fields and defaults, ModelingV2 families and ops, the
 CI lists that run a test, accuracy references and shipped serving configs.
 Ask it before a broad search: `trtllm-modeling-v2 wiki --workspace <workspace>
-feature|field|family|op|ci|accuracy|recipe <question>`.
+feature|field|family|op|ci|accuracy|recipe <question>`. `wiki/changes.md`, when
+it exists, lists what changed for this target since the checkout's previous
+commit: read it before reusing anything an earlier session found.
 - **Other inference engines** (vLLM, SGLang, ...), from a checkout, an
   installed package or the web where you have one: often the first to serve
   a new architecture, so their model, kernel and deployment code is a map of

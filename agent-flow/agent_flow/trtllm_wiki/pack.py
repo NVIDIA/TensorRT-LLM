@@ -19,9 +19,12 @@ the facts of the tree it now runs on.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import subprocess
+import tarfile
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -93,8 +96,12 @@ def _count(value: Any) -> int:
     return len(value) if isinstance(value, (list, dict)) else 0
 
 
-def build(repo: Path, out: Path) -> dict[str, Any]:
-    """Extract every fact of ``repo`` into ``out`` and return the manifest."""
+def build(repo: Path, out: Path, *, state: dict[str, str] | None = None) -> dict[str, Any]:
+    """Extract every fact of ``repo`` into ``out`` and return the manifest.
+
+    ``state`` (``repo``, ``commit``, ``dirty``) names the checkout state the files in
+    ``repo`` stand for, when they were materialized from a commit (:func:`build_at`).
+    """
     from .render import render_index
 
     repo, out = Path(repo).resolve(), Path(out)
@@ -110,6 +117,7 @@ def build(repo: Path, out: Path) -> dict[str, Any]:
         "schema": WIKI_SCHEMA,
         "repo": str(repo),
         **source_state(repo),
+        **(state or {}),
         "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "build_s": round(time.monotonic() - started, 2),
         "counts": counts,
@@ -120,6 +128,66 @@ def build(repo: Path, out: Path) -> dict[str, Any]:
 
     (out / "index.md").write_text(render_index(Wiki(out)), encoding="utf-8")
     return manifest
+
+
+#: What a pack is extracted from, by suffix, under :data:`SOURCE_ROOTS`.
+_SOURCE_SUFFIXES = (
+    ".py",
+    ".json",
+    ".yml",
+    ".yaml",
+    ".txt",
+    ".groovy",
+    ".cpp",
+    ".cc",
+    ".cu",
+    ".cuh",
+    ".h",
+)
+
+
+def _materialize(repo: Path, commit: str, into: Path) -> None:
+    """Write the files a pack is extracted from, as they are at ``commit``, under ``into``."""
+    listed = _git(repo, "ls-tree", "-r", "-z", "--name-only", commit, "--", *SOURCE_ROOTS)
+    paths = [p for p in listed.split("\0") if p.endswith(_SOURCE_SUFFIXES)]
+    if not paths:
+        raise ValueError(f"{repo} has no sources at {commit!r}")
+    for start in range(0, len(paths), 400):
+        archive = subprocess.run(
+            ["git", "-C", str(repo), "archive", commit, "--", *paths[start : start + 400]],
+            capture_output=True,
+            timeout=600,
+            check=False,
+        )
+        if archive.returncode != 0:
+            raise ValueError(
+                f"git archive {commit} failed: {archive.stderr.decode(errors='replace')[-300:]}"
+            )
+        with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tar:
+            # The archive is this repository's own; the data filter still refuses links out of it.
+            safe = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+            tar.extractall(into, **safe)
+
+
+def resolve_commit(repo: Path, ref: str) -> str:
+    """The full commit ``ref`` names in ``repo``; ``ValueError`` when it names none."""
+    full = _git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}").strip()
+    if not full:
+        raise ValueError(f"{repo} has no commit {ref!r}")
+    return full
+
+
+def build_at(repo: Path, commit: str, out: Path) -> dict[str, Any]:
+    """Build the pack of ``repo`` as it is at ``commit`` (its sources read with ``git archive``)."""
+    full = resolve_commit(repo, commit)
+    manifest = read_manifest(out)
+    if manifest and manifest.get("schema") == WIKI_SCHEMA and manifest.get("commit") == full:
+        return manifest
+    with tempfile.TemporaryDirectory(prefix="trtllm-wiki-") as tmp:
+        _materialize(Path(repo), full, Path(tmp))
+        return build(
+            Path(tmp), out, state={"repo": str(Path(repo).resolve()), "commit": full, "dirty": ""}
+        )
 
 
 def read_manifest(out: Path) -> dict[str, Any] | None:

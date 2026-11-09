@@ -28,6 +28,7 @@ import yaml
 
 from . import pack as pack_mod
 from . import render
+from .changes import diff_packs, render_changes
 from .query import Wiki
 
 NOT_FOUND = 4
@@ -68,6 +69,12 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "validate", help="fields an options YAML names that the schema does not"
     ).add_argument("options", type=Path)
+    changes = sub.add_parser("changes", help="what changed since an older pack or commit")
+    older = changes.add_mutually_exclusive_group(required=True)
+    older.add_argument("--since", help="a commit of the checkout the pack was built from")
+    older.add_argument("--from", dest="old_pack", type=Path, help="an older pack directory")
+    changes.add_argument("--target", default="", help="keep what concerns this ModelingV2 target")
+    changes.add_argument("--limit", type=int, default=15, help="items shown per list")
     return parser
 
 
@@ -141,7 +148,22 @@ def _answer(wiki: Wiki, args: argparse.Namespace) -> tuple[Any, str]:
         unknown = wiki.unknown_fields(options)
         text = "\n".join(f"not a field: {p}" for p in unknown) or "every field is declared"
         return {"unknown": unknown}, text
+    if command == "changes":
+        try:
+            old = Wiki(args.old_pack) if args.old_pack else _pack_at(wiki, args.since)
+            diff = diff_packs(old, wiki, target=args.target or None)
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"trtllm-wiki changes: {exc}") from exc
+        return diff, render_changes(diff, limit=args.limit)
     raise SystemExit(f"trtllm-wiki: unknown command {command}")
+
+
+def _pack_at(wiki: Wiki, ref: str) -> Wiki:
+    """The pack of ``wiki``'s checkout at ``ref``, kept beside ``wiki`` (``<pack>-at-<commit>``)."""
+    commit = pack_mod.resolve_commit(wiki.repo, ref)
+    out = wiki.path.parent / f"{wiki.path.name}-at-{commit[:12]}"
+    pack_mod.build_at(wiki.repo, commit, out)
+    return Wiki(out)
 
 
 def main(argv: list[str] | None = None) -> int:

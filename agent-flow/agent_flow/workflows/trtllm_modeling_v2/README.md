@@ -113,7 +113,9 @@ must change before that.
    feature; a member is a parallel configuration; their pairing defines a coverage cell. Preflight
    builds `wiki/` in the workspace from the checkout ([`agent_flow.trtllm_wiki`](../../trtllm_wiki)):
    the LLM API fields every option is held to, the family that routes the checkpoint, and the
-   facts roles look up with `trtllm-modeling-v2 wiki --workspace <ws> <question>`.
+   facts roles look up with `trtllm-modeling-v2 wiki --workspace <ws> <question>`. A run resumed
+   after the checkout moved to another commit keeps the previous pack in `wiki-previous/` and
+   writes what changed for its target to `wiki/changes.md`.
 2. **Plan and execute:** the planner proposes a dependency graph; Python admits and schedules it.
    Workers use separate worktrees. Kernel tasks certify or add operators; assemblers build the
    target. Commits are audited and integrated; shared-code changes require regression coverage.

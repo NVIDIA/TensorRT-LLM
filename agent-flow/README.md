@@ -175,6 +175,9 @@ wrappers, the test lists that run each test, accuracy tasks and references,
 the serving configs the tree ships, and the environment variables it reads.
 `trtllm-wiki --repo <checkout> feature reuse` (or `field`, `family`, `op`,
 `ci`, `accuracy`, `recipe`, `env`, `validate`) answers from it;
+`trtllm-wiki --repo <checkout> changes --since <commit> [--target <family/target>]`
+lists what changed between two commits (fields, family targets, the operations
+a target uses, test lists, waives, references, serving configs).
 `trtllm_modeling_v2` builds one into each run's workspace.
 
 The `agent-team` / `modeling-bringup` pipeline:

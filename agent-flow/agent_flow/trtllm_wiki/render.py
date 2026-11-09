@@ -19,6 +19,8 @@ trtllm-wiki --pack <dir> accuracy <task|model>    task parameters and reference 
 trtllm-wiki --pack <dir> recipe [text] [--gpu G] [--gpus N] [--isl I] [--osl O] [--concurrency C]
 trtllm-wiki --pack <dir> env [text]               TLLM_/TRTLLM_ variables and where they are read
 trtllm-wiki --pack <dir> validate <options.yaml>  fields the schema does not declare
+trtllm-wiki --pack <dir> changes --since <commit> [--target <family/target>]
+                                                  what changed since a commit, for one target
 """
 
 
