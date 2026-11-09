@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import math
 import zlib
-from collections.abc import Iterator
 from types import SimpleNamespace
 
 import pytest
@@ -50,13 +49,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nv
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _limit_cpu_threads() -> Iterator[None]:
-    """Leave torch's CPU thread count alone. Lowering it to 2 and restoring it afterwards made the
-    next wide CPU OpenMP op in the same process segfault (NGC PyTorch 26.09, libgomp + MKL)."""
-    yield
 
 
 _LAYOUTS = sorted(routing._DEFAULT_LAYOUTS)
