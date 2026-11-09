@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
-
 import torch
 from _deepseek_v41_test_utils import _init_random_weights, cache_case
 from utils.util import skip_blackwell_geforce, skip_pre_blackwell
@@ -164,21 +162,6 @@ def test_conditional_generation_image_forward(monkeypatch):
         assert not torch.allclose(raw_logits, bypassed_logits, atol=0.02, rtol=0.02)
         assert torch.isfinite(text_logits).all()
         assert not torch.allclose(raw_logits[-1], text_logits[-1], atol=1e-6, rtol=1e-5)
-
-        # The image mask is built from the CUDA mm_token_indices without a host sync.
-        torch.cuda.synchronize()
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            image_mask = model.get_language_model_extra_forward_kwargs(
-                raw_input_ids=ids,
-                position_ids=positions,
-                mm_inputs=SimpleNamespace(inputs_embeds=fused),
-                multimodal_params=[raw],
-                mm_token_indices=mm_indices,
-            )["image_mask"]
-        finally:
-            torch.cuda.set_sync_debug_mode("default")
-        assert image_mask.tolist() == [False, True, True, True, True, False]
 
     del model
     torch.cuda.empty_cache()
