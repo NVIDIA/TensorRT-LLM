@@ -171,9 +171,9 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         slotGroups.push_back(std::move(var));
     }
 
-    // Distinct reuse policies need separate GPU pools and eviction queues; SINK_REQUIRED_ONLY shares the REQUIRED
-    // ones (see poolReusePolicy). Keying on per-pool sparsity too keeps a shared pool uniformly host-backed or
-    // device-backed.
+    // Distinct reuse policies need separate GPU pools and eviction queues, except that SINK_REQUIRED_ONLY shares the
+    // REQUIRED ones (poolReusePolicy explains why). Keying on per-pool sparsity too keeps a shared pool uniformly
+    // host-backed or device-backed.
     struct PoolGroupKey
     {
         ReusePolicy reusePolicy = ReusePolicy::REQUIRED;

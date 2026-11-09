@@ -135,8 +135,10 @@ inline bool allowsCheckpoint(LifeCycle const& lc)
     return reusePolicy(lc) == ReusePolicy::OPTIONAL || reusePolicy(lc) == ReusePolicy::SINK_REQUIRED_ONLY;
 }
 
-// Reuse policy that keys a lifecycle's pools. SINK_REQUIRED_ONLY pools with REQUIRED: the policy changes which pages a
-// prefix match requires, not where the pages live, and its pages already mix required sinks with an optional window.
+//! Reuse policy that decides which pools a lifecycle shares. SINK_REQUIRED_ONLY shares the REQUIRED pools, so its
+//! pages can be reached through the block offsets of a REQUIRED layer of the same page shape. This is safe: evicting
+//! a page has the same effect on reuse whichever pool holds it. OPTIONAL keeps its own pools, so the extra slot per
+//! request that pool sizing gives it (ratioFromBatch) is not used up by other lifecycles.
 inline ReusePolicy poolReusePolicy(LifeCycle const& lc)
 {
     auto const policy = reusePolicy(lc);

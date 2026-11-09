@@ -165,12 +165,11 @@ TEST(KvCacheManagerV2ConfigTest, SinkRequiredOnlyWindowsShareRequiredPools)
     auto const& full = attributes.at(BufferId{0, "key"});
     auto const& window = attributes.at(BufferId{1, "key"});
     auto const& optionalWindow = attributes.at(BufferId{2, "key"});
-    // Three life cycles of one page shape. SINK_REQUIRED_ONLY changes which pages a prefix match
-    // requires, not where pages live, so its window shares the REQUIRED layer's pool; OPTIONAL
-    // keeps its own.
+    // Three life cycles of one page shape: the SINK_REQUIRED_ONLY window shares the REQUIRED
+    // layer's pool group, and OPTIONAL keeps its own.
     EXPECT_EQ(storage.numLifeCycles(), LifeCycleId{3});
+    EXPECT_EQ(storage.slotDescList.size(), PoolGroupIndex{2});
     EXPECT_EQ(grouping[full.lifeCycleId], grouping[window.lifeCycleId]);
-    EXPECT_EQ(full.poolIndex, window.poolIndex);
     EXPECT_NE(grouping[full.lifeCycleId], grouping[optionalWindow.lifeCycleId]);
 }
 
