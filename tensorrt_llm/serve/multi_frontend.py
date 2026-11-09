@@ -26,6 +26,7 @@ import contextlib
 import math
 import os
 import tempfile
+import zlib
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -38,6 +39,9 @@ from tensorrt_llm.logger import logger
 LAUNCHER_UDS_NAME = "launcher.sock"
 LAUNCHER_UDS_ENV = "TLLM_SERVE_LAUNCHER_UDS"
 CLOCK_OFFSET_NAME = "clock_offset"
+# Every frontend serves its prefix-tokenization cache on this Unix socket when
+# tokenization is routed by conversation.
+_TOKENIZATION_UDS_NAME = "tokenize-{}.sock"
 
 # Launcher-owned routes. Attached frontends register them ahead of the local
 # handlers, which they shadow since FastAPI matches in registration order.
@@ -91,6 +95,22 @@ class MultiFrontendServing:
     @property
     def is_attached(self) -> bool:
         return not self.is_launcher
+
+
+def frontend_of_conversation(conversation_id: str, num_frontends: int) -> int:
+    """The frontend that serves conversation ``conversation_id``, the same in every process.
+
+    A disaggregated server sends the conversation's context requests to this
+    frontend's affinity port, and with tokenization routing this frontend
+    tokenizes its prompts, so both must use this mapping.
+    """
+    # Lone surrogates, which JSON can carry, must not fail the request.
+    return zlib.crc32(conversation_id.encode(errors="surrogatepass")) % num_frontends
+
+
+def tokenization_uds_path(ipc_dir: str, frontend_id: int) -> str:
+    """The Unix socket frontend ``frontend_id`` serves its tokenization cache on."""
+    return os.path.join(ipc_dir, _TOKENIZATION_UDS_NAME.format(frontend_id))
 
 
 class LauncherForwarder:
