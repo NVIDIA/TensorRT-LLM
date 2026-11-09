@@ -1216,6 +1216,8 @@ def resolve_scheduled_encoder_args(llm_args: TorchLlmArgs) -> TorchLlmArgs:
             "; the default torch_compile_config is dropped with it, so the model runs eagerly."
             if drops_compile
             else "; torch_compile_config still applies, without piecewise CUDA graphs."
+            if llm_args.torch_compile_config is not None
+            else "."
         )
     )
     return llm_args.model_copy(update=update)
