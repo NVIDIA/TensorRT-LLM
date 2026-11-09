@@ -974,6 +974,7 @@ class TestInflightPrefixWait:
         req.cache_salt = None
         req.multimodal_hashes = None
         req.is_dummy_request = False
+        req.is_dummy = False
         return req
 
     @staticmethod
