@@ -635,6 +635,12 @@ def install(text_model, mapping: Mapping, pin_l061: bool = False) -> Optional[Ho
     if switch is not None:
         switch.refresh()
         return switch
+    if any(getattr(layer.feed_forward, "expert_slots", None) for layer in text_model.layers):
+        logger.warning(
+            "[musespark_open] hot_replicas: not installed, a static expert placement "
+            "(MUSESPARK_OPEN_EXPERT_PLACEMENT) is active and these hooks assume the identity one"
+        )
+        return None
     layers = []
     skipped = {}
     for index, decoder_layer in enumerate(text_model.layers):

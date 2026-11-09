@@ -1166,6 +1166,23 @@ class MuseSparkOpenRoutingMethod(MiniMaxM2MoeRoutingMethod):
         self._full_routing_torch_order = (
             os.getenv("MUSESPARK_OPEN_FULL_ROUTING_TORCH_ORDER", "0") == "1"
         )
+        # Static expert placement (``musespark_open_expert_placement``): maps the
+        # selected expert ids to the slots that hold them; None = identity.
+        self._slot_map = None
+
+    @property
+    def _routing_memo(self):
+        return self.__dict__.get("_routing_memo_value")
+
+    @_routing_memo.setter
+    def _routing_memo(self, memo) -> None:
+        """Every producer of the memo (``apply``, the sequence-parallel shard routing,
+        the decode MoE prologue) writes expert ids; under a static placement they are
+        stored as slot ids, once, here."""
+        slot_map = self.__dict__.get("_slot_map")
+        if memo is not None and slot_map is not None:
+            memo = (memo[0], memo[1], slot_map(memo[2]), *memo[3:])
+        self.__dict__["_routing_memo_value"] = memo
 
     @property
     def requires_separated_routing(self) -> bool:
@@ -1245,14 +1262,14 @@ class MuseSparkOpenRoutingMethod(MiniMaxM2MoeRoutingMethod):
                 num_warps=1 if router_logits.shape[0] >= 512 else 4,
             )
             self._routing_memo = (router_logits, version, selected, weights)
-            return selected, weights
+            return self._routing_memo[2], weights
         scores, scores_with_bias = self.get_scores(router_logits, self.e_score_correction_bias)
         _, topk_idx = torch.topk(scores_with_bias, k=self.top_k, dim=-1, sorted=False)
         # Weights come from the *unbiased* scores; the bias only steers which
         # experts are picked.
         selected, weights = _routing_weights(scores, topk_idx, self.renorm_eps, self.output_dtype)
         self._routing_memo = (router_logits, version, selected, weights)
-        return selected, weights
+        return self._routing_memo[2], weights
 
 
 def _frozen_gate_cache_enabled() -> bool:
@@ -2220,6 +2237,26 @@ class MuseSparkOpenMoE(nn.Module):
         # finalize + all-reduce path lives. ``comm`` is decided in the
         # ConfigurableMoE constructor; the only later reassignment swaps one
         # strategy for another, never between None and a strategy.
+        from . import musespark_open_expert_placement as _placement
+
+        self.expert_slots = None
+        placed = (_placement.placement_table(self.num_experts) or {}).get(layer_idx)
+        if placed is not None:
+            if layer_quant_config is not None:
+                raise ValueError(
+                    f"[musespark_open] expert placement: layer {layer_idx} keeps BF16 experts "
+                    "(quant-excluded); only NVFP4 expert layers can be placed"
+                )
+            if not pure_ep or self.mapping.moe_ep_size * 64 != self.num_experts:
+                raise ValueError(
+                    "[musespark_open] expert placement needs EP4 with 64 experts per rank, got "
+                    f"moe_ep_size {self.mapping.moe_ep_size}, moe_tp_size {self.mapping.moe_tp_size}"
+                )
+            _placement.apply_to_experts(
+                self.experts, placed, self.mapping.moe_ep_rank, self.mapping.moe_ep_size
+            )
+            self.expert_slots = list(placed)
+            self.experts.routing_method._slot_map = _placement.SlotMap(placed)
         if getattr(self.experts, "comm", None) is not None:
             self.experts.unfinalized_combine_fn = self.finalize
         # An explicit strategy, not the AUTO default. AUTO routes through

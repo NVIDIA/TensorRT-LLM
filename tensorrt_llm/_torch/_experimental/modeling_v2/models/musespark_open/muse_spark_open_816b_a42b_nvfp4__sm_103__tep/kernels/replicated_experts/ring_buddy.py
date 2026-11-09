@@ -819,6 +819,12 @@ def install(
     Raises:
         ValueError: on every rank alike, for any of those refusals on some rank.
     """
+    if any(getattr(layer.feed_forward, "expert_slots", None) for layer in text_model.layers):
+        logger.warning(
+            "[musespark_open] ring_buddy: not installed, a static expert placement "
+            "(MUSESPARK_OPEN_EXPERT_PLACEMENT) is active and these hooks assume the identity one"
+        )
+        return []
     ranks = ring_size(mapping)
     refusal = _install_refusal(
         text_model, windows, persistent, balance, bf16_unpacked, ranks, static_from, half

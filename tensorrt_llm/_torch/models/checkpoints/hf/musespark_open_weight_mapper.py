@@ -336,12 +336,23 @@ def _materialize(weights, key: str, accounting: WeightAccounting) -> torch.Tenso
 
 
 def _slice_experts(
-    weights, key: str, expert_start: int, expert_end: int, accounting: WeightAccounting
+    weights,
+    key: str,
+    expert_start: int,
+    expert_end: int,
+    accounting: WeightAccounting,
+    expert_ids: Optional[List[int]] = None,
 ) -> torch.Tensor:
-    """Read only this rank's expert range out of a stacked expert tensor."""
+    """Read only this rank's expert range out of a stacked expert tensor.
+
+    With ``expert_ids`` (a static expert placement, not a contiguous range) the
+    rows of those experts are read one by one and stacked in that order.
+    """
     accounting.consumed.add(key)
     value = weights[key]
-    return value[expert_start:expert_end]
+    if expert_ids is None:
+        return value[expert_start:expert_end]
+    return torch.stack([value[e : e + 1][0] for e in expert_ids])
 
 
 def _load_linear(module, weight: torch.Tensor) -> None:
@@ -350,6 +361,17 @@ def _load_linear(module, weight: torch.Tensor) -> None:
 
 def _copy_param(param: torch.nn.Parameter, value: torch.Tensor) -> None:
     param.data.copy_(value.to(param.dtype))
+
+
+def _placed_expert_ids(experts_module) -> Optional[List[int]]:
+    """This rank's expert ids when they are not one contiguous ascending range, else None."""
+    expert_ids = getattr(experts_module, "initial_local_expert_ids", None)
+    if not expert_ids:
+        return None
+    ids = [int(e) for e in expert_ids]
+    if ids == list(range(ids[0], ids[0] + len(ids))):
+        return None
+    return ids
 
 
 def _local_expert_range(experts_module, num_experts: int) -> Tuple[int, int]:
@@ -369,8 +391,12 @@ def build_expert_weights(
     intermediate_size: int,
     is_quantized: bool,
     accounting: WeightAccounting,
+    expert_ids: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Explode this layer's stacked expert tensors into per-expert entries.
+
+    ``expert_ids`` (static expert placement) replaces ``[expert_start, expert_end)``
+    with that list of experts.
 
     Checkpoint layout: ``w13_weight[e]`` holds the gate rows in ``[0:I)`` and
     the up rows in ``[I:2I)`` (packed FP4 halves the last dim). The global
@@ -379,9 +405,12 @@ def build_expert_weights(
     up projection, so they are threaded through separately.
     """
     entries: Dict[str, Any] = {}
-    w13 = _slice_experts(weights, f"{prefix}.w13_weight", expert_start, expert_end, accounting)
-    w2 = _slice_experts(weights, f"{prefix}.w2_weight", expert_start, expert_end, accounting)
-    for local_idx, expert_id in enumerate(range(expert_start, expert_end)):
+    local_ids = list(range(expert_start, expert_end)) if expert_ids is None else list(expert_ids)
+    w13 = _slice_experts(
+        weights, f"{prefix}.w13_weight", expert_start, expert_end, accounting, expert_ids
+    )
+    w2 = _slice_experts(weights, f"{prefix}.w2_weight", expert_start, expert_end, accounting, expert_ids)
+    for local_idx, expert_id in enumerate(local_ids):
         entries[f"{expert_id}.w1.weight"] = w13[local_idx, :intermediate_size]
         entries[f"{expert_id}.w3.weight"] = w13[local_idx, intermediate_size:]
         entries[f"{expert_id}.w2.weight"] = w2[local_idx]
@@ -390,12 +419,12 @@ def build_expert_weights(
         return entries
 
     w13_scale = _slice_experts(
-        weights, f"{prefix}.w13_weight_scale", expert_start, expert_end, accounting
+        weights, f"{prefix}.w13_weight_scale", expert_start, expert_end, accounting, expert_ids
     )
     w2_scale = _slice_experts(
-        weights, f"{prefix}.w2_weight_scale", expert_start, expert_end, accounting
+        weights, f"{prefix}.w2_weight_scale", expert_start, expert_end, accounting, expert_ids
     )
-    for local_idx, expert_id in enumerate(range(expert_start, expert_end)):
+    for local_idx, expert_id in enumerate(local_ids):
         entries[f"{expert_id}.w1.weight_scale"] = w13_scale[local_idx, :intermediate_size]
         entries[f"{expert_id}.w3.weight_scale"] = w13_scale[local_idx, intermediate_size:]
         entries[f"{expert_id}.w2.weight_scale"] = w2_scale[local_idx]
@@ -613,7 +642,13 @@ def load_layer(
     experts_prefix = f"{ffn_prefix}.experts"
     is_quantized = f"{experts_prefix}.w13_weight_scale" in weights
     expert_start, expert_end = _local_expert_range(moe.experts, config.num_experts)
+    placed_ids = _placed_expert_ids(moe.experts)
     experts_backend = getattr(moe.experts, "backend", moe.experts)
+    if placed_ids is not None and not is_quantized:
+        raise ValueError(
+            f"MuseSparkOpen: layer {layer_idx} has a static expert placement but BF16 experts "
+            "in the checkpoint; only NVFP4 expert layers can be placed"
+        )
     if not is_quantized and getattr(experts_backend, "has_nvfp4", False):
         if not excluded_layer_experts_nvfp4_enabled():
             raise ValueError(
@@ -651,6 +686,7 @@ def load_layer(
             config.intermediate_size,
             is_quantized,
             accounting,
+            expert_ids=placed_ids,
         )
     moe.experts.load_weights([expert_weights])
     expert_weights.clear()

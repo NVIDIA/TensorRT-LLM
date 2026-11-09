@@ -59,6 +59,7 @@ import triton
 
 from tensorrt_llm._torch.distributed import allgather, reducescatter
 from tensorrt_llm._torch.models import modeling_musespark_open as _builtin
+from tensorrt_llm._torch.models import musespark_open_expert_placement as _placement
 from tensorrt_llm._torch.models.modeling_musespark_open import (
     MuseSparkOpenMoE,
     MuseSparkOpenRoutingMethod,
@@ -299,6 +300,9 @@ class ContextSequenceParallelMoE:
                     if self._sp_shard_routing
                     else None
                 )
+                census = _placement.census()
+                if census is not None and routed is not None:
+                    census.add(self.layer_idx, routed[0])
                 head = [router_logits] if routed is None else list(routed)
                 gathered = allgather(
                     [*head, fp4.reshape(shard, -1), scale.reshape(shard, -1)], mapping, dim=0
