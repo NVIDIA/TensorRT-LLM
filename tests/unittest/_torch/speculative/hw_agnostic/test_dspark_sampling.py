@@ -32,7 +32,13 @@ from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm._torch.speculative.interface import _RNG_SLOT_SPAN, SpecWorkerBase
 from tensorrt_llm._torch.speculative.utils import get_spec_metadata
-from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, MTPDecodingConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (
+    AdvancedSamplingMode,
+    DSparkDecodingConfig,
+    Eagle3DecodingConfig,
+    MTPDecodingConfig,
+    TorchLlmArgs,
+)
 
 B, K, V, RANK = 4, 3, 32, 8
 INT32_MAX = torch.iinfo(torch.int32).max
@@ -205,36 +211,63 @@ def test_spec_metadata_carries_the_rejection_options() -> None:
     assert metadata.draft_temperature_only is True
 
 
-@pytest.mark.parametrize(
-    "mode, option",
-    [
-        ("use_dynamic_tree", dict(rejection_sample_method="block")),
-        ("use_dynamic_tree", dict(draft_temperature_only=True)),
-        ("use_relaxed_acceptance_for_thinking", dict(rejection_sample_method="block")),
-    ],
-    ids=["tree-block", "tree-temperature_only", "relaxed-block"],
-)
-@pytest.mark.cpu_only
-def test_rejection_options_are_rejected_where_they_would_not_apply(mode: str, option: dict) -> None:
-    # The dynamic tree drafts from a softmax top-k of the raw draft logits; relaxed
-    # thinking-phase acceptance returns before the rejection rule runs.
-    spec_config = types.SimpleNamespace(
+_REJECTION_OPTIONS = [dict(rejection_sample_method="block"), dict(draft_temperature_only=True)]
+
+
+def _mtp(**kwargs) -> MTPDecodingConfig:
+    return MTPDecodingConfig(num_nextn_predict_layers=1, use_rejection_sampling=True, **kwargs)
+
+
+def _eagle3(**kwargs) -> Eagle3DecodingConfig:
+    return Eagle3DecodingConfig(
+        max_draft_len=3, speculative_model="/path/to/eagle3", use_rejection_sampling=True, **kwargs
+    )
+
+
+def _dspark(**kwargs) -> DSparkDecodingConfig:
+    return DSparkDecodingConfig(
+        max_draft_len=7,
+        speculative_model="/path/to/dspark",
         use_rejection_sampling=True,
-        use_dynamic_tree=False,
-        use_relaxed_acceptance_for_thinking=False,
-        rejection_sample_method="standard",
-        draft_temperature_only=False,
+        **kwargs,
     )
-    setattr(spec_config, mode, True)
-    TorchLlmArgs._validate_rejection_sampling_options(
-        types.SimpleNamespace(speculative_config=spec_config)
-    )
-    for name, value in option.items():
-        setattr(spec_config, name, value)
-    with pytest.raises(ValueError, match=f"{mode}=True"):
-        TorchLlmArgs._validate_rejection_sampling_options(
-            types.SimpleNamespace(speculative_config=spec_config)
-        )
+
+
+_SETTINGS = {
+    "mtp-tree": (_mtp, "use_dynamic_tree", dict(use_dynamic_tree=True, dynamic_tree_max_topK=2)),
+    "eagle3-tree": (
+        _eagle3,
+        "use_dynamic_tree",
+        dict(use_dynamic_tree=True, dynamic_tree_max_topK=2),
+    ),
+    "mtp-relaxed": (
+        _mtp,
+        "use_relaxed_acceptance_for_thinking",
+        dict(use_relaxed_acceptance_for_thinking=True),
+    ),
+    "dspark-confidence": (
+        _dspark,
+        "enable_confidence_scheduling",
+        dict(enable_confidence_scheduling=True, confidence_cost_table_path="/path/to/costs"),
+    ),
+}
+
+
+@pytest.mark.parametrize("option", _REJECTION_OPTIONS, ids=["block", "temperature_only"])
+@pytest.mark.parametrize("setting", list(_SETTINGS))
+@pytest.mark.cpu_only
+def test_rejection_options_are_rejected_where_they_would_not_apply(
+    setting: str, option: dict
+) -> None:
+    # The dynamic tree drafts from a softmax top-k of the raw draft logits;
+    # relaxed thinking-phase acceptance accepts drafts without the rejection
+    # rule, so drafts drawn without the request's filters could be emitted;
+    # confidence scheduling admits no request the rejection path verifies.
+    make, name, setting_kwargs = _SETTINGS[setting]
+    make(**setting_kwargs)
+    make(**option)
+    with pytest.raises(ValueError, match=f"{name}=True"):
+        make(**setting_kwargs, **option)
 
 
 # The ancestral chain
@@ -576,7 +609,7 @@ def test_rejection_acceptance_routes_and_captures(method: str) -> None:
 @pytest.mark.parametrize(
     "mode", [AdvancedSamplingMode.FULL, AdvancedSamplingMode.NO_TOPK], ids=["fused", "flashinfer"]
 )
-@pytest.mark.parametrize("case", ["all_rejected", "all_accepted"])
+@pytest.mark.parametrize("case", ["all_rejected", "mid_block", "all_accepted"])
 def test_block_verify_emitted_token_follows_the_residual(
     case: str, mode: AdvancedSamplingMode
 ) -> None:
@@ -585,22 +618,25 @@ def test_block_verify_emitted_token_follows_the_residual(
     Each case pins the accepted length regardless of the uniforms, so thousands
     of rows that differ only in their RNG offset sample one known distribution:
     all drafts impossible under the target -> L = 0 and max(p_0 - q_0, 0);
-    draft == target -> L = K and the bonus row p_K.
+    draft == target up to position m, impossible from m on -> L = m and
+    max(p_m - q_m, 0); draft == target -> L = K and the bonus row p_K.
     """
     generator = torch.Generator().manual_seed(51)
     vocab, rows = 64, 20_000
     worker = _worker()
     meta = _metadata(rows, vocab=vocab, mode=mode, device="cuda")
     target = torch.softmax(torch.randn(1, K + 1, vocab, generator=generator), -1)
-    if case == "all_rejected":
-        target[:, :, 0] = 0.0
+    if case in ("all_rejected", "mid_block"):
+        position = 0 if case == "all_rejected" else K // 2
+        target[:, position:, 0] = 0.0
         target = target / target.sum(-1, keepdim=True)
         draft = torch.softmax(torch.randn(1, K, vocab, generator=generator), -1)
         draft[:, :, 0] = 0.5
         draft = draft / draft.sum(-1, keepdim=True)
+        draft[:, :position] = target[:, :position]
         tokens = torch.zeros(1, K, dtype=torch.int32)
-        expected = (target[0, 0] - draft[0, 0]).clamp_min(0)
-        position = 0
+        tokens[:, :position] = torch.multinomial(target[0, :position], 1, generator=generator).T
+        expected = (target[0, position] - draft[0, position]).clamp_min(0)
     else:
         draft = target[:, :K].clone()
         tokens = torch.multinomial(draft[0], 1).view(1, K).int()

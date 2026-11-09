@@ -301,6 +301,20 @@ class TestDSparkTailResolution:
         assert spec.context_recompute_tail is None
         log.warning.assert_called_once()
 
+    def test_resolve_from_checkpoint_re_probes_an_embedded_drafter(self, tmp_path: Path) -> None:
+        """A hub id probes as standalone during validation; the downloaded
+        embedded checkpoint must resolve as embedded (tail 0), not as an
+        MLA-shaped standalone drafter (-1)."""
+        spec = _spec(tmp_path / "hub-id", context_recompute_tail=None)
+        assert spec.draft_is_embedded_in_target is False  # warmed against the repo id
+        local = tmp_path / "local"
+        local.mkdir()
+        (local / "config.json").write_text(json.dumps(_EMBEDDED))
+        spec.speculative_model = str(local)  # what CachedModelLoader does after download
+        spec.resolve_from_checkpoint()
+        assert spec.draft_is_embedded_in_target is True
+        assert spec.context_recompute_tail == 0
+
     def test_resolve_from_checkpoint_reads_the_downloaded_drafter(self, tmp_path: Path) -> None:
         spec = _spec(tmp_path / "hub-id", context_recompute_tail=None)
         (tmp_path / "hub-id").mkdir()
@@ -329,7 +343,7 @@ class TestDSparkTailResolution:
             "layer_types": [SLIDING] * 2,
         }
         spec = _spec(ckpt, config, context_recompute_tail=None)
-        with pytest.raises(ValueError, match="trust_remote_code"):
+        with pytest.raises(ValueError, match="explicit integer context_recompute_tail"):
             TorchLlmArgs(
                 model="/tmp/dummy_model", skip_tokenizer_init=True, speculative_config=spec
             )
@@ -346,7 +360,7 @@ class TestDSparkTailResolution:
 
 def _target(*, enable_block_reuse: bool = True, tail: int = 4096) -> SimpleNamespace:
     """The slice of a target KV cache manager the drafter reports on."""
-    return SimpleNamespace(enable_block_reuse=enable_block_reuse, _spec_recompute_tail=tail)
+    return SimpleNamespace(enable_block_reuse=enable_block_reuse, spec_recompute_tail=tail)
 
 
 def _worker(*, addressable: bool = False, requested_tail: Optional[int] = 4096) -> SimpleNamespace:
@@ -358,31 +372,40 @@ def _worker(*, addressable: bool = False, requested_tail: Optional[int] = 4096) 
 
 
 @pytest.mark.parametrize(
-    "worker, target, info, warning",
+    "worker, target, joint_fallback, info, warning",
     [
-        (_worker(addressable=True), _target(tail=0), None, None),
-        (_worker(requested_tail=0), _target(enable_block_reuse=False, tail=0), None, None),
-        (_worker(requested_tail=0), None, None, None),
-        (_worker(), _target(tail=4096), "4096-token prompt tail", None),
+        (_worker(addressable=True), _target(tail=0), False, None, None),
+        (_worker(requested_tail=0), _target(enable_block_reuse=False, tail=0), False, None, None),
+        (_worker(requested_tail=0), None, False, None, None),
+        (_worker(), _target(tail=4096), False, "a 4096-token prompt tail", None),
+        (_worker(requested_tail=-1), _target(tail=-1), False, "the whole prompt", None),
         # e.g. a per_conversation policy disabled the configured tail
-        (_worker(), _target(tail=0), None, "disabled context_recompute_tail=4096"),
-        (_worker(requested_tail=0), _target(tail=0), None, "context_recompute_tail is 0"),
+        (_worker(), _target(tail=0), False, None, "disabled context_recompute_tail=4096"),
+        (_worker(requested_tail=0), _target(tail=0), False, None, "context_recompute_tail is 0"),
+        # the caller already warned about the paired pool's private-arena fallback
+        (_worker(requested_tail=0), _target(tail=0), True, None, None),
     ],
     ids=[
         "paired-pool-hands-the-prefix-back",
         "no-block-reuse",
         "no-target-manager",
         "recomputed-tail",
+        "recomputed-whole-prompt",
         "tail-disabled-by-the-manager",
         "no-tail-requested",
+        "joint-fallback-already-warned",
     ],
 )
 def test_prefix_reuse_report(
-    worker: SimpleNamespace, target: Any, info: Optional[str], warning: Optional[str]
+    worker: SimpleNamespace,
+    target: Any,
+    joint_fallback: bool,
+    info: Optional[str],
+    warning: Optional[str],
 ) -> None:
     with patch("tensorrt_llm._torch.speculative.dflash.logger") as log:
-        DFlashWorker._report_prefix_reuse(worker, target)
-    infos = [c.args[0] for c in log.info.call_args_list]
-    warnings = [c.args[0] for c in log.warning.call_args_list]
+        DFlashWorker._report_prefix_reuse(worker, target, joint_fallback)
+    infos = [c.args[0] for c in log.info_once.call_args_list]
+    warnings = [c.args[0] for c in log.warning_once.call_args_list]
     assert len(infos) == (info is not None) and all(info in m for m in infos)
     assert len(warnings) == (warning is not None) and all(warning in m for m in warnings)

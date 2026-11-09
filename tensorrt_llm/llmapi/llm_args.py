@@ -94,6 +94,8 @@ SERVE_CLI_CONFIG_FIELDS = {
 if TYPE_CHECKING:
     # Runtime methods import QSA params locally to avoid loading the sparse
     # backend while llm_args is defining its public configuration models.
+    from transformers import PretrainedConfig
+
     from tensorrt_llm._torch.attention.backends.sparse.qsa import (
         QSASparseMetadataParams, QSASparseParams)
     from tensorrt_llm._torch.virtual_memory import \
@@ -2423,6 +2425,9 @@ class _MTPDraftCheckpointType(StrEnum):
     EXTERNAL_DRAFT_MODEL = "external_draft_model"
 
 
+RejectionSampleMethod = Literal["standard", "block"]
+
+
 class DecodingBaseConfig(StrictBaseModel):
     max_draft_len: Optional[NonNegativeInt] = Field(
         default=None, description="The maximum number of draft tokens.")
@@ -2513,7 +2518,7 @@ class DecodingBaseConfig(StrictBaseModel):
         "(default) to use exact-match verification on non-greedy batches. "
         "The non-dynamic-tree one-model path requires FlashInfer.")
 
-    rejection_sample_method: Literal["standard", "block"] = Field(
+    rejection_sample_method: RejectionSampleMethod = Field(
         default="standard",
         status="prototype",
         description=
@@ -2521,18 +2526,19 @@ class DecodingBaseConfig(StrictBaseModel):
         "'standard': token-level rejection sampling. 'block': block "
         "verification (Sun et al., 2024), which judges the drafted block "
         "jointly; lossless, and accepts at least as many tokens in expectation. "
-        "Linear-chain one-model paths only (not the dynamic tree, nor with "
-        "relaxed thinking acceptance); ragged (confidence-scheduled) "
-        "verification steps fall back to 'standard'.")
+        "Linear-chain one-model paths only: not supported with the dynamic "
+        "tree, relaxed thinking acceptance or DSpark confidence scheduling.")
 
     draft_temperature_only: bool = Field(
         default=False,
         status="prototype",
         description="If true, rejection-sampled drafts are drawn from the "
         "temperature-scaled draft distribution without the request's top-k / "
-        "top-p / min-p filters; this changes the acceptance rate, not the "
-        "output distribution. Requires use_rejection_sampling=True; not "
-        "supported with the dynamic tree.")
+        "top-p / min-p filters; with rejection-sampling verification this "
+        "changes the acceptance rate, not the output distribution. Requires "
+        "use_rejection_sampling=True; not supported with the dynamic tree, "
+        "relaxed thinking acceptance (which accepts drafts without the "
+        "rejection rule) or DSpark confidence scheduling.")
 
     allow_advanced_sampling: bool = Field(
         default=False,
@@ -2638,6 +2644,45 @@ class DecodingBaseConfig(StrictBaseModel):
                                                    None) is not None:
             if "use_rejection_sampling" not in self.model_fields_set:
                 self.use_rejection_sampling = False
+        return self
+
+    def resolve_from_checkpoint(self, trust_remote_code: bool = False) -> None:
+        """Fill checkpoint-derived fields once ``speculative_model`` is local.
+
+        Called by ``CachedModelLoader`` after it downloads a hub drafter, whose
+        ``config.json`` validation could not read. A no-op unless a config
+        reads defaults from the drafter checkpoint. ``trust_remote_code`` is
+        the user's setting for loading the drafter config.
+        """
+
+    def _rejection_options_set(self) -> List[str]:
+        """The rejection-sampling options set away from their defaults."""
+        options = []
+        if self.rejection_sample_method != "standard":
+            options.append(
+                f"rejection_sample_method={self.rejection_sample_method!r}")
+        if self.draft_temperature_only:
+            options.append("draft_temperature_only=True")
+        return options
+
+    def _reject_rejection_options_with(self, setting: str) -> None:
+        """Raise when a rejection-sampling option is set with ``setting``=True.
+
+        The setting takes the drafts or their acceptance off the linear-chain
+        rejection rule the options act on.
+        """
+        options = self._rejection_options_set()
+        if options:
+            raise ValueError(f"{' and '.join(options)} is not supported with "
+                             f"{setting}=True.")
+
+    @model_validator(mode='after')
+    def validate_rejection_sampling_options(self) -> "DecodingBaseConfig":
+        """Both options act only through the rejection path."""
+        options = self._rejection_options_set()
+        if options and not self.use_rejection_sampling:
+            raise ValueError(f"{' and '.join(options)} require(s) "
+                             "use_rejection_sampling=True.")
         return self
 
     @model_validator(mode='before')
@@ -3003,6 +3048,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
         # Dynamic tree logic
         if self.use_dynamic_tree:
+            self._reject_rejection_options_with("use_dynamic_tree")
             if self.max_draft_len is None or self.max_draft_len <= 0:
                 raise ValueError(
                     "max_draft_len should be provided, which indicates the number of drafter layers"
@@ -3425,8 +3471,12 @@ class MTPDecodingConfig(DecodingBaseConfig):
             )
             self.dynamic_tree_max_topK = None
 
+        if self.use_relaxed_acceptance_for_thinking:
+            self._reject_rejection_options_with(
+                "use_relaxed_acceptance_for_thinking")
         # Dynamic tree defaults max_total_draft_tokens to topK * max_draft_len.
         if self.use_dynamic_tree:
+            self._reject_rejection_options_with("use_dynamic_tree")
             if self.max_draft_len is None:
                 raise ValueError(
                     "max_draft_len must be set when use_dynamic_tree is True")
@@ -3638,30 +3688,27 @@ def translate_speculators_dspark_config(config_dict: dict) -> dict:
     return translated
 
 
-def dflash_context_attention_window(draft_config: Any) -> Optional[int]:
+def dflash_context_attention_window(
+        draft_config: "PretrainedConfig") -> Optional[int]:
     """Widest context-attention window over a DFlash/DSpark drafter's layers.
 
-    Layers resolve as in ``DFlashForCausalLM`` (``dspark_layer_window_size``):
-    the ``dflash_config`` SWA window first, then the HF fields. With the SWA
-    window on, a drafter whose layer types name no sliding layer is windowed on
-    every layer. None when any layer attends to its whole context, or when no
-    layers are declared.
+    Layers resolve as in ``DFlashForCausalLM``: the ``dflash_config`` SWA
+    window by ``dspark_layer_window_size``, then the HF fields. None when any
+    layer attends to its whole context, or when no layers are declared.
     """
     from tensorrt_llm._torch.pyexecutor.config_utils import (
-        _is_sliding_attention_layer, get_layer_attention_window)
+        dspark_layer_window_size, get_layer_attention_window)
     dflash_cfg = getattr(draft_config, "dflash_config", None) or {}
     swa_window = int(dflash_cfg.get("swa_window_size", 0) or 0)
     use_swa = bool(dflash_cfg.get("use_swa", False)) and swa_window > 0
     layer_types = getattr(draft_config, "layer_types", None)
-    any_sliding = layer_types is not None and any(
-        _is_sliding_attention_layer(layer_type) for layer_type in layer_types)
     num_layers = int(getattr(draft_config, "num_hidden_layers", 0) or 0)
     windows = []
     for layer_idx in range(num_layers):
-        if use_swa and not (
-                any_sliding and layer_idx < len(layer_types)
-                and not _is_sliding_attention_layer(layer_types[layer_idx])):
-            window = swa_window
+        left, _ = dspark_layer_window_size(use_swa, swa_window, layer_types,
+                                           layer_idx)
+        if left >= 0:
+            window = left + 1
         else:
             window = get_layer_attention_window(draft_config, layer_idx)
         if window is None:
@@ -3798,8 +3845,7 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         ``target_layer_ids`` has no usable default, and without it no target
         hidden states are captured. Called from validation for a local path,
         and again from model loading once a HF repo id has been downloaded.
-        Reads the JSON directly, so ``trust_remote_code`` (the shared loader
-        signature) is unused here.
+        Reads the JSON directly, so ``trust_remote_code`` is unused here.
         """
         if self.speculative_model is None:
             return
@@ -3928,15 +3974,20 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     context_recompute_tail: Optional[int] = Field(
         default=0,
+        ge=-1,
+        status="prototype",
         description=
         "Prompt-tail tokens to recompute through the target forward when a "
         "request takes a KV-cache prefix hit, so a standalone DSpark drafter "
-        "gets context K/V for reused tokens; not needed when the draft KV "
-        "pool is paired with the target's block reuse. 0 (default) disables "
-        "it; -1 forces a full re-prefill on a hit; None resolves from the "
-        "draft model config to the drafter's attention window when every "
-        "layer's context attention is windowed, else -1 (0 for the embedded "
-        "drafter). A smaller tail trades acceptance length for TTFT. The V2 "
+        "gets context K/V for reused tokens. A draft KV pool paired with the "
+        "target's block reuse hands back the drafter K/V of the reused "
+        "prefix, so the tail matters most for an unpaired drafter. 0 "
+        "(default) disables it; -1 forces a full re-prefill on a hit; None "
+        "resolves from the draft model config to the drafter's attention "
+        "window when every layer's context attention is windowed, else -1 (0 "
+        "for the embedded drafter). A disaggregated context server recomputes "
+        "only when the draft layers share the target's KV cache manager, the "
+        "one layout whose draft pages reach the generation server. A smaller tail trades acceptance length for TTFT. The V2 "
         "KV cache manager requires the all_reusable block-reuse policy; the "
         "V1 manager requires chunked prefill and no sliding-window target "
         "layers; otherwise the managers disable it with a warning. On "
@@ -4034,6 +4085,9 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                 "tensorrt_llm.tools.dspark_profile_costs` or point to an "
                 "existing one; graph coverage and K are checked at engine "
                 "start.")
+        # Confidence scheduling admits greedy requests only under rejection
+        # sampling, so neither option would ever act.
+        self._reject_rejection_options_with("enable_confidence_scheduling")
         return self
 
     @model_validator(mode="after")
@@ -4073,8 +4127,16 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                                          "config.json")
         if not os.path.exists(draft_config_path):
             return
-        window = dspark_context_attention_window(str(self.speculative_model),
-                                                 trust_remote_code)
+        try:
+            window = dspark_context_attention_window(
+                str(self.speculative_model), trust_remote_code)
+        except Exception as error:
+            raise ValueError(
+                "context_recompute_tail=None resolves from the DSpark drafter "
+                f"config at {self.speculative_model}, which failed to load "
+                f"({error}). Set an explicit integer context_recompute_tail, or "
+                "trust_remote_code=True if the config needs remote code."
+            ) from error
         self.context_recompute_tail = int(window) if window else -1
         if window:
             reason = f"the drafter's {window}-token attention window"
@@ -4085,11 +4147,17 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                     f"{self.context_recompute_tail} ({reason}).")
 
     def resolve_from_checkpoint(self, trust_remote_code: bool = False) -> None:
-        """Resolve checkpoint-derived fields once a hub repo id is downloaded.
+        """Resolve ``context_recompute_tail`` once a hub repo id is downloaded.
 
-        Called by ``CachedModelLoader``. Only ``context_recompute_tail`` is
-        resolved here; the other checkpoint fields resolve during validation.
+        Called by ``CachedModelLoader`` after it swaps the repo id for the
+        local directory. The embedded-vs-standalone probe was memoized against
+        the repo id, which it cannot read, so it is dropped and re-probed.
+        Only the tail is resolved here: the other checkpoint fields
+        (``target_layer_ids`` and the rest) are read from a local
+        ``config.json`` during validation, and the model loader reads them for
+        a downloaded drafter.
         """
+        self.__dict__.pop("draft_is_embedded_in_target", None)
         self.resolve_context_recompute_tail(trust_remote_code)
         if self.context_recompute_tail is None:
             logger.warning(
@@ -8103,38 +8171,6 @@ class TorchLlmArgs(BaseLlmArgs):
             return False
         return True
 
-    def _validate_rejection_sampling_options(self) -> None:
-        """Reject rejection-sampling options that would have no effect.
-
-        Both options need the rejection path; neither reaches the dynamic
-        tree, and relaxed thinking-phase acceptance bypasses block verification.
-        """
-        spec_cfg = self.speculative_config
-        method = spec_cfg.rejection_sample_method
-        temperature_only = spec_cfg.draft_temperature_only
-        if not spec_cfg.use_rejection_sampling:
-            options = []
-            if method != "standard":
-                options.append(f"rejection_sample_method={method!r}")
-            if temperature_only:
-                options.append("draft_temperature_only=True")
-            if options:
-                raise ValueError(f"{' and '.join(options)} require(s) "
-                                 "use_rejection_sampling=True.")
-        if getattr(spec_cfg, "use_dynamic_tree", False):
-            if method == "block":
-                raise ValueError(
-                    "rejection_sample_method='block' is not supported with "
-                    "use_dynamic_tree=True.")
-            if temperature_only:
-                raise ValueError("draft_temperature_only=True is not supported "
-                                 "with use_dynamic_tree=True.")
-        if method == "block" and getattr(
-                spec_cfg, "use_relaxed_acceptance_for_thinking", False):
-            raise ValueError(
-                "rejection_sample_method='block' is not supported with "
-                "use_relaxed_acceptance_for_thinking=True.")
-
     def _validate_dflash_ctx_budget(self,
                                     memory_budget_bytes: Optional[int] = None
                                     ) -> None:
@@ -8395,8 +8431,6 @@ class TorchLlmArgs(BaseLlmArgs):
                 # The enabled paths (Eagle3, vanilla MTP, PARD, DFlash,
                 # DraftTarget one-model) share the SpecMetadata slot-indexed
                 # dispatch.
-
-            self._validate_rejection_sampling_options()
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"

@@ -42,7 +42,8 @@ if TYPE_CHECKING:
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
-from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
+from tensorrt_llm.llmapi.llm_args import (AdvancedSamplingMode,
+                                          RejectionSampleMethod)
 
 from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
@@ -649,7 +650,7 @@ class SpecMetadata:
     # Verification rule of the rejection path (deploy-time; from
     # DecodingBaseConfig.rejection_sample_method): "standard" (token-level) or
     # "block" (block verification, see block_verification.py).
-    rejection_sample_method: str = "standard"
+    rejection_sample_method: RejectionSampleMethod = "standard"
     # Whether rejection-sampled drafts ignore the request's top-k / top-p /
     # min-p and draw from the temperature-scaled draft distribution (deploy-time;
     # from DecodingBaseConfig.draft_temperature_only).
@@ -2515,8 +2516,8 @@ class SpecWorkerBase(nn.Module, ABC):
         advanced_sampling_mode: AdvancedSamplingMode,
         logits: torch.Tensor,
         temperatures: torch.Tensor,
-        top_ks: torch.Tensor,
-        top_ps: torch.Tensor,
+        top_ks: Optional[torch.Tensor],
+        top_ps: Optional[torch.Tensor],
         min_ps: Optional[torch.Tensor],
         *,
         seed: Optional[torch.Tensor] = None,
@@ -2544,8 +2545,8 @@ class SpecWorkerBase(nn.Module, ABC):
         advanced_sampling_mode: AdvancedSamplingMode,
         logits: torch.Tensor,
         temperatures: torch.Tensor,
-        top_ks: torch.Tensor,
-        top_ps: torch.Tensor,
+        top_ks: Optional[torch.Tensor],
+        top_ps: Optional[torch.Tensor],
         min_ps: Optional[torch.Tensor],
         *,
         seed: Optional[torch.Tensor] = None,
@@ -2638,18 +2639,20 @@ class SpecWorkerBase(nn.Module, ABC):
         start: int = 0,
         end: Optional[int] = None,
         repeat: int = 1,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor],
+               Optional[torch.Tensor]]:
         """Per-row ``(temperatures, top_ks, top_ps, min_ps)`` for drawing drafts.
 
         The request's parameters, or with ``draft_temperature_only`` its
-        temperature alone (filters disabled). ``start`` / ``end`` select the
+        temperature alone (filters disabled; ``None`` filters on the
+        flashinfer backends, see :meth:`_unfiltered_sampling_params`). ``start`` / ``end`` select the
         requests; ``repeat`` expands each to the rows a block sampler flattens.
         """
         temperatures = spec_metadata.request_temperatures[start:end]
         top_ks = spec_metadata.request_top_ks[start:end]
         top_ps = spec_metadata.request_top_ps[start:end]
         min_ps = spec_metadata.request_min_ps[start:end]
-        if getattr(spec_metadata, "draft_temperature_only", False):
+        if spec_metadata.draft_temperature_only:
             top_ks, top_ps, min_ps = SpecWorkerBase._unfiltered_sampling_params(
                 spec_metadata.advanced_sampling_mode, temperatures)
         if repeat > 1:
@@ -2662,10 +2665,12 @@ class SpecWorkerBase(nn.Module, ABC):
     @staticmethod
     def _unfiltered_sampling_params(
         advanced_sampling_mode: AdvancedSamplingMode,
-        temperatures: torch.Tensor,
+        like: torch.Tensor,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor],
                Optional[torch.Tensor]]:
         """Per-row ``(top_ks, top_ps, min_ps)`` that apply no filter.
+
+        ``like`` gives the row count and device (e.g. the temperatures).
 
         The fused kernel reads its per-row disable values (device-side fills:
         CUDA graph capture rejects host-scalar copies); the flashinfer ops skip
@@ -2674,10 +2679,10 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         if not advanced_sampling_mode.is_fused:
             return None, None, None
-        return (torch.full_like(temperatures,
+        return (torch.full_like(like,
                                 torch.iinfo(torch.int32).max,
-                                dtype=torch.int32),
-                torch.ones_like(temperatures), torch.zeros_like(temperatures))
+                                dtype=torch.int32), torch.ones_like(like),
+                torch.zeros_like(like))
 
     def advanced_sample_draft(self,
                               logits: torch.Tensor,
@@ -2697,7 +2702,7 @@ class SpecWorkerBase(nn.Module, ABC):
         temperatures, top_ks, top_ps, min_ps = self._draft_sampling_params(
             spec_metadata, end=batch_size)
 
-        # One row per request here, matching the request_* slices above.
+        # One row per request here, as _draft_sampling_params returns them.
         # Callers that do not pass a draft_step run this sampler once per step
         # and take the first draft slot.
         seed, offset = self._rng_state_per_request(
@@ -3002,15 +3007,12 @@ class SpecWorkerBase(nn.Module, ABC):
                 batch_size,
                 slot=spec_metadata.rng_accept_slot)
 
-            use_block = getattr(spec_metadata, "rejection_sample_method",
-                                "standard") == "block"
-            if use_block and is_ragged:
-                logger.warning_once(
-                    "rejection_sample_method='block' does not support ragged "
-                    "(confidence-scheduled) verification; these steps use "
-                    "token-level rejection sampling.",
-                    key="block_verification_ragged_fallback")
-            if use_block and not is_ragged:
+            if spec_metadata.rejection_sample_method == "block":
+                # Ragged layouts come only from DSpark confidence scheduling,
+                # which admits no request this path verifies, and the config
+                # rejects 'block' with it.
+                assert not is_ragged, (
+                    "block verification of a ragged verify layout")
                 gen_accepted, gen_num_accepted = self._block_verify(
                     spec_metadata, full_draft_tokens, full_draft_probs,
                     target_probs, seed, offset)

@@ -1358,13 +1358,19 @@ class DSparkWorker(DFlashWorker):
         token drawn before it (the anchor for k = 0), and that distribution is
         stored as the position's proposal in ``draft_probs``. ``gen_logits`` are the
         raw ``[num_gens, K, vocab]`` block logits. Returns the ``[num_gens, K]``
-        int32 draft tokens and the stored vocab width. Without a Markov head, or
-        for argmax drafts, the DFlash path (greedy-chained
-        :meth:`_refine_block_logits`, then the block sampler) applies.
+        int32 draft tokens and the stored vocab width. Without a Markov head,
+        for argmax drafts, or for a drafter that also carries a DFlash 2
+        candidate scorer (LiLiCorr or the selector), the DFlash path
+        (greedy-chained :meth:`_refine_block_logits`, then the scorer and the
+        block sampler) applies.
         """
+        has_candidate_scorer = getattr(draft_model, "lilicorr", None) is not None or getattr(
+            draft_model, "has_candidate_selector", False
+        )
         if not (
             getattr(draft_model, "has_markov_head", False)
             and spec_metadata.wants_advanced_draft_sampling
+            and not has_candidate_scorer
         ):
             return super()._sample_block_draft_tokens(
                 draft_model,
@@ -1398,8 +1404,9 @@ class DSparkWorker(DFlashWorker):
         )
 
         markov_w1, markov_w2 = draft_model.markov_w1, draft_model.markov_w2
-        # The K positions draw from consecutive RNG slots: one state per
-        # position, laid out [K, num_gens], instead of one launch per step.
+        # The K positions draw from consecutive RNG slots (rng_draft_slot(k)):
+        # one RNG-state call returns all K offsets, laid out [K, num_gens],
+        # rather than one call per step.
         seed = spec_metadata.request_seeds[num_contexts:batch_size]
         offsets = self._rng_state_per_request(
             spec_metadata,

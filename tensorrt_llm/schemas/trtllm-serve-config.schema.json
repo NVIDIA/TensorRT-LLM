@@ -209,7 +209,7 @@
         },
         "draft_temperature_only": {
           "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
           "status": "prototype",
           "title": "Draft Temperature Only",
           "type": "boolean"
@@ -304,7 +304,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
           "enum": [
             "standard",
             "block"
@@ -821,7 +821,7 @@
         },
         "draft_temperature_only": {
           "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
           "status": "prototype",
           "title": "Draft Temperature Only",
           "type": "boolean"
@@ -929,7 +929,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
           "enum": [
             "standard",
             "block"
@@ -1129,6 +1129,7 @@
         "context_recompute_tail": {
           "anyOf": [
             {
+              "minimum": -1,
               "type": "integer"
             },
             {
@@ -1136,7 +1137,8 @@
             }
           ],
           "default": 0,
-          "description": "Prompt-tail tokens to recompute through the target forward when a request takes a KV-cache prefix hit, so a standalone DSpark drafter gets context K/V for reused tokens; not needed when the draft KV pool is paired with the target's block reuse. 0 (default) disables it; -1 forces a full re-prefill on a hit; None resolves from the draft model config to the drafter's attention window when every layer's context attention is windowed, else -1 (0 for the embedded drafter). A smaller tail trades acceptance length for TTFT. The V2 KV cache manager requires the all_reusable block-reuse policy; the V1 manager requires chunked prefill and no sliding-window target layers; otherwise the managers disable it with a warning. On recurrent-state targets a positive tail becomes -1 (full re-prefill).",
+          "description": "Prompt-tail tokens to recompute through the target forward when a request takes a KV-cache prefix hit, so a standalone DSpark drafter gets context K/V for reused tokens. A draft KV pool paired with the target's block reuse hands back the drafter K/V of the reused prefix, so the tail matters most for an unpaired drafter. 0 (default) disables it; -1 forces a full re-prefill on a hit; None resolves from the draft model config to the drafter's attention window when every layer's context attention is windowed, else -1 (0 for the embedded drafter). Context-only (disaggregated) requests never recompute. A smaller tail trades acceptance length for TTFT. The V2 KV cache manager requires the all_reusable block-reuse policy; the V1 manager requires chunked prefill and no sliding-window target layers; otherwise the managers disable it with a warning. On recurrent-state targets a positive tail becomes -1 (full re-prefill).",
+          "status": "prototype",
           "title": "Context Recompute Tail"
         },
         "decoding_type": {
@@ -1163,7 +1165,7 @@
         },
         "draft_temperature_only": {
           "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
           "status": "prototype",
           "title": "Draft Temperature Only",
           "type": "boolean"
@@ -1316,7 +1318,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
           "enum": [
             "standard",
             "block"
@@ -1840,7 +1842,7 @@
         },
         "draft_temperature_only": {
           "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
           "status": "prototype",
           "title": "Draft Temperature Only",
           "type": "boolean"
@@ -1935,7 +1937,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
           "enum": [
             "standard",
             "block"
@@ -2303,7 +2305,7 @@
         },
         "draft_temperature_only": {
           "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
           "status": "prototype",
           "title": "Draft Temperature Only",
           "type": "boolean"
@@ -2451,7 +2453,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
           "enum": [
             "standard",
             "block"
@@ -2606,7 +2608,7 @@
         },
         "draft_temperature_only": {
           "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
           "status": "prototype",
           "title": "Draft Temperature Only",
           "type": "boolean"
@@ -2754,7 +2756,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
           "enum": [
             "standard",
             "block"
@@ -3924,7 +3926,7 @@
         },
         "draft_temperature_only": {
           "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
           "status": "prototype",
           "title": "Draft Temperature Only",
           "type": "boolean"
@@ -4052,7 +4054,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
           "enum": [
             "standard",
             "block"
@@ -4935,7 +4937,7 @@
         },
         "draft_temperature_only": {
           "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
           "status": "prototype",
           "title": "Draft Temperature Only",
           "type": "boolean"
@@ -5055,7 +5057,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
           "enum": [
             "standard",
             "block"
@@ -5209,7 +5211,7 @@
         },
         "draft_temperature_only": {
           "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
           "status": "prototype",
           "title": "Draft Temperature Only",
           "type": "boolean"
@@ -5317,7 +5319,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
           "enum": [
             "standard",
             "block"
@@ -5935,7 +5937,7 @@
         },
         "draft_temperature_only": {
           "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
           "status": "prototype",
           "title": "Draft Temperature Only",
           "type": "boolean"
@@ -6056,7 +6058,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
           "enum": [
             "standard",
             "block"
@@ -6206,7 +6208,7 @@
         },
         "draft_temperature_only": {
           "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
           "status": "prototype",
           "title": "Draft Temperature Only",
           "type": "boolean"
@@ -6329,7 +6331,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
           "enum": [
             "standard",
             "block"
@@ -6760,7 +6762,7 @@
         },
         "draft_temperature_only": {
           "default": false,
-          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; with rejection-sampling verification this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree, relaxed thinking acceptance (which accepts drafts without the rejection rule) or DSpark confidence scheduling.",
           "status": "prototype",
           "title": "Draft Temperature Only",
           "type": "boolean"
@@ -6859,7 +6861,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only: not supported with the dynamic tree, relaxed thinking acceptance or DSpark confidence scheduling.",
           "enum": [
             "standard",
             "block"
