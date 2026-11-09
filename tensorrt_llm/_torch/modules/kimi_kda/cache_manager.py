@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import sys
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -30,11 +31,14 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
-    ReplayLayout,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole
+
+from .replay_region import REPLAY_STATE_REGION, KDAReplayRegion, ReplayLayout
 
 _MAMBA_SSM_SEED_MASK = (1 << 62) - 1
 _MAMBA_SSM_UINT64_MASK = (1 << 64) - 1
@@ -490,6 +494,23 @@ class KDAReplayState:
         """
         return self.draft_records
 
+    @staticmethod
+    def replay_slot_count(max_living_caches: int, max_util_for_resume: float) -> int:
+        """GPU replay slots for every living KV cache, with the headroom ``KvCache.resume`` needs.
+
+        Every living KV cache keeps its replay slot while it is suspended. ``KvCache.resume``
+        fails when a pool group is above ``max_util_for_resume``, so all owners fit only in
+        ``ceil(owners / max_util_for_resume)`` slots: 4 owners at 0.8 need 5.
+
+        The count assumes beam width 1, which ``_create_kv_cache_manager`` enforces for KDA
+        models. Under beam search each beam holds its own replay state, so the owners become
+        ``max_living_caches * max_beam_width``; the fixed-pool estimate and the region's
+        allocation both take their count from here.
+        """
+        if not 0.0 < max_util_for_resume <= 1.0:
+            raise ValueError(f"max_util_for_resume must be in (0, 1], got {max_util_for_resume}")
+        return max(1, math.ceil(max_living_caches / max_util_for_resume))
+
     def replay_layout(self, context: MambaStateLayout, layer_id: int) -> ReplayLayout:
         """Per-slot shapes of one local KDA layer's replay buffers.
 
@@ -810,13 +831,16 @@ class KDAReplayState:
                 self.rand_seed.index_select(0, source_slots),
             )
 
-    def update(self, batch: MambaAcceptanceBatch) -> None:
+    def update(self, batch: MambaAcceptanceBatch, replay_slots: torch.Tensor | None = None) -> None:
+        """Record the batch's accepted drafts.
+
+        Args:
+            batch: The generation rows' acceptance.
+            replay_slots: ``[num_generations]`` replay slots of the generation rows;
+                ``batch.destination_state_indices`` when ``None``.
+        """
         self.record_acceptance(
-            (
-                batch.destination_state_indices
-                if batch.replay_indices is None
-                else batch.replay_indices
-            ),
+            batch.destination_state_indices if replay_slots is None else replay_slots,
             batch.num_accepted_tokens - 1,
             batch.is_dummy_request,
         )
@@ -978,6 +1002,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     """KDA/MLA cache layout and K3-only replay lifecycle handling."""
 
     kda_context_only = False
+    _kda_replay_region: KDAReplayRegion | None = None
 
     @override
     def __init__(
@@ -995,6 +1020,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         self._requested_num_spec = kda_replay_num_spec
         self._requested_draft_records = kda_draft_records
         self._kda_replay: KDAReplayState | None = None
+        self._kda_replay_region: KDAReplayRegion | None = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
 
@@ -1039,6 +1065,102 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         return self._kda_replay.pool_layout(self._state_layout)
 
     @override
+    def _managed_replay_state(self) -> None:
+        """``KDAReplayRegion`` declares, binds and indexes the KDA replay state."""
+        return None
+
+    @override
+    def _region_providers(self) -> Sequence[RegionProvider]:
+        providers = super()._region_providers()
+        if self._kda_replay is None or not self.mamba_pp_layers:
+            return providers
+        self._kda_replay_region = KDAReplayRegion(
+            self._kda_replay,
+            self._state_layout,
+            self.layer_offsets,
+            self._index_mapper_capacity,
+            self.kv_cache_config.max_util_for_resume,
+        )
+        return (*providers, self._kda_replay_region)
+
+    @override
+    def _get_recurrent_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
+        buffers = super()._get_recurrent_buffer_configs(global_layer_id)
+        if self._kda_replay_region is not None:
+            buffers += self._kda_replay_region.shared_buffers(global_layer_id)
+        return buffers
+
+    @override
+    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
+        roles = super().get_disagg_ignored_roles()
+        if self._kda_replay_region is not None:
+            roles |= self._kda_replay_region.roles
+        return roles
+
+    @override
+    def _setup_model_state(self) -> None:
+        region = self._kda_replay_region
+        if region is not None:
+            region.bind(
+                self._get_state_buffer,
+                self.layer_offsets,
+                self.get_region_group_ids(REPLAY_STATE_REGION),
+                self._host_state_indices.shape[0],
+                self.cuda_state_indices.device,
+            )
+        super()._setup_model_state()
+
+    @property
+    @override
+    def replay_layer_group_id(self) -> int | None:
+        region = self._kda_replay_region
+        return region.group_id if region is not None else None
+
+    @property
+    @override
+    def cuda_replay_state_indices(self) -> torch.Tensor:
+        region = self._kda_replay_region
+        return (
+            region.cuda_indices(self.cuda_state_indices)
+            if region is not None
+            else self.cuda_state_indices
+        )
+
+    @override
+    def get_replay_state_indices(
+        self, request_ids: list[int] | None = None
+    ) -> torch.Tensor | list[int]:
+        if request_ids is None:
+            return self.cuda_replay_state_indices
+        region = self._kda_replay_region
+        if region is None or region.group_id is None:
+            # The replay buffers share the recurrent-state slots.
+            return [self._request_id_to_state_index[rid] for rid in request_ids]
+        return region.request_indices(request_ids)
+
+    @override
+    def _reset_context_mamba_slots(self, num_contexts: int) -> None:
+        if self._kda_replay_region is None:
+            super()._reset_context_mamba_slots(num_contexts)
+        else:
+            self._kda_replay_region.reset_context(
+                num_contexts, self.cuda_state_indices, self._host_state_indices
+            )
+
+    @override
+    def _update_model_state(self, batch: MambaAcceptanceBatch) -> None:
+        if self._kda_replay_region is None:
+            super()._update_model_state(batch)
+        else:
+            self._kda_replay_region.update(batch, self.cuda_state_indices)
+
+    @override
+    def shutdown(self) -> None:
+        if self._kda_replay_region is not None:
+            self._kda_replay_region.shutdown()
+        super().shutdown()
+
+    @override
     def _build_cache_config(self, config):
         if (
             self._kda_replay is not None
@@ -1080,6 +1202,15 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     @override
     def _setup_state_indices(self, requests, num_contexts: int = 0) -> None:
         super()._setup_state_indices(requests, num_contexts)
+        if self._kda_replay_region is not None:
+            self._kda_replay_region.prepare(
+                requests,
+                self.kv_cache_map,
+                self.cuda_state_indices,
+                self._host_state_indices,
+                num_contexts,
+                self._skips_steady_state_index_upload,
+            )
         replay = self._kda_replay
         if replay is None or self.local_num_mamba_layers == 0:
             return
@@ -1149,6 +1280,8 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
             self._kda_replay.seed_on_resume.discard(request.py_request_id)
             self._kda_replay.acceptance_pending.discard(request.py_request_id)
             self._kda_replay.unseeded_requests.discard(request.py_request_id)
+        if self._kda_replay_region is not None:
+            self._kda_replay_region.release(request.py_request_id)
         super().free_resources(request, pin_on_release)
 
     @override
@@ -1156,6 +1289,21 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         if self._kda_replay is None or not self._kda_replay._stochastic_rounding:
             return 0
         return torch.int64.itemsize
+
+    @classmethod
+    @override
+    def _estimate_fixed_region_bytes(
+        cls,
+        model_config,
+        mapping: Mapping,
+        *,
+        max_batch_size: int,
+        kv_cache_config: KvCacheConfig,
+        **kwargs,
+    ) -> int:
+        return KDAReplayRegion.estimate_fixed_bytes(
+            model_config, mapping, max_batch_size, kv_cache_config.max_util_for_resume, **kwargs
+        )
 
     @classmethod
     @override
@@ -1168,15 +1316,6 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
                 model_config, mapping, **kwargs
             )
         return seed_bytes
-
-    @classmethod
-    @override
-    def _estimate_private_replay_bytes_per_slot(
-        cls, model_config, mapping: Mapping, **kwargs
-    ) -> int:
-        if kwargs.get("kda_draft_records", False):
-            return 0
-        return KDAReplayState.estimate_bytes_per_slot(model_config, mapping, **kwargs)
 
     @override
     def _on_state_slots_relocated(self, old_slots: list[int], new_slots: list[int]) -> None:
@@ -1191,6 +1330,10 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     ) -> None:
         if self.kda_context_only:
             return
+        if state_indices is not None and self.replay_layer_group_id is not None:
+            metadata = getattr(attn_metadata, "mamba_metadata", None)
+            if getattr(metadata, "replay_state_indices", None) is None:
+                raise RuntimeError("PRIVATE replay state needs mamba_metadata.replay_state_indices")
         super().update_mamba_states(
             attn_metadata, num_accepted_tokens, state_indices, accepted_leaf_positions
         )

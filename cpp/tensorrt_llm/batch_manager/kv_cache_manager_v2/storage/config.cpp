@@ -21,12 +21,9 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
-#include <cmath>
-#include <limits>
 #include <map>
 #include <optional>
 #include <stdexcept>
-#include <string>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
@@ -115,33 +112,6 @@ std::unordered_map<LayerId, std::vector<LifeCycleId>> StorageConfig::layerToLife
     return map;
 }
 
-namespace
-{
-
-// Fixed GPU slot count of a lifecycle, or nullopt for one sized by ratio. A PRIVATE SSM lifecycle never
-// publishes pages to the radix tree and holds one slot per living KvCache (beam width 1), so a bound on
-// living caches fixes its demand. The headroom keeps its pool at or below maxUtilForResume, above which
-// KvCache::resume() fails.
-std::optional<SlotCount> fixedSlotCount(KVCacheManagerConfig const& config, LifeCycle const& lifeCycle)
-{
-    if (!config.maxLiveKvCaches.has_value() || !std::holds_alternative<SsmLifeCycle>(lifeCycle)
-        || !isPrivateLifeCycle(lifeCycle))
-    {
-        return std::nullopt;
-    }
-    double const numSlots
-        = std::ceil(static_cast<double>(*config.maxLiveKvCaches) / static_cast<double>(config.maxUtilForResume));
-    if (!(numSlots >= 1.0 && numSlots <= static_cast<double>(std::numeric_limits<int>::max())))
-    {
-        throw std::invalid_argument("max_live_kv_caches=" + std::to_string(*config.maxLiveKvCaches)
-            + " with max_util_for_resume=" + std::to_string(config.maxUtilForResume)
-            + " does not give a valid fixed slot count for the private SSM layer group");
-    }
-    return static_cast<SlotCount>(numSlots);
-}
-
-} // namespace
-
 // ---------------------------------------------------------------------------
 // createStorageConfig — factory function.
 // Mirrors _storage/_config.py::create_storage_config.
@@ -177,6 +147,18 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
             bufferGroups[lcId][{buf.coalescingGroup, expandedSize, buf.isSparse}].push_back(bid);
         }
     }
+    // Region buffers join their region's lifecycle. Regions admit no tokensPerBlockOverride
+    // and no sparse buffer, so the expansion is 1 and the pool dense.
+    for (int regionIndex = 0; regionIndex < registry.numRegions(); ++regionIndex)
+    {
+        LifeCycleId const lcId = registry.regionLifeCycleId(regionIndex);
+        for (auto const& [layerId, buf] : config.regions[static_cast<size_t>(regionIndex)].buffers)
+        {
+            BufferId bid{layerId, buf.role};
+            expansionMap[bid] = 1;
+            bufferGroups[lcId][{buf.coalescingGroup, buf.size, false}].push_back(bid);
+        }
+    }
 
     // Build one SlotDescVariant per life cycle.
     // Each variant: coalesced buffers sorted by size descending.
@@ -204,19 +186,21 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     }
 
     // Distinct reuse policies need separate GPU pools and eviction queues. Keying on
-    // per-pool sparsity too keeps a shared pool uniformly host-backed or device-backed. A lifecycle with a
-    // fixed capacity gets a pool group of its own, so that no ratio-sized lifecycle shares its slots.
+    // per-pool sparsity too keeps a shared pool uniformly host-backed or device-backed.
+    // A region with a fixed slot count gets a pool group of its own: KvCache::resume()
+    // gates on each pool group's utilization, so a count that leaves resume headroom for the
+    // region's owners holds only while no other lifecycle shares its slots.
     struct PoolGroupKey
     {
         ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
         std::vector<size_t> slotSizes;
         std::vector<bool> sparsity;
-        bool fixedCapacity = false;
+        std::optional<int> fixedRegionIndex;
 
         bool operator<(PoolGroupKey const& other) const
         {
-            return std::tie(reusePolicy, slotSizes, sparsity, fixedCapacity)
-                < std::tie(other.reusePolicy, other.slotSizes, other.sparsity, other.fixedCapacity);
+            return std::tie(reusePolicy, slotSizes, sparsity, fixedRegionIndex)
+                < std::tie(other.reusePolicy, other.slotSizes, other.sparsity, other.fixedRegionIndex);
         }
     };
 
@@ -232,11 +216,16 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         {
             sparsity.push_back(sg.isSparse(pool));
         }
-        bool const fixedCapacity = fixedSlotCount(config, lifeCycle).has_value();
+        std::optional<int> fixedRegionIndex;
+        if (auto const* ssm = std::get_if<SsmLifeCycle>(&lifeCycle); ssm != nullptr && ssm->regionIndex.has_value()
+            && config.regions[static_cast<size_t>(*ssm->regionIndex)].fixedSlotCount.has_value())
+        {
+            fixedRegionIndex = ssm->regionIndex;
+        }
         poolGroups[{.reusePolicy = policy,
                        .slotSizes = sizes.raw(),
                        .sparsity = sparsity.raw(),
-                       .fixedCapacity = fixedCapacity}]
+                       .fixedRegionIndex = fixedRegionIndex}]
             .push_back(std::move(sg));
     }
 
@@ -247,17 +236,12 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
 
     for (auto& [key, variants] : poolGroups)
     {
-        std::optional<SlotCount> fixedSlots;
-        if (key.fixedCapacity)
-        {
-            // SSM lifecycles are deduplicated by policy, so the PRIVATE SSM lifecycle is the only fixed one.
-            TLLM_CHECK_WITH_INFO(variants.size() == 1, "A fixed-capacity pool group must hold exactly one lifecycle");
-            fixedSlots = fixedSlotCount(config, registry.getLifeCycle(variants.front().lifeCycleId));
-        }
         SlotDesc sd;
         sd.variants = std::move(variants);
         out.slotDescList.push_back(std::move(sd));
-        out.fixedSlotCounts.push_back(fixedSlots);
+        out.fixedSlotCounts.push_back(key.fixedRegionIndex.has_value()
+                ? config.regions[static_cast<size_t>(*key.fixedRegionIndex)].fixedSlotCount
+                : std::nullopt);
     }
 
     // A21: Assert all life_cycle_ids across all SlotDescVariants are unique.

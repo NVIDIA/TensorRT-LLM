@@ -291,14 +291,12 @@ public:
     // Apply the stored min_slots constraint and fixed slot counts to a ratio list for GPU level.
     TypedVec<PoolGroupIndex, float> constrainPoolGroupRatio(TypedVec<PoolGroupIndex, float> const& ratio) const;
 
-    // Fixed slot count of each hot-tier pool group (see KVCacheManagerConfig::maxLiveKvCaches). Ratio-based
+    // Fixed slot count of each hot-tier pool group (see RegionConfig::fixedSlotCount). Ratio-based
     // sizing at construction, in adjustCacheLevel() and in tuner targets leaves these groups at that size.
     FixedSlotCounts const& fixedSlotCounts() const noexcept
     {
         return mFixedSlots;
     }
-
-    bool hasFixedPoolGroups() const noexcept;
 
     // Byte address of a slot's buffer in GPU memory (per-layer, with offset).
     MemAddress getMemPoolBaseAddress(LayerId layerId, DataRole role) const;

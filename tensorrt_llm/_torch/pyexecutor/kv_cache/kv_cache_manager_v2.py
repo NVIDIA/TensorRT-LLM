@@ -1897,9 +1897,6 @@ class KVCacheManagerV2(BaseResourceManager):
     # Staging rows per batch for recurrent-state snapshots taken inside the
     # forward (MambaHybridCacheManagerV2); 0 = none.
     inforward_snapshot_rows: int = 0
-    # KVCacheManagerConfig.max_live_kv_caches; None leaves living caches
-    # bounded only by the IndexMapper.
-    _live_kv_cache_limit: Optional[int] = None
     # Block width of a drafter whose layers share this manager, else 0.
     _shared_draft_block_width: int = 0
 
@@ -2409,13 +2406,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
 
         self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
-        # Costing the memory budget below already reads the declared regions.
-        self._declare_regions()
 
         # Both diagnostics below are off unless their environment variable is
         # set; with neither set nothing here changes any allocation, any page
         # content or any reported count. The IndexMapper capacity bounds the
-        # living KV caches, which the quota and the cache config below read.
+        # living KV caches, which region declarations and the quota read.
         self._guard_page_fill, self._guard_page_value = _read_guard_page_setting()
         self.max_admissible_sequences, self._index_mapper_capacity = _compute_index_mapper_capacity(
             max_batch_size,
@@ -2425,6 +2420,8 @@ class KVCacheManagerV2(BaseResourceManager):
             num_reserved_index_slots=num_reserved_index_slots,
             has_guard_page=self._guard_page_value is not None,
         )
+        # Costing the memory budget below already reads the declared regions.
+        self._declare_regions()
         max_util_for_resume = kv_cache_config.max_util_for_resume
         quota = sys.maxsize
         if (
@@ -2434,11 +2431,8 @@ class KVCacheManagerV2(BaseResourceManager):
             quota = int(kv_cache_config.max_gpu_total_bytes)
             logger.info(f"max_gpu_total_bytes is provided. New quota is {quota / (1 << 30)}GiB")
         if kv_cache_config.max_tokens is not None:
-            quota_from_max_tokens = int(
-                math.ceil(
-                    self._get_quota_from_max_tokens(kv_cache_config.max_tokens)
-                    / max_util_for_resume
-                )
+            quota_from_max_tokens = self._gpu_quota_for_max_tokens(
+                kv_cache_config.max_tokens, max_util_for_resume
             )
             quota = min(quota, quota_from_max_tokens)
             logger.info(
@@ -2456,8 +2450,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # across PP ranks, including fixed per-rank costs.
         if mapping.world_size > 1:
             dist = Distributed.get(mapping)
-            resumable_quota = int(quota * max_util_for_resume)
-            max_tokens = self._get_max_tokens_from_quota(resumable_quota)
+            max_tokens = self._max_tokens_for_gpu_quota(quota, max_util_for_resume)
             max_tokens = dist.allreduce(max_tokens, op=ReduceOp.MIN)
             # inf max_tokens means all layers are SWA and every rank quota can
             # fit all SWA fixed cache.
@@ -2466,9 +2459,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 # token↔quota round-trip is not identity when SWA layers
                 # dominate (full_attn_size_per_token==0), so clamp to guard
                 # against a bogus inflation (nvbugs/6418103).
-                synced_quota = int(
-                    math.ceil(self._get_quota_from_max_tokens(max_tokens) / max_util_for_resume)
-                )
+                synced_quota = self._gpu_quota_for_max_tokens(max_tokens, max_util_for_resume)
                 quota = min(quota, synced_quota)
 
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
@@ -2567,10 +2558,10 @@ class KVCacheManagerV2(BaseResourceManager):
             tokens_per_block=tokens_per_block,
             cache_tiers=cache_tiers,
         )
-        config = self._lay_out_regions(config)
         config = self._build_cache_config(config)
         config = self._remove_zero_size_buffers(config)
         config = self._add_mixed_precision_layers(config)
+        config = self._lay_out_regions(config)
         has_host_cache_tier = any(
             isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
         )
@@ -2644,7 +2635,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 ],
             )
         self.kv_cache_manager_py_config = config
-        self._live_kv_cache_limit = config.max_live_kv_caches
         self.impl = candidate
         self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
@@ -3469,6 +3459,16 @@ class KVCacheManagerV2(BaseResourceManager):
         """Return the resident generation requests used for SWA sizing."""
         return self.max_batch_size
 
+    def _gpu_quota_for_max_tokens(self, max_tokens: float, max_util_for_resume: float) -> int:
+        """GPU quota holding ``max_tokens`` at ``max_util_for_resume``, plus the fixed regions."""
+        ratio_sized_quota = self._get_quota_from_max_tokens(max_tokens)
+        return int(math.ceil(ratio_sized_quota / max_util_for_resume)) + self._fixed_region_quota()
+
+    def _max_tokens_for_gpu_quota(self, quota: int, max_util_for_resume: float) -> float:
+        """Tokens ``quota`` holds at ``max_util_for_resume`` once the fixed regions are taken out."""
+        ratio_sized_quota = max(quota - self._fixed_region_quota(), 0)
+        return self._get_max_tokens_from_quota(int(ratio_sized_quota * max_util_for_resume))
+
     def _get_max_tokens_from_quota(self, quota: int) -> float:
         """Rank-local byte quota -> token capacity (GLOBAL tokens under helix)."""
         tokens = self._get_max_tokens_from_quota_impl(quota)
@@ -4144,9 +4144,8 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager.
 
-        Runs after the regions are laid out; a layer holding buffers that
-        ``region_layout`` assigns to a region is the regions' and must be left
-        as declared.
+        Runs before the declared regions are laid out (see ``_lay_out_regions``);
+        a region's buffers never appear in the layer configs.
         """
         return config
 
@@ -4169,21 +4168,14 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def _lay_out_regions(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
-        """Replace the base config of every layer a region covers with the regions' buffers."""
+        """Add the declared regions to the final layer list as native region configs."""
         if self._region_layout is None:
             self._declare_regions()
         regions = self._region_layout.regions
-        layers, self._region_layout = lay_out_regions(regions, config.layers)
+        region_configs, self._region_layout = lay_out_regions(regions, config.layers)
         if not regions:
             return config
-        # Per-request storage is snapshotted only at commit endpoints, which the
-        # runtime enforces through minimum-snapshot commits.
-        has_slot_storage = any(isinstance(layer, SsmLayerConfig) for layer in layers)
-        return replace(
-            config,
-            layers=list(layers),
-            commit_min_snapshot=config.commit_min_snapshot or has_slot_storage,
-        )
+        return replace(config, regions=region_configs)
 
     @property
     def region_layout(self) -> RegionLayout:
@@ -4195,6 +4187,15 @@ class KVCacheManagerV2(BaseResourceManager):
     def get_region_group_ids(self, region: str) -> Tuple[int, ...]:
         """Layer group ids of ``region``'s buffers, ascending; empty for an undeclared region."""
         return self.region_layout.group_ids(region, self.impl)
+
+    def _fixed_region_quota(self) -> int:
+        """GPU bytes of the declared regions' fixed pools.
+
+        A fixed slot count already carries the headroom ``KvCache.resume``
+        needs, so the quota adds these bytes as they are, outside the
+        ``1 / max_util_for_resume`` scaling of the ratio-sized pools.
+        """
+        return self.region_layout.fixed_bytes()
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Exclude empty buffers before creating the runtime storage pools."""
@@ -4233,7 +4234,8 @@ class KVCacheManagerV2(BaseResourceManager):
         if not layers:
             raise ValueError("KVCacheManagerV2 requires at least one non-empty local cache layer")
 
-        if self._region_layout is not None and self._region_layout.owners:
+        # Regions are declared against the uncompacted layer ids and laid out after this.
+        if self._region_layout is not None and self._region_layout.regions:
             self._region_layout = self._region_layout.renumbered(retained_layer_ids)
         # Runtime layer IDs are local offsets. Compact every per-layer view
         # together while preserving the model's global layer IDs and count.
@@ -4538,13 +4540,8 @@ class KVCacheManagerV2(BaseResourceManager):
         is valid only for a fixed manager/backend pair. A manager whose backend
         selects the layout at runtime must derive the mapping from that
         backend's configuration.
-
-        Declared regions add the kinds of their transferred roles.
         """
-        kinds = {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED}
-        for region in self.region_layout.regions:
-            kinds.update(region.transfer.mapper_kinds)
-        return kinds
+        return {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED}
 
     def get_disagg_role_layouts(self) -> dict[DataRole, RoleLayout]:
         """Resharding geometry for roles whose mapper kind needs it.
@@ -4552,13 +4549,10 @@ class KVCacheManagerV2(BaseResourceManager):
         SECTIONED roles declare ``section_bytes``; INDEXED roles whose head
         count is not derivable from the attention topology declare
         ``bytes_per_head``. Attention K/V and replicated roles need none, so
-        the base manager declares only the layouts of its regions' roles. The
-        page-table builder copies the layout onto the role's ``PoolView``.
+        the base manager declares nothing. The page-table builder copies the
+        layout onto the role's ``PoolView``.
         """
-        layouts = {}
-        for region in self.region_layout.regions:
-            layouts.update(region.transfer.role_layouts)
-        return layouts
+        return {}
 
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
         """Return local-only buffer roles excluded from disaggregation.
@@ -4566,12 +4560,9 @@ class KVCacheManagerV2(BaseResourceManager):
         Specialized managers may register storage-only buffers to satisfy
         physical pool layout constraints. Such buffers remain part of local
         slot copies, but contain no model state that needs to be transferred
-        between disaggregated workers. Declared regions add the roles their
-        receiving worker rebuilds.
+        between disaggregated workers.
         """
-        return frozenset(
-            role for region in self.region_layout.regions for role in region.transfer.rebuilt_roles
-        )
+        return frozenset()
 
     def get_disagg_pool_view_partition(
         self, layer_id: LayerId, role: DataRole
@@ -8688,19 +8679,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 request_id,
                 self.index_mapper.size(),
                 self.index_mapper.size(),
-            )
-            return None
-        if (
-            self._live_kv_cache_limit is not None
-            and len(self.kv_cache_map) >= self._live_kv_cache_limit
-        ):
-            # The native manager raises beyond this bound; callers retry a
-            # request whose cache cannot be created yet, as for a full IndexMapper.
-            logger.warning(
-                "Request %s would exceed max_live_kv_caches=%d living KV caches. "
-                "Skipping KV cache creation; request will retry next iteration.",
-                request_id,
-                self._live_kv_cache_limit,
             )
             return None
         # Synthetic requests must neither claim real prefixes nor publish reusable blocks.

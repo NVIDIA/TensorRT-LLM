@@ -104,12 +104,6 @@ lifecycle groups. Use `getBufferGroupId(layerId, role)` and `bufferGrouping()`
 (`get_buffer_group_id` and `buffer_grouping` in Python) for exact membership.
 These APIs return or index by `CacheGroupId`, a public alias of `LifeCycleId`.
 `LayerGroupId` remains a lifecycle alias for legacy APIs.
-Lifecycle ids follow registration order in two passes over layers and their
-buffers: first buffers on their layer's policy (no override, or an override
-equal to it), then buffers whose override differs. A lifecycle that only a
-buffer override creates (for example a PRIVATE replay group of REQUIRED SSM
-layers) is numbered after every layer lifecycle, so adding it never renumbers
-the existing groups.
 The legacy `getLayerGroupId(layerId)` and `layerGrouping()` are deprecated in
 documentation only: uniform layers retain their results, while a split layer
 fails a `TLLM_CHECK_WITH_INFO` (for the queried layer or the entire partition,
@@ -128,9 +122,20 @@ KVCM supports independent policies for callers that provide those indices.
 The sparse fetch path configured by `sparseCache` still uses one group per layer;
 its setup uses the checked layer lookup and rejects split layers.
 
-SSM lifecycles are deduplicated by policy, so a manager can have up to three SSM
-groups; iterate `ssmLifeCycleIds()` for working state and use
-`requiredSsmLifeCycleId()` only for prefix pruning.
+SSM lifecycles of layer buffers are deduplicated by policy, so layer configs give
+a manager up to three SSM groups; iterate `ssmLifeCycleIds()` for working state
+and use `requiredSsmLifeCycleId()` only for prefix pruning.
+
+`KVCacheManagerConfig::regions` declares buffers whose lifecycle comes from a
+`RegionConfig` rather than from a layer config. Each region has a lifecycle of
+its own: the region index is part of the `SsmLifeCycle` key, so a region never
+merges with a layer lifecycle or another region of equal policy. Region
+lifecycles are registered after every layer lifecycle, in declaration order, so
+declaring one never renumbers the layer groups. Only request regions with the
+`PRIVATE` policy are supported, on layers that have an `SsmLayerConfig`; a
+`(layer, role)` pair belongs to one layer config or one region. A region is an
+`SsmLifeCycle`, so every kind-dispatch site treats it as SSM state: one slot per
+cache and beam. `getRegionGroupId(name)` (`get_region_group_id`) resolves it.
 Optional SSM checkpoints require an exact endpoint match, including partial
 blocks. Fresh or unselected recurrent state must be initialized or reconstructed
 by the caller before inference. A pool-group index is a storage-layout index and is
@@ -356,20 +361,17 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
   becomes a byte ratio that splits the GPU quota above the constraint floors in
   `mHotMinSlots`. `CacheLevelStorage::ratioToSlotCountList` does this at
   construction, in `adjustCacheLevel()` (`resize()`/`adjust()`) and for tuner
-  targets (`constrainPoolGroupRatio()`). When `maxLiveKvCaches` is set, the
-  PRIVATE SSM lifecycle instead gets a pool group of its own with a fixed
-  capacity of `ceil(maxLiveKvCaches / maxUtilForResume)` slots
-  (`StorageConfig::fixedSlotCounts`): its pages never enter the radix tree and
-  each living cache holds exactly one, so that capacity keeps the group at or
-  below the resume gate. All three call sites take fixed groups out of the quota
-  first and split the rest by ratio; their ratio entries are ignored, `adjust()`
-  never resizes them, and their tuner target is their actual size. The fixed
-  capacity is also the group's entry in `mHotMinSlots`, so a GPU quota too small
-  for all floors is raised to fit it, as for the elastic floors.
-  `createKvCache()` enforces the bound (suspended caches count) and
-  `setBeamWidth()` rejects widths above one. Other PRIVATE lifecycles, such as
-  windowed attention, stay ratio-sized because their per-cache demand depends on
-  sequence length; cold tiers are sized as before.
+  targets (`constrainPoolGroupRatio()`). A region with
+  `RegionConfig::fixedSlotCount` instead gets a pool group of its own with
+  exactly that many slots (`StorageConfig::fixedSlotCounts`). All three call
+  sites take fixed groups out of the quota first and split the rest by ratio;
+  their ratio entries are ignored, `adjust()` never resizes them, and their tuner
+  target is their actual size. The fixed count is also the group's entry in
+  `mHotMinSlots`, so a GPU quota too small for all floors is raised to fit it, as
+  for the constraint floors. The region owner computes the count, including the
+  headroom `KvCache::resume()` needs below `maxUtilForResume`; the group is the
+  region's alone because that gate reads each pool group's utilization. Cold
+  tiers are sized as before.
 - `NodeRef` is a stable `std::list` iterator, but only within the exact
   `LRUEvictionPolicy` that issued it. Iterators from different lists are not
   comparable or interchangeable.

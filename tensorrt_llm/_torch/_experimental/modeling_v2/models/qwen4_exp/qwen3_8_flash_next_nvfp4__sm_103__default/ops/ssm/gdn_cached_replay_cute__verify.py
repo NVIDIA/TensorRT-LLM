@@ -2259,6 +2259,7 @@ class GdnCachedReplayCute(OpWrapper):
         output: Optional[torch.Tensor] = None,
         in_kernel_commit: Optional[bool] = None,
         config: Optional[dict] = None,
+        replay_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return cached_replay_update(
             q=q,
@@ -2287,6 +2288,7 @@ class GdnCachedReplayCute(OpWrapper):
             output=output,
             in_kernel_commit=in_kernel_commit,
             config=config,
+            replay_indices=replay_indices,
         )
 
     def reference(
@@ -2323,6 +2325,7 @@ class GdnCachedReplayCute(OpWrapper):
         output: Optional[torch.Tensor] = None,
         in_kernel_commit: Optional[bool] = None,
         config: Optional[dict] = None,
+        replay_indices: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """`(out, ssm_states, old_u, old_k, old_G)` as the call leaves them;
         mutates nothing. The state is rebuilt from the checkpoint and history
@@ -2370,15 +2373,16 @@ class GdnCachedReplayCute(OpWrapper):
         if live.numel() == 0:
             return out.to(out_dtype), pool, u_buf, k_buf, G_buf
         slot = state_indices[:N][live].long()
-        p = prev_num_accepted_tokens[slot].long()
-        b = cache_buf_idx[slot].long()
+        rslot = slot if replay_indices is None else replay_indices[:N][live].long()
+        p = prev_num_accepted_tokens[rslot].long()
+        b = cache_buf_idx[rslot].long()
         M, depth = live.numel(), old_u.shape[2]
 
         # 1. the pending state: checkpoint plus the p history entries of half b
         pending = torch.arange(depth, device=dev)[None, :] < p[:, None]  # [M, depth]
-        Gh = torch.where(pending[:, None, :], old_G[slot, b].float(), 0.0)  # [M, HV, depth]
-        Uh = torch.where(pending[:, :, None, None], old_u[slot, b].float(), 0.0)
-        Kh = torch.where(pending[:, :, None, None], old_k[slot, b].float(), 0.0)
+        Gh = torch.where(pending[:, None, :], old_G[rslot, b].float(), 0.0)  # [M, HV, depth]
+        Uh = torch.where(pending[:, :, None, None], old_u[rslot, b].float(), 0.0)
+        Kh = torch.where(pending[:, :, None, None], old_k[rslot, b].float(), 0.0)
         Kh = Kh.repeat_interleave(rep, dim=2)  # [M, depth, HV, K]
         last = (p - 1).clamp(min=0)[:, None, None].expand(M, HV, 1)
         g_start = torch.where(p[:, None] > 0, Gh.gather(2, last).squeeze(2), 0.0)  # [M, HV]
@@ -2408,10 +2412,10 @@ class GdnCachedReplayCute(OpWrapper):
         w_off = torch.where(wrap, 0, p)
         for t in range(T):
             pos = w_off + t
-            u_buf[slot, w_buf, pos] = u_new[t].to(u_buf.dtype)
-            k_buf[slot, w_buf, pos] = kf[live, t].to(k_buf.dtype)
+            u_buf[rslot, w_buf, pos] = u_new[t].to(u_buf.dtype)
+            k_buf[rslot, w_buf, pos] = kf[live, t].to(k_buf.dtype)
             G_store = torch.where(wrap[:, None], G_new[t], g_start + G_new[t])
-            G_buf[slot, w_buf, :, pos] = G_store.to(G_buf.dtype)
+            G_buf[rslot, w_buf, :, pos] = G_store.to(G_buf.dtype)
         commit = replay_work_items is None if in_kernel_commit is None else bool(in_kernel_commit)
         if commit and bool(wrap.any()):
             pool[slot[wrap]] = checkpoint[wrap].to(pool.dtype)
@@ -2451,6 +2455,7 @@ class GdnCachedReplayCute(OpWrapper):
         output: Optional[torch.Tensor] = None,
         in_kernel_commit: Optional[bool] = None,
         config: Optional[dict] = None,
+        replay_indices: Optional[torch.Tensor] = None,
     ) -> None:
         N, _, H, K = k.shape
         HV, V = v.shape[2], v.shape[3]
@@ -2459,18 +2464,28 @@ class GdnCachedReplayCute(OpWrapper):
             "kernel reads one slot per sequence with no bound, so a shorter tensor hands the "
             "trailing rows whatever follows it in memory, and they write that slot's history"
         )
-        pool_slots, slots = ssm_states.shape[0], old_u.shape[0]
-        assert slots >= pool_slots, (
-            f"the history buffers have {slots} slots for a {pool_slots}-slot pool -- a slot "
-            "past the history's end is read and written out of bounds"
+        # The history is addressed by the replay slots, the state slots when none are given.
+        if replay_indices is None:
+            history_slots, slot_space = ssm_states.shape[0], "the recurrent pool"
+        else:
+            assert replay_indices.dim() == 1 and replay_indices.shape[0] >= N, (
+                f"replay_indices has shape {tuple(replay_indices.shape)} for {N} sequences -- "
+                "the kernel reads one replay slot per sequence with no bound"
+            )
+            history_slots, slot_space = int(replay_indices[:N].max()) + 1, "the replay slots"
+        slots = old_u.shape[0]
+        assert slots >= history_slots, (
+            f"the history buffers have {slots} slots for {history_slots} of {slot_space} -- a "
+            "slot past the history's end is read and written out of bounds"
         )
         for name, tensor in (
             ("prev_num_accepted_tokens", prev_num_accepted_tokens),
             ("cache_buf_idx", cache_buf_idx),
         ):
-            assert tensor.dim() == 1 and tensor.is_contiguous() and tensor.shape[0] >= pool_slots, (
-                f"{name} has shape {tuple(tensor.shape)} and stride {tensor.stride()}; the kernel "
-                f"reads one element per slot of the {pool_slots}-slot pool, at the slot's index"
+            assert tensor.dim() == 1 and tensor.shape[0] >= history_slots, (
+                f"{name} has shape {tuple(tensor.shape)}; the kernel reads one element per "
+                f"history slot ({history_slots} of {slot_space}), at the slot's index times "
+                "the element stride"
             )
         expected = {
             "old_u": (old_u, (slots, 2, history_size, HV, V)),

@@ -151,8 +151,9 @@ class MambaState(Protocol):
 class MambaReplayState(MambaState, Protocol):
     """Recurrent state whose replay history lives in manager-declared buffers.
 
-    The hybrid manager declares the buffers of ``replay_layout()`` as a region
-    of its recurrent layers (see ``MambaHybridCacheManagerV2.declare_regions``)
+    The hybrid manager lays out the buffers of ``replay_layout()`` as a region
+    with slots of their own, or, when ``replay_shares_state_slot``, as buffers
+    of the recurrent-state slot (see ``MambaHybridCacheManagerV2.declare_regions``),
     and binds their views through ``bind_replay_pool()``.
     """
 
@@ -185,7 +186,8 @@ class MambaReplayState(MambaState, Protocol):
         """Reset the context requests in recurrent-state ``slots``.
 
         ``replay_slots`` are the requests' replay slots; ``None`` means
-        ``slots``. The manager passes them only for a PRIVATE replay group.
+        ``slots``. The manager passes them only when the replay buffers have
+        slots of their own.
         """
 
 

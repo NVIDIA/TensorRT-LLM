@@ -287,11 +287,11 @@ def _offload_and_resume(manager, request_ids):
         for pool in manager.impl.pool_group_descs
         if any(variant.layer_group_id == group for variant in pool.slot_desc.variants)
     )
-    # Every living cache holds a replay slot, so stay within max_live_kv_caches.
+    # Every living cache holds a replay slot, and the replay region has room, resume headroom included, for the
+    # IndexMapper's living caches only.
     num_pressure = pool.num_slots + len(caches)
-    max_live_kv_caches = manager.kv_cache_manager_py_config.max_live_kv_caches
-    if max_live_kv_caches is not None:
-        num_pressure = min(num_pressure, max_live_kv_caches - len(manager.kv_cache_map))
+    if manager.replay_layer_group_id is not None:
+        num_pressure = min(num_pressure, manager._index_mapper_capacity - len(manager.kv_cache_map))
     pressure = []
     try:
         for _ in range(num_pressure):

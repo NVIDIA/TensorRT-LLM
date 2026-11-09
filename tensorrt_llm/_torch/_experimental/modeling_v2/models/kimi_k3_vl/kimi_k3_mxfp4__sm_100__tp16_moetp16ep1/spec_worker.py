@@ -38,12 +38,6 @@ def dflash_ctx_rows_kwargs(draft_model, ctx_rows_start: Optional[int]) -> dict:
     return {"ctx_rows_start": ctx_rows_start}
 
 
-def _replay_state_indices(mamba_metadata) -> torch.Tensor:
-    """The requests' slots in the KDA replay record, which differ from the state slots when the cache manager keeps
-    the replay state in a pool of its own."""
-    return getattr(mamba_metadata, "replay_state_indices", mamba_metadata.state_indices)
-
-
 def capture_view(
     spec_metadata: Optional[SpecMetadata], layer_id: int, num_tokens: int
 ) -> Optional[torch.Tensor]:
@@ -165,7 +159,7 @@ class KimiK3DFlashWorker(DFlashWorker):
             or mgr._kda_replay.prev_num_accepted_tokens is None
             or getattr(mgr, "_dummy_request_mask", None) is None
             or mamba_metadata is None
-            or _replay_state_indices(mamba_metadata).dtype != torch.int32
+            or mamba_metadata.replay_state_indices.dtype != torch.int32
         ):
             return False
         # The kernel's block counts are backed entries, which a sliding-window
@@ -474,7 +468,7 @@ class KimiK3DFlashWorker(DFlashWorker):
             self._ctx_block_counts,
             self._ctx_block_tables,
             mgr._kda_replay.prev_num_accepted_tokens,
-            _replay_state_indices(attn_metadata.mamba_metadata),
+            attn_metadata.mamba_metadata.replay_state_indices,
             mgr._dummy_request_mask,
             attn_metadata.kv_lens_cuda,
             self._batch_to_slot_buffer.tensor,

@@ -335,6 +335,10 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     // A fixed-capacity group's floor is its fixed size, so every quota check reserves it. Like the
     // elastic floors, it raises a GPU quota that is too small to hold all floors.
     mFixedSlots = config.fixedSlotCounts;
+    if (mFixedSlots.empty())
+    {
+        mFixedSlots = FixedSlotCounts(numPoolGroups(), std::nullopt);
+    }
     TLLM_CHECK_WITH_INFO(mFixedSlots.size() == numPoolGroups(), "Fixed slot counts must cover every pool group");
     for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(); ++pgIdx)
     {
@@ -405,7 +409,8 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     {
         if (mFixedSlots[pgIdx])
         {
-            TLLM_LOG_INFO("KVCacheManagerV2: GPU pool group %d (layer group %d) has a fixed capacity of %lld slots",
+            TLLM_LOG_INFO(
+                "KVCacheManagerV2: GPU pool group %d (region layer group %d) has a fixed capacity of %lld slots",
                 pgIdx.value(), mHotPoolGroupMapping.lifeCycles(pgIdx)[0].value(),
                 static_cast<long long>(gpuSlotCounts[pgIdx]));
         }
@@ -2317,11 +2322,6 @@ TypedVec<PoolGroupIndex, float> StorageManager::constrainPoolGroupRatio(
     // have to be: _needAdjustment treats this as a prediction of the allocator's own output
     // and re-fires until the two agree.
     return normalizeToRatio(gpuStorage.allMediaBytes(slotCountList));
-}
-
-bool StorageManager::hasFixedPoolGroups() const noexcept
-{
-    return std::any_of(mFixedSlots.begin(), mFixedSlots.end(), [](auto const& fixed) { return fixed.has_value(); });
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -78,6 +78,7 @@ def test_forward_preserves_native_int32_state_indices(monkeypatch):
     metadata = SimpleNamespace(
         mamba_metadata=SimpleNamespace(
             state_indices=state_indices,
+            replay_state_indices=state_indices,
             query_start_loc_long=torch.zeros(1, dtype=torch.long),
         ),
         num_contexts=0,
@@ -192,8 +193,10 @@ class _LayerCache:
 
 def _decode_metadata(layer_cache: SimpleNamespace, slot_indices: torch.Tensor) -> SimpleNamespace:
     batch = slot_indices.shape[0]
+    state_indices = slot_indices.to(torch.int32)
     mamba_metadata = SimpleNamespace(
-        state_indices=slot_indices.to(torch.int32),
+        state_indices=state_indices,
+        replay_state_indices=state_indices,
         query_start_loc_long=torch.zeros(1, device=slot_indices.device, dtype=torch.long),
         _arange_buffer=torch.arange(batch + 1, device=slot_indices.device, dtype=torch.int32),
     )
@@ -212,8 +215,10 @@ def _prefill_metadata(
     layer_cache: SimpleNamespace, slot_indices: torch.Tensor, cu_seqlens: torch.Tensor
 ) -> SimpleNamespace:
     batch = slot_indices.shape[0]
+    state_indices = slot_indices.to(torch.int32)
     mamba_metadata = SimpleNamespace(
-        state_indices=slot_indices.to(torch.int32),
+        state_indices=state_indices,
+        replay_state_indices=state_indices,
         query_start_loc=cu_seqlens.to(torch.int32),
         query_start_loc_long=cu_seqlens,
         has_initial_states=torch.zeros(batch, dtype=torch.bool, device=slot_indices.device),

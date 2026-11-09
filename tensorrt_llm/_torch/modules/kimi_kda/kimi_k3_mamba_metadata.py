@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Host-prepared scheduling metadata for packed FlashInfer KDA prefill."""
+"""Host-prepared KDA metadata: packed FlashInfer prefill schedule and aligned slot vectors."""
 
 from itertools import accumulate
 
@@ -46,6 +46,7 @@ class KimiK3MambaMetadata(Mamba2Metadata):
             f"Expected positive context lengths, got {context_lengths}"
         )
 
+        # Mamba2Metadata.prepare fills replay_state_indices from the manager.
         super().prepare(attn_metadata)
 
         self.generation_state_indices = None

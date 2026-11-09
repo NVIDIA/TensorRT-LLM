@@ -512,7 +512,7 @@ def test_v2_builder_resolves_mixed_precision_high_layer_heads(virtual_layers: bo
     }
     manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
     manager.layer_specs = None
-    manager.impl.layer_grouping = (high_layers,)
+    manager._layer_ids_by_group = [list(high_layers)]
     manager.impl.init_config.layers.extend(
         [SimpleNamespace(window_size=128), SimpleNamespace(window_size=128)]
     )

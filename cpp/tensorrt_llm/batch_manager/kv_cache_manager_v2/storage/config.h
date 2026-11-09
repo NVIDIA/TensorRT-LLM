@@ -46,8 +46,8 @@ using PoolIndex = StrongIndex<int, struct PoolIndexTag>;
 using SlotCount = std::int64_t;
 // Slot index within a pool.
 using SlotId = StrongIndex<SlotCount, struct SlotIdTag>;
-// Fixed slot count of each pool group of a cache level; nullopt marks an elastic group, which ratio-based
-// sizing distributes the remaining quota to. An empty list makes every group elastic.
+// Fixed slot count of each pool group of a cache level; nullopt marks a group that ratio-based
+// sizing distributes the quota to. An empty list makes every group ratio-sized.
 using FixedSlotCounts = TypedVec<PoolGroupIndex, std::optional<SlotCount>>;
 
 [[nodiscard]] inline SlotCount slotCountValueFromSize(std::size_t count) noexcept
@@ -240,8 +240,8 @@ struct StorageConfig
 {
     TypedVec<CacheLevel, CacheTierConfig> cacheTiers;
     TypedVec<PoolGroupIndex, SlotDesc> slotDescList;
-    // Fixed GPU slot count of each entry of slotDescList. Only a pool group holding just the PRIVATE SSM
-    // lifecycle has one, and only when KVCacheManagerConfig::maxLiveKvCaches is set.
+    // Fixed GPU slot count of each entry of slotDescList: set only for the pool group of a region
+    // with RegionConfig::fixedSlotCount. Empty or all-nullopt when there is none.
     FixedSlotCounts fixedSlotCounts;
 
     //! Host bytes the GPU tier's host-backed pools may take, or unset for unbounded.

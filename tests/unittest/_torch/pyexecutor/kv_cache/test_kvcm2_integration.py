@@ -291,7 +291,6 @@ class _FakeManagerConfig:
             )
         ]
     )
-    max_live_kv_caches: int | None = None
 
 
 class _FakeKVCache:
@@ -700,7 +699,7 @@ def _layer_api_snapshot(manager: KVCacheManagerV2) -> dict:
             for layer in config.layers
         ],
         "commit_min_snapshot": config.commit_min_snapshot,
-        "max_live_kv_caches": config.max_live_kv_caches,
+        "regions": [region.name for region in config.regions],
         "initial_pool_ratio": config.initial_pool_ratio,
         "pool_groups": [
             (int(group.num_slots), list(group.slot_desc.slot_size_list), len(group.pools))

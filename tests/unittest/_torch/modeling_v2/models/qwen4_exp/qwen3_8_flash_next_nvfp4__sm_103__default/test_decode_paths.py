@@ -275,7 +275,7 @@ def _gdn_block(layer, x, si, int_idx, conv0, win0, p, captured, monkeypatch):
     target = object.__new__(M.DecodeTarget)
     target.core = core
     target._gdn_epilogue = lambda out, z, L, num_tokens: z.clone()
-    verify = (int_idx, None, None, False)
+    verify = (int_idx, None, None, False, None)
     z = target._gdn_block(x, 0, layer, si, verify, p, captured=captured)
     pools = core._bound.pools
     return dict(seen, z=z, conv=pools.conv[0], win=core._bound.int_conv[0])
