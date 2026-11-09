@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
     from tensorrt_llm.sampling_params import SamplingParams
 
+from tensorrt_llm._torch.modules.fla.replay_promotion import promote_conv_and_advance_replay_triton
 from tensorrt_llm._torch.modules.mamba.cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
     ReplayStateUpdateMetadata,
@@ -983,6 +984,13 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
     Delegates to PythonMambaCacheManager.
     """
 
+    @property
+    def mamba_metadata_cls(self):
+        """Mamba metadata with the replay slots and work items the replay path reads."""
+        from tensorrt_llm._torch.modules.mamba.replay_metadata import ReplayMamba2Metadata
+
+        return ReplayMamba2Metadata
+
     def __init__(
         self,
         d_state: int,
@@ -1147,6 +1155,13 @@ class _LegacyMambaHybridCacheManager(MambaHybridCacheManager):
     """
 
     _supports_additional_snapshot_offsets = False
+
+    @property
+    def mamba_metadata_cls(self):
+        """Mamba metadata with the replay slots and work items the replay path reads."""
+        from tensorrt_llm._torch.modules.mamba.replay_metadata import ReplayMamba2Metadata
+
+        return ReplayMamba2Metadata
 
     def _setup_mtp_intermediate_states(self, spec_config, max_batch_size: int) -> None:
         self.spec_config = spec_config
@@ -1970,6 +1985,17 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
     def use_gdn_cached_replay_all_layer_commit(self) -> bool:
         return self._use_gdn_cached_replay_all_layer_commit
 
+    def gdn_replay_partitioned(self, num_decodes: int) -> bool:
+        """Whether a GDN decode batch of num_decodes requests takes the
+        partitioned cached replay and one all-layer checkpoint commit; other
+        batches commit inside each layer, as the fused target verify of the
+        model's GDN layers (gdn_fused_verify) does at every batch size."""
+        from tensorrt_llm._torch.modules.fla.cached_replay import (
+            CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
+        )
+
+        return not self.gdn_fused_verify and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+
     def _commit_gdn_cached_replay_history_layers(
         self,
         attn_metadata: "AttentionMetadata",
@@ -2164,25 +2190,30 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
         # Conv: both paths save all intermediate conv windows, carry over the
         # accepted one. The replay path also advances PNAT and the active cache
         # buffer in this same launch.
-        replay_dummy_request_mask = None
         if self._use_replay_state_update:
-            replay_dummy_request_mask = self._dummy_request_mask[
-                num_contexts : num_contexts + num_gens
-            ]
-        _promote_mamba_state_triton(
-            self.all_conv_states,
-            self.intermediate_conv_states,
-            src_state_indices,
-            accepted_position_source,
-            state_indices_d,
-            num_accepted_tokens=accepted_tokens,
-            position_source_is_token_count=position_source_is_token_count,
-            replay_pnat=(self.prev_num_accepted_tokens if self._use_replay_state_update else None),
-            replay_cache_buf_idx=(self.cache_buf_idx if self._use_replay_state_update else None),
-            dummy_request_mask=replay_dummy_request_mask,
-            replay_step_width=(self.replay_step_width if self._use_replay_state_update else 0),
-            replay_history_size=(self.replay_history_size if self._use_replay_state_update else 0),
-        )
+            promote_conv_and_advance_replay_triton(
+                self.all_conv_states,
+                self.intermediate_conv_states,
+                src_state_indices,
+                accepted_position_source,
+                state_indices_d,
+                num_accepted_tokens=accepted_tokens,
+                replay_pnat=self.prev_num_accepted_tokens,
+                replay_cache_buf_idx=self.cache_buf_idx,
+                dummy_request_mask=self._dummy_request_mask[num_contexts : num_contexts + num_gens],
+                replay_step_width=self.replay_step_width,
+                replay_history_size=self.replay_history_size,
+                position_source_is_token_count=position_source_is_token_count,
+            )
+        else:
+            _promote_mamba_state_triton(
+                self.all_conv_states,
+                self.intermediate_conv_states,
+                src_state_indices,
+                accepted_position_source,
+                state_indices_d,
+                position_source_is_token_count=position_source_is_token_count,
+            )
 
     def get_num_available_tokens(
         self, token_num_upper_bound: int, max_num_draft_tokens: int = 0, **kwargs

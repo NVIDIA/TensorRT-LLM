@@ -639,7 +639,7 @@ def commit_gdn_cached_replay_history_layers(
     width ``REPLAY_WORK_ITEM_WIDTH`` address the history by their replay slot;
     narrower rows by their state slot.
     """
-    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import REPLAY_WORK_REPLAY_SLOT
+    from tensorrt_llm._torch.modules.mamba.replay_metadata import REPLAY_WORK_REPLAY_SLOT
 
     use_state_descriptors = ssm_state_descriptors is not None
     state_stride_args = (

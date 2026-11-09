@@ -61,7 +61,7 @@ from tensorrt_llm._torch.modules.fla.cached_replay import (
     CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
     commit_gdn_cached_replay_history_layers,
 )
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
+from tensorrt_llm._torch.modules.mamba.replay_metadata import (
     REPLAY_WORK_ITEM_WIDTH,
     _build_replay_work_items_triton,
 )

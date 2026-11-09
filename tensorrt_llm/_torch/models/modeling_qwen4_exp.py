@@ -796,7 +796,7 @@ class Qwen4ExpModel(DecoderModel):
             mamba_metadata is not None
             and getattr(mamba_metadata, "max_batch_size", None) != attn_metadata.max_num_requests
         ):
-            attn_metadata.mamba_metadata = Mamba2Metadata(
+            attn_metadata.mamba_metadata = type(mamba_metadata)(
                 attn_metadata.max_num_requests, chunk_size=128
             )
             mamba_metadata = attn_metadata.mamba_metadata

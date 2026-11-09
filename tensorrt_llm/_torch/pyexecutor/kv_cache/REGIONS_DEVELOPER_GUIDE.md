@@ -8,8 +8,8 @@ what a model is.
 
 Code: `tensorrt_llm/_torch/pyexecutor/kv_cache/regions.py` (declarations and their layout),
 `KVCacheManagerV2` (declaration and layout hooks, region lookups),
-`MambaHybridCacheManagerV2` (the shared replay region of Mamba2 and GDN),
-`tensorrt_llm/_torch/modules/kimi_kda/replay_region.py` (the KDA replay provider), and the native side in
+the model families' replay providers (`modules/mamba/replay_region.py`, `modules/fla/replay_region.py`,
+`modules/kimi_kda/replay_region.py`), and the native side in
 `cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/` (`RegionConfig` in `config.h`, the life-cycle
 registry and pool grouping; see that directory's `AGENTS.md`).
 
@@ -51,38 +51,47 @@ The pool group belongs to the region alone, so this arithmetic is exact.
 | `region_layout` | After declaration | The regions and, once laid out, the owner of each buffer |
 | `get_region_group_ids(name)` | After construction | The region's layer group, through `KVCacheManager.get_region_group_id`; empty for an undeclared region |
 | `get_disagg_ignored_roles()` | Disaggregated transfer | Model and backend managers identify locally rebuilt buffers to exclude |
-| `_managed_replay_state()` | `MambaHybridCacheManagerV2.__init__`, after the model state is created | The replay state whose buffers the shared hybrid manager lays out and indexes; `None` for a manager whose own provider declares them |
+| `mamba_metadata_cls` | Attention metadata creation | The Mamba metadata class the manager's state needs (the model's own class wins); `ReplayMamba2Metadata` carries replay slots and replay work items |
 
-## The shared replay region (Mamba2, GDN)
+## Replay regions of the model families
 
-The replay states of Mamba2 (`ReplayHistory`) and GDN (`GDNReplayState`, also used by Qwen4Exp) need
-no model-specific bookkeeping beyond their buffers, so `MambaHybridCacheManagerV2` declares and
-tracks them centrally. Each state implements `MambaReplayState`: `replay_layout()` gives the per-slot
-dtype and shape of every replay buffer of a layer, and `replay_shares_state_slot` says whether its
-kernels address those buffers by the recurrent-state slot.
+Speculative decoding's replay state belongs to its model family. The shared managers
+(`KVCacheManagerV2`, `MambaHybridCacheManagerV2`) and the shared Mamba metadata know nothing of it:
+each family's provider declares its region and keeps its request slots, and the family's cache
+managers compose the provider through the generic hooks above and the recurrent-state ones
+(`_setup_model_state`, `_setup_state_indices`, `_reset_context_mamba_slots`, `_update_model_state`,
+`_get_recurrent_buffer_configs`, `_estimate_fixed_region_bytes`, `free_resources`, `shutdown`).
+
+| Family | Provider | Managers | Metadata |
+|---|---|---|---|
+| Mamba2 | `Mamba2ReplayRegion` (`modules/mamba/replay_region.py`) | `NemotronHybridCacheManager` | `ReplayMamba2Metadata` |
+| GDN | `GDNReplayRegion` (`modules/fla/replay_region.py`) | `Qwen35HybridCacheManager`, `Qwen4ExpHybridCacheManager` | `ReplayMamba2Metadata` |
+| KDA | `KDAReplayRegion` (`modules/kimi_kda/replay_region.py`) | `KimiK3HybridCacheManager`, `Glm5NextCacheManager` | `KimiK3MambaMetadata` |
+
+Every provider follows the same contract:
 
 | Case | Storage |
 |---|---|
-| Own slots (Mamba2, GDN Triton / CuTe / fused verify) | The manager is its own provider and declares `replay_state` (`REQUEST`, `NEVER`) over the local recurrent layers, with `fixed_slot_count = ceil(IndexMapper capacity / max_util_for_resume)` |
-| Shared slots (GDN FlashInfer ring) | No region: the replay buffers are buffers of the layer's `SsmLayerConfig` (`_get_recurrent_buffer_configs`) and follow the recurrent state's life cycle |
-| Disaggregated context server | Neither: `_managed_replay_state()` is `None` |
+| Own slots (Mamba2, GDN Triton / CuTe / fused verify, KDA) | `replay_state` (`REQUEST`, `NEVER`) over the local recurrent layers, `fixed_slot_count = ceil(IndexMapper capacity / max_util_for_resume)` |
+| Shared slots (GDN FlashInfer ring, the Kimi K3 engine's draft records) | No region: `shared_buffers()` adds the replay buffers to the layer's `SsmLayerConfig`, and they follow the recurrent state's life cycle |
+| Disaggregated context server | Neither: the manager creates no provider |
 
-The manager binds the replay views (`bind_replay_pool`) before the state's `bind()`, keeps each
-request's replay slot (`replay_layer_group_id`, `get_replay_state_indices`,
-`cuda_replay_state_indices`), resets a replay slot a generation request acquires for the first time,
-and passes the generation rows' replay slots to the acceptance update
-(`MambaAcceptanceBatch.replay_indices`). `Mamba2Metadata.replay_state_indices` carries them to the
-kernels; it aliases `state_indices` when the replay buffers share the recurrent-state slots. Before
-the manager exists, `_estimate_fixed_region_bytes()` sizes the region from the class's
-`_estimate_private_replay_bytes_per_slot()`. Replay buffers are never transferred between
-disaggregated workers.
+The provider binds the replay views (`bind_replay_pool`) before the state's `bind()`, keeps each
+request's replay slot (the manager's `replay_layer_group_id`, `get_replay_state_indices` and
+`cuda_replay_state_indices` delegate to it), resets a replay slot a generation request acquires for
+the first time, and hands the generation rows' replay slots to the state's `update`. Its `prepare`
+runs after the manager's state-index upload on every step, because a replay page can move while the
+recurrent-state slot stays. The family's metadata copies the replay slots into a static buffer the
+kernels read (`replay_state_indices`), or aliases `state_indices` when the replay buffers share the
+recurrent-state slots. Before the manager exists, the manager's `_estimate_fixed_region_bytes()`
+reserves the provider's fixed pool. Replay buffers are never transferred between disaggregated
+workers: the manager lists them in `get_disagg_ignored_roles()`.
 
 ## The KDA replay region
 
 `KDAReplayRegion` declares `replay_state` from the geometry supplied by `KDAReplayState`.
 Kimi K3 and GLM5Next compose this provider in their model-specific cache managers and register it
-through `_region_providers()`; their `_managed_replay_state()` returns `None`, so the shared replay
-region above is not declared for them. The provider owns the region's identity, lifecycle, planes,
+through `_region_providers()`. The provider owns the region's identity, lifecycle, planes,
 capacity. The shared managers consume its declaration through the generic
 region interfaces.
 

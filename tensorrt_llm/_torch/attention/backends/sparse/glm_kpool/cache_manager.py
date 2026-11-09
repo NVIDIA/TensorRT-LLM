@@ -135,11 +135,6 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         return self._kda_replay is not None
 
     @override
-    def _managed_replay_state(self) -> None:
-        """``KDAReplayRegion`` declares, binds and indexes the KDA replay state."""
-        return None
-
-    @override
     def _region_providers(self) -> Sequence[RegionProvider]:
         providers = super()._region_providers()
         if self._kda_replay is None or not self.mamba_pp_layers:
@@ -181,13 +176,11 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         super()._setup_model_state()
 
     @property
-    @override
     def replay_layer_group_id(self) -> int | None:
         region = self._kda_replay_region
         return region.group_id if region is not None else None
 
     @property
-    @override
     def cuda_replay_state_indices(self) -> torch.Tensor:
         region = self._kda_replay_region
         return (
@@ -196,7 +189,6 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             else self.cuda_state_indices
         )
 
-    @override
     def get_replay_state_indices(
         self, request_ids: list[int] | None = None
     ) -> torch.Tensor | list[int]:

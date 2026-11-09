@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import NamedTuple, Optional
 
@@ -17,6 +18,7 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
+from tensorrt_llm._torch.modules.mamba.replay_metadata import ReplayMamba2Metadata
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     MambaLayerCache,
@@ -29,8 +31,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
-    ReplayLayout,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
 from tensorrt_llm._torch.utils import (
     is_gdn_flashinfer_replay_enabled,
     is_gdn_flashinfer_replay_required,
@@ -39,13 +41,14 @@ from tensorrt_llm._torch.utils import (
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole
 
 from .cached_replay import (
     CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
     build_gdn_history_descriptors,
     commit_gdn_cached_replay_history_layers,
 )
+from .replay_region import REPLAY_STATE_REGION, GDNReplayRegion, ReplayLayout
 
 MIN_REPLAY_HISTORY_SIZE = 16
 # Per-layer replay roles, by GDNReplayState attribute. The Triton kernel keeps
@@ -632,9 +635,14 @@ class GDNReplayState:
                 rank_offset=self._seed_rank_offset,
             )
 
-    def update(self, batch: MambaAcceptanceBatch) -> None:
+    def update(self, batch: MambaAcceptanceBatch, replay_slots: torch.Tensor | None = None) -> None:
+        """Commit, advance the bookkeeping of ``replay_slots`` and promote the accepted windows.
+
+        ``replay_slots`` are the generation rows' replay slots; ``None`` means
+        their destination state slots (the FlashInfer ring shares them).
+        """
         num_decodes = batch.num_generations
-        # Same rule as MambaHybridCacheManager.gdn_replay_partitioned.
+        # Same rule as the GDN managers' gdn_replay_partitioned.
         if (
             not self.use_flashinfer_ring
             and not self.fused_verify
@@ -644,11 +652,7 @@ class GDNReplayState:
         metadata = self.get_replay_metadata()
         if metadata is None:
             raise RuntimeError("GDN replay buffers are not bound")
-        replay_indices = (
-            batch.destination_state_indices
-            if batch.replay_indices is None
-            else batch.replay_indices
-        )
+        replay_indices = batch.destination_state_indices if replay_slots is None else replay_slots
         if self.use_flashinfer_ring:
             _advance_ring_start(
                 self.cache_base,
@@ -682,9 +686,9 @@ class GDNReplayState:
         launch advances PNAT and the active history buffer of
         ``replay_indices`` (the arithmetic of ``_advance_replay_state``).
         """
-        from tensorrt_llm._torch.pyexecutor.kv_cache import mamba_cache_manager
+        from tensorrt_llm._torch.modules.fla import replay_promotion
 
-        mamba_cache_manager._promote_mamba_state_triton(
+        replay_promotion.promote_conv_and_advance_replay_triton(
             self._stacked_conv,
             self.intermediate_conv,
             batch.source_state_indices,
@@ -986,18 +990,45 @@ def estimate_gdn_replay_bytes_per_slot(
 
 
 class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
-    """Qwen3.5/Qwen3Next recurrent state with shared GDN replay."""
+    """Qwen3.5/Qwen3Next recurrent state with GDN replay.
+
+    ``GDNReplayRegion`` declares and indexes the replay history; the FlashInfer
+    ring buffers are buffers of the recurrent layers instead.
+    """
 
     # The GDN mixer implements the in-forward snapshot split.
     _supports_inforward_snapshot = True
     _skips_steady_state_index_upload = True
+    mamba_metadata_cls = ReplayMamba2Metadata
+    _replay_region: GDNReplayRegion | None = None
+    _context_only = False
+    # Whether the model's GDN layers verify drafts with the fused kernels, which
+    # commit in-layer at every batch size.
+    gdn_fused_verify = False
 
     @override
-    def __init__(self, *args, use_replay_state_update: bool | None = None, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        use_replay_state_update: bool | None = None,
+        gdn_fused_verify: bool = False,
+        **kwargs,
+    ) -> None:
         kwargs.pop("mamba_ssm_stochastic_rounding", False)
         self._requested_replay = use_replay_state_update
+        self.gdn_fused_verify = gdn_fused_verify
+        # A disaggregated context server never decodes and keeps no replay history.
+        self._context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
+        self._replay_region = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
+
+    def gdn_replay_partitioned(self, num_decodes: int) -> bool:
+        """Whether a GDN decode batch of num_decodes requests takes the
+        partitioned cached replay and one all-layer checkpoint commit; other
+        batches commit inside each layer, as the fused target verify of the
+        model's GDN layers (gdn_fused_verify) does at every batch size."""
+        return not self.gdn_fused_verify and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 
     @override
     def _initialize_spec_state(self) -> GDNIntermediateState | GDNReplayState:
@@ -1006,13 +1037,140 @@ class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
         validate_gdn_layout(self, state)
         return state
 
+    @override
+    def _region_providers(self) -> Sequence[RegionProvider]:
+        providers = super()._region_providers()
+        if (
+            not isinstance(self._speculative_state, GDNReplayState)
+            or self._context_only
+            or not self.mamba_pp_layers
+        ):
+            return providers
+        self._replay_region = GDNReplayRegion(
+            self._speculative_state,
+            self._state_layout,
+            self.layer_offsets,
+            self._index_mapper_capacity,
+            self.kv_cache_config.max_util_for_resume,
+        )
+        return (*providers, self._replay_region)
+
+    @override
+    def _get_recurrent_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
+        buffers = super()._get_recurrent_buffer_configs(global_layer_id)
+        if self._replay_region is not None:
+            buffers += self._replay_region.shared_buffers(global_layer_id)
+        return buffers
+
+    @override
+    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
+        """The generation worker starts the replay history afresh."""
+        roles = super().get_disagg_ignored_roles()
+        if self._replay_region is not None:
+            roles |= self._replay_region.roles
+        return roles
+
+    @override
+    def _setup_model_state(self) -> None:
+        region = self._replay_region
+        if region is not None:
+            region.bind(
+                self._get_state_buffer,
+                self.layer_offsets,
+                self.get_region_group_ids(REPLAY_STATE_REGION),
+                self._host_state_indices.shape[0],
+                self.cuda_state_indices.device,
+            )
+        super()._setup_model_state()
+
+    @property
+    def replay_layer_group_id(self) -> int | None:
+        """Layer group of the replay history's own slots; None when it shares the state slots."""
+        region = self._replay_region
+        return region.group_id if region is not None else None
+
+    @property
+    def cuda_replay_state_indices(self) -> torch.Tensor:
+        region = self._replay_region
+        return (
+            region.cuda_indices(self.cuda_state_indices)
+            if region is not None
+            else self.cuda_state_indices
+        )
+
+    def get_replay_state_indices(
+        self, request_ids: list[int] | None = None
+    ) -> torch.Tensor | list[int]:
+        """Replay slots like get_state_indices(), without touching the dummy mask."""
+        if request_ids is None:
+            return self.cuda_replay_state_indices
+        region = self._replay_region
+        if region is None or region.group_id is None:
+            return [self._request_id_to_state_index[rid] for rid in request_ids]
+        return region.request_indices(request_ids)
+
+    @override
+    def _setup_state_indices(self, requests, num_contexts: int = 0) -> None:
+        super()._setup_state_indices(requests, num_contexts)
+        if self._replay_region is not None and self.local_num_mamba_layers:
+            self._replay_region.prepare(
+                requests,
+                self.kv_cache_map,
+                self.cuda_state_indices,
+                self._host_state_indices,
+                num_contexts,
+                self._skips_steady_state_index_upload,
+            )
+
+    @override
+    def _reset_context_mamba_slots(self, num_contexts: int) -> None:
+        if self._replay_region is None:
+            super()._reset_context_mamba_slots(num_contexts)
+        else:
+            self._replay_region.reset_context(
+                num_contexts, self.cuda_state_indices, self._host_state_indices
+            )
+
+    @override
+    def _update_model_state(self, batch: MambaAcceptanceBatch) -> None:
+        if self._replay_region is None:
+            super()._update_model_state(batch)
+        else:
+            self._replay_region.update(batch, self.cuda_state_indices)
+
+    @override
+    def free_resources(self, request, pin_on_release: bool = False) -> None:
+        if self._replay_region is not None:
+            self._replay_region.release(request.py_request_id)
+        super().free_resources(request, pin_on_release)
+
+    @override
+    def shutdown(self) -> None:
+        if self._replay_region is not None:
+            self._replay_region.shutdown()
+        super().shutdown()
+
     @classmethod
     @override
-    def _estimate_private_replay_bytes_per_slot(
-        cls, model_config, mapping: Mapping, **kwargs
+    def _estimate_fixed_region_bytes(
+        cls,
+        model_config,
+        mapping: Mapping,
+        *,
+        max_batch_size: int,
+        kv_cache_config,
+        **kwargs,
     ) -> int:
-        return estimate_gdn_replay_bytes_per_slot(
-            model_config, mapping, flashinfer_ring=False, **kwargs
+        if _is_disagg_context_server(kwargs.get("is_disagg", False)):
+            return 0
+        return GDNReplayRegion.estimate_fixed_bytes(
+            estimate_gdn_replay_bytes_per_slot(
+                model_config, mapping, flashinfer_ring=False, **kwargs
+            ),
+            mapping,
+            max_batch_size,
+            kv_cache_config.max_util_for_resume,
+            **kwargs,
         )
 
     @classmethod
