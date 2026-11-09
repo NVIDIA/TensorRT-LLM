@@ -16,6 +16,8 @@
 
 import torch
 
+from tensorrt_llm.math_utils import ceil_div
+
 from ....utils import ActivationType
 from ..activation import ActivationParamShape, MoEActivationSupport
 from ..fused_moe_triton_fp8_block_scale import (
@@ -97,7 +99,8 @@ class TrtllmTritonFp8BlockScalesImpl(CutlassFusedMoEBase):
         top_k = self.routing_method.top_k
         # Under attention DP a rank's MoE also computes the other ranks' tokens.
         max_rows = max_num_tokens * (self.parallel_size if self.use_dp else 1)
-        large_tile_tokens = -(-_LARGE_M_MIN_ROWS * num_local_experts // top_k)
+        # The fewest tokens that take the large tile
+        large_tile_tokens = ceil_div(_LARGE_M_MIN_ROWS * num_local_experts, top_k)
         token_counts = [1]
         if max_rows >= large_tile_tokens:
             token_counts.append(min(max_rows, max(max_num_tokens, large_tile_tokens)))

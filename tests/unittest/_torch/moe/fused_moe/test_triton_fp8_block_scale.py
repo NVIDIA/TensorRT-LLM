@@ -9,6 +9,7 @@ Run as a pytest:
 
 from __future__ import annotations
 
+import types
 from dataclasses import dataclass
 
 import pytest
@@ -16,6 +17,7 @@ import torch
 import torch.nn.functional as F
 from _torch.helpers import calc_diff, per_block_cast_to_fp8_e8m0
 
+import tensorrt_llm._torch.moe.fused_moe.cutlass.fp8_block_scales_triton as triton_impl
 import tensorrt_llm._torch.moe.fused_moe.fused_moe_triton_fp8_block_scale as triton_moe
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_triton_fp8_block_scale import (
     _BLOCK_SIZE_M,
@@ -301,6 +303,7 @@ def test_clamp_is_rejected_for_a_non_swiglu_activation() -> None:
         run_triton_fp8_block_scale_moe(**inputs)
 
 
+@pytest.mark.cpu_only
 def test_block_size_m_threshold() -> None:
     """Pins the switch to the large tile, and which test shapes take it, so that
     moving the threshold cannot silently drop the 64-row path from the tests."""
@@ -378,3 +381,55 @@ def test_each_block_size_is_tuned_separately() -> None:
     hidden, intermediate = SHAPES_BY_NAME["tiny"].hidden, SHAPES_BY_NAME["tiny"].intermediate
     for n, k in ((2 * intermediate, hidden), (hidden, intermediate)):
         assert {(n, k, _BLOCK_SIZE_M), (n, k, _BLOCK_SIZE_M_LARGE)} <= tuned, (n, k, tuned)
+
+
+def _prewarm_stub(intermediate: int, use_dp: bool) -> types.SimpleNamespace:
+    """The attributes ``prewarm_decode_kernels`` reads off the impl: 8 local
+    experts, hidden 256, top_k 2, and 4 attention-DP ranks when ``use_dp``."""
+    num_local_experts, hidden = 8, 256
+    return types.SimpleNamespace(
+        w3_w1_weight=torch.empty(num_local_experts, 2 * intermediate, hidden),
+        w2_weight=torch.empty(num_local_experts, hidden, intermediate),
+        quant_scales=types.SimpleNamespace(fc_weight_scales=None, proj_weight_scales=None),
+        routing_method=types.SimpleNamespace(top_k=2),
+        use_dp=use_dp,
+        parallel_size=4,
+        activation_type=int(ActivationType.Swiglu),
+        act_clamp=None,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("max_num_tokens", "use_dp", "token_counts"),
+    [
+        # 8 local experts at top_k 2 take the large tile from 256 tokens.
+        (255, False, [1]),
+        (256, False, [1, 256]),
+        (4096, False, [1, 4096]),
+        # Under attention DP a rank computes all 4 ranks' tokens.
+        (64, True, [1, 256]),
+    ],
+)
+def test_prewarm_tunes_each_tile_height_once(
+    max_num_tokens: int, use_dp: bool, token_counts: list[int], monkeypatch
+) -> None:
+    """Both GEMMs are tuned at every tile height a forward can reach, once per
+    shape and tile height across layers."""
+    calls = []
+    monkeypatch.setattr(
+        triton_impl, "run_triton_fp8_block_scale_moe", lambda x, *a, **kw: calls.append(x.shape[0])
+    )
+    monkeypatch.setattr(triton_impl, "_prewarmed_gemm_keys", set())
+    prewarm = triton_impl.TrtllmTritonFp8BlockScalesImpl.prewarm_decode_kernels
+
+    layer = _prewarm_stub(intermediate=512, use_dp=use_dp)
+    assert prewarm(layer, max_num_tokens, False) == 2 * len(token_counts)
+    assert calls == token_counts
+    # Another layer of the same shapes is already tuned.
+    assert prewarm(_prewarm_stub(intermediate=512, use_dp=use_dp), max_num_tokens, False) == 0
+    # A layer of other shapes is not.
+    assert prewarm(_prewarm_stub(intermediate=1024, use_dp=use_dp), max_num_tokens, False) == (
+        2 * len(token_counts)
+    )
+    assert calls == token_counts * 2
