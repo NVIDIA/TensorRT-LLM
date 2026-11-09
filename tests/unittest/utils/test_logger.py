@@ -364,3 +364,33 @@ class TestLoggerAPI:
 
         # Cleanup
         singleton._appeared_keys.discard("test_key_unique_12345")
+
+
+def test_no_exc_info_passed_to_trtllm_logger():
+    """The TRT-LLM logger takes no exc_info: passing it raises TypeError."""
+    import ast
+    import pathlib
+
+    import tensorrt_llm
+
+    root = pathlib.Path(tensorrt_llm.__file__).parent
+    methods = {"debug", "info", "warning", "error", "critical"}
+    offenders = []
+    for path in root.rglob("*.py"):
+        source = path.read_text(encoding="utf-8", errors="replace")
+        if "exc_info" not in source or "logger" not in source:
+            continue
+        # stdlib loggers accept exc_info
+        if "logging.getLogger" in source:
+            continue
+        for node in ast.walk(ast.parse(source)):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in methods
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "logger"
+                and any(kw.arg == "exc_info" for kw in node.keywords)
+            ):
+                offenders.append(f"{path.relative_to(root)}:{node.lineno}")
+    assert not offenders, f"exc_info passed to the TRT-LLM logger: {offenders}"

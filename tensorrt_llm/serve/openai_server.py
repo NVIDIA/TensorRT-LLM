@@ -2026,8 +2026,8 @@ class OpenAIServer(_VideoRoutesMixin):
                         self._record_iteration_stat(llm_stat)
                 except Exception as e:
                     # Log errors but continue collecting stats
-                    logger.error(f"Error collecting iteration stats: {e}",
-                                 exc_info=True)
+                    logger.error(f"Error collecting iteration stats: {e}\n"
+                                 f"{traceback.format_exc()}")
                     # Brief sleep to avoid tight loop on persistent errors
                     await asyncio.sleep(0.1)
         except asyncio.CancelledError:

@@ -6,6 +6,7 @@ import dataclasses
 import json
 import math
 import time
+import traceback
 import weakref
 from dataclasses import dataclass, field
 from queue import Empty, Queue
@@ -867,8 +868,8 @@ class GenerationResultBase:
                         if math.isfinite(ppl):
                             metrics_stats[MetricNames.PREFILL_PERPLEXITY] = ppl
                 except (ValueError, TypeError):
-                    logger.debug("Failed to compute prefill perplexity",
-                                 exc_info=True)
+                    logger.debug("Failed to compute prefill perplexity:\n"
+                                 f"{traceback.format_exc()}")
 
         # Candidate-scoped metric: generation perplexity is computed per candidate
         # from this candidate's logprobs.
@@ -895,8 +896,8 @@ class GenerationResultBase:
                         mean_lp = sum(gen_lps) / len(gen_lps)
                         gen_ppl = math.exp(-mean_lp)
                 except (ValueError, TypeError):
-                    logger.debug("Failed to compute generation perplexity",
-                                 exc_info=True)
+                    logger.debug("Failed to compute generation perplexity:\n"
+                                 f"{traceback.format_exc()}")
             if gen_ppl is not None and math.isfinite(gen_ppl):
                 metrics_stats[MetricNames.GENERATION_PERPLEXITY] = gen_ppl
 
