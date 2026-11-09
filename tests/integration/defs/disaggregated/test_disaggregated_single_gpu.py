@@ -1094,6 +1094,26 @@ def test_disaggregated_logits(model, generation_overlap):
                 "max_tokens=1 generation_only should return the first token's logits"
             assert single_output.generation_logits.shape[0] == 1
 
+            # --- generation_only whose first token is a stop token ---
+            # The request stops by STOP_WORDS at that token, as aggregated
+            # serving does: the stop token and its logits are trimmed, and no
+            # decode step adds a token after it.
+            ctx_responses4 = send_requests_to_worker(ctx_requests, 0, intercomm)
+            dp4 = ctx_responses4[0][0].disaggregated_params
+            dp4.request_type = "generation_only"
+            first_token = dp4.first_gen_tokens[0]
+            stop_sp = SamplingParams(max_tokens=max_tokens,
+                                     ignore_eos=True,
+                                     stop_token_ids=[first_token],
+                                     return_generation_logits=True)
+            stop_responses = send_requests_to_worker([(prompt, stop_sp, dp4)],
+                                                     1, intercomm)
+            stop_output = stop_responses[0][0]
+            assert list(stop_output.token_ids) == []
+            assert stop_output.finish_reason == "stop"
+            assert stop_output.stop_reason == first_token
+            assert stop_output.generation_logits.shape[0] == 0
+
         except Exception as e:
             print(f"Exception encountered: {e}", flush=True)
             raise e
@@ -1210,8 +1230,8 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
             output = responses[0][0]
             print(f"Worker 1 output: {output.text}", flush=True)
             print(f"Worker 1 token_ids: {output.token_ids}", flush=True)
-            assert len(output.token_ids) > 0, \
-                "generation_only request should produce output tokens"
+            assert len(output.token_ids) == 2, \
+                "generation_only request should return max_tokens tokens"
 
             # Send a normal (non-disagg) request to worker 1 to verify
             # it still works properly after the KV cache transfer.

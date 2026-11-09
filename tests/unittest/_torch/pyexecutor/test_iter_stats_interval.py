@@ -47,7 +47,7 @@ def _build_fake_self(interval: int, *, enabled: bool = True):
     fake.active_requests = []
     fake._pending_num_new_active_requests = 0
     fake._pending_num_completed_requests = 0
-    fake._close_outs_pending_iter_stats = False
+    fake._has_close_outs_pending_iter_stats = False
     fake._latest_host_step_time_ms = None
     fake._latest_prev_device_step_time_ms = None
     # _get_init_iter_stats: no spec-decode resource manager / spec config.
@@ -227,32 +227,34 @@ def test_interval_one_never_flushes_unsampled_batch():
 # ---------------------------------------------------------------------------
 
 
-def _with_close_outs(fake, num_closed: int):
+def _with_close_outs(fake: MagicMock, num_closed: int) -> MagicMock:
     """``fake`` after first-token close-outs left ``num_closed`` completions pending."""
     fake._process_iter_stats = types.MethodType(PyExecutor._process_iter_stats, fake)
     fake._pending_num_completed_requests += num_closed
-    fake._close_outs_pending_iter_stats = True
+    fake._has_close_outs_pending_iter_stats = True
     return fake
 
 
-def _run_iteration_without_batch(fake, iter_counter: int) -> None:
+def _run_iteration_without_batch(fake: MagicMock, iter_counter: int) -> None:
     fake.iter_counter = iter_counter
     PyExecutor._process_close_out_iter_stats(fake, fake._init_iter_stats_if_sampled(0), 0.0)
 
 
-def _record_completed(stats, _iter_latency_ms, num_completed_requests, *_args):
+def _record_completed(
+    stats: IterationStats, _iter_latency_ms: float, num_completed_requests: int, *_args
+) -> IterationStats:
     stats.num_completed_requests = num_completed_requests
     return stats
 
 
-def test_close_outs_are_recorded_once_by_an_iteration_without_a_batch():
+def test_close_outs_are_recorded_once_by_an_iteration_without_a_batch() -> None:
     fake = _with_close_outs(_build_fake_self(interval=1), num_closed=2)
     _run_iteration_without_batch(fake, 5)
     _run_iteration_without_batch(fake, 6)
     assert [(stats.iter, completed) for stats, completed in _emitted(fake)] == [(5, 2)]
 
 
-def test_close_outs_in_an_unsampled_iteration_follow_the_interval_rules():
+def test_close_outs_in_an_unsampled_iteration_follow_the_interval_rules() -> None:
     """Carried while requests remain active, then reported by the next sampled
     iteration; with no active request left, a drain record reports them at once."""
     fake = _with_close_outs(_build_fake_self(interval=4), num_closed=2)
@@ -268,7 +270,7 @@ def test_close_outs_in_an_unsampled_iteration_follow_the_interval_rules():
     assert [(stats.iter, completed) for stats, completed in _emitted(drained)] == [(1, 3)]
 
 
-def test_close_outs_under_attention_dp_are_fanned_out_once_through_rank0():
+def test_close_outs_under_attention_dp_are_fanned_out_once_through_rank0() -> None:
     """Only rank 0 reports them, as it owns the completion counts. Its record
     is fanned out once the next exchange has collected the other rank's zero
     payload, and never again."""
@@ -283,7 +285,7 @@ def test_close_outs_under_attention_dp_are_fanned_out_once_through_rank0():
             _with_close_outs(fake, num_closed=2)
         _run_iteration_without_batch(fake, 9)
 
-    def exchange():
+    def exchange() -> list:
         states = []
         for rank, buffer in enumerate(buffers):
             payload = buffer.next_payload()

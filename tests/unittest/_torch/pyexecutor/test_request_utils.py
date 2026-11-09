@@ -1215,7 +1215,7 @@ def test_merge_helix_requests_empty_ranks():
         pytest.param(None, [], id="no_stop_words"),
     ],
 )
-def test_merge_helix_requests_keeps_the_prompt_tail_on_every_rank(stop_words, prompt_tail):
+def test_merge_helix_requests_keeps_the_prompt_tail_on_every_rank(stop_words, prompt_tail) -> None:
     """A multi-token stop word that the first generated token completes can
     span prompt tokens a rank's slice does not hold, so every rank, including
     an empty one, keeps the tail it can span."""

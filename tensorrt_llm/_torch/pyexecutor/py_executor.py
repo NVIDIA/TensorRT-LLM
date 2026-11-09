@@ -652,35 +652,6 @@ def _single_rank_adp_skips_padding(executor: "PyExecutor") -> bool:
     return connector is None or connector.capacity_only
 
 
-def _create_request_response(executor: "PyExecutor", request: LlmRequest,
-                             gpu_times_cache: dict):
-    """Create ``request``'s response with the fields every emitted one carries."""
-    if request.return_perf_metrics:
-        # Response creation may finalize and copy scalar ctx GPU totals.
-        executor.perf_manager.compute_batch_gpu_times(
-            [request], gpu_times_cache=gpu_times_cache)
-    response = request.create_response()
-    if response:
-        response.result.cached_tokens = request.cached_tokens
-        response.result.ctx_computed_tokens = getattr(request,
-                                                      'py_ctx_computed_tokens',
-                                                      0)
-        response.result.ctx_first_begin = getattr(request, 'py_ctx_first_begin',
-                                                  -1)
-        response.result.ctx_num_chunks = getattr(request, 'py_ctx_num_chunks',
-                                                 0)
-        executor._maybe_attach_ctx_usage(request, response)
-        response.result.per_pos_drafted = request.py_per_pos_drafted
-        response.result.per_pos_accepted = request.py_per_pos_accepted
-        if request.py_total_draft_tokens > 0:
-            # Backfill RequestPerfMetrics.speculative_decoding on
-            # the client side from the Python-owned counters.
-            response.result.spec_dec_totals = (
-                request.py_total_accepted_draft_tokens,
-                request.py_total_draft_tokens)
-    return response
-
-
 def _rebuild_disagg_imported_cache(resource_manager: ResourceManager,
                                    requests: List[LlmRequest]) -> None:
     """Rebuild the cache state derived from the KV the requests received.
@@ -774,7 +745,7 @@ class PyExecutor:
     _stage_timing = False
     # Set on a rank that reports completions while requests its first-token
     # check finished, which run no batch, wait for an iteration-stats record.
-    _close_outs_pending_iter_stats = False
+    _has_close_outs_pending_iter_stats = False
 
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -3854,7 +3825,7 @@ class PyExecutor:
                 batch_state.iter_stats.iter = batch_state.iter_id
         num_completed_requests = self._pending_num_completed_requests
         self._pending_num_completed_requests = 0
-        self._close_outs_pending_iter_stats = False
+        self._has_close_outs_pending_iter_stats = False
 
         # Snapshot per-loop profiler timings plus the batch-matched GPU
         # forward time. The FPM GPU value is read from CUDA events without
@@ -3919,7 +3890,7 @@ class PyExecutor:
         come once the executor is idle. Only ranks that report completions
         have any pending (see ``_reports_completions``).
         """
-        if not self._close_outs_pending_iter_stats:
+        if not self._has_close_outs_pending_iter_stats:
             return
         self._process_iter_stats(
             [], self.active_requests,
@@ -4114,7 +4085,7 @@ class PyExecutor:
                 self.disagg.poll_gen_transfers()
                 self._activate_completed_remote_tails()
                 self._sweep_transfer_held_failures()
-                self._close_out_gen_receives_at_first_token()
+                self._finish_gen_requests_ended_by_first_token()
 
                 iter_stats = self._init_iter_stats_if_sampled(len(new_requests))
 
@@ -5707,7 +5678,7 @@ class PyExecutor:
         self._sweep_transfer_held_failures()
         # After the sweep, so a failed transfer is reported as a failure
         # rather than closed out as a success.
-        self._close_out_gen_receives_at_first_token()
+        self._finish_gen_requests_ended_by_first_token()
 
         iter_stats = self._init_iter_stats_if_sampled(len(new_requests))
 
@@ -10675,7 +10646,7 @@ class PyExecutor:
             max_seq_len=None if helix else self.sampler.max_seq_len,
             stop_word_history=stop_word_history)
 
-    def _close_out_gen_receives_at_first_token(self) -> None:
+    def _finish_gen_requests_ended_by_first_token(self) -> None:
         """Finish received generation requests that their first token ends.
 
         The context server samples the first token of a context-only request
@@ -10685,8 +10656,8 @@ class PyExecutor:
         here with the reason aggregated serving gives, instead of being
         scheduled for a decode step past its stop.
 
-        Runs after the transfer polls, timeouts and the parked-failure sweep,
-        so a failed transfer is still reported as a failure, and before
+        Runs after the transfer polls and the parked-failure sweep, so a
+        failed transfer is still reported as a failure, and before
         attention-DP padding and scheduling. Responses and terminations go
         through ``_flush_pending_transfer_responses``, which every executor
         loop enters at a rank-synchronized point. Every rank holding a request
@@ -10708,14 +10679,11 @@ class PyExecutor:
         held = self._held_transfer_failures()
         closing = []
         for req in candidates:
-            # A remote-tail destination samples its first token in a local
-            # context step, whose stop check the sampler runs; beam search
-            # needs the sampler's beam finalization. Parked failures and
-            # cancellations keep their own outcome.
+            # Beam search needs the sampler's beam finalization. Parked
+            # failures and cancellations keep their own outcome.
             cancel_id = (req.parent_request_id
                          if req.is_child else req.py_request_id)
-            if (getattr(req, "py_csa2_remote_tail_mode", None) == "destination"
-                    or req.py_beam_width != 1 or id(req) in held
+            if (req.py_beam_width != 1 or id(req) in held
                     or cancel_id in self.canceled_req_ids):
                 continue
             reason = self._first_gen_token_finish_reason(req)
@@ -10731,14 +10699,13 @@ class PyExecutor:
         batch_token_time = self.perf_manager.get_timestamp()
         finished = []
         for req, reason in closing:
-            if not self.disagg.try_finish_gen_receive(req):
-                continue
+            # A candidate is transmission-complete, so this always finishes.
+            finished_receive = self.disagg.try_finish_gen_receive(req)
+            assert finished_receive
             if req.return_perf_metrics:
                 # Set at seq slot assignment on the scheduled path.
                 req.set_first_scheduled_time()
-            req.decoding_iter = 1
             req.py_decoding_iter = 1
-            req.py_draft_tokens = []
             _import_first_gen_tokens(req, 1)
             # No forward follows to move the prepended logits to host
             # storage, so prepend them on the host and flush them now.
@@ -10770,26 +10737,27 @@ class PyExecutor:
         self.active_requests[:] = [
             req for req in self.active_requests if id(req) not in finished_ids
         ]
-        first_token_timer = getattr(self, "_first_token_timer", None)
-        if first_token_timer is not None:
-            first_token_timer.observe(finished, time.monotonic())
+        if self._first_token_timer is not None:
+            self._first_token_timer.observe(finished, time.monotonic())
         if self._reports_completions:
             self._pending_num_completed_requests += len(finished)
-            self._close_outs_pending_iter_stats = True
+            self._has_close_outs_pending_iter_stats = True
             # As for requests that finish in a batch, only an iteration that
             # builds a record gives them a requestStats entry.
             if (self.enable_iter_req_stats
                     and self.iter_counter % self.iter_perf_stats_interval == 0):
                 self._pending_close_out_requests.extend(finished)
 
-    def _create_first_token_terminal_response(self, req: LlmRequest,
-                                              batch_token_time):
+    def _create_first_token_terminal_response(
+            self, req: LlmRequest,
+            batch_token_time: Optional[float]) -> Optional[LlmResponse]:
         """Terminal response of a request finished at its first token.
 
-        Does the per-request bookkeeping of ``_handle_responses``. The
-        response is also the first-token response, so first-token logits
-        prepended from the context server are snapshotted past
-        ``exclude_last_generation_logits``, as in
+        Records the step metrics and creates the response as
+        ``_handle_responses`` does for a finished request; route capture has
+        nothing to attach, as no forward ran. The response is also the
+        first-token response, so first-token logits prepended from the context
+        server are snapshotted past ``exclude_last_generation_logits``, as in
         ``_handle_first_token_response``.
         """
         req.draft_tokens = []
@@ -10801,7 +10769,7 @@ class PyExecutor:
             req.update_perf_metrics(self.iter_counter)
         logits_snapshot = (req.py_result.get_latest_logits_unexcluded()
                            if self._has_prepended_logits(req) else None)
-        response = _create_request_response(self, req, {})
+        response = self._create_request_response(req, {})
         if logits_snapshot is not None and response is not None:
             response.result.generation_logits = logits_snapshot
         return response
@@ -12387,6 +12355,35 @@ class PyExecutor:
             return True
         return first_gen_emit or decoding_iter % self.stream_interval == 0
 
+    def _create_request_response(
+            self, request: LlmRequest,
+            gpu_times_cache: Dict[tuple, tuple]) -> Optional[LlmResponse]:
+        """Create ``request``'s response for ``_handle_responses`` and the
+        first-token finish, with the fields both attach."""
+        if request.return_perf_metrics:
+            # Response creation may finalize and copy scalar ctx GPU totals.
+            self.perf_manager.compute_batch_gpu_times(
+                [request], gpu_times_cache=gpu_times_cache)
+        response = request.create_response()
+        if response:
+            response.result.cached_tokens = request.cached_tokens
+            response.result.ctx_computed_tokens = getattr(
+                request, 'py_ctx_computed_tokens', 0)
+            response.result.ctx_first_begin = getattr(request,
+                                                      'py_ctx_first_begin', -1)
+            response.result.ctx_num_chunks = getattr(request,
+                                                     'py_ctx_num_chunks', 0)
+            self._maybe_attach_ctx_usage(request, response)
+            response.result.per_pos_drafted = request.py_per_pos_drafted
+            response.result.per_pos_accepted = request.py_per_pos_accepted
+            if request.py_total_draft_tokens > 0:
+                # Backfill RequestPerfMetrics.speculative_decoding on
+                # the client side from the Python-owned counters.
+                response.result.spec_dec_totals = (
+                    request.py_total_accepted_draft_tokens,
+                    request.py_total_draft_tokens)
+        return response
+
     @nvtx_range("_handle_responses")
     def _handle_responses(self, emit_first_iter: bool = True):
         new_responses = []
@@ -12510,8 +12507,8 @@ class PyExecutor:
                     and not request.return_perf_metrics):
                 should_emit = False
             if should_emit:
-                response = _create_request_response(self, request,
-                                                    gpu_times_cache)
+                response = self._create_request_response(
+                    request, gpu_times_cache)
                 if response:
                     if first_gen_emit:
                         request.py_gen_first_emitted = True

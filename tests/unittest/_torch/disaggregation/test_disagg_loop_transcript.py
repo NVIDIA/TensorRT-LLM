@@ -202,7 +202,6 @@ def _pp_executor(monkeypatch, calls: list, *, rank: int) -> PyExecutor:
     executor.unhandled_batch_counter = 0
     executor.pp_async_broadcast_sample_state = True
     executor._pp_rebalance_drain_iters = None
-    executor._progress_recompute_pause_termination_if_idle = Mock()
     executor._pending_recompute_pause_ids = set()
     executor._disagg_pp_termination_handler = None
     if rank != 0:
