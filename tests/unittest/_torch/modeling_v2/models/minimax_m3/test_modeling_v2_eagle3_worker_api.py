@@ -22,6 +22,7 @@ ROOT = next(p for p in Path(__file__).resolve().parents if (p / "tensorrt_llm").
 MODEL_ROOT = ROOT / "tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3"
 PARENT_PATH = ROOT / "tensorrt_llm/_torch/speculative/eagle3.py"
 MODEL_PATHS = sorted(MODEL_ROOT.glob("minimax_m3_nvfp4__*/modeling.py"))
+assert MODEL_PATHS, f"No MiniMax-M3 NVFP4 modeling.py files found under {MODEL_ROOT}"
 
 
 def _dispatch(class_node):
@@ -91,6 +92,7 @@ def _load_dispatch(path: Path, fused: bool):
 @pytest.mark.parametrize("path", MODEL_PATHS, ids=lambda path: path.parent.name)
 @pytest.mark.parametrize("fused", [False, True], ids=["stock", "fused"])
 def test_dispatch_matches_current_parent_signature_and_return_contract(path: Path, fused: bool):
+    """Verify argument forwarding and token-buffer handoff for stock and fused dispatch."""
     worker, parent = _load_dispatch(path, fused)
     parameters = list(inspect.signature(parent).parameters)[1:]
     arguments = {name: object() for name in parameters}
@@ -102,6 +104,7 @@ def test_dispatch_matches_current_parent_signature_and_return_contract(path: Pat
         assert result[0] is worker.fused_result
         # Targets may return the fused buffer or leave it on the worker for the caller.
         assert result[1] is None or result[1] is worker.fused_next_new
+        assert worker._m3_next_new_tokens is worker.fused_next_new
     else:
         assert result is worker.parent_result
         assert all(worker.parent_arguments[name] is value for name, value in arguments.items())
@@ -109,6 +112,8 @@ def test_dispatch_matches_current_parent_signature_and_return_contract(path: Pat
 
 @pytest.mark.parametrize("path", [PARENT_PATH, *MODEL_PATHS], ids=lambda path: path.parent.name)
 def test_external_shared_kv_keeps_the_parent_tensor_return_contract(path: Path):
+    """Verify external shared-KV drafting returns tokens without a next-input buffer."""
+
     class ExternalWorker:
         __slots__ = ()
         _uses_external_shared_target_kv = True
@@ -215,6 +220,8 @@ def test_forward_preserves_draft_arguments_and_token_buffers(path: Path, mode: s
     assert namespace["next_draft_tokens"] is sentinel.drafts
     assert namespace["next_new_tokens"] is sentinel.next_new
     if mode.startswith("fallback"):
+        assert worker.parent_arguments["inputs"] is sentinel.inputs
+        assert worker.parent_arguments["draft_kv_cache_manager"] is sentinel.cache
         assert worker.parent_arguments["accepted_tokens"] is sentinel.accepted
         assert worker.parent_arguments["pre_draft_seq_lens"] is sentinel.pre_draft_seq_lens
     if mode in ("fallback_buffer", "fused"):
