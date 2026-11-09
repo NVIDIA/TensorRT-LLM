@@ -969,13 +969,24 @@ def _publish_chunked(hidden, weight, slot, table) -> bool:
         return False
     tactics = [head] * len(bounds)
     run_splitk_dense, splitk_tactic = _splitk_publisher()
+    if table is None and WIDE_ONE:
+        # The split_k-4 publication of any 65..448-row slice in ONE launch (row tiles on the grid's second
+        # dimension), at the 65+-row tile of this site (``wide_splitk_tactic``); every row keeps its one-request bits.
+        wt = wide_splitk_tactic(hidden.shape[1], weight.shape[0], rows)
+        if wt is None:
+            return False
+        _run_splitk_one(hidden, weight, slot, splitk_tactic(*wt))
+        logger.info_once(f"[musespark_open] projection_publish: {WIDE_ONE_ENV}=1: 65..{WIDE_ONE_K4_MAX_ROWS}-row split_k-4 "
+                         f"slices publish in one launch (tactics {_wide_splitk_tactics()})",
+                         key="musespark_open.t8r5.publish_wide_one_k4")
+        return True
     if table is None:
         for (a, b), tactic in zip(bounds, tactics):
             run_splitk_dense(hidden[a:b], weight.t(), None, slot[a:b], _SPLITK_PDL, splitk_tactic(*tactic))
         return True
     tactic = splitk_tactic(*table[(hidden.shape[1], weight.shape[0])])
     if WIDE_ONE and table is TP8_PUBLISH_SPLITK1_TACTICS and rows <= 2 * SPLITK_MAX_ROWS:
-        _run_splitk1_one(hidden, weight, slot, tactic)
+        _run_splitk_one(hidden, weight, slot, tactic)
         logger.info_once(f"[musespark_open] projection_publish: {WIDE_ONE_ENV}=1: 65..128-row split_k-1 slices "
                          "publish in one launch", key="musespark_open.t8r4.publish_wide_one")
         return True
@@ -1014,17 +1025,66 @@ if _WIDE_ONE not in ("", "0", "1"):
 WIDE_ONE = _WIDE_ONE == "1"
 
 
-def _run_splitk1_one(hidden: torch.Tensor, weight: torch.Tensor, slot: torch.Tensor, tactic) -> None:
-    """``WIDE_ONE``: ``run_splitk_dense`` of all ``rows`` (65..128) in one launch, compiled exactly as the
-    64-row launch (``_launch_options(SPLITK_MAX_ROWS, 1)``); the tactic is validated at the 64-row launch's M (tile,
-    K partition, shared memory), the kernel itself tiles any M."""
+#: The most rows a one-launch split_k-4 publication takes (the transports' bound).
+WIDE_ONE_K4_MAX_ROWS = 448
+
+#: ``MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE_TACTICS`` (``;``-separated ``<site>[@<min rows>]=M,N,4,S`` entries,
+#: site ``pool`` or ``unpool``; default the 33..64-row split-K tactics at every row count) names the tile of the
+#: one-launch split_k-4 publication of 65+-row slices (``PUBLISH_WIDE=splitk`` + ``PUBLISH_WIDE_ONE=1``); an entry with
+#: ``@R`` serves calls of R rows or more (e.g. ``pool=64,32,4,8;pool@129=64,64,4,5``). Only split_k 4 is accepted: the K
+#: partition (4 cluster ranks, each its K/4 in CTA_K order, reduced in cluster-rank order through DSMEM) is what fixes
+#: an element's bits; the output-column tile (mma_m) and the token tile (mma_n) only place the element, so every row
+#: keeps the bits of sm_103's TP8 8-row cell (device-checked: every tile below, rows
+#: 65..256). Read at first use; rank-uniform.
+WIDE_TACTICS_ENV = "MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE_TACTICS"
+
+
+def _wide_splitk_tactics() -> dict:
+    """{(K, columns): [(min rows, tactic), ...] sorted by min rows}."""
+    cached = _splitk_state.get("wide_tactics")
+    if cached is not None:
+        return cached
+    sites = {"pool": (UNPOOL_HIDDEN, POOL_HIDDEN // 8), "unpool": (POOL_HIDDEN, UNPOOL_HIDDEN // 8)}
+    table = {key: {SPLITK_MAX_ROWS + 1: TP8_PUBLISH_SPLITK_TACTICS[key]} for key in sites.values()}
+    value = _sm107_env(WIDE_TACTICS_ENV, "").strip()
+    for part in filter(None, (p.strip() for p in value.split(";"))):
+        head, _, fields = part.partition("=")
+        site, _, low = head.strip().partition("@")
+        try:
+            tactic = tuple(int(f) for f in fields.split(","))
+            low = int(low) if low else SPLITK_MAX_ROWS + 1
+        except ValueError:
+            tactic, low = (), 0
+        if site not in sites or len(tactic) != 4 or tactic[2] != 4 or not SPLITK_MAX_ROWS < low <= WIDE_ONE_K4_MAX_ROWS:
+            raise ValueError(f"{WIDE_TACTICS_ENV}={value!r}: expected <pool|unpool>[@<65..{WIDE_ONE_K4_MAX_ROWS}>]="
+                             "M,N,4,S entries (split_k 4)")
+        table[sites[site]][low] = tactic
+    table = {key: sorted(v.items()) for key, v in table.items()}
+    _splitk_state["wide_tactics"] = table
+    return table
+
+
+def wide_splitk_tactic(k: int, n: int, rows: int) -> Optional[Tuple[int, int, int, int]]:
+    """The one-launch split_k-4 tile of a ``rows``-row ``[R, k] x [n, k]^T`` slice, or None (not a TP8 publish site)."""
+    ranges = _wide_splitk_tactics().get((k, n))
+    if not ranges:
+        return None
+    return [tactic for low, tactic in ranges if low <= rows][-1]
+
+
+def _run_splitk_one(hidden: torch.Tensor, weight: torch.Tensor, slot: torch.Tensor, tactic) -> None:
+    """``WIDE_ONE``: ``run_splitk_dense`` of all ``rows`` in one launch, compiled exactly as the 64-row
+    launch (``_launch_options(SPLITK_MAX_ROWS, split_k)``, the 33..64-row publication's producer key at split_k 4);
+    the tactic is validated at the 64-row launch's M (tile, K partition, shared memory), the kernel itself tiles any
+    M. split_k 1: 65..128 rows; split_k 4: 65..``WIDE_ONE_K4_MAX_ROWS`` rows."""
     from ..gemm import splitk_gemm as sk
 
     a, b = hidden, weight.t()
     m, n, k = sk._validate_runtime_tensors(a, b, None, slot)
-    if tactic.split_k != 1 or not SPLITK_MAX_ROWS < m <= 2 * SPLITK_MAX_ROWS:
-        raise ValueError(f"publish WIDE_ONE: split_k 1 at {SPLITK_MAX_ROWS + 1}..{2 * SPLITK_MAX_ROWS} rows, got "
-                         f"{tactic} at {m}")
+    top = {1: 2 * SPLITK_MAX_ROWS, 4: WIDE_ONE_K4_MAX_ROWS}.get(tactic.split_k, 0)
+    if not SPLITK_MAX_ROWS < m <= top:
+        raise ValueError(f"publish WIDE_ONE: split_k 1 at {SPLITK_MAX_ROWS + 1}..{2 * SPLITK_MAX_ROWS} rows or "
+                         f"split_k 4 at {SPLITK_MAX_ROWS + 1}..{WIDE_ONE_K4_MAX_ROWS}, got {tactic} at {m}")
     sk.validate_tactic(tactic, SPLITK_MAX_ROWS, n, k)
     cute_tensors = sk._to_cute_swap(a, b, slot, None)
     compiled = sk._get_compiled_splitk_kernel(

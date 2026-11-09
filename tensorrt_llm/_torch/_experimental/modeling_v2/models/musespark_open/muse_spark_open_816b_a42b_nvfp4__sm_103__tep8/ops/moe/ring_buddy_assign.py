@@ -96,8 +96,9 @@ def block_of(ranks: int) -> int:
 #: Largest ``M * TOP_K`` one program handles (M <= 32 decode rows: four requests'
 #: K = 7 verify steps). Opt-in: 64 rows (eight requests), so ring-buddy balance
 #: (``MUSESPARK_OPEN_TEP8_RING_BUDDY_MAX_ROWS=64``) also places the 33..64-row TEP8 steps; the kernel is the
-#: same [SLOTS, RANKS] program at a 512-slot tile.
-MAX_SLOTS = 512
+#: same [SLOTS, RANKS] program at a 512-slot tile. 128 rows (16 requests,
+#: ``MUSESPARK_OPEN_TEP8_RING_BUDDY_MAX_ROWS=128``) at a 1024-slot tile; smaller calls keep their tile.
+MAX_SLOTS = 1024
 
 #: The half window (``half_window_experts``, tep4): a block's upper half starts at this
 #: local index, and the stack ``[own block | the predecessor's upper half]`` holds

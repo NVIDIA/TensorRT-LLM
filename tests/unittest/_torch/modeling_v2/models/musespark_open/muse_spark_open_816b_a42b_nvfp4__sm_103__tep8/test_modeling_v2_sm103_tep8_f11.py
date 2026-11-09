@@ -587,8 +587,41 @@ def test_sm103_tep8_publish_wide_one_switch():
     assert name not in DEFAULTS.SM103_TEP8_DEFAULTS and name not in DEFAULTS.SM107_DEFAULTS
     assert f'WIDE_ONE_ENV = "{name}"' in src and "_WIDE_ONE = os.environ.get(WIDE_ONE_ENV, \"\").strip()" in src
     assert ("    if WIDE_ONE and table is TP8_PUBLISH_SPLITK1_TACTICS and rows <= 2 * SPLITK_MAX_ROWS:\n"
-            "        _run_splitk1_one(hidden, weight, slot, tactic)\n") in src
+            "        _run_splitk_one(hidden, weight, slot, tactic)\n") in src
     assert '"publish in one launch", key="musespark_open.t8r4.publish_wide_one")\n        return True\n' \
         "    main = torch.cuda.current_stream(hidden.device)\n" in src
     assert "**sk._launch_options(SPLITK_MAX_ROWS, tactic.split_k)," in src
     assert "sk.validate_tactic(tactic, SPLITK_MAX_ROWS, n, k)" in src
+
+
+def test_sm103_tep8_publish_wide_one_k4_switch():
+    """With ``PUBLISH_WIDE=splitk`` + ``PUBLISH_WIDE_ONE=1`` a 65..448-row slice publishes from ONE split_k-4
+    launch, compiled as the 64-row launch; ``MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE_TACTICS`` (in no defaults table)
+    picks the tile per row range and accepts split_k 4 only; the one-launch helper refuses other K partitions."""
+    src = (_TARGET / "ops/comm/projection_publish.py").read_text()
+    name = "MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE_TACTICS"
+    assert name not in DEFAULTS.SM103_TEP8_DEFAULTS and name not in DEFAULTS.SM107_DEFAULTS
+    assert f'WIDE_TACTICS_ENV = "{name}"' in src and "WIDE_ONE_K4_MAX_ROWS = 448" in src
+    k4 = src.index("    if table is None and WIDE_ONE:\n")
+    assert k4 < src.index("    if table is None:\n        for (a, b), tactic in zip(bounds, tactics):")
+    assert "wt = wide_splitk_tactic(hidden.shape[1], weight.shape[0], rows)" in src
+    assert "or tactic[2] != 4 or" in src
+    assert "top = {1: 2 * SPLITK_MAX_ROWS, 4: WIDE_ONE_K4_MAX_ROWS}.get(tactic.split_k, 0)" in src
+
+
+def test_sm103_tep8_prerouted_128_switch():
+    """``MUSESPARK_OPEN_TEP8_PREROUTED_MAX_ROWS`` (64 default, or 128; in no defaults table) extends the
+    prerouted two-window calls to 65..128 rows at tile 16 (the stock call's fallback tile there) and keeps tile 8 up to
+    64 rows; ring_buddy_assign's one program covers 1024 slots (128 rows)."""
+    src = (_TARGET / "kernels/replicated_experts/ring_buddy.py").read_text()
+    asg = (_TARGET / "ops/moe/ring_buddy_assign.py").read_text()
+    name = "MUSESPARK_OPEN_TEP8_PREROUTED_MAX_ROWS"
+    assert name not in DEFAULTS.SM103_TEP8_DEFAULTS and name not in DEFAULTS.SM107_DEFAULTS
+    assert DEFAULTS.SM103_TEP8_DEFAULTS["MUSESPARK_OPEN_TEP8_RING_BUDDY_MAX_ROWS"] == "64"
+    assert f'_TEP8_PREROUTED_MAX_ROWS = int(_sm107_env("{name}", "") or 64)' in src
+    assert "if _TEP8_PREROUTED_MAX_ROWS not in (64, 128):" in src
+    assert "_TEP8_PREROUTED_ROWS = range(9, _TEP8_PREROUTED_MAX_ROWS + 1)" in src
+    assert "    return _PREROUTED_TILE if rows <= 64 else 2 * _PREROUTED_TILE\n" in src
+    assert "meta_tile=_prerouted_tile(router_logits.shape[0])," in src
+    assert 'or meta.get("tile") != _prerouted_tile(rows)' in src and "if tile != _prerouted_tile(rows):" in src
+    assert "\nMAX_SLOTS = 1024\n" in asg

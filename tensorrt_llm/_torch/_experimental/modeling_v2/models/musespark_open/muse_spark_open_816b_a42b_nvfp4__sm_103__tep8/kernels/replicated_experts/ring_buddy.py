@@ -139,7 +139,21 @@ STATIC_FROM = 28
 #: (``prerouted_experts.available``) and every call is the stock call.
 _TEP8_PREROUTED = _sm107_env("MUSESPARK_OPEN_TEP8_PREROUTED", "") == "1"
 _PREROUTED_TILE = 8
-_TEP8_PREROUTED_ROWS = range(9, 65)
+#: ``MUSESPARK_OPEN_TEP8_PREROUTED_MAX_ROWS=128`` (default 64; with ``MUSESPARK_OPEN_TEP8_RING_BUDDY_MAX_ROWS=128``,
+#: which balances the 65..128-row steps on the two-window stack too) also takes the 65..128-row two-window calls
+#: (9..16 requests at K = 7) prerouted. Their tables are written for the tile the stock call runs there (the op's
+#: fallback config: tile nextPowerOfTwo(rows * top_k / 64) = 16, ``_prerouted_tile``), so every expert row stays
+#: bitwise the stock two-window call's; a call whose stock tactic has another tile keeps the stock call.
+_TEP8_PREROUTED_MAX_ROWS = int(_sm107_env("MUSESPARK_OPEN_TEP8_PREROUTED_MAX_ROWS", "") or 64)
+if _TEP8_PREROUTED_MAX_ROWS not in (64, 128):
+    raise ValueError(f"MUSESPARK_OPEN_TEP8_PREROUTED_MAX_ROWS={_TEP8_PREROUTED_MAX_ROWS}: 64 or 128")
+_TEP8_PREROUTED_ROWS = range(9, _TEP8_PREROUTED_MAX_ROWS + 1)
+
+
+def _prerouted_tile(rows: int) -> int:
+    """The token tile of the prerouted tables of a ``rows``-row two-window call: 8 up to 64 rows, 16 above
+    (the fallback tile of the 64-expert window at 65..128 rows)."""
+    return _PREROUTED_TILE if rows <= 64 else 2 * _PREROUTED_TILE
 
 
 def _stock_tactic(x, x_sf, stacks, local_ids, weights_bf16, intermediate, window, routing_method_type, act_type,
@@ -195,7 +209,7 @@ def _stock_tactic(x, x_sf, stacks, local_ids, weights_bf16, intermediate, window
         rows = x.fp4_tensor.shape[0]
         avg = -(-rows * TOP_K // window)
         tile = max(8, 1 << max(avg - 1, 0).bit_length())
-        if tile != _PREROUTED_TILE:
+        if tile != _prerouted_tile(rows):
             return None
         hidden = 2 * x.fp4_tensor.shape[1]
         ext = _prerouted_ext("moe3")
@@ -216,7 +230,7 @@ def _tep8_prerouted_call(stacks, x, x_sf, local_ids, weights_bf16, meta, interme
         rows not in _TEP8_PREROUTED_ROWS
         or meta.get("rows") != rows
         or window != 2 * BLOCK
-        or meta.get("tile") != _PREROUTED_TILE
+        or meta.get("tile") != _prerouted_tile(rows)
     ):
         return None
     if tactic is None:
@@ -566,7 +580,7 @@ def _patch_routing(moe, state: _State) -> None:
                     state.static_from,
                     ranks=state.ranks,
                     half=state.half,
-                    meta_tile=_PREROUTED_TILE,
+                    meta_tile=_prerouted_tile(router_logits.shape[0]),
                 )
             else:
                 local_ids, weights_bf16, stats = ring_buddy_assign(
