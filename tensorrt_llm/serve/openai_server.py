@@ -1087,10 +1087,10 @@ class OpenAIServer(_VideoRoutesMixin):
             getattr(self, "_internal_disagg_auth_key", None), request, headers)
 
     def _get_scheduling_params(
-            self, request: ChatCompletionRequest,
+            self, request: Union[ChatCompletionRequest, CompletionRequest],
             raw_request: Optional[Request]) -> SchedulingParams:
         return SchedulingParams(
-            agent_hierarchy=request.agent_hierarchy,
+            agent_hierarchy=getattr(request, "agent_hierarchy", None),
             subagent_affinity_id=validate_subagent_affinity(
                 getattr(self, "_internal_disagg_auth_key", None), request,
                 getattr(self, "server_role", None),
@@ -3114,6 +3114,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 request, None if raw_request is None else raw_request.headers)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
+            scheduling_params = self._get_scheduling_params(
+                request, raw_request)
             for idx, prompt in enumerate(prompts):
                 postproc_args = CompletionPostprocArgs.from_request(request)
                 self._apply_spec_decode_stats_opt_in(postproc_args)
@@ -3151,6 +3153,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     lora_request=request.lora_request,
                     disaggregated_params=disaggregated_params,
                     conversation_params=conversation_params,
+                    scheduling_params=scheduling_params,
                     trace_headers=trace_headers,
                     kv_hints=request.kv_hints,
                     priority=request.priority if request.priority is not None
