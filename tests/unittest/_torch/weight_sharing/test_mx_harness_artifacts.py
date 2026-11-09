@@ -22,9 +22,10 @@ tests lay out exactly that and check that `timing.json` still lands in the
 archive without raising, which would otherwise replace the failure that ended
 the run.
 
-Transfer bound: `mx_transfer_upper_bound` counts a storage that several
-parameters share once, and `assert_transfer_within_manifests` rejects a
-receiver rank whose RDMA record moves more than its manifest holds.
+Transfer bound: `mx_transfer_upper_bound` counts parameters that view a
+shared storage at the same offset once, at the largest of their sizes, and
+`assert_transfer_within_manifests` rejects a receiver rank whose RDMA record
+moves more than its manifest holds.
 
 Probe arguments: the remaining tests check how a row's probe becomes
 `mx_e2e_worker.py` arguments, including missing probe images, and that the
@@ -257,6 +258,22 @@ def test_mx_transfer_upper_bound_counts_each_shared_view_once() -> None:
     # norm.weight, norm.bias, and one empty parameter: 32 + 8 + 8 + 0 bytes.
     # The bound counts the second empty parameter as well.
     assert mx_transfer_upper_bound(build_weight_manifest(_SharedStorageModule())) == (5, 48)
+
+
+class _SharedStartModule(nn.Module):
+    """Two parameters that start at the same element of one storage, the larger registered first."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.arange(8, dtype=torch.float32))
+        self.a_prefix = nn.Parameter(self.weight.data[:2])
+
+
+def test_mx_transfer_upper_bound_counts_a_shared_start_at_its_largest_view() -> None:
+    # ModelExpress registers `weight` (32 bytes), the first in module order, at
+    # the shared data pointer, while the manifest lists `a_prefix` (8 bytes)
+    # first because its entries are sorted by name.
+    assert mx_transfer_upper_bound(build_weight_manifest(_SharedStartModule())) == (1, 32)
 
 
 @pytest.mark.parametrize(

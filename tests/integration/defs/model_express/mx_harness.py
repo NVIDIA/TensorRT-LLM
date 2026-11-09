@@ -689,8 +689,10 @@ def mx_transfer_upper_bound(manifest: WeightManifest) -> tuple[int, int]:
     ModelExpress registers one tensor per distinct parameter data pointer and
     no buffers. Non-empty parameters that view one storage at the same offset,
     such as a tied LM head and its token-embedding table, are one view and
-    count once. Empty parameters count once each, although they can share the
-    null data pointer, so the result bounds the transfer from above.
+    count once, at the largest of their sizes, because ModelExpress registers
+    whichever of them comes first in module order. Empty parameters count once
+    each, although they can share the null data pointer, so the result bounds
+    the transfer from above.
     """
     storage_of = {fqn: index for index, group in enumerate(manifest.alias_groups) for fqn in group}
     views: dict[tuple[object, ...], int] = {}
@@ -698,7 +700,8 @@ def mx_transfer_upper_bound(manifest: WeightManifest) -> tuple[int, int]:
         if entry.kind != "param":
             continue
         storage = storage_of.get(entry.fqn, entry.fqn) if entry.nbytes else entry.fqn
-        views.setdefault((storage, entry.dtype, entry.storage_offset), entry.nbytes)
+        view = (storage, entry.dtype, entry.storage_offset)
+        views[view] = max(views.get(view, 0), entry.nbytes)
     return len(views), sum(views.values())
 
 
