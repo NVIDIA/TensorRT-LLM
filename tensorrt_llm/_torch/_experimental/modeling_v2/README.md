@@ -39,8 +39,9 @@ modeling_v2: require
 
 Use `require` when you validate or benchmark a target, so the run cannot fall
 back to Modeling V1 without you noticing. A target can also read the mode with
-`resolved_mode()` when it is constructed. Under `require`, its own dispatch
-can then raise instead of falling back to a Modeling V1 code path.
+`resolved_mode()` when it is constructed. Under `auto`, its constructor can
+raise `NoTarget` to decline, and the engine then uses Modeling V1 for the
+whole model. Under `require`, the same `NoTarget` is an error.
 
 ## Families and targets
 
@@ -54,7 +55,8 @@ A **target** is a directory `models/<family>/<target>/` that holds one complete
 model implementation. Routing selects a target for a specific set of
 checkpoint, GPU and parallel configurations. A target does not import code
 from its sibling targets. It can use its family's shared code, the shared
-operation catalog and the TensorRT-LLM runtime.
+operation catalog and the TensorRT-LLM runtime, but not Modeling V1 model code.
+See [Modeling V1 code](#modeling-v1-code).
 
 Target directories are usually named `<checkpoint>__<sm>__<parallel>`, with
 double underscores between the three parts:
@@ -115,6 +117,26 @@ If two targets need the same code, move it to the family instead of importing
 it from a sibling target. Duplicating code between targets is fine. Whether to
 merge it is the family owners' decision.
 
+## Modeling V1 code
+
+A target builds its model from operations: catalog operations and its
+family's and its own operations and kernels. From the rest of TensorRT-LLM,
+it uses only runtime interfaces, for example:
+
+* `DecoderModel`, `DecoderModelForCausalLM`, `ModelConfig` and `Mapping`.
+* Attention and speculative metadata, and the KV cache managers.
+
+A target does not import, subclass or call Modeling V1 model code: the model
+classes in `_torch/models/`, the layers in `_torch/modules/`, MLA and the
+attention backends in `_torch/attention/`, and fused MoE in `_torch/moe/`.
+This applies to every path in the target: prefill, decode, the shapes a fast
+path does not cover, and weight loading. A change to Modeling V1 model code
+then cannot change a Modeling V2 target. The
+[DeepSeek R1 target](models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/) is an
+example: besides its own code, it uses only `DecoderModel`,
+`DecoderModelForCausalLM`, attention metadata and the engine's speculative
+worker.
+
 ## Adding a family or a target
 
 1. **New family only:** create `models/<family>/routing.py` with a `route`
@@ -136,8 +158,8 @@ merge it is the family owners' decision.
 ## Model lifecycle
 
 A target plugs into TensorRT-LLM through the existing `DecoderModel` and
-`DecoderModelForCausalLM` interfaces. It can inherit, override or delegate any
-of these steps:
+`DecoderModelForCausalLM` interfaces. It inherits these classes directly, not
+a Modeling V1 model class, and can override any of these steps:
 
 * **Constructor:** builds the model structure and parameters.
 * **`load_weights`:** loads checkpoint weights into the model. Put weight
@@ -168,6 +190,10 @@ Each family decides what to route on, for example the checkpoint shape, GPU
 architecture, parallel layout, speculative decoding mode or KV cache dtype.
 Routing runs once, when the model is loaded, so per-step differences such as
 batch composition or prefill versus decode are handled inside the target.
+
+Check in `route` every requirement the target has, not only in the target's
+constructor. A configuration that `route` declines falls back to Modeling V1
+under `auto`; one that the constructor rejects with an assertion fails.
 
 How the model loader resolves a target:
 
@@ -215,7 +241,8 @@ dtypes, add those cases to the operation's tests. The existing
 ## Native code
 
 C++/CUDA code for a family or target lives in its `csrc/` directory and builds
-into one library per family. See the
+into one library per family. Do not put it under `cpp/tensorrt_llm/kernels/`
+or `cpp/tensorrt_llm/thop/`. See the
 [native code guide](../../../../cpp/tensorrt_llm/modeling_v2/README.md) for
 build declarations, namespaces, op and fake registration, loading and errors.
 
@@ -248,6 +275,8 @@ Typical whole-model checks for a target:
 * **Accuracy:** run the checkpoint's evaluation and compare against its
   reference. Rerun it whenever a change affects numerics, weight loading or
   execution.
+* **Acceptance:** with speculative decoding, also check the acceptance length.
+  A wrong draft only slows decoding, so accuracy alone does not catch it.
 
 Set `TRTLLM_MODELING_V2_VALIDATE=1` to make targets that support it check, on
 the first forward step, that the attention metadata fields they read still
@@ -296,7 +325,8 @@ tests. Reading every generated kernel line by line does not scale.
 
 This lighter review applies only to code that is actually isolated. A shared
 change inside a large model PR still needs a full review. Keep shared changes
-easy to spot, and send them as a separate PR when you can.
+easy to spot, and send them as a separate PR when you can. Do not add
+model-specific branches to shared code.
 
 ### Do I have to use a particular agent or workflow?
 
