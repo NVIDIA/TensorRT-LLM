@@ -167,6 +167,12 @@ public:
     // Remove a page from the eviction queue.
     void excludeFromEviction(Page& page);
 
+    // Change a page's eviction priority. A page scheduled for eviction is re-queued at the
+    // most-recently-used end of its new priority's queue at the same cache level. Eviction
+    // order only: the page's data, status, slot and level are unchanged. Caller holds the
+    // manager's exclusive API lock.
+    void setPriority(Page& page, Priority priority);
+
     // Check if a page is evictable (optionally at a target level).
     bool isEvictable(Page const& page, std::optional<CacheLevel> level = std::nullopt) const noexcept;
 

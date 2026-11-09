@@ -437,6 +437,22 @@ def _swa_fork_anchor_enabled() -> bool:
     return os.environ.get("TRTLLM_KV_SWA_FORK_ANCHOR", "0") == "1"
 
 
+def _swa_demote_anchors_enabled() -> bool:
+    return os.environ.get("TRTLLM_KV_SWA_DEMOTE_ANCHORS", "0") == "1"
+
+
+def _swa_demote_priority() -> int:
+    """Eviction priority of a superseded sliding-window anchor page.
+
+    Above the intermediate window pages (0) and below the endpoint windows (70)
+    and the full-attention pages (35) of _swa_endpoint_priority.
+    """
+    prio = int(os.environ.get("TRTLLM_KV_SWA_DEMOTE_PRIORITY", "1"))
+    if not 0 <= prio < 35:
+        raise ValueError(f"TRTLLM_KV_SWA_DEMOTE_PRIORITY must be in [0, 35), got {prio}")
+    return prio
+
+
 def _request_conversation_id(request: LlmRequest) -> Optional[str]:
     if request.is_dummy_request:
         return None
@@ -1637,6 +1653,17 @@ class KVCacheManagerV2(BaseResourceManager):
             logger.info(
                 "KVCacheManagerV2: TRTLLM_KV_SWA_FORK_ANCHOR=1: sliding-window pages at a "
                 "pruned prefix-match divergence point get the endpoint eviction priority"
+            )
+        # Opt-in: on close, demote the reused endpoint window a request extended
+        # past (superseded anchor) to a low eviction priority, so old anchors are
+        # evicted before the current ones. Eviction priority only.
+        self._swa_demote_anchors = _swa_demote_anchors_enabled() and self._swa_endpoint_rewind > 0
+        self._swa_demote_prio = _swa_demote_priority() if self._swa_demote_anchors else None
+        self._swa_demote_stats = [0, 0, 0]  # closed caches, caches that demoted, demoted pages
+        if self._swa_demote_anchors and not is_draft:
+            logger.info(
+                "KVCacheManagerV2: TRTLLM_KV_SWA_DEMOTE_ANCHORS=1: superseded sliding-window "
+                f"endpoint pages are demoted to eviction priority {self._swa_demote_prio} on close"
             )
         # Recompute tail for hidden-state drafters with block reuse: cap the
         # reuse claim of cache-hit context requests so at least this many
@@ -6413,8 +6440,25 @@ class KVCacheManagerV2(BaseResourceManager):
         pending, self._deferred_closes = self._deferred_closes, ()
         for request_id, kv_cache in pending:
             kv_cache.close()
+            self._note_swa_demote(kv_cache)
             self.impl.clear_stats_excluded(request_id)
         return len(pending)
+
+    def _note_swa_demote(self, kv_cache) -> None:
+        """Account the superseded-anchor demotion of a just-closed cache (opt-in)."""
+        if not getattr(self, "_swa_demote_anchors", False) or kv_cache.superseded_anchor_priority is None:
+            return
+        stats = self._swa_demote_stats
+        stats[0] += 1
+        n = kv_cache.num_demoted_anchor_pages
+        if n:
+            stats[1] += 1
+            stats[2] += n
+        if stats[0] in (1, 10, 100) or stats[0] % 1000 == 0:
+            logger.info(
+                f"KVCacheManagerV2 SWA anchor demotion: {stats[1]} of {stats[0]} closed requests "
+                f"demoted superseded window pages; pages demoted so far {stats[2]}"
+            )
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         # A request awaiting preemption can still be cancelled or fail while
@@ -6464,6 +6508,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self._deferred_closes = (*self._deferred_closes, (request.py_request_id, kv_cache))
             return
         kv_cache.close()
+        self._note_swa_demote(kv_cache)
         self.impl.clear_stats_excluded(request.py_request_id)
         if request.py_request_id in self._early_freed_index_requests:
             self._early_freed_index_requests.discard(request.py_request_id)
@@ -7481,6 +7526,8 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         if fork_point is not None:
             self._set_swa_fork_point(kv_cache, fork_point, expected_prompt_length)
+        if priority_kwargs and getattr(self, "_swa_demote_anchors", False):
+            kv_cache.set_superseded_anchor_priority(self._swa_demote_prio)
         self.kv_cache_map[request_id] = kv_cache
         if enable_request_stats and not self.enable_stats:
             self._request_stats_enabled_ids.add(request_id)

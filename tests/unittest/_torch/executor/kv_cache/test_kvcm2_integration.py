@@ -271,6 +271,160 @@ def test_swa_endpoint_priority_steers_real_eviction(with_callback: bool) -> None
         core.shutdown()
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "env,rewind,is_dummy,expected",
+    [
+        ({}, 1024, False, None),
+        ({"TRTLLM_KV_SWA_DEMOTE_ANCHORS": "1"}, 1024, False, 1),
+        ({"TRTLLM_KV_SWA_DEMOTE_ANCHORS": "1", "TRTLLM_KV_SWA_DEMOTE_PRIORITY": "0"}, 1024, False, 0),
+        ({"TRTLLM_KV_SWA_DEMOTE_ANCHORS": "1"}, 1024, True, None),  # no callback for dummies
+    ],
+)
+def test_create_kv_cache_swa_demote_anchors(env: dict, rewind: int, is_dummy: bool, expected) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._swa_endpoint_rewind = rewind
+    manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
+    manager.enable_block_reuse = True
+    manager.is_draft = False
+    manager.tokens_per_block = 32
+    manager.kv_cache_map = {}
+    manager.index_mapper = Mock()
+    manager.index_mapper.num_free_slots.return_value = 1
+    manager.max_beam_width = 1
+    manager.num_pools = 0
+    manager.impl = Mock()
+    manager.impl.create_kv_cache.return_value.beam_width = 1
+    with patch.dict(os.environ, env, clear=False):
+        enabled = kv_cache_v2_module._swa_demote_anchors_enabled()
+        manager._swa_demote_anchors = enabled and rewind > 0
+        manager._swa_demote_prio = kv_cache_v2_module._swa_demote_priority() if enabled else None
+    manager._swa_demote_stats = [0, 0, 0]
+
+    kv = manager._create_kv_cache(0, None, None, is_dummy=is_dummy, expected_prompt_length=8192)
+
+    if expected is None:
+        kv.set_superseded_anchor_priority.assert_not_called()
+    else:
+        kv.set_superseded_anchor_priority.assert_called_once_with(expected)
+        kv.superseded_anchor_priority = expected
+        kv.num_demoted_anchor_pages = 3
+        manager._note_swa_demote(kv)
+        assert manager._swa_demote_stats == [1, 1, 3]
+
+
+@pytest.mark.cpu_only
+def test_swa_demote_priority_bounds() -> None:
+    with patch.dict(os.environ, {"TRTLLM_KV_SWA_DEMOTE_PRIORITY": "35"}):
+        with pytest.raises(ValueError):
+            kv_cache_v2_module._swa_demote_priority()
+
+
+def _release_prompt(core: KVCacheManager, prompt: list[int], priority_callback, demote=None) -> int:
+    """_commit_released_prompt with an optional superseded-anchor priority; returns the demoted count."""
+    cache = core.create_kv_cache(None, prompt, custom_priority_callback=priority_callback)
+    assert cache.superseded_anchor_priority is None
+    if demote is not None:
+        cache.set_superseded_anchor_priority(demote)
+        assert cache.superseded_anchor_priority == demote
+    try:
+        assert cache.resume(CudaStream(torch.cuda.current_stream().cuda_stream))
+        assert cache.resize(len(prompt))
+        uncommitted = prompt[cache.num_committed_tokens :]
+        if uncommitted:
+            cache.commit(uncommitted)
+    finally:
+        cache.close()
+    torch.cuda.synchronize()
+    return cache.num_demoted_anchor_pages
+
+
+@pytest.mark.parametrize("demote", [True, False], ids=["demote", "baseline"])
+def test_swa_superseded_anchor_demotion_steers_real_eviction(demote: bool) -> None:
+    """Closing a request that extended past a reused endpoint window demotes that window.
+
+    Window 8, rewind 4, endpoint callback. X (4 blocks, released first) and A
+    (4 blocks) each leave block 0 at priority 0 and an endpoint window (blocks
+    1-3) at 70. B = A + 4 blocks reuses A and leaves its own window (blocks 5-7)
+    at 70 and block 4 at 0. With demotion, B's close() moves A's blocks 1-3 to
+    priority 1 (still resident and reusable); B's and X's windows keep 70. Bounded
+    pressure of 4 evictions then takes the three priority-0 pages plus:
+
+    * with demotion: A's block 1 (lowest remaining priority), X fully kept;
+    * baseline: X's block 1 (oldest endpoint page, LRU), A fully kept.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    torch.cuda.synchronize()
+    tpb = TOKENS_PER_BLOCK
+    window_size, rewind_tokens = 2 * tpb, tpb
+    core = KVCacheManager(
+        KVCacheManagerConfig(
+            tokens_per_block=tpb,
+            cache_tiers=[GpuCacheTierConfig(quota=2 << 20)],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[
+                        BufferConfig(role=Role.KEY, size=65536),
+                        BufferConfig(role=Role.VALUE, size=65536),
+                    ],
+                    sliding_window_size=window_size,
+                )
+            ],
+        )
+    )
+
+    def cb(prompt_length: int):
+        return _swa_endpoint_priority(prompt_length, tpb, rewind_tokens)
+
+    prompt_x = [5000 + i for i in range(4 * tpb)]
+    prompt_a = list(range(4 * tpb))
+    prompt_b = prompt_a + [1000 + i for i in range(4 * tpb)]
+    pins = []
+    try:
+        assert _release_prompt(core, prompt_x, cb(len(prompt_x)), 1 if demote else None) == 0
+        assert _release_prompt(core, prompt_a, cb(len(prompt_a)), 1 if demote else None) == 0
+        lc = _introspection.swa_life_cycle_ids(core)[0]
+        _, pa = _introspection.reuse_match_page_priorities(core, ReuseScope(), prompt_a, lc)
+        assert [p[0] for p in pa] == [0, 70, 70, 70]
+        n = _release_prompt(core, prompt_b, cb(len(prompt_b)), 1 if demote else None)
+        assert n == (3 if demote else 0)
+
+        _, pb = _introspection.reuse_match_page_priorities(core, ReuseScope(), prompt_b, lc)
+        _, px = _introspection.reuse_match_page_priorities(core, ReuseScope(), prompt_x, lc)
+        assert all(p is not None and p[1] == 0 and p[2] for p in pb + px), "resident, scheduled"
+        assert [p[0] for p in pb] == [0] + [1 if demote else 70] * 3 + [0, 70, 70, 70]
+        assert [p[0] for p in px] == [0, 70, 70, 70]
+        # Demotion changes eviction order only: the demoted window is still reusable.
+        assert core.probe_reuse(input_tokens=prompt_a + [9999]) == len(prompt_a)
+
+        stream = CudaStream(torch.cuda.current_stream().cuda_stream)
+        free_pages = core.get_storage_statistics()[0].free
+        for _ in range(free_pages + 4):
+            pin = core.create_kv_cache()
+            pins.append(pin)
+            assert pin.resume(stream)
+            assert pin.resize(tpb)
+
+        _, pa = _introspection.reuse_match_pages(core, ReuseScope(), prompt_a, lc)
+        _, px = _introspection.reuse_match_pages(core, ReuseScope(), prompt_x, lc)
+        _, pb = _introspection.reuse_match_pages(core, ReuseScope(), prompt_b, lc)
+        assert pa[0] is None and px[0] is None and pb[4] is None, "priority-0 pages go first"
+        assert all(p is not None for p in pb[5:]), "the current endpoint window is kept"
+        if demote:
+            assert pa[1] is None and all(p is not None for p in pa[2:])
+            assert all(p is not None for p in px[1:])
+        else:
+            assert px[1] is None and all(p is not None for p in px[2:])
+            assert all(p is not None for p in pa[1:])
+    finally:
+        for pin in pins:
+            pin.close()
+        core.shutdown()
+
+
 class _CacheTierInitError(Exception):
     pass
 

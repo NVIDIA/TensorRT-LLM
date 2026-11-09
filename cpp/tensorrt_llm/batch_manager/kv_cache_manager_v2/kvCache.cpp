@@ -780,6 +780,11 @@ void KvCache::close()
     stopCommitting();
     TLLM_CHECK_DEBUG(_checkSanity());
 
+    if (mSupersededAnchorPriority.has_value())
+    {
+        mNumDemotedAnchorPages = _demoteSupersededAnchors(*mSupersededAnchorPriority);
+    }
+
     // Dummy/warmup caches are reserved at the model's full declared context, not at a realistic
     // sequence length, and mAvgSqrCapacity is an RMS -- so a handful of them dominates the
     // statistic outright and the tuner sizes pools for sequences that never arrive. They are
@@ -2417,6 +2422,53 @@ std::unique_ptr<PlannedDropHandle> KvCache::planCommittedBlockDrop()
 }
 
 // ---------------------------------------------------------------------------
+// _demoteSupersededAnchors: lower the eviction priority of the reused sliding-window pages this
+// request superseded. Only committed tree pages of the matched prefix are visited; a page is
+// demoted when its priority is above both `priority` and this cache's callback priority for the
+// same (ordinal, life cycle). Sink blocks, full-attention, sparse and SSM life cycles are skipped.
+// The callback is evaluated only for pages that pass the cheap priority test (in steady state, the
+// one endpoint window the request was matched at). Eviction order only.
+// ---------------------------------------------------------------------------
+
+int KvCache::_demoteSupersededAnchors(Priority priority)
+{
+    auto const& lifeCycles = mManager->lifeCycles();
+    auto const& allLc = lifeCycles.getAll();
+    LifeCycleId const numLc = lifeCycles.size();
+    auto& storageMgr = mManager->storage();
+    BlockOrdinal const end{std::min(mNumMatchedBlocks, mBlocks.size().value())};
+    int numDemoted = 0;
+    for (LifeCycleId lcId{0}; lcId < numLc; ++lcId)
+    {
+        auto const* attn = std::get_if<AttnLifeCycle>(&allLc[lcId]);
+        if (attn == nullptr || !attn->windowSize.has_value() || attn->isSparse)
+        {
+            continue;
+        }
+        for (BlockOrdinal ord{attn->numSinkBlocks}; ord < end; ++ord)
+        {
+            auto const& treeBlock = mBlocks[ord].treeBlock;
+            if (!treeBlock || lcId >= treeBlock->storage.size())
+            {
+                continue;
+            }
+            CommittedPage* page = treeBlock->storage[lcId];
+            if (page == nullptr || page->priority <= priority)
+            {
+                continue;
+            }
+            if (getPriority(ord, lcId) >= page->priority)
+            {
+                continue;
+            }
+            storageMgr.setPriority(*page, priority);
+            ++numDemoted;
+        }
+    }
+    return numDemoted;
+}
+
+// ---------------------------------------------------------------------------
 // _onStopCommitting: release stale held uncommitted pages for SWA layers.
 // Mirrors Python's _on_stop_committing().
 // ---------------------------------------------------------------------------
@@ -2552,6 +2604,7 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
     // --- Build blocks with stale range handling ---
 
     BlockOrdinal const numMatchedBlocks = matched.size();
+    mNumMatchedBlocks = numMatchedBlocks.value();
     _resizePageIndexBuffers(numMatchedBlocks);
 
     for (BlockOrdinal i{0}; i < numMatchedBlocks; ++i)

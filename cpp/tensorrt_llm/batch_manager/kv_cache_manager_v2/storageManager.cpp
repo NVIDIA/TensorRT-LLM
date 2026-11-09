@@ -763,6 +763,26 @@ void StorageManager::excludeFromEviction(Page& page)
     mLevels.at(page.cacheLevel).controller.remove(*page.nodeRef);
 }
 
+void StorageManager::setPriority(Page& page, Priority priority)
+{
+    if (page.priority == priority)
+    {
+        return;
+    }
+    if (!page.scheduledForEviction())
+    {
+        page.priority = priority;
+        return;
+    }
+    // The eviction queue may hold the last strong reference of a droppable page.
+    auto const keepAlive = page.sharedFromThis();
+    auto& controller = mLevels.at(page.cacheLevel).controller;
+    controller.remove(*page.nodeRef);
+    page.priority = priority;
+    controller.scheduleForEviction(page);
+    TLLM_CHECK_DEBUG(page.scheduledForEviction());
+}
+
 [[nodiscard]] auto StorageManager::makeEvictionRollbackGuard(
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const& evicted)
 {
