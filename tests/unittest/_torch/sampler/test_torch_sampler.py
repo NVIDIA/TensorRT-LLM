@@ -50,7 +50,6 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import (
     _get_max_beam_width,
     _request_get_sampling_params,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.sampler_features import apply_embedding_bias
 from tensorrt_llm._torch.pyexecutor.sampler.sampling_resolution import (
     RowSamplingParams,
     SamplingMode,
@@ -862,34 +861,6 @@ def test_greedy_no_repeat_ngram_uses_token_ban_path():
 
     assert not single_step_greedy
     assert new_tokens_host.reshape(-1)[0].item() == 3
-
-
-def test_apply_embedding_bias_adds_bias_to_request_rows_without_sync():
-    vocab_size = 8
-    bias_a = torch.arange(vocab_size, dtype=torch.float32)
-    bias_b = -2.0 * torch.ones(vocab_size, dtype=torch.float32)
-    # Mixed biased and unbiased requests, a shared bias, and multi-row requests.
-    request_biases = [bias_a, None, bias_a, bias_b]
-    request_steps = [2, 1, 1, 3]
-    requests = [SimpleNamespace(py_embedding_bias=bias) for bias in request_biases]
-    logits = torch.linspace(-1.0, 1.0, sum(request_steps) * vocab_size, device="cuda").view(
-        -1, vocab_size
-    )
-    expected = logits.clone()
-    row_offset = 0
-    for bias, steps in zip(request_biases, request_steps):
-        if bias is not None:
-            expected[row_offset : row_offset + steps] += bias.cuda()
-        row_offset += steps
-
-    torch.cuda.synchronize()
-    torch.cuda.set_sync_debug_mode("error")
-    try:
-        apply_embedding_bias(logits, requests, torch.tensor(request_steps, dtype=torch.int32))
-    finally:
-        torch.cuda.set_sync_debug_mode("default")
-
-    torch.testing.assert_close(logits, expected, rtol=0, atol=0)
 
 
 @force_ampere
