@@ -132,8 +132,8 @@ def _quant_args(quant_algo=None, kv_cache_quant_algo=None, nvfp4_backends=None):
     "sm, quant_algo, kv_cache_quant_algo, backends",
     [
         (80, QuantAlgo.FP8, None, None),
-        (89, QuantAlgo.FP8_BLOCK_SCALES, None, None),
-        (89, QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN, None, None),
+        (80, QuantAlgo.FP8_BLOCK_SCALES, None, None),
+        (80, QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN, None, None),
         (90, QuantAlgo.NVFP4, None, None),
         (80, QuantAlgo.NVFP4, None, ["marlin"]),
         (90, QuantAlgo.W4A8_MXFP4_MXFP8, None, None),
@@ -159,7 +159,9 @@ def test_quantization_below_minimum_is_unsupported(
     "sm, quant_algo, kv_cache_quant_algo, backends",
     [
         (89, QuantAlgo.FP8, None, None),
-        (90, QuantAlgo.FP8_BLOCK_SCALES, None, None),
+        # FP8 block-scale and rowwise GEMMs dispatch on Ada (SM89).
+        (89, QuantAlgo.FP8_BLOCK_SCALES, None, None),
+        (89, QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN, None, None),
         (100, QuantAlgo.NVFP4, None, None),
         (90, QuantAlgo.NVFP4, None, ["cutlass", "marlin"]),
         (120, QuantAlgo.NVFP4, QuantAlgo.FP8, None),
@@ -247,3 +249,15 @@ def test_architecture_check_passes_or_is_skipped(args, architectures):
 
 def test_architecture_check_skipped_without_config():
     startup_checks.check_architecture_registered(_arch_args(), None)
+
+
+def test_externally_declared_architecture_passes(monkeypatch):
+    # A declared external provider resolves on lookup even before its module is imported.
+    from tensorrt_llm._torch.models import modeling_utils
+
+    monkeypatch.setitem(
+        modeling_utils._EXTERNAL_ARCH_TO_MODULE, "FooBarForCausalLM", "custom_models.foo_bar"
+    )
+    startup_checks.check_architecture_registered(
+        _arch_args(), SimpleNamespace(architectures=["FooBarForCausalLM"])
+    )

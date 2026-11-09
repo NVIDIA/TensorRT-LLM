@@ -1206,6 +1206,21 @@ def register_external_model_modules(arch_to_module: Dict[str, str]) -> None:
     _rebuild_arch_registries(declared)
 
 
+def _model_arch_provider(model_arch: str) -> Optional[str]:
+    """The module to import for ``model_arch``, or ``None`` if no source lists it.
+
+    External declarations take precedence over the static index of built-in
+    architectures. Imports nothing; ``_ensure_model_registered`` and
+    ``is_model_arch_known`` both resolve providers through this function.
+    """
+    full_name = _EXTERNAL_ARCH_TO_MODULE.get(model_arch)
+    if full_name is None:
+        module_name = MODEL_ARCH_TO_MODULE.get(model_arch)
+        if module_name is not None:
+            full_name = f"tensorrt_llm._torch.models.{module_name}"
+    return full_name
+
+
 def _ensure_model_registered(model_arch: str) -> None:
     """Import the module that provides ``model_arch``, if it isn't loaded yet.
 
@@ -1226,12 +1241,9 @@ def _ensure_model_registered(model_arch: str) -> None:
     registration decorator; the import itself is idempotent via
     ``sys.modules``.
     """
-    full_name = _EXTERNAL_ARCH_TO_MODULE.get(model_arch)
+    full_name = _model_arch_provider(model_arch)
     if full_name is None:
-        module_name = MODEL_ARCH_TO_MODULE.get(model_arch)
-        if module_name is None:
-            return
-        full_name = f"tensorrt_llm._torch.models.{module_name}"
+        return
     try:
         importlib.import_module(full_name)
     except ModuleNotFoundError as e:
@@ -1256,6 +1268,18 @@ def get_registered_model_class(model_arch: str) -> Optional[Type[nn.Module]]:
     if model_arch not in MODEL_CLASS_MAPPING:
         _ensure_model_registered(model_arch)
     return MODEL_CLASS_MAPPING.get(model_arch)
+
+
+def is_model_arch_known(model_arch: str) -> bool:
+    """Whether ``get_registered_model_class`` has a source for ``model_arch``.
+
+    Checks the registry and then ``_model_arch_provider``, the same steps as
+    the lookup, but imports nothing, so it is cheap enough for checks that run
+    before the model is built. A provider whose module later fails to import
+    still counts as known; that error surfaces where the model is built.
+    """
+    return (model_arch in MODEL_CLASS_MAPPING
+            or _model_arch_provider(model_arch) is not None)
 
 
 def _is_builtin_draft_model_builder(builder) -> bool:

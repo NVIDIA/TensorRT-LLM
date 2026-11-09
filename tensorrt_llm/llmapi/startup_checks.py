@@ -22,13 +22,15 @@ from tensorrt_llm.llmapi.utils import get_device_count
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 # Lowest architecture marked as supported in the "Hardware Support Matrix" of
-# docs/source/features/quantization.md. Formats missing from the matrix are not
-# checked, and neither are KV cache formats: attention kernels dequantize the KV
-# cache before the MMA, so its support depends on the kernel, not on a lower bound.
+# docs/source/features/quantization.md, except FP8 block scales and FP8 per-channel
+# per-token: their GEMMs also dispatch on SM89 (Ada), which the matrix does not list.
+# Formats missing from the matrix are not checked, and neither are KV cache formats:
+# attention kernels dequantize the KV cache before the MMA, so its support depends on
+# the kernel, not on a lower bound.
 _MIN_SM_BY_QUANT_ALGO = {
     QuantAlgo.FP8: 89,
-    QuantAlgo.FP8_BLOCK_SCALES: 90,
-    QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN: 90,
+    QuantAlgo.FP8_BLOCK_SCALES: 89,
+    QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN: 89,
     QuantAlgo.W4A8_AWQ: 89,
     QuantAlgo.NVFP4: 100,
     QuantAlgo.W4A8_MXFP4_MXFP8: 100,
@@ -173,12 +175,9 @@ def check_architecture_registered(
     )
     if not architectures:
         return
-    # The static index lists every built-in architecture without importing the model
-    # zoo; MODEL_CLASS_MAPPING adds custom models registered in this process.
-    from tensorrt_llm._torch.models._arch_index import MODEL_ARCH_TO_MODULE
-    from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
+    from tensorrt_llm._torch.models.modeling_utils import is_model_arch_known
 
-    if any(arch in MODEL_CLASS_MAPPING or arch in MODEL_ARCH_TO_MODULE for arch in architectures):
+    if any(is_model_arch_known(arch) for arch in architectures):
         return
     raise UnsupportedError(
         f"Unknown model architecture: {architectures[0]}. TensorRT-LLM has no "
