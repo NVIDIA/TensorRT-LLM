@@ -1782,14 +1782,21 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
                             and spec_config.draft_is_embedded_in_target)
     load_balancer = (model_config.moe_load_balancer
                      if shares_load_balancer else None)
+    draft_moe_selection = _draft_moe_selection(model_config,
+                                               spec_config,
+                                               load_balancer=load_balancer)
+    if (shares_load_balancer and draft_moe_selection is not None
+            and draft_moe_selection.tactic is not None):
+        # The embedded draft loads the target checkpoint, whose expert map
+        # describes the main layers, not the draft stages a draft tactic pins.
+        # DSv4DSparkDraftModel resolves the tactic against the stages' entries,
+        # so load the checkpoint as an AUTO draft selection would.
+        draft_moe_selection = MoESelection(
+            backend=auto_moe_backend_for_load_balancer(load_balancer))
     kwargs = dict(
         trust_remote_code=True,
         attn_backend=model_config.attn_backend,
-        **_draft_loader_moe_kwargs(
-            model_config,
-            _draft_moe_selection(model_config,
-                                 spec_config,
-                                 load_balancer=load_balancer)),
+        **_draft_loader_moe_kwargs(model_config, draft_moe_selection),
         # The drafter runs on every row; keep it TP where the TP group shares
         # requests (helix + attention DP at tp_size 1).
         mapping=model_config.mapping.mapping_for_full_rows(),
