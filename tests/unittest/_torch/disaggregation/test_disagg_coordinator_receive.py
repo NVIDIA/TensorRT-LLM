@@ -804,6 +804,8 @@ class _ClosingRequest(_GenRequest):
             py_end_id=-1,
             py_stop_words_list=None,
             py_first_token_checked=False,
+            py_return_generation_logits=False,
+            py_use_chunked_generation_logits=False,
             return_perf_metrics=False,
             response=SimpleNamespace(result=SimpleNamespace()),
             cached_tokens=5,
@@ -847,7 +849,7 @@ def _closing_executor(
     executor.canceled_req_ids = []
     executor.enable_iter_perf_stats = False
     executor._is_kv_manager_v2 = False
-    executor.is_benchmark_disagg = False
+    executor._benchmark_fill_phase_active = False
     executor.iter_counter = 7
     executor.perf_manager = Mock()
     executor.sampler = SimpleNamespace(max_seq_len=max_seq_len)
@@ -1278,7 +1280,7 @@ def test_first_token_finishes_count_as_benchmark_fill_progress() -> None:
     completed receives; it still counts as progress, once."""
     h = CoordinatorHarness()
     executor = _closing_executor(h.coordinator, [_ClosingRequest(1)])
-    executor.is_benchmark_disagg = True
+    executor._benchmark_fill_phase_active = True
     executor._benchmark_first_token_finished_ids = set()
     executor._benchmark_completed_gen_transfer_ids = set()
 
@@ -1287,6 +1289,22 @@ def test_first_token_finishes_count_as_benchmark_fill_progress() -> None:
     assert executor.active_requests == []
     assert executor._benchmark_gen_transfer_made_progress() is True
     assert executor._benchmark_gen_transfer_made_progress() is False
+
+
+def test_first_token_finishes_after_the_benchmark_fill_are_not_recorded() -> None:
+    """Once the fill completes the gate stops polling, so later first-token
+    finishes are not recorded for it and the record does not grow for the
+    rest of the run."""
+    h = CoordinatorHarness()
+    executor = _closing_executor(h.coordinator, [_ClosingRequest(1)])
+    executor.is_benchmark_disagg = True
+    executor._benchmark_fill_phase_active = False
+    executor._benchmark_first_token_finished_ids = set()
+
+    executor._finish_gen_requests_ended_by_first_token()
+
+    assert executor.active_requests == []
+    assert executor._benchmark_first_token_finished_ids == set()
 
 
 def _stats_executor(coordinator: DisaggTransferCoordinator, active) -> PyExecutor:

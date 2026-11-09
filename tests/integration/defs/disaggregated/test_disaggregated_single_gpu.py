@@ -1097,13 +1097,14 @@ def test_disaggregated_logits(model, generation_overlap):
             # --- generation_only whose first token is a stop token ---
             # The request stops by STOP_WORDS at that token, as aggregated
             # serving does: the stop token and its logits are trimmed, and no
-            # decode step adds a token after it.
+            # decode step adds a token after it. ignore_eos would also drop
+            # the stop words.
             ctx_responses4 = send_requests_to_worker(ctx_requests, 0, intercomm)
             dp4 = ctx_responses4[0][0].disaggregated_params
             dp4.request_type = "generation_only"
             first_token = dp4.first_gen_tokens[0]
             stop_sp = SamplingParams(max_tokens=max_tokens,
-                                     ignore_eos=True,
+                                     ignore_eos=False,
                                      stop_token_ids=[first_token],
                                      return_generation_logits=True)
             stop_responses = send_requests_to_worker([(prompt, stop_sp, dp4)],

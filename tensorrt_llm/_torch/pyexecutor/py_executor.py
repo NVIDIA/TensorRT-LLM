@@ -10729,8 +10729,9 @@ class PyExecutor:
                 self._pending_transfer_responses.append(
                     (req.py_request_id, response))
             self._pending_response_terminations.append(req)
-        if self.is_benchmark_disagg:
-            # The fill gate counts completed receives as progress.
+        if self._benchmark_fill_phase_active:
+            # The fill gate counts completed receives as progress. It stops
+            # polling once the fill completes, so nothing is recorded after.
             self._benchmark_first_token_finished_ids.update(
                 get_unique_rid(req) for req in finished)
         finished_ids = {id(req) for req in finished}

@@ -4600,6 +4600,7 @@ class TestPendingTransferResponseFlush:
         executor._is_kv_manager_v2 = False
         executor._mm_encoder_item_scheduling_enabled = False
         executor.is_benchmark_disagg = False
+        executor.enable_kv_cache_events = False
         executor._flush_pending_transfer_responses = Mock()
         executor._packed_sync_enabled = False
         executor._stage_timing = False
