@@ -132,9 +132,7 @@ attention backends in `_torch/attention/`, and fused MoE in `_torch/moe/`.
 This applies to every path in the target: prefill, decode, the shapes a fast
 path does not cover, and weight loading. The
 [DeepSeek R1 target](models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/) is an
-example: besides its own code and catalog operations, it uses only
-`DecoderModel`, `DecoderModelForCausalLM`, attention metadata and the engine's
-speculative worker.
+example that uses no Modeling V1 model code.
 
 ## Adding a family or a target
 
