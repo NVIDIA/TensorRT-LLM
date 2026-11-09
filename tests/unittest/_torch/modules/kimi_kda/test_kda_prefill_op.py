@@ -559,12 +559,14 @@ def test_kda_prefill_op_sm_reserve_keeps_results(sequence_lengths, state_dtype, 
 
 @torch.no_grad()
 def test_kda_small_bh_k1_keeps_results_on_a_small_grid() -> None:
-    """A three-block Small-BH K1 grid writes bitwise the same tiles as a full grid.
+    """A three-block Small-BH K1 grid writes bitwise the same tiles as a clean reference.
 
     Each block of a small persistent grid passes many tiles through its two
     shared-memory stages, so a tile TMA-stored before its shared-memory writes
     were visible to the store would keep values of the stage's previous tile.
-    Repeated launches give such a store many chances to show.
+    Repeated launches give such a store many chances to show. The reference
+    launch gives every scheduled tile its own block, so no reference block
+    reuses a stage and a stale value cannot land in the expected tensors.
     """
     from tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda import (
         kda_chunked_bt16_small_bh as small_bh,
@@ -587,8 +589,15 @@ def test_kda_small_bh_k1_keeps_results_on_a_small_grid() -> None:
     dt_bias = torch.zeros(heads, HEAD_DIM, device="cuda")
     a_log = torch.zeros(heads, device="cuda")
 
-    def run(max_active_clusters: int, like: tuple[torch.Tensor, ...] | None = None):
-        # Padding rows between packed sequences are never written; zeros keep them equal.
+    def run(
+        max_active_clusters: int, like: tuple[torch.Tensor, ...] | None = None
+    ) -> tuple[torch.Tensor, ...]:
+        """Run one K1 launch with at most ``max_active_clusters`` blocks.
+
+        Returns the six freshly allocated outputs, or with ``like`` zero-filled
+        tensors matching it: the padding rows between packed sequences are
+        never written, and zeros keep them equal across launches.
+        """
         outputs = None if like is None else tuple(torch.zeros_like(t) for t in like)
         return small_bh.chunk_kda_fwd_k1(
             q,
@@ -606,13 +615,21 @@ def test_kda_small_bh_k1_keeps_results_on_a_small_grid() -> None:
             max_active_clusters=max_active_clusters,
         )
 
-    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    expected = run(num_sms, like=run(num_sms))
+    # A grid at least as large as the scheduled tile count gives the reference
+    # launch one block per tile (the scheduler clamps the grid to the problem
+    # size), so no reference block runs a second tile and reuses a stage.
+    scheduled_tiles = (tokens + small_bh._TT - 1) // small_bh._TT * heads * len(sequence_lengths)
+    expected = run(scheduled_tiles, like=run(scheduled_tiles))
     for launch in range(32):
         for name, got, want in zip(
             ("qd", "kd", "kr", "mqk", "mkk", "gk"), run(3, like=expected), expected, strict=True
         ):
-            assert torch.equal(got, want), f"{name} differs on launch {launch}"
+            if not torch.equal(got, want):
+                diff = got != want
+                raise AssertionError(
+                    f"{name} differs on launch {launch}: {int(diff.sum())} of "
+                    f"{got.numel()} elements differ, first at {diff.nonzero()[0].tolist()}"
+                )
 
 
 @torch.no_grad()
