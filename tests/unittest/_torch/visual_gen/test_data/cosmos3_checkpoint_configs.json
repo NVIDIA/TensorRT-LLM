@@ -1,0 +1,226 @@
+{
+  "nvidia/Cosmos3-Edge": {
+    "model_index.json": {
+      "default_use_system_prompt": false,
+      "use_native_flow_schedule": true
+    },
+    "transformer/config.json": {
+      "temporal_compression_factor": 4
+    },
+    "vae/config.json": {
+      "scale_factor_temporal": 4,
+      "scale_factor_spatial": 16
+    }
+  },
+  "nvidia/Cosmos3-Edge-Policy-DROID": {
+    "checkpoint.json": {
+      "policy": {
+        "action_chunk_size": 32,
+        "conditioning_fps": 15.0,
+        "domain_name": "droid_lerobot"
+      }
+    },
+    "config.json": {
+      "model": {
+        "config": {
+          "vlm_config": {
+            "use_system_prompt": false
+          }
+        }
+      }
+    },
+    "model_index.json": {
+      "default_use_system_prompt": false,
+      "use_native_flow_schedule": true
+    },
+    "transformer/config.json": {
+      "temporal_compression_factor": 4
+    },
+    "vae/config.json": {
+      "scale_factor_temporal": 4,
+      "scale_factor_spatial": 16
+    }
+  },
+  "nvidia/Cosmos3-Nano": {
+    "config.json": {
+      "model": {
+        "config": {
+          "vlm_config": {
+            "use_system_prompt": false
+          }
+        }
+      }
+    },
+    "transformer/config.json": {
+      "position_embedding_type": "unified_3d_mrope",
+      "max_position_embeddings": 262144,
+      "temporal_compression_factor_sound": 1
+    },
+    "vae/config.json": {
+      "scale_factor_temporal": 4,
+      "scale_factor_spatial": 16
+    }
+  },
+  "nvidia/Cosmos3-Nano-Policy-DROID": {
+    "config.json": {
+      "model": {
+        "config": {
+          "vlm_config": {
+            "use_system_prompt": false
+          }
+        }
+      }
+    },
+    "transformer/config.json": {
+      "position_embedding_type": "unified_3d_mrope",
+      "max_position_embeddings": 262144,
+      "temporal_compression_factor_sound": 1
+    },
+    "vae/config.json": {
+      "scale_factor_temporal": 4,
+      "scale_factor_spatial": 16
+    }
+  },
+  "nvidia/Cosmos3-Nano-Sim-Bimanual": {
+    "config.json": {
+      "model": {
+        "config": {
+          "vlm_config": {
+            "use_system_prompt": false
+          }
+        }
+      }
+    },
+    "model_index.json": {
+      "default_use_system_prompt": true,
+      "use_native_flow_schedule": false
+    },
+    "scheduler/scheduler_config.json": {
+      "fixed_step_sampler_config": {
+        "t_list": [
+          1.0,
+          0.9375,
+          0.8333333333333334,
+          0.625
+        ]
+      }
+    },
+    "transformer/config.json": {
+      "temporal_compression_factor": 4
+    },
+    "vae/config.json": {
+      "scale_factor_temporal": 4,
+      "scale_factor_spatial": 16
+    }
+  },
+  "nvidia/Cosmos3-Super": {
+    "config.json": {
+      "model": {
+        "config": {
+          "vlm_config": {
+            "use_system_prompt": false
+          }
+        }
+      }
+    },
+    "transformer/config.json": {
+      "position_embedding_type": "unified_3d_mrope",
+      "max_position_embeddings": 262144,
+      "temporal_compression_factor_sound": 1
+    },
+    "vae/config.json": {
+      "scale_factor_temporal": 4,
+      "scale_factor_spatial": 16
+    }
+  },
+  "nvidia/Cosmos3-Super-Image2Video": {
+    "config.json": {
+      "model": {
+        "config": {
+          "vlm_config": {
+            "use_system_prompt": false
+          }
+        }
+      }
+    },
+    "transformer/config.json": {
+      "position_embedding_type": "unified_3d_mrope",
+      "max_position_embeddings": 262144,
+      "temporal_compression_factor_sound": 1
+    },
+    "vae/config.json": {
+      "scale_factor_temporal": 4,
+      "scale_factor_spatial": 16
+    }
+  },
+  "nvidia/Cosmos3-Super-Image2Video-4Step": {
+    "config.json": {
+      "model": {
+        "config": {
+          "vlm_config": {
+            "use_system_prompt": false
+          }
+        }
+      }
+    },
+    "scheduler/scheduler_config.json": {
+      "fixed_step_sampler_config": {
+        "t_list": [
+          1.0,
+          0.9375,
+          0.8333333333333334,
+          0.625
+        ]
+      }
+    },
+    "vae/config.json": {
+      "scale_factor_temporal": 4,
+      "scale_factor_spatial": 16
+    }
+  },
+  "nvidia/Cosmos3-Super-Text2Image": {
+    "config.json": {
+      "model": {
+        "config": {
+          "vlm_config": {
+            "use_system_prompt": false
+          }
+        }
+      }
+    },
+    "transformer/config.json": {
+      "position_embedding_type": "unified_3d_mrope",
+      "max_position_embeddings": 262144,
+      "temporal_compression_factor_sound": 1
+    },
+    "vae/config.json": {
+      "scale_factor_temporal": 4,
+      "scale_factor_spatial": 16
+    }
+  },
+  "nvidia/Cosmos3-Super-Text2Image-4Step": {
+    "config.json": {
+      "model": {
+        "config": {
+          "vlm_config": {
+            "use_system_prompt": false
+          }
+        }
+      }
+    },
+    "scheduler/scheduler_config.json": {
+      "fixed_step_sampler_config": {
+        "t_list": [
+          1.0,
+          0.9375,
+          0.8333333333333334,
+          0.625
+        ]
+      }
+    },
+    "vae/config.json": {
+      "scale_factor_temporal": 4,
+      "scale_factor_spatial": 16
+    }
+  }
+}

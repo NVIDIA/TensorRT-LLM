@@ -163,6 +163,7 @@ def _run_cosmos3_lpips_pipeline(
     width=COSMOS3_LPIPS_WIDTH,
     num_inference_steps=COSMOS3_LPIPS_NUM_INFERENCE_STEPS,
     output_type="video",
+    flow_shift=None,
 ):
     """Run a Cosmos3 pipeline (default setting, VANILLA attn, compile-off).
 
@@ -224,6 +225,7 @@ def _run_cosmos3_lpips_pipeline(
                     video=video,
                     image=image,
                     output_type=output_type,
+                    flow_shift=flow_shift,
                 )
             if result is None:
                 return None
@@ -269,8 +271,10 @@ def _generate_cosmos3_v2v_lpips_frame(output_path):
     """Generate the Cosmos3-Nano video-to-video LPIPS sample (free frame only)."""
     from tensorrt_llm.media.encoding import save_image
 
+    # The golden was cut at flow shift 10.0, the value the cosmos-framework cookbook
+    # sends for video-to-video; an omitted value runs at the checkpoint scheduler's.
     video = _run_cosmos3_lpips_pipeline(
-        COSMOS3_LPIPS_V2V_NUM_FRAMES, video=_cosmos3_v2v_lpips_reference_bytes()
+        COSMOS3_LPIPS_V2V_NUM_FRAMES, video=_cosmos3_v2v_lpips_reference_bytes(), flow_shift=10.0
     )
     assert video is not None, "Cosmos3-Nano V2V LPIPS run produced no video"
     # video is (B, T, H, W, C); take the free frame -> (H, W, C) for save_image.
@@ -281,7 +285,9 @@ def _generate_cosmos3_lpips_image(output_path):
     """Generate the Cosmos3-Nano text-to-image LPIPS sample (single frame)."""
     from tensorrt_llm.media.encoding import save_image
 
-    video = _run_cosmos3_lpips_pipeline(COSMOS3_LPIPS_T2I_NUM_FRAMES)
+    # The golden was cut at flow shift 3.0, the value the cosmos-framework cookbook
+    # sends for text-to-image; an omitted value runs at the checkpoint scheduler's.
+    video = _run_cosmos3_lpips_pipeline(COSMOS3_LPIPS_T2I_NUM_FRAMES, flow_shift=3.0)
     assert video is not None, "Cosmos3-Nano T2I LPIPS run produced no frame"
     # video is (B, T, H, W, C); take the single frame -> (H, W, C) for save_image.
     save_image(video[0, 0], output_path)
@@ -967,6 +973,7 @@ def test_cosmos3_edge_t2v_lpips_against_golden(_visual_gen_deps, request, tmp_pa
         width=832,
         num_frames=COSMOS3_EDGE_LPIPS_NUM_FRAMES,
         num_inference_steps=COSMOS3_EDGE_T2V_LPIPS_STEPS,
+        flow_shift=3.0,  # the shift the golden was cut at; omitted, the checkpoint's applies
         guidance_scale=5.0,
         frame_rate=COSMOS3_EDGE_LPIPS_FRAME_RATE,
     )
@@ -1008,6 +1015,7 @@ def test_cosmos3_edge_i2v_lpips_against_golden(_visual_gen_deps, request, tmp_pa
         width=832,
         num_frames=COSMOS3_EDGE_LPIPS_NUM_FRAMES,
         num_inference_steps=COSMOS3_EDGE_I2V_LPIPS_STEPS,
+        flow_shift=3.0,  # the shift the golden was cut at; omitted, the checkpoint's applies
         guidance_scale=5.0,
         frame_rate=COSMOS3_EDGE_LPIPS_FRAME_RATE,
     )
@@ -1044,6 +1052,7 @@ def test_cosmos3_edge_t2i_lpips_against_golden(request, tmp_path):
         height=640,
         width=640,
         num_inference_steps=COSMOS3_EDGE_T2I_LPIPS_STEPS,
+        flow_shift=3.0,  # the shift the golden was cut at; omitted, the checkpoint's applies
         guidance_scale=4.0,
         output_type="image",
     )

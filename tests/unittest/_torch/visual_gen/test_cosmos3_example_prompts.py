@@ -14,15 +14,14 @@ import sys
 from pathlib import Path
 
 import pytest
+from cosmos3_fixtures import bare_resolver
 
-from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
+from tensorrt_llm._torch.visual_gen.models.cosmos3.action import ACTION_MODE_POLICY
+from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     VIDEO_RES_SIZE_INFO,
     find_closest_target_size,
 )
-from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
-    resolve_checkpoint_policy_defaults,
-    resolve_domain_action_config,
-)
+from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import RequestParameters
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 _EXAMPLE_DIR = _PROJECT_ROOT / "examples" / "visual_gen" / "models" / "cosmos3"
@@ -275,7 +274,9 @@ class TestShippedPromptFiles:
     def test_action_prompt_matches_example_domain(self, name: str, domain_name: str) -> None:
         data = cosmos3.load_prompt_file(f"prompts/{name}.json")
         prompt = json.loads(data["prompt"])
-        config = resolve_domain_action_config(domain_name=domain_name)
+        config = bare_resolver("qwen3").request(
+            RequestParameters(action_mode="action", domain_name=domain_name)
+        )
 
         assert list(prompt) == [
             "cinematography",
@@ -288,14 +289,14 @@ class TestShippedPromptFiles:
         assert prompt["cinematography"] == {
             "framing": "This video is captured from a first-person perspective looking at the scene."
         }
-        duration_seconds = config["num_frames"] / config["frame_rate"]
+        duration_seconds = config.num_frames / config.frame_rate
         minutes, seconds = divmod(round(duration_seconds), 60)
         assert prompt["duration"] == f"{int(duration_seconds)}s"
         assert prompt["actions"][0]["time"] == f"0:00-{minutes}:{seconds:02d}"
-        assert prompt["fps"] == config["frame_rate"]
-        width, height = find_closest_target_size(720, 1280, config["action_resolution"])
+        assert prompt["fps"] == config.frame_rate
+        width, height = find_closest_target_size(720, 1280, config.action_resolution)
         assert prompt["resolution"] == {"H": height, "W": width}
-        assert VIDEO_RES_SIZE_INFO[str(config["action_resolution"])][prompt["aspect_ratio"]] == (
+        assert VIDEO_RES_SIZE_INFO[str(config.action_resolution)][prompt["aspect_ratio"]] == (
             width,
             height,
         )
@@ -303,25 +304,19 @@ class TestShippedPromptFiles:
     def test_edge_policy_prompt_matches_checkpoint_defaults(self):
         data = cosmos3.load_prompt_file("prompts/action_edge_policy_droid.json")
         prompt = json.loads(data["prompt"])
-        policy_defaults = resolve_checkpoint_policy_defaults(
-            {
-                "action_chunk_size": 32,
-                "conditioning_fps": 15.0,
-                "domain_name": "droid_lerobot",
-            }
+        policy = {"action_chunk_size": 32, "conditioning_fps": 15.0, "domain_name": "droid_lerobot"}
+        config = bare_resolver("nemotron_dense", policy=policy).request(
+            RequestParameters(action_mode=ACTION_MODE_POLICY)
         )
-        config = resolve_domain_action_config(checkpoint_policy_defaults=policy_defaults)
 
-        duration_seconds = config["num_frames"] / config["frame_rate"]
+        duration_seconds = config.num_frames / config.frame_rate
         minutes, seconds = divmod(round(duration_seconds), 60)
         assert prompt["duration"] == f"{int(duration_seconds)}s"
         assert prompt["actions"][0]["time"] == f"0:00-{minutes}:{seconds:02d}"
-        assert prompt["fps"] == config["frame_rate"]
-        width, height = find_closest_target_size(544, 736, config["action_resolution"])
+        assert prompt["fps"] == config.frame_rate
+        width, height = find_closest_target_size(544, 736, config.action_resolution)
         assert prompt["resolution"] == {"H": height, "W": width}
-        width, height = VIDEO_RES_SIZE_INFO[str(config["action_resolution"])][
-            prompt["aspect_ratio"]
-        ]
+        width, height = VIDEO_RES_SIZE_INFO[str(config.action_resolution)][prompt["aspect_ratio"]]
         assert prompt["resolution"] == {"H": height, "W": width}
 
     def test_default_prompt_file(self):
