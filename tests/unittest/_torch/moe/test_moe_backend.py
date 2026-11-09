@@ -5625,8 +5625,6 @@ def test_trtllm_bf16_unquantized_moe(
     backend_type = MoeBackendType.TRTLLM
     dtype = torch.bfloat16
 
-    num_experts = _BF16_UNQUANT_NUM_EXPERTS
-    top_k = _BF16_UNQUANT_TOP_K
     hidden_size = _BF16_UNQUANT_HIDDEN
     intermediate_size = _BF16_UNQUANT_INTERMEDIATE
 
