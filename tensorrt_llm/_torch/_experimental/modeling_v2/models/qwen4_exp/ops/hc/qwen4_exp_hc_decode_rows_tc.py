@@ -124,10 +124,13 @@ def _mbar_init_tx(mbar, nbytes, *, loc=None, ip=None):
 
 @dsl_user_op
 def _mbar_wait0(mbar, *, loc=None, ip=None):
+    """Wait for phase 0 of this CTA's mailbox barrier with `.acquire.cluster` semantics: the
+    mailbox is filled by the peers' `st.async`, whose complete-tx releases at cluster scope, and
+    the default `.acquire.cta` wait does not synchronize with threads of another CTA."""
     _asm(
         T.i32(),
         [cutlass.Int32(mbar)],
-        "{ .reg .pred p; WAIT: mbarrier.try_wait.parity.shared::cta.b64 p, [$1], 0; "
+        "{ .reg .pred p; WAIT: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [$1], 0; "
         "@!p bra WAIT; mov.u32 $0, 0; }",
         "=r,r",
         loc,
