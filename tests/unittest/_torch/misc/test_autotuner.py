@@ -1847,8 +1847,9 @@ def test_parallel_tactics_split_skips_non_helix_cp_ranks():
 
 
 @pytest.mark.parametrize("num_tactics", [0, 1, 3, 15, 16, 17])
-def test_parallel_tactics_short_list_keeps_one_candidate_per_idle_rank(
-        num_tactics: int) -> None:
+@pytest.mark.parametrize("offset", [0, 1, 7, 15])
+def test_parallel_tactics_short_list_partitions_without_duplicates(
+        num_tactics: int, offset: int) -> None:
     from types import SimpleNamespace
 
     tactics = list(range(num_tactics))
@@ -1857,11 +1858,11 @@ def test_parallel_tactics_short_list_keeps_one_candidate_per_idle_rank(
         tuner = SimpleNamespace(_is_distributed=lambda: True,
                                 _tuning_group=lambda: (16, rank))
         selected = autotuner.AutoTuner._maybe_parallelize_tactics(
-            tuner, tactics, DistributedTuningStrategy.PARALLEL)
+            tuner, tactics, DistributedTuningStrategy.PARALLEL, offset=offset)
         shards.append(selected)
-        assert len(selected) <= max(1, (num_tactics + 15) // 16)
-        assert bool(selected) == bool(tactics)
-    assert set(tactic for shard in shards for tactic in shard) == set(tactics)
+    assert sorted(tactic for shard in shards for tactic in shard) == tactics
+    assert max(map(len, shards)) - min(map(len, shards)) <= 1
+    assert sum(not shard for shard in shards) == max(0, 16 - num_tactics)
 
 
 def test_profiling_cache_enum_tactic_roundtrip(tmp_path):
@@ -2184,10 +2185,12 @@ def test_parallel_split_deals_pairs_across_runners(monkeypatch):
     assert warnings == [], warnings
 
 
-def test_parallel_rank_dealt_no_pair_runs_the_merged_winner(monkeypatch):
+@pytest.mark.parametrize("group_size", [2, 4, 16])
+def test_parallel_rank_dealt_no_pair_runs_the_merged_winner(
+        monkeypatch: pytest.MonkeyPatch, group_size: int) -> None:
     """choose_one on a PARALLEL rank that profiles nothing returns the winner
-    the group found: with one (runner, tactic) pair on two ranks, the rank the
-    deal skips gets it from the merge."""
+    the group found: with one (runner, tactic) pair, all ranks the deal skips
+    get it from the merge without warning."""
 
     class SingleTacticRunner(TunableRunner):
 
@@ -2204,6 +2207,9 @@ def test_parallel_rank_dealt_no_pair_runs_the_merged_winner(monkeypatch):
         return 1.0
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record_pair)
+    warnings = []
+    monkeypatch.setattr(autotuner.logger, "warning_once",
+                        lambda *args, **kwargs: warnings.append(args))
     gathered = {}
 
     class _AllgatherDist:
@@ -2224,9 +2230,9 @@ def test_parallel_rank_dealt_no_pair_runs_the_merged_winner(monkeypatch):
 
     def tuner_for(rank):
         tuner = autotuner.AutoTuner()
-        tuner.setup_distributed_state(Mapping(world_size=2,
+        tuner.setup_distributed_state(Mapping(world_size=group_size,
                                               rank=rank,
-                                              tp_size=2),
+                                              tp_size=group_size),
                                       dist=_AllgatherDist(rank))
         tuner.is_tuning_mode = True
         return tuner
@@ -2235,10 +2241,13 @@ def test_parallel_rank_dealt_no_pair_runs_the_merged_winner(monkeypatch):
     profiling_rank = tuner_for(0)._parallel_deal_start(
         op, profile, DistributedTuningStrategy.PARALLEL)
     results = {}
-    for rank in (profiling_rank, 1 - profiling_rank):
+    ranks = [profiling_rank
+             ] + [rank for rank in range(group_size) if rank != profiling_rank]
+    for rank in ranks:
         results[rank] = tuner_for(rank).choose_one(op, [runner], config, inputs)
     assert profiled == [(profiling_rank, 7)], profiled
-    assert results[0] == results[1] == (runner, 7), results
+    assert all(result == (runner, 7) for result in results.values()), results
+    assert warnings == [], warnings
 
 
 def test_parallel_search_cache_picks_fastest_runner():
