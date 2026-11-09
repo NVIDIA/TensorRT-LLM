@@ -132,8 +132,11 @@ class ExecutionStage:
         contract = self.workflow._contract
         self.state = state
         units = assembly_units(self.workflow.task_data)
+        # A core accuracy check boots the engine as a boot check does: either passing says it runs.
         core_boots = [
-            c.key for c in contract.required() if units and c.unit == units[0] and c.gate == "boot"
+            c.key
+            for c in contract.required()
+            if units and c.unit == units[0] and (c.gate == "boot" or c.gate.startswith("accuracy["))
         ]
         feature_refs = [*units[1:], *variants_mod.variants(self.workflow.task_data)]
         total = max(len(state.devices), self.workflow._gate_env().world_size, 1)

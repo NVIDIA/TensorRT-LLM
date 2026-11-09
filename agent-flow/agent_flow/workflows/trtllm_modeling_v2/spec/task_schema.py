@@ -156,7 +156,8 @@ RUNTIME_SWITCHES: dict[str, bool] = {
     "cuda_graph": True,
     "chunked_prefill": False,
     "overlap_scheduler": True,
-    "kv_cache_reuse": True,
+    # Block reuse is a non-core feature, proven by a variant: the core runs without it.
+    "kv_cache_reuse": False,
 }
 
 # Scopes a target may be built at. ``text_only`` is the useful one: a
@@ -268,14 +269,17 @@ ANCHOR_STATES: tuple[str, ...] = (ANCHOR_RECORDED, ANCHOR_RELATIVE)
 
 # `accuracy.benchmark_members`: where each unit's accuracy benchmark runs.
 #
-#   every    (default) at every member.
+#   per_mode (default) the widest member of each parallel mode (tp, tep, dep), and a
+#            one-rank member, whose single-GPU path is one of its own; the others boot.
+#   every    at every member.
 #   <member> at that member (`dep4`, ...), for each unit that has it.
+BENCHMARK_MEMBERS_PER_MODE = "per_mode"
 BENCHMARK_MEMBERS_EVERY = "every"
 #: The concurrencies a perf campaign measures when nothing says: low latency, middle, high
 #: throughput. An attention-DP member measures only the last. A concurrency, like a batch
 #: size, is the global total across the ranks (``check_config.share_batch``).
 DEFAULT_PERF_CONCURRENCY: tuple[int, ...] = (1, 32, 128)
-BENCHMARK_MEMBERS: tuple[str, ...] = (BENCHMARK_MEMBERS_EVERY,)
+BENCHMARK_MEMBERS: tuple[str, ...] = (BENCHMARK_MEMBERS_PER_MODE, BENCHMARK_MEMBERS_EVERY)
 
 # Boot workloads allow run-wide keys and per-unit overlays. Keywords match
 # generated text, never logs; absent multimodal images use the repository asset.

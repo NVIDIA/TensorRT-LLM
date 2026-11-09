@@ -64,6 +64,8 @@ goal words cannot say.
 | chunked prefill, block reuse | off in core (`runtime.chunked_prefill: false`, `kv_cache_reuse: false`); one `chunked` variant (`gates: [accuracy]`) with a `max_num_tokens` below the benchmark's prompts (e.g. 512 for 8-shot GSM8K) so they are really split, one `reuse` variant with `kv_cache_config.enable_block_reuse: true`, each only when asked (`chunked_prefill`, `prefix_reuse` in `--goal`) | the core configuration is CUDA graphs and the overlap scheduler at TP/TEP/ADP, the KV and SSM caches in the checkpoint's own dtype; every other feature is one variant on core, never combined (the lint blocks a cross product unless the notes accept the one the request names) |
 | disagg | `accuracy.disagg.test`: the node id of the target's disaggregated-serving accuracy test, written beside the tree's own (the tests that serve through `trtllm-serve disaggregated`, configured, set up and launched as they are), with the environment it reads in `accuracy.disagg.env` (`LLM_MODELS_ROOT` ...); it runs once, at the member the request validates fully. Derive sizes it from the checkpoint: **one node** when a context and a generation engine both fit (`accuracy.disagg.devices`, two engines of two on a 4-GPU node), else `accuracy.disagg.nodes` with one engine per node, as the tree's multi-node disaggregated tests place them | boot and accuracy run one aggregated engine and never cross the hop; a multi-node test runs one pytest process per node of one gates allocation (`MV2FLOW_JOB_NODE_RANK/HOSTS/NODES`), so the gates session must hold that many nodes |
 | any other feature (MTP, speculative, offload ...) | name it in `--goal`; `derive.report.md` and `task.example.yaml` say what its unit owes | the same one-variant-per-axis rule applies |
+| a deployment, e.g. "low latency at TEP4 with MTP3, chunked prefill and reuse" | **one variant per deployment**: `unit:` the feature it serves (`mtp`), `members: [tep4]`, its options stacked in one `llm_api_options` overlay, `gates: [accuracy, acceptance]` (`acceptance` only with a speculator) | it proves the combination that ships, which one variant per axis never runs (disagg + MTP at attention TP failed only once deployed); a failure is the worker's to bisect along the axes |
+| speculative depths, e.g. "MTP1-7" | the depth the deployments run and the deepest one: two variants at most (`speculative_config.max_draft_len`), each `gates: [acceptance]` | every depth runs the same draft path; the deepest stresses it most |
 | workload isl / osl / concurrency | `max_seq_len = isl + osl`; `max_batch_size` >= the concurrency; both are **global totals**: under attention DP each rank serves its share (`max_batch_size / ranks`, rounded up); `max_num_tokens` = isl (or 8192); `perf.workload` | |
 | "perf tune" | `perf.enabled: true`; `perf.workload.concurrency` 1/32/128 unless the goal names it; a `dep` member only the high point, a global total; a perf config's `cuda_graph_config` captures up to the live requests a rank holds (under attention DP the concurrency over the ranks, x1.5 as they finish unevenly) | `trtllm-modeling-v2 tune` runs it on the delivered target, in a process of its own: the onboarding runs none of it; it measures one baseline (no stock reference, no repeats); a goal is `ratio_to_baseline` or `pct_of_sol` |
 
@@ -73,10 +75,13 @@ size is paid once per fix, not once per run. Prove each requested feature **once
 the request validates fully, and accept the rest in `coverage.accept`, where the delivery report
 states it:
 
-- A storage or scheduling variant (a KV dtype, `chunked`, `reuse`) takes `gates: [accuracy]`.
-  The accuracy check loads the same engine and fails unless each rank reports the variant's
-  setting (its KV dtype, its chunking); a variant that boots, boots at **every** member of its
-  unit.
+- A unit's benchmark runs at the widest member of each parallel mode and a one-rank member
+  (`accuracy.benchmark_members: per_mode`, the default); its other members boot. A member with
+  a benchmark owes no boot: the accuracy check starts and attests the same engine, unless the
+  unit runs with block reuse on, whose prefix hits only the boot's probe proves.
+- A storage or scheduling variant (a KV dtype, `chunked`, `reuse`) takes `gates: [accuracy]`
+  and names its member. The accuracy check loads the same engine and fails unless each rank
+  reports the variant's setting (its KV dtype, its chunking).
 - Members the request scopes to text-only or aggregate take core alone, not the variants.
 - A feature unit runs at one member (`members: {<feature>: [X]}`), and every variant stays on
   `unit: core`. Each feature then has a check that exercises it (disagg its test, multimodal

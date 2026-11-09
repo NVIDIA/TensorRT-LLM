@@ -45,6 +45,7 @@ from ...checks import check_config, disagg, serve
 from ...checks.accuracy import resolve_discriminators
 from ...checks.boot import resolve_boot_spec
 from ...checks.check_config import (
+    asks_block_reuse,
     load_llm_api_options,
     order_members_by_cost,
     resolve_llm_api_options,
@@ -54,6 +55,7 @@ from ...checks.check_config import (
 )
 from ...spec import variants as variants_mod
 from ...spec.task_schema import (
+    BENCHMARK_MEMBERS_EVERY,
     DISAGG_FEATURE,
     PROFILE_BRINGUP,
     PROFILE_CERTIFIED,
@@ -354,9 +356,42 @@ def _width(member: str) -> int:
 
 
 def benchmark_members(task_data: Mapping[str, Any], unit: str, members: Sequence[str]) -> list[str]:
-    """Where ``unit``'s accuracy benchmark runs: every member, or the one ``benchmark_members`` names."""
+    """Where ``unit``'s accuracy benchmark runs (``accuracy.benchmark_members``), in ``members`` order.
+
+    Every member, or the one named; else (``per_mode``, the default) the widest
+    member of each parallel mode, and the widest one-rank member: a one-rank
+    engine takes a single-GPU path of its own, and the other members of a mode
+    differ from its widest only in how many ranks share the same code.
+    """
     named = (task_data.get("accuracy") or {}).get("benchmark_members")
-    return [str(named)] if named in members else list(members)
+    if named == BENCHMARK_MEMBERS_EVERY:
+        return list(members)
+    if named in members:
+        return [str(named)]
+    widest: dict[str, str] = {}
+    for member in members:
+        width = _width(member)
+        try:
+            mode = "one-rank" if width == 1 else parse_parallel_segment(member)[0]
+        except TaskSchemaError:
+            mode = member
+        if mode not in widest or width > _width(widest[mode]):
+            widest[mode] = member
+    return [m for m in members if m in widest.values()]
+
+
+def boots_beside(
+    task_data: Mapping[str, Any], unit: str, members: Sequence[str], measured: Sequence[str]
+) -> list[str]:
+    """The members of ``members`` that owe ``unit`` a boot check beside the benchmark at ``measured``.
+
+    An accuracy check starts the same engine a boot does and attests it the same
+    way, so a member with one needs no boot, unless the unit runs with block reuse
+    on: only the boot's probe proves a reused prefix hits.
+    """
+    if asks_block_reuse(task_data, unit):
+        return list(members)
+    return [m for m in members if m not in measured]
 
 
 def benchmark_member(task_data: Mapping[str, Any], members: Sequence[str]) -> tuple[str, str]:
@@ -395,14 +430,16 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
 
     Each unit owes what its profile (``task_schema.profile_of``) asks:
     ``smoke`` its boot alone, ``bringup`` its checks at its cheapest member,
-    ``certified`` its boot boundaries and the serve gate. ``disagg`` owes its
-    disaggregated-serving test alone, once (``checks/disagg.py``): its boot and
-    accuracy would run one aggregated engine, which the units before it prove.
-    A storage or scheduling variant (one with no acceptance gate) boots at
-    every member of its unit and runs its benchmark at one
-    (:func:`benchmark_member`) unless it names its members; a variant of
-    ``disagg`` owes nothing of its own, its axis being proven on core. A
-    ``smoke`` or ``bringup`` run owes no variant and no delivery check.
+    ``certified`` its boot boundaries and the serve gate. A unit's benchmark runs
+    where :func:`benchmark_members` says, and its other members boot
+    (:func:`boots_beside`). ``disagg`` owes its disaggregated-serving test alone,
+    once (``checks/disagg.py``): its boot and accuracy would run one aggregated
+    engine, which the units before it prove. A variant (a deployment, or one
+    configuration axis) runs its benchmark at one of its members
+    (:func:`benchmark_member`) unless it names them, and boots at its other
+    members; a variant of ``disagg`` owes nothing of its own, its axis being
+    proven on core. A ``smoke`` or ``bringup`` run owes no variant and no
+    delivery check.
     """
     accuracy = task_data.get("accuracy") or {}
     serving = serve.ServeSpec.from_task(task_data).enabled
@@ -438,12 +475,14 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
                 f"({why}); its boot and accuracy would run one aggregated engine"
             )
             continue
-        add("boot", TIER_INNER)
         if level == PROFILE_SMOKE:
+            add("boot", TIER_INNER)
             notes.append(f"{unit}: the smoke profile owes its boot alone")
             continue
+        measured = benchmark_members(task_data, unit, members)
+        add("boot", TIER_INNER, at=boots_beside(task_data, unit, members, measured))
         benchmark = resolve_per_unit(accuracy, "benchmark", unit) or "accuracy"
-        add(f"accuracy[{benchmark}]", TIER_INNER, at=benchmark_members(task_data, unit, members))
+        add(f"accuracy[{benchmark}]", TIER_INNER, at=measured)
         if serving:
             add(serve.GATE_NAME, TIER_INNER, at=[serve.serve_member(members)])
         # Speculative decoding preserves the output distribution by construction, so a
@@ -472,19 +511,21 @@ def compile_contract(task_data: Mapping[str, Any], world_size: int) -> Contract:
         gates = variants_mod.variant_gates(task_data, name)
         if level == PROFILE_SMOKE:
             gates = ("boot",)
-        everywhere = order_members_by_cost(members_for(task_data, base, world_size))
         named = variants_mod.variants(task_data)[name].get("members")
         relative = variants_mod.anchor_state(task_data, name) == variants_mod.ANCHOR_RELATIVE
         if relative and "accuracy" in gates:
             notes.append(f"{name}: its anchor is {base}'s own score at the same member and target")
+        measured = members if "accuracy" in gates else []
+        if measured and not named and level != PROFILE_CERTIFIED and len(members) > 1:
+            member, why = benchmark_member(spec, members)
+            measured = [member]
+            notes.append(f"{name}: accuracy at {member} ({why}); its other members boot")
         for gate in gates:
             at = members
-            if gate == "boot" and "acceptance" not in gates:
-                at = [*members, *(m for m in everywhere if m not in members)]
-            elif gate == "accuracy" and not named and level != PROFILE_CERTIFIED and len(at) > 1:
-                member, why = benchmark_member(spec, members)
-                at = [member]
-                notes.append(f"{name}: accuracy at {member} ({why}); its other members boot")
+            if gate == "boot":
+                at = boots_beside(spec, name, members, measured)
+            elif gate == "accuracy":
+                at = measured
             owned = {c.key for c in checks}
             checks.extend(
                 Check(

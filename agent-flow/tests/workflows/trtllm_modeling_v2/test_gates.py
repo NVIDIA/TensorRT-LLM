@@ -1390,6 +1390,34 @@ def _load(tmp_path, spec) -> dict:
     return task_schema.load_and_validate_task_yaml(path)
 
 
+def test_a_member_with_a_benchmark_owes_no_boot_and_each_mode_is_benchmarked_once(tmp_path):
+    """FP8's contract booted and benchmarked all seven members: 14 core checks for 7 engines."""
+    spec = _spec(tmp_path)
+    spec["members"] = {"default": ["tp1", "tp2", "tep2", "dep2", "tp4", "tep4", "dep4"]}
+    spec["features"], spec["accuracy"]["llm_api_options"] = [], {}
+    spec["variants"] = {
+        "kv_fp8": {"members": ["dep4"], "llm_api_options": {"kv_cache_config": {"dtype": "fp8"}}}
+    }
+
+    def keys(data):
+        return sorted(c.key for c in contract_mod.compile_contract(data, world_size=4).checks)
+
+    core = [k for k in keys(_load(tmp_path, spec)) if k.startswith("core:")]
+    assert [k for k in core if ":accuracy" in k] == [
+        f"core:accuracy[gsm8k]@{m}" for m in ("dep4", "tep4", "tp1", "tp4")
+    ]
+    assert [k for k in core if ":boot" in k] == [f"core:boot@{m}" for m in ("dep2", "tep2", "tp2")]
+    assert [k for k in keys(_load(tmp_path, spec)) if k.startswith("kv_fp8:")] == [
+        "kv_fp8:accuracy[gsm8k]@dep4"
+    ]
+    # Only a boot's probe proves a reused prefix hits: with block reuse on, every member boots.
+    spec["runtime"]["kv_cache_reuse"] = True
+    assert len([k for k in keys(_load(tmp_path, spec)) if k.startswith("core:boot@")]) == 7
+    spec["runtime"]["kv_cache_reuse"] = False
+    spec["accuracy"]["benchmark_members"] = "every"
+    assert not [k for k in keys(_load(tmp_path, spec)) if k.startswith("core:boot@")]
+
+
 def test_each_member_is_launched_and_scheduled_at_its_own_width(tmp_path):
     from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
     from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow

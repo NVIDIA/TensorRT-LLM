@@ -703,6 +703,26 @@ def engine_declaration(config: Mapping[str, Any], *, mode: str | None) -> dict[s
     return declared_engine(options)
 
 
+def asks_block_reuse(task_data: Mapping[str, Any], unit: str) -> bool:
+    """Whether ``unit``'s checks run with KV-cache block reuse on, as :func:`check_configuration` has it.
+
+    ``task_data`` is the run's spec, or a variant's (:func:`variant_spec`), whose own
+    ``llm_api_options`` count too. Options that cannot be read count as on.
+    """
+    try:
+        runtime = resolve_runtime(task_data, unit)
+        extra, _, _ = parse_runtime_flags(runtime.get("extra_flags") or ())
+        options = merge_options(_unit_options(task_data, unit), extra)
+        if is_variant(task_data, unit):
+            options = merge_options(options, variants(task_data)[unit].get("llm_api_options") or {})
+    except (OSError, ValueError, yaml.YAMLError):
+        return True
+    if "kv_cache_reuse" in runtime:
+        return bool(runtime["kv_cache_reuse"])
+    kv = options.get("kv_cache_config")
+    return bool(kv.get("enable_block_reuse", False)) if isinstance(kv, Mapping) else False
+
+
 def llm_api_block_reuse(options: Mapping[str, Any]) -> bool:
     """Whether LLM-API ``options`` ask for KV-cache block reuse (``enable_block_reuse``, default on)."""
     kv_cache = options.get("kv_cache_config")

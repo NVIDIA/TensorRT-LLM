@@ -190,9 +190,11 @@ accuracy:
   # benchmark's is not known (gsm8k, mmlu, mmmu, gpqa_*): a count, or per unit.
   # samples: {default: 1319, multimodal: 900}
 
-  # Where each unit's benchmark runs: `every` member (the default), or the one member named
-  # (`dep4`). A configuration variant's runs at one member either way (attention DP first).
-  # benchmark_members: every
+  # Where each unit's benchmark runs: `per_mode` (the default: the widest member of each
+  # parallel mode, and a one-rank member), `every` member, or the one member named (`dep4`).
+  # A member with a benchmark owes no boot, unless block reuse is on. A configuration
+  # variant's runs at one of its members (attention DP first) unless it names them.
+  # benchmark_members: per_mode
 
   # Anchors are in percent; one of 1 or less is refused. Where no written or measured anchor exists
   # yet, record a low placeholder (e.g. 10 on GSM8K) and replace it when one is measured (the

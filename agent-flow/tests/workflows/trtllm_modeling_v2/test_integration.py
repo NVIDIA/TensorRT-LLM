@@ -383,7 +383,8 @@ def test_a_dependent_starts_with_the_receipt_and_the_measured_facts(
     facts = yaml.safe_load((ws / rf.FACTS_FILENAME).read_text())
     member = facts["members"]["core@tp1"]
     assert member["facts"]["recurrent_slots_per_rank"] == 897
-    assert {e["gate"] for e in member["engines"]} == {"boot", "accuracy[gsm8k]"}
+    # The benchmark boots and attests the engine: tp1 owes no boot of its own.
+    assert {e["gate"] for e in member["engines"]} == {"accuracy[gsm8k]"}
     # The first graph is planned before any gate has measured an engine.
     assert rf.HEADING not in planner_prompts[0]
     envelope = json.loads((ws / "tasks" / "why-core.json").read_text())

@@ -542,6 +542,7 @@ run declares.
   `tests/unittest/disaggregated/test_cache_transceiver_single_process.py`.
 - **Flow proof.** Every rank's worker reports `tp`, `ep`, `attention_dp` and
   `pp`; a width the engine ran other than declared fails the gate.
-- **Blind spots.** The reuse probe covers attention-DP rank 0 only. With
-  `benchmark_members: <member>` the benchmark runs at that member alone; the
-  other members rest on their boots (`task.example.yaml`).
+- **Blind spots.** The reuse probe covers attention-DP rank 0 only. The
+  benchmark runs at one member per parallel mode (`benchmark_members:
+  per_mode`, the default) or the one named; the other members rest on their
+  boots (`task.example.yaml`).
