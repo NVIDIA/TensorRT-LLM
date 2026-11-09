@@ -39,7 +39,8 @@ from defs.common import wait_for_reported_addr
 
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
-from tensorrt_llm.llmapi.llm_args import (DSparkDecodingConfig,
+from tensorrt_llm.llmapi.llm_args import (DFlashDecodingConfig,
+                                          DSparkDecodingConfig,
                                           Eagle3DecodingConfig, LlmArgs,
                                           MTPDecodingConfig)
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
@@ -1650,6 +1651,96 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
 @skip_pre_blackwell
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+class TestQwen3_8BDFlash(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen3/Qwen3-8B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-8B"
+    DRAFT_PATH = f"{llm_models_root()}/Qwen3-8B-DFlash-b16"
+    MAX_DRAFT_LEN = 15
+
+    @pytest.mark.skip_less_device(2)
+    def test_gsm8k_1p1d_unified_draft_kv(self):
+        """DFlash draft KV travels with the target KV from ctx to gen.
+
+        The drafter's layers share the target's KV cache manager, so the
+        generation worker drafts from the prompt context computed on the
+        context worker. Verified speculative decoding is lossless, so the
+        GSM8K score cannot see a drafter that starts from an empty context;
+        acceptance length can, so it is gated too.
+        """
+        speculative_config = {
+            "decoding_type": "DFlash",
+            "max_draft_len": self.MAX_DRAFT_LEN,
+            "speculative_model": self.DRAFT_PATH,
+            # The unified draft KV layout requires the TRTLLM drafter backend.
+            "attention_backend": "TRTLLM",
+        }
+        # Both workers run the drafter: the context worker writes the
+        # drafter's prompt KV into the shared manager, which is then
+        # transferred with the target KV.
+        common_server_config = {
+            "disable_overlap_scheduler": True,
+            "max_batch_size": 16,
+            "max_seq_len": 4096,
+            "max_num_tokens": 4096,
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.5,
+            },
+            # KVCacheManagerV2 requires the Python transceiver.
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+            },
+            "speculative_config": speculative_config,
+        }
+        ctx_server_config = {**common_server_config, "cuda_graph_config": None}
+        gen_server_config = {
+            **common_server_config,
+            "cuda_graph_config": {
+                "max_batch_size": 16,
+                "enable_padding": True,
+            },
+            # Acceptance length is read back off this worker's /metrics.
+            "enable_iter_perf_stats": True,
+            "iter_stats_max_iterations": -1,
+            "max_stats_len": -1,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                extra_env={"TRTLLM_DISAGG_SHARED_DRAFT_KV": "1"},
+                assert_worker_log_contains=
+                "target and draft KV layers share one KV cache manager") as llm:
+            llm.args.speculative_config = DFlashDecodingConfig(
+                max_draft_len=self.MAX_DRAFT_LEN,
+                speculative_model=self.DRAFT_PATH,
+            )
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+            # Drafting from an empty prompt context costs ~17% acceptance
+            # length on this model, well below the 95% floor.
+            acceptance_length = compute_disagg_acceptance_length(llm.serve_url)
+            print(f"[AL] test_gsm8k_1p1d_unified_draft_kv "
+                  f"acceptance_length = {acceptance_length:.3f}")
+            assert_acceptance_length(
+                "TestQwen3_8BDFlash::test_gsm8k_1p1d_unified_draft_kv",
+                acceptance_length)
+
+
+@skip_pre_blackwell
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     FP4_MODEL = f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf"
     FP8_MODEL = f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf"
@@ -2481,16 +2572,17 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
             },
         }
         # MegaMoE CuTe DSL builds its EP ProcessGroup by reusing MASTER_ADDR
-        # / MASTER_PORT when both are set (mega_moe_cute_dsl.py
-        # _pick_rendezvous), and only falls back to picking a free port when
-        # they are not. Under a launcher that exports them -- Slurm in CI --
-        # the context and generation workers are two independent 4-rank jobs
-        # on one node that both inherit the *same* endpoint, so neither group
-        # ever forms: CI showed 68 failed bootstraps against a single
-        # host:port and the generation worker never registered. Hand each
-        # worker its own port so the two rendezvous cannot collide. The
-        # DeepGEMM sibling avoids this by requiring RANK/WORLD_SIZE to be set
-        # too before trusting the launcher's endpoint.
+        # / MASTER_PORT when both are set (ensure_cutedsl_torch_distributed in
+        # tensorrt_llm/_torch/distributed/initialization.py), and only falls
+        # back to picking a free port when they are not. Under a launcher that
+        # exports them -- Slurm in CI -- the context and generation workers are
+        # two independent 4-rank jobs on one node that both inherit the *same*
+        # endpoint, so neither group ever forms: CI showed 68 failed bootstraps
+        # against a single host:port and the generation worker never
+        # registered. Hand each worker its own port so the two rendezvous
+        # cannot collide. The DeepGEMM sibling avoids this by requiring
+        # RANK/WORLD_SIZE to be set too before trusting the launcher's
+        # endpoint.
         ctx_master_port, gen_master_port = pick_distinct_free_ports(2)
 
         # Same long-init reason as TestDeepSeekV4Flash above, plus DSpark
@@ -2698,7 +2790,6 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "agent_bounce_buffer_enable": True,
                 "kv_cache_bounce_size_mb": 512,
                 # Relax the admission gates for this short CI workload.
                 # The production defaults remain 1024 descriptors / 16 KiB.

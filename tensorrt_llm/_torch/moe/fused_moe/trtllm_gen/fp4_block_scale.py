@@ -17,7 +17,7 @@
 :class:`.TRTLLMGenFp4BlockScaleBase` owns the kernel call; NVFP4, W4A16_MXFP4
 and W4A8_MXFP4_MXFP8 differ in how weights and inputs are prepared and not at
 all in how the kernel is called, so each subclass supplies only the
-preparation. Two leaves land here per format, one per provider.
+preparation. One leaf lands here per format.
 
 A format's class also answers whatever the family base would otherwise switch
 on ``quant_config`` for: the SiTu weight alignment and scale group size are
@@ -27,7 +27,12 @@ per-format, so they are settled here rather than branched on above.
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.utils import ActType_TrtllmGen, Fp4QuantizedTensor, MxFp8QuantizedTensor
+from tensorrt_llm._torch.utils import (
+    ActivationType,
+    ActType_TrtllmGen,
+    Fp4QuantizedTensor,
+    MxFp8QuantizedTensor,
+)
 
 from ..activation import materialize_activation_params, resolve_activation_support
 from ..impl_contract import MoERunContext
@@ -38,8 +43,12 @@ from ..quantization import (
     W4A16MXFP4TRTLLMGenFusedMoEMethod,
 )
 from .base import TrtllmGenFusedMoEBase
-from .eligibility import nvfp4_needs_padded_method
-from .kernel_inputs import get_data_or_none, prepare_kernel_inputs, to_trtllm_gen_act_type
+from .kernel_inputs import (
+    extract_routing_params,
+    get_data_or_none,
+    prepare_kernel_inputs,
+    to_trtllm_gen_act_type,
+)
 
 
 class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
@@ -54,6 +63,65 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
     #: Group size the SiTu cubins were built for. A property of the format,
     #: unlike ``supports_situ``; ``None`` where there are no such cubins.
     situ_scaling_vector_size: int | None = None
+
+    #: ``run_moe`` takes ``MoERunContext.prerouted`` (the native op's
+    #: pre-routed entry point).
+    supports_prerouted_routing: bool = False
+
+    def _intermediate_size_padded(self) -> int:
+        act_type = to_trtllm_gen_act_type(self.activation_type)
+        factor = 1 if act_type in [ActType_TrtllmGen.Relu2, ActType_TrtllmGen.Silu] else 2
+        return self.w3_w1_weight.shape[-2] // factor
+
+    def decode_tactic(self, num_tokens: int) -> list[int] | None:
+        """The [tile, config] ``run_moe`` runs for ``num_tokens`` tokens with router logits (the tuned
+        choice of the FP4 MoE op), or None when the shape is not tuned. A caller that routes the tokens
+        itself builds the tables for this tactic's tile."""
+        from ....custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
+
+        rp = extract_routing_params(self.routing_method)
+        runner = FP4BlockScaleMoERunner(
+            self.num_slots,
+            rp.top_k,
+            rp.n_group,
+            rp.topk_group,
+            self._intermediate_size_padded(),
+            self.slot_start,
+            self.expert_size_per_partition,
+            rp.routed_scaling_factor,
+            self.routing_method.routing_method_type,
+            True,
+            to_trtllm_gen_act_type(self.activation_type),
+            tune_max_num_tokens=self.max_num_tokens,
+            use_dp=self.use_dp,
+            decode_tuning=self.decode_tuning,
+        )
+        packed_hidden = self.w3_w1_weight.shape[-1]
+
+        def meta(*shape):
+            return torch.empty(shape, device="meta")
+
+        inputs = [
+            meta(num_tokens, self.num_slots),
+            rp.routing_bias,
+            meta(num_tokens, packed_hidden),
+            meta(num_tokens * packed_hidden // 8),
+            self.w3_w1_weight,
+            self.w3_w1_weight_scale,
+            self.w3_w1_bias if self.bias else None,
+            self.act_alpha,
+            self.act_beta,
+            self.act_clamp,
+            self.w2_weight,
+            self.w2_weight_scale,
+            self.w2_bias if self.bias else None,
+            get_data_or_none(self, "fc31_scale_c"),
+            get_data_or_none(self, "fc31_alpha"),
+            get_data_or_none(self, "fc2_alpha"),
+            None,
+            None,
+        ]
+        return runner.lookup_tactic(inputs)
 
     def _create_quant_method_weights(self) -> None:
         """Also promote SiTu's soft-caps to parameter slots the cubin indexes.
@@ -129,10 +197,12 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
     ) -> torch.Tensor | tuple:
         del workspace  # TRTLLMGen kernels allocate their own intermediates.
         k = prepare_kernel_inputs(self, ctx)
+        prerouted = ctx.prerouted
+        if prerouted is not None and not self.supports_prerouted_routing:
+            raise ValueError(f"{type(self).__name__} does not take prerouted routing")
 
         act_type = to_trtllm_gen_act_type(self.activation_type)
-        factor = 1 if act_type in [ActType_TrtllmGen.Relu2, ActType_TrtllmGen.Silu] else 2
-        intermediate_size_per_partition_padded = self.w3_w1_weight.shape[-2] // factor
+        intermediate_size_per_partition_padded = self._intermediate_size_padded()
         # Holds SwiGLU's per-expert alpha/beta, or SiTu's backend-local
         # activation parameters (which reuse this storage; see create_weights).
         gemm1_alpha, gemm1_beta = self.act_alpha, self.act_beta
@@ -179,6 +249,8 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             # Pass that to the autotuner so the top bucket profiles per-expert load at runtime scale.
             tune_max_num_tokens=self.max_num_tokens,
             use_dp=self.use_dp,
+            prerouted=prerouted,
+            decode_tuning=self.decode_tuning,
         )
 
         if not k.do_finalize:
@@ -198,7 +270,7 @@ class TRTLLMGenNvfp4Base(TRTLLMGenFp4BlockScaleBase):
     supports_gptoss_style = True
 
     def supports_unfinalized_output(self) -> bool:
-        """Both providers' NVFP4 runners honor ``do_finalize=False``.
+        """The NVFP4 runner honors ``do_finalize=False``.
 
         Declared here rather than on the family base: the MXFP4 siblings call
         runners without a ``do_finalize`` parameter, which finalize regardless.
@@ -206,8 +278,8 @@ class TRTLLMGenNvfp4Base(TRTLLMGenFp4BlockScaleBase):
         return True
 
     # Group size of the ``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*`` cubins. Whether a
-    # leaf may reach them is ``supports_situ``, declared per leaf because only
-    # the native op backend calls them.
+    # leaf may reach them is ``supports_situ``, declared on the leaf because it
+    # also depends on the op backend calling them.
     situ_scaling_vector_size = 16
 
     def _situ_tp_weight_alignment(self) -> int:
@@ -223,8 +295,10 @@ class TRTLLMGenNvfp4Base(TRTLLMGenFp4BlockScaleBase):
         # SiTu fills the act_alpha/act_beta slots from create_weights, which
         # runs after this, so keying off the tensor would make the method
         # depend on *when* it is asked for.
-        needs_padded_method = nvfp4_needs_padded_method(
-            self.activation_type, self.act_alpha is not None
+        needs_padded_method = self.act_alpha is not None or self.activation_type in (
+            ActivationType.SiTu,
+            ActivationType.Relu2,
+            ActivationType.Silu,
         )
         return (
             NVFP4TRTLLMGenFusedMoEMethod()

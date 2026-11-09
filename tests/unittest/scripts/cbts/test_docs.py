@@ -20,14 +20,16 @@ from __future__ import annotations
 import difflib
 import json
 import re
+import shutil
 from pathlib import Path
 
 import pytest
+import yaml
 from click.testing import CliRunner
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
 import cbts.command.main as cbts_main
-from cbts.blocks import Block, Stage, YAMLIndex
+from cbts.blocks import Block, Stage, YAMLIndex, parse_stages_from_groovy
 from cbts.command.main import Selector, _combine_scopes
 from cbts.coverage.tier import coverage_preflight
 from cbts.python_docstring_analysis import split_docstring_diff
@@ -65,7 +67,7 @@ def _docs_rule() -> DocsRule:
             yaml_stem=CPU_TEST_YAML_STEM,
             block_index=0,
             condition={},
-            tests=["unittest/tools", "unittest/usage -k telemetry"],
+            tests=["unittest/tools", "unittest/usage -k telemetry", "unittest/_torch/memory"],
         ),
         Block(
             yaml_stem="l0_h100",
@@ -114,7 +116,7 @@ def test_docs_rule_rejects_non_documentation_paths(path: str) -> None:
     assert not is_docs_path(path)
 
 
-def test_docs_rule_routes_changes_to_docs_and_complete_cpu_suite() -> None:
+def test_docs_rule_routes_changes_to_docs_and_related_cpu_tests() -> None:
     rule = _docs_rule()
     result = rule.apply(
         PRInputs(
@@ -145,6 +147,27 @@ def test_docs_rule_falls_back_when_cpu_suite_cannot_be_resolved() -> None:
     assert result is not None
     assert result.scope is None
     assert not result.affected_stages
+
+
+def test_docs_rule_preserves_registered_consumers_without_unrelated_cpu_tests() -> None:
+    index = YAMLIndex.load(_REPO_ROOT / "tests/integration/test_lists/test-db")
+    stages = parse_stages_from_groovy(_REPO_ROOT / "jenkins/L0_Test.groovy")
+    result = DocsRule(index, stages).apply(
+        PRInputs(changed_files=["docs/source/conf.py"], diffs={})
+    )
+
+    assert result is not None and result.scope == "docsonly"
+    selected = {entry for filters in result.block_filters.values() for entry in filters}
+    assert {
+        "unittest/_torch/pyexecutor",
+        "unittest/usage",
+        "unittest/tools",
+        "unittest/llmapi/test_trtllm_serve_config_schemas.py",
+    } <= selected
+    assert "unittest/_torch/memory" not in selected
+    assert len(selected) < sum(
+        len(block.tests) for block in index.blocks if block.yaml_stem == CPU_TEST_YAML_STEM
+    )
 
 
 def test_docs_rule_routes_non_docs_markdown_to_docs_build_only() -> None:
@@ -204,6 +227,7 @@ def test_docs_rule_combines_with_other_targeted_rules() -> None:
     assert result.scope == "testsonly"
     assert result.affected_stages == {DOCS_STAGE, AGENT_FLOW_STAGE}
     assert _combine_scopes(["docsonly", "noop"]) == "docsonly"
+    assert _combine_scopes(["docsonly", "testsonly"]) == "testsonly"
 
 
 def test_docs_stage_matches_jenkins_stage_key() -> None:
@@ -214,7 +238,6 @@ def test_docs_stage_matches_jenkins_stage_key() -> None:
 @pytest.mark.parametrize(
     "path",
     (
-        "tests/integration/defs/verl/.gitignore",
         "tests/integration/test_lists/qa/.gitignore",
         "tests/unittest/new/nested/.gitignore",
     ),
@@ -526,10 +549,13 @@ def test_out_of_scope_rule_removes_ruff_config_preflight_blockers(tmp_path: Path
             "[tool.autoflake]\nremove_unused_variables = false\n",
             "[tool.autoflake]\nremove_unused_variables = true\n",
         ),
-        ('[tool.mypy]\nfiles = ["old"]\n', '[tool.mypy]\nfiles = ["new"]\n'),
         (
-            '[[tool.mypy.overrides]]\nmodule = "old"\n',
-            '[[tool.mypy.overrides]]\nmodule = "new"\n',
+            '[tool.pyrefly]\nproject-includes = ["old"]\n',
+            '[tool.pyrefly]\nproject-includes = ["new"]\n',
+        ),
+        (
+            '[[tool.pyrefly.sub-config]]\nmatches = "old"\n',
+            '[[tool.pyrefly.sub-config]]\nmatches = "new"\n',
         ),
     ),
 )
@@ -582,7 +608,6 @@ def test_out_of_scope_rule_preserves_non_lint_and_ambiguous_toml_impact(
         "cpp/kernels/fmha_v2/.gitignore",
         "cpp/tests/resources/.gitignore",
         "scripts/attribution/sbom/.gitignore",
-        "tests/integration/defs/verl/.gitignore",
         "new/nested/.gitignore",
         ".github/ISSUE_TEMPLATE/01-installation.yml",
         ".github/ISSUE_TEMPLATE/02-new-model.yml",
@@ -854,16 +879,128 @@ def test_unreviewed_agent_flow_config_keeps_its_backend_tests(tmp_path: Path) ->
     assert result.affected_stages == {AGENT_FLOW_STAGE}
 
 
-def test_noop_entrypoint_keeps_cpu_baseline(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "paths",
+    (
+        [".pre-commit-config.yaml"],
+        ["tests/integration/test_lists/qa/multinode.yml"],
+        ["tests/integration/test_lists/dev/local.yml", ".github/CODEOWNERS"],
+        [".codex/config.toml", "cpp/kernels/.clang-format", "nested/.gitignore"],
+    ),
+)
+def test_reviewed_noop_entrypoint_skips_cpu_baseline(tmp_path: Path, paths: list[str]) -> None:
     input_path = tmp_path / "input.json"
-    input_path.write_text(json.dumps({"changed_files": [".pre-commit-config.yaml"], "diffs": {}}))
+    input_path.write_text(json.dumps({"changed_files": paths, "diffs": {}}))
 
     result = CliRunner().invoke(cbts_main.main, [str(input_path), "--repo-root", str(_REPO_ROOT)])
 
     assert result.exit_code == 0, result.output
     decision = json.loads(result.stdout)
     assert decision["scope"] == "noop"
-    assert set(decision["affected_stages"]) == _CPU_STAGE_NAMES
+    assert decision["affected_stages"] == []
     assert decision["test_db_dir_override"] is None
     assert not decision["sanity_required"]
     assert not decision["perfsanity_required"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "tests/integration/defs/.test_durations",
+        "tests/integration/defs/agg_unit_mem_df.csv",
+        "tests/microbenchmarks/example.py",
+        "tests/integration/test_lists/test-db/l0_cpu.yml",
+        "tests/integration/test_lists/waives.txt",
+        "tests/unittest/test_unregistered_cpu_policy.py",
+    ),
+)
+def test_other_noop_entrypoint_skips_cpu_baseline(tmp_path: Path, path: str) -> None:
+    input_path = tmp_path / "input.json"
+    input_path.write_text(json.dumps({"changed_files": [path], "diffs": {}}))
+    result = CliRunner().invoke(cbts_main.main, [str(input_path), "--repo-root", str(_REPO_ROOT)])
+
+    assert result.exit_code == 0, result.output
+    decision = json.loads(result.stdout)
+    assert decision["scope"] == "noop"
+    assert decision["affected_stages"] == []
+
+
+@pytest.mark.parametrize("scripts_registered", (True, False))
+def test_cbts_changes_require_registered_cpu_scripts_tests(
+    tmp_path: Path, scripts_registered: bool
+) -> None:
+    repo = tmp_path / "repo"
+    groovy = repo / "jenkins/L0_Test.groovy"
+    groovy.parent.mkdir(parents=True)
+    shutil.copyfile(_REPO_ROOT / "jenkins/L0_Test.groovy", groovy)
+    test_db = repo / "tests/integration/test_lists/test-db"
+    test_db.mkdir(parents=True)
+    entry = "unittest/scripts" if scripts_registered else "unittest/other"
+    (test_db / "l0_cpu.yml").write_text(f"l0_cpu:\n- tests: [{entry}]\n")
+    paths = [
+        "jenkins/scripts/cbts/cbts/command/main.py",
+        ".github/CODEOWNERS",
+        "tests/microbenchmarks/example.py",
+    ]
+    input_path = tmp_path / "input.json"
+    input_path.write_text(json.dumps({"changed_files": paths, "diffs": {}}))
+    result = CliRunner().invoke(cbts_main.main, [str(input_path), "--repo-root", str(repo)])
+
+    assert result.exit_code == 0, result.output
+    decision = json.loads(result.stdout)
+    if not scripts_registered:
+        assert decision["scope"] is None
+        return
+    assert decision["scope"] == "testsonly"
+    assert set(decision["affected_stages"]) == _CPU_STAGE_NAMES
+    assert decision["test_db_dir_override"] == "cbts_test_db"
+    assert set(decision["affected_stage_test_counts"].values()) == {1}
+    narrowed = yaml.safe_load((repo / "cbts_test_db/l0_cpu.yml").read_text())
+    assert narrowed["l0_cpu"][0]["tests"] == ["unittest/scripts"]
+
+
+def test_reviewed_noop_does_not_suppress_mixed_docs_validation(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        json.dumps({"changed_files": [".github/CODEOWNERS", "README.md"], "diffs": {}})
+    )
+    result = CliRunner().invoke(cbts_main.main, [str(input_path), "--repo-root", str(_REPO_ROOT)])
+
+    assert result.exit_code == 0, result.output
+    decision = json.loads(result.stdout)
+    assert decision["scope"] == "docsonly"
+    assert set(decision["affected_stages"]) == {DOCS_STAGE}
+
+
+def test_agent_flow_entrypoint_keeps_only_its_explicit_cpu_stage(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        json.dumps({"changed_files": ["agent-flow/agent_flow/cli.py"], "diffs": {}})
+    )
+    result = CliRunner().invoke(cbts_main.main, [str(input_path), "--repo-root", str(_REPO_ROOT)])
+
+    assert result.exit_code == 0, result.output
+    decision = json.loads(result.stdout)
+    assert decision["scope"] == "agentflowonly"
+    assert set(decision["affected_stages"]) == {AGENT_FLOW_STAGE}
+
+
+def test_gpu_test_entrypoint_does_not_add_cpu_stages(tmp_path: Path) -> None:
+    groovy = tmp_path / "jenkins/L0_Test.groovy"
+    groovy.parent.mkdir(parents=True)
+    shutil.copyfile(_REPO_ROOT / "jenkins/L0_Test.groovy", groovy)
+    test_db = tmp_path / "tests/integration/test_lists/test-db"
+    test_db.mkdir(parents=True)
+    (test_db / "l0_cpu.yml").write_text("l0_cpu:\n- tests: [unittest/other]\n")
+    (test_db / "l0_a10.yml").write_text("l0_a10:\n- tests: [test_gpu.py]\n")
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        json.dumps({"changed_files": ["tests/integration/defs/test_gpu.py"], "diffs": {}})
+    )
+    result = CliRunner().invoke(cbts_main.main, [str(input_path), "--repo-root", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    decision = json.loads(result.stdout)
+    assert decision["scope"] == "testdefonly"
+    assert decision["affected_stages"]
+    assert not any(stage.startswith("CPU-") for stage in decision["affected_stages"])

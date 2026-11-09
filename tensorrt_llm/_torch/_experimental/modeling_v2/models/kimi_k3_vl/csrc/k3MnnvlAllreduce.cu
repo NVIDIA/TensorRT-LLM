@@ -13,8 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "k3MnnvlAllreduce.h"
+#include "kimi_k3_vl/csrc/k3MnnvlAllreduce.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
 #include <cooperative_groups.h>
 #include <cstddef>
 #include <cstdint>
@@ -36,10 +37,11 @@
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels::kimiK3MnnvlOneShot
 {
+using namespace ::tensorrt_llm::kernels;
 
 using tensorrt_llm::common::isNegZero;
 using tensorrt_llm::common::isLamportDirty;
@@ -826,4 +828,4 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
 
 }
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END

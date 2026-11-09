@@ -108,8 +108,10 @@ def _loop_executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     executor.kv_cache_transceiver = None
     executor.kv_connector_manager = None
     executor.guided_decoder = None
+    executor.capturable_guided_decoder = None
     executor.drafter = None
     executor.dwdp_manager = None
+    executor.dense_dwdp_manager = None
     executor.speculation_gate = None
     executor.model_engine = SimpleNamespace(
         attn_metadata=None, kv_cache_dtype_byte_size=None, spec_metadata=None
@@ -125,6 +127,7 @@ def _loop_executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     executor.dist = Mock(tp_size=1, world_size=1)
 
     executor._disagg_coordinator = MagicMock()
+    executor._disagg_coordinator.handle_errors_synced.return_value = False
     executor.resource_manager = MagicMock()
 
     batches = iter([(_scheduled_batch(), None), (None, None)])
