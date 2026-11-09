@@ -4,6 +4,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from tensorrt_llm._torch.pyexecutor import kv_cache_stats
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import mamba_cache_manager_v2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
@@ -31,19 +33,18 @@ def _fake_request(is_dummy_request: bool = False) -> SimpleNamespace:
     )
 
 
-def _manager(rank: int = 0) -> MambaHybridCacheManagerV2:
+def _manager(rank: int = 0, enable_branch_snapshot: bool = False) -> MambaHybridCacheManagerV2:
     """Bare manager carrying only what the loss accounting reads; no cache pools."""
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.local_num_mamba_layers = 1
     manager.is_estimating_kv_cache = False
     manager.mapping = SimpleNamespace(rank=rank)
     manager.kv_cache_config = KvCacheConfig(
-        block_reuse_config=BlockReuseConfig(enable_branch_snapshot=False)
+        block_reuse_config=BlockReuseConfig(enable_branch_snapshot=enable_branch_snapshot)
     )
     manager._snapshot_pruned_tokens_total = 0
     manager._page_pruned_tokens_total = 0
     manager._prefix_matched_tokens_total = 0
-    manager._prefix_snapshot_lost_tokens_total = 0
     manager._iter_prefix_matched_tokens = 0
     manager._iter_prefix_snapshot_lost_tokens = 0
     manager._snapshot_loss_warned = False
@@ -57,8 +58,8 @@ def test_counts_loss_without_branch_snapshots():
     manager._record_branch_snapshot_point(_fake_request(), _fake_kv_cache(8_000, 8_000), 8_000)
     assert manager._iter_prefix_matched_tokens == 28_000
     assert manager._iter_prefix_snapshot_lost_tokens == 16_000
-    # The branch snapshot diagnostics stay off with their flag.
-    assert manager._snapshot_pruned_tokens_total == 0
+    assert manager._snapshot_pruned_tokens_total == 16_000
+    # The attention page diagnostics stay off with the branch snapshot flag.
     assert manager._page_pruned_tokens_total == 0
 
 
@@ -73,15 +74,22 @@ def test_skips_resumed_dummy_and_estimation_lookups():
     assert manager._prefix_matched_tokens_total == 0
 
 
-def test_warns_once_above_threshold(monkeypatch):
+@pytest.mark.parametrize(
+    ("enable_branch_snapshot", "hint"),
+    [(False, "enable_branch_snapshot"), (True, "periodic_snapshot_interval")],
+)
+def test_warns_once_above_threshold_without_iteration_stats(
+    monkeypatch, enable_branch_snapshot, hint
+):
     warnings = []
     monkeypatch.setattr(mamba_cache_manager_v2.logger, "warning", warnings.append)
-    manager = _manager()
+    manager = _manager(enable_branch_snapshot=enable_branch_snapshot)
     matched = mamba_cache_manager_v2._SNAPSHOT_LOSS_MIN_MATCHED_TOKENS
+    # No get_iteration_stats() call: the warning must not depend on stats being enabled.
     manager._record_prefix_loss(_fake_request(), _fake_kv_cache(matched, matched // 2))
-    manager._warn_on_snapshot_loss()
-    manager._warn_on_snapshot_loss()
-    assert len(warnings) == 1 and "50%" in warnings[0]
+    manager._record_prefix_loss(_fake_request(), _fake_kv_cache(matched, 0))
+    assert len(warnings) == 1
+    assert "50%" in warnings[0] and hint in warnings[0] and "pool_ratio" in warnings[0]
 
 
 def test_no_warning_below_threshold_or_on_other_ranks(monkeypatch):
@@ -90,10 +98,8 @@ def test_no_warning_below_threshold_or_on_other_ranks(monkeypatch):
     matched = mamba_cache_manager_v2._SNAPSHOT_LOSS_MIN_MATCHED_TOKENS
     small_loss = _manager()
     small_loss._record_prefix_loss(_fake_request(), _fake_kv_cache(matched, matched - 1))
-    small_loss._warn_on_snapshot_loss()
     other_rank = _manager(rank=1)
     other_rank._record_prefix_loss(_fake_request(), _fake_kv_cache(matched, 0))
-    other_rank._warn_on_snapshot_loss()
     assert warnings == []
 
 
