@@ -652,19 +652,45 @@ def test_model_engine_rejects_encode_only() -> None:
         )
 
 
-class ModelEngineTestCase(unittest.TestCase):
-    def test_breakable_rejects_multimodal_models(self) -> None:
-        engine = object.__new__(ModelEngine)
-        engine.model = DummyLegacyMultimodalIndexModel()
-        engine.input_processor = None
-        engine.llm_args = SimpleNamespace(
-            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE, disable_mm_encoder=False
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["piecewise", "breakable"])
+@pytest.mark.parametrize("mm_encoder_only", [False, True])
+def test_model_engine_resolves_multimodal_prefill_graphs_before_validation(
+    monkeypatch: pytest.MonkeyPatch, backend: str, mm_encoder_only: bool
+) -> None:
+    model = DummyLegacyMultimodalIndexModel()
+    model.model_config = SimpleNamespace(is_generation=not mm_encoder_only)
+    llm_args = TorchLlmArgs(
+        model="dummy", mm_encoder_only=mm_encoder_only, prefill_cuda_graph_backend=backend
+    )
+    monkeypatch.setattr(model_setup, "_configure_deep_gemm_pdl", Mock())
+    monkeypatch.setattr(
+        model_engine_module,
+        "create_input_processor",
+        Mock(return_value=Mock(spec=BaseMultimodalInputProcessor)),
+    )
+    monkeypatch.setattr(
+        ModelEngine,
+        "_init_from_model",
+        Mock(side_effect=RuntimeError("model configuration resolved")),
+    )
+    monkeypatch.setattr(ModelEngine, "__del__", lambda self: None)
+    engine = ModelEngine.__new__(ModelEngine)
+    rejects_breakable = not mm_encoder_only and backend == "breakable"
+    expected_error = ValueError if rejects_breakable else RuntimeError
+    message = "multimodal models" if rejects_breakable else "model configuration resolved"
+    with pytest.raises(expected_error, match=message):
+        ModelEngine.__init__(
+            engine, model_path="dummy", llm_args=llm_args, mapping=Mapping(), model=model
         )
 
-        self.assertTrue(is_multimodal(engine.model, engine.input_processor))
-        with self.assertRaisesRegex(ValueError, "multimodal models"):
-            engine._validate_breakable_cuda_graph_compatibility()
+    expected_backend = "disabled" if mm_encoder_only else backend
+    assert engine.llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend(expected_backend)
+    if mm_encoder_only:
+        assert engine.llm_args.torch_compile_config is None
 
+
+class ModelEngineTestCase(unittest.TestCase):
     def test_breakable_allows_text_decoder_with_multimodal_processor(self) -> None:
         engine = object.__new__(ModelEngine)
         engine.model = Mock(spec=DecoderModelForCausalLM)

@@ -151,6 +151,7 @@ class ModelEngine:
         )
         if not self.model.model_config.is_generation:
             self.llm_args = resolve_scheduled_encoder_args(self.llm_args)
+        self._validate_breakable_cuda_graph_compatibility()
         self._init_from_model()
         self._size_cuda_graphs()
         self._compile_model(configured_encoder_max_num_tokens)
@@ -284,7 +285,6 @@ class ModelEngine:
         else:
             self.model = model
         self.spec_decode_fast_paths = _spec_decode_fast_paths(self.model)
-        self._validate_breakable_cuda_graph_compatibility()
 
     def _init_from_model(self) -> None:
         """Copy the loaded model's facts onto the engine, rewriting the requested
