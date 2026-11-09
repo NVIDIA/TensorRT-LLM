@@ -962,13 +962,12 @@ TEST(KvCacheManagerV2ColdPageTest, SinkRequiredOnlyWindowSharesTheRequiredColdPo
     config.layers.emplace_back(std::move(optionalWindow));
     auto manager = std::make_shared<KvCacheManager>(std::move(config));
 
-    StorageManager const& storage = manager->storage();
-    auto const coldGroupOf = [&storage](LayerId layerId)
-    { return storage.getPoolGroupIndex(CacheLevel{1}, storage.getBufferAttr(layerId, "key").lifeCycleId); };
-    ASSERT_EQ(storage.numLifeCycles(), LifeCycleId{3});
-    EXPECT_EQ(storage.numPoolGroups(CacheLevel{1}), PoolGroupIndex{2});
-    EXPECT_EQ(coldGroupOf(0), coldGroupOf(1));
-    EXPECT_NE(coldGroupOf(0), coldGroupOf(2));
+    // Life cycles are registered in layer order.
+    auto const coldGroups = manager->getLifeCyclePoolGroupIndices(CacheLevel{1});
+    ASSERT_EQ(coldGroups.size(), LifeCycleId{3});
+    EXPECT_EQ(manager->storage().numPoolGroups(CacheLevel{1}), PoolGroupIndex{2});
+    EXPECT_EQ(coldGroups[LifeCycleId{0}], coldGroups[LifeCycleId{1}]);
+    EXPECT_NE(coldGroups[LifeCycleId{0}], coldGroups[LifeCycleId{2}]);
 }
 
 TEST(KvCacheManagerV2ColdPageTest, MigrationStatsUseColdPageBytes)
