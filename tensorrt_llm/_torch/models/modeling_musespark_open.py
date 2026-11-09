@@ -62,6 +62,11 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
   the reference reduction order above 128 tokens.
 - ``MUSESPARK_OPEN_OVERLAP_SP_PROJECTION`` (default off): overlap two output-projection
   chunks with reduce-scatter in eager sequence-parallel prefills of >=8192 tokens.
+- ``MUSESPARK_OPEN_OVERLAP_SP_PROJECTION_GRAPH`` (default off): with the switch above,
+  also overlap in steps captured into a CUDA graph (the served prefill graph), once the
+  projection stream exists (an eager step of >=8192 tokens creates it before capture).
+- ``MUSESPARK_OPEN_OVERLAP_SP_PROJECTION_CHUNKS`` (default 2): the output-projection
+  chunks the overlap runs (each chunk's reduce-scatter overlaps the next chunk's GEMM).
 - ``MUSESPARK_OPEN_PAD_SP_PROJECTION`` (default off): pad narrower projection inputs
   instead of outputs in eager sequence-parallel prefills; overlap takes precedence.
 
@@ -1904,10 +1909,13 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
         stream = self._sp_projection_stream
         padded = _pad_sequence_parallel_tokens(attention_output, self.mapping.tp_size)
         shard = padded.shape[0] // self.mapping.tp_size
-        split = (shard + 1) // 2
+        chunks = max(1, min(int(getattr(self, "_sp_projection_chunks", 2)), shard))
+        # Chunk c covers rows [ceil(c * shard / chunks), ceil((c + 1) * shard / chunks)) of
+        # every owner's shard; two chunks split at (shard + 1) // 2 as before.
+        bounds = [-(-shard * c // chunks) for c in range(chunks + 1)]
         results = []
         partials = []
-        for begin, end in ((0, split), (split, shard)):
+        for begin, end in zip(bounds[:-1], bounds[1:]):
             # Each collective must see owner-major rows. Splitting the original
             # tensor in half would send rows to the wrong rank.
             packed = torch.cat(
@@ -2677,6 +2685,14 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
         self._overlap_sp_projection_enabled = (
             os.getenv("MUSESPARK_OPEN_OVERLAP_SP_PROJECTION", "0") == "1"
         )
+        # Also overlap in captured steps (the served prefill graph); default off.
+        self._overlap_sp_projection_graph = (
+            self._overlap_sp_projection_enabled
+            and os.getenv("MUSESPARK_OPEN_OVERLAP_SP_PROJECTION_GRAPH", "0") == "1"
+        )
+        self.self_attn._sp_projection_chunks = int(
+            os.getenv("MUSESPARK_OPEN_OVERLAP_SP_PROJECTION_CHUNKS", "2")
+        )
         self._pad_sp_projection_enabled = os.getenv("MUSESPARK_OPEN_PAD_SP_PROJECTION", "0") == "1"
         self.feed_forward = MuseSparkOpenMoE(model_config, layer_idx, aux_stream)
 
@@ -2750,12 +2766,28 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
                 attn_input = self.pre_qkv_proj_norm(hidden_states.to(self.dtype))
         # The attention projection and its TP reduction stay in this range.
         with self.nvtx("attn"):
+            capturing = torch.cuda.is_current_stream_capturing()
             overlap_projection = (
                 sp_num_tokens is not None
                 and sp_num_tokens >= 8192
                 and self._overlap_sp_projection_enabled
-                and not torch.cuda.is_current_stream_capturing()
+                and (
+                    not capturing
+                    # In a capture only with a projection stream made before it: a
+                    # stream is never created while capturing.
+                    or (
+                        getattr(self, "_overlap_sp_projection_graph", False)
+                        and getattr(self.self_attn, "_sp_projection_stream", None) is not None
+                    )
+                )
             )
+            if overlap_projection and capturing:
+                logger.info_once(
+                    "[musespark_open] MUSESPARK_OPEN_OVERLAP_SP_PROJECTION_GRAPH: output projection "
+                    f"overlapped in {getattr(self.self_attn, '_sp_projection_chunks', 2)} chunks "
+                    f"in a captured step of {sp_num_tokens} rows",
+                    key="musespark_open.overlap_sp_projection_graph",
+                )
             pad_projection = (
                 sp_num_tokens is not None
                 and self._pad_sp_projection_enabled
