@@ -569,8 +569,9 @@ _BOTH = (False, True)
 # (id, workers, TRTLLM_DISAGG_SHARED_DRAFT_KV, creator settings, unifies, blocker substring or None)
 _GATE_CASES = [
     ("hosting-manager", _BOTH, "1", {}, True, None),
-    ("unset-env", (False,), None, {}, True, None),
-    ("unset-env", (True,), None, {}, False, None),
+    # Unset, the switch shares a hosting manager's draft KV, whose separate pool is not
+    # transferred; a plain V2 manager stays opt-in.
+    ("unset-env", _BOTH, None, {}, True, None),
     ("opt-out", (True,), "0", {}, False, None),
     ("context-kernel-64", _BOTH, "1", dict(tokens_per_block=64, context_kernel=True), True, None),
     ("context-kernel-128", _BOTH, "1", dict(context_kernel=True), False, "128-token pages"),
@@ -600,6 +601,22 @@ _GATE_CASES = [
         "1",
         dict(plain_v2=True, tokens_per_block=64, nvfp4_target=False),
         True,
+        None,
+    ),
+    (
+        "plain-v2-unset-env",
+        (False,),
+        None,
+        dict(plain_v2=True, tokens_per_block=64, nvfp4_target=False),
+        True,
+        None,
+    ),
+    (
+        "plain-v2-unset-env",
+        (True,),
+        None,
+        dict(plain_v2=True, tokens_per_block=64, nvfp4_target=False),
+        False,
         None,
     ),
     (
@@ -648,8 +665,9 @@ def test_unify_gate(
 ) -> None:
     """MiniMax-M3's manager hosts a DSpark drafter unless a layout it or transfer refuses applies.
 
-    Disaggregated workers share draft KV only on request; the refused layouts keep the separate
-    draft KV cache instead of failing at construction.
+    Disaggregated workers share a hosting manager's draft KV unless opted out, and a plain V2
+    manager's only on request; the refused layouts keep the separate draft KV cache instead of
+    failing at construction.
     """
     if env is None:
         monkeypatch.delenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", raising=False)

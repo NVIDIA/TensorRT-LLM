@@ -2333,7 +2333,8 @@ class KvCacheCreator:
         layers in one V2 manager.
 
         Disaggregated serving shares only when TRTLLM_DISAGG_SHARED_DRAFT_KV
-        is "1" or "auto".
+        is "1" or "auto". Unset, it is "auto" for a manager that hosts explicit
+        draft layers, whose separate draft pool is not transferred.
         """
         blocker = self._dflash_unify_blocker()
         if blocker is not None:
@@ -2345,9 +2346,10 @@ class KvCacheCreator:
                     f"KV cache: {blocker}.",
                     key="dflash_hosting_manager_blocker")
             return False
-        return not (self._is_disagg
-                    and os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV")
-                    not in ("1", "auto"))
+        default = "auto" if self._kv_cache_manager_hosts_draft_layers(
+        ) else None
+        return not (self._is_disagg and os.environ.get(
+            "TRTLLM_DISAGG_SHARED_DRAFT_KV", default) not in ("1", "auto"))
 
     def _kv_cache_manager_hosts_draft_layers(self) -> bool:
         """Whether the target's specialized manager accepts explicit draft layer specs."""
