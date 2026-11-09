@@ -54,6 +54,11 @@ public:
         allocator.recordSymmetricFailureLocked(comm, size);
     }
 
+    static bool exchangeBufferRequested(NCCLWindowAllocator& allocator, bool requested)
+    {
+        return allocator.mBufferRequested.exchange(requested);
+    }
+
     static cudaError_t clearCudaErrorIfSymmetricAllocationFailed(
         int localAllocOk, NCCLWindowAllocator::CudaGetLastErrorFunc getLastError = cudaGetLastError)
     {
@@ -465,6 +470,44 @@ TEST_F(NCCLWindowAllocatorTest, BasicAllocation)
 
     // Release the buffer
     allocator.releaseBuffer(*mComm, buffer.ptr);
+}
+
+TEST_F(NCCLWindowAllocatorTest, RequestedBuffersFollowUnsuppressedRequests)
+{
+    using Access = nccl_util::NCCLWindowAllocatorTestAccess;
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    auto const testComm = createSplitComm(*mComm, 0, mRank);
+    size_t constexpr kBufferSize = 4 * 1024;
+
+    // The flag is process-wide: start from an unrequested state and restore it on every exit.
+    struct RestoreRequested
+    {
+        nccl_util::NCCLWindowAllocator& allocator;
+        bool requested;
+
+        ~RestoreRequested()
+        {
+            Access::exchangeBufferRequested(allocator, requested);
+        }
+    } const restore{allocator, Access::exchangeBufferRequested(allocator, false)};
+
+    // Suppressed sections are not SPMD, so their requests are not recorded.
+    bool const previouslySuppressed = allocator.setWindowAllocationSuppressed(true);
+    EXPECT_FALSE(allocator.requestBuffer(*testComm, kBufferSize).isValid());
+    allocator.setWindowAllocationSuppressed(previouslySuppressed);
+    EXPECT_FALSE(allocator.hasRequestedBuffers());
+
+    auto const buffer = allocator.requestBuffer(*testComm, kBufferSize);
+    ASSERT_TRUE(buffer.isValid());
+    EXPECT_TRUE(allocator.hasRequestedBuffers());
+    allocator.releaseBuffer(*testComm, buffer.ptr);
+    EXPECT_TRUE(allocator.hasRequestedBuffers());
+
+    // A request that gets no buffer is recorded too: every rank makes it.
+    Access::exchangeBufferRequested(allocator, false);
+    Access::recordSymmetricFailure(allocator, *testComm, 2 * kBufferSize);
+    EXPECT_FALSE(allocator.requestBuffer(*testComm, 2 * kBufferSize).isValid());
+    EXPECT_TRUE(allocator.hasRequestedBuffers());
 }
 
 TEST_F(NCCLWindowAllocatorTest, ExplicitStreamAllocationAndCapture)

@@ -307,6 +307,12 @@ public:
     // Get the number of buffers allocated for a communicator
     size_t getBufferCount(ncclComm_t comm) const;
 
+    // Whether this process has requested a window buffer outside a suppressed section, whatever the
+    // outcome. No tensor can hold a window lease before the first such request. Ranks make these
+    // requests from the same operations, so the answer changes at the same point on every rank, and
+    // it never reverts.
+    bool hasRequestedBuffers() const noexcept;
+
     // Get the number of buffers in use for a communicator
     size_t getBufferInUseCount(ncclComm_t comm) const;
 
@@ -408,6 +414,7 @@ private:
 
     mutable std::mutex mMutex;
     std::atomic_bool mSuppressLifecycleWarningAssertionsForTest{false};
+    std::atomic_bool mBufferRequested{false};
     std::unordered_map<ncclComm_t, std::vector<BufferEntry>> mBufferPool;
     std::unordered_set<ncclComm_t> mRegisteredComms;
     // Smallest request size that is known to fail collectively for each communicator.

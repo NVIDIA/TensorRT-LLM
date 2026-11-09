@@ -482,6 +482,8 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
             static_cast<void*>(comm), size);
         return NCCLWindowBuffer();
     }
+    // Recorded whatever the outcome below: every rank makes this request.
+    mBufferRequested.store(true);
 
     TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator cannot be null");
     TLLM_CHECK_WITH_INFO(size > 0, "Buffer size must be greater than 0");
@@ -1105,6 +1107,11 @@ size_t NCCLWindowAllocator::getBufferCount(ncclComm_t comm) const
     std::lock_guard<std::mutex> lock(mMutex);
     auto commIt = mBufferPool.find(comm);
     return commIt != mBufferPool.end() ? commIt->second.size() : 0;
+}
+
+bool NCCLWindowAllocator::hasRequestedBuffers() const noexcept
+{
+    return mBufferRequested.load();
 }
 
 size_t NCCLWindowAllocator::getBufferInUseCount(ncclComm_t comm) const

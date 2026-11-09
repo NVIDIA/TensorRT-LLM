@@ -276,9 +276,20 @@ def _install_forward_scope(module: torch.nn.Module) -> _ForwardScopeHandle:
     # decoder layers run once per layer per iteration.
     previous = module.__dict__.get("forward")
     forward = module.forward
+    window_buffers_requested = False
 
     @wraps(forward)
     def forward_in_scope(*args: Any, **kwargs: Any) -> Any:
+        nonlocal window_buffers_requested
+        # Before the process requests an NCCL window buffer, no input carries a window lease
+        # and a layer scope has nothing to adopt or release. Every rank makes these requests
+        # from the same operations, so all ranks start scoping at the same call and scope
+        # every call after it. A window tensor created by the call that makes the first
+        # request joins the enclosing scope, if any.
+        if not window_buffers_requested:
+            window_buffers_requested = torch.ops.trtllm.has_requested_nccl_window_buffers()
+            if not window_buffers_requested:
+                return forward(*args, **kwargs)
         scope = _NCCLWindowTensorScope._for_module_call(args, kwargs)
         with scope:
             return scope.escape(forward(*args, **kwargs))

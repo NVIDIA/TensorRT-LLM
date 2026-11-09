@@ -416,6 +416,7 @@ def tensor_scope_events(monkeypatch):
 
     monkeypatch.setattr(torch.ops.trtllm.begin_nccl_window_tensor_scope, "tracked", begin)
     monkeypatch.setattr(torch.ops.trtllm.end_nccl_window_tensor_scope, "tracked", end)
+    monkeypatch.setattr(torch.ops.trtllm, "has_requested_nccl_window_buffers", lambda: True)
     return events
 
 
@@ -627,6 +628,41 @@ def test_module_hooks_scope_arbitrary_modules(tensor_scope_events):
 
     assert [event[0] for event in tensor_scope_events] == ["begin", "end"]
     assert tensor_scope_events[-1][-1] is False
+
+
+def test_eager_decoder_layer_scopes_after_first_window_request(tensor_scope_events, monkeypatch):
+    from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
+
+    class TestLayer(DecoderLayer):
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states
+
+    requested_states = [False, True]
+    queries = []
+
+    def has_requested_nccl_window_buffers():
+        queries.append(requested_states[len(queries)])
+        return queries[-1]
+
+    monkeypatch.setattr(
+        torch.ops.trtllm, "has_requested_nccl_window_buffers", has_requested_nccl_window_buffers
+    )
+    layer = TestLayer()
+    handles = nccl_window_tensor_scope.install_eager_nccl_window_tensor_scopes(layer)
+    output = [object()]
+    try:
+        assert layer(output) is output
+        assert tensor_scope_events == []
+        assert layer(output) is output
+        assert [event[0] for event in tensor_scope_events] == ["begin", "end"]
+        assert layer(output) is output
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    # A request is never undone, so the allocator is not queried again.
+    assert queries == [False, True]
+    assert [event[0] for event in tensor_scope_events] == ["begin", "end", "begin", "end"]
 
 
 def test_eager_decoder_layer_hook_allows_no_cuda_output(tensor_scope_events):
