@@ -63,6 +63,13 @@ PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-phi3-dense-target-layout-v1"
 # Q/K norm state, fused gate-up MLP tensors, and complete-model receiver
 # finalization.
 QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3_5-dense-vl-complete-layout-v1"
+# Stable contract for unquantized Qwen3 MoE fused-QKV tensors, Q/K norm state,
+# the replicated router weight, CUTLASS routed-expert tensors (`w3_w1_weight`
+# with the up projection before the gate projection, and `w2_weight`)
+# partitioned by MoE TP or EP, and target-only receiver finalization. Routed
+# expert layouts differ per MoE implementation, so another implementation
+# needs its own ID.
+QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-moe-cutlass-target-layout-v1"
 _MISSING = object()
 
 
@@ -175,6 +182,8 @@ class PostTransformRuntimeConfig:
     cp_size: int | None
     moe_tp_size: int | None
     moe_ep_size: int | None
+    # MoE cluster (smart-router) parallel size from the final mapping.
+    moe_cluster_size: int | None
     attention_tp_size: int | None
     attention_cp_size: int | None
     attention_dp: bool | None
@@ -241,6 +250,7 @@ class PostTransformRuntimeConfig:
             cp_size=_canonical_int(getattr(mapping, "cp_size", None)),
             moe_tp_size=_canonical_int(getattr(mapping, "moe_tp_size", None)),
             moe_ep_size=_canonical_int(getattr(mapping, "moe_ep_size", None)),
+            moe_cluster_size=_canonical_int(getattr(mapping, "moe_cluster_size", None)),
             attention_tp_size=_canonical_int(getattr(mapping, "attn_tp_size", None)),
             attention_cp_size=_canonical_int(getattr(mapping, "attn_cp_size", None)),
             attention_dp=_canonical_bool(getattr(mapping, "enable_attention_dp", None)),
@@ -273,6 +283,7 @@ class PostTransformRuntimeConstraints:
         ("cp_sizes", "cp_size"),
         ("moe_tp_sizes", "moe_tp_size"),
         ("moe_ep_sizes", "moe_ep_size"),
+        ("moe_cluster_sizes", "moe_cluster_size"),
         ("attention_tp_sizes", "attention_tp_size"),
         ("attention_cp_sizes", "attention_cp_size"),
         ("attention_dp", "attention_dp"),
@@ -297,6 +308,7 @@ class PostTransformRuntimeConstraints:
     cp_sizes: frozenset[int | None] | None = None
     moe_tp_sizes: frozenset[int | None] | None = None
     moe_ep_sizes: frozenset[int | None] | None = None
+    moe_cluster_sizes: frozenset[int | None] | None = None
     attention_tp_sizes: frozenset[int | None] | None = None
     attention_cp_sizes: frozenset[int | None] | None = None
     attention_dp: frozenset[bool | None] | None = None
@@ -372,6 +384,12 @@ class PostTransformFeature(str, Enum):
 
     SEPARATE_DRAFT_MODEL = "separate_draft_model"
     LOCALITY_DOMAIN_LOCALIZED_WEIGHTS = "localized_weights"
+    # A realized MoE expert-parallel load balancer (EPLB) places experts in
+    # slots that can differ per rank and migrate at runtime.
+    MOE_LOAD_BALANCER = "moe_load_balancer"
+    # DWDP installs its own expert storage range on every MoE layer while the
+    # mapping reports MoE TP and EP sizes of 1.
+    DWDP = "dwdp"
 
 
 class PostTransformQualificationReason(str, Enum):
@@ -539,6 +557,24 @@ class PostTransformQualificationDecision:
         return (
             self.profile.transform_abi_id if self.qualified and self.profile is not None else None
         )
+
+    def describe(self) -> str:
+        """Render the reason and the details this decision reports, for logs and errors.
+
+        For example `reason=feature_not_supported; unsupported_features=dwdp`.
+        Empty details are omitted: `qualify()` stops at a runtime mismatch
+        before it checks features, so an empty feature set there does not mean
+        that no unsupported feature is active.
+        """
+
+        parts = [f"reason={self.reason.value}"]
+        if self.unsupported_runtime_dimensions:
+            dimensions = ",".join(sorted(self.unsupported_runtime_dimensions))
+            parts.append(f"unsupported_runtime_dimensions={dimensions}")
+        if self.unsupported_features:
+            features = ",".join(sorted(feature.value for feature in self.unsupported_features))
+            parts.append(f"unsupported_features={features}")
+        return "; ".join(parts)
 
 
 @dataclass(frozen=True)

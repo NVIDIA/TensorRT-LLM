@@ -2287,6 +2287,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp(
         cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.skip_less_device(4)
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
@@ -2303,6 +2304,7 @@ def test_disaggregated_deepseek_v3_lite_bf16_cache_aware_balance(
                            cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.skip_less_device(2)
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
@@ -2320,6 +2322,7 @@ def test_disaggregated_deepseek_v3_lite_bf16_conditional(
 
 
 # V2 variant of the conditional disagg test: KV manager V2 + Python NIXL transceiver.
+@pytest.mark.skip_less_device(2)
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
@@ -2977,6 +2980,7 @@ def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
         return False, accuracy_value
 
 
+@pytest.mark.skip_less_device(3)
 @skip_pre_hopper
 @pytest.mark.parametrize("benchmark_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
@@ -4386,6 +4390,7 @@ def run_disaggregated_cancel_test(example_dir,
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+@pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,

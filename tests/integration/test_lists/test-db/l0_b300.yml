@@ -25,6 +25,8 @@ l0_b300:
   - unittest/_torch/modules/test_engram_replay.py
   - unittest/_torch/speculative/hw_agnostic/test_dspark_v41.py
   - unittest/_torch/modules/test_mhc.py::test_fused_hc_lagged_matches_eager_composition
+  - unittest/_torch/modules/test_mhc.py::test_mhc_fused_hc_mma_split_k_deterministic
+  - unittest/_torch/modules/test_mhc.py::test_mhc_fused_hc_small_m_fma_candidates_agree
   # Covers the GPU cases of tests/unittest/_torch/attention/ on B300, except the paths
   # ignored below; its cpu_only cases run on CPU (l0_cpu). kernels/ has no entry of its own
   # on any list, so apart from kernels/parallel_hw_agnostic/ this entry is what runs it
@@ -142,7 +144,7 @@ l0_b300:
   # TIMEOUT measured: 3122 cases in 13m54s on one GB300 (the cpu_only files run on the CPU
   # stage instead), so 30 is 2.2x headroom.
   - unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm --ignore=unittest/_torch/modeling_v2/models/kimi_k3_vl --ignore=unittest/_torch/modeling_v2/models/minimax_m3 TIMEOUT (30)
-  - unittest/_torch/modeling_v2/models/minimax_m3 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/minimax_m3 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__* TIMEOUT (30)
   # K3 single-GPU kernel and wrapper checks.
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_cluster_waits.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_ctm_gemv.py
@@ -203,14 +205,14 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_rms_norm_gated_token_major.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_situ_and_mul.py
   - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp1]
-  # qwen4_exp target, pre-merge: gsm8k; one MTP engine for gsm8k with the acceptance-length
-  # floor (the only gate that sees a miscomputed draft layer), mmmu (the vision tower) and
-  # synthetic videos; and 3k-6k-token pass keys with three drafts and IndexShare over bf16 KV,
-  # the only prompts long enough to run the sparse attention path. The opt-in variants run
-  # post-merge (below).
-  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_gsm8k
-  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp1_gsm8k_mmmu_and_video
-  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_long_context_passkey
+  # qwen4_exp target at tp1, pre-merge: gsm8k without speculation; one MTP engine for gsm8k
+  # with its acceptance-length floor, mmmu (the vision tower) and synthetic videos; and one
+  # engine with three drafts and IndexShare over bf16 KV, gsm8k and then 3k-6k-token pass
+  # keys, the only prompts long enough to run the sparse attention path. The other engines
+  # run post-merge (below).
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_gsm8k
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_mtp1_gsm8k_mmmu_and_video
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_mtp3_gsm8k_and_long_context
 - condition:
     ranges:
       system_gpu_count:
@@ -231,11 +233,12 @@ l0_b300:
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM"
-  # qwen4_exp target, post-merge: the opt-in variants -- three drafts over CuteDSL experts, fp8
-  # KV and a bf16 recurrent state in one engine (gsm8k and the pass keys); seven drafts over
-  # 3k-12k-token pass keys on NVFP4 KV and a bf16 state (the verify step's eight rows per
-  # request); and the breakable prefill CUDA graph replayed against eager greedy continuations
-  # at the bucket edges and with context and generation rows in one batch.
-  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp3_cutedsl_fp8_kv_bf16_state
-  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_mtp7_long_context_passkey
-  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1::test_breakable_prefill_matches_eager
+  # qwen4_exp target at tp1, post-merge: three drafts over CuteDSL experts, fp8 KV and a bf16
+  # recurrent state (gsm8k and the pass keys); seven drafts over 3k-12k-token pass keys on
+  # NVFP4 KV and a bf16 state (the verify step's eight rows per request); and the breakable
+  # prefill CUDA graph replayed against eager greedy continuations at the bucket edges and
+  # with context and generation rows in one batch. Its disaggregated engines run in
+  # l0_gb300_multi_gpus.
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_mtp3_cutedsl_fp8_kv_bf16_state
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_mtp7_long_context_passkey
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_breakable_prefill_matches_eager

@@ -209,6 +209,8 @@ public:
     /// Whether the fused context and generation kernels for this configuration exist;
     /// builds the runners if they have not been built yet.
     [[nodiscard]] bool supportsNvFp4Output();
+    /// Whether a variable-window context kernel exists for this configuration.
+    [[nodiscard]] bool supportsVariableWindow();
 
     [[nodiscard]] size_t getFmhaMultiCtasKvScratchSize(FmhaParams const& p) const noexcept;
     [[nodiscard]] int getMaxNumSeqLenTile(FmhaParams const& p, int batch_beam_size = 1) const;

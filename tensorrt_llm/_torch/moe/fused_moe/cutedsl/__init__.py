@@ -23,6 +23,7 @@ from .grouped_gemm import (
     CuteDslFusedMoEBase,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslGroupedGemmNvfp4Impl,
+    TrtllmCutedslGroupedGemmNvfp4PlusImpl,
     cutedsl_grouped_gemm_leaf,
     find_cutedsl_grouped_gemm_leaf,
 )
@@ -33,6 +34,7 @@ __all__ = [
     "TrtllmCutedslFusedFc12Nvfp4Impl",
     "TrtllmCutedslGroupedGemmBf16Impl",
     "TrtllmCutedslGroupedGemmNvfp4Impl",
+    "TrtllmCutedslGroupedGemmNvfp4PlusImpl",
     "cutedsl_grouped_gemm_leaf",
     "find_cutedsl_grouped_gemm_leaf",
 ]
