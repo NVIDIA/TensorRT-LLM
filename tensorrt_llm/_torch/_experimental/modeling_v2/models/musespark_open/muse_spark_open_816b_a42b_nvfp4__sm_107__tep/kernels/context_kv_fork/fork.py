@@ -63,7 +63,8 @@ No stream priority is set: the side stream is a default-priority stream of
 its own (``dedicated_stream``), never one of PyTorch's pooled streams.
 
 Over the KV cache manager's pages the side chain first decodes this step's page
-table (``_refresh_ctx_block_tables``, which the worker then skips), and the commit
+table (``_refresh_ctx_block_tables``, which the worker then skips; two launches under
+``paged_ctx_block_tables``), and the commit
 is the worker's alone: the rows past the accepted count are not zeroed, since
 their columns are the drafter block append's, which overwrites them in the same
 step before anything reads them.
@@ -88,6 +89,8 @@ from tensorrt_llm.logger import logger
 from ...ops.spec.context_kv_commit import MAX_REQUESTS, context_kv_commit
 from ...ops.spec.context_kv_commit_paged import context_kv_commit_paged
 from ...ops.spec.context_kv_commit_windowed import context_kv_commit_windowed
+from ...ops.spec.ctx_block_tables_paged import MAX_REQUESTS as TABLES_MAX_REQUESTS
+from ...ops.spec.ctx_block_tables_paged import ctx_block_tables_paged
 
 #: ``drafter_kv_glue`` (``ContextKvFork.glue_on``): the side chain's index math and its arena
 #: stores run as two Triton launches instead of ~11 torch kernels: the slots / columns /
@@ -409,6 +412,9 @@ class ContextKvFork:
         self.late_join_on = False
         #: ``paged_context_commit``: a paged context's commit runs ``context_kv_commit_paged``.
         self.paged_commit_on = False
+        #: ``paged_ctx_block_tables``: the side chain decodes a paged context's page table with
+        #: ``ctx_block_tables_paged``.
+        self.paged_tables_on = False
         #: Reports a step a lever left to the path below it (``dispatch.Plan.declined``), or None.
         self.declined: Optional[Callable[..., None]] = None
 
@@ -617,6 +623,47 @@ class ContextKvFork:
                 num_ctx.copy_(worker._drafter_context_lengths(slots, rows))
         return num_ctx
 
+    def _refresh_block_tables(self, attn_metadata, num_seqs: int) -> None:
+        """The side chain's decode of a paged context's page table (``_refresh_ctx_block_tables``).
+
+        Under ``paged_ctx_block_tables``, ``ctx_block_tables_paged`` writes the table rows and
+        the extents in two launches; any other case, and a missing table, is the worker's.
+        """
+        worker = self.worker
+        tables, counts = worker._ctx_block_tables, worker._ctx_block_counts
+        if self.paged_tables_on and tables is not None and 1 <= num_seqs <= TABLES_MAX_REQUESTS:
+            src = getattr(
+                attn_metadata,
+                "kv_cache_block_offsets"
+                if worker._ctx_unified_cache
+                else "draft_kv_cache_block_offsets",
+                None,
+            )
+            if (
+                src is not None
+                and src.dim() == 4
+                and src.dtype == torch.int32
+                and src.stride(3) == 1
+                and src.shape[3] == tables.shape[1]
+                and tables.dtype == torch.int32
+                and tables.is_contiguous()
+                and tables.shape[0] >= num_seqs
+                and counts is not None
+                and counts.dtype == torch.int64
+                and counts.is_contiguous()
+                and worker._ctx_block_offset >= 0
+                and worker._ctx_block_divisor >= 1
+            ):
+                ctx_block_tables_paged(
+                    src[worker._ctx_pool_idx, :num_seqs, 0],
+                    worker._ctx_block_offset,
+                    worker._ctx_block_divisor,
+                    tables,
+                    counts,
+                )
+                return
+        DFlashWorker._refresh_ctx_block_tables(worker, attn_metadata, num_seqs)
+
     def _commits_paged(self, worker, slots, num_accepted) -> bool:
         """Whether ``context_kv_commit_paged`` takes this paged context's commit (``paged_context_commit``)."""
         return (
@@ -798,7 +845,7 @@ class ContextKvFork:
             # A worker-owned arena (dense or windowed, ``_glue_fits``): a paged context has no
             # ``_ctx_k_buf``.
             return self._glue_side_chain(spec_metadata, num_gens, k)
-        DFlashWorker._refresh_ctx_block_tables(worker, attn_metadata, num_gens)
+        self._refresh_block_tables(attn_metadata, num_gens)
         slots = worker._batch_to_slot[:num_gens]
         # The built-in's get_hidden_states(num_tokens)[0 : rows]: the same view.
         gen_hs = spec_metadata.captured_hidden_states[
@@ -1389,6 +1436,7 @@ def install(
     late_join: bool = False,
     declined: Optional[Callable[..., None]] = None,
     paged_commit: bool = False,
+    paged_tables: bool = False,
 ) -> None:
     """Install the fork on the DFlash worker, the target core and the LM head (``POINT``).
 
@@ -1401,7 +1449,9 @@ def install(
     (``windowed_commit_parallel``'s MIN_REQUESTS, None for off), ``late_join``
     (``context_kv_late_join``), ``declined`` (``dispatch.Plan.declined``) and ``paged_commit``
     (``paged_context_commit``: a paged context's commit in one launch; refused when the
-    worker's class overrides one of the methods it stands in for, ``PAGED_COMMIT_METHODS``).
+    worker's class overrides one of the methods it stands in for, ``PAGED_COMMIT_METHODS``)
+    and ``paged_tables`` (``paged_ctx_block_tables``: the side chain's decode of a paged
+    context's page table in two launches).
 
     Raises:
         ValueError: if the fork cannot be installed (the reason), so the
@@ -1435,6 +1485,7 @@ def install(
     fork.late_join_on = bool(late_join)
     fork.declined = declined
     fork.paged_commit_on = bool(paged_commit)
+    fork.paged_tables_on = bool(paged_tables)
     core._context_kv_fork = fork
     if point == "head":
         lm_head = llm.lm_head
