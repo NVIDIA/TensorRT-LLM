@@ -30,6 +30,7 @@
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaMaskSelection.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/thop/attentionVariant.h"
 
@@ -417,6 +418,23 @@ std::unique_ptr<TllmGenFmhaRunner> makeTrtllmGenContextRunner(MHARunnerFixedPara
         fixedParams.fusesDsv4InvRopeFp8Quant);
 }
 
+/// Context configurations fmha_v2 serves even on SM100f: head size 72, which trtllm-gen has no
+/// kernels for, and FP16/BF16 full or causal packed-QKV head size 104. Mixed Q/KV precisions stay
+/// on trtllm-gen: fmha_v2 requires matching types.
+bool prefersFmhaV2Context(MHARunnerFixedParams const& fixedParams)
+{
+    if (fixedParams.headSize == 72)
+    {
+        return true;
+    }
+    return fixedParams.headSize == 104 && fixedParams.headSizeV == 104
+        && fixedParams.attentionInputLayout == AttentionInputLayout::PACKED_QKV
+        && fixedParams.dataType == fixedParams.dataTypeKv
+        && (fixedParams.dataType == DATA_TYPE_FP16 || fixedParams.dataType == DATA_TYPE_BF16)
+        && (fixedParams.attentionMaskType == ContextAttentionMaskType::PADDING
+            || fixedParams.attentionMaskType == ContextAttentionMaskType::CAUSAL);
+}
+
 /// Whether \p runner has a context kernel for \p fixedParams.
 bool isTrtllmGenContextSupported(TllmGenFmhaRunner const& runner, MHARunnerFixedParams const& fixedParams)
 {
@@ -445,15 +463,13 @@ bool isTrtllmGenContextSupported(TllmGenFmhaRunner const& runner, MHARunnerFixed
     // attributes for kernel selection.
     TllmGenFmhaRunnerParams tllmRunnerParams;
     memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
-    tllmRunnerParams.mLeftSlidingWindow = -1;
-    tllmRunnerParams.mRightSlidingWindow = -1;
     tllmRunnerParams.mQkvLayout = qkvLayout;
-    tllmRunnerParams.setAttentionMaskType(static_cast<std::int8_t>(fixedParams.attentionMaskType));
-    if (fixedParams.attentionMaskType == ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL)
-    {
-        tllmRunnerParams.mLeftSlidingWindow = 0;
-        tllmRunnerParams.mRightSlidingWindow = 0;
-    }
+    // A size of 1 becomes the (0, 0) inclusive sliding-window probe after converting size to reach.
+    int32_t const probeSlidingWindowSize
+        = fixedParams.attentionMaskType == ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL ? 1 : 0;
+    applyTrtllmGenMaskSelection(tllmRunnerParams,
+        tensorrt_llm::kernels::detail::selectTrtllmGenMask(
+            fixedParams.attentionMaskType, probeSlidingWindowSize, 0, kWindowProbeKvSeqLen));
     tllmRunnerParams.mKernelType = FmhaKernelType::Context;
     tllmRunnerParams.mTileScheduler = contextTileScheduler();
     tllmRunnerParams.mMultiCtasKvMode = false;
@@ -473,7 +489,6 @@ bool isTrtllmGenContextSupported(TllmGenFmhaRunner const& runner, MHARunnerFixed
     tllmRunnerParams.mNumTokensPerPage = (qkvLayout == QkvLayout::PagedKv) ? fixedParams.numTokensPerBlock : 0;
     tllmRunnerParams.mNumHeadsQPerKv = fixedParams.numQHeads / fixedParams.numKvHeads;
     tllmRunnerParams.mMultiProcessorCount = tc::getMultiProcessorCount();
-    tllmRunnerParams.mChunkedAttentionSize = 0;
     // Sparse context attention uses a generation-style kernel with per-token sparse indices.
     if (fixedParams.useTllmGenSparseAttention)
     {
@@ -732,8 +747,7 @@ void TrtllmGenFmha<AttentionVariant>::initContext(AttentionVariant const& op)
         }
     }
     mContextParams = op.contextFixedParams();
-    // trtllm-gen has no head size 72 kernels; fmha_v2 serves it.
-    if (mContextParams.headSize == 72)
+    if (prefersFmhaV2Context(mContextParams))
     {
         return;
     }
@@ -925,7 +939,6 @@ void TrtllmGenFmha<AttentionVariant>::launchContext(MHARunnerParams const& runne
 
     // Parameters to select kernels.
     tllmRunnerParams.mQkvLayout = qkvLayout;
-    tllmRunnerParams.setAttentionMaskType(static_cast<std::int8_t>(mContextParams.attentionMaskType));
     tllmRunnerParams.mKernelType = FmhaKernelType::Context;
     // Persistent scheduler by default for better performance; see contextTileScheduler().
     tllmRunnerParams.mTileScheduler = contextTileScheduler();
@@ -941,6 +954,8 @@ void TrtllmGenFmha<AttentionVariant>::launchContext(MHARunnerParams const& runne
     tllmRunnerParams.attentionSinksPtr = runnerParams.attentionSinksPtr;
     tllmRunnerParams.cumSeqLensQPtr = reinterpret_cast<int const*>(runnerParams.cuQSeqLenPtr);
     tllmRunnerParams.cumSeqLensKvPtr = reinterpret_cast<int const*>(runnerParams.cuKvSeqLenPtr);
+    tllmRunnerParams.variableWindowTokenStartsPtr = runnerParams.variableWindowTokenStartsPtr;
+    tllmRunnerParams.variableWindowTokenEndsPtr = runnerParams.variableWindowTokenEndsPtr;
     // Attention scales device pointers (only fp8 kernels need to load scales from the device memory).
     tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(runnerParams.scaleBmm2Ptr);
     // TRTLLM-GEN kernels always use the Log2 scale
@@ -971,30 +986,9 @@ void TrtllmGenFmha<AttentionVariant>::launchContext(MHARunnerParams const& runne
     tllmRunnerParams.mMaxSeqLenCacheKv = runnerParams.slidingWindowSize;
     tllmRunnerParams.mMaxSeqLenQ = runnerParams.qSeqLen;
     tllmRunnerParams.mMaxSeqLenKv = runnerParams.kvSeqLen;
-    tllmRunnerParams.mLeftSlidingWindow = -1;
-    tllmRunnerParams.mRightSlidingWindow = -1;
-    tllmRunnerParams.mChunkedAttentionSize = 0;
-    bool const usesChunkedAttention = runnerParams.chunkedAttentionSize > 0
-        && runnerParams.chunkedAttentionSize != INT_MAX && runnerParams.chunkedAttentionSize < runnerParams.kvSeqLen;
-    bool const usesSlidingWindow
-        = runnerParams.slidingWindowSize > 0 && runnerParams.kvSeqLen > runnerParams.slidingWindowSize;
-    TLLM_CHECK_WITH_INFO(!(usesChunkedAttention && usesSlidingWindow),
-        "Chunked attention size and sliding window size should not be used together.");
-    if (usesChunkedAttention)
-    {
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
-        tllmRunnerParams.mChunkedAttentionSize = runnerParams.chunkedAttentionSize;
-    }
-    else if (usesSlidingWindow)
-    {
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
-        tllmRunnerParams.mLeftSlidingWindow = runnerParams.slidingWindowSize - 1;
-        tllmRunnerParams.mRightSlidingWindow = 0;
-    }
-    else if (mContextParams.attentionMaskType == ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL)
-    {
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
-    }
+    applyTrtllmGenMaskSelection(tllmRunnerParams,
+        tensorrt_llm::kernels::detail::selectTrtllmGenMask(mContextParams.attentionMaskType,
+            runnerParams.slidingWindowSize, runnerParams.chunkedAttentionSize, runnerParams.kvSeqLen));
     tllmRunnerParams.mSumOfSeqLensQ = runnerParams.totalQSeqLen;
     tllmRunnerParams.mSumOfSeqLensKv = runnerParams.totalKvSeqLen;
     tllmRunnerParams.mJITWarmup = runnerParams.trtllmGenJITWarmup;
@@ -1566,7 +1560,7 @@ bool FmhaV2Fmha<AttentionVariant>::isAvailable(AttentionBase const& key)
 {
     if constexpr (std::is_same_v<AttentionVariant, MHA>)
     {
-        return !isTrtllmGenGpu() || key.head_size == 72;
+        return !isTrtllmGenGpu() || key.head_size == 72 || key.head_size == 104;
     }
     else
     {
@@ -1597,8 +1591,8 @@ void FmhaV2Fmha<AttentionVariant>::initContext(AttentionVariant const& op)
         }
     }
     auto fixedParams = op.contextFixedParams();
-    // On SM100f fmha_v2 serves only what trtllm-gen has no kernels for.
-    if (isTrtllmGenGpu() && fixedParams.headSize != 72)
+    // On SM100f fmha_v2 serves only what trtllm-gen leaves to it.
+    if (isTrtllmGenGpu() && !prefersFmhaV2Context(fixedParams))
     {
         return;
     }
@@ -2444,9 +2438,12 @@ bool UnfusedFmha::isSupported(FmhaParams const& p, bool isGen) const
     {
         return false;
     }
-    // Unfused self-attention cannot read a cached prefix. This library comes last, so the
-    // call has no fused context kernel: refuse it instead of dropping the prefix.
+    // This library comes last, so the call has no fused context kernel. Refuse what the
+    // unfused path would compute wrongly: variable-window bounds it ignores, and a cached
+    // prefix that unfused self-attention cannot read.
     auto const& op = this->attention;
+    TLLM_CHECK_WITH_INFO(
+        !op.use_variable_window, "Variable-window attention requires a supported context FMHA kernel configuration.");
     bool const needsFusedPagedContext = op.paged_context_fmha && op.use_kv_cache && !op.cross_attention;
     TLLM_CHECK_WITH_INFO(!needsFusedPagedContext,
         "Paged-context attention requires a fused context FMHA kernel, and this build has none for this "

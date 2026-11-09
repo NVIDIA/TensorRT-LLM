@@ -19,7 +19,7 @@
 
 #include <climits>
 
-#include "tensorrt_llm/kernels/fmhaDispatcher.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaMaskSelection.h"
 
 namespace
 {
@@ -28,7 +28,7 @@ using tensorrt_llm::kernels::ContextAttentionMaskType;
 using tensorrt_llm::kernels::TrtllmGenAttentionMaskType;
 using tensorrt_llm::kernels::detail::selectTrtllmGenMask;
 
-TEST(FmhaDispatcherTest, SelectsVariableWindowWithoutOverrides)
+TEST(FmhaMaskSelectionTest, SelectsVariableWindowWithoutOverrides)
 {
     auto const selection = selectTrtllmGenMask(ContextAttentionMaskType::VARIABLE_WINDOW, 4, 2, 8);
 
@@ -38,7 +38,7 @@ TEST(FmhaDispatcherTest, SelectsVariableWindowWithoutOverrides)
     EXPECT_EQ(selection.chunkedAttentionSize, 0);
 }
 
-TEST(FmhaDispatcherTest, SelectsSlidingWindow)
+TEST(FmhaMaskSelectionTest, SelectsSlidingWindow)
 {
     auto const selection = selectTrtllmGenMask(ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL, 4, INT_MAX, 8);
 
@@ -48,7 +48,7 @@ TEST(FmhaDispatcherTest, SelectsSlidingWindow)
     EXPECT_EQ(selection.chunkedAttentionSize, 0);
 }
 
-TEST(FmhaDispatcherTest, SelectsCausalForDenseEquivalentSlidingWindow)
+TEST(FmhaMaskSelectionTest, SelectsCausalForDenseEquivalentSlidingWindow)
 {
     auto const selection = selectTrtllmGenMask(ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL, 8, INT_MAX, 8);
 
@@ -58,7 +58,7 @@ TEST(FmhaDispatcherTest, SelectsCausalForDenseEquivalentSlidingWindow)
     EXPECT_EQ(selection.chunkedAttentionSize, 0);
 }
 
-TEST(FmhaDispatcherTest, SelectsChunkedAttention)
+TEST(FmhaMaskSelectionTest, SelectsChunkedAttention)
 {
     auto const selection = selectTrtllmGenMask(ContextAttentionMaskType::CAUSAL, 0, 4, 8);
 
@@ -68,7 +68,7 @@ TEST(FmhaDispatcherTest, SelectsChunkedAttention)
     EXPECT_EQ(selection.chunkedAttentionSize, 4);
 }
 
-TEST(FmhaDispatcherTest, RejectsSimultaneousSlidingAndChunkedAttention)
+TEST(FmhaMaskSelectionTest, RejectsSimultaneousSlidingAndChunkedAttention)
 {
     EXPECT_ANY_THROW(selectTrtllmGenMask(ContextAttentionMaskType::CAUSAL, 4, 2, 8));
 }

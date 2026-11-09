@@ -45,6 +45,7 @@ class FmhaV2Fmha(PhasedFmha):
     NEEDS_BLOCK_EXTENT = False
     supports_skip_correction = True
     supports_workspace_reclamation = True
+    supports_variable_window = True
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
