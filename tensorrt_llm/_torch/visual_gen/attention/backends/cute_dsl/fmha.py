@@ -573,7 +573,8 @@ def cute_dsl_paged_fmha_fwd(
 
     Args:
         q: ``[B, S, H_q, D]``.
-        kv_pool: one layer's pool ``[num_pages, 2, H_kv, page_size, D]`` (plane 0 K, plane 1 V).
+        kv_pool: one layer's pool ``[num_pages, 2, H_kv, page_size, D]`` (plane 0 K, plane 1 V),
+            contiguous and 32-byte aligned.
         page_table: ``[B, max_pages]`` int32 pool pages.
         cu_seqlens_kv: ``[B + 1]`` int32 cumulative K/V lengths.
         out: ``[B, S, H_q, D]``, written.
@@ -594,6 +595,8 @@ def cute_dsl_paged_fmha_fwd(
         raise ValueError(f"q, kv and out dtypes differ: {q.dtype}, {kv_pool.dtype}, {out.dtype}")
     if not q.is_contiguous() or not out.is_contiguous():
         raise ValueError("q and out must be contiguous.")
+    if not kv_pool.is_contiguous() or kv_pool.data_ptr() % 32:
+        raise ValueError("K/V pool must be contiguous and 32-byte aligned.")
     device = q.device
     gpu_arch_str = _get_gpu_arch(device)
     dtype = _torch_to_cutlass_dtype(q.dtype)

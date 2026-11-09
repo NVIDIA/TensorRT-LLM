@@ -1163,6 +1163,8 @@ int MHA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
         // A Q-only input leaves the cache as it is; the FMHA reads K/V from it.
         // Otherwise AttentionOp copies the KV from input tensor to the KV cache.
         bool const qOnlyInput = isQOnlySelfAttention(p);
+        TLLM_CHECK_WITH_INFO(!qOnlyInput || (p.getSparseKvIndices() == nullptr && p.getSparseKvOffsets() == nullptr),
+            "Q-only self-attention does not support sparse KV compaction metadata.");
         int const inputHiddenUnits
             = qOnlyInput ? local_hidden_units_qo : local_hidden_units_qo + 2 * local_hidden_units_kv;
         TLLM_CHECK_WITH_INFO(!(quant_mode.hasInt8KvCache() && enablePagedKVContextFMHA),
