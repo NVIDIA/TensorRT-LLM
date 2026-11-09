@@ -32,18 +32,19 @@ With 0-based draft positions ``j = 0..K-1``, drafts ``x_j ~ q_j``, target rows
 * emitted token: ``y ~ max(w_{L-1} p_L - q_L, 0)`` renormalized when ``L < K``,
   the bonus ``y ~ p_K`` when ``L = K``.
 
-This is the rule vLLM serves as ``rejection_sample_method="block"``.
+This is Algorithm 2 of Sun et al. (2024).
 
 Everything here is tensor arithmetic on static shapes with no host
 synchronization, so it can run inside a captured CUDA graph.
 """
 
-from typing import Callable, Optional, Tuple
+from collections.abc import Callable
 
 import torch
 
 _MASK32 = 0xFFFFFFFF
-# Keeps these draws apart from any other hash of the same (seed, offset).
+# Salt that keeps these draws apart from any other hash of the same
+# (seed, offset); the value is MurmurHash2's multiplier.
 _UNIFORM_DOMAIN = 0x5BD1E995
 
 
@@ -101,9 +102,15 @@ def sample_from_weights(weights: torch.Tensor, uniforms: torch.Tensor) -> torch.
     return index.clamp_(max=weights.shape[-1] - 1)
 
 
+def _is_distribution(probs: torch.Tensor, keepdim: bool = False) -> torch.Tensor:
+    """Per row of ``[..., V]`` probabilities: every entry in [0, 1] (NaN fails)."""
+    low, high = torch.aminmax(probs, dim=-1, keepdim=keepdim)
+    return (low >= 0) & (high <= 1)
+
+
 def block_acceptance_thresholds(
     draft_tokens: torch.Tensor, draft_probs: torch.Tensor, target_probs: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """The running capped joint ratios and the acceptance thresholds.
 
     Args:
@@ -121,7 +128,7 @@ def block_acceptance_thresholds(
     p_x = target_probs[:, :num_drafts].gather(-1, tokens).squeeze(-1).float()
     q_x = draft_probs.gather(-1, tokens).squeeze(-1).float()
     # A draft its own proposal gives no mass to was not drawn from it; such a
-    # draft (and a non-finite row) must never be accepted.
+    # draft (and a non-finite ratio) must never be accepted.
     log_ratio = torch.where(q_x > 0, p_x.log() - q_x.log(), torch.full_like(q_x, float("-inf")))
     log_ratio = torch.nan_to_num(log_ratio, nan=float("-inf"))
 
@@ -132,16 +139,21 @@ def block_acceptance_thresholds(
         log_w[:, j] = running
     w = log_w.exp()
 
-    # h_{K-1} = w_{K-1}; the look-ahead thresholds of positions 0..K-2 are
-    # computed for all of them at once (one [B, K-1, V] pass, no per-position
-    # launches).
+    # h_{K-1} = w_{K-1}. The look-ahead thresholds of positions 0..K-2 take
+    # one [B, V] pass each, so the scratch never spans the whole block. A
+    # look-ahead row that is not a distribution (e.g. a slot the draft sampler
+    # never wrote) gives a threshold of 0: with it, w_j = 0 would no longer
+    # imply h_j = 0, and a draft the target rules out could be accepted.
     h = w.clone()
-    if num_drafts > 1:
-        residual = w[:, :-1, None] * target_probs[:, 1:num_drafts].float()
-        residual.sub_(draft_probs[:, 1:].float()).clamp_min_(0.0)
-        mass = residual.sum(-1)
-        denom = mass + 1.0 - w[:, :-1]
-        h[:, :-1] = torch.where(denom > 0, mass / denom, torch.ones_like(mass))
+    for j in range(num_drafts - 1):
+        q_next = draft_probs[:, j + 1]
+        residual = target_probs[:, j + 1].float() * w[:, j : j + 1]
+        mass = residual.sub_(q_next.float()).clamp_min_(0.0).sum(-1)
+        denom = mass + 1.0 - w[:, j]
+        valid = _is_distribution(q_next)
+        h[:, j] = torch.where(
+            valid & (denom > 0), mass / denom, (valid & (denom == 0)).to(mass.dtype)
+        )
     return log_w, h
 
 
@@ -150,9 +162,9 @@ def block_verify(
     draft_probs: torch.Tensor,
     target_probs: torch.Tensor,
     uniforms: torch.Tensor,
-    resample_uniforms: Optional[torch.Tensor] = None,
-    sample_emitted: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    resample_uniforms: torch.Tensor | None = None,
+    sample_emitted: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Verify a batch of drafted blocks with block verification.
 
     Args:
@@ -165,12 +177,15 @@ def block_verify(
             drawn by inverse CDF (:func:`sample_from_weights`).
         sample_emitted: alternatively, ``([B, V] nonnegative weights) -> [B]``
             ids: draws the emitted token from the normalized weights (e.g. a
-            seeded sampler kernel). Exactly one of the two must be given.
+            seeded sampler kernel). Exactly one of the two is given.
     Returns:
         ``accepted_tokens`` ``[B, K + 1]`` int32 -- the ``L`` accepted drafts,
         the emitted token, then ``-1`` -- and ``num_accepted_tokens`` ``[B]``
         int32 ``= L + 1``, the layout of the token-level kernel.
     """
+    assert (resample_uniforms is None) != (sample_emitted is None), (
+        "block_verify takes exactly one of resample_uniforms and sample_emitted"
+    )
     num_drafts = draft_tokens.shape[1]
     vocab_size = target_probs.shape[-1]
     log_w, h = block_acceptance_thresholds(draft_tokens, draft_probs, target_probs)
@@ -193,15 +208,16 @@ def block_verify(
     is_bonus = (accepted_len == num_drafts).unsqueeze(-1)
     residual = torch.where(is_bonus, p_row, (log_w_prev.exp() * p_row - q_row).clamp_min(0.0))
     # The residual is empty only with probability zero; fall back to the
-    # target row so rounding can never leave nothing to draw from.
-    has_mass = residual.sum(-1, keepdim=True) > 0
-    residual = torch.where(has_mass, residual, p_row)
+    # target row so rounding can never leave nothing to draw from. A proposal
+    # row that is not a distribution falls back too: its residual could put
+    # mass on tokens the target rules out.
+    usable = is_bonus | (
+        _is_distribution(q_row, keepdim=True) & (residual.sum(-1, keepdim=True) > 0)
+    )
+    residual = torch.where(usable, residual, p_row)
     if sample_emitted is not None:
         emitted = sample_emitted(residual).long().clamp(0, vocab_size - 1)
     else:
-        assert resample_uniforms is not None, (
-            "block_verify needs resample_uniforms or sample_emitted"
-        )
         emitted = sample_from_weights(residual, resample_uniforms)
 
     slots = torch.arange(num_drafts + 1, dtype=torch.int64, device=draft_tokens.device)

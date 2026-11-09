@@ -108,11 +108,14 @@ def _vllm_block_reference(
     draft_tokens: torch.Tensor,
     uniforms: torch.Tensor,
 ) -> tuple[int, torch.Tensor, torch.Tensor]:
-    """Port of vLLM's block path for one request (``rejection_sampler_utils.py``).
+    """Independent float64 re-implementation of vLLM's block path for one request.
 
-    Mirrors ``_compute_cumulative_log_p_kernel``, ``_compute_local_residual_mass_kernel``,
+    No vLLM code is copied. It follows
+    vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py at
+    vllm-project/vllm@66875d3127534183b5ea723964fc7ec388e89722, mirroring
+    ``_compute_cumulative_log_p_kernel``, ``_compute_local_residual_mass_kernel``,
     the ``USE_BLOCK_VERIFICATION`` branch of ``_rejection_kernel`` and the block
-    branch of ``_resample_kernel`` with draft logits present, in float64.
+    branch of ``_resample_kernel`` with draft logits present.
 
     Args:
         target_logits: ``[K + 1, V]`` processed target logits (``-inf`` where filtered).
@@ -245,7 +248,7 @@ def test_block_verify_matches_vllm_given_identical_uniforms(num_drafts: int) -> 
 
 # Losslessness on a toy model with prefix-dependent conditionals
 
-_VOCAB = 3
+_VOCAB = 4
 _BLOCK = 3  # drafts per block; the verified sequences have _BLOCK + 1 tokens
 
 
@@ -366,6 +369,29 @@ def test_a_draft_its_proposal_gives_no_mass_is_rejected() -> None:
         torch.tensor([0.5], dtype=torch.float64),
     )
     assert int(num_accepted) == 1
+
+
+@pytest.mark.parametrize("corrupt", ["nan", "negative"])
+@pytest.mark.cpu_only
+def test_a_corrupt_look_ahead_row_never_accepts_a_draft_the_target_rules_out(corrupt: str) -> None:
+    """An unwritten proposal row (``draft_probs`` is uninitialized) must not force an accept."""
+    vocab = 8
+    target = torch.zeros(1, 4, vocab)
+    target[0, torch.arange(4), torch.tensor([5, 6, 7, 3])] = 1.0  # greedy one-hot rows
+    drafts = torch.tensor([[1, 6, 7]])  # the target gives token 1 zero probability
+    draft = torch.zeros(1, 3, vocab)
+    draft[0, torch.arange(3), drafts[0]] = 1.0
+    draft[0, 1, 2] = float("nan") if corrupt == "nan" else -3.0  # unrelated column, row 1
+    draft[0, 2, 4] = float("nan") if corrupt == "nan" else -3.0  # and the emitted row
+    tokens, num_accepted = block_verify(
+        drafts,
+        draft,
+        target,
+        torch.full((1, 3), 0.5, dtype=torch.float64),
+        torch.tensor([0.5], dtype=torch.float64),
+    )
+    assert int(num_accepted) == 1
+    assert int(tokens[0, 0]) == 5
 
 
 @pytest.mark.cpu_only
