@@ -19,13 +19,23 @@ Wraps TrtllmAttention with simplified metadata for visual generation (diffusion)
 Handles the specifics of no-KV-cache operation and fused QKV requirements.
 """
 
-from typing import Optional, Union
+import functools
+import math
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
+from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
+
+if TYPE_CHECKING:
+    from ....attention.backends.prims_ts.vc_attention.quantization import (
+        VCAttentionOperands,
+        VCAttentionPreprocessor,
+    )
 
 from ....attention.backends.interface import (
     AttentionForwardArgs,
@@ -36,8 +46,100 @@ from ....attention.backends.sparse.params import SparseBackendForwardArgs, Spars
 from ....attention.backends.sparse.timestep_phase import graph_phase_for_timestep
 from ....attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ....attention.backends.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
+from ....metadata import KVCacheParams
+from ...cache import BlockCausalKVCacheManager, ForwardPlan
 from ...cuda_graph_runner import resolved_extra_key
-from .interface import AttentionBackend, AttentionTensorLayout
+from .interface import AttentionBackend, AttentionTensorLayout, as_fused_qkv, is_fused_qkv
+
+
+def vc_smooth_phase(denoise_step: Optional[tuple[int, int]]) -> Optional[int]:
+    """Return the V-Smooth phase of a denoising step for the CUDA graph key.
+
+    ``VCAttentionPreprocessor.prepare`` chooses its path from the step alone,
+    so a graph captured at one step is only valid for steps on the same path.
+    2 regroups the value tokens and demeans V, 1 keeps the last grouping and
+    demeans V, 0 runs the plain per-channel E4M3 V after the window. ``None``
+    means no denoising step is active; CUDA Graph runners omit their phase key
+    part in that case. The schedule constants are the defaults the layer-owned
+    preprocessor runs with.
+    """
+    if denoise_step is None:
+        return None
+    from ....attention.backends.prims_ts.vc_attention.quantization import (
+        VC_PERM_REFRESH_EVERY,
+        VC_SMOOTH_STEP_FRACTION,
+    )
+
+    step, num_steps = denoise_step
+    if step >= math.ceil(VC_SMOOTH_STEP_FRACTION * num_steps):
+        return 0
+    return 2 if step == 0 or step % VC_PERM_REFRESH_EVERY == 0 else 1
+
+
+def vc_denoise_step_for_phase(phase: int) -> tuple[int, int]:
+    """Return a representative denoising step of the schedule in ``phase``.
+
+    Under CUDA graph capture the real step must not change what the graph
+    records, so the host resolved phase selects one step of that phase on a
+    schedule whose window holds exactly one refresh period.
+    """
+    from ....attention.backends.prims_ts.vc_attention.quantization import (
+        VC_PERM_REFRESH_EVERY,
+        VC_SMOOTH_STEP_FRACTION,
+    )
+
+    num_steps = math.ceil(VC_PERM_REFRESH_EVERY / VC_SMOOTH_STEP_FRACTION)
+    if phase == 2:
+        return 0, num_steps
+    if phase == 1:
+        return 1, num_steps
+    return num_steps - 1, num_steps
+
+
+def prepare_vc_operands(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    qk_fp8: bool,
+    repair_budget: float,
+    preprocessor: Optional["VCAttentionPreprocessor"],
+    denoise_step: Optional[tuple[int, int]],
+) -> "VCAttentionOperands":
+    """Quantize ``[B, S, H, D]`` bf16 Q, K and V for one VC-Attention forward.
+
+    With a repair budget the highest-residual tokens are appended as V repair
+    rows. Otherwise the layer-owned ``preprocessor`` groups the value tokens
+    and splits V into tile means and E4M3 residuals on the V-Smooth schedule
+    given by ``denoise_step``. Under QK8 ``q`` is rotated and quantized too.
+    """
+    from ....attention.backends.prims_ts.vc_attention.quantization import vc_quantize_repair
+
+    vc_q = q if qk_fp8 else None
+    if repair_budget:
+        return vc_quantize_repair(k, v, budget=repair_budget, q=vc_q)
+    if preprocessor is None:
+        raise ValueError("the tile-mean VC-Attention recipe needs a preprocessor")
+    return preprocessor.prepare(k, v, q=vc_q, denoise_step=denoise_step)
+
+
+@functools.lru_cache(maxsize=None)
+def _paged_context_kernel_exists(
+    head_dim: int, dtype: torch.dtype, tokens_per_page: int, device: int
+) -> bool:
+    """Whether this build has a fused paged context attention kernel for this head size,
+    K/V and output dtype and page size on ``device``'s GPU. Which page sizes exist
+    depends on the GPU family and on the kernels compiled in, so the build is asked.
+    The lookup probes a causal configuration; the full-attention kernels the cache path
+    runs come from the same kernel sets. A missing kernel would make the op fall back to
+    an unfused path that ignores the cached keys, so callers refuse instead."""
+    with torch.cuda.device(device):
+        # The lookup loads cubins through the driver, which needs a current context.
+        torch.empty(1, device="cuda")
+        binding = torch_dtype_to_binding(dtype)
+        return bool(
+            thop.fused_context_fmha_kernel_exists(head_dim, binding, tokens_per_page, binding)
+        )
 
 
 class TrtllmAttentionMetadata:
@@ -181,6 +283,88 @@ class TrtllmAttentionMetadata:
 
         return self._metadata
 
+    def prepare_with_kv_cache(
+        self, kv_cache: BlockCausalKVCacheManager, num_causal_blocks: int, causal_block_size: int
+    ) -> BaseTrtllmAttentionMetadata:
+        """Metadata over ``kv_cache``: ``num_causal_blocks`` context requests of
+        ``causal_block_size`` tokens, request ``i`` with the fixed region, its window
+        and the ``i`` earlier causal blocks already cached (``kv_cache.cached_tokens``).
+        All requests are the one sequence; each reads its own causal block's page list
+        (``kv_cache.causal_block_offsets``).
+
+        One object per (spec, causal block count and size), stored on the cache
+        (``kv_cache.attention_metadata``) and shared by every layer that attends over it;
+        ``BlockCausalKVCacheManager.shutdown`` drops it. It is built once, eagerly, and
+        then bound to the cache's own device tensors: the page offsets and the
+        per-causal-block key counts read by kernel are owned by the cache, rewritten in place by
+        ``commit``. So nothing here changes after a commit, and a CUDA graph captured
+        around the forward replays correctly with no refresh. The host-side lengths taken
+        by the op are upper bounds fixed by the spec.
+
+        ``prepare()`` runs exactly once, when the object is built. Right after it, four
+        fields are replaced: ``kv_cache_block_offsets`` and ``kv_lens_cuda_runtime`` by
+        views of the cache's device tensors, ``kv_lens_runtime`` and
+        ``host_total_kv_lens`` by ``kv_cache.max_keys_per_causal_block``. Every other field keeps
+        the value ``prepare()`` computed.
+
+        Mapping onto the LLM attention metadata: each causal block is one context
+        request whose cached past is the fixed region and its window.
+        - ``chunked_prefill=True`` makes each causal block attend to the cached tokens
+          (the fixed region, its window and the earlier causal blocks), not only to its
+          own.
+        - ``max_num_requests = max_num_sequences = max_causal_blocks``: one request per
+          causal block, sized for the most causal blocks the spec declares for one
+          forward. At the Cosmos spec that is 4: 1 per denoising forward, 4 in the clean
+          pass.
+        Unlike LLM chunked prefill, the requests are synthetic (no ``LlmRequest``) and
+        all carry request id 0, the mask is FULL within a causal block, and the past is
+        bounded by the window rather than a growing prefix. The total video length is
+        never needed: ``num_causal_blocks`` counts causal blocks per forward.
+        """
+        cache_key = ("trtllm", kv_cache.spec, num_causal_blocks, causal_block_size)
+        cached = kv_cache.attention_metadata.get(cache_key)
+        if cached is not None:
+            return cached
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "K/V cache attention metadata first needed during CUDA graph capture; "
+                "run the forward eagerly once before capturing"
+            )
+        n, size = num_causal_blocks, causal_block_size
+        metadata = BaseTrtllmAttentionMetadata(
+            max_num_requests=kv_cache.max_causal_blocks,
+            max_num_tokens=kv_cache.max_staged_tokens,
+            max_num_sequences=kv_cache.max_causal_blocks,
+            kv_cache_manager=kv_cache,
+            mapping=kv_cache.mapping,
+            runtime_features=AttentionRuntimeFeatures(chunked_prefill=True),
+        )
+        metadata.seq_lens = torch.full((n,), size, dtype=torch.int32)
+        metadata.num_contexts = n
+        metadata.request_ids = kv_cache.request_ids(n)
+        metadata.prompt_lens = [size] * n
+        # One ordinary prepare() allocates the metadata's buffers; what it fills in is
+        # then replaced by the cache's own tensors below.
+        metadata.kv_cache_params = KVCacheParams(
+            use_cache=True, num_cached_tokens_per_seq=kv_cache.cached_tokens(size)[:n]
+        )
+        kv_cache.set_causal_block_size(size)
+        metadata.prepare()
+        # Each causal block's page list holds the fixed region, its window, the earlier
+        # causal blocks and then its own tokens; the kernel writes the causal block right
+        # after the cached count, inside its private pages. Both tensors are the cache's.
+        metadata.kv_cache_block_offsets = kv_cache.causal_block_offsets(size)[:, :n]
+        metadata.kv_lens_cuda_runtime = kv_cache.causal_block_lengths(size)[1][:n]
+        # Actual per-causal-block lengths come from the device tensor above. The host
+        # upper bound holds for every open of the spec, whatever prefix it pins, so this
+        # metadata and captured graphs stay valid across reopens.
+        bound = kv_cache.max_keys_per_causal_block
+        metadata.kv_lens_runtime = torch.full((n,), bound, dtype=torch.int32)
+        metadata.host_total_kv_lens[0] = n * bound
+        metadata.host_total_kv_lens[1] = 0
+        kv_cache.attention_metadata[cache_key] = metadata
+        return metadata
+
 
 class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     """
@@ -192,6 +376,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     - No KV cache operation
     - SageAttention per-block QKV quantization (when a quant_attention_config is provided. requires unfused QKV)
     - PrimTS per-tensor FP8 recipes (quant_attention_config with zero block sizes, requires unfused QKV)
+    - VC-Attention recipes (quant_attention_config with vc_attention, requires unfused QKV)
     - Separate-QKV forwarding for generic block-sparse attention and backends that reject fused QKV
     """
 
@@ -228,13 +413,34 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
 
         # TRTLLM expects flat [B*S, H*D] format
         self._preferred_layout = AttentionTensorLayout.NHD
+        self._dtype = dtype
 
         self.metadata = TrtllmAttentionMetadata(
             attention_metadata_state=attention_metadata_state,
         )
 
         self.quant_attention_config = quant_attention_config
-        if (
+        # The tile-mean VC-Attention recipe keeps its value grouping between denoising
+        # steps in a preprocessor owned by this layer.
+        self._vc_preprocessor: Optional["VCAttentionPreprocessor"] = None
+        # The K/V shape the eager preprocessor currently holds a grouping for.
+        self._vc_shape: Optional[tuple[int, int, int]] = None
+        if quant_attention_config is not None and quant_attention_config.vc_attention:
+            if sparse_params is not None:
+                raise ValueError("VC-Attention does not compose with sparse attention.")
+            if not any(fmha.supports_vc_attention for fmha in self._fmha_manager.fmha_libs):
+                raise RuntimeError(
+                    "The VC-Attention recipe needs the PrimTS FMHA library "
+                    "(TLLM_FMHA_LIBS=+prims_ts), which is not enabled or not available on this "
+                    "platform."
+                )
+            if not quant_attention_config.vc_repair_budget:
+                from ....attention.backends.prims_ts.vc_attention.quantization import (
+                    VCAttentionPreprocessor,
+                )
+
+                self._vc_preprocessor = VCAttentionPreprocessor()
+        elif (
             quant_attention_config is not None
             and quant_attention_config.q_block_size == 0
             and not any(fmha.supports_per_tensor_fp8 for fmha in self._fmha_manager.fmha_libs)
@@ -279,6 +485,55 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             phase = graph_phase_for_timestep(timestep, disabled_until_timestep=self.timestep_cutoff)
         return phase
 
+    @torch.compiler.disable
+    def _vc_operands(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+        kv_seq_len: int,
+        timestep: object,
+    ) -> "VCAttentionOperands":
+        """Prepare the VC-Attention operands of this call from compact Q, K and V.
+
+        The denoising step comes from the pipeline through the shared attention
+        metadata state, so the V-Smooth window is a fraction of the schedule's
+        steps on any scheduler. Under the CUDA graph runner the host resolved
+        phase stands in for the step, which capture must not record, and
+        selects a representative step of that phase.
+        """
+        del timestep
+        quant_cfg = self.quant_attention_config
+        denoise_step = None
+        if self._vc_preprocessor is not None:
+            phase = resolved_extra_key("vc_smooth_phase")
+            if phase is not None:
+                denoise_step = vc_denoise_step_for_phase(phase)
+            else:
+                denoise_step = self.metadata._metadata_state.get("denoise_step")
+                # Eager runs keep the grouping of the current K/V shape only. Under
+                # the CUDA graph runner every captured shape keeps its grouping, as
+                # the captured graphs read those buffers by address.
+                shape = (batch_size, kv_seq_len, self.num_kv_heads)
+                if self._vc_shape is not None and shape != self._vc_shape:
+                    from ....attention.backends.prims_ts.vc_attention.quantization import (
+                        VCAttentionPreprocessor,
+                    )
+
+                    self._vc_preprocessor = VCAttentionPreprocessor()
+                self._vc_shape = shape
+        return prepare_vc_operands(
+            q.view(batch_size, seq_len, self.num_heads, self.head_dim),
+            k.view(batch_size, kv_seq_len, self.num_kv_heads, self.head_dim),
+            v.view(batch_size, kv_seq_len, self.num_kv_heads, self.head_dim),
+            qk_fp8=quant_cfg.qk_dtype == "fp8",
+            repair_budget=quant_cfg.vc_repair_budget,
+            preprocessor=self._vc_preprocessor,
+            denoise_step=denoise_step,
+        )
+
     def should_use_sparse(self, sparse_attn_phase: Optional[int]) -> bool:
         """Return whether this layer runs its sparse path in ``sparse_attn_phase``.
 
@@ -295,6 +550,12 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     @torch.compiler.disable
     def _prepare_metadata(self, batch_size: int, seq_len: int):
         return self.metadata.prepare(batch_size, seq_len)
+
+    @torch.compiler.disable
+    def _prepare_kv_cache_metadata(
+        self, kv_cache: BlockCausalKVCacheManager, num_causal_blocks: int, causal_block_size: int
+    ):
+        return self.metadata.prepare_with_kv_cache(kv_cache, num_causal_blocks, causal_block_size)
 
     @torch.compile
     def _concat_qkv(
@@ -331,6 +592,37 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         v = v.reshape(batch_size * kv_seq_len, -1).contiguous()
         return q, k, v
 
+    @torch.compiler.disable
+    def _forward_padded_self_attention(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        valid_seq_len: int,
+        timestep: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Attend to one valid prefix shared by every batch row.
+
+        Ulysses still needs the padded output shape for its return collective.
+        The caller validates the prefix layout before passing its host length.
+        """
+        batch_size, seq_len = q.shape[:2]
+        if type(valid_seq_len) is not int or not 0 <= valid_seq_len <= seq_len:
+            raise ValueError("valid_seq_len must be a host integer in [0, sequence length].")
+        if valid_seq_len == seq_len:
+            return self.forward(q, k, v, batch_size, seq_len, timestep=timestep)
+        if valid_seq_len == 0:
+            return q.new_zeros((batch_size, seq_len, self.num_heads * self.head_dim))
+        output = self.forward(
+            q=q[:, :valid_seq_len].contiguous(),
+            k=k[:, :valid_seq_len].contiguous() if k is not None else None,
+            v=v[:, :valid_seq_len].contiguous() if v is not None else None,
+            batch_size=batch_size,
+            seq_len=valid_seq_len,
+            timestep=timestep,
+        )
+        return torch.nn.functional.pad(output, (0, 0, 0, seq_len - valid_seq_len))
+
     def forward(
         self,
         q: torch.Tensor,
@@ -342,6 +634,10 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         seq_len_kv: Optional[int] = None,
         sparse_backend_args: Optional[SparseBackendForwardArgs] = None,
         timestep: Optional[torch.Tensor] = None,
+        kv: Optional[ForwardPlan] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        discard_padded_queries: bool = False,
+        valid_seq_len: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -364,22 +660,52 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             k: Key tensor [B, S_kv, H_kv, D] or None if fused
             v: Value tensor [B, S_kv, H_kv, D] or None if fused
             batch_size: Batch size
-            seq_len: Sequence length for Q
+            seq_len: Query length ``S`` used for metadata and reshaping, padding included.
             attention_mask: Attention mask type
             seq_len_kv: Sequence length for K/V (for cross-attention, defaults to seq_len)
             sparse_backend_args: Module-predicted sparse inputs handed to the core
                 prediction hooks. A ``block_sparse_inputs`` payload selects the
                 generic block-sparse FMHA.
             timestep: Denoising timestep consumed by the sparse prediction hooks.
-            **kwargs: Backend-specific keyword arguments forwarded by the attention
-                module, such as ``key_padding_mask``; ignored here, as by the other
-                backends. The TRTLLM kernels have no key-padding input, so callers
-                that need padded keys must guard at the model level or select the
-                ``VANILLA`` backend.
+            kv: A ``ForwardPlan`` from a ``BlockCausalKVCacheManager``. When given,
+                ``k``/``v`` are the new tokens only: the fused kernel writes them at
+                ``staging_offset`` and attends over everything cached before them plus
+                themselves, full within a causal block and causal across causal blocks.
+                The first ``kv.num_tokens`` rows are real; rows past them are padding,
+                neither cached nor attended, and output zero. ``batch_size`` must be 1.
+                Sparse attention is not supported on this path.
+            key_padding_mask: Ignored, preserving legacy TRTLLM behavior. Callers
+                opting into prefix trimming must supply valid_seq_len instead.
+            discard_padded_queries: Opt in to valid-prefix dense self-attention.
+                Caller guarantees padded query rows are unused; their outputs
+                are zero-filled.
+            valid_seq_len: Host length of the contiguous valid prefix, identical
+                for every batch row, in the global sequence after Ulysses exchange.
+                Required when opting into padding. The caller must validate
+                trailing padding; arbitrary masks and unequal lengths are unsupported.
+            **kwargs: Additional backend-specific arguments.
 
         Returns:
             Output tensor [B, S, H*D]
         """
+        if discard_padded_queries and (valid_seq_len is not None or key_padding_mask is not None):
+            if (
+                kv is not None
+                or attention_mask != PredefinedAttentionMask.FULL
+                or seq_len_kv not in (None, seq_len)
+                or self.quant_attention_config is not None
+                or sparse_backend_args is not None
+                or self.sparse_params is not None
+            ):
+                raise ValueError(
+                    "TRTLLM padding requires dense self-attention with discarded padded queries."
+                )
+            return self._forward_padded_self_attention(q, k, v, valid_seq_len, timestep)
+        if kv is not None:
+            if sparse_backend_args is not None:
+                raise NotImplementedError("Sparse attention is not supported over a K/V cache.")
+            output = self._forward_with_kv_cache(q, k, v, batch_size, kv, attention_mask)
+            return output.view(1, q.shape[1], -1)
         sparse_attn_phase = self._sparse_attn_phase(timestep)
         block_sparse_inputs = (
             sparse_backend_args.block_sparse_inputs if sparse_backend_args is not None else None
@@ -398,12 +724,19 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
 
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
-        sage_kwargs = {}
+        quantization_kwargs = {}
         if use_separate_qkv:
             q, k, v = self._compact_qkv(q, k, v, batch_size, seq_len, kv_seq_len)
             quant_cfg = self.quant_attention_config
-            if quant_cfg is not None:
-                sage_kwargs = {
+            if quant_cfg is not None and quant_cfg.vc_attention:
+                quantization_kwargs = {
+                    "vc_attention": True,
+                    "vc_operands": self._vc_operands(
+                        q, k, v, batch_size, seq_len, kv_seq_len, timestep
+                    ),
+                }
+            elif quant_cfg is not None:
+                quantization_kwargs = {
                     "sage_attn_num_elts_per_blk_q": quant_cfg.q_block_size,
                     "sage_attn_num_elts_per_blk_k": quant_cfg.k_block_size,
                     "sage_attn_num_elts_per_blk_v": quant_cfg.v_block_size,
@@ -431,10 +764,106 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 timestep=timestep,
                 sparse_attn_phase=sparse_attn_phase,
                 sparse_backend_args=sparse_backend_args,
-                **sage_kwargs,
+                **quantization_kwargs,
             ),
         )
         return output.view(batch_size, seq_len, -1)
+
+    def _forward_with_kv_cache(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        batch_size: int,
+        plan: ForwardPlan,
+        attention_mask: PredefinedAttentionMask,
+    ) -> torch.Tensor:
+        """Attention over the plan's cache with its ``num_tokens`` real new tokens;
+        returns ``[S, H*D]`` with zero rows past them."""
+        plan.validate()
+        kv_cache = plan.cache
+        if not isinstance(kv_cache, BlockCausalKVCacheManager):
+            raise NotImplementedError(
+                f"{type(self).__name__} attends over a BlockCausalKVCacheManager only; got "
+                f"{type(kv_cache).__name__}"
+            )
+        if attention_mask != PredefinedAttentionMask.FULL:
+            raise NotImplementedError("K/V cache attention is full attention over the cache.")
+        if self.quant_attention_config is not None:
+            raise NotImplementedError("K/V cache attention does not combine with SageAttention.")
+        if self.sparse_params is not None:
+            raise NotImplementedError("K/V cache attention does not combine with sparse attention.")
+        packed = None
+        if k is None and v is None:
+            # ``q`` contains packed QKV [1, S, H + 2*H_kv, D]. The kernel takes it as
+            # it is and the cache takes strided K/V slices of it, so nothing is
+            # re-concatenated.
+            packed = q
+            kv_heads = kv_cache.num_kv_heads
+            q = packed[:, :, : self.num_heads]
+            k = packed[:, :, self.num_heads : self.num_heads + kv_heads]
+            v = packed[:, :, self.num_heads + kv_heads :]
+        elif k is None or v is None:
+            raise ValueError("K/V cache attention needs separate q, k, v, or one packed qkv.")
+        elif q.dim() == 4 and is_fused_qkv(q, k, v):
+            # q/k/v are slices of one qkv_proj output: hand the kernel that buffer.
+            packed = as_fused_qkv(q, k, v).view(q.shape[0], q.shape[1], -1, self.head_dim)
+        if not self.support_kv_cache_page_size(kv_cache.tokens_per_page, q.dtype):
+            raise NotImplementedError(
+                f"This build has no fused paged context attention kernel for "
+                f"{kv_cache.tokens_per_page}-token pages with head_dim {self.head_dim} and "
+                f"{q.dtype} on this GPU. Build the cache with a page size "
+                f"support_kv_cache_page_size() accepts, or use the CUDNN backend."
+            )
+        batch, num_rows, _, _ = q.shape
+        if batch != 1 or batch_size != 1 or k.shape[1] != num_rows:
+            raise ValueError(
+                "K/V cache attention takes one video: q, k, v of [1, S, heads, head_dim]."
+            )
+        if k.shape[2] != kv_cache.num_kv_heads:
+            raise ValueError(
+                f"k has {k.shape[2]} heads but the cache holds {kv_cache.num_kv_heads} per rank."
+            )
+        if q.shape[2:] != (self.num_heads, self.head_dim) or k.shape[3] != self.head_dim:
+            raise ValueError(
+                f"q is {tuple(q.shape)}, k is {tuple(k.shape)}; this backend was built for "
+                f"{self.num_heads} heads of {self.head_dim}"
+            )
+        num_tokens = plan.num_tokens
+        if num_tokens > num_rows:
+            raise ValueError(
+                f"the plan's {num_tokens} tokens exceed the {num_rows} rows: it counts the real "
+                "tokens; rows past it are padding."
+            )
+        if num_tokens < num_rows:
+            q, k, v = q[:, :num_tokens], k[:, :num_tokens], v[:, :num_tokens]
+            if packed is not None:
+                packed = packed[:, :num_tokens]
+        causal_block_size, num_causal_blocks = plan.causal_block_size, plan.num_causal_blocks
+        # The fused kernel writes each causal block's own tokens into its private pages;
+        # the shared pages, which later causal blocks and later forwards read, are
+        # staged here.
+        kv_cache.write_staged(self.layer_idx, k[0], v[0], causal_block_size, own_tokens=False)
+        metadata = self._prepare_kv_cache_metadata(kv_cache, num_causal_blocks, causal_block_size)
+        if packed is not None:
+            qkv = packed.reshape(num_tokens, -1)
+        else:
+            qkv = torch.cat(
+                [q.reshape(num_tokens, -1), k.reshape(num_tokens, -1), v.reshape(num_tokens, -1)],
+                dim=-1,
+            )
+        # FULL is intended: attention within a causal block is full. Causality across
+        # causal blocks and against history comes from each causal block's page list
+        # and key count.
+        output = super().forward(
+            q=qkv, k=None, v=None, metadata=metadata, attention_mask=PredefinedAttentionMask.FULL
+        )
+        if num_tokens == num_rows:
+            return output
+        full = output.new_empty(num_rows, output.shape[-1])
+        full[:num_tokens].copy_(output.view(num_tokens, -1))
+        full[num_tokens:].zero_()
+        return full
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:
@@ -444,3 +873,16 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     def support_fused_qkv(self) -> bool:
         """Standard path fuses QKV; SageAttention path does not."""
         return self.quant_attention_config is None
+
+    def support_kv_cache(self) -> bool:
+        return self.quant_attention_config is None and self.sparse_params is None
+
+    def support_kv_cache_page_size(
+        self, tokens_per_page: int, dtype: Optional[torch.dtype] = None
+    ) -> bool:
+        dtype = dtype or self._dtype
+        if dtype is None:
+            raise ValueError("support_kv_cache_page_size needs a dtype: the backend has none")
+        return _paged_context_kernel_exists(
+            self.head_dim, dtype, tokens_per_page, torch.cuda.current_device()
+        )
