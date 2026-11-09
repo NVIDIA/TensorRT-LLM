@@ -39,10 +39,11 @@ import torch
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
-from tensorrt_llm._torch.pyexecutor.h2d_cache import copy_h2d_if_changed
+from tensorrt_llm._torch.pyexecutor.h2d_cache import copy_h2d_if_changed, copy_h2d_pool_shared
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .common import (
@@ -111,9 +112,23 @@ def _host_prefix_sum(lens_cpu: torch.Tensor, dtype: torch.dtype) -> torch.Tensor
     return maybe_pin_memory(torch.cat([sums.new_zeros(1), sums]).to(dtype))
 
 
+# Kill switches for A/B only.
+# SUBPAGE_IN_GRAPH: the sub-page block table is expanded from msa_block_table on the device inside the forward, once,
+# by the first dense layer that reads it (msa_subpage_rows), so the block table can join the step-input pack and the
+# step boundary issues no expansion; False expands it in prepare() after an unpacked block-table upload, as before.
+SUBPAGE_IN_GRAPH = True
+# SKIP_UNCHANGED_BLOCK_TABLE: msa_block_table takes the H2D skip cache. Its only writer is prepare() through that cache
+# (the device and every captured graph only read it), so the shadow describes the device rows; False always uploads it.
+SKIP_UNCHANGED_BLOCK_TABLE = True
+# TAIL_FILL_IN_FORWARD: prepare() records where msa_out_cache_loc's live slots end and the forward invalidates the rest
+# (on_update_kv_lens, which opens every forward, so a captured forward fills its own tail at each replay) instead of an
+# eager fill between the decode graphs; False fills it in prepare() as before.
+TAIL_FILL_IN_FORWARD = True
+
+
 def _fill_unused_slots(buf: torch.Tensor, start: int) -> None:
-    """buf[start:] = -1 after a write of the live slots buf[:start] (see h2d_cache.fill_tail_if_changed)."""
-    h2d_cache.fill_tail_if_changed(buf, start, -1)
+    """buf[start:] = -1 after a write of the live slots buf[:start] (see h2d_cache.fill_tail_pool_shared)."""
+    h2d_cache.fill_tail_pool_shared(buf, start, -1)
 
 
 class MsaDecodeSpan(NamedTuple):
@@ -196,6 +211,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # factor, or 0 where the pool has no single one; see msa_subpage_rows.
     msa_subpage_block_table: Optional[torch.Tensor] = None
     _msa_subpages_per_slot: int = 0
+    # SUBPAGE_IN_GRAPH: the rows prepare() staged for the forward to expand (0: none), and whether this forward did.
+    _msa_subpage_rows: int = 0
+    _msa_subpage_expanded: bool = False
+    # TAIL_FILL_IN_FORWARD: the first msa_out_cache_loc row past this step's live slots (None: prepare() filled it).
+    _msa_tail_start: Optional[int] = None
     # Inputs for on_update_kv_lens: each query token's request row and offset
     # within the request, and the kv_lens prepare() staged (the upper bound the
     # correction is clamped to). The write slots are re-derived from
@@ -377,6 +397,15 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         table = self.msa_subpage_block_table
         if table is None:
             return None, 0
+        rows = self._msa_subpage_rows
+        if rows > 0 and not self._msa_subpage_expanded:
+            # Once per forward (on_update_kv_lens, which opens every forward, resets it), from the block table the
+            # pack landed, over the rows prepare() staged; a captured forward records it once, so every replay
+            # expands its own rows.
+            write_subpage_block_table(
+                self.msa_block_table[:rows], self._msa_subpages_per_slot, table[:rows]
+            )
+            self._msa_subpage_expanded = True
         return table[row_first:row_last], self._msa_subpages_per_slot
 
     def _msa_main_kv_is_fp8(self) -> bool:
@@ -713,9 +742,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         ar = torch.arange(topk, dtype=torch.int32)
         table = torch.where(ar[None, :] < n_valid.to(torch.int32)[:, None], ar[None, :], -1)
         table = table.unsqueeze(0).expand(num_kv_heads, total_q, topk).contiguous()
-        copy_h2d_if_changed(
-            self.msa_short_table[: table.numel()], maybe_pin_memory(table.flatten()), pack=True
-        )
+        # Uploaded every step, never skipped: the buffer is shared through the CUDA graph buffer pool, so the skip
+        # cache's host shadow is not proof of its device contents, and a stale table selects too few blocks.
+        step_inputs.copy_(self.msa_short_table[: table.numel()], maybe_pin_memory(table.flatten()))
         self._msa_short_ok = True
 
     def prepare(self) -> None:
@@ -889,6 +918,18 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             or (runtime_features is not None and runtime_features.has_speculative_draft_tokens)
         )
 
+    def _fill_tail_in_forward(self) -> None:
+        """TAIL_FILL_IN_FORWARD: -1 over msa_out_cache_loc past the live slots prepare() staged (see the prepare()
+        comment on padded rows), before anything in the forward reads it."""
+        start = self._msa_tail_start
+        buf = self.msa_out_cache_loc
+        if start is not None and buf is not None and start < buf.shape[0]:
+            logger.info_once(
+                "[M3 host] MSA out_cache_loc tail filled inside the forward",
+                key="msa_tail_fill_in_forward",
+            )
+            buf[start:].fill_(-1)
+
     def on_update_kv_lens(self) -> None:
         """Re-derive lengths, slots and valid-block counts from the corrected kv_lens_cuda.
 
@@ -908,6 +949,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         extend_ctx promotes speculative generation rows into the context prefix.
         Staged host bounds remain valid upper bounds as lengths shrink.
         """
+        # A new forward: the first dense layer that reads the sub-page table expands it again (msa_subpage_rows).
+        self._msa_subpage_expanded = False
+        self._fill_tail_in_forward()
         super().on_update_kv_lens()
         if not self._msa_fields_ready or not self._msa_kv_lens_dynamic:
             return
@@ -1134,6 +1178,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         decoding the inputs for on_update_kv_lens are staged as well.
         """
         self._msa_fields_ready = False
+        # Set again below once this step's live slots are staged; until then the forward fills nothing.
+        self._msa_tail_start = None
         if not self._msa_buffers_ready:
             return
         request_ids = self.request_ids
@@ -1211,7 +1257,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # would make its shape dynamic, and a negative slot is what makes those
         # rows cache-write no-ops instead. Invalidate the unwritten tail so they
         # cannot reuse the previous step's live slots, which address real pages.
-        _fill_unused_slots(self.msa_out_cache_loc, total_new_tokens)
+        if TAIL_FILL_IN_FORWARD:
+            self._msa_tail_start = total_new_tokens
+        else:
+            self._msa_tail_start = None
+            _fill_unused_slots(self.msa_out_cache_loc, total_new_tokens)
         if kv_indices is not None:
             step_inputs.copy_(self.msa_kv_indices[: int(kv_indices.shape[0])], kv_indices)
 
@@ -1219,12 +1269,22 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # from the same host block ids the flat page table was built from.
         # Columns past a request's page count are left stale rather than
         # cleared: every consumer bounds its walk by seq_lens.
-        block_table_changed = copy_h2d_if_changed(
-            self.msa_block_table[:batch_size, :block_table_cols],
-            maybe_pin_memory(block_ids_cpu.to(torch.int32)),
-            # write_subpage_block_table below reads it on the device before the replay.
-            pack=self.msa_subpage_block_table is None,
-        )
+        # With SUBPAGE_IN_GRAPH nothing reads the table on the device before the replay, so it can join the pack;
+        # the prepare-time expansion below reads it first.
+        block_table_host = maybe_pin_memory(block_ids_cpu.to(torch.int32))
+        pack_block_table = self.msa_subpage_block_table is None or SUBPAGE_IN_GRAPH
+        if SKIP_UNCHANGED_BLOCK_TABLE:
+            block_table_changed = copy_h2d_if_changed(
+                self.msa_block_table[:batch_size, :block_table_cols],
+                block_table_host,
+                pack=pack_block_table,
+            )
+        else:
+            block_table_changed = copy_h2d_pool_shared(
+                self.msa_block_table[:batch_size, :block_table_cols],
+                block_table_host,
+                pack=pack_block_table,
+            )
         # Packed only when the device scan below (h2d_cache off) does not read it before the replay.
         if h2d_cache.enabled():
             step_inputs.copy_(self.msa_seq_lens_cuda[:batch_size], kv_lens_cpu)
@@ -1236,8 +1296,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             if h2d_cache.enabled():
                 # Both prefix sums from the host lengths (the values the device scans would give), staged with
                 # their leading zero: copies instead of zero / scan kernels between the decode graphs.
-                copy_h2d_if_changed(qo_lens_cuda, qo_lens_cpu, pack=True)
-                copy_h2d_if_changed(
+                copy_h2d_pool_shared(qo_lens_cuda, qo_lens_cpu, pack=True)
+                copy_h2d_pool_shared(
                     self.msa_cu_q_lens[: batch_size + 1],
                     _host_prefix_sum(qo_lens_cpu, self.msa_cu_q_lens.dtype),
                     pack=True,
@@ -1295,7 +1355,14 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # Sub-page expansion for the trtllm-gen dense layers, staged once here
         # instead of once per layer, outside capture into a graph-stable
         # buffer as with the slot table above.
-        if self.msa_subpage_block_table is not None and block_table_changed:
+        # With SUBPAGE_IN_GRAPH the forward expands this step's rows instead (msa_subpage_rows).
+        self._msa_subpage_expanded = False
+        self._msa_subpage_rows = batch_size if SUBPAGE_IN_GRAPH else 0
+        if (
+            not SUBPAGE_IN_GRAPH
+            and self.msa_subpage_block_table is not None
+            and block_table_changed
+        ):
             write_subpage_block_table(
                 self.msa_block_table[:batch_size],
                 self._msa_subpages_per_slot,
@@ -1319,10 +1386,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             torch.arange(total_new_tokens, dtype=torch.int64)
             - torch.repeat_interleave(starts, qo_long)
         ).to(torch.int32)
-        copy_h2d_if_changed(
+        copy_h2d_pool_shared(
             self.msa_q_batch_row[:total_new_tokens], maybe_pin_memory(batch_row_cpu), pack=True
         )
-        copy_h2d_if_changed(
+        copy_h2d_pool_shared(
             self.msa_q_intra[:total_new_tokens], maybe_pin_memory(intra_cpu), pack=True
         )
         # The staged lens are the upper bound on_update_kv_lens clamps to: the

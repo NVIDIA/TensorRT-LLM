@@ -298,9 +298,22 @@ class RepositoryReferenceIndex:
                 # Without an AST, no binding can be excluded soundly.
                 module_references = names
             else:
-                module_references = self._references_from_module(
-                    parsed, target_module, names, star_imported_names
-                )
+                targets = {target_module}
+                # These source roots are placed on sys.path by the test harness.
+                for root in (
+                    "jenkins/scripts/cbts/",
+                    "tests/",
+                    "tests/unittest/",
+                    "tests/integration/",
+                    "tests/integration/defs/",
+                ):
+                    if defining_path.startswith(root):
+                        targets.add(target_module.removeprefix(root.replace("/", ".")))
+                module_references = set()
+                for target in targets:
+                    module_references.update(
+                        self._references_from_module(parsed, target, names, star_imported_names)
+                    )
             for name in module_references:
                 referenced.setdefault(name, set()).add(module.path)
         return referenced

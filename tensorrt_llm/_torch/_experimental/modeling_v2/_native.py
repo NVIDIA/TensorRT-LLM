@@ -14,7 +14,7 @@ the family. The API is four names:
 * :func:`load_family_ops` -- the family's shared ops, ``load_family_ops(__name__)``
   from any module of the family;
 * :func:`namespace_of` -- the torch namespace a ``fake_ops.py`` registers its fakes
-  in, ``namespace_of(__name__)``;
+  in, or any module of a target registers its ops in, ``namespace_of(__name__)``;
 * :class:`NativeLoadError` -- a library that is installed but broken.
 
 ``route`` imports a target only on the branch that returns it, so loading is part of
@@ -26,16 +26,18 @@ load, or lacks an op a ``fake_ops.py`` declares, is a :class:`NativeLoadError`,
 never a fallback. The family's ``fake_ops.py`` registers when the library opens, a
 target's when the target is found in it.
 
-The "Native code" section of the modeling_v2 README is the guide for authors.
+``cpp/tensorrt_llm/modeling_v2/README.md`` is the guide for authors.
 """
 
 from __future__ import annotations
 
+import ast
+import functools
 import importlib
 import importlib.util
 import re
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional
 
 from ._router_index import NoTarget
 
@@ -59,13 +61,16 @@ class NativeLoadError(RuntimeError):
 
 
 def namespace_of(module: str) -> str:
-    """The torch namespace of the ops a module's ``fake_ops.py`` fakes.
+    """The torch namespace of the ops ``module`` registers or fakes.
 
-    ``mv2_<family>_<target>`` for a module of a target package, ``mv2_<family>`` for
-    a module of the family itself (its shared ops). Target directories are named
-    ``<checkpoint>__<sm>__<parallel>``, so the module path tells the two apart.
+    ``mv2_<family>_<target>`` for a target package or any module in it, at any
+    depth; ``mv2_<family>`` for every other module of the family (its shared ops).
+    A target is a directory whose class the family's ``route`` returns.
     """
-    return _namespace(*_split(module))
+    parts = _parts(module)
+    if len(parts) > 1 and parts[1] in _routed_targets(parts[0]):
+        return _namespace(parts[0], parts[1])
+    return _namespace(parts[0])
 
 
 # --- Naming (mirrors cpp/cmake/modules/modeling_v2.cmake) --------------------
@@ -84,15 +89,54 @@ def _library_name(family: str) -> str:
     return f"libth_modeling_v2_{family}.so"
 
 
-def _split(module: str) -> Tuple[str, Optional[str]]:
-    """``(family, target)`` of a module under ``models.<family>``; ``target`` is None
-    for a module of the family itself."""
+def _parts(module: str) -> List[str]:
+    """The path of ``module`` below ``models``, family first."""
     prefix = f"{_MODELS_PACKAGE}."
     parts = module[len(prefix) :].split(".") if module.startswith(prefix) else []
     if not parts or not parts[0]:
         raise ValueError(f"{module!r} is not a module of a modeling_v2 family")
-    target = parts[1] if len(parts) > 1 and "__" in parts[1] else None
-    return parts[0], target
+    return parts
+
+
+@functools.lru_cache(maxsize=None)
+def _routed_targets(family: str) -> FrozenSet[str]:
+    """The directories ``models/<family>/routing.py`` returns target classes from.
+
+    Read from the source, without importing it: a ``return <Class>`` in a
+    ``@routes(...)`` function, where ``from .<directory>... import <Class>`` binds
+    ``<Class>``. CBTS and the CPU checks read targets the same way, in
+    ``jenkins/scripts/cbts/cbts/rules/modeling_v2_source.py``, which the wheel does
+    not carry; ``test_modeling_v2_native_loader.py`` checks that the two agree.
+    """
+    path = Path(__file__).resolve().parent / "models" / family / "routing.py"
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError):
+        return frozenset()
+    bound = {
+        alias.asname or alias.name: node.module.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module
+        for alias in node.names
+    }
+    routes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(
+            isinstance(d, ast.Call)
+            and getattr(d.func, "id", getattr(d.func, "attr", None)) == "routes"
+            for d in node.decorator_list
+        )
+    ]
+    return frozenset(
+        bound[node.value.id]
+        for function in routes
+        for node in ast.walk(function)
+        if isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in bound
+    )
 
 
 # --- Loading ------------------------------------------------------------------
@@ -143,13 +187,14 @@ def load_target_ops(package: str) -> Any:
     """Load the native code of the target package ``package`` and return its ops
     namespace, ``torch.ops.mv2_<family>_<target>``.
 
-    Call it from the target's ``__init__.py`` with ``__name__``. Raises
-    :class:`NoTarget` when this installation does not carry the target
+    Call it with the target package's name, ``__name__`` in its ``__init__.py``.
+    Raises :class:`NoTarget` when this installation does not carry the target
     and :class:`NativeLoadError` when its library is broken.
     """
-    family, target = _split(package)
-    if target is None or package != f"{_MODELS_PACKAGE}.{family}.{target}":
+    parts = _parts(package)
+    if len(parts) != 2:
         raise ValueError(f"{package!r} is not a models.<family>.<target> package")
+    family, target = parts
     built = _load_family_library(family)
     if target not in built:
         carried = ", ".join(sorted(built)) or "none"
@@ -175,7 +220,7 @@ def load_family_ops(module: str) -> Any:
     """
     ops = _family_ops.get(module)
     if ops is None:
-        family = _split(module)[0]
+        family = _parts(module)[0]
         _load_family_library(family)
         import torch
 

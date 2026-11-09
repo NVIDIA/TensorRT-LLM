@@ -710,25 +710,26 @@ class TrtllmModelingV2Workflow:
         marker = self._commit_marker(commits.pop(), reads)
         return (ident, marker) if marker else ("", "")
 
-    def _verdict_holds(self, verdict: contract_mod.Verdict) -> bool:
+    def _verdict_holds(self, verdict: contract_mod.Verdict, workspace: Path | None = None) -> bool:
         """Whether ``verdict`` holds on the target as it is.
 
         What it read of the tree is unchanged: its narrowed marker (:meth:`_commit_marker`
-        with ``reads``) on the checkout's ``HEAD`` is the one it recorded. Asked once per head
-        and list.
+        with ``reads``) on the checkout's ``HEAD`` is the one it recorded. ``workspace``
+        holds the verdict's list of what it read: this run's by default, or the run that
+        recorded it. Asked once per head, list, workspace and native build: a rebuild changes
+        the marker without a commit.
         """
         head = self._head()
         if not head or not verdict.reads or not verdict.reads_marker:
             return False
-        key = (head, verdict.reads)
+        repo = str(self.task_data.get("trtllm_repo_path") or "")
+        lists = (workspace or self.workspace) / READS_DIRNAME
+        libraries = tuple(native_libraries(Path(repo))) if repo else ()
+        key = (head, verdict.reads, str(lists), libraries)
         cache = self.__dict__.setdefault("_narrowed_now", {})
         if key not in cache:
             try:
-                reads = json.loads(
-                    (self.workspace / READS_DIRNAME / f"{verdict.reads}.json").read_text(
-                        encoding="utf-8"
-                    )
-                )
+                reads = json.loads((lists / f"{verdict.reads}.json").read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 reads = None
             if len(cache) > 256:

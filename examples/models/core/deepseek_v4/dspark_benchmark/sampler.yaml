@@ -1,0 +1,4 @@
+temperature: 0.0
+top_k: 1
+ignore_eos: false
+detokenize: false

@@ -22,7 +22,6 @@
 #include "tensorrt_llm/kernels/dwdpFabricGatherTma.h"
 
 #include <cstdlib>
-#include <cstring>
 #include <cuda_runtime.h>
 #include <mutex>
 
@@ -100,25 +99,14 @@ int gatherClusterSize()
     }();
     return size;
 }
-
-//! TRTLLM_DWDP_GATHER_KERNEL=tma selects the shared-memory-staged bulk-copy kernel (dwdpFabricGatherTma.cu).
-bool gatherUsesTma()
-{
-    static bool const tma = []
-    {
-        char const* env = std::getenv("TRTLLM_DWDP_GATHER_KERNEL");
-        return env != nullptr && std::strcmp(env, "tma") == 0;
-    }();
-    return tma;
-}
 } // namespace
 
 void invokeDwdpFabricGather(void* const* dsts, void const* const* srcs, int64_t const* lines, int64_t const* rowStarts,
-    int64_t rows, int64_t blocksPerRow, int64_t threads, cudaStream_t stream)
+    int64_t rows, int64_t blocksPerRow, int64_t threads, bool useTma, cudaStream_t stream)
 {
     int dev = 0;
     TLLM_CUDA_CHECK(cudaGetDevice(&dev));
-    if (gatherUsesTma())
+    if (useTma)
     {
         if (dwdpFabricGatherTmaSupported(dev))
         {
@@ -130,7 +118,7 @@ void invokeDwdpFabricGather(void* const* dsts, void const* const* srcs, int64_t 
             [dev]
             {
                 TLLM_LOG_WARNING(
-                    "dwdp_fabric_gather: TRTLLM_DWDP_GATHER_KERNEL=tma needs SM90+ and enough opt-in shared memory; "
+                    "dwdp_fabric_gather: the tma kernel needs SM90+ and enough opt-in shared memory; "
                     "using the register gather on device %d",
                     dev);
             });
