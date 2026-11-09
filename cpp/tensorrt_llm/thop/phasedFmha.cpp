@@ -461,8 +461,7 @@ bool isTrtllmGenContextSupported(TllmGenFmhaRunner const& runner, MHARunnerFixed
     auto qkvLayout = AttentionInputLayoutToQkvLayout(fixedParams.attentionInputLayout);
     // Create TllmGenFmhaRunnerParams based on MHARunnerFixedParams. Only fill necessary
     // attributes for kernel selection.
-    TllmGenFmhaRunnerParams tllmRunnerParams;
-    memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
+    TllmGenFmhaRunnerParams tllmRunnerParams{};
     tllmRunnerParams.mQkvLayout = qkvLayout;
     // A size of 1 becomes the (0, 0) inclusive sliding-window probe after converting size to reach.
     int32_t const probeSlidingWindowSize
@@ -827,8 +826,7 @@ void TrtllmGenFmha<AttentionVariant>::initGeneration(AttentionVariant const& op)
 
         // Probe for a kernel; the launch uses the real sizes.
         bool const isSpecDecoding = op.is_spec_decoding_enabled;
-        TllmGenFmhaRunnerParams tllmRunnerParams;
-        memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
+        TllmGenFmhaRunnerParams tllmRunnerParams{};
         tllmRunnerParams.mQkvLayout = QkvLayout::PagedKv;
         tllmRunnerParams.mMaskType
             = isSpecDecoding ? TrtllmGenAttentionMaskType::Custom : TrtllmGenAttentionMaskType::Causal;
@@ -934,8 +932,7 @@ void TrtllmGenFmha<AttentionVariant>::launchContext(MHARunnerParams const& runne
         qkvLayout = kernels::QkvLayout::SeparateQkv;
     }
 
-    TllmGenFmhaRunnerParams tllmRunnerParams;
-    memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
+    TllmGenFmhaRunnerParams tllmRunnerParams{};
 
     // Parameters to select kernels.
     tllmRunnerParams.mQkvLayout = qkvLayout;
@@ -1155,8 +1152,7 @@ void TrtllmGenFmha<MHA>::runGenerationImpl(MHA const& op, FmhaParams const& p, c
     // IDEA: Store rotary_processed Q buffer to output buffer.
     // NOTE: MHA kernels should read kv cache that has already been appended with new tokens' kv cache.
     // The preprocessing kernel that applies RoPE and updates kv cache.
-    QKVPreprocessingParams<T, KVBlockArray> preprocessingParms;
-    memset(&preprocessingParms, 0, sizeof(preprocessingParms));
+    QKVPreprocessingParams<T, KVBlockArray> preprocessingParms{};
     preprocessingParms.qkv_input = p.getQueryInput<T>();
     preprocessingParms.q_output = static_cast<T*>(xqa_q_input_ptr);
     preprocessingParms.kv_cache_buffer = kv_cache_buffer;
@@ -1223,8 +1219,7 @@ void TrtllmGenFmha<MHA>::runGenerationImpl(MHA const& op, FmhaParams const& p, c
     sync_check_cuda_error(stream);
 
     // Build runner parameters.
-    TllmGenFmhaRunnerParams tllmRunnerParams;
-    memset(&tllmRunnerParams, 0, sizeof(tllmRunnerParams));
+    TllmGenFmhaRunnerParams tllmRunnerParams{};
 
     // Parameters to select kernels.
     tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
