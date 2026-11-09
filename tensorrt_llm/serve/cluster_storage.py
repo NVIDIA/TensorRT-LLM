@@ -639,15 +639,19 @@ class Etcd3WatchEventQueue(WatchEventQueue):
         self._queue(events)
 
     def resync(self, records: Dict[str, str]) -> None:
-        """Queue the changes from what the consumer has seen to ``records``, the current records."""
+        """Queue the changes from what the consumer has seen to ``records``, the current records.
+
+        Removals come first: when a worker came back on the same address under a new key, a
+        consumer that keys workers by address then removes the old record before adding the new.
+        """
         events = [
-            WatchEvent(storage_item=StorageItem(key=key, value=value),
-                       event_type=WatchEventType.SET)
-            for key, value in records.items()
-        ] + [
             WatchEvent(storage_item=StorageItem(key=key),
                        event_type=WatchEventType.DELETE)
             for key in self._values if key not in records
+        ] + [
+            WatchEvent(storage_item=StorageItem(key=key, value=value),
+                       event_type=WatchEventType.SET)
+            for key, value in records.items()
         ]
         self._queue(events)
 

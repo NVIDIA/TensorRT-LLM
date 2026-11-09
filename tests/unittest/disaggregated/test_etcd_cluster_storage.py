@@ -396,7 +396,8 @@ async def test_watch_continues_on_a_new_stream_with_the_changes_made_meanwhile(s
     client.send(PREFIX, *(PutEvent(f"{PREFIX}/{n}", client.data[f"{PREFIX}/{n}"]) for n in "abc"))
     assert len(await asyncio.wait_for(handle.drain(), 1)) == 3
 
-    # While the stream is down: b is removed, c changes, d is added.
+    # While the stream is down: b is removed, c changes, d is added (for example, b's worker
+    # came back on the same address under the new key d).
     del client.data[f"{PREFIX}/b"]
     await storage.set(f"{PREFIX}/c", "value-c2", overwrite_if_exists=True)
     await storage.set(f"{PREFIX}/d", "value-d")
@@ -404,10 +405,11 @@ async def test_watch_continues_on_a_new_stream_with_the_changes_made_meanwhile(s
     await asyncio.sleep(0)
     await asyncio.wait_for(handle.restart_task, 1)
 
+    # Removals come first, so a consumer that keys workers by address drops b before adding d.
     assert _changes(await asyncio.wait_for(handle.drain(), 1)) == [
+        ("DELETE", f"{PREFIX}/b", ""),
         ("SET", f"{PREFIX}/c", "value-c2"),
         ("SET", f"{PREFIX}/d", "value-d"),
-        ("DELETE", f"{PREFIX}/b", ""),
     ]
     # Events of the ended stream are ignored; the new stream fills the queue.
     late = {"value": "late", "signature": sign_record(RECORD_KEY, f"{PREFIX}/e", "late")}
