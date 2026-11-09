@@ -1506,8 +1506,19 @@ def collect_status(item: pytest.Item):
     except Exception:
         gpu_memory = get_gpu_memory_wo_pynvml()
 
-    print("\nCurrent memory status:")
-    print(gpu_memory)
+    # Keep command-line payloads (e.g. python -c scripts) out of routine CI logs.
+    summary = ", ".join(f"GPU{idx}={info['total_used']}/{info['total']}"
+                        for idx, info in sorted(gpu_memory.items()))
+    lines = [f"\nGPU memory after {item.name} (used/total MiB): {summary}"]
+    if any(info["process"] for info in gpu_memory.values()):
+        lines.append("GPU  PID      Program       GPU MiB  Host USS MiB")
+    for idx, info in sorted(gpu_memory.items()):
+        for pid, values in sorted(info["process"].items()):
+            gpu_mib, host_mib, cmdline = values
+            program = os.path.basename(cmdline[0]) if cmdline else "<unknown>"
+            lines.append(f"{idx:<4} {pid:<8} {program:<13} "
+                         f"{gpu_mib:>7}  {host_mib:>12}")
+    print("\n".join(lines))
 
 
 @pytest.hookimpl(wrapper=True)

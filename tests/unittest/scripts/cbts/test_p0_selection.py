@@ -83,7 +83,9 @@ def _formatting_pr(tmp_path: Path, path: str = "tensorrt_llm/example.py") -> PRI
     "path",
     ["tensorrt_llm/example.py", "tensorrt_llm/visual_gen/args.py", "tests/unittest/example.py"],
 )
-def test_formatting_bypasses_source_rules_and_keeps_cpu_baseline(tmp_path: Path, path: str) -> None:
+def test_formatting_bypasses_source_rules_without_adding_cpu_tests(
+    tmp_path: Path, path: str
+) -> None:
     pr = _formatting_pr(tmp_path, path)
     assert pr.formatting_only_files == {path}
     result = CliRunner().invoke(
@@ -101,8 +103,7 @@ def test_formatting_bypasses_source_rules_and_keeps_cpu_baseline(tmp_path: Path,
     assert result.exit_code == 0, result.output
     decision = json.loads(result.stdout)
     assert decision["scope"] == "noop"
-    assert decision["affected_stages"]
-    assert all(name.startswith("CPU-Generic-") for name in decision["affected_stages"])
+    assert decision["affected_stages"] == []
     assert not decision["sanity_required"]
     assert not decision["perfsanity_required"]
 

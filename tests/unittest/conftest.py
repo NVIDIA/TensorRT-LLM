@@ -86,6 +86,8 @@ def pytest_configure(config):
         periodic_batch_size = config.getoption("--periodic-batch-size")
         periodic_save_unfinished_test = config.getoption(
             "--periodic-save-unfinished-test", default=False)
+        periodic_unfinished_test_path = config.getoption(
+            "--periodic-unfinished-test-path", default=None)
         periodic_hang_traceback = config.getoption("--periodic-hang-traceback",
                                                    default=False)
         xml_dir = os.path.dirname(periodic_junit_xmlpath)
@@ -100,6 +102,7 @@ def pytest_configure(config):
                 'warning': print_warning
             },
             save_unfinished_test=periodic_save_unfinished_test,
+            unfinished_test_path=periodic_unfinished_test_path,
             dump_hang_traceback=periodic_hang_traceback,
         )
         config.pluginmanager.register(reporter, 'periodic_junit')
@@ -257,6 +260,13 @@ def pytest_addoption(parser):
         default=False,
         help=
         "Save unfinished test name to unfinished_test.txt. Only used with --periodic-junit.",
+    )
+    parser.addoption(
+        "--periodic-unfinished-test-path",
+        action="store",
+        default=None,
+        help="Override the unfinished_test.txt location (default: alongside "
+        "--periodic-junit-xmlpath). Only used with --periodic-save-unfinished-test.",
     )
     parser.addoption(
         "--periodic-hang-traceback",
