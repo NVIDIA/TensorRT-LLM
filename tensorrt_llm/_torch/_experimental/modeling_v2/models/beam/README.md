@@ -23,6 +23,31 @@ Beam-only operators live under `ops/`, with tests in the matching Beam test tree
 Component-specific cases for shared catalog operators reuse the catalog test drivers,
 including TP1 shapes and the per-rank TP4 projection, attention and expert shapes.
 
+## Direct component use
+
+The component classes are experimental Python building blocks for isolating a
+checkpoint-loading, routing, attention or cache-lifecycle problem without constructing
+the serving engine. A caller supplies the configuration, weights and prepared metadata;
+they do not download checkpoints or provide a server. Their precision/architecture/TP
+suffixes describe the component contract, not registration in the model router.
+
+| Component | Direct-call purpose |
+| --- | --- |
+| Router and expert | Inspect selection or one expert independently of the full MoE block. |
+| Dense, MoE and sparse blocks | Compare one block and its captured intermediates against its declared operator contract. |
+| Six-layer BF16 model | Exercise mixed attention, cached prefill/decode and prefix reuse with the component generator. The `small_model_prefill` package includes decoding. |
+| Full-depth NVFP4 component | Load rank-local checkpoint slices and run the 52-layer computation through a separately supplied engine adapter. BF16 base modules define the shared non-expert computation and loading transaction. |
+
+Capture dictionaries and `layer_capture` callbacks are opt-in debugging interfaces;
+they retain detached copies of intermediate tensors and are not enabled by default.
+The component generator is a debugging controller, not an alternative public serving
+entry point. End users should use a registered `LLM()` or `trtllm-serve` integration.
+
+The eager dispatch helper preserves ascending-expert accumulation and BF16 rounding
+of every weighted route. Grouped/fused expert execution and changes to projection or
+position-transform scheduling require their own numerical and performance validation;
+component certification alone does not establish equivalence for those optimizations.
+
 ## Component comparison limits
 
 The TP1 block components are directly constructed bring-up/debugging building blocks,
