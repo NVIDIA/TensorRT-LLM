@@ -1072,14 +1072,12 @@ def test_preallocation_uses_metadata_without_dummy_storage(monkeypatch, configur
 
     input_tensor = torch.ones((3, 8), dtype=torch.float32)
     calls = []
-    monkeypatch.setattr(AllReduceRunner, "_prealloc_done", set())
 
     def prepare(*args):
         calls.append(args)
         return len(calls) > 1
 
     monkeypatch.setattr(torch.ops.trtllm.preallocate_nccl_window_buffer, "bytes", prepare)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
     def reject_dummy_allocation(*args, **kwargs):
         pytest.fail("Preallocation must not allocate a dummy tensor")
@@ -1087,13 +1085,12 @@ def test_preallocation_uses_metadata_without_dummy_storage(monkeypatch, configur
     monkeypatch.setattr(torch, "empty", reject_dummy_allocation)
     metadata = dict(max_num_tokens=16, hidden_size=8, dtype=torch.float16) if configured else {}
     expected_bytes = 2 * 16 * 8 * 2 if configured else 3 * 8 * 4
-    cache_key = ((0, 1), input_tensor.device, expected_bytes)
-    for expected_calls, expected_cache in ((1, set()), (2, {cache_key}), (2, {cache_key})):
+    # Retry failed preparation and recheck availability after successful preparation.
+    for expected_calls in (1, 2, 3):
         AllReduceRunner._maybe_preallocate_buffers(
             input_tensor, [0, 1], do_preparation=True, **metadata
         )
         assert len(calls) == expected_calls
-        assert AllReduceRunner._prealloc_done == expected_cache
     for call in calls:
         assert call[0] is input_tensor
         assert call[1:] == ([0, 1], 2, expected_bytes)
@@ -1106,18 +1103,18 @@ def test_preallocation_uses_metadata_without_dummy_storage(monkeypatch, configur
     AllReduceRunner._maybe_preallocate_buffers(
         input_tensor, [0, 1], do_preparation=True, **metadata
     )
-    assert len(calls) == 3
-    assert calls[2][3] == 2 * expected_bytes
+    assert len(calls) == 4
+    assert calls[3][3] == 2 * expected_bytes
 
 
-def test_preallocation_during_capture_does_not_cache(monkeypatch):
+@pytest.mark.parametrize("is_capturing", [False, True])
+def test_preallocation_rechecks_native_buffers(monkeypatch, is_capturing):
     from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
 
     with FakeTensorMode():
         input_tensor = torch.ones((3, 8), dtype=torch.float32, device="cuda:0")
     calls = []
-    monkeypatch.setattr(AllReduceRunner, "_prealloc_done", set())
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: is_capturing)
 
     def prepare(*args):
         calls.append(args)
@@ -1127,7 +1124,6 @@ def test_preallocation_during_capture_does_not_cache(monkeypatch):
     for expected_calls in (1, 2):
         AllReduceRunner._maybe_preallocate_buffers(input_tensor, [0, 1], do_preparation=True)
         assert len(calls) == expected_calls
-        assert not AllReduceRunner._prealloc_done
     for call in calls:
         assert call[0] is input_tensor
         assert call[1:] == ([0, 1], 2, 3 * 8 * 4)

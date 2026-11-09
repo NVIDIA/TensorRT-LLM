@@ -2717,7 +2717,6 @@ _AR_TUNE_NCCL_SYMMETRIC_LOGGED = False
 
 class AllReduceRunner(TunableRunner):
     _prealloc_lock: ClassVar[threading.Lock] = threading.Lock()
-    _prealloc_done: ClassVar[set] = set()
     # Set from AllReduce.__init__ via extra_attrs when the model is built.
     _prealloc_max_num_tokens: ClassVar[Optional[int]] = None
     _prealloc_hidden_size: ClassVar[Optional[int]] = None
@@ -2794,20 +2793,13 @@ class AllReduceRunner(TunableRunner):
             buffer_size = input_tensor.numel() * input_tensor.element_size()
         if buffer_size <= 0:
             return
-        is_capturing = (input_tensor.is_cuda
-                        and torch.cuda.is_current_stream_capturing())
-        cache_key = (tuple(group), input_tensor.device, buffer_size)
         with cls._prealloc_lock:
-            if not is_capturing and cache_key in cls._prealloc_done:
-                return
             logger.debug(
                 "[tunable_allreduce] Pre-allocating NCCL window buffers: "
                 "bytes=%d group=%s", buffer_size, list(group))
-            prepared = preallocate(input_tensor, group, 2, buffer_size)
-            # Capture buffers belong to one graph pool and do not satisfy eager
-            # preparation or preparation for another graph pool.
-            if prepared and not is_capturing:
-                cls._prealloc_done.add(cache_key)
+            # The native allocator reuses eligible buffers and replenishes those
+            # claimed by another graph pool. Prior success does not imply availability.
+            preallocate(input_tensor, group, 2, buffer_size)
 
     def get_valid_tactics(
         self,
