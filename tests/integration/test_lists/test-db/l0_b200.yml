@@ -646,6 +646,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_lpips_against_golden[bf16]
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_lpips_against_golden[fp8]
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_lpips_against_golden[nvfp4]
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_two_stage_lpips_against_golden
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_retake_lpips_against_golden[bf16]
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_retake_lpips_against_golden[fp8]
   - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_retake_lpips_against_golden[nvfp4]

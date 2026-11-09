@@ -21,6 +21,7 @@ LTX23_TEXT_ENCODER_PATH, and LTX23_GOLDEN_DIR.
 """
 
 import os
+from unittest.mock import patch
 
 import librosa
 import numpy as np
@@ -192,6 +193,7 @@ def _save_ltx23_retake_audio(
 
 def _generate_ltx23_av(rank, world_size, *, video_out_path, audio_out_path, config_name):
     """Render a configured golden-test candidate; only rank zero writes media."""
+    from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2_FORCE_ONE_STAGE_ENV
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.visual_gen.args import VisualGenArgs
 
@@ -199,7 +201,12 @@ def _generate_ltx23_av(rank, world_size, *, video_out_path, audio_out_path, conf
     _require_exists(model_path, "LTX-2.3 dev checkpoint")
     _require_exists(text_encoder_path, "LTX-2.3 text encoder (Gemma QAT-unquantized)", is_dir=True)
 
-    with _lpips_deterministic_algorithms():
+    two_stage = config_name == "two-stage-bf16-1gpu"
+    config_name = config_name.removeprefix("two-stage-")
+    with (
+        _lpips_deterministic_algorithms(),
+        patch.dict(os.environ, {LTX2_FORCE_ONE_STAGE_ENV: "0" if two_stage else "1"}),
+    ):
         config_path = os.path.join(
             REPO_ROOT, "examples", "visual_gen", "configs", f"ltx23-t2v-{config_name}.yaml"
         )
@@ -214,6 +221,11 @@ def _generate_ltx23_av(rank, world_size, *, video_out_path, audio_out_path, conf
         args.compilation_config.num_frames = [LTX23_LPIPS_NUM_FRAMES]
         pipeline = PipelineLoader(args, device=f"cuda:{rank}").load()
         try:
+            from tensorrt_llm._torch.visual_gen.models.ltx23.pipeline_ltx23_two_stages import (
+                LTX23TwoStagesPipeline,
+            )
+
+            assert isinstance(pipeline, LTX23TwoStagesPipeline) is two_stage
             with torch.no_grad():
                 out = pipeline.forward(
                     prompt=LTX23_LPIPS_PROMPT,
@@ -296,6 +308,75 @@ def test_ltx23_lpips_against_golden(request, tmp_path, ltx23_av_candidate):
     assert distance < LTX23_AUDIO_LOG_STFT_THRESHOLD, (
         f"LTX-2.3 audio log-STFT too high: {distance:.6f} "
         f"(expected < {LTX23_AUDIO_LOG_STFT_THRESHOLD:.6f})"
+    )
+
+
+@pytest.fixture(scope="session")
+def ltx23_two_stage_candidate(llm_venv, _visual_gen_deps):
+    """Render BF16 two-stage generation for golden comparison."""
+    from defs.examples.visual_gen.test_visual_gen_multi_gpu import run_test_in_distributed
+
+    _ltx23_required_gpus("two-stage-bf16-1gpu")
+    video_path = _visual_gen_output_path(llm_venv, "ltx23_two_stage_bf16")
+    audio_path = os.path.join(os.path.dirname(video_path), "ltx23_two_stage_candidate_audio.wav")
+    with _lpips_deterministic_algorithms():
+        run_test_in_distributed(
+            1,
+            _generate_ltx23_av,
+            video_out_path=video_path,
+            audio_out_path=audio_path,
+            config_name="two-stage-bf16-1gpu",
+        )
+    return video_path, audio_path
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_ltx23_two_stage_lpips_against_golden(
+    request, tmp_path, ltx23_two_stage_candidate, _visual_gen_lpips_scorer
+):
+    """Full-model 8-step CFG + three LoRA steps, vs a separate official reference."""
+    import av
+
+    video_reference = _ltx23_golden_media_path(
+        tmp_path,
+        "ltx23_two_stage_generation_lpips_golden_video.mp4",
+        "LTX-2.3 two-stage official golden video",
+    )
+    audio_reference = _ltx23_golden_media_path(
+        tmp_path,
+        "ltx23_two_stage_generation_lpips_golden_audio.wav",
+        "LTX-2.3 two-stage official golden audio",
+    )
+    video_path, audio_path = ltx23_two_stage_candidate
+    for path in (video_path, video_reference):
+        with av.open(path) as container:
+            assert container.streams.video[0].average_rate == 24
+            frames = list(container.decode(video=0))
+        assert len(frames) == LTX23_LPIPS_NUM_FRAMES
+        assert all(
+            (frame.height, frame.width) == (LTX23_LPIPS_HEIGHT, LTX23_LPIPS_WIDTH)
+            for frame in frames
+        )
+    info, reference_info = sf.info(audio_path), sf.info(audio_reference)
+    assert info.samplerate == reference_info.samplerate == 48000
+    assert info.channels == reference_info.channels == 1
+    assert info.subtype == reference_info.subtype == "PCM_16"
+    assert info.frames == reference_info.frames == 96480
+    score = _run_reusable_video_lpips_eval(
+        "ltx23-two-stage-bf16",
+        video_reference,
+        video_path,
+        _visual_gen_lpips_scorer,
+    )
+    distance = _audio_log_stft_distance(audio_path, audio_reference)
+    threshold = 0.15
+    _preserve_lpips_candidate_on_failure(
+        request, score, threshold, video_path, "ltx23_two_stage_bf16_generated.mp4"
+    )
+    _assert_lpips_below_threshold(score, threshold)
+    assert distance < LTX23_AUDIO_LOG_STFT_THRESHOLD, (
+        f"LTX-2.3 two-stage audio log-STFT: {distance:.6f}, "
+        f"expected < {LTX23_AUDIO_LOG_STFT_THRESHOLD:.6f}; candidate: {audio_path}"
     )
 
 
