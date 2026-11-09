@@ -408,6 +408,10 @@ class TuneRequests:
             "workspace says where the engine's backends, ops and kernels are): what the same op shapes "
             "gained in other models, and this model's own in-tree implementation.",
             "- Profiles of the current best tree: the latest `roadmap*.yaml` evidence in the campaign workdir.",
+            f"- Serving configs the tree ships for similar deployments (config database, perf-sanity): "
+            f"`trtllm-modeling-v2 wiki --repo {s.repo} --pack {s.workdir / 'wiki'} recipe <model words> "
+            "--gpu <GPU> --concurrency <c>`. A perf config far from them (batch, CUDA-graph sizes, "
+            "parallel layout, speculation) is a finding for the roadmap's notes, not a lever to pull.",
         ]
         return "\n".join(lines)
 

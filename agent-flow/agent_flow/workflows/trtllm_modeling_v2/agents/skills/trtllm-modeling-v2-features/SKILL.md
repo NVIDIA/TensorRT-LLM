@@ -24,7 +24,10 @@ hard-linked library is not updated by relinking the build output alone.
 Paths here are where things were when this was written; the code moves, and
 what it defines moves with it. Every path sits next to a symbol (a class,
 function, flag or test name): when the path is missing, `git grep -n` the
-symbol and use where it is now. `tree_map.md` in the run's workspace says where
+symbol and use where it is now. `trtllm-modeling-v2 wiki --workspace <ws>
+feature <name>` lists, for the checkout under test, the feature's fields with
+their defaults, the tests that use them and the CI lists that run those
+tests, and the ModelingV2 code that touches it. `tree_map.md` in the run's workspace says where
 the backends, accuracy and perf tests and CI test lists are in the checkout
 under test. Where the tree disagrees with this skill, the tree wins.
 

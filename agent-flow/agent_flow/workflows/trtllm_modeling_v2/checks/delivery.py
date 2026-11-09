@@ -20,6 +20,8 @@ from typing import Iterable, Sequence
 
 import yaml
 
+from agent_flow.trtllm_wiki import tests as wiki_tests
+
 from ..infra.git import (
     DEFAULT_BASE_REFS,
     CommitPolicy,
@@ -656,21 +658,24 @@ def check_test_registration(repo_root: Path, accuracy_test: str) -> list[Check]:
             detail=str(test_path) if test_path.is_file() else f"missing: {test_path}",
         )
     ]
-    db = repo_root / TEST_DB_DIR
-    stem = Path(accuracy_test).stem
-    listed: list[str] = []
-    if db.is_dir():
-        for yml in sorted(db.glob("*.yml")):
-            if stem in yml.read_text(encoding="utf-8"):
-                listed.append(yml.name)
+    # An entry runs the file when it names the file, one of its tests, or a directory above it
+    # that does not --ignore it.
+    rel = f"{ACCURACY_TESTS_DIR}/{accuracy_test}"
+    listed = sorted(
+        {
+            entry["list"]
+            for entry in wiki_tests.extract_test_lists(repo_root)
+            if entry["kind"] == "l0" and wiki_tests.lists(entry["path"], "", rel, entry["ignore"])
+        }
+    )
     checks.append(
         Check(
             name="tests:test-db",
             passed=bool(listed),
             detail=(
-                f"{stem} is listed in {', '.join(listed)}"
+                f"{accuracy_test} is listed in {', '.join(listed)}"
                 if listed
-                else f"{stem} appears in no {TEST_DB_DIR}/*.yml; CI would never run it"
+                else f"{accuracy_test} is in no {TEST_DB_DIR}/*.yml list; CI would never run it"
             ),
         )
     )

@@ -213,6 +213,11 @@ def test_core_keeps_reuse_and_chunking_off_and_each_named_one_is_its_own_variant
     assert core["enable_chunked_prefill"] is False and "max_num_tokens" not in core
     variants = spec["variants"]
     assert set(variants) == {"kv_fp8", "chunked", "reuse"}
+    # A spec written without a runtime block keeps them off in core as well.
+    hand = tmp_path / "hand"
+    hand.mkdir()
+    written = load_and_validate_task_yaml(_write(hand, _valid_spec(hand)))
+    assert not written["runtime"]["kv_cache_reuse"] and not written["runtime"]["chunked_prefill"]
     assert variants["chunked"]["llm_api_options"] == {
         "enable_chunked_prefill": True,
         "max_num_tokens": 256,

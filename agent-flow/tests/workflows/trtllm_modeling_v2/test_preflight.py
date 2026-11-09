@@ -18,6 +18,7 @@ import pytest
 from agent_flow.workflows.trtllm_modeling_v2.checks.verdict import GateResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import tree_anchors
+from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import MODELING_V2_PACKAGE
 from agent_flow.workflows.trtllm_modeling_v2.operators.inventory import (
     PROBE_SOURCE,
     RECEIPT_PASSED,
@@ -88,6 +89,53 @@ def test_run_preflight_resolves_identity(tmp_path):
     assert result.devices == (0, 1, 2, 3)
     assert result.world_size == 4
     assert result.checkpoint_config["architectures"] == ["Qwen3MoeForCausalLM"]
+
+
+def test_an_option_the_checkouts_llm_api_lacks_is_refused_with_the_closest_field(tmp_path):
+    task = _task(tmp_path)
+    options = tmp_path / "core.llm_api.yaml"
+    options.write_text("kv_cache_config:\n  enable_blok_reuse: false\n", encoding="utf-8")
+    task["accuracy"] = {"benchmark": "gsm8k", "llm_api_options": {"core": str(options)}}
+    assert "unchecked" in preflight.check_llm_api_fields(task)[0]
+    schema = {
+        "properties": {"kv_cache_config": {"$ref": "#/$defs/Kv"}},
+        "$defs": {"Kv": {"properties": {"enable_block_reuse": {"type": "boolean"}}}},
+    }
+    target = tmp_path / "tensorrt_llm" / "schemas" / "trtllm-serve-config.schema.json"
+    target.parent.mkdir(parents=True)
+    target.write_text(json.dumps(schema), encoding="utf-8")
+    with pytest.raises(
+        preflight.UnknownLlmApiFieldError, match="did you mean `kv_cache_config.enable_block_reuse`"
+    ):
+        preflight.check_llm_api_fields(task)
+    options.write_text("kv_cache_config:\n  enable_block_reuse: false\n", encoding="utf-8")
+    assert preflight.check_llm_api_fields(task) == []
+    # A field the LLM API removed but still takes is a note, not a refusal.
+    llm_args = tmp_path / "tensorrt_llm" / "llmapi" / "llm_args.py"
+    llm_args.parent.mkdir(parents=True)
+    llm_args.write_text("_TORCH_LLMARGS_REMOVED_ARG_CHECKS = {'sampler_type': check}\n")
+    options.write_text("sampler_type: auto\n", encoding="utf-8")
+    (note,) = preflight.check_llm_api_fields(task)
+    assert "core sets sampler_type, removed from the LLM API" in note
+
+
+def test_a_routed_architecture_takes_the_directory_of_the_family_that_routes_it(tmp_path):
+    family = tmp_path / MODELING_V2_PACKAGE / "models" / "kimi_k3_vl"
+    family.mkdir(parents=True)
+    (family / "routing.py").write_text(
+        '@routes("KimiK3ForConditionalGeneration")\ndef route(config, llm_args, cc):\n    pass\n'
+    )
+    task = _task(tmp_path, parallel="tp4")
+    routed, target = preflight.resolve_target_identity(
+        task, {"architectures": ["KimiK3ForConditionalGeneration"]}
+    )
+    assert routed == "kimi_k3_vl"
+    assert target == f"{MODELING_V2_PACKAGE}/models/kimi_k3_vl/ckpt__sm_103__tp4"
+    # An architecture no family routes yet names a new family after itself.
+    fresh, _ = preflight.resolve_target_identity(
+        task, {"architectures": ["FooBarForConditionalGeneration"]}
+    )
+    assert fresh == "foo_bar"
 
 
 def test_a_relative_variant_needs_its_units_benchmark_and_disagg_one_node(tmp_path):

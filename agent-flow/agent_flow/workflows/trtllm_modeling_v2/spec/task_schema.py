@@ -151,12 +151,14 @@ NOTES_FIELD = "notes"
 #
 # The values are what the *user* wants true of the run, not what the flag
 # says: two of these are spelled as negations on the command line
-# (``--disable_overlap_scheduler``, ``--disable_kv_cache_reuse``).
+# (``--disable_overlap_scheduler``, ``--disable_kv_cache_reuse``). The core
+# configuration is CUDA graphs and the overlap scheduler; chunked prefill and
+# block reuse are non-core features, each proven by a variant of its own.
 RUNTIME_SWITCHES: dict[str, bool] = {
     "cuda_graph": True,
     "chunked_prefill": False,
     "overlap_scheduler": True,
-    "kv_cache_reuse": True,
+    "kv_cache_reuse": False,
 }
 
 # Scopes a target may be built at. ``text_only`` is the useful one: a
@@ -426,8 +428,17 @@ def derive_slug(data: Mapping[str, Any]) -> str:
 
 
 def derive_family(architecture: str) -> str:
-    """``GptOssForCausalLM`` -> ``gpt_oss``: the modeling_v2 family directory."""
-    name = re.sub(r"For(Causal|Conditional|Seq2Seq|Sequence)?LM$", "", architecture)
+    """``GptOssForCausalLM`` -> ``gpt_oss``: a family directory for an architecture no family routes.
+
+    An architecture a family already routes takes that family's directory
+    (:func:`~..run.startup.preflight.routed_family`); this is the name a new
+    family starts from.
+    """
+    name = re.sub(
+        r"For(?:(?:Causal|Conditional|Seq2Seq|Sequence)?LM|ConditionalGeneration)$",
+        "",
+        architecture,
+    )
     name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
     name = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", name)
     return re.sub(r"[^a-zA-Z0-9]+", "_", name).strip("_").lower()

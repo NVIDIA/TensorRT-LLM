@@ -343,6 +343,17 @@ def _feedback(argv: list[str]) -> int:
     return 0
 
 
+def _wiki(argv: list[str]) -> int:
+    """``wiki --workspace W <question>``: the run's wiki pack (``W/wiki``), see ``trtllm-wiki -h``."""
+    from agent_flow.trtllm_wiki import cli as wiki_cli
+
+    if "--workspace" in argv[:-1]:
+        at = argv.index("--workspace")
+        # Top-level options go before the question's subcommand.
+        argv = ["--pack", str(Path(argv[at + 1]) / "wiki"), *argv[:at], *argv[at + 2 :]]
+    return wiki_cli.main(argv)
+
+
 #: ``trtllm-modeling-v2 <subcommand> ...`` for the tools that are not a run.
 #: A run is ``trtllm-modeling-v2 --task ...``; a first argument named here
 #: dispatches instead, and everything after it is the subcommand's own.
@@ -360,6 +371,8 @@ SUBCOMMANDS = {
     "feedback": _feedback,
     # What a run cost and proved so far: `metrics --workspace W` (writes metrics.json).
     "metrics": _metrics,
+    # The checkout's facts: `wiki --workspace W feature|field|family|op|ci|accuracy|recipe ...`.
+    "wiki": _wiki,
 }
 
 

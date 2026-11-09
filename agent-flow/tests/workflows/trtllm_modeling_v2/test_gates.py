@@ -473,6 +473,20 @@ def test_inherited_weights_need_no_local_file_but_present_python_is_validated(tm
     assert any("weights.py" in check.detail for check in _verify(root).failures)
 
 
+def test_a_test_list_counts_only_when_it_runs_the_accuracy_file(tmp_path):
+    root = _build_repo(tmp_path)
+    db = root / delivery.TEST_DB_DIR / "l0_gb300.yml"
+    # A longer name that contains the file's stem is another file.
+    db.write_text(
+        "- condition: {}\n  tests:\n  - accuracy/test_modeling_v2_gpt_oss_extra.py::T::t\n",
+        encoding="utf-8",
+    )
+    (failed,) = _verify(root).failures
+    assert failed.name == "tests:test-db"
+    db.write_text("- condition: {}\n  tests:\n  - accuracy\n", encoding="utf-8")
+    assert _verify(root).passed
+
+
 @pytest.mark.parametrize("location", ["helper", "family", "catalog_reexport"])
 @pytest.mark.parametrize("defect", ["cells", "archs", "test"])
 def test_indirect_entries_must_have_contracts_and_collected_tests(tmp_path, location, defect):
@@ -1449,6 +1463,46 @@ def test_an_attention_dp_rank_serves_its_share_of_the_global_batch():
         "max_batch_size": 32,
         "batch_sizes": [1, 2, 4, 8, 16, 24, 32],
     }
+
+
+def test_an_accuracy_batch_limit_is_shared_across_attention_dp_ranks_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(accuracy_checks, "inspect_tree", lambda task_data: "t")
+    task = _engine_attestation_task(tmp_path)
+    task["accuracy"]["max_batch_size"] = 64
+    accuracy_checks.run_accuracy_gate(
+        RunEnvironment(kind="local", python="/py", world_size=4, env={}),
+        task_data=task,
+        reference=90.0,
+        workdir=tmp_path / "w",
+        runner=lambda command, env=None, timeout=0: CommandResult(returncode=1),
+        unit="core",
+        member="dep4",
+    )
+    written = yaml.safe_load((tmp_path / "w" / "eval.core.dep4.yaml").read_text())
+    # 64 requests over four ranks: 16 each, and each rank's graphs stop at its share.
+    assert written["max_batch_size"] == 16
+    assert written["cuda_graph_config"]["max_batch_size"] == 16
+
+
+def test_dflash_keeps_the_speculative_config_its_options_declare(tmp_path):
+    task = _engine_attestation_task(tmp_path, features=["dflash"])
+    drafter = {"decoding_type": "DFlash", "max_draft_len": 3, "speculative_model": "/drafter"}
+    Path(task["accuracy"]["llm_api_options"]["core"]).write_text(
+        yaml.safe_dump({**_OPTIONS, "speculative_config": drafter}), encoding="utf-8"
+    )
+    config = check_config.check_configuration(
+        task,
+        _engine_attestation_env(),
+        unit="core",
+        features=["dflash"],
+        max_tokens=8,
+        member="tp1",
+    )
+    assert config["llm"]["speculative_config"] == drafter
+    assert check_config.speculation_flags(["dflash"], max_draft_len=3) == [
+        "--spec_decode_algo=DFlash",
+        "--spec_decode_max_draft_len=3",
+    ]
 
 
 def test_the_stock_leg_is_asked_once_per_checkpoint(tmp_path, monkeypatch):
