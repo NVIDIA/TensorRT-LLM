@@ -1107,6 +1107,27 @@ def run_preflight(
     )
 
 
+def routed_family(repo: Path, architecture: str) -> str | None:
+    """The family directory whose ``routing.py`` registers ``architecture`` with ``@routes``."""
+    for routing in sorted((repo / MODELING_V2_PACKAGE / "models").glob("*/routing.py")):
+        try:
+            tree = ast.parse(routing.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in node.decorator_list:
+                func = decorator.func if isinstance(decorator, ast.Call) else None
+                name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+                if name == "routes" and any(
+                    isinstance(arg, ast.Constant) and arg.value == architecture
+                    for arg in decorator.args
+                ):
+                    return routing.parent.name
+    return None
+
+
 def resolve_target_identity(
     task_data: Mapping[str, Any],
     checkpoint_config: Mapping[str, Any],
@@ -1115,7 +1136,8 @@ def resolve_target_identity(
 
     The family and the checkpoint segment are derived and overridable through
     ``task.yaml``'s ``target`` block. The family comes from the checkpoint's
-    own ``architectures[0]``, which is the same string routing keys on.
+    own ``architectures[0]``, which is the same string routing keys on: the
+    family whose ``routing.py`` registers it, else a new family's name.
     """
     override = dict(task_data.get("target") or {})
 
@@ -1125,7 +1147,11 @@ def resolve_target_identity(
             "the checkpoint's config.json declares no `architectures`, so the "
             "modeling_v2 family cannot be derived. Set `target.family` in task.yaml."
         )
-    family = override.get("family") or derive_family(str(architectures[0]))
+    family = override.get("family")
+    if not family:
+        architecture = str(architectures[0])
+        repo = Path(str(task_data.get("trtllm_repo_path") or "."))
+        family = routed_family(repo, architecture) or derive_family(architecture)
     segment = override.get("checkpoint_segment") or derive_checkpoint_segment(
         task_data["checkpoint_path"]
     )

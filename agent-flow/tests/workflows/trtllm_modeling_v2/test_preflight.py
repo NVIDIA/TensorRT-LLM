@@ -18,6 +18,7 @@ import pytest
 from agent_flow.workflows.trtllm_modeling_v2.checks.verdict import GateResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import tree_anchors
+from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import MODELING_V2_PACKAGE
 from agent_flow.workflows.trtllm_modeling_v2.operators.inventory import (
     PROBE_SOURCE,
     RECEIPT_PASSED,
@@ -88,6 +89,25 @@ def test_run_preflight_resolves_identity(tmp_path):
     assert result.devices == (0, 1, 2, 3)
     assert result.world_size == 4
     assert result.checkpoint_config["architectures"] == ["Qwen3MoeForCausalLM"]
+
+
+def test_a_routed_architecture_takes_the_directory_of_the_family_that_routes_it(tmp_path):
+    family = tmp_path / MODELING_V2_PACKAGE / "models" / "kimi_k3_vl"
+    family.mkdir(parents=True)
+    (family / "routing.py").write_text(
+        '@routes("KimiK3ForConditionalGeneration")\ndef route(config, llm_args, cc):\n    pass\n'
+    )
+    task = _task(tmp_path, parallel="tp4")
+    routed, target = preflight.resolve_target_identity(
+        task, {"architectures": ["KimiK3ForConditionalGeneration"]}
+    )
+    assert routed == "kimi_k3_vl"
+    assert target == f"{MODELING_V2_PACKAGE}/models/kimi_k3_vl/ckpt__sm_103__tp4"
+    # An architecture no family routes yet names a new family after itself.
+    fresh, _ = preflight.resolve_target_identity(
+        task, {"architectures": ["FooBarForConditionalGeneration"]}
+    )
+    assert fresh == "foo_bar"
 
 
 def test_a_relative_variant_needs_its_units_benchmark_and_disagg_one_node(tmp_path):

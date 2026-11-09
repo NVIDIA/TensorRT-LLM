@@ -368,6 +368,15 @@ def merge_options(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[s
     return merged
 
 
+#: Speculative feature name -> the engine's ``speculative_config.decoding_type``.
+SPECULATIVE_ALGORITHMS: dict[str, str] = {
+    "mtp": "MTP",
+    "eagle3": "Eagle3",
+    "dspark": "DSpark",
+    "dflash": "DFlash",
+}
+
+
 def speculation_flags(features: Any, *, max_draft_len: int = 1) -> list[str]:
     """Describe a speculative feature using the workflow runtime input spelling.
 
@@ -376,7 +385,12 @@ def speculation_flags(features: Any, *, max_draft_len: int = 1) -> list[str]:
     weights drafts garbage that verification rejects, which passes accuracy.
     """
     names = {str(f).lower() for f in (features or ())}
-    for feature, algo in (("mtp", "MTP"), ("eagle3", "Eagle3"), ("dspark", "DSPARK")):
+    for feature, algo in (
+        ("mtp", "MTP"),
+        ("eagle3", "Eagle3"),
+        ("dspark", "DSPARK"),
+        ("dflash", "DFlash"),
+    ):
         if feature in names:
             return [f"--spec_decode_algo={algo}", f"--spec_decode_max_draft_len={max_draft_len}"]
     return []
@@ -719,11 +733,15 @@ def check_configuration(
     features: Any | None,
     max_tokens: int,
     member: str | None,
+    limits: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One public API configuration for request and eval checks.
 
     Runtime flags are an input spelling only. The complete options mapping,
     including nested KV and speculative settings, reaches every check intact.
+    ``limits`` (``max_seq_len``, ``max_batch_size``) replace the unit's own
+    values before the batch is shared across attention-DP ranks, so a global
+    batch is divided once.
     """
     runtime = resolve_runtime(task_data, unit)
     extra, sampling, chat = parse_runtime_flags(runtime.get("extra_flags") or ())
@@ -767,6 +785,9 @@ def check_configuration(
         moe_expert_parallel_size=size if kind in ("tep", "dep") else 1,
         enable_attention_dp=kind == "dep",
     )
+    for key, value in (limits or {}).items():
+        if value is not None:
+            options[key] = value
     share_batch(options, member or str(task_data["parallel"]), size)
     if features is None:
         actual_unit = base_unit(task_data, unit) if is_variant(task_data, unit) else unit
@@ -774,10 +795,7 @@ def check_configuration(
             features_through(task_data, actual_unit) if actual_unit else task_data.get("features")
         )
     names = {str(f).lower() for f in features or ()}
-    algorithm = next(
-        (a for f, a in (("mtp", "MTP"), ("eagle3", "Eagle3"), ("dspark", "DSpark")) if f in names),
-        None,
-    )
+    algorithm = next((a for f, a in SPECULATIVE_ALGORITHMS.items() if f in names), None)
     if algorithm:
         speculative = options.setdefault("speculative_config", {})
         if speculative is None:

@@ -289,16 +289,17 @@ def run_accuracy_gate(
 
     name = f"accuracy[{benchmark}]"
     common = dict(name=name, member=member, reference=reference, tolerance=tolerance)
+    # The benchmark's batch is a global total too: each attention-DP rank serves its share.
     config = check_configuration(
-        task_data, environment, unit=unit, features=None, max_tokens=64, member=member
+        task_data,
+        environment,
+        unit=unit,
+        features=None,
+        max_tokens=64,
+        member=member,
+        limits={key: accuracy.get(key) for key in ("max_seq_len", "max_batch_size")},
     )
     config["llm"]["modeling_v2"] = MODE_REQUIRE
-    for key in ("max_seq_len", "max_batch_size"):
-        if accuracy.get(key) is not None:
-            config["llm"][key] = accuracy[key]
-    if accuracy.get("max_batch_size") is not None:
-        # The benchmark's batch is a global total too: each attention-DP rank serves its share.
-        check_config.share_batch(config["llm"], member, config["llm"].get("tensor_parallel_size"))
     parts = eval_command(task_data, config, benchmark, unit=unit, member=member, workdir=workdir)
     command = eval_harness_command(env, parts)
 
