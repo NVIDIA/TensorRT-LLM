@@ -486,7 +486,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
 
         if not spec_step_copies.is_supported():
-            self.skipTest("the step-copy kernels run on SM 100")
+            self.skipTest("the step-copy kernels run on SM 100, 103 and 107")
         max_draft_len = 3
         tokens_per_step = max_draft_len + 1
         (preparer, kv_cache_manager) = self.enterContext(

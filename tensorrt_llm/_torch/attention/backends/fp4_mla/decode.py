@@ -3,7 +3,7 @@
 """FP4 MLA decode dispatch and Triton/CuTeDSL launch preparation."""
 
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import triton
@@ -65,6 +65,9 @@ from .v_cache import (
     _triton_prepack_v_enabled,
     _update_triton_v_packed_cache,
 )
+
+if TYPE_CHECKING:
+    from .fp4_mla_packed_reduce import PackedSplitPartials
 
 
 @triton.jit
@@ -784,12 +787,15 @@ def _run_cutedsl_packed_decode(
     helix_kv_bounds: torch.Tensor | None,
     softmax_stats_tensor: torch.Tensor | None,
     plan_geometry: _PackedPlanGeometry | None = None,
-) -> None:
+    defer_split_reduce: bool = False,
+) -> "PackedSplitPartials | None":
     """Packed CuTe DSL decode: one kernel over (split, request) tasks.
 
     A single split writes the output (and Helix stats) directly; several
     splits write FP32 partials that one reduction kernel folds into the
     output and stats. Nothing pads, replicates, or copies Q or the output.
+    With ``defer_split_reduce`` the reduction is not launched and its inputs
+    are returned instead (None where the decode wrote the rows directly).
     """
     valid_m, physical_m = module.packed_query_rows(num_heads, query_len)
     if physical_m != rows_per_seq:
@@ -821,6 +827,7 @@ def _run_cutedsl_packed_decode(
         stats_rows = softmax_stats_tensor.view(num_requests * valid_m, 2)
     common = dict(
         max_kv_len=plan_geometry.split_kv_len,
+        use_smem_page_plan=plan_geometry.use_smem_page_plan,
         sm_scale=sm_scale,
         num_heads=num_heads,
         query_len=query_len,
@@ -846,8 +853,8 @@ def _run_cutedsl_packed_decode(
             softmax_stats=stats_rows,
             **common,
         )
-        return
-    from .fp4_mla_packed_reduce import reduce_packed_splits
+        return None
+    from .fp4_mla_packed_reduce import PackedSplitPartials, reduce_packed_splits
 
     tasks = splits * num_requests
     task_capacity = plan_geometry.task_capacity
@@ -893,6 +900,21 @@ def _run_cutedsl_packed_decode(
         plan=plan,
         **common,
     )
+    output_scale = 1.0 / module.FP4_MLA_P_GLOBAL_SCALE
+    if defer_split_reduce:
+        return PackedSplitPartials(
+            partial,
+            maxima,
+            sums,
+            plan,
+            q_global_scale,
+            kv_global_scale,
+            num_requests=num_requests,
+            valid_m=valid_m,
+            physical_m=physical_m,
+            sm_scale=sm_scale,
+            output_scale=output_scale,
+        )
     reduce_packed_splits(
         partial,
         maxima,
@@ -906,10 +928,11 @@ def _run_cutedsl_packed_decode(
         physical_m=physical_m,
         sm_scale=sm_scale,
         plan=plan,
-        output_scale=1.0 / module.FP4_MLA_P_GLOBAL_SCALE,
+        output_scale=output_scale,
         stats=stats_rows,
         sm_count=_get_sm_count(device),
     )
+    return None
 
 
 def run_fp4_mla_attention_decode(
@@ -926,7 +949,8 @@ def run_fp4_mla_attention_decode(
     prequantized_q_sf: torch.Tensor,
     q_batch_capacity: int,
     softmax_stats_tensor: torch.Tensor | None = None,
-) -> None:
+    defer_split_reduce: bool = False,
+) -> "PackedSplitPartials | None":
     """Run MLA decode with FP4 QK and FP4 PV tensor-core matmuls.
 
     Q is supplied in its assembled ``[latent, RoPE]`` layout and quantized to
@@ -1268,7 +1292,7 @@ def run_fp4_mla_attention_decode(
                 )
 
         if packed_rows_per_seq:
-            _run_cutedsl_packed_decode(
+            return _run_cutedsl_packed_decode(
                 cutedsl_kernel,
                 metadata,
                 q_fp4,
@@ -1292,8 +1316,8 @@ def run_fp4_mla_attention_decode(
                 helix_kv_bounds=helix_kv_bounds,
                 softmax_stats_tensor=softmax_stats_tensor,
                 plan_geometry=plan_geometry,
+                defer_split_reduce=defer_split_reduce,
             )
-            return
 
         from .fp4_mla_splitkv import run_fp4_mla_splitkv, select_split_count
 

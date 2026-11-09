@@ -627,8 +627,21 @@ class KDAKernelDispatch:
         if mxfp8_output:
             if not kwargs.pop("fuse_output_norm", True):
                 raise ValueError("the MXFP8-output KDA MTP op always fuses the output norm")
+            if kwargs.pop("use_pdl", False):
+                raise ValueError("the MXFP8-output KDA MTP op has no PDL launch")
             return torch.ops.trtllm.kda_mtp_decode_fp8(**kwargs)
         return torch.ops.trtllm.kda_mtp_decode(**kwargs)
+
+    def mtp_verify_fused_fb(self, **kwargs) -> torch.Tensor:
+        """Fused KDA multi-token verify that computes its forget gate from ``f_a``.
+
+        Thin passthrough to ``trtllm::kda_mtp_decode_fused_fb`` (packed rows, fused gated
+        RMSNorm, BF16 output; see ``custom_ops/cute_dsl_kimi_k3_kda_mtp_ops.py``).
+        """
+        if self.verify_kernel_path != "optimized":
+            raise RuntimeError("mtp_verify_fused_fb needs the optimized verify path")
+        _load_mtp_module()
+        return torch.ops.trtllm.kda_mtp_decode_fused_fb(**kwargs)
 
     def can_use_indexed_prefill(
         self,
@@ -709,6 +722,7 @@ class KDAKernelDispatch:
         seq_order: Optional[torch.Tensor] = None,
         cu_chunks: Optional[torch.Tensor] = None,
         sm_reserve: int = 0,
+        snapshot: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run prefill on raw Q/K/V and gate/beta logits.
 
@@ -717,7 +731,13 @@ class KDAKernelDispatch:
 
         ``sm_reserve`` SMs are left out of the optimized kernels' persistent
         grids for a kernel that runs concurrently with prefill.
+
+        ``snapshot = (pool, rows, chunks)`` (optimized indexed path only) also
+        stores each selected sequence's state after its first ``64 * chunks[b]``
+        tokens into ``pool[rows[b]]`` (``trtllm::kda_prefill``).
         """
+        if snapshot is not None and state_pool is None:
+            raise RuntimeError("KDA prefill state snapshots require the optimized prefill path")
         if state_pool is not None:
             if self.prefill_kernel_path != "optimized" or initial_state is not None:
                 raise ValueError("Indexed prefill requires FlashInfer and no dense initial state")
@@ -742,6 +762,7 @@ class KDAKernelDispatch:
                 seq_order,
                 cu_chunks,
                 sm_reserve,
+                *(snapshot or (None, None, None)),
             )
             return out, None
 

@@ -49,7 +49,12 @@ from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
+    KVCacheManagerV2,
+    Role,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
@@ -335,13 +340,34 @@ def _create_cache_manager(
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
+    num_draft_layers: int = 0,
 ) -> "KVCacheManagerV2":
-    """Create a KVCacheManagerV2 for the given mapping."""
+    """Create a KVCacheManagerV2 for the given mapping.
+
+    ``num_draft_layers`` K-only draft-owned layers follow the target's (MLA, pp 1),
+    as a standalone MLA drafter's unified draft KV cache lays them out.
+    """
     num_kv_heads = 1 if is_mla else NUM_KV_HEADS
     cache_type = CacheTypeCpp.SELFKONLY if is_mla else CacheTypeCpp.SELF
 
     if max_attention_window_vec is None:
         max_attention_window_vec = [MAX_SEQ_LEN]
+    layer_specs = None
+    if num_draft_layers:
+        assert is_mla and mapping.pp_size == 1
+        layer_specs = tuple(
+            KVCacheLayerSpec(
+                global_layer_id=layer_id,
+                owner=(
+                    KVCacheLayerOwner.TARGET if layer_id < num_layers else KVCacheLayerOwner.DRAFT
+                ),
+                dtype=DataType.FLOAT,
+                num_kv_heads=1,
+                head_dim=HEAD_DIM,
+                buffer_roles=(Role.KEY,),
+            )
+            for layer_id in range(num_layers + num_draft_layers)
+        )
 
     return KVCacheManagerV2(
         KvCacheConfigV2(
@@ -359,6 +385,7 @@ def _create_cache_manager(
         mapping=mapping,
         dtype=DataType.FLOAT,
         vocab_size=VOCAB_SIZE,
+        layer_specs=layer_specs,
         is_disagg=True,
     )
 
@@ -373,6 +400,7 @@ def _create_managers_for_instance(
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
     cp_size: int = 1,
+    num_draft_layers: int = 0,
 ) -> list[KVCacheManagerV2]:
     """Create cache managers for all ranks in an instance.
 
@@ -404,6 +432,7 @@ def _create_managers_for_instance(
                         max_attention_window_vec,
                         num_layers,
                         max_batch_size,
+                        num_draft_layers,
                     )
                 )
     return managers
@@ -987,8 +1016,12 @@ def run_transfer_test(
     gen_scratch_tokens: int = 0,
     gen_cp: int = 1,
     pipelined_piece_tokens: Optional[int] = None,
+    num_draft_layers: int = 0,
 ) -> None:
     """Run a full KV transfer test using KvCacheTransceiverV2.
+
+    num_draft_layers > 0 adds K-only draft-owned layers after the target's on
+    both sides (a unified draft KV cache); they must transfer like the target's.
 
     pipelined_piece_tokens enables enable_pipelined_transfer: the context sends each prompt in
     pieces of that many tokens instead of whole.
@@ -1027,6 +1060,7 @@ def run_transfer_test(
         max_attention_window_vec,
         num_layers,
         max_batch_size,
+        num_draft_layers=num_draft_layers,
     )
     gen_managers = _create_managers_for_instance(
         gen_tp,
@@ -1038,6 +1072,7 @@ def run_transfer_test(
         num_layers,
         max_batch_size,
         cp_size=gen_cp,
+        num_draft_layers=num_draft_layers,
     )
 
     # 2. Initialize data: random for ctx, zeros for gen
@@ -1216,7 +1251,7 @@ def run_transfer_test(
                 is_mla=is_mla,
                 gen_cp=gen_cp,
                 max_attention_window_vec=max_attention_window_vec,
-                num_layers=num_layers,
+                num_layers=num_layers + num_draft_layers,
             )
         else:
             verify_all_requests(
@@ -1544,6 +1579,30 @@ def test_cache_transceiver_helix_cp(gen_cp, is_mla):
     )
 
     print("PASSED")
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("gen_cp", [2, 4, 8], ids=["cp2", "cp4", "cp8"])
+def test_cache_transceiver_helix_cp_with_draft_layers(gen_cp):
+    """Unified draft KV cache under helix: draft pages move like the target's.
+
+    K-only draft layers after the MLA target's on both sides transfer with the
+    target's block stride, so each generation CP rank holds the drafter's
+    context pages [cp_rank::cp_size].
+    """
+    run_transfer_test(
+        ctx_tp=1,
+        ctx_pp=1,
+        gen_tp=1,
+        gen_pp=1,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        is_mla=True,
+        use_v2=True,
+        max_attention_window_vec=None,
+        gen_cp=gen_cp,
+        num_draft_layers=2,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -78,7 +78,7 @@ class AttnResFwd(OpWrapper):
     Shape-only launches can be captured after warm-up and replay eager bits.
     The Kimi K3 targets use this unfused path above
     KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS (their default 1; the built-in model's is
-    64) unless persistent topology handles it, and wherever a drafter needs
+    192) unless persistent topology handles it, and wherever a drafter needs
     the pre-norm mixture. The fake op reports the same shapes and dtypes.
     """
 

@@ -500,18 +500,18 @@ class TestHelixZeroKvMask(unittest.TestCase):
     """
 
     def test_mla_skips_generic_mask_when_per_token_bounds_are_valid(self):
+        from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
         from tensorrt_llm._torch.attention.mla import MLA
 
         num_tokens = 3
         num_heads = 2
         kv_lora_rank = 4
         helix_kv_bounds = torch.tensor([0, 5, 0], dtype=torch.int32)
-        attn_metadata = SimpleNamespace(
-            helix_kv_bounds=helix_kv_bounds,
-            _helix_spec_tokens_valid=True,
-            num_contexts=0,
-            num_generations=1,
-        )
+        attn_metadata = Mock(spec=TrtllmAttentionMetadata)
+        attn_metadata.helix_zero_kv_tokens = helix_kv_bounds == 0
+        attn_metadata._helix_spec_tokens_valid = True
+        attn_metadata.num_contexts = 0
+        attn_metadata.num_generations = 1
         attn_backend = Mock()
         attn_backend.forward.return_value = torch.empty(num_tokens, num_heads * kv_lora_rank)
         mla = SimpleNamespace(
@@ -521,6 +521,7 @@ class TestHelixZeroKvMask(unittest.TestCase):
             kv_lora_rank=kv_lora_rank,
             aux_stream=None,
             ln_events=None,
+            helix_exchange_event=Mock(),
         )
         q = torch.empty(num_tokens, 1)
 

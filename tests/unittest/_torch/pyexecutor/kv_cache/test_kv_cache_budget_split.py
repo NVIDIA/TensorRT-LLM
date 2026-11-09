@@ -1257,6 +1257,26 @@ class TestExternalDrafterKvDtype:
         assert draft_model_config.quant_config is inherited
         assert inherited.quant_mode.has_fp4_kv_cache()
 
+    @pytest.mark.parametrize("inherited_algo", [None, "FP8", "NVFP4"])
+    def test_fp8_context_kv_dtype_sizes_an_fp8_draft_pool(self, mocker, inherited_algo):
+        """speculative_config.context_kv_dtype="fp8" stores FP8 latents whatever
+        KV algo the drafter inherited from the target."""
+        from tensorrt_llm.models.modeling_utils import QuantConfig
+        from tensorrt_llm.quantization.mode import QuantAlgo
+
+        inherited = QuantConfig(
+            kv_cache_quant_algo=None if inherited_algo is None else QuantAlgo[inherited_algo]
+        )
+        c, draft_model_config, seen = self._creator(mocker, inherited)
+        c._speculative_config = DSparkDecodingConfig(max_draft_len=4, context_kv_dtype="fp8")
+
+        cost = c._get_kv_size_per_token()
+
+        assert cost.slope == self.FP8_SLOPE
+        assert seen[0].quant_config.quant_mode.has_fp8_kv_cache()
+        assert c._get_draft_kv_model_config().quant_config.quant_mode.has_fp8_kv_cache()
+        assert draft_model_config.quant_config is inherited
+
     def test_cost_and_allocation_paths_agree(self, mocker):
         """Both call sites must resolve the draft config through one helper."""
         from tensorrt_llm.models.modeling_utils import QuantConfig

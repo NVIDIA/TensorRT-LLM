@@ -96,10 +96,13 @@ def _make_layer(layer_idx, attn_weight, moe_weight, rank, token_sliced):
     layer.seen_all_rank_num_tokens = []
 
     class _MoE(nn.Module):
-        def forward(self, x, all_rank_num_tokens, return_parts=False):
+        def forward(self, x, all_rank_num_tokens, return_parts=False, column_parallel_tail=False):
             assert return_parts
             layer.seen_all_rank_num_tokens.append(all_rank_num_tokens)
             return torch.tanh(x @ moe_weight), torch.zeros_like(x)
+
+        def moe_front_releases_early(self, like):
+            return False
 
     layer.block_sparse_moe = _MoE()
     return layer
@@ -208,6 +211,7 @@ def test_model_marks_the_bank_written_by_the_row_scatter():
     model.helix_a2a.world_size = world_size
     model.helix_a2a.all_gather = lambda x, n: x.repeat(world_size, 1)[:n]
     model.num_attn_res_snapshots = 3
+    model._fp4_mla_metadata_stream = None  # no FP4 KV cache: no metadata-ahead stream
     model.norm = KimiK3RMSNorm(HIDDEN)
     model.output_attn_res_norm = KimiK3RMSNorm(HIDDEN)
     model.output_attn_res_proj = nn.Linear(HIDDEN, 1, bias=False)

@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
+import os
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -346,3 +348,224 @@ def gumbel_max_reference(logits: torch.Tensor, temperatures: torch.Tensor,
     sampled = temperatures >= greedy_threshold
     return torch.where(sampled, scores.argmax(-1),
                        logits.float().argmax(-1)).to(torch.int32)
+
+
+def mpi_worker_env(**env: str):
+    """Decorate a function run in a pooled MPI worker to see ``env`` set, restoring the
+    previous values after it: the pool reuses its processes for later tests."""
+
+    def decorate(fn):
+
+        @functools.wraps(fn)
+        def wrapped(*args, **kwargs):
+            saved = {name: os.environ.get(name) for name in env}
+            os.environ.update(env)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                for name, value in saved.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+
+        return wrapped
+
+    return decorate
+
+
+def bf16_bits_differ(ref: torch.Tensor, out: torch.Tensor) -> int:
+    """Number of 16-bit elements whose bits differ."""
+    return int((ref.view(torch.int16) != out.view(torch.int16)).sum())
+
+
+def r128c4_scale_offsets(m: int, h: int, device) -> torch.Tensor:
+    """``[m, h // 32]`` byte offsets of the first ``m`` rows' UE8M0 1x32 scales of ``[*, h]``
+    rows in the R128c4 layout (128-row blocks of 4-column groups)."""
+    r = torch.arange(m, device=device).unsqueeze(1)
+    c = torch.arange(h // 32, device=device).unsqueeze(0)
+    return (((r // 128) * (h // 128) + c // 4) * 512 + (r % 32) * 16 +
+            (r % 128) // 32 * 4 + c % 4)
+
+
+def mnnvl_torch_push(workspace, target, x: torch.Tensor, rank: int) -> None:
+    """Producer stand-in for a pushed MNNVL all-reduce: store ``x`` into the Lamport slots of
+    ``target`` with plain copies (``-0`` sent as ``+0``), through every rank's unicast
+    mapping."""
+    torch.cuda.synchronize()  # the previous call's rotation state is final
+    flags = target.view.flags.cpu().tolist()
+    cur, nbytes = int(flags[0]), int(flags[2])
+    world = target.view.world
+    m, h = x.shape
+    bits = x.view(torch.int16)
+    clean = torch.where(bits == -32768, torch.zeros_like(bits),
+                        bits).view(torch.bfloat16)
+    handle = workspace["handle"]
+    elems = 3 * nbytes // 2
+    for peer in range(world):
+        buf = handle.get_uc_buffer(peer, (elems, ), torch.bfloat16, 0)
+        base = cur * nbytes // 2
+        if target.one_shot:
+            slots = buf[base:base + m * world * h].view(m, world, h)
+            slots[:, rank].copy_(clean)
+        else:
+            for t in range(peer, m, world):
+                slot = (t // world) * world + rank
+                buf[base + slot * h:base + (slot + 1) * h].copy_(clean[t])
+    torch.cuda.synchronize()
+
+
+SMALL_BATCH_MOE_SITU_BETA = 2.5
+SMALL_BATCH_MOE_SITU_LINEAR_BETA = 0.7
+
+
+def random_nvfp4_experts(
+        num: int, rows: int, cols: int,
+        gen: torch.Generator) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Random e2m1 weights ``[num, rows, cols / 2]`` and E4M3 block scales in
+    [0.5, 2) (128x4 layout)."""
+    w = torch.randint(0,
+                      256, (num, rows, cols // 2),
+                      dtype=torch.uint8,
+                      device="cuda",
+                      generator=gen)
+    sf = torch.rand(
+        (num, rows, cols // 16), device="cuda", generator=gen) * 1.5 + 0.5
+    return w, sf.to(torch.float8_e4m3fn).view(torch.uint8)
+
+
+def small_batch_moe_operands(
+        ids: torch.Tensor,
+        scales: torch.Tensor,
+        hidden: int,
+        inter_size: int,
+        num_experts: int,
+        num_local: int,
+        offset: int,
+        gen: torch.Generator,
+        weight_gen: Optional[torch.Generator] = None) -> Dict[str, object]:
+    """Operands of ``trtllm::cute_dsl_nvfp4_small_batch_moe_rubin`` on a rank
+    whose ``num_local`` experts start at ``offset``, for the top-k ``ids`` /
+    ``scales`` ``[num_tokens, top_k]``: the ``moe_sort`` tables, NVFP4 tokens
+    drawn from ``gen`` and NVFP4 experts drawn from ``weight_gen`` (default
+    ``gen``)."""
+    num_tokens, top_k = ids.shape
+    t2g, t2lim, e2p, p2e, _, nnet = torch.ops.trtllm.moe_sort(
+        token_selected_experts=ids,
+        token_final_scales=scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=offset,
+        local_num_experts=num_local,
+        tile_tokens_dim=128,
+    )
+    xb = torch.randn(num_tokens,
+                     hidden,
+                     device="cuda",
+                     dtype=torch.bfloat16,
+                     generator=gen)
+    x_gsf = xb.abs().max().float() / (448 * 6)
+    x, x_sf = torch.ops.trtllm.fp4_quantize(xb, 1 / x_gsf, 16, False, False)
+    weight_gen = gen if weight_gen is None else weight_gen
+    w1, w1_sf = random_nvfp4_experts(num_local, 2 * inter_size, hidden,
+                                     weight_gen)
+    w2, w2_sf = random_nvfp4_experts(num_local, hidden, inter_size, weight_gen)
+    ramp = torch.linspace(0.5, 1.5, num_local, device="cuda")
+    global_sf = torch.tensor([448 * 6 / 64.0],
+                             dtype=torch.float32,
+                             device="cuda")
+    return dict(
+        hidden=hidden,
+        inter_size=inter_size,
+        num_local=num_local,
+        top_k=top_k,
+        offset=offset,
+        ids=ids,
+        scales=scales,
+        t2g=t2g,
+        t2lim=t2lim,
+        p2e=p2e,
+        e2p=e2p,
+        nnet=nnet,
+        x=x,
+        x_sf=x_sf.view(num_tokens, hidden // 16),
+        w1=w1,
+        w1_sf=w1_sf,
+        w2=w2,
+        w2_sf=w2_sf,
+        alpha1=(ramp * x_gsf * 0.004).float(),
+        alpha2=(ramp * 0.003 / global_sf[0]).float(),
+        global_sf=global_sf,
+    )
+
+
+def run_small_batch_moe(d: Dict[str, object],
+                        out: torch.Tensor,
+                        counters: torch.Tensor,
+                        *,
+                        token_indexed: bool,
+                        deterministic: bool,
+                        num_ctas: int = 0,
+                        die_major: bool = False,
+                        published: bool = False,
+                        push=None) -> None:
+    """``trtllm::cute_dsl_nvfp4_small_batch_moe_rubin`` on the operands ``d``
+    of :func:`small_batch_moe_operands`: on their ``moe_sort`` tables or, with
+    ``published``, on their top-k (the routing word holds the token count
+    before the launch); ``push``: the ``LamportWorkspaceView`` of a one-shot
+    MNNVL all-reduce call the kernel pushes its output into."""
+    from tensorrt_llm._torch.moe.custom_ops.cute_dsl_small_batch_moe_custom_op import \
+        small_batch_moe_route_word
+
+    tables = (d["t2g"], d["t2lim"], d["p2e"], d["nnet"])
+    e2p = d["e2p"]
+    if published:
+        small_batch_moe_route_word(counters).fill_(d["ids"].size(0))
+        tables, e2p = (None, ) * 4, d["ids"].reshape(-1)
+    torch.ops.trtllm.cute_dsl_nvfp4_small_batch_moe_rubin(
+        input=d["x"].view(torch.float4_e2m1fn_x2),
+        input_scale=d["x_sf"].view(torch.uint8),
+        fc1_weight=d["w1"].view(torch.float4_e2m1fn_x2),
+        fc1_weight_scale=d["w1_sf"],
+        fc1_alpha=d["alpha1"],
+        fc2_weight=d["w2"].view(torch.float4_e2m1fn_x2),
+        fc2_weight_scale=d["w2_sf"],
+        fc2_alpha=d["alpha2"],
+        output=out,
+        tile_idx_to_group_idx=tables[0],
+        tile_idx_to_mn_limit=tables[1],
+        permuted_idx_to_expanded_idx=tables[2],
+        expanded_idx_to_permuted_idx=e2p,
+        num_non_exiting_tiles=tables[3],
+        global_sf=d["global_sf"],
+        token_final_scales=d["scales"],
+        counters=counters,
+        top_k=d["top_k"],
+        situ_beta=SMALL_BATCH_MOE_SITU_BETA,
+        situ_linear_beta=SMALL_BATCH_MOE_SITU_LINEAR_BETA,
+        token_indexed=token_indexed,
+        num_ctas=num_ctas,
+        deterministic_combine=deterministic,
+        die_major=die_major,
+        published_routing=published,
+        expert_offset=d["offset"],
+        push_mc=push.mc_base if push is not None else 0,
+        push_flags=push.flags if push is not None else None,
+        push_rank=push.rank if push is not None else 0,
+        push_world=push.world if push is not None else 0,
+    )
+
+
+def dsv3_router_logits(x: torch.Tensor,
+                       router: torch.Tensor,
+                       tile_rows: int = 0) -> torch.Tensor:
+    """FP32 router logits ``x @ router.T`` from ``trtllm::dsv3_router_gemm_op``,
+    one call per ``tile_rows`` rows of ``x`` where given (0: one call)."""
+    tile_rows = tile_rows or x.shape[0]
+    return torch.cat([
+        torch.ops.trtllm.dsv3_router_gemm_op(x[r:r + tile_rows].contiguous(),
+                                             router.t(),
+                                             bias=None,
+                                             out_dtype=torch.float32)
+        for r in range(0, x.shape[0], tile_rows)
+    ])

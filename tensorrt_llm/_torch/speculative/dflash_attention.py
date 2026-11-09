@@ -25,10 +25,9 @@ from tensorrt_llm._torch.cute_dsl_utils import install_cutlass_dsl_compatibility
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
-# TRTLLM lowering ``validate_block_attention_windows`` reports for a draft
-# layer that runs the context kernel; every other lowering is the block decode,
-# so only this one is subject to the context kernel's head-size limits.
-DFLASH_CONTEXT_LOWERING = "non-causal context"
+# Full non-causal blocks fold their query positions into the decode heads;
+# they use the generation kernel's shape constraints.
+DFLASH_FOLDED_DECODE_LOWERING = "non-causal folded decode"
 
 
 @dataclass(frozen=True)
@@ -190,3 +189,51 @@ def validate_dflash_trtllm_gen_runtime(
         raise RuntimeError(
             f"DFlash TRTLLM context attention does not support head dimension {head_dim}."
         )
+
+
+# FP8 E4M3 storage of an MLA drafter's context latent: one per-tensor scale of
+# 1.0 for the latent and for the query that reads it, the scheme of the target
+# MLA's FP8 KV cache without calibrated kv scales. Values saturate at the
+# format's largest finite value instead of overflowing to NaN.
+DRAFT_FP8_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+DRAFT_FP8_KV_SCALE = 1.0
+
+
+def to_draft_fp8(x: torch.Tensor) -> torch.Tensor:
+    """``x`` as saturated FP8 E4M3 at the drafter's unit per-tensor scale."""
+    return x.clamp(-DRAFT_FP8_MAX, DRAFT_FP8_MAX).to(torch.float8_e4m3fn)
+
+
+@dataclass(frozen=True)
+class HelixDraftShard:
+    """The pages of a drafter's context this helix CP rank holds.
+
+    Global page ``g`` (positions ``[g * page_size, (g + 1) * page_size)``) lives
+    on rank ``g % cp_size`` as its local page ``g // cp_size``, like the target's
+    helix pages, so the drafter's pages ride the target's ledger and transfer.
+    """
+
+    cp_size: int
+    cp_rank: int
+    page_size: int
+
+    def local_slots(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rank-local token slots of global ``positions`` and whether this rank owns them.
+
+        A position on another rank maps to the local slot with the same offset in
+        the same ledger block, which belongs to the same request.
+        """
+        page = positions // self.page_size
+        local = (page // self.cp_size) * self.page_size + positions % self.page_size
+        return local, page % self.cp_size == self.cp_rank
+
+    def local_lengths(self, lengths: torch.Tensor) -> torch.Tensor:
+        """How many of the first ``lengths`` global positions this rank holds."""
+        span = self.page_size * self.cp_size
+        tail = (lengths % span - self.cp_rank * self.page_size).clamp(min=0, max=self.page_size)
+        return (lengths // span) * self.page_size + tail
+
+    @property
+    def positions_per_page(self) -> int:
+        """Global positions one local page stands for (one per ledger block)."""
+        return self.page_size * self.cp_size

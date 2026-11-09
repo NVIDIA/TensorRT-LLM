@@ -82,7 +82,7 @@ class AttnResRmsnormFwd(OpWrapper):
     The Kimi K3 targets call this before attention, snapshot-appending MLPs and
     model output up to KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS (their default 1,
     topology mode 32), unless the persistent topology handles it. The built-in
-    model (default ceiling 64) runs the CuTe DSL decode kernel there and this
+    model (default ceiling 192) runs the CuTe DSL decode kernel there and this
     op where that kernel is unavailable on the device. Drafter-captured mixtures use
     the unfused entry. The fake op returns empty_like(layer_residual).
     """

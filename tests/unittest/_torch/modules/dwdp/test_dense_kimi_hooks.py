@@ -185,6 +185,10 @@ class _Recorder(nn.Module):
         output = hidden_states * 0.5
         return (output, torch.zeros_like(output)) if return_parts else output
 
+    def moe_front_releases_early(self, like: torch.Tensor) -> bool:
+        """As a MoE, its front never lets the preceding mix release it at kernel entry."""
+        return False
+
 
 class _RecordingDense:
     """The ``DenseDWDP`` calls the model makes, recorded; any other call raises."""

@@ -22,6 +22,7 @@ import traceback
 import cloudpickle
 import pytest
 import torch
+from _torch.helpers import mpi_worker_env, r128c4_scale_offsets
 from mpi4py import MPI
 from utils.util import skip_pre_blackwell
 
@@ -975,6 +976,200 @@ def test_mnnvl_rms_norm_fusion_without_residual(seq_len, hidden_size,
             reference_norm,
         ) for i in range(tensor_parallel_size)]),
     )
+    for r in results:
+        assert r is True
+
+
+@mpi_worker_env(TLLM_TEST_MNNVL="1")
+def run_rms_norm_mxfp8_single_rank(tensor_parallel_size, seq_len, hidden_size):
+    """RMS_NORM_QUANT_MXFP8 against the low-M GEMM's quantization of the RMS_NORM output of the
+    same call, and Kimi K3's latent_up on that operand against latent_up on the BF16 rows."""
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        from tensorrt_llm._torch.kernels.blackwell import \
+            fp8_block_scale_low_m_gemm as low_m
+        from tensorrt_llm._torch.models.modeling_kimi_linear import \
+            _Fp8BlockScaleWeightReadLinear
+
+        allreduce = AllReduce(mapping=Mapping(world_size=tensor_parallel_size,
+                                              tp_size=tensor_parallel_size,
+                                              rank=rank),
+                              strategy=AllReduceStrategy.MNNVL,
+                              dtype=torch.bfloat16)
+        assert allreduce.mnnvl_runs_fusion(
+            AllReduceFusionOp.RMS_NORM_QUANT_MXFP8, hidden_size)
+        assert not allreduce.mnnvl_runs_fusion(
+            AllReduceFusionOp.RMS_NORM_QUANT_MXFP8, hidden_size + 128)
+        gen = torch.Generator(device="cuda").manual_seed(rank + 3)
+        x = (torch.randn(seq_len, hidden_size, device="cuda", generator=gen) *
+             0.5).to(torch.bfloat16)
+        x[0, :32] = 0  # an all-zero group takes the amax floor
+        norm_weight = (1 + 0.1 * torch.randn(
+            hidden_size,
+            device="cuda",
+            generator=torch.Generator(device="cuda").manual_seed(0))).to(
+                torch.bfloat16)
+        eps = 1e-6
+        norm = allreduce(x,
+                         all_reduce_params=AllReduceParams(
+                             fusion_op=AllReduceFusionOp.RMS_NORM,
+                             norm_weight=norm_weight,
+                             eps=eps))
+        xq, xs = allreduce(x,
+                           all_reduce_params=AllReduceParams(
+                               fusion_op=AllReduceFusionOp.RMS_NORM_QUANT_MXFP8,
+                               norm_weight=norm_weight,
+                               eps=eps))
+        ref_q, ref_s = low_m.mxfp8_quantize_reference(norm)
+        assert xq.dtype == torch.float8_e4m3fn and xs.dtype == torch.uint8
+        assert torch.equal(xq.view(torch.uint8), ref_q.view(torch.uint8))
+        assert torch.equal(
+            xs[r128c4_scale_offsets(seq_len, hidden_size, "cuda")], ref_s)
+
+        weight = (torch.randn(7168, hidden_size, device="cuda", generator=gen) *
+                  0.02).to(torch.bfloat16)
+        up = _Fp8BlockScaleWeightReadLinear(
+            *_Fp8BlockScaleWeightReadLinear.quantize_weight(weight), 7168)
+        up.post_load_weights()
+        if up.takes_prequantized_input(seq_len):
+            assert torch.equal(up.forward_prequantized(xq, xs), up(norm))
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("seq_len", [1, 16, 96, 300], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("hidden_size", [3072, 7168], ids=lambda h: f"n{h}")
+@pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
+def test_mnnvl_rms_norm_mxfp8_fusion(seq_len, hidden_size, mpi_pool_executor):
+    """AllReduce + RMSNorm + MXFP8 (Kimi K3 routed latent for latent_up), one-shot and
+    two-shot."""
+    world = mpi_pool_executor.num_workers
+    if torch.cuda.device_count() < world:
+        pytest.skip(f"needs {world} GPUs")
+    results = mpi_pool_executor.map(
+        run_rms_norm_mxfp8_single_rank,
+        *zip(*[(world, seq_len, hidden_size)] * world))
+    for r in results:
+        assert r is True
+
+
+@torch.inference_mode()
+@mpi_worker_env(TLLM_TEST_MNNVL="1")
+def run_own_workspace_single_rank(tensor_parallel_size, hidden_size,
+                                  early_state):
+    """An all-reduce on a workspace of its own (MnnvlOwnWorkspace): its own buffers, one-shot up
+    to its own limit, interleaved with calls on the group's shared workspace; with
+    ``early_state`` bitwise the same calls on a workspace without it."""
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        from tensorrt_llm._torch.distributed.ops import (
+            MnnvlOwnWorkspace, mnnvl_allreduce_transport)
+        from tensorrt_llm._torch.kernels.blackwell import \
+            fp8_block_scale_low_m_gemm as low_m
+
+        MPI.COMM_WORLD.barrier()
+        mapping = Mapping(world_size=tensor_parallel_size,
+                          tp_size=tensor_parallel_size,
+                          rank=rank)
+        big = 96
+        limit = big * hidden_size * tensor_parallel_size * 2
+        shared = AllReduce(mapping=mapping,
+                           strategy=AllReduceStrategy.MNNVL,
+                           dtype=torch.bfloat16)
+        own = AllReduce(mapping=mapping,
+                        strategy=AllReduceStrategy.MNNVL,
+                        dtype=torch.bfloat16,
+                        mnnvl_own_workspace=MnnvlOwnWorkspace(
+                            f"test_own_{early_state}", limit, early_state))
+        own_ws = own.mnnvl_allreduce._workspace()
+        shared_ws = shared.mnnvl_allreduce._workspace()
+        assert own_ws["buffer_size_bytes"] == limit
+        assert own_ws["uc_buffer"].data_ptr(
+        ) != shared_ws["uc_buffer"].data_ptr()
+        assert own.mnnvl_allreduce._transport(big, hidden_size)[0]
+        assert not own.mnnvl_allreduce._transport(big + 1, hidden_size)[0]
+        assert mnnvl_allreduce_transport(big, hidden_size, tensor_parallel_size,
+                                         torch.bfloat16, limit)[0]
+
+        norm_weight = (1 + 0.1 * torch.randn(
+            hidden_size,
+            device="cuda",
+            generator=torch.Generator(device="cuda").manual_seed(0))).to(
+                torch.bfloat16)
+        eps = 1e-6
+        params = AllReduceParams(fusion_op=AllReduceFusionOp.RMS_NORM,
+                                 norm_weight=norm_weight,
+                                 eps=eps)
+        for step, m in enumerate((1, big, 16, big, 1)):
+
+            def inputs(r):
+                gen = torch.Generator(device="cuda").manual_seed(100 * step + r)
+                return (
+                    torch.randn(m, hidden_size, device="cuda", generator=gen) *
+                    0.5).to(torch.bfloat16)
+
+            x = inputs(rank)
+            total = sum(inputs(r).float() for r in range(tensor_parallel_size))
+            ref = rms_norm(
+                total.to(torch.bfloat16).float(), norm_weight.float(),
+                eps).to(torch.bfloat16)
+            out_own = own(x, all_reduce_params=params)
+            out_shared = shared(x, all_reduce_params=params)
+            if early_state:
+                # Early state only moves the state read and the re-arm: the same bits.
+                plain = AllReduce(mapping=mapping,
+                                  strategy=AllReduceStrategy.MNNVL,
+                                  dtype=torch.bfloat16,
+                                  mnnvl_own_workspace=MnnvlOwnWorkspace(
+                                      "test_own_False", limit))
+                assert torch.equal(out_own, plain(x, all_reduce_params=params))
+            torch.testing.assert_close(out_own, ref, rtol=0.05, atol=0.15)
+            if shared.mnnvl_allreduce._transport(m, hidden_size)[0]:
+                # Both one-shot: the same kernel on other buffers.
+                assert torch.equal(out_own, out_shared)
+            else:
+                torch.testing.assert_close(out_own,
+                                           out_shared,
+                                           rtol=0.02,
+                                           atol=0.05)
+            xq, xs = own(x,
+                         all_reduce_params=AllReduceParams(
+                             fusion_op=AllReduceFusionOp.RMS_NORM_QUANT_MXFP8,
+                             norm_weight=norm_weight,
+                             eps=eps))
+            ref_q, _ = low_m.mxfp8_quantize_reference(out_own)
+            assert torch.equal(xq.view(torch.uint8), ref_q.view(torch.uint8))
+        # A two-shot size falls back to the strategies after MNNVL; the own workspace keeps its
+        # size. The fallback may return an NCCL window tensor, which needs a lease scope (the
+        # decoder layer's in a model).
+        x = (torch.randn(big + 1, hidden_size, device="cuda") * 0.5).to(
+            torch.bfloat16)
+        with discard_nccl_window_tensor_outputs(x):
+            torch.testing.assert_close(own(x), shared(x), rtol=0.02, atol=0.05)
+        assert own.mnnvl_allreduce._workspace()["buffer_size_bytes"] == limit
+        torch.cuda.synchronize()
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("early_state", [False, True],
+                         ids=["late_state", "early_state"])
+@pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
+def test_mnnvl_own_workspace(mpi_pool_executor, early_state):
+    """The Kimi K3 routed latent all-reduce's own workspace, one-shot limit and early state."""
+    world = mpi_pool_executor.num_workers
+    if torch.cuda.device_count() < world:
+        pytest.skip(f"needs {world} GPUs")
+    results = mpi_pool_executor.map(run_own_workspace_single_rank,
+                                    *zip(*[(world, 3584, early_state)] * world))
     for r in results:
         assert r is True
 

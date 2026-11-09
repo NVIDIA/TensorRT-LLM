@@ -16,6 +16,7 @@
 
 import copy
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 import torch
@@ -24,6 +25,7 @@ from torch import nn
 
 from tensorrt_llm._torch.models.modeling_dspark import _build_mla_block_fixup
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+from tensorrt_llm._torch.speculative.dflash_attention import HelixDraftShard
 from tensorrt_llm._torch.speculative.spec_tail_kernels import (
     decode_draft_block_table,
     strict_accept,
@@ -217,12 +219,24 @@ def _paged_worker(draft_len, page_size, max_blocks, num_slots, layers, head_dim,
     return worker, storage
 
 
+@pytest.mark.parametrize("helix_rank", [None, 0, 1], ids=["no_helix", "helix_r0", "helix_r1"])
+@pytest.mark.parametrize("side_stream", [False, True])
 @pytest.mark.parametrize("based", [False, True], ids=["no_base", "based"])
 @pytest.mark.parametrize("draft_len", [3, 7])
-def test_paged_latent_prepare_matches_eager(draft_len: int, based: bool) -> None:
+def test_paged_latent_prepare_matches_eager(
+    draft_len: int, side_stream: bool, helix_rank: Optional[int], based: bool
+) -> None:
     """The fused generation-step preparation matches the eager one, including
     the read view rebased past each slot's base pages: the advertised context,
-    the rebased block-table rows and the block placement."""
+    the rebased block-table rows and the block placement.
+
+    ``side_stream``: the fused path stores the context latents on the
+    worker's side stream and hands the drafter the event to wait on.
+    ``helix_rank``: the pages are sharded over a helix CP group of two (a
+    unified cache shared with a helix target); each rank stores and places only
+    its own positions."""
+    if based and helix_rank is not None:
+        pytest.skip("a helix-sharded context is a unified cache, whose slots start at base 0")
     vocab, hidden, features, layers, head_dim = 100, 64, 128, 3, 96
     page_size, max_blocks, num_slots, max_ctx = 16, 6, 10, 70
     num_ctx_reqs, num_gens = 1, 6
@@ -233,6 +247,9 @@ def test_paged_latent_prepare_matches_eager(draft_len: int, based: bool) -> None
         draft_len, page_size, max_blocks, num_slots, layers, head_dim, max_ctx, gen
     )
     drafter = _LatentDrafter(vocab, hidden, features, layers, head_dim, mask_token_id=3)
+    cp_size = 1 if helix_rank is None else 2
+    shard = None if helix_rank is None else HelixDraftShard(cp_size, helix_rank, page_size)
+    worker._ctx_helix = shard
 
     # Rows: an ordinary request, one at the max_ctx ceiling, one whose context
     # outruns its pages, one with no pages, and two padding rows on the dummy slot.
@@ -277,6 +294,7 @@ def test_paged_latent_prepare_matches_eager(draft_len: int, based: bool) -> None
         w._ctx_kv_buf = [pool_storage[:, layer] for layer in range(layers)]
         w._ctx_kv_ptrs = torch.tensor([p.data_ptr() for p in w._ctx_kv_buf], device="cuda")
         w._fused_gen_prepare_applies = lambda *_: fused
+        w._ctx_store_stream = torch.cuda.Stream() if fused and side_stream else None
         md = attn_metadata()
         inputs = w.prepare_1st_drafter_inputs(
             input_ids=None,
@@ -289,6 +307,10 @@ def test_paged_latent_prepare_matches_eager(draft_len: int, based: bool) -> None
             draft_model=drafter,
             total_target_tokens=captured.shape[0],
         )
+        stored = None if inputs["block_placement"] is None else inputs["block_placement"].ctx_stored
+        assert (stored is not None) == (fused and side_stream)
+        if stored is not None:
+            torch.cuda.current_stream().wait_event(stored)
         return inputs, w._ctx_len, md, pool_storage
 
     eager, eager_len, eager_md, eager_pool = prepare(False)
@@ -308,9 +330,12 @@ def test_paged_latent_prepare_matches_eager(draft_len: int, based: bool) -> None
     counts = worker._ctx_block_counts.tolist()
     for g in range(num_gens):
         row = num_ctx_reqs + g
-        capacity = counts[row] * page_size
+        capacity = counts[row] * page_size * cp_size
         for j in range(width):
             col = max(min(old_len[slots[row].item()] + j, capacity - 1), 0)
+            if (col // page_size) % cp_size != (helix_rank or 0):
+                continue  # another rank's position: left untouched
+            col = (col // page_size // cp_size) * page_size + col % page_size
             page = worker._ctx_block_tables[row, col // page_size].item()
             writers.setdefault((page, col % page_size), []).append((g, j))
     shared = torch.zeros(storage.shape[0], page_size, dtype=torch.bool)
@@ -330,7 +355,7 @@ def test_paged_latent_prepare_matches_eager(draft_len: int, based: bool) -> None
         assert torch.equal(bits * untouched, init_bits * untouched)
         changed = (bits != init_bits).any(dim=-1).flatten(1, 3).any(dim=1)
         assert bool(changed[written.cuda()].all())
-    assert bool(shared.any()) and bool(untouched.any())
+    assert bool(untouched.any()) and (bool(shared.any()) or helix_rank == 1)
 
     rows = eager["ctx_cache_batch_idx"]
     read_rows = eager["ctx_page_table"].index_select(0, rows)
@@ -342,6 +367,7 @@ def test_paged_latent_prepare_matches_eager(draft_len: int, based: bool) -> None
         read_rows.long(),
         draft_len,
         page_size,
+        shard,
     )
     placement = fused["block_placement"]
     assert eager["block_placement"] is None
@@ -349,3 +375,164 @@ def test_paged_latent_prepare_matches_eager(draft_len: int, based: bool) -> None
     assert torch.equal(placement.offsets, fixup.offsets)
     assert torch.equal(placement.seq_lens, fixup.seq_lens_i32)
     assert torch.equal(placement.kv_bounds, fixup.kv_bounds_i32)
+    if shard is None:
+        assert placement.owned is None
+    else:
+        assert torch.equal(placement.owned, fixup.owned)
+
+
+@pytest.mark.parametrize("helix_rank", [None, 1], ids=["no_helix", "helix_r1"])
+def test_context_side_stream_matches_main_stream(helix_rank):
+    """The step's context latents computed on the worker's side stream (beside
+    the target-token selection) give the fused preparation the same outputs,
+    context lengths and pool contents as computing them on the main stream."""
+    draft_len, vocab, hidden, features, layers, head_dim = 7, 100, 64, 128, 3, 96
+    page_size, max_blocks, num_slots, max_ctx = 16, 6, 6, 70
+    num_gens, width = 4, draft_len + 1
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    worker, storage = _paged_worker(
+        draft_len, page_size, max_blocks, num_slots, layers, head_dim, max_ctx, gen
+    )
+    worker._ctx_dtype = torch.bfloat16
+    if helix_rank is not None:
+        worker._ctx_helix = HelixDraftShard(2, helix_rank, page_size)
+    drafter = _LatentDrafter(vocab, hidden, features, layers, head_dim, mask_token_id=3)
+    drafter.context_kv_only = False
+    drafter.projects_context_beside = lambda rows: True
+    drafter.project_target_hidden_beside = drafter.project_target_hidden
+
+    slots = torch.tensor([3, 0, 2, worker._dummy_slot], device="cuda")
+    worker._batch_to_slot_buffer.tensor[:num_gens] = slots
+    worker._ctx_len[:4] = torch.tensor([10, 3, 33, 50], device="cuda")
+    worker._ctx_block_counts[:num_gens] = torch.tensor([4, 2, 6, 1], device="cuda")
+    num_accepted = torch.tensor([1, width, 3, 1], dtype=torch.int32, device="cuda")
+    accepted = torch.randint(
+        0, vocab, (num_gens, width), dtype=torch.int32, device="cuda", generator=gen
+    )
+    captured = torch.randn(num_gens * width + 3, features, device="cuda", generator=gen)
+    spec_metadata = SimpleNamespace(
+        runtime_draft_len=draft_len,
+        hidden_size=0,
+        captured_hidden_states=captured,
+        get_hidden_states=lambda n: captured[:n],
+    )
+
+    def prepare(side):
+        w = copy.copy(worker)
+        w._ctx_len = worker._ctx_len.clone()
+        pool_storage = storage.clone()
+        w._ctx_kv_buf = [pool_storage[:, layer] for layer in range(layers)]
+        w._ctx_kv_ptrs = torch.tensor([p.data_ptr() for p in w._ctx_kv_buf], device="cuda")
+        w._fused_gen_prepare_applies = lambda *_: True
+        md = SimpleNamespace(
+            num_contexts=0,
+            num_seqs=num_gens,
+            num_ctx_tokens=0,
+            _seq_lens_cuda=torch.full((num_gens,), 99, dtype=torch.int32, device="cuda"),
+            _seq_lens=torch.full((num_gens,), 99, dtype=torch.int32),
+        )
+        w._ctx_side = (
+            w._launch_context_side(drafter, spec_metadata, md, captured.shape[0]) if side else None
+        )
+        assert (w._ctx_side is not None) == side
+        inputs = w.prepare_1st_drafter_inputs(
+            input_ids=None,
+            position_ids=None,
+            hidden_states=captured,
+            accepted_tokens=accepted,
+            num_accepted_tokens=num_accepted,
+            attn_metadata=md,
+            spec_metadata=spec_metadata,
+            draft_model=drafter,
+            total_target_tokens=captured.shape[0],
+        )
+        assert w._ctx_side is None
+        torch.cuda.synchronize()
+        return inputs, w._ctx_len, md, pool_storage
+
+    main, main_len, main_md, main_pool = prepare(False)
+    side, side_len, side_md, side_pool = prepare(True)
+    for key in ("noise_embedding", "query_positions", "num_ctx_per_req", "first_prev_tokens"):
+        assert torch.equal(side[key], main[key]), key
+    for field in ("pages", "offsets", "seq_lens", "kv_bounds"):
+        assert torch.equal(
+            getattr(side["block_placement"], field), getattr(main["block_placement"], field)
+        ), field
+    assert torch.equal(side_len, main_len)
+    assert torch.equal(side_md._seq_lens_cuda, main_md._seq_lens_cuda)
+    assert torch.equal(side_pool.view(torch.int16), main_pool.view(torch.int16))
+    assert not torch.equal(main_pool.view(torch.int16), storage.view(torch.int16))
+
+
+def test_store_context_latents_saturates_into_an_fp8_pool():
+    from tensorrt_llm._torch.speculative.dflash_attention import to_draft_fp8
+    from tensorrt_llm._torch.speculative.spec_tail_kernels import store_context_latents
+
+    fp8 = torch.float8_e4m3fn
+    num_tokens, num_layers, num_pages, page, latent_dim = 9, 3, 4, 32, 576
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    latent = (torch.randn(num_tokens, num_layers, latent_dim, device="cuda", generator=gen) * 3).to(
+        torch.bfloat16
+    )
+    # Saturating, in range, subnormal and NaN values.
+    latent[0, :, :5] = torch.tensor([600.0, -1000.0, 447.0, 1e-3, float("nan")], device="cuda").to(
+        torch.bfloat16
+    )
+    flat = torch.randperm(num_pages * page, device="cuda", generator=gen)[:num_tokens]
+    pages, offsets = flat // page, flat % page
+    # -1: another helix rank's position, left untouched.
+    mask = torch.tensor([1, 1, 0, 1, -1, 1, 1, 0, 1], dtype=torch.int8, device="cuda")
+    stored = mask >= 0
+
+    pools = [
+        torch.full((num_pages, 1, 1, page, latent_dim), 7.0, device="cuda").to(fp8)
+        for _ in range(num_layers)
+    ]
+    expected = [p.view(torch.uint8).clone() for p in pools]
+    for layer in range(num_layers):
+        rows = to_draft_fp8(latent[:, layer] * (mask > 0).to(torch.bfloat16)[:, None])
+        expected[layer][:, 0, 0][pages[stored], offsets[stored]] = rows[stored].view(torch.uint8)
+    ptrs = torch.tensor([p.data_ptr() for p in pools], dtype=torch.int64, device="cuda")
+    store_context_latents(latent, pools, ptrs, pages, offsets, mask)
+    for layer in range(num_layers):
+        assert torch.equal(pools[layer].view(torch.uint8), expected[layer])
+    assert pools[0][pages[0], 0, 0, offsets[0], :3].float().tolist() == [448.0, -448.0, 448.0]
+    assert int(pools[0].float().isnan().sum()) == 1
+
+
+@pytest.mark.parametrize("rows", [7, 14, 28])
+def test_q_kv_a_projection_is_one_gemm_matching_the_two(rows):
+    """The K3 MLA drafter's [q_a | kv_a] projection: one GEMM (split-K where pinned) whose
+    column ranges match the separate projections up to the GEMM's rounding, with the modules'
+    weights re-pointed at the stacked weight."""
+    from tensorrt_llm._torch.models.modeling_dspark import (
+        MLADSparkForCausalLM,
+        _q_kv_a_splitk_tactic,
+        _stack_q_kv_a_weight,
+    )
+    from tensorrt_llm._torch.modules.linear import Linear
+
+    gen = torch.Generator(device="cuda").manual_seed(rows)
+    hidden, q_lora, kv = 7168, 1536, 576
+    attn = SimpleNamespace(
+        q_a_proj=Linear(hidden, q_lora, bias=False, dtype=torch.bfloat16).cuda(),
+        kv_a_proj_with_mqa=Linear(hidden, kv, bias=False, dtype=torch.bfloat16).cuda(),
+    )
+    for linear in (attn.q_a_proj, attn.kv_a_proj_with_mqa):
+        linear.weight.data.copy_(
+            torch.randn(linear.weight.shape, device="cuda", generator=gen).to(torch.bfloat16) * 0.02
+        )
+    q_ref_w = attn.q_a_proj.weight.detach().clone()
+    weight = _stack_q_kv_a_weight(attn)
+    assert weight.shape == (q_lora + kv, hidden)
+    assert attn.q_a_proj.weight.data_ptr() == weight.data_ptr()
+    assert torch.equal(attn.q_a_proj.weight, q_ref_w)
+
+    drafter = object.__new__(MLADSparkForCausalLM)
+    drafter._q_kv_a_weights = [weight]
+    x = torch.randn(rows, hidden, device="cuda", generator=gen).to(torch.bfloat16)
+    out = drafter._q_kv_a_projection(0, x)
+    ref = F.linear(x.float(), weight.float())
+    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
+    if _q_kv_a_splitk_tactic(rows, q_lora + kv, hidden) is None:
+        pytest.skip("no pinned split-K tactic on this architecture")

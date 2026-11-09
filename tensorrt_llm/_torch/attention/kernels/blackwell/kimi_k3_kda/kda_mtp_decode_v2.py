@@ -37,6 +37,19 @@ CTA:
   the read boxes. While the tensor cores run, warps 1..15 stage Kbar, seed the GEMM2
   accumulator, build the B2 tiles and write the new tokens' replay-cache rows and conv-window
   commits (vectorized, from smem).
+
+Optional (compile-time) variants, both bitwise identical to the plain kernel fed by
+``k3_kda_fab``:
+
+* **PDL.** Launched as a programmatic dependent of the projection GEMM: the slot, accepted count,
+  S0 TMA, replay entries, conv windows and weights are loaded before ``griddepcontrol.wait``,
+  only the new-token rows (and the TMEM allocation) after it. Each CTA releases the dependent
+  grid (o_proj) once it holds its tensor memory, so o_proj streams its weights during the
+  recurrence.
+* **Fused forget gate.** The kernel reads ``f_a`` (``k3_kda_fab`` in f_a mode) instead of the
+  gate and computes ``bf16(f_a @ W_fb[h]^T)`` itself: warps 8..15 each own 16 ``W_fb`` rows
+  (TMA-loaded into free scratch words up front) and run eight ``mma.sync`` k16 steps on f_a
+  fragments loaded with the other new-token rows, before the precompute barrier.
 """
 
 import cutlass
@@ -46,6 +59,9 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from .....kernels.blackwell.raw_ptx import ldsm_x4 as ldmatrix_x4
+from .....kernels.blackwell.raw_ptx import mma_bf16 as mma_bf16_16816
+from .....kernels.blackwell.utils import griddepcontrol_launch_dependents, griddepcontrol_wait
 from .kda_mtp_decode import (
     NUM_THREADS,
     SCRATCH_FLOATS,
@@ -73,6 +89,11 @@ OFF_B2LO = 12800  # 128 x 16   Kbar lo
 OFF_A3 = 16384  # 64 x 128   [Kf; Qf hi; Qf lo; -] (clear of the S0 boxes)
 OFF_B3HI = 24576  # 16 x 128   Kb hi
 OFF_B3LO = 26624  # 16 x 128   Kb lo
+# FUSED_FB: this head's W_fb rows (128 x 128 BF16 = 32 KB, two 128B-swizzled TMA boxes of 64
+# columns) in scratch words that stay unused until the cumulative-gate stage writes the GEMM3
+# tiles (OFF_A3 onwards).
+OFF_FB = 16384
+FB_BOX_COLS = 64
 
 
 def asm_words(n, asm, constraints, operands, *, loc, ip):
@@ -168,6 +189,70 @@ def st_shared_f32x4(addr, a, b, c, d):
         "r,f,f,f,f",
         [cutlass.Int32(addr).ir_value()] + [cutlass.Float32(x).ir_value() for x in (a, b, c, d)],
     )
+
+
+@dsl_user_op
+def ld_global_b32(addr: Int64, *, loc=None, ip=None):
+    """One 32-bit word (4-byte aligned) from global memory, unconverted."""
+    return asm_words(
+        1, "ld.global.b32 $0, [$1];", "=r,l", [Int64(addr).ir_value(loc=loc, ip=ip)], loc=loc, ip=ip
+    )[0]
+
+
+def round_bf16(x: cutlass.Float32) -> cutlass.Float32:
+    """``x`` rounded to BF16 (nearest even, ``cvt.rn``) and widened back to FP32."""
+    w = cvt_bf16x2(x, x).bitcast(cutlass.Int32)
+    return (w & cutlass.Int32(-65536)).bitcast(cutlass.Float32)
+
+
+def _load_fb_b_fragments(fa, i_n, NEW_TOK, lane, r_fb_b):
+    """B fragments of the f_b MMA (``m16n8k16``, K = 128 in eight k16 steps): column ``n`` holds
+    the f_a row of this request's token whose packed row index is ``n`` mod 8 (the column
+    k3_kda_fab's tail gives it); lane ``l`` holds rows ``k = 16 kk + 2 (l % 4) + {0, 1}`` and
+    ``+ 8`` of column ``l / 4``. Columns without a token of this request read the request's
+    last row here and are zeroed before the MMA."""
+    jt = (lane // 4 - (i_n * NEW_TOK) % 8 + 8) % 8
+    over = cutlass.Int32(jt >= NEW_TOK)
+    tok = i_n * NEW_TOK + jt - over * (jt - (NEW_TOK - 1))
+    kq = 2 * (lane % 4)
+    for kk in range(8):
+        r_fb_b[2 * kk] = ld_global_b32(gaddr(fa, (0, tok, 16 * kk + kq)))
+        r_fb_b[2 * kk + 1] = ld_global_b32(gaddr(fa, (0, tok, 16 * kk + 8 + kq)))
+
+
+def _load_new_token_row(
+    x_q,
+    x_k,
+    x_v,
+    g,
+    onorm_g,
+    beta,
+    tok_row,
+    i_h,
+    i_hv,
+    hk_off,
+    hv_off,
+    k4,
+    r_new,
+    r_newb,
+    use_flat_layout,
+    fused_fb,
+):
+    """Issue one lane's loads of a new token's projections: q / k / v / gate (unless the gate is
+    computed in the kernel) / output gate four channels each into ``r_new``, beta into
+    ``r_newb``."""
+    if cutlass.const_expr(use_flat_layout):
+        ld_row4(x_q, (0, tok_row, hk_off + k4), r_new, 0)
+        ld_row4(x_k, (0, tok_row, hk_off + k4), r_new, 4)
+        ld_row4(x_v, (0, tok_row, hv_off + k4), r_new, 8)
+    else:
+        ld_row4(x_q, (0, tok_row, i_h, k4), r_new, 0)
+        ld_row4(x_k, (0, tok_row, i_h, k4), r_new, 4)
+        ld_row4(x_v, (0, tok_row, i_hv, k4), r_new, 8)
+    if cutlass.const_expr(not fused_fb):
+        ld_row4(g, (0, tok_row, i_hv, k4), r_new, 12)
+    ld_row4(onorm_g, (0, tok_row, i_hv, k4), r_new, 16)
+    r_newb[0] = cutlass.Float32(beta[0, tok_row, i_hv])
 
 
 def gaddr(tensor, coord):
@@ -267,6 +352,10 @@ def kda_decode_mtp_v2_kernel(
     box_layout_t: cute.ComposedLayout,
     tiled_mma2q: cute.TiledMma,
     smem_layout_b2q: cute.ComposedLayout,
+    fa: cute.Tensor,
+    tma_atom_fb: cute.CopyAtom,
+    mFb_tma: cute.Tensor,
+    fb_layout: cute.ComposedLayout,
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -277,11 +366,24 @@ def kda_decode_mtp_v2_kernel(
     onorm_eps: cutlass.Constexpr[float],
     USE_FLAT_LAYOUT: cutlass.Constexpr[bool],
     SPLIT_V: cutlass.Constexpr[int],
+    PDL: cutlass.Constexpr[bool],
+    FUSED_FB: cutlass.Constexpr[bool],
 ):
     """KDA MTP verify, packed-token / fused-norm contract (see the module docstring).
 
     Grid ``(HV, N, SPLIT_V)``: one (head, request) tile per CTA, or per cluster pair of CTAs
-    with ``SPLIT_V == 2`` (each CTA seeds and stores half of the state rows)."""
+    with ``SPLIT_V == 2`` (each CTA seeds and stores half of the state rows).
+
+    ``PDL``: launched as a programmatic dependent; everything that does not depend on this
+    layer's projections (slot, accepted count, state TMA, replay entries, conv windows, weights)
+    is loaded before ``griddepcontrol.wait``, the new-token rows and TMEM after it; the dependent
+    grid is released once TMEM is allocated.
+    ``FUSED_FB``: ``fa`` holds the BF16 ``f_a`` rows ``[1, T, 128]`` instead of the forget gate;
+    the CTA computes its head's gate ``bf16(f_a @ W_fb[h]^T)`` with ``mma.sync`` (``W_fb`` rows
+    TMA-loaded via ``tma_atom_fb`` before ``griddepcontrol.wait``, f_a fragments loaded with the
+    other new-token rows): FP32 accumulation, the operands, positions and k order of
+    ``k3_kda_fab``'s tail, so bitwise its forget gate.
+    """
     tidx, _, _ = cute.arch.thread_idx()
     in_warp_tid = tidx % 32
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -345,6 +447,7 @@ def kda_decode_mtp_v2_kernel(
     mbar2 = smem.allocate_array(cutlass.Int64, 1)
     mbar_ld = smem.allocate_array(cutlass.Int64, 1)
     mbar2b = smem.allocate_array(cutlass.Int64, 1)
+    mbar_fb = smem.allocate_array(cutlass.Int64, 1)
     sScratch = smem.allocate_tensor(cutlass.Float32, cute.make_layout((SCRATCH_FLOATS,)), 1024)
     sB1 = cute.make_tensor(
         cute.recast_ptr(sScratch.iterator + OFF_B1, smem_layout_b1.inner, dtype=cutlass.Float32),
@@ -432,26 +535,57 @@ def kda_decode_mtp_v2_kernel(
     r_new = cute.make_rmem_tensor(cute.make_layout((5 * 4,)), cutlass.Int32)
     r_newb = cute.make_rmem_tensor(cute.make_layout((1,)), cutlass.Float32)
     tok_row = i_n * NEW_TOK + warp_idx
-    if warp_idx < NEW_TOK:
-        if cutlass.const_expr(USE_FLAT_LAYOUT):
-            ld_row4(x_q, (0, tok_row, hk_off + k4), r_new, 0)
-            ld_row4(x_k, (0, tok_row, hk_off + k4), r_new, 4)
-            ld_row4(x_v, (0, tok_row, hv_off + k4), r_new, 8)
-        else:
-            ld_row4(x_q, (0, tok_row, i_h, k4), r_new, 0)
-            ld_row4(x_k, (0, tok_row, i_h, k4), r_new, 4)
-            ld_row4(x_v, (0, tok_row, i_hv, k4), r_new, 8)
-        ld_row4(g, (0, tok_row, i_hv, k4), r_new, 12)
-        ld_row4(onorm_g, (0, tok_row, i_hv, k4), r_new, 16)
-        r_newb[0] = cutlass.Float32(beta[0, tok_row, i_hv])
+    new_rows = (x_q, x_k, x_v, g, onorm_g, beta)
+    # FUSED_FB: warp REPLAY_WARP0 + mi computes the forget gate of W_fb rows [16 mi, 16 mi + 16)
+    # of this head; its f_a B fragments are loaded with the other new-token rows.
+    r_fb_b = cute.make_rmem_tensor(cute.make_layout((16,)), cutlass.Int32)
+    if cutlass.const_expr(not PDL):
+        if warp_idx < NEW_TOK:
+            _load_new_token_row(
+                *new_rows,
+                tok_row,
+                i_h,
+                i_hv,
+                hk_off,
+                hv_off,
+                k4,
+                r_new,
+                r_newb,
+                USE_FLAT_LAYOUT,
+                FUSED_FB,
+            )
+        if cutlass.const_expr(FUSED_FB):
+            if warp_idx >= REPLAY_WARP0:
+                _load_fb_b_fragments(fa, i_n, NEW_TOK, in_warp_tid, r_fb_b)
     if warp_idx == 0:
         with cute.arch.elect_one():
             cute.arch.mbarrier_init(mbar1, 1)
             cute.arch.mbarrier_init(mbar2, 1)
             cute.arch.mbarrier_init(mbar2b, 1)
             cute.arch.mbarrier_init(mbar_ld, 1)
+            if cutlass.const_expr(FUSED_FB):
+                cute.arch.mbarrier_init(mbar_fb, 1)
     cute.arch.mbarrier_init_fence()
     cute.arch.barrier()
+    if cutlass.const_expr(FUSED_FB):
+        # This head's W_fb rows into scratch (independent of the previous grid).
+        sFb = cute.make_tensor(
+            cute.recast_ptr(sScratch.iterator + OFF_FB, fb_layout.inner, dtype=cutlass.BFloat16),
+            fb_layout.outer,
+        )
+        gFb = cute.local_tile(mFb_tma, (TILE_K, FB_BOX_COLS), (None, None))
+        tFbs, tFbg = cpasync.tma_partition(
+            tma_atom_fb,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sFb, 0, 2),
+            cute.group_modes(gFb, 0, 2),
+        )
+        if warp_idx == TMA_WARP:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(mbar_fb, TILE_K * TILE_K * 2)
+            for b in cutlass.range_constexpr(TILE_K // FB_BOX_COLS):
+                cute.copy(tma_atom_fb, tFbg[(None, i_hv, b)], tFbs[(None, b)], tma_bar_ptr=mbar_fb)
     # V2 state views may place many layer pages between adjacent slots. Widen
     # the slot before indexing: slot * state stride can exceed INT32_MAX.
     slot = Int64(slot32)
@@ -504,10 +638,37 @@ def kda_decode_mtp_v2_kernel(
         )
         if warp_idx == TMA_WARP:
             cute.copy(tma_atom_l, tGl_h, tSl_h, tma_bar_ptr=mbar_ld)
+    if cutlass.const_expr(PDL):
+        # Everything above only reads this layer's pools, metadata and weights; the new-token
+        # rows are the previous grids' outputs.
+        griddepcontrol_wait()
+        if warp_idx < NEW_TOK:
+            _load_new_token_row(
+                *new_rows,
+                tok_row,
+                i_h,
+                i_hv,
+                hk_off,
+                hv_off,
+                k4,
+                r_new,
+                r_newb,
+                USE_FLAT_LAYOUT,
+                FUSED_FB,
+            )
+        if cutlass.const_expr(FUSED_FB):
+            if warp_idx >= REPLAY_WARP0:
+                _load_fb_b_fragments(fa, i_n, NEW_TOK, in_warp_tid, r_fb_b)
     # TMEM allocation overlaps the in-flight loads; the pointer is retrieved after the
-    # precompute barrier (first TMEM use is the S0 staging in the chunk stage).
+    # precompute barrier (first TMEM use is the S0 staging in the chunk stage). With PDL it
+    # follows griddepcontrol.wait, so a waiting CTA never holds tensor memory.
     if warp_idx == 0:
         cute.arch.alloc_tmem(TMEM_COLS, tmem_holder)
+        if cutlass.const_expr(PDL):
+            # A dependent reads this grid's outputs only after its own griddepcontrol.wait, i.e.
+            # after this grid completed. Released after the allocation, so that a dependent CTA
+            # resident on this SM cannot take the tensor memory this CTA still needs.
+            griddepcontrol_launch_dependents()
     # (3) placement: the slot-independent operands first, the token rows once the accepted count
     #     is in. Smem rows keep the [row][channel] fp32 layout of the precompute.
     if quad < 3:
@@ -542,7 +703,8 @@ def kda_decode_mtp_v2_kernel(
         st_shared_f32x4(saddr(sXQ, (t_new + 3) * K + k4), *unpack4(x_q.element_type, r_new, 0))
         st_shared_f32x4(saddr(sXK, (t_new + 3) * K + k4), *unpack4(x_k.element_type, r_new, 4))
         st_shared_f32x4(saddr(sXV, (t_new + 3) * V + k4), *unpack4(x_v.element_type, r_new, 8))
-        st_shared_f32x4(saddr(sGin, t_new * K + k4), *unpack4(g.element_type, r_new, 12))
+        if cutlass.const_expr(not FUSED_FB):
+            st_shared_f32x4(saddr(sGin, t_new * K + k4), *unpack4(g.element_type, r_new, 12))
         if in_warp_tid == 0:
             sBetaRaw[t_new] = r_newb[0]
     if (warp_idx >= REPLAY_WARP0) & (rep < commit_len):
@@ -557,6 +719,33 @@ def kda_decode_mtp_v2_kernel(
         st_shared_f32x4(saddr(sXV, (rep + 3) * V + k4), *unpack4(CONV_DTYPE, r_rep, 20))
         if in_warp_tid == 0:
             sBeta[rep] = r_repb[0]
+    if cutlass.const_expr(FUSED_FB):
+        # ---- forget gate of the new tokens, gate[t, row] = bf16(f_a[t] @ W_fb[h * 128 + row]^T)
+        #      (MMA M = this warp's 16 W_fb rows, N = the token columns, K = 128 in eight
+        #      sequential k16 steps from zero) into the raw-gate rows read by the precompute.
+        if warp_idx >= REPLAY_WARP0:
+            col0 = (i_n * NEW_TOK) % 8
+            if (in_warp_tid // 4 - col0 + 8) % 8 >= NEW_TOK:
+                for i in cutlass.range_constexpr(16):
+                    r_fb_b[i] = cutlass.Int32(0)
+            # A fragments: W_fb rows 16 mi + {0..7, 8..15} x k16 chunk kk through ldmatrix.x4 on
+            # the 128B-swizzled boxes (row r & 7 == lane & 7 selects the 16 B unit XOR)
+            mi = warp_idx - REPLAY_WARP0
+            mat = in_warp_tid >> 3
+            r8 = in_warp_tid & 7
+            a_row = saddr(sScratch, OFF_FB) + (mi * 16 + (mat & 1) * 8 + r8) * 128
+            cute.arch.mbarrier_wait(mbar_fb, 0)
+            acc = [cutlass.Float32(0.0)] * 4
+            for kk in cutlass.range_constexpr(TILE_K // 16):
+                a = ldmatrix_x4(
+                    a_row + (kk // 4) * (TILE_K * 128) + ((((kk % 4) * 2 + (mat >> 1)) ^ r8) << 4)
+                )
+                acc = mma_bf16_16816(a, r_fb_b[2 * kk], r_fb_b[2 * kk + 1], acc)
+            for e in cutlass.range_constexpr(4):
+                jt = (2 * (in_warp_tid & 3) + (e & 1) - col0 + 8) % 8
+                if jt < NEW_TOK:
+                    row = mi * 16 + (in_warp_tid >> 2) + (e >> 1) * 8
+                    sGin[(commit_len + jt) * K + row] = round_bf16(acc[e])
     # Padding rows [T_loop, t_max) of the gates, values and betas are zeroed so the chunk
     # stage's r_Y / cumulative-gate / V' loops are branch-free.
     if tidx < K:

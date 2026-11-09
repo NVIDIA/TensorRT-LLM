@@ -137,10 +137,15 @@ class _FakeVocabParallelHead:
 
     def __init__(self, lm_head):
         self.lm_head = lm_head
+        self.bound_markov_head = None
 
     @staticmethod
     def supports(lm_head):
         return True
+
+    def bind_markov_head(self, markov_w1, markov_w2):
+        self.bound_markov_head = (markov_w1, markov_w2)
+        return False
 
 
 def _bare_worker(worker_cls, monkeypatch, **spec_config):
@@ -224,8 +229,9 @@ def test_vocab_parallel_selection_decisions(monkeypatch):
     dspark = _bare_worker(DSparkWorker, monkeypatch)
     dspark.bind_target_lm_head(lm_head, _plain_logits_processor())
     assert dspark._vocab_parallel_draft_tokens(drafter()) == dspark._argmax_block_tokens
-    markov = drafter(has_markov_head=True)
+    markov = drafter(has_markov_head=True, markov_w1=object(), markov_w2=object())
     assert dspark._vocab_parallel_draft_tokens(markov) == dspark._markov_block_tokens
+    assert dspark._vocab_parallel.head.bound_markov_head == (markov.markov_w1, markov.markov_w2)
 
     # A guided decoder edits the full target logits, also if the post-load
     # hook runs again.

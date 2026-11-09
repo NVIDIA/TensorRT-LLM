@@ -183,6 +183,24 @@ def test_configure_does_not_claim_success_when_nothing_was_bound(
     assert any("could not set" in msg.lower() for msg in rec_logger.warnings)
 
 
+@pytest.mark.parametrize("value,expect_numa", [("1", True),
+                                               ("pin_executor", True),
+                                               ("0", False)])
+def test_configure_pin_executor_applies_the_numa_affinity_of_1(
+        monkeypatch, rec_logger, value, expect_numa):
+    _fake_psutil(monkeypatch, current=[0, 1], ncpus=4)
+    monkeypatch.setattr(llmapi_utils, "get_numa_aware_cpu_affinity",
+                        lambda device_id: [2, 3])
+    applied = []
+    monkeypatch.setattr(llmapi_utils, "_set_affinity_all_threads",
+                        lambda cpus: applied.append(list(cpus)) or (1, 1))
+    monkeypatch.setenv("TLLM_NUMA_AWARE_WORKER_AFFINITY", value)
+
+    configure_cpu_affinity(0)
+
+    assert applied == ([[2, 3]] if expect_numa else [])
+
+
 _REAL_THREAD_PROBE = """
 import os
 import sys

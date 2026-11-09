@@ -63,7 +63,8 @@ from tensorrt_llm.llmapi.disagg_utils import (
     validate_internal_request_auth_key)
 from tensorrt_llm.llmapi.llm_args import (SERVE_CLI_CONFIG_FIELDS,
                                           KvCacheConnectorConfig, SleepConfig,
-                                          TorchLlmArgs, build_cli_config)
+                                          TorchLlmArgs, build_cli_config,
+                                          drafter_reads_helix_sharded_context)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
@@ -784,8 +785,16 @@ def launch_server(
     # Publish an explicit serving role before constructing/spawning the model.
     # Remote-tail context workers use it to omit generation-only weights.
     if server_role is not None:
-        os.environ[
-            DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = server_role.name.lower()
+        role = server_role.name.lower()
+        os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = role
+        # MPI workers can predate this process (trtllm-llmapi-launch) and then
+        # never see the variable above; forward it through worker_main's
+        # explicit environment overrides as well.
+        llm_args["env_overrides"] = {
+            **(llm_args.get("env_overrides") or {}),
+            DisaggLauncherEnvs.TLLM_DISAGG_ROLE.value:
+            role,
+        }
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -2828,28 +2837,42 @@ def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
     if with_spec != {"ctx", "gen"}:
         return ("speculative_config in both context_servers and "
                 "generation_servers")
-    if len({(cfg.other_args.get("tensor_parallel_size", 1),
-             bool(cfg.other_args.get("enable_attention_dp", False)))
-            for cfg in server_configs}) != 1:
-        return ("the same tensor_parallel_size and enable_attention_dp in "
-                "context_servers and generation_servers")
+    # Ranks hold the same KV heads when their attention TP matches: attention
+    # DP keeps every head on each rank.
+    if len({
+            1 if cfg.other_args.get("enable_attention_dp", False) else
+            cfg.other_args.get("tensor_parallel_size", 1)
+            for cfg in server_configs
+    }) != 1:
+        return ("the same attention tensor parallelism (tensor_parallel_size, "
+                "or 1 with enable_attention_dp) in context_servers and "
+                "generation_servers")
+    if any(
+            cfg.other_args.get("context_parallel_size", 1) != 1
+            for cfg in server_configs
+    ) and not all(
+            drafter_reads_helix_sharded_context(
+                cfg.other_args["speculative_config"].get("decoding_type"),
+                cfg.other_args["speculative_config"].get("attention_backend"))
+            for cfg in server_configs):
+        return ("context_parallel_size 1, or DSpark with attention_backend "
+                "CUTEDSL, in both sections")
     for cfg in server_configs:
         spec = cfg.other_args["speculative_config"]
         backend = spec.get("attention_backend")
         if not ((spec.get("decoding_type") == "DFlash" and backend == "TRTLLM")
                 or (spec.get("decoding_type") == "DSpark"
-                    and backend in (None, "AUTO", "TRTLLM"))):
+                    and backend in (None, "AUTO", "TRTLLM", "CUTEDSL"))):
             return ("speculative_config to be DFlash with attention_backend "
-                    "TRTLLM, or DSpark with attention_backend AUTO or TRTLLM, "
-                    "in both sections")
+                    "TRTLLM, or DSpark with attention_backend AUTO, TRTLLM "
+                    "or CUTEDSL, in both sections")
         if (spec.get("draft_len_schedule") is not None
                 or spec.get("max_concurrency") is not None):
             return "draft_len_schedule and max_concurrency to be unset in both sections"
         if cfg.other_args.get("attn_backend", "TRTLLM") != "TRTLLM":
             return "attn_backend TRTLLM in both sections"
-        if (cfg.other_args.get("pipeline_parallel_size", 1) != 1
-                or cfg.other_args.get("context_parallel_size", 1) != 1):
-            return "pipeline_parallel_size and context_parallel_size to be 1 in both sections"
+        if cfg.other_args.get("pipeline_parallel_size", 1) != 1:
+            return "pipeline_parallel_size to be 1 in both sections"
         if cfg.other_args.get("kv_cache_compression_config") is not None:
             return "kv_cache_compression_config to be unset in both sections"
         kv_cache = cfg.other_args.get("kv_cache_config") or {}

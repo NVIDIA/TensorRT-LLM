@@ -493,15 +493,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Whether an idle generation worker may skip its receive-status collectives.
 
         Requires a synchronized status poll in which every rank owns every
-        request (no attention DP, one PP stage, no context parallelism), so
-        every rank requests the same receives in the same iteration.
+        request (no attention DP, one PP stage), so every rank requests the same
+        receives in the same iteration; helix CP ranks hold to that through
+        DisaggTransferCoordinator.align_gen_admission_across_cp.
         """
-        return (
-            gen_need_sync
-            and not mapping.enable_attention_dp
-            and mapping.pp_size == 1
-            and mapping.cp_size == 1
-        )
+        return gen_need_sync and not mapping.enable_attention_dp and mapping.pp_size == 1
 
     def _init_gen_idle_poll(self, enabled: bool) -> None:
         """Set up the idle-poll skip of check_gen_transfer_status (called by _init_sync_policy).

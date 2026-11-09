@@ -824,6 +824,9 @@ def test_dflash_block_tables_with_fp8_target_and_bf16_draft() -> None:
             assert cache.resize(num_blocks * TOKENS_PER_BLOCK, 0)
 
         worker = object.__new__(DFlashWorker)
+        worker._ctx_helix = None
+        worker._ctx_store_stream = None
+        worker._ctx_store_operands = ()
         worker._ctx_unified_cache = True
         pool = worker._managed_ctx_pool(
             manager, 1, draft.num_kv_heads, draft.head_dim, torch.bfloat16, 2

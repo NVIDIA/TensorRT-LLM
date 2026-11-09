@@ -80,6 +80,7 @@ l0_gb300_multi_gpus:
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
+  - unittest/_torch/modeling/test_kimi_k3_moe_front.py
   # MNNVL all-reduce + residual RMSNorm kernels (slot / two-shot / MoE fold / GEMM) and the LL TP exchanges.
   - unittest/_torch/multi_gpu/test_mnnvl_fused_allreduce_norm.py
   - unittest/_torch/multi_gpu/test_ll_exchange.py
@@ -106,6 +107,14 @@ l0_gb300_multi_gpus:
   # TP2 DSpark MLA drafter (split context projection, fused all-reduce + norm)
   # vs the single-GPU drafter.
   - unittest/_torch/multi_gpu/test_dspark_drafter_tp_fusion.py
+  # Pushed MNNVL all-reduce (low-M GEMM push epilogue + finish kernel) vs the
+  # C++ MNNVL all-reduce on 2 / 4 ranks, bitwise.
+  - unittest/_torch/multi_gpu/test_mnnvl_pushed_allreduce.py
+  # Pushed BF16 split-K GEMM and the RESIDUAL_RMS_NORM finish of a pushed call.
+  - unittest/_torch/multi_gpu/test_mnnvl_pushed_allreduce_norm.py
+  # MNNVL RMS_NORM_QUANT_MXFP8 fusion and the per-call-site own workspace.
+  - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_rms_norm_mxfp8_fusion
+  - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_own_workspace
   - unittest/_torch/multi_gpu_modeling -k "deepseek"
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-tp2pp2-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-low_precision_combine=False-torch_compile=True]

@@ -54,6 +54,8 @@ def _make_decoder_runner(
     graph_key: KeyType | None,
     runner_enabled: bool = True,
     private_decoder: bool = False,
+    mapping: Mapping | None = None,
+    lm_head: object | None = None,
     **config_changes: Any,
 ) -> tuple[DecoderRunner, Mock, Mock, Mock, dict[str, object]]:
     config = decoder_config(
@@ -74,6 +76,8 @@ def _make_decoder_runner(
             extra_attrs={},
             model_config=SimpleNamespace(pretrained_config=SimpleNamespace(rope_scaling=None)),
         )
+        if lm_head is not None:
+            model.lm_head = lm_head
     outputs = {"logits": object()}
     backend = Mock()
     backend.enabled = runner_enabled
@@ -100,7 +104,7 @@ def _make_decoder_runner(
             model,
             config,
             model_caller=Mock(),
-            mapping=Mapping(),
+            mapping=mapping or Mapping(),
             dist=None,
             moe_load_balancer=None,
             sparse_attention_config=None,
@@ -912,3 +916,71 @@ def test_decoder_runner_forward_enters_model_context() -> None:
 
     engine._forward_decoder.assert_called_once_with(inputs, resources, is_dummy=False)
     assert get_model_extra_attrs() is None
+
+
+_SHARD, _VOCAB = 4, 32
+
+
+def _helix_adp_mappings() -> tuple[Mapping, Mapping]:
+    """Helix CP 8 at tp_size 1 with attention DP: executor and LM-head mappings."""
+    executor = Mapping(
+        world_size=8,
+        rank=3,
+        tp_size=1,
+        cp_size=8,
+        cp_config={"cp_type": "HELIX"},
+        enable_attention_dp=True,
+    )
+    return executor, executor.repurpose_helix_cp_to_tp().mapping_for_full_rows()
+
+
+def _plain_adp_mappings() -> tuple[Mapping, Mapping]:
+    """Attention DP over tp_size 8: the LM head's TP group is the DP group."""
+    executor = Mapping(world_size=8, rank=3, tp_size=8, enable_attention_dp=True)
+    return executor, executor
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("has_post_processor", [False, True])
+@pytest.mark.parametrize(
+    "mappings,shares_requests",
+    [(_helix_adp_mappings, True), (_plain_adp_mappings, False)],
+    ids=["helix_adp", "plain_adp"],
+)
+def test_vocab_shard_post_processor_gather_group(
+    mappings: Any, shares_requests: bool, has_post_processor: bool
+) -> None:
+    executor_mapping, lm_head_mapping = mappings()
+    lm_head = SimpleNamespace(mapping=lm_head_mapping, num_embeddings=_VOCAB)
+    engine, *_ = _make_decoder_runner(None, mapping=executor_mapping, lm_head=lm_head)
+    request = SimpleNamespace(
+        py_logits_post_processors=[Mock()] if has_post_processor else None,
+        py_orig_prompt_len=3,
+        get_tokens=lambda beam: [1, 2, 3],
+    )
+    scheduled = ScheduledRequests()
+    scheduled.context_requests_last_chunk = [request]
+    shard = torch.zeros(1, _SHARD, dtype=torch.bfloat16)
+    outputs = {"logits": shard, "logits_vocab_shard": True}
+    gathered = torch.ones(1, _VOCAB)
+    engine._apply_logits_processors = Mock()
+
+    with patch("tensorrt_llm._torch.distributed.allgather", return_value=gathered) as allgather:
+        if has_post_processor and not shares_requests:
+            with pytest.raises(RuntimeError, match="schedule the same requests"):
+                DecoderRunner._execute_logit_post_processors(engine, scheduled, outputs)
+            allgather.assert_not_called()
+            return
+        DecoderRunner._execute_logit_post_processors(engine, scheduled, outputs)
+
+    if not has_post_processor:
+        allgather.assert_not_called()
+        engine._apply_logits_processors.assert_not_called()
+        return
+    # Helix + attention DP: the gather spans the LM head's tp*cp group, which
+    # the executor mapping's TP group (tp_size 1) is not.
+    (shard_arg, mapping_arg), kwargs = allgather.call_args
+    assert shard_arg is shard and kwargs == {"dim": -1}
+    assert mapping_arg is lm_head_mapping and mapping_arg.tp_size == 8
+    engine._apply_logits_processors.assert_called_once()
+    assert engine._apply_logits_processors.call_args.args[2].shape == (1, _VOCAB)

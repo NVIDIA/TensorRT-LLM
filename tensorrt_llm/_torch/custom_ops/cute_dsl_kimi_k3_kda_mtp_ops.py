@@ -245,7 +245,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         if split_v == 2:
             # cluster pair: the two CTAs of a (head, request) must be co-scheduled (in-place state)
             launched.launch(
-                grid=(HV, N, 2), block=[NUM_THREADS, 1, 1], cluster=(1, 1, 2), stream=stream
+                grid=(HV, N, 2),
+                block=[NUM_THREADS, 1, 1],
+                cluster=(1, 1, 2),
+                stream=stream,
+                **launch_kwargs,
             )
         else:
             launched.launch(
@@ -420,6 +424,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         beta_cache: cute.Tensor,
         ssm_state_indices: cute.Tensor,
         num_accepted_tokens: cute.Tensor,
+        fa: cute.Tensor,
+        w_fb: cute.Tensor,
         N: cutlass.Int32,
         scale: cutlass.Constexpr[float],
         HV: cutlass.Constexpr[int],
@@ -431,12 +437,38 @@ if IS_CUTLASS_DSL_AVAILABLE:
         onorm_eps: cutlass.Constexpr[float],
         USE_FLAT_LAYOUT: cutlass.Constexpr[bool],
         SPLIT_V: cutlass.Constexpr[int],
+        PDL: cutlass.Constexpr[bool],
+        FUSED_FB: cutlass.Constexpr[bool],
         stream: cuda.CUstream,
     ):
         """Host side of ``kda_decode_mtp_v2_kernel`` (packed rows, fused gated RMSNorm, bf16
-        output, 3xTF32); the state is committed in place."""
+        output, 3xTF32): the tf32 MMA atoms, operand smem layouts and state TMA atoms of
+        ``_run_kda_decode_mtp``, then the launch. With ``FUSED_FB``, ``fa`` is the BF16
+        ``[1, T, 128]`` f_a view and ``w_fb`` the BF16 ``[HV * 128, 128]`` f_b weight (else both
+        are unused placeholders)."""
         mma = _verify_mma_atoms(cutlass.Float32, V, K, 3 * T_PAD)
         state_tma = _state_tma_atoms(h0, h0, V, K, SPLIT_V)
+        if cutlass.const_expr(FUSED_FB):
+            # W_fb rows of one head: two 128 x 64 BF16 boxes with 128B swizzle.
+            fb_atom = sm100_utils.make_smem_layout_atom(
+                tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.BFloat16
+            )
+            mFb = cute.make_tensor(
+                w_fb.iterator, cute.make_layout((w_fb.shape[0], K), stride=(K, 1))
+            )
+            tma_atom_fb, mFb_tma = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                mFb,
+                cute.tile_to_shape(fb_atom, (K, 64), order=(0, 1)),
+                (K, 64),
+            )
+            fb_layout = cute.tile_to_shape(fb_atom, (K, 64, K // 64), (0, 1, 2))
+        else:
+            tma_atom_fb, mFb_tma, fb_layout = (
+                state_tma.tma_atom_l,
+                state_tma.mS_tma,
+                state_tma.box_layout,
+            )
         launched = kda_decode_mtp_v2_kernel(
             h0,
             x_q,
@@ -481,6 +513,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             state_tma.box_layout_t,
             mma.tiled_mma2q,
             mma.smem_layout_b2q,
+            fa,
+            tma_atom_fb,
+            mFb_tma,
+            fb_layout,
             scale,
             HV,
             K,
@@ -491,8 +527,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             onorm_eps,
             USE_FLAT_LAYOUT,
             SPLIT_V,
+            PDL,
+            FUSED_FB,
         )
-        _launch_verify(launched, HV, N, SPLIT_V, stream)
+        _launch_verify(launched, HV, N, SPLIT_V, stream, use_pdl=PDL)
 
     @cute.jit
     def _run_kda_decode_mtp_2cta(
@@ -632,6 +670,8 @@ def _require_stride_layout(
     packed_token_layout,
     fuse_output_norm,
     quantize_output,
+    fa=None,
+    w_fb=None,
 ):
     if x_q.ndim != 4 or x_k.ndim != 4 or x_v.ndim != 4:
         raise ValueError("Expected x_q/x_k/x_v to have shape [1, T, H, D].")
@@ -639,7 +679,14 @@ def _require_stride_layout(
         raise ValueError(f"Expected x_q/x_k shape [1, {T_total}, {H}, {K}].")
     if x_v.shape != (1, T_total, HV, V):
         raise ValueError(f"Expected x_v shape [1, {T_total}, {HV}, {V}].")
-    if g.ndim != 4 or g.shape != (1, T_total, HV, K):
+    if fa is not None:
+        if fa.ndim != 3 or fa.shape != (1, T_total, K) or fa.dtype != torch.bfloat16:
+            raise ValueError(f"Expected bf16 fa shape [1, {T_total}, {K}].")
+        if w_fb.shape != (HV * K, K) or w_fb.dtype != torch.bfloat16 or not w_fb.is_contiguous():
+            raise ValueError(f"Expected a contiguous bf16 w_fb of shape [{HV * K}, {K}].")
+        if w_fb.data_ptr() % 16:
+            raise ValueError("Expected w_fb to be 16-byte aligned (TMA source).")
+    elif g.ndim != 4 or g.shape != (1, T_total, HV, K):
         raise ValueError(f"Expected g shape [1, {T_total}, {HV}, {K}].")
     if beta.ndim != 3 or beta.shape != (1, T_total, HV):
         raise ValueError(f"Expected beta shape [1, {T_total}, {HV}].")
@@ -670,7 +717,7 @@ def _require_stride_layout(
         "x_q": x_q,
         "x_k": x_k,
         "x_v": x_v,
-        "g": g,
+        "g": g if fa is None else fa,
         "beta": beta,
         "recurrent_state": recurrent_state,
         "k_cache": k_cache,
@@ -862,6 +909,26 @@ def _num_sms(device: torch.device) -> int:
     return _num_sms_cache[index]
 
 
+def v2_verify_applies(num_heads: int, num_requests: int, num_spec: int, device) -> bool:
+    """Whether a packed, fused-norm, BF16-output verify of ``num_heads`` x ``num_requests``
+    tiles runs ``kda_decode_mtp_v2_kernel`` (`_select_verify_kernel`, for operands on its
+    contract)."""
+    return (
+        _select_verify_kernel(
+            packed_token_layout=True,
+            fuse_output_norm=True,
+            quantize_output=False,
+            bf16_math=_bf16_math_enabled(),
+            replay_only=False,
+            num_spec=num_spec,
+            num_tiles=num_heads * num_requests,
+            num_sms=_num_sms(device),
+            operands_ok=lambda: True,
+        )
+        == "v2"
+    )
+
+
 def _select_verify_kernel(
     *,
     packed_token_layout: bool,
@@ -987,6 +1054,9 @@ def kda_mtp_decode_impl(
     fuse_output_norm: bool = False,
     quantize_output: bool = False,
     replay_only: bool = False,
+    fa: Optional[torch.Tensor] = None,
+    w_fb: Optional[torch.Tensor] = None,
+    use_pdl: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Launch the fused KDA MTP verify kernel. See the module docstring.
 
@@ -1033,6 +1103,14 @@ def kda_mtp_decode_impl(
             constants, conv caches, ``cu_seqlens`` and ``out`` are not
             accessed. Takes the shifted-metadata layout without hints, output
             norm or quantization.
+        fa, w_fb: fused forget gate (v2 contract only): ``fa`` is the BF16
+            ``[1, T_total, 128]`` f_a projection (rows may be strided, e.g. the
+            first 128 columns of the ``[f_a | b]`` output) and ``w_fb`` the BF16
+            ``[H * 128, 128]`` f_b weight; the kernel computes the forget gate
+            ``bf16(f_a @ w_fb^T)`` itself and ``g`` must be ``None``.
+        use_pdl: launch as a programmatic dependent of the previous grid where
+            the v2 kernel runs (ignored by the others); the kernel loads its
+            state, replay entries and weights before ``griddepcontrol.wait``.
 
     Returns either BF16 ``[1, T_total, H, V]`` or, with
     ``quantize_output=True``, E4M3 ``[T_total, H*V]`` and packed UE8M0 scales
@@ -1040,7 +1118,10 @@ def kda_mtp_decode_impl(
     """
     _, T_total, _, D = x_q.shape
     H = A_log.shape[0]
-    HV = g.shape[2] if g.ndim == 4 else H
+    fused_fb = fa is not None
+    if fused_fb != (w_fb is not None) or fused_fb == (g is not None):
+        raise ValueError("pass either g, or fa and w_fb (fused forget gate)")
+    HV = H if fused_fb else (g.shape[2] if g.ndim == 4 else H)
     K = D
     V_dim = x_v.shape[-1]
     W = w_q.shape[1]
@@ -1136,6 +1217,8 @@ def kda_mtp_decode_impl(
         packed_token_layout=packed_token_layout,
         fuse_output_norm=fuse_output_norm,
         quantize_output=quantize_output,
+        fa=fa,
+        w_fb=w_fb,
     )
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -1184,6 +1267,7 @@ def kda_mtp_decode_impl(
     split_v = 2 if HV * N <= SPLIT_MAX_TILES else 1
     bf16_math = _bf16_math_enabled()
 
+    gate_rows = (fa,) if fused_fb else (g,)
     kernel = _select_verify_kernel(
         packed_token_layout=packed_token_layout,
         fuse_output_norm=fuse_output_norm,
@@ -1199,12 +1283,27 @@ def kda_mtp_decode_impl(
             w_v=w_v,
             state=h0_arg,
             projections=(x_q, x_k, x_v),
-            rows=(x_q_arg, x_k_arg, x_v_arg, g, onorm_g, k_cache, g_cache, v_cache),
+            rows=(x_q_arg, x_k_arg, x_v_arg, *gate_rows, onorm_g, k_cache, g_cache, v_cache),
             conv_caches=(cs_q, cs_k, cs_v),
             g_cache=g_cache,
         ),
     )
+    if fused_fb:
+        # Only kda_decode_mtp_v2_kernel has the fused forget gate; it also runs the multi-wave
+        # grids the two-CTA kernel would otherwise take (callers avoid those, v2_verify_applies).
+        if kernel == "v1" or quantize_output:
+            raise ValueError(
+                "the fused forget gate needs the v2 kernel contract (packed rows, fused output "
+                "norm, bf16 output, 3xTF32, vector-aligned operands)"
+            )
+        kernel = "v2"
+    # Only kda_decode_mtp_v2_kernel has the PDL prologue; the other kernels launch plainly.
+    use_pdl = bool(use_pdl) and kernel == "v2"
     if kernel != "v1":
+        # Placeholders for the operands of the other gate mode (compile-time dead).
+        g_arg = onorm_g if fused_fb else g
+        fa_arg = fa if fused_fb else beta
+        w_fb_arg = w_fb if fused_fb else w_q
         # Shared operands of kda_decode_mtp_v2_kernel and kda_decode_mtp_2cta_kernel.
         args = [
             (h0_arg, 16),
@@ -1218,7 +1317,7 @@ def kda_mtp_decode_impl(
             (cs_k, 16),
             (cs_v, 16),
             (A_log, 16),
-            (g, 16),
+            (g_arg, 16),
             (dt_bias, 16),
             (beta, 16),
             (onorm_g, 16),
@@ -1238,7 +1337,8 @@ def kda_mtp_decode_impl(
             variant = {"MXFP8_OUT": bool(quantize_output)}
         else:
             runner = _run_kda_decode_mtp_v2
-            variant = {"SPLIT_V": split_v}
+            args += [(fa_arg, 16 if fused_fb else 2), (w_fb_arg, 16)]
+            variant = {"SPLIT_V": split_v, "PDL": bool(use_pdl), "FUSED_FB": fused_fb}
         constexprs = dict(
             scale=scale,
             HV=HV,
@@ -1572,6 +1672,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         onorm_weight: Optional[torch.Tensor] = None,
         onorm_eps: float = 1e-5,
         fuse_output_norm: bool = False,
+        use_pdl: bool = False,
     ) -> torch.Tensor:
         """Fused KDA multi-token verify with in-place state commit."""
         return kda_mtp_decode_impl(
@@ -1606,6 +1707,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             onorm_weight=onorm_weight,
             onorm_eps=onorm_eps,
             fuse_output_norm=fuse_output_norm,
+            use_pdl=use_pdl,
         )
 
     @kda_mtp_decode.register_fake
@@ -1641,8 +1743,124 @@ if IS_CUTLASS_DSL_AVAILABLE:
         onorm_weight: Optional[torch.Tensor] = None,
         onorm_eps: float = 1e-5,
         fuse_output_norm: bool = False,
+        use_pdl: bool = False,
     ) -> torch.Tensor:
-        del onorm_g, onorm_weight, onorm_eps, fuse_output_norm
+        del onorm_g, onorm_weight, onorm_eps, fuse_output_norm, use_pdl
+        return x_q.new_empty(x_v.shape)
+
+    @torch.library.custom_op(
+        "trtllm::kda_mtp_decode_fused_fb",
+        mutates_args=(
+            "cs_q",
+            "cs_k",
+            "cs_v",
+            "recurrent_state",
+            "k_cache",
+            "g_cache",
+            "v_cache",
+            "beta_cache",
+        ),
+        device_types="cuda",
+    )
+    def kda_mtp_decode_fused_fb(
+        x_q: torch.Tensor,
+        x_k: torch.Tensor,
+        x_v: torch.Tensor,
+        w_q: torch.Tensor,
+        w_k: torch.Tensor,
+        w_v: torch.Tensor,
+        cs_q: torch.Tensor,
+        cs_k: torch.Tensor,
+        cs_v: torch.Tensor,
+        fa: torch.Tensor,
+        w_fb: torch.Tensor,
+        beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        k_cache: torch.Tensor,
+        g_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        beta_cache: torch.Tensor,
+        ssm_state_indices: torch.Tensor,
+        num_spec: int,
+        num_accepted_tokens: torch.Tensor,
+        lower_bound: float,
+        scale: float,
+        onorm_g: torch.Tensor,
+        onorm_weight: torch.Tensor,
+        onorm_eps: float,
+        use_pdl: bool,
+    ) -> torch.Tensor:
+        """KDA multi-token verify that computes its forget gate from ``f_a`` (packed rows,
+        fused gated RMSNorm, BF16 output): ``fa`` is ``[1, T, 128]`` BF16 (rows may be
+        strided), ``w_fb`` the ``[H * 128, 128]`` BF16 f_b weight."""
+        return kda_mtp_decode_impl(
+            x_q=x_q,
+            x_k=x_k,
+            x_v=x_v,
+            w_q=w_q,
+            w_k=w_k,
+            w_v=w_v,
+            cs_q=cs_q,
+            cs_k=cs_k,
+            cs_v=cs_v,
+            g=None,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            recurrent_state=recurrent_state,
+            k_cache=k_cache,
+            g_cache=g_cache,
+            v_cache=v_cache,
+            beta_cache=beta_cache,
+            ssm_state_indices=ssm_state_indices,
+            cu_seqlens=None,
+            num_spec=num_spec,
+            num_accepted_tokens=num_accepted_tokens,
+            lower_bound=lower_bound,
+            scale=scale,
+            packed_token_layout=True,
+            onorm_g=onorm_g,
+            onorm_weight=onorm_weight,
+            onorm_eps=onorm_eps,
+            fuse_output_norm=True,
+            fa=fa,
+            w_fb=w_fb,
+            use_pdl=use_pdl,
+        )
+
+    @kda_mtp_decode_fused_fb.register_fake
+    def _(
+        x_q: torch.Tensor,
+        x_k: torch.Tensor,
+        x_v: torch.Tensor,
+        w_q: torch.Tensor,
+        w_k: torch.Tensor,
+        w_v: torch.Tensor,
+        cs_q: torch.Tensor,
+        cs_k: torch.Tensor,
+        cs_v: torch.Tensor,
+        fa: torch.Tensor,
+        w_fb: torch.Tensor,
+        beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        k_cache: torch.Tensor,
+        g_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        beta_cache: torch.Tensor,
+        ssm_state_indices: torch.Tensor,
+        num_spec: int,
+        num_accepted_tokens: torch.Tensor,
+        lower_bound: float,
+        scale: float,
+        onorm_g: torch.Tensor,
+        onorm_weight: torch.Tensor,
+        onorm_eps: float,
+        use_pdl: bool,
+    ) -> torch.Tensor:
         return x_q.new_empty(x_v.shape)
 
     @torch.library.custom_op(

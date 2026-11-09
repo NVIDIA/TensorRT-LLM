@@ -55,8 +55,11 @@ def _generation_request(post_processors, tokens=(1, 2, 3)):
 
 def _engine(vocab_size=None, attention_dp=False):
     engine = object.__new__(DecoderRunner)
+    # Without attention DP the TP group shares the requests (Mapping.tp_group_shares_requests).
     engine._mapping = SimpleNamespace(
-        is_last_pp_rank=lambda: True, enable_attention_dp=attention_dp
+        is_last_pp_rank=lambda: True,
+        enable_attention_dp=attention_dp,
+        tp_group_shares_requests=not attention_dp,
     )
     engine._model = SimpleNamespace(lm_head=SimpleNamespace(num_embeddings=vocab_size))
     return engine

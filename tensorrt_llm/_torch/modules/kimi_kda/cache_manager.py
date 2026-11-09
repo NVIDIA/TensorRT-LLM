@@ -932,6 +932,12 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     """KDA/MLA cache layout and K3-only replay lifecycle handling."""
 
     kda_context_only = False
+    # The KDA prefill kernel records the state at a snapshot point in its single pass over a
+    # context chunk (state checkpoints into the staging rows), so a chunk takes any snapshot
+    # point it passes inside the forward, at the kernel's checkpoint granularity (__init__).
+    inforward_snapshot_any_point = True
+    # The DSpark MLA drafter keeps its context KV in this manager.
+    accepts_appended_draft_layers = True
 
     @override
     def __init__(
@@ -949,8 +955,23 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         self._requested_num_spec = kda_replay_num_spec
         self._requested_draft_records = kda_draft_records
         self._kda_replay: KDAReplayState | None = None
+        # In-forward snapshots need the optimized (indexed) KDA prefill kernel.
+        from ._kda_kernels import is_intree_prefill_available, is_kda_optimized_supported
+
+        self._supports_inforward_snapshot = (
+            is_kda_optimized_supported() and is_intree_prefill_available()
+        )
+        if self._supports_inforward_snapshot:
+            from ...custom_ops.cute_dsl_kimi_k3_custom_ops import KDA_PREFILL_SNAPSHOT_CHUNK
+
+            self.inforward_snapshot_alignment = KDA_PREFILL_SNAPSHOT_CHUNK
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
+
+    @override
+    def _inforward_snapshot_max_tail(self) -> int:
+        # One pass records the state at P whatever follows it in the chunk.
+        return self.max_seq_len
 
     @override
     def _initialize_spec_state(self) -> KDAIntermediateState | KDAReplayState | None:

@@ -173,7 +173,7 @@ class GlmMLA(DeepseekV32Attention):
         )
 
         # Unquantized view of the module input, used by create_mla_outputs and
-        # by _apply_output_gate.
+        # by _gate_and_project_output.
         output_hidden_states = hidden_states
         deferred_view = _deferred_norm_view(hidden_states)
         if deferred_view is not None:
@@ -216,7 +216,6 @@ class GlmMLA(DeepseekV32Attention):
                 latent_cache_gen=latent_cache_gen,
             )
 
-        attn_output[0] = self._apply_output_gate(output_hidden_states, attn_output[0])
         if tail_armed:
             partial = attn_tail.project(self, attn_output[0])
             if partial is not None:
@@ -226,7 +225,9 @@ class GlmMLA(DeepseekV32Attention):
                 if self.o_proj.reduce_output:
                     partial = self.o_proj.all_reduce(partial, all_reduce_params=all_reduce_params)
                 return partial
-        return self._project_output(attn_output, position_ids, attn_metadata, all_reduce_params)
+        return self._gate_and_project_output(
+            output_hidden_states, attn_output, position_ids, attn_metadata, all_reduce_params
+        )
 
 
 class GlmDsaHooks(DSAHooks):

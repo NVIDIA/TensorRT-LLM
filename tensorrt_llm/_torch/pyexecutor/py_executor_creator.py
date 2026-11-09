@@ -59,7 +59,8 @@ from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.registry import uses_connector
-from .dwdp import DwdpManager, get_global_dwdp_manager
+from .dwdp import (DWDP_DRIVER_MEMORY_RESERVE, DwdpManager,
+                   get_global_dwdp_manager)
 from .engine.runners.decoder.inputs import uses_full_generation_page_table
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .hang_diagnostics import monitor_executor_initialization
@@ -1481,7 +1482,10 @@ def _create_py_executor(
             py_executor.shutdown()
             raise
 
-    _adjust_torch_mem_fraction()
+    if dwdp_manager is not None:
+        _adjust_torch_mem_fraction(DWDP_DRIVER_MEMORY_RESERVE)
+    else:
+        _adjust_torch_mem_fraction()
 
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")

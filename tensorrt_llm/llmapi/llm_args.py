@@ -3920,6 +3920,28 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "decode pass over context and block, on SM100/SM103/SM107. Which "
         "kernel each name selects: MLADSparkForCausalLM.")
 
+    context_kv_only: bool = Field(
+        default=False,
+        description=
+        "Set on the context servers of disaggregated serving with a standalone "
+        "MLA DSpark drafter. A context server never drafts: it builds the "
+        "drafter's context KV from the target hidden states during prefill. "
+        "With this set it loads only what that needs (the context projection "
+        "and each drafter layer's latent projection and norm) and emits "
+        "placeholder draft tokens. Requires disaggregated serving.")
+
+    context_kv_dtype: Literal["auto", "fp8"] = Field(
+        default="auto",
+        description=
+        "Storage dtype of a standalone MLA DSpark drafter's context KV (one "
+        "latent per token and drafter layer) in its paged draft KV cache. "
+        "'auto' keeps the drafter's weight dtype (BF16). 'fp8' stores FP8 "
+        "E4M3 latents at a unit per-tensor scale, halving the draft cache "
+        "bytes per token; the block decode then reads them with the FP8 CuTe "
+        "DSL MLA decode, so a drafting server needs attention_backend CUTEDSL "
+        "(the MLA drafter's AUTO choice). Lossy. The context and generation "
+        "servers of disaggregated serving must set the same value.")
+
     @model_validator(mode="after")
     def validate_confidence_scheduling(self):
         if not self.enable_confidence_scheduling:
@@ -4025,6 +4047,15 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         return TorchSpeculativeDecodingMode.DSPARK
+
+
+def drafter_reads_helix_sharded_context(
+        decoding_type: Optional[str], attention_backend: Optional[str]) -> bool:
+    """Whether a speculative_config's drafter reads a helix-sharded context.
+
+    Only the standalone MLA DSpark drafter's CUTEDSL block decode does.
+    """
+    return decoding_type == "DSpark" and attention_backend == "CUTEDSL"
 
 
 class AutoDecodingConfig(DecodingBaseConfig):
@@ -4924,6 +4955,16 @@ class MambaStateConfig(StrictBaseModel):
         "Offsets that do not resolve inside the prompt are ignored. These "
         "snapshots require KV cache manager V2.")
 
+    low_priority_snapshot_prompt_len: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        telemetry=False,
+        description=
+        "Context requests whose prompt is shorter than this many tokens create "
+        "their recurrent-state pages (live state and snapshots) at the lowest "
+        "eviction priority; attention pages keep the default priority. 0 "
+        "disables. Requires KV cache manager V2 and block reuse.")
+
     enable_branch_snapshot: bool = Field(
         default=False,
         status="deprecated",
@@ -5568,6 +5609,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     "block_reuse_config.swa_endpoint_rewind_tokens requires "
                     "kv_cache_config.use_kv_cache_manager_v2=True.")
+            if self.mamba_state_config.low_priority_snapshot_prompt_len > 0:
+                raise ValueError(
+                    "block_reuse_config.swa_endpoint_rewind_tokens cannot be "
+                    "combined with mamba_state_config."
+                    "low_priority_snapshot_prompt_len.")
         return self
 
     @model_validator(mode='after')
@@ -7390,7 +7436,13 @@ class TorchLlmArgs(BaseLlmArgs):
     enable_min_latency: bool = Field(
         default=False,
         description=
-        "If true, enable min-latency mode. Currently only used for Llama4.",
+        "If true, enable min-latency mode for Llama4 and Kimi K3. For Kimi K3 it runs lossy decode "
+        "kernels on generation steps of at most 8 rows: the MoE tail and the shared expert read BF16 "
+        "activations instead of MXFP8, apply the RMSNorm scale late and use approximate tanh / sigmoid. "
+        "Leave it unset where accuracy must match the default kernels or batches exceed 8 rows. "
+        "It also packs a Kimi K3 CUDA-graph decode step's small input uploads into one copy and "
+        "one scatter launch (lossless), and the executor loop runs with a 200 us Python thread "
+        "switch interval.",
         status="beta")
 
     # TODO: make this a per-request parameter

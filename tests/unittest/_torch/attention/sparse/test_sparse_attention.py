@@ -159,6 +159,7 @@ def test_mla_backend_only_forward_uses_default_path() -> None:
         None,
         attn_output[0],
         latent_cache_gen=None,
+        prequantized_input=None,
     )
 
 

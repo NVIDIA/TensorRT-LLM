@@ -55,10 +55,11 @@ def test_plan_mla_split_kv_policy(kv_lens: list[int], rows: int, expected: list[
 
 
 def test_plan_kernel_matches_host_mirror() -> None:
+    """Every block size the launch picks for the batch (one warp of lanes up to the request cap)."""
     mod = _plan_mod()
     generator = torch.Generator().manual_seed(3)
     for rows in (1, 4, 8):
-        for batch in (1, 3, 8, 16, 37, 128):
+        for batch in (1, 3, 8, 16, 37, 128, 300, 1024):
             kv = torch.randint(1, 300_000, (batch,), generator=generator)
             kv[0] = 262144  # a long one
             kv_lens = kv.tolist()
@@ -105,26 +106,16 @@ def test_split_kv_plan_is_launched_once_per_step(monkeypatch) -> None:
     assert mod.CuteDslMlaFmha._split_kv_plan(meta, cache_seqs, 2000, 8, 96) is None
 
 
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("empty_request", [False, True])
-def test_runner_variable_split_matches_uniform_split(
-    input_dtype: torch.dtype, empty_request: bool
-) -> None:
-    """Per-request splits under a 16-slot grid reproduce the uniform-split output and Helix stats.
-
-    Covers requests planned onto one split (stored directly by the split
-    kernel), onto several, onto more splits than KV tiles, and a request
-    without local KV (the reduction's canonical empty result).
-    """
+def _decode_case(input_dtype: torch.dtype, kv_lens: list[int], seq_len_q: int, num_heads: int):
+    """``run(block_split_kvs, split_kv) -> (output, helix stats)`` of the runner on random
+    paged inputs (the split-KV workspace sized for ``len(kv_lens)`` requests)."""
     import cutlass
 
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
 
-    torch.manual_seed(5)
     device = torch.device("cuda")
-    batch_size, seq_len_q, num_heads = 4, 2, 96
+    batch_size = len(kv_lens)
     latent_dim, rope_dim, page_size = 512, 64, 64
-    kv_lens = [4096, 0 if empty_request else 300, 9000, 1500]
     blocks_per_sequence = math.ceil(max(kv_lens) / page_size)
     num_pages = batch_size * blocks_per_sequence
     softmax_scale = 1.0 / math.sqrt(latent_dim + rope_dim)
@@ -193,9 +184,28 @@ def test_runner_variable_split_matches_uniform_split(
             inputs.append(torch.tensor(block_split_kvs, dtype=torch.int32, device=device))
         runner.forward(inputs, tactic=((128, 128), (128, 256), split_kv, False), **kwargs)
         torch.cuda.synchronize()
-        return output_storage.float(), stats
+        return output_storage, stats
+
+    return run
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("empty_request", [False, True])
+def test_runner_variable_split_matches_uniform_split(
+    input_dtype: torch.dtype, empty_request: bool
+) -> None:
+    """Per-request splits under a 16-slot grid reproduce the uniform-split output and Helix stats.
+
+    Covers requests planned onto one split (stored directly by the split
+    kernel), onto several, onto more splits than KV tiles, and a request
+    without local KV (the reduction's canonical empty result).
+    """
+    torch.manual_seed(5)
+    kv_lens = [4096, 0 if empty_request else 300, 9000, 1500]
+    run = _decode_case(input_dtype, kv_lens, seq_len_q=2, num_heads=96)
 
     ref_out, ref_stats = run(None, 1)
+    ref_out = ref_out.float()
     for plan, split_kv in (
         ([3, 1, 7, 2], 16),
         ([16, 16, 16, 16], 16),
@@ -204,7 +214,7 @@ def test_runner_variable_split_matches_uniform_split(
     ):
         out, stats = run(plan, split_kv)
         tol = 2e-2 if input_dtype == torch.float8_e4m3fn else 1e-2
-        torch.testing.assert_close(out, ref_out, rtol=tol, atol=tol)
+        torch.testing.assert_close(out.float(), ref_out, rtol=tol, atol=tol)
         log_partition = stats[:, :, 0] + stats[:, :, 1].log()
         ref_log_partition = ref_stats[:, :, 0] + ref_stats[:, :, 1].log()
         finite = torch.isfinite(ref_log_partition)
@@ -212,3 +222,38 @@ def test_runner_variable_split_matches_uniform_split(
         torch.testing.assert_close(
             log_partition[finite], ref_log_partition[finite], rtol=1e-4, atol=1e-4
         )
+
+
+def test_reduce_rows_per_cta_follows_the_row_count(monkeypatch) -> None:
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
+
+    runner_cls = CuteDSLNVMlaDecodeBlackwellRunner
+    monkeypatch.setattr(runner_cls, "_get_max_active_blocks", classmethod(lambda cls: 2 * WAVE))
+    # 64 heads x 6 query tokens: one row per block at batch 1, four at batch 20.
+    assert runner_cls.reduce_rows_per_cta(64, 6, 1) == 1
+    assert runner_cls.reduce_rows_per_cta(64, 6, 20) == 4
+    assert runner_cls.reduce_rows_per_cta(96, 6, 20) == 4
+
+
+@pytest.mark.parametrize("plan", [None, [1, 3, 1, 8, 1, 2]], ids=["uniform", "per_request"])
+def test_fp8_reduce_rows_per_cta_is_bitwise(monkeypatch, plan) -> None:
+    """Several output rows per block of the FP8 split-KV reduction (one 128-thread group each,
+    also when the row count is not a multiple of it) give the bits of one row per block, with
+    rows that reduce and rows planned onto one split."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
+
+    torch.manual_seed(7)
+    run = _decode_case(
+        torch.float8_e4m3fn, [3000, 17000, 300, 64000, 900, 9000], seq_len_q=6, num_heads=64
+    )
+    results = {}
+    for rows in (1, 4, 5, 8):
+        monkeypatch.setattr(
+            CuteDSLNVMlaDecodeBlackwellRunner,
+            "reduce_rows_per_cta",
+            classmethod(lambda cls, *args, rows=rows: rows),
+        )
+        results[rows] = run(plan, 8)
+    for rows in (4, 5, 8):
+        for got, want in zip(results[rows], results[1]):
+            assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))

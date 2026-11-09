@@ -533,7 +533,8 @@ class Runner:
             for layer_idx in layer_indices:
                 layer = model.model.layers[layer_idx]
                 # As in KimiLinearModel.forward: a MoE layer may leave its residual update to the
-                # next layer's attention-residual mix; the last one returns it applied.
+                # next layer's attention-residual mix; the slice's last one, which no mix here
+                # follows, returns it applied.
                 hidden_states, num_snapshots = layer(
                     hidden_states,
                     block_residual,
