@@ -30,6 +30,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_grou
     beam_grouped_topk_router,
 )
 
+from .._constants import ROUTER_EPS as NORM_EPS
+
 #: The configuration this component computes, as the checkpoint's config.json states it.
 #: Anything else is rejected at construction rather than computed approximately.
 SUPPORTED_CONFIG = {
@@ -45,7 +47,6 @@ DEFAULT_LAYER_IDX = 3
 SUPPORTED_LAYER_INDICES = (3, 4, 5)
 
 #: Added to the selected scores' sum before dividing, as the source model does.
-NORM_EPS = 1e-20
 
 _SM = (10, 3)
 
