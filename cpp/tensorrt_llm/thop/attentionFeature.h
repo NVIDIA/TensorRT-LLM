@@ -83,19 +83,15 @@ public:
     {
     }
 
-    /// Self-attention writes this call's K/V into the cache. Throws for a paged prefill on a
-    /// page size only the trtllm-gen kernels outside this op read.
+    /// Self-attention writes this call's K/V into the cache. A paged prefill on a page size only
+    /// the trtllm-gen kernels outside this op read is left to those kernels.
     [[nodiscard]] static bool checkParams(FmhaParams const& p, bool isGen)
     {
         if (!p.fwd.update_kv_cache && !p.is_cross)
         {
             return false;
         }
-        TLLM_CHECK_WITH_INFO(isGen || !p.meta.use_paged_context_fmha || !p.meta.uses_trtllm_gen_only_page_size,
-            "The native attention op cannot serve paged prefill with %d-token KV pages. Use a supported TRTLLM-Gen "
-            "configuration or disable chunked prefill, KV reuse and speculative decoding.",
-            static_cast<int>(p.tokens_per_block));
-        return true;
+        return isGen || !p.meta.use_paged_context_fmha || !p.meta.uses_trtllm_gen_only_page_size;
     }
 
     void prepare(FmhaParams const& p, bool /*isGen*/)

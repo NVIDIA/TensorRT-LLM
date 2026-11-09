@@ -517,8 +517,8 @@ accepts separate Q/K/V only for cross attention or SageAttention, and `MLA`
 declines custom masks. Both then call `TrtllmAttention::checkFeatureParams()`,
 which declines raw FP8 E4M3 query input and runs the static `checkParams()`
 every `AttentionFeature` declares: `CustomMaskFeature` declines custom masks,
-`PagedKVCacheFeature` requires self-attention to update the KV cache and raises
-for a paged prefill on a page size the KV manager lists in
+`PagedKVCacheFeature` requires self-attention to update the KV cache and declines
+a paged prefill on a page size the KV manager lists in
 `trtllm_gen_extra_tokens_per_block`, `SpecDecodingFeature` declines a helix
 verify group whose KV straddles CP ranks, and `SparseMlaFeature` declines DSA
 and DeepSeek-V4 sparse MLA with an `fp8_ds_mla` KV cache or on SM120f.

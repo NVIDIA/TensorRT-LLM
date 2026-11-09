@@ -9,7 +9,8 @@ context phase would reach the unfused library, whose context path builds K/V
 from the current chunk only: the cached prefix would be dropped from attention
 and then overwritten by the chunk's write-back. ``unfused_is_supported``
 refuses that call with an error instead. A page size that only the trtllm-gen
-kernels outside the op read is refused the same way for every native library.
+kernels outside the op read is declined by every native library, so selection
+continues to those kernels.
 """
 
 import pytest
@@ -55,7 +56,7 @@ def test_generation_only_batch_skips_the_paged_context_refusal():
 
 
 @pytest.mark.parametrize("fmha_cls", [FallbackFmha, TrtllmGenFmha, UnfusedFmha])
-def test_trtllm_gen_only_page_size_refuses_paged_prefill(fmha_cls):
+def test_trtllm_gen_only_page_size_declines_paged_prefill(fmha_cls):
     with native_batch(
         torch.bfloat16,
         num_contexts=1,
@@ -63,8 +64,7 @@ def test_trtllm_gen_only_page_size_refuses_paged_prefill(fmha_cls):
         chunked_prefill=True,
         extra_page_sizes=frozenset({32}),
     ) as batch:
-        with pytest.raises(RuntimeError, match="32-token KV pages"):
-            _is_supported(fmha_cls, batch)
+        assert not _is_supported(fmha_cls, batch)
 
 
 def test_trtllm_gen_only_page_size_admits_generation():
