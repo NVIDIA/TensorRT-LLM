@@ -274,7 +274,15 @@ class ThrowawayPrefillTopK:
             )
 
 
-def create_throwaway_prefill_topk(
+# One runner per (geometry, max length, device), shared by every layer of the process. The
+# runner owns the K staging buffers, the selected-index buffer and the kernel workspace; keeping
+# one per layer would multiply that memory by the number of indexer layers. A failed build is
+# cached as None so the fallback warning is logged once.
+_RunnerKey = Tuple[int, int, int, int, str, str]
+_RUNNERS: Dict[_RunnerKey, Optional[ThrowawayPrefillTopK]] = {}
+
+
+def get_throwaway_prefill_topk(
     *,
     n_heads: int,
     index_topk: int,
@@ -283,9 +291,15 @@ def create_throwaway_prefill_topk(
     device: torch.device,
     qkv_dtype: str = "fp8",
 ) -> Optional[ThrowawayPrefillTopK]:
-    """Builds the shared runner, or returns None (with a warning) if it is unsupported."""
+    """Returns the process-wide runner for this configuration, building it on first use.
+
+    Returns None (after one warning) if the kernels do not support the configuration.
+    """
+    key = (n_heads, index_topk, compress_ratio, max_context_length, str(device), qkv_dtype)
+    if key in _RUNNERS:
+        return _RUNNERS[key]
     try:
-        return ThrowawayPrefillTopK(
+        runner = ThrowawayPrefillTopK(
             n_heads=n_heads,
             index_topk=index_topk,
             compress_ratio=compress_ratio,
@@ -300,4 +314,6 @@ def create_throwaway_prefill_topk(
             f"qkv_dtype={qkv_dtype}: {error}; "
             "using the unfused indexer + Top-K path"
         )
-        return None
+        runner = None
+    _RUNNERS[key] = runner
+    return runner

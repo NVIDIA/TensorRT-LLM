@@ -32,6 +32,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.dsa import indexer as indexer_module
+from tensorrt_llm._torch.attention.backends.sparse.dsa import (
+    throwaway_topk as throwaway_topk_module,
+)
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
     Indexer,
     IndexerPrefillChunkMetadata,
@@ -40,6 +43,7 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.throwaway_topk import (
     THROWAWAY_MAX_CHUNK_ENV,
     THROWAWAY_MIN_CONTEXT_ENV,
     ThrowawayPrefillTopK,
+    get_throwaway_prefill_topk,
     throwaway_topk_min_context,
 )
 from tensorrt_llm._utils import get_sm_version
@@ -730,6 +734,48 @@ def test_min_context_env(monkeypatch):
         monkeypatch.setenv(THROWAWAY_MIN_CONTEXT_ENV, bad)
         with pytest.raises(ValueError, match=THROWAWAY_MIN_CONTEXT_ENV):
             throwaway_topk_min_context()
+
+
+_RUNNER_ARGS = dict(
+    n_heads=64,
+    index_topk=2048,
+    compress_ratio=1,
+    max_context_length=8192,
+    device=torch.device("cuda", 0),
+)
+
+
+def test_runner_is_shared_per_configuration(monkeypatch):
+    built = []
+
+    class _Runner:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+
+    monkeypatch.setattr(throwaway_topk_module, "ThrowawayPrefillTopK", _Runner)
+    monkeypatch.setattr(throwaway_topk_module, "_RUNNERS", {})
+    first = get_throwaway_prefill_topk(**_RUNNER_ARGS)
+    assert get_throwaway_prefill_topk(**_RUNNER_ARGS) is first  # every layer gets one runner
+    other = get_throwaway_prefill_topk(**{**_RUNNER_ARGS, "qkv_dtype": "mxfp4"})
+    assert other is not first
+    assert len(built) == 2
+
+
+def test_runner_build_failure_is_cached(monkeypatch):
+    built, warnings = [], []
+
+    class _Unsupported:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+            raise ValueError("unsupported geometry")
+
+    monkeypatch.setattr(throwaway_topk_module, "ThrowawayPrefillTopK", _Unsupported)
+    monkeypatch.setattr(throwaway_topk_module, "_RUNNERS", {})
+    monkeypatch.setattr(throwaway_topk_module.logger, "warning", warnings.append)
+    assert get_throwaway_prefill_topk(**_RUNNER_ARGS) is None
+    assert get_throwaway_prefill_topk(**_RUNNER_ARGS) is None
+    assert len(built) == 1
+    assert len(warnings) == 1
 
 
 def test_dispatch_slices_rows_and_shifts_prefix():

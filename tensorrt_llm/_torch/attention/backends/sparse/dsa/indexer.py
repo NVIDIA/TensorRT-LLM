@@ -51,7 +51,7 @@ from .throwaway_topk import (
     THROWAWAY_TOPK_ENV,
     PlanCache,
     ThrowawayPrefillTopK,
-    create_throwaway_prefill_topk,
+    get_throwaway_prefill_topk,
     throwaway_topk_min_context,
     throwaway_topk_requested,
     throwaway_topk_supported,
@@ -1750,7 +1750,7 @@ class Indexer(nn.Module):
             compress_ratio = _effective_compress_ratio_divisor(
                 _select_indexer_compress_ratio(metadata.compress_ratios)
             )
-            self._throwaway_topk = create_throwaway_prefill_topk(
+            self._throwaway_topk = get_throwaway_prefill_topk(
                 n_heads=self.n_heads,
                 index_topk=self.index_topk,
                 compress_ratio=compress_ratio,
