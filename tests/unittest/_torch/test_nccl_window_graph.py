@@ -13,6 +13,7 @@ import torch
 from torch._subclasses import FakeTensorMode
 
 from tensorrt_llm._torch import nccl_window_graph, nccl_window_tensor_scope
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, MxFp8QuantizedTensor
 
 pytestmark = pytest.mark.cpu_only
 
@@ -976,8 +977,6 @@ def test_decoder_warmup_scope_uses_device_buffer_for_host_only_batch(
 
 
 def test_fast_tensor_collectors_match_generic_traversal() -> None:
-    from tensorrt_llm._torch.utils import Fp4QuantizedTensor, MxFp8QuantizedTensor
-
     class Ids(list):
         pass
 
@@ -1064,3 +1063,23 @@ def test_eager_decoder_layer_scope_keeps_module_call_fast_path(
     assert ("forward" in layer.__dict__) is instance_forward
     assert layer.forward == original_forward
     assert layer(output) is output
+
+
+@pytest.mark.parametrize("retain_bf16", [False, True])
+def test_tensor_scope_retains_mxfp8_optional_bf16_view(retain_bf16: bool) -> None:
+    with FakeTensorMode():
+        fp8 = torch.empty((2, 128), dtype=torch.float8_e4m3fn, device="cuda")
+        scales = torch.empty(512, dtype=torch.uint8, device="cuda")
+        hidden = torch.empty((2, 128), dtype=torch.bfloat16, device="cuda") if retain_bf16 else None
+    carrier = MxFp8QuantizedTensor(
+        fp8, scales, is_sf_swizzled=True, unquantized_hidden_states=hidden
+    )
+    expected = [fp8, scales] + ([hidden] if hidden is not None else [])
+    tensors = []
+    nccl_window_tensor_scope._cuda_tensors(carrier, tensors)
+    assert list(map(id, tensors)) == list(map(id, expected))
+    tensors = []
+    nccl_window_tensor_scope._output_cuda_tensors(carrier, tensors)
+    assert list(map(id, tensors)) == list(map(id, expected))
+    tensors = nccl_window_tensor_scope._module_call_cuda_tensors((carrier,), {})
+    assert list(map(id, tensors)) == list(map(id, expected))

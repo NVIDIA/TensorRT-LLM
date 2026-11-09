@@ -15,10 +15,12 @@
 """``TrtllmCutedslGroupedGemmNvfp4Impl``: ``trtllm.cutedsl.grouped_gemm.nvfp4``."""
 
 import os
+from contextvars import ContextVar
 
 import torch
 
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.logger import logger
 
 from .....autotuner import AutoTuner
 from .....cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
@@ -65,6 +67,45 @@ ASYNC_INPUT_QUANT_MAX_TOKENS = 1024
 _DISABLE_DIRECT_DEEP_EP_METADATA_ENV = "TRTLLM_DISABLE_CUTEDSL_DEEP_EP_DIRECT_METADATA"
 
 
+_DETERMINISTIC_FC2_LOGGED = False
+
+
+class FinalizeResidual:
+    """A one-shot residual (e.g. a MoE's shared-expert output, [tokens, hidden] bf16) for the deterministic Rubin
+    finalize to add while it un-permutes: bitwise ``residual.add_(routed_output)``. ``event`` (recorded on the stream
+    that produced it) is waited on right before the finalize; ``consumed`` tells the caller to skip its own add."""
+
+    def __init__(self, residual: torch.Tensor, event: torch.cuda.Event | None = None) -> None:
+        self.previous: FinalizeResidual | None = None
+        self.residual = residual
+        self.event = event
+        self.consumed = False
+        self.calls = (
+            0  # det-finalize calls seen since the offer: only the FIRST may consume (pairing guard)
+        )
+
+
+_FINALIZE_RESIDUAL: ContextVar[FinalizeResidual | None] = ContextVar(
+    "moe_finalize_residual", default=None
+)
+
+
+def offer_finalize_residual(
+    residual: torch.Tensor, event: torch.cuda.Event | None = None
+) -> FinalizeResidual:
+    """Offer ``residual`` to the next deterministic Rubin FC2 finalize in this execution context."""
+    holder = FinalizeResidual(residual, event)
+    holder.previous = _FINALIZE_RESIDUAL.get()
+    _FINALIZE_RESIDUAL.set(holder)
+    return holder
+
+
+def clear_finalize_residual() -> None:
+    """Restore the offer that preceded the current execution context's innermost offer."""
+    holder = _FINALIZE_RESIDUAL.get()
+    _FINALIZE_RESIDUAL.set(holder.previous if holder is not None else None)
+
+
 @register_moe_impl
 class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
     """``trtllm.cutedsl.grouped_gemm.nvfp4``: CuteDSL NVFP4 grouped GEMM.
@@ -98,7 +139,14 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
     # and the epilogue has no "clamp absent" branch, so an absent clamp is
     # +inf, not None.
     activation_support = MoEActivationSupport(
-        kinds=frozenset({ActivationType.Swiglu, ActivationType.Relu2, ActivationType.SiTu}),
+        kinds=frozenset(
+            {
+                ActivationType.Swiglu,
+                ActivationType.Relu2,
+                ActivationType.SiTu,
+                ActivationType.SwigluBias,
+            }
+        ),
         alpha_beta=ActivationParamShape.UNIFORM_SCALAR,
         limit=ActivationParamShape.UNIFORM_SCALAR,
         limit_when_absent=float("inf"),
@@ -109,7 +157,19 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         # process_weights_after_loading() unswizzles the FC1 block scales,
         # which asserts 128-row tiles; without this gate an unaligned shard
         # dies mid weight load with a bare swizzle error.
-        return check_grouped_gemm_leaf(cls, p, d, nvfp4_fc1_row_alignment_rejection(p, d))
+        return check_grouped_gemm_leaf(
+            cls,
+            p,
+            d,
+            nvfp4_fc1_row_alignment_rejection(p, d),
+            allow_swiglu_oai=(
+                p.activation == ActivationType.SwigluBias.name
+                and not p.bias
+                and d.env.sm == 107
+                and not d.locality_domain_requested
+                and d.deterministic_finalize_requested
+            ),
+        )
 
     def _init_format_state(self) -> None:
         # Opt-out for adapter-free DeepEP metadata; see
@@ -337,7 +397,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             ]
         else:
             forward_impl = self.run_moe_nvfp4_impl
-            workload_identity = None
+            workload_identity = ("deterministic_finalize",) if self.deterministic_finalize else None
             tuner_key = "CuteDslFusedMoE::run_moe_nvfp4"
             inputs = [
                 x,
@@ -465,7 +525,11 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             ) = sort_outputs
 
         has_aux_streams = self._has_moe_output_memset_aux_stream()
-        if self.use_fused_finalize and has_aux_streams:
+        # The deterministic Rubin FC2 overwrites every output row (moe_unpermute_inplace): no zeroed output needed.
+        deterministic_fc2 = (
+            use_rubin and self.deterministic_finalize and not use_count_native_expert_metadata
+        )
+        if self.use_fused_finalize and has_aux_streams and not deterministic_fc2:
             memset_stream = self._moe_output_memset_run_stream()
             self.event_dict[EventType.Main].record()
             moe_output.record_stream(memset_stream)
@@ -541,13 +605,86 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         if self.activation_type == ActivationType.Swiglu:
             gather_act_kwargs["swiglu_limit_scalar"] = self.act_clamp
 
+        # SwiGLU-OAI (SwigluBias): gate scale and linear offset use the
+        # activation kernel's constant slots; the clamp uses the SwiGLU limit.
+        if self.activation_type == ActivationType.SwigluBias:
+            gather_act_kwargs["situ_beta"] = self.act_alpha
+            gather_act_kwargs["situ_linear_beta"] = self.act_beta
+            gather_act_kwargs["swiglu_limit_scalar"] = self.act_clamp
+
         # Join the async input quantization (quantize_input_async): x/x_sf were
         # produced on the aux stream and are first read here, after moe_sort
         # ran on the main stream in parallel with the quantization.
         self._join_pending_x_ready()
         x, x_sf = gather_act_op(**gather_act_kwargs)
 
-        if self.use_fused_finalize:
+        if deterministic_fc2:
+            global _DETERMINISTIC_FC2_LOGGED
+            if not _DETERMINISTIC_FC2_LOGGED:
+                _DETERMINISTIC_FC2_LOGGED = True
+                logger.info(
+                    "[CuteDSL MoE] deterministic FC2 engaged (grouped store + fixed-order finalize; "
+                    f"activation={self.activation_type.name})"
+                )
+            # (rule 1b) Deterministic FC2 on Rubin: the grouped GEMM stores bf16(alpha * acc) per permuted row
+            # (no scatter-add atomics), then moe_unpermute_inplace sums each token's top-k rows in fixed index
+            # order with the token scales. Same run-to-run output; kill: TLLM_CUTEDSL_MOE_DETERMINISTIC=0.
+            fc2_rows = torch.empty(
+                x.shape[0], weight_view.w2_weight.shape[1], dtype=output_dtype, device=x.device
+            )
+            torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_store_rubin(
+                input=x.view(torch.float4_e2m1fn_x2),
+                weight=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
+                input_scale=x_sf.view(torch.uint8),
+                weight_scale=weight_view.fc2_weight_scale.view(torch.uint8),
+                alpha=weight_view.fc2_global_scale,
+                output=fc2_rows,
+                tile_idx_to_group_idx=tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                token_final_scales=token_final_scales,
+                num_experts=self.num_slots,
+                top_k=effective_top_k,
+                num_local_experts=esp,
+                local_expert_offset=slot_start,
+                tile_size=tile_size,
+                output_dtype=output_dtype,
+            )
+            holder = _FINALIZE_RESIDUAL.get()
+            if holder is not None:
+                holder.calls += 1
+            if (
+                holder is not None
+                and not holder.consumed
+                and holder.calls == 1
+                and holder.residual.shape == moe_output.shape
+                and holder.residual.dtype == moe_output.dtype
+                and moe_output.dtype == torch.bfloat16
+            ):
+                # The shared + routed add folded into the finalize (bitwise; kill TLLM_M3_MOE_FOLD_SHARED=0).
+                from ...unpermute_residual import unpermute_residual
+
+                if holder.event is not None:
+                    torch.cuda.current_stream().wait_event(holder.event)
+                if not (torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing()):
+                    holder.residual.record_stream(torch.cuda.current_stream())
+                unpermute_residual(
+                    fc2_rows,
+                    moe_output,
+                    expanded_idx_to_permuted_idx.view(moe_output.shape[0], -1),
+                    token_final_scales,
+                    holder.residual.contiguous(),
+                )
+                holder.consumed = True
+            else:
+                torch.ops.trtllm.moe_unpermute_inplace(
+                    permuted_input=fc2_rows,
+                    output=moe_output,
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    topk_scales=token_final_scales,
+                )
+        elif self.use_fused_finalize:
             if has_aux_streams:
                 self.event_dict[EventType.MoeOutputMemset].wait()
             elif use_count_native_expert_metadata:

@@ -100,6 +100,24 @@ def blk_reduce_bf16(dst_gemm, src_smem, size, loc=None, ip=None):
 
 
 @dsl_user_op
+def blk_store_b16(dst_gemm, src_smem, size, loc=None, ip=None):
+    """Plain bulk store (no reduction) of a 16-bit row segment, cp.async.bulk (store_permuted mode)."""
+    llvm.inline_asm(
+        None,
+        [
+            dst_gemm.iterator.llvm_ptr,
+            src_smem.iterator.llvm_ptr,
+            size.ir_value(),
+        ],
+        "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;",
+        "l,l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def blk_reduce_fp32(dst_gemm, src_smem, size, loc=None, ip=None):
     """Block reduce for FP32 using cp.reduce.async.bulk."""
     llvm.inline_asm(
@@ -171,7 +189,12 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         cluster_shape_mn: Tuple[int, int],
         raster_along_m: bool = False,
         topK: int = 1,
+        store_permuted: bool = False,
     ):
+        """store_permuted: instead of the fused finalize (scatter-add of token_scale * alpha * acc into the token
+        row, bf16 atomics: run-to-run order dependent), store bf16(alpha * acc) at the permuted row of c [m, n],
+        for a separate fixed-order finalize (deterministic, rule 1b)."""
+        self.store_permuted = store_permuted
         self.sf_vec_size = sf_vec_size
         self.acc_dtype = cutlass.Float32
         self.mma_inst_shape = mma_inst_shape
@@ -1588,10 +1611,11 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     token_idx = cutlass.Int32(0)
                     alpha_val_iter = alpha_val
                     if is_valid_row:
-                        token_idx = expanded_idx // self.topK
-                        topk_idx = expanded_idx % self.topK
-                        token_scale = token_final_scales[(token_idx, topk_idx)]
-                        alpha_val_iter = alpha_val * token_scale
+                        if cutlass.const_expr(not self.store_permuted):
+                            token_idx = expanded_idx // self.topK
+                            topk_idx = expanded_idx % self.topK
+                            token_scale = token_final_scales[(token_idx, topk_idx)]
+                            alpha_val_iter = alpha_val * token_scale
 
                     for n_iter_idx in cutlass.range(n_subtile_cnt):
                         # Load accumulator from tensor memory buffer to register
@@ -1630,13 +1654,21 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     if is_valid_row:
                         expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
                         token_idx = expanded_idx // self.topK
+                        if cutlass.const_expr(self.store_permuted):
+                            token_idx = permuted_row
                         coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
                         scatter_out_offset = cute.domain_offset((token_idx, coord_n, 0), c)
 
                         # sC row index: m_iter_idx * 128 + epi_tidx
                         sC_row = m_iter_idx * 128 + epi_tidx
 
-                        if cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
+                        if cutlass.const_expr(self.store_permuted):
+                            blk_store_b16(
+                                scatter_out_offset,
+                                sC[sC_row, None, 0],
+                                cutlass.Int32(self.copy_size),
+                            )
+                        elif cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
                             blk_reduce_bf16(
                                 scatter_out_offset,
                                 sC[sC_row, None, 0],

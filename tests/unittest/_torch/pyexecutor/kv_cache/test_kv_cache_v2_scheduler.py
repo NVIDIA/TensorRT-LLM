@@ -19,7 +19,7 @@ No GPU required.
 """
 
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, PropertyMock, call, patch
 
 import pytest
 
@@ -739,6 +739,9 @@ def make_scheduler(
     enable_recompute_pause: bool = True,
     context_scheduling_policy: ContextSchedulingPolicy = ContextSchedulingPolicy.FCFS,
     context_starvation_iterations: int | None = None,
+    context_append_reserve_tokens: int | None = None,
+    context_append_reserve_adaptive: bool | None = None,
+    context_append_reserve_reprobe_iterations: int | None = None,
 ) -> object:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -768,6 +771,9 @@ def make_scheduler(
             enable_recompute_pause=enable_recompute_pause,
             context_scheduling_policy=context_scheduling_policy,
             context_starvation_iterations=context_starvation_iterations,
+            context_append_reserve_tokens=context_append_reserve_tokens,
+            context_append_reserve_adaptive=context_append_reserve_adaptive,
+            context_append_reserve_reprobe_iterations=context_append_reserve_reprobe_iterations,
             **kwargs,
         )
 
@@ -5202,6 +5208,468 @@ def test_replay_only_batch_clears_deferred_generation_overlap_state(
     manager.try_allocate_generation.assert_called_with(decoding)
 
 
+# ===========================================================================
+# Context append reserve: shortest-first order behind the first request
+# ===========================================================================
+
+
+class TestTypedAppendReserve:
+    @pytest.mark.parametrize("draft_reuse,expected", [(0, 2048), (4000, 1000), (None, 2048)])
+    def test_starvation_share_uses_joint_reuse(
+        self, draft_reuse: int | None, expected: int
+    ) -> None:
+        manager = make_kv_cache_manager(enable_joint_kv_cache_reuse=True)
+        draft_manager = make_kv_cache_manager()
+        for pool, reuse in ((manager, 5000), (draft_manager, draft_reuse)):
+            pool.probe_context_reuse.side_effect = None
+            pool.probe_context_reuse.return_value = reuse
+        scheduler = make_scheduler(
+            manager,
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+            draft_kv_cache_manager=draft_manager,
+            context_scheduling_policy=ContextSchedulingPolicy.SHORTEST_UNCACHED_FIRST,
+            context_starvation_iterations=2,
+            context_append_reserve_tokens=1024,
+        )
+        request = Mock(
+            spec_set=[
+                "py_request_id",
+                "context_remaining_length",
+                "is_first_context_chunk",
+                "context_current_position",
+            ]
+        )
+        request.py_request_id = 1
+        request.context_remaining_length = 5000
+        request.context_current_position = 0
+        request.is_first_context_chunk = True
+        # Sorting may already have cached the optimistic target-only estimate.
+        assert scheduler._uncached_tokens(request) == 0
+        assert scheduler._starved_ctx_shares([request], BudgetTracker(8192, 100)) == [expected]
+
+    def test_modifiers_override_legacy_environment(self, monkeypatch) -> None:
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE", "1024")
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE_ADAPTIVE", "1")
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE_SJF_REPROBE", "8")
+        scheduler = make_scheduler(
+            make_kv_cache_manager(),
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+            context_append_reserve_adaptive=False,
+            context_append_reserve_reprobe_iterations=2,
+        )
+        assert scheduler._ctx_append_reserve == 1024
+        assert scheduler._ctx_append_reserve_adaptive is False
+        assert scheduler._ctx_append_reserve_sjf_reprobe == 2
+
+    @pytest.mark.parametrize("reserve", [0, 1024])
+    def test_explicit_reserve_overrides_environment(self, monkeypatch, reserve: int) -> None:
+        for name in (
+            "TLLM_CTX_APPEND_RESERVE",
+            "TLLM_CTX_APPEND_RESERVE_ADAPTIVE",
+            "TLLM_CTX_APPEND_RESERVE_SJF",
+            "TLLM_CTX_APPEND_RESERVE_SJF_REPROBE",
+        ):
+            monkeypatch.setenv(name, "invalid")
+        scheduler = make_scheduler(
+            make_kv_cache_manager(),
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+            context_append_reserve_tokens=reserve,
+            context_scheduling_policy=ContextSchedulingPolicy.SHORTEST_UNCACHED_FIRST,
+        )
+        assert scheduler._ctx_append_reserve == reserve
+        assert scheduler._ctx_append_reserve_adaptive is (reserve > 0)
+        assert scheduler._ctx_append_reserve_sjf is (reserve > 0)
+        assert scheduler._ctx_append_reserve_sjf_reprobe == 8
+
+    @pytest.mark.parametrize("chunked,budget", [(False, 8192), (True, 2048), (True, None)])
+    def test_inapplicable_reserve_is_disabled(self, chunked: bool, budget: int | None) -> None:
+        scheduler = make_scheduler(
+            make_kv_cache_manager(),
+            max_num_tokens=budget,
+            ctx_chunk_config=(None, 64) if chunked else None,
+            context_append_reserve_tokens=1024,
+        )
+        assert scheduler._ctx_append_reserve == 0
+
+    @pytest.mark.parametrize("legacy,expected", [(True, 1000), (False, 3000)])
+    def test_first_chunk_with_prepopulated_prefix(
+        self, monkeypatch, legacy: bool, expected: int
+    ) -> None:
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE", "1024")
+        manager = make_kv_cache_manager()
+        manager.probe_context_reuse.side_effect = None
+        manager.probe_context_reuse.return_value = 4000
+        scheduler = make_scheduler(
+            manager,
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+            context_append_reserve_tokens=None if legacy else 1024,
+        )
+        request = Mock(
+            spec_set=[
+                "py_request_id",
+                "context_remaining_length",
+                "is_first_context_chunk",
+                "context_current_position",
+            ]
+        )
+        request.py_request_id = 1
+        request.context_remaining_length = 5000
+        request.context_current_position = 2000
+        request.is_first_context_chunk = True
+        assert scheduler._uncached_context_tokens(request) == expected
+        assert scheduler._uncached_context_tokens(request) == expected
+        manager.probe_context_reuse.assert_called_once_with(request)
+        scheduler._ctx_append_reserve_sjf_pass += scheduler._ctx_append_reserve_sjf_reprobe
+        assert scheduler._uncached_context_tokens(request) == expected
+        assert manager.probe_context_reuse.call_count == 2
+        # The ordinary policy uses cursor-relative depth and its own per-pass cache.
+        assert scheduler._uncached_tokens(request) == 3000
+        assert scheduler._uncached_tokens(request) == 3000
+        assert manager.probe_context_reuse.call_count == 3
+
+    @pytest.mark.parametrize(
+        "policy,expected",
+        [
+            (ContextSchedulingPolicy.FCFS, [0, 1]),
+            (ContextSchedulingPolicy.SHORTEST_UNCACHED_FIRST, [0, 2, 1]),
+        ],
+    )
+    def test_policy_preserves_first_admitted_context(self, policy, expected: list[int]) -> None:
+        manager = make_kv_cache_manager()
+        scheduler = make_scheduler(
+            manager,
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+            context_append_reserve_tokens=2048,
+            context_scheduling_policy=policy,
+        )
+        requests = [
+            make_ctx_request(i, length, is_last_context_chunk=i == 2)
+            for i, length in enumerate([20000, 6000, 1000])
+        ]
+        output = scheduler.schedule_request(requests, set())
+        assert sorted(ids(output.context_requests)) == sorted(expected)
+        # Output groups non-final chunks first, after admission has assigned the budget.
+        assert [
+            args[0][0].py_request_id for args in manager.resize_context.call_args_list
+        ] == expected
+        assert requests[0].context_chunk_size == 6144
+
+
+class TestAppendReserveShortestFirst:
+    """The first context request keeps its place and its max_num_tokens - R chunk; the requests behind it share the
+    reserve shortest-uncached-first (TLLM_CTX_APPEND_RESERVE_SJF=0 keeps arrival order)."""
+
+    @pytest.fixture(autouse=True)
+    def _reserve_env(self, monkeypatch):
+        for name in (
+            "TLLM_CTX_APPEND_RESERVE",
+            "TLLM_CTX_APPEND_RESERVE_ADAPTIVE",
+            "TLLM_CTX_APPEND_RESERVE_SJF",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE", "2048")
+
+    def _schedule(self, mgr, reqs):
+        sched = make_scheduler(mgr, max_num_tokens=8192, ctx_chunk_config=(None, 64))
+        return sched.schedule_request(reqs, set())
+
+    def test_reserve_is_opt_in(self, monkeypatch):
+        """Without TLLM_CTX_APPEND_RESERVE the scheduler keeps the full max_num_tokens chunk and arrival order."""
+        monkeypatch.delenv("TLLM_CTX_APPEND_RESERVE")
+        sched = make_scheduler(
+            make_kv_cache_manager(tokens_per_block=64),
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+        )
+        assert sched._ctx_append_reserve == 0
+        assert not sched._ctx_append_reserve_adaptive and not sched._ctx_append_reserve_sjf
+        head = make_ctx_request(0, context_remaining_length=20000)
+        short = make_ctx_request(1, context_remaining_length=1000)
+        out = sched.schedule_request([head, short], set())
+        assert ids(out.context_requests) == [0]
+        assert head.context_chunk_size == 8192
+
+    def test_reserve_leaves_room_for_a_chunk_unit(self):
+        scheduler = make_scheduler(
+            make_kv_cache_manager(tokens_per_block=8192),
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 8192),
+        )
+        requests = [make_ctx_request(i, context_remaining_length=20000) for i in range(2)]
+        out = scheduler.schedule_request(requests, set())
+        assert ids(out.context_requests) == [0]
+        assert requests[0].context_chunk_size == 8192
+
+    def test_reserve_released_for_indivisible_multimodal_block(self):
+        requests = [
+            TestMultimodalAwareChunkingV2()._make_mm_req(i, 10000, [(0, 7000)]) for i in range(2)
+        ]
+        out = self._schedule(make_kv_cache_manager(tokens_per_block=64), requests)
+        assert ids(out.context_requests) == [0]
+        assert requests[0].context_chunk_size == 8192
+
+    def test_reserve_released_for_exact_pregrown_replay(self):
+        manager = make_kv_cache_manager(tokens_per_block=64)
+        manager.enable_swa_scratch_reuse = True
+        requests = [make_ctx_request(i, context_remaining_length=10000) for i in range(2)]
+        for request in requests:
+            manager.kv_cache_map[request.py_request_id].capacity = (
+                7168 + manager.num_extra_kv_tokens
+            )
+        out = self._schedule(manager, requests)
+        assert ids(out.context_requests) == [0]
+        assert requests[0].context_chunk_size == 7168
+
+    def test_reserve_released_when_encoder_replay_exhausts_reduced_budget(self) -> None:
+        """Two replaying contexts must not both wait on the optional append reserve."""
+        manager = make_kv_cache_manager(tokens_per_block=64)
+        manager.context_replay_tokens.side_effect = None
+        manager.context_replay_tokens.return_value = 6500
+        requests = [make_ctx_request(i, 10000, prompt_len=16500) for i in range(2)]
+        for request in requests:
+            request.context_current_position = 6500
+            request.py_multimodal_data = None
+        out = self._schedule(manager, requests)
+        assert ids(out.context_requests) == [0]
+        assert requests[0].context_chunk_size == 1664
+
+    def test_short_request_takes_the_reserve_ahead_of_a_second_long_one(self):
+        head = make_ctx_request(0, context_remaining_length=20000)
+        long_second = make_ctx_request(1, context_remaining_length=6000)
+        short = make_ctx_request(2, context_remaining_length=1000)
+        out = self._schedule(make_kv_cache_manager(tokens_per_block=64), [head, long_second, short])
+        assert sorted(ids(out.context_requests)) == [0, 1, 2]
+        assert head.context_chunk_size == 8192 - 2048
+        assert short.context_chunk_size == 1000
+        assert long_second.context_chunk_size == 1024
+
+    def test_reserve_with_generation_rows_applies_only_to_first_context(self):
+        generation = make_gen_request(100, num_draft_tokens=31)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        long_second = make_ctx_request(1, context_remaining_length=6000)
+        short = make_ctx_request(2, context_remaining_length=1000)
+        out = self._schedule(
+            make_kv_cache_manager(tokens_per_block=64), [generation, head, long_second, short]
+        )
+        assert ids(out.generation_requests) == [100]
+        assert sorted(ids(out.context_requests)) == [0, 1, 2]
+        assert head.context_chunk_size == 6080  # floor((8192 - 32 - 2048) / 64) * 64
+        assert short.context_chunk_size == 1000
+        assert long_second.context_chunk_size == 1024
+
+    @pytest.mark.parametrize("adaptive,expected", [(True, 8128), (False, 6080)])
+    def test_single_context_adaptive_reserve_with_generation(self, monkeypatch, adaptive, expected):
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE_ADAPTIVE", "1" if adaptive else "0")
+        generation = make_gen_request(100, num_draft_tokens=31)
+        head = make_ctx_request(0, context_remaining_length=20000)
+        out = self._schedule(make_kv_cache_manager(tokens_per_block=64), [generation, head])
+        assert ids(out.context_requests) == [0]
+        assert head.context_chunk_size == expected
+
+    @pytest.mark.parametrize(
+        "first_context,cap,expected",
+        [(True, None, 4032), (False, None, 6080), (True, 512, 512), (False, 512, 512)],
+    )
+    def test_first_context_flag_preserves_held_tokens_and_cap(self, first_context, cap, expected):
+        scheduler = make_scheduler(
+            make_kv_cache_manager(tokens_per_block=64),
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+        )
+        request = make_ctx_request(0, context_remaining_length=20000)
+        budget = BudgetTracker(8192, 8)
+        budget.hold(2080, 2)  # 32 committed generation tokens plus a 2048-token starvation share.
+        action, tokens, chunked = scheduler._try_schedule_context(
+            request,
+            budget,
+            lambda req: False,
+            token_cap=cap,
+            first_context_in_batch=first_context,
+        )
+        assert action is ScheduleAction.SCHEDULED and chunked
+        assert tokens == expected
+        assert budget.num_tokens == 2080 and budget.max_num_tokens == 8192
+
+    def test_skipped_candidate_does_not_consume_first_context_reserve(self, monkeypatch):
+        scheduler = make_scheduler(
+            make_kv_cache_manager(tokens_per_block=64),
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+        )
+        original = scheduler._try_schedule_context
+
+        def skip_candidate(request, *args, **kwargs):
+            if request.py_request_id == 0:
+                return ScheduleAction.SKIP, 0, False
+            return original(request, *args, **kwargs)
+
+        monkeypatch.setattr(scheduler, "_try_schedule_context", skip_candidate)
+        generation = make_gen_request(100, num_draft_tokens=31)
+        skipped = make_ctx_request(0, context_remaining_length=20000)
+        head = make_ctx_request(1, context_remaining_length=20000)
+        short = make_ctx_request(2, context_remaining_length=1000)
+        out = scheduler.schedule_request([generation, skipped, head, short], set())
+        assert sorted(ids(out.context_requests)) == [1, 2]
+        # SJF admits the short request first; the head is the second admitted context.
+        assert head.context_chunk_size == 7104 and short.context_chunk_size == 1000
+
+    def test_skipped_candidate_keeps_reserve_for_first_admitted_long_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scheduler = make_scheduler(
+            make_kv_cache_manager(tokens_per_block=64),
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+        )
+        original = scheduler._try_schedule_context
+
+        def skip_candidate(request: Mock, *args, **kwargs) -> tuple[ScheduleAction, int, bool]:
+            if request.py_request_id == 0:
+                return ScheduleAction.SKIP, 0, False
+            return original(request, *args, **kwargs)
+
+        monkeypatch.setattr(scheduler, "_try_schedule_context", skip_candidate)
+        requests = [make_ctx_request(i, context_remaining_length=20000) for i in range(3)]
+        out = scheduler.schedule_request(requests, set())
+        assert ids(out.context_requests) == [1, 2]
+        assert requests[1].context_chunk_size == 6144
+        assert requests[2].context_chunk_size == 2048
+
+    @pytest.mark.parametrize("drafts,expected", [(0, 6144), (31, 6080)])
+    def test_last_chunk_drafts_do_not_spend_append_reserve(
+        self, drafts: int, expected: int
+    ) -> None:
+        head = make_ctx_request(0, context_remaining_length=6144, num_draft_tokens=drafts)
+        follower_length = 2100 if drafts else 2048
+        next_request = make_ctx_request(1, context_remaining_length=follower_length)
+        manager = make_kv_cache_manager(tokens_per_block=64)
+        with patch.object(
+            type(head),
+            "is_last_context_chunk",
+            new_callable=PropertyMock,
+            create=True,
+            side_effect=lambda: head.context_chunk_size >= head.context_remaining_length,
+        ):
+            out = self._schedule(manager, [head, next_request])
+            assert head.is_last_context_chunk is (drafts == 0)
+        assert ids(out.context_requests) == [0, 1]
+        assert head.context_chunk_size == expected
+        assert next_request.context_chunk_size == follower_length
+        assert manager.resize_context.call_args_list[0] == call(head, expected)
+        head.discard_draft_tokens.assert_not_called()
+
+    def test_kill_switch_keeps_arrival_order(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE_SJF", "0")
+        head = make_ctx_request(0, context_remaining_length=20000)
+        long_second = make_ctx_request(1, context_remaining_length=6000)
+        short = make_ctx_request(2, context_remaining_length=1000)
+        out = self._schedule(make_kv_cache_manager(tokens_per_block=64), [head, long_second, short])
+        assert sorted(ids(out.context_requests)) == [0, 1]
+        assert long_second.context_chunk_size == 2048
+
+    def test_order_uses_the_uncached_length_from_the_reuse_probe(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.probe_context_reuse.side_effect = lambda req: 5900 if req.py_request_id == 3 else None
+        head = make_ctx_request(0, context_remaining_length=20000)
+        short = make_ctx_request(2, context_remaining_length=1000)
+        mostly_cached = make_ctx_request(3, context_remaining_length=6000)
+        out = self._schedule(mgr, [head, short, mostly_cached])
+        assert 3 in ids(out.context_requests)
+        assert 2 not in ids(out.context_requests)
+
+    def test_head_keeps_its_place(self):
+        head = make_ctx_request(0, context_remaining_length=20000)
+        short = make_ctx_request(1, context_remaining_length=500)
+        shorter = make_ctx_request(2, context_remaining_length=100)
+        self._schedule(make_kv_cache_manager(tokens_per_block=64), [head, short, shorter])
+        assert head.context_chunk_size == 8192 - 2048
+
+    def test_started_continuation_keeps_its_place_ahead_of_new_requests(self):
+        """A started prefill holds pages; reordering it behind new short requests could preempt it."""
+        sched = make_scheduler(
+            make_kv_cache_manager(tokens_per_block=64),
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+        )
+        head = make_ctx_request(0, context_remaining_length=20000)
+        started = make_ctx_request(1, context_remaining_length=12000, is_first_context_chunk=False)
+        new_long = make_ctx_request(2, context_remaining_length=6000)
+        new_short = make_ctx_request(3, context_remaining_length=500)
+        pending = [head, new_long, started, new_short]
+        sched._order_reserve_shortest_first(pending)
+        assert ids(pending) == [0, 1, 3, 2]
+
+    def test_joint_draft_pool_orders_by_the_common_claim_depth(self):
+        """With a paired draft pool, the reuse that will be claimed is min(draft, target)."""
+        mgr = make_kv_cache_manager(tokens_per_block=64, enable_joint_kv_cache_reuse=True)
+        draft_mgr = make_kv_cache_manager(tokens_per_block=64)
+        mgr.probe_context_reuse.side_effect = lambda req: 5900
+        draft_mgr.probe_context_reuse.side_effect = (
+            lambda req: 1000 if req.py_request_id == 1 else 5900
+        )
+        sched = make_scheduler(
+            mgr, max_num_tokens=8192, ctx_chunk_config=(None, 64), draft_kv_cache_manager=draft_mgr
+        )
+        draft_short = make_ctx_request(1, context_remaining_length=6000)
+        both_deep = make_ctx_request(2, context_remaining_length=6000)
+        assert sched._uncached_context_tokens(draft_short) == 5000
+        assert sched._uncached_context_tokens(both_deep) == 100
+        pending = [make_ctx_request(0, context_remaining_length=20000), draft_short, both_deep]
+        sched._order_reserve_shortest_first(pending)
+        assert ids(pending) == [0, 2, 1]
+
+    def test_uncached_count_is_memoized_between_reprobes(self, monkeypatch):
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE_SJF_REPROBE", "3")
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(mgr, max_num_tokens=8192, ctx_chunk_config=(None, 64))
+        reqs = [make_ctx_request(i, context_remaining_length=1000 * (i + 1)) for i in range(3)]
+        for _ in range(3):
+            sched._order_reserve_shortest_first(list(reqs))
+        assert mgr.probe_context_reuse.call_count == 2  # requests 1 and 2, probed once in 3 passes
+        sched._order_reserve_shortest_first(list(reqs))
+        assert mgr.probe_context_reuse.call_count == 4  # re-probed on the 4th pass
+
+    def test_memo_drops_requests_that_left(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(mgr, max_num_tokens=8192, ctx_chunk_config=(None, 64))
+        reqs = [make_ctx_request(i, context_remaining_length=1000 * (i + 1)) for i in range(4)]
+        sched._order_reserve_shortest_first(list(reqs))
+        sched._order_reserve_shortest_first([reqs[0], reqs[1], reqs[2]])
+        assert set(sched._uncached_context_memo) == {1, 2}
+
+    def test_a_request_deferred_behind_a_contributor_is_reprobed_next_pass(self):
+        """Its reuse jumps once the contributor commits the shared block, so its memo must not keep it 'long'."""
+        reuse = {}
+        mgr = make_kv_cache_manager(
+            tokens_per_block=64,
+            enable_block_reuse=True,
+            block_reuse_policy=BlockReusePolicy.ALL_REUSABLE,
+            first_new_block_fn=lambda req: {0: b"blockA", 1: b"blockA", 2: b"blockB"}.get(
+                req.request_id
+            ),
+        )
+        mgr.probe_context_reuse.side_effect = lambda req: reuse.get(req.py_request_id)
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        req0, req1, req2 = (
+            make_ctx_request(0, 5000),
+            make_ctx_request(1, 3000),
+            make_ctx_request(2, 2000),
+        )
+        out = sched.schedule_request([req0, req1, req2], set())
+        assert 1 not in ids(out.context_requests)  # deferred behind request 0's block
+        assert 1 not in sched._uncached_context_memo and 2 in sched._uncached_context_memo
+        reuse[1] = 2900  # request 0 committed the shared prefix
+        req3 = make_ctx_request(3, 1500)
+        pending = [req0, req3, req1]
+        sched._order_reserve_shortest_first(pending)
+        assert ids(pending) == [0, 1, 3]
+
+
 @pytest.mark.parametrize("prompt_len", [0, 8])
 def test_rewind_context_after_cache_drop_handles_empty_rank_local_prompt(
     prompt_len: int,
@@ -5761,3 +6229,23 @@ class TestDisaggAdmitBeforeAlloc:
         base, gated = self._both(64, reqs)
         assert ids(base.out.generation_requests) == ids(gated.out.generation_requests) == [2, 4]
         assert gated.admitted == [0] and gated.allocated == [0, 1]
+
+
+@pytest.mark.parametrize("reserve", [0, 2048])
+def test_append_reserve_preserves_starved_context_token_cap(
+    monkeypatch: pytest.MonkeyPatch, reserve: int
+) -> None:
+    monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE", str(reserve))
+    scheduler = make_scheduler(
+        make_kv_cache_manager(tokens_per_block=64),
+        max_num_tokens=8192,
+        ctx_chunk_config=(None, 64),
+    )
+    request = make_ctx_request(0, context_remaining_length=20000)
+    budget = BudgetTracker(8192, 8)
+    action, tokens, chunked = scheduler._try_schedule_context(
+        request, budget, lambda req: False, token_cap=512
+    )
+    assert action is ScheduleAction.SCHEDULED
+    assert tokens == 512 and chunked
+    assert budget.max_num_tokens == 8192

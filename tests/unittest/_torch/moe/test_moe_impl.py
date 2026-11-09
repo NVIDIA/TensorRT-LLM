@@ -2025,7 +2025,14 @@ _CUTEDSL_DECLARATIONS = (
             supports_deep_ep_direct_metadata=True,
         ),
         MoEActivationSupport(
-            kinds=frozenset({ActivationType.Swiglu, ActivationType.Relu2, ActivationType.SiTu}),
+            kinds=frozenset(
+                {
+                    ActivationType.Swiglu,
+                    ActivationType.Relu2,
+                    ActivationType.SiTu,
+                    ActivationType.SwigluBias,
+                }
+            ),
             alpha_beta=ActivationParamShape.UNIFORM_SCALAR,
             limit=ActivationParamShape.UNIFORM_SCALAR,
             limit_when_absent=float("inf"),

@@ -6207,6 +6207,50 @@
           "default": "GUARANTEED_NO_EVICT",
           "description": "The capacity scheduler policy to use"
         },
+        "context_append_reserve_adaptive": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Release the append reserve when no second context request is waiting. None defaults to True with an explicit reserve, or uses the environment configuration otherwise.",
+          "status": "prototype",
+          "title": "Context Append Reserve Adaptive"
+        },
+        "context_append_reserve_reprobe_iterations": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Scheduler passes between cache-reuse probes used to order new requests behind the append reserve. None defaults to 8 with an explicit reserve, or uses the environment configuration otherwise.",
+          "status": "prototype",
+          "title": "Context Append Reserve Reprobe Iterations"
+        },
+        "context_append_reserve_tokens": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Tokens reserved behind the first admitted context chunk for other context requests. Only the KV cache V2 scheduler with chunked context and max_num_tokens greater than twice the reserve applies it. Zero disables the reserve; None uses the environment configuration. With an explicit reserve, context_scheduling_policy selects the order behind the first and already-started requests.",
+          "status": "prototype",
+          "title": "Context Append Reserve Tokens"
+        },
         "context_chunking_policy": {
           "anyOf": [
             {

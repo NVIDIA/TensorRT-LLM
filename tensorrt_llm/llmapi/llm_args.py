@@ -4602,6 +4602,34 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
             "disables it."),
         status="prototype")
 
+    context_append_reserve_tokens: Optional[NonNegativeInt] = Field(
+        default=None,
+        description=(
+            "Tokens reserved behind the first admitted context chunk for other "
+            "context requests. Only the KV cache V2 scheduler with chunked "
+            "context and max_num_tokens greater than twice the reserve applies "
+            "it. Zero disables the reserve; None uses the environment "
+            "configuration. With an explicit reserve, context_scheduling_policy "
+            "selects the order behind the first and already-started requests."),
+        status="prototype")
+
+    context_append_reserve_adaptive: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Release the append reserve when no second context request is "
+            "waiting. None defaults to True with an explicit reserve, or uses "
+            "the environment configuration otherwise."),
+        status="prototype")
+
+    context_append_reserve_reprobe_iterations: Optional[PositiveInt] = Field(
+        default=None,
+        description=(
+            "Scheduler passes between cache-reuse probes used to order new "
+            "requests behind the append reserve. None defaults to 8 with an "
+            "explicit reserve, or uses the environment configuration otherwise."
+        ),
+        status="prototype")
+
     @model_validator(mode="after")
     def validate_context_starvation_iterations(self) -> 'SchedulerConfig':
         if (self.context_starvation_iterations is not None

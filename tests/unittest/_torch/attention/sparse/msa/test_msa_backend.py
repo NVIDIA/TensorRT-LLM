@@ -18,9 +18,14 @@ from unittest.mock import Mock, create_autospec
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha import msa_prefill
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
     MiniMaxM3KVCacheManagerV2,
     MiniMaxM3MsaSparseAttention,
+    msa_indexer,
+)
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
+    msa_backend as msa_backend_module,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_scatter import (
     fused_write_layer_caches,
@@ -28,6 +33,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_scatte
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
+    build_kv_page_indices,
     msa_paged_kv,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
@@ -39,12 +45,62 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_spa
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
     MiniMaxM3MsaSparseAttentionMetadata,
     MsaDecodeSpan,
+    gather_page_ranges,
+    proxy_segment_page_ranges,
+    proxy_segment_rows,
 )
 from tensorrt_llm._torch.attention.backends.sparse.registry import _resolve_minimax_m3_backend_cls
+from tensorrt_llm._torch.pyexecutor import step_inputs
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="SM107 context step-input staging",
+)
+def test_segmented_proxy_reads_current_page_table_before_pack_flush(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preparation must gather this step's pages while unrelated input copies remain packed."""
+    monkeypatch.setattr(msa_backend_module.h2d_cache, "enabled", lambda: True)
+    monkeypatch.setattr(msa_backend_module, "SKIP_UNCHANGED_BLOCK_TABLE", False)
+    monkeypatch.setattr(msa_backend_module, "TAIL_FILL_IN_FORWARD", True)
+    device = torch.device("cuda", torch.cuda.current_device())
+    metadata = _span_metadata(num_contexts=1, qo_lens=(257,), kv_lens=(385,))
+    block_ids = torch.tensor([[19, 7, 13, 2]], dtype=torch.int32)
+    # tokens_per_block is an instance field; the other members come from the production manager interface.
+    manager = Mock(spec_set=[*dir(KVCacheManagerV2), "tokens_per_block"])
+    manager.tokens_per_block = 128
+    manager.get_buffers.return_value = torch.empty(1, device=device)
+    manager.get_block_ids_per_seq.return_value = block_ids
+    metadata.kv_cache_manager = manager
+    metadata.request_ids = [0]
+    metadata._msa_buffers_ready = True
+    metadata._msa_decode_span = None
+    metadata.msa_out_cache_loc = torch.full((257,), -1, dtype=torch.int32, device=device)
+    metadata.msa_kv_indices = torch.full((4,), -1, dtype=torch.int32, device=device)
+    metadata.msa_proxy_kv_indices = torch.full((9,), -1, dtype=torch.int32, device=device)
+    metadata.msa_block_table = torch.zeros((1, 4), dtype=torch.int32, device=device)
+    metadata.msa_seq_lens_cuda = torch.zeros(1, dtype=torch.int32, device=device)
+    metadata.msa_subpage_block_table = None
+    metadata.msa_cu_q_lens = None
+    monkeypatch.setattr(metadata, "_msa_kv_lens_may_change", lambda: False)
+    pack = step_inputs.StepInputPack(device)
+    with step_inputs.active(pack):
+        step_inputs.begin()
+        try:
+            metadata._build_msa_fields()
+            assert step_inputs.is_open(), "the regression must check pages before a pack flush"
+            assert bool((metadata.msa_out_cache_loc == -1).all()), (
+                "unrelated slot copies must remain deferred"
+            )
+            assert metadata.msa_proxy_kv_indices.cpu().tolist() == [19, 7, 19, 7, 13, 19, 7, 13, 2]
+        finally:
+            step_inputs.flush()
+    manager.get_block_ids_per_seq.assert_called_once_with([0])
 
 
 @pytest.mark.cpu_only
@@ -1459,6 +1515,9 @@ def test_nvfp4_step_plans_skip_the_sparse_attention_plan(monkeypatch, dtype):
     """NVFP4 sparse layers run the CSR kernel, so only FP8 caches plan sparse GQA."""
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
 
+    # The dense layers plan fmha_sm100 here; with FA4 dense prefill (SM107) they plan nothing.
+    monkeypatch.setattr(msa_prefill, "dense_prefill_fa4_enabled", lambda *_: False)
+
     planned = []
 
     def fmha_sm100_plan(qo_lens, kv_lens, **kwargs):
@@ -2424,3 +2483,76 @@ def test_nvfp4_scatter_writes_physical_p32_data_and_scale_layouts():
     for backing in (k_backing, v_backing, ksf_backing, vsf_backing):
         assert torch.count_nonzero(backing[0]).item() == 0
         assert torch.count_nonzero(backing[-1]).item() == 0
+
+
+@pytest.mark.parametrize(
+    "sm_version,enabled,expected",
+    [(107, True, True), (107, False, False), (103, True, False), (100, True, False)],
+)
+def test_proxy_segmented_only_on_sm107(monkeypatch, sm_version, enabled, expected):
+    """The segmented, split indexer proxy runs on SM107 only, behind its constant."""
+    monkeypatch.setattr(msa_backend_module, "get_sm_version", lambda: sm_version)
+    monkeypatch.setattr(msa_backend_module, "_SM107_PROXY_AUTO_KV_SPLITS", enabled)
+    assert msa_backend_module._proxy_segmented() is expected
+
+
+@pytest.mark.cpu_only
+def test_proxy_segment_rows_keep_each_tokens_causal_range() -> None:
+    """Segments tile each request's query tokens in order and keep every token's key range."""
+    # A 300-token chunk over 1000 cached tokens, an empty row, and a 5-token chunk.
+    qo = torch.tensor([300, 0, 5], dtype=torch.int32)
+    kv = torch.tensor([1300, 40, 85], dtype=torch.int32)
+    off = kv - qo
+    seg_qo, seg_kv, seg_off, seg_src = proxy_segment_rows(qo, kv, off, 128)
+    assert seg_qo.tolist() == [128, 128, 44, 5]
+    assert seg_kv.tolist() == [1128, 1256, 1300, 85]
+    assert seg_off.tolist() == [1000, 1128, 1256, 80]
+    assert seg_src.tolist() == [0, 0, 0, 2]
+    assert seg_qo.dtype == seg_kv.dtype == seg_off.dtype == torch.int32
+    # Each segment sees exactly its own tokens beyond its offset (causal key range kept).
+    assert (seg_kv - seg_off).tolist() == seg_qo.tolist()
+    assert int(seg_qo.sum()) == int(qo.sum())
+
+
+@pytest.mark.cpu_only
+def test_proxy_segment_page_table_matches_per_segment_build() -> None:
+    """The device-gathered segmented page table equals a per-segment host build."""
+    page = 128
+    qo = torch.tensor([300, 0, 5, 130], dtype=torch.int32)
+    kv = torch.tensor([1300, 40, 85, 600], dtype=torch.int32)
+    seg_qo, seg_kv, seg_off, seg_src = proxy_segment_rows(qo, kv, kv - qo, page)
+    block_ids = torch.randperm(4 * 16, dtype=torch.int32).view(4, 16)
+    flat = build_kv_page_indices(block_ids, kv, page)
+    expected = build_kv_page_indices(block_ids.index_select(0, seg_src), seg_kv, page)
+    starts, counts = proxy_segment_page_ranges(kv, seg_kv, seg_src, page)
+    total = int(counts.sum())
+    out = torch.full((total + 7,), -1, dtype=flat.dtype)
+    gather_page_ranges(flat, starts, counts, total, out)
+    assert torch.equal(out[:total], expected)
+    assert (out[total:] == -1).all()
+    planner = Mock(spec_set=["fmha_sm100_plan"])
+    planner.fmha_sm100_plan.return_value = ("segmented plan",)
+    plan, gathered = msa_indexer._segmented_proxy_plan(
+        planner,
+        qo.tolist(),
+        (kv - qo).tolist(),
+        num_index_heads=2,
+        page_size=page,
+        num_kv_splits=3,
+        kv_indices=flat,
+    )
+    assert plan is planner.fmha_sm100_plan.return_value
+    assert torch.equal(gathered, expected)
+    planner.fmha_sm100_plan.assert_called_once()
+    args, kwargs = planner.fmha_sm100_plan.call_args
+    assert torch.equal(args[0], seg_qo)
+    assert torch.equal(args[1], seg_kv)
+    assert torch.equal(kwargs.pop("qo_offset"), seg_off)
+    assert kwargs == dict(
+        page_size=page,
+        num_kv_splits=3,
+        causal=True,
+        num_qo_heads=2,
+        num_kv_heads=1,
+        output_maxscore=True,
+    )

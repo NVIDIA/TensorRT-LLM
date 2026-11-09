@@ -24,11 +24,13 @@ at allocation (test_minimax_m3_kv_pool_zero_init.py);
 the "nan" tail cases check that rows of requests without a tail stay exact.
 """
 
+from typing import Any
+
 import pytest
 import torch
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention.backends.fmha import fallback
+from tensorrt_llm._torch.attention.backends.fmha import drafter_last_row, fallback
 from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen as fi_mod
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionRuntimeFeatures,
@@ -371,5 +373,80 @@ def test_generation_verify_and_mixed_steps(served, case, kv_dtype, tail) -> None
                 f"[{name}] request {rid} ({phase}, past {c}, q_len {n}) vs FP32 reference: {error:.4f}"
             )
             assert error <= tolerance[phase]
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("decode_kernel", [False, True], ids=["context", "decode"])
+@pytest.mark.parametrize("kv_dtype", _KV_DTYPES, ids=_KV_IDS)
+def test_drafter_last_row_matches_stock_forward(
+    monkeypatch: pytest.MonkeyPatch,
+    served: dict[str, int],
+    kv_dtype: torch.dtype,
+    decode_kernel: bool,
+) -> None:
+    monkeypatch.setattr(drafter_last_row, "_DECODE_KERNEL", decode_kernel)
+    monkeypatch.setattr(drafter_last_row, "_KV_TAIL_ZERO", True)
+    taken = []
+    original = drafter_last_row.DrafterLastRowContextFmha._run_context_attention
+
+    def record(self: drafter_last_row.DrafterLastRowContextFmha, *args: Any, **kwargs: Any) -> None:
+        taken.append(True)
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        drafter_last_row.DrafterLastRowContextFmha, "_run_context_attention", record
+    )
+    steps = [[(0, 0, 384), (1, 0, 129)], [(0, 384, 385), (1, 129, 128)]]
+    lengths = {0: 769, 1: 257}
+    generator = torch.Generator(device="cuda").manual_seed(20629)
+    width = (_HEADS + 2 * _KV_HEADS) * _HEAD_DIM
+    qkv = {
+        rid: torch.randn(length, width, device="cuda", generator=generator).to(torch.bfloat16)
+        for rid, length in lengths.items()
+    }
+    num_tokens = 2 * sum(-(-length // _PAGE) * _PAGE for length in lengths.values()) + 8 * _PAGE
+    manager = _kv_manager(kv_dtype, num_tokens)
+    try:
+        stock = _attention(kv_dtype)
+        optimized = _attention(kv_dtype)
+        draft = torch.nn.Module()
+        draft.attn = optimized
+        assert drafter_last_row.mark_drafter_last_row_attention(draft) == 1
+        rids = sorted(lengths)
+        manager.add_dummy_requests(
+            rids + [_REF_RID + rid for rid in rids], [lengths[rid] for rid in rids] * 2
+        )
+        for step_index, rows in enumerate(steps):
+            packed = torch.cat([qkv[rid][cached : cached + new] for rid, cached, new in rows])
+            reference_rows = [(_REF_RID + rid, cached, new) for rid, cached, new in rows]
+            stock_out = _step(stock, manager, reference_rows, packed.clone(), len(rows))
+            optimized_out = _step(optimized, manager, rows, packed.clone(), len(rows))
+            assert len(taken) == step_index + 1, "The actual builtin last-row library must run"
+            assert served["fallback"] == 0, served
+            assert torch.isfinite(optimized_out).all()
+            live_rows = []
+            first = 0
+            for rid, cached, new in rows:
+                last = first + new - 1
+                live_rows.append(last)
+                actual = optimized_out[last : last + 1]
+                expected = stock_out[last : last + 1]
+                tolerance = _TOLERANCE[kv_dtype]["ctx"]
+                assert _relative_error(actual, expected) <= tolerance
+                # Reuse the independent FP32 reference and measured context
+                # budget, including the FP8 query cast from preprocessing.
+                reference = _float_reference(
+                    qkv[rid], cached, new, 0, kv_dtype == torch.float8_e4m3fn
+                )[-1:]
+                assert _relative_error(actual, reference) <= tolerance
+                assert torch.equal(
+                    _cached_kv(manager, rid, cached + new),
+                    _cached_kv(manager, _REF_RID + rid, cached + new),
+                ), "Every appended K/V row must match stock, including dead query rows"
+                first += new
+            dead = torch.ones(optimized_out.shape[0], dtype=torch.bool, device="cuda")
+            dead[live_rows] = False
+            assert torch.count_nonzero(optimized_out[dead]).item() == 0
     finally:
         manager.shutdown()

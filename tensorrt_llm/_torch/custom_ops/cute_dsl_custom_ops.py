@@ -95,6 +95,17 @@ def _canonicalize_situ_beta(situ_beta: float) -> Optional[float]:
     return None if situ_beta <= 0 else float(situ_beta)
 
 
+def _canonicalize_rubin_activation_beta(activation_type: ActivationType,
+                                        value: float) -> Optional[float]:
+    """OAI constants are scalars, including non-positive linear offsets.
+
+    Only SiTU soft-caps use non-positive values as the absent sentinel.
+    """
+    if activation_type == ActivationType.SwigluBias:
+        return float(value)
+    return _canonicalize_situ_beta(value)
+
+
 _KIMI_K3_MXFP8_TUNING_BUCKETS = (1, 2, 4, 8, *range(16, 193, 16))
 
 # Both dense MXFP8 wrappers pass a scalar one to the CuTe kernel. Keep one
@@ -16610,8 +16621,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tile_size,
                 scaling_vector_size,
                 activation_type=activation_type,
-                situ_beta=_canonicalize_situ_beta(situ_beta),
-                situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
+                situ_beta=_canonicalize_rubin_activation_beta(
+                    activation_type, situ_beta),
+                situ_linear_beta=_canonicalize_rubin_activation_beta(
+                    activation_type, situ_linear_beta),
                 swiglu_limit_scalar=_canonicalize_swiglu_limit_scalar(
                     swiglu_limit_scalar),
                 sf_dtype=sf_dtype,
@@ -16922,8 +16935,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     tile_size,
                     scaling_vector_size,
                     activation_type=ActivationType(activation_type),
-                    situ_beta=_canonicalize_situ_beta(situ_beta),
-                    situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
+                    situ_beta=_canonicalize_rubin_activation_beta(
+                        activation_type, situ_beta),
+                    situ_linear_beta=_canonicalize_rubin_activation_beta(
+                        activation_type, situ_linear_beta),
                     swiglu_limit_scalar=_canonicalize_swiglu_limit_scalar(
                         swiglu_limit_scalar),
                 ))
@@ -17634,17 +17649,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
             kernel_cache = dict()
             tuning_config_cache = dict()
 
-            def __init__(
-                    self,
-                    num_experts: int,
-                    top_k: int,
-                    num_local_experts: int,
-                    local_expert_offset: int,
-                    tile_size: int,
-                    output_dtype: torch.dtype,
-                    scaling_vector_size: int = 16,
-                    sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN):
+            def __init__(self,
+                         num_experts: int,
+                         top_k: int,
+                         num_local_experts: int,
+                         local_expert_offset: int,
+                         tile_size: int,
+                         output_dtype: torch.dtype,
+                         scaling_vector_size: int = 16,
+                         sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN,
+                         store_permuted: bool = False):
                 super().__init__()
+                # store_permuted: FC2 stores bf16(alpha * acc) at each permuted row of c [m, n] instead of the
+                # fused scatter-add finalize (deterministic route; the finalize runs separately in fixed order).
+                self.store_permuted = store_permuted
                 self.num_experts = num_experts
                 self.top_k = top_k
                 self.num_local_experts = num_local_experts
@@ -17677,6 +17695,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.tile_size,
                     self.output_dtype,
                     self.scaling_vector_size,
+                    self.store_permuted,
                 ) + _rubin_sf_dtype_key(self.sf_dtype)
 
             @staticmethod
@@ -17786,7 +17805,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 functools.partial(
                                     fp4_scale_infer_shape,
                                     sf_vec_size=self.scaling_vector_size)),
-                            ConstraintSpec(5, 0, helper.infer_shape_num_tokens),
+                            ConstraintSpec(
+                                5, 0, helper.infer_shape_max_num_permuted_tokens
+                                if self.store_permuted else
+                                helper.infer_shape_num_tokens),
                             ConstraintSpec(6, 0,
                                            helper.infer_shape_max_num_tiles),
                             ConstraintSpec(7, 0,
@@ -17831,6 +17853,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 assert c.dim() == 2
                 num_tokens = c.size(0)
                 assert c.size(1) == n or c.size(1) == n * 2
+                if self.store_permuted:
+                    assert num_tokens == m, "store_permuted: c is [permuted rows, n]"
 
                 num_tiles = m // self.tile_size
                 assert tile_idx_to_group_idx.dtype == torch.int32
@@ -17843,7 +17867,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 assert num_non_exiting_tiles.numel() == 1
                 assert token_final_scales.dtype == torch.float32
                 assert token_final_scales.dim() == 2
-                assert token_final_scales.size() == (num_tokens, self.top_k)
+                if not self.store_permuted:
+                    assert token_final_scales.size() == (num_tokens, self.top_k)
 
                 locality_domain_id = get_current_locality_domain()
                 locality_domain_half_gemm = locality_domain_id is not None
@@ -17923,7 +17948,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cache_key = (self.scaling_vector_size, self.sf_dtype,
                              self.tile_size, self.top_k, mma_tiler,
                              mma_inst_shape, cluster_shape_mn, raster_along_m,
-                             locality_domain_half_gemm, max_active_clusters)
+                             locality_domain_half_gemm, max_active_clusters,
+                             self.store_permuted)
                 if cache_key not in self.__class__.kernel_cache:
                     gemm = self.__class__.kernel_class(
                         sf_vec_size=self.scaling_vector_size,
@@ -17932,6 +17958,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         cluster_shape_mn=cluster_shape_mn,
                         raster_along_m=raster_along_m,
                         topK=self.top_k,
+                        store_permuted=self.store_permuted,
                     )
                     compiled_gemm = cute.compile(
                         gemm.wrapper,
@@ -18034,6 +18061,60 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 best_tactic = ast.literal_eval(precomputed_tactic)
 
+            runner(inputs, tactic=best_tactic)
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_nvfp4_grouped_gemm_store_rubin",
+            mutates_args=("output", ),
+            device_types="cuda")
+        def cute_dsl_nvfp4_grouped_gemm_store_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            output: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
+            scaling_vector_size: int = 16,
+            precomputed_tactic: Optional[str] = None,
+        ) -> None:
+            """(rule 1b, deterministic) The FC2 grouped GEMM storing bf16(alpha * acc) per permuted row into output
+            [m, n] (no token scale, no scatter-add); a fixed-order finalize then sums the top-k rows per token."""
+            tuner = AutoTuner.get()
+            runner = Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
+                num_experts,
+                top_k,
+                num_local_experts,
+                local_expert_offset,
+                tile_size,
+                output_dtype,
+                scaling_vector_size,
+                store_permuted=True)
+            inputs = [
+                input, weight, input_scale, weight_scale, alpha, output,
+                tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx, num_non_exiting_tiles,
+                token_final_scales
+            ]
+            if precomputed_tactic is None:
+                _, best_tactic = tuner.choose_one(
+                    "trtllm::cute_dsl_nvfp4_grouped_gemm_store_rubin",
+                    [runner],
+                    runner.get_tuning_config(),
+                    inputs,
+                )
+            else:
+                best_tactic = ast.literal_eval(precomputed_tactic)
             runner(inputs, tactic=best_tactic)
 
         @torch.library.custom_op(

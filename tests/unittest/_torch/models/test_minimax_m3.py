@@ -22,8 +22,9 @@ from __future__ import annotations
 
 import json
 import os
-from types import SimpleNamespace
-from unittest.mock import Mock, create_autospec
+import sys
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, call, create_autospec
 
 import pytest
 import torch
@@ -38,6 +39,9 @@ from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 
 import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops import (
+    context as m3_context,
+)
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
@@ -48,6 +52,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager impo
     MiniMaxM3KVCacheManagerV2,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
+    MiniMaxM3BackendForwardArgs,
     MiniMaxM3SparseConfig,
     MiniMaxM3SparseMetadataParams,
     MiniMaxM3SparseParams,
@@ -57,6 +62,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import
     MiniMaxM3MsaSparseAttentionMetadata,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import _group_max_reduce
+from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.compilation.remove_copy_pass import remove_copy_for_mutates_args
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
@@ -86,14 +92,21 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
 )
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
-from tensorrt_llm._torch.modules.linear import _load_kv_cache_scales
+from tensorrt_llm._torch.modules import linear as linear_module
+from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod, _load_kv_cache_scales
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm.nvfp4 import (
+    TrtllmCutedslGroupedGemmNvfp4Impl,
+)
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import DETERMINISTIC_MOE_FINALIZE
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
 from tensorrt_llm._torch.moe.fused_moe.routing import (
     MiniMaxM2MoeRoutingMethod,
     MiniMaxM3MoeRoutingMethod,
 )
-from tensorrt_llm._torch.utils import AuxStreamType, EventType
+from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.trtllm_nvfp4 import TrtllmTrtllmGenNvfp4Impl
+from tensorrt_llm._torch.utils import AuxStreamType, EventType, MxFp8QuantizedTensor
 from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -219,7 +232,7 @@ def test_nvfp4_reload_preserves_attention_scale_storage(
 
 
 class _M3CompositionGate(nn.Module):
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, generation_only: bool = False) -> torch.Tensor:
         return hidden_states
 
 
@@ -285,6 +298,7 @@ def test_minimax_m3_moe_reduces_only_local_terms(
     moe.allreduce = _M3CompositionAllReduce()
     moe.event_dict = {EventType.Main: None, EventType.MoeShared: None}
     moe.aux_stream = None
+    moe._prequantized_fp4 = None
 
     hidden_states = torch.ones((2, 4))
     output = moe(hidden_states, SimpleNamespace(all_rank_num_tokens=None))
@@ -492,6 +506,68 @@ def test_minimax_m3_uses_one_engine_speculative_base() -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("deferred", [False, True])
+def test_minimax_m3_enables_clc_only_for_target_linears(
+    monkeypatch: pytest.MonkeyPatch, deferred: bool
+) -> None:
+    """Only target linears opt in, including before their quantization methods exist."""
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    monkeypatch.setattr(linear_module, "mxfp8_gemm_backend_override", lambda: None)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
+    projections = []
+    for _ in range(3):
+        projection = linear_module.Linear.__new__(linear_module.Linear)
+        nn.Module.__init__(projection)
+        if not deferred:
+            projection.quant_method = MXFP8LinearMethod()
+        projections.append(projection)
+    target_linear, draft_linear, unrelated_linear = projections
+    model, draft = nn.Module(), nn.Module()
+    model.projection = target_linear
+    draft.projection = draft_linear
+    other_method = linear_module.UnquantizedLinearMethod()
+    model.other = linear_module.Linear.__new__(linear_module.Linear)
+    nn.Module.__init__(model.other)
+    model.other.quant_method = other_method
+
+    def base_init(
+        self: SpecDecOneEngineForCausalLM, target: nn.Module, config: ModelConfig
+    ) -> None:
+        nn.Module.__init__(self)
+        self.model = target
+        self.draft_model = draft
+
+    monkeypatch.setattr(SpecDecOneEngineForCausalLM, "__init__", base_init)
+    constructor = create_autospec(MiniMaxM3Model, spec_set=True, return_value=model)
+    monkeypatch.setattr(modeling_minimaxm3, "MiniMaxM3Model", constructor)
+    config = ModelConfig(
+        pretrained_config=_make_text_config(), quant_config=QuantConfig(quant_algo=QuantAlgo.MXFP8)
+    )
+    target = MiniMaxM3ForCausalLM(config)
+    constructor.assert_called_once_with(config)
+    assert target.model is model and target.draft_model is draft
+    assert target_linear._use_ctx_clc_gemm
+    assert not draft_linear._use_ctx_clc_gemm
+    assert not unrelated_linear._use_ctx_clc_gemm
+    if deferred:
+        assert not hasattr(target_linear, "quant_method")
+        target_linear._weights_created = False
+        target_linear.quant_config = config.quant_config
+        target_linear.in_features, target_linear.out_features = 4096, 6144
+        target_linear.has_bias, target_linear.dtype = False, torch.bfloat16
+        create_weights = create_autospec(MXFP8LinearMethod.create_weights, spec_set=True)
+        monkeypatch.setattr(MXFP8LinearMethod, "create_weights", create_weights)
+        target_linear.create_weights_impl()
+        assert isinstance(target_linear.quant_method, MXFP8LinearMethod)
+        assert target_linear._use_ctx_clc_gemm
+        create_weights.assert_called_once_with(
+            target_linear.quant_method, target_linear, 4096, 6144, False, torch.bfloat16
+        )
+    assert model.other.quant_method is other_method
+    assert model.other._use_ctx_clc_gemm
+
+
+@pytest.mark.cpu_only
 def test_setup_aliases_preserves_one_engine_draft_weight_loading() -> None:
     loaded = []
 
@@ -531,7 +607,7 @@ def test_eagle_capture_precedes_next_layer_norm() -> None:
 
     layer = SimpleNamespace(
         layer_idx=25,
-        _apply_pre_feed_forward_norm=lambda hidden, residual: (hidden + 1, residual + 2),
+        _apply_pre_feed_forward_norm=lambda hidden, residual, moe=None: (hidden + 1, residual + 2),
         block_sparse_moe=lambda hidden, unused_metadata, **unused_kwargs: hidden + 3,
         _feed_forward_all_reduce_params=lambda: None,
         _apply_next_layer_layernorm=lambda hidden, residual: (hidden + 10, residual + 20),
@@ -571,7 +647,9 @@ def test_piecewise_attention_boundary_runs_horizontal_producer(monkeypatch) -> N
             )
             return packed[:, :3].clone(), packed[:, :1].clone()
 
-        def _dispatch_attention_backend(self, q, k, v, idx_q, idx_k, attn_metadata, output) -> None:
+        def _dispatch_attention_backend(
+            self, q, k, v, idx_q, idx_k, attn_metadata, output, mxfp8_output=None
+        ) -> None:
             assert k is None and v is None and idx_k is None
             assert idx_q.shape == (attn_metadata.num_tokens, 1)
             output.copy_(q)
@@ -741,7 +819,7 @@ def test_piecewise_captures_horizontal_producer_before_attention(
         layer_idx=3,
         layer_idx_str="3",
         qkv_proj=Mock(return_value=packed),
-        _fused_fp8_qkv_indexer_norm_rope_kv_insert=Mock(return_value=(q, idx_q)),
+        _fused_fp8_qkv_indexer_norm_rope_kv_insert=Mock(side_effect=[None, (q, idx_q)]),
         _forward_attention_core=Mock(return_value=output),
         o_proj=lambda output, all_reduce_params: output,
     )
@@ -756,9 +834,12 @@ def test_piecewise_captures_horizontal_producer_before_attention(
     result = MiniMaxM3Attention._sparse_forward(layer, positions, hidden, metadata)
     assert result is output
     layer.qkv_proj.assert_called_once_with(hidden)
-    layer._fused_fp8_qkv_indexer_norm_rope_kv_insert.assert_called_once_with(
-        packed, positions, metadata, cache_tensors=(kv_cache, index_cache, scale_cache, slots)
-    )
+    cache_tensors = (kv_cache, index_cache, scale_cache, slots)
+    # The fused QKV GEMM + producer is tried first on hidden_states; it declines here, so the packed projection runs.
+    assert layer._fused_fp8_qkv_indexer_norm_rope_kv_insert.call_args_list == [
+        call(None, positions, metadata, cache_tensors=cache_tensors, hidden_states=hidden),
+        call(packed, positions, metadata, cache_tensors=cache_tensors),
+    ]
     layer._forward_attention_core.assert_called_once_with(q, None, None, idx_q, None, metadata)
 
 
@@ -785,7 +866,8 @@ def test_piecewise_captured_producer_rejects_unavailable_fusion(
             "3",
         )
     assert str(exc.value) == "MiniMax-M3 piecewise graph requires the fused sparse QKV producer."
-    layer._fused_fp8_qkv_indexer_norm_rope_kv_insert.assert_called_once()
+    # Tried on hidden_states (fused QKV GEMM + producer) and on the packed projection; both decline.
+    assert layer._fused_fp8_qkv_indexer_norm_rope_kv_insert.call_count == 2
 
 
 @pytest.mark.cpu_only
@@ -804,8 +886,11 @@ def test_piecewise_captured_producer_declares_cache_mutations(
         metadata: object,
         *,
         cache_tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Emulate native cache writes using only the explicit tensor arguments."""
+        if packed is None:
+            return None  # no fused QKV GEMM + producer here: the op falls back to the packed projection
         kv_cache, index_cache, scale_cache, slots = cache_tensors
         # Deliberately use only the explicit caches, not the runtime metadata.
         valid = slots >= 0
@@ -945,6 +1030,7 @@ def test_piecewise_unfused_indexer_keeps_cache_write_eager(monkeypatch: pytest.M
         aux_stream=None,
         _forward_attention_core=Mock(return_value=torch.empty((4, 128), dtype=torch.bfloat16)),
         o_proj=lambda output, all_reduce_params: output,
+        _core_then_o_proj=lambda core, all_reduce_params, site, padded=False: core(None),
     )
     monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
     monkeypatch.setattr(
@@ -958,7 +1044,7 @@ def test_piecewise_unfused_indexer_keeps_cache_write_eager(monkeypatch: pytest.M
     layer._fused_fp8_index_qk_norm_rope.assert_not_called()
     assert layer._fused_qk_norm_rope.call_count == 2
     assert all(call.kwargs["out_fp8"] for call in layer._fused_qk_norm_rope.call_args_list)
-    layer._forward_attention_core.assert_called_once_with(q, k, v, idx_q, idx_k, metadata)
+    layer._forward_attention_core.assert_called_once_with(q, k, v, idx_q, idx_k, metadata, None)
 
 
 @pytest.mark.cpu_only
@@ -1172,7 +1258,7 @@ def test_attention_dispatch_clips_the_piecewise_token_pad():
     are left as the buffer supplied them."""
     seen = {}
 
-    def capture(q, k, v, idx_q, idx_k, attn_metadata, output):
+    def capture(q, k, v, idx_q, idx_k, attn_metadata, output, mxfp8_output=None):
         del attn_metadata
         seen["rows"] = [None if t is None else int(t.shape[0]) for t in (q, k, v, idx_q, idx_k)]
         seen["out_rows"] = int(output.shape[0])
@@ -1205,7 +1291,7 @@ def test_attention_dispatch_leaves_an_unpadded_step_alone():
     """No pad, so nothing to clip."""
     seen = {}
 
-    def capture(q, k, v, idx_q, idx_k, attn_metadata, output):
+    def capture(q, k, v, idx_q, idx_k, attn_metadata, output, mxfp8_output=None):
         del q, k, v, idx_q, idx_k, attn_metadata
         seen["out"] = output
 
@@ -3107,3 +3193,529 @@ def test_minimax_m3_sdpa_dense_decode_matches_repeat_interleave_reference(num_kv
 
     ref = _dense_sdpa_decode_reference(q, k_ctx, v_ctx, seq_lens, num_kv_heads, head_dim)
     torch.testing.assert_close(output.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "bcg_p5a, qkv_fused, rows, expected",
+    [
+        (True, True, 1024, False),
+        (True, True, 1025, True),
+        (True, True, 1536, True),
+        (True, True, 2048, True),
+        (False, True, 2048, False),
+        (True, False, 2048, False),
+    ],
+)
+def test_bcg_bucket_takes_eager_qkv(
+    monkeypatch, bcg_p5a: bool, qkv_fused: bool, rows: int, expected: bool
+) -> None:
+    # Breakable buckets above the fused-QKV row floor run the eager path's QKV in an eager break (bitwise the eager
+    # step); TRTLLM_CTX_BCG_P5A=0 or TRTLLM_CTX_QKV_FUSED=0 keeps the captured stock projection.
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_BCG_P5A", bcg_p5a)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED", qkv_fused)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
+    assert modeling_minimaxm3._bcg_bucket_takes_eager_qkv(rows) is expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm", [90, 100, 103, 110])
+def test_bcg_bucket_keeps_captured_qkv_off_rubin(monkeypatch, sm: int) -> None:
+    # Off SM107 the fused QKV GEMM never engages, so breakable buckets keep the captured stock projection.
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_BCG_P5A", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED", True)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    assert not modeling_minimaxm3._bcg_bucket_takes_eager_qkv(2048)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("rows", [1, 1023, 1024, 1025, 2048, 16384])
+def test_fused_qkv_rows_agree_between_eager_and_breakable(monkeypatch, rows: int) -> None:
+    # A breakable bucket runs the eager QKV exactly when an eager step of the same rows takes the fused QKV GEMM +
+    # producer, so a captured step is bitwise the eager one at every row count, including the 1024-row boundary.
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_BCG_P5A", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED", True)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
+    fused = modeling_minimaxm3._ctx_qkv_fused_takes_rows(rows)
+    assert modeling_minimaxm3._bcg_bucket_takes_eager_qkv(rows) is fused
+    assert fused is (rows > 1024)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm, expected", [(107, True), (103, False), (100, False), (90, False)])
+def test_swiglu_mxfp8_engages_on_sm107_only(monkeypatch, sm: int, expected: bool) -> None:
+    # The fused SwiGLU + MXFP8 quantize is SM107-only; other architectures keep the stock activation and quantize.
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_SWIGLU_MXFP8", True)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
+    method = MXFP8LinearMethod.__new__(MXFP8LinearMethod)
+    method.use_cutlass = True
+    mlp = SimpleNamespace(
+        activation=torch.nn.functional.silu, down_proj=SimpleNamespace(quant_method=method)
+    )
+    x = torch.zeros((modeling_minimaxm3._CTX_NORM_MXFP8_MIN_ROWS, 3072), dtype=torch.bfloat16)
+    assert modeling_minimaxm3._SwigluOaiMLP._swiglu_mxfp8_eligible(mlp, x, False) is expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("capturing", [False, True])
+@pytest.mark.parametrize("tuning", [False, True])
+@pytest.mark.parametrize("rows", [8191, 8192, 16384])
+def test_swiglu_mxfp8_avoids_non_consuming_decode_graph(
+    monkeypatch: pytest.MonkeyPatch, capturing: bool, tuning: bool, rows: int
+) -> None:
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_SWIGLU_MXFP8", True)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
+    method = MXFP8LinearMethod.__new__(MXFP8LinearMethod)
+    method.use_cutlass = True
+    method.tune_decode_graph_backends = tuning
+    mlp = Mock(spec_set=["activation", "down_proj"])
+    mlp.activation = torch.nn.functional.silu
+    mlp.down_proj = Mock(spec_set=["quant_method"])
+    mlp.down_proj.quant_method = method
+    x = torch.empty((rows, 3072), dtype=torch.bfloat16, device="meta")
+    active = linear_module._FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE
+    token = active.set(capturing)
+    try:
+        expected = rows >= modeling_minimaxm3._CTX_NORM_MXFP8_MIN_ROWS and not capturing
+        assert modeling_minimaxm3._SwigluOaiMLP._swiglu_mxfp8_eligible(mlp, x, False) is expected
+    finally:
+        active.reset(token)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm, expected", [(107, True), (100, False), (103, False), (90, False)])
+def test_shared_fold_into_trtllm_gen_finalize_is_sm107_only(
+    monkeypatch, sm: int, expected: bool
+) -> None:
+    # An otherwise eligible TRTLLM-gen NVFP4 MoE: the fold engages on SM107 (positive control) and, elsewhere, the
+    # shared expert keeps its separate add after the finalize.
+    monkeypatch.setattr(modeling_minimaxm3, "_FOLD_SHARED_INTO_FINALIZE", True)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
+    hidden = 64
+    backend = TrtllmTrtllmGenNvfp4Impl.__new__(TrtllmTrtllmGenNvfp4Impl)
+    backend.supports_unfinalized_output = lambda: True
+    backend._routes_outside_the_kernel = lambda: False
+    backend.w3_w1_weight = torch.empty((4, 2 * hidden, hidden // 2), dtype=torch.uint8)
+    experts = SimpleNamespace(backend=backend, moe_max_num_tokens=16)
+    block = SimpleNamespace(
+        shared_experts=object(), experts=experts, routed_output_is_global=False, hidden_dim=hidden
+    )
+    x = torch.zeros((8, hidden), dtype=torch.bfloat16)
+    assert modeling_minimaxm3.MiniMaxM3MoE.fold_shared_ok(block, x, None) is expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm, hidden", [(103, 3072), (100, 3072), (107, 384), (107, 16384)])
+def test_ctx_boundary_norm_declines_off_rubin_and_off_geometry(
+    monkeypatch, sm: int, hidden: int
+) -> None:
+    # The fused boundary norm + MXFP8 kernel is SM107-only and needs whole 256-element groups in at most 1024
+    # threads; anything else keeps the stock AllReduce + RMSNorm (None) before touching the layer.
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_NORM_MXFP8", True)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
+    layer = SimpleNamespace(allreduce=Mock(side_effect=AssertionError("fused boundary norm ran")))
+    hidden_states = torch.zeros(
+        (modeling_minimaxm3._CTX_NORM_MXFP8_MIN_ROWS, hidden), dtype=torch.bfloat16
+    )
+    norm = SimpleNamespace(weight=torch.ones(hidden, dtype=torch.bfloat16), variance_epsilon=1e-6)
+    assert (
+        modeling_minimaxm3.MiniMaxM3DecoderLayer._reduce_norm_mxfp8(
+            layer, hidden_states, hidden_states, norm
+        )
+        is None
+    )
+
+
+@pytest.mark.skipif(not _has_cuda(), reason="the embedding gather is a Triton kernel")
+def test_embedding_gather_matches_f_embedding_for_any_id_layout() -> None:
+    # The fused gather equals F.embedding with out-of-vocabulary rows zeroed, for contiguous, 2-D and strided ids.
+    torch.manual_seed(0)
+    vocab, hidden = 64, 1536
+    weight = torch.randn(vocab, hidden, dtype=torch.bfloat16, device="cuda")
+    base = torch.tensor([1, 5, -1, 7, vocab, 3, 63, 0], dtype=torch.int32, device="cuda")
+
+    def reference(ids: torch.Tensor) -> torch.Tensor:
+        valid = (ids >= 0) & (ids < vocab)
+        out = torch.nn.functional.embedding(torch.where(valid, ids, 0).long(), weight)
+        return out.masked_fill(~valid.unsqueeze(-1), 0)
+
+    for ids in (base, base.view(2, 4), base[::2], base.view(2, 4)[:, 1::2]):
+        out = modeling_minimaxm3.minimax_m3_embedding_gather(ids, weight)
+        assert out.shape == (*ids.shape, hidden)
+        assert torch.equal(out, reference(ids))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "use_dp, comm, folds",
+    [(False, None, True), (True, None, False), (False, object(), False)],
+    ids=["local_tokens", "attention_dp", "moe_communication"],
+)
+def test_cutedsl_shared_fold_only_without_token_dispatch(monkeypatch, use_dp, comm, folds) -> None:
+    # With attention DP or MoE communication the finalize rows can be other ranks' tokens, so the shared output of
+    # this rank's tokens must not be folded into them.
+    monkeypatch.setattr(modeling_minimaxm3, "_FOLD_SHARED_INTO_FINALIZE", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_fold_shared_backend", lambda experts: True)
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
+    moe = SimpleNamespace(
+        experts=SimpleNamespace(comm=comm),
+        aux_stream=object(),
+        routed_output_is_global=False,
+        use_dp=use_dp,
+    )
+    assert modeling_minimaxm3.MiniMaxM3MoE.cutedsl_fold_ok(moe) is folds
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tuning", [False, True])
+def test_ctx_qkv_fused_skips_autotune_pass(monkeypatch, tuning: bool) -> None:
+    # The fused QKV producer stays out of the AutoTuner warmup pass, so the stock MXFP8 QKV GEMM profiles its shape
+    # for the steps the producer does not take.
+    tuner = Mock(spec_set=["is_tuning_mode"])
+    tuner.is_tuning_mode = tuning
+    monkeypatch.setattr(AutoTuner, "get", lambda: tuner)
+    monkeypatch.setattr(m3_context, "_CTX_QKV_FUSED_YIELD_LOGGED", False)
+    assert modeling_minimaxm3._autotuner_tuning() is tuning
+    # The yield is logged once per process, and only when it happens.
+    assert m3_context._CTX_QKV_FUSED_YIELD_LOGGED is tuning
+
+
+@pytest.mark.cpu_only
+def test_ctx_qkv_fused_keeps_native_mxfp8_without_rubin_dsl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native MXFP8 support does not imply that the optional Rubin DSL is installed."""
+    monkeypatch.setattr(m3_context, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", False)
+    monkeypatch.setattr(m3_context, "_CTX_QKV_FUSED_RUNNERS", {})
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED", True)
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(modeling_minimaxm3, "_autotuner_tuning", lambda: False)
+    monkeypatch.setitem(sys.modules, "tensorrt_llm._torch.kernels.rubin.m3_qkv_fusion.kernel", None)
+
+    attention = MiniMaxM3Attention.__new__(MiniMaxM3Attention)
+    nn.Module.__init__(attention)
+    attention.num_heads = 8
+    attention.num_key_value_heads = 1
+    attention.sparse_num_index_heads = 1
+    attention.head_dim = 128
+    attention.qkv_proj = nn.Linear(64, 1536, bias=False, dtype=torch.bfloat16)
+    method = MXFP8LinearMethod.__new__(MXFP8LinearMethod)
+    method.use_cutlass = True
+    attention.qkv_proj.quant_method = method
+    hidden = torch.zeros(1025, 64, dtype=torch.bfloat16)
+    unused_cache = torch.empty(0)
+    assert (
+        attention._ctx_fused_qkv_gemm_producer(
+            hidden, unused_cache, unused_cache, unused_cache, unused_cache, (), (), 1e-6
+        )
+        is None
+    )
+    assert not m3_context._CTX_QKV_FUSED_RUNNERS
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("fails", [False, True])
+def test_ctx_qkv_fused_shares_initialization_cache(
+    monkeypatch: pytest.MonkeyPatch, fails: bool
+) -> None:
+    """Built-in and target callers share successful runners and one failed attempt per geometry."""
+
+    def construct_runner(*, num_heads_q: int, num_heads_kv: int, num_heads_index: int) -> object:
+        return object()
+
+    module = ModuleType("tensorrt_llm._torch.kernels.rubin.m3_qkv_fusion.kernel")
+    constructor = create_autospec(
+        construct_runner,
+        spec_set=True,
+        side_effect=RuntimeError("compile failed") if fails else construct_runner,
+    )
+    module.M3QkvFusedRunner = constructor
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(m3_context, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
+    monkeypatch.setattr(m3_context, "_CTX_QKV_FUSED_RUNNERS", {})
+    warning = create_autospec(m3_context.logger.warning, spec_set=True)
+    monkeypatch.setattr(m3_context.logger, "warning", warning)
+    assert modeling_minimaxm3._ctx_qkv_fused_runner is m3_context.qkv_fused_runner
+    assert modeling_minimaxm3._ctx_qkv_fused_takes_rows is m3_context.qkv_fused_takes_rows
+    assert modeling_minimaxm3._ctx_norm_op_has_fp4 is m3_context.norm_op_has_fp4
+    assert modeling_minimaxm3.split_router_weight_bf16 is m3_context.split_router_weight_bf16
+    first = m3_context.qkv_fused_runner(8, 1, 1)
+    for caller in (modeling_minimaxm3._ctx_qkv_fused_runner, m3_context.qkv_fused_runner):
+        assert caller(8, 1, 1) is first
+    constructor.assert_called_once_with(num_heads_q=8, num_heads_kv=1, num_heads_index=1)
+    second = modeling_minimaxm3._ctx_qkv_fused_runner(16, 1, 1)
+    assert constructor.call_count == 2
+    assert warning.call_count == (2 if fails else 0)
+    assert m3_context._CTX_QKV_FUSED_RUNNERS == {(8, 1, 1): first, (16, 1, 1): second}
+    if fails:
+        assert first is second is None
+    else:
+        assert first is not None and second is not None and first is not second
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("has_prescale", [False, True])
+def test_ctx_fp4_input_scale_rejects_cutedsl_awq_prescale(has_prescale: bool) -> None:
+    backend = TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl)
+    nn.Module.__init__(backend)
+    backend.scaling_vector_size = 16
+    backend.fc31_input_scale = torch.ones(1, dtype=torch.float32)
+    backend.fc31_act_scale = torch.ones(64) if has_prescale else None
+    experts = nn.Module()
+    experts.backend = backend
+    experts.moe_max_num_tokens = 32
+    block = modeling_minimaxm3.MiniMaxM3MoE.__new__(modeling_minimaxm3.MiniMaxM3MoE)
+    nn.Module.__init__(block)
+    block.experts = experts
+    block.routed_output_is_global = False
+    block.hidden_dim = 64
+
+    scale = block.fp4_input_scale(16)
+    if has_prescale:
+        assert scale is None
+    else:
+        assert scale is backend.fc31_input_scale
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("direct_reload", [False, True], ids=["explicit_refresh", "direct_reload"])
+def test_minimax_m3_gate_fixed_router_refit_preserves_allocation(
+    monkeypatch: pytest.MonkeyPatch, direct_reload: bool
+) -> None:
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_ROUTER_TF32_FIXED", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_ROUTER_TC_GEN", False)
+    # CPU checks the registered split-weight allocation; captured replay is tested on Rubin.
+    gate = modeling_minimaxm3.MiniMaxM3Gate(64, 16, 2, 1.0)
+    gate.load_weights([{"weight": torch.ones(16, 64)}])
+    assert not gate._use_fixed_router
+    gate.cache_fixed_router_weight()
+    assert gate._use_fixed_router
+    captured_weight = gate.split_weight
+    ptr = captured_weight.data_ptr()
+    if direct_reload:
+        gate.load_weights([{"weight": torch.full((16, 64), 2.0)}])
+    else:
+        gate.weight.fill_(2.0)
+        gate.cache_fixed_router_weight()
+    assert gate.split_weight is captured_weight
+    assert gate.split_weight.data_ptr() == ptr
+    expected = torch.cat((torch.full((16, 64), 2.0), torch.zeros(16, 128)), dim=1).bfloat16()
+    torch.testing.assert_close(captured_weight, expected, rtol=0, atol=0)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm", [100, 103, 107, 110])
+@pytest.mark.parametrize("opted_in", [False, True])
+def test_cutedsl_shared_fold_backend_is_rubin_only(
+    monkeypatch: pytest.MonkeyPatch, sm: int, opted_in: bool
+) -> None:
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    backend = TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl)
+    nn.Module.__init__(backend)
+    backend.deterministic_finalize = opted_in
+    assert modeling_minimaxm3._fold_shared_backend(backend) is (sm == 107 and opted_in)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("hidden_size,num_experts", [(64, 8), (65, 16), (64, 24), (64, 512)])
+def test_minimax_m3_gate_unsupported_fixed_geometry_uses_stock(
+    monkeypatch: pytest.MonkeyPatch, hidden_size: int, num_experts: int
+) -> None:
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_ROUTER_TF32_FIXED", True)
+    monkeypatch.setattr(modeling_minimaxm3, "_ROUTER_TC_GEN", False)
+    gate = modeling_minimaxm3.MiniMaxM3Gate(hidden_size, num_experts, 2, 1.0)
+    gate.load_weights([{"weight": torch.ones(num_experts, hidden_size)}])
+    gate.cache_fixed_router_weight()
+    assert not gate._use_fixed_router
+
+    def stock_mm(a, b, bias, out_dtype):
+        assert bias is None and out_dtype == torch.float32
+        return a.float() @ b.float()
+
+    stock = create_autospec(stock_mm, spec_set=True, side_effect=stock_mm)
+    monkeypatch.setattr(torch.ops.trtllm, "cublas_mm", stock)
+    hidden = torch.ones((2, hidden_size), dtype=torch.bfloat16)
+    actual = gate(hidden)
+    stock.assert_called_once()
+    assert actual.shape == (2, num_experts)
+    torch.testing.assert_close(actual, torch.full_like(actual, hidden_size), rtol=0, atol=0)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("error_type", [ValueError, AssertionError])
+def test_ctx_qkv_invalid_arguments_keep_stock_fallback(monkeypatch, error_type) -> None:
+    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED", True)
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(modeling_minimaxm3, "_autotuner_tuning", lambda: False)
+    runner = Mock(spec_set=["make_args", "run_args"])
+    runner.make_args.side_effect = error_type("unsupported cache layout")
+    monkeypatch.setattr(modeling_minimaxm3, "_ctx_qkv_fused_runner", lambda *heads: runner)
+    attention = MiniMaxM3Attention.__new__(MiniMaxM3Attention)
+    nn.Module.__init__(attention)
+    attention.num_heads = 8
+    attention.num_key_value_heads = attention.sparse_num_index_heads = 1
+    attention.head_dim = 128
+    attention.qkv_proj = nn.Linear(64, 1536, bias=False, dtype=torch.bfloat16)
+    method = MXFP8LinearMethod.__new__(MXFP8LinearMethod)
+    method.use_cutlass = True
+    attention.qkv_proj.quant_method = method
+    attention.qkv_proj.weight_scale = torch.empty(1, dtype=torch.uint8)
+    attention.qkv_proj._mxfp8_alpha = torch.ones(1)
+    hidden = torch.zeros((1025, 64), dtype=torch.bfloat16)
+    quantize = Mock(
+        return_value=(
+            torch.empty_like(hidden, dtype=torch.float8_e4m3fn),
+            torch.empty(1, dtype=torch.uint8),
+        )
+    )
+    monkeypatch.setattr(torch.ops.trtllm, "mxfp8_quantize", quantize)
+    unused_cache = torch.empty(0, dtype=torch.uint8)
+    common_args = (
+        torch.zeros(1025, dtype=torch.int32),
+        torch.empty((1, 2, 32)),
+        torch.zeros(1025, dtype=torch.int32),
+    )
+    assert (
+        attention._ctx_fused_qkv_gemm_producer(
+            hidden,
+            unused_cache,
+            unused_cache,
+            unused_cache,
+            torch.ones(3),
+            common_args,
+            [torch.ones(128, dtype=torch.bfloat16)] * 4,
+            1e-6,
+        )
+        is None
+    )
+    runner.make_args.assert_called_once()
+    runner.run_args.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+def test_minimax_m3_opts_in_only_its_routed_moe_config(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    config = ModelConfig(pretrained_config=_make_text_config())
+    config.pretrained_config.n_shared_experts = 0
+    sentinel = object()
+    config.extra_attrs["scope_sentinel"] = sentinel
+    original_attrs = dict(config.extra_attrs)
+    gate = create_autospec(modeling_minimaxm3.MiniMaxM3Gate, instance=True, spec_set=True)
+    gate_constructor = create_autospec(
+        modeling_minimaxm3.MiniMaxM3Gate, spec_set=True, return_value=gate
+    )
+    experts = nn.Module()
+    factory = create_autospec(modeling_minimaxm3.create_moe, spec_set=True, return_value=experts)
+    monkeypatch.setattr(modeling_minimaxm3, "MiniMaxM3Gate", gate_constructor)
+    monkeypatch.setattr(modeling_minimaxm3, "create_moe", factory)
+    monkeypatch.setattr(modeling_minimaxm3, "_CUTEDSL_DETERMINISTIC_FC2", enabled)
+    monkeypatch.setattr(torch.cuda, "Event", create_autospec(torch.cuda.Event, spec_set=True))
+    moe = MiniMaxM3MoE(config, {AuxStreamType.MoeShared: None}, layer_idx=0)
+    assert moe.experts is experts
+    routed_config = factory.call_args.kwargs["model_config"]
+    assert routed_config is not config
+    assert routed_config.extra_attrs is not config.extra_attrs
+    assert routed_config.extra_attrs[DETERMINISTIC_MOE_FINALIZE] is enabled
+    assert routed_config.extra_attrs["scope_sentinel"] is sentinel
+    assert config.extra_attrs == original_attrs
+    assert routed_config.pretrained_config is config.pretrained_config
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("produces_mxfp8", [False, True])
+def test_ctx_combine_passes_its_explicit_result_to_o_proj(monkeypatch, produces_mxfp8) -> None:
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
+    method = MXFP8LinearMethod.__new__(MXFP8LinearMethod)
+    method.use_cutlass = True
+    output = torch.zeros((2, 128), dtype=torch.bfloat16)
+    projected = torch.ones_like(output)
+    layer = Mock(spec_set=["o_proj"])
+    layer.o_proj.quant_method = method
+    layer.o_proj.return_value = projected
+    carrier = MxFp8QuantizedTensor(
+        torch.empty((2, 128), dtype=torch.float8_e4m3fn),
+        torch.empty(512, dtype=torch.uint8),
+        is_sf_swizzled=True,
+    )
+    seen = []
+
+    def core(request):
+        assert isinstance(request, MiniMaxM3BackendForwardArgs)
+        assert request.mxfp8_output and request.mxfp8_skip_bf16
+        assert request.mxfp8_result is None
+        if produces_mxfp8:
+            request.mxfp8_result = carrier
+        seen.append(request)
+        return output
+
+    for _ in range(2):
+        result = MiniMaxM3Attention._core_then_o_proj(layer, core, None, "test")
+        assert result is projected
+        assert layer.o_proj.call_args.args[0] is (carrier if produces_mxfp8 else output)
+    assert seen[0] is not seen[1]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("eager,padded", [(False, False), (True, True)])
+def test_ctx_combine_keeps_compile_and_padded_handoff_tensor_only(
+    monkeypatch, eager, padded
+) -> None:
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: eager)
+    output = torch.zeros((2, 128), dtype=torch.bfloat16)
+    layer = Mock(spec_set=["o_proj"])
+    core = Mock(spec_set=lambda request: None, return_value=output)
+    MiniMaxM3Attention._core_then_o_proj(layer, core, None, "test", padded=padded)
+    core.assert_called_once_with(None)
+    assert layer.o_proj.call_args.args[0] is output
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("padded", [False, True])
+def test_ctx_combine_declines_live_row_mismatch(padded) -> None:
+    metadata = Mock(spec_set=["num_tokens"])
+    metadata.num_tokens = 2
+    output = torch.zeros((4 if padded else 2, 128), dtype=torch.bfloat16)
+    request = MiniMaxM3BackendForwardArgs(mxfp8_output=True, mxfp8_skip_bf16=True)
+    layer = Mock(spec_set=["_dispatch_attention_backend"])
+    _dispatch_attention_over_live_tokens(
+        layer, output, None, None, None, None, metadata, output, request
+    )
+    received = layer._dispatch_attention_backend.call_args.kwargs["mxfp8_output"]
+    assert received is (None if padded else request)
+    assert layer._dispatch_attention_backend.call_args.args[-1].shape[0] == 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("has_lora", [False, True])
+def test_ctx_mlp_unwraps_carrier_before_lora_adapter(monkeypatch, has_lora) -> None:
+    hidden = torch.zeros((2, 128), dtype=torch.bfloat16)
+    carrier = MxFp8QuantizedTensor(
+        hidden.to(torch.float8_e4m3fn),
+        torch.empty(512, dtype=torch.uint8),
+        is_sf_swizzled=True,
+        unquantized_hidden_states=hidden,
+    )
+    mlp = modeling_minimaxm3._SwigluOaiMLP.__new__(modeling_minimaxm3._SwigluOaiMLP)
+    nn.Module.__init__(mlp)
+    parent = create_autospec(GatedMLP.forward, spec_set=True, return_value=hidden)
+    monkeypatch.setattr(GatedMLP, "forward", parent)
+    params = {"adapter": object()} if has_lora else None
+    assert mlp(carrier, lora_params=params) is hidden
+    assert parent.call_args.args[0] is mlp
+    assert parent.call_args.args[1] is (hidden if has_lora else carrier)
+    assert parent.call_args.kwargs["lora_params"] is params
+    if has_lora:
+        carrier.unquantized_hidden_states = None
+        with pytest.raises(ValueError, match="no unquantized hidden-state view"):
+            mlp(carrier, lora_params=params)
+        assert parent.call_count == 1

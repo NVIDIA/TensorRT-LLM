@@ -16,8 +16,17 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import (  # noqa: E501
     modeling,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.context import (
+    split_router_weight_bf16,
+)
 
 LAYERS = 4
+
+
+class _Rows(tuple):
+    """A tagged stand-in activation that has the row count the layer reads."""
+
+    shape = (2,)
 
 
 class _Spec:
@@ -47,7 +56,7 @@ def layer(request, monkeypatch):
     monkeypatch.setattr(
         modeling,
         "_native_allreduce_norm",
-        lambda core, x, r, norm: (("normed", x, norm), ("updated", x, r)),
+        lambda core, x, r, norm: (_Rows(("normed", x, norm)), ("updated", x, r)),
     )
 
     def boundary(self, x, x2, residual, norm_w):
@@ -57,9 +66,10 @@ def layer(request, monkeypatch):
     if request.param == "prefill":
         cls = modeling.PrefillTarget
         monkeypatch.setattr(cls, "_moe", lambda self, i, h, **k: (("moe", i), ("routed", i)))
-        monkeypatch.setattr(
-            cls, "_swiglu_mlp", lambda self, h, prefix, low_m, dense=False: ("mlp", prefix)
-        )
+        monkeypatch.setattr(cls, "_swiglu_mlp", lambda self, h, prefix, low_m, **k: ("mlp", prefix))
+        # The stand-in activations are not prefill-sized tensors: no boundary here takes the built-in CTX stack.
+        monkeypatch.setattr(modeling, "_ctx_norm_rows", lambda x: False)
+        monkeypatch.setattr(modeling, "_ctx_stack_step", lambda step, rows: False)
     else:
         cls = modeling.DecodeTarget
         monkeypatch.setattr(
@@ -134,6 +144,8 @@ def test_a_prefill_moe_layer_takes_the_mc_finalize_boundary_when_it_folds(monkey
         _decode=SimpleNamespace(_generic_mc_finalize=mc_finalize),
     )
     monkeypatch.setattr(modeling, "_can_mc", lambda x, folded=False: False)
+    # Stand-in activations: not a CTX-stack step.
+    monkeypatch.setattr(modeling, "_ctx_norm_rows", lambda x: False)
     monkeypatch.setattr(
         modeling, "_native_allreduce_norm", lambda core, x, r, norm: (("normed", x), ("upd", x, r))
     )
@@ -161,3 +173,28 @@ def test_a_prefill_moe_layer_takes_the_mc_finalize_boundary_when_it_folds(monkey
     assert out == (("normed", 2), ("updated", 2))
     assert seen and seen[0][0] == 2 and seen[0][3] == "in_norm3"
     assert captured == [(2, ("updated", 2), None)]
+
+
+@pytest.mark.cpu_only
+def test_ctx_router_cache_refreshes_in_place_after_refit(monkeypatch: pytest.MonkeyPatch) -> None:
+    core = modeling.MiniMaxM3Tp2ModelingV2.__new__(modeling.MiniMaxM3Tp2ModelingV2)
+    torch.nn.Module.__init__(core)
+    core.w = {"l0_router": torch.full((8, 64), 1.0 + 2**-9 + 2**-18)}
+    core.router_w_split = {0: split_router_weight_bf16(core.w["l0_router"])}
+    captured = core.router_w_split[0]
+    pointer = captured.data_ptr()
+    # Existing storages take post_load_weights' idempotent return; no kernels need rebuilding.
+    monkeypatch.setattr(core, "post_load_weights", lambda: None)
+    before = captured.clone()
+    core.w["l0_router"].fill_(2.0 + 2**-8 + 2**-17)
+    core.cache_derived_state()
+    assert core.router_w_split[0] is captured
+    assert captured.data_ptr() == pointer
+    expected = split_router_weight_bf16(core.w["l0_router"])
+    for term in (1, 2):
+        old_term = before[:, term * 64 : (term + 1) * 64]
+        new_term = captured[:, term * 64 : (term + 1) * 64]
+        assert torch.count_nonzero(old_term) == old_term.numel()
+        assert torch.count_nonzero(new_term) == new_term.numel()
+        assert not torch.equal(old_term, new_term)
+    torch.testing.assert_close(captured, expected, rtol=0, atol=0)

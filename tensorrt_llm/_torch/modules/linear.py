@@ -47,11 +47,13 @@ from ..locality_domain.policy import (DISABLED_PLAN, LinearPartitionPlan,
                                       LocalityDomainPolicy)
 from ..locality_domain.runtime import LocalityDomainRuntime
 from ..locality_domain_utils import _copy_to_new_cuda_allocation
-from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_torch_compiling, replace_parameter_and_save_metadata,
-                     unswizzle_sf)
+from ..utils import (Fp4QuantizedTensor, MxFp8QuantizedTensor,
+                     get_model_extra_attrs, is_torch_compiling,
+                     replace_parameter_and_save_metadata, unswizzle_sf)
 from .low_m_gemm import (_should_apply_low_m_gemm, apply_low_m_gemm,
                          low_m_gemm_dispatcher)
+from .m3_ctx_clc_gemm import (clear_ctx_clc_weight_cache, ctx_clc_gemm_enabled,
+                              try_ctx_clc_mxfp8_gemm)
 
 
 class WeightMode(str, enum.Enum):
@@ -3600,6 +3602,11 @@ def flashinfer_mxfp8_decode_graph_capture() -> Iterator[None]:
         _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.reset(token)
 
 
+def ctx_eager_only() -> bool:
+    """Whether CTX dispatch may use eager-only capability and data-pointer checks."""
+    return not (is_torch_compiling() or torch.compiler.is_compiling())
+
+
 class MXFP8LinearMethod(LinearMethodBase):
     """MXFP8 weights (e4m3 + UE8M0 1x32) x dynamic MXFP8 activations (W8A8).
 
@@ -3772,9 +3779,17 @@ class MXFP8LinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    def apply(self, module: Linear, input: torch.Tensor | MxFp8QuantizedTensor,
+              bias: Optional[torch.Tensor]) -> torch.Tensor:
         """Apply MXFP8 linear projection with eager or capture-safe dispatch."""
+        quantized_input = input if isinstance(input,
+                                              MxFp8QuantizedTensor) else None
+        if quantized_input is not None:
+            if not quantized_input.is_sf_swizzled:
+                raise ValueError(
+                    "MXFP8 Linear requires swizzled activation scales")
+            input = (quantized_input.fp8_tensor
+                     if self.use_cutlass else quantized_input.unquantized())
         original_shape = input.shape
         if input.dim() > 2:
             input = input.reshape(-1, input.shape[-1])
@@ -3784,6 +3799,10 @@ class MXFP8LinearMethod(LinearMethodBase):
             if (self.tune_decode_graph_backends and not is_torch_compiling()
                     and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()):
                 # Tune only in the warmup-only pass (flashinfer_mxfp8_autotune).
+                if quantized_input is not None:
+                    input = quantized_input.unquantized()
+                    if input.dim() > 2:
+                        input = input.reshape(-1, input.shape[-1])
                 output = mxfp8_quantize_gemm_autotuned(
                     input,
                     module.weight,
@@ -3794,7 +3813,11 @@ class MXFP8LinearMethod(LinearMethodBase):
             else:
                 # Dynamic MXFP8 activation quantization (swizzled SF layout),
                 # then the CUTLASS block-scaled e4m3xe4m3 GEMM.
-                act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(input, True)
+                act_e4m3, act_sf = (
+                    quantized_input.quantized() if quantized_input is not None
+                    else torch.ops.trtllm.mxfp8_quantize(input, True))
+                if act_e4m3.dim() > 2:
+                    act_e4m3 = act_e4m3.reshape(-1, act_e4m3.shape[-1])
                 use_flashinfer = self.backend == "flashinfer" or (
                     self.backend == "auto" and not is_torch_compiling() and
                     (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
@@ -3811,17 +3834,27 @@ class MXFP8LinearMethod(LinearMethodBase):
                         module.dtype,
                     )
                 else:
-                    gemm = (torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
-                            if self.needs_native_autotune else
-                            torch.ops.trtllm.mxfp8_mxfp8_gemm)
-                    output = gemm(
-                        act_e4m3,
-                        act_sf,
-                        module.weight,
-                        module.weight_scale,
-                        module._mxfp8_alpha,
-                        module.dtype,
-                    )
+                    output = None
+                    if (module._use_ctx_clc_gemm and ctx_eager_only()
+                            and ctx_clc_gemm_enabled()):
+                        # SM107 CTX prefill shapes at >= 1024 rows (eager): see m3_ctx_clc_gemm.
+                        output = try_ctx_clc_mxfp8_gemm(act_e4m3, act_sf,
+                                                        module.weight,
+                                                        module.weight_scale,
+                                                        module._mxfp8_alpha,
+                                                        module.dtype)
+                    if output is None:
+                        gemm = (torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
+                                if self.needs_native_autotune else
+                                torch.ops.trtllm.mxfp8_mxfp8_gemm)
+                        output = gemm(
+                            act_e4m3,
+                            act_sf,
+                            module.weight,
+                            module.weight_scale,
+                            module._mxfp8_alpha,
+                            module.dtype,
+                        )
             if bias is not None:
                 output = output + bias
         else:
@@ -4162,6 +4195,9 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
 
 
 class Linear(nn.Module):
+
+    # Model policy survives deferred creation or replacement of quant_method.
+    _use_ctx_clc_gemm: bool = False
 
     def __init__(
         self,
@@ -4725,12 +4761,16 @@ class Linear(nn.Module):
 
     def forward(
         self,
-        input: Union[torch.Tensor, Fp4QuantizedTensor],
+        input: Union[torch.Tensor, Fp4QuantizedTensor, MxFp8QuantizedTensor],
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
+        if isinstance(input, MxFp8QuantizedTensor) and (
+                not isinstance(self.quant_method, MXFP8LinearMethod) or
+            (self.lora is not None and bool(lora_params))):
+            input = input.unquantized()
         if self.tp_mode == TensorParallelMode.ROW:
             use_locality_domain = self.partition_plan.enabled
             # The fused GEMM-allreduce and NCCL-window GEMM paths consume the
@@ -4847,6 +4887,7 @@ class Linear(nn.Module):
         self.transform_weights()
 
     def pre_reload_weights(self):
+        clear_ctx_clc_weight_cache()
         self._output_slice_cache = None
         assert hasattr(
             self.quant_method, "pre_reload_weights"
