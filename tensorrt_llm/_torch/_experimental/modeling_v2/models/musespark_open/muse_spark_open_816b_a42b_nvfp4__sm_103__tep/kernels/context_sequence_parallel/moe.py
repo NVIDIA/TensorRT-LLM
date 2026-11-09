@@ -252,7 +252,7 @@ class ContextSequenceParallelMoE:
     #: ``(norm output, its FP32 widening)`` left by the layer's attention-side join for
     #: the next sequence-parallel call (``router_input``); consumed or dropped by it.
     sp_router_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-    #: ``(norm output, router logits, NVFP4 expert input)`` of the shard, prepared by the
+    #: ``(norm output, None, NVFP4 expert input)`` of the shard, prepared by the
     #: attention-side tail pipeline (``router_input.tail_pipeline``); consumed or dropped.
     sp_pre = None
     #: Whether a sequence-parallel call routes the shard's rows and gathers their ids and
@@ -288,8 +288,9 @@ class ContextSequenceParallelMoE:
         routing_method = experts.routing_method
         pre, self.sp_pre = self.sp_pre, None
         if pre is not None and pre[0] is hidden_states:
-            self.sp_router_input = None
-            router_logits, prepared = pre[1], pre[2]
+            with self.nvtx("router"):
+                router_logits = self._sp_router_logits(hidden_states)
+            prepared = pre[2]
         else:
             with self.nvtx("router"):
                 router_logits = self._sp_router_logits(hidden_states)

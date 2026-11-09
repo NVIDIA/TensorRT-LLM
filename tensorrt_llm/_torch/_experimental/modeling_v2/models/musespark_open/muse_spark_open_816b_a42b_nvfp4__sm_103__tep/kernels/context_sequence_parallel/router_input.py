@@ -175,21 +175,19 @@ def tail_pipeline(layer, residual: torch.Tensor, split) -> Tuple[torch.Tensor, t
     ``split`` is the overlapped output projection's ``SplitProjection``: chunk ``c``
     holds rows ``[lo, hi)`` of this rank's shard, reduced on the projection stream. For
     each chunk in turn, after its reduce-scatter's event, the main stream runs the join
-    (``join_with_router_input`` into row slices of whole-shard buffers), the router GEMM
-    on the join's FP32 rows and the pooler GEMM + pre-expert NVFP4 quantization on its
-    BF16 rows, while the later chunks are still being reduced. The router logits and the
-    NVFP4 payload and scales are concatenated and handed to the layer's MoE
-    (``moe.sp_pre``), whose sequence-parallel arm then routes and gathers them as before.
+    (``join_with_router_input`` into row slices of whole-shard buffers) and the pooler
+    GEMM + pre-expert NVFP4 quantization on its BF16 rows, while the later chunks are
+    still being reduced. The NVFP4 payload and scales are concatenated and handed to the
+    layer's MoE (``moe.sp_pre``) with the join's FP32 rows (``moe.sp_router_input``);
+    its sequence-parallel arm runs the router GEMM on the whole shard, routes and gathers
+    as before.
 
-    Numerics: the join, the quantization and the routing are per row. The router and
-    pooler GEMMs run on row chunks of the shard; their rows equal the whole-shard GEMM's
-    only where the GEMM library computes each row alike at both row counts (checked per
-    shape), otherwise this is an accumulation-order
-    change.
+    Numerics: bitwise. The join and the quantization are per row; the pooler GEMM (BF16,
+    8192 -> 4096) is row-split invariant on sm103 (raw bits equal for 1024/1024, 512/1536,
+    1023/1025 splits of a 2048-row shard);
+    the router GEMM (FP32/TF32) is not, so it is not split.
     """
     from tensorrt_llm._torch.utils import Fp4QuantizedTensor
-
-    from .moe import _fp32_router_input_takes
 
     moe = layer.feed_forward
     join = layer.add_attn
@@ -200,7 +198,7 @@ def tail_pipeline(layer, residual: torch.Tensor, split) -> Tuple[torch.Tensor, t
     updated = torch.empty_like(residual)
     next_input = torch.empty((residual.shape[0], hidden), dtype=split.results[0].dtype, device=residual.device)
     router_input = torch.empty_like(residual)
-    logits, payload, scales = [], [], []
+    payload, scales = [], []
     for (lo, hi), reduced, event in split.chunks():
         main.wait_event(event)
         rows = slice(lo, hi)
@@ -214,10 +212,6 @@ def tail_pipeline(layer, residual: torch.Tensor, split) -> Tuple[torch.Tensor, t
                 "chunk would not run its fused kernel"
             )
         chunk_in = next_input[rows]
-        if _fp32_router_input_takes(moe, chunk_in):
-            logits.append(moe.router(router_input[rows]) * moe.metap_multiplier)
-        else:
-            logits.append(moe.router_logits(chunk_in))
         prepared = moe.prepare_expert_input(moe.pooler(chunk_in))
         if not isinstance(prepared, Fp4QuantizedTensor) or prepared.is_sf_swizzled:
             raise RuntimeError(
@@ -227,9 +221,13 @@ def tail_pipeline(layer, residual: torch.Tensor, split) -> Tuple[torch.Tensor, t
         payload.append(prepared.fp4_tensor)
         scales.append(prepared.scaling_factor)
     split.release(main)
+    # The router GEMM is not row-split invariant (FP32/TF32 accumulation differs between
+    # row counts on sm103), so it runs once on the whole shard, in the MoE as before, from
+    # the join's FP32 rows.
+    moe.sp_router_input = (next_input, router_input)
     moe.sp_pre = (
         next_input,
-        torch.cat(logits, 0) if len(logits) > 1 else logits[0],
+        None,
         Fp4QuantizedTensor(
             torch.cat(payload, 0) if len(payload) > 1 else payload[0],
             torch.cat(scales, 0) if len(scales) > 1 else scales[0],
@@ -237,8 +235,8 @@ def tail_pipeline(layer, residual: torch.Tensor, split) -> Tuple[torch.Tensor, t
         ),
     )
     logger.info_once(
-        f"[musespark_open] MUSESPARK_OPEN_SP_TAIL_PIPELINE: attention-side join and MoE input "
-        f"prepared in {len(logits)} chunks behind the output projection's reduce-scatters",
+        f"[musespark_open] MUSESPARK_OPEN_SP_TAIL_PIPELINE: attention-side join and pooled NVFP4 "
+        f"expert input prepared in {len(payload)} chunks behind the output projection's reduce-scatters",
         key="musespark_open.sp_tail_pipeline",
     )
     return updated, next_input
