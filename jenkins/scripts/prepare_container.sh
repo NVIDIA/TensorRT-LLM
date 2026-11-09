@@ -6,10 +6,7 @@
 # polls until it completes. Called from a thin generated wrapper that sets the
 # following required environment variables:
 #
-#   FAT_SQSH_DIR            - scratch path where fat .sqsh files are stored
-#   FAT_LLM_TAR_ARTIFACT_PATH - artifact path of the TRT-LLM tarball (for cache-key hashing)
-#   FAT_LLM_DOCKER_IMAGE    - full docker image tag (for cache-key hashing)
-#   FAT_BUILD_SCRIPT_PATH   - path to fat_build_inline.sh on the login node (for cache-key hashing)
+#   FAT_SQSH_PATH           - fat .sqsh path, named by computeFatSqshPath() in L0_Test.groovy
 #   FAT_BUILD_SBATCH_PATH   - path to the fat_build_sbatch.sh wrapper on the login node
 #   FAT_BUILD_LOG_TEMPLATE  - SLURM log path template (may contain %j for job ID)
 #   FAT_ARTIFACTORY_NETRC   - netrc that the builder this stage submits reads the tarball with
@@ -26,24 +23,12 @@ removeUnusedNetrc() {
 }
 trap removeUnusedNetrc EXIT
 
-if ! mkdir -p "${FAT_SQSH_DIR}" 2>&1; then
-    echo "Warning: mkdir -p ${FAT_SQSH_DIR} failed; fat sqsh will not be built on this run."
+fatSqshPath="${FAT_SQSH_PATH}"
+if ! mkdir -p "$(dirname "$fatSqshPath")" 2>&1; then
+    echo "Warning: mkdir -p $(dirname "$fatSqshPath") failed; fat sqsh will not be built on this run."
     echo "=== [Prepare Container] STAGE END (mkdir failed): $(date '+%Y-%m-%d %H:%M:%S') ==="
     exit 0
 fi
-
-# Cache key formula is mirrored in fat_build_sbatch_body.sh (the only writer) and
-# computeFatSqshPath() in L0_Test.groovy; a divergent key misses the cache silently.
-# The builder hashes FAT_BUILD_SCRIPT_PATH unconditionally, so bail out rather than
-# fall back to an empty hash, which yields a path no builder ever writes.
-if [ -z "${FAT_BUILD_SCRIPT_PATH:-}" ] || [ ! -f "${FAT_BUILD_SCRIPT_PATH}" ]; then
-    echo "Warning: FAT_BUILD_SCRIPT_PATH (${FAT_BUILD_SCRIPT_PATH:-unset}) is missing; cannot compute the fat sqsh cache key."
-    echo "=== [Prepare Container] STAGE END (no build script): $(date '+%Y-%m-%d %H:%M:%S') ==="
-    exit 0
-fi
-fatBuildScriptHash=$(sha256sum "${FAT_BUILD_SCRIPT_PATH}" | cut -d' ' -f1 | head -c 8)
-fatHash=$(printf '%s' "${FAT_LLM_TAR_ARTIFACT_PATH}|${FAT_LLM_DOCKER_IMAGE}|${fatBuildScriptHash}" | sha256sum | cut -d' ' -f1 | head -c 16)
-fatSqshPath="${FAT_SQSH_DIR}/fat-${fatHash}.sqsh"
 
 if [ -f "$fatSqshPath" ]; then
     echo "Fat sqsh already cached: $fatSqshPath"
@@ -55,7 +40,7 @@ fi
 BUILDER_ID=""
 STATUS=""
 actualFatBuildLogPath=""
-FAT_BUILD_JOB_NAME="fat_build_${fatHash}"
+FAT_BUILD_JOB_NAME="fat_build_$(basename "$fatSqshPath" .sqsh)"
 
 runningFatBuilder() {
     squeue -h -n "$FAT_BUILD_JOB_NAME" -t RUNNING -o "%i" 2>/dev/null | head -1 || true
@@ -78,7 +63,7 @@ fatBuilderLogPath() {
     scontrol show job "$1" 2>/dev/null | grep -oP '(?<=StdOut=)\S+' || true
 }
 
-# Concurrent stages can each submit a builder for the same hash; --dependency=singleton
+# Concurrent stages can each submit a builder for the same fat sqsh; --dependency=singleton
 # then holds the extras in PENDING (Dependency) until the running one ends, so wait on
 # the running builder when there is one.
 EXISTING=$(runningFatBuilder)
@@ -144,7 +129,7 @@ iters=0
 pendingIters=0
 gaveUp=false
 while true; do
-    # Any builder for this hash may publish the sqsh, not only the one being polled.
+    # Any builder for this fat sqsh may publish the sqsh, not only the one being polled.
     if [ -f "$fatSqshPath" ]; then
         echo "Fat sqsh published while waiting on builder $BUILDER_ID"
         STATUS="PUBLISHED"
