@@ -461,6 +461,34 @@ async def test_watch_is_tried_again_until_etcd_answers(monkeypatch):
     assert connect.call_count == 3 and PREFIX in second.callbacks
 
 
+class _EndsOnFirstWatch(FakeEtcdClient):
+    """A client whose first watch stream ends while the watch is being created."""
+
+    def __init__(self):
+        super().__init__()
+        self.watches = 0
+
+    def add_watch_prefix_callback(self, prefix, callback):
+        watch_id = super().add_watch_prefix_callback(prefix, callback)
+        self.watches += 1
+        if self.watches == 1:
+            callback(None)
+        return watch_id
+
+
+@pytest.mark.asyncio
+async def test_watch_whose_stream_ends_before_watch_returns_is_watched_again():
+    client, storage = _storage(client=_EndsOnFirstWatch())
+    await storage.set(f"{PREFIX}/a", "value-a")
+    handle = await storage.watch(PREFIX)
+    assert handle.restart_task is not None
+    await asyncio.wait_for(handle.restart_task, 1)
+    assert client.watches == 2
+    assert _changes(await asyncio.wait_for(handle.drain(), 1)) == [
+        ("SET", f"{PREFIX}/a", "value-a")
+    ]
+
+
 @pytest.mark.asyncio
 async def test_unwatched_prefix_is_not_watched_again():
     client, storage = _storage()

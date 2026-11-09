@@ -951,6 +951,9 @@ class Etcd3ClusterStorage(ClusterStorage):
                                             asyncio.get_running_loop())
         await self._start_watch(watch_handle)
         self._watch_handles[key_prefix] = watch_handle
+        if watch_handle.stream_ended:
+            # The stream ended before the handle was cached.
+            self._on_watch_stream_end(watch_handle, watch_handle.stream)
         return watch_handle
 
     async def _start_watch(self, handle: Etcd3WatchEventQueue) -> None:
@@ -966,11 +969,16 @@ class Etcd3ClusterStorage(ClusterStorage):
 
     def _on_watch_stream_end(self, handle: Etcd3WatchEventQueue,
                              stream: int) -> None:
-        """Watch again when the current stream of a watched prefix ends."""
-        if (stream != handle.stream
-                or self._watch_handles.get(handle.key_prefix) is not handle):
+        """Watch again when the current stream of a watched prefix ends.
+
+        A handle that ``watch()`` has not cached yet only keeps ``stream_ended`` set;
+        ``watch()`` restarts it once cached.
+        """
+        if stream != handle.stream:
             return
         handle.stream_ended = True
+        if self._watch_handles.get(handle.key_prefix) is not handle:
+            return
         if handle.restart_task is None or handle.restart_task.done():
             logger.warning(
                 f"The etcd watch of {handle.key_prefix!r} ended, watching again"
