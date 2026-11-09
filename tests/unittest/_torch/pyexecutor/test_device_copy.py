@@ -14,6 +14,7 @@ from tensorrt_llm._torch.pyexecutor import device_copy
 from tensorrt_llm._torch.pyexecutor.device_copy import (
     CHECK_ENV,
     CopyPlan,
+    CopySite,
     CopySiteEnum,
     DeviceCopier,
     Direction,
@@ -139,9 +140,9 @@ def test_the_plan_routes_each_site():
 
     with device_copy.active(_new_copier(plan)):
         device_copy.begin()
-        assert device_copy.copy(_Site.H2D, merged, values) is True
         # A site not in the plan is a plain copy, every time.
         assert [device_copy.copy(_Site.PLAIN, plain, values) for _ in range(2)] == [True, True]
+        assert device_copy.copy(_Site.H2D, merged, values) is True
         # The caller's unchanged=True is not issued, merged or not.
         assert device_copy.copy(_Site.PLAIN, plain, values, unchanged=True) is False
         assert device_copy.copy(_Site.H2D, merged, _host([9, 9]), unchanged=True) is False
@@ -468,6 +469,38 @@ def test_an_unpackable_copy_flushes_first_and_keeps_order(copier):
     device_copy.flush()
     torch.cuda.synchronize()
     assert later.tolist() == [5, 6]
+
+
+def test_an_eager_consumer_of_a_merged_copy_flushes_its_producer_first():
+    # A partial plan: the decoder's position ids are merged, the graph runner's copy of them into the static input is
+    # not. That eager copy reads the merged copy's destination, so the producer lands first.
+    copier = _new_copier(CopyPlan(merge={CopySite.INPUT_POSITION_IDS}))
+    positions, static = _zeros(4), _zeros(4)
+    with device_copy.active(copier):
+        device_copy.begin()
+        device_copy.copy(CopySite.INPUT_POSITION_IDS, positions, _host([7, 8, 9, 10]))
+        device_copy.copy(CopySite.GRAPH_POSITION_IDS, static, positions)
+        device_copy.flush()
+    torch.cuda.synchronize()
+    assert static.tolist() == positions.tolist() == [7, 8, 9, 10]
+
+
+@pytest.mark.parametrize("eager", ["host_copy", "fill"])
+def test_an_eager_write_issues_the_staged_copies_first(copier, eager):
+    buf = _zeros(4)
+    pack = copier._pack
+
+    device_copy.begin()
+    _copy(buf, _host([1, 2, 3, 4]))
+    if eager == "host_copy":
+        device_copy.copy(_Site.PLAIN, buf[2:], _host([0, 0]))
+    else:
+        device_copy.fill_tail(_Site.TAIL, buf, 2, 0)
+    # The staged copy was issued before the eager write, and the pack stays open.
+    assert pack.seg > 0 and device_copy.is_open()
+    device_copy.flush()
+    torch.cuda.synchronize()
+    assert buf.tolist() == [1, 2, 0, 0]
 
 
 def test_a_device_copy_with_a_dtype_change_is_not_merged(copier):
@@ -1204,12 +1237,12 @@ def test_on_drop_runs_for_the_staged_copies_of_a_discarded_pack(copier):
     staged, eager = _zeros(2), _zeros(2)
 
     device_copy.begin()
-    assert device_copy.copy(
-        _Site.H2D, staged, _host([1, 1]), on_drop=lambda: dropped.append("staged")
-    )
     # A copy that runs eagerly has landed: its on_drop is never kept.
     assert device_copy.copy(
         _Site.PLAIN, eager, _host([2, 2]), on_drop=lambda: dropped.append("eager")
+    )
+    assert device_copy.copy(
+        _Site.H2D, staged, _host([1, 1]), on_drop=lambda: dropped.append("staged")
     )
     assert not device_copy.copy(
         _Site.H2D, staged, _host([3, 3]), unchanged=True, on_drop=lambda: dropped.append("x")

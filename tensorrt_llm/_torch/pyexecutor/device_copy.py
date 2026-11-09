@@ -29,7 +29,9 @@ Two questions decide what happens to it, and two different owners answer them:
 
   Listing a site in ``merge`` asserts that between the call and its barrier no device work reads or writes the
   destination, nor, for a device-to-device copy, writes the source (which is read at the flush). A site in neither
-  set, and every site of an engine whose model declares no plan, is ``dst.copy_(src, non_blocking=True)``.
+  set, and every site of an engine whose model declares no plan, is ``dst.copy_(src, non_blocking=True)``. An eager
+  copy or fill issued through this module while copies are staged issues them first, so the copies land in call order
+  whichever sites the plan merges; only device work outside this module needs a ``flush_after`` anchor.
 * **Whether** a copy is needed at all is the buffer owner's business. It depends on the values and on who else writes
   the buffer, which only the owner knows: the owner passes ``unchanged=True`` when the destination already holds what
   the call would write, and the call is not issued. ``DeviceCopyBuffer`` is that owner-side record for one buffer and
@@ -41,7 +43,11 @@ Two questions decide what happens to it, and two different owners answer them:
 Model-specific backends name their own sites with their own ``CopySiteEnum``. Adding a model: declare the plan from
 the readers of each destination (merge what no device work touches before the replay, and anchor a barrier on each
 copy that has an eager reader), and let each buffer owner decide on its own whether its uploads may be skipped (a
-``DeviceCopyBuffer`` with the copy's site).
+``DeviceCopyBuffer`` with the copy's site). Worked example: MiniMax-M3. Its MSA attention backend names its sites
+(``MsaCopySite`` in ``attention/backends/sparse/minimax_m3/common.py``, each with the readers of its destination) and
+skips its unchanged uploads through ``DeviceCopyBuffer``; each modeling_v2 target declares ``_COPY_PLAN`` in its
+``modeling.py`` (``minimax_m3_nvfp4__sm_103__tp4`` merges plain copies; ``minimax_m3_nvfp4__sm_107__tp8`` adds
+``changed_span``, ``parallel_scatter`` and an ``InGraph`` final flush) and sets it as ``copy_plan``.
 
 ``CHECK_MODE`` verifies the assertions at runtime, at the cost of a device synchronization per check: a write of a
 merged destination before its flush, and an ``unchanged`` copy or fill (including every copy a ``DeviceCopyBuffer``
@@ -854,6 +860,8 @@ class DeviceCopier:
                 return True
             # Cannot be staged: what is staged lands first, then this copy (which keeps the order).
             pack.barrier()
+        else:
+            self._land_staged()
         dst.copy_(src if snapshot is None else snapshot(src), non_blocking=True)
         return True
 
@@ -862,7 +870,20 @@ class DeviceCopier:
     ) -> None:
         if site.direction is not Direction.FILL:
             raise ValueError(f"{_site_name(site)} is not a fill site")
+        if not unchanged and start < buf.shape[0]:
+            self._land_staged()
         _fill_tail(site, buf, start, value, unchanged, self)
+
+    def _land_staged(self) -> None:
+        """Before an eager copy or fill: issue what is staged, so the eager one lands after every earlier copy."""
+        pack = self._pack
+        if (
+            pack is not None
+            and pack.open
+            and (pack.h2d or pack.d2d)
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            pack.barrier()
 
 
 def _check_unchanged_copy(
