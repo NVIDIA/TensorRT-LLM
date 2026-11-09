@@ -7780,7 +7780,8 @@ def _glm_parity(parser_cls, text, tools, chunkings=None):
 
 
 # The definitions the "$ref" schemas below name, laid out as schema generators
-# such as Pydantic emit nested models and enums (draft-07 uses `definitions`).
+# such as Pydantic emit nested models and enums (draft-07 uses `definitions`),
+# plus names that a reference must percent-encode or escape.
 _GLM_DEFINITIONS = {
     "$defs": {
         "Opts": {
@@ -7796,6 +7797,12 @@ _GLM_DEFINITIONS = {
         },
         "Loop": {
             "$ref": "#/$defs/Loop"
+        },
+        "My Opts": {
+            "type": "object"
+        },
+        "My/Opts": {
+            "type": "object"
         },
     },
     "definitions": {
@@ -7852,6 +7859,15 @@ _GLM_SCHEMAS.update({
     },
     "cyclic $ref": {
         "$ref": "#/$defs/Loop"
+    },
+    "$ref percent-encoded name": {
+        "$ref": "#/$defs/My%20Opts"
+    },
+    "$ref percent-encoded escape": {
+        "$ref": "#/$defs/My%7E1Opts"
+    },
+    "$ref invalid encoding": {
+        "$ref": "#/$defs/%FF"
     },
 })
 
@@ -7915,6 +7931,9 @@ _GLM_TYPED_VALUES += [
     ("1", "optional $ref enum", "1"),
     ('{"a": 1}', "dangling $ref", '{"a": 1}'),
     ('{"a": 1}', "cyclic $ref", '{"a": 1}'),
+    ('{"verbose": true}', "$ref percent-encoded name", dict(verbose=True)),
+    ('{"verbose": true}', "$ref percent-encoded escape", dict(verbose=True)),
+    ('{"a": 1}', "$ref invalid encoding", '{"a": 1}'),
 ]
 
 _GLM_VALUES = sorted({row[0] for row in _GLM_TYPED_VALUES})

@@ -6,6 +6,7 @@ import json
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Dict, Iterator, Optional
+from urllib.parse import unquote
 
 import partial_json_parser
 from partial_json_parser.core.options import Allow
@@ -67,15 +68,26 @@ _MAX_REFS_FOLLOWED = 32
 def _resolve_local_ref(ref: Any, root: Any) -> Any:
     """The subschema of `root` named by a local reference like ``#/$defs/X``.
 
-    None for a reference into another document, a named anchor, or a pointer
-    that names nothing in `root`.
+    The fragment is percent-decoded into a JSON pointer before its tokens are
+    split and unescaped (RFC 6901, section 6), so ``#/$defs/My%20Model`` names
+    the definition ``My Model``.
+
+    None for a reference into another document, a named anchor, a fragment
+    that is not valid percent-encoded UTF-8, or a pointer that names nothing
+    in `root`.
     """
     if not isinstance(ref, str) or not isinstance(root, dict):
         return None
-    if ref != "#" and not ref.startswith("#/"):
+    if not ref.startswith("#"):
+        return None
+    try:
+        pointer = unquote(ref[1:], errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if pointer and not pointer.startswith("/"):
         return None
     node = root
-    for token in ref.split("/")[1:]:
+    for token in pointer.split("/")[1:]:
         token = token.replace("~1", "/").replace("~0", "~")
         if not isinstance(node, dict) or token not in node:
             return None
