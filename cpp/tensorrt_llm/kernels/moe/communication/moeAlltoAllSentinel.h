@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
-// Lamport transport of the NVLink one-sided MoE all-to-all for small steps: one dispatch and one
+// Sentinel transport of the NVLink one-sided MoE all-to-all for small steps: one dispatch and one
 // combine kernel, no completion flags and no fences between data and its readiness.
 //
-// Lamport arrival. Every landing row a peer writes into is armed with a sentinel word that no
+// Sentinel arrival. Every landing row a peer writes into is armed with a sentinel word that no
 // payload word takes (senders rewrite the few words that could, see canonicalize_* in
-// moeAlltoAllLamport.cu). A receiver polls the data itself: a 16-byte vector has arrived when none
+// moeAlltoAllSentinel.cu). A receiver polls the data itself: a 16-byte vector has arrived when none
 // of its four 32-bit words is the sentinel (32-bit stores are single-copy atomic, so a torn vector
 // still shows one). The receiver copies the vector out and re-arms it; it is the vector's only
 // reader.
@@ -77,7 +77,7 @@
 
 TRTLLM_NAMESPACE_BEGIN
 
-namespace kernels::moe_comm::lamport
+namespace kernels::moe_comm::sentinel
 {
 
 static constexpr int kMaxRanks = 64; // the active-rank mask is one 64-bit word
@@ -202,13 +202,13 @@ struct CombineParams
 
 // Whether the code loaded for the current device carries the kernels. They are built for compute
 // capability 10.0, 10.3 and 10.7; other architectures get kernels that trap.
-bool moe_a2a_lamport_kernels_available();
+bool moe_a2a_sentinel_kernels_available();
 
 // Grid max_tokens_per_rank * blocks_per_token; launched with PDL when TRTLLM_ENABLE_PDL is set.
-void moe_a2a_lamport_dispatch_launch(
+void moe_a2a_sentinel_dispatch_launch(
     int payload_kind, DispatchParams const& params, bool enable_rank_mask, cudaStream_t stream);
-void moe_a2a_lamport_combine_launch(CombineParams const& params, bool enable_rank_mask, cudaStream_t stream);
+void moe_a2a_sentinel_combine_launch(CombineParams const& params, bool enable_rank_mask, cudaStream_t stream);
 
-} // namespace kernels::moe_comm::lamport
+} // namespace kernels::moe_comm::sentinel
 
 TRTLLM_NAMESPACE_END

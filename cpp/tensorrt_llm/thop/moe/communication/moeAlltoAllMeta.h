@@ -18,7 +18,7 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/moe/communication/moeAlltoAllKernels.h"
-#include "tensorrt_llm/kernels/moe/communication/moeAlltoAllLamport.h"
+#include "tensorrt_llm/kernels/moe/communication/moeAlltoAllSentinel.h"
 
 #include <array>
 #include <cstdint>
@@ -32,7 +32,7 @@ namespace torch_ext
 namespace moe_comm
 {
 
-// Per-rank layout: round state, dispatch control/payload, combine control/input, then the Lamport regions.
+// Per-rank layout: round state, dispatch control/payload, combine control/input, then the sentinel regions.
 // Fence combine pulls from peer input buffers.
 // Region boundaries are fixed at allocation; token slices remain runtime-packed.
 // OFFSET fields are byte offsets from the per-rank workspace base; SIZE fields are byte capacities.
@@ -83,23 +83,23 @@ enum MoeA2AMetaInfoIndex : int64_t
     // Total required bytes per rank, including all control buffers, payloads and alignment padding.
     WORKSPACE_SIZE_INDEX = 17,
 
-    // Lamport transport (moeAlltoAllLamport.h), appended after the regions above by
-    // moe_a2a_lamport_extend_workspace_layout. Every field is zero when it is not allocated.
-    // Landing rows per source rank: the largest runtime_max_tokens_per_rank of a Lamport step.
-    LAMPORT_MAX_NUM_TOKENS_INDEX = 18,
-    // Payload format (kernels::moe_comm::lamport::PayloadFormat) and hidden size the landing rows hold.
-    LAMPORT_PAYLOAD_FORMAT_INDEX = 19,
-    LAMPORT_HIDDEN_SIZE_INDEX = 20,
+    // Sentinel transport (moeAlltoAllSentinel.h), appended after the regions above by
+    // moe_a2a_sentinel_extend_workspace_layout. Every field is zero when it is not allocated.
+    // Landing rows per source rank: the largest runtime_max_tokens_per_rank of a sentinel step.
+    SENTINEL_MAX_NUM_TOKENS_INDEX = 18,
+    // Payload format (kernels::moe_comm::sentinel::PayloadFormat) and hidden size the landing rows hold.
+    SENTINEL_PAYLOAD_FORMAT_INDEX = 19,
+    SENTINEL_HIDDEN_SIZE_INDEX = 20,
     // Round state: int32 words (epoch, ...), then a uint64 receive-source mask per token slot.
-    LAMPORT_STATE_OFFSET_INDEX = 21,
+    SENTINEL_STATE_OFFSET_INDEX = 21,
     // Landing rows: payload, scale and weight rows, then two sets of expert-id rows.
-    LAMPORT_LANDING_OFFSET_INDEX = 22,
+    SENTINEL_LANDING_OFFSET_INDEX = 22,
     // Combine landing rows: one bf16 partial row per (source rank, token).
-    LAMPORT_COMBINE_LANDING_OFFSET_INDEX = 23,
-    // Receive buffers of a Lamport dispatch, packed like the dispatch payload region.
-    LAMPORT_RECV_OFFSET_INDEX = 24,
+    SENTINEL_COMBINE_LANDING_OFFSET_INDEX = 23,
+    // Receive buffers of a sentinel dispatch, packed like the dispatch payload region.
+    SENTINEL_RECV_OFFSET_INDEX = 24,
     // Reserved receive capacity, including payload alignment padding.
-    LAMPORT_RECV_SIZE_INDEX = 25,
+    SENTINEL_RECV_SIZE_INDEX = 25,
 
     // Number of int64_t entries in the metadata tensor; not a stored layout field.
     NUM_METAINFO_FIELDS = 26
@@ -130,29 +130,29 @@ inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs(
         {"MOE_A2A_EP_SIZE_INDEX", EP_SIZE_INDEX},
         {"MOE_A2A_EPLB_STATS_NUM_EXPERTS_INDEX", EPLB_STATS_NUM_EXPERTS_INDEX},
         {"MOE_A2A_WORKSPACE_SIZE_INDEX", WORKSPACE_SIZE_INDEX},
-        {"MOE_A2A_LAMPORT_MAX_NUM_TOKENS_INDEX", LAMPORT_MAX_NUM_TOKENS_INDEX},
-        {"MOE_A2A_LAMPORT_PAYLOAD_FORMAT_INDEX", LAMPORT_PAYLOAD_FORMAT_INDEX},
-        {"MOE_A2A_LAMPORT_HIDDEN_SIZE_INDEX", LAMPORT_HIDDEN_SIZE_INDEX},
-        {"MOE_A2A_LAMPORT_STATE_OFFSET_INDEX", LAMPORT_STATE_OFFSET_INDEX},
-        {"MOE_A2A_LAMPORT_LANDING_OFFSET_INDEX", LAMPORT_LANDING_OFFSET_INDEX},
-        {"MOE_A2A_LAMPORT_COMBINE_LANDING_OFFSET_INDEX", LAMPORT_COMBINE_LANDING_OFFSET_INDEX},
-        {"MOE_A2A_LAMPORT_RECV_OFFSET_INDEX", LAMPORT_RECV_OFFSET_INDEX},
-        {"MOE_A2A_LAMPORT_RECV_SIZE_INDEX", LAMPORT_RECV_SIZE_INDEX},
+        {"MOE_A2A_SENTINEL_MAX_NUM_TOKENS_INDEX", SENTINEL_MAX_NUM_TOKENS_INDEX},
+        {"MOE_A2A_SENTINEL_PAYLOAD_FORMAT_INDEX", SENTINEL_PAYLOAD_FORMAT_INDEX},
+        {"MOE_A2A_SENTINEL_HIDDEN_SIZE_INDEX", SENTINEL_HIDDEN_SIZE_INDEX},
+        {"MOE_A2A_SENTINEL_STATE_OFFSET_INDEX", SENTINEL_STATE_OFFSET_INDEX},
+        {"MOE_A2A_SENTINEL_LANDING_OFFSET_INDEX", SENTINEL_LANDING_OFFSET_INDEX},
+        {"MOE_A2A_SENTINEL_COMBINE_LANDING_OFFSET_INDEX", SENTINEL_COMBINE_LANDING_OFFSET_INDEX},
+        {"MOE_A2A_SENTINEL_RECV_OFFSET_INDEX", SENTINEL_RECV_OFFSET_INDEX},
+        {"MOE_A2A_SENTINEL_RECV_SIZE_INDEX", SENTINEL_RECV_SIZE_INDEX},
         {"MOE_A2A_NUM_METAINFO_FIELDS", NUM_METAINFO_FIELDS},
         {"MOE_A2A_MAX_RANKS", kMaxRanks},
         {"MOE_A2A_MAX_TOP_K", kMaxTopK},
         {"MOE_A2A_MAX_PAYLOADS", kMaxPayloads},
         {"MOE_A2A_WORKSPACE_ALIGNMENT", kWorkspaceAlignment},
-        // Limits of the Lamport transport and its payload formats.
-        {"MOE_A2A_LAMPORT_MAX_RANKS", lamport::kMaxRanks},
-        {"MOE_A2A_LAMPORT_MAX_TOP_K", lamport::kMaxTopK},
-        {"MOE_A2A_LAMPORT_MAX_TOKENS_PER_RANK", lamport::kMaxTokensPerRank},
-        {"MOE_A2A_LAMPORT_DISPATCH_BLOCKS_PER_SM", lamport::kDispatchBlocksPerSM},
-        {"MOE_A2A_LAMPORT_IDS_SENTINEL", static_cast<int32_t>(lamport::kIdsSentinel)},
-        {"MOE_A2A_LAMPORT_FORMAT_BF16", lamport::kBf16},
-        {"MOE_A2A_LAMPORT_FORMAT_MXFP8", lamport::kMxfp8},
-        {"MOE_A2A_LAMPORT_FORMAT_FP8_BLOCK128", lamport::kFp8Block128},
-        {"MOE_A2A_LAMPORT_FORMAT_NVFP4", lamport::kNvfp4},
+        // Limits of the sentinel transport and its payload formats.
+        {"MOE_A2A_SENTINEL_MAX_RANKS", sentinel::kMaxRanks},
+        {"MOE_A2A_SENTINEL_MAX_TOP_K", sentinel::kMaxTopK},
+        {"MOE_A2A_SENTINEL_MAX_TOKENS_PER_RANK", sentinel::kMaxTokensPerRank},
+        {"MOE_A2A_SENTINEL_DISPATCH_BLOCKS_PER_SM", sentinel::kDispatchBlocksPerSM},
+        {"MOE_A2A_SENTINEL_IDS_SENTINEL", static_cast<int32_t>(sentinel::kIdsSentinel)},
+        {"MOE_A2A_SENTINEL_FORMAT_BF16", sentinel::kBf16},
+        {"MOE_A2A_SENTINEL_FORMAT_MXFP8", sentinel::kMxfp8},
+        {"MOE_A2A_SENTINEL_FORMAT_FP8_BLOCK128", sentinel::kFp8Block128},
+        {"MOE_A2A_SENTINEL_FORMAT_NVFP4", sentinel::kNvfp4},
     };
 }
 

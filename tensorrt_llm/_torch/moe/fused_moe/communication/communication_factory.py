@@ -40,7 +40,7 @@ from .base import Communication
 from .deep_ep import DeepEP
 from .deep_ep_low_latency import DeepEPLowLatency
 from .nccl_ep import NcclEP
-from .nvlink_one_sided import NVLinkOneSided, lamport_payload_format
+from .nvlink_one_sided import NVLinkOneSided, sentinel_payload_format
 from .nvlink_two_sided import NVLinkTwoSided
 
 # Temporary NCCL-EP v0.1.0 limitation. The LL combine kernel derives its
@@ -223,7 +223,7 @@ class CommunicationFactory:
                 ep_group_health=ep_group_health,
                 alltoall_watchdog_timeout_s=watchdog_timeout_s,
                 alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
-                lamport_payload_format=lamport_payload_format(
+                sentinel_payload_format=sentinel_payload_format(
                     quant_config.quant_algo if quant_config is not None else None
                 ),
             )
@@ -400,7 +400,7 @@ class CommunicationFactory:
                 ep_group_health=ep_group_health,
                 alltoall_watchdog_timeout_s=watchdog_timeout_s,
                 alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
-                lamport_payload_format=lamport_payload_format(
+                sentinel_payload_format=sentinel_payload_format(
                     quant_config.quant_algo if quant_config is not None else None
                 ),
             )

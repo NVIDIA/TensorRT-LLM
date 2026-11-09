@@ -73,8 +73,8 @@ from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep import DeepEP
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
-    FORCE_LAMPORT_ENV,
-    LAMPORT_MAX_TOKENS_ENV,
+    SENTINEL_MAX_TOKENS_ENV,
+    SYNC_PROTOCOL_ENV,
     NVLinkOneSided,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import (
@@ -2692,9 +2692,9 @@ def _worker_mnnvl_checkpoint_graph_replay(config: CommTestConfig) -> bool:
         world_size=config.ep_size,
     )
     with pytest.MonkeyPatch.context() as patch:
-        # Pin worker-side policy: the default transport selection, with Lamport on.
-        patch.delenv(FORCE_LAMPORT_ENV, raising=False)
-        patch.delenv(LAMPORT_MAX_TOKENS_ENV, raising=False)
+        # Pin worker-side policy: the default transport selection, with sentinel on.
+        patch.delenv(SYNC_PROTOCOL_ENV, raising=False)
+        patch.delenv(SENTINEL_MAX_TOKENS_ENV, raising=False)
         communication = create_comm_object(config.comm_type, mapping, config)
     try:
         return _exercise_mnnvl_checkpoint_graph_replay(config, rank, communication)
@@ -2729,9 +2729,9 @@ def _worker_mnnvl_engine_checkpoint_coordination(config: CommTestConfig) -> bool
         world_size=world_size,
     )
     with pytest.MonkeyPatch.context() as patch:
-        # Pin worker-side policy: the default transport selection, with Lamport on.
-        patch.delenv(FORCE_LAMPORT_ENV, raising=False)
-        patch.delenv(LAMPORT_MAX_TOKENS_ENV, raising=False)
+        # Pin worker-side policy: the default transport selection, with sentinel on.
+        patch.delenv(SYNC_PROTOCOL_ENV, raising=False)
+        patch.delenv(SENTINEL_MAX_TOKENS_ENV, raising=False)
         communication = create_comm_object(config.comm_type, mapping, config)
     sleep_wakeup_comm = MPI.COMM_WORLD.Dup()
     control_comm = MPI.COMM_WORLD.Dup()

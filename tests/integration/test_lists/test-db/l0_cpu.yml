@@ -38,12 +38,12 @@ l0_cpu:
   - disaggregated/test_aiperf_gate.py::test_gate_disabled_paths_not_affected
   - disaggregated/test_aiperf_gate.py::test_was_cancelled_metadata_fallback
   - disaggregated/test_aiperf_gate.py::test_non_request_records_excluded_from_denominator
-  # NVLinkOneSided Lamport host-side rules (layout, row geometry, token limit, format, step selection).
-  - unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py::test_lamport_workspace_layout
-  - unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py::test_lamport_row_geometry
-  - unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py::test_default_lamport_max_tokens
-  - unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py::test_lamport_payload_format
-  - unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py::test_lamport_step_selection
+  # NVLinkOneSided sentinel host-side rules (layout, row geometry, token limit, format, step selection).
+  - unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py::test_sentinel_workspace_layout
+  - unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py::test_sentinel_row_geometry
+  - unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py::test_default_sentinel_max_tokens
+  - unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py::test_sentinel_payload_format
+  - unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py::test_sentinel_step_selection
   # Kimi K3 disagg parity harness self-test (comparison logic only, no GPUs).
   - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
   # Disagg cancellation stress harness: marathon config validation and attach-mode

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """NVLinkOneSided path selection and model-shaped round trips with independent references.
 
-Every round trip runs with the fence and Lamport transports (``Case.mode``); the Lamport
+Every round trip runs with the fence and sentinel transports (``Case.mode``); the sentinel
 transport places received rows at (source rank, token) instead of compacting them, which the
 dispatch check accepts because it identifies tokens by their encoded routing weights.
 """
@@ -25,12 +25,12 @@ from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
-    FORCE_LAMPORT_ENV,
-    LAMPORT_MAX_TOKENS_ENV,
+    SENTINEL_MAX_TOKENS_ENV,
+    SYNC_PROTOCOL_ENV,
     NVLinkOneSided,
-    default_lamport_max_tokens,
-    lamport_payload_format,
-    lamport_row,
+    default_sentinel_max_tokens,
+    sentinel_payload_format,
+    sentinel_row,
 )
 from tensorrt_llm.mapping import Mapping
 
@@ -65,8 +65,8 @@ MODELS = {
 }
 
 
-# Lamport payload format of each dispatch format the tests generate.
-LAMPORT_FORMATS = {
+# Sentinel payload format of each dispatch format the tests generate.
+SENTINEL_FORMATS = {
     "bf16": "BF16",
     "blockwise_fp8": "FP8_BLOCK128",
     "mxfp8": "MXFP8",
@@ -144,28 +144,28 @@ class Case:
         model: Expert layout, hidden width, and dispatch payload format.
         rounds: Ordered iterations with no host synchronization between them.
             All token-count tuples must describe the same EP group size.
-        mode: Automatic transport selection (Lamport for small steps, fence for
-            the rest), forced fence, or requested Lamport with fence for the steps
+        mode: Automatic transport selection (sentinel for small steps, fence for
+            the rest), forced fence, or requested sentinel with fence for the steps
             it cannot carry; platform and payload restrictions still apply to
-            Lamport.
+            sentinel.
         payload_in_workspace: Copy simulated expert outputs into the communication workspace
             before combine, instead of passing an external tensor.
         fp8_combine: Use FP8 on the combine wire; the returned output remains BF16.
         graph: Capture and replay the entire round sequence in one CUDA graph.
         pdl: Enable programmatic dependent launch for communication kernels.
         eplb: Gather and verify expert-load statistics alongside dispatch.
-        lamport_max_tokens: Token limit of the Lamport transport; None keeps its default.
+        sentinel_max_tokens: Token limit of the sentinel transport; None keeps its default.
     """
 
     model: ModelShape
     rounds: tuple[Round, ...]
-    mode: Literal["auto", "fence", "lamport"]
+    mode: Literal["auto", "fence", "sentinel"]
     payload_in_workspace: bool
     fp8_combine: bool
     graph: bool
     pdl: bool
     eplb: bool
-    lamport_max_tokens: int | None = None
+    sentinel_max_tokens: int | None = None
 
     @property
     def ep_size(self) -> int:
@@ -284,9 +284,9 @@ def _run_worker(case: Case) -> dict:
     import torch
 
     # Selection is read by each communicator constructor, not cached by the MPI pool.
-    os.environ[FORCE_LAMPORT_ENV] = {"auto": "", "fence": "0", "lamport": "1"}[case.mode]
-    os.environ[LAMPORT_MAX_TOKENS_ENV] = (
-        "" if case.lamport_max_tokens is None else str(case.lamport_max_tokens)
+    os.environ[SYNC_PROTOCOL_ENV] = case.mode
+    os.environ[SENTINEL_MAX_TOKENS_ENV] = (
+        "" if case.sentinel_max_tokens is None else str(case.sentinel_max_tokens)
     )
 
     rank = MPI.COMM_WORLD.Get_rank()
@@ -320,26 +320,28 @@ def _run_worker(case: Case) -> dict:
         payload_in_workspace=case.payload_in_workspace,
         use_low_precision_combine=case.fp8_combine,
         num_experts=case.model.num_experts // 2 if case.eplb else None,
-        lamport_payload_format=LAMPORT_FORMATS[case.model.dispatch_dtype],
+        sentinel_payload_format=SENTINEL_FORMATS[case.model.dispatch_dtype],
     )
     try:
-        # Whether every precondition of the Lamport transport holds, from the case alone.
+        # Whether every precondition of the sentinel transport holds, from the case alone.
         try:
-            lamport_row(
-                LAMPORT_FORMATS[case.model.dispatch_dtype], case.model.hidden_size, case.model.top_k
+            sentinel_row(
+                SENTINEL_FORMATS[case.model.dispatch_dtype],
+                case.model.hidden_size,
+                case.model.top_k,
             )
-            lamport_shape_ok = True
+            sentinel_shape_ok = True
         except RuntimeError:
-            lamport_shape_ok = False
-        lamport_expected = (
-            case.mode in ("auto", "lamport")
-            and bool(torch.ops.trtllm.moe_a2a_lamport_available())
-            and lamport_shape_ok
+            sentinel_shape_ok = False
+        sentinel_expected = (
+            case.mode in ("auto", "sentinel")
+            and bool(torch.ops.trtllm.moe_a2a_sentinel_available())
+            and sentinel_shape_ok
             and not case.fp8_combine
             and case.model.num_experts % case.ep_size == 0
         )
-        if case.mode == "lamport" and not lamport_expected:
-            return {"skip": "the Lamport transport does not support this case on this platform"}
+        if case.mode == "sentinel" and not sentinel_expected:
+            return {"skip": "the sentinel transport does not support this case on this platform"}
         inputs = [_make_inputs(case, rank, i) for i in range(len(case.rounds))]
         stats = None
         if case.eplb:
@@ -354,15 +356,15 @@ def _run_worker(case: Case) -> dict:
 
         def record_dispatch(*args, **kwargs):
             # Record the actual op arguments, not just the wrapper's capability.
-            use_lamport = args[14] if len(args) > 14 else kwargs.get("use_lamport", False)
-            launches.append(("dispatch", bool(use_lamport)))
+            use_sentinel = args[14] if len(args) > 14 else kwargs.get("use_sentinel", False)
+            launches.append(("dispatch", bool(use_sentinel)))
             result = dispatch_op(*args, **kwargs)
             combine_offsets.append(result[1])
             return result
 
         def record_combine(*args, **kwargs):
-            use_lamport = args[13] if len(args) > 13 else kwargs.get("use_lamport", False)
-            launches.append(("combine", bool(use_lamport)))
+            use_sentinel = args[13] if len(args) > 13 else kwargs.get("use_sentinel", False)
+            launches.append(("combine", bool(use_sentinel)))
             return combine_op(*args, **kwargs)
 
         def sequence() -> list[dict]:
@@ -432,8 +434,8 @@ def _run_worker(case: Case) -> dict:
                 for o in outputs
             ],
             "launches": launches,
-            "lamport_max_tokens": comm.lamport_max_tokens,
-            "lamport_expected": lamport_expected,
+            "sentinel_max_tokens": comm.sentinel_max_tokens,
+            "sentinel_expected": sentinel_expected,
         }
         MPI.COMM_WORLD.Barrier()
         return result
@@ -518,23 +520,23 @@ def _assert_results(case: Case, results: list[dict]) -> None:
     for rank in range(case.ep_size):
         result = results[rank]
         assert len(result["outputs"]) == len(case.rounds)
-        lamport_max_tokens = result["lamport_max_tokens"]
-        assert (lamport_max_tokens > 0) == result["lamport_expected"], (
-            f"rank {rank}: Lamport limit {lamport_max_tokens}, expected it "
-            f"{'on' if result['lamport_expected'] else 'off'}"
+        sentinel_max_tokens = result["sentinel_max_tokens"]
+        assert (sentinel_max_tokens > 0) == result["sentinel_expected"], (
+            f"rank {rank}: sentinel limit {sentinel_max_tokens}, expected it "
+            f"{'on' if result['sentinel_expected'] else 'off'}"
         )
-        if case.lamport_max_tokens is not None and lamport_max_tokens:
-            assert lamport_max_tokens == min(
-                case.lamport_max_tokens, case.runtime_max_num_tokens_per_rank
+        if case.sentinel_max_tokens is not None and sentinel_max_tokens:
+            assert sentinel_max_tokens == min(
+                case.sentinel_max_tokens, case.runtime_max_num_tokens_per_rank
             )
         expected_launches = []
         for i, spec in enumerate(case.rounds):
             verify_combine(case, results, rank, i)
             if result["outputs"][i]["dispatch"] is not None:
                 verify_dispatch(case, results, rank, i)
-            # The Lamport transport takes every step it can carry; fence takes the rest.
-            lamport = max(spec.tokens) <= lamport_max_tokens and not case.eplb
-            expected_launches.extend((("dispatch", lamport), ("combine", lamport)))
+            # The sentinel transport takes every step it can carry; fence takes the rest.
+            sentinel = max(spec.tokens) <= sentinel_max_tokens and not case.eplb
+            expected_launches.extend((("dispatch", sentinel), ("combine", sentinel)))
             if case.eplb:
                 expected = torch.stack(
                     [
@@ -590,15 +592,15 @@ def _run(case: Case, pools: dict[tuple[int, bool], MPIPoolExecutor]) -> None:
             pools.pop(key).shutdown(wait=True, cancel_futures=True)
 
 
-def _skew_rounds(ep_size: int, num_rounds: int, lamport_max_tokens: int) -> tuple[Round, ...]:
+def _skew_rounds(ep_size: int, num_rounds: int, sentinel_max_tokens: int) -> tuple[Round, ...]:
     """Rounds with varying, uneven token counts (zero included), every routing pattern, and
-    rotating delays; every eighth round exceeds ``lamport_max_tokens`` on one rank."""
+    rotating delays; every eighth round exceeds ``sentinel_max_tokens`` on one rank."""
     rounds = []
     patterns = (Routing.SPREAD, Routing.LOCAL, Routing.HOTSPOT)
     for i in range(num_rounds):
-        tokens = [(7 * i + 13 * rank) % (lamport_max_tokens + 1) for rank in range(ep_size)]
+        tokens = [(7 * i + 13 * rank) % (sentinel_max_tokens + 1) for rank in range(ep_size)]
         if i % 8 == 7:
-            tokens[i % ep_size] = lamport_max_tokens + 1 + i % 5
+            tokens[i % ep_size] = sentinel_max_tokens + 1 + i % 5
         rounds.append(
             Round(
                 tokens=tuple(tokens),
@@ -661,7 +663,7 @@ CASES = [
         for payload_in_workspace in (False, True)
     ],
     # Reuse one four-rank communicator across changing token counts and peer dependencies,
-    # including zero-token ranks and delayed ranks. Counts 128/129 straddle a Lamport
+    # including zero-token ranks and delayed ranks. Counts 128/129 straddle a sentinel
     # limit of 128; graph cases replay the entire sequence.
     *[
         pytest.param(
@@ -686,42 +688,42 @@ CASES = [
                 graph=graph,
                 pdl=True,
                 eplb=False,
-                lamport_max_tokens=lamport_max_tokens,
+                sentinel_max_tokens=sentinel_max_tokens,
             ),
             id=(
                 f"round-sequence-ep4-{mode}-{'graph' if graph else 'eager'}"
-                + ("" if lamport_max_tokens is None else f"-lamport{lamport_max_tokens}")
+                + ("" if sentinel_max_tokens is None else f"-sentinel{sentinel_max_tokens}")
             ),
         )
-        for mode, graph, lamport_max_tokens in (
+        for mode, graph, sentinel_max_tokens in (
             ("auto", False, None),
             ("auto", True, None),
             ("fence", True, None),
-            # A Lamport limit of 128 hands the 129-token rounds to fence, so one
+            # A sentinel limit of 128 hands the 129-token rounds to fence, so one
             # sequence and one graph mix the transports.
             ("auto", True, 128),
-            ("lamport", False, 128),
-            ("lamport", True, 128),
+            ("sentinel", False, 128),
+            ("sentinel", True, 128),
         )
     ],
-    # Back-to-back Lamport rounds under rank skew: no host synchronization or fence round
+    # Back-to-back sentinel rounds under rank skew: no host synchronization or fence round
     # between most of them, a rotating rank delayed before dispatch and another before
-    # combine, and every eighth round above the Lamport limit (a fence round). Every round's
+    # combine, and every eighth round above the sentinel limit (a fence round). Every round's
     # combine is checked, so a stale or early landing row in any round shows up.
     *[
         pytest.param(
             Case(
                 model=MODELS[model],
-                rounds=_skew_rounds(ep_size, num_rounds=48, lamport_max_tokens=128),
-                mode="lamport",
+                rounds=_skew_rounds(ep_size, num_rounds=48, sentinel_max_tokens=128),
+                mode="sentinel",
                 payload_in_workspace=True,
                 fp8_combine=False,
                 graph=graph,
                 pdl=True,
                 eplb=False,
-                lamport_max_tokens=128,
+                sentinel_max_tokens=128,
             ),
-            id=f"lamport-skew-ep{ep_size}-{model}-{'graph' if graph else 'eager'}",
+            id=f"sentinel-skew-ep{ep_size}-{model}-{'graph' if graph else 'eager'}",
         )
         for ep_size in (4, 8)
         for model, graph in (("qwen3_5_397b_a17b", False), ("deepseek_r1_nvfp4", True))
@@ -807,7 +809,7 @@ def test_workspace_layout() -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("payload_format", ["BF16", "MXFP8", "FP8_BLOCK128", "NVFP4"])
-def test_lamport_workspace_layout(payload_format: str) -> None:
+def test_sentinel_workspace_layout(payload_format: str) -> None:
     from tensorrt_llm.bindings import internal as _tllm_internal
 
     thop = _tllm_internal.thop
@@ -815,83 +817,83 @@ def test_lamport_workspace_layout(payload_format: str) -> None:
     def field(layout: torch.Tensor, name: str) -> int:
         return int(layout[getattr(thop, f"MOE_A2A_{name}")])
 
-    ep_size, top_k, capacity, hidden_size, lamport_tokens = 8, 8, 256, 7168, 160
+    ep_size, top_k, capacity, hidden_size, sentinel_tokens = 8, 8, 256, 7168, 160
     base = NVLinkOneSided._make_workspace_layout(
         ep_size, top_k, capacity, hidden_size, torch.bfloat16, None, 0
     )
-    for name in ("LAMPORT_MAX_NUM_TOKENS_INDEX", "LAMPORT_RECV_SIZE_INDEX"):
+    for name in ("SENTINEL_MAX_NUM_TOKENS_INDEX", "SENTINEL_RECV_SIZE_INDEX"):
         assert field(base, name) == 0
     layout = base.clone()
-    torch.ops.trtllm.moe_a2a_lamport_extend_workspace_layout(
+    torch.ops.trtllm.moe_a2a_sentinel_extend_workspace_layout(
         layout,
-        lamport_tokens,
-        int(getattr(thop, f"MOE_A2A_LAMPORT_FORMAT_{payload_format}")),
+        sentinel_tokens,
+        int(getattr(thop, f"MOE_A2A_SENTINEL_FORMAT_{payload_format}")),
         hidden_size,
     )
-    # The other regions keep their offsets; the Lamport regions follow them in order.
-    num_base_fields = int(thop.MOE_A2A_LAMPORT_MAX_NUM_TOKENS_INDEX)
+    # The other regions keep their offsets; the sentinel regions follow them in order.
+    num_base_fields = int(thop.MOE_A2A_SENTINEL_MAX_NUM_TOKENS_INDEX)
     assert torch.equal(
         layout[: int(thop.MOE_A2A_WORKSPACE_SIZE_INDEX)],
         base[: int(thop.MOE_A2A_WORKSPACE_SIZE_INDEX)],
     )
     assert num_base_fields == int(thop.MOE_A2A_WORKSPACE_SIZE_INDEX) + 1
     starts = [
-        field(layout, f"LAMPORT_{name}_OFFSET_INDEX")
+        field(layout, f"SENTINEL_{name}_OFFSET_INDEX")
         for name in ("STATE", "LANDING", "COMBINE_LANDING", "RECV")
     ]
     assert field(base, "WORKSPACE_SIZE_INDEX") <= starts[0]
     assert starts == sorted(starts) and all(start % 256 == 0 for start in starts)
-    row = lamport_row(payload_format, hidden_size, top_k)
-    rows = ep_size * lamport_tokens
+    row = sentinel_row(payload_format, hidden_size, top_k)
+    rows = ep_size * sentinel_tokens
     # One bf16 partial row per (source rank, token), padded to the workspace alignment.
     assert starts[3] - starts[2] >= rows * hidden_size * 2
-    assert field(layout, "LAMPORT_RECV_SIZE_INDEX") >= rows * (
+    assert field(layout, "SENTINEL_RECV_SIZE_INDEX") >= rows * (
         row.hidden_bytes + row.scale_bytes + 2 * top_k * 4
     )
     assert field(layout, "WORKSPACE_SIZE_INDEX") == starts[3] + field(
-        layout, "LAMPORT_RECV_SIZE_INDEX"
+        layout, "SENTINEL_RECV_SIZE_INDEX"
     )
-    assert field(layout, "LAMPORT_MAX_NUM_TOKENS_INDEX") == lamport_tokens
-    assert field(layout, "LAMPORT_HIDDEN_SIZE_INDEX") == hidden_size
+    assert field(layout, "SENTINEL_MAX_NUM_TOKENS_INDEX") == sentinel_tokens
+    assert field(layout, "SENTINEL_HIDDEN_SIZE_INDEX") == hidden_size
 
     # Only a layout fresh from moe_a2a_get_workspace_layout can be extended, once.
     with pytest.raises(RuntimeError, match="must be a layout from moe_a2a_get_workspace_layout"):
-        torch.ops.trtllm.moe_a2a_lamport_extend_workspace_layout(
-            layout, lamport_tokens, int(thop.MOE_A2A_LAMPORT_FORMAT_BF16), hidden_size
+        torch.ops.trtllm.moe_a2a_sentinel_extend_workspace_layout(
+            layout, sentinel_tokens, int(thop.MOE_A2A_SENTINEL_FORMAT_BF16), hidden_size
         )
     with pytest.raises(RuntimeError, match="token capacity"):
-        torch.ops.trtllm.moe_a2a_lamport_extend_workspace_layout(
-            base.clone(), capacity + 1, int(thop.MOE_A2A_LAMPORT_FORMAT_BF16), hidden_size
+        torch.ops.trtllm.moe_a2a_sentinel_extend_workspace_layout(
+            base.clone(), capacity + 1, int(thop.MOE_A2A_SENTINEL_FORMAT_BF16), hidden_size
         )
 
 
 @pytest.mark.cpu_only
-def test_lamport_row_geometry() -> None:
+def test_sentinel_row_geometry() -> None:
     hidden_size, top_k = 7168, 8
     # (hidden-state bytes, scale bytes, dispatch blocks per token) per row.
-    assert lamport_row("BF16", hidden_size, top_k)[:3] == (2 * hidden_size, 0, 7)
-    assert lamport_row("MXFP8", hidden_size, top_k)[:3] == (hidden_size, hidden_size // 32, 4)
-    assert lamport_row("FP8_BLOCK128", hidden_size, top_k)[:3] == (
+    assert sentinel_row("BF16", hidden_size, top_k)[:3] == (2 * hidden_size, 0, 7)
+    assert sentinel_row("MXFP8", hidden_size, top_k)[:3] == (hidden_size, hidden_size // 32, 4)
+    assert sentinel_row("FP8_BLOCK128", hidden_size, top_k)[:3] == (
         hidden_size,
         hidden_size // 32,
         4,
     )
-    assert lamport_row("NVFP4", hidden_size, top_k)[:3] == (hidden_size // 2, hidden_size // 16, 2)
+    assert sentinel_row("NVFP4", hidden_size, top_k)[:3] == (hidden_size // 2, hidden_size // 16, 2)
     # The payload format must split into whole 16-byte vectors.
     with pytest.raises(RuntimeError, match="hidden_size % 256"):
-        lamport_row("NVFP4", 2880, top_k)
+        sentinel_row("NVFP4", 2880, top_k)
     with pytest.raises(RuntimeError, match="hidden_size % 8"):
-        lamport_row("BF16", 4100, top_k)
+        sentinel_row("BF16", 4100, top_k)
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("payload_format", "hidden_size", "top_k", "ep_size", "expected"),
     [
-        # Limits FlashInfer's Lamport transport reports on GB300 (152 SMs).
+        # Limits FlashInfer's sentinel transport reports on GB300 (152 SMs).
         # One wave holds fewer than 159 tokens: the floor.
         pytest.param("BF16", 7168, 8, 8, 159, id="dsv3-bf16-ep8"),
-        # The 64 MiB bound on the Lamport regions.
+        # The 64 MiB bound on the sentinel regions.
         pytest.param("NVFP4", 7168, 8, 8, 371, id="dsv3-nvfp4-ep8"),
         # The 64 MiB bound below the floor: the floor.
         pytest.param("NVFP4", 7168, 8, 64, 159, id="dsv3-nvfp4-ep64"),
@@ -899,34 +901,34 @@ def test_lamport_row_geometry() -> None:
         pytest.param("MXFP8", 3584, 16, 8, 455, id="kimi-k3-mxfp8-ep8"),
     ],
 )
-def test_default_lamport_max_tokens(
+def test_default_sentinel_max_tokens(
     payload_format: str, hidden_size: int, top_k: int, ep_size: int, expected: int
 ) -> None:
-    row = lamport_row(payload_format, hidden_size, top_k)
-    assert default_lamport_max_tokens(ep_size, 152, row) == expected
+    row = sentinel_row(payload_format, hidden_size, top_k)
+    assert default_sentinel_max_tokens(ep_size, 152, row) == expected
 
 
 @pytest.mark.cpu_only
-def test_lamport_payload_format() -> None:
+def test_sentinel_payload_format() -> None:
     from tensorrt_llm.quantization.mode import QuantAlgo
 
-    assert lamport_payload_format(QuantAlgo.NVFP4) == "NVFP4"
-    assert lamport_payload_format(QuantAlgo.W4A8_MXFP4_MXFP8) == "MXFP8"
-    assert lamport_payload_format(QuantAlgo.MXFP8) == "MXFP8"
+    assert sentinel_payload_format(QuantAlgo.NVFP4) == "NVFP4"
+    assert sentinel_payload_format(QuantAlgo.W4A8_MXFP4_MXFP8) == "MXFP8"
+    assert sentinel_payload_format(QuantAlgo.MXFP8) == "MXFP8"
     # FP8 block-scale backends quantize after dispatch.
-    assert lamport_payload_format(QuantAlgo.FP8_BLOCK_SCALES) == "BF16"
-    assert lamport_payload_format(None) == "BF16"
+    assert sentinel_payload_format(QuantAlgo.FP8_BLOCK_SCALES) == "BF16"
+    assert sentinel_payload_format(None) == "BF16"
 
 
 @pytest.mark.cpu_only
-def test_lamport_step_selection() -> None:
+def test_sentinel_step_selection() -> None:
     from types import SimpleNamespace
 
     hidden_size, top_k = 7168, 8
     comm = SimpleNamespace(
-        _lamport_row=lamport_row("NVFP4", hidden_size, top_k),
-        _lamport_format="NVFP4",
-        lamport_max_tokens=160,
+        _sentinel_row=sentinel_row("NVFP4", hidden_size, top_k),
+        _sentinel_format="NVFP4",
+        sentinel_max_tokens=160,
         top_k=top_k,
     )
     tokens = 4
@@ -935,7 +937,7 @@ def test_lamport_step_selection() -> None:
     weights = torch.empty((tokens, top_k), dtype=torch.float32)
 
     def carries(*args) -> bool:
-        return NVLinkOneSided.use_lamport_for_dispatch(comm, *args)
+        return NVLinkOneSided.use_sentinel_for_dispatch(comm, *args)
 
     assert carries(160, hidden, sf, weights, None)
     assert carries(160, hidden, sf, None, None)
@@ -946,7 +948,7 @@ def test_lamport_step_selection() -> None:
         1, torch.empty((tokens, hidden_size), dtype=torch.bfloat16), None, weights, None
     )
     assert not carries(1, hidden, sf, weights.bfloat16(), None)  # 2-byte weights
-    comm._lamport_row, comm.lamport_max_tokens = None, 0
+    comm._sentinel_row, comm.sentinel_max_tokens = None, 0
     assert not carries(1, hidden, sf, weights, None)
 
 
@@ -962,8 +964,8 @@ def _run_watchdog_worker(_unused: int) -> dict:
 
     import torch
 
-    # Pin the policy: a rank-mask communicator keeps the Lamport transport off anyway.
-    os.environ[FORCE_LAMPORT_ENV] = "0"
+    # Pin the policy: a rank-mask communicator keeps the sentinel transport off anyway.
+    os.environ[SYNC_PROTOCOL_ENV] = "fence"
 
     from tensorrt_llm._torch.moe.fused_moe.wide_ep_ft import EPGroupHealth
 

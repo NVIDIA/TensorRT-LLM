@@ -51,44 +51,48 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from ..moe_comm_timeout_guard import register_moe_comm_timeout_proxy
 from .base import Communication
 
-FORCE_LAMPORT_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_LAMPORT"
-LAMPORT_MAX_TOKENS_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_LAMPORT_MAX_TOKENS"
-# Lamport payload formats (the MOE_A2A_LAMPORT_FORMAT_<name> constants).
-LAMPORT_PAYLOAD_FORMATS = ("BF16", "MXFP8", "FP8_BLOCK128", "NVFP4")
-# Default token limit of the Lamport transport (default_lamport_max_tokens). Up to 159 tokens per
+SYNC_PROTOCOL_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL"
+# How a rank learns that a step's rows have arrived: "fence" (completion flags behind a
+# system-scope fence), "sentinel" (receivers poll the data itself) or "auto" (sentinel for the
+# steps it can carry, fence for the others). Same names as FlashInfer's ``sync_protocol``.
+SYNC_PROTOCOLS = ("auto", "fence", "sentinel")
+SENTINEL_MAX_TOKENS_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_SENTINEL_MAX_TOKENS"
+# Sentinel payload formats (the MOE_A2A_SENTINEL_FORMAT_<name> constants).
+SENTINEL_PAYLOAD_FORMATS = ("BF16", "MXFP8", "FP8_BLOCK128", "NVFP4")
+# Default token limit of the sentinel transport (default_sentinel_max_tokens). Up to 159 tokens per
 # rank the transport was faster than the fence transport in every configuration measured (GB300,
 # EP 4 to 64, hidden 3584 to 7168, every payload format), so the default never goes below.
-_LAMPORT_MIN_DEFAULT_MAX_TOKENS = 159
-# Above it the default keeps the ep_size * limit rows a Lamport step polls, copies out and re-arms
+_SENTINEL_MIN_DEFAULT_MAX_TOKENS = 159
+# Above it the default keeps the ep_size * limit rows a sentinel step polls, copies out and re-arms
 # within this: a speed bound, not a memory budget; the largest that kept every GB300 case faster.
-_LAMPORT_MAX_DEFAULT_REGION_BYTES = 64 << 20
+_SENTINEL_MAX_DEFAULT_REGION_BYTES = 64 << 20
 
 
-def get_force_lamport() -> bool | None:
-    """``TRTLLM_NVLINK_ONE_SIDED_A2A_LAMPORT``: "0" off, "1" on, unset automatic."""
-    value = os.environ.get(FORCE_LAMPORT_ENV)
-    if value == "0":
-        return False
-    if value == "1":
-        return True
-    return None
+def get_sync_protocol() -> str:
+    """``TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL``: "auto" (also when unset), "fence" or "sentinel"."""
+    value = os.environ.get(SYNC_PROTOCOL_ENV, "").strip().lower() or "auto"
+    if value not in SYNC_PROTOCOLS:
+        raise ValueError(
+            f"{SYNC_PROTOCOL_ENV} must be one of {', '.join(SYNC_PROTOCOLS)}, got {value!r}"
+        )
+    return value
 
 
-def _get_lamport_max_tokens() -> int | None:
-    env_value = os.environ.get(LAMPORT_MAX_TOKENS_ENV)
+def _get_sentinel_max_tokens() -> int | None:
+    env_value = os.environ.get(SENTINEL_MAX_TOKENS_ENV)
     if not env_value:
         return None
     try:
         max_tokens = int(env_value)
     except ValueError as e:
-        raise ValueError(f"{LAMPORT_MAX_TOKENS_ENV} must be an integer") from e
+        raise ValueError(f"{SENTINEL_MAX_TOKENS_ENV} must be an integer") from e
     if max_tokens <= 0:
-        raise ValueError(f"{LAMPORT_MAX_TOKENS_ENV} must be positive")
+        raise ValueError(f"{SENTINEL_MAX_TOKENS_ENV} must be positive")
     return max_tokens
 
 
-def lamport_payload_format(quant_algo: QuantAlgo | None) -> str:
-    """Lamport payload format of the rows MoE backends dispatch for ``quant_algo``.
+def sentinel_payload_format(quant_algo: QuantAlgo | None) -> str:
+    """Sentinel payload format of the rows MoE backends dispatch for ``quant_algo``.
 
     NVFP4 and MXFP8-activation formats dispatch quantized rows with their block
     scales; the others dispatch BF16 activations (FP8 block-scale backends
@@ -101,48 +105,48 @@ def lamport_payload_format(quant_algo: QuantAlgo | None) -> str:
     return "BF16"
 
 
-class LamportRow(NamedTuple):
-    """Row geometry of a Lamport payload format, from the native op."""
+class SentinelRow(NamedTuple):
+    """Row geometry of a sentinel payload format, from the native op."""
 
     hidden_bytes: int  # one token's hidden states
     scale_bytes: int  # one token's scales (0 for BF16)
     blocks_per_token: int  # dispatch blocks per token slot
-    bytes_per_row: int  # Lamport workspace bytes per (source rank, token) row
+    bytes_per_row: int  # sentinel workspace bytes per (source rank, token) row
 
 
-def lamport_row(payload_format: str, hidden_size: int, top_k: int) -> LamportRow:
+def sentinel_row(payload_format: str, hidden_size: int, top_k: int) -> SentinelRow:
     """Raises if the kernels do not take rows of ``hidden_size`` in ``payload_format``."""
-    format_id = int(getattr(_tllm_internal.thop, f"MOE_A2A_LAMPORT_FORMAT_{payload_format}"))
-    return LamportRow(
-        *map(int, torch.ops.trtllm.moe_a2a_lamport_row_bytes(format_id, hidden_size, top_k))
+    format_id = int(getattr(_tllm_internal.thop, f"MOE_A2A_SENTINEL_FORMAT_{payload_format}"))
+    return SentinelRow(
+        *map(int, torch.ops.trtllm.moe_a2a_sentinel_row_bytes(format_id, hidden_size, top_k))
     )
 
 
-def default_lamport_max_tokens(ep_size: int, num_sms: int, row: LamportRow) -> int:
-    """Default token limit of the Lamport transport, in this order of precedence:
+def default_sentinel_max_tokens(ep_size: int, num_sms: int, row: SentinelRow) -> int:
+    """Default token limit of the sentinel transport, in this order of precedence:
 
-    1. at least ``_LAMPORT_MIN_DEFAULT_MAX_TOKENS`` (159);
+    1. at least ``_SENTINEL_MIN_DEFAULT_MAX_TOKENS`` (159);
     2. else the largest step whose dispatch grid stays below one full wave of
        resident blocks (from a full wave on, the fence transport catches up),
        at most the kernels' 512;
-    3. lowered while the Lamport regions (landing, combine and receive rows,
+    3. lowered while the sentinel regions (landing, combine and receive rows,
        ``ep_size * limit`` of them) would exceed
-       ``_LAMPORT_MAX_DEFAULT_REGION_BYTES`` per rank.
+       ``_SENTINEL_MAX_DEFAULT_REGION_BYTES`` per rank.
 
     The caller caps it by ``max_num_tokens_per_rank``.
     """
     thop = _tllm_internal.thop
     below_one_wave = (
-        int(thop.MOE_A2A_LAMPORT_DISPATCH_BLOCKS_PER_SM) * num_sms - 1
+        int(thop.MOE_A2A_SENTINEL_DISPATCH_BLOCKS_PER_SM) * num_sms - 1
     ) // row.blocks_per_token
-    by_region_bytes = _LAMPORT_MAX_DEFAULT_REGION_BYTES // (ep_size * row.bytes_per_row)
+    by_region_bytes = _SENTINEL_MAX_DEFAULT_REGION_BYTES // (ep_size * row.bytes_per_row)
     return max(
-        min(below_one_wave, int(thop.MOE_A2A_LAMPORT_MAX_TOKENS_PER_RANK), by_region_bytes),
-        _LAMPORT_MIN_DEFAULT_MAX_TOKENS,
+        min(below_one_wave, int(thop.MOE_A2A_SENTINEL_MAX_TOKENS_PER_RANK), by_region_bytes),
+        _SENTINEL_MIN_DEFAULT_MAX_TOKENS,
     )
 
 
-def _lamport_unsupported_reason(
+def _sentinel_unsupported_reason(
     *,
     ep_size: int,
     top_k: int,
@@ -153,18 +157,18 @@ def _lamport_unsupported_reason(
     use_low_precision_combine: bool,
     fault_tolerant: bool,
 ) -> str | None:
-    """Why this rank cannot use the Lamport transport, or ``None`` if it can.
+    """Why this rank cannot use the sentinel transport, or ``None`` if it can.
 
-    Never raises: every rank must reach the collective Lamport vote.
+    Never raises: every rank must reach the collective sentinel vote.
     """
     thop = _tllm_internal.thop
     try:
-        if not torch.ops.trtllm.moe_a2a_lamport_available():
+        if not torch.ops.trtllm.moe_a2a_sentinel_available():
             return "its kernels are not built for this GPU (SM100, SM103 and SM107 only)"
-        if ep_size > int(thop.MOE_A2A_LAMPORT_MAX_RANKS):
-            return f"it supports at most {int(thop.MOE_A2A_LAMPORT_MAX_RANKS)} EP ranks"
-        if top_k > int(thop.MOE_A2A_LAMPORT_MAX_TOP_K):
-            return f"it supports top_k <= {int(thop.MOE_A2A_LAMPORT_MAX_TOP_K)}"
+        if ep_size > int(thop.MOE_A2A_SENTINEL_MAX_RANKS):
+            return f"it supports at most {int(thop.MOE_A2A_SENTINEL_MAX_RANKS)} EP ranks"
+        if top_k > int(thop.MOE_A2A_SENTINEL_MAX_TOP_K):
+            return f"it supports top_k <= {int(thop.MOE_A2A_SENTINEL_MAX_TOP_K)}"
         if num_slots % ep_size != 0:
             return "it needs the expert slots to split evenly across EP ranks"
         if dtype != torch.bfloat16:
@@ -175,11 +179,11 @@ def _lamport_unsupported_reason(
             return (
                 "the AlltoAll watchdog and rank-mask recovery observe fence completion flags only"
             )
-        if payload_format not in LAMPORT_PAYLOAD_FORMATS:
+        if payload_format not in SENTINEL_PAYLOAD_FORMATS:
             return f"it does not carry the payload format {payload_format}"
-        lamport_row(payload_format, hidden_size, top_k)
+        sentinel_row(payload_format, hidden_size, top_k)
     except Exception as error:  # CUDA queries and the native row checks alike
-        return f"the Lamport support probe failed: {type(error).__name__}: {error}"
+        return f"the sentinel support probe failed: {type(error).__name__}: {error}"
     return None
 
 
@@ -330,7 +334,7 @@ class NVLinkOneSided(Communication):
         alltoall_watchdog_timeout_s: Optional[float] = None,
         alltoall_watchdog_poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
         alltoall_watchdog_on_timeout: Optional[Callable[[AlltoAllWatchdogTimeout], None]] = None,
-        lamport_payload_format: Optional[str] = None,
+        sentinel_payload_format: Optional[str] = None,
     ) -> None:
         """
         Initialize NVLinkOneSided with workspace allocation.
@@ -338,25 +342,25 @@ class NVLinkOneSided(Communication):
         Steps take the fence transport: payloads, then a system fence and a
         completion flag per peer.
 
-        Small steps can take the Lamport transport instead (moeAlltoAllLamport.h):
+        Small steps can take the sentinel transport instead (moeAlltoAllSentinel.h):
         one dispatch and one combine kernel in which every pushed 16-byte vector
         carries its own arrival, so neither direction waits for a completion
         flag or a system fence. Where every EP rank supports it, it takes every
         step without EPLB statistics whose busiest rank sends at most
-        ``lamport_max_tokens`` tokens and whose payloads are in the instance's
-        ``lamport_payload_format``; the fence transport takes the other
+        ``sentinel_max_tokens`` tokens and whose payloads are in the instance's
+        ``sentinel_payload_format``; the fence transport takes the other
         steps. It needs SM100, SM103 or SM107, at most 64 EP ranks, BF16 expert
         outputs without FP8 combine, expert slots that split evenly across ranks,
         and no AlltoAll watchdog or rank-mask recovery (which observe the fence
-        completion flags). TRTLLM_NVLINK_ONE_SIDED_A2A_LAMPORT=0 turns it off and
-        =1 asks for it (a warning names the reason when it stays off); unset, it
-        is on. TRTLLM_NVLINK_ONE_SIDED_A2A_LAMPORT_MAX_TOKENS sets the token limit,
+        completion flags). TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL=fence turns it
+        off and =sentinel asks for it (a warning names the reason when it stays
+        off); unset or "auto", it is on. TRTLLM_NVLINK_ONE_SIDED_A2A_SENTINEL_MAX_TOKENS sets the token limit,
         which otherwise is the largest step whose dispatch grid stays within one
-        wave of resident blocks and whose Lamport regions (``ep_size * limit``
+        wave of resident blocks and whose sentinel regions (``ep_size * limit``
         landing, combine and receive rows, appended to the workspace) stay within
         64 MiB per rank, clamped to 159..512 tokens and to
         ``max_num_tokens_per_rank``. Every rank votes, so a rank where it is off
-        turns it off everywhere. A Lamport step places the rows it receives from
+        turns it off everywhere. A sentinel step places the rows it receives from
         rank ``src`` for its token ``t`` at ``src * runtime_max_tokens_per_rank + t``
         and gives rows of tokens not routed here invalid expert IDs. Payload
         words equal to the transport's sentinel arrive rewritten to the same
@@ -384,8 +388,8 @@ class NVLinkOneSided(Communication):
                 watchdog is disabled.
             alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
             alltoall_watchdog_on_timeout: Optional callback invoked when the watchdog reports suspects.
-            lamport_payload_format: Dispatch payload format whose small steps the Lamport transport carries,
-                one of LAMPORT_PAYLOAD_FORMATS (see lamport_payload_format()); None means "BF16". Needs
+            sentinel_payload_format: Dispatch payload format whose small steps the sentinel transport carries,
+                one of SENTINEL_PAYLOAD_FORMATS (see sentinel_payload_format()); None means "BF16". Needs
                 hidden_size and dtype.
         """
         super().__init__(mapping)
@@ -437,16 +441,16 @@ class NVLinkOneSided(Communication):
                 self.eplb_stats_num_experts,
                 0,
             )
-        # Largest step of the Lamport transport; 0 when this instance does not use it.
-        self.lamport_max_tokens = 0
-        self._lamport_format: str | None = None
-        self._lamport_row: LamportRow | None = None
+        # Largest step of the sentinel transport; 0 when this instance does not use it.
+        self.sentinel_max_tokens = 0
+        self._sentinel_format: str | None = None
+        self._sentinel_row: SentinelRow | None = None
         if metainfo is not None:
-            self._setup_lamport(
+            self._setup_sentinel(
                 metainfo,
                 hidden_size,
                 dtype,
-                lamport_payload_format or "BF16",
+                sentinel_payload_format or "BF16",
                 fault_tolerant=ep_group_health is not None
                 or alltoall_watchdog_timeout_s is not None,
             )
@@ -608,7 +612,7 @@ class NVLinkOneSided(Communication):
         # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-code to support -1 only.
         self.invalid_token_expert_id: int = -1
 
-    def _setup_lamport(
+    def _setup_sentinel(
         self,
         metainfo: torch.Tensor,
         hidden_size: int,
@@ -616,16 +620,17 @@ class NVLinkOneSided(Communication):
         payload_format: str,
         fault_tolerant: bool,
     ) -> None:
-        """Vote on the Lamport transport and, where every rank takes it, append its regions to ``metainfo``.
+        """Vote on the sentinel transport and, where every rank takes it, append its regions to ``metainfo``.
 
         Collective over the EP group: every rank votes its own decision, its SM
-        count (for the default token limit) and its explicit token limit.
+        count (for the default token limit), its sync protocol and its explicit
+        token limit.
         """
-        requested = get_force_lamport()
+        protocol = get_sync_protocol()
         reason = None
         num_sms = None
-        if requested is not False:
-            reason = _lamport_unsupported_reason(
+        if protocol != "fence":
+            reason = _sentinel_unsupported_reason(
                 ep_size=self.ep_size,
                 top_k=self.top_k,
                 num_slots=self.num_experts,
@@ -639,51 +644,52 @@ class NVLinkOneSided(Communication):
                 num_sms = torch.cuda.get_device_properties(
                     torch.cuda.current_device()
                 ).multi_processor_count
-        max_tokens_request = _get_lamport_max_tokens()
+        max_tokens_request = _get_sentinel_max_tokens()
         votes = MnnvlMemory.get_comm(self.mapping).allgather(
-            (requested is not False and reason is None, num_sms, max_tokens_request)
+            (protocol != "fence" and reason is None, num_sms, protocol, max_tokens_request)
         )
-        if len({vote[2] for vote in votes}) > 1:
-            raise ValueError(
-                f"{LAMPORT_MAX_TOKENS_ENV} must be the same on every EP rank, got "
-                + ", ".join(sorted({repr(vote[2]) for vote in votes}))
-            )
+        for index, env in ((2, SYNC_PROTOCOL_ENV), (3, SENTINEL_MAX_TOKENS_ENV)):
+            if len({vote[index] for vote in votes}) > 1:
+                raise ValueError(
+                    f"{env} must be the same on every EP rank, got "
+                    + ", ".join(sorted({repr(vote[index]) for vote in votes}))
+                )
         if not all(vote[0] for vote in votes):
-            if requested is not False:
-                log = tllm_logger.warning if requested else tllm_logger.info
+            if protocol != "fence":
+                log = tllm_logger.warning if protocol == "sentinel" else tllm_logger.info
                 log(
-                    "NVLinkOneSided AlltoAll: Lamport transport disabled: "
+                    "NVLinkOneSided AlltoAll: sentinel transport disabled: "
                     f"{reason or 'another EP rank does not support it or turned it off'}"
                 )
             return
 
         thop = _tllm_internal.thop
-        row = lamport_row(payload_format, hidden_size, self.top_k)
+        row = sentinel_row(payload_format, hidden_size, self.top_k)
         if max_tokens_request is None:
-            max_tokens = default_lamport_max_tokens(
+            max_tokens = default_sentinel_max_tokens(
                 self.ep_size, min(vote[1] for vote in votes), row
             )
         else:
-            max_tokens = min(max_tokens_request, int(thop.MOE_A2A_LAMPORT_MAX_TOKENS_PER_RANK))
+            max_tokens = min(max_tokens_request, int(thop.MOE_A2A_SENTINEL_MAX_TOKENS_PER_RANK))
         max_tokens = min(max_tokens, self.max_num_tokens_per_rank)
         size_before = int(metainfo[self.WORKSPACE_SIZE_INDEX])
-        torch.ops.trtllm.moe_a2a_lamport_extend_workspace_layout(
+        torch.ops.trtllm.moe_a2a_sentinel_extend_workspace_layout(
             metainfo,
             max_tokens,
-            int(getattr(thop, f"MOE_A2A_LAMPORT_FORMAT_{payload_format}")),
+            int(getattr(thop, f"MOE_A2A_SENTINEL_FORMAT_{payload_format}")),
             hidden_size,
         )
-        self.lamport_max_tokens = max_tokens
-        self._lamport_format = payload_format
-        self._lamport_row = row
+        self.sentinel_max_tokens = max_tokens
+        self._sentinel_format = payload_format
+        self._sentinel_row = row
         tllm_logger.info(
-            f"NVLinkOneSided AlltoAll: Lamport transport for {payload_format} steps of up to "
+            f"NVLinkOneSided AlltoAll: sentinel transport for {payload_format} steps of up to "
             f"{max_tokens} tokens per rank, "
             f"{(int(metainfo[self.WORKSPACE_SIZE_INDEX]) - size_before) / (1 << 20):.1f} MiB "
             "of workspace per rank"
         )
 
-    def use_lamport_for_dispatch(
+    def use_sentinel_for_dispatch(
         self,
         runtime_max_tokens_per_rank: int,
         hidden_states: torch.Tensor,
@@ -691,16 +697,16 @@ class NVLinkOneSided(Communication):
         token_final_scales: Optional[torch.Tensor],
         eplb_local_stats: Optional[torch.Tensor],
     ) -> bool:
-        """Whether the Lamport transport carries this step: few enough tokens, no
+        """Whether the sentinel transport carries this step: few enough tokens, no
         EPLB statistics and payloads in the instance's format.
 
         Depends only on values every rank passes alike, so all ranks take the
         same transport.
         """
-        row = self._lamport_row
+        row = self._sentinel_row
         if (
             row is None
-            or runtime_max_tokens_per_rank > self.lamport_max_tokens
+            or runtime_max_tokens_per_rank > self.sentinel_max_tokens
             or eplb_local_stats is not None
         ):
             return False
@@ -717,7 +723,7 @@ class NVLinkOneSided(Communication):
             return False
         # Senders rewrite payload words equal to a sentinel the way the format
         # keeps its values (NaN stays NaN), so the dtype must be the format's.
-        if self._lamport_format == "BF16":
+        if self._sentinel_format == "BF16":
             if hidden_states.dtype != torch.bfloat16:
                 return False
         elif hidden_states.element_size() != 1:  # quantized values are bytes
@@ -912,9 +918,9 @@ class NVLinkOneSided(Communication):
         # Calculate runtime_max_tokens_per_rank from all_rank_num_tokens
         runtime_max_tokens_per_rank = max(all_rank_num_tokens)
         eplb_local_stats = kwargs.get("eplb_local_stats")
-        # The Lamport transport takes every step it can carry: its combine receives and
+        # The sentinel transport takes every step it can carry: its combine receives and
         # reduces each token in the same kernel as it lands.
-        use_lamport = self.use_lamport_for_dispatch(
+        use_sentinel = self.use_sentinel_for_dispatch(
             runtime_max_tokens_per_rank,
             hidden_states,
             hidden_states_sf,
@@ -961,16 +967,16 @@ class NVLinkOneSided(Communication):
                 self.top_k,
                 self.num_experts,
                 eplb_local_stats,
-                # A Lamport dispatch fills the expert IDs of rows without a token itself.
-                expert_id_payload_index if use_lamport else None,
-                int(self.invalid_token_expert_id) if use_lamport else None,
+                # A sentinel dispatch fills the expert IDs of rows without a token itself.
+                expert_id_payload_index if use_sentinel else None,
+                int(self.invalid_token_expert_id) if use_sentinel else None,
                 self._rank_mask_enabled,
                 active_rank_mask,
-                use_lamport,
+                use_sentinel,
             )
         )
-        # A Lamport round writes no completion flags for the watchdog to observe.
-        if not use_lamport:
+        # A sentinel round writes no completion flags for the watchdog to observe.
+        if not use_sentinel:
             self._watchdog_coordinator.watch_collective(
                 self._alltoall_watchdog, "dispatch", active_rank_mask
             )
@@ -981,7 +987,7 @@ class NVLinkOneSided(Communication):
         self._dispatch_state["local_num_tokens"] = token_selected_slots.size(0)
         self._dispatch_state["runtime_max_tokens_per_rank"] = runtime_max_tokens_per_rank
         self._dispatch_state["active_rank_mask_snapshot"] = active_rank_mask_snapshot
-        self._dispatch_state["lamport"] = use_lamport
+        self._dispatch_state["sentinel"] = use_sentinel
         self._dispatch_state["phase"] = "dispatched"
 
         # Extract results from recv_buffers
@@ -997,7 +1003,7 @@ class NVLinkOneSided(Communication):
             token_selected_slots_recv = recv_buffers[1]
             token_final_scales_recv = recv_buffers[2] if token_final_scales is not None else None
 
-        if not use_lamport:
+        if not use_sentinel:
             torch.ops.trtllm.moe_a2a_sanitize_expert_ids(
                 token_selected_slots_recv,
                 self.workspace,
@@ -1094,8 +1100,8 @@ class NVLinkOneSided(Communication):
             active_rank_mask_snapshot,
             requested_active_rank_mask,
         )
-        # A Lamport dispatch is followed by a Lamport combine.
-        use_lamport = bool(self._dispatch_state.get("lamport", False))
+        # A sentinel dispatch is followed by a sentinel combine.
+        use_sentinel = bool(self._dispatch_state.get("sentinel", False))
         output = torch.ops.trtllm.moe_a2a_combine(
             final_hidden_states,
             int(local_num_tokens),
@@ -1110,9 +1116,9 @@ class NVLinkOneSided(Communication):
             bool(self.use_low_precision_combine),
             self._rank_mask_enabled,
             active_rank_mask,
-            use_lamport,
+            use_sentinel,
         )
-        if not use_lamport:
+        if not use_sentinel:
             self._watchdog_coordinator.watch_collective(
                 self._alltoall_watchdog, "combine", active_rank_mask
             )

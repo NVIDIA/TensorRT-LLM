@@ -833,7 +833,7 @@ def _register_fake():
         invalid_token_expert_id: Optional[int] = None,
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
-        use_lamport: bool = False,
+        use_sentinel: bool = False,
     ) -> Tuple[List[torch.Tensor], int, torch.Tensor]:
         recv_tensors: List[torch.Tensor] = []
         for payload in input_payloads:
@@ -866,7 +866,7 @@ def _register_fake():
         use_low_precision: bool = False,
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
-        use_lamport: bool = False,
+        use_sentinel: bool = False,
     ) -> torch.Tensor:
         return payload.new_empty((local_num_tokens, payload.shape[2]))
 

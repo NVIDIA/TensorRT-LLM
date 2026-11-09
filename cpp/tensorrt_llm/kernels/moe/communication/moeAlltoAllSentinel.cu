@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
-// Kernels and launchers of the Lamport transport of the NVLink one-sided MoE all-to-all. The
-// protocol is described in moeAlltoAllLamport.h.
+// Kernels and launchers of the sentinel transport of the NVLink one-sided MoE all-to-all. The
+// protocol is described in moeAlltoAllSentinel.h.
 
 #include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/kernels/moe/communication/moeAlltoAllLamport.h"
+#include "tensorrt_llm/kernels/moe/communication/moeAlltoAllSentinel.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -27,22 +27,22 @@
 #include <cstdio>
 
 // The kernels are built for compute capability 10.0, 10.3 and 10.7, where the transport is validated.
-// Other architectures get kernels that trap, and moe_a2a_lamport_kernels_available() is false.
+// Other architectures get kernels that trap, and moe_a2a_sentinel_kernels_available() is false.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070)
-#define MOE_A2A_LAMPORT_COMPILE 1
+#define MOE_A2A_SENTINEL_COMPILE 1
 #else
-#define MOE_A2A_LAMPORT_COMPILE 0
+#define MOE_A2A_SENTINEL_COMPILE 0
 #endif
 
 TRTLLM_NAMESPACE_BEGIN
 
-namespace kernels::moe_comm::lamport
+namespace kernels::moe_comm::sentinel
 {
 
 namespace
 {
 
-#if MOE_A2A_LAMPORT_COMPILE
+#if MOE_A2A_SENTINEL_COMPILE
 // ================================================================================ PTX helpers
 __device__ __forceinline__ uint4 load_volatile(void const* ptr)
 {
@@ -84,9 +84,9 @@ __device__ __forceinline__ uint4 splat(uint32_t word)
     return make_uint4(word, word, word, word);
 }
 
-__device__ __forceinline__ bool has_arrived(uint4 v, uint32_t sentinel)
+__device__ __forceinline__ bool has_arrived(uint4 v, uint32_t sentinel_word)
 {
-    return v.x != sentinel && v.y != sentinel && v.z != sentinel && v.w != sentinel;
+    return v.x != sentinel_word && v.y != sentinel_word && v.z != sentinel_word && v.w != sentinel_word;
 }
 
 // Row (source, token) of the landing regions: a token slot's rows from every source are adjacent.
@@ -100,7 +100,7 @@ __device__ __forceinline__ int64_t landing_row(int ep_size, int source, int toke
 // start of every spin (e.g. to re-read address(i)'s inputs from shared memory, all before the
 // first load). Returns the bits still pending when the wait timed out (0: all arrived).
 template <int NUM_VECTORS, typename BeforeEachSpin, typename Address>
-__device__ __forceinline__ uint32_t poll_until_arrived(uint32_t pending, uint32_t sentinel,
+__device__ __forceinline__ uint32_t poll_until_arrived(uint32_t pending, uint32_t sentinel_word,
     BeforeEachSpin const& before_each_spin, Address const& address, uint4 (&vectors)[NUM_VECTORS], long long wait_start,
     int64_t timeout_cycles)
 {
@@ -113,7 +113,7 @@ __device__ __forceinline__ uint32_t poll_until_arrived(uint32_t pending, uint32_
                 vectors[i] = load_volatile(address(i));
 #pragma unroll
         for (int i = 0; i < NUM_VECTORS; ++i)
-            if (((pending >> i) & 1u) && has_arrived(vectors[i], sentinel))
+            if (((pending >> i) & 1u) && has_arrived(vectors[i], sentinel_word))
                 pending &= ~(1u << i);
         if (pending && spins % 64 == 0 && clock64() - wait_start > timeout_cycles)
             break;
@@ -127,7 +127,7 @@ __device__ __forceinline__ uint32_t poll_until_arrived(uint32_t pending, uint32_
 [[noreturn]] static __device__ __noinline__ void report_and_trap(int32_t* round_state, int ep_rank, char const* what)
 {
     if (atomicExch(round_state + kTimeoutReported, 1) == 0)
-        printf("Lamport transport: rank %d %s\n", ep_rank, what);
+        printf("sentinel transport: rank %d %s\n", ep_rank, what);
     __threadfence_system();
     __trap();
 }
@@ -581,14 +581,15 @@ __device__ __forceinline__ void receive_token_slot(DispatchParams const& p, int 
     if (timed_out)
         report_and_trap(p.round_state, p.ep_rank, "timed out waiting for a peer (dispatch)");
 }
-#endif // MOE_A2A_LAMPORT_COMPILE
+#endif // MOE_A2A_SENTINEL_COMPILE
 
 // ============================================================================= dispatch kernel
 // Any payload format and top-k (fixed at compile time, or at most TOP_K_CAPACITY).
 template <int TOP_K_CAPACITY, bool FIXED_TOP_K, int PAYLOAD_KIND, bool ENABLE_RANK_MASK>
-__global__ void __launch_bounds__(kNumThreads, kDispatchBlocksPerSM) moeA2ALamportDispatchKernel(DispatchParams const p)
+__global__ void __launch_bounds__(kNumThreads, kDispatchBlocksPerSM)
+    moeA2ASentinelDispatchKernel(DispatchParams const p)
 {
-#if MOE_A2A_LAMPORT_COMPILE
+#if MOE_A2A_SENTINEL_COMPILE
     constexpr int kRowCapacity = topk_row_vectors(TOP_K_CAPACITY);
     int const top_k = FIXED_TOP_K ? TOP_K_CAPACITY : p.top_k;
     int const ids_row_vectors = topk_row_vectors(top_k);
@@ -635,11 +636,11 @@ __global__ void __launch_bounds__(kNumThreads, kDispatchBlocksPerSM) moeA2ALampo
     receive_token_slot<PAYLOAD_KIND, ENABLE_RANK_MASK>(
         p, top_k, ids_row_vectors, token, chunk, vec, target_mask, ids_set_offset, s_recv_source_mask);
 #else
-    __trap(); // not built for this architecture (see MOE_A2A_LAMPORT_COMPILE)
+    __trap(); // not built for this architecture (see MOE_A2A_SENTINEL_COMPILE)
 #endif
 }
 
-#if MOE_A2A_LAMPORT_COMPILE
+#if MOE_A2A_SENTINEL_COMPILE
 // ============================================================================= combine phases
 // C1, warp 0: the ranks of the token's target slots (topk_target_ranks >= 0) in top-k slot
 // order into s_sources[0, n); lane 0 stores n.
@@ -811,13 +812,13 @@ __device__ __forceinline__ void rearm_ids_and_advance_epoch(
         }
     }
 }
-#endif // MOE_A2A_LAMPORT_COMPILE
+#endif // MOE_A2A_SENTINEL_COMPILE
 
 // ============================================================================== combine kernel
 template <int TOP_K_CAPACITY, bool FIXED_TOP_K, bool ENABLE_RANK_MASK>
-__global__ void __launch_bounds__(kNumThreads) moeA2ALamportCombineKernel(CombineParams const p)
+__global__ void __launch_bounds__(kNumThreads) moeA2ASentinelCombineKernel(CombineParams const p)
 {
-#if MOE_A2A_LAMPORT_COMPILE
+#if MOE_A2A_SENTINEL_COMPILE
     constexpr int kNumGroups = (TOP_K_CAPACITY + 7) / 8;
     int const top_k = FIXED_TOP_K ? TOP_K_CAPACITY : p.top_k;
     int const token = blockIdx.x / p.blocks_per_token, chunk = blockIdx.x % p.blocks_per_token;
@@ -857,65 +858,65 @@ __global__ void __launch_bounds__(kNumThreads) moeA2ALamportCombineKernel(Combin
         report_and_trap(p.round_state, p.ep_rank, "timed out waiting for a peer (combine)");
     rearm_ids_and_advance_epoch(p, token, chunk, topk_row_vectors(top_k), s_landing_set); // C4
 #else
-    __trap(); // not built for this architecture (see MOE_A2A_LAMPORT_COMPILE)
+    __trap(); // not built for this architecture (see MOE_A2A_SENTINEL_COMPILE)
 #endif
 }
 
 // Runs the statements __VA_ARGS__ with TOP_K_CAPACITY and FIXED_TOP_K of the kernels serving
 // top_k: top_k 6, 8, 10, 16 and 22 have their own kernels, the others share a kernel with a
 // runtime top_k of at most 8, 16 or 24.
-#define MOE_A2A_LAMPORT_TOP_K_CASE(CAPACITY, FIXED, ...)                                                               \
+#define MOE_A2A_SENTINEL_TOP_K_CASE(CAPACITY, FIXED, ...)                                                              \
     {                                                                                                                  \
         constexpr int TOP_K_CAPACITY = CAPACITY;                                                                       \
         constexpr bool FIXED_TOP_K = FIXED;                                                                            \
         __VA_ARGS__;                                                                                                   \
     }
-#define MOE_A2A_LAMPORT_SWITCH_TOP_K(top_k, ...)                                                                       \
+#define MOE_A2A_SENTINEL_SWITCH_TOP_K(top_k, ...)                                                                      \
     if ((top_k) == 6)                                                                                                  \
-        MOE_A2A_LAMPORT_TOP_K_CASE(6, true, __VA_ARGS__)                                                               \
+        MOE_A2A_SENTINEL_TOP_K_CASE(6, true, __VA_ARGS__)                                                              \
     else if ((top_k) == 8)                                                                                             \
-        MOE_A2A_LAMPORT_TOP_K_CASE(8, true, __VA_ARGS__)                                                               \
+        MOE_A2A_SENTINEL_TOP_K_CASE(8, true, __VA_ARGS__)                                                              \
     else if ((top_k) == 10)                                                                                            \
-        MOE_A2A_LAMPORT_TOP_K_CASE(10, true, __VA_ARGS__)                                                              \
+        MOE_A2A_SENTINEL_TOP_K_CASE(10, true, __VA_ARGS__)                                                             \
     else if ((top_k) == 16)                                                                                            \
-        MOE_A2A_LAMPORT_TOP_K_CASE(16, true, __VA_ARGS__)                                                              \
+        MOE_A2A_SENTINEL_TOP_K_CASE(16, true, __VA_ARGS__)                                                             \
     else if ((top_k) == 22)                                                                                            \
-        MOE_A2A_LAMPORT_TOP_K_CASE(22, true, __VA_ARGS__)                                                              \
+        MOE_A2A_SENTINEL_TOP_K_CASE(22, true, __VA_ARGS__)                                                             \
     else if ((top_k) <= 8)                                                                                             \
-        MOE_A2A_LAMPORT_TOP_K_CASE(8, false, __VA_ARGS__)                                                              \
+        MOE_A2A_SENTINEL_TOP_K_CASE(8, false, __VA_ARGS__)                                                             \
     else if ((top_k) <= 16)                                                                                            \
-        MOE_A2A_LAMPORT_TOP_K_CASE(16, false, __VA_ARGS__)                                                             \
+        MOE_A2A_SENTINEL_TOP_K_CASE(16, false, __VA_ARGS__)                                                            \
     else                                                                                                               \
-        MOE_A2A_LAMPORT_TOP_K_CASE(24, false, __VA_ARGS__)
+        MOE_A2A_SENTINEL_TOP_K_CASE(24, false, __VA_ARGS__)
 
 using tensorrt_llm::common::launchWithPdlWhenEnabled;
 
 // 1 in the code built for an architecture the kernels support.
-__device__ int g_kernels_compiled = MOE_A2A_LAMPORT_COMPILE;
+__device__ int g_kernels_compiled = MOE_A2A_SENTINEL_COMPILE;
 
 template <int TOP_K_CAPACITY, bool FIXED_TOP_K, bool ENABLE_RANK_MASK>
 void launch_dispatch(int payload_kind, DispatchParams const& params, cudaStream_t stream)
 {
     void (*kernel)(DispatchParams) = payload_kind == kKindBf16
-        ? moeA2ALamportDispatchKernel<TOP_K_CAPACITY, FIXED_TOP_K, kKindBf16, ENABLE_RANK_MASK>
+        ? moeA2ASentinelDispatchKernel<TOP_K_CAPACITY, FIXED_TOP_K, kKindBf16, ENABLE_RANK_MASK>
         : payload_kind == kKindFp8
-        ? moeA2ALamportDispatchKernel<TOP_K_CAPACITY, FIXED_TOP_K, kKindFp8, ENABLE_RANK_MASK>
-        : moeA2ALamportDispatchKernel<TOP_K_CAPACITY, FIXED_TOP_K, kKindNvfp4, ENABLE_RANK_MASK>;
-    launchWithPdlWhenEnabled("moeA2ALamportDispatchKernel", kernel,
+        ? moeA2ASentinelDispatchKernel<TOP_K_CAPACITY, FIXED_TOP_K, kKindFp8, ENABLE_RANK_MASK>
+        : moeA2ASentinelDispatchKernel<TOP_K_CAPACITY, FIXED_TOP_K, kKindNvfp4, ENABLE_RANK_MASK>;
+    launchWithPdlWhenEnabled("moeA2ASentinelDispatchKernel", kernel,
         dim3(params.max_tokens_per_rank * params.blocks_per_token), dim3(kNumThreads), 0, stream, params);
 }
 
 template <int TOP_K_CAPACITY, bool FIXED_TOP_K, bool ENABLE_RANK_MASK>
 void launch_combine(CombineParams const& params, cudaStream_t stream)
 {
-    launchWithPdlWhenEnabled("moeA2ALamportCombineKernel",
-        moeA2ALamportCombineKernel<TOP_K_CAPACITY, FIXED_TOP_K, ENABLE_RANK_MASK>,
+    launchWithPdlWhenEnabled("moeA2ASentinelCombineKernel",
+        moeA2ASentinelCombineKernel<TOP_K_CAPACITY, FIXED_TOP_K, ENABLE_RANK_MASK>,
         dim3(params.max_tokens_per_rank * params.blocks_per_token), dim3(kNumThreads), 0, stream, params);
 }
 
 } // namespace
 
-bool moe_a2a_lamport_kernels_available()
+bool moe_a2a_sentinel_kernels_available()
 {
     int compiled = 0;
     if (cudaMemcpyFromSymbol(&compiled, g_kernels_compiled, sizeof(compiled)) != cudaSuccess)
@@ -926,10 +927,10 @@ bool moe_a2a_lamport_kernels_available()
     return compiled != 0;
 }
 
-void moe_a2a_lamport_dispatch_launch(
+void moe_a2a_sentinel_dispatch_launch(
     int payload_kind, DispatchParams const& params, bool enable_rank_mask, cudaStream_t stream)
 {
-    MOE_A2A_LAMPORT_SWITCH_TOP_K(params.top_k, {
+    MOE_A2A_SENTINEL_SWITCH_TOP_K(params.top_k, {
         if (enable_rank_mask)
         {
             launch_dispatch<TOP_K_CAPACITY, FIXED_TOP_K, true>(payload_kind, params, stream);
@@ -941,9 +942,9 @@ void moe_a2a_lamport_dispatch_launch(
     })
 }
 
-void moe_a2a_lamport_combine_launch(CombineParams const& params, bool enable_rank_mask, cudaStream_t stream)
+void moe_a2a_sentinel_combine_launch(CombineParams const& params, bool enable_rank_mask, cudaStream_t stream)
 {
-    MOE_A2A_LAMPORT_SWITCH_TOP_K(params.top_k, {
+    MOE_A2A_SENTINEL_SWITCH_TOP_K(params.top_k, {
         if (enable_rank_mask)
         {
             launch_combine<TOP_K_CAPACITY, FIXED_TOP_K, true>(params, stream);
@@ -955,6 +956,6 @@ void moe_a2a_lamport_combine_launch(CombineParams const& params, bool enable_ran
     })
 }
 
-} // namespace kernels::moe_comm::lamport
+} // namespace kernels::moe_comm::sentinel
 
 TRTLLM_NAMESPACE_END
