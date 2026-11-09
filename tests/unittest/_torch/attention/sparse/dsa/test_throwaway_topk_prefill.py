@@ -23,7 +23,10 @@ rounded to the logits storage dtype first). The dispatch tests run on CPU with a
 ``THROWAWAY_TOPK_TEST_LARGE=1`` adds the 64K/128K-key shapes, which need minutes of JIT time.
 """
 
+import gc
+import itertools
 import os
+import weakref
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Optional
@@ -789,6 +792,11 @@ _RUNNER_ARGS = dict(
 )
 
 
+def _fresh_runner_cache(monkeypatch):
+    monkeypatch.setattr(throwaway_topk_module, "_RUNNERS", weakref.WeakValueDictionary())
+    monkeypatch.setattr(throwaway_topk_module, "_FAILED", set())
+
+
 def test_runner_is_shared_per_configuration(monkeypatch):
     built = []
 
@@ -797,11 +805,30 @@ def test_runner_is_shared_per_configuration(monkeypatch):
             built.append(kwargs)
 
     monkeypatch.setattr(throwaway_topk_module, "ThrowawayPrefillTopK", _Runner)
-    monkeypatch.setattr(throwaway_topk_module, "_RUNNERS", {})
+    _fresh_runner_cache(monkeypatch)
     first = get_throwaway_prefill_topk(**_RUNNER_ARGS)
     assert get_throwaway_prefill_topk(**_RUNNER_ARGS) is first  # every layer gets one runner
     other = get_throwaway_prefill_topk(**{**_RUNNER_ARGS, "qkv_dtype": "mxfp4"})
     assert other is not first
+    assert len(built) == 2
+
+
+def test_runner_is_released_with_the_model(monkeypatch):
+    """The cache does not keep a runner (and its GPU buffers) alive once no layer holds it."""
+    built = []
+
+    class _Runner:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+
+    monkeypatch.setattr(throwaway_topk_module, "ThrowawayPrefillTopK", _Runner)
+    _fresh_runner_cache(monkeypatch)
+    runner = get_throwaway_prefill_topk(**_RUNNER_ARGS)
+    released = weakref.ref(runner)
+    del runner  # the model and its indexers are gone
+    gc.collect()
+    assert released() is None
+    assert get_throwaway_prefill_topk(**_RUNNER_ARGS) is not None  # a new model builds anew
     assert len(built) == 2
 
 
@@ -818,7 +845,7 @@ def test_runner_rejects_unvalidated_geometries(monkeypatch, geometry):
     monkeypatch.setattr(
         throwaway_topk_module, "ThrowawayPrefillTopK", lambda **kwargs: built.append(kwargs)
     )
-    monkeypatch.setattr(throwaway_topk_module, "_RUNNERS", {})
+    _fresh_runner_cache(monkeypatch)
     monkeypatch.setattr(throwaway_topk_module.logger, "warning", warnings.append)
     args = {**_RUNNER_ARGS, **geometry}
     assert get_throwaway_prefill_topk(**args) is None
@@ -836,12 +863,42 @@ def test_runner_build_failure_is_cached(monkeypatch):
             raise ValueError("unsupported geometry")
 
     monkeypatch.setattr(throwaway_topk_module, "ThrowawayPrefillTopK", _Unsupported)
-    monkeypatch.setattr(throwaway_topk_module, "_RUNNERS", {})
+    _fresh_runner_cache(monkeypatch)
     monkeypatch.setattr(throwaway_topk_module.logger, "warning", warnings.append)
     assert get_throwaway_prefill_topk(**_RUNNER_ARGS) is None
     assert get_throwaway_prefill_topk(**_RUNNER_ARGS) is None
     assert len(built) == 1
     assert len(warnings) == 1
+
+
+def _chunk_metadata(cached, new_tokens, compress_ratio):
+    """Host-side fields of the attention metadata that prepare_one_prefill_chunk reads."""
+
+    def indptr(values):
+        return torch.tensor([0] + list(itertools.accumulate(values)), dtype=torch.int32)
+
+    return SimpleNamespace(
+        cu_seqlen_ks=torch.zeros(1, dtype=torch.int32),
+        compress_ratios=[compress_ratio],
+        host_ctx_cached_token_indptr=indptr(cached),
+        host_ctx_kv_indptr=indptr([c + n for c, n in zip(cached, new_tokens)]),
+    )
+
+
+def test_prepare_one_prefill_chunk_sets_kv_prefix_len():
+    """kv_prefix_len counts original (uncompressed) tokens, cached ones included, and matches the
+    compressed causal window the unfused path derives from cu_seqlen_ke."""
+    ratio, cached, new_tokens = 4, [37, 1000], [50, 300]
+    metadata = _chunk_metadata(cached, new_tokens, ratio)
+    # Q block [120, 250) of request 1, whose tokens start at 50 in the batch.
+    chunk = Indexer.prepare_one_prefill_chunk(metadata, [(1, 120, 250, 50)])
+    assert chunk.kv_prefix_len == 1000 + 120
+    rows = torch.arange(250 - 120)
+    assert torch.equal(chunk.cu_seqlen_ke.cpu(), ((chunk.kv_prefix_len + rows + 1) // ratio).int())
+    assert chunk.k_token_end - chunk.k_token_start == (1000 + 250) // ratio
+    # Several whole requests in one chunk: not eligible for the fused path.
+    multi = Indexer.prepare_one_prefill_chunk(metadata, [(0, 0, 50, 0), (1, 0, 300, 50)])
+    assert multi.kv_prefix_len is None
 
 
 def test_dispatch_slices_rows_and_shifts_prefix():

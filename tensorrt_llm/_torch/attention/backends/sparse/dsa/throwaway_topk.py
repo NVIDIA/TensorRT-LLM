@@ -24,7 +24,8 @@ are eligible; everything else keeps using the existing path.
 from __future__ import annotations
 
 import os
-from typing import Dict, Optional, Tuple
+import weakref
+from typing import Dict, Optional, Set, Tuple
 
 import torch
 
@@ -93,7 +94,7 @@ def throwaway_topk_supported(n_heads: int, head_dim: int) -> bool:
 class ThrowawayPrefillTopK:
     """Runs the fused indexer + Top-K for single-request prefill chunks.
 
-    One instance is shared by all layers of a process. The kernel binds K by device
+    One instance is shared by all layers of a model. The kernel binds K by device
     pointer, so gathered keys are copied into one persistent staging buffer and a single
     binding serves every layer and chunk.
     """
@@ -304,12 +305,16 @@ class ThrowawayPrefillTopK:
         torch.cuda.empty_cache()
 
 
-# One runner per (geometry, max length, device), shared by every layer of the process. The
-# runner owns the K staging buffers, the selected-index buffer and the kernel workspace; keeping
-# one per layer would multiply that memory by the number of indexer layers. A failed build is
-# cached as None so the fallback warning is logged once.
+# One runner per (geometry, max length, device), shared by every layer of a model. The runner owns
+# the K staging buffers, the selected-index buffer and the kernel workspace; keeping one per layer
+# would multiply that memory by the number of indexer layers. The layers' indexers hold the
+# runner, so it is referenced weakly here and released with the model. Configurations that failed
+# to build are remembered by key so the fallback warning is logged once.
 _RunnerKey = Tuple[int, int, int, int, str, str]
-_RUNNERS: Dict[_RunnerKey, Optional[ThrowawayPrefillTopK]] = {}
+_RUNNERS: "weakref.WeakValueDictionary[_RunnerKey, ThrowawayPrefillTopK]" = (
+    weakref.WeakValueDictionary()
+)
+_FAILED: Set[_RunnerKey] = set()
 
 
 def get_throwaway_prefill_topk(
@@ -321,20 +326,24 @@ def get_throwaway_prefill_topk(
     device: torch.device,
     qkv_dtype: str = "fp8",
 ) -> Optional[ThrowawayPrefillTopK]:
-    """Returns the process-wide runner for this configuration, building it on first use.
+    """Returns the runner shared by the live layers for this configuration, building it on
+    first use.
 
     Returns None (after one warning) if the kernels do not support the configuration.
     """
     key = (n_heads, index_topk, compress_ratio, max_context_length, str(device), qkv_dtype)
-    if key in _RUNNERS:
-        return _RUNNERS[key]
+    if key in _FAILED:
+        return None
+    runner = _RUNNERS.get(key)
+    if runner is not None:
+        return runner
     if (n_heads, index_topk, compress_ratio) not in _VALIDATED_GEOMETRIES:
         logger.warning(
             f"{THROWAWAY_TOPK_ENV}=1 but the fused throwaway Top-K is not validated for "
             f"heads={n_heads}, top_k={index_topk}, compress_ratio={compress_ratio}; "
             "using the unfused indexer + Top-K path"
         )
-        _RUNNERS[key] = None
+        _FAILED.add(key)
         return None
     try:
         runner = ThrowawayPrefillTopK(
@@ -352,6 +361,7 @@ def get_throwaway_prefill_topk(
             f"qkv_dtype={qkv_dtype}: {error}; "
             "using the unfused indexer + Top-K path"
         )
-        runner = None
+        _FAILED.add(key)
+        return None
     _RUNNERS[key] = runner
     return runner
