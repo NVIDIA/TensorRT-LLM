@@ -2881,26 +2881,23 @@ def test_v2_hybrid_fp4_mla_snapshot_realignment_logs_once(
 
     messages = []
     monkeypatch.setattr(mamba_cache_manager_v2.logger, "info", messages.append)
-    mgr = SimpleNamespace(
-        _attention_cache_layout_policy=object(),
-        tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
-        _fp4_mla_snapshot_realignment_logged=False,
-    )
-    align = MambaHybridCacheManagerV2._align_fp4_mla_snapshot_points
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._attention_cache_layout_policy = object()
+    mgr.tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
 
     aligned = SimpleNamespace(py_request_id=1, expect_snapshot_points=[128, 256])
-    align(mgr, aligned)
+    mgr._align_snapshot_points(aligned)
     assert aligned.expect_snapshot_points == [128, 256]
     assert messages == []
 
     moved = SimpleNamespace(py_request_id=2, expect_snapshot_points=[100, 1000])
-    align(mgr, moved)
+    mgr._align_snapshot_points(moved)
     assert moved.expect_snapshot_points == [896]
     assert len(messages) == 1
     assert "[100, 1000] -> [896]" in messages[0]
 
     again = SimpleNamespace(py_request_id=3, expect_snapshot_points=[300])
-    align(mgr, again)
+    mgr._align_snapshot_points(again)
     assert again.expect_snapshot_points == [256]
     assert len(messages) == 1
 

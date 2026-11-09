@@ -41,6 +41,38 @@ from .accuracy_core import (
     assert_kv_cache_reuse_for_llm,
 )
 
+# KDA recurrent state is snapshotted every SNAPSHOT_INTERVAL tokens, and under
+# aggregated Helix a reused prefix ends on a ledger block of
+# tokens_per_block x cp_size tokens.
+SNAPSHOT_INTERVAL = 256
+HELIX_TOKENS_PER_BLOCK = 64
+HELIX_CP_SIZE = 2
+LEDGER_TOKENS = HELIX_TOKENS_PER_BLOCK * HELIX_CP_SIZE
+
+
+def _assert_helix_reuse_blocks(llm: LLM, prompt_len: int) -> None:
+    """Cold-then-warm run of a fresh prompt; check how deep the warm run reuses.
+
+    A KDA state is reusable only at a snapshot point, and a reused prefix must
+    end on a ledger block. The deepest usable point is the last multiple of
+    SNAPSHOT_INTERVAL strictly before the prompt end, so a prompt not longer
+    than one interval reuses nothing. Token output is not compared: greedy
+    decoding is not run-to-run deterministic on this config even without reuse.
+    """
+    # Distinct tokens per length so no earlier probe shares a prefix with this one.
+    prompt = [prompt_len] + [1000 + prompt_len] * (prompt_len - 2) + [2000 + prompt_len]
+    sampling_params = SamplingParams(
+        max_tokens=8, temperature=0, end_id=-1, return_perf_metrics=True
+    )
+    reused = []
+    for _ in range(2):  # cold, then warm
+        out = llm.generate([prompt], sampling_params=sampling_params, use_tqdm=False)[0]
+        reused.append(out.outputs[0].request_perf_metrics.kv_cache_metrics.num_reused_blocks)
+    expected = (prompt_len - 1) // SNAPSHOT_INTERVAL * (SNAPSHOT_INTERVAL // LEDGER_TOKENS)
+    assert reused == [0, expected], (
+        f"prompt_len={prompt_len}: reused blocks (cold, warm) {reused}, expected [0, {expected}]"
+    )
+
 
 @pytest.mark.timeout(10800)
 class TestKimiK3(LlmapiAccuracyTestHarness):
@@ -324,6 +356,95 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.skip_less_device_memory(250000)
+    @pytest.mark.parametrize(
+        "kv_cache_dtype,mode",
+        [("auto", "reuse"), ("fp8", "reuse"), ("fp8", "reuse_preempt")],
+        ids=["auto-reuse", "fp8-reuse", "fp8-reuse_preempt"],
+    )
+    def test_gsm8k_nvfp4_tp4_helix2_block_reuse(self, kv_cache_dtype: str, mode: str) -> None:
+        """Full GSM8K with block reuse on aggregated Helix (TP4 x CP2).
+
+        Same engine as test_gsm8k_nvfp4_tp4_helix2 with block reuse on, held to
+        the same GSM8K reference. KDA state is reusable only at snapshot points,
+        and under Helix a reused prefix ends on a ledger block (tokens_per_block
+        x cp_size = 128 tokens), so a misaligned snapshot restores the wrong
+        recurrent state and costs accuracy. The few-shot prompts share a long
+        prefix, so reuse is exercised on every request. reuse_preempt caps the
+        KV pool so requests are suspended and resumed while reused blocks are
+        claimed and evicted. Counters confirm reuse and preemption happened.
+        """
+        kv_cache_kwargs = {
+            # Without a snapshot cadence a hybrid model never reuses.
+            "mamba_state_config": MambaStateConfig(periodic_snapshot_interval=SNAPSHOT_INTERVAL),
+        }
+        llm_kwargs = {}
+        if mode == "reuse_preempt":
+            # max_tokens counts global ledger tokens under Helix. The pool holds
+            # the longest request but not eight concurrent ones.
+            kv_cache_kwargs["max_tokens"] = 4096
+            llm_kwargs["max_seq_len"] = 3072
+        else:
+            llm_kwargs["max_seq_len"] = 8192
+        with LLM(
+            self.NVFP4_MODEL_PATH,
+            tensor_parallel_size=4,
+            context_parallel_size=2,
+            moe_expert_parallel_size=8,
+            cp_config={"cp_type": "HELIX", "tokens_per_block": HELIX_TOKENS_PER_BLOCK},
+            max_batch_size=8,
+            max_num_tokens=8192,
+            trust_remote_code=True,
+            enable_chunked_prefill=True,
+            cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=8),
+            moe_config=MoeConfig(backend="CUTLASS"),
+            kv_cache_config=KvCacheConfig(
+                dtype=kv_cache_dtype,
+                enable_block_reuse=True,
+                tokens_per_block=64,
+                use_kv_cache_manager_v2=True,
+                **kv_cache_kwargs,
+            ),
+            enable_iter_perf_stats=True,
+            max_stats_len=-1,
+            **llm_kwargs,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            assert llm.args.kv_cache_config.enable_block_reuse is True
+            # Reuse depth on an idle engine follows the snapshot alignment:
+            # nothing up to one interval, then one interval at a time.
+            for prompt_len in (129, 257, 513, 1000):
+                _assert_helix_reuse_blocks(llm, prompt_len)
+            llm.get_stats(timeout=2)  # keep the counters below GSM8K-only
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            # A pass must exercise reuse (and preemption), not just score well.
+            stats = llm.get_stats(timeout=2)
+            windows = [w for s in stats for w in (s.get("kvCacheIterationStats") or {}).values()]
+            reused_blocks = sum(w.get("iterReusedBlocks", 0) for w in windows)
+            suspended = sum(s.get("iterSuspendedRequests", 0) for s in stats)
+            resumed = sum(s.get("iterResumedRequests", 0) for s in stats)
+            totals = {
+                key: sum(w.get(key, 0) for w in windows)
+                for key in (
+                    "iterAllocTotalBlocks",
+                    "iterMissedBlocks",
+                    "iterSnapshotLookups",
+                    "iterSnapshotHits",
+                    "iterReusedTokens",
+                    "iterUnreusedTokens",
+                )
+            }
+            print(
+                f"[reuse] reused_blocks = {reused_blocks}, "
+                f"suspended = {suspended}, resumed = {resumed}, {totals}"
+            )
+            assert reused_blocks > 0
+            if mode == "reuse_preempt":
+                assert suspended > 0 and resumed > 0
 
     def _assert_checkpoint_routing(self) -> None:
         config = load_pretrained_config(self.MODEL_PATH, trust_remote_code=True)

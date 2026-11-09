@@ -116,8 +116,12 @@ SCENARIOS = {
 
 
 def _make_rank(
-    cp_rank: int, scenario: Scenario, host_cache_size: int = 0, enable_block_reuse: bool = False
+    cp_rank: int,
+    scenario: Scenario,
+    host_cache_size: Optional[int] = 0,
+    enable_block_reuse: bool = False,
 ) -> tuple[KVCacheManagerV2, KVCacheV2Scheduler]:
+    """`host_cache_size=None` provisions the automatic host tier."""
     distributed = Mock()
     distributed.allreduce.side_effect = lambda value, op: value
     distributed.local_world_size = 1
@@ -185,6 +189,48 @@ def _check_helix_fields(request: LlmRequest, cp_rank: int) -> None:
     ) + (owner == cp_rank), (request.py_request_id, pos)
 
 
+def _assert_given_up_once(out) -> None:
+    """A pass suspends or recompute-pauses each request at most once."""
+    paused_ids = [r.py_request_id for r in out.paused_requests]
+    recompute_paused_ids = [r.py_request_id for r in out.recompute_paused_requests]
+    assert len(set(paused_ids)) == len(paused_ids), paused_ids
+    assert len(set(recompute_paused_ids)) == len(recompute_paused_ids), recompute_paused_ids
+    assert not set(paused_ids) & set(recompute_paused_ids), (paused_ids, recompute_paused_ids)
+
+
+class _RecomputeChecks:
+    """Checks every recompute-pause of a run across all ranks.
+
+    A re-prefill replays every token the request held when it was preempted,
+    generated ones included, in full on every rank. Requests taking turns
+    preempting each other would preempt the same ones over and over, so each
+    preemption has to make lasting room.
+    """
+
+    def __init__(self) -> None:
+        self.preemptions: Counter = Counter()
+        self._preempted_at_tokens: dict[int, int] = {}
+
+    def update(self, active: list, ctx: tuple, recompute_paused: tuple) -> None:
+        """Record this step's decisions; `active` holds every rank's requests."""
+        for request_id, *_ in ctx:
+            if request_id in self._preempted_at_tokens:
+                tokens = self._preempted_at_tokens.pop(request_id)
+                for rank_active in active:
+                    request = next(r for r in rank_active if r.py_request_id == request_id)
+                    assert request.prompt_len == tokens, (request_id, request.prompt_len, tokens)
+        for request in active[0]:
+            if request.py_request_id in recompute_paused:
+                self._preempted_at_tokens[request.py_request_id] = request.get_num_tokens(0)
+                self.preemptions[request.py_request_id] += 1
+        assert max(self.preemptions.values(), default=0) <= MAX_PREEMPTIONS_PER_REQUEST, (
+            self.preemptions
+        )
+
+    def finish(self) -> None:
+        assert not self._preempted_at_tokens, f"never re-prefilled: {self._preempted_at_tokens}"
+
+
 def _step(
     cp_rank: int,
     manager: KVCacheManagerV2,
@@ -194,6 +240,7 @@ def _step(
 ) -> tuple:
     """One executor iteration on one rank; returns what the rank decided."""
     out = scheduler.schedule_request(active, set())
+    _assert_given_up_once(out)
     for request in out.recompute_paused_requests:
         request.reset_for_recompute(1 << 20)
     for request in out.context_requests:
@@ -386,10 +433,11 @@ HOST_TIER_BYTES = 2 << 20
 
 
 @pytest.mark.parametrize("cp_rank", range(CP_SIZE))
-def test_suspend_frees_gpu_pages_until_the_host_tier_is_full(cp_rank: int) -> None:
-    """Suspending a request moves its pages to the host tier and frees them on
-    GPU, so a new request fits. Once the host tier is full, a suspended
-    request's pages stay on GPU, and only recompute-pause can free them."""
+def test_suspended_pages_migrate_to_host_until_the_host_tier_is_full(cp_rank: int) -> None:
+    """Suspending a request makes its GPU pages eligible to migrate: the next
+    allocation that needs room moves them to the host tier, so a new request
+    fits. Once the host tier is full they have nowhere to go and stay on GPU,
+    and only recompute-pause can free them."""
     scenario = Scenario(prompt_lens={i: 96 for i in range(1, 17)}, max_num_tokens=96)
     manager, _ = _make_rank(cp_rank, scenario, host_cache_size=HOST_TIER_BYTES)
     requests = {}
@@ -420,7 +468,8 @@ def test_suspend_frees_gpu_pages_until_the_host_tier_is_full(cp_rank: int) -> No
         num_suspendable = host_pages // pages_per_request
         assert 0 < num_suspendable < num_resident
 
-        # Room on the host tier: each suspend makes room for one new request.
+        # Room on the host tier: each suspended request's pages migrate to
+        # make room for one new request.
         newcomer = num_resident + 1
         for victim in range(num_resident, num_resident - num_suspendable, -1):
             assert not allocate(newcomer)
@@ -444,16 +493,20 @@ def test_suspend_frees_gpu_pages_until_the_host_tier_is_full(cp_rank: int) -> No
 ROOMY_HOST_TIER_BYTES = 8 << 20
 
 
-def test_agg_helix_suspends_and_resumes_identically() -> None:
+@pytest.mark.parametrize(
+    "host_cache_size", [ROOMY_HOST_TIER_BYTES, None], ids=["explicit_host_tier", "auto_host_tier"]
+)
+def test_agg_helix_suspends_and_resumes_identically(host_cache_size: Optional[int]) -> None:
     """Under decode pressure with room on the host tier, every rank suspends
     the same requests and resumes them later, and a resumed request decodes
     on from where it stopped with consistent helix fields. The generation
     ladder can still recompute-pause a suspended request before the requester
-    suspends itself; that request re-prefills instead of resuming."""
+    suspends itself; that request re-prefills instead of resuming. The
+    automatic host tier, which aggregated helix gets by default, behaves the
+    same."""
     scenario = SCENARIOS["decode_pressure"]
     ranks = [
-        _make_rank(cp_rank, scenario, host_cache_size=ROOMY_HOST_TIER_BYTES)
-        for cp_rank in range(CP_SIZE)
+        _make_rank(cp_rank, scenario, host_cache_size=host_cache_size) for cp_rank in range(CP_SIZE)
     ]
     for manager, _ in ranks:
         assert manager.has_cache_tier_below_gpu
@@ -462,6 +515,7 @@ def test_agg_helix_suspends_and_resumes_identically() -> None:
     # Token count of each request when it was last suspended, until it resumes.
     suspended_at_tokens: dict[int, int] = {}
     resumed: set[int] = set()
+    recompute_checks = _RecomputeChecks()
     for _ in range(MAX_ITERATIONS):
         if not any(active):
             break
@@ -470,7 +524,8 @@ def test_agg_helix_suspends_and_resumes_identically() -> None:
             for cp_rank, ((manager, scheduler), rank_active) in enumerate(zip(ranks, active))
         ]
         assert all(d == decisions[0] for d in decisions), decisions
-        _, gen, paused, recompute_paused = decisions[0]
+        ctx, gen, paused, recompute_paused = decisions[0]
+        recompute_checks.update(active, ctx, recompute_paused)
         for request_id in recompute_paused:
             suspended_at_tokens.pop(request_id, None)
 
@@ -489,6 +544,7 @@ def test_agg_helix_suspends_and_resumes_identically() -> None:
     assert not any(active), "requests did not finish"
     assert resumed, "the pool never ran out, so nothing was suspended"
     assert not suspended_at_tokens, f"never resumed: {sorted(suspended_at_tokens)}"
+    recompute_checks.finish()
 
 
 # Request 1 decodes and needs its third page while request 2 is mid-prefill and
@@ -528,6 +584,7 @@ def test_agg_helix_chunked_prefill_with_host_tier(scenario_name: str) -> None:
     num_suspends = 0
     suspended_while_prompt_pending = False
     had_mixed_step = False
+    recompute_checks = _RecomputeChecks()
     for iteration in range(MAX_ITERATIONS):
         for rank_pending, rank_active in zip(pending, active):
             for request_id in list(rank_pending):
@@ -551,6 +608,7 @@ def test_agg_helix_chunked_prefill_with_host_tier(scenario_name: str) -> None:
         assert all(d == decisions[0] for d in decisions), decisions
         ctx, gen, paused, recompute_paused = decisions[0]
         had_mixed_step = had_mixed_step or bool(ctx and gen)
+        recompute_checks.update(active, ctx, recompute_paused)
 
         for request_id in recompute_paused:
             suspended_at_position.pop(request_id, None)
@@ -569,6 +627,7 @@ def test_agg_helix_chunked_prefill_with_host_tier(scenario_name: str) -> None:
             suspended_while_prompt_pending = True
 
     assert not any(active) and not any(pending), "requests did not finish"
+    recompute_checks.finish()
     assert num_suspends > 0, "the pool never ran out, so nothing was suspended"
     assert had_mixed_step, "no step scheduled prefill and decode together"
     if scenario_name == "chunked_staggered_arrivals":
@@ -586,16 +645,19 @@ PREFILL_ONLY_PRESSURE = Scenario(
 )
 
 
-def _fill_pool_with_prefills(ranks: list) -> list:
-    """Leave both requests half-prefilled in a full pool on every rank, with no
-    decode request holding pages.
+def _fill_pool_with_prefills(
+    ranks: list, scenario: Scenario = PREFILL_ONLY_PRESSURE, requests: Optional[list] = None
+) -> list:
+    """Leave requests 1 and 2 half-prefilled in a full pool on every rank, with
+    no decode request holding GPU pages.
 
     FCFS chunking gives the whole token budget to the oldest prompt, which then
     finishes its prefill before a newer one gets far. Leaving request 1 out of
     the active list while request 2 prefills is what lets both stop halfway.
+    `requests` holds each rank's requests when the caller has already run some.
     """
-    scenario = PREFILL_ONLY_PRESSURE
-    requests = [{i: _make_request(i, scenario) for i in scenario.prompt_lens} for _ in ranks]
+    if requests is None:
+        requests = [{i: _make_request(i, scenario) for i in scenario.prompt_lens} for _ in ranks]
     for request_id in (1, 2):
         for _ in range(2):
             decisions = [
@@ -607,9 +669,9 @@ def _fill_pool_with_prefills(ranks: list) -> list:
             assert all(d == decisions[0] for d in decisions), decisions
     for (manager, _), rank_requests in zip(ranks, requests):
         assert manager.impl.get_storage_statistics(GPU_LEVEL)[0].free == 0
-        for request in rank_requests.values():
-            assert request.state == LlmRequestState.CONTEXT_INIT
-            assert request.context_current_position == 256
+        for request_id in (1, 2):
+            assert rank_requests[request_id].state == LlmRequestState.CONTEXT_INIT
+            assert rank_requests[request_id].context_current_position == 256
     return [[rank_requests[1], rank_requests[2]] for rank_requests in requests]
 
 
@@ -644,6 +706,225 @@ def test_prefill_only_pressure_recompute_pauses_with_host_tier() -> None:
 
     assert not any(active), "requests did not finish"
     assert first_recompute_paused == (2,)
+
+
+def test_suspended_prefill_preempts_a_newer_prefill_to_resume() -> None:
+    """Request 1 is suspended to the host tier mid-prefill, and the newer
+    request 2 takes part of the freed GPU room for its next chunk, so request
+    1's pages cannot come back. The context path recompute-pauses request 2
+    rather than letting it run ahead of the older request, every rank picks
+    it, and request 1 resumes chunking from where it stopped.
+
+    The starting state is built directly; serving reaches it when the
+    generation path suspends a mid-prefill request.
+    """
+    scenario = PREFILL_ONLY_PRESSURE
+    ranks = [
+        _make_rank(cp_rank, scenario, host_cache_size=ROOMY_HOST_TIER_BYTES)
+        for cp_rank in range(CP_SIZE)
+    ]
+    active = _fill_pool_with_prefills(ranks)
+    for (_, scheduler), rank_active in zip(ranks, active):
+        scheduler._suspend_request(rank_active[0])
+    decisions = [
+        _step(cp_rank, manager, scheduler, [rank_active[1]], scenario)
+        for cp_rank, ((manager, scheduler), rank_active) in enumerate(zip(ranks, active))
+    ]
+    assert all(d == decisions[0] for d in decisions), decisions
+    assert decisions[0][0] == ((2, 256, 128),)
+
+    decisions = [
+        _step(cp_rank, manager, scheduler, rank_active, scenario)
+        for cp_rank, ((manager, scheduler), rank_active) in enumerate(zip(ranks, active))
+    ]
+    assert all(d == decisions[0] for d in decisions), decisions
+    assert decisions[0] == ((), (), (), (2,))
+
+    resumed_at = None
+    for _ in range(MAX_ITERATIONS):
+        if not any(active):
+            break
+        positions = [
+            {r.py_request_id: r.context_current_position for r in rank_active}
+            for rank_active in active
+        ]
+        decisions = [
+            _step(cp_rank, manager, scheduler, rank_active, scenario)
+            for cp_rank, ((manager, scheduler), rank_active) in enumerate(zip(ranks, active))
+        ]
+        assert all(d == decisions[0] for d in decisions), decisions
+        if resumed_at is None and any(request_id == 1 for request_id, _, _ in decisions[0][0]):
+            resumed_at = [rank_positions[1] for rank_positions in positions]
+
+    assert not any(active), "requests did not finish"
+    assert resumed_at == [256] * CP_SIZE
+
+
+# The two prompts of PREFILL_ONLY_PRESSURE, plus two short decodes that are
+# suspended to the host tier before the prompts fill the pool.
+SUSPENDED_DECODES_BEHIND_PREFILLS = Scenario(
+    prompt_lens={1: 448, 2: 448, 3: 64, 4: 64},
+    max_new_tokens={1: 8, 2: 8, 3: 8, 4: 8},
+    max_num_tokens=128,
+    chunk_unit=TOKENS_PER_BLOCK,
+)
+
+
+def test_context_fallback_skips_requests_given_up_earlier_in_the_pass() -> None:
+    """Prompts 1 and 2 fill the pool ahead of decodes 3 and 4, both suspended
+    to the host tier. Decode 3 cannot resume, so the generation path
+    recompute-pauses decode 4; prompt 1 then needs pages, and the context path
+    must not take decode 4 a second time. `_step` checks that no request is
+    listed twice; every rank decides the same, and all finish.
+
+    Decode 3's pages are all on the roomy host tier, so recompute-pausing it
+    would free no GPU memory: the context path takes the active prompt 2.
+    """
+    scenario = SUSPENDED_DECODES_BEHIND_PREFILLS
+    ranks = [
+        _make_rank(cp_rank, scenario, host_cache_size=ROOMY_HOST_TIER_BYTES)
+        for cp_rank in range(CP_SIZE)
+    ]
+    requests = [{i: _make_request(i, scenario) for i in scenario.prompt_lens} for _ in ranks]
+    decisions = [
+        _step(cp_rank, manager, scheduler, [rank_requests[3], rank_requests[4]], scenario)
+        for cp_rank, ((manager, scheduler), rank_requests) in enumerate(zip(ranks, requests))
+    ]
+    assert all(d == decisions[0] for d in decisions), decisions
+    assert decisions[0][0] == ((3, 0, 64), (4, 0, 64))
+    for (_, scheduler), rank_requests in zip(ranks, requests):
+        for request_id in (3, 4):
+            assert rank_requests[request_id].state == LlmRequestState.GENERATION_IN_PROGRESS
+            scheduler._suspend_request(rank_requests[request_id])
+    _fill_pool_with_prefills(ranks, scenario, requests)
+    active = [[rank_requests[i] for i in (1, 2, 3, 4)] for rank_requests in requests]
+
+    first_recompute_paused = None
+    for _ in range(MAX_ITERATIONS):
+        if not any(active):
+            break
+        decisions = [
+            _step(cp_rank, manager, scheduler, rank_active, scenario)
+            for cp_rank, ((manager, scheduler), rank_active) in enumerate(zip(ranks, active))
+        ]
+        assert all(d == decisions[0] for d in decisions), decisions
+        if first_recompute_paused is None:
+            first_recompute_paused = decisions[0][3]
+
+    assert not any(active), "requests did not finish"
+    assert first_recompute_paused == (4, 2)
+
+
+def test_context_fallback_skips_a_request_given_up_earlier_with_no_active_victim() -> None:
+    """As above, but prompt 2 is left out of the active list, so every
+    candidate behind prompt 1 is suspended and the context path falls back to
+    suspended victims. Decode 3 cannot resume and the generation path
+    recompute-pauses decode 4; the context path must then take decode 3, not
+    decode 4 a second time.
+    """
+    scenario = SUSPENDED_DECODES_BEHIND_PREFILLS
+    ranks = [
+        _make_rank(cp_rank, scenario, host_cache_size=ROOMY_HOST_TIER_BYTES)
+        for cp_rank in range(CP_SIZE)
+    ]
+    requests = [{i: _make_request(i, scenario) for i in scenario.prompt_lens} for _ in ranks]
+    decisions = [
+        _step(cp_rank, manager, scheduler, [rank_requests[3], rank_requests[4]], scenario)
+        for cp_rank, ((manager, scheduler), rank_requests) in enumerate(zip(ranks, requests))
+    ]
+    assert all(d == decisions[0] for d in decisions), decisions
+    for (_, scheduler), rank_requests in zip(ranks, requests):
+        for request_id in (3, 4):
+            scheduler._suspend_request(rank_requests[request_id])
+    _fill_pool_with_prefills(ranks, scenario, requests)
+
+    decisions = [
+        _step(cp_rank, manager, scheduler, [rank_requests[i] for i in (1, 3, 4)], scenario)
+        for cp_rank, ((manager, scheduler), rank_requests) in enumerate(zip(ranks, requests))
+    ]
+    assert all(d == decisions[0] for d in decisions), decisions
+    assert decisions[0][3] == (4, 3)
+
+
+# Request 2 fills most of the pool and decodes while the older request 1 is
+# still mid-prefill; request 1's later chunks need more pages than the
+# four-page host tier can take from request 2.
+HOST_FULL_PRESSURE = Scenario(
+    prompt_lens={1: 448, 2: 352},
+    max_new_tokens={1: 8, 2: 64},
+    max_num_tokens=128,
+    chunk_unit=TOKENS_PER_BLOCK,
+)
+
+
+def _decode_behind_a_partial_prefill(ranks: list) -> list:
+    """Leave request 1 one chunk into its prefill and request 2, behind it,
+    decoding in an almost full pool on every rank.
+
+    FCFS chunking gives the whole token budget to the oldest prompt, so request
+    2 would not finish its prefill first; leaving request 1 out of the active
+    list while request 2 prefills is what lets it.
+    """
+    scenario = HOST_FULL_PRESSURE
+    requests = [{i: _make_request(i, scenario) for i in scenario.prompt_lens} for _ in ranks]
+    for request_id, num_steps in ((1, 1), (2, 3)):
+        for _ in range(num_steps):
+            decisions = [
+                _step(cp_rank, manager, scheduler, [rank_requests[request_id]], scenario)
+                for cp_rank, ((manager, scheduler), rank_requests) in enumerate(
+                    zip(ranks, requests)
+                )
+            ]
+            assert all(d == decisions[0] for d in decisions), decisions
+    for (manager, _), rank_requests in zip(ranks, requests):
+        assert manager.impl.get_storage_statistics(GPU_LEVEL)[0].free == 0
+        assert rank_requests[1].state == LlmRequestState.CONTEXT_INIT
+        assert rank_requests[2].state == LlmRequestState.GENERATION_IN_PROGRESS
+    return [[rank_requests[1], rank_requests[2]] for rank_requests in requests]
+
+
+def test_full_host_tier_recompute_pauses_a_suspended_request_holding_gpu_pages() -> None:
+    """Request 2 suspends itself, and request 1's chunks move its pages to the
+    host tier until that is full. The rest of request 2's pages stay on GPU, so
+    request 1 can continue only once the context path recompute-pauses request
+    2, which every rank does, and both finish.
+
+    The starting state is built directly; how often serving reaches it needs a
+    multi-GPU run.
+    """
+    scenario = HOST_FULL_PRESSURE
+    ranks = [
+        _make_rank(cp_rank, scenario, host_cache_size=HOST_TIER_BYTES) for cp_rank in range(CP_SIZE)
+    ]
+    active = _decode_behind_a_partial_prefill(ranks)
+    # Whether each victim was still active when it was picked.
+    victims: list[tuple[int, bool]] = []
+    for manager, scheduler in ranks:
+        preempt_or_defer = scheduler._preempt_or_defer
+
+        def record(victim, recompute_paused, manager=manager, preempt_or_defer=preempt_or_defer):
+            victims.append((victim.py_request_id, manager.is_request_active(victim.py_request_id)))
+            return preempt_or_defer(victim, recompute_paused)
+
+        scheduler._preempt_or_defer = record
+
+    suspended: set[int] = set()
+    recompute_paused_after_suspend: list[int] = []
+    for _ in range(MAX_ITERATIONS):
+        if not any(active):
+            break
+        decisions = [
+            _step(cp_rank, manager, scheduler, rank_active, scenario)
+            for cp_rank, ((manager, scheduler), rank_active) in enumerate(zip(ranks, active))
+        ]
+        assert all(d == decisions[0] for d in decisions), decisions
+        _, _, paused, recompute_paused = decisions[0]
+        recompute_paused_after_suspend.extend(r for r in recompute_paused if r in suspended)
+        suspended.update(paused)
+
+    assert not any(active), "requests did not finish"
+    assert recompute_paused_after_suspend == [2]
+    assert victims == [(2, False)] * CP_SIZE
 
 
 # Kimi K3 keeps a fixed-size KDA recurrent state per request next to its
@@ -736,6 +1017,7 @@ def _hybrid_step(
     The forward pass does not run, so nothing else writes the state.
     """
     out = scheduler.schedule_request(active, set())
+    _assert_given_up_once(out)
     decided = (
         tuple(
             (r.py_request_id, r.context_current_position, r.context_chunk_size)
@@ -822,6 +1104,7 @@ def test_agg_helix_kda_state_survives_suspend_and_restarts_on_recompute(
     awaiting_re_prefill: set[int] = set()
     num_re_prefills = 0
     num_suspends = 0
+    recompute_checks = _RecomputeChecks()
     for _ in range(MAX_ITERATIONS):
         if not any(active):
             break
@@ -831,6 +1114,7 @@ def test_agg_helix_kda_state_survives_suspend_and_restarts_on_recompute(
         ]
         assert all(d == decisions[0] for d in decisions), decisions
         ctx, gen, paused, recompute_paused = decisions[0]
+        recompute_checks.update(active, ctx, recompute_paused)
 
         for request_id, start_position, _ in ctx:
             if request_id in awaiting_re_prefill:
@@ -848,6 +1132,7 @@ def test_agg_helix_kda_state_survives_suspend_and_restarts_on_recompute(
 
     assert not any(active), "requests did not finish"
     assert not awaiting_re_prefill
+    recompute_checks.finish()
     if host_cache_size:
         assert resumed_with_state, "no request resumed with its KDA state"
     else:

@@ -167,10 +167,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     # Mixed-precision high layers are appended like any attention layer group.
     _supports_mixed_precision_kv = True
+    # Set per instance by KVCacheManagerV2 under helix context parallelism.
+    _has_cp_helix = False
     # Set per instance when the MLA latent cache uses the FP4 MLA layout.
     _attention_cache_layout_policy = None
-    # Set per instance once the FP4 MLA layout has logged a snapshot move.
-    _fp4_mla_snapshot_realignment_logged = False
+    # Set per instance once a snapshot point move has been logged.
+    _snapshot_realignment_logged = False
     # Set per instance by the FP4 MLA layout on a disaggregated context
     # worker, which keeps no generation-only V scales or packed V.
     fp4_mla_context_only_cache = False
@@ -358,13 +360,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         kv_cache_config = kv_cache_config.model_copy(deep=True)
         if any(mamba_layer_mask) and kv_cache_config.enable_block_reuse:
-            if mapping.has_cp_helix():
-                raise ValueError(
-                    "Block reuse is not supported for models with recurrent "
-                    "state layers under helix context parallelism: state "
-                    "snapshot points are not aligned to ledger blocks. "
-                    "Set kv_cache_config.enable_block_reuse=False."
-                )
             block_reuse_config = kv_cache_config.block_reuse_config
             block_reuse_policy = BlockReusePolicy(block_reuse_config.policy)
             if block_reuse_policy == BlockReusePolicy.ALL_REUSABLE:
@@ -1641,7 +1636,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def prepare_expect_snapshot_points(self, requests: List[LlmRequest]) -> None:
         super().prepare_expect_snapshot_points(requests)
         for request in requests:
-            self._align_fp4_mla_snapshot_points(request)
+            self._align_snapshot_points(request)
         block_reuse_config = self.kv_cache_config.block_reuse_config
         if self.enable_block_reuse and block_reuse_config.enable_branch_snapshot:
             for request in requests:
@@ -1664,31 +1659,46 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         point may arrive after ``owner``'s history has passed its committed
         tokens; update_context_resources then advances history to each chunk
         end, so the commit at the point ends at history as commit_min_snapshot
-        requires.
+        requires. The point is moved down onto the same blocks as every other
+        snapshot point (see _align_snapshot_points).
         """
+        block = self._snapshot_alignment_block()
+        if block is not None:
+            num_tokens = num_tokens // block * block
         return self._add_waiter_snapshot_point(owner, num_tokens)
 
-    def _align_fp4_mla_snapshot_points(self, request: LlmRequest) -> None:
-        """Move recurrent-state snapshots onto full cache blocks.
+    def _snapshot_alignment_block(self) -> Optional[int]:
+        """Token granularity that snapshot points are moved down to, if any."""
+        if self._has_cp_helix:
+            return self._ledger_tokens_per_block
+        if self._attention_cache_layout_policy is not None:
+            return self.tokens_per_block
+        return None
 
-        The FP4 MLA cache quantizes the latent cache in 16-token tiles and
-        disables partial-block reuse, so a reused prefix always ends on a
-        cache block. A snapshot inside a block would restore the recurrent
-        state of a later token than the reused prefix ends at; one below the
-        first block can never be reused. Snapshot points also end the
-        context chunks, which keeps every non-final chunk tile-aligned.
+    def _align_snapshot_points(self, request: LlmRequest) -> None:
+        """Move recurrent-state snapshots down onto the blocks a reused prefix ends on.
+
+        Without partial-block reuse, a reused prefix always ends on a whole
+        block: a ledger block (tokens_per_block * cp_size global tokens) under
+        helix context parallelism, or a cache block under the FP4 MLA layout,
+        which quantizes the latent cache in 16-token tiles. A snapshot inside
+        a block would restore the recurrent state of a later token than the
+        reused prefix ends at; one below the first block can never be reused.
+        Snapshot points also end the context chunks, which keeps every
+        non-final FP4 MLA chunk tile-aligned.
         """
-        if self._attention_cache_layout_policy is None:
+        block = self._snapshot_alignment_block()
+        if block is None:
             return
-        block = self.tokens_per_block
         points = request.expect_snapshot_points
         aligned = sorted({point // block * block for point in points if point >= block})
-        if aligned != sorted(set(points)) and not self._fp4_mla_snapshot_realignment_logged:
-            self._fp4_mla_snapshot_realignment_logged = True
+        if aligned != sorted(set(points)) and not self._snapshot_realignment_logged:
+            self._snapshot_realignment_logged = True
+            block_kind = "helix ledger" if self._has_cp_helix else "FP4 MLA cache"
             logger.info(
-                "FP4 MLA moves Mamba snapshot points down to "
-                f"{block}-token cache blocks and drops points below the "
-                f"first block (logged once; request {request.py_request_id}: "
+                f"Moving Mamba snapshot points down to {block}-token "
+                f"{block_kind} blocks and dropping points below the first "
+                f"block (logged once; request {request.py_request_id}: "
                 f"{sorted(set(points))} -> {aligned})."
             )
         request.expect_snapshot_points = aligned
@@ -1777,7 +1787,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if point is not None and point > current_position:
             points.add(point)
         request.expect_snapshot_points = sorted(points)
-        self._align_fp4_mla_snapshot_points(request)
+        self._align_snapshot_points(request)
 
     def _format_branch_snapshot_counters(self) -> str:
         """Attribute reuse loss between missing snapshots and evicted pages.
