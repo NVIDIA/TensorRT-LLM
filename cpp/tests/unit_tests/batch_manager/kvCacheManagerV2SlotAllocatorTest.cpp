@@ -321,8 +321,8 @@ TEST(KvCacheManagerV2SlotAllocatorTest, ReleaseOrderRecyclingIgnoresEventReadine
 constexpr size_t kKiB = 1024;
 constexpr size_t kMiB = 1024 * kKiB;
 
-TypedVec<PoolGroupIndex, SlotWindow> arenaWindows(size_t arenaBytes, std::vector<size_t> sizes,
-    std::vector<float> ratios, std::vector<SlotCount> minSlots)
+TypedVec<PoolGroupIndex, SlotWindow> arenaWindows(
+    size_t arenaBytes, std::vector<size_t> sizes, std::vector<float> ratios, std::vector<SlotCount> minSlots)
 {
     return ArenaGpuCacheLevelStorage::computeArenaWindows(arenaBytes, TypedVec<PoolGroupIndex, size_t>{sizes},
         TypedVec<PoolGroupIndex, float>{ratios}, TypedVec<PoolGroupIndex, SlotCount>{minSlots});
@@ -338,9 +338,9 @@ TEST(KvCacheManagerV2ArenaLayoutTest, WindowsTileTheArena)
     size_t const end0 = toSizeT(w[PoolGroupIndex{0}].end) * sizes[0];
     size_t const begin1 = toSizeT(w[PoolGroupIndex{1}].begin) * sizes[1];
     EXPECT_EQ(w[PoolGroupIndex{0}].begin, SlotId{0});
-    EXPECT_LE(end0, begin1);                 // no overlap
-    EXPECT_LT(begin1 - end0, sizes[0]);      // under one (smaller) block wasted at the boundary
-    EXPECT_EQ(begin1 % sizes[1], 0u);        // snapped to the larger block size
+    EXPECT_LE(end0, begin1);            // no overlap
+    EXPECT_LT(begin1 - end0, sizes[0]); // under one (smaller) block wasted at the boundary
+    EXPECT_EQ(begin1 % sizes[1], 0u);   // snapped to the larger block size
     EXPECT_EQ(toSizeT(w[PoolGroupIndex{1}].end), arena / sizes[1]);
     EXPECT_NEAR(static_cast<double>(begin1) / arena, 0.5, 0.01);
 }
@@ -445,8 +445,8 @@ TEST(KvCacheManagerV2ArenaPoolLayoutTest, SinglePoolsMatchGroupLayout)
 TEST(KvCacheManagerV2ArenaPoolLayoutTest, DeepSeekV4PoolsTileTheArena)
 {
     size_t const arena = 100 * 1024 * kMiB;
-    for (auto const& ratio : {std::vector<float>{0.95976f, 0.01311f, 0.02713f},
-             std::vector<float>{0.11645f, 0.30154f, 0.58200f}})
+    for (auto const& ratio :
+        {std::vector<float>{0.95976f, 0.01311f, 0.02713f}, std::vector<float>{0.11645f, 0.30154f, 0.58200f}})
     {
         auto const w = arenaPoolWindows(arena, kDsv4Sizes, ratio, {1, 1, 1});
         size_t const unused = checkPoolLayout(arena, kDsv4Sizes, w);
@@ -488,15 +488,16 @@ TEST(KvCacheManagerV2ArenaPoolLayoutTest, SameRatioSameWindowsAndMinSlots)
 // a smaller quota (e.g. the estimation pass's, from free memory) to it, as the VMM path does.
 TEST(KvCacheManagerV2ArenaPoolLayoutTest, MinArenaBytesFitsMinSlots)
 {
-    std::vector<std::vector<float>> const ratios{{0.98f, 0.01f, 0.01f}, {0.01f, 0.98f, 0.01f},
-        {0.01f, 0.01f, 0.98f}, {0.34f, 0.33f, 0.33f}};
+    std::vector<std::vector<float>> const ratios{
+        {0.98f, 0.01f, 0.01f}, {0.01f, 0.98f, 0.01f}, {0.01f, 0.01f, 0.98f}, {0.34f, 0.33f, 0.33f}};
     for (auto const& sizes : {kDsv4Sizes, PoolSizes{{2 * kMiB}, {10 * kMiB}, {768 * kKiB}}})
     {
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> typed;
         for (auto const& group : sizes)
             typed.push_back(TypedVec<PoolIndex, size_t>{group});
         std::vector<SlotCount> const minSlots{40, 45, 45};
-        size_t const arena = ArenaGpuCacheLevelStorage::minArenaBytes(typed, TypedVec<PoolGroupIndex, SlotCount>{minSlots});
+        size_t const arena
+            = ArenaGpuCacheLevelStorage::minArenaBytes(typed, TypedVec<PoolGroupIndex, SlotCount>{minSlots});
         for (auto const& ratio : ratios)
         {
             auto const w = arenaPoolWindows(arena, sizes, ratio, minSlots);
@@ -593,7 +594,7 @@ TEST(HostArenaCopySplit, StraddlingPagesAreSplitAtRegistrationBoundaries)
 {
     ASSERT_EQ(cudaFree(nullptr), cudaSuccess); // a current context for the copier and the registrations
     constexpr size_t kUnit = 2ULL << 20;
-    constexpr uint32_t kPageBytes = 80 << 10; // 2 MiB is not a multiple: page 25 spans [2000 KiB, 2080 KiB)
+    constexpr uint32_t kPageBytes = 80 << 10;  // 2 MiB is not a multiple: page 25 spans [2000 KiB, 2080 KiB)
     HostMem host(2 * kUnit, 2 * kUnit, HostMemBackingOptions{kUnit, true}, /*waitForFill=*/true);
     auto* bytes = reinterpret_cast<uint8_t*>(host.address());
     for (size_t i = 0; i < 2 * kUnit; ++i)

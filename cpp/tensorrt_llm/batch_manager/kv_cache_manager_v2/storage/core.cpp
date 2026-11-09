@@ -92,8 +92,8 @@ SlotAllocator::~SlotAllocator()
     {
         KVCM2_CHECK_FATAL_WITH_INFO(slotCountToSizeT(mNumReadyRecycledSlots) == mRecycledSlots.size(),
             "SlotAllocator destroyed with unfinished events — did you call synchronize()?");
-        KVCM2_CHECK_FATAL_WITH_INFO(!shrinkInProgress() && mOverflowSlots.empty(),
-            "SlotAllocator destroyed while resize is in progress");
+        KVCM2_CHECK_FATAL_WITH_INFO(
+            !shrinkInProgress() && mOverflowSlots.empty(), "SlotAllocator destroyed while resize is in progress");
         KVCM2_CHECK_FATAL_WITH_INFO(
             mOccupiedMask.numSetBits() == 0, "SlotAllocator destroyed with occupied slots still in use");
         KVCM2_CHECK_FATAL_WITH_INFO(mRecycledSlots.size() == slotCountToSizeT(numActiveSlots()),
@@ -493,8 +493,8 @@ void ArenaGpuSlotPool::resize(SlotCount newNumSlots)
 
 void ArenaGpuSlotPool::setWindow(SlotWindow window)
 {
-    TLLM_CHECK_WITH_INFO(window.begin >= SlotCount{0} && !(window.end < window.begin)
-            && toSizeT(window.end) <= mArenaBytes / mSlotSize,
+    TLLM_CHECK_WITH_INFO(
+        window.begin >= SlotCount{0} && !(window.end < window.begin) && toSizeT(window.end) <= mArenaBytes / mSlotSize,
         "ArenaGpuSlotPool::setWindow: window [%ld, %ld) does not fit an arena of %zu slots of %zu bytes",
         static_cast<long>(window.begin.value()), static_cast<long>(window.end.value()), mArenaBytes / mSlotSize,
         mSlotSize);
@@ -522,8 +522,8 @@ MemAddress ArenaGpuSlotPool::localAddress(SlotId local) const
 
 void ArenaGpuSlotPool::bindInOrder(SlotWindow groupWindow, SlotCount groupIdBound)
 {
-    TLLM_CHECK_WITH_INFO(!mBound && groupWindow.size() == mWindow.size()
-            && toSizeT(groupWindow.end) <= slotCountToSizeT(groupIdBound),
+    TLLM_CHECK_WITH_INFO(
+        !mBound && groupWindow.size() == mWindow.size() && toSizeT(groupWindow.end) <= slotCountToSizeT(groupIdBound),
         "ArenaGpuSlotPool::bindInOrder: the group window must match this pool's window in size");
     mBound = true;
     mGroupToLocal.assign(slotCountToSizeT(groupIdBound), -1);
@@ -883,8 +883,8 @@ void PoolGroupBase::completeBindings()
             }
             while (pool.groupId(local).has_value())
                 ++local;
-            TLLM_CHECK_WITH_INFO(pool.window().contains(local), "completeBindings: bound pool %d ran out of ids",
-                poolIdx.value());
+            TLLM_CHECK_WITH_INFO(
+                pool.window().contains(local), "completeBindings: bound pool %d ran out of ids", poolIdx.value());
             pool.bind(slot, local);
         }
     }
@@ -981,9 +981,8 @@ GpuPoolGroup::GpuPoolGroup(TypedVec<PoolIndex, SlotWindow> const& poolWindows, S
     SlotWindow const groupWindow = poolWindows[PoolIndex{0}];
     for (PoolIndex poolIdx{0}; poolIdx < slotSizeList.size(); ++poolIdx)
     {
-        mPools.push_back(
-            std::make_unique<ArenaGpuSlotPool>(
-                slotSizeList[poolIdx], arenaBase, arenaBytes, poolWindows[poolIdx], arenaGranularity));
+        mPools.push_back(std::make_unique<ArenaGpuSlotPool>(
+            slotSizeList[poolIdx], arenaBase, arenaBytes, poolWindows[poolIdx], arenaGranularity));
     }
     // Pool 0's ids are the group's; the other pools bind them to their own.
     SlotCount const groupIdBound = mPools[PoolIndex{0}]->slotIdUpperBound();
@@ -1123,9 +1122,8 @@ ArenaGpuCacheLevelStorage::ArenaGpuCacheLevelStorage(TypedVec<PoolGroupIndex, Sl
     auto const windows = computeArenaPoolWindows(arenaBytes, sizes, ratioList, minSlots);
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
-        mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(
-            windows[pgIdx], growthFor(pgIdx, slotDescList.size()), sizes[pgIdx], arenaBase(), arenaBytes,
-            physMemAllocator.physMemSize()));
+        mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(windows[pgIdx], growthFor(pgIdx, slotDescList.size()),
+            sizes[pgIdx], arenaBase(), arenaBytes, physMemAllocator.physMemSize()));
     }
 }
 
@@ -1328,8 +1326,8 @@ TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> ArenaGpuCacheLevelStor
         for (PoolIndex poolIdx{0}; poolIdx < sizes.size(); ++poolIdx)
         {
             double const s = static_cast<double>(sizes[poolIdx]);
-            double const end = std::min(begin + share[pgIdx] * s / static_cast<double>(perSlot[pgIdx]),
-                static_cast<double>(arenaBytes));
+            double const end = std::min(
+                begin + share[pgIdx] * s / static_cast<double>(perSlot[pgIdx]), static_cast<double>(arenaBytes));
             first[poolIdx] = SlotId{static_cast<SlotCount>(std::ceil(begin / s))};
             auto const last = static_cast<SlotCount>(std::floor(end / s));
             count = std::min(count, std::max(SlotCount{0}, last - first[poolIdx].value()));
@@ -1535,9 +1533,10 @@ size_t ArenaHostCacheLevelStorage::arenaUnitBytes(size_t tierUnitBytes) noexcept
     // 1 GiB: a 100 GiB arena takes 100 registrations, and a 44 MB page straddles a unit with odds of 4%. Host tier
     // units are powers of two up to 32 MiB, so this is a multiple of any of them.
     constexpr size_t kArenaUnit = 1ULL << 30;
-    // TLLM_KV_CACHE_MANAGER_V2_HOST_ARENA_UNIT_BYTES (tests): a small unit makes many pages straddle one. Rounded to the host
-    // memory alignment.
-    if (char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_HOST_ARENA_UNIT_BYTES"); value != nullptr && value[0] != '\0')
+    // TLLM_KV_CACHE_MANAGER_V2_HOST_ARENA_UNIT_BYTES (tests): a small unit makes many pages straddle one. Rounded to
+    // the host memory alignment.
+    if (char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_HOST_ARENA_UNIT_BYTES");
+        value != nullptr && value[0] != '\0')
     {
         size_t const unit = std::strtoull(value, nullptr, 10);
         return std::max(roundUp(unit, hostMemSizeGranularity()), hostMemSizeGranularity());

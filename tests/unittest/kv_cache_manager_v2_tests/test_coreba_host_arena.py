@@ -42,8 +42,10 @@ class _HostArena(base._Arena):
         return self.mgr.get_storage_statistics(kvm.CACHE_LEVEL1)
 
     def rebalance_host(self, target_ratio: list[float]):
-        """Force a host-level rebalance to target_ratio (cold pool-group order); the GPU target is left
-        at the current ratio, so only the host level moves."""
+        """Force a host-level rebalance to target_ratio (cold pool-group order).
+
+        The GPU target is left at the current ratio, so only the host level moves.
+        """
         if self.in_place:
             torch.cuda.synchronize()
         else:
@@ -67,7 +69,9 @@ class TestCopyBasedRebalancingHostArena(unittest.TestCase):
             self.assertLessEqual(end, begin, "host windows overlap")
 
     def _run(self, in_place: bool):
-        arena = _HostArena(drop_unreferenced=False, ratio=[0.4, 0.6], in_place=in_place, host_quota=HOST_QUOTA)
+        arena = _HostArena(
+            drop_unreferenced=False, ratio=[0.4, 0.6], in_place=in_place, host_quota=HOST_QUOTA
+        )
         try:
             # Many more cached prefixes than the GPU holds (~140 requests): the oldest are offloaded.
             for seed in range(1000, 1300):
@@ -90,7 +94,9 @@ class TestCopyBasedRebalancingHostArena(unittest.TestCase):
             for target in ([0.8, 0.2], [0.15, 0.85]):
                 arena.rebalance_host(target)
                 windows = arena.host_windows()
-                self.assertNotEqual(windows, windows0, f"host windows did not move for target {target}")
+                self.assertNotEqual(
+                    windows, windows0, f"host windows did not move for target {target}"
+                )
                 self._check_host_layout(arena, cold_bytes)
                 # The windows follow the target byte ratio (within the arena's rounding).
                 shares = [(e - b) * s / HOST_QUOTA for (b, e), s in zip(windows, cold_bytes)]
@@ -98,7 +104,9 @@ class TestCopyBasedRebalancingHostArena(unittest.TestCase):
                     self.assertAlmostEqual(share, want, delta=0.05)
                 total_moves += 1
                 windows0 = windows
-                self.assertEqual(arena.check_live(self), 0, "a GPU block moved in a host-only rebalance")
+                self.assertEqual(
+                    arena.check_live(self), 0, "a GPU block moved in a host-only rebalance"
+                )
 
             # Admitting every cached prefix again onboards its host pages: their data must be intact.
             matched = arena.check_cached(self)

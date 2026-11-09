@@ -5150,7 +5150,8 @@ class KvPoolRebalanceConfig(StrictBaseModel):
     def _validate_drop_requires_copy_based(self) -> 'KvPoolRebalanceConfig':
         if self.drop_unreferenced_on_rebalance and not self.copy_based_rebalancing:
             raise ValueError(
-                "drop_unreferenced_on_rebalance requires copy_based_rebalancing")
+                "drop_unreferenced_on_rebalance requires copy_based_rebalancing"
+            )
         if self.in_place_relocation and not self.copy_based_rebalancing:
             raise ValueError(
                 "in_place_relocation requires copy_based_rebalancing")

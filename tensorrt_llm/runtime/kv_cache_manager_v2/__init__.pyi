@@ -1771,10 +1771,13 @@ class KVCacheManager:
     def get_page_index_range(self, layer_id: LayerId, data_role: DataRole) -> tuple[int, int]: ...
     def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def get_page_index_bindings(self, layer_id: LayerId, data_role: DataRole) -> list[int] | None:
-        """Copy-based rebalancing with several pools in a pool group: the buffer's pool has its own
+        """Slot-id bindings of the buffer's pool, or None if it uses the base page indices.
+
+        Copy-based rebalancing with several pools in a pool group: the buffer's pool has its own
         slot ids, and its kernel page index is ``bindings[base_page_index] * scale`` (plus the
         converter's layer offset). None when the pool uses the base page indices directly. Changes
-        when a rebalance moves the pool, as does ``get_page_index_binding_version()``."""
+        when a rebalance moves the pool, as does ``get_page_index_binding_version()``.
+        """
     def get_page_index_binding_version(self) -> int: ...
     def get_page_index_converter(
         self, layer_id: LayerId, data_role: DataRole
