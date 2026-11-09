@@ -279,7 +279,6 @@ class _Fp4MlaContextScatterPlan:
     num_dim_blocks: int
     global_scale: torch.Tensor
     v_sf: Optional[torch.Tensor]
-    v_layer_base: int
     hp_pool: torch.Tensor
     hp_pool_size: int
     pool_head_dim: int
@@ -468,7 +467,6 @@ def _build_fp4_mla_context_scatter_plan(
             if has_decode_views
             else None
         ),
-        v_layer_base=int(getattr(state, "v_layer_base", 0)),
         hp_pool=hp_pool,
         hp_pool_size=hp_pool_size,
         pool_head_dim=pool_head_dim,
@@ -663,7 +661,7 @@ def _scatter_fp4_mla_context(
 
     state = metadata.fp4_mla_state
     kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
-    has_decode_views = _fp4_mla_layer_has_decode_views(kv_cache_manager, local_layer)
+    has_decode_views = _fp4_mla_cache_has_decode_views(kv_cache_manager)
     kv_cache, sf_cache = _get_fp4_mla_kv_cache_tensors(metadata, layer_idx)
     plan = getattr(state, "context_scatter_plan", None)
     if plan is None or not plan.matches(
@@ -688,8 +686,6 @@ def _scatter_fp4_mla_context(
         state.context_scatter_plan = plan
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
     v_sf = plan.v_sf
-    if v_sf is not None and plan.v_layer_base != 0:
-        v_sf = _fp4_mla_v_scale_pool_for_layer(metadata, local_layer, v_head_dim)
 
     persistent_v_packed = None
     v_page_offset = 0
@@ -1105,16 +1101,13 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     return kv_lens_gen, gen_lens_gen, page_ids
 
 
-def _fp4_mla_layer_has_decode_views(kv_cache_manager: Any, local_layer: int) -> bool:
-    """Whether a compact FP4 MLA layer keeps V scales and packed V.
+def _fp4_mla_cache_has_decode_views(kv_cache_manager: Any) -> bool:
+    """Whether the cache keeps the V scales and packed V that generation needs.
 
-    A disaggregated context worker keeps a single-copy cache without them,
-    except on one-model draft layers.
+    The single-copy cache of a disaggregated context worker omits them
+    (``fp4_mla_context_only_cache``).
     """
-    if getattr(kv_cache_manager, "fp4_mla_context_only_cache", False) is not True:
-        return True
-    has_views = getattr(kv_cache_manager, "fp4_mla_compact_layer_has_decode_views", None)
-    return callable(has_views) and bool(has_views(local_layer))
+    return getattr(kv_cache_manager, "fp4_mla_context_only_cache", False) is not True
 
 
 def _fp4_mla_generation_writes_owned_pages(kv_cache_manager: Any) -> bool:
@@ -1128,23 +1121,6 @@ def _fp4_mla_generation_writes_owned_pages(kv_cache_manager: Any) -> bool:
     if getattr(kv_cache_manager, "enable_block_reuse", True) is False:
         return True
     return getattr(kv_cache_manager, "fp4_mla_reuse_claims_whole_blocks", False) is True
-
-
-def _fp4_mla_v_scale_pool_for_layer(
-    metadata: Any, local_layer: int, v_head_dim: int
-) -> torch.Tensor:
-    """V-scale pool view that the cache-update kernels index by compact layer.
-
-    The pool covers the compact layers from the state's ``v_layer_base`` on.
-    For a nonzero base, present this layer's scales at every layer index with
-    a zero layer stride, so that ``local_layer`` still addresses them.
-    """
-    pool = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=v_head_dim)
-    v_layer_base = int(getattr(metadata.fp4_mla_state, "v_layer_base", 0))
-    if v_layer_base == 0:
-        return pool
-    num_layers = metadata.fp4_mla_state.hp_pool.shape[1]
-    return pool[local_layer - v_layer_base].unsqueeze(0).expand(num_layers, *pool.shape[1:])
 
 
 # Public cache update and decode entry points
@@ -1256,7 +1232,7 @@ def scatter_fp4_mla_kv_cache(
     sf_per_token = storage_head_dim // FP4_BLOCK_SIZE
 
     kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
-    if not _fp4_mla_layer_has_decode_views(kv_cache_manager, local_layer):
+    if not _fp4_mla_cache_has_decode_views(kv_cache_manager):
         raise RuntimeError("FP4 MLA context-only cache cannot execute generation.")
     if getattr(metadata.fp4_mla_state, "v_scale_pool", None) is None:
         raise RuntimeError("FP4 MLA scatter requires the auxiliary V scale pool.")
@@ -1279,7 +1255,7 @@ def scatter_fp4_mla_kv_cache(
         )
 
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
-    v_sf = _fp4_mla_v_scale_pool_for_layer(metadata, local_layer, v_head_dim)
+    v_sf = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=v_head_dim)
     num_dim_blocks = triton.cdiv(head_dim, FP4_BLOCK_SIZE)
     sf_per_page = metadata.page_size // FP4_BLOCK_SIZE
 

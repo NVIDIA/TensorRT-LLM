@@ -1174,9 +1174,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_nvfp4_kv_cache_nixl(self):
         """FP4 MLA: the generation worker decodes from an imported NVFP4 cache.
 
-        The context worker keeps a single-copy cache on its target layers; its
-        MTP draft layer keeps the decode views for the draft steps of every
-        context step.
+        The context worker keeps a single-copy cache, which cannot run the
+        later draft steps of an MTP drafter, so it drafts one token. The
+        generation worker drafts three and fills in the drafts it lacks.
         """
         kv_cache_config = {
             "dtype": "nvfp4",
@@ -1196,7 +1196,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cuda_graph_config": None,
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": cache_transceiver_config,
-            "speculative_config": speculative_config,
+            "speculative_config": {
+                "decoding_type": "MTP",
+                "max_draft_len": 1
+            },
         }
         gen_server_config = {
             "disable_overlap_scheduler": False,
@@ -1215,12 +1218,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             },
         }
+        context_only_log = "omitting the generation-only V scales and packed V"
         with launch_disaggregated_llm(
                 disaggregated_server_config,
                 ctx_server_config,
                 gen_server_config,
                 f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
-                assert_worker_log_contains="the draft layers keep them",
+                assert_worker_log_contains=context_only_log,
         ) as llm:
             # The DuckLLM args do not carry the served quantization, so set
             # the specs the accuracy reference lookup matches on.

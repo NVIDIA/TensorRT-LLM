@@ -1868,21 +1868,18 @@ def test_fp4_mla_pool_views_built_in_inference_mode_can_be_scrubbed(monkeypatch)
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="FP4 MLA (NVFP4 KV cache) requires Blackwell or newer",
 )
-@pytest.mark.parametrize("context_only", [False, True], ids=["decoding", "context-only"])
-def test_fp4_mla_decode_kv_regime_stays_on_the_graph_metadata(monkeypatch, context_only) -> None:
+def test_fp4_mla_decode_kv_regime_stays_on_the_graph_metadata(monkeypatch) -> None:
     """A KV-regime-keyed CUDA graph bounds the decode path choice of its own metadata only.
 
-    The graph metadata owns FP4 states of its own, so eager steps keep deciding on the
-    page-table capacity. On a single-copy cache the draft-layer state gets the regime too.
+    The graph metadata owns an FP4 state of its own, so eager steps keep deciding on the
+    page-table capacity.
     """
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
     manager = _create_fp4_mla_v2_manager(
         max_tokens=1024,
         max_seq_len=512,
         max_batch_size=2,
         spec_config=MTPDecodingConfig(max_draft_len=3, num_nextn_predict_layers=1),
-        is_disagg=context_only,
     )
     try:
         metadata = trtllm_backend.TrtllmAttentionMetadata(
@@ -1892,16 +1889,16 @@ def test_fp4_mla_decode_kv_regime_stays_on_the_graph_metadata(monkeypatch, conte
             mapping=Mapping(world_size=1, tp_size=1, rank=0),
         )
         graph_metadata = metadata.create_cuda_graph_metadata(2, False, 3)
-        eager_states = metadata._fp4_mla_states()
-        graph_states = graph_metadata._fp4_mla_states()
-        assert len(graph_states) == (2 if context_only else 1)
-        assert not {id(state) for state in graph_states} & {id(state) for state in eager_states}
+        eager_state = metadata.fp4_mla_state
+        graph_state = graph_metadata.fp4_mla_state
+        assert eager_state is not None and graph_state is not None
+        assert graph_state is not eager_state
 
         graph_metadata.set_decode_kv_regime(8192)
         assert graph_metadata.decode_kv_regime == 8192
-        assert [state.kv_regime_max_kv for state in graph_states] == [8192] * len(graph_states)
+        assert graph_state.kv_regime_max_kv == 8192
         assert metadata.decode_kv_regime is None
-        assert all(state.kv_regime_max_kv is None for state in eager_states)
+        assert eager_state.kv_regime_max_kv is None
 
         graph_metadata.set_decode_kv_regime(None)
         assert graph_metadata.decode_kv_regime is None
@@ -1916,7 +1913,6 @@ def _create_fp4_mla_v2_manager(
     max_batch_size: int,
     spec_config: DecodingBaseConfig | None = None,
     enable_block_reuse: bool = False,
-    is_disagg: bool = False,
 ) -> Fp4MlaKVCacheManagerV2:
     return Fp4MlaKVCacheManagerV2(
         LlmKvCacheConfig(
@@ -1937,22 +1933,17 @@ def _create_fp4_mla_v2_manager(
         spec_config=spec_config,
         max_num_tokens=max_tokens,
         pretrained_config=SimpleNamespace(kv_lora_rank=512),
-        is_disagg=is_disagg,
     )
 
 
 def _build_multi_seq_metadata(
-    kv_cache_manager: Fp4MlaKVCacheManagerV2,
-    *,
-    seq_lens: list[int],
-    page_size: int,
-    layer_idx: int = 0,
+    kv_cache_manager: Fp4MlaKVCacheManagerV2, *, seq_lens: list[int], page_size: int
 ) -> SimpleNamespace:
     device = torch.device("cuda")
     num_seqs = len(seq_lens)
     request_ids = list(range(num_seqs))
-    block_ids_per_seq = kv_cache_manager.get_batch_cache_indices(request_ids, layer_idx=layer_idx)
-    page_spec = kv_cache_manager.get_fp4_mla_page_table_spec(layer_idx)
+    block_ids_per_seq = kv_cache_manager.get_batch_cache_indices(request_ids, layer_idx=0)
+    page_spec = kv_cache_manager.get_fp4_mla_page_table_spec(0)
     hp_block_ids_per_seq = kv_cache_manager._get_batch_cache_indices_by_pool_id(
         request_ids,
         pool_id=page_spec.hp_pool_id,
@@ -2027,7 +2018,6 @@ def _build_multi_seq_metadata(
             num_blocks=None,
             hp_pool=hp_pool,
             v_scale_pool=kv_cache_manager.get_mla_v_scale_pool(),
-            v_layer_base=kv_cache_manager.fp4_mla_v_layer_base,
             generation_kv_lens=torch.empty(num_seqs, dtype=torch.int32, device=device),
             generation_append_lens=torch.empty(num_seqs, dtype=torch.int32, device=device),
             generation_lengths_num_tokens=-1,
@@ -2506,9 +2496,6 @@ def _build_fp4_mla_attention_decode_case(
     query_len_per_seq: int = 1,
     enable_helix: bool = False,
     enable_block_reuse: bool = False,
-    layer_idx: int = 0,
-    is_disagg: bool = False,
-    spec_config: DecodingBaseConfig | None = None,
 ) -> tuple[Fp4MlaKVCacheManagerV2, SimpleNamespace, torch.Tensor, int, int]:
     torch.manual_seed(seed)
     device = torch.device("cuda")
@@ -2529,8 +2516,9 @@ def _build_fp4_mla_attention_decode_case(
     context_seq_lens = [seq_len - query_len_per_seq for seq_len in seq_lens]
     if min(context_seq_lens) <= 0:
         raise ValueError("FP4 MLA decode cases require a non-empty context for every sequence.")
-    if spec_config is None and query_len_per_seq > 1:
-        spec_config = MTPDecodingConfig(max_draft_len=query_len_per_seq - 1)
+    spec_config = (
+        MTPDecodingConfig(max_draft_len=query_len_per_seq - 1) if query_len_per_seq > 1 else None
+    )
 
     kv_cache_manager = _create_fp4_mla_v2_manager(
         max_tokens=max_tokens,
@@ -2538,16 +2526,12 @@ def _build_fp4_mla_attention_decode_case(
         max_batch_size=len(seq_lens),
         spec_config=spec_config,
         enable_block_reuse=enable_block_reuse,
-        is_disagg=is_disagg,
-    )
-    local_layer = kv_cache_manager._fp4_mla_compact_layer_idx(
-        kv_cache_manager.layer_offsets[layer_idx]
     )
     kv_cache_manager.add_dummy_requests(list(range(len(seq_lens))), seq_lens)
     expected_storage_head_dim = head_dim + (
         FP4_MLA_K_RESIDUAL_DIM if _fp4_mla_attention_backend() in ("triton", "cutedsl") else 0
     )
-    kv_cache, sf_cache = kv_cache_manager.get_fp4_mla_cache_buffers(layer_idx)
+    kv_cache, sf_cache = kv_cache_manager.get_fp4_mla_cache_buffers(0)
     kv_cache.zero_()
     sf_cache.zero_()
     assert kv_cache.shape[-1] * 2 == expected_storage_head_dim
@@ -2557,7 +2541,6 @@ def _build_fp4_mla_attention_decode_case(
         kv_cache_manager,
         seq_lens=seq_lens,
         page_size=page_size,
-        layer_idx=layer_idx,
     )
     assert metadata.fp4_mla_state.v_scale_pool is not None
     persistent_pool_base = kv_cache_manager.get_mla_v_packed_pool_base()
@@ -2587,10 +2570,10 @@ def _build_fp4_mla_attention_decode_case(
     scatter_fp4_mla_kv_cache(
         metadata,
         context_latent,
-        layer_idx=layer_idx,
+        layer_idx=0,
         token_offset=0,
         phase="context",
-        local_layer=local_layer,
+        local_layer=0,
         v_head_dim=kv_lora_rank,
     )
     torch.cuda.synchronize()
@@ -2668,10 +2651,10 @@ def _build_fp4_mla_attention_decode_case(
     assert scatter_fp4_mla_kv_cache(
         metadata,
         generation_latent,
-        layer_idx=layer_idx,
+        layer_idx=0,
         token_offset=0,
         phase="generation",
-        local_layer=local_layer,
+        local_layer=0,
         v_head_dim=kv_lora_rank,
         rotary_cos_sin=rotary_cos_sin,
         q_pe=q_pe,
@@ -2688,7 +2671,7 @@ def _build_fp4_mla_attention_decode_case(
 
     canonical_generation = _materialize_reference_cache_tokens(
         metadata,
-        layer_idx=layer_idx,
+        layer_idx=0,
         batch_indices=metadata.fp4_mla_state.batch_indices,
         positions=metadata.fp4_mla_state.positions,
         head_dim=head_dim,
@@ -2716,10 +2699,9 @@ def _fp4_mla_attention_decode_reference(
     sm_scale: float,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-    layer_idx: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     head_dim = kv_lora_rank + qk_rope_head_dim
-    storage = _materialize_reference_cache_storage(metadata, layer_idx, head_dim)
+    storage = _materialize_reference_cache_storage(metadata, 0, head_dim)
     dequant_cache = storage[..., :head_dim]
     dequant_k_residual = None
     if _fp4_mla_attention_backend() in ("triton", "cutedsl"):
@@ -2831,9 +2813,6 @@ def _assert_fp4_mla_attention_decode_accuracy(
     enable_block_reuse: bool = False,
     packed_queries: bool = False,
     split_kv: int | None = None,
-    layer_idx: int = 0,
-    is_disagg: bool = False,
-    spec_config: DecodingBaseConfig | None = None,
     enable_4x: bool = False,
     env: dict[str, str] | None = None,
 ) -> None:
@@ -2879,15 +2858,9 @@ def _assert_fp4_mla_attention_decode_accuracy(
         query_len_per_seq=query_len_per_seq,
         enable_helix=enable_helix,
         enable_block_reuse=enable_block_reuse,
-        layer_idx=layer_idx,
-        is_disagg=is_disagg,
-        spec_config=spec_config,
     )
     try:
-        local_layer = kv_cache_manager._fp4_mla_compact_layer_idx(
-            kv_cache_manager.layer_offsets[layer_idx]
-        )
-        v_packed_pool = fp4_mla_backend._get_fp4_mla_v_packed_pool(metadata, local_layer)
+        v_packed_pool = fp4_mla_backend._get_fp4_mla_v_packed_pool(metadata, 0)
         assert (v_packed_pool is None) is fused_v_transpose
 
         output = torch.empty_like(q[..., :kv_lora_rank])
@@ -2897,8 +2870,8 @@ def _assert_fp4_mla_attention_decode_accuracy(
         sm_scale = 0.1
         run_fp4_mla_attention_decode(
             metadata,
-            layer_idx=layer_idx,
-            local_layer=local_layer,
+            layer_idx=0,
+            local_layer=0,
             q=q,
             output=output,
             sm_scale=sm_scale,
@@ -2918,7 +2891,6 @@ def _assert_fp4_mla_attention_decode_accuracy(
             sm_scale=sm_scale,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
-            layer_idx=layer_idx,
         )
         output_float = output.float()
         error = output_float - ref_output
@@ -3614,35 +3586,6 @@ def test_fp4_mla_rowmax_readers_wait_for_correction_warps(
             packed_queries=True,
             split_kv=1,
         )
-
-
-@pytest.mark.skipif(
-    _is_cutedsl_unavailable(),
-    reason="requires Rubin SM107 and the CuTeDSL runtime",
-)
-@pytest.mark.parametrize("query_len_per_seq", [1, 4], ids=["draft-step", "verify"])
-def test_fp4_mla_attention_decode_on_context_only_draft_layer(
-    monkeypatch, query_len_per_seq: int
-) -> None:
-    """The MTP draft layer of a single-copy context cache decodes like a decoding cache.
-
-    The drafter runs its later draft steps as one-token generation steps on
-    its draft layer inside every context step. That layer keeps the decode
-    views in a lifecycle of its own, with a page table of its own.
-    """
-    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
-    _assert_fp4_mla_attention_decode_accuracy(
-        monkeypatch,
-        backend="cutedsl",
-        fused_v_transpose=False,
-        num_heads=128,
-        seq_lens=[FP4_MLA_TOKENS_PER_BLOCK + 37, 51],
-        seed=29,
-        query_len_per_seq=query_len_per_seq,
-        layer_idx=1,
-        is_disagg=True,
-        spec_config=MTPDecodingConfig(max_draft_len=3),
-    )
 
 
 @pytest.mark.skipif(
@@ -4494,20 +4437,13 @@ def test_fp4_mla_cached_context_matches_reference(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="FP4 MLA (NVFP4 KV cache) requires Blackwell or newer",
 )
-@pytest.mark.parametrize("context_only", [False, True], ids=["decoding", "context-only"])
-def test_fp4_mla_block_reuse_claims_whole_blocks(monkeypatch, context_only) -> None:
-    """Reuse claims only whole blocks, even for one-model draft lookahead.
-
-    On the single-copy cache of a disaggregated context worker the draft layer
-    lives in a lifecycle of its own, which reuses the same prefix blocks as
-    the target layers.
-    """
+def test_fp4_mla_block_reuse_claims_whole_blocks(monkeypatch) -> None:
+    """Reuse claims only whole blocks, even for one-model draft lookahead."""
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
     from tensorrt_llm.sampling_params import SamplingParams
 
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
     page_size = FP4_MLA_TOKENS_PER_BLOCK
     manager = _create_fp4_mla_v2_manager(
         max_tokens=16 * page_size,
@@ -4515,7 +4451,6 @@ def test_fp4_mla_block_reuse_claims_whole_blocks(monkeypatch, context_only) -> N
         max_batch_size=2,
         spec_config=MTPDecodingConfig(max_draft_len=3, num_nextn_predict_layers=1),
         enable_block_reuse=True,
-        is_disagg=context_only,
     )
 
     def make_request(request_id: int, tokens: list[int]) -> LlmRequest:
@@ -4548,14 +4483,10 @@ def test_fp4_mla_block_reuse_claims_whole_blocks(monkeypatch, context_only) -> N
         assert all(layer.reuse_policy == ReusePolicy.PRIVATE for layer in hp_layers)
         assert manager.reuse_match_backoff == 0
 
-        draft_layer = manager.pp_layers[-1]
-        assert (manager.fp4_mla_draft_lifecycle_layer_ids() == [draft_layer]) == context_only
-
         prompt = list(range(1000, 1000 + 3 * page_size + 40))
         first = make_request(1, prompt)
         assert run_context(first) == 0
         first_pages = manager.get_batch_cache_indices([1], layer_idx=0)[0]
-        first_draft_pages = manager.get_batch_cache_indices([1], layer_idx=draft_layer)[0]
         manager.free_resources(first)
 
         # The shared prefix ends inside the fourth block. Only whole blocks
@@ -4563,9 +4494,7 @@ def test_fp4_mla_block_reuse_claims_whole_blocks(monkeypatch, context_only) -> N
         second = make_request(2, prompt[: 3 * page_size + 20] + [7] * 30)
         assert run_context(second) == 3 * page_size
         second_pages = manager.get_batch_cache_indices([2], layer_idx=0)[0]
-        second_draft_pages = manager.get_batch_cache_indices([2], layer_idx=draft_layer)[0]
         assert second_pages[:3] == first_pages[:3]
-        assert second_draft_pages[:3] == first_draft_pages[:3]
         manager.free_resources(second)
 
         # The final prompt token is always recomputed, so an exact block
