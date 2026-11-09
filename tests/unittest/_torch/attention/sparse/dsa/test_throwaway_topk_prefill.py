@@ -38,7 +38,9 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.throwaway_topk import (
     THROWAWAY_MAX_CHUNK_ENV,
+    THROWAWAY_MIN_CONTEXT_ENV,
     ThrowawayPrefillTopK,
+    throwaway_topk_min_context,
 )
 from tensorrt_llm._utils import get_sm_version
 
@@ -645,10 +647,11 @@ class _FakeRunner:
         self.calls.append((q, weights, k, k_scale, out, kv_prefix_len, plan_cache, q_scale))
 
 
-def _fake_indexer(runner, enabled=True, failed=False):
+def _fake_indexer(runner, enabled=True, failed=False, min_context=0):
     return SimpleNamespace(
         _use_throwaway_topk=enabled,
         _throwaway_topk_failed=failed,
+        _throwaway_topk_min_context=min_context,
         _throwaway_topk=runner,
         n_heads=4,
         index_topk=8,
@@ -701,6 +704,34 @@ def test_dispatch_falls_back_when_keys_do_not_fit():
     assert runner.calls == []
 
 
+@pytest.mark.parametrize(
+    "kv_prefix_len,q_end,handled",
+    [
+        (93, 7, True),  # context of the last row == min_context
+        (92, 7, False),  # one token short
+        (0, 10, False),  # first chunk of a short request
+    ],
+)
+def test_dispatch_routes_short_context_to_unfused_path(kv_prefix_len, q_end, handled):
+    runner = _FakeRunner()
+    result, *_ = _call(
+        _fake_indexer(runner, min_context=100), _chunk(kv_prefix_len), q_begin=2, q_end=q_end
+    )
+    assert result is handled
+    assert len(runner.calls) == int(handled)
+
+
+def test_min_context_env(monkeypatch):
+    monkeypatch.delenv(THROWAWAY_MIN_CONTEXT_ENV, raising=False)
+    assert throwaway_topk_min_context() == 65536
+    monkeypatch.setenv(THROWAWAY_MIN_CONTEXT_ENV, "0")
+    assert throwaway_topk_min_context() == 0
+    for bad in ("-1", "64K"):
+        monkeypatch.setenv(THROWAWAY_MIN_CONTEXT_ENV, bad)
+        with pytest.raises(ValueError, match=THROWAWAY_MIN_CONTEXT_ENV):
+            throwaway_topk_min_context()
+
+
 def test_dispatch_slices_rows_and_shifts_prefix():
     runner = _FakeRunner()
     chunk = _chunk(kv_prefix_len=100, token_start=3)
@@ -723,10 +754,12 @@ def test_dispatch_logs_each_outcome_once(monkeypatch):
     _call(_fake_indexer(_FakeRunner(), enabled=False), _chunk(5))  # not opted in: silent
     assert keys == []
     _call(_fake_indexer(_FakeRunner()), _chunk(None))
+    _call(_fake_indexer(_FakeRunner(), min_context=100), _chunk(5))
     _call(_fake_indexer(_FakeRunner(can_run=False)), _chunk(5))
     _call(_fake_indexer(_FakeRunner()), _chunk(5))
     assert keys == [
         "throwaway_topk_multi_request",
+        "throwaway_topk_short_context",
         "throwaway_topk_too_many_keys",
         "throwaway_topk_fused",
     ]

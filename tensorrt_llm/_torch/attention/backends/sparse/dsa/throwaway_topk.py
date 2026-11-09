@@ -35,10 +35,15 @@ from tensorrt_llm.logger import logger
 THROWAWAY_TOPK_ENV = "TRTLLM_THROWAWAY_TOPK"
 THROWAWAY_MAX_CHUNK_ENV = "TRTLLM_THROWAWAY_TOPK_MAX_CHUNK"
 THROWAWAY_LOGITS_DTYPE_ENV = "TRTLLM_THROWAWAY_TOPK_LOGITS_DTYPE"
+THROWAWAY_MIN_CONTEXT_ENV = "TRTLLM_THROWAWAY_TOPK_MIN_CONTEXT"
 
 _HEAD_DIM = 128
 _SUPPORTED_NUM_HEADS = (4, 32, 64)
 _DEFAULT_MAX_CHUNK = 8192
+# Below this many context tokens (history + chunk rows) the unfused DeepGEMM logits + GVR Top-K
+# is as fast or faster; from 64K on the fused path wins for every supported indexer geometry
+# (DS-V3.2, GLM-5.x, DSV4-Flash/Pro; FP32 and BF16 logits; 4K and 8K query rows).
+_DEFAULT_MIN_CONTEXT = 65536
 _MXFP4_KEY_ALIGNMENT = 256
 _LOGITS_DTYPES = {
     "fp32": torch.float32,
@@ -54,6 +59,24 @@ PlanCache = Dict[Tuple[int, int, int], Tuple[torch.Tensor, torch.Tensor]]
 def throwaway_topk_requested() -> bool:
     """Returns True when the user opted in through ``TRTLLM_THROWAWAY_TOPK=1``."""
     return os.environ.get(THROWAWAY_TOPK_ENV, "0") == "1"
+
+
+def throwaway_topk_min_context() -> int:
+    """Returns the smallest chunk context (in tokens) that takes the fused path.
+
+    ``TRTLLM_THROWAWAY_TOPK_MIN_CONTEXT`` overrides the default; 0 sends every eligible chunk
+    to the fused path.
+    """
+    value = os.environ.get(THROWAWAY_MIN_CONTEXT_ENV, str(_DEFAULT_MIN_CONTEXT))
+    try:
+        min_context = int(value)
+    except ValueError:
+        min_context = -1
+    if min_context < 0:
+        raise ValueError(
+            f"{THROWAWAY_MIN_CONTEXT_ENV} must be a non-negative integer, got {value!r}"
+        )
+    return min_context
 
 
 def throwaway_topk_supported(n_heads: int, head_dim: int) -> bool:

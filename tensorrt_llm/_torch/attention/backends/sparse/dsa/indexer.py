@@ -47,10 +47,12 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ..params import get_indexer_mqa_logits_elem_budget, use_self_sampling_gvr
 from .params import DSAParams
 from .throwaway_topk import (
+    THROWAWAY_MIN_CONTEXT_ENV,
     THROWAWAY_TOPK_ENV,
     PlanCache,
     ThrowawayPrefillTopK,
     create_throwaway_prefill_topk,
+    throwaway_topk_min_context,
     throwaway_topk_requested,
     throwaway_topk_supported,
 )
@@ -1043,6 +1045,9 @@ class Indexer(nn.Module):
                 "using the unfused indexer + Top-K path",
                 key="throwaway_topk_unsupported",
             )
+        self._throwaway_topk_min_context = (
+            throwaway_topk_min_context() if self._use_throwaway_topk else 0
+        )
         self._throwaway_topk: Optional[ThrowawayPrefillTopK] = None
         self._throwaway_topk_failed = False
 
@@ -1731,6 +1736,14 @@ class Indexer(nn.Module):
                 "Throwaway Top-K: prefill chunks that hold several requests use the unfused "
                 "indexer + Top-K path",
                 key="throwaway_topk_multi_request",
+            )
+            return False
+        if chunk.kv_prefix_len + q_end < self._throwaway_topk_min_context:
+            logger.info_once(
+                f"Throwaway Top-K: prefill chunks with less than "
+                f"{self._throwaway_topk_min_context} tokens of context use the unfused indexer + "
+                f"Top-K path, which is faster there (override with {THROWAWAY_MIN_CONTEXT_ENV})",
+                key="throwaway_topk_short_context",
             )
             return False
         if self._throwaway_topk is None:
