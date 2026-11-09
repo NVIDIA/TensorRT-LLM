@@ -493,7 +493,9 @@ The official post-merge pipeline runs every perf-sanity stage once every N build
 | DeepSeek-V4-Pro FP4 disaggregated `e2e` | 4 |
 | Every other perf-sanity case | 2 |
 
-`POST_MERGE_STAGE_BUILD_INTERVALS` in `jenkins/L0_Test.groovy` sets `N` (or `[N, offset]`) per stage: split `k` runs on the post-merge builds whose `BUILD_NUMBER % N == (offset + k - 1) % N`, and the offsets spread the stages so that every build carries a similar load. Because the frequency is per stage, a test list holds cases of one frequency only; a case that runs at a different frequency than its list goes into its own list and stage (the `_glm5` / `-GLM5-` and `_e2e` / `-E2E-` ones). Add a new case to a list of its own frequency, and give a new list an entry if it is not every 2 builds.
+The cadence is encoded in the stage name: `Stage-k_of_N` runs when the parent `BUILD_NUMBER % N == k % N`. For example, `-1_of_8` runs at remainder 1, `-2_of_8` at remainder 2, and `-8_of_8` at remainder 0. Stages without this suffix are not filtered by build number. There is no frequency mapping table or offset balancing.
+
+`buildStageConfigs()` accepts a name template such as `Stage-{split}_of_8`. With three actual pytest splits, it generates only `-1_of_8`, `-2_of_8`, and `-3_of_8`; the other five slots launch no stage. Existing larger lists retain their actual split counts, with shard IDs wrapping modulo N when necessary. Each DeepSeek-V4-Pro E2E stage uses `-1_of_4`, so it runs alongside its corresponding `-1_of_2` gen-only stage. Cases with different frequencies stay in separate contexts and stages.
 
 A PR's `/bot run --post-merge` runs no post-merge perf-sanity stage (a stage whose name contains both `PerfSanity` and `Post-Merge`); only the official post-merge pipeline runs them. The pre-merge perf-sanity stages run as in a plain `/bot run`. To run a post-merge perf-sanity stage on a PR, name it with `--stage-list` or `--extra-stage`.
 
@@ -689,25 +691,28 @@ Each disagg test line in the test-db file follows one of these formats:
 Open `jenkins/L0_Test.groovy` and search for the `multiNodesSBSAConfigs` section inside `launchTestJobs()`. Disaggregated perf sanity stages are added via `buildStageConfigs()`:
 
 ```groovy
-def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCount, runWithSbatch=false)
+def buildStageConfigs(stageName, platform, testlist, splitCount, gpuCount, nodeCount,
+                      runWithSbatch=false, useClusterDurations=false)
 ```
 
 | Parameter | Description |
 |-----------|-------------|
-| `stageName` | CI stage name prefix (see naming convention below) |
+| `stageName` | CI name template with a `{split}` placeholder and `_of_N` cadence suffix (see below) |
 | `platform` | Hardware platform, e.g., `"auto:gb200-flex"` |
-| `testlist` | Test-db filename **without** `.yml`, e.g., `"l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4"` |
-| `testCount` | Number of **active (uncommented)** tests in the test-db file. Each disagg test gets its own stage, so `testCount` must equal the number of active tests. |
+| `testlist` | Test-db context (top-level key), e.g., `"l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4"` |
+| `splitCount` | Number of **active (uncommented)** tests in the test-db context. Each disagg test gets its own stage, so `splitCount` must equal the number of active tests. |
 | `gpuCount` | Total GPUs from Step 2 (= `total_nodes * gpus_per_node`) |
 | `nodeCount` | Total nodes from Step 2 |
 
 **Stage naming convention:**
 
 ```
-GB200-{gpuCount}_GPUs-{nodeCount}_Nodes-PyTorch-Disagg-PerfSanity-CTX{num_ctx}-NODE{nodes_per_ctx}-GPU{ctx_tp}-GEN{num_gen}-NODE{nodes_per_gen}-GPU{gen_tp}-Post-Merge
+GB200-{gpuCount}_GPUs-{nodeCount}_Nodes-PyTorch-Disagg-PerfSanity-CTX{num_ctx}-NODE{nodes_per_ctx}-GPU{ctx_tp}-GEN{num_gen}-NODE{nodes_per_gen}-GPU{gen_tp}-Post-Merge-{split}_of_{N}
 ```
 
-**If a `buildStageConfigs` entry already exists** for the test-db file: update `testCount` to match the new total number of active tests.
+Use N = 2, 4, or 8 from the frequency table; keep `{split}` literal for the generator.
+
+**If a `buildStageConfigs` entry already exists** for the test-db file: update `splitCount` to match the new total number of active tests.
 
 **If no entry exists** for the test-db file: add a new `buildStageConfigs` block. Insert it in the correct section sorted by node count (2 Nodes, 3 Nodes, 4 Nodes, etc.).
 
@@ -725,5 +730,5 @@ Checking the existing `qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_c
 4. Test-db file: `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4.yml`
 5. Locate `perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL]`. It is currently active with `TIMEOUT (30)`; do not add a duplicate. Uncomment it only if it has been disabled.
 6. Recount the active tests after any edits.
-7. In `L0_Test.groovy`, find the `buildStageConfigs` for `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4` and set `testCount` to that count, preserving it if unchanged.
+7. In `L0_Test.groovy`, find the `buildStageConfigs` for `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4` and set `splitCount` to that count, preserving it if unchanged.
 8. Check `waives.txt` for the exact test ID before enabling the test.

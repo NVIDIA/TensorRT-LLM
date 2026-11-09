@@ -374,7 +374,7 @@ def RELEASE_TARGET = "release_target"
 @Field
 def JOB_TYPE = "job_type"
 // BUILD_NUMBER of the official post-merge pipeline, passed to every L0_Test job so they all
-// pick the same stages of L0_Test.groovy's POST_MERGE_STAGE_BUILD_INTERVALS; null otherwise.
+// apply consistent stage scheduling; null otherwise.
 @Field
 def POST_MERGE_BUILD_NUMBER = "post_merge_build_number"
 // The primary location of build artifacts (see llmArtifactsPrimary), passed to every child job.

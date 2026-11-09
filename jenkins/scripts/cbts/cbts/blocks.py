@@ -430,6 +430,14 @@ _STAGE_ENTRY_RE = re.compile(
 # Used to track which cpu_arch bucket the stage entries below belong to.
 _MAP_OPEN_RE = re.compile(r"\b(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*\[\s*$")
 
+# Literal calls to the Groovy stage generator, including optional execution/schedule args.
+_STAGE_BUILDER_RE = re.compile(
+    r'(?P<var>\w+)\s*\+=\s*buildStageConfigs\(\s*"(?P<stage>[^"]+)"\s*,'
+    r'\s*"[^"]+"\s*,\s*"(?P<yml>[^"]+)"\s*,'
+    r"\s*(?P<total_splits>\d+)\s*,\s*(?P<gpu_count>\d+)\s*,\s*\d+"
+    r"(?:\s*,\s*(?:true|false|\d+))*\s*\)"
+)
+
 
 def _classify_map_var(var_name: str) -> Optional[str]:
     """Map a Groovy variable name to cpu_arch bucket, or None if unknown."""
@@ -519,10 +527,10 @@ def parse_stages_from_groovy(
     stages: dict[str, Stage] = {}
     current_arch: Optional[str] = None
 
-    for line in groovy_path.read_text().splitlines():
-        # Skip commented-out lines: disabled stage configs must not be parsed.
-        if line.lstrip().startswith("//"):
-            continue
+    source = "\n".join(
+        line for line in groovy_path.read_text().splitlines() if not line.lstrip().startswith("//")
+    )
+    for line in source.splitlines():
         open_match = _MAP_OPEN_RE.search(line.rstrip())
         if open_match:
             # Reset on every map opening — including unfamiliar ones — so a
@@ -550,6 +558,25 @@ def parse_stages_from_groovy(
             total_splits=int(m.group("total_splits") or 1),
             mako=derive_mako_from_stage(stage_name),
         )
+
+    for match in _STAGE_BUILDER_RE.finditer(source):
+        prefix = match.group("stage")
+        if not include_post_merge and "Post-Merge" in prefix:
+            continue
+        for split_id in range(1, int(match.group("total_splits")) + 1):
+            stage_name = (
+                prefix.replace("{split}", str(split_id))
+                if "{split}" in prefix
+                else f"{prefix}-{split_id}"
+            )
+            stages[stage_name] = Stage(
+                name=stage_name,
+                yaml_stem=match.group("yml"),
+                cpu_arch=_classify_map_var(match.group("var")) or "x86",
+                split_id=split_id,
+                total_splits=int(match.group("total_splits")),
+                mako=derive_mako_from_stage(stage_name),
+            )
     return stages
 
 
