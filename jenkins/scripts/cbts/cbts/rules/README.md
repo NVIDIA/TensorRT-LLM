@@ -166,7 +166,7 @@ later pre-image number.
 ### accuracy/references/*.yaml
 
 Top-level keys name what a section is a reference for, and resolve to
-anchors under `accuracy/test_*.py` so the lineage walk matches every
+anchors under `accuracy/` (including nested test directories) so the lineage walk matches every
 parametrization:
 
 - HF model name (15 of the 16 files) → test classes carrying that
@@ -175,7 +175,14 @@ parametrization:
   `accuracy/test_*.py::TestLlama3_1_8BInstruct` rather than the whole
   `accuracy/` subtree.
 - `TestC::test_m` id (`acceptance_length.yaml` only) → that method in
-  every module defining `TestC`.
+  every module defining it on `TestC`. An unverified suffix keeps the
+  class, covering inherited tests, and includes namespace consumers.
+- Other acceptance keys, such as `ModelingV2Target::mtp3`, select every
+  test class containing a reference literal with the same namespace
+  (`ModelingV2Target::`). This also covers variants constructed with string
+  suffixes or f-strings. A namespace in a module-level constant or helper
+  selects the test file. Variant names do not name pytest methods;
+  unresolved keys retain the directory fallback.
 
 Resolving to *no* anchor is a zero-impact claim, not a failure, when the
 changed keys are also absent from the post-PR YAML: that is the shape of
