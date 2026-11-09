@@ -4260,6 +4260,8 @@ class KVCacheManagerV2(BaseResourceManager):
         layers = list(config.layers)
         layer_by_id = {int(layer.layer_id): layer for layer in layers}
         roles = (Role.KEY,) if self.kv_factor == 1 else (Role.KEY, Role.VALUE)
+        if self.mixed_precision_low_dtype == self.mixed_precision_high_dtype:
+            self._check_high_layers_share_no_page_group(layers)
         for local in range(self.num_local_layers):
             if not self._is_mixed_precision_layer(local):
                 continue
@@ -4311,6 +4313,35 @@ class KVCacheManagerV2(BaseResourceManager):
         # A configured pool_ratio must now cover the appended mixed-precision high
         # group as well; the runtime rejects a mismatched length.
         return replace(config, layers=layers)
+
+    def _check_high_layers_share_no_page_group(self, layers: Sequence[object]) -> None:
+        """Reject a first/last-N setting whose high layers would share a page group with a model layer.
+
+        The KV cache manager groups layers by retention window, sink pages and reuse policy, and the
+        cold-page codec quantizes or keeps such a group as a whole. The high layers are built with a
+        window of ``mixed_precision_last_n + 1`` tokens and ``mixed_precision_first_n`` sink tokens;
+        a sliding-window layer with that same retention would land in their group, and the codec
+        could not quantize it while leaving the high layers alone.
+        """
+        tokens_per_block = self.tokens_per_block
+        high_window = self.last_n + 1
+        high_sink_pages = math.ceil(self.first_n / tokens_per_block)
+        for layer in layers:
+            window = getattr(layer, "sliding_window_size", None)
+            if window != high_window:
+                continue
+            sink_pages = math.ceil((layer.num_sink_tokens or 0) / tokens_per_block)
+            if sink_pages != high_sink_pages or layer.reuse_policy != ReusePolicy.REQUIRED:
+                continue
+            raise ValueError(
+                f"mixed_precision_first_n={self.first_n} with mixed_precision_last_n={self.last_n} "
+                f"cannot be used with this model: layer {int(layer.layer_id)} has a sliding window of "
+                f"{window} tokens and {sink_pages} sink pages, the same retention as the first/last-N "
+                "mixed-precision high layers (mixed_precision_last_n + 1 tokens, "
+                "mixed_precision_first_n sink tokens). The KV cache manager would store both in one "
+                "page group, which the cold-page codec cannot split. Choose a different "
+                "mixed_precision_last_n."
+            )
 
     def _mixed_precision_global_layer_ids(self, layer_group_id: int) -> List[int]:
         """Return the global layer ids of a layer group under mixed-precision KV.

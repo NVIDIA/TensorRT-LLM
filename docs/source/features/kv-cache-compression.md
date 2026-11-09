@@ -251,7 +251,13 @@ sequence are stored in the cold tiers at the runtime KV type, and only the
 tokens in between are stored in the compact format. This first/last-N mixed
 precision applies per attention layer: full-attention layers take it;
 sliding-window layers do not take part, as with the mixed-precision KV cache,
-and their pages are stored as ordinary cold pages.
+and their pages are stored as ordinary cold pages. The high copies are kept
+with a retention of `mixed_precision_last_n + 1` tokens plus
+`mixed_precision_first_n` sink tokens. A sliding-window layer whose window and
+sink pages match that retention would share the high copies' page group,
+which the codec cannot split, so the manager rejects that first/last-N
+combination (`mixed_precision_first_n: 0` with `mixed_precision_last_n: 127`
+for a 128-token window) and asks for another `mixed_precision_last_n`.
 
 This is the same split as the
 [mixed-precision KV cache](kvcache.md#mixed-precision-kv-cache-prototype),
@@ -276,11 +282,16 @@ kv_cache_compression_config:
   mixed_precision_last_n: 256
 ```
 
-The cost is one extra GPU copy of the first/last tokens per attention layer,
-sized by `mixed_precision_first_n + mixed_precision_last_n`, and the full-size
-storage of those tokens in the cold tiers. Attention kernels are unchanged: the
-page tables point the first/last tokens at that copy, and each step's new tokens
-are copied into the history pages as well.
+The cost in steady decode is one extra GPU copy of the first/last tokens per
+attention layer, `mixed_precision_first_n + mixed_precision_last_n` tokens
+rounded up to whole pages, plus the full-size storage of those tokens in the
+cold tiers. The two fields describe the retained history, not the peak GPU
+memory: during prefill the copy also has to hold every token of the chunk being
+processed, so its peak per layer is that window plus one prefill chunk (bounded
+by `max_num_tokens`), and the pages beyond the window are released once the
+chunk is history, as for a native sliding-window layer. Attention kernels are
+unchanged: the page tables point the first/last tokens at that copy, and each
+step's new tokens are copied into the history pages as well.
 
 The option is a prototype and has the limits of the mixed-precision KV cache:
 the TRTLLM attention backend, the standard KV cache manager, the hybrid Mamba

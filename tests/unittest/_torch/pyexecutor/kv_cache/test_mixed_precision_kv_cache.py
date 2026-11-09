@@ -316,6 +316,36 @@ def test_cold_page_mixed_precision_is_per_layer_and_skips_sliding_window_layers(
     ] == [[0, 1]]
 
 
+@pytest.mark.parametrize(
+    "first_n, last_n, builds",
+    [(0, 127, False), (0, 126, True), (128, 127, True)],
+    ids=["same_retention", "one_token_less", "different_sink_pages"],
+)
+def test_cold_page_mixed_precision_rejects_a_sliding_window_with_the_high_layers_retention(
+    make_manager, first_n, last_n, builds
+):
+    """A sliding-window layer that keeps as many tokens as the high layers (a window of
+    mixed_precision_last_n + 1 tokens, the same sink pages) would share their page group, which the
+    cold-page codec cannot split; the manager refuses that first/last-N combination and names the
+    layer. One token less, or another sink page count, keeps the layer and the high layers apart."""
+    options = dict(
+        config=cold_page_config(max_attention_window=[128, 1024], pool_ratio=[0.5, 0.25, 0.25]),
+        num_layers=2,
+        cold_page_codec_provider=_ColdPageProvider(first_n, last_n),
+    )
+    if not builds:
+        with pytest.raises(
+            ValueError,
+            match="cannot be used with this model: layer 0 has a sliding window of 128 tokens",
+        ):
+            make_manager(**options)
+        return
+    manager = make_manager(**options)
+    assert manager.mixed_precision_high_layers == {1: 2}
+    high_layer = manager.kv_cache_manager_py_config.layers[2]
+    assert (high_layer.num_sink_tokens, high_layer.sliding_window_size) == (first_n, last_n + 1)
+
+
 def test_mixed_precision_warns_when_no_layer_takes_it(make_manager):
     """When every attention layer has a sliding window, neither way of asking for mixed precision
     reaches a layer; the manager says so instead of staying silent."""

@@ -4794,7 +4794,10 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         description=
         "Number of most recent tokens per sequence kept unquantized in the cold "
         "tiers, in whole cache pages. Applies to full-attention layers; "
-        "sliding-window layers are stored as ordinary cold pages.")
+        "sliding-window layers are stored as ordinary cold pages. Rejected when a "
+        "sliding-window layer keeps the same tokens (its window is this value plus "
+        "one, with the same sink pages): the high layers would share that layer's "
+        "page group, which the cold-page codec cannot split.")
 
     @property
     def mixed_precision_high_window(self) -> Optional[tuple[int, int]]:
