@@ -1429,7 +1429,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                         raise ValueError(
                             f"Non-gated FP8 block-scale expert {expert_id} has a non-empty w3 scale."
                         )
-                    w3_scale = None
+                    w3_scale = dst_w3_weight_scale = None
                     dst_w1_weight_scale = dst_w3_w1_weight_scale[local_slot_id]
                 assert module.intermediate_size_per_partition % self.FP8_QUANT_BLOCK_SIZE == 0, "For DeepSeekFP8BlockScalesFusedMoEMethod, intermediate_size_per_partition should be divisible by FP8_QUANT_BLOCK_SIZE."
                 if w1_scale is not None:
