@@ -73,7 +73,9 @@ under the subtree count whether or not their file exists, so the importers
 of a deleted or moved module are still found. A unit test reaches the
 subtree by module name and its helpers (`_validating`, `_cells`, ...) by
 bare name; a bare name matches every test-tree file of that name, since tests
-put different directories on `sys.path`. Paths stop at the files directly
+put different directories on `sys.path`. A multi-GPU test that runs
+`_rank_job.run("<entry>", ...)` reaches `_<entry>_op_matrix.py`, the launcher
+its ranks import. Paths stop at the files directly
 under the subtree, `models/` or `catalog/`, since those reach every family.
 A file that does not parse widens the selection to the whole family or
 every entry.
@@ -204,6 +206,25 @@ def _parse(path: Path) -> Optional[ast.AST]:
         return None
 
 
+def _rank_job_launchers(tree: ast.AST) -> set[str]:
+    """The `_<entry>_op_matrix` launchers a test runs with `_rank_job.run("<entry>", ...)`.
+
+    The ranks import the launcher, not the test, so no import names it.
+    """
+    return {
+        f"_{node.args[0].value}_op_matrix"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "run"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "_rank_job"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    }
+
+
 class _ImportGraph:
     """Who imports whom among the subtree's modules and the unit tests, parsed from disk once.
 
@@ -262,7 +283,7 @@ class _ImportGraph:
             # computed name reaches no helper.
             names, _ = imported_names(tree, "")
             deps = package_names(names)
-            for name in names:
+            for name in names | _rank_job_launchers(tree):
                 for part in name.split("."):
                     deps |= helpers.get(part, set())
             for dep in deps - {key}:

@@ -389,6 +389,9 @@ changed module or a module that reaches it, directly or through a test helper.
 Tests import helpers (`_validating`, `_cells`, `_k3_*`, ...) by bare name after
 putting different directories on `sys.path`, so a bare name matches every file
 of that name in the unit test tree. This over-selects rather than misses.
+A multi-GPU test that calls `_rank_job.run("<entry>", ...)` counts as
+importing `_<entry>_op_matrix.py`, the launcher its ranks import, so it is
+selected when the code that launcher reaches changes.
 
 Import paths stop at the files directly under the subtree, `models/` or
 `catalog/`, since those reach every family. A file that does not parse widens

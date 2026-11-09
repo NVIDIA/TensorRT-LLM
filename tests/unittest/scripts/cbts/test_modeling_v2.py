@@ -333,6 +333,23 @@ def test_aliased_import_module_counts_as_an_import(tmp_path: Path) -> None:
         assert _kept(rule, f"{_SRC}/models/fam/{kernel}.py") == _FAMILY_LEVEL | _B | {_TREE}
 
 
+def test_a_rank_job_test_reaches_its_launcher(tmp_path: Path) -> None:
+    """A multi-GPU test reaches the code its `_<entry>_op_matrix.py` launcher imports."""
+    _rule(tmp_path)
+    comm = f"{_UNIT}/models/fam/ops/comm"
+    test = f"{comm}/test_fused_op_matrix.py"
+    for path, text in (
+        (test, 'import _rank_job\n\n\ndef test_fused():\n    _rank_job.run("fam_fused", 4)\n'),
+        (f"{comm}/_fam_fused_op_matrix.py", f"from {_ABS}.models.fam.ops.norm import fused\n"),
+    ):
+        (tmp_path / "tests" / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "tests" / path).write_text(text)
+    index = YAMLIndex()
+    index.blocks = [Block("l0_b300", 0, {}, sorted(_EVERYTHING | {_TREE, test}))]
+    rule = ModelingV2Rule(index, {}, repo_root=tmp_path)
+    assert test in _kept(rule, f"{_SRC}/models/fam/ops/norm/fused.py")
+
+
 def test_targets_come_from_routing(tmp_path: Path) -> None:
     """An accuracy directory neither makes nor is needed for a target."""
     rule = _rule(tmp_path)
