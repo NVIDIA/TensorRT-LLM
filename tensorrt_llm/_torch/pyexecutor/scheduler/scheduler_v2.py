@@ -25,6 +25,7 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 from tensorrt_llm.logger import logger
 
+from ...disaggregation import diagnostics as disagg_diagnostics
 from ..llm_request import (
     LlmRequest,
     LlmRequestState,
@@ -698,6 +699,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             protected = {r.py_request_id for r in scheduled_gen}
             protected.update(r.py_request_id for r in scheduled_ctx)
             protected.add(req.py_request_id)
+            # A request this pass already suspended or recompute-paused has
+            # given up what it can for now; taking it again would list it
+            # twice and report pages that were never released.
+            protected.update(r.py_request_id for r in evicted)
+            protected.update(r.py_request_id for r in recompute_paused)
             # Demotion reorders compute, not page priority: a demoted request
             # that arrived before `req` would have been scheduled, and so
             # protected, ahead of it in FCFS order.
@@ -1216,10 +1222,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         Returns ``(action, tokens)``.  *tokens* is 0 because disagg requests
         don't participate in the forward pass token budget.
         """
-        # Cache-transceiver mode disables the separate one-model draft manager,
-        # so disagg generation init has no paired-reuse path. Supporting one
-        # would also require draft KV transfer and history_length=prompt_len.
-        if not self.kv_cache_manager.prepare_disagg_gen_init(req):
+        # Only the target manager receives prompt KV. Drafters that need it
+        # under disagg keep their layers in that manager (MTP/Eagle fold them
+        # in; DFlash uses explicit draft layer specs). A separate draft manager
+        # gets no transfer and no paired-reuse path here.
+        prepared = self.kv_cache_manager.prepare_disagg_gen_init(req)
+        if not prepared:
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                disagg_diagnostics.emit_kv_admission_result(
+                    req, self.kv_cache_manager, admitted=False
+                )
             logger.debug("prepare_disagg_gen_init failed for request %s", req.py_request_id)
             return ScheduleAction.SKIP, 0
         return ScheduleAction.SCHEDULED, 0
@@ -1344,6 +1356,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # before budget check.
         if not self._prepare_context_pair(req):
             logger.debug(f"prepare_context failed for context request {req.py_request_id}")
+            self._preempt_for_resume(req, preempt_for_pages)
             return ScheduleAction.STOP, 0, False
 
         context_tokens = req.context_remaining_length
@@ -1415,6 +1428,18 @@ class KVCacheV2Scheduler(RequestScheduler):
             return req.context_remaining_length > remaining
         return self._uncached_tokens(req) > remaining and not self._holds_context_cache(req)
 
+    def _preempt_for_resume(
+        self, req: LlmRequest, preempt_for_pages: Callable[[LlmRequest], bool]
+    ) -> bool:
+        """Free GPU pages for a suspended mid-prefill request that could not resume.
+
+        Under helix, bringing a suspended request's pages back can fail once
+        newer requests have taken the GPU pages, for example after its pages
+        moved to a tier below GPU. Like a failed resize, give up a newer
+        started request so the older one is not left waiting behind it.
+        """
+        return self.has_cp_helix and not req.is_first_context_chunk and preempt_for_pages(req)
+
     def _try_schedule_context_chunked(
         self,
         req: LlmRequest,
@@ -1445,6 +1470,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Prepare context (create _KVCache, block reuse, resume — no resize)
         if not self._prepare_context_pair(req):
             logger.debug(f"prepare_context failed for chunked context request {req.py_request_id}")
+            if self._preempt_for_resume(req, preempt_for_pages):
+                return ScheduleAction.STOP, 0, False
             return ScheduleAction.SKIP, 0, False
 
         # Calculate chunk size from remaining budget
@@ -2006,8 +2033,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if not self.enable_recompute_pause:
                     # Without recompute pause (e.g. a disaggregated generation
                     # server, which cannot replay a prefill) there is no way to
-                    # free pages, and suspending to a lower tier is not
-                    # validated under helix, so fail instead of stalling.
+                    # free pages, and suspending to a lower tier is validated
+                    # only under aggregated helix, so fail instead of stalling.
                     raise RuntimeError(
                         f"[V2Scheduler] KV allocation failed for helix request "
                         f"{req.py_request_id}; recompute pause is disabled "
@@ -2018,11 +2045,10 @@ class KVCacheV2Scheduler(RequestScheduler):
                         f"or max_tokens (GLOBAL tokens across CP ranks, not "
                         f"per-rank), or reduce concurrency."
                     )
-                # Aggregated helix has a single hot GPU pool (no host, disk
-                # or GPU cold level), so a suspended request's pages have
-                # nowhere to go and recompute-pause is the only way to make
-                # room.
-            else:
+            # Under helix without a tier below GPU, a suspended request's pages
+            # have nowhere to go, so recompute-pause is the only way to make
+            # room.
+            if not self.has_cp_helix or self.kv_cache_manager.has_cache_tier_below_gpu:
                 req_it_end, success = self._try_evict_for_gen(
                     req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
                 )
@@ -2046,10 +2072,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         # GPU pages so other requests can resume().
         # Skip if already suspended — suspending again is a no-op
         # that frees no pages.
-        if self.has_cp_helix:
-            # Suspending frees nothing in aggregated helix's single hot GPU
-            # pool. The request still sits out this step, so clear its stale
-            # batch index.
+        if self.has_cp_helix and not self.kv_cache_manager.has_cache_tier_below_gpu:
+            # Suspending frees nothing under helix without a tier below GPU.
+            # The request still sits out this step, so clear its stale batch
+            # index.
             logger.debug(
                 f"[V2Scheduler] Helix request {req.py_request_id} found no pages or victim; waiting"
             )
@@ -2132,8 +2158,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         """Release one started request's KV cache so another can allocate.
 
         The fallback for a pool that suspension cannot drain; see
-        `KVCacheManagerV2.preempt_request`. With a cache tier below GPU,
-        suspension is cheaper and keeps the pages, so that path is left alone.
+        `KVCacheManagerV2.preempt_request`. With a cache tier below GPU, this
+        waits while an active decode request holds GPU pages; under helix it
+        falls back to preemption once none does.
 
         The victim leaves on `recompute_paused`, the same channel the
         generation side uses, because a re-prefill needs more teardown than the
@@ -2145,7 +2172,18 @@ class KVCacheV2Scheduler(RequestScheduler):
         Returns True when pages became available in this iteration.
         """
         if self.kv_cache_manager.has_cache_tier_below_gpu:
-            return False
+            # Wait while an active generation request holds GPU pages: they
+            # come back when it finishes, or if a failing generation request
+            # suspends it; a blocked context request never triggers that
+            # suspend. Under helix, once no active generation request is left,
+            # every started request is mid-prefill or suspended, and none gives
+            # its pages back on its own, so fall through to recompute-pause.
+            if not self.has_cp_helix or any(
+                r.is_generation_in_progress_state
+                and self.kv_cache_manager.is_request_active(r.py_request_id)
+                for r in requests_list
+            ):
+                return False
         # A disaggregated generation worker received its context KV rather
         # than computing it, so it cannot replay a prefill at all.
         if not self.enable_recompute_pause:
@@ -2159,15 +2197,25 @@ class KVCacheV2Scheduler(RequestScheduler):
             # does: an older victim would retake the pages on the next pass
             # and preempt the requester in turn.
             stop = requester_idx
-        for i in range(len(requests_list) - 1, stop, -1):
-            victim = requests_list[i]
-            if victim.py_request_id in protected_ids:
-                continue
-            if not self._is_recompute_pause_candidate(victim, inflight_request_ids):
-                continue
-            if not self.kv_cache_manager.is_request_active(victim.py_request_id):
-                continue
-
+        candidates = [
+            victim
+            for victim in reversed(requests_list[stop + 1 :])
+            if victim.py_request_id not in protected_ids
+            and self._is_recompute_pause_candidate(victim, inflight_request_ids)
+        ]
+        # An active request holds its pages on GPU, so preempting it always
+        # frees GPU memory. A suspended request's pages move to the lower tier
+        # whenever that tier has room, so it is worth preempting only once the
+        # tier is full and its pages are stuck on GPU; take one only when no
+        # active request is left to give.
+        active = [
+            victim
+            for victim in candidates
+            if self.kv_cache_manager.is_request_active(victim.py_request_id)
+        ]
+        if active or not self.kv_cache_manager.has_cache_tier_below_gpu:
+            candidates = active
+        for victim in candidates:
             if not self._preempt_or_defer(victim, recompute_paused):
                 return False
             logger.debug(
@@ -2298,19 +2346,29 @@ class KVCacheV2Scheduler(RequestScheduler):
                 )
             return
 
-        # Aggregated helix (`KVCacheManagerV2.__init__`) and a connector
-        # (`PyExecutor._reject_non_gpu_cache_tiers`) reject every tier below GPU
-        # at bring-up, so offering host_cache_size there is advice the user
-        # cannot act on.
-        if self.has_cp_helix and self.enable_recompute_pause:
-            remedy = (
-                "Aggregated helix runs a single hot GPU pool, so no secondary "
-                "tier can be configured. Increase "
-                "kv_cache_config.max_gpu_total_bytes (rank-local bytes), "
+        if self.has_cp_helix:
+            # Under helix, max_gpu_total_bytes is per rank but max_tokens
+            # counts tokens across all CP ranks.
+            gpu_remedy = (
+                "increase kv_cache_config.max_gpu_total_bytes (rank-local bytes), "
                 "max_tokens (GLOBAL tokens across CP ranks) or "
                 "free_gpu_memory_fraction, or lower max_batch_size."
             )
+            # Only aggregated helix (the side that can recompute-pause) can
+            # suspend to a host tier.
+            if not self.enable_recompute_pause:
+                remedy = gpu_remedy[0].upper() + gpu_remedy[1:]
+            elif self.kv_cache_manager.has_cache_tier_below_gpu:
+                remedy = (
+                    "The host tier may be full: increase "
+                    f"kv_cache_config.host_cache_size, or {gpu_remedy}"
+                )
+            else:
+                remedy = f"Configure kv_cache_config.host_cache_size, or {gpu_remedy}"
         elif getattr(self.kv_cache_manager, "kv_connector_manager", None) is not None:
+            # A connector rejects every tier below GPU at bring-up
+            # (`PyExecutor._reject_non_gpu_cache_tiers`), so host_cache_size is
+            # not an option here.
             remedy = (
                 "A KV connector is attached, which requires a GPU-only cache, "
                 "so no secondary tier can be configured. Increase "

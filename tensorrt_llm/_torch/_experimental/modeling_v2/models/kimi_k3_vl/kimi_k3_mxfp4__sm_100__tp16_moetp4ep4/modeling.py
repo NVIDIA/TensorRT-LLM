@@ -229,8 +229,7 @@ REQUIRED_ENGINE_FIELDS = {
 }
 
 #: Stock code the generic path runs outside the catalog, declared so it is not consumed silently: every
-#: tensorrt_llm import of this module that computes (test_modeling_v2_claims.py checks the list both ways). An entry
-#: leaves the list when a catalog entry replaces it.
+#: tensorrt_llm import of this module that computes. An entry leaves the list when a catalog entry replaces it.
 UNCERTIFIED_GENERIC_CALLS = (
     # The checkpoint load and the engine hooks this target inherits, and the causal LM around the text model.
     "tensorrt_llm._torch.models.modeling_kimi_linear.KimiLinearForCausalLM",
@@ -2330,11 +2329,23 @@ class K3DecodeKDA(KimiKDALinearAttention):
         slot_indices,
         output: Optional[torch.Tensor] = None,
         allow_prequantized_output: bool = False,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """The built-in verify, unless the cache manager keeps the per-token states; then the decode kernels'."""
+        """The built-in verify, unless the cache manager keeps the per-token states; then the decode kernels'.
+
+        ``prequantized_input`` (the MXFP8 form of ``x2d``) goes to the built-in verify; the decode kernels read
+        ``x2d``.
+        """
         if not (self._has_kda_replay_caches(layer_cache) and layer_cache.kda_state_tok is not None):
             return super().forward_verify(
-                x2d, num_steps, layer_cache, conv_pool, ssm_pool, slot_indices, output=output
+                x2d,
+                num_steps,
+                layer_cache,
+                conv_pool,
+                ssm_pool,
+                slot_indices,
+                output=output,
+                prequantized_input=prequantized_input,
             )
         assert self.takes_k3_kernels and self.k3_buffers is not None, (
             f"Kimi K3 KDA layer {self.layer_idx}: the cache manager keeps the per-token verify states, which only "

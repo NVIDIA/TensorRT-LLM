@@ -28,9 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 from cbts.blocks import normalize_test_id
-
-# Canonicalize an absolute co_filename to the DB `file` form (`tensorrt_llm/...`).
-_CANON_RE = re.compile(r"(tensorrt_llm/.*)$")
+from cbts.coverage.collection.compact_db import canonicalize_path
 
 # A DB test value is `<stage>/<nodeid>`; unit tests wrap the inner entry.
 _UNITTEST_WRAP_RE = re.compile(r"::test_unittests_v2\[(?P<inner>.+)\]$")
@@ -59,9 +57,8 @@ _QUALIFIED_TEST_SQL = (
 
 
 def canon(path: str) -> str:
-    """Canonicalize a path to the DB's `file` form (`tensorrt_llm/...`)."""
-    m = _CANON_RE.search(path)
-    return m.group(1) if m else path
+    """Use collection's file identity, preserving repository-relative paths."""
+    return canonicalize_path(path)
 
 
 def split_stage(test: str) -> tuple[str, str]:

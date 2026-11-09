@@ -86,6 +86,7 @@ def _decoder(cls):
     decoder._step_skip = None
     decoder._cur_step_eager = False
     decoder._prev_step_eager = False
+    decoder._num_added_batches = 0
     for name in (
         "fetch_batch",
         "init_disagg_gen_requests",
