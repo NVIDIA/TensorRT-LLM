@@ -14,11 +14,29 @@
 # limitations under the License.
 """Unit tests for MambaHybridCacheManagerV2 under helix context parallelism."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MambaStateConfig
 
 pytestmark = pytest.mark.cpu_only
+
+TOKENS_PER_BLOCK = 32
+
+
+def _helix_manager(cp_size: int, **mamba_state: object) -> MambaHybridCacheManagerV2:
+    """Bare V2 hybrid manager carrying only what snapshot placement reads."""
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._has_cp_helix = True
+    mgr.tokens_per_block = TOKENS_PER_BLOCK
+    mgr._ledger_tokens_per_block = TOKENS_PER_BLOCK * cp_size
+    mgr.enable_block_reuse = True
+    mgr.kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True, mamba_state_config=MambaStateConfig(**mamba_state)
+    )
+    return mgr
 
 
 @pytest.mark.parametrize("cp_size", [2, 4, 8])
@@ -50,37 +68,39 @@ def test_mamba_hybrid_quota_to_tokens_under_helix(cp_size: int) -> None:
     assert mgr._get_quota_from_max_tokens(tokens + 1) > quota
 
 
-def test_block_reuse_rejected_for_recurrent_state_under_helix() -> None:
-    """Recurrent-state snapshot points are not aligned to ledger blocks, so a
-    reused prefix could restore the state of a later token."""
-    import torch
+@pytest.mark.parametrize(
+    ("cp_size", "expected"),
+    [
+        (2, [64, 192, 256, 384, 448, 576, 640, 768, 832, 960]),
+        (4, [128, 256, 384, 512, 640, 768, 896]),
+    ],
+)
+def test_snapshot_points_land_on_ledger_blocks_under_helix(cp_size: int, expected: list) -> None:
+    """A reused prefix ends on a ledger block, so every recurrent-state
+    snapshot moves down onto one; points below the first block are dropped."""
+    mgr = _helix_manager(
+        cp_size, periodic_snapshot_interval=96, additional_snapshot_offsets_from_end=[0, 10]
+    )
+    request = SimpleNamespace(py_request_id=1, prompt_len=1000, expect_snapshot_points=[])
 
-    from tensorrt_llm.bindings import DataType
-    from tensorrt_llm.bindings.internal.batch_manager import CacheType
-    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-    from tensorrt_llm.mapping import CpType, Mapping
+    mgr.prepare_expect_snapshot_points([request])
 
-    with pytest.raises(ValueError, match="recurrent state layers under helix"):
-        MambaHybridCacheManagerV2(
-            mamba_d_state=128,
-            mamba_d_conv=4,
-            mamba_num_heads=2,
-            mamba_n_groups=2,
-            mamba_head_dim=64,
-            mamba_num_layers=1,
-            mamba_layer_mask=[True, False],
-            mamba_cache_dtype=torch.bfloat16,
-            mamba_ssm_cache_dtype=torch.float32,
-            kv_cache_config=KvCacheConfig(enable_block_reuse=True),
-            kv_cache_type=CacheType.SELFKONLY,
-            num_layers=1,
-            num_kv_heads=1,
-            head_dim=576,
-            tokens_per_block=32,
-            max_seq_len=1024,
-            max_batch_size=1,
-            mapping=Mapping(world_size=2, rank=0, cp_size=2, cp_config={"cp_type": CpType.HELIX}),
-            dtype=DataType.HALF,
-            layer_mask=[False, True],
-            is_disagg=False,
-        )
+    assert request.expect_snapshot_points == expected
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_waiter_snapshot_point_lands_on_ledger_block_under_helix(cp_size: int) -> None:
+    """A prefix a waiting request asks for moves down onto a ledger block; one
+    shorter than a ledger block cannot be reused, so the request does not wait."""
+    mgr = _helix_manager(cp_size)
+    mgr.kv_cache_map = {}
+    mgr.num_extra_kv_tokens = 0
+    owner = SimpleNamespace(
+        py_request_id=1, prompt_len=1000, context_current_position=0, expect_snapshot_points=[]
+    )
+
+    assert mgr.request_prefix_snapshot(owner, 300)
+    assert owner.expect_snapshot_points == [256]
+
+    assert not mgr.request_prefix_snapshot(owner, 50)
+    assert owner.expect_snapshot_points == [256]

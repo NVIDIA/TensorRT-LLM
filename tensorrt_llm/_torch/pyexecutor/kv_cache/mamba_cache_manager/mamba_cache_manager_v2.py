@@ -154,10 +154,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     # Mixed-precision high layers are appended like any attention layer group.
     _supports_mixed_precision_kv = True
+    # Set per instance by KVCacheManagerV2 under helix context parallelism.
+    _has_cp_helix = False
     # Set per instance to the policy that lays out the attention layers when a
     # subclass selects one (see _configure_attention_cache_layout); the
     # manager forwards attention-layout operations to it.
     _attention_cache_layout_policy = None
+    # Set per instance once a helix ledger snapshot move has been logged.
+    _helix_snapshot_realignment_logged = False
     # Construction and cache configuration
 
     @override
@@ -350,13 +354,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         kv_cache_config = kv_cache_config.model_copy(deep=True)
         if any(mamba_layer_mask) and kv_cache_config.enable_block_reuse:
-            if mapping.has_cp_helix():
-                raise ValueError(
-                    "Block reuse is not supported for models with recurrent "
-                    "state layers under helix context parallelism: state "
-                    "snapshot points are not aligned to ledger blocks. "
-                    "Set kv_cache_config.enable_block_reuse=False."
-                )
             block_reuse_config = kv_cache_config.block_reuse_config
             block_reuse_policy = BlockReusePolicy(block_reuse_config.policy)
             if block_reuse_policy == BlockReusePolicy.ALL_REUSABLE:
@@ -1641,7 +1638,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def prepare_expect_snapshot_points(self, requests: List[LlmRequest]) -> None:
         super().prepare_expect_snapshot_points(requests)
         for request in requests:
-            self._align_snapshot_points_to_attention_layout(request)
+            self._align_snapshot_points(request)
         block_reuse_config = self.kv_cache_config.block_reuse_config
         if self.enable_block_reuse and block_reuse_config.enable_branch_snapshot:
             for request in requests:
@@ -1664,19 +1661,47 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         point may arrive after ``owner``'s history has passed its committed
         tokens; update_context_resources then advances history to each chunk
         end, so the commit at the point ends at history as commit_min_snapshot
-        requires.
+        requires. The point is moved down onto the same blocks as every other
+        snapshot point (see _align_snapshot_points).
         """
+        block = self._snapshot_alignment_block()
+        if block is not None:
+            num_tokens = num_tokens // block * block
         return self._add_waiter_snapshot_point(owner, num_tokens)
 
-    def _align_snapshot_points_to_attention_layout(self, request: LlmRequest) -> None:
-        """Let the attention cache layout policy move the request's snapshot points.
+    def _snapshot_alignment_block(self) -> Optional[int]:
+        """Helix ledger-block granularity that snapshot points are moved down to, if any."""
+        return self._ledger_tokens_per_block if self._has_cp_helix else None
 
-        A policy whose reuse resumes only on some token boundaries moves the
-        recurrent-state snapshots onto them (``align_snapshot_points``).
+    def _align_snapshot_points(self, request: LlmRequest) -> None:
+        """Move recurrent-state snapshots down onto the blocks a reused prefix ends on.
+
+        Under helix context parallelism, a reused prefix ends on a whole ledger
+        block (tokens_per_block * cp_size global tokens), since partial-block
+        reuse is off. A snapshot inside a block would restore the recurrent
+        state of a later token than the reused prefix ends at; one below the
+        first block can never be reused. A ledger block is a whole number of
+        cache blocks, so it also meets a layout policy that aligns to cache
+        blocks. Without helix, the attention cache layout policy, if any, moves
+        the points (``align_snapshot_points``).
         """
-        layout_policy = self._attention_cache_layout_policy
-        if layout_policy is not None:
-            layout_policy.align_snapshot_points(self, request)
+        if not self._has_cp_helix:
+            layout_policy = self._attention_cache_layout_policy
+            if layout_policy is not None:
+                layout_policy.align_snapshot_points(self, request)
+            return
+        block = self._ledger_tokens_per_block
+        points = request.expect_snapshot_points
+        aligned = sorted({point // block * block for point in points if point >= block})
+        if aligned != sorted(set(points)) and not self._helix_snapshot_realignment_logged:
+            self._helix_snapshot_realignment_logged = True
+            logger.info(
+                f"Moving Mamba snapshot points down to {block}-token helix "
+                f"ledger blocks and dropping points below the first block "
+                f"(logged once; request {request.py_request_id}: "
+                f"{sorted(set(points))} -> {aligned})."
+            )
+        request.expect_snapshot_points = aligned
 
     def _skip_branch_snapshot(self, reason: str) -> None:
         self._branch_snapshots_skipped_total[reason] = (
@@ -1774,7 +1799,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if point is not None and point > current_position:
             points.add(point)
         request.expect_snapshot_points = sorted(points)
-        self._align_snapshot_points_to_attention_layout(request)
+        self._align_snapshot_points(request)
 
     def _format_branch_snapshot_counters(self) -> str:
         """Attribute reuse loss between missing snapshots and evicted pages.
