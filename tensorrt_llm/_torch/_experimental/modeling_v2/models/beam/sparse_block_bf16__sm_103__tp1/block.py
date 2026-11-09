@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Beam decoder blocks 3-5 / sm_103 / tp1: one sparse (MoE) block, constructed directly.
 
+This TP1 component uses FlashInfer normalization/activation kernels; see the family
+README for its numerical differences from the TP4 serving model.
+
 A component, not a routed target. There is no ``routing.py``, no router-index entry and
 no ``ForCausalLM``: nothing in the engine builds this class, and it serves no request.
 A caller constructs it from the checkpoint's configuration for one of the sparse blocks

@@ -22,3 +22,12 @@ graphs and overlap scheduling are outside this component baseline.
 Beam-only operators live under `ops/`, with tests in the matching Beam test tree.
 Component-specific cases for shared catalog operators reuse the catalog test drivers,
 including TP1 shapes and the per-rank TP4 projection, attention and expert shapes.
+
+## Component comparison limits
+
+The TP1 block components are directly constructed bring-up/debugging building blocks,
+not the serving implementation or an op-for-op reference for the TP4 model. TP1 uses
+FlashInfer RMSNorm and fused SiLU/multiply; the TP4 input norm and dense MLP use explicit
+FP32 Beam operators. Those paths can differ by BF16 rounding units. TP1 also accepts a
+narrower RoPE configuration schema. Compare each component against its declared operator
+contract rather than expecting bitwise TP1/TP4 identity.

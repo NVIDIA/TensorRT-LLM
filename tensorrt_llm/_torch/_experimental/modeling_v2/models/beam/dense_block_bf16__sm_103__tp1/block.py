@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Beam decoder blocks 0-2 / sm_103 / tp1: one dense, sliding-attention block, constructed directly.
 
+This TP1 component uses FlashInfer normalization/activation kernels; see the family
+README for its numerical differences from the TP4 serving model.
+
 A component, not a routed target. There is no ``routing.py``, no router-index entry and
 no ``ForCausalLM``: nothing in the engine builds this class, and it serves no request.
 A caller constructs it from the checkpoint's configuration for one of the dense blocks
@@ -24,7 +27,7 @@ The block, with block 0's residual coefficients (block i's are in ``depth_scales
     m = (silu(h @ gate^T) * (h @ up^T)) @ down^T            silu and product in fp32
     out = rmsnorm(m, post_feedforward_layernorm) / sqrt(3) + x * sqrt(2) / sqrt(3)
 
-Every RMSNorm computes its statistics, normalization and affine in fp32 and rounds once.
+RMSNorm and the dense activation follow their FlashInfer operator contracts.
 """
 
 from __future__ import annotations
