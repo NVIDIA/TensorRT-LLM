@@ -81,7 +81,11 @@ def registered_routes() -> Dict[str, Callable[..., type]]:
 #: mode is its own bug taking down a working deployment.
 #:
 #: An environment variable rather than an LLM arg while modeling_v2 is
-#: experimental; it has to reach the ranks, so a test passes it through
+#: Beam additionally enables checkpoint digests, per-layer metadata rechecks and per-step
+#: routing agreement (device-to-host copies, hashing and collectives). Keep it off for
+#: performance measurements; all Beam ranks must use the same setting.
+#:
+#: It has to reach the ranks, so a test passes it through
 #: ``env_overrides``. When this stops being experimental it belongs in the
 #: LLM args, where a caller can set it per engine rather than per process.
 MODELING_V2_VALIDATE_ENV = "TRTLLM_MODELING_V2_VALIDATE"
