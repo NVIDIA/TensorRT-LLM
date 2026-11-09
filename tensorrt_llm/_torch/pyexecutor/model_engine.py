@@ -149,7 +149,7 @@ class ModelEngine:
             model_weights_memory_tag=model_weights_memory_tag,
             model_weights_restore_mode=model_weights_restore_mode,
         )
-        if not (self.model.model_config.is_generation or self.llm_args.mm_encoder_only):
+        if not self.model.model_config.is_generation:
             self.llm_args = resolve_scheduled_encoder_args(self.llm_args)
         self._init_from_model()
         self._size_cuda_graphs()
