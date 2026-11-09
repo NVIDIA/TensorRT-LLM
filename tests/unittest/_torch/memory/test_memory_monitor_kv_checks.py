@@ -203,10 +203,6 @@ class TestInconsistentPoolKeepsCapacity:
         logical = [e for e in KvCacheProvider(manager).collect() if e.basis is Basis.LOGICAL]
         assert logical[0].size_bytes is None
 
-    def test_check_c_still_flags_it(self):
-        manager = _manager(_stats(100, 70, 50))
-        assert not check_kv_pool_conservation(kv_pool_group_stats(manager))[0].passed
-
 
 @pytest.mark.cpu_only
 class TestPoolRoles:
@@ -263,34 +259,22 @@ class TestChecksRunInRealReports:
         yield
         reg.clear_registered_providers()
 
-    def test_inconsistent_pool_fails_check_c_in_the_report(self):
+    def test_every_report_runs_the_checks(self):
         from tensorrt_llm._torch.memory.monitor import capture, render_capture
         from tensorrt_llm._torch.memory.monitor.providers import register_provider
 
-        manager = _manager(_stats(100, 70, 50))
-        register_provider(KvCacheProvider(manager, "main"))
+        # Providers hold their manager weakly; keep both alive.
+        inconsistent, consistent = _manager(_stats(100, 70, 50)), _manager(_stats(100, 30, 20))
+        register_provider(KvCacheProvider(inconsistent, "main"))
+        register_provider(KvCacheProvider(consistent, "draft"))
         snapshot = capture(tag="unit")
 
-        failed = [c for c in snapshot.checks if not c.passed]
-        assert any(c.name.startswith("C:kv_cache.main") for c in failed)
+        main = [c.passed for c in snapshot.checks if c.name.startswith("C:kv_cache.main")]
+        draft = [c.passed for c in snapshot.checks if c.name.startswith("C:kv_cache.draft")]
+        assert main == [False] and draft == [True]
+        assert any(c.name.startswith("B:") for c in snapshot.checks)
         text = render_capture(snapshot)
         assert "FAILED" in text and "[checks]" in text
-
-    def test_consistent_pool_passes(self):
-        from tensorrt_llm._torch.memory.monitor import capture
-        from tensorrt_llm._torch.memory.monitor.providers import register_provider
-
-        manager = _manager(_stats(100, 30, 20))
-        register_provider(KvCacheProvider(manager, "main"))
-        snapshot = capture(tag="unit")
-        kv = [c for c in snapshot.checks if c.name.startswith("C:")]
-        assert kv and all(c.passed for c in kv)
-
-    def test_check_b_is_always_present(self):
-        from tensorrt_llm._torch.memory.monitor import capture
-
-        snapshot = capture(tag="unit")
-        assert any(c.name.startswith("B:") for c in snapshot.checks)
 
 
 @pytest.mark.cpu_only

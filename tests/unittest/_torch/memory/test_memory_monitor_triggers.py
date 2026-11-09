@@ -157,11 +157,6 @@ class TestReportNow:
 
 
 class TestOomReporter:
-    @pytest.mark.cpu_only
-    def test_not_installed_when_disabled(self, monkeypatch):
-        monkeypatch.setenv("TLLM_MEM_MONITOR", "0")
-        assert install_oom_reporter(rank=0) is False
-
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
     def test_installs_once_and_stays_installed(self, monkeypatch):
         monkeypatch.setenv("TLLM_MEM_MONITOR", "1")

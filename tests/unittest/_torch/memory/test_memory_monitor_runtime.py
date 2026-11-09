@@ -127,9 +127,8 @@ class TestOnRequest:
         from tensorrt_llm.executor.base_worker import BaseWorker
 
         monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
-        worker = object.__new__(BaseWorker)
-        worker.engine = SimpleNamespace(device_id=torch.cuda.current_device())
-        (text,) = worker.get_memory_report()
+        worker = SimpleNamespace(engine=SimpleNamespace(device_id=torch.cuda.current_device()))
+        (text,) = BaseWorker.get_memory_report(worker)
         assert "This process uses" in text
 
     @pytest.mark.cpu_only
@@ -229,8 +228,8 @@ class TestEveryRank:
     def test_a_silent_rank_does_not_hold_up_the_rest(self, monkeypatch):
         reporters, _, _ = self._ranks(monkeypatch, 3, {1})
         try:
-            got = reporters[0].gather(timeout=1)
-            assert got == ["report of rank 1", "rank 2: no report within 1 s"]
+            got = reporters[0].gather(timeout=0.3)
+            assert got == ["report of rank 1", "rank 2: no report within 0.3 s"]
         finally:
             for r in reporters:
                 r.stop()
@@ -241,4 +240,4 @@ class TestEveryRank:
 
         with lock:  # rank 1's answer to request 0, which timed out long ago
             box.setdefault((1, 0, ranks._REPLY_TAG), []).append((0, "stale"))
-        assert reporters[0].gather(timeout=0.5) == ["rank 1: no report within 0.5 s"]
+        assert reporters[0].gather(timeout=0.2) == ["rank 1: no report within 0.2 s"]

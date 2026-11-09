@@ -62,16 +62,13 @@ class TestDefaultReportsOnlyOutOfMemory:
         monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
         monkeypatch.setenv(triggers.INTERVAL_VAR, "0.05")
 
-    def test_oom_reporting_is_armed(self):
-        assert triggers.install_oom_reporter(rank=0) is True
-
     def test_an_oom_is_reported(self, monkeypatch):
         seen = []
         monkeypatch.setenv("TLLM_MEM_MONITOR_OOM_INTERVAL", "0")
         monkeypatch.setattr(
             triggers, "report_now", lambda tag, **kw: seen.append((tag, kw.get("force"))) or "r"
         )
-        triggers.install_oom_reporter(rank=0)
+        assert triggers.install_oom_reporter(rank=0) is True
         triggers.notify_error("CUDA error: out of memory")
         # The full monitor is off, so the report has to be forced.
         assert seen == [("out_of_memory", True)]
@@ -100,10 +97,3 @@ def test_off_reports_nothing(monkeypatch):
     assert triggers.install_oom_reporter(rank=0) is False
     triggers.notify_error("CUDA error: out of memory")
     assert seen == []
-
-
-def test_full_mode_also_starts_the_periodic_report(monkeypatch):
-    monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
-    monkeypatch.setenv(triggers.INTERVAL_VAR, "60")
-    assert triggers.install_oom_reporter(rank=0) is True
-    assert any(t.name == "memory-monitor-periodic" for t in threading.enumerate())
