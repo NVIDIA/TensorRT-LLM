@@ -128,6 +128,25 @@ if TYPE_CHECKING:
 
 _UNBOUNDED_STATS_MAX_LEN = -1
 
+# A busy fetch (timeout 0) skips the batch_wait_timeout_ms wait while the
+# executor already holds context work for the next step (a waiting request that
+# is not generation-only, or an active request still in CONTEXT_INIT): the wait
+# then only delays that step.
+# Installed as ExecutorRequestQueue.skip_batch_wait_when. Armed process-wide by
+# arm_ctx_batch_wait_skip (the MiniMax-M3.1 sm_107 targets); kill switch
+# TRTLLM_M31_DISABLE_CTX_BATCH_WAIT_SKIP=1.
+_CTX_BATCH_WAIT_SKIP_KILLED = os.environ.get(
+    "TRTLLM_M31_DISABLE_CTX_BATCH_WAIT_SKIP", "0") == "1"
+# MSO: no target arms it yet, so TRTLLM_CTX_BATCH_WAIT_SKIP=1 arms it too.
+_CTX_BATCH_WAIT_SKIP = (os.environ.get("TRTLLM_CTX_BATCH_WAIT_SKIP", "0") == "1"
+                        and not _CTX_BATCH_WAIT_SKIP_KILLED)
+
+
+def arm_ctx_batch_wait_skip() -> None:
+    """Skip the batch wait on busy fetches while context work is held, in this process, unless killed."""
+    global _CTX_BATCH_WAIT_SKIP
+    _CTX_BATCH_WAIT_SKIP = not _CTX_BATCH_WAIT_SKIP_KILLED
+
 
 class _ADPForwardIntent(IntEnum):
     # MAX reduction gives context precedence when ADP ranks have mixed work.
@@ -961,6 +980,8 @@ class PyExecutor:
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
         )
+        if _CTX_BATCH_WAIT_SKIP:
+            self.executor_request_queue.skip_batch_wait_when = self._holds_context_work
         # When overlap scheduler is enabled then when starting to handle a new prompt,
         # _sample_async is called twice before the first call to update_requests:
         # - 1st time as a context request that operates on the 1st generated token
@@ -6140,6 +6161,16 @@ class PyExecutor:
                                   'validate_multimodal_request_data', None)
             if validate_mm is not None:
                 validate_mm(mm_data)
+
+    def _holds_context_work(self) -> bool:
+        """Whether the next step already has context work without new requests:
+        a waiting request that is not generation-only, or an active request
+        still in CONTEXT_INIT."""
+        return any(item.request.request_type !=
+                   RequestType.REQUEST_TYPE_GENERATION_ONLY
+                   for item in self.waiting_queue) or any(
+                       request.is_context_init_state
+                       for request in self.active_requests)
 
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_live_requests: int) -> None:
