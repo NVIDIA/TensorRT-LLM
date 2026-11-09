@@ -168,9 +168,6 @@ class Services:
     #: ``correct``: name the bring-up's commit the first time its checks hold. ``None``:
     #: no bring-up is named.
     bringup: Callable[[str, contract_mod.Evaluation], Any] | None = None
-    #: The same, for each cell (a unit or variant at one member) whose checks all hold:
-    #: record where. ``None``: no cell is recorded.
-    cells: Callable[[str, contract_mod.Evaluation], Any] | None = None
     #: The delivery checks on disk (the CI accuracy test, the test list entry, the
     #: accuracy reference, the target's files and commits), as cheap as reading files:
     #: what fails, one line each; empty when all pass. ``None``: none are checked here.
@@ -655,8 +652,6 @@ class GraphOrchestrator:
             return
         if self.s.bringup is not None:
             self.s.bringup(marker, evaluation)
-        if self.s.cells is not None:
-            self.s.cells(marker, evaluation)
         if self.s.correct is None:
             return
         held = self.milestone

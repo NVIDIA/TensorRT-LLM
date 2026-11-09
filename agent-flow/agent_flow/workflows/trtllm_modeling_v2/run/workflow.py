@@ -922,58 +922,6 @@ class TrtllmModelingV2Workflow:
         )
         return milestone
 
-    def _mark_cells(self, marker: str, evaluation: contract_mod.Evaluation) -> list[str]:
-        """Record the cells the contract holds on ``marker``; the ones that hold anew.
-
-        A cell is a unit or a variant at one member (:func:`~.contract.cells`).
-        ``cells.json`` keeps, per cell, the latest commit every one of its
-        checks passed on, so a run stopped at any moment says what it proved
-        and where. The commit the most cells hold on at once gets the branch
-        ``<target branch>-best``, moved forward by a later commit that holds as
-        many.
-        """
-        contract = self._contract
-        if contract is None or not marker:
-            return []
-        holding = contract_mod.cells_holding(contract, evaluation)
-        if not holding:
-            return []
-        owed = contract_mod.cells(contract)
-        with self._milestone_lock:
-            sha = self._milestone_commit(
-                marker, evaluation, [c for cell in holding for c in owed[cell]]
-            )
-            if sha is None:
-                return []
-            record = contract_mod.load_cells(self.workspace)
-            now = time.time()
-            anew = []
-            for cell in holding:
-                name = contract_mod.cell_name(cell)
-                if (record["cells"].get(name) or {}).get("sha") != sha:
-                    anew.append(name)
-                record["cells"][name] = {"sha": sha, "at": now}
-            best = record["best"] or {}
-            moved = len(holding) >= int(best.get("cells") or 0) and best.get("sha") != sha
-            if moved:
-                ref = self._point_branch(
-                    "best", sha, f"trtllm-modeling-v2: {len(holding)} of {len(owed)} cells hold"
-                )
-                record["best"] = {"sha": sha, "cells": len(holding), "ref": ref, "at": now}
-            contract_mod.save_cells(self.workspace, record)
-        if anew:
-            self.journal.event(
-                f"CELLS {sha}",
-                f"{', '.join(anew)} hold on {sha[:10]}; {len(holding)} of {len(owed)} cells hold there",
-            )
-        if moved:
-            self.journal.event(
-                f"BEST {sha}",
-                f"{len(holding)} of {len(owed)} cells hold on it"
-                + (f"; branch `{record['best']['ref']}`" if record["best"]["ref"] else ""),
-            )
-        return anew
-
     def _checkpoint(self, state: WorkflowState) -> None:
         save_state(self.state_path, state)
 
@@ -1003,22 +951,18 @@ class TrtllmModelingV2Workflow:
         state.verdict = verdict
         self._checkpoint(state)
         metrics = metrics_mod.write(self.workspace, opened=self.journal.opened_at())
-        cells = contract_mod.load_cells(self.workspace)
+        correct = contract_mod.latest_milestone(self.workspace)
         self.journal.close(
             summary="\n".join(
                 [
                     f"- verdict: **{verdict}**",
                     f"- stage reached: `{state.stage}`",
-                    f"- cells that hold: {', '.join(sorted(cells['cells'])) or 'none'}"
+                    "- correctness: "
                     + (
-                        f"; the most at once on `{cells['best']['sha'][:10]}`"
-                        + (
-                            f" (branch `{cells['best']['ref']}`)"
-                            if cells["best"].get("ref")
-                            else ""
-                        )
-                        if cells["best"]
-                        else ""
+                        f"every required check holds on `{correct.sha[:10]}`"
+                        + (f" (branch `{correct.ref}`)" if correct.ref else "")
+                        if correct is not None
+                        else "not delivered"
                     ),
                     f"- metrics: `{metrics}`",
                     "",

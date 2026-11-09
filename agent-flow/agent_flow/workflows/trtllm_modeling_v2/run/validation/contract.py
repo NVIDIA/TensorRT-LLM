@@ -52,7 +52,6 @@ from ...checks.check_config import (
     resolve_runtime,
     speculation_flags,
 )
-from ...infra.files import write_text_atomic
 from ...spec import variants as variants_mod
 from ...spec.task_schema import (
     DISAGG_FEATURE,
@@ -894,51 +893,7 @@ def bringup_holds(contract: Contract, evaluation: Evaluation) -> bool:
     return bool(owed) and all(c.key in passed for c in owed)
 
 
-# ------------------------------------------------------------------- the cells
-
-#: Where each cell's latest holding commit is kept, and the commit holding the most at once.
-CELLS_FILENAME = "cells.json"
-
-
-def cell_name(cell: tuple[str, str]) -> str:
-    """``core@tp1`` for ``("core", "tp1")``."""
-    return f"{cell[0]}@{cell[1]}"
-
-
-def cells(contract: Contract) -> dict[tuple[str, str], tuple[Check, ...]]:
-    """The required checks by cell: a unit or a variant at one member, in the contract's order."""
-    out: dict[tuple[str, str], list[Check]] = {}
-    for check in contract.required():
-        out.setdefault((check.unit, check.member), []).append(check)
-    return {cell: tuple(checks) for cell, checks in out.items()}
-
-
-def cells_holding(contract: Contract, evaluation: Evaluation) -> list[tuple[str, str]]:
-    """The cells every one of whose checks passed in ``evaluation``, in the contract's order."""
-    passed = {c.key for c in evaluation.passed}
-    return [cell for cell, owed in cells(contract).items() if all(c.key in passed for c in owed)]
-
-
-def load_cells(workspace: Path) -> dict[str, Any]:
-    """``cells.json``: ``{"cells": {name: {sha, at}}, "best": {sha, cells, ref, at} | None}``."""
-    path = Path(workspace) / CELLS_FILENAME
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    return {"cells": dict(data.get("cells") or {}), "best": data.get("best")}
-
-
-def save_cells(workspace: Path, record: Mapping[str, Any]) -> None:
-    write_text_atomic(
-        Path(workspace) / CELLS_FILENAME, json.dumps(record, indent=1, sort_keys=True)
-    )
-
-
 __all__ = [
-    "CELLS_FILENAME",
     "CONTRACT_FILENAME",
     "Check",
     "Contract",
@@ -958,19 +913,14 @@ __all__ = [
     "bringup_holds",
     "core_checks",
     "bringup_milestone",
-    "cell_name",
-    "cells",
-    "cells_holding",
     "check_inputs",
     "compile_contract",
     "equivalence_key",
     "evaluate",
     "latest_milestone",
-    "load_cells",
     "measured_commit",
     "milestones",
     "record_milestone",
-    "save_cells",
     "standing",
     "write_contract",
 ]

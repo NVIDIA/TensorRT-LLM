@@ -154,7 +154,6 @@ class ExecutionStage:
             landed=self._landed_unfinished,
             correct=self._mark_correct,
             bringup=getattr(self.workflow, "_mark_bringup", None),
-            cells=getattr(self.workflow, "_mark_cells", None),
             delivery_files=lambda: deliver.delivery_failures(self.workflow),
             stage_notes=self._take_stage_notes,
             regression=self._run_regression_check,

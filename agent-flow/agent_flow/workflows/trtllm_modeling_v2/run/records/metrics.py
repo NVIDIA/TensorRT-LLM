@@ -108,14 +108,12 @@ def collect(workspace: Path, *, opened: datetime | None = None) -> dict[str, Any
     """The run's metrics, read off its workspace; ``opened`` is when it started."""
     workspace = Path(workspace)
     now = time.time()
-    cells = contract_mod.load_cells(workspace)
     taken = workspace / inbox_mod.INBOX_DIRNAME / inbox_mod.TAKEN_DIRNAME
     return {
         "written_at": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"),
         "opened_at": opened.isoformat(timespec="seconds") if opened else None,
         "hours": round((now - opened.timestamp()) / 3600, 2) if opened else None,
         "milestones": _milestones(workspace, opened),
-        "cells": {"holding": sorted(cells["cells"]), "best": cells["best"]},
         "checks": _checks(workspace),
         "turns": _turns(workspace),
         "planner_refusals": len(_lines(workspace / REFUSALS_FILENAME)),
