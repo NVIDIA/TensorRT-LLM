@@ -551,11 +551,13 @@ void sentinelDispatch(torch::Tensor const& tokenSelectedExperts, std::vector<tor
     TORCH_CHECK(expertIds.data_ptr() == tokenSelectedExperts.data_ptr(),
         "The expert-id payload must be token_selected_experts");
     bool const hasWeights = numPayloads == expertIdPayloadIndex + 2;
+    bool weightsBf16 = false;
     if (hasWeights)
     {
         torch::Tensor const& weights = inputPayloads[expertIdPayloadIndex + 1];
-        TORCH_CHECK(weights.element_size() == 4 && weights.size(1) == topK,
-            "Sentinel routing weights must be 4-byte [local_num_tokens, top_k]");
+        weightsBf16 = weights.scalar_type() == at::kBFloat16;
+        TORCH_CHECK((weights.element_size() == 4 || weightsBf16) && weights.size(1) == topK,
+            "Sentinel routing weights must be 4-byte or bf16 [local_num_tokens, top_k]");
     }
     TORCH_CHECK(numExperts % epSize == 0, "The sentinel transport needs num_experts divisible by ep_size");
     TORCH_CHECK(static_cast<uint32_t>(invalidExpertId) != sentinel::kIdsSentinel,
@@ -577,6 +579,7 @@ void sentinelDispatch(torch::Tensor const& tokenSelectedExperts, std::vector<tor
     params.local_num_tokens = static_cast<int>(tokenSelectedExperts.size(0));
     params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
     params.has_topk_weights = hasWeights;
+    params.weights_bf16 = weightsBf16;
     params.mx_scales = payloadFormat == sentinel::kMxfp8;
     params.payload_row_bytes = static_cast<int>(row.payload);
     params.scale_row_bytes = static_cast<int>(row.scale);

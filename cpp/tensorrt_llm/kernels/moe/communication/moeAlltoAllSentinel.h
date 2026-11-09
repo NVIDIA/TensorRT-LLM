@@ -148,12 +148,12 @@ struct DispatchParams
     uint8_t const* hidden_states;          // [local_num_tokens, payload_row_bytes]
     uint8_t const* hidden_states_scale;    // [local_num_tokens, scale_row_bytes]; null for BF16
     int32_t const* token_selected_experts; // [local_num_tokens, top_k]
-    uint32_t const* topk_weights;          // [local_num_tokens, top_k] 4-byte words
+    uint32_t const* topk_weights;          // [local_num_tokens, top_k] 4-byte words, or bf16 (weights_bf16)
     // Receive buffers, row (src, token) = src * max_tokens_per_rank + token.
     uint8_t* recv_hidden_states;
     uint8_t* recv_hidden_states_scale;
     int32_t* recv_topk_ids;
-    uint32_t* recv_topk_weights;
+    uint32_t* recv_topk_weights; // in the dtype of topk_weights
     // Round state shared with the combine.
     int32_t* topk_target_ranks; // [max_tokens_per_rank, top_k]: rank of slot k at its first
                                 // occurrence in the token's top-k, else -1
@@ -167,6 +167,7 @@ struct DispatchParams
     int local_num_tokens;
     int max_tokens_per_rank; // of this step: the receive buffers' rows per source
     int has_topk_weights;    // the step carries routing weights (every rank alike)
+    int weights_bf16;        // the routing weights are bf16: each travels as the fp32 word of its value
     int mx_scales;           // MXFP8: UE8M0 scale bytes travel as 16-bit lanes
     int payload_row_bytes;   // landing and receive
     int scale_row_bytes;     // input and receive scale row

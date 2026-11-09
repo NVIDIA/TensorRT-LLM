@@ -166,6 +166,28 @@ __device__ __forceinline__ void store_topk_words(uint32_t* row, int top_k, int v
             row[4 * vec + w] = words[w];
 }
 
+// Routing weights of row vector `vec` into a receive row of top_k weights. bf16 weights travel as
+// the fp32 words of their values (bits << 16), so the high halves are the bf16 values exactly.
+__device__ __forceinline__ void store_topk_weights(
+    DispatchParams const& p, int64_t recv_row, int top_k, int vec, uint4 v)
+{
+    if (!p.weights_bf16)
+    {
+        store_topk_words(p.recv_topk_weights + recv_row * top_k, top_k, vec, v);
+        return;
+    }
+    uint16_t* const row = reinterpret_cast<uint16_t*>(p.recv_topk_weights) + recv_row * top_k;
+    uint32_t const words[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int w = 0; w < 4; ++w)
+    {
+        if (4 * vec + w < top_k)
+        {
+            row[4 * vec + w] = static_cast<uint16_t>(words[w] >> 16);
+        }
+    }
+}
+
 // ============================================== sender-side rewrites: no wire word is a sentinel
 // BF16 0xFFFFFFFF (two NaNs) -> 0x7FFF7FFF; FP8 data and fp32 / e4m3 scale or weight words
 // 0xFFFFFFFF -> 0x7FFFFFFF (NaN stays NaN); an id equal to kIdsSentinel (an invalid id) ->
@@ -379,7 +401,7 @@ __device__ __forceinline__ void push_ids_and_weights(DispatchParams const& p, in
         {
             store_topk_words(reinterpret_cast<uint32_t*>(p.recv_topk_ids) + recv_row * top_k, top_k, vec, ids);
             if (sends_weights)
-                store_topk_words(p.recv_topk_weights + recv_row * top_k, top_k, vec, s_weights_row[vec]);
+                store_topk_weights(p, recv_row, top_k, vec, s_weights_row[vec]);
             continue;
         }
         if (!is_rank_alive<ENABLE_RANK_MASK>(p.active_rank_mask, peer))
@@ -540,7 +562,7 @@ __device__ __forceinline__ void receive_vectors(DispatchParams const& p, int top
         if ((received >> kWeights) & 1u)
         {
             int64_t const recv_row = static_cast<int64_t>(weights_source) * p.max_tokens_per_rank + token;
-            store_topk_words(p.recv_topk_weights + recv_row * top_k, top_k, weights_vec, vectors[kWeights]);
+            store_topk_weights(p, recv_row, top_k, weights_vec, vectors[kWeights]);
             store_volatile(address(kWeights), splat(kDataSentinel));
         }
     }
@@ -607,7 +629,12 @@ __global__ void __launch_bounds__(kNumThreads, kDispatchBlocksPerSM)
             epoch = load_volatile_int(p.round_state + kEpoch);
         uint32_t weight = 0; // loaded before routing, so that it is in flight with the expert id
         if (chunk == 0 && p.has_topk_weights && token < p.local_num_tokens && lane < top_k)
-            weight = p.topk_weights[static_cast<int64_t>(token) * top_k + lane];
+        {
+            int64_t const index = static_cast<int64_t>(token) * top_k + lane;
+            weight = p.weights_bf16
+                ? static_cast<uint32_t>(reinterpret_cast<uint16_t const*>(p.topk_weights)[index]) << 16
+                : p.topk_weights[index];
+        }
         uint64_t const target_mask = route_token<TOP_K_CAPACITY, FIXED_TOP_K, ENABLE_RANK_MASK>(p, token, lane,
             reinterpret_cast<uint32_t*>(s_ids_row),
             chunk == 0 ? p.topk_target_ranks + static_cast<int64_t>(token) * top_k : nullptr);

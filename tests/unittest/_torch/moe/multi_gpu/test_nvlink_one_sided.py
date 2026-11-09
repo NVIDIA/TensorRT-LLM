@@ -155,6 +155,7 @@ class Case:
         pdl: Enable programmatic dependent launch for communication kernels.
         eplb: Gather and verify expert-load statistics alongside dispatch.
         sentinel_max_tokens: Token limit of the sentinel transport; None keeps its default.
+        bf16_weights: Dispatch bf16 routing weights, as TRTLLM-Gen backends do.
     """
 
     model: ModelShape
@@ -166,6 +167,7 @@ class Case:
     pdl: bool
     eplb: bool
     sentinel_max_tokens: int | None = None
+    bf16_weights: bool = False
 
     @property
     def ep_size(self) -> int:
@@ -221,6 +223,8 @@ def _make_inputs(case: Case, rank: int, round_index: int) -> tuple[torch.Tensor,
     weights = (identity * (choice + 1)).float() / (
         case.runtime_max_num_tokens_per_rank * case.ep_size * 32
     )
+    if case.bf16_weights:
+        weights = weights.bfloat16()
     return payload, sf, slots, weights
 
 
@@ -641,6 +645,22 @@ CASES = [
         )
         for num_tokens in (1, 128, 1024)
     ],
+    # bf16 routing weights, as TRTLLM-Gen backends dispatch them: a sentinel step carries them
+    # bit for bit (few tokens per rank, so the identity encoded in the first weight survives bf16).
+    pytest.param(
+        Case(
+            model=MODELS["deepseek_r1_nvfp4"],
+            rounds=(Round(tokens=(9, 5, 3, 1), routing=Routing.SPREAD, delay_rank=-1),),
+            mode="auto",
+            payload_in_workspace=False,
+            fp8_combine=False,
+            graph=False,
+            pdl=True,
+            eplb=False,
+            bf16_weights=True,
+        ),
+        id="bf16-weights-ep4",
+    ),
     # Cover BF16/FP8 combine with external/workspace-resident input payloads.
     *[
         pytest.param(
@@ -947,7 +967,8 @@ def test_sentinel_step_selection() -> None:
     assert not carries(
         1, torch.empty((tokens, hidden_size), dtype=torch.bfloat16), None, weights, None
     )
-    assert not carries(1, hidden, sf, weights.bfloat16(), None)  # 2-byte weights
+    assert carries(1, hidden, sf, weights.bfloat16(), None)  # bf16 weights (TRTLLM-Gen)
+    assert not carries(1, hidden, sf, weights.half(), None)  # other 2-byte weights
     comm._sentinel_row, comm.sentinel_max_tokens = None, 0
     assert not carries(1, hidden, sf, weights, None)
 

@@ -728,9 +728,14 @@ class NVLinkOneSided(Communication):
                 return False
         elif hidden_states.element_size() != 1:  # quantized values are bytes
             return False
+        # Routing weights travel as 4-byte words; bf16 weights (TRTLLM-Gen) as the fp32 words
+        # of their values, which the receiver narrows back exactly.
         return token_final_scales is None or (
             token_final_scales.dim() == 2
-            and (token_final_scales.shape[1], token_final_scales.element_size()) == (self.top_k, 4)
+            and token_final_scales.shape[1] == self.top_k
+            and (
+                token_final_scales.element_size() == 4 or token_final_scales.dtype == torch.bfloat16
+            )
         )
 
     @property
