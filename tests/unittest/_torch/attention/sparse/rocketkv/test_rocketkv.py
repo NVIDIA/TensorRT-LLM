@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import math
 import os
@@ -32,14 +35,13 @@ from tensorrt_llm.mapping import Mapping
 @pytest.mark.parametrize("backend", ["pytorch"])
 @pytest.mark.parametrize("model_name", ["llama-3.1-model/Llama-3.1-8B-Instruct"])
 @pytest.mark.parametrize("attention_backend", ["VANILLA", "TRTLLM"])
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
-def test_model(backend, model_name, attention_backend, use_kv_cache_manager_v2, monkeypatch):
+def test_model(backend, model_name, attention_backend, monkeypatch):
     # RocketKV is a single-GPU path. Keep this test independent of MPI
     # dynamic-process bootstrap so a cluster launch failure cannot mask the
     # attention result.
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     # The single-process worker builds the cache managers in this process;
-    # record them to check that the requested manager version is honored.
+    # record them to check that the default KV cache manager V2 is used.
     created_manager_types = []
     for manager_cls in (RocketKVCacheManager, RocketKVCacheManagerV2):
 
@@ -51,11 +53,7 @@ def test_model(backend, model_name, attention_backend, use_kv_cache_manager_v2, 
     model_dir = str(llm_models_root() / model_name)
     max_batch_size = 16
     max_output_tokens = 128
-    kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.7,
-        enable_block_reuse=False,
-        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
-    )
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7, enable_block_reuse=False)
 
     kt_cache_dtype = "float8_e5m2" if attention_backend == "TRTLLM" else "bfloat16"
 
@@ -106,23 +104,18 @@ def test_model(backend, model_name, attention_backend, use_kv_cache_manager_v2, 
             ),
         )
 
-    count = 0
-    for ref, ret in zip(references, outputs):
-        print(f"ret: {ret.outputs[0].text}")
-        print(f"ref: {ref}")
-        if ref not in ret.outputs[0].text:
-            print(f"reference {ref} is not in the output {ret.outputs[0].text}")
-        else:
-            count = count + 1
-    acc = count / len(outputs)
+    misses = [
+        (ref, ret.outputs[0].text)
+        for ref, ret in zip(references, outputs)
+        if ref not in ret.outputs[0].text
+    ]
+    acc = 1 - len(misses) / len(outputs)
 
-    expected_manager_type = (
-        RocketKVCacheManagerV2 if use_kv_cache_manager_v2 else RocketKVCacheManager
-    )
-    print(f"RocketKV NIAH accuracy with {expected_manager_type.__name__}: {acc:.4f}")
     assert created_manager_types
-    assert set(created_manager_types) == {expected_manager_type}
-    assert acc >= 0.9, "accuracy test of rocketkv sparse attention failed"
+    assert set(created_manager_types) == {RocketKVCacheManagerV2}
+    assert acc >= 0.9, (
+        f"RocketKV NIAH accuracy {acc:.4f} < 0.9; missed (reference, output): {misses}"
+    )
 
 
 def create_rocket_kv_cache_manager(
@@ -135,6 +128,7 @@ def create_rocket_kv_cache_manager(
     dtype,
     sparse_attn_config,
     use_kv_cache_manager_v2=False,
+    **manager_kwargs,
 ):
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
     num_blocks = 100
@@ -155,8 +149,24 @@ def create_rocket_kv_cache_manager(
         mapping=mapping,
         dtype=dtype,
         sparse_attention_config=sparse_attn_config,
+        **manager_kwargs,
     )
     return kv_cache_manager
+
+
+@pytest.fixture
+def make_rocket_kv_cache_manager():
+    """Create RocketKV cache managers that are shut down when the test ends."""
+    managers = []
+
+    def make(*args, **kwargs):
+        manager = create_rocket_kv_cache_manager(*args, **kwargs)
+        managers.append(manager)
+        return manager
+
+    yield make
+    for manager in managers:
+        manager.shutdown()
 
 
 def create_test_metadata(
@@ -201,7 +211,9 @@ def create_test_metadata(
     ],
 )
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
-def test_sparse_kv_predict(batch_size, num_contexts, use_kv_cache_manager_v2):
+def test_sparse_kv_predict(
+    batch_size, num_contexts, use_kv_cache_manager_v2, make_rocket_kv_cache_manager
+):
     """
     Test sparse_kv_predict against vanilla _get_snapkv_indices.
 
@@ -256,7 +268,7 @@ def test_sparse_kv_predict(batch_size, num_contexts, use_kv_cache_manager_v2):
 
     request_ids = list(range(batch_size))
 
-    num_layers = 1
+    num_layers = 2
     tokens_per_block = 64
     max_seq_len = 4096
     if dtype == torch.float16:
@@ -268,7 +280,7 @@ def test_sparse_kv_predict(batch_size, num_contexts, use_kv_cache_manager_v2):
 
     vanilla_tokens_per_block = max_seq_len  # Each sequence in one block
 
-    trtllm_kv_cache_manager = create_rocket_kv_cache_manager(
+    trtllm_kv_cache_manager = make_rocket_kv_cache_manager(
         num_layers,
         num_kv_heads,
         head_dim,
@@ -279,7 +291,7 @@ def test_sparse_kv_predict(batch_size, num_contexts, use_kv_cache_manager_v2):
         sparse_attn_config,
         use_kv_cache_manager_v2,
     )
-    vanilla_kv_cache_manager = create_rocket_kv_cache_manager(
+    vanilla_kv_cache_manager = make_rocket_kv_cache_manager(
         num_layers,
         num_kv_heads,
         head_dim,
@@ -439,7 +451,9 @@ def test_sparse_kv_predict(batch_size, num_contexts, use_kv_cache_manager_v2):
     ],
 )
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
-def test_sparse_attn_predict(batch_size, num_contexts, use_kv_cache_manager_v2):
+def test_sparse_attn_predict(
+    batch_size, num_contexts, use_kv_cache_manager_v2, make_rocket_kv_cache_manager
+):
     """Test sparse_attn_predict against vanilla _rocketkv_selection."""
     num_generations = batch_size - num_contexts
 
@@ -485,7 +499,7 @@ def test_sparse_attn_predict(batch_size, num_contexts, use_kv_cache_manager_v2):
 
     request_ids = list(range(batch_size))
 
-    num_layers = 1
+    num_layers = 2
     tokens_per_block = 64
     max_seq_len = 4096
     if dtype == torch.float16:
@@ -497,7 +511,7 @@ def test_sparse_attn_predict(batch_size, num_contexts, use_kv_cache_manager_v2):
 
     vanilla_tokens_per_block = max_seq_len  # Each sequence in one block
 
-    trtllm_kv_cache_manager = create_rocket_kv_cache_manager(
+    trtllm_kv_cache_manager = make_rocket_kv_cache_manager(
         num_layers,
         num_kv_heads,
         head_dim,
@@ -508,7 +522,7 @@ def test_sparse_attn_predict(batch_size, num_contexts, use_kv_cache_manager_v2):
         sparse_attn_config_trtllm,
         use_kv_cache_manager_v2,
     )
-    vanilla_kv_cache_manager = create_rocket_kv_cache_manager(
+    vanilla_kv_cache_manager = make_rocket_kv_cache_manager(
         num_layers,
         num_kv_heads,
         head_dim,
@@ -567,16 +581,21 @@ def test_sparse_attn_predict(batch_size, num_contexts, use_kv_cache_manager_v2):
         total_tokens, (num_heads + 2 * num_kv_heads) * head_dim, dtype=dtype, device=device
     )
 
+    # Fill every layer before copying any of them: KVCacheManagerV2 layer views
+    # interleave in one KT pool, so filling a whole view also writes the pages
+    # of the other layers.
     for layer_idx in range(num_layers):
         trtllm_kt_buf = trtllm_kv_cache_manager.get_kt_buffers(layer_idx)
-        vanilla_kt_buf = vanilla_kv_cache_manager.get_kt_buffers(layer_idx)
-
         if trtllm_kt_buf.dtype == torch.float8_e5m2:
             temp_buf = torch.empty_like(trtllm_kt_buf, dtype=torch.float16)
             torch.nn.init.normal_(temp_buf)
             trtllm_kt_buf.copy_(temp_buf.to(trtllm_kt_buf.dtype))
         else:
             torch.nn.init.normal_(trtllm_kt_buf)
+
+    for layer_idx in range(num_layers):
+        trtllm_kt_buf = trtllm_kv_cache_manager.get_kt_buffers(layer_idx)
+        vanilla_kt_buf = vanilla_kv_cache_manager.get_kt_buffers(layer_idx)
 
         # Map trtllm data to vanilla based on block offsets
         # TRTLLM: (num_blocks, kt_tokens_per_block, num_kv_heads, 2*head_dim)
@@ -803,27 +822,6 @@ def test_rocket_add_dummy_requests_forwards_capture_sampling_params(mocker):
     assert base_add_dummy_requests.call_args.kwargs["capture_sampling_params"] is sampling_params
 
 
-if __name__ == "__main__":
-    # RocketKV e2e tests
-    print("=== Testing RocketKV E2E tests ===")
-    test_model("pytorch", "llama-3.1-model/Llama-3.1-8B-Instruct", "VANILLA")
-    test_model("pytorch", "llama-3.1-model/Llama-3.1-8B-Instruct", "TRTLLM")
-
-    # Unit tests for sparse_kv_predict
-    print("\n=== Testing sparse_kv_predict ===")
-    test_sparse_kv_predict(1, 1)  # bs=1, context only
-    test_sparse_kv_predict(2, 2)  # bs=2, context only
-    test_sparse_kv_predict(6, 3)  # bs=6, mixed (3 ctx + 3 gen)
-
-    # Unit tests for sparse_attn_predict
-    print("\n=== Testing sparse_attn_predict ===")
-    test_sparse_attn_predict(1, 0)  # bs=1, generation only
-    test_sparse_attn_predict(2, 0)  # bs=2, generation only
-    test_sparse_attn_predict(3, 0)  # bs=3, generation only
-    test_sparse_attn_predict(5, 3)  # bs=5, mixed (3 ctx + 2 gen)
-    test_sparse_attn_predict(6, 2)  # bs=6, mixed (2 ctx + 4 gen)
-
-
 @pytest.mark.parametrize(
     "kt_cache_dtype,page_size",
     [
@@ -831,9 +829,13 @@ if __name__ == "__main__":
         ("bfloat16", 4),
         # A KT page as large as a K/V page.
         ("bfloat16", 2),
+        # A RocketKV page longer than a KV cache block: one KT row per block.
+        ("bfloat16", 64),
     ],
 )
-def test_rocketkv_v2_kt_rows_live_in_request_pages(kt_cache_dtype, page_size):
+def test_rocketkv_v2_kt_rows_live_in_request_pages(
+    kt_cache_dtype, page_size, make_rocket_kv_cache_manager
+):
     """KVCacheManagerV2 KT rows are addressed by the request's own KV pages.
 
     The KT block table must be the request's base page indices in KT-view units,
@@ -844,7 +846,7 @@ def test_rocketkv_v2_kt_rows_live_in_request_pages(kt_cache_dtype, page_size):
     sparse_attn_config = RocketSparseAttentionConfig(
         prompt_budget=256, page_size=page_size, kt_cache_dtype=kt_cache_dtype
     )
-    kv_cache_manager = create_rocket_kv_cache_manager(
+    kv_cache_manager = make_rocket_kv_cache_manager(
         num_layers,
         num_kv_heads,
         head_dim,
@@ -855,75 +857,81 @@ def test_rocketkv_v2_kt_rows_live_in_request_pages(kt_cache_dtype, page_size):
         sparse_attn_config=sparse_attn_config,
         use_kv_cache_manager_v2=True,
     )
-    try:
-        request_ids = [0, 1]
-        token_nums = [100, 200]
-        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
-        assert kv_cache_manager.kt_tokens_per_block == tokens_per_block // page_size
+    request_ids = [0, 1]
+    token_nums = [100, 200]
+    kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+    kt_tokens_per_block = math.ceil(tokens_per_block / page_size)
+    assert kv_cache_manager.kt_tokens_per_block == kt_tokens_per_block
 
-        kt_dtype = torch.float8_e5m2 if kt_cache_dtype == "float8_e5m2" else torch.bfloat16
-        kv_bytes_per_token = 2 * num_kv_heads * head_dim * 2
-        kt_bytes_per_token = 2 * num_kv_heads * head_dim * kt_dtype.itemsize // page_size
-        assert kv_cache_manager.get_cache_bytes_per_token() == num_layers * (
-            kv_bytes_per_token + kt_bytes_per_token
-        )
+    kt_dtype = torch.float8_e5m2 if kt_cache_dtype == "float8_e5m2" else torch.bfloat16
+    kv_bytes_per_token = 2 * num_kv_heads * head_dim * 2
+    kt_bytes_per_block = kt_tokens_per_block * 2 * num_kv_heads * head_dim * kt_dtype.itemsize
+    kt_bytes_per_token = math.ceil(kt_bytes_per_block / tokens_per_block)
+    assert kv_cache_manager.get_cache_bytes_per_token() == num_layers * (
+        kv_bytes_per_token + kt_bytes_per_token
+    )
 
-        block_offsets = torch.full(
-            (len(request_ids), kv_cache_manager.max_kt_blocks_per_seq), -7, dtype=torch.int32
-        )
-        kv_cache_manager.copy_kt_block_offsets(request_ids, block_offsets)
-        base_page_indices = kv_cache_manager.get_batch_cache_indices(request_ids, raw_indices=True)
-        kt_pages = []
-        for row, token_num in enumerate(token_nums):
-            num_blocks = math.ceil(token_num / tokens_per_block)
-            expected = [
-                page * kv_cache_manager.kt_cache_page_scale
-                for page in base_page_indices[row][:num_blocks]
-            ]
-            assert block_offsets[row, :num_blocks].tolist() == expected
-            kt_pages.append(expected)
+    block_offsets = torch.full(
+        (len(request_ids), kv_cache_manager.max_kt_blocks_per_seq), -7, dtype=torch.int32
+    )
+    kv_cache_manager.copy_kt_block_offsets(request_ids, block_offsets)
+    base_page_indices = kv_cache_manager.get_batch_cache_indices(request_ids, raw_indices=True)
+    kt_pages = []
+    for row, token_num in enumerate(token_nums):
+        num_blocks = math.ceil(token_num / tokens_per_block)
+        # Every KT row of the request's tokens maps into one of its own pages.
+        assert math.ceil(math.ceil(token_num / page_size) / kt_tokens_per_block) <= num_blocks
+        expected = [
+            page * kv_cache_manager.kt_cache_page_scale
+            for page in base_page_indices[row][:num_blocks]
+        ]
+        assert block_offsets[row, :num_blocks].tolist() == expected
+        # Unused table entries keep the invalid page index rather than a scaled one.
+        assert torch.all(block_offsets[row, num_blocks:] == -1)
+        kt_pages.append(expected)
 
-        kv_buffers = [kv_cache_manager.get_buffers(layer) for layer in range(num_layers)]
-        kt_buffers = [kv_cache_manager.get_kt_buffers(layer) for layer in range(num_layers)]
-        for layer in range(num_layers):
-            assert kt_buffers[layer].dtype == kt_dtype
-            assert kt_buffers[layer].shape[1:] == (
-                tokens_per_block // page_size,
-                num_kv_heads,
-                2 * head_dim,
-            )
-            for pages in kt_pages:
-                kt_buffers[layer][pages] = 0
-        for kv_buffer in kv_buffers:
-            kv_buffer.zero_()
+    kv_buffers = [kv_cache_manager.get_buffers(layer) for layer in range(num_layers)]
+    kt_buffers = [kv_cache_manager.get_kt_buffers(layer) for layer in range(num_layers)]
+    for layer in range(num_layers):
+        assert kt_buffers[layer].dtype == kt_dtype
+        assert kt_buffers[layer].shape[1:] == (kt_tokens_per_block, num_kv_heads, 2 * head_dim)
+        for pages in kt_pages:
+            kt_buffers[layer][pages] = 0
+    for kv_buffer in kv_buffers:
+        kv_buffer.zero_()
 
-        # Small integers are exact in both KT dtypes.
-        def fill_value(layer, row):
-            return float(1 + layer * len(request_ids) + row)
+    # Small integers are exact in both KT dtypes.
+    def fill_value(layer, row):
+        return float(1 + layer * len(request_ids) + row)
 
-        for layer in range(num_layers):
-            for row, pages in enumerate(kt_pages):
-                kt_buffers[layer][pages] = fill_value(layer, row)
-        torch.cuda.synchronize()
+    for layer in range(num_layers):
+        for row, pages in enumerate(kt_pages):
+            kt_buffers[layer][pages] = fill_value(layer, row)
+    torch.cuda.synchronize()
 
-        for kv_buffer in kv_buffers:
-            assert torch.count_nonzero(kv_buffer) == 0
-        for layer in range(num_layers):
-            for row, pages in enumerate(kt_pages):
-                values = kt_buffers[layer][pages].float()
-                assert torch.all(values == fill_value(layer, row))
-    finally:
-        kv_cache_manager.shutdown()
+    for kv_buffer in kv_buffers:
+        assert torch.count_nonzero(kv_buffer) == 0
+    for layer in range(num_layers):
+        for row, pages in enumerate(kt_pages):
+            values = kt_buffers[layer][pages].float()
+            assert torch.all(values == fill_value(layer, row))
 
 
 @pytest.mark.parametrize("prompt_len", [40, 200])
-def test_rocketkv_v2_context_completion_keeps_retained_prompt(prompt_len):
-    """A finished prompt keeps only its retained RocketKV entries in V2 pages."""
+def test_rocketkv_v2_context_completion_keeps_retained_prompt(
+    prompt_len, make_rocket_kv_cache_manager
+):
+    """A finished prompt keeps only its retained RocketKV entries in V2 pages.
+
+    The cache counts the retained entries as its prompt and history, so decode
+    grows from them and its allocations count as generation, not missed context
+    blocks.
+    """
     tokens_per_block, prompt_budget = 32, 64
     sparse_attn_config = RocketSparseAttentionConfig(
         prompt_budget=prompt_budget, page_size=4, kt_cache_dtype="float8_e5m2"
     )
-    kv_cache_manager = create_rocket_kv_cache_manager(
+    kv_cache_manager = make_rocket_kv_cache_manager(
         num_layers=2,
         num_kv_heads=8,
         head_dim=128,
@@ -933,45 +941,106 @@ def test_rocketkv_v2_context_completion_keeps_retained_prompt(prompt_len):
         dtype=DataType.BF16,
         sparse_attn_config=sparse_attn_config,
         use_kv_cache_manager_v2=True,
+        enable_stats=True,
     )
-    try:
-        request = LlmRequest(
-            request_id=0,
-            max_new_tokens=8,
-            input_tokens=list(range(prompt_len)),
-            sampling_config=SamplingConfig(),
-            is_streaming=False,
-        )
-        assert kv_cache_manager.prepare_context(request)
-        assert kv_cache_manager.resize_context(request, request.context_chunk_size)
-        kv_cache = kv_cache_manager.kv_cache_map[request.py_request_id]
-        assert kv_cache.capacity >= prompt_len
-        assert kv_cache.num_blocks == math.ceil(kv_cache.capacity / tokens_per_block)
+    request = LlmRequest(
+        request_id=0,
+        max_new_tokens=8,
+        input_tokens=list(range(prompt_len)),
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+    assert kv_cache_manager.prepare_context(request)
+    assert kv_cache_manager.resize_context(request, request.context_chunk_size)
+    kv_cache = kv_cache_manager.kv_cache_map[request.py_request_id]
+    assert kv_cache.capacity >= prompt_len
+    assert kv_cache.num_blocks == math.ceil(kv_cache.capacity / tokens_per_block)
 
-        context_batch = ScheduledRequests()
-        context_batch.context_requests_last_chunk = [request]
-        request.context_current_position = prompt_len
-        request.add_new_token(prompt_len, 0)
-        kv_cache_manager.update_context_resources(context_batch)
+    context_batch = ScheduledRequests()
+    context_batch.context_requests_last_chunk = [request]
+    request.context_current_position = prompt_len
+    request.add_new_token(prompt_len, 0)
+    kv_cache_manager.update_context_resources(context_batch)
+    kv_cache_manager.commit_scheduled_kv_cache_stats(context_batch)
+    prompt_stats = kv_cache_manager.get_kv_cache_stats()
+    assert prompt_stats.missed_blocks > 0
 
-        retained = min(prompt_len, prompt_budget)
-        assert kv_cache.capacity == retained
-        assert kv_cache.history_length == retained
-        # Only the pages that hold retained entries stay with the request.
-        assert kv_cache.num_blocks == math.ceil(retained / tokens_per_block)
-        assert len(kv_cache_manager.get_batch_cache_indices([request.py_request_id])[0]) == (
-            kv_cache.num_blocks
-        )
+    retained = min(prompt_len, prompt_budget)
+    assert kv_cache.capacity == retained
+    assert kv_cache.history_length == retained
+    # Only the pages that hold retained entries stay with the request.
+    assert kv_cache.num_blocks == math.ceil(retained / tokens_per_block)
+    assert len(kv_cache_manager.get_batch_cache_indices([request.py_request_id])[0]) == (
+        kv_cache.num_blocks
+    )
 
-        # Decode grows from the retained entries, and the generation update must
-        # not move history to the logical token count, which exceeds capacity.
-        request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    # Decode grows from the retained entries, and each generation update
+    # advances history over the retained entries plus the decoded tokens.
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    generation_batch = ScheduledRequests()
+    generation_batch.generation_requests = [request]
+    num_decode_steps = 2 * tokens_per_block
+    for step in range(1, num_decode_steps + 1):
         assert kv_cache_manager.try_allocate_generation(request)
-        assert kv_cache.capacity == retained + 1
-        generation_batch = ScheduledRequests()
-        generation_batch.generation_requests = [request]
+        assert kv_cache.capacity == retained + step
+        request.add_new_token(prompt_len + step, 0)
         kv_cache_manager.update_resources(generation_batch)
-        assert kv_cache.capacity == retained + 1
-        assert kv_cache.history_length == retained
-    finally:
-        kv_cache_manager.shutdown()
+        assert kv_cache.capacity == retained + step
+        assert kv_cache.history_length == retained + step
+    num_decode_blocks = kv_cache.num_blocks - math.ceil(retained / tokens_per_block)
+    assert num_decode_blocks == 2
+
+    kv_cache_manager.commit_scheduled_kv_cache_stats(generation_batch)
+    stats = kv_cache_manager.get_kv_cache_stats()
+    # Decode pages are generation allocations, not missed context blocks.
+    assert stats.alloc_new_blocks == prompt_stats.alloc_new_blocks + num_decode_blocks
+    assert stats.missed_blocks == prompt_stats.missed_blocks
+
+
+@pytest.mark.parametrize("kt_tokens_per_block", [3, 8])
+def test_vanilla_kt_rows_follow_the_kt_block_table(kt_tokens_per_block):
+    """Vanilla KT rows spread over KT blocks match the single-block layout."""
+    page_size, num_kv_heads, head_dim = 4, 2, 16
+    prompt_len, num_decode_steps = 37, 6
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    sparse_params = RocketSparseAttentionConfig(
+        page_size=page_size, kt_cache_dtype="bfloat16"
+    ).to_sparse_params()
+    attn = RocketVanillaAttention(
+        layer_idx=0,
+        num_heads=2 * num_kv_heads,
+        head_dim=head_dim,
+        num_kv_heads=num_kv_heads,
+        sparse_params=sparse_params,
+    )
+
+    num_kt_rows = math.ceil((prompt_len + num_decode_steps) / page_size)
+    kt_row_shape = (num_kv_heads, 2 * head_dim)
+    single_block_cache = torch.zeros((1, num_kt_rows, *kt_row_shape), dtype=dtype, device=device)
+    single_block_table = torch.zeros(1, dtype=torch.int32, device=device)
+    num_blocks = math.ceil(num_kt_rows / kt_tokens_per_block)
+    paged_cache = torch.zeros(
+        (num_blocks + 3, kt_tokens_per_block, *kt_row_shape), dtype=dtype, device=device
+    )
+    # Give the request its blocks in reverse order, away from block 0.
+    paged_table = torch.arange(num_blocks + 2, 1, -1, dtype=torch.int32, device=device)[:num_blocks]
+
+    def update(k, seq_len, past_seen_tokens, is_generation):
+        positions = torch.arange(
+            past_seen_tokens // page_size, math.ceil(seq_len / page_size), device=device
+        )
+        expected = attn._single_request_update_kt_cache(
+            k, single_block_cache, single_block_table, seq_len, positions, is_generation
+        )
+        actual = attn._single_request_update_kt_cache(
+            k, paged_cache, paged_table, seq_len, positions, is_generation
+        )
+        assert actual.shape == (1, math.ceil(seq_len / page_size), *kt_row_shape)
+        assert torch.equal(actual, expected)
+
+    k = torch.randn((1, prompt_len, num_kv_heads, head_dim), dtype=dtype, device=device)
+    update(k, prompt_len, 0, is_generation=False)
+    for past_seen_tokens in range(prompt_len, prompt_len + num_decode_steps):
+        k = torch.randn((1, 1, num_kv_heads, head_dim), dtype=dtype, device=device)
+        update(k, past_seen_tokens + 1, past_seen_tokens, is_generation=True)

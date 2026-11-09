@@ -20,13 +20,22 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole, PageIndexMode
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    BAD_PAGE_INDEX,
+    BufferConfig,
+    DataRole,
+    PageIndexMode,
+)
 
 from .params import RocketKVParams
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, SparseAttentionConfig
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmKvCacheConfig
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import _KVCache
     from tensorrt_llm.sampling_params import SamplingParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
@@ -39,9 +48,13 @@ ROCKET_KT_ROLE = DataRole("rocket_kt")
 # matches the K/V page size.
 _KT_COALESCING_GROUP = 1
 
+_KT_LANDMARKS = 2
+"""A KT row stores two landmarks per key channel: the page's min and max keys."""
+
 
 def _get_rocket_params(
-    sparse_attention_config: Optional["SparseAttentionConfig"], pretrained_config
+    sparse_attention_config: Optional["SparseAttentionConfig"],
+    pretrained_config: Optional["PretrainedConfig"],
 ) -> RocketKVParams:
     if sparse_attention_config is None:
         raise ValueError("sparse_attention_config is required for RocketKV cache")
@@ -55,8 +68,29 @@ def _get_kt_cache_dtype(sparse_params: RocketKVParams) -> torch.dtype:
     return torch.bfloat16 if sparse_params.kt_cache_dtype == "bfloat16" else torch.float8_e5m2
 
 
+def _get_kt_row_bytes(kv_hidden_size: float, kt_cache_dtype: torch.dtype) -> float:
+    """Return the bytes of one layer's KT row for a ``num_kv_heads * head_dim`` key."""
+    return _KT_LANDMARKS * kv_hidden_size * kt_cache_dtype.itemsize
+
+
+def _get_kt_tokens_per_block(tokens_per_block: int, page_size: int) -> int:
+    """Return the KT rows that each KVCacheManagerV2 page holds.
+
+    KT row ``r`` of a request lives in the request's page ``r //
+    kt_tokens_per_block``. Because ``ceil(n / page_size) <= ceil(tokens_per_block
+    / page_size) * ceil(n / tokens_per_block)``, the pages of ``n`` cached tokens
+    hold all of their KT rows for any ``tokens_per_block`` and ``page_size``, and
+    shrinking a request from its tail keeps the KT rows of its retained tokens.
+    """
+    return math.ceil(tokens_per_block / page_size)
+
+
 def _get_local_kv_hidden_size(model_config: ModelConfig, mapping: Mapping) -> float:
-    """Return ``num_kv_heads * head_dim`` of one rank-local layer (averaged over layers)."""
+    """Return ``num_kv_heads * head_dim`` of one rank-local layer, averaged over layers.
+
+    The value matches the allocation only when ``tp_size`` divides every layer's
+    ``num_kv_heads``.
+    """
     config = model_config.pretrained_config
     num_key_value_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
     if isinstance(num_key_value_heads, Iterable):
@@ -91,7 +125,7 @@ class RocketKVCacheManager(KVCacheManager):
         model_config: Optional[ModelConfig] = None,
         max_beam_width: int = 1,
         sparse_attention_config: Optional["SparseAttentionConfig"] = None,
-        pretrained_config=None,
+        pretrained_config: Optional["PretrainedConfig"] = None,
         **kwargs,
     ) -> None:
         sparse_params = _get_rocket_params(sparse_attention_config, pretrained_config)
@@ -178,12 +212,10 @@ class RocketKVCacheManager(KVCacheManager):
             self.kt_cache_manager.add_tokens(request_id, kt_token_num)
         return requests
 
-    def get_kt_buffers(self, layer_idx: int):
+    def get_kt_buffers(self, layer_idx: int) -> torch.Tensor:
         return self.kt_cache_pool_per_layer[layer_idx]
 
-    def copy_kt_block_offsets(
-        self, request_ids: List[int], block_offsets: torch.Tensor
-    ) -> torch.Tensor:
+    def copy_kt_block_offsets(self, request_ids: List[int], block_offsets: torch.Tensor) -> None:
         self.kt_cache_manager.copy_block_offsets(request_ids, block_offsets)
 
     def prepare_resources(self, scheduled_batch):
@@ -226,21 +258,21 @@ class RocketKVCacheManager(KVCacheManager):
     @staticmethod
     def get_cache_size_per_token(
         model_config: ModelConfig, mapping: Mapping, num_layers: Optional[int] = None, **kwargs
-    ):
+    ) -> float:
         # main KV cache dtype bytes (one each for K and V)
         kv_dtype_bytes = 2
         quant_config = model_config.quant_config
         if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
             kv_dtype_bytes = 1
 
-        head_dim = _get_local_kv_hidden_size(model_config, mapping)
+        kv_hidden_size = _get_local_kv_hidden_size(model_config, mapping)
 
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers
         )
 
         # K and V: two tensors stored at the main KV cache dtype.
-        mem_per_token = kv_dtype_bytes * 2 * num_attention_layers * head_dim
+        mem_per_token = kv_dtype_bytes * 2 * num_attention_layers * kv_hidden_size
 
         tokens_per_block = kwargs["tokens_per_block"]
         sparse_params = _get_rocket_params(
@@ -248,25 +280,18 @@ class RocketKVCacheManager(KVCacheManager):
         )
         kt_tokens_per_block = next_power_of_2(math.ceil(tokens_per_block / sparse_params.page_size))
         # KT (key-landmark) cache: a separate pool stored at kt_cache_dtype,
-        # NOT the main KV dtype. Per real token it holds
-        # kt_tokens_per_block / tokens_per_block landmark slots, each storing
-        # the concatenated (min, max) landmark -- a factor of 2 over head_dim.
-        # Size it at its own dtype's byte width (1 for float8_e5m2, else 2) so
-        # the estimate is independent of the main KV dtype and matches both
-        # get_cache_bytes_per_token and the physical pool allocated in
-        # RocketKVCacheManager.__init__.
-        kt_dtype_bytes = 1 if sparse_params.kt_cache_dtype == "float8_e5m2" else 2
+        # not the main KV dtype. Per real token it holds
+        # kt_tokens_per_block / tokens_per_block KT rows, which matches both
+        # get_cache_bytes_per_token and the pool allocated in __init__.
         mem_per_token += (
-            kt_dtype_bytes
-            * 2
-            * kt_tokens_per_block
+            kt_tokens_per_block
             / tokens_per_block
             * num_attention_layers
-            * head_dim
+            * _get_kt_row_bytes(kv_hidden_size, _get_kt_cache_dtype(sparse_params))
         )
         return mem_per_token
 
-    def get_cache_bytes_per_token(self):
+    def get_cache_bytes_per_token(self) -> int:
         # Main K/V cache: stored at the main KV cache dtype (self.dtype).
         cache_size_per_token = math.ceil(
             self.kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim
@@ -288,51 +313,45 @@ class RocketKVCacheManager(KVCacheManager):
             )
 
         # KT (key-landmark) cache: a separate pool physically allocated at
-        # kt_cache_dtype, NOT the main KV dtype -- see __init__:
+        # kt_cache_dtype, not the main KV dtype -- see __init__:
         #   torch.empty((num_blocks, kt_tokens_per_block, num_kv_heads,
         #                head_dim * 2), dtype=kt_cache_dtype).
-        # The trailing factor of 2 is the concatenated (min, max) landmark per
-        # head_dim. Per real token the pool holds
-        # kt_tokens_per_block / tokens_per_block landmark slots. Size it at its
-        # own dtype's byte width (1 for float8_e5m2, else 2) so the estimate
-        # matches the allocation regardless of self.dtype.
-        kt_dtype_bytes = 1 if self.kt_cache_dtype == torch.float8_e5m2 else 2
+        # Per real token the pool holds kt_tokens_per_block / tokens_per_block
+        # KT rows, so the estimate matches the allocation regardless of
+        # self.dtype.
         kt_elements_per_token = math.ceil(
-            2
+            _KT_LANDMARKS
             * self.kt_tokens_per_block
             / self.tokens_per_block
             * sum(self.num_kv_heads_per_layer)
             * self.head_dim
         )
-        cache_size_bytes_per_token += kt_elements_per_token * kt_dtype_bytes
+        cache_size_bytes_per_token += kt_elements_per_token * self.kt_cache_dtype.itemsize
 
         return cache_size_bytes_per_token
 
 
 class RocketKVCacheManagerV2(KVCacheManagerV2):
-    """KVCacheManagerV2 that stores the RocketKV KT cache in the KV pages.
+    """KVCacheManagerV2 that keeps the RocketKV KT cache in the request's slots.
 
-    Every layer registers a KT buffer beside its K/V buffers. A page holds the
-    K/V rows of ``tokens_per_block`` tokens and the ``tokens_per_block //
-    page_size`` KT rows (the per-page min/max key landmarks) that summarize
-    them, so KT storage is allocated, freed, suspended, and resumed with the
-    K/V pages it describes, and the KV cache byte budget covers it. A request's
-    KT block table is its V2 base page indices multiplied by the KT buffer's
-    page-index scale; each layer's KT view starts at that layer's shared base
-    address.
+    Every layer registers a KT buffer beside its K/V buffers: each slot (block)
+    holds this layer's K/V pages and one KT page with ``ceil(tokens_per_block /
+    page_size)`` KT rows (the per-page min/max key landmarks). KT storage is
+    therefore allocated, freed, suspended, and resumed with the request's K/V
+    pages, and the KV cache byte budget covers it. KT pages use their own
+    coalescing group, so they never share a pool with K/V. A request's KT block
+    table is its V2 base page indices multiplied by the KT buffer's page-index
+    scale; each layer's KT view starts at that layer's shared base address.
 
     RocketKV keeps ``min(prompt_len, prompt_budget)`` KV entries of a prompt.
     When a prompt completes, the cache is shrunk to that retained length, and
-    its history watermark follows the retained entries rather than the
-    request's logical token count.
+    the cache's prompt and history lengths count the retained entries rather
+    than the request's logical tokens.
     """
-
-    # Set once construction completes; see kv_compression_manages_history.
-    _constructed: bool = False
 
     def __init__(
         self,
-        kv_cache_config: KvCacheConfig,
+        kv_cache_config: "LlmKvCacheConfig",
         kv_cache_type: CacheTypeCpp,
         *,
         num_layers: int,
@@ -349,7 +368,7 @@ class RocketKVCacheManagerV2(KVCacheManagerV2):
         model_config: Optional[ModelConfig] = None,
         max_beam_width: int = 1,
         sparse_attention_config: Optional["SparseAttentionConfig"] = None,
-        pretrained_config=None,
+        pretrained_config: Optional["PretrainedConfig"] = None,
         **kwargs,
     ) -> None:
         sparse_params = _get_rocket_params(sparse_attention_config, pretrained_config)
@@ -357,15 +376,16 @@ class RocketKVCacheManagerV2(KVCacheManagerV2):
             raise ValueError(
                 "RocketKV cache requires block reuse to be disabled in KV cache config"
             )
-        if tokens_per_block % sparse_params.page_size != 0:
+        if kv_cache_config.enable_swa_scratch_reuse:
+            # Scratch reuse requires the context resize to keep history within
+            # max_rewind_len of the capacity, which the prompt shrink breaks.
             raise ValueError(
-                f"RocketKV with KVCacheManagerV2 requires tokens_per_block ({tokens_per_block}) "
-                f"to be a multiple of the RocketKV page_size ({sparse_params.page_size}), "
-                "because each KV page stores the KT rows of its own tokens."
+                "RocketKV with KVCacheManagerV2 does not support "
+                "kv_cache_config.enable_swa_scratch_reuse"
             )
         self.page_size = sparse_params.page_size
         self.prompt_budget = sparse_params.prompt_budget
-        self.kt_tokens_per_block = tokens_per_block // sparse_params.page_size
+        self.kt_tokens_per_block = _get_kt_tokens_per_block(tokens_per_block, self.page_size)
         self.kt_cache_dtype = _get_kt_cache_dtype(sparse_params)
         self.kt_cache_page_scale = 1
         self.kt_cache_pool_per_layer: List[torch.Tensor] = []
@@ -389,36 +409,39 @@ class RocketKVCacheManagerV2(KVCacheManagerV2):
             pretrained_config=pretrained_config,
             **kwargs,
         )
-        self.max_kt_blocks_per_seq = self.max_blocks_per_seq
-        self._init_kt_cache_views()
-        self._constructed = True
+        try:
+            self._init_kt_cache_views()
+        except ValueError:
+            # The base pools are already allocated.
+            self.shutdown()
+            raise
 
     @property
-    def kv_compression_manages_history(self) -> bool:
-        """Always true: generation updates must leave the history watermark alone.
+    def max_kt_blocks_per_seq(self) -> int:
+        """Width of a KT block table, which has one entry per base page-table slot."""
+        return self.max_blocks_per_seq
 
-        Once a prompt is pruned, a request's retained KV length trails its
-        logical token count, which generation updates would otherwise write as
-        the history length.
-        """
-        return True
+    def _retained_prompt_length(self, req: "LlmRequest") -> int:
+        """Return the prompt KV entries that RocketKV keeps after the prompt forward."""
+        return min(req.prompt_len, self.prompt_budget)
 
-    @kv_compression_manages_history.setter
-    def kv_compression_manages_history(self, value: bool) -> None:
-        # The base initializer assigns the flag; only a KV-cache compression
-        # manager assigns it after construction.
-        if self._constructed:
-            raise NotImplementedError(
-                "RocketKV sparse attention does not support KV-cache compression"
-            )
+    def _expected_prompt_length(self, req: "LlmRequest") -> int:
+        return self._retained_prompt_length(req)
+
+    def _generation_history_length(self, req: "LlmRequest") -> Optional[int]:
+        history_length = super()._generation_history_length(req)
+        if history_length is None or req.is_dummy:
+            # Dummy requests are sized directly and never shrink their prompt.
+            return history_length
+        return history_length - (req.prompt_len - self._retained_prompt_length(req))
 
     def _kt_bytes_per_block(self, local_layer_idx: int, tokens_per_block: int) -> int:
-        return (
-            (tokens_per_block // self.page_size)
-            * self.num_kv_heads_per_layer[local_layer_idx]
-            * 2
-            * self.head_dim_per_layer[local_layer_idx]
-            * self.kt_cache_dtype.itemsize
+        return _get_kt_tokens_per_block(tokens_per_block, self.page_size) * int(
+            _get_kt_row_bytes(
+                self.num_kv_heads_per_layer[local_layer_idx]
+                * self.head_dim_per_layer[local_layer_idx],
+                self.kt_cache_dtype,
+            )
         )
 
     def _extra_buffers_per_layer(self, *, tokens_per_block: int) -> dict[int, List[BufferConfig]]:
@@ -434,6 +457,14 @@ class RocketKVCacheManagerV2(KVCacheManagerV2):
         }
 
     def _init_kt_cache_views(self) -> None:
+        # One KT block table serves every layer, and copy_kt_block_offsets
+        # derives it from the shared base page table of pool 0.
+        if self.num_pools != 1 or self._use_per_layer_page_tables:
+            raise ValueError(
+                "RocketKV with KVCacheManagerV2 requires every layer to share one KV "
+                f"page table, got {self.num_pools} layer groups and "
+                f"per-layer page tables={self._use_per_layer_page_tables}"
+            )
         converters = [
             self.impl.get_page_index_converter(local_layer_idx, ROCKET_KT_ROLE)
             for local_layer_idx in range(self.num_local_layers)
@@ -442,7 +473,6 @@ class RocketKVCacheManagerV2(KVCacheManagerV2):
             raise ValueError("RocketKV KT cache does not support page expansion")
         scales = {int(converter.scale) for converter in converters}
         if len(scales) > 1:
-            # The KT block table is shared by every layer.
             raise ValueError(
                 "RocketKV requires a uniform KT cache page-index scale across layers, "
                 f"got {sorted(scales)}"
@@ -464,6 +494,12 @@ class RocketKVCacheManagerV2(KVCacheManagerV2):
         )
         num_pages = self.impl.get_page_index_upper_bound(local_layer_idx, ROCKET_KT_ROLE)
         page_bytes = self._kt_bytes_per_block(local_layer_idx, self.tokens_per_block)
+        page_stride = int(self.impl.get_page_stride(local_layer_idx, ROCKET_KT_ROLE))
+        if page_stride != page_bytes:
+            raise ValueError(
+                f"RocketKV KT pages of layer {local_layer_idx} are {page_stride} bytes apart, "
+                f"but the KT view expects {page_bytes}-byte pages"
+            )
         pool = convert_to_torch_tensor(
             TensorWrapper(int(address), torch.uint8, [num_pages, page_bytes])
         )
@@ -493,14 +529,20 @@ class RocketKVCacheManagerV2(KVCacheManagerV2):
         copy_idx = copy_idx.to(device="cpu", dtype=torch.long)
         base_page_indices = self.host_kv_cache_block_offsets[0, copy_idx, 0, :]
         block_offsets[:num_seqs, : base_page_indices.shape[1]].copy_(
-            base_page_indices * self.kt_cache_page_scale
+            torch.where(
+                base_page_indices == BAD_PAGE_INDEX,
+                base_page_indices,
+                base_page_indices * self.kt_cache_page_scale,
+            )
         )
 
-    def _resize_context_history(self, req: "LlmRequest", kv_cache, history_length: int) -> None:
+    def _resize_context_history(
+        self, req: "LlmRequest", kv_cache: "_KVCache", history_length: int
+    ) -> None:
         if self.kv_cache_type == CacheTypeCpp.SELF and req.context_remaining_length == 0:
             # The prompt forward stored only the retained entries; release the
             # pages past them and mark them as the cache history.
-            retained_length = min(req.prompt_len, self.prompt_budget)
+            retained_length = self._retained_prompt_length(req)
             if not kv_cache.resize(retained_length, retained_length):
                 raise ValueError(
                     f"Failed to shrink the KV cache of request {req.py_request_id} to "
@@ -536,7 +578,7 @@ class RocketKVCacheManagerV2(KVCacheManagerV2):
         *,
         tokens_per_block: int,
         **kwargs,
-    ):
+    ) -> tuple[int, int]:
         cache_size_per_token, fixed_cost = super().get_cache_size_per_token(
             model_config,
             mapping,
@@ -550,12 +592,14 @@ class RocketKVCacheManagerV2(KVCacheManagerV2):
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers
         )
-        # Per token, a page holds 1 / page_size KT rows of (min, max) landmarks.
+        # Per token, a page holds kt_tokens_per_block / tokens_per_block KT rows.
         kt_bytes_per_token = (
-            2
-            * _get_local_kv_hidden_size(model_config, mapping)
-            * _get_kt_cache_dtype(sparse_params).itemsize
-            / sparse_params.page_size
+            _get_kt_tokens_per_block(tokens_per_block, sparse_params.page_size)
+            / tokens_per_block
+            * _get_kt_row_bytes(
+                _get_local_kv_hidden_size(model_config, mapping),
+                _get_kt_cache_dtype(sparse_params),
+            )
         )
         return (
             cache_size_per_token + math.ceil(kt_bytes_per_token * num_attention_layers),

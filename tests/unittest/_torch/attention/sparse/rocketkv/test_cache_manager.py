@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -94,14 +95,14 @@ def test_registry_follows_kv_cache_manager_version(use_kv_cache_manager_v2: bool
 
 
 @pytest.mark.parametrize(
-    "enable_block_reuse,tokens_per_block,match",
+    "enable_block_reuse,enable_swa_scratch_reuse,match",
     [
-        (True, 32, "block reuse"),
-        (False, 30, "multiple of the RocketKV page_size"),
+        (True, False, "block reuse"),
+        (False, True, "enable_swa_scratch_reuse"),
     ],
 )
-def test_v2_rejects_unsupported_layouts(
-    enable_block_reuse: bool, tokens_per_block: int, match: str
+def test_v2_rejects_unsupported_kv_cache_config(
+    enable_block_reuse: bool, enable_swa_scratch_reuse: bool, match: str
 ) -> None:
     from tensorrt_llm._torch.attention.backends.sparse.rocket import cache_manager as module
     from tensorrt_llm.llmapi import RocketSparseAttentionConfig
@@ -111,12 +112,15 @@ def test_v2_rejects_unsupported_layouts(
         pytest.raises(ValueError, match=match),
     ):
         module.RocketKVCacheManagerV2(
-            SimpleNamespace(enable_block_reuse=enable_block_reuse),
+            SimpleNamespace(
+                enable_block_reuse=enable_block_reuse,
+                enable_swa_scratch_reuse=enable_swa_scratch_reuse,
+            ),
             None,
             num_layers=1,
             num_kv_heads=8,
             head_dim=128,
-            tokens_per_block=tokens_per_block,
+            tokens_per_block=32,
             max_seq_len=128,
             max_batch_size=1,
             mapping=None,
@@ -125,15 +129,41 @@ def test_v2_rejects_unsupported_layouts(
     parent_init.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "tokens_per_block,page_size,kt_tokens_per_block",
+    [
+        (32, 4, 8),
+        # tokens_per_block need not be a multiple of page_size.
+        (30, 4, 8),
+        # A RocketKV page longer than a block keeps one KT row per block.
+        (32, 64, 1),
+    ],
+)
+def test_v2_kt_tokens_per_block_covers_any_page_size(
+    tokens_per_block: int, page_size: int, kt_tokens_per_block: int
+) -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.rocket import cache_manager as module
+
+    assert module._get_kt_tokens_per_block(tokens_per_block, page_size) == kt_tokens_per_block
+    # The pages of any request hold the KT rows of all of its tokens.
+    for num_tokens in range(1, 8 * max(tokens_per_block, page_size)):
+        num_pages = math.ceil(num_tokens / tokens_per_block)
+        num_kt_rows = math.ceil(num_tokens / page_size)
+        assert math.ceil(num_kt_rows / kt_tokens_per_block) <= num_pages
+
+
 @pytest.mark.parametrize("kt_cache_dtype,kt_dtype_bytes", [("float8_e5m2", 1), ("bfloat16", 2)])
-def test_v2_static_cost_adds_kt_rows(kt_cache_dtype: str, kt_dtype_bytes: int) -> None:
+@pytest.mark.parametrize("tokens_per_block,page_size", [(32, 4), (32, 64)])
+def test_v2_static_cost_adds_kt_rows(
+    kt_cache_dtype: str, kt_dtype_bytes: int, tokens_per_block: int, page_size: int
+) -> None:
     """The V2 estimate adds the KT bytes the pages hold on top of the plain K/V estimate."""
     from tensorrt_llm._torch.attention.backends.sparse.rocket import RocketKVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm.llmapi import RocketSparseAttentionConfig
     from tensorrt_llm.mapping import Mapping
 
-    num_layers, num_kv_heads, head_dim, tp_size, page_size = 4, 8, 128, 2, 4
+    num_layers, num_kv_heads, head_dim, tp_size = 4, 8, 128, 2
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(
             num_attention_heads=32,
@@ -148,7 +178,7 @@ def test_v2_static_cost_adds_kt_rows(kt_cache_dtype: str, kt_dtype_bytes: int) -
     )
     kwargs = dict(
         num_layers=num_layers,
-        tokens_per_block=32,
+        tokens_per_block=tokens_per_block,
         max_seq_len=4096,
         max_batch_size=4,
         max_num_tokens=8192,
@@ -164,21 +194,181 @@ def test_v2_static_cost_adds_kt_rows(kt_cache_dtype: str, kt_dtype_bytes: int) -
 
     local_kv_hidden = num_kv_heads // tp_size * head_dim
     assert dense_slope == num_layers * 2 * local_kv_hidden * 2
-    kt_bytes_per_token = num_layers * 2 * local_kv_hidden * kt_dtype_bytes // page_size
+    kt_rows_per_block = math.ceil(tokens_per_block / page_size)
+    kt_bytes_per_token = math.ceil(
+        num_layers * kt_rows_per_block * 2 * local_kv_hidden * kt_dtype_bytes / tokens_per_block
+    )
     assert slope == dense_slope + kt_bytes_per_token
     assert intercept == dense_intercept
 
 
-def test_v2_keeps_history_ownership_and_rejects_kv_cache_compression() -> None:
+def _v2_manager_for_history(prompt_budget: int, kv_compression_manages_history: bool = False):
     from tensorrt_llm._torch.attention.backends.sparse.rocket import RocketKVCacheManagerV2
 
     manager = RocketKVCacheManagerV2.__new__(RocketKVCacheManagerV2)
-    # The base initializer's default does not take the ownership away.
-    manager.kv_compression_manages_history = False
-    assert manager.kv_compression_manages_history
+    manager.prompt_budget = prompt_budget
+    manager.kv_compression_manages_history = kv_compression_manages_history
+    manager._has_cp_helix = False
+    return manager
 
-    # A KV-cache compression manager binding after construction is rejected.
-    manager._constructed = True
-    with pytest.raises(NotImplementedError, match="KV-cache compression"):
-        manager.kv_compression_manages_history = False
-    assert manager.kv_compression_manages_history
+
+@pytest.mark.parametrize(
+    "prompt_len,is_dummy,expected_history",
+    [
+        # The prompt was shrunk to its 2048 retained entries before decode.
+        (4096, False, 2048 + 2),
+        (1000, False, 1000 + 2),
+        # Dummy requests are sized directly and keep their full prompt.
+        (4096, True, 4096 + 2),
+    ],
+)
+def test_v2_generation_history_counts_retained_entries(
+    prompt_len: int, is_dummy: bool, expected_history: int
+) -> None:
+    manager = _v2_manager_for_history(prompt_budget=2048)
+    # Two decoded tokens are in the cache, and the third was just sampled.
+    req = SimpleNamespace(
+        prompt_len=prompt_len, max_beam_num_tokens=prompt_len + 3, is_dummy=is_dummy
+    )
+
+    assert manager._generation_history_length(req) == expected_history
+    assert manager._expected_prompt_length(req) == min(prompt_len, 2048)
+
+
+def test_v2_generation_history_keeps_base_ownership_rules() -> None:
+    manager = _v2_manager_for_history(prompt_budget=2048, kv_compression_manages_history=True)
+    req = SimpleNamespace(prompt_len=4096, max_beam_num_tokens=4099, is_dummy=False)
+
+    assert manager._generation_history_length(req) is None
+
+
+def _v2_manager_for_kt_views(converters, num_pools: int = 1, per_layer_page_tables: bool = False):
+    from tensorrt_llm._torch.attention.backends.sparse.rocket import RocketKVCacheManagerV2
+
+    manager = RocketKVCacheManagerV2.__new__(RocketKVCacheManagerV2)
+    manager.num_local_layers = len(converters)
+    manager.num_pools = num_pools
+    manager._use_per_layer_page_tables = per_layer_page_tables
+    manager.impl = SimpleNamespace(
+        get_page_index_converter=lambda local_layer_idx, role: converters[local_layer_idx]
+    )
+    manager._get_kt_cache_pool_view = Mock(return_value=None)
+    return manager
+
+
+@pytest.mark.parametrize(
+    "converters,num_pools,per_layer_page_tables,match",
+    [
+        ([SimpleNamespace(expansion=2, scale=1)] * 2, 1, False, "page expansion"),
+        (
+            [SimpleNamespace(expansion=1, scale=1), SimpleNamespace(expansion=1, scale=2)],
+            1,
+            False,
+            "uniform KT cache page-index scale",
+        ),
+        ([SimpleNamespace(expansion=1, scale=2)] * 2, 2, False, "share one KV page table"),
+        ([SimpleNamespace(expansion=1, scale=2)] * 2, 1, True, "share one KV page table"),
+    ],
+)
+def test_v2_kt_views_reject_unsupported_layouts(
+    converters, num_pools: int, per_layer_page_tables: bool, match: str
+) -> None:
+    manager = _v2_manager_for_kt_views(converters, num_pools, per_layer_page_tables)
+
+    with pytest.raises(ValueError, match=match):
+        manager._init_kt_cache_views()
+
+
+def test_v2_kt_views_use_uniform_page_scale() -> None:
+    manager = _v2_manager_for_kt_views([SimpleNamespace(expansion=1, scale=2)] * 2)
+
+    manager._init_kt_cache_views()
+
+    assert manager.kt_cache_page_scale == 2
+    assert manager._get_kt_cache_pool_view.call_count == 2
+
+
+def test_v2_shuts_down_when_kt_views_are_rejected() -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.rocket import cache_manager as module
+    from tensorrt_llm.llmapi import RocketSparseAttentionConfig
+
+    with (
+        patch.object(module.KVCacheManagerV2, "__init__", return_value=None),
+        patch.object(
+            module.RocketKVCacheManagerV2,
+            "_init_kt_cache_views",
+            side_effect=ValueError("unsupported KT layout"),
+        ),
+        patch.object(module.RocketKVCacheManagerV2, "shutdown") as shutdown,
+        pytest.raises(ValueError, match="unsupported KT layout"),
+    ):
+        module.RocketKVCacheManagerV2(
+            SimpleNamespace(enable_block_reuse=False, enable_swa_scratch_reuse=False),
+            None,
+            num_layers=1,
+            num_kv_heads=8,
+            head_dim=128,
+            tokens_per_block=32,
+            max_seq_len=128,
+            max_batch_size=1,
+            mapping=None,
+            sparse_attention_config=RocketSparseAttentionConfig(page_size=4),
+        )
+    shutdown.assert_called_once_with()
+
+
+def _rocket_llm_args(tmp_path, **kwargs):
+    from tensorrt_llm.llmapi import KvCacheConfig, RocketSparseAttentionConfig
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    kwargs.setdefault("kv_cache_config", KvCacheConfig(enable_block_reuse=False))
+    return TorchLlmArgs(
+        model=tmp_path,
+        skip_tokenizer_init=True,
+        sparse_attention_config=RocketSparseAttentionConfig(),
+        **kwargs,
+    )
+
+
+def test_rocket_llm_args_accept_supported_config(tmp_path) -> None:
+    args = _rocket_llm_args(tmp_path)
+
+    assert args.sparse_attention_config.algorithm == "rocket"
+
+
+@pytest.mark.parametrize(
+    "feature,match",
+    [
+        ("chunked_prefill", "enable_chunked_prefill"),
+        ("speculative_decoding", "speculative_config"),
+        ("disaggregated_serving", "cache_transceiver_config"),
+        ("kv_cache_compression", "kv_cache_compression_config"),
+        ("swa_scratch_reuse", "enable_swa_scratch_reuse"),
+    ],
+)
+def test_rocket_llm_args_reject_unsupported_features(tmp_path, feature: str, match: str) -> None:
+    from tensorrt_llm.llmapi import KvCacheConfig
+    from tensorrt_llm.llmapi.llm_args import (
+        CacheTransceiverConfig,
+        NGramDecodingConfig,
+        TriAttentionKvCacheCompressionConfig,
+    )
+
+    kwargs = {
+        "chunked_prefill": dict(enable_chunked_prefill=True),
+        "speculative_decoding": dict(speculative_config=NGramDecodingConfig(max_draft_len=2)),
+        "disaggregated_serving": dict(
+            cache_transceiver_config=CacheTransceiverConfig(backend="NIXL")
+        ),
+        "kv_cache_compression": dict(
+            kv_cache_compression_config=TriAttentionKvCacheCompressionConfig(
+                calibration_path="/calib/test.pt"
+            )
+        ),
+        "swa_scratch_reuse": dict(
+            kv_cache_config=KvCacheConfig(enable_block_reuse=False, enable_swa_scratch_reuse=True)
+        ),
+    }[feature]
+
+    with pytest.raises(ValueError, match=f"RocketKV sparse attention does not support .*{match}"):
+        _rocket_llm_args(tmp_path, **kwargs)

@@ -6186,9 +6186,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     kv_cache_retention_config=self._retention_config_for_request(req),
                     is_dummy=req.is_dummy,
                     enable_request_stats=req.return_perf_metrics,
-                    expected_prompt_length=(
-                        req.total_input_len_cp if self._has_cp_helix else req.prompt_len
-                    ),
+                    expected_prompt_length=self._expected_prompt_length(req),
                 )
                 if kv_cache is None:
                     return None
@@ -9422,6 +9420,18 @@ class KVCacheManagerV2(BaseResourceManager):
                 # pages before the first generation allocation.
                 kv_cache.enable_swa_scratch_reuse = False
 
+    def _expected_prompt_length(self, req: LlmRequest) -> int:
+        """Return the cached prompt length after which allocations count as generation."""
+        return req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+
+    def _generation_history_length(self, req: LlmRequest) -> int | None:
+        """Return the history length a generation update records, or None to keep it."""
+        # Reuse (history's consumer) is disabled under helix, and
+        # max_beam_num_tokens mixes rank-local and global counts.
+        if self.kv_compression_manages_history or self._has_cp_helix:
+            return None
+        return req.max_beam_num_tokens - 1
+
     def _resize_context_history(self, req: LlmRequest, kv_cache, history_length: int) -> None:
         """Advance a context cache's history marker, or raise."""
         if not kv_cache.resize(None, history_length):
@@ -9492,13 +9502,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
                 else kv_cache.capacity - rewind_len
             )
-            history_length = (
-                None
-                # Reuse (history's consumer) is disabled under helix, and
-                # max_beam_num_tokens mixes rank-local and global counts.
-                if self.kv_compression_manages_history or self._has_cp_helix
-                else req.max_beam_num_tokens - 1
-            )
+            history_length = self._generation_history_length(req)
             success = kv_cache.resize(new_capacity, history_length)
             if not success:
                 raise ValueError(
