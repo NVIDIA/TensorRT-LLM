@@ -976,6 +976,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_mode)  # handle passed a raw string
         self.py_disaggregated_params = None
         self.py_conversation_params = None
+        # Parent conversation id of a sub-agent request (the disagg edge's
+        # authenticated sub-agent affinity hint), else None.
+        self.py_subagent_parent_id: Optional[str] = None
         # Uncached-prefill estimate published by the attention-DP router, if
         # any. The V2 scheduler drops it when the demotion aging bound lets the
         # request through.
@@ -1393,6 +1396,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         child.py_disaggregated_params = deepcopy(self.py_disaggregated_params)
         child.py_conversation_params = deepcopy(self.py_conversation_params)
         child.py_kv_hints = self.py_kv_hints
+        child.py_subagent_parent_id = self.py_subagent_parent_id
         child.py_uncached_prefill_tokens = self.py_uncached_prefill_tokens
         child.py_disable_speculative_decoding = self.py_disable_speculative_decoding
         child.is_attention_dp_dummy = self.is_attention_dp_dummy
@@ -1885,6 +1889,8 @@ def executor_request_to_llm_request(
     llm_request.py_original_end_id = inputs.original_end_id
     llm_request.py_disaggregated_params = inputs.disaggregated_params
     llm_request.py_conversation_params = inputs.conversation_params
+    llm_request.py_subagent_parent_id = getattr(inputs.scheduling_params,
+                                                "subagent_affinity_id", None)
     # Published by the attention-DP router before this conversion, if at all.
     llm_request.py_uncached_prefill_tokens = inputs.uncached_prefill_tokens
     llm_request.py_kv_hints = inputs.kv_hints

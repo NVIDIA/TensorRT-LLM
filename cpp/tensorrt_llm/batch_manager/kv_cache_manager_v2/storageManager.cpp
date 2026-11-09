@@ -1060,22 +1060,27 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
                 }
             }
         });
+    // One stable pass per life cycle, not an erase per moved page (quadratic for a whole demoted
+    // prefix): kept and moved pages both keep their order.
     for (auto& pages : fallenPages)
     {
-        for (auto iter = pages.begin(); iter != pages.end();)
+        auto kept = pages.begin();
+        for (auto iter = pages.begin(); iter != pages.end(); ++iter)
         {
             auto const& page = *iter;
             if (page->cacheLevel == kHotLevel && page->status() == PageStatus::DROPPABLE
                 && page->priority() < mColdTierOffloadMinPriority)
             {
                 belowOffloadThreshold.at(page->lifeCycle).push_back(std::move(*iter));
-                iter = pages.erase(iter);
             }
             else
             {
-                ++iter;
+                if (kept != iter)
+                    *kept = std::move(*iter);
+                ++kept;
             }
         }
+        pages.erase(kept, pages.end());
     }
     if (TLLM_UNLIKELY(gDebug))
     {

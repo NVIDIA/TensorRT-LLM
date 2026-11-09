@@ -53,6 +53,7 @@ def _load_cpp_module():
 _cpp = _load_cpp_module()
 
 DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY = _cpp.DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
+DEFAULT_RETENTION_PRIORITY = _cpp.DEFAULT_RETENTION_PRIORITY
 
 AggregatedPageDesc = _cpp.AggregatedPageDesc
 AttentionLayerConfig = _cpp.AttentionLayerConfig
@@ -156,6 +157,7 @@ PageIndexConverter = _cpp.PageIndexConverter
 PageIndexMode = _cpp.PageIndexMode
 PageStatus = _cpp.PageStatus
 PlannedDropHandle = _cpp.PlannedDropHandle
+CommittedRetentionHandle = _cpp.CommittedRetentionHandle
 PoolDesc = _cpp.PoolDesc
 PoolGroupDesc = _cpp.PoolGroupDesc
 PoolGroupPeakBlockStats = _cpp.PoolGroupPeakBlockStats
@@ -236,6 +238,7 @@ __all__ = [
     "CudaStream",
     "DEFAULT_BEAM_INDEX",
     "DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY",
+    "DEFAULT_RETENTION_PRIORITY",
     "DataRole",
     "DiskCacheTierConfig",
     "ExpandedBuffer",
@@ -267,6 +270,7 @@ __all__ = [
     "OutOfPagesError",
     "PageIndexConverter",
     "PlannedDropHandle",
+    "CommittedRetentionHandle",
     "PoolGroupPeakBlockStats",
     "PageIndexMode",
     "PageStatus",

@@ -235,6 +235,38 @@ private:
     std::optional<std::vector<WeakPtr<CommittedPage>>> mPageRefs;
 };
 
+// ---------------------------------------------------------------------------
+// CommittedRetentionHandle — re-prioritizes the committed blocks a closed
+// request computed itself, without owning them.
+//
+// Keeps a weak reference to the last block of the request's committed path.
+// setPriority() walks toward the root over the blocks at or after `ownedBegin`
+// (the first block the conversation computed rather than reused) and stops at a
+// block another path extends or branches from: from there up the prefix is shared.
+// ---------------------------------------------------------------------------
+class CommittedRetentionHandle
+{
+public:
+    // Holds a strong reference to the manager (setPriority() takes its API lock), like
+    // PlannedDropHandle: release every handle before shutting the manager down.
+    CommittedRetentionHandle(KvCacheManager& manager, Block& leaf, BlockOrdinal ownedBegin);
+
+    // Releases the weak block reference under the manager's API lock (its count is not atomic).
+    ~CommittedRetentionHandle();
+
+    CommittedRetentionHandle(CommittedRetentionHandle const&) = delete;
+    CommittedRetentionHandle& operator=(CommittedRetentionHandle const&) = delete;
+
+    // Returns the number of pages whose priority was set: zero once the leaf block left the
+    // tree or the path became shared.
+    int setPriority(Priority priority);
+
+private:
+    std::shared_ptr<KvCacheManager> mManager;
+    WeakPtr<Block> mLeaf;
+    BlockOrdinal mOwnedBegin;
+};
+
 // Availability at the claimed prefix, indexed by LayerGroupId. OPTIONAL
 // candidates are held until the first successful resume or close.
 // Describes the initial prefix claim, not subsequent request progress.
@@ -499,6 +531,13 @@ public:
     // Every returned handle must be dropped -- via drop() or destruction -- before the manager is
     // shut down: applying a plan takes the manager's API lock and mutates its state.
     std::unique_ptr<PlannedDropHandle> planCommittedBlockDrop();
+
+    // Handle for lowering the retention priority of this request's own committed blocks later
+    // (e.g. once its conversation is known to be finished). `ownedBeginTokens` is the prefix the
+    // conversation reused rather than computed; blocks that start inside it are never touched.
+    // Must be called after stopCommitting(). Returns nullptr when the committed path is not fully
+    // present in the tree or the request owns no block.
+    std::unique_ptr<CommittedRetentionHandle> planCommittedRetention(int ownedBeginTokens);
 
     int historyLength() const noexcept
     {

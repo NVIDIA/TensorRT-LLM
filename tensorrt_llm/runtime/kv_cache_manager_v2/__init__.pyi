@@ -39,6 +39,7 @@ from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 NDEBUG: Final[int]
 DEFAULT_BEAM_INDEX: Final[BeamIndex]
 DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY: Final[int]
+DEFAULT_RETENTION_PRIORITY: Final[int]
 BAD_PAGE_INDEX: Final[int]
 GPU_LEVEL: Final[CacheLevel]
 CACHE_LEVEL1: Final[CacheLevel]
@@ -132,6 +133,10 @@ TokenIdExt = Union[TokenId, bytes, MmItemContext]
 
 class PlannedDropHandle:
     def drop(self) -> None: ...
+
+class CommittedRetentionHandle:
+    def set_priority(self, priority: int) -> int:
+        """Set the retention priority of the request's own committed pages; returns the count."""
 
 class ReuseScope:
     """Reuse identity; salt is also reported in stored-block events."""
@@ -822,6 +827,9 @@ class _KVCache:
     @property
     def reuse_scope(self) -> ReuseScope: ...
     def plan_committed_block_drop(self) -> PlannedDropHandle | None: ...
+    def plan_committed_retention(
+        self, owned_begin_tokens: int = 0
+    ) -> CommittedRetentionHandle | None: ...
     def stop_committing(self) -> None: ...
     def suspend(self) -> None:
         """Unlock this cache's pages and detach from its stream.

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import array
+import itertools
 import os
 import sys
 from collections.abc import Callable
@@ -31,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_cache_v2_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
+    ConversationManager,
     HostMemoryLimits,
     KVCacheLayerOwner,
     KVCacheLayerSpec,
@@ -3497,7 +3499,12 @@ def max_num_turns() -> int:
 
 
 @pytest.fixture
-def manager(max_num_turns: int) -> KVCacheManagerV2:
+def finished_subagent_priority() -> int | None:
+    return None
+
+
+@pytest.fixture
+def manager(max_num_turns: int, finished_subagent_priority: int | None) -> KVCacheManagerV2:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     torch.cuda.init()
@@ -3511,6 +3518,8 @@ def manager(max_num_turns: int) -> KVCacheManagerV2:
             block_reuse_config=BlockReuseConfig(
                 policy="per_conversation",
                 max_num_turns=max_num_turns,
+                finished_subagent_priority=finished_subagent_priority,
+                finished_subagent_min_idle_iterations=5,
             ),
         ),
         CacheType.SELF,
@@ -3841,6 +3850,124 @@ def test_per_conversation_policy_retains_configured_number_of_turns(
         _free_if_active(manager, request_a_probe)
         _free_if_active(manager, request_b)
         _free_if_active(manager, request_a)
+
+
+@pytest.mark.parametrize("finished_subagent_priority", [1])
+def test_per_conversation_policy_demotes_finished_subagent_when_parent_returns(
+    manager: KVCacheManagerV2,
+) -> None:
+    conversations = manager.conversation_manager
+    parent_turn1 = _ContextRequest(1, list(range(8)), 8, "parent")
+    child = _ContextRequest(2, [*range(8), 50, 51, 52, 53], 12, "child")
+    child.py_subagent_parent_id = "parent"
+    parent_turn2 = _ContextRequest(3, [*range(8), 60, 61, 62, 63], 12, "parent")
+    parent_turn3 = _ContextRequest(4, [*range(8), 60, 61, 62, 63, 64], 13, "parent")
+    child_turn2 = _ContextRequest(5, [*range(8), 50, 51, 52, 53, 54], 13, "child")
+    child_turn2.py_subagent_parent_id = "parent"
+    requests = [parent_turn1, child, parent_turn2, parent_turn3, child_turn2]
+    try:
+        _run_context(manager, parent_turn1)
+        _free_if_active(manager, parent_turn1)
+        _run_context(manager, child)
+        assert child.prepopulated_prompt_len == 8
+        _free_if_active(manager, child)
+        state = conversations._conversation_states["child"]
+        assert state.parent_id == "parent" and state.owned_begin_tokens == 8
+        assert state.retention_handle is not None
+
+        # Too soon after the sub-agent's context ended (one scheduler step): it may be mid-turn.
+        _run_context(manager, parent_turn2)
+        _free_if_active(manager, parent_turn2)
+        assert conversations.num_demoted_conversations == 0
+
+        for _ in range(5):
+            conversations.advance_step()  # other batches; prepare_resources counts one per step
+        _run_context(manager, parent_turn3)
+        _free_if_active(manager, parent_turn3)
+        assert conversations.num_demoted_conversations == 1
+        assert conversations.num_demoted_pages >= 1  # at least its own block 8..11
+        assert state.demoted
+
+        # The sub-agent comes back after all: its blocks get the default priority again.
+        _run_context(manager, child_turn2)
+        assert conversations.num_restored_conversations == 1
+        assert not state.demoted
+        _free_if_active(manager, child_turn2)
+    finally:
+        for request in reversed(requests):
+            _free_if_active(manager, request)
+
+
+class _RecordingRetentionHandle:
+    def __init__(self, name: str, calls: list[str]) -> None:
+        self.name, self.calls = name, calls
+
+    def set_priority(self, priority: int) -> int:
+        self.calls.append(self.name)
+        return 1
+
+
+class _PlanningKVCache:
+    def __init__(self, name: str, calls: list[str]) -> None:
+        self.name, self.calls = name, calls
+        self.num_committed_tokens = 4
+
+    def plan_committed_block_drop(self) -> None:
+        return None
+
+    def plan_committed_retention(self, owned_begin_tokens: int) -> _RecordingRetentionHandle:
+        return _RecordingRetentionHandle(self.name, self.calls)
+
+
+@dataclass
+class _ConversationRequest:
+    py_request_id: int
+    conversation_id: str
+    py_subagent_parent_id: str | None = None
+    is_dummy_request: bool = False
+
+    @property
+    def py_conversation_params(self) -> ConversationParams:
+        return ConversationParams(conversation_id=self.conversation_id)
+
+
+@pytest.mark.cpu_only
+def test_finished_subagent_demotion_is_rank_deterministic() -> None:
+    """Demotion depends only on rank-identical inputs: scheduler steps and arrival order.
+
+    Not a per-rank clock, and not the per-process salted iteration order of a str set.
+    """
+    calls: list[str] = []
+    manager = ConversationManager(
+        1, finished_subagent_priority=1, finished_subagent_min_idle_iterations=3
+    )
+    request_ids = itertools.count(1)
+
+    def run(conversation_id: str, parent: str | None = None) -> None:
+        request = _ConversationRequest(next(request_ids), conversation_id, parent)
+        manager.prepare_request(request)
+        with patch("tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2.logger.warning"):
+            manager.save_drop_plan(request, _PlanningKVCache(conversation_id, calls))
+
+    children = [f"sub-{name}" for name in ("q", "a", "zz", "m", "b", "k7", "x", "c")]
+    run("parent")
+    for child in children:
+        manager.advance_step()
+        run(child, "parent")
+    # The last child finished one step ago: the parent's next request leaves it alone.
+    manager.advance_step()
+    run("parent")
+    assert calls == children[:-2]
+    for _ in range(3):
+        manager.advance_step()
+    run("parent")
+    assert calls == children
+    assert manager.num_demoted_conversations == len(children)
+
+
+def test_finished_subagent_priority_requires_per_conversation() -> None:
+    with pytest.raises(ValueError, match="requires block_reuse_config.policy='per_conversation'"):
+        BlockReuseConfig(policy="per_request", finished_subagent_priority=1)
 
 
 def test_per_conversation_policy_ignores_overlapping_request(

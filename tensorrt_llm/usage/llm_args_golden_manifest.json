@@ -648,6 +648,16 @@
     {
       "capture_policy": "int",
       "kind": "value",
+      "path": "kv_cache_config.block_reuse_config.finished_subagent_min_idle_iterations"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "kv_cache_config.block_reuse_config.finished_subagent_priority"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
       "path": "kv_cache_config.block_reuse_config.max_num_turns"
     },
     {

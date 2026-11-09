@@ -6267,6 +6267,78 @@ class TestRetention(TestKVCacheManagerV2):
         pressure.close()
         self.assertEqual(self._cache(tokens).get_page_priorities(0), [priority if retained else 35])
 
+    def _closed_with_retention_handle(self, tokens: list[TokenIdExt]):
+        reused = self.manager.probe_reuse(input_tokens=tokens)
+        cache = self._cache(tokens)
+        cache.stop_committing()
+        handle = cache.plan_committed_retention(reused)
+        self.caches.remove(cache)
+        cache.close()
+        return handle, reused
+
+    def test_committed_retention_handle_demotes_only_owned_blocks(self) -> None:
+        self._prepare_retention()
+        parent = list(range(8))
+        child = parent + list(range(100, 108))
+        parent_handle, _ = self._closed_with_retention_handle(parent)
+        child_handle, reused = self._closed_with_retention_handle(child)
+        self.assertEqual(reused, 8)
+        # The child's own blocks (2, 3) are demoted; the reused parent prefix keeps its priority.
+        self.assertEqual(child_handle.set_priority(1), 2)
+        # A full-prompt probe reuses every block and commits nothing new.
+        probe = self._cache(child)
+        self.assertEqual(probe.get_page_priorities(0), [35, 35, 1, 1])
+        self.caches.remove(probe)
+        probe.close()
+        # The parent's leaf now continues into the child's path: nothing of it is exclusive.
+        self.assertEqual(parent_handle.set_priority(1), 0)
+        self.assertEqual(child_handle.set_priority(35), 2)
+        probe = self._cache(child)
+        self.assertEqual(probe.get_page_priorities(0), [35] * 4)
+        self.caches.remove(probe)
+        probe.close()
+        # Once another request extends the child's path (its partial tail is committed on close), the
+        # child's blocks are shared and left alone.
+        extend = self._cache(child + [999])
+        self.caches.remove(extend)
+        extend.close()
+        self.assertEqual(child_handle.set_priority(1), 0)
+        with self.assertRaises(RuntimeError):
+            child_handle.set_priority(101)
+        del parent_handle, child_handle
+
+    def test_committed_retention_handle_stops_at_a_fork(self) -> None:
+        self._prepare_retention()
+        shared = list(range(4))
+        first, _ = self._closed_with_retention_handle(shared + [10, 11, 12, 13])
+        second, _ = self._closed_with_retention_handle(shared + [20, 21, 22, 23])
+        # Owned-begin 0 still never reaches the block both paths share.
+        self.assertEqual(first.set_priority(1), 1)
+        probe = self._cache(shared + [10, 11, 12, 13, 999])
+        self.assertEqual(probe.get_page_priorities(0), [35, 1, 35])
+        self.assertEqual(
+            self._cache(shared + [20, 21, 22, 23, 999]).get_page_priorities(0), [35, 35, 35]
+        )
+        del first, second
+
+    def test_committed_retention_handle_steers_eviction(self) -> None:
+        self._prepare_retention()
+        older, newer = [1, 2, 3, 4], [5, 6, 7, 8]
+        older_handle, _ = self._closed_with_retention_handle(older)
+        newer_handle, _ = self._closed_with_retention_handle(newer)
+        self.assertEqual(newer_handle.set_priority(1), 1)
+        # LRU alone would evict the older conversation first.
+        pressure = self._apply_memory_pressure()
+        self.assertEqual(self.manager.probe_reuse(input_tokens=older), 4)
+        self.assertEqual(self.manager.probe_reuse(input_tokens=newer), 0)
+        pressure.close()
+        # The handle outlives its evicted path harmlessly.
+        self.assertEqual(newer_handle.set_priority(1), 0)
+        empty = self._cache([])
+        empty.stop_committing()
+        self.assertIsNone(empty.plan_committed_retention(0))
+        del older_handle, newer_handle
+
     def test_eviction_offload_preserves_priority_and_clears_expiry(self) -> None:
         self._prepare_retention(host_quota=2 << 20, offload_threshold=50)
         tokens = [1, 2, 3, 4]

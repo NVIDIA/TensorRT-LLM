@@ -71,6 +71,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     CACHE_LEVEL1,
     DEFAULT_BEAM_INDEX,
     DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY,
+    DEFAULT_RETENTION_PRIORITY,
     GPU_LEVEL,
     AttentionLayerConfig,
     AttnLifeCycle,
@@ -80,6 +81,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     CacheLevel,
     CacheTier,
     CacheTierConfig,
+    CommittedRetentionHandle,
     DataRole,
     DiskCacheTierConfig,
     GpuCacheTierConfig,
@@ -441,14 +443,62 @@ def _request_conversation_id(request: LlmRequest) -> Optional[str]:
 class _ConversationState:
     current_request_id: Optional[int] = None
     planned_drop_handles: deque[PlannedDropHandle] = field(default_factory=deque)
+    # Finished sub-agent demotion (block_reuse_config.finished_subagent_priority). `children` is
+    # a dict, not a set: str hashing is salted per process, so a set iterates differently per rank.
+    parent_id: Optional[str] = None
+    owned_begin_tokens: Optional[int] = None
+    retention_handle: Optional[CommittedRetentionHandle] = None
+    last_finish_step: Optional[int] = None
+    children: Optional[Dict[str, None]] = None
+    demoted: bool = False
+
+    def is_idle(self) -> bool:
+        return (
+            self.current_request_id is None
+            and not self.planned_drop_handles
+            and self.retention_handle is None
+            and not self.children
+        )
 
 
 class ConversationManager:
-    """Track the current request and drop plan for each conversation."""
+    """Track the current request and drop plan for each conversation.
 
-    def __init__(self, max_num_turns: int) -> None:
+    With ``finished_subagent_priority`` set, a sub-agent conversation (its requests carry
+    ``LlmRequest.py_subagent_parent_id``) is demoted when its parent sends its next request
+    while the sub-agent has no request in flight and its last context ended at least
+    ``finished_subagent_min_idle_iterations`` scheduler steps earlier: its own committed
+    blocks get that retention priority, so they are evicted before conversations that will
+    come back.
+
+    Every input of a demotion is identical on all ranks of a TP group, since ranks that
+    demote different blocks would evict different pages and schedule different batches:
+    the idle test counts scheduler steps (``advance_step()``) rather than reading a clock,
+    and children are visited in arrival order.
+    """
+
+    def __init__(
+        self,
+        max_num_turns: int,
+        finished_subagent_priority: Optional[int] = None,
+        finished_subagent_min_idle_iterations: int = 32,
+    ) -> None:
         self._max_num_turns = max_num_turns
         self._conversation_states: Dict[str, _ConversationState] = {}
+        self._finished_subagent_priority = finished_subagent_priority
+        self._finished_subagent_min_idle = finished_subagent_min_idle_iterations
+        self._step = 0
+        self.num_demoted_conversations = 0
+        self.num_demoted_pages = 0
+        self.num_restored_conversations = 0
+
+    @property
+    def _demotion_enabled(self) -> bool:
+        return self._finished_subagent_priority is not None
+
+    def advance_step(self) -> None:
+        """Count one executed scheduler step (rank-identical clock of the idle test)."""
+        self._step += 1
 
     def save_drop_plan(self, request: LlmRequest, kv_cache: _KVCache) -> None:
         """Save a completed context's drop plan and apply the preceding plan on success."""
@@ -472,7 +522,25 @@ class ConversationManager:
             if len(state.planned_drop_handles) > self._max_num_turns:
                 state.planned_drop_handles.popleft().drop()
 
+        if self._demotion_enabled and state.parent_id is not None:
+            # The latest turn's path covers every earlier turn of the conversation.
+            state.retention_handle = kv_cache.plan_committed_retention(
+                state.owned_begin_tokens or 0
+            )
+            state.last_finish_step = self._step
+
         self.finish_request(request)
+
+    def record_first_reuse(self, request: LlmRequest, reused_tokens: int) -> None:
+        """Remember the prefix a sub-agent conversation's first request reused (never demoted)."""
+        if not self._demotion_enabled:
+            return
+        conversation_id = _request_conversation_id(request)
+        if conversation_id is None:
+            return
+        state = self._conversation_states.get(conversation_id)
+        if state is not None and state.owned_begin_tokens is None:
+            state.owned_begin_tokens = int(reused_tokens)
 
     def prepare_request(self, request: LlmRequest) -> None:
         """Register a context request unless its conversation has another active one."""
@@ -490,7 +558,54 @@ class ConversationManager:
             )
             return
 
+        newly_registered = current_request_id is None
         state.current_request_id = request_id
+        if self._demotion_enabled and newly_registered:
+            self._on_conversation_request(conversation_id, state, request)
+
+    def _on_conversation_request(
+        self, conversation_id: str, state: _ConversationState, request: LlmRequest
+    ) -> None:
+        if state.demoted:
+            # It came back after all: give its blocks the default priority again before the
+            # request claims them (a claim without a retention config keeps the priority).
+            state.demoted = False
+            if state.retention_handle is not None:
+                state.retention_handle.set_priority(DEFAULT_RETENTION_PRIORITY)
+                self.num_restored_conversations += 1
+        parent_id = getattr(request, "py_subagent_parent_id", None)
+        if parent_id and parent_id != conversation_id:
+            state.parent_id = parent_id
+            parent = self._conversation_states.setdefault(parent_id, _ConversationState())
+            if parent.children is None:
+                parent.children = {}
+            parent.children[conversation_id] = None
+        if state.children:
+            self._demote_finished_children(state)
+
+    def _demote_finished_children(self, parent: _ConversationState) -> None:
+        for child_id in list(parent.children):
+            child = self._conversation_states.get(child_id)
+            if child is None:
+                parent.children.pop(child_id, None)
+                continue
+            if child.current_request_id is not None or child.last_finish_step is None:
+                continue  # running, or no finished context yet
+            idle = self._step - child.last_finish_step
+            if idle < self._finished_subagent_min_idle:
+                continue
+            parent.children.pop(child_id, None)
+            if child.retention_handle is not None:
+                pages = child.retention_handle.set_priority(self._finished_subagent_priority)
+                self.num_demoted_pages += pages
+                self.num_demoted_conversations += 1
+                child.demoted = True
+                if self.num_demoted_conversations % 200 == 1:
+                    logger.info(
+                        f"KVCM2 per_conversation: demoted {self.num_demoted_conversations} finished "
+                        f"sub-agent conversation(s), {self.num_demoted_pages} pages; "
+                        f"{self.num_restored_conversations} came back"
+                    )
 
     def finish_request(self, request: LlmRequest) -> None:
         """Clear a request as active while preserving any saved drop plan."""
@@ -502,7 +617,7 @@ class ConversationManager:
             return
 
         state.current_request_id = None
-        if not state.planned_drop_handles:
+        if state.is_idle():
             self._conversation_states.pop(conversation_id)
 
     def clear(self) -> None:
@@ -1962,6 +2077,9 @@ class _BasePageTableMaterializer:
 
 class KVCacheManagerV2(BaseResourceManager):
     gen_preemption_headroom: int = 0
+    # Set by __init__ under the per-conversation reuse policy, else None. Declared on the class so
+    # it is present even when an instance is built without running __init__.
+    conversation_manager: Optional["ConversationManager"] = None
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
@@ -2984,10 +3102,25 @@ class KVCacheManagerV2(BaseResourceManager):
             and self._can_publish_block_reuse
         )
         self.conversation_manager = (
-            ConversationManager(block_reuse_config.max_num_turns)
+            ConversationManager(
+                block_reuse_config.max_num_turns,
+                finished_subagent_priority=block_reuse_config.finished_subagent_priority,
+                finished_subagent_min_idle_iterations=(
+                    block_reuse_config.finished_subagent_min_idle_iterations
+                ),
+            )
             if enable_conversation_manager
             else None
         )
+        if self.conversation_manager is not None and (
+            block_reuse_config.finished_subagent_priority is not None
+        ):
+            logger.info(
+                "KVCM2 per_conversation: finished sub-agent conversations are demoted to "
+                f"priority {block_reuse_config.finished_subagent_priority} when their parent "
+                f"returns (min idle {block_reuse_config.finished_subagent_min_idle_iterations} "
+                "scheduler steps)"
+            )
         # Commit the SWA window where a prompt leaves the radix tree; see
         # _record_branch_snapshot_point. A draft pool commits at the target's
         # points, which live on the shared request, but records none itself.
@@ -5930,6 +6063,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.enable_swa_scratch_reuse = False
             if not self._resume_context_cache(req, kv_cache):
                 return None
+            if self.conversation_manager is not None and num_lookup_tokens is not None:
+                self.conversation_manager.record_first_reuse(req, kv_cache.num_committed_tokens)
             return kv_cache.num_committed_tokens
 
         # Subsequent chunk: cache must exist from first chunk. It may be
@@ -6391,6 +6526,8 @@ class KVCacheManagerV2(BaseResourceManager):
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         self.impl.refresh_retention()
+        if self.conversation_manager is not None:
+            self.conversation_manager.advance_step()
         for request in scheduled_batch.context_requests:
             ready = self._disagg_receive_ready.get(request.py_request_id)
             if ready is not None:
