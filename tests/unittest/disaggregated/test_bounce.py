@@ -1156,3 +1156,69 @@ class TestQuarantine:
         a.quarantine(s, grace_s=float("inf"))  # close-only reclaim
         assert a.reclaim_expired() == 0
         assert a.quarantined_bytes == 512
+
+
+# --------------------------------------------------------------------------- #
+# TRTLLM_KV_BOUNCE_NONBLOCKING_STREAMS: gather/scatter stream flags (cudart mocked)
+# --------------------------------------------------------------------------- #
+class _FakeCudart:
+    cudaStreamNonBlocking = 0x1
+
+    def __init__(self):
+        self.calls = []
+
+    def cudaStreamCreate(self):
+        self.calls.append(("create",))
+        return (0, 11)
+
+    def cudaStreamCreateWithFlags(self, flags):
+        self.calls.append(("with_flags", flags))
+        return (0, 22)
+
+
+class TestNonBlockingStreams:
+    def _new_stream(self, monkeypatch, value):
+        fake = _FakeCudart()
+        monkeypatch.setattr(btr, "cudart", fake)
+        monkeypatch.setattr(btr, "CUASSERT", lambda ret: ret[1:])
+        if value is None:
+            monkeypatch.delenv("TRTLLM_KV_BOUNCE_NONBLOCKING_STREAMS", raising=False)
+        else:
+            monkeypatch.setenv("TRTLLM_KV_BOUNCE_NONBLOCKING_STREAMS", value)
+        handle = btr.VmmBounceTransport._new_stream(object.__new__(btr.VmmBounceTransport))
+        return handle, fake.calls
+
+    @pytest.mark.parametrize("value", [None, "0", "", "true", "2"])
+    def test_default_keeps_blocking_stream(self, monkeypatch, value):
+        handle, calls = self._new_stream(monkeypatch, value)
+        assert (handle, calls) == (11, [("create",)])
+        assert not btr.nonblocking_streams_enabled()
+
+    def test_switch_creates_nonblocking_stream(self, monkeypatch):
+        handle, calls = self._new_stream(monkeypatch, "1")
+        assert (handle, calls) == (22, [("with_flags", _FakeCudart.cudaStreamNonBlocking)])
+        assert btr.nonblocking_streams_enabled()
+
+    def test_transport_streams_use_the_switch(self, monkeypatch):
+        """Both the send (gather) and scatter streams come from _new_stream."""
+        fake = _FakeCudart()
+        monkeypatch.setattr(btr, "cudart", fake)
+        monkeypatch.setattr(btr, "CUASSERT", lambda ret: ret[1:])
+        monkeypatch.setenv("TRTLLM_KV_BOUNCE_NONBLOCKING_STREAMS", "1")
+        monkeypatch.setattr(btr, "SlotAllocator", _FakeAlloc)
+        started = []
+
+        def _fake_worker(self, name):
+            self._scatter_stream = self._new_stream()
+            started.append(self._scatter_stream)
+
+        monkeypatch.setattr(btr.VmmBounceTransport, "_start_scatter_worker", _fake_worker)
+        t = btr.VmmBounceTransport(
+            SimpleNamespace(register_memory=lambda d: None),
+            device_id=0,
+            capacity_bytes=1 << 20,
+            phys_chunk_size=1 << 20,
+            block_bytes_per_group=[4096],
+        )
+        assert t._send_stream == 22 and t._scatter_stream == 22
+        assert fake.calls == [("with_flags", 1), ("with_flags", 1)]
