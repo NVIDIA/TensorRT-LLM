@@ -4343,6 +4343,11 @@ def _create_kv_cache_manager(
             mamba_manager_extra_kwargs.update(
                 pretrained_config=config,
                 sparse_attention_config=sparse_attention_config)
+            # Set by a model that implements the in-forward snapshot split.
+            if model_engine is not None:
+                mamba_manager_extra_kwargs["inforward_snapshot_min_main"] = int(
+                    getattr(model_engine.model, "inforward_snapshot_min_main",
+                            0) or 0)
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,

@@ -4156,6 +4156,48 @@ def test_v2_inforward_snapshot_commits_point_and_restores_prompt_end_state():
 
 
 @skip_no_cuda
+@pytest.mark.parametrize("reverse", [False, True], ids=["staging order", "reversed batch"])
+def test_v2_inforward_snapshot_restores_every_planned_request_in_one_pass(reverse):
+    # Each planned request's live slot gets its own staging row back, whether the rows come in
+    # staging order (slice) or not (gather).
+    mgr = _build_v2_inforward_snapshot_manager()
+    try:
+        requests = [
+            _make_v2_prompt_request(rid, [rid * 1000 + t for t in range(66)]) for rid in (1, 2)
+        ]
+        mgr.prepare_expect_snapshot_points(requests)
+        batch = ScheduledRequests()
+        for request in requests:
+            assert mgr.prepare_context(request)
+            assert mgr.resize_context(request, num_tokens=66)
+            request.context_chunk_size = 66
+            request.py_mamba_inforward_snapshot_point = 64
+            batch.append_context_request(request)
+        mgr.prepare_resources(batch)
+        rows = {rid: entry.row for rid, entry in mgr.inforward_snapshot_plan.items()}
+        assert sorted(rows.values()) == [0, 1]
+        slots = {rid: mgr.state_index(rid) for rid in (1, 2)}
+        for layer in range(2):
+            stage_ssm, stage_conv = mgr.inforward_snapshot_stage_views(layer)
+            for rid in (1, 2):
+                mgr.get_ssm_states(layer)[slots[rid]].fill_(1.0)
+                mgr.get_conv_states(layer)[slots[rid]].fill_(1.0)
+                stage_ssm[rows[rid]].fill_(10.0 * rid + layer)
+                stage_conv[rows[rid]].fill_(10.0 * rid + layer)
+        visit = ScheduledRequests()
+        for request in reversed(requests) if reverse else requests:
+            visit.append_context_request(request)
+        mgr.finish_inforward_snapshots(visit)
+        torch.cuda.synchronize()
+        for layer in range(2):
+            for rid in (1, 2):
+                assert torch.all(mgr.get_ssm_states(layer)[slots[rid]] == 10.0 * rid + layer)
+                assert torch.all(mgr.get_conv_states(layer)[slots[rid]] == 10.0 * rid + layer)
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
 def test_v2_inforward_snapshot_plan_drops_a_mark_in_a_mixed_batch():
     mgr = _build_v2_inforward_snapshot_manager()
     try:
