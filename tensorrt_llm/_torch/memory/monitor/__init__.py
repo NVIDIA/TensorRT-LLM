@@ -55,12 +55,21 @@ __all__ = [
     "clear_baseline",
     "current_rank",
     "enabled",
+    "mode",
+    "oom_enabled",
     "render_capture",
     "summarize_by_category",
 ]
 
 ENV_VAR = "TLLM_MEM_MONITOR"
 RANK_ENV_VAR = "TLLM_MEM_MONITOR_RANKS"
+
+#: ``TLLM_MEM_MONITOR`` modes.
+OFF, OOM, FULL = "off", "oom", "full"
+_MODE_VALUES = {"0": OFF, "oom": OOM, "1": FULL}
+#: Unset: report out-of-memory errors, which costs nothing until one happens.
+DEFAULT_MODE = OOM
+_warned_values: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -104,17 +113,48 @@ def current_rank() -> int | None:
         return None
 
 
+def mode() -> str:
+    """The monitor's mode from ``TLLM_MEM_MONITOR``.
+
+    * ``0`` -- off: no reports are produced on their own.
+    * ``oom`` (the default, also when unset) -- a report when memory runs out,
+      and nothing else. No work is done until an allocation fails, so the
+      default costs nothing while serving; the report has every row but no
+      startup-step breakdown and no comparison with warmup, which need
+      recording during startup.
+    * ``1`` -- full: also records startup, reports when it completes, and
+      enables the periodic report, stack mode, every-rank gathering under MPI
+      and ``trtllm-serve``'s ``/memory_report``.
+
+    An unrecognised value falls back to the default, with a warning.
+    """
+    raw = os.environ.get(ENV_VAR, "").strip().lower()
+    if not raw:
+        return DEFAULT_MODE
+    if raw in _MODE_VALUES:
+        return _MODE_VALUES[raw]
+    if raw not in _warned_values:
+        _warned_values.add(raw)
+        from tensorrt_llm.logger import logger
+
+        logger.warning(
+            f"memory monitor: unknown {ENV_VAR}={raw!r}; expected 0, oom or 1. "
+            f"Using {DEFAULT_MODE!r}."
+        )
+    return DEFAULT_MODE
+
+
 def requested() -> bool:
-    """Whether ``TLLM_MEM_MONITOR=1`` is set, regardless of the rank filter.
+    """Whether full mode is set, regardless of the rank filter.
 
     For setup every rank must agree on, such as a collective communicator
     duplication; :func:`enabled` can differ between ranks.
     """
-    return os.environ.get(ENV_VAR, "") == "1"
+    return mode() == FULL
 
 
 def enabled(rank: int | None = None) -> bool:
-    """Whether the monitor should run in this process.
+    """Whether the full monitor should run in this process (``TLLM_MEM_MONITOR=1``).
 
     ``TLLM_MEM_MONITOR_RANKS`` optionally restricts collection to a
     comma-separated rank list, so a multi-rank job can pay the cost on one
@@ -122,8 +162,15 @@ def enabled(rank: int | None = None) -> bool:
     determined the filter is not applied, so the report is produced rather
     than silently skipped.
     """
-    if os.environ.get(ENV_VAR, "") != "1":
-        return False
+    return mode() == FULL and _rank_selected(rank)
+
+
+def oom_enabled(rank: int | None = None) -> bool:
+    """Whether out-of-memory errors are reported: the default and full modes."""
+    return mode() != OFF and _rank_selected(rank)
+
+
+def _rank_selected(rank: int | None) -> bool:
     ranks = os.environ.get(RANK_ENV_VAR, "")
     if not ranks:
         return True

@@ -204,7 +204,9 @@ def _report_oom(headline: str) -> None:
 
     _reporting.active = True
     try:
-        report = report_now(tag="out_of_memory", headline=headline)
+        # Forced: in the default mode the full monitor is off, and an armed
+        # reporter is all the permission this report needs.
+        report = report_now(tag="out_of_memory", headline=headline, force=True)
         # WARNING rather than ERROR: the caller may yet handle the OOM, and
         # the error itself is what reports the failure.
         logger.warning(
@@ -346,16 +348,17 @@ def install_oom_reporter(rank: int | None = None) -> bool:
     """
     global _attached, _enabled_flag
 
-    from . import enabled
+    from . import enabled, oom_enabled
 
-    if not enabled(rank):
+    if not oom_enabled(rank):
         return False
 
     # Armed even if torch's observer cannot be attached: errors from outside
     # the PyTorch allocator still arrive through notify_error.
     _enabled_flag = True
     _install_error_hooks()
-    _start_periodic(rank)
+    if enabled(rank):
+        _start_periodic(rank)
     if _attached:
         return True
 

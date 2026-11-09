@@ -21,21 +21,30 @@ the same memory down by allocator for whoever needs to dig further.
 The memory monitor is a prototype and its report format may change.
 ```
 
-## Turning it on
+## Modes
 
-The monitor is off by default and costs nothing while off. Set
-`TLLM_MEM_MONITOR=1` for the run:
+`TLLM_MEM_MONITOR` selects one of three modes:
+
+| Value | Mode | What it does |
+|---|---|---|
+| unset or `oom` | out-of-memory reports (default) | A report when an allocation runs out of memory, and nothing else. No work is done until an allocation fails. |
+| `1` | full | Also records startup and reports when it finishes, compares later reports with that point, and enables the options below. |
+| `0` | off | No reports are produced on their own. |
 
 ```bash
 TLLM_MEM_MONITOR=1 trtllm-serve <model> ...
 ```
 
-With the monitor on, each worker process reports:
+Out-of-memory errors are reported whether they fail in PyTorch or in native
+code such as NCCL, cuBLAS or TensorRT-LLM's own C++ pools, and whether they
+happen on the executor thread or a background thread.
+
+In the default mode a report has every row, but no breakdown by startup step
+and no comparison with warmup: both need startup to be recorded, which only
+the full mode does. With `TLLM_MEM_MONITOR=1` each worker process also
+reports:
 
 * once startup has finished, including warmup and CUDA graph capture;
-* when an allocation runs out of memory, whether it fails in PyTorch or in
-  native code such as NCCL, cuBLAS or TensorRT-LLM's own C++ pools, and
-  whether it happens on the executor thread or a background thread;
 * every `TLLM_MEM_MONITOR_INTERVAL` seconds, if set.
 
 Reports go to the log at INFO (startup, periodic) or WARNING (out of memory)
@@ -43,7 +52,7 @@ level.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `TLLM_MEM_MONITOR` | unset | `1` turns the monitor on. |
+| `TLLM_MEM_MONITOR` | `oom` | `0`, `oom` or `1`; see above. |
 | `TLLM_MEM_MONITOR_RANKS` | all ranks | Comma-separated ranks that report, e.g. `0` or `0,4`. |
 | `TLLM_MEM_MONITOR_OOM_INTERVAL` | `60` | Minimum seconds between two out-of-memory reports; a retry loop that fails repeatedly produces one report per interval. |
 | `TLLM_MEM_MONITOR_INTERVAL` | unset | Report every this many seconds while serving, to watch memory that grows slowly. |
@@ -53,9 +62,8 @@ level.
 ## Asking for a report
 
 `LLM.get_memory_report()` (also on `AsyncLLM`) returns one report per rank,
-rank 0 first, whether or not `TLLM_MEM_MONITOR` is set. Under the default MPI
-executor the other ranks answer only while the monitor is on; with it off,
-only rank 0 reports.
+rank 0 first, in every mode. Under the default MPI executor the other ranks
+answer only with `TLLM_MEM_MONITOR=1`; otherwise only rank 0 reports.
 
 ```python
 from tensorrt_llm import LLM
@@ -71,7 +79,7 @@ breakdown and no comparison with warmup, but every row is still there.
 
 A `trtllm-serve` started with `TLLM_MEM_MONITOR=1` answers the same request
 at `GET /memory_report`, with `{"reports": [...]}`. The route exists only
-while the monitor is on.
+in that mode.
 
 ## Reading a report
 
@@ -126,8 +134,10 @@ on resume.
 
 ## Cost
 
-With the monitor off, nothing runs while serving. With it on, allocation
-history is recorded during startup only, and a report takes about a
-millisecond once startup has finished; no work is added to the executor loop.
+In the default `oom` mode nothing runs until an allocation fails; the first
+report after it may take a few hundred milliseconds while it classifies the
+process's memory pools. With `TLLM_MEM_MONITOR=1`, allocation history is
+recorded during startup only, and a report takes about a millisecond once
+startup has finished. Neither mode adds work to the executor loop.
 `TLLM_MEM_MONITOR_STACKS=1` is the exception and slows every PyTorch
 allocation while it is on.
