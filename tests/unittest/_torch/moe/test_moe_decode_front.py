@@ -36,7 +36,9 @@ _ROUTER_TACTIC = default_tactic(1, E, H, fp8=False)
 _K_WARPS = _ROUTER_TACTIC[0]
 
 
-def _inputs(m, seed, dup=False, crowd=False, h=H):
+def _inputs(
+    m: int, seed: int, dup: bool = False, crowd: bool = False, h: int = H
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     g = torch.Generator(device="cuda").manual_seed(seed)
     x = (torch.randn((m, h), generator=g, device="cuda") * 0.5).to(torch.bfloat16)
     x[0, :32] = 0  # all-zero quant blocks
@@ -127,7 +129,15 @@ def _route_front(x, w, gs, flat, ls, nl, tile):
     return (logits,) + front(fn, logits, x, gs, flat, tile, ls, nl, K)
 
 
-def _ref_route(logits, x, gs, ls, nl, tile, quant=True):
+def _ref_route(
+    logits: torch.Tensor,
+    x: torch.Tensor,
+    gs: torch.Tensor,
+    ls: int,
+    nl: int,
+    tile: int,
+    quant: bool = True,
+) -> tuple[torch.Tensor, ...]:
     """The Triton per-token route + tables (+ quant, power-of-two H only) kernel at any token count
     (RouteTables caps it at 32)."""
     m, h = x.shape
@@ -333,7 +343,7 @@ def test_route_front_parity(m, nl, ls, tile, dup, crowd):
 
 # M = 64: the route-front step of MTP-3 at CUDA-graph batch 16 (perf-sanity qwen3_8_flash_next_fp4_tp1_mtp3_8k1k).
 @pytest.mark.parametrize("m,nl,ls,tile", [(64, 512, 0, 8), (40, 128, 384, 16)])
-def test_route_front_non_pow2_hidden(m, nl, ls, tile, h=2560):
+def test_route_front_non_pow2_hidden(m: int, nl: int, ls: int, tile: int, h: int = 2560) -> None:
     """The route front at a hidden size that is not a power of two (Qwen3.8-Flash-Next), which the small-M
     fronts decline: routing equal to the Triton route kernel, x bytes equal to fp4_quantize."""
     x, w, gs = _inputs(m, seed=1700 + m + nl, h=h)
@@ -620,7 +630,7 @@ def test_decode_front_keeps_token_count_dynamic_under_compile():
 class _RecordingMoe:
     """The routed experts as ``DecodeFront`` calls them (CPU, no kernels), recording into ``calls``."""
 
-    def __init__(self, calls):
+    def __init__(self, calls: list[str]) -> None:
         self.calls = calls
         self.backend = type(
             "Backend",
@@ -634,27 +644,50 @@ class _RecordingMoe:
         )()
         self.routing_method = type("Routing", (), dict(experts_per_token=K))()
 
-    def __call__(self, x, logits, output_dtype, prerouted, **kwargs):
+    def __call__(
+        self,
+        x: object,
+        logits: torch.Tensor,
+        output_dtype: torch.dtype,
+        prerouted: PreroutedRouting | None = None,
+        **kwargs: object,
+    ) -> str:
         self.calls.append("moe")
         return "front"
 
 
 # H 4096 / 2048: Qwen3.5-397B / Qwen3-Next-80B; H 2560: Qwen3.8-Flash-Next, whose MTP-3 step at CUDA-graph batch
-# 8 (M 32) hit RouterGemm's power-of-two assertion (nvbugs/7046452) and at batch 16 (M 64) takes the route front.
+# 8 (M 32) takes the stock path and at batch 16 (M 64) the route front.
+# mode: "router" = no low-M dispatcher (RouterGemm), "dispatcher" = a low-M dispatcher attached (gate + RouteTables
+# with x), "tune" = under autotune() (the stock router and MoE of the tuning step).
 @pytest.mark.parametrize(
-    "h,m,route_steps,path",
+    "h,m,route_steps,mode,path",
     [
-        (4096, 32, (), ["router_gemm", "route", "moe"]),
-        (2048, 8, (), ["router_gemm", "route", "moe"]),
-        (2560, 32, (), None),
-        (2560, 1, (), None),
-        (2560, 64, (64,), ["gate", "route_front", "moe"]),
+        (4096, 32, (), "router", ["router_gemm", "route", "moe"]),
+        (2048, 8, (), "router", ["router_gemm", "route", "moe"]),
+        (2560, 32, (), "router", None),
+        (2560, 1, (), "router", None),
+        (2560, 64, (64,), "router", ["gate", "route_front", "moe"]),
+        (4096, 32, (), "dispatcher", ["gate", "route", "moe"]),
+        (2560, 32, (), "dispatcher", None),
+        (4096, 32, (), "tune", ["gate", "moe"]),
+        (2560, 32, (), "tune", None),
     ],
 )
-def test_decode_front_hidden_size(monkeypatch, h, m, route_steps, path):
+def test_decode_front_hidden_size(
+    monkeypatch: pytest.MonkeyPatch,
+    h: int,
+    m: int,
+    route_steps: tuple[int, ...],
+    mode: str,
+    path: list[str] | None,
+) -> None:
     """Steps of up to ROUTER_MAX_TOKENS tokens take the front only with a power-of-two hidden size (its Triton
-    launches span whole rows) and otherwise decline before any launch; the route front takes other sizes."""
-    calls = []
+    launches span whole rows) and otherwise decline before any launch, with or without a low-M dispatcher and
+    under autotuning; the route front takes other sizes."""
+    from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+
+    calls: list[str] = []
     xq = torch.zeros((m, h // 2), dtype=torch.uint8)
     xsf = torch.zeros((m, h // 16), dtype=torch.uint8)
     ids, wts = torch.zeros((m, K), dtype=torch.int32), torch.zeros((m, K), dtype=torch.bfloat16)
@@ -663,31 +696,61 @@ def test_decode_front_hidden_size(monkeypatch, h, m, route_steps, path):
         out_dtype = torch.bfloat16
         weight = torch.zeros((E, h), dtype=torch.bfloat16)
 
-        def __call__(self, x):
+        def __call__(self, x: torch.Tensor) -> torch.Tensor:
             calls.append("gate")
             return torch.zeros((x.shape[0], E), dtype=torch.bfloat16)
 
     class RouteFront:
-        def compiled(self, x, n, tile, num_local, top_k):
+        def compiled(self, x: torch.Tensor, n: int, tile: int, num_local: int, top_k: int) -> str:
             return "compiled"
 
-        def __call__(self, fn, logits, x, gs, flat, tile, local_start, num_local, top_k):
+        def __call__(
+            self,
+            fn: str,
+            logits: torch.Tensor,
+            x: torch.Tensor,
+            gs: torch.Tensor,
+            flat: torch.Tensor,
+            tile: int,
+            local_start: int,
+            num_local: int,
+            top_k: int,
+        ) -> tuple[torch.Tensor, ...]:
             calls.append("route_front")
             return xq, xsf, ids, wts
 
-    def router_gemm(x, weight, global_scale):
+    def router_gemm(
+        x: torch.Tensor, weight: torch.Tensor, global_scale: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
         calls.append("router_gemm")
         return torch.zeros((x.shape[0], E), dtype=torch.bfloat16), xq, xsf
 
-    def route(logits, top_k, local_start, num_local, tile, flat=None):
+    def route(
+        logits: torch.Tensor,
+        top_k: int,
+        local_start: int,
+        num_local: int,
+        tile: int,
+        flat: torch.Tensor | None = None,
+        x: torch.Tensor | None = None,
+        global_scale: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
         calls.append("route")
-        return ids, wts
+        return (ids, wts) if x is None else (ids, wts, xq, xsf)
 
+    dispatcher = object() if mode == "dispatcher" else None
     monkeypatch.setattr(df, "front_eligible", lambda moe, x, max_tokens: True)
-    monkeypatch.setattr(df, "low_m_gemm_dispatcher", lambda gate: None)
+    monkeypatch.setattr(df, "low_m_gemm_dispatcher", lambda gate: dispatcher)
     front = df.DecodeFront(frozenset(route_steps))
     front.router_gemm, front.route, front.route_front = router_gemm, route, RouteFront()
-    out = front(Gate(), _RecordingMoe(calls), torch.zeros((m, h), dtype=torch.bfloat16))
+    x = torch.zeros((m, h), dtype=torch.bfloat16)
+    if mode == "tune":
+        AutoTuner.get().clear_cache()
+        with autotune():
+            out = front(Gate(), _RecordingMoe(calls), x)
+        AutoTuner.get().clear_cache()
+    else:
+        out = front(Gate(), _RecordingMoe(calls), x)
     if path is None:
         assert out is None and calls == [], calls
     else:

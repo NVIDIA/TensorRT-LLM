@@ -233,7 +233,7 @@ class RouterGemm:
         assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
         assert weight.is_contiguous() and x.stride(1) == 1
         assert m <= ROUTER_MAX_TOKENS
-        assert n % self.BN == 0 and k % (self.SPLITK * 16) == 0
+        assert n % self.BN == 0 and router_front_supports(k)
         bm = 16 if m <= 16 else 32
         dev = x.device
         if self.part is None or self.part.device != dev:
@@ -242,7 +242,6 @@ class RouterGemm:
         out = torch.empty((m, n), dtype=torch.bfloat16, device=dev)
         quant = global_scale is not None
         if quant:
-            assert (k & (k - 1)) == 0
             xq = torch.empty((m, k // 2), dtype=torch.uint8, device=dev)
             xsf = torch.empty((m, k // 16), dtype=torch.uint8, device=dev)
         else:
@@ -548,7 +547,7 @@ class RouteTables:
         quant = x is not None
         if quant:
             assert global_scale is not None and x.dtype == torch.bfloat16 and x.shape[0] == m
-            assert x.stride(1) == 1 and (x.shape[1] & (x.shape[1] - 1)) == 0
+            assert x.stride(1) == 1 and router_front_supports(x.shape[1])
             xq = torch.empty((m, x.shape[1] // 2), dtype=torch.uint8, device=dev)
             xsf = torch.empty((m, x.shape[1] // 16), dtype=torch.uint8, device=dev)
             qargs = (x, x.stride(0), global_scale, xq, xsf)
@@ -843,10 +842,10 @@ class RouteFront:
 
 
 def router_front_supports(hidden: int) -> bool:
-    """Whether the fronts of up to ``ROUTER_MAX_TOKENS`` tokens take hidden size ``hidden``: their Triton launches
-    (``RouterGemm``, ``RouteTables`` with x) quantize whole rows and split K into ``RouterGemm.SPLITK`` slices,
-    all power-of-two blocks. The route front takes any multiple of 16."""
-    return hidden >= RouterGemm.SPLITK * 16 and hidden & (hidden - 1) == 0
+    """Whether the fronts of up to ``ROUTER_MAX_TOKENS`` tokens take hidden size ``hidden``, as their Triton
+    launches (``RouterGemm``, ``RouteTables`` with x) assert: they load whole rows and split K into
+    ``RouterGemm.SPLITK`` slices, all power-of-two blocks. The route front takes any multiple of 16."""
+    return hidden >= RouterGemm.SPLITK * 16 and (hidden & (hidden - 1)) == 0
 
 
 def front_eligible(moe, x: torch.Tensor, max_tokens: int) -> bool:
