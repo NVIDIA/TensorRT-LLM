@@ -201,6 +201,8 @@ SERVED_AT = {
     "wide_drafter_hops": ({(103, 4)}, "composition", "upstream"),
     "router_gemm": ({(103, 4)}, "composition", "upstream"),
     "projection_publish": ({(103, 4)}, "composition", "upstream"),
+    # Opt-in at (103, 4) only.
+    "prefill_cutedsl_experts": ({(103, 4)}, "composition", "HC"),
 }
 
 
@@ -217,7 +219,7 @@ def test_the_compositions_and_the_fast_paths():
     assert sorted(TARGET_PATHS) == [(103, 4), (103, 8)]
     served = TARGET_PATHS[(103, 4)].served | TARGET_PATHS[(103, 8)].served
     assert DISPATCH.FAST_PATH_NAMES == served
-    assert (len(TARGET_PATHS[(103, 8)].served), len(TARGET_PATHS[(103, 4)].served)) == (44, 55)
+    assert (len(TARGET_PATHS[(103, 8)].served), len(TARGET_PATHS[(103, 4)].served)) == (44, 56)
     with pytest.raises(KeyError):
         table((107, 4), 4, "agg", "windowed")
 
