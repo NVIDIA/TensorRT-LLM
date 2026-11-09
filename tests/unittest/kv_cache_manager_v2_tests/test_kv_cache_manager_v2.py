@@ -11460,9 +11460,12 @@ class TestTeardownWithoutCudaContext(TestKVCacheManagerV2):
         free_after = self._device_free_memory()
         self.assertGreaterEqual(free_after, free_before - self.FREE_MEMORY_SLACK, f"{held} B held")
 
-    def _open_cache(self, manager: KVCacheManager, num_tokens: int = 64) -> _KVCache:
+    def _open_cache(
+        self, manager: KVCacheManager, tokens: list[TokenIdExt] | None = None
+    ) -> _KVCache:
         """A resumed cache holding committed pages, so a teardown has pages to release."""
-        tokens = [self.next_token() for _ in range(num_tokens)]
+        if tokens is None:
+            tokens = [self.next_token() for _ in range(64)]
         cache = manager.create_kv_cache(input_tokens=tokens)
         self.assertTrue(cache.resume(self.stream))
         self.assertTrue(cache.resize(len(tokens)))
@@ -11473,14 +11476,22 @@ class TestTeardownWithoutCudaContext(TestKVCacheManagerV2):
         """Runs a request through the manager, so the teardown has events and pages to release."""
         self._open_cache(manager).close()
 
-    def _plan_drop(self, manager: KVCacheManager) -> PlannedDropHandle:
-        """A live plan over a closed cache's committed blocks, as the executor keeps them."""
-        cache = self._open_cache(manager)
+    def _plan_drop(
+        self, manager: KVCacheManager, num_tokens: int = 64
+    ) -> tuple[PlannedDropHandle, list[TokenIdExt]]:
+        """A live plan over a closed cache's committed blocks, as the executor keeps them.
+
+        Also returns the cache's tokens: the plan has been applied once they stop matching.
+        Full-attention blocks are never planned, so only a sliding-window manager yields a plan
+        that drops anything.
+        """
+        tokens = [self.next_token() for _ in range(num_tokens)]
+        cache = self._open_cache(manager, tokens)
         cache.stop_committing()
         handle = cache.plan_committed_block_drop()
         cache.close()
         assert handle is not None
-        return handle
+        return handle, tokens
 
     def _assert_process_still_usable(self) -> None:
         self.assertIsNone(poison_reason())
@@ -11528,14 +11539,22 @@ class TestTeardownWithoutCudaContext(TestKVCacheManagerV2):
 
     def test_planned_drop_handle_finalized_without_cuda_context_applies_the_plan(self) -> None:
         """Dropping the handle is how the plan is applied; it may free a page's last owner."""
-        self.manager = KVCacheManager(self.cfg)
-        holder: list[object] = [self._plan_drop(self.manager)]
+        # A window of one block: the plan covers the cache's whole single block.
+        tokens_per_block = 32
+        self.manager = KVCacheManager(
+            create_config(tokens_per_block, 64 << 20, 16 << 20, 0, 2, tokens_per_block, 0)
+        )
+        handle, planned_tokens = self._plan_drop(self.manager, num_tokens=tokens_per_block)
+        holder: list[object] = [handle]
+        del handle
+        # Planning alone keeps the block reusable; applying the plan is what drops it.
+        self.assertGreater(self.manager.probe_reuse(input_tokens=planned_tokens), 0)
 
         self._drop_without_cuda_context(holder)
         self.assertIsNone(poison_reason())
-        # The plan was applied: a second plan over fresh blocks still works, and the manager
-        # still serves requests.
-        self._plan_drop(self.manager).drop()
+        self.assertEqual(self.manager.probe_reuse(input_tokens=planned_tokens), 0)
+        # The manager still plans drops and serves requests.
+        self._plan_drop(self.manager)[0].drop()
         self._exercise(self.manager)
         self.manager.shutdown()
         del self.manager
