@@ -104,26 +104,63 @@ def _assignment(node: ast.AST, name: str) -> ast.Assign:
     return _only(found, f"assignment to {name}")
 
 
-def _cluster_scope_spin(node: ast.AST, barrier: str) -> ast.Call:
-    """The first cluster-scope try-wait on ``barrier`` under ``node``, which must be spun on.
+def _statement_lists(node: ast.AST) -> list[list[ast.stmt]]:
+    """Every list of statements (bodies, else branches) under ``node``."""
+    lists = []
+    for n in ast.walk(node):
+        for field in ("body", "orelse", "finalbody"):
+            stmts = getattr(n, field, None)
+            if isinstance(stmts, list) and stmts and isinstance(stmts[0], ast.stmt):
+                lists.append(stmts)
+    return lists
 
-    The helper returns 1 once the phase completed, so the kernel repeats it in a
-    ``while done == 0`` loop. Returns the first try-wait, the one whose line marks
-    the start of the wait.
+
+def _assigns_done_from_try_wait(stmt: ast.stmt, barrier: str) -> bool:
+    """``done = ptx.mbar_try_wait_cluster(<barrier>, Int32(0))``."""
+    return (
+        isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and ast.unparse(stmt.targets[0]) == "done"
+        and isinstance(stmt.value, ast.Call)
+        and _callee(stmt.value) == _HELPER
+        and _arg(stmt.value, 0) == barrier
+        and _arg(stmt.value, 1) == "Int32(0)"
+    )
+
+
+def _cluster_scope_spin(node: ast.AST, barrier: str) -> ast.Call:
+    """The cluster-scope try-wait on ``barrier`` under ``node``, which must be spun on.
+
+    The helper returns 1 once the phase completed, so the kernel has to take its
+    result into ``done`` and repeat it while ``done == 0``, taking each repeat's
+    result into ``done`` as well:
+
+        done = ptx.mbar_try_wait_cluster(barrier, Int32(0))
+        while done == 0:
+            done = ptx.mbar_try_wait_cluster(barrier, Int32(0))
+
+    An initial ``done`` that does not come from the try-wait, or a loop whose body
+    does not refresh it, would let the kernel read the operand before the barrier
+    completed. Returns the initial try-wait, whose line marks the start of the wait.
     """
-    waits = [c for c in _calls(node) if _callee(c) == _HELPER and _arg(c, 0) == barrier]
-    assert waits, f"no {_HELPER} on {barrier}"
-    for wait in waits:
-        assert _arg(wait, 1) == "Int32(0)", ast.unparse(wait)
-    spins = [
-        loop
-        for loop in ast.walk(node)
-        if isinstance(loop, ast.While)
-        and ast.unparse(loop.test) == "done == 0"
-        and any(c is w for c in _calls(loop) for w in waits)
+    spins = []
+    for stmts in _statement_lists(node):
+        for first, loop in zip(stmts, stmts[1:]):
+            if (
+                isinstance(loop, ast.While)
+                and ast.unparse(loop.test) == "done == 0"
+                and _assigns_done_from_try_wait(first, barrier)
+                and any(_assigns_done_from_try_wait(s, barrier) for s in loop.body)
+            ):
+                spins.append(first.value)
+    assert spins, f"no try-wait on {barrier} whose result is taken into done and spun on"
+    other = [
+        c
+        for c in _calls(node)
+        if _callee(c) == _HELPER and _arg(c, 0) == barrier and _arg(c, 1) != "Int32(0)"
     ]
-    assert spins, f"the try-wait on {barrier} is not repeated until it reports completion"
-    return waits[0]
+    assert not other, [ast.unparse(c) for c in other]
+    return spins[0]
 
 
 def _cta_scope_waits_on(node: ast.AST, fragment: str) -> list[ast.Call]:
