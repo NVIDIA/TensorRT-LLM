@@ -1662,6 +1662,9 @@ class ChunkKdaFwdK1:
                 )
 
         tma_full.release()
+        # The MMA warpgroup TMA-stores sQd and sKd as soon as this stage is
+        # committed; make these shared-memory writes visible to the async proxy.
+        cute.arch.fence_view_async_shared()
         mma_empty.commit()
         return tma_consumer, gate_mma_producer
 

@@ -558,6 +558,64 @@ def test_kda_prefill_op_sm_reserve_keeps_results(sequence_lengths, state_dtype, 
 
 
 @torch.no_grad()
+def test_kda_small_bh_k1_keeps_results_on_a_small_grid() -> None:
+    """A three-block Small-BH K1 grid writes bitwise the same tiles as a full grid.
+
+    Each block of a small persistent grid passes many tiles through its two
+    shared-memory stages, so a tile TMA-stored before its shared-memory writes
+    were visible to the store would keep values of the stage's previous tile.
+    Repeated launches give such a store many chances to show.
+    """
+    from tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda import (
+        kda_chunked_bt16_small_bh as small_bh,
+    )
+
+    heads = 8
+    sequence_lengths = [640, 100, 1000, 37]
+    tokens = sum(sequence_lengths)
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    q, k, g = (
+        torch.randn(tokens, heads, HEAD_DIM, generator=gen, device="cuda").to(torch.bfloat16)
+        for _ in range(3)
+    )
+    beta = torch.randn(tokens, heads, generator=gen, device="cuda").to(torch.bfloat16)
+    dt_bias = torch.zeros(heads, HEAD_DIM, device="cuda")
+    a_log = torch.zeros(heads, device="cuda")
+
+    def run(max_active_clusters: int, like: tuple[torch.Tensor, ...] | None = None):
+        # Padding rows between packed sequences are never written; zeros keep them equal.
+        outputs = None if like is None else tuple(torch.zeros_like(t) for t in like)
+        return small_bh.chunk_kda_fwd_k1(
+            q,
+            k,
+            g,
+            beta,
+            dt_bias,
+            a_log,
+            scale=HEAD_DIM**-0.5,
+            gate_scale=-5.0,
+            gate_lower_bound=True,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=tokens,
+            outputs=outputs,
+            max_active_clusters=max_active_clusters,
+        )
+
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    expected = run(num_sms, like=run(num_sms))
+    for launch in range(32):
+        for name, got, want in zip(
+            ("qd", "kd", "kr", "mqk", "mkk", "gk"), run(3, like=expected), expected, strict=True
+        ):
+            assert torch.equal(got, want), f"{name} differs on launch {launch}"
+
+
+@torch.no_grad()
 @pytest.mark.parametrize("mode", ["small-bh", "bt16"])
 def test_kda_prefill_op_state_row_beyond_int32_offset(mode) -> None:
     """A state row more than 2**31 elements into the pool updates like the first row.
