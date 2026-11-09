@@ -13,10 +13,7 @@ dispatch and close:
    beside the first turns of the next stage and stops them when it fails.
 2. ``execution`` -- the planner's task graph, driven until the contract holds
    (``run/execution/tasks.py``, ``orchestrator.py``), then delivery. The
-   onboarding ends there; no performance work runs beside it.
-3. ``tune``      -- only for ``trtllm-modeling-v2 tune``: a campaign on a
-   delivered target, in a process of its own (on the delivered workspace, or a
-   workspace of its own that names the onboarding's as ``perf.source_workspace``).
+   run ends there: performance work is not the flow's.
 
 Every stage checkpoints before advancing, so a crash resumes where it was.
 """
@@ -58,7 +55,6 @@ from ..infra.compute.environment import RunEnvironment
 from ..infra.compute.rebuild import LIBRARY_PATTERNS
 from ..infra.git import CommitPolicy, git_output
 from ..spec.task_schema import load_and_validate_task_yaml
-from ..tune import stage as tune_stage
 from . import orchestrator as orchestrator_mod
 from .execution.handoff import current_decision
 from .execution.tasks import ExecutionStage, _start_with_the_survey
@@ -67,7 +63,6 @@ from .records.journal import Journal
 from .records.state import (
     STAGE_EXECUTION,
     STAGE_PREFLIGHT,
-    STAGE_TUNE,
     STATE_FILENAME,
     WorkflowState,
     is_remediable,
@@ -142,7 +137,6 @@ class TrtllmModelingV2Workflow:
         shell_runner: Any | None = None,
         git_runner: Any | None = None,
         agent_turn_timeout: float | None = None,
-        entry_stage: str = "",
         event_window_s: float = DEFAULT_EVENT_WINDOW_S,
         primers: bool = True,
     ) -> None:
@@ -157,8 +151,6 @@ class TrtllmModelingV2Workflow:
         self._primer_lock = threading.Lock()
         #: Per worker thread: the worktree block its turns carry.
         self._tls = threading.local()
-        # `trtllm-modeling-v2 tune`: start (or re-enter) at the tune stage.
-        self.entry_stage = entry_stage
         self.task_path = self.workspace / "task.yaml"
         self.plan_path = self.workspace / "plan.md"
         self.vocabulary_path = self.workspace / "vocabulary.yaml"
@@ -333,7 +325,7 @@ class TrtllmModelingV2Workflow:
         roots = [self.task_data.get("trtllm_repo_path")]
         if self.environment is not None:
             env = self.environment
-            roots += [env.spool, *(session.spool for session in env.sessions), *env.dev_spools]
+            roots += [env.spool, *(session.spool for session in env.sessions)]
         return tuple(dict.fromkeys(str(root) for root in roots if root and Path(root).is_dir()))
 
     def _run_turn(
@@ -567,7 +559,7 @@ class TrtllmModelingV2Workflow:
         re-running the same command proves the substrate again and resumes.
         """
         self._state = state
-        beside = stop if state.stage != STAGE_TUNE and not state.done else None
+        beside = stop if not state.done else None
         if state.stage == STAGE_PREFLIGHT:
             if not bootstrap._run_preflight(self, state, log, stop=beside):
                 return
@@ -599,14 +591,6 @@ class TrtllmModelingV2Workflow:
             execution = ExecutionStage(self)
             if execution.run_execution(state, log):
                 self._close_run(state, log, verdict="delivered")
-                self._say_how_to_tune(log)
-            return
-
-        if state.stage == STAGE_TUNE:
-            verdict = tune_stage.run_tune_phase(self, state, log)
-            if verdict is None:
-                return
-            self._close_run(state, log, verdict=verdict)
             return
 
         raise ValueError(f"unsupported workflow stage: {state.stage}")
@@ -729,18 +713,6 @@ class TrtllmModelingV2Workflow:
                 self.journal.event("re-entered a closed run", f"verdict={state.verdict}")
                 state.done = False
                 state.verdict = ""
-            elif (
-                state.done
-                and self.entry_stage == STAGE_TUNE
-                and (state.verdict == "delivered" or state.verdict.startswith("tune"))
-            ):
-                # An explicit `tune` is the operator's decision to spend more:
-                # re-enter at tune, keep the campaign's history, reset its misses.
-                state.done, state.verdict, state.stage = False, "", STAGE_TUNE
-                state.tune = {**state.tune, "misses": 0, "entry": "re-entered"}
-                state.tune.pop("verdict", None)
-                if state.tune.get("phase") == "done":
-                    state.tune["phase"] = "campaign"
             elif state.done:
                 print_message(
                     "[bold green]✔ this run already completed; pass --clean to start "
@@ -760,12 +732,6 @@ class TrtllmModelingV2Workflow:
                 encoding="utf-8",
             )
         state = WorkflowState(task_path=str(self.task_path))
-        if self.entry_stage == STAGE_TUNE:
-            # Standalone: a target onboarded elsewhere. Preflight still runs
-            # (environment, prompts, skills); the stage then
-            # measures and tunes the target the task names.
-            state.stage = STAGE_TUNE
-            state.tune = {"entry": "standalone"}
         self._checkpoint(state)
         return state
 
@@ -929,22 +895,6 @@ class TrtllmModelingV2Workflow:
         """The environment a gate runs under: the run's, as preflight resolved it."""
         assert self.environment is not None, "preflight must run before any gate"
         return self.environment
-
-    def _say_how_to_tune(self, log) -> None:
-        """After delivery, when the spec asks for performance work: how to start it.
-
-        The campaign is a process of its own, from the delivered commit; nothing of it
-        runs beside the onboarding or changes its verdict.
-        """
-        if not (self.task_data.get("perf") or {}).get("enabled"):
-            return
-        note = (
-            "perf.enabled: tune the delivered target with `trtllm-modeling-v2 tune --task "
-            f"{self.task_path} --workspace {self.workspace}`, or from a workspace of its own "
-            "that names this one as `perf.source_workspace`"
-        )
-        self.journal.event("tune", note)
-        print_message(f"[bold cyan]→ {escape_markup(note)}[/bold cyan]", log)
 
     def _close_run(self, state: WorkflowState, log, *, verdict: str) -> None:
         state.done = True

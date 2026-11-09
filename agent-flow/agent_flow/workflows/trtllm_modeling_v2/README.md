@@ -6,7 +6,8 @@ SPDX-License-Identifier: Apache-2.0
 # trtllm-modeling-v2
 
 Build a TensorRT-LLM ModelingV2 target from a HuggingFace checkpoint: reuse or certify catalog
-operators, assemble the model, prove the requested features, and optionally optimize performance.
+operators, assemble the model and prove the requested features. Performance tuning is not part of
+the flow: it runs on the delivered target, with the tools of your choice.
 Agents write code; Python owns scheduling, integration and correctness verdicts.
 
 ## Terms
@@ -34,8 +35,7 @@ it for what would stop the launch or judge it wrongly (the spec's schema, a memb
 one engine, disaggregation wider than a session, a KV-cache dtype the engine does not load, an
 anchor row the accuracy gate cannot resolve, a placeholder anchor, a chat-template protocol cut
 off early, an accuracy check run without CUDA graphs, open-ended boot probes, uncovered requested
-cells, a missing interpreter or role model, a perf config whose CUDA graphs stop below the live
-requests a rank holds), and prints the contract's checks per unit and variant, the engine's
+cells, a missing interpreter or role model), and prints the contract's checks per unit and variant, the engine's
 constraints for this geometry and the prior art the tree already holds. What only costs time is
 the launching agent's judgement, following INTAKE.md. The spec should be
 the smallest contract that covers the request. Launch only once the lint is clean or its findings
@@ -57,10 +57,6 @@ Validation:
 - Fully validate <features/configurations>; limit <others> to <aggregated text-only / smoke>.
 - Accuracy reference: <benchmark and reference/config>. Report unsupported or unverified cases.
 
-Tuning (optional, after delivery with `trtllm-modeling-v2 tune`):
-- Optimize <configurations> for low latency at concurrency <list>.
-- Optimize <configurations> for high throughput at concurrency <list>.
-- Budget: <time/resource limit>. Preserve correctness and report baseline versus final results.
 ```
 
 Roles run on the backend, model and reasoning effort the spec states in `agents.defaults` (the
@@ -95,8 +91,7 @@ a container runtime, a shell). The run needs:
 hand-over with no newer session on its spool. A gate, substrate or delivery test job the run has
 waited on for 15 minutes writes a `waiting` event: the job, its spool, queued or running and since
 when, why the session holds it when its `status.json` says, and for a queued job what runs on its
-spool meanwhile; then at most one every 15 minutes while the wait lasts. The tune campaign's jobs
-say the same in its `tune` events.
+spool meanwhile; then at most one every 15 minutes while the wait lasts.
 
 **While it runs**, you or the launching agent keep the sessions alive and leave the work to the run. Never cancel
 a job the run submitted (a gate, a worker's test) or run a replacement check beside it: a cancelled
@@ -130,20 +125,6 @@ must change before that.
 4. **Resume:** checkpoints, decision identities and task receipts recover completed work without
    adopting another attempt's answer. Compute sessions own resource allocation and safe cancellation;
    you or the launching agent handle cluster allocations and session renewal.
-5. **Tune optionally, after delivery:** the onboarding ends at delivery and runs no performance
-   work beside it. `trtllm-modeling-v2 tune` is a process of its own on the delivered target (the
-   same workspace, or one of its own that names the onboarding's as `perf.source_workspace`):
-   one baseline, parallel candidates kept one at a time, a checkpoint every few keeps that rolls
-   them back on a loss, and the accuracy benchmark once on the final tree. Results stay on a
-   separate best branch with `tune/summary.md`; nothing merges into delivery, and the outcome is
-   `state.tune["verdict"]`. A deferral waiting can fix (a job to finish, a session to come back)
-   is waited out in process; an unfinished campaign resumes when the same command runs again.
-   Config or judgment-policy changes isolate stale evidence (a changed perf config's baseline
-   alone is measured again, and the roadmap stays without its step shares); validated source
-   changes invalidate profile shares and revalidate the kept stack.
-   Micro checks require comparable finite outputs, with exact discrete results. Final performance
-   validation uses a same-host control; cross-host summary deltas are descriptive.
-   `tune/stage.py` and `tune/campaign.py` describe the policy.
 
 ## Code map
 
@@ -160,4 +141,3 @@ must change before that.
 | `checks/`, `checks/harness/` | Verdict rules and evidence; programs executed in the measured environment |
 | `infra/compute/`, `infra/monitor/` | Execution, sessions, scheduler and provenance; status and heartbeat |
 | `infra/git.py`, `infra/files.py` | Shared Git/worktree operations and atomic file I/O |
-| `tune/`, `tune/harness/` | Campaign, measurement and keep policy; standalone benchmark programs |

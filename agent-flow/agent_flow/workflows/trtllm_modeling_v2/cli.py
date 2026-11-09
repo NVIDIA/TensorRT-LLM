@@ -67,7 +67,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--goal",
         default=None,
         help="With --checkpoint: the features, members and workload in one line, e.g. "
-        '"mtp disagg@tp1/tp2 tp1 tep4 dep4 isl=8192 osl=1024 tune" (spec/derive.py). '
+        '"mtp disagg@tp1/tp2 tp1 tep4 dep4 isl=8192 osl=1024" (spec/derive.py). '
         "Features the checkpoint carries are built unless named `-<feature>`.",
     )
     parser.add_argument(
@@ -156,15 +156,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "dataset loads offline. A resumed run already skips it when its last pass "
         "(gates/substrate/pass.json) is under 12 h old in the same environment; use "
         "this only when the probe itself is what is broken.",
-    )
-    parser.add_argument(
-        "--stage",
-        dest="entry_stage",
-        choices=["", "tune"],
-        default="",
-        help="Start at a later stage. `tune` runs the performance stage (ground truth, "
-        "tuner candidates) on an already-onboarded target, or re-enters a "
-        "delivered run at it. Same as the `tune` subcommand. Needs a `perf:` block.",
     )
     parser.add_argument(
         "--agent-turn-timeout",
@@ -384,9 +375,6 @@ def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] in SUBCOMMANDS:
         sys.exit(SUBCOMMANDS[argv[0]](argv[1:]))
-    if argv and argv[0] == "tune":
-        # `trtllm-modeling-v2 tune --task T --workspace W` == `--stage tune`.
-        argv = [*argv[1:], "--stage", "tune"]
     args = _parse_args(argv)
     if args.wait_for_spool > 0:
         # A derived task takes its environment from the site.
@@ -443,7 +431,6 @@ def main(argv: list[str] | None = None) -> None:
         dry_run=args.dry_run,
         skip_substrate_gate=args.skip_substrate_gate,
         agent_turn_timeout=args.agent_turn_timeout,
-        entry_stage=args.entry_stage,
         event_window_s=args.event_window_s,
         primers=args.primers,
     ) as workflow:

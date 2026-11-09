@@ -186,7 +186,7 @@ def stop_server(
         server.wait()
     stray = holders(world) - before - {os.getpid()}
     if stray and log is not None:
-        log(f"[perf] server left device holders {sorted(stray)}; reaping")
+        log(f"[server] server left device holders {sorted(stray)}; reaping")
     reaped = sorted(set(reap(stray))) if stray else []
     deadline = time.monotonic() + DEVICE_RELEASE_TIMEOUT_S
     while stray and holders(world) & stray and time.monotonic() < deadline:

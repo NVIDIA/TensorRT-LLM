@@ -495,7 +495,7 @@ def test_decision_file_extra_keys_scope_and_role_endings() -> None:
 
 
 def test_workers_wait_for_results_and_write_decisions_before_ending() -> None:
-    for role in ("surveyor", "kernel_writer", "assembler", "tuner"):
+    for role in ("surveyor", "kernel_writer", "assembler"):
         text = getattr(prompts.DEFAULT_PROMPTS, role)
         assert WORKER_BASE in text
         assert "nothing wakes you after it" in text

@@ -37,7 +37,6 @@ import yaml
 from ..checks import accuracy_policy, check_config
 from ..checks import disagg as disagg_checks
 from ..operators import prior_art
-from ..tune.schema import REMOVED_PERF_KEYS
 from .task_schema import (
     assembly_units,
     gpus_per_node,
@@ -284,11 +283,6 @@ def kv_cache_rules(ctx: LintContext) -> Iterator[Finding]:
         dtype = (launch.config or {}).get("dtype")
         if dtype is not None:
             asked.setdefault(str(dtype), []).append(launch.name)
-    for config in (ctx.task.get("perf") or {}).get("configs") or ():
-        options = config.get("llm_api_options") if isinstance(config, Mapping) else None
-        dtype = ((options or {}).get("kv_cache_config") or {}).get("dtype")
-        if dtype is not None:
-            asked.setdefault(str(dtype), []).append(f"perf {config.get('name')}")
     for dtype, where in sorted(asked.items()):
         if dtype not in values:
             yield Finding(
@@ -555,28 +549,6 @@ def engine_rules(ctx: LintContext) -> Iterator[Finding]:
 
 
 #: Every rule, in report order. A new feature, scope or launch check adds its function here.
-def perf_rules(ctx: LintContext) -> Iterator[Finding]:
-    """A ``perf`` key the campaign no longer reads, and a perf config whose decode runs eager.
-
-    A config with CUDA graphs off, or whose largest captured batch is below the live requests a
-    rank holds (``tune.spec.capture_shortfalls``), measures eager steps for the whole campaign.
-    """
-    from ..tune.spec import capture_shortfalls, serving_options
-
-    perf = ctx.task.get("perf")
-    if not isinstance(perf, Mapping):
-        return
-    for key in sorted(set(perf) & set(REMOVED_PERF_KEYS)):
-        yield Finding(
-            "perf-removed-key",
-            WARN,
-            f"`perf.{key}` is ignored: {REMOVED_PERF_KEYS[key]}",
-            f"drop `perf.{key}`",
-        )
-    for why, fix in capture_shortfalls(serving_options(ctx.task)):
-        yield Finding("perf-cuda-graph-coverage", WARN, why, fix)
-
-
 RULES: tuple[Rule, ...] = (
     cuda_graph_rules,
     kv_cache_rules,
@@ -589,7 +561,6 @@ RULES: tuple[Rule, ...] = (
     environment_rules,
     agents_rules,
     engine_rules,
-    perf_rules,
 )
 
 

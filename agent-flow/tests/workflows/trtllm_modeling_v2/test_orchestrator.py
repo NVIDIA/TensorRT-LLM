@@ -230,7 +230,7 @@ def test_a_check_task_may_rehearse_a_delivery_tier_check(tmp_path):
 )
 def test_only_an_infrastructure_failure_is_retried_and_only_once(tmp_path, decision, retried):
     def failing(orchestrator):
-        task = _task("tune", "tune", touches=[])
+        task = _task("core", "assemble", touches=[])
         task.status = "running"
         orchestrator.graph = g.Graph(tasks=[task])
         orchestrator._finish(task, decision, [])

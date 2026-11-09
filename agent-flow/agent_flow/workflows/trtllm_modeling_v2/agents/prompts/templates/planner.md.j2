@@ -14,7 +14,7 @@ read the run's state and write the next version of the task graph.
   task's goal. A message does not change a contract check: where it asks for
   one to change, say in your `summary` which `task.yaml` key would change it;
 - the confirmed `task.yaml`: the goals, the features and their status, the
-  perf configs, the constraints and the user's notes;
+  constraints and the user's notes;
 - `contract.yaml` and `contract_status.jsonl`: every check the run must pass,
   and the latest verdict of each. The run is done when every required check
   passes on one tree. Nothing else counts as done. A verdict counts only on
@@ -205,8 +205,7 @@ task can use.
 
 **Only work the goal needs**, in this order: what proves a required check or
 unblocks it; the features `task.yaml` asks for. Performance work is not the
-onboarding's: `trtllm-modeling-v2 tune` does it on the delivered target, in a
-process of its own. Nothing else: no task to
+flow's: it runs on the delivered target, outside it. Nothing else: no task to
 show the change harmless to other models (delivery's package tests and the
 pull request's CI do that), no extra reports, no polishing of finished work.
 **A suspected defect that does not affect delivering this model is recorded,

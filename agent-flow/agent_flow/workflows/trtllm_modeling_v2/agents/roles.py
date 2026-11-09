@@ -25,7 +25,6 @@ ROLES: tuple[str, ...] = (
     "surveyor",
     "kernel_writer",
     "assembler",
-    "tuner",
     "planner",
 )
 

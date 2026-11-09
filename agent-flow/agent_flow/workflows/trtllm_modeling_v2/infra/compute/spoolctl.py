@@ -344,8 +344,7 @@ def _add_job_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--priority",
         type=int,
-        help="class the job queues at (default 0); a higher one starts first, a negative one is "
-        "background work that never ages",
+        help="class the job queues at (default 0); a higher one starts first",
     )
     parser.add_argument("--owner", help="requester prefix (default $MV2FLOW_JOB_PREFIX)")
     parser.add_argument(

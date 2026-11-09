@@ -50,7 +50,7 @@ goal words cannot say.
 - `kv=` lists the KV dtypes in one word: the first is every gate's, each other one a variant
   (`gates: [accuracy]`) judged against the unit's own score.
 - Derive asks rather than guesses (and stops until the spec answers): `model_key` when
-  `config.json` names no model. A tuning goal that names no concurrency tunes at 1/32/128.
+  `config.json` names no model.
 
 ## 3. Map the request
 
@@ -66,8 +66,7 @@ goal words cannot say.
 | any other feature (MTP, speculative, offload ...) | name it in `--goal`; `derive.report.md` and `task.example.yaml` say what its unit owes | the same one-variant-per-axis rule applies |
 | a deployment, e.g. "low latency at TEP4 with MTP3, chunked prefill and reuse" | **one variant per deployment**: `unit:` the feature it serves (`mtp`), `members: [tep4]`, its options stacked in one `llm_api_options` overlay, `gates: [accuracy, acceptance]` (`acceptance` only with a speculator) | it proves the combination that ships, which one variant per axis never runs (disagg + MTP at attention TP failed only once deployed); a failure is the worker's to bisect along the axes |
 | speculative depths, e.g. "MTP1-7" | the depth the deployments run and the deepest one: two variants at most (`speculative_config.max_draft_len`), each `gates: [acceptance]` | every depth runs the same draft path; the deepest stresses it most |
-| workload isl / osl / concurrency | `max_seq_len = isl + osl`; `max_batch_size` >= the concurrency; both are **global totals**: under attention DP each rank serves its share (`max_batch_size / ranks`, rounded up); `max_num_tokens` = isl (or 8192); `perf.workload` | |
-| "perf tune" | `perf.enabled: true`; `perf.workload.concurrency` 1/32/128 unless the goal names it; a `dep` member only the high point, a global total; a perf config's `cuda_graph_config` captures up to the live requests a rank holds (under attention DP the concurrency over the ranks, x1.5 as they finish unevenly) | `trtllm-modeling-v2 tune` runs it on the delivered target, in a process of its own: the onboarding runs none of it; it measures one baseline (no stock reference, no repeats); a goal is `ratio_to_baseline` or `pct_of_sol` |
+| workload isl / osl / concurrency | `max_seq_len = isl + osl`; `max_batch_size` >= the concurrency; both are **global totals**: under attention DP each rank serves its share (`max_batch_size / ranks`, rounded up); `max_num_tokens` = isl (or 8192) | |
 
 **The smallest contract that covers the request.** Every check loads the model (minutes on a
 large checkpoint), and every change to the target runs the stale checks again, so the contract's

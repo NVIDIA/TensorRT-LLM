@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""trtllm_modeling_v2: the ModelingV2 onboarding workflow, and its tune command, built on ``agent_flow.AgentLayer``.
+"""trtllm_modeling_v2: the ModelingV2 onboarding workflow, built on ``agent_flow.AgentLayer``.
 
 Brings one deployment target — a ``(checkpoint, GPU arch, parallel
 config)`` triple — from a HuggingFace checkpoint to a gated
@@ -9,22 +9,19 @@ config)`` triple — from a HuggingFace checkpoint to a gated
 
     preflight -> execution stage (planner + workers) -> delivery
 
-and, as a command of its own on a delivered target, ``trtllm-modeling-v2 tune``.
-
 See ``README.md`` for usage and architecture, and ``task.example.yaml`` for configuration.
 """
 
 from typing import Any
 
 from .agents.prompts import DEFAULT_PROMPTS, PromptBundle, build_trtllm_modeling_v2_prompts
-from .run.records.state import STAGE_EXECUTION, STAGE_PREFLIGHT, STAGE_TUNE
+from .run.records.state import STAGE_EXECUTION, STAGE_PREFLIGHT
 
 __all__ = [
     "DEFAULT_PROMPTS",
     "PromptBundle",
     "STAGE_EXECUTION",
     "STAGE_PREFLIGHT",
-    "STAGE_TUNE",
     "TrtllmModelingV2Workflow",
     "build_trtllm_modeling_v2_prompts",
     "main",
