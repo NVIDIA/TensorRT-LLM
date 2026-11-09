@@ -73,7 +73,11 @@ def parse_argument_text(text: str) -> Optional[List[Tuple[str, str]]]:
 
 
 def get_argument_type(func_name: str, arg_key: str, defined_tools: List[Tool]) -> Optional[str]:
-    """Get the expected type of a function argument from tool definitions."""
+    """Get the expected type of a function argument from tool definitions.
+
+    A property declared through a local ``$ref`` takes the type of the
+    definition it names in the tool's parameters schema.
+    """
     name2tool = {tool.function.name: tool for tool in defined_tools}
     if func_name not in name2tool:
         return None
@@ -83,7 +87,7 @@ def get_argument_type(func_name: str, arg_key: str, defined_tools: List[Tool]) -
         properties = {}
     if arg_key not in properties:
         return None
-    return infer_type_from_json_schema(properties[arg_key])
+    return infer_type_from_json_schema(properties[arg_key], tool.function.parameters)
 
 
 def _convert_to_number(value: str) -> Any:
@@ -115,11 +119,11 @@ def parse_arguments(value: str, arg_type: Optional[str] = None) -> Any:
     """Deliver an argument's raw text as the value its schema type calls for.
 
     Text the schema types as a string, or gives no type at all (an undeclared
-    tool or key, a property without a type), is delivered as written. Any other
-    declared type decodes the text as strict JSON, then as JSON with escaped
-    quotes, then as a Python literal; a result that is not strict JSON
-    (``NaN``, an overflowing ``1e309``, a set) keeps the text, as does text
-    none of them decodes.
+    tool or key, a property without a type, a ``$ref`` that names no
+    definition), is delivered as written. Any other declared type decodes the
+    text as strict JSON, then as JSON with escaped quotes, then as a Python
+    literal; a result that is not strict JSON (``NaN``, an overflowing
+    ``1e309``, a set) keeps the text, as does text none of them decodes.
     """
     if arg_type in (None, "string"):
         return value

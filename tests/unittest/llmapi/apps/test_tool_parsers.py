@@ -7665,14 +7665,18 @@ class TestUnparsedToolCallWarning:
 # ============================================================================
 
 
-def _glm_tool(name, properties=None):
-    """One declared tool; `properties` is its JSON-schema property map."""
+def _glm_tool(name, properties=None, definitions=None):
+    """One declared tool; `properties` is its JSON-schema property map.
+
+    `definitions` adds keywords such as ``$defs`` to the parameters schema.
+    """
     return ChatCompletionToolsParam(type="function",
                                     function=FunctionDefinition(
                                         name=name,
                                         parameters={
                                             "type": "object",
                                             "properties": properties or {},
+                                            **(definitions or {}),
                                         }))
 
 
@@ -7775,12 +7779,81 @@ def _glm_parity(parser_cls, text, tools, chunkings=None):
     return whole.normal_text, expected
 
 
+# The definitions the "$ref" schemas below name, laid out as schema generators
+# such as Pydantic emit nested models and enums (draft-07 uses `definitions`).
+_GLM_DEFINITIONS = {
+    "$defs": {
+        "Opts": {
+            "type": "object",
+            "properties": {
+                "verbose": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "Mode": {
+            "enum": ["fast", "1"]
+        },
+        "Loop": {
+            "$ref": "#/$defs/Loop"
+        },
+    },
+    "definitions": {
+        "Opts": {
+            "type": "object"
+        }
+    },
+}
+
 _GLM_SCHEMAS = {
     kind: dict(type=kind)
     for kind in ("string", "integer", "number", "boolean", "object", "array",
                  "null")
 }
-_GLM_SCHEMAS.update({"any": {}, "$ref": {"$ref": "#/$defs/F"}, "none": None})
+_GLM_SCHEMAS.update({
+    "any": {},
+    "none": None,
+    "$ref object": {
+        "$ref": "#/$defs/Opts"
+    },
+    "$ref object, described": {
+        "$ref": "#/$defs/Opts",
+        "description": "options"
+    },
+    "allOf $ref object": {
+        "allOf": [{
+            "$ref": "#/$defs/Opts"
+        }],
+        "description": "options"
+    },
+    "optional $ref object": {
+        "anyOf": [{
+            "$ref": "#/$defs/Opts"
+        }, {
+            "type": "null"
+        }],
+        "default": None
+    },
+    "definitions $ref object": {
+        "$ref": "#/definitions/Opts"
+    },
+    "$ref enum": {
+        "$ref": "#/$defs/Mode"
+    },
+    "optional $ref enum": {
+        "anyOf": [{
+            "$ref": "#/$defs/Mode"
+        }, {
+            "type": "null"
+        }]
+    },
+    "dangling $ref": {
+        "$ref": "#/$defs/Missing"
+    },
+    "cyclic $ref": {
+        "$ref": "#/$defs/Loop"
+    },
+})
 
 # Declared strings, and values with no resolvable type, are delivered verbatim,
 # whatever they look like, markup included.
@@ -7798,8 +7871,9 @@ _GLM_STRING_VALUES = [
 ]
 
 # (raw value, schema, delivered value). A declared string and a value with no
-# resolvable type ("none", "any", "$ref") are delivered as written; other
-# declared types decode, keeping the text when the result is not strict JSON.
+# resolvable type ("none", "any", a "$ref" that names no definition) are
+# delivered as written; other declared types decode, keeping the text when the
+# result is not strict JSON. A "$ref" is typed by the definition it names.
 _GLM_TYPED_VALUES = [(value, schema, value) for schema in ("string", "none")
                      for value in _GLM_STRING_VALUES]
 _GLM_TYPED_VALUES += [
@@ -7832,7 +7906,15 @@ _GLM_TYPED_VALUES += [
     ("NaN", "none", "NaN"),
     ("'single'", "none", "'single'"),
     ('{"a": 1}', "any", '{"a": 1}'),
-    ('{"a": 1}', "$ref", '{"a": 1}'),
+    ('{"verbose": true}', "$ref object", dict(verbose=True)),
+    ('{"verbose": true}', "$ref object, described", dict(verbose=True)),
+    ('{"verbose": true}', "allOf $ref object", dict(verbose=True)),
+    ('{"verbose": true}', "optional $ref object", dict(verbose=True)),
+    ('{"verbose": true}', "definitions $ref object", dict(verbose=True)),
+    ("1", "$ref enum", "1"),
+    ("1", "optional $ref enum", "1"),
+    ('{"a": 1}', "dangling $ref", '{"a": 1}'),
+    ('{"a": 1}', "cyclic $ref", '{"a": 1}'),
 ]
 
 _GLM_VALUES = sorted({row[0] for row in _GLM_TYPED_VALUES})
@@ -7943,8 +8025,9 @@ class TestGlmStreamingMatchesWholeParse:
     def test_argument_typing(self, parser_cls, value, schema, expected):
         properties = {"v": _GLM_SCHEMAS[schema]} if schema != "none" else {}
         text = _glm_call(parser_cls, "f", ("v", value))
+        tool = _glm_tool("f", properties, _GLM_DEFINITIONS)
 
-        _, calls = _glm_parity(parser_cls, text, [_glm_tool("f", properties)])
+        _, calls = _glm_parity(parser_cls, text, [tool])
 
         assert calls == [("f", dict(v=expected))]
 
@@ -7953,7 +8036,8 @@ class TestGlmStreamingMatchesWholeParse:
         text = _glm_call(parser_cls, "f", ("v", value))
         for schema in _GLM_SCHEMAS.values():
             properties = {} if schema is None else {"v": schema}
-            _glm_parity(parser_cls, text, [_glm_tool("f", properties)],
+            _glm_parity(parser_cls, text,
+                        [_glm_tool("f", properties, _GLM_DEFINITIONS)],
                         [("whole", [text]), ("per character", list(text))])
 
     @pytest.mark.parametrize("tool,name,key,raw,expected",
