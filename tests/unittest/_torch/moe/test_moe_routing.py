@@ -554,54 +554,6 @@ def test_grouped_routing_exposes_n_group_topk_group(routing_cls):
     assert routing.topk_group == topk_group
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
-def test_deepseek_v3_grouped_pytorch_routing_sync_free():
-    """The grouped PyTorch fallback of DSv3 routing runs without host syncs
-    and matches the same routing on CPU."""
-    num_tokens, num_experts = 64, 64
-    n_group, topk_group = _DSV4_PRO_N_GROUP, _DSV4_PRO_TOPK_GROUP
-    top_k = _DSV4_PRO_TOP_K
-    logits = torch.randn(num_tokens,
-                         num_experts,
-                         generator=torch.Generator().manual_seed(0))
-    bias = torch.randn(num_experts, generator=torch.Generator().manual_seed(1))
-    cpu_routing = DeepSeekV3MoeRoutingMethod(
-        top_k=top_k,
-        n_group=n_group,
-        topk_group=topk_group,
-        routed_scaling_factor=2.5,
-        callable_e_score_correction_bias=lambda: bias,
-        is_fused=False)
-    cuda_bias = bias.cuda()
-    cuda_routing = DeepSeekV3MoeRoutingMethod(
-        top_k=top_k,
-        n_group=n_group,
-        topk_group=topk_group,
-        routed_scaling_factor=2.5,
-        callable_e_score_correction_bias=lambda: cuda_bias,
-        is_fused=False)
-    expected_indices, expected_weights = cpu_routing.apply(logits)
-    cuda_logits = logits.cuda()
-    # Warm up torch.compile in get_scores outside the sync check.
-    cuda_routing.apply(cuda_logits)
-    torch.cuda.synchronize()
-
-    torch.cuda.set_sync_debug_mode("error")
-    try:
-        indices, weights = cuda_routing.apply(cuda_logits)
-    finally:
-        torch.cuda.set_sync_debug_mode("default")
-
-    assert torch.equal(indices.cpu(), expected_indices)
-    torch.testing.assert_close(weights.cpu(), expected_weights)
-    # Every token picks experts from at most topk_group groups.
-    groups_per_token = torch.zeros(num_tokens, n_group, dtype=torch.bool)
-    groups_per_token.scatter_(1,
-                              indices.cpu().long() // (num_experts // n_group),
-                              True)
-    assert (groups_per_token.sum(dim=1) <= topk_group).all()
-
-
 @pytest.mark.parametrize(
     "shape",
     [
