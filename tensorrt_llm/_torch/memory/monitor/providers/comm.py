@@ -24,9 +24,8 @@ Covered elsewhere:
 * MoE all-to-all workspaces are ``MnnvlMemory``: :class:`~.mnnvl.MnnvlProvider`.
 * NCCL communicators and the fused GEMM+allreduce NVLS workspace are recorded
   by the C++ code that creates them: :class:`~.native.NativeMemoryProvider`.
-* Custom-allreduce IPC workspaces live in ``threading.local``, out of reach
-  of a report built on another thread, so they are measured as a named
-  region around their creation instead.
+* Custom-allreduce IPC workspaces expose no allocation size, so they are
+  measured as a named region around their creation instead.
 """
 
 from ..schema import Basis, Category, Entry, Placement, Source
