@@ -165,6 +165,7 @@ class _StubQueueItem:
         self.request = types.SimpleNamespace(
             input_token_ids=input_token_ids,
             num_input_tokens=len(input_token_ids),
+            py_prompt_trimmed_prefix=0,
             request_type=request_type,
         )
         self.is_normal_request = is_normal_request

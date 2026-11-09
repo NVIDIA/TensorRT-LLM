@@ -218,6 +218,9 @@ class RuntimeHooks:
     # Run the overlap executor loop with the execution stream current, so the
     # loop's own stream work and the forward are ordered on one stream.
     loop_on_execution_stream: bool = False
+    # Under multi-rank MPI attention DP, rank 0 sends each admitted request's prompt only to the rank
+    # that owns it instead of broadcasting every prompt to every rank (RequestBroadcaster).
+    prompts_to_owners: bool = False
     # After autotuning, keep the fastest profiled tactic per shape on every
     # tensor-parallel rank, so the ranks capture the same kernels.
     merge_tuned_tactics_across_ranks: bool = False
