@@ -390,13 +390,26 @@ def _coalescing_group_kwargs(group: int) -> dict[str, int]:
 
 
 def _swa_endpoint_priority(
-    prompt_length: int, tokens_per_block: int, rewind_tokens: int
+    prompt_length: int,
+    tokens_per_block: int,
+    rewind_tokens: int,
+    fork_point: Optional[List[int]] = None,
 ) -> Callable[[int, object], int]:
     """Assign page priorities around a fixed reusable prompt endpoint.
 
     ``prompt_length`` excludes the final prompt token that is recomputed.
     The callback applies to newly created pages; reused pages keep their priority.
     Intermediate pages remain reusable until evicted.
+
+    ``fork_point`` (opt-in, TRTLLM_KV_SWA_FORK_ANCHOR=1) is a one-element cell
+    the caller fills right after the KV cache is created, before any page is
+    allocated: the depth at which this prompt's raw token match against the
+    radix tree ended although the match was pruned shorter (no sliding-window
+    pages resident there). That depth is a divergence point another request
+    already shares (e.g. sibling sub-agents of one parent). The window pages
+    ending there get the endpoint priority too, so the next request that
+    diverges at the same point finds them. Eviction order only: matching and
+    the attention math are unchanged.
     """
 
     def priority(ordinal: int, life_cycle: object) -> int:
@@ -404,13 +417,24 @@ def _swa_endpoint_priority(
             return 35
         first_protected_token = max(0, prompt_length - rewind_tokens - life_cycle.window_size)
         block_start = ordinal * tokens_per_block
+        block_end = block_start + tokens_per_block
         if ordinal < life_cycle.num_sink_blocks or (
-            block_start < prompt_length and block_start + tokens_per_block > first_protected_token
+            block_start < prompt_length and block_end > first_protected_token
         ):
             return 70
+        if fork_point is not None and fork_point[0] > 0:
+            fork = fork_point[0]
+            if block_start < fork and block_end > max(
+                0, fork - life_cycle.window_size - tokens_per_block
+            ):
+                return 70
         return 0
 
     return priority
+
+
+def _swa_fork_anchor_enabled() -> bool:
+    return os.environ.get("TRTLLM_KV_SWA_FORK_ANCHOR", "0") == "1"
 
 
 def _request_conversation_id(request: LlmRequest) -> Optional[str]:
@@ -1605,6 +1629,15 @@ class KVCacheManagerV2(BaseResourceManager):
         block_reuse_config = kv_cache_config.block_reuse_config
         self.block_reuse_policy = BlockReusePolicy(block_reuse_config.policy)
         self._swa_endpoint_rewind = block_reuse_config.swa_endpoint_rewind_tokens
+        # Opt-in: protect the sliding-window pages at a detected divergence
+        # point (see _swa_endpoint_priority). Eviction priority only.
+        self._swa_fork_anchor = _swa_fork_anchor_enabled() and self._swa_endpoint_rewind > 0
+        self._swa_fork_stats = [0, 0, 0]  # requests, fork anchors set, fork tokens
+        if self._swa_fork_anchor and not is_draft:
+            logger.info(
+                "KVCacheManagerV2: TRTLLM_KV_SWA_FORK_ANCHOR=1: sliding-window pages at a "
+                "pruned prefix-match divergence point get the endpoint eviction priority"
+            )
         # Recompute tail for hidden-state drafters with block reuse: cap the
         # reuse claim of cache-hit context requests so at least this many
         # prompt tokens pass through the target forward (see
@@ -7359,6 +7392,41 @@ class KVCacheManagerV2(BaseResourceManager):
         digest = hashlib.sha256(cache_salt.encode("utf-8")).digest()
         return int.from_bytes(digest[:8], "little")
 
+    def _set_swa_fork_point(
+        self, kv_cache, fork_point: List[int], expected_prompt_length: int
+    ) -> None:
+        """Fill the fork cell of a new request from its raw vs pruned prefix match.
+
+        Runs before the first resize, so every page the callback prices sees it.
+        The raw match is the token-path depth in the radix tree before the
+        page-coverage pruning; when it exceeds the committed (pruned) match by at
+        least one block, the prompt shares a prefix with some earlier request up
+        to that depth but no window pages were resident there. The cell is left
+        at 0 when the divergence lies inside the endpoint-protected tail, which
+        the endpoint priority already covers.
+        """
+        stats = self._swa_fork_stats
+        stats[0] += 1
+        if kv_cache is None:
+            return
+        try:
+            raw = int(kv_cache._get_num_reusable_tokens_before_pruning())
+            matched = int(kv_cache.num_committed_tokens)
+        except AttributeError:
+            return
+        tpb = self.tokens_per_block
+        if raw - matched < tpb or raw >= expected_prompt_length - self._swa_endpoint_rewind:
+            return
+        fork_point[0] = raw
+        stats[1] += 1
+        stats[2] += raw - matched
+        if stats[1] in (1, 10, 100) or stats[1] % 1000 == 0:
+            logger.info(
+                f"KVCacheManagerV2 SWA fork anchor: {stats[1]} of {stats[0]} requests anchored "
+                f"a divergence point (last: raw match {raw}, pruned {matched}, prompt "
+                f"{expected_prompt_length}); pruned-away tokens so far {stats[2]}"
+            )
+
     def _create_kv_cache(
         self,
         request_id: int,
@@ -7386,6 +7454,7 @@ class KVCacheManagerV2(BaseResourceManager):
         salt_int = self._derive_reuse_salt(cache_salt)
         enable_request_stats = enable_request_stats and not is_dummy and not self.is_draft
         priority_kwargs = {}
+        fork_point = None
         if (
             self._swa_endpoint_rewind > 0
             and self.enable_block_reuse
@@ -7394,8 +7463,13 @@ class KVCacheManagerV2(BaseResourceManager):
             and not self.is_draft
             and expected_prompt_length is not None
         ):
+            if getattr(self, "_swa_fork_anchor", False):
+                fork_point = [0]
             priority_kwargs["custom_priority_callback"] = _swa_endpoint_priority(
-                expected_prompt_length, self.tokens_per_block, self._swa_endpoint_rewind
+                expected_prompt_length,
+                self.tokens_per_block,
+                self._swa_endpoint_rewind,
+                fork_point,
             )
         kv_cache = self.impl.create_kv_cache(
             ReuseScope(lora_id=lora_task_id, salt=salt_int),
@@ -7405,6 +7479,8 @@ class KVCacheManagerV2(BaseResourceManager):
             expected_prompt_length=expected_prompt_length,
             **priority_kwargs,
         )
+        if fork_point is not None:
+            self._set_swa_fork_point(kv_cache, fork_point, expected_prompt_length)
         self.kv_cache_map[request_id] = kv_cache
         if enable_request_stats and not self.enable_stats:
             self._request_stats_enabled_ids.add(request_id)

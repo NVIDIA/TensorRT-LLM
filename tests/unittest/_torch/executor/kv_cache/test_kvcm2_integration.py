@@ -112,6 +112,23 @@ def test_swa_endpoint_priority(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
+    "fork,ordinal,expected",
+    [
+        (0, 330, 0),  # no fork recorded: intermediate page stays priority 0
+        (12608, 329, 70),  # first block overlapping [fork - window - block, fork)
+        (12608, 328, 0),
+        (12608, 393, 70),  # block holding fork - 1
+        (12608, 394, 0),  # at/after the fork: not part of the shared prefix window
+    ],
+)
+def test_swa_endpoint_priority_fork_point(fork: int, ordinal: int, expected: int) -> None:
+    priority = _swa_endpoint_priority(40000, 32, 1024, [fork])
+    assert priority(ordinal, AttnLifeCycle(2048, 0)) == expected
+    assert priority(ordinal, AttnLifeCycle(None, 0)) == 35
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
     "rewind,is_dummy,is_draft,prompt,enabled",
     [
         (0, False, False, 8192, False),
