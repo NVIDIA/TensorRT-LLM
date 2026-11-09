@@ -814,8 +814,8 @@ def isValidSlurmJobId(def slurmJobID) {
 }
 
 // Named after what the fat sqsh bakes in: the commit, the base image, the package
-// (which also tells x86 from SBSA and BOLTed from un-BOLTed builds) and the builder
-// script. Every pipeline that tests the same commit therefore reuses one file.
+// (which also tells x86 from SBSA) and the builder script.
+// Every pipeline that tests the same commit therefore reuses one file.
 // Computed only here; the builder and prepare_container.sh receive it as FAT_SQSH_PATH.
 def computeFatSqshPath(String fatSqshDir, String llmTarArtifactPath, String fatBuildScriptLocalPath) {
     def shortHash = { String text -> sh(returnStdout: true, script: "printf '%s' '${text}' | sha256sum | cut -c1-8").trim() }
@@ -823,11 +823,10 @@ def computeFatSqshPath(String fatSqshDir, String llmTarArtifactPath, String fatB
     // Without a commit, fall back to the artifact path, which is unique per pipeline.
     def commitTag = commit ? commit.take(8) : shortHash(llmTarArtifactPath)
     def imageTag = LLM_DOCKER_IMAGE.contains("@sha256:") ? LLM_DOCKER_IMAGE.split("@sha256:")[1].take(8) : shortHash(LLM_DOCKER_IMAGE)
-    def packageTag = llmTarArtifactPath.tokenize('/')[-1].replaceAll(/\.tar\.gz$/, '').replaceAll(/[^A-Za-z0-9._-]/, '_')
-    // BOLTed packages of one commit differ by the profile bundle applied to them.
-    if (packageTag.startsWith("bolted-") && BOLT_PINNED_REF) {
-        packageTag += "-bolt-${shortHash(BOLT_PINNED_REF)}"
-    }
+    // Pre-merge tests the canonical package and post-merge tests bolted-<package>; both
+    // are the commit's build for that arch, so the BOLT prefix is not part of the name.
+    def packageTag = llmTarArtifactPath.tokenize('/')[-1]
+        .replaceAll(/^bolted-/, '').replaceAll(/\.tar\.gz$/, '').replaceAll(/[^A-Za-z0-9._-]/, '_')
     def scriptHash = sh(returnStdout: true, script: "sha256sum ${fatBuildScriptLocalPath} | cut -c1-8").trim()
     def name = "fat-commit-${commitTag}-image-${imageTag}-${packageTag}-script-${scriptHash}"
     return [name: name, path: "${fatSqshDir}/${name}.sqsh"]
