@@ -119,7 +119,7 @@ def _cluster_scope_spin(node: ast.AST, barrier: str) -> ast.Call:
         loop
         for loop in ast.walk(node)
         if isinstance(loop, ast.While)
-        and "done" in ast.unparse(loop.test)
+        and ast.unparse(loop.test) == "done == 0"
         and any(c is w for c in _calls(loop) for w in waits)
     ]
     assert spins, f"the try-wait on {barrier} is not repeated until it reports completion"
