@@ -173,22 +173,38 @@ class RouterGemmMoE:
                     # Router push: this rank's router columns and their multicast all-gather in one
                     # kernel (ops/moe/router_push.py; TP16 and TP8, each armed by its own switch); None -> the op below.
                     route_armed = getattr(_tep16_router_push, "route_armed", None)
-                    if route_armed is not None and route_armed() and _routing_version_guard() is not None:
+                    if (
+                        route_armed is not None
+                        and route_armed()
+                        and _routing_version_guard() is not None
+                    ):
                         # Step A: the push also writes the routing method's selection and weights
                         # (_full_routing_kernel's bits); the memo then serves this layer's routing_method.apply calls,
                         # as the 8-row prologue's _prologue_record_routing does. (out, None, None): apply computes.
                         routing = getattr(getattr(self, "experts", None), "routing_method", None)
                         res = _tep16_router_push.logits_routed(
-                            getattr(self, "mapping", None), hidden_states, weight, self.metap_multiplier, routing
+                            getattr(self, "mapping", None),
+                            hidden_states,
+                            weight,
+                            self.metap_multiplier,
+                            routing,
                         )
                         if res is not None:
                             out, selected, weights = res
                             if selected is not None:
-                                routing._routing_memo = (out, _version_or_none(out), selected, weights)
+                                routing._routing_memo = (
+                                    out,
+                                    _version_or_none(out),
+                                    selected,
+                                    weights,
+                                )
                             return out
                     else:
                         out = _tep16_router_push.logits(
-                            getattr(self, "mapping", None), hidden_states, weight, self.metap_multiplier
+                            getattr(self, "mapping", None),
+                            hidden_states,
+                            weight,
+                            self.metap_multiplier,
                         )
                         if out is not None:
                             return out

@@ -56,8 +56,6 @@ expert kernel of layer ``l`` completed, after layer ``l``'s FMHA.
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
 from typing import Callable, FrozenSet, Optional
 
 import torch
@@ -65,6 +63,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 from ...ops.gemm.dense_gemm import QKV_SHAPE, l2_prefetch, post_wait_columns
+from ...sm107_defaults import env as _sm107_env
 
 #: The fork's name in the dense GEMM plan and the site whose dispatchers join it.
 FORK_NAME = "qkv_prefetch_qkv"
@@ -230,6 +229,10 @@ def install(model, plan) -> QkvPrefetch:
         f"stream forked after the expert launch on {len(converted)} of {len(layers) - 1} "
         f"layers, layer 0's at the start of the decode forward; joined at the QKV GEMM; "
         f"rows {sorted(rows)}"
-        + (f"; MUSESPARK_OPEN_NEXT_QKV_PREFETCH_SKIP_ROWS={SKIP_ROWS}: none at <= {SKIP_ROWS} rows" if SKIP_ROWS else "")
+        + (
+            f"; MUSESPARK_OPEN_NEXT_QKV_PREFETCH_SKIP_ROWS={SKIP_ROWS}: none at <= {SKIP_ROWS} rows"
+            if SKIP_ROWS
+            else ""
+        )
     )
     return prefetch

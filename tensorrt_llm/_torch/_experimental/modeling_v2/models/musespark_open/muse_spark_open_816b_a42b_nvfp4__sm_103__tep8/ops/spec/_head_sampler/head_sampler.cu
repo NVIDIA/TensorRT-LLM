@@ -1043,8 +1043,7 @@ __global__ void __launch_bounds__(VB, VB == kSplitNarrowBlock ? 2 : 1) vpDrawKer
                 {
                     w[g] = vpAwait<3>(vpState(p.copy, p, r0 + g, row, tid, VB), p.status, p.timeoutNs);
                 }
-                OnlineSoftmax const part{
-                    __uint_as_float(w[g].x), __uint_as_float(w[g].y), static_cast<int>(w[g].z)};
+                OnlineSoftmax const part{__uint_as_float(w[g].x), __uint_as_float(w[g].y), static_cast<int>(w[g].z)};
                 st = r0 + g == 0 ? part : combineOnlineSoftmax(st, part);
             }
         }
@@ -1670,7 +1669,8 @@ fs::VpParams vpLayout(int64_t rank, int64_t ranks, int64_t shardVecs, int64_t co
     int64_t timeoutS)
 {
     TORCH_CHECK(ranks >= 1 && ranks <= fs::kVpMaxRanks && rank >= 0 && rank < ranks, "rank / ranks out of range");
-    TORCH_CHECK(publish.size() >= 1 && publish.size() <= static_cast<size_t>(fs::kVpMaxRanks), "1..kVpMaxRanks (16) publish targets");
+    TORCH_CHECK(publish.size() >= 1 && publish.size() <= static_cast<size_t>(fs::kVpMaxRanks),
+        "1..kVpMaxRanks (16) publish targets");
     TORCH_CHECK(shardVecs >= 1, "empty shard");
     fs::VpParams p;
     p.rank = static_cast<int>(rank);

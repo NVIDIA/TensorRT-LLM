@@ -89,9 +89,6 @@ call stays TRTLLM-gen's.
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
-import os
 import types
 from typing import Dict, List, Optional
 
@@ -113,6 +110,7 @@ from ...ops.moe.ring_buddy_assign import (
     block_of,
     ring_buddy_assign,
 )
+from ...sm107_defaults import env as _sm107_env
 
 #: Decode rows the stacked path serves; larger calls keep the built-in path.
 MAX_ROWS = 16
@@ -146,7 +144,9 @@ _PREROUTED_TILE = 8
 #: bitwise the stock two-window call's; a call whose stock tactic has another tile keeps the stock call.
 _TEP8_PREROUTED_MAX_ROWS = int(_sm107_env("MUSESPARK_OPEN_TEP8_PREROUTED_MAX_ROWS", "") or 64)
 if _TEP8_PREROUTED_MAX_ROWS not in (64, 128):
-    raise ValueError(f"MUSESPARK_OPEN_TEP8_PREROUTED_MAX_ROWS={_TEP8_PREROUTED_MAX_ROWS}: 64 or 128")
+    raise ValueError(
+        f"MUSESPARK_OPEN_TEP8_PREROUTED_MAX_ROWS={_TEP8_PREROUTED_MAX_ROWS}: 64 or 128"
+    )
 _TEP8_PREROUTED_ROWS = range(9, _TEP8_PREROUTED_MAX_ROWS + 1)
 
 
@@ -166,8 +166,18 @@ def _prerouted_tile(rows: int) -> int:
     return _PREROUTED_TILE if rows <= 64 else 2 * _PREROUTED_TILE
 
 
-def _stock_tactic(x, x_sf, stacks, local_ids, weights_bf16, intermediate, window, routing_method_type, act_type,
-                  tune_max_num_tokens):
+def _stock_tactic(
+    x,
+    x_sf,
+    stacks,
+    local_ids,
+    weights_bf16,
+    intermediate,
+    window,
+    routing_method_type,
+    act_type,
+    tune_max_num_tokens,
+):
     """The ``(tile_n, config)`` the stock ``fp4_block_scale_moe_runner`` call runs on these inputs: the
     autotuner's cached choice, looked up as that op looks it up, else (cache miss) the op's fallback, the
     runner's default config. None while tuning, or when that is not an 8-token tile."""
@@ -180,13 +190,31 @@ def _stock_tactic(x, x_sf, stacks, local_ids, weights_bf16, intermediate, window
     tuner = AutoTuner.get()
     if tuner.is_tuning_mode:
         return None
-    key = (x.fp4_tensor.device.index, window, x.fp4_tensor.shape[0], intermediate, act_type, routing_method_type)
+    key = (
+        x.fp4_tensor.device.index,
+        window,
+        x.fp4_tensor.shape[0],
+        intermediate,
+        act_type,
+        routing_method_type,
+    )
     cached = _prerouted_state.get(("tactic", key))
     if cached is not None:
         return cached
     runner = FP4BlockScaleMoERunner(
-        EXPERTS, TOP_K, None, None, intermediate, 0, window, None, routing_method_type, False, act_type,
-        tune_max_num_tokens=tune_max_num_tokens, use_dp=False,
+        EXPERTS,
+        TOP_K,
+        None,
+        None,
+        intermediate,
+        0,
+        window,
+        None,
+        routing_method_type,
+        False,
+        act_type,
+        tune_max_num_tokens=tune_max_num_tokens,
+        use_dp=False,
     )
     logits, weights, ids, config = prepare_dummy_topk_and_hook(
         routing_method_type=routing_method_type,
@@ -206,10 +234,24 @@ def _stock_tactic(x, x_sf, stacks, local_ids, weights_bf16, intermediate, window
         use_dp=False,
     )
     inputs = [
-        logits, None, x.fp4_tensor, x_sf,
-        stacks["w3_w1_weight"], stacks["w3_w1_weight_scale"].view(torch.float8_e4m3fn), None, None, None, None,
-        stacks["w2_weight"], stacks["w2_weight_scale"].view(torch.float8_e4m3fn), None,
-        stacks["fc31_scale_c"], stacks["fc31_alpha"], stacks["fc2_alpha"], weights, ids,
+        logits,
+        None,
+        x.fp4_tensor,
+        x_sf,
+        stacks["w3_w1_weight"],
+        stacks["w3_w1_weight_scale"].view(torch.float8_e4m3fn),
+        None,
+        None,
+        None,
+        None,
+        stacks["w2_weight"],
+        stacks["w2_weight_scale"].view(torch.float8_e4m3fn),
+        None,
+        stacks["fc31_scale_c"],
+        stacks["fc31_alpha"],
+        stacks["fc2_alpha"],
+        weights,
+        ids,
     ]
     _, tactic = tuner.choose_one("trtllm::fp4_block_scale_moe_runner", [runner], config, inputs)
     if tactic is None or isinstance(tactic, int) or -1 in tuple(tactic):
@@ -225,15 +267,30 @@ def _stock_tactic(x, x_sf, stacks, local_ids, weights_bf16, intermediate, window
         ext = _prerouted_ext("moe3")
         if ext is None:
             return None
-        tactic = (tile, int(ext.default_config(tile, TOP_K, hidden, intermediate, window, rows, act_type)))
+        tactic = (
+            tile,
+            int(ext.default_config(tile, TOP_K, hidden, intermediate, window, rows, act_type)),
+        )
     else:
         tactic = (int(tactic[0]), int(tactic[1]))
     _prerouted_state[("tactic", key)] = tactic
     return tactic
 
 
-def _tep8_prerouted_call(stacks, x, x_sf, local_ids, weights_bf16, meta, intermediate, window, act_type,
-                    routing_method_type, tune_max_num_tokens, tactic=None):
+def _tep8_prerouted_call(
+    stacks,
+    x,
+    x_sf,
+    local_ids,
+    weights_bf16,
+    meta,
+    intermediate,
+    window,
+    act_type,
+    routing_method_type,
+    tune_max_num_tokens,
+    tactic=None,
+):
     """FC1 / FC2 of a two-window call on ``ring_buddy_assign``'s tables, or None (the stock call)."""
     rows = x.fp4_tensor.shape[0]
     if (
@@ -244,8 +301,18 @@ def _tep8_prerouted_call(stacks, x, x_sf, local_ids, weights_bf16, meta, interme
     ):
         return None
     if tactic is None:
-        tactic = _stock_tactic(x, x_sf, stacks, local_ids, weights_bf16, intermediate, window,
-                               routing_method_type, act_type, tune_max_num_tokens)
+        tactic = _stock_tactic(
+            x,
+            x_sf,
+            stacks,
+            local_ids,
+            weights_bf16,
+            intermediate,
+            window,
+            routing_method_type,
+            act_type,
+            tune_max_num_tokens,
+        )
     if tactic is None or tactic[0] != meta.get("tile"):
         return None
     ext = _prerouted_ext("moe3")
@@ -285,6 +352,7 @@ def _tep8_prerouted_call(stacks, x, x_sf, local_ids, weights_bf16, meta, interme
         act_type,
         False,
     )
+
 
 #: Per-expert tensors the expert call reads, per expert format, in the order
 #: the stack is built. Every one is indexed by local expert first. ``nvfp4`` is
@@ -1018,7 +1086,9 @@ def _prerouted_call(stacks, x, x_sf, local_ids, weights_bf16, meta, intermediate
     if window != HALF_SPAN or rows not in _PREROUTED_ROWS or meta.get("rows") != rows:
         return None
     hidden = 2 * x.fp4_tensor.shape[1]
-    if _PREROUTED_TACTIC not in _decode_tactics._valid(act_type, TOP_K, hidden, intermediate, window, rows):
+    if _PREROUTED_TACTIC not in _decode_tactics._valid(
+        act_type, TOP_K, hidden, intermediate, window, rows
+    ):
         return None
     ext = _prerouted_ext()
     if ext is None:
@@ -1248,7 +1318,8 @@ def install(
         logger.info(
             f"[musespark_open] tep8 prerouted experts (MUSESPARK_OPEN_TEP8_PREROUTED=1): ring_buddy_assign "
             f"writes the expert op's routing tables ({2 * block}-expert two-window stack, {_PREROUTED_TILE}-token "
-            f"tiles) for the NVFP4 layers' {_TEP8_PREROUTED_ROWS[0]}..{_TEP8_PREROUTED_ROWS[-1]}-row decode calls, which "
+            f"tiles) for the NVFP4 layers' {_TEP8_PREROUTED_ROWS[0]}..{_TEP8_PREROUTED_ROWS[-1]}-row decode calls, "
+            "which "
             f"run FC1 / FC2 on them through the prerouted expert op "
             f"({_prerouted.describe()}) at the stock call's tactic, without the "
             f"routing kernel"

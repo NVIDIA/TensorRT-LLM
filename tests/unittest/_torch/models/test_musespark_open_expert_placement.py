@@ -48,8 +48,11 @@ def test_table_rejects_non_permutation(tmp_path, monkeypatch):
 
 def test_routing_memo_placed_once():
     r = MuseSparkOpenRoutingMethod(
-        top_k=8, num_experts=256, callable_e_score_correction_bias=lambda: torch.zeros(256),
-        renorm_eps=1e-20)
+        top_k=8,
+        num_experts=256,
+        callable_e_score_correction_bias=lambda: torch.zeros(256),
+        renorm_eps=1e-20,
+    )
     perm = _perm(2)
     r._slot_map = P.SlotMap(perm)
     ids = torch.randint(0, 256, (5, 8), dtype=torch.int32)
@@ -65,13 +68,19 @@ def test_routing_memo_placed_once():
 
 def test_apply_torch_path_places_ids():
     r = MuseSparkOpenRoutingMethod(
-        top_k=8, num_experts=256, callable_e_score_correction_bias=lambda: torch.zeros(256),
-        renorm_eps=1e-20)
+        top_k=8,
+        num_experts=256,
+        callable_e_score_correction_bias=lambda: torch.zeros(256),
+        renorm_eps=1e-20,
+    )
     logits = torch.randn(9, 256)
     base_ids, base_w = r.apply(logits)
     r2 = MuseSparkOpenRoutingMethod(
-        top_k=8, num_experts=256, callable_e_score_correction_bias=lambda: torch.zeros(256),
-        renorm_eps=1e-20)
+        top_k=8,
+        num_experts=256,
+        callable_e_score_correction_bias=lambda: torch.zeros(256),
+        renorm_eps=1e-20,
+    )
     perm = _perm(3)
     r2._slot_map = P.SlotMap(perm)
     ids, w = r2.apply(logits)
@@ -85,20 +94,22 @@ class _Acc:
 
 
 def test_build_expert_weights_placed_ids():
-    E, I, H = 8, 4, 6
-    w13 = torch.arange(E * 2 * I * H, dtype=torch.float32).reshape(E, 2 * I, H)
-    w2 = torch.arange(E * H * I, dtype=torch.float32).reshape(E, H, I) + 1e6
+    E, inter, H = 8, 4, 6
+    w13 = torch.arange(E * 2 * inter * H, dtype=torch.float32).reshape(E, 2 * inter, H)
+    w2 = torch.arange(E * H * inter, dtype=torch.float32).reshape(E, H, inter) + 1e6
     weights = {"x.w13_weight": w13, "x.w2_weight": w2}
     ids = [5, 1, 7, 2]
-    ent = M.build_expert_weights(weights, "x", 0, 4, E, I, False, _Acc(), expert_ids=ids)
+    ent = M.build_expert_weights(weights, "x", 0, 4, E, inter, False, _Acc(), expert_ids=ids)
     for e in ids:
-        assert torch.equal(ent[f"{e}.w1.weight"], w13[e, :I])
-        assert torch.equal(ent[f"{e}.w3.weight"], w13[e, I:])
+        assert torch.equal(ent[f"{e}.w1.weight"], w13[e, :inter])
+        assert torch.equal(ent[f"{e}.w3.weight"], w13[e, inter:])
         assert torch.equal(ent[f"{e}.w2.weight"], w2[e])
     assert not any(k.startswith("0.") for k in ent)
+
     # contiguous ids keep the range path
     class _E:
         initial_local_expert_ids = [4, 5, 6, 7]
+
     assert M._placed_expert_ids(_E()) is None
     _E.initial_local_expert_ids = ids
     assert M._placed_expert_ids(_E()) == ids

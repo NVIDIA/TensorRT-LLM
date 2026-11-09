@@ -81,8 +81,6 @@ under a late rank.
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
 from typing import Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 import torch
@@ -97,6 +95,7 @@ from ...attention import (
     MuseSparkOpenTepPrepDecodeAttention,
 )
 from ...ops.attention import norm_gate as _norm_gate
+from ...sm107_defaults import env as _sm107_env
 
 #: When the fused boundary lets the next QKV GEMM launch: at its entry.
 BOUNDARY_TRIGGER = "entry"
@@ -107,16 +106,18 @@ NORM_GATE_TRIGGER = "after_wait"
 #: norm-gate copy from 8 (one request) to N <= 128 on decode steps that ``batch_dense_gemms`` does not serve (it is not
 #: composed: the TEP8 bundle's multi-request steps of 16..64 rows). Up to 128 rows the built-in ``apply_output_gate``
 #: launches exactly the Triton ``_attention_norm_gate_kernel`` (same grid, num_warps 4) that ``ops/attention/norm_gate``
-#: copies statement for statement, so the result is bitwise; above 128 the built-in runs the CuTe ``rmsnorm_gate``, which
-#: this copy is not, so the bound is capped at 128. What changes is the launch: PDL with the after-wait trigger, so the
-#: output projection (a split-K GEMM that loads its weight before its own wait) launches early and pre-stages its
+#: copies statement for statement, so the result is bitwise; above 128 the built-in runs the CuTe ``rmsnorm_gate``,
+#: which this copy is not, so the bound is capped at 128. What changes is the launch: PDL with the after-wait trigger,
+#: so the output projection (a split-K GEMM that loads its weight before its own wait) launches early and pre-stages its
 #: weight instead of launching after a plain kernel. Unset or empty: the image's bound (8).
 _PDL_MAX_ROWS_ENV = "MUSESPARK_OPEN_NORM_GATE_PDL_MAX_ROWS"
 _PDL_MAX_ROWS = min(128, max(_norm_gate.MAX_ROWS, int(_sm107_env(_PDL_MAX_ROWS_ENV, "") or 0)))
 if _PDL_MAX_ROWS > _norm_gate.MAX_ROWS:
-    logger.info(f"[musespark_open] boundary_early_release: the PDL norm-gate also takes decode steps of "
-                f"{_norm_gate.MAX_ROWS + 1}..{_PDL_MAX_ROWS} rows where batch_dense_gemms is not composed "
-                f"({_PDL_MAX_ROWS_ENV}={_PDL_MAX_ROWS})")
+    logger.info(
+        f"[musespark_open] boundary_early_release: the PDL norm-gate also takes decode steps of "
+        f"{_norm_gate.MAX_ROWS + 1}..{_PDL_MAX_ROWS} rows where batch_dense_gemms is not composed "
+        f"({_PDL_MAX_ROWS_ENV}={_PDL_MAX_ROWS})"
+    )
 
 
 class _NormGatePdl:
@@ -171,8 +172,8 @@ class _NormGatePdl:
         return _PDL_MAX_ROWS
 
     def _fits_norm_gate(self, attention_output, gate) -> bool:
-        """Exactly when the built-in method would launch its Triton kernel, at 1-8 rows (with the row-bound switch: up to
-        ``_pdl_max_rows`` <= 128, where the built-in still launches that Triton kernel)."""
+        """Exactly when the built-in method would launch its Triton kernel, at 1-8 rows (with the row-bound switch:
+        up to ``_pdl_max_rows`` <= 128, where the built-in still launches that Triton kernel)."""
         return (
             not isinstance(attention_output, Fp4QuantizedTensor)
             and attention_output.is_cuda

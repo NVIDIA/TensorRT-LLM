@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E501
 """Transports the column-sharded pool and unpool GEMMs publish into on 33..512-row decode steps (TP4).
 
 From 33 rows the built-in MoE multiplies the whole replicated pool (8192 -> 4096) and
@@ -58,8 +59,6 @@ inboxes and every other collective use their own memory.
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
 import ctypes
 import os
 import threading
@@ -74,6 +73,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ...sm107_defaults import env as _sm107_env
 from .unpool_direct_boundary import buffer_sequence, check_buffer_sequence
 
 __all__ = [
@@ -136,7 +136,7 @@ CERTIFIED_PRODUCERS = frozenset(
 #: GEMMs than the TP4 census drove, so TP8 publishes only with a producer the TP8 census
 #: (a device census, 33..448 rows, both sites) certified
 #: (two-tray TP8). Same key as above.
-CERTIFIED_PRODUCERS_TP8 = frozenset({('2.14.0a0+b2c75dd062.nv26.09', 130800, 212)})
+CERTIFIED_PRODUCERS_TP8 = frozenset({("2.14.0a0+b2c75dd062.nv26.09", 130800, 212)})
 #: The GB300 (152-SM) TP8 cuBLAS producer census (pool / unpool slices, 33..448 rows, eager module loading).
 #: Consulted only by ``MUSESPARK_OPEN_SM103_TEP8_PUBLISH_WIDE
 #: =cublas`` (kernels/projection_publish), so the default sm103 TP8 build keeps refusing exactly as before.
@@ -238,8 +238,12 @@ def _splitk_publisher():
         else:
             key = (
                 torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count,
-                _splitk_site_key(splitk, TP8_PUBLISH_SPLITK_TACTICS[(UNPOOL_HIDDEN, POOL_HIDDEN // 8)]),
-                _splitk_site_key(splitk, TP8_PUBLISH_SPLITK_TACTICS[(POOL_HIDDEN, UNPOOL_HIDDEN // 8)]),
+                _splitk_site_key(
+                    splitk, TP8_PUBLISH_SPLITK_TACTICS[(UNPOOL_HIDDEN, POOL_HIDDEN // 8)]
+                ),
+                _splitk_site_key(
+                    splitk, TP8_PUBLISH_SPLITK_TACTICS[(POOL_HIDDEN, UNPOOL_HIDDEN // 8)]
+                ),
             )
             if key not in CERTIFIED_SPLITK_PRODUCERS_TP8:
                 reason = f"the split-K producer census does not cover {key}"
@@ -254,7 +258,9 @@ def _splitk_publisher():
             f"({TEP8_PUBLISH_SPLITK_ENV}=1)"
         )
     else:
-        logger.warning(f"[musespark_open] projection_publish: {TEP8_PUBLISH_SPLITK_ENV}=1 ignored, cuBLAS publishes: {reason}")
+        logger.warning(
+            f"[musespark_open] projection_publish: {TEP8_PUBLISH_SPLITK_ENV}=1 ignored, cuBLAS publishes: {reason}"
+        )
     _splitk_state["publisher"] = publisher
     return publisher
 
@@ -539,24 +545,41 @@ def _join_cl_function(device: torch.device, has_gain: bool, norm_fp32: bool, cl:
     from cuda.bindings import nvrtc
 
     major, minor = torch.cuda.get_device_capability(index)
-    prog = _join_cl_check(nvrtc.nvrtcCreateProgram(_JOIN_CL_SRC.encode(), b"publish_join_cluster.cu", 0, [], []))
-    opts = [f"--gpu-architecture=sm_{major}{minor}".encode(), b"-std=c++17", b"-default-device", b"-DPUB=1",
-            f"-DHAS_GAIN={int(bool(has_gain))}".encode(), f"-DNORM_FP32={int(bool(norm_fp32))}".encode(),
-            f"-DCL={int(cl)}".encode()]
+    prog = _join_cl_check(
+        nvrtc.nvrtcCreateProgram(_JOIN_CL_SRC.encode(), b"publish_join_cluster.cu", 0, [], [])
+    )
+    opts = [
+        f"--gpu-architecture=sm_{major}{minor}".encode(),
+        b"-std=c++17",
+        b"-default-device",
+        b"-DPUB=1",
+        f"-DHAS_GAIN={int(bool(has_gain))}".encode(),
+        f"-DNORM_FP32={int(bool(norm_fp32))}".encode(),
+        f"-DCL={int(cl)}".encode(),
+    ]
     r = nvrtc.nvrtcCompileProgram(prog, len(opts), opts)
     if int(r[0]) != 0:
         n = _join_cl_check(nvrtc.nvrtcGetProgramLogSize(prog))
         log = b" " * n
         nvrtc.nvrtcGetProgramLog(prog, log)
-        raise RuntimeError("projection_publish join cluster kernel: NVRTC compile failed:\n" + log.decode(errors="replace"))
+        raise RuntimeError(
+            "projection_publish join cluster kernel: NVRTC compile failed:\n"
+            + log.decode(errors="replace")
+        )
     n = _join_cl_check(nvrtc.nvrtcGetCUBINSize(prog))
     cubin = b" " * n
     _join_cl_check(nvrtc.nvrtcGetCUBIN(prog, cubin))
     with torch.cuda.device(index):
         mod = _join_cl_check(cu.cuModuleLoadData(cubin))
         f = _join_cl_check(cu.cuModuleGetFunction(mod, b"pubjoin4"))
-    regs = int(_join_cl_check(cu.cuFuncGetAttribute(cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS, f)))
-    lmem = int(_join_cl_check(cu.cuFuncGetAttribute(cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, f)))
+    regs = int(
+        _join_cl_check(cu.cuFuncGetAttribute(cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS, f))
+    )
+    lmem = int(
+        _join_cl_check(
+            cu.cuFuncGetAttribute(cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, f)
+        )
+    )
     _JOIN_CL_FN[key] = (f, mod)
     logger.info(
         f"[musespark_open] projection_publish: {JOIN_CLUSTER_ENV}={JOIN_CLUSTER}: post-FFN join cluster kernel "
@@ -566,8 +589,28 @@ def _join_cl_function(device: torch.device, has_gain: bool, norm_fp32: bool, cl:
     return _JOIN_CL_FN[key]
 
 
-def _join_cl_launch(fn, cl, rows, updated, residual, receive, gain, alpha, beta, post_eps, next_input, weight, pre_eps,
-                    guard_ptr, buffer, world, capacity, columns, guard_rounds, pdl):
+def _join_cl_launch(
+    fn,
+    cl,
+    rows,
+    updated,
+    residual,
+    receive,
+    gain,
+    alpha,
+    beta,
+    post_eps,
+    next_input,
+    weight,
+    pre_eps,
+    guard_ptr,
+    buffer,
+    world,
+    capacity,
+    columns,
+    guard_rounds,
+    pdl,
+):
     from cuda.bindings import driver as cu
 
     cfg = cu.CUlaunchConfig()
@@ -587,10 +630,28 @@ def _join_cl_launch(fn, cl, rows, updated, residual, receive, gain, alpha, beta,
     cfg.attrs = attrs
     cfg.numAttrs = len(attrs)
     vp, ll, fl, ii = ctypes.c_void_p, ctypes.c_longlong, ctypes.c_float, ctypes.c_int
-    args = ((updated.data_ptr(), residual.data_ptr(), receive.data_ptr(), gain.data_ptr(), alpha.data_ptr(),
-             beta.data_ptr(), float(post_eps), next_input.data_ptr(), weight.data_ptr(), float(pre_eps), int(guard_ptr),
-             int(buffer), int(world), int(capacity), int(columns), int(guard_rounds), int(bool(pdl))),
-            (vp, vp, vp, vp, vp, vp, fl, vp, vp, fl, vp, ii, ii, ii, ii, ll, ii))
+    args = (
+        (
+            updated.data_ptr(),
+            residual.data_ptr(),
+            receive.data_ptr(),
+            gain.data_ptr(),
+            alpha.data_ptr(),
+            beta.data_ptr(),
+            float(post_eps),
+            next_input.data_ptr(),
+            weight.data_ptr(),
+            float(pre_eps),
+            int(guard_ptr),
+            int(buffer),
+            int(world),
+            int(capacity),
+            int(columns),
+            int(guard_rounds),
+            int(bool(pdl)),
+        ),
+        (vp, vp, vp, vp, vp, vp, fl, vp, vp, fl, vp, ii, ii, ii, ii, ll, ii),
+    )
     _join_cl_check((cu.cuLaunchKernelEx(cfg, fn[0], args, 0)[0], None))
 
 
@@ -599,7 +660,10 @@ def capture_dependencies(stream: torch.cuda.Stream):
     from cuda.bindings import runtime as cudart
 
     err, status, _, _, nodes, edges, count = cudart.cudaStreamGetCaptureInfo(stream.cuda_stream)
-    if err != cudart.cudaError_t.cudaSuccess or status != cudart.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive:
+    if (
+        err != cudart.cudaError_t.cudaSuccess
+        or status != cudart.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive
+    ):
         return None
     return list(nodes)[:count], list(edges)[:count]
 
@@ -611,7 +675,10 @@ def single_kernel_node(nodes) -> bool:
     if len(nodes) != 1:
         return False
     err, kind = cudart.cudaGraphNodeGetType(nodes[0])
-    return err == cudart.cudaError_t.cudaSuccess and kind == cudart.cudaGraphNodeType.cudaGraphNodeTypeKernel
+    return (
+        err == cudart.cudaError_t.cudaSuccess
+        and kind == cudart.cudaGraphNodeType.cudaGraphNodeTypeKernel
+    )
 
 
 def programmatic_from(stream: torch.cuda.Stream, sources) -> bool:
@@ -637,11 +704,16 @@ def programmatic_from(stream: torch.cuda.Stream, sources) -> bool:
     if not changed:
         return False
     (err,) = cudart.cudaStreamUpdateCaptureDependencies(
-        stream.cuda_stream, nodes, new_edges, len(nodes),
+        stream.cuda_stream,
+        nodes,
+        new_edges,
+        len(nodes),
         cudart.cudaStreamUpdateCaptureDependenciesFlags.cudaStreamSetCaptureDependencies,
     )
     if err != cudart.cudaError_t.cudaSuccess:
-        raise RuntimeError(f"[musespark_open] projection_publish: programmatic pool fork failed: {err}")
+        raise RuntimeError(
+            f"[musespark_open] projection_publish: programmatic pool fork failed: {err}"
+        )
     return True
 
 
@@ -934,7 +1006,9 @@ def wide_producer_refusal(device: torch.device) -> Optional[str]:
     return None
 
 
-def publish_projection_chunked(hidden: torch.Tensor, weight: torch.Tensor, slot: torch.Tensor) -> bool:
+def publish_projection_chunked(
+    hidden: torch.Tensor, weight: torch.Tensor, slot: torch.Tensor
+) -> bool:
     """Publish a 65..448-row TP8 slice from the certified split-K producer, one launch per 64 rows.
 
     Rows are independent in a GEMM, so every row carries the bits the producer gives it in a 33..64-row call
@@ -948,7 +1022,9 @@ def publish_projection_chunked(hidden: torch.Tensor, weight: torch.Tensor, slot:
 _chunk_streams: dict = {}
 
 
-def publish_projection_chunked_k1(hidden: torch.Tensor, weight: torch.Tensor, slot: torch.Tensor) -> bool:
+def publish_projection_chunked_k1(
+    hidden: torch.Tensor, weight: torch.Tensor, slot: torch.Tensor
+) -> bool:
     """``splitk1``: ``publish_projection_chunked`` at split_k 1 (``TP8_PUBLISH_SPLITK1_TACTICS``): bitwise equal
     to the built-in replicated GEMM's columns of this rank. A split_k-1 launch has one CTA per (64-column, row) tile
     streaming the whole K, so the 64-row chunks run concurrently: the first on the current stream (PDL), the others
@@ -976,19 +1052,26 @@ def _publish_chunked(hidden, weight, slot, table) -> bool:
         if wt is None:
             return False
         _run_splitk_one(hidden, weight, slot, splitk_tactic(*wt))
-        logger.info_once(f"[musespark_open] projection_publish: {WIDE_ONE_ENV}=1: 65..{WIDE_ONE_K4_MAX_ROWS}-row split_k-4 "
-                         f"slices publish in one launch (tactics {_wide_splitk_tactics()})",
-                         key="musespark_open.t8r5.publish_wide_one_k4")
+        logger.info_once(
+            f"[musespark_open] projection_publish: {WIDE_ONE_ENV}=1: 65..{WIDE_ONE_K4_MAX_ROWS}-row split_k-4 "
+            f"slices publish in one launch (tactics {_wide_splitk_tactics()})",
+            key="musespark_open.t8r5.publish_wide_one_k4",
+        )
         return True
     if table is None:
         for (a, b), tactic in zip(bounds, tactics):
-            run_splitk_dense(hidden[a:b], weight.t(), None, slot[a:b], _SPLITK_PDL, splitk_tactic(*tactic))
+            run_splitk_dense(
+                hidden[a:b], weight.t(), None, slot[a:b], _SPLITK_PDL, splitk_tactic(*tactic)
+            )
         return True
     tactic = splitk_tactic(*table[(hidden.shape[1], weight.shape[0])])
     if WIDE_ONE and table is TP8_PUBLISH_SPLITK1_TACTICS and rows <= 2 * SPLITK_MAX_ROWS:
         _run_splitk_one(hidden, weight, slot, tactic)
-        logger.info_once(f"[musespark_open] projection_publish: {WIDE_ONE_ENV}=1: 65..128-row split_k-1 slices "
-                         "publish in one launch", key="musespark_open.t8r4.publish_wide_one")
+        logger.info_once(
+            f"[musespark_open] projection_publish: {WIDE_ONE_ENV}=1: 65..128-row split_k-1 slices "
+            "publish in one launch",
+            key="musespark_open.t8r4.publish_wide_one",
+        )
         return True
     main = torch.cuda.current_stream(hidden.device)
     side = _chunk_streams.get(hidden.device)
@@ -1055,9 +1138,16 @@ def _wide_splitk_tactics() -> dict:
             low = int(low) if low else SPLITK_MAX_ROWS + 1
         except ValueError:
             tactic, low = (), 0
-        if site not in sites or len(tactic) != 4 or tactic[2] != 4 or not SPLITK_MAX_ROWS < low <= WIDE_ONE_K4_MAX_ROWS:
-            raise ValueError(f"{WIDE_TACTICS_ENV}={value!r}: expected <pool|unpool>[@<65..{WIDE_ONE_K4_MAX_ROWS}>]="
-                             "M,N,4,S entries (split_k 4)")
+        if (
+            site not in sites
+            or len(tactic) != 4
+            or tactic[2] != 4
+            or not SPLITK_MAX_ROWS < low <= WIDE_ONE_K4_MAX_ROWS
+        ):
+            raise ValueError(
+                f"{WIDE_TACTICS_ENV}={value!r}: expected <pool|unpool>[@<65..{WIDE_ONE_K4_MAX_ROWS}>]="
+                "M,N,4,S entries (split_k 4)"
+            )
         table[sites[site]][low] = tactic
     table = {key: sorted(v.items()) for key, v in table.items()}
     _splitk_state["wide_tactics"] = table
@@ -1083,12 +1173,18 @@ def _run_splitk_one(hidden: torch.Tensor, weight: torch.Tensor, slot: torch.Tens
     m, n, k = sk._validate_runtime_tensors(a, b, None, slot)
     top = {1: 2 * SPLITK_MAX_ROWS, 4: WIDE_ONE_K4_MAX_ROWS}.get(tactic.split_k, 0)
     if not SPLITK_MAX_ROWS < m <= top:
-        raise ValueError(f"publish WIDE_ONE: split_k 1 at {SPLITK_MAX_ROWS + 1}..{2 * SPLITK_MAX_ROWS} rows or "
-                         f"split_k 4 at {SPLITK_MAX_ROWS + 1}..{WIDE_ONE_K4_MAX_ROWS}, got {tactic} at {m}")
+        raise ValueError(
+            f"publish WIDE_ONE: split_k 1 at {SPLITK_MAX_ROWS + 1}..{2 * SPLITK_MAX_ROWS} rows or "
+            f"split_k 4 at {SPLITK_MAX_ROWS + 1}..{WIDE_ONE_K4_MAX_ROWS}, got {tactic} at {m}"
+        )
     sk.validate_tactic(tactic, SPLITK_MAX_ROWS, n, k)
     cute_tensors = sk._to_cute_swap(a, b, slot, None)
     compiled = sk._get_compiled_splitk_kernel(
-        dtype=a.dtype, tactic=tactic, use_pdl=_SPLITK_PDL, has_bias=False, leading_dims=cute_tensors[4],
+        dtype=a.dtype,
+        tactic=tactic,
+        use_pdl=_SPLITK_PDL,
+        has_bias=False,
+        leading_dims=cute_tensors[4],
         **sk._launch_options(SPLITK_MAX_ROWS, tactic.split_k),
     )
     compiled(*cute_tensors[:3], sk._cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream))
@@ -1310,15 +1406,38 @@ class UnpoolPublishJoin(OpWrapper):
             (rows, UNPOOL_HIDDEN), dtype=torch.bfloat16, device=residual.device
         )
         pdl = _join_pdl()
-        if JOIN_CLUSTER not in ("", "0") and not guard_break and residual.is_contiguous() and next_input.is_contiguous():
+        if (
+            JOIN_CLUSTER not in ("", "0")
+            and not guard_break
+            and residual.is_contiguous()
+            and next_input.is_contiguous()
+        ):
             # The bitwise cluster join (JOIN_CLUSTER above).
             cl = _join_cl_size(rows)
             fn = _join_cl_function(residual.device, gain is not None, bool(norm_fp32_residual), cl)
             if fn is not None:
-                _join_cl_launch(fn, cl, rows, updated, residual, transport.receive(),
-                                gain if gain is not None else weight, alpha, beta, post_eps, next_input, weight, pre_eps,
-                                transport.control_ptr(), int(buffer), transport.world, transport.max_rows,
-                                transport.columns, int(guard), pdl)
+                _join_cl_launch(
+                    fn,
+                    cl,
+                    rows,
+                    updated,
+                    residual,
+                    transport.receive(),
+                    gain if gain is not None else weight,
+                    alpha,
+                    beta,
+                    post_eps,
+                    next_input,
+                    weight,
+                    pre_eps,
+                    transport.control_ptr(),
+                    int(buffer),
+                    transport.world,
+                    transport.max_rows,
+                    transport.columns,
+                    int(guard),
+                    pdl,
+                )
                 return updated, next_input
         _unpool_publish_join_kernel[(rows,)](
             updated,

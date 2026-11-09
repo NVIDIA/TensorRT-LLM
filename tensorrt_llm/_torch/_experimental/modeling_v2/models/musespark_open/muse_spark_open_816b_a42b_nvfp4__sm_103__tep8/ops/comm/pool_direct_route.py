@@ -84,8 +84,6 @@ The workspace is this op's alone.
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
 import functools
 import os
 import threading
@@ -99,6 +97,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ...sm107_defaults import env as _sm107_env
 from . import pool_gather_route as _route
 from . import unpool_direct_boundary as _direct
 from .pool_gather_fp4quant import _VECTOR_SPAN_WORDS, _VECTORS, BLOCK, HIDDEN, local_columns
@@ -580,7 +579,9 @@ if _AVAILABLE:
             )
             sCensus = smem.allocate_tensor(Uint32, cute.make_layout((CHUNKS,)), byte_alignment=16)
             if cutlass.const_expr(self.meta):
-                sCounts = smem.allocate_tensor(Uint32, cute.make_layout((EXPERTS,)), byte_alignment=16)
+                sCounts = smem.allocate_tensor(
+                    Uint32, cute.make_layout((EXPERTS,)), byte_alignment=16
+                )
                 sLocal = smem.allocate_tensor(
                     Uint32, cute.make_layout((META_WINDOW,)), byte_alignment=16
                 )
@@ -1919,7 +1920,9 @@ class PoolDirectRoute(OpWrapper):
             workspace.control_ptr(),
             int(buffer),
             bias.data_ptr(),
-            meta=getattr(workspace, "meta", None) if place == PLACE_HALF and workspace.wide else None,
+            meta=getattr(workspace, "meta", None)
+            if place == PLACE_HALF and workspace.wide
+            else None,
         )
         if publish:
             early.arm(out.local_ids)

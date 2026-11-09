@@ -4966,7 +4966,14 @@ _SPF_FIRST_ENV = "TRTLLM_SCHED_SPF_FIRST_CHUNK_MAX_WAIT_PASSES"
 
 @pytest.fixture
 def admission_env(monkeypatch):
-    for name in (_INTERVAL_ENV, _SPF_ENV, _SPF_WAIT_ENV, _SPF_AGE_ENV, _SPF_LEAD_ENV, _SPF_FIRST_ENV):
+    for name in (
+        _INTERVAL_ENV,
+        _SPF_ENV,
+        _SPF_WAIT_ENV,
+        _SPF_AGE_ENV,
+        _SPF_LEAD_ENV,
+        _SPF_FIRST_ENV,
+    ):
         monkeypatch.delenv(name, raising=False)
     return monkeypatch
 
@@ -5242,12 +5249,21 @@ class TestShortestPrefillFirstAgingTiers:
 
     def test_defaults_keep_single_tier(self, admission_env):
         admission_env.setenv(_SPF_ENV, "1")
-        spf = make_scheduler(_reuse_settling_manager({}), max_num_tokens=150)._shortest_prefill_first
-        assert (spf.max_age_passes, spf.aged_lead_every, spf.first_chunk_max_wait_passes) == (0, 1, 0)
+        spf = make_scheduler(
+            _reuse_settling_manager({}), max_num_tokens=150
+        )._shortest_prefill_first
+        assert (spf.max_age_passes, spf.aged_lead_every, spf.first_chunk_max_wait_passes) == (
+            0,
+            1,
+            0,
+        )
 
     def test_first_chunk_without_spf_warns_and_is_inert(self, admission_env):
         admission_env.setenv(_SPF_FIRST_ENV, "4")
-        assert make_scheduler(_reuse_settling_manager({}), max_num_tokens=150)._shortest_prefill_first is None
+        assert (
+            make_scheduler(_reuse_settling_manager({}), max_num_tokens=150)._shortest_prefill_first
+            is None
+        )
 
     def test_first_chunk_tier_promotes_fitting_cold_prompt(self, admission_env):
         admission_env.setenv(_SPF_ENV, "1")

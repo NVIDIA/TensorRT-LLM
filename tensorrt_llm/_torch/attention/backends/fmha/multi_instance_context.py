@@ -233,7 +233,9 @@ def plan_context_fmha(
     dev = device if device is not None else torch.device("cuda")
     buf = torch.from_numpy(host)
     if dev.type == "cuda":
-        buf = buf.pin_memory().to(dev, non_blocking=True)
+        from tensorrt_llm._utils import maybe_pin_memory
+
+        buf = maybe_pin_memory(buf).to(dev, non_blocking=True)
     else:
         buf = buf.to(dev)
     views = [buf[s : s + n] for s, n in zip(starts, lengths)]
@@ -417,7 +419,9 @@ class MultiInstanceWorkspace:
         need = max(slots, 1) * num_inst * M_TILE
         if self.part_o is None or self.part_o.numel() < need * HEAD_DIM:
             if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("MultiInstanceWorkspace: the workspace must be reserved before capture")
+                raise RuntimeError(
+                    "MultiInstanceWorkspace: the workspace must be reserved before capture"
+                )
             self.part_o = torch.empty(need * HEAD_DIM, dtype=torch.float32, device=device)
             self.part_ml = torch.empty(need * 2, dtype=torch.float32, device=device)
         return self.part_o, self.part_ml
@@ -627,8 +631,20 @@ def _reserved_workspace(device, num_ctas: int) -> MultiInstanceWorkspace:
     return _WORKSPACE
 
 
-def _decline_reason(params, q, kv_pool, block_tables, bmm1_scale, bmm2_scale, cu_q, window_left,
-                    fp8_context_fmha, attention_chunk_size, causal, num_ctas):
+def _decline_reason(
+    params,
+    q,
+    kv_pool,
+    block_tables,
+    bmm1_scale,
+    bmm2_scale,
+    cu_q,
+    window_left,
+    fp8_context_fmha,
+    attention_chunk_size,
+    causal,
+    num_ctas,
+):
     """None when this path can run the context call, else why not (host-side checks only)."""
     from tensorrt_llm._utils import get_sm_version
     from tensorrt_llm.quantization.mode import QuantMode
@@ -714,8 +730,20 @@ def _decline_reason(params, q, kv_pool, block_tables, bmm1_scale, bmm2_scale, cu
     return None
 
 
-def maybe_run_context(params, q, kv_pool, block_tables, bmm1_scale, bmm2_scale, cu_q, window_left,
-                      fp8_context_fmha, attention_chunk_size, causal, num_ctas) -> bool:
+def maybe_run_context(
+    params,
+    q,
+    kv_pool,
+    block_tables,
+    bmm1_scale,
+    bmm2_scale,
+    cu_q,
+    window_left,
+    fp8_context_fmha,
+    attention_chunk_size,
+    causal,
+    num_ctas,
+) -> bool:
     """Run the context call of ``params`` on the multi-instance kernel when ``ENV`` is on and the
     call is one it serves; return whether it ran. A call it declines (logged once per reason) is
     left to flashinfer's trtllm-gen context kernel."""
@@ -723,8 +751,20 @@ def maybe_run_context(params, q, kv_pool, block_tables, bmm1_scale, bmm2_scale, 
 
     if not requested():
         return False
-    reason = _decline_reason(params, q, kv_pool, block_tables, bmm1_scale, bmm2_scale, cu_q,
-                             window_left, fp8_context_fmha, attention_chunk_size, causal, num_ctas)
+    reason = _decline_reason(
+        params,
+        q,
+        kv_pool,
+        block_tables,
+        bmm1_scale,
+        bmm2_scale,
+        cu_q,
+        window_left,
+        fp8_context_fmha,
+        attention_chunk_size,
+        causal,
+        num_ctas,
+    )
     lengths = None
     if reason is None:
         meta, batch, s0 = params.meta, params.batch_size, params.seq_offset

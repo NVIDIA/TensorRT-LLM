@@ -135,11 +135,8 @@ TP4 workspace uses it).
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
 import dataclasses
 import functools
-import os
 from typing import Optional, Sequence
 
 import torch
@@ -149,6 +146,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...kernels.persistent_experts import rows as _expert_rows
+from ...sm107_defaults import env as _sm107_env
 
 #: Expert (pooled) width the thread map is written for.
 HIDDEN = 4096
@@ -176,7 +174,9 @@ TP8_MAX_TOKENS = int(
 #: GB300 TEP8 at 16 requests: 128 = the built-in TP8 kernel's own bound (``_MAX_TOKENS``), whose 17..128-token calls all
 #: run one CTA per token, the flat build's order; a 128-token call is 1024 CTAs of 64 threads in 128 clusters of 8
 #: (grid_step 1024). Without it a 65..128-token TP8 step (9..16 requests at K = 7) falls back to the built-in kernel.
-assert TP8_MAX_TOKENS in (16, 32, 64, 128), f"finalize transport token cap {TP8_MAX_TOKENS}: 16, 32, 64 or 128"
+assert TP8_MAX_TOKENS in (16, 32, 64, 128), (
+    f"finalize transport token cap {TP8_MAX_TOKENS}: 16, 32, 64 or 128"
+)
 #: CTAs per token (one cluster), threads per CTA, BF16 values per thread.
 CLUSTER = 8
 VECTOR = 8

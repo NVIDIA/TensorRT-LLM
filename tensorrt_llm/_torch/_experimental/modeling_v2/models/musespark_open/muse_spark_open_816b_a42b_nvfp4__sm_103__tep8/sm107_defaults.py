@@ -224,10 +224,16 @@ def sm103_tep8_wide_gemm_sites() -> frozenset:
     value = os.environ.get(SM103_TEP8_WIDE_GEMMS_ENV, "").strip()
     if not sm103_tep8_f11() or value in ("", "0"):
         return frozenset()
-    sites = SM103_TEP8_WIDE_GEMMS_DEFAULT_SITES if value == "1" else tuple(v.strip() for v in value.split(",") if v.strip())
+    sites = (
+        SM103_TEP8_WIDE_GEMMS_DEFAULT_SITES
+        if value == "1"
+        else tuple(v.strip() for v in value.split(",") if v.strip())
+    )
     unknown = sorted(set(sites) - set(_WIDE_GEMM_SITES))
     if unknown:
-        raise ValueError(f"{SM103_TEP8_WIDE_GEMMS_ENV}={value!r}: unknown sites {unknown} (of {_WIDE_GEMM_SITES})")
+        raise ValueError(
+            f"{SM103_TEP8_WIDE_GEMMS_ENV}={value!r}: unknown sites {unknown} (of {_WIDE_GEMM_SITES})"
+        )
     return frozenset(sites)
 
 
@@ -292,9 +298,12 @@ def sm103_tep8_hop128_producer() -> tuple:
     only). ``chunks`` keeps the served tactic's stages."""
     value = os.environ.get(SM103_TEP8_HOP128_PRODUCER_ENV, "").strip() or "chunks"
     mode, _, stages = value.partition(":")
-    if mode not in _HOP128_PRODUCER_STAGES or (stages and (mode == "chunks" or not stages.isdigit()
-                                                           or not 1 <= int(stages) <= 12)):
-        raise ValueError(f"{SM103_TEP8_HOP128_PRODUCER_ENV}={value!r}: expected chunks, grid[:S] or tile128[:S]")
+    if mode not in _HOP128_PRODUCER_STAGES or (
+        stages and (mode == "chunks" or not stages.isdigit() or not 1 <= int(stages) <= 12)
+    ):
+        raise ValueError(
+            f"{SM103_TEP8_HOP128_PRODUCER_ENV}={value!r}: expected chunks, grid[:S] or tile128[:S]"
+        )
     return mode, int(stages) if stages else _HOP128_PRODUCER_STAGES[mode]
 
 
@@ -302,8 +311,9 @@ def sm103_tep8_hop128_producer() -> tuple:
 #: in no defaults table) is the last row count of the direct hop. 256 extends it to the decode steps of 17..32 requests
 #: at K = 7 (129..256 rows), which otherwise run cuBLAS o_proj + the two-shot hop: a 256-row workspace (32 slots per
 #: source), o_proj on the same split_k-1 scatter kernel (``grid`` / ``tile128``: one launch of 3..4 token tiles;
-#: ``chunks``: 64-row launches), the consumer summing the eight partials in rank order. Same per-element arithmetic as at
-#: 65..128 rows (one full-K FP32 accumulation, rounded once); bitwise vs the cuBLAS o_proj it replaces is device-gated.
+#: ``chunks``: 64-row launches), the consumer summing the eight partials in rank order. Same per-element arithmetic as
+#: at 65..128 rows (one full-K FP32 accumulation, rounded once); bitwise vs the cuBLAS o_proj it replaces is
+#: device-gated.
 SM103_TEP8_HOP_DIRECT_MAX_ROWS_ENV = "MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT_MAX_ROWS"
 
 

@@ -1662,7 +1662,9 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
                     # Apply alpha and convert to C type
                     #
                     if cutlass.const_expr(self.trtllm_gen_n_shuffle):
-                        acc_vec = tiled_copy_r2s.retile(self._trtllm_gen_n_unshuffle(tTR_rAcc)).load()
+                        acc_vec = tiled_copy_r2s.retile(
+                            self._trtllm_gen_n_unshuffle(tTR_rAcc)
+                        ).load()
                     else:
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                     acc_vec = epilogue_op((alpha_val * acc_vec).to(self.c_dtype))

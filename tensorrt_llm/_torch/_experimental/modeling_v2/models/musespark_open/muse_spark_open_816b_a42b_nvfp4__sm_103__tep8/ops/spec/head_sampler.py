@@ -54,8 +54,6 @@ otherwise load whichever build is newest.
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
 import functools
 import hashlib
 import threading
@@ -66,6 +64,8 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
 from tensorrt_llm.mapping import Mapping
+
+from ...sm107_defaults import env as _sm107_env
 
 #: The CUDA sources of the library, in ``_head_sampler/``.
 SOURCE_DIR = Path(__file__).resolve().parent / "_head_sampler"

@@ -46,11 +46,8 @@ warns about layers a step of the folded shape left on the folded-prep + split-KV
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
 import collections
 import functools
-import os
 from dataclasses import dataclass, field
 from typing import Deque, Dict, Optional, Tuple
 
@@ -69,6 +66,7 @@ from tensorrt_llm.logger import logger
 from ...dispatch import LAUNCH_PDL
 from ...ops.attention import full_attention_prep_fold as _fold
 from ...ops.attention import full_attention_split_kv as _v4
+from ...sm107_defaults import env as _sm107_env
 from ..full_attention_prep_append import attention as _prep_append
 from ..full_attention_split_kv import attention as _split_kv
 
@@ -510,7 +508,11 @@ class FullAttnSplitKvFoldAttention:
                 "full_attention_prep_fold, but "
                 f"its attention call is not the plain one the fold serves ({reason})"
             )
-        fold_op = _fold.full_attention_prep_fold_multi if call.requests > 1 else _fold.full_attention_prep_fold
+        fold_op = (
+            _fold.full_attention_prep_fold_multi
+            if call.requests > 1
+            else _fold.full_attention_prep_fold
+        )
         part_o, part_lse = fold_op(
             call.qkv,
             call.eps,
@@ -534,7 +536,14 @@ class FullAttnSplitKvFoldAttention:
             dtype=torch.bfloat16,
             device=call.qkv.device,
         )
-        self._split_kv_pending = (part_o, part_lse, rows, out.data_ptr(), call.seq_lens, call.requests)
+        self._split_kv_pending = (
+            part_o,
+            part_lse,
+            rows,
+            out.data_ptr(),
+            call.seq_lens,
+            call.requests,
+        )
         self._prep_fold_record(FOLD)
         if self._split_kv_census is not None:
             self._split_kv_census.record(self.layer_idx, _split_kv.V4)

@@ -90,7 +90,9 @@ def band(sm: int, tp_size: int) -> Tuple[int, int]:
     value = os.environ.get(TP8_MAX_ROWS_ENV, "").strip() if tp_size == 8 else ""
     if value:
         if not value.isdigit() or not first <= int(value) <= last:
-            raise ValueError(f"{TP8_MAX_ROWS_ENV} must be an integer in {first}..{last}, got {value!r}")
+            raise ValueError(
+                f"{TP8_MAX_ROWS_ENV} must be an integer in {first}..{last}, got {value!r}"
+            )
         last = int(value)
     return first, last
 

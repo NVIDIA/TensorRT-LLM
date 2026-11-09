@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E501
 """The MoE router logits as each rank's expert columns plus a multicast all-gather, in one kernel (TP16, TP8).
 
 Moved into this target from ``tensorrt_llm/_torch/models/musespark_open_tep16_router_push.py``. Its one caller,
@@ -69,13 +70,12 @@ mapping; the TEP16 switches keep arming TP16 only.
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
 import ctypes
-import os
 from typing import Dict, Optional, Tuple
 
 import torch
+
+from ...sm107_defaults import env as _sm107_env
 
 EXPERTS = 256
 HIDDEN = 8192
@@ -102,6 +102,8 @@ def _world_rows(world: int):
     if world == 8:
         return TEP8_MIN_ROWS, min(TEP8_MAX_ROWS, MAX_ROWS), TEP8_CLUSTER
     return MIN_ROWS, MAX_ROWS, CLUSTER
+
+
 BUFFERS = 2
 THREADS = 256
 SENTINEL_I32 = -1
@@ -125,8 +127,9 @@ def _world_armed(world) -> bool:
 
 def route_armed() -> bool:
     """Step A: the push also writes the routing method's selection and weights."""
-    return (_tep16_armed() and _sm107_env("MUSESPARK_OPEN_TEP16_ROUTER_PUSH_ROUTE", "0") == "1") or (
-        _tep8_armed() and _sm107_env("MUSESPARK_OPEN_TEP8_ROUTER_PUSH_ROUTE", "0") == "1")
+    return (
+        _tep16_armed() and _sm107_env("MUSESPARK_OPEN_TEP16_ROUTER_PUSH_ROUTE", "0") == "1"
+    ) or (_tep8_armed() and _sm107_env("MUSESPARK_OPEN_TEP8_ROUTER_PUSH_ROUTE", "0") == "1")
 
 
 def gather_bytes(max_rows: int = MAX_ROWS) -> int:
@@ -629,8 +632,17 @@ class Kernel:
     """One compiled build of ``tp_router_push`` on one device: ``tpl`` threads per logit (4, 2 or 1; every build
     computes the same bits), its resources and its resident-cluster capacity."""
 
-    def __init__(self, device_index: int, world: int, cluster: int = CLUSTER, tpl: int = 4,
-                 max_rows: int = MAX_ROWS, extra: Tuple[str, ...] = (), timing: bool = False, route: bool = False):
+    def __init__(
+        self,
+        device_index: int,
+        world: int,
+        cluster: int = CLUSTER,
+        tpl: int = 4,
+        max_rows: int = MAX_ROWS,
+        extra: Tuple[str, ...] = (),
+        timing: bool = False,
+        route: bool = False,
+    ):
         from cuda.bindings import driver as cu
         from cuda.bindings import nvrtc
 
@@ -638,17 +650,27 @@ class Kernel:
         self.route = bool(route)
         major, minor = torch.cuda.get_device_capability(device_index)
         prog = _chk(nvrtc.nvrtcCreateProgram(SRC.encode(), b"tp_router_push.cu", 0, [], []))
-        opts = [f"--gpu-architecture=sm_{major}{minor}".encode(), b"-std=c++17", b"-default-device",
-                f"-DWORLD={int(world)}".encode(), f"-DCL={int(cluster)}".encode(),
-                f"-DMAX_ROWS={int(max_rows)}".encode(), f"-DTIMING={int(bool(timing))}".encode()] + \
-            ([b"-DROUTE=1", f"-DROUTE_ROW_MAX={ROUTE_ROW_MAX}".encode()] if self.route else []) + \
-            [e.encode() for e in extra]
+        opts = (
+            [
+                f"--gpu-architecture=sm_{major}{minor}".encode(),
+                b"-std=c++17",
+                b"-default-device",
+                f"-DWORLD={int(world)}".encode(),
+                f"-DCL={int(cluster)}".encode(),
+                f"-DMAX_ROWS={int(max_rows)}".encode(),
+                f"-DTIMING={int(bool(timing))}".encode(),
+            ]
+            + ([b"-DROUTE=1", f"-DROUTE_ROW_MAX={ROUTE_ROW_MAX}".encode()] if self.route else [])
+            + [e.encode() for e in extra]
+        )
         r = nvrtc.nvrtcCompileProgram(prog, len(opts), opts)
         if int(r[0]) != 0:
             n = _chk(nvrtc.nvrtcGetProgramLogSize(prog))
             log = b" " * n
             nvrtc.nvrtcGetProgramLog(prog, log)
-            raise RuntimeError("tp_router_push NVRTC compile failed:\n" + log.decode(errors="replace"))
+            raise RuntimeError(
+                "tp_router_push NVRTC compile failed:\n" + log.decode(errors="replace")
+            )
         n = _chk(nvrtc.nvrtcGetCUBINSize(prog))
         self.cubin = b" " * n
         _chk(nvrtc.nvrtcGetCUBIN(prog, self.cubin))
@@ -663,15 +685,33 @@ class Kernel:
             self.fn = _chk(cu.cuModuleGetFunction(self.module, b"tp_router_push"))
             attr = cu.CUfunction_attribute
             if cluster > 8:
-                _chk((cu.cuFuncSetAttribute(self.fn, attr.CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1)[0],
-                      None))
-            _chk((cu.cuFuncSetAttribute(self.fn, attr.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                        self.dyn_smem)[0], None))
+                _chk(
+                    (
+                        cu.cuFuncSetAttribute(
+                            self.fn, attr.CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1
+                        )[0],
+                        None,
+                    )
+                )
+            _chk(
+                (
+                    cu.cuFuncSetAttribute(
+                        self.fn, attr.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, self.dyn_smem
+                    )[0],
+                    None,
+                )
+            )
             self.regs = int(_chk(cu.cuFuncGetAttribute(attr.CU_FUNC_ATTRIBUTE_NUM_REGS, self.fn)))
-            self.local_bytes = int(_chk(cu.cuFuncGetAttribute(attr.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, self.fn)))
-            self.smem = int(_chk(cu.cuFuncGetAttribute(attr.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, self.fn))) + \
-                self.dyn_smem
-            cfg = self._make_config(cluster, cu.CUstream(torch.cuda.current_stream().cuda_stream), False)
+            self.local_bytes = int(
+                _chk(cu.cuFuncGetAttribute(attr.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, self.fn))
+            )
+            self.smem = (
+                int(_chk(cu.cuFuncGetAttribute(attr.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, self.fn)))
+                + self.dyn_smem
+            )
+            cfg = self._make_config(
+                cluster, cu.CUstream(torch.cuda.current_stream().cuda_stream), False
+            )
             self.max_clusters = int(_chk(cu.cuOccupancyMaxActiveClusters(self.fn, cfg)))
         self._cfg: Dict[Tuple[int, int, bool], object] = {}
 
@@ -702,11 +742,26 @@ class Kernel:
         cfg.numAttrs = len(attrs)
         return cfg
 
-    def launch(self, rows: int, x: int, w: int, scale: float, out: int, rbcnt: int, gather: int, gather_mc: int,
-               rank: int, stream: int, pdl: bool = True, timing: int = 0,
-               route: Optional[Tuple[int, float, int, int]] = None):
+    def launch(
+        self,
+        rows: int,
+        x: int,
+        w: int,
+        scale: float,
+        out: int,
+        rbcnt: int,
+        gather: int,
+        gather_mc: int,
+        rank: int,
+        stream: int,
+        pdl: bool = True,
+        timing: int = 0,
+        route: Optional[Tuple[int, float, int, int]] = None,
+    ):
         assert self.fits(rows), (rows, self.clusters(rows), self.max_clusters)
-        assert (route is not None) == self.route, "a ROUTE build takes (bias, eps, selected, weights), others none"
+        assert (route is not None) == self.route, (
+            "a ROUTE build takes (bias, eps, selected, weights), others none"
+        )
         grid = self.clusters(rows) * self.cluster
         key = (grid, stream, pdl)
         cfg = self._cfg.get(key)
@@ -734,9 +789,14 @@ class RouteLab:
         self.cu = cu
         major, minor = torch.cuda.get_device_capability(device_index)
         prog = _chk(nvrtc.nvrtcCreateProgram(SRC.encode(), b"route_lab.cu", 0, [], []))
-        opts = [f"--gpu-architecture=sm_{major}{minor}".encode(), b"-std=c++17", b"-default-device",
-                b"-DWORLD=16", b"-DROUTE=1", b"-DROUTE_LAB=1"] + \
-            [f"-DTREE_S{i}={int(s)}".encode() for i, s in enumerate(tree)]
+        opts = [
+            f"--gpu-architecture=sm_{major}{minor}".encode(),
+            b"-std=c++17",
+            b"-default-device",
+            b"-DWORLD=16",
+            b"-DROUTE=1",
+            b"-DROUTE_LAB=1",
+        ] + [f"-DTREE_S{i}={int(s)}".encode() for i, s in enumerate(tree)]
         r = nvrtc.nvrtcCompileProgram(prog, len(opts), opts)
         if int(r[0]) != 0:
             n = _chk(nvrtc.nvrtcGetProgramLogSize(prog))
@@ -750,13 +810,22 @@ class RouteLab:
             self.module = _chk(cu.cuModuleLoadData(self.cubin))
             self.fn = _chk(cu.cuModuleGetFunction(self.module, b"route_lab"))
 
-    def __call__(self, logits: torch.Tensor, bias: torch.Tensor, eps: float,
-                 out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        bias: torch.Tensor,
+        eps: float,
+        out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         rows = logits.shape[0]
-        assert logits.dtype == torch.float32 and logits.is_contiguous() and logits.shape[1] == EXPERTS
+        assert (
+            logits.dtype == torch.float32 and logits.is_contiguous() and logits.shape[1] == EXPERTS
+        )
         if out is None:
-            out = (torch.full((rows, TOP_K), -1, dtype=torch.int32, device=logits.device),
-                   torch.full((rows, TOP_K), float("nan"), dtype=torch.float32, device=logits.device))
+            out = (
+                torch.full((rows, TOP_K), -1, dtype=torch.int32, device=logits.device),
+                torch.full((rows, TOP_K), float("nan"), dtype=torch.float32, device=logits.device),
+            )
         sel, wts = out
         cu = self.cu
         cfg = cu.CUlaunchConfig()
@@ -767,8 +836,17 @@ class RouteLab:
         cfg.attrs = []
         cfg.numAttrs = 0
         vp, fl, ii = ctypes.c_void_p, ctypes.c_float, ctypes.c_int
-        args = ((logits.data_ptr(), bias.data_ptr(), float(eps), sel.data_ptr(), wts.data_ptr(), int(rows)),
-                (vp, vp, fl, vp, vp, ii))
+        args = (
+            (
+                logits.data_ptr(),
+                bias.data_ptr(),
+                float(eps),
+                sel.data_ptr(),
+                wts.data_ptr(),
+                int(rows),
+            ),
+            (vp, vp, fl, vp, vp, ii),
+        )
         _chk((cu.cuLaunchKernelEx(cfg, self.fn, args, 0)[0], None))
         return sel, wts
 
@@ -778,8 +856,17 @@ class RouterPush:
 
     TPLS = (8,)  # one build: 8 K parts per CTA, 4 x 2 logits per thread
 
-    def __init__(self, world: int, rank: int, device: torch.device, uc_ptr: int, mc_ptr: int, keepalive=None,
-                 cluster: int = CLUSTER, tpls: Tuple[int, ...] = TPLS):
+    def __init__(
+        self,
+        world: int,
+        rank: int,
+        device: torch.device,
+        uc_ptr: int,
+        mc_ptr: int,
+        keepalive=None,
+        cluster: int = CLUSTER,
+        tpls: Tuple[int, ...] = TPLS,
+    ):
         self.world, self.rank, self.device = world, rank, device
         self.gather, self.gather_mc = int(uc_ptr), int(mc_ptr)
         self.kernels = [Kernel(device.index, world, cluster, tpl) for tpl in tpls]
@@ -793,13 +880,20 @@ class RouterPush:
 
     def route_build(self) -> Kernel:
         if self.route_kernel is None:
-            self.route_kernel = Kernel(self.device.index, self.world, self.cluster, self.kernel.tpl, route=True)
+            self.route_kernel = Kernel(
+                self.device.index, self.world, self.cluster, self.kernel.tpl, route=True
+            )
         return self.route_kernel
 
     @classmethod
-    def from_mapping(cls, mapping, device: torch.device, cluster: int = CLUSTER, tpls: Tuple[int, ...] = TPLS) -> "RouterPush":
+    def from_mapping(
+        cls, mapping, device: torch.device, cluster: int = CLUSTER, tpls: Tuple[int, ...] = TPLS
+    ) -> "RouterPush":
         """Collective over the TP group: the gather buffer (fabric handles), filled with the sentinel."""
-        from tensorrt_llm._torch.distributed.ops import _get_mnnvl_workspace_comm, _make_mnnvl_mcast_buffer
+        from tensorrt_llm._torch.distributed.ops import (
+            _get_mnnvl_workspace_comm,
+            _make_mnnvl_mcast_buffer,
+        )
 
         world, rank = mapping.tp_size, mapping.tp_rank
         size = gather_bytes()
@@ -809,8 +903,16 @@ class RouterPush:
         uc = handle.get_uc_buffer(rank, (words,), torch.int32, 0)
         mc = handle.get_mc_buffer((words,), torch.int32, 0)
         uc.fill_(SENTINEL_I32)
-        push = cls(world, rank, device, uc.data_ptr(), mc.data_ptr(), keepalive=(handle, uc, mc), cluster=cluster,
-                   tpls=tpls)
+        push = cls(
+            world,
+            rank,
+            device,
+            uc.data_ptr(),
+            mc.data_ptr(),
+            keepalive=(handle, uc, mc),
+            cluster=cluster,
+            tpls=tpls,
+        )
         push.local_words = uc
         torch.cuda.synchronize(device)
         comm.Barrier()
@@ -823,9 +925,17 @@ class RouterPush:
                 return k
         return None
 
-    def __call__(self, x: torch.Tensor, weight: torch.Tensor, scale: float, out: Optional[torch.Tensor] = None,
-                 pdl: bool = True, timing: Optional[torch.Tensor] = None, tpl: Optional[int] = None,
-                 route: Optional[Tuple[torch.Tensor, float, torch.Tensor, torch.Tensor]] = None) -> torch.Tensor:
+    def __call__(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        scale: float,
+        out: Optional[torch.Tensor] = None,
+        pdl: bool = True,
+        timing: Optional[torch.Tensor] = None,
+        tpl: Optional[int] = None,
+        route: Optional[Tuple[torch.Tensor, float, torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
         """``route`` (step A): ``(bias [256] FP32, eps, selected [rows, 8] int32, weights [rows, 8] FP32)``; the
         kernel then also writes ``selected`` and ``weights`` as ``_full_routing_kernel`` would."""
         rows = x.shape[0]
@@ -836,7 +946,9 @@ class RouterPush:
             bias, eps, sel, wts = route
             k = self.route_build()
             if not k.fits(rows):
-                raise RuntimeError(f"tp_router_push: the routed build does not keep {rows} rows resident")
+                raise RuntimeError(
+                    f"tp_router_push: the routed build does not keep {rows} rows resident"
+                )
             rargs = (bias.data_ptr(), float(eps), sel.data_ptr(), wts.data_ptr())
         else:
             k = self.build_for(rows, tpl)
@@ -844,11 +956,25 @@ class RouterPush:
                 raise RuntimeError(f"tp_router_push: no build keeps {rows} rows resident")
             if timing is not None:
                 if k.tpl not in self._timed:
-                    self._timed[k.tpl] = Kernel(self.device.index, self.world, k.cluster, k.tpl, timing=True)
+                    self._timed[k.tpl] = Kernel(
+                        self.device.index, self.world, k.cluster, k.tpl, timing=True
+                    )
                 k = self._timed[k.tpl]
-        k.launch(rows, x.data_ptr(), weight.data_ptr(), scale, out.data_ptr(), self.rbcnt.data_ptr(),
-                 self.gather, self.gather_mc, self.rank, torch.cuda.current_stream(x.device).cuda_stream,
-                 pdl=pdl, timing=0 if timing is None else timing.data_ptr(), route=rargs)
+        k.launch(
+            rows,
+            x.data_ptr(),
+            weight.data_ptr(),
+            scale,
+            out.data_ptr(),
+            self.rbcnt.data_ptr(),
+            self.gather,
+            self.gather_mc,
+            self.rank,
+            torch.cuda.current_stream(x.device).cuda_stream,
+            pdl=pdl,
+            timing=0 if timing is None else timing.data_ptr(),
+            route=rargs,
+        )
         return out
 
 
@@ -859,7 +985,11 @@ def route_eligible(routing, rows: int) -> bool:
     """Whether ``routing.apply`` on this call's logits (FP32, contiguous, ``[rows, 256]``) would run
     ``_full_routing_kernel`` with ``TORCH_ORDER`` off and memoize its result: the same conditions, read from the
     routing method (rank-uniform). Anything else keeps the routing method's own computation."""
-    if routing is None or not getattr(routing, "_memo_enabled", False) or not hasattr(routing, "_routing_memo"):
+    if (
+        routing is None
+        or not getattr(routing, "_memo_enabled", False)
+        or not hasattr(routing, "_routing_memo")
+    ):
         return False
     bias = getattr(routing, "e_score_correction_bias", None)
     return (
@@ -943,9 +1073,18 @@ def logits_routed(mapping, x: torch.Tensor, weight: torch.Tensor, scale: float, 
         return None
     rows = x.shape[0]
     capturing = torch.cuda.is_current_stream_capturing()
-    if route_eligible(routing, rows) and not (capturing and push.route_kernel is None) and push.route_build().fits(rows):
+    if (
+        route_eligible(routing, rows)
+        and not (capturing and push.route_kernel is None)
+        and push.route_build().fits(rows)
+    ):
         sel = torch.empty((rows, TOP_K), dtype=torch.int32, device=x.device)
         wts = torch.empty((rows, TOP_K), dtype=torch.float32, device=x.device)
-        out = push(x, weight, scale, route=(routing.e_score_correction_bias, float(routing.renorm_eps), sel, wts))
+        out = push(
+            x,
+            weight,
+            scale,
+            route=(routing.e_score_correction_bias, float(routing.renorm_eps), sel, wts),
+        )
         return out, sel, wts
     return push(x, weight, scale), None, None

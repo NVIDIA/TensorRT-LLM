@@ -117,7 +117,9 @@ def install(model: MuseSparkOpenModel, router_rows: bool = False, direct: bool =
     # TP8 (wide pool inbox): the pool side only. The unpool of 9..32-row calls stays replicated with the built-in
     # boundary, so only the pool's slices are handed on ungathered up to WIDE_MAX_ROWS rows.
     unpool_inbox = (
-        ProjectionInbox(mapping, row_words=_unpool.local_columns(world) // 2, max_rows=WIDE_MAX_ROWS)
+        ProjectionInbox(
+            mapping, row_words=_unpool.local_columns(world) // 2, max_rows=WIDE_MAX_ROWS
+        )
         if world == WORLD
         else None
     )

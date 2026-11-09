@@ -22,7 +22,15 @@ MOD = (
 
 @pytest.mark.parametrize(
     "value, expected",
-    [(None, False), ("0", False), ("", False), ("1", True), ("true", True), ("ON", True), ("no", False)],
+    [
+        (None, False),
+        ("0", False),
+        ("", False),
+        ("1", True),
+        ("true", True),
+        ("ON", True),
+        ("no", False),
+    ],
 )
 def test_switch_parse(monkeypatch, value, expected):
     pp = importlib.import_module(MOD)
@@ -60,10 +68,24 @@ def _launch(pp, kernel, qkv, cos_sin, positions, heads, kv_heads, permuted):
     qkv_out = torch.empty(rows, (heads + 2 * kv_heads) * 64, dtype=qkv.dtype, device=qkv.device)
     gate_out = torch.empty(rows, heads * 64, dtype=qkv.dtype, device=qkv.device)
     kernel[(-(-rows // pp.ROW_BLOCK), heads + kv_heads)](
-        qkv, qkv_out, gate_out, cos_sin, positions, rows, qkv.stride(0), qkv_out.stride(0),
-        gate_out.stride(0), 1e-5, pp.CKPT_Q_SCALE, NUM_Q_HEADS=heads, NUM_KV_HEADS=kv_heads,
-        QKV_PERMUTED=permuted, APPLY_ROPE=cos_sin is not None, LAUNCH_WITH_PDL=False,
-        BLOCK=pp.ROW_BLOCK, num_warps=4,
+        qkv,
+        qkv_out,
+        gate_out,
+        cos_sin,
+        positions,
+        rows,
+        qkv.stride(0),
+        qkv_out.stride(0),
+        gate_out.stride(0),
+        1e-5,
+        pp.CKPT_Q_SCALE,
+        NUM_Q_HEADS=heads,
+        NUM_KV_HEADS=kv_heads,
+        QKV_PERMUTED=permuted,
+        APPLY_ROPE=cos_sin is not None,
+        LAUNCH_WITH_PDL=False,
+        BLOCK=pp.ROW_BLOCK,
+        num_warps=4,
     )
     return qkv_out, gate_out
 
@@ -84,9 +106,12 @@ def test_vec_bitwise(rows, rope, permuted, heads, kv_heads, special):
         ang = torch.arange(1 << 20, dtype=torch.float64)[:, None] * inv[None]
         cos_sin = torch.stack([ang.cos(), ang.sin()], 1).float().contiguous().cuda()
         positions = torch.randint(0, 1 << 20, (rows,), generator=gen, dtype=torch.int32).cuda()
-    ref = _launch(pp, pp._preattn_prep_rows_kernel, qkv, cos_sin, positions, heads, kv_heads, permuted)
-    got = _launch(pp, pp._preattn_prep_rows_vec_kernel, qkv, cos_sin, positions, heads, kv_heads,
-                  permuted)
+    ref = _launch(
+        pp, pp._preattn_prep_rows_kernel, qkv, cos_sin, positions, heads, kv_heads, permuted
+    )
+    got = _launch(
+        pp, pp._preattn_prep_rows_vec_kernel, qkv, cos_sin, positions, heads, kv_heads, permuted
+    )
     for r, g, name in zip(ref, got, ("qkv_out", "gate_out")):
         diff = (_bits(r) != _bits(g)).sum().item()
         assert diff == 0, f"{name}: {diff} elements differ"

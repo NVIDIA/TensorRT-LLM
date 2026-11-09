@@ -2868,9 +2868,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     ):
         """SwiGLU in TRTLLM-gen's gated-activation GEMM arithmetic (fp32, in this order)::
 
-            k = log2(e) * scale_gate
-            s = rcp(1 + exp2(-(gate[i] * k)))
-            tCompute[i] = (up[i] * scale_gate) * (gate[i] * s)
+        k = log2(e) * scale_gate
+        s = rcp(1 + exp2(-(gate[i] * k)))
+        tCompute[i] = (up[i] * scale_gate) * (gate[i] * s)
         """
         k = cutlass.Float32(1.4426950408889634) * cutlass.Float32(scale_gate)
         for i in cutlass.range_constexpr(0, cute.size(acc_vec_up.shape), 2):

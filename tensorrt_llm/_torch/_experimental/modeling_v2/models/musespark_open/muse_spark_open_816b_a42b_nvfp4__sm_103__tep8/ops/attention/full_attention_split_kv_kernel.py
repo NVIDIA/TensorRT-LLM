@@ -43,11 +43,8 @@ pages. Every one of its threads executes ``griddepcontrol.wait`` before it exits
 fold-only code sits under ``const_expr`` in the shared roles, so the op's build is unchanged.
 """
 
-from ...sm107_defaults import env as _sm107_env
-
 import copy
 import math
-import os
 
 import cutlass
 import cutlass.cute as cute
@@ -59,6 +56,8 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.common import OperandMajorMode
 from cutlass.cute.typing import Float32, Int32
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+from ...sm107_defaults import env as _sm107_env
 
 F8 = cutlass.Float8E4M3FN
 BF16 = cutlass.BFloat16

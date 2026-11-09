@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E402
 """Blackwell low-M BF16/FP16 GEMM with an in-kernel cluster split-K reduction.
 
 Each cluster rank accumulates an exact K slice in FP32. Peers publish partials
@@ -26,13 +27,11 @@ flashinfer's module path resolve here for the built-in low-M dispatcher, as the 
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
 import dataclasses
 import functools
 import hashlib
-import os
 import sys
+
 import cuda.bindings.driver as _cuda
 import cutlass
 import cutlass.cute as cute
@@ -45,6 +44,7 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from ...sm107_defaults import env as _sm107_env
 
 #: Per-CTA SMEM capacity reported by CuTeDSL on SM100/SM103.
 _SMEM_CAPACITY_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
@@ -102,7 +102,9 @@ def _install_oversized_mode() -> None:
                 result = _cuda.cuKernelSetAttribute(mode_attr, mode, kernel, device)
             err = result[0] if isinstance(result, tuple) else result
             if int(err) != 0:
-                raise RuntimeError(f"split-K oversized shared memory: CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE failed ({err})")
+                raise RuntimeError(
+                    f"split-K oversized shared memory: CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE failed ({err})"
+                )
             return None
         return original(kernel, attribute, value, device)
 
@@ -114,10 +116,14 @@ if _sm107_env(OVERSIZED_SMEM_ENV, "0") == "1":
     _SMEM_CAPACITY_BYTES = _oversized_capacity()
     if _SMEM_CAPACITY_BYTES > _OPTIN_SMEM_BYTES:
         _install_oversized_mode()
-    _OVERSIZED_TAG = "sol35" if _sm107_env("MUSESPARK_OPEN_TEP8_WIDE64_SPLITK", "0") == "1" else "sol38"
+    _OVERSIZED_TAG = (
+        "sol35" if _sm107_env("MUSESPARK_OPEN_TEP8_WIDE64_SPLITK", "0") == "1" else "sol38"
+    )
     print(
-        f"[musespark_open] dense_bf16_gemm_sm100_splitk: {OVERSIZED_SMEM_ENV}=1 ({_OVERSIZED_TAG}): split-K tactics may use "
-        f"{_SMEM_CAPACITY_BYTES} B of shared memory per CTA (opt-in {_OPTIN_SMEM_BYTES} B); deeper tactics launch in the "
+        f"[musespark_open] dense_bf16_gemm_sm100_splitk: {OVERSIZED_SMEM_ENV}=1 ({_OVERSIZED_TAG}): "
+        "split-K tactics may use "
+        f"{_SMEM_CAPACITY_BYTES} B of shared memory per CTA (opt-in {_OPTIN_SMEM_BYTES} B); "
+        "deeper tactics launch in the "
         "oversized shared-memory mode",
         flush=True,
     )
@@ -148,6 +154,7 @@ def _rs_only_allows(split_k: int) -> bool:
     """Whether MUSESPARK_OPEN_SPLITK_RS_ONLY (unset: every size) lets ``split_k`` take the reduce-scatter."""
     only = _sm107_env("MUSESPARK_OPEN_SPLITK_RS_ONLY", "")
     return not only or split_k in {int(v) for v in only.split(",") if v.strip()}
+
 
 #: Largest public M this low-M policy serves.
 _MAX_M = 32
@@ -219,8 +226,7 @@ def _smem_bytes(
         mailbox_bytes //= tactic.split_k
     return (
         _align_up(
-            _align_up(cursor, _MAILBOX_ALIGN_BYTES)
-            + mailbox_bytes,
+            _align_up(cursor, _MAILBOX_ALIGN_BYTES) + mailbox_bytes,
             _MBARRIER_BYTES,
         )
         + _MBARRIER_BYTES
@@ -260,8 +266,7 @@ def validate_tactic(
         raise ValueError(f"unsupported split_k={tactic.split_k}")
     if not _MIN_AB_STAGES <= tactic.ab_stages <= _MAX_AB_STAGES:
         raise ValueError(
-            f"ab_stages must be in [{_MIN_AB_STAGES}, {_MAX_AB_STAGES}], "
-            f"got {tactic.ab_stages}"
+            f"ab_stages must be in [{_MIN_AB_STAGES}, {_MAX_AB_STAGES}], got {tactic.ab_stages}"
         )
     max_m = _WIDE64_MAX_M if _wide64_enabled() else _MAX_M
     if not 1 <= m <= max_m:
@@ -270,8 +275,7 @@ def validate_tactic(
         raise ValueError(f"N must be positive, got {n}")
     if k <= 0 or k % _CTA_K or (k // _CTA_K) % tactic.split_k:
         raise ValueError(
-            f"K={k} with CTA_K={_CTA_K} does not divide evenly across "
-            f"split_k={tactic.split_k}"
+            f"K={k} with CTA_K={_CTA_K} does not divide evenly across split_k={tactic.split_k}"
         )
     smem_bytes = _smem_bytes(tactic, tactic.ab_stages)
     if smem_bytes > smem_capacity:
@@ -413,16 +417,12 @@ def _store_shared_remote_v4(
     llvm.inline_asm(
         None,
         [
-            _map_shared_rank(
-                smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
-            ).ir_value(),
+            _map_shared_rank(smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value(),
             value0.bitcast(Int32).ir_value(loc=loc, ip=ip),
             value1.bitcast(Int32).ir_value(loc=loc, ip=ip),
             value2.bitcast(Int32).ir_value(loc=loc, ip=ip),
             value3.bitcast(Int32).ir_value(loc=loc, ip=ip),
-            _map_shared_rank(
-                mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
-            ).ir_value(),
+            _map_shared_rank(mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value(),
         ],
         "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 "
         "[$0], {$1, $2, $3, $4}, [$5];",
@@ -483,15 +483,15 @@ class SplitKDenseGemmKernel:
                 f"{values_per_thread} "
                 "values per epilogue thread; remote stores require a multiple of 4"
             )
-        self.mailbox_elements = (
-            (tactic.split_k - 1) * self.epilog_threads * values_per_thread
-        )
+        self.mailbox_elements = (tactic.split_k - 1) * self.epilog_threads * values_per_thread
         self.expected_transaction_bytes = self.mailbox_elements * _FP32_BYTES
         if self.rs:
             # Reduce-scatter: epilogue thread group g (epilog_threads / split_k threads) of every CTA belongs
             # to cluster rank g, which receives that group's values from the other split_k - 1 ranks.
             if self.epilog_threads % tactic.split_k:
-                raise ValueError(f"split_k {tactic.split_k} does not divide {self.epilog_threads} epilogue threads")
+                raise ValueError(
+                    f"split_k {tactic.split_k} does not divide {self.epilog_threads} epilogue threads"
+                )
             self.rs_group = self.epilog_threads // tactic.split_k
             self.rs_mailbox_elements = (tactic.split_k - 1) * self.rs_group * values_per_thread
             self.rs_expected_bytes = self.rs_mailbox_elements * _FP32_BYTES
@@ -562,9 +562,7 @@ class SplitKDenseGemmKernel:
             alignment=_AB_BUFFER_ALIGN_BYTES,
         )
 
-        acc_layout = cute_ext.make_tmem_layout_acc(
-            tiled_mma, self.mma_tiler_mn, acc_stage=1
-        )
+        acc_layout = cute_ext.make_tmem_layout_acc(tiled_mma, self.mma_tiler_mn, acc_stage=1)
         c_tiler_mn = (self.cta_m, self.cta_n)
 
         bar_full = cute_ext.allocate(
@@ -936,9 +934,13 @@ class SplitKDenseGemmKernel:
                     acc = own
                     for r in cutlass.range_constexpr(self.split_k):
                         # rank r's partial: this CTA's own, or its slot in the mailbox (clamped when unused)
-                        jr = cutlass.min(Int32(r) - cutlass.select_(Int32(r) > split_rank, Int32(1), Int32(0)),
-                                         Int32(self.split_k - 2))
-                        term = cutlass.select_(Int32(r) == split_rank, own, mailbox[jr * group_values + slot])
+                        jr = cutlass.min(
+                            Int32(r) - cutlass.select_(Int32(r) > split_rank, Int32(1), Int32(0)),
+                            Int32(self.split_k - 2),
+                        )
+                        term = cutlass.select_(
+                            Int32(r) == split_rank, own, mailbox[jr * group_values + slot]
+                        )
                         if cutlass.const_expr(r == 0):
                             acc = term
                         else:
@@ -956,9 +958,7 @@ class SplitKDenseGemmKernel:
                 (self.split_k - 1) * self.epilog_threads
             )
             values_per_thread = cutlass.const_expr(cute.size(rmem_layout))
-            values_per_peer = cutlass.const_expr(
-                self.epilog_threads * values_per_thread
-            )
+            values_per_peer = cutlass.const_expr(self.epilog_threads * values_per_thread)
             if split_rank != OWNER_RANK:
                 for value_idx in cutlass.range_constexpr(0, values_per_thread, 4):
                     if cutlass.const_expr(self.mailbox_v4):
@@ -971,9 +971,7 @@ class SplitKDenseGemmKernel:
                         rAcc[value_idx + 1],
                         rAcc[value_idx + 2],
                         rAcc[value_idx + 3],
-                        mailbox.iterator
-                        + (split_rank - Int32(1)) * values_per_peer
-                        + slot,
+                        mailbox.iterator + (split_rank - Int32(1)) * values_per_peer + slot,
                         bar_reduce,
                         Int32(OWNER_RANK),
                     )
@@ -1066,9 +1064,7 @@ def _detect_leading_dim(tensor: _torch.Tensor) -> int:
 def _make_layout_tensor(
     shape: tuple[int, ...], dtype: _torch.dtype, leading_dim: int
 ) -> _torch.Tensor:
-    permutation = [dim for dim in range(len(shape)) if dim != leading_dim] + [
-        leading_dim
-    ]
+    permutation = [dim for dim in range(len(shape)) if dim != leading_dim] + [leading_dim]
     return _torch.empty(
         tuple(shape[dim] for dim in permutation), dtype=dtype, device="cuda"
     ).permute([permutation.index(dim) for dim in range(len(shape))])
@@ -1083,9 +1079,7 @@ def _make_compile_repr_tensors(
 ):
     m, n, k, batch = 64, 8, _CTA_K, 1
     tensors = tuple(
-        _from_dlpack_dynamic(
-            _make_layout_tensor(shape, dtype, leading_dim), leading_dim
-        )
+        _from_dlpack_dynamic(_make_layout_tensor(shape, dtype, leading_dim), leading_dim)
         for shape, leading_dim in (
             ((batch, n, k), a_leading),
             ((batch, k, m), b_leading),
@@ -1110,23 +1104,17 @@ def _to_cute_swap(a, b, out, bias):
     a_swap = b.unsqueeze(0).transpose(-2, -1)
     b_swap = a.unsqueeze(0).transpose(-2, -1)
     c_swap = out.unsqueeze(0).transpose(-2, -1)
-    leading_dims = tuple(
-        _detect_leading_dim(tensor) for tensor in (a_swap, b_swap, c_swap)
-    )
+    leading_dims = tuple(_detect_leading_dim(tensor) for tensor in (a_swap, b_swap, c_swap))
     cute_tensors = tuple(
         _from_dlpack_dynamic(tensor, leading_dim)
-        for tensor, leading_dim in zip(
-            (a_swap, b_swap, c_swap), leading_dims, strict=True
-        )
+        for tensor, leading_dim in zip((a_swap, b_swap, c_swap), leading_dims, strict=True)
     )
     if bias is None:
         return (*cute_tensors, None, leading_dims)
     return (
         *cute_tensors,
         _from_dlpack_dynamic(
-            bias.as_strided(
-                size=(1, c_swap.shape[1], c_swap.shape[2]), stride=(0, 1, 0)
-            ),
+            bias.as_strided(size=(1, c_swap.shape[1], c_swap.shape[2]), stride=(0, 1, 0)),
             1,
             2,
         ),
@@ -1145,9 +1133,7 @@ def _get_compiled_splitk_kernel(
     rs: bool = False,
 ):
     if dtype not in _SUPPORTED_TORCH_DTYPES:
-        raise ValueError(
-            f"split-K dense GEMM supports {_SUPPORTED_TORCH_DTYPES}; got {dtype}"
-        )
+        raise ValueError(f"split-K dense GEMM supports {_SUPPORTED_TORCH_DTYPES}; got {dtype}")
 
     kernel = SplitKDenseGemmKernel(
         tactic=tactic,
@@ -1163,6 +1149,8 @@ def _get_compiled_splitk_kernel(
     else:
         compiled = cute_ext.compile(_bmm_no_bias, kernel, *compile_tensors[:3], stream)
     return compiled
+
+
 # ---- device code end
 
 
@@ -1174,31 +1162,20 @@ def _validate_runtime_tensors(a, b, bias, out) -> tuple[int, int, int]:
         raise ValueError("split-K dense GEMM accepts only 2D tensors")
     if a.device.type != "cuda" or any(tensor.device != a.device for tensor in tensors):
         raise ValueError("all tensors must be on the same CUDA device")
-    if a.dtype not in _SUPPORTED_TORCH_DTYPES or any(
-        tensor.dtype != a.dtype for tensor in tensors
-    ):
+    if a.dtype not in _SUPPORTED_TORCH_DTYPES or any(tensor.dtype != a.dtype for tensor in tensors):
         raise ValueError("a, b, out, and bias must share BF16 or FP16 dtype")
-    if any(
-        not (tensor.is_contiguous() or tensor.t().is_contiguous())
-        for tensor in (a, b, out)
-    ):
-        raise ValueError(
-            "a, b, and out must be dense row-major or column-major matrices"
-        )
+    if any(not (tensor.is_contiguous() or tensor.t().is_contiguous()) for tensor in (a, b, out)):
+        raise ValueError("a, b, and out must be dense row-major or column-major matrices")
     if any(tensor.data_ptr() % 32 for tensor in (a, b, out)):
         raise ValueError("a, b, and out must be 32-byte aligned")
 
     m, k = a.shape
     if b.shape[0] != k:
-        raise ValueError(
-            f"incompatible shapes: a is {tuple(a.shape)}, b is {tuple(b.shape)}"
-        )
+        raise ValueError(f"incompatible shapes: a is {tuple(a.shape)}, b is {tuple(b.shape)}")
     n = b.shape[1]
     if out.shape != (m, n):
         raise ValueError(f"out must have shape {(m, n)}, got {tuple(out.shape)}")
-    if bias is not None and (
-        bias.ndim != 1 or bias.shape[0] != n or not bias.is_contiguous()
-    ):
+    if bias is not None and (bias.ndim != 1 or bias.shape[0] != n or not bias.is_contiguous()):
         raise ValueError(
             f"bias must be contiguous with shape {(n,)}, "
             f"got shape {tuple(bias.shape)} and stride {bias.stride()}"
@@ -1239,8 +1216,11 @@ def _rs_enabled() -> bool:
         _RS_ANNOUNCED.append(True)
         import sys as _sys
 
-        print(f"[musespark_open] dense split-K: {RS_ENV}=1 reduce-scatter epilogue", file=_sys.stderr,
-              flush=True)
+        print(
+            f"[musespark_open] dense split-K: {RS_ENV}=1 reduce-scatter epilogue",
+            file=_sys.stderr,
+            flush=True,
+        )
     return on
 
 
@@ -1266,8 +1246,12 @@ def _rs_for(split_k: int) -> bool:
         _RS_ONLY_ANNOUNCED.append(True)
         import sys as _sys
 
-        print(f"[musespark_open] dense split-K: {RS_ONLY_ENV}={only} reduce-scatter epilogue only at split-K "
-              f"{sorted(sizes)}", file=_sys.stderr, flush=True)
+        print(
+            f"[musespark_open] dense split-K: {RS_ONLY_ENV}={only} reduce-scatter epilogue only at split-K "
+            f"{sorted(sizes)}",
+            file=_sys.stderr,
+            flush=True,
+        )
     return split_k in sizes
 
 
@@ -1331,7 +1315,9 @@ def _device_code_md5() -> str | None:
     try:
         with open(__file__, encoding="utf-8") as f:
             lines = f.read().splitlines()
-        begin = next(i for i, line in enumerate(lines) if line.startswith("# ---- device code begin"))
+        begin = next(
+            i for i, line in enumerate(lines) if line.startswith("# ---- device code begin")
+        )
         end = next(i for i, line in enumerate(lines) if line.startswith("# ---- device code end"))
     except (OSError, StopIteration):
         return None

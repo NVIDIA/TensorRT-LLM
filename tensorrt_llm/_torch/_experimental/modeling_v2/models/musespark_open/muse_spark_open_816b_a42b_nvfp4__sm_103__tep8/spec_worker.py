@@ -78,9 +78,6 @@ built-in, and why.
 
 from __future__ import annotations
 
-from .sm107_defaults import env as _sm107_env
-
-import os
 import types
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -106,6 +103,7 @@ from .ops.spec.dflash_accept import (
     SLOT_STRIDE,
     dflash_accept,
 )
+from .sm107_defaults import env as _sm107_env
 
 #: The sharded ``fc`` path's row bound at TP8, where the fabric projection
 #: gather serves decode steps at batch 1 (K + 1 <= 8 rows); larger calls
@@ -123,7 +121,9 @@ FC_SHARD_MAX_ROWS = 8
 TEP8_FC_SHARD_WIDE_ENV = "MUSESPARK_OPEN_TEP8_FC_SHARD_WIDE"
 _TEP8_FC_SHARD_WIDE = _sm107_env(TEP8_FC_SHARD_WIDE_ENV, "0").strip()
 if _TEP8_FC_SHARD_WIDE not in ("", "0"):
-    FC_SHARD_MAX_ROWS = 64 if _TEP8_FC_SHARD_WIDE == "1" else max(8, min(128, int(_TEP8_FC_SHARD_WIDE)))
+    FC_SHARD_MAX_ROWS = (
+        64 if _TEP8_FC_SHARD_WIDE == "1" else max(8, min(128, int(_TEP8_FC_SHARD_WIDE)))
+    )
 
 #: Opt-in: ``MUSESPARK_OPEN_TEP8_FC_GATHER_PROGRAMS=N`` launches the TP8 fc gather (the built-in
 #: ``_gather_columns`` kernel on the fc's own workspace) with N programs instead of the built-in's 32, so a call of up
@@ -353,7 +353,9 @@ def install_sharded_fc(
         if TEP8_FC_GATHER_PROGRAMS > 0 and TEP8_FC_GATHER_PROGRAMS != gather.programs:
             # Per-program epochs and slots: a fresh counter per program, before the workspace's first call.
             gather.programs = TEP8_FC_GATHER_PROGRAMS
-            gather.counters = torch.zeros(TEP8_FC_GATHER_PROGRAMS, dtype=torch.uint64, device="cuda")
+            gather.counters = torch.zeros(
+                TEP8_FC_GATHER_PROGRAMS, dtype=torch.uint64, device="cuda"
+            )
     elif gather is None:
         gather = AllGatherColumns(mapping)
     draft_model._fc_shard = ShardedFc(

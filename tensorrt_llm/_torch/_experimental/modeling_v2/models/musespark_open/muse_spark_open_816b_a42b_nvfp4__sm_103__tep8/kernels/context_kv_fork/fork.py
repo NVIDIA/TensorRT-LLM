@@ -76,9 +76,6 @@ step before anything reads them.
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
-import os
 import types
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -95,6 +92,7 @@ from tensorrt_llm.logger import logger
 
 from ...ops.spec.context_kv_commit import MAX_REQUESTS, context_kv_commit
 from ...ops.spec.context_kv_commit_windowed import context_kv_commit_windowed
+from ...sm107_defaults import env as _sm107_env
 
 #: Opt-in: ``MUSESPARK_OPEN_CTX_KV_GLUE=1`` runs the side chain's index math and its arena stores as two
 #: Triton launches instead of ~11 torch kernels: the slots / columns / positions of the step's rows and the RoPE's
@@ -113,9 +111,21 @@ try:
     import triton.language as tl
 
     @triton.jit
-    def _glue_prep_kernel(batch_to_slot, ctx_len, ctx_base, slot_out, col_out, pos_out, pos_rep_out, last,
-                          ROWS: tl.constexpr, KP1: tl.constexpr, L: tl.constexpr, WINDOWED: tl.constexpr,
-                          BLOCK: tl.constexpr):
+    def _glue_prep_kernel(
+        batch_to_slot,
+        ctx_len,
+        ctx_base,
+        slot_out,
+        col_out,
+        pos_out,
+        pos_rep_out,
+        last,
+        ROWS: tl.constexpr,
+        KP1: tl.constexpr,
+        L: tl.constexpr,
+        WINDOWED: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
         # one lane per (row, layer); row = gen * (K + 1) + r, as the built-in's reshape(-1) orders them
         idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         live = idx < ROWS * L
@@ -138,8 +148,21 @@ try:
         tl.store(pos_rep_out + idx, pos.to(tl.int32), mask=live)
 
     @triton.jit
-    def _glue_store_kernel(k_src, v_src, k_buf, v_buf, slot_ptr, col_ptr, slot_stride, layer_stride, col_stride,
-                           L: tl.constexpr, WIDTH: tl.constexpr, HAS_V: tl.constexpr, BLOCK: tl.constexpr):
+    def _glue_store_kernel(
+        k_src,
+        v_src,
+        k_buf,
+        v_buf,
+        slot_ptr,
+        col_ptr,
+        slot_stride,
+        layer_stride,
+        col_stride,
+        L: tl.constexpr,
+        WIDTH: tl.constexpr,
+        HAS_V: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
         # one program per (row, layer): its nkv * hd K (and V) values, contiguous at both ends
         pid = tl.program_id(0)
         row = pid // L
@@ -169,8 +192,20 @@ def glue_prep(batch_to_slot, ctx_len, ctx_base, num_gens: int, kp1: int, layers:
     pos_rep = torch.empty(rows * layers, dtype=torch.int32, device=dev)
     block = 256
     _glue_prep_kernel[(triton.cdiv(rows * layers, block),)](
-        batch_to_slot, ctx_len, ctx_base if ctx_base is not None else ctx_len, slot_flat, col_flat, pos_flat,
-        pos_rep, last, ROWS=rows, KP1=kp1, L=layers, WINDOWED=ctx_base is not None, BLOCK=block, num_warps=4,
+        batch_to_slot,
+        ctx_len,
+        ctx_base if ctx_base is not None else ctx_len,
+        slot_flat,
+        col_flat,
+        pos_flat,
+        pos_rep,
+        last,
+        ROWS=rows,
+        KP1=kp1,
+        L=layers,
+        WINDOWED=ctx_base is not None,
+        BLOCK=block,
+        num_warps=4,
     )
     return slot_flat, col_flat, pos_flat, pos_rep
 
@@ -180,9 +215,20 @@ def glue_store(k_new, v_new, k_buf, v_buf, slot_flat, col_flat) -> None:
     rows, layers = k_new.shape[0], k_new.shape[1]
     width = k_new[0, 0].numel()
     _glue_store_kernel[(rows * layers,)](
-        k_new, v_new if v_new is not None else k_new, k_buf, v_buf if v_buf is not None else k_buf,
-        slot_flat, col_flat, k_buf.stride(0), k_buf.stride(1), k_buf.stride(2),
-        L=layers, WIDTH=width, HAS_V=v_new is not None, BLOCK=triton.next_power_of_2(width), num_warps=1,
+        k_new,
+        v_new if v_new is not None else k_new,
+        k_buf,
+        v_buf if v_buf is not None else k_buf,
+        slot_flat,
+        col_flat,
+        k_buf.stride(0),
+        k_buf.stride(1),
+        k_buf.stride(2),
+        L=layers,
+        WIDTH=width,
+        HAS_V=v_new is not None,
+        BLOCK=triton.next_power_of_2(width),
+        num_warps=1,
     )
 
 
@@ -191,7 +237,9 @@ def _glue_fits(worker, k_new_shape=None) -> bool:
     buf = worker._ctx_k_buf
     if not (_GLUE_KERNELS and buf is not None and buf.dim() == 5 and buf.is_contiguous()):
         return False
-    if worker._ctx_v_buf is not None and (worker._ctx_v_buf.shape != buf.shape or not worker._ctx_v_buf.is_contiguous()):
+    if worker._ctx_v_buf is not None and (
+        worker._ctx_v_buf.shape != buf.shape or not worker._ctx_v_buf.is_contiguous()
+    ):
         return False
     return worker._batch_to_slot.dtype == worker._ctx_len.dtype == torch.int64
 
@@ -210,9 +258,17 @@ def _rope_with_positions(drafter, pos_rep, fallback):
         if dummy_q is None or dummy_q.dtype != k_flat.dtype or dummy_q.shape[0] < need_rows:
             dummy_q = k_flat.new_empty(need_rows, drafter._head_dim)
             drafter._rope_dummy_q = dummy_q
-        rope(pos_rep, dummy_q[:need_rows], k_flat, drafter._head_dim, drafter._get_cos_sin_cache(), drafter._is_neox)
+        rope(
+            pos_rep,
+            dummy_q[:need_rows],
+            k_flat,
+            drafter._head_dim,
+            drafter._get_cos_sin_cache(),
+            drafter._is_neox,
+        )
 
     return fused_rope_inplace
+
 
 #: Where the side chain forks: right after the LM head's GEMM.
 POINT = "head"
@@ -688,9 +744,13 @@ class ContextKvFork:
         projected = drafter.project_target_hidden(gen_hs.reshape(-1, gen_hs.shape[-1]))
         had = "_fused_rope_inplace" in drafter.__dict__
         previous = drafter.__dict__.get("_fused_rope_inplace")
-        drafter._fused_rope_inplace = _rope_with_positions(drafter, pos_rep, drafter._fused_rope_inplace)
+        drafter._fused_rope_inplace = _rope_with_positions(
+            drafter, pos_rep, drafter._fused_rope_inplace
+        )
         try:
-            k_new, v_new = drafter.precompute_context_kv(projected.to(worker._ctx_k_buf.dtype), pos_flat)
+            k_new, v_new = drafter.precompute_context_kv(
+                projected.to(worker._ctx_k_buf.dtype), pos_flat
+            )
         finally:
             if had:
                 drafter._fused_rope_inplace = previous

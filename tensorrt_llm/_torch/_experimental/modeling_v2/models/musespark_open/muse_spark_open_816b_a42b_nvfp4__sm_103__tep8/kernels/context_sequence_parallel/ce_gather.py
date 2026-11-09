@@ -134,14 +134,17 @@ def _wait_flags() -> int:
             err, dev = _cu.cuDeviceGet(index)
             _check(err)
             err, can = _cu.cuDeviceGetAttribute(
-                _cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_CAN_FLUSH_REMOTE_WRITES, dev)
+                _cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_CAN_FLUSH_REMOTE_WRITES, dev
+            )
             _check(err)
         flags = int(_cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ)
         if can:
             flags |= int(_cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_FLUSH)
         _FLUSH_BY_DEVICE[index] = flags
-        logger.info(f"[musespark_open] ce_gather: device {index} CAN_FLUSH_REMOTE_WRITES={int(can)}: "
-                    f"flag waits {'with' if can else 'without'} CU_STREAM_WAIT_VALUE_FLUSH")
+        logger.info(
+            f"[musespark_open] ce_gather: device {index} CAN_FLUSH_REMOTE_WRITES={int(can)}: "
+            f"flag waits {'with' if can else 'without'} CU_STREAM_WAIT_VALUE_FLUSH"
+        )
     return flags
 
 

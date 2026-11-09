@@ -624,7 +624,9 @@ class TargetHead:
         if VP_FILL_LOGITS:
             from tensorrt_llm._torch.distributed import allgather
 
-            logits.copy_(allgather(local, self.lm_head.mapping, sizes=self.lm_head.gather_output_sizes))
+            logits.copy_(
+                allgather(local, self.lm_head.mapping, sizes=self.lm_head.gather_output_sizes)
+            )
 
     def _gather_now(self, logits: torch.Tensor) -> Optional[torch.Tensor]:
         """Consume the pending row; returns the gathered BF16 row of a vocab-parallel one."""

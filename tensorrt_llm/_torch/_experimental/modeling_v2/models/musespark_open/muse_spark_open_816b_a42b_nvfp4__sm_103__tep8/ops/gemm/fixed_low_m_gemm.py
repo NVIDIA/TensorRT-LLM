@@ -19,11 +19,6 @@ elements -- the same distance from the fp64 product as cuBLAS.
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-from ...sm107_defaults import sm103_tep8_f11 as _sm103_tep8_f11
-
-import os
-
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
@@ -31,6 +26,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     OpWrapper,
     true_fp32_matmul,
 )
+
+from ...sm107_defaults import env as _sm107_env
+from ...sm107_defaults import sm103_tep8_f11 as _sm103_tep8_f11
 
 #: The split-K tactic ``(mma_m, mma_n, split_k, ab_stages)`` per ``(M, K, N)`` of a
 #: tep8 drafter (two trays) on sm103, chosen on GB300 with cold weights and PDL on;
@@ -63,27 +61,74 @@ SM107_SPLITK_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
 #: Opt-in: ``MUSESPARK_OPEN_TEP8_DRAFTER_WIDE_GEMMS=1`` adds the tep8 sm107 drafter's 2..4-request blocks
 #: (16, 24 and 32 rows), and with ``MUSESPARK_OPEN_TEP8_WIDE64_SPLITK=1`` (the split-K kernel's 64-wide tiles)
 #: its 5..8-request blocks (40..64 rows), which otherwise run cuBLAS (nvjet, plus a cublasLt splitKreduce launch on four
-#: of the five per-layer projections: 20-23 reduce launches per step on the TEP8 bs4/bs8 critical path). Each shape keeps
-#: the ``split_k`` of its 8-row cell, so every row of a block gets the bits it gets in a one-request step (flashinfer's
-#: split-K sums the same K slices in the same order whatever the tile widths); against cuBLAS a row differs in the last
-#: BF16 place on some elements, as the 8-row cells already do (o_proj and down_proj, split_k 1: equal). Tile widths
-#: and stages: the fastest measured behind an early-releasing predecessor
+#: of the five per-layer projections: 20-23 reduce launches per step on the TEP8 bs4/bs8 critical path). Each shape
+#: keeps the ``split_k`` of its 8-row cell, so every row of a block gets the bits it gets in a one-request step
+#: (flashinfer's split-K sums the same K slices in the same order whatever the tile widths); against cuBLAS a row
+#: differs in the last BF16 place on some elements, as the 8-row cells already do (o_proj and down_proj, split_k 1:
+#: equal). Tile widths and stages: the fastest measured behind an early-releasing predecessor
 #: with PDL, which is what the drafter's predecessors are (hop, block convolution, window-attention merge, SiLU-mul
 #: all release their dependents early: the 8-row split-K GEMMs start 1.5-4.7 us before them in TEP8 bs1 traces).
 TEP8_DRAFTER_WIDE_ENV = "MUSESPARK_OPEN_TEP8_DRAFTER_WIDE_GEMMS"
 _TEP8_WIDE64_ENV = "MUSESPARK_OPEN_TEP8_WIDE64_SPLITK"
 #: (mma_m, mma_n, split_k, ab_stages) per row count and site: the fastest split-K tile behind an early-releasing
 #: predecessor with PDL, at the 8-row cell's split_k.
-_TP8_DRAFTER_WIDE_SHAPES = {"conv_coef": (8192, 2048), "qkv": (8192, 1280), "o_proj": (1024, 8192),
-                            "down": (3584, 8192), "gate_up": (8192, 7168)}  # qkv: also the context K/V
+_TP8_DRAFTER_WIDE_SHAPES = {
+    "conv_coef": (8192, 2048),
+    "qkv": (8192, 1280),
+    "o_proj": (1024, 8192),
+    "down": (3584, 8192),
+    "gate_up": (8192, 7168),
+}  # qkv: also the context K/V
 _TP8_DRAFTER_WIDE_TILES = {
-    16: {"conv_coef": (64, 16, 4, 10), "qkv": (64, 16, 4, 10), "o_proj": (64, 16, 1, 11), "down": (64, 16, 1, 11), "gate_up": (64, 16, 1, 11)},
-    24: {"conv_coef": (64, 32, 4, 8), "qkv": (64, 32, 4, 8), "o_proj": (64, 32, 1, 9), "down": (64, 32, 1, 9), "gate_up": (64, 32, 1, 9)},
-    32: {"conv_coef": (64, 32, 4, 8), "qkv": (64, 32, 4, 8), "o_proj": (64, 32, 1, 9), "down": (64, 32, 1, 9), "gate_up": (64, 32, 1, 9)},
-    40: {"conv_coef": (64, 64, 4, 5), "qkv": (64, 64, 4, 5), "o_proj": (64, 64, 1, 7), "down": (64, 64, 1, 7), "gate_up": (64, 64, 1, 7)},
-    48: {"conv_coef": (64, 64, 4, 5), "qkv": (64, 64, 4, 5), "o_proj": (64, 64, 1, 7), "down": (64, 64, 1, 7), "gate_up": (64, 64, 1, 7)},
-    56: {"conv_coef": (64, 64, 4, 5), "qkv": (64, 64, 4, 5), "o_proj": (64, 64, 1, 7), "down": (64, 64, 1, 7), "gate_up": (64, 64, 1, 7)},
-    64: {"conv_coef": (64, 64, 4, 5), "qkv": (64, 64, 4, 5), "o_proj": (64, 64, 1, 7), "down": (64, 64, 1, 7), "gate_up": (64, 64, 1, 7)},
+    16: {
+        "conv_coef": (64, 16, 4, 10),
+        "qkv": (64, 16, 4, 10),
+        "o_proj": (64, 16, 1, 11),
+        "down": (64, 16, 1, 11),
+        "gate_up": (64, 16, 1, 11),
+    },
+    24: {
+        "conv_coef": (64, 32, 4, 8),
+        "qkv": (64, 32, 4, 8),
+        "o_proj": (64, 32, 1, 9),
+        "down": (64, 32, 1, 9),
+        "gate_up": (64, 32, 1, 9),
+    },
+    32: {
+        "conv_coef": (64, 32, 4, 8),
+        "qkv": (64, 32, 4, 8),
+        "o_proj": (64, 32, 1, 9),
+        "down": (64, 32, 1, 9),
+        "gate_up": (64, 32, 1, 9),
+    },
+    40: {
+        "conv_coef": (64, 64, 4, 5),
+        "qkv": (64, 64, 4, 5),
+        "o_proj": (64, 64, 1, 7),
+        "down": (64, 64, 1, 7),
+        "gate_up": (64, 64, 1, 7),
+    },
+    48: {
+        "conv_coef": (64, 64, 4, 5),
+        "qkv": (64, 64, 4, 5),
+        "o_proj": (64, 64, 1, 7),
+        "down": (64, 64, 1, 7),
+        "gate_up": (64, 64, 1, 7),
+    },
+    56: {
+        "conv_coef": (64, 64, 4, 5),
+        "qkv": (64, 64, 4, 5),
+        "o_proj": (64, 64, 1, 7),
+        "down": (64, 64, 1, 7),
+        "gate_up": (64, 64, 1, 7),
+    },
+    64: {
+        "conv_coef": (64, 64, 4, 5),
+        "qkv": (64, 64, 4, 5),
+        "o_proj": (64, 64, 1, 7),
+        "down": (64, 64, 1, 7),
+        "gate_up": (64, 64, 1, 7),
+    },
 }
 SM107_TP8_DRAFTER_WIDE_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
     (_rows, *_TP8_DRAFTER_WIDE_SHAPES[_site]): _tactic
@@ -99,7 +144,8 @@ SM107_TP8_DRAFTER_WIDE_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, 
 #: chain's torch kernels), 16 rows per tile up to 32 rows, 32 above.
 TEP8_FC_SHARD_WIDE_ENV = "MUSESPARK_OPEN_TEP8_FC_SHARD_WIDE"
 SM107_TP8_FC_WIDE_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
-    (_rows, 40960, 1024): (64, 16, 4, 10) if _rows <= 32 else (64, 32, 4, 8) for _rows in (16, 24, 32, 40, 48, 56, 64)
+    (_rows, 40960, 1024): (64, 16, 4, 10) if _rows <= 32 else (64, 32, 4, 8)
+    for _rows in (16, 24, 32, 40, 48, 56, 64)
 }
 TEP8_WIDE64 = _sm107_env(_TEP8_WIDE64_ENV, "0") == "1"
 TEP8_DRAFTER_WIDE = _sm107_env(TEP8_DRAFTER_WIDE_ENV, "0") == "1"
@@ -107,11 +153,19 @@ TEP8_FC_WIDE = _sm107_env(TEP8_FC_SHARD_WIDE_ENV, "0").strip() not in ("", "0")
 TEP8_DRAFTER_WIDE64 = TEP8_DRAFTER_WIDE and TEP8_WIDE64
 if TEP8_DRAFTER_WIDE:
     SM107_SPLITK_TACTICS.update(
-        {key: tactic for key, tactic in SM107_TP8_DRAFTER_WIDE_TACTICS.items() if key[0] <= 32 or TEP8_WIDE64}
+        {
+            key: tactic
+            for key, tactic in SM107_TP8_DRAFTER_WIDE_TACTICS.items()
+            if key[0] <= 32 or TEP8_WIDE64
+        }
     )
 if TEP8_FC_WIDE:
     SM107_SPLITK_TACTICS.update(
-        {key: tactic for key, tactic in SM107_TP8_FC_WIDE_TACTICS.items() if key[0] <= 32 or TEP8_WIDE64}
+        {
+            key: tactic
+            for key, tactic in SM107_TP8_FC_WIDE_TACTICS.items()
+            if key[0] <= 32 or TEP8_WIDE64
+        }
     )
 
 
@@ -144,11 +198,19 @@ SM103_TP8_FC_WIDE_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]]
 if _sm103_tep8_f11():
     if TEP8_DRAFTER_WIDE:
         SPLITK_TACTICS.update(
-            {key: tactic for key, tactic in SM103_TP8_DRAFTER_WIDE_TACTICS.items() if key[0] <= 32 or TEP8_WIDE64}
+            {
+                key: tactic
+                for key, tactic in SM103_TP8_DRAFTER_WIDE_TACTICS.items()
+                if key[0] <= 32 or TEP8_WIDE64
+            }
         )
     if TEP8_FC_WIDE:
         SPLITK_TACTICS.update(
-            {key: tactic for key, tactic in SM103_TP8_FC_WIDE_TACTICS.items() if key[0] <= 32 or TEP8_WIDE64}
+            {
+                key: tactic
+                for key, tactic in SM103_TP8_FC_WIDE_TACTICS.items()
+                if key[0] <= 32 or TEP8_WIDE64
+            }
         )
 
 #: The same for a tep4 drafter (one tray) on sm103: every TP-sharded projection is
@@ -329,10 +391,7 @@ class FixedLowMGemm(OpWrapper):
         tactic: tuple[int, int, int, int],
         enable_pdl: bool,
     ) -> torch.Tensor:
-        from .splitk_gemm import (
-            SplitKTactic,
-            run_splitk_dense,
-        )
+        from .splitk_gemm import SplitKTactic, run_splitk_dense
 
         out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
         # DLPack refuses tensors that require grad; a trainable nn.Linear

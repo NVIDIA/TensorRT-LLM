@@ -63,10 +63,10 @@ from typing import FrozenSet, Optional, Sequence, Tuple
 import torch
 
 from ... import dispatch as _tp_agreement
-from ...sm107_defaults import sm103_tep8_unpool_direct_wide as _sm103_tep8_unpool_direct_wide
 from ...ops.comm import unpool_direct_boundary as _direct
 from ...ops.comm import unpool_gather_boundary as _unpool
 from ...ops.comm.projection_inbox import WIDE_MAX_ROWS
+from ...sm107_defaults import sm103_tep8_unpool_direct_wide as _sm103_tep8_unpool_direct_wide
 from ..dense_gemms.dispatcher import (
     FLASHINFER_FAMILIES,
     DenseGemmDispatcher,

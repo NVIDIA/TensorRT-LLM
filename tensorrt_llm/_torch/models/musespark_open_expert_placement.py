@@ -126,7 +126,9 @@ def apply_to_experts(experts, slot_expert: List[int], ep_rank: int, ep_size: int
                 f"{len(module.initial_local_expert_ids)} local experts, expected {per}"
             )
         if getattr(module, "layer_load_balancer", None) is not None:
-            raise ValueError("[musespark_open] expert placement cannot run with the MoE load balancer")
+            raise ValueError(
+                "[musespark_open] expert placement cannot run with the MoE load balancer"
+            )
         module.initial_local_expert_ids = list(local)
         module.initial_global_assignments = list(slot_expert)
     return local
@@ -158,7 +160,9 @@ class _Census:
             if torch.cuda.is_current_stream_capturing():
                 ones = None
             else:
-                ones = torch.ones(max(flat.numel(), 8192 * 8), dtype=torch.int64, device=selected.device)
+                ones = torch.ones(
+                    max(flat.numel(), 8192 * 8), dtype=torch.int64, device=selected.device
+                )
                 self.ones = ones
         if ones is None:
             return
@@ -186,8 +190,14 @@ class _Census:
                 stream.synchronize()
                 tmp = out + ".tmp"
                 with open(tmp, "w") as fh:
-                    json.dump({"rank": rank, "time": time.time(),
-                               "layers": {str(k): v.tolist() for k, v in host.items()}}, fh)
+                    json.dump(
+                        {
+                            "rank": rank,
+                            "time": time.time(),
+                            "layers": {str(k): v.tolist() for k, v in host.items()},
+                        },
+                        fh,
+                    )
                 os.replace(tmp, out)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"[musespark_open] expert census write failed: {e}")

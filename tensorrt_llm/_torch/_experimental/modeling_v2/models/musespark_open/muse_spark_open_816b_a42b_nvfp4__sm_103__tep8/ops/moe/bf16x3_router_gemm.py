@@ -34,9 +34,6 @@ helpers moved: the target sums the split-K partials with its own kernel
 ``bf16x3_router_gemm`` entry point stay behind.
 """
 
-from ...sm107_defaults import env as _sm107_env
-
-import os
 from functools import cache
 
 import cutlass
@@ -48,6 +45,8 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch.cute_dsl_kernels.blackwell import router_tcgen05 as _tcgen05
 from tensorrt_llm._torch.cute_dsl_kernels.blackwell.cute_ptx_utils import simple_tma_copy
+
+from ...sm107_defaults import env as _sm107_env
 
 __all__ = ["PREWAIT", "PREWAIT_ENV", "Sm100BF16x3RouterGemm"]
 
@@ -258,9 +257,13 @@ class Sm100BF16x3RouterGemm:
                     stage_id = i % num_stages
                     tile_k = bid_k + i * split_k
                     if i >= num_stages:
-                        cute.arch.mbarrier_wait(tma_empty_mbar + stage_id, ((i // num_stages) + 1) % 2)
+                        cute.arch.mbarrier_wait(
+                            tma_empty_mbar + stage_id, ((i // num_stages) + 1) % 2
+                        )
                         with cute.arch.elect_one():
-                            cute.arch.mbarrier_arrive_and_expect_tx(tma_full_mbar + stage_id, BM * BK * 4)
+                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                tma_full_mbar + stage_id, BM * BK * 4
+                            )
                         simple_tma_copy(
                             W_tma.atom,
                             gW_tiles[None, None, tile_k],

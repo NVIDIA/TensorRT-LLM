@@ -100,8 +100,6 @@ device is still polling and log the stuck rank.
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
 import functools
 import threading
 import time
@@ -114,6 +112,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+from ...sm107_defaults import env as _sm107_env
 
 #: The kernels launch with programmatic dependent launch: ``TRTLLM_ENABLE_PDL`` on is a
 #: precondition of every composition that builds them.

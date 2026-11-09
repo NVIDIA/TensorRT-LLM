@@ -1510,6 +1510,7 @@ class DFlashWorker(SpecWorkerBase):
             if all(cache is not None for cache in caches):
                 return [-(-cache.capacity // page) * page for cache in caches]
         return (self._ctx_block_counts[: len(request_ids)] * page).tolist()
+
     def _draft_window_counters_get(self) -> DraftWindowCounters:
         """This worker's draft-window counters (``disaggregation/draft_kv.py``)."""
         counters = getattr(self, "_draft_window_counters", None)

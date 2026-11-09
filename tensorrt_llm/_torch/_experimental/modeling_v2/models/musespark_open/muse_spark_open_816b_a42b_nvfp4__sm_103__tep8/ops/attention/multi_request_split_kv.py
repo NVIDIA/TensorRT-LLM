@@ -62,11 +62,8 @@ combine waits before its first read (a device ``bmm2_scale`` included).
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
 import functools
 import math
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -78,6 +75,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     OpWrapper,
     true_fp32_matmul,
 )
+
+from ...sm107_defaults import env as _sm107_env
 
 #: Head width, tokens per page, query heads per KV head.
 HEAD_DIM = 64
@@ -108,7 +107,10 @@ RING_STAGES_BY_SM = {103: {1: 20, 2: 16}, 107: {1: 16, 2: 16}}
 #: 256k / 512k / 1M). Unset =
 #: the image exactly. Read once at import.
 if _sm107_env("MUSESPARK_OPEN_MR_STAGES"):
-    RING_STAGES_BY_SM[107] = {1: int(_sm107_env("MUSESPARK_OPEN_MR_STAGES")), 2: RING_STAGES_BY_SM[107][2]}
+    RING_STAGES_BY_SM[107] = {
+        1: int(_sm107_env("MUSESPARK_OPEN_MR_STAGES")),
+        2: RING_STAGES_BY_SM[107][2],
+    }
 #: sm103's ring depths.
 RING_STAGES = RING_STAGES_BY_SM[103]
 

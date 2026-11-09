@@ -6446,7 +6446,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _note_swa_demote(self, kv_cache) -> None:
         """Account the superseded-anchor demotion of a just-closed cache (opt-in)."""
-        if not getattr(self, "_swa_demote_anchors", False) or kv_cache.superseded_anchor_priority is None:
+        if (
+            not getattr(self, "_swa_demote_anchors", False)
+            or kv_cache.superseded_anchor_priority is None
+        ):
             return
         stats = self._swa_demote_stats
         stats[0] += 1

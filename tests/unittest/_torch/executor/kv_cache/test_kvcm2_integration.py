@@ -277,11 +277,18 @@ def test_swa_endpoint_priority_steers_real_eviction(with_callback: bool) -> None
     [
         ({}, 1024, False, None),
         ({"TRTLLM_KV_SWA_DEMOTE_ANCHORS": "1"}, 1024, False, 1),
-        ({"TRTLLM_KV_SWA_DEMOTE_ANCHORS": "1", "TRTLLM_KV_SWA_DEMOTE_PRIORITY": "0"}, 1024, False, 0),
+        (
+            {"TRTLLM_KV_SWA_DEMOTE_ANCHORS": "1", "TRTLLM_KV_SWA_DEMOTE_PRIORITY": "0"},
+            1024,
+            False,
+            0,
+        ),
         ({"TRTLLM_KV_SWA_DEMOTE_ANCHORS": "1"}, 1024, True, None),  # no callback for dummies
     ],
 )
-def test_create_kv_cache_swa_demote_anchors(env: dict, rewind: int, is_dummy: bool, expected) -> None:
+def test_create_kv_cache_swa_demote_anchors(
+    env: dict, rewind: int, is_dummy: bool, expected
+) -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager._swa_endpoint_rewind = rewind
     manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE

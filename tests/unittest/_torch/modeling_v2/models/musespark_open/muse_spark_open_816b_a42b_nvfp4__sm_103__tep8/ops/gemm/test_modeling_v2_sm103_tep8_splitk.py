@@ -25,9 +25,12 @@ import torch
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"),
     pytest.mark.skipif(
-        torch.cuda.is_available() and torch.cuda.get_device_capability() != (10, 3), reason="sm_103 only"
+        torch.cuda.is_available() and torch.cuda.get_device_capability() != (10, 3),
+        reason="sm_103 only",
     ),
-    pytest.mark.skipif(os.environ.get("MUSESPARK_OPEN_SM103_TEP8_F11") != "1", reason="needs the F11 switch"),
+    pytest.mark.skipif(
+        os.environ.get("MUSESPARK_OPEN_SM103_TEP8_F11") != "1", reason="needs the F11 switch"
+    ),
 ]
 
 _PKG = (

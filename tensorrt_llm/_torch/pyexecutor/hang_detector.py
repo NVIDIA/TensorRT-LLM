@@ -442,7 +442,11 @@ class HangDetector:
         report_context: Optional[str] = None,
     ) -> None:
         # TRTLLM_HANG_DETECTION_TIMEOUT (seconds) overrides the default 300 when the caller passes none.
-        self.timeout = timeout if timeout is not None else int(os.environ.get("TRTLLM_HANG_DETECTION_TIMEOUT", "300"))
+        self.timeout = (
+            timeout
+            if timeout is not None
+            else int(os.environ.get("TRTLLM_HANG_DETECTION_TIMEOUT", "300"))
+        )
         assert self.timeout > 0, "timeout must be greater than 0"
         self.on_detected = on_detected or (lambda: None)
         self.report_context = report_context

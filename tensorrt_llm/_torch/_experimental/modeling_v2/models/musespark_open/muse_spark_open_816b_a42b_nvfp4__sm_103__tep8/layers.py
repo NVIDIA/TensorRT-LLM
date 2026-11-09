@@ -867,7 +867,9 @@ def _build_wide_hop(model: MuseSparkOpenModel, call: PostAttnHopCall) -> WideHop
     return wide_call
 
 
-def _build_wide_direct(model: MuseSparkOpenModel, call: PostAttnHopCall, variants) -> "_wide.DirectPublication":
+def _build_wide_direct(
+    model: MuseSparkOpenModel, call: PostAttnHopCall, variants
+) -> "_wide.DirectPublication":
     """Direct hop (MUSESPARK_OPEN_TEP8_HOP_DIRECT=1): the direct publication of the wide hop's
     two-shot (collective). Checked on every layer and agreed over the TP group first: an even layer count, eight
     ranks, and every o_proj on the dense GEMM dispatcher's wide64 split-K (whose kernel has the scatter epilogue).
@@ -887,7 +889,9 @@ def _build_wide_direct(model: MuseSparkOpenModel, call: PostAttnHopCall, variant
     if not getattr(_wide, "HAS_SCATTER_GEMM", False):
         reasons.append("no scatter producer (flashinfer's split-K kernel is unavailable)")
     if "o_proj" not in getattr(dense_gemms, "TEP8_WIDE64_SITES", ()):
-        reasons.append("o_proj is not on the TEP8 wide64 split-K (MUSESPARK_OPEN_TEP8_WIDE64_SPLITK)")
+        reasons.append(
+            "o_proj is not on the TEP8 wide64 split-K (MUSESPARK_OPEN_TEP8_WIDE64_SPLITK)"
+        )
     if len(call.joins) != len(layers):
         reasons.append(f"{len(call.joins)} post-attention joins for {len(layers)} layers")
     dispatchers = []
@@ -898,7 +902,9 @@ def _build_wide_direct(model: MuseSparkOpenModel, call: PostAttnHopCall, variant
             continue
         dispatcher = o_proj._low_m_gemm_dispatcher
         if dispatcher.site.role != "o_proj":
-            reasons.append(f"layer {layer.layer_idx}: the dispatcher's role is {dispatcher.site.role}")
+            reasons.append(
+                f"layer {layer.layer_idx}: the dispatcher's role is {dispatcher.site.role}"
+            )
             continue
         dispatchers.append(dispatcher)
     refusal = _tp_agreement.agreed_refusal(

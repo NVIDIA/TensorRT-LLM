@@ -72,8 +72,6 @@ the replicated warmup's growth) and before any CUDA graph is captured.
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
 import contextlib
 from typing import Any, Dict, Iterator, Optional, Tuple
 
@@ -86,6 +84,8 @@ from tensorrt_llm._torch.models.modeling_musespark_open import (
 )
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata
+
+from ...sm107_defaults import env as _sm107_env
 
 #: The fewest rows a step captured into the breakable prefill CUDA graph needs to run
 #: sequence-parallel: below it the two collectives' fixed cost per all-reduce replaced
@@ -166,16 +166,22 @@ SHARD_PARTS_BY_SM = {
 _SP_SM107_PARTS_ENV = "MUSESPARK_OPEN_SP_SM107_PARTS"
 _SP_SM107_EXTRA = _sm107_env(_SP_SM107_PARTS_ENV, "").strip()
 if _SP_SM107_EXTRA:
-    _extra = (SHARD_PARTS_BY_SM[103][1:] if _SP_SM107_EXTRA == "all"
-              else tuple(p.strip() for p in _SP_SM107_EXTRA.split(",") if p.strip()))
+    _extra = (
+        SHARD_PARTS_BY_SM[103][1:]
+        if _SP_SM107_EXTRA == "all"
+        else tuple(p.strip() for p in _SP_SM107_EXTRA.split(",") if p.strip())
+    )
     _unknown = sorted(set(_extra) - set(SHARD_PARTS_BY_SM[103][1:]))
     if _unknown:
         raise ValueError(f"[musespark_open] {_SP_SM107_PARTS_ENV}: not an sm103 part: {_unknown}")
     SHARD_PARTS_BY_SM[107] = ("moe",) + tuple(p for p in SHARD_PARTS_BY_SM[103][1:] if p in _extra)
     import sys as _sys
 
-    print(f"[musespark_open] context_sequence_parallel: sm107 parts {SHARD_PARTS_BY_SM[107]}",
-          file=_sys.stderr, flush=True)
+    print(
+        f"[musespark_open] context_sequence_parallel: sm107 parts {SHARD_PARTS_BY_SM[107]}",
+        file=_sys.stderr,
+        flush=True,
+    )
 
 
 def install(model: MuseSparkOpenModel, sm: Optional[int]) -> "ContextSequenceParallel":

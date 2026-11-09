@@ -314,7 +314,11 @@ class _SwaBlock:
         rows = md.num_tokens
         seq_lens = getattr(md, "seq_lens", None)
         # MUSESPARK_OPEN_SWA_ONE2: TEP8 layers (2 KV heads) take up to 8 sequences (ops/attention/swa_block).
-        cap = _ONE2_MAX_REQUESTS if _SWA_ONE2 and self.num_key_value_heads == 2 else MULTI_MAX_REQUESTS
+        cap = (
+            _ONE2_MAX_REQUESTS
+            if _SWA_ONE2 and self.num_key_value_heads == 2
+            else MULTI_MAX_REQUESTS
+        )
         if (
             not 2 <= n <= cap
             or md.num_generations != n
@@ -469,17 +473,27 @@ def install_multi(model) -> int:
                 f"{layer.layer_idx} carries {type(attention).__name__}"
             )
         attention._swa_multi = True
-        if _SWA_ONE2 and attention.num_key_value_heads == 2 and hasattr(attention, "_mr_append_min_seqs"):
+        if (
+            _SWA_ONE2
+            and attention.num_key_value_heads == 2
+            and hasattr(attention, "_mr_append_min_seqs")
+        ):
             # MUSESPARK_OPEN_SWA_ONE2: the one-launch block of 5..8 sequences does its own prep and K/V append on
             # these layers, so multi_request_prep_append (installed before this) folds only larger steps here.
-            attention._mr_append_min_seqs = max(attention._mr_append_min_seqs, _ONE2_MAX_REQUESTS + 1)
+            attention._mr_append_min_seqs = max(
+                attention._mr_append_min_seqs, _ONE2_MAX_REQUESTS + 1
+            )
             one2 += 1
         count += 1
     logger.info(
         f"[musespark_open] wide_swa_block: swa_block on decode steps of 2..{MULTI_MAX_REQUESTS} "
         f"requests of up to {MAX_ROWS} rows each on {count} sliding-window layers"
-        + (f"; MUSESPARK_OPEN_SWA_ONE2: also 5..{_ONE2_MAX_REQUESTS} requests on {one2} TEP8 layers (one launch; "
-           "multi_request_prep_append stands down for them)" if one2 else "")
+        + (
+            f"; MUSESPARK_OPEN_SWA_ONE2: also 5..{_ONE2_MAX_REQUESTS} requests on {one2} TEP8 layers (one launch; "
+            "multi_request_prep_append stands down for them)"
+            if one2
+            else ""
+        )
     )
     return count
 

@@ -196,14 +196,21 @@ def tail_pipeline(layer, residual: torch.Tensor, split) -> Tuple[torch.Tensor, t
     main = torch.cuda.current_stream()
     hidden = residual.shape[1]
     updated = torch.empty_like(residual)
-    next_input = torch.empty((residual.shape[0], hidden), dtype=split.results[0].dtype, device=residual.device)
+    next_input = torch.empty(
+        (residual.shape[0], hidden), dtype=split.results[0].dtype, device=residual.device
+    )
     router_input = torch.empty_like(residual)
     payload, scales = [], []
     for (lo, hi), reduced, event in split.chunks():
         main.wait_event(event)
         rows = slice(lo, hi)
         joined = join_with_router_input(
-            join, residual[rows], reduced, eps, next_norm, None,
+            join,
+            residual[rows],
+            reduced,
+            eps,
+            next_norm,
+            None,
             out=(updated[rows], next_input[rows], router_input[rows]),
         )
         if joined is None:

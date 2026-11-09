@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E501
 """A sliding-window layer's decode attention block, from the QKV projection to o_proj's input.
 
 Between the QKV projection and the output projection a sliding-window decode
@@ -36,8 +37,6 @@ that is what lets its cached K/V be read before the wait.
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
 import math
 import os
 from typing import Optional
@@ -45,6 +44,8 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
+
+from ...sm107_defaults import env as _sm107_env
 
 try:
     from triton.language.extra import libdevice
@@ -146,7 +147,9 @@ _TEP8_SWA_CL8 = _sm107_env("MUSESPARK_OPEN_TEP8_SWA_CL8", "0")
 #: takes (2..5). CL8 computes each (request, KV head) in its own 8-CTA cluster, so a request's output and K/V bytes do
 #: not depend on the other requests of the step (device-checked: 2 / 4 requests == the same requests inside an
 #: 8-request call); lowering it gives 2..4-request steps the per-request bits they already get in 5..8-request steps.
-_CL8_TEP8_MIN_REQUESTS = min(5, max(2, int(_sm107_env("MUSESPARK_OPEN_TEP8_SWA_CL8_MIN_REQUESTS", "5") or 5)))
+_CL8_TEP8_MIN_REQUESTS = min(
+    5, max(2, int(_sm107_env("MUSESPARK_OPEN_TEP8_SWA_CL8_MIN_REQUESTS", "5") or 5))
+)
 _CL8_TEP8_MAX_REQUESTS = 8
 #: MUSESPARK_OPEN_TEP8_SWA_CL8_2CTA=1 (default off): a TEP8 CL8 step whose (request, KV head) clusters do not
 #: all fit one wave at one CTA per SM (GB300: at most 15 8-CTA clusters co-resident, so 8 requests x 2 KV heads = 16
@@ -551,11 +554,11 @@ swa_cl8(const u16* PRODUCED qkv, long long qkv_stride, u8* __restrict__ pool, co
   if (warp < 8) {  // ======== attention warps
   // ---------------- S = Q K^T: warp w = row block rb (rows 16rb.., tokens 2rb, 2rb+1) x key half kh (144 keys)
   const int rb = warp & 3, kh = warp >> 2;
-  const int g = lane >> 2, c4 = lane & 3, mi = lane >> 3, rin = lane & 7;
+  const int g = lane >> 2, c4 = lane & 3, mi = lane >> 3, rin = lane & 7;  // codespell:ignore
   u32 qa[2][4];
   {
     const u32 sq = sm32(smem + SQ_OFF);
-    const int row = rb * 16 + (mi & 1) * 8 + rin;
+    const int row = rb * 16 + (mi & 1) * 8 + rin;  // codespell:ignore
 #pragma unroll
     for (int kk = 0; kk < 2; ++kk) ldsm4(sq + swz8(row, 2 * kk + (mi >> 1)), qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3]);
   }
@@ -576,7 +579,7 @@ swa_cl8(const u16* PRODUCED qkv, long long qkv_stride, u8* __restrict__ pool, co
 #pragma unroll
       for (int n = 0; n < 18; n += 2) {
         // matrices: (tile n, dims 32kk..+15), (tile n, +16..31), (tile n+1, ..), (tile n+1, ..): FP8 bytes
-        const int krow = kh * 144 + 8 * (n + (mi >> 1)) + rin;
+        const int krow = kh * 144 + 8 * (n + (mi >> 1)) + rin;  // codespell:ignore
         u32 b0, b1, b2, b3;
         ldsm4(sk + swz8(krow, 2 * kk + (mi & 1)), b0, b1, b2, b3);
         mma16832(sa[n], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], b0, b1);
@@ -630,7 +633,7 @@ swa_cl8(const u16* PRODUCED qkv, long long qkv_stride, u8* __restrict__ pool, co
     for (int kk = 0; kk < 9; ++kk) {
       if (CL8_ABL == 1 || CL8_ABL == 2) continue;
       const u32 a0 = pl[2 * kk], a1 = ph[2 * kk], a2 = pl[2 * kk + 1], a3 = ph[2 * kk + 1];
-      const int vrow = kh * 144 + 16 * kk + (mi & 1) * 8 + rin;
+      const int vrow = kh * 144 + 16 * kk + (mi & 1) * 8 + rin;  // codespell:ignore
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
         u32 b0, b1, b2, b3;
@@ -757,14 +760,21 @@ def _cl8_function(device: torch.device, pos64: bool, hkv: int, ctas: int = 1):
     if torch.cuda.is_current_stream_capturing():
         if key not in _CL8_WARNED:
             _CL8_WARNED.add(key)
-            _cl8_log("[musespark_open] swa_block CL8: first call inside a CUDA-graph capture; this capture keeps the "
-                     f"{'ONE2' if hkv == 4 else 'ONE2'} path (compile happens on an eager call)", warning=True)
+            _cl8_log(
+                "[musespark_open] swa_block CL8: first call inside a CUDA-graph capture; this capture keeps the "
+                f"{'ONE2' if hkv == 4 else 'ONE2'} path (compile happens on an eager call)",
+                warning=True,
+            )
         return None
     from cuda.bindings import driver as cu
     from cuda.bindings import nvrtc
 
     major, minor = torch.cuda.get_device_capability(index)
-    src = _CL8_SRC if ctas == 1 else _CL8_SRC.replace("__launch_bounds__(NT, 1)", f"__launch_bounds__(NT, {int(ctas)})")
+    src = (
+        _CL8_SRC
+        if ctas == 1
+        else _CL8_SRC.replace("__launch_bounds__(NT, 1)", f"__launch_bounds__(NT, {int(ctas)})")
+    )
     smem = _CL8_SMEM if ctas == 1 else _CL8_SMEM_2CTA
     prog = _cl8_check(nvrtc.nvrtcCreateProgram(src.encode(), b"swa_cl8.cu", 0, [], []))
     opts = [f"--gpu-architecture=sm_{major}{minor}".encode(), b"-std=c++17", b"-default-device"]
@@ -795,10 +805,19 @@ def _cl8_function(device: torch.device, pos64: bool, hkv: int, ctas: int = 1):
     with torch.cuda.device(index):
         mod = _cl8_check(cu.cuModuleLoadData(cubin))
         f = _cl8_check(cu.cuModuleGetFunction(mod, b"swa_cl8"))
-        _cl8_check(cu.cuFuncSetAttribute(f, cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                                         smem))
-    regs = int(_cl8_check(cu.cuFuncGetAttribute(cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS, f)))
-    lmem = int(_cl8_check(cu.cuFuncGetAttribute(cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, f)))
+        _cl8_check(
+            cu.cuFuncSetAttribute(
+                f, cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem
+            )
+        )
+    regs = int(
+        _cl8_check(cu.cuFuncGetAttribute(cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS, f))
+    )
+    lmem = int(
+        _cl8_check(
+            cu.cuFuncGetAttribute(cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, f)
+        )
+    )
     clusters = _cl8_max_clusters(f, smem, hkv) if hkv != 4 else 0
     _CL8_FN[key] = (f, mod, smem, clusters)
     # Each build keeps its own install line: TEP4's, and TEP8's (gate name, KV heads).
@@ -807,14 +826,16 @@ def _cl8_function(device: torch.device, pos64: bool, hkv: int, ctas: int = 1):
     else:
         head = f"[musespark_open] swa_block CL8 (TEP8): MUSESPARK_OPEN_TEP8_SWA_CL8={_TEP8_SWA_CL8}"
         heads = f"{int(hkv)} KV heads per rank, "
-    _cl8_log(f"{head} compiled for sm_{major}{minor} on "
-             f"device {index} (regs {regs}, local {lmem} B, smem {smem // 1024} KB, {ctas} CTA/SM build, "
-             f"{clusters} co-resident 8-CTA clusters, cluster 8, 320 threads, "
-             f"{heads}{'int64' if pos64 else 'int32'} positions, PDL {'on' if _CL8_PDL else 'off'}, trigger "
-             f"{'at the end' if _CL8_TRIGGER_END else 'after the wait'}, pre-wait loads "
-             f"{'off' if _CL8_NO_PREWAIT else ('at L2 (cg)' if _CL8_PREWAIT_CG else 'on')}"
-             f"{', DEBUG re-reads' if _CL8_DEBUG else ''}"
-             f"{', qkv/gate __restrict__ (A/B only)' if _CL8_RESTRICT_PRODUCED else ''})")
+    _cl8_log(
+        f"{head} compiled for sm_{major}{minor} on "
+        f"device {index} (regs {regs}, local {lmem} B, smem {smem // 1024} KB, {ctas} CTA/SM build, "
+        f"{clusters} co-resident 8-CTA clusters, cluster 8, 320 threads, "
+        f"{heads}{'int64' if pos64 else 'int32'} positions, PDL {'on' if _CL8_PDL else 'off'}, trigger "
+        f"{'at the end' if _CL8_TRIGGER_END else 'after the wait'}, pre-wait loads "
+        f"{'off' if _CL8_NO_PREWAIT else ('at L2 (cg)' if _CL8_PREWAIT_CG else 'on')}"
+        f"{', DEBUG re-reads' if _CL8_DEBUG else ''}"
+        f"{', qkv/gate __restrict__ (A/B only)' if _CL8_RESTRICT_PRODUCED else ''})"
+    )
     return _CL8_FN[key]
 
 
@@ -849,8 +870,20 @@ def _cl8_tep8_function(device: torch.device, pos64: bool, hkv: int, reqs: int):
     return fn2 if fn2 is not None and fn2[3] >= reqs * hkv else fn
 
 
-def _cl8_eligible(qkv, kv_pool, num_q_heads, num_kv_heads, window, rows, q_fp8, fused_prep, gate, cos_sin,
-                  position_ids, hkv) -> bool:
+def _cl8_eligible(
+    qkv,
+    kv_pool,
+    num_q_heads,
+    num_kv_heads,
+    window,
+    rows,
+    q_fp8,
+    fused_prep,
+    gate,
+    cos_sin,
+    position_ids,
+    hkv,
+) -> bool:
     """A call the CL8 build of ``hkv`` KV heads per rank serves: ``hkv`` KV / ``8 hkv`` query heads per rank (4 / 32
     at tep4, 2 / 16 at tep8), the kernel's other conditions."""
     return (
@@ -866,7 +899,11 @@ def _cl8_eligible(qkv, kv_pool, num_q_heads, num_kv_heads, window, rows, q_fp8, 
         and qkv.stride(0) % 8 == 0
         and qkv.data_ptr() % 16 == 0
         and kv_pool.data_ptr() % 16 == 0
-        and (cos_sin is None or position_ids is None or position_ids.dtype in (torch.int32, torch.int64))
+        and (
+            cos_sin is None
+            or position_ids is None
+            or position_ids.dtype in (torch.int32, torch.int64)
+        )
     )
 
 
@@ -880,19 +917,40 @@ def _cl8_dbg_ptr(device) -> int:
     if st is None:
         if torch.cuda.is_current_stream_capturing():
             return 0
-        st = _CL8_DBG[index] = {"buf": torch.zeros(16, dtype=torch.int64, device=device), "calls": 0}
+        st = _CL8_DBG[index] = {
+            "buf": torch.zeros(16, dtype=torch.int64, device=device),
+            "calls": 0,
+        }
     if not torch.cuda.is_current_stream_capturing():
         st["calls"] += 1
         if st["calls"] % 500 == 0:
             c = st["buf"].tolist()
             with open(f"{_CL8_DEBUG}.dev{index}.txt", "a") as f:
-                f.write(f"calls {st['calls']} seq_len {c[0]} window_page {c[1]} window_kv {c[2]} new_page {c[3]} "
-                        f"rope {c[4]} ctas {c[5]}\n")
+                f.write(
+                    f"calls {st['calls']} seq_len {c[0]} window_page {c[1]} window_kv {c[2]} new_page {c[3]} "
+                    f"rope {c[4]} ctas {c[5]}\n"
+                )
     return st["buf"].data_ptr()
 
 
-def _cl8_launch(fn, qkv, kv_pool, bt, seq_lens, kv_scale, cos_sin, positions, prep_eps, q_scale, gate, gate_eps,
-                out, qkv_permuted, enable_pdl, rope):
+def _cl8_launch(
+    fn,
+    qkv,
+    kv_pool,
+    bt,
+    seq_lens,
+    kv_scale,
+    cos_sin,
+    positions,
+    prep_eps,
+    q_scale,
+    gate,
+    gate_eps,
+    out,
+    qkv_permuted,
+    enable_pdl,
+    rope,
+):
     import ctypes
 
     from cuda.bindings import driver as cu
@@ -923,15 +981,66 @@ def _cl8_launch(fn, qkv, kv_pool, bt, seq_lens, kv_scale, cos_sin, positions, pr
     cfg.attrs = attrs
     cfg.numAttrs = len(attrs)
     vp, ll, fl, ii = ctypes.c_void_p, ctypes.c_longlong, ctypes.c_float, ctypes.c_int
-    args = ((qkv.data_ptr(), qkv.stride(0), kv_pool.data_ptr(), bt.data_ptr(), bt.stride(0), bt.stride(1),
-             seq_lens.data_ptr(), kv_scale.data_ptr(), cos_sin.data_ptr() if rope else 0,
-             positions.data_ptr() if rope else 0, float(prep_eps), float(q_scale), math.log2(math.e) / 8.0,
-             out.data_ptr(), out.stride(0), gate.data_ptr(), gts, ghs, float(gate_eps), rows, q_stride, k_col0,
-             v_col0, int(rope), int(bool(enable_pdl)), _cl8_dbg_ptr(qkv.device)),
-            (vp, ll, vp, vp, ll, ll, vp, vp, vp, vp, fl, fl, fl, vp, ll, vp, ll, ll, fl, ii, ii, ii, ii, ii, ii, vp))
+    args = (
+        (
+            qkv.data_ptr(),
+            qkv.stride(0),
+            kv_pool.data_ptr(),
+            bt.data_ptr(),
+            bt.stride(0),
+            bt.stride(1),
+            seq_lens.data_ptr(),
+            kv_scale.data_ptr(),
+            cos_sin.data_ptr() if rope else 0,
+            positions.data_ptr() if rope else 0,
+            float(prep_eps),
+            float(q_scale),
+            math.log2(math.e) / 8.0,
+            out.data_ptr(),
+            out.stride(0),
+            gate.data_ptr(),
+            gts,
+            ghs,
+            float(gate_eps),
+            rows,
+            q_stride,
+            k_col0,
+            v_col0,
+            int(rope),
+            int(bool(enable_pdl)),
+            _cl8_dbg_ptr(qkv.device),
+        ),
+        (
+            vp,
+            ll,
+            vp,
+            vp,
+            ll,
+            ll,
+            vp,
+            vp,
+            vp,
+            vp,
+            fl,
+            fl,
+            fl,
+            vp,
+            ll,
+            vp,
+            ll,
+            ll,
+            fl,
+            ii,
+            ii,
+            ii,
+            ii,
+            ii,
+            ii,
+            vp,
+        ),
+    )
     _cl8_check(cu.cuLaunchKernelEx(cfg, fn[0], args, 0))
     return out
-
 
 
 #: MUSESPARK_OPEN_SWA_SHADOW=<path prefix> (numerical verification; TEP4 CL8 only). On EAGER decode
@@ -959,8 +1068,27 @@ def _shadow_rank() -> int:
     return 0
 
 
-def _shadow_one2(qkv, kv_pool, block_tables, seq_lens, kv_scale, num_q_heads, num_kv_heads, window, rows, reqs,
-                 cos_sin, positions, rope, prep_eps, q_scale, q_fp8, qkv_permuted, gate, gate_eps):
+def _shadow_one2(
+    qkv,
+    kv_pool,
+    block_tables,
+    seq_lens,
+    kv_scale,
+    num_q_heads,
+    num_kv_heads,
+    window,
+    rows,
+    reqs,
+    cos_sin,
+    positions,
+    rope,
+    prep_eps,
+    q_scale,
+    q_fp8,
+    qkv_permuted,
+    gate,
+    gate_eps,
+):
     """The ONE2 launch (NM=16 at 2 KV heads), statement for statement, without PDL (eager)."""
     counters = _one2_counters(qkv.device)
     programs = triton.cdiv(max_blocks(window, rows) * BLOCK_N, _ONE2_KEYS)
@@ -968,17 +1096,52 @@ def _shadow_one2(qkv, kv_pool, block_tables, seq_lens, kv_scale, num_q_heads, nu
     sms = torch.cuda.get_device_properties(qkv.device).multi_processor_count
     part_o = torch.empty((groups * programs * 64, HEAD_DIM), dtype=torch.float32, device=qkv.device)
     part_ml = torch.empty((groups * programs * 64, 2), dtype=torch.float32, device=qkv.device)
-    out = torch.empty((qkv.shape[0], num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device)
+    out = torch.empty(
+        (qkv.shape[0], num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device
+    )
     options = {"maxnreg": 128} if programs * groups > sms else {}
     _swa_one2_kernel[(programs, num_kv_heads, reqs)](
-        qkv, qkv.stride(0), kv_pool, block_tables, block_tables.stride(1), seq_lens, kv_scale,
-        cos_sin if rope else kv_scale, positions if rope else seq_lens, prep_eps, q_scale, part_o, part_ml,
-        math.log2(math.e) / math.sqrt(HEAD_DIM), out, out.stride(0), gate, gate.stride(0), gate_head_stride(gate),
-        gate_eps, counters, M=rows, HQ=num_q_heads, HKV=num_kv_heads, D=HEAD_DIM, P=BLOCK_N, WINDOW=window,
-        KEYS=_ONE2_KEYS, S=programs, SP=triton.next_power_of_2(programs), RM=4, Q_FP8=q_fp8,
-        QKV_PERMUTED=qkv_permuted, APPLY_ROPE=rope, LAUNCH_WITH_PDL=False,
-        NM=16 if num_kv_heads == 2 else 4, num_warps=8, num_stages=1,
-        launch_pdl=False, **options)
+        qkv,
+        qkv.stride(0),
+        kv_pool,
+        block_tables,
+        block_tables.stride(1),
+        seq_lens,
+        kv_scale,
+        cos_sin if rope else kv_scale,
+        positions if rope else seq_lens,
+        prep_eps,
+        q_scale,
+        part_o,
+        part_ml,
+        math.log2(math.e) / math.sqrt(HEAD_DIM),
+        out,
+        out.stride(0),
+        gate,
+        gate.stride(0),
+        gate_head_stride(gate),
+        gate_eps,
+        counters,
+        M=rows,
+        HQ=num_q_heads,
+        HKV=num_kv_heads,
+        D=HEAD_DIM,
+        P=BLOCK_N,
+        WINDOW=window,
+        KEYS=_ONE2_KEYS,
+        S=programs,
+        SP=triton.next_power_of_2(programs),
+        RM=4,
+        Q_FP8=q_fp8,
+        QKV_PERMUTED=qkv_permuted,
+        APPLY_ROPE=rope,
+        LAUNCH_WITH_PDL=False,
+        NM=16 if num_kv_heads == 2 else 4,
+        num_warps=8,
+        num_stages=1,
+        launch_pdl=False,
+        **options,
+    )
     return out
 
 
@@ -1003,7 +1166,9 @@ def _shadow_put_kv(kv_pool, idx, rows_bytes):
         raw[pid, :, slot, :] = b
 
 
-def _shadow_ref64(prepped, kv_pool, block_tables, seq_lens, kv_scale, H, G, window, rows, reqs, gate, gate_eps):
+def _shadow_ref64(
+    prepped, kv_pool, block_tables, seq_lens, kv_scale, H, G, window, rows, reqs, gate, gate_eps
+):
     """fp64 attention + norm-gate over the pool as it is after the step (its K/V rows included), from the prepped
     q' (fp64 prep, BF16 at the op's three rounding points): {"exact": q' as is, "q8": q' through the op's E4M3}."""
     D = HEAD_DIM
@@ -1024,20 +1189,26 @@ def _shadow_ref64(prepped, kv_pool, block_tables, seq_lens, kv_scale, H, G, wind
 
         Kh = gather(0).repeat_interleave(H // G, dim=1)
         Vh = gather(1).repeat_interleave(H // G, dim=1)
-        q = prepped[r * rows:(r + 1) * rows, : H * D].reshape(rows, H, D)
-        q8 = (q.float() * sb).to(torch.bfloat16).float().clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        q = prepped[r * rows : (r + 1) * rows, : H * D].reshape(rows, H, D)
+        q8 = (
+            (q.float() * sb).to(torch.bfloat16).float().clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        )
         qs = {"exact": q.double(), "q8": q8.float().double() / scale}
         qp = past + torch.arange(rows, device=dev)
         mask = (j[None, :] <= qp[:, None]) & (j[None, :] > qp[:, None] - window)
         for k, qq in qs.items():
-            s = torch.einsum("thd,nhd->thn", qq, Kh) / math.sqrt(D)
+            s = torch.einsum("thd,nhd->thn", qq, Kh) / math.sqrt(D)  # codespell:ignore
             s = s.masked_fill(~mask[:, None, :], float("-inf"))
-            res[k].append(torch.einsum("thn,nhd->thd", torch.softmax(s, dim=-1), Vh))
+            res[k].append(
+                torch.einsum("thn,nhd->thd", torch.softmax(s, dim=-1), Vh)  # codespell:ignore
+            )
     sig = torch.sigmoid(gate.reshape(rows * reqs, H, D).double())
     out = {}
     for k, parts in res.items():
         x = torch.cat(parts)
-        out[k] = ((x * torch.rsqrt(x.square().mean(-1, keepdim=True) + gate_eps)) * sig).reshape(rows * reqs, H * D)
+        out[k] = ((x * torch.rsqrt(x.square().mean(-1, keepdim=True) + gate_eps)) * sig).reshape(
+            rows * reqs, H * D
+        )
     return out
 
 
@@ -1047,17 +1218,25 @@ _ULP_EDGES = (0.5, 1.0, 2.0, 4.0, 8.0)
 def _shadow_stats(y, ref):
     yd = y.double()
     d = (yd - ref).abs()
-    ulp = torch.exp2(torch.floor(torch.log2(ref.abs().clamp_min(2.0 ** -126))) - 7)
+    ulp = torch.exp2(torch.floor(torch.log2(ref.abs().clamp_min(2.0**-126))) - 7)
     u = d / ulp
     hist, prev = [], None
     for e in _ULP_EDGES:
         hist.append(int(((u <= e) & (u > prev)).sum()) if prev is not None else int((u <= e).sum()))
         prev = e
     hist.append(int((u > _ULP_EDGES[-1]).sum()))
-    return {"max_abs": float(d.max()), "mean_abs": float(d.mean()), "max_ulp": float(u.max()),
-            "mean_ulp": float(u.mean()), "ulp_hist": hist, "n": int(d.numel()),
-            "rn_frac": float((y.view(torch.int16) == ref.to(torch.bfloat16).view(torch.int16)).double().mean()),
-            "finite": bool(torch.isfinite(yd).all())}
+    return {
+        "max_abs": float(d.max()),
+        "mean_abs": float(d.mean()),
+        "max_ulp": float(u.max()),
+        "mean_ulp": float(u.mean()),
+        "ulp_hist": hist,
+        "n": int(d.numel()),
+        "rn_frac": float(
+            (y.view(torch.int16) == ref.to(torch.bfloat16).view(torch.int16)).double().mean()
+        ),
+        "finite": bool(torch.isfinite(yd).all()),
+    }
 
 
 def _shadow_compare(op, args, kw, rope, positions, rows, reqs):
@@ -1067,15 +1246,46 @@ def _shadow_compare(op, args, kw, rope, positions, rows, reqs):
     qkv, kv_pool, block_tables, seq_lens, kv_scale, H, G, window, num_splits = args
     if G == 2:
         # TEP8 steps of 5..8 requests (the ONE2 range at 2 KV heads)
-        eligible = (_cl8_eligible(qkv, kv_pool, H, G, window, rows, kw["q_fp8"], kw["fused_prep"], kw["gate"],
-                                  kw["cos_sin"], kw["position_ids"], 2)
-                    and _CL8_TEP8_MIN_REQUESTS <= reqs <= _CL8_TEP8_MAX_REQUESTS and kv_pool.shape[2] == BLOCK_N
-                    and _SWA_ONE2 and rows <= MAX_ROWS)
+        eligible = (
+            _cl8_eligible(
+                qkv,
+                kv_pool,
+                H,
+                G,
+                window,
+                rows,
+                kw["q_fp8"],
+                kw["fused_prep"],
+                kw["gate"],
+                kw["cos_sin"],
+                kw["position_ids"],
+                2,
+            )
+            and _CL8_TEP8_MIN_REQUESTS <= reqs <= _CL8_TEP8_MAX_REQUESTS
+            and kv_pool.shape[2] == BLOCK_N
+            and _SWA_ONE2
+            and rows <= MAX_ROWS
+        )
     else:
         # TEP4 steps of 2..4 requests
-        eligible = (_cl8_eligible(qkv, kv_pool, H, G, window, rows, kw["q_fp8"], kw["fused_prep"], kw["gate"],
-                                  kw["cos_sin"], kw["position_ids"], 4) and 2 <= reqs <= 4
-                    and kv_pool.shape[2] == BLOCK_N)
+        eligible = (
+            _cl8_eligible(
+                qkv,
+                kv_pool,
+                H,
+                G,
+                window,
+                rows,
+                kw["q_fp8"],
+                kw["fused_prep"],
+                kw["gate"],
+                kw["cos_sin"],
+                kw["position_ids"],
+                4,
+            )
+            and 2 <= reqs <= 4
+            and kv_pool.shape[2] == BLOCK_N
+        )
     if eligible:
         st["calls"] += 1
     if not eligible or (st["calls"] > _SHADOW_FIRST and st["calls"] % _SHADOW_EVERY):
@@ -1087,34 +1297,106 @@ def _shadow_compare(op, args, kw, rope, positions, rows, reqs):
     cs = kw["cos_sin"]
     use_cl8 = (_TEP8_SWA_CL8 == "1") if G == 2 else (_SWA_CL8 in ("1", "all"))
     idx = _shadow_rows_index(block_tables, seq_lens, rows, reqs)
-    o1 = _shadow_one2(qkv, kv_pool, block_tables, seq_lens, kv_scale, H, G, window, rows, reqs, cs, positions, rope,
-                      kw["prep_eps"], kw["q_scale"], kw["q_fp8"], kw["qkv_permuted"], kw["gate"], kw["gate_eps"])
+    o1 = _shadow_one2(
+        qkv,
+        kv_pool,
+        block_tables,
+        seq_lens,
+        kv_scale,
+        H,
+        G,
+        window,
+        rows,
+        reqs,
+        cs,
+        positions,
+        rope,
+        kw["prep_eps"],
+        kw["q_scale"],
+        kw["q_fp8"],
+        kw["qkv_permuted"],
+        kw["gate"],
+        kw["gate_eps"],
+    )
     kv1 = _shadow_get_kv(kv_pool, idx)
     fn = _cl8_function(qkv.device, rope and positions.dtype == torch.int64, G)
     o2 = torch.empty_like(o1)
-    _cl8_launch(fn, qkv, kv_pool, block_tables, seq_lens, kv_scale, cs, positions, kw["prep_eps"], kw["q_scale"],
-                kw["gate"], kw["gate_eps"], o2, kw["qkv_permuted"], False, rope)
+    _cl8_launch(
+        fn,
+        qkv,
+        kv_pool,
+        block_tables,
+        seq_lens,
+        kv_scale,
+        cs,
+        positions,
+        kw["prep_eps"],
+        kw["q_scale"],
+        kw["gate"],
+        kw["gate_eps"],
+        o2,
+        kw["qkv_permuted"],
+        False,
+        rope,
+    )
     kv2 = _shadow_get_kv(kv_pool, idx)
-    prepped, _ = _preattn_prep.reference(qkv, cs, positions if rope else None, H, G, kw["prep_eps"], kw["q_scale"],
-                                         kw["qkv_permuted"])
-    refs = _shadow_ref64(prepped, kv_pool, block_tables, seq_lens, kv_scale, H, G, window, rows, reqs, kw["gate"],
-                         kw["gate_eps"])
+    prepped, _ = _preattn_prep.reference(
+        qkv,
+        cs,
+        positions if rope else None,
+        H,
+        G,
+        kw["prep_eps"],
+        kw["q_scale"],
+        kw["qkv_permuted"],
+    )
+    refs = _shadow_ref64(
+        prepped,
+        kv_pool,
+        block_tables,
+        seq_lens,
+        kv_scale,
+        H,
+        G,
+        window,
+        rows,
+        reqs,
+        kw["gate"],
+        kw["gate_eps"],
+    )
     kw_ref = {k: v for k, v in kw.items() if k != "enable_pdl"}
     o3 = op.reference(*args, **kw_ref)
     kv3 = _shadow_get_kv(kv_pool, idx)
-    _shadow_put_kv(kv_pool, idx, kv2 if use_cl8 else kv1)  # the deployed arm's bytes stay in the pool
+    _shadow_put_kv(
+        kv_pool, idx, kv2 if use_cl8 else kv1
+    )  # the deployed arm's bytes stay in the pool
     torch.cuda.synchronize()
     rank = _shadow_rank()
-    rec = {"rank": rank, "call": st["calls"], "sample": st["samples"], "reqs": reqs, "rows": rows,
-           "L": [int(x) for x in seq_lens.tolist()], "rope": bool(rope), "qkv_permuted": bool(kw["qkv_permuted"]),
-           "q_scale": float(kw["q_scale"]), "prep_eps": float(kw["prep_eps"]), "gate_eps": float(kw["gate_eps"]),
-           "kv_scale": float(kv_scale.reshape(-1)[0]), "gate_shape": list(kw["gate"].shape),
-           "gate_strides": list(kw["gate"].stride()), "qkv_stride": qkv.stride(0), "bt_strides": list(block_tables.stride()),
-           "pos_dtype": str(positions.dtype) if positions is not None else None,
-           "kv_one2_vs_cl8": all(torch.equal(a, b) for a, b in zip(kv1, kv2)),
-           "kv_ref_vs_cl8": all(torch.equal(a, b) for a, b in zip(kv3, kv2)),
-           "cl8_vs_one2": {"max_abs": float((o2.float() - o1.float()).abs().max()),
-                           "differ_frac": float((o2.view(torch.int16) != o1.view(torch.int16)).double().mean())}}
+    rec = {
+        "rank": rank,
+        "call": st["calls"],
+        "sample": st["samples"],
+        "reqs": reqs,
+        "rows": rows,
+        "L": [int(x) for x in seq_lens.tolist()],
+        "rope": bool(rope),
+        "qkv_permuted": bool(kw["qkv_permuted"]),
+        "q_scale": float(kw["q_scale"]),
+        "prep_eps": float(kw["prep_eps"]),
+        "gate_eps": float(kw["gate_eps"]),
+        "kv_scale": float(kv_scale.reshape(-1)[0]),
+        "gate_shape": list(kw["gate"].shape),
+        "gate_strides": list(kw["gate"].stride()),
+        "qkv_stride": qkv.stride(0),
+        "bt_strides": list(block_tables.stride()),
+        "pos_dtype": str(positions.dtype) if positions is not None else None,
+        "kv_one2_vs_cl8": all(torch.equal(a, b) for a, b in zip(kv1, kv2)),
+        "kv_ref_vs_cl8": all(torch.equal(a, b) for a, b in zip(kv3, kv2)),
+        "cl8_vs_one2": {
+            "max_abs": float((o2.float() - o1.float()).abs().max()),
+            "differ_frac": float((o2.view(torch.int16) != o1.view(torch.int16)).double().mean()),
+        },
+    }
     for name, y in (("one2", o1), ("cl8", o2), ("ref", o3)):
         rec[name] = {k: _shadow_stats(y, ref) for k, ref in refs.items()}
     st["samples"] += 1
@@ -1129,39 +1411,65 @@ def _shadow_compare(op, args, kw, rope, positions, rows, reqs):
             L = int(seq_lens[r])
             lo = max(L - rows - window + 1, 0)
             for kv in range(2):
-                need.append(block_tables[r, kv, lo // BLOCK_N:(L - 1) // BLOCK_N + 1].long())
+                need.append(block_tables[r, kv, lo // BLOCK_N : (L - 1) // BLOCK_N + 1].long())
         need = torch.unique(torch.cat(need))
-        torch.save({"rec": rec, "qkv": qkv.detach().clone(), "gate": kw["gate"].detach().clone(),
-                    "gate_meta": {"shape": list(kw["gate"].shape), "strides": list(kw["gate"].stride()),
-                                  "offset_in_qkv": (kw["gate"].data_ptr() - qkv.data_ptr()) // 2},
-                    "block_tables": block_tables.detach().clone(), "seq_lens": seq_lens.detach().clone(),
-                    "positions": positions.detach().clone() if positions is not None else None,
-                    "cos_sin_rows": cs[positions.long()].detach().clone() if rope else None,
-                    "kv_scale": kv_scale.detach().clone(), "pages": need.cpu(),
-                    "pool_pages": kv_pool.view(torch.uint8)[need].detach().cpu(),
-                    "pool_shape": list(kv_pool.shape), "window": window, "H": H, "G": G, "num_splits": num_splits,
-                    "kw": {k: v for k, v in kw.items() if not torch.is_tensor(v)},
-                    "out_one2": o1.cpu(), "out_cl8": o2.cpu(), "out_ref": o3.cpu(),
-                    "kv_one2": [x.cpu() for x in kv1], "kv_cl8": [x.cpu() for x in kv2]},
-                   f"{tag}.bs{reqs}.{n_dump}.pt")
+        torch.save(
+            {
+                "rec": rec,
+                "qkv": qkv.detach().clone(),
+                "gate": kw["gate"].detach().clone(),
+                "gate_meta": {
+                    "shape": list(kw["gate"].shape),
+                    "strides": list(kw["gate"].stride()),
+                    "offset_in_qkv": (kw["gate"].data_ptr() - qkv.data_ptr()) // 2,
+                },
+                "block_tables": block_tables.detach().clone(),
+                "seq_lens": seq_lens.detach().clone(),
+                "positions": positions.detach().clone() if positions is not None else None,
+                "cos_sin_rows": cs[positions.long()].detach().clone() if rope else None,
+                "kv_scale": kv_scale.detach().clone(),
+                "pages": need.cpu(),
+                "pool_pages": kv_pool.view(torch.uint8)[need].detach().cpu(),
+                "pool_shape": list(kv_pool.shape),
+                "window": window,
+                "H": H,
+                "G": G,
+                "num_splits": num_splits,
+                "kw": {k: v for k, v in kw.items() if not torch.is_tensor(v)},
+                "out_one2": o1.cpu(),
+                "out_cl8": o2.cpu(),
+                "out_ref": o3.cpu(),
+                "kv_one2": [x.cpu() for x in kv1],
+                "kv_cl8": [x.cpu() for x in kv2],
+            },
+            f"{tag}.bs{reqs}.{n_dump}.pt",
+        )
     return o2 if use_cl8 else o1
 
 
 if _SWA_SHADOW:
-    _cl8_log(f"[musespark_open] swa_block SHADOW: MUSESPARK_OPEN_SWA_SHADOW={_SWA_SHADOW}: the first {_SHADOW_FIRST} "
-             f"then every {_SHADOW_EVERY}th eager multi-op call run ONE2 + CL8 + the reference vs fp64 "
-             f"(dumps {_SHADOW_DUMP} per request count; deployed arm {'CL8' if _SWA_CL8 in ('1', 'all') else 'ONE2'})")
-    _cl8_log(f"[musespark_open] swa_block SHADOW (TEP8): MUSESPARK_OPEN_SWA_SHADOW={_SWA_SHADOW}: the first "
-             f"{_SHADOW_FIRST} then every {_SHADOW_EVERY}th eager TEP8 multi-op call of {_CL8_TEP8_MIN_REQUESTS}-"
-             f"{_CL8_TEP8_MAX_REQUESTS} requests run ONE2 + CL8 + the reference vs fp64 (dumps {_SHADOW_DUMP} per "
-             f"request count; deployed arm {'CL8' if _TEP8_SWA_CL8 == '1' else 'ONE2'})")
+    _cl8_log(
+        f"[musespark_open] swa_block SHADOW: MUSESPARK_OPEN_SWA_SHADOW={_SWA_SHADOW}: the first {_SHADOW_FIRST} "
+        f"then every {_SHADOW_EVERY}th eager multi-op call run ONE2 + CL8 + the reference vs fp64 "
+        f"(dumps {_SHADOW_DUMP} per request count; deployed arm {'CL8' if _SWA_CL8 in ('1', 'all') else 'ONE2'})"
+    )
+    _cl8_log(
+        f"[musespark_open] swa_block SHADOW (TEP8): MUSESPARK_OPEN_SWA_SHADOW={_SWA_SHADOW}: the first "
+        f"{_SHADOW_FIRST} then every {_SHADOW_EVERY}th eager TEP8 multi-op call of {_CL8_TEP8_MIN_REQUESTS}-"
+        f"{_CL8_TEP8_MAX_REQUESTS} requests run ONE2 + CL8 + the reference vs fp64 (dumps {_SHADOW_DUMP} per "
+        f"request count; deployed arm {'CL8' if _TEP8_SWA_CL8 == '1' else 'ONE2'})"
+    )
 if _SWA_CL8 not in ("0", ""):
-    _cl8_log(f"[musespark_open] swa_block CL8 gate: MUSESPARK_OPEN_SWA_CL8={_SWA_CL8} "
-             f"({'1-4' if _SWA_CL8 == 'all' else '2-4'} requests per TEP4 decode step run the one-cluster SWA block)")
+    _cl8_log(
+        f"[musespark_open] swa_block CL8 gate: MUSESPARK_OPEN_SWA_CL8={_SWA_CL8} "
+        f"({'1-4' if _SWA_CL8 == 'all' else '2-4'} requests per TEP4 decode step run the one-cluster SWA block)"
+    )
 if _TEP8_SWA_CL8 not in ("0", ""):
-    _cl8_log(f"[musespark_open] swa_block CL8 gate (TEP8): MUSESPARK_OPEN_TEP8_SWA_CL8={_TEP8_SWA_CL8} "
-             f"({_CL8_TEP8_MIN_REQUESTS}-{_CL8_TEP8_MAX_REQUESTS} requests per TEP8 decode step run the one-cluster "
-             "SWA block)")
+    _cl8_log(
+        f"[musespark_open] swa_block CL8 gate (TEP8): MUSESPARK_OPEN_TEP8_SWA_CL8={_TEP8_SWA_CL8} "
+        f"({_CL8_TEP8_MIN_REQUESTS}-{_CL8_TEP8_MAX_REQUESTS} requests per TEP8 decode step run the one-cluster "
+        "SWA block)"
+    )
 
 
 def _split_maxnreg(ctas: int, device: torch.device) -> dict:
@@ -1602,12 +1910,41 @@ def _rows_norm_gate_sum_of_squares(x, RM: tl.constexpr):
 
 @triton.jit
 def _swa_one_launch_kernel(
-    qkv_ptr, qkv_stride, pool_ptr, bt_ptr, bt_stride_kv, seq_len_ptr, scale_ptr, cos_sin_ptr, positions_ptr,
-    prep_eps, q_scale, part_o_ptr, part_ml_ptr, sm_scale_log2,
-    out_ptr, out_stride, gate_ptr, gate_token_stride, gate_head_stride, gate_eps, cnt_ptr,
-    M: tl.constexpr, HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr, P: tl.constexpr,
-    WINDOW: tl.constexpr, KEYS: tl.constexpr, S: tl.constexpr, SP: tl.constexpr, RM: tl.constexpr,
-    Q_FP8: tl.constexpr, QKV_PERMUTED: tl.constexpr, APPLY_ROPE: tl.constexpr, LAUNCH_WITH_PDL: tl.constexpr,
+    qkv_ptr,
+    qkv_stride,
+    pool_ptr,
+    bt_ptr,
+    bt_stride_kv,
+    seq_len_ptr,
+    scale_ptr,
+    cos_sin_ptr,
+    positions_ptr,
+    prep_eps,
+    q_scale,
+    part_o_ptr,
+    part_ml_ptr,
+    sm_scale_log2,
+    out_ptr,
+    out_stride,
+    gate_ptr,
+    gate_token_stride,
+    gate_head_stride,
+    gate_eps,
+    cnt_ptr,
+    M: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    D: tl.constexpr,
+    P: tl.constexpr,
+    WINDOW: tl.constexpr,
+    KEYS: tl.constexpr,
+    S: tl.constexpr,
+    SP: tl.constexpr,
+    RM: tl.constexpr,
+    Q_FP8: tl.constexpr,
+    QKV_PERMUTED: tl.constexpr,
+    APPLY_ROPE: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
 ):
     """The sliding-window block of several sequences in one launch (MUSESPARK_OPEN_SWA_ONE_LAUNCH).
 
@@ -1664,8 +2001,12 @@ def _swa_one_launch_kernel(
     page_k = tl.load(bt_ptr + j // P, mask=cached, other=0).to(tl.int64)
     page_v = tl.load(bt_ptr + bt_stride_kv + j // P, mask=cached, other=0).to(tl.int64)
     in_page = (h * P + j % P) * D
-    k_old = tl.load(pool_ptr + (page_k * PAGE + in_page)[:, None] + d[None, :], mask=cached[:, None], other=0.0)
-    v_old = tl.load(pool_ptr + (page_v * PAGE + in_page)[:, None] + d[None, :], mask=cached[:, None], other=0.0)
+    k_old = tl.load(
+        pool_ptr + (page_k * PAGE + in_page)[:, None] + d[None, :], mask=cached[:, None], other=0.0
+    )
+    v_old = tl.load(
+        pool_ptr + (page_v * PAGE + in_page)[:, None] + d[None, :], mask=cached[:, None], other=0.0
+    )
     writer = s_id == 0
     tok = tl.arange(0, 8)
     tok_ok = tok < M
@@ -1692,26 +2033,52 @@ def _swa_one_launch_kernel(
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
     g = tl.load(
-        gate_ptr + t_m[:, None] * gate_token_stride + head_m[:, None] * gate_head_stride + d[None, :],
+        gate_ptr
+        + t_m[:, None] * gate_token_stride
+        + head_m[:, None] * gate_head_stride
+        + d[None, :],
         mask=rm_ok[:, None],
         other=0.0,
     )
     if writer:
         k_w = _prep_rows(
-            qkv_ptr, tok * qkv_stride, tl.zeros([8], tl.int32) + k_col, tok_ok, cos_w, sin_w, 1.0, prep_eps, 8,
+            qkv_ptr,
+            tok * qkv_stride,
+            tl.zeros([8], tl.int32) + k_col,
+            tok_ok,
+            cos_w,
+            sin_w,
+            1.0,
+            prep_eps,
+            8,
             APPLY_ROPE,
         )
-        v_w = tl.load(qkv_ptr + tok[:, None] * qkv_stride + v_col + d[None, :], mask=tok_ok[:, None], other=0.0)
+        v_w = tl.load(
+            qkv_ptr + tok[:, None] * qkv_stride + v_col + d[None, :],
+            mask=tok_ok[:, None],
+            other=0.0,
+        )
         tl.store(
-            pool_ptr + (w_page_k * PAGE + slot)[:, None] + d[None, :], _to_cache_fp8(k_w, scale_bf16),
+            pool_ptr + (w_page_k * PAGE + slot)[:, None] + d[None, :],
+            _to_cache_fp8(k_w, scale_bf16),
             mask=tok_ok[:, None],
         )
         tl.store(
-            pool_ptr + (w_page_v * PAGE + slot)[:, None] + d[None, :], _to_cache_fp8(v_w, scale_bf16),
+            pool_ptr + (w_page_v * PAGE + slot)[:, None] + d[None, :],
+            _to_cache_fp8(v_w, scale_bf16),
             mask=tok_ok[:, None],
         )
     q = _prep_rows(
-        qkv_ptr, t * qkv_stride, q_head * q_stride, row_ok, cos_q, sin_q, q_scale, prep_eps, R, APPLY_ROPE
+        qkv_ptr,
+        t * qkv_stride,
+        q_head * q_stride,
+        row_ok,
+        cos_q,
+        sin_q,
+        q_scale,
+        prep_eps,
+        R,
+        APPLY_ROPE,
     )
     q = tl.where(row_ok[:, None], q, 0.0)
     qk_scale = sm_scale_log2 * dequant
@@ -1722,15 +2089,27 @@ def _swa_one_launch_kernel(
     k_new = tl.zeros([KEYS, D], tl.bfloat16)
     if has_new:
         k_new = _prep_rows(
-            qkv_ptr, new_row * qkv_stride, tl.zeros([KEYS], tl.int32) + k_col, new, cos_k, sin_k, 1.0, prep_eps,
-            KEYS, APPLY_ROPE,
+            qkv_ptr,
+            new_row * qkv_stride,
+            tl.zeros([KEYS], tl.int32) + k_col,
+            new,
+            cos_k,
+            sin_k,
+            1.0,
+            prep_eps,
+            KEYS,
+            APPLY_ROPE,
         )
-    v_new = tl.load(qkv_ptr + new_row[:, None] * qkv_stride + v_col + d[None, :], mask=new[:, None], other=0.0)
+    v_new = tl.load(
+        qkv_ptr + new_row[:, None] * qkv_stride + v_col + d[None, :], mask=new[:, None], other=0.0
+    )
     k = tl.where(new[:, None], _to_cache_fp8(k_new, scale_bf16), k_old)
     v = tl.where(new[:, None], _to_cache_fp8(v_new, scale_bf16), v_old)
     sc = tl.dot(q, tl.trans(k.to(tl.bfloat16))) * qk_scale
     q_pos = past + t
-    keep = (j[None, :] <= q_pos[:, None]) & (j[None, :] >= lo) & (j[None, :] > q_pos[:, None] - WINDOW)
+    keep = (
+        (j[None, :] <= q_pos[:, None]) & (j[None, :] >= lo) & (j[None, :] > q_pos[:, None] - WINDOW)
+    )
     sc = tl.where(keep, sc, -float("inf"))
     m_i = tl.maximum(tl.full([R], -1.0e30, tl.float32), tl.max(sc, 1))
     pr = tl.math.exp2(sc - m_i[:, None])
@@ -1752,8 +2131,18 @@ def _swa_one_launch_kernel(
     sp = tl.arange(0, SP)
     s_ok = sp < S
     pidx = sp[:, None] * R + rm[None, :]
-    mm = tl.load(part_ml_ptr + pidx * 2, mask=s_ok[:, None] & rm_ok[None, :], other=-1.0e30, cache_modifier=".cg")
-    ll = tl.load(part_ml_ptr + pidx * 2 + 1, mask=s_ok[:, None] & rm_ok[None, :], other=0.0, cache_modifier=".cg")
+    mm = tl.load(
+        part_ml_ptr + pidx * 2,
+        mask=s_ok[:, None] & rm_ok[None, :],
+        other=-1.0e30,
+        cache_modifier=".cg",
+    )
+    ll = tl.load(
+        part_ml_ptr + pidx * 2 + 1,
+        mask=s_ok[:, None] & rm_ok[None, :],
+        other=0.0,
+        cache_modifier=".cg",
+    )
     m_max = tl.max(mm, 0)
     w = tl.where(s_ok[:, None] & (ll > 0), tl.math.exp2(mm - m_max[None, :]), 0.0)
     den = tl.sum(w * ll, 0)
@@ -1771,7 +2160,9 @@ def _swa_one_launch_kernel(
     sigmoid = tl.sigmoid(g.to(tl.float32)).to(tl.bfloat16)
     result = normed.to(tl.float32) * sigmoid.to(tl.float32)
     tl.store(
-        out_ptr + t_m[:, None] * out_stride + head_m[:, None] * D + d[None, :], result, mask=rm_ok[:, None]
+        out_ptr + t_m[:, None] * out_stride + head_m[:, None] * D + d[None, :],
+        result,
+        mask=rm_ok[:, None],
     )
     left = tl.atomic_add(cnt_ptr + group * 2 + 1, 1, sem="acq_rel", scope="gpu")
     if left == S - 1:
@@ -1781,13 +2172,43 @@ def _swa_one_launch_kernel(
 
 @triton.jit
 def _swa_one2_kernel(
-    qkv_ptr, qkv_stride, pool_ptr, bt_ptr, bt_stride_kv, seq_len_ptr, scale_ptr, cos_sin_ptr, positions_ptr,
-    prep_eps, q_scale, part_o_ptr, part_ml_ptr, sm_scale_log2,
-    out_ptr, out_stride, gate_ptr, gate_token_stride, gate_head_stride, gate_eps, cnt_ptr,
-    M: tl.constexpr, HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr, P: tl.constexpr,
-    WINDOW: tl.constexpr, KEYS: tl.constexpr, S: tl.constexpr, SP: tl.constexpr, RM: tl.constexpr,
-    Q_FP8: tl.constexpr, QKV_PERMUTED: tl.constexpr, APPLY_ROPE: tl.constexpr, LAUNCH_WITH_PDL: tl.constexpr,
-    ABL: tl.constexpr = 0, NM: tl.constexpr = 4,
+    qkv_ptr,
+    qkv_stride,
+    pool_ptr,
+    bt_ptr,
+    bt_stride_kv,
+    seq_len_ptr,
+    scale_ptr,
+    cos_sin_ptr,
+    positions_ptr,
+    prep_eps,
+    q_scale,
+    part_o_ptr,
+    part_ml_ptr,
+    sm_scale_log2,
+    out_ptr,
+    out_stride,
+    gate_ptr,
+    gate_token_stride,
+    gate_head_stride,
+    gate_eps,
+    cnt_ptr,
+    M: tl.constexpr,
+    HQ: tl.constexpr,
+    HKV: tl.constexpr,
+    D: tl.constexpr,
+    P: tl.constexpr,
+    WINDOW: tl.constexpr,
+    KEYS: tl.constexpr,
+    S: tl.constexpr,
+    SP: tl.constexpr,
+    RM: tl.constexpr,
+    Q_FP8: tl.constexpr,
+    QKV_PERMUTED: tl.constexpr,
+    APPLY_ROPE: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
+    ABL: tl.constexpr = 0,  # codespell:ignore
+    NM: tl.constexpr = 4,
 ):
     G: tl.constexpr = HQ // HKV
     R: tl.constexpr = 8 * G  # 64 query rows of one KV head: 8 token slots x 8 query heads
@@ -1829,8 +2250,12 @@ def _swa_one2_kernel(
     page_k = tl.load(bt_ptr + j // P, mask=cached, other=0).to(tl.int64)
     page_v = tl.load(bt_ptr + bt_stride_kv + j // P, mask=cached, other=0).to(tl.int64)
     in_page = (h * P + j % P) * D
-    k_old = tl.load(pool_ptr + (page_k * PAGE + in_page)[:, None] + d[None, :], mask=cached[:, None], other=0.0)
-    v_old = tl.load(pool_ptr + (page_v * PAGE + in_page)[:, None] + d[None, :], mask=cached[:, None], other=0.0)
+    k_old = tl.load(
+        pool_ptr + (page_k * PAGE + in_page)[:, None] + d[None, :], mask=cached[:, None], other=0.0
+    )
+    v_old = tl.load(
+        pool_ptr + (page_v * PAGE + in_page)[:, None] + d[None, :], mask=cached[:, None], other=0.0
+    )
     holds_new = base + s_id * KEYS + KEYS > past
     tok = tl.arange(0, 16)
     tok_ok = tok < M
@@ -1854,22 +2279,53 @@ def _swa_one2_kernel(
     k16 = tl.zeros([16, D], tl.bfloat16)
     v16 = tl.zeros([16, D], tl.bfloat16)
     if holds_new:
-        k_w = _prep_rows(qkv_ptr, tok * qkv_stride, tl.zeros([16], tl.int32) + k_col, tok_ok, cos_w, sin_w, 1.0,
-                         prep_eps, 16, APPLY_ROPE)
-        v_w = tl.load(qkv_ptr + tok[:, None] * qkv_stride + v_col + d[None, :], mask=tok_ok[:, None], other=0.0)
+        k_w = _prep_rows(
+            qkv_ptr,
+            tok * qkv_stride,
+            tl.zeros([16], tl.int32) + k_col,
+            tok_ok,
+            cos_w,
+            sin_w,
+            1.0,
+            prep_eps,
+            16,
+            APPLY_ROPE,
+        )
+        v_w = tl.load(
+            qkv_ptr + tok[:, None] * qkv_stride + v_col + d[None, :],
+            mask=tok_ok[:, None],
+            other=0.0,
+        )
         k8 = _to_cache_fp8(k_w, scale_bf16)
         v8 = _to_cache_fp8(v_w, scale_bf16)
-        tl.store(pool_ptr + (w_page_k * PAGE + slot)[:, None] + d[None, :], k8, mask=tok_ok[:, None])
-        tl.store(pool_ptr + (w_page_v * PAGE + slot)[:, None] + d[None, :], v8, mask=tok_ok[:, None])
+        tl.store(
+            pool_ptr + (w_page_k * PAGE + slot)[:, None] + d[None, :], k8, mask=tok_ok[:, None]
+        )
+        tl.store(
+            pool_ptr + (w_page_v * PAGE + slot)[:, None] + d[None, :], v8, mask=tok_ok[:, None]
+        )
         k16 = tl.where(tok_ok[:, None], k8.to(tl.bfloat16), 0.0)
         v16 = tl.where(tok_ok[:, None], v8.to(tl.bfloat16), 0.0)
 
-    if ABL >= 2:  # ablation: raw q, no prep
-        q = tl.load(qkv_ptr + t[:, None] * qkv_stride + (q_head * q_stride)[:, None] + d[None, :],
-                    mask=row_ok[:, None], other=0.0)
+    if ABL >= 2:  # ablation: raw q, no prep  # codespell:ignore
+        q = tl.load(
+            qkv_ptr + t[:, None] * qkv_stride + (q_head * q_stride)[:, None] + d[None, :],
+            mask=row_ok[:, None],
+            other=0.0,
+        )
     else:
-        q = _prep_rows(qkv_ptr, t * qkv_stride, q_head * q_stride, row_ok, cos_q, sin_q, q_scale, prep_eps, R,
-                       APPLY_ROPE)
+        q = _prep_rows(
+            qkv_ptr,
+            t * qkv_stride,
+            q_head * q_stride,
+            row_ok,
+            cos_q,
+            sin_q,
+            q_scale,
+            prep_eps,
+            R,
+            APPLY_ROPE,
+        )
     q = tl.where(row_ok[:, None], q, 0.0)
     qk_scale = sm_scale_log2 * dequant
     if Q_FP8:
@@ -1883,26 +2339,35 @@ def _swa_one2_kernel(
         v_ins = tl.dot(onehot, v16)
         k = tl.where(new[:, None], k_ins.to(tl.bfloat16), k)
         v = tl.where(new[:, None], v_ins.to(tl.bfloat16), v)
-    if ABL >= 3:  # ablation: no MMA / softmax work
-        sc = tl.zeros([R, KEYS], tl.float32) + tl.sum(k.to(tl.float32), 1)[None, :] * 0.0 + tl.sum(
-            q.to(tl.float32), 1)[:, None] * 0.0
+    if ABL >= 3:  # ablation: no MMA / softmax work  # codespell:ignore
+        sc = (
+            tl.zeros([R, KEYS], tl.float32)
+            + tl.sum(k.to(tl.float32), 1)[None, :] * 0.0
+            + tl.sum(q.to(tl.float32), 1)[:, None] * 0.0
+        )
     else:
         sc = tl.dot(q, tl.trans(k)) * qk_scale
     q_pos = past + t
-    keep = (j[None, :] <= q_pos[:, None]) & (j[None, :] >= lo) & (j[None, :] > q_pos[:, None] - WINDOW)
+    keep = (
+        (j[None, :] <= q_pos[:, None]) & (j[None, :] >= lo) & (j[None, :] > q_pos[:, None] - WINDOW)
+    )
     sc = tl.where(keep, sc, -float("inf"))
     m_i = tl.maximum(tl.full([R], -1.0e30, tl.float32), tl.max(sc, 1))
     p = tl.math.exp2(sc - m_i[:, None])
     l_i = tl.sum(p, 1)
-    if ABL >= 3:
-        acc = tl.zeros([R, D], tl.float32) + tl.sum(v.to(tl.float32), 0)[None, :] * 0.0 + l_i[:, None] * 0.0
+    if ABL >= 3:  # codespell:ignore
+        acc = (
+            tl.zeros([R, D], tl.float32)
+            + tl.sum(v.to(tl.float32), 0)[None, :] * 0.0
+            + l_i[:, None] * 0.0
+        )
     else:
         acc = tl.dot(p.to(tl.bfloat16), v)
     tl.store(part_o_ptr + (s_id * R + r)[:, None] * D + d[None, :], acc * dequant)
     tl.store(part_ml_ptr + (s_id * R + r) * 2, m_i)
     tl.store(part_ml_ptr + (s_id * R + r) * 2 + 1, l_i)
 
-    if ABL >= 1:  # ablation: partial only, no barrier / merge / norm-gate
+    if ABL >= 1:  # ablation: partial only, no barrier / merge / norm-gate  # codespell:ignore
         return
     # ---- arrive; the last NM arrivals of the group each merge 64 / NM rows once all S partials are stored
     _fence_acq_rel_gpu(tl.zeros([R], tl.int32))
@@ -1918,18 +2383,38 @@ def _swa_one2_kernel(
         while cur < S:
             cur = tl.atomic_add(cnt_ptr + group * 2, 0, sem="acquire", scope="gpu")
         tl.debug_barrier()
-        g = tl.load(gate_ptr + t_m[:, None] * gate_token_stride + head_m[:, None] * gate_head_stride + d[None, :],
-                    mask=rm_ok[:, None], other=0.0)
+        g = tl.load(
+            gate_ptr
+            + t_m[:, None] * gate_token_stride
+            + head_m[:, None] * gate_head_stride
+            + d[None, :],
+            mask=rm_ok[:, None],
+            other=0.0,
+        )
         sp = tl.arange(0, SP)
         s_ok = sp < S
         pidx = sp[:, None] * R + rm[None, :]  # [SP, RM2]
-        mm = tl.load(part_ml_ptr + pidx * 2, mask=s_ok[:, None] & rm_ok[None, :], other=-1.0e30, cache_modifier=".cg")
-        ll = tl.load(part_ml_ptr + pidx * 2 + 1, mask=s_ok[:, None] & rm_ok[None, :], other=0.0, cache_modifier=".cg")
+        mm = tl.load(
+            part_ml_ptr + pidx * 2,
+            mask=s_ok[:, None] & rm_ok[None, :],
+            other=-1.0e30,
+            cache_modifier=".cg",
+        )
+        ll = tl.load(
+            part_ml_ptr + pidx * 2 + 1,
+            mask=s_ok[:, None] & rm_ok[None, :],
+            other=0.0,
+            cache_modifier=".cg",
+        )
         m_max = tl.max(mm, 0)
         w = tl.where(s_ok[:, None] & (ll > 0), tl.math.exp2(mm - m_max[None, :]), 0.0)
         den = tl.sum(w * ll, 0)
-        o = tl.load(part_o_ptr + pidx[:, :, None] * D + d[None, None, :],
-                    mask=(s_ok[:, None] & rm_ok[None, :])[:, :, None], other=0.0, cache_modifier=".cg")
+        o = tl.load(
+            part_o_ptr + pidx[:, :, None] * D + d[None, None, :],
+            mask=(s_ok[:, None] & rm_ok[None, :])[:, :, None],
+            other=0.0,
+            cache_modifier=".cg",
+        )
         num = tl.sum(o * w[:, :, None], 0)
         attention = (num / den[:, None]).to(tl.bfloat16)
         x = attention.to(tl.float32)
@@ -1937,8 +2422,11 @@ def _swa_one2_kernel(
         normed = (x * tl.rsqrt(variance + gate_eps)[:, None]).to(tl.bfloat16)
         sig = tl.sigmoid(g.to(tl.float32)).to(tl.bfloat16)
         res = normed.to(tl.float32) * sig.to(tl.float32)
-        tl.store(out_ptr + t_m[:, None] * out_stride + head_m[:, None] * D + d[None, :], res.to(tl.bfloat16),
-                 mask=rm_ok[:, None])
+        tl.store(
+            out_ptr + t_m[:, None] * out_stride + head_m[:, None] * D + d[None, :],
+            res.to(tl.bfloat16),
+            mask=rm_ok[:, None],
+        )
         left = tl.atomic_add(cnt_ptr + group * 2 + 1, 1, sem="acq_rel", scope="gpu")
         if left == NM - 1:
             tl.atomic_xchg(cnt_ptr + group * 2, 0, sem="relaxed", scope="gpu")
@@ -2133,14 +2621,43 @@ class SwaBlockAttention(OpWrapper):
                 f"swa_block's gate must be BF16 [rows, H * {HEAD_DIM}] or [rows, H, {HEAD_DIM}] "
                 f"with unit last stride, got {gate.dtype} {tuple(gate.shape)}"
             )
-        if _SWA_CL8 == "all" and _cl8_eligible(qkv, kv_pool, num_q_heads, num_kv_heads, window, rows, q_fp8,
-                                               fused_prep, gate, cos_sin, position_ids, 4):
+        if _SWA_CL8 == "all" and _cl8_eligible(
+            qkv,
+            kv_pool,
+            num_q_heads,
+            num_kv_heads,
+            window,
+            rows,
+            q_fp8,
+            fused_prep,
+            gate,
+            cos_sin,
+            position_ids,
+            4,
+        ):
             fn = _cl8_function(qkv.device, rope and positions.dtype == torch.int64, 4)
             if fn is not None:
-                out = torch.empty((rows, num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device)
-                return _cl8_launch(fn, qkv, kv_pool, block_tables.unsqueeze(0) if block_tables.dim() == 2 else
-                                   block_tables, seq_lens, kv_scale_orig_quant, cos_sin, positions, prep_eps, q_scale,
-                                   gate, gate_eps, out, qkv_permuted, enable_pdl and _CL8_PDL, rope)
+                out = torch.empty(
+                    (rows, num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device
+                )
+                return _cl8_launch(
+                    fn,
+                    qkv,
+                    kv_pool,
+                    block_tables.unsqueeze(0) if block_tables.dim() == 2 else block_tables,
+                    seq_lens,
+                    kv_scale_orig_quant,
+                    cos_sin,
+                    positions,
+                    prep_eps,
+                    q_scale,
+                    gate,
+                    gate_eps,
+                    out,
+                    qkv_permuted,
+                    enable_pdl and _CL8_PDL,
+                    rope,
+                )
         out = torch.empty((rows, num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device)
         group_rows = rows * Q_PER_KV
         part_o = torch.empty(
@@ -2399,7 +2916,9 @@ class SwaBlockMultiAttention(OpWrapper):
         if (
             # ONE2 lifts the cap to 8 at TEP8 (2 KV heads), as kernels/swa_block/attention.py's caller does;
             # 4 KV heads keep 2..4.
-            not 2 <= reqs <= (_ONE2_MAX_REQUESTS if _SWA_ONE2 and num_kv_heads == 2 else MULTI_MAX_REQUESTS)
+            not 2
+            <= reqs
+            <= (_ONE2_MAX_REQUESTS if _SWA_ONE2 and num_kv_heads == 2 else MULTI_MAX_REQUESTS)
             or rows * reqs != total
             or not 1 <= rows <= MAX_ROWS
             or qkv.dtype != torch.bfloat16
@@ -2468,39 +2987,128 @@ class SwaBlockMultiAttention(OpWrapper):
         if _SWA_SHADOW and not _SHADOW["bypass"] and not torch.cuda.is_current_stream_capturing():
             return _shadow_compare(
                 self,
-                (qkv, kv_pool, block_tables, seq_lens, kv_scale_orig_quant, num_q_heads, num_kv_heads, window,
-                 num_splits),
-                dict(q_fp8=q_fp8, fused_prep=fused_prep, cos_sin=cos_sin, position_ids=position_ids, prep_eps=prep_eps,
-                     q_scale=q_scale, qkv_permuted=qkv_permuted, gate=gate, gate_eps=gate_eps, enable_pdl=enable_pdl),
-                rope, positions, rows, reqs)
-        if _SWA_CL8 in ("1", "all") and _cl8_eligible(qkv, kv_pool, num_q_heads, num_kv_heads, window, rows, q_fp8,
-                                                     fused_prep, gate, cos_sin, position_ids, 4):
+                (
+                    qkv,
+                    kv_pool,
+                    block_tables,
+                    seq_lens,
+                    kv_scale_orig_quant,
+                    num_q_heads,
+                    num_kv_heads,
+                    window,
+                    num_splits,
+                ),
+                dict(
+                    q_fp8=q_fp8,
+                    fused_prep=fused_prep,
+                    cos_sin=cos_sin,
+                    position_ids=position_ids,
+                    prep_eps=prep_eps,
+                    q_scale=q_scale,
+                    qkv_permuted=qkv_permuted,
+                    gate=gate,
+                    gate_eps=gate_eps,
+                    enable_pdl=enable_pdl,
+                ),
+                rope,
+                positions,
+                rows,
+                reqs,
+            )
+        if _SWA_CL8 in ("1", "all") and _cl8_eligible(
+            qkv,
+            kv_pool,
+            num_q_heads,
+            num_kv_heads,
+            window,
+            rows,
+            q_fp8,
+            fused_prep,
+            gate,
+            cos_sin,
+            position_ids,
+            4,
+        ):
             fn = _cl8_function(qkv.device, rope and positions.dtype == torch.int64, 4)
             if fn is not None:
-                out = torch.empty((total, num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device)
-                return _cl8_launch(fn, qkv, kv_pool, block_tables, seq_lens, kv_scale_orig_quant, cos_sin, positions,
-                                   prep_eps, q_scale, gate, gate_eps, out, qkv_permuted, enable_pdl and _CL8_PDL, rope)
+                out = torch.empty(
+                    (total, num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device
+                )
+                return _cl8_launch(
+                    fn,
+                    qkv,
+                    kv_pool,
+                    block_tables,
+                    seq_lens,
+                    kv_scale_orig_quant,
+                    cos_sin,
+                    positions,
+                    prep_eps,
+                    q_scale,
+                    gate,
+                    gate_eps,
+                    out,
+                    qkv_permuted,
+                    enable_pdl and _CL8_PDL,
+                    rope,
+                )
         if (
             _TEP8_SWA_CL8 == "1"
             and _CL8_TEP8_MIN_REQUESTS <= reqs <= _CL8_TEP8_MAX_REQUESTS
             and page == BLOCK_N
-            and _cl8_eligible(qkv, kv_pool, num_q_heads, num_kv_heads, window, rows, q_fp8, fused_prep, gate,
-                              cos_sin, position_ids, 2)
+            and _cl8_eligible(
+                qkv,
+                kv_pool,
+                num_q_heads,
+                num_kv_heads,
+                window,
+                rows,
+                q_fp8,
+                fused_prep,
+                gate,
+                cos_sin,
+                position_ids,
+                2,
+            )
         ):
             # The one-cluster SWA block at TEP8 (MUSESPARK_OPEN_TEP8_SWA_CL8=1).
-            fn = _cl8_tep8_function(qkv.device, rope and positions.dtype == torch.int64, num_kv_heads, reqs)
+            fn = _cl8_tep8_function(
+                qkv.device, rope and positions.dtype == torch.int64, num_kv_heads, reqs
+            )
             if fn is not None:
-                out = torch.empty((total, num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device)
-                return _cl8_launch(fn, qkv, kv_pool, block_tables, seq_lens, kv_scale_orig_quant, cos_sin, positions,
-                                   prep_eps, q_scale, gate, gate_eps, out, qkv_permuted, enable_pdl and _CL8_PDL, rope)
+                out = torch.empty(
+                    (total, num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device
+                )
+                return _cl8_launch(
+                    fn,
+                    qkv,
+                    kv_pool,
+                    block_tables,
+                    seq_lens,
+                    kv_scale_orig_quant,
+                    cos_sin,
+                    positions,
+                    prep_eps,
+                    q_scale,
+                    gate,
+                    gate_eps,
+                    out,
+                    qkv_permuted,
+                    enable_pdl and _CL8_PDL,
+                    rope,
+                )
         out = torch.empty((total, num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device)
         group_rows = rows * Q_PER_KV
         sms = None
         if _SWA_ONE_LAUNCH or _SWA_ROWS64 or _SWA_PREP_SPLIT or _SWA_ONE2:
-            index = qkv.device.index if qkv.device.index is not None else torch.cuda.current_device()
+            index = (
+                qkv.device.index if qkv.device.index is not None else torch.cuda.current_device()
+            )
             sms = _SM_COUNT.get(index)
             if sms is None:
-                sms = _SM_COUNT[index] = torch.cuda.get_device_properties(index).multi_processor_count
+                sms = _SM_COUNT[index] = torch.cuda.get_device_properties(
+                    index
+                ).multi_processor_count
         # The image's 32-row split grid; the alternatives apply only where it takes more than one wave.
         multi_wave = sms is not None and (
             num_splits * num_kv_heads * reqs * triton.cdiv(group_rows, ROWS_PER_PROGRAM)
@@ -2521,8 +3129,12 @@ class SwaBlockMultiAttention(OpWrapper):
             programs = triton.cdiv(max_blocks(window, rows) * BLOCK_N, _ONE2_KEYS)
             groups = reqs * num_kv_heads
             if counters is not None and 2 * groups <= counters.numel() and programs >= 4:
-                part_o = torch.empty((groups * programs * 64, HEAD_DIM), dtype=torch.float32, device=qkv.device)
-                part_ml = torch.empty((groups * programs * 64, 2), dtype=torch.float32, device=qkv.device)
+                part_o = torch.empty(
+                    (groups * programs * 64, HEAD_DIM), dtype=torch.float32, device=qkv.device
+                )
+                part_ml = torch.empty(
+                    (groups * programs * 64, 2), dtype=torch.float32, device=qkv.device
+                )
                 options = {"maxnreg": 128} if programs * groups > sms else {}
                 _swa_one2_kernel[(programs, num_kv_heads, reqs)](
                     qkv,
@@ -2571,10 +3183,18 @@ class SwaBlockMultiAttention(OpWrapper):
         if _SWA_ONE_LAUNCH and multi_wave and fused_prep and gate is not None:
             programs = _one_launch_programs(window, rows)
             counters = _one_launch_counters(qkv.device)
-            if programs * num_kv_heads * reqs <= sms and counters is not None and 2 * reqs * num_kv_heads <= 4096:
-                rows_merged = triton.next_power_of_2(triton.cdiv(64, programs))  # 64 rows: 8 slots x 8 heads
+            if (
+                programs * num_kv_heads * reqs <= sms
+                and counters is not None
+                and 2 * reqs * num_kv_heads <= 4096
+            ):
+                rows_merged = triton.next_power_of_2(
+                    triton.cdiv(64, programs)
+                )  # 64 rows: 8 slots x 8 heads
                 part_o = torch.empty(
-                    (reqs * num_kv_heads * programs * 64, HEAD_DIM), dtype=torch.float32, device=qkv.device
+                    (reqs * num_kv_heads * programs * 64, HEAD_DIM),
+                    dtype=torch.float32,
+                    device=qkv.device,
                 )
                 part_ml = torch.empty(
                     (reqs * num_kv_heads * programs * 64, 2), dtype=torch.float32, device=qkv.device

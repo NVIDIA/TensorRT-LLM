@@ -332,7 +332,12 @@ class PublishedProjections:
                     reason = f"{reason}; {SPLITK_ONLY_ENV}=1 but the split-K producer is not certified here"
         reason = _tp_agreement.agreed_refusal(self.mapping, reason)
         if reason is not None:
-            self._max_rows, self._splitk_only, self._min_rows, self._wide = MAX_ROWS, False, MIN_ROWS, ""
+            self._max_rows, self._splitk_only, self._min_rows, self._wide = (
+                MAX_ROWS,
+                False,
+                MIN_ROWS,
+                "",
+            )
         if reason is None:
             try:
                 self.pool = _publish.PublishTransport(
@@ -388,7 +393,9 @@ class PublishedProjections:
             if k1_reason is not None:
                 return f"{reason}; {WIDE_ENV}=splitk1: {k1_reason}"
         if WIDE == "cublas":
-            wide_reason = _publish.wide_producer_refusal(torch.device("cuda", torch.cuda.current_device()))
+            wide_reason = _publish.wide_producer_refusal(
+                torch.device("cuda", torch.cuda.current_device())
+            )
             if wide_reason is not None:
                 return f"{reason}; {WIDE_ENV}=cublas: {wide_reason}"
         if SPLITK_ONLY and not splitk:
@@ -402,9 +409,11 @@ class PublishedProjections:
             f"this device ({reason}); {self._min_rows}..{self._max_rows}-row steps publish "
             + (f"(33..64 from split-K, {SPLITK_ONLY_ENV}=1) " if SPLITK_ONLY else "")
             + f"65..{self._max_rows} from "
-            + {"splitk": "the certified split-K producer in 64-row launches",
-               "splitk1": "split_k-1 64-row launches (bitwise = the built-in replicated GEMM)",
-               "cublas": "GB300-certified cuBLAS"}[WIDE]
+            + {
+                "splitk": "the certified split-K producer in 64-row launches",
+                "splitk1": "split_k-1 64-row launches (bitwise = the built-in replicated GEMM)",
+                "cublas": "GB300-certified cuBLAS",
+            }[WIDE]
             + "; other steps keep the built-in projections"
         )
         return None
@@ -487,7 +496,11 @@ class PublishedProjections:
         edge, when the split-K producer (which waits on its prerequisite grid before reading) publishes this call."""
         stream = getattr(moe, "_prepare_stream", None)
         sources = getattr(stream, "fork_sources", None)
-        if not isinstance(stream, _ForkStream) or sources is None or not torch.cuda.is_current_stream_capturing():
+        if (
+            not isinstance(stream, _ForkStream)
+            or sources is None
+            or not torch.cuda.is_current_stream_capturing()
+        ):
             return
         stream.fork_sources = None
         if torch.cuda.current_stream().cuda_stream != stream.cuda_stream:
@@ -497,8 +510,10 @@ class PublishedProjections:
         try:
             changed = _publish.programmatic_from(stream, sources)
         except RuntimeError as error:
-            logger.warning_once(f"{error}; the pool GEMM keeps the full fork edge",
-                                key="musespark_open.projection_publish.programmatic_fork_failed")
+            logger.warning_once(
+                f"{error}; the pool GEMM keeps the full fork edge",
+                key="musespark_open.projection_publish.programmatic_fork_failed",
+            )
             return
         if changed and (self._rows, "programmatic") not in self._reported:
             self._reported.add((self._rows, "programmatic"))

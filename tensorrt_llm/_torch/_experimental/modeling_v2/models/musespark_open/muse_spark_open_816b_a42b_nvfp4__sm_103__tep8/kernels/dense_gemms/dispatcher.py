@@ -59,12 +59,7 @@ work outside it.
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-from ...sm107_defaults import SM103_TEP8_WIDE_GEMMS_ENV as _SM103_WIDE_ENV
-from ...sm107_defaults import sm103_tep8_wide_gemm_sites as _sm103_tep8_wide_gemm_sites
-
 import json
-import os
 from dataclasses import dataclass
 from typing import Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
@@ -92,6 +87,9 @@ from ...ops.gemm.dense_gemm import (
     l2_prefetch,
     parse_kernel,
 )
+from ...sm107_defaults import SM103_TEP8_WIDE_GEMMS_ENV as _SM103_WIDE_ENV
+from ...sm107_defaults import env as _sm107_env
+from ...sm107_defaults import sm103_tep8_wide_gemm_sites as _sm103_tep8_wide_gemm_sites
 
 #: The first row count of a plan's wide table (``DenseGemmPlan.set_wide_kernels``).
 WIDE_MIN_ROWS = MAX_ROWS + 1
@@ -105,8 +103,8 @@ SITES = ("qkv", "o_proj", "pool", "unpool")
 #: ``MUSESPARK_OPEN_POOL_SPLITK8=1`` lets the pooler's ``wide_dense_gemms`` kernels
 #: (9..32 rows) sum K in 8 slices (split_k 8, served by the split-K kernel only with its reduce-scatter epilogue,
 #: ``MUSESPARK_OPEN_SPLITK_RS=1``) instead of the 8-row cell's 4: a wide call's pool rows then no longer get their
-#: one-request bits (numerics-gated, not bitwise). Every other site, and the pooler without the gate, keeps ``install``'s
-#: same-split_k check. Unset = unchanged. Read at install.
+#: one-request bits (numerics-gated, not bitwise). Every other site, and the pooler without the gate, keeps
+#: ``install``'s same-split_k check. Unset = unchanged. Read at install.
 POOL_SPLITK8_ENV = "MUSESPARK_OPEN_POOL_SPLITK8"
 #: ``MUSESPARK_OPEN_POOL_SPLITK8_SHADOW=<file.jsonl>``: on eager (not capturing) pool calls whose kernel is a split-K 8
 #: one, also run ``MUSESPARK_OPEN_POOL_SPLITK8_SHADOW_REF`` (default the 24-row production kernel ``splitk:64,16,4,10``)
@@ -132,8 +130,13 @@ def _pool_splitk8_shadow(site, x, weight, out, kernel, enable_pdl) -> None:
         o4 = dense_gemm(x, weight, ref_kernel, enable_pdl)
         ref = x.double() @ weight.double().t()
         ulp = (ref.abs().clamp(min=1e-30).log2().floor() - 7).exp2()
-        rec = {"layer": int(site.layer_idx), "rows": int(x.shape[0]), "kernel": kernel, "ref_kernel": ref_kernel,
-               "diff_frac": float((o4 != out.view_as(o4)).float().mean())}
+        rec = {
+            "layer": int(site.layer_idx),
+            "rows": int(x.shape[0]),
+            "kernel": kernel,
+            "ref_kernel": ref_kernel,
+            "diff_frac": float((o4 != out.view_as(o4)).float().mean()),
+        }
         for nm, o in (("s8", out.view_as(o4)), ("s4", o4)):
             e = (o.double() - ref).abs()
             eu = e / ulp
@@ -141,6 +144,7 @@ def _pool_splitk8_shadow(site, x, weight, out, kernel, enable_pdl) -> None:
     rank = int(_sm107_env("RANK", _sm107_env("OMPI_COMM_WORLD_RANK", "0")))
     with open(f"{path}.rank{rank}", "a") as f:
         f.write(json.dumps(rec) + "\n")
+
 
 #: Kernel per site by row count on sm103 at tep8 (two trays, sharded pooler and
 #: unpooler), as ``(last row count, kernel)`` steps, chosen in
@@ -270,7 +274,9 @@ def wide_steps(tp_size: int = 4) -> Dict[str, Tuple[Tuple[int, str], ...]]:
         if override:
             for site, cells in json.loads(override).items():
                 if site not in SITES:
-                    raise ValueError(f"[musespark_open] MUSESPARK_OPEN_TEP4_WIDE_GEMMS: unknown site {site!r}")
+                    raise ValueError(
+                        f"[musespark_open] MUSESPARK_OPEN_TEP4_WIDE_GEMMS: unknown site {site!r}"
+                    )
                 steps[site] = tuple((int(last), str(kernel)) for last, kernel in cells)
         return steps
     steps = dict(SM107_TP8_WIDE_KERNELS)
@@ -278,7 +284,9 @@ def wide_steps(tp_size: int = 4) -> Dict[str, Tuple[Tuple[int, str], ...]]:
     if override:
         for site, cells in json.loads(override).items():
             if site not in SITES:
-                raise ValueError(f"[musespark_open] MUSESPARK_OPEN_TEP8_WIDE_GEMMS: unknown site {site!r}")
+                raise ValueError(
+                    f"[musespark_open] MUSESPARK_OPEN_TEP8_WIDE_GEMMS: unknown site {site!r}"
+                )
             steps[site] = tuple((int(last), str(kernel)) for last, kernel in cells)
     # The deepest pipeline each tactic's shared memory allows on this device (split_k 4 holds
     # more partials than the tep4 cells' split_k 2, so the tep4 stage counts can overflow).
@@ -298,7 +306,10 @@ def _fit_stages(kernel: str, rows: int, k: int, n: int) -> str:
     if family != SPLITK:
         return kernel
     mma_m, mma_n, split_k, stages = fields
-    while stages > 2 and kernel_error(f"splitk:{mma_m},{mma_n},{split_k},{stages}", rows, k, n) is not None:
+    while (
+        stages > 2
+        and kernel_error(f"splitk:{mma_m},{mma_n},{split_k},{stages}", rows, k, n) is not None
+    ):
         stages -= 1
     return f"splitk:{mma_m},{mma_n},{split_k},{stages}"
 
@@ -366,8 +377,9 @@ def kernel_steps(
     if key[1] == 4 and not sharded:
         table = {**table, **TP4_REPLICATED_PROJECTION_KERNELS_BY_SM[key[0]]}
     # Opt-in: ``MUSESPARK_OPEN_TEP4_NARROW_GEMMS`` (JSON, site -> [[last row count, kernel], ...]
-    # covering rows 1..8) replaces tep4 sites' 1..8-row steps, as ``MUSESPARK_OPEN_TEP4_WIDE_GEMMS`` does for 9..32 rows:
-    # deeper split-K stages under MUSESPARK_OPEN_SPLITK_OVERSIZED_SMEM (same split_k, same bits). Unset = unchanged.
+    # covering rows 1..8) replaces tep4 sites' 1..8-row steps, as ``MUSESPARK_OPEN_TEP4_WIDE_GEMMS`` does for 9..32
+    # rows: deeper split-K stages under MUSESPARK_OPEN_SPLITK_OVERSIZED_SMEM (same split_k, same bits). Unset =
+    # unchanged.
     narrow = _sm107_env(NARROW_GEMMS_ENV, "").strip() if key[1] == 4 else ""
     if narrow:
         table = dict(table)
@@ -376,13 +388,19 @@ def kernel_steps(
                 raise ValueError(f"[musespark_open] {NARROW_GEMMS_ENV}: unknown site {site!r}")
             steps = tuple((int(last), str(kernel)) for last, kernel in cells)
             if not steps or steps[-1][0] != MAX_ROWS:
-                raise ValueError(f"[musespark_open] {NARROW_GEMMS_ENV}: {site} steps must end at {MAX_ROWS} rows")
+                raise ValueError(
+                    f"[musespark_open] {NARROW_GEMMS_ENV}: {site} steps must end at {MAX_ROWS} rows"
+                )
             old_k = [parse_kernel(k) for _, k in table[site]]
             for _, kernel in steps:
                 family, fields = parse_kernel(kernel)
-                if family == SPLITK and not any(f == SPLITK and o[2] == fields[2] for f, o in old_k):
-                    raise ValueError(f"[musespark_open] {NARROW_GEMMS_ENV}: {site} {kernel} changes the split_k of "
-                                     "the table's split-K cells (bits)")
+                if family == SPLITK and not any(
+                    f == SPLITK and o[2] == fields[2] for f, o in old_k
+                ):
+                    raise ValueError(
+                        f"[musespark_open] {NARROW_GEMMS_ENV}: {site} {kernel} changes the split_k of "
+                        "the table's split-K cells (bits)"
+                    )
             table[site] = steps
     return table
 
@@ -774,7 +792,9 @@ DROPPED_PREFETCH_CONSUMERS = dropped_prefetch_consumers()
 PREFETCH_JOIN_ENV = "MUSESPARK_OPEN_PREFETCH_JOIN"
 _join = _sm107_env(PREFETCH_JOIN_ENV, "before").strip() or "before"
 if _join not in ("before", "after"):
-    raise ValueError(f"[musespark_open] {PREFETCH_JOIN_ENV} must be 'before' or 'after', got {_join!r}")
+    raise ValueError(
+        f"[musespark_open] {PREFETCH_JOIN_ENV} must be 'before' or 'after', got {_join!r}"
+    )
 PREFETCH_JOIN_AFTER = _join == "after"
 
 
@@ -804,7 +824,10 @@ TEP8_WIDE64_MIN_ROWS, TEP8_WIDE64_MAX_ROWS = WIDE_MAX_ROWS + 1, 64
 #: Tactic per site for 33..64 rows (split_k of the 8-row cells); stages are what shared memory holds at 64-wide tiles.
 #: The fastest measured at 40 and 64 rows behind a predecessor that releases early (64-row tiles keep 144 CTAs and
 #: stream each weight slab once).
-SM107_TP8_WIDE64_KERNELS: Mapping[str, str] = {"qkv": "splitk:64,64,4,5", "o_proj": "splitk:64,64,1,7"}
+SM107_TP8_WIDE64_KERNELS: Mapping[str, str] = {
+    "qkv": "splitk:64,64,4,5",
+    "o_proj": "splitk:64,64,1,7",
+}
 #: The (site, capability) whose 8-row cell is cuBLAS and whose wide64 split-K tactic with ``split_k`` 1 was measured
 #: bitwise equal to it row by row: sm103 TP8 o_proj ``[8192, 1024]`` (cuBLAS ``nvjet`` 64x8 at 8 rows) vs
 #: ``splitk:64,64,1,7`` at 33..64 rows, 48/48 random cases equal to each 8-row block and to the whole-call cuBLAS
@@ -816,11 +839,17 @@ TEP8_WIDE64_CUBLAS_CELLS: FrozenSet[Tuple[str, Tuple[int, int]]] = frozenset({("
 def _tep8_wide64_sites() -> FrozenSet[str]:
     if _sm107_env(TEP8_WIDE64_ENV, "0") != "1":
         return frozenset()
-    names = {n.strip() for n in _sm107_env("MUSESPARK_OPEN_TEP8_WIDE64_SITES", "qkv,o_proj").split(",") if n.strip()}
+    names = {
+        n.strip()
+        for n in _sm107_env("MUSESPARK_OPEN_TEP8_WIDE64_SITES", "qkv,o_proj").split(",")
+        if n.strip()
+    }
     unknown = names - {"qkv", "o_proj"}
     if unknown:
-        raise ValueError(f"[musespark_open] MUSESPARK_OPEN_TEP8_WIDE64_SITES: unknown sites {sorted(unknown)} "
-                         "(qkv, o_proj; the pool and unpool slices stay with projection_publish)")
+        raise ValueError(
+            f"[musespark_open] MUSESPARK_OPEN_TEP8_WIDE64_SITES: unknown sites {sorted(unknown)} "
+            "(qkv, o_proj; the pool and unpool slices stay with projection_publish)"
+        )
     return frozenset(names)
 
 
@@ -830,7 +859,9 @@ def _tep8_wide64_kernels() -> Dict[str, str]:
     if override:
         for site, kernel in json.loads(override).items():
             if site not in kernels:
-                raise ValueError(f"[musespark_open] MUSESPARK_OPEN_TEP8_WIDE64_KERNELS: unknown site {site!r}")
+                raise ValueError(
+                    f"[musespark_open] MUSESPARK_OPEN_TEP8_WIDE64_KERNELS: unknown site {site!r}"
+                )
             kernels[site] = str(kernel)
     return kernels
 
@@ -992,7 +1023,9 @@ class DenseGemmDispatcher:
             plan.fork_prefetch(self.site.next_weight())
         return out.view(*input_tensor.shape[:-1], int(weight.shape[0]))
 
-    def wide64(self, input_tensor: torch.Tensor, weight: torch.Tensor, bias) -> Optional[torch.Tensor]:
+    def wide64(
+        self, input_tensor: torch.Tensor, weight: torch.Tensor, bias
+    ) -> Optional[torch.Tensor]:
         """A 33..64-row TP8 decode call of a ``TEP8_WIDE64_SITES`` site on flashinfer's split-K, or ``None``
         (the caller then runs the built-in ``Linear.apply_linear``, i.e. cuBLAS)."""
         site = self.site
@@ -1045,14 +1078,24 @@ class DenseGemmDispatcher:
                         "not a split_k 1 split-K kernel"
                     )
                 _wide.run_splitk_scatter(
-                    input_tensor.view(-1, k), weight.t(), view, plan.enable_pdl, _wide.SplitKTactic(*fields),
-                    peer_stride, fb_layout, publication.target_slots(),
+                    input_tensor.view(-1, k),
+                    weight.t(),
+                    view,
+                    plan.enable_pdl,
+                    _wide.SplitKTactic(*fields),
+                    peer_stride,
+                    fb_layout,
+                    publication.target_slots(),
                 )
                 return view.view(*input_tensor.shape[:-1], int(weight.shape[0]))
-        out = dense_gemm(input_tensor.view(-1, k), weight, TEP8_WIDE64_KERNELS[site.role], plan.enable_pdl)
+        out = dense_gemm(
+            input_tensor.view(-1, k), weight, TEP8_WIDE64_KERNELS[site.role], plan.enable_pdl
+        )
         return out.view(*input_tensor.shape[:-1], int(weight.shape[0]))
 
-    def _direct128(self, input_tensor: torch.Tensor, weight: torch.Tensor, rows: int, k: int) -> Optional[torch.Tensor]:
+    def _direct128(
+        self, input_tensor: torch.Tensor, weight: torch.Tensor, rows: int, k: int
+    ) -> Optional[torch.Tensor]:
         """hop128: o_proj of a 65..128-row step the direct publication armed, as 64-row chunks of the split_k-1
         scatter kernel (each chunk's tokens land in their own slots: chunk c through the view advanced by 8 c slots),
         in token order on the current stream (PDL chains them); ``None`` (cuBLAS, as before) when not armed."""
@@ -1083,21 +1126,37 @@ class DenseGemmDispatcher:
         if mode != "chunks":
             # MUSESPARK_OPEN_SM103_TEP8_HOP128_PRODUCER=grid|tile128: the whole call in one launch, same bits.
             if not fb_layout:
-                raise RuntimeError(f"[musespark_open] hop128 producer {mode}: needs the fb-layout workspace")
+                raise RuntimeError(
+                    f"[musespark_open] hop128 producer {mode}: needs the fb-layout workspace"
+                )
             _wide.run_splitk_scatter_wide(
-                a, b, publication.chunk_view(view, 0, rows), plan.enable_pdl, _wide.hop128_tactic(mode, stages),
-                peer_stride, slots,
+                a,
+                b,
+                publication.chunk_view(view, 0, rows),
+                plan.enable_pdl,
+                _wide.hop128_tactic(mode, stages),
+                peer_stride,
+                slots,
             )
             logger.info_once(
-                f"[musespark_open] hop128 producer: o_proj of {TEP8_WIDE64_MAX_ROWS + 1}..{_wide.DIRECT128_MAX_ROWS}-row steps in one "
-                f"{mode} launch ({stages} stages)", key="musespark_open.t8r4.hop128_producer")
+                "[musespark_open] hop128 producer: o_proj of "
+                f"{TEP8_WIDE64_MAX_ROWS + 1}..{_wide.DIRECT128_MAX_ROWS}-row steps in one "
+                f"{mode} launch ({stages} stages)",
+                key="musespark_open.t8r4.hop128_producer",
+            )
             return view.view(*input_tensor.shape[:-1], int(weight.shape[0]))
         tactic = _wide.SplitKTactic(*fields)
         for row0 in range(0, rows, TEP8_WIDE64_MAX_ROWS):
             n = min(TEP8_WIDE64_MAX_ROWS, rows - row0)
             _wide.run_splitk_scatter(
-                a[row0 : row0 + n], b, publication.chunk_view(view, row0, n), plan.enable_pdl, tactic, peer_stride,
-                fb_layout, slots,
+                a[row0 : row0 + n],
+                b,
+                publication.chunk_view(view, row0, n),
+                plan.enable_pdl,
+                tactic,
+                peer_stride,
+                fb_layout,
+                slots,
             )
         return view.view(*input_tensor.shape[:-1], int(weight.shape[0]))
 
@@ -1163,7 +1222,9 @@ class DenseGemmDispatcher:
         kernel = plan.kernel_for(self.site.role, rows)
         if self.fits(input_tensor, weight, bias) and parse_kernel(kernel)[0] in policy.direct:
             dense_gemm(input_tensor.view(-1, k), weight, kernel, plan.enable_pdl, out=publish)
-            _pool_splitk8_shadow(self.site, input_tensor.view(-1, k), weight, publish, kernel, plan.enable_pdl)
+            _pool_splitk8_shadow(
+                self.site, input_tensor.view(-1, k), weight, publish, kernel, plan.enable_pdl
+            )
             if deferred:
                 plan.join()
             if _keeps_prefetch(self.site, rows):
@@ -1311,9 +1372,13 @@ def install(
         # sm_103 TEP8 for the sites MUSESPARK_OPEN_SM103_TEP8_WIDE_GEMMS names (sm107's TP8 tiles, the stages
         # fitted to GB300's opt-in by ``wide_steps``; the split_k check below holds against sm103's own 8-row cells).
         sm103_sites = (
-            _sm103_tep8_wide_gemm_sites() if tuple(capability) == (10, 3) and tp_size == 8 and sharded else frozenset()
+            _sm103_tep8_wide_gemm_sites()
+            if tuple(capability) == (10, 3) and tp_size == 8 and sharded
+            else frozenset()
         )
-        if not sm103_sites and (tuple(capability) != (10, 7) or tp_size not in (4, 8) or not sharded):
+        if not sm103_sites and (
+            tuple(capability) != (10, 7) or tp_size not in (4, 8) or not sharded
+        ):
             raise ValueError(
                 "[musespark_open] wide_dense_gemms is measured for sm107 at TP4 and TP8 with the sharded "
                 f"pooler and unpooler (sm103 TP8 with {_SM103_WIDE_ENV}); got SM {tuple(capability)} at "
@@ -1324,7 +1389,10 @@ def install(
             wide_table = {role: cells for role, cells in wide_table.items() if role in sm103_sites}
             logger.info(
                 f"[musespark_open] dense_gemms: {_SM103_WIDE_ENV}: sm103 TP8 9..32-row calls of "
-                + ", ".join(f"{role}={'|'.join(sorted(set(cells)))}" for role, cells in sorted(wide_table.items()))
+                + ", ".join(
+                    f"{role}={'|'.join(sorted(set(cells)))}"
+                    for role, cells in sorted(wide_table.items())
+                )
                 + " (flashinfer split-K, the 8-row cells' split_k)"
             )
         pool8 = _sm107_env(POOL_SPLITK8_ENV, "0") == "1"
@@ -1348,7 +1416,9 @@ def install(
                     and tp_size == 8
                     and (role, tuple(capability)) in TEP8_WIDE64_CUBLAS_CELLS
                 )
-                if not cublas_cell and (family != SPLITK or wide_family != SPLITK or wide_fields[2] != fields[2]):
+                if not cublas_cell and (
+                    family != SPLITK or wide_family != SPLITK or wide_fields[2] != fields[2]
+                ):
                     raise ValueError(
                         f"[musespark_open] wide_dense_gemms: {role} kernel {kernel} does not sum "
                         f"the K slices of the {MAX_ROWS}-row kernel {kernels[role][MAX_ROWS - 1]}"
@@ -1365,7 +1435,11 @@ def install(
             cell_family, cell_fields = parse_kernel(cells[role][MAX_ROWS - 1])
             same_bits = family == SPLITK and (
                 (cell_family == SPLITK and fields[2] == cell_fields[2])
-                or (cell_family == CUBLAS and fields[2] == 1 and (role, tuple(capability)) in TEP8_WIDE64_CUBLAS_CELLS)
+                or (
+                    cell_family == CUBLAS
+                    and fields[2] == 1
+                    and (role, tuple(capability)) in TEP8_WIDE64_CUBLAS_CELLS
+                )
             )
             if not same_bits:
                 raise ValueError(

@@ -35,16 +35,14 @@ to it as well.
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
-import os
-
 import torch
 import triton
 import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm.logger import logger
+
+from ...sm107_defaults import env as _sm107_env
 
 #: The checkpoint's router: 256 experts over the 8192-wide residual.
 EXPERTS = 256
@@ -804,7 +802,9 @@ ROWS_TILING = _rows_tiling()
 if ROWS_TILING:
     logger.info(
         f"[musespark_open] router_shard_rows: {ROWS_TILING_ENV} rows per program / experts per program "
-        + ", ".join(f"{rows} rows {per}/{experts}" for rows, (per, experts) in sorted(ROWS_TILING.items()))
+        + ", ".join(
+            f"{rows} rows {per}/{experts}" for rows, (per, experts) in sorted(ROWS_TILING.items())
+        )
     )
 
 

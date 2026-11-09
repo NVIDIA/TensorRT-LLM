@@ -121,7 +121,9 @@ class ProjectionInbox:
         if max_rows not in ROW_CAPACITIES:
             # Wide pool inbox: a wide inbox at TP8 too (wide_prologue's pool route inbox); the fused unpool
             # boundary still bounds its own TP8 calls at MAX_ROWS (unpool_gather_boundary.max_rows).
-            raise ValueError(f"max_rows must be {MAX_ROWS} or {WIDE_MAX_ROWS}; got {max_rows} at TP{world}")
+            raise ValueError(
+                f"max_rows must be {MAX_ROWS} or {WIDE_MAX_ROWS}; got {max_rows} at TP{world}"
+            )
         allowed = tuple(row_words_of(width, world) for width in PROJECTION_WIDTHS)
         if row_words not in allowed:
             raise ValueError(f"row_words must be one of {allowed} at TP{world}, got {row_words}")

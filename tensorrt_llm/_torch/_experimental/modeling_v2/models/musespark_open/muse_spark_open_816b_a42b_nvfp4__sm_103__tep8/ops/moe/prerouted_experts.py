@@ -41,7 +41,9 @@ _state: Dict[str, object] = {}
 def op_registered() -> bool:
     """Whether this TRT-LLM build registers the prerouted FP4 MoE ops."""
     try:
-        return hasattr(torch.ops.trtllm, OP_NAME) and hasattr(torch.ops.trtllm, DEFAULT_CONFIG_OP_NAME)
+        return hasattr(torch.ops.trtllm, OP_NAME) and hasattr(
+            torch.ops.trtllm, DEFAULT_CONFIG_OP_NAME
+        )
     except Exception:  # noqa: BLE001 - no trtllm op library: no op
         return False
 
@@ -139,7 +141,13 @@ class _TrtllmPrerouted:
     ) -> int:
         return int(
             getattr(torch.ops.trtllm, DEFAULT_CONFIG_OP_NAME)(
-                tile_n, top_k, hidden_size, intermediate_size, local_num_experts, num_tokens, act_type
+                tile_n,
+                top_k,
+                hidden_size,
+                intermediate_size,
+                local_num_experts,
+                num_tokens,
+                act_type,
             )
         )
 
@@ -156,7 +164,13 @@ class _TrtllmPrerouted:
         return [
             int(c)
             for c in getattr(torch.ops.trtllm, VALID_CONFIGS_OP_NAME)(
-                tile_n, top_k, hidden_size, intermediate_size, local_num_experts, num_tokens, act_type
+                tile_n,
+                top_k,
+                hidden_size,
+                intermediate_size,
+                local_num_experts,
+                num_tokens,
+                act_type,
             )
         ]
 

@@ -50,9 +50,6 @@ alone (``local_num_experts = BLOCK``), the owner-only window
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
-import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -61,6 +58,8 @@ import triton.language as tl
 from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
+
+from ...sm107_defaults import env as _sm107_env
 
 #: Model geometry: 256 experts over the 8 expert-parallel ranks of tep8 (the
 #: defaults), or over the 4 of tep4 (``ranks=4``).
@@ -142,15 +141,18 @@ _META_WARPS = int(_sm107_env("MUSESPARK_OPEN_TEP8_PREROUTED_WARPS", "8"))
 #: Opt-in: ``MUSESPARK_OPEN_TEP8_TILE_PLACEMENT=1``
 #: places the TEP8 prerouted calls (``meta_tile``, balanced, two windows) of at least
 #: ``MUSESPARK_OPEN_TEP8_TILE_PLACEMENT_MIN_ROWS`` rows (default 33: bs5-8) by expert cost instead of expert count.
-#: An expert's cost is ``A + B * (tiles - 1)`` (tiles of ``meta_tile`` tokens; ``MUSESPARK_OPEN_TEP8_TILE_PLACEMENT_COST``
-#: = ``A,B`` in 0.1 us, default 20,11: FP4 FC1 + FC2 stream an expert in ~2.0 us and add ~1.1 us per extra tile). The
-#: ring flow is the count rule's on those costs; block ``b`` then moves its present experts in descending local index
-#: while the moved cost stays short of its outflow, the last one only if it lands closer. Every rank derives the same
-#: placement (integer arithmetic on the same ids), so each slot still runs on exactly one rank; only which experts move
-#: changes, so it is accuracy-equivalent to the count rule, not bitwise (per-rank finalize partials). Unset: the count rule.
+#: An expert's cost is ``A + B * (tiles - 1)`` (tiles of ``meta_tile`` tokens;
+#: ``MUSESPARK_OPEN_TEP8_TILE_PLACEMENT_COST`` = ``A,B`` in 0.1 us, default 20,11: FP4 FC1 + FC2 stream an expert in
+#: ~2.0 us and add ~1.1 us per extra tile). The ring flow is the count rule's on those costs; block ``b`` then moves its
+#: present experts in descending local index while the moved cost stays short of its outflow, the last one only if it
+#: lands closer. Every rank derives the same placement (integer arithmetic on the same ids), so each slot still runs on
+#: exactly one rank; only which experts move changes, so it is accuracy-equivalent to the count rule, not bitwise
+#: (per-rank finalize partials). Unset: the count rule.
 _TILE_PLACEMENT = _sm107_env("MUSESPARK_OPEN_TEP8_TILE_PLACEMENT", "") == "1"
 _TILE_MIN_ROWS = int(_sm107_env("MUSESPARK_OPEN_TEP8_TILE_PLACEMENT_MIN_ROWS", "33") or 33)
-_TILE_COST = tuple(int(v) for v in _sm107_env("MUSESPARK_OPEN_TEP8_TILE_PLACEMENT_COST", "20,11").split(","))
+_TILE_COST = tuple(
+    int(v) for v in _sm107_env("MUSESPARK_OPEN_TEP8_TILE_PLACEMENT_COST", "20,11").split(",")
+)
 if _TILE_PLACEMENT:
     try:
         from tensorrt_llm.logger import logger as _logger
@@ -165,7 +167,10 @@ if _TILE_PLACEMENT:
 
 
 def expert_cost(tokens: int, tile: int, cost=_TILE_COST) -> int:
-    """Tile placement: an expert's placement cost (0.1 us) for ``tokens`` tokens in ``tile``-token tiles (0 when absent)."""
+    """Tile placement: an expert's placement cost (0.1 us) for ``tokens`` tokens in ``tile``-token tiles.
+
+    0 when absent.
+    """
     if tokens <= 0:
         return 0
     return cost[0] + cost[1] * ((tokens + tile - 1) // tile - 1)
@@ -183,8 +188,9 @@ def meta_sizes(rows: int, window: int, tile: int) -> Dict[str, int]:
 @triton.jit
 def _fence_acq_rel_gpu(x):
     """``fence.acq_rel.gpu`` on every thread (``x``: any int32 scalar, returned)."""
-    return tl.inline_asm_elementwise("fence.acq_rel.gpu; mov.u32 $0, $1;", "=r,r", [x], dtype=tl.int32,
-                                     is_pure=False, pack=1)
+    return tl.inline_asm_elementwise(
+        "fence.acq_rel.gpu; mov.u32 $0, $1;", "=r,r", [x], dtype=tl.int32, is_pure=False, pack=1
+    )
 
 
 @triton.jit
@@ -299,11 +305,13 @@ def _ring_buddy_assign_kernel(
         x = tl.zeros([RANKS], dtype=tl.int32)
 
     if TILEW:
-        # Tile placement: the same ring flow on expert costs (A + B * (tiles - 1), 0.1 us) and the movers of each block in
-        # descending local index while the moved cost stays short of the block's outflow (the last one only if the
+        # Tile placement: the same ring flow on expert costs (A + B * (tiles - 1), 0.1 us) and the movers of each block
+        # in descending local index while the moved cost stays short of the block's outflow (the last one only if the
         # outflow is then overshot by no more than it was missed). Pure integer arithmetic on the step's ids.
         tl.static_assert(BALANCE and not HALF, "tile placement: the balanced two-window placement")
-        hist = tl.histogram(tl.where(smask, g, EXPERTS), 2 * EXPERTS)  # [2E]; bin E takes the masked slots
+        hist = tl.histogram(
+            tl.where(smask, g, EXPERTS), 2 * EXPERTS
+        )  # [2E]; bin E takes the masked slots
         cnt2 = tl.reshape(hist, (2, EXPERTS))
         first = tl.arange(0, 2)[:, None] == 0
         cnt = tl.sum(tl.where(first, cnt2, 0), axis=0)  # [EXPERTS] tokens per expert
@@ -321,17 +329,25 @@ def _ring_buddy_assign_kernel(
             (warc + wspan[None, :]) // (wspan[None, :] + 1),
         )
         wt = tl.max(tl.max(wneed, axis=1), axis=0)
-        wx = tl.max(tl.maximum(warc - wspan[None, :] * wt, 0), axis=1)  # [RANKS] cost to move out of each block
-        after_c = tl.cumsum(cost_rb, axis=1, reverse=True)  # cost of the experts at or above each local index
+        wx = tl.max(
+            tl.maximum(warc - wspan[None, :] * wt, 0), axis=1
+        )  # [RANKS] cost to move out of each block
+        after_c = tl.cumsum(
+            cost_rb, axis=1, reverse=True
+        )  # cost of the experts at or above each local index
         before_c = after_c - cost_rb
         wxb = wx[:, None]
-        move_t = (cost_rb > 0) & (before_c < wxb) & (2 * wxb >= before_c + after_c)  # [RANKS, BLOCK]
+        move_t = (
+            (cost_rb > 0) & (before_c < wxb) & (2 * wxb >= before_c + after_c)
+        )  # [RANKS, BLOCK]
         # The count rule's movers on the same grid (present experts with fewer than x[b] present above them); the
         # step takes the tile rule only where its busiest rank costs less than the count rule's (ties: count).
         pres = (cost_rb > 0).to(tl.int32)
         above_n = tl.cumsum(pres, axis=1, reverse=True) - pres
         move_c = (pres > 0) & (above_n < x[:, None])
-        from_prev_r = ((ranks[:, None] + RANKS - 1) % RANKS) == ranks[None, :]  # [r, b]: block b moves onto r
+        from_prev_r = ((ranks[:, None] + RANKS - 1) % RANKS) == ranks[
+            None, :
+        ]  # [r, b]: block b moves onto r
         stay_t = tl.sum(tl.where(move_t, 0, cost_rb), axis=1)
         out_t = tl.sum(tl.where(move_t, cost_rb, 0), axis=1)
         stay_c = tl.sum(tl.where(move_c, 0, cost_rb), axis=1)
@@ -394,7 +410,9 @@ def _ring_buddy_assign_kernel(
         cta = cta_off[:, None] + tt[None, :]  # [BINS, MAXT]
         cmask = tt[None, :] < tiles[:, None]
         tl.store(c2b_ptr + cta, ev[:, None] + tt[None, :] * 0, mask=cmask)
-        tl.store(c2m_ptr + cta, tl.minimum((cta + 1) * TILE, (cta_off * TILE + cnt)[:, None]), mask=cmask)
+        tl.store(
+            c2m_ptr + cta, tl.minimum((cta + 1) * TILE, (cta_off * TILE + cnt)[:, None]), mask=cmask
+        )
         tl.store(nnc_ptr, nnc)
         tl.store(tnp_ptr, nnc * TILE)
         if TRIGGER:
@@ -417,8 +435,11 @@ def place_tile_reference(flat: List[int], ranks: int, tile: int, cost=_TILE_COST
     for e in flat:
         tokens[e] = tokens.get(e, 0) + 1
     cost_e = [expert_cost(tokens.get(e, 0), tile, cost) for e in range(EXPERTS)]
-    wload = [sum(cost_e[b * size:(b + 1) * size]) for b in range(ranks)]
-    arc = [[sum(wload[(r - k) % ranks] for k in range(n)) for n in range(1, ranks + 1)] for r in range(ranks)]
+    wload = [sum(cost_e[b * size : (b + 1) * size]) for b in range(ranks)]
+    arc = [
+        [sum(wload[(r - k) % ranks] for k in range(n)) for n in range(1, ranks + 1)]
+        for r in range(ranks)
+    ]
     t = 0
     for r in range(ranks):
         for n in range(1, ranks + 1):
@@ -504,8 +525,11 @@ def _ring_buddy_assign_wide_kernel(
     # of its selected experts.
     counts = tl.histogram(g, EXPERTS) - tl.where(experts == 0, SLOTS - num_slots, 0)
     i_e = experts % BLOCK
-    bit_e = tl.where(counts > 0, tl.full([EXPERTS], 1, tl.uint32) << i_e.to(tl.uint32),
-                     tl.zeros([EXPERTS], dtype=tl.uint32))
+    bit_e = tl.where(
+        counts > 0,
+        tl.full([EXPERTS], 1, tl.uint32) << i_e.to(tl.uint32),
+        tl.zeros([EXPERTS], dtype=tl.uint32),
+    )
     word = tl.reduce(tl.reshape(bit_e, [RANKS, BLOCK]), 1, _bit_or)  # [RANKS] uint32
     load = _popc(word, False)  # [RANKS]
     # The balanced placement's smallest maximum T and smallest flow x (as the narrow program).
@@ -513,7 +537,11 @@ def _ring_buddy_assign_wide_kernel(
     back = (ranks[:, None] - ranks[None, :] + RANKS) % RANKS  # [r, k]
     inarc = back[:, None, :] < span[None, :, None]  # [r, n, k]
     arc = tl.sum(tl.where(inarc, load[None, None, :], 0), axis=2)  # [r, n]
-    need = tl.where(span[None, :] == RANKS, (arc + RANKS - 1) // RANKS, (arc + span[None, :]) // (span[None, :] + 1))
+    need = tl.where(
+        span[None, :] == RANKS,
+        (arc + RANKS - 1) // RANKS,
+        (arc + span[None, :]) // (span[None, :] + 1),
+    )
     t = tl.max(tl.max(need, axis=1), axis=0)
     x = tl.max(tl.maximum(arc - span[None, :] * t, 0), axis=1)  # [RANKS]
     # Per expert: it moves to its block's successor when fewer than x[b] selected experts of its block sit above it.
@@ -522,7 +550,11 @@ def _ring_buddy_assign_wide_kernel(
     blk_e = experts // BLOCK
     above_e = _popc((word_e >> i_e.to(tl.uint32)) >> 1, False)
     er_e = (blk_e + (above_e < x_e).to(tl.int32)) % RANKS
-    local_e = tl.where(er_e == rank, tl.where(blk_e == rank, i_e, BLOCK + i_e), 2 * BLOCK + experts % (EXPERTS - 2 * BLOCK))
+    local_e = tl.where(
+        er_e == rank,
+        tl.where(blk_e == rank, i_e, BLOCK + i_e),
+        2 * BLOCK + experts % (EXPERTS - 2 * BLOCK),
+    )
     local = tl.gather(local_e, g, 0)  # [SLOTS]
     tl.store(local_ids_ptr + s, local, mask=smask)
     tl.store(weights_bf16_ptr + s, w.to(tl.bfloat16), mask=smask)
@@ -587,12 +619,29 @@ class RingBuddyAssign(OpWrapper):
         weights_bf16 = torch.empty(selected.shape, dtype=torch.bfloat16, device=selected.device)
         stats = torch.empty(2 * ranks, dtype=torch.int32, device=selected.device)
         slots = max(16, triton.next_power_of_2(num_slots))
-        if (wide and meta_tile is None and slots > WIDE_MIN_SLOTS and ranks == 8 and balance and not half
-                and static_from == block):
+        if (
+            wide
+            and meta_tile is None
+            and slots > WIDE_MIN_SLOTS
+            and ranks == 8
+            and balance
+            and not half
+            and static_from == block
+        ):
             # The balanced tep8 placement of a > 128-row call on the per-expert program.
             _ring_buddy_assign_wide_kernel[(1,)](
-                selected, weights, local_ids, weights_bf16, stats, rank, num_slots,
-                SLOTS=slots, EXPERTS=EXPERTS, RANKS=ranks, BLOCK=block, num_warps=WIDE_NUM_WARPS,
+                selected,
+                weights,
+                local_ids,
+                weights_bf16,
+                stats,
+                rank,
+                num_slots,
+                SLOTS=slots,
+                EXPERTS=EXPERTS,
+                RANKS=ranks,
+                BLOCK=block,
+                num_warps=WIDE_NUM_WARPS,
             )
             return local_ids, weights_bf16, stats
         meta = None
@@ -628,7 +677,11 @@ class RingBuddyAssign(OpWrapper):
             stats,
             rank,
             num_slots,
-            *((meta[name] for name in META_FIELDS) if meta is not None else (dummy,) * len(META_FIELDS)),
+            *(
+                (meta[name] for name in META_FIELDS)
+                if meta is not None
+                else (dummy,) * len(META_FIELDS)
+            ),
             scratch if meta is not None else dummy,
             SLOTS=slots,
             EXPERTS=EXPERTS,

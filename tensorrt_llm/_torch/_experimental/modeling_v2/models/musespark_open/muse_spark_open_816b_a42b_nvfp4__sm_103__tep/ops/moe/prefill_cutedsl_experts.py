@@ -184,9 +184,7 @@ class PrefillCuteDslExperts:
         the ids; the rows carry no weight).
         """
         rows = int(x_fp4.shape[0])
-        fc1_tactic, fc2_tactic = (
-            tactics if tactics is not None else tactics_for(rows, self.tactics)
-        )
+        fc1_tactic, fc2_tactic = tactics if tactics is not None else tactics_for(rows, self.tactics)
         (
             tile_idx_to_expert_idx,
             tile_idx_to_mn_limit,

@@ -409,7 +409,9 @@ def build_expert_weights(
     w13 = _slice_experts(
         weights, f"{prefix}.w13_weight", expert_start, expert_end, accounting, expert_ids
     )
-    w2 = _slice_experts(weights, f"{prefix}.w2_weight", expert_start, expert_end, accounting, expert_ids)
+    w2 = _slice_experts(
+        weights, f"{prefix}.w2_weight", expert_start, expert_end, accounting, expert_ids
+    )
     for local_idx, expert_id in enumerate(local_ids):
         entries[f"{expert_id}.w1.weight"] = w13[local_idx, :intermediate_size]
         entries[f"{expert_id}.w3.weight"] = w13[local_idx, intermediate_size:]

@@ -558,7 +558,8 @@ class ShortestPrefillFirstOrder:
             if first_chunk_wait > 0:
                 return self._first_chunk_tier_key(arrival, req, waited, age_leads, kv_cache_manager)
             if waited >= self.max_wait_passes or (
-                age_leads and self._pass - self._arrived_at[req.py_request_id] >= self.max_age_passes
+                age_leads
+                and self._pass - self._arrived_at[req.py_request_id] >= self.max_age_passes
             ):
                 return (0, 0, arrival)
             return (1, self._uncached_tokens(req, kv_cache_manager), arrival)

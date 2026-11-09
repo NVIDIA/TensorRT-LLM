@@ -96,9 +96,7 @@ def gen_window_seed(unified_cache: bool, position: int, max_ctx: int) -> Tuple[i
     return min(int(position), int(max_ctx)), SEED_WINDOW
 
 
-def draft_window_mode(
-    disagg: bool, unified_cache: bool, reuse_addressable: bool
-) -> Optional[str]:
+def draft_window_mode(disagg: bool, unified_cache: bool, reuse_addressable: bool) -> Optional[str]:
     """One word for the startup log: how a disaggregated worker's drafter context travels.
 
     None for an aggregated worker. ``shipped`` when the draft layers live in the unified

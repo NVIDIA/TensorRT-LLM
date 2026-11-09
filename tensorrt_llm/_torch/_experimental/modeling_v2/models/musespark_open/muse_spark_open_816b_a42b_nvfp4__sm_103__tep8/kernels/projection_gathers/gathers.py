@@ -68,9 +68,6 @@ route each projection's output to its one consumer
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -90,6 +87,7 @@ from tensorrt_llm.mapping import Mapping
 from ...ops.comm import pool_gather_fp4quant as _pool
 from ...ops.comm import unpool_gather_boundary as _unpool
 from ...ops.comm.projection_inbox import MAX_ROWS, WIDE_ROWS, ProjectionInbox
+from ...sm107_defaults import env as _sm107_env
 
 
 def fused_rows(owner) -> int:
@@ -158,7 +156,9 @@ class MuseSparkOpenTepGatherMoE(MuseSparkOpenMoE):
             or torch.compiler.is_compiling()
             or hidden_states.dtype != torch.bfloat16
             or hidden_states.ndim != 2
-            or not 0 < hidden_states.shape[0] <= max(
+            or not 0
+            < hidden_states.shape[0]
+            <= max(
                 self._defer_max_rows_pool
                 if (module is self.pooler and self._defer_max_rows_pool is not None)
                 else self._defer_max_rows_unpool
@@ -563,7 +563,9 @@ def install(model: MuseSparkOpenModel, *, unpool: bool, pool: bool) -> dict:
     # of this path takes that).
     wide_unpool_inbox = (
         ProjectionInbox(mapping, row_words=_unpool.local_columns(world) // 2, max_rows=WIDE_ROWS)
-        if unpool and world == 8 and _sm107_env("MUSESPARK_OPEN_TEP8_WIDE_UNPOOL_GATHER", "0") == "1"
+        if unpool
+        and world == 8
+        and _sm107_env("MUSESPARK_OPEN_TEP8_WIDE_UNPOOL_GATHER", "0") == "1"
         else None
     )
     for layer in layers:
@@ -593,9 +595,16 @@ def install(model: MuseSparkOpenModel, *, unpool: bool, pool: bool) -> dict:
     logger.info(
         f"[musespark_open] projection_gathers: TP{world} sharded-projection gathers fused on the "
         f"decode path ({'; '.join(sites)}), steps of at most {MAX_ROWS} rows"
-        + (f"; the pool site also on 9..{WIDE_ROWS}-row steps (32-row inbox)" if wide_pool_inbox is not None else "")
-        + (f"; the unpool site also on 9..{WIDE_ROWS}-row steps (32-row inbox)"
-           if wide_unpool_inbox is not None else "")
+        + (
+            f"; the pool site also on 9..{WIDE_ROWS}-row steps (32-row inbox)"
+            if wide_pool_inbox is not None
+            else ""
+        )
+        + (
+            f"; the unpool site also on 9..{WIDE_ROWS}-row steps (32-row inbox)"
+            if wide_unpool_inbox is not None
+            else ""
+        )
     )
     layer_kwargs = {}
     if unpool:

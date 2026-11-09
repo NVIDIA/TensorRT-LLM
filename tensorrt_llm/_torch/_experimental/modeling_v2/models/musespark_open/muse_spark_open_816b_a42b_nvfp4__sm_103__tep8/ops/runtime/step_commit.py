@@ -55,9 +55,6 @@ Bitwise equal to the two-dimensional grid.
 
 from __future__ import annotations
 
-from ...sm107_defaults import env as _sm107_env
-
-import os
 from typing import Optional
 
 import numpy as np
@@ -67,6 +64,8 @@ import triton.language as tl
 
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
+
+from ...sm107_defaults import env as _sm107_env
 
 KIND_COPY, KIND_GATHER, KIND_FILL, KIND_BLOCKS = 0, 1, 2, 3
 
@@ -367,7 +366,9 @@ class StepStaging:
                 )
             else:
                 _step_commit_kernel[(pending, chunks)](
-                    self._desc_base + self.launched * _DESC_BYTES, BLOCK=_BLOCK, num_warps=_NUM_WARPS
+                    self._desc_base + self.launched * _DESC_BYTES,
+                    BLOCK=_BLOCK,
+                    num_warps=_NUM_WARPS,
                 )
         self.launched = self.num
         self._max_count = 0
@@ -443,7 +444,9 @@ def warm_up() -> None:
         staging.launch()
         torch.cuda.current_stream().synchronize()
         if not bool((long == 7).all()):
-            raise RuntimeError("step_commit v2 warm-up: a fill of three chunks was not written whole")
+            raise RuntimeError(
+                "step_commit v2 warm-up: a fill of three chunks was not written whole"
+            )
         staging.reset()
         logger.info(
             f"[musespark_open] step_commit descriptor read: MUSESPARK_OPEN_STEP_COMMIT_V2={_V2_MODE} "

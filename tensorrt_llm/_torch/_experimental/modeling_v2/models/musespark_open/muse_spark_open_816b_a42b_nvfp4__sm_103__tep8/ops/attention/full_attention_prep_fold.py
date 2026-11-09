@@ -511,8 +511,15 @@ class FullAttnSplitKvFoldMulti(OpWrapper):
         device_index = qkv.device.index
         fold = fold_key(eps, q_scale, qkv_permuted)
         key = compiled_key(
-            device_index, enable_pdl, evict_first, eps, q_scale, qkv_permuted, rescale_cols,
-            kv_heads, reqs,
+            device_index,
+            enable_pdl,
+            evict_first,
+            eps,
+            q_scale,
+            qkv_permuted,
+            rescale_cols,
+            kv_heads,
+            reqs,
         )
         if torch.cuda.is_current_stream_capturing() and key not in _v4._compiled_keys:
             raise RuntimeError(

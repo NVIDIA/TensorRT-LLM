@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E501
 """Where a MuseSparkOpenOmniForCausalLM config lands. Read this file and you know.
 
 ``route`` is one forward-reading decision on three facts: the GPU, the model

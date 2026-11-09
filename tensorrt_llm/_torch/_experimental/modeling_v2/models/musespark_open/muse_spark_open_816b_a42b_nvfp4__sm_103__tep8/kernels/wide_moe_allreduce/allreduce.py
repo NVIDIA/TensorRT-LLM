@@ -150,7 +150,9 @@ def refusal(model: torch.nn.Module) -> Optional[str]:
     ):
         return "it is written for sm_103 and sm_107"
     mapping = model.layers[0].mapping
-    tep8 = mapping.tp_size == 8 and _sm103_tep8_f11() and torch.cuda.get_device_capability() == (10, 3)
+    tep8 = (
+        mapping.tp_size == 8 and _sm103_tep8_f11() and torch.cuda.get_device_capability() == (10, 3)
+    )
     if not ((mapping.tp_size == 4 and not mapping.is_multi_node()) or tep8):
         return (
             f"it serves TP4 on one node, or TP8 on sm_103 under {SM103_TEP8_F11_ENV}=1, got "
