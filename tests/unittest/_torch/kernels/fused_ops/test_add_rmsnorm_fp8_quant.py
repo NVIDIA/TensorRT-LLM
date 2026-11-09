@@ -24,7 +24,7 @@ from tensorrt_llm._torch.kernels.fused_ops.add_rmsnorm_fp8_quant import add_rmsn
 from tensorrt_llm._torch.models.modeling_qwen3_next import _fp8_linear_input_scale
 from tensorrt_llm._torch.modules import rms_norm
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.modules.rms_norm import Fp8NormOutput, RMSNorm
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -116,8 +116,10 @@ def test_rms_norm_emits_fp8_copy(num_tokens):
     ref_normed, ref_residual = _flashinfer_add_norm(x, residual, norm.weight, use_gemma=True)
 
     norm.fp8_scale = scale
-    (fp8, normed), residual_out = norm(x, residual)
+    out, residual_out = norm(x, residual)
 
+    assert isinstance(out, Fp8NormOutput)
+    fp8, normed = out
     _assert_same_bits(residual_out, ref_residual)
     _assert_same_bits(fp8, _static_quant(normed, scale))
     torch.testing.assert_close(normed, ref_normed, atol=0, rtol=2**-7)

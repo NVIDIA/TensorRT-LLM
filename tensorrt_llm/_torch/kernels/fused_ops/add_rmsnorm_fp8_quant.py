@@ -50,6 +50,8 @@ def _add_rmsnorm_fp8_quant_kernel(
     normed = (x * rstd * (weight + WEIGHT_OFFSET)).to(input_ptr.dtype.element_ty)
     tl.store(input_ptr + offsets, normed, mask=mask)
 
+    # A correctly rounded reciprocal and then a multiply, as in scaleMatrixPerTensorVec
+    # (cudaFp8Utils.cu), so the E4M3 bits match the C++ static quantization.
     inv_scale = tldevice.rcp_rn(tl.load(scale_ptr).to(tl.float32))
     fp8 = (normed.to(tl.float32) * inv_scale).to(fp8_ptr.dtype.element_ty)
     tl.store(fp8_ptr + offsets, fp8, mask=mask)

@@ -34,7 +34,7 @@ from tensorrt_llm._torch.models.modeling_qwen3_next import (
     _Qwen3NextDecoderLayerBase,
 )
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.modules.rms_norm import Fp8NormOutput, RMSNorm
 from tensorrt_llm._torch.utils import EventType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -439,24 +439,48 @@ def _scale_wiring_layer(gate_up_proj, fused: bool):
 
 
 @pytest.mark.parametrize(
-    "case", ("standalone", "fused", "lora", "pp", "helix", "dense_mlp", "unquantized_shared_expert")
+    "case",
+    (
+        "standalone",
+        "fused",
+        "attention_dp",
+        "attention_dp_sm120",
+        "env_disabled",
+        "lora",
+        "pp",
+        "helix",
+        "dense_mlp",
+        "unquantized_shared_expert",
+    ),
 )
 @torch.no_grad()
-def test_norms_outside_fused_allreduce_get_fp8_scales(case) -> None:
-    """Only norms that run on their own get the static scale of the FP8 Linear they feed."""
+def test_norms_get_the_fp8_scale_of_the_linear_they_feed(monkeypatch, case) -> None:
+    """Norms get the static scale of the FP8 Linear they feed, also where a fused all-reduce runs in
+    their place, except where nothing reads the copy or the fusions are turned off."""
+    if case == "env_disabled":
+        monkeypatch.setenv("TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "1")
+    else:
+        monkeypatch.delenv("TRTLLM_QWEN3_EAGER_FUSION_DISABLED", raising=False)
+    monkeypatch.setattr(modeling_qwen3_next, "is_sm_120f", lambda: case == "attention_dp_sm120")
     gate_up_proj = _fp8_linear(quantized=case != "unquantized_shared_expert")
     layers = [
         _scale_wiring_layer(None if case == "dense_mlp" else gate_up_proj, case == "fused")
         for _ in range(2)
     ]
+    attention_dp = case.startswith("attention_dp")
     model_config = SimpleNamespace(
         lora_config=object() if case == "lora" else None,
-        mapping=SimpleNamespace(has_pp=lambda: case == "pp", has_cp_helix=lambda: case == "helix"),
+        mapping=SimpleNamespace(
+            has_pp=lambda: case == "pp",
+            has_cp_helix=lambda: case == "helix",
+            enable_attention_dp=attention_dp,
+            tp_size=2 if attention_dp or case == "fused" else 1,
+        ),
     )
 
     _attach_norm_fp8_scales(layers, model_config)
 
-    wired = case in ("standalone", "dense_mlp", "unquantized_shared_expert")
+    wired = case not in ("env_disabled", "lora", "pp", "helix")
     assert layers[0].input_layernorm.fp8_scale is None
     if wired:
         assert layers[1].input_layernorm.fp8_scale is layers[0].next_layer_input_scale
@@ -464,7 +488,7 @@ def test_norms_outside_fused_allreduce_get_fp8_scales(case) -> None:
         assert layers[1].input_layernorm.fp8_scale is None
     for layer in layers:
         norm = layer.post_attention_layernorm
-        if case == "standalone":
+        if case in ("standalone", "fused", "attention_dp"):
             assert norm.fp8_scale.data_ptr() == gate_up_proj.input_scale.data_ptr()
             assert "fp8_scale" not in norm.state_dict()
         else:
@@ -489,8 +513,10 @@ def test_standalone_norms_hand_over_their_fp8_copy(next_layer_reads_bf16) -> Non
         hidden_size=_HIDDEN,
         input_layernorm=MagicMock(),
         mixer_forward=MagicMock(side_effect=lambda pos, h, *args, **kwargs: h),
-        post_attention_layernorm=MagicMock(return_value=((post_fp8, post_bf16), residual)),
-        next_layer_layernorm=MagicMock(return_value=((next_fp8, next_bf16), residual)),
+        post_attention_layernorm=MagicMock(
+            return_value=(Fp8NormOutput(post_fp8, post_bf16), residual)
+        ),
+        next_layer_layernorm=MagicMock(return_value=(Fp8NormOutput(next_fp8, next_bf16), residual)),
         next_layer_reads_bf16=next_layer_reads_bf16,
         fusion_config=SimpleNamespace(PRE_MOE_FUSION=False, POST_MOE_FUSION=False),
         disable_attn_allreduce=True,
@@ -574,4 +600,30 @@ def test_moe_block_feeds_fp8_copy_to_shared_expert_only(monkeypatch, path) -> No
         assert shared_input.data_ptr() == expected.data_ptr()
     for module in (block.gate, block.experts):
         assert module.call_args.args[0].data_ptr() == bf16.data_ptr()
+    assert out.shape == bf16.shape
+
+
+@torch.no_grad()
+def test_moe_block_with_dp_padding_feeds_bf16_to_shared_expert(monkeypatch) -> None:
+    """With attention DP on SM120 the MoE pads its input, and the shared expert reads the padded BF16
+    input instead of the E4M3 copy."""
+    monkeypatch.setattr(
+        modeling_qwen3_next,
+        "fused_sigmoid_gate_mul_add",
+        lambda routed, gate_logits, shared, output=None: routed + shared,
+    )
+    monkeypatch.setattr(modeling_qwen3_next, "is_sm_120f", lambda: True)
+    block = _moe_block()
+    block.enable_attention_dp = True
+    block.mapping = SimpleNamespace(tp_size=2)
+    bf16 = torch.randn(3, _HIDDEN, dtype=torch.bfloat16)
+
+    out = block(
+        _Fp8HiddenStates(bf16, bf16.to(torch.float8_e4m3fn)),
+        SimpleNamespace(all_rank_num_tokens=[3, 3]),
+    )
+
+    shared_input = block.shared_expert.call_args.args[0]
+    assert shared_input.dtype == torch.bfloat16
+    torch.testing.assert_close(shared_input, bf16, atol=0.0, rtol=0.0)
     assert out.shape == bf16.shape

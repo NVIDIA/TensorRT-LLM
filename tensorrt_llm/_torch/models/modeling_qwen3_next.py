@@ -65,7 +65,7 @@ from ..modules.low_m_mma_gemm import (fused_shared_expert,
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.multi_stream_utils import (do_multi_stream,
                                           maybe_execute_in_parallel)
-from ..modules.rms_norm import RMSNorm
+from ..modules.rms_norm import Fp8NormOutput, RMSNorm
 from ..moe.fused_moe import (BaseMoeRoutingMethod, MoEWeightLoadingMode,
                              RenormalizeMoeRoutingMethod,
                              RenormalizeNaiveMoeRoutingMethod,
@@ -155,14 +155,17 @@ def _precompute_fused_norm_weights(module: nn.Module) -> None:
                 norm._fused_norm_weight = fused
 
 
+def _eager_fusion_disabled_by_env() -> bool:
+    return os.environ.get("TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") != "0"
+
+
 def _eager_fusion_enabled(enable_attention_dp: bool) -> bool:
-    return (os.environ.get("TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
-            and not enable_attention_dp)
+    return not _eager_fusion_disabled_by_env() and not enable_attention_dp
 
 
 class _Fp8HiddenStates(NamedTuple):
-    """A decoder layer's input with its E4M3 copy at the input projection's
-    static scale, made by the previous layer's fused all-reduce."""
+    """A BF16 activation with its E4M3 copy at the static input scale of the
+    FP8 Linear that reads it, made by a fused all-reduce or a standalone norm."""
 
     hidden_states: torch.Tensor
     fp8: torch.Tensor
@@ -208,29 +211,41 @@ def _fp8_linear_input_scale(linear: Optional[Linear]) -> Optional[torch.Tensor]:
     return scale.detach() if scale is not None else None
 
 
+def _moe_uses_dp_padding(enable_attention_dp: bool, tp_size: int) -> bool:
+    """Whether the MoE block pads its input to the largest token count across
+    attention-DP ranks, in which case its shared expert reads the BF16 input."""
+    return enable_attention_dp and tp_size > 1 and is_sm_120f()
+
+
 def _attach_norm_fp8_scales(layers, model_config: ModelConfig) -> None:
-    """Let norms that run outside a fused all-reduce also write the E4M3 copy
-    their static-FP8 consumer reads: a layer's input norm for its input
-    projection, and its post-attention norm for the shared expert.
+    """Let norms also write the E4M3 copy their static-FP8 consumer reads: a
+    layer's input norm for its input projection, and its post-attention norm
+    for the shared expert.
+
+    Where a fused all-reduce replaces a norm, it reads only the norm's weight
+    and eps, so the scale is used only when the layer runs the norm itself, as
+    a layer that captures hidden states for speculative decoding does.
 
     Expects ``next_layer_input_scale`` to be set on ``layers``. Pipeline stages
     send a plain tensor, Helix all-gathers the attention input and LoRA
-    adapters read the BF16 input, so none of them use the copy.
+    adapters read the BF16 input, so none of them use the copy, and neither
+    does a shared expert behind the MoE's attention-DP padding.
+    ``TRTLLM_QWEN3_EAGER_FUSION_DISABLED=1`` turns the copy off as well.
     """
     mapping = model_config.mapping
-    if (model_config.lora_config is not None or mapping.has_pp()
-            or mapping.has_cp_helix()):
+    if (_eager_fusion_disabled_by_env() or model_config.lora_config is not None
+            or mapping.has_pp() or mapping.has_cp_helix()):
         return
     for layer, next_layer in zip(layers, layers[1:]):
-        next_layer.input_layernorm.fp8_scale = (
-            None if layer.fusion_config.POST_MOE_FUSION else
-            layer.next_layer_input_scale)
+        next_layer.input_layernorm.fp8_scale = layer.next_layer_input_scale
+    shared_expert_reads_fp8 = not _moe_uses_dp_padding(
+        mapping.enable_attention_dp, mapping.tp_size)
     for layer in layers:
         shared_expert = getattr(layer.mlp, "shared_expert", None)
+        scale = _fp8_linear_input_scale(
+            getattr(shared_expert, "gate_up_proj", None))
         layer.post_attention_layernorm.fp8_scale = (
-            None
-            if layer.fusion_config.PRE_MOE_FUSION else _fp8_linear_input_scale(
-                getattr(shared_expert, "gate_up_proj", None)))
+            scale if shared_expert_reads_fp8 else None)
 
 
 def _post_moe_allreduce(layer: nn.Module, mlp_output, residual: torch.Tensor):
@@ -648,8 +663,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         use_dp_padding = False
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
-        if self.enable_attention_dp and self.mapping.tp_size > 1 and is_sm_120f(
-        ):
+        if _moe_uses_dp_padding(self.enable_attention_dp, self.mapping.tp_size):
             use_dp_padding = True
             # Padding improves context-phase MoE communication on SM120. Keep
             # it local to the routed experts: the shared expert operates on
@@ -942,7 +956,7 @@ class _Qwen3NextDecoderLayerBase(DecoderLayer):
                 hidden_states, residual)
 
         mlp_input = hidden_states
-        if isinstance(hidden_states, tuple):
+        if isinstance(hidden_states, Fp8NormOutput):
             # The norm also wrote the shared expert's E4M3 input.
             fp8, hidden_states = hidden_states
             mlp_input = _Fp8HiddenStates(hidden_states, fp8)
@@ -976,7 +990,7 @@ class _Qwen3NextDecoderLayerBase(DecoderLayer):
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
-                if isinstance(hidden_states, tuple):
+                if isinstance(hidden_states, Fp8NormOutput):
                     # The norm also wrote the next layer's E4M3 input: GDN
                     # reads both, attention only the E4M3 copy.
                     fp8, hidden_states = hidden_states
