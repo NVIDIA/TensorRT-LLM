@@ -15,7 +15,7 @@ results (``checks/test_results.py``), which hold at the exact commit they ran at
 
 It runs only the test files the change can reach (:func:`affected_files`):
 those it changed, those that import a module it changed (directly, or through
-a helper or another module of the package that does), and the claims gates.
+a helper or another module of the package that does), and the source-level gates.
 A change to code the whole package shares (outside the catalog's and the
 targets' own directories, the catalog's or ``models/``'s own ``__init__.py``, a
 ``conftest.py``) reaches every file. A package ``__init__.py`` deeper down (a
@@ -86,7 +86,9 @@ UNREACHED_PREFIXES: tuple[str, ...] = (
 )
 UNREACHED_SUFFIXES: tuple[str, ...] = (".md", ".rst")
 #: Test files every check runs: the package's source-level gates read every entry.
-ALWAYS_RUN = re.compile(r"(?:^|/)test_modeling_v2_[a-z_]*claims[a-z_]*\.py$")
+ALWAYS_RUN = re.compile(
+    r"(?:^|/)test_modeling_v2_(?:[a-z_]*claims[a-z_]*|ci_selection|contracts)\.py$"
+)
 
 #: Runs one command line in a tree on the run's devices; returns its exit code and output tail.
 #: Called ``(command, tree)``, or with ``timeout_s=`` for a job shorter than the run's job size,

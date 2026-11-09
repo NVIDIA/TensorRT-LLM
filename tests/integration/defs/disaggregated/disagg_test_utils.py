@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -216,7 +216,9 @@ def run_gen_worker(
     )
 
 
-def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, env=None, cwd=None):
+def run_disagg_server(
+    disagg_cluster_config, work_dir, port=0, save_log=False, env=None, cwd=None, report_addr=None
+):
     """Launch the disaggregated server.
 
     Args:
@@ -225,6 +227,8 @@ def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, e
         port: Port number
         save_log: Whether to save logs to file
         env: Environment variables for the subprocess
+        report_addr: If set, passed as --report_addr: the server writes the
+            host:port it bound to this file (read it with wait_for_reported_addr)
 
     Returns:
         ProcessWrapper: Wrapped subprocess
@@ -234,6 +238,8 @@ def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, e
     with open(disagg_server_config_path, "w+") as f:
         yaml.dump(disagg_cluster_config, f)
     cmds = ["trtllm-serve", "disaggregated", "-c", disagg_server_config_path]
+    if report_addr:
+        cmds += ["--report_addr", report_addr]
     log_file = None
     log_path = None
     # See WAR rationale in _run_worker above (nvbugs/5821433).

@@ -29,13 +29,20 @@ Exactly two recipes are supported, read from the checkpoint's
 The pipeline owns the scheduler instances; :class:`Cosmos3SamplingPolicy` is
 an immutable value object of config-derived facts whose methods take
 schedulers as arguments.
+
+A request may select the sigma grid of a base checkpoint with
+``extra_params["sigma_grid"]`` (:data:`SIGMA_GRIDS`); :func:`resolve_sampling_schedule`
+turns that selection, the request's ``flow_shift`` and the mode's own defaults
+into a :class:`SamplingSchedule`. Omitting ``sigma_grid`` selects checkpoint- and
+mode-specific defaults.
 """
 
 import json
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Literal, Optional, get_args
 
 import numpy as np
 from diffusers import FlowMatchEulerDiscreteScheduler, UniPCMultistepScheduler
@@ -45,6 +52,253 @@ from tensorrt_llm.logger import logger
 # Distilled checkpoints bake classifier-free guidance into the weights; the
 # only valid scale is 1.0 ("off": a single conditional forward per step).
 DISTILLED_GUIDANCE_SCALE = 1.0
+
+# Grids a request can select through ``extra_params["sigma_grid"]``:
+#   karras    -- the checkpoint's Karras levels converted to flow sigmas; no flow shift.
+#   native    -- the Cosmos framework's shifted-linear flow grid.
+#   diffusers -- the pinned Diffusers UniPC shifted-linear flow grid.
+SigmaGrid = Literal["karras", "native", "diffusers"]
+SIGMA_GRIDS: tuple[str, ...] = get_args(SigmaGrid)
+
+# Every grid a resolved schedule can name: the selectable grids, plus
+#   checkpoint_native_flow -- descending linear flow sigmas starting at 1 - 1/T, excluding
+#                             the terminal zero, for checkpoints that declare the native
+#                             flow schedule (1 - 1/T is not rounded to float32, unlike
+#                             ``native``);
+#   scheduler_config       -- the non-Karras grid of a scheduler without flow sigmas;
+#   fixed                  -- a distilled checkpoint's fixed sigmas.
+ResolvedGrid = Literal[
+    "karras", "native", "diffusers", "checkpoint_native_flow", "scheduler_config", "fixed"
+]
+RESOLVED_GRIDS: tuple[str, ...] = get_args(ResolvedGrid)
+
+# Diffusers UniPC lowers a first shifted flow sigma within this distance of 1
+# (its log-SNR is singular at sigma 1). The native grid never applies it.
+_DIFFUSERS_FLOW_SIGMA_EPS = 1e-6
+
+
+def native_flow_upper_sigma(num_train_timesteps: int) -> float:
+    """The first unshifted level of the native grid: ``1 - 1/num_train_timesteps`` rounded to float32."""
+    # The Cosmos framework stores its training sigmas 1 - linspace(1, 1/T, T)[::-1] as
+    # float32 and spaces inference levels between the stored endpoints, which it reads
+    # back as Python floats.
+    return float(np.float32(1.0 - 1.0 / num_train_timesteps))
+
+
+def native_flow_base_sigmas(num_inference_steps: int, num_train_timesteps: int) -> np.ndarray:
+    """Return ``num_inference_steps`` unshifted, evenly spaced sigma levels as a float64 NumPy array.
+
+    The first level is :func:`native_flow_upper_sigma`, ``1 - 1/num_train_timesteps``
+    rounded to float32; the terminal zero is excluded.
+    """
+    upper = native_flow_upper_sigma(num_train_timesteps)
+    return np.linspace(upper, 0.0, num_inference_steps + 1)[:-1]
+
+
+def _shift_flow_sigma(sigma: float, flow_shift: float) -> float:
+    return flow_shift * sigma / (1.0 + (flow_shift - 1.0) * sigma)
+
+
+@dataclass(frozen=True)
+class SamplingSchedule:
+    """The concrete sigma grid and flow shift one request samples with.
+
+    ``grid`` is the grid the request's scheduler is programmed with (one of
+    :data:`RESOLVED_GRIDS`). ``flow_shift`` is the shift its UniPC scheduler is built
+    with; the ``karras`` and ``fixed`` grids do not use it. ``flow_shift_explicit``
+    records whether the request supplied ``flow_shift`` itself rather than taking the
+    mode's.
+    """
+
+    grid: ResolvedGrid
+    flow_shift: float
+    flow_shift_explicit: bool = False
+
+    def __post_init__(self) -> None:
+        if self.grid not in RESOLVED_GRIDS:
+            raise ValueError(
+                f"Unknown Cosmos3 sigma grid {self.grid!r}; expected one of {RESOLVED_GRIDS}."
+            )
+
+    @property
+    def use_karras_sigmas(self) -> bool:
+        """Whether the request's UniPC scheduler is built with Karras sigmas."""
+        return self.grid == "karras"
+
+    @property
+    def inactive_flow_shift(self) -> bool:
+        """Whether the request supplied a ``flow_shift`` while sampling the Karras grid, which ignores it."""
+        return self.flow_shift_explicit and self.grid == "karras"
+
+
+def resolve_sampling_schedule(
+    sampling: "Cosmos3SamplingPolicy",
+    *,
+    sigma_grid: Optional[SigmaGrid],
+    flow_shift: Optional[float],
+    mode_flow_shift: float,
+    mode_use_karras_sigmas: Optional[bool],
+) -> SamplingSchedule:
+    """Resolve one request's concrete sampling schedule.
+
+    Each setting is taken from the first source that sets it: the request
+    (``sigma_grid``, ``flow_shift``), then the mode (``mode_use_karras_sigmas``,
+    ``mode_flow_shift``), then the checkpoint. Without ``sigma_grid`` the grid is
+    chosen by :func:`_default_schedule`.
+
+    Args:
+        sampling: The checkpoint's sampling policy.
+        sigma_grid: ``extra_params["sigma_grid"]``; ``None`` when omitted.
+        flow_shift: ``extra_params["flow_shift"]``; ``None`` when omitted.
+        mode_flow_shift: The shift the mode uses when the request names none.
+        mode_use_karras_sigmas: ``False`` when the mode needs a non-Karras grid
+            (V2V and transfer); ``None`` to follow the checkpoint.
+
+    Raises:
+        ValueError: The selection cannot be honored for this checkpoint or the
+            explicit values conflict.
+    """
+    if sigma_grid is None:
+        return _default_schedule(
+            sampling,
+            flow_shift=flow_shift,
+            mode_flow_shift=mode_flow_shift,
+            mode_use_karras_sigmas=mode_use_karras_sigmas,
+        )
+    if sampling.is_distilled:
+        raise ValueError(
+            f"sigma_grid={sigma_grid!r} is not supported for a distilled Cosmos3 "
+            "checkpoint: its sampling schedule is fixed by the checkpoint. Omit "
+            "sigma_grid."
+        )
+    if sigma_grid not in SIGMA_GRIDS:
+        raise ValueError(f"sigma_grid must be one of {list(SIGMA_GRIDS)}, got {sigma_grid!r}.")
+    base_config = sampling.unipc_base_config
+    if base_config is not None and not _config_get(base_config, "use_flow_sigmas", False):
+        raise ValueError(
+            f"sigma_grid={sigma_grid!r} requires a flow-sigma UniPC scheduler; this "
+            "checkpoint's scheduler config does not set use_flow_sigmas."
+        )
+
+    if sigma_grid == "karras":
+        if flow_shift is not None:
+            raise ValueError(
+                "flow_shift has no effect with sigma_grid='karras': the Karras grid is "
+                "not flow-shifted. Omit flow_shift, or select sigma_grid='native' or "
+                "'diffusers'."
+            )
+        return SamplingSchedule(grid="karras", flow_shift=mode_flow_shift)
+
+    shift = mode_flow_shift if flow_shift is None else float(flow_shift)
+    if not math.isfinite(shift) or shift <= 0.0:
+        raise ValueError(f"flow_shift must be a positive finite number, got {shift!r}.")
+    if sigma_grid == "native":
+        _validate_native_grid(base_config, shift)
+    return SamplingSchedule(
+        grid=sigma_grid, flow_shift=shift, flow_shift_explicit=flow_shift is not None
+    )
+
+
+def _default_schedule(
+    sampling: "Cosmos3SamplingPolicy",
+    *,
+    flow_shift: Optional[float],
+    mode_flow_shift: float,
+    mode_use_karras_sigmas: Optional[bool],
+) -> SamplingSchedule:
+    """The schedule of a request that selects no ``sigma_grid``.
+
+    The grid is the fixed sigmas of a distilled checkpoint; the checkpoint's linear
+    flow grid when it declares the native flow schedule; otherwise Karras when the
+    mode or, failing that, the scheduler config enables it, and else the scheduler
+    config's flow grid (``diffusers``) or non-flow grid (``scheduler_config``). The
+    shift is the request's ``flow_shift``, else the mode's.
+    """
+    if sampling.is_distilled:
+        grid = "fixed"
+    elif sampling.native_flow_schedule:
+        grid = "checkpoint_native_flow"
+    else:
+        base_config = sampling.unipc_base_config
+        karras = mode_use_karras_sigmas
+        if karras is None:
+            karras = bool(_config_get(base_config, "use_karras_sigmas", False))
+        if karras:
+            grid = "karras"
+        elif _config_get(base_config, "use_flow_sigmas", False):
+            grid = "diffusers"
+        else:
+            grid = "scheduler_config"
+    explicit = flow_shift is not None
+    return SamplingSchedule(
+        grid=grid,
+        flow_shift=float(flow_shift) if explicit else mode_flow_shift,
+        flow_shift_explicit=explicit,
+    )
+
+
+def _validate_native_grid(scheduler_config: Any, flow_shift: float) -> None:
+    """Raise ``ValueError`` when ``native`` cannot reproduce the Cosmos framework grid.
+
+    The framework grid needs the scheduler's default flow settings, and a first
+    shifted level far enough from 1 that UniPC does not adjust it.
+    """
+    unsupported = [
+        key
+        for key, value in (
+            ("use_dynamic_shifting", _config_get(scheduler_config, "use_dynamic_shifting", False)),
+            ("shift_terminal", _config_get(scheduler_config, "shift_terminal", None)),
+        )
+        if value
+    ]
+    if _config_get(scheduler_config, "final_sigmas_type", "zero") != "zero":
+        unsupported.append("final_sigmas_type")
+    if unsupported:
+        raise ValueError(
+            "sigma_grid='native' reproduces the Cosmos framework grid, which needs the "
+            "scheduler's default flow settings; this checkpoint sets "
+            f"{', '.join(unsupported)}."
+        )
+    num_train = int(_config_get(scheduler_config, "num_train_timesteps", 1000))
+    upper = _shift_flow_sigma(native_flow_upper_sigma(num_train), flow_shift)
+    if abs(upper - 1.0) < _DIFFUSERS_FLOW_SIGMA_EPS:
+        raise ValueError(
+            f"flow_shift={flow_shift} moves the first native sigma within "
+            f"{_DIFFUSERS_FLOW_SIGMA_EPS} of 1, where the UniPC solver alters it; the "
+            "native grid cannot be reproduced at this shift."
+        )
+
+
+def _validate_unipc_sigmas(scheduler: Any, schedule: SamplingSchedule) -> None:
+    """Raise ``ValueError`` when UniPC cannot step through ``scheduler``'s programmed sigmas.
+
+    UniPC steps between consecutive levels in log-SNR. Every level must be finite, the
+    levels it steps from must be positive and strictly decreasing, and the terminal
+    level must lie between 0 and the last of them. Flow sigmas must also stay below 1,
+    where the log-SNR is singular. An extreme ``flow_shift`` breaks these through
+    rounding: leading levels reach 1 or more, or stop decreasing.
+    """
+    sigmas = scheduler.sigmas.numpy()
+    levels, terminal = sigmas[:-1], sigmas[-1]
+    bad = ~np.isfinite(levels) | (levels <= 0.0)
+    if _config_get(scheduler.config, "use_flow_sigmas", False):
+        bad |= levels >= 1.0
+    bad[1:] |= levels[1:] >= levels[:-1]
+    if bad.any():
+        index = int(np.argmax(bad))
+        problem = f"level {index} is {float(levels[index])}"
+        if index > 0:
+            problem += f" after {float(levels[index - 1])}"
+    elif not (np.isfinite(terminal) and 0.0 <= terminal <= levels[-1]):
+        problem = f"the terminal level is {float(terminal)}"
+    else:
+        return
+    raise ValueError(
+        f"flow_shift={schedule.flow_shift} on the {schedule.grid!r} grid with "
+        f"{len(levels)} steps gives sigmas the UniPC solver cannot step through. Levels "
+        "must be finite, positive, strictly decreasing and, for flow sigmas, below 1; "
+        f"{problem}. Use a less extreme flow_shift."
+    )
 
 
 def _config_get(config: Any, key: str, default: Any = None) -> Any:
@@ -214,19 +468,60 @@ class Cosmos3SamplingPolicy:
                 f"left unset (got {guidance_scale})."
             )
 
-    def set_timesteps(self, scheduler: Any, num_inference_steps: int, device: Any) -> None:
-        """Program a scheduler for one generation: fixed sigmas or a step count."""
-        if self.is_distilled:
+    def set_timesteps(
+        self,
+        scheduler: Any,
+        num_inference_steps: int,
+        device: Any,
+        schedule: SamplingSchedule,
+    ) -> None:
+        """Program ``scheduler`` with ``schedule``'s timesteps for one generation.
+
+        ``scheduler`` must be built for ``schedule`` (see :meth:`set_flow_shift`).
+        A distilled checkpoint's fixed schedule ignores ``num_inference_steps``; every
+        other grid runs ``num_inference_steps`` steps. Programming resets the
+        scheduler's solver state and starts the next generation at step 0.
+
+        Raises:
+            RuntimeError: ``schedule`` does not match this checkpoint or ``scheduler``.
+            ValueError: The programmed sigmas cannot be stepped through (see
+                :func:`_validate_unipc_sigmas`), which an extreme ``flow_shift`` causes.
+        """
+        is_fixed = schedule.grid == "fixed"
+        if is_fixed != self.is_distilled:
+            raise RuntimeError(
+                f"Cosmos3 sigma grid {schedule.grid!r} does not match a "
+                f"{'distilled' if self.is_distilled else 'base'} checkpoint."
+            )
+        if is_fixed:
             scheduler.set_timesteps(sigmas=list(self.fixed_sigmas), device=device)
-        elif self.native_flow_schedule:
-            # The PyTorch-backend base grid: linear flow sigmas over
-            # (1 - 1/T, 0]. UniPC applies its flow_shift to provided sigmas;
-            # a numpy array is required (a list breaks diffusers 0.39).
-            num_train = int(_config_get(scheduler.config, "num_train_timesteps", 1000))
+            return
+        scheduler_karras = bool(_config_get(scheduler.config, "use_karras_sigmas", False))
+        if schedule.use_karras_sigmas != scheduler_karras:
+            raise RuntimeError(
+                f"Cosmos3 sigma grid {schedule.grid!r} does not match a scheduler built with "
+                f"use_karras_sigmas={scheduler_karras}."
+            )
+        num_train = int(_config_get(scheduler.config, "num_train_timesteps", 1000))
+        # The native and checkpoint_native_flow levels are passed to UniPC unshifted, so
+        # its flow_shift shifts them exactly once; the karras, diffusers and
+        # scheduler_config grids are generated by the scheduler from its config.
+        if schedule.grid == "native":
+            sigmas = native_flow_base_sigmas(num_inference_steps, num_train)
+        elif schedule.grid == "checkpoint_native_flow":
+            # A numpy array is required (a list breaks diffusers 0.39).
             sigmas = np.linspace(1.0 - 1.0 / num_train, 0.0, num_inference_steps + 1)[:-1]
-            scheduler.set_timesteps(num_inference_steps, device=device, sigmas=sigmas)
         else:
+            sigmas = None
+        if sigmas is None:
             scheduler.set_timesteps(num_inference_steps, device=device)
+        else:
+            scheduler.set_timesteps(num_inference_steps, device=device, sigmas=sigmas)
+        _validate_unipc_sigmas(scheduler, schedule)
+        # A strongly shifted grid can repeat its leading integer timesteps (999, 999, ...).
+        # UniPC looks up its first step by timestep value and, on repeats, starts at the
+        # second match; every generation runs the whole schedule, so start at step 0.
+        scheduler.set_begin_index(0)
 
     def scheduler_step_kwargs(self, generator: Any) -> dict:
         """Extra kwargs each ``scheduler.step()`` call requires.
@@ -250,39 +545,20 @@ class Cosmos3SamplingPolicy:
             return 1.0
         return float(_config_get(self.unipc_base_config, "flow_shift", 1.0) or 1.0)
 
-    def set_flow_shift(
-        self,
-        scheduler: Any,
-        target_shift: Optional[float],
-        *,
-        use_karras_sigmas: Optional[bool] = None,
-    ) -> Any:
-        """Return ``scheduler`` rebuilt for the requested sampling knobs.
+    def set_flow_shift(self, scheduler: Any, schedule: SamplingSchedule) -> Any:
+        """Return a UniPC scheduler built for ``schedule``'s flow shift and Karras setting.
 
-        Current values are read from the supplied scheduler's own config, so
-        no tracking state exists to diverge. ``None`` means "whatever the
-        checkpoint shipped" for either knob: V2V passes
-        ``use_karras_sigmas=False`` to force the uniform sigma schedule, and a
-        checkpoint on the native flow schedule needs the same for the same
-        reason. Structural no-op for distilled checkpoints (no UniPC base
-        config) and when neither knob is requested.
+        ``scheduler`` itself is returned when its config already matches; otherwise a
+        new scheduler is built from the checkpoint config, which is never modified.
+        Distilled checkpoints return ``scheduler`` unchanged: their fixed schedule takes
+        no flow shift.
         """
         if self.unipc_base_config is None:
             return scheduler
-        if target_shift is None and use_karras_sigmas is None:
-            return scheduler
-
+        target_shift = float(schedule.flow_shift)
+        target_karras = schedule.use_karras_sigmas
         current_shift = float(_config_get(scheduler.config, "flow_shift", 1.0) or 1.0)
-        target_shift = self.checkpoint_flow_shift if target_shift is None else float(target_shift)
         current_karras = bool(_config_get(scheduler.config, "use_karras_sigmas", False))
-        base_karras = bool(_config_get(self.unipc_base_config, "use_karras_sigmas", False))
-        # The native flow schedule is defined on explicit linear sigmas, which
-        # UniPC's karras branch discards; treat it as an implicit request for
-        # the uniform grid rather than a separate code path.
-        if use_karras_sigmas is None and self.native_flow_schedule:
-            use_karras_sigmas = False
-        target_karras = base_karras if use_karras_sigmas is None else bool(use_karras_sigmas)
-
         if current_shift == target_shift and current_karras == target_karras:
             return scheduler
         return UniPCMultistepScheduler.from_config(
