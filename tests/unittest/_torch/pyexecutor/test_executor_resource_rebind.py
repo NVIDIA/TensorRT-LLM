@@ -17,6 +17,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor import (
     PyExecutorResources,
     _ExecutorExecutionConfig,
 )
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.sampler import AsyncWorkerMixin
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
@@ -85,8 +86,9 @@ def executor(monkeypatch):
     ex.dense_dwdp_manager = None
     ex.pending_encoder_steps = [object()]
     ex.active_requests = [object()]
-    ex.responses = {17: object()}
-    ex.result_wait_queues = {17: object()}
+    ex._response_channel = ResponseChannel()
+    ex._response_channel.responses[17] = [object()]
+    ex._response_channel.register([17], object())
     ex._pending_transfer_responses = [object()]
     ex._pending_response_terminations = [object()]
     ex.request_accumulated = [object()]
@@ -152,7 +154,11 @@ def test_release_preserves_model_and_orders_gpu_teardown(executor):
     assert ex.scheduler is None
     assert ex.kv_cache_transceiver is None
     assert ex.hang_detector is None  # Drops the old transceiver's status-provider reference.
-    assert not ex.responses and not ex.active_requests and not ex.result_wait_queues
+    assert (
+        not ex._response_channel.responses
+        and not ex.active_requests
+        and not ex._response_channel.result_wait_queues
+    )
     assert not ex.pending_encoder_steps
     assert not ex.request_accumulated and not ex.control_requests
     assert ex.waiting_queue is None and ex._pending_adp_dummy_request is None

@@ -43,6 +43,12 @@ class ResponseChannel:
         """
         self.result_wait_queues.pop(request_id, None)
 
+    def clear(self) -> None:
+        """Drop every stored response and every registered queue."""
+        with self.response_cv:
+            self.responses.clear()
+            self.result_wait_queues.clear()
+
     def publish(self, responses: Iterable[tuple[int, LlmResponse]]) -> None:
         """Store responses for pickup, forward them to registered queues and wake the waiters.
 

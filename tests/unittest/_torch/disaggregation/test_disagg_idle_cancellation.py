@@ -8,7 +8,6 @@ resource allocation are controlled boundaries; these CPU tests require the
 native TRT-LLM runtime but do not qualify GPU/NIXL deployment or DMA fencing.
 """
 
-import threading
 from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
@@ -36,6 +35,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmResponse, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.request_delivery import ResponseChannel
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.executor import FinishReason
@@ -114,9 +114,7 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     engine.executor_request_queue = ExecutorRequestQueue(
         dist=engine.dist, max_batch_size=8, enable_iter_perf_stats=False, batch_wait_timeout_ms=0.0
     )
-    engine.response_cv = threading.Condition()
-    engine.responses = {}
-    engine.result_wait_queues = {}
+    engine._response_channel = ResponseChannel()
     engine._disagg_pp_termination_handler = None
     engine._prefetched_request_ids = set()
     engine.resource_manager = Mock(spec=["free_resources"])
@@ -179,12 +177,12 @@ def _assert_released_once(executor: PyExecutor, request: LlmRequest) -> None:
     assert request.is_finished_due_to_cancellation
     assert request not in executor.active_requests
     executor._flush_pending_transfer_responses()
-    (response,) = executor.responses[request.py_request_id]
+    (response,) = executor._response_channel.responses[request.py_request_id]
     assert response.error_msg is None
     executor.sampler.release_request.assert_called_once_with(request)
     executor.resource_manager.free_resources.assert_called_once_with(request)
     executor._flush_pending_transfer_responses()
-    assert len(executor.responses[request.py_request_id]) == 1
+    assert len(executor._response_channel.responses[request.py_request_id]) == 1
     executor.sampler.release_request.assert_called_once_with(request)
     executor.resource_manager.free_resources.assert_called_once_with(request)
 
@@ -435,11 +433,11 @@ def test_preserved_failure_is_flushed_before_idle_fetch(
             assert executor._pending_transfer_responses == []
             assert executor._pending_response_terminations == []
         if not should_flush:
-            assert executor.responses == {}
+            assert executor._response_channel.responses == {}
             executor.dist.tp_gather.assert_not_called()
             executor.dist.allgather.assert_not_called()
         else:
-            (response,) = executor.responses[1]
+            (response,) = executor._response_channel.responses[1]
             assert response.error_msg == "Disagg KV cache transfer error"
             response_gather.assert_called_once()
         if failure_rank == 0 and should_flush:
@@ -707,7 +705,7 @@ def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
     cancel()
     assert executor.active_requests == [request]
     assert not request.is_finished
-    assert executor.responses == {}
+    assert executor._response_channel.responses == {}
     aux.free_slot.assert_not_called()
     executor.resource_manager.free_resources.assert_not_called()
 
@@ -728,7 +726,7 @@ def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
     executor._flush_pending_transfer_responses()
 
     assert executor.active_requests == []
-    (response,) = executor.responses[request.py_request_id]
+    (response,) = executor._response_channel.responses[request.py_request_id]
     assert (response.error_msg is not None) is failure_first
     assert request.is_finished_due_to_cancellation is not failure_first
     executor.resource_manager.free_resources.assert_called_once_with(request)
@@ -737,7 +735,7 @@ def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
     cancel()
     executor.disagg.reap_gen_receives(0)
     executor._flush_pending_transfer_responses()
-    assert len(executor.responses[request.py_request_id]) == 1
+    assert len(executor._response_channel.responses[request.py_request_id]) == 1
     executor.resource_manager.free_resources.assert_called_once_with(request)
     aux.free_slot.assert_called_once_with(0)
     watchdog.require_retired()
@@ -774,7 +772,7 @@ def test_worker_cancel_retains_published_kv_and_aux_until_both_settle(
         assert request.py_kv_transfer_start_time == 12.0
         assert session.status is SessionStatus.CANCELLED
         assert isinstance(handle.poll(), Cancelled)
-        assert executor.responses == {}
+        assert executor._response_channel.responses == {}
         executor.sampler.release_request.assert_not_called()
         executor.resource_manager.free_resources.assert_not_called()
         aux.free_slot.assert_not_called()
