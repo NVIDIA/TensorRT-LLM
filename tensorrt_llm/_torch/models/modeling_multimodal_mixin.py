@@ -1817,8 +1817,8 @@ def maybe_prefetch_mm_encoder_for_next_iter(
         max_prefetch_ahead = 0
     if max_prefetch_ahead <= 0:
         return 0
-    # The encoder can hold the GIL while it waits on the device. While host functions of a replayed
-    # graph are pending, these requests are encoded when scheduled instead, after a drain.
+    # The encoder can hold the GIL while it waits on the device. Until the host functions of a
+    # replayed graph have been drained, these requests are encoded when scheduled instead.
     if hostfuncs_pending():
         return 0
 

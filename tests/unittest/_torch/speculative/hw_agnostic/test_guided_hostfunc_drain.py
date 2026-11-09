@@ -221,14 +221,16 @@ def test_drain_waits_for_the_last_replay_outside_capture(monkeypatch, capturing)
 
 @pytest.mark.parametrize(
     "replayed,completed,expected",
-    [(False, False, False), (True, False, True), (True, True, False)],
+    [(False, False, False), (True, False, True), (True, True, True)],
 )
-def test_hostfuncs_pending_until_the_replay_completes(monkeypatch, replayed, completed, expected):
+def test_hostfuncs_pending_until_the_replay_is_drained(monkeypatch, replayed, completed, expected):
+    """Device progress is not consulted, so every rank answers the same way."""
     event = MagicMock(name="replay_event")
     event.query.return_value = completed
     monkeypatch.setattr(hostfunc, "_replay_event", event if replayed else None)
 
     assert hostfunc.hostfuncs_pending() is expected
+    event.query.assert_not_called()
 
 
 _IMAGE = {"image": {"pixel_values": torch.zeros(1)}}

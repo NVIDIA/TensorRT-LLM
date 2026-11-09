@@ -39,8 +39,12 @@ def record_hostfunc_graph_replay() -> None:
 
 
 def hostfuncs_pending() -> bool:
-    """Return True if the last replay's host functions may still be pending."""
-    return _replay_event is not None and not _replay_event.query()
+    """Return True if a graph with host functions has replayed since the last drain.
+
+    Only host-side state is read, not device progress, so ranks that issue the
+    same replays and drains reach the same answer.
+    """
+    return _replay_event is not None
 
 
 def drain_captured_hostfuncs() -> None:
