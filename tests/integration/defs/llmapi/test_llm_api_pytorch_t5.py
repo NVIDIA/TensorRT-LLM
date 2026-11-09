@@ -1233,12 +1233,14 @@ def test_t5_encoder_steps_take_requests_in_arrival_order(
         offered_encoder_batch_sizes: list[int] = []
         encoder_steps: list[list[int]] = []
         all_submitted = threading.Event()
+        # Whether each scheduling iteration saw every request queued in time.
+        submit_waits: list[bool] = []
 
         def recording_schedule_request(*args: object, **kwargs: object) -> SchedulerOutput:
             """Hold the first scheduling iteration, then record what the scheduler offered."""
             # The first iteration waits until every request is queued, so that
             # the next request fetch takes all the others at once.
-            all_submitted.wait(timeout=_SUBMIT_TIMEOUT_S)
+            submit_waits.append(all_submitted.wait(timeout=_SUBMIT_TIMEOUT_S))
             scheduler_output = schedule_request(*args, **kwargs)
             offered_encoder_batch_sizes.append(len(scheduler_output.encoder_requests))
             return scheduler_output
@@ -1262,6 +1264,7 @@ def test_t5_encoder_steps_take_requests_in_arrival_order(
         for i, response in enumerate(responses):
             assert list(response.result().outputs[0].token_ids) == expected_token_ids[i % 2][0]
 
+    assert all(submit_waits), f"the requests were not all queued within {_SUBMIT_TIMEOUT_S} s"
     assert max(offered_encoder_batch_sizes) > 16
     assert [len(step) for step in encoder_steps] == [
         min(num_offered, 2) for num_offered in offered_encoder_batch_sizes if num_offered

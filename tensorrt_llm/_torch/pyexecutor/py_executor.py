@@ -8677,8 +8677,12 @@ class PyExecutor:
         decoder-context requests are already coalesced and must not wait for a
         second window. CUDA-graph microbatch admission returns at most one
         supported graph batch so scheduler overfill cannot turn a target-eight
-        batch into an eager batch of nine or more requests. The token-threshold
-        path also releases the requests once they fill one encoder step
+        batch into an eager batch of nine or more requests. The encoder step
+        limits are applied afterwards (_fit_encoder_requests_to_encoder_step):
+        when the variable-length encoder inputs of a graph batch exceed
+        encoder_max_num_tokens, the batch is cut to fit, and its encoder step
+        may then run without a captured graph. The token-threshold path also
+        releases the requests once they fill one encoder step
         (encoder_max_batch_size requests or encoder_max_num_tokens tokens),
         since waiting cannot make that step larger.
         """
@@ -8852,7 +8856,8 @@ class PyExecutor:
         Encoder batch waiting and the encoder step limits keep a prefix of
         these requests and defer the rest, so the oldest must come first. The
         C++ micro-batch scheduler sorts its output with an unstable sort and
-        does not keep this order.
+        does not keep this order. The schedulers' grouping by LoRA task id is
+        not kept either: the encoder step has no LoRA path.
         """
         if len(encoder_requests) <= 1:
             return encoder_requests

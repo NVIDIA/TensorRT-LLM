@@ -336,12 +336,14 @@ def test_whisper_pytorch_concurrent_requests_encoder_step_limits(
         # Per encoder step: its scheduling iteration and its number of requests.
         encoder_steps: list[tuple[int, int]] = []
         all_submitted = threading.Event()
+        # Whether each scheduling iteration saw every request queued in time.
+        submit_waits: list[bool] = []
 
         def recording_schedule_request(*args: object, **kwargs: object) -> SchedulerOutput:
             """Hold the first scheduling iteration, then record what the scheduler offered."""
             # The first iteration waits until every request is queued, so that
             # the next request fetch takes all the others at once.
-            all_submitted.wait(timeout=_SUBMIT_TIMEOUT_S)
+            submit_waits.append(all_submitted.wait(timeout=_SUBMIT_TIMEOUT_S))
             scheduler_output = schedule_request(*args, **kwargs)
             num_offered = len(scheduler_output.encoder_requests)
             offers.append(
@@ -373,6 +375,7 @@ def test_whisper_pytorch_concurrent_requests_encoder_step_limits(
         for future in futures:
             assert list(future.result().outputs[0].token_ids) == _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS
 
+    assert all(submit_waits), f"the requests were not all queued within {_SUBMIT_TIMEOUT_S} s"
     steps_by_iteration: dict[int, list[int]] = {}
     for iteration, num_requests in encoder_steps:
         steps_by_iteration.setdefault(iteration, []).append(num_requests)
