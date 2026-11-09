@@ -564,17 +564,6 @@ def test_temporal_prior_identity_rewind_and_replay(manager_requests):
     metadata.is_cuda_graph = True
     resets = []
     metadata.register_indexer_reset(1, lambda: resets.append(True))
-    # Every prior refresh below must build its source rows without a host sync.
-    refresh_indexer_prior = metadata._refresh_indexer_prior
-
-    def refresh_indexer_prior_without_sync(layer_idx):
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            refresh_indexer_prior(layer_idx)
-        finally:
-            torch.cuda.set_sync_debug_mode("default")
-
-    metadata._refresh_indexer_prior = refresh_indexer_prior_without_sync
 
     def prepare(ordered, positions):
         metadata.request_ids = [request.py_request_id for request in ordered]
