@@ -27,11 +27,12 @@ from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     ModelLoader,
     _checkpoint_startup_metadata,
-    _construct_checkpoint_loader,
     _open_checkpoint_weight_session,
     _resolve_checkpoint_io_policy,
     _timed_checkpoint_weight_session,
+    construct_checkpoint_loader,
 )
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy, LoadFormat
 from tensorrt_llm.mapping import Mapping
 
@@ -41,7 +42,7 @@ pytestmark = pytest.mark.cpu_only
 def test_checkpoint_startup_metadata_describes_actual_loader() -> None:
     checkpoint_loader = HfCheckpointLoader()
 
-    metadata = _checkpoint_startup_metadata(checkpoint_loader, "auto")
+    metadata = _checkpoint_startup_metadata(checkpoint_loader, LoadFormat.AUTO)
 
     assert metadata == {
         "checkpoint_loader_kind": "HfCheckpointLoader",
@@ -161,7 +162,7 @@ def test_context_only_flag_preserves_custom_checkpoint_loader(
 def test_construct_checkpoint_loader_selects_rank_striped_for_builtin_hf(
     requested: CheckpointIOPolicy,
 ) -> None:
-    loader = _construct_checkpoint_loader(
+    loader = construct_checkpoint_loader(
         None,
         "HF",
         checkpoint_io_policy=requested,
@@ -208,8 +209,9 @@ def test_hf_reader_policy_error_shows_plain_values() -> None:
 @pytest.mark.parametrize(
     ("kwargs", "reason"),
     [
-        ({"checkpoint_format": "MX"}, "checkpoint_format='HF'"),
-        ({"load_format": "dummy"}, "load_format='auto'"),
+        # An enum format shows its plain value 'MX' in the reason, not the enum repr.
+        ({"checkpoint_format": CheckpointFormat.MX}, "checkpoint_format='HF' (received 'MX')"),
+        ({"load_format": LoadFormat.DUMMY}, "load_format='auto' (received 'DUMMY')"),
         ({"partial_model_loading": True}, "partial model loading"),
     ],
 )
@@ -223,7 +225,7 @@ def test_construct_checkpoint_loader_falls_back_before_incompatible_request(
     options = dict(kwargs)
     checkpoint_format = options.pop("checkpoint_format", "HF")
 
-    loader = _construct_checkpoint_loader(
+    loader = construct_checkpoint_loader(
         None,
         checkpoint_format,
         checkpoint_io_policy=CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD,
@@ -248,7 +250,7 @@ def test_construct_checkpoint_loader_preserves_explicit_loader_on_fallback(
     warning = MagicMock()
     monkeypatch.setattr(model_loader_module.logger, "warning", warning)
 
-    loader = _construct_checkpoint_loader(
+    loader = construct_checkpoint_loader(
         provided_loader,
         "HF",
         checkpoint_io_policy=CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD,
@@ -281,7 +283,7 @@ def test_auto_selects_native_for_incompatible_config_without_warning(
     monkeypatch.setattr(model_loader_module.logger, "warning", warning)
     monkeypatch.setattr(model_loader_module.logger, "info", info)
 
-    loader = _construct_checkpoint_loader(
+    loader = construct_checkpoint_loader(
         None,
         "MX",
         checkpoint_io_policy=CheckpointIOPolicy.AUTO,
@@ -297,7 +299,7 @@ def test_auto_selects_native_for_incompatible_config_without_warning(
 def test_static_native_selection_skips_rank_striped_setup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    loader = _construct_checkpoint_loader(
+    loader = construct_checkpoint_loader(
         None,
         "HF",
         checkpoint_io_policy=CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD,
@@ -327,7 +329,7 @@ def test_construct_checkpoint_loader_preserves_custom_hf_weight_loader(
         modeling_utils, "get_checkpoint_weight_loader", lambda _format: _CustomWeightLoader
     )
 
-    loader = _construct_checkpoint_loader(None, "HF")
+    loader = construct_checkpoint_loader(None, "HF")
     assert isinstance(loader.weight_loader, _CustomWeightLoader)
     mapping = Mapping()
     with loader.open_weight_session("/checkpoint", mapping=mapping) as weights:
@@ -336,7 +338,7 @@ def test_construct_checkpoint_loader_preserves_custom_hf_weight_loader(
 
     warning = MagicMock()
     monkeypatch.setattr(model_loader_module.logger, "warning", warning)
-    fallback_loader = _construct_checkpoint_loader(
+    fallback_loader = construct_checkpoint_loader(
         None,
         "HF",
         checkpoint_io_policy=CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD,
@@ -360,7 +362,7 @@ def test_construct_checkpoint_loader_detects_custom_hf_wrapper(
     warning = MagicMock()
     monkeypatch.setattr(model_loader_module.logger, "warning", warning)
 
-    loader = _construct_checkpoint_loader(
+    loader = construct_checkpoint_loader(
         None,
         "HF",
         checkpoint_io_policy=CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD,

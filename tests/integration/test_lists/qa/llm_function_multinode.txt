@@ -15,12 +15,15 @@ accuracy/test_kimi3.py::TestKimiK3::test_w4a16_mxfp4[dspark]
 accuracy/test_kimi3.py::TestKimiK3::test_w4a16_mxfp4[reuse]
 accuracy/test_kimi3.py::TestKimiK3::test_w4a16_mxfp4[sa]
 # ModelingV2 Kimi K3: 16 GB200 GPUs in one NVLink domain (SM100).
-accuracy/modeling_v2/test_kimi_k3_vl.py::TestModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4::test_gsm8k
-accuracy/modeling_v2/test_kimi_k3_vl.py::TestModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1::test_gsm8k
+accuracy/modeling_v2/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_accuracy.py::TestModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4::test_gsm8k
+accuracy/modeling_v2/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_accuracy.py::TestModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1::test_gsm8k
 # ModelingV2 GLM-5.2 on VR200 (SM107), TP4/TP8/TP16.
-accuracy/modeling_v2/test_glm_moe_dsa.py::TestModelingV2Glm52Nvfp4Sm107LowLatency::test_mtp7_gsm8k_and_acceptance
-accuracy/modeling_v2/test_glm_moe_dsa.py::TestModelingV2Glm52Nvfp4Sm107LowLatency::test_tp4_mtp5_gsm8k_and_acceptance
-accuracy/modeling_v2/test_glm_moe_dsa.py::TestModelingV2Glm52Nvfp4Sm107LowLatency::test_tp8_mtp3_gsm8k_and_acceptance
-accuracy/modeling_v2/test_glm_moe_dsa.py::TestModelingV2Glm52Nvfp4Sm107LowLatency::test_tp8_mtp7_gsm8k_and_acceptance
+accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/test_accuracy.py::TestModelingV2Glm52Nvfp4Sm107LowLatency::test_mtp7_gsm8k_and_acceptance
+accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/test_accuracy.py::TestModelingV2Glm52Nvfp4Sm107LowLatency::test_tp4_mtp5_gsm8k_and_acceptance
+accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/test_accuracy.py::TestModelingV2Glm52Nvfp4Sm107LowLatency::test_tp8_mtp3_gsm8k_and_acceptance
+accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/test_accuracy.py::TestModelingV2Glm52Nvfp4Sm107LowLatency::test_tp8_mtp7_gsm8k_and_acceptance
+# ModelingV2 MiniMax-M3: 8 Rubin GPUs (SM107) over two trays, TP8.
+accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/test_accuracy.py::TestModelingV2MiniMaxM3Nvfp4Sm107Tp8::test_gsm8k TIMEOUT (60)
+accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/test_accuracy.py::TestModelingV2MiniMaxM3Nvfp4Sm107Tp8::test_eagle3_gsm8k_and_acceptance TIMEOUT (60)
 accuracy/test_llm_api_pytorch_multimodal.py::TestKimiK3::test_w4a16_mxfp4
 accuracy/test_disaggregated_multinode.py::TestDeepSeekV4ProDSparkMultinode::test_gsm8k_1p1d_dep4

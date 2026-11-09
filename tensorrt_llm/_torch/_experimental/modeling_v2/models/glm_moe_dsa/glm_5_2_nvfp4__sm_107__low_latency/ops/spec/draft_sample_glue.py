@@ -8,9 +8,9 @@ from typing import Dict, List, Optional, Sequence
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
+from ... import native_ops
 from ._draft_step_state import (
     assert_state_args_valid,
     eh_proj_input_window,
@@ -164,7 +164,7 @@ class GlmDraftSampleGlue(OpWrapper):
         num_accepted: Optional[torch.Tensor],
         next_new_tokens: Optional[torch.Tensor],
     ) -> None:
-        torch.ops.trtllm.glm_draft_sample_glue(
+        native_ops.glm_draft_sample_glue(
             logits,
             exchange_buffer,
             exchange_flags,

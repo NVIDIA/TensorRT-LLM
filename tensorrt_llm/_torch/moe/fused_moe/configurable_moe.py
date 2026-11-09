@@ -422,7 +422,6 @@ class ConfigurableMoE(MoE):
         # enforce ``moe.comm is None`` without ``getattr`` guards.
         self.backend = backend
         self._reject_non_divisible_ep_backend()
-        self.use_flashinfer = getattr(self.backend, "use_flashinfer", False)
 
         # DWDP eligibility needs the backend; a layer DWDP manages stores only
         # this rank's experts, so it is sized here, before the sync below
@@ -788,7 +787,6 @@ class ConfigurableMoE(MoE):
             # Currently the TRTLLMGEN reduce sum internally.
             # Keep updated with more supported backends.
             alltoall_result_do_sum=True,
-            use_flashinfer=self.use_flashinfer,
             hidden_size=self.hidden_size,
             communication_method=self.communication_method,
             allow_alltoall=self.backend.supports_alltoall,
