@@ -3800,19 +3800,66 @@ def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch(has_local_requ
 
 
 @pytest.mark.parametrize(
-    ("context_dummy", "beam_width"), [(False, 4), (True, 1)], ids=["generation", "context"]
+    ("max_beam_width", "context_only_cache", "is_gen"),
+    [
+        pytest.param(1, False, True, id="generation"),
+        pytest.param(1, True, False, id="context_only_cache"),
+        pytest.param(4, False, False, id="beam_search"),
+    ],
 )
-def test_pad_empty_batch_dummy_beam_width_follows_role(
-    context_dummy: bool, beam_width: int
+def test_pad_empty_batch_dummy_is_one_block_wide(
+    max_beam_width: int, context_only_cache: bool, is_gen: bool
 ) -> None:
-    stub, scheduled_batch = _unfittable_rank(max_beam_width=4)
-    stub.kv_cache_manager.kda_context_only = context_dummy
+    # The rescue dummy always fits in one block: a generation dummy at width
+    # one, or a one-token context dummy where a generation row cannot run or
+    # would need a block per beam.
+    stub, scheduled_batch = _unfittable_rank(max_beam_width=max_beam_width)
+    stub.kv_cache_manager.kda_context_only = context_only_cache
 
     _run_pad_empty(stub, scheduled_batch)
 
     assert len(stub.add_dummy_calls) == 1
-    assert stub.add_dummy_calls[0]["is_gen"] is not context_dummy
-    assert stub.add_dummy_calls[0].get("max_beam_width", 1) == beam_width
+    assert stub.add_dummy_calls[0]["is_gen"] is is_gen
+    assert stub.add_dummy_calls[0].get("max_beam_width", 1) == 1
+    assert scheduled_batch.batch_size == 1
+    if is_gen:
+        assert len(scheduled_batch.generation_requests) == 1
+    else:
+        assert stub.add_dummy_calls[0]["token_nums"] == [1]
+        assert len(scheduled_batch.context_requests) == 1
+
+
+@pytest.mark.parametrize("free_blocks", [1, 2, 3])
+def test_pad_empty_batch_lands_under_beam_search_with_fewer_free_blocks_than_beams(
+    free_blocks: int,
+) -> None:
+    # A starved beam-search rank holds fewer free blocks than beams. A width-W
+    # generation dummy would be refused on every iteration, and `_can_queue`
+    # would veto the forward fleet-wide until something frees KV cache; the
+    # one-block context dummy has to land instead.
+    stub, scheduled_batch = _unfittable_rank(max_beam_width=4)
+    tokens_per_block = stub.kv_cache_manager.tokens_per_block
+    stub.kv_cache_manager.get_num_available_tokens.side_effect = (
+        lambda token_num_upper_bound, max_num_draft_tokens=0, **_: min(
+            token_num_upper_bound, free_blocks * tokens_per_block - max_num_draft_tokens
+        )
+    )
+    allocate = stub.kv_cache_manager.add_dummy_requests.side_effect
+
+    def _refuse_beams_that_do_not_fit(**kwargs):
+        if kwargs.get("max_beam_width", 1) > free_blocks:
+            return None
+        return allocate(**kwargs)
+
+    stub.kv_cache_manager.add_dummy_requests.side_effect = _refuse_beams_that_do_not_fit
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert scheduled_batch.batch_size == 1
+    assert len(scheduled_batch.context_requests) == 1
+    assert stub.add_dummy_calls[0]["is_gen"] is False
+    assert stub.add_dummy_calls[0]["max_beam_width"] == 1
+    assert stub.add_dummy_calls[0]["token_nums"] == [1]
 
 
 def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():

@@ -9215,10 +9215,11 @@ class PyExecutor:
         succeeded. ``draft_reserve`` overrides the draft tokens reserved for
         the dummy; by default they follow the dummy role.
 
-        The estimate covers one sequence. A generation dummy with
-        ``max_beam_width > 1`` can need a block per beam; if those do not
-        fit, ``add_dummy_requests`` returns None and the callers schedule an
-        empty batch instead.
+        The estimate covers one sequence. The pre-schedule generation dummy
+        with ``max_beam_width > 1`` can need a block per beam; if those do
+        not fit, ``add_dummy_requests`` returns None and the caller schedules
+        an empty batch, which the fleet retries. The empty-batch rescue never
+        requests a beam dummy, so there one block is all the dummy needs.
         """
         token_num = (token_nums[0] if token_nums is not None else 1 +
                      self.max_total_draft_tokens)
@@ -9434,8 +9435,10 @@ class PyExecutor:
         except OutOfPagesError:
             dummy_requests = None
         if not dummy_requests:
-            logger.warning("Cannot allocate ADP pad dummy; rank schedules "
-                           "an empty batch and the fleet will retry.")
+            logger.warning_once(
+                "Cannot allocate ADP pad dummy; rank schedules an empty "
+                "batch and the fleet will retry.",
+                key="adp_pad_dummy_alloc_failed")
             return
 
         dummy_request = dummy_requests[0]
@@ -9472,7 +9475,10 @@ class PyExecutor:
         context dummy the pre-schedule path would pick, since this rank is empty
         precisely because it is short of KV cache. A context-only cache cannot
         run a generation row, so there the dummy is a one-token context
-        request. Not reached under pipeline parallelism, which does not call
+        request. Under beam search a generation dummy needs a block per beam,
+        so there too the dummy is a one-token, width-one context request: the
+        rescue has to stay at one block on a rank that is short of KV cache.
+        Not reached under pipeline parallelism, which does not call
         `_prepare_and_schedule_batch`.
         """
         if not self.enable_attention_dp:
@@ -9508,8 +9514,16 @@ class PyExecutor:
             return
         # A context-only cache manager keeps no KDA replay or draft-verification
         # buffers, or no FP4 MLA V scales, so it cannot run a generation row;
-        # pad with a one-token context dummy instead.
-        context_dummy = is_context_only_kv_cache(self.kv_cache_manager)
+        # pad with a one-token context dummy instead. Under beam search a
+        # generation dummy needs a block per beam (V1 counts them, V2 copies
+        # the tail page to every beam) while this rank is short of KV cache:
+        # with one to W-1 free blocks that dummy would be refused on every
+        # iteration and the fleet would never resume. The one-token context
+        # dummy keeps the rescue at one block, and a batch whose only row is a
+        # context request runs at beam width one, so it cannot reach the
+        # attention row-count mismatch a narrow generation dummy causes.
+        context_dummy = (is_context_only_kv_cache(self.kv_cache_manager)
+                         or self.max_beam_width > 1)
         token_nums = [1] if context_dummy else None
         if not self._has_adp_dummy_kv_capacity(
                 token_nums, draft_reserve=0 if context_dummy else None):
@@ -9531,7 +9545,9 @@ class PyExecutor:
                 is_gen=not context_dummy,
                 max_num_draft_tokens=(0 if context_dummy else
                                       self.max_total_draft_tokens),
-                max_beam_width=1 if context_dummy else self.max_beam_width,
+                # Every dummy on this path is one block wide: a generation
+                # dummy is only used when the engine beam width is one.
+                max_beam_width=1,
             )
         except (OutOfPagesError, NoFreeSlotsError):
             dummy_requests = None
