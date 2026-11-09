@@ -25,7 +25,6 @@ from transformers import Gemma3TextConfig
 from tensorrt_llm._torch.attention.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
@@ -35,6 +34,7 @@ from ..attention.backends import (AttentionMetadata,
 from ..attention.backends.interface import (AttentionMask, CustomAttentionMask,
                                             PositionalEmbeddingParams,
                                             PredefinedAttentionMask, RopeParams)
+from ..attention.backends.trtllm import trtllm_supports_swa_scratch_reuse
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
@@ -383,9 +383,10 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
 
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
-        """Default to prefill scratch reuse on SM90+ when block reuse is disabled."""
+        """Default to prefill scratch reuse where TRTLLM attention supports it
+        and block reuse is disabled."""
         enable_scratch = (getattr(llm_args, "attn_backend", "TRTLLM").upper()
-                          == "TRTLLM" and get_sm_version() >= 90)
+                          == "TRTLLM" and trtllm_supports_swa_scratch_reuse())
         kv_cache_config = llm_args.kv_cache_config
         if enable_scratch and kv_cache_config.enable_block_reuse:
             enable_scratch = False

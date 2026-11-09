@@ -1411,6 +1411,9 @@ class TestModelDefaults:
             ("gemma3", 89, "trtllm", False, "trtllm", False),
             ("gemma3", 90, None, False, "TRTLLM", True),
             ("gemma3", 100, None, False, "TRTLLM", True),
+            ("gemma3", 103, None, False, "TRTLLM", True),
+            ("gemma3", 120, None, False, "TRTLLM", False),
+            ("gemma3", 121, None, False, "TRTLLM", False),
             ("gemma3", 100, "trtllm", False, "trtllm", True),
             ("gemma3", 100, "FLASHINFER", False, "FLASHINFER", False),
             ("gemma3", 100, "VANILLA", False, "VANILLA", False),
@@ -1418,6 +1421,9 @@ class TestModelDefaults:
             ("gemma4", 90, None, False, "FLASHINFER", False),
             ("gemma4", 100, "FLASHINFER", False, "FLASHINFER", False),
             ("gemma4", 90, "TRTLLM", False, "TRTLLM", True),
+            ("gemma4", 86, "TRTLLM", False, "TRTLLM", False),
+            ("gemma4", 120, None, False, "FLASHINFER", False),
+            ("gemma4", 120, "TRTLLM", False, "TRTLLM", False),
             ("gemma4", 100, "trtllm", False, "trtllm", True),
             ("gemma4", 100, None, True, "FLASHINFER", False),
             ("gemma4", 100, "TRTLLM", True, "TRTLLM", False),
@@ -1449,7 +1455,7 @@ class TestModelDefaults:
             "gemma4_unified": Gemma4UnifiedForConditionalGeneration,
         }[model]
         monkeypatch.setattr(
-            "tensorrt_llm._torch.models.modeling_gemma3.get_sm_version",
+            "tensorrt_llm._torch.attention.backends.trtllm.get_sm_version",
             lambda: sm)
         monkeypatch.setattr(
             "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f",
@@ -1490,7 +1496,7 @@ class TestModelDefaults:
         from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4ForCausalLM
 
         monkeypatch.setattr(
-            "tensorrt_llm._torch.models.modeling_gemma3.get_sm_version",
+            "tensorrt_llm._torch.attention.backends.trtllm.get_sm_version",
             lambda: 100)
         monkeypatch.setattr(
             "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f",

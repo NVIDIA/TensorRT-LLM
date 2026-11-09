@@ -47,7 +47,7 @@ _FALLBACK_SM_VERSION_TARGET = "tensorrt_llm._torch.attention.backends.fmha.fallb
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("sm_version", [80, 86, 89, 90, 100])
+@pytest.mark.parametrize("sm_version", [80, 86, 89, 90, 100, 103, 120, 121])
 @pytest.mark.parametrize("scratch", [False, True])
 def test_swa_scratch_architecture_gate(sm_version, scratch):
     manager = object.__new__(KVCacheManagerV2)
@@ -59,8 +59,9 @@ def test_swa_scratch_architecture_gate(sm_version, scratch):
         ),
         mock.patch.object(TrtllmAttentionMetadata, "_post_init_with_buffers") as allocate,
     ):
-        if scratch and sm_version < 90:
-            with pytest.raises(ValueError, match="requires SM90 or newer for SWA scratch reuse"):
+        # SM120/121 run the fmha_v2 kernels that dereference stale per-layer pages.
+        if scratch and sm_version not in (90, 100, 103):
+            with pytest.raises(ValueError, match="only on SM90 and SM100-family"):
                 TrtllmAttentionMetadata(
                     max_num_requests=1, max_num_tokens=32, kv_cache_manager=manager
                 )

@@ -91,6 +91,19 @@ def _has_fp8_context_mla_fmha(sm_version: int) -> bool:
     return sm_version == 90 or is_sm_100f(sm_version) or is_sm_120f(sm_version)
 
 
+def trtllm_supports_swa_scratch_reuse(sm_version: Optional[int] = None) -> bool:
+    """Whether TRTLLM attention can run with SWA scratch reuse on this GPU.
+
+    Scratch reuse needs per-layer page tables, which keep BAD_PAGE_INDEX for
+    blocks that left the window. The SM90 and SM100-family context kernels
+    load paged KV through TMA, which does not fault on those entries. The
+    fmha_v2 flash kernels used on other GPUs start the KV loop at a tile
+    boundary before the window and dereference every page in that tile.
+    """
+    sm = get_sm_version() if sm_version is None else sm_version
+    return sm == 90 or is_sm_100f(sm)
+
+
 def _resolve_skip_correction_threshold(threshold: float,
                                        sm_version: int,
                                        *,
@@ -502,13 +515,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return self.kv_cache_manager.kv_cache_pool_mapping if self.kv_cache_manager is not None else None
 
     def __post_init__(self) -> None:
-        # Pre-Hopper FMHA can load invalid pages before applying the window mask.
         if (isinstance(self.kv_cache_manager, KVCacheManagerV2)
                 and self.kv_cache_manager.enable_swa_scratch_reuse
-                and get_sm_version() < 90):
+                and not trtllm_supports_swa_scratch_reuse()):
             raise ValueError(
-                "TRTLLM attention requires SM90 or newer for SWA scratch reuse. "
-                "Set kv_cache_config.enable_swa_scratch_reuse=False.")
+                "TRTLLM attention supports SWA scratch reuse only on SM90 and "
+                "SM100-family GPUs. Set "
+                "kv_cache_config.enable_swa_scratch_reuse=False.")
         super().__post_init__()
         self.enable_helix = self.mapping.has_cp_helix(
         ) if self.mapping is not None else False

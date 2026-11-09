@@ -49,6 +49,7 @@ from ..attention.backends.interface import (
     PredefinedAttentionMask,
     RopeParams,
 )
+from ..attention.backends.trtllm import trtllm_supports_swa_scratch_reuse
 from ..distributed import AllReduce
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..kernels.fused_ops.gelu_tanh_mul_fp4_quant import gelu_tanh_mul_fp4_quant
@@ -1454,7 +1455,11 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         effective_backend = default_backend
         if "attn_backend" in getattr(llm_args, "model_fields_set", set()):
             effective_backend = llm_args.attn_backend
-        enable_scratch = effective_backend.upper() == "TRTLLM" and not uses_external_shared_kv
+        enable_scratch = (
+            effective_backend.upper() == "TRTLLM"
+            and not uses_external_shared_kv
+            and trtllm_supports_swa_scratch_reuse()
+        )
         kv_cache_config = llm_args.kv_cache_config
         if enable_scratch and kv_cache_config.enable_block_reuse:
             enable_scratch = False
