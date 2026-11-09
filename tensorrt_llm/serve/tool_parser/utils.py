@@ -89,9 +89,21 @@ def _resolve_local_ref(ref: Any, root: Any) -> Any:
     node = root
     for token in pointer.split("/")[1:]:
         token = token.replace("~1", "/").replace("~0", "~")
-        if not isinstance(node, dict) or token not in node:
+        if isinstance(node, dict):
+            if token not in node:
+                return None
+            node = node[token]
+        elif isinstance(node, list):
+            # An array index is "0" or digits without a leading zero (RFC 6901,
+            # section 4); "-" and out-of-range indices name nothing.
+            if not (token == "0" or (token.isdigit() and token[0] != "0")):
+                return None
+            index = int(token)
+            if index >= len(node):
+                return None
+            node = node[index]
+        else:
             return None
-        node = node[token]
     return node
 
 

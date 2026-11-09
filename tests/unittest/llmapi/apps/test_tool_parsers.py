@@ -7804,6 +7804,13 @@ _GLM_DEFINITIONS = {
         "My/Opts": {
             "type": "object"
         },
+        "Choices": {
+            "anyOf": [{
+                "type": "object"
+            }, {
+                "type": "string"
+            }]
+        },
     },
     "definitions": {
         "Opts": {
@@ -7868,6 +7875,18 @@ _GLM_SCHEMAS.update({
     },
     "$ref invalid encoding": {
         "$ref": "#/$defs/%FF"
+    },
+    "$ref array index": {
+        "$ref": "#/$defs/Choices/anyOf/0"
+    },
+    "$ref array index, leading zero": {
+        "$ref": "#/$defs/Choices/anyOf/00"
+    },
+    "$ref array index, out of range": {
+        "$ref": "#/$defs/Choices/anyOf/2"
+    },
+    "$ref array index, past the end": {
+        "$ref": "#/$defs/Choices/anyOf/-"
     },
 })
 
@@ -7934,6 +7953,10 @@ _GLM_TYPED_VALUES += [
     ('{"verbose": true}', "$ref percent-encoded name", dict(verbose=True)),
     ('{"verbose": true}', "$ref percent-encoded escape", dict(verbose=True)),
     ('{"a": 1}', "$ref invalid encoding", '{"a": 1}'),
+    ('{"a": 1}', "$ref array index", dict(a=1)),
+    ('{"a": 1}', "$ref array index, leading zero", '{"a": 1}'),
+    ('{"a": 1}', "$ref array index, out of range", '{"a": 1}'),
+    ('{"a": 1}', "$ref array index, past the end", '{"a": 1}'),
 ]
 
 _GLM_VALUES = sorted({row[0] for row in _GLM_TYPED_VALUES})
