@@ -12,9 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""FlashAttention-4 kernels of the n-sample shared-prefix path (SM90).
+"""FlashAttention-4 shared-prefix attention for generation (SM90).
 
-One layer of a step runs four launches:
+Rows of a generation step that attend the same leading KV pages form a group. One layer of a step
+runs four launches:
 
 * ``_gather_q_kernel`` copies the queries into grouped order (the rows of a group contiguous);
 * ``Fa4Prefix`` attends every group's shared pages once for all of its queries (non-causal);
@@ -22,17 +23,106 @@ One layer of a step runs four launches:
 * ``_merge_fa4_tail_kernel`` joins the two normalized states by their log-sum-exp and writes
   the output in batch order.
 
+The groups are described by ``PrefixGroups``; how rows are grouped is up to the caller (the
+n-sample library groups rows whose block tables start with the same pages). A caller with a
+different tail passes any object with ``Fa4Tail``'s ``q_len``, ``run``, ``out`` and ``lse``.
+
 Every table is a fixed-address device tensor refreshed before the step, so the sequence can be
 captured in a CUDA graph.
 """
 
+from dataclasses import dataclass
 from typing import Optional
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
 
 _NEG = tl.constexpr(-1.0e30)
+
+
+@dataclass
+class PrefixGroups:
+    """The groups of a step as the prefix call reads them, in grouped (``perm``) order.
+
+    Group ``g`` holds the query tokens ``[qo_indptr[g], qo_indptr[g + 1])`` and attends the pages
+    ``prefix_indices[prefix_indptr[g]:prefix_indptr[g + 1]]``; its last page holds
+    ``prefix_last_page_len[g]`` tokens, so a group may share a partly filled last page.
+    """
+
+    num_groups: int
+    """Groups handed to the prefix call, placeholder and padding groups included."""
+    qo_indptr: np.ndarray
+    """[num_groups + 1] int32: query-token range of each group."""
+    prefix_indptr: np.ndarray
+    """[num_groups + 1] int32: page range of each group in ``prefix_indices``."""
+    prefix_indices: np.ndarray
+    """int32: the groups' shared pages."""
+    prefix_last_page_len: np.ndarray
+    """[num_groups] int32: tokens in each group's last prefix page."""
+
+
+def prefix_request_tables(
+    groups: PrefixGroups,
+    tokens_per_block: int,
+    chunk_tokens: int,
+    num_requests: int,
+    max_pages: int,
+    splits: int = 1,
+) -> tuple:
+    """Request tables of the prefix call (``Fa4Prefix``).
+
+    Every group with query rows becomes one request per ``chunk_tokens`` query tokens, each
+    over the group's shared pages; the rest of the ``num_requests`` entries are empty. With
+    ``splits`` > 1 the queries are replicated ``splits`` times (copy ``s`` at query offset
+    ``s * tokens``) and copy ``s`` of a request attends only the ``s``-th of ``splits``
+    near-equal runs of the group's pages (possibly empty).
+    Returns ``(block_tables, seq_lens, cum_q, cum_kv)`` as int32 arrays.
+    """
+    from .flash_attn4_generation import MIN_SPLIT_TOKENS
+
+    qo = groups.qo_indptr
+    pages_ptr = groups.prefix_indptr
+    pages = groups.prefix_indices
+    last = groups.prefix_last_page_len
+    block_tables = np.zeros((num_requests, max_pages), dtype=np.int32)
+    seq_lens = np.zeros((num_requests,), dtype=np.int32)
+    cum_q = np.zeros((num_requests + 1,), dtype=np.int32)
+    cum_kv = np.zeros((num_requests + 1,), dtype=np.int32)
+    request = 0
+    tokens = int(qo[groups.num_groups])
+    for split in range(splits):
+        for group in range(groups.num_groups):
+            q0, q1 = int(qo[group]), int(qo[group + 1])
+            if q1 == q0:
+                continue
+            first, stop = int(pages_ptr[group]), int(pages_ptr[group + 1])
+            count = stop - first
+            kv_len = (count - 1) * tokens_per_block + int(last[group]) if count else 0
+            if splits > 1:
+                # Runs of at least MIN_SPLIT_TOKENS: a short prompt uses fewer (non-empty) runs.
+                per = max(-(-count // splits), -(-MIN_SPLIT_TOKENS // tokens_per_block))
+                lo = min(split * per, count)
+                hi = min(lo + per, count)
+                first, stop = first + lo, first + hi
+                # Only the group's last page may be partly filled.
+                kv_len = max(min(kv_len - lo * tokens_per_block, (hi - lo) * tokens_per_block), 0)
+                count = hi - lo
+            for start in range(q0, q1, chunk_tokens):
+                if request >= num_requests:
+                    raise RuntimeError(
+                        f"shared-prefix attention: the step needs more prefix requests than the "
+                        f"{num_requests} its buffers hold."
+                    )
+                block_tables[request, :count] = pages[first:stop]
+                seq_lens[request] = kv_len
+                cum_q[request + 1] = split * tokens + min(start + chunk_tokens, q1)
+                cum_kv[request + 1] = cum_kv[request] + kv_len
+                request += 1
+    cum_q[request + 1 :] = cum_q[request]
+    cum_kv[request + 1 :] = cum_kv[request]
+    return block_tables, seq_lens, cum_q, cum_kv
 
 
 @triton.jit
@@ -122,7 +212,7 @@ class Fa4Prefix:
         return num_groups + tokens // chunk + 1
 
     def table_arrays(self):
-        """Device tables, in the order ``_prefix_tables`` returns their host copies."""
+        """Device tables, in the order ``prefix_request_tables`` returns their host copies."""
         return self.block_tables, self.seq_lens, self.cum_q, self.cum_kv
 
     def run(self, pool: torch.Tensor, sm_scale: float) -> None:
@@ -397,7 +487,7 @@ def fa4_prefix_splits(
 
 
 def fa4_supported(head_dim: int, dtype: torch.dtype, device=None) -> bool:
-    """Whether FlashAttention-4 can serve the n-sample path (SM90, bf16, d64/d128)."""
+    """Whether FlashAttention-4 can serve shared-prefix attention (SM90, bf16, d64/d128)."""
     if dtype != torch.bfloat16 or head_dim not in (64, 128):
         return False
     if not torch.cuda.is_available() or torch.cuda.get_device_capability(device) != (9, 0):
@@ -407,7 +497,7 @@ def fa4_supported(head_dim: int, dtype: torch.dtype, device=None) -> bool:
     return _fa4_forward() is not None
 
 
-def fa4_sampling_attention(
+def fa4_shared_prefix_attention(
     pool: torch.Tensor,
     q: torch.Tensor,
     k: Optional[torch.Tensor],
