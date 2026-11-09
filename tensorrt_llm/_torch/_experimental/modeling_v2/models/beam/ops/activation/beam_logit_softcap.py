@@ -7,6 +7,7 @@ from __future__ import annotations
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch.modules.logits_processor import scale_and_soft_cap_logits
 
 #: The head's output: every token's 151936 vocabulary logits, bf16, cap 30.
 _HEAD = dict(vocab=151936, cap=30.0, dtype=torch.bfloat16)
@@ -42,7 +43,8 @@ class BeamLogitSoftcap(OpWrapper):
     """
 
     def __call__(self, logits: torch.Tensor, cap: float) -> torch.Tensor:
-        return (logits.float() / cap).tanh() * cap
+        owned = logits.to(dtype=torch.float32, copy=True)
+        return scale_and_soft_cap_logits(owned, multiplier=1.0, soft_cap=cap)
 
     def reference(self, logits: torch.Tensor, cap: float) -> torch.Tensor:
         """The same three fp32 steps, written out one by one."""
