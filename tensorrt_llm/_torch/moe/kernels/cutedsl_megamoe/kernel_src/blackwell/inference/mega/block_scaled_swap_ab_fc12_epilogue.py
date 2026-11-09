@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Autonomous epilogue for the fused FC1+FC2 swap-AB MegaMoE kernel.
 
-Per-thread RMEM tensors flow between the transpose / SwiGLU / quantize / fc2
+Per-thread RMEM tensors flow between the transpose / activation / quantize / fc2
 store steps as bare ``cute.Tensor`` fragments; their thread distribution is a
 fixed physical property of the surrounding atom sequence and is documented in
 local comments. FC2 store mappings are finite ``FunctionMapping`` objects
@@ -25,12 +25,13 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
 
+from .....activation_def import ExpertActivation
 from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDevice
 from .....communication.token_protocol import TokenSrcMetadata
 from .....quant_def import CombineFormat, QuantKind
 from .....api import ImplDesc, KernelComponent, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from .....helpers.constants import Nvfp4E2M1RcpLimit, Fp8E4M3RcpLimit, Fp8E5M2RcpLimit, Fp32Max
-from .....helpers.cute_py_helpers import tcgen05_block_scaled_acc_dtype
+from .....helpers.cute_py_helpers import tcgen05_block_scaled_acc_dtype, tcgen05_dense_acc_dtype
 from .....helpers.dsl_helpers import mark_alignment
 from .....helpers.flag_batch import make_flag_batch_tracker
 from .....helpers.ptx_helpers import (
@@ -522,7 +523,8 @@ class _TmemTranspose16x32Core:
     """Physical implementation of the 16x32 -> 32x16 TMEM in-place transpose.
 
     The transpose is a fixed sequence of tcgen05 32-bit element atoms; each
-    32-bit slot is an fp32 SwiGLU-fold value for FC1. The (thread, reg) ->
+    32-bit slot is an fp32 FC1 value (a gated-activation fold, or a raw
+    accumulator row for a non-gated kind). The (thread, reg) ->
     (tmem_dp, tmem_col) input / output mapping is documented on the
     ``TmemTranspose16x32`` subclass, which is the public entry point.
 
@@ -743,8 +745,9 @@ class TmemTranspose16x32(_TmemTranspose16x32Core):
     """FC1 16x32 -> 32x16 TMEM in-place transpose.
 
     The per-thread RMEM ``(lane_idx, elem_idx) -> (tmem_dp, tmem_col)`` mapping
-    is fixed by the underlying atom sequence. Each slot is an fp32 SwiGLU-fold
-    value and ``tmem_col`` is the intermediate-output index.
+    is fixed by the underlying atom sequence. Each slot is an fp32 FC1 value
+    (see ``_TmemTranspose16x32Core``) and ``tmem_col`` is the intermediate-output
+    index within the 16 the transpose covers.
 
     Input distribution -- what each (lane_idx, elem_idx) reg holds on entry
     (i.e. straight after the 16-dp x 32-col source LDTM, or as fed in via
@@ -769,6 +772,11 @@ class TmemTranspose16x32(_TmemTranspose16x32Core):
 class TmemTranspose32x32Inplace:
     """fc1 epi 32x32 in-place TMEM transpose: two ``TmemTranspose16x32``
     sub-instances (``top`` = lanes 0..15, ``bot`` = lanes 16..31).
+
+    Afterwards lane ``l`` holds, for the token in column ``l`` of the 32 the
+    transpose covers, ``top.output[e]`` = row ``e`` and ``bot.output[e]`` = row
+    ``16 + e`` of the warp's 32 accumulator rows. It reads and rewrites only
+    lanes 0..31 x columns [tmem_ptr, tmem_ptr + 32).
 
     Optional ``reg_tensor_top`` / ``reg_tensor_bot`` enable skip-R1.Load mode
     for both halves; they must be provided or omitted together.
@@ -923,7 +931,12 @@ class GatedActEpilogueArgs:
 
 
 class SwapABGatedActEpilogue(KernelComponent):
-    """Autonomous epilogue for the swap-AB SwiGLU NVFP4 kernel.
+    """Autonomous epilogue for the swap-AB MegaMoE kernel: gated (SwiGLU / SiTU) or ReLU2 experts.
+
+    FC1 re-quantizes its output to the block-scaled kind FC2 consumes, or, for the unquantized
+    bf16 kind, converts it to bf16 with no scale factors. A gated kind folds each warp's 32
+    accumulator rows ([gate 16, up 16]) into 16 outputs; the non-gated relu2 (bf16 only) keeps
+    all 32, so one 128-row FC1 tile emits ``fc1_output_tile_size`` = 64 or 128 features.
 
     ``run()`` is the single entry point the kernel calls inside the epi
     warp body.  The kernel's responsibility is reduced to:
@@ -942,12 +955,11 @@ class SwapABGatedActEpilogue(KernelComponent):
     _EpilogueFc1GateUpInterleave = 16
     _EpilogueTokenTileSize = 64  # Fundamentally the epi_tile_n
     _EpilogueFc1IntermediateGateUpTileSize = 128  # Fundamentally epi_tile_m
-    _EpilogueFc1IntermediateDownTileSize = 64  # Fundamentally epi_tile_m // 2
+    # The FC1 output tile (epi_tile_m, or half of it for a gated kind) and its per-warp share are
+    # instance attributes, fc1_output_tile_size / fc1_output_features_per_warp: they depend on the
+    # activation, so there is deliberately no class-level default to fall back on.
     _EpilogueFc2HiddenTileSize = 128  # Fundamentally epi_tile_m
     _EpilogueWarpCnt = 4
-    # One warp owns this many intermediate_down outputs per token: the TMEM transpose gives each
-    # warp 32 accumulator rows, which the gate/up interleave halves.
-    _EpilogueFc1IntermediateDownPerWarp = 16
     smem_scratch_overlay: ClassVar[str] = "blackwell.swap_ab_gated_act_epilogue.scratch"
     # (subtile, warp, 32) fp32 de-interleave buffer for the per-token FC1 activation scale (see
     # SwapABFc1Epilogue.run_subtile): 512 B per subtile, 2 KB at cta_tile_n=256. Registered only
@@ -971,9 +983,11 @@ class SwapABGatedActEpilogue(KernelComponent):
             "swiglu_alpha": OptionalRequirement(Optional[float]),
             "swiglu_beta": OptionalRequirement(Optional[float]),
             # SiTU (Kimi K3) selects a different gated-activation core; optional so
-            # existing SwiGLU descriptors stay valid unchanged. See _resolve_situ_betas.
+            # existing SwiGLU descriptors stay valid unchanged. See _resolve_activation.
             "situ_beta": OptionalRequirement(Optional[float]),
             "situ_linear_beta": OptionalRequirement(Optional[float]),
+            # An ExpertActivation value; absent or None infers SiTU / SwiGLU as before.
+            "expert_activation": OptionalRequirement(Optional[str]),
             # "swiglu" (default) or "quick_geglu": up * gate * sigmoid(1.702 * gate). Same core as
             # SwiGLU with the sigmoid argument scaled, so it costs nothing extra; exclusive with SiTU.
             "gate_activation": OptionalRequirement(str),
@@ -1002,27 +1016,42 @@ class SwapABGatedActEpilogue(KernelComponent):
         }
 
     @staticmethod
-    def _resolve_situ_betas(problem_desc: ProblemDesc) -> Tuple[Optional[float], Optional[float]]:
-        """Resolve the SiTU (Kimi K3) betas from the ProblemDesc; ``(None, None)`` means SwiGLU.
+    def _resolve_activation(problem_desc: ProblemDesc) -> Tuple[ExpertActivation, Optional[float], Optional[float]]:
+        """Resolve the activation kind and its SiTU (Kimi K3) betas from the ProblemDesc.
+
+        The betas are set exactly when the kind is SiTU, so the kind and its constants cannot
+        disagree; ``(kind, None, None)`` is SwiGLU or ReLU2. ReLU2 takes no constants at all.
 
         Both betas must be given together, and SiTU excludes ``gate_up_clamp`` -- matching DeepGEMM's
         ``DG_HOST_ASSERT(not use_situ or not activation_clamp_opt.has_value())``. They are baked in at
         codegen time exactly like ``gate_up_clamp``, so the enclosing KernelClass must also fold them
         into its ``name()`` cache key.
         """
+        kind = ExpertActivation.from_problem_desc(problem_desc)
         beta = problem_desc.get("situ_beta")
         linear_beta = problem_desc.get("situ_linear_beta")
         if (beta is None) != (linear_beta is None):
             raise ValueError(f"situ_beta and situ_linear_beta must be set together, got {beta} and {linear_beta}.")
+        if (beta is not None) != (kind is ExpertActivation.situ):
+            raise ValueError(
+                f"The SiTU betas must be set exactly for the situ activation, got {kind} with "
+                f"situ_beta={beta} and situ_linear_beta={linear_beta}."
+            )
+        if not kind.is_gated:
+            constants = {name: problem_desc.get(name) for name in ("gate_up_clamp", "swiglu_alpha", "swiglu_beta")}
+            given = {name: value for name, value in constants.items() if value is not None}
+            if given:
+                raise ValueError(f"The {kind} activation takes no constants, got {given}.")
+            return kind, None, None
         if beta is None:
-            return None, None
+            return kind, None, None
         if beta <= 0 or linear_beta <= 0:
             raise ValueError(f"SiTU beta parameters must be positive, got {beta} and {linear_beta}.")
         if problem_desc["gate_up_clamp"] is not None:
             raise ValueError("SiTU does not support gate_up_clamp; the two activation variants are exclusive.")
         if problem_desc.get("swiglu_alpha") is not None:
             raise ValueError("SiTU does not support SwiGLUBias constants.")
-        return float(beta), float(linear_beta)
+        return kind, float(beta), float(linear_beta)
 
     @classmethod
     def _resolve_gate_activation(cls, problem_desc: ProblemDesc) -> str:
@@ -1049,7 +1078,7 @@ class SwapABGatedActEpilogue(KernelComponent):
         self._validate_desc_inputs(problem_desc, impl_desc)
 
         self.quant_kind = QuantKind(problem_desc["quant_kind"])
-        self.acc_dtype = tcgen05_block_scaled_acc_dtype
+        self.acc_dtype = tcgen05_block_scaled_acc_dtype if self.quant_kind.is_block_scaled else tcgen05_dense_acc_dtype
         self.hidden_size = problem_desc["hidden_size"]
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
         self.combine_format = problem_desc["combine_format"]
@@ -1061,11 +1090,24 @@ class SwapABGatedActEpilogue(KernelComponent):
         if self.swiglu_alpha is not None:
             self.swiglu_alpha = float(self.swiglu_alpha)
             self.swiglu_beta = float(self.swiglu_beta)
-        self.situ_beta, self.situ_linear_beta = self._resolve_situ_betas(problem_desc)
+        self.expert_activation, self.situ_beta, self.situ_linear_beta = self._resolve_activation(problem_desc)
+        if not self.expert_activation.is_gated and self.quant_kind.is_block_scaled:
+            # The mega kernel checks this too; kernels that build this epilogue directly (the shared-MLP FC12
+            # kernel) size their FC1 output as gated, so a non-gated block-scaled descriptor must not get here.
+            raise NotImplementedError(
+                f"The non-gated {self.expert_activation} activation runs only on the unquantized bf16 kind; "
+                f"the {self.quant_kind} FC1 epilogue re-quantizes gated outputs only."
+            )
         self.gate_activation = self._resolve_gate_activation(problem_desc)
+        if not self.expert_activation.is_gated and self.gate_activation != "swiglu":
+            raise ValueError(
+                f"gate_activation={self.gate_activation!r} applies to gated activations only, got {self.expert_activation}."
+            )
         # The scratch costs mainloop SMEM budget, so only a descriptor that enables the scale
         # reserves it; passing the tensor without the flag is rejected in run().
         self.act_scale_scratch_enabled = bool(problem_desc.get("fc1_activation_per_token_scale", False))
+        if self.act_scale_scratch_enabled and not (self.expert_activation.is_gated and self.quant_kind.is_block_scaled):
+            raise ValueError("fc1_activation_per_token_scale needs a gated activation on a block-scaled kind.")
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
         self.use_2cta_instrs = impl_desc["use_2cta_instrs"]
@@ -1085,12 +1127,25 @@ class SwapABGatedActEpilogue(KernelComponent):
         if not self.communication_enabled and (self.reduce_topk_in_kernel or self.token_back_push_data):
             raise ValueError("A communication-disabled Epilogue cannot enable communication policies.")
 
-        # FC1 emits what FC2 consumes as its activation, in the kind's own scale format.
+        # FC1 emits what FC2 consumes as its activation, in the kind's own scale format. The
+        # unquantized bf16 kind emits plain bf16 with no scale plane (both SF fields are None).
         self.fc1_output_dtype = self.quant_kind.activation_dtype
-        self.fc1_output_sf_dtype = self.quant_kind.sf_dtype
-        self.sf_vec_size = self.quant_kind.sf_vec_size
+        if self.quant_kind.is_block_scaled:
+            self.fc1_output_sf_dtype = self.quant_kind.sf_dtype
+            self.sf_vec_size = self.quant_kind.sf_vec_size
+        else:
+            self.fc1_output_sf_dtype = None
+            self.sf_vec_size = None
+        # One FC1 CTA tile is 128 accumulator rows. A gated kind folds each [gate, up] row pair into
+        # one output, a non-gated kind keeps one output per row, so a tile emits 64 or 128 features.
+        # The TMEM transpose gives each warp 32 of the rows, hence 16 or 32 outputs per token.
+        rows_per_feature = 2 if self.expert_activation.is_gated else 1
+        self.fc1_output_tile_size = self._EpilogueFc1IntermediateGateUpTileSize // rows_per_feature
+        self.fc1_output_features_per_warp = self.fc1_output_tile_size // self._EpilogueWarpCnt
         # A 32-wide scale block spans two epilogue warps; see QuantImpl's paired direction.
-        self.needs_pair_amax_exchange = self.sf_vec_size > self._EpilogueFc1IntermediateDownPerWarp
+        self.needs_pair_amax_exchange = (
+            self.sf_vec_size is not None and self.sf_vec_size > self.fc1_output_features_per_warp
+        )
         self.token_back_push_sf = self.communication_enabled and self.combine_format.is_quantized
         self.token_back_enabled = self.token_back_push_data or self.token_back_push_sf
         self.fc2_output_is_local = not self.communication_enabled or self.token_back_push_data
@@ -1106,7 +1161,7 @@ class SwapABGatedActEpilogue(KernelComponent):
         if self.epi_async_release and max(self.fc1_epi_flag_batch, self.fc2_epi_flag_batch) > self._EpilogueWarpCnt:
             # The async tracker batches per warp (one elected publisher per warp), the blocking one per lane.
             raise ValueError(f"epi_async_release=True needs epilogue flag batch sizes <= {self._EpilogueWarpCnt}.")
-        self.cluster_tile_intermediate_downproj = self._EpilogueFc1IntermediateDownTileSize * self.cluster_shape_mn[0]
+        self.cluster_tile_intermediate_downproj = self.fc1_output_tile_size * self.cluster_shape_mn[0]
 
         atom_thr_size = 2 if self.use_2cta_instrs else 1
         self.cta_tile_m = self._EpilogueFc2HiddenTileSize
@@ -1126,6 +1181,12 @@ class SwapABGatedActEpilogue(KernelComponent):
         )
         self.num_accumulator_tmem_cols = tmem_plan.accumulator_columns
         self.overlapping_accum = self.accumulator_overlap_columns > 0
+        if not self.expert_activation.is_gated and self.overlapping_accum:
+            # Its TMEM transposes rewrite all 64 columns of the subtile they read, in place; the
+            # overlap path releases the accumulator early and borrows one subtile as scratch. No
+            # bf16 plan overlaps (no SF TMEM columns), so this is a backstop, and a ValueError
+            # lets the op's default-tactic resolution fall back.
+            raise ValueError("The non-gated FC1 epilogue has no overlapped-accumulator path.")
         self.accumulator_shape = (self.cta_tile_m, self.cta_tile_n, tmem_plan.accumulator_stage_count)
         self.accumulator_stride = (1 << 16, 1, tmem_plan.accumulator_stage_stride_columns)
 
@@ -1134,16 +1195,19 @@ class SwapABGatedActEpilogue(KernelComponent):
         else:
             self.fc2_hidden_needs_predicate: bool = True
 
-        if isinstance(self.intermediate_gateup_size, int):
-            self.intermediate_downproj: Optional[int] = self.intermediate_gateup_size // 2
-        else:
-            self.intermediate_downproj: Optional[int] = None
+        # FC2's K, the FC1 output width. It only decides whether the static in-bound guards fold.
+        self.intermediate_downproj: Optional[int] = (
+            self.expert_activation.intermediate_downproj(self.intermediate_gateup_size)
+            if isinstance(self.intermediate_gateup_size, int)
+            else None
+        )
 
         self.subtile_cnt = self.cta_tile_n // self._EpilogueTokenTileSize
 
-        # One staging stage per token subtile, each an (epi_tile_n, epi_tile_m // 2) quantized tile.
+        # One staging stage per token subtile, each an (epi_tile_n, fc1_output_tile_size) tile of
+        # the FC1 output dtype (4x the nvfp4 bytes for bf16, and twice the gated bytes for relu2).
         self.fc1_staging_stage_bytes = (
-            self._EpilogueTokenTileSize * self._EpilogueFc1IntermediateDownTileSize * self.fc1_output_dtype.width // 8
+            self._EpilogueTokenTileSize * self.fc1_output_tile_size * self.fc1_output_dtype.width // 8
         )
         self.fc1_staging_bytes = self.subtile_cnt * self.fc1_staging_stage_bytes
         # The amax exchange plane is (token chunk, epilogue thread), block-major so each thread's
@@ -1214,10 +1278,12 @@ class SwapABGatedActEpilogue(KernelComponent):
     def fc1_staged_smem_layout(
         self, n_stages: int, without_stage_mode: bool = False
     ) -> Union[cute.Layout, cute.ComposedLayout]:
+        # (token, feature) per stage. A 128-feature bf16 stage is two dense 64x64 SW128 blocks,
+        # the same element offsets as FC2's bf16 TMA staging (fc2_tma_staged_smem_spec).
         layout = sm100_utils.make_smem_layout_epi(
             self.fc1_output_dtype,
             utils.LayoutEnum.ROW_MAJOR,
-            (self._EpilogueTokenTileSize, self._EpilogueFc1IntermediateDownTileSize),
+            (self._EpilogueTokenTileSize, self.fc1_output_tile_size),
             n_stages,
         )
         if without_stage_mode:
@@ -1297,7 +1363,9 @@ class SwapABGatedActEpilogue(KernelComponent):
         """Build the FC1 TMA store and the optional local FC2 TMA store."""
         fc1_operation = cpasync.CopyBulkTensorTileS2GOp()
         fc1_smem_layout = self.fc1_staged_smem_layout(1, without_stage_mode=True)
-        fc1_tile = (self._EpilogueTokenTileSize, self._EpilogueFc1IntermediateDownTileSize)
+        # SW128 caps a TMA box's inner extent at 128 B, so a 128-feature bf16 tile is stored as
+        # two 64-feature boxes by one copy (one bulk group); a clipped box writes nothing.
+        fc1_tile = (self._EpilogueTokenTileSize, self.fc1_output_tile_size)
         fc1_atom, fc1_tensor = cpasync.make_tiled_tma_atom(
             fc1_operation, fc1_output_template, fc1_smem_layout, fc1_tile
         )
@@ -1337,7 +1405,7 @@ class SwapABGatedActEpilogue(KernelComponent):
         # ── tensors ──────────────────────────────────
         tma_atom_fc1_output: cute.CopyAtom,
         fc1_output: cute.Tensor,  # Domain of fake (m, n, l)
-        fc1_output_sf: cute.Tensor,  # Domain of fake (m, n, l)
+        fc1_output_sf: Optional[cute.Tensor],  # Domain of fake (m, n, l); None for bf16
         tma_atom_fc2_output: Optional[cute.CopyAtom],
         fc2_tma_output: Optional[cute.Tensor],  # Domain (physical_token, hidden, l=1)
         fc2_output: cute.Tensor,  # MoE domain (token, topk, hidden)
@@ -1379,6 +1447,11 @@ class SwapABGatedActEpilogue(KernelComponent):
             raise ValueError("Token-back requires an FC2 done counter.")
         if cutlass.const_expr(self.token_back_push_sf and fc2_output_sf is None):
             raise ValueError("Quantized token-back requires an FC2 output scale tensor.")
+        if cutlass.const_expr((fc1_output_sf is None) == self.quant_kind.is_block_scaled):
+            raise ValueError(
+                f"{self.quant_kind} requires fc1_output_sf to be "
+                f"{'given' if self.quant_kind.is_block_scaled else 'None'}."
+            )
         tmem_acc = cute.make_tensor(
             cute.recast_ptr(tmem_ptr, dtype=cutlass.Float32),
             cute.make_layout(self.accumulator_shape, stride=self.accumulator_stride),
@@ -1508,6 +1581,27 @@ class SwapABGatedActEpilogue(KernelComponent):
         flag_tracker.fire()
 
 
+def fc1_tile_signals(tile_m_idx, extent, width):
+    """Whether FC1 CTA tile ``tile_m_idx`` adds to its (expert, token tile) fc1_done counter.
+
+    The tile covers FC1 output features [tile_m_idx * width, (tile_m_idx + 1) * width), with
+    ``width`` the epilogue's ``fc1_output_tile_size`` (64 gated, 128 non-gated), and signals iff it
+    holds an in-bound feature (``extent`` = intermediate_downproj). The tiles that signal per slot
+    then number ceil(FC1 rows / 128), the FC2 spin threshold. Works on Python ints (host checks)
+    and Int32 (device); keep the expression order, the existing code generation depends on it.
+    """
+    return tile_m_idx * width < extent
+
+
+def fc1_signal_guard_needed(extent, width, cluster_m):
+    """Whether ``fc1_tile_signals`` has to be evaluated on device.
+
+    False iff no CTA tile the scheduler hands out can be out of bound: ``extent`` is static and a
+    whole number of ``width * cluster_m`` cluster tiles. A runtime extent (None) always needs it.
+    """
+    return extent is None or extent % (width * cluster_m) != 0
+
+
 class _ImmutableAfterInit:
     """Froze at the point calling `_freeze()`"""
 
@@ -1531,7 +1625,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         kernel_extension: BlockScaledSwapAbFc12Extension,
         tma_atom_fc1_output: cute.CopyAtom,
         fc1_output: cute.Tensor,  # fake (m,n,l) domain
-        fc1_output_sf: cute.Tensor,  # fake (m,n,l) domain
+        fc1_output_sf: Optional[cute.Tensor],  # fake (m,n,l) domain; None for bf16
         fc1_done_counter: cute.Tensor,  # 1D tensor
         optional_epi_args: GatedActEpilogueArgs,
     ):
@@ -1640,13 +1734,14 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
 
     @cute.jit
     def signal_fc1_done(self, work_tile_info, next_work_tile_info, flag_tracker):
-        # Only in-bound intermediate_downproj tiles signal; OOB -> null slot.
-        needs_intermediate_guard = (
-            self.intermediate_downproj is None
-            or self.intermediate_downproj % self.cluster_tile_intermediate_downproj != 0
+        # Only in-bound intermediate_downproj tiles signal; OOB -> null slot. Both the width and
+        # the fold condition follow fc1_output_tile_size: with the gated 64 a non-gated tile
+        # past the extent would signal and complete the counter early.
+        needs_intermediate_guard = fc1_signal_guard_needed(
+            self.intermediate_downproj, self.fc1_output_tile_size, self.cluster_shape_mn[0]
         )
         if cutlass.const_expr(needs_intermediate_guard):
-            in_bound = work_tile_info.tile_m_idx * self._EpilogueFc1IntermediateDownTileSize < self.fc1_output.shape[1]
+            in_bound = fc1_tile_signals(work_tile_info.tile_m_idx, self.fc1_output.shape[1], self.fc1_output_tile_size)
         else:
             in_bound = True
         slot = work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
@@ -1671,8 +1766,10 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
     ):
         # (tokens_this_expert, intermediate_down, 1)
         real_fc1_output, _ = self.kernel_extension.get_gmem_tensor("c", self.fc1_output, work_tile_info)
-        # (tokens_this_expert, intermediate_down, 1)
-        real_fc1_output_sf, _ = self.kernel_extension.get_gmem_tensor("sfc", self.fc1_output_sf, work_tile_info)
+        real_fc1_output_sf = None
+        if cutlass.const_expr(self.quant_kind.is_block_scaled):
+            # (tokens_this_expert, intermediate_down, 1)
+            real_fc1_output_sf, _ = self.kernel_extension.get_gmem_tensor("sfc", self.fc1_output_sf, work_tile_info)
         # subtile-irrevalent hoist out here.
         if cutlass.const_expr(self.optional_epi_args.fc1_alpha is not None):
             alpha_val = self.optional_epi_args.fc1_alpha[work_tile_info.expert_idx]
@@ -1796,7 +1893,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         preload_acc: Tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor],
         # (tokens_this_expert, intermediate_down, 1)
         fc1_output: cute.Tensor,
-        fc1_output_sf: cute.Tensor,
+        fc1_output_sf: Optional[cute.Tensor],
         alpha_val: Optional[cutlass.Float32],
         norm_const: Optional[cutlass.Float32],
         # (tokens_this_expert,) fp32 per-token activation scale view, or None.
@@ -1810,11 +1907,12 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         else:
             topk_score_tensor = None
 
-        # Mapping of the transposed accumulator for orthodox NVFP4 output:
+        # Mapping of the transposed accumulator for orthodox NVFP4 output, with
+        # F = fc1_output_features_per_warp (16 gated, 32 non-gated):
         # (epi_tid, val_id) -> (token_idx, intermediate_down_idx)
-        # token_idx = epi_tid % 32 + val_id // 16 * 32
-        # intermediate_down_idx = val_id % 16 + epi_tid // 32 * 16
-        # Each thread holds (intermediate_down_16, token_2):(1, 16)
+        # token_idx = epi_tid % 32 + val_id // F * 32
+        # intermediate_down_idx = val_id % F + epi_tid // 32 * F
+        # Each thread holds (intermediate_down_F, token_2):(1, F)
 
         # Step -1: preload topk scores.
         current_two_token_idices = (
@@ -1880,6 +1978,10 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             activation_alpha = alpha_val
 
         # Step 0: load tmem
+        # Four quadrants of the warp's 32 accumulator rows: the top / bottom 16 rows over the
+        # first / second 32 tokens. Under the gated [gate 16, up 16] interleave the top rows are
+        # gate and the bottom rows up, hence the names; for a non-gated kind they are simply
+        # features 32w..32w+15 and 32w+16..32w+31.
         if cutlass.const_expr(preload_acc is not None):
             gate_token_0_32, up_token_0_32, gate_token_32_64, up_token_32_64 = preload_acc
         else:
@@ -1917,56 +2019,70 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 wrap_into_copy_standard_layout(up_token_32_64),
             )
 
-        # Step 1: perform swiglu on the first part, interleave with the second's 32x32 tmem transpose.
-        token_0_32_pre_quant_pre_trans = self.alpha_swiglu_clamp(
-            gate_token_0_32, up_token_0_32, activation_alpha, dequant_scales=dequant_scales_token_0_32
-        )
+        # Step 1: the activation. Either way each lane ends with its two tokens' (lane, lane + 32)
+        # fc1_output_features_per_warp outputs, in fp32.
+        if cutlass.const_expr(self.expert_activation.is_gated):
+            # Gated activation on the first part, interleaved with the second's 32x32 tmem
+            # transpose.
+            token_0_32_pre_quant_pre_trans = self.alpha_swiglu_clamp(
+                gate_token_0_32, up_token_0_32, activation_alpha, dequant_scales=dequant_scales_token_0_32
+            )
 
-        # gate_token_32_64 / up_token_32_64 are already in the transpose input
-        # distribution (see TmemTranspose16x32 / load_subtile_raw_acc).
-        token_32_64_tmem_trans = TmemTranspose32x32Inplace(
-            tmem_subtile_tensor.iterator, reg_tensor_top=gate_token_32_64, reg_tensor_bot=up_token_32_64
-        )
+            # gate_token_32_64 / up_token_32_64 are already in the transpose input
+            # distribution (see TmemTranspose16x32 / load_subtile_raw_acc).
+            token_32_64_tmem_trans = TmemTranspose32x32Inplace(
+                tmem_subtile_tensor.iterator, reg_tensor_top=gate_token_32_64, reg_tensor_bot=up_token_32_64
+            )
 
-        # Transpose output: each lane holds (token_1, intermediate_16); tmem_dp
-        # = lane_idx (token), tmem_col = elem_idx (intermediate output idx).
-        gate_token_32_64_trans_pre_act, up_token_32_64_trans_pre_act = (
-            token_32_64_tmem_trans.from_r1_perm_until_last_store()
-        )
+            # Transpose output: each lane holds (token_1, intermediate_16); tmem_dp
+            # = lane_idx (token), tmem_col = elem_idx (intermediate output idx).
+            gate_token_32_64_trans_pre_act, up_token_32_64_trans_pre_act = (
+                token_32_64_tmem_trans.from_r1_perm_until_last_store()
+            )
 
-        token_32_64_pre_quant = self.alpha_swiglu_clamp(
-            gate_token_32_64_trans_pre_act,
-            up_token_32_64_trans_pre_act,
-            activation_alpha,
-            dequant_scale=dequant_scale_token_32_64,
-        )
+            token_32_64_pre_quant = self.alpha_swiglu_clamp(
+                gate_token_32_64_trans_pre_act,
+                up_token_32_64_trans_pre_act,
+                activation_alpha,
+                dequant_scale=dequant_scale_token_32_64,
+            )
 
-        token_0_32_tmem_trans = TmemTranspose16x32(
-            tmem_subtile_tensor.iterator, Region.Top, reg_tensor=token_0_32_pre_quant_pre_trans
-        )
-        token_0_32_pre_quant = token_0_32_tmem_trans.from_r1_perm_until_last_store()
+            token_0_32_tmem_trans = TmemTranspose16x32(
+                tmem_subtile_tensor.iterator, Region.Top, reg_tensor=token_0_32_pre_quant_pre_trans
+            )
+            token_0_32_pre_quant = token_0_32_tmem_trans.from_r1_perm_until_last_store()
+            two_token = (token_0_32_pre_quant, token_32_64_pre_quant)
+        else:
+            if cutlass.const_expr(alpha_val is not None or act_scale_tensor is not None):
+                raise NotImplementedError("The non-gated FC1 epilogue has no fc1_alpha or per-token scale path.")
+            two_token = self.relu2_token_major(
+                tmem_subtile_tensor, (gate_token_0_32, up_token_0_32, gate_token_32_64, up_token_32_64)
+            )
 
-        # Step 2: Quant
-        self.fc1_quant(
-            work_tile_info=work_tile_info,
-            two_token=(token_0_32_pre_quant, token_32_64_pre_quant),
-            topk_scores=topk_scores,
-            norm_const=norm_const,
-            intermediate_output_size=cute.size(fc1_output, 1),
-            fc1_output_sf=fc1_output_sf,
-            subtile_idx=subtile_idx,
-        )
+        # Step 2: Quant (block-scaled), or the plain bf16 conversion FC2 consumes unquantized.
+        if cutlass.const_expr(self.quant_kind.is_block_scaled):
+            self.fc1_quant(
+                work_tile_info=work_tile_info,
+                two_token=two_token,
+                topk_scores=topk_scores,
+                norm_const=norm_const,
+                intermediate_output_size=cute.size(fc1_output, 1),
+                fc1_output_sf=fc1_output_sf,
+                subtile_idx=subtile_idx,
+            )
+        else:
+            self.fc1_store_unquantized(two_token=two_token, topk_scores=topk_scores, subtile_idx=subtile_idx)
 
         # Step 3: TMASTG
-        # (token_64, intermeidate_64)
+        # (token_64, fc1_output_tile)
         fc1_smem = self.smem_tensor[None, None, subtile_idx]
         # (token, intermediate_down, l=1) -> (cta_token, cta_intermediate_down)
-        fc1_gmem_cta_view = cute.flat_divide(fc1_output, (self.cta_tile_n, self.cta_tile_m // 2))[
+        fc1_gmem_cta_view = cute.flat_divide(fc1_output, (self.cta_tile_n, self.fc1_output_tile_size))[
             None, None, work_tile_info.tile_n_idx, work_tile_info.tile_m_idx, 0
         ]
-        # (cta_token, cta_intermediate_down) -> (token_64, intermediate_64)
+        # (cta_token, cta_intermediate_down) -> (token_64, fc1_output_tile)
         fc1_gmem_subtile_view = cute.flat_divide(
-            fc1_gmem_cta_view, (self._EpilogueTokenTileSize, self._EpilogueFc1IntermediateDownTileSize)
+            fc1_gmem_cta_view, (self._EpilogueTokenTileSize, self.fc1_output_tile_size)
         )[None, None, subtile_idx, 0]
         tma_smem_src, tma_gmem_dst = cpasync.tma_partition(
             self.fc1_tma_atom,
@@ -1984,11 +2100,51 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         if self.warp_idx == subtile_idx:
             tma_ready_to_read_smem_named_barrier.arrive_and_wait()
             with cute.arch.elect_one():
-                # if work_tile_info.tile_m_idx * (self.cta_tile_m // 2) < cute.size(fc1_output, 1):
+                # No in-bound check: TMA clips each box (a non-gated tile issues two) at the FC1
+                # output extent, so a CTA tile past it stores nothing.
                 cute.copy(self.fc1_tma_atom, tma_smem_src, tma_gmem_dst)
                 cute.arch.cp_async_bulk_commit_group()
         else:
             tma_ready_to_read_smem_named_barrier.arrive()
+
+    @cute.jit
+    def relu2_token_major(
+        self, tmem_subtile_tensor: cute.Tensor, quadrants: Tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor]
+    ) -> Tuple[cute.Tensor, cute.Tensor]:
+        """ReLU^2 of one subtile: each lane gets the 32 features of tokens lane and lane + 32.
+
+        ``quadrants`` are Step 0's raw loads (top / bottom 16 rows over tokens 0-31, then 32-63).
+        Transposer A works in subtile columns 0..31 (tokens 0-31, quadrants 0/1) and B in columns
+        32..63 (tokens 32-63, quadrants 2/3), so each one only rewrites TMEM whose contents are
+        already in registers. The +32 is a Python int so the TMEM atoms keep their alignment.
+        """
+        first = TmemTranspose32x32Inplace(
+            tmem_subtile_tensor.iterator, reg_tensor_top=quadrants[0], reg_tensor_bot=quadrants[1]
+        )
+        tokens_0_32 = self.relu2(*first.from_r1_perm_until_last_store())
+        second = TmemTranspose32x32Inplace(
+            tmem_subtile_tensor.iterator + 32, reg_tensor_top=quadrants[2], reg_tensor_bot=quadrants[3]
+        )
+        tokens_32_64 = self.relu2(*second.from_r1_perm_until_last_store())
+        return tokens_0_32, tokens_32_64
+
+    @cute.jit
+    def relu2(self, top: cute.Tensor, bottom: cute.Tensor) -> cute.Tensor:
+        """relu(x)^2 in fp32 over one token's [top 16 | bottom 16] features, i.e. 32w..32w+31.
+
+        ``fmax``'s default (IEEE maxNumber) maps NaN to 0, as ``_apply_relu2_epilogue`` does.
+        """
+        n = cute.size(top)
+        out = cute.make_rmem_tensor((2 * n,), cutlass.Float32)
+        zero = cutlass.Float32(0.0)
+        for base, values in ((0, top), (n, bottom)):
+            for i in cutlass.range_constexpr(0, n, 2):
+                r0 = cute.arch.fmax(values[i], zero)
+                r1 = cute.arch.fmax(values[i + 1], zero)
+                squared = cute.arch.mul_packed_f32x2((r0, r1), (r0, r1))
+                out[base + i] = squared[0]
+                out[base + i + 1] = squared[1]
+        return out
 
     @cute.jit
     def alpha_swiglu_clamp(
@@ -2249,8 +2405,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         # plane folds any coordinate inside a block onto that block's slot, so the per-warp base
         # addresses the right entry for either vec size.
         intermediate_idx = (
-            work_tile_info.tile_m_idx * (self.cta_tile_m // 2)
-            + self.warp_idx * self._EpilogueFc1IntermediateDownPerWarp
+            work_tile_info.tile_m_idx * self.fc1_output_tile_size + self.warp_idx * self.fc1_output_features_per_warp
         )
         if cutlass.const_expr(self.needs_pair_amax_exchange):
             stores_scale_factor = self.warp_idx % 2 == 0
@@ -2315,6 +2470,59 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             # ((1, 16), (token_tile_size, warp_cnt)) -> (16)
             smem_thread_row = smem_tiled[(0, None), (self.lane_idx + 32 * half, self.warp_idx)]
             cute.copy(store_atom, cute.coalesce(data_by_token[None, half]), cute.coalesce(smem_thread_row))
+
+    @cute.jit
+    def fc1_store_unquantized(
+        self,
+        two_token: Tuple[
+            cute.Tensor, cute.Tensor
+        ],  # two rmem tensor, each fp32 @ (token_1, intermediate_F), F = 16 gated / 32 non-gated
+        topk_scores: Optional[Tuple[cutlass.Float32, cutlass.Float32]],
+        subtile_idx: cutlass.Int32,
+    ):
+        # Unquantized counterpart of ``fc1_quant`` for the bf16 kind, where FC2 consumes the FC1
+        # output as plain bf16. Per token half (lane, lane + 32), the fc1_output_features_per_warp
+        # post-activation values (16 gated, 32 non-gated)
+        #   1. (Path A) take the top-k weight with the same fp32 multiply as the quantized path,
+        #   2. are rounded to bf16 once (round-to-nearest-even), and
+        #   3. are STS'd into this subtile's shared output stage for the TMA store in run_subtile.
+        # No scale factor exists, so there is no amax, no paired-warp exchange, no fc1_output_sf
+        # write and no stage-retire barrier.
+        values_per_token = cute.size(two_token[0])
+        smem_stage = self.smem_tensor[None, None, subtile_idx]
+        # (token_64, fc1_output_tile) -> ((1, F), (token_tile_size, warp_cnt)). For the 128-wide
+        # non-gated stage the warp mode is (2, 2) over its two 64-feature blocks, so warp w still
+        # lands on features 32w..32w+31.
+        smem_tiled = cute.zipped_divide(smem_stage, (1, values_per_token))
+        # A token's F bf16 outputs are 32 B or 64 B but one STS moves at most 16 B, and the staging
+        # swizzle permutes 16 B chunks, so the pieces of the row segment need not even be adjacent
+        # in SMEM. Store 16 B vectors through the swizzled view instead.
+        store_bits = 128
+        vector_elements = store_bits // self.fc1_output_dtype.width
+        store_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), self.fc1_output_dtype, num_bits_per_copy=store_bits
+        )
+
+        for half in cutlass.range_constexpr(2):
+            tok = two_token[half]
+            if cutlass.const_expr(topk_scores is not None):
+                weighted = cute.make_rmem_tensor((values_per_token,), cutlass.Float32)
+                topk_pair = (topk_scores[half], topk_scores[half])
+                for i in cutlass.range_constexpr(0, values_per_token, 2):
+                    w0, w1 = cute.arch.mul_packed_f32x2((tok[i], tok[i + 1]), topk_pair)
+                    weighted[i] = w0
+                    weighted[i + 1] = w1
+                tok = weighted
+            converted = cute.make_rmem_tensor((values_per_token,), self.fc1_output_dtype)
+            converted.store(tok.load().to(self.fc1_output_dtype))
+
+            # ((1, F), (token_tile_size, warp_cnt)) -> (F)
+            smem_thread_row = smem_tiled[(0, None), (self.lane_idx + 32 * half, self.warp_idx)]
+            cute.copy(
+                store_atom,
+                cute.zipped_divide(converted, (vector_elements,)),
+                cute.zipped_divide(cute.coalesce(smem_thread_row), (vector_elements,)),
+            )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3363,6 +3571,8 @@ __all__ = [
     "GatedActEpilogueArgs",
     "QuantImpl",
     "SwapABGatedActEpilogue",
+    "fc1_signal_guard_needed",
+    "fc1_tile_signals",
     "make_fc2_redg_process_pipeline",
     "make_fc2_stg_process_pipeline",
     "make_fc2_tma_process_pipeline",

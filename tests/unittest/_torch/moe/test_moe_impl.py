@@ -109,7 +109,9 @@ from tensorrt_llm._torch.moe.fused_moe.marlin import MarlinCudaNvfp4Impl, Marlin
 from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
     DeepgemmCudaW4a8Mxfp4Mxfp8Impl,
     MegaMoECuteDsl,
+    MegaMoECuteDslBase,
     MegaMoEDeepGemm,
+    TrtllmCutedslMegaMoeBf16Impl,
     TrtllmCutedslMegaMoeNvfp4Impl,
 )
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
@@ -470,10 +472,10 @@ def test_pinned_megamoe_cutedsl_identity_fails_hard_on_another_format():
         impl_class_for(report)
 
 
-def test_the_two_mega_moe_leaves_are_separated_by_their_quant_gates():
-    """One kernel segment, two leaves, and the format is what chooses.
+def test_the_mega_moe_leaves_are_separated_by_their_quant_gates():
+    """One kernel segment, three leaves, and the format is what chooses.
 
-    Both match ``*.*.mega_moe.*``, so the pin cannot tell them apart; their
+    All match ``*.*.mega_moe.*``, so the pin cannot tell them apart; their
     ``quant`` segments are disjoint, which is why each lands on its own class.
 
     One deployment carries every MegaMoE dep, so the loser has to decline on
@@ -507,16 +509,29 @@ def test_the_two_mega_moe_leaves_are_separated_by_their_quant_gates():
         deployment=deployment,
         impl_id="mega_moe",
     )
+    unquantized = resolve_moe_impl(
+        _megamoe_cutedsl_model_config(),
+        problem=_megamoe_cutedsl_problem(None),
+        deployment=deployment,
+        impl_id="mega_moe",
+    )
 
     assert impl_class_for(cutedsl) is TrtllmCutedslMegaMoeNvfp4Impl
     assert impl_class_for(deepgemm) is DeepgemmCudaW4a8Mxfp4Mxfp8Impl
-    assert cutedsl.requested == deepgemm.requested == "*.*.mega_moe.*"
+    assert impl_class_for(unquantized) is TrtllmCutedslMegaMoeBf16Impl
+    assert cutedsl.requested == deepgemm.requested == unquantized.requested == "*.*.mega_moe.*"
 
     assert [(r.legacy_backend, r.reason) for r in cutedsl.rejected] == [
-        (DeepgemmCudaW4a8Mxfp4Mxfp8Impl.__name__, MoERejectReason.QUANT_UNSUPPORTED)
+        (DeepgemmCudaW4a8Mxfp4Mxfp8Impl.__name__, MoERejectReason.QUANT_UNSUPPORTED),
+        (TrtllmCutedslMegaMoeBf16Impl.__name__, MoERejectReason.QUANT_UNSUPPORTED),
     ]
     assert [(r.legacy_backend, r.reason) for r in deepgemm.rejected] == [
-        (TrtllmCutedslMegaMoeNvfp4Impl.__name__, MoERejectReason.QUANT_UNSUPPORTED)
+        (TrtllmCutedslMegaMoeNvfp4Impl.__name__, MoERejectReason.QUANT_UNSUPPORTED),
+        (TrtllmCutedslMegaMoeBf16Impl.__name__, MoERejectReason.QUANT_UNSUPPORTED),
+    ]
+    assert [(r.legacy_backend, r.reason) for r in unquantized.rejected] == [
+        (DeepgemmCudaW4a8Mxfp4Mxfp8Impl.__name__, MoERejectReason.QUANT_UNSUPPORTED),
+        (TrtllmCutedslMegaMoeNvfp4Impl.__name__, MoERejectReason.QUANT_UNSUPPORTED),
     ]
 
 
@@ -530,6 +545,321 @@ def test_registering_megamoe_cutedsl_leaves_the_backend_literal_path_unchanged()
     assert impl_class_for(report) is TrtllmCutedslMegaMoeNvfp4Impl
     assert report.selected_by == "pinned"
     assert report.requested == MoeBackendType.MEGAMOE_CUTEDSL.value
+
+
+# The gated activations both MegaMoE CuteDSL leaves run.
+_MEGAMOE_CUTEDSL_GATED_KINDS = frozenset(
+    {ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.SiTu}
+)
+
+# The two MegaMoE CuteDSL leaves: the class, the format its identity
+# publishes, the SMs its gate admits, the activations it runs and its static
+# capabilities. Written out so a leaf that stops registering, or an SM,
+# activation or capability gate that widens, fails here.
+_MEGAMOE_CUTEDSL_DECLARATIONS = (
+    # ``is_sm_100f`` admits the whole SM10x family, SM107 (Rubin) included.
+    pytest.param(
+        TrtllmCutedslMegaMoeNvfp4Impl,
+        QuantAlgo.NVFP4,
+        set(range(100, 110)),
+        _MEGAMOE_CUTEDSL_GATED_KINDS,
+        MoEStaticCapability(supports_eplb=True, supports_per_layer_dynamic_eplb=True),
+        id="nvfp4",
+    ),
+    # Blackwell only: the Rubin mainloops have no BF16 path. The non-gated
+    # FC1 epilogue stores a bf16 intermediate, so Relu2 is this leaf's alone.
+    # No per-layer dynamic EPLB: its live kernel planes are the NVFP4 method's.
+    pytest.param(
+        TrtllmCutedslMegaMoeBf16Impl,
+        None,
+        {100, 103},
+        _MEGAMOE_CUTEDSL_GATED_KINDS | {ActivationType.Relu2},
+        MoEStaticCapability(supports_eplb=True),
+        id="none",
+    ),
+)
+
+
+def test_megamoe_cutedsl_declarations_cover_every_leaf():
+    """Every registered CuteDSL ``mega_moe`` leaf is in the table, the literal's family and ranked."""
+    leaves = {case.values[0] for case in _MEGAMOE_CUTEDSL_DECLARATIONS}
+    query = MoEImplQuery(provider="trtllm", technique="cutedsl", kernel_name="mega_moe")
+    assert leaves == {impl for _, impl in MOE_IMPL_REGISTRY.find(query)}
+    assert leaves == BACKEND_FAMILY[MoeBackendType.MEGAMOE_CUTEDSL.value]
+    assert leaves <= set(IMPL_PRIORITY)
+
+
+@pytest.mark.parametrize(
+    "leaf, quant_algo, sms, kinds, capabilities", _MEGAMOE_CUTEDSL_DECLARATIONS
+)
+def test_megamoe_cutedsl_leaf_declarations(leaf, quant_algo, sms, kinds, capabilities):
+    deployment = _megamoe_cutedsl_deployment()
+    admitted = {
+        sm
+        for sm in range(75, 125)
+        if leaf.can_implement(
+            _megamoe_cutedsl_problem(quant_algo),
+            dataclasses.replace(deployment, env=dataclasses.replace(deployment.env, sm=sm)),
+        ).eligible
+    }
+    assert admitted == sms
+    assert leaf.capabilities == capabilities
+    assert leaf.scheduler_kind is MoESchedulerKind.FUSED_COMM
+    # Per leaf: only the kinds differ from the root's declaration.
+    assert leaf.activation_support.kinds == kinds
+    assert leaf.activation_support == dataclasses.replace(
+        MegaMoECuteDslBase.activation_support, kinds=kinds
+    )
+
+    assert "descriptor" in vars(leaf)
+    assert MOE_IMPL_REGISTRY.lookup(leaf.descriptor.identity) is leaf
+    assert leaf.capabilities is leaf.descriptor.capabilities
+    assert leaf.input_requirement is leaf.descriptor.input_requirement
+    # The root implements none of the four, so the class that publishes the
+    # identity is the one that executes it.
+    for name in _ABSTRACT_METHODS:
+        assert name in vars(leaf)
+        assert name not in vars(MegaMoECuteDslBase)
+    assert not leaf.__abstractmethods__
+    # What create_moe_backend dispatches on.
+    assert issubclass(leaf, MegaMoECuteDslBase)
+
+
+@pytest.mark.parametrize(
+    "quant_algo, leaf",
+    [
+        pytest.param(QuantAlgo.NVFP4, TrtllmCutedslMegaMoeNvfp4Impl, id="nvfp4"),
+        pytest.param(None, TrtllmCutedslMegaMoeBf16Impl, id="none"),
+    ],
+)
+def test_megamoe_cutedsl_literal_picks_the_leaf_that_publishes_the_format(quant_algo, leaf):
+    """``moe_backend: MEGAMOE_CUTEDSL`` names the family; the quant picks which leaf."""
+    report = resolve_moe_impl(
+        _megamoe_cutedsl_model_config(),
+        problem=_megamoe_cutedsl_problem(quant_algo),
+        deployment=_megamoe_cutedsl_deployment(),
+    )
+    assert impl_class_for(report) is leaf
+    assert report.selected_by == "pinned"
+    assert not report.degraded
+
+
+@pytest.mark.parametrize(
+    "layer_quant_algo",
+    [
+        # DeepSeek-V3 / V4 build the MTP layer's MoE of an NVFP4 checkpoint
+        # with ``QuantConfig(quant_algo=None)``.
+        pytest.param(None, id="unquantized_layer"),
+        # A layer left on the model-level marker reads as unquantized.
+        pytest.param(QuantAlgo.MIXED_PRECISION, id="mixed_precision_marker"),
+    ],
+)
+@pytest.mark.parametrize(
+    "sm, leaf",
+    [
+        pytest.param(100, TrtllmCutedslMegaMoeBf16Impl, id="sm100"),
+        pytest.param(103, TrtllmCutedslMegaMoeBf16Impl, id="sm103"),
+        # No BF16 MegaMoE kernel on Rubin: the layer degrades, with a warning.
+        pytest.param(107, TrtllmCutlassUnquantizedImpl, id="sm107"),
+    ],
+)
+def test_megamoe_cutedsl_serves_the_unquantized_layers_of_a_quantized_checkpoint(
+    layer_quant_algo, sm, leaf
+):
+    """Resolution is per layer, so an NVFP4 checkpoint that asks for
+    ``MEGAMOE_CUTEDSL`` runs its unquantized MoE layers on the BF16 leaf
+    wherever that leaf has a kernel, and degrades them to Cutlass elsewhere."""
+    cfg = _megamoe_cutedsl_model_config()
+    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    deployment = _megamoe_cutedsl_deployment()
+    report = resolve_moe_impl(
+        cfg,
+        override_quant_config=QuantConfig(quant_algo=layer_quant_algo),
+        deployment=dataclasses.replace(deployment, env=dataclasses.replace(deployment.env, sm=sm)),
+        dtype=torch.bfloat16,
+        num_experts=8,
+        hidden_size=1024,
+        intermediate_size=1024,
+    )
+    assert impl_class_for(report) is leaf
+    if leaf is TrtllmCutedslMegaMoeBf16Impl:
+        assert report.selected_by == "pinned"
+        assert not report.degraded
+    else:
+        assert report.degraded
+        assert (report.degraded_from.legacy_backend, report.degraded_from.reason) == (
+            TrtllmCutedslMegaMoeBf16Impl.__name__,
+            MoERejectReason.SM_UNSUPPORTED,
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides, reason, detail",
+    [
+        pytest.param(
+            {"hidden_size": 1056}, MoERejectReason.SHAPE_UNALIGNED, None, id="hidden_not_64"
+        ),
+        pytest.param(
+            {"intermediate_size": 1056},
+            MoERejectReason.SHAPE_UNALIGNED,
+            None,
+            id="intermediate_not_64",
+        ),
+        pytest.param(
+            {"dtype_act": torch.float16},
+            MoERejectReason.DTYPE_UNSUPPORTED,
+            None,
+            id="fp16_activation",
+        ),
+        # Relu2 is the one non-gated kind the kernel runs.
+        pytest.param(
+            {"activation": "Silu"}, MoERejectReason.ACTIVATION_UNSUPPORTED, None, id="silu"
+        ),
+        pytest.param(
+            {"activation": "Gelu"}, MoERejectReason.ACTIVATION_UNSUPPORTED, None, id="gelu"
+        ),
+        pytest.param(
+            {"activation": "Geglu"}, MoERejectReason.ACTIVATION_UNSUPPORTED, None, id="geglu"
+        ),
+        # An expert bias also sets swiglu_gptoss_style, so the bias has to be
+        # what turns a biased Relu2 down, not the GPT-OSS SwiGLU package.
+        pytest.param(
+            {"activation": "Relu2", "bias": True, "swiglu_gptoss_style": True},
+            MoERejectReason.ACTIVATION_UNSUPPORTED,
+            "expert FC bias",
+            id="relu2_expert_bias",
+        ),
+        pytest.param(
+            {
+                "swiglu_gptoss_style": True,
+                "bias": True,
+                "activation": "SwigluBias",
+                "activation_constants": frozenset({"alpha", "beta", "clamp"}),
+            },
+            MoERejectReason.ACTIVATION_UNSUPPORTED,
+            None,
+            id="gpt_oss_expert_bias",
+        ),
+    ],
+)
+def test_megamoe_cutedsl_bf16_leaf_declines_what_its_kernel_does_not_run(overrides, reason, detail):
+    verdict = TrtllmCutedslMegaMoeBf16Impl.can_implement(
+        dataclasses.replace(_megamoe_cutedsl_problem(None), **overrides),
+        _megamoe_cutedsl_deployment(),
+    )
+    assert not verdict.eligible
+    assert verdict.reject_reason is reason
+    if detail is not None:
+        assert detail in verdict.detail, verdict.detail
+
+
+@pytest.mark.parametrize("sm", [100, 103])
+def test_megamoe_cutedsl_bf16_leaf_admits_the_gated_activations_and_relu2(sm):
+    """The NVFP4 leaf's gated activations, and the non-gated Relu2 (Nemotron-H) with no constants."""
+    deployment = _megamoe_cutedsl_deployment()
+    deployment = dataclasses.replace(deployment, env=dataclasses.replace(deployment.env, sm=sm))
+    for activation, constants, gptoss in (
+        ("Swiglu", frozenset(), False),
+        ("SwigluBias", frozenset({"alpha", "beta", "clamp"}), True),
+        ("SiTu", frozenset({"alpha", "beta"}), False),
+        ("Relu2", frozenset(), False),
+    ):
+        problem = dataclasses.replace(
+            _megamoe_cutedsl_problem(None),
+            activation=activation,
+            activation_constants=constants,
+            swiglu_gptoss_style=gptoss,
+            bias=False,
+        )
+        verdict = TrtllmCutedslMegaMoeBf16Impl.can_implement(problem, deployment)
+        assert verdict.eligible, (activation, verdict.detail)
+
+
+def test_megamoe_cutedsl_bf16_leaf_declines_per_layer_dynamic_eplb():
+    """Per-layer dynamic EPLB needs the NVFP4 quant method's live kernel planes."""
+    deployment = dataclasses.replace(
+        _megamoe_cutedsl_deployment(), eplb_enabled=True, eplb_mode="per_layer_dynamic"
+    )
+    report = resolve_moe_impl(
+        _megamoe_cutedsl_model_config(),
+        problem=_megamoe_cutedsl_problem(None),
+        deployment=deployment,
+        impl_id="trtllm.cutedsl.mega_moe.none",
+    )
+    assert report.winner is None
+    assert [item.reason for item in report.rejected] == [MoERejectReason.EPLB_UNSUPPORTED]
+
+
+def test_megamoe_cutedsl_nvfp4_leaf_declines_relu2():
+    """Its FC1 epilogue re-quantizes gated outputs only."""
+    verdict = TrtllmCutedslMegaMoeNvfp4Impl.can_implement(
+        dataclasses.replace(_megamoe_cutedsl_problem(), activation="Relu2"),
+        _megamoe_cutedsl_deployment(),
+    )
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+
+
+@pytest.mark.parametrize("swiglu_gptoss_style", [None, False, True])
+@pytest.mark.parametrize(
+    "leaf, quant_algo",
+    [
+        pytest.param(TrtllmCutedslMegaMoeNvfp4Impl, QuantAlgo.NVFP4, id="nvfp4"),
+        pytest.param(TrtllmCutedslMegaMoeBf16Impl, None, id="none"),
+    ],
+)
+def test_megamoe_cutedsl_leaves_decline_an_expert_bias(leaf, quant_algo, swiglu_gptoss_style):
+    """Neither kernel has a bias operand, so the bias alone turns a layer down.
+
+    ``create_moe`` derives ``swiglu_gptoss_style`` from the bias, so a biased
+    layer arrives with it set and used to read as the GPT-OSS SwiGLU package;
+    a caller that leaves it unset or False is turned down all the same.
+    """
+    verdict = leaf.can_implement(
+        dataclasses.replace(
+            _megamoe_cutedsl_problem(quant_algo),
+            bias=True,
+            swiglu_gptoss_style=swiglu_gptoss_style,
+        ),
+        _megamoe_cutedsl_deployment(),
+    )
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+    assert "expert FC bias" in verdict.detail, verdict.detail
+
+
+@pytest.mark.parametrize(
+    "leaf, admitted, refused",
+    [
+        # Kimi K3's top-16.
+        pytest.param(TrtllmCutedslMegaMoeNvfp4Impl, (16,), 17, id="nvfp4"),
+        # Nemotron-H's top-22, up to the bound of the fused noaux_tc routing.
+        pytest.param(TrtllmCutedslMegaMoeBf16Impl, (22, 32), 33, id="none"),
+    ],
+)
+def test_megamoe_cutedsl_leaf_caps_experts_per_token(leaf, admitted, refused):
+    """The top-k cap is per leaf, and above it the layer fails at construction.
+
+    ``can_implement`` never reads top_k, so an uncapped top-k would not
+    degrade to another backend; ``validate_configurable_moe`` refuses it when
+    ``ConfigurableMoE`` builds the layer.
+    """
+    # ``object.__new__``: the check reads the class bound, not the backend's state.
+    impl = object.__new__(leaf)
+
+    def layer(top_k: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            comm=None,
+            routing_method=SimpleNamespace(experts_per_token=top_k),
+            moe_max_num_tokens=256,
+            use_dp=True,
+            parallel_size=1,
+        )
+
+    for top_k in admitted:
+        impl.validate_configurable_moe(layer(top_k))
+    with pytest.raises(ValueError, match=f"experts_per_token <= {admitted[-1]}"):
+        impl.validate_configurable_moe(layer(refused))
 
 
 # =====================================================================
