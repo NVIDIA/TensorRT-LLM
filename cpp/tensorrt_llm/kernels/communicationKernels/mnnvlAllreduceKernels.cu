@@ -337,6 +337,8 @@ struct MnnvlAllReduceKernelParams
     uint32_t* bufferFlags;
     bool waitForResults;
     QuantizationSFLayout layout;
+    // One-shot only: false releases PDL dependents before the reduction (their prologue overlaps it).
+    bool triggerCompletionAtEnd = true;
 };
 
 template <typename PackedType, typename T>
@@ -591,6 +593,10 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
     int threadOffset = token * params.tokenDim + packedIdx * kELTS_PER_THREAD;
 
     cudaGridDependencySynchronize();
+    if (!params.triggerCompletionAtEnd)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
 #else
     int packedIdx = blockIdx.y * blockDim.x + threadIdx.x;
     int token = blockIdx.x;
@@ -673,7 +679,10 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
         }
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
+    if (params.triggerCompletionAtEnd)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
 #endif
     if constexpr (ar_fusion::HasResidual<Pattern>)
     {
@@ -845,6 +854,7 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
             reinterpret_cast<T*>(params.bufferPtrLocal), mcPtr, params.quantOut, params.scaleOut, params.scaleFactor,
             numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
             false, params.layout};
+        kernelParams.triggerCompletionAtEnd = params.triggerCompletionAtEnd;
 
         switch (params.nRanks)
         {

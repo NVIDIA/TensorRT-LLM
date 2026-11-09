@@ -1046,6 +1046,82 @@ def test_mnnvl_fp8_payload_residual_rms_norm(mpi_pool_executor):
         assert r is True
 
 
+@torch.inference_mode()
+def run_early_pdl_release_single_rank(tensor_parallel_size, input, residual,
+                                      norm_weight):
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        input, residual = input.cuda(), residual.cuda()
+        norm_weight = norm_weight.cuda()
+        os.environ["TLLM_TEST_MNNVL"] = "1"
+        MPI.COMM_WORLD.barrier()
+        mapping = Mapping(world_size=tensor_parallel_size,
+                          tp_size=tensor_parallel_size,
+                          rank=rank)
+        workspace = get_or_scale_allreduce_mnnvl_workspace(
+            mapping,
+            input.dtype,
+            buffer_size_bytes=MNNVLAllReduce.get_required_workspace_size(
+                *input.shape, tensor_parallel_size, input.dtype))
+        comm = (workspace["uc_buffer"].view(input.dtype).view(3, -1),
+                workspace["buffer_flags"])
+
+        def chain(trigger):
+            # The norm call is a PDL dependent of the sum call and reads its output.
+            total, = torch.ops.trtllm.mnnvl_fusion_allreduce(
+                input,
+                None,
+                None,
+                None,
+                *comm,
+                False,
+                None,
+                int(AllReduceFusionOp.NONE),
+                trigger_completion_at_end=trigger)
+            return (total, *torch.ops.trtllm.mnnvl_fusion_allreduce(
+                total,
+                norm_weight,
+                residual,
+                1e-6,
+                *comm,
+                True,
+                None,
+                int(AllReduceFusionOp.RESIDUAL_RMS_NORM),
+                trigger_completion_at_end=trigger))
+
+        for early, default in zip(chain(False), chain(True)):
+            assert torch.equal(early, default)
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        # The pool worker is reused: later tests must not see the MNNVL override.
+        os.environ.pop("TLLM_TEST_MNNVL", None)
+    return True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="needs 2 GPUs to run this test")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_mnnvl_oneshot_early_pdl_release(mpi_pool_executor):
+    """trigger_completion_at_end=False: one-shot and PDL dependent outputs match the default bit for bit."""
+    torch.manual_seed(11)
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    seq_len, hidden_size = 32, 2560  # one-shot (<= 1 MiB message)
+    x = torch.randn((tensor_parallel_size, seq_len, hidden_size),
+                    dtype=torch.bfloat16)
+    residual = torch.randn((seq_len, hidden_size), dtype=torch.bfloat16)
+    norm_weight = torch.randn((hidden_size, ), dtype=torch.bfloat16)
+    results = mpi_pool_executor.map(
+        run_early_pdl_release_single_rank,
+        *zip(*[(tensor_parallel_size, x[i], residual, norm_weight)
+               for i in range(tensor_parallel_size)]),
+    )
+    for r in results:
+        assert r is True
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
