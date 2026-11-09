@@ -4959,11 +4959,14 @@ class TestMirrorAdmissionPreview:
 _INTERVAL_ENV = "TRTLLM_SCHED_PREFILL_DECODE_INTERVAL"
 _SPF_ENV = "TRTLLM_SCHED_SHORTEST_PREFILL_FIRST"
 _SPF_WAIT_ENV = "TRTLLM_SCHED_SPF_MAX_WAIT_PASSES"
+_SPF_AGE_ENV = "TRTLLM_SCHED_SPF_MAX_AGE_PASSES"
+_SPF_LEAD_ENV = "TRTLLM_SCHED_SPF_AGED_LEAD_EVERY"
+_SPF_FIRST_ENV = "TRTLLM_SCHED_SPF_FIRST_CHUNK_MAX_WAIT_PASSES"
 
 
 @pytest.fixture
 def admission_env(monkeypatch):
-    for name in (_INTERVAL_ENV, _SPF_ENV, _SPF_WAIT_ENV):
+    for name in (_INTERVAL_ENV, _SPF_ENV, _SPF_WAIT_ENV, _SPF_AGE_ENV, _SPF_LEAD_ENV, _SPF_FIRST_ENV):
         monkeypatch.delenv(name, raising=False)
     return monkeypatch
 
@@ -5232,6 +5235,71 @@ class TestShortestPrefillFirstPolicy:
         out = sched.schedule_request([gen, long_ctx, short], set())
         # Request 1 aged while it was held, so it now goes first.
         assert ids(out.context_requests) == [1]
+
+
+class TestShortestPrefillFirstAgingTiers:
+    """SPF max-age clock + first-chunk aging tier."""
+
+    def test_defaults_keep_single_tier(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        spf = make_scheduler(_reuse_settling_manager({}), max_num_tokens=150)._shortest_prefill_first
+        assert (spf.max_age_passes, spf.aged_lead_every, spf.first_chunk_max_wait_passes) == (0, 1, 0)
+
+    def test_first_chunk_without_spf_warns_and_is_inert(self, admission_env):
+        admission_env.setenv(_SPF_FIRST_ENV, "4")
+        assert make_scheduler(_reuse_settling_manager({}), max_num_tokens=150)._shortest_prefill_first is None
+
+    def test_first_chunk_tier_promotes_fitting_cold_prompt(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        admission_env.setenv(_SPF_WAIT_ENV, "100")
+        admission_env.setenv(_SPF_FIRST_ENV, "2")
+        sched = make_scheduler(_reuse_settling_manager({}), max_num_tokens=210)
+        mid = make_ctx_request(1, 200)  # fits one step
+        admitted = []
+        for request_id in (2, 3, 4):
+            out = sched.schedule_request([mid, make_ctx_request(request_id, 100)], set())
+            admitted.append(ids(out.context_requests))
+        # Without the tier it would wait 100 passes; with M=2 it goes first on pass 3.
+        assert admitted == [[2], [3], [1]]
+        assert sched._shortest_prefill_first.first_chunk_aged_admissions == 1
+
+    def test_first_chunk_tier_skips_prompts_above_the_budget(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        admission_env.setenv(_SPF_WAIT_ENV, "100")
+        admission_env.setenv(_SPF_FIRST_ENV, "1")
+        sched = make_scheduler(_reuse_settling_manager({}), max_num_tokens=150)
+        big = make_ctx_request(1, 1000)  # does not fit max_num_tokens: not promoted
+        for request_id in (2, 3, 4):
+            out = sched.schedule_request([big, make_ctx_request(request_id, 100)], set())
+            assert ids(out.context_requests) == [request_id]
+        assert sched._shortest_prefill_first.first_chunk_aged_admissions == 0
+
+    def test_max_age_bounds_total_time(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        admission_env.setenv(_SPF_WAIT_ENV, "100")
+        admission_env.setenv(_SPF_AGE_ENV, "3")
+        sched = make_scheduler(_reuse_settling_manager({}), max_num_tokens=210)
+        long_ctx = make_ctx_request(1, 200)
+        admitted = []
+        for request_id in (2, 3, 4, 5):
+            out = sched.schedule_request([long_ctx, make_ctx_request(request_id, 100)], set())
+            admitted.append(ids(out.context_requests))
+        # Arrived on pass 1; aged by max_age on pass 4 (3 passes later).
+        assert admitted == [[2], [3], [4], [1]]
+
+    def test_max_age_tier_leads_first_chunk_tier(self, admission_env):
+        admission_env.setenv(_SPF_ENV, "1")
+        admission_env.setenv(_SPF_WAIT_ENV, "100")
+        admission_env.setenv(_SPF_AGE_ENV, "2")
+        admission_env.setenv(_SPF_FIRST_ENV, "1")
+        sched = make_scheduler(_reuse_settling_manager({}), max_num_tokens=210)
+        old = make_ctx_request(1, 200)
+        sched.schedule_request([old, make_ctx_request(9, 100)], set())  # pass 1: 9 goes
+        newer = make_ctx_request(2, 150)
+        sched.schedule_request([old, newer, make_ctx_request(8, 100)], set())  # pass 2
+        out = sched.schedule_request([old, newer, make_ctx_request(7, 100)], set())  # pass 3
+        # 1 is max-age aged (tier 0,0); 2 is first-chunk aged (tier 0,1): 1 first.
+        assert ids(out.context_requests)[0] == 1
 
 
 class TestPrefillDecodeIntervalWithheldContext:
