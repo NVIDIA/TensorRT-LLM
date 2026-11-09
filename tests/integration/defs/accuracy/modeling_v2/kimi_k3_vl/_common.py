@@ -44,7 +44,6 @@ def _run_gsm8k(model_path: str, moe_tp_size: int, moe_ep_size: int) -> None:
         scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
         LLM(
             model_path,
-            dtype="bfloat16",
             tensor_parallel_size=16,
             pipeline_parallel_size=1,
             moe_tensor_parallel_size=moe_tp_size,
