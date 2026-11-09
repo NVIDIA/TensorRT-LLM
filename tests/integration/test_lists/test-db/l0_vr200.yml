@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 0.0.1
+l0_vr200:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*vr200*'
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  # Bounded model correctness checks; larger feature matrices remain on B200.
+  - unittest/_torch/visual_gen/test_wan_transformer.py::TestWanUnit::test_allclose_to_hf
+  - unittest/_torch/visual_gen/test_cosmos3_transformer.py::TestCosmos3Unit::test_sanity_forward
+  - unittest/_torch/visual_gen/test_cosmos3_transformer.py::TestCosmos3Unit::test_reset_cache
+  - unittest/_torch/visual_gen/test_flux_transformer.py::TestFluxTransformer::test_flux2_forward_sanity
+  - unittest/_torch/visual_gen/test_flux_attention.py::TestFlux2AttentionBackend::test_flux2_vanilla_backend_sanity
+  - unittest/_torch/visual_gen/test_minimax_h3_transformer.py::test_tiny_nonzero_layer_transformer_matches_cpu_reference
+  - unittest/_torch/visual_gen/test_minimax_h3_transformer.py::test_static_context_is_numerically_identical_to_uncached_path
+  # One generation smoke test per model family.
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_t2v_example
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example[nano-1gpu]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux2_example
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_pipeline_smoke TIMEOUT (30)
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*vr200*'
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  # Accuracy gates include Wan 2.2 and MiniMax-H3 video/audio reference parity.
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan22_t2v_lpips_against_golden
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2i_lpips_against_golden TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux2_lpips_against_golden
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va] TIMEOUT (60)

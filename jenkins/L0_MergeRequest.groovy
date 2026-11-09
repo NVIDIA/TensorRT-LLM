@@ -2327,7 +2327,7 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
         return
     }
     // The results archives of SBSA stages; every other one is x86_64.
-    def sbsaArchive = /results-(GH200|GB10|GB200|GB300|CPU-Generic-arm)-.*\.tar\.gz/
+    def sbsaArchive = /results-(GH200|GB10|GB200|GB300|VR200|CPU-Generic-arm)-.*\.tar\.gz/
     try {
         timeout(time: 15, unit: 'MINUTES') {
             def podSpec = createKubernetesPodConfig("", "agent")
