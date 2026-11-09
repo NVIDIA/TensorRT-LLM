@@ -348,6 +348,10 @@ def get_text_model_config(
     return cfg
 
 
+# Bound on MiniMaxM3Attention._fused_producer_plans; see _fused_producer_plan.
+_MAX_FUSED_PRODUCER_PLANS = 8
+
+
 def _tensor_view_key(
     tensor: Optional[torch.Tensor],
 ) -> Optional[Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, torch.device]]:
@@ -1641,6 +1645,13 @@ class MiniMaxM3Attention(Attention):
         The plan holds the kernel's static arguments only; the cache views
         themselves are passed per call. Returns ``None`` when the fused producer
         does not apply.
+
+        Plans live in ``_fused_producer_plans`` for the layer's lifetime. An
+        entry references the norm weights, the RoPE table and the KV quant
+        scales, never the cache views, and a serving process sees only a handful
+        of distinct cache views and parameter sets per layer. A miss that would
+        exceed ``_MAX_FUSED_PRODUCER_PLANS`` entries clears the dict first, so
+        repeated buffer or parameter replacement cannot retain stale tensors.
         """
         rotary_cos_sin = self.rotary_emb.rotary_cos_sin if self.rotary_emb is not None else None
         kv_quant_scale = (
@@ -1663,6 +1674,8 @@ class MiniMaxM3Attention(Attention):
             cache = self.__dict__["_fused_producer_plans"] = {}
         if key in cache:
             return cache[key]
+        if len(cache) >= _MAX_FUSED_PRODUCER_PLANS:
+            cache.clear()
         plan = self._resolve_fused_producer_plan(
             buffers, index_k_cache, scale_buffers, out_cache_loc, rotary_cos_sin, kv_quant_scale
         )

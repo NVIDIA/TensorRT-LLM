@@ -45,6 +45,10 @@ l0_b200:
   - unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_fp8_main_kv_insert.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_unfused_index_projection_tp_construction
   - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_explicit_caches_match_manager
+  - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_plan_reuses_and_invalidates
+  - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_plan_caches_unsupported_layout
+  - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_checks_slot_capacity_after_plan_hit
+  - unittest/_torch/models/test_minimax_m3.py::test_horizontal_producer_plan_cache_is_bounded
   - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_reload_preserves_attention_scale_storage[cuda]
   # MiniMax-M3 VL checkpoint-backed processor parity (the CPU stage's -m cpu_only leaves these out)
   - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_processor_input_ids_match_trt_build_helper
