@@ -3368,6 +3368,43 @@ async def test_responses_routing_falls_back_to_the_request_as_sent_when_rejected
     assert "<|tool|>A1<result:a><|tool|>A2<result:a>" in prompt
 
 
+def test_responses_routing_falls_back_to_the_text_of_a_request_with_media(
+        servers):
+    """A Responses request with an image routes on its text, as a chat request with media does."""
+    hf_tokenizer = _byte_level_probe_tokenizer()
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                use_harmony=False)
+    request = ResponsesRequest(model="m",
+                               input=[{
+                                   "type":
+                                   "message",
+                                   "role":
+                                   "user",
+                                   "content": [{
+                                       "type": "input_text",
+                                       "text": "describe this"
+                                   }, {
+                                       "type":
+                                       "input_image",
+                                       "image_url":
+                                       "https://example.com/cat.png"
+                                   }]
+                               }])
+
+    with mock.patch.object(router, "_get_tokenizer", return_value=hf_tokenizer), \
+            mock.patch.object(router, "_get_model_type",
+                              return_value="router-test-model-without-extension"), \
+            mock.patch.object(router, "_length_chat_ids",
+                              wraps=router._length_chat_ids) as length_chat_ids:
+        router_ids = router._tokenize(request)
+
+    assert length_chat_ids.call_count == 1
+    assert hf_tokenizer.decode(
+        router_ids[0]) == "<|user|>describe this<|assistant|>"
+
+
 @pytest.mark.asyncio
 async def test_conversation_router_tells_responses_conversations_apart():
     router = ConversationRouter(server_role=None,
