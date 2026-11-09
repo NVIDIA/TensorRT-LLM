@@ -833,9 +833,15 @@ def _create_unified_draft_managers(
 @pytest.mark.cuda
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize(
-    "tp,enable_dp",
-    [(1, False), (2, False), (2, True)],
-    ids=["tp1_to_tp1", "tp2_to_tp2", "dep2_to_dep2"],
+    "ctx_tp,ctx_enable_dp,gen_tp,gen_enable_dp",
+    [
+        (1, False, 1, False),
+        (2, False, 2, False),
+        (2, True, 2, True),
+        (1, False, 2, False),
+        (2, False, 2, True),
+    ],
+    ids=["tp1_to_tp1", "tp2_to_tp2", "dep2_to_dep2", "tp1_to_tp2", "tp2_to_dep2"],
 )
 @pytest.mark.parametrize(
     "update_before_transfer",
@@ -843,22 +849,24 @@ def _create_unified_draft_managers(
     ids=["update_before", "update_after"],
 )
 def test_minimax_m3_unified_draft_layer_transfer(
-    tp: int,
-    enable_dp: bool,
+    ctx_tp: int,
+    ctx_enable_dp: bool,
+    gen_tp: int,
+    gen_enable_dp: bool,
     update_before_transfer: bool,
 ) -> None:
     """Windowed BF16 draft layers of the NVFP4 manager reach the same pages as the target's.
 
-    Peers sharing draft KV have equal TP and attention DP. Draft layers are verified byte for byte
-    with the target's K/V, block scales and index-K.
+    Draft layers reshard across TP and attention DP like the target's, and are verified byte for
+    byte with the target's K/V, block scales and index-K.
     """
     transfer_harness.run_kv_transfer_test(
-        ctx_tp=tp,
+        ctx_tp=ctx_tp,
         ctx_pp=1,
-        gen_tp=tp,
+        gen_tp=gen_tp,
         gen_pp=1,
-        ctx_enable_dp=enable_dp,
-        gen_enable_dp=enable_dp,
+        ctx_enable_dp=ctx_enable_dp,
+        gen_enable_dp=gen_enable_dp,
         update_before_transfer=update_before_transfer,
         manager_factory=_create_unified_draft_managers,
         init_fn=_initialize_cache,
