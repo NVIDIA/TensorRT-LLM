@@ -1227,7 +1227,7 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         assert info.trigger == "<tool_call>"
 
     def test_structure_info_matches_chat_template_format(self):
-        """begin + arguments + end must be the call Qwen3's chat template writes.
+        """The tag's begin + arguments + end must match Qwen3's chat template.
 
         The template renders ``{"name": "<name>", "arguments": <args|tojson>}``,
         with the same spacing as ``json.dumps``. The strict-tools structural
