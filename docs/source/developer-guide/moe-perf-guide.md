@@ -115,7 +115,7 @@ Default selection (`AUTO`)
        │     (candidates below are skipped when not divisible)
        │
        ├─ NVLINK_TWO_SIDED     needs MNNVL
-       ├─ NCCL_EP              needs NCCL-EP 0.2+, BF16 activations
+       ├─ NCCL_EP              needs NCCL-EP 0.2+, BF16 activations, NCCL Device API on the EP communicator
        ├─ DEEPEP               needs BF16 activations
        ├─ DEEPEPLOWLATENCY     needs BF16 activations, top_k <= 16
        │
