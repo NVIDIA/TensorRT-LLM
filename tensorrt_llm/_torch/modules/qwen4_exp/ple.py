@@ -243,6 +243,7 @@ class PLEMetadata:
                     f"{processed_tokens} != {num_seq} * {uniform_row_width}"
                 )
             row_width = uniform_row_width
+            context_row_width = row_width
             generation_row_width = row_width
             lengths = torch.full((num_seq,), row_width, dtype=torch.long, device=device)
             req_indices = torch.div(positions, row_width, rounding_mode="floor")

@@ -33,6 +33,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.configs.qwen4_exp import Qwen4ExpTextConfig
 from tensorrt_llm._torch.models.modeling_qwen4_exp import Qwen4ExpModel
 from tensorrt_llm._torch.modules.qwen4_exp import ple as ple_module
 from tensorrt_llm._torch.modules.qwen4_exp.ple import (
@@ -704,6 +705,43 @@ def test_ple_mixed_batch_bounds_short_conv_workspace(monkeypatch) -> None:
         (1, channels, state_len + 5),
         (2, channels, state_len + 1),
     ]
+
+
+def test_ple_uniform_layout_with_contexts_matches_joint_short_conv() -> None:
+    """A uniform layout gives context rows the same padded width as generation rows."""
+    config = Qwen4ExpTextConfig(**{**vars(_make_config()), "hidden_size": 2, "ple_embed_dim": 16})
+    module = Qwen4ExpPLE(config, ple_layer_index=0, layer_id=1)
+    channels = module.conv_channels
+    state_len = module.short_conv_state_len
+    row_width = 4
+    num_seq = 3
+    metadata = PLEMetadata.build(
+        torch.arange(num_seq * row_width, dtype=torch.long),
+        torch.full((num_seq,), row_width, dtype=torch.long),
+        torch.tensor([2, 0, 1], dtype=torch.long),
+        is_decode=False,
+        eos_token_id=EOS_TOKEN_ID,
+        num_contexts=1,
+        uniform_row_width=row_width,
+    )
+    assert metadata.context_row_width == row_width
+    assert metadata.generation_row_width == row_width
+    assert metadata.context_tokens == row_width
+
+    values = torch.randn(num_seq * row_width, channels)
+    initial_state = torch.randn(num_seq, channels, state_len)
+
+    expected_state = initial_state.clone()
+    expected = module._short_conv(
+        values,
+        dataclasses.replace(metadata, num_contexts=0, context_tokens=0),
+        expected_state,
+    )
+    actual_state = initial_state.clone()
+    actual = module._short_conv(values, metadata, actual_state)
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_state, expected_state)
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
