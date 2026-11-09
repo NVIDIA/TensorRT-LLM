@@ -797,6 +797,12 @@ class DSv4DSparkWorker(SpecWorkerBase):
         if capture_lens is not None and len(capture_lens) != attn_metadata.num_contexts:
             raise ValueError("DSpark capture lengths must match the context requests")
         flat_position_ids = position_ids.reshape(-1)
+        # Scalar token positions on the host. The device tensor holds the same
+        # values, but reading it costs a D2H sync per request. MRoPE (3, 1, N)
+        # positions can differ from the host values, so they keep the device read.
+        host_pos = (
+            getattr(spec_metadata, "host_position_ids", None) if position_ids.dim() < 3 else None
+        )
         context_offset = 0
         for i in range(attn_metadata.num_contexts):
             chunk_len = int(attn_metadata._seq_lens[i])
@@ -809,10 +815,15 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 continue
 
             req_id = spec_metadata.request_ids[i]
-            first_position = int(chunk_positions[0].item())
+            if host_pos is not None:
+                first_position = int(host_pos[context_offset])
+            else:
+                first_position = int(chunk_positions[0].item())
             slot = self._assign_slot(req_id, reset=first_position == 0)
             self._ctx_len[slot] = chunk_positions[-1] + 1
-            self._position_initialized[slot] = True
+            # fill_ takes True as a kernel argument; assigning a Python scalar
+            # through an index would copy it to the GPU with a blocking copy.
+            self._position_initialized[slot].fill_(True)
 
             if captured is not None and capture_len:
                 self._valid_len[slot] = torch.clamp(

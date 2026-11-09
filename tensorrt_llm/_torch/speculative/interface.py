@@ -27,7 +27,7 @@ from torch import nn
 
 from tensorrt_llm.logger import logger
 
-from ..._utils import get_sm_version, prefer_pinned
+from ..._utils import async_tensor_h2d, get_sm_version, prefer_pinned
 from ..attention.backends.interface import AttentionMetadata
 from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
                                          TrtllmAttentionMetadata)
@@ -1213,11 +1213,14 @@ class SpecMetadata:
             return
         onehot_vocab = (self.draft_probs_last_dim if self.draft_probs_last_dim
                         > 0 else self.draft_probs_vocab_size)
-        slots = torch.tensor(padding_slot_ids,
-                             dtype=torch.long,
-                             device=self.draft_probs.device)
-        self.draft_probs[slots, :draft_len, :onehot_vocab] = 0.0
-        self.draft_probs[slots, :draft_len, 0] = 1.0
+        slots = async_tensor_h2d(padding_slot_ids, torch.long,
+                                 self.draft_probs.device)
+        # index_fill_ on a sliced view takes the value as a kernel argument;
+        # assigning a Python scalar through a tensor index would copy it with
+        # a blocking H2D copy.
+        self.draft_probs[:, :draft_len, :onehot_vocab].index_fill_(
+            0, slots, 0.0)
+        self.draft_probs[:, :draft_len, 0].index_fill_(0, slots, 1.0)
 
     def dp_num_tokens(self) -> int:
         """Return the attention-DP token count for the current batch.
@@ -3252,8 +3255,13 @@ class SpecWorkerBase(nn.Module, ABC):
         else:
             onehot_vocab = spec_metadata.draft_probs_vocab_size
             spec_metadata.draft_probs_last_dim = onehot_vocab
-        spec_metadata.draft_probs[ctx_slot_ids, :draft_len, :onehot_vocab] = 0.0
-        spec_metadata.draft_probs[ctx_slot_ids, :draft_len, 0] = 1.0
+        # index_fill_ on a sliced view takes the value as a kernel argument;
+        # assigning a Python scalar through a tensor index would copy it with
+        # a blocking H2D copy.
+        draft_probs = spec_metadata.draft_probs
+        draft_probs[:, :draft_len, :onehot_vocab].index_fill_(
+            0, ctx_slot_ids, 0.0)
+        draft_probs[:, :draft_len, 0].index_fill_(0, ctx_slot_ids, 1.0)
 
     def sample_draft_tokens(self,
                             logits,
