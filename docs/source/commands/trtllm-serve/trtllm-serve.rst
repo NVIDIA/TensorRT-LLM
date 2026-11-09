@@ -500,7 +500,7 @@ Start a profile window. All fields in the JSON body are optional.
      - Description
    * - ``output_dir``
      - string
-     - Directory where chrome traces are written. Defaults to ``$TLLM_TORCH_PROFILER_DIR`` if set, otherwise ``/tmp``. One trace file per rank is written as ``trtllm-trace-<profile_id>-rank-<N>.json``; ``<profile_id>`` is a timestamp + short uuid so successive cycles don't collide.
+     - Directory where chrome traces are written. Defaults to ``$TLLM_TORCH_PROFILER_DIR`` if set, otherwise a temporary directory. One trace file per rank is written as ``trtllm-trace-<profile_id>-rank-<N>.json``; ``<profile_id>`` is a timestamp + short uuid so successive cycles don't collide.
    * - ``num_steps``
      - int
      - Number of engine iterations to capture. When set, the engine stops the window automatically and you do not need to call ``/stop_profile``. When omitted, profiling runs until ``/stop_profile`` is called.
