@@ -4419,11 +4419,8 @@ def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
     mgr = object.__new__(MambaHybridCacheManagerV2)
     mgr.mapping = SimpleNamespace(rank=rank)
     mgr.local_num_mamba_layers = 1
-    mgr._prefix_matched_tokens_total = 0
-    mgr._prefix_snapshot_lost_tokens_total = 0
     mgr._iter_prefix_matched_tokens = 0
     mgr._iter_prefix_snapshot_lost_tokens = 0
-    mgr._snapshot_loss_warned = False
     mgr._stats_life_cycle_metadata = MagicMock(
         return_value={
             0: (4, 4096, "attention"),
@@ -4695,7 +4692,6 @@ def _branch_snapshot_manager(
     mgr._snapshot_pruned_tokens_total = 0
     mgr._page_pruned_tokens_total = 0
     mgr._prefix_matched_tokens_total = 0
-    mgr._prefix_snapshot_lost_tokens_total = 0
     mgr._iter_prefix_matched_tokens = 0
     mgr._iter_prefix_snapshot_lost_tokens = 0
     mgr._branch_snapshots_taken_total = 0
@@ -8035,7 +8031,7 @@ def test_v2_hybrid_iteration_stats_report_prefix_lost_to_missing_snapshot():
         _run_v2_hybrid_context(mgr, diverged)
         report = mgr.get_iteration_stats()
         assert diverged.prepopulated_prompt_len == 0
-        assert report.prefix_matched_tokens > 0
+        assert report.prefix_matched_tokens == 48
         assert report.prefix_snapshot_lost_tokens == report.prefix_matched_tokens
         mgr.free_resources(diverged)
 
