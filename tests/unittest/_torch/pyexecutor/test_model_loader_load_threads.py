@@ -11,7 +11,7 @@ from transformers import LlamaForCausalLM as HFLlamaForCausalLM
 
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader, _construct_checkpoint_loader
+from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader, construct_checkpoint_loader
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 
@@ -51,7 +51,7 @@ def _load(checkpoint_dir: str, monkeypatch: pytest.MonkeyPatch, load_threads: st
             max_num_tokens=64,
             max_seq_len=64,
         )
-        model, _ = loader.load(checkpoint_dir, _construct_checkpoint_loader(None, "HF"))
+        model, _ = loader.load(checkpoint_dir, construct_checkpoint_loader(None, "HF"))
     tensors = dict(model.named_parameters())
     tensors.update((f"buffer:{name}", buf) for name, buf in model.named_buffers())
     data = {
