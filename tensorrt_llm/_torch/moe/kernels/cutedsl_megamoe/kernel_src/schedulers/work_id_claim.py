@@ -7,7 +7,6 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass.cutlass_dsl import Boolean, Int32, Int64, extract_mlir_values, new_from_mlir_values
 
 from ...helpers.cluster_pipeline import (
@@ -773,7 +772,7 @@ def _claim_cluster_launch_control_work_id(
     if not use_bootstrap:
         state_before_leader_query = work_id_state
         if work_id_state.is_leader_cta:
-            work_id_state.cluster_pipeline.producer_acquire(work_id_state.producer_state)
+            producer_acquire_cluster(work_id_state.cluster_pipeline, work_id_state.producer_state)
             response_barrier = work_id_state.cluster_pipeline.producer_get_barrier(work_id_state.producer_state)
             with cute.arch.elect_one():
                 cute.arch.issue_clc_query(response_barrier, work_id_state.response_pointer)
@@ -781,12 +780,15 @@ def _claim_cluster_launch_control_work_id(
             work_id_state = state_before_leader_query
         work_id_state.producer_state.advance()
 
+        # The CLC unit writes the response into this CTA's slot through the async proxy and completes this
+        # CTA's own barrier, as a multicast TMA load does; the pipeline's CTA-scope wait is the DSL's own
+        # choice for it (``PipelineClcFetchAsync.consumer_wait``), so it stays.
         work_id_state.cluster_pipeline.consumer_wait(work_id_state.consumer_state)
         (cluster_origin_m, cluster_origin_n, grid_l, response_is_valid) = cute.arch.clc_response(
             work_id_state.response_pointer
         )
         cute.arch.fence_acq_rel_cta()
-        work_id_state.cluster_pipeline.consumer_release(work_id_state.consumer_state)
+        consumer_release_cluster(work_id_state.cluster_pipeline, work_id_state.consumer_state)
         work_id_state.consumer_state.advance()
 
         work_id_state.grid_m = cluster_origin_m + work_id_state.cta_coord_in_cluster[0]
@@ -837,18 +839,16 @@ def _claim_clc_mixed_cga_work_id(
             work_id_state = state_before_leader_query
         work_id_state.producer_state.advance()
 
+        # The CLC unit writes the response into this CTA's slot through the async proxy and completes this
+        # CTA's own barrier, as a multicast TMA load does; the pipeline's CTA-scope wait is the DSL's own
+        # choice for it (``PipelineClcFetchAsync.consumer_wait``), so it stays.
         cluster_pipeline.consumer_wait(work_id_state.consumer_state)
         (cluster_origin_m, cluster_origin_n, grid_l, response_is_valid) = cute.arch.clc_response(
             work_id_state.response_pointer
         )
         cute.arch.fence_acq_rel_cta()
         cute.arch.fence_proxy("async.shared", space="cta")
-        # Cluster-scoped release orders this CTA's read of the response before the leader's next overwrite.
-        cute.arch.mbarrier_arrive(
-            cluster_pipeline.sync_object_empty.get_barrier(work_id_state.consumer_state.index),
-            Int32(0),
-            scope=_nvvm.MemScopeKind.CLUSTER,
-        )
+        consumer_release_cluster(cluster_pipeline, work_id_state.consumer_state, work_id_state.cluster_size)
         work_id_state.consumer_state.advance()
 
         work_id_state.grid_m = cluster_origin_m + work_id_state.cta_coord_in_cluster[0]

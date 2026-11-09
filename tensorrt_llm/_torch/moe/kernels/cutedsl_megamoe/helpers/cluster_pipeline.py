@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Cluster-scope waits and releases for pipelines whose stage is handed between CTAs.
 
 A ``cutlass.pipeline`` stage that one CTA publishes into another CTA's shared memory
@@ -131,6 +145,11 @@ def producer_acquire_cluster(
         pipe.producer_acquire(state)
     else:
         mbarrier_wait_acquire_cluster(pipe.sync_object_empty.get_barrier(state.index), state.phase)
+        # ``try_acquire_token=True`` says the empty barrier is already acquired. ``PipelineAsync``
+        # and ``PipelineClcFetchAsync`` (CuTe DSL 4.8.0) skip their CTA-scope wait on a truthy
+        # token and run only what follows it, which for the CLC fetch pipeline is the arrive with
+        # transaction count on every CTA's full barrier. Should a DSL upgrade change that contract,
+        # this would turn into a second, CTA-scope wait: keep it in step with ``producer_acquire``.
         pipe.producer_acquire(state, try_acquire_token=True)
 
 
