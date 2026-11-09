@@ -497,29 +497,24 @@ def test_child_requests_inherit_hint_snapshot() -> None:
     llm_request = executor_request_to_llm_request(
         42, request, child_req_ids=[43], exclude_last_generation_logits=False
     )
-    assert llm_request.child_requests[0].py_kv_hints == request.py_kv_hints
+    assert llm_request.child_requests[0].py_kv_hints is llm_request.py_kv_hints
+    assert llm_request.py_kv_hints == request.py_kv_hints
 
 
 @pytest.mark.parametrize("broadcast_kind", ["single_round", "tensor_parallel", "pipeline_parallel"])
 def test_request_broadcast_transports_hints(broadcast_kind: str) -> None:
     """Rank transport preserves immutable hints alongside other Python metadata."""
     from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
-    from tensorrt_llm._torch.pyexecutor.request_utils import (
-        RequestBroadcaster,
-        attach_py_objects_to_requests,
-    )
+    from tensorrt_llm._torch.pyexecutor.request_utils import RequestBroadcaster
+    from tensorrt_llm.bindings import executor as bindings
 
     hints = snapshot_kv_hints(_hints())
+    request = bindings.Request(input_token_ids=[1, 2, 3], max_tokens=4)
+    request.py_kv_hints = hints
+    request.py_lora_ckpt_source = "hf"
     items = [
-        RequestQueueItem(
-            1,
-            SimpleNamespace(
-                py_kv_hints=hints,
-                py_conversation_params=None,
-                py_lora_ckpt_source="hf",
-            ),
-        ),
-        RequestQueueItem(2, SimpleNamespace(py_kv_hints=None, py_conversation_params=None)),
+        RequestQueueItem(1, request),
+        RequestQueueItem(2, bindings.Request(input_token_ids=[4, 5], max_tokens=4)),
     ]
     pipeline_parallel = broadcast_kind == "pipeline_parallel"
     transport = MagicMock()
@@ -535,10 +530,9 @@ def test_request_broadcast_transports_hints(broadcast_kind: str) -> None:
     transport.broadcast_or_none.side_effect = transport.broadcast.side_effect
     hang_detector = SimpleNamespace(pause=nullcontext)
     broadcaster = RequestBroadcaster(transport, hang_detector)
-    collected = broadcaster._collect_py_objects(items)
     with patch.dict("os.environ", {"TRTLLM_PP_REQ_SEND_ASYNC": "0"}):
         if broadcast_kind == "single_round":
-            original_requests, _ = broadcaster.broadcast(items)
+            original_requests = broadcaster.broadcast(items)
             assert original_requests is items
             sent = transport.broadcast_or_none.call_args.args[0]
             receiver = MagicMock()
@@ -547,13 +541,13 @@ def test_request_broadcast_transports_hints(broadcast_kind: str) -> None:
             receiver.has_pp = False
             receiver.supports_single_round_broadcast = True
             receiver.broadcast_or_none.return_value = pickle.loads(pickle.dumps(sent))
-            _, received = RequestBroadcaster(receiver, hang_detector).broadcast([])
+            received = RequestBroadcaster(receiver, hang_detector).broadcast([])
             transport.broadcast_or_none.assert_called_once()
             receiver.broadcast_or_none.assert_called_once_with(None, root=0)
             transport.broadcast_int64.assert_not_called()
             receiver.broadcast_int64.assert_not_called()
         else:
-            _, received = broadcaster._broadcast_requests(items, collected)
+            received = broadcaster._broadcast_requests(items)
     if pipeline_parallel:
         transport.tp_cp_broadcast.assert_called_once()
         transport.send_object.assert_called_once()
@@ -565,17 +559,15 @@ def test_request_broadcast_transports_hints(broadcast_kind: str) -> None:
         receiver.is_last_pp_rank = True
         receiver.pp_size = 2
         receiver.recv_object.return_value = pickle.loads(pickle.dumps(sent))
-        _, received = RequestBroadcaster(receiver, hang_detector)._broadcast_requests([], None)
+        received = RequestBroadcaster(receiver, hang_detector)._broadcast_requests([])
         receiver.recv_object.assert_called_once()
     elif broadcast_kind == "tensor_parallel":
         transport.broadcast.assert_called_once()
 
-    targets = [RequestQueueItem(1, SimpleNamespace()), RequestQueueItem(2, SimpleNamespace())]
-    attach_py_objects_to_requests(targets, received)
-    transported_hints = targets[0].request.py_kv_hints
+    transported_hints = received[0].request.py_kv_hints
     assert transported_hints == hints
-    assert targets[0].request.py_lora_ckpt_source == "hf"
-    assert getattr(targets[1].request, "py_kv_hints", None) is None
+    assert received[0].request.inputs.lora_ckpt_source == "hf"
+    assert received[1].request.py_kv_hints is None
     transported_hints.envelope().actions[0].payload["block_hashes"].append(99)
     assert transported_hints.envelope().model_dump() == _wire()
     with pytest.raises(FrozenInstanceError):

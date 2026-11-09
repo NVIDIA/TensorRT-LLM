@@ -615,6 +615,48 @@ def test_v2_builder_splits_mixed_heads_without_view_partition() -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("virtual_layers", [False, True])
+def test_v2_builder_resolves_mixed_precision_high_pool_heads(virtual_layers: bool) -> None:
+    from enum import IntEnum
+    from types import SimpleNamespace
+
+    class AttentionKind(IntEnum):
+        PRIMARY = 0
+        COMPRESSED = 1
+
+    high_layers = (3, 4) if virtual_layers else (2, 3)
+    attrs = {
+        (layer, role): SimpleNamespace(
+            life_cycle_id=0, pool_index=0, offset=(2 * index + role_index) * 128, size=128
+        )
+        for index, layer in enumerate(high_layers)
+        for role_index, role in enumerate((Role.KEY, Role.VALUE))
+    }
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
+    manager.impl.layer_grouping = (high_layers,)
+    manager.impl.init_config.layers = [
+        SimpleNamespace(window_size=None) for _ in range(high_layers[-1] + 1)
+    ]
+    manager.pp_layers = [20, 21]
+    manager.layer_offsets = {20: 0, 21: 1}
+    manager.num_kv_heads_per_layer = [2, 1]
+    manager.mixed_precision_high_layers = dict(enumerate(high_layers))
+    manager.get_disagg_global_layer_ids = lambda _: [41, 43]
+    if virtual_layers:
+        # Local model layer 1 owns the second high pool, while virtual storage layer 1
+        # belongs to model layer 20. Resolving the high owner through this map is wrong.
+        manager._layer_attn_to_layer_id = {
+            (20, AttentionKind.PRIMARY): 0,
+            (20, AttentionKind.COMPRESSED): 1,
+            (21, AttentionKind.PRIMARY): 2,
+        }
+
+    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
+    assert [view.num_kv_heads for view in views] == [2, 1]
+    assert [get_unique_layers(view) for view in views] == [{layer} for layer in high_layers]
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("head_counts", [(0, 1), (-1, 1), (1,)])
 def test_v2_builder_rejects_unresolved_or_nonpositive_heads(head_counts: tuple[int, ...]) -> None:
     from types import SimpleNamespace

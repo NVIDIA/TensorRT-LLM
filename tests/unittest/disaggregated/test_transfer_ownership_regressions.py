@@ -44,6 +44,14 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
 from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 
+_KV_RESULT_REPORT_TOKEN = b"report-token-123"
+
+
+def _publish_report_tokens(session, ranks=range(16)):
+    """Publish the per-writer report tokens that Receiver.dispatch_task mints."""
+    for task in getattr(session, "_kv_tasks", []):
+        task._kv_result_report_tokens = {int(r): _KV_RESULT_REPORT_TOKEN for r in ranks}
+
 
 def _sole_piece(block_ids_per_layer_groups=None, *, tokens=0, is_last=True) -> Chunk:
     """A transfer's only piece; nothing in this file exercises chunking."""
@@ -203,11 +211,13 @@ def test_failed_writer_cannot_authorize_reuse_while_sibling_is_active() -> None:
     def finish_sibling_writer() -> None:
         sibling_started.set()
         release_sibling.wait()
+        _publish_report_tokens(session)
         session.process_kv_agent_result(
             peer_rank=1,
             receiver_slice_id=0,
             is_last_slice=True,
             status=AgentResult.SUCCESS,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
         )
 
     sibling_thread = _start_checked_thread(finish_sibling_writer, thread_results)
@@ -216,11 +226,13 @@ def test_failed_writer_cannot_authorize_reuse_while_sibling_is_active() -> None:
 
         # Writer 0 is terminal, but writer 1 has not reported a terminal result
         # and may still write to the same receive-side KV allocation.
+        _publish_report_tokens(session)
         session.process_kv_agent_result(
             peer_rank=0,
             receiver_slice_id=0,
             is_last_slice=True,
             status=AgentResult.FAILED,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
         )
 
         safe_to_reuse = transceiver.cancel_request(request)
@@ -449,11 +461,13 @@ def test_non_terminal_writer_result_does_not_authorize_reuse() -> None:
     session = _make_rx_session(receiver, rid=80)
     session.receive(_sole_piece())
 
+    _publish_report_tokens(session)
     session.process_kv_agent_result(
         peer_rank=0,
         receiver_slice_id=0,
         is_last_slice=False,
         status=AgentResult.SUCCESS,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
 
     assert session.status == SessionStatus.TRANSFERRING
@@ -497,7 +511,7 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group(
     publication_timestamps: dict[int, tuple[int, int]] = {}
     fast_response_timestamps: dict[int, tuple[int, int]] = {}
 
-    def request_sender_data(endpoint: str, _payload: bytes) -> None:
+    def request_sender_data(endpoint: str, _payload: bytes, _token: bytes) -> None:
         rank = int(endpoint.rsplit("-", 1)[1])
         assert publication_order[-1][0] == "capture"
         publication_timestamps[rank] = captured_timestamps[-1]
@@ -566,20 +580,24 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group(
         ),
         *(("emit", rank) for rank in published_ranks),
     ]
+    _publish_report_tokens(session)
     session.process_kv_agent_result(
         peer_rank=2,
         receiver_slice_id=0,
         is_last_slice=True,
         status=AgentResult.FAILED,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
     assert task.status == transfer_mod.TaskStatus.ERROR
     assert not task.resources_drained
 
+    _publish_report_tokens(session)
     session.process_kv_agent_result(
         peer_rank=3,
         receiver_slice_id=0,
         is_last_slice=True,
         status=AgentResult.SUCCESS,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
     assert task.resources_drained
     assert task.status == transfer_mod.TaskStatus.ERROR
@@ -629,16 +647,18 @@ def test_partial_publication_waits_for_queued_writer_success(
         )
     )
 
-    def request_sender_data(endpoint: str, _payload: bytes) -> None:
+    def request_sender_data(endpoint: str, _payload: bytes, _token: bytes) -> None:
         if endpoint == "tcp://sender-1":
             raise RuntimeError("writer 1 publication failed after writer 0")
         queued_endpoints.append(endpoint)
         if writer_settles_before_failure:
+            _publish_report_tokens(session)
             session.process_kv_agent_result(
                 peer_rank=0,
                 receiver_slice_id=0,
                 is_last_slice=True,
                 status=AgentResult.SUCCESS,
+                kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
             )
 
     receiver._request_sender_data = request_sender_data
@@ -679,11 +699,13 @@ def test_partial_publication_waits_for_queued_writer_success(
 
         # Only writer 0's REQUEST_DATA was successfully queued. The destination
         # remains owned until that writer reports terminal physical evidence.
+        _publish_report_tokens(session)
         session.process_kv_agent_result(
             peer_rank=0,
             receiver_slice_id=0,
             is_last_slice=True,
             status=AgentResult.SUCCESS,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
         )
 
     assert session.status == SessionStatus.ERROR
@@ -706,11 +728,13 @@ def test_aborted_publication_cannot_complete_during_failure_unwind() -> None:
 
             def abort_then_deliver_success(writers: set[int]) -> None:
                 original_abort(writers)
+                _publish_report_tokens(self._session)
                 self._session.process_kv_agent_result(
                     peer_rank=0,
                     receiver_slice_id=0,
                     is_last_slice=True,
                     status=AgentResult.SUCCESS,
+                    kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
                 )
                 assert task.status == transfer_mod.TaskStatus.TRANSFERRING
 
@@ -745,11 +769,13 @@ def test_out_of_cohort_writer_cannot_authorize_reuse() -> None:
     session.receive(_sole_piece())
 
     with pytest.raises(RuntimeError, match="outside the sealed cohort"):
+        _publish_report_tokens(session)
         session.process_kv_agent_result(
             peer_rank=2,
             receiver_slice_id=0,
             is_last_slice=True,
             status=AgentResult.SUCCESS,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
         )
 
     assert not session.resources_drained()
@@ -799,7 +825,7 @@ def test_cancel_after_publication_cannot_overtake_request_data(
         )
     )
 
-    def request_sender_data(_endpoint: str, _receiver_info_bytes: bytes) -> None:
+    def request_sender_data(_endpoint: str, _receiver_info_bytes: bytes, _token: bytes) -> None:
         protocol_order.append("request_data_started")
         request_data_started.set()
         assert finish_request_data.wait(timeout=10)
@@ -835,11 +861,13 @@ def test_cancel_after_publication_cannot_overtake_request_data(
 
     def finish_writer() -> None:
         result_started.set()
+        _publish_report_tokens(session)
         session.process_kv_agent_result(
             peer_rank=0,
             receiver_slice_id=0,
             is_last_slice=True,
             status=AgentResult.FAILED,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
         )
 
     receive_thread = _start_checked_thread(receive, thread_results)
@@ -1474,7 +1502,15 @@ def test_writer_result_correlation_uses_session_provenance_not_wire_id(
     monkeypatch.setattr(
         transfer_mod.disagg_diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True
     )
-    message = transfer_mod._make_kv_result_msg(2, rid, 0, True, AgentResult.SUCCESS, 256)
+    message = transfer_mod._make_kv_result_msg(
+        2,
+        rid,
+        0,
+        True,
+        AgentResult.SUCCESS,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+        transfer_size=256,
+    )
     wire_message = tuple(message)
 
     receiver._process_kv_agent_result(b"sender", message)
@@ -1490,6 +1526,7 @@ def test_writer_result_correlation_uses_session_provenance_not_wire_id(
             0,
             True,
             AgentResult.SUCCESS,
+            _KV_RESULT_REPORT_TOKEN,
             transfer_size=256,
         )
 
@@ -1562,6 +1599,7 @@ def test_sender_failed_result_routes_messages_directly_in_order(monkeypatch) -> 
         instance_rank=2,
         block_ids_per_layer_groups=[],
         unique_rid=rid,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
     kv_message = [MessageType.KV_AGENT_RESULT, b"kv"]
     aux_message = [MessageType.AUX_AGENT_RESULT, b"aux"]
@@ -1573,7 +1611,9 @@ def test_sender_failed_result_routes_messages_directly_in_order(monkeypatch) -> 
     sender._send_failed_result_to_receiver(info, include_aux=True)
 
     sender._registrar.get_peer_rank_info.assert_called_once_with("gen", 2)
-    make_kv_result.assert_called_once_with(5, rid, 0, True, AgentResult.FAILED)
+    make_kv_result.assert_called_once_with(
+        5, rid, 0, True, AgentResult.FAILED, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+    )
     make_aux_result.assert_called_once_with(5, rid, AgentResult.FAILED)
     sender._get_or_connect_dealer.assert_called_once_with("receiver")
     assert [send.args[0] for send in dealer.send.call_args_list] == [kv_message, aux_message]
@@ -1820,7 +1860,10 @@ def test_late_request_data_to_terminal_sender_settles_aux(
     )
     sender._get_session = Mock(side_effect=[session, session if session_still_registered else None])
 
-    sender._respond_with_kv(b"receiver", [MessageType.REQUEST_DATA, info.to_bytes()])
+    sender._respond_with_kv(
+        b"receiver",
+        [MessageType.REQUEST_DATA, info.to_bytes(), _KV_RESULT_REPORT_TOKEN],
+    )
 
     if session_still_registered:
         sender._save_peer_req_info.assert_called_once_with(info)
@@ -2157,11 +2200,9 @@ def test_receiver_in_doubt_retains_destination_and_closes_admission(
     assert session.try_begin_transfer(task.slice_id, set(), writer_cohort={0})
 
     if auxiliary:
+        _publish_report_tokens(session)
         session.process_kv_agent_result(
-            0,
-            0,
-            True,
-            AgentResult.FAILED,
+            0, 0, True, AgentResult.FAILED, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
         )
         assert task.resources_drained
         session.process_aux_agent_result(0, AgentResult.IN_DOUBT)
@@ -2170,7 +2211,10 @@ def test_receiver_in_doubt_retains_destination_and_closes_admission(
         session.process_aux_agent_result(0, AgentResult.FAILED)
         assert session._aux_physical_owner is not None
         assert session._aux_physical_owner.resources_drained
-        session.process_kv_agent_result(0, 0, True, AgentResult.IN_DOUBT)
+        _publish_report_tokens(session)
+        session.process_kv_agent_result(
+            0, 0, True, AgentResult.IN_DOUBT, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+        )
         assert task.status == transfer_mod.TaskStatus.ERROR
 
     assert session.status == SessionStatus.ERROR
@@ -2537,13 +2581,16 @@ def test_rejected_sender_slice_addresses_receiver_task(monkeypatch) -> None:
         block_ids_per_layer_groups=[],
         unique_rid=rid,
         slice_id=0,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
     make_result = Mock(return_value=[MessageType.KV_AGENT_RESULT, b"failed"])
     monkeypatch.setattr(transfer_mod, "_make_kv_result_msg", make_result)
 
     sender._send_failed_task_result_to_receiver(task, info)
 
-    make_result.assert_called_once_with(5, rid, 0, True, AgentResult.FAILED)
+    make_result.assert_called_once_with(
+        5, rid, 0, True, AgentResult.FAILED, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+    )
     assert sender._send_task_queues[0].get_nowait() == (
         "receiver",
         [MessageType.KV_AGENT_RESULT, b"failed"],
@@ -2783,3 +2830,33 @@ def test_fp4_mla_bridge_rejects_requests_outside_qualified_protocol() -> None:
     )
     transceiver.request_and_receive_async(req)
     assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "peer_rank, token",
+    [
+        # Known writer, wrong token: the compare_digest branch.
+        (0, b"wrong-token-xxx!"),
+        # A writer that was never handed a token: the missing-token branch.
+        (5, _KV_RESULT_REPORT_TOKEN),
+    ],
+    ids=["wrong_token", "unpublished_writer"],
+)
+def test_kv_result_with_bad_report_token_is_rejected(peer_rank: int, token: bytes) -> None:
+    receiver = _ReceiverProbe()
+    session = _make_rx_session(receiver, rid=201)
+    session.receive(_sole_piece())
+    task = session._kv_tasks[0]
+    # Only writer 0 is handed a token.
+    task._kv_result_report_tokens = {0: _KV_RESULT_REPORT_TOKEN}
+
+    with pytest.raises(ValueError, match="report token"):
+        session.process_kv_agent_result(
+            peer_rank=peer_rank,
+            receiver_slice_id=0,
+            is_last_slice=True,
+            status=AgentResult.SUCCESS,
+            kv_result_report_token=token,
+        )
+    assert task.status != transfer_mod.TaskStatus.TRANSFERRED
