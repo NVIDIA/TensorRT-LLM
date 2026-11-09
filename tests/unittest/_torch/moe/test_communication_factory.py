@@ -270,9 +270,10 @@ def test_nccl_ep_without_runtime_group_timeout_is_unavailable(monkeypatch: pytes
     [
         (32, 232448, None),
         (32, 101376, "requires 202240 bytes of dynamic shared memory"),
+        (2632, 232448, None),
         (4096, 232448, "at most 14 expert warp groups"),
     ],
-    ids=["fits", "smem-too-small", "too-many-warp-groups"],
+    ids=["fits", "smem-too-small", "max-warp-groups", "too-many-warp-groups"],
 )
 def test_nccl_ep_v01_low_latency_combine_device_limits(
     monkeypatch: pytest.MonkeyPatch, num_slots: int, smem_optin: int, match: str | None
