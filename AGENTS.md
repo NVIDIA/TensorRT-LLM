@@ -190,6 +190,22 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 | Test waives | `tests/integration/test_lists/waives.txt` | Skip known-failing tests with NVBug links |
 | Performance | See [benchmarking guide](docs/source/developer-guide/perf-benchmarking.md) | `trtllm-bench` and `trtllm-serve` benchmarks |
 
+Pass product Python file paths to `scripts/run_pyrefly.sh` for a file-list static
+check; pre-commit supplies these paths with `pass_filenames: true`. If none are
+eligible, the script skips the check. `--full-project` requests a scan of all
+product Python files. For supplied files, diagnostics are filtered to added
+and modified lines when Git provides them and retained at file level otherwise.
+File-list checks print every remaining diagnostic; full-project checks save the
+report and print its absolute path.
+Jenkins runs a full-project check with path/module and symbol exclusions.
+Whole-project checks always return success; file-list checks can opt into
+`--strict`. Jenkins and pre-commit checks are advisory. The `[tool.pyrefly]`
+section in `pyproject.toml` defines the product roots, diagnostics, and native
+exclusions. `[tool.pyrefly-exclusions]` defines additional symbol exclusions
+for the wrapper.
+Pyrefly is pinned in `requirements-dev.txt`. Missing imports are reported except for
+PyTorch, generated bindings, and configured third-party libraries.
+
 New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
 `LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
 for integration tests and include `gpu` in `LABELS` for tests that need a GPU.
