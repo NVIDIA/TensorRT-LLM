@@ -19,8 +19,6 @@ TAG_SUMMARIES: dict[str, str] = {
     "feature": "one feature, or one configuration variant, on a target whose core is built",
     "integrate": "land work that did not integrate on its own, resolving its conflicts",
     "investigate": "find the root cause of a failing check; writes a diagnosis, never the target",
-    "tune": "make the target faster: as a kind, the performance campaign on the target as it "
-    "is when the task starts; as a tag, one measured speedup",
 }
 
 #: Tags another tag brings with it: a feature is work on the target.
@@ -39,7 +37,6 @@ _ASSEMBLE = render_template("tags/assemble.md.j2")
 _FEATURE = render_template("tags/feature.md.j2")
 _INTEGRATE = render_template("tags/integrate.md.j2")
 _INVESTIGATE = render_template("tags/investigate.md.j2")
-_TUNE = render_template("tags/tune.md.j2")
 
 #: Each tag's section of the dispatch.
 TAG_PROMPTS: dict[str, str] = {
@@ -49,7 +46,6 @@ TAG_PROMPTS: dict[str, str] = {
     "feature": _FEATURE,
     "integrate": _INTEGRATE,
     "investigate": _INVESTIGATE,
-    "tune": _TUNE,
 }
 
 

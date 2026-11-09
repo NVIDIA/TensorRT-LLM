@@ -331,9 +331,9 @@ accuracy:
 #                              # origin/main, else upstream/main, else main
 
 # ------------------------------------------------------------- performance
-# The tune campaign (tune/stage.py): with `enabled: true`, a `tune` task that starts once the
-# core's correctness checks hold (on a target onboarded elsewhere, `trtllm-modeling-v2 tune --task
-# task.yaml --workspace W`). Perf is never a release gate. A micro/module candidate is judged by
+# The tune campaign (tune/stage.py), run only by `trtllm-modeling-v2 tune --task task.yaml
+# --workspace W` on a delivered target, in a process of its own; the onboarding runs none of it
+# and `enabled: true` only has it say how to start once delivered. Perf is never a release gate. A micro/module candidate is judged by
 # its micro-bench, projected to e2e through `microbench.share`, with its outputs held roughly to
 # the control's; a win keeps at once. A checkpoint every few keeps measures e2e, the first output
 # token's distribution and the target's suite on the best tree, and a failure rolls those keeps
@@ -381,9 +381,9 @@ accuracy:
 #   env_script: <sourced by every perf job>   # default <workspace>/tune/env.sh
 #   wall: 2h                       # default; one perf job's wall limit
 #   model: /path/to/checkpoint     # default checkpoint_path (and `target`: the run's target)
-#   source_workspace: <onboarding workspace>   # a standalone tune beside an onboarding of the
-#                                  # same checkout imports the commits the core's verdicts there
-#                                  # validate; default the tune's own workspace
+#   source_workspace: <onboarding workspace>   # a tune in a workspace of its own imports the
+#                                  # commit the onboarding's verdicts there validate; default the
+#                                  # tune's own workspace
 #   campaign:                      # every value shown is the default but max_hours (none)
 #     enabled: true                # false: the baseline only
 #     min_gain: 0.01               # an e2e win = max(min_gain, noise_factor x spread)

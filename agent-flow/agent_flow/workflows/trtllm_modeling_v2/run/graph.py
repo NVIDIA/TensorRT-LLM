@@ -11,9 +11,7 @@ Scheduling means: among tasks whose dependencies are done, first any task
 that was running when the last process stopped, then required tasks on the
 critical path, then other required tasks, then ``nice_to_have``
 tasks only on devices no waiting required task could use; never two running
-tasks that declare the same file, and nothing beside an ``exclusive`` task;
-and no task of a gated kind (``tune``, until the core's correctness checks
-hold) at all.
+tasks that declare the same file, and nothing beside an ``exclusive`` task.
 
 A soft dependency (``depends_on_soft``) lets a task start once the task it
 names has started; it is held back only at its integration (:func:`ready`).
@@ -40,10 +38,6 @@ from .workspace.integration import INTEGRATED_KINDS
 
 #: A task whose work is only contract checks, run with no agent turn.
 CHECK_KIND = "check"
-#: Task kinds that run for hours beside the graph on idle capacity: a performance
-#: campaign. Its result is an artifact of the run, never a step another task builds
-#: on, and it gives way to every other task (:func:`touches_conflict`).
-BACKGROUND_KINDS = frozenset({"tune"})
 KINDS: tuple[str, ...] = (
     "survey",
     "kernel",
@@ -51,7 +45,6 @@ KINDS: tuple[str, ...] = (
     "feature",
     "integrate",
     "investigate",
-    "tune",
     CHECK_KIND,
 )
 #: What a worker's task can be tagged with: every kind an agent's turn serves. A
@@ -199,10 +192,9 @@ def touches_conflict(a: Task, b: Task) -> bool:
 
     Either is ``exclusive``, or both declare the very same file. Directories
     never conflict: each task commits on its own branch and is rebased onto the
-    checkout when it finishes. A background campaign works on its own branches
-    from the commit it pinned, so an ``exclusive`` task does not wait for it.
+    checkout when it finishes.
     """
-    if (a.exclusive or b.exclusive) and not {a.kind, b.kind} & BACKGROUND_KINDS:
+    if a.exclusive or b.exclusive:
         return True
     return bool(_files(a) & _files(b))
 
@@ -435,14 +427,11 @@ def validate(
     required_checks: Iterable[str] = (),
     allowed_paths: Sequence[str] = (),
     max_gpus: int | None = None,
-    required_kinds: Iterable[str] = (),
     known_checks: Iterable[str] | None = None,
 ) -> list[str]:
     """Every reason ``graph`` is not admissible, batched.
 
-    ``required_kinds`` are kinds the run's goals need a task of, such as
-    ``tune`` when the task asks for performance work. ``known_checks`` are the
-    contract's checks: a ``check`` task names only those, as it has nothing
+    ``known_checks`` are the contract's checks: a ``check`` task names only those, as it has nothing
     else to run, unless it is a regression check.
     """
     errors: list[str] = []
@@ -465,12 +454,6 @@ def validate(
         for dep in t.depends_on:
             if dep not in tasks:
                 errors.append(f"{where}: depends on unknown task {dep!r}")
-        for dep in [*t.depends_on, *t.depends_on_soft]:
-            if dep in tasks and tasks[dep].kind in BACKGROUND_KINDS:
-                errors.append(
-                    f"{where}: depends on {dep!r}, a `{tasks[dep].kind}` task; its result is "
-                    "an artifact of the run that no task builds on or integrates"
-                )
         errors += [f"{where}: {e}" for e in _soft_errors(t, tasks)]
         errors += [f"{where}: {e}" for e in _gating_errors(t, tasks)]
         if t.kind == CHECK_KIND:
@@ -495,10 +478,6 @@ def validate(
     for check in required_checks:
         if check not in claimed:
             errors.append(f"required check {check!r} is in no task's `satisfies`")
-    kinds = {t.kind for t in graph.tasks if t.status != "abandoned"}
-    for kind in required_kinds:
-        if kind not in kinds:
-            errors.append(f"the task asks for `{kind}` work and the graph has no `{kind}` task")
     return errors
 
 
@@ -657,7 +636,6 @@ def _id_order(tid: str) -> tuple[str | int, ...]:
 def next_to_start(
     graph: Graph,
     free_gpus: int,
-    gated_kinds: Iterable[str] = (),
     resumed: Iterable[str] = (),
     held: Callable[[Task], int] | None = None,
     held_back: Iterable[str] = (),
@@ -677,18 +655,15 @@ def next_to_start(
     first; one that cannot start yet keeps its claim: nothing that conflicts
     with it starts before it does.
 
-    Then required tasks, a background campaign after the rest, longest
-    critical path first, a task's minutes waiting ready (``waited``) counting
+    Then required tasks, longest critical path first, a task's minutes waiting ready (``waited``) counting
     as path so a short one is not passed over for ever; on equal paths, in
     the order the ids number them (:func:`_id_order`). The caller starts only
     as many as it has slots, so this order decides which run. A
     ``nice_to_have`` task starts only while no ready required task is waiting
     for devices. No two running or starting tasks may conflict
-    (:func:`touches_conflict`), and no task of a kind in ``gated_kinds``
-    starts. An ``exclusive`` task that must wait for others to finish holds
+    (:func:`touches_conflict`). An ``exclusive`` task that must wait for others to finish holds
     back every task ranked after it, or the run would never empty for it.
     """
-    gated = set(gated_kinds)
     first = set(resumed)
     waiting = set(held_back)
     if _cycle(graph.by_id()):
@@ -701,7 +676,6 @@ def next_to_start(
         key=lambda t: (
             t.id not in first,
             t.priority != "required",
-            t.kind in BACKGROUND_KINDS,
             -(path.get(t.id, 0) + aged.get(t.id, 0.0)),
             _id_order(t.id),
         ),
@@ -711,7 +685,7 @@ def next_to_start(
     claimed: list[Task] = []
     waiting_required = False
     for task in candidates:
-        if task.kind in gated or task.id in waiting:
+        if task.id in waiting:
             continue
         if task.priority != "required" and waiting_required:
             continue
@@ -838,7 +812,6 @@ def stalled(revisions_since_progress: int, cap: int) -> bool:
 
 
 __all__ = [
-    "BACKGROUND_KINDS",
     "CHECK_KIND",
     "GRAPH_FILENAME",
     "Graph",

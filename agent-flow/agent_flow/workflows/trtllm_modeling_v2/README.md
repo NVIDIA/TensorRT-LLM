@@ -57,7 +57,7 @@ Validation:
 - Fully validate <features/configurations>; limit <others> to <aggregated text-only / smoke>.
 - Accuracy reference: <benchmark and reference/config>. Report unsupported or unverified cases.
 
-Tuning (optional):
+Tuning (optional, after delivery with `trtllm-modeling-v2 tune`):
 - Optimize <configurations> for low latency at concurrency <list>.
 - Optimize <configurations> for high throughput at concurrency <list>.
 - Budget: <time/resource limit>. Preserve correctness and report baseline versus final results.
@@ -129,19 +129,17 @@ must change before that.
 4. **Resume:** checkpoints, decision identities and task receipts recover completed work without
    adopting another attempt's answer. Compute sessions own resource allocation and safe cancellation;
    you or the launching agent handle cluster allocations and session renewal.
-5. **Tune optionally:** background work for the performance the onboarding's workers leave; it
-   never holds the onboarding back (its jobs queue below the onboarding's, it reserves none of the
-   run's devices, it takes at most two agent slots while onboarding work is open, and no onboarding
-   verdict waits for it). It starts once the core's required checks pass, or on its own
-   (`trtllm-modeling-v2 tune`): one baseline, parallel candidates kept one at a time, a checkpoint
-   every few keeps that rolls them back on a loss, and the accuracy benchmark once on the final
-   tree. Results stay on a separate best branch with `tune/summary.md`; nothing merges into
-   delivery, and the outcome is `state.tune["verdict"]`. A deferral waiting can fix (a job to
-   finish, a session to come back) is waited out in process; a campaign still deferred before
-   delivery resumes on the next ordinary invocation. Config or judgment-policy changes isolate
-   stale evidence (a changed perf config's baseline alone is measured again, and the roadmap
-   stays without its step shares); validated source changes invalidate profile shares and
-   revalidate the kept stack.
+5. **Tune optionally, after delivery:** the onboarding ends at delivery and runs no performance
+   work beside it. `trtllm-modeling-v2 tune` is a process of its own on the delivered target (the
+   same workspace, or one of its own that names the onboarding's as `perf.source_workspace`):
+   one baseline, parallel candidates kept one at a time, a checkpoint every few keeps that rolls
+   them back on a loss, and the accuracy benchmark once on the final tree. Results stay on a
+   separate best branch with `tune/summary.md`; nothing merges into delivery, and the outcome is
+   `state.tune["verdict"]`. A deferral waiting can fix (a job to finish, a session to come back)
+   is waited out in process; an unfinished campaign resumes when the same command runs again.
+   Config or judgment-policy changes isolate stale evidence (a changed perf config's baseline
+   alone is measured again, and the roadmap stays without its step shares); validated source
+   changes invalidate profile shares and revalidate the kept stack.
    Micro checks require comparable finite outputs, with exact discrete results. Final performance
    validation uses a same-host control; cross-host summary deltas are descriptive.
    `tune/stage.py` and `tune/campaign.py` describe the policy.

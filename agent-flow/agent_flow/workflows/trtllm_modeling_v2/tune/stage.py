@@ -2,13 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """The tune campaign: one baseline -> modeling campaign -> wrap-up.
 
-It starts once the core's required checks hold (the target serves), so nothing is measured
-before the baseline (no smoke, no stock reference) and the baseline once (no repeats). It is
-background work and never holds the onboarding back: an onboarding that ends while it runs does
-not wait for it, and it goes on past the run's close as the tune stage. Runs as the execution
-stage's ``tune`` task, pinned to the commit the target is at when it starts (:func:`run_tune_task`),
-as ``trtllm-modeling-v2 tune`` (:func:`run_tune_phase`), or, unfinished at the close, from its
-checkpoint in a later process (:func:`resume_campaign`). Every phase
+It runs only as ``trtllm-modeling-v2 tune`` (:func:`run_tune_phase`), in a process of its own,
+on a target whose core's required checks hold (the commit the onboarding delivered, or the one
+its workspace's verdicts establish): nothing is measured before the baseline (no smoke, no stock
+reference) and the baseline once (no repeats). No onboarding runs beside it, and an unfinished
+campaign resumes from its checkpoint when the same command runs again. Every phase
 checkpoints into ``state.tune`` and is idempotent on resume: a label measured at the same
 workload, configs and commit is never re-measured, a turn whose answer is on disk (SOL, roadmap,
 candidate, rebase) never re-dispatched. Once ``perf.campaign.max_hours`` (counted from the task's
@@ -29,7 +27,6 @@ from typing import Any, Callable, Mapping, Sequence
 
 import yaml
 
-from ..agents.slots import Priority, turn_priority
 from ..infra.git import git_checked
 from ..operators.coverage import CATALOG_TESTS_DIR, MODELING_V2_PACKAGE
 from . import sol as sol_mod
@@ -1558,9 +1555,7 @@ def _stage_for(
     spec.base_commit = base_commit
 
     def dispatch(role: str, what: str, prompt: str) -> str:
-        # A campaign's turns use only the agent slots the feature work leaves idle.
-        with turn_priority(Priority.BACKGROUND):
-            return wf._run_turn(role, what, prompt, unit="tune")
+        return wf._run_turn(role, what, prompt, unit="tune")
 
     source = spec.source_workspace or Path(wf.workspace)
     if spec.source_workspace is not None and not _is_workspace(source):
@@ -1623,57 +1618,3 @@ def run_tune_phase(wf: Any, state: Any, log: Any) -> str | None:
     """``trtllm-modeling-v2 tune``: tune the target the task names, as the checkout has it."""
     stage = _stage_for(wf, state)
     return stage if isinstance(stage, str) else stage.run()
-
-
-def run_tune_task(
-    wf: Any,
-    state: Any,
-    base_commit: str,
-    attempt: int = 1,
-) -> tuple[str, str]:
-    """The execution stage's ``tune`` task: the campaign on ``base_commit``.
-
-    Returns the task's decision (``TUNED`` when the campaign wrapped up) and one line for the
-    planner: the best tree and what was kept, or what failed. A resumed run keeps its first pin.
-    """
-    base = str(state.tune.setdefault("base_commit", base_commit))
-    # A campaign the onboarding closes beside resumes as this attempt (:func:`resume_campaign`).
-    state.tune["attempt"] = attempt
-    stage = _stage_for(wf, state, base, attempt)
-    verdict = stage if isinstance(stage, str) else stage.run()
-    if verdict is None:
-        return "TUNE_PENDING", str(
-            state.tune.get("deferred") or "campaign incomplete; resume from checkpoint"
-        )
-    if verdict != "tuned":
-        return f"TUNE_FAILED ({verdict})", str(state.tune.get("failure") or "")
-    t = state.tune
-    ended = stage._end_text()
-    line = (
-        f"tuned from {base[:10]}: best branch `{stage.branch_prefix}/best` at "
-        f"{str(t.get('best_commit', ''))[:10]}, kept {t.get('kept', [])}, goal "
-        f"{'reached' if t.get('goal_reached') else 'not reached'}"
-        + (f"; {ended}" if ended else "")
-        + f"; summary `{stage.spec.workdir / 'summary.md'}`"
-    )
-    return "TUNED", line
-
-
-def resume_campaign(wf: Any, state: Any) -> str | None:
-    """A campaign the onboarding closed beside, from its checkpoint; the tune stage's verdict.
-
-    On its first pin, as its last attempt, whose queued jobs it adopts. ``None``: unfinished.
-    """
-    stage = _stage_for(
-        wf, state, str(state.tune.get("base_commit") or ""), int(state.tune.get("attempt") or 1)
-    )
-    return stage if isinstance(stage, str) else stage.run()
-
-
-def campaign_verdict(decision: str) -> str | None:
-    """The tune stage's verdict from a ``tune`` task's decision; ``None`` when it did not end."""
-    first = decision.partition("\n")[0].strip()
-    if first == "TUNED":
-        return "tuned"
-    failed = first.removeprefix("TUNE_FAILED (").removesuffix(")")
-    return failed if failed != first and failed.startswith("tune-failed") else None

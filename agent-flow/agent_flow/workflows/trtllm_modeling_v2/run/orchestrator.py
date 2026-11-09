@@ -68,15 +68,10 @@ EVENTS_FILENAME = "planner_events.json"
 #: How many tasks run at once, and how many checks, unless the caller says otherwise.
 DEFAULT_MAX_PARALLEL_TASKS = 9
 DEFAULT_MAX_PARALLEL_CHECKS = 8
-#: Task kinds that run for hours beside the graph: while only they run, the loop
-#: reads the graph as idle, and no verdict of the onboarding waits for them.
-BACKGROUND_KINDS = graph_mod.BACKGROUND_KINDS
 #: How many times a task the run's infrastructure failed starts again on its own.
 INFRA_RETRIES = 1
 #: A state write that fails with one of these waits for room instead of ending the run.
 STORAGE_FULL = frozenset({errno.EDQUOT, errno.ENOSPC})
-#: Agent slots a campaign's turns may take at once while the onboarding has work open.
-CAMPAIGN_SLOTS_BESIDE_ONBOARDING = 2
 #: How long a task thread waiting on its soft dependencies sleeps between looks,
 #: past the wake-up each recorded outcome gives it.
 SOFT_POLL_S = 5.0
@@ -191,25 +186,18 @@ class Services:
 
 #: What a ``check`` task ends with once its checks are in; no worker writes it.
 CHECKED = "CHECKED"
-#: What a ``tune`` task ends with once its campaign wrapped up (``tune/stage.py``).
-TUNED = "TUNED"
 #: Decisions that mean the task did what it was asked: the roles' that finish
-#: a task in the decision table (``agents/decisions.py``), and the two the run
+#: a task in the decision table (``agents/decisions.py``), and the one the run
 #: writes itself.
-FINISHED = decision_table.finishing() | {TUNED, CHECKED}
+FINISHED = decision_table.finishing() | {CHECKED}
 
 
 def _not_the_task(decision: str) -> bool:
     """A decision that says the run's infrastructure failed, not the task's work.
 
-    The worker's turn raised, its finished branch could not be integrated, or
-    a tune campaign could not measure its baseline.
+    The worker's turn raised, or its finished branch could not be integrated.
     """
-    return (
-        decision.startswith("raised ")
-        or decision == "INTEGRATION_FAILED"
-        or (decision.startswith("TUNE_FAILED") and "tune-failed:baseline" in decision)
-    )
+    return decision.startswith("raised ") or decision == "INTEGRATION_FAILED"
 
 
 class ChecksRaised(Exception):
@@ -260,8 +248,6 @@ class GraphOrchestrator:
         event_window_s: float = 0.0,
         allowed_paths: Iterable[str] = (),
         max_gpus: int | None = None,
-        required_kinds: Iterable[str] = (),
-        start_after: Mapping[str, Sequence[str]] | None = None,
         after_core: tuple[Iterable[str], Iterable[str]] = ((), ()),
         own_paths: Iterable[str] = (),
         repo_root: str | Path = "",
@@ -293,9 +279,6 @@ class GraphOrchestrator:
                 "[resume] the tasks running when the last process stopped start again: "
                 + ", ".join(t.id for t in restarted)
             )
-        #: Per kind, the checks that must have passed before a task of that
-        #: kind may start.
-        self.start_after = {k: tuple(v) for k, v in (start_after or {}).items()}
         #: The feature units and variants (their ``ref``), and the core's boot checks: a
         #: worker's task on one of them starts once any of those checks has passed.
         refs, boots = after_core
@@ -322,7 +305,6 @@ class GraphOrchestrator:
             "required_checks": [c.key for c in contract.required()],
             "allowed_paths": tuple(allowed_paths),
             "max_gpus": max_gpus,
-            "required_kinds": tuple(required_kinds),
             "own_paths": tuple(own_paths),
             "known_checks": [c.key for c in contract.checks],
         }
@@ -335,7 +317,7 @@ class GraphOrchestrator:
             saved = json.loads(self.events_path.read_text(encoding="utf-8") or "{}")
         self.events = [Event(str(e)) for e in saved.get("events") or ()]
         #: A worker reported something the planner has not read yet. The run is
-        #: not delivered past it: a tune task's best branch may still need merging.
+        #: not delivered past it.
         self.unread_reports = bool(saved.get("unread_reports"))
         #: Per task, how many times it started again after the infrastructure failed it.
         self.retries: dict[str, int] = {
@@ -380,11 +362,6 @@ class GraphOrchestrator:
         self._files_said: tuple[str, tuple[str, ...]] | None = None
         #: The task threads in flight, by task id, as the loop drives them.
         self._running: dict[str, Future] = {}
-        #: The campaign whose end the loop had not recorded when :meth:`run` returned the
-        #: onboarding's verdict: not waited for, the tune stage reads its end.
-        self.campaign: Future | None = None
-        #: Background campaigns without a measurement verdict resume in the next process.
-        self._deferred_campaigns: set[str] = set()
         #: Tasks whose work finished but some of whose checks raised: why, until recorded.
         self._inconclusive: dict[str, str] = {}
         #: Planner turns that raised in a row, and when the planner may be asked again.
@@ -395,13 +372,11 @@ class GraphOrchestrator:
         #: Running tasks whose thread needs no agent now: waiting on soft dependencies
         #: or running its checks. They take no task slot and hold no devices meanwhile.
         self._agentless: set[str] = set()
-        #: Per ready task of a gated kind, the checks it was last journaled as waiting for.
-        self._gated_said: dict[str, tuple[str, ...]] = {}
         #: Tasks whose commits were integrated on the target, and the attempt that did:
         #: a soft dependency is met then, without waiting for its checks.
         self._integrated: dict[str, int] = {}
-        #: The foreground work that wants an agent now (ready or running required tasks
-        #: that are not campaigns), as the loop last counted it.
+        #: The work that wants an agent now (ready or running required tasks), as the
+        #: loop last counted it.
         self._foreground_demand = 0
         #: When each ready task was first seen ready, for the order they start in.
         self._ready_since: dict[str, float] = {}
@@ -593,41 +568,23 @@ class GraphOrchestrator:
     def _priority_of(self, task: graph_mod.Task) -> Priority:
         """The priority ``task``'s turns take agent slots at (``slots.Priority``).
 
-        A campaign's are background; a required task on the longest open
-        critical path is critical; other required tasks are required, and a
-        ``nice_to_have`` one is side work.
+        A required task on the longest open critical path is critical; other
+        required tasks are required, and a ``nice_to_have`` one is side work.
         """
-        if task.kind in BACKGROUND_KINDS:
-            return Priority.BACKGROUND
         if task.priority != "required":
             return Priority.SIDE
         path = graph_mod.critical_path_minutes(self.graph)
         open_paths = [
             path.get(t.id, 0)
             for t in self.graph.tasks
-            if t.status in ("pending", "running")
-            and t.priority == "required"
-            and t.kind not in BACKGROUND_KINDS
+            if t.status in ("pending", "running") and t.priority == "required"
         ]
         longest = max(open_paths, default=0)
         return Priority.CRITICAL if path.get(task.id, 0) >= longest else Priority.REQUIRED
 
     def idle_agent_slots(self) -> int:
-        """Agent slots the open foreground work leaves idle: what a side turn may use."""
+        """Agent slots the open required work leaves idle: what a side turn may use."""
         return max(0, AgentGate(self.max_parallel).task_slots - self._foreground_demand)
-
-    def campaign_agent_slots(self) -> int:
-        """Agent slots a campaign's turns may take now.
-
-        The idle ones; while the onboarding has a task open, at most
-        :data:`CAMPAIGN_SLOTS_BESIDE_ONBOARDING` of them.
-        """
-        idle = self.idle_agent_slots()
-        onboarding = any(
-            t.status in ("pending", "running") and t.kind not in BACKGROUND_KINDS
-            for t in self.graph.tasks
-        )
-        return min(idle, CAMPAIGN_SLOTS_BESIDE_ONBOARDING) if onboarding else idle
 
     def agentless(self, task_id: str) -> bool:
         """Whether running ``task_id`` needs no agent and no device now (waiting or checking)."""
@@ -663,7 +620,7 @@ class GraphOrchestrator:
             evaluation,
             files=missing,
             unreviewed=self._unreviewed_landings(),
-            required_open=self._required_open(campaign=False),
+            required_open=self._required_open(),
             unread_reports=self.unread_reports,
         )
         said = (marker, tuple(missing))
@@ -721,39 +678,6 @@ class GraphOrchestrator:
             f"{', '.join(failed)} failed"
         )
 
-    def _gated(self) -> dict[str, list[str]]:
-        """Per gated kind, the checks it is still waiting for.
-
-        A check lets a gated task start once its latest verdict passed, on
-        whatever state of the target it measured: a ``tune`` task measures the
-        commit it pins when it starts, so an integration that leaves the pass
-        stale does not hold it back again. A later failure does.
-        """
-        if not self.start_after:
-            return {}
-        with self._status_lock:
-            latest = self.status.latest()
-        passed = {key for key, verdict in latest.items() if verdict.passed}
-        waiting = {
-            kind: [k for k in keys if k not in passed] for kind, keys in self.start_after.items()
-        }
-        return {kind: keys for kind, keys in waiting.items() if keys}
-
-    def _say_gated(self, gated: Mapping[str, Sequence[str]], ready: set[str]) -> None:
-        """Journal, as it changes, what each ready task of a gated kind still waits for.
-
-        While the onboarding's work runs, the note that names a blocked task's
-        checks (once nothing else does) never comes: this one says it meanwhile.
-        """
-        kinds = {t.id: t.kind for t in self.graph.tasks}
-        waiting = {
-            tid: tuple(gated[kinds[tid]]) for tid in sorted(ready) if kinds.get(tid) in gated
-        }
-        for tid, keys in waiting.items():
-            if self._gated_said.get(tid) != keys:
-                self.s.log(f"[gated] {tid} ({kinds[tid]}) waits for {', '.join(keys)} to pass")
-        self._gated_said = waiting
-
     def _waiting_for_core(self) -> set[str]:
         """The pending feature-unit and variant tasks that build on the core and wait for it to boot.
 
@@ -782,44 +706,12 @@ class GraphOrchestrator:
             and graph_mod.builds_on(tasks, t.id, core)
         }
 
-    def _required_open(self, *, campaign: bool = True) -> bool:
-        """Whether a required task is pending or running.
-
-        With ``campaign=False`` a campaign, and a task that waits for one
-        (:meth:`_waiting_on_campaign`), does not count.
-        """
-        beside = set() if campaign else self._waiting_on_campaign()
+    def _required_open(self) -> bool:
+        """Whether a required task is pending or running."""
         return any(
-            t.priority == "required" and t.status in ("pending", "running") and t.id not in beside
+            t.priority == "required" and t.status in ("pending", "running")
             for t in self.graph.tasks
         )
-
-    def _waiting_on_campaign(self) -> set[str]:
-        """The open campaigns (:data:`BACKGROUND_KINDS`) and the open tasks that depend on one.
-
-        Directly or through other open tasks: such a task cannot start before
-        the campaign ends, which is hours away.
-        """
-        tasks = self.graph.by_id()
-        waits: dict[str, bool] = {}
-
-        def waiting(task_id: str) -> bool:
-            if task_id not in waits:
-                waits[task_id] = False  # validated acyclic; a cycle that slipped in ends here
-                task = tasks.get(task_id)
-                waits[task_id] = (
-                    task is not None
-                    and task.status in ("pending", "running")
-                    and (task.kind in BACKGROUND_KINDS or any(map(waiting, task.depends_on)))
-                )
-            return waits[task_id]
-
-        return {task_id for task_id in tasks if waiting(task_id)}
-
-    def _foreground(self, running: Mapping[str, Future]) -> list[str]:
-        """The running tasks that are not campaigns, which run for hours beside the graph."""
-        kinds = {t.id: t.kind for t in self.graph.tasks}
-        return [task_id for task_id in running if kinds.get(task_id) not in BACKGROUND_KINDS]
 
     def _settle(self) -> None:
         """Re-certify the final tree: once no required task is open, each claimed check stale on it.
@@ -827,7 +719,7 @@ class GraphOrchestrator:
         While required work is open nothing runs here: a task's claimed checks
         run as it lands (:meth:`_run_task`), and the planner adds a ``check``
         task for whatever a change may have broken. Once no required task is
-        open but a campaign (it changes nothing a check measures), every
+        open, every
         required check a done task claims and with no verdict on the target as
         it is runs again; then, once every other required check holds, the
         delivery tier runs on the target as it is. A check that failed on this
@@ -836,7 +728,7 @@ class GraphOrchestrator:
         :meth:`_settled` reads the verdicts once they are all in, and tells the
         planner what failed.
         """
-        if self._required_open(campaign=False):
+        if self._required_open():
             return
         claimed = {k for t in self.graph.tasks if t.status == "done" for k in t.satisfies}
         delivery = self._delivery_keys()
@@ -1095,15 +987,6 @@ class GraphOrchestrator:
     def _finish(self, task: graph_mod.Task, decision: str, failed: list[str]) -> None:
         decision, _, note = decision.partition("\n")
         note = note.strip()
-        if task.kind == "tune" and decision == "TUNE_PENDING":
-            task.status = "pending"
-            self._deferred_campaigns.add(task.id)
-            self.s.log(
-                f"[tune] {task.id}: {note or 'measurement unavailable'}; resume from checkpoint"
-            )
-            self._save_graph()
-            self._persist("state", self.s.checkpoint)
-            return
         blocks_work = task.priority != "nice_to_have" and any(
             task.id in other.depends_on and other.status == "pending" for other in self.graph.tasks
         )
@@ -1136,12 +1019,7 @@ class GraphOrchestrator:
             if ended == "failed" and task.priority == "nice_to_have":
                 ended = "abandoned"
             outcome = _Outcome(task.id, task.attempts, ended)
-            if note and task.kind in BACKGROUND_KINDS:
-                # A campaign's report names its best branch, an artifact of the run that
-                # no task acts on: journaled and read by the next turn, waiting for none.
-                self.s.log(f"[{task.kind}] {task.id} reports: {note}")
-                self._note(f"task {task.id} ({task.kind}) reports: {note}", quiet=True)
-            elif note:
+            if note:
                 # A run that did not finish reports part of how it ended (what became
                 # of a failed receipt's commits): a revision that re-planned the task
                 # past the run answers both. A finished run's report may still need
@@ -1319,7 +1197,7 @@ class GraphOrchestrator:
         a landing now would make every check stale again. They wait for a
         planner turn to require them or for the run to end.
         """
-        if self._required_open(campaign=False):
+        if self._required_open():
             return set()
         return {
             t.id
@@ -1679,10 +1557,6 @@ class GraphOrchestrator:
         then returns at once, and the turns and checks in flight are left to
         end on their own. The loop's own failure, or Ctrl-C, records what
         finished and raises at once, the same way; a resumed run starts them again.
-
-        A verdict never waits for a campaign: the onboarding's own work in flight
-        is waited for, and a campaign still running is left running, as
-        :attr:`campaign`, for the tune stage to wait for.
         """
         checks = ThreadPoolExecutor(
             max_workers=self.max_parallel_checks, thread_name_prefix="mv2-check"
@@ -1709,25 +1583,12 @@ class GraphOrchestrator:
                     self._ended.notify_all()
                 stopped = crashed or self._stop.done()
                 planner.shutdown(wait=not stopped, cancel_futures=stopped)
-                self.campaign = None if stopped else self._unrecorded_campaign()
-                if self.campaign is not None:
-                    wait([f for f in self._running.values() if f is not self.campaign])
-                tasks.shutdown(wait=not stopped and self.campaign is None, cancel_futures=stopped)
+                tasks.shutdown(wait=not stopped, cancel_futures=stopped)
         finally:
             # After the tasks: a task still running submits its checks here.
             stopped = crashed or self._stop.done()
             checks.shutdown(wait=not stopped, cancel_futures=stopped)
             self._check_pool = None
-
-    def _unrecorded_campaign(self) -> Future | None:
-        """The thread of a campaign (:data:`BACKGROUND_KINDS`) whose end the loop has not recorded.
-
-        Still running, or ended as the verdict came: either way the tune stage reads its end.
-        """
-        kinds = {t.id: t.kind for t in self.graph.tasks}
-        return next(
-            (f for tid, f in self._running.items() if kinds.get(tid) in BACKGROUND_KINDS), None
-        )
 
     def _record_finished(self) -> None:
         """Record the tasks whose thread already ended, as the loop would have: their work stands."""
@@ -1779,36 +1640,26 @@ class GraphOrchestrator:
                 self._wait(running, self.poll_s)
                 continue
             free = self.s.free_gpus()
-            gated = self._gated()
             # A task takes a slot only while its thread needs an agent: a check
             # task never does, nor one waiting on its soft dependencies or running
-            # its checks, nor a campaign, whose turns use only idle slots.
+            # its checks.
             kinds = {t.id: t.kind for t in self.graph.tasks}
             workers = sum(
                 1
                 for tid in running
-                if kinds.get(tid) != graph_mod.CHECK_KIND
-                and kinds.get(tid) not in BACKGROUND_KINDS
-                and tid not in self._agentless
+                if kinds.get(tid) != graph_mod.CHECK_KIND and tid not in self._agentless
             )
             # One agent slot stays free for the planner (agents/slots.py).
             slots = max(AgentGate(self.max_parallel).task_slots - workers, 0)
             self._resumed &= {t.id for t in self.graph.tasks if t.status == "pending"}
             self._follow_shared_changes()
-            waiting = (
-                self._regression_step()
-                | self._closing_holds()
-                | self._waiting_for_core()
-                | self._deferred_campaigns
-            )
+            waiting = self._regression_step() | self._closing_holds() | self._waiting_for_core()
             ready_now = {t.id for t in graph_mod.ready(self.graph, self._receipts_landed)}
-            self._say_gated(gated, ready_now)
             now = time.monotonic()
             self._ready_since = {tid: self._ready_since.get(tid, now) for tid in ready_now}
             chosen = graph_mod.next_to_start(
                 self.graph,
                 free,
-                gated,
                 resumed=self._resumed | self._waited_for(),
                 held=self._held,
                 held_back=waiting,
@@ -1830,30 +1681,22 @@ class GraphOrchestrator:
                 self._save_graph()
             self._foreground_demand = (
                 workers
-                + len(
-                    [t for t in started if t.kind not in BACKGROUND_KINDS | {graph_mod.CHECK_KIND}]
-                )
+                + len([t for t in started if t.kind != graph_mod.CHECK_KIND])
                 + len(
                     [
                         t
                         for t in graph_mod.ready(self.graph, self._receipts_landed)
-                        if t.priority == "required"
-                        and t.kind not in BACKGROUND_KINDS | {graph_mod.CHECK_KIND}
+                        if t.priority == "required" and t.kind != graph_mod.CHECK_KIND
                     ]
                 )
             )
             # Once no required task is open, the final tree is re-certified.
             if self._settling is None:
                 self._settle()
-            # Nothing in flight but a campaign is nothing in flight: the onboarding
-            # decides, delivers and escalates without waiting for one, which goes on
-            # past it as the tune stage (:attr:`campaign`).
-            spent = (
-                not self._foreground(running) and self._settling is None and self._planner is None
-            )
+            spent = not running and self._settling is None and self._planner is None
             if spent:
                 marker, evaluation = self._evaluated()
-                holds = evaluation.holds and not self._required_open(campaign=False)
+                holds = evaluation.holds and not self._required_open()
                 completion = self._completion(marker, evaluation)
                 self._correctness(marker, evaluation, completion)
                 unreviewed, gaps = completion.unreviewed, completion.gaps
@@ -1888,13 +1731,10 @@ class GraphOrchestrator:
                 self._done_said = False
                 blocked = graph_mod.ready(self.graph, self._receipts_landed)
                 if blocked and not self._escalated:
-                    # Ready work that cannot start with nothing running never will
-                    # (a campaign holds none of the run's devices).
+                    # Ready work that cannot start with nothing running never will.
                     before_core = self._waiting_for_core()
                     reasons = ", ".join(
-                        f"{t.id} (waits for {', '.join(gated[t.kind])})"
-                        if t.kind in gated
-                        else f"{t.id} (waits for a core boot to pass)"
+                        f"{t.id} (waits for a core boot to pass)"
                         if t.id in before_core
                         else f"{t.id} ({self._held(t)} GPUs)"
                         for t in blocked
@@ -1906,18 +1746,17 @@ class GraphOrchestrator:
                 self._save_events()
             if self._planner is None:
                 if self._escalated and spent and not self._loud():
-                    # Nothing runs but a campaign, and nothing came in since: only the
-                    # operator can move it.
+                    # Nothing runs, and nothing came in since: only the operator can move it.
                     return "escalated"
                 if self._loud() and self._first_event_at is None:
                     self._first_event_at = time.monotonic()
-                # With nothing in flight but a campaign the graph is spent or stuck: the
-                # planner decides what comes next. Otherwise it reads events as they
+                # With nothing in flight the graph is spent or stuck: the planner decides
+                # what comes next. Otherwise it reads events as they
                 # come due.
                 retry_due = time.monotonic() >= self._planner_retry_at
                 if retry_due and (spent or self._events_due()):
-                    # A stall is judged only once no task but a campaign runs: while
-                    # work is in flight its outcome may still be the progress.
+                    # A stall is judged only once no task runs: while work is in flight
+                    # its outcome may still be the progress.
                     if spent and graph_mod.stalled(
                         self.revisions_since_progress, self.revision_cap
                     ):
