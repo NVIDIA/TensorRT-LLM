@@ -134,6 +134,33 @@ For each file under `tests/` in the diff:
    `unittest/api_stability/references/llmapi.yaml` lifts to
    `unittest/api_stability/`.
 
+### Shared perf model paths
+
+When `_model_paths.py` changes only literal entries of `MODEL_PATH_DICT`,
+`perf_model_paths.py` reconstructs and verifies the pre-image from the raw
+patch and computes the added, removed, and modified keys. Other module
+statements must remain AST-equivalent. Direct import discovery must be
+complete and restricted to the known perf consumers, whose table usages
+must be model-name membership checks or lookups (including the historical
+sanity-side dictionary copy with literal overrides).
+
+Explicit `test_perf` parameters identify the model directly. For
+`test_perf_sanity::test_e2e`, the adapter reads the default aggregated or
+disaggregated config YAML and includes all its `model_name` fields, including
+server and client overrides. Server selection is deliberately over-included.
+Only cases with resolved model names disjoint from the changed keys are
+removed. Missing, malformed, dynamic, or unfamiliar configs, runtime config
+directory overrides, changed default config locations, coarse test targets,
+and unsupported table usages retain the affected consumer's cases. Unknown
+importers, module edits beyond the table, or an unverifiable patch restore
+the existing helper-selection fallback.
+
+Selected parameterized cases remain exact filters through YAML rendering
+and stage test counts; file-level contributions from other changed files
+still combine by union. This refinement does not change multi-GPU scheduling
+or approval gates. Recipe matching and model-specific branches in
+`test_perf.py` are outside this adapter's scope.
+
 ### Deletion-only diffs
 
 Deleted lines have no post-image position. `iter_diff_post_line_numbers`
@@ -166,7 +193,7 @@ later pre-image number.
 ### accuracy/references/*.yaml
 
 Top-level keys name what a section is a reference for, and resolve to
-anchors under `accuracy/test_*.py` so the lineage walk matches every
+anchors under `accuracy/` (including nested test directories) so the lineage walk matches every
 parametrization:
 
 - HF model name (15 of the 16 files) → test classes carrying that
@@ -175,7 +202,14 @@ parametrization:
   `accuracy/test_*.py::TestLlama3_1_8BInstruct` rather than the whole
   `accuracy/` subtree.
 - `TestC::test_m` id (`acceptance_length.yaml` only) → that method in
-  every module defining `TestC`.
+  every module defining it on `TestC`. An unverified suffix keeps the
+  class, covering inherited tests, and includes namespace consumers.
+- Other acceptance keys, such as `ModelingV2Target::mtp3`, select every
+  test class containing a reference literal with the same namespace
+  (`ModelingV2Target::`). This also covers variants constructed with string
+  suffixes or f-strings. A namespace in a module-level constant or helper
+  selects the test file. Variant names do not name pytest methods;
+  unresolved keys retain the directory fallback.
 
 Resolving to *no* anchor is a zero-impact claim, not a failure, when the
 changed keys are also absent from the post-PR YAML: that is the shape of
