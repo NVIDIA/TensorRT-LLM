@@ -39,7 +39,7 @@ requests a rank holds), and prints the contract's checks per unit and variant, t
 constraints for this geometry and the prior art the tree already holds. What only costs time is
 the launching agent's judgement, following INTAKE.md. The spec should be
 the smallest contract that covers the request. Launch only once the lint is clean or its findings
-are accepted in `notes`. Preflight's substrate gate boots a GPU beside the run's first turns; its
+are accepted in `notes`. Preflight's substrate gate (a probe launched as the widest gate launches, no model loaded) runs beside the run's first turns; its
 failure stops the run, which the same command resumes once the host is fixed.
 
 **Example prompt** — replace placeholders and omit requirements you do not need.

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 import time
@@ -81,7 +82,11 @@ def test_the_substrate_gate_runs_beside_the_first_turns_and_its_failure_leaves_t
             booted.append(command)
             # The gate answers only once the first turn is under way: it does not hold it back.
             planner_called.wait(10)
-            return CommandResult(returncode=1, stdout="MPI_ERR_SPAWN: could not spawn processes")
+            said = {
+                "facts": {},
+                "problems": ["MPI: the leader sees a world of 1, the launch made 4"],
+            }
+            return CommandResult(returncode=1, stdout=f"MV2FLOW_SUBSTRATE {json.dumps(said)}")
         return passing_shell()(command, env, timeout)
 
     workspace = (tmp_path / "ws").resolve()

@@ -291,6 +291,9 @@ def passing_shell(score: float = 90.0, accepted: int = 320, iterations: int = 10
         # which prints one record per prompt; the acceptance gate wants 32 of them.
         if "engine_driver.py" in command:
             return CommandResult(returncode=0, stdout=driver_records(accepted, iterations))
+        if _substrate_boot(command):
+            report = {"facts": {"devices": 4}, "problems": []}
+            return CommandResult(returncode=0, stdout=f"MV2FLOW_SUBSTRATE {json.dumps(report)}\n")
         return CommandResult(
             returncode=0,
             stdout=(
@@ -407,4 +410,5 @@ def _state(tmp_path):
 
 
 def _substrate_boot(command: str) -> bool:
-    return "TRTLLM_MODELING_V2=off" in command and "engine_driver" in command
+    """Whether ``command`` is the substrate gate's probe (``checks/harness/env_probe.py``)."""
+    return "env_probe.py" in command

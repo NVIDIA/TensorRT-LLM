@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import subprocess
 import sys
 import warnings
@@ -15,7 +16,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_flow.workflows.trtllm_modeling_v2.checks.verdict import GateResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import tree_anchors
 from agent_flow.workflows.trtllm_modeling_v2.operators.inventory import (
@@ -133,46 +133,46 @@ def test_a_gate_longer_than_one_gates_allocation_is_refused_before_it_waits_for_
     assert preflight.check_gate_budgets({"environment": {"kind": "local"}}) == []
 
 
-def _fake_boot(fails: dict[str, str], booted: list):
-    """A boot gate that fails the members named in ``fails`` with their detail."""
+def test_the_substrate_gate_launches_a_probe_as_a_gate_does_and_loads_no_model(tmp_path):
+    """The stock path need not serve the checkpoint: the probe checks the launch, not a model."""
+    from agent_flow.workflows.trtllm_modeling_v2.checks.harness import env_probe
+    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
+    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
 
-    def run_boot_gate(environment, *, member=None, **_):
-        booted.append(member)
-        detail = fails.get(member)
-        return GateResult(
-            name="boot[off]", member=member, passed=detail is None, detail=detail or "generated"
-        )
-
-    return run_boot_gate
-
-
-def test_a_unified_substrate_is_proven_by_the_first_member_the_stock_path_serves(
-    tmp_path, monkeypatch
-):
     task = _task(tmp_path, parallel="unified", members=["tp4", "tep4", "dep4"])
-    environment = SimpleNamespace(world_size=4)
-    booted, notes = [], []
-    misaligned = {"tp4": "AssertionError: M % 128 == 0"}
-    monkeypatch.setattr(preflight.boot_checks, "run_boot_gate", _fake_boot(misaligned, booted))
-    preflight.substrate_gate(task, environment, shell_runner=None, workdir=tmp_path, notes=notes)
-    assert booted == ["tp4", "tep4"]
-    assert "at `tep4`" in notes[0]
-    assert "could not serve `tp4` (AssertionError: M % 128 == 0)" in notes[1]
+    environment = RunEnvironment(kind="local", python="/venv/bin/python3", world_size=4)
+    ran, notes = [], []
 
-    # Every member failing is still a stop, and names what each member said.
-    booted.clear()
-    every = {member: f"{member} broke" for member in ("tp4", "tep4", "dep4")}
-    monkeypatch.setattr(preflight.boot_checks, "run_boot_gate", _fake_boot(every, booted))
-    with pytest.raises(PreflightError, match="every member failed:\n  tp4: tp4 broke\n  tep4"):
-        preflight.substrate_gate(task, environment, shell_runner=None, workdir=tmp_path)
-    assert booted == ["tp4", "tep4", "dep4"]
+    def shell(report, code=0):
+        def run(command, env=None, timeout=0):
+            ran.append(command)
+            line = f"MV2FLOW_SUBSTRATE {json.dumps(report)}\n" if report is not None else "ok\n"
+            return CommandResult(returncode=code, stdout=line)
 
-    # A concrete segment is booted once, as itself.
-    booted.clear()
-    task["parallel"] = "dep4"
-    monkeypatch.setattr(preflight.boot_checks, "run_boot_gate", _fake_boot({}, booted))
-    preflight.substrate_gate(task, environment, shell_runner=None, workdir=tmp_path, notes=notes)
-    assert booted == [None]
+        return run
+
+    passed = {"facts": {"devices": 4, "mpi_world": 4}, "problems": []}
+    preflight.substrate_gate(task, environment, shell_runner=shell(passed), workdir=tmp_path,
+                             notes=notes)  # fmt: skip
+    assert "env_probe.py" in ran[0] and "trtllm-llmapi-launch" in ran[0]
+    assert "engine_driver" not in ran[0] and "devices 4; mpi_world 4" in notes[0]
+    spec = json.loads((tmp_path / "substrate.json").read_text())
+    assert spec["world_size"] == 4 and spec["dataset"] == {"hf": ["openai/gsm8k", "main", "test"]}
+    failed = {"facts": {}, "problems": ["dataset ['openai/gsm8k'] offline: ConnectionError: x"]}
+    with pytest.raises(PreflightError, match="dataset .* offline: ConnectionError"):
+        preflight.substrate_gate(task, environment, shell_runner=shell(failed, 1), workdir=tmp_path)
+    with pytest.raises(PreflightError, match="printed no report"):
+        preflight.substrate_gate(task, environment, shell_runner=shell(None), workdir=tmp_path)
+    # The probe itself: a cache directory that takes no file is a problem of its own.
+    blocked = tmp_path / "blocked"
+    blocked.write_text("a file where a directory belongs")
+    os.environ["TRITON_CACHE_DIR"] = str(blocked / "triton")
+    try:
+        _, problems = env_probe.probe({"world_size": 1, "dataset": {"path": str(tmp_path / "x")}})
+    finally:
+        del os.environ["TRITON_CACHE_DIR"]
+    assert any(str(blocked / "triton") in p for p in problems)
+    assert any("dataset: " in p and "does not exist" in p for p in problems)
 
 
 def test_a_substrate_pass_stands_for_more_sessions_but_not_for_another_environment(tmp_path):

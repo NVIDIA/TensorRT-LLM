@@ -3,9 +3,10 @@
 
 """Preflight: the checks, the environment, the agent probe, host facts and the surface survey.
 
-The substrate gate, the one check that boots a GPU, runs beside the run's
-first turns, unless a recent pass in this environment stands for it: its
-failure stops the run, which stays open for the same command to resume.
+The substrate gate, a probe launched as the widest gate launches (no model
+loaded), runs beside the run's first turns, unless a recent pass in this
+environment stands for it: its failure stops the run, which stays open for
+the same command to resume.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from agent_flow.prompts import dump_prompt_bundle
 from ...agents.prompts import PROMPTS_DIRNAME, build_trtllm_modeling_v2_prompts
 from ...agents.roles import packaged_skills
 from ...agents.turns import TURNS_DIRNAME
-from ...checks import check_config, gate_cli
+from ...checks import gate_cli
 from ...infra.compute.environment import (
     MAX_TMPDIR_LEN,
     RunEnvironment,
@@ -55,6 +56,7 @@ from .preflight import (
     check_processor_dependencies,
     format_preflight_report,
     run_preflight,
+    substrate_dataset,
     substrate_gate,
 )
 
@@ -80,11 +82,8 @@ def substrate_inputs(task_data: Mapping[str, Any], environment: RunEnvironment) 
     """What a substrate pass proves something about, one digest per part.
 
     - ``environment``: the launch environment as preflight resolved it, and
-      ``spec_environment``, the block it was resolved from, which also names
-      the proxy checkpoint;
-    - ``engine``: what the boot's command line is built from -- the
-      checkpoint, the parallel segment and the runtime block -- and
-      ``options``, the options file it reads, by content;
+      ``spec_environment``, the block it was resolved from;
+    - ``dataset``: what the probe loads of the benchmark's dataset;
     - ``checkout``: the checkout it ran in, by path.
 
     Not by where jobs queue: of the sessions only the env and setup lines
@@ -94,11 +93,6 @@ def substrate_inputs(task_data: Mapping[str, Any], environment: RunEnvironment) 
     gate of the run measures it on this same substrate under the tree's own
     marker.
     """
-    accuracy = task_data.get("accuracy") or {}
-    options = check_config.resolve_llm_api_options(accuracy, None)
-    options_text = None
-    if options and Path(str(options)).is_file():
-        options_text = Path(str(options)).read_text(encoding="utf-8", errors="replace")
     block = dict(task_data.get("environment") or {})
     resolved = dataclasses.asdict(dataclasses.replace(environment, sessions=(), dev_spools=()))
     parts: dict[str, Any] = {
@@ -110,12 +104,7 @@ def substrate_inputs(task_data: Mapping[str, Any], environment: RunEnvironment) 
             **block,
             "sessions": _session_runtimes(s for s in block.get("sessions") or () if s),
         },
-        "engine": {
-            "checkpoint_path": task_data.get("checkpoint_path"),
-            "parallel": task_data.get("parallel"),
-            "runtime": check_config.resolve_runtime(task_data, None),
-        },
-        "options": [options, options_text],
+        "dataset": substrate_dataset(task_data),
         "checkout": task_data.get("trtllm_repo_path"),
     }
     return agent_probe.part_digests(parts)
@@ -328,7 +317,7 @@ def _prove_substrate(workflow, result, log) -> bool:
         workflow.journal.event("substrate gate not run", f"{why}; `{record_path}`")
         print_message(f"[bold green]✔ substrate gate[/bold green] not run: {why}", log)
         return True
-    # The boot takes minutes to an hour on a large checkpoint: say why it runs now, not only after.
+    # The probe waits for a session's devices: say why it runs now, not only after.
     workflow.journal.event("substrate gate running", f"{why}; `{record_path}`")
     print_message(f"→ substrate gate running: {why}", log)
     before = len(result.notes)

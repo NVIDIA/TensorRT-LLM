@@ -233,15 +233,16 @@ def test_the_environment_can_start_the_run(tmp_path):
         python="/work/venv/bin/python",
     )
     rules = _rules(lint.lint_task(task, checkpoint=checkpoint, repo=repo))
-    assert {"environment-python-missing", "substrate-checkpoint-missing"} <= rules
+    assert "environment-python-missing" in rules
     assert "agents-model-missing" not in rules
     del task["agents"]
     assert "agents-model-missing" in _rules(lint.lint_task(task, checkpoint=checkpoint, repo=repo))
     task["agents"] = copy.deepcopy(_GOOD["agents"])
-    # The image's own interpreter is not on this host to check; a proxy answers the gate.
-    task["environment"].update(python="/usr/bin/python3", substrate_checkpoint=str(checkpoint))
-    rules = _rules(lint.lint_task(task, checkpoint=checkpoint, repo=repo))
-    assert not {"environment-python-missing", "substrate-checkpoint-missing"} & rules
+    # The image's own interpreter is not on this host to check.
+    task["environment"].update(python="/usr/bin/python3")
+    assert "environment-python-missing" not in _rules(
+        lint.lint_task(task, checkpoint=checkpoint, repo=repo)
+    )
     # The lazy zoo's index registers architectures too.
     (repo / STOCK_ARCH_INDEX).write_text(
         'MODEL_ARCH_TO_MODULE = {"ToyForCausalLM": "modeling_toy"}\n'

@@ -330,10 +330,6 @@ ENVIRONMENT_KEYS: tuple[str, ...] = (
     "gpus_per_node",
     # Each device's memory, GiB: the intake lint sizes engines and disaggregation by it.
     "gpu_memory_gib",
-    # A checkpoint the STOCK modeling path already supports, used by
-    # `preflight.substrate_gate` when the run's own checkpoint has an
-    # architecture that path has never heard of.
-    "substrate_checkpoint",
     # The compute sessions the run stands on.
     "sessions",
     # How long the orchestrator waits for a gate session that stopped
@@ -671,21 +667,6 @@ def _validate_environment(block: Any, errors: list[str]) -> None:
     memory = block.get("gpu_memory_gib")
     if memory is not None and not (_number(memory) and memory > 0):
         errors.append(f"'{ENVIRONMENT_FIELD}.gpu_memory_gib' must be a positive number of GiB")
-
-    proxy = block.get("substrate_checkpoint")
-    if proxy is not None:
-        if not isinstance(proxy, str) or not proxy.strip():
-            errors.append(
-                f"'{ENVIRONMENT_FIELD}.substrate_checkpoint' must be a path to a "
-                f"checkpoint directory the stock modeling path supports"
-            )
-        elif not Path(proxy).exists():
-            errors.append(
-                f"'{ENVIRONMENT_FIELD}.substrate_checkpoint' does not exist: {proxy}. "
-                f"The substrate gate falls back to it only after the run's own "
-                f"checkpoint has already failed, so a missing proxy turns the "
-                f"longest step in preflight into two failures instead of one."
-            )
 
     if kind == "session_spool":
         spool = block.get("spool")

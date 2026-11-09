@@ -150,18 +150,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--skip-substrate-gate",
         action="store_true",
-        help="Skip preflight's substrate gate — the cold start that proves "
-        "this host generates a token on the STOCK modeling path under this "
-        "run's runtime block. It is the single highest-value preflight "
-        "check and skipping it means the three failures it catches "
-        "(MPI_ERR_SPAWN, kvCache sizing, NVRTC's missing cuda.h) resurface "
-        "hours later inside an agent's turn, reading as target defects. "
-        "A resumed run already skips the gate when its last pass "
-        "(gates/substrate/pass.json) is under 12 h old in the same environment; "
-        "use this only when the gate itself is what is broken. It is "
-        "NOT the answer to an architecture the stock path does not know — "
-        "declare `environment.substrate_checkpoint` for that, which keeps "
-        "the two checks that do not depend on the checkpoint.",
+        help="Skip preflight's substrate gate, the probe that launches as the widest "
+        "gate launches (no model loaded) and proves the build imports, MPI makes the "
+        "world, a device takes a tensor, the caches take a file and the benchmark's "
+        "dataset loads offline. A resumed run already skips it when its last pass "
+        "(gates/substrate/pass.json) is under 12 h old in the same environment; use "
+        "this only when the probe itself is what is broken.",
     )
     parser.add_argument(
         "--stage",
