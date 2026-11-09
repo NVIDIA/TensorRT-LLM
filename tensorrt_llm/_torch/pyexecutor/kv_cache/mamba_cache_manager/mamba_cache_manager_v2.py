@@ -203,6 +203,23 @@ def _uses_fp4_mla_cache_layout(
     )
 
 
+def _equal_state_slices(capacity: int, num_states: int) -> List[KVCacheDesc]:
+    """One typical request of ``capacity`` tokens holding ``num_states`` recurrent states.
+
+    Each state is modeled as an equal slice of the sequence, so the slices' attention pages
+    add up to the request's and each slice adds one recurrent-state slot.
+    """
+    capacity_per_state, capacity_remainder = divmod(capacity, num_states)
+    capacities = [capacity_per_state + int(i < capacity_remainder) for i in range(num_states)]
+    return [
+        KVCacheDesc(
+            capacity=state_capacity,
+            history_length=max(0, state_capacity - 1),
+        )
+        for state_capacity in capacities
+    ]
+
+
 class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     """Hybrid Mamba cache manager backed by KVCacheManagerV2.
 
@@ -1045,15 +1062,28 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         Each retained state is modeled as an equal slice of the sequence.
         """
         num_states = self._num_ssm_states_per_typical_request(capacity, kv_cache_config)
-        capacity_per_state, capacity_remainder = divmod(capacity, num_states)
-        capacities = [capacity_per_state + int(i < capacity_remainder) for i in range(num_states)]
-        return [
-            KVCacheDesc(
-                capacity=state_capacity,
-                history_length=max(0, state_capacity - 1),
-            )
-            for state_capacity in capacities
-        ]
+        return _equal_state_slices(capacity, num_states)
+
+    def _cold_typical_step(
+        self, kv_cache_config: KvCacheConfig, num_cache_tiers: int
+    ) -> Optional[BatchDesc]:
+        """Typical step for the cold tiers' pool split, or None to keep the GPU tier's split.
+
+        One typical request with ``cold_tier_states_per_request`` states, instead of the GPU
+        split's live state plus every retained snapshot: a released conversation mostly comes
+        back through its latest endpoint, so the rest of the cold quota goes to attention pages.
+        """
+        if num_cache_tiers < 2:
+            return None
+        num_states = kv_cache_config.mamba_state_config.cold_tier_states_per_request
+        if num_states is None or not kv_cache_config.enable_block_reuse:
+            return None
+        capacity = self._get_typical_request_capacity(kv_cache_config)
+        logger.info(
+            f"[MambaHybridCacheManagerV2] cold cache tiers sized for {num_states} recurrent "
+            f"state(s) per {capacity}-token typical request"
+        )
+        return BatchDesc(_equal_state_slices(capacity, num_states))
 
     def _get_typical_request_capacity(
         self,
@@ -1196,6 +1226,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             config,
             layers=layers,
             typical_step=typical_step,
+            cold_typical_step=self._cold_typical_step(kv_cache_config, len(config.cache_tiers)),
             constraints=constraints,
             # SSM lifecycles require minimum-snapshot commit semantics. The
             # flag is harmless when reuse is disabled because no commits are

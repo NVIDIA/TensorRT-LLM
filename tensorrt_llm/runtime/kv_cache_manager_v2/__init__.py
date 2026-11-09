@@ -143,6 +143,7 @@ class _KVCacheManagerConfigFieldSpec:
     host_sparse_pool_quota: object = None
     regions: object = None
     host_mem_backing: object = None
+    cold_typical_step: object = None
 
 
 KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__

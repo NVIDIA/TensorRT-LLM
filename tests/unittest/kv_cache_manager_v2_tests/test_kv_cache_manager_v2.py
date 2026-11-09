@@ -9474,10 +9474,21 @@ class TestInitRatioConfig(unittest.TestCase):
             swa_scratch_reuse=(SwaScratchReuseConfig() if enable_swa_scratch_reuse else None),
         )
 
-    def _make_hybrid_config(self, gpu_quota: int = 128 << 20) -> KVCacheManagerConfig:
+    def _make_hybrid_config(
+        self,
+        gpu_quota: int = 128 << 20,
+        host_quota: int = 0,
+        typical_step: BatchDesc | None = None,
+        cold_typical_step: BatchDesc | None = None,
+    ) -> KVCacheManagerConfig:
+        cache_tiers: list = [GpuCacheTierConfig(quota=gpu_quota)]
+        if host_quota > 0:
+            cache_tiers.append(HostCacheTierConfig(quota=host_quota))
         return KVCacheManagerConfig(
             tokens_per_block=self.TOKENS_PER_BLOCK,
-            cache_tiers=[GpuCacheTierConfig(quota=gpu_quota)],
+            typical_step=typical_step,
+            cold_typical_step=cold_typical_step,
+            cache_tiers=cache_tiers,
             layers=[
                 SsmLayerConfig(
                     layer_id=LayerId(0),
@@ -9541,6 +9552,79 @@ class TestInitRatioConfig(unittest.TestCase):
         # Windowed layers (window=128) have many stale blocks, non-windowed keep all.
         self.assertLess(ratio[0], ratio[1])
         self.assertLess(ratio[0], 0.15)
+        manager.shutdown()
+
+    def _hybrid_slot_counts(self, manager: KVCacheManager, level: CacheLevel) -> tuple[int, int]:
+        """(SSM slots, attention slots) of a hybrid manager at one cache level."""
+        ssm_lc = _introspection.ssm_life_cycle_id(manager)
+        assert ssm_lc is not None
+        attn_lc = manager.get_layer_group_id(LayerId(1))
+        mapping = manager.get_life_cycle_pool_group_indices(level)
+        stats = manager.get_storage_statistics(level)
+        self.assertNotEqual(mapping[ssm_lc], mapping[attn_lc])
+        return stats[mapping[ssm_lc]].total, stats[mapping[attn_lc]].total
+
+    def test_cold_typical_step_sizes_cold_tier_only(self):
+        """cold_typical_step re-splits the host tier; the GPU tier is unchanged.
+
+        Without it the host tier keeps the GPU tier's slot proportions. With one state per typical
+        request instead of four, host bytes move from recurrent-state slots to attention pages.
+        """
+        capacity = 64 * self.TOKENS_PER_BLOCK
+        slice_desc = KVCacheDesc(capacity=capacity // 4, history_length=capacity // 4 - 1)
+        hot_step = BatchDesc(kv_caches=[slice_desc] * 4)
+        cold_step = BatchDesc(
+            kv_caches=[KVCacheDesc(capacity=capacity, history_length=capacity - 1)]
+        )
+        host_quota = 1 << 30
+
+        def build(cold):
+            return KVCacheManager(
+                self._make_hybrid_config(
+                    gpu_quota=512 << 20,
+                    host_quota=host_quota,
+                    typical_step=hot_step,
+                    cold_typical_step=cold,
+                )
+            )
+
+        default, resplit = build(None), build(cold_step)
+        gpu_ssm, gpu_attn = self._hybrid_slot_counts(default, GPU_LEVEL)
+        self.assertEqual(self._hybrid_slot_counts(resplit, GPU_LEVEL), (gpu_ssm, gpu_attn))
+        default_ssm, default_attn = self._hybrid_slot_counts(default, CacheLevel(1))
+        self.assertAlmostEqual(
+            default_attn / default_ssm, gpu_attn / gpu_ssm, delta=0.15 * gpu_attn / gpu_ssm
+        )
+        resplit_ssm, resplit_attn = self._hybrid_slot_counts(resplit, CacheLevel(1))
+        self.assertLess(resplit_ssm, default_ssm)
+        self.assertGreater(resplit_attn, default_attn)
+        # One SSM slot per `capacity` tokens of attention pages.
+        blocks_per_request = capacity // self.TOKENS_PER_BLOCK
+        self.assertAlmostEqual(
+            resplit_attn / resplit_ssm, blocks_per_request, delta=0.2 * blocks_per_request
+        )
+        stats = resplit.get_storage_statistics(CacheLevel(1))
+        self.assertLessEqual(sum(sum(s.slot_sizes) * s.total for s in stats), host_quota)
+        default.shutdown()
+        resplit.shutdown()
+
+    def test_cold_typical_step_config(self):
+        """cold_typical_step survives replace(), rejects an empty step and floors pageless groups.
+
+        A step that gives a pool group no pages still leaves that group a share of the host tier.
+        """
+        cold_step = BatchDesc(kv_caches=[KVCacheDesc(capacity=128, history_length=127)])
+        cfg = replace(self._make_hybrid_config(host_quota=64 << 20), cold_typical_step=cold_step)
+        self.assertEqual(
+            replace(cfg, layers=cfg.layers).cold_typical_step.kv_caches[0].capacity, 128
+        )
+        with self.assertRaises(RuntimeError):
+            self._make_hybrid_config(host_quota=64 << 20, cold_typical_step=BatchDesc(kv_caches=[]))
+        no_pages = BatchDesc(kv_caches=[KVCacheDesc(capacity=0, history_length=0)])
+        manager = KVCacheManager(
+            self._make_hybrid_config(host_quota=64 << 20, cold_typical_step=no_pages)
+        )
+        self.assertTrue(all(s.total > 0 for s in manager.get_storage_statistics(CacheLevel(1))))
         manager.shutdown()
 
     def test_zero_capacity_request_reserves_only_an_ssm_slot(self):

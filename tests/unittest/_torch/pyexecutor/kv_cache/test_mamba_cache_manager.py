@@ -2308,6 +2308,40 @@ def test_v2_hybrid_snapshot_sizing_scales_with_pp_and_explicit_rules():
 
 
 @pytest.mark.parametrize(
+    "states, num_tiers, reuse, expected",
+    [
+        (None, 2, True, None),
+        (1, 1, True, None),
+        (1, 2, False, None),
+        (1, 2, True, [128]),
+        (2, 3, True, [64, 64]),
+        (3, 2, True, [43, 43, 42]),
+    ],
+)
+def test_v2_hybrid_cold_typical_step(states, num_tiers, reuse, expected) -> None:
+    """cold_tier_states_per_request sizes the cold tiers from that many states per typical request."""
+    config = KvCacheConfig(
+        max_gpu_total_bytes=32 << 20,
+        host_cache_size=0,
+        avg_seq_len=128,
+        enable_block_reuse=reuse,
+        mamba_state_config=MambaStateConfig(
+            additional_snapshot_offsets_from_start=[32, 64],
+            additional_snapshot_offsets_from_end=[2],
+            cold_tier_states_per_request=states,
+        ),
+    )
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.max_seq_len = 256
+    step = mgr._cold_typical_step(config, num_tiers)
+    if expected is None:
+        assert step is None
+    else:
+        assert [desc.capacity for desc in step.kv_caches] == expected
+        assert [desc.history_length for desc in step.kv_caches] == [c - 1 for c in expected]
+
+
+@pytest.mark.parametrize(
     "capacity, interval, from_start, from_end, reuse, branch, expected_states",
     [
         (128, 0, [], [], True, False, 1),

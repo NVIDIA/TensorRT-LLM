@@ -232,7 +232,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     std::unique_ptr<IKvCacheColdPageCodec> coldPageCodec, std::optional<SwaScratchReuseConfig> swaScratchReuse,
     std::optional<BatchDesc> const& typicalBatch, std::vector<BatchDesc> const& constraints,
     std::optional<std::vector<float>> const& initialPoolRatio, std::shared_ptr<EventSink> eventSink,
-    float maxUtilForResume, Priority coldTierOffloadMinPriority)
+    float maxUtilForResume, Priority coldTierOffloadMinPriority, std::optional<BatchDesc> const& coldTypicalBatch)
     : mLifeCycles(lifeCycles)
     , mEventSink(std::move(eventSink))
     , mColdTierOffloadMinPriority(coldTierOffloadMinPriority)
@@ -533,7 +533,9 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     for (CacheLevel level{1}; level < config.cacheTiers.size(); ++level)
     {
         TLLM_CHECK(appendLevelSlotDescList(coldSlotDescList) == level);
-        auto const coldRatio = projectPoolGroupRatio(kHotLevel, level, lifeCycleRatio);
+        auto const coldRatio = coldTypicalBatch.has_value()
+            ? coldPoolGroupRatioFromBatch(level, *coldTypicalBatch, tokensPerBlock)
+            : projectPoolGroupRatio(kHotLevel, level, lifeCycleRatio);
         // No second budget: a cold group is a single pool holding whatever the codec packs
         // into it, dense and sparse buffers alike, so its quota pays for all of it.
         auto slotCounts = computeSlotCountForLevel(
@@ -1962,6 +1964,22 @@ TypedVec<PoolGroupIndex, float> StorageManager::toPoolGroupRatio(
     return normalizeToRatio(poolGroupRatio);
 }
 
+TypedVec<PoolGroupIndex, float> StorageManager::coldPoolGroupRatioFromBatch(
+    CacheLevel level, BatchDesc const& batch, int tokensPerBlock) const
+{
+    auto const numSlots = typicalSlotsForBatch(batch, tokensPerBlock, mSwaScratchReuse);
+    TypedVec<PoolGroupIndex, double> weights(numPoolGroups(level), 0.0);
+    for (LifeCycleId lifeCycle{0}; lifeCycle < numLifeCycles(); ++lifeCycle)
+    {
+        PoolGroupIndex const pgIdx = getPoolGroupIndex(level, lifeCycle);
+        auto const sizes = slotSize(level, pgIdx);
+        // At least one slot each, so every group gets the positive share ratioToSlotCountList requires.
+        weights[pgIdx] += static_cast<double>(std::max(numSlots[lifeCycle], SlotCount{1}))
+            * static_cast<double>(std::accumulate(sizes.begin(), sizes.end(), size_t{0}));
+    }
+    return normalizeToRatio(weights);
+}
+
 TypedVec<PoolGroupIndex, float> StorageManager::projectPoolGroupRatio(
     CacheLevel srcLevel, CacheLevel dstLevel, TypedVec<LifeCycleId, float> const& srcLifeCycleRatio) const
 {
@@ -1988,6 +2006,13 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromBatch(BatchDesc const& bat
     std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t deviceGranularity,
     TypedVec<PoolGroupIndex, std::vector<PoolIndex>> const& sparsePools) const
 {
+    return normalizeToRatio(
+        slotsToBytes(typicalSlotsForBatch(batch, tokensPerBlock, swaScratchReuse), deviceGranularity, sparsePools));
+}
+
+TypedVec<LifeCycleId, SlotCount> StorageManager::typicalSlotsForBatch(
+    BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const
+{
     auto numSlots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
     // A soft preference, not a feasibility floor: keep one optional endpoint
     // per typical request in addition to its private working pages.
@@ -1998,7 +2023,7 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromBatch(BatchDesc const& bat
             numSlots[lc] += slotCountValueFromSize(batch.kvCaches.size());
         }
     }
-    return normalizeToRatio(slotsToBytes(numSlots, deviceGranularity, sparsePools));
+    return numSlots;
 }
 
 // ---------------------------------------------------------------------------

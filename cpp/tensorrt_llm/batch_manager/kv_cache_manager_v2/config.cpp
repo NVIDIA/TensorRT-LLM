@@ -291,6 +291,12 @@ void KVCacheManagerConfig::validate() const
     {
         typicalStep->validate();
     }
+    if (coldTypicalStep.has_value())
+    {
+        coldTypicalStep->validate();
+        TLLM_CHECK_WITH_INFO(
+            !coldTypicalStep->kvCaches.empty(), "cold_typical_step must describe at least one KV cache");
+    }
 
     poolRebalance.validate();
     hostMemBacking.validate();

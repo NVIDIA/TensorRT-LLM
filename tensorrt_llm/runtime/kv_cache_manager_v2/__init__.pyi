@@ -563,6 +563,9 @@ class KVCacheManagerConfig:
     # declaration order. A (layer, role) pair belongs to one layer config or one region.
     regions: list[RegionConfig] = ...
     host_mem_backing: HostMemBackingConfig = ...
+    # Typical step that sizes the cold (host / disk) tiers' pool groups. None keeps the hot tier's
+    # per-layer-group slot-count proportions at cold page sizes.
+    cold_typical_step: BatchDesc | None = None
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
