@@ -3164,6 +3164,7 @@ class _StubADPExecutor:
         self.expected_num_active_requests = 1
         self.max_num_active_requests = 8
         self.max_total_draft_tokens = 0
+        self.enable_joint_kv_cache_reuse = False
         self.max_num_tokens = max_num_tokens
         self._adp_dummy_is_gen = True
         self._pending_adp_dummy_request = None
