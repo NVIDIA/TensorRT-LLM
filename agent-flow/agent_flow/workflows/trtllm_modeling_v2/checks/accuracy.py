@@ -181,6 +181,17 @@ def unparsed_score_detail(output: str, pattern: str | None) -> str:
     )
 
 
+#: The keys an in-tree accuracy test selects a reference row by, and the value a row that
+#: leaves one out stands for (``AccuracyTask.get_hypothesis_testing_params``).
+REFERENCE_SPEC_DEFAULTS: dict[str, Any] = {
+    "dtype": "auto",
+    "quant_algo": None,
+    "kv_cache_quant_algo": None,
+    "spec_dec_algo": None,
+    "extra_acc_spec": None,
+}
+
+
 def load_reference_score(
     reference_yaml: str | Path,
     model_key: str,
@@ -189,10 +200,16 @@ def load_reference_score(
 ) -> float:
     """Read the anchor for one model from TensorRT-LLM's accuracy references.
 
-    An entry matches when its discriminators (``quant_algo``,
-    ``kv_cache_quant_algo``, ``spec_dec_algo``) are exactly the ones asked
-    for, no more, no less. Raises ``KeyError`` when no entry, or more than
-    one, matches: the anchor is never invented.
+    The row is the one the in-tree accuracy test would take
+    (``AccuracyTask.get_hypothesis_testing_params`` in
+    ``tests/integration/defs/accuracy/accuracy_core.py``): the first whose
+    ``dtype``, ``quant_algo``, ``kv_cache_quant_algo``, ``spec_dec_algo`` and
+    ``extra_acc_spec`` equal the ones asked for, a key the row leaves out
+    counting as ``auto`` for ``dtype`` and unset for the rest. A row's other
+    keys (``num_samples``, ``threshold``, ...) tune the in-tree test's
+    threshold and do not select. A discriminator outside those five narrows
+    the match to rows that carry it with that value. Raises ``KeyError`` when
+    no row matches: the anchor is never invented.
     """
     path = Path(reference_yaml)
     if not path.is_file():
@@ -206,29 +223,23 @@ def load_reference_score(
         )
 
     wanted = {k: v for k, v in (discriminators or {}).items() if v is not None}
-    entries = data[model_key] or []
-    matches = []
+    asked = {key: wanted.get(key, default) for key, default in REFERENCE_SPEC_DEFAULTS.items()}
+    narrowing = {k: v for k, v in wanted.items() if k not in REFERENCE_SPEC_DEFAULTS}
+    entries = [e for e in data[model_key] or [] if isinstance(e, dict)]
     for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        present = {k: v for k, v in entry.items() if k != "accuracy"}
-        if present == wanted:
-            matches.append(entry)
-
-    if not matches:
-        available = [
-            {k: v for k, v in e.items() if k != "accuracy"} for e in entries if isinstance(e, dict)
-        ]
-        raise KeyError(
-            f"{path}:{model_key} has no entry matching {wanted or '{}'}. Available "
-            f"discriminator sets: {available}"
+        selects = all(
+            entry.get(key, default) == asked[key]
+            for key, default in REFERENCE_SPEC_DEFAULTS.items()
         )
-    if len(matches) > 1:
-        raise KeyError(
-            f"{path}:{model_key} has {len(matches)} entries matching {wanted or '{}'}; "
-            f"the anchor must be unambiguous"
-        )
-    return float(matches[0]["accuracy"])
+        if selects and all(entry.get(k) == v for k, v in narrowing.items()) and "accuracy" in entry:
+            return float(entry["accuracy"])
+    available = [
+        {k: e[k] for k in (*REFERENCE_SPEC_DEFAULTS, *narrowing) if k in e} for e in entries
+    ]
+    raise KeyError(
+        f"{path}:{model_key} has no entry matching {wanted or '{}'}. Available "
+        f"discriminator sets: {available}"
+    )
 
 
 def resolve_floor(

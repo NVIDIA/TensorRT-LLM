@@ -1266,6 +1266,36 @@ def test_an_unreadable_reference_is_unknown_not_a_failure(tmp_path):
     assert result.passed and "divergence UNKNOWN" in result.detail
 
 
+def test_the_anchor_row_is_the_one_the_in_tree_accuracy_test_takes(tmp_path):
+    reference = tmp_path / "gsm8k.yaml"
+    rows = [
+        # Keys outside the five the in-tree test selects by tune its threshold; they do not select.
+        {"accuracy": 90.0, "num_samples": 512},
+        {"quant_algo": "FP8", "accuracy": 91.0, "threshold": 88.0},
+        {"quant_algo": "FP8", "spec_dec_algo": "MTP", "extra_acc_spec": "mtp3", "accuracy": 92.0},
+        {"quant_algo": "FP8", "spec_dec_algo": "MTP", "accuracy": 93.0},
+        {"quant_algo": "FP8", "spec_dec_algo": "MTP", "mtp_enabled": True, "accuracy": 94.0},
+        {"quant_algo": "FP8", "dtype": "float16", "accuracy": 95.0},
+    ]
+    reference.write_text(yaml.safe_dump({"org/m": rows}), encoding="utf-8")
+
+    def anchor(**discriminators):
+        return accuracy_checks.load_reference_score(
+            reference, "org/m", discriminators=discriminators
+        )
+
+    assert anchor() == 90.0
+    assert anchor(quant_algo="FP8") == 91.0
+    # The first row that agrees on all five wins, as in the in-tree test.
+    assert anchor(quant_algo="FP8", spec_dec_algo="MTP") == 93.0
+    assert anchor(quant_algo="FP8", spec_dec_algo="MTP", extra_acc_spec="mtp3") == 92.0
+    assert anchor(quant_algo="FP8", dtype="float16") == 95.0
+    # A discriminator outside the five narrows to the rows that carry it.
+    assert anchor(quant_algo="FP8", spec_dec_algo="MTP", mtp_enabled=True) == 94.0
+    with pytest.raises(KeyError, match="no entry matching"):
+        anchor(quant_algo="NVFP4")
+
+
 _ANCHOR = 92.30
 
 
