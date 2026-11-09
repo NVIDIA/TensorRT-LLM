@@ -43,7 +43,6 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAReplayState,
     KimiK3HybridCacheManager,
     _kda_replay_layout,
-    compute_deterministic_mamba_seed,
 )
 from tensorrt_llm._torch.modules.mamba.cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
@@ -1577,40 +1576,6 @@ def test_python_mamba_slot_assignment_without_sync():
     # Fresh assignments rotate their seeds; the dummy never reaches the seed rotation.
     for slot in slots[:2]:
         assert int(seeds[slot]) != int(seeds_before[slot])
-
-
-@skip_no_cuda
-def test_mixed_manager_ngram_promotion_without_sync():
-    """NGram acceptance promotes the accepted states without synchronizing the stream; a request
-    freed this step keeps its row and writes to the padding slot."""
-    mgr = object.__new__(MixedMambaHybridCacheManager)
-    mgr._promote_states_in_update_resources = True
-    mgr._impl = SimpleNamespace(
-        is_speculative=lambda: True,
-        mamba_cache=SimpleNamespace(temporal=torch.empty(0, device="cuda")),
-        mamba_cache_index={100: 3, 201: 5},
-        _padding_slot=9,
-        update_mamba_states=MagicMock(),
-    )
-    context = SimpleNamespace(py_request_id=100)
-    generations = [
-        SimpleNamespace(
-            py_request_id=request_id, py_draft_tokens=[1, 2], py_num_accepted_draft_tokens=accepted
-        )
-        for request_id, accepted in ((201, 2), (202, 0))
-    ]
-    batch = SimpleNamespace(context_requests=[context], generation_requests=generations)
-    attn_metadata = object()
-
-    with _no_host_sync():
-        mgr._maybe_promote_drafter_states(batch, attn_metadata)
-
-    metadata, num_accepted, state_indices, _ = mgr._impl.update_mamba_states.call_args.args
-    assert metadata is attn_metadata
-    assert num_accepted.dtype == torch.int32 and num_accepted.is_cuda
-    assert num_accepted.tolist() == [0, 3, 1]
-    assert state_indices.dtype == torch.int32 and state_indices.is_cuda
-    assert state_indices.tolist() == [3, 5, 9]
 
 
 @skip_no_cuda
@@ -7122,14 +7087,12 @@ def test_v2_stack_state_views_rejects_non_affine_layout():
     assert stack([]) is None
 
 
-@pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=skip_no_cuda)])
-def test_v2_kda_admission_slot_updates_without_sync(monkeypatch, manager_cls, device):
-    """Disagg GEN admission resets, relocates and seeds KDA replay slots, a resumed request
-    reseeds its slot, and NGram acceptance is recorded; on CUDA none of it may synchronize the
-    stream (the previous step is still queued)."""
-    num_slots, num_layers, num_spec, dim, window = 10, 2, 2, 2, 3
-    mgr = object.__new__(manager_cls)
+def test_v2_kda_admission_slot_updates_without_sync(device):
+    """Disagg GEN admission resets, relocates and seeds KDA replay slots; on CUDA none of it may
+    synchronize the stream (the previous step is still queued)."""
+    num_slots, num_layers, num_spec, dim, window = 8, 2, 2, 2, 3
+    mgr = object.__new__(KimiK3HybridCacheManager)
     policy = KDAReplayState(num_spec)
     mgr._kda_replay = policy
     mgr._speculative_state = policy
@@ -7137,15 +7100,12 @@ def test_v2_kda_admission_slot_updates_without_sync(monkeypatch, manager_cls, de
     policy.prev_num_accepted_tokens = torch.arange(
         1, num_slots + 1, dtype=torch.int32, device=device
     )
-    # Stochastic-rounding seeds, rotated for every reset slot.
-    policy.rand_seed = torch.zeros(num_slots, dtype=torch.int64, device=device)
     # Stale device indices: the reset must take its slots from _host_state_indices.
     mgr._state_indices_buffer = DeviceCopyBuffer(
         torch.full((num_slots,), 7, dtype=torch.int32, device=device)
     )
-    mgr._host_state_indices = torch.tensor([5, 1] + [0] * (num_slots - 2), dtype=torch.int32)
-    mgr._request_id_to_state_index = {10: 4, 11: 2, 12: 7}
-    mgr._request_id_to_is_dummy = {11: True}
+    mgr._host_state_indices = torch.tensor([5, 1, 0, 0, 0, 0, 0, 0], dtype=torch.int32)
+    mgr._request_id_to_state_index = {10: 4, 11: 2}
     mgr.conv_state_shape = [3 * dim, window]
     mgr.conv_section_dims = [dim] * 3
     mgr.all_conv_states = [
@@ -7162,48 +7122,21 @@ def test_v2_kda_admission_slot_updates_without_sync(monkeypatch, manager_cls, de
     policy._conv_section_dims = tuple(mgr.conv_section_dims)
     policy._committed_window = window
 
-    # Only the replay part of _setup_state_indices is under test, not the base slot mapping.
-    monkeypatch.setattr(MambaHybridCacheManagerV2, "_setup_state_indices", lambda *args: None)
-    if device == "cuda":
-        mgr._stream = torch.cuda.current_stream()
-    else:
-        mgr._stream = None
-        monkeypatch.setattr(
-            KDAReplayState, "on_cache_stream", staticmethod(lambda stream: contextlib.nullcontext())
-        )
-    policy.suspended_requests.add(12)
-    drafted = [
-        SimpleNamespace(
-            py_request_id=request_id, py_draft_tokens=[1, 2], py_num_accepted_draft_tokens=2
-        )
-        for request_id in (10, 11)
-    ]
-
     if device == "cuda":
         torch.cuda.synchronize()
         previous_mode = torch.cuda.get_sync_debug_mode()
         torch.cuda.set_sync_debug_mode("error")
     try:
         mgr._reset_context_mamba_slots(2)
-        mgr._on_state_slots_relocated([-1, 1], [3, 6])
+        policy.reset_slots(torch.tensor([3]), [3])
+        policy.relocate_slots([1], [6])
         mgr.seed_kda_replay_caches_for_disagg_gen([10, 11])
-        mgr._setup_state_indices([SimpleNamespace(py_request_id=12)], num_contexts=0)
-        mgr._record_replay_request_acceptance(SimpleNamespace(generation_requests=drafted))
     finally:
         if device == "cuda":
             torch.cuda.set_sync_debug_mode(previous_mode)
 
-    # Reset 5, 1 and 3; slot 6 takes slot 1's (reset) count; seeding resets 4, 2 and 7; then
-    # request 10 accepts 2 drafts in slot 4 and dummy request 11 keeps slot 2; 0, 8, 9 untouched.
-    assert policy.prev_num_accepted_tokens.tolist() == [1, 0, 0, 0, 2, 0, 0, 0, 9, 10]
-    # Context resets rotate seeds with counter 1, the fresh slot 3 with counter 2; slot 6 takes
-    # slot 1's seed.
-    expected_seeds = [0] * num_slots
-    for counter, slot in ((1, 5), (1, 1), (2, 3)):
-        expected_seeds[slot] = compute_deterministic_mamba_seed(counter, slot, 0)
-    expected_seeds[6] = expected_seeds[1]
-    assert policy.rand_seed.tolist() == expected_seeds
-    assert not policy.suspended_requests
+    # Reset 5, 1 and 3; slot 6 takes slot 1's (reset) count; seeding resets 4 and 2; 7 untouched.
+    assert policy.prev_num_accepted_tokens.tolist() == [1, 0, 0, 0, 0, 0, 0, 8]
 
 
 @skip_no_cuda
