@@ -395,6 +395,10 @@ class PendingEncoderStep:
 
 
 class PyExecutor:
+    # Commit finished disaggregated-generation receives for reuse after the
+    # step's forward is launched (RuntimeHooks.defer_gen_reuse_commit, or
+    # TRTLLM_DEFER_GEN_REUSE_COMMIT=1).
+    _defer_gen_reuse_commit = False
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
     # If the number of micro batches is too small, the executor will spend too much time in synchronization.
@@ -572,6 +576,9 @@ class PyExecutor:
         self._pending_num_new_active_requests = 0
         self._pending_num_completed_requests = 0
         self.stream_interval = self.llm_args.stream_interval
+        self._defer_gen_reuse_commit = (
+            runtime_hooks_of(self.model_engine.model).defer_gen_reuse_commit
+            or os.environ.get("TRTLLM_DEFER_GEN_REUSE_COMMIT", "0") == "1")
         self.perf_manager = PerfMetricsManager(
             enabled=getattr(self.llm_args, 'return_perf_metrics', False))
         self.attention_dp_enable_balance = (
@@ -4733,6 +4740,7 @@ class PyExecutor:
                             if self.dwdp_manager is not None:
                                 self.dwdp_manager.prefetch_first_layers()
                             batch_outputs = self._forward_step(scheduled_batch)
+                        self.disagg.commit_deferred_gen_receives()
 
                         # None: _forward_step hit an exception and
                         # _handle_errors already failed the affected requests
@@ -5655,6 +5663,7 @@ class PyExecutor:
                         with self._step_scope(scheduled_batch):
                             batch_outputs = self._forward_step(
                                 scheduled_batch, previous_tensors_device)
+                    self.disagg.commit_deferred_gen_receives()
 
                     if batch_outputs is None:
                         # _forward_step hit an exception; _handle_errors
@@ -7677,6 +7686,8 @@ class PyExecutor:
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
+        # Commits still deferred from a step whose loop did not run them.
+        self.disagg.commit_deferred_gen_receives()
         cache_trans_complete_requests = self.disagg.completed_gen_receives(
             scheduled_batch)
         if not cache_trans_complete_requests:
@@ -7707,7 +7718,8 @@ class PyExecutor:
         for req in scheduled_batch.generation_requests:
             # Re-checked per request: the sampler setup above may have failed
             # and terminated the request, leaving nothing to finish.
-            if not self.disagg.try_finish_gen_receive(req):
+            if not self.disagg.try_finish_gen_receive(
+                    req, defer_commit=self._defer_gen_reuse_commit):
                 continue
             req.decoding_iter = 1
             req.py_decoding_iter = 1

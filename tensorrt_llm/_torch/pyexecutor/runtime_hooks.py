@@ -179,6 +179,10 @@ class RuntimeHooks:
     # The overlap scheduler's position-id and KV-length corrections of a speculative decode
     # step issued by the model's applier (see OverlapOffsetsApplier) instead of two adds.
     overlap_offsets_applier: Optional[OverlapOffsetsApplier] = None
+    # Commit a disaggregated-generation request's received prompt blocks for reuse right after the step's forward
+    # is launched instead of before it: the commit is host work, and the request itself never reads the reuse
+    # tree (DisaggTransferCoordinator.commit_deferred_gen_receives).
+    defer_gen_reuse_commit: bool = False
 
 
 DEFAULT_RUNTIME_HOOKS = RuntimeHooks()

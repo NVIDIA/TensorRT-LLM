@@ -302,6 +302,41 @@ def test_try_finish_gen_receive_hands_a_completed_request_to_generation() -> Non
     assert req.py_kv_transfer_timed_out is False
 
 
+def test_a_deferred_reuse_commit_runs_only_when_committed() -> None:
+    """With defer_commit the request is handed to generation at once, but its
+    blocks are committed for reuse only by commit_deferred_gen_receives, once:
+    the flush empties the list."""
+    h = CoordinatorHarness()
+    req = _GenRequest(1, py_kv_transfer_start_time=5.0, py_kv_transfer_timed_out=True)
+
+    assert h.coordinator.try_finish_gen_receive(req, defer_commit=True) is True
+
+    assert req.state == LlmRequestState.GENERATION_IN_PROGRESS
+    assert req.context_current_position == req.prompt_len
+    assert (req.py_kv_transfer_start_time, req.py_kv_transfer_timed_out) == (None, False)
+    assert h.transceiver.call_log == []
+    h.coordinator.commit_deferred_gen_receives()
+    assert h.transceiver.call_log == ["commit_blocks_for_reuse:1"]
+    h.coordinator.commit_deferred_gen_receives()
+    assert h.transceiver.call_log == ["commit_blocks_for_reuse:1"]
+
+
+def test_a_deferred_reuse_commit_skips_requests_that_left_their_prompt_end() -> None:
+    """A deferred request that finished, or moved past its prompt end, before
+    the flush gets no commit (that only keeps its blocks out of the reuse
+    tree); the others are committed in finish order."""
+    h = CoordinatorHarness()
+    kept, finished, moved, later = (_GenRequest(rid) for rid in (1, 2, 3, 4))
+    for req in (kept, finished, moved, later):
+        assert h.coordinator.try_finish_gen_receive(req, defer_commit=True) is True
+    finished.state = LlmRequestState.GENERATION_COMPLETE
+    moved.context_current_position = moved.prompt_len + 3
+
+    h.coordinator.commit_deferred_gen_receives()
+
+    assert h.transceiver.call_log == ["commit_blocks_for_reuse:1", "commit_blocks_for_reuse:4"]
+
+
 @pytest.mark.parametrize(
     "state",
     [
@@ -354,8 +389,8 @@ def _executor_over(coordinator: DisaggTransferCoordinator, events: list) -> PyEx
 
     finish = coordinator.try_finish_gen_receive
 
-    def finish_and_record(req):
-        finished = finish(req)
+    def finish_and_record(req, **kwargs):
+        finished = finish(req, **kwargs)
         events.append(("finish", req.py_request_id, finished))
         return finished
 
@@ -369,6 +404,23 @@ def _executor_over(coordinator: DisaggTransferCoordinator, events: list) -> PyEx
 
     executor._maybe_prepend_logprobs_and_logits = prepend_and_record
     return executor
+
+
+def test_receive_tail_defers_the_reuse_commit_when_the_hook_asks() -> None:
+    """With RuntimeHooks.defer_gen_reuse_commit the receive tail finishes the
+    request without committing its blocks; the executor's next flush (here the
+    next receive tail's entry) commits them."""
+    h = CoordinatorHarness()
+    executor = _executor_over(h.coordinator, [])
+    executor._defer_gen_reuse_commit = True
+    req = _GenRequest(1)
+
+    executor._prepare_disagg_gen_transmission_complete(_batch(req))
+
+    assert req.state == LlmRequestState.GENERATION_IN_PROGRESS
+    assert h.transceiver.call_log == []
+    executor._prepare_disagg_gen_transmission_complete(_batch())
+    assert h.transceiver.call_log == ["commit_blocks_for_reuse:1"]
 
 
 def test_receive_tail_prepares_the_batch_before_finishing_each_request() -> None:

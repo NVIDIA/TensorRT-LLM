@@ -114,6 +114,9 @@ class DisaggTransferCoordinator:
         self._timed_out_ctx_cancelled_ids: Set[int] = set()
         self._timed_out_gen_cancelled_ids: Set[int] = set()
         self._inflight_cancel_unsupported_logged = False
+        # Finished receives whose reuse commit try_finish_gen_receive deferred,
+        # for commit_deferred_gen_receives.
+        self._deferred_reuse_commits: List[LlmRequest] = []
 
     # -- loop head -----------------------------------------------------------
 
@@ -389,22 +392,45 @@ class DisaggTransferCoordinator:
             if req.is_disagg_generation_transmission_complete
         ]
 
-    def try_finish_gen_receive(self, request: LlmRequest) -> bool:
+    def try_finish_gen_receive(self, request: LlmRequest, defer_commit: bool = False) -> bool:
         """Close out a completed KV receive and hand the request to generation.
 
         Returns False, touching nothing, when the request is no longer
         transmission-complete (batch-level preparation may have failed and
         terminated it). Errors from the transfer side propagate.
+
+        With ``defer_commit``, the received blocks' reuse commit waits for
+        ``commit_deferred_gen_receives``: the request itself never reads the
+        reuse tree, so the executor runs the commit's host work after the
+        step's forward is launched.
         """
         if not request.is_disagg_generation_transmission_complete:
             return False
         request.state = LlmRequestState.GENERATION_IN_PROGRESS
         # commit_blocks_for_reuse requires the position to be at the prompt end.
         request.context_current_position = request.prompt_len
-        self._transceiver.commit_blocks_for_reuse(request)
+        if defer_commit:
+            self._deferred_reuse_commits.append(request)
+        else:
+            self._transceiver.commit_blocks_for_reuse(request)
         request.py_kv_transfer_start_time = None
         request.py_kv_transfer_timed_out = False
         return True
+
+    def commit_deferred_gen_receives(self) -> None:
+        """Commit the blocks of the receives ``try_finish_gen_receive`` deferred.
+
+        A request no longer in generation at its prompt end (it finished or
+        was terminated since) is skipped; a skipped commit only keeps its
+        blocks out of the reuse tree.
+        """
+        pending, self._deferred_reuse_commits = self._deferred_reuse_commits, []
+        for request in pending:
+            if (
+                request.state == LlmRequestState.GENERATION_IN_PROGRESS
+                and request.context_current_position == request.prompt_len
+            ):
+                self._transceiver.commit_blocks_for_reuse(request)
 
     def send_completed_context(self, requests: List[LlmRequest]) -> None:
         """Start async KV sends for finished context-only requests."""
@@ -814,8 +840,11 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def completed_gen_receives(self, scheduled_batch: "ScheduledRequests") -> List[LlmRequest]:
         return []
 
-    def try_finish_gen_receive(self, request: LlmRequest) -> bool:
+    def try_finish_gen_receive(self, request: LlmRequest, defer_commit: bool = False) -> bool:
         return False
+
+    def commit_deferred_gen_receives(self) -> None:
+        return None
 
     def prepare_context_schedulable(self, new_requests: List[LlmRequest]) -> None:
         return None
