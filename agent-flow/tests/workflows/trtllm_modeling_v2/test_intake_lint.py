@@ -116,14 +116,31 @@ def _finding(rule, task, **context):
     return next((f for f in lint.lint_task(task, **context).findings if f.rule == rule), None)
 
 
-def test_a_batch_and_a_concurrency_are_both_global_totals():
+def test_a_deployment_variant_stacks_its_axes_and_only_launch_blockers_are_findings():
+    """What only costs time is the operator's judgement; a combination the request ships is a variant."""
     task = copy.deepcopy(_GOOD)
-    task["members"] = {"default": ["dep4"]}
-    task["runtime"]["extra_flags"] = ["--max_seq_len=9216", "--max_batch_size=32"]
-    # Attention DP splits both alike: 32 in all is below 128 in all, whatever the ranks.
-    assert "runtime-batch-below-concurrency" in _rules(lint.lint_task(task))
-    task["runtime"]["extra_flags"] = ["--max_seq_len=9216", "--max_batch_size=128"]
-    assert "runtime-batch-below-concurrency" not in _rules(lint.lint_task(task))
+    task["features"] = ["disagg", "mtp"]
+    task["members"]["mtp"] = ["tep4"]
+    task["runtime"]["extra_flags"] = ["--max_seq_len=16384", "--max_batch_size=32"]
+    task["variants"]["deploy_ll"] = {
+        "unit": "mtp",
+        "members": ["tep4"],
+        "gates": ["accuracy", "acceptance"],
+        "runtime": {"chunked_prefill": True, "kv_cache_reuse": True},
+        "llm_api_options": {"kv_cache_config": {"dtype": "fp8"}},
+    }
+    task["notes"] = ""
+    # The deployment runs at tep4 alone: the request accepts its other cells.
+    task["coverage"]["accept"] += ["mtp@tp4", "mtp@dep4", "deploy_ll@*"]
+    assert not lint.lint_task(task).open()
+
+
+def test_derived_family_drops_the_task_head_suffix():
+    from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import derive_family
+
+    assert derive_family("GptOssForCausalLM") == "gpt_oss"
+    assert derive_family("Qwen4ExpForConditionalGeneration") == "qwen4_exp"
+    assert derive_family("KimiK3VLForConditionalGeneration") == "kimi_k3_vl"
 
 
 def test_an_accuracy_check_runs_eager_only_on_purpose():
@@ -144,8 +161,8 @@ def test_an_accuracy_check_runs_eager_only_on_purpose():
     task["profile"] = {"multimodal": "smoke"}
     findings = {f.rule: f for f in lint.lint_task(task).findings}
     assert "for core, kv_fp8, chunked:" in findings["accuracy-eager"].message
-    assert "the checks of multimodal run" in findings["runtime-cuda-graph-off"].message
-    assert not {"accuracy-eager", "runtime-cuda-graph-off"} & _rules(lint.lint_task(_GOOD))
+    assert "multimodal" not in findings["accuracy-eager"].message
+    assert "accuracy-eager" not in _rules(lint.lint_task(_GOOD))
 
 
 def test_a_placeholder_anchor_is_named_with_the_floor_it_implies(tmp_path):
@@ -158,6 +175,10 @@ def test_a_placeholder_anchor_is_named_with_the_floor_it_implies(tmp_path):
     assert _finding("accuracy-placeholder-anchor", task) is None
     reference.write_text("# placeholder\n" + yaml.safe_dump({"toy": [{"accuracy": 95.0}]}))
     assert "95 -> floor 93.80" in _finding("accuracy-placeholder-anchor", task).message
+    # A row the gate cannot resolve stops preflight: the lint says so first.
+    task["accuracy"]["model_key"] = "absent"
+    finding = _finding("accuracy-anchor-row", task)
+    assert finding.severity == lint.BLOCK and "does not resolve" in finding.message
 
 
 def _tree(tmp_path):
@@ -243,23 +264,6 @@ def test_a_kv_dtype_the_engine_refuses_is_a_block(tmp_path):
     assert "kv-cache-dtype" not in _rules(lint.lint_task(task, repo=repo))
     # A tree that does not say what it accepts is not guessed at.
     assert prior_art.engine_kv_dtypes(tmp_path / "elsewhere") is None
-
-
-def test_a_feature_is_not_proven_again_under_another_axis():
-    task = copy.deepcopy(_GOOD)
-    task["features"] = ["disagg", "mtp"]
-    task["members"]["mtp"] = ["dep4"]
-    task["variants"]["mtp_kv_fp8"] = {
-        "unit": "mtp",
-        "llm_api_options": {"kv_cache_config": {"dtype": "fp8"}},
-    }
-    finding = _finding("feature-combination", task)
-    assert "mtp_kv_fp8 (mtp x kv dtype: " in finding.message
-    assert "core proves the axis in kv_fp8" in finding.message
-    # A variant on a feature unit that changes none of the storage or scheduling axes is the
-    # feature's own configuration, not a combination.
-    task["variants"]["mtp_kv_fp8"] = {"unit": "mtp", "env": {"TRTLLM_MTP_EAGER": "1"}}
-    assert "feature-combination" not in _rules(lint.lint_task(task))
 
 
 def test_every_member_holds_one_engine_of_the_checkpoint(tmp_path):

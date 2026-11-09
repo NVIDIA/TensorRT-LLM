@@ -30,14 +30,14 @@ The agent prepares the spec and launches the workflow; missing inputs must be re
 
 **The agent writes the spec by following [spec/INTAKE.md](spec/INTAKE.md)**: `trtllm-modeling-v2 intake
 derive` writes a starting spec (no `site.yaml` needed), and `trtllm-modeling-v2 intake lint` checks
-it for slow or stalling choices (eager gates, a batch below the claimed concurrency, a perf
-config whose CUDA graphs stop below the live requests a rank holds, a member too
-narrow for one engine, disaggregation wider than a session, variant cross products, variants that
-boot at every member, a feature proven
-at several members or again under another axis, unusable accuracy anchors, open-ended boot probes) and blocks an accuracy check that runs without CUDA graphs and
-what would stop preflight (uncovered requested cells, a KV-cache dtype the engine does not load),
-and prints the contract's checks per unit and variant, the
-engine's constraints for this geometry and the prior art the tree already holds. The spec should be
+it for what would stop the launch or judge it wrongly (the spec's schema, a member too narrow for
+one engine, disaggregation wider than a session, a KV-cache dtype the engine does not load, an
+anchor row the accuracy gate cannot resolve, a placeholder anchor, a chat-template protocol cut
+off early, an accuracy check run without CUDA graphs, open-ended boot probes, uncovered requested
+cells, a missing interpreter or role model, a perf config whose CUDA graphs stop below the live
+requests a rank holds), and prints the contract's checks per unit and variant, the engine's
+constraints for this geometry and the prior art the tree already holds. What only costs time is
+the launching agent's judgement, following INTAKE.md. The spec should be
 the smallest contract that covers the request. Launch only once the lint is clean or its findings
 are accepted in `notes`. Preflight's substrate gate boots a GPU beside the run's first turns; its
 failure stops the run, which the same command resumes once the host is fixed.

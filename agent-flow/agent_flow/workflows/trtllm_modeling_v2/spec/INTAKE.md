@@ -61,7 +61,7 @@ goal words cannot say.
 | "Y only aggregate / text-only" | Y in `members.default` for core alone; its variant and feature cells in `coverage.accept` | |
 | "<feature> smoke" | the feature in `features`, `profile: {<feature>: smoke}`, its members narrowed | |
 | a KV cache dtype list | base `kv_cache_config.dtype: auto`; one variant per other dtype (`llm_api_options.kv_cache_config.dtype`, `gates: [accuracy]`) | |
-| chunked prefill, block reuse | off in core (`runtime.chunked_prefill: false`, `kv_cache_reuse: false`); one `chunked` variant (`gates: [accuracy]`) with a `max_num_tokens` below the benchmark's prompts (e.g. 512 for 8-shot GSM8K) so they are really split, one `reuse` variant with `kv_cache_config.enable_block_reuse: true`, each only when asked (`chunked_prefill`, `prefix_reuse` in `--goal`) | the core configuration is CUDA graphs and the overlap scheduler at TP/TEP/ADP, the KV and SSM caches in the checkpoint's own dtype; every other feature is one variant on core, never combined (the lint blocks a cross product unless the notes accept the one the request names) |
+| chunked prefill, block reuse | off in core (`runtime.chunked_prefill: false`, `kv_cache_reuse: false`); one `chunked` variant (`gates: [accuracy]`) with a `max_num_tokens` below the benchmark's prompts (e.g. 512 for 8-shot GSM8K) so they are really split, one `reuse` variant with `kv_cache_config.enable_block_reuse: true`, each only when asked (`chunked_prefill`, `prefix_reuse` in `--goal`) | the core configuration is CUDA graphs and the overlap scheduler at TP/TEP/ADP, the KV and SSM caches in the checkpoint's own dtype; every other feature is one variant on core; a combination is a deployment the request names (below) |
 | disagg | `accuracy.disagg.test`: the node id of the target's disaggregated-serving accuracy test, written beside the tree's own (the tests that serve through `trtllm-serve disaggregated`, configured, set up and launched as they are), with the environment it reads in `accuracy.disagg.env` (`LLM_MODELS_ROOT` ...); it runs once, at the member the request validates fully. Derive sizes it from the checkpoint: **one node** when a context and a generation engine both fit (`accuracy.disagg.devices`, two engines of two on a 4-GPU node), else `accuracy.disagg.nodes` with one engine per node, as the tree's multi-node disaggregated tests place them | boot and accuracy run one aggregated engine and never cross the hop; a multi-node test runs one pytest process per node of one gates allocation (`MV2FLOW_JOB_NODE_RANK/HOSTS/NODES`), so the gates session must hold that many nodes |
 | any other feature (MTP, speculative, offload ...) | name it in `--goal`; `derive.report.md` and `task.example.yaml` say what its unit owes | the same one-variant-per-axis rule applies |
 | a deployment, e.g. "low latency at TEP4 with MTP3, chunked prefill and reuse" | **one variant per deployment**: `unit:` the feature it serves (`mtp`), `members: [tep4]`, its options stacked in one `llm_api_options` overlay, `gates: [accuracy, acceptance]` (`acceptance` only with a speculator) | it proves the combination that ships, which one variant per axis never runs (disagg + MTP at attention TP failed only once deployed); a failure is the worker's to bisect along the axes |
@@ -89,7 +89,7 @@ states it:
   combination, added only when the request names it. A variant of disagg owes nothing.
 - Leave the boot boundaries off (section 5) and the profile at `standard` unless the request asks.
 
-The lint prints the checks per unit and variant; past ~30 deserves a second look.
+The lint prints the checks per unit and variant; past ~20 deserves a second look.
 
 **The disagg test.** The run writes it; the flow deploys nothing of its own. Name the node id it
 will have, say in `notes` which task writes it (the lint's `disagg-test-pending` notes it until
@@ -230,9 +230,8 @@ trtllm-modeling-v2 intake lint --task task.yaml --report intake.report.md [--ses
 
 Fix every `block` and every `warn`, or keep one on purpose with a line in `notes`:
 `intake-accept: <rule>[, <rule>] -- <why>`. A `block` is what preflight or the first boot would stop
-on (a requested cell no check covers, a KV-cache dtype the engine does not load) and cannot be
-accepted, except a cross product of variants the request names and an accuracy check run eager on
-purpose. The report also prints the contract size; a contract past ~30 checks
-deserves a second look. Then `--dry-run`, then launch. Preflight journals the same lint, so the run's record shows
+on (a requested cell no check covers, a KV-cache dtype the engine does not load, an anchor row
+the gate cannot resolve) and cannot be accepted, except an accuracy check run eager on purpose.
+The report also prints the contract size; a contract past ~20 checks deserves a second look. Then `--dry-run`, then launch. Preflight journals the same lint, so the run's record shows
 what was accepted. Once it runs, steer it only through `feedback` (the README's "While it runs"):
 cancelling the run's own jobs proves nothing and costs them again.

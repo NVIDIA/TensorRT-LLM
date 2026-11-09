@@ -434,8 +434,16 @@ def derive_slug(data: Mapping[str, Any]) -> str:
 
 
 def derive_family(architecture: str) -> str:
-    """``GptOssForCausalLM`` -> ``gpt_oss``: the modeling_v2 family directory."""
-    name = re.sub(r"For(Causal|Conditional|Seq2Seq|Sequence)?LM$", "", architecture)
+    """``GptOssForCausalLM`` -> ``gpt_oss``: the modeling_v2 family directory.
+
+    The task head's suffix goes, ``ForConditionalGeneration`` (a checkpoint with a vision
+    tower) as well as ``For...LM``: ``Qwen4ExpForConditionalGeneration`` -> ``qwen4_exp``.
+    """
+    name = re.sub(
+        r"For(?:(?:Causal|Conditional|Seq2Seq|Sequence)?LM|ConditionalGeneration)$",
+        "",
+        architecture,
+    )
     name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
     name = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", name)
     return re.sub(r"[^a-zA-Z0-9]+", "_", name).strip("_").lower()

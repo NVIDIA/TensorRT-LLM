@@ -1,19 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Intake lint: what a spec will cost and where it is likely to stall, before any GPU is spent.
+"""Intake lint: what would stop a launch or judge it wrongly, before any GPU is spent.
 
-The schema says whether a spec is well formed. This says whether it is a good
-one for the request: settings that make every gate slow (eager graphs, a batch
-below the concurrency it claims), scope that multiplies the contract (variant
-cross products, a feature proven at several members or again under another
-axis, a member too narrow for one engine, a disaggregated member wider than a
-session), accuracy that
-cannot judge anything (a placeholder anchor, a chat-template protocol cut off
-early), boot probes that fail on near ties, a launch the environment cannot
-start, a compute session no gate reaches, and notes that tell the roles what
-not to read but nothing about the model. Each finding names its rule, why it
-costs time and the usual fix.
+The schema says whether a spec is well formed. This says whether it can run and
+be judged: a launch the environment or the engine cannot start (a member too
+narrow for one engine, a KV dtype the engine does not load, a disaggregated
+member wider than a session, a missing interpreter or role model), an accuracy
+check that cannot judge anything (an anchor row that does not resolve, a
+placeholder anchor, a chat-template protocol cut off early, a benchmark run
+eager), boot probes that fail on near ties, and a requested cell no check
+covers. What only costs time is the operator agent's judgement, following
+``spec/INTAKE.md``. Each finding names its rule, why and the usual fix.
 
 Every rule reads the spec and the checkpoint's ``config.json``, never a model
 name: a :data:`RULES` entry is a function of a :class:`LintContext` yielding
@@ -29,7 +27,6 @@ A finding the spec keeps on purpose is accepted in ``notes`` with a line
 from __future__ import annotations
 
 import json
-import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,10 +36,8 @@ import yaml
 
 from ..checks import accuracy_policy, check_config
 from ..checks import disagg as disagg_checks
-from ..infra.compute.sessions import GATE_ROLES
-from ..operators import prior_art, tree_anchors
+from ..operators import prior_art
 from ..tune.schema import REMOVED_PERF_KEYS
-from . import variants as variants_mod
 from .task_schema import (
     assembly_units,
     gpus_per_node,
@@ -56,39 +51,19 @@ BLOCK = "block"
 WARN = "warn"
 INFO = "info"
 
-#: Blocks a request may still keep on purpose, accepted in notes like a warn: a combination
-#: of non-core features the request names, which the contract otherwise refuses to multiply,
-#: and an accuracy check run eager on purpose (a short subset, a capture still being built).
-ACCEPTABLE_BLOCKS: frozenset[str] = frozenset({"variants-cross-product", "accuracy-eager"})
-#: A contract past this many required checks is worth a second look before it is paid for:
-#: every check loads the model, and every change to the target runs the stale ones again.
-CONTRACT_REVIEW_SIZE = 30
+#: Blocks a request may still keep on purpose, accepted in notes like a warn: an accuracy
+#: check run eager on purpose (a short subset, a capture still being built).
+ACCEPTABLE_BLOCKS: frozenset[str] = frozenset({"accuracy-eager"})
 #: Per benchmark: an anchor below this cannot tell a working target from a broken one.
 PLAUSIBLE_ANCHOR: dict[str, float] = {"gsm8k": 60.0}
 #: Output tokens a chat-template protocol needs for a model that reasons first.
 CHAT_TEMPLATE_MIN_OUTPUT = 1024
-#: A chunked-prefill engine splitting prompts finer than this pays a context step per chunk.
-SMALL_CHUNK_TOKENS = 4096
 #: The share of a device's memory one engine's weights may take: the rest holds the KV cache,
 #: activations and CUDA graphs. A member below the width this implies cannot serve the model.
 #: (A 344-GiB checkpoint has served disaggregated on two 277-GiB devices per engine: 62%.)
 ENGINE_WEIGHT_FRACTION = 0.75
-#: Notes past this many characters stop being a brief: every role reads them in every turn.
-NOTES_BRIEF_CHARS = 6000
-#: The prior-art leads of each kind the notes are expected to name (or set aside).
-PRIOR_ART_NAMED_PER_KIND = 3
 
 _ACCEPT = re.compile(r"intake-accept:\s*([a-z0-9-]+(?:\s*,\s*[a-z0-9-]+)*)", re.I)
-# Words about the intake itself. At launch every role reads them as standing orders.
-_INTAKE_PROCESS = re.compile(
-    r"\bintake[- ]only\b"
-    r"|\bthis intake\b"
-    r"|\bnot (?:an? )?authori[sz]ation to (?:launch|run|start)"
-    r"|\b(?:do not|don't|never)\s+(?:start|launch|run)\s+(?:the\s+)?(?:workflow|run)\b"
-    r"|\bno\s+(?:workflow|agent turns?|builds?|slurm jobs?)\b[^.]{0,120}\b(?:allowed|permitted)\b",
-    re.I,
-)
-_BRIEF_WORDS = ("architecture", "prior art")
 _PLACEHOLDER_WORDS = ("placeholder", "uncalibrated", "unmeasured", "pending")
 
 
@@ -195,35 +170,6 @@ class LintContext:
 Rule = Callable[[LintContext], Iterable[Finding]]
 
 
-def _flags(runtime: Mapping[str, Any]) -> dict[str, Any]:
-    options, _, _ = check_config.parse_runtime_flags(runtime.get("extra_flags") or ())
-    return options
-
-
-def _perf_targets(task: Mapping[str, Any]) -> list[tuple[str | None, int, int | None, int | None]]:
-    """(member or None, max concurrency, isl, osl) the perf block asks for."""
-    perf = task.get("perf") or {}
-    found = []
-    workload = perf.get("workload") or {}
-    if workload.get("concurrency"):
-        found.append((None, max(workload["concurrency"]), workload.get("isl"), workload.get("osl")))
-    for config in perf.get("configs") or ():
-        load = config.get("workload") or {}
-        if load.get("concurrency"):
-            found.append(
-                (config.get("name"), max(load["concurrency"]), load.get("isl"), load.get("osl"))
-            )
-    return found
-
-
-def _as_member(name: Any) -> bool:
-    """Whether a perf config's name is a parallel member (``tp4``, ``dep4``)."""
-    try:
-        return bool(name) and parse_parallel_segment(str(name))[1] is not None
-    except Exception:
-        return False
-
-
 _gpus_per_node = gpus_per_node
 
 
@@ -236,33 +182,6 @@ def _benchmark_args(accuracy: Mapping[str, Any]) -> list[str]:
     if isinstance(args, Mapping):
         args = args.get("default") or next(iter(args.values()), [])
     return [str(a) for a in args]
-
-
-def _variant_axes(entry: Mapping[str, Any]) -> set[str]:
-    axes = set()
-    runtime = entry.get("runtime") or {}
-    options = entry.get("llm_api_options") or {}
-    flags = _flags(runtime)
-    if (options.get("kv_cache_config") or {}).get("dtype") or (
-        flags.get("kv_cache_config") or {}
-    ).get("dtype"):
-        axes.add("kv dtype")
-    if (
-        "chunked_prefill" in runtime
-        or "enable_chunked_prefill" in options
-        or "max_num_tokens" in flags
-        or "max_num_tokens" in options
-    ):
-        axes.add("chunked prefill")
-    if "kv_cache_reuse" in runtime or "enable_block_reuse" in (
-        options.get("kv_cache_config") or {}
-    ):
-        axes.add("block reuse")
-    if options.get("speculative_config") or flags.get("speculative_config"):
-        axes.add("speculative decoding")
-    if "mamba_ssm_cache_dtype" in flags or "mamba_ssm_cache_dtype" in options:
-        axes.add("ssm dtype")
-    return axes
 
 
 def checkpoint_weight_bytes(checkpoint: str | Path | None) -> int | None:
@@ -304,17 +223,6 @@ def _gib(nbytes: float) -> str:
     return f"{nbytes / 2**30:.0f} GiB"
 
 
-def _session_nodes(task: Mapping[str, Any]) -> int:
-    """The most nodes one session the gates run on holds (``environment.sessions[].nodes``)."""
-    sessions = (task.get("environment") or {}).get("sessions") or ()
-    nodes = [
-        s.get("nodes") or 1
-        for s in sessions
-        if isinstance(s, Mapping) and s.get("role", "any") in GATE_ROLES
-    ]
-    return max([n for n in nodes if isinstance(n, int)] or [1])
-
-
 def _host_path(environment: Mapping[str, Any], path: str) -> Path | None:
     """Where ``path``, as the run's commands see it, lives on this host; ``None``: in the image only."""
     if not environment.get("container_image"):
@@ -338,11 +246,10 @@ def cuda_graph_rules(ctx: LintContext) -> Iterator[Finding]:
         return
     eager = [c.name for c in captures if c.resolved is None]
     if ctx.contract is None:
-        checked = scored = set(eager)
+        scored = set(eager)
     else:
         # The disaggregated-serving test configures its own engines, whatever `runtime` says.
         required = [c for c in ctx.contract.required() if c.gate != disagg_checks.GATE_NAME]
-        checked = {c.unit for c in required}
         scored = {c.unit for c in required if str(c.gate).startswith("accuracy")}
     blocked = [name for name in eager if name in scored]
     fix = (
@@ -360,76 +267,6 @@ def cuda_graph_rules(ctx: LintContext) -> Iterator[Finding]:
             "scored is not the captured path the target serves",
             fix,
         )
-    rest = [name for name in eager if name in checked and name not in scored]
-    if rest:
-        yield Finding(
-            "runtime-cuda-graph-off",
-            WARN,
-            f"the checks of {', '.join(rest)} run without CUDA graphs: none exercises the "
-            "captured path the target serves there",
-            fix,
-        )
-
-
-def runtime_rules(ctx: LintContext) -> Iterator[Finding]:
-    task = ctx.task
-    runtime = check_config.resolve_runtime(task, None)
-    flags = _flags(runtime)
-    batch = flags.get("max_batch_size") or ctx.accuracy.get("max_batch_size")
-    seq = flags.get("max_seq_len") or ctx.accuracy.get("max_seq_len")
-    chunk = flags.get("max_num_tokens")
-    targets = _perf_targets(task)
-    # A batch size and a concurrency are both global totals: an attention-DP rank serves
-    # its share of each (``check_config.share_batch``), so they compare as they stand.
-    short: dict[str, int] = {}
-    for member, concurrency, _, _ in targets:
-        for name in [member] if _as_member(member) else members_for(task, "core", ctx.world):
-            if isinstance(batch, int) and batch < concurrency > short.get(name, 0):
-                short[name] = concurrency
-    for name, concurrency in short.items():
-        yield Finding(
-            "runtime-batch-below-concurrency",
-            WARN,
-            f"max_batch_size {batch} is below the concurrency {name} is measured at "
-            f"({concurrency}, a global total like the batch): the perf points queue instead of "
-            f"measuring, and the CUDA-graph capture list stops short",
-            f"size max_batch_size to the largest concurrency ({concurrency}), or drop the "
-            "concurrencies the target is not meant to serve",
-        )
-    on = [name for name in ("chunked_prefill", "kv_cache_reuse") if runtime.get(name)]
-    if on:
-        yield Finding(
-            "runtime-non-core-in-core",
-            WARN,
-            f"the core configuration turns on {' and '.join(on)}: a non-core feature in core is "
-            "in every check, so a failure no longer says which feature it belongs to",
-            "keep core to CUDA graphs and the overlap scheduler; turn it off in `runtime` and "
-            "prove it with its own variant on core (`chunked`, `reuse`)",
-        )
-    # One workload decides the envelope: the first that states both lengths.
-    workloads = [(i, o) for _, _, i, o in targets if isinstance(i, int) and isinstance(o, int)]
-    for isl, osl in workloads[:1]:
-        if isinstance(seq, int) and seq > 1.25 * (isl + osl):
-            yield Finding(
-                "runtime-max-seq-len-oversized",
-                WARN,
-                f"max_seq_len {seq} is well above the workload's {isl}+{osl}: KV pools and "
-                "boundary probes are sized for lengths nothing serves",
-                f"set max_seq_len to {isl + osl} (isl + osl) unless a longer context is requested",
-            )
-        if (
-            runtime.get("chunked_prefill")
-            and isinstance(chunk, int)
-            and chunk < min(isl, SMALL_CHUNK_TOKENS)
-        ):
-            yield Finding(
-                "runtime-small-chunk",
-                WARN,
-                f"max_num_tokens {chunk} splits every {isl}-token prompt into "
-                f"{math.ceil(isl / chunk)} context chunks in every gate",
-                "keep max_num_tokens at the workload's isl (or 8192) and prove chunking "
-                "with one `chunked` variant at a small max_num_tokens",
-            )
 
 
 def kv_cache_rules(ctx: LintContext) -> Iterator[Finding]:
@@ -487,17 +324,6 @@ def placement_rules(ctx: LintContext) -> Iterator[Finding]:
     per_node = _gpus_per_node(task)
     if not per_node:
         return
-    nodes = _session_nodes(task)
-    disagg_spec = disagg_checks.DisaggSpec.from_task(task)
-    if nodes > 1 and not (disagg_spec and disagg_spec.nodes > 1):
-        yield Finding(
-            "session-nodes-unneeded",
-            INFO,
-            f"a gates session holds {nodes} nodes, but no check needs more than one (the "
-            "disaggregated-serving test runs on one node): a multi-node allocation waits "
-            "longer to start and to renew than single-node ones",
-            "use single-node sessions",
-        )
     if "disagg" not in assembly_units(task):
         return
     spec = disagg_checks.DisaggSpec.from_task(task) or disagg_checks.DisaggSpec(
@@ -537,126 +363,6 @@ def _width(member: str) -> int:
         return parse_parallel_segment(member)[1] or 1
     except Exception:
         return 1
-
-
-def scope_rules(ctx: LintContext) -> Iterator[Finding]:
-    task = ctx.task
-    crossed = sorted(
-        name
-        for name, entry in (task.get("variants") or {}).items()
-        if len(_variant_axes(entry or {})) >= 2
-    )
-    if crossed:
-        yield Finding(
-            "variants-cross-product",
-            BLOCK,
-            f"{len(crossed)} variant{'s combine' if len(crossed) > 1 else ' combines'} two or more axes "
-            f"({', '.join(crossed[:6])}{', ...' if len(crossed) > 6 else ''}): each pays its own "
-            "checks and proves no axis a one-axis variant does not",
-            "one variant per non-core feature (a KV dtype, `chunked`, `reuse`) proves each; a "
-            "combination the request names goes in notes with `intake-accept: "
-            "variants-cross-product -- <why>`",
-        )
-    if profile_of(task) == "certified":
-        yield Finding(
-            "profile-certified",
-            INFO,
-            "the certified profile turns on boot boundaries and the serve gate",
-        )
-
-
-def contract_rules(ctx: LintContext) -> Iterator[Finding]:
-    if ctx.contract is None:
-        return
-    required = ctx.contract.required()
-    if len(required) > CONTRACT_REVIEW_SIZE:
-        yield Finding(
-            "contract-size",
-            WARN,
-            f"the contract owes {len(required)} checks: each loads the model, each accuracy "
-            "check is a full benchmark run, and every change to the target runs the stale "
-            "ones again",
-            "prove each requested feature once, at the member the request validates fully; "
-            "members the request scopes to text-only take core alone; accept the rest "
-            "explicitly (the report's per-unit lines show where the checks go)",
-        )
-    # A storage or scheduling variant that boots boots at every member of its unit.
-    boots: dict[str, int] = {}
-    for name in variants_mod.variants(ctx.task):
-        gates = variants_mod.variant_gates(ctx.task, name)
-        if "boot" not in gates or "accuracy" not in gates or "acceptance" in gates:
-            continue
-        if profile_of(ctx.task, name) in ("smoke", "bringup"):
-            continue
-        count = sum(1 for c in required if c.unit == name and c.gate == "boot")
-        if count:
-            boots[name] = count
-    if boots:
-        yield Finding(
-            "variant-boot-everywhere",
-            WARN,
-            f"{', '.join(f'{n} ({k})' for n, k in boots.items())} boot at every member of their "
-            f"unit: {sum(boots.values())} boot checks, each a model load, beside accuracy "
-            "checks that load the same engine and fail unless each rank reports the variant's "
-            "setting (its KV dtype, its chunking)",
-            "give each such variant `gates: [accuracy]` and `members:` the member(s) the request "
-            "validates it at, and accept its other cells in coverage.accept",
-        )
-
-
-def feature_rules(ctx: LintContext) -> Iterator[Finding]:
-    """Each requested feature is proven once: at one member, and not again under another axis."""
-    if ctx.contract is None:
-        return
-    task = ctx.task
-    required = ctx.contract.required()
-    units = assembly_units(task)
-    spread = []
-    for unit in units[1:]:
-        if profile_of(task, unit) == "certified":
-            continue
-        at = list(dict.fromkeys(c.member for c in required if c.unit == unit))
-        if len(at) > 1:
-            count = sum(1 for c in required if c.unit == unit)
-            spread.append(f"{unit} at {', '.join(at)} ({count} checks)")
-    if spread:
-        yield Finding(
-            "feature-members",
-            WARN,
-            f"{'; '.join(spread)}: one member proves a feature, and each other member proves it "
-            "again with a model load per check",
-            "narrow the feature's `members` to the member the request validates fully and list "
-            "its other cells in coverage.accept; keep more only when the request names them",
-        )
-    # Axes a variant on core proves, so a variant on a feature unit that changes one is a combination.
-    on_core: dict[str, list[str]] = {}
-    declared = variants_mod.variants(task)
-    for name, entry in declared.items():
-        if variants_mod.base_unit(task, name) == units[0]:
-            for axis in _variant_axes(entry):
-                on_core.setdefault(axis, []).append(name)
-    combined = []
-    for name, entry in declared.items():
-        base = variants_mod.base_unit(task, name)
-        axes = sorted(_variant_axes(entry))
-        count = sum(1 for c in required if c.unit == name)
-        if base == units[0] or not axes or not count or profile_of(task, name) == "certified":
-            continue
-        proven = sorted({v for axis in axes for v in on_core.get(axis, ())})
-        combined.append(
-            f"{name} ({base} x {', '.join(axes)}: {count} check{'s' if count > 1 else ''}"
-            + (f"; core proves the axis in {', '.join(proven)}" if proven else "")
-            + ")"
-        )
-    if combined:
-        yield Finding(
-            "feature-combination",
-            WARN,
-            f"{'; '.join(combined)}: a variant on a feature unit proves a combination; its "
-            "feature is proven by its own unit's checks and the axis by a variant on core",
-            "put the variant on `unit: core` (or drop it when core already proves the axis); keep "
-            "a combination only when the request names it",
-        )
 
 
 def coverage_rules(ctx: LintContext) -> Iterator[Finding]:
@@ -755,6 +461,26 @@ def accuracy_rules(ctx: LintContext) -> Iterator[Finding]:
         )
 
 
+def anchor_rules(ctx: LintContext) -> Iterator[Finding]:
+    """Every unit's anchor row resolves, committed: preflight refuses the launch otherwise.
+
+    The lookup is the accuracy gate's own (``preflight.check_accuracy_anchors``).
+    """
+    from ..run.startup.preflight import PreflightError, check_accuracy_anchors
+
+    try:
+        check_accuracy_anchors(ctx.task)
+    except PreflightError as exc:
+        yield Finding(
+            "accuracy-anchor-row",
+            BLOCK,
+            " ".join(str(exc).split("\n\nNothing here")[0].split()),
+            "add the row, citing its written source (or a low placeholder such as 10 on "
+            "GSM8K until one is measured), under the protocol the gate runs, and commit it; "
+            "or fix `accuracy.model_key` / `accuracy.discriminators`",
+        )
+
+
 def boot_rules(ctx: LintContext) -> Iterator[Finding]:
     envelope = ctx.accuracy.get("envelope") or {}
     on = envelope.get("enabled") or (envelope == {} and profile_of(ctx.task) == "certified")
@@ -767,24 +493,6 @@ def boot_rules(ctx: LintContext) -> Iterator[Finding]:
             "routing, low-precision GEMM tactics) and fail every boot without a defect",
             "set accuracy.envelope.probes to continuations with one right answer, e.g. "
             '["1, 2, 3, 4, 5, 6, 7,", "Monday, Tuesday, Wednesday,"]',
-        )
-    if envelope.get("enabled") and profile_of(ctx.task) != "certified":
-        from ..checks.boot import BootBoundarySpec
-
-        spec = BootBoundarySpec.from_task(ctx.task)
-        boots = ctx.contract.required() if ctx.contract is not None else ()
-        at = [
-            f"{c.unit}@{c.member}"
-            for c in boots
-            if c.gate == "boot" and spec.runs_at(ctx.task, c.unit, c.member, ctx.world)
-        ]
-        yield Finding(
-            "envelope-on",
-            INFO,
-            f"accuracy.envelope is on: the boot at {', '.join(at) or 'one member of each unit'} "
-            "also runs the boundary probes (alone, then under load, at the longest prompt the "
-            "engine takes); a probe whose legs part past a near-tie fails that boot. Leave it off "
-            "unless the request asks for boot boundaries; the certified profile turns it on",
         )
 
 
@@ -849,45 +557,6 @@ def agents_rules(ctx: LintContext) -> Iterator[Finding]:
         )
 
 
-def notes_rules(ctx: LintContext) -> Iterator[Finding]:
-    notes = ctx.notes
-    lowered = notes.lower()
-    missing = [w for w in _BRIEF_WORDS if w not in lowered]
-    if missing:
-        yield Finding(
-            "notes-missing-brief",
-            WARN,
-            f"notes have no {' or '.join(repr(w) for w in missing)} section: every role reads "
-            "them, and rules alone say nothing about the model or what the tree already has",
-            "add an architecture brief (attention kinds and head dims, sparse/indexer, MoE, "
-            "norms, towers) and 'Prior art in this tree worth surveying: ...' from the lint "
-            "report's prior-art leads you checked",
-        )
-    if len(notes) > NOTES_BRIEF_CHARS:
-        yield Finding(
-            "notes-long",
-            WARN,
-            f"notes are {len(notes)} characters: every role reads them in every turn, and a "
-            "brief that long buries the few facts that change what a role does",
-            f"keep notes under ~{NOTES_BRIEF_CHARS} characters (reference, architecture, prior "
-            "art, engine constraints, scope); keep evidence, provenance and launch "
-            "caveats in intake files a role can open when it needs them",
-        )
-    # `intake-accept:` paragraphs explain the intake's choices; they are not orders.
-    orders = "\n".join(p for p in re.split(r"\n\s*\n", notes) if "intake-accept:" not in p.lower())
-    process = _INTAKE_PROCESS.search(orders)
-    if process:
-        yield Finding(
-            "notes-intake-process",
-            WARN,
-            f'notes speak about the intake itself ("{process.group(0)}"): at launch every role '
-            "reads them as standing orders, and a line such as 'no build is allowed' stops the "
-            "run's own work",
-            "keep notes to what the roles need while they work; put what the intake may or may "
-            "not do, launch blockers and questions for the user in the intake summary",
-        )
-
-
 def engine_rules(ctx: LintContext) -> Iterator[Finding]:
     for constraint in ctx.constraints:
         yield Finding(
@@ -896,46 +565,6 @@ def engine_rules(ctx: LintContext) -> Iterator[Finding]:
             constraint,
             "decide the design in notes before the survey (the way out it names, or a planned "
             "native kernel)",
-        )
-
-
-def prior_art_rules(ctx: LintContext) -> Iterator[Finding]:
-    """The best leads of each kind are named in notes: used, or set aside with a reason."""
-    if ctx.prior_art is None:
-        return
-    lowered = ctx.notes.lower()
-    unnamed = []
-    for kind in dict.fromkeys(c.kind for c in ctx.prior_art.candidates):
-        for candidate in ctx.prior_art.by_kind(kind)[:PRIOR_ART_NAMED_PER_KIND]:
-            tail = "/".join(Path(candidate.path).parts[-2:]).lower()
-            if tail not in lowered and not any(n.lower() in lowered for n in candidate.names):
-                unnamed.append(candidate.path)
-    if unnamed:
-        yield Finding(
-            "notes-prior-art-unnamed",
-            WARN,
-            f"notes do not name {len(unnamed)} of the top prior-art leads (the first "
-            f"{PRIOR_ART_NAMED_PER_KIND} of each kind): " + ", ".join(f"`{p}`" for p in unnamed),
-            "read each and give it one line under 'Prior art in this tree worth surveying', "
-            "named by its last two path parts (`<dir>/<file>.py`) or a function it defines: "
-            "what it offers, or why it does not fit",
-        )
-
-
-def tree_rules(ctx: LintContext) -> Iterator[Finding]:
-    """What the lint reads off the tree and this checkout has nowhere: the check it then skips."""
-    if not ctx.repo:
-        return
-    for gone in tree_anchors.missing(ctx.repo, prior_art.PRIOR_ART_ANCHORS):
-        anchor = gone.anchor
-        roots = ", ".join(f"`{r}/`" for r in anchor.roots)
-        yield Finding(
-            "tree-anchor-missing",
-            INFO,
-            f"{anchor.concept}: not at `{anchor.hint}`, and no {anchor.search} under {roots}, "
-            f"so {anchor.consequence}",
-            "if the engine renamed what identifies it, update its anchor "
-            "(`operators/tree_anchors.py`)",
         )
 
 
@@ -964,22 +593,16 @@ def perf_rules(ctx: LintContext) -> Iterator[Finding]:
 
 RULES: tuple[Rule, ...] = (
     cuda_graph_rules,
-    runtime_rules,
     kv_cache_rules,
     placement_rules,
-    scope_rules,
-    contract_rules,
-    feature_rules,
     coverage_rules,
     accuracy_rules,
+    anchor_rules,
     boot_rules,
     disagg_rules,
     environment_rules,
     agents_rules,
-    notes_rules,
     engine_rules,
-    prior_art_rules,
-    tree_rules,
     perf_rules,
 )
 
@@ -1078,47 +701,37 @@ def _planned_sessions(schema_error: str) -> tuple[list[str], list[str]]:
     return [p for p in problems if p not in spools], spools
 
 
-def main(argv: list[str] | None = None) -> int:
-    """``trtllm-modeling-v2 intake lint``: print the report; exit 1 while a finding stands."""
-    import argparse
+def lint_file(
+    path: Path,
+    *,
+    checkpoint: str | Path | None = None,
+    repo: str | Path | None = None,
+    sessions_planned: bool = False,
+) -> LintReport:
+    """Lint the spec at ``path`` as a launch reads it: its schema first, then :func:`lint_task`.
 
+    A schema error is a ``schema`` block. With ``sessions_planned`` a missing session spool is
+    information instead: the compute sessions start after the intake.
+    """
     from . import task_schema
     from .task_schema import TaskSchemaError, load_and_validate_task_yaml
 
-    parser = argparse.ArgumentParser(
-        prog="trtllm-modeling-v2 intake lint",
-        description="Lint a spec before launch: cost, scope, accuracy, boot probes, environment, "
-        "notes, engine constraints and prior art. CPU only; reads the checkpoint config and the tree.",
-    )
-    parser.add_argument("--task", type=Path, required=True, help="The spec to lint.")
-    parser.add_argument("--checkpoint", type=Path, default=None, help="Default: checkpoint_path.")
-    parser.add_argument("--repo", type=Path, default=None, help="Default: trtllm_repo_path.")
-    parser.add_argument("--report", type=Path, default=None, help="Also write the report here.")
-    parser.add_argument(
-        "--sessions-planned",
-        action="store_true",
-        help="The compute sessions are not started yet: a missing environment.spool is "
-        "reported as info instead of failing the schema.",
-    )
-    args = parser.parse_args(argv)
     try:
-        task = load_and_validate_task_yaml(args.task)
+        task = load_and_validate_task_yaml(path)
         schema_error = ""
     except TaskSchemaError as exc:
-        task = yaml.safe_load(args.task.read_text(encoding="utf-8")) or {}
+        task = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         schema_error = str(exc)
         # The rest of the lint reads the spec as a launch would: its paths and derived gates.
         try:
-            task_schema._resolve_spec_relative_paths(task, args.task.resolve().parent)
-            task_schema.derive_gate_defaults(task, args.task.resolve().parent)
+            task_schema._resolve_spec_relative_paths(task, path.resolve().parent)
+            task_schema.derive_gate_defaults(task, path.resolve().parent)
         except Exception:  # a spec that cannot be resolved is already a schema block
             pass
-    report = lint_task(
-        task, checkpoint=args.checkpoint, repo=args.repo, base=args.task.resolve().parent
-    )
+    report = lint_task(task, checkpoint=checkpoint, repo=repo, base=path.resolve().parent)
     if schema_error:
         problems, spools = _planned_sessions(schema_error)
-        if not args.sessions_planned:
+        if not sessions_planned:
             problems, spools = [schema_error], []
         if problems:
             report.findings.insert(0, Finding("schema", BLOCK, "\n  - ".join(problems)))
@@ -1131,6 +744,36 @@ def main(argv: list[str] | None = None) -> int:
                     spool.split(". ")[0] + ": start its compute session before launch",
                 ),
             )
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``trtllm-modeling-v2 intake lint``: print the report; exit 1 while a finding stands."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="trtllm-modeling-v2 intake lint",
+        description="Lint a spec before launch: what would stop it or judge it wrongly (engine "
+        "fit, accuracy anchors and protocol, boot probes, environment, coverage), engine "
+        "constraints and prior art. CPU only; reads the checkpoint config and the tree.",
+    )
+    parser.add_argument("--task", type=Path, required=True, help="The spec to lint.")
+    parser.add_argument("--checkpoint", type=Path, default=None, help="Default: checkpoint_path.")
+    parser.add_argument("--repo", type=Path, default=None, help="Default: trtllm_repo_path.")
+    parser.add_argument("--report", type=Path, default=None, help="Also write the report here.")
+    parser.add_argument(
+        "--sessions-planned",
+        action="store_true",
+        help="The compute sessions are not started yet: a missing environment.spool is "
+        "reported as info instead of failing the schema.",
+    )
+    args = parser.parse_args(argv)
+    report = lint_file(
+        args.task,
+        checkpoint=args.checkpoint,
+        repo=args.repo,
+        sessions_planned=args.sessions_planned,
+    )
     text = report.render()
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)
@@ -1144,6 +787,7 @@ __all__ = [
     "INFO",
     "RULES",
     "WARN",
+    "lint_file",
     "Finding",
     "LintContext",
     "LintReport",

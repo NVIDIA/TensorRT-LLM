@@ -70,9 +70,9 @@ def derive_main(argv: list[str]) -> int:
             "replace it with the cluster's (session_spool, its sessions, image, mounts)"
         )
     path = derive_mod.write_derivation(args.out, derivation)
-    task = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    report = lint_mod.lint_task(
-        task, checkpoint=args.checkpoint, repo=site["trtllm_repo_path"], base=path.resolve().parent
+    # The derived spec's schema too: a block the launch would hit is reported here, not later.
+    report = lint_mod.lint_file(
+        path, checkpoint=args.checkpoint, repo=site["trtllm_repo_path"], sessions_planned=True
     )
     (args.out / REPORT_FILENAME).write_text(report.render(), encoding="utf-8")
     print(f"→ {path}\n→ {args.out / derive_mod.REPORT_FILENAME}\n→ {args.out / REPORT_FILENAME}")

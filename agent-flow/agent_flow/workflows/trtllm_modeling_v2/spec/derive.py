@@ -61,8 +61,9 @@ DEFAULT_MEMBERS: tuple[str, ...] = ("tp1",)
 #: whole ``max_position_embeddings``.
 DEFAULT_WORKLOAD: dict[str, int] = {"isl": 4096, "osl": 1024, "max_batch_size": 64}
 #: Tokens between Mamba state snapshots on a hybrid checkpoint with block
-#: reuse: without a snapshot policy the engine turns reuse off.
-DEFAULT_SNAPSHOT_INTERVAL = 2048
+#: reuse: without a snapshot policy the engine turns reuse off, and a snapshot
+#: past the benchmark's prompts (a few hundred tokens of GSM8K) reuses nothing.
+DEFAULT_SNAPSHOT_INTERVAL = 256
 #: The boot gate's prompts when the site declares none: one whose answer any
 #: working target states, checked, and one open continuation.
 DEFAULT_BOOT: dict[str, Any] = {
