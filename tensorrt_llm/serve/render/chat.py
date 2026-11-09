@@ -493,11 +493,12 @@ def preparation_context(
     with the ids (see ``PreparedContext``). ``request`` is the request as rendered, so it
     does not yet carry ``prompt_token_ids``.
     """
-    excluded = 0
-    if res.default_chat_template is None:
-        # A server-level chat template may end differently, so the route reports
-        # unadjusted usage when one is configured.
-        excluded = int(res.extension.prompt_tokens_excluded_from_usage(request) or 0)
+    excluded = res.prompt_tokens_excluded_from_usage(
+        add_generation_prompt=request.add_generation_prompt,
+        pre_tokenized=request.prompt_token_ids is not None
+        or request.prompt_token_ids_b64 is not None,
+        request_chat_template=request.chat_template,
+    )
     thinking: Dict[str, bool] = {}
     if rendered.template_text and request.add_generation_prompt:
         # Deferred: the reasoning parsers module is only needed here.

@@ -632,7 +632,7 @@ async def test_messages_stream_after_a_fast_context_phase_is_the_reframed_genera
     expected = "".join([frame async for frame in reframed])
 
     def without_message_id(text):
-        return re.sub(r'"id":"msg_[0-9a-f]+"', '"id":"msg"', text)
+        return re.sub(r'"id":"msg_[0-9a-f_]+"', '"id":"msg"', text)
 
     assert _status(sent) == 200
     assert "event: ping" not in _body(sent)

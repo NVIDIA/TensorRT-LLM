@@ -107,7 +107,7 @@ class MemoryStore:
 
     Subclass and override ``commit``, ``get`` or ``presence`` to make a test's store block or
     fail; they may raise ``StoreError``, which the driver turns into a row fault or re-raises from
-    ``probe``.
+    ``probe``. Override ``reading_source`` to hold a put before the caller's memory is read.
     """
 
     def __init__(self, capacity: int | None = None) -> None:
@@ -116,6 +116,10 @@ class MemoryStore:
         self._writing: set[str] = set()
         self._presence_failure: str | None = None
         self.capacity = capacity
+
+    def reading_source(self, key: str) -> None:
+        """The put of ``key`` is about to read the caller's memory. A store that stalls here
+        keeps the source in use, as one that pulls the payload itself would."""
 
     def commit(self, key: str, payload: bytes, trailer: bytes) -> Commit:
         new = StoredObject(bytes(payload), bytes(trailer))
@@ -717,6 +721,7 @@ class MemoryDriver:
             return faulted(f"{type(error).__name__}: {error}")
 
     def _put_row(self, io: RowIO) -> RowResult:
+        self.store.reading_source(io.key)
         payload = _gather(io.spans)
         trailer = self._trailer_for(io, payload)
         outcome = self.store.commit(io.key, payload, trailer)

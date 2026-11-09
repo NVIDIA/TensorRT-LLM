@@ -16,6 +16,7 @@
 # yapf: disable
 import asyncio
 import json
+import os
 import signal
 import socket
 import traceback
@@ -57,7 +58,9 @@ from tensorrt_llm.serve.conversation_id import (extract_subagent_parent_id,
                                                 resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
-from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
+from tensorrt_llm.serve.kv_hints import KvHintsRoute
+from tensorrt_llm.serve.openai_client import (OpenAIClient, OpenAIHttpClient,
+                                              _server_base_url)
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
@@ -147,6 +150,9 @@ class RawRequestResponseHooks(ResponseHooks):
     def on_disagg_request_id(self, disagg_request_id: int):
         self.disagg_request_id = disagg_request_id
         self.request_id = str(disagg_request_id)
+        # A route that names its reply after the request (Anthropic Messages)
+        # reads it here, the id the perf metrics record.
+        self.raw_req.state.disagg_request_id = disagg_request_id
 
     def on_ctx_dispatch(self, request: UCompletionRequest):
         self.ctx_dispatch_time = get_steady_clock_now_in_seconds()
@@ -326,6 +332,8 @@ class OpenAIDisaggServer:
             await self._perf_metrics_writer.close()
 
         self.app = FastAPI(lifespan=lifespan)
+        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS", "0") == "1"
+        self.app.router.route_class = KvHintsRoute
 
         if self._collect_perf_metrics:
             self.app.add_middleware(
@@ -521,20 +529,26 @@ class OpenAIDisaggServer:
                 return _MessagesStreamingResponse(
                     chat=chat,
                     content=reframe_openai_stream(
-                        self._openai_stream_when_done(chat),
+                        self._openai_stream_when_done(chat, raw_request),
                         model=request.model),
                 )
 
-        answer = await self._messages_answer(chat)
+        answer = await self._messages_answer(chat, raw_request)
         if isinstance(answer, StreamingResponse):
+            # The reply is named after the disaggregated request rather than
+            # the worker's own id for it (see anthropic_message_id).
             return StreamingResponse(
-                content=reframe_openai_stream(answer.body_iterator,
-                                              model=request.model),
+                content=reframe_openai_stream(
+                    answer.body_iterator,
+                    model=request.model,
+                    request_id=getattr(raw_request.state, "disagg_request_id",
+                                       None)),
                 media_type="text/event-stream",
             )
         return answer
 
-    async def _messages_answer(self, chat: Awaitable[Response]) -> Response:
+    async def _messages_answer(self, chat: Awaitable[Response],
+                               raw_request: Request) -> Response:
         """Await a /v1/messages request's chat pipeline and answer from it.
 
         A stream is returned as the pipeline's OpenAI stream, anything else as
@@ -566,7 +580,12 @@ class OpenAIDisaggServer:
         try:
             chat_response = ChatCompletionResponse(
                 **json.loads(openai_response.body))
-            anthropic_response = convert_chat_response(chat_response)
+            # The reply is named after the disaggregated request rather than
+            # the worker's own id for it (see anthropic_message_id).
+            anthropic_response = convert_chat_response(
+                chat_response,
+                request_id=getattr(raw_request.state, "disagg_request_id",
+                                   None))
         except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
             logger.error(
                 "Invalid response from OpenAI chat pipeline:\n"
@@ -577,7 +596,8 @@ class OpenAIDisaggServer:
             exclude_none=True))
 
     async def _openai_stream_when_done(
-            self, chat: asyncio.Future) -> AsyncIterator[Union[str, bytes]]:
+            self, chat: asyncio.Future,
+            raw_request: Request) -> AsyncIterator[Union[str, bytes]]:
         """The OpenAI stream of a chat pipeline that outlasted the start wait.
 
         The status line is already out, so a pipeline that fails raises
@@ -587,7 +607,7 @@ class OpenAIDisaggServer:
         cancels the pipeline.
         """
         try:
-            answer = await self._messages_answer(chat)
+            answer = await self._messages_answer(chat, raw_request)
         finally:
             chat.cancel()
         if not isinstance(answer, StreamingResponse):
@@ -806,8 +826,7 @@ class OpenAIDisaggServer:
             # Negate the offset so that worker servers can adjust their steady clock by adding the new offset
             await set_steady_clock_offset(session, server_url, -offset)
 
-        server_scheme = "http://" if not server.startswith("http://") else ""
-        server_url = f"{server_scheme}{server}/steady_clock_offset"
+        server_url = f"{_server_base_url(server)}/steady_clock_offset"
 
         try:
             async with aiohttp.ClientSession(

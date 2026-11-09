@@ -67,7 +67,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
 | **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
 | **LTX-2.3** | Yes | Yes | No | No | No | No | Yes | Yes | Yes | Yes | Yes | No | No | No | No | No |
-| **MiniMax-H3** | Yes | Yes | No | No | No | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
+| **MiniMax-H3** | Yes | Yes | No | No | Yes | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No | No |
 | **Qwen-Image-Layered** | Yes | No | No | Yes | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No | No |
@@ -174,7 +174,7 @@ Tile geometry and blending follow the loaded Diffusers VAE.
 Tensor parallelism shards the DiT attention and gated MLP weights via
 `parallel_config.tp_size`. The text encoder, AdaLN modulation, and media
 input/output projections remain replicated. TP can be combined with Ulysses;
-Ulysses requires VANILLA or FA4 attention. CFG, ring, and Attention2D parallelism
+Ulysses supports VANILLA, FA4, TRTLLM, and FLASHINFER attention. CFG, ring, and Attention2D parallelism
 are not supported. See the
 [2-GPU TP config](../../../examples/visual_gen/configs/minimax-h3-bf16-tp2.yaml).
 
@@ -393,7 +393,7 @@ Skip Softmax and SOL share the `disabled_until_timestep` schedule that keeps the
 
 ### CPU Offloading
 
-CPU offloading stages move selected Wan and Cosmos3 T2V pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with `cpu_offload_config.enable: true`.
+CPU offloading stages move selected Wan, Cosmos3 T2V, and MiniMax-H3 pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with `cpu_offload_config.enable: true`.
 
 ### Multi-GPU Parallelism
 
@@ -407,7 +407,7 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
     - **Attention2D** (`attn2d_size: [N, M]`): Shards the sequence axis across an `N × M` device mesh (CP degree = `N · M`; total SP degree = `N · M · ulysses_size`).
     - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (CP degree = `N`; total SP degree = `N · ulysses_size`; mutually exclusive with Attention2D).
 - **Tensor Parallelism** (`tp_size: N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
-    - **Token-sharded TP** (`tp_layout: token_sharded` in `parallel_config`, prototype): Keeps the residual stream sharded by tokens across the TP group, so each all-reduce becomes a reduce-scatter plus an all-gather and the norms, modulation and quantization between projections run on `1/tp_size` of the tokens. Requires `tp_size > 1`; composes with CFG parallelism, not with Ulysses, Ring Attention, Attention2D or VSA. Supported for Wan 2.1 and Wan 2.2.
+    - **Token-sharded TP** (`tp_layout: token_sharded` in `parallel_config`, prototype): Keeps the residual stream sharded by tokens across the TP group, so each all-reduce becomes a reduce-scatter plus an all-gather and the norms, modulation and quantization between projections run on `1/tp_size` of the tokens. Requires `tp_size > 1`; composes with CFG parallelism, not with Ulysses, Ring Attention, Attention2D or VSA. Supported for Wan 2.1 and Wan 2.2. Static (calibrated) NVFP4 checkpoints all-gather the activations between projections as NVFP4 and `FP8_BLOCK_SCALES` checkpoints on SM100-family GPUs (the DeepGEMM path) as FP8 with per-token block scales; other models all-gather BF16.
 - **Text encoder tensor parallelism** (`text_encoder_tp_size: N`): MiniMax-H3
   only. Shards the Qwen3-VL text encoder over the first N ranks for text-only
   prompt encoding, then broadcasts prompt embeddings to the remaining VisualGen
@@ -441,10 +441,15 @@ pipeline.wake_up()
 ```
 
 `CPU` uses pageable host backing; `PINNED` uses pinned host backing. Host backups
-remain allocated after wake and are reused on later sleeps. Budget host RAM for
+remain allocated after wake by default and are reused on later sleeps. Budget host RAM for
 each instance's captured allocation pool, which can include cached loading and
 quantization buffers in addition to weights. This is process-local offload:
 the process, CUDA context, host memory, and node must remain alive.
+
+Set `sleep_release_host_backup=True` alongside `sleep_restore_mode` when loading
+to free the instance's host backups before wake returns. This synchronous cleanup
+can increase wake latency, and each subsequent sleep must allocate fresh backups.
+Host RAM must still hold the full backup while asleep. The default is `False`.
 
 Sleep rejects new generation and waits for the active call to finish before
 releasing memory. Sleep/wake transitions are serialized per instance; overlapping

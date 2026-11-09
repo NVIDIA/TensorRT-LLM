@@ -771,6 +771,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             raise RuntimeError(
                 "FlashInfer metadata cannot mix shared and separate draft KV "
                 "views.")
+        if not uses_shared_kv_cache:
+            # The separate view runs on the target's staging copy of the draft manager.
+            self.sync_draft_mixed_precision_staging()
         return self._draft_metadata
 
     def _sync_draft_view(self, target: "FlashInferAttentionMetadata") -> None:
@@ -791,6 +794,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.seq_lens_kv = None
             self.num_contexts = target.num_contexts
             self._uses_full_draft_page_table = False
+            # Reuse the target's staging copy of a mixed-precision draft manager.
+            self.mixed_precision_staging = target.draft_mixed_precision_staging
+            self.draft_mixed_precision_staging = None
             self.prepare()
             torch.add(
                 target._cached_token_lens[:num_seqs],
@@ -928,6 +934,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._logical_kv_lens[row_slice].add_(runtime_offsets, alpha=direction)
         token_offsets = runtime_offsets.repeat_interleave(tokens_per_generation)
         self._positions[token_slice].add_(token_offsets, alpha=direction)
+        view = self.mixed_precision_staging
+        if view is not None and view.manager is self.kv_cache_manager:
+            # Keep the staging lengths in step with the KV lengths.
+            view.lengths[:, row_slice].add_(runtime_offsets, alpha=direction)
 
         for wrappers in self._plan_params_to_wrappers.values():
             self._publish_decode_wrapper_kv_lens(wrappers.decode_wrapper)
@@ -1195,7 +1205,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 layer_buffer = self.kv_cache_manager.get_buffers(layer_idx)
                 if layer_buffer is not None:
                     max_num_blocks = max(max_num_blocks, layer_buffer.shape[0])
-            if self._has_mixed_precision_kv():
+            if self._has_mixed_precision_staging():
                 # The staging page space spans every sequence slot.
                 max_num_blocks = max(
                     max_num_blocks,
@@ -1228,8 +1238,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     key = (mgr.layer_to_pool_mapping_dict[layer_offset],
                            get_scale(layer_idx),
                            get_kv_factor(layer_idx) if get_kv_factor else None)
-                    if (self._has_mixed_precision_kv()
-                            and layer_offset in mgr.high_layers):
+                    if (self._has_mixed_precision_staging() and layer_offset
+                            in mgr.mixed_precision_high_layers):
                         key = ("mixed_precision_staging", )
                     space_ids.setdefault(key, len(space_ids))
                     layer_space[layer_idx] = space_ids[key]
@@ -1730,7 +1740,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self.num_context_blocks = sum(self.num_blocks[:self.num_contexts])
         self.num_generation_blocks = sum(self.num_blocks[self.num_contexts:])
 
-        if self._has_mixed_precision_kv():
+        if self._has_mixed_precision_staging():
             self.prepare_mixed_precision_kv(
                 self.kv_layout, self.kv_cache_manager.tokens_per_block)
 

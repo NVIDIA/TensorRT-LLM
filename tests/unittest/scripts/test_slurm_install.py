@@ -615,6 +615,7 @@ def test_l0_fetch_repeats_only_a_failed_transfer(tmp_path: Path, status: int) ->
 @pytest.mark.parametrize(
     "reader",
     [
+        "runLLMTestlistWithAgent",
         "runLLMTestlistWithSbatch",
         "runLLMDocBuild",
         "runLLMTestlistOnPlatformImpl",
@@ -636,6 +637,32 @@ def test_l0_has_no_direct_download_of_packaged_builds() -> None:
     ]
 
     assert package_downloads == []
+
+
+def test_fat_sqsh_builder_reads_the_package_through_fetch_helper() -> None:
+    scripts_dir = REPO_ROOT / "jenkins" / "scripts"
+    inline = (scripts_dir / "fat_build_inline.sh").read_text(encoding="utf-8")
+    body = (scripts_dir / "fat_build_sbatch_body.sh").read_text(encoding="utf-8")
+    prepare = (scripts_dir / "prepare_container.sh").read_text(encoding="utf-8")
+
+    code_lines = [
+        line for line in inline.splitlines() if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert not [line for line in code_lines if re.search(r"\b(wget|curl)\b", line)]
+    assert re.search(
+        r'bash "\$FAT_FETCH_HELPER_PATH" "\$LLM_TAR_ARTIFACT_PATH" "\$WORK_DIR/\$TAR_NAME"',
+        inline,
+    )
+    # The builder and Prepare Container delete the builder's netrc.
+    assert "trap removeNetrc EXIT" in body
+    assert "trap removeUnusedNetrc EXIT" in prepare
+
+    # Every hash of the fat sqsh cache key is on the artifact path, not a location URL.
+    key = """printf '%s' "${FAT_LLM_TAR_ARTIFACT_PATH}|${FAT_LLM_DOCKER_IMAGE}|"""
+    assert key in body
+    assert key in prepare
+    l0_key = "printf '%s' '${llmTarArtifactPath}|${LLM_DOCKER_IMAGE}|${scriptHash}'"
+    assert l0_key in L0_TEST.read_text(encoding="utf-8")
 
 
 def test_l0_slurm_job_gets_the_read_helper_and_its_netrc() -> None:
@@ -748,6 +775,31 @@ def test_l0_reads_build_artifacts_and_pulls_images_with_separate_credential_sett
     # That setting holds the image-pull identity, not the credential that publishes build artifacts.
     publishing = _artifact_location_field(_groovy_code(BUILD_GROOVY), "aws", "credential")
     assert _groovy_string("\n".join(lines), "ARTIFACTORY_CREDENTIALS_ID") != publishing
+
+
+def test_l0_deletes_checkpoints_with_each_locations_publishing_credential() -> None:
+    lines = _l0_test_code_lines()
+    code = "\n".join(lines)
+
+    # Each entry of the delete's netrc names its location's host and holds the identity that
+    # publishes to that location. A netrc "default" entry would send a token to every host.
+    entry_writer = _groovy_function_body(lines, "addArtifactoryNetrcEntry")
+    assert "credentialsId: LLM_ARTIFACTS_LOCATIONS[location].credential," in entry_writer
+    assert '"ARTIFACTORY_HOST=${llmArtifactsHost(location)}"' in entry_writer
+    assert "printf 'machine %s login %s password %s\\\\n' \"$ARTIFACTORY_HOST\"" in entry_writer
+    assert not re.search(r"\bdefault\b", entry_writer)
+    build = _groovy_code(BUILD_GROOVY)
+    for location in ("aws", "urm"):
+        assert _artifact_location_field(code, location, "credential") == _artifact_location_field(
+            build, location, "credential"
+        )
+
+    # The delete sends the credentials only through that netrc, never on a command line.
+    delete = _groovy_function_body(lines, "deleteProgressArtifact")
+    assert "addArtifactoryNetrcEntry(pipeline, netrcPath, location)" in delete
+    request = _groovy_function_body(lines, "artifactoryRequestStatus")
+    assert '--netrc-file "$ARTIFACTORY_REQUEST_NETRC"' in request
+    assert not re.search(r"(?:^|\s)(?:-u|--user)\s", request)
 
 
 # A netrc entry that a pipeline writes with printf, which keeps the secret off the command line.

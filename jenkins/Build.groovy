@@ -693,9 +693,6 @@ def runLLMBuild(
     sh "rm -rf **/*.xml *.tar.gz"
 
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
-    if (env.alternativeTRT) {
-        sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
-    }
 
     sh "mkdir TensorRT-LLM"
     sh "cp -r ${LLM_ROOT}/ TensorRT-LLM/src/"
@@ -721,10 +718,6 @@ def runLLMBuild(
 
     // install python package
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pip3 install -r requirements-dev.txt ${pipArgs}")
-
-    if (env.alternativeTRT) {
-        trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, "cp312")
-    }
 
     int buildJobs = (buildFlags[BUILD_JOBS_FOR_CONFIG] ?: BUILD_JOBS) as int
 
@@ -949,7 +942,7 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
     }
 }
 
-def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=false, pre_cxx11abi=false, cpver="312", extra_args="", reconfigure=false)
+def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=false, pre_cxx11abi=false, extra_args="", reconfigure=false)
 {
     // Random sleep to avoid resource contention
     sleep(10 * Math.random())
@@ -960,10 +953,6 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
 
     // Step 1: cloning tekit source code
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
-    if (env.alternativeTRT) {
-        trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
-        sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
-    }
     // Step 2: building libs in container
     sh "bash -c 'pip3 show tensorrt || true'"
 
@@ -1003,7 +992,6 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         echo "dockerImage: ${env.dockerImage}"
         echo "gitlabSourceRepoHttpUrl: ${env.gitlabSourceRepoHttpUrl}"
         echo "gitlabCommit: ${env.gitlabCommit}"
-        echo "alternativeTRT: ${env.alternativeTRT}"
         echo "Using GitLab repo: ${LLM_REPO}. Commit: ${env.gitlabCommit}"
 
         echo "env.globalVars is: ${env.globalVars}"
@@ -1124,7 +1112,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
                     stage(key) {
                         stage("[${key}] Run") {
                             echoNodeAndGpuInfo(pipeline, key)
-                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90' -b Debug --micro_benchmarks", true)
+                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "-a '90' -b Debug --micro_benchmarks", true)
                         }
                     }
                 })

@@ -956,11 +956,6 @@ class HarmonyAdapter:
         if not msg_recipient or msg_recipient == "assistant":
             return None
 
-        # # Clean up function name by removing constraint tokens that may be incorrectly included
-        # # The harmony library sometimes includes ><|constrain|>json in the recipient
-        # if ">" in function_name:
-        #     function_name = function_name.split(">")[0]
-
         # Extract arguments from message content
         function_call_args = ""
         for content in msg_content:
@@ -1434,12 +1429,8 @@ class HarmonyAdapter:
             stream_state = self.create_stream_state(request_id, available_tools,
                                                     tool_choice)
 
-        # decoded_tokens = self.encoding.decode_utf8(tokens)
-        # logger.info(">> DECODED TOKENS: %r", decoded_tokens)
-
         try:
             deltas = stream_state.process_token_batch(tokens)
-            # logger.info(">> GENERATED DELTAS: %s", deltas)
             return deltas
         except (HarmonyError, UnicodeDecodeError, ValueError):
             logger.error(
