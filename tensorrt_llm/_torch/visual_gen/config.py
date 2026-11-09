@@ -79,6 +79,17 @@ def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
     return components
 
 
+def _registered_pipeline_class(checkpoint_dir: str) -> Optional[type]:
+    """Registered pipeline class detected for a checkpoint, or None."""
+    from .pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
+
+    try:
+        entry = PIPELINE_REGISTRY.get(AutoPipeline._detect_from_checkpoint(checkpoint_dir))
+    except ValueError:
+        return None
+    return entry.pipeline_cls if entry is not None else None
+
+
 def create_attention_metadata_state() -> Dict[str, Any]:
     """Create state shared by attention layers in one model component.
 
@@ -675,6 +686,14 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             for component_name, component_config_path in components.items():
                 with open(component_config_path) as f:
                     component_config_dicts[component_name] = json.load(f)
+            pipeline_cls = _registered_pipeline_class(checkpoint_dir)
+            if pipeline_cls is not None:
+                component_config_dicts = pipeline_cls.resolve_component_configs(
+                    str(checkpoint_path),
+                    component_config_dicts,
+                    resolved_pipeline_config,
+                    args.quant_config if args else None,
+                )
 
             config_dict = component_config_dicts[component]
             pretrained_config = SimpleNamespace(**config_dict)

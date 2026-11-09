@@ -27,6 +27,8 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 |---|---|
 | `black-forest-labs/FLUX.1-dev` | Text-to-Image |
 | `black-forest-labs/FLUX.2-dev` | Text-to-Image |
+| `black-forest-labs/flux-3-image-klein-base` | Text-to-Image, Image-to-Image |
+| `black-forest-labs/flux-3-image-klein` | Text-to-Image, Image-to-Image |
 | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.1-T2V-14B-Diffusers` | Text-to-Video |
 | `FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers` | Text-to-Video (VSA) |
@@ -61,6 +63,8 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **FLUX.1** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
 | **FLUX.2** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
+| **FLUX.3 Klein Base** | No\*\* | Yes\*\* | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | Yes | No | No |
+| **FLUX.3 Klein** | No\*\* | Yes\*\* | No | No | No | No | Yes | No | Yes | Yes | Yes | No | No | Yes | No | No |
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
 | **Wan 2.1 VSA** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes |
 | **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
@@ -77,6 +81,8 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 \* Wan 2.1 and Wan 2.2 (not VSA) also support a token-sharded TP layout (prototype), enabled with `parallel_config.tp_layout: token_sharded`; see [Multi-GPU Parallelism](#multi-gpu-parallelism).
 
+\*\* FLUX.3 runs FP8 rowwise instead of FP8 blockwise, and NVFP4 from BFL's pre-quantized weights; see [FLUX.3 Notes](#flux3-notes).
+
 SOL-Attn is a runtime sparse-attention feature of the `TRTLLM` and `CUTEDSL` backends (bfloat16 self-attention with `head_dim=128` on SM100/SM103); it needs no dedicated checkpoint. Video Sparse Attention (VSA) requires a VSA-fine-tuned checkpoint and is therefore listed as its own model, `Wan 2.1 VSA`. See [VisualGen Sparse Attention](../features/visualgen-sparse-attention.md) for both.
 
 ## Quick Start
@@ -92,6 +98,8 @@ To learn more about VisualGen, see [`examples/visual_gen/`](https://github.com/N
 ### Usage with `trtllm-serve`
 
 The `trtllm-serve` command automatically detects diffusion models (by the presence of `model_index.json`) and launches an OpenAI-compatible visual generation server with image and video generation endpoints.
+
+FLUX.3 checkpoints ship only `modular_model_index.json`, so serve them with `--visual_gen_args` (or `--enable_visual_gen`).
 
 See [`examples/visual_gen/serve/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for server launch instructions, example configurations, and API usage.
 
@@ -161,7 +169,7 @@ params.image_reference = [
 ]
 ```
 
-FLUX.2 and Qwen-Image-Edit accept a list of reference images on `image_reference`.
+FLUX.2, FLUX.3 and Qwen-Image-Edit accept a list of reference images on `image_reference`.
 
 The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/serve/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for request examples.
 
@@ -189,6 +197,23 @@ are not supported. See the
   model-specific restriction, not a general VisualGen backend requirement.
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
   restricts use by territory. Obtain legal approval before downloading or running the weights.
+
+## FLUX.3 Notes
+
+- FLUX.3 encodes the prompt as given, as Diffusers does with its `prompt_upsampler` step
+  popped and the BFL CLI does with `--no-pup`. The model expects full scene captions: write
+  them, or upsample offline with `black-forest-labs/flux-3-image-klein-pup`. For an edit,
+  caption the whole result rather than giving a one-line instruction.
+- `pipeline_config.variant: nvfp4` or `fp8r` loads BFL's pre-quantized transformer weights
+  (NVFP4, or FP8 rowwise) from the checkpoint's `variants/<variant>/` directory; a Hub download
+  fetches only that variant's transformer weights. A variant fixes the precision, so it cannot be
+  combined with `quant_config.quant_algo`.
+- Without a variant, `quant_config: {quant_algo: FP8_PER_CHANNEL_PER_TOKEN}` quantizes the BF16
+  weights to FP8 rowwise on load. The embedders, the text mode blocks and the output layers stay
+  in BF16, as in the `fp8r` variant. FLUX.3 rejects other `quant_algo` values.
+- Prompts are padded to 80-token windows. At each warmup resolution, warmup runs the 80- and
+  160-token windows for text-to-image and a single-reference edit. A longer window may
+  recompile on its first request and, with CUDA graphs, captures a new graph.
 
 ## Optimizations
 
@@ -399,8 +424,9 @@ CPU offloading stages move selected Wan, Cosmos3 T2V, and MiniMax-H3 pipeline co
 
 Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
 
-- **CFG Parallelism** (`cfg_size: 2`): Splits positive/negative guidance prompts across GPUs. FLUX uses embedded guidance without a separate negative prompt path; CFG parallelism is not applicable to FLUX or the distilled FastWan 2.2 model.
+- **CFG Parallelism** (`cfg_size: 2`): Splits positive/negative guidance prompts across GPUs. FLUX.1 and FLUX.2 use embedded guidance without a separate negative prompt path; CFG parallelism is not applicable to them, to the distilled FLUX.3 Klein or to the distilled FastWan 2.2 model. FLUX.3 Klein Base uses it when `guidance_scale` is not 1.
 - **Ulysses Parallelism** (`ulysses_size: N`): Splits the sequence dimension across GPUs for longer sequences.
+    - **FLUX.3**: `ulysses_size` must be 2, 4 or 8, which divide both its 24 attention heads and every padded prompt length. The output's (H/16)·(W/16) image tokens and the summed tokens of the reference images must also be divisible by it. Ring Attention and Attention2D are not supported.
     - **Async Ulysses A2A pipeline** (`async_ulysses: true` in `parallel_config`): Overlaps per-rank V/Q/K projection compute with the cross-rank all-to-all on a dedicated side stream. Requires `ulysses_size > 1` and an NVLink-connected GPU domain (uses PyTorch `_SymmetricMemory` with CUDA IPC for peer pushes; not currently supported across nodes without MNNVL). Currently wired for WAN, LTX-2 and MiniMax-H3 self-attention. MiniMax-H3 async is validated in BF16 only; FP8/NVFP4 combinations remain unvalidated.
 - **Parallel VAE** (`parallel_vae_size: N`): Parallelizes the final VAE decode (constraint: `parallel_vae_size ≤ world_size`). WAN/Cosmos3 shard along a spatial axis; LTX-2, LTX-2.3, and MiniMax-H3 distribute independent tiles.
 - **Context Parallel (CP)** — Partitions the sequence into shards so that each rank computes partial attention. Requires an LSE-capable attention backend (`FA4` or `CUTEDSL`). CP can be composed with Ulysses, giving a total sequence-parallel (SP) degree = `cp_size · ulysses_size`. The CP degree depends on the implementation below:
@@ -523,5 +549,5 @@ After these steps, the framework automatically handles:
 
 - Weight loading with optional dynamic quantization via `PipelineLoader`
 - Multi-GPU execution via `DiffusionExecutor`
-- Cache acceleration (if you call `self._setup_cache_acceleration(self.transformer, coefficients=...)` in `post_load_weights()`; supports both TeaCache and Cache-DiT via `VisualGenArgs.cache_config`)
+- Cache acceleration: `PipelineLoader` enables TeaCache or Cache-DiT from `VisualGenArgs.cache_config` after `torch_compile()`, so pipelines do not call `_setup_cache_acceleration()` themselves
 - Serving via `trtllm-serve` with the full endpoint set
