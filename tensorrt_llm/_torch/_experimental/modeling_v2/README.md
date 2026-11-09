@@ -131,7 +131,7 @@ merge it is the family owners' decision.
    lists. See [Testing and validation](#testing-and-validation).
 7. Add the new paths to [CODEOWNERS](../../../../.github/CODEOWNERS). Families
    with their own owners list three paths: the package directory, the unit
-   test directory and the accuracy test file.
+   test directory and the accuracy test directory.
 
 ## Model lifecycle
 
@@ -221,24 +221,39 @@ build declarations, namespaces, op and fake registration, loading and errors.
 
 ## Testing and validation
 
-Put tests under `tests/`, mirroring the scope of the code they test. Within a
-family or target, the test layout can follow the code layout.
+Put tests under `tests/`, in a directory that mirrors the code they test. CI
+picks tests by that mirror, so a test outside it may not run. Inside a target's
+test directory, the layout is up to the target.
 
 | Tests | Location |
 |---|---|
 | Routing, loader and CI selection | `tests/unittest/_torch/modeling_v2/test_modeling_v2_*.py` |
 | Catalog operations | `tests/unittest/_torch/modeling_v2/<category>/` |
-| Family-shared code | `tests/unittest/_torch/modeling_v2/models/<family>/` |
+| Family routing | `tests/unittest/_torch/modeling_v2/models/<family>/` |
+| Family-shared code | `tests/unittest/_torch/modeling_v2/models/<family>/<path of the code>/` |
 | Target code | `tests/unittest/_torch/modeling_v2/models/<family>/<target>/` |
-| Whole-model accuracy | `tests/integration/defs/accuracy/modeling_v2/test_<family>.py` |
+| Whole-model accuracy | `tests/integration/defs/accuracy/modeling_v2/<family>/<target>/` |
 | Accuracy references | `tests/integration/defs/accuracy/references/` |
 
-CI selects tests per family: a change under `models/<family>/` runs the tests
-in `tests/unittest/_torch/modeling_v2/models/<family>/` and
-`tests/integration/defs/accuracy/modeling_v2/test_<family>.py`, so keep a
-family's tests there. Make sure a test list under
-`tests/integration/test_lists/test-db/` reaches every new unit test, either by
-file or by directory. CI does not run unlisted tests.
+CI selects tests by the scope of the change:
+
+* A change inside a target runs that target's unit and accuracy tests.
+* A change to family-shared code runs its mirrored tests and the tests of
+  every target that imports it. A family's `routing.py`, and its native code
+  outside a target, run the whole family.
+* A change to a catalog operation runs its category's tests and the tests of
+  every target that imports it. A change to code every model shares runs all
+  Modeling V2 tests.
+
+A target is a directory under `models/<family>/` whose class the family's
+`route` returns. Give each target a mirrored unit test directory and an
+accuracy test directory, `tests/integration/defs/accuracy/modeling_v2/<family>/<target>/`.
+Make sure a test list under `tests/integration/test_lists/test-db/` reaches
+every new test, either by file or by directory. CI does not run unlisted tests.
+A target's accuracy tests may instead be listed under
+`tests/integration/test_lists/qa/`, which runs on the QA schedule.
+`tests/unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py` checks
+the layout and the test lists.
 
 Typical whole-model checks for a target:
 
