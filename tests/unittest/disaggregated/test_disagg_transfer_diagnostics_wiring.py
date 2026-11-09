@@ -1577,8 +1577,12 @@ def test_native_writer_result_precedes_local_destination_completion(
         receiver=receiver,
     )
 
+    report_token = b"report-token-123"
+
     def dispatch(task) -> None:
         task.expected_transfers = 1
+        # Receiver.dispatch_task hands every writer the token its result must echo.
+        task._kv_result_report_tokens = {writer_rank: report_token}
         session.mark_transferring(task.slice_id, writer_cohort={writer_rank})
 
     receiver.dispatch_task = dispatch
@@ -1614,6 +1618,7 @@ def test_native_writer_result_precedes_local_destination_completion(
         0,
         True,
         AgentResult.SUCCESS,
+        kv_result_report_token=report_token,
         transfer_size=4096,
     )
     receiver._process_kv_agent_result(b"sender", message)

@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from ... import native_ops
 
 VOCAB_SIZE = 154880
 MAX_ROWS = 24
@@ -78,7 +79,7 @@ class GlmVerifyHeadSample(OpWrapper):
     def __call__(
         self, logits, temperatures, top_ks, top_ps, min_ps, seed, offset, row_counters, workspace
     ):
-        return torch.ops.trtllm.glm_verify_head_sample_tokens(
+        return native_ops.glm_verify_head_sample_tokens(
             logits, temperatures, top_ks, top_ps, min_ps, seed, offset, row_counters, workspace
         )
 
