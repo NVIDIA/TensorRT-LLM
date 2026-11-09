@@ -21,7 +21,7 @@ from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
 from .impl_base import MoEImplBase
 from .interface import MoE, MoEWeightLoadingMode
-from .mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
+from .mega_moe import MegaMoECuteDslBase, MegaMoEDeepGemm
 from .moe_load_balancer import get_moe_load_balancer
 from .moe_resolution import (WIDEEP_DEPRECATION_MESSAGE, MoEImplClass,
                              derive_moe_layer_shapes, infer_swiglu_gptoss_style,
@@ -248,7 +248,9 @@ def create_moe_backend(
             init_load_balancer=init_load_balancer,
             activation=activation,
         )
-    elif issubclass(moe_cls, (MegaMoEDeepGemm, MegaMoECuteDsl)):
+    # The CuteDSL MegaMoE leaves (NVFP4, BF16) share MegaMoECuteDslBase; the
+    # MegaMoECuteDsl alias names the NVFP4 leaf only.
+    elif issubclass(moe_cls, (MegaMoEDeepGemm, MegaMoECuteDslBase)):
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
