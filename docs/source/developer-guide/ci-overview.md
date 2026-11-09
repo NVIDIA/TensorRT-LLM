@@ -143,8 +143,8 @@ file/class/function matching described below.
 ### Outer layer: match the complete test-db entry
 
 The parser converts a `unittest/` entry into a wrapper node ID, preserving the
-whole entry inside the brackets, including options such as `-k`, `-m`, and
-`--ignore`:
+test path and command-line options such as `-k`, `-m`, and `--ignore` inside the
+brackets. Test-list metadata such as `ISOLATION` is not part of the node ID:
 
 ```text
 unittest/_torch/modeling
@@ -157,7 +157,19 @@ unittest/_torch/modeling -k "modeling_llama"
 The outer waive lookup compares the complete node IDs. It does not interpret
 the waive name as a directory prefix, glob, or regular expression, and it does
 not normalize equivalent shell arguments. Copy the entry exactly, including
-option order, internal spaces, and quotes.
+option order, internal spaces, and quotes, but omit test-list metadata such as
+`ISOLATION`. Jenkins removes that marker before pytest collects the tests;
+the waive parser does not remove it. For example, this YAML entry:
+
+```yaml
+- unittest/executor/test_base_worker.py ISOLATION
+```
+
+needs this waive, without `ISOLATION`:
+
+```text
+unittest/executor/test_base_worker.py SKIP (Known issue in this file)
+```
 
 For this waive:
 
@@ -348,9 +360,9 @@ does not change the outer exact-entry or inner unittest matching rules.
 
 - Decide whether to skip a whole test-db entry or only a file/class/function/case
   inside it. Prefer the narrowest scope that covers the known failure.
-- For a whole entry, copy the full YAML entry value after `- `, including all
-  command-line options. Changing those options can stop an existing waive from
-  matching.
+- For a whole entry, copy the test path and all command-line options from the
+  YAML value after `- `, omitting test-list metadata such as `ISOLATION`.
+  Changing the command-line options can stop an existing waive from matching.
 - For an inner unittest, use the actual collected node ID, including parameter
   IDs when needed. Use `unittest/` paths as in the test lists, not repository-root
   `tests/unittest/` paths. Check any `full:` hardware restriction as well.
