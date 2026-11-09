@@ -99,6 +99,7 @@ from __future__ import annotations
 
 from ...sm107_defaults import env as _sm107_env
 from ...sm107_defaults import sm103_tep8_hop_direct128 as _sm103_tep8_hop_direct128
+from ...sm107_defaults import sm103_tep8_hop_direct_max_rows as _sm103_tep8_hop_direct_max_rows
 from ...sm107_defaults import sm103_tep8_hop128_producer as _sm103_tep8_hop128_producer
 
 import functools
@@ -2451,7 +2452,9 @@ SERVED_DIRECT_ROWS = (int(_DIRECT_ROWS[0]), int(_DIRECT_ROWS[1]))
 #: o_proj publishes 65..128 rows as two 64-row split_k-1 scatter chunks. The consumer at 65..128 rows keeps no SMEM pad
 #: (``DIRECT128_PAD_ROWS``), as the served two-shot hop it replaces (HOP_PAD_ROWS 9-40), so its 2-row CTAs all fit.
 DIRECT128 = _sm103_tep8_hop_direct128()
-DIRECT128_MAX_ROWS = 128
+#: hop256 (sm107_defaults.sm103_tep8_hop_direct_max_rows): 256 extends the workspace to 32 slots per source and the
+#: direct hop to 129..256 rows (o_proj's producer covers 3..4 token tiles, or 64-row chunks); 128 is the hop128 default.
+DIRECT128_MAX_ROWS = _sm103_tep8_hop_direct_max_rows() if DIRECT128 else 128
 DIRECT128_PAD_ROWS = (0, 64)
 if DIRECT128:
     SERVED_DIRECT_ROWS = (SERVED_DIRECT_ROWS[0], max(SERVED_DIRECT_ROWS[1], DIRECT128_MAX_ROWS))
@@ -3373,8 +3376,8 @@ if HAS_SCATTER_GEMM:
         m, n, k = _validate_runtime_tensors(a, b, None, out)
         if tactic.split_k != 1 or tactic.mma_m != 64 or tactic.mma_n not in (64, 128):
             raise ValueError(f"wide scatter: split_k 1, 64 x (64 | 128) tiles; got {tactic}")
-        if not 1 <= m <= 128 or n != 8192 or k <= 0 or k % _CTA_K or peer_stride_bytes % 16:
-            raise ValueError(f"wide scatter: 1..128 rows, 8192 columns, K a multiple of {_CTA_K}; got {m} x {n} x {k}")
+        if not 1 <= m <= 256 or n != 8192 or k <= 0 or k % _CTA_K or peer_stride_bytes % 16:
+            raise ValueError(f"wide scatter: 1..256 rows, 8192 columns, K a multiple of {_CTA_K}; got {m} x {n} x {k}")
         if slots * 8 < m or slots % 8:
             raise ValueError(f"wide scatter: {slots} slots per source do not hold {m} rows")
         if _smem_bytes(tactic, tactic.ab_stages) + 2048 > _SMEM_CAPACITY_BYTES:

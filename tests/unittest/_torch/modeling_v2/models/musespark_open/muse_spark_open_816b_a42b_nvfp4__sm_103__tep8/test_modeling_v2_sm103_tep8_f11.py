@@ -496,15 +496,17 @@ def test_sm103_tep8_hop_direct128_switch_and_scatter_addresses(monkeypatch):
     wide = (_TARGET / "ops/allreduce/post_attn_hop_wide.py").read_text()
     assert "+ cutlass.Int64(bidx) * ((self.slots - 1) * self.cta_m)" in wide
     assert "* (7 * self.cta_m)" not in wide
-    assert "DIRECT128_PAD_ROWS = (0, 64)" in wide and "DIRECT128_MAX_ROWS = 128" in wide
+    assert "DIRECT128_PAD_ROWS = (0, 64)" in wide
+    assert "DIRECT128_MAX_ROWS = _sm103_tep8_hop_direct_max_rows() if DIRECT128 else 128" in wide
     assert "if DIRECT128:\n    SERVED_DIRECT_ROWS = (SERVED_DIRECT_ROWS[0], max(SERVED_DIRECT_ROWS[1], DIRECT128_MAX_ROWS))" in wide
     dispatcher = (_TARGET / "kernels/dense_gemms/dispatcher.py").read_text()
-    assert 'if TEP8_WIDE64_MAX_ROWS < rows <= 2 * TEP8_WIDE64_MAX_ROWS and site.role == "o_proj":' in dispatcher
+    # hop256: the band reaches 256 rows; the publication arms only what its workspace takes.
+    assert 'if TEP8_WIDE64_MAX_ROWS < rows <= 4 * TEP8_WIDE64_MAX_ROWS and site.role == "o_proj":' in dispatcher
     assert 'if publication is None or not getattr(_wide, "DIRECT128", False):' in dispatcher
 
     # Host model of the fb-layout addresses (elements, BF16), ranks 8, cta_m 64, one rank's window peer stride PS.
     ranks, cta_m, hidden, PS = 8, 64, 8192, 1 << 24
-    for max_rows in (64, 128):
+    for max_rows in (64, 128, 256):
         slots = max_rows // ranks
         polled = {}
         for row in range(max_rows):  # the consumer: owner row % 8 polls source slab p at its receive base
@@ -522,6 +524,23 @@ def test_sm103_tep8_hop_direct128_switch_and_scatter_addresses(monkeypatch):
                         stored[(dst // PS, dst % PS)] = (row0 + tok, bidx * cta_m + fchunk * 8)
         assert stored == polled, max_rows
 
+
+
+def test_sm103_tep8_hop_direct_max_rows_switch(monkeypatch):
+    """hop256: ``MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT_MAX_ROWS`` (128 when unset, in no defaults table) takes
+    128 or 256 only; the one-launch producer's row guard admits 256 rows."""
+    name = DEFAULTS.SM103_TEP8_HOP_DIRECT_MAX_ROWS_ENV
+    assert name == "MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT_MAX_ROWS"
+    assert name not in DEFAULTS.SM103_TEP8_DEFAULTS and name not in DEFAULTS.SM107_DEFAULTS
+    for value, want in (("", 128), ("128", 128), ("256", 256)):
+        monkeypatch.setenv(name, value)
+        assert DEFAULTS.sm103_tep8_hop_direct_max_rows() == want, value
+    for bad in ("64", "192", "512", "x"):
+        monkeypatch.setenv(name, bad)
+        with pytest.raises(ValueError):
+            DEFAULTS.sm103_tep8_hop_direct_max_rows()
+    wide = (_TARGET / "ops/allreduce/post_attn_hop_wide.py").read_text()
+    assert "if not 1 <= m <= 256 or n != 8192" in wide
 
 def test_sm103_tep8_hop128_producer_switch_and_wide_tile_addresses(monkeypatch):
     """``MUSESPARK_OPEN_SM103_TEP8_HOP128_PRODUCER`` (default ``chunks``, in no defaults table, read only with

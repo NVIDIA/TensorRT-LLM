@@ -2,6 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """wide_moe_allreduce: the MoE output all-reduce of 129..1024-row decode steps on MNNVL two-shot.
 
+also served at TP8 on sm_103 under ``MUSESPARK_OPEN_SM103_TEP8_F11=1`` (added to that composition with
+``MUSESPARK_OPEN_SM103_TEP8_F11_EXTRA_PATHS=wide_moe_allreduce``). There the group is two trays of four in one NVLink
+domain (the composition's ``TWO_TRAYS_OF_4`` topology), the MNNVL two-shot the drafter and attention all-reduces already
+run on; the built-in reduces the 129..1024-token unfused MoE output over an 8-rank NCCL ring (27.7 us per layer at 192
+rows on GB300). Same numerics note as TP4: one FP32 sum in rank order instead of the ring's per-hop BF16
+roundings, so not bitwise the NCCL result (accuracy pair).
+
 At TEP4 the built-in MoE finalizes a step of up to 128 tokens with its fused
 finalize + all-reduce. A larger step (the decode steps of 17 to 128 requests, 8
 rows each; above 64 requests, a generation worker's) combines the expert rows
@@ -54,6 +61,9 @@ from tensorrt_llm._torch.distributed.ops import (
 from tensorrt_llm._torch.models.modeling_musespark_open import _LARGE_PREPARE_OVERLAP_MAX_TOKENS
 from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
 from tensorrt_llm.logger import logger
+
+from ...sm107_defaults import SM103_TEP8_F11_ENV
+from ...sm107_defaults import sm103_tep8_f11 as _sm103_tep8_f11
 
 #: The calls this path takes: the steps the fused finalize does not serve, up to
 #: 128 requests of 8 rows (a generation worker of ``max_batch_size`` up to 128).
@@ -140,8 +150,12 @@ def refusal(model: torch.nn.Module) -> Optional[str]:
     ):
         return "it is written for sm_103 and sm_107"
     mapping = model.layers[0].mapping
-    if mapping.tp_size != 4 or mapping.is_multi_node():
-        return f"it serves TP4 on one node, got TP{mapping.tp_size}"
+    tep8 = mapping.tp_size == 8 and _sm103_tep8_f11() and torch.cuda.get_device_capability() == (10, 3)
+    if not ((mapping.tp_size == 4 and not mapping.is_multi_node()) or tep8):
+        return (
+            f"it serves TP4 on one node, or TP8 on sm_103 under {SM103_TEP8_F11_ENV}=1, got "
+            f"TP{mapping.tp_size}{' over several nodes' if mapping.is_multi_node() else ''}"
+        )
     if mapping.enable_attention_dp or mapping.moe_tp_size != 1:
         return "the MoE output is not all-reduced over the TP group (attention DP or MoE TP)"
     for layer in model.layers:

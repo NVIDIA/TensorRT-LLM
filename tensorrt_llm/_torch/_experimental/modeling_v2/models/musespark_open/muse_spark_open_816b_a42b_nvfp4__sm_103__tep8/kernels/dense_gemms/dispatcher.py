@@ -1017,7 +1017,9 @@ class DenseGemmDispatcher:
             return None
         k = int(weight.shape[1])
         rows = input_tensor.numel() // k
-        if TEP8_WIDE64_MAX_ROWS < rows <= 2 * TEP8_WIDE64_MAX_ROWS and site.role == "o_proj":
+        if TEP8_WIDE64_MAX_ROWS < rows <= 4 * TEP8_WIDE64_MAX_ROWS and site.role == "o_proj":
+            # hop256: up to 256 rows when MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT_MAX_ROWS=256 sized the workspace (the
+            # publication arms only steps it takes, so a 129..256-row call is cuBLAS otherwise).
             # hop128: only a step the direct publication armed (MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT128=1);
             # every other 65..128-row call keeps cuBLAS, as before.
             return self._direct128(input_tensor, weight, rows, k)
@@ -1087,7 +1089,7 @@ class DenseGemmDispatcher:
                 peer_stride, slots,
             )
             logger.info_once(
-                f"[musespark_open] hop128 producer: o_proj of {TEP8_WIDE64_MAX_ROWS + 1}..128-row steps in one "
+                f"[musespark_open] hop128 producer: o_proj of {TEP8_WIDE64_MAX_ROWS + 1}..{_wide.DIRECT128_MAX_ROWS}-row steps in one "
                 f"{mode} launch ({stages} stages)", key="musespark_open.t8r4.hop128_producer")
             return view.view(*input_tensor.shape[:-1], int(weight.shape[0]))
         tactic = _wide.SplitKTactic(*fields)

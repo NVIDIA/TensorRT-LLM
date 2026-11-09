@@ -298,6 +298,23 @@ def sm103_tep8_hop128_producer() -> tuple:
     return mode, int(stages) if stages else _HOP128_PRODUCER_STAGES[mode]
 
 
+#: hop256: ``MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT_MAX_ROWS`` (128 when unset, or 256; with ``..._HOP_DIRECT128=1``,
+#: in no defaults table) is the last row count of the direct hop. 256 extends it to the decode steps of 17..32 requests
+#: at K = 7 (129..256 rows), which otherwise run cuBLAS o_proj + the two-shot hop: a 256-row workspace (32 slots per
+#: source), o_proj on the same split_k-1 scatter kernel (``grid`` / ``tile128``: one launch of 3..4 token tiles;
+#: ``chunks``: 64-row launches), the consumer summing the eight partials in rank order. Same per-element arithmetic as at
+#: 65..128 rows (one full-K FP32 accumulation, rounded once); bitwise vs the cuBLAS o_proj it replaces is device-gated.
+SM103_TEP8_HOP_DIRECT_MAX_ROWS_ENV = "MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT_MAX_ROWS"
+
+
+def sm103_tep8_hop_direct_max_rows() -> int:
+    """The direct hop's last row count with ``..._HOP_DIRECT128=1``: 128 (unset) or 256 (the environment only)."""
+    value = os.environ.get(SM103_TEP8_HOP_DIRECT_MAX_ROWS_ENV, "").strip() or "128"
+    if value not in ("128", "256"):
+        raise ValueError(f"{SM103_TEP8_HOP_DIRECT_MAX_ROWS_ENV}={value!r}: expected 128 or 256")
+    return int(value)
+
+
 def env(name: str, default: Optional[str] = None) -> Optional[str]:
     """``os.environ.get(name, default)``, except that an unset switch reads ``SM107_DEFAULTS[name]`` on sm_107 and
     ``SM103_TEP8_DEFAULTS[name]`` on sm_103 under ``MUSESPARK_OPEN_SM103_TEP8_F11=1``."""
