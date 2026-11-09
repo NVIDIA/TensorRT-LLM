@@ -28,7 +28,8 @@ The cache must be a BF16 ``KVCacheManagerV2`` holding all 52 logical layers in l
 with 2 kv heads of 128 per rank, a 512-token window on every sliding layer and the whole
 sequence (``max_seq_len``) on the full-attention layers 5, 11, 17, 23, 29, 35, 41, 47 and 51
 (``attention_windows``). Input geometry, metadata and cache are validated before execution; absolute position
-values are compared with the request spans only in diagnostic mode; a call with T above ``max_tokens`` is rejected (the default ``MAX_NUM_TOKENS`` matches
+values are compared with the request spans only in diagnostic mode. A call with T above
+``max_tokens`` is rejected (the default ``MAX_NUM_TOKENS`` matches
 the supported deployment's native ``max_num_tokens``).
 
 Host synchronization: diagnostic mode checks position values once per call and router

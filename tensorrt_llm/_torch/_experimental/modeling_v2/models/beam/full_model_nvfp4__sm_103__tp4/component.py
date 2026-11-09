@@ -215,7 +215,6 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
             raise ValueError(f"layer {layer} expert {expert} {proj!r} is not held")
         return {f: self.bank(spec.bank, f)[expert] for f in BANK_FIELDS}
 
-
     # ------------------------------------------------------------------ loading
 
     def _load_expert(self, catalog, reader, spec: QuantSpec, digest) -> dict:

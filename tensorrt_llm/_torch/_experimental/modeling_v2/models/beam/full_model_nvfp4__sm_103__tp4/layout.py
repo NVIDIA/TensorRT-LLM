@@ -239,8 +239,6 @@ def check_partition(specs: Mapping[str, Any], world_size: int = WORLD_SIZE) -> N
                 raise ValueError(f"{spec.name}: {kind} intervals cover {cursor} of {extent}")
 
 
-
-
 def _module_names(specs: Mapping[str, Any]) -> tuple:
     """(quantized expert modules, higher-precision Linear modules) of ``specs``."""
     quantized, kept = [], []

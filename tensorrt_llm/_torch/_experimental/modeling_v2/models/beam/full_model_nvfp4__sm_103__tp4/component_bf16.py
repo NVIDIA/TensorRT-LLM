@@ -252,7 +252,6 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         """The current ``[256, ...]`` storage of one sparse layer's expert bank."""
         return getattr(self, _attr(bank))
 
-
     def weight_state(self) -> tuple:
         """Identity of every current parameter and bank: object, version, storage, geometry.
 
@@ -356,7 +355,6 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         }
         self.usable = True
         return self.load_record
-
 
     # ------------------------------------------------------------------ helpers
 
@@ -500,7 +498,6 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
             },
         )
         return out
-
 
     @torch.no_grad()
     def dense_ffn(

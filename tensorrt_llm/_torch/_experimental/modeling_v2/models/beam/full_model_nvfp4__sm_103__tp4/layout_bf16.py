@@ -322,8 +322,6 @@ def tensor_specs(config: Any, layers: Optional[tuple] = None) -> "OrderedDict[st
     return specs
 
 
-
-
 def check_partition(specs: Mapping[str, TensorSpec], world_size: int = WORLD_SIZE) -> None:
     """Raise unless every split tensor's rank intervals tile its axis exactly, in rank order."""
     for spec in specs.values():
