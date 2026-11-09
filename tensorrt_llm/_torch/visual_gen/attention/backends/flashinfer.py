@@ -37,9 +37,12 @@ class FlashInferAttention(AttentionBackend):
 
     # Per device, the zeroed workspace and multi-CTA counter buffer shared by every layer's paged
     # K/V attention. Kernels on one stream run one after another, and each kernel resets the
-    # counters it used, so one pair serves all layers. The workspace is separate from the
-    # prefill wrappers' workspaces, which hold their plans.
-    _trtllm_gen_paged_buffers: ClassVar[dict[torch.device, tuple[torch.Tensor, torch.Tensor]]] = {}
+    # counters it used. Keep every counter allocation alive for captured graphs; geometric
+    # capacities bound their total storage to less than twice the largest allocation. The
+    # workspace is separate from the prefill wrappers' workspaces, which hold their plans.
+    _trtllm_gen_paged_buffers: ClassVar[
+        dict[torch.device, tuple[torch.Tensor, dict[int, torch.Tensor]]]
+    ] = {}
 
     def __init__(
         self,
@@ -645,7 +648,14 @@ class FlashInferAttention(AttentionBackend):
         num_sms = torch.cuda.get_device_properties(device).multi_processor_count
         counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(batch_size, num_heads, num_sms)
         buffers = cls._trtllm_gen_paged_buffers.get(device)
-        if buffers is None or buffers[1].numel() < counter_bytes:
+        counters = (
+            None
+            if buffers is None
+            else next(
+                (buf for size, buf in sorted(buffers[1].items()) if size >= counter_bytes), None
+            )
+        )
+        if counters is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "Paged K/V attention buffers first needed during CUDA graph capture; run "
@@ -658,11 +668,11 @@ class FlashInferAttention(AttentionBackend):
                     q.dtype, batch_size, num_tokens, num_heads, head_dim, 0, True, False
                 )["trtllm_gen_workspace_size"]
                 workspace = torch.zeros(workspace_bytes, dtype=torch.uint8, device=device)
-            else:
-                workspace = buffers[0]
-            counters = torch.zeros(counter_bytes, dtype=torch.uint8, device=device)
-            buffers = cls._trtllm_gen_paged_buffers[device] = (workspace, counters)
-        return buffers
+                buffers = cls._trtllm_gen_paged_buffers[device] = (workspace, {})
+            capacity = 1 << (counter_bytes - 1).bit_length()
+            counters = torch.zeros(capacity, dtype=torch.uint8, device=device)
+            buffers[1][capacity] = counters
+        return buffers[0], counters
 
     def forward_paged_kv(
         self, q: torch.Tensor, kv_pool: torch.Tensor, tables: PagedKVTables

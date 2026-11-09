@@ -21,6 +21,7 @@ of the chunk and the causal block itself. Stale tokens the whole-page eviction k
 resident must not be seen.
 """
 
+import weakref
 from functools import partial
 from types import SimpleNamespace
 
@@ -29,6 +30,7 @@ import torch
 from utils.block_causal_reference import exact_reference as _exact_reference
 from utils.block_causal_reference import reference_attention
 
+from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention
 from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
@@ -850,3 +852,160 @@ def test_cache_path_refusals(cache, backend):
         )
     with pytest.raises(ValueError, match="not declared"):
         cache.plan(CHUNK, 8)
+
+
+def _assert_attention_parity(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """T1 attention parity against FP32 SDPA with BF16 fused-kernel accumulation."""
+    actual_fp32, expected_fp32 = actual.float().flatten(), expected.float().flatten()
+    error = actual_fp32 - expected_fp32
+    ref_norm = expected_fp32.norm()
+    if ref_norm > 0:
+        relative_l2 = (error.norm() / ref_norm).item()
+        cosine = torch.nn.functional.cosine_similarity(actual_fp32, expected_fp32, dim=0).item()
+    else:
+        relative_l2 = error.norm().item()
+        cosine = float(relative_l2 == 0)
+    max_error = error.abs().max().item()
+    stats = f"relative_l2={relative_l2:.6g}, cosine={cosine:.8f}, max_abs={max_error:.6g}"
+    print(stats)
+    assert relative_l2 < 1e-2 and cosine > 0.9999, stats
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2, msg=stats)
+
+
+@pytest.mark.parametrize("metadata", ["indices", "offsets", "both"])
+def test_q_only_rejects_sparse_compaction_before_cache_write(monkeypatch, metadata: str) -> None:
+    """The Q-only native op refuses compaction metadata without modifying cached K/V."""
+    cache = make_cache(32)
+    try:
+        open_with_prompt(cache, 9)
+        q, k, v = rand_qkv(CHUNK)
+        plan = cache.plan(CHUNK)
+        cache.write_staged(0, k, v, plan)
+        pool = cache.kv_buffer(0)
+        before = pool.clone()
+        indices = torch.full((NUM_KV_HEADS, 1), 5, dtype=torch.int32, device=DEVICE)
+        offsets = torch.tensor([0, 1], dtype=torch.int32, device=DEVICE)
+        native_attention = FallbackFmha.attention
+
+        def with_compaction(**kwargs) -> None:
+            kwargs["sparse_kv_indices"] = indices if metadata != "offsets" else None
+            kwargs["sparse_kv_offsets"] = offsets if metadata != "indices" else None
+            native_attention(**kwargs)
+
+        monkeypatch.setattr(FallbackFmha, "attention", staticmethod(with_compaction))
+        with pytest.raises(RuntimeError, match="Q-only self-attention.*sparse KV compaction"):
+            make_backend("trtllm").forward_paged_kv(q[None], pool, cache.tables(plan))
+        torch.cuda.synchronize()
+        torch.testing.assert_close(pool, before, rtol=0, atol=0)
+    finally:
+        cache.shutdown()
+
+
+@pytest.mark.parametrize("backend", ["trtllm", BACKENDS[3]])
+def test_graph_replay_after_larger_plan_warmup(monkeypatch, backend: str) -> None:
+    """T1: a captured paged-attention output still matches FP32 SDPA after scratch growth.
+
+    A larger plan crosses the counter's SM-count floor and increases query storage. Weak
+    references and saved addresses prove the captured allocation survives without test-owned
+    tensor references; allocator churn makes an accidentally released allocation observable.
+    """
+    torch.manual_seed(15)
+    buffers = []
+
+    def record(buffer: torch.Tensor) -> None:
+        buffers.append((weakref.ref(buffer), buffer.data_ptr(), buffer.numel()))
+
+    if backend == "flashinfer":
+        monkeypatch.setattr(FlashInferAttention, "_trtllm_gen_paged_buffers", {})
+        get_buffers = FlashInferAttention._trtllm_gen_buffers
+
+        def recording_buffers(
+            cls: type[FlashInferAttention], q: torch.Tensor, batch_size: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            workspace, counters = get_buffers(q, batch_size)
+            record(counters)
+            return workspace, counters
+
+        monkeypatch.setattr(
+            FlashInferAttention, "_trtllm_gen_buffers", classmethod(recording_buffers)
+        )
+    else:
+        monkeypatch.setattr(TrtllmAttention, "_paged_kv_workspaces", {})
+        native_attention = FallbackFmha.attention
+
+        def recording_attention(**kwargs) -> None:
+            native_attention(**kwargs)
+            record(kwargs["workspace"])
+
+        monkeypatch.setattr(FallbackFmha, "attention", staticmethod(recording_attention))
+
+    sm_count = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    large_chunk = 1 << sm_count.bit_length()
+    small_chunk = 8
+    small = make_cache(32, spec=spec_for(chunk=small_chunk, causal_blocks={small_chunk: 1}))
+    large = make_cache(32, spec=spec_for(chunk=large_chunk, causal_blocks={1: large_chunk}))
+    try:
+        pk, pv = open_with_prompt(small, 9)
+        open_with_prompt(large, 9)
+        attention = make_backend(backend)
+        q, k, v = rand_qkv(small_chunk)
+        plan = small.plan(small_chunk)
+        small.write_staged(0, k, v, plan)
+        with pytest.raises(RuntimeError, match="first needed during CUDA graph capture"):
+            with torch.cuda.graph(torch.cuda.CUDAGraph()):
+                attention.forward_paged_kv(q[None], small.kv_buffer(0), small.tables(plan))
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            run(attention, small, q, k, v)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = run(attention, small, q, k, v)
+        captured_ref, captured_ptr, captured_size = buffers[-1]
+        run(attention, large, *rand_qkv(large_chunk), causal_block_size=1)
+        assert buffers[-1][2] > captured_size, "larger plan must require a larger allocation"
+        assert captured_ref() is not None, "captured scratch allocation was released"
+        assert captured_ref().data_ptr() == captured_ptr, "captured scratch storage moved"
+        scratch = torch.empty(captured_size, dtype=torch.uint8, device=DEVICE)
+        scratch.fill_(0xA5)
+        q2, k2, v2 = rand_qkv(small_chunk)
+        q.copy_(q2), k.copy_(k2), v.copy_(v2)
+        graph.replay()
+        torch.cuda.synchronize()
+        empty = pk[:0]
+        expected = exact_reference(q, pk, pv, empty, empty, k, v, 0, small_chunk)
+        _assert_attention_parity(output, expected)
+    finally:
+        small.shutdown()
+        large.shutdown()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() not in (100, 103),
+    reason="the CuTe DSL kernel runs on SM100/SM103",
+)
+@pytest.mark.parametrize("layout", ["padded_pages", "nonunit_head", "unaligned", "overlapping"])
+def test_cutedsl_rejects_unsupported_pool_strides(layout: str) -> None:
+    """Reject unsupported TMA layouts before launching a paged-attention kernel."""
+    cache = make_cache(32)
+    try:
+        open_with_prompt(cache, 9)
+        pool = cache.kv_buffer(0)
+        shape = pool.shape
+        if layout == "padded_pages":
+            invalid = pool.new_empty(shape[0] * 2, *shape[1:])[::2]
+        elif layout == "nonunit_head":
+            invalid = pool.new_empty(*shape[:-1], shape[-1] * 2)[..., ::2]
+        elif layout == "unaligned":
+            invalid = pool.new_empty(pool.numel() + 1)[1:].view(shape)
+            assert invalid.is_contiguous()
+        else:
+            invalid = pool[:1].expand_as(pool)
+        q = rand_qkv(CHUNK)[0]
+        with pytest.raises(ValueError, match="K/V pool must be contiguous and 32-byte aligned"):
+            make_backend("cutedsl").forward_paged_kv(
+                q[None], invalid, cache.tables(cache.plan(CHUNK))
+            )
+    finally:
+        cache.shutdown()

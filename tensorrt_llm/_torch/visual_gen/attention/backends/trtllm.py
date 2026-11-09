@@ -301,9 +301,10 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
       the queries only
     """
 
-    # Per device, the attention op's workspace for paged K/V attention, shared by every layer.
-    # The op grows it to the size it needs on the first, eager forward.
-    _paged_kv_workspaces: ClassVar[dict[torch.device, torch.Tensor]] = {}
+    # Per-device capacity buckets, shared by all layers. Allocations never grow or retire:
+    # captured graphs keep their addresses. Geometric capacities bound retained storage to
+    # less than twice the largest allocation.
+    _paged_kv_workspaces: ClassVar[dict[torch.device, dict[int, torch.Tensor]]] = {}
 
     def __init__(
         self,
@@ -772,15 +773,26 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         q = q.reshape(num_tokens, num_heads * head_dim).contiguous()
         out = torch.empty_like(q)
         host = self._paged_kv_host_tensors(kv_pool, batch, seq_len, max_kv_len)
-        workspace = self._paged_kv_workspaces.setdefault(
-            q.device, torch.empty(0, dtype=torch.int8, device=q.device)
-        )
-        if workspace.numel() == 0 and torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "Paged K/V attention workspace first needed during CUDA graph capture; run the "
-                "forward eagerly once before capturing."
-            )
         rope = self.rope_params
+        # The dense paged-context layout upper-bounds the native op's Q-only workspace.
+        # Its FMHA scratch allocation is not used by the native dense context path.
+        required_bytes = thop.get_trtllm_gen_context_workspace_layout(
+            q.dtype, batch, num_tokens, num_heads, head_dim, rope.dim, True, False, True
+        )["total_size"]
+        workspaces = self._paged_kv_workspaces.setdefault(q.device, {})
+        workspace = next(
+            (buf for size, buf in sorted(workspaces.items()) if size >= required_bytes), None
+        )
+        if workspace is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Paged K/V attention workspace first needed during CUDA graph capture; run the "
+                    "forward eagerly once before capturing."
+                )
+            capacity = 1 << (required_bytes - 1).bit_length()
+            workspace = workspaces[capacity] = torch.empty(
+                capacity, dtype=torch.int8, device=q.device
+            )
         FallbackFmha.attention(
             q=q,
             k=None,
