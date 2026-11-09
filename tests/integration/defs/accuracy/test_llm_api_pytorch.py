@@ -1277,7 +1277,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             (False, False, False, True, False),
             (True, False, True, True, False),
             (True, True, True, True, False),
-            # low_precision_combine only valid with attention_dp=True
+            # low_precision_combine is only read for pure EP (moe_tp_size == 1)
+            # with attention_dp. tp4 has moe_tp_size != 1, so the factory
+            # returns AllGatherReduceScatter and drops the flag.
             (False, True, False, False, True),
             (True, True, True, True, True),
         ])
@@ -1291,6 +1293,15 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                          overlap_scheduler, low_precision_combine, tp_size,
                          pp_size, ep_size, torch_compile, mtp_nextn,
                          moe_tactic):
+        # moe_tp_size = world / ep. The tp4 id is (4, 1, 1), so the flag never
+        # reaches NVLinkOneSided. Fail here instead of reporting a pass for a
+        # configuration the factory discards.
+        if low_precision_combine and not (attention_dp and tp_size == ep_size
+                                          and pp_size == 1):
+            pytest.fail(
+                "use_low_precision_moe_combine requires pure EP with attention DP "
+                "(ep4). moe_tp_size != 1 selects AllGatherReduceScatter and "
+                "drops the flag.")
         skip_unless_moe_tactic_runs_here(moe_tactic)
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
@@ -3435,11 +3446,11 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         ])
     def test_eagle3(self, eagle3_one_model, enable_chunked_prefill,
                     enable_max_concurrency, enable_draft_len_schedule):
-        max_concurrency = 100 if enable_max_concurrency else None
+        max_concurrency = 16 if enable_max_concurrency else None
         draft_len_schedule = {
-            50: 4,
-            200: 3,
-            350: 2
+            4: 4,
+            16: 2,
+            32: 1,
         } if enable_draft_len_schedule else None
         cuda_graph_config = (CudaGraphConfig(
             enable_padding=True, max_batch_size=32) if enable_draft_len_schedule
