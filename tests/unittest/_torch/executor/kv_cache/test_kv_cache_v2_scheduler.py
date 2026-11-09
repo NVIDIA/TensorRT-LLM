@@ -5630,3 +5630,123 @@ class TestAdmissionDiagnostics:
         plain = run()
         backoff_env.setenv(_DIAG_ENV, "1")
         assert run() == plain
+
+
+class TestPrefixSkipExtensions:
+    """Opt-in extensions of the prefix-aware skip (TRTLLM_SCHED_PREFIX_SKIP_*).
+
+    All default off; with them unset the skip behaves as TestPrefixAwareSkip pins.
+    """
+
+    _ENVS = (
+        "TRTLLM_SCHED_PREFIX_SKIP_PENDING",
+        "TRTLLM_SCHED_PREFIX_SKIP_MAX_DEFER_PASSES",
+        "TRTLLM_SCHED_PREFIX_SKIP_KEY_CACHE",
+        "TRTLLM_SCHED_PREFIX_SKIP_PRIORITIZE",
+        "TRTLLM_SCHED_SHORTEST_PREFILL_FIRST",
+    )
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        for name in self._ENVS:
+            monkeypatch.delenv(name, raising=False)
+
+    @staticmethod
+    def _manager(keys):
+        return make_kv_cache_manager(
+            enable_block_reuse=True,
+            block_reuse_policy=BlockReusePolicy.ALL_REUSABLE,
+            first_new_block_fn=lambda req: keys.get(req.request_id),
+        )
+
+    @staticmethod
+    def _pending_contributor_and_duplicate():
+        # req 0 has started its prefill (a continuation) but is not in flight this pass;
+        # req 1 is a first chunk whose first new block is the one req 0 commits next, and is
+        # tried first (as after a shortest-prefill-first reorder). By default req 0 registers
+        # its block only once it is scheduled, which is too late for req 1.
+        req0 = make_ctx_request(0, 500, prompt_len=1000, is_first_context_chunk=False)
+        req1 = make_ctx_request(1, 500)
+        return [req1, req0]
+
+    def test_defaults_off(self):
+        sched = make_scheduler(self._manager({}))
+        assert not sched._prefix_skip_pending
+        assert not sched._prefix_skip_key_cache
+        assert not sched._prefix_skip_prioritize
+
+    def test_pending_contributor_not_registered_by_default(self):
+        mgr = self._manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        out = sched.schedule_request(self._pending_contributor_and_duplicate(), set())
+        assert ids(out.context_requests) == [1, 0]
+
+    def test_pending_contributor_defers_duplicate(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_SCHED_PREFIX_SKIP_PENDING", "1")
+        mgr = self._manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        out = sched.schedule_request(self._pending_contributor_and_duplicate(), set())
+        assert ids(out.context_requests) == [0]
+        assert sched._prefix_skip_defer_passes == {1: 1}
+
+    def test_pending_deferrals_are_bounded(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_SCHED_PREFIX_SKIP_PENDING", "1")
+        monkeypatch.setenv("TRTLLM_SCHED_PREFIX_SKIP_MAX_DEFER_PASSES", "2")
+        mgr = self._manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        reqs = self._pending_contributor_and_duplicate()
+        admitted = [ids(sched.schedule_request(reqs, set()).context_requests) for _ in range(3)]
+        assert admitted == [[0], [0], [1, 0]]
+        # Admission forgets the request's deferral count.
+        assert 1 not in sched._prefix_skip_defer_passes
+
+    def test_key_cache_probes_a_continuation_once_per_commit(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_SCHED_PREFIX_SKIP_KEY_CACHE", "1")
+        mgr = self._manager({0: b"blockA", 1: b"blockB", 2: b"blockC"})
+        mgr.kv_cache_map[0] = Mock(is_active=True, num_committed_tokens=128)
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        req0 = make_ctx_request(0, 500, prompt_len=1000, is_first_context_chunk=False)
+        reqs = [req0, make_ctx_request(1, 100), make_ctx_request(2, 100)]
+
+        def probes_of_req0():
+            return sum(1 for c in mgr.probe_first_new_block_key.call_args_list if c.args[0] is req0)
+
+        sched.schedule_request(reqs, {0})
+        sched.schedule_request(reqs, {0})
+        assert probes_of_req0() == 1
+        mgr.kv_cache_map[0].num_committed_tokens = 192  # its chunk landed: the key may move
+        sched.schedule_request(reqs, {0})
+        assert probes_of_req0() == 2
+
+    def test_key_cache_keeps_the_deferred_first_chunk_key(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_SCHED_PREFIX_SKIP_KEY_CACHE", "1")
+        mgr = self._manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        req0 = make_ctx_request(0, 500, prompt_len=1000, is_first_context_chunk=False)
+        req1 = make_ctx_request(1, 500)
+        assert ids(sched.schedule_request([req0, req1], {0}).context_requests) == []
+        assert sched._deferred_first_block_key == {1: b"blockA"}
+        probes = mgr.probe_first_new_block_key.call_count
+        # Still behind the same contributor block: deferred again without re-probing req 1.
+        sched.schedule_request([req0, req1], {0})
+        assert not any(
+            c.args[0] is req1 for c in mgr.probe_first_new_block_key.call_args_list[probes:]
+        )
+
+    def test_prioritize_zeroes_the_deferred_estimate(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_SCHED_SHORTEST_PREFILL_FIRST", "1")
+        monkeypatch.setenv("TRTLLM_SCHED_PREFIX_SKIP_PRIORITIZE", "1")
+        mgr = self._manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        req0 = make_ctx_request(0, 500, prompt_len=1000, is_first_context_chunk=False)
+        req1 = make_ctx_request(1, 900)
+        sched.schedule_request([req0, req1], {0})
+        assert sched._shortest_prefill_first._uncached_estimate.get(1) == 0
+
+    def test_prioritize_without_spf_is_inert(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_SCHED_PREFIX_SKIP_PRIORITIZE", "1")
+        mgr = self._manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        req0 = make_ctx_request(0, 500, prompt_len=1000, is_first_context_chunk=False)
+        out = sched.schedule_request([req0, make_ctx_request(1, 900)], {0})
+        assert ids(out.context_requests) == []

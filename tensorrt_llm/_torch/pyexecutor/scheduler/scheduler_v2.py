@@ -605,6 +605,14 @@ class ShortestPrefillFirstOrder:
             self.first_chunk_aged_admissions += len(admitted)
             self._first_chunk_aged = set()
 
+    def prioritize(self, request_id: int) -> None:
+        """Order a not-yet-started request ahead of every request with a nonzero estimate.
+
+        Its uncached estimate becomes zero, so among requests that have not
+        aged it is tried first (ties keep arrival order).
+        """
+        self._uncached_estimate[request_id] = 0
+
 
 class KVCacheV2Scheduler(RequestScheduler):
     """Interleaved scheduler for KV Cache Manager V2.
@@ -620,6 +628,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     # Scheduling passes between two summaries of the prefill-decode interval.
     _CONTEXT_ADMISSION_LOG_PASSES = 4096
+    # Size above which the opt-in prefix-skip caches are pruned.
+    _PREFIX_SKIP_STATE_MAX_ENTRIES = 4096
 
     def __init__(
         self,
@@ -734,6 +744,56 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._skip_blocked_pending_ctx = (
             os.environ.get("TLLM_SCHEDULER_DISABLE_BLOCKED_CTX_SKIP", "0") != "1"
         )
+
+        # Opt-in (default off) extensions of the prefix-aware skip. With all
+        # three unset, the skip behaves as described in
+        # _collect_contributed_blocks.
+        #
+        # TRTLLM_SCHED_PREFIX_SKIP_PENDING=1: a started context request that is
+        # not in flight this pass also registers the block it is about to
+        # commit, so a first chunk sharing that prefix waits for it instead of
+        # recomputing the shared prefix. Under the overlap executor a long
+        # prefill is in flight only every other pass, and with an admission
+        # order other than arrival order a duplicate can otherwise be tried
+        # ahead of its contributor. A request is deferred at most
+        # TRTLLM_SCHED_PREFIX_SKIP_MAX_DEFER_PASSES times before it is
+        # admitted; the count restarts once it is scheduled.
+        self._prefix_skip_pending = os.environ.get("TRTLLM_SCHED_PREFIX_SKIP_PENDING", "0") == "1"
+        self._prefix_skip_max_defer_passes = _read_non_negative_int_env(
+            "TRTLLM_SCHED_PREFIX_SKIP_MAX_DEFER_PASSES", 2048
+        )
+        self._prefix_skip_defer_passes: dict[int, int] = {}
+        # TRTLLM_SCHED_PREFIX_SKIP_KEY_CACHE=1: cache a started context
+        # request's first-new-block key on its committed token count. The key
+        # moves only when the request commits blocks, so a pass re-probes only
+        # the requests whose previous chunk landed. The key is advisory (it
+        # only gates deferrals). A deferred first chunk also keeps its key:
+        # while that key is still some contributor's next block, the first
+        # chunk is deferred again without re-walking its prompt.
+        self._prefix_skip_key_cache = (
+            os.environ.get("TRTLLM_SCHED_PREFIX_SKIP_KEY_CACHE", "0") == "1"
+        )
+        self._continuation_key_cache: dict[int, tuple[int, bytes | None]] = {}
+        self._deferred_first_block_key: dict[int, bytes] = {}
+        # TRTLLM_SCHED_PREFIX_SKIP_PRIORITIZE=1 (with
+        # TRTLLM_SCHED_SHORTEST_PREFILL_FIRST=1): once the skip defers a
+        # request, its shortest-prefill-first estimate becomes zero, so it is
+        # tried ahead of every request that has not aged. The estimate was
+        # taken before the contributor computed the shared prefix, so it
+        # overstates the work left and would queue the request behind short
+        # ones while the contributor's sliding-window pages at the divergence
+        # point age out.
+        self._prefix_skip_prioritize = (
+            os.environ.get("TRTLLM_SCHED_PREFIX_SKIP_PRIORITIZE", "0") == "1"
+        )
+        if self._prefix_skip_pending or self._prefix_skip_key_cache or self._prefix_skip_prioritize:
+            logger.info(
+                "KVCacheV2Scheduler prefix-aware skip: "
+                f"pending_contributors={self._prefix_skip_pending} "
+                f"(max_defer_passes={self._prefix_skip_max_defer_passes}), "
+                f"key_cache={self._prefix_skip_key_cache}, "
+                f"prioritize_deferred={self._prefix_skip_prioritize}"
+            )
 
         # Opt-in (default off) context admission policies for decode-heavy
         # aggregated serving; see PrefillDecodeInterval and
@@ -1166,17 +1226,42 @@ class KVCacheV2Scheduler(RequestScheduler):
             if contributed_blocks is not None and (
                 req.state_value == self._context_init_state_value
             ):
-                first_new_block = self.kv_cache_manager.probe_first_new_block_key(req)
+                held_key = (
+                    self._deferred_first_block_key.get(req.py_request_id)
+                    if self._prefix_skip_key_cache and req.is_first_context_chunk
+                    else None
+                )
+                if held_key is not None and held_key in contributed_blocks:
+                    # Its next block is still a contributor's next block: no
+                    # block it could match has been committed since it was
+                    # last deferred.
+                    first_new_block = held_key
+                else:
+                    first_new_block = self._continuation_block_key(req)
                 if (
                     req.is_first_context_chunk
                     and first_new_block is not None
                     and first_new_block in contributed_blocks
+                    and (
+                        not self._prefix_skip_pending
+                        or self._prefix_skip_defer_passes.get(req.py_request_id, 0)
+                        < self._prefix_skip_max_defer_passes
+                    )
                 ):
                     logger.debug(
                         f"Deferring context request {req.py_request_id}: its first new "
                         "block is already contributed by a request that runs this iteration"
                     )
                     deferred_behind_contributor = True
+                    request_id = req.py_request_id
+                    if self._prefix_skip_pending:
+                        self._prefix_skip_defer_passes[request_id] = (
+                            self._prefix_skip_defer_passes.get(request_id, 0) + 1
+                        )
+                    if self._prefix_skip_prioritize and self._shortest_prefill_first is not None:
+                        self._shortest_prefill_first.prioritize(request_id)
+                    if self._prefix_skip_key_cache:
+                        self._deferred_first_block_key[request_id] = first_new_block
                     continue
             peft_pages = budget.peft_pages_needed(req)
             if peft_pages is None:
@@ -1216,6 +1301,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 # a request is only ever deferred behind a contributor that
                 # actually runs this iteration, so a deferral always leaves
                 # either inflight_request_ids or scheduled_ctx non-empty.
+                # TRTLLM_SCHED_PREFIX_SKIP_PENDING relaxes this to pending
+                # contributors and bounds each request's deferrals instead.
                 if first_new_block is not None:
                     contributed_blocks.add(first_new_block)
 
@@ -1224,6 +1311,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             backoff.record_pass(has_generation, self._ctx_page_refused)
         if diag is not None:
             diag.end_pass(len(ctx_candidates), len(scheduled_ctx))
+        if self._prefix_skip_pending or self._prefix_skip_key_cache:
+            self._forget_admitted_prefix_skip_state(scheduled_ctx, requests_list)
         if self._prefill_decode_interval is not None:
             self._record_context_admission(scheduled_ctx, has_generation, deferred_by_interval)
         if self._shortest_prefill_first is not None:
@@ -1397,6 +1486,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         produce an iteration scheduling nothing, which the deadlock detector
         would report as a hang.
 
+        With ``TRTLLM_SCHED_PREFIX_SKIP_PENDING=1`` every started continuation
+        qualifies, in flight or not, and each request's deferrals are bounded
+        by ``TRTLLM_SCHED_PREFIX_SKIP_MAX_DEFER_PASSES`` instead.
+
         Returns None when the skip provably cannot fire this iteration, which
         lets the caller avoid every probe: nothing else consumes the radix walk,
         so a probe that cannot change a decision is pure overhead.
@@ -1411,7 +1504,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             for req in requests_list
             if req.state_value == self._context_init_state_value
             and not req.is_first_context_chunk
-            and req.request_id in inflight_request_ids
+            and (self._prefix_skip_pending or req.request_id in inflight_request_ids)
         ]
         if not in_flight and num_candidates < 2:
             # A lone candidate with nothing running can never be deferred: only
@@ -1424,10 +1517,47 @@ class KVCacheV2Scheduler(RequestScheduler):
                 return None
         contributed = set()
         for req in in_flight:
-            key = self.kv_cache_manager.probe_first_new_block_key(req)
+            key = self._continuation_block_key(req)
             if key is not None:
                 contributed.add(key)
         return contributed
+
+    def _continuation_block_key(self, req: LlmRequest) -> bytes | None:
+        """``probe_first_new_block_key`` of *req*, cached on a started request's commits.
+
+        With ``TRTLLM_SCHED_PREFIX_SKIP_KEY_CACHE=1`` the key of a started
+        context request is reused while its committed token count is unchanged.
+        """
+        manager = self.kv_cache_manager
+        if not self._prefix_skip_key_cache or req.is_first_context_chunk:
+            return manager.probe_first_new_block_key(req)
+        request_id = req.py_request_id
+        kv_cache = manager.kv_cache_map.get(request_id)
+        stamp = None if kv_cache is None else kv_cache.num_committed_tokens
+        cached = self._continuation_key_cache.get(request_id)
+        if stamp is not None and cached is not None and cached[0] == stamp:
+            return cached[1]
+        key = manager.probe_first_new_block_key(req)
+        if stamp is not None:
+            if len(self._continuation_key_cache) > self._PREFIX_SKIP_STATE_MAX_ENTRIES:
+                self._continuation_key_cache.clear()
+            self._continuation_key_cache[request_id] = (stamp, key)
+        return key
+
+    def _forget_admitted_prefix_skip_state(
+        self, scheduled_ctx: RequestList, requests_list: RequestList
+    ) -> None:
+        """Drop the prefix-skip bookkeeping of requests admitted this pass."""
+        for req in scheduled_ctx:
+            self._deferred_first_block_key.pop(req.py_request_id, None)
+            self._prefix_skip_defer_passes.pop(req.py_request_id, None)
+        if len(self._deferred_first_block_key) > self._PREFIX_SKIP_STATE_MAX_ENTRIES:
+            self._deferred_first_block_key.clear()
+        if len(self._prefix_skip_defer_passes) > self._PREFIX_SKIP_STATE_MAX_ENTRIES:
+            live = {r.py_request_id for r in requests_list}
+            self._prefix_skip_defer_passes = {
+                k: v for k, v in self._prefix_skip_defer_passes.items() if k in live
+            }
 
     # ---- Per-type scheduling methods ----
 
