@@ -79,14 +79,22 @@ def run(entry: str, world_size: int) -> str:
     launcher = Path(__file__).resolve().with_name(f"_{entry}_op_matrix.py")
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=require_world(world_size))
 
-    # The ranks import tensorrt_llm absolutely, and a source checkout is not necessarily installed.
-    # tests/unittest/_torch/modeling_v2/models/minimax_m3/<target>/comm -> repo root.
+    # Match the package resolved by pytest: an unbuilt checkout must not
+    # shadow an installed wheel in rank subprocesses.
     repo_root = Path(__file__).resolve().parents[8]
-    assert (repo_root / "tensorrt_llm").is_dir(), (
-        f"expected the repo root at {repo_root}, found no tensorrt_llm/ there; "
-        f"this file moved without its parents[] index following"
-    )
-    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(repo_root), env.get("PYTHONPATH", "")) if p)
+    installed = importlib.util.find_spec("tensorrt_llm")
+    if installed is None or Path(installed.origin).resolve().parents[1] == repo_root:
+        assert (repo_root / "tensorrt_llm").is_dir(), (
+            f"expected the repo root at {repo_root}, found no tensorrt_llm/ there; "
+            f"this file moved without its parents[] index following"
+        )
+        env["PYTHONPATH"] = os.pathsep.join(
+            p for p in (str(repo_root), env.get("PYTHONPATH", "")) if p
+        )
+    elif "PYTHONPATH" in env:
+        env["PYTHONPATH"] = os.pathsep.join(
+            p for p in env["PYTHONPATH"].split(os.pathsep) if Path(p or ".").resolve() != repo_root
+        )
 
     constants = _load_launcher_constants(launcher)
     timeout = constants.DEADLINE_S + _LAUNCHER_GRACE_S

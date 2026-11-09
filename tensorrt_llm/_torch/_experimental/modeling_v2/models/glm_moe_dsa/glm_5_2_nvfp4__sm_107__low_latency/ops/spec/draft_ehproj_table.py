@@ -8,9 +8,9 @@ from typing import Dict, List, Optional, Sequence
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
+from ... import native_ops
 from ._draft_step_state import assert_state_args_valid, global_argmax, next_step_state
 
 
@@ -118,7 +118,7 @@ class GlmDraftEhprojTable(OpWrapper):
         gen_kv_indptr: Optional[torch.Tensor],
         gen_cached_token_indptr: Optional[torch.Tensor],
     ) -> None:
-        torch.ops.trtllm.glm_draft_ehproj_table(
+        native_ops.glm_draft_ehproj_table(
             logits,
             exchange_buffer,
             exchange_flags,
