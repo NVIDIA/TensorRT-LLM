@@ -37,11 +37,10 @@ import pytest
 from tensorrt_llm import LLM
 from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_ENV
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 
-from ...conftest import llm_models_root
-from ..accuracy_core import GSM8K, LlmapiAccuracyTestHarness, assert_acceptance_length_for_llm
-from ._env import scoped_env_overrides
+from ....conftest import llm_models_root
+from .._env import scoped_env_overrides
 
 _MODEL_NAME = "zai-org/GLM-5.3-Flash"
 _MODEL_PATH = f"{llm_models_root()}/GLM-5.3-Flash-NVFP4"
@@ -87,43 +86,3 @@ def _sm100_tp4(cls):
     for mark in _SM100_TP4:
         cls = mark(cls)
     return cls
-
-
-@_sm100_tp4
-class TestModelingV2Glm53FlashNvfp4Sm100Default(LlmapiAccuracyTestHarness):
-    """The split target at attention TP4 with expert-parallel MoE (EP4)."""
-
-    MODEL_NAME = _MODEL_NAME
-    MODEL_PATH = _MODEL_PATH
-
-    def test_gsm8k(self) -> None:
-        with _llm(self.MODEL_PATH) as llm:
-            GSM8K(self.MODEL_NAME).evaluate(llm)
-
-    def test_gsm8k_mtp_vanilla(self) -> None:
-        """Vanilla one-model MTP, which the fused target declines: the engine's MTP worker drives this target."""
-        spec = MTPDecodingConfig(max_draft_len=1, use_mtp_vanilla=True)
-        with _llm(self.MODEL_PATH, spec) as llm:
-            GSM8K(self.MODEL_NAME).evaluate(llm)
-
-
-@_sm100_tp4
-class TestModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused(LlmapiAccuracyTestHarness):
-    """The MTP-fused target at attention TP4 with expert-parallel MoE (EP4), three drafts per step."""
-
-    MODEL_NAME = _MODEL_NAME
-    MODEL_PATH = _MODEL_PATH
-
-    def test_gsm8k_mtp(self) -> None:
-        # Strict acceptance keeps GSM8K unchanged even when every draft is rejected, so the
-        # acceptance length is what shows the draft chain works.
-        with _llm(
-            self.MODEL_PATH,
-            MTPDecodingConfig(max_draft_len=3),
-            max_stats_len=-1,
-            enable_iter_perf_stats=True,
-        ) as llm:
-            GSM8K(self.MODEL_NAME).evaluate(llm)
-            assert_acceptance_length_for_llm(
-                "TestModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused::test_gsm8k_mtp", llm
-            )
