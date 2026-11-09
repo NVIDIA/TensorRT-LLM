@@ -33,19 +33,22 @@ def _clean(monkeypatch):
     triggers.uninstall_oom_reporter()
 
 
-@pytest.mark.parametrize(
-    "value, expected",
-    [(None, "oom"), ("", "oom"), ("oom", "oom"), ("OOM", "oom"), ("0", "off"), ("1", "full")],
-)
-def test_values(monkeypatch, value, expected):
-    if value is None:
-        monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
-    else:
-        monkeypatch.setenv("TLLM_MEM_MONITOR", value)
-    assert mon.mode() == expected
+def test_values(monkeypatch):
+    for value, expected in [
+        (None, "oom"),
+        ("", "oom"),
+        ("oom", "oom"),
+        ("OOM", "oom"),
+        ("0", "off"),
+        ("1", "full"),
+    ]:
+        if value is None:
+            monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
+        else:
+            monkeypatch.setenv("TLLM_MEM_MONITOR", value)
+        assert mon.mode() == expected, f"TLLM_MEM_MONITOR={value!r}"
 
-
-def test_unknown_value_falls_back_to_the_default_with_a_warning(monkeypatch):
+    # An unknown value falls back to the default, with a warning.
     warnings = []
     monkeypatch.setenv("TLLM_MEM_MONITOR", "yes-please")
     from tensorrt_llm.logger import logger
@@ -57,12 +60,9 @@ def test_unknown_value_falls_back_to_the_default_with_a_warning(monkeypatch):
 
 
 class TestDefaultReportsOnlyOutOfMemory:
-    @pytest.fixture(autouse=True)
-    def _default(self, monkeypatch):
+    def test_reports_only_out_of_memory(self, monkeypatch):
         monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
         monkeypatch.setenv(triggers.INTERVAL_VAR, "0.05")
-
-    def test_an_oom_is_reported(self, monkeypatch):
         seen = []
         monkeypatch.setenv("TLLM_MEM_MONITOR_OOM_INTERVAL", "0")
         monkeypatch.setattr(
@@ -73,8 +73,6 @@ class TestDefaultReportsOnlyOutOfMemory:
         # The full monitor is off, so the report has to be forced.
         assert seen == [("out_of_memory", True)]
 
-    def test_nothing_else_runs(self):
-        triggers.install_oom_reporter(rank=0)
         # No periodic thread even though an interval is set ...
         assert not any(t.name == "memory-monitor-periodic" for t in threading.enumerate())
         # ... no startup recording or regions ...
@@ -85,9 +83,9 @@ class TestDefaultReportsOnlyOutOfMemory:
         if torch.cuda.is_available():
             assert mon.capture(tag="unit") is None
 
-    def test_rank_filter_applies(self, monkeypatch):
+        triggers.uninstall_oom_reporter()
         monkeypatch.setenv("TLLM_MEM_MONITOR_RANKS", "3")
-        assert triggers.install_oom_reporter(rank=0) is False
+        assert triggers.install_oom_reporter(rank=0) is False, "the rank filter applies"
 
 
 def test_off_reports_nothing(monkeypatch):

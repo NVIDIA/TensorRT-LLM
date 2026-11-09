@@ -69,56 +69,46 @@ class TestPeriodic:
         triggers.uninstall_oom_reporter()
         assert not any(t.name == "memory-monitor-periodic" for t in threading.enumerate())
 
-    @pytest.mark.cpu_only
-    def test_off_unless_asked(self, monkeypatch):
-        monkeypatch.delenv(triggers.INTERVAL_VAR, raising=False)
-        monkeypatch.setattr(triggers, "_attached", True)
-        triggers.install_oom_reporter()
-        assert not any(t.name == "memory-monitor-periodic" for t in threading.enumerate())
-
 
 @pytest.mark.cpu_only
-class TestErrorsFromOtherThreads:
-    def test_logged_oom_is_reported_once(self, reports):
-        triggers.install_oom_reporter()
-        # How the KV transfer workers report a failed delivery.
-        logger.error("_process_task_queue[0]: unhandled exception: CUDA error: out of memory")
-        assert len(reports) == 1 and reports[0][0] == "out_of_memory"
+def test_errors_from_other_threads(reports, monkeypatch):
+    def periodic_running():
+        return any(t.name == "memory-monitor-periodic" for t in threading.enumerate())
 
-    def test_other_errors_and_warnings_are_ignored(self, reports):
-        triggers.install_oom_reporter()
-        level = logger.level
-        logger.set_level("info")  # let the warning reach the filter
-        try:
-            logger.error("request 7 failed: invalid token id")
-            # Runtime autotuning skips tactics this way; not a failure.
-            logger.warning("autotuner: tactic 3 ran out of memory, skipping")
-        finally:
-            logger.set_level(level)
-        assert reports == []
+    logger.error("CUDA out of memory")
+    assert reports == [], "nothing is reported before arming"
 
-    def test_thread_dying_of_oom_is_reported(self, reports):
-        triggers.install_oom_reporter()
+    previous = threading.excepthook
+    monkeypatch.delenv(triggers.INTERVAL_VAR, raising=False)
+    triggers.install_oom_reporter()
+    assert not periodic_running(), "periodic reports are off unless an interval is set"
 
-        def run():
-            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB")
+    # How the KV transfer workers report a failed delivery.
+    logger.error("_process_task_queue[0]: unhandled exception: CUDA error: out of memory")
+    assert len(reports) == 1 and reports[0][0] == "out_of_memory", "a logged OOM"
 
-        worker = threading.Thread(target=run)
-        worker.start()
-        worker.join()
-        assert len(reports) == 1
+    level = logger.level
+    logger.set_level("info")  # let the warning reach the filter
+    try:
+        logger.error("request 7 failed: invalid token id")
+        # Runtime autotuning skips tactics this way; not a failure.
+        logger.warning("autotuner: tactic 3 ran out of memory, skipping")
+    finally:
+        logger.set_level(level)
+    assert len(reports) == 1, "other errors and warnings are ignored"
 
-    def test_hooks_are_removed_with_the_reporter(self, reports):
-        previous = threading.excepthook
-        triggers.install_oom_reporter()
-        triggers.uninstall_oom_reporter()
-        assert threading.excepthook is previous
-        logger.error("CUDA out of memory")
-        assert reports == []
+    def run():
+        raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB")
 
-    def test_nothing_before_arming(self, reports):
-        logger.error("CUDA out of memory")
-        assert reports == []
+    worker = threading.Thread(target=run)
+    worker.start()
+    worker.join()
+    assert len(reports) == 2, "a thread dying of an OOM"
+
+    triggers.uninstall_oom_reporter()
+    assert threading.excepthook is previous, "the hooks are removed with the reporter"
+    logger.error("CUDA out of memory")
+    assert len(reports) == 2
 
 
 class TestOnRequest:
@@ -130,23 +120,6 @@ class TestOnRequest:
         worker = SimpleNamespace(engine=SimpleNamespace(device_id=torch.cuda.current_device()))
         (text,) = BaseWorker.get_memory_report(worker)
         assert "This process uses" in text
-
-    @pytest.mark.cpu_only
-    def test_llm_returns_each_workers_report(self):
-        from tensorrt_llm import LLM
-
-        llm = object.__new__(LLM)
-        # Rank 0's worker answers for every rank under MPI; Ray workers each
-        # answer for themselves. Either way one flat list comes back.
-        llm._collective_rpc = MagicMock(return_value=[["rank 0", "rank 1"], None, ["rank 2"]])
-        assert llm.get_memory_report() == ["rank 0", "rank 1", "rank 2"]
-        llm._collective_rpc.assert_called_once_with("get_memory_report")
-
-    @pytest.mark.cpu_only
-    def test_allowed_on_a_multi_rank_mpi_executor(self):
-        from tensorrt_llm.executor.proxy import _check_collective_rpc_guard
-
-        _check_collective_rpc_guard(2, None, None, method="get_memory_report")
 
 
 @needs_gpu
@@ -177,6 +150,21 @@ def test_worker_thread_allocation_is_named_after_the_running_step(monkeypatch):
 
 
 @pytest.mark.cpu_only
+def test_llm_returns_each_workers_report():
+    from tensorrt_llm import LLM
+    from tensorrt_llm.executor.proxy import _check_collective_rpc_guard
+
+    llm = object.__new__(LLM)
+    # Rank 0's worker answers for every rank under MPI; Ray workers each
+    # answer for themselves. Either way one flat list comes back.
+    llm._collective_rpc = MagicMock(return_value=[["rank 0", "rank 1"], None, ["rank 2"]])
+    assert llm.get_memory_report() == ["rank 0", "rank 1", "rank 2"]
+    llm._collective_rpc.assert_called_once_with("get_memory_report")
+    # Allowed on a multi-rank MPI executor.
+    _check_collective_rpc_guard(2, None, None, method="get_memory_report")
+
+
+@pytest.mark.cpu_only
 def test_nested_windows_resolve_to_the_innermost():
     lookup = tagging._window_lookup([(0, 100, "outer"), (40, 60, "inner")])
     assert [lookup(t) for t in (10, 50, 70, 150)] == ["outer", "inner", "outer", None]
@@ -201,43 +189,43 @@ class _FakeComm:
             return self._box[(source, self.rank, tag)].pop(0)
 
 
+def _ranks(monkeypatch, world, listening):
+    from tensorrt_llm._torch.memory.monitor import ranks
+
+    monkeypatch.setattr(
+        triggers, "report_now", lambda tag, rank=None, **_: f"report of rank {rank}"
+    )
+    box, lock = {}, threading.Lock()
+    reporters = [
+        ranks.RankReporter(_FakeComm(r, box, lock), r, world, None)
+        for r in range(world)
+        if r == 0 or r in listening
+    ]
+    return reporters, box, lock
+
+
 @pytest.mark.cpu_only
-class TestEveryRank:
-    def _ranks(self, monkeypatch, world, listening):
-        from tensorrt_llm._torch.memory.monitor import ranks
+def test_rank_zero_gathers_every_rank(monkeypatch):
+    from tensorrt_llm._torch.memory.monitor import ranks
 
-        monkeypatch.setattr(
-            triggers, "report_now", lambda tag, rank=None, **_: f"report of rank {rank}"
-        )
-        box, lock = {}, threading.Lock()
-        reporters = [
-            ranks.RankReporter(_FakeComm(r, box, lock), r, world, None)
-            for r in range(world)
-            if r == 0 or r in listening
-        ]
-        return reporters, box, lock
+    reporters, _, _ = _ranks(monkeypatch, 3, {1, 2})
+    try:
+        got = reporters[0].gather(timeout=10)
+        assert got == ["report of rank 1", "report of rank 2"], "in rank order"
+    finally:
+        for r in reporters:
+            r.stop()
 
-    def test_rank_zero_gathers_the_others_in_order(self, monkeypatch):
-        reporters, _, _ = self._ranks(monkeypatch, 3, {1, 2})
-        try:
-            assert reporters[0].gather(timeout=10) == ["report of rank 1", "report of rank 2"]
-        finally:
-            for r in reporters:
-                r.stop()
+    reporters, _, _ = _ranks(monkeypatch, 3, {1})
+    try:
+        got = reporters[0].gather(timeout=0.3)
+        assert got == ["report of rank 1", "rank 2: no report within 0.3 s"], "a silent rank"
+    finally:
+        for r in reporters:
+            r.stop()
 
-    def test_a_silent_rank_does_not_hold_up_the_rest(self, monkeypatch):
-        reporters, _, _ = self._ranks(monkeypatch, 3, {1})
-        try:
-            got = reporters[0].gather(timeout=0.3)
-            assert got == ["report of rank 1", "rank 2: no report within 0.3 s"]
-        finally:
-            for r in reporters:
-                r.stop()
-
-    def test_a_late_answer_to_an_earlier_request_is_dropped(self, monkeypatch):
-        reporters, box, lock = self._ranks(monkeypatch, 2, set())
-        from tensorrt_llm._torch.memory.monitor import ranks
-
-        with lock:  # rank 1's answer to request 0, which timed out long ago
-            box.setdefault((1, 0, ranks._REPLY_TAG), []).append((0, "stale"))
-        assert reporters[0].gather(timeout=0.2) == ["rank 1: no report within 0.2 s"]
+    reporters, box, lock = _ranks(monkeypatch, 2, set())
+    with lock:  # rank 1's answer to request 0, which timed out long ago
+        box.setdefault((1, 0, ranks._REPLY_TAG), []).append((0, "stale"))
+    got = reporters[0].gather(timeout=0.2)
+    assert got == ["rank 1: no report within 0.2 s"], "a late answer is dropped"

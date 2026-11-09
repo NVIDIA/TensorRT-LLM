@@ -56,88 +56,65 @@ class _AllReduce(torch.nn.Module):
         self.symm_mem_allreduce = inst
 
 
-class TestSymmMem:
-    def test_walks_the_claimed_model_and_counts_shared_buffers_once(self):
-        shared = _SymmInstance(8 * MB)
-        model = torch.nn.Sequential(
-            _AllReduce(shared), _AllReduce(shared), _AllReduce(_SymmInstance(2 * MB))
-        )
-        tagging.claim_module_memory(model, "WEIGHTS")
-        entries = SymmMemProvider().collect()
-        assert len(entries) == 1
-        assert entries[0].size_bytes == 10 * MB
-        assert entries[0].category is Category.COMM_SYMM_MEM
-        # The allocator rounds up; the request is a lower bound.
-        assert entries[0].basis is Basis.REQUESTED
+def test_symm_mem_walks_the_claimed_model_and_counts_shared_buffers_once():
+    assert SymmMemProvider().available() is False, "no claimed model, nothing to walk"
 
-    def test_unavailable_without_a_model(self):
-        assert SymmMemProvider().available() is False
+    tagging.claim_module_memory(torch.nn.Sequential(_AllReduce(None)), "WEIGHTS")
+    assert SymmMemProvider().collect() == [], "symmetric memory not in use"
+    tagging.clear_claims()
 
-    def test_nothing_when_symm_mem_is_not_in_use(self):
-        model = torch.nn.Sequential(_AllReduce(None))
-        tagging.claim_module_memory(model, "WEIGHTS")
-        assert SymmMemProvider().collect() == []
+    shared = _SymmInstance(8 * MB)
+    model = torch.nn.Sequential(
+        _AllReduce(shared), _AllReduce(shared), _AllReduce(_SymmInstance(2 * MB))
+    )
+    tagging.claim_module_memory(model, "WEIGHTS")
+    entries = SymmMemProvider().collect()
+    assert len(entries) == 1
+    assert entries[0].size_bytes == 10 * MB
+    assert entries[0].category is Category.COMM_SYMM_MEM
+    # The allocator rounds up; the request is a lower bound.
+    assert entries[0].basis is Basis.REQUESTED
 
 
-class TestMcastAllReduce:
-    def _workspace(self, nbytes):
-        return {"uc_buffer": torch.empty(nbytes // 4, dtype=torch.float32), "buffer_size_bytes": 0}
-
-    def test_counts_active_and_retired_workspaces(self, monkeypatch):
-        from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
-
-        monkeypatch.setattr(
-            MNNVLAllReduce,
-            "allreduce_mnnvl_workspaces",
-            {"tp0": self._workspace(12 * MB)},
-        )
-        # Retired by a resize but kept alive for captured graphs: still held.
-        monkeypatch.setattr(
-            MNNVLAllReduce,
-            "allreduce_mnnvl_retired_workspaces",
-            {"tp0": [self._workspace(6 * MB)]},
-        )
-        entries = McastAllReduceProvider().collect()
-        assert entries[0].size_bytes == 18 * MB
-        assert entries[0].category is Category.COMM_NVLS
-        assert entries[0].basis is Basis.REQUESTED
-
-    def test_sized_from_the_whole_unicast_view(self, monkeypatch):
-        # The view spans every Lamport buffer; reading buffer_size_bytes
-        # alone would count one of three.
-        from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
-
-        ws = self._workspace(12 * MB)
-        ws["buffer_size_bytes"] = 4 * MB
-        monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_workspaces", {"tp0": ws})
-        monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_retired_workspaces", {})
-        assert McastAllReduceProvider().collect()[0].size_bytes == 12 * MB
-
-    def test_nothing_when_no_workspace_exists(self, monkeypatch):
-        from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
-
-        monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_workspaces", {})
-        monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_retired_workspaces", {})
-        assert McastAllReduceProvider().collect() == []
+def _workspace(nbytes):
+    return {"uc_buffer": torch.empty(nbytes // 4, dtype=torch.float32), "buffer_size_bytes": 0}
 
 
-def test_both_are_in_the_default_set():
+def test_mcast_allreduce_counts_active_and_retired_workspaces(monkeypatch):
+    from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+
     kinds = {type(p) for p in default_providers()}
     assert SymmMemProvider in kinds and McastAllReduceProvider in kinds
 
+    def workspaces(active, retired):
+        monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_workspaces", active)
+        monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_retired_workspaces", retired)
+        return McastAllReduceProvider().collect()
 
-class TestNcclWindow:
-    def _provider(self, monkeypatch, usage):
-        from tensorrt_llm._torch.memory.monitor.providers.comm import NcclWindowProvider
+    assert workspaces({}, {}) == [], "no workspace exists"
 
+    # Retired by a resize but kept alive for captured graphs: still held.
+    entries = workspaces({"tp0": _workspace(12 * MB)}, {"tp0": [_workspace(6 * MB)]})
+    assert entries[0].size_bytes == 18 * MB
+    assert entries[0].category is Category.COMM_NVLS
+    assert entries[0].basis is Basis.REQUESTED
+
+    # The view spans every Lamport buffer; reading buffer_size_bytes
+    # alone would count one of three.
+    ws = _workspace(12 * MB)
+    ws["buffer_size_bytes"] = 4 * MB
+    assert workspaces({"tp0": ws}, {})[0].size_bytes == 12 * MB
+
+
+def test_nccl_window_counts_pooled_buffers_whether_or_not_checked_out(monkeypatch):
+    from tensorrt_llm._torch.memory.monitor.providers.comm import NcclWindowProvider
+
+    def collect(usage):
         monkeypatch.setattr(NcclWindowProvider, "_op", staticmethod(lambda: lambda _d: usage))
         monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-        return NcclWindowProvider()
+        return NcclWindowProvider().collect()
 
-    def test_pooled_buffers_count_whether_or_not_checked_out(self, monkeypatch):
-        (entry,) = self._provider(monkeypatch, [3, 96 * MB, 32 * MB]).collect()
-        assert entry.size_bytes == 96 * MB
-        assert GROUP_OF[entry.category] is Group.COMMUNICATION
-
-    def test_no_buffers_no_row(self, monkeypatch):
-        assert self._provider(monkeypatch, [0, 0, 0]).collect() == []
+    (entry,) = collect([3, 96 * MB, 32 * MB])
+    assert entry.size_bytes == 96 * MB
+    assert GROUP_OF[entry.category] is Group.COMMUNICATION
+    assert collect([0, 0, 0]) == [], "no buffers, no row"

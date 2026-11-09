@@ -47,50 +47,43 @@ def _with_fake_ledger(monkeypatch, rows):
 
 
 @pytest.mark.cpu_only
-class TestLabels:
-    def test_known_labels_land_in_their_groups(self, monkeypatch):
-        _with_fake_ledger(
-            monkeypatch,
+def test_ledger_labels_become_rows_in_their_groups(monkeypatch):
+    from tensorrt_llm._torch.memory.monitor.providers import default_providers
+
+    assert any(isinstance(p, NativeMemoryProvider) for p in default_providers())
+    for label in LABELS.values():
+        assert label.category in GROUP_OF and GROUP_OF[label.category] is not None, label
+
+    def collect(rows):
+        _with_fake_ledger(monkeypatch, rows)
+        return NativeMemoryProvider().collect()
+
+    entries = {
+        e.owner: e
+        for e in collect(
             [
                 ("nccl_communicators", 2, 900 * MB),
                 ("moe_gemm_profiler_workspace", 1, 64 * MB),
                 ("eplb_device", 4, 512 * MB),
-            ],
+            ]
         )
-        entries = {e.owner: e for e in NativeMemoryProvider().collect()}
-        assert GROUP_OF[entries["NCCL communicators"].category] is Group.COMMUNICATION
-        assert GROUP_OF[entries["MoE GEMM profiler workspace"].category] is Group.WORKSPACE
-        # Expert weight slots moved out of PyTorch are still weights.
-        assert GROUP_OF[entries["MoE load balancer, host-accessible"].category] is Group.WEIGHTS
+    }
+    assert GROUP_OF[entries["NCCL communicators"].category] is Group.COMMUNICATION
+    assert GROUP_OF[entries["MoE GEMM profiler workspace"].category] is Group.WORKSPACE
+    # Expert weight slots moved out of PyTorch are still weights.
+    assert GROUP_OF[entries["MoE load balancer, host-accessible"].category] is Group.WEIGHTS
 
-    def test_unknown_label_is_reported_under_its_own_name(self, monkeypatch):
-        _with_fake_ledger(monkeypatch, [("new_cpp_buffer", 1, 32 * MB)])
-        (entry,) = NativeMemoryProvider().collect()
-        assert entry.owner == "new_cpp_buffer" and entry.size_bytes == 32 * MB
+    (entry,) = collect([("new_cpp_buffer", 1, 32 * MB)])
+    assert entry.owner == "new_cpp_buffer" and entry.size_bytes == 32 * MB, "unknown label"
 
-    def test_released_labels_are_not_listed(self, monkeypatch):
-        _with_fake_ledger(monkeypatch, [("moe_gemm_profiler_workspace", 0, 0)])
-        assert NativeMemoryProvider().collect() == []
+    assert collect([("moe_gemm_profiler_workspace", 0, 0)]) == [], "released labels are not listed"
 
-    def test_negative_measurement_is_unknown_not_zero(self, monkeypatch):
-        # Memory freed elsewhere on the device during creation.
-        _with_fake_ledger(monkeypatch, [("nccl_communicators", 1, -4 * MB)])
-        (entry,) = NativeMemoryProvider().collect()
-        assert entry.size_bytes is None
+    # Memory freed elsewhere on the device during creation.
+    (entry,) = collect([("nccl_communicators", 1, -4 * MB)])
+    assert entry.size_bytes is None, "a negative measurement is unknown, not zero"
 
-    def test_memory_that_may_not_be_device_usage_is_not_summed(self, monkeypatch):
-        _with_fake_ledger(monkeypatch, [("eplb_managed", 1, 64 * MB)])
-        (entry,) = NativeMemoryProvider().collect()
-        assert entry.counts_toward_total is False
-
-    def test_provider_is_on_by_default(self):
-        from tensorrt_llm._torch.memory.monitor.providers import default_providers
-
-        assert any(isinstance(p, NativeMemoryProvider) for p in default_providers())
-
-    def test_every_label_has_a_group(self):
-        for label in LABELS.values():
-            assert label.category in GROUP_OF and GROUP_OF[label.category] is not None
+    (entry,) = collect([("eplb_managed", 1, 64 * MB)])
+    assert entry.counts_toward_total is False, "memory that may not be device usage"
 
 
 def _has_ledger():

@@ -88,21 +88,18 @@ def _by_basis(entries, basis):
     return [e for e in entries if e.basis is basis]
 
 
-class TestMnnvlResidency:
-    @pytest.mark.parametrize(
-        "state",
-        [
-            _State.MAPPED,
-            _State.RESTORING,
-            _State.PREPARING,
-        ],
-    )
-    def test_states_holding_backing_are_counted(self, monkeypatch, state):
-        # RESTORING: handles are created after the state is set and before
-        # the frontend protocol completes.
-        # PREPARING: the unmap has not happened yet.
-        _install_fake_mnnvl(monkeypatch, {0: _Record(state, aligned_size=8 * MB)})
-        entries = _by_basis(MnnvlProvider().collect(), Basis.PHYSICAL_BACKING)
+def test_mnnvl_counts_every_state_that_holds_backing(monkeypatch):
+    def collect(records):
+        _install_fake_mnnvl(monkeypatch, records)
+        return MnnvlProvider().collect()
+
+    # RESTORING: handles are created after the state is set and before
+    # the frontend protocol completes.
+    # PREPARING: the unmap has not happened yet.
+    for state in (_State.MAPPED, _State.RESTORING, _State.PREPARING):
+        entries = _by_basis(
+            collect({0: _Record(state, aligned_size=8 * MB)}), Basis.PHYSICAL_BACKING
+        )
         resident = [e for e in entries if e.size_bytes is not None]
         assert resident, f"state {state} reported nothing"
         assert resident[0].size_bytes == 8 * MB, (
@@ -110,119 +107,101 @@ class TestMnnvlResidency:
             "here hides memory during a failed restore or an OOM"
         )
 
-    def test_unmapped_is_the_only_released_state(self, monkeypatch):
-        _install_fake_mnnvl(monkeypatch, {0: _Record(_State.UNMAPPED, aligned_size=8 * MB)})
-        entries = _by_basis(MnnvlProvider().collect(), Basis.PHYSICAL_BACKING)
-        assert entries[0].size_bytes == 0
+    entries = _by_basis(
+        collect({0: _Record(_State.UNMAPPED, aligned_size=8 * MB)}), Basis.PHYSICAL_BACKING
+    )
+    assert entries[0].size_bytes == 0, "UNMAPPED is the only released state"
 
-    def test_broken_is_unknown_not_zero(self, monkeypatch):
-        # A teardown that raised. Whether the handles survived is unknown,
-        # and asserting zero would claim knowledge we do not have.
-        _install_fake_mnnvl(monkeypatch, {0: _Record(_State.BROKEN, aligned_size=8 * MB)})
-        entries = MnnvlProvider().collect()
-        unknown = [e for e in entries if e.size_bytes is None]
-        assert unknown, "BROKEN records must surface as unknown"
-        assert "BROKEN" in (unknown[0].note or "")
+    # A teardown that raised. Whether the handles survived is unknown,
+    # and asserting zero would claim knowledge we do not have.
+    unknown = [
+        e for e in collect({0: _Record(_State.BROKEN, aligned_size=8 * MB)}) if e.size_bytes is None
+    ]
+    assert unknown, "BROKEN records must surface as unknown"
+    assert "BROKEN" in (unknown[0].note or "")
 
-    def test_mixed_states(self, monkeypatch):
-        _install_fake_mnnvl(
-            monkeypatch,
+    entries = _by_basis(
+        collect(
             {
                 0: _Record(_State.MAPPED, aligned_size=4 * MB),
                 1: _Record(_State.RESTORING, aligned_size=2 * MB),
                 2: _Record(_State.UNMAPPED, aligned_size=16 * MB),
-            },
-        )
-        entries = _by_basis(MnnvlProvider().collect(), Basis.PHYSICAL_BACKING)
-        resident = [e for e in entries if e.size_bytes is not None][0]
-        assert resident.size_bytes == 6 * MB
+            }
+        ),
+        Basis.PHYSICAL_BACKING,
+    )
+    assert [e for e in entries if e.size_bytes is not None][0].size_bytes == 6 * MB, "mixed states"
 
 
-class TestMnnvlVirtualAddress:
-    def test_local_bytes_not_multiplied_by_peers(self, monkeypatch):
-        # One local cuMemCreate of aligned_size; peers' handles are imported
-        # and cost no local memory.
-        _install_fake_mnnvl(
-            monkeypatch, {0: _Record(_State.MAPPED, aligned_size=100 * MB, comm_size=4)}
-        )
-        resident = _by_basis(MnnvlProvider().collect(), Basis.PHYSICAL_BACKING)[0]
-        assert resident.size_bytes == 100 * MB
-        assert resident.size_bytes != 400 * MB
+def test_mnnvl_reads_local_backing_and_address_space_without_double_counting(monkeypatch):
+    def collect(base_map, subclass_map=None):
+        _install_fake_mnnvl(monkeypatch, base_map, subclass_map)
+        return MnnvlProvider().collect()
 
-    def test_va_reported_but_never_summed(self, monkeypatch):
-        _install_fake_mnnvl(
-            monkeypatch,
-            {0: _Record(_State.MAPPED, aligned_size=MB, comm_size=4, rank_stride=64 * MB)},
-        )
-        va = _by_basis(MnnvlProvider().collect(), Basis.LOGICAL)
-        assert va and va[0].counts_toward_total is False
+    # One local cuMemCreate of aligned_size; peers' handles are imported
+    # and cost no local memory.
+    entries = collect({0: _Record(_State.MAPPED, aligned_size=100 * MB, comm_size=4)})
+    resident = _by_basis(entries, Basis.PHYSICAL_BACKING)[0]
+    assert resident.size_bytes == 100 * MB, "local bytes are not multiplied by peers"
 
-    def test_shared_va_window_deduplicated(self, monkeypatch):
-        # Several records share one address reservation, refcounted by
-        # start_address; summing per record would double count.
-        shared = dict(comm_size=4, rank_stride=64 * MB, start_address=0xABC000)
-        _install_fake_mnnvl(
-            monkeypatch,
-            {
-                0: _Record(_State.MAPPED, aligned_size=MB, **shared),
-                1: _Record(_State.MAPPED, aligned_size=MB, **shared),
-            },
-        )
-        va = _by_basis(MnnvlProvider().collect(), Basis.LOGICAL)[0]
-        assert va.size_bytes == 4 * 64 * MB
+    entries = collect(
+        {0: _Record(_State.MAPPED, aligned_size=MB, comm_size=4, rank_stride=64 * MB)}
+    )
+    va = _by_basis(entries, Basis.LOGICAL)
+    assert va and va[0].counts_toward_total is False, "VA is reported but never summed"
 
+    # Several records share one address reservation, refcounted by
+    # start_address; summing per record would double count.
+    shared = dict(comm_size=4, rank_stride=64 * MB, start_address=0xABC000)
+    entries = collect(
+        {
+            0: _Record(_State.MAPPED, aligned_size=MB, **shared),
+            1: _Record(_State.MAPPED, aligned_size=MB, **shared),
+        }
+    )
+    assert _by_basis(entries, Basis.LOGICAL)[0].size_bytes == 4 * 64 * MB, "shared VA window"
 
-class TestMnnvlSubclasses:
-    def test_subclass_maps_are_included(self, monkeypatch):
-        # __init_subclass__ gives each subclass its own allocated_map;
-        # walking only the base silently misses CftMnnvlMemory and
-        # HelixCpMnnvlMemory.
-        _install_fake_mnnvl(
-            monkeypatch,
-            base_map={0: _Record(_State.MAPPED, aligned_size=MB)},
-            subclass_map={0: _Record(_State.MAPPED, aligned_size=2 * MB)},
-        )
-        resident = _by_basis(MnnvlProvider().collect(), Basis.PHYSICAL_BACKING)[0]
-        assert resident.size_bytes == 3 * MB
+    # __init_subclass__ gives each subclass its own allocated_map;
+    # walking only the base silently misses CftMnnvlMemory and
+    # HelixCpMnnvlMemory.
+    entries = collect(
+        base_map={0: _Record(_State.MAPPED, aligned_size=MB)},
+        subclass_map={0: _Record(_State.MAPPED, aligned_size=2 * MB)},
+    )
+    assert _by_basis(entries, Basis.PHYSICAL_BACKING)[0].size_bytes == 3 * MB, "subclass maps"
 
-    def test_unavailable_when_module_missing(self, monkeypatch):
-        monkeypatch.setitem(sys.modules, "tensorrt_llm._torch.distributed.mnnvl_memory", None)
-        provider = MnnvlProvider()
-        assert provider.available() is False
-        assert provider.collect() == []
+    monkeypatch.setitem(sys.modules, "tensorrt_llm._torch.distributed.mnnvl_memory", None)
+    provider = MnnvlProvider()
+    assert provider.available() is False and provider.collect() == [], "module missing"
 
 
-class TestDwdpReadsHeldPages:
+class _DwdpPool:
+    page_size = 16 * MB
+    num_slots = 2
+    release_failed = 0
+
+    def num_pages(self, slot):
+        return 4  # configured; unchanged by release()
+
+    def configured_pages(self, slot):
+        return 4
+
+    def held_pages(self, slot):
+        return 0  # everything released
+
+
+def test_dwdp_reads_held_pages_not_configured(monkeypatch):
     """``num_pages()`` keeps reporting capacity after the pages are gone."""
+    pool = _DwdpPool()
+    provider = DwdpPagePoolProvider()
+    monkeypatch.setattr(provider, "_pool", lambda: pool)
+    entry = provider.collect()[0]
+    # 8 configured pages * 16 MiB = 128 MiB would be invented out of nothing.
+    assert entry.size_bytes == 0
+    assert entry.basis is Basis.PHYSICAL_BACKING
 
-    class _Pool:
-        page_size = 16 * MB
-        num_slots = 2
-        release_failed = 0
-
-        def num_pages(self, slot):
-            return 4  # configured; unchanged by release()
-
-        def configured_pages(self, slot):
-            return 4
-
-        def held_pages(self, slot):
-            return 0  # everything released
-
-    def test_reports_held_not_configured(self, monkeypatch):
-        provider = DwdpPagePoolProvider()
-        monkeypatch.setattr(provider, "_pool", lambda: self._Pool())
-        entry = provider.collect()[0]
-        # 8 configured pages * 16 MiB = 128 MiB would be invented out of nothing.
-        assert entry.size_bytes == 0
-        assert entry.basis is Basis.PHYSICAL_BACKING
-
-    def test_release_failures_make_it_a_lower_bound(self, monkeypatch):
-        pool = self._Pool()
-        pool.release_failed = 3
-        provider = DwdpPagePoolProvider()
-        monkeypatch.setattr(provider, "_pool", lambda: pool)
-        assert "at least" in (provider.collect()[0].note or "")
+    pool.release_failed = 3
+    assert "at least" in (provider.collect()[0].note or ""), "release failures: a lower bound"
 
 
 class TestMemoryCountersIsDiagnosticOnly:

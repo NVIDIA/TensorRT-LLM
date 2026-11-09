@@ -60,25 +60,25 @@ def _region(name):
 
 
 @pytest.mark.cpu_only
-class TestRegions:
-    def test_nested_region_is_not_counted_twice(self, fake_memory):
-        with startup.region("outer"):
-            fake_memory(10 * MB)
-            with startup.region("inner"):
-                fake_memory(30 * MB)
-        assert _region("inner")[0].residual_taken == 30 * MB
-        assert _region("outer")[0].residual_taken == 10 * MB
+def test_regions_count_each_byte_once(fake_memory):
+    with startup.region("outer"):
+        fake_memory(10 * MB)
+        with startup.region("inner"):
+            fake_memory(30 * MB)
+    assert _region("inner")[0].residual_taken == 30 * MB, "a nested region"
+    assert _region("outer")[0].residual_taken == 10 * MB, "the region around it"
 
-    def test_region_entered_twice_is_one_part(self, fake_memory):
-        # One workspace per mapping enters the same region more than once;
-        # the summary keys parts by name and would keep only the last.
-        for size in (16 * MB, 48 * MB):
-            with startup.region("custom allreduce workspace"):
-                fake_memory(size)
-        parts = startup.residual_breakdown(64 * MB)
-        assert dict(parts)["custom allreduce workspace"] == 64 * MB
-        assert sum(size for _, size in parts) == 64 * MB
-        assert len(parts) == len(dict(parts))
+    startup.clear()
+    startup.begin_stage("unit")
+    # One workspace per mapping enters the same region more than once;
+    # the summary keys parts by name and would keep only the last.
+    for size in (16 * MB, 48 * MB):
+        with startup.region("custom allreduce workspace"):
+            fake_memory(size)
+    parts = startup.residual_breakdown(64 * MB)
+    assert dict(parts)["custom allreduce workspace"] == 64 * MB, "a region entered twice"
+    assert sum(size for _, size in parts) == 64 * MB
+    assert len(parts) == len(dict(parts))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

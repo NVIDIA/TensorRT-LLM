@@ -57,39 +57,43 @@ def _capture_graph(size):
 
 
 @needs_gpu
-class TestReportCost:
-    def test_one_allocator_snapshot_per_report(self, monkeypatch):
-        real = torch.cuda.memory._snapshot
-        calls = []
-        monkeypatch.setattr(
-            torch.cuda.memory, "_snapshot", lambda *a, **k: calls.append(1) or real(*a, **k)
+def test_report_cost(monkeypatch):
+    # One allocator snapshot per report.
+    real_snapshot = torch.cuda.memory._snapshot
+    calls = []
+    with monkeypatch.context() as m:
+        m.setattr(
+            torch.cuda.memory,
+            "_snapshot",
+            lambda *a, **k: calls.append(1) or real_snapshot(*a, **k),
         )
         mon.capture(tag="unit")
-        assert len(calls) == 1
+    assert len(calls) == 1, "one allocator snapshot per report"
 
-    def test_heap_is_walked_once_per_new_pool_not_per_report(self, monkeypatch):
-        graph, kept = _capture_graph(8 * MB)
-        walks = []
-        real = pools._live_mempool_ids
-        monkeypatch.setattr(pools, "_live_mempool_ids", lambda: walks.append(1) or real())
-        try:
+    # The heap is walked once per new pool, not per report: the graph pool
+    # is classified when first seen and remembered.
+    graph, kept = _capture_graph(8 * MB)
+    walks = []
+    real_walk = pools._live_mempool_ids
+    try:
+        with monkeypatch.context() as m:
+            m.setattr(pools, "_live_mempool_ids", lambda: walks.append(1) or real_walk())
             for _ in range(3):
                 mon.capture(tag="unit")
-            # The graph pool is classified when first seen and remembered.
-            assert len(walks) <= 1
-        finally:
-            del graph, kept
+        assert len(walks) <= 1, "heap walked on every report"
+    finally:
+        del graph, kept
 
-    def test_a_mempool_collected_while_its_blocks_live_stays_a_mempool(self):
-        pools.clear_registered_pools()
-        pool = torch.cuda.MemPool()
-        with torch.cuda.use_mem_pool(pool):
-            held = torch.empty(8 * MB, dtype=torch.uint8, device="cuda")
-        key = tuple(pool.id)
-        assert pools.classify_all([key])[key][0] == "mempool"
-        del pool
-        assert pools.classify_all([key])[key][0] == "mempool"
-        del held
+    # A MemPool collected while its blocks live stays a mempool.
+    pools.clear_registered_pools()
+    pool = torch.cuda.MemPool()
+    with torch.cuda.use_mem_pool(pool):
+        held = torch.empty(8 * MB, dtype=torch.uint8, device="cuda")
+    key = tuple(pool.id)
+    assert pools.classify_all([key])[key][0] == "mempool"
+    del pool
+    assert pools.classify_all([key])[key][0] == "mempool", "collected MemPool reclassified"
+    del held
 
 
 @needs_gpu
@@ -109,139 +113,138 @@ def test_groups_add_up_when_allocator_counters_lag_the_snapshot(monkeypatch):
     assert sum(s for s in totals.sizes.values() if s is not None) == totals.process_total
 
 
-class TestSleepReleasedKvCache:
-    class _V1Manager:
-        def get_kv_cache_stats(self):
-            return types.SimpleNamespace(allocated_bytes=512 * MB)
-
-    @pytest.mark.cpu_only
-    def test_released_pool_is_listed_not_counted(self):
-        from tensorrt_llm._torch.memory.monitor.providers.kv_cache import KvCacheProvider
-
-        manager = self._V1Manager()
-        provider = KvCacheProvider(manager)
-        pools.clear_registered_pools()
-        try:
-            pools.mark_released(["kv_cache"])
-            entries = provider.collect()
-            counted = sum(e.size_bytes for e in entries if e.counts_toward_total)
-            assert counted == 0
-            assert all(e.released for e in entries if e.category is Category.KV_CACHE_POOL)
-            assert all(e.size_bytes >= 0 for e in entries if e.size_bytes is not None)
-            pools.mark_materialized(["kv_cache"])
-            assert sum(e.size_bytes for e in provider.collect()) == 512 * MB
-        finally:
-            pools.clear_registered_pools()
-        assert weakref.ref(manager)() is manager
-
-    @needs_gpu
-    def test_detail_section_keeps_the_residual_row_while_asleep(self):
-        from tensorrt_llm._torch.virtual_memory import RestoreMode, release_with_tag
-        from tensorrt_llm._torch.virtual_memory import scope as vm_scope
-
-        pools.clear_registered_pools()
-        with vm_scope("unit_detail", RestoreMode.NONE) as proxy:
-            held = torch.empty(64 * MB, dtype=torch.uint8, device="cuda")
-        try:
-            release_with_tag("unit_detail")
-            text = mon.render_capture(mon.capture(tag="unit"))
-            assert "nontorch_residual" in text and "Released by sleep mode" in text
-            assert "unattributed_live" in text
-        finally:
-            from tensorrt_llm._torch.virtual_memory import materialize_with_tag
-
-            materialize_with_tag("unit_detail")
-            pools.clear_registered_pools()
-            del held, proxy
+class _V1Manager:
+    def get_kv_cache_stats(self):
+        return types.SimpleNamespace(allocated_bytes=512 * MB)
 
 
 @pytest.mark.cpu_only
-class TestStartupState:
-    @pytest.fixture
-    def window(self, monkeypatch):
-        logged = []
-        monkeypatch.setattr(tagging, "start_tagging_window", lambda: True)
-        monkeypatch.setattr(tagging, "stop_tagging_window", lambda: None)
-        monkeypatch.setattr(
-            tagging, "_log_window_result", lambda *a, **k: logged.append(k.get("failed"))
-        )
-        return logged
+def test_released_kv_cache_is_listed_not_counted():
+    from tensorrt_llm._torch.memory.monitor.providers.kv_cache import KvCacheProvider
 
-    def test_a_second_executor_starts_from_scratch(self, window, monkeypatch):
-        monkeypatch.setattr(tagging, "freeze_tag_map", lambda: tagging.TagSnapshot(True))
-        startup._stages.append(startup.StageSample("model", "Model", 0, 0, 1, 1))
+    manager = _V1Manager()
+    provider = KvCacheProvider(manager)
+    pools.clear_registered_pools()
+    try:
+        pools.mark_released(["kv_cache"])
+        entries = provider.collect()
+        counted = sum(e.size_bytes for e in entries if e.counts_toward_total)
+        assert counted == 0
+        assert all(e.released for e in entries if e.category is Category.KV_CACHE_POOL)
+        assert all(e.size_bytes >= 0 for e in entries if e.size_bytes is not None)
+        pools.mark_materialized(["kv_cache"])
+        assert sum(e.size_bytes for e in provider.collect()) == 512 * MB
+    finally:
+        pools.clear_registered_pools()
+    assert weakref.ref(manager)() is manager
+
+
+@needs_gpu
+def test_detail_section_keeps_the_residual_row_while_asleep():
+    from tensorrt_llm._torch.virtual_memory import RestoreMode, release_with_tag
+    from tensorrt_llm._torch.virtual_memory import scope as vm_scope
+
+    pools.clear_registered_pools()
+    with vm_scope("unit_detail", RestoreMode.NONE) as proxy:
+        held = torch.empty(64 * MB, dtype=torch.uint8, device="cuda")
+    try:
+        release_with_tag("unit_detail")
+        text = mon.render_capture(mon.capture(tag="unit"))
+        assert "nontorch_residual" in text and "Released by sleep mode" in text
+        assert "unattributed_live" in text
+    finally:
+        from tensorrt_llm._torch.virtual_memory import materialize_with_tag
+
+        materialize_with_tag("unit_detail")
+        pools.clear_registered_pools()
+        del held, proxy
+
+
+@pytest.mark.cpu_only
+def test_startup_state_does_not_leak(monkeypatch):
+    logged = []
+    monkeypatch.setattr(tagging, "start_tagging_window", lambda: True)
+    monkeypatch.setattr(tagging, "stop_tagging_window", lambda: None)
+    monkeypatch.setattr(
+        tagging, "_log_window_result", lambda *a, **k: logged.append(k.get("failed"))
+    )
+
+    def frozen():
+        return tagging.TagSnapshot(True)
+
+    # A second executor starts from scratch.
+    monkeypatch.setattr(tagging, "freeze_tag_map", frozen)
+    startup._stages.append(startup.StageSample("model", "Model", 0, 0, 1, 1))
+    with tagging.startup_window():
+        assert not startup.stages(), "a second executor inherited the first one's steps"
+    logged.clear()
+
+    # A failing freeze does not replace the startup error.
+    def broken():
+        raise MemoryError("trace too large")
+
+    monkeypatch.setattr(tagging, "freeze_tag_map", broken)
+    with pytest.raises(ValueError, match="startup failed"):
         with tagging.startup_window():
-            assert not startup.stages()
+            raise ValueError("startup failed")
+    assert logged == [True]
+    logged.clear()
 
-    def test_a_failing_freeze_does_not_replace_the_startup_error(self, window, monkeypatch):
-        def broken():
-            raise MemoryError("trace too large")
+    # No report when interrupted.
+    monkeypatch.setattr(tagging, "freeze_tag_map", frozen)
+    with pytest.raises(KeyboardInterrupt):
+        with tagging.startup_window():
+            raise KeyboardInterrupt
+    assert logged == [], "reported after an interrupt"
 
-        monkeypatch.setattr(tagging, "freeze_tag_map", broken)
-        with pytest.raises(ValueError, match="startup failed"):
-            with tagging.startup_window():
-                raise ValueError("startup failed")
-        assert window == [True]
-
-    def test_no_report_when_interrupted(self, window, monkeypatch):
-        monkeypatch.setattr(tagging, "freeze_tag_map", lambda: tagging.TagSnapshot(True))
-        with pytest.raises(KeyboardInterrupt):
-            with tagging.startup_window():
-                raise KeyboardInterrupt
-        assert window == []
-
-    def test_region_before_the_first_step_is_not_counted_twice(self, monkeypatch):
-        state = types.SimpleNamespace(process=1000 * MB)
-        monkeypatch.setattr(startup, "_reading", lambda: startup.Reading(state.process, 0, 0))
-        with startup.region("NCCL communicators (torch.distributed)"):
-            state.process += 300 * MB
-        startup.begin_stage("model")
-        parts = dict(startup.residual_breakdown(1300 * MB))
-        assert parts["NCCL communicators (torch.distributed)"] == 300 * MB
-        assert parts["before the first startup step"] == 1000 * MB
-        assert sum(parts.values()) == 1300 * MB
+    # A region before the first step is not counted twice.
+    startup.clear()
+    state = types.SimpleNamespace(process=1000 * MB)
+    monkeypatch.setattr(startup, "_reading", lambda: startup.Reading(state.process, 0, 0))
+    with startup.region("NCCL communicators (torch.distributed)"):
+        state.process += 300 * MB
+    startup.begin_stage("model")
+    parts = dict(startup.residual_breakdown(1300 * MB))
+    assert parts["NCCL communicators (torch.distributed)"] == 300 * MB
+    assert parts["before the first startup step"] == 1000 * MB
+    assert sum(parts.values()) == 1300 * MB
 
 
 @pytest.mark.cpu_only
-class TestNvmlReason:
-    def _fake_nvml(self, monkeypatch, pid):
-        from tensorrt_llm import profiler
+def test_nvml_lookup_says_why_the_process_is_missing(monkeypatch):
+    from tensorrt_llm import profiler
 
-        proc = types.SimpleNamespace(pid=pid, usedGpuMemory=7 * MB)
-        fake = types.SimpleNamespace(
-            nvmlDeviceGetHandleByUUID=lambda u: "handle",
-            nvmlDeviceGetComputeRunningProcesses_v3=lambda h: [proc],
-        )
-        monkeypatch.setitem(sys.modules, "pynvml", fake)
-        monkeypatch.setattr(profiler, "pynvml_context", contextlib.nullcontext)
-        monkeypatch.setattr(
-            mon.torch.cuda, "get_device_properties", lambda i: types.SimpleNamespace(uuid="x")
-        )
+    proc = types.SimpleNamespace(pid=os.getpid(), usedGpuMemory=7 * MB)
+    fake = types.SimpleNamespace(
+        nvmlDeviceGetHandleByUUID=lambda u: "handle",
+        nvmlDeviceGetComputeRunningProcesses_v3=lambda h: [proc],
+    )
+    monkeypatch.setitem(sys.modules, "pynvml", fake)
+    monkeypatch.setattr(profiler, "pynvml_context", contextlib.nullcontext)
+    monkeypatch.setattr(
+        mon.torch.cuda, "get_device_properties", lambda i: types.SimpleNamespace(uuid="x")
+    )
 
-    def test_process_missing_from_nvml_says_so(self, monkeypatch):
-        # Another PID namespace: NVML lists the host PID, never ours.
-        self._fake_nvml(monkeypatch, os.getpid() + 100000)
-        used, reason = mon._nvml_process_lookup(0)
-        assert used is None and "PID namespace" in reason
-
-    def test_found_process_has_no_reason(self, monkeypatch):
-        self._fake_nvml(monkeypatch, os.getpid())
-        assert mon._nvml_process_lookup(0) == (7 * MB, "")
+    assert mon._nvml_process_lookup(0) == (7 * MB, ""), "found process has no reason"
+    # Another PID namespace: NVML lists the host PID, never ours.
+    proc.pid = os.getpid() + 100000
+    used, reason = mon._nvml_process_lookup(0)
+    assert used is None and "PID namespace" in reason
 
 
 @pytest.mark.cpu_only
-def test_warmup_report_never_raises(monkeypatch):
+def test_startup_problems_are_logged_not_raised(monkeypatch):
     from tensorrt_llm._torch.pyexecutor import trace_log_utils
 
     def broken(**_):
         raise RuntimeError("snapshot failed")
 
-    monkeypatch.setattr(mon, "capture", broken)
-    trace_log_utils._maybe_log_monitor_report("warmup")
+    # The warmup report never raises.
+    with monkeypatch.context() as m:
+        m.setattr(mon, "capture", broken)
+        trace_log_utils._maybe_log_monitor_report("warmup")
 
-
-@pytest.mark.cpu_only
-def test_wrapped_startup_history_is_reported(monkeypatch):
+    # Startup history that wrapped the ring buffer is reported.
     warnings = []
     monkeypatch.setattr(tagging, "tagging_supported", lambda: True)
     monkeypatch.setattr(tagging, "_DEFAULT_MAX_ENTRIES", 2)
@@ -264,11 +267,7 @@ def test_reports_are_written_to_files_when_asked(monkeypatch, tmp_path):
     )
     assert path.read_text().strip() == text.strip()
 
-
-@needs_gpu
-def test_an_unwritable_directory_does_not_lose_the_report(monkeypatch, tmp_path):
-    from tensorrt_llm._torch.memory.monitor import triggers
-
+    # An unwritable directory does not lose the report.
     blocker = tmp_path / "file"
     blocker.write_text("")
     monkeypatch.setenv(triggers.DIR_VAR, str(blocker / "sub"))
@@ -276,37 +275,29 @@ def test_an_unwritable_directory_does_not_lose_the_report(monkeypatch, tmp_path)
 
 
 @pytest.mark.cpu_only
-def test_another_process_holding_the_gpu_is_named():
-    from tensorrt_llm._torch.memory.monitor.frame import DeviceReading, TorchReading, build_frame
-    from tensorrt_llm._torch.memory.monitor.summary import render_summary
+def test_summary_edge_cases():
+    import re
 
-    gib = 1 << 30
-    device = DeviceReading(total=178 * gib, free=gib // 2, process_used=2 * gib)
-    frame = build_frame(device, TorchReading(reserved=gib, live=gib), [])
-    text = "\n".join(render_summary(frame, group_totals(frame), headline="STARTUP FAILED."))
-    assert "other processes on this GPU hold 175.50 GiB" in text
-
-
-@pytest.mark.cpu_only
-def test_share_column_never_runs_into_the_size():
-    from tensorrt_llm._torch.memory.monitor.frame import DeviceReading, TorchReading, build_frame
-    from tensorrt_llm._torch.memory.monitor.summary import render_summary
-
-    gib = 1 << 30
-    # A residual far larger than the process, as when readings disagree.
-    device = DeviceReading(total=178 * gib, free=100 * gib, process_used=gib)
-    frame = build_frame(device, TorchReading(reserved=40 * gib, live=40 * gib), [])
-    for line in render_summary(frame, group_totals(frame)):
-        assert "GiB-" not in line and not __import__("re").search(r"GiB\d", line)
-
-
-@pytest.mark.cpu_only
-def test_released_note_uses_readable_merged_names():
     from tensorrt_llm._torch.memory.monitor.frame import DeviceReading, TorchReading, build_frame
     from tensorrt_llm._torch.memory.monitor.pools import PoolUsage
     from tensorrt_llm._torch.memory.monitor.summary import render_summary
 
     gib = 1 << 30
+
+    # Another process holding the GPU is named.
+    device = DeviceReading(total=178 * gib, free=gib // 2, process_used=2 * gib)
+    frame = build_frame(device, TorchReading(reserved=gib, live=gib), [])
+    text = "\n".join(render_summary(frame, group_totals(frame), headline="STARTUP FAILED."))
+    assert "other processes on this GPU hold 175.50 GiB" in text
+
+    # The share column never runs into the size, even with a residual far
+    # larger than the process, as when readings disagree.
+    device = DeviceReading(total=178 * gib, free=100 * gib, process_used=gib)
+    frame = build_frame(device, TorchReading(reserved=40 * gib, live=40 * gib), [])
+    for line in render_summary(frame, group_totals(frame)):
+        assert "GiB-" not in line and not re.search(r"GiB\d", line), line
+
+    # The released note uses readable, merged names.
     pools_ = (
         PoolUsage((0, 1), "mempool", "sleep: model_weights", gib, gib, released=True),
         PoolUsage((0, 2), "mempool", "sleep: model", 20 * MB, 10 * MB, released=True),

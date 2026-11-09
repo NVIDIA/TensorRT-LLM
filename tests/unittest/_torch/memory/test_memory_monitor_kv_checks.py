@@ -66,184 +66,151 @@ def _manager(*stats):
 
 
 @pytest.mark.cpu_only
-class TestCheckCIsNotVacuous:
+def test_check_c_can_fail_and_does_not_read_the_derived_properties():
     """The reason this check exists at all."""
 
-    def test_passes_on_a_consistent_pool(self):
-        rows = kv_pool_group_stats(_manager(_stats(100, 30, 20)))
-        assert all(r.passed for r in check_kv_pool_conservation(rows))
+    def check(*stats):
+        return check_kv_pool_conservation(kv_pool_group_stats(_manager(*stats)))
 
-    def test_fails_when_free_and_evictable_exceed_total(self):
-        # Double counting a block as both free and evictable produces exactly
-        # this. If no input could make the check fail, it would be worthless.
-        rows = kv_pool_group_stats(_manager(_stats(100, 70, 50)))
-        results = check_kv_pool_conservation(rows)
-        assert not results[0].passed
-        assert "in_use=-20" in results[0].detail
+    assert all(r.passed for r in check(_stats(100, 30, 20))), "a consistent pool passes"
 
-    def test_boundary_is_allowed(self):
-        rows = kv_pool_group_stats(_manager(_stats(100, 60, 40)))
-        assert check_kv_pool_conservation(rows)[0].passed
+    # Double counting a block as both free and evictable produces exactly
+    # this. If no input could make the check fail, it would be worthless.
+    results = check(_stats(100, 70, 50))
+    assert not results[0].passed
+    assert "in_use=-20" in results[0].detail
 
-    def test_does_not_read_the_derived_properties(self):
-        # available()/unavailable() are computed from total/free/evictable,
-        # so a check written against them passes by construction. Poison
-        # them: a check that consults them would now disagree with itself.
-        stats = _stats(100, 70, 50)
-        stats.available = lambda: 0
-        stats.unavailable = lambda: 100
+    assert check(_stats(100, 60, 40))[0].passed, "the boundary is allowed"
 
-        rows = kv_pool_group_stats(_manager(stats))
-        assert not check_kv_pool_conservation(rows)[0].passed, (
-            "the check must read the stored fields, not the derived ones"
+    # available()/unavailable() are computed from total/free/evictable,
+    # so a check written against them passes by construction. Poison
+    # them: a check that consults them would now disagree with itself.
+    stats = _stats(100, 70, 50)
+    stats.available = lambda: 0
+    stats.unavailable = lambda: 100
+    assert not check(stats)[0].passed, "the check must read the stored fields, not the derived ones"
+
+    results = check(_stats(100, 30, 20), _stats(100, 70, 50))
+    assert [r.passed for r in results] == [True, False], "each pool group is checked separately"
+
+
+@pytest.mark.cpu_only
+def test_capacity_is_physical_and_in_use_is_logical():
+    rows = kv_pool_group_stats(_manager(_stats(10, 2, 3, slot_sizes=(MB, 2 * MB))))
+    # Every pool in the group contributes a slot.
+    assert rows[0]["slot_bytes"] == 3 * MB
+    assert rows[0]["capacity_bytes"] == 30 * MB
+    assert rows[0]["in_use_bytes"] == 15 * MB
+
+    # The provider holds the manager weakly, so the caller keeps it
+    # alive -- in production the ResourceManager owns it.
+    manager = _manager(_stats(100, 60, 20))
+    entries = KvCacheProvider(manager).collect()
+    physical = [e for e in entries if e.basis is Basis.PHYSICAL_BACKING]
+    assert len(physical) == 1
+    # The pool is resident in full; free blocks are not given back.
+    assert physical[0].size_bytes == 100 * MB
+    assert physical[0].counts_toward_total is True
+    logical = [e for e in entries if e.basis is Basis.LOGICAL]
+    assert len(logical) == 1
+    assert logical[0].size_bytes == 20 * MB
+    assert logical[0].counts_toward_total is False, (
+        "in-use bytes live inside capacity_bytes; summing both would double count the pool"
+    )
+
+    def physical_of(m):
+        return next(
+            e.size_bytes for e in KvCacheProvider(m).collect() if e.basis is Basis.PHYSICAL_BACKING
         )
 
-    def test_each_pool_group_checked_separately(self):
-        rows = kv_pool_group_stats(_manager(_stats(100, 30, 20), _stats(100, 70, 50)))
-        results = check_kv_pool_conservation(rows)
-        assert [r.passed for r in results] == [True, False]
+    busy_manager, idle_manager = _manager(_stats(100, 0, 0)), _manager(_stats(100, 100, 0))
+    # The device has not taken anything back, so neither may the monitor.
+    assert physical_of(busy_manager) == physical_of(idle_manager) == 100 * MB
+
+    small = _manager(_stats(8, 1, 1))
+    entries = KvCacheProvider(small).collect()
+    assert all(e.category is Category.KV_CACHE_POOL for e in entries)
+    assert "pool_group[0]" in entries[0].owner
+
+    # free + evictable > total is what check C exists to catch.
+    inconsistent = _manager(_stats(100, 70, 50))
+    entries = KvCacheProvider(inconsistent).collect()
+    physical = [e for e in entries if e.basis is Basis.PHYSICAL_BACKING]
+    # Raising on the negative split used to drop the whole pool from the
+    # report, at the one moment its accounting was worth looking at.
+    assert physical and physical[0].size_bytes == 100 * MB, "an inconsistent pool keeps capacity"
+    assert "withheld" in physical[0].note
+    logical = [e for e in entries if e.basis is Basis.LOGICAL]
+    assert logical[0].size_bytes is None, "the split is unknown, not negative"
 
 
 @pytest.mark.cpu_only
-class TestSlotsToBytes:
-    def test_every_pool_in_the_group_contributes_a_slot(self):
-        rows = kv_pool_group_stats(_manager(_stats(10, 2, 3, slot_sizes=(MB, 2 * MB))))
-        assert rows[0]["slot_bytes"] == 3 * MB
-        assert rows[0]["capacity_bytes"] == 30 * MB
-        assert rows[0]["in_use_bytes"] == 15 * MB
+def test_managers_without_storage_statistics():
+    from tensorrt_llm._torch.memory.monitor.providers import default_providers
+
+    assert not any(isinstance(p, KvCacheProvider) for p in default_providers()), (
+        "the manager has no process-wide accessor, so it must be passed in rather than discovered"
+    )
+    provider = KvCacheProvider(None)
+    assert provider.available() is False and provider.collect() == [], "no manager"
+
+    # KV cache manager V1 has no storage statistics. Omitting it would
+    # let the pool fall into the unexplained residual with nothing to
+    # say it is missing; reporting 0 would claim the cache is empty.
+    class _V1Manager:
+        pass
+
+    manager = _V1Manager()
+    entries = KvCacheProvider(manager).collect()
+    assert len(entries) == 1
+    assert entries[0].size_bytes is None
+    assert entries[0].basis is Basis.PHYSICAL_BACKING
+    assert "_V1Manager" in entries[0].owner
+
+    class _V1:
+        def get_kv_cache_stats(self):
+            return types.SimpleNamespace(allocated_bytes=12 * MB)
+
+    v1 = _V1()
+    entries = KvCacheProvider(v1).collect()
+    assert entries[0].size_bytes == 12 * MB
+    assert entries[0].basis is Basis.PHYSICAL_BACKING
+
+    class _Broken:
+        def get_kv_cache_stats(self):
+            raise RuntimeError("not ready")
+
+    broken = _Broken()
+    assert KvCacheProvider(broken).collect()[0].size_bytes is None, "a failing accessor is unknown"
 
 
 @pytest.mark.cpu_only
-class TestPhysicalVersusLogical:
-    def test_capacity_is_physical_and_counts(self):
-        manager = _manager(_stats(100, 60, 20))
-        provider = KvCacheProvider(manager)
-        physical = [e for e in provider.collect() if e.basis is Basis.PHYSICAL_BACKING]
-        assert len(physical) == 1
-        # The pool is resident in full; free blocks are not given back.
-        assert physical[0].size_bytes == 100 * MB
-        assert physical[0].counts_toward_total is True
+def test_main_draft_and_cross_pools_are_registered_once_each():
+    from tensorrt_llm._torch.memory.monitor import providers as reg
+    from tensorrt_llm._torch.pyexecutor._util import _register_kv_cache_monitor_providers
 
-    def test_in_use_is_logical_and_does_not_count(self):
-        manager = _manager(_stats(100, 60, 20))
-        provider = KvCacheProvider(manager)
-        logical = [e for e in provider.collect() if e.basis is Basis.LOGICAL]
-        assert len(logical) == 1
-        assert logical[0].size_bytes == 20 * MB
-        assert logical[0].counts_toward_total is False, (
-            "in-use bytes live inside capacity_bytes; summing both would double count the pool"
+    a, b = _manager(_stats(10, 0, 0)), _manager(_stats(20, 0, 0))
+    assert KvCacheProvider(a, "main").name != KvCacheProvider(b, "draft").name
+
+    def physical():
+        return sorted(
+            e.size_bytes
+            for e in reg.collect_all()
+            if e.category is Category.KV_CACHE_POOL and e.basis is Basis.PHYSICAL_BACKING
         )
 
-    def test_freeing_blocks_does_not_shrink_the_physical_figure(self):
-        # The provider holds the manager weakly, so the caller keeps it
-        # alive -- in production the ResourceManager owns it.
-        busy_manager = _manager(_stats(100, 0, 0))
-        idle_manager = _manager(_stats(100, 100, 0))
-        busy = KvCacheProvider(busy_manager).collect()
-        idle = KvCacheProvider(idle_manager).collect()
-
-        def physical(entries):
-            return next(e.size_bytes for e in entries if e.basis is Basis.PHYSICAL_BACKING)
-
-        # The device has not taken anything back, so neither may the monitor.
-        assert physical(busy) == physical(idle) == 100 * MB
-
-    def test_category_and_owner(self):
-        manager = _manager(_stats(8, 1, 1))
-        entries = KvCacheProvider(manager).collect()
-        assert all(e.category is Category.KV_CACHE_POOL for e in entries)
-        assert "pool_group[0]" in entries[0].owner
-
-
-@pytest.mark.cpu_only
-class TestProviderAvailability:
-    def test_unavailable_without_a_manager(self):
-        provider = KvCacheProvider(None)
-        assert provider.available() is False
-        assert provider.collect() == []
-
-    def test_manager_without_statistics_yields_an_unknown_row(self):
-        # KV cache manager V1 has no storage statistics. Omitting it would
-        # let the pool fall into the unexplained residual with nothing to
-        # say it is missing; reporting 0 would claim the cache is empty.
-        class _V1Manager:
-            pass
-
-        manager = _V1Manager()
-        entries = KvCacheProvider(manager).collect()
-        assert len(entries) == 1
-        assert entries[0].size_bytes is None
-        assert entries[0].basis is Basis.PHYSICAL_BACKING
-        assert "_V1Manager" in entries[0].owner
-
-    def test_not_in_the_default_set(self):
-        from tensorrt_llm._torch.memory.monitor.providers import default_providers
-
-        assert not any(isinstance(p, KvCacheProvider) for p in default_providers()), (
-            "the manager has no process-wide accessor, so it must be "
-            "passed in rather than discovered"
-        )
-
-
-@pytest.mark.cpu_only
-class TestInconsistentPoolKeepsCapacity:
-    """free + evictable > total is what check C exists to catch."""
-
-    def test_capacity_row_survives(self):
-        manager = _manager(_stats(100, 70, 50))
-        entries = KvCacheProvider(manager).collect()
-        physical = [e for e in entries if e.basis is Basis.PHYSICAL_BACKING]
-        # Raising on the negative split used to drop the whole pool from the
-        # report, at the one moment its accounting was worth looking at.
-        assert physical and physical[0].size_bytes == 100 * MB
-        assert "withheld" in physical[0].note
-
-    def test_split_is_unknown_not_negative(self):
-        manager = _manager(_stats(100, 70, 50))
-        logical = [e for e in KvCacheProvider(manager).collect() if e.basis is Basis.LOGICAL]
-        assert logical[0].size_bytes is None
-
-
-@pytest.mark.cpu_only
-class TestPoolRoles:
-    def test_roles_have_distinct_names(self):
-        a, b = _manager(_stats(10, 0, 0)), _manager(_stats(20, 0, 0))
-        assert KvCacheProvider(a, "main").name != KvCacheProvider(b, "draft").name
-
-    def test_main_draft_and_cross_are_all_registered(self, monkeypatch):
-        from tensorrt_llm._torch.memory.monitor import providers as reg
-        from tensorrt_llm._torch.pyexecutor._util import _register_kv_cache_monitor_providers
+    reg.clear_registered_providers()
+    try:
+        main, draft, cross = (_manager(_stats(n, 0, 0)) for n in (100, 20, 5))
+        _register_kv_cache_monitor_providers(main, draft, cross)
+        # A shared fixed name would have let the registry keep only one.
+        assert physical() == [5 * MB, 20 * MB, 100 * MB]
 
         reg.clear_registered_providers()
-        try:
-            main, draft, cross = (_manager(_stats(n, 0, 0)) for n in (100, 20, 5))
-            _register_kv_cache_monitor_providers(main, draft, cross)
-            physical = sorted(
-                e.size_bytes
-                for e in reg.collect_all()
-                if e.category is Category.KV_CACHE_POOL and e.basis is Basis.PHYSICAL_BACKING
-            )
-            # A shared fixed name would have let the registry keep only one.
-            assert physical == [5 * MB, 20 * MB, 100 * MB]
-        finally:
-            reg.clear_registered_providers()
-
-    def test_shared_draft_manager_is_counted_once(self):
-        from tensorrt_llm._torch.memory.monitor import providers as reg
-        from tensorrt_llm._torch.pyexecutor._util import _register_kv_cache_monitor_providers
-
+        _register_kv_cache_monitor_providers(main, main, None)
+        assert physical() == [100 * MB], "a draft sharing the main manager is counted once"
+    finally:
         reg.clear_registered_providers()
-        try:
-            main = _manager(_stats(100, 0, 0))
-            _register_kv_cache_monitor_providers(main, main, None)
-            physical = [
-                e
-                for e in reg.collect_all()
-                if e.category is Category.KV_CACHE_POOL and e.basis is Basis.PHYSICAL_BACKING
-            ]
-            assert len(physical) == 1
-        finally:
-            reg.clear_registered_providers()
 
 
 @pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="capture reads the device")
@@ -275,24 +242,3 @@ class TestChecksRunInRealReports:
         assert any(c.name.startswith("B:") for c in snapshot.checks)
         text = render_capture(snapshot)
         assert "FAILED" in text and "[checks]" in text
-
-
-@pytest.mark.cpu_only
-class TestKvCacheManagerV1:
-    def test_reads_the_managers_allocated_bytes(self):
-        class _V1:
-            def get_kv_cache_stats(self):
-                return types.SimpleNamespace(allocated_bytes=12 * MB)
-
-        manager = _V1()
-        entries = KvCacheProvider(manager).collect()
-        assert entries[0].size_bytes == 12 * MB
-        assert entries[0].basis is Basis.PHYSICAL_BACKING
-
-    def test_a_failing_accessor_is_unknown_not_zero(self):
-        class _Broken:
-            def get_kv_cache_stats(self):
-                raise RuntimeError("not ready")
-
-        manager = _Broken()
-        assert KvCacheProvider(manager).collect()[0].size_bytes is None
