@@ -39,11 +39,17 @@ THROWAWAY_MIN_CONTEXT_ENV = "TRTLLM_THROWAWAY_TOPK_MIN_CONTEXT"
 
 _HEAD_DIM = 128
 _SUPPORTED_NUM_HEADS = (4, 32, 64)
+# (heads, index_topk, compress_ratio) of the indexers the kernels are validated for: DS-V3.2,
+# GLM-5.x, DSV4-Flash and DSV4-Pro. Other geometries select kernel variants that are not tested;
+# the H4 kernels are validated only under Qwen3.8-Flash-Next's fixed-weight contract
+# (``model_config``), which the DSA indexer does not use.
+_VALIDATED_GEOMETRIES = frozenset({(64, 2048, 1), (32, 2048, 1), (64, 512, 4), (64, 1024, 4)})
 _DEFAULT_MAX_CHUNK = 8192
 # Below this many context tokens (history + chunk rows) the unfused DeepGEMM logits + GVR Top-K
 # is as fast or faster; from 64K on the fused path wins for every supported indexer geometry
 # (DS-V3.2, GLM-5.x, DSV4-Flash/Pro; FP32 and BF16 logits; 4K and 8K query rows).
 _DEFAULT_MIN_CONTEXT = 65536
+_FP8_KEY_ALIGNMENT = 128
 _MXFP4_KEY_ALIGNMENT = 256
 _LOGITS_DTYPES = {
     "fp32": torch.float32,
@@ -147,10 +153,10 @@ class ThrowawayPrefillTopK:
                 f"logits_dtype must be float32, bfloat16 or float16, got {logits_dtype}"
             )
         self.logits_dtype = logits_dtype
-        self.num_keys = max_context_length // compress_ratio
-        if self._mxfp4:
-            # Block-scaled K storage must hold a multiple of 256 rows; plan() bounds the live part.
-            self.num_keys = -(-self.num_keys // _MXFP4_KEY_ALIGNMENT) * _MXFP4_KEY_ALIGNMENT
+        # The K storage holds whole key tiles (FP8: 128 rows; block-scaled MXFP4: 256 rows);
+        # plan() bounds the live part.
+        alignment = _MXFP4_KEY_ALIGNMENT if self._mxfp4 else _FP8_KEY_ALIGNMENT
+        self.num_keys = -(-(max_context_length // compress_ratio) // alignment) * alignment
         self._wrapper = FP8MQATopKWrapper(
             max_context_length=max_context_length,
             max_chunk_size=self.max_chunk_size,
@@ -179,6 +185,7 @@ class ThrowawayPrefillTopK:
             self._k_scale_stage = torch.empty(self.num_keys, dtype=torch.float32, device=device)
         self._device = device
         self._pool_prepared = False
+        self._failed = False
         # (kv_prefix_len, rows) of the plan the wrapper currently holds, or None.
         self._planned_key: Optional[Tuple[int, int]] = None
 
@@ -213,7 +220,7 @@ class ThrowawayPrefillTopK:
         kv_prefix_len: int,
         plan_cache: PlanCache,
         q_scale: Optional[torch.Tensor] = None,
-    ) -> None:
+    ) -> bool:
         """Selects Top-K indices for consecutive query rows of one request.
 
         Query row ``i`` attends to keys ``[0, (kv_prefix_len + i + 1) // compress_ratio)``,
@@ -233,7 +240,13 @@ class ThrowawayPrefillTopK:
             plan_cache: Cache of device prefix tensors shared across layers.
             q_scale: MXFP4 only: four UE8M0 bytes per query row and head (int32 ``[num_q,
                 n_heads]``, or any dtype/shape with ``4 * num_q * n_heads`` bytes).
+
+        Returns:
+            True if ``out`` was written; False if the kernel workspace could not be allocated, in
+            which case this runner is disabled and the caller must use the unfused path.
         """
+        if self._failed:
+            return False
         num_q = q.shape[0]
         num_k = k.shape[0]
         if weights.dtype != torch.float32:
@@ -262,7 +275,13 @@ class ThrowawayPrefillTopK:
                 self._wrapper.plan(qo_indptr, kv_indptr, num_query_rows=end - begin)
                 self._planned_key = plan_key
             if not self._pool_prepared:
-                self._wrapper.prepare_pool(self._k_stage, k_scale=self._k_scale_stage)
+                # The first call builds the kernels and their workspace, after the KV cache has
+                # taken the memory it was sized for.
+                try:
+                    self._wrapper.prepare_pool(self._k_stage, k_scale=self._k_scale_stage)
+                except torch.OutOfMemoryError as error:
+                    self._disable(error)
+                    return False
                 self._pool_prepared = True
             self._wrapper.run(
                 q[begin:end],
@@ -272,6 +291,17 @@ class ThrowawayPrefillTopK:
                 out=out[begin:end],
                 q_scale=None if q_scale is None else q_scale[begin:end],
             )
+        return True
+
+    def _disable(self, error: torch.OutOfMemoryError) -> None:
+        """Releases this runner's buffers so the unfused path gets the memory back."""
+        logger.warning(
+            f"The fused throwaway Top-K could not allocate its workspace ({error}); "
+            "using the unfused indexer + Top-K path"
+        )
+        self._failed = True
+        self._wrapper = self._k_stage = self._k_scale_stage = None
+        torch.cuda.empty_cache()
 
 
 # One runner per (geometry, max length, device), shared by every layer of the process. The
@@ -298,6 +328,14 @@ def get_throwaway_prefill_topk(
     key = (n_heads, index_topk, compress_ratio, max_context_length, str(device), qkv_dtype)
     if key in _RUNNERS:
         return _RUNNERS[key]
+    if (n_heads, index_topk, compress_ratio) not in _VALIDATED_GEOMETRIES:
+        logger.warning(
+            f"{THROWAWAY_TOPK_ENV}=1 but the fused throwaway Top-K is not validated for "
+            f"heads={n_heads}, top_k={index_topk}, compress_ratio={compress_ratio}; "
+            "using the unfused indexer + Top-K path"
+        )
+        _RUNNERS[key] = None
+        return None
     try:
         runner = ThrowawayPrefillTopK(
             n_heads=n_heads,

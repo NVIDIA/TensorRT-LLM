@@ -1771,7 +1771,7 @@ class Indexer(nn.Module):
             return False
         g_begin = chunk.token_start + q_begin
         g_end = chunk.token_start + q_end
-        self._throwaway_topk.run_chunk(
+        if not self._throwaway_topk.run_chunk(
             q_fp8[g_begin:g_end],
             weights[g_begin:g_end],
             chunk_k_fp8,
@@ -1780,7 +1780,8 @@ class Indexer(nn.Module):
             kv_prefix_len=chunk.kv_prefix_len + q_begin,
             plan_cache=chunk.throwaway_plans,
             q_scale=None if q_scale is None else q_scale[g_begin:g_end],
-        )
+        ):
+            return False
         logger.info_once(
             "Throwaway Top-K: using the fused indexer + Top-K for prefill",
             key="throwaway_topk_fused",
