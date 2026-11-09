@@ -87,6 +87,7 @@ class FallbackFmha(PhasedFmha):
     NEEDS_BLOCK_EXTENT = False
     supports_skip_correction = True
     supports_workspace_reclamation = True
+    supports_variable_window = True
 
     # Head sizes whose fused context FMHA kernel is proven absent for at
     # least one KV cache dtype, per SM version. This is a blocklist of

@@ -652,7 +652,13 @@ def _budget_spec(tmp_path: Path, **campaign):
             "spools": ["s1"],
             "env_script": "/env.sh",
             "sol": {"enabled": False},
-            "campaign": {"max_parallel_tuners": 1, "kernel_ledger": "off", **campaign},
+            # A deferral ends the run at once unless a test waits it out.
+            "campaign": {
+                "max_parallel_tuners": 1,
+                "kernel_ledger": "off",
+                "max_retries": 0,
+                **campaign,
+            },
         },
     }
     return TuneSpec.from_task(task, tmp_path / "ws", target="t/")
