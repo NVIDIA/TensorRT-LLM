@@ -383,3 +383,79 @@ def test_every_anchor_is_found_by_what_identifies_it_in_this_checkout():
         ):
             unfindable.append(f"{key}: a search found {list(found[:3])}")
     assert not unfindable, f"anchors a search cannot find by what identifies them: {unfindable}"
+
+
+def _write_source(root: Path, rel: str, text: str) -> None:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def test_what_the_harness_reads_of_the_engine_is_looked_for_in_the_checkout(tmp_path):
+    from agent_flow.workflows.trtllm_modeling_v2.checks import harness_contract
+
+    _write_source(
+        tmp_path,
+        "tensorrt_llm/executor/base_worker.py",
+        "class BaseWorker:\n    def __init__(self, llm_args):\n        self.llm_args = llm_args\n"
+        "        self.engine = None\n        self.rank = 0\n\n    def setup_engine(self): ...\n",
+    )
+    _write_source(
+        tmp_path,
+        "tensorrt_llm/_torch/pyexecutor/py_executor.py",
+        "class PyExecutor:\n    def __init__(self, m, k):\n"
+        "        self.model_engine = m\n        self.kv_cache_manager = k\n",
+    )
+    # Renamed upstream: the harness still reads `_cuda_graph_batch_sizes`.
+    _write_source(
+        tmp_path,
+        "tensorrt_llm/_torch/pyexecutor/model_engine.py",
+        "class PyTorchModelEngine:\n    def __init__(self, plan):\n        self._graph_batch_sizes = plan\n",
+    )
+    _write_source(
+        tmp_path,
+        "tensorrt_llm/_torch/pyexecutor/kv_cache/manager.py",
+        "class KvCacheManagerV3:\n    enable_block_reuse: bool\n\n    def get_kv_cache_stats(self): ...\n",
+    )
+    _write_source(tmp_path, "tensorrt_llm/_torch/pyexecutor/resource_manager.py", "")
+    _write_source(
+        tmp_path,
+        "tensorrt_llm/llmapi/llm.py",
+        "class BaseLLM:\n    def get_kv_cache_capacity(self): ...\n",
+    )
+    _write_source(
+        tmp_path,
+        "tensorrt_llm/_torch/pyexecutor/model_loader.py",
+        'logger.warning(\n    "Disabling KV cache block reuse for the hybrid Mamba model "\n'
+        '    "without a snapshot policy")\n',
+    )
+    # The KV-cache manager's members moved to another file under the same directory, one
+    # of them declared as a field: both still found. A sparse checkout without the C++
+    # batch manager leaves its log line unchecked, not missing.
+    missing, unchecked = harness_contract.check(tmp_path)
+    assert [d.what for d in unchecked] == ["the paged KV-cache allocation log line"]
+    assert [d.what for d in missing] == ["PyTorchModelEngine._cuda_graph_batch_sizes"]
+    notes = preflight.check_harness_dependencies({"trtllm_repo_path": str(tmp_path)})
+    assert notes[0].startswith("harness drift: this checkout no longer has PyTorchModelEngine.")
+    assert "feeds cuda_graph_captured" in notes[0] and "not the target" in notes[0]
+    assert "not checked" in notes[1]
+    _write_source(
+        tmp_path,
+        "cpp/tensorrt_llm/batch_manager/kvCacheManager.cpp",
+        'TLLM_LOG_INFO("[MemUsageChange] Allocated %0.2f GiB for max tokens in paged KV cache (%d).", a, b);\n',
+    )
+    assert harness_contract.check(tmp_path)[1] == []
+    assert (
+        preflight.check_harness_dependencies({"trtllm_repo_path": str(tmp_path / "absent")}) == []
+    )
+
+
+@pytest.mark.skipif(
+    not (Path(__file__).resolve().parents[4] / "tensorrt_llm" / "executor").is_dir(),
+    reason="agent-flow outside a TensorRT-LLM checkout",
+)
+def test_this_checkout_defines_everything_the_harness_reads():
+    from agent_flow.workflows.trtllm_modeling_v2.checks import harness_contract
+
+    missing, _ = harness_contract.check(Path(__file__).resolve().parents[4])
+    assert not missing, harness_contract.describe(missing, [])

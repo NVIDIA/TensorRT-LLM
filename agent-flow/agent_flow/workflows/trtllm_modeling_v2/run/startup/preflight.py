@@ -30,7 +30,7 @@ import yaml
 
 from ...checks import accuracy as accuracy_checks
 from ...checks import boot as boot_checks
-from ...checks import check_config, check_runtime
+from ...checks import check_config, check_runtime, harness_contract
 from ...checks import disagg as disagg_checks
 from ...checks.check_config import resolve_llm_api_options, speculation_flags
 from ...checks.runtime_evidence import reports_unsupported_architecture
@@ -682,6 +682,20 @@ def check_capture_lists(task_data: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def check_harness_dependencies(task_data: Mapping[str, Any]) -> list[str]:
+    """Notes naming what the gate harness reads that the checkout no longer defines.
+
+    The harness reads engine internals and log lines no public API promises
+    (:mod:`..checks.harness_contract`); one that moved leaves the checks resting
+    on it UNKNOWN after a GPU run. A note rather than a refusal: most of them
+    feed some checks only, and the run's other checks still mean what they say.
+    """
+    repo = task_data.get("trtllm_repo_path")
+    if not repo or not Path(str(repo)).is_dir():
+        return []
+    return harness_contract.describe(*harness_contract.check(Path(str(repo))))
+
+
 def check_kv_cache_configs(
     task_data: Mapping[str, Any], checkpoint_config: Mapping[str, Any]
 ) -> list[str]:
@@ -1065,6 +1079,7 @@ def run_preflight(
     notes.extend(check_speculation_support(task_data))
     notes.extend(check_capture_lists(task_data))
     notes.extend(check_kv_cache_configs(task_data, checkpoint_config))
+    notes.extend(check_harness_dependencies(task_data))
 
     env_block = dict(task_data.get("environment") or {})
     declared_env = {str(k): str(v) for k, v in (env_block.get("env") or {}).items()}

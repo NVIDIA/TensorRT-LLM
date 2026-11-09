@@ -111,6 +111,9 @@ must change before that.
 1. **Specify and prepare:** derive or validate `task.yaml`, check the environment and agent access,
    survey available operators, and compile a contract of required checks. A unit is core or a
    feature; a member is a parallel configuration; their pairing defines a coverage cell.
+   Preflight also looks in the checkout for the engine internals and log lines the gate harness
+   reads ([`checks/harness_contract.py`](checks/harness_contract.py)) and notes any it no longer
+   defines: the checks resting on one report UNKNOWN evidence, a harness gap rather than the target's.
 2. **Plan and execute:** the planner proposes a dependency graph; Python admits and schedules it.
    Workers use separate worktrees. Kernel tasks certify or add operators; assemblers build the
    target. Commits are audited and integrated; shared-code changes require regression coverage.
