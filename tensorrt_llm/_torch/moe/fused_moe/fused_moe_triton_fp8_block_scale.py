@@ -43,6 +43,7 @@ def _moe_prefix_kernel(
     NUM_EXPERTS_POW2: tl.constexpr,
 ):
     """Compute exclusive offsets from padded expert counts."""
+    # tl.arange needs a power-of-2 range; lanes >= NUM_EXPERTS load a count of 0 and are not stored.
     e = tl.arange(0, NUM_EXPERTS_POW2)
     mask = e < NUM_EXPERTS
     counts = tl.load(counts_ptr + e, mask=mask, other=0).to(tl.int32)

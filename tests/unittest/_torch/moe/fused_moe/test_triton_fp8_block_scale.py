@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-Unit tests for ``run_triton_fp8_block_scale_moe``.
+Unit tests for ``run_triton_fp8_block_scale_moe`` and ``moe_align_block_size``.
 
 Run as a pytest:
     pytest tests/unittest/_torch/moe/fused_moe/test_triton_fp8_block_scale.py -v
@@ -27,6 +27,7 @@ skip_unsupported = pytest.mark.skipif(
     not torch.cuda.is_available() or not is_sm_120f(),
     reason="Requires CUDA SM120 for the Triton FP8 block-scale MoE path",
 )
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 
 
 def _run_moe_bf16_reference(
@@ -244,9 +245,6 @@ def test_clamp_is_rejected_for_a_non_swiglu_activation() -> None:
 
     with pytest.raises(ValueError, match="clamps SwiGLU only"):
         run_triton_fp8_block_scale_moe(**inputs)
-
-
-requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 
 
 @requires_cuda
