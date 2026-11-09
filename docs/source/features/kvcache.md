@@ -362,7 +362,9 @@ their activation points.
 
 Partial reuse of a block can happen when some but not all tokens are matched. It is enabled by default, but can be disabled by setting ```enable_partial_reuse``` to False.
 
-The property ```copy_on_partial_reuse``` specifies whether a block should be copied or not in order to allow partial reuse. If copying is disabled, a partially matched block can only be reused if no other request is using it. If copying is enabled, partially matched blocks are not reused directly, instead a new block is created and the matched tokens are copied into the new block. This allows multiple requests to partially reuse a block.
+With KV cache manager V1, the property `copy_on_partial_reuse` specifies whether a block should be copied to allow partial reuse. If copying is disabled, a partially matched block can only be reused if it is an unreferenced leaf. If copying is enabled, a new block is created and the matched tokens are copied into it. This allows multiple requests to partially reuse a block.
+
+KV cache manager V2 ignores `copy_on_partial_reuse`. It copies retained partial-prefix pages into private storage before continuing inference. Set `enable_partial_reuse=False` to disable partial-block reuse with V2.
 
 ### Attention Window Size
 
