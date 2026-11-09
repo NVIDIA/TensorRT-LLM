@@ -447,7 +447,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Select native DSA indexer metadata for a draft forward."""
-        super().prepare_for_draft_forward()
         # DeepSeek-V4 metadata inherits DSA metadata, but its cache manager uses a
         # different dual-pool layout. Only native DSA cache managers use the DSA
         # draft-replay buffers below.

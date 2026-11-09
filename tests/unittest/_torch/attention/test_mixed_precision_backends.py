@@ -551,27 +551,46 @@ def test_one_model_draft_kv_cache_dtype(is_mtp):
     assert target.mixed_precision_kv is not None
 
 
+def _draft_replay_metadata(cls):
+    """A metadata stand-in with the real draft-swap bookkeeping and the class's draft hook, for
+    prepare_attn_metadata_for_draft_replay with a separate draft manager."""
+    metadata = Mock(spec=cls)
+    metadata.enable_flash_mla = False
+    metadata.kv_cache_manager = Mock(name="target_kv_cache_manager")
+    metadata.draft_kv_cache_block_offsets = torch.zeros(1, dtype=torch.int32)
+    metadata.prepare_for_draft_forward = lambda: cls.prepare_for_draft_forward(metadata)
+    metadata.draft_replay_swapped_attrs = {}
+    for helper in ("record_draft_swap", "swap_for_draft", "restore_draft_swaps"):
+        setattr(metadata, helper, partial(getattr(TrtllmAttentionMetadata, helper), metadata))
+    return metadata
+
+
+_DRAFT_MANAGER = SimpleNamespace(host_kv_cache_block_offsets=torch.zeros(1, dtype=torch.int32))
+
+
 @pytest.mark.cpu_only
-def test_dsa_draft_forward_uses_draft_mixed_precision_high_table():
-    """A mixed DSA draft manager's MTP layers read its own mixed-precision high page table."""
-    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
-        DSAtrtllmAttentionMetadata,
+def test_draft_replay_uses_the_draft_manager_mixed_precision_tables():
+    """A draft forward on a separate draft manager reads that manager's mixed-precision high page
+    table and block-offset copy (None when its layers take no mixed precision)."""
+    from tensorrt_llm._torch.speculative.interface import (
+        prepare_attn_metadata_for_draft_replay,
+        restore_attn_metadata_after_draft_replay,
     )
 
-    metadata = Mock(spec=DSAtrtllmAttentionMetadata)
-    metadata.kv_cache_manager = Mock(name="draft_kv_cache_manager")
-    metadata.draft_replay_swapped_attrs = {}
-    metadata.record_draft_swap = partial(TrtllmAttentionMetadata.record_draft_swap, metadata)
-    metadata.swap_for_draft = partial(TrtllmAttentionMetadata.swap_for_draft, metadata)
-    metadata.restore_draft_swaps = partial(TrtllmAttentionMetadata.restore_draft_swaps, metadata)
-    target, draft = (torch.full((2, 4), -1, dtype=torch.int32) for _ in range(2))
-    metadata.mixed_precision_high_block_table = target
-    metadata.draft_mixed_precision_high_block_table = draft
+    metadata = _draft_replay_metadata(TrtllmAttentionMetadata)
+    target_table, draft_table = (torch.full((2, 4), -1, dtype=torch.int32) for _ in range(2))
+    metadata.mixed_precision_high_block_table = target_table
+    metadata.draft_mixed_precision_high_block_table = draft_table
+    target_offsets = torch.zeros((1, 2, 2, 4), dtype=torch.int32)
+    metadata.mixed_precision_low_block_offsets = target_offsets
+    metadata.draft_mixed_precision_low_block_offsets = None
 
-    DSAtrtllmAttentionMetadata.prepare_for_draft_forward(metadata)
-    assert metadata.mixed_precision_high_block_table is draft
-    metadata.restore_draft_swaps()
-    assert metadata.mixed_precision_high_block_table is target
+    saved = prepare_attn_metadata_for_draft_replay(metadata, _DRAFT_MANAGER)
+    assert metadata.mixed_precision_high_block_table is draft_table
+    assert metadata.mixed_precision_low_block_offsets is None
+    restore_attn_metadata_after_draft_replay(metadata, saved)
+    assert metadata.mixed_precision_high_block_table is target_table
+    assert metadata.mixed_precision_low_block_offsets is target_offsets
 
 
 @pytest.mark.cpu_only
@@ -933,26 +952,25 @@ def test_draft_forward_hides_mixed_precision_high_rows(backend):
     from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
         DSAtrtllmAttentionMetadata,
     )
+    from tensorrt_llm._torch.speculative.interface import (
+        prepare_attn_metadata_for_draft_replay,
+        restore_attn_metadata_after_draft_replay,
+    )
 
     cls = {"dsa": DSAtrtllmAttentionMetadata, "deepseek_v4": DeepseekV4TrtllmAttentionMetadata}[
         backend
     ]
-    metadata = Mock(spec=cls)
-    metadata.kv_cache_manager = Mock(name="draft_kv_cache_manager")
+    metadata = _draft_replay_metadata(cls)
     # The property reads this class flag; a Mock attribute would be truthy.
     metadata.mixed_precision_block_offsets_redirect = cls.mixed_precision_block_offsets_redirect
     metadata.draft_sliding_block_tables = None
     metadata.draft_mixed_precision_high_block_table = None
-    metadata.draft_replay_swapped_attrs = {}
-    metadata.record_draft_swap = partial(TrtllmAttentionMetadata.record_draft_swap, metadata)
-    metadata.swap_for_draft = partial(TrtllmAttentionMetadata.swap_for_draft, metadata)
-    metadata.restore_draft_swaps = partial(TrtllmAttentionMetadata.restore_draft_swaps, metadata)
     table = torch.full((2, 4), -1, dtype=torch.int32)
     metadata.mixed_precision_high_block_table = table
 
-    assert cls.prepare_for_draft_forward(metadata) is None
+    saved = prepare_attn_metadata_for_draft_replay(metadata, _DRAFT_MANAGER)
     assert cls.has_mixed_precision_high_rows.fget(metadata) is False
-    metadata.restore_draft_swaps()
+    restore_attn_metadata_after_draft_replay(metadata, saved)
     assert metadata.mixed_precision_high_block_table is table
     assert cls.has_mixed_precision_high_rows.fget(metadata) is True
 

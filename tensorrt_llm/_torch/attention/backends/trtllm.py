@@ -997,11 +997,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # MTP layers of a mixed-precision draft manager run on its own
             # staging copy.
             self.swap_for_draft("mixed_precision_staging", draft)
-        # MTP layers of a cold-page draft manager use its mixed-precision high page table.
-        self.swap_for_draft("mixed_precision_high_block_table",
-                            self.draft_mixed_precision_high_block_table)
-        self.swap_for_draft("mixed_precision_low_block_offsets",
-                            self.draft_mixed_precision_low_block_offsets)
         return None
 
     def restore_after_draft_forward(self, saved_state: dict | None) -> None:
@@ -1258,8 +1253,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         redirect_block_offsets = self.mixed_precision_block_offsets_redirect
         for prefix, manager in (("", self.kv_cache_manager),
                                 ("draft_", self.draft_kv_cache_manager)):
-            if not getattr(manager, "mixed_precision_high_layers", None):
-                continue
+            high_layers = getattr(manager, "mixed_precision_high_layers", None)
+            if not isinstance(high_layers, dict) or not high_layers:
+                continue  # no mixed precision (a mock manager fabricates the attribute)
             if redirect_block_offsets and not manager.mixed_precision_high_layer_offsets:
                 continue  # NVFP4 history: dense attention runs on the staging copy
             if redirect_block_offsets and manager._use_per_layer_page_tables:
