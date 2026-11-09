@@ -6,6 +6,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
+    flashinfer_rmsnorm as op,
+)
 
 __extra_import_path__ = ["../../../../norm", "../../../.."]
 import test_modeling_v2_flashinfer_rmsnorm as shared  # noqa: E402
@@ -50,4 +53,5 @@ CELLS = tuple(
 
 @pytest.mark.parametrize("cell", CELLS, ids=[c.why for c in CELLS])
 def test_certified_cells(cell: Cell, certifying) -> None:  # noqa: F811
+    assert shared.op is op
     shared.test_certified_cells(cell, certifying)

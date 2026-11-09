@@ -6,6 +6,9 @@ import pytest
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import STANDARD
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
+    thop_attention as op,
+)
 
 __extra_import_path__ = ["../../../../attention", "../../../.."]
 import test_modeling_v2_thop_attention as shared  # noqa: E402
@@ -131,4 +134,5 @@ CELLS = tuple(
 
 @pytest.mark.parametrize("cell", CELLS, ids=[c.why for c in CELLS])
 def test_certified_cells(cell: Cell, certifying) -> None:  # noqa: F811
+    assert shared.op is op
     shared.test_certified_cells(cell, certifying)

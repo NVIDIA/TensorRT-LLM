@@ -6,8 +6,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm as op
 
-__extra_import_path__ = ["../../../../gemm", "../../../.."]
+__extra_import_path__ = ["../../gemm", "../.."]
 import test_modeling_v2_cublas_mm as shared  # noqa: E402
 
 _BEAM_DENSE_BLOCK = tuple(
@@ -63,4 +64,5 @@ CELLS = tuple(
 
 @pytest.mark.parametrize("cell", CELLS, ids=[c.why for c in CELLS])
 def test_certified_cells(cell: Cell) -> None:
+    assert shared.op is op
     shared.test_certified_cells(cell)

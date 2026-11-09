@@ -6,6 +6,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (
+    flashinfer_silu_and_mul as op,
+)
 
 __extra_import_path__ = ["../../../../activation", "../../../.."]
 import test_modeling_v2_flashinfer_silu_and_mul as shared  # noqa: E402
@@ -32,4 +35,5 @@ CELLS = tuple(
 
 @pytest.mark.parametrize("cell", CELLS, ids=[c.why for c in CELLS])
 def test_certified_cells(cell: Cell) -> None:
+    assert shared.op is op
     shared.test_certified_cells(cell)
