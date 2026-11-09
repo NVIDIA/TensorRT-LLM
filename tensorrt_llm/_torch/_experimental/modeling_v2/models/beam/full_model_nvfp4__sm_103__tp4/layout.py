@@ -89,7 +89,6 @@ __all__ = [
     "check_partition",
     "check_rank",
     "check_recipe",
-    "ownership_ledger",
     "stored_entries",
     "swizzled_numel",
     "tensor_specs",
@@ -240,51 +239,6 @@ def check_partition(specs: Mapping[str, Any], world_size: int = WORLD_SIZE) -> N
                 raise ValueError(f"{spec.name}: {kind} intervals cover {cursor} of {extent}")
 
 
-def ownership_ledger(specs: Mapping[str, Any], world_size: int = WORLD_SIZE) -> list:
-    """One plain-data row per logical tensor: its rule and every rank's intervals and storage.
-
-    Higher-precision rows are the BF16 layout's. An expert row records, per rank, the logical,
-    packed-byte and block-scale intervals, the bank and the slot (the global expert id).
-    """
-    rows = bf16_layout.ownership_ledger(
-        OrderedDict((n, s) for n, s in specs.items() if not isinstance(s, QuantSpec)), world_size
-    )
-    for spec in specs.values():
-        if not isinstance(spec, QuantSpec):
-            continue
-        ranks = []
-        for rank in range(world_size):
-            dim, start, stop = spec.interval(rank, world_size)
-            _, pstart, pstop = spec.packed_interval(rank, world_size)
-            _, sstart, sstop = spec.scale_interval(rank, world_size)
-            ranks.append(
-                {
-                    "rank": rank,
-                    "replicated": False,
-                    "dim": dim,
-                    "start": start,
-                    "stop": stop,
-                    "packed": [pstart, pstop],
-                    "scale": [sstart, sstop],
-                    "local_packed_shape": list(spec.local_packed_shape(rank, world_size)),
-                    "local_scale_shape": list(spec.local_scale_shape(rank, world_size)),
-                    "scalars": "replicated",
-                    "bank": spec.bank,
-                    "slot": spec.expert,
-                }
-            )
-        rows.append(
-            {
-                "name": spec.name,
-                "family": spec.family,
-                "layer": spec.layer,
-                "expert": spec.expert,
-                "shape": list(spec.shape),
-                "stored": {k: [d, list(s)] for k, (d, s) in spec.stored().items()},
-                "ranks": ranks,
-            }
-        )
-    return rows
 
 
 def _module_names(specs: Mapping[str, Any]) -> tuple:

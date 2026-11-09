@@ -322,41 +322,6 @@ def tensor_specs(config: Any, layers: Optional[tuple] = None) -> "OrderedDict[st
     return specs
 
 
-def ownership_ledger(specs: Mapping[str, TensorSpec], world_size: int = WORLD_SIZE) -> list:
-    """One row per logical tensor: its rule and every rank's interval, replica flag and storage.
-
-    Rows are plain data (the same fields an independent ledger records), so two ledgers can
-    be compared without sharing code: ``dim``/``start``/``stop`` per split rank, ``replicated``
-    otherwise, and ``bank``/``slot`` for expert slices.
-    """
-    rows = []
-    for spec in specs.values():
-        ranks = []
-        for rank in range(world_size):
-            interval = spec.interval(rank, world_size)
-            entry = {"rank": rank, "local_shape": list(spec.local_shape(rank, world_size))}
-            if interval is None:
-                entry["replicated"] = True
-            else:
-                dim, start, stop = interval
-                entry.update(replicated=False, dim=dim, start=start, stop=stop)
-            if spec.bank is not None:
-                entry.update(bank=spec.bank, slot=spec.expert)
-            ranks.append(entry)
-        rows.append(
-            {
-                "name": spec.name,
-                "family": spec.family,
-                "layer": spec.layer,
-                "expert": spec.expert,
-                "shape": list(spec.shape),
-                "stored_dtype": spec.stored_dtype,
-                "effective_dtype": spec.effective_dtype,
-                "scale": spec.scale_name,
-                "ranks": ranks,
-            }
-        )
-    return rows
 
 
 def check_partition(specs: Mapping[str, TensorSpec], world_size: int = WORLD_SIZE) -> None:

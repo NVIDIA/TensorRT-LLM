@@ -71,7 +71,6 @@ from .layout import (
     check_config,
     check_partition,
     check_recipe,
-    ownership_ledger,
     read_quant_config,
     stored_entries,
     swizzled_numel,
@@ -144,7 +143,6 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         self.softcap = config["final_logit_softcapping"]
         self.routed_scaling_factor = config["routed_scaling_factor"]
         self.vocab_interval = self.specs[EMBED].interval(self.rank)[1:]
-        self.tensor_names: list = []
         self.bank_names: list = []
         self.expert_names: list = []
         experts = config["num_experts"]
@@ -178,7 +176,6 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
                 requires_grad=False,
             )
             self.register_parameter(_attr(spec.name), param)
-            self.tensor_names.append(spec.name)
         self._allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL)
         self.usable = False
         self.load_record: Optional[dict] = None
@@ -218,9 +215,6 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
             raise ValueError(f"layer {layer} expert {expert} {proj!r} is not held")
         return {f: self.bank(spec.bank, f)[expert] for f in BANK_FIELDS}
 
-    def ledger(self) -> list:
-        """This component's ownership rows (see ``layout.ownership_ledger``)."""
-        return ownership_ledger(self.specs)
 
     # ------------------------------------------------------------------ loading
 

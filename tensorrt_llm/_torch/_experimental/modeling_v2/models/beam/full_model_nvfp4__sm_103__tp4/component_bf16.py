@@ -97,7 +97,6 @@ from .layout_bf16 import (
     check_config,
     check_partition,
     check_rank,
-    ownership_ledger,
     tensor_specs,
 )
 from .loader_bf16 import CheckpointFormatError, SafetensorsCatalog, TileReader, read_slice_into
@@ -193,7 +192,6 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         self.vocab_interval = self.specs[EMBED].interval(self.rank)[1:]
         #: Storage is always resolved from the currently registered parameters, never from
         #: references taken here, so a replaced parameter or bank is what every call uses.
-        self.tensor_names: list = []
         self.bank_names: list = []
         for spec in self.specs.values():
             if spec.bank is not None:
@@ -213,7 +211,6 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
                 requires_grad=False,
             )
             self.register_parameter(_attr(spec.name), param)
-            self.tensor_names.append(spec.name)
         self._allreduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL)
         self.usable = False
         self.load_record: Optional[dict] = None
@@ -242,8 +239,6 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
                 f"set {MODELING_V2_VALIDATE_ENV} alike on every rank"
             )
 
-    # ------------------------------------------------------------------ KV cache mode
-
     # ------------------------------------------------------------------ storage
 
     def tensor(self, name: str) -> torch.Tensor:
@@ -257,9 +252,6 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         """The current ``[256, ...]`` storage of one sparse layer's expert bank."""
         return getattr(self, _attr(bank))
 
-    def ledger(self) -> list:
-        """This component's ownership rows (see ``layout.ownership_ledger``)."""
-        return ownership_ledger(self.specs)
 
     def weight_state(self) -> tuple:
         """Identity of every current parameter and bank: object, version, storage, geometry.
@@ -365,10 +357,6 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         self.usable = True
         return self.load_record
 
-    def effective_sha256(self, name: str) -> str:
-        """SHA-256 of the rank-local effective bytes of ``name`` (C order, its dtype)."""
-        t = self.tensor(name).contiguous().cpu()
-        return hashlib.sha256(memoryview(t.view(torch.uint8).numpy())).hexdigest()
 
     # ------------------------------------------------------------------ helpers
 
@@ -513,20 +501,6 @@ class BeamCheckpointLayoutBf16Sm103Tp4(nn.Module):
         )
         return out
 
-    @torch.no_grad()
-    def o_proj_reduce(
-        self, layer: int, gated: torch.Tensor, capture: Optional[dict] = None
-    ) -> torch.Tensor:
-        """Local heads' gated attention ``[T, 12, 128]`` -> o_proj partial, reduced once."""
-        self._check_usable(layer)
-        T = gated.shape[0]
-        part = cublas_mm(
-            gated.reshape(T, self.local_heads * self.head_dim),
-            self._layer(layer, "self_attn.o_proj.weight").t(),
-        )
-        out = self.all_reduce(part)
-        _rec(capture, {"tp.o_part": part, "attn_out": out})
-        return out
 
     @torch.no_grad()
     def dense_ffn(

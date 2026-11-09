@@ -57,8 +57,6 @@ if TYPE_CHECKING:
 NUM_LAYERS = 52
 #: Tokens per call of the supported deployment (its native ``max_num_tokens``).
 MAX_NUM_TOKENS = 8192
-#: KV cache page size of the supported deployment.
-TOKENS_PER_BLOCK = 32
 
 LogitRows = Literal["all"] | Sequence[int] | None
 
@@ -269,7 +267,6 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
                         "mlp": "sparse" if self.schedule.is_sparse(layer) else "dense",
                         "attention": "sliding" if sliding else "full",
                         "window": self.window if sliding else attn_metadata.max_seq_len,
-                        "output_sq_norm": x.float().square().sum(),
                     }
                 )
         selected = x if len(rows) == num_tokens and rows == list(range(num_tokens)) else x[rows]
@@ -284,6 +281,5 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
 __all__ = [
     "MAX_NUM_TOKENS",
     "NUM_LAYERS",
-    "TOKENS_PER_BLOCK",
     "BeamFullModelNvfp4Sm103Tp4",
 ]

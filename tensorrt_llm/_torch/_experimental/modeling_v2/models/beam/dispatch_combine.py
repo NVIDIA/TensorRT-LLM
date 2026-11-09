@@ -39,7 +39,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_disp
 )
 
 HIDDEN_SIZE = 5120
-NUM_EXPERTS = 256
 EXPERTS_PER_TOKEN = 8
 ROUTED_SCALING_FACTOR = 2.5
 
