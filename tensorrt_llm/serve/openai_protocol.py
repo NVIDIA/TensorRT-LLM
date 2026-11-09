@@ -2399,7 +2399,8 @@ class MediaReferenceItem(OpenAIBaseModel):
     format: Literal["path", "url", "base64"] = Field(description=(
         "Wire form of ``content``: ``path`` (a server-side file under the "
         "directory named by ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR``; a ``file://`` "
-        "URI is also accepted), ``url`` (``http(s)``, fetched "
+        "URI is also accepted; at most 200 MiB per file and 512 MiB across "
+        "the ``path`` references of one request), ``url`` (``http(s)``, fetched "
         "through the SSRF-guarded loader), or ``base64`` (a ``data:`` URI is "
         "also accepted). Raw bytes reach the server as a multipart upload, "
         "which carries no ``format`` of its own. Distinct from the top-level "

@@ -128,7 +128,7 @@ Conditioning references are supplied through the typed fields `image_reference`,
 
 | `format` | Content | Notes |
 |---|---|---|
-| `path` | A local file readable by the coordinator process | Bare path or `file://` URI. Over HTTP, only a regular file under `TRTLLM_MEDIA_ALLOWED_INPUT_DIR`. |
+| `path` | A local file readable by the coordinator process | Bare path or `file://` URI. Over HTTP, only a regular file under `TRTLLM_MEDIA_ALLOWED_INPUT_DIR`, of at most 200 MiB, and at most 512 MiB across the `path` references of one request; send a larger file as a multipart upload. |
 | `url` | An `http(s)` URL | Fetched on the coordinator through the SSRF-guarded loader. |
 | `base64` | Base64 text | A `data:` URI is also accepted. |
 | `bytes` | Raw `bytes` | Python API only. |

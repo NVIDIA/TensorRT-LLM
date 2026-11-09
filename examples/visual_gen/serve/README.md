@@ -298,7 +298,7 @@ You can customize these by:
 - `num_frames`: when set, wins over the `seconds * frame_rate` derivation
 - `seed`, `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`: per-request denoise controls
 - `image_reference`, `video_reference`, `audio_reference`: reference image(s) for I2V/TI2V, video(s) for V2V, audio(s). In JSON each takes a `{content, format, role}` object or a list of them; a multipart file upload needs no `format`.
-  - `format` declares how to read `content`: `"path"` (a server-side file under `TRTLLM_MEDIA_ALLOWED_INPUT_DIR`, as a bare path or a `file://` URI), `"url"` (`http(s)`), or `"base64"` (or a `data:` URI). It is required in JSON, where `"bytes"` is rejected — upload the file instead.
+  - `format` declares how to read `content`: `"path"` (a server-side file under `TRTLLM_MEDIA_ALLOWED_INPUT_DIR`, as a bare path or a `file://` URI; at most 200 MiB per file and 512 MiB across the `path` references of one request, so send a larger file as a multipart upload), `"url"` (`http(s)`), or `"base64"` (or a `data:` URI). It is required in JSON, where `"bytes"` is rejected — upload the file instead.
 
     ```json
     {"image_reference": {"content": "iVBORw0KGgoAAAANSUhEUg...", "format": "base64"}}
