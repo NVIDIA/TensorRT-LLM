@@ -799,11 +799,11 @@ class _ClosingRequest(_GenRequest):
     def __init__(self, rid: int, max_new_tokens: int = 1, prompt=_PROMPT, **overrides) -> None:
         defaults = dict(
             prompt_len=len(prompt),
-            total_input_len_cp=len(prompt),
             py_max_new_tokens=max_new_tokens,
             py_orig_prompt_len=len(prompt),
             py_end_id=-1,
             py_stop_words_list=None,
+            py_first_token_checked=False,
             return_perf_metrics=False,
             response=SimpleNamespace(result=SimpleNamespace()),
             cached_tokens=5,
@@ -816,12 +816,16 @@ class _ClosingRequest(_GenRequest):
         super().__init__(rid, **defaults)
         self.prompt = list(prompt)
         self.finished_reason = None
+        # Number of tokens each get_tokens_range call copied.
+        self.token_reads = []
 
     def get_num_tokens(self, beam: int) -> int:
-        return len(self.get_tokens(beam))
+        return len(self.prompt) + len(self.new_tokens)
 
-    def get_tokens(self, beam: int) -> list:
-        return self.prompt + [token for token, _ in self.new_tokens]
+    def get_tokens_range(self, beam: int, begin: int, end: int) -> list:
+        tokens = (self.prompt + [token for token, _ in self.new_tokens])[begin:end]
+        self.token_reads.append(len(tokens))
+        return tokens
 
     def finish_by(self, reason, beam: int) -> None:
         self.state = LlmRequestState.GENERATION_COMPLETE
@@ -836,7 +840,10 @@ def _closing_executor(
     executor._disagg_coordinator = coordinator
     executor.active_requests = list(active)
     executor.enable_attention_dp = attention_dp
-    executor.dist = SimpleNamespace(rank=0, cp_size=cp_size)
+    executor.dist = SimpleNamespace(
+        rank=0, cp_size=cp_size, mapping=SimpleNamespace(has_cp_helix=lambda: cp_size > 1)
+    )
+    executor.kv_cache_transceiver = Mock()
     executor.canceled_req_ids = []
     executor.enable_iter_perf_stats = False
     executor._is_kv_manager_v2 = False
@@ -844,7 +851,6 @@ def _closing_executor(
     executor.iter_counter = 7
     executor.perf_manager = Mock()
     executor.sampler = SimpleNamespace(max_seq_len=max_seq_len)
-    executor.max_seq_len = max_seq_len
     executor.should_exclude_last_generation_logits = False
     executor.resource_manager = SimpleNamespace(resource_managers={})
     executor._enqueue_responses = Mock()
@@ -1037,9 +1043,11 @@ _HELIX_TOKENS_PER_BLOCK = 4
     ("max_new_tokens", "max_seq_len_margin", "stop_words", "reason"),
     [
         pytest.param(1, 8, None, FinishReason.LENGTH, id="max_new_tokens"),
-        pytest.param(8, 1, None, FinishReason.LENGTH, id="full_sequence_reaches_max_seq_len"),
-        pytest.param(8, 2, None, None, id="full_sequence_below_max_seq_len"),
-        pytest.param(8, 8, "multi_token", None, id="multi_token_stop_word"),
+        # KV cache manager V1 bounds a rank's slice by max_seq_len, so a full
+        # prompt longer than it is admitted; the limit is left to decode.
+        pytest.param(8, -2, None, None, id="full_prompt_beyond_max_seq_len"),
+        pytest.param(8, 8, None, None, id="no_stop"),
+        pytest.param(8, 8, "multi_token", FinishReason.STOP_WORDS, id="multi_token_stop_word"),
         pytest.param(8, 8, "mixed", FinishReason.STOP_WORDS, id="single_token_word_in_mixed_list"),
     ],
 )
@@ -1048,20 +1056,22 @@ def test_close_out_decides_alike_on_every_helix_rank(
 ) -> None:
     """Under Helix each CP rank holds its own slice of the prompt, possibly an
     empty one, and every rank must decide the same way or one would schedule
-    a request another closed out. The length limit is checked on the full
-    sequence; multi-token stop words, which need the prompt's tail, are left to
-    the decode steps, single-token ones are still checked, and the request's
-    stop words are not modified."""
+    a request another closed out. The decision gives the aggregated result:
+    max_new_tokens counts generated tokens, max_seq_len is left to the decode
+    steps, and a stop word ending at the first token is matched against the
+    prompt tail every rank keeps; the request's stop words are not modified."""
     prompt = list(range(100, 100 + prompt_len))
     words = {
         None: None,
         "multi_token": [[prompt[-1], 41]],
         "mixed": [[prompt[-1], 41], [41]],
     }[stop_words]
+    # What merge_helix_requests keeps on every rank for these words.
+    prompt_tail = [prompt[-1]] if stop_words else []
     slice_lens = []
     outcomes = []
     for cp_rank in range(_HELIX_CP_SIZE):
-        local_prompt, _, full_len, _ = partition_context_for_helix(
+        local_prompt, _, _, _ = partition_context_for_helix(
             np.array(prompt), cp_rank, _HELIX_CP_SIZE, _HELIX_TOKENS_PER_BLOCK
         )
         slice_lens.append(len(local_prompt))
@@ -1069,8 +1079,8 @@ def test_close_out_decides_alike_on_every_helix_rank(
             1,
             max_new_tokens,
             prompt=local_prompt,
-            total_input_len_cp=full_len,
             py_stop_words_list=copy.deepcopy(words),
+            py_helix_prompt_tail=prompt_tail,
         )
         executor = _closing_executor(
             CoordinatorHarness().coordinator,
@@ -1086,6 +1096,37 @@ def test_close_out_decides_alike_on_every_helix_rank(
     assert len(set(slice_lens)) == _HELIX_CP_SIZE, "slices must differ for this case"
     expected_reason = None if reason is None else (reason, 0)
     assert outcomes == [(expected_reason, words)] * _HELIX_CP_SIZE
+
+
+def test_close_out_checks_a_waiting_request_once_from_the_prompt_tail() -> None:
+    """A received request whose first token does not end it may wait several
+    iterations for a slot; its verdict cannot change, so it is checked once,
+    and a multi-token stop word reads only the prompt tail it can span, not
+    the whole prompt."""
+    h = CoordinatorHarness()
+    req = _ClosingRequest(1, max_new_tokens=8, py_stop_words_list=[[99, 98, 97]])
+    executor = _closing_executor(h.coordinator, [req])
+
+    for _ in range(3):
+        executor._close_out_gen_receives_at_first_token()
+
+    assert req.token_reads == [2]
+    assert (req.state, req.finished_reason) == (_COMPLETE, None)
+    assert executor.active_requests == [req]
+
+
+def test_close_out_needs_a_kv_cache_transceiver() -> None:
+    """Without a transceiver no request receives KV, so the check does not
+    run on an aggregated executor."""
+    h = CoordinatorHarness()
+    req = _ClosingRequest(1)
+    executor = _closing_executor(h.coordinator, [req])
+    executor.kv_cache_transceiver = None
+
+    executor._close_out_gen_receives_at_first_token()
+
+    assert (req.state, req.new_tokens, req.finished_reason) == (_COMPLETE, [], None)
+    assert executor.active_requests == [req]
 
 
 def _native_received_request(rid: int, **request_options) -> LlmRequest:
@@ -1104,7 +1145,9 @@ def _flushing_executor(coordinator: DisaggTransferCoordinator, active) -> PyExec
     executor = _closing_executor(coordinator, active)
     del executor._enqueue_responses
     del executor._terminate_request
-    executor.dist = SimpleNamespace(rank=0, cp_size=1, mapping=SimpleNamespace(tp_group=[0]))
+    executor.dist = SimpleNamespace(
+        rank=0, cp_size=1, mapping=SimpleNamespace(tp_group=[0], has_cp_helix=lambda: False)
+    )
     executor.gather_all_responses = False
     executor.response_cv = threading.Condition()
     executor.responses = {}
@@ -1252,6 +1295,7 @@ def _stats_executor(coordinator: DisaggTransferCoordinator, active) -> PyExecuto
     executor._pending_close_out_requests = []
     executor._latest_host_step_time_ms = None
     executor._latest_prev_device_step_time_ms = None
+    executor._latest_kv_iter_stats = None
     executor.executor_request_queue = SimpleNamespace(
         get_request_queue=lambda: SimpleNamespace(queue=[])
     )
@@ -1320,6 +1364,41 @@ def test_close_outs_ride_on_a_batch_record_without_double_counting() -> None:
     executor._process_close_out_iter_stats(IterationStats(), 0.0)
 
     assert _recorded(executor) == [(2, [(1, 1), (3, 0)])]
+
+
+def test_close_outs_in_an_unsampled_iteration_get_no_request_stats_entry() -> None:
+    """With iter_perf_stats_interval > 1, a request that finishes in a skipped
+    iteration gets no requestStats entry; a request its first token finished
+    in one follows the same rule, while its completion is still counted."""
+    h = CoordinatorHarness()
+    executor = _stats_executor(h.coordinator, [_native_received_request(1, max_tokens=1)])
+    executor.iter_perf_stats_interval = 2  # iteration 7 is skipped
+    executor._get_new_active_requests_queue_latency = lambda: 0.0
+    executor._get_init_iter_stats = lambda _num_new, _latency: IterationStats()
+
+    executor._close_out_gen_receives_at_first_token()
+    # No request is left, so the skipped iteration emits a drain record.
+    executor._process_close_out_iter_stats(None, 0.0)
+
+    assert _recorded(executor) == [(1, [])]
+
+
+@pytest.mark.parametrize(("rank", "reports"), [(0, True), (1, False)])
+def test_close_outs_are_reported_by_rank0_under_attention_dp(rank, reports) -> None:
+    """Under attention DP the exported completion counts and requestStats are
+    rank 0's, the other ranks' rows carrying zero, so only rank 0 queues a
+    record for its close-outs."""
+    h = CoordinatorHarness()
+    executor = _stats_executor(h.coordinator, [_native_received_request(1, max_tokens=1)])
+    executor.enable_attention_dp = True
+    executor.dist.rank = rank
+    executor._adp_iter_stats = Mock()
+
+    executor._close_out_gen_receives_at_first_token()
+    executor._process_close_out_iter_stats(IterationStats(), 0.0)
+
+    assert executor._adp_iter_stats.queue.called is reports
+    executor._append_iter_stats.assert_not_called()
 
 
 def test_close_out_rebuilds_derived_cache_state_before_committing_blocks() -> None:

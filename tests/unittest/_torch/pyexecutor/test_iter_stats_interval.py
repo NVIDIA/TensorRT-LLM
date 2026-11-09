@@ -269,16 +269,18 @@ def test_close_outs_in_an_unsampled_iteration_follow_the_interval_rules():
 
 
 def test_close_outs_under_attention_dp_are_fanned_out_once_through_rank0():
-    """Only rank 0 records them, as it owns the completion counts. The record is
-    fanned out once the next exchange has collected the other rank's zero
+    """Only rank 0 reports them, as it owns the completion counts. Its record
+    is fanned out once the next exchange has collected the other rank's zero
     payload, and never again."""
     buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
     for rank, buffer in enumerate(buffers):
-        fake = _with_close_outs(_build_fake_self(interval=1), num_closed=2 + rank)
+        fake = _build_fake_self(interval=1)
         fake.enable_attention_dp = True
         fake.dist.rank = rank
         fake._adp_iter_stats = buffer
         fake._update_iter_stats.side_effect = _record_completed
+        if PyExecutor._reports_completions.fget(fake):
+            _with_close_outs(fake, num_closed=2)
         _run_iteration_without_batch(fake, 9)
 
     def exchange():

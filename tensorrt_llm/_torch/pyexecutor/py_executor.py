@@ -131,8 +131,7 @@ from .runtime_hooks import ExecutorEvents, RuntimeHooks, runtime_hooks_of
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
 from .sampler.sampler_common import SampleType
-from .sampler.sampler_features import (meet_max_token_stop_criteria_at,
-                                       stop_words_match)
+from .sampler.sampler_features import first_stop_reason
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
@@ -773,6 +772,9 @@ class PyExecutor:
     # the real values.
     _packed_sync_enabled = False
     _stage_timing = False
+    # Set on a rank that reports completions while requests its first-token
+    # check finished, which run no batch, wait for an iteration-stats record.
+    _close_outs_pending_iter_stats = False
 
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -1063,11 +1065,9 @@ class PyExecutor:
         # drain into the next emitted record, so sums over records stay exact.
         self._pending_num_new_active_requests = 0
         self._pending_num_completed_requests = 0
-        # Set while first-token close-outs, which run no batch, wait for a
-        # record; see _process_close_out_iter_stats.
-        self._close_outs_pending_iter_stats = False
-        # Close-outs waiting for their final requestStats entry (kept only
-        # with enable_iter_req_stats); their completions are already counted.
+        # Requests finished by their first-token check in a sampled iteration,
+        # waiting for their final requestStats entry; their completions are
+        # already counted.
         self._pending_close_out_requests: List[LlmRequest] = []
         self.stream_interval = self.llm_args.stream_interval
         # Streaming: also emit on decoding iterations 2..N when the model's
@@ -3901,6 +3901,14 @@ class PyExecutor:
                 prev_device_step_time_ms=prev_device_step_time_ms,
                 gpu_forward_time_ms=gpu_forward_time_ms)
 
+    @property
+    def _reports_completions(self) -> bool:
+        """Whether this rank's iteration-stats records report completed
+        requests: with attention DP only rank 0's do, the other ranks' rows
+        carry zero."""
+        return self.enable_iter_perf_stats and (not self.enable_attention_dp
+                                                or self.dist.rank == 0)
+
     def _process_close_out_iter_stats(self,
                                       iter_stats: Optional[IterationStats],
                                       iter_start_time: float) -> None:
@@ -3908,12 +3916,10 @@ class PyExecutor:
         record, under the usual sampling rules.
 
         Otherwise their completions wait for the next batch, which may not
-        come once the executor is idle. Under attention DP only rank 0 records:
-        it owns the completion counts, and the other ranks get zero rows.
+        come once the executor is idle. Only ranks that report completions
+        have any pending (see ``_reports_completions``).
         """
         if not self._close_outs_pending_iter_stats:
-            return
-        if self.enable_attention_dp and self.dist.rank != 0:
             return
         self._process_iter_stats(
             [], self.active_requests,
@@ -4424,7 +4430,7 @@ class PyExecutor:
 
                 # Stage 3.3: Handle executed batches.
                 handle_executed_batches(executed_batch_num)
-                self._progress_idle_pp_iteration(executed_batch_num)
+                self._progress_idle_pp_iteration(executed_batch_num, can_queue)
 
                 # Stage 3.4: Rebalance the KV pools once the drain started at
                 # the top of some earlier iteration has emptied the ring.
@@ -4434,9 +4440,8 @@ class PyExecutor:
                 if not can_queue and self._pp_ring_is_drained():
                     # No batch in flight can carry pending close-outs into
                     # its record.
-                    if self.enable_iter_perf_stats:
-                        self._process_close_out_iter_stats(
-                            iter_stats, iter_start_time)
+                    self._process_close_out_iter_stats(iter_stats,
+                                                       iter_start_time)
                     self.disagg.pace_idle()
 
                 # Stage 4: March forward in microbatch slots
@@ -4805,24 +4810,30 @@ class PyExecutor:
                     tag=tag,
                 )
 
-    def _progress_idle_pp_iteration(self, executed_batch_num: int) -> None:
+    def _progress_idle_pp_iteration(self, executed_batch_num: int,
+                                    can_queue: bool) -> None:
         """Advance what executed-batch handling drives, when no batch executed.
 
-        ``executed_batch_num`` is broadcast along the PP ring, so every rank
-        takes this path in the same iteration and the calls below stay
-        symmetric. Responses buffered outside a batch (first-token close-out,
-        transfer errors) are flushed instead of waiting for the next executed
-        batch, and deferred PP terminations progress so finished requests
-        release their blocks while nothing executes.
+        Both arguments agree on every rank: ``executed_batch_num`` is
+        broadcast along the PP ring and ``can_queue`` follows the propagated
+        schedule, so the calls below stay symmetric. With a batch queued, one
+        executes soon and drives them; otherwise responses buffered outside a
+        batch (first-token finishes, transfer errors) are flushed and deferred
+        PP terminations advance, so finished requests release their blocks
+        while nothing executes.
         """
         if executed_batch_num != 0:
             return
-        self._flush_pending_transfer_responses()
-        if self._pending_recompute_pause_ids:
+        if can_queue:
             self._progress_recompute_pause_termination_if_idle(
                 executed_batch_num)
-        elif self._disagg_pp_termination_handler is not None:
+            return
+        self._flush_pending_transfer_responses()
+        if self._disagg_pp_termination_handler is not None:
             self._disagg_pp_termination_handler.terminate_pending_requests()
+        elif self._pending_recompute_pause_ids:
+            raise RuntimeError(
+                "Deferred recompute pause requires a PP termination handler")
 
     def _progress_recompute_pause_termination_if_idle(
             self, executed_batch_num: int) -> None:
@@ -7032,7 +7043,7 @@ class PyExecutor:
                 elif gpu_forward_events_from_perf_pool:
                     self.perf_manager.release_forward_timing_events(
                         gpu_forward_start, gpu_forward_end)
-                if self.enable_iter_perf_stats and sample_state is None:
+                if sample_state is None:
                     self._process_close_out_iter_stats(iter_stats,
                                                        iter_start_time)
                 # Same lockstep guarantee for iter-stats; no-op when
@@ -8161,9 +8172,8 @@ class PyExecutor:
                     self.disagg.handle_timeouts_synced()
                 # A previous batch deferred on this rank records them instead,
                 # in iteration order.
-                if (self.enable_iter_perf_stats and not can_queue
-                        and (self.previous_batch is None
-                             or should_process_previous_batch)):
+                if not can_queue and (self.previous_batch is None
+                                      or should_process_previous_batch):
                     self._process_close_out_iter_stats(iter_stats,
                                                        iter_start_time)
                 self._flush_iter_stats_synced()
@@ -10637,37 +10647,33 @@ class PyExecutor:
             self, req: LlmRequest) -> Optional[FinishReason]:
         """The reason the context server's first token ends ``req``, if any.
 
-        Applies the checks of ``handle_stop_criteria`` in the same order to
-        the sequence the token produces, without appending it: END_ID, then
-        LENGTH (``max_new_tokens`` or ``max_seq_len``), then STOP_WORDS.
-
-        Every rank holding ``req`` must reach the same result. Under Helix
-        each CP rank holds only its slice of the prompt, so the sequence
-        length is taken from the full prompt and multi-token stop words,
-        which need the prompt's tail, are left to the decode steps.
+        Applies the sampler's stop criteria to the sequence the token
+        produces, without appending it. Every rank holding ``req`` must reach
+        the same result. Under Helix each CP rank holds only its slice of the
+        prompt: the ``max_seq_len`` limit is left to the decode steps, since
+        the KV cache managers disagree on whether it bounds the full sequence
+        or a rank's slice, and multi-token stop words are matched against the
+        prompt tail every rank keeps.
         """
         first_gen_tokens = req.context_phase_params.first_gen_tokens
         if not first_gen_tokens:
             return None
-        token = first_gen_tokens[0]
-        if token == req.py_end_id:
-            return FinishReason.END_ID
-        helix_sliced = self.dist.cp_size > 1
-        num_tokens = req.get_num_tokens(0) + 1
-        seq_len = req.total_input_len_cp + 1 if helix_sliced else num_tokens
-        max_seq_len = getattr(self.sampler, "max_seq_len",
-                              None) or self.max_seq_len
-        if meet_max_token_stop_criteria_at(req,
-                                           num_tokens - req.py_orig_prompt_len,
-                                           seq_len, max_seq_len):
-            return FinishReason.LENGTH
-        stop_words = req.py_stop_words_list
-        if stop_words and helix_sliced:
-            stop_words = [word for word in stop_words if len(word) == 1]
-        if stop_words and stop_words_match(
-                stop_words, token, lambda: list(req.get_tokens(0)) + [token]):
-            return FinishReason.STOP_WORDS
-        return None
+        helix = self.dist.mapping.has_cp_helix()
+        num_tokens = req.get_num_tokens(0)
+
+        def stop_word_history(count: int) -> List[int]:
+            if helix:
+                return req.py_helix_prompt_tail[-count:]
+            return req.get_tokens_range(0, max(0, num_tokens - count),
+                                        num_tokens)
+
+        return first_stop_reason(
+            req,
+            first_gen_tokens[0],
+            num_generated_tokens=num_tokens + 1 - req.py_orig_prompt_len,
+            num_tokens=num_tokens + 1,
+            max_seq_len=None if helix else self.sampler.max_seq_len,
+            stop_word_history=stop_word_history)
 
     def _close_out_gen_receives_at_first_token(self) -> None:
         """Finish received generation requests that their first token ends.
@@ -10687,13 +10693,15 @@ class PyExecutor:
         must decide the same way, or one would schedule a request another
         closed out.
         """
-        if self._kv_connector_moves_kv:
-            # The connector is handed a finished request's blocks only on
-            # the batch path (_save_kv_to_connector_async).
+        if self.kv_cache_transceiver is None or self._kv_connector_moves_kv:
+            # Without a transceiver no request receives KV. A connector that
+            # moves KV is handed a finished request's blocks only on the batch
+            # path (_save_kv_to_connector_async).
             return
         candidates = [
             req for req in self.active_requests
             if req.is_disagg_generation_transmission_complete
+            and not req.py_first_token_checked
         ]
         if not candidates:
             return
@@ -10711,7 +10719,10 @@ class PyExecutor:
                     or cancel_id in self.canceled_req_ids):
                 continue
             reason = self._first_gen_token_finish_reason(req)
-            if reason is not None:
+            if reason is None:
+                # The verdict holds while the request waits to be scheduled.
+                req.py_first_token_checked = True
+            else:
                 closing.append((req, reason))
         if not closing:
             return
@@ -10762,12 +10773,13 @@ class PyExecutor:
         first_token_timer = getattr(self, "_first_token_timer", None)
         if first_token_timer is not None:
             first_token_timer.observe(finished, time.monotonic())
-        if self.enable_iter_perf_stats:
+        if self._reports_completions:
             self._pending_num_completed_requests += len(finished)
             self._close_outs_pending_iter_stats = True
-            # Under attention DP only rank 0's requestStats are exported.
-            if self.enable_iter_req_stats and not (self.enable_attention_dp
-                                                   and self.dist.rank != 0):
+            # As for requests that finish in a batch, only an iteration that
+            # builds a record gives them a requestStats entry.
+            if (self.enable_iter_req_stats
+                    and self.iter_counter % self.iter_perf_stats_interval == 0):
                 self._pending_close_out_requests.extend(finished)
 
     def _create_first_token_terminal_response(self, req: LlmRequest,
