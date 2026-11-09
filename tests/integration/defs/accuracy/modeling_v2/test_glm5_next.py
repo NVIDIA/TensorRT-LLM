@@ -20,6 +20,13 @@ forward) and the MTP-fused target (one-model MTP-Eagle inside its forward). Each
 picks a configuration that routes to exactly one of them. Requiring
 modeling_v2 prevents an unsupported deployment from silently testing the
 built-in model.
+
+The ranks build the model in their own processes, so a test cannot read the
+built target back. Which target each configuration builds is pinned by the
+routing unit test (``test_glm5_next_routing.py``): TP4/EP4 with three-draft
+MTP-Eagle routes to the fused target (``tep4-mtp3``), and TP4/EP4 without
+speculation or with vanilla MTP to the split target (``no-spec``,
+``vanilla-mtp``).
 """
 
 from collections.abc import Iterator
