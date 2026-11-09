@@ -519,22 +519,30 @@ class BlockHashMixin:
         prepared = request.model_copy(deep=True)
         try:
             extension.apply_responses_extensions(prepared)
+            # Runs the history hook (prepare_responses_history) on the result.
+            conversation = responses_utils.chat_messages_from_responses_input(
+                prepared, [], extension
+            )
         except Exception as error:
-            # Any exception from the hook is the worker's 400 on this request;
+            # Any exception from the hooks is the worker's 400 on this request;
             # routing must not fail on it, so route on the request as sent with
             # the generic conversion, as the chat path routes a request its
-            # extension rejects on its text.
+            # extension rejects on its text. An error in the generic conversion
+            # itself is raised again by the call below.
             logger.debug(
                 f"Router could not preprocess the Responses request ({error}); "
                 "routing on the request as sent."
             )
             prepared, extension = request, ServingExtension()
+            conversation = responses_utils.chat_messages_from_responses_input(
+                prepared, [], extension
+            )
         tools = responses_utils._get_chat_completion_function_tools(prepared.tools)
         tool_dicts = [extension.serialize_tool(tool) for tool in tools]
         # As on the worker, developer messages render as system for a chat
         # template that has no developer role.
         messages = responses_utils._render_developer_as_system(
-            responses_utils.chat_messages_from_responses_input(prepared, [], extension),
+            conversation,
             self._get_tokenizer(request.model),
             None,
             tool_dicts,

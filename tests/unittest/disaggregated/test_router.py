@@ -3220,7 +3220,8 @@ def responses_extension_model():
 
     The request hook derives a chat-template kwarg from ``reasoning.effort``
     and rejects a temperature above 1; the history hook joins the segments of
-    a split tool result and appends a note.
+    a split tool result, appends a note, and rejects a conversation whose
+    system message is ``_REJECTED_BY_THE_HISTORY_HOOK``.
     """
     from tensorrt_llm.serve import serving_extensions
     from tensorrt_llm.serve.serving_extensions import (
@@ -3245,6 +3246,8 @@ def responses_extension_model():
                 request.chat_template_kwargs = {"probe": effort}
 
         def prepare_responses_history(self, messages):
+            if _message("system", _REJECTED_BY_THE_HISTORY_HOOK) in messages:
+                raise ValueError("the history hook rejects this conversation")
             prepared, seen = [], {}
             for message in messages:
                 call_id = message.get("tool_call_id")
@@ -3266,9 +3269,12 @@ def responses_extension_model():
         serving_extensions._BY_MODEL_TYPE.pop(model_type, None)
 
 
-def _responses_request_with_a_split_result(**fields):
+_REJECTED_BY_THE_HISTORY_HOOK = "Reject this conversation."
+
+
+def _responses_request_with_a_split_result(instructions="Be brief.", **fields):
     return ResponsesRequest(model="m",
-                            instructions="Be brief.",
+                            instructions=instructions,
                             input=[
                                 _message("user", "run it"),
                                 {
@@ -3344,22 +3350,30 @@ async def test_responses_routing_tokens_follow_the_workers_extension(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("rejection", [
+    dict(temperature=1.5),
+    dict(instructions=_REJECTED_BY_THE_HISTORY_HOOK),
+],
+                         ids=["request hook", "history hook"])
 async def test_responses_routing_falls_back_to_the_request_as_sent_when_rejected(
-        servers, responses_extension_model):
-    """A request the extension rejects is routed on the generic conversion; the worker answers it."""
+        servers, responses_extension_model, rejection):
+    """A request a Responses hook rejects is routed on the generic conversion; the worker answers it."""
     hf_tokenizer = _byte_level_probe_tokenizer()
     router = KvCacheAwareRouter(server_role=None,
                                 servers=servers,
                                 tokens_per_block=4,
                                 use_harmony=False)
     request = _responses_request_with_a_split_result(
-        reasoning={"effort": "high"}, temperature=1.5)
+        reasoning={"effort": "high"}, **rejection)
 
     with mock.patch.object(router, "_get_tokenizer", return_value=hf_tokenizer), \
             mock.patch.object(router, "_get_model_type",
                               return_value=responses_extension_model):
         router_ids = router._tokenize(request)
 
+    with pytest.raises(ValueError):
+        await _worker_prompt_ids(request.model_copy(deep=True), hf_tokenizer,
+                                 responses_extension_model)
     as_sent_ids = await _worker_prompt_ids(
         request, hf_tokenizer, "router-test-model-without-extension")
     assert router_ids == [as_sent_ids]
@@ -3392,6 +3406,7 @@ def test_responses_routing_falls_back_to_the_text_of_a_request_with_media(
                                        "https://example.com/cat.png"
                                    }]
                                }])
+    as_sent = request.model_dump()
 
     with mock.patch.object(router, "_get_tokenizer", return_value=hf_tokenizer), \
             mock.patch.object(router, "_get_model_type",
@@ -3400,6 +3415,8 @@ def test_responses_routing_falls_back_to_the_text_of_a_request_with_media(
                               wraps=router._length_chat_ids) as length_chat_ids:
         router_ids = router._tokenize(request)
 
+    # The worker receives the request with its image.
+    assert request.model_dump() == as_sent
     assert length_chat_ids.call_count == 1
     assert hf_tokenizer.decode(
         router_ids[0]) == "<|user|>describe this<|assistant|>"
