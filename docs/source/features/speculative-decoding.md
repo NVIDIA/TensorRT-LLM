@@ -296,7 +296,7 @@ Speculative decoding options must be specified via `--config config.yaml` for bo
 * `MTP`
 * `Eagle3`
 * `NGram` (deprecated; use `SA` instead)
-* `DraftTarget`
+* `Draft_Target`
 * `PARD`
 * `DFlash`
 * `SA`
