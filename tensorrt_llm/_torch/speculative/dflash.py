@@ -1670,9 +1670,10 @@ class DFlashWorker(SpecWorkerBase):
             )
         self._ctx_buf_inited = True
 
-        if not self._ctx_reuse_addressable and getattr(
+        joint_fallback = not self._ctx_reuse_addressable and getattr(
             draft_kv_cache_manager, "enable_joint_kv_cache_reuse", False
-        ):
+        )
+        if joint_fallback:
             # Every fallback above (shape mismatch, stride mismatch, pool layer
             # count) logs its own reason and then costs only memory -- except
             # this one, where the scheduler goes on matching prefixes the
@@ -1683,7 +1684,7 @@ class DFlashWorker(SpecWorkerBase):
                 "fell back to a private ctx arena, so a reused prefix's drafter K/V "
                 "stays unreachable and acceptance length drops as if unpaired."
             )
-        self._report_prefix_reuse(cache_manager)
+        self._report_prefix_reuse(cache_manager, joint_fallback)
 
         logger.info(
             f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
@@ -1692,24 +1693,33 @@ class DFlashWorker(SpecWorkerBase):
             f"reuse_addressable={self._ctx_reuse_addressable}"
         )
 
-    def _report_prefix_reuse(self, target_cache_manager: Optional[BaseResourceManager]) -> None:
-        """Report how this drafter's context is served on KV-cache prefix hits.
+    def _report_prefix_reuse(
+        self, target_cache_manager: Optional[BaseResourceManager], joint_fallback: bool
+    ) -> None:
+        """Report, once, how this drafter's context is served on KV-cache prefix hits.
 
         Unless the draft pool is paired with the target's block reuse, the
         target must recompute the prompt tail the drafter attends to
         (``context_recompute_tail``), or a cache hit drafts from only the
-        uncached tail of the prompt.
+        uncached tail of the prompt. ``joint_fallback``: the caller already
+        warned that a paired pool fell back to a private arena.
         """
         if self._ctx_reuse_addressable or not getattr(
             target_cache_manager, "enable_block_reuse", False
         ):
             return
-        tail = getattr(target_cache_manager, "_spec_recompute_tail", 0)
+        name = type(self).__name__
+        tail = getattr(target_cache_manager, "spec_recompute_tail", 0)
         if tail:
-            logger.info(
-                f"DFlash: prefix-cache hits recompute a {tail}-token prompt tail for the "
-                "drafter (context_recompute_tail; -1 = whole prompt)."
+            span = "the whole prompt" if tail < 0 else f"a {tail}-token prompt tail"
+            logger.info_once(
+                f"{name}: prefix-cache hits recompute {span} for the drafter "
+                "(context_recompute_tail), unless the KV cache manager disables it "
+                "with a warning on its first context batch.",
+                key="dflash_prefix_reuse_report",
             )
+            return
+        if joint_fallback:
             return
         # The target skips the reused prefix, so _store_prefill_context only
         # ever sees the uncached tail; nothing else reports the loss.
@@ -1724,11 +1734,12 @@ class DFlashWorker(SpecWorkerBase):
                 "context_recompute_tail is 0 (set it to the drafter's attention "
                 "window -- null resolves it -- or -1 to recompute on hits)"
             )
-        logger.warning(
-            "DFlash: KV-cache block reuse is on, but the drafter's context K/V are "
+        logger.warning_once(
+            f"{name}: KV-cache block reuse is on, but the drafter's context K/V are "
             f"not kept where a prefix-cache hit can hand them back, and {why}: a "
             "cache-hit request drafts from only the uncached tail of its prompt, so "
-            "acceptance drops on every hit."
+            "acceptance drops on every hit.",
+            key="dflash_prefix_reuse_report",
         )
 
     def _ctx_paged_index_args(self):
@@ -2613,8 +2624,7 @@ class DFlashWorker(SpecWorkerBase):
 
         The walk always chains through the greedy successor, so under sampling
         a draft token can differ from the predecessor the next position was
-        scored under. That costs acceptance rate, not correctness — same
-        trade-off as ``_apply_dspark_markov_bias``.
+        scored under. That costs acceptance rate, not correctness.
         """
         selector = draft_model.candidate_selector
         candidate_ids, unary_logits, block_logits = self._dflash2_global_top_k(

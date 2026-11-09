@@ -97,6 +97,7 @@ class FakeRequest:
         self.prepopulated_prompt_len = 0
         self.is_dummy = False
         self.is_generation_only_request = False
+        self.is_context_only_request = False
         self.is_disagg_generation_init_state = False
         self.py_num_connector_matched_tokens = 0
         self.py_connector_allocation_reported = False
@@ -457,8 +458,13 @@ class TestOfferIsClamped:
         assert connector.commits == [(0, 0, False)]
 
 
+@pytest.mark.cpu_only
 class TestSpecRecomputeTail:
-    """A query-and-commit offer leaves a hidden-state drafter its recompute tail."""
+    """A query-and-commit offer leaves a hidden-state drafter its recompute tail.
+
+    Defensive: startup rejects a KV connector with speculative decoding on the
+    V2 manager, so this covers the cap for when that guard is lifted.
+    """
 
     @pytest.mark.parametrize(
         "tail, committed, served_to",

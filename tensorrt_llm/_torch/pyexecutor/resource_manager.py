@@ -410,6 +410,12 @@ class KVCacheManager(BaseResourceManager):
     # state a second time. Only a full re-prefill (rewind target 0) is safe.
     _has_recurrent_state: bool = False
 
+    @property
+    def spec_recompute_tail(self) -> int:
+        """Prompt-tail tokens recomputed on a prefix hit for a hidden-state
+        drafter: 0 off, -1 the whole prompt."""
+        return self._spec_recompute_tail
+
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,

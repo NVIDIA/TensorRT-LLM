@@ -193,6 +193,12 @@ class PrefixWaitPlanner:
             return None
         shared = units * self._unit_tokens
         reusable = self._kv_cache_manager.probe_context_reuse(req) or 0
+        # Only the part of the prefix the request may claim counts: a spec
+        # recompute tail caps the claim (to 0 for a full re-prefill).
+        limit = self._kv_cache_manager.context_reuse_claim_limit(req)
+        if limit is not None:
+            shared = min(shared, limit)
+            reusable = min(reusable, limit)
         if shared - reusable < self._min_gain_tokens:
             return None
         if not self._kv_cache_manager.request_prefix_snapshot(owner, shared):

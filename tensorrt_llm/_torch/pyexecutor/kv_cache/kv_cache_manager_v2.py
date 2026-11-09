@@ -1857,6 +1857,12 @@ class KVCacheManagerV2(BaseResourceManager):
     _shared_draft_block_width: int = 0
 
     @property
+    def spec_recompute_tail(self) -> int:
+        """Prompt-tail tokens recomputed on a prefix hit for a hidden-state
+        drafter: 0 off, -1 the whole prompt."""
+        return self._spec_recompute_tail
+
+    @property
     def _kv_alloc_extra_tokens(self) -> int:
         """Tokens a request is allocated beyond its history for spec decoding.
 
@@ -5449,8 +5455,16 @@ class KVCacheManagerV2(BaseResourceManager):
         recompute needs (SWA life cycles onboard only the sink and live-window
         pages at the matched endpoint). The tail check runs first: partially
         constructed managers carry only the class-level zero tail.
+
+        A context-only (disaggregated) request is not capped unless the
+        drafter's layers share this manager: only then are its draft pages
+        transferred with the target's; otherwise the generation worker's
+        drafter starts from an empty context whatever the context server
+        recomputes.
         """
         if not self._spec_recompute_tail:
+            return None
+        if req.is_context_only_request and not self._shared_draft_block_width:
             return None
         return _spec_recompute_claim_limit(
             req,
@@ -6071,6 +6085,9 @@ class KVCacheManagerV2(BaseResourceManager):
         offered_end = min(local_end + num_tokens, req.prompt_len - 1)
         # A connector-served prefix starves a hidden-state drafter like local
         # reuse does: leave the spec recompute tail to the forward pass.
+        # Defensive today: startup rejects a KV connector with speculative
+        # decoding on this manager (py_executor.py), so a tail never meets a
+        # connector offer until that guard is lifted.
         limit = self.context_reuse_claim_limit(req)
         if limit is not None:
             offered_end = min(offered_end, max(limit, local_end))

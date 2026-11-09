@@ -23,7 +23,7 @@ import torch
 
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm.llmapi.llm_args import (
@@ -86,7 +86,10 @@ def real_manager(
         torch.cuda.empty_cache()
 
 
-def make_request(request_id: int) -> LlmRequest:
+def make_request(
+    request_id: int,
+    request_type: LlmRequestType = LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
+) -> LlmRequest:
     """A prompt sharing its first SHARED_PREFIX tokens with every other request."""
     shared = list(range(SHARED_PREFIX))
     tail = [10000 * request_id + i for i in range(PROMPT_LEN - SHARED_PREFIX)]
@@ -96,6 +99,7 @@ def make_request(request_id: int) -> LlmRequest:
         input_tokens=shared + tail,
         sampling_config=SamplingConfig(1),
         is_streaming=False,
+        llm_request_type=request_type,
     )
 
 
@@ -146,3 +150,15 @@ def test_a_dspark_tail_caps_the_reuse_claim(tail: int, second_start: int, paired
         )
         assert prefill(managers, scheduler, make_request(1)) == [0]
         assert prefill(managers, scheduler, make_request(2)) == [second_start]
+
+
+def test_a_context_only_request_is_capped_only_when_draft_pages_are_transferred() -> None:
+    """A separate draft pool's context stays on the context server, so the
+    generation worker's drafter starts empty and a recompute there buys
+    nothing; draft layers sharing the target's manager travel with its pages."""
+    with real_manager(-1) as manager:
+        assert manager.context_reuse_claim_limit(make_request(1)) == 0
+        context_only = make_request(2, LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+        assert manager.context_reuse_claim_limit(context_only) is None
+        manager._shared_draft_block_width = TOKENS_PER_BLOCK
+        assert manager.context_reuse_claim_limit(context_only) == 0

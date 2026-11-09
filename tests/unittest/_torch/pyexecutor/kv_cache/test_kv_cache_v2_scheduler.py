@@ -398,6 +398,7 @@ def make_ctx_request(
     req.lora_task_id = lora_task_id
     req.is_context_init_state = True
     req.is_generation_in_progress_state = False
+    req.is_context_only_request = False
     req.encoder_output_len = encoder_output_len
     req.py_encoder_output_ready_event = None
     req.py_skip_cross_kv_projection = False
@@ -1014,6 +1015,18 @@ class TestInflightPrefixWait:
         assert ids(sched.schedule_request([owner], set()).context_requests) == [0]
         self.run_chunk(owner)
         return owner
+
+    @pytest.mark.parametrize("tail", [-1, PROMPT_LEN - TOKENS_PER_BLOCK])
+    def test_request_does_not_wait_for_a_prefix_its_recompute_tail_cannot_claim(self, tail):
+        """The spec recompute tail caps the claim, so the request would gain
+        nothing by waiting for the owner's prefill."""
+        mgr = self.make_manager()
+        mgr._spec_recompute_tail = tail
+        sched = make_scheduler(mgr, max_num_tokens=100000)
+        owner = self._owner_in_flight(sched)
+        out = sched.schedule_request([owner, self.make_request(1)], {owner.request_id})
+        assert ids(out.context_requests) == [1]
+        mgr.request_prefix_snapshot.assert_not_called()
 
     def test_pass_where_every_request_waits_is_a_bounded_stall(self):
         """A pass in which every pending request waits for a prefilling owner
