@@ -397,6 +397,11 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "construct",
         ("next_qkv_prefetch",),
     ),
+    FastPath(
+        "prefill_cutedsl_experts",
+        "the NVFP4 experts of 4096..8192-row calls on the SM100-family CuTe DSL GEMMs (opt-in on sm103)",
+        "load",
+    ),
 )
 
 #: The name of every fast path.

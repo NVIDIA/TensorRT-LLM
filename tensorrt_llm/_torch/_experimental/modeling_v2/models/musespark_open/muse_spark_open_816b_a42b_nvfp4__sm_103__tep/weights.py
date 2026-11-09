@@ -79,6 +79,21 @@ def install_loaded_features(
 
         # After the owner-window install, whose expert and routing hooks it wraps.
         _hot_replicas.install(text_model, mapping)
+    if plan.enabled("prefill_cutedsl_experts"):
+        from .kernels.prefill_cutedsl_experts import install as _prefill_cutedsl
+
+        serves = compute_capability is not None and _prefill_cutedsl.serves(
+            compute_capability, mapping.tp_size
+        )
+        if serves:
+            # After the expert paths above, whose expert forwards it wraps for the large
+            # prefill calls only.
+            _prefill_cutedsl.install(text_model, mapping)
+        plan.installed(
+            "prefill_cutedsl_experts",
+            serves,
+            f"written for sm107 / sm103 at tp 4, not {compute_capability} at tp {mapping.tp_size}",
+        )
     if plan.enabled("early_expert_ids"):
         _install_early_expert_ids(text_model, mapping)
     if plan.enabled("pool_into_route"):

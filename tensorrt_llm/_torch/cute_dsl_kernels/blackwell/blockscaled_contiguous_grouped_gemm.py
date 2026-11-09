@@ -107,8 +107,15 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         raster_along_m: bool = False,
+        trtllm_gen_n_shuffle: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
+
+        ``trtllm_gen_n_shuffle`` (port of the SM107 FC2 kernel's mode of the same
+        name): B (and SFB) rows are in TRTLLM-gen's shuffle_matrix_a order
+        (epilogue_tile_m 128: within every 32 rows, stored row p is logical row
+        ``4 * (p % 8) + p // 8``); the epilogue writes C columns back in logical
+        order (register moves only).
 
         This configuration includes several key aspects:
 
@@ -129,6 +136,7 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
 
         self.sf_vec_size = sf_vec_size
         self.raster_along_m = raster_along_m
+        self.trtllm_gen_n_shuffle = trtllm_gen_n_shuffle
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -282,6 +290,10 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         )
 
         self.epi_tile_n = cute.size(self.epi_tile[1])
+        if self.trtllm_gen_n_shuffle:
+            assert self.epi_tile_n % 32 == 0, (
+                f"trtllm_gen_n_shuffle needs 32-column epilogue subtiles, got {self.epi_tile_n}"
+            )
 
         # Setup A/B/C/Scale stage count in shared memory and ACC stage count in tensor memory
         (
@@ -1649,7 +1661,10 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
                     #
                     # Apply alpha and convert to C type
                     #
-                    acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+                    if cutlass.const_expr(self.trtllm_gen_n_shuffle):
+                        acc_vec = tiled_copy_r2s.retile(self._trtllm_gen_n_unshuffle(tTR_rAcc)).load()
+                    else:
+                        acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                     acc_vec = epilogue_op((alpha_val * acc_vec).to(self.c_dtype))
                     tRS_rC.store(acc_vec)
                     #
@@ -1984,6 +1999,20 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
         ) // (occupancy * c_bytes_per_stage)
 
         return num_acc_stage, num_ab_stage, num_c_stage, num_tile_stage
+
+    @cute.jit
+    def _trtllm_gen_n_unshuffle(self, tAcc: cute.Tensor) -> cute.Tensor:
+        """One thread's accumulator columns back in logical order (trtllm_gen_n_shuffle).
+
+        Column q of every 32-column group takes accumulator column
+        ``8 * (q % 4) + q // 4``. Only register indices move.
+        """
+        tOut = cute.make_rmem_tensor(tAcc.shape, self.acc_dtype)
+        for q in cutlass.range_constexpr(cute.size(tAcc)):
+            base = q - q % 32
+            r = q % 32
+            tOut[q] = tAcc[base + 8 * (r % 4) + r // 4]
+        return tOut
 
     @staticmethod
     def _compute_grid(

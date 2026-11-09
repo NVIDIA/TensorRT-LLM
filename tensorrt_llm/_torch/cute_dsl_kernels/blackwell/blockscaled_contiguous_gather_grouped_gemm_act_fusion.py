@@ -290,6 +290,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_local_experts: int = 0,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        trtllm_gen_gated_layout: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and fused activation.
@@ -346,6 +347,22 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.topk = topk
         self.activation_type = validate_activation_type(activation_type)
         self.is_gated = is_gated_activation(self.activation_type)
+        # trtllm_gen_gated_layout (port of the SM107 kernel's mode of the same name):
+        # B (and SFB) rows are in TRTLLM-gen's gated FC1 layout (see
+        # _trtllm_gen_gated_split) instead of the granularity-64 [up, gate]
+        # interleave, alpha holds two values per group (the gate scale at [g],
+        # the output scale at [l + g]), and the SwiGLU + NVFP4 quantization use
+        # TRTLLM-gen's arithmetic (global_sf is not read). With the SM100-family
+        # 64-deep MMA the accumulators are TRTLLM-gen's, so the output codes and
+        # block scales are meant to equal TRTLLM-gen's gated-activation GEMM.
+        self.trtllm_gen_gated_layout = trtllm_gen_gated_layout
+        clamped = 0 <= swiglu_limit < float("inf")
+        if trtllm_gen_gated_layout and (
+            self.activation_type != ActivationType.Swiglu or clamped or use_expert_counts
+        ):
+            raise ValueError(
+                "trtllm_gen_gated_layout supports unclamped SwiGLU without expert counts only"
+            )
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -2436,7 +2453,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # Get alpha for current group
                 #
                 expert_idx = mma_tile_coord_mnl[2]
-                alpha_val = alpha_tuple[0][expert_idx]
+                if cutlass.const_expr(self.trtllm_gen_gated_layout):
+                    # gate scale; output scale (applied by the quantization)
+                    alpha_val = alpha_tuple[0][(expert_idx, 0)]
+                    scale_c_val = alpha_tuple[0][(expert_idx, 1)]
+                else:
+                    alpha_val = alpha_tuple[0][expert_idx]
 
                 #
                 # Slice to per mma tile index
@@ -2536,7 +2558,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     acc_vec_up = tTR_rAcc_up.load()
 
                     tCompute = cute.make_rmem_tensor(acc_vec_up.shape, self.acc_dtype)
-                    if cutlass.const_expr(self.activation_type == ActivationType.Swiglu):
+                    if cutlass.const_expr(self.trtllm_gen_gated_layout):
+                        tUp, tGate = self._trtllm_gen_gated_split(tTR_rAcc_up, tTR_rAcc_gate)
+                        self._apply_trtllm_gen_swiglu_epilogue(
+                            tUp.load(), tGate.load(), alpha_val, tCompute
+                        )
+                    elif cutlass.const_expr(self.activation_type == ActivationType.Swiglu):
                         acc_vec_gate = tTR_rAcc_gate.load()
                         self._apply_swiglu_epilogue(acc_vec_up, acc_vec_gate, alpha_val, tCompute)
                     elif cutlass.const_expr(self.activation_type == ActivationType.SiTu):
@@ -2580,7 +2607,31 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         abs_acc_frg_ir = math.absf(acc_frg.ir_value())
                         abs_acc_frg = type(acc_frg)(abs_acc_frg_ir, acc_frg.shape, acc_frg.dtype)
 
-                        if cutlass.const_expr(self.vectorized_f32):
+                        if cutlass.const_expr(self.trtllm_gen_gated_layout):
+                            # TRTLLM-gen: SF = e4m3((amax * scale_c) * (1/6))
+                            for vi in cutlass.range_constexpr(abs_acc_frg.shape[1]):
+                                tCrSFC_pvscale[vi] = abs_acc_frg[None, vi].reduce(
+                                    cute.ReductionOp.MAX,
+                                    cutlass.Float32(0.0),
+                                    0,  # Use 0.0 as init for abs values
+                                )
+                            for vi in cutlass.range_constexpr(0, abs_acc_frg.shape[1], 2):
+                                tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1] = (
+                                    cute.arch.mul_packed_f32x2(
+                                        (tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1]),
+                                        (scale_c_val, scale_c_val),
+                                    )
+                                )
+                                tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1] = (
+                                    cute.arch.mul_packed_f32x2(
+                                        (tCrSFC_pvscale[vi], tCrSFC_pvscale[vi + 1]),
+                                        (
+                                            self.get_dtype_rcp_limits(self.c_dtype),
+                                            self.get_dtype_rcp_limits(self.c_dtype),
+                                        ),
+                                    )
+                                )
+                        elif cutlass.const_expr(self.vectorized_f32):
                             for vi in cutlass.range_constexpr(abs_acc_frg.shape[1]):
                                 tCrSFC_pvscale[vi] = abs_acc_frg[None, vi].reduce(
                                     cute.ReductionOp.MAX,
@@ -2631,7 +2682,31 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         # TODO: need to add f8x2 -> f32x2 conversion
                         tCrSFC_qpvscale_up = tCrSFC.load().to(cutlass.Float32)
                         fp32_max = cutlass.Float32(3.40282346638528859812e38)
-                        if cutlass.const_expr(self.vectorized_f32):
+                        if cutlass.const_expr(self.trtllm_gen_gated_layout):
+                            # TRTLLM-gen: q = (x * rcp(SF)) * scale_c
+                            for vi in cutlass.range_constexpr(0, cute.size(tCrSFC), 2):
+                                acc_scale_min0 = fmin(
+                                    cute.arch.rcp_approx(tCrSFC_qpvscale_up[vi]),
+                                    fp32_max,
+                                    nan=True,
+                                )
+                                acc_scale_min1 = fmin(
+                                    cute.arch.rcp_approx(tCrSFC_qpvscale_up[vi + 1]),
+                                    fp32_max,
+                                    nan=True,
+                                )
+                                vec0 = tTR_rAcc_frg[None, vi]
+                                vec1 = tTR_rAcc_frg[None, vi + 1]
+                                for ei in cutlass.range_constexpr(self.sf_vec_size):
+                                    vec0[ei], vec1[ei] = cute.arch.mul_packed_f32x2(
+                                        (vec0[ei], vec1[ei]),
+                                        (acc_scale_min0, acc_scale_min1),
+                                    )
+                                    vec0[ei], vec1[ei] = cute.arch.mul_packed_f32x2(
+                                        (vec0[ei], vec1[ei]),
+                                        (scale_c_val, scale_c_val),
+                                    )
+                        elif cutlass.const_expr(self.vectorized_f32):
                             for vi in cutlass.range_constexpr(0, cute.size(tCrSFC), 2):
                                 acc_scale = cute.arch.mul_packed_f32x2(
                                     (
@@ -2757,6 +2832,69 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     #   4. If the new activation is gated, also handle the two-subtile TMEM
     #      load path in ``__call__`` (mirror the existing Swiglu branch).
     # ------------------------------------------------------------------
+
+    @cute.jit
+    def _trtllm_gen_gated_split(self, tAccLo: cute.Tensor, tAccHi: cute.Tensor):
+        """Gather up / gate for 64 output columns from TRTLLM-gen gated FC1 accumulators.
+
+        Same as the SM107 kernel's: ``tAccLo`` / ``tAccHi`` are one thread's two
+        consecutive 64-column accumulator subtiles. Every 32-row block of B
+        covers 16 intermediate columns: rows 0-7 up of the even columns, 8-15
+        gate of the even columns, 16-23 up of the odd columns, 24-31 gate of
+        the odd columns. Output column ``j`` (``r = j % 32 = 16 g + 2 kk + o``)
+        takes up from column ``32 g + 16 o + kk`` of subtile ``j // 32`` and
+        gate from 8 columns later. Only register indices move.
+        """
+        tUp = cute.make_rmem_tensor(tAccLo.shape, self.acc_dtype)
+        tGate = cute.make_rmem_tensor(tAccLo.shape, self.acc_dtype)
+        for j in cutlass.range_constexpr(64):
+            r = j % 32
+            g = r // 16
+            o = r % 2
+            kk = (r % 16) // 2
+            src_up = 32 * g + 16 * o + kk
+            src = tAccLo if j < 32 else tAccHi
+            tUp[j] = src[src_up]
+            tGate[j] = src[src_up + 8]
+        return tUp, tGate
+
+    @cute.jit
+    def _apply_trtllm_gen_swiglu_epilogue(
+        self,
+        acc_vec_up: cute.Tensor,
+        acc_vec_gate: cute.Tensor,
+        scale_gate,
+        tCompute: cute.Tensor,
+    ):
+        """SwiGLU in TRTLLM-gen's gated-activation GEMM arithmetic (fp32, in this order)::
+
+            k = log2(e) * scale_gate
+            s = rcp(1 + exp2(-(gate[i] * k)))
+            tCompute[i] = (up[i] * scale_gate) * (gate[i] * s)
+        """
+        k = cutlass.Float32(1.4426950408889634) * cutlass.Float32(scale_gate)
+        for i in cutlass.range_constexpr(0, cute.size(acc_vec_up.shape), 2):
+            arg = cute.arch.mul_packed_f32x2(
+                (acc_vec_gate[i], acc_vec_gate[i + 1]),
+                (k, k),
+            )
+            arg = cute.arch.mul_packed_f32x2(arg, (-1.0, -1.0))
+            den = cute.arch.add_packed_f32x2(
+                (
+                    cute.math.exp2(arg[0], fastmath=True),
+                    cute.math.exp2(arg[1], fastmath=True),
+                ),
+                (1.0, 1.0),
+            )
+            act = cute.arch.mul_packed_f32x2(
+                (acc_vec_gate[i], acc_vec_gate[i + 1]),
+                (cute.arch.rcp_approx(den[0]), cute.arch.rcp_approx(den[1])),
+            )
+            lin = cute.arch.mul_packed_f32x2(
+                (acc_vec_up[i], acc_vec_up[i + 1]),
+                (cutlass.Float32(scale_gate), cutlass.Float32(scale_gate)),
+            )
+            tCompute[i], tCompute[i + 1] = cute.arch.mul_packed_f32x2(lin, act)
 
     @cute.jit
     def _apply_swiglu_epilogue(
@@ -3629,7 +3767,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 order=(2, 1, 4, 0, 3, 5),
             ),
         )
-        alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
+        if cutlass.const_expr(self.trtllm_gen_gated_layout):
+            alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l, 2), stride=(1, l)))
+        else:
+            alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
         b = cute.make_tensor(b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2)))
         b_sf = cute.make_tensor(
             b_sf_ptr,

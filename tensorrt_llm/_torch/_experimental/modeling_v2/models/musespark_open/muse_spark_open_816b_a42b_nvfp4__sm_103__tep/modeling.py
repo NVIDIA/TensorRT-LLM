@@ -993,7 +993,8 @@ TARGET_PATHS = {
         served=_TEP8_PATHS | _PREFETCH_LEVERS, topology=_dispatch.TWO_TRAYS_OF_4
     ),
     (103, 4): _dispatch.TargetPaths(
-        served=_SM103_TEP4_PATHS,
+        # prefill_cutedsl_experts: opt-in here (levers.py rule), the SM100-family port.
+        served=_SM103_TEP4_PATHS | frozenset({"prefill_cutedsl_experts"}),
         topology=_dispatch.ONE_TRAY_OF_4,
         preconditions=(_dispatch.NO_PREFILL_SEQUENCE_PARALLEL,),
     ),

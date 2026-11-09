@@ -409,6 +409,15 @@ TEP4_PATHS = (
 )
 
 
+def _never(why_off: str) -> RuleFn:
+    """Served but opt-in: off under ``auto`` unless its knob is ``on``."""
+
+    def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+        return False, why_off
+
+    return rule
+
+
 def _tep4_path_rule() -> Rule:
     return Rule(
         "upstream",
@@ -458,6 +467,12 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
                 Param("MAX_BATCH", LL_MAX_BATCH, 1, 64),
                 Param("MIN_ROWS", 16, 8, 16),
             ),
+        ),
+        # Opt-in on sm103: the SM100-family CuTe DSL port of the sm107 lever.
+        "prefill_cutedsl_experts": Rule(
+            "HC",
+            Kind.COMPOSITION,
+            _never("opt-in on sm103 (SM100-family CuTe DSL port, ctx5-moe): knob on"),
         ),
         **{name: _tep4_path_rule() for name in TEP4_PATHS},
     }

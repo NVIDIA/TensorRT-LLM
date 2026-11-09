@@ -2807,8 +2807,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      local_expert_offset: int,
                      tile_size: int,
                      output_dtype: torch.dtype,
-                     scaling_vector_size: int = 16):
+                     scaling_vector_size: int = 16,
+                     trtllm_gen_n_shuffle: bool = False):
             super().__init__()
+            # trtllm_gen_n_shuffle: B / SFB are TRTLLM-gen's FC2 tensors (rows in
+            # shuffle_matrix_a order); C columns are written in logical order.
+            self.trtllm_gen_n_shuffle = trtllm_gen_n_shuffle
             self.num_experts = num_experts
             self.top_k = top_k
             self.num_local_experts = num_local_experts
@@ -2838,6 +2842,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.tile_size,
                 self.output_dtype,
                 self.scaling_vector_size,
+                self.trtllm_gen_n_shuffle,
             )
 
         def get_valid_tactics(
@@ -2981,12 +2986,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
-                         cluster_shape_mn)
+                         cluster_shape_mn, self.trtllm_gen_n_shuffle)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
+                    trtllm_gen_n_shuffle=self.trtllm_gen_n_shuffle,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -3961,8 +3967,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      swiglu_limit_scalar: float = float("inf"),
                      use_expert_counts: bool = False,
                      situ_beta: Optional[float] = None,
-                     situ_linear_beta: Optional[float] = None):
+                     situ_linear_beta: Optional[float] = None,
+                     trtllm_gen_gated_layout: bool = False):
             """Initialize the runner.
+
+            ``trtllm_gen_gated_layout``: the weights are TRTLLM-gen's gated FC1
+            tensors, alpha is [gate scales | output scales] (2 * L values) and
+            the epilogue follows TRTLLM-gen's arithmetic (global_sf unread).
 
             Args:
                 activation_type: ``ActivationType`` for the fused epilogue.
@@ -3974,6 +3985,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 situ_linear_beta: Linear-side SiTU soft-cap, same rule.
             """
             super().__init__()
+            self.trtllm_gen_gated_layout = trtllm_gen_gated_layout
             self.activation_type = validate_activation_type(activation_type)
             self.is_gated = is_gated_activation(self.activation_type)
             self.situ_beta = situ_beta
@@ -4025,6 +4037,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.use_expert_counts,
                 self.situ_beta,
                 self.situ_linear_beta,
+                self.trtllm_gen_gated_layout,
             )
 
         def get_valid_tactics(
@@ -4290,7 +4303,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          mma_tiler_mn, cluster_shape_mn, raster_along_m,
                          self.activation_type, self.swiglu_limit_scalar,
                          self.use_expert_counts, self.num_local_experts,
-                         self.situ_beta, self.situ_linear_beta)
+                         self.situ_beta, self.situ_linear_beta,
+                         self.trtllm_gen_gated_layout)
 
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
@@ -4306,6 +4320,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     num_local_experts=self.num_local_experts,
                     situ_beta=self.situ_beta,
                     situ_linear_beta=self.situ_linear_beta,
+                    trtllm_gen_gated_layout=self.trtllm_gen_gated_layout,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
