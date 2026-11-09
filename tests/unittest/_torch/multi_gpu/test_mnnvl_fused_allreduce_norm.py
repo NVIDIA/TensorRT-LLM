@@ -18,7 +18,6 @@ without the in-kernel MoE finalize), the FP8 output, the FP8 GEMM + all-reduce +
 two-shot), and the TP2 large-message all-reduce + norm (Tp2AllReduceNorm)."""
 
 import operator
-import os
 import pickle
 import sys
 import traceback
@@ -119,7 +118,6 @@ def _library_arithmetic(m, tp, hidden=H):
 def _mnnvl(tp, hidden=H, max_num_tokens=max(ROWS)):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
-    os.environ["TLLM_TEST_MNNVL"] = "1"
     MPI.COMM_WORLD.barrier()
     mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
     ar = MNNVLAllReduce(mapping, torch.bfloat16, max_num_tokens=max_num_tokens, hidden_size=hidden)
@@ -135,8 +133,6 @@ def _worker(fn, tp):
     except Exception:
         traceback.print_exc()
         raise
-    finally:
-        os.environ.pop("TLLM_TEST_MNNVL", None)
     return True
 
 

@@ -23,7 +23,6 @@ matching a NCCL reference.
 """
 
 import os
-import platform
 from typing import Optional
 
 import pytest
@@ -99,32 +98,24 @@ class MnnvlAllReduceWorker:
     def mnnvl_supported(self) -> bool:
         """Whether the hardware can do MNNVL at all.
 
-        Only the hardware capability, not is_mnnvl(): off aarch64 the test bypasses that policy
-        gate below, so skipping has to key off what the machine can actually do.
+        Skip collectively on unsupported hardware; the test exercises normal dispatch
+        with the same capability checks as normal execution.
         """
         from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 
         MnnvlMemory.initialize()
         return MnnvlMemory.supports_mnnvl()
 
-    def run(self, fusion: bool) -> bool:
+    def run(self, fusion: bool, strategy: AllReduceStrategy) -> bool:
         from tensorrt_llm._torch.distributed import AllReduce, AllReduceParams
 
-        # is_mnnvl() only opts in on aarch64 and, for AUTO, only when the group spans nodes.
-        # On aarch64 the explicit MNNVL strategy below is enough to get past it on a single
-        # node, so leave the policy gate up and let this test cover that path for real.
-        # Elsewhere the aarch64 check alone would reject the request, so fall back to the same
-        # bypass the MPI test uses to reach the code under test. Which allocator runs still
-        # follows the machine either way: an IMEX-provisioned NVL domain exchanges fabric
-        # handles, anything else falls back to POSIX file descriptors over an IPC socket.
-        if "aarch64" not in platform.machine().lower():
-            os.environ["TLLM_TEST_MNNVL"] = "1"
+        # AUTO and explicit MNNVL both qualify node-local TP on any host architecture.
+        # Exercise the normal capability checks and native collective preflight.
         torch.distributed.barrier()
 
-        allreduce = AllReduce(mapping=self.mapping, strategy=AllReduceStrategy.MNNVL, dtype=DTYPE)
+        allreduce = AllReduce(mapping=self.mapping, strategy=strategy, dtype=DTYPE)
         assert allreduce.mnnvl_allreduce is not None, (
-            "MNNVL AllReduce was requested but is not enabled; on aarch64 this means is_mnnvl() "
-            "turned down an explicit MNNVL request on a single-node group"
+            f"MNNVL AllReduce was not enabled for {strategy} on qualified hardware"
         )
 
         # The point of the Ray path: the workspace is built from the TP ProcessGroup, never from
@@ -202,11 +193,12 @@ def _spawn_workers(world_size: int):
 @pytest.mark.gpu2
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize("fusion", [True, False], ids=["fusion", "no_fusion"])
-def test_mnnvl_allreduce_over_process_group(setup_ray_cluster, fusion):
+@pytest.mark.parametrize("strategy", [AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL])
+def test_mnnvl_allreduce_over_process_group(setup_ray_cluster, fusion, strategy):
     world_size = 2
     workers = _spawn_workers(world_size)
 
     if not all(ray.get([w.mnnvl_supported.remote() for w in workers])):
         pytest.skip("MNNVL is not supported on this machine")
 
-    assert all(ray.get([w.run.remote(fusion) for w in workers]))
+    assert all(ray.get([w.run.remote(fusion, strategy) for w in workers]))

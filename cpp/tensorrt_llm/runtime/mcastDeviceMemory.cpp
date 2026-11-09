@@ -337,6 +337,8 @@ McastDeviceMemory::~McastDeviceMemory() noexcept
     int previousDevice{-1};
     bool const restoreDevice = cudaGetDevice(&previousDevice) == cudaSuccess;
     cleanupNoThrow("device selection", [this]() { TLLM_CUDA_CHECK_FREE_RESOURCE(cudaSetDevice(mDeviceIdx)); });
+    // Tensor views can be used on multiple streams, so fencing only the allocation stream is insufficient.
+    // The last owner must be released outside CUDA graph capture, after all captured uses have retired.
     cleanupNoThrow("device synchronization", []() { TLLM_CUDA_CHECK_FREE_RESOURCE(cudaDeviceSynchronize()); });
     if (mIsMNNvlink)
     {
@@ -768,6 +770,16 @@ void McastDeviceMemory::allocNvlsMcastMem(size_t bufSize)
     // under MPI and non-MPI (Ray) orchestrators alike.
     mNvlsHandle = tensorrt_llm::runtime::ipcNvlsAllocate(bufSize, ranks, mGroupComm);
     TLLM_CHECK_WITH_INFO(mNvlsHandle != nullptr, "[McastDeviceMemory] ipcNvlsAllocate returned a null handle.");
+    uint64_t const allocationSize = mNvlsHandle->size;
+    std::vector<uint64_t> allocationSizes(mGroupSize);
+    mGroupComm->allgather(&allocationSize, allocationSizes.data(), sizeof(allocationSize));
+    TLLM_CHECK_WITH_INFO(
+        std::all_of(allocationSizes.begin(), allocationSizes.end(),
+            [allocationSize, bufSize](uint64_t size) { return size == allocationSize && size >= bufSize; }),
+        "[McastDeviceMemory] Ranks received inconsistent or insufficient NVLS allocation sizes.");
+    // Expose allocation slack as workspace capacity, keeping the signal pad after the usable region on every rank.
+    mBufSize = allocationSize - kSIGNAL_PAD_SIZE;
+    mSignalPadOffset = mBufSize;
     mMcHandle = mNvlsHandle->mc_handle;
     mMcPtr = mNvlsHandle->mc_va;
     mUcPtrs = mNvlsHandle->ipc_uc_vas;

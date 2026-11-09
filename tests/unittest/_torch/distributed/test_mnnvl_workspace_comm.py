@@ -22,6 +22,8 @@ to make the MNNVL workspace allocation fail and fall back to NCCL.
 """
 
 import importlib
+import platform
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -82,6 +84,12 @@ class _FakeMapping:
         self.local_rank = 3
         self.tp_group_pg = tp_group_pg
         self.multi_node = False
+        self.rank = 1
+        self.tp_group = [0, 1, 2, 3]
+        self.enable_attention_dp = False
+
+    def get_node_rank(self, rank):
+        return rank // 2 if self.multi_node else 0
 
     def has_cp(self):
         return False
@@ -248,17 +256,15 @@ def mnnvl_capable_hardware(monkeypatch):
     """Make every hardware-level precondition of is_mnnvl() pass."""
     import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl_utils
 
-    monkeypatch.setattr(ops.platform, "machine", lambda: "aarch64")
     monkeypatch.setattr(mnnvl_utils.MnnvlMemory, "supports_mnnvl", staticmethod(lambda: True))
-    monkeypatch.delenv("TLLM_TEST_MNNVL", raising=False)
 
 
-def test_auto_does_not_pick_mnnvl_on_a_single_node(mnnvl_capable_hardware):
+def test_auto_picks_mnnvl_on_a_single_node(mnnvl_capable_hardware):
     import torch
 
     mapping = _FakeMapping()
     mapping.multi_node = False
-    assert not ops.MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16)
+    assert ops.MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16)
 
 
 def test_explicit_request_enables_mnnvl_on_a_single_node(mnnvl_capable_hardware):
@@ -278,7 +284,7 @@ def test_auto_picks_mnnvl_across_nodes(mnnvl_capable_hardware):
 
 
 def test_explicit_request_still_respects_hardware(mnnvl_capable_hardware, monkeypatch):
-    """An explicit request relaxes the single-node heuristic, not the dtype check."""
+    """AUTO and explicit MNNVL both require a supported dtype."""
     import torch
 
     mapping = _FakeMapping()
@@ -355,6 +361,8 @@ def test_minimax_workspace_constructors_use_tp_process_group(
 
 @pytest.mark.parametrize("use_ray", [False, True])
 def test_qualified_workspace_receives_correct_communicator(monkeypatch, use_ray):
+    monkeypatch.setattr(ops, "_mnnvl_hardware_supported", lambda: True)
+    monkeypatch.setattr(ops, "_mnnvl_workspace_all_succeeded", lambda comm, success: success)
     monkeypatch.setattr(ops, "mpi_disabled", lambda: use_ray)
     monkeypatch.setattr(ops, "torch_pybind11_abi", lambda: "abi")
     monkeypatch.setattr(ops.torch.cuda, "current_device", lambda: 0)
@@ -382,15 +390,13 @@ def test_qualified_workspace_receives_correct_communicator(monkeypatch, use_ray)
 
 
 @pytest.mark.parametrize("use_ray", [False, True])
-def test_dispatch_plan_supports_both_orchestrators(monkeypatch, use_ray):
+def test_dispatch_plan_supports_both_orchestrators(monkeypatch, use_ray, mnnvl_capable_hardware):
     import torch
 
     from tensorrt_llm._torch import device_mesh
     from tensorrt_llm.mapping import DeviceMeshTopology, Mapping, MpiTopology
 
     monkeypatch.setenv("TLLM_DISABLE_MPI", "1" if use_ray else "0")
-    monkeypatch.delenv("TRTLLM_FORCE_MNNVL_AR_FABRIC", raising=False)
-    monkeypatch.delenv("TRTLLM_FORCE_MNNVL_AR", raising=False)
 
     if use_ray:
 
@@ -422,3 +428,211 @@ def test_dispatch_plan_supports_both_orchestrators(monkeypatch, use_ray):
     plan = ops._get_mnnvl_dispatch_plan(mapping, torch.bfloat16)
     assert plan.is_supported
     assert plan.transport == ops.MnnvlTransport.POSIX_FD
+
+
+@pytest.mark.parametrize("arch", ["aarch64", "x86_64"])
+def test_single_node_auto_constructs_mnnvl(monkeypatch, mnnvl_capable_hardware, arch):
+    from tensorrt_llm.mapping import Mapping
+
+    monkeypatch.setattr(platform, "machine", lambda: arch)
+    monkeypatch.setattr(ops, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(ops.torch.ops.trtllm, "allreduce", Mock(), raising=False)
+    monkeypatch.setattr(ops, "get_model_extra_attrs", lambda: {})
+    monkeypatch.setattr(ops, "get_allreduce_workspace", lambda mapping: None)
+    construct = Mock(return_value=torch.nn.Identity())
+    monkeypatch.setattr(ops, "MNNVLAllReduce", construct)
+    module = ops.AllReduce(
+        Mapping(world_size=2, tp_size=2, rank=0),
+        strategy=ops.AllReduceStrategy.AUTO,
+        dtype=torch.bfloat16,
+    )
+    assert module.mnnvl_allreduce is construct.return_value
+    construct.assert_called_once()
+    expected = ops.MnnvlTransport.POSIX_FD
+    assert construct.call_args.kwargs["dispatch_plan"].transport == expected
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("arch", ["aarch64", "x86_64"])
+@pytest.mark.parametrize("cross_node", [False, True])
+def test_dispatch_and_eligibility_share_policy(
+    monkeypatch, mnnvl_capable_hardware, explicit, arch, cross_node
+):
+    mapping = _FakeMapping()
+    mapping.multi_node = cross_node
+    monkeypatch.setattr(platform, "machine", lambda: arch)
+    assert ops._get_mnnvl_dispatch_plan(mapping, torch.bfloat16).is_supported
+    assert ops.MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16, explicitly_requested=explicit)
+
+
+def test_eligibility_requires_hardware_and_structural_checks(monkeypatch):
+    mapping = _FakeMapping()
+    monkeypatch.setattr(ops.MnnvlMemory, "supports_mnnvl", lambda: False)
+    assert not ops.MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16)
+    monkeypatch.setattr(ops.MnnvlMemory, "supports_mnnvl", lambda: True)
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
+    assert ops._get_mnnvl_dispatch_plan(mapping, torch.bfloat16).is_supported
+    assert ops.MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16)
+    assert not ops.MNNVLAllReduce.is_mnnvl(mapping, torch.int8)
+    mapping.has_cp = lambda: True
+    assert not ops._get_mnnvl_dispatch_plan(mapping, torch.bfloat16).is_supported
+
+
+def test_attention_dp_does_not_disable_tp_allreduce(mnnvl_capable_hardware):
+    mapping = _FakeMapping()
+    mapping.multi_node = True
+    mapping.enable_attention_dp = True
+    assert ops._get_mnnvl_dispatch_plan(mapping, torch.bfloat16).is_supported
+    assert ops.MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16)
+
+
+def test_local_hardware_failure_rejects_eligibility(mnnvl_capable_hardware, monkeypatch):
+    mapping = _FakeMapping()
+    mapping.multi_node = True
+    monkeypatch.setattr(ops.MnnvlMemory, "supports_mnnvl", lambda: False)
+    assert not ops.MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16)
+
+
+@pytest.mark.parametrize("local_supported", [False, True, RuntimeError("NVML failure")])
+def test_hardware_failure_is_agreed_before_native_construction(monkeypatch, local_supported):
+    probe = (
+        Mock(side_effect=local_supported)
+        if isinstance(local_supported, Exception)
+        else Mock(return_value=local_supported)
+    )
+    monkeypatch.setattr(ops, "_mnnvl_hardware_supported", probe)
+    vote = Mock(return_value=False)
+    monkeypatch.setattr(ops, "_mnnvl_workspace_all_succeeded", vote)
+    construct = Mock()
+    monkeypatch.setattr(ops, "MnnvlWorkspace", construct)
+    comm = object()
+    with pytest.raises(ops._MnnvlUnavailableError, match="hardware qualification"):
+        ops._make_mnnvl_workspace(comm, 4096, _FakeMapping(), ops.MnnvlTransport.FABRIC)
+    vote.assert_called_once_with(comm, local_supported is True)
+    construct.assert_not_called()
+
+
+@pytest.mark.parametrize("cross_node_tp", [False, True])
+def test_transport_uses_tp_placement(mnnvl_capable_hardware, cross_node_tp):
+    mapping = _FakeMapping()
+    mapping.multi_node = cross_node_tp
+    # The world can span nodes even when this TP group is entirely node-local.
+    mapping.is_multi_node = lambda: True
+    expected = cross_node_tp
+    assert ops.use_mnnvl_fabric_handle(mapping) == expected
+    plan = ops._get_mnnvl_dispatch_plan(mapping, torch.bfloat16)
+    assert plan.transport == (
+        ops.MnnvlTransport.FABRIC if expected else ops.MnnvlTransport.POSIX_FD
+    )
+    assert ops._get_mnnvl_dispatch_plan(mapping, torch.bfloat16).is_supported
+
+
+@pytest.mark.parametrize(
+    "explicit,cross_node,attention_dp",
+    [(True, False, False), (False, True, False), (False, True, True)],
+)
+def test_allreduce_constructs_mnnvl_for_supported_policy(
+    monkeypatch, mnnvl_capable_hardware, explicit, cross_node, attention_dp
+):
+    mapping = _FakeMapping()
+    mapping.multi_node = cross_node
+    mapping.enable_attention_dp = attention_dp
+    monkeypatch.setattr(ops, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(ops.torch.ops.trtllm, "allreduce", Mock(), raising=False)
+    monkeypatch.setattr(ops, "get_model_extra_attrs", lambda: {})
+    monkeypatch.setattr(ops, "get_allreduce_workspace", lambda mapping: None)
+    construct = Mock(return_value=torch.nn.Identity())
+    monkeypatch.setattr(ops, "MNNVLAllReduce", construct)
+    strategy = ops.AllReduceStrategy.MNNVL if explicit else ops.AllReduceStrategy.AUTO
+    module = ops.AllReduce(mapping, strategy=strategy, dtype=torch.bfloat16)
+    assert module.mnnvl_allreduce is construct.return_value
+    construct.assert_called_once()
+    assert construct.call_args.kwargs["dispatch_plan"].is_supported
+
+
+@pytest.mark.parametrize("kind", ["draft_exchange", "k3_spec_accept", "k3_markov"])
+@pytest.mark.parametrize("cross_node_tp", [False, True])
+def test_experimental_workspaces_share_transport_policy(monkeypatch, kind, cross_node_tp):
+    prefix = "tensorrt_llm._torch._experimental.modeling_v2.models."
+    if kind == "draft_exchange":
+        module = importlib.import_module(
+            prefix + "glm_moe_dsa.glm_5_2_nvfp4__sm_107__tp16.ops.spec._draft_exchange"
+        )
+    else:
+        module = importlib.import_module(prefix + f"kimi_k3_vl.kernels.{kind}.op")
+    mapping = _FakeMapping()
+    mapping.multi_node = cross_node_tp
+    # A multi-node world can contain node-local TP groups.
+    mapping.is_multi_node = lambda: True
+    comm = object()
+    if kind == "draft_exchange":
+        monkeypatch.setattr(module, "_get_mnnvl_workspace_comm", lambda mapping: comm)
+        monkeypatch.setattr(module, "_mnnvl_device_index", lambda mapping: 0)
+        construct = Mock(return_value=None)
+        monkeypatch.setattr(module.DraftExchangeWorkspace, "__init__", construct)
+        module.DraftExchangeWorkspace.for_mapping(mapping, 4096)
+        assert construct.call_args.args[4] == cross_node_tp
+        assert construct.call_args.args[5] is comm
+    else:
+        monkeypatch.setattr(module, "_workspaces", {})
+        kernel = SimpleNamespace(
+            MAX_SLOTS=64,
+            BUFFERS=3,
+            BUF_WORDS=16,
+            FLAG_WORDS=4,
+            MAX_BATCH=8,
+            EMPTY_WORD=-1,
+            buffer_words=lambda *args: 16,
+        )
+        monkeypatch.setattr(module, "_kernel_module", lambda: kernel)
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+        monkeypatch.setattr(ops, "_get_mnnvl_workspace_comm", lambda mapping: comm)
+        monkeypatch.setattr(ops, "_mnnvl_workspace_all_succeeded", lambda comm, success: success)
+        handle = Mock()
+        handle.get_uc_buffer.return_value = torch.empty(48, dtype=torch.int32)
+        handle.get_mc_buffer.return_value = torch.empty(48, dtype=torch.int32)
+        allocate = Mock(return_value=handle)
+        monkeypatch.setattr(ops, "_make_mnnvl_mcast_buffer", allocate)
+        create = module.workspace if kind == "k3_spec_accept" else module.markov_workspace
+        workspace = create(mapping)
+        assert workspace["handle"] is handle
+        allocate.assert_called_once_with(comm, 192, mapping, cross_node_tp)
+
+
+@pytest.mark.parametrize("arch", ["aarch64", "x86_64"])
+def test_router_uses_shared_mnnvl_eligibility(monkeypatch, mnnvl_capable_hardware, arch):
+    router = importlib.import_module("tensorrt_llm._torch._experimental.modeling_v2._router_index")
+    mapping = _FakeMapping()
+    mapping.multi_node = True
+    monkeypatch.setattr(platform, "machine", lambda: arch)
+    assert router.tp_reaches_across_nodes(mapping)
+    monkeypatch.setattr(ops.MnnvlMemory, "supports_mnnvl", lambda: False)
+    assert not router.tp_reaches_across_nodes(mapping)
+
+
+@pytest.mark.parametrize("transport", [ops.MnnvlTransport.POSIX_FD, ops.MnnvlTransport.FABRIC])
+def test_explicit_transport_is_used_for_allocation_and_forward(monkeypatch, transport):
+    import sys
+    from types import ModuleType
+
+    fused = ModuleType("tensorrt_llm._torch.distributed.mnnvl_fused_allreduce")
+    fused.MnnvlAllReduceNorm = Mock()
+    fused.GemmAllReduceNorm = Mock()
+    monkeypatch.setitem(sys.modules, fused.__name__, fused)
+    allocate = Mock(
+        return_value={
+            "uc_buffer": torch.zeros(48),
+            "buffer_flags": torch.zeros(9, dtype=torch.uint32),
+        }
+    )
+    monkeypatch.setattr(ops, "get_or_scale_allreduce_mnnvl_workspace", allocate)
+    module = ops.MNNVLAllReduce(
+        _FakeMapping(), torch.bfloat16, dispatch_plan=ops._MnnvlDispatchPlan(transport=transport)
+    )
+    x = torch.zeros((2, 128), dtype=torch.bfloat16)
+    kernel = Mock(return_value=[x])
+    monkeypatch.setattr(torch.ops.trtllm, "mnnvl_fusion_allreduce", kernel, raising=False)
+    module(x, ops.AllReduceParams())
+    assert allocate.call_count == 2
+    assert all(call.kwargs["transport"] == transport for call in allocate.call_args_list)

@@ -22,6 +22,7 @@
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
@@ -59,6 +60,33 @@ inline DeviceMemoryOwner getMcastDevMemBuffer(at::Tensor const& tensor)
     return *static_cast<DeviceMemoryOwner*>(dataPtr.get_context());
 }
 
+struct McastDeviceMemoryDeleter
+{
+    uint32_t deviceIdx;
+
+    void operator()(McastDeviceMemory* memory) const noexcept
+    {
+        c10::cuda::CUDAGuard const deviceGuard(static_cast<c10::DeviceIndex>(deviceIdx));
+        auto const stream = at::cuda::getCurrentCUDAStream(deviceIdx);
+        cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+        auto const captureError = cudaStreamIsCapturing(stream, &captureStatus);
+        bool const canRelease = captureError == cudaSuccess && captureStatus == cudaStreamCaptureStatusNone;
+        // Final release can come from either the wrapper or a tensor view. Check PyTorch's current stream before
+        // the destructor synchronizes and frees memory: synchronization during capture would invalidate the graph.
+        // This noexcept deleter makes the assertion fatal; it must not be caught by best-effort cleanup.
+        // Capture on other streams/threads must still be excluded by the caller's lifetime contract.
+        if (!canRelease)
+        {
+            TLLM_LOG_ERROR(
+                "[McastDeviceMemory] Cannot release multicast memory during CUDA graph capture or when "
+                "capture status is unknown (device %u, capture status %d, CUDA error: %s).",
+                deviceIdx, static_cast<int>(captureStatus), cudaGetErrorString(captureError));
+        }
+        TLLM_CHECK_WITH_INFO(canRelease, "Multicast memory must be released outside CUDA graph capture.");
+        delete memory;
+    }
+};
+
 //! \brief Wrapper class for McastDeviceMemory to facilitate PyTorch tensor creation.
 //! It manages a buffer accessible via unicast or multicast for multi-node communication.
 class McastGPUBuffer
@@ -77,8 +105,9 @@ public:
     //! \param mpiCommFortranHandle The Fortran handle for the MPI communicator (from Python mpi4py).
     McastGPUBuffer(size_t bufSize, uint32_t groupSize, uint32_t groupRank, uint32_t deviceIdx, bool mnNvlink,
         int64_t mpiCommFortranHandle)
-        : mMcastDeviceMemory(std::make_shared<McastDeviceMemory>(
-            bufSize, groupSize, groupRank, deviceIdx, mnNvlink, mpiCommFortranHandle))
+        : mMcastDeviceMemory(
+            new McastDeviceMemory(bufSize, groupSize, groupRank, deviceIdx, mnNvlink, mpiCommFortranHandle),
+            McastDeviceMemoryDeleter{deviceIdx})
         , mBufSize(mMcastDeviceMemory->getBufferSize())
         , mLocalDevice(at::Device(at::DeviceType::CUDA, deviceIdx))
     {
@@ -93,8 +122,9 @@ public:
     //! \param groupComm Collective used to exchange the CUDA memory handles.
     McastGPUBuffer(size_t bufSize, uint32_t groupSize, uint32_t groupRank, uint32_t deviceIdx, bool mnNvlink,
         std::shared_ptr<McastGroupComm> groupComm)
-        : mMcastDeviceMemory(std::make_shared<McastDeviceMemory>(
-            bufSize, groupSize, groupRank, deviceIdx, mnNvlink, std::move(groupComm)))
+        : mMcastDeviceMemory(
+            new McastDeviceMemory(bufSize, groupSize, groupRank, deviceIdx, mnNvlink, std::move(groupComm)),
+            McastDeviceMemoryDeleter{deviceIdx})
         , mBufSize(mMcastDeviceMemory->getBufferSize())
         , mLocalDevice(at::Device(at::DeviceType::CUDA, deviceIdx))
     {
@@ -493,8 +523,9 @@ public:
             {
                 if (std::memcmp(deviceUuids[lhs].bytes, deviceUuids[rhs].bytes, sizeof(deviceUuids[lhs].bytes)) == 0)
                 {
-                    throw std::invalid_argument("[MNNVL] Communicator ranks " + std::to_string(lhs) + " and "
-                        + std::to_string(rhs) + " selected the same physical CUDA device");
+                    mReason = "[MNNVL] Communicator ranks " + std::to_string(lhs) + " and " + std::to_string(rhs)
+                        + " selected the same physical CUDA device";
+                    return;
                 }
             }
         }

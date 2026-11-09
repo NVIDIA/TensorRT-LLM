@@ -67,8 +67,6 @@ public:
     McastDeviceMemory(size_t bufSize, uint32_t groupSize, uint32_t groupRank, int deviceIdx, bool mnNvlink,
         std::shared_ptr<McastGroupComm> groupComm);
 
-    // We don't register the pointer in these two functions since we don't expect any python-level code would call
-    // to obtain the raw pointers.
     //! Get the raw array of signal pad pointers to all ranks (including self)
     void** getSignalPadPtrsDev()
     {
@@ -137,6 +135,8 @@ public:
         return mState == State::kMapped;
     }
 
+    //! Release the last owner only outside CUDA graph capture, once no executable graph can use the allocation.
+    //! Teardown fences all device streams because tensor views do not have a single owning stream.
     ~McastDeviceMemory() noexcept;
 
 private:

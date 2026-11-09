@@ -18,12 +18,10 @@ Every rank holds a vocab shard of the logits. The vocab-parallel argmax and the
 DSpark Markov chain must give the ids ``torch.argmax`` gives on the gathered
 logits (ties to the lowest global index, NaN first), and the Gumbel-max sampler
 the draw a single shard holding the whole vocab gives, on every rank, eagerly
-and under CUDA-graph replay, over the MNNVL and the default all-reduce.
+and under CUDA-graph replay, using the production AUTO all-reduce selection.
 """
 
-import os
 import pickle
-import platform
 import sys
 import traceback
 from types import SimpleNamespace
@@ -39,7 +37,6 @@ from mpi4py.futures import MPIPoolExecutor
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
 from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper
-from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.nccl_window_graph import nccl_window_graph_capture
@@ -64,17 +61,6 @@ MPI.pickle.__init__(
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
-# The MNNVL all-reduce needs fabric-backed NVLink memory (GB200/GB300).
-_MNNVL = pytest.param(
-    True,
-    id="mnnvl",
-    marks=pytest.mark.skipif(
-        platform.machine().lower() != "aarch64" or not MnnvlMemory.supports_mnnvl(),
-        reason="needs fabric-backed MNNVL",
-    ),
-)
-_EXCHANGES = [pytest.param(False, id="auto"), _MNNVL]
-
 HIDDEN = 256
 SHARD = 3000  # not a multiple of the 2048-wide kernel tile
 
@@ -82,9 +68,6 @@ SHARD = 3000  # not a multiple of the 2048-wide kernel tile
 def _run(fn, *args):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
-    # _make_head sets TLLM_TEST_MNNVL in this pooled MPI worker; later tasks on
-    # the same worker must see the value it had before.
-    saved_mnnvl = os.environ.get("TLLM_TEST_MNNVL")
     try:
         # The exchanges may return NCCL-window tensors, whose leases must end in a
         # tensor scope and whose graph captures need a window graph-pool owner (the
@@ -95,17 +78,10 @@ def _run(fn, *args):
     except Exception:
         traceback.print_exc()
         raise
-    finally:
-        if saved_mnnvl is None:
-            os.environ.pop("TLLM_TEST_MNNVL", None)
-        else:
-            os.environ["TLLM_TEST_MNNVL"] = saved_mnnvl
     return True
 
 
-def _make_head(rank, tp, mnnvl):
-    # Selects MNNVL for the pair all-reduce on a single node.
-    os.environ["TLLM_TEST_MNNVL"] = "1" if mnnvl else "0"
+def _make_head(rank, tp):
     mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
     vocab = SHARD * tp
     lm_head = LMHead(
@@ -120,8 +96,8 @@ def _make_head(rank, tp, mnnvl):
     full = (torch.randn(vocab, HIDDEN, device="cuda", generator=gen) * 0.05).to(torch.bfloat16)
     lm_head.weight.data.copy_(full[rank * SHARD : (rank + 1) * SHARD])
     assert VocabParallelHead.supports(lm_head)
+
     head = VocabParallelHead(lm_head)
-    assert (head._exchange.all_reduce.mnnvl_allreduce is not None) == mnnvl
     return head, vocab
 
 
@@ -159,8 +135,8 @@ def _special_rows(full):
 
 
 @torch.inference_mode()
-def _argmax_check(rank, tp, mnnvl):
-    head, vocab = _make_head(rank, tp, mnnvl)
+def _argmax_check(rank, tp):
+    head, vocab = _make_head(rank, tp)
     for rows in (1, 7, 64, 300):
         gen = torch.Generator(device="cuda").manual_seed(rows)
         full = torch.randint(-4, 4, (rows, vocab), device="cuda", generator=gen).to(torch.bfloat16)
@@ -186,11 +162,11 @@ def _argmax_check(rank, tp, mnnvl):
 
 
 @torch.inference_mode()
-def _sample_check(rank, tp, mnnvl):
+def _sample_check(rank, tp):
     # A Triton kernel holds a lock, so cloudpickle cannot ship it as a global of this check.
     from tensorrt_llm._torch.speculative.vocab_parallel import _local_sample_kernel
 
-    head, vocab = _make_head(rank, tp, mnnvl)
+    head, vocab = _make_head(rank, tp)
     for rows in (1, 64, 257):
         gen = torch.Generator(device="cuda").manual_seed(rows)
         full = (torch.randn(rows, vocab, device="cuda", generator=gen) * 2).to(torch.bfloat16)
@@ -229,8 +205,8 @@ def _markov_reference(full, anchors, w1, w2):
 
 
 @torch.inference_mode()
-def _markov_check(rank, tp, mnnvl):
-    head, vocab = _make_head(rank, tp, mnnvl)
+def _markov_check(rank, tp):
+    head, vocab = _make_head(rank, tp)
     gen = torch.Generator(device="cuda").manual_seed(11)
     w1 = torch.randn(vocab, 256, device="cuda", generator=gen).to(torch.bfloat16)
     w2 = (torch.randn(vocab, 256, device="cuda", generator=gen) * 0.1).to(torch.bfloat16)
@@ -249,7 +225,7 @@ def _markov_check(rank, tp, mnnvl):
         gathered = MPI.COMM_WORLD.allgather(step_logits.cpu())
         return torch.cat(gathered, dim=-1).argmax(dim=-1).cuda()
 
-    exchange = tp_pair_exchange(head.lm_head.mapping, AllReduceStrategy.NCCL)
+    exchange = tp_pair_exchange(head.lm_head.mapping, AllReduceStrategy.AUTO)
     full = torch.randn(6, 7, vocab, device="cuda", generator=gen) * 3
     anchors = torch.randint(0, vocab, (6,), device="cuda", generator=gen)
     local = _shard(full, rank)
@@ -280,7 +256,7 @@ def _markov_check(rank, tp, mnnvl):
 
 
 @torch.inference_mode()
-def _worker_accept_check(rank, tp, mnnvl):
+def _worker_accept_check(rank, tp):
     """Strict acceptance on shard logits equals acceptance on gathered logits."""
 
     class _Worker(SpecWorkerBase):
@@ -291,7 +267,7 @@ def _worker_accept_check(rank, tp, mnnvl):
         def _forward_impl(self, *args, **kwargs):
             raise NotImplementedError
 
-    head, vocab = _make_head(rank, tp, mnnvl)
+    head, vocab = _make_head(rank, tp)
     num_ctx, num_gens, draft_len = 2, 6, 6
     rows = num_ctx + num_gens * (draft_len + 1)
     gen = torch.Generator(device="cuda").manual_seed(5)
@@ -325,22 +301,20 @@ _CHECKS = {
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
-@pytest.mark.parametrize("mnnvl", _EXCHANGES)
 @pytest.mark.parametrize("check", list(_CHECKS))
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_vocab_parallel_selection_tp2(check, mnnvl, mpi_pool_executor):
+def test_vocab_parallel_selection_tp2(check, mpi_pool_executor):
     tp = mpi_pool_executor.num_workers
-    results = mpi_pool_executor.map(_run, *zip(*[(_CHECKS[check], tp, mnnvl)] * tp))
+    results = mpi_pool_executor.map(_run, *zip(*[(_CHECKS[check], tp)] * tp))
     assert all(results)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")
-@pytest.mark.parametrize("mnnvl", _EXCHANGES)
 @pytest.mark.parametrize("check", list(_CHECKS))
 @pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
-def test_vocab_parallel_selection_tp4(check, mnnvl, mpi_pool_executor):
+def test_vocab_parallel_selection_tp4(check, mpi_pool_executor):
     tp = mpi_pool_executor.num_workers
-    results = mpi_pool_executor.map(_run, *zip(*[(_CHECKS[check], tp, mnnvl)] * tp))
+    results = mpi_pool_executor.map(_run, *zip(*[(_CHECKS[check], tp)] * tp))
     assert all(results)
 
 
@@ -365,7 +339,7 @@ def _after_large_allreduce_check(rank: int, tp: int, order: str) -> None:
     round starts each call late, so the other rank reads its part of the
     buffer before it arrives and takes any stale value.
     """
-    head, vocab = _make_head(rank, tp, mnnvl=False)
+    head, vocab = _make_head(rank, tp)
     mapping = head.lm_head.mapping
     # Untuned AUTO runs the exchange on NCCL; the autotuner profiles it on the
     # one-shot kernel at warm-up, right after the model's bf16 all-reduces.
