@@ -51,9 +51,11 @@ from cutlass.experimental.task_scheduling.schedule_builder import (
 )
 from cutlass.experimental.task_scheduling.task import Task
 
+from ...sage.modes import SageScoreScaling
 from ..stage import FmhaStage
 from ..task_compat import task_context_kwargs
 from .direct_sparse_metadata import DirectSparseMetadataView
+from .direct_sparse_metadata import HeadIndexedMetadataView
 from .fmha_decode_config import FmhaDecodeConfig
 from .fmha_decode_constants import (
     KV_INST0,
@@ -61,7 +63,11 @@ from .fmha_decode_constants import (
     KV_KIND_K,
     KV_KIND_V,
 )
+from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
+
 from .fmha_decode_resources.helpers_common import (
+    split_kv_grid_coord,
+    UniformQueryOffsets,
     _assume_nonnegative_i32,
     _q_group_token_base,
     _q_seq_bounds,
@@ -69,6 +75,7 @@ from .fmha_decode_resources.helpers_common import (
 )
 from .fmha_decode_resources.helpers_kv_tile_idx import (
     _runtime_last_valid_page_idx,
+    _runtime_configured_local_kv_tiles,
     _runtime_total_kv_tiles,
     _sliding_window_start_idx,
 )
@@ -169,35 +176,55 @@ class ScheduleTokenThrottleResource(MemoryResource):
 
 @dataclass(kw_only=True)
 class PackedDecodeWorkQueue(WorkQueue):
-    """CLC work queue that drops packed-Q tiles beyond a batch's Q length."""
+    """CLC work queue that drops Q padding and inactive KV requests."""
 
     cfg: cutlass.Constexpr[FmhaDecodeConfig] = field(init=False, default=None)
     cu_seqlens_q: Any = field(init=False, default=None)
+    seqlens_kv: Any = field(init=False, default=None)
+    num_heads_kv: Any = field(init=False, default=None)
 
     def __init__(
         self,
         cfg: FmhaDecodeConfig,
-        cu_seqlens_q: cute.Pointer,
+        cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
+        seqlens_kv: cute.Pointer | None = None,
+        num_heads_kv: cutlass.Int32 | None = None,
         **kwargs: Any,
     ) -> None:
-        """Attach packed-Q metadata to the shared persistent work queue."""
+        """Attach request metadata to the shared persistent work queue."""
         super().__init__(**kwargs)
         self.cfg = cfg
         self.cu_seqlens_q = cu_seqlens_q
+        self.seqlens_kv = seqlens_kv
+        self.num_heads_kv = num_heads_kv
 
     @cute.jit
     def skip_work_tile_if(self, work_tile: Any) -> cutlass.Boolean:
-        """Skip a fetched Q group when its first token is outside this batch."""
-        q_group_cta_idx, _, b_idx = work_tile.tile_idx
+        """Skip empty KV requests and Q groups outside their live sequence."""
+        q_group_cta_idx, h_idx, b_idx = work_tile.tile_idx
+        empty_kv = cutlass.Boolean(False)
+        if cutlass.const_expr(self.seqlens_kv is not None):
+            lengths = self.seqlens_kv
+            if cutlass.const_expr(
+                self.cfg.use_q_token_kv_block_sparse_route
+                and not self.cfg.shares_sparse_pattern
+            ):
+                if cutlass.const_expr(isinstance(lengths, DirectSparseMetadataView)):
+                    lengths = lengths.with_head(h_idx)
+                else:
+                    lengths = HeadIndexedMetadataView(lengths, self.num_heads_kv, h_idx)
+            empty_kv = cutlass.Int32(lengths[b_idx]) <= cutlass.Int32(0)
         q_group_idx = cutlass.Int32(q_group_cta_idx)
-        if cutlass.const_expr(self.cfg.use_split_kv):
+        if cutlass.const_expr(self.cfg.uses_compact_split_grid):
+            q_group_idx = cutlass.Int32(cute.arch.block_idx()[2]) % self.cfg.num_q_ctas
+        elif cutlass.const_expr(self.cfg.use_split_kv):
             q_group_idx = q_group_idx // cutlass.Int32(self.cfg.splits_kv)
         _, seq_len_q = _q_seq_bounds(
             self.cfg,
             self.cu_seqlens_q,
             cutlass.Int32(b_idx),
         )
-        return _q_group_token_base(self.cfg, q_group_idx) >= seq_len_q
+        return empty_kv or _q_group_token_base(self.cfg, q_group_idx) >= seq_len_q
 
 
 def _page_offsets_consume(
@@ -236,13 +263,21 @@ def _can_hold_native_page_window(
     cfg: FmhaDecodeConfig,
     smem_page_offsets: MemoryResource | None,
 ) -> bool:
-    """Return whether one native page-ID stage covers every runtime KV range."""
+    """Return whether one native page-ID stage covers every runtime KV range.
+
+    A runtime launch selects the CTA-relative window only when its host KV
+    bound and count guarantee the entire instruction-aligned span fits.
+    Longer spans retain the ordinary staged pipeline.
+    """
     if (
         smem_page_offsets is None
         or not smem_page_offsets.use_native_paged_kv
         or cfg.use_sliding_window_causal
+        or not cfg.fixed_seqlen
     ):
         return False
+    if cfg.runtime_split_kv:
+        return cfg.runtime_page_window
     pages_per_tile = cfg.tile_size_kv // cfg.num_tokens_per_page
     if cfg.uses_scattered_page_route:
         # Each sparse route gets a page-offset stage sized for its complete
@@ -514,16 +549,10 @@ def _decode_work_tile_schedule(
     body: Callable[[], None],
     non_skippable_head: Callable[[], None] | None = None,
 ) -> None:
-    """Trace one worker schedule, making only packed persistent data skippable."""
+    """Trace data work separately from persistent queue bookkeeping."""
     if cfg.use_persistent_scheduler:
         assert work_queue is not None
-        if not cfg.use_variable_seqlens_q:
-            with work_tile_loop(work_queue):
-                if non_skippable_head is not None:
-                    non_skippable_head()
-                body()
-                _work_queue_tail(work_queue)
-            return
+        # Schedule tracing passes resource proxies, so use the static config.
         with work_tile_loop(
             work_queue,
             skip_if=PackedDecodeWorkQueue.skip_work_tile_if,
@@ -562,13 +591,6 @@ def _decode_work_tile_schedule_with_invariant_bridge(
         # Descriptor backing storage depends only on the task's SMEM
         # allocation, so initialize it once before the persistent loop.
         invariant_setup()
-        if not cfg.use_variable_seqlens_q:
-            with work_tile_loop(work_queue):
-                active_prelude()
-                invariant = bridge()
-                body(invariant)
-                _work_queue_tail(work_queue)
-            return
         with work_tile_loop(
             work_queue,
             skip_if=PackedDecodeWorkQueue.skip_work_tile_if,
@@ -577,7 +599,11 @@ def _decode_work_tile_schedule_with_invariant_bridge(
                 active_prelude()
                 # Packed persistent QK reads Q's consumer-work stage directly,
                 # so it needs no descriptor task local crossing this guard.
-                body(None)
+                if cfg.use_variable_seqlens_q:
+                    body(None)
+                else:
+                    invariant = bridge()
+                    body(invariant)
             _work_queue_tail(work_queue)
         return
 
@@ -662,6 +688,7 @@ class DecodeGenTask(Task):
     def __init__(self, **kwargs: TaskKwarg) -> None:
         """Capture decode-specific task config and initialize cache slots."""
         self.cfg = kwargs.pop("cfg", None)
+        self.requested_splits = kwargs.pop("requested_splits", None)
         self.seqlens_kv = kwargs.pop("seqlens_kv", None)
         self.block_table_capacity = kwargs.pop("block_table_capacity", None)
         self.sparse_row_route_offsets = kwargs.pop("sparse_row_route_offsets", None)
@@ -709,25 +736,12 @@ class DecodeGenTask(Task):
             self._tmem_base_offset = _warp_broadcast_i32(loaded, 0)
 
     @cute.jit
-    def make_task_cache(
-        self,
-    ) -> tuple[
-        cutlass.Int32,
-        cutlass.Int32,
-        cutlass.Int32,
-        cutlass.Int32,
-        cutlass.Int32,
-        cutlass.Int32,
-        cutlass.Int32,
-        cutlass.Int32,
-        cutlass.Int32,
-        cutlass.Int32,
-    ]:
+    def make_task_cache(self):
         """Return cached task-local values passed through StageInfo."""
         # The cache is threaded through StageInfo so resource methods can read
         # task-local constants without recomputing them or adding more
         # resource variables to every schedule edge.
-        return (
+        values = (
             self._tmem_base_offset,
             self._warp_grp_thread_idx,
             self._local_warp_idx,
@@ -739,6 +753,15 @@ class DecodeGenTask(Task):
             self._kv_valid_tile_end,
             self._kv_window_start,
         )
+
+        if cutlass.const_expr(self.cfg.runtime_split_kv):
+            count = (
+                cutlass.Int32(self.cfg.splits_kv)
+                if self.requested_splits is None
+                else self.requested_splits
+            )
+            values = (*values, count)
+        return values
 
     @cute.jit
     def _refresh_packed_q_bounds(self, work_tile: Any) -> None:
@@ -796,6 +819,11 @@ class DecodeGenTask(Task):
         context: ResourceContext | None = None,
     ) -> None:
         """Run one ordinary task tile and synchronize attention-sink tails."""
+        if cutlass.const_expr(self.cfg is not None and self.cfg.runtime_split_kv):
+            work_tile = WorkTileInfo(
+                split_kv_grid_coord(self.cfg, work_tile.tile_idx),
+                work_tile.is_valid_tile,
+            )
         Task._run_task_body_impl(
             self,
             work_tile,
@@ -832,10 +860,9 @@ class DecodeGenTask(Task):
         self,
         context: ResourceContext | None = None,
     ) -> None:
-        """Drain inactive packed tiles before each unconditional active body."""
+        """Drain inactive tiles before each unconditional active body."""
         use_packed_early_stop = (
             self.cfg is not None
-            and self.cfg.use_variable_seqlens_q
             and self.cfg.use_persistent_scheduler
             and self._has_skip_if
         )
@@ -866,7 +893,8 @@ class DecodeGenTask(Task):
             self.dummy = cutlass.Boolean(True)
 
         while work_tile.is_valid_tile:
-            self._refresh_packed_q_bounds(work_tile)
+            if cutlass.const_expr(self.cfg.use_variable_seqlens_q):
+                self._refresh_packed_q_bounds(work_tile)
             # The tile is known active here. Running the complete schedule
             # without a dynamic skip guard keeps HEAD-produced pipeline state
             # in scope for LOOP and TAIL.
@@ -905,6 +933,9 @@ class DecodeGenTask(Task):
     def get_domain(self, tile_coord: cute.Coord) -> cutlass.Int32 | int:
         """Return this task's loop domain for one static or persistent tile."""
         if self.cfg is None:
+            return self.domain
+        if cutlass.const_expr(not self.cfg.fixed_seqlen and self.seq_len_q is None):
+            # Padding and scheduler tasks do not consume request dimensions.
             return self.domain
 
         # Sparse rows have a runtime-dependent number of prepared KV routes
@@ -993,6 +1024,7 @@ class DecodeGenTask(Task):
         if (
             self.seqlens_kv is None
             and not self.cfg.use_split_kv
+            and self.cfg.fixed_seqlen
             and not self.cfg.uses_runtime_q_kv_union
         ):
             return self.domain
@@ -1003,6 +1035,7 @@ class DecodeGenTask(Task):
         # causal/window/split coordinate construction in every task warp.
         if cutlass.const_expr(
             not self.cfg.use_split_kv
+            and self.cfg.fixed_seqlen
             and not self.cfg.uses_runtime_q_kv_union
             and not self.cfg.use_sliding_window_causal
         ):
@@ -1018,11 +1051,12 @@ class DecodeGenTask(Task):
             )
             return loop_domain + cutlass.Int32(self.domain_bias)
 
-        # Decode the logical Q tile with the configured physical split fanout,
-        # then derive its causal/window K union and useful runtime split prefix.
+        # Work-tile coordinates retain the configured capacity stride.
         q_group_cta_idx = cutlass.Int32(tile_coord[0])
         q_group_idx = q_group_cta_idx
-        if self.cfg.use_split_kv:
+        if self.cfg.uses_compact_split_grid:
+            q_group_idx = cutlass.Int32(cute.arch.block_idx()[2]) % self.cfg.num_q_ctas
+        elif self.cfg.use_split_kv:
             q_group_idx = q_group_cta_idx // cutlass.Int32(self.cfg.splits_kv)
         q_token_base = _q_group_token_base(self.cfg, q_group_idx)
         seq_len_q = (
@@ -1048,24 +1082,20 @@ class DecodeGenTask(Task):
         # Split-KV groups CTAs by K/V split. The loop domain is rounded so
         # each CTA in the group executes the same number of instruction pairs.
         if self.cfg.use_split_kv:
-            # The useful active prefix is derived from this configured-fanout
-            # local span at kernel entry. Recomputing it in every scheduled
-            # task produces the same span but adds a runtime integer division
-            # to each task warp.
-            splits_kv = cutlass.Int32(self.cfg.splits_kv)
-            num_insts_kv = cutlass.Int32(self.cfg.num_insts_kv)
-            tiles_per_cta_group = splits_kv * num_insts_kv
-            num_groups = (
-                total_kv_tiles + tiles_per_cta_group - cutlass.Int32(1)
-            ) // tiles_per_cta_group
-            total_kv_tiles = cute.math.max(
-                num_groups * num_insts_kv,
-                num_insts_kv,
+            # The domain and tile consumers share the instruction-aligned
+            # partition. Runtime launches carry its host-prepared reciprocal.
+            total_kv_tiles = _runtime_configured_local_kv_tiles(
+                self.cfg,
+                seq_len_kv,
+                seq_len_q,
+                q_token_base,
+                requested_splits=self.requested_splits,
             )
-            # Physical split coordinates and page-cache strides are laid out with
-            # the configured launch fanout.  Runtime pruning only shortens the
-            # useful prefix; it must not renumber the remaining CTAs.
-            split_idx = cutlass.Int32(tile_coord[0]) % cutlass.Int32(self.cfg.splits_kv)
+            split_idx = cutlass.Int32(cute.arch.block_idx()[0])
+            if not self.cfg.uses_compact_split_grid:
+                split_idx = cutlass.Int32(tile_coord[0]) % cutlass.Int32(
+                    self.cfg.splits_kv
+                )
             self._kv_raw_tile_base = skipped_tiles + split_idx * total_kv_tiles
         else:
             self._kv_raw_tile_base = skipped_tiles
@@ -2370,25 +2400,28 @@ def create_mma_task_split_kv(
             FmhaStage.Head,
         )
 
+        # TMEM P aliases S, so an instance's next QK must follow the PV that
+        # reads P. A Q128 tile with SMEM P leaves S once Softmax has the scores
+        # in registers: the next QK goes first and overlaps the exponentials
+        # of this tile (``stages_q128_p_in_smem``).
+        qk_before_pv = cfg.stages_q128_p_in_smem
         with domain_loop(0, domain, 1, unroll=1):
-            pv_mma(smem_v0, smem_p0, "vp_mma_loop", KV_INST0, FmhaStage.Loop)
-            qk_mma(
-                smem_k0,
-                tmem_s0,
-                tmem_stats_done0,
-                q_desc,
-                "qk_mma_loop",
-                FmhaStage.Loop,
-            )
-            pv_mma(smem_v1, smem_p1, "vp_mma_loop", KV_INST1, FmhaStage.Loop)
-            qk_mma(
-                smem_k1,
-                tmem_s1,
-                tmem_stats_done1,
-                q_desc,
-                "qk_mma_loop",
-                FmhaStage.Loop,
-            )
+            for inst_idx, smem_k, smem_v, tmem_s, tmem_stats_done, smem_p in (
+                (KV_INST0, smem_k0, smem_v0, tmem_s0, tmem_stats_done0, smem_p0),
+                (KV_INST1, smem_k1, smem_v1, tmem_s1, tmem_stats_done1, smem_p1),
+            ):
+                if not qk_before_pv:
+                    pv_mma(smem_v, smem_p, "vp_mma_loop", inst_idx, FmhaStage.Loop)
+                qk_mma(
+                    smem_k,
+                    tmem_s,
+                    tmem_stats_done,
+                    q_desc,
+                    "qk_mma_loop",
+                    FmhaStage.Loop,
+                )
+                if qk_before_pv:
+                    pv_mma(smem_v, smem_p, "vp_mma_loop", inst_idx, FmhaStage.Loop)
 
         # The last BMM1 has been issued once the loop ends, and BMM2 never reads
         # Q. Releasing it here lets a persistent CTA load the next work tile's
@@ -3184,7 +3217,9 @@ def _softmax_schedule_body(
     # with each tile. They are read in place, so the ring stage stays held
     # through the last pass that reads them: the max pass for dequantized
     # scores, else the P pass.
-    releases_sage_stage_after_max = cfg.sage_scores_dequantized()
+    releases_sage_stage_after_max = (
+        cfg.sage_score_scaling() is SageScoreScaling.DEQUANTIZED
+    )
     compute_softmax_loop = {
         (False, False): tmem_s.compute_softmax_loop,
         (False, True): tmem_s.compute_sage_softmax_loop,
@@ -3245,7 +3280,7 @@ def _softmax_schedule_body(
             **softmax_loop_kwargs
         )
         if cutlass.const_expr(releases_sage_stage_after_max):
-            # Dequantized scores went back to TMEM; the P pass reads no words.
+            # The scores came back dequantized; the P pass reads no words.
             sage_k_scales.release()
         if cutlass.const_expr(not cfg.use_keeps_mma_ab or not cfg.uses_tmem_p):
             # ConsRelease: free S once the scores are in registers unless
@@ -3290,6 +3325,12 @@ def _softmax_schedule_body(
                     s_arr=s_arr,
                     keeps_route_flags=sparse_route_flags,
                     swaps_route_flags=sparse_token_word2,
+                )
+            elif cutlass.const_expr(use_sage):
+                smem_p.compute_sage_p(
+                    new_max_arr=new_max_arr,
+                    s_arr=s_arr,
+                    sage_q_scale=sage_q_scale,
                 )
             else:
                 smem_p.compute_p(
