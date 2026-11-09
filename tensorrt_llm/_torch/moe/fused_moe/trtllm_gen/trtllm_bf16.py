@@ -14,9 +14,15 @@
 # limitations under the License.
 """``trtllm.trtllm_gen.fused_moe.none`` -- the unquantized path."""
 
+import os
+
 import torch
 
+from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
+from tensorrt_llm._torch.route_capture import get_active_route_capture
 from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
+from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Mode as CalibratorMode
 
 from ..impl_contract import (
     MoEDeployment,
@@ -61,6 +67,13 @@ class TrtllmTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
         ActivationType.Swiglu,
         ActivationType.Relu2,
     }
+    #: Every BF16 cubin has tileM 128 and tileK 128 (or 64). The hidden size is
+    #: gemm1's K and gemm2's M; each rank's intermediate shard is gemm2's K and
+    #: (half of) gemm1's M. Both must be multiples of this, or no cubin applies.
+    _SHAPE_ALIGNMENT = 128
+    #: The routing kernels' limits (``runner.cu``, ``RoutingCustomPolicy.cuh``).
+    _MAX_ROUTING_EXPERTS = 2048
+    _MAX_ROUTING_TOP_K = 32
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
@@ -71,6 +84,23 @@ class TrtllmTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
             cls._check_bf16_path(p, d),
             check_no_expert_bias(cls, p),
             check_no_activation_constants(cls, p),
+        )
+
+    def _requires_separated_routing(self) -> bool:
+        """Route on the host while something reads the host top-k.
+
+        The kernel routes from the logits, which leaves Router Replay capture,
+        ExpertStatistic, the layer-wise benchmark calibrator and
+        ``ENABLE_PERFECT_ROUTER=expert_ids`` with no top-k to read. Asked per
+        forward, because Router Replay registers its capturer after the model
+        is built.
+        """
+        return (
+            get_active_route_capture() is not None
+            or ExpertStatistic.get() is not None
+            or get_calibrator().mode != CalibratorMode.NONE
+            # Read like MoE._init_perfect_router; the leaf does not run that init.
+            or os.environ.get("ENABLE_PERFECT_ROUTER") == "expert_ids"
         )
 
     def supports_unfinalized_output(self) -> bool:
@@ -113,11 +143,26 @@ class TrtllmTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
                 MoERejectReason.ACTIVATION_UNSUPPORTED,
                 f"{cls.__name__} only supports {supported} activations, got {p.activation}",
             )
-        # Each rank's intermediate shard is gemm2's K and (half of) gemm1's M.
-        # The op needs a multiple of 64 for the BlockMajorK K blocks; 128 is
-        # the granularity the BF16 cubins are validated at, and a smaller
-        # shard falls back to another backend instead of failing in the op.
-        return check_intermediate_shard_alignment(cls, p, d, weight_alignment=128)
+        # Rejected here rather than in the op, so the layer falls back to
+        # another backend instead of failing at warmup.
+        if p.hidden_size is not None and p.hidden_size % cls._SHAPE_ALIGNMENT != 0:
+            return _reject(
+                MoERejectReason.SHAPE_UNALIGNED,
+                f"{cls.__name__} requires hidden_size ({p.hidden_size}) to be a "
+                f"multiple of {cls._SHAPE_ALIGNMENT}",
+            )
+        if d.num_slots > cls._MAX_ROUTING_EXPERTS:
+            return _reject(
+                MoERejectReason.ROUTING_UNSUPPORTED,
+                f"{cls.__name__} routes at most {cls._MAX_ROUTING_EXPERTS} experts, "
+                f"got {d.num_slots} slots",
+            )
+        if p.top_k is not None and p.top_k > cls._MAX_ROUTING_TOP_K:
+            return _reject(
+                MoERejectReason.ROUTING_UNSUPPORTED,
+                f"{cls.__name__} routes at most top_k={cls._MAX_ROUTING_TOP_K}, got {p.top_k}",
+            )
+        return check_intermediate_shard_alignment(cls, p, d, weight_alignment=cls._SHAPE_ALIGNMENT)
 
     def _get_quant_method(self) -> object:
         return BF16TRTLLMGenFusedMoEMethod()

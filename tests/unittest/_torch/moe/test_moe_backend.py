@@ -1039,7 +1039,7 @@ def _unfinalized_triple(
     """What ``run_moe`` returns for ``do_finalize=False``.
 
     ``expanded_idx_to_permuted_idx`` covers ``num_tokens * top_k`` slots.
-    FlashInfer returns it flattened; neither its leading dimension nor the
+    A runner may return it flattened; neither its leading dimension nor the
     expert-major ``gemm2_output`` height is necessarily the token count.
     """
     return [
@@ -1049,7 +1049,7 @@ def _unfinalized_triple(
     ]
 
 
-@pytest.mark.parametrize("flattened", [False, True], ids=["matrix", "flat-flashinfer"])
+@pytest.mark.parametrize("flattened", [False, True], ids=["matrix", "flat"])
 @pytest.mark.parametrize("rows", [0, 8, _HOOK_DISPATCHED_ROWS])
 def test_the_finalize_runs_on_the_dispatched_rows(flattened: bool, rows: int) -> None:
     seen = {}
@@ -1162,7 +1162,7 @@ def test_missing_dispatched_routing_weights_are_refused():
         )
 
 
-@pytest.mark.parametrize("flattened", [False, True], ids=["matrix", "flat-flashinfer"])
+@pytest.mark.parametrize("flattened", [False, True], ids=["matrix", "flat"])
 @pytest.mark.parametrize(
     "shape", [(_HOOK_DISPATCHED_ROWS - 1, _HOOK_TOP_K), (_HOOK_DISPATCHED_ROWS, _HOOK_TOP_K - 1)]
 )
@@ -4843,8 +4843,8 @@ def run_backend_moe(
         args["output_dtype"] = dtype
     elif backend_type == MoeBackendType.TRTLLM:
         args["token_final_scales"] = token_final_scales.to(torch.bfloat16)
-        # A leaf whose kernel cannot route (e.g. FlashInfer BF16) takes top-k
-        # from the host, as the scheduler supplies it in production.
+        # A leaf that routes on the host for this config takes top-k from
+        # the host, as the scheduler supplies it in production.
         if trtllm_use_router_logits and not backend._routes_outside_the_kernel():
             # Use router_logits for routing (TRTLLM will compute topk internally)
             args["router_logits"] = router_logits
@@ -5607,7 +5607,7 @@ def test_moe_backend(
 # =====================================================================
 # BF16 (unquantized) TRTLLM-Gen MoE: DeepSeekV3 / Renormalize routing
 # =====================================================================
-# Covers the BF16 FlashInfer path beyond the Renormalize/SwiGLU cases of the
+# Covers the BF16 path beyond the Renormalize/SwiGLU cases of the
 # main test_moe_backend matrix (Nemotron-H enablement): DeepSeekV3/Renormalize
 # routing x Relu2/Swiglu, via both fused and separated routing.
 
@@ -5788,8 +5788,13 @@ def _run_trtllm_bf16_unquantized_moe(
                 trtllm_use_router_logits=trtllm_use_router_logits,
             )
 
-        # Autotune, then verify accuracy against the reference.
-        with torch.inference_mode(), autotune(cache_path="/tmp/moe_autotuner_cache.json"):
+        # Autotune the actual shape only, with the matrix test's short profiling,
+        # then verify accuracy against the reference.
+        autotuner = AutoTuner.get()
+        autotuner.warmup = 0
+        autotuner.repeat = 1
+        autotuner.stream_delay_micro_secs = 10
+        with torch.inference_mode(), autotune(skip_dynamic_tuning_buckets=True):
             _ = run_moe()
         with torch.inference_mode():
             output = run_moe()

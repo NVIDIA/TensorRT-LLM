@@ -399,9 +399,9 @@ exactly one leaf.
 Ids follow the class names (`trtllm.trtllm_gen.fused_moe.nvfp4`,
 `trtllm.trtllm_gen.fused_moe.none`), keeping the technique and kernel
 segments so a future non-TRTLLM-Gen kernel from the same provider stays
-distinguishable. The two native formats on runner ops of their own subclass the
-family base directly: a per-quant parent implementing three methods for one
-subclass buys nothing. Because the `quant` segments are disjoint, the order of
+distinguishable. The three formats on runner ops of their own (`none`,
+`w4a8_nvfp4_fp8`, `w4a8_mxfp4_fp8`) subclass the family base directly: a
+per-quant parent implementing three methods for one subclass buys nothing. Because the `quant` segments are disjoint, the order of
 the TRTLLM-Gen leaves within `IMPL_PRIORITY` does not matter.
 
 Only a registered class may be resolved to, and importing the package is what
@@ -733,10 +733,15 @@ cubins through `trtllm::bf16_moe_runner`, with the weights in the shuffled
 BlockMajorK layout `BF16TRTLLMGenFusedMoEMethod` produces. It is the only
 TRTLLM-Gen leaf reachable on a host with no quantization configured at all. Its
 cubins ship gated SwiGLU and Relu2 gemm1 epilogues and take no expert bias or
-activation constants. One shape gate applies: `intermediate_size_per_partition`
-has to be a multiple of 128, so a non-aligned shard is `SHAPE_UNALIGNED` and
-falls back to Cutlass rather than failing in the op — Qwen3.5-35B BF16 TP8
-shards 512 → 64 and takes that path.
+activation constants. Its shape gates are kernel requirements: every BF16 cubin
+has tileM 128 and tileK 128 (or 64), so `hidden_size` and
+`intermediate_size_per_partition` both have to be multiples of 128. A
+non-aligned layer is `SHAPE_UNALIGNED` and falls back to Cutlass rather than
+failing at warmup — Qwen3.5-35B BF16 TP8 shards 512 → 64 and takes that path.
+More than 2048 expert slots or `top_k` above 32 is `ROUTING_UNSUPPORTED`. The
+kernel routes from the logits, except while something reads the host top-k
+(Router Replay, ExpertStatistic, the layer-wise benchmark calibrator,
+`ENABLE_PERFECT_ROUTER=expert_ids`): then the leaf routes on the host.
 
 ¶ On SM107 both CuteDSL grouped-GEMM leaves need `MoEDep.CUTEDSL_RUBIN` (the
 installed CuTe DSL exposes the Rubin helpers), and the family carries three

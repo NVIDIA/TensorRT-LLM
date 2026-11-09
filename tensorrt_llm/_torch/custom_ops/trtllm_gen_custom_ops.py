@@ -2310,7 +2310,7 @@ class Bf16MoERunner(TunableRunner):
                  do_finalize: bool,
                  act_type: int,
                  tune_max_num_tokens: int = 8192,
-                 use_dp: bool = False):
+                 use_dp: bool = False) -> None:
         self.num_experts = num_experts
         self.top_k = top_k
         self.n_group = n_group
@@ -2328,11 +2328,11 @@ class Bf16MoERunner(TunableRunner):
             tune_max_num_tokens=tune_max_num_tokens,
             use_dp=use_dp)
 
-    def unique_id(self):
+    def unique_id(self) -> Tuple[int, int, int, int]:
         return (self.top_k, self.intermediate_size, self.local_num_experts,
                 self.act_type)
 
-    def get_runner(self):
+    def get_runner(self) -> torch.ScriptObject:
         instance_key = (self.act_type, )
         if instance_key not in Bf16MoERunner.runner_dict:
             Bf16MoERunner.runner_dict[
@@ -2499,7 +2499,8 @@ def bf16_moe_runner(routing_logits: Optional[torch.Tensor],
         input_tensors_for_tuner,
     )
 
-    # A copy: the tuner above profiled with the dummy routing tensors.
+    # The tuner profiled with the dummy routing tensors; swap the real ones
+    # into a copy, since AutoTuner.capture() keeps a reference to its list.
     input_tensors = list(input_tensors_for_tuner)
     input_tensors[0] = routing_logits
     input_tensors[-2] = topk_weights
@@ -2518,34 +2519,37 @@ def bf16_moe_runner(routing_logits: Optional[torch.Tensor],
 
 
 @bf16_moe_runner.register_fake
-def _(routing_logits,
-      routing_bias,
-      hidden_states,
-      gemm1_weights,
-      gemm2_weights,
-      num_experts,
-      top_k,
-      n_group,
-      topk_group,
-      intermediate_size,
-      local_expert_offset,
-      local_num_experts,
-      routed_scaling_factor,
-      routing_method_type,
-      do_finalize,
-      act_type=ActType_TrtllmGen.SwiGlu.value,
+def _(routing_logits: Optional[torch.Tensor],
+      routing_bias: Optional[torch.Tensor],
+      hidden_states: torch.Tensor,
+      gemm1_weights: torch.Tensor,
+      gemm2_weights: torch.Tensor,
+      num_experts: int,
+      top_k: int,
+      n_group: Optional[int],
+      topk_group: Optional[int],
+      intermediate_size: int,
+      local_expert_offset: int,
+      local_num_experts: int,
+      routed_scaling_factor: Optional[float],
+      routing_method_type: int,
+      do_finalize: bool,
+      act_type: int = ActType_TrtllmGen.SwiGlu.value,
       topk_weights: Optional[torch.Tensor] = None,
       topk_ids: Optional[torch.Tensor] = None,
       output: Optional[torch.Tensor] = None,
       tune_max_num_tokens: int = 8192,
       use_dp: bool = False) -> List[torch.Tensor]:
     if do_finalize:
+        # With ``output`` the op writes into it and returns an empty placeholder.
         if output is not None:
             return [hidden_states.new_empty((0, ), dtype=torch.bfloat16)]
         return [
             hidden_states.new_empty(hidden_states.shape, dtype=torch.bfloat16)
         ]
-    # The op returns its top-k weights in bf16 whatever the routing bias dtype.
+    # gemm2_output's row count depends on the tile the tactic picks, so this is
+    # the bound for the largest tile. The op returns its top-k weights in bf16
+    # whatever the routing bias dtype.
     return fp4_block_scale_fake_output_without_finalize(hidden_states,
                                                         num_experts,
                                                         top_k,

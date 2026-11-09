@@ -697,6 +697,43 @@ def test_trtllm_literal_picks_the_bf16_leaf_without_flashinfer() -> None:
     assert impl_class_for(report) is TrtllmTrtllmGenBf16Impl
 
 
+def test_bf16_leaf_routes_on_the_host_while_its_top_k_is_read(monkeypatch) -> None:
+    """Router Replay and the other host top-k readers get a top-k to read.
+
+    The kernel routes from the logits, so without host routing they would see
+    nothing. The leaf stands in as a namespace: the hook reads no instance state.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import trtllm_bf16
+
+    requires = TrtllmTrtllmGenBf16Impl._requires_separated_routing
+    leaf = SimpleNamespace()
+    monkeypatch.delenv("ENABLE_PERFECT_ROUTER", raising=False)
+    assert not requires(leaf)
+    monkeypatch.setenv("ENABLE_PERFECT_ROUTER", "expert_ids")
+    assert requires(leaf)
+    monkeypatch.delenv("ENABLE_PERFECT_ROUTER")
+    monkeypatch.setattr(trtllm_bf16, "get_active_route_capture", lambda: object())
+    assert requires(leaf)
+
+
+@pytest.mark.parametrize(
+    "shape, reason",
+    [
+        ({"hidden_size": 2112}, MoERejectReason.SHAPE_UNALIGNED),
+        ({"top_k": 33}, MoERejectReason.ROUTING_UNSUPPORTED),
+    ],
+    ids=["hidden_not_128_aligned", "top_k_above_32"],
+)
+def test_bf16_leaf_declines_shapes_no_cubin_or_routing_kernel_runs(shape, reason) -> None:
+    """Declined during selection, so the layer falls back instead of failing at warmup."""
+    verdict = TrtllmTrtllmGenBf16Impl.can_implement(
+        MoEProblem(quant=None, dtype_act=torch.bfloat16, **shape),
+        _single_rank_deployment(_trtllm_gen_environment()),
+    )
+    assert not verdict.eligible
+    assert verdict.reject_reason is reason
+
+
 # The leaves whose runner reads no expert bias: the fp8/fp4 activation cubins
 # take none, and neither do the unquantized ones.
 _NO_EXPERT_BIAS_IDS = (

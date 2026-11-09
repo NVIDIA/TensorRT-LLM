@@ -313,10 +313,10 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
             )
 
     def _requires_separated_routing(self) -> bool:
-        """Whether this leaf's kernel takes top-k from the host, not the logits.
+        """Whether this leaf takes top-k from the host, not the logits.
 
         False by default: these cubins route internally from the logits. A
-        leaf whose kernel has no internal routing overrides this.
+        leaf overrides this when it has to route on the host.
         """
         return False
 

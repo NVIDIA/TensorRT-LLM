@@ -18,12 +18,16 @@ The MTP layer of the GLM-5.2 NVFP4 checkpoint is unquantized, so its routed
 experts run the TRT-LLM-Gen BF16 MoE (``TrtllmTrtllmGenBf16Impl``,
 ``trtllm::bf16_moe_runner``). ``routed_output`` replaces that call with
 ``native_ops.draft_routed_moe`` on the leaf's own weight buffers (no
-copy, no re-layout) and returns the same finalized ``[R, 6144]`` BF16 tensor,
-bit for bit:
+copy, no re-layout) and returns the finalized ``[R, 6144]`` BF16 tensor. The
+kernels were written bit-exact against FlashInfer's JIT build of the same
+computation:
 
-* routing: TRT-LLM-Gen's ``routingCustom`` with ``SigmoidBias`` preprocess and
-  ``ScaledSumNormalize`` postprocess (DeepSeek-V3 with ``n_group <= 1``),
-  including its fast-math instructions, tie order and FP32 sum order;
+* routing: ``routingCustom`` with ``SigmoidBias`` preprocess and
+  ``ScaledSumNormalize`` postprocess (DeepSeek-V3 with ``n_group <= 1``) as
+  that build compiles it: fast-math sigmoid and division, sum epsilon 1e-20,
+  its tie order and FP32 sum order. ``trtllm::bf16_moe_runner`` computes the
+  sigmoid and the division precisely, so routing weights can differ in the
+  last bits and near-tied scores can select different experts;
 * FC1/FC2: ``mma.sync`` over K in natural order with one FP32 accumulator per
   output element (the batched-GEMM cubins accumulate K sequentially and have
   no split-K), the cubin's SwiGLU epilogue and BF16 rounding;
