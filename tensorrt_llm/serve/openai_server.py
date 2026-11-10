@@ -1456,8 +1456,11 @@ class OpenAIServer(_VideoRoutesMixin):
         are enabled. The frontend is rank 0 and serves every rank's report,
         so ``TLLM_MEM_MONITOR_RANKS`` does not decide whether it exists.
         """
-        from tensorrt_llm._torch.memory.monitor import full_mode_requested
+        from tensorrt_llm._torch.memory.monitor import (configure,
+                                                        full_mode_requested)
 
+        args = getattr(self.generator, "args", None)
+        configure(getattr(args, "memory_monitor_config", None))
         if not full_mode_requested():
             return
         if not self._enable_runtime_control_endpoints:

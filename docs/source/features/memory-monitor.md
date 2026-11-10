@@ -23,13 +23,32 @@ The memory monitor is a prototype and its report format may change.
 
 ## Modes
 
-`TLLM_MEM_MONITOR` selects one of three modes:
+`memory_monitor_config.mode` in the LLM arguments, or the
+`TLLM_MEM_MONITOR` environment variable, selects one of three modes:
 
 | Value | Mode | What it does |
 |---|---|---|
 | unset or `oom` | out-of-memory reports (default) | A report when an allocation fails once the executor has started, and nothing else. |
 | `1` (or `full`) | full | Also records startup and reports when it finishes, compares later reports with that point, and enables periodic reports and `GET /memory_report`. |
 | `0` (or `off`) | off | No reports are produced on their own. |
+
+```yaml
+# trtllm-serve <model> --config config.yaml
+memory_monitor_config:
+  mode: full
+  report_dir: /tmp/memory-reports
+```
+
+```python
+from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import MemoryMonitorConfig
+
+llm = LLM(model=..., memory_monitor_config=MemoryMonitorConfig(mode="full"))
+```
+
+Each field of `memory_monitor_config` has an environment variable, listed
+below; a variable that is set overrides the field, so a run can be
+diagnosed without changing its configuration:
 
 ```bash
 TLLM_MEM_MONITOR=1 trtllm-serve <model> ...
@@ -53,14 +72,14 @@ TensorRT-LLM's default log level. Startup and periodic reports go at INFO
 level, and a failed startup at WARNING: set `TLLM_LOG_LEVEL=info` to see
 them, on every rank -- the LLM API raises the level for rank 0 only.
 
-| Variable | Modes | Default | Effect |
-|---|---|---|---|
-| `TLLM_MEM_MONITOR` | | `oom` | `0`, `oom` or `1`; see above. An unrecognised value is reported once and the default is used. |
-| `TLLM_MEM_MONITOR_RANKS` | default, full | all ranks | Ranks that report, e.g. `0`, `0,4` or `0-3`. |
-| `TLLM_MEM_MONITOR_OOM_INTERVAL` | default, full | `60` | Minimum seconds between two out-of-memory reports; a retry loop that fails repeatedly produces one report per interval. |
-| `TLLM_MEM_MONITOR_DIR` | default, full | unset | Also write each startup, periodic and out-of-memory report to its own file in this directory, named by rank, process and time. Logs from several ranks interleave and are often cut short when a job dies; the files survive. |
-| `TLLM_MEM_MONITOR_INTERVAL` | full | unset | Report every this many seconds while serving, to watch memory that grows slowly. At least 1 second. |
-| `TLLM_MEM_MONITOR_STACKS` | full | unset | `1` records the allocating Python stack of every live PyTorch block, so that the "PyTorch, unattributed" row is broken down by the code that allocated it. Needs PyTorch's native allocator. Slows PyTorch allocations; turn it on to reproduce a problem, not in production. |
+| Variable | `memory_monitor_config` field | Modes | Default | Effect |
+|---|---|---|---|---|
+| `TLLM_MEM_MONITOR` | `mode` | | `oom` | `0`, `oom` or `1`; see above. An unrecognised value is reported once and the default is used. |
+| `TLLM_MEM_MONITOR_RANKS` | `ranks` | default, full | all ranks | Ranks that report, e.g. `0`, `0,4` or `0-3`. |
+| `TLLM_MEM_MONITOR_OOM_INTERVAL` | `oom_report_interval` | default, full | `60` | Minimum seconds between two out-of-memory reports; a retry loop that fails repeatedly produces one report per interval. |
+| `TLLM_MEM_MONITOR_DIR` | `report_dir` | default, full | unset | Also write each startup, periodic and out-of-memory report to its own file in this directory, named by rank, process and time. Logs from several ranks interleave and are often cut short when a job dies; the files survive. |
+| `TLLM_MEM_MONITOR_INTERVAL` | `periodic_report_interval` | full | unset | Report every this many seconds while serving, to watch memory that grows slowly. At least 1 second. |
+| `TLLM_MEM_MONITOR_STACKS` | `record_stacks` | full | unset | `1` records the allocating Python stack of every live PyTorch block, so that the "PyTorch, unattributed" row is broken down by the code that allocated it. Needs PyTorch's native allocator. Slows PyTorch allocations; turn it on to reproduce a problem, not in production. |
 
 ## Asking for a report
 
@@ -171,6 +190,9 @@ on resume.
 * **Allocation stacks need PyTorch's native allocator.** With
   `PYTORCH_ALLOC_CONF=backend:cudaMallocAsync` or a pluggable allocator,
   `TLLM_MEM_MONITOR_STACKS=1` records nothing.
+* **One executor at a time per process for startup records.** Each
+  executor's components are reported separately, but the startup-step
+  breakdown and the warmup baseline describe the executor started last.
 
 ## Cost
 

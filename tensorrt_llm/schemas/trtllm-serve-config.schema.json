@@ -4171,6 +4171,84 @@
       "title": "MambaStateConfig",
       "type": "object"
     },
+    "MemoryMonitorConfig": {
+      "additionalProperties": false,
+      "description": "Configuration for the GPU memory monitor.\n\nEach field corresponds to a ``TLLM_MEM_MONITOR*`` environment variable;\na variable that is set overrides the field. See\n``docs/source/features/memory-monitor.md``.",
+      "properties": {
+        "mode": {
+          "default": "oom",
+          "description": "'oom' reports when GPU memory runs out and does nothing until then; 'full' also records startup, reports when it completes and compares later reports with that point; 'off' produces no reports on its own. Overridden by TLLM_MEM_MONITOR.",
+          "enum": [
+            "off",
+            "oom",
+            "full"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "oom_report_interval": {
+          "default": 60.0,
+          "description": "Minimum seconds between two out-of-memory reports. Overridden by TLLM_MEM_MONITOR_OOM_INTERVAL.",
+          "minimum": 0,
+          "title": "Oom Report Interval",
+          "type": "number"
+        },
+        "periodic_report_interval": {
+          "anyOf": [
+            {
+              "minimum": 1.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "In 'full' mode, report every this many seconds while serving. Overridden by TLLM_MEM_MONITOR_INTERVAL.",
+          "title": "Periodic Report Interval"
+        },
+        "ranks": {
+          "anyOf": [
+            {
+              "items": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Ranks that report; all ranks when unset. Overridden by TLLM_MEM_MONITOR_RANKS.",
+          "title": "Ranks"
+        },
+        "record_stacks": {
+          "default": false,
+          "description": "In 'full' mode, record the Python stack of every live PyTorch allocation so that unattributed PyTorch memory is broken down by the code that allocated it. Slows every PyTorch allocation; meant for reproducing a problem. Overridden by TLLM_MEM_MONITOR_STACKS.",
+          "title": "Record Stacks",
+          "type": "boolean"
+        },
+        "report_dir": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Directory to which every report is also written, one file per report. Overridden by TLLM_MEM_MONITOR_DIR.",
+          "title": "Report Dir"
+        }
+      },
+      "title": "MemoryMonitorConfig",
+      "type": "object"
+    },
     "MiniMaxM3SparseAttentionConfig": {
       "additionalProperties": false,
       "description": "Configuration for MiniMax-M3 block-sparse attention.\n\nDrives the two-step sparse attention used by MiniMax-M3 layers 3..N:\n\n  1. An index attention branch projects a per-head Q vector and a single\n     replicated K vector, scores main K/V cache blocks, and selects the\n     top-k blocks per (num_kv_heads, q_token) pair, with init_blocks forced\n     at the head and local_blocks forced at the tail.\n  2. A sparse GQA attention runs only over the selected blocks.\n\nAt runtime one of the MiniMax-M3 sparse attention backends under\ntensorrt_llm._torch.attention.backends.sparse.minimax_m3 is selected. The\nchosen backend runs on top of a MiniMaxM3KVCacheManagerV2 that allocates a\npaged side index-K cache of shape [num_slots, 1, sparse_index_dim] parallel\nto the main K/V cache. The M3 checkpoint sets disable_index_value=True on\nevery sparse layer, so no index V cache is allocated.",
@@ -7948,6 +8026,19 @@
       "status": "prototype",
       "title": "Max Stats Len",
       "type": "integer"
+    },
+    "memory_monitor_config": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MemoryMonitorConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Configuration for the GPU memory monitor, which explains out-of-memory errors. Unset uses the defaults: a report when GPU memory runs out, and nothing else.",
+      "status": "prototype"
     },
     "mla_skip_correction_threshold": {
       "default": 8.0,

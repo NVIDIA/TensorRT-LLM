@@ -161,7 +161,9 @@ class _FailedAllocation:
 
     device: int
     requested_bytes: int
-    device_total: int
+    #: What PyTorch may hold on the device: the device total, or the
+    #: per-process limit once ``set_per_process_memory_fraction`` set one.
+    pytorch_limit: int
     device_free: int
     live_bytes: int | None
     reserved_bytes: int | None
@@ -177,8 +179,8 @@ class _FailedAllocation:
             )
         return (
             f"PyTorch could not allocate {self.requested_bytes / gib:.2f} GiB on device "
-            f"{self.device} (device free {self.device_free / gib:.2f} of "
-            f"{self.device_total / gib:.2f} GiB{held})"
+            f"{self.device} (device free {self.device_free / gib:.2f} GiB; PyTorch may use up "
+            f"to {self.pytorch_limit / gib:.2f} GiB{held})"
         )
 
 
@@ -193,13 +195,13 @@ def _oom_interval_s() -> float:
 
 def _periodic_interval_s() -> float:
     """Seconds between periodic reports; ``0`` for none."""
-    from . import seconds_setting, warn_once
+    from . import seconds_setting, setting, warn_once
 
     interval = seconds_setting(PERIODIC_INTERVAL_VAR, 0.0)
     if 0 < interval < MIN_PERIODIC_INTERVAL_S:
         warn_once(
             PERIODIC_INTERVAL_VAR,
-            os.environ.get(PERIODIC_INTERVAL_VAR, ""),
+            setting(PERIODIC_INTERVAL_VAR) or "",
             f"is below the minimum of {MIN_PERIODIC_INTERVAL_S:g} s; using the minimum",
         )
         return MIN_PERIODIC_INTERVAL_S
@@ -279,7 +281,9 @@ _UNSAFE_FILE_CHARS = re.compile(r"[^A-Za-z0-9._-]")
 
 def _save(text: str, tag: str, rank: int | None) -> str | None:
     """Write a report to ``TLLM_MEM_MONITOR_DIR``; the path, or ``None``."""
-    directory = os.environ.get(DIR_VAR, "").strip()
+    from . import setting
+
+    directory = (setting(DIR_VAR) or "").strip()
     if not directory:
         return None
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000_000:09d}"
@@ -344,9 +348,12 @@ def _report_oom(headline: str) -> None:
 
 
 def _on_out_of_memory(
-    device: int, requested_bytes: int, device_total: int, device_free: int
+    device: int, requested_bytes: int, pytorch_limit: int, device_free: int
 ) -> None:
     """torch's OOM observer: record the failed allocation, report nothing.
+
+    torch passes the device total as ``pytorch_limit``, or the per-process
+    limit when one is set.
 
     torch calls it before the caller can catch the error; whether the error
     is a failure is decided later, when it reaches :func:`notify_error`.
@@ -363,7 +370,7 @@ def _on_out_of_memory(
     _last_failed_allocation = _FailedAllocation(
         device=device,
         requested_bytes=requested_bytes,
-        device_total=device_total,
+        pytorch_limit=pytorch_limit,
         device_free=device_free,
         live_bytes=live,
         reserved_bytes=reserved,

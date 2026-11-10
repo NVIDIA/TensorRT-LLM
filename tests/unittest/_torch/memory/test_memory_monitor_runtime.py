@@ -139,7 +139,7 @@ def test_every_rank_has_an_entry(monkeypatch):
     reports = BaseWorker.get_memory_report(SimpleNamespace(engine=engine))
     assert reports[0] == "rank 0: the report could not be built; see this rank's log"
     assert [r.split(":")[0] for r in reports[1:]] == ["rank 1", "rank 2"]
-    assert "set TLLM_MEM_MONITOR=1" in reports[1]
+    assert "TLLM_MEM_MONITOR=1" in reports[1]
 
     # Ray workers each answer for themselves; nothing to add.
     engine._disable_mpi = True

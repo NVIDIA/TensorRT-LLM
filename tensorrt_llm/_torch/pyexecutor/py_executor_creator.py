@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
+from ..memory import monitor as gpu_memory_monitor
 from ..memory.monitor import pools as gpu_memory_pools
 from ..memory.monitor import providers as gpu_memory_providers
 from ..memory.monitor import startup as gpu_memory_startup
@@ -1578,6 +1579,9 @@ def create_py_executor(
     """
     previous_dwdp_manager = get_global_dwdp_manager()
     previous_dense_manager = get_global_dense_dwdp_manager()
+    # The memory monitor's settings; environment variables override them.
+    gpu_memory_monitor.configure(
+        getattr(llm_args, "memory_monitor_config", None))
     # Components registered with the memory monitor from here on belong to
     # this executor and are dropped at its shutdown.
     monitor_token = gpu_memory_providers.begin_executor()

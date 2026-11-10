@@ -4318,6 +4318,48 @@ class _SleepConfigDefaultFactory:
         return self.default_mode
 
 
+class MemoryMonitorConfig(StrictBaseModel):
+    """Configuration for the GPU memory monitor.
+
+    Each field corresponds to a ``TLLM_MEM_MONITOR*`` environment variable;
+    a variable that is set overrides the field. See
+    ``docs/source/features/memory-monitor.md``.
+    """
+
+    mode: Literal["off", "oom", "full"] = Field(
+        default="oom",
+        description="'oom' reports when GPU memory runs out and does nothing "
+        "until then; 'full' also records startup, reports when it completes "
+        "and compares later reports with that point; 'off' produces no "
+        "reports on its own. Overridden by TLLM_MEM_MONITOR.")
+    ranks: Optional[List[NonNegativeInt]] = Field(
+        default=None,
+        min_length=1,
+        description="Ranks that report; all ranks when unset. Overridden by "
+        "TLLM_MEM_MONITOR_RANKS.")
+    record_stacks: bool = Field(
+        default=False,
+        description="In 'full' mode, record the Python stack of every live "
+        "PyTorch allocation so that unattributed PyTorch memory is broken "
+        "down by the code that allocated it. Slows every PyTorch allocation; "
+        "meant for reproducing a problem. Overridden by "
+        "TLLM_MEM_MONITOR_STACKS.")
+    periodic_report_interval: Optional[float] = Field(
+        default=None,
+        ge=1.0,
+        description="In 'full' mode, report every this many seconds while "
+        "serving. Overridden by TLLM_MEM_MONITOR_INTERVAL.")
+    oom_report_interval: NonNegativeFloat = Field(
+        default=60.0,
+        description="Minimum seconds between two out-of-memory reports. "
+        "Overridden by TLLM_MEM_MONITOR_OOM_INTERVAL.")
+    report_dir: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description="Directory to which every report is also written, one "
+        "file per report. Overridden by TLLM_MEM_MONITOR_DIR.")
+
+
 class SleepConfig(StrictBaseModel):
     """Configuration for the LLM sleep/wakeup feature."""
 
@@ -7724,6 +7766,13 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Configuration for the LLM sleep feature. "
         "Sleep feature requires extra setup that may slow down model loading. "
         "Only enable it if you intend to use this feature.",
+        status="prototype")
+
+    memory_monitor_config: Optional[MemoryMonitorConfig] = Field(
+        default=None,
+        description="Configuration for the GPU memory monitor, which explains "
+        "out-of-memory errors. Unset uses the defaults: a report when GPU "
+        "memory runs out, and nothing else.",
         status="prototype")
 
     reorder_policy_config: Optional[ReorderRequestPolicyConfig] = Field(

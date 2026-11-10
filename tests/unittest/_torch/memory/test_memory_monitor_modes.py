@@ -100,3 +100,57 @@ def test_off_reports_nothing(monkeypatch):
     assert triggers.install_oom_reporter(rank=0) is False
     triggers.notify_error("CUDA error: out of memory")
     assert seen == []
+
+
+def test_llm_args_configure_the_monitor_and_the_environment_overrides(monkeypatch, tmp_path):
+    from pydantic import ValidationError
+
+    from tensorrt_llm.llmapi import MemoryMonitorConfig, TorchLlmArgs
+
+    for var in (
+        mon.ENV_VAR,
+        mon.RANK_ENV_VAR,
+        mon.STACKS_ENV_VAR,
+        triggers.PERIODIC_INTERVAL_VAR,
+        triggers.OOM_INTERVAL_VAR,
+        triggers.DIR_VAR,
+    ):
+        monkeypatch.delenv(var, raising=False)
+    config = MemoryMonitorConfig(
+        mode="full",
+        ranks=[0, 2],
+        record_stacks=True,
+        periodic_report_interval=30,
+        oom_report_interval=5,
+        report_dir=str(tmp_path),
+    )
+    args = TorchLlmArgs(model="/tmp/dummy_model", memory_monitor_config=config)
+    try:
+        mon.configure(args.memory_monitor_config)
+        assert mon.mode() == "full", "the configured mode"
+        assert mon.selected_ranks() == frozenset({0, 2}), "the configured ranks"
+        assert mon.stacks_requested(), "the configured stack recording"
+        assert triggers._periodic_interval_s() == 30.0, "the configured periodic interval"
+        assert triggers._oom_interval_s() == 5.0, "the configured OOM interval"
+        assert mon.setting(triggers.DIR_VAR) == str(tmp_path), "the configured directory"
+
+        monkeypatch.setenv(mon.ENV_VAR, "0")
+        monkeypatch.setenv(mon.RANK_ENV_VAR, "1")
+        assert mon.mode() == "off", "a set variable overrides the configured mode"
+        assert mon.selected_ranks() == frozenset({1}), "and the configured ranks"
+    finally:
+        mon.configure(None)
+    monkeypatch.delenv(mon.ENV_VAR)
+    assert mon.mode() == "oom", "clearing the configuration restores the default"
+    assert TorchLlmArgs(model="/tmp/dummy_model").memory_monitor_config is None
+
+    for bad in (
+        {"mode": "on"},
+        {"ranks": []},
+        {"ranks": [-1]},
+        {"periodic_report_interval": 0.5},
+        {"oom_report_interval": -1},
+        {"unknown": 1},
+    ):
+        with pytest.raises(ValidationError):
+            MemoryMonitorConfig(**bad)

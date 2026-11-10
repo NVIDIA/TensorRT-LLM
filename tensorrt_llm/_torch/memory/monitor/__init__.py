@@ -59,6 +59,7 @@ __all__ = [
     "Source",
     "capture",
     "clear_baseline",
+    "configure",
     "current_rank",
     "full_mode",
     "full_mode_requested",
@@ -66,6 +67,7 @@ __all__ = [
     "mode",
     "oom_reports_enabled",
     "render_capture",
+    "setting",
     "stacks_requested",
     "summarize_by_category",
 ]
@@ -103,6 +105,39 @@ _OFF_VALUES = frozenset({"", "0", "off", "false", "no"})
 _RANK_TOKEN = re.compile(r"(\d+)(?:-(\d+))?")
 #: ``(variable, value)`` pairs already warned about.
 _warned: set[tuple[str, str]] = set()
+#: Settings from ``memory_monitor_config``, by the variable they stand for.
+_configured: dict[str, str] = {}
+
+
+def configure(config) -> None:
+    """Take settings from ``TorchLlmArgs.memory_monitor_config``.
+
+    ``None`` clears them. Each setting is read as the value of the
+    environment variable it corresponds to, so both pass the same checks;
+    a variable that is set in the environment overrides the configuration.
+    """
+    from .triggers import DIR_VAR, OOM_INTERVAL_VAR, PERIODIC_INTERVAL_VAR
+
+    _configured.clear()
+    if config is None:
+        return
+    _configured[ENV_VAR] = config.mode
+    _configured[STACKS_ENV_VAR] = "1" if config.record_stacks else "0"
+    if config.ranks is not None:
+        _configured[RANK_ENV_VAR] = ",".join(str(r) for r in config.ranks)
+    if config.periodic_report_interval is not None:
+        _configured[PERIODIC_INTERVAL_VAR] = repr(float(config.periodic_report_interval))
+    _configured[OOM_INTERVAL_VAR] = repr(float(config.oom_report_interval))
+    if config.report_dir is not None:
+        _configured[DIR_VAR] = config.report_dir
+
+
+def setting(var: str) -> str | None:
+    """A monitor setting: the environment variable if set, else the configuration."""
+    value = os.environ.get(var)
+    if value is not None:
+        return value
+    return _configured.get(var)
 
 
 def warn_once(var: str, raw: str, problem: str) -> None:
@@ -115,7 +150,7 @@ def warn_once(var: str, raw: str, problem: str) -> None:
 
 def seconds_setting(var: str, default: float) -> float:
     """A non-negative number of seconds from ``var``; ``default`` if unset or invalid."""
-    raw = os.environ.get(var, "").strip()
+    raw = (setting(var) or "").strip()
     if not raw:
         return default
     try:
@@ -187,7 +222,7 @@ def mode() -> str:
 
     An unrecognised value falls back to the default, with one warning.
     """
-    raw = os.environ.get(ENV_VAR, "").strip().lower()
+    raw = (setting(ENV_VAR) or "").strip().lower()
     if not raw:
         return DEFAULT_MODE
     if raw in _MODE_VALUES:
@@ -224,7 +259,7 @@ def oom_reports_enabled(rank: int | None = None) -> bool:
 
 def stacks_requested() -> bool:
     """Whether ``TLLM_MEM_MONITOR_STACKS`` asks for allocation stacks."""
-    raw = os.environ.get(STACKS_ENV_VAR, "").strip().lower()
+    raw = (setting(STACKS_ENV_VAR) or "").strip().lower()
     if raw in _ON_VALUES:
         return True
     if raw not in _OFF_VALUES:
@@ -240,7 +275,7 @@ def selected_ranks() -> frozenset[int] | None:
     once and then ignored, so a typo costs the filter rather than every
     report.
     """
-    raw = os.environ.get(RANK_ENV_VAR)
+    raw = setting(RANK_ENV_VAR)
     if raw is None or not raw.strip():
         if raw is not None and raw != "":
             warn_once(RANK_ENV_VAR, raw, "selects no rank; reporting on every rank")

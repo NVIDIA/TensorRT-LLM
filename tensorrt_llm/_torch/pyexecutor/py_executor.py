@@ -2281,8 +2281,9 @@ class PyExecutor:
                 or getattr(self, "_disable_mpi", True)):
             return []
         return [
-            f"rank {rank}: not gathered; set TLLM_MEM_MONITOR=1 for the run "
-            "to get every rank's report" for rank in range(1, dist.world_size)
+            f"rank {rank}: not gathered; run with memory_monitor_config.mode='full' "
+            "(or TLLM_MEM_MONITOR=1) to get every rank's report"
+            for rank in range(1, dist.world_size)
         ]
 
     def _shutdown_sleep_wakeup_listeners(self) -> None:

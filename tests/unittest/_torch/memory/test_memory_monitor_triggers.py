@@ -249,7 +249,7 @@ def test_torch_observer_only_records(armed):
     assert len(emitted) == 1
     headline = emitted[0]["headline"]
     assert "PyTorch could not allocate 1.00 GiB on device 0" in headline
-    assert "device free 0.50 of 80.00 GiB" in headline
+    assert "device free 0.50 GiB; PyTorch may use up to 80.00 GiB" in headline
     assert "CUDA out of memory" in headline
     assert emitted[0]["device_index"] == 3, "built on the executor's device"
 
