@@ -29,6 +29,7 @@ import sys
 from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -917,10 +918,12 @@ def test_forced_device_page_table_matches_the_native_kernel(monkeypatch):
 
 @requires_native_page_table_kernel
 @pytest.mark.parametrize("heterogeneous", [False, True], ids=["swa", "heterogeneous_no_swa"])
-def test_forced_device_page_table_matches_non_cc_per_layer(monkeypatch, heterogeneous):
-    """Per-layer conversion retains its full-table H2D path under either policy."""
+@pytest.mark.parametrize("is_gen", [False, True], ids=["prefill", "decode"])
+def test_forced_device_page_table_matches_non_cc_per_layer(monkeypatch, heterogeneous, is_gen):
+    """Forced device staging preserves per-layer offsets without direct host reads."""
     request_ids = [1, 2]
     num_seqs = len(request_ids)
+    num_contexts = 0 if is_gen else num_seqs
 
     def materialize(setting: str) -> torch.Tensor:
         monkeypatch.setenv(_DEVICE_PAGE_TABLE_ENV, setting)
@@ -955,9 +958,16 @@ def test_forced_device_page_table_matches_non_cc_per_layer(monkeypatch, heteroge
                 manager.add_dummy_requests(
                     request_ids=request_ids,
                     token_nums=[_TOKENS_PER_REQUEST] * num_seqs,
+                    is_gen=is_gen,
                 )
                 is not None
             )
+            has_scratch = any(
+                manager.kv_cache_map[request_id].has_scratch_slots
+                for request_id in request_ids[:num_contexts]
+            )
+            if heterogeneous or is_gen:
+                assert not has_scratch
             output = torch.full(
                 (
                     manager.num_attention_op_pools,
@@ -969,20 +979,30 @@ def test_forced_device_page_table_matches_non_cc_per_layer(monkeypatch, heteroge
                 dtype=torch.int32,
                 device="cuda",
             )
-            manager.copy_batch_block_offsets(
-                output,
-                request_ids,
-                beam_width=1,
-                num_contexts=num_seqs,
-                num_seqs=num_seqs,
-            )
+            with mock.patch.object(
+                kvcm_v2,
+                "copy_per_layer_block_offsets_to_device",
+                wraps=kvcm_v2.copy_per_layer_block_offsets_to_device,
+            ) as native_copy:
+                manager.copy_batch_block_offsets(
+                    output,
+                    request_ids,
+                    beam_width=1,
+                    num_contexts=num_contexts,
+                    num_seqs=num_seqs,
+                )
+                if setting == "0" and not has_scratch:
+                    native_copy.assert_called_once()
+                else:
+                    native_copy.assert_not_called()
             torch.cuda.synchronize()
             if setting == "1":
                 assert manager._page_table_materializer._device_base_page_rows is None
-            torch.testing.assert_close(
-                manager._device_kv_cache_block_offsets_input.cpu(),
-                manager.host_kv_cache_block_offsets,
-            )
+            if setting == "1" or has_scratch:
+                torch.testing.assert_close(
+                    manager._device_kv_cache_block_offsets_input.cpu(),
+                    manager.host_kv_cache_block_offsets,
+                )
             return output.cpu()
         finally:
             manager.shutdown()

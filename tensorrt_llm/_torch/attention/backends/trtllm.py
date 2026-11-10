@@ -50,6 +50,7 @@ from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids, is_kimi_k3
 from ...pyexecutor import step_inputs
 from ...pyexecutor.config_utils import is_mla
 from ...pyexecutor.h2d_cache import copy_h2d_pool_shared
+from ...pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
@@ -415,6 +416,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return self.kv_cache_manager.kv_cache_pool_mapping if self.kv_cache_manager is not None else None
 
     def __post_init__(self) -> None:
+        # Pre-Hopper FMHA can load invalid pages before applying the window mask.
+        if (isinstance(self.kv_cache_manager, KVCacheManagerV2)
+                and self.kv_cache_manager.enable_swa_scratch_reuse
+                and get_sm_version() < 90):
+            raise ValueError(
+                "TRTLLM attention requires SM90 or newer for SWA scratch reuse. "
+                "Set kv_cache_config.enable_swa_scratch_reuse=False.")
         super().__post_init__()
         self.enable_helix = self.mapping.has_cp_helix(
         ) if self.mapping is not None else False
