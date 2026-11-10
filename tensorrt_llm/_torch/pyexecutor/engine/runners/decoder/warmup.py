@@ -22,6 +22,7 @@ from tensorrt_llm._torch.kernel_builder import KernelBuilder
 from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.nccl_window_graph import nccl_window_allocation_suppressed
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.config_utils import is_decode_only
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
@@ -326,11 +327,14 @@ class DecoderWarmup:
         from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
 
         try:
-            # force_eager: no torch.compile traces, whole-model or op-level.
+            # force_eager: no torch.compile traces, whole-model or op-level. Window
+            # requests come from plain memory, so the NCCL window pool grows only with
+            # the warmup that sizes it, not with these eager forwards' buffers too.
             with (
                 torch.inference_mode(),
                 torch.compiler.set_stance("force_eager"),
                 self._torch_compile_bypass(),
+                nccl_window_allocation_suppressed(),
             ):
                 self._prewarm_minimax_m3_msa_indexer(kv_cache_manager)
                 self._run_attention_warmup(resource_manager, can_run_general_warmup)
