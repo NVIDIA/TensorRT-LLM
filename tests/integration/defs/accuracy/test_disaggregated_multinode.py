@@ -15,6 +15,7 @@
 import contextlib
 import os
 import re
+import sys
 import time
 from concurrent.futures import Future
 from pathlib import Path
@@ -27,11 +28,15 @@ import requests
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, LlmArgs
 from tensorrt_llm.llmapi.tokenizer import DeepseekV4Tokenizer
-from tests.unittest.llmapi.apps.openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
 
 from ..conftest import llm_models_root, skip_pre_blackwell
 from .accuracy_core import GSM8K, LlmapiAccuracyTestHarness
 from .test_disaggregated_serving import DuckLLM, MyThreadPoolExecutor, Result, run_accuracy_test
+
+# tests/ is not an importable package where the integration defs run, so load
+# openai_server from its directory (main does this with __extra_import_path__).
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "unittest" / "llmapi" / "apps"))
+from openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer  # noqa: E402
 
 # Run from the repository root without installing the repository into the image:
 #
