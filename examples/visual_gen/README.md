@@ -31,13 +31,7 @@ python models/ltx2.py --visual_gen_args configs/ltx2-1gpu.yaml
 python models/minimax_h3.py --model <approved-checkpoint> --visual_gen_args configs/minimax-h3-bf16-1gpu.yaml
 python models/flux1.py --visual_gen_args configs/flux1-dev-fp4-1gpu.yaml
 python models/flux2.py --visual_gen_args configs/flux2-dev-fp4-1gpu.yaml
-# FLUX.3 Klein (step-distilled); pass --model black-forest-labs/flux-3-image-klein-base for Klein Base.
-# FLUX.3 encodes prompts as given (no prompt upsampler): pass full scene captions, and caption the whole result of an edit.
-python models/flux3.py --visual_gen_args configs/flux3-bf16-1gpu.yaml --output_path lighthouse.png --prompt "A chunky knitted diorama of a lighthouse on a rocky island at sunset: a white and red striped cable-knit tower, tiny felt seagulls, waves of blue and teal yarn, warm orange light, shallow depth of field"
-python models/flux3.py --visual_gen_args configs/flux3-bf16-1gpu.yaml --image lighthouse.png --prompt "The same chunky knitted diorama of a lighthouse on a rocky island at night: the white and red striped cable-knit tower casts a yellow felt beam, embroidered stars fill a navy sky, waves of dark blue yarn, cool moonlight, shallow depth of field"
-# FLUX.3 with BFL's pre-quantized NVFP4 (variants/nvfp4) or FP8 rowwise (variants/fp8r) transformer weights.
 python models/flux3.py --visual_gen_args configs/flux3-fp4-1gpu.yaml
-python models/flux3.py --visual_gen_args configs/flux3-fp8-1gpu.yaml
 python models/cosmos3/cosmos3.py --visual_gen_args configs/cosmos3-nano-1gpu.yaml --prompt "A robot arm picks fruit in a grocery store"
 python models/qwen_image.py --visual_gen_args configs/qwen-image-fp8-1gpu.yaml
 python models/qwen_image_layered.py --visual_gen_args configs/qwen-image-layered-1gpu.yaml --image /path/to/image.png

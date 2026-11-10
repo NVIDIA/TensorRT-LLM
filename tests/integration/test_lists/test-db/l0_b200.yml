@@ -489,7 +489,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_flux.py::test_flux1_example
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_example
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_reference_image_example
-  - examples/visual_gen/test_visual_gen_flux.py::test_flux3_example[nvfp4]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux3_example
   - examples/visual_gen/test_visual_gen_flux.py::test_flux3_reference_image_example
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_example
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example
@@ -619,8 +619,6 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-fp8-blockwise]
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-nvfp4]
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-cuda-graph]
-  - examples/visual_gen/test_visual_gen_flux.py::test_flux3_example[bf16]
-  - examples/visual_gen/test_visual_gen_flux.py::test_flux3_example[fp8r]
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_feature_accuracy_against_golden[fp8-blockwise]
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_feature_accuracy_against_golden[nvfp4]
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_feature_accuracy_against_golden[cuda-graph]

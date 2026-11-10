@@ -26,20 +26,18 @@ def bounds(lengths: tuple[int, ...]) -> Bounds:
 
 @dataclass
 class Packed:
-    """Per modality: tokens [N, C], position ids [N, 4] and timesteps [num_samples]."""
+    """Per modality: tokens [N, C] and position ids [N, 4]."""
 
     data: dict[str, Tensor]
     ids: dict[str, Tensor]
-    timesteps: dict[str, Tensor]
     layout: Layout
 
     def kwargs(self) -> dict:
-        """Transformer inputs: ``layout`` and ``x_{modality}{,_ids,_timesteps}``."""
+        """Transformer inputs: ``layout`` and ``x_{modality}{,_ids}``."""
         result = {"layout": self.layout}
         for name, _ in self.layout:
             result[f"x_{name}"] = self.data[name]
             result[f"x_{name}_ids"] = self.ids[name]
-            result[f"x_{name}_timesteps"] = self.timesteps[name]
         return result
 
 
@@ -48,16 +46,16 @@ def pack(
 ) -> Packed:
     """Concatenate each modality's (tokens [n, C], ids [n, 4]) across samples, modalities sorted.
 
-    ``channels`` gives every modality's width C. Timesteps start at zero, one per sample.
+    ``channels`` gives every modality's width C.
     """
     if not samples:
         raise ValueError("FLUX.3 requires at least one packed sample")
     first = next((item for sample in samples for item in sample.values() if item is not None), None)
     if first is None:
         raise ValueError("FLUX.3 requires nonempty packed conditioning")
-    # Empty modalities and timesteps take the device and dtypes of the first present sample.
+    # Empty modalities take the device and dtypes of the first present sample.
     first_tokens, first_ids = first
-    data, ids, timesteps, layout = {}, {}, {}, []
+    data, ids, layout = {}, {}, []
     for sample in samples:
         if sample.keys() - channels.keys():
             raise ValueError("Unknown FLUX.3 packed modality")
@@ -80,6 +78,5 @@ def pack(
             lengths.append(length)
         data[name] = torch.cat(tokens) if tokens else first_tokens.new_zeros(0, width)
         ids[name] = torch.cat(positions) if positions else first_ids.new_zeros(0, NUM_POSITION_AXES)
-        timesteps[name] = first_tokens.new_zeros(len(samples))
         layout.append((name, tuple(lengths)))
-    return Packed(data, ids, timesteps, tuple(layout))
+    return Packed(data, ids, tuple(layout))

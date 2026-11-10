@@ -307,8 +307,8 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 |---|---|---|---|---|---|---|---|---|---|--|--|--|---|
 | **FLUX.1** | Yes | Yes | Yes | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **FLUX.2** | Yes | Yes | Yes | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **FLUX.3 Klein Base** | No\* | Yes\* | No | Yes | Yes | No | Yes | Yes | Yes | No | No | Yes | No |
-| **FLUX.3 Klein** | No\* | Yes\* | No | No | Yes | No | Yes | Yes | Yes | No | No | Yes | No |
+| **FLUX.3 Klein Base** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | Yes | No |
+| **FLUX.3 Klein** | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | No | No | Yes | No |
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **LTX-2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
@@ -318,5 +318,3 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **Qwen-Image-Layered** | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
-
-\* FLUX.3 runs FP8 rowwise instead of FP8 blockwise, and NVFP4 from BFL's pre-quantized weights; see [FLUX.3 Notes](./visual-generation.md#flux3-notes).

@@ -135,6 +135,8 @@ def _prepare_runtime_lora(
     )
     if _is_minimax_h3_turbo_lora(modules, pairs, strip_prefixes=strip_prefixes):
         pairs = _normalize_minimax_h3_turbo_pairs(pairs)
+    elif _is_flux3_lora(modules, pairs, strip_prefixes=strip_prefixes):
+        pairs = _normalize_flux3_pairs(pairs, strip_prefixes=strip_prefixes)
 
     qkv_groups: Dict[str, Dict[str, _LoRAPair]] = {}
     incomplete_qkv_names: List[str] = []
@@ -634,6 +636,61 @@ def _normalize_minimax_h3_turbo_name(name: str) -> str:
     normalized = normalized.replace(".mlp.fc1", ".ff.gate_up_proj")
     normalized = normalized.replace(".mlp.fc2", ".ff.down_proj")
     return normalized.replace("final_layer.adaln_proj.linear", "norm_out.linear")
+
+
+def _is_flux3_lora(
+    modules: Dict[str, nn.Module],
+    pairs: Iterable[_LoRAPair],
+    *,
+    strip_prefixes: Tuple[str, ...],
+) -> bool:
+    if not all(
+        name in modules
+        for name in (
+            "image_mode_blocks",
+            "image_cond_mode_blocks",
+            "txt_mode_blocks",
+            "single_transformer_blocks",
+            "norm_out.linear",
+        )
+    ):
+        return False
+
+    names = {_strip_known_prefix(pair.name, strip_prefixes) for pair in pairs}
+    return any(_normalize_flux3_name(name) != name for name in names)
+
+
+def _normalize_flux3_pairs(
+    pairs: Iterable[_LoRAPair], *, strip_prefixes: Tuple[str, ...]
+) -> List[_LoRAPair]:
+    # FLUX.3 adapters use BFL-native or Diffusers names; BFL orders output-norm rows shift, scale.
+    from .models.flux3.transformer_flux3 import BFL_NORM_OUT, swap_norm_out_halves
+
+    normalized: Dict[str, _LoRAPair] = {}
+    for pair in pairs:
+        name = _strip_known_prefix(pair.name, strip_prefixes)
+        target = _normalize_flux3_name(name)
+        if target in normalized:
+            raise ValueError(
+                f"Runtime LoRA tensors {normalized[target].name!r} and {pair.name!r} both "
+                f"target FLUX.3 module {target!r}"
+            )
+        b = swap_norm_out_halves(pair.b) if name == BFL_NORM_OUT else pair.b
+        prefix = pair.name[: len(pair.name) - len(name)]
+        normalized[target] = _LoRAPair(prefix + target, pair.a, b, pair.scale)
+    return list(normalized.values())
+
+
+def _normalize_flux3_name(name: str) -> str:
+    from .models.flux3.transformer_flux3 import bfl_to_diffusers_module, diffusers_to_module_name
+
+    try:
+        name = bfl_to_diffusers_module(name)
+    except ValueError:
+        pass
+    name = diffusers_to_module_name(name)
+    name = name.replace(".ff.linear_in", ".ff.gate_up_proj")
+    return name.replace(".ff.linear_out", ".ff.down_proj")
 
 
 def _strip_known_prefix(name: str, strip_prefixes: Tuple[str, ...]) -> str:

@@ -131,9 +131,8 @@ class BasePipeline(nn.Module):
     def hf_download_patterns(
         cls, patterns: List[str], pipeline_config: Dict[str, Any]
     ) -> List[str]:
-        """Hub allow-patterns for this ``pipeline_config`` (registry defaults plus user values).
+        """Hub allow-patterns for this ``pipeline_config``; an empty list fetches the whole repo.
 
-        ``patterns`` are the registered ones, returned by default; an empty list fetches the repo.
         Runs on the registered class before ``resolve_variant``; subclass-only overrides never run.
         """
         return patterns
@@ -146,9 +145,8 @@ class BasePipeline(nn.Module):
         pipeline_config: Dict[str, Any],
         quant_config: Any,
     ) -> Dict[str, Dict[str, Any]]:
-        """Diffusers component configs to build from, given the user's ``quant_config``.
+        """Diffusers component configs to build from; a returned ``quantization_config`` applies.
 
-        Runs before quantization is resolved, so a returned ``quantization_config`` applies.
         Runs on the registered class before ``resolve_variant``; subclass-only overrides never run.
         """
         return component_configs
@@ -852,13 +850,6 @@ class BasePipeline(nn.Module):
             f"world_size={dist.get_world_size(vgm.vae_group)}"
         )
 
-    def torch_compile_options(self) -> Optional[Dict[str, Any]]:
-        """Inductor options for this pipeline's torch.compile calls.
-
-        None compiles in the default mode; a dict is passed as ``options`` instead of a mode.
-        """
-        return None
-
     def torch_compile(self) -> None:
         """Apply torch.compile to pipeline components based on TorchCompileConfig.
 
@@ -871,11 +862,9 @@ class BasePipeline(nn.Module):
         self._remove_nccl_window_tensor_scope_hooks()
         tc_config = self.pipeline_config.torch_compile
 
-        # Default mode: max-autotune costs more init time for little gain.
-        # torch.compile rejects mode and options together.
-        options = self.torch_compile_options()
-        compile_kwargs = {"options": options} if options is not None else {"mode": "default"}
-        compile_desc = ", ".join(f"{key}={value}" for key, value in compile_kwargs.items())
+        # Using default as max-autotune mode takes more initialization time and
+        # does not improve performance a lot.
+        compile_mode = "default"
 
         # Compiling transformer blocks provides max performance value.
         targets = self.transformer_components
@@ -888,29 +877,30 @@ class BasePipeline(nn.Module):
 
             blocks_attr = self._find_transformer_blocks(model)
             if blocks_attr:
-                for block_path in blocks_attr:
-                    blocks = model.get_submodule(block_path)
+                for block_name in blocks_attr:
+                    blocks = getattr(model, block_name)
                     logger.info(
-                        f"torch.compile: {name}.{block_path} ({len(blocks)} blocks, {compile_desc})"
+                        f"torch.compile: {name}.{block_name} "
+                        f"({len(blocks)} blocks, mode={compile_mode})"
                     )
-                    compiled_blocks = nn.ModuleList(
-                        torch.compile(
-                            block,
-                            dynamic=None,
-                            fullgraph=tc_config.enable_fullgraph,
-                            **compile_kwargs,
+                    compiled_blocks = []
+                    for block in blocks:
+                        compiled_blocks.append(
+                            torch.compile(
+                                block,
+                                mode=compile_mode,
+                                dynamic=None,
+                                fullgraph=tc_config.enable_fullgraph,
+                            )
                         )
-                        for block in blocks
-                    )
-                    parent_path, _, attr = block_path.rpartition(".")
-                    setattr(model.get_submodule(parent_path), attr, compiled_blocks)
+                    setattr(model, block_name, nn.ModuleList(compiled_blocks))
             else:
-                logger.info(f"torch.compile: {name} (whole module, {compile_desc})")
+                logger.info(f"torch.compile: {name} (whole module, mode={compile_mode})")
                 compiled = torch.compile(
                     model,
+                    mode=compile_mode,
                     dynamic=None,
                     fullgraph=tc_config.enable_fullgraph,
-                    **compile_kwargs,
                 )
                 setattr(self, name, compiled)
         # Hooks stay outside the lazy-compiled blocks, so their opaque operations
@@ -918,21 +908,16 @@ class BasePipeline(nn.Module):
         self._install_nccl_window_tensor_scope_hooks()
 
     @staticmethod
-    def _find_transformer_blocks(model: nn.Module) -> List[str]:
+    def _find_transformer_blocks(model: nn.Module) -> list:
         """Find ModuleList children that look like transformer blocks.
 
-        Returns submodule paths of nn.ModuleList with >1 elements, including lists
-        one level inside an nn.ModuleDict child (e.g. ``mode_blocks.image``).
+        Returns list of attribute names containing nn.ModuleList with >1 elements.
         """
-        block_paths = []
+        block_names = []
         for name, child in model.named_children():
             if isinstance(child, nn.ModuleList) and len(child) > 1:
-                block_paths.append(name)
-            elif isinstance(child, nn.ModuleDict):
-                for key, grandchild in child.items():
-                    if isinstance(grandchild, nn.ModuleList) and len(grandchild) > 1:
-                        block_paths.append(f"{name}.{key}")
-        return block_paths
+                block_names.append(name)
+        return block_names
 
     def _uses_nccl_window_tensors(self) -> bool:
         strategy = getattr(self.pipeline_config, "allreduce_strategy", None)
@@ -972,8 +957,8 @@ class BasePipeline(nn.Module):
             model = getattr(self, name, None)
             if model is None:
                 continue
-            for block_path in self._find_transformer_blocks(model):
-                blocks.extend(model.get_submodule(block_path))
+            for block_name in self._find_transformer_blocks(model):
+                blocks.extend(getattr(model, block_name))
         self._nccl_window_tensor_scope_hooks = install_module_nccl_window_tensor_scopes(blocks)
 
     def warmup(self) -> None:

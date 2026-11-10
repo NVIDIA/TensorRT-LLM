@@ -391,25 +391,15 @@ def test_flux2_reference_image_example(_visual_gen_deps, llm_root, llm_venv, tmp
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
 
 
-# Example config for BF16 and each pre-quantized FLUX.3 variant.
-FLUX3_EXAMPLE_CONFIGS = {
-    "bf16": "flux3-bf16-1gpu.yaml",
-    "nvfp4": "flux3-fp4-1gpu.yaml",
-    "fp8r": "flux3-fp8-1gpu.yaml",
-}
-
-
-@pytest.mark.parametrize("precision", list(FLUX3_EXAMPLE_CONFIGS))
-def test_flux3_example(_visual_gen_deps, llm_root, llm_venv, precision):
-    """Run the FLUX.3 Klein example in BF16 and with each pre-quantized variant."""
+def test_flux3_example(_visual_gen_deps, llm_root, llm_venv):
+    """Run the FLUX.3 Klein example with the supported single-GPU NVFP4 config."""
     model_path = get_checkpoint("flux-3-image-klein")
-    config_name = FLUX3_EXAMPLE_CONFIGS[precision]
 
     out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "flux3_example")
     os.makedirs(out_dir, exist_ok=True)
-    output_path = os.path.join(out_dir, f"flux3_output_{precision}.png")
+    output_path = os.path.join(out_dir, "flux3_output.png")
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "flux3.py")
-    config_path = os.path.join(llm_root, "examples", "visual_gen", "configs", config_name)
+    config_path = os.path.join(llm_root, "examples", "visual_gen", "configs", "flux3-fp4-1gpu.yaml")
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
@@ -450,9 +440,7 @@ def test_flux3_reference_image_example(_visual_gen_deps, llm_root, llm_venv, tmp
     os.makedirs(out_dir, exist_ok=True)
     output_path = os.path.join(out_dir, "flux3_reference_image_output.png")
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "flux3.py")
-    config_path = os.path.join(
-        llm_root, "examples", "visual_gen", "configs", "flux3-bf16-1gpu.yaml"
-    )
+    config_path = os.path.join(llm_root, "examples", "visual_gen", "configs", "flux3-fp4-1gpu.yaml")
 
     venv_check_call(
         llm_venv,

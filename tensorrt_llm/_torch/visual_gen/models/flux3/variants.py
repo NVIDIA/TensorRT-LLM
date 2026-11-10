@@ -3,8 +3,7 @@
 
 """BFL pre-quantized FLUX.3 transformers in a checkpoint's ``variants/<variant>/`` directory.
 
-Each holds BFL-named weights and scales in model.safetensors, a BFL config.json and an
-hf_quant_config.json, which is translated here to a ModelOpt-style quantization_config.
+Each holds BFL-named weights, a config.json and an hf_quant_config.json read as ModelOpt config.
 """
 
 import json
@@ -17,7 +16,12 @@ from torch import Tensor
 from tensorrt_llm._torch.visual_gen.checkpoints import WeightLoader
 from tensorrt_llm.mapping import Mapping
 
-from .bfl_keys import bfl_to_diffusers_module, bfl_to_diffusers_state_dict
+from .transformer_flux3 import (
+    bfl_to_diffusers_module,
+    bfl_to_diffusers_state_dict,
+    diffusers_to_module_name,
+    format_names,
+)
 
 # Quantization algorithm of each variant, as its hf_quant_config.json names it.
 VARIANT_QUANT_ALGOS = {"nvfp4": "NVFP4", "fp8r": "FP8_PER_CHANNEL_PER_TOKEN"}
@@ -53,8 +57,8 @@ def _read_json(path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
-def _format_names(names: List[str], limit: int = 10) -> str:
-    return f"{len(names)} [{', '.join(names[:limit])}{', ...' if len(names) > limit else ''}]"
+def _module_name(bfl_name: str) -> str:
+    return diffusers_to_module_name(bfl_to_diffusers_module(bfl_name))
 
 
 def collapse_exclusions(excluded: Iterable[str], modules: Iterable[str]) -> List[str]:
@@ -86,8 +90,7 @@ def variant_quantization_config(
 ) -> Dict[str, Any]:
     """ModelOpt-style quantization_config of a variant with static weights.
 
-    BFL excludes become Diffusers module names via :func:`collapse_exclusions` over the Linears
-    whose weights are among the BFL ``tensor_names``.
+    BFL excludes become transformer module names over the Linears among the BFL ``tensor_names``.
     """
     quantization = hf_quant_config.get("quantization") or {}
     quant_algo = VARIANT_QUANT_ALGOS[variant]
@@ -105,11 +108,9 @@ def variant_quantization_config(
             )
         weights["group_size"] = group_size
     modules = [
-        bfl_to_diffusers_module(name[: -len(".weight")])
-        for name in tensor_names
-        if name.endswith(".weight")
+        _module_name(name[: -len(".weight")]) for name in tensor_names if name.endswith(".weight")
     ]
-    excluded = [bfl_to_diffusers_module(name) for name in quantization.get("exclude_modules", [])]
+    excluded = [_module_name(name) for name in quantization.get("exclude_modules", [])]
     return {
         "quant_algo": quant_algo,
         "config_groups": {
@@ -174,26 +175,26 @@ def check_variant_scales(
 ) -> None:
     """Raise unless each quantized module has every scale of ``variant`` and the others have none.
 
-    ``quantized_modules`` maps Diffusers checkpoint module names to whether they load quantized.
+    ``quantized_modules`` is the transformer's ``checkpoint_quantization()``, under its module
+    names; ``weights`` has Diffusers names.
     """
+    names = {diffusers_to_module_name(key) for key in weights}
     missing, unexpected = [], []
     for module, quantized in sorted(quantized_modules.items()):
         if quantized:
             missing += [
                 f"{module}.{suffix}"
                 for suffix in VARIANT_SCALES[variant]
-                if f"{module}.{suffix}" not in weights
+                if f"{module}.{suffix}" not in names
             ]
         else:
             unexpected += [
-                f"{module}.{suffix}"
-                for suffix in _SCALE_SUFFIXES
-                if f"{module}.{suffix}" in weights
+                f"{module}.{suffix}" for suffix in _SCALE_SUFFIXES if f"{module}.{suffix}" in names
             ]
     if missing or unexpected:
         raise ValueError(
             f"FLUX.3 {variant} weights do not match their quantization config: quantized layers "
-            f"miss {_format_names(missing)}, BF16 layers carry {_format_names(unexpected)}"
+            f"miss {format_names(missing)}, BF16 layers carry {format_names(unexpected)}"
         )
 
 

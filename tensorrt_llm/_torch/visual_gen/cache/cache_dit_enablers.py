@@ -315,6 +315,61 @@ def enable_cache_dit_for_flux(
     )
 
 
+def enable_cache_dit_for_flux3(
+    pipeline: Any, cache_dit_cfg: CacheDiTConfig
+) -> CacheDiTEnableResult:
+    """FLUX.3: Pattern_3 BlockAdapter over the joint single-stream blocks."""
+    calibrator = _maybe_calibrator(cache_dit_cfg)
+    # Every packed sample, CFG included, runs in one transformer call per step.
+    db_cfg = _build_db_cache_config(cache_dit_cfg, enable_separate_cfg=False)
+
+    if calibrator is not None:
+        logger.info(f"TaylorSeer enabled with order={cache_dit_cfg.taylorseer_order}")
+        modifier = ParamsModifier(cache_config=db_cfg, calibrator_config=calibrator)
+    else:
+        modifier = ParamsModifier(cache_config=db_cfg)
+
+    transformer = pipeline.transformer
+    compiled_blocks = _has_compiled_blocks(transformer.single_transformer_blocks)
+    if compiled_blocks:
+        logger.info(
+            "Cache-DiT: FLUX.3 blocks are torch.compile'd; skipping forward-pattern checks."
+        )
+    adapter = BlockAdapter(
+        transformer=transformer,
+        blocks=[transformer.single_transformer_blocks],
+        forward_pattern=[ForwardPattern.Pattern_3],
+        params_modifiers=[modifier],
+        check_forward_pattern=not compiled_blocks,
+        check_num_outputs=not compiled_blocks,
+    )
+
+    logger.info(
+        f"Cache-DiT: FLUX.3 Fn={db_cfg.Fn_compute_blocks}, Bn={db_cfg.Bn_compute_blocks}, "
+        f"W={db_cfg.max_warmup_steps}, R={cache_dit_cfg.residual_diff_threshold:.3f}",
+    )
+
+    _cached = cache_dit.enable_cache(
+        adapter,
+        cache_config=db_cfg,
+        calibrator_config=calibrator,
+    )
+
+    def refresh_flux3(num_inference_steps: int, **_kwargs) -> None:
+        _refresh_ctx(
+            transformer,
+            cache_dit_cfg,
+            num_inference_steps,
+            False,
+        )
+
+    return CacheDiTEnableResult(
+        refresh=refresh_flux3,
+        disable=lambda: cache_dit.disable_cache(_cached),
+        summary_modules=[transformer],
+    )
+
+
 def enable_cache_dit_for_ltx2(pipeline: Any, cache_dit_cfg: CacheDiTConfig) -> CacheDiTEnableResult:
     """Native LTX-2: Pattern_0 passes video latents and audio latents.
 
@@ -435,6 +490,8 @@ CUSTOM_CACHE_DIT_ENABLERS = {
     "WanImageToVideoPipeline": enable_cache_dit_for_wan,
     "FluxPipeline": lambda p, c: enable_cache_dit_for_flux(p, c, is_flux2=False),
     "Flux2Pipeline": lambda p, c: enable_cache_dit_for_flux(p, c, is_flux2=True),
+    "Flux3Pipeline": enable_cache_dit_for_flux3,
+    "Flux3DistilledPipeline": enable_cache_dit_for_flux3,
     "LTX2Pipeline": enable_cache_dit_for_ltx2,
     "QwenImagePipeline": enable_cache_dit_for_qwen_image,
     "QwenImageLayeredPipeline": enable_cache_dit_for_qwen_image,

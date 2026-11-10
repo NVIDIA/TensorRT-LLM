@@ -15,16 +15,10 @@
 # limitations under the License.
 """FLUX.3 Klein text-to-image and reference-image generation.
 
-FLUX.3 encodes prompts as given, with no prompt upsampler, so pass full scene captions; for an
-edit, caption the whole result rather than giving a one-line instruction.
-
 Usage:
     python flux3.py
     python flux3.py --model black-forest-labs/flux-3-image-klein-base
-    python flux3.py --visual_gen_args ../configs/flux3-bf16-1gpu.yaml
     python flux3.py --visual_gen_args ../configs/flux3-fp4-1gpu.yaml
-    python flux3.py --visual_gen_args ../configs/flux3-fp8-1gpu.yaml
-    python flux3.py --variant nvfp4
     python flux3.py --image lighthouse.png --prompt "<full caption of the edited image>"
     python flux3.py --image subject.png --image style.png
 """
@@ -67,7 +61,7 @@ def main():
             "amber sky glows behind a distant tree line, and the shallow depth of field blurs the "
             "background. Photorealistic wildlife photograph, sharp focus on the fox's eyes."
         ),
-        help="Text prompt for image generation",
+        help="Text prompt; FLUX.3 encodes it as given, so pass a full scene caption",
     )
     parser.add_argument(
         "--image",
