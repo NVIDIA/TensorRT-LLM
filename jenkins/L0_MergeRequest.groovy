@@ -1527,9 +1527,6 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         def inputJson = groovy.json.JsonOutput.toJson([
             changed_files: changedFiles,
             diffs: diffs,
-            // Stage scheduling below applies the command scope, including explicitly
-            // requested Post-Merge stages on an otherwise pre-merge run.
-            post_merge: true,
         ])
         def inputPath = "${LLM_ROOT}/cbts_input.json"
         writeFile file: inputPath, text: inputJson
