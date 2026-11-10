@@ -17,6 +17,7 @@
 ``TRTLLM_CUTE_DSL_CACHE_DIR=<dir>`` turns it on.
 """
 
+import atexit
 import enum
 import functools
 import hashlib
@@ -43,6 +44,9 @@ _TVM_FFI_HOOK = "CutlassBaseDSL.compile_and_cache.<locals>.post_compile_hook"
 _local = threading.local()
 _file_digests: dict[tuple[str, int, int], str] = {}
 _dsl_digests: dict[type, bytes] = {}
+_stats_lock = threading.Lock()
+# Compiles and seconds per outcome (hit, miss, uncached) for the summary at exit.
+_stats: dict[str, tuple[int, float]] = {}
 _installed = False
 
 
@@ -201,6 +205,28 @@ def _store(path: str, module) -> tuple[float, float]:
     return written - start, time.perf_counter() - written
 
 
+def _record(outcome: str, function_name: str, key, seconds: float, steps: str) -> None:
+    """Log one ``cute.compile`` at DEBUG and count it for the summary at exit."""
+    with _stats_lock:
+        count, total = _stats.get(outcome, (0, 0.0))
+        _stats[outcome] = (count + 1, total + seconds)
+    keyed = f" key={key[:16]}" if key else ""
+    logger.debug(
+        f"[cute_dsl_file_cache] {outcome} {function_name}{keyed} in {seconds:.3f}s ({steps})"
+    )
+
+
+def _log_summary() -> None:
+    """One INFO line with this process's hits, misses and uncached compiles and their seconds."""
+    with _stats_lock:
+        stats = sorted(_stats.items())
+    if stats:
+        logger.info(
+            "[cute_dsl_file_cache] cute.compile calls: "
+            + ", ".join(f"{outcome} {count} ({total:.1f}s)" for outcome, (count, total) in stats)
+        )
+
+
 def install_cute_dsl_file_cache() -> None:
     """Install the cache when ``TRTLLM_CUTE_DSL_CACHE_DIR`` names a directory."""
     global _installed
@@ -293,6 +319,7 @@ def install_cute_dsl_file_cache() -> None:
 
     @functools.wraps(backend_compile)
     def compile_cached(self, ctx):
+        """``CompilerBackend.compile`` that serves ``cute.compile`` calls from the directory."""
         # Only cute.compile calls; the DSL's own JIT cache covers the rest.
         if not getattr(_local, "depth", 0) or ctx.cache_enabled:
             return backend_compile(self, ctx)
@@ -316,10 +343,7 @@ def install_cute_dsl_file_cache() -> None:
             loaded = time.perf_counter()
             steps += f", load {loaded - keyed:.3f}s"
             if fn is not None:
-                logger.debug(
-                    f"[cute_dsl_file_cache] hit {ctx.function_name} key={key[:16]} "
-                    f"in {loaded - start:.3f}s ({steps})"
-                )
+                _record("hit", ctx.function_name, key, loaded - start, steps)
                 return fn
         compile_start = time.perf_counter()
         fn = backend_compile(self, ctx)
@@ -334,19 +358,12 @@ def install_cute_dsl_file_cache() -> None:
                     f"({type(e).__name__}: {e})",
                     key="cute_dsl_file_cache.store",
                 )
-        elapsed = time.perf_counter() - start
-        if path is None:
-            logger.debug(
-                f"[cute_dsl_file_cache] uncached {ctx.function_name} in {elapsed:.3f}s ({steps})"
-            )
-        else:
-            logger.info(
-                f"[cute_dsl_file_cache] miss {ctx.function_name} key={key[:16]} "
-                f"in {elapsed:.3f}s ({steps})"
-            )
+        outcome = "uncached" if path is None else "miss"
+        _record(outcome, ctx.function_name, key, time.perf_counter() - start, steps)
         return fn
 
     compiler.CompileCallable._compile = compile_marked
     compile_backend.CompilerBackend.compile = compile_cached
+    atexit.register(_log_summary)
     _installed = True
     logger.info(f"[cute_dsl_file_cache] cute.compile results are cached in {directory}")
