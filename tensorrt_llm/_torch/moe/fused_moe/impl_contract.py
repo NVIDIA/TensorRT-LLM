@@ -50,6 +50,9 @@ class MoEStaticCapability:
     # Whether the backend consumes a per-forward helper-slot plan whose live
     # weights may be published concurrently with shared-expert computation.
     supports_per_layer_dynamic_eplb: bool = False
+    # Whether the backend provides the methods adaptive EPLB moves and prices
+    # its slot weights with (adaptive_eplb.transport.AdaptiveEplbBackend).
+    supports_adaptive_eplb: bool = False
     # Legacy gate: the ``assert moe_cls in [...]`` bias allow-list in
     # ``create_moe_backend``. Per-expert FC bias from the checkpoint, added
     # before the activation functor runs -- not an activation constant.

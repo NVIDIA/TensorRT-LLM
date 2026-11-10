@@ -2078,8 +2078,36 @@ class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
                 f"({num_experts}) for per-layer dynamic EPLB.")
 
 
+class MoeAdaptiveLoadBalancerConfig(_MoeLoadBalancerConfigBase):
+    """Configure decode-time adaptive EPLB."""
+
+    mode: Literal["adaptive"] = Field(
+        default="adaptive",
+        description=
+        "EPLB mode. `adaptive` keeps one copy of every expert on its home slot and, while decoding, replicates hot experts into the remaining slots when the MoE backend's time model predicts that the replication repays its measured copy cost. Routing and statistics run inside CUDA graphs. Requires a MoE backend that supports adaptive EPLB (currently `MEGAMOE_CUTEDSL`).",
+        status="prototype")
+    num_slots: PositiveInt = Field(
+        description=
+        "Total number of expert slots across all EP ranks. Must be divisible by `ep_size` and at least the number of experts; the slots beyond one per expert hold replicas. A placement fills at most half of the replica slots (rounded up per rank); the other half stays empty so that every install has free slots to copy new replicas into.",
+        status="prototype")
+
+    def validate_expert_capacity(self, num_experts: int) -> None:
+        """Validate that every EP rank homes as many experts and every expert has a slot."""
+        if self._ep_size is None:
+            raise ValueError("Call setup() before validating expert capacity.")
+        if num_experts <= 0 or num_experts % self._ep_size != 0:
+            raise ValueError(
+                f"`num_experts` ({num_experts}) must be a positive multiple of "
+                f"`ep_size` ({self._ep_size}) for adaptive EPLB.")
+        if self.num_slots < num_experts:
+            raise ValueError(
+                f"`num_slots` ({self.num_slots}) must be at least `num_experts` "
+                f"({num_experts}) for adaptive EPLB.")
+
+
 MoeLoadBalancerConfigType = Annotated[
-    Union[MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig],
+    Union[MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig,
+          MoeAdaptiveLoadBalancerConfig],
     PydanticField(discriminator="mode"),
 ]
 _MOE_LOAD_BALANCER_ADAPTER = TypeAdapter(MoeLoadBalancerConfigType)
@@ -2149,7 +2177,8 @@ class MoeConfig(StrictBaseModel):
 
     load_balancer: Optional[Union[MoeLoadBalancerConfigType, str]] = Field(
         default=None,
-        description="Configuration for standard or per-layer dynamic EPLB.")
+        description=
+        "Configuration for standard, per-layer dynamic or adaptive EPLB.")
 
     disable_finalize_fusion: bool = Field(
         default=False,

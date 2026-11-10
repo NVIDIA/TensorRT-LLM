@@ -1278,6 +1278,11 @@ def _create_py_executor(
     else:
         kv_connector_manager = None
 
+    # A load balancer that moves weights (adaptive EPLB moves the MoE slot
+    # planes into peer-mapped memory) does so before the KV cache is sized.
+    if model_engine.moe_load_balancer is not None:
+        model_engine.moe_load_balancer.prepare_runtime(model_engine.model)
+
     resources = {}
     estimating_kv_cache = False
     kv_cache_creator = None

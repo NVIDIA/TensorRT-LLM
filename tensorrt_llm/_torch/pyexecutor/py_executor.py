@@ -109,9 +109,9 @@ from .kv_cache_load import KvLoadTracker, aggregate_load
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
-                          MultimodalEncoderRequestError, get_draft_token_length,
-                          get_mm_context_chunk_start, get_mm_items_for_chunk,
-                          get_mm_pending_items,
+                          MultimodalEncoderRequestError, generation_progress,
+                          get_draft_token_length, get_mm_context_chunk_start,
+                          get_mm_items_for_chunk, get_mm_pending_items,
                           initialize_multimodal_encoder_request,
                           is_mm_context_chunk_ready, release_consumed_mm_items)
 from .model_engine import ModelEngine
@@ -3579,6 +3579,9 @@ class PyExecutor:
         is_overlap_like = (not self.disable_overlap_scheduler
                            or self.dist.pp_size > 1)
         scheduler_mode = "overlap" if is_overlap_like else "non_overlap"
+        balancer = self.model_engine.moe_load_balancer
+        balancer_stats = (balancer.iteration_stats()
+                          if balancer is not None else None)
 
         tp_size = getattr(self.dist, "tp_size", 1)
         gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
@@ -3598,6 +3601,8 @@ class PyExecutor:
             if gpu_forward_time_ms is not None:
                 local_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
             local_dict["schedulerMode"] = scheduler_mode
+            if balancer_stats is not None:
+                local_dict["moeLoadBalancerStats"] = balancer_stats
             local_dict["rank"] = self.dist.tp_rank
             # Buffer for _flush_iter_stats_synced; in-place tp_allgather would
             # desync (reached from per-rank-divergent gates).
@@ -3615,6 +3620,7 @@ class PyExecutor:
         #   [5] prev_device_step_time_ms: Optional[float]
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
+        #   [8] moe_load_balancer_stats: Optional[dict]
         with self.stats_lock:
             if (not _stats_buffer_is_unbounded(self.max_stats_len)
                     and len(self.stats) > self.max_stats_len):
@@ -3622,7 +3628,7 @@ class PyExecutor:
             self.stats.append(
                 (stats, req_stats, kv_iter_stats, attention_dp_rank,
                  host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
-                 gpu_forward_time_ms))
+                 gpu_forward_time_ms, balancer_stats))
 
     def _process_iter_stats(
         self,
@@ -10259,6 +10265,14 @@ class PyExecutor:
                         "(TLLM_TEST_INJECT_FORWARD_FAIL_STEPS)")
 
             cache_indirection_buffer = self.sampler.get_cache_indirection()
+
+            balancer = self.model_engine.moe_load_balancer
+            if balancer is not None:
+                generation = scheduled_requests.generation_requests
+                balancer.observe_scheduled_batch(
+                    len(generation), not scheduled_requests.context_requests,
+                    self.is_warmup, lambda start, stop: generation_progress(
+                        generation, start, stop))
 
             # Run model forward on the execution stream for proper synchronization
             # with KVCacheTransferManager's onboard/offload operations. With the

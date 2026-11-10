@@ -588,6 +588,15 @@ def resolve_moe_impl(
                 )
             )
             continue
+        if deployment.eplb_mode == "adaptive" and not candidate.capabilities.supports_adaptive_eplb:
+            rejected.append(
+                MoERejection(
+                    _legacy_backend_name(candidate),
+                    MoERejectReason.EPLB_UNSUPPORTED,
+                    f"{candidate.__name__} does not support adaptive EPLB",
+                )
+            )
+            continue
         if deployment.eplb_enabled and not candidate.capabilities.supports_eplb:
             rejected.append(
                 MoERejection(

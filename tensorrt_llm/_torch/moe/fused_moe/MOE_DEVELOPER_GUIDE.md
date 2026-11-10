@@ -286,6 +286,7 @@ Still on old path (standalone, with embedded communication):
 | `moe_comm_timeout_guard.py` | Device-side timeouts of communication kernels, relaxed during warmup — budget resolution and `MoECommTimeoutProxy` registration (see [Communication timeouts](#communication-timeouts)) |
 | `moe_load_balancer.py` | EPLB implementation |
 | `per_layer_dynamic_eplb/` | Per-layer dynamic EPLB, created by `maybe_create_moe_load_balancer`: model-level `manager`, per-layer handle `layer`, live-weight `arena`, and HALO-Q/TMA `planner` |
+| `adaptive_eplb/` | Adaptive EPLB, created by `maybe_create_moe_load_balancer`: model-level and per-layer `balancer`, decision `policy`, statistics windows and installs in `runtime`, expert weights in MNNVL memory in `transport`. A backend opts in with `supports_adaptive_eplb`, the methods of `transport.AdaptiveEplbBackend` and a measured time model of its kernels for each GPU type it supports (`has_decode_time_model`) |
 | `moe_op_backend.py` | Op backend registry for TRTLLMGen: `trtllm` ops for every quantized leaf, the FlashInfer bf16 runner for the unquantized one |
 
 ### Backends (`fused_moe/`)

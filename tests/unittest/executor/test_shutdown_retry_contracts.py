@@ -55,13 +55,17 @@ _uses_collective_shutdown = _extract_function(
 )
 
 
-def _llm_args(per_layer_dynamic=True, **fields):
-    load_balancer = SimpleNamespace(mode="per_layer_dynamic") if per_layer_dynamic else None
+def _llm_args(per_layer_dynamic=True, mode=None, **fields):
+    if mode is None and per_layer_dynamic:
+        mode = "per_layer_dynamic"
+    load_balancer = SimpleNamespace(mode=mode) if mode is not None else None
     return SimpleNamespace(moe_config=SimpleNamespace(load_balancer=load_balancer), **fields)
 
 
-def test_collective_shutdown_is_limited_to_per_layer_dynamic_eplb():
+def test_collective_shutdown_is_limited_to_the_balancers_that_need_it():
     assert _uses_collective_shutdown(_llm_args())
+    assert _uses_collective_shutdown(_llm_args(mode="adaptive"))
+    assert not _uses_collective_shutdown(_llm_args(mode="standard"))
     assert not _uses_collective_shutdown(_llm_args(per_layer_dynamic=False))
     assert not _uses_collective_shutdown(SimpleNamespace(backend="pytorch"))
     assert not _uses_collective_shutdown(None)

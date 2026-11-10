@@ -55,8 +55,9 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           EagleDecodingConfig,
                                           EncodeCudaGraphConfig,
                                           ExecutorMemoryType, KvCacheConfig,
-                                          MambaStateConfig, MoeConfig,
-                                          MoeLoadBalancerConfig,
+                                          MambaStateConfig,
+                                          MoeAdaptiveLoadBalancerConfig,
+                                          MoeConfig, MoeLoadBalancerConfig,
                                           MoePerLayerDynamicLoadBalancerConfig,
                                           MTPDecodingConfig, MultimodalConfig,
                                           MultimodalEncoderCudaGraphConfig,
@@ -506,6 +507,42 @@ class TestMoeConfigPerLayerDynamicEplb:
                 ValidationError,
                 match=r"Failed to load MoE load balancer config file:"):
             MoeConfig(load_balancer=str(config_path))
+
+
+@pytest.mark.cpu_only
+class TestMoeConfigAdaptiveEplb:
+
+    def test_adaptive_mode_parses_to_its_config(self) -> None:
+        config = MoeConfig(backend="MEGAMOE_CUTEDSL",
+                           load_balancer={
+                               "mode": "adaptive",
+                               "num_slots": 512
+                           })
+        assert isinstance(config.load_balancer, MoeAdaptiveLoadBalancerConfig)
+        assert config.load_balancer.num_slots == 512
+
+    @pytest.mark.parametrize(
+        "num_slots, num_experts, message",
+        [
+            pytest.param(12, 6, "multiple of `ep_size`", id="experts-ep"),
+            pytest.param(8, 12, "at least `num_experts`", id="few-slots"),
+            pytest.param(10, 8, "divisible by `ep_size`", id="slots-ep"),
+        ],
+    )
+    def test_validates_expert_capacity_after_setup(self, num_slots: int,
+                                                   num_experts: int,
+                                                   message: str) -> None:
+        config = MoeAdaptiveLoadBalancerConfig(num_slots=num_slots)
+        with pytest.raises(ValueError, match=message):
+            config.setup(ep_rank=0, ep_size=4)
+            config.validate_expert_capacity(num_experts)
+
+    def test_expert_capacity_requires_setup(self) -> None:
+        config = MoeAdaptiveLoadBalancerConfig(num_slots=12)
+        with pytest.raises(ValueError, match=r"Call setup\(\)"):
+            config.validate_expert_capacity(num_experts=8)
+        config.setup(ep_rank=0, ep_size=4)
+        config.validate_expert_capacity(num_experts=8)
 
 
 @pytest.mark.cpu_only

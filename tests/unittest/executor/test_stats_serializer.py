@@ -289,6 +289,22 @@ class TestStatsSerializer:
         assert d["schedulerMode"] == "overlap"
         assert d["gpuForwardTimeMS"] == 4.25
 
+    def test_serializer_9_tuple_emits_the_moe_load_balancer_stats(self):
+        """Slot 8 carries the MoE load balancer's counters; None omits the key.
+
+        The counters are ``BaseMoeLoadBalancer.iteration_stats``.
+        """
+        iter_stats = _make_mock_iteration_stats()
+        counters = {"windows": 3, "installs": 1, "installedLayers": 2}
+        result = BaseWorker._stats_serializer(
+            (iter_stats, None, None, None, None, None, "non_overlap", None, counters)
+        )
+        assert json.loads(result)["moeLoadBalancerStats"] == counters
+        result = BaseWorker._stats_serializer(
+            (iter_stats, None, None, None, None, None, "non_overlap", None, None)
+        )
+        assert "moeLoadBalancerStats" not in json.loads(result)
+
     def test_serializer_with_v2_pool_group_stats(self):
         """KV cache manager V2 stats should include pool group breakdown."""
         iter_stats = _make_mock_iteration_stats()

@@ -125,6 +125,9 @@ def create_moe_backend(
             and not moe_cls.capabilities.supports_per_layer_dynamic_eplb):
         raise ValueError(
             f"{moe_cls.__name__} does not support per-layer dynamic EPLB.")
+    if (eplb_mode == "adaptive"
+            and not moe_cls.capabilities.supports_adaptive_eplb):
+        raise ValueError(f"{moe_cls.__name__} does not support adaptive EPLB.")
 
     if bias and not moe_cls.capabilities.supports_expert_bias:
         raise ValueError(f"bias not supported in {moe_cls.__name__}.")

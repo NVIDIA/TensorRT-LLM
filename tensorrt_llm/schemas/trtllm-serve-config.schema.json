@@ -4342,6 +4342,32 @@
       "title": "ModelExpressConfig",
       "type": "object"
     },
+    "MoeAdaptiveLoadBalancerConfig": {
+      "additionalProperties": false,
+      "description": "Configure decode-time adaptive EPLB.",
+      "properties": {
+        "mode": {
+          "const": "adaptive",
+          "default": "adaptive",
+          "description": "EPLB mode. `adaptive` keeps one copy of every expert on its home slot and, while decoding, replicates hot experts into the remaining slots when the MoE backend's time model predicts that the replication repays its measured copy cost. Routing and statistics run inside CUDA graphs. Requires a MoE backend that supports adaptive EPLB (currently `MEGAMOE_CUTEDSL`).",
+          "status": "prototype",
+          "title": "Mode",
+          "type": "string"
+        },
+        "num_slots": {
+          "description": "Total number of expert slots across all EP ranks. Must be divisible by `ep_size` and at least the number of experts; the slots beyond one per expert hold replicas. A placement fills at most half of the replica slots (rounded up per rank); the other half stays empty so that every install has free slots to copy new replicas into.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Num Slots",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "num_slots"
+      ],
+      "title": "MoeAdaptiveLoadBalancerConfig",
+      "type": "object"
+    },
     "MoeConfig": {
       "additionalProperties": false,
       "description": "Configuration for MoE.",
@@ -4384,6 +4410,12 @@
               ]
             },
             {
+              "$ref": "#/$defs/MoeAdaptiveLoadBalancerConfig",
+              "required": [
+                "mode"
+              ]
+            },
+            {
               "type": [
                 "string",
                 "null"
@@ -4391,7 +4423,7 @@
             }
           ],
           "default": null,
-          "description": "Configuration for standard or per-layer dynamic EPLB.",
+          "description": "Configuration for standard, per-layer dynamic or adaptive EPLB.",
           "title": "Load Balancer"
         },
         "max_num_tokens": {

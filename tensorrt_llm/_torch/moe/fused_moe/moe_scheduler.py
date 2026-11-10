@@ -1614,6 +1614,14 @@ class FusedCommMoEScheduler(MoEScheduler):
                 device=device,
             )
 
+        # CuteDSL needs the scheduler's rank-identical chunk maximum to select
+        # one adaptive bucket on every EP rank; using a local token count could
+        # diverge and deadlock its in-kernel NVLink barrier. Set before the
+        # route and the input quantization, which may write into that bucket's staging.
+        set_adaptive = getattr(moe.backend, "set_adaptive_launch_tokens", None)
+        if set_adaptive is not None:
+            set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
+
         # ----- EPLB: update stats + remap expert ids -> slot ids -----
         # Per-layer dynamic EPLB plans from the routes that the layer-wise
         # calibrator records or replays, so they are recorded before the route,
@@ -1636,19 +1644,13 @@ class FusedCommMoEScheduler(MoEScheduler):
                     is_last_call,
                     ignore_allreduce=False,
                 )
-                token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
+                token_selected_slots = moe._load_balancer_route(
+                    token_selected_experts, moe.use_dp, token_final_scales=token_final_scales
+                )
             else:
                 token_selected_slots = token_selected_experts
             token_selected_slots = _record_routes(moe, token_selected_slots, moe.num_slots)
             replica_plan = None
-
-        # CuteDSL needs the scheduler's rank-identical chunk maximum to select
-        # one adaptive bucket on every EP rank; using a local token count could
-        # diverge and deadlock its in-kernel NVLink barrier. Set before the
-        # input quantization, which may write into that bucket's staging.
-        set_adaptive = getattr(moe.backend, "set_adaptive_launch_tokens", None)
-        if set_adaptive is not None:
-            set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
 
         # ----- quantize / prepare -----
         if getattr(moe.backend, "supports_fused_prepare", lambda: False)():

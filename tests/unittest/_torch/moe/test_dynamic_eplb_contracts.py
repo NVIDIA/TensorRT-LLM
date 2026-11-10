@@ -2435,7 +2435,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         )
     )
 
-    def route(routes, use_dp):
+    def route(routes, use_dp, token_final_scales=None):
         trace.append(("route", routes.name))
         return _ChunkRoutes("physical" if mode == "per_layer_dynamic" else "slots")
 
@@ -2486,19 +2486,18 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     )
 
     assert out == "out"
-    # The bucket hint precedes the quantization, which may write into that
-    # bucket's staging.
-    tail = [("bucket", 6), ("quantize", {})]
+    # The bucket hint precedes the route and the quantization, which may write
+    # into that bucket's staging.
     if mode == "per_layer_dynamic":
         # The planner consumes the logical routes the calibrator records or
         # replays, and quantization leaves the plan's SMs to its copy kernel.
         # The layer has no CPU stage or host statistics, so only the post-MoE
         # hook that releases its plan runs.
         expected = [
+            ("bucket", 6),
             ("statistic", "logical"),
             ("calibrator", "logical"),
             ("route", "replayed logical"),
-            ("bucket", 6),
             ("quantize", {"reserved_sms": 4}),
             ("run_moe", "physical", plan),
             "start_set_cpu",
@@ -2506,12 +2505,13 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     elif mode == "standard":
         expected = [
             "start_wait_gpu",
+            ("bucket", 6),
             "done_wait_gpu",
             ("update_statistic", "logical"),
             ("route", "logical"),
             ("statistic", "slots"),
             ("calibrator", "slots"),
-            *tail,
+            ("quantize", {}),
             ("run_moe", "replayed slots", None),
             "start_set_cpu",
             "done_set_cpu",
@@ -2519,9 +2519,10 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     else:
         expected = [
             "start_wait_gpu",
+            ("bucket", 6),
             ("statistic", "logical"),
             ("calibrator", "logical"),
-            *tail,
+            ("quantize", {}),
             ("run_moe", "replayed logical", None),
             "start_set_cpu",
             "done_set_cpu",
