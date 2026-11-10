@@ -30,7 +30,7 @@ from tensorrt_llm._torch.pyexecutor.sampler.watermark import (
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.watermark import GumbelWatermarkDetector, WatermarkConfig
-from tensorrt_llm.watermark.detector import _gamma_upper_tail, _max_pair_sum_tail
+from tensorrt_llm.watermark.detector import _dual_key_p_value, _gamma_upper_tail
 from tensorrt_llm.watermark.prf import (
     PAD_TOKEN,
     context_seed,
@@ -110,18 +110,15 @@ def _generate(config, probs, *, num_tokens, prompt, watermark=True, seed=0):
     return out
 
 
-class TestMaxPairTail:
-    def test_matches_simulation(self):
+class TestDualKeyPValue:
+    def test_is_valid_under_the_null_and_keeps_the_power_of_one_key(self):
         rng = np.random.default_rng(0)
-        n = 40
-        sums = np.maximum(
-            rng.exponential(size=(200_000, n)), rng.exponential(size=(200_000, n))
-        ).sum(1)
-        for quantile in (0.5, 0.9, 0.99):
-            threshold = float(np.quantile(sums, quantile))
-            assert _max_pair_sum_tail(n, threshold) == pytest.approx(
-                1 - quantile, rel=0.08, abs=2e-3
-            )
+        n, trials = 60, 20_000
+        scores = rng.exponential(size=(2, trials, n)).sum(-1)
+        p = np.array([_dual_key_p_value(a, b, n)[0] for a, b in zip(*scores)])
+        assert (p <= 0.05).mean() <= 0.05 and (p <= 0.01).mean() <= 0.01
+        # Text that carries only the first key (a mean score of 1.5 per position) stays detectable.
+        assert _dual_key_p_value(1.5 * n, n, n)[0] < 1e-3
 
 
 class TestDetector:

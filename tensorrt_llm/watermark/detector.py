@@ -42,7 +42,9 @@ __all__ = ["GumbelWatermarkDetector", "WatermarkDetection"]
 class WatermarkDetection:
     """Result of testing one token sequence."""
 
-    score: float  # sum of -ln(1 - u) over the scored positions (larger of the two keys' per token)
+    # Sum of -ln(1 - u) over the scored positions. For ``gumbel_dual_key`` it belongs to the test
+    # with the smaller p-value, scaled to a mean of 1 per position under "not watermarked".
+    score: float
     p_value: float  # P(score >= observed) under "not watermarked"
     num_scored: int  # positions that entered the score
     num_tokens: int  # tokens given
@@ -91,22 +93,21 @@ def _gamma_upper_tail(n: float, x: float) -> float:
     return min(1.0, math.exp(log_prefactor) * h)
 
 
-def _max_pair_sum_tail(n: int, total: float) -> float:
-    """``P(S >= total)`` for ``S`` the sum of ``n`` iid ``max(E1, E2)``, with ``E1, E2 ~ Exp(1)``.
+def _dual_key_p_value(total_a: float, total_b: float, n: int) -> tuple[float, float]:
+    """Combine the two tests of dual-key text; returns ``(p_value, score)``.
 
-    ``max(E1, E2)`` is ``Exp(rate 2) + Exp(rate 1)``, so ``S = Gamma(n, rate 2) + Gamma(n, rate 1)``
-    and the tail is ``P(Gamma(n, 2) >= t) + integral_0^t f_Gamma(n, 2)(x) Q(n, t - x) dx``,
-    integrated numerically.
+    Text from ``gumbel_dual_key`` mixes tokens drawn under the first key with tokens drawn under
+    the second, in a proportion the detector cannot know: plain and exact-match decoding use only
+    the first key, rejection sampling uses both. So two tests are run. The first key alone has the
+    most power when the text carries few second-key tokens, and the two keys' scores summed have
+    the most power for a mix. Each is exact under "not watermarked", so the smaller p-value, doubled,
+    is a valid p-value.
     """
-    if n <= 0 or total <= 0.0:
-        return 1.0
-    grid = np.linspace(0.0, total, 2001)[1:-1]
-    log_density = n * math.log(2.0) + (n - 1) * np.log(grid) - 2.0 * grid - math.lgamma(n)
-    tail = np.fromiter(
-        (_gamma_upper_tail(float(n), float(total - x)) for x in grid), dtype=np.float64
-    )
-    integral = float(np.trapezoid(np.exp(log_density) * tail, grid))
-    return min(1.0, _gamma_upper_tail(float(n), 2.0 * total) + integral)
+    p_a = _gamma_upper_tail(float(n), total_a)
+    p_both = _gamma_upper_tail(2.0 * n, total_a + total_b)
+    if p_a <= p_both:
+        return min(1.0, 2.0 * p_a), total_a
+    return min(1.0, 2.0 * p_both), 0.5 * (total_a + total_b)
 
 
 class GumbelWatermarkDetector:
@@ -161,12 +162,12 @@ class GumbelWatermarkDetector:
         if len(per_key) == 1:
             total = float(per_key[0].sum())
             p_value = _gamma_upper_tail(float(num_scored), total) if num_scored else 1.0
+        elif num_scored:
+            p_value, total = _dual_key_p_value(
+                float(per_key[0].sum()), float(per_key[1].sum()), num_scored
+            )
         else:
-            # Dual-key text carries the first key in some tokens and the second in others,
-            # and the detector cannot tell which. Score every token with the larger of its
-            # two scores; the null distribution of that statistic is known exactly.
-            total = float(np.maximum(per_key[0], per_key[1]).sum())
-            p_value = _max_pair_sum_tail(num_scored, total) if num_scored else 1.0
+            total, p_value = 0.0, 1.0
         return WatermarkDetection(
             score=total,
             p_value=p_value,

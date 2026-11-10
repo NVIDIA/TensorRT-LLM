@@ -59,8 +59,8 @@ share their verification).
   the target, so they need care. Two modes are supported:
   - `algorithm="gumbel_dual_key"` draws the draft tokens under the key and the token that follows the
     accepted prefix under a second key derived from it. The two draws and the accept decisions are
-    independent, so the output distribution stays exact. The detector tests every token against both
-    keys. Requires an autoregressive drafter (Eagle3, MTP, DraftTarget).
+    independent, so the output distribution stays exact. The detector tests the first key alone and
+    both keys together and reports the smaller p-value, doubled for the two tests. Requires an autoregressive drafter (Eagle3, MTP, DraftTarget).
   - `allow_target_only_watermarking=True` leaves accepted draft tokens unmarked and watermarks only the
     token that follows them. The signal weakens as the acceptance rate rises.
 
