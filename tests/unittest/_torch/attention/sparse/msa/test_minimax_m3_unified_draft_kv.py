@@ -756,8 +756,22 @@ _GATE_CASES = [
     ("nvfp4-draft", _BOTH, "1", dict(nvfp4_draft=True), False, "NVFP4 draft layers"),
     # Settings each disaggregated worker sets on its own: aggregated serving and an explicit
     # opt-out fall back to the separate draft KV cache; otherwise the worker refuses to start.
-    ("shared-lifecycle", (False,), "1", dict(draft_window=None), False, "share a KV cache lifecycle"),
-    ("shared-lifecycle", (True,), "1", dict(draft_window=None), _RAISES, "share a KV cache lifecycle"),
+    (
+        "shared-lifecycle",
+        (False,),
+        "1",
+        dict(draft_window=None),
+        False,
+        "share a KV cache lifecycle",
+    ),
+    (
+        "shared-lifecycle",
+        (True,),
+        "1",
+        dict(draft_window=None),
+        _RAISES,
+        "share a KV cache lifecycle",
+    ),
     ("shared-lifecycle-unset-env", (True,), None, dict(draft_window=None), _RAISES, "lifecycle"),
     ("shared-lifecycle-opt-out", (True,), "0", dict(draft_window=None), False, "lifecycle"),
     ("pool-ratio-arity", (False,), "1", dict(pool_ratio=[1.0]), False, "pool_ratio has 1 entries"),

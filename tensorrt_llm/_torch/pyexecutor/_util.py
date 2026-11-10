@@ -2344,8 +2344,8 @@ class KvCacheCreator:
         """
         blocker, worker_local = self._dflash_unify_blocker_and_scope()
         if blocker is not None:
-            if (worker_local and self._is_disagg and
-                    os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") != "0"):
+            if (worker_local and self._is_disagg
+                    and os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") != "0"):
                 raise ValueError(
                     f"{self._unified_drafter_name()}: disaggregated workers "
                     "keep the draft KV in the target's KV cache manager "
@@ -2540,9 +2540,8 @@ class KvCacheCreator:
             ))
 
     def _hosting_manager_blocker(
-        self, target_layout: tuple[int, int, object, bool],
-        draft_layout: tuple[int, int, object, bool]
-    ) -> Optional[str]:
+            self, target_layout: tuple[int, int, object, bool],
+            draft_layout: tuple[int, int, object, bool]) -> Optional[str]:
         """Why a manager hosting draft layer specs would refuse this layout, or None."""
         if draft_layout[2] == tensorrt_llm.bindings.DataType.NVFP4:
             return "the target's KV cache manager does not host NVFP4 draft layers"

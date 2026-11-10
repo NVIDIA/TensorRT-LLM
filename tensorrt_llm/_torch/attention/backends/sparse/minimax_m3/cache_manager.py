@@ -891,7 +891,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # A hybrid cache's target layers address pages by slot id, so only the explicit
         # draft layers read attention-op block offsets: build just their rows each step.
         rows = sorted(
-            int(self.layer_offsets[layer]) for layer in self.draft_layer_ids
+            int(self.layer_offsets[layer])
+            for layer in self.draft_layer_ids
             if layer in self.layer_offsets
         )
         if not rows or rows != list(range(rows[0], rows[-1] + 1)):

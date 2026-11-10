@@ -2824,10 +2824,10 @@ _TP_OR_ATTENTION_DP_MISMATCH = (
     "context_servers and generation_servers")
 
 
-def _shared_draft_kv_blocker(server_configs,
-                             *,
-                             check_tp_and_attention_dp: bool = True
-                             ) -> Optional[str]:
+def _shared_draft_kv_blocker(
+        server_configs,
+        *,
+        check_tp_and_attention_dp: bool = True) -> Optional[str]:
     """What keeps the context and generation servers from sharing draft KV, or None."""
     with_spec = {
         cfg.type
@@ -2836,10 +2836,10 @@ def _shared_draft_kv_blocker(server_configs,
     if with_spec != {"ctx", "gen"}:
         return ("speculative_config in both context_servers and "
                 "generation_servers")
-    if check_tp_and_attention_dp and len(
-        {(cfg.other_args.get("tensor_parallel_size", 1),
-          bool(cfg.other_args.get("enable_attention_dp", False)))
-         for cfg in server_configs}) != 1:
+    if check_tp_and_attention_dp and len({(cfg.other_args.get(
+            "tensor_parallel_size",
+            1), bool(cfg.other_args.get("enable_attention_dp", False)))
+                                          for cfg in server_configs}) != 1:
         return _TP_OR_ATTENTION_DP_MISMATCH
     for cfg in server_configs:
         spec = cfg.other_args["speculative_config"]
