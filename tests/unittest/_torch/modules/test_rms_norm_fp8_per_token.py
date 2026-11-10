@@ -141,6 +141,7 @@ def test_gdn_in_proj_fp8_per_token_handoff():
         num_v_heads_per_tp=heads,
         head_v_dim=head_dim,
         _lowm_in_proj=lambda *args, **kwargs: None,
+        _in_proj_fused_weight=None,
     )
     Qwen3NextGatedDeltaNet._compute_tokenwise_inputs(gdn, normed)
 

@@ -196,13 +196,7 @@ def _rms_norm_gated_fwd_multirow_kernel(
 
     When CONTIG, x is loaded and y stored through flat [ROWS * N] offsets so
     the whole program block is one contiguous span (widest possible global
-    accesses); EVEN additionally drops the bounds masks. The silu gate uses
-    the single-instruction MUFU tanh (sm_75+): silu(z) = 0.5*z*(1 + tanh(z/2)).
-    Its absolute error is below ~3e-3 of the normalized value for every z (and
-    far below it for z < -8, where the gate itself is ~0), so the output stays
-    within about one bf16 ulp of the row; the relative error of individual
-    elements with z < -8 is larger. Saturation and NaN behavior match
-    z * sigmoid(z).
+    accesses); EVEN additionally drops the bounds masks.
     """
     r0 = tl.program_id(0) * ROWS
     rows = r0 + tl.arange(0, ROWS)
@@ -249,18 +243,10 @@ def _rms_norm_gated_fwd_multirow_kernel(
         z = tl.load(Z + z_off).to(tl.float32)
     else:
         z = tl.load(Z + z_off, mask=rows[:, None] < M, other=0.0).to(tl.float32)
-    if GATE_SIGMOID:
-        y *= tl.sigmoid(z)
-    else:
-        t = tl.inline_asm_elementwise(
-            "tanh.approx.f32 $0, $1;",
-            "=r,r",
-            [z * 0.5],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
-        y *= z * 0.5 * (1.0 + t)
+    gate = tl.sigmoid(z)
+    if not GATE_SIGMOID:
+        gate *= z
+    y *= gate
     if OUTPUT_FP8:
         # Match the existing two-kernel path: RMSNorm first stores to the
         # input dtype, then static quantization reloads and multiplies by the
