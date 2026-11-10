@@ -8,11 +8,11 @@ An expert-parallel mixture-of-experts (MoE) layer runs at the pace of its most l
 
 **ISER-MoE (In-Switch Expert Replication for MoE) multicasts each hot expert through the NVLink switch into a fixed, aligned group of GPUs, so each byte leaves its owner GPU once, however many replicas the group holds.** At every MoE layer, HALO-Q (Hot-Aligned, Locality-Optimal expert replication with Quota repair), a GPU scheduler, picks hot experts and groups from that layer's routing, and a replication kernel multicasts each hot expert from its owner or through SAMI (Scalable Asynchronous Multi-port In-switch broadcast), which spreads the injection over the members' NVLink ports. Both run beside the shared expert, which every token uses, so the MoE kernel waits only for the plan.
 
-In simulated replay of that routing at 8,192 tokens/rank, HALO-Q removed **98–99% of the excess load** (the most loaded GPU's load above the mean) at EP4–EP24, with four helper slots (spare expert buffers) per rank. With attention data parallelism (DP) and EP8 (DEP8) on GB300, ISER-MoE raised DeepSeek-V4-Pro's context-only (prefill-only) throughput by **17.4% on GSM8K** (Grade School Math 8K) and **7.2% on agentic prompts** from [AgentPerf](https://artificialanalysis.ai/methodology/agentperf), Artificial Analysis's agentic benchmark (Figure 1). In disaggregated serving of agentic coding traces on a GB300 NVL72 rack, it improved P90 (90th-percentile) request latency by **3.1–4.3%** and output throughput per GPU by **1.4–1.9%**.
+In simulated replay of that routing at 8,192 tokens/rank, HALO-Q removed **98–99% of the excess load** (the most loaded GPU's load above the mean) at EP4–EP24, with four helper slots (spare expert buffers) per rank. With attention data parallelism (DP) and EP8 (DEP8), ISER-MoE raised DeepSeek-V4-Pro's context-only (prefill-only) request throughput on GSM8K (Grade School Math 8K) by **6.9% on GB200** and **12.6% on pre-release Rubin GPUs**, reaching over **99% of forced balanced-routing throughput**. On pre-release Rubin GPUs, computed-token throughput on agentic prompts from [AgentPerf](https://artificialanalysis.ai/methodology/agentperf), Artificial Analysis's agentic benchmark, rose **3.9–9.1% with 16-bit brain floating-point (BF16) combine** across DEP6 and DEP8 (Figure 1). In disaggregated serving of agentic coding traces on a GB300 NVL72 rack, it improved P90 (90th-percentile) request latency by **3.1–4.3%** and output throughput per GPU by **1.4–1.9%**.
 
-![Grouped bars of context-only throughput gain over the load balancer off on GB300: ISER-MoE gains 17.4% (GSM8K) and 7.2% (AgentPerf) at DEP8 and 9.5% and 1.6% at DEP6; forced balanced routing gains 13.5%, 6.0%, 10.8% and 3.8%.](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_e2e_gb300.svg)
+![Context-only results: on GSM8K at DEP8, ON reaches 99.2% of forced balanced-routing throughput on GB200 and 99.3% on pre-release Rubin GPUs; on AgentPerf on pre-release Rubin GPUs, gains over OFF are 6.1%, 9.1%, 4.2% and 3.9% with BF16 combine, and 3.4%, 2.9%, 2.6% and 3.9% with FP4 combine at DEP8 and DEP6 with 8K and 16K token limits.](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_e2e_context_only.svg)
 
-*Figure 1. Context-only (prefill-only) serving of DeepSeek-V4-Pro (NVFP4) on GB300: end-to-end (E2E) throughput gain over OFF (load balancer off) of ON (ISER-MoE) and of FB (force expert balance: OFF with routing forced to be perfectly balanced; its outputs are not meaningful). Throughput counts computed (non-reused) tokens per GPU and second; all arms use a tile-wise FP4 combine. Labels above the AgentPerf bars: key-value (KV) cache reuse rate across the three arms.*
+*Figure 1. End-to-end (E2E) context-only (prefill-only) serving of DeepSeek-V4-Pro (NVFP4). (a) GSM8K at DEP8 on GB200 and pre-release Rubin GPUs: request throughput normalized to OFF (load balancer off), with ON (ISER-MoE) and FB (force expert balance: OFF with routing forced to be perfectly balanced; its outputs are not meaningful). (b) AgentPerf on pre-release Rubin GPUs: gain over OFF in computed (non-reused) tokens per GPU and second, with BF16 combine (six runs per arm) or FP4 combine (two). 8K and 16K limit each iteration to 8,192 and 16,384 tokens/rank; whiskers show the reported ± in percentage points. Key-value (KV) cache reuse is 95.1–95.9%.*
 
 **What stays exact.** Replicas are byte copies of an expert's weights and block scales, and tokens keep their routing weights, so ISER-MoE changes where a token-expert pair is calculated, not what is computed; in the [MegaMoE kernel measurements](#megamoe-kernel-time-with-replicas) below, OFF and ON outputs matched bitwise.
 
@@ -38,7 +38,7 @@ TensorRT LLM's Expert Parallelism Load Balancer (EPLB), from Scaling Expert Para
   - [HALO-Q in Trace Replay](#halo-q-in-trace-replay)
   - [SAMI Broadcast on GB200](#sami-broadcast-on-gb200)
   - [MegaMoE Kernel Time with Replicas](#megamoe-kernel-time-with-replicas)
-  - [Context-Only Prefill Serving on GB300](#context-only-prefill-serving-on-gb300)
+  - [Context-Only Prefill Serving](#context-only-prefill-serving)
   - [Disaggregated Serving on a GB300 NVL72 Rack](#disaggregated-serving-on-a-gb300-nvl72-rack)
 - **[Enable ISER-MoE in TensorRT LLM](#enable-iser-moe-in-tensorrt-llm)**
   - [Configuration](#configuration)
@@ -108,7 +108,7 @@ The shared expert needs neither the plan nor token communication, so it can run 
 
 *Figure 4. Peak-rate model per MoE layer and rank on GB300 (EP8, uniform routing, NVFP4). (a) Math/comm ratio with n copies per rank, routed experts only (orange) or with the FP8 shared expert weighted ×3 (green); hatched: below the device ratio (dashed). (b) DeepSeek-V4-Pro, 8,192 tokens/rank, four copies: they delay the combine beside the routed experts but hide beside the shared expert.*
 
-With MegaMoE's default 16-bit brain floating-point (BF16) combine instead of the modeled FP4 one, the combine alone (685 µs) outlasts DeepSeek-V4-Pro's routed computation (433 µs) at 8,192 tokens/rank, so copies hide only beside the shared expert.
+With MegaMoE's default BF16 combine instead of the modeled FP4 one, the combine alone (685 µs) outlasts DeepSeek-V4-Pro's routed computation (433 µs) at 8,192 tokens/rank, so copies hide only beside the shared expert.
 
 ### Point-to-Point Copies Make the Owner a Hot Spot
 
@@ -239,11 +239,15 @@ For **trace routing**, EP8 routes at 8,192 tokens/rank were sampled per layer fr
 
 **Costs outside the kernel** come from earlier builds. Run sequentially, HALO-Q took 19.6–29.2 µs and the replication kernel (eight SMs, READY included) 128.7–340.6 µs, so the copy must overlap other work. Beside a 300 µs single-CTA delay kernel that stood in for the shared expert but moved no data, with ranks arriving 10 µs apart, ON took 15.6–29.2% less time than OFF on the skewed cells and 0.2–1.5% more on the balanced ones, planning, copy and READY waits included.
 
-### Context-Only Prefill Serving on GB300
+### Context-Only Prefill Serving
 
-Figure 1 shows the whole system serving prefill only: DeepSeek-V4-Pro (NVFP4) context-only in TensorRT LLM at DEP8 and DEP6, with FB using TensorRT LLM's [perfect router](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/perf-analysis.md#moe-expert-load-balance-analysis-perfect-router) to force synthetic, perfectly balanced routing. All arms used a tile-wise FP4 combine, in which the second GEMM's epilogue quantizes each output tile to NVFP4.
+Figure 1 shows the whole system serving prefill only: DeepSeek-V4-Pro (NVFP4) in TensorRT LLM with attention DP. For GSM8K, `trtllm-bench` measured OFF and ON request throughput at DEP8 with one output token, using the A/B/C runs reported in [PR #19646](https://github.com/NVIDIA/TensorRT-LLM/pull/19646). ON used three helper slots per rank and four auxiliary SMs. FB uses TensorRT LLM's [perfect router](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/perf-analysis.md#moe-expert-load-balance-analysis-perfect-router) to force synthetic, perfectly balanced routing.
 
-On GSM8K, ON raised throughput by 17.4% at DEP8 and 9.5% at DEP6, against FB's 13.5% and 10.8%; on AgentPerf, with 94.4–95.0% KV cache reuse in every arm, ON gained 7.2% and 1.6%, against FB's 6.0% and 3.8%. **ON exceeded FB at DEP8 and stayed below it at DEP6**: FB is a balanced-routing reference, not a ceiling. The implementation has no unicast copy path, so multicast and point-to-point copies were not compared in serving.
+On GB200, ON raised request throughput by **6.9%**, from 2,285 to 2,444 requests/s, against FB's 7.8%, reaching **99.2% of FB's throughput** (Figure 1(a)). On pre-release Rubin GPUs, ON gained **12.6%** against FB's 13.4%, reaching **99.3% of FB**; a second run on other nodes reached 99.1%. The implementation has no unicast copy path, so multicast and point-to-point copies were not compared in serving.
+
+For AgentPerf on pre-release Rubin GPUs, OFF and ON ran at DEP8 and DEP6 with at most 8,192 or 16,384 tokens/rank per iteration and 95.1–95.9% KV cache reuse (Figure 1(b)). With BF16 combine, the default, throughput rose **6.1% and 9.1% at DEP8**, and **4.2% and 3.9% at DEP6**, in 8K/16K order. Six runs per arm gave reported ± values of 0.6/1.1/0.6/0.8 percentage points. With FP4 combine, two runs per arm gave gains of 3.4/2.9/2.6/3.9% in the same order. BF16 time to first token (TTFT) improved 6.6–12.1% except at DEP6 with 8,192 tokens/rank, where the reported improvement was −1.2 ± 2.4%.
+
+A profile of an earlier commit (one rank, DEP8, BF16 combine, three helper slots) found the routed MegaMoE kernel 29.5% shorter and all MoE work 15.0% shorter per layer. The shared expert, running beside the copy with SMs held back for it, slowed by 127 µs from 182.6 µs; the profile does not separate these two causes.
 
 ### Disaggregated Serving on a GB300 NVL72 Rack
 
@@ -304,7 +308,7 @@ Pass the file with `--config` to `trtllm-bench` (with `--tp 8 --ep 8`) or `trtll
 | :--- | :--- |
 | Backend | `MEGAMOE_CUTEDSL` only; `AUTO` resolves to it, and other explicit backends are rejected. |
 | Model | An architecture in `moe_model_arch_list` with NVFP4 MoE weights, at most 384 routed experts, and an expert count divisible by the EP size; results here cover DeepSeek-V4-Pro only. |
-| GPUs | Blackwell SM100 or SM103, evaluated on GB200 and GB300 (the [per-layer dynamic EPLB guide](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#per-layer-dynamic-ep-load-balancer) lists every supported GPU), all EP ranks in one multicast-capable NVLink domain, and CUDA 13.1 or later for the TMA multicast copy. |
+| GPUs | Evaluated on GB200, GB300 and pre-release Rubin GPUs; the [per-layer dynamic EPLB guide](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#per-layer-dynamic-ep-load-balancer) lists supported GPUs and build requirements. All EP ranks must be in one multicast-capable NVLink domain, with CUDA 13.1 or later for the TMA multicast copy. |
 | Parallelism | Attention DP with pure EP (no MoE tensor or pipeline parallelism), an even EP size from 2 to 32, and no MoE smart router; unsupported setups raise an error. |
 | CUDA graphs | Not supported: a non-null `cuda_graph_config` is replaced with `null`, with a warning, and any `prefill_cuda_graph_backend` other than `DISABLED` is rejected. |
 | Launch queues | `CUDA_SCALE_LAUNCH_QUEUES=4x` before CUDA initializes: the LLM API behind `trtllm-bench` and `trtllm-serve` sets it; a process that initializes CUDA before creating its `LLM` instance, or that does not use the LLM API, such as the layer-wise benchmarks, must export it. |
@@ -333,7 +337,7 @@ Here `eplb_per_layer_dynamic.yaml` is a file you create in that directory with t
 
 ### When It Helps and When It Does Not
 
-- **Skewed routing gains most.** In the [kernel measurements](#megamoe-kernel-time-with-replicas) (GB200, planning and copy excluded), the time saved at EP8 grew with $R$, from 1.3% (layer 45, $R=1.12$) to 42.8% (layer 20, $R=2.36$), while balanced routing changed by −0.7% to +0.4%. Serving gains also vary by deployment: on GB300, AgentPerf throughput gained 7.2% at DEP8 but 1.6% at DEP6.
+- **Skewed routing gains most.** In the [kernel measurements](#megamoe-kernel-time-with-replicas) (GB200, planning and copy excluded), the time saved at EP8 grew with $R$, from 1.3% (layer 45, $R=1.12$) to 42.8% (layer 20, $R=2.36$), while balanced routing changed by −0.7% to +0.4%. Serving gains also vary by deployment: on pre-release Rubin GPUs, AgentPerf throughput with BF16 combine gained 9.1% at DEP8 but 3.9% at DEP6, both with at most 16,384 tokens/rank per iteration.
 - **The shared expert gives the copy its window.** Without one, only home tiles hide the copy: at most about one DeepSeek-V4-Pro-sized copy (GB300 peak-rate model, EP8, 8,192 tokens/rank), and none with the BF16 combine.
 - **Prefill first.** The [parallelism guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/parallel-strategy.md#best-practices) recommends this mode for context-heavy serving whose hot experts change from batch to batch, and online EPLB for generation-heavy deployments that rely on CUDA graphs; generation is untested here.
 - **Tested range.** On hardware, EP4–EP8 for kernels and DEP6–DEP8 for serving; in replay, EP4–EP24. No controlled hardware point used fewer than 8,192 tokens/rank.
@@ -344,7 +348,7 @@ Here `eplb_per_layer_dynamic.yaml` is a file you create in that directory with t
 
 Beyond the [tested range](#when-it-helps-and-when-it-does-not):
 
-- **Missing measurements.** On GB200, neither a layer with the real shared expert nor serving throughput was measured, and no hardware result compares ISER-MoE with a static plan; the 85–88% estimate comes from a model fit.
+- **Missing measurements.** On GB200, a layer with the real shared expert was not measured, and no hardware result compares ISER-MoE with a static plan; the 85–88% estimate comes from a model fit.
 - **Alignment cost.** Every group member spends a helper slot and receives the whole expert: in [replay](#halo-q-in-trace-replay), HALO-Q made 2.5–3.3× as many remote copies at EP8–EP24 as the greedy point-to-point planner capped at four copies per owner, which balanced worse ($R$ = 1.016–1.100).
 - **Replica lifetime.** HALO-Q plans each replica for one invocation, although in replay 74–78% of the all-rank policy's expert selections recur in the next iteration; the merged implementation's default `per_layer_resident` mode skips a broadcast only when every member of its group still holds the expert in the helper slot HALO-Q assigns, and slot coloring does not try to keep an expert in its previous slot.
 - **Static plus dynamic, and arrival skew.** Per-layer dynamic EPLB cannot currently start from an offline EPLB map, and placement cannot fix ranks that reach the layer at different times.
