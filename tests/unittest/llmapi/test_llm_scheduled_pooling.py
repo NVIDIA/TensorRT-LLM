@@ -15,6 +15,7 @@
 """Scheduled pooling: a non-generation model served through LLM.generate()."""
 
 import random
+import threading
 
 import pytest
 import torch
@@ -100,11 +101,22 @@ def test_cancelling_a_queued_request_finishes_it(monkeypatch):
     params = SamplingParams(max_tokens=1, return_context_logits=True)
 
     with _llm(max_batch_size=1) as llm:
-        assert isinstance(llm._executor.engine, ScheduledEncoderExecutor)
+        engine = llm._executor.engine
+        assert isinstance(engine, ScheduledEncoderExecutor)
+        # The first forward waits for the abort, so the last request is still queued when it lands.
+        aborted = threading.Event()
+        forward = engine._runner.forward
+
+        def forward_after_abort(*args, **kwargs):
+            assert aborted.wait(timeout=60)
+            return forward(*args, **kwargs)
+
+        monkeypatch.setattr(engine._runner, "forward", forward_after_abort)
         futures = [
             llm.generate_async(_prompt(32, seed=seed), sampling_params=params) for seed in range(50)
         ]
         futures[-1].abort()
+        aborted.set()
         finished = [future.result(timeout=60).outputs[0].finish_reason for future in futures]
 
     assert finished == ["length"] * 49 + ["cancelled"]
