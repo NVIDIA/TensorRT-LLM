@@ -28,6 +28,8 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttention
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     DecoderInputBuffers,
     DecoderInputPreparer,
@@ -46,6 +48,7 @@ from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
+    strip_mm_data_for_generation,
 )
 from tensorrt_llm.llmapi import (
     MTPDecodingConfig,
@@ -64,6 +67,11 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.config import DecoderRunnerConfig
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+
+
+# `torch.cuda._sleep` spins for this many GPU clock cycles: long enough to outlast the host
+# side of a test, so that the stream it blocks is still pending when the other stream reads.
+_SIDE_STREAM_DELAY_CYCLES = 2_000_000_000
 
 
 def _input_preparer(*, spec_config: DecodingBaseConfig | None = None) -> DecoderInputPreparer:
@@ -1137,6 +1145,133 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         # group and the plain request seed theirs.
         self.assertEqual(result["mrope_delta_write_seq_slots"].cpu().tolist(), [0, 1, 2])
         self.assertEqual(context.py_mrope_delta_cache_slot, 0)
+
+    @staticmethod
+    def _stage_on_side_stream(
+        values: torch.Tensor, side_stream: torch.cuda.Stream, delay_cycles: int = 0
+    ) -> tuple[torch.Tensor, torch.cuda.Event]:
+        """Write `values` into side-stream storage the way a cross-iter prefetch
+        stages a request's tensors, optionally behind a spin of `delay_cycles`."""
+        values = values.cuda()
+        torch.cuda.synchronize()
+        event = torch.cuda.Event()
+        with torch.cuda.stream(side_stream):
+            staged = torch.zeros_like(values)
+            if delay_cycles:
+                torch.cuda._sleep(delay_cycles)
+            staged.copy_(values)
+            event.record()
+        return staged, event
+
+    def _prepare_prefetched_mrope_chunk(
+        self,
+        preparer: DecoderInputPreparer,
+        kv_cache_manager: KVCacheManagerV2,
+        attn_metadata: AttentionMetadata,
+        context: LlmRequest,
+        *,
+        last_chunk: bool,
+    ) -> dict[str, Any]:
+        scheduled_requests = ScheduledRequests()
+        if last_chunk:
+            scheduled_requests.context_requests_last_chunk = [context]
+        else:
+            scheduled_requests.context_requests_chunking = [context]
+        return preparer.prepare_inputs(
+            scheduled_requests=scheduled_requests,
+            kv_cache_manager=kv_cache_manager,
+            attn_metadata=attn_metadata,
+            enable_spec_decode=False,
+            runtime_draft_len=0,
+            is_dummy=False,
+        ).kwargs
+
+    def test_prefetch_staged_mrope_is_read_after_the_prefetch_event(self) -> None:
+        """The MRoPE positions a cross-iter prefetch staged on its side stream
+        are sliced into the runner buffer during prepare, ahead of any wait in
+        the model forward."""
+        preparer, kv_cache_manager, attn_metadata = self._setup_mrope_inputs()
+        preparer.model.config.vocab_size = 1000
+        context = self._make_mrope_ctx_request(4, 1, 0, 30)
+        mrope_config = context.py_multimodal_data["mrope_config"]
+        mrope_config["mrope_position_ids"], event = self._stage_on_side_stream(
+            mrope_config["mrope_position_ids"], torch.cuda.Stream(), _SIDE_STREAM_DELAY_CYCLES
+        )
+        context.py_mm_encoder_event = event
+
+        result = self._prepare_prefetched_mrope_chunk(
+            preparer, kv_cache_manager, attn_metadata, context, last_chunk=True
+        )
+        position_ids = result["position_ids"].clone()
+
+        self.assertFalse(event.query(), "the staging must still be pending for this to test order")
+        expected = (100 + 1000 * torch.arange(3).view(3, 1, 1) + torch.arange(4).view(1, 1, -1)).to(
+            dtype=torch.int32, device="cuda"
+        )
+        torch.testing.assert_close(position_ids, expected, atol=0, rtol=0)
+
+    def test_prefetch_event_survives_a_first_chunk_without_multimodal_rows(self) -> None:
+        """A first chunk with no multimodal rows is dropped before the wait in
+        the model forward, so the chunk that does read the prefetched embedding
+        has to find the stream already ordered after the prefetch."""
+        preparer, kv_cache_manager, attn_metadata = self._setup_mrope_inputs()
+        preparer.model.config.vocab_size = 1000
+        context = self._make_mrope_ctx_request(4, 1, 0, 30)
+        context.context_chunk_size = 2
+        embedding = torch.arange(1, 5, dtype=torch.float16).view(2, 2)
+        context.py_multimodal_data["multimodal_embed_mask_cumsum"] = torch.tensor([0, 0, 1, 2])
+        context.py_multimodal_data["multimodal_embedding"], event = self._stage_on_side_stream(
+            embedding, torch.cuda.Stream(), _SIDE_STREAM_DELAY_CYCLES
+        )
+        context.py_mm_encoder_event = event
+        model = MultimodalModelMixin()
+
+        gathered = []
+        for last_chunk in (False, True):
+            result = self._prepare_prefetched_mrope_chunk(
+                preparer, kv_cache_manager, attn_metadata, context, last_chunk=last_chunk
+            )
+            selected = model.select_multimodal_params(result["multimodal_params"], 1)
+            if selected:
+                gathered.append(
+                    get_multimodal_embeddings(
+                        encoder_forward_fn=lambda _: self.fail("the embedding is attached"),
+                        multimodal_params=list(selected),
+                    )[0].clone()
+                )
+            context.context_current_position = 2
+
+        self.assertFalse(event.query(), "the staging must still be pending for this to test order")
+        self.assertEqual(len(gathered), 1)
+        torch.testing.assert_close(gathered[0], embedding.cuda(), atol=0, rtol=0)
+
+    def test_prefetch_staged_storage_outlives_the_request_while_still_read(self) -> None:
+        """Post-prefill cleanup drops the request's side-stream tensors while
+        this stream's reads of them can still be queued; the side stream must
+        not get their storage back before those reads ran."""
+        preparer, kv_cache_manager, attn_metadata = self._setup_mrope_inputs()
+        preparer.model.config.vocab_size = 1000
+        context = self._make_mrope_ctx_request(4, 1, 0, 30)
+        mrope_config = context.py_multimodal_data["mrope_config"]
+        side_stream = torch.cuda.Stream()
+        staged, event = self._stage_on_side_stream(mrope_config["mrope_position_ids"], side_stream)
+        mrope_config["mrope_position_ids"] = staged
+        context.py_mm_encoder_event = event
+        expected = staged.clone()
+        torch.cuda.synchronize()
+
+        torch.cuda._sleep(_SIDE_STREAM_DELAY_CYCLES)
+        result = self._prepare_prefetched_mrope_chunk(
+            preparer, kv_cache_manager, attn_metadata, context, last_chunk=True
+        )
+        position_ids = result["position_ids"].clone()
+        del staged, mrope_config, result
+        strip_mm_data_for_generation(context.py_multimodal_data)
+        with torch.cuda.stream(side_stream):
+            reused = torch.full_like(expected, -1)
+
+        torch.testing.assert_close(position_ids, expected, atol=0, rtol=0)
+        del reused
 
     def _setup_extend_as_context_inputs(
         self,

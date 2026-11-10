@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
 import torch
+from torch.utils._pytree import tree_flatten
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
@@ -1376,12 +1377,16 @@ class DecoderInputPreparer:
         # Transfer any cross-iter MM encoder prefetch event stamped on the request onto the
         # freshly-built MultimodalParams. The downstream consume site reads it from the wrapper,
         # not from the request.
-        # NOTE: the prefetch producer always writes the cached embedding into
-        # `py_multimodal_data` before stamping the event, so whenever the event is present,
-        # `has_content()` below is `True` and the wrapper reaches the consume site that waits on
-        # it.
+        # The prefetch staged this request's tensors on its side stream, and this stream reads
+        # them from here on (the MRoPE slice below, the embedding in a later chunk), so order it
+        # after the prefetch now and keep their storage until this stream is done with it.
         mm_encoder_event = request.py_mm_encoder_event
         if mm_encoder_event is not None:
+            consumer_stream = torch.cuda.current_stream()
+            consumer_stream.wait_event(mm_encoder_event)
+            for leaf in tree_flatten(request.py_multimodal_data)[0]:
+                if isinstance(leaf, torch.Tensor) and leaf.is_cuda:
+                    leaf.record_stream(consumer_stream)
             multimodal_params.encoder_event = mm_encoder_event
             request.py_mm_encoder_event = None
         if multimodal_params.has_content():
