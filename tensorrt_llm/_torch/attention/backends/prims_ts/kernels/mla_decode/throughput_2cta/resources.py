@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -61,6 +62,7 @@ from ...mask import kv_tile_needs_right_mask
 from ...tensor_map import transform_ragged_coords
 
 from ..helpers.sparse_indices import SparseKVIndices, SparseSourceTile
+from ..helpers.kv_bounds import query_kv_bound
 from ..helpers.gather import (
     gather4_cached,
     load_sparse_rows,
@@ -121,6 +123,7 @@ from ..helpers.math import (
     qkv_dtype,
     qkv_major_k_stride_bytes_for,
 )
+from ..helpers.softmax_stats import store_softmax_stats
 from ..helpers.ops import (
     fp8_log2_p_scale,
     fp8_p_scale_rcp,
@@ -531,7 +534,9 @@ class MlaWorkQueue(WorkQueue):
             self.cu_seqlens_q,
             safe_b_idx,
         )
-        if cutlass.const_expr(cfg.mask_type == MaskType.CAUSAL.value):
+        if cutlass.const_expr(
+            not cfg.use_kv_bounds and cfg.mask_type == MaskType.CAUSAL.value
+        ):
             # Split partitioning owns the mask-visible CTA domain. The final
             # physical row resolves to the tile's latest valid Q
             # token. Row-causal softmax narrows earlier rows without changing
@@ -2432,8 +2437,10 @@ class TmemSResource(HighThroughputMlaResource):
     smem_p: Any = None  # SMEM P array
     smem_exchange: Any = None  # SMEM array for cross-warp max exchange
     scale_softmax_log2: Any = None  # softmax_scale * log2(e)
+    store_softmax_stats: cutlass.Constexpr[bool] = False
     page_offsets: Any = None
     cache_seqs: Any = None  # per-batch valid K length
+    kv_bounds: Any = None  # per-logical-query prefix length
     cu_seqlens_q: Any = None  # cumulative compact-Q offsets, or None for fixed Q
     split_kv: Any = None  # per-work-tile split count
     logical_num_heads_q: cutlass.Constexpr[int] = 128
@@ -2827,9 +2834,25 @@ class TmemSResource(HighThroughputMlaResource):
         k_index = work_tile.k_index_base + Int32(stage_info.loop_offset)
         tile_offset_k = k_index * Int32(cfg.mma_qk_tiler[1])
         needs_row_causal_mask = cutlass.const_expr(
-            cfg.mask_type == MaskType.CAUSAL.value
+            not cfg.use_kv_bounds and cfg.mask_type == MaskType.CAUSAL.value
         )
-        if cutlass.const_expr(needs_row_causal_mask):
+        row_kv_bound = Int32(0)
+        if cutlass.const_expr(cfg.use_kv_bounds):
+            row_in_tile = self.cta_rank * Int32(
+                cfg.mma_qk_tiler[0] // cfg.num_mma_ctas
+            ) + (local_tidx & Int32(EPILOGUE_ROW_MASK))
+            flat_query_row = (
+                Int32(work_tile.tile_idx[1]) * Int32(cfg.mma_qk_tiler[0]) + row_in_tile
+            )
+            row_kv_bound = query_kv_bound(
+                self.kv_bounds,
+                self.cu_seqlens_q,
+                Int32(work_tile.tile_idx[2]),
+                flat_query_row // Int32(self.logical_num_heads_q),
+                self.logical_seq_len_q,
+            )
+            group_needs_mask = True
+        elif cutlass.const_expr(needs_row_causal_mask):
             batch_idx = Int32(work_tile.tile_idx[2])
             _, logical_seq_len_q = query_batch_bounds(
                 self.cu_seqlens_q,
@@ -2958,7 +2981,9 @@ class TmemSResource(HighThroughputMlaResource):
             ) << EPILOGUE_COLUMN_GROUP_SHIFT
             for i in cutlass.range_constexpr(64):
                 token_idx = tile_offset_k + tidx_col + Int32(i)
-                if cutlass.const_expr(needs_row_causal_mask):
+                if cutlass.const_expr(cfg.use_kv_bounds):
+                    token_is_visible = token_idx < row_kv_bound
+                elif cutlass.const_expr(needs_row_causal_mask):
                     mask_flat_row = Int32(self.logical_num_heads_q) * (
                         token_idx - K + logical_seq_len_q
                     )
@@ -3219,16 +3244,30 @@ class TmemSResource(HighThroughputMlaResource):
 
         fma_b = self.scale_softmax_log2
         fma_c = Float32(0) - safe_row_max_new * self.scale_softmax_log2
+        if cutlass.const_expr(self.store_softmax_stats):
+            fma_c = Float32(0)
         if cutlass.const_expr(cfg.is_fp8_qkv()):
             # Use the same selected FP8 probability scale as output and LSE:
             # 448 with exact maxima, 448 * 2**-T with a rescale threshold T.
             fma_c = fma_c + fp8_log2_p_scale(cfg)
         for i in cutlass.range_constexpr(0, 64, 2):
-            fma_result = fma_packed_f32x2(
-                (qk_acc_regs[i], qk_acc_regs[i + 1]),
-                (fma_b, fma_b),
-                (fma_c, fma_c),
-            )
+            if cutlass.const_expr(self.store_softmax_stats):
+                # Fusing absolute scaled scores with a rounded scaled maximum
+                # can make exp(score - max) differ from one when score == max.
+                fma_result = fma_packed_f32x2(
+                    (
+                        qk_acc_regs[i] - safe_row_max_new,
+                        qk_acc_regs[i + 1] - safe_row_max_new,
+                    ),
+                    (fma_b, fma_b),
+                    (fma_c, fma_c),
+                )
+            else:
+                fma_result = fma_packed_f32x2(
+                    (qk_acc_regs[i], qk_acc_regs[i + 1]),
+                    (fma_b, fma_b),
+                    (fma_c, fma_c),
+                )
             qk_acc_regs[i] = cute.math.exp2(fma_result[0], fastmath=True)
             qk_acc_regs[i + 1] = cute.math.exp2(fma_result[1], fastmath=True)
 
@@ -4021,6 +4060,8 @@ class GmemOResource(HighThroughputMlaResource):
     partial_output: Any = None
     lse: Any = None
     partial_lse: Any = None
+    softmax_stats: Any = None
+    softmax_stats_scale: Any = None
     tmem_o_ref: Any = None  # Reference to TmemOResource for tmem_base_addr
     tmem_corr_ref: Any = None  # Reference to TmemCorrResource for correction data
     output_scale: Any = None
@@ -4036,6 +4077,27 @@ class GmemOResource(HighThroughputMlaResource):
     logical_num_heads_q: cutlass.Constexpr[int] = 128
     logical_seq_len_q: Int32 = 1
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
+
+    @cute.jit
+    def _store_softmax_stats(self, lse_ptr, raw_maximum, denominator):
+        if cutlass.const_expr(self.softmax_stats is not None):
+            rows = Int64(cute.cosize(self.partial_lse.layout))
+            (lse_ptr + rows).store(raw_maximum)
+            (lse_ptr + rows * Int64(2)).store(denominator)
+
+    @cute.jit
+    def _store_final_softmax_stats(self, storage_row, batch_idx, maximum, denominator):
+        if cutlass.const_expr(
+            self.softmax_stats is not None and self.partial_lse is None
+        ):
+            row = Int64(storage_row)
+            if cutlass.const_expr(self.cu_seqlens_q is None):
+                row += (
+                    Int64(batch_idx) * self.logical_num_heads_q * self.logical_seq_len_q
+                )
+            store_softmax_stats(
+                self.softmax_stats, row, maximum, denominator, self.softmax_stats_scale
+            )
 
     @cute.jit
     def _prefetch_output_rope(self, flat_row, batch_idx, local_tidx, head, valid):
@@ -4564,6 +4626,7 @@ class GmemOResource(HighThroughputMlaResource):
                         * Int64(S_q)
                     )
                     lse_base_ptr.store(lse)
+                    self._store_softmax_stats(lse_base_ptr, row_max, lse_row_sum)
                 elif cutlass.const_expr(self.lse is not None):
                     if cutlass.const_expr(self.cu_seqlens_q is not None):
                         lse_base_ptr = (
@@ -4582,6 +4645,9 @@ class GmemOResource(HighThroughputMlaResource):
                             + Int64(batch_idx) * Int64(logical_num_heads_q) * Int64(S_q)
                         )
                     lse_base_ptr.store(final_lse(lse, cfg.lse_base_on_e))
+                self._store_final_softmax_stats(
+                    storage_flat_lse_row, batch_idx, row_max, lse_row_sum
+                )
 
         prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
         cute.arch.fence_view_async_tmem_load()
@@ -4859,6 +4925,7 @@ class GmemOResource(HighThroughputMlaResource):
                             * Int64(S_q)
                         )
                         lse_base_ptr.store(lse)
+                        self._store_softmax_stats(lse_base_ptr, row_max, lse_row_sum)
                     elif cutlass.const_expr(self.lse is not None):
                         if cutlass.const_expr(self.cu_seqlens_q is not None):
                             lse_base_ptr = (
@@ -4879,6 +4946,9 @@ class GmemOResource(HighThroughputMlaResource):
                                 * Int64(S_q)
                             )
                         lse_base_ptr.store(final_lse(lse, cfg.lse_base_on_e))
+                    self._store_final_softmax_stats(
+                        storage_flat_lse_row, batch_idx, row_max, lse_row_sum
+                    )
 
         prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
         cute.arch.fence_view_async_tmem_load()

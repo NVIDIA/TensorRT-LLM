@@ -339,6 +339,7 @@ def _build_decode_gen_schedule(
     partial_stats_ptr: cute.Pointer | None = None,
     split_kv_counter_ptr: cute.Pointer | None = None,
     attention_sinks_ptr: cute.Pointer | None = None,
+    softmax_stats_ptr: cute.Pointer | None = None,
     seqlens_kv: cute.Pointer | None = None,
     cu_seqlens_q: cute.Pointer | UniformQueryOffsets | None = None,
     max_seq_len_kv: int | Int32 = 0,
@@ -381,6 +382,7 @@ def _build_decode_gen_schedule(
     sage_scales_ptr: cute.Pointer | None = None,
     lse_ptr: cute.Pointer | None = None,
     requested_splits=None,
+    stats_scale: Float32 | cute.Pointer | None = None,
 ) -> tuple[
     list[Task],
     dict[MemoryResource, list[MemoryResource]],
@@ -1449,6 +1451,8 @@ def _build_decode_gen_schedule(
         split_kv_counter_ptr=split_kv_counter_ptr,
         attention_sinks_ptr=attention_sinks_ptr,
         lse_ptr=lse_ptr,
+        softmax_stats_ptr=softmax_stats_ptr,
+        stats_scale=stats_scale,
         seqlens_kv=kv_seqlens,
         max_seq_len_kv=corr_max_seq_len_kv,
         max_q_len=max_q_len,
@@ -1481,6 +1485,8 @@ def _build_decode_gen_schedule(
             split_kv_counter_ptr=split_kv_counter_ptr,
             attention_sinks_ptr=attention_sinks_ptr,
             lse_ptr=lse_ptr,
+            softmax_stats_ptr=softmax_stats_ptr,
+            stats_scale=stats_scale,
             seqlens_kv=kv_seqlens,
             max_seq_len_kv=corr_max_seq_len_kv,
             max_q_len=max_q_len,
@@ -2627,6 +2633,8 @@ def _run_decode_gen_active(
     lse_ptr: cute.Pointer | None = None,
     requested_splits=None,
     g_max_q_len: Int32 = 1,
+    g_softmax_stats: cute.Pointer | None = None,
+    stats_scale: Float32 | cute.Pointer | None = None,
 ) -> None:
     """Run the complete decode body for one runtime-valid Q tile.
 
@@ -2754,6 +2762,10 @@ def _run_decode_gen_active(
         partial_stats_ptr=g_partial_stats,
         split_kv_counter_ptr=g_split_kv_counter,
         attention_sinks_ptr=g_attention_sinks,
+        softmax_stats_ptr=g_softmax_stats,
+        stats_scale=(
+            Float32(1.0) if isinstance(stats_scale, cute.Pointer) else stats_scale
+        ),
         seqlens_kv=runtime_seqlens_kv,
         cu_seqlens_q=g_cu_seqlens_q,
         max_seq_len_kv=runtime_max_seq_len_kv,
@@ -2896,9 +2908,10 @@ def _run_decode_gen_active(
     # Scales are first consumed by the task bodies. Bind their device values
     # after the producer acquire so resource initialization can overlap it.
     if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Pointer)):
-        scale_softmax_log2 = cute.make_tensor(
+        resolved_softmax_scale = cute.make_tensor(
             softmax_scale_operand, cute.make_layout(1)
-        )[0] * Float32(math.log2(math.e))
+        )[0]
+        scale_softmax_log2 = resolved_softmax_scale * Float32(math.log2(math.e))
         for resource in task_manager.resources:
             if cutlass.const_expr(
                 isinstance(
@@ -2913,6 +2926,10 @@ def _run_decode_gen_active(
                 )
             ):
                 resource.scale_softmax_log2 = scale_softmax_log2
+            if cutlass.const_expr(
+                cfg.store_softmax_stats and isinstance(resource, TmemCorrResource)
+            ):
+                resource.stats_scale = resolved_softmax_scale
     if cutlass.const_expr(isinstance(output_scale, cute.Pointer)):
         resolved_output_scale = cute.make_tensor(output_scale, cute.make_layout(1))[0]
         for resource in task_manager.resources:
@@ -3018,6 +3035,8 @@ def _run_decode_gen_runtime_prefix(
     lse_ptr: cute.Pointer | None = None,
     requested_splits=None,
     g_max_q_len: Int32 = 1,
+    g_softmax_stats: cute.Pointer | None = None,
+    stats_scale: Float32 | cute.Pointer | None = None,
 ) -> None:
     """Run the general runtime split-prefix producer or retire its suffix."""
 
@@ -3109,6 +3128,8 @@ def _run_decode_gen_runtime_prefix(
                 lse_ptr=lse_ptr,
                 requested_splits=requested_splits,
                 g_max_q_len=g_max_q_len,
+                g_softmax_stats=g_softmax_stats,
+                stats_scale=stats_scale,
             )
         else:
             _run_decode_gen_inactive_cluster_rank()
@@ -3166,6 +3187,8 @@ def _run_decode_gen_runtime_prefix(
                 lse_ptr=lse_ptr,
                 requested_splits=requested_splits,
                 g_max_q_len=g_max_q_len,
+                g_softmax_stats=g_softmax_stats,
+                stats_scale=stats_scale,
             )
         else:
             _signal_padded_pdl_producer(cfg)
@@ -3217,6 +3240,8 @@ def decode_gen_kernel(
     lse_ptr: cute.Pointer | None = None,
     requested_splits=None,
     g_max_q_len: Int32 = 1,
+    g_softmax_stats: cute.Pointer | None = None,
+    stats_scale: Float32 | cute.Pointer | None = None,
 ) -> None:
     """Dispatch one static Q/split tile and drain padded launch slots safely."""
     if cutlass.const_expr(not cfg.fixed_seqlen):
@@ -3347,6 +3372,8 @@ def decode_gen_kernel(
                 lse_ptr=lse_ptr,
                 requested_splits=requested_splits,
                 g_max_q_len=g_max_q_len,
+                g_softmax_stats=g_softmax_stats,
+                stats_scale=stats_scale,
             )
         elif cutlass.const_expr(cfg.use_split_kv and cfg.use_pdl):
             # The immediately preceding grid may produce seq_lens. Send every
@@ -3404,6 +3431,8 @@ def decode_gen_kernel(
                 lse_ptr=lse_ptr,
                 requested_splits=requested_splits,
                 g_max_q_len=g_max_q_len,
+                g_softmax_stats=g_softmax_stats,
+                stats_scale=stats_scale,
             )
         else:
             _run_decode_gen_runtime_prefix(
@@ -3457,6 +3486,8 @@ def decode_gen_kernel(
                 lse_ptr=lse_ptr,
                 requested_splits=requested_splits,
                 g_max_q_len=g_max_q_len,
+                g_softmax_stats=g_softmax_stats,
+                stats_scale=stats_scale,
             )
     else:
         # Inactive requests publish no output or partials; dependent reducers
@@ -3510,6 +3541,7 @@ def fmha_decode_launch(
     requested_splits=None,
     max_q_len: Int32 = 0,
     runtime_q_capacity_rows: Int32 = 0,
+    softmax_stats_iter: cute.Pointer | None = None,
 ) -> None:
     """Standalone JIT launcher for FMHA decode TS.
 
@@ -3956,6 +3988,8 @@ def fmha_decode_launch(
                 null_sparse_route_ptr,
                 static_full_split_prefix,
                 g_sage_scales=sage_scales_iter,
+                g_softmax_stats=softmax_stats_iter,
+                stats_scale=softmax_scale,
                 lse_ptr=lse_ptr,
                 requested_splits=requested_splits,
                 g_max_q_len=max_q_len,

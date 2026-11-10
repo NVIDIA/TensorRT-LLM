@@ -336,13 +336,33 @@ class SmemPResource(DecodeGenResourceBase):
             if safe_new_max == _neg_max_f32():
                 safe_new_max = Float32(0.0)
         # Not ``cute.math.fma``: the fused form makes ptxas spill in the callers.
-        addend = Float32(-self.scale_softmax_log2 * safe_new_max)
+        addend = Float32(0.0)
+        if cutlass.const_expr(not cfg.store_softmax_stats):
+            addend = Float32(-self.scale_softmax_log2 * safe_new_max)
         if cutlass.const_expr(self.cfg.use_fp8_pv):
             addend += Float32(cfg.fp8_p_quant_log2_scale)
         if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
             if route_is_proxy:
                 addend += Float32(cfg.proxy_log2_block_mass)
         return addend
+
+    @cute.jit
+    def _center_stats_scores(
+        self, scores: cutlass.Array, maxima: cutlass.Array
+    ) -> None:
+        """Subtract each raw row maximum before multiplying by the QK scale."""
+        cfg = self.cfg
+        if cutlass.const_expr(cfg.store_softmax_stats):
+            for score_idx in cutlass.range_constexpr(scores.shape[0]):
+                if cutlass.const_expr(cfg.use_keeps_mma_ab):
+                    scale_idx = 0
+                else:
+                    repeats = max(cfg.tile_size_q // 8, 1)
+                    scale_idx = ((score_idx % (4 * repeats)) // 4) * 2 + score_idx % 2
+                anchor = maxima[scale_idx]
+                if anchor == _neg_max_f32():
+                    anchor = Float32(0.0)
+                scores[score_idx] = scores[score_idx] - anchor
 
     @producer_work
     @cute.jit
@@ -526,6 +546,7 @@ class SmemPResource(DecodeGenResourceBase):
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
             for score_idx in cutlass.range_constexpr(fragment_regs):
                 s_arr[score_idx] = pending_scores[score_idx]
+            self._center_stats_scores(s_arr, new_max_arr)
             if cutlass.const_expr(dequantized):
                 self._scale_fragment_pairs(
                     s_arr, row_addends, row_multipliers, groups=1
@@ -815,6 +836,7 @@ class SmemPResource(DecodeGenResourceBase):
                 + stage_info.stage_idx * cfg.tmem_s_cols
             )
 
+        self._center_stats_scores(s_arr, new_max_arr)
         exponent_addend = self._exponent_addend(new_max_arr[0], route_is_proxy)
         exp_scale = self.scale_softmax_log2
         if cutlass.const_expr(cfg.use_sage_attention):
@@ -994,6 +1016,7 @@ class SmemPResource(DecodeGenResourceBase):
                 route_is_proxy=route_is_proxy,
             )
             return
+        self._center_stats_scores(s_arr, new_max_arr)
         # ProdWork: transform the softmax S registers into the P operand layout
         # expected by BMM2, while recording the per-scale local sums consumed by
         # the denominator update.

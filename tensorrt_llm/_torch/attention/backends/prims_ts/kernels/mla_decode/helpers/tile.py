@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +21,7 @@ from cutlass import Int32
 
 from cutlass.experimental.task_scheduling.resources import StageInfo
 
+from .kv_bounds import query_kv_bound
 from .layout import _TASK_CACHE_SEQ_LEN_KV, _TASK_CACHE_LOCAL_KV_TILES
 from .mask import MaskType, mask_visible_k_length
 from .query import (
@@ -219,12 +221,18 @@ def runtime_seq_len_kv_for_logical_q(
     batch_idx,
     logical_q_idx,
     cu_seqlens_q=None,
+    kv_bounds=None,
 ):
     """Return the mask-visible KV length for one logical Q row.
 
     Dense decode exposes the full runtime cache. Bottom-right causal decode
     removes the speculative K positions following ``logical_q_idx``.
+    Explicit bounds replace either policy with a per-query prefix count.
     """
+    if cutlass.const_expr(kv_bounds is not None):
+        return query_kv_bound(
+            kv_bounds, cu_seqlens_q, batch_idx, logical_q_idx, cfg.logical_seq_len_q
+        )
     _, logical_seq_len_q = query_batch_bounds(
         cu_seqlens_q,
         batch_idx,
@@ -248,11 +256,13 @@ def runtime_seq_len_kv_for_q(
 ):
     """Return the KV domain shared by flat query rows in a CTA.
 
-    The last physical row has the largest causal domain. Row-causal softmax
-    applies the remaining row-specific mask; all other modes can use
-    this CTA-visible length with the ordinary dense tail predicate.
+    The last physical row has the largest causal domain. Explicit per-query
+    bounds instead retain the full raw cache domain. Softmax applies each
+    row's remaining prefix mask within this shared producer/reducer domain.
     """
-    if cutlass.const_expr(cfg.mask_type == MaskType.DENSE.value):
+    if cutlass.const_expr(cfg.use_kv_bounds or cfg.mask_type == MaskType.DENSE.value):
+        # Explicit bounds replace causality. The raw cache domain conservatively
+        # covers every row's prefix and is shared with split reduction.
         return runtime_base_seq_len_kv(cfg, cache_seqs, batch_idx)
     _, _, logical_q_idx, _, _ = flat_query_row_state(
         Int32(cfg.tile_size_q - 1),
@@ -392,6 +402,7 @@ def runtime_seq_len_kv_for_query_row(
     cta_idx_q,
     row_in_tile,
     cu_seqlens_q=None,
+    kv_bounds=None,
 ):
     """Return the KV length visible to one physical flat-query row."""
     _, _, logical_q_idx, _, _ = flat_query_row_state(
@@ -409,6 +420,7 @@ def runtime_seq_len_kv_for_query_row(
         batch_idx,
         logical_q_idx,
         cu_seqlens_q,
+        kv_bounds,
     )
 
 
@@ -422,7 +434,7 @@ def runtime_seq_len_kv_from_task_cache(
 ):
     """Return the CTA-visible KV domain from the task-cached raw length."""
     seq_len_kv = Int32(task_cache[_TASK_CACHE_SEQ_LEN_KV])
-    if cutlass.const_expr(cfg.mask_type == MaskType.DENSE.value):
+    if cutlass.const_expr(cfg.use_kv_bounds or cfg.mask_type == MaskType.DENSE.value):
         return seq_len_kv
     _, logical_seq_len_q = query_batch_bounds(
         cu_seqlens_q,
