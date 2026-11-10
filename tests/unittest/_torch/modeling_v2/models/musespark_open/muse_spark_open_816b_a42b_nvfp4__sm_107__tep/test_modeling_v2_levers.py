@@ -298,10 +298,9 @@ def test_the_rule_table_is_the_lever_registry():
 # The regions under auto
 # --------------------------------------------------------------------------
 LL = {"step_loop_on_execution_stream", "incremental_block_offsets", "head_sampler_coop_fold"}
+#: The drafter-arena levers: their stores and commits are a dense full-length arena's or the KV
+#: cache manager's pages (``dispatch.UNWINDOWED_ARENA_LEVERS``).
 DENSE = {"drafter_kv_side_chain", "drafter_fc_early_fork", "drafter_preamble_from_commit"}
-#: The ``DENSE`` levers that serve the KV cache manager's pages too (their fused store is the
-#: paged one there).
-PAGED_TOO = {"drafter_kv_side_chain", "drafter_fc_early_fork"}
 MIDC = {"wide_direct_transports", "wide_oproj_publish", "wide_finalize_transport"}
 HC = {"packed_prep_append", "windowed_commit_parallel"}
 PREFILL = {"prefill_cutedsl_experts"}
@@ -857,19 +856,11 @@ def test_agg_tep8_mbs1_dense():
     assert base_off(lever_table) == set()
 
 
-#: The single-request levers built on a dense-arena-only lever (``DENSE - PAGED_TOO``).
-SINGLE_ON_DENSE = {"drafter_preamble_late_join"}
-
-
 def test_agg_tep8_mbs1_paged():
     lever_table = table((107, 8), 1, "agg", "paged")
-    assert rule_levers_on(lever_table) == LL | PAGED_TOO | (SINGLE - SINGLE_ON_DENSE) | VR_SINGLE
-    for name in DENSE - PAGED_TOO:
-        assert lever_table.decisions[name].source == "structural", name
-    for name in SINGLE_ON_DENSE:
-        assert lever_table.decisions[name].source == "dependency", name
+    assert rule_levers_on(lever_table) == LL | DENSE | SINGLE | VR_SINGLE
     assert rule_levers_on(rs_table(arena="paged")) == (
-        LL | PAGED_TOO | (SINGLE - SINGLE_ON_DENSE) | VR_SINGLE | SINGLE_TAIL | SINGLE_RS
+        LL | DENSE | SINGLE | VR_SINGLE | SINGLE_TAIL | SINGLE_RS
     )
 
 
@@ -2010,9 +2001,8 @@ def test_context_fp8_dense_on_refuses_a_reachable_decode_step():
 
 def test_a_paged_arena_leaves_the_arena_writing_levers_out():
     lever_table = table((107, 8), 1, "agg", "paged")
-    for name in (DENSE - PAGED_TOO) | {"windowed_commit_parallel"}:
-        assert lever_table.decisions[name].source == "structural", name
-    for name in PAGED_TOO:
+    assert lever_table.decisions["windowed_commit_parallel"].source == "structural"
+    for name in DENSE | {"drafter_preamble_late_join"}:
         assert lever_table.on(name), name
     assert lever_table.on("step_loop_on_execution_stream")
     assert lever_table.on("context_kv_fork")

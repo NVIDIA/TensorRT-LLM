@@ -7,7 +7,9 @@ lengths the drafter reads bit for bit as ``DFlashWorker._commit_context`` does
 -- the add, the whole-tensor clamp, the dummy slot's zero, the context base
 (``TRTLLM_DFLASH_WINDOWED_CTX_ARENA``), the allocation limit -- and, where the
 unified cache's check fails, end the process with a CUDA error as the built-in's
-device assert does.
+device assert does. ``context_kv_commit_paged_preamble`` must do the same and write the
+drafter preamble as ``windowed_block_decode`` and the prepare derive it, and the verify fold
+must take it over pages only where the fork's commit is this kernel.
 """
 
 import subprocess
@@ -20,6 +22,9 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_107__tep.kernels.context_kv_fork import (  # noqa: E501
     fork as fork_mod,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_107__tep.kernels.verify_fold import (  # noqa: E501
+    fold as fold_mod,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_107__tep.ops.spec import (  # noqa: E501
     context_kv_commit_paged as mod,
@@ -106,6 +111,103 @@ def test_the_commit_is_the_builtin_method(gens, limit, counts_dtype, base):
     assert torch.equal(ctx_len, want_len)
     assert (ctx_base is None) or torch.equal(ctx_base, want_base)
     assert torch.equal(out, want)
+
+
+@pytest.mark.parametrize("seq_dtype", [torch.int32, torch.int64], ids=["seq-i32", "seq-i64"])
+@pytest.mark.parametrize("batch", ["rows", "slots-i32"])
+@pytest.mark.parametrize("base", [False, True], ids=["no-base", "base"])
+@pytest.mark.parametrize("limit", [True, False], ids=["limit", "no-limit"])
+@pytest.mark.parametrize("gens", [1, 3, mod.MAX_REQUESTS])
+def test_the_preamble_commit_is_the_commit_and_the_forward_s_preamble(
+    gens, limit, base, batch, seq_dtype
+):
+    ctx_len, ctx_base, slots, counts, rows, block_counts, dummy = _case(
+        gens, 3 * gens, limit, base=base
+    )
+    # The forward's ctx_cache_batch_idx: the batch rows over the manager's block tables, the
+    # slots over the worker's own pages (any integer dtype).
+    batch_idx = rows if batch == "rows" else slots.to(torch.int32)
+    g = torch.Generator(device="cuda").manual_seed(gens)
+    query_positions = torch.randint(0, MAX_CTX, (gens, BLOCK), generator=g, device="cuda")
+    seq_lens = torch.full((gens + 3,), -9, dtype=seq_dtype, device="cuda")
+    want_len = ctx_len.clone()
+    want_base = None if ctx_base is None else ctx_base.clone()
+    want = _Worker(want_len, block_counts, unified=True, ctx_base=want_base)._commit_context(
+        slots, counts.long(), rows
+    )
+    # windowed_block_decode's own derivations and the prepare's _seq_lens_cuda fill.
+    want_i32s = (
+        want.to(torch.int32),
+        want.to(torch.int32) + BLOCK,
+        batch_idx.to(torch.int32),
+        query_positions.reshape(-1).to(torch.int32),
+    )
+    want_seq_lens = seq_lens.clone()
+    want_seq_lens[:gens] = BLOCK - 1
+    out = torch.full((gens,), -5, dtype=torch.int64, device="cuda")
+    i32s = tuple(torch.full_like(t, -3) for t in want_i32s)
+    mod.context_kv_commit_paged_preamble(
+        ctx_len,
+        ctx_base,
+        slots,
+        counts,
+        rows,
+        block_counts,
+        PAGE,
+        BLOCK,
+        MAX_CTX,
+        dummy,
+        True,
+        out,
+        batch_idx,
+        query_positions,
+        seq_lens,
+        BLOCK - 1,
+        BLOCK,
+        i32s,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(ctx_len, want_len)
+    assert (ctx_base is None) or torch.equal(ctx_base, want_base)
+    assert torch.equal(out, want)
+    for got, expected in zip(i32s, want_i32s):
+        assert got.dtype == torch.int32 and torch.equal(got, expected)
+    assert torch.equal(seq_lens, want_seq_lens)
+
+
+def _fold_inputs(gens):
+    fold = types.SimpleNamespace(
+        query_positions=torch.zeros(gens, BLOCK, dtype=torch.int64, device="cuda")
+    )
+    attn_metadata = types.SimpleNamespace(
+        _seq_lens_cuda=torch.zeros(gens + 2, dtype=torch.int32, device="cuda")
+    )
+    return fold, attn_metadata
+
+
+def test_the_fold_takes_the_preamble_over_pages_only_where_the_paged_commit_runs():
+    ctx_len, _, slots, counts, rows, block_counts, _ = _case(3, 2)
+    worker = _Worker(ctx_len, block_counts, unified=True)
+    fork = types.SimpleNamespace(paged_commit_on=True)
+    fork._commits_paged = types.MethodType(fork_mod.ContextKvFork._commits_paged, fork)
+    fold, attn_metadata = _fold_inputs(3)
+
+    def refusal(batch_idx=rows):
+        return fold_mod._preamble_refusal(
+            worker, fork, fold, attn_metadata, slots, counts, batch_idx, 3, BLOCK
+        )
+
+    assert refusal() is None
+    assert refusal(slots.to(torch.int32)) is None
+    assert "batch index" in refusal(torch.arange(6, device="cuda")[::2])
+    fork.paged_commit_on = False
+    assert "context_kv_commit_paged" in refusal()
+    fork.paged_commit_on = True
+    worker._ctx_base = torch.zeros_like(ctx_len)
+    assert "windowed" in refusal()
+    # The dense full-length arena: the slots index it.
+    worker._ctx_base, worker._ctx_paged, worker._ctx_block_tables = None, False, None
+    assert refusal(slots) is None
 
 
 def test_the_reference_is_the_builtin_method():

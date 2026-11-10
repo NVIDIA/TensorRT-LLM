@@ -79,7 +79,8 @@ class DrafterPreamble:
     Published by the verify fold's prepare (``verify_fold/fold.py``, ``_fold_preamble``)
     right before the drafter forward, taken by that forward when its inputs are these very
     tensors (identity), otherwise ignored: ``i32s`` = (``num_ctx.to(int32)``,
-    that ``+ block``, ``slots.to(int32)``, ``query_positions.reshape(-1).to(int32)``),
+    that ``+ block``, ``ctx_cache_batch_idx.to(int32)`` (the slots, or the batch rows over the
+    manager's block tables), ``query_positions.reshape(-1).to(int32)``),
     ``residual`` a copy of ``noise``'s bytes (or None).
 
     ``join`` (``drafter_preamble_late_join``): the context-K/V side chain's join that the

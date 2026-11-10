@@ -944,9 +944,7 @@ def _decode_qkv_excluded(d: Deployment, t: Resolving) -> Optional[str]:
     return None
 
 
-#: The deployments the single-request decode schedule of sm107 TEP8 was measured on. Over a
-#: paged arena the levers that write a dense one (``dispatch.DENSE_ARENA_LEVERS``) and the
-#: levers built on them stay out by their structural rule.
+#: The deployments the single-request decode schedule of sm107 TEP8 was measured on.
 _SINGLE_REQUEST = (
     "aggregated sm107 tep8 servers of max_batch_size 1 over a dense or paged drafter context arena"
 )
@@ -1077,7 +1075,7 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         ),
         "drafter_fc_early_fork": Rule("LL", Kind.BITWISE, _always("forked side-chain steps")),
         "drafter_preamble_from_commit": Rule(
-            "LL", Kind.BITWISE, _always("folded steps over a dense arena")
+            "LL", Kind.BITWISE, _always("folded steps over a dense arena or pages")
         ),
         "head_sampler_coop_fold": Rule(
             "LL",

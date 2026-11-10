@@ -5,7 +5,8 @@
 * ``dflash_window_attention`` and ``dflash_window_attention_wide`` (at its split geometry)
   over pages are bitwise their dense calls, the appended block included.
 * ``context_kv_fork``'s commit empties the dummy slot, as the worker's own commit does.
-* The block decode over a unified target/draft ``KVCacheManagerV2`` is bitwise the dense one.
+* The block decode over a unified target/draft ``KVCacheManagerV2`` is bitwise the dense one,
+  also when it takes a preamble the folded commit wrote (``drafter_preamble_from_commit``).
 """
 
 import importlib.util
@@ -156,10 +157,16 @@ def _unified_manager(num_draft: int, nkv: int, head_dim: int) -> KVCacheManagerV
     return manager
 
 
+@pytest.mark.parametrize("preamble", [False, True], ids=["derived", "preamble"])
 @pytest.mark.parametrize("wide", [False, True], ids=["single", "wide"])
-def test_the_block_decode_over_a_unified_kv_cache_is_the_dense_arena_one(wide):
+def test_the_block_decode_over_a_unified_kv_cache_is_the_dense_arena_one(
+    wide, preamble, monkeypatch
+):
     """Over each draft layer's view of the manager's pool and the worker's one page table, the
-    block decode is bitwise the VANILLA drafter's over dense arenas of the same context."""
+    block decode is bitwise the VANILLA drafter's over dense arenas of the same context.
+
+    ``preamble``: the paged forward takes the integer preamble a folded commit publishes
+    (``DrafterPreamble``) instead of deriving it."""
     if (reason := dflash_attention.dflash_trtllm_gen_unavailability_reason()) is not None:
         pytest.skip(reason)
     # The speculative tests' tiny DFlash 2 drafter, over pages and over dense arenas.
@@ -209,9 +216,36 @@ def test_the_block_decode_over_a_unified_kv_cache_is_the_dense_arena_one(wide):
             num_ctx_per_req=ctx,
             ctx_cache_batch_idx=torch.arange(num_seqs, device="cuda"),
         )
+        taken = []
+        if preamble:
+            # What context_kv_commit_paged_preamble writes for this step.
+            lengths = ctx.to(torch.int32)
+            memo = block_decode.DrafterPreamble(
+                step["num_ctx_per_req"],
+                step["ctx_cache_batch_idx"],
+                step["query_positions"],
+                step["noise_embedding"],
+                (
+                    lengths,
+                    lengths + sem.BLOCK,
+                    step["ctx_cache_batch_idx"].to(torch.int32),
+                    block.reshape(-1).to(torch.int32),
+                ),
+                None,
+            )
+            take = block_decode._take_preamble
+
+            def spy(*args):
+                taken.append(take(*args))
+                return taken[-1]
+
+            monkeypatch.setattr(block_decode, "_take_preamble", spy)
+            block_decode.publish_preamble(memo)
         got = paged.dflash_forward(
             **step, ctx_k_cache=None, ctx_v_cache=None, ctx_kv_cache=pool, ctx_page_table=table
         )
+        if preamble:
+            assert taken and taken[0] is memo
         want = dense.dflash_forward(**step, ctx_k_cache=arenas[0], ctx_v_cache=arenas[1])
         assert torch.equal(got, want), (got.float() - want.float()).abs().max().item()
         # The block's K/V are in the requests' pages as in their arena slots.

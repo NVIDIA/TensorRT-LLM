@@ -89,7 +89,10 @@ from tensorrt_llm._utils import CUASSERT
 from tensorrt_llm.logger import logger
 
 from ...ops.spec.context_kv_commit import MAX_REQUESTS, context_kv_commit
-from ...ops.spec.context_kv_commit_paged import context_kv_commit_paged
+from ...ops.spec.context_kv_commit_paged import (
+    context_kv_commit_paged,
+    context_kv_commit_paged_preamble,
+)
 from ...ops.spec.context_kv_commit_windowed import context_kv_commit_windowed
 from ...ops.spec.ctx_block_tables_paged import MAX_REQUESTS as TABLES_MAX_REQUESTS
 from ...ops.spec.ctx_block_tables_paged import ctx_block_tables_paged
@@ -719,25 +722,32 @@ class ContextKvFork:
         seq_lens_cuda,
         seq_lens_value: int,
         draft_block: int,
+        batch_idx,
     ) -> tuple:
-        """``commit`` whose kernel also writes the drafter preamble (``context_kv_commit_preamble``).
+        """``commit`` whose kernel also writes the drafter preamble.
 
-        The dense full-length arena only (the caller checks: no pages, no window), where
-        ``commit`` is ``context_kv_commit`` and ``_commit_context``; the kernel is both.
-        Returns ``(num_ctx, i32s)``; every output is allocated on the main stream, as
-        ``commit``'s, and valid after the join.
+        Over the dense full-length arena, where ``commit`` is ``context_kv_commit`` and
+        ``_commit_context``, the kernel is both (``context_kv_commit_preamble``); over pages
+        whose commit is ``context_kv_commit_paged`` (``_commits_paged``), it is that one
+        launch writing the preamble too (``context_kv_commit_paged_preamble``). No window
+        base on either (the caller checks). ``batch_idx`` is the drafter forward's
+        ``ctx_cache_batch_idx`` (``_drafter_inputs``): the slots, or over the manager's
+        block tables the batch rows. Returns ``(num_ctx, i32s)``; every output is allocated
+        on the main stream, as ``commit``'s, and valid after the join.
         """
         from ...ops.spec.context_kv_commit import context_kv_commit_preamble
 
         worker = self.worker
+        paged = worker._ctx_paged and self._commits_paged(worker, slots, num_accepted)
         if (
-            worker._ctx_paged
-            or worker._ctx_block_tables is not None
-            or worker._ctx_base is not None
+            worker._ctx_base is not None
+            or (worker._ctx_paged and not paged)
+            or (not worker._ctx_paged and worker._ctx_block_tables is not None)
         ):
             raise RuntimeError(
-                "[musespark_open] context_kv_fork: the preamble commit is the dense full-length arena's; "
-                "this worker's context is paged or windowed"
+                "[musespark_open] context_kv_fork: the preamble commit is the dense full-length "
+                "arena's or the paged commit's; this worker's context is windowed, or its pages "
+                "are not context_kv_commit_paged's"
             )
         main = torch.cuda.current_stream()
         if main != launched.main or current_capture_id() != launched.capture:
@@ -756,6 +766,28 @@ class ContextKvFork:
         )
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
+            if paged:
+                context_kv_commit_paged_preamble(
+                    worker._ctx_len,
+                    worker._ctx_base,
+                    slots,
+                    num_accepted,
+                    self.rows[:gens],
+                    worker._ctx_block_counts if worker._ctx_block_tables is not None else None,
+                    worker._ctx_page_size,
+                    worker._compute_block_size,
+                    worker._max_ctx,
+                    worker._dummy_slot,
+                    worker._ctx_unified_cache,
+                    num_ctx,
+                    batch_idx,
+                    query_positions,
+                    seq_lens_cuda,
+                    seq_lens_value,
+                    draft_block,
+                    i32s,
+                )
+                return num_ctx, i32s
             context_kv_commit_preamble(
                 worker._ctx_k_buf,
                 worker._ctx_v_buf,

@@ -519,7 +519,7 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     ),
     FastPath(
         "drafter_preamble_from_commit",
-        "the drafter forward's integer preamble written by the folded step's commit (dense arena)",
+        "the drafter forward's integer preamble written by the folded step's commit (dense arena or pages)",
         "draft",
         ("verify_fold", "context_kv_fork"),
     ),
@@ -1735,13 +1735,14 @@ def dependents(names: Iterable[str]) -> FrozenSet[str]:
     return frozenset(path for path in FAST_PATH_NAMES if closure((path,)) & names)
 
 
-#: The levers that write the dense full-length drafter arena by its own column rule, and so
-#: need it: the folded commit that also writes the drafter's preamble.
-DENSE_ARENA_LEVERS: Tuple[str, ...] = ("drafter_preamble_from_commit",)
 #: The levers whose store is the dense full-length arena's or the KV cache manager's pages,
-#: and so not a windowed arena's: the context-K/V side chain with its fused store and its
-#: early fc fork.
-UNWINDOWED_ARENA_LEVERS: Tuple[str, ...] = ("drafter_kv_side_chain", "drafter_fc_early_fork")
+#: and so not a windowed arena's: the context-K/V side chain with its fused store, its early fc
+#: fork, and the folded commit that also writes the drafter's preamble.
+UNWINDOWED_ARENA_LEVERS: Tuple[str, ...] = (
+    "drafter_kv_side_chain",
+    "drafter_fc_early_fork",
+    "drafter_preamble_from_commit",
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1761,7 +1762,6 @@ def structural_rules(served: FrozenSet[str], deployment: "_levers.Deployment") -
 
     * An arena that is not windowed leaves the per-step compaction (``WINDOWED_STEP_PATHS``)
       out.
-    * ``DENSE_ARENA_LEVERS`` need a dense full-length arena.
     * ``UNWINDOWED_ARENA_LEVERS`` need a dense full-length arena or pages.
     * ``windowed_commit_parallel`` runs inside the windowed commit, so it needs a windowed
       arena.
@@ -1782,12 +1782,6 @@ def structural_rules(served: FrozenSet[str], deployment: "_levers.Deployment") -
         for name in WINDOWED_STEP_PATHS:
             if name in served:
                 exclusions[name] = f"the drafter context arena is {arena.value}, not windowed"
-    if arena is not _levers.Arena.DENSE:
-        for name in DENSE_ARENA_LEVERS:
-            if name in served:
-                exclusions[name] = (
-                    f"it needs a dense full-length drafter context arena, not a {arena.value} one"
-                )
     if arena is _levers.Arena.WINDOWED:
         for name in UNWINDOWED_ARENA_LEVERS:
             if name in served:

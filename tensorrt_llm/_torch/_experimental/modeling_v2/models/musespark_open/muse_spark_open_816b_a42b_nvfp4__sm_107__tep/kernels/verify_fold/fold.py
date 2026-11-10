@@ -131,19 +131,42 @@ def _join_holding(fork, launched, held) -> None:
     fork.join(launched)
 
 
-def _preamble_refusal(worker, fold, attn_metadata, num_gens: int, block_size: int) -> Optional[str]:
+def _preamble_refusal(
+    worker,
+    fork,
+    fold,
+    attn_metadata,
+    slots,
+    num_accepted,
+    batch_idx,
+    num_gens: int,
+    block_size: int,
+) -> Optional[str]:
     """Why the preamble commit cannot write this step's preamble, or None.
 
     With ``drafter_preamble_from_commit`` (``SpecLoopFoldDFlashWorker._fold_preamble``), on
     a forked folded step the commit also writes the drafter forward's integer preamble
     (``drafter_block_decode.DrafterPreamble``) and the ``_seq_lens_cuda`` fill, and the
-    noise gather also writes the residual's copy. Its kernel
-    (``context_kv_commit_preamble``) is the dense full-length arena's commit only: no KV
-    cache manager pages (``_ctx_paged`` / ``_ctx_block_tables``) and no windowed arena
-    (``_ctx_base``); every other arena, and every other shape, takes ``ContextKvFork.commit``.
+    noise gather also writes the residual's copy. Its kernel is the dense full-length
+    arena's commit (``context_kv_commit_preamble``) or the paged one
+    (``context_kv_commit_paged_preamble``, where ``ContextKvFork.commit`` would launch
+    ``context_kv_commit_paged``); a windowed arena (``_ctx_base``), any other pages, and
+    every other shape take ``ContextKvFork.commit``. ``batch_idx`` is the drafter forward's
+    ``ctx_cache_batch_idx``, which the paged kernel reads.
     """
-    if worker._ctx_paged or worker._ctx_block_tables is not None or worker._ctx_base is not None:
-        return "the drafter context is not the dense full-length arena"
+    if worker._ctx_base is not None:
+        return "the drafter context is a windowed arena"
+    if worker._ctx_paged:
+        if not fork._commits_paged(worker, slots, num_accepted):
+            return "the paged drafter context's commit is not context_kv_commit_paged's"
+        if not (
+            batch_idx.dtype in (torch.int32, torch.int64)
+            and batch_idx.is_contiguous()
+            and batch_idx.numel() >= num_gens
+        ):
+            return "the drafter's batch index is not a contiguous int32 / int64 [requests]"
+    elif worker._ctx_block_tables is not None:
+        return "the drafter context has block tables but no pages"
     qpos = fold.query_positions
     seq_lens = getattr(attn_metadata, "_seq_lens_cuda", None)
     if not (
@@ -733,8 +756,20 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
                 f"{num_gens} and K {spec_metadata.runtime_draft_len}"
                 + ("; the step has no target features" if not has_target_features else "")
             )
+        # The drafter forward's ctx_cache_batch_idx (``_drafter_inputs``).
+        batch_idx = fold.gen_rows if self._ctx_block_tables is not None else slots
         refusal = (
-            _preamble_refusal(self, fold, attn_metadata, num_gens, block_size)
+            _preamble_refusal(
+                self,
+                fork,
+                fold,
+                attn_metadata,
+                slots,
+                gen_num_accepted,
+                batch_idx,
+                num_gens,
+                block_size,
+            )
             if self._fold_preamble
             else None
         )
@@ -749,6 +784,7 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
                 attn_metadata._seq_lens_cuda,
                 total_tokens_per_req,
                 block_size,
+                batch_idx,
             )
             table = _replicated_embedding.table_of(embed_tokens)
             residual = None
@@ -786,7 +822,10 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
                 # drafter_preamble_late_join: the drafter forward joins right before layer 0's
                 # QK norm + RoPE.
                 join = functools.partial(
-                    _join_holding, fork, launched, (slots, gen_num_accepted, fold.query_positions)
+                    _join_holding,
+                    fork,
+                    launched,
+                    (slots, gen_num_accepted, fold.query_positions, batch_idx),
                 )
                 _log_late_join_once()
             else:
@@ -795,7 +834,11 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             inputs = self._drafter_inputs(
                 noise_embed_2d, fold.query_positions, num_ctx, slots, fold.gen_rows, fold.bonus
             )
-            # The dense arena (``_preamble_refusal``): the drafter reads the context by slot.
+            if inputs["ctx_cache_batch_idx"] is not batch_idx:
+                raise FoldStateError(
+                    "[musespark_open] drafter_preamble_from_commit: the drafter's batch index is "
+                    "not the one the commit wrote the preamble from"
+                )
             _block_decode.publish_preamble(
                 _block_decode.DrafterPreamble(
                     num_ctx,

@@ -24,6 +24,11 @@ each request's length from the value it computed for that request's slot, so
 nothing is read after it is written. A length past its limit under the check
 traps the program, which ends the CUDA context as the built-in's device assert
 does. Integer arithmetic: bitwise the built-in.
+
+``context_kv_commit_paged_preamble`` (``drafter_preamble_from_commit``) is the same launch
+writing the drafter forward's integer preamble too: the int32 values ``windowed_block_decode``
+derives from the lengths, the batch index and the query positions, and the prepare's
+``_seq_lens_cuda`` fill.
 """
 
 from __future__ import annotations
@@ -70,11 +75,22 @@ def _context_kv_commit_paged_kernel(
     dummy_slot,
     page_size,
     block_size,
+    num_ctx_i32_ptr,
+    seq_after_i32_ptr,
+    batch_idx_ptr,
+    batch_idx_i32_ptr,
+    qpos_ptr,
+    qpos_i32_ptr,
+    seq_lens_ptr,
+    seq_lens_value,
     GENS: tl.constexpr,
     SLOT_BLOCK: tl.constexpr,
     LIMIT: tl.constexpr,
     CHECK: tl.constexpr,
     BASE: tl.constexpr,
+    PREAMBLE: tl.constexpr,
+    DRAFT_BLOCK: tl.constexpr,
+    QBLOCK: tl.constexpr,
 ):
     g = tl.arange(0, GENS)
     live = g < num_gens
@@ -111,6 +127,81 @@ def _context_kv_commit_paged_kernel(
             length = length + _trap_where(bad).to(tl.int64)
         length = tl.minimum(length, allocated)
     tl.store(out_ptr + g, length, mask=live)
+    if PREAMBLE:
+        # The drafter forward's preamble (windowed_block_decode): num_ctx_per_req.to(int32),
+        # that + block_size, ctx_cache_batch_idx.to(int32); and the prepare's
+        # _seq_lens_cuda[0:gens] = K + 1.
+        length32 = length.to(tl.int32)
+        tl.store(num_ctx_i32_ptr + g, length32, mask=live)
+        tl.store(seq_after_i32_ptr + g, length32 + DRAFT_BLOCK, mask=live)
+        batch_idx = tl.load(batch_idx_ptr + g, mask=live, other=0)
+        tl.store(batch_idx_i32_ptr + g, batch_idx.to(tl.int32), mask=live)
+        tl.store(seq_lens_ptr + g, tl.zeros([GENS], dtype=tl.int64) + seq_lens_value, mask=live)
+        # query_positions.reshape(-1).to(int32), written by the verify fold before this launch.
+        q = tl.arange(0, QBLOCK)
+        qm = q < num_gens * DRAFT_BLOCK
+        tl.store(qpos_i32_ptr + q, tl.load(qpos_ptr + q, mask=qm).to(tl.int32), mask=qm)
+
+
+def _launch(
+    ctx_len,
+    ctx_base,
+    slots,
+    num_accepted,
+    rows,
+    block_counts,
+    page_size,
+    block_size,
+    max_ctx,
+    dummy_slot,
+    check,
+    out,
+    preamble=None,
+) -> torch.Tensor:
+    """The one launch of both entries; ``preamble`` is ``(batch_idx, query_positions,
+    seq_lens_cuda, seq_lens_value, draft_block, i32s)`` or None."""
+    num_gens = slots.shape[0]
+    limit = block_counts is not None
+    if preamble is None:
+        # Unread placeholders for the preamble's operands.
+        batch_idx, qpos, seq_lens, seq_lens_value, draft_block = slots, slots, out, 0, 1
+        i32s = (out, out, out, out)
+    else:
+        batch_idx, qpos, seq_lens, seq_lens_value, draft_block, i32s = preamble
+    num_ctx_i32, seq_after, batch_idx_i32, qpos_i32 = i32s
+    _context_kv_commit_paged_kernel[(1,)](
+        ctx_len,
+        ctx_len if ctx_base is None else ctx_base,
+        ctx_len.numel(),
+        slots,
+        num_accepted,
+        rows if limit else slots,
+        block_counts if limit else ctx_len,
+        out,
+        num_gens,
+        max_ctx,
+        dummy_slot,
+        page_size,
+        block_size,
+        num_ctx_i32,
+        seq_after,
+        batch_idx,
+        batch_idx_i32,
+        qpos,
+        qpos_i32,
+        seq_lens,
+        seq_lens_value,
+        GENS=max(triton.next_power_of_2(num_gens), 2),
+        SLOT_BLOCK=SLOT_BLOCK,
+        LIMIT=limit,
+        CHECK=bool(limit and check),
+        BASE=ctx_base is not None,
+        PREAMBLE=preamble is not None,
+        DRAFT_BLOCK=draft_block,
+        QBLOCK=1 if preamble is None else triton.next_power_of_2(max(1, num_gens * draft_block)),
+        num_warps=4,
+    )
+    return out
 
 
 class ContextKvCommitPaged(OpWrapper):
@@ -165,30 +256,20 @@ class ContextKvCommitPaged(OpWrapper):
         check: bool,
         out: torch.Tensor,
     ) -> torch.Tensor:
-        num_gens = slots.shape[0]
-        limit = block_counts is not None
-        _context_kv_commit_paged_kernel[(1,)](
+        return _launch(
             ctx_len,
-            ctx_len if ctx_base is None else ctx_base,
-            ctx_len.numel(),
+            ctx_base,
             slots,
             num_accepted,
-            rows if limit else slots,
-            block_counts if limit else ctx_len,
-            out,
-            num_gens,
-            max_ctx,
-            dummy_slot,
+            rows,
+            block_counts,
             page_size,
             block_size,
-            GENS=max(triton.next_power_of_2(num_gens), 2),
-            SLOT_BLOCK=SLOT_BLOCK,
-            LIMIT=limit,
-            CHECK=bool(limit and check),
-            BASE=ctx_base is not None,
-            num_warps=4,
+            max_ctx,
+            dummy_slot,
+            check,
+            out,
         )
-        return out
 
     def reference(
         self,
@@ -268,3 +349,50 @@ class ContextKvCommitPaged(OpWrapper):
 
 
 context_kv_commit_paged = ContextKvCommitPaged()
+
+
+def context_kv_commit_paged_preamble(
+    ctx_len: torch.Tensor,
+    ctx_base: Optional[torch.Tensor],
+    slots: torch.Tensor,
+    num_accepted: torch.Tensor,
+    rows: torch.Tensor,
+    block_counts: Optional[torch.Tensor],
+    page_size: int,
+    block_size: int,
+    max_ctx: int,
+    dummy_slot: int,
+    check: bool,
+    out: torch.Tensor,
+    batch_idx: torch.Tensor,
+    query_positions: torch.Tensor,
+    seq_lens_cuda: torch.Tensor,
+    seq_lens_value: int,
+    draft_block: int,
+    i32s: tuple,
+) -> torch.Tensor:
+    """``context_kv_commit_paged``, writing the drafter preamble too (``drafter_preamble_from_commit``).
+
+    ``i32s = (num_ctx_i32 [g], seq_lens_after_i32 [g], batch_idx_i32 [g],
+    query_positions_i32 [g * draft_block])`` (int32, allocated by the caller) get the values
+    ``windowed_block_decode`` derives from ``out``, ``batch_idx`` (the forward's
+    ``ctx_cache_batch_idx``: the batch rows over the manager's block tables, the slots over the
+    worker's own pages; integer, contiguous) and ``query_positions`` (int64
+    ``[g, draft_block]`` contiguous, written by the verify fold before this launch); also sets
+    ``seq_lens_cuda[:g] = seq_lens_value``. Integer copies and one add: the same values.
+    """
+    return _launch(
+        ctx_len,
+        ctx_base,
+        slots,
+        num_accepted,
+        rows,
+        block_counts,
+        page_size,
+        block_size,
+        max_ctx,
+        dummy_slot,
+        check,
+        out,
+        (batch_idx, query_positions, seq_lens_cuda, seq_lens_value, draft_block, i32s),
+    )
