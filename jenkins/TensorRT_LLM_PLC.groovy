@@ -44,12 +44,12 @@ def createKubernetesPodConfig()
                     tty: true
                     resources:
                       requests:
-                        cpu: '8'
-                        memory: 32Gi
+                        cpu: '2'
+                        memory: 12Gi
                         ephemeral-storage: 200Gi
                       limits:
-                        cpu: '8'
-                        memory: 32Gi
+                        cpu: '2'
+                        memory: 12Gi
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
                   - name: jnlp
@@ -70,12 +70,12 @@ def createKubernetesPodConfig()
                     tty: true
                     resources:
                       requests:
-                        cpu: '16'
-                        memory: 64Gi
+                        cpu: '2'
+                        memory: 8Gi
                         ephemeral-storage: 200Gi
                       limits:
-                        cpu: '16'
-                        memory: 64Gi
+                        cpu: '2'
+                        memory: 8Gi
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
                     securityContext:
@@ -87,12 +87,12 @@ def createKubernetesPodConfig()
                     tty: true
                     resources:
                       requests:
-                        cpu: '16'
-                        memory: 64Gi
+                        cpu: '2'
+                        memory: 16Gi
                         ephemeral-storage: 200Gi
                       limits:
-                        cpu: '16'
-                        memory: 64Gi
+                        cpu: '2'
+                        memory: 16Gi
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
                     securityContext:
@@ -104,12 +104,12 @@ def createKubernetesPodConfig()
                     tty: true
                     resources:
                       requests:
-                        cpu: '16'
-                        memory: 64Gi
+                        cpu: '2'
+                        memory: 16Gi
                         ephemeral-storage: 200Gi
                       limits:
-                        cpu: '16'
-                        memory: 64Gi
+                        cpu: '2'
+                        memory: 16Gi
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
                     securityContext:
