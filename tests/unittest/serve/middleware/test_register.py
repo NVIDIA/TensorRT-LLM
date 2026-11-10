@@ -128,6 +128,39 @@ def test_no_perf_metrics_installs_only_the_arrival_time_middleware():
     assert [m.cls for m in app.user_middleware] == [ServerArrivalTimeMiddleware]
 
 
+def test_a_request_trace_sits_between_the_arrival_stamp_and_the_perf_metrics():
+    from tensorrt_llm.serve.middleware.request_trace import (
+        RequestTrace,
+        RequestTraceMiddleware,
+        RequestTraceWriter,
+    )
+
+    trace = RequestTrace(RequestTraceWriter(None))
+    w = SimpleNamespace(submit=Mock())
+    c = SimpleNamespace(now=lambda: 123.25)
+    for adjusted_clock, arrival_kwargs, perf_kwargs in (
+        (c, {"adjusted_clock": c}, {"expose_headers": True, "writer": w, "adjusted_clock": c}),
+        (None, {}, {"expose_headers": True, "writer": w}),
+    ):
+        app = FastAPI()
+        register_middlewares(
+            app,
+            collect_perf_metrics=True,
+            expose_perf_metrics=True,
+            perf_metrics_writer=w,
+            adjusted_clock=adjusted_clock,
+            request_trace=trace,
+        )
+        assert [(m.cls, m.kwargs) for m in app.user_middleware] == [
+            (ServerArrivalTimeMiddleware, arrival_kwargs),
+            (RequestTraceMiddleware, {"trace": trace}),
+            (PerfMetricsMiddleware, perf_kwargs),
+        ], (
+            "the trace runs after the arrival stamp, which its request line records, and "
+            "wraps PerfMetricsMiddleware, whose metrics event its response line records"
+        )
+
+
 def test_user_middleware_is_outermost():
     app = FastAPI()
     w = SimpleNamespace(submit=Mock())

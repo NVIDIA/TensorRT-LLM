@@ -22,6 +22,8 @@ not listed: it takes the default code path without perf metrics, and no VisualGe
 path can change middleware registration.
 """
 
+import os
+
 import pytest
 from test_common.serve.app_factory import AggConfig, CoordinatorConfig, DisaggConfig
 from test_common.serve.middleware import middleware_snapshot
@@ -131,3 +133,30 @@ def test_user_middleware_is_outermost(serve_env):
     snapshot = middleware_snapshot(server.app)
     expected = [{"class": "UserProbeMiddleware"}, _ARRIVAL_WITH_CLOCK]
     assert snapshot == expected, _failure("llm_user_middleware", expected, snapshot)
+
+
+_REQUEST_TRACE = {"class": "RequestTraceMiddleware", "kwargs": ["trace"]}
+
+
+def test_request_trace_sits_inside_the_arrival_stamp_when_its_directory_is_set(serve_env):
+    """``TRTLLM_REQUEST_TRACE_DIR`` adds the trace after the arrival stamp, on both apps.
+
+    The EXPECTED table above, built with the variable unset, is the proof that the stacks
+    are unchanged without it.
+    """
+    trace_dir = str(serve_env.tmp_dir / "trace")
+    server = serve_env.build_openai_server(
+        AggConfig(return_perf_metrics=True, env=(("TRTLLM_REQUEST_TRACE_DIR", trace_dir),))
+    )
+    snapshot = middleware_snapshot(server.app)
+    expected = [
+        _ARRIVAL_WITH_CLOCK,
+        _REQUEST_TRACE,
+        _perf(["adjusted_clock", "expose_headers", "writer"], True),
+    ]
+    assert snapshot == expected, _failure("llm_request_trace", expected, snapshot)
+
+    os.environ["TRTLLM_REQUEST_TRACE_DIR"] = trace_dir  # restored by isolated_serve_env
+    snapshot = middleware_snapshot(serve_env.build_disagg_server(DisaggConfig()).app)
+    expected = [_ARRIVAL_PLAIN, _REQUEST_TRACE]
+    assert snapshot == expected, _failure("disagg_request_trace", expected, snapshot)

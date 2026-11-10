@@ -94,6 +94,7 @@ from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.middleware.register import register_middlewares
+from tensorrt_llm.serve.middleware.request_trace import RequestTrace
 from tensorrt_llm.serve.multi_frontend import (FORWARDED_ROUTES,
                                                AttachedFrontendWatchdog,
                                                LauncherForwarder,
@@ -743,6 +744,8 @@ class OpenAIServer(_VideoRoutesMixin):
         ) if server_role is not None else "server"
         self._perf_metrics_writer = PerfMetricsJsonlWriter(
             perf_metrics_output_dir, server_kind)
+        # None unless TRTLLM_REQUEST_TRACE_DIR is set; see serve/middleware/request_trace.py.
+        self._request_trace = RequestTrace.from_env()
         # Multi-frontend serving: see serve/multi_frontend.py.
         self._multi_frontend = multi_frontend_serving
         self._launcher_forwarder: Optional[LauncherForwarder] = None
@@ -790,6 +793,8 @@ class OpenAIServer(_VideoRoutesMixin):
         @asynccontextmanager
         async def lifespan(app: FastAPI):
             await self._perf_metrics_writer.start()
+            if self._request_trace is not None:
+                await self._request_trace.start()
             self._register_server()
 
             # VisualGen has no args
@@ -852,6 +857,8 @@ class OpenAIServer(_VideoRoutesMixin):
 
             yield
 
+            if self._request_trace is not None:
+                await self._request_trace.close()
             await self._perf_metrics_writer.close()
             for task in (self._launcher_watchdog_task, self._clock_offset_task):
                 if task is not None:
@@ -937,7 +944,8 @@ class OpenAIServer(_VideoRoutesMixin):
                              collect_perf_metrics=self._collect_perf_metrics,
                              expose_perf_metrics=self._expose_perf_metrics,
                              perf_metrics_writer=self._perf_metrics_writer,
-                             adjusted_clock=self._adjusted_steady_clock)
+                             adjusted_clock=self._adjusted_steady_clock,
+                             request_trace=self._request_trace)
 
     def _init_visual_gen(self):
         self.processor = None

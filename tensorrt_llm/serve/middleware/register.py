@@ -25,6 +25,7 @@ from fastapi import FastAPI
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.serve.middleware.arrival_time import ServerArrivalTimeMiddleware
 from tensorrt_llm.serve.middleware.perf_metrics import PerfMetricsMiddleware
+from tensorrt_llm.serve.middleware.request_trace import RequestTrace, RequestTraceMiddleware
 from tensorrt_llm.serve.perf_metrics import PerfMetricsJsonlWriter
 
 
@@ -35,12 +36,17 @@ def register_middlewares(
     expose_perf_metrics: bool,
     perf_metrics_writer: Optional[PerfMetricsJsonlWriter],
     adjusted_clock: Optional[AdjustedSteadyClock] = None,
+    request_trace: Optional[RequestTrace] = None,
 ) -> None:
     """Install the built-in middleware of a trtllm-serve app.
 
-    The stack, outermost first, is ServerArrivalTimeMiddleware, then PerfMetricsMiddleware
-    when perf metrics are collected. ``--middleware`` entries are added after the server is
-    built (serve/middleware/user_middleware.py), so they end up outside both.
+    The stack, outermost first, is ServerArrivalTimeMiddleware, then
+    RequestTraceMiddleware when a request trace is configured, then PerfMetricsMiddleware
+    when perf metrics are collected. The trace sits inside the arrival stamp, which it
+    records, and outside the perf metrics, so the reply it records is the one the client
+    received, metrics headers and SSE metrics event included. ``--middleware`` entries are
+    added after the server is built (serve/middleware/user_middleware.py), so they end up
+    outside all of them.
 
     Args:
         app: The app of OpenAIServer or OpenAIDisaggServer.
@@ -52,6 +58,8 @@ def register_middlewares(
         adjusted_clock: The aggregated server's clock, mapped to the disaggregated server's
             clock domain. The disaggregated server passes None, and then neither middleware
             receives the argument.
+        request_trace: The request trace built from ``TRTLLM_REQUEST_TRACE_DIR``; None (the
+            variable unset) installs no trace middleware.
     """
     if adjusted_clock is None:
         if collect_perf_metrics:
@@ -60,6 +68,8 @@ def register_middlewares(
                 expose_headers=expose_perf_metrics,
                 writer=perf_metrics_writer,
             )
+        if request_trace is not None:
+            app.add_middleware(RequestTraceMiddleware, trace=request_trace)
         app.add_middleware(ServerArrivalTimeMiddleware)
         return
     if collect_perf_metrics:
@@ -69,4 +79,6 @@ def register_middlewares(
             writer=perf_metrics_writer,
             adjusted_clock=adjusted_clock,
         )
+    if request_trace is not None:
+        app.add_middleware(RequestTraceMiddleware, trace=request_trace)
     app.add_middleware(ServerArrivalTimeMiddleware, adjusted_clock=adjusted_clock)

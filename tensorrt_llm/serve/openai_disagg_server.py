@@ -59,6 +59,7 @@ from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
 from tensorrt_llm.serve.kv_hints import KvHintsRoute
 from tensorrt_llm.serve.middleware.register import register_middlewares
+from tensorrt_llm.serve.middleware.request_trace import RequestTrace
 from tensorrt_llm.serve.openai_client import (OpenAIClient, OpenAIHttpClient,
                                               _server_base_url)
 from tensorrt_llm.serve.openai_disagg_service import (
@@ -241,6 +242,8 @@ class OpenAIDisaggServer:
             or config.perf_metrics_output_dir is not None)
         self._perf_metrics_writer = PerfMetricsJsonlWriter(
             config.perf_metrics_output_dir, "disagg")
+        # None unless TRTLLM_REQUEST_TRACE_DIR is set; see serve/middleware/request_trace.py.
+        self._request_trace = RequestTrace.from_env()
 
         self._disagg_cluster_storage = None
         if config.disagg_cluster_config:
@@ -286,9 +289,13 @@ class OpenAIDisaggServer:
         async def lifespan(app) -> None:
             # The cluster manager (via setup) owns server preparation + monitoring.
             await self._perf_metrics_writer.start()
+            if self._request_trace is not None:
+                await self._request_trace.start()
             await self._service.setup()
             yield
             await self._service.teardown()
+            if self._request_trace is not None:
+                await self._request_trace.close()
             await self._perf_metrics_writer.close()
 
         self.app = FastAPI(lifespan=lifespan)
@@ -298,7 +305,8 @@ class OpenAIDisaggServer:
         register_middlewares(self.app,
                              collect_perf_metrics=self._collect_perf_metrics,
                              expose_perf_metrics=self._expose_perf_metrics,
-                             perf_metrics_writer=self._perf_metrics_writer)
+                             perf_metrics_writer=self._perf_metrics_writer,
+                             request_trace=self._request_trace)
 
         # Log request-body validation failures so a client/server schema mismatch
         # shows up server-side. Throttled (first, then every 1000th) to avoid
