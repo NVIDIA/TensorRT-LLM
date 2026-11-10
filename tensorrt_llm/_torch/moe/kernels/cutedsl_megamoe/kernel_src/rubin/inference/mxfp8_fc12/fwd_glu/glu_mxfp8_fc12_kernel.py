@@ -31,7 +31,7 @@ from .....schedulers.fc12_scheduler import (
     minimum_phase_interleave_hint,
 )
 from .....schedulers.non_clc_mixed_cga import NonClcMixedCgaConfig, NonClcMixedCgaSchedulerWorker
-from ....custom_mix_cga_helpers import (
+from .....blackwell.custom_mix_cga_helpers import (
     PipelineTmaUmmaMixedCga,
     TmaAtomOrPair,
     bind_executable_tma_load_fields,

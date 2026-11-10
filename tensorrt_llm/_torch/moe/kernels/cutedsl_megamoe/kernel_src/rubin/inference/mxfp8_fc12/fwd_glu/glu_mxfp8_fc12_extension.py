@@ -23,7 +23,7 @@ from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
 
 from ......helpers.dsl_helpers import spin_peek, spin_wait
 from .....schedulers.fc12_mapping import BlockPhase, NonSwapAbFc12WorkTileInfo, peek_ready_bit
-from ....custom_mix_cga_helpers import PipelineTmaUmmaMixedCga
+from .....blackwell.custom_mix_cga_helpers import PipelineTmaUmmaMixedCga
 
 # Forward GLU tensor roles: FC1 activation is token-indexed (M), FC1 weight is
 # expert-indexed; "d"/"sfd" are the FC1 fp8 output + E8M0 plane, "c" the raw gate/up.
