@@ -234,9 +234,14 @@ def _local_slot_inputs(
 
 def _assert_matches_reference(out: torch.Tensor, ref: torch.Tensor, name: str) -> None:
     """Cosine difference of the whole output and of every token, so that one
-    wrong or missing row cannot hide in the aggregate."""
+    wrong or missing row cannot hide in the aggregate, and the ratio of the
+    norms, which the cosine difference barely sees: 10% too large is 4.5e-3."""
     diff = calc_diff(out, ref).item()
     assert diff < 1e-2, f"shape={name} cosine-diff={diff:.4e} exceeds 1e-2"
+    norm_ratio = (out.double().norm() / ref.double().norm()).item()
+    assert abs(norm_ratio - 1) < 1e-2, (
+        f"shape={name} norm ratio {norm_ratio:.4f} is off by 1% or more"
+    )
 
     x, y = out.double(), ref.double()
     denominator = (x * x + y * y).sum(dim=-1)
@@ -383,15 +388,16 @@ def test_each_block_size_is_tuned_separately() -> None:
         assert {(n, k, _BLOCK_SIZE_M), (n, k, _BLOCK_SIZE_M_LARGE)} <= tuned, (n, k, tuned)
 
 
-def _prewarm_stub(intermediate: int, use_dp: bool) -> types.SimpleNamespace:
+def _prewarm_stub(intermediate: int, use_dp: bool, top_k: int = 2) -> types.SimpleNamespace:
     """The attributes ``prewarm_decode_kernels`` reads off the impl: 8 local
-    experts, hidden 256, top_k 2, and 4 attention-DP ranks when ``use_dp``."""
+    experts, hidden 256, top_k 2 by default, and 4 attention-DP ranks when
+    ``use_dp``."""
     num_local_experts, hidden = 8, 256
     return types.SimpleNamespace(
         w3_w1_weight=torch.empty(num_local_experts, 2 * intermediate, hidden),
         w2_weight=torch.empty(num_local_experts, hidden, intermediate),
         quant_scales=types.SimpleNamespace(fc_weight_scales=None, proj_weight_scales=None),
-        routing_method=types.SimpleNamespace(top_k=2),
+        routing_method=types.SimpleNamespace(top_k=top_k),
         use_dp=use_dp,
         parallel_size=4,
         activation_type=int(ActivationType.Swiglu),
@@ -434,3 +440,5 @@ def test_prewarm_tunes_each_tile_height_once(
         2 * len(token_counts)
     )
     assert calls == token_counts * 2
+    # top_k is a constexpr of the GEMM kernels, so another top_k compiles anew.
+    assert prewarm(_prewarm_stub(intermediate=512, use_dp=use_dp, top_k=1), max_num_tokens, False)
