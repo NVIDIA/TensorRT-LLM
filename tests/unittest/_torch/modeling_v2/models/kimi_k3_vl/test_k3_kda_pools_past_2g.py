@@ -195,11 +195,11 @@ def test_attn():
 
         def call(q: dict, slot: int) -> torch.Tensor:
             bufs = op.make_buffers(torch.device("cuda"), op.FUSED_CTAS)
+            slots = torch.tensor([slot], dtype=torch.int32, device="cuda")
             return torch.ops.trtllm.k3_kda_attn(
                 x, wt["w"], wt["w_fb"], wt["w_q"], wt["w_k"], wt["w_v"], wt["a_log"], wt["dt_bias"], wt["onorm_w"],
-                q["cs_q"], q["cs_k"], q["cs_v"], q["ssm"], q["state_tok"],
-                torch.tensor([slot], dtype=torch.int32, device="cuda"), q["pending"], *bufs, NUM_SPEC, LOWER_BOUND,
-                SCALE, EPS,
+                q["cs_q"], q["cs_k"], q["cs_v"], q["ssm"], q["state_tok"], slots, slots, q["pending"], *bufs,
+                NUM_SPEC, LOWER_BOUND, SCALE, EPS,
             )  # fmt: skip
 
         want = call(small, 0)
@@ -221,11 +221,11 @@ def test_verify():
         proj = torch.randn(len(used) * NT, PROJ, generator=g, device="cuda").bfloat16()
 
         def call(q: dict, slots: list) -> torch.Tensor:
+            index = torch.tensor(slots, dtype=torch.int32, device="cuda")
             return torch.ops.trtllm.k3_kda_verify(
                 proj, wt["w_fb"], wt["w_q"], wt["w_k"], wt["w_v"], wt["a_log"], wt["dt_bias"], wt["onorm_w"],
-                q["cs_q"], q["cs_k"], q["cs_v"], q["ssm"], q["state_tok"],
-                torch.tensor(slots, dtype=torch.int32, device="cuda"), q["pending"], NUM_SPEC, LOWER_BOUND, SCALE,
-                EPS,
+                q["cs_q"], q["cs_k"], q["cs_v"], q["ssm"], q["state_tok"], index, index, q["pending"], NUM_SPEC,
+                LOWER_BOUND, SCALE, EPS,
             )  # fmt: skip
 
         want = call(small, list(range(len(used))))

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU contracts for model-owned hybrid managers and shared recurrent state."""
 
+import math
 from dataclasses import replace
 from types import FunctionType, SimpleNamespace
 from unittest.mock import Mock
@@ -26,6 +27,7 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAReplayState,
     KimiK3HybridCacheManager,
 )
+from tensorrt_llm._torch.modules.kimi_kda.replay_region import REPLAY_STATE_REGION, KDAReplayRegion
 from tensorrt_llm._torch.modules.mamba.cache_manager import (
     Mamba2LayerCache,
     Mamba2State,
@@ -52,6 +54,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
+    DataRole,
     GpuCacheTierConfig,
     HostCacheTierConfig,
     KVCacheManagerConfig,
@@ -323,19 +326,21 @@ def test_k3_initializes_only_the_selected_state(
     else:
         selector.assert_not_called()
 
+    manager._kda_replay_region = Mock(spec=KDAReplayRegion) if num_spec is not None else None
+    manager._get_state_buffer = Mock()
+    manager.layer_offsets = {0: 0, 1: 1}
+    manager.get_region_group_ids = Mock(return_value=(2,))
+    manager._host_state_indices = torch.zeros(4, dtype=torch.int32)
+    manager._state_indices_buffer = SimpleNamespace(tensor=torch.zeros(4, dtype=torch.int32))
     manager._state_layout = object()
     manager.all_ssm_states, manager.all_conv_states = [], []
-    pool_bind = Mock()
-    monkeypatch.setitem(
-        manager_cls._setup_model_state.__globals__, "bind_kda_replay_pool", pool_bind
-    )
     bind = Mock()
     monkeypatch.setattr(state, "bind", bind)
     manager._setup_model_state()
     if num_spec is not None:
-        pool_bind.assert_called_once_with(state, manager)
-    else:
-        pool_bind.assert_not_called()
+        manager._kda_replay_region.bind.assert_called_once_with(
+            manager._get_state_buffer, manager.layer_offsets, (2,), 4, torch.device("cpu")
+        )
     bind.assert_called_once_with(
         manager._state_layout, manager.all_ssm_states, manager.all_conv_states
     )
@@ -534,6 +539,175 @@ def test_model_owns_speculative_state_lifecycle(monkeypatch, manager_cls, mode):
     assert manager.intermediate_ssm_states is None and state.intermediate_conv is None
     if mode == "replay":
         assert state.intermediate_ssm is None
+
+
+@pytest.mark.parametrize(
+    "state, shared_row",
+    [
+        (KDAReplayState(2), "prev_num_accepted_tokens"),
+        (KDAReplayState(2, draft_records=True), "prev_num_accepted_tokens"),
+    ],
+    ids=["kda", "kda_draft_records"],
+)
+def test_replay_states_declare_their_buffers_to_the_manager(state, shared_row):
+    """KDA declares its planes and the shared accepted-draft row from its model geometry."""
+    layout = _layout()
+    first, second = state.replay_layout(layout, 0), state.replay_layout(layout, 1)
+    # The first local layer also holds the per-request row every layer shares.
+    assert set(first) - set(second) == {DataRole(shared_row)}
+    assert all(math.prod(shape) > 0 for _, shape in first.values())
+
+
+@pytest.mark.parametrize(
+    "living_caches, max_util_for_resume, expected",
+    [(4, 0.8, 5), (5, 1.0, 5), (9, 0.97, 10), (1, 0.5, 2)],
+)
+def test_kda_replay_slot_count_covers_every_owner_with_resume_headroom(
+    living_caches, max_util_for_resume, expected
+):
+    """KDA's replay region holds one slot per living cache, and enough beyond them that resuming the last owner
+    leaves the region at or below max_util_for_resume."""
+    count = KDAReplayState.replay_slot_count(living_caches, max_util_for_resume)
+    assert count == expected
+    assert living_caches / count <= max_util_for_resume
+    # One slot fewer would not leave that headroom.
+    assert count == living_caches or living_caches / (count - 1) > max_util_for_resume
+    with pytest.raises(ValueError, match="max_util_for_resume"):
+        KDAReplayState.replay_slot_count(living_caches, 0.0)
+
+
+@pytest.mark.parametrize("manager_cls", [NemotronHybridCacheManager, Qwen35HybridCacheManager])
+def test_states_without_replay_declare_no_replay_buffers(manager_cls):
+    manager = object.__new__(manager_cls)
+    assert manager._region_providers() == ()
+    assert not hasattr(manager, "replay_layer_group_id")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("draft_records", [False, True])
+def test_kda_region_declares_storage_without_a_hybrid_manager(draft_records):
+    """The replay state is a fixed PRIVATE region with or without the drafts' records, which then replace the
+    per-draft caches among its planes."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.regions import lay_out_regions
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy, SsmLayerConfig
+
+    state = KDAReplayState(2, draft_records=draft_records)
+    context = _layout(layers=(4, 7))
+    provider = KDAReplayRegion(state, context, {4: 0, 7: 1}, 5, 0.8)
+    configs, layout = lay_out_regions(
+        provider.declare_regions(),
+        [
+            SsmLayerConfig(
+                layer_id=LayerId(i), buffers=[BufferConfig(role=MambaRole.SSM_STATE, size=128)]
+            )
+            for i in range(2)
+        ],
+    )
+    (config,) = configs
+    assert config.name == REPLAY_STATE_REGION
+    assert config.reuse_policy == ReusePolicy.PRIVATE
+    assert config.fixed_slot_count == 7
+    assert {int(buffer.layer_id) for buffer in config.buffers} == {0, 1}
+    count_buffers = [
+        buffer
+        for buffer in config.buffers
+        if buffer.buffer.role == DataRole("prev_num_accepted_tokens")
+    ]
+    assert len(count_buffers) == 1 and int(count_buffers[0].layer_id) == 0
+    assert (
+        frozenset(
+            plane.role
+            for layer in layout.region(REPLAY_STATE_REGION).layers
+            for plane in layer.planes
+        )
+        == provider.roles
+    )
+    assert (DataRole("kda_state_tok") in provider.roles) == draft_records
+    assert (DataRole("kda_k_cache") in provider.roles) != draft_records
+    assert provider.region.fixed_bytes() == 7 * provider.bytes_per_slot
+    assert MambaHybridCacheManagerV2._region_providers is KVCacheManagerV2._region_providers
+    assert not hasattr(MambaHybridCacheManagerV2, "declare_regions")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "manager_cls, draft_records",
+    [
+        (KimiK3HybridCacheManager, False),
+        (KimiK3HybridCacheManager, True),
+        (Glm5NextCacheManager, False),
+    ],
+)
+def test_kda_manager_excludes_replay_from_transfer(manager_cls, draft_records):
+    """KDA's transfer hook excludes every replay role in either storage layout."""
+    state = KDAReplayState(2, draft_records=draft_records)
+    provider = KDAReplayRegion(state, _layout(), {0: 0, 1: 1}, 5, 0.8)
+    manager = object.__new__(manager_cls)
+    manager._kda_replay_region = provider
+
+    ignored = manager.get_disagg_ignored_roles()
+
+    assert ignored == provider.roles
+    assert DataRole("prev_num_accepted_tokens") in ignored
+    assert DataRole("kda_conv_q") in ignored
+    assert (DataRole("kda_state_tok") in ignored) == draft_records
+    assert ignored.isdisjoint({MambaRole.SSM_STATE, MambaRole.CONV_STATE})
+
+
+@pytest.mark.cpu_only
+def test_kda_region_refreshes_moved_slots_without_resetting_live_history(monkeypatch):
+    from tensorrt_llm._torch.modules.kimi_kda import replay_region
+
+    state = KDAReplayState(2)
+    provider = KDAReplayRegion(state, _layout(), {0: 1, 1: 3}, 5, 0.8)
+    monkeypatch.setattr(replay_region, "prefer_pinned", lambda: False)
+    uploads = []
+
+    class IndexBuffer:
+        def __init__(self, tensor, **kwargs):
+            self.tensor = tensor
+
+        def update(self, values):
+            self.tensor.copy_(values)
+            uploads.append(values.clone())
+
+    monkeypatch.setattr(replay_region, "DeviceCopyBuffer", IndexBuffer)
+    monkeypatch.setattr(state, "bind_replay_pool", Mock())
+    monkeypatch.setattr(state, "reset_replay_slots", Mock())
+    bound_layers = []
+
+    def get_buffer(layer, role, dtype, shape):
+        bound_layers.append(layer)
+        return torch.zeros([7, *shape], dtype=dtype)
+
+    # Binding uses the final layer mapping after empty layers have been removed.
+    provider.bind(get_buffer, {0: 0, 1: 1}, (3,), 2, torch.device("cpu"))
+    assert set(bound_layers) == {0, 1}
+    state_slots = torch.tensor([1, 0], dtype=torch.int32)
+    requests = [SimpleNamespace(py_request_id=42)]
+    slot = 2
+    caches = {42: SimpleNamespace(get_ssm_block_base_index=lambda group: slot)}
+
+    def prepare():
+        provider.prepare(requests, caches, state_slots, state_slots, 0, True)
+
+    prepare()
+    state.reset_replay_slots.assert_called_once()
+    assert state.reset_replay_slots.call_args.args[0].tolist() == [2]
+    indices_ptr = provider.cuda_indices(state_slots).data_ptr()
+    prepare()
+    assert len(uploads) == 1
+    slot = 4
+    prepare()
+    assert len(uploads) == 2
+    assert provider.request_indices([42]) == [4]
+    assert provider.cuda_indices(state_slots).tolist() == [4, 0]
+    assert provider.cuda_indices(state_slots).data_ptr() == indices_ptr
+    state.reset_replay_slots.assert_called_once()
+    provider.release(42)
+    prepare()
+    assert state.reset_replay_slots.call_count == 2
+    assert state.reset_replay_slots.call_args.args[0].tolist() == [4]
 
 
 def test_ple_adds_buffers_without_overriding_snapshot_or_budget_solver():
@@ -753,20 +927,38 @@ def test_kda_pool_allocation_includes_replay_in_native_quota(
     manager._state_layout = layout
     manager.mamba_pp_layers = list(layout.mamba_pp_layers)
     manager.layer_offsets = {0: 0, 1: 1}
-    manager._kda_replay = KDAReplayState(2) if replay else None
+    manager._kda_replay = manager._speculative_state = KDAReplayState(2) if replay else None
     manager.ssm_bytes, manager.conv_bytes = 128, 288
     manager.max_batch_size = layout.max_batch_size
     manager.mapping = layout.mapping
     manager._num_reserved_dummy_slots = 1
     manager.kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+    manager.max_beam_width = 1
+    manager._index_mapper_capacity = 2 * layout.max_batch_size + 1
+    manager._declare_regions()
+    assert (REPLAY_STATE_REGION in manager.region_layout) == replay
+    if replay:
+        assert manager.region_layout.region(REPLAY_STATE_REGION).fixed_slot_count == math.ceil(
+            manager._index_mapper_capacity / manager.kv_cache_config.max_util_for_resume
+        )
     persistent_bytes_per_slot = manager._mamba_state_bytes_per_slot()
+    assert persistent_bytes_per_slot == 2 * (128 + 288)
+    replay_bytes = manager._fixed_region_quota()
+    assert bool(replay_bytes) == replay
+    if replay:
+        region = manager.region_layout.region(REPLAY_STATE_REGION)
+        assert replay_bytes == region.fixed_slot_count * region.bytes_per_slot()
     total_quota = 1 << 20
     if quota_source in ("max_tokens", "both"):
         monkeypatch.setattr(
             KVCacheManagerV2, "_get_quota_from_max_tokens", lambda self, tokens: tokens * 64
         )
-        total_quota = manager._get_quota_from_max_tokens(16384)
-        assert total_quota == 16384 * 64 + 4 * persistent_bytes_per_slot
+        # The replay pool is not one of the ratio-sized pools the resume headroom scales.
+        ratio_sized_quota = manager._get_quota_from_max_tokens(16384)
+        assert ratio_sized_quota == 16384 * 64 + 4 * persistent_bytes_per_slot
+        max_util_for_resume = manager.kv_cache_config.max_util_for_resume
+        total_quota = manager._gpu_quota_for_max_tokens(16384, max_util_for_resume)
+        assert total_quota == math.ceil(ratio_sized_quota / max_util_for_resume) + replay_bytes
 
     class Pool:
         def __init__(self, config, **kwargs):
@@ -811,6 +1003,25 @@ def test_kda_pool_allocation_includes_replay_in_native_quota(
     # Host fallback retries must retain the original total GPU budget.
     assert config.cache_tiers[0].quota == total_quota
     assert config.cache_tiers[1].quota == 12345
+
+
+@pytest.mark.cpu_only
+def test_fixed_regions_stay_outside_the_resume_headroom(monkeypatch):
+    """The GPU quota scales the ratio-sized pools by 1 / max_util_for_resume and adds the fixed regions as they are;
+    the inverse that aligns token capacity across ranks takes the fixed regions out first."""
+    manager = object.__new__(KVCacheManagerV2)
+    monkeypatch.setattr(
+        KVCacheManagerV2, "_get_quota_from_max_tokens", lambda self, tokens: tokens * 64
+    )
+    monkeypatch.setattr(
+        KVCacheManagerV2, "_get_max_tokens_from_quota", lambda self, quota: quota // 64
+    )
+    monkeypatch.setattr(KVCacheManagerV2, "_fixed_region_quota", lambda self: 1000)
+    quota = manager._gpu_quota_for_max_tokens(100, 0.5)
+    assert quota == 100 * 64 * 2 + 1000
+    assert manager._max_tokens_for_gpu_quota(quota, 0.5) == 100
+    # A quota the fixed regions fill holds no tokens.
+    assert manager._max_tokens_for_gpu_quota(999, 0.5) == 0
 
 
 @pytest.mark.parametrize("resize_succeeds", [False, True])
@@ -927,24 +1138,33 @@ def test_kda_affine_estimator_includes_replay_scratch(
         kv_cache_config=kv_config,
         spec_config=layout.spec_config,
     )
-    scratch_per_slot = 0
+    seed_per_slot = replay_per_slot = 0
     if replay:
         state = KDAReplayState(2, stochastic_rounding=stochastic_rounding)
         state.bind(layout, _state_views().all_ssm_states, _state_views().all_conv_states)
         buffers = [*state._layer_replay_buffers(), state.prev_num_accepted_tokens]
-        if stochastic_rounding:
-            buffers.append(state.rand_seed)
-        scratch_per_slot = (
+        # KVCM pads the shared accepted-draft count from 4 to 16 bytes.
+        replay_per_slot = (
             sum(buffer.untyped_storage().nbytes() for buffer in buffers) // layout.slot_capacity
+            + 12
         )
+        if stochastic_rounding:
+            seed_per_slot = state.rand_seed.untyped_storage().nbytes() // layout.slot_capacity
     dummy_slots = common._get_num_cuda_graph_padding_dummy_slots(
         layout.spec_config, layout.max_batch_size
     )
-    # KVCM pads the shared accepted-draft count from 4 to 16 bytes.
-    state_bytes = 2 * 416 + scratch_per_slot + (12 if replay else 0)
+    # Every recurrent-state slot, snapshots included, holds the seed; the replay buffers form a fixed pool of one
+    # slot per IndexMapper slot (two leases per sequence with the overlap scheduler, plus the dummies), with the
+    # headroom resume needs.
+    state_bytes = 2 * 416 + seed_per_slot
+    living_caches = 2 * layout.max_batch_size + dummy_slots
+    fixed_slots = math.ceil(living_caches / kv_config.max_util_for_resume)
     interval = kv_config.mamba_state_config.periodic_snapshot_interval
     slope = (state_bytes + interval - 1) // interval if reuse and interval > 0 else 0
-    assert cost == (slope, (layout.max_batch_size + dummy_slots) * state_bytes)
+    assert cost == (
+        slope,
+        (layout.max_batch_size + dummy_slots) * state_bytes + fixed_slots * replay_per_slot,
+    )
 
 
 @pytest.mark.parametrize("layer", [0, 1])
@@ -1235,15 +1455,18 @@ def test_model_compatibility_properties_follow_owned_state(manager_cls):
 
 def test_k3_resolves_transfer_requests_before_calling_algorithm():
     manager = object.__new__(KimiK3HybridCacheManager)
+    manager.local_num_mamba_layers = 1
     manager._request_id_to_state_index = {101: 3, 202: 1}
     replay = KDAReplayState(2)
     replay.prev_num_accepted_tokens = torch.zeros(5, dtype=torch.int32)
     replay.seed_transferred_slots = Mock()
     manager._kda_replay = replay
     manager.on_state_transfer_complete([101, 999, 202, 101])
-    slots = replay.seed_transferred_slots.call_args.args[0]
+    slots, replay_slots = replay.seed_transferred_slots.call_args.args
     assert slots.tolist() == [1, 3]
     assert slots.dtype == torch.long
+    # Without replay slots of their own, the replay slots are the state slots.
+    assert replay_slots.tolist() == [1, 3]
     replay.seed_transferred_slots.reset_mock()
     manager.on_state_transfer_complete([999])
     replay.seed_transferred_slots.assert_not_called()
@@ -1252,6 +1475,7 @@ def test_k3_resolves_transfer_requests_before_calling_algorithm():
 @pytest.mark.parametrize("draft_lengths", [[], [0, 0], [1, 0], [1, 1]])
 def test_k3_host_acceptance_handles_empty_mixed_and_completed_requests(draft_lengths):
     manager = object.__new__(KimiK3HybridCacheManager)
+    manager.local_num_mamba_layers = 1
     replay = KDAReplayState(2)
     replay.prev_num_accepted_tokens = torch.tensor([5, 6], dtype=torch.int32)
     manager._kda_replay = replay
@@ -1466,7 +1690,7 @@ def test_constructor_validates_before_pool_and_binds_after_slot_capacity(monkeyp
         self.mapping = kwargs["mapping"]
         self.layer_offsets = {0: 0, 1: 1}
         self.impl = SimpleNamespace(
-            get_layer_group_id=lambda layer: 0,
+            get_buffer_group_id=lambda layer, role: 0,
             get_page_index_scale=lambda layer, role: 1,
             get_page_index_upper_bound=lambda layer, role: 5,
         )

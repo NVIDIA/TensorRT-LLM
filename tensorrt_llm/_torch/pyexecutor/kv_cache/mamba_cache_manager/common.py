@@ -173,6 +173,11 @@ class _PrefixReuseDiagnostics(Protocol):
     def _get_num_reusable_tokens_before_pruning(self) -> int: ...
 
 
+def _is_disagg_context_server(is_disagg: bool) -> bool:
+    """Whether this worker only serves the context phase of disagg requests."""
+    return is_disagg and os.getenv("TRTLLM_DISAGG_ROLE") == "context"
+
+
 def _get_num_cuda_graph_padding_dummy_slots(
     spec_config: Optional["DecodingBaseConfig"],
     max_batch_size: int,

@@ -57,13 +57,13 @@ def _layers(mgr) -> list:
     return [kc.layer_pools(mgr, layer) for layer in range(LAYERS)]
 
 
-def _verify(wt, pools, proj_src, slots, num_spec) -> torch.Tensor:
+def _verify(wt, pools, proj_src, slots, draft_slots, num_spec) -> torch.Tensor:
     """One launch, after a plain copy kernel (its projection rows)."""
     proj = proj_src.clone()
     return k3_kda_verify(
         proj, wt["w_fb"], wt["w_q"], wt["w_k"], wt["w_v"], wt["a_log"], wt["dt_bias"], wt["onorm_w"],
-        pools["cs_q"], pools["cs_k"], pools["cs_v"], pools["ssm"], pools["state_tok"], slots, pools["pending"],
-        num_spec, kc.LOWER_BOUND, kc.SCALE, kc.EPS,
+        pools["cs_q"], pools["cs_k"], pools["cs_v"], pools["ssm"], pools["state_tok"], slots, draft_slots,
+        pools["pending"], num_spec, kc.LOWER_BOUND, kc.SCALE, kc.EPS,
     )  # fmt: skip
 
 
@@ -71,26 +71,34 @@ def _proj(num: int, steps: int, gen: torch.Generator) -> torch.Tensor:
     return torch.randn(num * steps, kc.PROJ, generator=gen, device="cuda").bfloat16()
 
 
-def _accept(pools_list, slots, accepted) -> None:
+def _accept(pools_list, draft_slots, accepted) -> None:
+    """The sampler's record of the drafts it accepted, at the requests' draft slots."""
     for pools in pools_list:
-        pools["pending"][slots.long()] = torch.tensor(accepted, dtype=torch.int32, device="cuda")
+        pools["pending"][draft_slots.long()] = torch.tensor(
+            accepted, dtype=torch.int32, device="cuda"
+        )
 
 
 @pytest.mark.parametrize("cell", k3_kda_verify.CELLS, ids=[c.why[:40] for c in k3_kda_verify.CELLS])
 def test_verify_on_manager_pools(managers, cell) -> None:
-    """ROUNDS rounds of every layer with a pending count per request that changes every round: outputs and the
-    committed states against float64 (fp32 tolerance); the other slots of each layer untouched."""
+    """ROUNDS rounds of every layer with a pending count per request that changes every round, each request's draft
+    records at a draft slot apart from its state slot: outputs and the committed states against float64 (fp32
+    tolerance); the other slots of each layer untouched."""
     seed = zlib.crc32(cell.why.encode()) % 2**31
     num, num_spec = cell.spec["requests"], cell.spec["num_spec"]
     steps, layers = num_spec + 1, cell.spec["layers"]
     mgr, all_slots = managers[num_spec]
     slots = all_slots[:num]
     pools = _layers(mgr)[:layers]
+    draft_slots = kc.draft_slots_apart(pools[0], slots)
     with torch.inference_mode(), validating(k3_kda_verify):
         for layer, p in enumerate(pools):
             kc.fill_pools(p, seed + layer)
         wts = [kc.make_weights(seed + 100 + layer) for layer in range(layers)]
-        refs = [kc.F64Verify(wts[layer], p, slots, num_spec) for layer, p in enumerate(pools)]
+        refs = [
+            kc.F64Verify(wts[layer], p, slots, num_spec, draft_slots)
+            for layer, p in enumerate(pools)
+        ]
         reference_pools = [kc.clone_pools(p) for p in pools]
         for p in reference_pools[1:]:
             p["pending"] = reference_pools[0]["pending"]
@@ -99,7 +107,7 @@ def test_verify_on_manager_pools(managers, cell) -> None:
             for layer, p in enumerate(pools):
                 before = kc.snapshot(p)
                 proj = _proj(num, steps, gen)
-                out = _verify(wts[layer], p, proj, slots, num_spec)
+                out = _verify(wts[layer], p, proj, slots, draft_slots, num_spec)
                 want = refs[layer](proj)
                 rp, wt = reference_pools[layer], wts[layer]
                 out_reference = k3_kda_verify.reference(
@@ -117,6 +125,7 @@ def test_verify_on_manager_pools(managers, cell) -> None:
                     rp["ssm"],
                     rp["state_tok"],
                     slots,
+                    draft_slots,
                     rp["pending"],
                     num_spec,
                     kc.LOWER_BOUND,
@@ -131,17 +140,22 @@ def test_verify_on_manager_pools(managers, cell) -> None:
                     layer,
                 )
                 assert (
-                    kc.rel(p["state_tok"][slots.long()], rp["state_tok"][slots.long()])
+                    kc.rel(p["state_tok"][draft_slots.long()], rp["state_tok"][draft_slots.long()])
                     <= kc.TOL_STATE
                 ), (rnd, layer)
-                assert kc.same_rows(p, rp, slots.tolist(), ("cs_q", "cs_k", "cs_v")), (rnd, layer)
+                assert kc.same_rows(p, rp, draft_slots.tolist(), ("cs_q", "cs_k", "cs_v")), (
+                    rnd,
+                    layer,
+                )
                 for n, s in enumerate(slots.tolist()):
                     committed = refs[layer].last[n][0][0]  # the state after the golden token
                     assert kc.rel(p["ssm"][s], committed) <= kc.TOL_STATE, (rnd, layer, n)
-                others = kc.other_slots(p["ssm"].shape[0], slots.tolist())
-                assert kc.same_rows(p, before, others, POOL_NAMES), (rnd, layer)
+                assert kc.same_other_rows(p, before, slots.tolist(), draft_slots.tolist()), (
+                    rnd,
+                    layer,
+                )
             accepted = kc.pending_schedule(num, num_spec, rnd)
-            _accept([pools[0], reference_pools[0]], slots, accepted)
+            _accept([pools[0], reference_pools[0]], draft_slots, accepted)
             for ref in refs:
                 ref.commit(accepted)
 
@@ -154,6 +168,7 @@ def test_layers_rounds_replay_and_repeat(managers) -> None:
     slots = all_slots[:4]
     steps = kc.NT
     pools = _layers(mgr)
+    draft_slots = kc.draft_slots_apart(pools[0], slots)
     with torch.inference_mode():
         for layer, p in enumerate(pools):
             kc.fill_pools(p, 2100 + layer)
@@ -169,13 +184,17 @@ def test_layers_rounds_replay_and_repeat(managers) -> None:
         for rnd in range(ROUNDS):
             for layer in range(LAYERS):
                 first.append(
-                    _verify(wts[layer], pools[layer], projs[rnd][layer], slots, kc.NUM_SPEC).clone()
+                    _verify(
+                        wts[layer], pools[layer], projs[rnd][layer], slots, draft_slots, kc.NUM_SPEC
+                    ).clone()
                 )
                 second.append(
-                    _verify(wts[layer], again[layer], projs[rnd][layer], slots, kc.NUM_SPEC).clone()
+                    _verify(
+                        wts[layer], again[layer], projs[rnd][layer], slots, draft_slots, kc.NUM_SPEC
+                    ).clone()
                 )
             accepted = kc.pending_schedule(4, kc.NUM_SPEC, rnd)
-            _accept([pools[0], again[0]], slots, accepted)
+            _accept([pools[0], again[0]], draft_slots, accepted)
         torch.cuda.synchronize()
         static = [p.clone() for p in projs[0]]
         stream = torch.cuda.Stream()
@@ -183,7 +202,7 @@ def test_layers_rounds_replay_and_repeat(managers) -> None:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
             outs = [
-                _verify(wts[li], graph_pools[li], static[li], slots, kc.NUM_SPEC)
+                _verify(wts[li], graph_pools[li], static[li], slots, draft_slots, kc.NUM_SPEC)
                 for li in range(LAYERS)
             ]
         torch.cuda.current_stream().wait_stream(stream)
@@ -193,7 +212,7 @@ def test_layers_rounds_replay_and_repeat(managers) -> None:
                 static[layer].copy_(projs[rnd][layer])
             graph.replay()
             replayed.extend(o.clone() for o in outs)
-            _accept([graph_pools[0]], slots, kc.pending_schedule(4, kc.NUM_SPEC, rnd))
+            _accept([graph_pools[0]], draft_slots, kc.pending_schedule(4, kc.NUM_SPEC, rnd))
         torch.cuda.synchronize()
     assert all(torch.equal(a, b) for a, b in zip(first, second)), "the schedule twice differs"
     assert all(torch.equal(a, b) for a, b in zip(replayed, first))
@@ -208,18 +227,19 @@ def test_swapped_rounds_are_silently_wrong(managers) -> None:
     slots = all_slots[:1]
     s = int(slots[0])
     p = kc.layer_pools(mgr, 0)
+    draft_slots = kc.draft_slots_apart(p, slots)
     with torch.inference_mode():
         kc.fill_pools(p, 2200)
         swapped = kc.clone_pools(p)
         wt = kc.make_weights(620)
         gen = torch.Generator(device="cuda").manual_seed(62)
         a, b = _proj(1, kc.NT, gen), _proj(1, kc.NT, gen)
-        _verify(wt, p, a, slots, kc.NUM_SPEC)
-        _accept([p], slots, [3])
-        right = _verify(wt, p, b, slots, kc.NUM_SPEC).clone()
-        _verify(wt, swapped, b, slots, kc.NUM_SPEC)
-        _accept([swapped], slots, [3])
-        wrong = _verify(wt, swapped, a, slots, kc.NUM_SPEC).clone()
+        _verify(wt, p, a, slots, draft_slots, kc.NUM_SPEC)
+        _accept([p], draft_slots, [3])
+        right = _verify(wt, p, b, slots, draft_slots, kc.NUM_SPEC).clone()
+        _verify(wt, swapped, b, slots, draft_slots, kc.NUM_SPEC)
+        _accept([swapped], draft_slots, [3])
+        wrong = _verify(wt, swapped, a, slots, draft_slots, kc.NUM_SPEC).clone()
         torch.cuda.synchronize()
     print(f"swapped rounds: second output rel diff {kc.rel(wrong, right):.3e}, "
           f"state rel diff {kc.rel(swapped['ssm'][s], p['ssm'][s]):.3e}")  # fmt: skip
@@ -232,6 +252,7 @@ def test_rejects_out_of_contract(managers) -> None:
     mgr, all_slots = managers[kc.NUM_SPEC]
     slots = all_slots[:2]
     p = kc.layer_pools(mgr, 0)
+    draft_slots = kc.draft_slots_apart(p, slots)
     with torch.inference_mode():
         kc.fill_pools(p, 2300)
         before = kc.snapshot(p)
@@ -239,18 +260,24 @@ def test_rejects_out_of_contract(managers) -> None:
         proj = _proj(2, kc.NT, torch.Generator(device="cuda").manual_seed(63))
         short = dict(p, state_tok=p["state_tok"][:, :, : kc.NUM_SPEC - 1].contiguous())
         with pytest.raises(ValueError, match="unsupported call"):
-            _verify(wt, short, proj, slots, kc.NUM_SPEC)
+            _verify(wt, short, proj, slots, draft_slots, kc.NUM_SPEC)
         with pytest.raises(ValueError, match="unsupported call"):
-            _verify(wt, dict(p, pending=p["pending"].long()), proj, slots, kc.NUM_SPEC)
+            _verify(wt, dict(p, pending=p["pending"].long()), proj, slots, draft_slots, kc.NUM_SPEC)
+        with pytest.raises(ValueError, match="unsupported call"):
+            _verify(wt, p, proj, slots, draft_slots[:1], kc.NUM_SPEC)
         torch.cuda.synchronize()
     assert all(torch.equal(p[n], before[n]) for n in POOL_NAMES)
 
 
-@pytest.mark.parametrize("misuse", ("duplicate_slot", "pending", "conv_layout"))
+@pytest.mark.parametrize(
+    "misuse",
+    ("duplicate_slot", "duplicate_draft_slot", "draft_slot_outside", "pending", "conv_layout"),
+)
 def test_guard_rejects_silent_misuse(managers, misuse) -> None:
     mgr, all_slots = managers[kc.NUM_SPEC]
     slots = all_slots[:2]
     p = kc.layer_pools(mgr, 0)
+    draft_slots = kc.draft_slots_apart(p, slots)
     with torch.inference_mode():
         kc.fill_pools(p, 2400)
         before = kc.snapshot(p)
@@ -260,13 +287,76 @@ def test_guard_rejects_silent_misuse(managers, misuse) -> None:
         if misuse == "duplicate_slot":
             slots = slots[:1].repeat(2)
             match = "each slot once"
+        elif misuse == "duplicate_draft_slot":
+            draft_slots = draft_slots[:1].repeat(2)
+            match = "each draft slot once"
+        elif misuse == "draft_slot_outside":
+            draft_slots = draft_slots.clone()
+            draft_slots[0] = p["state_tok"].shape[0]
+            match = "draft_slots must be inside"
         elif misuse == "pending":
             bad = dict(p, pending=p["pending"].clone())
-            bad["pending"][slots.long()] = kc.NUM_SPEC + 1
+            bad["pending"][draft_slots.long()] = kc.NUM_SPEC + 1
             match = "pending must be in"
         else:
             bad = dict(p, cs_k=p["cs_k"].contiguous())
             match = "channel-contiguous"
         with pytest.raises(AssertionError, match=match), validating(k3_kda_verify):
-            _verify(wt, bad, proj, slots, kc.NUM_SPEC)
+            _verify(wt, bad, proj, slots, draft_slots, kc.NUM_SPEC)
         assert all(torch.equal(p[n], before[n]) for n in POOL_NAMES)
+
+
+def test_draft_slots_apart_match_equal_slots(managers) -> None:
+    """Draft records, conv windows and pending counts at draft slots apart from the state slots give bit for bit the
+    outputs, states and draft rows of the same requests with each draft row at the request's state slot: a captured
+    round of every layer replayed over ROUNDS rounds against eager rounds. The last request stands for a CUDA-graph
+    padding row, a dummy with slots of its own."""
+    mgr, all_slots = managers[kc.NUM_SPEC]
+    slots = all_slots[:4]
+    pools = _layers(mgr)
+    draft_slots = kc.draft_slots_apart(pools[0], slots)
+    with torch.inference_mode():
+        for layer, p in enumerate(pools):
+            kc.fill_pools(p, 2500 + layer)
+        equal = [kc.clone_pools(p) for p in pools]
+        for c in equal[1:]:
+            c["pending"] = equal[0]["pending"]
+        for p, e in zip(pools, equal):
+            for name in kc.DRAFT_POOLS:
+                e[name][slots.long()] = p[name][draft_slots.long()]
+        wts = [kc.make_weights(650 + layer) for layer in range(LAYERS)]
+        gen = torch.Generator(device="cuda").manual_seed(65)
+        projs = [[_proj(4, kc.NT, gen) for _ in range(LAYERS)] for _ in range(ROUNDS)]
+        _verify(wts[0], kc.clone_pools(pools[0]), projs[0][0], slots, draft_slots, kc.NUM_SPEC)
+        torch.cuda.synchronize()  # compiles outside capture
+        static = [p.clone() for p in projs[0]]
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+            outs = [
+                _verify(wts[li], pools[li], static[li], slots, draft_slots, kc.NUM_SPEC)
+                for li in range(LAYERS)
+            ]
+        torch.cuda.current_stream().wait_stream(stream)
+        for rnd in range(ROUNDS):
+            for layer in range(LAYERS):
+                static[layer].copy_(projs[rnd][layer])
+            graph.replay()
+            want = [
+                _verify(wts[li], equal[li], projs[rnd][li], slots, slots, kc.NUM_SPEC)
+                for li in range(LAYERS)
+            ]
+            torch.cuda.synchronize()
+            for layer, (p, e) in enumerate(zip(pools, equal)):
+                assert torch.equal(outs[layer], want[layer]), (rnd, layer)
+                assert torch.equal(p["ssm"], e["ssm"]), (rnd, layer)
+                for name in kc.DRAFT_POOLS:
+                    assert torch.equal(p[name][draft_slots.long()], e[name][slots.long()]), (
+                        rnd,
+                        layer,
+                        name,
+                    )
+            accepted = kc.pending_schedule(4, kc.NUM_SPEC, rnd)
+            _accept([pools[0]], draft_slots, accepted)
+            _accept([equal[0]], slots, accepted)

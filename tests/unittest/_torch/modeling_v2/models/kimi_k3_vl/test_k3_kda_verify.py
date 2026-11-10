@@ -179,19 +179,24 @@ class MainPath:
 
 
 class K3Path:
-    """k3_kda_verify: the golden token's state and the drafts' records per slot, a per-slot pending count."""
+    """k3_kda_verify: the golden token's state per slot; the drafts' records, the conv caches and a pending count per
+    draft slot (``draft_slots``, the slots themselves when None), in pools the size of the conv caches."""
 
-    def __init__(self, wt, pools, slots, num_spec):
+    def __init__(self, wt, pools, slots, num_spec, draft_slots=None):
         self.wt, self.p, self.slots, self.num_spec = wt, pools, slots, num_spec
-        self.p["state_tok"] = torch.zeros(POOL, 3, num_spec, H, K, device="cuda")
-        self.p["pending"] = torch.zeros(POOL, dtype=torch.int32, device="cuda")
+        self.draft_slots = slots if draft_slots is None else draft_slots
+        num_draft_slots = pools["cs_q"].shape[0]
+        self.p.setdefault(
+            "state_tok", torch.zeros(num_draft_slots, 3, num_spec, H, K, device="cuda")
+        )
+        self.p.setdefault("pending", torch.zeros(num_draft_slots, dtype=torch.int32, device="cuda"))
 
     def __call__(self, proj, g_ext=None):
         p = self.p
         return torch.ops.trtllm.k3_kda_verify(
             proj, self.wt["w_fb"], self.wt["w_q"], self.wt["w_k"], self.wt["w_v"], self.wt["a_log"],
             self.wt["dt_bias"], self.wt["onorm_w"], p["cs_q"], p["cs_k"], p["cs_v"], p["state"], p["state_tok"],
-            self.slots, p["pending"], self.num_spec, LOWER_BOUND, SCALE, EPS, g_ext,
+            self.slots, self.draft_slots, p["pending"], self.num_spec, LOWER_BOUND, SCALE, EPS, g_ext,
         )  # fmt: skip
 
 
@@ -461,11 +466,11 @@ def _at_offset(t: torch.Tensor, offset: int) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("offset", [0, 1, 2, 3])
-@pytest.mark.parametrize("which", ["slots", "pending"])
+@pytest.mark.parametrize("which", ["slots", "draft_slots", "pending"])
 def test_index_offset(which, offset):
-    """The slots or the pending counts as a slice of a longer index tensor that starts at element ``offset``: over two
-    rounds, the second on nonzero pending counts, the outputs and the pools bit for bit those of the same indices in
-    tensors of their own."""
+    """The slots, the draft slots or the pending counts as a slice of a longer index tensor that starts at element
+    ``offset``: over two rounds, the second on nonzero pending counts, the outputs and the pools bit for bit those of
+    the same indices in tensors of their own."""
     _ops()
     with torch.inference_mode():
         num_requests, steps = 3, 8
@@ -479,6 +484,7 @@ def test_index_offset(which, offset):
             clone_pools(pools),
             _at_offset(slots, offset) if which == "slots" else slots,
             num_spec,
+            draft_slots=_at_offset(slots, offset) if which == "draft_slots" else None,
         )
         if which == "pending":
             got.p["pending"] = _at_offset(got.p["pending"], offset)
@@ -495,6 +501,97 @@ def test_index_offset(which, offset):
             )
             ref.p["pending"][slots.long()] = nxt
             got.p["pending"][slots.long()] = nxt
+
+
+def make_draft_slots(slots: torch.Tensor, num_draft_slots: int, seed: int) -> torch.Tensor:
+    """Distinct slots of a draft pool of ``num_draft_slots``, one per request and none equal to the request's slot."""
+    gen = torch.Generator().manual_seed(seed)
+    while True:
+        drafts = torch.randperm(num_draft_slots, generator=gen)[: slots.numel()].to(torch.int32)
+        if not bool((drafts == slots.cpu()).any()):
+            return drafts.cuda()
+
+
+def draft_pools_apart(pools, slots, draft_slots, num_draft_slots, num_spec, seed) -> dict:
+    """``pools`` with the conv caches, the drafts' records and the pending counts in pools of ``num_draft_slots``: each
+    request's rows moved from its slot to its draft slot (no records, no pending), every other row a distinct
+    random fill."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    out = clone_pools(pools)
+    rows, drafts = slots.long(), draft_slots.long()
+    for name in ("cs_q", "cs_k", "cs_v"):
+        t = pools[name]
+        moved = (
+            torch.randn(num_draft_slots, t.shape[2], t.shape[1], generator=g, device="cuda") * 0.5
+        ).transpose(1, 2)
+        moved[drafts] = t[rows]
+        out[name] = moved
+    out["state_tok"] = torch.randn(num_draft_slots, 3, num_spec, H, K, generator=g, device="cuda")
+    out["state_tok"][drafts] = 0
+    out["pending"] = torch.randint(
+        1, num_spec + 1, (num_draft_slots,), generator=g, device="cuda", dtype=torch.int32
+    )
+    out["pending"][drafts] = 0
+    return out
+
+
+UNEQUAL = [(4, 8), (7, 2), (1, 8)]
+
+
+@pytest.mark.parametrize("draft_pool", [POOL - 3, POOL + 5], ids=["smaller", "larger"])
+@pytest.mark.parametrize("num_requests,steps", UNEQUAL, ids=[f"{r}x{t}" for r, t in UNEQUAL])
+def test_draft_slots_apart(num_requests, steps, draft_pool):
+    """Each request's conv caches, drafts' records and pending count at a draft slot of their own, in pools smaller or
+    larger than the state pool, every other draft row a distinct fill: one call captured with an extra padding row
+    and replayed over the rounds gives, bit for bit, the outputs, the state pool and the requests' draft rows of
+    eager calls with every draft row at the request's slot, and leaves every other draft row as it was."""
+    _ops()
+    with torch.inference_mode():
+        num_spec = steps - 1
+        rows_n = num_requests + 1  # the last row is a CUDA-graph padding request
+        wt = make_weights(31)
+        pools = make_pools(32, num_spec, "dense")
+        slots = make_slots(rows_n, 33)
+        draft_slots = make_draft_slots(slots, draft_pool, 34)
+        equal = K3Path(wt, clone_pools(pools), slots, num_spec)
+        apart = K3Path(
+            wt,
+            draft_pools_apart(pools, slots, draft_slots, draft_pool, num_spec, 35),
+            slots,
+            num_spec,
+            draft_slots,
+        )
+        draft_names = ("cs_q", "cs_k", "cs_v", "state_tok", "pending")
+        others = [d for d in range(draft_pool) if d not in set(draft_slots.tolist())]
+        untouched = {name: apart.p[name][others].clone() for name in draft_names}
+        proj = torch.zeros(rows_n * steps, PROJ, dtype=torch.bfloat16, device="cuda")
+        warm = K3Path(wt, clone_pools(apart.p), slots, num_spec, draft_slots)
+        warm(proj)  # compiles outside capture
+        torch.cuda.synchronize()
+        holder = {}
+        stream = torch.cuda.Stream()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            holder["out"] = apart(proj)
+        gen = torch.Generator(device="cuda").manual_seed(36)
+        for rnd in range(ROUNDS):
+            proj.copy_(torch.randn(proj.shape, generator=gen, device="cuda").bfloat16())
+            graph.replay()
+            want = equal(proj.clone())
+            torch.cuda.synchronize()
+            assert torch.equal(holder["out"], want), f"round {rnd}"
+            assert torch.equal(apart.p["state"], equal.p["state"]), f"round {rnd}"
+            for name in ("cs_q", "cs_k", "cs_v", "state_tok"):
+                assert torch.equal(
+                    apart.p[name][draft_slots.long()], equal.p[name][slots.long()]
+                ), f"round {rnd} {name}"
+            for name in draft_names:
+                assert torch.equal(apart.p[name][others], untouched[name]), f"round {rnd} {name}"
+            nxt = torch.tensor(
+                pending_schedule(rows_n, num_spec, rnd), dtype=torch.int32, device="cuda"
+            )
+            equal.p["pending"][slots.long()] = nxt
+            apart.p["pending"][draft_slots.long()] = nxt
 
 
 # ----------------------------------------------------------------------------------------------------------------

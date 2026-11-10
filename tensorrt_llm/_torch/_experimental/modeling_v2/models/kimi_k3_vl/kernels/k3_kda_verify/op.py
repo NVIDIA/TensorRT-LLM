@@ -15,12 +15,14 @@
 """``trtllm::k3_kda_verify``: Kimi K3's KDA speculative verify for 1 + num_spec tokens per request, from the fused
 projection rows to the gated-norm core output, with the drafts' records for the next round.
 
-State contract (differs from ``trtllm::kda_mtp_decode``'s replay caches): after a call the pool ``ssm`` holds the
-state after each request's golden token and ``state_tok[slot]`` the records of its drafts: the row innovations vn
-[num_spec][H][V], then beta * k and the decay [num_spec][H][K]. The conv caches hold the raw inputs at positions
--2..num_spec around the golden token. The next call starts from the pool state with the drafts the sampler accepted
-(``pending[slot]``) replayed from their records, S = fma(decay, S, vn (beta k)), the recurrence's own arithmetic.
-The kernel compiles on the first call for each configuration, which must happen outside CUDA-graph capture.
+State contract (differs from ``trtllm::kda_mtp_decode``'s replay caches): request n has a slot ``slots[n]`` in the
+state pool ``ssm`` and a slot ``d = draft_slots[n]`` in the draft-record pools ``state_tok``, ``pending`` and the conv
+caches; the two pools may differ in size and the two slots in value. After a call ``ssm`` holds the state after each
+request's golden token and ``state_tok[d]`` the records of its drafts: the row innovations vn [num_spec][H][V], then
+beta * k and the decay [num_spec][H][K]. The conv caches hold the raw inputs at positions -2..num_spec around the
+golden token. The next call starts from the pool state with the drafts the sampler accepted (``pending[d]``) replayed
+from their records, S = fma(decay, S, vn (beta k)), the recurrence's own arithmetic. The kernel compiles on the first
+call for each configuration, which must happen outside CUDA-graph capture.
 """
 
 from __future__ import annotations
@@ -47,8 +49,9 @@ def _arg(t: torch.Tensor, align: int = 16):
 
 
 def _index_arg(t: torch.Tensor):
-    """An int32 index tensor the kernel reads element by element (``slots``, ``pending``), declared at its element's
-    alignment: the mixer passes slices such as ``state_indices[num_prefills:]``, which start on any 4-byte boundary."""
+    """An int32 index tensor the kernel reads element by element (``slots``, ``draft_slots``, ``pending``), declared at
+    its element's alignment: the mixer passes slices such as ``state_indices[num_prefills:]``, which start on any
+    4-byte boundary."""
     return _arg(t, t.element_size())
 
 
@@ -90,6 +93,7 @@ def k3_kda_verify(
     ssm: torch.Tensor,
     state_tok: torch.Tensor,
     slots: torch.Tensor,
+    draft_slots: torch.Tensor,
     pending: torch.Tensor,
     num_spec: int,
     lower_bound: float,
@@ -121,6 +125,8 @@ def k3_kda_verify(
         or ssm.stride()[1:] != (K * K, K, 1)
         or ssm.dtype != torch.float32
         or slots.dtype != torch.int32
+        or draft_slots.dtype != torch.int32
+        or draft_slots.shape != slots.shape
         or pending.dtype != torch.int32
         or any(t.dtype != torch.float32 for t in (w_q, w_k, w_v, a_log, dt_bias, onorm_w))
     ):
@@ -131,7 +137,8 @@ def k3_kda_verify(
             f"w_fb {tuple(w_fb.shape)} {w_fb.dtype} contiguous {w_fb.is_contiguous()}, onorm_w {tuple(onorm_w.shape)}, "
             f"ssm {tuple(ssm.shape)} {ssm.dtype} strides {ssm.stride()}, state_tok {tuple(state_tok.shape)} "
             f"{state_tok.dtype} contiguous {state_tok.is_contiguous()}, cs_q {tuple(cs_q.shape)}, num_spec {num_spec}, "
-            f"slots {tuple(slots.shape)} {slots.dtype}, pending {pending.dtype} (tokens expected {tokens})"
+            f"slots {tuple(slots.shape)} {slots.dtype}, draft_slots {tuple(draft_slots.shape)} {draft_slots.dtype}, "
+            f"pending {pending.dtype} (tokens expected {tokens})"
         )
     fold_fb = g_ext is None
     out = torch.empty(tokens, num_heads, v_dim, dtype=torch.bfloat16, device=proj.device)
@@ -151,6 +158,7 @@ def k3_kda_verify(
         _arg(slots_view(ssm)),
         _arg(slots_view(state_tok)),
         _index_arg(slots),
+        _index_arg(draft_slots),
         _index_arg(pending.unsqueeze(-1)),
         _arg(_flat(out)),
     )
@@ -198,8 +206,8 @@ def k3_kda_verify(
 
 
 @k3_kda_verify.register_fake
-def _(proj, w_fb, w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v, ssm, state_tok, slots, pending,
-      num_spec, lower_bound, scale, eps, g_ext=None):  # fmt: skip
+def _(proj, w_fb, w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v, ssm, state_tok, slots, draft_slots,
+      pending, num_spec, lower_bound, scale, eps, g_ext=None):  # fmt: skip
     return proj.new_empty(
         (proj.shape[0], w_fb.shape[0] // K, onorm_w.shape[0]), dtype=torch.bfloat16
     )

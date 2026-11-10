@@ -288,8 +288,15 @@ public:
     TypedVec<PoolGroupIndex, float> toPoolGroupRatio(
         CacheLevel level, TypedVec<LifeCycleId, float> const& lifeCycleRatio) const;
 
-    // Apply stored min_slots constraint to a ratio list for GPU level.
+    // Apply the stored min_slots constraint and fixed slot counts to a ratio list for GPU level.
     TypedVec<PoolGroupIndex, float> constrainPoolGroupRatio(TypedVec<PoolGroupIndex, float> const& ratio) const;
+
+    // Fixed slot count of each hot-tier pool group (see RegionConfig::fixedSlotCount). Ratio-based
+    // sizing at construction, in adjustCacheLevel() and in tuner targets leaves these groups at that size.
+    FixedSlotCounts const& fixedSlotCounts() const noexcept
+    {
+        return mFixedSlots;
+    }
 
     // Byte address of a slot's buffer in GPU memory (per-layer, with offset).
     MemAddress getMemPoolBaseAddress(LayerId layerId, DataRole role) const;
@@ -394,11 +401,13 @@ private:
         CacheTierConfig const& tierConfig, size_t gpuPhysMemSize);
 
     //! `slotSizeLists` holds every pool's size. The level's quota pays for all of them bar
-    //! the ones `secondBudget` names, which are host memory charged to it instead.
+    //! the ones `secondBudget` names, which are host memory charged to it instead. Groups with
+    //! an entry in `fixedSlots` get exactly that many slots.
     [[nodiscard]] static TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
-        size_t gpuPhysMemSize, std::optional<SecondaryPoolBudget> const& secondBudget = std::nullopt);
+        size_t gpuPhysMemSize, std::optional<SecondaryPoolBudget> const& secondBudget = std::nullopt,
+        FixedSlotCounts const& fixedSlots = {});
     //! For the config stage, which sizes a level before it exists: every fact it needs is
     //! named in the call rather than read off the manager.
     [[nodiscard]] static size_t minQuotaForLevel(
@@ -410,7 +419,8 @@ private:
     //! slot floors off it.
     [[nodiscard]] size_t minQuotaForLevel(CacheLevel level) const;
 
-    //! Slot counts `quota` buys at `ratio`, for a level that exists.
+    //! Slot counts `quota` buys at `ratio`, for a level that exists. Fixed hot-tier groups keep
+    //! their fixed slot count.
     [[nodiscard]] TypedVec<PoolGroupIndex, SlotCount> slotCountsForLevel(
         CacheLevel level, size_t quota, TypedVec<PoolGroupIndex, float> const& ratio) const;
 
@@ -508,8 +518,11 @@ private:
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotDesc>> mSlotDescLists;
     // Slot sizes per (level, pool group), built from mSlotDescLists.
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>>> mSlotSizes;
-    //! Hot-level slot floors, from the batch constraints and scaled by 1/maxUtilForResume.
+    //! Hot-level slot floors, from the batch constraints and scaled by 1/maxUtilForResume. A
+    //! fixed-capacity group's floor is its fixed slot count.
     TypedVec<PoolGroupIndex, SlotCount> mHotMinSlots;
+    //! Hot-level fixed slot counts, one entry per pool group.
+    FixedSlotCounts mFixedSlots;
 
     //! Host memory the hot level's host-backed pools may take: the configured quota, or the
     //! default construction fills in when it is unset. Kept because a rebalance moves the

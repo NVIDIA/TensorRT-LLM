@@ -39,6 +39,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -304,6 +305,10 @@ public:
 
     //! Cache group of one buffer; throws std::out_of_range for an unknown buffer.
     CacheGroupId getBufferGroupId(LayerId layerId, DataRole const& role) const;
+
+    //! CacheGroupId of the region named `name` (see KVCacheManagerConfig::regions).
+    //! Throws std::out_of_range for a name no region declares.
+    CacheGroupId getRegionGroupId(std::string const& name) const;
 
     //! Deprecated: use bufferGrouping(). Partitions uniform layers by lifecycle.
     //! Throws common::TllmException if any layer spans several groups. Member order

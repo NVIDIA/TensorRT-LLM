@@ -2295,6 +2295,11 @@ class K3DecodeKDA(KimiKDALinearAttention):
         slots = getattr(mamba_metadata, "generation_state_indices", None)
         if slots is None:
             slots = mamba_metadata.state_indices[: x.shape[0]]
+        # The replay caches' slots, which differ from the state slots when the cache manager keeps them in a pool of
+        # their own.
+        replay_slots = getattr(mamba_metadata, "generation_replay_state_indices", None)
+        if replay_slots is None:
+            replay_slots = mamba_metadata.replay_state_indices[: x.shape[0]]
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         core = k3_kda_decode_attn(
@@ -2316,7 +2321,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
             float(self.o_norm.eps),
         )
         # Speculative decoding's replay caches keep their committed conv window in step with the pool's.
-        self._sync_kda_replay_conv_window(layer_cache, slots, layer_cache.conv)
+        self._sync_kda_replay_conv_window(layer_cache, slots, layer_cache.conv, replay_slots)
         return core
 
     def forward_verify(
@@ -2329,12 +2334,15 @@ class K3DecodeKDA(KimiKDALinearAttention):
         slot_indices,
         output: Optional[torch.Tensor] = None,
         allow_prequantized_output: bool = False,
+        replay_slot_indices: Optional[torch.Tensor] = None,
         prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """The built-in verify, unless the cache manager keeps the per-token states; then the decode kernels'.
 
-        ``prequantized_input`` (the MXFP8 form of ``x2d``) goes to the built-in verify; the decode kernels read
-        ``x2d``.
+        ``replay_slot_indices`` are the requests' slots in the replay caches (``slot_indices`` when ``None``). Either
+        verify addresses the state by ``slot_indices`` and the replay caches, the per-token states included, by
+        ``replay_slot_indices``. ``prequantized_input`` (the MXFP8 form of ``x2d``) goes to the built-in verify; the
+        decode kernels read ``x2d``.
         """
         if not (self._has_kda_replay_caches(layer_cache) and layer_cache.kda_state_tok is not None):
             return super().forward_verify(
@@ -2345,22 +2353,33 @@ class K3DecodeKDA(KimiKDALinearAttention):
                 ssm_pool,
                 slot_indices,
                 output=output,
+                replay_slot_indices=replay_slot_indices,
                 prequantized_input=prequantized_input,
             )
         assert self.takes_k3_kernels and self.k3_buffers is not None, (
             f"Kimi K3 KDA layer {self.layer_idx}: the cache manager keeps the per-token verify states, which only "
             "the decode kernels write, and this layer has no fused projection weight or buffers"
         )
-        core = self._k3_verify(x2d, num_steps, layer_cache, ssm_pool, slot_indices)
+        core = self._k3_verify(
+            x2d,
+            num_steps,
+            layer_cache,
+            ssm_pool,
+            slot_indices,
+            slot_indices if replay_slot_indices is None else replay_slot_indices,
+        )
         return self._store_core(core, output)
 
-    def _k3_verify(self, x, num_steps, layer_cache, ssm_pool, slot_indices) -> torch.Tensor:
+    def _k3_verify(
+        self, x, num_steps, layer_cache, ssm_pool, slot_indices, replay_slot_indices
+    ) -> torch.Tensor:
         """The core output ``[N T, H, 128]`` of N requests of T verify tokens: ``ssm/k3_kda_attn`` for one request of
         8 tokens, else ``ssm/k3_kda_verify`` on the projection's rows (the ``kda_proj`` decode GEMV site where it
-        takes them). Each slot's state after the golden token, its drafts' states and its conv window are written in
-        place."""
+        takes them). Each request's state after the golden token is written in place at its slot in
+        ``slot_indices``, its drafts' states and its conv window at its slot in ``replay_slot_indices``."""
         num_requests = x.shape[0] // num_steps
         slots = slot_indices[:num_requests]
+        draft_slots = replay_slot_indices[:num_requests]
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         constants = (float(self.gate_lower_bound), self.head_k_dim**-0.5, float(self.o_norm.eps))
         if num_requests == 1 and num_steps == 8:
@@ -2380,6 +2399,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
                 ssm_pool,
                 layer_cache.kda_state_tok,
                 slots,
+                draft_slots,
                 layer_cache.prev_num_accepted_tokens,
                 self.k3_buffers,
                 num_steps - 1,
@@ -2406,6 +2426,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
                 ssm_pool,
                 layer_cache.kda_state_tok,
                 slots,
+                draft_slots,
                 layer_cache.prev_num_accepted_tokens,
                 num_steps - 1,
                 *constants,

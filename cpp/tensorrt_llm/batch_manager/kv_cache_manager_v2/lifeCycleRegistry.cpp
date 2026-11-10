@@ -18,6 +18,7 @@
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include <algorithm>
 #include <stdexcept>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -46,6 +47,15 @@ LifeCycle makeLifeCycle(LayerConfig const& layer, BufferConfig const& buffer, in
         layer);
 }
 
+LifeCycle makeLifeCycle(RegionConfig const& region, int regionIndex)
+{
+    // RegionConfig::validate() admits request regions only; a token-block region would map
+    // to an AttnLifeCycle with the region's own window.
+    TLLM_CHECK_WITH_INFO(region.allocationUnit == RegionAllocationUnit::kRequest,
+        "Region '%s': only request regions are supported", region.name.c_str());
+    return SsmLifeCycle{region.reusePolicy, regionIndex};
+}
+
 // ---------------------------------------------------------------------------
 // LifeCycleRegistry
 // ---------------------------------------------------------------------------
@@ -72,7 +82,38 @@ LifeCycleRegistry::LifeCycleRegistry(KVCacheManagerConfig const& config)
             registerLifeCycle(makeLifeCycle(layer, buffer, config.tokensPerBlock));
         }
     }
+    // The region index is part of a region's lifecycle, so each region registers a new one.
+    mRegionLifeCycleIds.reserve(config.regions.size());
+    for (size_t regionIndex = 0; regionIndex < config.regions.size(); ++regionIndex)
+    {
+        auto const& region = config.regions[regionIndex];
+        region.validate();
+        auto const lc = makeLifeCycle(region, static_cast<int>(regionIndex));
+        registerLifeCycle(lc);
+        auto const id = getId(lc);
+        mRegionLifeCycleIds.push_back(id);
+        TLLM_CHECK_WITH_INFO(mRegionLifeCycleIdByName.emplace(region.name, id).second,
+            "Region name '%s' is declared twice", region.name.c_str());
+    }
+    // Matching prunes to an endpoint where the first REQUIRED SSM life cycle has a checkpoint, and
+    // restoration expects every REQUIRED SSM life cycle to have one there. A second one's checkpoint
+    // can be missing at that endpoint, so layer buffers and regions together may have one at most.
+    auto const numRequiredSsm = std::count_if(mSsmLifeCycleIds.begin(), mSsmLifeCycleIds.end(),
+        [this](LifeCycleId id) { return requiresPrefixCoverage(mLifeCycleList[id]); });
+    TLLM_CHECK_WITH_INFO(numRequiredSsm <= 1,
+        "At most one REQUIRED SSM life cycle is supported, from SSM layer buffers or a region; got %ld",
+        static_cast<long>(numRequiredSsm));
     check();
+}
+
+LifeCycleId LifeCycleRegistry::regionLifeCycleId(std::string const& name) const
+{
+    auto const it = mRegionLifeCycleIdByName.find(name);
+    if (it == mRegionLifeCycleIdByName.end())
+    {
+        throw std::out_of_range("LifeCycleRegistry: no region named '" + name + "'");
+    }
+    return it->second;
 }
 
 LifeCycle const& LifeCycleRegistry::operator[](LifeCycleId id) const

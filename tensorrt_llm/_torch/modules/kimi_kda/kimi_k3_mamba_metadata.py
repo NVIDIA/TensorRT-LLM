@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Host-prepared scheduling metadata for packed FlashInfer KDA prefill."""
+"""Host-prepared KDA metadata: packed FlashInfer prefill schedule and replay slots."""
 
 from itertools import accumulate
 
 import torch
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._utils import prefer_pinned
@@ -18,6 +19,18 @@ class KimiK3MambaMetadata(Mamba2Metadata):
 
     def __init__(self, max_batch_size: int, chunk_size: int, max_num_tokens: int) -> None:
         super().__init__(max_batch_size, chunk_size, max_num_tokens)
+        # Each request's slot in the KDA replay buffers. A cache manager that
+        # keeps replay state in a region of its own fills this static buffer;
+        # otherwise the replay buffers share the recurrent-state slots and
+        # this aliases ``state_indices``.
+        self.replay_state_indices = self.state_indices
+        self._replay_state_indices = torch.zeros(max_batch_size, dtype=torch.int32, device="cuda")
+        self._replay_state_indices_cpu = torch.zeros(
+            max_batch_size, dtype=torch.int32, pin_memory=prefer_pinned()
+        )
+        self._replay_state_indices_buffer = DeviceCopyBuffer(
+            self._replay_state_indices, pin_memory=prefer_pinned()
+        )
         self.kda_max_seqlen = 0
         # Align both rows to 16 bytes. One transfer refreshes the metadata shared
         # by all layers; device storage stays fixed for CUDA graph replay.
@@ -27,12 +40,18 @@ class KimiK3MambaMetadata(Mamba2Metadata):
         self.kda_cu_chunks = self._kda_schedule[1, :1]
 
         # KDA's CuTe verify kernel requires a 16-byte-aligned DLPack pointer.
-        # Keep the backing allocation stable so metadata preparation remains
+        # Keep the backing allocations stable so metadata preparation remains
         # safe for CUDA graph capture and replay.
         self._generation_state_indices = torch.empty(
             max_batch_size, dtype=torch.int32, device="cuda"
         )
         self.generation_state_indices: torch.Tensor | None = None
+        # The generation requests' replay slots, aligned the same way when
+        # they are not the state slots.
+        self._generation_replay_state_indices = torch.empty(
+            max_batch_size, dtype=torch.int32, device="cuda"
+        )
+        self.generation_replay_state_indices: torch.Tensor | None = None
 
     def prepare(self, attn_metadata: AttentionMetadata) -> None:
         context_lengths = attn_metadata.seq_lens[: attn_metadata.num_contexts].tolist()
@@ -41,20 +60,28 @@ class KimiK3MambaMetadata(Mamba2Metadata):
         )
 
         super().prepare(attn_metadata)
+        self._prepare_replay_state_indices(attn_metadata)
 
         self.generation_state_indices = None
+        self.generation_replay_state_indices = None
         batch_size = attn_metadata.seq_lens.shape[0]
-        generation_state_indices = self.state_indices[attn_metadata.num_contexts : batch_size]
+        num_contexts = attn_metadata.num_contexts
         if (
             getattr(attn_metadata.kv_cache_manager, "use_kda_replay_update", False)
-            and generation_state_indices.numel() > 0
-            and generation_state_indices.data_ptr() % 16
+            and batch_size > num_contexts
         ):
-            aligned_state_indices = self._generation_state_indices[
-                : generation_state_indices.shape[0]
-            ]
-            aligned_state_indices.copy_(generation_state_indices)
-            self.generation_state_indices = aligned_state_indices
+            self.generation_state_indices = self._aligned_generation_indices(
+                self.state_indices, self._generation_state_indices, num_contexts, batch_size
+            )
+            if self.replay_state_indices is self.state_indices:
+                self.generation_replay_state_indices = self.generation_state_indices
+            else:
+                self.generation_replay_state_indices = self._aligned_generation_indices(
+                    self.replay_state_indices,
+                    self._generation_replay_state_indices,
+                    num_contexts,
+                    batch_size,
+                )
 
         self.kda_max_seqlen = max(context_lengths, default=0)
         n = len(context_lengths)
@@ -74,3 +101,37 @@ class KimiK3MambaMetadata(Mamba2Metadata):
             pin_memory=prefer_pinned(),
         )
         self._kda_schedule.copy_(host_schedule, non_blocking=True)
+
+    def _prepare_replay_state_indices(self, attn_metadata: AttentionMetadata) -> None:
+        """Fill the static replay-slot buffer, or alias the state slots."""
+        kv_cache_manager = attn_metadata.kv_cache_manager
+        request_ids = attn_metadata.request_ids
+        if getattr(kv_cache_manager, "replay_layer_group_id", None) is None or request_ids is None:
+            self.replay_state_indices = self.state_indices
+            return
+        batch_size = attn_metadata.seq_lens.shape[0]
+        indices = kv_cache_manager.get_replay_state_indices(request_ids[:batch_size])
+        assert len(indices) == batch_size, (
+            f"get_replay_state_indices() returned {len(indices)} entries for "
+            f"a batch of {batch_size} requests."
+        )
+        self._replay_state_indices_cpu[:batch_size].copy_(
+            torch.as_tensor(indices, dtype=self._replay_state_indices_cpu.dtype)
+        )
+        self._replay_state_indices_buffer.update(self._replay_state_indices_cpu[:batch_size])
+        self.replay_state_indices = self._replay_state_indices
+
+    @staticmethod
+    def _aligned_generation_indices(
+        indices: torch.Tensor, aligned: torch.Tensor, num_contexts: int, batch_size: int
+    ) -> torch.Tensor | None:
+        """Copy ``indices[num_contexts:batch_size]`` into ``aligned`` when it is misaligned.
+
+        Returns the aligned copy, or ``None`` when the slice is already 16-byte aligned.
+        """
+        generation_indices = indices[num_contexts:batch_size]
+        if generation_indices.data_ptr() % 16 == 0:
+            return None
+        aligned_indices = aligned[: generation_indices.shape[0]]
+        aligned_indices.copy_(generation_indices)
+        return aligned_indices
