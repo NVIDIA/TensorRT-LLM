@@ -545,9 +545,9 @@ def test_a_round_stops_when_a_repaired_check_fails_again_and_the_run_ends_uncert
     assert not certification["certified"]
 
 
-@pytest.mark.parametrize("how", ["dirty", "moved"])
+@pytest.mark.parametrize("how", ["dirty", "moved", "rebuilt"])
 def test_only_a_clean_checkout_that_stays_on_one_commit_is_certified(
-    tmp_path, task_file, monkeypatch, how
+    tmp_path, task_file, repo, monkeypatch, how
 ):
     checkout = _Checkout()
     inner = passing_shell()
@@ -557,6 +557,9 @@ def test_only_a_clean_checkout_that_stays_on_one_commit_is_certified(
         ran.append(command)
         if how == "moved" and "engine_driver" in command:
             checkout.head = "0therc0mm1t"  # something moved the checkout under the check
+        if how == "rebuilt" and "engine_driver" in command:
+            # A native rebuild: no commit, but not the binary the round started on.
+            (repo / "tensorrt_llm" / "libtensorrt_llm.so").write_bytes(b"rebuilt")
         return inner(command, env, timeout)
 
     if how == "dirty":
@@ -577,8 +580,33 @@ def test_only_a_clean_checkout_that_stays_on_one_commit_is_certified(
         assert "uncommitted changes to tracked files" in certification["problems"][0]
         assert not any("engine_driver" in c or "trtllm-eval" in c for c in ran)
     else:
-        assert certification["problems"] == ["its commit changed while the checks ran"]
+        assert certification["problems"] == [
+            "its commit or its native libraries changed while the checks ran"
+        ]
         assert not any("trtllm-eval" in c for c in ran)  # the round stopped at once
+
+
+def test_a_check_that_cannot_be_run_is_a_failed_check_not_a_crash(tmp_path, task_file, monkeypatch):
+    """A run that raised inside a check would raise again at that check on every restart."""
+    from agent_flow.workflows.trtllm_modeling_v2.checks import gate_cli
+
+    real = gate_cli.run_check
+
+    def run_check(task_data, gate, unit, member=None, **kwargs):
+        if gate == "boot":
+            raise FileNotFoundError("the boot prompts file is gone")
+        return real(task_data, gate, unit, member, **kwargs)
+
+    monkeypatch.setattr(gate_cli, "run_check", run_check)
+    _run(tmp_path, task_file, monkeypatch, Script(), max_rounds=1)
+    assert _state(tmp_path).verdict == "certification-failed"
+    boot, accuracy = _verdicts(tmp_path)
+    assert not boot["passed"] and accuracy["passed"]
+    assert boot["detail"] == (
+        "the check could not be run: FileNotFoundError: the boot prompts file is gone"
+    )
+    report = (tmp_path / "ws" / "delivery_report.md").read_text()
+    assert "check core:boot@tp1 FAILED" in report and "could not be run" in report
 
 
 def test_a_passing_verdict_counts_only_for_the_tree_it_measured(tmp_path):

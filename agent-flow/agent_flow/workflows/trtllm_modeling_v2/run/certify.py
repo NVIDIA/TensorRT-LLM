@@ -11,7 +11,9 @@ delivered only when all of it passed on that one commit, with the checkout
 clean and unmoved while it ran.
 
 One rule decides what counts: a verdict counts for the tree it measured
-(``contract.tree_id``) and for no other. Nothing is shared between checks and
+(``contract.tree_id``: the commit and the native libraries built into the
+checkout) and for no other. A round whose tree changed under it certifies
+nothing. Nothing is shared between checks and
 nothing is carried from an earlier commit. A round interrupted by a restart
 goes on from the verdicts it already recorded for the same tree.
 
@@ -33,6 +35,7 @@ from rich.markup import escape as escape_markup
 from agent_flow.console import print_message, print_rule
 
 from ..checks import accuracy_policy, gate_cli, gate_records, test_results
+from ..checks import verdict as check_result
 from ..checks.accuracy import resolve_model_key
 from ..checks.delivery import Check as DeliveryCheck
 from ..checks.delivery import DeliveryReport, accuracy_test_path, verify_delivery
@@ -140,7 +143,24 @@ def _dirty(workflow, repo: str) -> str:
 
 
 def _run_check(workflow, check: contract_mod.Check, round: int, anchor: float | None) -> Any:
-    """One contract check on the checkout as it is, through the shared :func:`gate_cli.run_check`."""
+    """One contract check on the checkout as it is, through the shared :func:`gate_cli.run_check`.
+
+    A check that cannot be run at all (a reference it cannot read, a file it
+    cannot write) is a failed check with why, never an error of the run: a run
+    that raised here would raise again at the same check on every restart.
+    """
+    try:
+        return _measure(workflow, check, round, anchor)
+    except Exception as exc:
+        return check_result.GateResult(
+            name=check.gate,
+            passed=False,
+            member=check.member,
+            detail=f"the check could not be run: {type(exc).__name__}: {exc}",
+        )
+
+
+def _measure(workflow, check: contract_mod.Check, round: int, anchor: float | None) -> Any:
     directory = round_dir(workflow.workspace, round)
     return gate_cli.run_check(
         workflow.task_data,
@@ -252,8 +272,10 @@ def certify(workflow, round: int, first: Sequence[str] = (), log=None) -> Certif
             f"[bold {colour}]{check.unit}: {escape_markup(outcome.summary())}[/bold {colour}]",
             log,
         )
-        if workflow._head() != commit:
-            return result(problems=["its commit changed while the checks ran"])
+        if contract_mod.tree_id(repo, workflow._head()) != tree:
+            return result(
+                problems=["its commit or its native libraries changed while the checks ran"]
+            )
         if not verdict.passed and check.key in again:
             workflow.journal.event(
                 "certification",
@@ -265,8 +287,15 @@ def certify(workflow, round: int, first: Sequence[str] = (), log=None) -> Certif
     problems = shift_findings(workflow.task_data, verdicts)
     if not evaluation.holds:
         return result(problems=problems)
-    delivery = delivery_report(workflow, commit, round)
-    if workflow._head() != commit or _dirty(workflow, repo):
+    try:
+        delivery = delivery_report(workflow, commit, round)
+    except Exception as exc:  # as for a check: a failed delivery check, not an error of the run
+        delivery = DeliveryReport(
+            checks=(
+                DeliveryCheck("delivery", False, f"could not be run: {type(exc).__name__}: {exc}"),
+            )
+        )
+    if contract_mod.tree_id(repo, workflow._head()) != tree or _dirty(workflow, repo):
         problems.append("it changed while the delivery checks ran")
     return result(delivery, problems)
 
