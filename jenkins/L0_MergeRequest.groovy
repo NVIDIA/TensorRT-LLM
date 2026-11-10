@@ -761,15 +761,6 @@ def checkoutTargetBranchFile(String targetBranch, String targetCommit, String so
     return ""
 }
 
-def isWaiveValidationRun(globalVars) {
-    def stages = (readJSON(text: env.gitlabTriggerPhrase ?: '{}', returnPojo: true).stage_list ?: '')
-        .tokenize(',').collect { it.trim() }
-    return globalVars[GITHUB_PR_API_URL]?.endsWith('/pulls/21009') && stages && stages.every {
-        it in ['CPU-Generic-WaiveRefresh-Inner-1', 'CPU-Generic-WaiveRefresh-Outer-1',
-               'CPU-Generic-WaiveRefresh-Partial-1']
-    }
-}
-
 def mergeWaiveList(pipeline, globalVars)
 {
     // Get current waive list
@@ -831,14 +822,6 @@ def mergeWaiveList(pipeline, globalVars)
         writeFile file: "waives_TOT_initial_${env.gitlabCommit}.txt",
             text: "# snapshot-time: ${snapshotTime}\n" +
                 "# target-branch-commit: ${targetBranchTOTCommit ?: 'unknown'}\n" + readFile(waiveTot)
-        if (isWaiveValidationRun(globalVars)) {
-            sh ': > waives.txt'
-            writeFile file: "waives_TOT_initial_${env.gitlabCommit}.txt", text:
-                '# snapshot-time: 2026-10-01T00:00:00Z\n# validation-fixture: simulated-old-TOT\n'
-            sh "tar --exclude=__pycache__ -czf waive_validation_scripts.tar.gz -C ${LLM_ROOT} jenkins/scripts tests/integration/defs/test_unittests.py tests/integration/defs/utils/periodic_junit.py tests/unittest/conftest.py tests/test_common/waive.py"
-            trtllm_utils.uploadArtifacts('waive_validation_scripts.tar.gz', "${UPLOAD_PATH}/waive-validation/", 'urm')
-            echo '[WAIVE-VALIDATION] Empty waive list and simulated old TOT; refresh queries existing OpenDB records.'
-        }
         def primary = llmArtifactsPrimary()
         def waiveListTarget = primary == "aws" ?
             "${llmArtifactsRepoPath('aws', UPLOAD_PATH)}/waive_list/" : "${UPLOAD_PATH}/waive_list/"
@@ -2813,10 +2796,6 @@ def launchInfraDryRunTestJob(pipeline, arch, testFilter, globalVars, imageParame
 
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
-    if (isWaiveValidationRun(globalVars)) {
-        reuseBuild = '69129'
-        echo '[WAIVE-VALIDATION] Reusing build 69129; the three CPU test stages execute normally.'
-    }
     def releaseTargets = globalVars[RELEASE_TARGET] ?: []
     def wheelSelected = releaseTargets.contains("wheel")
     def containerSelected = releaseTargets.contains("container")
@@ -3121,10 +3100,6 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         },
         "SBSA-Linux": {
             script {
-                if (isWaiveValidationRun(globalVars)) {
-                    echo '[WAIVE-VALIDATION] Only the three x86 CPU validation stages are requested.'
-                    return
-                }
                 if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
                     echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
                     return
