@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """No buffer a captured graph writes on the device is routed through a skipping upload (K3 audit #150, check #6).
 
-An attention metadata's ``_upload_metadata`` (and the ``DeviceCopyBuffer`` behind ``_upload_buffer``) skips an upload
-when its record says the destination already holds the values. That is sound only while nothing else writes the
-destination: a graph replay that rewrites it on the device (``on_update_kv_lens`` / the MSA KV-length update for the
-lengths, slots and valid-block counts, ``_preprocess_inputs`` for ``kv_lens_cuda``), or another graph key's captured
-forward writing the same pooled CUDA graph metadata block, leaves the record describing values the device no longer
-holds. This test scans ``tensorrt_llm/_torch`` and fails if any of those buffers is the destination of a skipping
-helper; they have to go through the never-skipping ``device_copy.copy`` / ``device_copy.fill_tail``.
+The MSA metadata's ``_upload_block_table`` (a ``DeviceCopyBuffer`` per destination) skips an upload when its record
+says the destination already holds the values. That is sound only while nothing else writes the destination: a graph
+replay that rewrites it on the device (``on_update_kv_lens`` / the MSA KV-length update for the lengths, slots and
+valid-block counts, ``_preprocess_inputs`` for ``kv_lens_cuda``), or another graph key's captured forward writing the
+same pooled CUDA graph metadata block, leaves the record describing values the device no longer holds. This test scans
+``tensorrt_llm/_torch`` and fails if any of those buffers is the destination of a skipping helper; they have to go
+through the never-skipping ``device_copy.copy`` / ``device_copy.fill_tail``.
 
 CPU only: it parses the sources.
 """
@@ -38,9 +38,8 @@ _DEVICE_WRITTEN = {
     "msa_q_batch_row",
     "msa_q_intra",
 }
-# Helpers that may skip the write; their second argument is the destination (``_upload_metadata(site, dst, src)``,
-# ``_upload_buffer(site, dst)``).
-_SKIPPING = {"_upload_metadata", "_upload_buffer"}
+# Helpers that may skip the write; their first argument is the destination (``_upload_block_table(dst, src)``).
+_SKIPPING = {"_upload_block_table"}
 
 
 def _receiver_names(node) -> set:
@@ -62,8 +61,8 @@ def _skipped_device_buffers(tree: ast.AST):
             continue
         f = node.func
         name = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else "")
-        if name in _SKIPPING and len(node.args) > 1:
-            bad = _receiver_names(node.args[1]) & _DEVICE_WRITTEN
+        if name in _SKIPPING:
+            bad = _receiver_names(node.args[0]) & _DEVICE_WRITTEN
             if bad:
                 hits.append((node.lineno, name, sorted(bad)))
     return hits
@@ -85,12 +84,12 @@ def test_no_device_written_buffer_goes_through_the_skip_cache() -> None:
 def test_the_scan_sees_a_skipped_device_buffer() -> None:
     """The scan itself: a skipping helper writing a device-written buffer is reported, a never-skipping one is not."""
     bad = ast.parse(
-        "self._upload_metadata(S.SEQ_LENS, self.msa_seq_lens_cuda[:b], host)\n"
-        "self._upload_buffer(None, m.msa_out_cache_loc).fill_tail(S.TAIL, n, -1)"
+        "self._upload_block_table(self.msa_seq_lens_cuda[:b], host)\n"
+        "m._upload_block_table(m.msa_out_cache_loc, host)"
     )
     ok = ast.parse(
         "device_copy.copy(S.SEQ_LENS, self.msa_seq_lens_cuda[:b], host)\n"
-        "self._upload_metadata(S.BLOCK_TABLE, self.msa_block_table[:b], h)"
+        "self._upload_block_table(self.msa_block_table[:b], h)"
     )
-    assert [h[1] for h in _skipped_device_buffers(bad)] == ["_upload_metadata", "_upload_buffer"]
+    assert [h[1] for h in _skipped_device_buffers(bad)] == ["_upload_block_table"] * 2
     assert _skipped_device_buffers(ok) == []

@@ -381,16 +381,16 @@ A class-level `TrtllmAttentionMetadata` hook lets a metadata family decide
 engine behaviour that depends on what its own `prepare()` does, instead of a
 model arming it from outside (MiniMax-M3's MSA metadata sets it):
 
-- `skips_unchanged_uploads`: its per-step uploads (`_upload_metadata`) skip
-  values their destination already holds. This is sound only while nothing
-  else writes those buffers, so the decoder runner then gives the CUDA-graph
-  metadata private buffers. Each skippable destination keeps its record in a
-  `device_copy.DeviceCopyBuffer` with the upload's site; the CUDA-graph
-  metadata copies share one set of them. Every graph key's metadata still
-  takes its buffers from one pool, and a captured forward's device writes
-  into a block rerun at each replay, so only a destination its upload alone
-  writes (MSA's block table) goes through `_upload_metadata`; the others use
-  the never-skipping `device_copy.copy` / `device_copy.fill_tail`.
+- `skips_unchanged_uploads`: its skippable per-step uploads skip values their
+  destination already holds. This is sound only while nothing else writes
+  those buffers, so the decoder runner then gives the CUDA-graph metadata
+  private buffers. Every graph key's metadata still takes its buffers from one
+  pool, and a captured forward's device writes into a block rerun at each
+  replay, so only a destination its upload alone writes is skippable: MSA's
+  block table, through `_upload_block_table`, which keeps its record in a
+  `device_copy.DeviceCopyBuffer` per destination storage shared by the
+  CUDA-graph metadata copies. MSA's other uploads use the never-skipping
+  `device_copy.copy` / `device_copy.fill_tail`.
 
 The sparse attention config decides whether decode CUDA graphs are keyed by
 short and long contexts: `BaseSparseAttentionConfig.short_long_seq_len_threshold(

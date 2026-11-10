@@ -49,7 +49,7 @@ from ...distributed import cp_allgather
 from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids, is_kimi_k3
 from ...pyexecutor import device_copy
 from ...pyexecutor.config_utils import is_mla
-from ...pyexecutor.device_copy import CopySite, CopySiteEnum
+from ...pyexecutor.device_copy import CopySite
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
@@ -187,10 +187,9 @@ class HelixMlaChunkPlan:
 
 @dataclass(kw_only=True)
 class TrtllmAttentionMetadata(AttentionMetadata):
-    # Whether this metadata's skippable uploads (_upload_metadata) skip values their destination already holds.
-    # Sound only for a destination its upload alone writes: no other engine (an engine whose metadata class sets it
-    # gives its CUDA graph metadata private buffers), and no captured forward of another graph key sharing the pooled
-    # block. A metadata class routes only such destinations through _upload_metadata.
+    # Whether this metadata class's skippable uploads skip values their destination already holds. Sound only for a
+    # destination its upload alone writes: no other engine (an engine whose metadata class sets it gives its CUDA
+    # graph metadata private buffers), and no captured forward of another graph key sharing the pooled block.
     skips_unchanged_uploads: ClassVar[bool] = False
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
@@ -453,47 +452,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.fmha_plan_caches = {}
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
-        self._ensure_upload_buffers()
         self._post_init_with_buffers(self.cuda_graph_buffers)
-
-    def _ensure_upload_buffers(self) -> None:
-        """The skippable uploads' DeviceCopyBuffers, by destination storage (used only with skips_unchanged_uploads).
-        One set per engine: CUDA graph metadata is a shallow copy that re-runs __post_init__ and shares it, since the
-        copies of different batch sizes write the same graph-metadata buffers."""
-        if getattr(self, "_upload_buffers", None) is None:
-            self._upload_buffers: Dict[int, device_copy.DeviceCopyBuffer] = {}
-
-    def _upload_buffer(self, site: Optional[CopySiteEnum],
-                       dst: torch.Tensor) -> device_copy.DeviceCopyBuffer:
-        """The DeviceCopyBuffer of ``dst``'s storage for ``site``'s uploads (None: tail fills only). It holds the
-        destination, which keeps the storage alive, so a new buffer at a reused address cannot inherit its record;
-        a write through another site replaces it."""
-        addr = dst.untyped_storage().data_ptr()
-        buffer = self._upload_buffers.get(addr)
-        if buffer is None or buffer.site is not site:
-            buffer = device_copy.DeviceCopyBuffer(dst,
-                                                  site=site,
-                                                  snapshot=False)
-            self._upload_buffers[addr] = buffer
-        return buffer
-
-    def _upload_metadata(self,
-                         site: CopySiteEnum,
-                         dst: torch.Tensor,
-                         src: torch.Tensor,
-                         changed_span: bool = False) -> bool:
-        """A host-to-device metadata upload, skipped when unchanged if the metadata class skips them; True if issued.
-
-        ``src`` is a host tensor the caller does not write again before the copy runs. ``changed_span``: see
-        ``DeviceCopyBuffer.update``. Use it only for a destination this upload alone writes: CUDA graph metadata of
-        every graph key takes its buffers from one pool, and a captured forward's device writes into a block rerun at
-        each replay, so a record of any other pooled buffer does not describe its device contents."""
-        if self.skips_unchanged_uploads:
-            return self._upload_buffer(site,
-                                       dst).update(src,
-                                                   view=dst,
-                                                   changed_span=changed_span)
-        return device_copy.copy(site, dst, src)
 
     def _post_init_with_buffers(self, buffers) -> None:
 

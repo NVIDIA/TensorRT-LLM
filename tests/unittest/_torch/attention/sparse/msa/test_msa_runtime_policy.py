@@ -18,6 +18,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
     MiniMaxM3SparseMetadataParams,
+    MsaCopySite,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
@@ -89,7 +90,7 @@ def _short_table_metadata(
     metadata.cuda_graph_buffers = None
     metadata.is_cuda_graph = False
     metadata.mapping = Mapping()
-    metadata._upload_buffers = {}
+    metadata._msa_block_table_uploads = {}
     return metadata
 
 
@@ -624,32 +625,26 @@ def test_msa_metadata_skips_unchanged_uploads_and_arms_its_manager(manager):
 
 @requires_cuda
 def test_cuda_graph_metadata_copies_share_one_record_set():
-    """Graph metadata of different batch sizes are shallow copies writing the same buffers: a write through one
-    copy must make the others send their values again."""
+    """Graph metadata of different batch sizes are shallow copies writing the same block table: a write through
+    one copy must make the others send their values again."""
     import copy
 
-    from tensorrt_llm._torch.pyexecutor.device_copy import CopySite
-
     engine_md = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
-    engine_md._ensure_upload_buffers()
+    engine_md._msa_block_table_uploads = {}
     graphs = [copy.copy(engine_md) for _ in range(3)]
-    for g in graphs:
-        # CUDA graph metadata re-runs __post_init__, which keeps the shared DeviceCopyBuffers.
-        g._ensure_upload_buffers()
-    assert all(g._upload_buffers is engine_md._upload_buffers for g in graphs)
+    assert all(g._msa_block_table_uploads is engine_md._msa_block_table_uploads for g in graphs)
 
-    buf = torch.zeros(4, dtype=torch.int32, device="cuda")
-    one = torch.tensor([1, 2, 3, 4], dtype=torch.int32).pin_memory()
-    two = torch.tensor([5, 6, 7, 8], dtype=torch.int32).pin_memory()
-    site = CopySite.ATTN_PROMPT_LENS
-    assert graphs[0]._upload_metadata(site, buf, one) is True
-    assert graphs[1]._upload_metadata(site, buf, two) is True
-    # graphs[1] overwrote the buffer: graphs[0]'s identical values must be sent again, then skipped.
-    assert graphs[0]._upload_metadata(site, buf, one) is True
-    assert graphs[2]._upload_metadata(site, buf, one) is False
+    table = torch.zeros(4, 3, dtype=torch.int32, device="cuda")
+    dst = table[:2, :2]
+    one = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32).pin_memory()
+    two = torch.tensor([[5, 6], [7, 8]], dtype=torch.int32).pin_memory()
+    assert graphs[0]._upload_block_table(dst, one) is True
+    assert graphs[1]._upload_block_table(dst, two) is True
+    # graphs[1] overwrote the table: graphs[0]'s identical values must be sent again, then skipped.
+    assert graphs[0]._upload_block_table(dst, one) is True
+    assert graphs[2]._upload_block_table(dst, one) is False
     torch.cuda.synchronize()
-    assert buf.tolist() == [1, 2, 3, 4]
-    # One DeviceCopyBuffer per destination, with the upload's site, shared by every copy.
-    shared = graphs[0]._upload_buffer(site, buf)
-    assert shared is graphs[2]._upload_buffer(site, buf) is engine_md._upload_buffer(site, buf)
-    assert shared.site is site and shared.tensor is buf
+    assert table[:2, :2].tolist() == [[1, 2], [3, 4]]
+    # One DeviceCopyBuffer for the table's storage, with the block-table site, shared by every copy.
+    (shared,) = engine_md._msa_block_table_uploads.values()
+    assert shared.site is MsaCopySite.BLOCK_TABLE and shared.tensor is dst

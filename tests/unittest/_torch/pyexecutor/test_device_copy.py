@@ -4,12 +4,10 @@
 needed is the buffer owner's call (``unchanged``, ``DeviceCopyBuffer``)."""
 
 import threading
-from types import SimpleNamespace
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor import device_copy
 from tensorrt_llm._torch.pyexecutor.device_copy import (
     CHECK_ENV,
@@ -57,14 +55,19 @@ _PLAN = CopyPlan(merge={_Site.H2D, _Site.D2D, _Site.SKIP})
 
 
 class _Owner:
-    """A buffer owner keeping a DeviceCopyBuffer per destination storage, through the attention metadata's own
-    ``_upload_buffer`` (the owner pattern of a metadata class that skips unchanged uploads)."""
+    """A buffer owner keeping a DeviceCopyBuffer per destination storage (the owner pattern of a metadata class that
+    skips unchanged uploads), replaced when written through another site."""
 
     def __init__(self) -> None:
-        self._state = SimpleNamespace(_upload_buffers={})
+        self._buffers: dict[int, device_copy.DeviceCopyBuffer] = {}
 
     def buffer(self, site, t: torch.Tensor) -> device_copy.DeviceCopyBuffer:
-        return TrtllmAttentionMetadata._upload_buffer(self._state, site, t)
+        addr = t.untyped_storage().data_ptr()
+        buffer = self._buffers.get(addr)
+        if buffer is None or buffer.site is not site:
+            buffer = device_copy.DeviceCopyBuffer(t, site=site, snapshot=False)
+            self._buffers[addr] = buffer
+        return buffer
 
     def copy(self, site, dst: torch.Tensor, src: torch.Tensor) -> bool:
         return self.buffer(site, dst).update(src, view=dst)
@@ -74,7 +77,7 @@ class _Owner:
 
     def forget(self, t: torch.Tensor) -> None:
         """Another writer wrote ``t``: drop its record."""
-        buffer = self._state._upload_buffers.get(t.untyped_storage().data_ptr())
+        buffer = self._buffers.get(t.untyped_storage().data_ptr())
         if buffer is not None:
             buffer.invalidate()
 

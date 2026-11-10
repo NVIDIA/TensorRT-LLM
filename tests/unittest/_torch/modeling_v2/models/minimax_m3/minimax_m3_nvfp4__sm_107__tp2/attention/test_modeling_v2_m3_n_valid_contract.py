@@ -42,11 +42,12 @@ _MUTATORS = {
     "add_",
     "sub_",
 }
-# Calls whose first argument is the destination they write (``dst.copy_(src)`` is a mutator).
-_COPY_HELPERS = {"copy_"}
-# Calls whose second argument is the destination they write: ``device_copy.copy(site, dst, src)``,
-# ``device_copy.fill_tail(site, buf, start, value)`` and the attention metadata's ``_upload_metadata(site, dst, src)``.
-_SITE_COPY_HELPERS = {"copy", "fill_tail", "_upload_metadata"}
+# Calls whose first argument is the destination they write (``dst.copy_(src)`` is a mutator) and the MSA metadata's
+# ``_upload_block_table(dst, src)``.
+_COPY_HELPERS = {"copy_", "_upload_block_table"}
+# Calls whose second argument is the destination they write: ``device_copy.copy(site, dst, src)`` and
+# ``device_copy.fill_tail(site, buf, start, value)``.
+_SITE_COPY_HELPERS = {"copy", "fill_tail"}
 _BACKEND = "attention/backends/sparse/minimax_m3/msa_backend.py"
 # (file relative to tensorrt_llm/_torch, enclosing function) -> writes allowed there
 _ALLOWED = {

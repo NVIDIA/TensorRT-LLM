@@ -37,9 +37,11 @@ _MUTATORS = {
     "add_",
     "sub_",
 }
-# Helpers whose second argument is the destination they write: ``device_copy.copy(site, dst, src)``,
-# ``device_copy.fill_tail(site, buf, start, value)`` and the attention metadata's ``_upload_metadata(site, dst, src)``.
-_COPY_HELPERS = {"copy", "fill_tail", "_upload_metadata"}
+# Helpers whose second argument is the destination they write: ``device_copy.copy(site, dst, src)`` and
+# ``device_copy.fill_tail(site, buf, start, value)``.
+_COPY_HELPERS = {"copy", "fill_tail"}
+# Helpers whose first argument is the destination they write: the MSA metadata's ``_upload_block_table(dst, src)``.
+_UPLOAD_HELPERS = {"_upload_block_table"}
 # (file relative to tensorrt_llm/_torch, enclosing function) -> what it may do
 _ALLOWED = {
     (
@@ -82,6 +84,8 @@ def _write_sites(tree: ast.AST):
                 else (f.attr if isinstance(f, ast.Attribute) else "")
             )
             if name in _COPY_HELPERS and len(node.args) > 1 and _mentions(node.args[1]):
+                sites.append((func, node.lineno))
+            if name in _UPLOAD_HELPERS and node.args and _mentions(node.args[0]):
                 sites.append((func, node.lineno))
         for child in ast.iter_child_nodes(node):
             visit(child, func)

@@ -60,7 +60,7 @@ def test_msa_metadata_clears_padded_cache_slot_tail(
     monkeypatch.setattr(msa_backend, "maybe_pin_memory", lambda tensor: tensor)
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     metadata = metadata_cls.__new__(metadata_cls)
-    metadata._ensure_upload_buffers()
+    metadata._msa_block_table_uploads = {}
     metadata._msa_buffers_ready = True
     metadata.request_ids = [0]
     metadata.kv_cache_manager = SimpleNamespace(
@@ -113,6 +113,7 @@ def test_msa_metadata_stages_query_rows_for_dynamic_kv_lens(
     monkeypatch.setattr(msa_backend, "maybe_pin_memory", lambda tensor: tensor)
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     metadata = metadata_cls.__new__(metadata_cls)
+    metadata._msa_block_table_uploads = {}
     metadata._msa_buffers_ready = True
     # One four-token page per request, page id 10 + request id.
     metadata.kv_cache_manager = SimpleNamespace(

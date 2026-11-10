@@ -180,6 +180,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # every MSA metadata buffer is written only by this metadata's own uploads, and the engine gives the CUDA graph
     # metadata private buffers when this is set.
     skips_unchanged_uploads: ClassVar[bool] = True
+    # The block-table upload's DeviceCopyBuffer per destination storage (_upload_block_table). CUDA graph metadata is
+    # a shallow copy that re-runs __post_init__ and keeps this dict: the copies of different batch sizes write the
+    # same graph-metadata buffers, so a write through one copy must make the others send their values again.
+    _msa_block_table_uploads: Optional[dict[int, device_copy.DeviceCopyBuffer]] = None
     # Short-sequence decode-only steps: every query token has at most topk valid blocks, so its selection is all of
     # them, the identity table [kv_heads, tokens, topk] = (i < n_valid ? i : -1), staged here by prepare() and read
     # by run_indexer (and any decode kernel that takes the selection from the metadata). _msa_short_ok says whether
@@ -269,11 +273,29 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self._msa_block_table_uploads is None:
+            self._msa_block_table_uploads = {}
         self._arm_kv_cache_manager()
         params = self.sparse_metadata_params
         self._msa_params = params if isinstance(params, MiniMaxM3SparseMetadataParams) else None
         self._create_msa_buffers()
         self._validate_decode_kernel_support()
+
+    def _upload_block_table(self, dst: torch.Tensor, src: torch.Tensor) -> bool:
+        """Upload the host block table ``src`` (not written again before the copy runs) into ``dst``, a view of
+        msa_block_table; True if issued. With skips_unchanged_uploads only the row span that changed is staged
+        (DeviceCopyBuffer.update's changed_span), which is sound only because this upload is the table's only writer.
+        """
+        if not self.skips_unchanged_uploads:
+            return device_copy.copy(MsaCopySite.BLOCK_TABLE, dst, src)
+        # Keyed by storage: the buffer holds dst, which keeps the storage alive, so a new buffer at a reused address
+        # cannot inherit its record.
+        addr = dst.untyped_storage().data_ptr()
+        buffer = self._msa_block_table_uploads.get(addr)
+        if buffer is None:
+            buffer = device_copy.DeviceCopyBuffer(dst, site=MsaCopySite.BLOCK_TABLE, snapshot=False)
+            self._msa_block_table_uploads[addr] = buffer
+        return buffer.update(src, view=dst, changed_span=True)
 
     @property
     def msa_qo_lens_cpu(self) -> Optional[torch.Tensor]:
@@ -1277,11 +1299,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # A step where a request crossed into a new page changes one entry: with the plan's changed_span only that row
         # span is staged, so the pack keeps fitting an in-graph final flush window. Nothing reads the table on the
         # device before the replay: the forward expands the sub-page table from it (msa_subpage_rows).
-        self._upload_metadata(
-            MsaCopySite.BLOCK_TABLE,
-            self.msa_block_table[:batch_size, :block_table_cols],
-            block_table_host,
-            changed_span=True,
+        self._upload_block_table(
+            self.msa_block_table[:batch_size, :block_table_cols], block_table_host
         )
         device_copy.copy(
             MsaCopySite.SEQ_LENS,
