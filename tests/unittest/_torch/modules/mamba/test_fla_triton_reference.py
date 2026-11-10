@@ -12,9 +12,6 @@ heads, so a kernel that drops or misplaces a tail row or column fails here.
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.chunk_gated_delta_rule import (  # noqa: E501
-    chunk_gated_delta_rule as gdn_op,
-)
 from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
 from tensorrt_llm._torch.modules.fla.l2norm import l2norm_fwd
 
@@ -28,7 +25,7 @@ NUM_K_HEADS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM = 2, 4, 96, 48
 NUM_SLOTS = 8
 #: One pool slot per sequence, out of order; slots 2, 4 and 5 stay untouched.
 SLOTS = (6, 0, 3, 7, 1)
-#: The band of the qwen4_exp test_modeling_v2_chunk_gated_delta_rule.py:
+#: The band of the qwen4_exp test_modeling_v2_flashinfer_chunk_gated_delta_rule.py:
 #: the WY operands are rounded to bf16.
 RTOL, ATOL_OUTPUT, ATOL_STATE = 1.6e-2, 2e-3, 2e-2
 
@@ -54,6 +51,28 @@ def _gdn_operands(device: str, dtype: torch.dtype, seed: int = 2026):
     return [t.to(device) for t in (q, k, v, g, beta, pool, cu_seqlens, indices)]
 
 
+def _fp64_reference(q, k, v, g, beta, pool, indices, cu_seqlens):
+    """`(o, pool as the call leaves it)` from the token-at-a-time recurrence in
+    fp64, rounded once: `o` to `q.dtype`, the states to the pool's dtype."""
+    dt = torch.float64
+    repeats = v.shape[2] // q.shape[2]
+    scale = q.shape[-1] ** -0.5
+    out = torch.zeros(v.shape, dtype=dt, device=q.device)
+    ref_pool = pool.clone()
+    bounds = cu_seqlens.tolist()
+    for n, slot in enumerate(indices.tolist()):
+        state = pool[slot].to(dt)
+        for t in range(bounds[n], bounds[n + 1]):
+            q_t = q[0, t].to(dt).repeat_interleave(repeats, dim=0) * scale
+            k_t = k[0, t].to(dt).repeat_interleave(repeats, dim=0)
+            state = state * g[0, t].to(dt).exp()[:, None, None]
+            u = (v[0, t].to(dt) - (state * k_t[:, None, :]).sum(-1)) * beta[0, t].to(dt)[:, None]
+            state = state + u[:, :, None] * k_t[:, None, :]
+            out[0, t] = (state * q_t[:, None, :]).sum(-1)
+        ref_pool[slot] = state.to(pool.dtype)
+    return out.to(q.dtype), ref_pool
+
+
 def check_chunk_gated_delta_rule(device: str, dtype: torch.dtype) -> None:
     """Packed varlen call with an indexed pool against the fp64 recurrence."""
     q, k, v, g, beta, pool, cu_seqlens, indices = _gdn_operands(device, dtype)
@@ -63,7 +82,7 @@ def check_chunk_gated_delta_rule(device: str, dtype: torch.dtype) -> None:
         inplace_indexed_state_update=True,
         cu_seqlens=cu_seqlens,
     )
-    ref_o, _, ref_pool = gdn_op.reference(q, k, v, g, beta, **kwargs)
+    ref_o, ref_pool = _fp64_reference(q, k, v, g, beta, pool, indices, cu_seqlens)
     pool_before = pool.clone()
 
     o, _ = chunk_gated_delta_rule(q, k, v, g, beta, **kwargs)
