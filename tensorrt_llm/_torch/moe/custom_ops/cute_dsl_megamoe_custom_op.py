@@ -454,8 +454,10 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
 # Static defaults for the explicitly keyed SM107 configurations. Routing is not
 # rank-identical, so each bucket uses one deterministic tactic. The complete
 # runner key prevents applying an entry to a different shape or codegen mode.
-_SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
-    (
+def _sm107_dsv4_pro_problem_key(
+    world_size: int, num_experts_per_rank: int, max_tokens_per_rank: int
+) -> Tuple:
+    return (
         107,
         world_size,
         6,
@@ -474,7 +476,11 @@ _SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
         None,
         None,
         0,
-    ): (
+    )
+
+
+_SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
+    _sm107_dsv4_pro_problem_key(world_size, num_experts_per_rank, max_tokens_per_rank): (
         list(mma_tiler),
         [4, 1, 1],
         [2, 1, 1],
@@ -509,6 +515,43 @@ _SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
         flag_batch,
     ) in bucket_tactics.items()
 }
+
+# DSv4-Pro (world_size, num_experts_per_rank) -> inclusive max_tokens_per_rank range whose
+# default turns combine_dedup on. Only buckets measured faster are listed: dedup trims the
+# combine traffic by the duplicate-destination rate, which falls as the world size grows.
+_SM107_DSV4_PRO_COMBINE_DEDUP_TOKENS: dict[Tuple[int, int], Tuple[int, int]] = {
+    (4, 96): (8192, 32768),
+    (8, 48): (4096, 16384),
+    (16, 24): (8192, 8192),
+}
+
+
+def _sm107_default_combine_dedup(problem_key: Tuple) -> bool:
+    tokens = _SM107_DSV4_PRO_COMBINE_DEDUP_TOKENS.get((problem_key[1], problem_key[3]))
+    return (
+        tokens is not None
+        and tokens[0] <= problem_key[7] <= tokens[1]
+        and _sm107_tactic_bucket(problem_key[7]) is None
+        and problem_key
+        == _sm107_dsv4_pro_problem_key(problem_key[1], problem_key[3], problem_key[7])
+    )
+
+
+def _with_combine_dedup(tactic: Tuple) -> Tuple:
+    """Return ``tactic`` with combine dedup and the token-back settings it needs.
+
+    Dedup pushes the reduced rows from the dispatch warps, which need the N256
+    tile and a bulk FC2 store; the remaining fields keep the shape default.
+    """
+    tactic = list(_unpack_tactic(tactic))
+    tactic[0] = [tactic[0][0], 256, tactic[0][2]]
+    tactic[5] = "reuse_dispatch_warps"
+    tactic[6] = True
+    if tactic[7] is None:
+        tactic[7] = 1
+    tactic[8] = 1
+    tactic[11] = True
+    return tuple(tactic)
 
 
 # Static default for the SM107 Kimi K3 NVFP4 generation-phase shape at EP4. The full runner
@@ -802,8 +845,11 @@ def _default_megamoe_tactic_for_problem(
     return default_megamoe_tactic(num_tokens)
 
 
-def _default_megamoe_tactic_for_key(problem_key: Tuple, *, num_tokens: int) -> Tuple:
-    return _default_megamoe_tactic_for_problem(
+def _default_megamoe_tactic_for_key(
+    problem_key: Tuple, *, num_tokens: int, combine_dedup: bool = True
+) -> Tuple:
+    """Default tactic for ``problem_key``; ``combine_dedup=False`` returns it without the dedup rule."""
+    tactic = _default_megamoe_tactic_for_problem(
         sm_version=problem_key[0],
         max_tokens_per_rank=problem_key[7],
         num_tokens=num_tokens,
@@ -813,6 +859,9 @@ def _default_megamoe_tactic_for_key(problem_key: Tuple, *, num_tokens: int) -> T
         shape_tuned_tactic=_SM107_DSV4_PRO_DEFAULT_TACTICS.get(problem_key),
         genphase_shape_tuned_tactic=_SM107_KIMI_K3_GENPHASE_TACTICS.get(problem_key),
     )
+    if combine_dedup and _sm107_default_combine_dedup(problem_key):
+        return _with_combine_dedup(tactic)
+    return tactic
 
 
 def _megamoe_default_tactic_candidates(tactic: Tuple) -> Tuple[Tuple, ...]:
@@ -2305,7 +2354,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             )
             return probe
 
-        probe, _ = _resolve_megamoe_kernel_tactic(
+        probe, resolved = _resolve_megamoe_kernel_tactic(
             tactic,
             allow_fallback=use_default_tactic,
             build=build,
@@ -2314,6 +2363,17 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # otherwise the provider carves an undersized shared region and the
         # combine staging writes OOB (single-rank IMA; EP>1 looks like a hang).
         _, shared_bytes = probe.get_workspace_sizes()
+        if use_default_tactic and _unpack_tactic(resolved)[11]:
+            # A dedup default's combine region holds world_size rows per token, the
+            # non-dedup one top-k rows; autotuned tactics never dedup, so fit both.
+            plain, _ = _resolve_megamoe_kernel_tactic(
+                _default_megamoe_tactic_for_key(
+                    problem_key, num_tokens=max_tokens_per_rank, combine_dedup=False
+                ),
+                allow_fallback=True,
+                build=build,
+            )
+            shared_bytes = max(shared_bytes, plain.get_workspace_sizes()[1])
         return int(shared_bytes), isinstance(probe, RubinInferenceGenphaseMegaMoE)
 
     def _megamoe_autotune_num_tokens(shapes: List[torch.Size]) -> int:
@@ -2506,6 +2566,14 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     default_tactic = _unpack_tactic(default_tactic)
                     if default_tactic not in candidates:
                         candidates.append(default_tactic)
+            # The provider fits a dedup default and its non-dedup base (see
+            # query_megamoe_kernel_properties); no other dedup tactic is sized for.
+            if _sm107_default_combine_dedup(self.unique_id()):
+                default_tactic = _default_megamoe_tactic_for_key(
+                    self.unique_id(), num_tokens=num_tokens
+                )
+                if default_tactic not in candidates:
+                    candidates.append(default_tactic)
             choices = _token_back_ready_granularity_choices(
                 load_balance=self.helper_expert_count > 0
             )

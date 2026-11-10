@@ -16,8 +16,8 @@
 
 Execute production host definitions with CUDA imports replaced by metadata
 stubs. These checks establish the tactic format, validation, consumer
-selection and cache keys; the problem-level preconditions (top-k at FC1, BF16
-combine, world size) are enforced by the kernel itself and are not covered here.
+selection, cache keys and the default rule; the kernel enforces the
+problem-level preconditions (top-k at FC1, BF16 combine, world size) itself.
 """
 
 from __future__ import annotations
@@ -254,7 +254,7 @@ def test_dedup_never_reaches_a_kernel_without_the_option(
         op._construct_megamoe_kernel(sm_version=sm_version, common=common, combine_format="bf16")
 
 
-def test_default_and_autotune_tactics_never_select_dedup(op: types.ModuleType) -> None:
+def test_shape_defaults_and_autotune_space_never_select_dedup(op: types.ModuleType) -> None:
     for tokens in (32, 256, 1024, 4096, 8192, 16384):
         for in_kernel in (False, True):
             tactic = op._default_megamoe_tactic_for_problem(
@@ -268,8 +268,8 @@ def test_default_and_autotune_tactics_never_select_dedup(op: types.ModuleType) -
             assert len(tactic) == 12 and tactic[11] is False
     for table in (op._SM107_DSV4_PRO_DEFAULT_TACTICS.values(), op._SM107_GENPHASE_TACTICS.values()):
         assert all(op._unpack_tactic(tactic)[11] is False for tactic in table)
-    # The provider and the profiling scratch are sized from the default kernel, and a dedup
-    # kernel needs a larger shared workspace at EP >= 8, so autotune never proposes it.
+    # The provider is sized for the default and its non-dedup base only, so the
+    # tuning space never proposes any other dedup tactic.
     for sm_version in (100, 107):
         for tokens in (64, 4096, 16384):
             for load_balance in (False, True):
@@ -277,3 +277,87 @@ def test_default_and_autotune_tactics_never_select_dedup(op: types.ModuleType) -
                     tokens, sm_version, load_balance=load_balance
                 )
                 assert candidates and all(len(t) == 12 and t[11] is False for t in candidates)
+
+
+def _dedup_cells(op: types.ModuleType) -> list[tuple[int, int, int]]:
+    return [
+        (world, experts, tokens)
+        for (world, experts), (low, high) in op._SM107_DSV4_PRO_COMBINE_DEDUP_TOKENS.items()
+        for tokens in sorted({low, (low + high) // 2, high})
+    ]
+
+
+def test_default_turns_dedup_on_only_in_the_measured_ranges(op: types.ModuleType) -> None:
+    on = set(_dedup_cells(op))
+    assert on
+    for world, experts in ((4, 96), (8, 48), (16, 24), (32, 12)):
+        for tokens in (256, 1024, 2048, 4096, 6144, 8192, 12288, 16384, 32768):
+            key = op._sm107_dsv4_pro_problem_key(world, experts, tokens)
+            tactic = op._default_megamoe_tactic_for_key(key, num_tokens=tokens)
+            low, high = op._SM107_DSV4_PRO_COMBINE_DEDUP_TOKENS.get((world, experts), (1, 0))
+            assert tactic[11] is (low <= tokens <= high)
+            base = op._default_megamoe_tactic_for_key(key, num_tokens=tokens, combine_dedup=False)
+            assert base[11] is False
+            if not tactic[11]:
+                assert tactic == base
+                continue
+            op.validate_megamoe_tactic(tactic, sm_version=107)
+            # Same tactic as the measured reuse + dedup arm: only the token-back fields move.
+            assert tactic[0][1] == 256 and tactic[5:7] == ("reuse_dispatch_warps", True)
+            assert tactic[8] == 1 and tactic[7] == (base[7] or 1)
+            assert tactic[1:5] == base[1:5] and tactic[9:11] == base[9:11]
+    assert all(world <= 32 and tokens > 1024 for world, _, tokens in on)
+
+
+@pytest.mark.parametrize(
+    "index, value",
+    [
+        (0, 100),  # SM100 kernel
+        (2, 8),  # top-k
+        (4, 4096),  # hidden size
+        (9, False),  # top-k at FC2
+        (10, None),  # gate/up clamp
+        (13, True),  # in-kernel FC2 reduce
+        (14, "32e4m3xe8m0"),  # quantized combine
+        (17, 2),  # helper experts
+    ],
+)
+def test_default_keeps_dedup_off_outside_the_measured_problem(
+    op: types.ModuleType, index: int, value: object
+) -> None:
+    for world, experts, tokens in _dedup_cells(op):
+        key = list(op._sm107_dsv4_pro_problem_key(world, experts, tokens))
+        key[index] = value
+        assert op._sm107_default_combine_dedup(tuple(key)) is False
+
+
+def test_query_sizes_the_provider_for_dedup_and_its_base(
+    op: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def sizes(kernel: _KernelMetadata) -> tuple[int, int]:
+        rows = kernel.problem["world_size"] if kernel.implementation.get("combine_dedup") else 6
+        return 384, rows * 128
+
+    monkeypatch.setattr(_KernelMetadata, "get_workspace_sizes", sizes)
+    # The shape defaults launch [4, 1, 1] clusters with a [2, 1, 1] fallback.
+    monkeypatch.setattr(op, "_max_active_clusters", lambda size, *args: 184 // size)
+    for world, experts, tokens in _dedup_cells(op):
+        query = dict(
+            world_size=world,
+            num_topk=6,
+            num_experts_per_rank=experts,
+            hidden_size=7168,
+            intermediate_size_per_partition=3072,
+            expand_intermediate_size_per_partition=6144,
+            max_tokens_per_rank=tokens,
+            gate_up_clamp=10.0,
+        )
+        assert op.query_megamoe_kernel_properties(**query) == (max(world, 6) * 128, False)
+        key = op._sm107_dsv4_pro_problem_key(world, experts, tokens)
+        runner = op.Sm100MegaMoENvfp4Runner(**_problem(**query, output_dtype="torch.bfloat16"))
+        assert runner.unique_id() == key
+        default = op._default_megamoe_tactic_for_key(key, num_tokens=tokens)
+        assert runner._build_kernel_once(default).implementation["combine_dedup"] is True
+        inputs = [SimpleNamespace(shape=(tokens, 7168))]
+        tactics = runner.get_valid_tactics(inputs, None)
+        assert [t for t in tactics if op._unpack_tactic(t)[11]] == [default]
