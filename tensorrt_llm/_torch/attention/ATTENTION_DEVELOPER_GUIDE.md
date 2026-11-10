@@ -377,9 +377,9 @@ workspace, page-table KV metadata, and prefill/decode wrapper state.
 sparse-specific runtime state (indexer buffers, routing state, side-cache
 state).
 
-Two class-level `TrtllmAttentionMetadata` hooks let a metadata family decide
+A class-level `TrtllmAttentionMetadata` hook lets a metadata family decide
 engine behaviour that depends on what its own `prepare()` does, instead of a
-model arming it from outside (MiniMax-M3's MSA metadata sets both):
+model arming it from outside (MiniMax-M3's MSA metadata sets it):
 
 - `skips_unchanged_uploads`: its per-step uploads (`_upload_metadata`) skip
   values their destination already holds. This is sound only while nothing
@@ -391,11 +391,16 @@ model arming it from outside (MiniMax-M3's MSA metadata sets both):
   into a block rerun at each replay, so only a destination its upload alone
   writes (MSA's block table) goes through `_upload_metadata`; the others use
   the never-skipping `device_copy.copy` / `device_copy.fill_tail`.
-- `short_long_seq_len_threshold(sparse_config, tokens_per_gen_step)`: a
-  sequence length at which `prepare()` stages different work, so the runner
-  keys decode CUDA graphs by short and long contexts. The runner passes one
-  generation step's tokens as headroom: the graph key's host length estimate
-  misses up to the in-flight step's accepted tokens.
+
+The sparse attention config decides whether decode CUDA graphs are keyed by
+short and long contexts: `BaseSparseAttentionConfig.short_long_seq_len_threshold(
+tokens_per_gen_step)` returns the sequence length that splits them, or None.
+`SeqLenAwareSparseAttentionConfig` returns its `seq_len_threshold` when it asks
+for the split; `MiniMaxM3SparseAttentionConfig` returns the top-k blocks' token
+span for the MSA implementation, within which MSA's `prepare()` stages the
+identity selection. The decoder runner passes one generation step's tokens as
+headroom: the graph key's host length estimate misses up to the in-flight
+step's accepted tokens.
 
 `SparseRuntimeParams` is the backend-to-`AttentionOp` carrier only on the
 `TrtllmAttention` path. Its fields are algorithm-specific, not a generic

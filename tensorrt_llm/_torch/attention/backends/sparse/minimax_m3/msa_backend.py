@@ -184,7 +184,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # them, the identity table [kv_heads, tokens, topk] = (i < n_valid ? i : -1), staged here by prepare() and read
     # by run_indexer (and any decode kernel that takes the selection from the metadata). _msa_short_ok says whether
     # this step staged it. Because a captured decode graph bakes that choice in, the engine keys decode graphs by
-    # short and long contexts (short_long_seq_len_threshold).
+    # short and long contexts (MiniMaxM3SparseAttentionConfig.short_long_seq_len_threshold).
     msa_short_table: Optional[torch.Tensor] = None
     _msa_short_ok: bool = False
     # The same page table and lengths as msa_kv_indices / msa_kv_lens, in the
@@ -258,21 +258,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # True only with speculative decoding; otherwise on_update_kv_lens and its
     # staging are skipped and non-speculative steps run as before.
     _msa_kv_lens_dynamic: bool = False
-
-    @classmethod
-    def short_long_seq_len_threshold(
-        cls, sparse_attention_config, tokens_per_gen_step: int = 0
-    ) -> Optional[int]:
-        """The total sequence length that splits the short and long decode graph families: the top-k blocks'
-        token span, within which a decode step selects every valid block (see msa_short_table), less
-        ``tokens_per_gen_step``. The short family runs the identity selection, so every token it attends must fit in
-        the top-k blocks; the graph key estimates a sequence's length from host token counts, which under the overlap
-        scheduler miss up to the in-flight step's accepted tokens."""
-        topk = getattr(sparse_attention_config, "sparse_topk_blocks", None)
-        block = getattr(sparse_attention_config, "sparse_block_size", None)
-        if topk is None or block is None:
-            return None
-        return int(topk) * int(block) - tokens_per_gen_step
 
     def _arm_kv_cache_manager(self) -> None:
         """Let the MiniMax-M3 KV cache manager skip unchanged block-offset gathers into this metadata's buffers: like

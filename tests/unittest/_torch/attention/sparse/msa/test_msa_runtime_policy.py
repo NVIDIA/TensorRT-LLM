@@ -615,21 +615,6 @@ def test_msa_metadata_skips_unchanged_uploads_and_arms_its_manager(manager):
 
     assert MiniMaxM3MsaSparseAttentionMetadata.skips_unchanged_uploads
     assert not TrtllmAttentionMetadata.skips_unchanged_uploads
-    assert (
-        MiniMaxM3MsaSparseAttentionMetadata.short_long_seq_len_threshold(
-            MiniMaxM3SparseAttentionConfig(sparse_topk_blocks=16, sparse_block_size=128)
-        )
-        == 16 * 128
-    )
-    # One generation step's tokens of headroom for the in-flight step's accepted tokens.
-    assert (
-        MiniMaxM3MsaSparseAttentionMetadata.short_long_seq_len_threshold(
-            MiniMaxM3SparseAttentionConfig(sparse_topk_blocks=16, sparse_block_size=128),
-            tokens_per_gen_step=4,
-        )
-        == 16 * 128 - 4
-    )
-    assert TrtllmAttentionMetadata.short_long_seq_len_threshold(None) is None
     assert not manager.skip_unchanged_block_offsets
     metadata = object.__new__(MiniMaxM3MsaSparseAttentionMetadata)
     metadata.kv_cache_manager = manager

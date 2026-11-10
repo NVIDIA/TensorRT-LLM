@@ -477,16 +477,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self._upload_buffers[addr] = buffer
         return buffer
 
-    @classmethod
-    def short_long_seq_len_threshold(
-            cls,
-            sparse_attention_config,
-            tokens_per_gen_step: int = 0) -> Optional[int]:
-        """The total sequence length splitting this metadata's decode CUDA graphs into short and long families, or
-        None for one family. A metadata class whose prepare() stages different work for short contexts sets it;
-        ``tokens_per_gen_step`` is the headroom for the in-flight step's tokens the graph key cannot see."""
-        return None
-
     def _upload_metadata(self,
                          site: CopySiteEnum,
                          dst: torch.Tensor,

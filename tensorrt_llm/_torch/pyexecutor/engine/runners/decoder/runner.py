@@ -62,11 +62,7 @@ from tensorrt_llm._torch.utils import (
     with_model_extra_attrs,
 )
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.llmapi.llm_args import (
-    BaseSparseAttentionConfig,
-    PrefillCudaGraphBackend,
-    SeqLenAwareSparseAttentionConfig,
-)
+from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, PrefillCudaGraphBackend
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -517,29 +513,13 @@ class DecoderRunner(ScheduledModelRunner):
         )
 
     def _short_long_seq_len_threshold(self) -> int | None:
-        """The total sequence length that splits the short and long decode graph families, or None for one family.
-
-        Set by a sparse attention config that asks for the split, or by the attention metadata
-        class when its prepare() stages different work for short contexts (MiniMax-M3 MSA's
-        identity selection: a sequence within the top-k blocks attends every valid block). The graph
-        key estimates a sequence's length from host token counts, which under the overlap scheduler
-        miss up to the in-flight step's accepted tokens, so the class is given one generation step's
-        tokens of headroom.
-        """
+        """The total sequence length that splits the short and long decode graph families, or None for one family,
+        as the sparse attention config sets it, given one generation step's tokens of headroom."""
         sparse_config = self._sparse_attention_config
-        if (
-            isinstance(sparse_config, SeqLenAwareSparseAttentionConfig)
-            and sparse_config.needs_separate_short_long_cuda_graphs()
-        ):
-            return sparse_config.seq_len_threshold
-        threshold = getattr(
-            self._config.attention_backend.Metadata, "short_long_seq_len_threshold", None
-        )
-        if threshold is None:
+        if sparse_config is None:
             return None
-        return threshold(
-            sparse_config,
-            tokens_per_gen_step=self._get_runtime_tokens_per_gen_step(self._config.max_draft_len),
+        return sparse_config.short_long_seq_len_threshold(
+            tokens_per_gen_step=self._get_runtime_tokens_per_gen_step(self._config.max_draft_len)
         )
 
     def _initialize_breakable_cuda_graph_runner(self) -> BreakableCUDAGraphRunner | None:
