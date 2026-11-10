@@ -1969,7 +1969,9 @@ class GenphaseTokenComm(KernelComponent):
             # reset them for the previous call before this call's increments land.
             self._tail.wait_previous_done(device_workspace, previous_done)
             counter_address = device_workspace.ptr(self.token_data_ready_region).toint()
-            red_add_relaxed_sys_s32(peer_rank_ptr_mapper.map(counter_address, lane_idx, Int64(0)), Int32(1))
+            # Lane l signals peers l, l + 32, ...: every rank gets its flag for any world size.
+            for peer in cutlass.range(lane_idx, self.world_size, 32):
+                red_add_relaxed_sys_s32(peer_rank_ptr_mapper.map(counter_address, peer, Int64(0)), Int32(1))
 
     @cute.jit
     def _publish_payload_flags(
