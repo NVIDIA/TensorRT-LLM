@@ -43,9 +43,7 @@ trtllm-eval --model /path/to/image-model image_generation_eval \
   --evaluator /path/to/Qwen-Image-Bench \
   --evaluator-options qwen-image-bench.yaml \
   --prompts prompts.jsonl \
-  --output-dir results \
-  --criteria Quality \
-  --criteria Alignment
+  --output-dir results
 ```
 
 The evaluator YAML is optional; omit `--evaluator-options` to use all defaults.
