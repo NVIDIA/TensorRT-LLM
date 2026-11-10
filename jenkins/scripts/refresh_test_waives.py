@@ -156,8 +156,11 @@ def _test_name(case: ET.Element, stage_name: str) -> str:
     filename = case.get("file", "")
     if not filename:
         return ""
-    name = parse_name(case.get("classname", ""), case.get("name", ""), filename)
-    return name.removeprefix(stage_name + "/")
+    classname = case.get("classname", "")
+    name = parse_name(classname, case.get("name", ""), filename).removeprefix(stage_name + "/")
+    if not name.startswith("unittest/") and classname.startswith(stage_name + ".unittest."):
+        name = "unittest/" + name
+    return name
 
 
 def _waive_names(case: ET.Element, stage_name: str) -> list[str]:
