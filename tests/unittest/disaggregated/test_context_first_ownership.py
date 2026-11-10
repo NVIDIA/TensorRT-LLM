@@ -155,6 +155,9 @@ def test_native_ownership_selection_preserves_legacy_generation_first(
     assert not worker._retirement_watchdog._owners
 
 
+_KV_RESULT_REPORT_TOKEN = b"report-token-123"
+
+
 def _native_pair(
     monkeypatch: pytest.MonkeyPatch, *, completes: bool
 ) -> tuple[
@@ -175,11 +178,14 @@ def _native_pair(
     assert recv_task is not None
     recv_task.expected_transfers = 1
     assert rx.try_begin_transfer(recv_task.slice_id, {"ctx"}, writer_cohort={0})
+    recv_task._kv_result_report_tokens[0] = _KV_RESULT_REPORT_TOKEN
     assert worker._sender._begin_task_operation(send_task, 0)
     status = Mock(wait=Mock(return_value=completes), is_completed=Mock(return_value=completes))
     status.last_status_str.return_value = "ERROR"
     worker._sender._agent = SimpleNamespace(
-        name="nixl", submit_transfer_requests=Mock(return_value=status)
+        name="nixl",
+        check_remote_descs=Mock(return_value=True),
+        submit_transfer_requests=Mock(return_value=status),
     )
     request = SimpleNamespace(op="WRITE", remote_name="gen")
     monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", Mock(return_value=request))
@@ -202,6 +208,7 @@ def _native_pair(
         receiver_slice_id=0,
         is_last_slice=True,
         meta_type=transfer_mod.WriteMetaType.KV,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
     return worker, tx, rx, meta, request, status, dealer
 

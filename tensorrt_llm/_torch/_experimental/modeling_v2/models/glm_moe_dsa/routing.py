@@ -133,14 +133,14 @@ def route(
         pretrained_config.q_lora_rank,
     )
     index_n_heads = getattr(pretrained_config, "index_n_heads", None)
-    # tp16: attention heads and the expert intermediate dimension sharded over
-    # 16 ranks, no attention DP, no expert parallelism. A weight-layout
+    # pure TP: attention heads and the expert intermediate dimension sharded over
+    # 4, 8, or 16 ranks, no attention DP, no expert parallelism. A weight-layout
     # question, which is why it selects a target rather than a runtime branch.
-    tp16 = (
-        mapping.world_size == 16
-        and mapping.tp_size == 16
+    pure_tp = (
+        mapping.tp_size in (4, 8, 16)
+        and mapping.world_size == mapping.tp_size
         and mapping.moe_ep_size == 1
-        and mapping.moe_tp_size == 16
+        and mapping.moe_tp_size == mapping.tp_size
         and not mapping.enable_attention_dp
         and mapping.pp_size == 1
         and mapping.cp_size == 1
@@ -155,22 +155,18 @@ def route(
         and getattr(spec_config, "eagle_choices", None) is None
         and spec_config.max_total_draft_tokens == spec_config.max_draft_len
     )
-    # GLM-5.2-NVFP4 on 16 Rubin GPUs (sm107), tp16, MTP-Eagle or no speculation.
+    # GLM-5.2-NVFP4 on Rubin (sm107), TP4/TP8/TP16, MTP-Eagle or no speculation.
     if (
         compute_capability == (10, 7)
         and shape == _SHAPE
-        and tp16
+        and index_n_heads == 32
+        and pure_tp
         and mtp_eagle_or_none
         and kv_cache_quant_algo == QuantAlgo.FP8
     ):
-        # One line on purpose: the claims suite reads the routed targets off
-        # `from .<target>.modeling import <Class>` lines.
-        # fmt: off
-        # isort: off
-        from .glm_5_2_nvfp4__sm_107__tp16.modeling import ModelingV2Glm52Nvfp4Sm107Tp16
-        # isort: on
-        # fmt: on
-        return ModelingV2Glm52Nvfp4Sm107Tp16
+        from .glm_5_2_nvfp4__sm_107__low_latency.modeling import ModelingV2Glm52Nvfp4Sm107LowLatency
+
+        return ModelingV2Glm52Nvfp4Sm107LowLatency
 
     # tep4: the attention heads and the dense MLPs sharded four ways, the experts
     # sharded four ways. Attention DP would replicate attention, which is a
@@ -263,7 +259,7 @@ def route(
         f"moe_tp={mapping.moe_tp_size} attention_dp={mapping.enable_attention_dp} "
         f"pp={mapping.pp_size} cp={mapping.cp_size}, speculative decoding {spec}; "
         f"KV cache {kv_cache_quant_algo or 'bf16'}; "
-        "the glm_moe_dsa targets are GLM-5.2-NVFP4 on sm107, tp16 (16 ranks, "
+        "the glm_moe_dsa targets are GLM-5.2-NVFP4 on sm107, TP4/TP8/TP16 (4/8/16 ranks, "
         "tensor-parallel attention and experts, no attention DP), with one-model "
         "MTP-Eagle as a linear chain or no speculative decoding; GLM-5.2-NVFP4 "
         "on sm103, tep4 (4 ranks, tensor-parallel attention, expert-parallel MoE), "

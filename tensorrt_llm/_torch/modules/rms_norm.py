@@ -23,7 +23,9 @@ from torch import nn
 from ..._utils import get_sm_version
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..utils import Fp4QuantizedTensor, is_nvfp4_marlin_enabled
+from ..utils import (Fp4QuantizedTensor, Fp8PerTokenQuantizedTensor,
+                     is_nvfp4_marlin_enabled)
+from .rms_norm_fp8_per_token import add_rms_norm_fp8_per_token
 
 # Hidden-dim bounds of the warp-specialized fused_add_rms_norm_quant kernel
 # (cpp/tensorrt_llm/thop/fusedAddRMSNormQuant.cpp).
@@ -88,14 +90,13 @@ class RMSNorm(nn.Module):
 
         # The fused NVFP4 epilogue (cvt_warp_fp16_to_fp4 in quantization.cuh) is
         # guarded by __CUDA_ARCH__ >= 1000, so it only produces correct FP4 on
-        # SM 10.x (Blackwell); SM 12.x lacks the warp-cooperative SF path. On
-        # unsupported SMs (incl. SM 9.x / Hopper, where the epilogue would
-        # silently emit zeros) fall back to flashinfer/generic RMSNorm and let
-        # the downstream linear layer handle FP4 quantization.
+        # SM 10.x and later. On older SMs (SM 9.x / Hopper, where the epilogue
+        # would silently emit zeros) fall back to flashinfer/generic RMSNorm and
+        # let the downstream linear layer handle FP4 quantization.
         if self.is_nvfp4:
             sm_version = get_sm_version()
             # Marlin is also incompatible with the fused NVFP4 path.
-            if not (100 <= sm_version < 120) or is_nvfp4_marlin_enabled():
+            if sm_version < 100 or is_nvfp4_marlin_enabled():
                 self.is_nvfp4 = False
                 return_hp_output = False
         self.return_hp_output = return_hp_output
@@ -107,6 +108,11 @@ class RMSNorm(nn.Module):
         # attaches it afterwards (DeepseekV3 post_load_weights /
         # MLA._resolve_qa_fused_scale). None keeps the fusion disabled.
         self.nvfp4_scale: Optional[torch.Tensor] = None
+        # (1 + weight) for gemma norms, cached by the owning model.
+        self._fused_norm_weight: Optional[torch.Tensor] = None
+        # When set, forward returns an Fp8PerTokenQuantizedTensor that also
+        # carries the BF16/FP16 normed output.
+        self.fp8_per_token_out = False
 
     def forward(
         self,
@@ -136,9 +142,20 @@ class RMSNorm(nn.Module):
         # (e.g. a layer's first input_layernorm whose consumer has no static
         # scale), fall through to the plain norm below.
         nvfp4_scale = self.nvfp4_scale if self.is_nvfp4 else None
-        if nvfp4_scale is not None and not self.use_gemma:
+        if nvfp4_scale is not None and (not self.use_gemma
+                                        or self._fused_norm_weight is not None):
             return self._fused_nvfp4_quant(hidden_states, residual, nvfp4_scale,
                                            return_norm_out)
+
+        if self.fp8_per_token_out and hidden_states.dtype in (torch.float16,
+                                                              torch.bfloat16):
+            normed, fp8, scale = add_rms_norm_fp8_per_token(
+                hidden_states, residual, self.weight, self.variance_epsilon,
+                self.use_gemma)
+            # Zero-token inputs skip the FP8 consumer, so stay high precision.
+            out = (Fp8PerTokenQuantizedTensor(fp8, scale, normed)
+                   if hidden_states.shape[0] != 0 else normed)
+            return (out, residual) if has_residual else out
 
         if self.return_hp_output:
             raise ValueError(
@@ -223,6 +240,9 @@ class RMSNorm(nn.Module):
         and always use reduce_fusion. See _WS_M_THRESHOLD / _WS_MIN_N."""
         if residual is None:
             return False
+        # The ws kernel needs more shared memory than SM 12.x provides.
+        if get_sm_version() >= 120:
+            return False
         n = hidden_states.shape[-1]
         if not (_WS_MIN_N <= n <= _WS_MAX_N and n % 16 == 0):
             return False
@@ -234,6 +254,9 @@ class RMSNorm(nn.Module):
         # ws requires contiguous rank-2 input + residual (it cannot read a
         # row-strided column slice and issues padded vectorized stores).
         return hidden_states.is_contiguous() and residual.is_contiguous()
+
+    def _quant_norm_weight(self) -> torch.Tensor:
+        return self._fused_norm_weight if self.use_gemma else self.weight
 
     def _fused_nvfp4_quant(
         self,
@@ -260,6 +283,22 @@ class RMSNorm(nn.Module):
         # Either flag means "also produce the BF16 normed value".
         want_norm = return_norm_out or self.return_hp_output
 
+        if hidden_states.shape[0] == 0:
+            n = hidden_states.shape[-1]
+            act_fp4 = hidden_states.new_empty(
+                (*hidden_states.shape[:-1], n // 2), dtype=torch.uint8)
+            act_sf = hidden_states.new_empty((0, ), dtype=torch.uint8)
+            norm_out = torch.empty_like(hidden_states) if want_norm else None
+            fp4 = Fp4QuantizedTensor(act_fp4,
+                                     act_sf,
+                                     unquantized_hidden_states=norm_out)
+            if residual is None:
+                return (fp4, norm_out) if return_norm_out else fp4
+            outputs = [fp4, residual]
+            if self.return_hp_output:
+                outputs.append(norm_out)
+            return tuple(outputs)
+
         if self._ws_kernel_eligible(hidden_states, residual):
             return self._fused_nvfp4_quant_ws(hidden_states, residual, sf_scale,
                                               return_norm_out)
@@ -268,7 +307,7 @@ class RMSNorm(nn.Module):
             results = torch.ops.trtllm.fused_add_rmsnorm_fp4_quantize(
                 hidden_states,
                 residual,
-                self.weight,
+                self._quant_norm_weight(),
                 sf_scale,
                 float(self.variance_epsilon),
                 want_norm,
@@ -291,7 +330,7 @@ class RMSNorm(nn.Module):
         hs_2d = hidden_states.reshape(-1, n)
         results = torch.ops.trtllm.fused_rmsnorm_fp4_quantize(
             hs_2d,
-            self.weight,
+            self._quant_norm_weight(),
             sf_scale,
             float(self.variance_epsilon),
             want_norm,
@@ -325,7 +364,7 @@ class RMSNorm(nn.Module):
         n = int(orig_shape[-1])
         hs_2d = hidden_states.reshape(-1, n).contiguous()
         res_2d = residual.reshape(-1, n).contiguous()
-        gamma = self.weight.contiguous()
+        gamma = self._quant_norm_weight().contiguous()
 
         results = torch.ops.trtllm.fused_add_rms_norm_quant(
             hs_2d,
