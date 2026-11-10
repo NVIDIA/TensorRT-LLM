@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Certification matrix for the FP8 target's MoE all-to-all round trip (`moe_a2a_dispatch` and
 `moe_a2a_combine` on the stock NVLink one-sided all-to-all) at dep2 and dep4 under mpirun, eagerly
-and graph-replayed. Passes without checking where the platform has no MNNVL."""
+and graph-replayed. Fails where the platform has no MNNVL (the collected test skips there first)."""
 
 import os
 import sys
@@ -176,9 +176,9 @@ def _run_one_mpi_rank() -> int:
     max_rows = max(max(c.spec["counts"]) for c in entry.moe_a2a_dispatch.CELLS)
     STRATEGY = entry.build_strategy(mapping, max_rows)
     if STRATEGY is None:
-        print(f"[rank {RANK}] no MNNVL on this platform: nothing to certify", flush=True)
+        print(f"[rank {RANK}] no MNNVL on this platform: nothing certified", flush=True)
         MPI_RANK.MPI.Finalize()
-        os._exit(0)
+        os._exit(1)
     _lockstep.run_checks(MPI_RANK, list(CHECKS))
     torch.cuda.synchronize()
     print(f"[rank {RANK}] {len(CHECKS)} checks passed over the MPI session", flush=True)

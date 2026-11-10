@@ -261,6 +261,9 @@ class _TopkRowsKernel:
             state[4] = cutlass.Int32(1)
             state[5] = cutlass.Int32(0)  # candidates compacted
             state[6] = cutlass.Int32(0)
+        # Thread 0's reset of the candidate counter must be visible to every warp's `_compact`
+        # atomic below: the `n > k` path has a barrier of its own, a row of <= k blocks does not.
+        cute.arch.sync_threads()
         n = mEnd[row]
         seqlen = mLen[row]
         visible = cutlass.Int32(mPos[row]) + 1
