@@ -122,6 +122,7 @@ from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV4MoeRoutingMethod
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
     FlashinferTrtllmGenBf16Impl,
     TrtllmTrtllmGenNvfp4Impl,
+    TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
     TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
     find_trtllm_gen_leaf,
 )
@@ -530,6 +531,31 @@ def test_registering_megamoe_cutedsl_leaves_the_backend_literal_path_unchanged()
     assert impl_class_for(report) is TrtllmCutedslMegaMoeNvfp4Impl
     assert report.selected_by == "pinned"
     assert report.requested == MoeBackendType.MEGAMOE_CUTEDSL.value
+
+
+def test_megamoe_cutedsl_tries_trtllm_gen_before_the_cutlass_fallback():
+    trtllm_gen = [impl for impl in IMPL_PRIORITY if impl in BACKEND_FAMILY["TRTLLM"]]
+    assert moe_resolution._candidates_for("MEGAMOE_CUTEDSL") == [
+        TrtllmCutedslMegaMoeNvfp4Impl,
+        *trtllm_gen,
+        *CUTLASS_LEAVES,
+    ]
+
+
+def test_megamoe_cutedsl_runs_a_layer_of_another_format_on_trtllm_gen():
+    """MXFP4 experts (the MTP layer of an NVFP4 DeepSeek-V4 checkpoint) degrade to the
+    TRTLLM-Gen leaf for their format, and the report names the MegaMoE rejection."""
+    report = resolve_moe_impl(
+        _megamoe_cutedsl_model_config(),
+        problem=_megamoe_cutedsl_problem(QuantAlgo.W4A8_MXFP4_MXFP8),
+        deployment=_megamoe_cutedsl_deployment(),
+    )
+
+    assert impl_class_for(report) is TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl
+    assert report.degraded
+    assert report.degraded_from.legacy_backend == TrtllmCutedslMegaMoeNvfp4Impl.__name__
+    assert report.degraded_from.reason is MoERejectReason.QUANT_UNSUPPORTED
+    assert TrtllmCutlassW4a8Mxfp4Mxfp8Impl.__name__ in report.eligible
 
 
 # =====================================================================
