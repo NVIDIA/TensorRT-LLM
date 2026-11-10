@@ -116,7 +116,9 @@ def _barrier_events(fn: ast.FunctionDef, barrier: str) -> list[tuple]:
         if _callee(call) == "cute.arch.mbarrier_arrive":
             events.append(("arrive",))
         elif _callee(call) == "cute.arch.mbarrier_wait":
-            assert isinstance(call.args[1], ast.Constant), ast.unparse(call)
+            assert len(call.args) > 1 and isinstance(call.args[1], ast.Constant), (
+                f"expected a constant parity as the second positional argument: {ast.unparse(call)}"
+            )
             events.append(("wait", call.args[1].value))
     return events
 
