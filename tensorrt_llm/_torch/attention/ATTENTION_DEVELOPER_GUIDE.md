@@ -507,8 +507,12 @@ preserve its routing semantics. The PrimTS sparse MLA library
 generation on SM100 and sits ahead of the TRTLLM-Gen libraries, so DeepSeek-V4
 decode on B200/GB200 runs on it unless `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
 removes it. With sparse KV cache offload, it reads the compress-ratio-4
-layers' compressed rows from the sparse cache arena (§3.2.5). Delta entries update the
-default membership and follow canonical registry order, while an exact list
+layers' compressed rows from the sparse cache arena (§3.2.5). Two SM90 generation
+libraries are opt-in as well: `flash_attn4_generation` (FlashAttention-4 decode
+and linear speculative verification) and `sampling_shared_prefix` (shared-prefix
+attention for `n`-sample requests on KV Cache Manager V2), enabled together with
+`TLLM_FMHA_LIBS=+sampling_shared_prefix,+flash_attn4_generation`. Delta entries
+update the default membership and follow canonical registry order, while an exact list
 preserves the user-specified order. Each FMHA library exposes `is_available()`
 for module/static environment checks and `is_supported()` for per-forward
 request checks. `AttentionForwardArgs.sparse_runtime_params` is the sole
@@ -542,6 +546,33 @@ remain invariant for its lifetime. Request-varying capability requirements
 must be represented in `FmhaManager._make_cache_key`, because a cache hit
 reuses the selected library without rechecking support.
 
+A library whose support depends on host work done once per step overrides the
+class hooks of `Fmha` instead of adding calls to the backend or the executor:
+
+- `plan_step(metadata)` runs from `TrtllmAttentionMetadata.prepare()` for every
+  enabled library that overrides it (`registry.step_planning_fmha_lib_classes`),
+  ahead of every forward of the step, so under CUDA graphs it precedes both
+  capture and replay. Device tables it refreshes keep fixed addresses. Plan state
+  that lives across steps belongs in `metadata.fmha_plan_caches`; per-step device
+  tensors that several layers of one forward share (page tables) belong in
+  `metadata.fmha_step_caches`, which `prepare()` empties. An enabled planning
+  library disables `prepare_steady_decode_step`.
+- `selection_cache_key(metadata)` returns the plan state `is_supported` reads;
+  the manager adds it to the selection cache key of the layers that have the
+  library.
+- `step_stats(kv_cache_manager)`, `reset_step_stats(kv_cache_manager)` and
+  `step_stats_field` let a library keep cumulative per-step counters: the
+  executor resets them after warm-up and reports them in the iteration-stats
+  record under `step_stats_field` (e.g. `sharedPrefixAttnStats`).
+
+A phased generation library may serve the generation rows of a mixed batch
+while a phased library that supports the whole batch (the thop op,
+`FallbackFmha`) serves its context phase. The generation library opts in with
+`pairs_with_whole_batch_context`; the manager then pairs the two in a
+`CombinedFmha`, and each step `serves_mixed_generation_rows(metadata)` decides
+whether the generation library takes that step's (uniform) generation rows or
+the whole-batch library serves the whole batch.
+
 For a configuration a library would serve *incorrectly* rather than not at
 all -- a failure inside the library's own kernels that selection cannot see
 or route around -- `_is_supported` raises an actionable error instead of
@@ -566,7 +597,20 @@ The FMHA package is split by role:
   in `key_input`/`value_input`, and `output` holds the phase's output view.
   MLA uses `query_input` with `is_fused_qkv=False`.
 - `fmha/combined.py` composes different context and generation implementations
-  for non-MLA mixed batches.
+  for non-MLA mixed batches, including the whole-batch pairing above.
+- `fmha/flash_attn4_kernels.py` holds the FlashAttention-4 (CuTe DSL, SM90)
+  generation kernels shared by the FA4 libraries: the FA4 loader, the step's
+  RoPE and paged K/V write, split-KV tables, split calls (with caller-owned
+  workspaces) and their merge.
+- `fmha/flash_attn4_generation.py` implements `flash_attn4_generation`: FA4
+  paged decode and linear speculative verification, including the EAGLE-3
+  draft layer and, when the cache is long enough, the generation rows of mixed
+  batches.
+- `fmha/sampling_shared_prefix.py` implements `sampling_shared_prefix`: per
+  step (`plan_step`) it groups the rows whose block tables start with the same
+  pages, and per layer `fmha/shared_prefix_fa4.py` attends each group's shared
+  pages once and every row's private pages, merging the two by log-sum-exp.
+  It keeps the `sharedPrefixAttnStats` counters.
 - `fmha/fp4_mla.py` implements FP4 MLA using FP8 context attention with FP4
   cache updates and FP4 no-dequant decode. It uses KV Cache Manager V2;
   batch state, cache storage, and kernels live in `fp4_mla/`. The absorption
