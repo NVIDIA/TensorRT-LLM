@@ -137,7 +137,6 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     engine._pending_transfer_responses = []
     engine._pending_response_terminations = []
     engine.is_shutdown = False
-    engine.previous_batch = None
     engine.enable_attention_dp = False
     engine.gather_all_responses = False
     engine.kv_connector_manager = None
@@ -630,7 +629,9 @@ def test_cancelled_overlap_request_retires_at_the_existing_post_sampler_boundary
     else:
         batch.generation_requests = [request]
     executor.previous_batch = BatchState(
-        scheduled_requests=batch, sample_state=SampleStateTorch(requests=[])
+        scheduled_requests=batch,
+        sample_state=SampleStateTorch(requests=[]),
+        guided_failures=[],
     )
     executor._is_kv_manager_v2 = True
     executor.enable_joint_kv_cache_reuse = False
@@ -696,7 +697,9 @@ def _prepare_generation_harvest(executor: PyExecutor, requests: list[LlmRequest]
             single_step_greedy=True,
         ),
     )
-    executor.previous_batch = BatchState(scheduled_requests=batch, sample_state=state)
+    executor.previous_batch = BatchState(
+        scheduled_requests=batch, sample_state=state, guided_failures=[]
+    )
     sampler = object.__new__(TorchSampler)
     sampler.max_seq_len = 1024
     sampler._track_pending_steps = False
@@ -715,6 +718,7 @@ def _prepare_generation_harvest(executor: PyExecutor, requests: list[LlmRequest]
     executor.perf_manager = Mock()
     executor.iter_counter = 0
     executor.stream_interval = 1
+    executor.max_draft_len = 0
 
 
 def test_deferred_lora_generation_resumes_from_harvested_host_token(executor: PyExecutor) -> None:
@@ -801,7 +805,7 @@ def test_overlap_marker_changes_only_after_previous_sample_is_harvested(
     executor._release_unused_connector_reservations = Mock()
     executor._terminate_recompute_paused_requests = Mock()
     executor._pause_recompute_paused_requests = Mock()
-    executor._revert_gen_alloc = Mock()
+    executor._revert_unexecuted_alloc = Mock()
     executor._finalize_adp_dummy_allocation = Mock()
     executor._send_kv_async = Mock()
     executor._commit_kv_cache_stats = Mock()
@@ -812,6 +816,7 @@ def test_overlap_marker_changes_only_after_previous_sample_is_harvested(
     executor.device_id = 0
     executor._profiler = lambda: nullcontext(lambda: None)
     executor.hang_detector = MagicMock()
+    executor._intake_window = threading.Event()
     executor._execution_stream_loop_armed = False
     executor._resource_governor_enabled = False
     executor.is_benchmark_disagg = False
