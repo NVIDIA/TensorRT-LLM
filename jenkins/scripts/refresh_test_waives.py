@@ -36,8 +36,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tests"))
+
 import open_search_db
 from open_search_db import WAIVE_PROJECT_NAME, OpenSearchDB
+from test_common.waive import waive_candidates
 from test_rerun import parse_name, update_junit_counts
 
 EXIT_ALL_WAIVED = 0
@@ -157,6 +160,67 @@ def _test_name(case: ET.Element, stage_name: str) -> str:
     return name.removeprefix(stage_name + "/")
 
 
+def _waive_names(case: ET.Element, stage_name: str) -> list[str]:
+    """Keep outer entries exact; only inner unit tests have parent-name fallbacks."""
+    name = _test_name(case, stage_name)
+    if not name:
+        return []
+    if name.startswith("unittest/") and case.get("file") != "test_unittests.py":
+        return waive_candidates(name)
+    return [name]
+
+
+def _properties(node: ET.Element) -> dict[str, str]:
+    return {p.get("name", ""): p.get("value", "") for p in node.findall("properties/property")}
+
+
+def _read_reports(result_dir: Path) -> dict[Path, ET.ElementTree]:
+    """Include MoE child reports without publishing their individual cases to Jenkins."""
+    paths = set(result_dir.glob("results*.xml")) | set(
+        result_dir.glob("moe-results-sub-unittests-*.xml")
+    )
+    return {path: ET.parse(path) for path in sorted(paths)}
+
+
+def _unit_report_links(
+    trees: dict[Path, ET.ElementTree], stage_name: str
+) -> dict[ET.Element, Path]:
+    """Link ordinary wrapper failures to complete child reports by explicit metadata."""
+    by_name = {path.name: path for path in trees}
+    links = {}
+    for tree in trees.values():
+        for case in _failed_cases(tree.getroot()):
+            props = _properties(case)
+            path = by_name.get(props.get("unittest_report"))
+            if (
+                case.get("file") != "test_unittests.py"
+                or props.get("unittest_exit_code") != "1"
+                or case.find("error") is not None
+                or len(case.findall("failure")) != 1
+                or path is None
+                or not path.name.startswith(
+                    ("results-sub-unittests-", "moe-results-sub-unittests-")
+                )
+            ):
+                continue
+            root = trees[path].getroot()
+            suites = list(root.iter("testsuite"))
+            if len(suites) != 1:
+                continue
+            child_props = _properties(suites[0])
+            failures = _failed_cases(root)
+            if (
+                child_props.get("unittest_entry") == _test_name(case, stage_name)
+                and props.get("unittest_report_id")
+                and child_props.get("unittest_report_id") == props["unittest_report_id"]
+                and child_props.get("pytest_session_complete") == "true"
+                and failures
+                and all(_test_name(child, stage_name) for child in failures)
+            ):
+                links[case] = path
+    return links
+
+
 def _failed_cases(root: ET.Element) -> list[ET.Element]:
     """Return cases with either a pytest failure or an execution error."""
     return [
@@ -191,7 +255,7 @@ def query_latest_waives(test_names: list[str], branch: str) -> tuple[list[WaiveR
     same ingestion cutoff so updates arriving during the query are excluded.
 
     Args:
-        test_names: Failed test names to look up.
+        test_names: Rule names to look up, including inner unit-test ancestors.
         branch: Target branch whose waive states are read.
 
     Returns:
@@ -398,12 +462,17 @@ def reclassify_failures(
         if name not in initial_rules and rule.recorded_ms > snapshot_ms
     }
     if trees is None:
-        trees = {path: ET.parse(path) for path in sorted(result_dir.glob("results*.xml"))}
+        trees = _read_reports(result_dir)
 
     recorded = set()
     timeouts = set()
     for path, tree in trees.items():
-        recorded.update(filter(None, (_test_name(c, stage_name) for c in tree.iter("testcase"))))
+        recorded.update(
+            name
+            for case in tree.iter("testcase")
+            if (name := _test_name(case, stage_name))
+            and (not name.startswith("unittest/") or case.get("file") == "test_unittests.py")
+        )
         if path.name == _TIMEOUT_REPORT:
             cases = _failed_cases(tree.getroot())
             timeouts.update(filter(None, (_test_name(case, stage_name) for case in cases)))
@@ -434,28 +503,54 @@ def reclassify_failures(
     }
     changed_paths = set()
     unattributed_failure = False
-    for path, tree in trees.items():
-        for case in _failed_cases(tree.getroot()):
-            name = _test_name(case, stage_name)
-            if path.name == "results-stage.xml":
-                reason = "synthetic failure"
-            elif name in initial_rules:
-                reason = "already present in initial TOT"
-            elif name not in latest_rules:
-                reason = "not covered by a new TOT waive"
-            elif name not in added_rules:
-                reason = "waive recorded before the initial TOT snapshot"
-            elif not run_complete:
-                reason = (
-                    "cannot prove every test ran: no shard test list"
-                    if expected is None
-                    else "cannot prove every test ran: some shard tests have no result"
+
+    def matching_rule(case: ET.Element) -> tuple[WaiveRule | None, str]:
+        names = _waive_names(case, stage_name)
+        if any(name in initial_rules for name in names):
+            return None, "already present in initial TOT"
+        rule = next((latest_rules[name] for name in names if name in latest_rules), None)
+        if rule is None:
+            return None, "not covered by a new TOT waive"
+        if rule.recorded_ms <= snapshot_ms:
+            return None, "waive recorded before the initial TOT snapshot"
+        return rule, ""
+
+    links = _unit_report_links(trees, stage_name)
+    child_failures = {path: _failed_cases(tree.getroot()) for path, tree in trees.items()}
+    parent_rules = {path: rule for case, path in links.items() if (rule := matching_rule(case)[0])}
+    resolved = {}
+    failures = [(path, case) for path, cases in child_failures.items() for case in cases]
+    # Resolve inner cases first, then their outer wrappers.
+    for path, case in sorted(failures, key=lambda item: item[1].get("file") == "test_unittests.py"):
+        name = _test_name(case, stage_name)
+        rule, reason = matching_rule(case)
+        if case.get("file") == "test_unittests.py":
+            child_path = links.get(case)
+            if child_path is None:
+                rule, reason = None, "cannot prove a complete, associated inner unittest run"
+            elif rule is None and all(child in resolved for child in child_failures[child_path]):
+                child_rule = resolved[child_failures[child_path][0]]
+                rule = WaiveRule(
+                    child_rule.nodeid,
+                    f"All failed inner tests waived; {child_rule.reason}",
+                    child_rule.recorded_ms,
                 )
-            else:
-                entry = _apply_waive(case, added_rules[name], path, stage_name, source)
-                report["waived"].append(entry)
-                changed_paths.add(path)
-                continue
+        elif path in parent_rules:
+            rule, reason = parent_rules[path], ""
+        if path.name == "results-stage.xml":
+            rule, reason = None, "synthetic failure"
+        if rule is not None and not run_complete:
+            rule = None
+            reason = (
+                "cannot prove every test ran: no shard test list"
+                if expected is None
+                else "cannot prove every test ran: some shard tests have no result"
+            )
+        if rule is not None:
+            report["waived"].append(_apply_waive(case, rule, path, stage_name, source))
+            changed_paths.add(path)
+            resolved[case] = rule
+        else:
             unattributed_failure = unattributed_failure or not name
             report["remaining_failures"].append(
                 {"test": name or case.get("name", ""), "file": path.name, "reason": reason}
@@ -553,12 +648,12 @@ def run(argv: list[str] | None = None) -> int:
         args = _jenkins_arguments()
     if not (args.result_dir and args.stage_name and args.target_branch and args.initial_waives):
         parser.error("result directory, stage name, target branch and initial waives are required")
-    trees = {path: ET.parse(path) for path in sorted(args.result_dir.glob("results*.xml"))}
+    trees = _read_reports(args.result_dir)
     names = set()
     for path, tree in trees.items():
         if path.name != "results-stage.xml":
             cases = _failed_cases(tree.getroot())
-            names.update(filter(None, (_test_name(case, args.stage_name) for case in cases)))
+            names.update(name for case in cases for name in _waive_names(case, args.stage_name))
     if not names:
         print("[TOT-WAIVE] No named test failures to check.")
         return EXIT_FAILURES_RETAINED

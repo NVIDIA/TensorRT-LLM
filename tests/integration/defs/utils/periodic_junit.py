@@ -148,6 +148,8 @@ class PeriodicJUnitXML:
         # LogXML will be created only when generating reports
         self.logxml: Optional[LogXML] = None
         self.config = None
+        self.finished_nodeids: set[str] = set()
+        self.session_complete = False
 
     def _log_info(self, message):
         """Log info message."""
@@ -237,6 +239,7 @@ class PeriodicJUnitXML:
 
         # Only increment counter and check for save on teardown phase
         if report.when == "teardown":
+            self.finished_nodeids.add(report.nodeid)
             self.completed_tests += 1
             current_time = time.time()
 
@@ -275,8 +278,12 @@ class PeriodicJUnitXML:
                 except Exception as e:
                     self._log_warning(f"Error generating periodic report: {e}")
 
-    def pytest_sessionfinish(self):
+    def pytest_sessionfinish(self, session, exitstatus):
         """Generate final report at session end."""
+        self.session_complete = (exitstatus in (0, 1)
+                                 and session.testscollected > 0
+                                 and len(self.finished_nodeids)
+                                 == session.testscollected)
         self._cancel_hang_timer()
         try:
             self._generate_report(is_final=True)
@@ -366,6 +373,20 @@ class PeriodicJUnitXML:
                 )
 
                 # Add all test cases using pytest's node reporters
+                if entry := os.environ.get("TRTLLM_UNITTEST_ENTRY"):
+                    properties = ET.SubElement(suite_node, "properties")
+                    for name, value in {
+                            "unittest_entry":
+                            entry,
+                            "unittest_report_id":
+                            os.environ.get("TRTLLM_UNITTEST_REPORT_ID", ""),
+                            "pytest_session_complete":
+                            str(self.session_complete).lower(),
+                    }.items():
+                        ET.SubElement(properties,
+                                      "property",
+                                      name=name,
+                                      value=value)
                 for node_reporter in self.logxml.node_reporters_ordered:
                     suite_node.append(node_reporter.to_xml())
 
