@@ -59,12 +59,16 @@ SYNC_PROTOCOLS = ("auto", "fence", "sentinel")
 SENTINEL_MAX_TOKENS_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_SENTINEL_MAX_TOKENS"
 # Sentinel payload formats (the MOE_A2A_SENTINEL_FORMAT_<name> constants).
 SENTINEL_PAYLOAD_FORMATS = ("BF16", "MXFP8", "FP8_BLOCK128", "NVFP4")
-# Default token limit of the sentinel transport (default_sentinel_max_tokens). Up to 159 tokens per
-# rank the transport was faster than the fence transport in every configuration measured (GB300,
-# EP 4 to 64, hidden 3584 to 7168, every payload format), so the default never goes below.
+# Default token limit of the sentinel transport (default_sentinel_max_tokens). Both constants are
+# FlashInfer's (flashinfer-ai/flashinfer#7498), from its GB300 measurements of the sentinel transport
+# against FlashInfer's own fence path; they were not re-measured against this fence path. Up to 159
+# tokens per rank the sentinel transport was faster in every configuration measured there (EP 4 to
+# 64, hidden 3584 to 7168, every payload format), so the default never goes below.
 _SENTINEL_MIN_DEFAULT_MAX_TOKENS = 159
 # Above it the default keeps the ep_size * limit rows a sentinel step polls, copies out and re-arms
 # within this: a speed bound, not a memory budget; the largest that kept every GB300 case faster.
+# The 159 floor takes precedence, so at wide EP the regions exceed it (hidden 7168, top-8 BF16 rows:
+# about 52 / 105 / 210 / 419 MiB per rank at EP 8 / 16 / 32 / 64).
 _SENTINEL_MAX_DEFAULT_REGION_BYTES = 64 << 20
 
 
@@ -198,7 +202,9 @@ def default_sentinel_max_tokens(ep_size: int, num_sms: int, row: SentinelRow) ->
        ``ep_size * limit`` of them) would exceed
        ``_SENTINEL_MAX_DEFAULT_REGION_BYTES`` per rank.
 
-    The caller caps it by ``max_num_tokens_per_rank``.
+    So at wide EP, where 3 would go below 159, the regions are larger than
+    ``_SENTINEL_MAX_DEFAULT_REGION_BYTES``. The caller caps the result by
+    ``max_num_tokens_per_rank``.
     """
     thop = _tllm_internal.thop
     below_one_wave = (
@@ -270,8 +276,9 @@ class NVLinkOneSided(Communication):
 
     This implementation utilizes symmetric memory to enable peer-to-peer access between GPUs over NVLink.
     The kernels only take the role as one side of the communication: the dispatch kernel puts the data
-    into peer ranks' symmetric memory from local buffer, while the combine kernel gets the data from peer
-    ranks' symmetric memory and reduces the data into local buffer. It is the most efficient implementation
+    into peer ranks' symmetric memory from local buffer. The fence combine kernel gets the data from peer
+    ranks' symmetric memory and reduces it into the local buffer; the sentinel combine instead puts each
+    expert output into the token owner's symmetric memory, where the owner polls and reduces it. It is the most efficient implementation
     by now, but requires symmetric memory size proportional to `max_num_tokens * n_ranks`, which may not
     scale well for very large-scale parallelization.
     """
@@ -427,7 +434,8 @@ class NVLinkOneSided(Communication):
         wave of resident blocks and whose sentinel regions (``ep_size * limit``
         landing, combine and receive rows, appended to the workspace) stay within
         64 MiB per rank, clamped to 159..512 tokens and to
-        ``max_num_tokens_per_rank``. Every rank votes, so a rank where it is off
+        ``max_num_tokens_per_rank``; the 159 floor wins, so at wide EP the regions
+        are larger than 64 MiB (see ``default_sentinel_max_tokens``). Every rank votes, so a rank where it is off
         turns it off everywhere. A sentinel step places the rows it receives from
         rank ``src`` for its token ``t`` at ``src * runtime_max_tokens_per_rank + t``
         and gives rows of tokens not routed here invalid expert IDs. Payload
@@ -826,6 +834,16 @@ class NVLinkOneSided(Communication):
         """Whether the sentinel transport carries this step: few enough tokens, no
         EPLB statistics and payloads in the instance's format.
 
+        Args:
+            runtime_max_tokens_per_rank: Tokens of the busiest rank in this step.
+            hidden_states: [local_num_tokens, row] payload: bf16 [T, hidden] for a BF16
+                instance, else the quantized bytes (1-byte elements) of its format.
+            hidden_states_sf: [local_num_tokens, scale_row] block scales of a quantized
+                format, else None.
+            token_final_scales: [local_num_tokens, top_k] routing weights, 4-byte or bf16;
+                None when the step carries none.
+            eplb_local_stats: EPLB statistics to gather, or None.
+
         Depends only on values every rank passes alike, so all ranks take the
         same transport.
         """
@@ -1039,7 +1057,11 @@ class NVLinkOneSided(Communication):
 
         Returns:
             Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales)
-            Each tensor has shape [ep_size, max_tokens_per_rank, ...]
+            Each tensor has shape [ep_size, max_tokens_per_rank, ...]. On a sentinel step
+            (``use_sentinel_for_dispatch``) the rows are not compacted: row [src, t] holds token
+            t of rank src for t < runtime_max_tokens_per_rank, and a row whose token is not routed
+            to this rank (or that rank src does not have) has ``invalid_token_expert_id`` in every
+            top-k slot.
         """
         self._require_mapped()
         if self._dispatch_state.get("phase") == "dispatched":

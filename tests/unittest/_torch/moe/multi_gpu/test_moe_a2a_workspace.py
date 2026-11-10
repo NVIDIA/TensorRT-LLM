@@ -39,7 +39,7 @@ def workspace_mpi_pool():
         faulthandler.cancel_dump_traceback_later()
 
 
-def _run_worker(capture, in_workspace, low_precision):
+def _run_worker(capture, in_workspace, low_precision, protocol):
     """Bound hangs in native calls, MPI barriers, and collective cleanup."""
     faulthandler.dump_traceback_later(_WORKER_TIMEOUT_S, exit=True)
     communicators = []
@@ -48,7 +48,10 @@ def _run_worker(capture, in_workspace, low_precision):
         with pytest.MonkeyPatch.context() as patch:
             # Pin worker-side policy rather than inheriting user/CI overrides.
             patch.delenv("TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB", raising=False)
-            patch.delenv("TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL", raising=False)
+            if protocol == "auto":
+                patch.delenv("TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL", raising=False)
+            else:
+                patch.setenv("TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL", protocol)
             patch.delenv("TRTLLM_NVLINK_ONE_SIDED_A2A_SENTINEL_MAX_TOKENS", raising=False)
             try:
                 rank = tllm.mpi_rank()
@@ -64,7 +67,7 @@ def _run_worker(capture, in_workspace, low_precision):
                     reason = "Requires at least 24 GiB free memory per GPU"
                 reasons = MPI.COMM_WORLD.allgather(reason)
                 if any(reasons):
-                    return "; ".join(sorted({r for r in reasons if r})), []
+                    return "; ".join(sorted({r for r in reasons if r})), [], [], 0
 
                 hidden, capacity = 6144, 32768
                 mapping = Mapping(
@@ -90,8 +93,10 @@ def _run_worker(capture, in_workspace, low_precision):
                     )
                 first, second = communicators
                 assert first.workspace.data_ptr() == second.workspace.data_ptr()
-                failures = _run_rounds(first, second, rank, hidden, capacity, capture, in_workspace)
-                return None, failures
+                failures, transports = _run_rounds(
+                    first, second, rank, hidden, capacity, capture, in_workspace
+                )
+                return None, failures, transports, first.sentinel_max_tokens
             except Exception:
                 # A peer may already be in a collective. Abort this test's MPI
                 # workers before attempting CUDA-synchronizing teardown.
@@ -128,18 +133,23 @@ def _run_rounds(first, second, rank, hidden, capacity, capture, in_workspace):
         [1, 9, 64, 0],
     )
 
+    transports = []
+
     def rounds():
         checks = []
+        transports.clear()
         for i, lengths in enumerate(lengths_list):
             count, maximum = lengths[rank], max(lengths)
             comm = first if i % 2 == 0 else second
-            comm.dispatch(
-                small[:count] if i % 2 == 0 else big[:count],
-                sf[:count] if i % 2 == 0 else None,
-                ids[:count],
-                scales[:count],
-                lengths,
+            hidden_states = small[:count] if i % 2 == 0 else big[:count]
+            hidden_states_sf = sf[:count] if i % 2 == 0 else None
+            # The transport this round takes (the dispatch makes the same choice).
+            transports.append(
+                comm.use_sentinel_for_dispatch(
+                    maximum, hidden_states, hidden_states_sf, scales[:count], None
+                )
             )
+            comm.dispatch(hidden_states, hidden_states_sf, ids[:count], scales[:count], lengths)
             if in_workspace:
                 payload = comm.get_combine_payload_tensor_in_workspace(
                     maximum, hidden, torch.bfloat16
@@ -171,28 +181,39 @@ def _run_rounds(first, second, rank, hidden, capacity, capture, in_workspace):
     valid = torch.stack(records).cpu()
     failures = (~valid).nonzero().tolist()
     MPI.COMM_WORLD.Barrier()
-    return failures
+    return failures, list(transports)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < _EP_SIZE, reason="Requires four local GPUs")
 @pytest.mark.threadleak(enabled=False)  # MPI pool shutdown has known thread timing issues.
+@pytest.mark.parametrize("protocol", ["auto", "fence"])
 @pytest.mark.parametrize("low_precision", [False, True])
 @pytest.mark.parametrize(
     "capture,in_workspace", [(False, False), (False, True), (True, False), (True, True)]
 )
 def test_mixed_dispatch_layout_preserves_previous_combine(
-    workspace_mpi_pool, capture, in_workspace, low_precision
+    workspace_mpi_pool, capture, in_workspace, low_precision, protocol
 ):
-    """Run four ranks under the regular pytest/CI MPI pool launcher."""
+    """Run four ranks under the regular pytest/CI MPI pool launcher.
+
+    With the default policy the last round (64 tokens, BF16) takes the sentinel transport where
+    it is available and every other round the fence transport, so a sentinel round follows fence
+    rounds of the other layout on the shared workspace; with ``fence`` every round is fence.
+    """
     results = list(
         workspace_mpi_pool.map(
             _run_worker,
-            *zip(*[(capture, in_workspace, low_precision)] * _EP_SIZE),
+            *zip(*[(capture, in_workspace, low_precision, protocol)] * _EP_SIZE),
         )
     )
-    reasons = [reason for reason, _ in results if reason]
+    reasons = [reason for reason, *_ in results if reason]
     if reasons:
         assert len(reasons) == _EP_SIZE, "Workers must agree to skip before native collectives"
         pytest.skip(reasons[0])
-    for rank, (_, failures) in enumerate(results):
-        assert not failures, (rank, capture, in_workspace, low_precision, failures)
+    for rank, (_, failures, transports, sentinel_max_tokens) in enumerate(results):
+        assert not failures, (rank, capture, in_workspace, low_precision, protocol, failures)
+        sentinel_on = protocol == "auto" and not low_precision and sentinel_max_tokens >= 64
+        expected = [False] * 5 + [sentinel_on]
+        assert transports == expected, (rank, protocol, low_precision, transports)
+        if protocol == "fence" or low_precision:
+            assert sentinel_max_tokens == 0, (rank, protocol, low_precision, sentinel_max_tokens)

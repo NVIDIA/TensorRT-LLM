@@ -47,6 +47,7 @@ Run with: mpirun -np 8 pytest test_moe_comm.py -x -v
 """
 
 import atexit
+import contextlib
 import os
 import pickle
 import sys
@@ -2649,6 +2650,26 @@ def _exercise_mnnvl_checkpoint_graph_replay(
         def any_allocation_is_mapped() -> bool:
             return communication.mnnvl_mem.mapped
 
+    record_sentinel_steps = contextlib.nullcontext
+    sentinel_steps: List[bool] = []
+    if config.comm_type == COMM_NVLINK_ONE_SIDED:
+        # Import locally so cloudpickle does not serialize torch's dynamic ops namespace.
+        from unittest import mock
+
+        import torch as _torch
+
+        if _torch.ops.trtllm.moe_a2a_sentinel_available():
+            # The default policy carries these small steps on the sentinel transport.
+            assert communication.sentinel_max_tokens >= max(config.all_num_tokens)
+        dispatch_op = _torch.ops.trtllm.moe_a2a_dispatch
+
+        def record_dispatch(*args, **kwargs):
+            sentinel_steps.append(bool(kwargs.get("use_sentinel", False)))
+            return dispatch_op(*args, **kwargs)
+
+        def record_sentinel_steps():
+            return mock.patch.object(_torch.ops.trtllm, "moe_a2a_dispatch", record_dispatch)
+
     for cycle in range(3):
         free_before_prepare = torch.cuda.mem_get_info()[0]
         communication.checkpoint_prepare()
@@ -2671,9 +2692,15 @@ def _exercise_mnnvl_checkpoint_graph_replay(
             )
         assert restored_addresses == stable_addresses
 
-        with torch.inference_mode():
+        sentinel_steps.clear()
+        with torch.inference_mode(), record_sentinel_steps():
             worker_inputs.hs.add_(cycle + 1)
             expected = forward().clone()
+        if config.comm_type == COMM_NVLINK_ONE_SIDED:
+            # The step after restore takes the transport the instance selects for it.
+            assert sentinel_steps == [
+                communication.sentinel_max_tokens >= max(config.all_num_tokens)
+            ]
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(graph_output, expected)

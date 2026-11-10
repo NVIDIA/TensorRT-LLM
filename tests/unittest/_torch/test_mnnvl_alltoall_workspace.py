@@ -826,3 +826,75 @@ def test_one_sided_failed_registration_does_not_publish_new_workspace(
     assert NVLinkOneSided._WORKSPACE_REFCOUNTS == {}
     assert NVLinkOneSided._WORKSPACE is None
     lifecycle.unregister.assert_not_called()
+
+
+def _destroyable_one_sided(workspace_key: tuple, workspace_state: dict) -> NVLinkOneSided:
+    comm = NVLinkOneSided.__new__(NVLinkOneSided)
+    comm._destroyed = False
+    comm._workspace_key = workspace_key
+    comm._workspace_state = workspace_state
+    comm._workspace_lifecycle = None
+    comm._workspace_registered = True
+    comm.mnnvl_mem = workspace_state["mnnvl_mem"]
+    comm.workspace = workspace_state["workspace"]
+    comm._dispatch_state = {"phase": "idle"}
+    return comm
+
+
+def test_destroy_last_reference_releases_only_its_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The last communicator of a workspace frees that workspace and leaves a sibling alone.
+
+    ``destroy`` -> ``_release_workspace`` pops the shared state and its refcount, clears the
+    state, resets ``_WORKSPACE`` only when it is this state, and drops the instance's
+    references; a second ``destroy`` is inert.
+    """
+    released_key, kept_key = ("workspace-a",), ("workspace-b",)
+    released_state = {"workspace": object(), "ep_rank": 1, "mnnvl_mem": object()}
+    kept_state = {"workspace": object(), "ep_rank": 1, "mnnvl_mem": object()}
+    kept_snapshot = dict(kept_state)
+    monkeypatch.setattr(
+        NVLinkOneSided, "_WORKSPACES", {released_key: released_state, kept_key: kept_state}
+    )
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {released_key: 1, kept_key: 1})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", kept_state)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    comm = _destroyable_one_sided(released_key, released_state)
+    comm.destroy()
+    comm.destroy()
+
+    assert released_key not in NVLinkOneSided._WORKSPACES
+    assert released_key not in NVLinkOneSided._WORKSPACE_REFCOUNTS
+    assert released_state == {}
+    assert comm.mnnvl_mem is None and comm.workspace is None
+    # The sibling, which is also the current workspace, is untouched.
+    assert NVLinkOneSided._WORKSPACES[kept_key] is kept_state
+    assert NVLinkOneSided._WORKSPACE_REFCOUNTS[kept_key] == 1
+    assert NVLinkOneSided._WORKSPACE is kept_state
+    assert kept_state == kept_snapshot
+
+    # Releasing the current workspace also resets _WORKSPACE.
+    _destroyable_one_sided(kept_key, kept_state).destroy()
+    assert NVLinkOneSided._WORKSPACES == {}
+    assert NVLinkOneSided._WORKSPACE is None
+
+
+def test_destroy_non_last_reference_keeps_workspace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A communicator that is not the last reference only drops the refcount."""
+    workspace_key = ("shared-workspace",)
+    workspace_state = {"workspace": object(), "ep_rank": 0, "mnnvl_mem": object()}
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACES", {workspace_key: workspace_state})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {workspace_key: 2})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", workspace_state)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    comm = _destroyable_one_sided(workspace_key, workspace_state)
+    comm.destroy()
+
+    assert NVLinkOneSided._WORKSPACES[workspace_key] is workspace_state
+    assert NVLinkOneSided._WORKSPACE_REFCOUNTS[workspace_key] == 1
+    assert NVLinkOneSided._WORKSPACE is workspace_state
+    assert workspace_state["workspace"] is not None
+    assert comm.workspace is None
