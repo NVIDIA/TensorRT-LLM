@@ -2374,7 +2374,6 @@ def test_megamoe_replica_plan_supplies_launch_facts_and_route_wait():
 def test_megamoe_staging_widens_int32_routes_after_the_route_wait():
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)
-    moe._last_staged_T = {8: 6}
     trace = []
     moe._wait_rebalance_routes = lambda replica_plan=None: trace.append(("wait", replica_plan))
     bufs = SimpleNamespace(
@@ -2401,9 +2400,8 @@ def test_megamoe_staging_widens_int32_routes_after_the_route_wait():
     # One copy widens the int32 routes into the int64 kernel index buffer.
     assert bufs.topk_idx_local.dtype == torch.int64
     assert torch.equal(bufs.topk_idx_local[:3], routes.to(torch.int64))
-    # Rows a previous launch wrote, and only those, are reset to -1.
-    assert torch.equal(bufs.topk_idx_local[3:6], torch.full((3, 4), -1, dtype=torch.int64))
-    assert torch.equal(bufs.topk_idx_local[6:], torch.full((2, 4), 5, dtype=torch.int64))
+    # The whole tail is reset to -1, whatever earlier calls wrote (graph replays bypass host state).
+    assert torch.equal(bufs.topk_idx_local[3:], torch.full((5, 4), -1, dtype=torch.int64))
     assert torch.equal(bufs.topk_weights[:3], weights)
     assert not bufs.topk_weights[3:].any()
     assert trace == [("wait", "plan")]
