@@ -79,8 +79,7 @@ public:
     }
 
     /// Runs this call's context phase on \p fmha. The caller chose it with `isFmhaSupported()`,
-    /// possibly for an earlier call of the same shape: XQA's choice over MMHA weighs the
-    /// history length, which grows between calls the library still serves.
+    /// possibly for an earlier call of the same shape.
     void runContext(PhasedFmha<Derived>* fmha, FmhaParams& p)
     {
         TLLM_CHECK_WITH_INFO(fmha != nullptr,

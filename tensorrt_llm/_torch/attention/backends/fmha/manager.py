@@ -133,8 +133,9 @@ class _FmhaCacheKey(NamedTuple):
     context_batch_size: int
     generation_batch_size: int
     generation_seq_len_q: int
-    # XqaFmha.kv_exceeds_beam_search_window, keyed only when XQA is enabled.
+    # XqaFmha.kv_exceeds_beam_search_window and XqaFmha.has_perf_gain, keyed only when XQA is enabled.
     xqa_kv_exceeds_beam_search_window: bool
+    xqa_has_perf_gain: bool
     attention_mask_type: AttentionMaskType
     has_variable_window: bool
     use_spec_decoding: bool
@@ -347,7 +348,7 @@ class FmhaManager:
             if fmha_cls.is_available(attn):
                 self.fmha_libs.append(fmha_cls(attn))
         self._layer_idx = getattr(attn, "layer_idx", None)
-        self._keys_xqa_window = any(isinstance(fmha, XqaFmha) for fmha in self.fmha_libs)
+        self._xqa = next((fmha for fmha in self.fmha_libs if isinstance(fmha, XqaFmha)), None)
 
     def _announce(self, fmha: Fmha, cache_key: _FmhaCacheKey) -> None:
         # One line per library per layer is enough to tell which kernel
@@ -365,6 +366,8 @@ class FmhaManager:
     def _make_cache_key(
         self,
         q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> _FmhaCacheKey:
@@ -378,8 +381,10 @@ class FmhaManager:
         are separate grid points so a support boundary at the candidate cannot
         alias with the interval below it. Generation Q lengths are uniform in
         the executor, including padded speculative-decoding batches. XQA judges
-        generation at the longest KV history, except that beam search past the
-        cyclic window declines it; that boundary is keyed while XQA is enabled.
+        support at the longest KV history, except that beam search past the
+        cyclic window declines it; that boundary, and whether XQA is expected to
+        outrun MMHA for this call's batch and history, are keyed while XQA is
+        enabled.
 
         The batch fields describe the complete source scheduler batch, even
         when ``q`` contains only one compacted phase. Ordinary attention
@@ -411,6 +416,7 @@ class FmhaManager:
         )
         generation_seq_len_q = 0
         xqa_kv_exceeds_beam_search_window = False
+        xqa_has_perf_gain = False
         if attention_input_type != AttentionInputType.context_only and metadata.num_generations > 0:
             generation_num_tokens = q.shape[0]
             if attention_input_type == AttentionInputType.mixed:
@@ -419,10 +425,11 @@ class FmhaManager:
             generation_seq_len_q = _normalize_fmha_cache_grid_value(
                 generation_seq_len_q, _FMHA_CACHE_SEQ_LEN_Q_GRID
             )
-            if self._keys_xqa_window:
+            if self._xqa is not None:
                 xqa_kv_exceeds_beam_search_window = XqaFmha.kv_exceeds_beam_search_window(
                     metadata, forward_args
                 )
+                xqa_has_perf_gain = self._xqa.has_perf_gain(q, k, v, metadata, forward_args)
 
         block_sparse_inputs = forward_args.sparse_runtime_params.block_sparse_inputs
         return _FmhaCacheKey(
@@ -430,6 +437,7 @@ class FmhaManager:
             generation_batch_size=generation_batch_size,
             generation_seq_len_q=generation_seq_len_q,
             xqa_kv_exceeds_beam_search_window=xqa_kv_exceeds_beam_search_window,
+            xqa_has_perf_gain=xqa_has_perf_gain,
             attention_mask_type=attention_mask_type,
             has_variable_window=forward_args.variable_window_token_starts is not None,
             use_spec_decoding=metadata.use_spec_decoding,
@@ -454,7 +462,7 @@ class FmhaManager:
         if not _is_fmha_cache_enabled():
             return self._select_uncached(attn, q, k, v, metadata, forward_args)
 
-        cache_key = self._make_cache_key(q, metadata, forward_args)
+        cache_key = self._make_cache_key(q, k, v, metadata, forward_args)
         fmha = self._cache.get(cache_key)
         if fmha is not None:
             if self._cache_sanity_check_enabled:

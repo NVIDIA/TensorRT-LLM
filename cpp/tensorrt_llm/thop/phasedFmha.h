@@ -191,7 +191,10 @@ public:
         return isGen && mRunner != nullptr;
     }
 
+    /// Whether the XQA kernels serve this call, without weighing them against MMHA.
     [[nodiscard]] bool isSupported(FmhaParams const& p, bool isGen) const override;
+    /// Whether XQA is expected to outrun MMHA for this generation call's batch and history.
+    [[nodiscard]] bool hasPerfGain(FmhaParams const& p) const;
     void initGeneration(AttentionVariant const& op) override;
     /// Generation bytes of the XQA kernels, sized from the batch bound (sum of beam widths),
     /// num_gen_tokens and the block-table width.

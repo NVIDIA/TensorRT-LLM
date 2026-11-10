@@ -492,9 +492,13 @@ registry order serves MHA and MLA, because FMHA-v2 serves no MHA generation and
 XQA no context phase. `FallbackFmha` wraps them as one library that runs each
 phase on the first native library that serves it, in the op's original
 per-variant priority, for direct callers such as `FallbackFmha.attention`.
-`NATIVE_FMHA_LIBS` lists the wrapper and the libraries. `XqaFmha` judges its
-generation support at `max_seq_len`, so the choice holds for every KV history
-length that shares a selection cache key. The native
+`NATIVE_FMHA_LIBS` lists the wrapper and the libraries, and every `run_*` stays
+eager under `torch.compile`. `XqaFmha` judges its generation
+support at `max_seq_len`, so the choice holds for every KV history length that
+shares a selection cache key. Whether XQA is expected to outrun MMHA weighs the
+call's batch against its KV history; `XqaFmha.has_perf_gain` asks
+`thop.xqa_has_perf_gain` once per batch, history block and speculative mode,
+and `FmhaManager` keys selection on the answer. The native
 carrier behind the entry points is per host thread and never visible to
 Python. Generated nanobind readers
 (`scripts/generate_fmha_params.py`) copy the fields C++ reads from `attn`,

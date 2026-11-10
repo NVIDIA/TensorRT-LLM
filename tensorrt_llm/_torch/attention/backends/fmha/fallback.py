@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Mapping, Optional
 
 import torch
+from typing_extensions import deprecated
 
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
@@ -155,20 +156,24 @@ def _legacy_forward_args(
     return AttentionForwardArgs(**values)
 
 
+def _xqa_is_supported(params: FmhaParams, is_gen: bool) -> bool:
+    return thop.xqa_is_supported(params, is_gen) and thop.xqa_has_perf_gain(params)
+
+
 # The native op's library priorities. They agree phase by phase with the registry order,
 # which serves both variants: fmha_v2 serves no MHA generation and XQA no context phase.
 _NativeLibrary = tuple[type[PhasedFmha], Callable[[FmhaParams, bool], bool]]
 _MHA_LIBRARIES: tuple[_NativeLibrary, ...] = (
     (TrtllmGenFmha, thop.trtllm_gen_is_supported),
     (FmhaV2Fmha, thop.fmha_v2_is_supported),
-    (XqaFmha, thop.xqa_is_supported),
+    (XqaFmha, _xqa_is_supported),
     (MmhaFmha, thop.mmha_is_supported),
     (UnfusedFmha, thop.unfused_is_supported),
 )
 _MLA_LIBRARIES: tuple[_NativeLibrary, ...] = (
     (TrtllmGenFmha, thop.trtllm_gen_is_supported),
     (FlashMlaFmha, thop.flash_mla_is_supported),
-    (XqaFmha, thop.xqa_is_supported),
+    (XqaFmha, _xqa_is_supported),
     (FmhaV2Fmha, thop.fmha_v2_is_supported),
 )
 
@@ -255,12 +260,15 @@ class FallbackFmha(PhasedFmha):
     ) -> None:
         warn_unsupported_sage_smoothing(forward_args)
 
+    # Keep nanobind calls eager, including when CombinedFmha delegates individual phases.
+    @torch.compiler.disable
     def run_context(self, params: FmhaParams) -> None:
         library = self._first_library(params, False)
         if library is None:
             raise RuntimeError("No native FMHA library supports this context call.")
         library.run_context(params)
 
+    @torch.compiler.disable
     def run_generation(self, params: FmhaParams) -> None:
         library = self._first_library(params, True)
         if library is None:
@@ -271,6 +279,10 @@ class FallbackFmha(PhasedFmha):
     run_mla_generation = run_generation
 
     @classmethod
+    @deprecated(
+        "FallbackFmha.attention is deprecated and will be removed; run attention through "
+        "TrtllmAttention instead."
+    )
     def attention(
         cls,
         q: torch.Tensor,
@@ -392,6 +404,8 @@ class FallbackFmha(PhasedFmha):
         uses_spcompress: Optional[bool] = None,
     ) -> None:
         """Shared MHA/MLA replacement for the removed monolithic ``thop.attention``.
+
+        Deprecated: this entry point will be removed; run attention through TrtllmAttention.
 
         Builds native FMHA parameters and runs each phase on the first native
         library that serves it. Direct callers supply the flat attention

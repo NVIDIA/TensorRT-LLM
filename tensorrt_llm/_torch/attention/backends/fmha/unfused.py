@@ -87,6 +87,7 @@ class UnfusedFmha(PhasedFmha):
     ) -> None:
         fallback.warn_unsupported_sage_smoothing(forward_args)
 
+    @torch.compiler.disable
     def run_context(self, params: FmhaParams) -> None:
         thop.unfused_run_context(params)
 

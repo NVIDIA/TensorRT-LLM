@@ -18,7 +18,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+)
 from tensorrt_llm.bindings.internal import thop
 
 from . import fallback
@@ -46,6 +49,11 @@ class XqaFmha(PhasedFmha):
     supports_skip_correction = True
     supports_workspace_reclamation = True
 
+    def __init__(self, attn: "TrtllmAttention"):
+        super().__init__(attn)
+        # has_perf_gain() by (generation batch, history in XQA multi-block units, spec decoding).
+        self._perf_gain: dict[tuple[int, int, bool], bool] = {}
+
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
         return fallback.is_native_op_available(
@@ -63,8 +71,8 @@ class XqaFmha(PhasedFmha):
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
         def is_supported(params: FmhaParams, is_gen: bool) -> bool:
-            # Judge at the longest KV history the selection cache key admits, so the choice holds
-            # for every request sharing the key.
+            # Judge support at the longest KV history the selection cache key admits, so the
+            # choice holds for every request sharing the key; has_perf_gain() is keyed separately.
             if is_gen and metadata.max_seq_len is not None:
                 if metadata.beam_width == 1:
                     params.max_past_kv_length = metadata.max_seq_len
@@ -85,7 +93,41 @@ class XqaFmha(PhasedFmha):
             serves_context=self.SERVES_CONTEXT,
             serves_generation=self.SERVES_GENERATION,
             is_supported=is_supported,
+        ) and self.has_perf_gain(q, k, v, metadata, forward_args)
+
+    def has_perf_gain(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+    ) -> bool:
+        """Whether XQA is expected to outrun MMHA for this call's generation batch and history.
+
+        The native op weighs the generation batch against the KV history in multi-block units,
+        so the answer is memoized on those and on speculative decoding.
+        """
+        num_contexts = metadata.num_contexts
+        num_generations = metadata.num_generations
+        max_kv_len = int(
+            metadata.kv_lens_runtime[num_contexts : num_contexts + num_generations].max()
         )
+        key = (
+            num_generations,
+            max_kv_len // thop.xqa_min_history_tokens_per_block,
+            bool(metadata.is_spec_decoding_enabled and metadata.use_spec_decoding),
+        )
+        gain = self._perf_gain.get(key)
+        if gain is None:
+            is_gen_only = forward_args.attention_input_type == AttentionInputType.generation_only
+            num_gen_tokens = q.shape[0] if is_gen_only else q.shape[0] - metadata.num_ctx_tokens
+            params = self.generation_params(
+                q, k, v, metadata, forward_args, metadata.effective_workspace, 0, num_gen_tokens
+            )
+            gain = thop.xqa_has_perf_gain(params)
+            self._perf_gain[key] = gain
+        return gain
 
     @staticmethod
     def kv_exceeds_beam_search_window(
@@ -111,6 +153,7 @@ class XqaFmha(PhasedFmha):
     ) -> None:
         fallback.warn_unsupported_sage_smoothing(forward_args)
 
+    @torch.compiler.disable
     def run_generation(self, params: FmhaParams) -> None:
         thop.xqa_run_generation(params)
 

@@ -23,6 +23,7 @@
 #include <nanobind/stl/vector.h>
 #include <tensorrt_llm/common/cudaUtils.h>
 #include <tensorrt_llm/common/tllmDataType.h>
+#include <tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h>
 #include <tensorrt_llm/kernels/helixAllToAll.h>
 #include <tensorrt_llm/thop/attentionOp.h>
 #include <tensorrt_llm/thop/attentionVariant.h>
@@ -326,6 +327,21 @@ bool xqaIsSupported(nb::handle source, bool isGen)
         });
 }
 
+bool xqaHasPerfGain(nb::handle source)
+{
+    return callFmha(source,
+        [](torch_ext::FmhaParams& p)
+        {
+            if (p.attn.is_mla_enable)
+            {
+                auto& op = getOp<torch_ext::MLA>(p);
+                return op.isFmhaSupported(op.xqa(), p, /*isGen=*/true) && op.xqa()->hasPerfGain(p);
+            }
+            auto& op = getOp<torch_ext::MHA>(p);
+            return op.isFmhaSupported(op.xqa(), p, /*isGen=*/true) && op.xqa()->hasPerfGain(p);
+        });
+}
+
 void xqaRunGeneration(nb::handle source)
 {
     callFmha(source,
@@ -461,6 +477,9 @@ void initBindings(nb::module_& m)
         "MLA generation phase on the fmha_v2 kernels.");
     m.def("xqa_is_supported", &xqaIsSupported, nb::arg("params"), nb::arg("is_gen"),
         "Whether the XQA kernels serve this phase call.");
+    m.def("xqa_has_perf_gain", &xqaHasPerfGain, nb::arg("params"),
+        "Whether the XQA kernels are expected to outrun MMHA for this generation call.");
+    m.attr("xqa_min_history_tokens_per_block") = tensorrt_llm::kernels::kMinHistoryTokensPerBlock;
     m.def("xqa_run_generation", &xqaRunGeneration, nb::arg("params"), "Generation phase on the XQA kernels.");
     m.def("flash_mla_is_supported", &flashMlaIsSupported, nb::arg("params"), nb::arg("is_gen"),
         "Whether the FlashMLA kernels serve this phase call.");

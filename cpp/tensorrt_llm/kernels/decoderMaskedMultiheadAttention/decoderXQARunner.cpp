@@ -75,22 +75,26 @@ bool DecoderXQARunner::shouldUse(XQAParams const& umbrellaXQAParams, bool forCon
             TLLM_LOG_DEBUG("JIT XQA is not used: unsupported configuration");
             return false;
         }
-        bool hasPerfGain = mayHavePerfGain(xqaParams);
-        if (!hasPerfGain)
-        {
-            if (!xqaParams.is_fp8_output && xqaParams.kv_cache_data_type == DATA_TYPE_E4M3
-                && (xqaParams.data_type == DATA_TYPE_BF16 || xqaParams.data_type == DATA_TYPE_FP16))
-            {
-                TLLM_LOG_DEBUG(
-                    "JIT XQA is selected in the generation phase for fp16/bf16 input and e4m3 kv cache because MMHA "
-                    "does not support this combination.");
-                return true;
-            }
-            TLLM_LOG_DEBUG("JIT XQA is not used: maybe no performance gain");
-            return false;
-        }
+        return hasPerfGain(xqaParams);
+    }
+}
+
+bool DecoderXQARunner::hasPerfGain(XQAParams const& xqaParams) const
+{
+    if (mayHavePerfGain(xqaParams))
+    {
         return true;
     }
+    if (!xqaParams.is_fp8_output && xqaParams.kv_cache_data_type == DATA_TYPE_E4M3
+        && (xqaParams.data_type == DATA_TYPE_BF16 || xqaParams.data_type == DATA_TYPE_FP16))
+    {
+        TLLM_LOG_DEBUG(
+            "JIT XQA is selected in the generation phase for fp16/bf16 input and e4m3 kv cache because MMHA "
+            "does not support this combination.");
+        return true;
+    }
+    TLLM_LOG_DEBUG("JIT XQA is not used: maybe no performance gain");
+    return false;
 }
 
 void DecoderXQARunner::prepare(XQAParams const& umbrellaXQAParams)

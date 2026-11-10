@@ -87,9 +87,11 @@ class FmhaV2Fmha(PhasedFmha):
     ) -> None:
         fallback.warn_unsupported_sage_smoothing(forward_args)
 
+    @torch.compiler.disable
     def run_context(self, params: FmhaParams) -> None:
         thop.fmha_v2_run_context(params)
 
+    @torch.compiler.disable
     def run_generation(self, params: FmhaParams) -> None:
         thop.fmha_v2_run_generation(params)
 

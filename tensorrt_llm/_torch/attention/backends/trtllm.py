@@ -2901,6 +2901,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                         "The per-tensor FP8 attention recipe needs the PrimTS "
                         "FMHA library (TLLM_FMHA_LIBS=+prims_ts), which is not "
                         "enabled or does not support this request.")
+                if (metadata.num_contexts > 0
+                        and metadata.use_paged_context_fmha
+                        and metadata.uses_trtllm_gen_only_page_size):
+                    raise RuntimeError(
+                        "No TRT-LLM attention FMHA library serves paged prefill "
+                        f"with {metadata.tokens_per_block}-token KV pages. Enable "
+                        "flashinfer_trtllm_gen in TLLM_FMHA_LIBS, use a supported "
+                        "TRTLLM-Gen configuration or disable chunked prefill, KV "
+                        "reuse and speculative decoding.")
                 raise RuntimeError(
                     "No TRT-LLM attention FMHA library supports this request.")
             if metadata.is_cuda_graph or not fmha.supports_workspace_reclamation:

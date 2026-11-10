@@ -1877,9 +1877,27 @@ bool XqaFmha<AttentionVariant>::isSupported(FmhaParams const& p, bool isGen) con
         {
             XQAParams params{};
             usable = fillParams<T>(op, p, params, /*forConfigurePlugin=*/false)
-                && mRunner->shouldUse(params, /*forConfigurePlugin=*/false);
+                && mRunner->supportConfig(params, /*forConfigurePlugin=*/false);
         });
     return usable;
+}
+
+template <typename AttentionVariant>
+bool XqaFmha<AttentionVariant>::hasPerfGain(FmhaParams const& p) const
+{
+    if (mRunner == nullptr)
+    {
+        return false;
+    }
+    auto const& op = static_cast<AttentionVariant const&>(this->attention);
+    bool gain = false;
+    dispatchOnDtype(p.getQueryInput().scalar_type(),
+        [&]<typename T>(std::type_identity<T>)
+        {
+            XQAParams params{};
+            gain = fillParams<T>(op, p, params, /*forConfigurePlugin=*/false) && mRunner->hasPerfGain(params);
+        });
+    return gain;
 }
 
 template <typename AttentionVariant>
@@ -2200,13 +2218,21 @@ void FlashMlaFmha::runGenerationImpl(MLA const& op, FmhaParams const& p, cudaStr
 
 bool MmhaFmha::isAvailable(AttentionBase const& key)
 {
-    // Support head size == 72 only for fmha kernels.
-    return key.head_size == 72 || mmha_supported(static_cast<int>(key.head_size));
+    return mmha_supported(static_cast<int>(key.head_size));
 }
 
 bool MmhaFmha::isSupported(FmhaParams const& p, bool isGen) const
 {
-    return isGen;
+    if (!isGen)
+    {
+        return false;
+    }
+    auto const& op = static_cast<MHA const&>(this->attention);
+    TLLM_CHECK_WITH_INFO(!op.template feature<torch_ext::SpecDecodingFeature>().active(),
+        "No available XQA kernels are found for speculative decoding mode.");
+    TLLM_CHECK_WITH_INFO(!op.is_fp4_out, "No available kernels are found for FP4 output.");
+    TLLM_CHECK_WITH_INFO(!op.quant_mode.hasFp4KvCache(), "No available kernels are found for FP4 KV cache.");
+    return true;
 }
 
 void MmhaFmha::initGeneration(MHA const& op)
@@ -2276,18 +2302,6 @@ std::size_t MmhaFmha::getWorkspaceSize(MHA const& op, FmhaParams const& p, bool 
 
 void MmhaFmha::runGeneration(MHA const& op, FmhaParams const& p, cudaStream_t stream)
 {
-    if (op.template feature<torch_ext::SpecDecodingFeature>().active())
-    {
-        TLLM_CHECK_WITH_INFO(false, "No available XQA kernels are found for speculative decoding mode.");
-    }
-    else if (op.is_fp4_out)
-    {
-        TLLM_CHECK_WITH_INFO(false, "No available kernels are found for FP4 output.");
-    }
-    else if (op.quant_mode.hasFp4KvCache())
-    {
-        TLLM_CHECK_WITH_INFO(false, "No available kernels are found for FP4 KV cache.");
-    }
     dispatchOnDtype(p.getQueryInput().scalar_type(),
         [&]<typename T>(std::type_identity<T>) { runGenerationImpl<T>(op, p, stream); });
 }

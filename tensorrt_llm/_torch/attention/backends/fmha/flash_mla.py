@@ -86,6 +86,7 @@ class FlashMlaFmha(PhasedFmha):
     ) -> None:
         fallback.warn_unsupported_sage_smoothing(forward_args)
 
+    @torch.compiler.disable
     def run_generation(self, params: FmhaParams) -> None:
         thop.flash_mla_run_generation(params)
 

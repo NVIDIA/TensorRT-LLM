@@ -69,6 +69,33 @@ def test_fallback_support_follows_native_input_requirements(overrides, expected)
 
 
 @_NEEDS_GPU
+@pytest.mark.parametrize("mode", ["separate", "cross", "sage"])
+def test_fallback_admits_separate_qkv_only_for_cross_and_sage(mode: str) -> None:
+    with native_batch(torch.bfloat16, num_contexts=1, num_generations=1) as (attn, metadata, qkv):
+        q_size = attn.num_heads * attn.head_dim
+        kv_size = attn.num_kv_heads * attn.head_dim
+        q, k, v = (t.contiguous() for t in qkv.split([q_size, kv_size, kv_size], dim=-1))
+        sage = (
+            {
+                "sage_attn_num_elts_per_blk_q": 1,
+                "sage_attn_num_elts_per_blk_k": 16,
+                "sage_attn_num_elts_per_blk_v": 1,
+            }
+            if mode == "sage"
+            else {}
+        )
+        forward_args = native_forward_args(attn, metadata, qkv, is_fused_qkv=False, **sage)
+        cross = (
+            patch.object(type(metadata), "is_cross", property(lambda self: True))
+            if mode == "cross"
+            else nullcontext()
+        )
+        with cross:
+            supported = FallbackFmha(attn).is_supported(q, k, v, metadata, forward_args)
+        assert supported is (mode != "separate")
+
+
+@_NEEDS_GPU
 def test_fallback_rejects_raw_fp8_input() -> None:
     with native_batch(torch.bfloat16, num_contexts=1, num_generations=1) as (attn, metadata, qkv):
         forward_args = native_forward_args(attn, metadata, qkv)
