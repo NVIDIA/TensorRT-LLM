@@ -1008,6 +1008,10 @@ class Etcd3ClusterStorage(ClusterStorage):
                 # the consumer gets them after the resync, in etcd's order.
                 handle.resync(records)
                 await self._start_watch(handle, start_revision=revision + 1)
+                if self._watch_handles.get(handle.key_prefix) is not handle:
+                    # unwatch() ran while the stream started; nothing reads it.
+                    handle.cancel_event()
+                    return
                 # etcd does not report a watch that it did not start because
                 # it rejected the login token; a read with the same login does.
                 client.get(handle.key_prefix)

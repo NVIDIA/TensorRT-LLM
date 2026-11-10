@@ -562,6 +562,21 @@ async def test_unwatched_prefix_is_not_watched_again():
 
 
 @pytest.mark.asyncio
+async def test_stream_started_after_an_unwatch_is_cancelled():
+    def unwatch(callback):
+        # The prefix is unwatched while the new stream starts.
+        asyncio.run_coroutine_threadsafe(storage.unwatch(PREFIX), loop).result(5)
+
+    loop = asyncio.get_running_loop()
+    client, storage = _storage(client=_OnWatch({2: unwatch}))
+    handle = await storage.watch(PREFIX)
+    client.callbacks[PREFIX](None)
+    await asyncio.sleep(0)
+    await asyncio.wait_for(handle.restart_task, 1)
+    assert len(client.start_revisions) == 2 and client.callbacks == {}
+
+
+@pytest.mark.asyncio
 async def test_events_added_by_the_caller_are_not_verified():
     # The cluster manager puts the records it has read into the queue before draining it.
     _, storage = _storage()
