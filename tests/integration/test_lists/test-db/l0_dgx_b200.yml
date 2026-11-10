@@ -18,6 +18,7 @@ l0_dgx_b200:
       backend: pytorch
       orchestrator: mpi
   tests:
+  - unittest/_torch/visual_gen/multi_gpu/test_checkpoint_prefetch_distributed.py TIMEOUT (5)
   # Two-rank cases include uneven/empty attention-DP batches and bounded CSA2 replay.
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world2-row-sharded]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_bounded_replay[world2]
