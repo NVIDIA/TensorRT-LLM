@@ -52,7 +52,6 @@ l0_gb300:
   - unittest/_torch/speculative/hw_agnostic/test_dspark_v41.py
   - unittest/_torch/modules/test_mhc.py::test_fused_hc_lagged_matches_eager_composition
   # CSA2 kernel, indexer, chunked prefill and prefix-cache parity on Grace Blackwell.
-  # test_packed_attention_parity requires capability (10, 0). GB200 runs it.
   - unittest/_torch/attention/sparse/csa2/test_kernel.py::test_native_fp8_staging_exact_bytes
   - unittest/_torch/attention/sparse/csa2/test_indexer.py::test_native_paged_owner_indexer_and_graph
   - unittest/_torch/attention/sparse/csa2/test_module.py::test_native_chunked_compression

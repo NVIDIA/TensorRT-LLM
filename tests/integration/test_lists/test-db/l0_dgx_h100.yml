@@ -222,8 +222,6 @@ l0_dgx_h100:
       auto_trigger: gpt_oss
       orchestrator: mpi
   tests:
-  # test_w4_4gpus is skip_pre_blackwell, and its TRITON param is
-  # skip_no_hopper, so these ids skip on both H100 and Blackwell.
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4-auto]
 - condition:
     ranges:

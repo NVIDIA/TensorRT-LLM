@@ -33,8 +33,6 @@ l0_rtx_pro_6000:
   - unittest/_torch/kernels/parallel/test_finegrained_mixed_dtype_gemm.py
   - unittest/_torch/kernels/parallel/test_weight_only_quant_linear.py
   - unittest/_torch/kernels/parallel/test_weight_only_quant_gemm.py
-  # test_w4a8_linear skips when SM>103. The kernels/parallel directory on
-  # l0_h100, l0_b200, and l0_b300 already collects it.
   - unittest/_torch/modules/mamba/test_flashinfer_chunk_gdn.py
   - unittest/_torch/modules/test_fused_rmsnorm_fp4_quantize.py
   - unittest/_torch/modules/test_swiglu_nvfp4_quantize.py
