@@ -336,8 +336,8 @@ def test_kda_decode_matches_reference(num_heads):
 
 @pytest.mark.parametrize("batch", [1, 3])
 @pytest.mark.parametrize("t_steps", [2, 3])
-@pytest.mark.parametrize("batched", [False, True], ids=["per_step", "batched"])
-def test_kda_verify_matches_sequential_decode(batch, t_steps, batched):
+@pytest.mark.parametrize("mode", ["per_step", "batched", "batched_fused_proj"])
+def test_kda_verify_matches_sequential_decode(batch, t_steps, mode):
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
     torch.manual_seed(0)
@@ -353,13 +353,19 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps, batched):
     # load_weights(); with random weights it holds heap garbage, and a
     # NaN/Inf bit pattern poisons both paths identically (nvbug 6599150).
     torch.nn.init.normal_(runtime.dt_bias, std=0.1)
-    if batched:
+    t_max = t_steps
+    if mode == "batched_fused_proj":
+        # Fused projections feed the strided-section inputs of the one-launch
+        # verify, and spare time slots exercise the scratch-buffer row stride.
+        runtime.finalize_decode_weights()
+        t_max = t_steps + 1
+    if mode == "per_step":
+        runtime._packed_conv_weight = None
+    else:
         # The packed convolution weight selects the one-launch verify path.
         runtime._build_mtp_conv_weights()
-    else:
-        runtime._packed_conv_weight = None
     slots = batch + 2  # non-trivial slot mapping
-    cache = _LayerCache(slots, 3 * dim, w - 1, h, lin["head_dim"], lin["head_dim"], t_steps, device)
+    cache = _LayerCache(slots, 3 * dim, w - 1, h, lin["head_dim"], lin["head_dim"], t_max, device)
     slot_indices = torch.arange(2, 2 + batch, device=device, dtype=torch.long)
 
     # Random-but-fixed starting state and inputs.

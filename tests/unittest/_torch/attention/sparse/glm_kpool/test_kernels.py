@@ -720,6 +720,9 @@ def test_fp8_sparse_core_sm120_matches_dequantized_cache_and_replays_graph(heads
 
 @pytest.mark.skipif(not HAS_FLASH_MLA, reason="FlashMLA not available")
 @pytest.mark.skipif(get_sm_version() < 90, reason="FlashMLA requires SM90 (Hopper) or later")
+@pytest.mark.skipif(
+    get_sm_version() in (120, 121), reason="SM120/121 run FlashInfer's FP8 sparse MLA instead"
+)
 @pytest.mark.parametrize("num_tokens", [1, 4, 16])
 def test_split_topk_sparse_core_matches_single_call(num_tokens):
     """Decode-sized calls split over top-k chunks match the single-call kernel."""
@@ -745,11 +748,15 @@ def test_split_topk_sparse_core_matches_single_call(num_tokens):
     ).int()
     indices[:, -61:] = -1  # Padding tail, as in the expanded k-pool rows.
     indices[0, : 2 * 128] = -1  # Whole chunks without a valid row.
+    if num_tokens > 1:
+        indices[-1] = -1  # A token without any valid row, e.g. a padded graph slot.
 
     expected = make_backend(split=False)._dispatch_sparse_core(q, kv_rows, indices)
     actual = make_backend(split=True)._dispatch_sparse_core(q, kv_rows, indices)
     assert actual.shape == expected.shape == (num_tokens, 16, 512)
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-2)
+    if num_tokens > 1:
+        assert torch.count_nonzero(actual[-1]) == 0
 
 
 def test_merge_split_attention_matches_reference():
@@ -760,15 +767,18 @@ def test_merge_split_attention_matches_reference():
     ).to(torch.bfloat16)
     lse = torch.randn(num_tokens * splits, kernel_heads, device="cuda", generator=generator) * 4
     lse[1] = float("inf")  # A chunk without valid rows.
+    lse[2 * splits : 3 * splits] = float("inf")  # A token without valid rows in any chunk.
 
     actual = merge_split_attention(out, lse, num_tokens, splits, heads)
 
     lse_ref = lse.view(num_tokens, splits, kernel_heads)[..., :heads]
     lse_ref = torch.where(torch.isinf(lse_ref), torch.full_like(lse_ref, float("-inf")), lse_ref)
-    weights = torch.softmax(lse_ref, dim=1)
+    # Softmax over all -inf is NaN; the merge returns zeros for such a token.
+    weights = torch.softmax(lse_ref, dim=1).nan_to_num(0.0)
     parts = out.view(num_tokens, splits, kernel_heads, dim)[:, :, :heads].float()
     expected = (weights[..., None] * parts).sum(dim=1)
     torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
+    assert torch.count_nonzero(actual[2]) == 0
 
 
 @pytest.mark.parametrize("context", [False, True])

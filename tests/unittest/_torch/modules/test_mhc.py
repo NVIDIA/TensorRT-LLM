@@ -686,6 +686,8 @@ def test_mhc_fused_hc_split_dg_tactics_without_mma(monkeypatch):
 
     monkeypatch.setattr(mhc_cuda, "_fused_hc_mma_supported", lambda: False)
     monkeypatch.setattr(mhc_cuda, "_get_dg_fn", lambda: object())
+    # The inputs live on the CPU, so skip the device query of the small-M pinning check.
+    monkeypatch.setattr(mhc_cuda, "_fused_hc_pins_small_m_half_fma", lambda device: False)
     runner = mhc_cuda.MhcFusedHcRunner(
         n=4,
         hidden_size=4096,
