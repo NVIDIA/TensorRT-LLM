@@ -32,7 +32,7 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import Breakable
 from tensorrt_llm._torch.pyexecutor.context_logits_plan import (
     ContextLogitsPlan,
     context_logits_rows,
-    keep_sampled_context_rows,
+    store_context_logits_from_full_rows,
 )
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
@@ -148,6 +148,21 @@ class PrefillCompiledModel(torch.nn.Module):
             return super().__getattr__(name)
         except AttributeError:
             return getattr(super().__getattr__("eager_model"), name)
+
+
+def _full_context_rows_need_storing(scheduled_requests: ScheduledRequests) -> bool:
+    """Whether every-token logits must be stored and dropped before post-processing.
+
+    They can stay for the sampler only when every row is a requested context
+    row (no other context request, whose single sampling row the sampler
+    expects) and no post-processor will edit one of them.
+    """
+    return any(
+        not request.py_return_context_logits for request in scheduled_requests.context_requests
+    ) or any(
+        getattr(request, "py_logits_post_processors", None)
+        for request in scheduled_requests.all_requests()
+    )
 
 
 class DecoderRunner(ScheduledModelRunner):
@@ -873,14 +888,18 @@ class DecoderRunner(ScheduledModelRunner):
                 and isinstance(outputs, dict)
                 and outputs.get("logits") is not None
                 and not outputs.get("context_logits_handled", False)
+                and _full_context_rows_need_storing(semantic_requests)
             ):
                 # Without the plan the LM head projected every context token of
-                # every context request; keep the rows the sampler reads.
+                # every context request. Store the requested context logits
+                # before any post-processor edits a row, and leave the plan's
+                # layout: one sampling row per context request.
                 outputs = {
                     **outputs,
-                    "logits": keep_sampled_context_rows(
+                    "logits": store_context_logits_from_full_rows(
                         semantic_requests.context_requests, outputs["logits"]
                     ),
+                    "context_logits_handled": True,
                 }
             if isinstance(outputs, dict) and outputs.get(GREEDY_TOKENS_KEY) is not None:
                 outputs = self._logits_for_greedy_tokens(semantic_requests, outputs)

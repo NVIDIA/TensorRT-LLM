@@ -4,19 +4,20 @@
 
 Without the context-logits plan (always the case when a request has a
 per-request logits processor), a step that gathers context logits projects every
-context token. The rows of the requests that did not ask for context logits are
-dropped down to their last one, and a post-processor edits the row its request
-is sampled from.
+context token. The requested context logits are stored from those rows before
+any post-processor runs, leaving one sampling row per context request, and a
+post-processor edits the row its request is sampled from.
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.context_logits_plan import (
     context_logits_rows,
-    keep_sampled_context_rows,
+    store_context_logits_from_full_rows,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
 
@@ -29,6 +30,10 @@ def _context(chunk_size, *, returns_context_logits=False, processors=None, last_
     return SimpleNamespace(
         py_request_id=chunk_size,
         context_chunk_size=chunk_size,
+        prepopulated_prompt_len=0,
+        py_prompt_logprobs=None,
+        py_context_logits_explicit=True,
+        py_result=Mock(),
         py_return_context_logits=returns_context_logits,
         py_logits_post_processors=processors,
         is_last_context_chunk=last_chunk,
@@ -86,26 +91,37 @@ def test_rows_follow_whether_the_request_returns_context_logits(handled):
     )
 
 
-def test_only_the_requesting_chunks_keep_every_row():
+def _stored_rows(request):
+    (stored,), kwargs = request.py_result.append_context_logits.call_args
+    assert kwargs == {"reusable": False}
+    return stored[:, 0].tolist()
+
+
+def test_requested_chunks_are_stored_and_one_row_per_context_request_is_left():
     # Context rows 0-2 belong to the requester, 3-4 and 5 to the others; 6-7 are
     # generation rows.
-    requests = [_context(3, returns_context_logits=True), _context(2), _context(1)]
+    requester = _context(3, returns_context_logits=True)
+    others = [_context(2), _context(1)]
 
-    kept = keep_sampled_context_rows(requests, _rows(8))
+    kept = store_context_logits_from_full_rows([requester, *others], _rows(8))
 
-    assert kept[:, 0].tolist() == [0, 1, 2, 4, 5, 6, 7]
+    assert _stored_rows(requester) == [0, 1, 2]
+    assert all(not other.py_result.append_context_logits.called for other in others)
+    assert kept[:, 0].tolist() == [2, 4, 5, 6, 7]
 
 
-def test_nothing_is_copied_when_every_context_request_returns_context_logits():
-    logits = _rows(5)
-    requests = [_context(2, returns_context_logits=True), _context(3, returns_context_logits=True)]
+def test_editing_a_sampling_row_leaves_the_stored_context_logits_alone():
+    requester = _context(2, returns_context_logits=True)
 
-    assert keep_sampled_context_rows(requests, logits) is logits
+    kept = store_context_logits_from_full_rows([requester], _rows(2))
+    kept.fill_(-1.0)
+
+    assert _stored_rows(requester) == [0, 1]
 
 
 def test_fewer_rows_than_context_tokens_are_refused():
     with pytest.raises(ValueError, match="fewer than the 4 scheduled context tokens"):
-        keep_sampled_context_rows([_context(4)], _rows(2))
+        store_context_logits_from_full_rows([_context(4)], _rows(2))
 
 
 def test_a_processor_edits_the_row_its_request_is_sampled_from():
