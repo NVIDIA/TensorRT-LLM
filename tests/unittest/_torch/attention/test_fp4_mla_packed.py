@@ -66,36 +66,51 @@ def _plan_mod():
 
 
 @pytest.mark.parametrize(
-    "tiles,capacity,wave_tasks,expected_tiles_per_task,expected_begins",
+    "tiles,capacity,wave_tasks,wave_plan,expected_tiles_per_task,expected_begins",
     [
         # Even batch under one wave (helix16 B4, 6 m-tiles -> 17 wave tasks): one wave of 32-tile tasks.
-        ([128, 128, 128, 128], 24, 17, 32, [0, 4, 8, 12, 16]),
+        ([128, 128, 128, 128], 24, 17, True, 32, [0, 4, 8, 12, 16]),
+        ([128, 128, 128, 128], 24, 17, False, 32, [0, 4, 8, 12, 16]),
         # One long request among short ones: 16-tile tasks; the one task past the wave is a short tail.
-        ([1, 79, 3, 176], 24, 17, 16, [0, 1, 6, 7, 18]),
+        ([1, 79, 3, 176], 24, 17, True, 16, [0, 1, 6, 7, 18]),
+        # The rule takes most of the slots (two-wave target, fit by the fallback share).
+        ([1, 79, 3, 176], 24, 17, False, 13, [0, 1, 8, 9, 23]),
         # Full machine, longest 1.5x above the wave share: 100-tile tasks, the tails in a second wave.
-        ([128] * 15 + [200], 48, 17, 100, list(range(0, 34, 2))),
+        ([128] * 15 + [200], 48, 17, True, 100, list(range(0, 34, 2))),
+        # The rule's two-wave target also halves the short requests.
+        ([128] * 15 + [200], 48, 17, False, 67, list(range(0, 32, 2)) + [33]),
         # Full machine, longest within 1.5x of the wave share: no split at all.
-        ([128] * 15 + [130], 48, 17, 130, list(range(17))),
+        ([128] * 15 + [130], 48, 17, True, 130, list(range(17))),
+        ([128] * 15 + [130], 48, 17, False, 130, list(range(17))),
         # Strong skew in a full machine: eleven 94-tile tasks for the long request, short tails behind.
-        ([128] * 15 + [1024], 48, 17, 94, list(range(0, 32, 2)) + [41]),
+        ([128] * 15 + [1024], 48, 17, True, 94, list(range(0, 32, 2)) + [41]),
+        # The rule gives the long request twelve tasks.
+        ([128] * 15 + [1024], 48, 17, False, 86, list(range(0, 32, 2)) + [42]),
         # Strong skew in a small batch: 94-tile tasks, 11 for the long request, fill one wave.
-        ([128, 128, 128, 1024], 24, 17, 94, [0, 2, 4, 6, 17]),
+        ([128, 128, 128, 1024], 24, 17, True, 94, [0, 2, 4, 6, 17]),
+        # The rule's two-wave target, fit by the fallback share.
+        ([128, 128, 128, 1024], 24, 17, False, 71, [0, 2, 4, 6, 21]),
         # A single request fills one wave with 16 tasks; a short one is not worth splitting.
-        ([128], 16, 17, 8, [0, 16]),
-        ([8], 16, 17, 8, [0, 1]),
+        ([128], 16, 17, True, 8, [0, 16]),
+        ([8], 16, 17, True, 8, [0, 1]),
+        # The rule fills one wave too, or honours the minimum task length.
+        ([128], 16, 17, False, 8, [0, 16]),
+        ([8], 16, 17, False, 2, [0, 4]),
         # No spare slots: one task per request, however long.
-        ([5, 900], 2, 17, 900, list(range(3))),
+        ([5, 900], 2, 17, True, 900, list(range(3))),
+        ([5, 900], 2, 17, False, 900, list(range(3))),
     ],
 )
 def test_plan_packed_tasks_balances_by_kv_length(
     tiles: list[int],
     capacity: int,
     wave_tasks: int,
+    wave_plan: bool,
     expected_tiles_per_task: int,
     expected_begins: list[int],
 ) -> None:
     tiles_per_task, begins = _plan_mod().plan_packed_tasks(
-        tiles, capacity, wave_tasks, wave_plan=True
+        tiles, capacity, wave_tasks, wave_plan=wave_plan
     )
     assert tiles_per_task == expected_tiles_per_task
     assert begins == expected_begins
@@ -152,7 +167,8 @@ def test_plan_task_order_runs_full_tasks_then_longest_tails() -> None:
 def test_plan_without_wave_plan_keeps_the_rule_and_request_order() -> None:
     reduce_mod = _plan_mod()
     plan = reduce_mod.plan_packed_tasks
-    # TRTLLM_FP4_MLA_PACKED_WAVE_PLAN=0: the rule's length, as before the wave simulation.
+    # The default plan (TRTLLM_FP4_MLA_PACKED_WAVE_PLAN=0): rule-based task length, request
+    # order, no wave simulation.
     assert plan([1, 79, 3, 176], 24, 17, wave_plan=False) == (13, [0, 1, 8, 9, 23])
     assert plan([128] * 15 + [1024], 48, 17, wave_plan=False) == (
         86,
