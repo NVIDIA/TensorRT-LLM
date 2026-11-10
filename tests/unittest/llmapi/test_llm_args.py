@@ -2104,9 +2104,9 @@ def test_KvCacheConfig_disk_offload_options(tmp_path):
                         str(tmp_path),
                         num_io_threads=4,
                         write_through=True).validate()
-    with pytest.raises(ValueError, match="numIoThreads"):
+    with pytest.raises(ValueError, match="writeThrough requires numIoThreads"):
         DiskCacheTierConfig(2048, str(tmp_path), write_through=True).validate()
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="numIoThreads must be >= 0"):
         DiskCacheTierConfig(2048, str(tmp_path), num_io_threads=-1).validate()
 
 

@@ -944,6 +944,7 @@ void StorageManager::addRetainedCopy(Page& page, CacheLevel level, PoolGroupInde
     if (auto it = mRetainedByPage.find(&page); it != mRetainedByPage.end())
     {
         eraseRetainedCopy(it->second);
+        ++mKeepCopyStats.reclaimed;
     }
     mRetainedCopies.push_back(RetainedCopy{&page, level, pgIdx, std::move(slot), false});
     try
