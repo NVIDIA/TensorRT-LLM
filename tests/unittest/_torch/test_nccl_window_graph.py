@@ -692,6 +692,64 @@ def test_eager_decoder_layer_scopes_after_first_window_request(
     ]
 
 
+def test_eager_decoder_layer_scopes_after_failed_first_window_request(
+    tensor_scope_events: list[tuple], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed call that makes the first window request leaves its leases to the enclosing scope.
+
+    The enclosing scope's failed exit handles them, and the next call is scoped.
+    """
+    from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
+
+    class TestLayer(DecoderLayer):
+        def forward(self, hidden_states: list[object], *, fail: bool = False) -> list[object]:
+            if fail:
+                raise RuntimeError("layer failed")
+            return hidden_states
+
+    # Before the failing call, which makes the first request; before the next call.
+    requested_states = [False, True]
+    queries = []
+
+    def has_requested_nccl_window_buffers() -> bool:
+        queries.append(requested_states[len(queries)])
+        return queries[-1]
+
+    def release_nccl_window_tensor_scope_leases(
+        inputs: list[object], outputs: list[object]
+    ) -> None:
+        tensor_scope_events.append(("release", inputs, outputs))
+
+    monkeypatch.setattr(
+        torch.ops.trtllm, "has_requested_nccl_window_buffers", has_requested_nccl_window_buffers
+    )
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "release_nccl_window_tensor_scope_leases",
+        release_nccl_window_tensor_scope_leases,
+    )
+    layer = TestLayer()
+    handles = nccl_window_tensor_scope.install_eager_nccl_window_tensor_scopes(layer)
+    forward_inputs = [object()]
+    output = [object()]
+    try:
+        with pytest.raises(RuntimeError, match="layer failed"):
+            with nccl_window_tensor_scope.nccl_window_tensor_scope(forward_inputs):
+                layer(output, fail=True)
+        assert tensor_scope_events == [
+            ("begin", forward_inputs),
+            ("end", forward_inputs, [], True),
+        ]
+        assert layer(output) is output
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert queries == [False, True]
+    assert [event[0] for event in tensor_scope_events] == ["begin", "end", "begin", "end"]
+    assert tensor_scope_events[-1][2:] == (output, False)
+
+
 def test_eager_decoder_layer_hook_allows_no_cuda_output(tensor_scope_events):
     from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 
