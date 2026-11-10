@@ -11,6 +11,7 @@ helpers gate backend selection so that fails early with a clear message.
 
 from __future__ import annotations
 
+from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
 from .kernels.msa_utils import msa_package_available
@@ -22,7 +23,7 @@ MSA_PACKAGE = "fmha_sm100"
 
 
 def ensure_msa_available() -> None:
-    """Raise RuntimeError if the MSA sparse attention path cannot run here."""
+    """Raise UnsupportedError or RuntimeError if the MSA sparse attention path cannot run here."""
     # Function-local: msa_indexer reaches the trtllm attention classes through
     # this package's init, which a module-scope import here would cycle with.
     from .msa_indexer import cutedsl_score_runner
@@ -34,7 +35,7 @@ def ensure_msa_available() -> None:
         )
     if not is_sm_100f():
         sm_version = get_sm_version()
-        raise RuntimeError(
+        raise UnsupportedError(
             "MiniMax-M3 MSA sparse attention requires an SM100 or SM103 device, "
             f"but the current device reports SM version {sm_version}."
         )

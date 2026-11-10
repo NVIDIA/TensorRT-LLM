@@ -12,7 +12,7 @@
     ],
     "$schema": "http://json-schema.org/draft-07/schema#",
     "schemaMeta": {
-        "schemaVersion": "0.7",
+        "schemaVersion": "0.8",
         "clientId": "616561816355034",
         "clientName": "TrtllmTelemetry",
         "definitionVersion": "2.0"
@@ -143,6 +143,18 @@
                     },
                     "llmInitializationFailures": {
                         "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "priorStartupFailures": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "startupStateStatus": {
+                        "type": "string",
+                        "enum": [
+                            "",
+                            "persisted",
+                            "new",
+                            "unavailable"
+                        ]
                     }
                 },
                 "required": [
@@ -176,7 +188,9 @@
                     "llmInstancesCreated",
                     "activeLlmInstances",
                     "maxConcurrentLlmInstances",
-                    "llmInitializationFailures"
+                    "llmInitializationFailures",
+                    "priorStartupFailures",
+                    "startupStateStatus"
                 ]
             },
             "trtllm_heartbeat": {
@@ -312,6 +326,30 @@
                     },
                     "llmInitializationFailures": {
                         "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "errorCategory": {
+                        "type": "string",
+                        "enum": [
+                            "",
+                            "config_input",
+                            "resource",
+                            "unsupported",
+                            "model_load",
+                            "runtime_init",
+                            "other"
+                        ]
+                    },
+                    "priorStartupFailures": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "startupStateStatus": {
+                        "type": "string",
+                        "enum": [
+                            "",
+                            "persisted",
+                            "new",
+                            "unavailable"
+                        ]
                     }
                 },
                 "required": [
@@ -329,7 +367,10 @@
                     "llmInstancesCreated",
                     "activeLlmInstances",
                     "maxConcurrentLlmInstances",
-                    "llmInitializationFailures"
+                    "llmInitializationFailures",
+                    "errorCategory",
+                    "priorStartupFailures",
+                    "startupStateStatus"
                 ]
             }
         }
