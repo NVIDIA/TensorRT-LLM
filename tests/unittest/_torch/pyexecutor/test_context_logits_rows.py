@@ -93,7 +93,7 @@ def test_rows_follow_whether_the_request_returns_context_logits(handled):
 
 def _stored_rows(request):
     (stored,), kwargs = request.py_result.append_context_logits.call_args
-    assert kwargs == {"reusable": False}
+    assert kwargs == {"reusable": True}
     return stored[:, 0].tolist()
 
 
