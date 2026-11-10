@@ -90,6 +90,8 @@ class K3MoeFront(OpWrapper):
     shared activation's 2e-2 relative gate for fast tanh/sigmoid. General
     payload sums can differ from another GEMM: kernel tests bound changed
     routing to a 16th/17th-key gap <=1e-4 and >99.9% equal MXFP8 bytes.
+    Kernel tests also cover fabric handles and a quantization CTA held
+    while head-flags k3_moe advances the epoch (publish order).
     Routed experts, shared-down/rank reduction, routed reduction and latent-
     up remain outside this front; its producer owns x.
 

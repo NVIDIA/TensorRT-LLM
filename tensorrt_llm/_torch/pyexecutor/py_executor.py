@@ -48,7 +48,8 @@ from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.multimodal import (get_multimodal_item_metadata,
                                             strip_mm_data_for_generation)
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
-                                          ExecutorMemoryType, PeftCacheConfig,
+                                          ExecutorMemoryType,
+                                          GenPreemptionConfig, PeftCacheConfig,
                                           PrefillCudaGraphBackend,
                                           WaitingQueuePolicy)
 from tensorrt_llm.llmapi.utils import \
@@ -134,6 +135,7 @@ from .scheduler.adp_router import (ADPRouter, RankIterStatsPayload, RankState,
                                    count_retiring_requests)
 from .scheduler.gen_admission_queue import (GenAdmissionConfig,
                                             GenAdmissionWaitingQueue)
+from .scheduler.gen_preemption import create_gen_preemption
 from .scheduler.scheduler import RemoteTailPhase
 from .scheduler.scheduler_v2 import KVCacheV2Scheduler
 
@@ -726,6 +728,7 @@ class PyExecutor:
         enable_adp_dummy_fixes: bool = False,
         enable_scheduler_aware_adp_dummy: bool = False,
         enable_non_overlap_adp_forward_intent: bool = False,
+        gen_preemption: Optional[GenPreemptionConfig] = None,
         transfer_budget_is_explicit: bool = False,
     ) -> None:
         if kv_pool_rebalance_check_interval <= 0:
@@ -834,6 +837,7 @@ class PyExecutor:
         )
         self._resources_released = False
         self._closed = False
+        self._gen_preemption_settings = gen_preemption
         self._initialize_execution(
             PyExecutorResources(
                 resource_manager=resource_manager,
@@ -1215,6 +1219,9 @@ class PyExecutor:
         if hasattr(self.scheduler, "set_async_transfer_manager"):
             self.scheduler.set_async_transfer_manager(
                 self.async_transfer_manager)
+        if hasattr(self.scheduler, "set_retiring_gen_receives_probe"):
+            self.scheduler.set_retiring_gen_receives_probe(
+                lambda: self.disagg.has_local_retiring_gen_receives)
 
         # Router is built after async_transfer_manager so KVCacheAwareADPRouter
         # can receive the transfer-manager reference at construction time.
@@ -1450,6 +1457,9 @@ class PyExecutor:
         if self.dist.rank == 0 and isinstance(self.waiting_queue,
                                               GenAdmissionWaitingQueue):
             self._first_token_timer = self.waiting_queue.enable_rank0()
+        # GEN slot preemption (scheduler_config.gen_preemption).
+        self._gen_preemption = create_gen_preemption(
+            self, getattr(self, "_gen_preemption_settings", None))
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
@@ -2900,7 +2910,8 @@ class PyExecutor:
     @property
     def should_stop_processing(self) -> bool:
         return self.is_shutdown and len(self.active_requests) == 0 and \
-            len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers()
+            len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers() and \
+            not self.disagg.has_retiring_gen_receives
 
     def _has_pending_connector_transfers(self) -> bool:
         connector = getattr(self, "kv_connector_manager", None)
@@ -4035,8 +4046,10 @@ class PyExecutor:
                                 # Copy the batch outputs as sampler inputs
                                 # to avoid next forward step overwriting them.
                                 batch_outputs_copy = {
-                                    name: tensor.clone()
-                                    for name, tensor in batch_outputs.items()
+                                    name:
+                                    value.clone() if isinstance(
+                                        value, torch.Tensor) else value
+                                    for name, value in batch_outputs.items()
                                 }
                                 self.sample_stream.wait_stream(
                                     torch.cuda.current_stream())
@@ -6632,7 +6645,8 @@ class PyExecutor:
         if pending.control_requires_drain:
             drained = (len(self.active_requests) == 0
                        and len(self.waiting_queue) == 0
-                       and not self._has_pending_connector_transfers())
+                       and not self._has_pending_connector_transfers()
+                       and not self.disagg.has_retiring_gen_receives)
             if self.enable_attention_dp and self.dist.world_size != 1:
                 # Attention-DP ranks drain independently (per-rank queues), and
                 # the retire below issues attention-DP gathers that every rank
@@ -8017,9 +8031,11 @@ class PyExecutor:
         # blocking would keep the loop from reaching the
         # `should_stop_processing` check that ends it, deadlocking shutdown()
         # on `shutdown_event`.
+        pending_retirement = self.disagg.has_retiring_gen_receives
         idle = (total_num_live_requests == 0 and len(waiting_queue) == 0
                 and not self.is_shutdown
-                and not self._has_pending_connector_transfers())
+                and not self._has_pending_connector_transfers()
+                and not pending_retirement)
         if idle:
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
@@ -8039,7 +8055,10 @@ class PyExecutor:
                 timeout = datetime.timedelta(0)
             with self.hang_detector.pause():
                 new_requests.extend(
-                    self.executor_request_queue.get_from_request_queue(timeout))
+                    self.executor_request_queue.get_from_request_queue(
+                        timeout,
+                        wait_for_batch=not (pending_retirement
+                                            or self.is_shutdown)))
 
         if connector is not None and not self.enable_attention_dp and self.dist.rank == 0:
             completed = connector.take_finished_prefix_loads()
@@ -8338,6 +8357,19 @@ class PyExecutor:
         # 2. Fetch and enqueue to waiting queue
         self._fetch_and_enqueue_requests(waiting_queue, total_num_live_requests)
         self._cancel_queued_context_requests(waiting_queue)
+
+        # 2b. GEN slot preemption: resume paused requests, then pause running
+        # ones for at-risk waiting requests.
+        preemption = getattr(self, "_gen_preemption", None)
+        if preemption is not None:
+            total_num_active_requests = preemption.step(
+                active_requests, self.request_broadcaster.rank0_now,
+                self._get_request_admission_capacity(),
+                total_num_active_requests, waiting_queue)
+            self.scheduler.set_gen_paused_ids(preemption.paused_ids,
+                                              preemption.resumed_ids)
+            if self.dist.rank == 0:
+                preemption.maybe_log()
 
         # 3. Pop requests from waiting queue
         new_requests, placement = self._pop_from_waiting_queue(
@@ -8977,6 +9009,33 @@ class PyExecutor:
         scheduled_requests.scheduled_mm_encoder_items = (
             scheduler_output.scheduled_mm_encoder_items)
         scheduled_requests.recompute_paused_requests = scheduler_output.recompute_paused_requests
+        if getattr(self, "_gen_preemption", None) is not None:
+            retained_ids = set(self._gen_preemption.paused_ids)
+            scheduled_ids = {
+                req.py_request_id
+                for req in scheduled_requests.generation_requests
+            }
+            evicted_ids = {
+                req.py_request_id
+                for req in (scheduled_requests.paused_requests +
+                            scheduled_requests.recompute_paused_requests)
+            }
+            num_displaced = len(scheduled_ids
+                                & self._gen_preemption.forced_resumed_ids)
+            for req in self.active_requests:
+                if (num_displaced > 0
+                        and req.state == LlmRequestState.GENERATION_IN_PROGRESS
+                        and req.py_batch_idx is not None
+                        and req.py_request_id not in scheduled_ids
+                        and req.py_request_id not in retained_ids
+                        and req.py_request_id not in evicted_ids):
+                    # Forced resumes may displace another live decode request.
+                    # Its previous sample is harvested without a new forward.
+                    req.py_batch_idx = None
+                    self._gen_preemption.record_displaced(req)
+                    retained_ids.add(req.py_request_id)
+                    num_displaced -= 1
+            scheduled_requests.paused_in_place_ids = frozenset(retained_ids)
 
         self._maybe_record_hang_diagnostic_phase("scheduled",
                                                  scheduled_requests)
@@ -10356,9 +10415,11 @@ class PyExecutor:
                 num_context_logits_prefix_sum = [0]
                 prefix_sum = 0
                 num_context_tokens = 0
+                context_logits_handled = batch_outputs.get(
+                    "context_logits_handled", False)
                 for request in scheduled_batch.context_requests:
                     context_chunk_size = request.context_chunk_size
-                    prefix_sum += context_chunk_size if request.py_return_context_logits else 1
+                    prefix_sum += context_chunk_size if request.py_return_context_logits and not context_logits_handled else 1
                     num_context_logits_prefix_sum.append(prefix_sum)
                     num_context_tokens += context_chunk_size
 
@@ -10369,9 +10430,11 @@ class PyExecutor:
                 # returns no logits; no request of such a batch asks for them.
                 HandleLogits()(scheduled_batch.context_requests,
                                scheduled_batch.generation_requests,
-                               batch_outputs.get("logits"), beam_width,
+                               batch_outputs.get("logits"),
+                               beam_width,
                                num_context_logits_prefix_sum,
-                               self.sampler.is_generation_model())
+                               self.sampler.is_generation_model(),
+                               context_logits_handled=context_logits_handled)
 
                 HandleAdditionalOutputs()(scheduled_batch.context_requests,
                                           scheduled_batch.generation_requests,
@@ -10738,6 +10801,8 @@ class PyExecutor:
                 raise self._fatal_error
 
     def _terminate_request(self, request: LlmRequest) -> None:
+        if self.disagg.defer_gen_termination(request) is True:
+            return
         connector = getattr(self, "kv_connector_manager", None)
         if connector is not None:
             connector.release_unstarted_prefix_loads(request)
@@ -10989,9 +11054,18 @@ class PyExecutor:
                 continue
             if model_cancelled and not self._try_cancel_request(request):
                 continue
+            if (generation_waiting
+                    and id(request) in self._held_transfer_failures()):
+                # Progress retirement without replacing the earlier executor error.
+                if self.disagg.request_cancellation(request):
+                    request.state = LlmRequestState.DISAGG_TRANS_ERROR
+                continue
+            logically_cancelled = (generation_waiting and
+                                   self.disagg.cancel_gen_logically(request))
             # Even an unsubmitted CTX request may be in the transceiver's
             # peer-info wait set. Cancel there before a late ready can revive it.
-            if not self.disagg.request_cancellation(request):
+            if not logically_cancelled and not self.disagg.request_cancellation(
+                    request):
                 continue
             handled_cancel_ids.add(cancel_id)
             if request.state == LlmRequestState.DISAGG_TRANS_ERROR:
@@ -11054,6 +11128,20 @@ class PyExecutor:
             # until get_finished confirms that the blocks are no longer used.
             return False
         if self.kv_cache_transceiver is None:
+            return True
+
+        if (request.is_generation_only_request
+                and id(request) in self._held_transfer_failures()
+                and self.kv_cache_transceiver.
+                supports_idle_request_cancellation(request) is True):
+            if self.disagg.request_cancellation(request):
+                request.state = LlmRequestState.DISAGG_TRANS_ERROR
+            return False
+
+        # KV-moving connectors can read destination pages when cancellation
+        # finishes the request. Keep that handoff behind physical retirement.
+        if (not self._kv_connector_moves_kv
+                and self.disagg.cancel_gen_logically(request)):
             return True
 
         async_transfer_manager = getattr(self, "async_transfer_manager", None)

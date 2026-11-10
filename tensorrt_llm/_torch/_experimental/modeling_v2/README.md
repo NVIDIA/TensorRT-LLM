@@ -20,9 +20,16 @@ The `modeling_v2` LLM API option selects the implementation:
 
 | `modeling_v2` | Behavior |
 |---|---|
-| `off` (default) | Use Modeling V1. No Modeling V2 routing or target code is loaded. |
-| `auto` | Use a Modeling V2 target if one matches this deployment; otherwise use Modeling V1. |
+| `off` | Use Modeling V1. No Modeling V2 routing or target code is loaded. |
+| `auto` (default) | Use a Modeling V2 target if one matches this deployment; otherwise use Modeling V1. |
 | `require` | Use a Modeling V2 target, or raise an error that says why none matches. |
+
+Because `auto` is the default, a deployment that a target matches runs on
+Modeling V2 without any option set. Every other deployment runs on Modeling V1
+as before. Targets decorated with `@disable_v2_by_default` are the exception:
+under the default they are skipped, and a deployment uses them only when it
+sets `modeling_v2` to `auto` or `require` itself. See
+[Adding a family or a target](#adding-a-family-or-a-target).
 
 Python API:
 
@@ -36,6 +43,9 @@ LLM(model, modeling_v2="require")
 # trtllm-serve --config serve.yaml
 modeling_v2: require
 ```
+
+To opt out and always use Modeling V1, set `modeling_v2="off"` in the Python
+API or `modeling_v2: off` in the configuration file.
 
 Use `require` when you validate or benchmark a target, so the run cannot fall
 back to Modeling V1 without you noticing. A target can also read the mode with
@@ -143,6 +153,11 @@ example that uses no Modeling V1 model code.
    following the naming in [Families and targets](#families-and-targets). See
    [Model lifecycle](#model-lifecycle).
 3. In `route`, return the target class for the configurations it supports.
+   Under the default `auto` mode, every deployment `route` returns the target
+   for switches to it as soon as the target lands. To keep a target opt-in
+   until it is validated, decorate its class with `@disable_v2_by_default`
+   (from `tensorrt_llm._torch._experimental.modeling_v2`). Deployments then use
+   it only when they set `modeling_v2` to `auto` or `require` explicitly.
 4. Use catalog operations where they fit. Add new operations as `OpWrapper`s
    with tests. See [Writing operations](#writing-operations).
 5. For C++/CUDA code, follow the [native code guide](../../../../cpp/tensorrt_llm/modeling_v2/README.md).
@@ -365,8 +380,10 @@ whose implementation differs significantly from existing Modeling V1 models,
 and for optimizations specific to one model. Modeling V1 will eventually be
 deprecated, as the models it supports are deprecated, but not now.
 
-Users keep using the LLM API and `trtllm-serve`; the `modeling_v2` option,
-`off` by default, selects the implementation. See [Using it](#using-it).
+Users keep using the LLM API and `trtllm-serve`. The `modeling_v2` option
+selects the implementation. It defaults to `auto`, which uses a Modeling V2
+target where one matches the deployment and Modeling V1 everywhere else. See
+[Using it](#using-it).
 
 ### Is Modeling V2 a separate inference engine?
 
