@@ -1177,7 +1177,6 @@ def fp4_mla_4x_full_ctm(
     softmax_scale_log2: ctm.Float32,
     pv_output_scale: ctm.Float32,
     requested_cut: ctm.Int32,  # x79 ABI slot, unused: no PREFIX cut in FULL-only
-    vpfl_enable: ctm.Int32,  # vpfl: 1 = issue the warp-11 V/VSF L2 prefetch, 0 = skip it (long-KV cliff mitigation)
     task_capacity: ctm.Int32,  # split mode: plan slots (requests * splits) = plan table stride
     used_tasks: ctm.Int32,  # split mode: planned tasks actually launched; grid z = used_tasks * pairs_per_seq
     stream: cuda.CUstream,
@@ -1556,11 +1555,8 @@ def fp4_mla_4x_full_ctm(
         v_page_offset,
         softmax_scale_log2,
         pv_output_scale,
-        vpfl_enable,  # vpfl
         task_capacity,
         num_requests,  # split mode
-        v_pair_tma_tensor,
-        vsf_mma_tensor,  # vpfl
         page_size,
         query_len_per_seq,
         heads,
@@ -7307,7 +7303,7 @@ def _vh2_issue(
     v_page_offset: ctm.Int32,
     rank: ctm.Int32,
 ):
-    # vpfl: one tile's V/VSF packet (kai's warp-11 loop body minus page lookups / prefetches).
+    # One tile's V/VSF packet; the page lookups are hoisted into the loader's rolling window.
     bank = local_tile & ctm.Int32(1)
     vbank = local_tile & ctm.Int32(DS_V_BANKS - 1)
     if local_tile >= ctm.Int32(DS_V_BANKS):
@@ -7356,7 +7352,7 @@ def _vh2_lookup4(
     page_begin: ctm.Int32,
     page_count: ctm.Int32,
 ):
-    # vpfl: pages of tiles tile+4 / tile+5 (tile = even tile 2k of the current pair); clamped lookups,
+    # Pages of tiles tile+4 / tile+5 (tile = even tile 2k of the current pair); clamped lookups,
     # harmless past the chunk.
     n0 = _lookup_physical_page(
         mPageTable_pl, (tile + ctm.Int32(4)) * ctm.Int32(2), sequence, page_begin, page_count
@@ -7379,56 +7375,6 @@ def _vh2_lookup4(
         page_count,
     )
     return n0, n1, m0, m1
-
-
-@cute.jit
-def _vpfl_line(addr: ctm.Int64):
-    # vpfl: one L2 line prefetch through the LSU (no TMA engine request).
-    cute_inline_ptx("prefetch.global.L2 [{$r0}];", read_only_args=[addr])
-
-
-@cute.jit
-def _vpfl_prefetch(
-    mVPair,
-    mVSF16,
-    local_tile: ctm.Int32,
-    chunk_tiles: ctm.Int32,
-    pf0: ctm.Int32,
-    pf1: ctm.Int32,
-    pair_id: ctm.Int32,
-    pair_rank: ctm.Int32,
-    v_page_offset: ctm.Int32,
-    lane: ctm.Int32,
-):
-    # vpfl: L2-warm the V (8 KiB contiguous per page for this CTA: coordinates (0, 0, pair_id, page, pair_rank) of the
-    # V^T view, 4-bit elements) and VSF (2 KiB contiguous per page: coordinates (0, 0, pair_id*2, page) of the
-    # Uint16 view)
-    # of tile local_tile+2, one 128-byte line per lane per instruction; same guard as kai's tensor prefetch.
-    if local_tile + ctm.Int32(2) < chunk_tiles:
-        v_base = ctm.Int64(mVPair.iterator.toint())
-        s_base = ctm.Int64(mVSF16.iterator.toint())
-        for np in ctm.range_constexpr(2):
-            pf_page = pf0 if cutlass.const_expr(np == 0) else pf1
-            v_idx = cute.crd2idx(
-                (ctm.Int32(0), ctm.Int32(0), pair_id, pf_page + v_page_offset, pair_rank),
-                mVPair.layout,
-            )
-            v_addr = v_base + ctm.Int64(v_idx) // ctm.Int64(2) + ctm.Int64(lane) * ctm.Int64(128)
-            _vpfl_line(v_addr)
-            _vpfl_line(v_addr + ctm.Int64(4096))
-            s_idx = cute.crd2idx(
-                (ctm.Int32(0), ctm.Int32(0), pair_id * ctm.Int32(2), pf_page + v_page_offset),
-                mVSF16.layout,
-            )
-            s_addr = (
-                s_base
-                + ctm.Int64(s_idx) * ctm.Int64(2)
-                + ctm.Int64(lane & ctm.Int32(15)) * ctm.Int64(128)
-            )
-            if (
-                local_tile & ctm.Int32(1)
-            ) == pair_rank:  # vmc: VSF L2 warm by the designated CTA only
-                _vpfl_line(s_addr)
 
 
 @cute.jit
@@ -9003,11 +8949,8 @@ def ordered_v30_six_yield_kernel(
     v_page_offset: ctm.Int32,
     softmax_scale_log2: ctm.Float32,
     pv_output_scale: ctm.Float32,
-    vpfl_enable: ctm.Int32,  # vpfl: runtime switch (host gate on the KV footprint; see fp4_mla_4x_host.vpfl_decision)
     task_capacity: ctm.Int32,
     num_requests: ctm.Int32,  # split mode
-    mVPair: cute.Tensor,
-    mVSF16: cute.Tensor,  # vpfl: V^T / VSF global views (prefetch.global.L2 addressing)
     page_size: ctm.Constexpr,
     query_len_per_seq: ctm.Constexpr,
     heads: ctm.Constexpr,
@@ -9446,9 +9389,9 @@ def ordered_v30_six_yield_kernel(
                                     rank,
                                 )
     if warp == ctm.Int32(11):
-        # vpfl: tiles walked in pairs over a rolling window of resolved pages (vhoist2); the
-        # L2 prefetch of tile+2 is issued by all 32 lanes as prefetch.global.L2 lines (LSU path,
-        # nothing on the TMA engine) at the same program point as kai's tensor prefetch.
+        # Tiles are walked in pairs over a rolling window of resolved pages (vhoist2), so no page-table load
+        # sits between a V bank's release and its TMA issue.  There is no L2 prefetch: the four-bank ring
+        # issues the load itself a round ahead.
         vh_a0 = _lookup_physical_page(
             mPageTable_pl, begin_tile * ctm.Int32(2), sequence, page_begin, page_count
         )
@@ -9508,19 +9451,6 @@ def ordered_v30_six_yield_kernel(
             vh_e1 = ctm.Int32(0)
             vh_f0 = ctm.Int32(0)
             vh_f1 = ctm.Int32(0)
-            if vpfl_enable != ctm.Int32(0):
-                _vpfl_prefetch(
-                    mVPair,
-                    mVSF16,
-                    vh_t0,
-                    chunk_tiles,
-                    vh_c0,
-                    vh_c1,
-                    pair_id,
-                    pair_rank,
-                    v_page_offset,
-                    lane,
-                )
             _vh2_issue(
                 sV,
                 sVSF,
@@ -9540,19 +9470,6 @@ def ordered_v30_six_yield_kernel(
                     mPageTable_pl, vh_tile, sequence, page_begin, page_count
                 )
             if vh_t0 + ctm.Int32(1) < chunk_tiles:
-                if vpfl_enable != ctm.Int32(0):
-                    _vpfl_prefetch(
-                        mVPair,
-                        mVSF16,
-                        vh_t0 + ctm.Int32(1),
-                        chunk_tiles,
-                        vh_d0,
-                        vh_d1,
-                        pair_id,
-                        pair_rank,
-                        v_page_offset,
-                        lane,
-                    )
                 _vh2_issue(
                     sV,
                     sVSF,
