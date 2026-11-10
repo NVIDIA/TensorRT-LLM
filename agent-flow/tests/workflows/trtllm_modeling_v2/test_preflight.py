@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.checks import datasets
 from agent_flow.workflows.trtllm_modeling_v2.checks.verdict import GateResult
@@ -303,3 +304,30 @@ def test_every_anchor_is_found_by_what_identifies_it_in_this_checkout():
         ):
             unfindable.append(f"{key}: a search found {list(found[:3])}")
     assert not unfindable, f"anchors a search cannot find by what identifies them: {unfindable}"
+
+
+@pytest.mark.parametrize(
+    "limit,host_cache_size,warned",
+    [
+        (64 << 30, None, True),
+        (64 << 30, 8 << 30, False),
+        (None, None, False),
+        (900 << 30, None, False),
+    ],
+)
+def test_a_memory_limited_host_is_told_to_bound_the_kv_host_tier(
+    tmp_path, task_file, monkeypatch, limit, host_cache_size, warned
+):
+    spec = yaml.safe_load(task_file.read_text())
+    kv = {"enable_block_reuse": False}
+    if host_cache_size is not None:
+        kv["host_cache_size"] = host_cache_size
+    options = tmp_path / "core.yaml"
+    options.write_text(yaml.safe_dump({"kv_cache_config": kv}), encoding="utf-8")
+    spec["accuracy"]["llm_api_options"] = {"core": str(options)}
+    monkeypatch.setattr(preflight, "memory_limit_and_free", lambda: (limit, 690 << 30))
+    notes = preflight.check_kv_cache_configs(spec, {})
+    said = [n for n in notes if n.startswith("host memory:")]
+    assert bool(said) is warned
+    if warned:
+        assert "690 GiB" in said[0] and "64 GiB" in said[0] and "host_cache_size" in said[0]

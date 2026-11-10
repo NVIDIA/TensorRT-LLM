@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -636,6 +637,31 @@ def check_capture_lists(task_data: Mapping[str, Any]) -> list[str]:
     ]
 
 
+#: Where a process's memory limit is, under cgroup v2 and v1.
+CGROUP_MEMORY_LIMITS = (
+    Path("/sys/fs/cgroup/memory.max"),
+    Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+)
+
+
+def memory_limit_and_free() -> tuple[int | None, int | None]:
+    """This process's cgroup memory limit and the node's free memory, in bytes; ``None`` if unknown."""
+    limit = None
+    for path in CGROUP_MEMORY_LIMITS:
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if text.isdigit() and int(text) < 1 << 60:  # v1 writes a huge number for "none"
+            limit = int(text)
+        break
+    try:
+        free = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+    except (ValueError, OSError):
+        free = None
+    return limit, free
+
+
 def check_kv_cache_configs(
     task_data: Mapping[str, Any], checkpoint_config: Mapping[str, Any]
 ) -> list[str]:
@@ -668,6 +694,17 @@ def check_kv_cache_configs(
         notes.append(
             f"kv cache: {', '.join(labels)}: boot, acceptance and {_LLM_API_GATE} use "
             f"`kv_cache_config` {described}"
+        )
+    unbounded = [label(launch) for launch in launches if "host_cache_size" not in launch.config]
+    limit, free = memory_limit_and_free()
+    if unbounded and limit is not None and free is not None and limit < free:
+        notes.append(
+            f"host memory: {', '.join(unbounded)}: set no `kv_cache_config.host_cache_size`. "
+            f"The engine then sizes a KV host tier of up to its device quota from the "
+            f"node's free memory ({free / 2**30:.0f} GiB), while this process may use "
+            f"{limit / 2**30:.0f} GiB (its cgroup's limit): every engine a check or a "
+            f"worker starts pins that much host memory, and a few at once are OOM-killed. "
+            f"Set `host_cache_size` (bytes, e.g. 8589934592) in the options."
         )
     marker = hybrid_marker(checkpoint_config)
     exposed = [label(launch) for launch in launches if launch.reuse and not launch.snapshots]
