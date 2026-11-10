@@ -34,6 +34,7 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     MoEActivation,
     SimpleActivation,
     SiTuActivation,
+    SwigluActivation,
     SwigluBiasActivation,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEEnvFlag, collect_moe_environment
@@ -306,6 +307,7 @@ def _build_moe_module(
         num_experts=mc.num_experts,
         bias_dtype=dtype,
         profile_model_config=mc,
+        routed_scaling_factor=model.routed_scaling_factor,
     )
 
     model_config = _build_model_config(
@@ -351,6 +353,16 @@ def _build_moe_module(
     )
 
     swiglu_tensors = quantize_util.get_swiglu_tensors()
+    if model.swiglu_clamp is not None:
+        activation = SwigluActivation(clamp=model.swiglu_clamp)
+    elif swiglu_tensors:
+        activation = SwigluBiasActivation(
+            gate_sigmoid_scale=swiglu_tensors["swiglu_alpha"],
+            linear_offset=swiglu_tensors["swiglu_beta"],
+            clamp=swiglu_tensors["swiglu_limit"],
+        )
+    else:
+        activation = _plain_activation(activation_type)
 
     # Merge then unpack so SiTU can override activation_type / swiglu_alpha-beta.
     moe_kwargs = dict(
@@ -363,15 +375,7 @@ def _build_moe_module(
         model_config=model_config,
         weight_loading_mode=weight_loading_mode,
         bias=swiglu_gptoss_style,
-        activation=(
-            SwigluBiasActivation(
-                gate_sigmoid_scale=swiglu_tensors["swiglu_alpha"],
-                linear_offset=swiglu_tensors["swiglu_beta"],
-                clamp=swiglu_tensors["swiglu_limit"],
-            )
-            if swiglu_tensors
-            else _plain_activation(activation_type)
-        ),
+        activation=activation,
     )
     moe_kwargs.update(_situ_kwargs(model, moe_backend, quant_algo))
     moe = _create_moe_for_benchmark(**moe_kwargs)

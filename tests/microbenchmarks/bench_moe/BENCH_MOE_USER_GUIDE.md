@@ -667,6 +667,7 @@ includes full requested and observed dispatch/expert matrices.
 | `glm_5` | 256 | 8 | 6144 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
 | `deepseek_v4_pro` | 384 | 6 | 7168 | 3072 | pass `--quant` | `RENORMALIZE` |
 | `deepseek_v4_flash` | 256 | 6 | 4096 | 2048 | pass `--quant` | `RENORMALIZE` |
+| `deepseek_v4_1_flash` | 384 | 6 | 5120 | 2304 | pass `--quant` | `DEEPSEEK_V4` |
 | `qwen3_8` | 512 | 10 | 8192 | 2048 | pass `--quant` | `RENORMALIZE` |
 | `gpt_oss_120b` | 128 | 4 | 2880 | 2880 | `W4A8_MXFP4_MXFP8` | `RENORMALIZE` |
 
@@ -675,6 +676,11 @@ before dispatch and back up after combine, so the routed experts never see the
 model's `hidden_size`. For those, `Hidden` is the latent dimension — that is what
 both the expert GEMMs and the all-to-all payload actually run at. The outer
 down/up projections sit outside the MoE layer and are not benchmarked.
+
+`deepseek_v4_1_flash` uses the learned sqrt-softplus gate with zero synthetic
+score-correction bias, routed scaling factor 1.5, and SwiGLU clamp 10. It benchmarks
+the routed-expert branch; the checkpoint's separate shared expert, vision encoder,
+and DSpark draft experts are outside this preset.
 
 Custom shapes can be used instead of `--model`:
 

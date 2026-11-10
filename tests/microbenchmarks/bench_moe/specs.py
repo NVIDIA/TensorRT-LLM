@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from tensorrt_llm._torch.moe.fused_moe.routing import (
     DeepSeekV3MoeRoutingMethod,
+    DeepSeekV4MoeRoutingMethod,
     DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod,
     MiniMaxM2MoeRoutingMethod,
@@ -46,6 +47,7 @@ _ROUTING_METHODS: Dict[str, type] = {
     "RENORMALIZE_NAIVE": RenormalizeNaiveMoeRoutingMethod,
     "LLAMA4_RENORMALIZE": Llama4RenormalizeMoeRoutingMethod,
     "DEEPSEEK_V3": DeepSeekV3MoeRoutingMethod,
+    "DEEPSEEK_V4": DeepSeekV4MoeRoutingMethod,
     "MINIMAX_M2": MiniMaxM2MoeRoutingMethod,
     "SIGMOID_RENORM": SigmoidRenormMoeRoutingMethod,
 }
@@ -124,6 +126,8 @@ class ModelSpec:
     swiglu_beta: float = 0.0
     swiglu_limit: float = float("inf")
     activation_type: str = "SWIGLU"
+    swiglu_clamp: float | None = None
+    routed_scaling_factor: float = 1.0
     # SiTU constants (Kimi-K3: activation_situ_beta / activation_situ_linear_beta).
     # SiTU is gated, so ``activation_type`` stays SWIGLU and only the epilogue
     # changes; backends take it through their own parameters (see build.py).
@@ -131,6 +135,13 @@ class ModelSpec:
     situ_linear_beta: Optional[float] = None
 
     def __post_init__(self) -> None:
+        if self.swiglu_clamp is not None:
+            if self.swiglu_clamp <= 0:
+                raise ValueError("swiglu_clamp must be positive.")
+            if self.swiglu_gptoss_style:
+                raise ValueError(
+                    "Plain SwiGLU clamp and gpt-oss activation are mutually exclusive."
+                )
         if self.n_shared_experts < 0:
             raise ValueError(f"n_shared_experts must be >= 0, got {self.n_shared_experts}.")
         if self.shared_expert_mode not in ("fused", "unfused"):
@@ -144,7 +155,7 @@ class ModelSpec:
                 raise ValueError("SiTU betas must be positive.")
             if self.activation_type != "SWIGLU":
                 raise ValueError("SiTU requires the SwiGLU fc1 geometry (activation_type=SWIGLU).")
-            if self.swiglu_limit != float("inf"):
+            if self.swiglu_limit != float("inf") or self.swiglu_clamp is not None:
                 raise ValueError("SiTU is mutually exclusive with a gate/up clamp.")
 
     @property
@@ -393,6 +404,19 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         intermediate_size=2048,
         quant_algo=None,
         routing_method="RENORMALIZE",
+    ),
+    "deepseek_v4_1_flash": ModelSpec(
+        name="deepseek_v4_1_flash",
+        num_experts=384,
+        top_k=6,
+        hidden_size=5120,
+        intermediate_size=2304,
+        quant_algo=None,
+        routing_method="DEEPSEEK_V4",
+        n_group=1,
+        topk_group=1,
+        swiglu_clamp=10.0,
+        routed_scaling_factor=1.5,
     ),
     "gpt_oss_120b": ModelSpec(
         name="gpt_oss_120b",
