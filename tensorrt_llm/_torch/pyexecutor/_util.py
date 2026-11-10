@@ -2545,6 +2545,14 @@ class KvCacheCreator:
         """Why a manager hosting draft layer specs would refuse this layout, or None."""
         if draft_layout[2] == tensorrt_llm.bindings.DataType.NVFP4:
             return "the target's KV cache manager does not host NVFP4 draft layers"
+        draft_config = self._get_draft_kv_model_config().pretrained_config
+        if draft_config_defines_attention_layout(draft_config) and all(
+                get_layer_attention_window(draft_config, layer) is None
+                for layer in range(int(draft_config.num_hidden_layers))):
+            # Its checkpoint, not a worker setting, puts it in the target's
+            # full-attention lifecycle.
+            return ("the drafter uses full attention, so its layers would "
+                    "share a KV cache lifecycle with target layers")
         head_major = getattr(self._kv_cache_manager_cls,
                              "main_kv_is_head_major", None)
         if (self._is_disagg and head_major is not None and not head_major(

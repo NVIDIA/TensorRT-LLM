@@ -756,6 +756,7 @@ def _gate_creator(
     nvfp4_target: bool = True,
     speculative: bool = True,
     pp_size: int = 1,
+    full_attention_drafter: bool = False,
 ) -> KvCacheCreator:
     """``_dspark_creator`` with one setting changed, for the unify-gate table."""
     creator = _dspark_creator(is_disagg=is_disagg, context_kernel=context_kernel)
@@ -766,6 +767,9 @@ def _gate_creator(
             quant_mode=QuantMode.from_quant_algo(kv_cache_quant_algo=QuantAlgo.NVFP4)
         )
     draft.pretrained_config.num_key_value_heads = draft_kv_heads
+    if full_attention_drafter:
+        draft.pretrained_config.use_sliding_window = False
+        draft_window = None
     window = creator._unification_max_seq_len if draft_window is None else draft_window
     creator._get_draft_max_attention_window = lambda *_: [window]
     if pool_ratio is not None:
@@ -826,6 +830,15 @@ _GATE_CASES = [
     ("pp2", (False,), None, dict(pp_size=2), False, "pipeline_parallel_size is 2"),
     ("pp2", (True,), None, dict(pp_size=2), _RAISES, "pipeline_parallel_size is 2"),
     ("pp2-opt-out", (True,), "0", dict(pp_size=2), False, "pipeline_parallel_size is 2"),
+    # A drafter whose checkpoint is full attention falls back on every worker alike.
+    (
+        "full-attention-drafter",
+        _BOTH,
+        None,
+        dict(full_attention_drafter=True),
+        False,
+        "drafter uses full attention",
+    ),
     # A setting every worker shares decides first, so a worker-local one alongside it falls back.
     ("pp2-nvfp4-draft", (True,), None, dict(pp_size=2, nvfp4_draft=True), False, "NVFP4 draft"),
     ("pool-ratio-per-lifecycle", _BOTH, "1", dict(pool_ratio=[0.9, 0.1]), True, None),
@@ -885,6 +898,35 @@ _GATE_CASES = [
         "k_only",
     ),
 ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+@pytest.mark.parametrize(
+    ("draft_window", "full_attention_drafter"),
+    [(256, False), (1024, False), (None, True)],
+    ids=["windowed", "window-at-max-seq-len", "full-attention"],
+)
+def test_the_gate_refuses_what_the_manager_refuses(
+    monkeypatch: pytest.MonkeyPatch, draft_window: Optional[int], full_attention_drafter: bool
+) -> None:
+    """Aggregated serving shares draft KV only in layouts the manager builds, else falls back."""
+    torch.cuda.init()
+    monkeypatch.delenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", raising=False)
+    max_seq_len = 1024
+    creator = _gate_creator(
+        is_disagg=False, draft_window=draft_window, full_attention_drafter=full_attention_drafter
+    )
+    creator._unification_max_seq_len = creator._max_seq_len = max_seq_len
+    unifies = creator._should_unify_dflash_kv_cache()
+    # Specs carry a window reaching max_seq_len as full attention.
+    spec_window = None if draft_window is None or draft_window >= max_seq_len else draft_window
+    try:
+        _manager(_specs(spec_window), max_seq_len=max_seq_len).shutdown()
+        builds = True
+    except ValueError as error:
+        assert "own lifecycle" in str(error)
+        builds = False
+    assert unifies is builds
 
 
 @pytest.mark.cpu_only
