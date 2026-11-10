@@ -3993,6 +3993,18 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "layers; otherwise the managers disable it with a warning. On "
         "recurrent-state targets a positive tail becomes -1 (full re-prefill).")
 
+    ancestral_draft_sampling: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "If true, sampled drafts of a drafter with a Markov head are drawn "
+        "ancestrally: each position is sampled given the token drawn before "
+        "it, so the stored proposals are the drafter's joint distribution, "
+        "which raises acceptance. Costs one sampler call per draft position. "
+        "False (default) chains the Markov bias through the greedy argmax and "
+        "samples every position at once. Requires use_rejection_sampling=True; "
+        "standalone drafters only, not supported with confidence scheduling.")
+
     enable_confidence_scheduling: bool = Field(
         default=False,
         description=
@@ -4062,6 +4074,14 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "kernel each name selects: MLADSparkForCausalLM.")
 
     @model_validator(mode="after")
+    def validate_ancestral_draft_sampling(self) -> "DSparkDecodingConfig":
+        """Ancestral drafting acts only on rejection-sampled drafts."""
+        if self.ancestral_draft_sampling and not self.use_rejection_sampling:
+            raise ValueError("ancestral_draft_sampling=True requires "
+                             "use_rejection_sampling=True.")
+        return self
+
+    @model_validator(mode="after")
     def validate_confidence_scheduling(self):
         if not self.enable_confidence_scheduling:
             # A static config copied from a dynamic one may keep the
@@ -4086,8 +4106,11 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                 "existing one; graph coverage and K are checked at engine "
                 "start.")
         # Confidence scheduling admits greedy requests only under rejection
-        # sampling, so neither option would ever act.
+        # sampling, so none of these options would ever act.
         self._reject_rejection_options_with("enable_confidence_scheduling")
+        if self.ancestral_draft_sampling:
+            raise ValueError("ancestral_draft_sampling=True is not supported "
+                             "with enable_confidence_scheduling=True.")
         return self
 
     @model_validator(mode="after")

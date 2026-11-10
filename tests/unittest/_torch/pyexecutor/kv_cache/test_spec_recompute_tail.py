@@ -91,7 +91,8 @@ class TestSpecRecomputeClaimLimit:
 class _V1Req:
     """The slice of LlmRequest that _maybe_rewind_reused_context touches."""
 
-    def __init__(self, prompt_len, prepopulated):
+    def __init__(self, prompt_len, prepopulated, context_only=False):
+        self.is_context_only_request = context_only
         self.prompt_len = prompt_len
         self.prepopulated_prompt_len = prepopulated
         self.context_current_position = prepopulated
@@ -133,6 +134,13 @@ class TestV1RewindReusedContext:
         # explicitly.
         assert req.context_current_position == 0
         assert req.context_chunk_size == 16
+
+    @pytest.mark.parametrize("tail", [4, -1])
+    def test_a_context_only_request_is_not_rewound(self, tail):
+        req = _V1Req(prompt_len=16, prepopulated=16, context_only=True)
+        _rewind([req], tail=tail)
+        assert req.setter_calls == []
+        assert req.context_chunk_size == 0
 
     def test_a_hit_already_leaving_the_tail_uncached_is_untouched(self):
         req = _V1Req(prompt_len=16, prepopulated=4)

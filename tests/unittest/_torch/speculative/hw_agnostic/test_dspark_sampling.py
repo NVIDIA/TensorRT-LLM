@@ -61,9 +61,10 @@ def _drafter(
     return _MarkovDrafter(w1.to(device), w2.to(device))
 
 
-def _worker() -> DSparkWorker:
+def _worker(ancestral: bool = True) -> DSparkWorker:
     worker = DSparkWorker.__new__(DSparkWorker)
     torch.nn.Module.__init__(worker)
+    worker.spec_config = types.SimpleNamespace(ancestral_draft_sampling=ancestral)
     worker.mapping = None
     worker._d2t = None
     worker.force_num_accepted_tokens = 0.0
@@ -214,6 +215,31 @@ def test_spec_metadata_carries_the_rejection_options() -> None:
 _REJECTION_OPTIONS = [dict(rejection_sample_method="block"), dict(draft_temperature_only=True)]
 
 
+@pytest.mark.cpu_only
+def test_ancestral_draft_sampling_is_off_by_default_and_requires_rejection_sampling() -> None:
+    config = DSparkDecodingConfig(max_draft_len=7, speculative_model="/path/to/dspark")
+    assert config.ancestral_draft_sampling is False
+    with pytest.raises(ValueError, match="use_rejection_sampling=True"):
+        DSparkDecodingConfig(
+            max_draft_len=7, speculative_model="/path/to/dspark", ancestral_draft_sampling=True
+        )
+    assert DSparkDecodingConfig(
+        max_draft_len=7,
+        speculative_model="/path/to/dspark",
+        use_rejection_sampling=True,
+        ancestral_draft_sampling=True,
+    ).ancestral_draft_sampling
+    with pytest.raises(ValueError, match="ancestral_draft_sampling=True is not supported"):
+        DSparkDecodingConfig(
+            max_draft_len=7,
+            speculative_model="/path/to/dspark",
+            use_rejection_sampling=True,
+            ancestral_draft_sampling=True,
+            enable_confidence_scheduling=True,
+            confidence_cost_table_path="/path/to/costs.json",
+        )
+
+
 def _mtp(**kwargs) -> MTPDecodingConfig:
     return MTPDecodingConfig(num_nextn_predict_layers=1, use_rejection_sampling=True, **kwargs)
 
@@ -317,6 +343,15 @@ def test_only_sampled_drafts_with_a_markov_head_take_the_ancestral_path() -> Non
             "dflash",
             V,
         )
+        hook.assert_called_once()
+
+    # Option off, sampled drafts of a drafter with a head: the DFlash hook.
+    with patch.object(
+        DFlashWorker, "_sample_block_draft_tokens", return_value=("dflash", V)
+    ) as hook:
+        assert _worker(ancestral=False)._sample_block_draft_tokens(
+            drafter, base, None, inputs, sampled, 0, B
+        ) == ("dflash", V)
         hook.assert_called_once()
 
     # No head, sampled drafts: the real DFlash hook, unrefined logits straight into the block sampler.

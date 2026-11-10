@@ -1350,7 +1350,7 @@ class DSparkWorker(DFlashWorker):
         num_contexts: int,
         batch_size: int,
     ) -> tuple[torch.Tensor, int]:
-        """Draw sampled drafts ancestrally through the Markov head; argmax drafts keep the chain.
+        """With ``ancestral_draft_sampling``, draw sampled drafts ancestrally through the Markov head.
 
         Position k is drawn by the seeded draft sampler from
         ``base_k + bias(d_{k-1})`` under the request's draft sampling
@@ -1358,9 +1358,9 @@ class DSparkWorker(DFlashWorker):
         token drawn before it (the anchor for k = 0), and that distribution is
         stored as the position's proposal in ``draft_probs``. ``gen_logits`` are the
         raw ``[num_gens, K, vocab]`` block logits. Returns the ``[num_gens, K]``
-        int32 draft tokens and the stored vocab width. Without a Markov head,
-        for argmax drafts, or for a drafter that also carries a DFlash 2
-        candidate scorer (LiLiCorr or the selector), the DFlash path
+        int32 draft tokens and the stored vocab width. With the option off,
+        without a Markov head, for argmax drafts, or for a drafter that also
+        carries a DFlash 2 candidate scorer (LiLiCorr or the selector), the DFlash path
         (greedy-chained :meth:`_refine_block_logits`, then the scorer and the
         block sampler) applies.
         """
@@ -1368,7 +1368,8 @@ class DSparkWorker(DFlashWorker):
             draft_model, "has_candidate_selector", False
         )
         if not (
-            getattr(draft_model, "has_markov_head", False)
+            self.spec_config.ancestral_draft_sampling
+            and getattr(draft_model, "has_markov_head", False)
             and spec_metadata.wants_advanced_draft_sampling
             and not has_candidate_scorer
         ):

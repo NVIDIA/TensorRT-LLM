@@ -364,6 +364,26 @@ def test_rejection_sampling_option_values(
 
 
 @pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("yes", False)])
+def test_dspark_ancestral_draft_sampling_values(
+    schemas: dict[str, dict], filename: str, value: bool | str, valid: bool
+) -> None:
+    config = {
+        "speculative_config": {
+            "decoding_type": "DSpark",
+            "max_draft_len": 7,
+            "speculative_model": "/path/to/drafter",
+            "use_rejection_sampling": True,
+            "ancestral_draft_sampling": value,
+        }
+    }
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"generation_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
 @pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("invalid", False)])
 def test_dspark_device_reranking_field(
     schemas: dict[str, dict], filename: str, value: bool | str, valid: bool

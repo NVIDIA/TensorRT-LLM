@@ -1366,13 +1366,16 @@ class KVCacheManager(BaseResourceManager):
         enforced by the caller: the micro-batch scheduler admits on estimated
         reuse, and ``fit_token_budget`` needs chunking to trim the extra
         compute tokens when a batch of rewound requests exceeds
-        ``max_num_tokens``.
+        ``max_num_tokens``. A context-only (disaggregated) request is not
+        rewound: this manager's draft pages are not transferred, so the
+        generation worker's drafter starts from an empty context whatever the
+        context server recomputes.
         """
         tail = self._spec_recompute_tail
         tokens_per_block = self.tokens_per_block
         for req in batch_llm_requests:
             prepopulated = req.prepopulated_prompt_len
-            if prepopulated <= 0:
+            if prepopulated <= 0 or req.is_context_only_request:
                 continue
             prompt_len = req.prompt_len
             if tail < 0:
