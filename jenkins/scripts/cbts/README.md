@@ -400,14 +400,3 @@ Every fallback emits an `echo` log line.
 `getMakoArgsFromStageName` (~`L0_Test.groovy:2079`) and
 `parseTaskConfigFromStageName` (~`:2066`). Update both when adding new
 backends / orchestrators / stage-name conventions.
-
-### Pipeline stage-scope regression tests
-
-With Groovy installed (or `GROOVY_CLASSPATH` set to Groovy and groovy-json JARs), run:
-
-```bash
-python3 -m pytest -q --confcutdir=tests/unittest/scripts \
-  tests/unittest/scripts/test_cbts_stage_scope.py
-```
-
-These tests execute the pipeline's Groovy methods with Jenkins IO mocked.
