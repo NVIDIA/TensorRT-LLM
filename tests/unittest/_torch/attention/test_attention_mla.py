@@ -525,6 +525,25 @@ def test_mla_owned_prefill_rejects_fp4_before_cache_update(
         assert forward_args.latent_cache is expected_latent_cache
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cached_tokens", [0, 64], ids=["fresh", "cached"])
+def test_mla_helix_fp4_rejected_before_context_dispatch(cached_tokens) -> None:
+    backend = mock.Mock(spec=mla_module.TrtllmAttention)
+    backend.uses_fp4_mla_attention = True
+    metadata = mock.Mock(spec=TrtllmAttentionMetadata)
+    metadata.helix_context_local_slots = object()
+    metadata.num_ctx_cached_tokens = cached_tokens
+    attention = types.SimpleNamespace(mha=backend)
+
+    with pytest.raises(NotImplementedError,
+                       match="Owner-only Helix prefill.*FP4"):
+        mla_module.MLA.forward_context(attention, None, None, None, None,
+                                       metadata, None)
+    backend.has_cached_kv_for_mla_context_warmup.assert_not_called()
+    backend.is_chunked_prefill_for_mla_context.assert_not_called()
+    backend.append_fp4_mla_context_cache.assert_not_called()
+
+
 # Convert parameterized tests to pytest parametrize
 @pytest.mark.parametrize("scenario", scenarios, ids=lambda x: f"scenario: {x}")
 @pytest.mark.parametrize("context_sequence_lengths",

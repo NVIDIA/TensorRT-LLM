@@ -13,6 +13,41 @@ l0_gr100:
       stage: post_merge
       backend: pytorch
   tests:
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
+  # MiniMax-M3 Rubin target unit tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/activation
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/embedding
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/gemm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/moe
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/norm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/spec
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_capture_boundary.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_decode_dense_route.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_dispatch.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_rank_agreement.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_wide_lc_cap.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/activation
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/attention
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/embedding
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/gemm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/moe
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/norm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/spec
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/test_modeling_v2_m3_capture_boundary.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/test_modeling_v2_m3_dispatch.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/test_modeling_v2_m3_prebuild.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/test_modeling_v2_m3_rank_agreement.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/activation
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/attention
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/embedding
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/gemm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/moe
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/norm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/spec
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/test_modeling_v2_m3_capture_boundary.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/test_modeling_v2_m3_dispatch.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/test_modeling_v2_m3_rank_agreement.py
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
   - unittest/_torch/attention/test_flashinfer_trtllm_gen_sm107_p128.py
   - unittest/_torch/kernels/parallel/test_nvfp4_quant.py
@@ -20,12 +55,16 @@ l0_gr100:
   - unittest/_torch/modeling/test_kimi_k3_mla.py::test_k3_mla_nvfp4_kv_with_fp8_kv_b_matches_huggingface
   - unittest/_torch/modules/kimi_kda/test_kda_flashinfer_prefill.py::test_auto_prefill_stays_finite_on_repeated_token_with_mixed_decay
   - unittest/_torch/modules/mamba/test_flashinfer_chunk_gdn.py
+  # NVFP4_PLUS (E2M1 with UE5M3 scales per 32 values) runs on SM107 only.
+  - unittest/_torch/kernels/parallel/test_nvfp4_plus_quantize_rubin.py
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTEDSL-quant=NVFP4_PLUS-routing=Renormalize]
+  - unittest/_torch/moe/test_moe_backend.py::test_moe_backend[e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=CUTEDSL-quant=NVFP4_PLUS-routing=Renormalize]
   # The GLM-5.2 target's unit tests, one entry per op directory. Its comm tests
   # run 4 ranks, and CI has no 4-GPU GR100 stage yet.
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/attention
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/dsa
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/embedding
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/gemm
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/moe
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/quantization
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/spec
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/attention
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/dsa
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/embedding
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/gemm
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/moe
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/quantization
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec

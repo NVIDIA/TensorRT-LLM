@@ -18,6 +18,7 @@ l0_a100:
     - unittest/llmapi/test_llm_pytorch.py -m "part2"
     - unittest/llmapi/test_llm_pytorch.py -m "part3"
     - unittest/llmapi/test_llm_encode.py
+    - unittest/llmapi/test_llm_scheduled_pooling.py
     - unittest/llmapi/test_llm_encode_multi_item.py
     - unittest/llmapi/test_flashinfer_workspace.py ISOLATION
     - unittest/_torch/visual_gen/test_attention_flashinfer.py

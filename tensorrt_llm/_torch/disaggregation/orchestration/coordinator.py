@@ -12,6 +12,7 @@ import os
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
+from tensorrt_llm._torch.disaggregation import diagnostics as disagg_diagnostics
 from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     is_disagg_inflight_cancel_enabled,
@@ -283,17 +284,25 @@ class DisaggTransferCoordinator:
             current_time = time.monotonic()
         elapsed_ms = (current_time - request.py_kv_transfer_start_time) * 1000
         if elapsed_ms > timeout_ms and not request.py_kv_transfer_timed_out:
-            verb = (
-                "Requesting cancellation for"
-                if self.inflight_cancel_active()
-                else "Observed timeout on"
-            )
+            cancel_enabled = self.inflight_cancel_active()
+            verb = "Requesting cancellation for" if cancel_enabled else "Observed timeout on"
             logger.warning(
                 f"{verb} {kind} request {request.py_request_id} due to KV cache "
                 f"transfer timeout: elapsed {elapsed_ms:.0f}ms > "
                 f"kv_transfer_timeout_ms={timeout_ms}ms; "
                 f"{self._describe_transfer_timeout(request)}"
             )
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    disagg_diagnostics.emit_transfer_timeout(
+                        "transfer_timeout_observed",
+                        request,
+                        side="ctx" if kind == "context" else "gen",
+                        dist=self._dist,
+                        elapsed_ms=elapsed_ms,
+                        timeout_ms=timeout_ms,
+                        cancellation_requested=cancel_enabled,
+                    )
             request.py_kv_transfer_timed_out = True
 
     @nvtx_range("check_transfer_timeouts")
@@ -345,7 +354,9 @@ class DisaggTransferCoordinator:
                 f"budget={controller.max_transfer_blocks}"
             )
 
-        self.revert_deferred_gen_init(fitting_gen_init, admission_result.admitted_requests)
+        self.revert_deferred_gen_init(
+            fitting_gen_init, admission_result.admitted_requests, reason="transfer_window"
+        )
 
         return (
             admission_result.admitted_requests,
@@ -353,14 +364,16 @@ class DisaggTransferCoordinator:
         )
 
     def revert_deferred_gen_init(
-        self, candidates: List[LlmRequest], admitted: List[LlmRequest]
+        self,
+        candidates: List[LlmRequest],
+        admitted: List[LlmRequest],
+        reason: str = "pp_reconciliation",
     ) -> None:
         """Release KV allocated for candidates that were not admitted.
 
         Scheduler V2 allocates KV while evaluating generation-init requests.
         This reconciliation is required both after transfer-window admission
-        and when a PP follower's local candidates differ from the canonical
-        schedule propagated by rank 0.
+        and when PP or CP ranks reconcile their local candidates.
         """
         if not (self._is_kv_manager_v2 and candidates):
             return
@@ -371,6 +384,10 @@ class DisaggTransferCoordinator:
         ]
         if deferred_requests:
             self._effects.revert_ctx_alloc(deferred_requests)
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    for request in deferred_requests:
+                        disagg_diagnostics.emit_kv_rollback(request, dist=self._dist, reason=reason)
 
     @nvtx_range("align_gen_admission_across_cp")
     def align_gen_admission_across_cp(self, admitted: List[LlmRequest]) -> List[LlmRequest]:
@@ -402,7 +419,7 @@ class DisaggTransferCoordinator:
         if len(common_ids) == len(local_ids):
             return admitted
         aligned = [request for request in admitted if request.py_request_id in common_ids]
-        self.revert_deferred_gen_init(admitted, aligned)
+        self.revert_deferred_gen_init(admitted, aligned, reason="cp_reconciliation")
         return aligned
 
     def _transfer_window_is_active(self) -> bool:
@@ -430,6 +447,13 @@ class DisaggTransferCoordinator:
         # does not block this thread on them; publication polls them instead.
         fences = self._take_receive_fences(admitted) if defer_unready else {}
         self._effects.prepare_gen_resources(admitted)
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED and self._is_kv_manager_v2:
+            # Selection and resource preparation are committed; receive
+            # publication may still wait for destination readiness below.
+            for req in admitted:
+                disagg_diagnostics.emit_kv_admission_result(
+                    req, self._kv_cache_manager, admitted=True, dist=self._dist
+                )
 
         # gen_only_no_context has no CTX worker, so mark each request as
         # transmission-complete immediately.
@@ -568,7 +592,17 @@ class DisaggTransferCoordinator:
             return
         for req in requests:
             if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
-                req.py_kv_transfer_start_time = time.monotonic()
+                timeout_start = time.monotonic()
+                req.py_kv_transfer_start_time = timeout_start
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        disagg_diagnostics.emit_transfer_timeout(
+                            "transfer_timeout_started",
+                            req,
+                            side="gen",
+                            dist=self._dist,
+                            timeout_ms=self._transceiver.kv_transfer_timeout_ms,
+                        )
 
     def poll_progress_when_idle(self) -> None:
         """Reap completed context KV transfers so their blocks can be freed.
@@ -649,6 +683,19 @@ class DisaggTransferCoordinator:
                 # sends the final slice and (for the Python transceiver) moves
                 # the request toward completion.
                 self._transfers.start_transfer(req)
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        disagg_diagnostics.emit_request_event(
+                            "ctx_send_ready",
+                            req,
+                            side="ctx",
+                            dist=self._dist,
+                            prompt_tokens=req.prompt_len,
+                            state=req.state.name,
+                            source_kv_request_owned=True,
+                            source_kv_reuse_pinned=self._transfers.should_store_blocks,
+                            timeout_expected=self._transceiver.kv_transfer_timeout_ms is not None,
+                        )
                 self._transceiver.respond_and_send_async(req)
                 # Bridge validation can reject before a transfer session exists.
                 # Release the claim right away: there is no physical accessor
@@ -659,9 +706,31 @@ class DisaggTransferCoordinator:
                     and not self._transceiver.has_inflight_transfer(req)
                 ):
                     self.release_transfer(req)
+                    if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                        with disagg_diagnostics.suppress_diagnostic_errors():
+                            disagg_diagnostics.emit_request_event(
+                                "ctx_transfer_settled",
+                                req,
+                                side="ctx",
+                                dist=self._dist,
+                                instance=getattr(self._transceiver, "_instance_name", None),
+                                outcome="failed",
+                                resources_drained=True,
+                                dp_rank=getattr(self._dist, "dp_rank", None),
+                            )
                     continue
                 if self._transceiver.kv_transfer_timeout_ms is not None:
-                    req.py_kv_transfer_start_time = time.monotonic()
+                    timeout_start = time.monotonic()
+                    req.py_kv_transfer_start_time = timeout_start
+                    if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                        with disagg_diagnostics.suppress_diagnostic_errors():
+                            disagg_diagnostics.emit_transfer_timeout(
+                                "transfer_timeout_started",
+                                req,
+                                side="ctx",
+                                dist=self._dist,
+                                timeout_ms=self._transceiver.kv_transfer_timeout_ms,
+                            )
             elif (
                 self._transceiver.pipeline_transfer_enabled
                 and req.state != LlmRequestState.GENERATION_COMPLETE

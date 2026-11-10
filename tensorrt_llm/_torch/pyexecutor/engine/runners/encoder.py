@@ -42,6 +42,7 @@ from tensorrt_llm.llmapi.llm_args import (
     ENCODER_RUNNER_MANAGED_INPUTS,
     EncodeCudaGraphConfig,
     EncodeExtraInputSpec,
+    TorchLlmArgs,
     validate_token_encoder_bucket_config,
 )
 from tensorrt_llm.logger import logger
@@ -598,6 +599,52 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
             attention_runtime_features=attention_runtime_features,
         )
         self._attn_metadata: AttentionMetadata | None = None
+
+    @classmethod
+    def create(
+        cls,
+        model: nn.Module,
+        *,
+        llm_args: TorchLlmArgs,
+        mapping: Mapping,
+        dist: Distributed | None,
+        max_batch_size: int,
+        max_num_tokens: int,
+        max_seq_len: int,
+        max_beam_width: int,
+        model_caller: ModelCaller,
+        attention_backend: type[AttentionBackend],
+        attention_runtime_features: AttentionRuntimeFeatures,
+        moe_load_balancer: MoeLoadBalancer | None = None,
+    ) -> Self:
+        """Build the runner for ``llm_args``.
+
+        Encoder CUDA graphs come only from an ``EncodeCudaGraphConfig`` given as
+        ``cuda_graph_config``; ``encoder_cuda_graph_config`` belongs to
+        encoder-decoder models.
+        """
+        graph_config = llm_args.cuda_graph_config
+        config = EncoderRunnerConfig.create(
+            model=model,
+            mapping=mapping,
+            graph_config=graph_config if isinstance(graph_config, EncodeCudaGraphConfig) else None,
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
+            max_seq_len=max_seq_len,
+            max_beam_width=max_beam_width,
+            without_logits=False,
+            attention_backend=attention_backend,
+            enable_autotuner=llm_args.enable_autotuner,
+        )
+        return cls(
+            model,
+            config,
+            mapping=mapping,
+            dist=dist,
+            moe_load_balancer=moe_load_balancer,
+            model_caller=model_caller,
+            attention_runtime_features=attention_runtime_features,
+        )
 
     def _setup_attention_metadata(self) -> AttentionMetadata:
         if self._attn_metadata is None:

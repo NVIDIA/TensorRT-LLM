@@ -189,10 +189,31 @@ class BasePipeline(nn.Module):
 
             for i, t in self._profile_denoise_steps(timesteps):
                 ...
+
+        It also publishes each step as ``(step, num_steps)`` under
+        ``denoise_step`` in every transformer component's attention metadata
+        state, for the attention recipes that follow the step schedule, and
+        clears it when the loop ends.
         """
-        if self._is_warmup:
-            return enumerate(timesteps)
-        return self._profiler.steps(timesteps)
+        steps = enumerate(timesteps) if self._is_warmup else self._profiler.steps(timesteps)
+        num_steps = len(timesteps) if hasattr(timesteps, "__len__") else None
+        try:
+            for i, t in steps:
+                self._publish_denoise_step(None if num_steps is None else (i, num_steps))
+                yield i, t
+        finally:
+            self._publish_denoise_step(None)
+
+    def _publish_denoise_step(self, denoise_step: Optional[Tuple[int, int]]) -> None:
+        """Record the current denoising step in each transformer component's attention state."""
+        # Partially built pipelines, as the unit tests construct them, may not resolve
+        # their component list yet; they have no attention state to publish into.
+        for name in getattr(self, "transformer_components", None) or ():
+            model = getattr(self, name, None)
+            model_config = getattr(model, "model_config", None)
+            state = getattr(model_config, "attention_metadata_state", None)
+            if state is not None:
+                state["denoise_step"] = denoise_step
 
     def _get_or_create_cuda_graph_shared_pool(self) -> SharedGraphPool:
         """Return the pipeline-owned pool shared by non-concurrent graph runners."""

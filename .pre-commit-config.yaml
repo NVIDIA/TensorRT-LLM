@@ -484,16 +484,13 @@ common-files: &common_files |
         tests/integration/defs/local_venv.py |
         tests/integration/defs/perf/__init__.py |
         tests/integration/defs/perf/allowed_configs.py |
-        tests/integration/defs/perf/create_perf_comparison_report.py |
         tests/integration/defs/perf/data.py |
         tests/integration/defs/perf/data_export.py |
-        tests/integration/defs/perf/diff_tools.py |
         tests/integration/defs/perf/gpu_clock_lock.py |
         tests/integration/defs/perf/misc.py |
         tests/integration/defs/perf/open_search_db_utils.py |
         tests/integration/defs/perf/pytorch_model_config.py |
         tests/integration/defs/perf/sampler_options_config.py |
-        tests/integration/defs/perf/sanity_perf_check.py |
         tests/integration/defs/perf/session_data_writer.py |
         tests/integration/defs/perf/test_perf.py |
         tests/integration/defs/perf/utils.py |
@@ -1213,16 +1210,13 @@ legacy-files: &legacy_files |
         tests/integration/defs/local_venv.py |
         tests/integration/defs/perf/__init__.py |
         tests/integration/defs/perf/allowed_configs.py |
-        tests/integration/defs/perf/create_perf_comparison_report.py |
         tests/integration/defs/perf/data.py |
         tests/integration/defs/perf/data_export.py |
-        tests/integration/defs/perf/diff_tools.py |
         tests/integration/defs/perf/gpu_clock_lock.py |
         tests/integration/defs/perf/misc.py |
         tests/integration/defs/perf/open_search_db_utils.py |
         tests/integration/defs/perf/pytorch_model_config.py |
         tests/integration/defs/perf/sampler_options_config.py |
-        tests/integration/defs/perf/sanity_perf_check.py |
         tests/integration/defs/perf/session_data_writer.py |
         tests/integration/defs/perf/test_perf.py |
         tests/integration/defs/perf/utils.py |

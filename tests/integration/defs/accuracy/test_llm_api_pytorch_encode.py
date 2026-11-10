@@ -297,7 +297,7 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
             dtype=llm_dtype,
             model_kwargs={"architectures": ["Qwen3ForTextEmbedding"]},
         ) as llm:
-            runtime_config = llm._encoder_executor.model_engine.model.model_config.pretrained_config
+            runtime_config = llm._encoder_executor.pretrained_config
             assert runtime_config.architectures[0] == "Qwen3ForTextEmbedding"
             outs = llm.encode(PROMPTS)
 

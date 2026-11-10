@@ -22,7 +22,7 @@ import tensorrt_llm  # noqa: F401
 # The MiniMax-M3 ops' fake impls are registered by their modeling_v2 package.
 import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.fake_ops  # noqa: F401
 import tensorrt_llm._torch.pyexecutor.step_inputs  # noqa: F401
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__tp16.ops import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops import (  # noqa: E501
     _cpp_fakes,  # noqa: F401
 )
 

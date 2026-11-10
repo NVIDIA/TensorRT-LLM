@@ -292,7 +292,7 @@ def isCbtsStage(String stageName) {
     if (!(testFilter[(CBTS_COVERAGE)] ?: false)) {
         return false
     }
-    // Perf stages skip coverage to avoid skewing measurements (perfMode == stageName.contains("Perf")).
+    // PerfSanity stages skip coverage to avoid skewing measurements.
     if (stageName.contains("Perf")) {
         return false
     }
@@ -619,7 +619,7 @@ def getInfraDryRunPytestTargets(testListPath) {
     return targets
 }
 
-def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false, durationsPath="") {
+def processShardTestList(llmSrc, testDBList, splitId, splits, durationsPath="") {
     // Preprocess testDBList to extract ISOLATION markers
     echo "Preprocessing testDBList to extract ISOLATION markers..."
 
@@ -672,99 +672,87 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false, du
 
     def shardTestList = []
 
-    if (perfMode) {
-        // In perfMode, skip pytest collection as it may cause errors with automatically generated testcases
-        // Instead, use all tests from the original testDBList
-        echo "Performance mode enabled - skipping pytest collection, using all tests from testDBList"
-    } else {
-        def testListCmd = [
-            "LLM_ROOT=${llmSrc}",
-            "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
-            "pytest",
-            "--collect-only",
-            "--splitting-algorithm least_duration",
-            "--test-list=${cleanedTestDBList}",
-            "--quiet",
-            "--splits ${splits}",
-            "--group ${splitId}",
-        ]
-        if (durationsPath) {
-            testListCmd += ["--durations-path ${durationsPath}"]
-        }
-        testListCmd += getInfraDryRunPytestTargets(cleanedTestDBList)
+    def testListCmd = [
+        "LLM_ROOT=${llmSrc}",
+        "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
+        "pytest",
+        "--collect-only",
+        "--splitting-algorithm least_duration",
+        "--test-list=${cleanedTestDBList}",
+        "--quiet",
+        "--splits ${splits}",
+        "--group ${splitId}",
+    ]
+    if (durationsPath) {
+        testListCmd += ["--durations-path ${durationsPath}"]
+    }
+    testListCmd += getInfraDryRunPytestTargets(cleanedTestDBList)
 
-        try {
-            // First execute the pytest command and check if it succeeds
-            def pytestOutput = sh(
-                script: "cd ${llmSrc}/tests/integration/defs && ${testListCmd.join(' ')}",
-                returnStdout: true
-            ).trim()
+    try {
+        // First execute the pytest command and check if it succeeds
+        def pytestOutput = sh(
+            script: "cd ${llmSrc}/tests/integration/defs && ${testListCmd.join(' ')}",
+            returnStdout: true
+        ).trim()
 
-            // Debug: Show the raw pytest output
-            echo "<<<START_PYTEST_OUTPUT>>>"
-            echo "${pytestOutput}"
-            echo "<<<END_PYTEST_OUTPUT>>>"
+        // Debug: Show the raw pytest output
+        echo "<<<START_PYTEST_OUTPUT>>>"
+        echo "${pytestOutput}"
+        echo "<<<END_PYTEST_OUTPUT>>>"
 
-            // Filter the output to get only test lines with '::' that occur after "Running X items in this shard"
-            def lines = pytestOutput.split('\n')
-            def foundRunningLine = false
-            def lineIndex = 0
-            shardTestList = lines.findAll { line ->
-                lineIndex++
+        // Filter the output to get only test lines with '::' that occur after "Running X items in this shard"
+        def lines = pytestOutput.split('\n')
+        def foundRunningLine = false
+        def lineIndex = 0
+        shardTestList = lines.findAll { line ->
+            lineIndex++
 
-                if (line.matches(/.*Running \d+ items in this shard.*/) || line.matches(/.*\[pytest-split\] Running group.*/)) {
-                    foundRunningLine = true
-                    return false  // Don't include the "Running" line itself
-                }
-                // Stop collecting when we hit the warnings/errors summary separator
-                if (foundRunningLine && line.contains('======================')) {
-                    foundRunningLine = false  // Stop collecting
-                    return false
-                }
-
-                def hasDoubleColon = line.contains('::')
-                def shouldInclude = foundRunningLine && hasDoubleColon
-                return shouldInclude
+            if (line.matches(/.*Running \d+ items in this shard.*/) || line.matches(/.*\[pytest-split\] Running group.*/)) {
+                foundRunningLine = true
+                return false  // Don't include the "Running" line itself
             }
-            echo "Filtering complete. shardTestList size: ${shardTestList.size()}"
-        } catch (Exception e) {
-            echo "Error: Failed to execute pytest command for test collection: ${e.getMessage()}"
-            error "Test collection failed for shard ${splitId}/${splits}. Cannot proceed without valid test list."
+            // Stop collecting when we hit the warnings/errors summary separator
+            if (foundRunningLine && line.contains('======================')) {
+                foundRunningLine = false  // Stop collecting
+                return false
+            }
+
+            def hasDoubleColon = line.contains('::')
+            def shouldInclude = foundRunningLine && hasDoubleColon
+            return shouldInclude
         }
+        echo "Filtering complete. shardTestList size: ${shardTestList.size()}"
+    } catch (Exception e) {
+        echo "Error: Failed to execute pytest command for test collection: ${e.getMessage()}"
+        error "Test collection failed for shard ${splitId}/${splits}. Cannot proceed without valid test list."
     }
 
-    if (shardTestList || perfMode) {
+    if (shardTestList) {
         // Split the shard test list into regular and isolate tests
         def shardRegularTests = []
         def shardIsolateTests = []
 
-        if (perfMode) {
-            // In perfMode, put all tests in regular and skip isolation
-            echo "Performance mode enabled - all tests will run as regular tests (no isolation)"
-            shardRegularTests = cleanedTestLines.findAll { it.trim() }
-        } else {
-            // Process each test from shardTestList
-            shardTestList.each { test ->
-                def trimmedTest = test.trim()
-                if (trimmedTest) {
-                    // Process test_unittests.py::test_unittests_v2[xxxx] pattern
-                    if (trimmedTest.startsWith('test_unittests.py::test_unittests_v2[') && trimmedTest.endsWith(']')) {
-                        // Extract content between [ and ]
-                        def startIndex = trimmedTest.indexOf('[') + 1
-                        def endIndex = trimmedTest.lastIndexOf(']')
-                        trimmedTest = trimmedTest.substring(startIndex, endIndex)
-                    }
+        // Process each test from shardTestList
+        shardTestList.each { test ->
+            def trimmedTest = test.trim()
+            if (trimmedTest) {
+                // Process test_unittests.py::test_unittests_v2[xxxx] pattern
+                if (trimmedTest.startsWith('test_unittests.py::test_unittests_v2[') && trimmedTest.endsWith(']')) {
+                    // Extract content between [ and ]
+                    def startIndex = trimmedTest.indexOf('[') + 1
+                    def endIndex = trimmedTest.lastIndexOf(']')
+                    trimmedTest = trimmedTest.substring(startIndex, endIndex)
+                }
 
-                    // Check if this test is in the isolation list
-                    def isolationTestLine = isolationTestLines.find { it.contains(trimmedTest) }
-                    if (isolationTestLine) {
-                        // This test needs isolation
-                        shardIsolateTests.add(isolationTestLine)
-                    } else {
-                        // This test is a regular test - find the actual line from cleanedTestLines
-                        def cleanedTestLine = cleanedTestLines.find { it.contains(trimmedTest) }
-                        shardRegularTests.add(cleanedTestLine)
-                    }
+                // Check if this test is in the isolation list
+                def isolationTestLine = isolationTestLines.find { it.contains(trimmedTest) }
+                if (isolationTestLine) {
+                    // This test needs isolation
+                    shardIsolateTests.add(isolationTestLine)
+                } else {
+                    // This test is a regular test - find the actual line from cleanedTestLines
+                    def cleanedTestLine = cleanedTestLines.find { it.contains(trimmedTest) }
+                    shardRegularTests.add(cleanedTestLine)
                 }
             }
         }
@@ -1181,7 +1169,7 @@ boolean isNonTerminalSlurmState(String state) {
     return state != null && SLURM_NON_TERMINAL_STATES.contains(state.toUpperCase(java.util.Locale.ROOT))
 }
 
-def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
+def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -1736,7 +1724,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             return err
         }
         try {
-            executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
+            executeLLMTestOnSlurm(pipeline, platform, testList, config, stageName, splitId, splits, skipInstallWheel, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -1785,13 +1773,13 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
     }
 }
 
-def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, runner, String postTag="", boolean useClusterDurations=false, Map retryContext=null, Closure classifySlurmFailure=null)
+def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, runner, String postTag="", boolean useClusterDurations=false, Map retryContext=null, Closure classifySlurmFailure=null)
 {
     runner {
         // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
         cacheErrorAndUploadResult(pipeline, stageName, {
             try {
-                runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, postTag, useClusterDurations, retryContext)
+                runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, stageName, splitId, splits, skipInstallWheel, postTag, useClusterDurations, retryContext)
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
@@ -1852,7 +1840,6 @@ def getPytestBaseCommandLine(
     String llmSrc,
     String stageName,
     String waivesFilePath,
-    Boolean perfMode,
     String outputPath,
     String coverageConfigFile,
     String pytestUtil = "",
@@ -1946,14 +1933,6 @@ def getPytestBaseCommandLine(
         "--periodic-hang-traceback",
     ]
 
-    if (perfMode) {
-        testCmdLine += [
-            "--perf",
-            "--perf-log-formats csv",
-            "--perf-log-formats yaml",
-            "--enable-gpu-clock-lock"
-        ]
-    }
     if (stageName.contains("-Ray-")) {
         testCmdLine += ["--run-ray"]
     }
@@ -2152,7 +2131,7 @@ def boltedTarArtifactPath(pipeline, String config, String tarName)
     return "${ARTIFACT_PATH}/bolted-${tarName}"
 }
 
-def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
+def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -2175,7 +2154,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         testList = INFRA_DRY_RUN_TEST_CONTEXT
         splitId = 1
         splits = 1
-        perfMode = false
     }
 
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
@@ -2510,7 +2488,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     llmSrcNode,
                     stageName,
                     waivesListPathNode,
-                    perfMode,
                     jobWorkspace,
                     "$jobWorkspace/.coveragerc",
                     pytestUtil,
@@ -2524,8 +2501,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 // Generate Job Launch Script
                 def mounts = getMountListForSlurmTest(cluster, true).join(",")
-                // Multi-node perf-sanity and SingleNvlinkDomain stages must land in one NVLink
-                // domain: across racks the wide-EP MoE all-to-all cannot use MNNVL.
+                // Request one Slurm segment for multi-node disaggregated/aggregated perf-sanity
+                // and SingleNvlinkDomain stages; the cluster defines its topology constraints.
                 String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode || aggMultiNodeMode || singleNvlinkDomainMode)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"
@@ -2708,7 +2685,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export llmTarfile=$llmTarfile
                     export llmSrcNode=$llmSrcNode
                     export stageName=$stageName
-                    export perfMode=$perfMode
                     ${infraDryRun ? "export infraDryRun=true" : ""}
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
@@ -3471,7 +3447,7 @@ boolean isDispatcherPodFailure(Throwable e) {
     return ContextDeath.isContextDeath(e)
 }
 
-def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, String outerAttemptTag="", boolean useClusterDurations=false, Integer infraRetryMax=null)
+def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, String outerAttemptTag="", boolean useClusterDurations=false, Integer infraRetryMax=null)
 {
   echo "Run Slurm job with native sbatch: $runWithSbatch"
 
@@ -3529,9 +3505,9 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       def postTag = "${outerAttemptTag}${innerSuffix}"
 
       if (nodeCount > 1 || runWithSbatch) {
-        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
+        runLLMTestlistWithSbatch(pipeline, platform, testList, config, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
       } else {
-        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
+        runLLMTestlistWithAgent(pipeline, platform, testList, config, stageName, splitId, splits, gpuCount, skipInstallWheel, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
       }
 
       // Job succeeded
@@ -4305,7 +4281,7 @@ def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, no
     }
 }
 
-def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMode = false, modelExpress = false)
+def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelExpress = false)
 {
     def targetCloud = "kubernetes-cpu"
     def selectors = """
@@ -4469,18 +4445,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     kubernetes.io/os: linux
                     nvidia.com/gpu_type: ${gpuType}"""
             }
-        } else if (perfMode && !hasMultipleGPUs) {
-        // Use single GPU machine with "tensorrt/test_type: perf" for stable perf testing.
-        // H100 / A100 single GPU machine has this unique label in TensorRT Blossom pool.
-            selectors = """
-                    kubernetes.io/arch: ${arch}
-                    kubernetes.io/os: linux
-                    nvidia.com/gpu_type: ${gpuType}
-                    nvidia.com/driver_version: '${driverVersion}'
-                    tensorrt/test_type: perf"""
-        }
-        else
-        {
+        } else {
             selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
@@ -5709,7 +5674,7 @@ def priorAttemptTags(String postTag) {
     return priors
 }
 
-def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, String postTag="", boolean useClusterDurations=false, Map retryContext=null)
+def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, String postTag="", boolean useClusterDurations=false, Map retryContext=null)
 {
     // Step 1: create LLM_ROOT dir and clean up the workspace
     def llmRootConfig = "${LLM_ROOT}${config}"
@@ -5886,7 +5851,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             testList = INFRA_DRY_RUN_TEST_CONTEXT
             splitId = 1
             splits = 1
-            perfMode = false
         }
 
         // When useClusterDurations is set, use a per-cluster durations file keyed on
@@ -5922,7 +5886,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         // Process shard test list and create separate files for regular and isolate tests
-        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode, clusterDurationsPath)
+        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, clusterDurationsPath)
 
         // Test Coverage
         def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
@@ -5966,7 +5930,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             llmSrc,
             stageName,
             waivesFilePath,
-            perfMode,
             "${WORKSPACE}/${stageName}",
             coverageConfigFile,
             "",  // pytestUtil
@@ -6154,44 +6117,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
         }
 
-        // catchError just lets "Create Perf Report" still run; the real
-        // failure is raised via perfRegressionExitCode after perfMode below.
-        def perfRegressionExitCode = null
-        if (perfMode) {
-            // Only PyTorch perf stages remain; the TensorRT perf baseline was removed.
-            basePerfFilename = "base_perf_pytorch.csv"
-            basePerfPath = "${llmSrc}/tests/integration/defs/perf/${basePerfFilename}"
-            stage("Check Perf Result") {
-                def perfCheckResult = sh(
-                    script: """
-                    python3 ${llmSrc}/tests/integration/defs/perf/sanity_perf_check.py \
-                        ${stageName}/perf_script_test_results.csv \
-                        ${basePerfPath}
-                    """,
-                    returnStatus: true
-                )
-                if (perfCheckResult != 0) {
-                    perfRegressionExitCode = perfCheckResult
-                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                        error "Performance regression detected and failing the build (exit code: ${perfCheckResult})"
-                    }
-                }
-            }
-            stage("Create Perf Report") {
-                if (fileExists("${stageName}/perf_script_test_results.csv")) {
-                    sh """
-                        python3 ${llmSrc}/tests/integration/defs/perf/create_perf_comparison_report.py \
-                        --output_path ${stageName}/report.pdf \
-                        --files ${stageName}/perf_script_test_results.csv \
-                        ${basePerfPath}
-                    """
-                } else {
-                    echo "No perf script test results to create report"
-                }
-            }
-        }
-
-        // Checked after perfMode so perf artifacts are generated first.
         // Unguarded error() on purpose -- catchError here would swallow the
         // throw that cacheErrorAndUploadResult relies on to fail the build.
         if (rerunFailed) {
@@ -6211,10 +6136,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
             error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
         }
-
-        if (perfRegressionExitCode != null) {
-            error "Performance regression detected and failing the build (exit code: ${perfRegressionExitCode})"
-        }
     }
 
 }
@@ -6227,7 +6148,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 // composed with an attempt tag by the helper) and `isFinalAttempt` (so this
 // function's `cacheErrorAndUploadResult` can suppress synthetic stage-fail XML
 // and junit() for intermediate retryable failures).
-def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
+def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
 {
     cacheErrorAndUploadResult(pipeline, stageName, {
         // PMIx builds a singleton ID, singleton.{hostname}.{pid}, that must fit a
@@ -6242,7 +6163,7 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
             "PMIX_HOSTNAME=mpi-node0",
         ]
         withEnv(testEnv) {
-            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, postTag, useClusterDurations, retryContext)
+            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, stageName, splitId, splits, skipInstallWheel, postTag, useClusterDurations, retryContext)
         }
     }, {
         if (testFilter[(DEBUG_MODE)]) {
@@ -7065,7 +6986,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "L40S-PyTorch-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
         "L40S-FMHA-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
         "H100_PCIe-FMHA-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
-        "H100_PCIe-PyTorch-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "DGX_H200-8_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
         "DGX_H200-4_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
         "DGX_H200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200_perf_sanity", 1, 1, 8],
@@ -7082,7 +7002,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     ]
 
     x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
-    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-"), values.size() > 5 ? values[5] : false), { attemptTag, isFinalAttempt, retryContext = null ->
+    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, values.size() > 5 ? values[5] : false), { attemptTag, isFinalAttempt, retryContext = null ->
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -7090,7 +7010,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, attemptTag, isFinalAttempt, retryContext)
+        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key, values[2], values[3], false, attemptTag, isFinalAttempt, retryContext)
     }]]}
     fullSet = parallelJobs.keySet()
 
@@ -7145,6 +7065,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "B300-PyTorch-2": ["auto:dgx-b300-flex", "l0_b300", 2, 2, 1, 1, true],
         "B300-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_b300", 1, 1, 1, 1, true],
         "DGX_B300-4_GPUs-PyTorch-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 1, 4, 1, true],
+        // Keep this functional stage on AWS-PDX for EFA coverage.
+        "DGX_B300-2_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-1": ["b300-flex-aws-pdx", "l0_dgx_b300_efa_multi_nodes", 1, 1, 2, 2, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 2, 4, 1, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
         // VisualGen PerfSanity post-merge test
@@ -7172,7 +7094,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, attemptTag, false, retryContext?.infraRetryMax)
+        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, attemptTag, false, retryContext?.infraRetryMax)
     }, [singleAttempt: true, slurmDispatcher: true]]]}
     // SLURM dispatcher pods run their own inner retry loop
     // (runLLMTestlistOnSlurm with SLURM_INFRA_RETRY_MAX). Disabling the outer
@@ -7385,7 +7307,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     if (env.targetArch == AARCH64_TRIPLE) {
         parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
-            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, attemptTag, isFinalAttempt, retryContext, values[4] ?: false)
+            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, key, values[2], values[3], false, attemptTag, isFinalAttempt, retryContext, values[4] ?: false)
         }]]}
 
         // Add SBSA Slurm jobs
@@ -7404,7 +7326,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
         }, [singleAttempt: true, slurmDispatcher: true]]]}
         parallelJobs += parallelSlurmJobs
 
@@ -7418,7 +7340,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
         }, [singleAttempt: true, slurmDispatcher: true]]]}
 
         parallelJobs += parallelMultiNodesSBSAJobs
@@ -7612,7 +7534,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             }
 
             if (checkPipStage) {
-                stage("Run LLMAPI Test") {
+                stage("[${toStageName(values[1], key)}] Run LLMAPI Test") {
                     pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
                     runKubernetesPodWithInfraRetry(pipeline, pipInstallSanitySpec, "trt-llm", toStageName(values[1], key), { attemptTag, isFinalAttempt, retryContext = null ->
                         echo "###### Prerequisites Start ######"
@@ -7700,7 +7622,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, "-SubJob-RunTest" + attemptTag, isFinalAttempt, retryContext)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, toStageName(values[1], key), 1, 1, true, "-SubJob-RunTest" + attemptTag, isFinalAttempt, retryContext)
                         }
                     })
                 }
@@ -7986,7 +7908,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
                 runKubernetesPodWithInfraRetry(pipeline, imageSanitySpec, "trt-llm", values.name, { attemptTag, isFinalAttempt, retryContext = null ->
                     sh "env | sort"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
-                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, "-SubJob-TestImage" + attemptTag, isFinalAttempt, retryContext)
+                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, values.name, 1, 1, true, "-SubJob-TestImage" + attemptTag, isFinalAttempt, retryContext)
                 })
             }
         } else {

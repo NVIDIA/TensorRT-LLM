@@ -25,6 +25,7 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 from tensorrt_llm.logger import logger
 
+from ...disaggregation import diagnostics as disagg_diagnostics
 from ..llm_request import (
     LlmRequest,
     LlmRequestState,
@@ -1220,7 +1221,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         # under disagg keep their layers in that manager (MTP/Eagle fold them
         # in; DFlash uses explicit draft layer specs). A separate draft manager
         # gets no transfer and no paired-reuse path here.
-        if not self.kv_cache_manager.prepare_disagg_gen_init(req):
+        prepared = self.kv_cache_manager.prepare_disagg_gen_init(req)
+        if not prepared:
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                disagg_diagnostics.emit_kv_admission_result(
+                    req, self.kv_cache_manager, admitted=False
+                )
             logger.debug("prepare_disagg_gen_init failed for request %s", req.py_request_id)
             return ScheduleAction.SKIP, 0
         return ScheduleAction.SCHEDULED, 0

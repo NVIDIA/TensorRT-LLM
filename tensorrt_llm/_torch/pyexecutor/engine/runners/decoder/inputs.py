@@ -957,7 +957,8 @@ class DecoderInputPreparer:
         buffers, and the attention and speculative metadata are prepared.
         """
         set_per_request_prefill_cuda_graph_flag(False)
-        if "cp_type" in self.mapping.cp_config:
+        # A cp_type takes effect only with context parallelism on.
+        if "cp_type" in self.mapping.cp_config and self.mapping.cp_size > 1:
             cp_type = self.mapping.cp_config["cp_type"]
             if cp_type not in (CpType.HELIX, CpType.ULYSSES):
                 raise NotImplementedError(
@@ -2909,6 +2910,20 @@ class DecoderInputPreparer:
             )
         return gathered[:, 0].tolist()
 
+    def _kv_lens_corrected_in_preprocess(
+        self, inputs: dict[str, Any], enable_spec_decode: bool
+    ) -> bool:
+        """Whether preprocess_inputs applies the overlap scheduler's KV-length offsets to kv_lens_cuda and then calls
+        on_update_kv_lens (the branch below)."""
+        attn_meta = inputs.get("attn_metadata")
+        return (
+            enable_spec_decode
+            and not self._config.disable_overlap_scheduler
+            and attn_meta is not None
+            and attn_meta.kv_cache_manager is not None
+            and hasattr(attn_meta, "kv_lens_cuda")
+        )
+
     def preprocess_inputs(
         self, inputs: dict[str, Any], *, enable_spec_decode: bool, runtime_draft_len: int
     ) -> dict[str, Any]:
@@ -2928,13 +2943,7 @@ class DecoderInputPreparer:
             return inputs
         # Overlap scheduling corrects kv_lens_cuda below from the runtime
         # accepted-token counts and calls on_update_kv_lens() again after it.
-        has_kv_lens_correction = (
-            enable_spec_decode
-            and not self._config.disable_overlap_scheduler
-            and attn_meta is not None
-            and attn_meta.kv_cache_manager is not None
-            and hasattr(attn_meta, "kv_lens_cuda")
-        )
+        has_kv_lens_correction = self._kv_lens_corrected_in_preprocess(inputs, enable_spec_decode)
         # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
         # With a correction, the call after it does this: every on_update_kv_lens rebuilds
         # from the current lengths and nothing reads its outputs in between.
@@ -2955,7 +2964,25 @@ class DecoderInputPreparer:
                 num_ctx_tokens = inputs["attn_metadata"].num_ctx_tokens
                 num_chunked_ctx_requests = inputs["attn_metadata"].num_chunked_ctx_requests
                 previous_batch_tokens = inputs["input_ids"].shape[0] - num_ctx_tokens
-                if inputs["position_ids"].ndim == 3:  # mrope: [3, 1, N]
+                # RuntimeHooks.spec_offsets_op: both corrections of a generation-row step in one launch.
+                fused_offsets = (
+                    self.runtime_hooks.spec_offsets_op is not None
+                    and inputs["position_ids"].ndim != 3
+                    and hasattr(inputs["attn_metadata"], "kv_lens_cuda")
+                    and not (
+                        num_ctx_requests >= num_chunked_ctx_requests
+                        and num_chunked_ctx_requests > 0
+                    )
+                    and self.runtime_hooks.spec_offsets_op(
+                        inputs["position_ids"][0, num_ctx_tokens:],
+                        self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens],
+                        inputs["attn_metadata"].kv_lens_cuda[num_ctx_requests:num_seqs],
+                        self._buffers.previous_kv_lens_offsets_cuda[:num_gen_requests],
+                    )
+                )
+                if fused_offsets:
+                    pass
+                elif inputs["position_ids"].ndim == 3:  # mrope: [3, 1, N]
                     inputs["position_ids"][:, :, num_ctx_tokens:] += (
                         self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
                     )
@@ -2965,7 +2992,9 @@ class DecoderInputPreparer:
                     )
 
                 if has_kv_lens_correction:
-                    if (
+                    if fused_offsets:
+                        pass
+                    elif (
                         num_ctx_requests >= num_chunked_ctx_requests
                         and num_chunked_ctx_requests > 0
                     ):
@@ -3294,6 +3323,23 @@ class DecoderInputPreparer:
         """Return the one-model speculative worker when it is initialized."""
         return getattr(self.model, "spec_worker", None)
 
+    def _dspark_tp_rank0_rows(self):
+        """Return a hook that swaps this rank's confidence rows for TP rank 0's.
+
+        Without attention DP every TP rank runs one token layout, but confidence
+        can differ in the last bits between ranks. Returns None when each rank
+        owns its layout.
+        """
+        if self.mapping.tp_size <= 1 or self._config.enable_attention_dp:
+            return None
+        from tensorrt_llm._torch.distributed import allgather
+
+        def sync_rows(rows):
+            rows = rows.contiguous()
+            return allgather(rows, self.mapping, dim=0)[: rows.shape[0]]
+
+        return sync_rows
+
     def _apply_device_window_prologue(self, inputs, new_tensors_device) -> bool:
         """Re-rank this step's verify windows on device, with fresh confidence.
 
@@ -3385,6 +3431,7 @@ class DecoderInputPreparer:
             stamp=stamps,
             expected_stamp=expected_stamp,
             pad_len=pad_len_tok,
+            sync_rows=self._dspark_tp_rank0_rows(),
         )
 
         lens_buf[:padded_bs].copy_(result.verify_lens)

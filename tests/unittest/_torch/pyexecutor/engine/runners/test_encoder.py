@@ -30,7 +30,11 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import (
     EncoderStageConfig,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PackedInputs
-from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, EncodeExtraInputSpec
+from tensorrt_llm.llmapi.llm_args import (
+    CudaGraphConfig,
+    EncodeCudaGraphConfig,
+    EncodeExtraInputSpec,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -75,6 +79,68 @@ def _encoder_config(
     if encoder_decoder:
         kwargs["is_encoder_decoder"] = True
     return config_type.create(**kwargs), feature_spec
+
+
+@pytest.mark.parametrize(
+    ("cuda_graph_config", "expected_encode_config"),
+    [
+        (None, False),
+        (CudaGraphConfig(), False),
+        (EncodeCudaGraphConfig(batch_sizes=[1], num_tokens=[16], seq_lens=[16]), True),
+    ],
+)
+def test_encoder_runner_graph_config_comes_only_from_cuda_graph_config(
+    cuda_graph_config: CudaGraphConfig | None,
+    expected_encode_config: bool,
+) -> None:
+    """Encode-only takes its buckets from `cuda_graph_config`, never from
+    `encoder_cuda_graph_config`."""
+    llm_args = SimpleNamespace(
+        cuda_graph_config=cuda_graph_config,
+        encoder_cuda_graph_config=EncodeCudaGraphConfig(
+            batch_sizes=[8],
+            num_tokens=[64],
+            seq_lens=[64],
+        ),
+        enable_autotuner=False,
+    )
+    model = object()
+    mapping = object()
+    dist = object()
+    model_caller = Mock()
+    runtime_features = AttentionRuntimeFeatures()
+    runner_config = object()
+
+    with (
+        patch.object(EncoderRunnerConfig, "create", return_value=runner_config) as create_config,
+        patch.object(EncoderRunner, "__init__", return_value=None) as init,
+    ):
+        runner = EncoderRunner.create(
+            model,
+            llm_args=llm_args,
+            mapping=mapping,
+            dist=dist,
+            max_batch_size=4,
+            max_num_tokens=16,
+            max_seq_len=16,
+            max_beam_width=1,
+            model_caller=model_caller,
+            attention_backend=TrtllmAttention,
+            attention_runtime_features=runtime_features,
+        )
+
+    assert isinstance(runner, EncoderRunner)
+    resolved = create_config.call_args.kwargs["graph_config"]
+    assert resolved is (cuda_graph_config if expected_encode_config else None)
+    init.assert_called_once_with(
+        model,
+        runner_config,
+        mapping=mapping,
+        dist=dist,
+        moe_load_balancer=None,
+        model_caller=model_caller,
+        attention_runtime_features=runtime_features,
+    )
 
 
 @pytest.mark.parametrize(

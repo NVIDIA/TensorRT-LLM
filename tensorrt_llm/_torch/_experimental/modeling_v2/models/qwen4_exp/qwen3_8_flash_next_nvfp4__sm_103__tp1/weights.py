@@ -44,6 +44,7 @@ plain row-major FP8 128x128: `[up ; gate]` concat, bf16
 both ways: every key is consumed or in the non-load set.
 """
 
+import mmap
 import os
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -55,6 +56,7 @@ from torch import nn
 
 from tensorrt_llm._utils import CUASSERT
 from tensorrt_llm.llmapi.utils import get_numa_aware_cpu_affinity
+from tensorrt_llm.logger import logger
 
 #: `layers=ALL_LAYERS` is the common case and the default. A sentinel rather
 #: than a lambda so the table reads as data, and rather than `True` so the
@@ -157,10 +159,15 @@ def _local_cpus(device) -> set | None:
 
 
 class _RegisteredHostBuffer:
-    """A pageable CPU allocation registered (pinned and mapped) for the device, and
-    unregistered before its storage is released: at this size glibc serves the
-    allocation with `mmap` and returns it with `munmap`, so freeing registered pages
+    """A pageable CPU mapping of its own, registered (pinned and mapped) for the
+    device, and unregistered before its pages are unmapped: freeing registered pages
     would leave the driver mapping memory the OS may hand out again.
+
+    The mapping is advised `MADV_HUGEPAGE` before the registration faults it in, so
+    the table sits on transparent huge pages whatever torch's CPU allocator does
+    (TensorRT LLM imports torch with mimalloc's THP advice off). On GB300 the
+    device's random row gathers from 64 KiB pages run 2.5x (64 tokens) to 23x
+    (1024 tokens) slower.
 
     Not torch's pinned allocator: it rounds the 47.7 GiB table up to 64 GiB, and on
     GB300 the device's random row gathers from its pages run an order of magnitude
@@ -177,7 +184,16 @@ class _RegisteredHostBuffer:
         if local:
             os.sched_setaffinity(0, local)
         try:
-            self._storage = torch.empty(nbytes, dtype=torch.uint8)
+            self._mapping = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+            try:
+                self._mapping.madvise(mmap.MADV_HUGEPAGE)
+            except OSError as error:  # a kernel without transparent huge pages
+                logger.warning(
+                    f"madvise(MADV_HUGEPAGE) failed for the host-resident PLE table ({error}); "
+                    "the device's row gathers from its base pages run several times slower"
+                )
+            # Shares the mapping's pages, and keeps the mapping alive while it lives.
+            self._storage = torch.frombuffer(self._mapping, dtype=torch.uint8)
             self.pointer = self._storage.data_ptr()
             CUASSERT(
                 cudart.cudaHostRegister(

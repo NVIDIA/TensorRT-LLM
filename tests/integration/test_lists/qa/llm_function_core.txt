@@ -362,6 +362,7 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_mixed_breakable_cuda
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_mixed_breakable_cuda_graph[dp8] TIMEOUT (120)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_4gpus_static_eplb[moe_backend=MEGAMOE_DEEPGEMM]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_4gpus_static_eplb[moe_backend=TRTLLM]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_plus
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_tep_mtp_separate_draft_kv_cache
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_auto_dtype[moe_backend=DEEPGEMM]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_auto_dtype[moe_backend=TRTLLM]
@@ -608,7 +609,6 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_prims_ts_bfloat16
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[fp8-latency]
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[mxfp8-latency]
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_27B::test_dflash2[VANILLA]
-accuracy/test_llm_api_pytorch.py::TestQwen3_8_2_4T_A95B::test_nvfp4_tp8_mtp3_trtllm
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_bf16_tep4_cutlass
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_fp8_adp4_mtp3_trtllm_ple_offload
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_fp8_adp4_mtp3_prefix_cache
@@ -632,6 +632,7 @@ accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_qwen3_text_embe
 accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[forced_chunked_prefill]
 accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget]
 accuracy/test_llm_api_pytorch_multimodal.py::TestGemma4_26B_A4B::test_nvfp4
+accuracy/test_llm_api_pytorch_multimodal.py::TestGemma4_31B::test_multi_image_encoder_budget
 accuracy/test_llm_api_pytorch_multimodal.py::TestGemma4Unified12B::test_guided_decoding TIMEOUT (60)
 accuracy/test_llm_api_pytorch_multimodal.py::TestKimiK25::test_nvfp4[dep8]
 accuracy/test_llm_api_pytorch_multimodal.py::TestKimiK25::test_nvfp4[dep8] TIMEOUT (120)
@@ -776,6 +777,12 @@ test_e2e.py::test_qwen_e2e_cpprunner_large_new_tokens[Qwen3/Qwen3-0.6B-Qwen3/Qwe
 test_e2e.py::test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus[DeepSeek-R1-DeepSeek-R1/DeepSeek-R1]
 test_e2e.py::test_trtllm_benchmark_serving[gpt_oss/gpt-oss-20b]
 test_e2e.py::test_trtllm_multimodal_benchmark_serving
+
+# ModelingV2 GLM-5.2 op matrices: four visible VR200 GPUs (SM107).
+unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/dsa/test_modeling_v2_hist_topk_op_matrix.py
+unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_draft_ehproj_table.py
+unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_draft_sample_glue.py
+unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/comm/test_modeling_v2_intra_node_reduce_op_matrix.py
 
 # Dense FP4 MLA accuracy (SM107 only)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla

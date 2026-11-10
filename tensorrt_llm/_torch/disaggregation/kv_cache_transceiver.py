@@ -497,6 +497,18 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
                  attention_type: AttentionTypeCpp,
                  cache_transceiver_config: CacheTransceiverConfig,
                  mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
+        logger.warning_once(
+            "The C++ cache transceiver "
+            "(cache_transceiver_config.transceiver_runtime='CPP' or None) is "
+            "deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed "
+            "after the 3-month migration period; it keeps working until then. "
+            "Use the Python transceiver (transceiver_runtime='PYTHON', the "
+            "default) with backend='NIXL' and KV cache manager V2. "
+            "Experimental in-flight cancellation "
+            "(TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1) still requires a "
+            "supported C++ configuration until Python support is available. See "
+            "https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy",
+            key="deprecated_cpp_cache_transceiver")
         _validate_disagg_inflight_cancel_config(cache_transceiver_config)
         world_config = mapping_to_world_config(mapping)
         # Filter out mamba/recurrent state layers (kv_heads == 0) so that

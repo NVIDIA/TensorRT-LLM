@@ -595,31 +595,54 @@ class TestClampStrIntegration:
 
 
 class TestDisaggMetadata:
-    """Verify _background_reporter() reads disagg env vars into initial report."""
+    """Verify disagg correlation accepts UUIDs but excludes arbitrary identifying text."""
 
-    def test_disagg_env_vars_appear_in_payload(self, monkeypatch, reporter_session):
-        """Disagg env vars appear as disaggRole and deploymentId in payload."""
+    @pytest.mark.parametrize(
+        ("deployment_id", "expected"),
+        [
+            (None, ""),
+            ("", ""),
+            ("/home/alice/model", ""),
+            ("alice@example.com", ""),
+            ("a" * 128, ""),
+            ("7cd46f928e324879b82a7cabd3c0ecd", ""),
+            ("7cd46f928e324879b82a7cabd3c0ecdZ", ""),
+            ("7cd46f928e324879b82a7cabd3c0ecde", "7cd46f928e324879b82a7cabd3c0ecde"),
+            ("7CD46F92-8E32-4879-B82A-7CABD3C0ECDE", "7cd46f928e324879b82a7cabd3c0ecde"),
+        ],
+    )
+    def test_deployment_id_validated_in_payloads(
+        self, monkeypatch, reporter_session, deployment_id, expected
+    ):
+        """Initial, heartbeat, and exit payloads contain only normalized UUIDs or empty IDs."""
         monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
-        monkeypatch.setenv("TRTLLM_DISAGG_DEPLOYMENT_ID", "abc123")
-
-        captured = {}
-
-        def fake_send(payload):
-            captured.update(payload)
-
-        stop_event = threading.Event()
-        stop_event.set()
+        if deployment_id is None:
+            monkeypatch.delenv("TRTLLM_DISAGG_DEPLOYMENT_ID", raising=False)
+        else:
+            monkeypatch.setenv("TRTLLM_DISAGG_DEPLOYMENT_ID", deployment_id)
+        assert usage_lib._empty_event_snapshot()["deploymentId"] == expected
+        captured = []
+        stop_event = MagicMock()
+        stop_event.wait.side_effect = [False, True]
 
         with (
-            patch.object(usage_lib, "_send_to_gxt", side_effect=fake_send),
+            patch.object(usage_lib, "_send_to_gxt", side_effect=captured.append),
             patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
         ):
             usage_lib._background_reporter(None, None, "")
+            usage_lib.report_exit(usage_lib.TerminalOutcome("clean", exit_code_known=True))
 
-        assert captured, "No payload was captured"
-        params = captured["events"][0]["parameters"]
-        assert params["disaggRole"] == "context"
-        assert params["deploymentId"] == "abc123"
+        events = [event for payload in captured for event in payload["events"]]
+        assert [event["name"] for event in events] == [
+            "trtllm_initial_report",
+            "trtllm_heartbeat",
+            "trtllm_exit_report",
+        ]
+        for event in events:
+            assert event["parameters"]["disaggRole"] == "context"
+            assert event["parameters"]["deploymentId"] == expected
+        if deployment_id and not expected:
+            assert deployment_id not in json.dumps(captured)
 
     def test_disagg_payload_includes_llm_api_config_json(self, monkeypatch, reporter_session):
         """Disagg payloads retain sanitized LLM API config JSON fields."""
@@ -630,7 +653,8 @@ class TestDisaggMetadata:
             )
 
         monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "generation")
-        monkeypatch.setenv("TRTLLM_DISAGG_DEPLOYMENT_ID", "deploy123")
+        deployment_id = usage_lib.uuid.uuid4()
+        monkeypatch.setenv("TRTLLM_DISAGG_DEPLOYMENT_ID", deployment_id.hex)
 
         captured = {}
 
@@ -649,7 +673,7 @@ class TestDisaggMetadata:
         assert captured, "No payload was captured"
         params = captured["events"][0]["parameters"]
         assert params["disaggRole"] == "generation"
-        assert params["deploymentId"] == "deploy123"
+        assert params["deploymentId"] == deployment_id.hex
         assert json.loads(params["llmApiConfigJson"]) == {"tensor_parallel_size": 2}
         meta = json.loads(params["llmApiConfigMetaJson"])
         assert meta["capture_succeeded"] is True
@@ -1286,12 +1310,17 @@ class TestProcessTelemetrySession:
         assert event["parameters"]["ingressPoint"] == "cli_serve"
         assert event["parameters"]["exitCode"] == 130
 
+    @pytest.mark.parametrize("valid_id", [False, True])
     def test_terminal_event_contains_correlation_and_counter_snapshot(
-        self, monkeypatch, enable_telemetry
+        self, monkeypatch, enable_telemetry, valid_id
     ):
         """Terminal-only sessions carry enough state for independent analysis."""
         monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "ctx0")
-        monkeypatch.setenv("TRTLLM_DISAGG_DEPLOYMENT_ID", "deployment")
+        deployment_id = usage_lib.uuid.uuid4()
+        monkeypatch.setenv(
+            "TRTLLM_DISAGG_DEPLOYMENT_ID",
+            str(deployment_id) if valid_id else "/home/alice/deployment",
+        )
         assert usage_lib.record_llm_initialization_attempt(default_usage_context="cli_serve")
         usage_lib.record_llm_initialization_failure()
 
@@ -1308,7 +1337,8 @@ class TestProcessTelemetrySession:
             )
 
         params = sent[0]["events"][0]["parameters"]
-        assert params["deploymentId"] == "deployment"
+        assert params["deploymentId"] == (deployment_id.hex if valid_id else "")
+        assert "/home/alice/deployment" not in json.dumps(sent)
         assert params["disaggRole"] == "ctx0"
         assert params["llmInitializationAttempts"] == 1
         assert params["llmInitializationFailures"] == 1

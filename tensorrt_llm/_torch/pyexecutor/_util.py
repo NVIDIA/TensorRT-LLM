@@ -51,6 +51,7 @@ from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+from ..modules.dwdp.dense.manager import DenseDwdpManager
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
                            get_num_spec_layers, get_spec_decoder,
@@ -4371,6 +4372,7 @@ def create_py_executor_resources(
     virtual_memory_pools: Optional[dict] = None,
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
+    dense_dwdp_manager: Optional[DenseDwdpManager] = None,
     max_num_sequences: Optional[int] = None,
 ) -> PyExecutorResources:
     """Build the resource graph shared by initial execution and rebinding."""
@@ -4773,6 +4775,7 @@ def create_py_executor_resources(
         virtual_memory_pools=virtual_memory_pools,
         kv_connector_manager=kv_connector_manager,
         dwdp_manager=dwdp_manager,
+        dense_dwdp_manager=dense_dwdp_manager,
         max_seq_len=executor_max_seq_len,
         max_num_sequences=max_num_sequences,
         waiting_queue_policy=waiting_queue_policy,
@@ -4805,6 +4808,7 @@ def create_py_executor_instance(
     virtual_memory_pools: Optional[dict] = None,
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
+    dense_dwdp_manager: Optional[DenseDwdpManager] = None,
     max_num_sequences: Optional[int] = None,
     transfer_budget_is_explicit: bool = False,
 ) -> PyExecutor:
@@ -4827,6 +4831,7 @@ def create_py_executor_instance(
         virtual_memory_pools=virtual_memory_pools,
         execution_stream=execution_stream,
         dwdp_manager=dwdp_manager,
+        dense_dwdp_manager=dense_dwdp_manager,
         max_num_sequences=max_num_sequences,
     )
     spec_config = model_engine.spec_config
@@ -4861,6 +4866,7 @@ def create_py_executor_instance(
         execution_stream=execution_stream,
         waiting_queue_policy=execution_resources.waiting_queue_policy,
         dwdp_manager=execution_resources.dwdp_manager,
+        dense_dwdp_manager=execution_resources.dense_dwdp_manager,
         enable_kv_pool_rebalance=llm_args.kv_cache_config.
         enable_kv_pool_rebalance,
         kv_pool_rebalance_check_interval=llm_args.kv_cache_config.
@@ -4938,9 +4944,16 @@ def instantiate_sampler(
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
         sampler = get_spec_decoder(sampler_args, engine.spec_config)
-        spec_step_fold = runtime_hooks_of(engine.model).spec_step_fold
-        if spec_step_fold is not None and isinstance(sampler, SpecSampler):
-            sampler.bind_spec_step_fold(spec_step_fold)
+        runtime_hooks = runtime_hooks_of(engine.model)
+        if isinstance(sampler, SpecSampler):
+            if runtime_hooks.spec_step_fold is not None:
+                sampler.bind_spec_step_fold(runtime_hooks.spec_step_fold)
+            sampler.d2h_side_stream_copies = runtime_hooks.sampler_d2h_side_stream
+            sampler.static_slot_ids = runtime_hooks.spec_small_h2d
+            if runtime_hooks.sampler_d2h_side_stream:
+                logger.info(
+                    "[M3 host] spec sampler store copies on the D2H side stream"
+                )
         return sampler
 
     if mm_encoder_only:
@@ -4951,10 +4964,11 @@ def instantiate_sampler(
         # is never opened, so PyTorch would never release its allocation.
         returns_responses = mapping.rank == 0 or (mapping.enable_attention_dp
                                                   and 0 in mapping.tp_group)
-        return EarlyStopWithMMResult(return_mm_results=returns_responses)
+        return EarlyStopWithMMResult(return_mm_results=returns_responses,
+                                     max_num_tokens=engine.max_num_tokens)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
-        return EarlyStopSampler()
+        return EarlyStopSampler(max_num_tokens=engine.max_num_tokens)
     return TorchSampler(sampler_args)
 
 

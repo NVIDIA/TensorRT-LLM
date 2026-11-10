@@ -35,6 +35,10 @@ _UNSUPPORTED_HEAD_SIZE = 96
 # A head width the SM100-family kernel table does carry for 16-bit paged-context
 # attention.
 _SUPPORTED_HEAD_SIZE = 64
+# The page size and head width of MiniMax-M3's dense and draft attention. The
+# kernel table carries no 128-token-page kernels; SM107 generates them at runtime.
+_NVRTC_TOKENS_PER_BLOCK = 128
+_NVRTC_HEAD_SIZE = 128
 
 _NO_GPU = not torch.cuda.is_available()
 _NO_GPU_REASON = "needs a GPU; missing bindings on a GPU are a test failure"
@@ -188,3 +192,30 @@ def test_lookup_is_page_size_sensitive():
     )
     assert present
     assert not odd_page
+
+
+@pytest.mark.parametrize("kv_cache_dtype", [DataType.BF16, DataType.FP8], ids=["bf16", "fp8"])
+def test_lookup_reports_present_for_sm107_128_token_pages(kv_cache_dtype):
+    """SM107 serves dense paged context over 128-token pages with BF16 output.
+
+    No precompiled kernel exists for that page size, so matched BF16/E4M3 Q
+    and KV with BF16 output must be generated at runtime rather than reported
+    absent, which would refuse paged-context attention for such models. The
+    runtime path is limited to that output precision: FP8 output at the same
+    page size has no kernel either way and must still report absent.
+    """
+    if get_sm_version() != 107:
+        pytest.skip("runtime-generated 128-token-page context kernels are specific to SM107")
+    assert thop.fused_context_fmha_kernel_exists(
+        head_size=_NVRTC_HEAD_SIZE,
+        kv_cache_dtype=kv_cache_dtype,
+        tokens_per_block=_NVRTC_TOKENS_PER_BLOCK,
+        output_dtype=DataType.BF16,
+    )
+    if kv_cache_dtype == DataType.FP8:
+        assert not thop.fused_context_fmha_kernel_exists(
+            head_size=_NVRTC_HEAD_SIZE,
+            kv_cache_dtype=kv_cache_dtype,
+            tokens_per_block=_NVRTC_TOKENS_PER_BLOCK,
+            output_dtype=DataType.FP8,
+        )

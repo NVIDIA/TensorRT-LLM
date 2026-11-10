@@ -626,11 +626,12 @@ def test_routes_on_the_kv_cache_algorithm_the_engine_runs(
         # experts split by expert rather than by tensor: another weight layout, no target
         (dict(world_size=8, tp_size=8, moe_tp_size=1, moe_ep_size=8), None),
         (dict(world_size=8, tp_size=8, moe_tp_size=8, enable_attention_dp=True), None),
-        (dict(world_size=2, tp_size=2, moe_tp_size=2), None),
+        (dict(world_size=2, tp_size=2, moe_tp_size=2, moe_ep_size=1), "tp2"),
+        (dict(world_size=2, tp_size=2, moe_tp_size=1, moe_ep_size=2), None),
     ],
 )
 def test_minimax_m3_parallel_names_the_target_topology(mapping_kwargs, parallel):
-    """MiniMax-M3 has one target per tensor-parallel width: tp4 and tp8 load different per-rank shapes."""
+    """MiniMax-M3 has one target per tensor-parallel width: tp2, tp4 and tp8 load different per-rank shapes."""
     from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
 
     assert routing._parallel(Mapping(**mapping_kwargs)) == parallel
@@ -659,6 +660,64 @@ def _m3_text_config(**layout):
     from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
 
     return dict(zip(_M3_SHAPE_FIELDS, routing._SHAPE), **(layout or _M3_LAYOUT))
+
+
+_M3_TARGETS = "tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3"
+_M3_TP2 = dict(world_size=2, tp_size=2, moe_tp_size=2, moe_ep_size=1)
+_M3_TP4 = dict(world_size=4, tp_size=4, moe_tp_size=4, moe_ep_size=1)
+_M3_TP8 = dict(world_size=8, tp_size=8, moe_tp_size=8, moe_ep_size=1)
+
+
+@pytest.mark.parametrize(
+    "capability, mapping_kwargs, target",
+    [
+        ((10, 3), _M3_TP4, "minimax_m3_nvfp4__sm_103__tp4.ModelingV2MiniMaxM3Nvfp4Sm103Tp4"),
+        ((10, 3), _M3_TP8, "minimax_m3_nvfp4__sm_103__tp8.ModelingV2MiniMaxM3Nvfp4Sm103Tp8"),
+        ((10, 7), _M3_TP2, "minimax_m3_nvfp4__sm_107__tp2.ModelingV2MiniMaxM3Nvfp4Sm107Tp2"),
+        ((10, 7), _M3_TP4, "minimax_m3_nvfp4__sm_107__tp4.ModelingV2MiniMaxM3Nvfp4Sm107Tp4"),
+        ((10, 7), _M3_TP8, "minimax_m3_nvfp4__sm_107__tp8.ModelingV2MiniMaxM3Nvfp4Sm107Tp8"),
+        # no GB300 tp2 target
+        ((10, 3), _M3_TP2, None),
+    ],
+)
+def test_minimax_m3_route_picks_the_target_by_architecture_and_width(
+    monkeypatch, capability, mapping_kwargs, target
+):
+    """Each (SM, tensor-parallel width) has its own target directory. The target modules are stubbed: this checks the
+    decision, not that the modeling code imports on this host."""
+    import sys
+    import types
+
+    from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    for directory, name in (
+        ("minimax_m3_nvfp4__sm_103__tp4", "ModelingV2MiniMaxM3Nvfp4Sm103Tp4"),
+        ("minimax_m3_nvfp4__sm_103__tp8", "ModelingV2MiniMaxM3Nvfp4Sm103Tp8"),
+        ("minimax_m3_nvfp4__sm_107__tp2", "ModelingV2MiniMaxM3Nvfp4Sm107Tp2"),
+        ("minimax_m3_nvfp4__sm_107__tp4", "ModelingV2MiniMaxM3Nvfp4Sm107Tp4"),
+        ("minimax_m3_nvfp4__sm_107__tp8", "ModelingV2MiniMaxM3Nvfp4Sm107Tp8"),
+    ):
+        stub = types.ModuleType(f"{_M3_TARGETS}.{directory}.modeling")
+        setattr(stub, name, type(name, (), {"__module__": stub.__name__}))
+        monkeypatch.setitem(sys.modules, stub.__name__, stub)
+    monkeypatch.setattr(routing, "_quant_algo", lambda _config: QuantAlgo.MIXED_PRECISION)
+
+    model_config = types.SimpleNamespace(
+        pretrained_config=types.SimpleNamespace(text_config=_m3_text_config()),
+        mapping=Mapping(**mapping_kwargs),
+        spec_config=None,
+    )
+    llm_args = _m3_llm_args("auto", "nvfp4")
+    if target is None:
+        with pytest.raises(NoTarget, match="sm107 \\(Rubin\\) with 2, 4 or 8 ranks"):
+            routing.route(model_config, llm_args, capability)
+        return
+    resolved = routing.route(model_config, llm_args, capability)
+    directory, name = target.split(".")
+    assert resolved.__module__ == f"{_M3_TARGETS}.{directory}.modeling"
+    assert resolved.__name__ == name
 
 
 @pytest.mark.parametrize("spec", [None, "eagle3"], ids=["no_speculation", "one_model_eagle3"])
@@ -733,6 +792,41 @@ def test_minimax_m3_route_declines_another_rope_base_or_sparse_layout(monkeypatc
             ),
             _m3_llm_args("auto", "nvfp4"),
             routing._SM,
+        )
+
+
+@pytest.mark.parametrize("mapping_kwargs", [_M3_TP2, _M3_TP4, _M3_TP8], ids=["tp2", "tp4", "tp8"])
+@pytest.mark.parametrize(
+    "layout",
+    [
+        _OTHER_LAYOUT,
+        dict(
+            _M3_LAYOUT,
+            sparse_attention_config=dict(
+                _M3_LAYOUT["sparse_attention_config"], use_sparse_attention=False
+            ),
+        ),
+    ],
+    ids=["other_revision", "sparse_disabled"],
+)
+def test_minimax_m3_rubin_route_declines_another_layout(monkeypatch, mapping_kwargs, layout):
+    """The sm107 targets build the same RoPE table and sparse layout as the sm103 ones, so they decline the same
+    checkpoints."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import routing
+
+    monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
+    with pytest.raises(NoTarget, match="sparse attention layers other than 3-59|rope_theta"):
+        routing.route(
+            SimpleNamespace(
+                pretrained_config=SimpleNamespace(text_config=_m3_text_config(**layout)),
+                mapping=Mapping(**mapping_kwargs),
+                spec_config=None,
+            ),
+            _m3_llm_args("auto", "nvfp4"),
+            routing._SM_RUBIN,
         )
 
 

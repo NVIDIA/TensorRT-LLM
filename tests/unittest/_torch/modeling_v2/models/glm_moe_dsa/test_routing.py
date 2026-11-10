@@ -59,7 +59,8 @@ def _model_config(
 
 
 _GLM52_TARGET = (
-    "models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__tp16.modeling.ModelingV2Glm52Nvfp4Sm107Tp16"
+    "models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.modeling."
+    "ModelingV2Glm52Nvfp4Sm107LowLatency"
 )
 _TP16 = dict(world_size=16, tp_size=16, moe_ep_size=1, moe_tp_size=16)
 
@@ -79,20 +80,29 @@ def _glm52_config(**overrides):
         hidden_size=6144,
         n_routed_experts=256,
         q_lora_rank=2048,
+        index_n_heads=32,
     )
     fields.update(overrides)
     return PretrainedConfig(**fields)
 
 
+@pytest.mark.parametrize("tp", [4, 8, 16])
 @pytest.mark.parametrize("mode", ["auto", "require"])
 @pytest.mark.parametrize(
     "spec_config",
     [None, MTPDecodingConfig(max_draft_len=7), MTPDecodingConfig(max_draft_len=3)],
     ids=["no-spec", "mtp7", "mtp3"],
 )
-def test_glm52_tp16_matches(_on_sm107, spec_config, mode):
+def test_glm52_supported_tp_matches(_on_sm107, spec_config, mode, tp):
     """Any draft length: the draft loop replays the one MTP module per step."""
-    config = _model_config(_glm52_config(), spec_config=spec_config, **_TP16)
+    config = _model_config(
+        _glm52_config(),
+        spec_config=spec_config,
+        world_size=tp,
+        tp_size=tp,
+        moe_ep_size=1,
+        moe_tp_size=tp,
+    )
     assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _GLM52_TARGET
 
 
@@ -100,13 +110,14 @@ def test_glm52_tp16_matches(_on_sm107, spec_config, mode):
     "config_kwargs, mapping_kwargs, spec_config, missed",
     [
         (dict(num_hidden_layers=92), _TP16, None, r"shape \(92, 6144, 256, 2048\)"),
+        (dict(index_n_heads=64), _TP16, None, "index_n_heads=64"),
         (dict(), dict(_TP16, enable_attention_dp=True), None, "attention_dp=True"),
         (dict(), dict(_TP16, moe_ep_size=16, moe_tp_size=1), None, "moe_ep=16"),
-        (dict(), dict(world_size=8, tp_size=8, moe_tp_size=8), None, "world_size=8"),
+        (dict(), dict(world_size=2, tp_size=2, moe_tp_size=2), None, "world_size=2"),
         (dict(), _TP16, MTPDecodingConfig(max_draft_len=3, use_mtp_vanilla=True), "MTP"),
         (dict(), _TP16, _NGRAM, "NGRAM"),
     ],
-    ids=["other-shape", "attention-dp", "expert-parallel", "tp8", "vanilla-mtp", "ngram"],
+    ids=["other-shape", "heads", "attention-dp", "expert-parallel", "tp2", "vanilla-mtp", "ngram"],
 )
 def test_glm52_near_misses_do_not_match(
     _on_sm107, config_kwargs, mapping_kwargs, spec_config, missed

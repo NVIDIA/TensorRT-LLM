@@ -76,6 +76,10 @@ scheduler_config:
 
 ### Selecting the KV Cache Manager
 
+```{warning}
+KV cache manager V1 (`use_kv_cache_manager_v2: false`, or `auto` when it resolves to V1) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use KV cache manager V2, the default, for supported features. Sleep mode (`sleep_config`), RocketKV, and skip-softmax still require V1 until V2 support is available; keep V1 for these features during migration.
+```
+
 TensorRT LLM ships two KV cache manager implementations. `use_kv_cache_manager_v2`
 selects between them and defaults to `true`, which selects the V2 manager. Set it
 to `false` to select the V1 C++ manager for models that support it. Set it to

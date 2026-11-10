@@ -32,7 +32,7 @@ CBTS narrows test cases only; Build always runs.
 
 | Layer | Where | Action |
 |---|---|---|
-| **2. Stage** | `L0_Test.groovy::launchTestJobs` | Intersect the baseline-eligible stage set with affected stages, then add PackageSanityCheck (kept iff `sanity_required`) and PerfSanity (kept iff `perfsanity_required`). Pure `-Perf-` stages run only when present in `affected_stages` (not force-kept). Empty affectedSet + nothing force-kept → no-op. |
+| **2. Stage** | `L0_Test.groovy::launchTestJobs` | Intersect the baseline-eligible stage set with affected stages, then add PackageSanityCheck (kept iff `sanity_required`) and PerfSanity (kept iff `perfsanity_required`). Empty affectedSet + nothing force-kept → no-op. |
 | **2.5. Split-resize** | `L0_Test.groovy::launchTestJobs` (`cbtsResizeSplits`) | Keep only shards `1..k` per narrowed stage, where `k` (duration-sized to ~2h/shard) is `affected_stage_split_counts`. |
 | **3. Within-stage tests** | `L0_Test.groovy::renderTestDB` | Point trt-test-db at the narrowed `cbts_test_db/`. Each affected block's `tests:` is restricted to entries in the filter prefix subtree; unaffected blocks are dropped. |
 
@@ -53,7 +53,7 @@ Nine rules, registered in `cbts/command/main.py::RULE_CLASSES`:
 | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per model node for changes under `models/` |
 | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) |
 | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) |
-| `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus complete `l0_cpu`; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
+| `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus registered documentation-related CPU tests; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
 | `OutOfScopeRule` | `noop` | Reviewed metadata paths, root issue-template and developer-assistant folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure; see `cbts/rules/README.md` |
 
 See `cbts/rules/README.md` for per-rule logic.
@@ -69,11 +69,14 @@ See `cbts/rules/README.md` for per-rule logic.
 | `specdeconly` | `SpecDecRule` fired solo: PR only touches speculative-decoding source paths (`tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py`; excl. docs). Narrows to blocks containing spec-dec test entries (eagle / medusa / redrafter / ngram / draft-target-model / MTP). |
 | `modelingv2only` | `ModelingV2Rule` fired solo: PR only touches modeling_v2 code -- the subtree (`tensorrt_llm/_torch/_experimental/modeling_v2/**`, each family's native code in its `csrc/` included: one torch-op library per model family) or what the family libraries share (`cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake`); excl. docs, which are a fifth of the Python subtree — every catalog entry carries a contract document. A change under `models/` selects its model node's unit tests and target accuracy gates, plus whole-tree checks; shared code or an unreadable routing tree selects every modeling_v2 entry. No outward-facing fallback is needed: nothing beyond the resolver module is imported, and no family library is loaded, unless `LLM(modeling_v2=...)` is on; the CPU checks that keep this true run in every scope. The callers outside the subtree (`_torch/pyexecutor/model_loader.py`, `_torch/models/modeling_auto.py`) are left unclaimed, so touching them falls back to baseline. |
 | `agentflowonly` | `AgentFlowRule` fired solo: PR only touches `agent-flow/**` source or test files (excl. docs). Runs `CPU-AgentFlow-UnitTest`. |
-| `openengineonly` | `OpenEngineRule` fired solo: PR only touches `tensorrt_llm/grpc/openengine/**` source files (excl. docs). Narrows to the registered OpenEngine unit tests: the stub-based ones on the always-run `CPU-Generic-*` stages, plus `test_capability_conformance.py` on `A10-PyTorch-*`, which needs a GPU. |
-| `docsonly` | `DocsRule` fired solo: all documentation changes run `CPU-Build_Docs`; changes under `docs/**` also run the complete `l0_cpu` suite on matching `CPU-Generic-*` stages. Docs-only orchestration skips the SBSA track, so its resolved ARM stage is not launched. |
+| `openengineonly` | `OpenEngineRule` fired solo: PR only touches `tensorrt_llm/grpc/openengine/**` source files (excl. docs). Narrows to the registered OpenEngine unit tests: the stub-based ones on matching `CPU-Generic-*` stages, plus `test_capability_conformance.py` on `A10-PyTorch-*`, which needs a GPU. |
+| `docsonly` | `DocsRule` fired solo: all documentation changes run `CPU-Build_Docs`; changes under `docs/**` also run registered documentation-related CPU tests on matching `CPU-Generic-*` stages. Docs-only orchestration skips the SBSA track, so its resolved ARM stage is not launched. |
 | `testsonly` | Multiple rules from the testsonly family fired (`waiveonly`, `testdefonly`, `testlistonly`, `visualgenonly`, `specdeconly`, `modelingv2only`, `agentflowonly`, `openengineonly`, `docsonly`); their narrows union. |
-| `noop` | Rule(s) claimed files without contributing tests. Always-run CPU stages remain; a pure noop uses the source CPU list. In mixed PRs, other rules and coverage decide the remaining tests. |
+| `noop` | Rule(s) claimed files without contributing tests. No implicit CPU tests. CBTS infrastructure changes explicitly select CPU scripts tests with `testsonly` scope. |
 | `null` (fallback) | A rule cannot decide, scopes don't combine, or there are unhandled files. Groovy defers to baseline filter chain. |
+
+Actionable rules explicitly select their CPU stages and test entries; the entry
+point does not append a generic CPU suite to their decisions.
 
 `_combine_scopes` (`cbts/command/main.py`): rules with `scope="noop"` give way to any
 actionable rule that also fired. Identical actionable scopes pass through;
@@ -256,8 +259,8 @@ Decision JSON:
 
 - `scope: null` → fallback; Groovy defers to baseline.
 - `scope: "noop"` → rule(s) fired without a test contribution; the final
-  affected stages still include the always-run CPU baseline. Layer 2 also
-  honors `sanity_required` / `perfsanity_required`.
+  affected stages remain empty. No generic CPU suite is appended. Layer 2
+  still honors `sanity_required` / `perfsanity_required`.
 - `test_db_dir_override: null` → no Layer 3 narrowing; trt-test-db reads
   the source test-db.
 - `affected_stage_test_counts` → per-stage kept-entry count (telemetry).

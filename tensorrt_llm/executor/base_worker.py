@@ -23,6 +23,7 @@ import uuid
 import weakref
 from pathlib import Path
 from queue import Empty, Queue
+from threading import Lock
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
@@ -145,6 +146,12 @@ class BaseWorker(GenerationExecutor):
         self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
         self._backend = None if llm_args is None else llm_args.backend
         self._lora_config = llm_args.lora_config if llm_args is not None else None
+        # Maps adapter ID to (canonical path, checkpoint source).
+        self._lora_adapter_identities: dict[str, tuple[str, str]] = {}
+        # Weak values avoid retaining locks for failed, one-off adapter IDs.
+        self._lora_adapter_id_locks = weakref.WeakValueDictionary()
+        # Ensures concurrent requests for one adapter ID share the same lock.
+        self._lora_adapter_id_locks_guard = Lock()
         self._resource_governor_queue = None
 
         if global_mpi_size() > 1:
@@ -333,10 +340,47 @@ class BaseWorker(GenerationExecutor):
     def _load_lora_adapter(self, lora_request: LoRARequest) -> None:
         """Ensure the adapter is loaded into the local cache."""
         adapter_id = str(lora_request.adapter_id)
-        self._lora_manager.load_from_ckpt([lora_request.path],
-                                          model_config=self._lora_model_config,
-                                          uids=[adapter_id],
-                                          ckpt_source=lora_request.ckpt_source)
+        with self._lora_adapter_id_locks_guard:
+            adapter_lock = self._lora_adapter_id_locks.get(adapter_id)
+            if adapter_lock is None:
+                adapter_lock = Lock()
+                self._lora_adapter_id_locks[adapter_id] = adapter_lock
+
+        with adapter_lock:
+            previous = self._lora_adapter_identities.get(adapter_id)
+            identity = (lora_request.path, lora_request.ckpt_source)
+            # An empty path retains the trusted API's ID-only cache lookup.
+            if lora_request.path:
+                same_source = (previous is not None
+                               and previous[1] == lora_request.ckpt_source)
+                if previous is None or (same_source and previous != identity):
+                    # Preserve path-alias support while avoiding filesystem
+                    # access for the common exact-identity reuse case.
+                    identity = (str(Path(lora_request.path).resolve()),
+                                lora_request.ckpt_source)
+                if previous is not None and previous != identity:
+                    logger.warning(
+                        "Rejecting conflicting LoRA adapter identity for ID %s: "
+                        "existing=%r, requested=%r", adapter_id, previous,
+                        identity)
+                    raise ValueError(
+                        f"LoRA adapter ID {adapter_id} is already bound to a "
+                        "different path or checkpoint source; use a new ID.")
+            loaded = False
+            try:
+                self._lora_manager.load_from_ckpt(
+                    [lora_request.path],
+                    model_config=self._lora_model_config,
+                    uids=[adapter_id],
+                    ckpt_source=lora_request.ckpt_source)
+                loaded = True
+            finally:
+                # Failed lookups are retryable unless the loader published UID
+                # state. Keep bindings for partial loads and across eviction.
+                if (loaded or adapter_id in self._lora_manager.cpp_lora_weights
+                        or adapter_id in self._lora_manager.cpp_lora_config):
+                    self._lora_adapter_identities.setdefault(
+                        adapter_id, identity)
 
     def _enqueue_request(self,
                          request: GenerationRequest,
@@ -428,6 +472,16 @@ class BaseWorker(GenerationExecutor):
                     # use max_tokens if can't deduce default_max_tokens
                     return max_tokens
             splited_prompt_len = int(len(prompt_token_ids) / cp_size)
+            if not self.engine.is_generation_model:
+                # The prompt runs in one forward and nothing is generated, so
+                # it may fill max_seq_len; max_tokens=1 has the request
+                # complete with that forward in every executor loop.
+                if len(prompt_token_ids) > max_seq_len * cp_size:
+                    raise ValueError(
+                        context_length_exceeded_message(
+                            max_context_length=max_seq_len * cp_size,
+                            num_prompt_tokens=len(prompt_token_ids)))
+                return 1
             default_max_tokens = max_seq_len - splited_prompt_len
             if default_max_tokens <= 0:
                 # Reject (never truncate): the prompt leaves no room for even
@@ -1626,9 +1680,16 @@ def _compute_pytorch_prompt_logprobs(
         if cached is not None:
             return LogProbsResult(prompt=cached)
     context_logits = response.result.context_logits
-    assert context_logits is not None, "context_logits must not be None when prompt_logprobs is requested."
     result = response.result.get_result()
     assert result is not None, "result must not be None when prompt_logprobs is requested."
+    if (context_logits is None and result.is_sequence_final
+            and result.finish_reasons
+            and all(reason == tllm.FinishReason.CANCELLED
+                    for reason in result.finish_reasons)):
+        # Cancellation before execution has no prompt logits to report. Keep
+        # cached streaming logprobs above, but do not invent them for queued work.
+        return None
+    assert context_logits is not None, "context_logits must not be None when prompt_logprobs is requested."
     # Single element list
     first_generation_token = result.output_token_ids[0][:1]
     assert first_generation_token, "first generation token must not be empty when prompt_logprobs is requested."

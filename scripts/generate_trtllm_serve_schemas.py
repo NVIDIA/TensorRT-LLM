@@ -117,6 +117,68 @@ def _nullable(schema: dict) -> dict:
     return {"anyOf": [schema, {"type": "null"}]}
 
 
+def _dwdp_launch_rules() -> list[dict]:
+    """``if``/``then`` rules mirroring ``TorchLlmArgs.validate_dwdp_launch()``.
+
+    They hold only for values the YAML sets: a default, a ``--set`` value from the command line
+    and, in a disaggregated configuration, a value a server inherits from the top level are left
+    to runtime validation, so no rule requires a field.
+    """
+
+    def when(dwdp: dict, **then: dict) -> dict:
+        return {
+            "if": {
+                "properties": {"dwdp_config": {"type": "object", **dwdp}},
+                "required": ["dwdp_config"],
+            },
+            "then": {"properties": then},
+        }
+
+    def dwdp_fields(required: tuple[str, ...] = (), **values: object) -> dict:
+        return {
+            "properties": {name: {"const": value} for name, value in values.items()},
+            "required": list(required),
+        }
+
+    unset = {"type": "null"}
+    return [
+        # Expert DWDP (enable_experts, True by default): a DWDP group of complete model replicas,
+        # no CUDA graphs.
+        when(
+            dwdp_fields(enable_experts=True),
+            dwdp_config={"properties": {"dwdp_size": {"minimum": 2}}},
+            cuda_graph_config=unset,
+            pipeline_parallel_size={"const": 1},
+            context_parallel_size={"const": 1},
+        ),
+        # Dense DWDP in either mode: eager execution and the features it rules out.
+        when(
+            dwdp_fields(("enable_dense",), enable_dense=True),
+            cuda_graph_config=unset,
+            torch_compile_config=unset,
+            prefill_cuda_graph_backend={"const": "disabled"},
+            sleep_config=unset,
+            lora_config=unset,
+            speculative_config=unset,
+            enable_locality_domains={"const": False},
+            pipeline_parallel_size={"const": 1},
+            context_parallel_size={"const": 1},
+        ),
+        # Attached to expert DWDP: tensor parallel size 1, the overlap scheduler off.
+        when(
+            dwdp_fields(("enable_dense",), enable_dense=True, enable_experts=True),
+            tensor_parallel_size={"const": 1},
+            disable_overlap_scheduler={"const": True},
+        ),
+        # Standalone on an attention-DP instance.
+        when(
+            dwdp_fields(("enable_experts",), enable_experts=False),
+            tensor_parallel_size={"minimum": 2},
+            enable_attention_dp={"const": True},
+        ),
+    ]
+
+
 def generate_serve_schema() -> dict:
     """Describe the YAML fragment merged with ordinary serving CLI arguments."""
     from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, InternalRequestAuthKey
@@ -153,6 +215,59 @@ def generate_serve_schema() -> dict:
         {**per_layer_dynamic, "required": ["mode"]},
         {"type": ["string", "null"]},
     ]
+    # Mirror DwdpConfig._validate_modes(): without expert DWDP, dense DWDP is on and the expert
+    # fields keep their defaults; contention_opt, which selects batched copies, rules out another
+    # copy_mode; and gather_kernel needs copy_mode gather.
+    dwdp = schema["$defs"]["DwdpConfig"]
+    expert_fields = (
+        "dwdp_size",
+        "num_groups",
+        "num_experts_per_worker",
+        "num_prefetch_experts",
+        "contention_opt",
+        "num_prefetch_slots",
+    )
+    dwdp["allOf"] = [
+        {
+            "if": {
+                "properties": {"enable_experts": {"const": False}},
+                "required": ["enable_experts"],
+            },
+            "then": {
+                "properties": {
+                    "enable_dense": {"const": True},
+                    **{
+                        name: {"const": dwdp["properties"][name]["default"]}
+                        for name in expert_fields
+                    },
+                },
+                "required": ["enable_dense"],
+            },
+        },
+        {
+            "if": {
+                "properties": {"contention_opt": {"const": True}},
+                "required": ["contention_opt"],
+            },
+            "then": {"properties": {"copy_mode": {"enum": ["batched", None]}}},
+        },
+        {
+            "if": {
+                "properties": {"gather_kernel": {"enum": ["register", "tma"]}},
+                "required": ["gather_kernel"],
+            },
+            "then": {
+                "properties": {"copy_mode": {"const": "gather"}},
+                "required": ["copy_mode"],
+            },
+        },
+    ]
+    # Mirror DwdpConfig._validate_expert_partition(): both fields 0 (or absent), or both positive.
+    pair = ("num_experts_per_worker", "num_prefetch_experts")
+    dwdp["anyOf"] = [
+        {"properties": {name: {"const": 0} for name in pair}},
+        {"properties": {name: {"minimum": 1} for name in pair}, "required": list(pair)},
+    ]
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.
     # Update these restrictions when hooks are added or gain YAML construction support.
     for name in ("batched_logits_processor", "checkpoint_loader", "_mpi_session"):
@@ -160,6 +275,7 @@ def generate_serve_schema() -> dict:
             "type": "null",
             "description": "Live objects require the Python LLM API.",
         }
+    schema["allOf"] = _dwdp_launch_rules()
     schema["$defs"]["RayPlacementConfig"]["properties"]["placement_groups"] = {"type": "null"}
     user_draft = schema["$defs"]["UserProvidedDecodingConfig"]["properties"]
     user_draft["drafter"] = {"not": {}, "description": "A Drafter requires the Python LLM API."}
@@ -199,6 +315,7 @@ def generate_disagg_schema() -> dict:
         "additionalProperties": True,
     }
     worker["additionalProperties"] = False
+    worker["allOf"] = _dwdp_launch_rules()
     schema["$defs"]["DisaggServerBlock"] = worker
 
     orchestrator = _schema_for(extract_disagg_cfg, schema)["properties"]

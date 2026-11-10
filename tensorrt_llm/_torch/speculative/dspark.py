@@ -741,6 +741,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self.verify_planner = DSparkVerifyPlanner(
             cfg=cfg,
             apply_calibration=apply_calibration,
+            device_windows=bool(
+                getattr(self.spec_config, "enable_fused_confidence_scheduler", False)
+            ),
         )
         logger.info(
             f"DSpark verify planner: max_verify_len={self.verify_planner.max_verify_len}, "
