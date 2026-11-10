@@ -56,13 +56,20 @@ This directory contains various test configuration files:
 
 `llm_function_multinode.yml` contains a `tests` sequence. Each entry has an exact
 pytest node ID in `case` and an optional `launch` mapping. Entries without
-`launch` use `defaults.launch`, which specifies `mode: mpi` and `world_size: 16`.
-An explicit per-case `launch` replaces the entire default launch mapping; it is
-not merged with it, so per-node cases do not inherit an MPI `world_size`.
+`launch` use `defaults.launch`, which specifies `mode: mpi`, `world_size: 16`,
+and `nodes: 2`. Per-case launch fields override the defaults; omit fields whose
+values match the defaults. The shared `nodes` field is inherited in both modes.
+Mode-specific fields are inherited only when the case uses the default mode,
+so `mode: per_node` cases do not inherit an MPI `world_size`.
 
-- `mode: mpi` uses `world_size` for the total MPI rank count. The pipeline derives
-  node count and tasks per node from the selected platform's GPU capacity.
-- `mode: per_node` uses explicit `nodes`, `tasks_per_node`, and `gpus_per_node`.
+- `mode: mpi` uses `world_size` for the total MPI rank count and `nodes` for the
+  exact number of hosts on which those ranks must run. The pipeline must honor
+  both fields when deriving tasks per node from the selected platform's GPU
+  capacity. For example, `world_size: 4` inherits `nodes: 2` and runs two ranks
+  on each node even if one node has capacity for all four ranks. Allocating a
+  second node without running ranks on it does not satisfy the node count.
+  Reject launch plans that cannot meet both the world size and node count.
+- `mode: per_node` uses `nodes`, `tasks_per_node`, and `gpus_per_node`.
   Pytest runs on each node and the test starts its local server workers.
 
 GPU architecture, memory, and NVLink-domain requirements still apply; select a
