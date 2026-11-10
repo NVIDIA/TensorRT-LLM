@@ -63,6 +63,7 @@ server (see [Launch the TensorRT LLM Server](#launch-the-tensorrt-llm-server)).
 
 * **Block-sparse attention is required.** MiniMax-M3 runs on the block-sparse attention backend, which must be selected via `sparse_attention_config.algorithm: minimax_m3` in the YAML configuration. There is no dense fallback for the sparse layers.
 * **Weight and KV precision.** BF16, MXFP8, and mixed MXFP8/NVFP4 checkpoints are supported. On SM100/SM103, the MSA backend supports FP8 and NVFP4 KV cache. NVFP4 storage is used in sparse target layers; dense target layers and the shared Eagle3 draft layer use FP8. The curated BF16-KV YAML remains a separate starting configuration.
+* **Hopper (SM90).** Mixed MXFP8/NVFP4 checkpoints run on Hopper with these changes to the curated configuration: `sparse_attention_config.implementation: triton`, a BF16 KV cache (the FP8 and NVFP4 KV paths above are for SM100/SM103), no Eagle3, and the routed experts on the Marlin W4A16 MoE backend, which is the default on SM90 (`moe_config.backend: MARLIN`). Under expert parallelism Marlin still runs the non-local token-expert pairs through both GEMMs and drops them at the combine, so use MoE tensor parallelism (`moe_expert_parallel_size: 1`). The weights take about 250 GB before parallelism; size the GPU count for that plus the KV cache. This has been checked with the first six decoder layers of MiniMax-M3.1-Flash on H200 at TP1, and at TP2 with both EP2 and MoE TP2, not yet with the whole model.
 * **KV cache reuse must be disabled.** KV cache reuse is not supported on the sparse-attention path, so set `kv_cache_config.enable_block_reuse: false`.
 * **Eagle3.** The MSA path supports one shared GQA draft layer with linear Eagle3 drafting. Other MTP and tree-drafting configurations are unsupported. Keep NVFP4 KV and piecewise CUDA graph qualification separate: the existing PCG accuracy cases use FP8 KV.
 * **Rubin (SM107) Eagle3 draft layer.** On SM107 the shared Eagle3 draft layer runs at 128-token pages through FlashInfer's TRTLLM-Gen FMHA, the only FMHA with kernels for that page size there: keep `flashinfer_trtllm_gen` enabled in `TLLM_FMHA_LIBS`. `flashinfer-python` downloads those kernels on first use. On nodes without internet access, or to keep the download off the serving path, pre-populate the cubin directory and serve offline:
@@ -99,8 +100,8 @@ Both SM100 and SM103 support NVFP4; GB300-measured decode tuning applies only
 to SM103. MSA requires 128-token sparse pages and the packaged `fmha_sm100`
 dependency. The indexer stays FP8 in this configuration.
 
-For mixed MXFP8/NVFP4 weights, select `moe_config.backend: CUTLASS` as in the
-accuracy tests. KV-cache quantization does not choose the MoE weight backend.
+On SM100/SM103, for mixed MXFP8/NVFP4 weights, select `moe_config.backend: CUTLASS`
+as in the accuracy tests. KV-cache quantization does not choose the MoE weight backend.
 Full weight reload refreshes the quantization and aligned prefill scale buffers
 in place so CUDA-graph replay retains valid addresses.
 

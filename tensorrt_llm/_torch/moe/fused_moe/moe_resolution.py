@@ -480,8 +480,10 @@ def _reject_unsupported_activation(
 
     Reads the *class* declaration. TRTLLM-Gen overrides
     ``resolve_activation_support`` per instance, but only to narrow
-    ``PER_EXPERT_TENSOR`` to ``UNIFORM_SCALAR``; no instance turns a shape into
-    ``UNSUPPORTED``, so no instance refuses a constant its class admits.
+    ``PER_EXPERT_TENSOR`` to ``UNIFORM_SCALAR``. Marlin narrows the constants
+    to ``UNSUPPORTED`` for every kind but SwigluBias, and
+    ``check_marlin_capabilities`` turns those layers down here, so no selected
+    instance refuses a constant its class admits.
     """
     detail = activation_rejection_detail(candidate, problem)
     if detail is None:

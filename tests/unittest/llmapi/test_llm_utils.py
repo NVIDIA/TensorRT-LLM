@@ -29,6 +29,7 @@ from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import CachedModelLoader, ModelLoader
 from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.llmapi.utils import AsyncQueue, _SyncQueue
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 # isort: off
 from .test_llm import llama_model_path
@@ -74,6 +75,29 @@ def test_cached_model_loader_returns_model_dir(tmp_path):
     model_dir = CachedModelLoader(llm_args)()
 
     assert model_dir == tmp_path
+
+
+@pytest.mark.cpu_only
+def test_cached_model_loader_reads_quant_config_after_hub_download(
+        monkeypatch, tmp_path):
+    """A hub id gets its quant config from the downloaded checkpoint.
+
+    Model defaults that read ``llm_args.quant_config`` depend on it.
+    """
+    (tmp_path / "config.json").write_text(
+        json.dumps({"quantization_config": {
+            "quant_method": "mxfp8"
+        }}))
+    llm_args = TorchLlmArgs(model="example/model", gpus_per_node=1)
+    monkeypatch.setattr("tensorrt_llm.llmapi.llm_utils.local_mpi_rank",
+                        lambda: 0)
+    download = MagicMock(return_value=tmp_path)
+    monkeypatch.setattr("tensorrt_llm.llmapi.llm_utils.download_hf_model",
+                        download)
+
+    assert CachedModelLoader(llm_args)() == tmp_path
+    download.assert_called_once()
+    assert llm_args.quant_config.quant_algo == QuantAlgo.MXFP8
 
 
 @pytest.mark.cpu_only

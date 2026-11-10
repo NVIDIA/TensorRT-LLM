@@ -85,7 +85,10 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     is_minimax_m3_vl_config,
 )
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
-from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
+from tensorrt_llm._torch.models.modeling_utils import (
+    _load_weights_impl_v2,
+    get_registered_model_class,
+)
 from tensorrt_llm._torch.modules.linear import _load_kv_cache_scales
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
@@ -107,6 +110,33 @@ _NUM_HIDDEN_LAYERS = 7
 _SPARSE_FREQ = [0, 0, 0, 1, 1, 1, 1]
 _DISABLE_INDEX_VALUE = [0, 0, 0, 1, 1, 1, 1]
 _MOE_LAYER_FREQ = [0, 0, 0, 1, 1, 1, 1]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "architecture", ["MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration"]
+)
+@pytest.mark.parametrize(
+    "quant_algo,sm,expected",
+    [
+        (QuantAlgo.MIXED_PRECISION, 90, {"moe_config": {"backend": "MARLIN"}}),
+        (QuantAlgo.MXFP8, 90, {"moe_config": {"backend": "MARLIN"}}),
+        (QuantAlgo.MIXED_PRECISION, 89, {}),
+        (QuantAlgo.MIXED_PRECISION, 100, {}),
+        (None, 90, {}),
+    ],
+)
+def test_nvfp4_experts_default_to_marlin_on_hopper(
+    monkeypatch: pytest.MonkeyPatch,
+    architecture: str,
+    quant_algo: QuantAlgo | None,
+    sm: int,
+    expected: dict,
+) -> None:
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    model_cls = get_registered_model_class(architecture)
+    llm_args = SimpleNamespace(quant_config=QuantConfig(quant_algo=quant_algo))
+    assert model_cls.get_model_defaults(llm_args) == expected
 
 
 @pytest.mark.cpu_only

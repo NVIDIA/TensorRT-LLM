@@ -22,7 +22,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import os
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 from typing import Mapping as TMapping
 
 import torch
@@ -88,6 +88,9 @@ from .modeling_utils import (
     layerwise_moe_quant_config,
     register_auto_model,
 )
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # Legacy dense fallback: cuDNN cannot consume this SDPA layout.
 _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
@@ -3042,6 +3045,24 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         directly. This routes the fully-'auto' path to that combination.
         """
         return "PYTHON"
+
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        """Run the NVFP4 routed experts through Marlin on Hopper.
+
+        Applies when the checkpoint reports MIXED_PRECISION (NVFP4 experts,
+        MXFP8 elsewhere) or MXFP8: the compressed-tensors packaging reports
+        MXFP8 here and gets its NVFP4 experts later, from
+        ``ModelConfig._build_minimax_m3_mxfp8_moe_quant_config``. CUTLASS W4A4
+        needs Blackwell, so Hopper runs these experts as W4A16 on Marlin.
+        """
+        defaults = super().get_model_defaults(llm_args)
+        if (
+            llm_args.quant_config.quant_algo in (QuantAlgo.MXFP8, QuantAlgo.MIXED_PRECISION)
+            and get_sm_version() == 90
+        ):
+            defaults["moe_config"] = {"backend": "MARLIN"}
+        return defaults
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
         raw_pretrained = model_config.pretrained_config
