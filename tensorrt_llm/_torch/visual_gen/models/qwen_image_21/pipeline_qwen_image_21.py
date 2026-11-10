@@ -17,6 +17,7 @@ from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema, RefSlotSpec, RoleSpec
@@ -511,12 +512,17 @@ class QwenImage21Pipeline(QwenImagePipeline):
     def infer(self, req):
         params = req.params
         num_per = params.num_images_per_prompt or 1
-        prompts = req.prompt if isinstance(req.prompt, list) else [req.prompt]
-        prompts = [p for p in prompts for _ in range(num_per)]
+        base_prompts = req.prompt if isinstance(req.prompt, list) else [req.prompt]
+        prompts = [p for p in base_prompts for _ in range(num_per)]
+        negative = params.negative_prompt
+        if negative is not None:
+            negative = self._normalize_negative_prompt(negative, len(base_prompts))
+            negative = [n for n in negative for _ in range(num_per)]
         extra_params = params.extra_params or {}
         refs = params.image_reference or []
         return self.forward(
             prompt=prompts,
+            negative_prompt=negative,
             image=[r.content for r in refs] if refs else None,
             height=params.height,
             width=params.width,
@@ -547,7 +553,7 @@ class QwenImage21Pipeline(QwenImagePipeline):
         **kwargs: Any,
     ) -> PipelineOutput:
         """Qwen-Image 2.1 text-to-image / image-conditioned forward path."""
-        del negative_prompt, true_cfg_scale, kwargs
+        del kwargs
         from PIL import Image as PILImage
 
         pipeline_start = time.time()
@@ -556,6 +562,13 @@ class QwenImage21Pipeline(QwenImagePipeline):
         if isinstance(prompt, str):
             prompt = [prompt]
         batch_size = len(prompt)
+        cfg_scale = negative_prompt_cfg_scale if true_cfg_scale is None else true_cfg_scale
+        use_cfg = cfg_scale > 1.0 and negative_prompt is not None
+        if cfg_scale > 1.0 and negative_prompt is None:
+            logger.warning("Qwen-Image 2.1 CFG requires a negative prompt; guidance is disabled.")
+        elif cfg_scale <= 1.0 and negative_prompt is not None:
+            logger.warning("Qwen-Image 2.1 ignores negative_prompt when CFG scale <= 1.")
+        do_cfg_parallel, cfg_size, cfg_rank, cfg_pg = self._cfg_parallel_state(use_cfg)
         device = self.device
         generator = make_noise_generator(seed, device)
 
@@ -594,6 +607,11 @@ class QwenImage21Pipeline(QwenImagePipeline):
         prompt_embeds, prompt_embeds_mask, image_pad_mask = self._encode_prompt(
             prompt, device, max_sequence_length, image=condition_images
         )
+        if use_cfg:
+            negative_prompt = self._normalize_negative_prompt(negative_prompt, batch_size)
+            neg_embeds, neg_embeds_mask, neg_image_pad_mask = self._encode_prompt(
+                negative_prompt, device, max_sequence_length, image=condition_images
+            )
         num_channels_latents = int(
             getattr(self.transformer.config, "in_channels", self.latent_channels)
         )
@@ -615,6 +633,8 @@ class QwenImage21Pipeline(QwenImagePipeline):
             [(1, height // self.vae_scale_factor, width // self.vae_scale_factor)]
         ] * batch_size
         img_mask = append_target_slots(image_pad_mask.bool(), latents.shape[1])
+        if use_cfg:
+            neg_img_mask = append_target_slots(neg_image_pad_mask.bool(), latents.shape[1])
 
         sigmas_np = (
             sigmas
@@ -634,6 +654,7 @@ class QwenImage21Pipeline(QwenImagePipeline):
 
         timer.mark_denoise_start()
         kv_cache = None
+        neg_kv_cache = None
         cache_enabled = (
             bool(use_kv_cache)
             and hasattr(self.transformer, "transformer_blocks")
@@ -641,6 +662,8 @@ class QwenImage21Pipeline(QwenImagePipeline):
         )
         if cache_enabled:
             kv_cache = QwenImage21KVCache(len(self.transformer.transformer_blocks))
+            if use_cfg:
+                neg_kv_cache = QwenImage21KVCache(len(self.transformer.transformer_blocks))
         logger.info(
             "Denoising Qwen-Image 2.1 (%d steps, kv_cache=%s)...", len(timesteps), cache_enabled
         )
@@ -654,18 +677,36 @@ class QwenImage21Pipeline(QwenImagePipeline):
                 if input_images_latents is None
                 else torch.cat([input_images_latents, latents], dim=1)
             )
-            noise_pred = self.transformer(
-                hidden_states=latent_model_input,
-                timestep=timestep / 1000,
-                encoder_hidden_states=prompt_embeds,
-                encoder_hidden_states_mask=prompt_embeds_mask,
-                img_shapes=img_shapes,
-                img_mask=img_mask,
-                kv_cache=kv_cache,
-                kv_cache_mode=kv_cache_mode,
-                return_dict=False,
-            )[0]
-            noise_pred = noise_pred[:, -latents.size(1) :]
+
+            def predict(negative: bool):
+                with self.transformer.cache_context("uncond" if negative else "cond"):
+                    prediction = self.transformer(
+                        hidden_states=latent_model_input,
+                        timestep=timestep / 1000,
+                        encoder_hidden_states=neg_embeds if negative else prompt_embeds,
+                        encoder_hidden_states_mask=neg_embeds_mask
+                        if negative
+                        else prompt_embeds_mask,
+                        img_shapes=img_shapes,
+                        img_mask=neg_img_mask if negative else img_mask,
+                        kv_cache=neg_kv_cache if negative else kv_cache,
+                        kv_cache_mode=kv_cache_mode,
+                        return_dict=False,
+                    )[0]
+                return prediction[:, -latents.size(1) :]
+
+            if do_cfg_parallel:
+                local_prediction = predict(cfg_rank != 0).contiguous()
+                predictions = [torch.empty_like(local_prediction) for _ in range(cfg_size)]
+                dist.all_gather(predictions, local_prediction, group=cfg_pg)
+                noise_pred, neg_noise_pred = predictions
+            else:
+                noise_pred = predict(False)
+                if use_cfg:
+                    neg_noise_pred = predict(True)
+            if use_cfg:
+                # Unlike Qwen-Image 1.x, Diffusers 2.1 does not renormalize CFG predictions.
+                noise_pred = neg_noise_pred + cfg_scale * (noise_pred - neg_noise_pred)
             latents_dtype = latents.dtype
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
             if latents.dtype != latents_dtype:
