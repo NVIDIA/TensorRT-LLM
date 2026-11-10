@@ -111,6 +111,9 @@ def test_fp8_lookup_fuses_scale_and_preserves_table_address() -> None:
 
 @pytest.mark.parametrize("use_fp8, nvfp4_config", [(False, False), (True, False), (True, True)])
 def test_mapper_loads_pinned_table_in_place(use_fp8, nvfp4_config, monkeypatch) -> None:
+    """The mapper copies the checkpoint shards into the pinned table without
+    moving it, in the table's dtype: BF16, FP8, or FP8 declared by an NVFP4
+    checkpoint's ple_embedding_dtype."""
     from tensorrt_llm._torch.models.checkpoints.hf.qwen4_exp_weight_mapper import (
         Qwen4ExpHfWeightMapper,
     )
