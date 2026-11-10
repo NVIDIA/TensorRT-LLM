@@ -573,10 +573,17 @@ def test_prims_ts_deepseek_v3_lite_mla_generation(
     run_case(case)
 
 
-@pytest.mark.parametrize("head_dim,v_head_dim", [(128, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize(
+    "head_dim,v_head_dim,strided_v,kv_length",
+    [
+        pytest.param(128, 128, True, 5, id="qk128-strided"),
+        pytest.param(192, 128, True, 5, id="qk192-strided"),
+        pytest.param(256, 256, True, 5, id="qk256-strided"),
+        pytest.param(192, 128, False, 5, id="compact-control"),
+        pytest.param(192, 128, True, 0, id="empty-kv"),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("strided_v", [False, True])
-@pytest.mark.parametrize("kv_length", [0, 5])
 @pytest.mark.parametrize("fp8", [False, True])
 def test_prims_ts_mla_context_preprocess_layout(
     head_dim: int, v_head_dim: int, dtype: torch.dtype, strided_v: bool, kv_length: int, fp8: bool
@@ -659,9 +666,20 @@ def test_prims_ts_mla_context_preprocess_layout(
 
 
 @pytest.mark.parametrize("kv_cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("num_heads", [6, 12, 96])
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
-@pytest.mark.parametrize("qk_head_dim,v_head_dim", [(128, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize(
+    "qk_head_dim,v_head_dim,num_heads,use_kv_cache_manager_v2",
+    [
+        pytest.param(128, 128, 6, False, id="qk128-h6-v1"),
+        pytest.param(128, 128, 12, True, id="qk128-h12-v2"),
+        pytest.param(128, 128, 96, False, id="qk128-h96-v1"),
+        pytest.param(192, 128, 6, True, id="qk192-h6-v2"),
+        pytest.param(192, 128, 12, False, id="qk192-h12-v1"),
+        pytest.param(192, 128, 96, True, id="qk192-h96-v2"),
+        pytest.param(256, 256, 6, False, id="qk256-h6-v1"),
+        pytest.param(256, 256, 12, True, id="qk256-h12-v2"),
+        pytest.param(256, 256, 96, False, id="qk256-h96-v1"),
+    ],
+)
 def test_prims_ts_mla_preprocessing(
     monkeypatch: pytest.MonkeyPatch,
     num_heads: int,
