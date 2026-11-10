@@ -4902,9 +4902,9 @@ class TransferWorker:
             # overlap and miss windows that start further into the arena.
             # Register the arena once instead; pools outside it, if any, as
             # before.
-            memory_descs = [(arena_base, arena_bytes, self._rank_info.device_id, "kv_cache_arena")] + [
-                d for d in memory_descs if not arena_base <= d[0] < arena_base + arena_bytes
-            ]
+            memory_descs = [
+                (arena_base, arena_bytes, self._rank_info.device_id, "kv_cache_arena")
+            ] + [d for d in memory_descs if not arena_base <= d[0] < arena_base + arena_bytes]
         if memory_descs:
             reg_memory_desc = RegMemoryDescs("VRAM", memory_descs)
             self._agent.register_memory(reg_memory_desc)

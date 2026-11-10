@@ -3564,8 +3564,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("data_role"), nb::call_guard<nb::gil_scoped_release>())
         .def("get_page_index_binding_version", &kv::KvCacheManager::getPageIndexBindingVersion,
             nb::call_guard<nb::gil_scoped_release>())
-        .def("get_gpu_arena_extent", &kv::KvCacheManager::getGpuArenaExtent,
-            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_gpu_arena_extent", &kv::KvCacheManager::getGpuArenaExtent, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_pool_bindings",
             [](kv::KvCacheManager const& self, int poolGroupIndex, int poolIndex)
