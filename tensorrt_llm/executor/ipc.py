@@ -235,7 +235,15 @@ class ZeroMqQueue:
         with nvtx_range_debug("send", color="blue", category="IPC"):
             flags = 0
             if timeout is not None:
-                if not self.socket.poll(int(timeout * 1000), zmq.POLLOUT):
+                if timeout == 0:
+                    # ZMQ_EVENTS processes pending pipe updates like a
+                    # zero-timeout zmq_poll but does not release the GIL, so
+                    # callers holding a lock do not make others wait for it.
+                    writable = self.socket.getsockopt(zmq.EVENTS) & zmq.POLLOUT
+                else:
+                    writable = self.socket.poll(int(timeout * 1000),
+                                                zmq.POLLOUT)
+                if not writable:
                     raise zmq.Again()
                 # A peer can disappear after poll reports writability.
                 flags = zmq.NOBLOCK

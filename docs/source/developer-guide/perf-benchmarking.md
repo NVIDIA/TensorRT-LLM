@@ -267,9 +267,10 @@ worker as one message, so the worker receives and authenticates one message per
 burst instead of one per request. The sender thread must take the GIL first.
 While the submitting thread keeps running Python and briefly releasing the GIL,
 as a busy `trtllm-serve` event loop does, the sender thread may not run until
-that thread goes idle, so queued requests can wait and admission can fill. By
-default, the submitting thread writes each request itself when the socket is
-idle and writable.
+that thread goes idle, so queued requests can wait. When the queue reaches its
+admission limit, the submitting thread writes the queued requests as one message
+instead of rejecting the next request. By default, the submitting thread writes
+each request itself when the socket is idle and writable.
 
 #### Benchmarking with LoRA Adapters in PyTorch workflow
 
