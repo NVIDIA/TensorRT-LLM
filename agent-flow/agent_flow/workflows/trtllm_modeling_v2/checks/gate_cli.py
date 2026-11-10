@@ -44,6 +44,7 @@ from . import boot as boot_checks
 from . import check_config, check_runtime, datasets, disagg, gate_records, serve
 from . import verdict as check_result
 from .accuracy import resolve_model_key
+from .harness import workload_io
 
 #: The gates this command runs, by the name it takes.
 GATE_NAMES: tuple[str, ...] = (
@@ -151,6 +152,44 @@ def claimed_devices(workspace: str | Path | None) -> tuple[int, ...]:
         return ()
 
 
+class _ImportWatch:
+    """A check's runner, noting where each engine the check started imported the package from.
+
+    The engine driver says it once per engine (``workload_io.DRIVER_MARKER``). A
+    check one of whose engines imported ``tensorrt_llm`` from anywhere but the
+    tree it measures did not measure that tree: :meth:`judge` fails it, whatever
+    it measured. A command that does not say is not judged.
+    """
+
+    def __init__(self, runner: Callable[..., Any], tree: Path) -> None:
+        self.runner = runner
+        self.tree = Path(tree).resolve()
+        self.roots: set[str] = set()
+
+    def __call__(self, command: str, env: Mapping[str, str] | None = None, timeout: int = 1800):
+        result = self.runner(command, env, timeout)
+        output = f"{getattr(result, 'stdout', '')}\n{getattr(result, 'stderr', '')}"
+        for record in workload_io.parse_marked(output, workload_io.DRIVER_MARKER):
+            origin = Path(str(record.get("tensorrt_llm") or ""))
+            if origin.name:
+                # .../<root>/tensorrt_llm/__init__.py -> <root>
+                package = origin.parent if origin.name == "__init__.py" else origin
+                self.roots.add(str(package.parent.resolve()))
+        return result
+
+    def judge(self, result: check_result.GateResult) -> check_result.GateResult:
+        others = sorted(root for root in self.roots if Path(root) != self.tree)
+        if not others:
+            return result
+        return replace(
+            result,
+            passed=False,
+            explained=True,
+            detail=f"its engines imported tensorrt_llm from {', '.join(others)}, not from the tree "
+            f"it measures ({self.tree}); what it measured: {result.detail}",
+        )
+
+
 def run_check(
     task_data: Mapping[str, Any],
     gate: str,
@@ -179,7 +218,8 @@ def run_check(
     ``runner`` replaces the environment's own, for tests. A variant whose
     accuracy anchor is relative is judged against ``anchor_score`` (its unit's
     score at the same member on the same tree); without one its unit's
-    benchmark runs here first.
+    benchmark runs here first. A check whose engines imported the package from
+    another tree fails (:class:`_ImportWatch`): it measured something else.
     """
     name = gate_name(gate)
     if name not in GATE_NAMES:
@@ -217,7 +257,7 @@ def run_check(
         unit_environment = replace(unit_environment, python=python)
     if runner is None:
         runner = shell_runner_for(select_command_executor(environment))
-    runner = check_runtime.in_tree(runner, tree)
+    runner = watch = _ImportWatch(check_runtime.in_tree(runner, tree), tree)
     if features is None:
         features = features_for(spec, unit)
     features = list(features)
@@ -226,82 +266,88 @@ def run_check(
     bound = {"timeout": timeout} if timeout else {}
     common = dict(task_data=spec, runner=runner, unit=unit, member=member)
 
-    if name == "boot":
-        return boot_checks.run_boot_gate(
-            environment,
-            spec=boot_checks.resolve_boot_spec(spec, unit, features),
-            features=features,
-            workdir=workdir / unit,
-            mode=mode,
-            **bound,
-            **common,
-        )
-    if name == "accuracy":
-        relative = variants_mod.anchor_state(declared, unit) == variants_mod.ANCHOR_RELATIVE
-        if relative and anchor_score is None:
-            base = variants_mod.base_unit(declared, unit)
-            try:
-                anchor = accuracy_checks.resolve_reference(
-                    declared, model_key=resolve_model_key(declared, base), unit=base
-                )
-            except (KeyError, FileNotFoundError, TypeError, ValueError):
-                anchor = 0.0  # only the score it measures is used, as the variant's anchor
-            first = accuracy_checks.run_accuracy_gate(
-                unit_environment,
-                reference=anchor,
-                workdir=workdir / base,
-                **bound,
-                **{
-                    **common,
-                    "task_data": datasets.staged_spec(declared, gate, workspace),
-                    "unit": base,
-                },
-            )
-            if first.infrastructure or first.measured is None:
-                return replace(
-                    first,
-                    passed=False,
-                    detail=f"{base}'s benchmark at {member} measured no score ({first.detail}), "
-                    f"so {unit}, whose anchor is that score, has nothing to be judged against",
-                )
-            anchor_score = first.measured
-        if relative:
-            return accuracy_checks.run_accuracy_gate(
+    def measure() -> check_result.GateResult:
+        nonlocal anchor_score, disagg_spec
+        if name == "boot":
+            return boot_checks.run_boot_gate(
                 environment,
-                reference=anchor_score,
+                spec=boot_checks.resolve_boot_spec(spec, unit, features),
+                features=features,
                 workdir=workdir / unit,
-                relative=True,
+                mode=mode,
                 **bound,
                 **common,
             )
-        reference = accuracy_checks.resolve_reference(
-            spec, model_key=resolve_model_key(spec, unit), unit=unit
+        if name == "accuracy":
+            relative = variants_mod.anchor_state(declared, unit) == variants_mod.ANCHOR_RELATIVE
+            if relative and anchor_score is None:
+                base = variants_mod.base_unit(declared, unit)
+                try:
+                    anchor = accuracy_checks.resolve_reference(
+                        declared, model_key=resolve_model_key(declared, base), unit=base
+                    )
+                except (KeyError, FileNotFoundError, TypeError, ValueError):
+                    anchor = 0.0  # only the score it measures is used, as the variant's anchor
+                first = accuracy_checks.run_accuracy_gate(
+                    unit_environment,
+                    reference=anchor,
+                    workdir=workdir / base,
+                    **bound,
+                    **{
+                        **common,
+                        "task_data": datasets.staged_spec(declared, gate, workspace),
+                        "unit": base,
+                    },
+                )
+                if first.infrastructure or first.measured is None:
+                    return replace(
+                        first,
+                        passed=False,
+                        detail=f"{base}'s benchmark at {member} measured no score ({first.detail}), "
+                        f"so {unit}, whose anchor is that score, has nothing to be judged against",
+                    )
+                anchor_score = first.measured
+            if relative:
+                return accuracy_checks.run_accuracy_gate(
+                    environment,
+                    reference=anchor_score,
+                    workdir=workdir / unit,
+                    relative=True,
+                    **bound,
+                    **common,
+                )
+            reference = accuracy_checks.resolve_reference(
+                spec, model_key=resolve_model_key(spec, unit), unit=unit
+            )
+            return accuracy_checks.run_accuracy_gate(
+                environment, reference=reference, workdir=workdir / unit, **bound, **common
+            )
+        if name == "acceptance":
+            return acceptance_checks.run_acceptance_gate(
+                environment,
+                features=features,
+                workdir=workdir / unit,
+                records=records,
+                **bound,
+                **common,
+            )
+        if name == "serve":
+            serve_spec = serve.ServeSpec.from_task(spec)
+            return serve.run_serve_gate(
+                environment,
+                features=features,
+                workdir=workdir / unit,
+                boot=boot_checks.resolve_boot_spec(spec, unit, features),
+                spec=replace(serve_spec, timeout=timeout) if timeout else serve_spec,
+                **common,
+            )
+        if disagg_spec is not None and timeout:
+            disagg_spec = replace(disagg_spec, timeout=timeout)
+        return disagg.run_disagg_gate(
+            environment, workdir=workdir / unit, spec=disagg_spec, **common
         )
-        return accuracy_checks.run_accuracy_gate(
-            environment, reference=reference, workdir=workdir / unit, **bound, **common
-        )
-    if name == "acceptance":
-        return acceptance_checks.run_acceptance_gate(
-            environment,
-            features=features,
-            workdir=workdir / unit,
-            records=records,
-            **bound,
-            **common,
-        )
-    if name == "serve":
-        serve_spec = serve.ServeSpec.from_task(spec)
-        return serve.run_serve_gate(
-            environment,
-            features=features,
-            workdir=workdir / unit,
-            boot=boot_checks.resolve_boot_spec(spec, unit, features),
-            spec=replace(serve_spec, timeout=timeout) if timeout else serve_spec,
-            **common,
-        )
-    if disagg_spec is not None and timeout:
-        disagg_spec = replace(disagg_spec, timeout=timeout)
-    return disagg.run_disagg_gate(environment, workdir=workdir / unit, spec=disagg_spec, **common)
+
+    return watch.judge(measure())
 
 
 def run_gate(args: argparse.Namespace) -> check_result.GateResult:

@@ -1403,6 +1403,33 @@ def test_each_member_is_launched_at_its_own_width(tmp_path):
     assert "CUDA_VISIBLE_DEVICES=0 " in seen["tp1"][0]
 
 
+def test_a_check_whose_engine_imported_another_tree_did_not_measure_this_one(tmp_path):
+    """The certification measures the checkout: an engine that loaded another tree's package fails."""
+    data = _load(tmp_path, _spec(tmp_path))
+    tree = (tmp_path / "repo").resolve()
+
+    def engine_from(root):
+        said = {"tensorrt_llm": f"{root}/tensorrt_llm/__init__.py", "api": "LLM"}
+        return CommandResult(
+            returncode=0,
+            stdout=f"{workload_io.DRIVER_MARKER} {json.dumps(said)}\n" + _records("Paris", "the"),
+        )
+
+    def boot(output):
+        return gate_cli.run_check(
+            data, "boot", "core", "tp1", workdir=tmp_path / "w", runner=_gates_recorder(output)
+        )
+
+    here, elsewhere = boot(engine_from(tree)), boot(engine_from("/opt/other/TensorRT-LLM"))
+    assert here.passed and "imported tensorrt_llm from" not in here.detail
+    assert not elsewhere.passed
+    assert (
+        "imported tensorrt_llm from /opt/other/TensorRT-LLM, not from the tree" in elsewhere.detail
+    )
+    # What it measured is still said, after why it does not count.
+    assert here.detail in elsewhere.detail
+
+
 def test_every_member_under_its_reference_is_a_finding_unless_the_spec_acknowledges_it():
     """Each member can clear its own floor while all of them sit low: the round's verdicts say."""
 
