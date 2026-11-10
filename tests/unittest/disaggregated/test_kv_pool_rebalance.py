@@ -329,6 +329,8 @@ def test_rebalance_integrity(mode, tmp_path):
 
     env = os.environ.copy()
     env.update({"MODE": mode, "ZMQ_PORT": str(_find_free_port()), "CUDA_VISIBLE_DEVICES": "0"})
+    # Other test modules set this at import time; the workers need the default (C++) transfer agent.
+    env["TRTLLM_USE_PY_NIXL_KVCACHE"] = "0"
     cmd = [mpirun, "--allow-run-as-root", "--oversubscribe", "-np", "1", sys.executable, WORKER]
     logs = {role: tmp_path / f"{role}.log" for role in ("ctx", "gen")}
     procs = {}
