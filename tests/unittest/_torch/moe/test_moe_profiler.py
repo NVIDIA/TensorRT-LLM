@@ -160,6 +160,7 @@ class _Moe:
     num_experts = 4
     num_slots = 8
     comm = None
+    sort_routing_applies = False
     use_dp = False
     parallel_size = 1
     reduce_results = False
