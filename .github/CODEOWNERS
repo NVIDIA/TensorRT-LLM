@@ -325,9 +325,6 @@
 /tensorrt_llm/_torch/modules/fla @NVIDIA/trt-llm-torch-attention-devs
 /tests/microbenchmarks/cute_dsl_kernels/paged_mqa_logits @NVIDIA/trt-llm-torch-attention-devs
 /tests/unittest/_torch/attention @NVIDIA/trt-llm-torch-attention-devs
-# Exercises the sliding-block-table op that the sparse cache manager owns,
-# so a change to either side routes to that team as well.
-/tests/unittest/_torch/attention/kernels/test_deepseek_v4_block_table.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-kv-cache-manager-devs
 # The kernel-ownership question this test was waiting on is settled: the top-k
 # kernel has two production consumers (Attention and KV-cache compression), so it
 # landed in the architecture-neutral tree at /tensorrt_llm/_torch/kernels/blackwell/
@@ -341,10 +338,6 @@
 /tests/unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_fp8_main_kv_insert.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
 /tests/unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_nvfp4_horizontal_producer.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
 /tests/unittest/_torch/kernels/serial/test_sparse_kv_cache_compact.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
-# The fused QK-norm, RoPE and gate kernel and its test are co-owned by the
-# kernels and Attention teams.
-/tensorrt_llm/_torch/attention/kernels/fused_qk_norm_rope_gate.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
-/tests/unittest/_torch/attention/kernels/test_fused_qk_norm_rope_gate.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
 
 # ===== MoE =====
 /cpp/tensorrt_llm/deep_ep @NVIDIA/trt-llm-moe-devs
@@ -413,17 +406,6 @@
 # Domain-local overrides and co-ownership rules also live in the module sections.
 # Later sections can override these entries; keep intentional precedence explicit.
 # New files use directory rules unless another matching rule overrides them.
-/tensorrt_llm/_torch/attention/kernels/blackwell/__init__.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/attention/kernels/blackwell/dspark/attention.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/attention/kernels/blackwell/dspark/attention_kernel.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/attention/kernels/blackwell/dspark_rmsnorm_rope.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/attention/kernels/blackwell/mla/__init__.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_decode_fp16.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_decode_fp8.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_helpers.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/__init__.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/clc_tile_scheduler.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/kernel.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
 /tests/unittest/_torch/disaggregation/test_kv_cache_transceiver_creation.py @NVIDIA/trt-llm-kv-cache-manager-devs @NVIDIA/trt-llm-disagg-devs
 /tests/unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul_fp4_quant.py @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/kernels/fused_ops/test_rmsnorm_fp4_quant.py @NVIDIA/trt-llm-runtime-devs
