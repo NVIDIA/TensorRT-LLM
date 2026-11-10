@@ -175,6 +175,26 @@ class PeerRegistrar:
                 f"peer={peer_ri.bounded_replay_on_generation})."
             )
 
+    def validate_draft_layers_compatible(self, peer_ri: RankInfo) -> None:
+        """Raise ValueError when the peers' shared draft KV layer counts differ.
+
+        Both sides run it: the sender when it registers a receiver, and the
+        receiver before it registers with a sender, so a mismatch fails the
+        receiver's requests instead of leaving them waiting for KV.
+        """
+        if self._ri.num_draft_layers != peer_ri.num_draft_layers:
+            # The layer-count tolerance in _check_peer_compatible would transfer
+            # only the target layers and leave the drafter's prompt KV unset on
+            # the receiver.
+            raise ValueError(
+                "PeerRegistrar: unified draft KV layer count differs "
+                f"(local={self._ri.num_draft_layers}, peer={peer_ri.num_draft_layers}); "
+                "both peers must use the same speculative decoding KV cache layout: "
+                "give both workers the same speculative_config, or set "
+                "TRTLLM_DISAGG_SHARED_DRAFT_KV=0 on every worker to keep a separate "
+                "draft KV cache."
+            )
+
     def _check_peer_compatible(self, peer_ri: RankInfo) -> bool:
         # Wire-format gate first: a peer on another protocol version cannot be
         # trusted on any other field. Raises ValueError naming both versions.
@@ -196,15 +216,7 @@ class PeerRegistrar:
             peer_ri.page_table,
         )
         AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
-        if self._ri.num_draft_layers != peer_ri.num_draft_layers:
-            # The layer-count tolerance below would transfer only the target
-            # layers and leave the drafter's prompt KV unset on the receiver.
-            raise ValueError(
-                "PeerRegistrar: unified draft KV layer count differs "
-                f"(local={self._ri.num_draft_layers}, peer={peer_ri.num_draft_layers}); "
-                "both peers must use the same speculative decoding KV cache layout; "
-                "set TRTLLM_DISAGG_SHARED_DRAFT_KV identically on both workers."
-            )
+        self.validate_draft_layers_compatible(peer_ri)
         self.validate_view_head_geometry(peer_ri)
 
         self_layers = sum(self._ri.layer_num_per_pp)

@@ -660,6 +660,7 @@ def _make_receiver_for_view_validation(
     [
         ("missing_heads", "must publish a positive num_kv_heads"),
         ("pool_roles", "has no peer view with the same roles"),
+        ("draft_layers", "unified draft KV layer count differs (local=5, peer=0)"),
     ],
 )
 def test_receiver_rejects_view_mismatch_before_registration(
@@ -690,8 +691,12 @@ def test_receiver_rejects_view_mismatch_before_registration(
     bad_view = bad_ri.page_table.layer_groups[0].pool_views[1]
     if mismatch == "missing_heads":
         bad_view.num_kv_heads = None
-    else:
+    elif mismatch == "pool_roles":
         bad_view.pool_role = frozenset({"other_kv"})
+    else:
+        # A generation worker sharing draft KV with a context worker that has no draft layers
+        # (no speculative_config, or the launcher's TRTLLM_DISAGG_SHARED_DRAFT_KV=0).
+        local_ri.num_draft_layers = good_ri.num_draft_layers = 5
     bad_ri.sender_endpoints = ["tcp://bad-sender"]
     good_ri.sender_endpoints = ["tcp://good-sender"]
     bad_endpoint = "tcp://bad-info"
@@ -724,6 +729,9 @@ def test_receiver_rejects_view_mismatch_before_registration(
             assert task.is_done
             assert isinstance(task._exception, PeerIncompatibleError)
             assert diagnostic in str(task._exception)
+            if mismatch == "draft_layers":
+                assert "TRTLLM_DISAGG_SHARED_DRAFT_KV=0" in str(task._exception)
+                assert "speculative_config" in str(task._exception)
             if enforce_physical_ownership:
                 assert task.resources_drained
 
