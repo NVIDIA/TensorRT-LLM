@@ -685,6 +685,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 warmup_fused_dsv4_dspark_attention(
                     block_size,
                     eps=float(draft_model._attn_params["eps"]),
+                    num_heads=int(draft_model._attn_params["n_heads"]),
                 )
         self._attention_warmup_attempted = True
 
