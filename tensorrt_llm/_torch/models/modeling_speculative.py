@@ -1890,6 +1890,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 key_exchange=key_exchange,
                 spec_decode_fast_paths=self.spec_decode_fast_paths)
             if self.spec_worker is not None:
+                self._enable_vocab_parallel_argmax(model_config, key_exchange)
                 # Cache the static draft->target vocab map now that the draft
                 # model is loaded, so workers read self._d2t instead of probing
                 # draft_model.model.d2t on every forward.
@@ -1897,6 +1898,31 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 self.spec_worker.set_target_model(self)
                 self.epilogue.append(self.spec_worker)
         self.layer_idx = -1
+
+    def _enable_vocab_parallel_argmax(self, model_config: ModelConfig,
+                                      key_exchange) -> None:
+        """Let the spec worker take its greedy target and draft tokens from
+        vocabulary-sharded logits (cross-rank argmax, no logits all-gather)
+        where the worker and the LM head allow it, unless
+        ``TLLM_SPEC_VOCAB_PARALLEL_ARGMAX=0``.
+
+        Collective over the TP group: the decision depends only on the
+        configuration, which every rank shares, and the key exchange is
+        built by every rank in step."""
+        from ..speculative.vocab_parallel import (is_vocab_sharded_lm_head,
+                                                  vocab_parallel_argmax_enabled)
+        mapping = model_config.mapping
+        if not (vocab_parallel_argmax_enabled()
+                and self.spec_worker.verifies_on_target_shard
+                and not mapping.has_pp() and mapping.cp_size == 1
+                and is_vocab_sharded_lm_head(self.lm_head)):
+            return
+        if key_exchange is None:
+            from ..distributed import ll_exchange
+            key_exchange = ll_exchange.create_tp_key_exchange(
+                mapping, model_config.max_num_tokens)
+        self.spec_worker.enable_vocab_parallel_argmax(self.lm_head,
+                                                      key_exchange)
 
     def setup_aliases(self) -> None:
         if (self.draft_model is not None
