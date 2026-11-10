@@ -112,6 +112,7 @@ class ADPIterStatsBuffer:
         self._synthetic_iters: Set[int] = set()
         # Rank 0 only: full IterationStats objects waiting for ADP fanout.
         self._rank0_iter_stats: Dict[int, IterationStats] = {}
+        self._rank0_allow_empty_heartbeat: Dict[int, bool] = {}
         # Rank 0 only: per-request stats preserved for compatibility.
         # RequestStats remain rank-0-owned under Attention-DP.
         self._rank0_req_stats: Dict[int, Optional[List[RequestStats]]] = {}
@@ -139,6 +140,10 @@ class ADPIterStatsBuffer:
             num_gen_kv_tokens=ifb.num_gen_kv_tokens,
             num_paused_requests=ifb.num_paused_requests,
             num_paused_kv_tokens=ifb.num_paused_kv_tokens,
+            num_queued_context_requests=ifb.num_queued_context_requests,
+            num_queued_ctx_tokens=ifb.num_queued_ctx_tokens,
+            num_queued_gen_requests=ifb.num_queued_gen_requests,
+            num_queued_gen_kv_tokens=ifb.num_queued_gen_kv_tokens,
             kv_cache_stats=_snapshot_kv_cache_stats(stats.kv_cache_stats),
             cross_kv_cache_stats=_snapshot_kv_cache_stats(stats.cross_kv_cache_stats),
         )
@@ -153,6 +158,7 @@ class ADPIterStatsBuffer:
         host_step_time_ms: Optional[float] = None,
         prev_device_step_time_ms: Optional[float] = None,
         gpu_forward_time_ms: Optional[float] = None,
+        allow_empty_heartbeat: bool = True,
     ) -> None:
         """Queue local stats; rank 0 also keeps objects needed for fanout."""
         payload = self.make_payload(stats)
@@ -169,6 +175,7 @@ class ADPIterStatsBuffer:
 
         if is_rank0:
             self._rank0_iter_stats[iter_id] = stats
+            self._rank0_allow_empty_heartbeat[iter_id] = allow_empty_heartbeat
             self._rank0_req_stats[iter_id] = req_stats
             self._rank0_kv_iter_stats[iter_id] = kv_iter_stats
             self._rank0_host_step_time_ms[iter_id] = host_step_time_ms
@@ -206,6 +213,7 @@ class ADPIterStatsBuffer:
         self._payloads.pop(iter_id, None)
         self._synthetic_iters.discard(iter_id)
         self._rank0_iter_stats.pop(iter_id, None)
+        self._rank0_allow_empty_heartbeat.pop(iter_id, None)
         self._rank0_req_stats.pop(iter_id, None)
         self._rank0_kv_iter_stats.pop(iter_id, None)
         self._rank0_host_step_time_ms.pop(iter_id, None)
@@ -238,13 +246,14 @@ class ADPIterStatsBuffer:
     def _make_rank_iter_stats(
         rank0_stats: IterationStats,
         rank_state: RankState,
+        queued_stats: RankIterStatsPayload,
     ) -> IterationStats:
         """Build one IterationStats row for an ADP rank.
 
         Attention-DP emits one stats row per rank so downstream FPM consumers
         can see scheduling distribution and diagnose load imbalance. Scheduled
-        fields are rank-local. Queued fields remain rank-0/global because the
-        executor request queue lives on rank 0.
+        fields are rank-local. Queued fields are summed over rank-local
+        admitted backlogs and rank 0's shared pre-admission queues.
         """
         rank = rank_state.rank
         payload = rank_state.iter_stats
@@ -280,10 +289,13 @@ class ADPIterStatsBuffer:
             ifb.micro_batch_id = source_ifb.micro_batch_id
             ifb.avg_num_decoded_tokens_per_iter = source_ifb.avg_num_decoded_tokens_per_iter
             if rank == 0:
-                ifb.num_queued_context_requests = source_ifb.num_queued_context_requests
-                ifb.num_queued_ctx_tokens = source_ifb.num_queued_ctx_tokens
-                ifb.num_queued_gen_requests = source_ifb.num_queued_gen_requests
-                ifb.num_queued_gen_kv_tokens = source_ifb.num_queued_gen_kv_tokens
+                ifb.num_queued_context_requests = queued_stats.num_queued_context_requests
+                ifb.num_queued_ctx_tokens = queued_stats.num_queued_ctx_tokens
+                ifb.num_queued_gen_requests = queued_stats.num_queued_gen_requests
+                ifb.num_queued_gen_kv_tokens = queued_stats.num_queued_gen_kv_tokens
+                stats.num_queued_requests = (
+                    ifb.num_queued_context_requests + ifb.num_queued_gen_requests
+                )
 
         if rank != 0:
             stats.num_queued_requests = 0
@@ -347,11 +359,40 @@ class ADPIterStatsBuffer:
             prev_device_step_time_ms = self._rank0_prev_device_step_time_ms.get(iter_stats_iter)
             gpu_forward_time_ms = self._rank0_gpu_forward_time_ms.get(iter_stats_iter)
 
+            queued_stats = RankIterStatsPayload()
+            for name in RankIterStatsPayload._QUEUED_FIELDS:
+                setattr(
+                    queued_stats,
+                    name,
+                    sum(getattr(state.iter_stats, name) for state in matching_states),
+                )
+            allow_empty = self._rank0_allow_empty_heartbeat[iter_stats_iter] and not any(
+                getattr(queued_stats, name) for name in RankIterStatsPayload._QUEUED_FIELDS
+            )
             for rank_state in sorted(matching_states, key=lambda s: s.rank):
                 rank = rank_state.rank
+                stats = self._make_rank_iter_stats(rank0_stats, rank_state, queued_stats)
+                ifb = stats.inflight_batching_stats
+                if (
+                    not allow_empty
+                    and stats.iter_latency_ms == 0
+                    and not any(
+                        (
+                            ifb.num_context_requests,
+                            ifb.num_ctx_tokens,
+                            ifb.num_gen_requests,
+                            ifb.num_gen_kv_tokens,
+                            ifb.num_queued_context_requests,
+                            ifb.num_queued_ctx_tokens,
+                            ifb.num_queued_gen_requests,
+                            ifb.num_queued_gen_kv_tokens,
+                        )
+                    )
+                ):
+                    continue
                 records.append(
                     ADPIterStatsRecord(
-                        stats=self._make_rank_iter_stats(rank0_stats, rank_state),
+                        stats=stats,
                         req_stats=req_stats if rank == 0 else None,
                         kv_iter_stats=kv_iter_stats if rank == 0 else None,
                         attention_dp_rank=rank,

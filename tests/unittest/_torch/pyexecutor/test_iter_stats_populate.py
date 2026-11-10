@@ -74,6 +74,8 @@ class _StubRequest:
         and paused (preempted-decode) requests.
     """
 
+    _next_id = 0
+
     def __init__(
         self,
         *,
@@ -83,10 +85,21 @@ class _StubRequest:
         is_attention_dp_dummy: bool = False,
         is_cuda_graph_dummy: bool = False,
         is_dummy_request: bool = False,
+        is_context_init_state: bool = False,
+        context_remaining_length: int = 0,
+        is_disagg_generation_init_state: bool = False,
+        is_finished: bool = False,
         num_draft_tokens: int = 0,
         py_draft_tokens=None,
         py_num_accepted_draft_tokens=None,
     ):
+        _StubRequest._next_id += 1
+        self.py_request_id = _StubRequest._next_id
+        self.is_context_init_state = is_context_init_state
+        self.context_remaining_length = context_remaining_length
+        self.is_disagg_generation_init_state = is_disagg_generation_init_state
+        self.is_finished = is_finished
+        self.is_child = False
         self.context_current_position = context_current_position
         # py_last_context_chunk = (begin_compute, end_compute). For a fresh
         # prefill, begin_compute == 0; for continuations, == prev position.
@@ -164,13 +177,24 @@ class _StubQueueItem:
             request_type=request_type,
         )
         self.is_normal_request = is_normal_request
+        self.is_canceled_request = False
         # Stable id so the populate block's drift-warning log has a value
         # to reference even if a future branch exercises item.id.
         _StubQueueItem._next_id += 1
         self.id = _StubQueueItem._next_id
 
 
-def _build_fake_self(queued_items, model_engine_iter_states, *, enable_attention_dp=False):
+def _build_fake_self(
+    queued_items,
+    model_engine_iter_states,
+    *,
+    enable_attention_dp=False,
+    waiting_items=(),
+    active_requests=(),
+    rank=0,
+    canceled_ids=(),
+    inflight_ids=(),
+):
     """Minimal 'self' for ``PyExecutor._update_iter_stats(self, ...)``.
 
     Stubs only the ``self.*`` attributes the method actually reads:
@@ -204,6 +228,11 @@ def _build_fake_self(queued_items, model_engine_iter_states, *, enable_attention
     fake.drafter = None
     fake.model_engine = types.SimpleNamespace(iter_states=model_engine_iter_states)
     fake.enable_attention_dp = enable_attention_dp
+    fake.dist.rank = rank
+    fake.waiting_queue = list(waiting_items)
+    fake.active_requests = list(active_requests)
+    fake.canceled_req_ids = list(canceled_ids)
+    fake.inflight_req_ids = set(inflight_ids)
     # Bind the real dummy-request predicate: a bare MagicMock auto-generates a
     # child Mock for attribute access (always truthy when called), which would
     # classify every request as dummy and zero out all per-request aggregates.
@@ -219,6 +248,11 @@ def _invoke_update_iter_stats(
     enable_attention_dp=False,
     scheduled_batch_stats=None,
     specdec=False,
+    waiting_items=(),
+    active_requests=(),
+    rank=0,
+    canceled_ids=(),
+    inflight_ids=(),
 ):
     """Call real ``PyExecutor._update_iter_stats`` unbound; return the stats.
 
@@ -255,6 +289,11 @@ def _invoke_update_iter_stats(
         queued_items,
         model_engine_iter_states,
         enable_attention_dp=enable_attention_dp,
+        waiting_items=waiting_items,
+        active_requests=active_requests,
+        rank=rank,
+        canceled_ids=canceled_ids,
+        inflight_ids=inflight_ids,
     )
 
     stats = IterationStats()
@@ -394,6 +433,102 @@ def test_queued_filters_non_normal_requests():
     ifb = stats.inflight_batching_stats
     assert ifb.num_queued_context_requests == 1
     assert ifb.num_queued_ctx_tokens == 50
+
+
+@pytest.mark.parametrize("enable_attention_dp", [False, True])
+def test_queued_includes_pre_admission_queue_once(enable_attention_dp):
+    from tensorrt_llm.bindings.executor import RequestType
+
+    ingress = _StubQueueItem(list(range(100)))
+    waiting_context = _StubQueueItem(list(range(200)))
+    waiting_decode = _StubQueueItem(
+        list(range(300)),
+        request_type=RequestType.REQUEST_TYPE_GENERATION_ONLY,
+    )
+    control = _StubQueueItem([0], is_normal_request=False)
+    missing_payload = _StubQueueItem([0])
+    missing_payload.request = None
+    canceled = _StubQueueItem(list(range(400)))
+    cancel = _StubQueueItem([0], is_normal_request=False)
+    cancel.id = canceled.id
+    cancel.is_canceled_request = True
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(),
+        [ingress, canceled, cancel],
+        num_ctx_tokens=0,
+        enable_attention_dp=enable_attention_dp,
+        waiting_items=[ingress, waiting_context, waiting_decode, control, missing_payload],
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_queued_context_requests == 2
+    assert ifb.num_queued_ctx_tokens == 300
+    assert ifb.num_queued_gen_requests == 1
+    assert ifb.num_queued_gen_kv_tokens == 300
+    assert stats.num_queued_requests == 3
+
+
+def test_queued_counts_admitted_prefill_remaining_tokens():
+    scheduled = _StubRequest(is_context_init_state=True, context_remaining_length=900)
+    waiting = _StubRequest(
+        is_context_init_state=True,
+        context_remaining_length=300,
+        context_current_position=700,
+    )
+    paused = _StubRequest(is_context_init_state=True, context_remaining_length=200)
+    dummy = _StubRequest(
+        is_context_init_state=True,
+        context_remaining_length=999,
+        is_attention_dp_dummy=True,
+    )
+    finished = _StubRequest(
+        is_context_init_state=True,
+        context_remaining_length=999,
+        is_finished=True,
+    )
+    canceled = _StubRequest(is_context_init_state=True, context_remaining_length=999)
+    inflight = _StubRequest(is_context_init_state=True, context_remaining_length=999)
+    decode = _StubRequest(num_tokens=1000)
+    transferring = _StubRequest(num_tokens=500, is_disagg_generation_init_state=True)
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(context_reqs=[scheduled], paused_reqs=[paused]),
+        [],
+        num_ctx_tokens=100,
+        active_requests=[
+            scheduled,
+            waiting,
+            paused,
+            dummy,
+            finished,
+            canceled,
+            inflight,
+            decode,
+            transferring,
+        ],
+        canceled_ids=[canceled.py_request_id],
+        inflight_ids=[inflight.py_request_id],
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_queued_context_requests == 1
+    assert ifb.num_queued_ctx_tokens == 300
+    assert ifb.num_queued_gen_requests == 1
+    assert ifb.num_queued_gen_kv_tokens == 500
+    assert ifb.num_paused_requests == 1
+    assert stats.num_queued_requests == 2
+
+
+def test_attention_dp_local_backlog_excludes_replicated_waiting_queue():
+    active = _StubRequest(is_context_init_state=True, context_remaining_length=300)
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(),
+        [_StubQueueItem(list(range(100)))],
+        num_ctx_tokens=0,
+        enable_attention_dp=True,
+        rank=1,
+        waiting_items=[_StubQueueItem(list(range(200)))],
+        active_requests=[active],
+    )
+    assert stats.inflight_batching_stats.num_queued_context_requests == 1
+    assert stats.inflight_batching_stats.num_queued_ctx_tokens == 300
 
 
 def test_queued_routes_by_request_type():
@@ -1183,3 +1318,79 @@ def test_update_iter_stats_does_not_overwrite_construction_iter():
 
     # If someone re-introduces ``stats.iter = self.iter_counter`` this becomes 999.
     assert stats.iter == 17
+
+
+def test_attention_dp_fanout_sums_admitted_backlog_on_rank0():
+    rank0_stats = _make_adp_iteration_stats(
+        iter_id=10,
+        num_queued_context_requests=2,
+        num_queued_ctx_tokens=300,
+    )
+    rank0_stats.iter_latency_ms = 12.5
+    buffer = _build_adp_stats_buffer(rank0_stats)
+    states = [
+        RankState(rank=0, iter_stats=buffer.next_payload()),
+        RankState(
+            rank=1,
+            iter_stats=RankIterStatsPayload(
+                has_iter_stats=1,
+                iter_stats_iter=10,
+                num_queued_context_requests=1,
+                num_queued_ctx_tokens=400,
+                num_queued_gen_requests=1,
+                num_queued_gen_kv_tokens=500,
+            ),
+        ),
+    ]
+    # Exercise the wire, not just direct Python dataclass exchange.
+    records = buffer.finalize(
+        [RankState.deserialize(state.serialize()) for state in states],
+        is_rank0=True,
+    )
+    assert len(records) == 2
+    ifb = records[0].stats.inflight_batching_stats
+    assert ifb.num_queued_context_requests == 3
+    assert ifb.num_queued_ctx_tokens == 700
+    assert ifb.num_queued_gen_requests == 1
+    assert ifb.num_queued_gen_kv_tokens == 500
+    assert records[0].stats.num_queued_requests == 4
+    assert records[1].stats.num_queued_requests == 0
+    assert records[1].stats.inflight_batching_stats.num_queued_context_requests == 0
+
+
+@pytest.mark.parametrize("allow_empty", [False, True])
+@pytest.mark.parametrize("queued_tokens", [0, 300])
+@pytest.mark.parametrize("iter_latency_ms", [0.0, 12.5])
+def test_attention_dp_idle_heartbeat_requires_global_idle(
+    allow_empty,
+    queued_tokens,
+    iter_latency_ms,
+):
+    stats = _make_adp_iteration_stats(
+        iter_id=11,
+        num_queued_context_requests=int(queued_tokens > 0),
+        num_queued_ctx_tokens=queued_tokens,
+    )
+    stats.iter_latency_ms = iter_latency_ms
+    buffer = ADPIterStatsBuffer()
+    buffer.queue(stats, is_rank0=True, allow_empty_heartbeat=allow_empty)
+    records = buffer.finalize(
+        [
+            RankState(rank=0, iter_stats=buffer.next_payload()),
+            RankState(
+                rank=1,
+                iter_stats=RankIterStatsPayload(
+                    has_iter_stats=1,
+                    iter_stats_iter=11,
+                ),
+            ),
+        ],
+        is_rank0=True,
+    )
+    expected_count = (
+        2 if iter_latency_ms > 0 or (allow_empty and not queued_tokens) else int(queued_tokens > 0)
+    )
+    assert len(records) == expected_count
+    for record in records:
+        assert record.stats.inflight_batching_stats.num_scheduled_requests == 0
+        assert record.stats.iter_latency_ms == iter_latency_ms

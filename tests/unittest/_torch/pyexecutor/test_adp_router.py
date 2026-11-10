@@ -311,6 +311,53 @@ class TestRankState:
         assert RankIterStatsPayload.deserialize(payload.serialize(include_kv_cache_load)) == payload
         assert RankState.deserialize(state.serialize(include_kv_cache_load)) == state
 
+    @pytest.mark.parametrize("include_kv_cache_load", [False, True])
+    @pytest.mark.parametrize("with_kv_snapshot", [False, True])
+    @pytest.mark.parametrize("has_pending_work", [False, True])
+    def test_queued_stats_roundtrip_preserves_routing_tail(
+        self,
+        include_kv_cache_load: bool,
+        with_kv_snapshot: bool,
+        has_pending_work: bool,
+    ) -> None:
+        payload = RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=9,
+            num_queued_context_requests=2,
+            num_queued_ctx_tokens=300,
+            num_queued_gen_requests=1,
+            num_queued_gen_kv_tokens=400,
+            has_pending_work=has_pending_work,
+            kv_cache_stats=(
+                RankKvCacheStats(10, 8, 2, 16, 3, 2, 1, 1, 0.5) if with_kv_snapshot else None
+            ),
+        )
+        state = RankState(
+            rank=1,
+            iter_stats=payload,
+            num_connector_transfers=7,
+            connector_poll_failed=True,
+        )
+        wire = state.serialize(include_kv_cache_load)
+        assert wire[4] == -2
+        assert RankState.deserialize(wire) == state
+        with pytest.raises(ValueError, match="four trailing fields"):
+            RankState.deserialize(wire[:-1])
+
+    @pytest.mark.parametrize("include_kv_cache_load", [False, True])
+    @pytest.mark.parametrize("has_pending_work", [False, True])
+    def test_pending_work_roundtrip_without_sampled_stats(
+        self,
+        include_kv_cache_load: bool,
+        has_pending_work: bool,
+    ) -> None:
+        payload = RankIterStatsPayload(has_pending_work=has_pending_work)
+        state = RankState(rank=1, iter_stats=payload, num_connector_transfers=7)
+        wire = state.serialize(include_kv_cache_load)
+        assert wire[4] == (-2 if has_pending_work else 0)
+        assert RankState.deserialize(wire) == state
+        assert not RankState.deserialize(wire).iter_stats.has_iter_stats
+
     def test_kv_snapshot_wire_schema_is_stable(self) -> None:
         """Pin field order and the complete versioned frame independently of roundtrips."""
         assert RankKvCacheStats._fields == (

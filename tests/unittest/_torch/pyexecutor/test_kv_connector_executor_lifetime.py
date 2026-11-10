@@ -30,6 +30,7 @@ pytestmark = pytest.mark.cpu_only
 def _executor() -> PyExecutor:
     executor = object.__new__(PyExecutor)
     executor.enable_attention_dp = False
+    executor.enable_iter_perf_stats = False
     executor.model_engine = SimpleNamespace(_dspark_confidence_enabled=False)
     executor._kv_connector_failed = False
     executor._kv_connector_has_pending = False
