@@ -479,3 +479,154 @@ def test_every_listener_keeps_its_policy(
         "_listener_address_family in tensorrt_llm/commands/serve_cli/_net.py); changing "
         "one is a behavior change for its own PR."
     )
+
+
+# --- the kernel-assigned port and the launcher's port lock --------------------
+
+_KERNEL_PORT = 45678
+
+
+class _BoundSocket:
+    """What the bind recorder hands back: a bound socket with a known kernel-assigned port."""
+
+    def __init__(self, port: int) -> None:
+        self._port = port
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+    def getsockname(self):
+        return (_HOST, self._port)
+
+
+def _bind_to_kernel_port(monkeypatch: pytest.MonkeyPatch, module: ModuleType, calls: list) -> None:
+    """A port-0 bind answers with _KERNEL_PORT; publishing records its arguments and stops."""
+    monkeypatch.setattr(
+        module, "_listener_address_family", lambda kind, host, port, policy="auto": socket.AF_INET
+    )
+
+    def bind_listener(kind, host, port, *, family, reuse_port=False):
+        calls.append(("bind", host, port))
+        return _BoundSocket(_KERNEL_PORT if port == 0 else port)
+
+    def publish_bound_address(report_addr, host, port):
+        calls.append(("publish", report_addr, host, port))
+        raise _Stop()
+
+    monkeypatch.setattr(module, "_bind_listener", bind_listener)
+    monkeypatch.setattr(module, "_publish_bound_address", publish_bound_address)
+
+
+def test_launch_server_publishes_the_kernel_assigned_port(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restored_environment
+) -> None:
+    module = inspect.getmodule(serve_module.launch_server)
+    calls = []
+    _bind_to_kernel_port(monkeypatch, module, calls)
+    report_addr = str(tmp_path / "server.addr")
+
+    with pytest.raises(_Stop):
+        module.launch_server(
+            _HOST, 0, {"backend": "pytorch", "model": "dummy"}, report_addr=report_addr
+        )
+
+    assert calls == [("bind", _HOST, 0), ("publish", report_addr, _HOST, _KERNEL_PORT)], (
+        "launch_server must publish the port the kernel assigned to a port-0 bind, read back "
+        f"from the bound socket, not the requested port 0; recorded {calls}"
+    )
+
+
+def test_disaggregated_publishes_the_kernel_assigned_port(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restored_environment
+) -> None:
+    module = inspect.getmodule(serve_module.disaggregated.callback)
+    calls = []
+    _bind_to_kernel_port(monkeypatch, module, calls)
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    config = tmp_path / "disagg.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "hostname": _HOST,
+                "port": 0,
+                "num_workers": 1,
+                "context_servers": {},
+                "generation_servers": {},
+            }
+        )
+    )
+    report_addr = str(tmp_path / "disagg.addr")
+
+    with pytest.raises(_Stop):
+        module.disaggregated.callback(
+            config_file=str(config),
+            metadata_server_config_file=None,
+            server_start_timeout=180,
+            request_timeout=180,
+            log_level="info",
+            metrics_log_interval=0,
+            schedule_style=None,
+            telemetry=True,
+            report_addr=report_addr,
+        )
+
+    # The published port is disagg_cfg.port: the readback must have been written into it.
+    assert calls == [("bind", _HOST, 0), ("publish", report_addr, _HOST, _KERNEL_PORT)], (
+        "the disaggregated server must write the kernel-assigned port of a port-0 bind back "
+        f"into its config and publish that port, not the requested port 0; recorded {calls}"
+    )
+
+
+class _RecordingLock:
+    """Stands in for the launcher's port lock; records when it is entered and left."""
+
+    def __init__(self, events: list) -> None:
+        self._events = events
+
+    def __enter__(self):
+        self._events.append("lock entered")
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self._events.append("lock left")
+        return False
+
+
+def test_launch_server_holds_the_port_lock_across_the_bind(
+    monkeypatch: pytest.MonkeyPatch, restored_environment
+) -> None:
+    module = inspect.getmodule(serve_module.launch_server)
+    events = []
+
+    def reserve_multi_frontend_port(host, port, family):
+        events.append(("reserved", host, port, family))
+        return _RecordingLock(events)
+
+    def bind_listener(kind, host, port, *, family, reuse_port=False):
+        events.append(("bind", host, port))
+        raise _Stop()
+
+    monkeypatch.setattr(module, "_reserve_multi_frontend_port", reserve_multi_frontend_port)
+    monkeypatch.setattr(
+        module, "_listener_address_family", lambda kind, host, port, policy="auto": socket.AF_INET
+    )
+    monkeypatch.setattr(module, "_bind_listener", bind_listener)
+
+    with pytest.raises(_Stop):
+        module.launch_server(
+            _HOST, _PORT, {"backend": "pytorch", "model": "dummy", "num_serve_frontends": 2}
+        )
+
+    assert events == [
+        ("reserved", _HOST, _PORT, socket.AF_INET),
+        "lock entered",
+        ("bind", _HOST, _PORT),
+        "lock left",
+    ], (
+        "the launcher must hold the port lock while it binds the listener: the lock is "
+        "reserved and entered before the bind and left after it, also when the bind fails; "
+        f"recorded {events}"
+    )
