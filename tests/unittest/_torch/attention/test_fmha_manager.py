@@ -62,7 +62,6 @@ def _make_metadata(
         num_ctx_tokens=num_ctx_tokens,
         use_spec_decoding=use_spec_decoding,
         num_sparse_topk=num_sparse_topk,
-        # Read by the selection cache key (``has_active_plan``).
         fmha_plan_caches={},
     )
 
@@ -1208,3 +1207,55 @@ def test_manager_skips_an_unavailable_prepended_library() -> None:
 
     assert [type(lib) for lib in manager.fmha_libs] == registry
     assert [name for name, _ in checked] == ["Prepended", "First"]
+
+
+class _PlanningFakePhasedFmha(FakePhasedFmha):
+    """A library whose support follows its per-step plan (``metadata.planned``)."""
+
+    def __init__(self, attn: FakeAttention) -> None:
+        super().__init__(
+            attn,
+            {None, FmhaPhase.GENERATION},
+            "planning",
+            [],
+            support_predicate=lambda metadata, phase: metadata.planned,
+        )
+
+    @classmethod
+    def plan_step(cls, metadata) -> None:
+        pass
+
+    @classmethod
+    def selection_cache_key(cls, metadata) -> bool:
+        return metadata.planned
+
+
+def test_fmha_cache_keys_on_the_plans_of_libraries_that_plan_steps() -> None:
+    """A selection made on a planned step is not reused on an unplanned one of the same shape."""
+    attn = FakeAttention()
+    with (
+        patch.object(
+            fmha_manager, "get_enabled_fmha_lib_classes", return_value=[_PlanningFakePhasedFmha]
+        ),
+        patch.object(
+            fmha_manager, "step_planning_fmha_lib_classes", return_value=(_PlanningFakePhasedFmha,)
+        ),
+    ):
+        manager = FmhaManager(attn)
+    planning_fmha = manager.fmha_libs[0]
+
+    def select(planned: bool):
+        metadata = _make_metadata(num_contexts=0, num_generations=2)
+        metadata.planned = planned
+        return manager.select(
+            attn,
+            torch.empty((8, 4)),
+            None,
+            None,
+            metadata,
+            AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only),
+        )
+
+    assert select(True) is planning_fmha
+    assert select(False) is None
+    assert select(True) is planning_fmha

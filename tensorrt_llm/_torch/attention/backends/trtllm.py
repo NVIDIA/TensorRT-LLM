@@ -55,10 +55,7 @@ from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
 from ..kernels.sage_quant import SageQuantized, sage_quantize
 from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
-from .fmha.registry import is_fmha_lib_enabled
-from .fmha.sampling_shared_prefix import LIB_NAME as SAMPLING_SHARED_PREFIX_LIB
-from .fmha.sampling_shared_prefix import \
-    plan_step as sampling_shared_prefix_plan_step
+from .fmha.registry import step_planning_fmha_lib_classes
 from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
                       populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
@@ -1380,11 +1377,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                 pool_block_offsets[:, 1],
                                 out=pool_block_offsets[:, 1])
 
-        # Per-step host planning of the opt-in shared-prefix generation library.
-        # It must run here, ahead of every forward of the step, so that under
-        # CUDA graphs it precedes both capture and replay.
-        if is_fmha_lib_enabled(SAMPLING_SHARED_PREFIX_LIB):
-            sampling_shared_prefix_plan_step(self)
+        # Per-step host planning of the enabled FMHA libraries that plan steps
+        # (Fmha.plan_step). It must run here, ahead of every forward of the
+        # step, so that under CUDA graphs it precedes both capture and replay.
+        for fmha_cls in step_planning_fmha_lib_classes():
+            fmha_cls.plan_step(self)
 
     def _on_mixed_precision_kv_prepared(self, view) -> None:
         """Lay out the staging pages as TRTLLM block offsets for this batch."""
@@ -1499,7 +1496,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def supports_steady_decode_step(self) -> bool:
         """Whether prepare_steady_decode_step may stand in for this metadata's prepare(): no host state of
         prepare() beyond the KV lengths and block offsets (no FlashMLA, helix, cached-KV context MLA, FP4 MLA,
-        mixed-precision KV, full generation page table or shared-prefix step plan) and prepare() is this
+        mixed-precision KV, full generation page table or FMHA library step plan) and prepare() is this
         class's."""
         return (type(self).prepare is TrtllmAttentionMetadata.prepare
                 and self.kv_cache_manager is not None
@@ -1509,8 +1506,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 and not self._has_mixed_precision_staging()
                 and self.mixed_precision_high_block_table is None
                 and not self.kv_cache_params.use_full_generation_page_table
-                # The shared-prefix library plans every step in prepare().
-                and not is_fmha_lib_enabled(SAMPLING_SHARED_PREFIX_LIB))
+                # No enabled FMHA library plans steps in prepare().
+                and not step_planning_fmha_lib_classes())
 
     def key_prepared_block_offsets(self) -> None:
         """Key the block offsets the last prepare() copied, so that the next prepare_steady_decode_step skips

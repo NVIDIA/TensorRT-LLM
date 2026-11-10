@@ -730,6 +730,12 @@ class _SamplingState:
     page_scale: int
     page_div: int
     num_pages: int
+    shape: tuple
+    """(heads, kv_heads, head_dim) of the attention layers the plan serves: the KV heads and head
+    size of the KV cache manager's first layer, the query heads from the model's query heads per KV
+    head (``max_num_heads_per_kv``). Each layer checks its own shape against it (``_is_supported``),
+    so the buffers and the size gate always describe the model of this executor."""
+    kv_dtype: torch.dtype
     manager_ref: Optional[weakref.ref] = None
     """The KV-cache manager the plan describes. The draft layers of one-model
     speculative decoding run on this metadata with the draft manager swapped in;
@@ -768,11 +774,6 @@ def _int_env(name: str, default: int) -> int:
     return int(value)
 
 
-_model_shape: Optional[tuple] = None
-"""(heads, kv_heads, head_dim) of the attention layers that can use the library, set
-when a layer reports itself available; the buffers and the cost model need it."""
-
-
 def group_saved_bytes(rows: np.ndarray, tokens: np.ndarray, shape: tuple) -> np.ndarray:
     """KV bytes per layer that sharing groups of ``rows`` rows and ``tokens`` shared tokens do not
     read again: every row but one would read the shared prefix (K and V, bf16)."""
@@ -788,12 +789,12 @@ def _min_saved_bytes(shape: tuple) -> float:
     return COST_MODEL[key]
 
 
-def _group_filter(q_len: int) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
-    """Which candidate groups ``(rows, shared tokens)`` share: the env threshold if set, else the
-    cost model (``COST_MODEL``); never a group below the minimum size."""
+def _group_filter(q_len: int, shape: tuple) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
+    """Which candidate groups ``(rows, shared tokens)`` of a model with attention ``shape`` (heads,
+    KV heads, head size) share: the env threshold if set, else the cost model (``COST_MODEL``);
+    never a group below the minimum size."""
     min_group = _int_env(MIN_GROUP_ENV, DEFAULT_MIN_GROUP)
     fixed = os.environ.get(MIN_SHARED_ENV, "").strip()
-    shape = _model_shape
 
     def pays(rows: np.ndarray, tokens: np.ndarray) -> np.ndarray:
         wide = rows >= min_group
@@ -896,11 +897,9 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
     """
     rows = metadata.num_generations
     q_len = _sampling_q_len(metadata, rows)
-    if q_len < MIN_Q_LEN or _model_shape is None:
+    if q_len < MIN_Q_LEN:
         return
     device = metadata.kv_cache_block_offsets.device
-    if not fa4_supported(_model_shape[2], torch.bfloat16, device):
-        return
     state = metadata.fmha_plan_caches.get(SAMPLING_KEY)
     tokens_per_block = int(metadata.tokens_per_block)
     host_offsets = metadata.host_kv_cache_block_offsets
@@ -909,15 +908,21 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
         kv_cache_manager = metadata.kv_cache_manager
         first_layer = min(kv_cache_manager.layer_offsets)
         pool_index, page_scale, page_div = page_layout(metadata, first_layer)
+        # HND pool view: [pages, 2, kv_heads, tokens_per_block, head_dim].
         pool = kv_cache_manager.get_buffers(first_layer, kv_layout="HND")
+        num_kv_heads, head_dim = int(pool.size(2)), int(pool.size(4))
         state = _SamplingState(
             pool_index=pool_index,
             page_scale=page_scale,
             page_div=page_div,
             num_pages=int(pool.size(0)),
+            shape=(num_kv_heads * int(metadata.max_num_heads_per_kv), num_kv_heads, head_dim),
+            kv_dtype=pool.dtype,
             manager_ref=weakref.ref(kv_cache_manager),
         )
         metadata.fmha_plan_caches[SAMPLING_KEY] = state
+    if not fa4_supported(state.shape[2], state.kv_dtype, device):
+        return
     eager = not metadata.is_cuda_graph
     buffers = state.buffers
     if buffers is not None and (rows != buffers.rows or q_len != buffers.tail.q_len):
@@ -930,7 +935,7 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
         buffers = state.buffers = _StepBuffers.create(
             rows,
             q_len,
-            _model_shape,
+            state.shape,
             _int_env(MAX_GROUPS_ENV, DEFAULT_MAX_GROUPS),
             int(host_offsets.size(-1)),
             tokens_per_block,
@@ -979,7 +984,7 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
                 max_sharing_groups=buffers.num_groups - 1,
                 padded_groups=buffers.num_groups,
                 q_len=q_len,
-                group_pays=_group_filter(q_len),
+                group_pays=_group_filter(q_len, state.shape),
                 groupable=_real_row_mask(metadata, rows),
             )
         grouping = state.grouping = advanced
@@ -1006,6 +1011,24 @@ class SamplingSharedPrefixFmha(PhasedFmha):
     """Generation-phase library for n-sample requests; see the module docstring."""
 
     supports_workspace_reclamation = False
+    step_stats_field = "sharedPrefixAttnStats"
+
+    @classmethod
+    def plan_step(cls, metadata: "TrtllmAttentionMetadata") -> None:
+        # The module-level planner (also the tests' entry point).
+        plan_step(metadata)
+
+    @classmethod
+    def selection_cache_key(cls, metadata: "TrtllmAttentionMetadata") -> bool:
+        return has_active_plan(metadata)
+
+    @classmethod
+    def step_stats(cls, kv_cache_manager: object) -> dict[str, int]:
+        return step_stats(kv_cache_manager).as_dict()
+
+    @classmethod
+    def reset_step_stats(cls, kv_cache_manager: object) -> None:
+        reset_step_stats(kv_cache_manager)
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
@@ -1052,9 +1075,6 @@ class SamplingSharedPrefixFmha(PhasedFmha):
             # ALiBi, relative, GLM and deferred embeddings are applied inside the attention op,
             # which this library bypasses.
             return False
-        global _model_shape
-        if _model_shape is None:  # the target layers come first; draft layers share the shape
-            _model_shape = (num_heads, num_kv_heads, head_dim)
         return True
 
     def _is_supported(
@@ -1112,6 +1132,18 @@ class SamplingSharedPrefixFmha(PhasedFmha):
         manager_ref = sampling_state.manager_ref
         if manager_ref is None or manager_ref() is not metadata.kv_cache_manager:
             return False
+        attn = self.attn
+        layer_shape = (attn.num_heads, attn.num_kv_heads, attn.head_dim)
+        if layer_shape != sampling_state.shape:
+            # A layer of another shape than the one the step buffers were sized for (a model with
+            # mixed attention shapes, or KV heads replicated across tensor-parallel ranks, where
+            # the query heads per KV head of a rank differ from the model's).
+            logger.warning_once(
+                f"{LIB_NAME}: layer {attn.layer_idx} has (heads, kv_heads, head_dim) "
+                f"{layer_shape}, the plan {sampling_state.shape}; the regular kernel serves it.",
+                key=f"{LIB_NAME}_shape_{layer_shape}_{sampling_state.shape}",
+            )
+            return False
         plan = sampling_state.plan
         return q.shape[0] == plan.num_rows * plan.q_len
 
@@ -1161,12 +1193,6 @@ class SamplingSharedPrefixFmha(PhasedFmha):
                 f"built for {(state.pool_index, state.page_scale, state.page_div)}."
             )
         tail = buffers.tail
-        if tail.out.shape[1:] != (num_heads, head_dim):
-            raise RuntimeError(
-                f"{type(self).__name__}: the step buffers were sized for (heads, head_dim) "
-                f"{tuple(tail.out.shape[1:])} (the first model that reported the library available) "
-                f"but layer {attn.layer_idx} has {(num_heads, head_dim)}."
-            )
         pool = self._pool_view(metadata)
         kv_lens = metadata.kv_lens_cuda_runtime[:rows]
         capturing = torch.cuda.is_current_stream_capturing()

@@ -38,8 +38,7 @@ from tensorrt_llm.logger import logger
 from .combined import CombinedFmha
 from .interface import Fmha, FmhaPhase
 from .phased import PhasedFmha
-from .registry import get_enabled_fmha_lib_classes
-from .sampling_shared_prefix import has_active_plan
+from .registry import get_enabled_fmha_lib_classes, step_planning_fmha_lib_classes
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -143,9 +142,9 @@ class _FmhaCacheKey(NamedTuple):
     output_sf_dtype: torch.dtype | None
     # The query is the raw projection of a deferred prologue (Fmha.supports_deferred_prologue).
     deferred_prologue: bool
-    # Whether the batch was planned for the shared-prefix library, which
-    # supports a batch only when it was.
-    shared_prefix_plan: bool
+    # Per-step plan state of the libraries that plan steps (Fmha.selection_cache_key):
+    # such a library supports a batch only as its plan says.
+    library_plans: tuple
 
 
 _FmhaCacheInputs = dict[str, str]
@@ -347,6 +346,12 @@ class FmhaManager:
         ):
             if fmha_cls.is_available(attn):
                 self.fmha_libs.append(fmha_cls(attn))
+        # Libraries of this layer that prepare() plans every step (Fmha.plan_step): their
+        # support follows that plan.
+        available = {type(fmha) for fmha in self.fmha_libs}
+        self._planning_libs = tuple(
+            fmha_cls for fmha_cls in step_planning_fmha_lib_classes() if fmha_cls in available
+        )
         self._layer_idx = getattr(attn, "layer_idx", None)
 
     def _announce(self, fmha: Fmha, cache_key: _FmhaCacheKey) -> None:
@@ -431,7 +436,9 @@ class FmhaManager:
             deferred_prologue=(
                 forward_args.kv_append is not None and forward_args.kv_append.fold is not None
             ),
-            shared_prefix_plan=has_active_plan(metadata),
+            library_plans=tuple(
+                fmha_cls.selection_cache_key(metadata) for fmha_cls in self._planning_libs
+            ),
         )
 
     def select(

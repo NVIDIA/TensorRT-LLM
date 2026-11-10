@@ -156,6 +156,26 @@ def is_fmha_lib_enabled(name: str) -> bool:
     return name in _parse_fmha_libs_env()
 
 
+@functools.lru_cache(maxsize=8)
+def _step_planning_classes(names: tuple[str, ...]) -> tuple[FmhaCls, ...]:
+    return tuple(FMHA_LIBS[name] for name in names if FMHA_LIBS[name].plans_steps())
+
+
+@functools.lru_cache(maxsize=8)
+def _step_stats_classes(names: tuple[str, ...]) -> tuple[FmhaCls, ...]:
+    return tuple(FMHA_LIBS[name] for name in names if FMHA_LIBS[name].step_stats_field is not None)
+
+
+def step_planning_fmha_lib_classes() -> tuple[FmhaCls, ...]:
+    """Enabled libraries that plan every step (``Fmha.plan_step``); cached, prepare() calls it."""
+    return _step_planning_classes(_parse_fmha_libs_env())
+
+
+def step_stats_fmha_lib_classes() -> tuple[FmhaCls, ...]:
+    """Enabled libraries that keep per-step counters (``Fmha.step_stats``)."""
+    return _step_stats_classes(_parse_fmha_libs_env())
+
+
 __all__ = [
     "DEFAULT_FMHA_LIBS",
     "FMHA_LIBS",
@@ -163,4 +183,6 @@ __all__ = [
     "get_enabled_fmha_lib_classes",
     "init_fmha_libs",
     "is_fmha_lib_enabled",
+    "step_planning_fmha_lib_classes",
+    "step_stats_fmha_lib_classes",
 ]
