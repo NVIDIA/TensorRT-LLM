@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from . import generation_pb2 as _generation_pb2
 from . import kv_pb2 as _kv_pb2
 from . import server_pb2 as _server_pb2
 from google.protobuf.internal import containers as _containers
@@ -24,6 +25,12 @@ class AbortStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     ABORT_STATUS_UNSPECIFIED: _ClassVar[AbortStatus]
     ABORT_STATUS_ABORTED: _ClassVar[AbortStatus]
     ABORT_STATUS_ALREADY_FINISHED: _ClassVar[AbortStatus]
+
+class ShutdownStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    SHUTDOWN_STATUS_UNSPECIFIED: _ClassVar[ShutdownStatus]
+    SHUTDOWN_STATUS_ACCEPTED: _ClassVar[ShutdownStatus]
+    SHUTDOWN_STATUS_ALREADY_STOPPING: _ClassVar[ShutdownStatus]
 HEALTH_STATE_UNSPECIFIED: HealthState
 HEALTH_STATE_STARTING: HealthState
 HEALTH_STATE_READY: HealthState
@@ -32,6 +39,9 @@ HEALTH_STATE_NOT_READY: HealthState
 ABORT_STATUS_UNSPECIFIED: AbortStatus
 ABORT_STATUS_ABORTED: AbortStatus
 ABORT_STATUS_ALREADY_FINISHED: AbortStatus
+SHUTDOWN_STATUS_UNSPECIFIED: ShutdownStatus
+SHUTDOWN_STATUS_ACCEPTED: ShutdownStatus
+SHUTDOWN_STATUS_ALREADY_STOPPING: ShutdownStatus
 
 class HealthRequest(_message.Message):
     __slots__ = ("include_inference_probe", "model", "role")
@@ -62,14 +72,16 @@ class HealthCheck(_message.Message):
     def __init__(self, name: _Optional[str] = ..., state: _Optional[_Union[HealthState, str]] = ..., message: _Optional[str] = ...) -> None: ...
 
 class AbortRequest(_message.Message):
-    __slots__ = ("request_id", "kv_session", "all_requests")
+    __slots__ = ("request_id", "kv_session", "all_requests", "encoder_cache")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     KV_SESSION_FIELD_NUMBER: _ClassVar[int]
     ALL_REQUESTS_FIELD_NUMBER: _ClassVar[int]
+    ENCODER_CACHE_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     kv_session: _kv_pb2.KvSessionRef
     all_requests: AllRequests
-    def __init__(self, request_id: _Optional[str] = ..., kv_session: _Optional[_Union[_kv_pb2.KvSessionRef, _Mapping]] = ..., all_requests: _Optional[_Union[AllRequests, _Mapping]] = ...) -> None: ...
+    encoder_cache: _generation_pb2.EncoderCacheRef
+    def __init__(self, request_id: _Optional[str] = ..., kv_session: _Optional[_Union[_kv_pb2.KvSessionRef, _Mapping]] = ..., all_requests: _Optional[_Union[AllRequests, _Mapping]] = ..., encoder_cache: _Optional[_Union[_generation_pb2.EncoderCacheRef, _Mapping]] = ...) -> None: ...
 
 class AllRequests(_message.Message):
     __slots__ = ()
@@ -82,3 +94,17 @@ class AbortResponse(_message.Message):
     status: AbortStatus
     message: str
     def __init__(self, status: _Optional[_Union[AbortStatus, str]] = ..., message: _Optional[str] = ...) -> None: ...
+
+class ShutdownRequest(_message.Message):
+    __slots__ = ("expected_instance_id",)
+    EXPECTED_INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
+    expected_instance_id: str
+    def __init__(self, expected_instance_id: _Optional[str] = ...) -> None: ...
+
+class ShutdownResponse(_message.Message):
+    __slots__ = ("status", "instance_id")
+    STATUS_FIELD_NUMBER: _ClassVar[int]
+    INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
+    status: ShutdownStatus
+    instance_id: str
+    def __init__(self, status: _Optional[_Union[ShutdownStatus, str]] = ..., instance_id: _Optional[str] = ...) -> None: ...

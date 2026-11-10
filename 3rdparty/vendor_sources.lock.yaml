@@ -25,13 +25,13 @@ vendors:
     digest: sha256-tree-v1:bf74c7664256a1c7064163ca417a6c589f8ab8f47bb478444bb1b3c402c856ee
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
-    tag: v0.1.0
-    commit: b5f2bd93721f7b888d3e2440679e0ae7012939d1
+    branch: krish/openengine-image-epd-protocol
+    commit: 4f2d17edc16d8b430df34c049c13cb5aedf0ba11
     source: proto/openengine/v1
     destination: tensorrt_llm/grpc/openengine/proto/openengine/v1
     include:
     - '*.proto'
-    digest: sha256-tree-v1:54c95724673b50dee9f27ba72f98ed13b3009209f858f80e044ccd13974770f4
+    digest: sha256-tree-v1:fe05f21e346a4dd14646a97c881747ae93c9eb0565e3459a3f71d8ae1a676268
   sana-sol-attn:
     url: https://github.com/NVlabs/Sana.git
     branch: sol-engine

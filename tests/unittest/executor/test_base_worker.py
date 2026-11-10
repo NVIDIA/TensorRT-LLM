@@ -5,6 +5,7 @@ import importlib.util
 import sys
 import time
 import warnings
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
@@ -14,11 +15,16 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 
+from tensorrt_llm._torch.pyexecutor.executor_request_queue import \
+    ExecutorRequestQueue
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.request_inputs import ExecutorRequest
 from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
 # isort: off
@@ -951,6 +957,85 @@ def test_rpc_submit_rejects_prompt_adapters_before_dispatch(
             need_response=False)
         assert request.id == 7
         assert proxy._results == {7: result, 8: peer_result}
+
+
+@pytest.fixture
+def multimodal_enqueue_case(
+) -> tuple[BaseWorker, GenerationRequest, ExecutorRequestQueue]:
+    queue = ExecutorRequestQueue(SimpleNamespace(rank=0), 8, False, 0)
+    worker = object.__new__(BaseWorker)
+    worker.doing_shutdown = True
+    worker._lora_manager = None
+    worker.mapping = SimpleNamespace(cp_size=1)
+    worker.max_seq_len = 128
+    worker.engine = SimpleNamespace(is_generation_model=True,
+                                    enqueue_request=queue.enqueue_request)
+    request = GenerationRequest(
+        prompt_token_ids=[1, 2],
+        sampling_params=SamplingParams(max_tokens=1, end_id=2),
+        multimodal_params=MultimodalParams(
+            multimodal_data={
+                "mrope_config": {
+                    "mrope_position_deltas": torch.tensor([[7]],
+                                                          dtype=torch.int32)
+                }
+            }))
+    request.set_id(11)
+    return worker, request, queue
+
+
+@pytest.mark.cpu_only
+def test_enqueue_transfers_media_ownership(
+    multimodal_enqueue_case: tuple[BaseWorker, GenerationRequest,
+                                   ExecutorRequestQueue],
+) -> None:
+    worker, request, queue = multimodal_enqueue_case
+    result = GenerationResult(request)
+    request_id = worker._enqueue_request(request)
+    item = queue.request_queue.get_nowait()
+    assert item.id == request_id
+    envelope = item.request
+    delta = envelope.inputs.multimodal_data["mrope_config"][
+        "mrope_position_deltas"]
+    tensor_ref = weakref.ref(delta)
+    storage_ref = StorageWeakRef(delta.untyped_storage())
+    del delta
+    assert request.multimodal_params is None
+    assert result._generation_request.multimodal_params is None
+    assert torch.equal(tensor_ref(), torch.tensor([[7]], dtype=torch.int32))
+    assert not storage_ref.expired()
+    envelope.inputs.multimodal_data = None
+    assert tensor_ref() is None
+    assert storage_ref.expired()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("accept_first", [False, True])
+def test_failed_enqueue_preserves_media_ownership(
+    multimodal_enqueue_case: tuple[BaseWorker, GenerationRequest,
+                                   ExecutorRequestQueue],
+    accept_first: bool,
+) -> None:
+    worker, request, queue = multimodal_enqueue_case
+    original_params = request.multimodal_params
+
+    def failing_enqueue(envelope: ExecutorRequest) -> None:
+        if accept_first:
+            queue.enqueue_request(envelope)
+        raise RuntimeError("enqueue failed")
+
+    worker.engine.enqueue_request = failing_enqueue
+    with pytest.raises(RequestError, match="enqueue failed"):
+        worker._enqueue_request(request)
+    assert request.multimodal_params is original_params
+    assert torch.equal(
+        original_params.multimodal_data["mrope_config"]
+        ["mrope_position_deltas"], torch.tensor([[7]], dtype=torch.int32))
+    if accept_first:
+        assert queue.request_queue.get_nowait().request.py_multimodal_data is (
+            original_params.multimodal_data)
+    else:
+        assert queue.request_queue.empty()
 
 
 @pytest.mark.cpu_only

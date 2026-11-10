@@ -16,5 +16,13 @@
   "runtime_floors": {
     "protobuf": "6.30.2",
     "grpcio": "1.73.1"
+  },
+  "draft_extensions": [
+    "encoder-handoff-v1 (unreleased protocol proposal)"
+  ],
+  "source": {
+    "url": "https://github.com/ai-dynamo/openengine.git",
+    "commit": "4f2d17edc16d8b430df34c049c13cb5aedf0ba11",
+    "publication": "canonical review branch; not in a published BSR release"
   }
 }

@@ -4,6 +4,7 @@
 """Unit tests for the OpenEngine Control service."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -940,3 +941,122 @@ async def test_subscribe_kv_events_is_unimplemented(enabled):
             kv_pb2.SubscribeKvEventsRequest(), context
         )
     assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role,has_discard", [("", True), ("consume", True), ("encode", False)])
+async def test_abort_encoder_cache_requires_encode_cleanup_support(role, has_discard):
+    inference = _inference()
+    inference.encoder_role = role
+    inference._encoder_cache = SimpleNamespace(**({"discard": Mock()} if has_discard else {}))
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
+        await _servicer(inference=inference).Abort(
+            lifecycle_pb2.AbortRequest(encoder_cache={}), context
+        )
+    assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
+    if has_discard:
+        inference._encoder_cache.discard.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_abort_encoder_cache_reports_release_and_idempotent_outcomes():
+    from tensorrt_llm.grpc.openengine.bindings import generation_pb2
+
+    inference = _inference()
+    inference.encoder_role = "encode"
+    present = True
+
+    def discard(reference):
+        nonlocal present
+        assert reference.transfer_backend == "test-encoder"
+        removed, present = present, False
+        return removed
+
+    inference._encoder_cache = SimpleNamespace(discard=discard)
+    control = _servicer(inference=inference)
+    req = lifecycle_pb2.AbortRequest(
+        encoder_cache=generation_pb2.EncoderCacheRef(transfer_backend="test-encoder")
+    )
+    for expected in (
+        lifecycle_pb2.ABORT_STATUS_ABORTED,
+        lifecycle_pb2.ABORT_STATUS_ALREADY_FINISHED,
+    ):
+        result = await control.Abort(req, FakeServicerContext())
+        assert result.status == expected
+    assert inference.active_request_count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure,code",
+    [
+        (ValueError("invalid reference"), grpc.StatusCode.INVALID_ARGUMENT),
+        (RuntimeError("transport unhealthy"), grpc.StatusCode.UNAVAILABLE),
+        (OSError("cannot remove cached encoder output"), grpc.StatusCode.INTERNAL),
+    ],
+)
+async def test_abort_encoder_cache_preserves_failures(failure, code):
+    inference = _inference()
+    inference.encoder_role = "encode"
+
+    def discard(reference):
+        raise failure
+
+    inference._encoder_cache = SimpleNamespace(discard=discard)
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
+        await _servicer(inference=inference).Abort(
+            lifecycle_pb2.AbortRequest(encoder_cache={}), context
+        )
+    assert context.abort_code == code
+
+
+@pytest.mark.asyncio
+async def test_abort_encoder_cache_over_real_grpc(tmp_path):
+    from test_encoder import model, native_result, request
+
+    from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc
+    from tensorrt_llm.grpc.openengine.encoder import EncoderCache
+
+    cache = EncoderCache(str(tmp_path))
+    llm, _ = model()
+    reference = cache.publish(native_result()[0], request(), llm)
+    inference = _inference()
+    inference.encoder_role = "encode"
+    inference._encoder_cache = cache
+    server = grpc.aio.server()
+    openengine_pb2_grpc.add_ControlServicer_to_server(_servicer(inference=inference), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    await server.start()
+    try:
+        async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
+            stub = openengine_pb2_grpc.ControlStub(channel)
+            req = lifecycle_pb2.AbortRequest(encoder_cache=reference)
+            for expected in (
+                lifecycle_pb2.ABORT_STATUS_ABORTED,
+                lifecycle_pb2.ABORT_STATUS_ALREADY_FINISHED,
+            ):
+                response = await stub.Abort(req, timeout=2)
+                assert response.status == expected
+        assert not list(tmp_path.glob("*.safetensors"))
+    finally:
+        await server.stop(0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["", "encode", "consume"])
+async def test_encoder_cache_requirement_is_distinct_from_consumption_capability(role):
+    inference = _inference()
+    inference.encoder_role = role
+    inference._encoder_cache = SimpleNamespace(backend="test-encoder")
+    info = await _servicer(inference=inference).GetModelInfo(
+        model_pb2.GetModelInfoRequest(model=MODEL), FakeServicerContext()
+    )
+    assert info.HasField("encoder") is bool(role)
+    assert info.encoder.encoder_only is (role == "encode")
+    assert info.encoder.accepts_cache is (role == "consume")
+    assert info.encoder.supports_abort_cleanup is (role == "encode")
+    assert info.encoder.requires_cache is (role == "consume")
+    assert "trtllm_encoder_cache_release" not in info.extra
+    assert "trtllm_requires_encoder_cache" not in info.extra
