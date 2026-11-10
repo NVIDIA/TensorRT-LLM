@@ -1,9 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import collections
+import contextlib
 import os
 import unittest
 from collections.abc import Iterator
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -561,6 +564,57 @@ def test_nemotron_vl_decoder_inherits_eplb_and_registers_moe(
         finally:
             balancer.shutdown()
     assert get_moe_load_balancer() is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("capturing", [False, True])
+def test_statistic_allreduce_is_joined_before_an_eager_moe_launch(
+        monkeypatch: pytest.MonkeyPatch, capturing: bool) -> None:
+    """Under multi-stream the EP-wide statistic allreduce runs on the auxiliary
+    stream. An eager forward joins it into the current stream before
+    update_statistic_with_local_ids returns, so the MoE kernel launched next
+    cannot overlap it; a stream being captured keeps the overlap."""
+    from tensorrt_llm._torch.moe.fused_moe import \
+        moe_load_balancer as moe_load_balancer_module
+
+    trace = []
+    layer = SingleLayerMoeLoadBalancer.__new__(SingleLayerMoeLoadBalancer)
+    layer.func_called_count = collections.defaultdict(int)
+    layer.func_called_count["done_wait_gpu_stage"] = 1
+    layer.updates_enabled = True
+    layer.aux_stream = "aux"
+    layer.local_statistic_tensor = "local_statistic"
+    layer.statistic_flag_tensor = "statistic_flag"
+    layer.single_layer_load_balancer_ptr = "balancer"
+    layer.update_local_statistic = lambda *args: trace.append("local")
+
+    @contextlib.contextmanager
+    def stream(name):
+        trace.append(f"enter:{name}")
+        yield
+        trace.append(f"exit:{name}")
+
+    current_stream = SimpleNamespace(
+        wait_stream=lambda name: trace.append(f"join:{name}"))
+    monkeypatch.setattr(moe_load_balancer_module, "do_multi_stream",
+                        lambda: True)
+    monkeypatch.setattr(torch.cuda, "stream", stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing",
+                        lambda: capturing)
+    monkeypatch.setattr(torch.ops.trtllm,
+                        "moe_hierarchical_statistic_update",
+                        lambda *args: trace.append("update"),
+                        raising=False)
+
+    layer.update_statistic_with_local_ids(
+        "expert_ids",
+        is_first_stage=True,
+        is_last_stage=True,
+        allreduce=lambda tensor: trace.append("allreduce") or tensor)
+
+    expected = ["local", "enter:aux", "allreduce", "update", "exit:aux"]
+    assert trace == expected + ([] if capturing else ["join:aux"])
 
 
 if __name__ == '__main__':
