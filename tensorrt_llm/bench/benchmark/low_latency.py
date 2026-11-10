@@ -248,8 +248,12 @@ def latency_command(
     if bench_env.checkpoint_path is None:
         snapshot_download(options.model, revision=bench_env.revision)
 
-    exec_settings = get_settings(params, metadata, bench_env.model,
-                                 bench_env.checkpoint_path)
+    explicit_cli_keys = collect_explicit_cli_keys()
+    exec_settings = get_settings(params,
+                                 metadata,
+                                 bench_env.model,
+                                 bench_env.checkpoint_path,
+                                 explicit_cli_keys=explicit_cli_keys)
     kwargs_max_sql = options.max_seq_len or metadata.max_sequence_length
     logger.info(f"Setting PyTorch max sequence length to {kwargs_max_sql}")
     kwargs["max_seq_len"] = kwargs_max_sql
@@ -270,7 +274,7 @@ def latency_command(
 
     exec_settings["extra_llm_api_options"] = params.get("extra_llm_api_options")
     exec_settings["iteration_log"] = options.iteration_log
-    exec_settings["explicit_cli_keys"] = collect_explicit_cli_keys()
+    exec_settings["explicit_cli_keys"] = explicit_cli_keys
 
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
