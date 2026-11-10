@@ -123,7 +123,7 @@ def test_split_prefill_core_matches_two_iterations(linear_gate):
         start += length
 
     # The reference scans take the log-space gate; the split path gets what the mixer passes it:
-    # alpha = exp(g) when the FlashInfer scan is the resolved one (exponentiating it again gives NaN).
+    # alpha = exp(g) when the FlashInfer scan is the resolved one.
     out = _inforward_split_prefill_core(
         q,
         k,

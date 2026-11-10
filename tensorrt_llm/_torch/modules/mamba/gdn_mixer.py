@@ -220,7 +220,8 @@ def _inforward_split_prefill_core(
     split: InforwardSnapshotSplit,
     stage_ssm: torch.Tensor,
     output: Optional[torch.Tensor],
-    g_is_linear: bool = False,
+    *,
+    g_is_linear: bool,
 ) -> torch.Tensor:
     """Chunked GDN prefill of a context-only batch with in-forward Mamba snapshots.
 
@@ -237,7 +238,8 @@ def _inforward_split_prefill_core(
         split: This step's split (``Mamba2Metadata.inforward_split``).
         stage_ssm: The layer's SSM staging rows, ``[rows, H, V, K]``.
         output: Optional preallocated output.
-        g_is_linear: ``g`` already holds ``alpha = exp(g)`` (the FlashInfer gate convention), for both scans.
+        g_is_linear: ``g`` holds ``alpha = exp(g)`` (the FlashInfer gate convention) instead of log space;
+            applies to both scans. Required: the wrong convention gives wrong outputs and states silently.
     """
     initial = ssm_states.index_select(0, split.gather)
     core_out, final = chunk_gated_delta_rule(
