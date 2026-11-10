@@ -2327,6 +2327,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         "poison_for_testing", [](std::string const& reason) { kv::Poison::set("poison_for_testing", reason.c_str()); },
         nb::arg("reason"), "Set the KVCM2 poison latch directly, to exercise the refusal paths.");
     mIntrospection.def(
+        "async_disk_io_enabled", []() { return kv::asyncDiskIoEnabled(); },
+        "Whether the process-wide disk I/O pool is running, so disk transfers are asynchronous.");
+    mIntrospection.def(
         "inject_disk_write_failures_for_testing", [](uint64_t count) { kv::injectDiskWriteFailuresForTesting(count); },
         nb::arg("count"), "Make the next `count` disk write pieces fail without writing.");
 

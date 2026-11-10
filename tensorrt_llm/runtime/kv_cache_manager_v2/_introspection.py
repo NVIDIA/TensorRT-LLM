@@ -65,6 +65,11 @@ def poison_for_testing(reason: str) -> None:
     _cpp().poison_for_testing(reason)
 
 
+def async_disk_io_enabled() -> bool:
+    """Whether the process-wide disk I/O pool is running, so disk transfers are asynchronous."""
+    return bool(_cpp().async_disk_io_enabled())
+
+
 def inject_disk_write_failures_for_testing(count: int) -> None:
     """Make the next ``count`` disk write pieces fail without writing."""
     _cpp().inject_disk_write_failures_for_testing(count)

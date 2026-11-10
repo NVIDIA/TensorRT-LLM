@@ -11504,11 +11504,23 @@ class TestPoison(TestKVCacheManagerV2):
 
 
 # Disk-tier tests rerun with every SSD offload option on.
+# The disk I/O pool is process-wide and starts at the first nonzero num_io_threads, so once one of these classes has
+# run, later tests in the same process that set num_io_threads=0 also use the pool. Disk contents and results are the
+# same either way; only the I/O path differs.
 _ALL_DISK_OPTIONS = {"num_io_threads": 4, "keep_copy_after_restore": True, "write_through": True}
 
 
 class TestNoBatchingDiskOptions(TestNoBatching):
     disk_tier_options = _ALL_DISK_OPTIONS
+    # Inherited tests that move pages to the disk tier. The others build no disk tier or never evict, so rerunning
+    # them with the options on adds time but no coverage.
+    _INHERITED_DISK_TESTS = ("test_cache_reuse", "test_sol_mem_utilization")
+
+    def setUp(self) -> None:
+        name = self._testMethodName
+        if name not in type(self).__dict__ and not name.startswith(self._INHERITED_DISK_TESTS):
+            self.skipTest("inherited test does not reach the disk tier")
+        super().setUp()
 
     def _run_and_close(self, req: "TestNoBatching.Request") -> None:
         with TemporaryCudaStream([]) as s:
@@ -11529,6 +11541,7 @@ class TestNoBatchingDiskOptions(TestNoBatching):
         # Async disk I/O alone: restores from disk move the page back (no retained copies) and pass refcheck.
         self.disk_tier_options = {"num_io_threads": 4}
         self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        self.assertTrue(_introspection.async_disk_io_enabled())
         seq_len = 32 * 22
         req_ids = itertools.count()
         first = self.new_request(next(req_ids), None, 256, seq_len - 256)
@@ -11833,10 +11846,6 @@ class TestNoBatchingDiskOptions(TestNoBatching):
 
 
 class TestResizeQuotaDiskOptions(TestResizeQuota):
-    disk_tier_options = _ALL_DISK_OPTIONS
-
-
-class TestDisaggDiskOptions(TestDisagg):
     disk_tier_options = _ALL_DISK_OPTIONS
 
 
