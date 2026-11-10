@@ -6689,6 +6689,7 @@ def test_cutedsl_fc12_run_moe_sort_tables(
     backend.mapping = SimpleNamespace(moe_ep_size=1)
     backend._concurrent_sm_reserve = 0
     backend.apply_router_weight_on_input = False
+    backend.routing_method = None
     weights = MagicMock(expert_size_per_partition=8, slot_start=0)
     backend._build_local_weight_view = lambda: weights
     sort_outputs = (None,) * 6
