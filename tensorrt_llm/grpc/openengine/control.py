@@ -296,10 +296,18 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             reasoning_parser=str(self._llm.args.reasoning_parser or ""),
         )
         info.extra.update({"trtllm_supported_modalities": sorted(media_modalities)})
-        if getattr(self._inference, "encoder_role", ""):
-            info.extra.update({"trtllm_encoder_cache_release": True})
-        if getattr(self._inference, "encoder_role", "") == "consume":
-            info.extra.update({"trtllm_requires_encoder_cache": True})
+        role = getattr(self._inference, "encoder_role", "")
+        if role:
+            info.encoder.CopyFrom(
+                model_pb2.EncoderCapabilities(
+                    schema_version=1,
+                    encoder_only=role == "encode",
+                    accepts_cache=role == "consume",
+                    transfer_backends=[self._inference._encoder_cache.backend],
+                    supports_abort_cleanup=role == "encode",
+                    requires_cache=role == "consume",
+                )
+            )
         if supports_image_routing(self._llm, media_modalities):
             info.extra.update({"trtllm_image_routing_version": 1})
 

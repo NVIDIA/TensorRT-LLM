@@ -16,6 +16,7 @@ import torch
 from test_encoder import model, native_result, request
 
 from tensorrt_llm.grpc.openengine import encoder_nixl as transport
+from tensorrt_llm.grpc.openengine.bindings import encoder_transfer_pb2
 from tensorrt_llm.grpc.openengine.bindings import generation_pb2 as pb
 
 pytestmark = pytest.mark.cpu_only
@@ -136,17 +137,17 @@ def pair(monkeypatch):
         def __init__(self, channel):
             pass
 
-        def TransferEncoderCache(self, req, timeout):
+        def Transfer(self, req, timeout):
             try:
                 producer.transfer(req.cache, req.destination)
             except transport.EncoderTransferRejected as error:
                 raise RpcFailure(
                     str(error), metadata=(transport.ENCODER_TRANSFER_REJECTED_METADATA,)
                 ) from error
-            return pb.TransferEncoderCacheResponse()
+            return encoder_transfer_pb2.TransferEncoderCacheResponse()
 
     monkeypatch.setattr(transport.grpc, "insecure_channel", lambda endpoint: Channel())
-    monkeypatch.setattr(transport.openengine_pb2_grpc, "ControlStub", Stub)
+    monkeypatch.setattr(transport.encoder_transfer_pb2_grpc, "EncoderTransferStub", Stub)
     yield producer, consumer
     for cache in (consumer, producer):
         if not cache._closed:
@@ -385,19 +386,22 @@ def test_native_nixl_over_real_grpc_loopback():
 
     import grpc
 
-    from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc
+    from tensorrt_llm.grpc.openengine.bindings import (
+        encoder_transfer_pb2,
+        encoder_transfer_pb2_grpc,
+    )
 
     server = grpc.server(ThreadPoolExecutor(max_workers=2))
     port = server.add_insecure_port("127.0.0.1:0")
     producer = transport.NixlEncoderCache(f"127.0.0.1:{port}", "a" * 40, device="cpu")
     consumer = transport.NixlEncoderCache("", "a" * 40, device="cpu")
 
-    class Service(openengine_pb2_grpc.ControlServicer):
-        def TransferEncoderCache(self, req, context):
+    class Service(encoder_transfer_pb2_grpc.EncoderTransferServicer):
+        def Transfer(self, req, context):
             producer.transfer(req.cache, req.destination)
-            return pb.TransferEncoderCacheResponse()
+            return encoder_transfer_pb2.TransferEncoderCacheResponse()
 
-    openengine_pb2_grpc.add_ControlServicer_to_server(Service(), server)
+    encoder_transfer_pb2_grpc.add_EncoderTransferServicer_to_server(Service(), server)
     server.start()
     try:
         llm, seen = model()
@@ -417,18 +421,21 @@ def _native_encoder_producer(pipe):
 
     import grpc
 
-    from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc
+    from tensorrt_llm.grpc.openengine.bindings import (
+        encoder_transfer_pb2,
+        encoder_transfer_pb2_grpc,
+    )
 
     server = grpc.server(ThreadPoolExecutor(max_workers=2))
     port = server.add_insecure_port("127.0.0.1:0")
     producer = transport.NixlEncoderCache(f"127.0.0.1:{port}", "a" * 40, device="cpu")
 
-    class Service(openengine_pb2_grpc.ControlServicer):
-        def TransferEncoderCache(self, req, context):
+    class Service(encoder_transfer_pb2_grpc.EncoderTransferServicer):
+        def Transfer(self, req, context):
             producer.transfer(req.cache, req.destination)
-            return pb.TransferEncoderCacheResponse()
+            return encoder_transfer_pb2.TransferEncoderCacheResponse()
 
-    openengine_pb2_grpc.add_ControlServicer_to_server(Service(), server)
+    encoder_transfer_pb2_grpc.add_EncoderTransferServicer_to_server(Service(), server)
     server.start()
     try:
         llm, _ = model()
@@ -821,16 +828,16 @@ def test_real_grpc_marked_rejection_releases_receiver_and_allows_a_fresh_referen
     producer = _cache(f"127.0.0.1:{port}")
     consumer = _cache()
 
-    class Service(transport.openengine_pb2_grpc.ControlServicer):
-        def TransferEncoderCache(self, req, context):
+    class Service(transport.encoder_transfer_pb2_grpc.EncoderTransferServicer):
+        def Transfer(self, req, context):
             try:
                 producer.transfer(req.cache, req.destination)
             except transport.EncoderTransferRejected as error:
                 context.set_trailing_metadata((transport.ENCODER_TRANSFER_REJECTED_METADATA,))
                 context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
-            return pb.TransferEncoderCacheResponse()
+            return encoder_transfer_pb2.TransferEncoderCacheResponse()
 
-    transport.openengine_pb2_grpc.add_ControlServicer_to_server(Service(), server)
+    transport.encoder_transfer_pb2_grpc.add_EncoderTransferServicer_to_server(Service(), server)
     server.start()
     try:
         llm, _ = model()

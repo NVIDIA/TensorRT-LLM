@@ -19,8 +19,8 @@ import torch
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
+from .bindings import encoder_transfer_pb2, encoder_transfer_pb2_grpc
 from .bindings import generation_pb2 as pb
-from .bindings import openengine_pb2_grpc
 from .encoder import _release, take_encoder_exports
 from .errors import ENCODER_TRANSFER_REJECTED_METADATA, EncoderTransferRejected
 from .preparation import _config_digest, _input_digest
@@ -420,8 +420,10 @@ class NixlEncoderCache:
             )
             with grpc.insecure_channel(value["endpoint"]) as channel:
                 attempted = True
-                openengine_pb2_grpc.ControlStub(channel).TransferEncoderCache(
-                    pb.TransferEncoderCacheRequest(cache=reference, destination=destination),
+                encoder_transfer_pb2_grpc.EncoderTransferStub(channel).Transfer(
+                    encoder_transfer_pb2.TransferEncoderCacheRequest(
+                        cache=reference, destination=destination
+                    ),
                     timeout=_TIMEOUT_SECONDS + 10,
                 )
         except Exception as error:

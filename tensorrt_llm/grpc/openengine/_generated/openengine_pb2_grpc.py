@@ -196,11 +196,6 @@ class ControlStub(object):
                 request_serializer=openengine_dot_v1_dot_lora__pb2.ListLorasRequest.SerializeToString,
                 response_deserializer=openengine_dot_v1_dot_lora__pb2.ListLorasResponse.FromString,
                 _registered_method=True)
-        self.TransferEncoderCache = channel.unary_unary(
-                '/openengine.v1.Control/TransferEncoderCache',
-                request_serializer=openengine_dot_v1_dot_generation__pb2.TransferEncoderCacheRequest.SerializeToString,
-                response_deserializer=openengine_dot_v1_dot_generation__pb2.TransferEncoderCacheResponse.FromString,
-                _registered_method=True)
         self.GetKvEventSources = channel.unary_unary(
                 '/openengine.v1.Control/GetKvEventSources',
                 request_serializer=openengine_dot_v1_dot_kv__pb2.GetKvEventSourcesRequest.SerializeToString,
@@ -274,14 +269,6 @@ class ControlServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def TransferEncoderCache(self, request, context):
-        """Returns only after the encoder backend has completed the data transfer.
-        Single-use handoffs must not be retried after an uncertain outcome.
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
     def GetKvEventSources(self, request, context):
         """Disaggregated serving / KV transfer. Connector info: ServerInfo.kv_connector.
         """
@@ -342,11 +329,6 @@ def add_ControlServicer_to_server(servicer, server):
                     servicer.ListLoras,
                     request_deserializer=openengine_dot_v1_dot_lora__pb2.ListLorasRequest.FromString,
                     response_serializer=openengine_dot_v1_dot_lora__pb2.ListLorasResponse.SerializeToString,
-            ),
-            'TransferEncoderCache': grpc.unary_unary_rpc_method_handler(
-                    servicer.TransferEncoderCache,
-                    request_deserializer=openengine_dot_v1_dot_generation__pb2.TransferEncoderCacheRequest.FromString,
-                    response_serializer=openengine_dot_v1_dot_generation__pb2.TransferEncoderCacheResponse.SerializeToString,
             ),
             'GetKvEventSources': grpc.unary_unary_rpc_method_handler(
                     servicer.GetKvEventSources,
@@ -602,33 +584,6 @@ class Control(object):
             '/openengine.v1.Control/ListLoras',
             openengine_dot_v1_dot_lora__pb2.ListLorasRequest.SerializeToString,
             openengine_dot_v1_dot_lora__pb2.ListLorasResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def TransferEncoderCache(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/openengine.v1.Control/TransferEncoderCache',
-            openengine_dot_v1_dot_generation__pb2.TransferEncoderCacheRequest.SerializeToString,
-            openengine_dot_v1_dot_generation__pb2.TransferEncoderCacheResponse.FromString,
             options,
             channel_credentials,
             insecure,

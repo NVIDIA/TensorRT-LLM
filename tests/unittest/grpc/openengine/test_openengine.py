@@ -32,6 +32,9 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc  # noqa: E402
 
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
     SCHEMA_RELEASE,
+    encoder_transfer_pb2,
+    encoder_transfer_pb2_grpc,
+    generation_pb2,
     kv_pb2,
     openengine_pb2_grpc,
     server_pb2,
@@ -189,6 +192,26 @@ def test_openengine_server_serves_the_control_contract() -> None:
             assert info.schema_revision == 1
             assert info.minimum_client_revision == 1
             assert info.schema_release == SCHEMA_RELEASE
+            transfers = []
+            inference = server._control._inference
+            inference.encoder_role = "encode"
+            inference._encoder_cleanup_tasks = set()
+            inference._encoder_cache = SimpleNamespace(
+                backend="test-encoder",
+                transfer=lambda cache, destination: transfers.append((cache, destination)),
+                close=lambda: None,
+            )
+            reference = generation_pb2.EncoderCacheRef(
+                transfer_backend="test-encoder", opaque_state=b"reference"
+            )
+            peer = encoder_transfer_pb2_grpc.EncoderTransferStub(channel)
+            await peer.Transfer(
+                encoder_transfer_pb2.TransferEncoderCacheRequest(
+                    cache=reference, destination=b"destination"
+                ),
+                timeout=5,
+            )
+            assert transfers == [(reference, b"destination")]
         finally:
             await channel.close()
             await server.stop(grace=0)

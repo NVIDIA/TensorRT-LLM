@@ -307,9 +307,11 @@ Multiple frontends require the default classic IPC executor and a nonzero port. 
 
 ## Schema and binding provenance
 
-The schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository at signed Git tag [`v0.1.0`](https://github.com/ai-dynamo/openengine/releases/tag/v0.1.0), Git commit `b5f2bd93721f7b888d3e2440679e0ae7012939d1`. That release maps to the public [`buf.build/openengine/openengine`](https://buf.build/openengine/openengine) module at immutable BSR release `768a93c7b44e40f28c692ad0b471a8f2`.
+The baseline schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository at signed Git tag [`v0.1.0`](https://github.com/ai-dynamo/openengine/releases/tag/v0.1.0), Git commit `b5f2bd93721f7b888d3e2440679e0ae7012939d1`. That release maps to the public [`buf.build/openengine/openengine`](https://buf.build/openengine/openengine) module at immutable BSR release `768a93c7b44e40f28c692ad0b471a8f2`.
 
-TensorRT-LLM vendors that immutable schema under `tensorrt_llm/grpc/openengine/proto/`. `3rdparty/vendor_sources.lock.yaml` pins the upstream commit and verifies that the schema files are exact upstream copies. The adjacent `manifest.json` records protocol metadata, generator versions, and runtime floors. The deterministic private bindings under `tensorrt_llm.grpc.openengine._generated` are checked in so ordinary wheel and editable builds do not require a protocol compiler or network access.
+The encoder extension is pinned to canonical [OpenEngine #35](https://github.com/ai-dynamo/openengine/pull/35), which is not yet included in that BSR release. Its exact source revision is recorded in the vendor lock and schema manifest.
+
+TensorRT-LLM vendors the immutable schema under `tensorrt_llm/grpc/openengine/proto/`. `3rdparty/vendor_sources.lock.yaml` pins the upstream commit and verifies that the schema files are exact upstream copies. The adjacent `manifest.json` records protocol metadata, generator versions, and runtime floors. The deterministic private bindings under `tensorrt_llm.grpc.openengine._generated` are checked in so ordinary wheel and editable builds do not require a protocol compiler or network access.
 
 When changing the schema, generator, or `requirements-build-openengine.txt`, regenerate and commit the bindings:
 
@@ -371,7 +373,10 @@ limit and a 256 MiB serialized-cache limit.
 The helpers use the encoder-handoff contract proposed in
 [OpenEngine #35](https://github.com/ai-dynamo/openengine/pull/35), pinned to an
 immutable source revision in the vendor lock. It is not in a published BSR
-release. Serving role discovery, request dispatch and lifecycle integration are
+release. Producer cleanup and mandatory-cache policy use typed encoder capabilities.
+Native NIXL peers use the TensorRT-LLM-owned `trtllm.openengine.v1.EncoderTransfer`
+service on the same gRPC listener; its schema is in `proto/trtllm/openengine/v1/`.
+OpenEngine defines the reference and release contract while the engine owns transfer. Serving role discovery, request dispatch and lifecycle integration are
 provided by the stacked serving change.
 
 ### Encoder transport tests

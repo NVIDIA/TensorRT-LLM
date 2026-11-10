@@ -282,7 +282,11 @@ def encoder_role(llm: Any, cache: EncoderCache | None) -> str:
 
 def validate_encoder(request: Any, role: str) -> str:
     if not request.HasField("encoder"):
-        if role == "consume" and request.media:
+        if (
+            role == "consume"
+            and request.media
+            and not (request.HasField("kv") and request.kv.HasField("session"))
+        ):
             raise UnsupportedFeatureError(
                 "encoder consumer requires an encoder cache reference for images"
             )
@@ -296,7 +300,7 @@ def validate_encoder(request: Any, role: str) -> str:
     if role != expected:
         raise UnsupportedFeatureError(f"loaded engine does not support encoder role {expected}")
     if request.HasField("kv") and request.kv.HasField("session"):
-        raise UnsupportedFeatureError("encoder handoffs currently support E+PD only")
+        raise UnsupportedFeatureError("KV decode requests must not consume an encoder cache")
     if not request.media or any(
         item.modality != generation_pb2.MODALITY_IMAGE for item in request.media
     ):

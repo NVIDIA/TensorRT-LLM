@@ -35,9 +35,10 @@ from tensorrt_llm.serve._frontend_processes import (
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 
 from ._health import OpenEngineHealthServicer
-from .bindings import openengine_pb2_grpc
+from .bindings import encoder_transfer_pb2_grpc, openengine_pb2_grpc
 from .control import OpenEngineControlServicer
 from .coordinator import CoordinationError, Coordinator, FrontendClient
+from .encoder_transfer import EncoderTransferServicer
 from .kv_events import KvEventsUnavailableError, _format_host_port, events_config
 from .metrics import MetricsDirectory, OpenEngineMetrics
 from .servicer import OpenEngineInferenceServicer
@@ -172,6 +173,9 @@ class OpenEngineServer:
             instance_id=instance_id,
         )
         openengine_pb2_grpc.add_ControlServicer_to_server(self._control, self._server)
+        encoder_transfer_pb2_grpc.add_EncoderTransferServicer_to_server(
+            EncoderTransferServicer(inference), self._server
+        )
         bind_address = _format_bind_address(host, port)
         # Plaintext h2c with no authentication: any client that can reach this
         # port can run inference and call Control.Abort. It is meant to be
