@@ -33,7 +33,13 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
+from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
+
+# A greedy token may differ only where the two-pass run's top two logprobs are closer than this.
+NEAR_TIE = 0.05
+# How far a token's logprob may differ between the runs while their tokens still match.
+LOGPROB_TOLERANCE = 1e-2
 
 PROMPTS = [
     "The capital of France is",
@@ -52,6 +58,8 @@ class _Run:
     """What one LLM generated, and how its executors captured and replayed CUDA graphs."""
 
     tokens: list[list[int]]
+    # Per prompt and generated token, the top two logprobs and the generated token's.
+    logprobs: list[list[dict[int, Logprob]]]
     keys: set[KeyType]
     # The graphs the generation replayed.
     replayed: set[KeyType]
@@ -69,7 +77,8 @@ def _generate(skip_warmup_pass: bool, move_workspace: bool = False) -> _Run:
     replayed: list[KeyType] = []
     moved: list[bool] = []
     generating: list[bool] = []
-    prompts_fetched: list[bool] = []
+    # The number of requests the executor's first fetch while generating returned.
+    first_fetch: list[int] = []
     guard = MoECommTimeoutGuard(environ={})
     warmup_and_capture = DecoderCudaGraphs.warmup_and_capture
     run_cuda_graph_warmup = DecoderCudaGraphs.run_cuda_graph_warmup
@@ -125,12 +134,12 @@ def _generate(skip_warmup_pass: bool, move_workspace: bool = False) -> _Run:
     ) -> list[RequestQueueItem]:
         """Schedule every prompt in the first batch, so each run steps through the same batches."""
         items = get_from_request_queue(self, timeout)
-        if items and generating and not prompts_fetched:
-            prompts_fetched.append(True)
+        if items and generating and not first_fetch:
             while len(items) < len(PROMPTS) and (
                 more := get_from_request_queue(self, datetime.timedelta(seconds=10))
             ):
                 items += more
+            first_fetch.append(len(items))
         return items
 
     with pytest.MonkeyPatch.context() as patch:
@@ -158,7 +167,9 @@ def _generate(skip_warmup_pass: bool, move_workspace: bool = False) -> _Run:
                 outputs = llm.generate(
                     PROMPTS,
                     [
-                        SamplingParams(max_tokens=8 + 3 * i, temperature=0, ignore_eos=True)
+                        SamplingParams(
+                            max_tokens=8 + 3 * i, temperature=0, ignore_eos=True, logprobs=2
+                        )
                         for i in range(len(PROMPTS))
                     ],
                 )
@@ -167,13 +178,34 @@ def _generate(skip_warmup_pass: bool, move_workspace: bool = False) -> _Run:
             # The in-process executor lowers the PyTorch memory fraction for the whole process.
             torch.cuda.set_per_process_memory_fraction(1.0)
     assert moved == ([True] if move_workspace else [])
+    assert first_fetch == [len(PROMPTS)]
     return _Run(
         tokens=[list(output.outputs[0].token_ids) for output in outputs],
+        logprobs=[output.outputs[0].logprobs for output in outputs],
         keys=keys,
         replayed=set(replayed),
         passes=passes,
         capture_timeouts=capture_timeouts,
     )
+
+
+def _assert_same_generation(run: _Run, two_pass_run: _Run) -> None:
+    """Tokens and logprobs match the two-pass run up to a near tie there; the token may then flip
+    to the two-pass runner-up, and that prompt is compared no further."""
+    for tokens, logprobs, ref_tokens, ref_logprobs in zip(
+        run.tokens, run.logprobs, two_pass_run.tokens, two_pass_run.logprobs, strict=True
+    ):
+        assert len(tokens) == len(ref_tokens)
+        for token, step, ref_token, ref_step in zip(tokens, logprobs, ref_tokens, ref_logprobs):
+            if token != ref_token:
+                by_rank = sorted(ref_step, key=lambda candidate: ref_step[candidate].rank)
+                top, runner_up = by_rank[:2]
+                assert (token, top) == (runner_up, ref_token)
+                assert ref_step[top].logprob - ref_step[runner_up].logprob < NEAR_TIE
+                break
+            for candidate in step.keys() & ref_step.keys():
+                drift = abs(step[candidate].logprob - ref_step[candidate].logprob)
+                assert drift < LOGPROB_TOLERANCE
 
 
 @pytest.fixture(scope="module")
@@ -193,7 +225,7 @@ def test_single_pass_capture_matches_two_passes(two_pass_run: _Run) -> None:
     assert run.passes == [[True, False], [False]]
     assert run.keys == two_pass_run.keys
     assert run.replayed == run.keys
-    assert run.tokens == two_pass_run.tokens
+    _assert_same_generation(run, two_pass_run)
     # Eager forwards keep the warmup MoE timeouts; each capture switches to the serving ones.
     assert run.capture_timeouts[-1] == {(False, True), (True, False)}
 
@@ -205,4 +237,4 @@ def test_single_pass_capture_falls_back_when_a_buffer_moves(two_pass_run: _Run) 
     assert run.passes == [[True, False], [False, True, False]]
     assert run.keys == two_pass_run.keys
     assert run.replayed == run.keys
-    assert run.tokens == two_pass_run.tokens
+    _assert_same_generation(run, two_pass_run)
