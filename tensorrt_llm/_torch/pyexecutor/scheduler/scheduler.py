@@ -30,6 +30,7 @@ from ..llm_request import (
     get_mm_items_for_chunk,
     get_mm_pending_items,
     make_mm_encoder_transient_cache_key,
+    release_consumed_mm_items,
 )
 
 RequestList = list[LlmRequest]
@@ -1115,6 +1116,8 @@ class MultimodalScheduler(RequestScheduler):
             if state is None:
                 ready_context_requests.append(request)
                 continue
+            # KV reuse can start a prefill past outputs that were bound while it was at zero.
+            release_consumed_mm_items(request, self.encoder_cache)
             begin = chunk.start
             chunk_items = get_mm_items_for_chunk(request, begin, chunk.end)
             item_cache_keys, retain_after_release = self._get_request_item_cache_keys(

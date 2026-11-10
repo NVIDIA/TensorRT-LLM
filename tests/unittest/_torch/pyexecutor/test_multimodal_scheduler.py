@@ -18,7 +18,10 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin,
 )
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheManagerV2,
+    _settle_context_cursor,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     MultimodalEncoderRequestError,
     MultimodalEncoderRequestState,
@@ -1385,6 +1388,58 @@ def test_v2_prompt_windows_finish_when_whole_request_outputs_exceed_cache_budget
     assert state.item_cache_keys == [None, None, None]
     scheduler.scheduler.kv_cache_manager.free_resources(request)
     assert kv_allocated == {}
+
+
+def test_eager_item_behind_a_reused_prefix_does_not_block_the_first_chunk():
+    """EAGER binds a waiting request's items from prompt position zero. When KV
+    reuse then starts its prefill past such an item, that output must not keep
+    the cache space the first chunk's own item needs."""
+    scheduler, _ = _make_v2_multimodal_scheduler(
+        kv_capacity=100,
+        max_num_tokens=10,
+        encoder_max_num_tokens=4,
+        encoder_batch_size=1,
+        context_chunk_unit_size=10,
+        scheduler_cls=MultimodalEagerEncoderScheduler,
+    )
+    manager = scheduler.scheduler.kv_cache_manager
+    text_request = _make_v2_request(1, 10)
+    request = _make_v2_request(2, 30, [1, 1])
+    mask = torch.zeros(30, dtype=torch.int64)
+    mask[[5, 20]] = 1
+    request.py_multimodal_data["multimodal_embed_mask_cumsum"] = mask.cumsum(0)
+    initialize_multimodal_encoder_request(
+        request,
+        max_num_tokens=4,
+        max_output_bytes=4,
+        bytes_per_encoder_embedding=_BYTES_PER_ROW,
+        context_chunk_unit_size=10,
+    )
+
+    # The text request takes this pass's whole token budget, so the multimodal
+    # request gets encoder work only, with its prefill still at position zero.
+    output = scheduler.schedule_request([text_request, request], set())
+    assert output.context_requests == [text_request]
+    assert output.scheduled_mm_encoder_items == {2: [0]}
+    state = request.py_mm_encoder_state
+    scheduler.encoder_cache.commit(state.item_cache_keys[0], torch.zeros(1, 1))
+    state.mark_cache_key_ready(state.item_cache_keys[0])
+
+    # Its first prepare now finds two reusable KV blocks, which cover item 0.
+    prepare_context = manager.prepare_context.side_effect
+
+    def prepare_reused_context(req):
+        prepared = prepare_context(req)
+        if req is request and req.is_first_context_chunk:
+            _settle_context_cursor(req, 20, manager.tokens_per_block)
+        return prepared
+
+    manager.prepare_context.side_effect = prepare_reused_context
+
+    output = scheduler.schedule_request([request], set())
+    assert request.context_current_position == 20
+    assert output.context_requests == [request]
+    assert output.scheduled_mm_encoder_items == {2: [1]}
 
 
 @pytest.mark.parametrize("encoder_max_num_tokens", [4, 8])
