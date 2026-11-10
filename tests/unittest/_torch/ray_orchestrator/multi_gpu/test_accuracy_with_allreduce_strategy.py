@@ -149,18 +149,14 @@ def test_accuracy_with_allreduce_strategy(
     llm_logprobs = []
     llm_responses = []
 
-    # Fix attention dispatch for the cross-backend comparison while retaining
-    # the selected all-reduce strategy in each fresh Ray worker.
+    # Pin attention dispatch in the Ray workers, which inherit this environment.
+    # Use FORCE_ATTENTION_KERNEL_DETERMINISTIC rather than FORCE_DETERMINISTIC,
+    # which would also force deterministic all-reduce and change the path under test.
     monkeypatch.setenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", "1")
-    kv_cache_config = KvCacheConfig(
-        enable_block_reuse=False,
-        free_gpu_memory_fraction=0.6,
-        use_kv_cache_manager_v2=True,
-    )
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.6)
     llm = LLM(
         model=model_dir,
         backend="pytorch",
-        dtype="bfloat16",
         model_kwargs={"dtype": "bfloat16"},
         orchestrator_type="ray",
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",

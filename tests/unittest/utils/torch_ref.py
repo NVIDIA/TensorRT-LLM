@@ -1318,8 +1318,8 @@ class RefHFModel:
                         ref_results.append(response_logits)
                     else:
                         # Convert to logprobs
-                        response_logprobs = torch.log_softmax(response_logits,
-                                                              dim=-1)
+                        response_logprobs = torch.log_softmax(
+                            response_logits, dim=-1, dtype=torch.float32)
 
                         # Extract logprobs for the actual generated tokens
                         response_tensor = torch.tensor(
