@@ -95,9 +95,14 @@ MAX_SLOTS = 2048
 
 #: ``tep8_wide_balance``'s ``MAX_ROWS`` (default off): on tep8 the balanced placement of the
 #: NVFP4 layers also serves the decode calls above the stacked path's row cap, up to those rows
-#: (129..256, ``8 * B`` for B requests at K = 7), each call of more than 64 rows placed by the
+#: (129..512, ``8 * B`` for B requests at K = 7), each call of more than 64 rows placed by the
 #: wide program.
 WIDE_BALANCE_MIN_ROWS = 129
+#: Largest ``M * TOP_K`` the wide program handles: 512 decode rows (64 requests at K = 7), a
+#: 4096-slot tile from 257 rows on. Its work is per expert (the census is a histogram of the
+#: ids, the move decision one per expert, one gather per slot), so the tile above ``MAX_SLOTS``
+#: costs no ``[SLOTS, RANKS]`` tensor; the narrow program keeps ``MAX_SLOTS``.
+WIDE_MAX_SLOTS = 4096
 _WIDE_BALANCE_ROWS: Optional[int] = None
 
 
@@ -109,7 +114,7 @@ def configure(*, wide_balance_rows: Optional[int] = None) -> None:
 
     Args:
         wide_balance_rows: ``tep8_wide_balance``'s ``MAX_ROWS`` (``_WIDE_BALANCE_ROWS``),
-            in ``WIDE_BALANCE_MIN_ROWS``..``MAX_SLOTS // TOP_K``.
+            in ``WIDE_BALANCE_MIN_ROWS``..``WIDE_MAX_SLOTS // TOP_K``.
 
     Raises:
         ValueError: for a row cap outside that range.
@@ -119,11 +124,11 @@ def configure(*, wide_balance_rows: Optional[int] = None) -> None:
         _WIDE_BALANCE_ROWS = None
         return
     rows = int(wide_balance_rows)
-    if not WIDE_BALANCE_MIN_ROWS <= rows <= MAX_SLOTS // TOP_K:
+    if not WIDE_BALANCE_MIN_ROWS <= rows <= WIDE_MAX_SLOTS // TOP_K:
         raise ValueError(
             f"[musespark_open] tep8_wide_balance MAX_ROWS {rows}: expected the balanced "
             f"placement's row cap for the NVFP4 layers' decode calls, a whole number in "
-            f"{WIDE_BALANCE_MIN_ROWS}..{MAX_SLOTS // TOP_K}"
+            f"{WIDE_BALANCE_MIN_ROWS}..{WIDE_MAX_SLOTS // TOP_K}"
         )
     _WIDE_BALANCE_ROWS = rows
 
@@ -745,8 +750,15 @@ class RingBuddyAssign(OpWrapper):
         assert selected.ndim == 2 and selected.shape[1] == TOP_K, (
             f"selected must be [M, {TOP_K}], got {tuple(selected.shape)}"
         )
-        assert 0 < selected.numel() <= MAX_SLOTS, (
-            f"one program covers at most {MAX_SLOTS} slots (M <= {MAX_SLOTS // TOP_K}), got {selected.numel()}"
+        slots = max(16, triton.next_power_of_2(max(1, selected.numel())))
+        most = (
+            WIDE_MAX_SLOTS
+            if wide and wide_serves(slots, ranks, balance, static_from, half)
+            else MAX_SLOTS
+        )
+        assert 0 < selected.numel() <= most, (
+            f"one program covers at most {most} slots (M <= {most // TOP_K}), "
+            f"got {selected.numel()}"
         )
         assert weights.dtype == torch.float32 and weights.is_contiguous(), (
             "weights must be contiguous float32"

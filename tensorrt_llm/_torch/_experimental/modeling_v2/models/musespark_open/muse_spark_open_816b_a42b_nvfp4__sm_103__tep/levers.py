@@ -570,9 +570,13 @@ DRAFTER_PREP_MIN_REQUESTS = 2
 RING_BUDDY_MAX_ROWS = 128
 RING_BUDDY_ROW_CEILING = 256
 #: ``tep8_wide_balance__MAX_ROWS``: the band the balanced NVFP4 placement adds above the
-#: stacked cap, from ``ring_buddy_assign.WIDE_BALANCE_MIN_ROWS`` (129) to the same ceiling.
+#: stacked cap, from ``ring_buddy_assign.WIDE_BALANCE_MIN_ROWS`` (129) to one wide
+#: ``ring_buddy_assign`` program's rows (``WIDE_MAX_SLOTS // TOP_K``). The default stays at the
+#: narrow program's ceiling; the band above it is reached only by setting the parameter, and
+#: the wide program places every call of more than 64 rows.
 WIDE_BALANCE_ROWS = 256
 WIDE_BALANCE_MIN_ROWS = 129
+WIDE_BALANCE_ROW_CEILING = 512
 #: ``ring_buddy_stats__INTERVAL_S``: seconds between the placement-census reports TP rank 0
 #: logs. Whole seconds only (the knob grammar has no fractional parameter).
 RING_BUDDY_STATS_INTERVAL_S = 60
@@ -694,7 +698,14 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         "tep8_wide_balance": _ported_tep8(
             Kind.FLAGGED,
             "the 256-row wide balance",
-            (Param("MAX_ROWS", WIDE_BALANCE_ROWS, WIDE_BALANCE_MIN_ROWS, RING_BUDDY_ROW_CEILING),),
+            (
+                Param(
+                    "MAX_ROWS",
+                    WIDE_BALANCE_ROWS,
+                    WIDE_BALANCE_MIN_ROWS,
+                    WIDE_BALANCE_ROW_CEILING,
+                ),
+            ),
         ),
         # Diagnostics: one extra assign launch per placement, and the in-kernel placement
         # stands aside for it (``ring_buddy``'s ``_stats is None``), so it is never on by
