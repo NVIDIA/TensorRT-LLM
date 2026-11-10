@@ -36,7 +36,6 @@ Two implementations for the coordinator/worker deployment:
 """
 
 import asyncio
-import os
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, Tuple
@@ -53,6 +52,7 @@ from tensorrt_llm.llmapi.disagg_utils import (
     worker_local_process_id,  # noqa: F401
 )
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve import envs
 from tensorrt_llm.serve.cluster_storage import (
     ClusterStorage,
     WatchEventType,
@@ -80,18 +80,12 @@ __all__ = [
 ]
 
 COORDINATOR_RESERVATION_TIMEOUT_ENV = "TRTLLM_DISAGG_COORDINATOR_RESERVATION_TIMEOUT"
-COORDINATOR_RESERVATION_TIMEOUT_DEFAULT_S = 180.0
 COORDINATOR_RESERVATION_LOCK_STRIPES = 256
 COORDINATOR_STATE_SYNC_INTERVAL_S = 3.0
 
 
 def coordinator_reservation_timeout() -> float:
-    return float(
-        os.environ.get(
-            COORDINATOR_RESERVATION_TIMEOUT_ENV,
-            COORDINATOR_RESERVATION_TIMEOUT_DEFAULT_S,
-        )
-    )
+    return envs.TRTLLM_DISAGG_COORDINATOR_RESERVATION_TIMEOUT
 
 
 class DisaggCoordinator(ABC):
@@ -405,9 +399,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
         return info
 
     async def _wait_for_all_servers_ready(self) -> None:
-        import os
-
-        gen_only = os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
+        gen_only = envs.TRTLLM_DISAGG_BENCHMARK_GEN_ONLY
 
         async def check_servers_ready():
             elapsed_time = 0

@@ -19,6 +19,7 @@ from typing import NamedTuple
 
 from tensorrt_llm.llmapi.mpi_session import split_mpi_env
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve import envs
 
 
 class FrontendStartupCancelled(RuntimeError):
@@ -56,9 +57,7 @@ def _init_multi_frontend_mode(llm_args: dict, enabled: bool) -> MultiFrontendMod
             )
         return MultiFrontendMode(1, False)
 
-    mode = MultiFrontendMode(
-        llm_args.get("num_serve_frontends", 1), os.getenv("TLLM_EXECUTOR_ATTACH_INFO") is not None
-    )
+    mode = MultiFrontendMode(llm_args.get("num_serve_frontends", 1), envs.TLLM_EXECUTOR_ATTACH_INFO)
     if mode.is_launcher and llm_args.get("orchestrator_type") is not None:
         raise ValueError(
             "num_serve_frontends > 1 requires the default (classic IPC) "
@@ -155,7 +154,7 @@ def _wait_attached_frontends_ready(
     report_failure: Callable[[int, str, str], None] | None = None,
 ) -> None:
     """Block until every attached frontend writes its READY byte."""
-    timeout = float(os.getenv("TLLM_FRONTEND_READY_TIMEOUT", "300"))
+    timeout = envs.TLLM_FRONTEND_READY_TIMEOUT
     deadline = time.monotonic() + timeout
     pending = dict(zip(ready_fds, children))
     with selectors.DefaultSelector() as selector:
@@ -205,7 +204,7 @@ def _signal_frontend_ready(multi_frontend: MultiFrontendMode) -> None:
     middleware registration) has succeeded; the launcher blocks group
     startup on this byte (see _wait_attached_frontends_ready).
     """
-    ready_fd = os.environ.pop("TLLM_FRONTEND_READY_FD", None)
+    ready_fd = envs.consume("TLLM_FRONTEND_READY_FD")
     if not (multi_frontend.is_attached_frontend and ready_fd):
         return
     fd = int(ready_fd)
@@ -292,8 +291,8 @@ def _frontend_affinity_sockets(
     reserved: dict[int, socket.socket] = {}
     try:
         if ports and multi_frontend.is_attached_frontend:
-            frontend_id = int(os.environ["TLLM_EXECUTOR_FRONTEND_ID"])
-            inherited_fd = os.environ.pop("TLLM_FRONTEND_AFFINITY_FD", None)
+            frontend_id = envs.TLLM_EXECUTOR_FRONTEND_ID
+            inherited_fd = envs.consume("TLLM_FRONTEND_AFFINITY_FD")
             if inherited_fd is not None:
                 own = socket.socket(fileno=int(inherited_fd))
                 own.set_inheritable(False)

@@ -28,7 +28,6 @@ implementation for comes back as "unsupported call".
 """
 
 import json
-import os
 from typing import Any, List, Optional, Sequence, Tuple
 
 from openai.types.responses.response_function_web_search import (
@@ -37,6 +36,7 @@ from openai.types.responses.response_function_web_search import (
 )
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve import envs
 from tensorrt_llm.serve.web_search import SearchOutcome, WebSearchToolSpec, load_web_search_config
 
 # How the tool is named to the model. The client's tool has no function name
@@ -155,7 +155,7 @@ def _unavailable_policy() -> str:
 
     Unset or blank reads as "ignore"; an unknown value reads as "reject".
     """
-    value = (os.environ.get(WEB_SEARCH_UNAVAILABLE_ENV) or "").strip().lower() or "ignore"
+    value = (envs.TRTLLM_WEB_SEARCH_UNAVAILABLE or "").strip().lower() or "ignore"
     if value in _UNAVAILABLE_POLICIES:
         return value
     logger.warning_once(

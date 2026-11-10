@@ -68,6 +68,7 @@ from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.serve import envs
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
@@ -507,7 +508,7 @@ def _resolve_media_dir() -> Path:
     holds directories owned by other users, so the fallback takes a name
     nobody else can hold rather than a fixed one.
     """
-    explicit = os.getenv("TRTLLM_MEDIA_STORAGE_PATH")
+    explicit = envs.TRTLLM_MEDIA_STORAGE_PATH
     if explicit:
         path = Path(explicit)
         path.mkdir(parents=True, exist_ok=True)
@@ -887,8 +888,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                                   cancel_futures=True)
 
         self.app = FastAPI(lifespan=lifespan)
-        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
-                                                  "0") == "1"
+        self.app.state.trust_kv_hints = envs.TRTLLM_TRUST_KV_HINTS
         self.app.router.route_class = _MsgspecRoute
 
         @self.app.exception_handler(RequestValidationError)
@@ -1009,15 +1009,14 @@ class OpenAIServer(_VideoRoutesMixin):
         self.chat_template = load_chat_template(chat_template)
 
         # Enable response storage for Responses API
-        self.enable_store = (len(
-            os.getenv("TRTLLM_RESPONSES_API_DISABLE_STORE", ""))
-                             < 1) and not self.postproc_worker_enabled
+        self.enable_store = (not envs.TRTLLM_RESPONSES_API_DISABLE_STORE
+                             ) and not self.postproc_worker_enabled
 
         self.conversation_store = ConversationHistoryStore()
 
         # gpt-oss
         self.harmony_adapter: HarmonyAdapter | None = None
-        disable_harmony = os.getenv("DISABLE_HARMONY_ADAPTER", "0") == "1"
+        disable_harmony = envs.DISABLE_HARMONY_ADAPTER
         if disable_harmony or self.model_config is None:
             self.use_harmony = False
         else:
@@ -3103,7 +3102,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 tokenizer=self.tokenizer,
             )
             # TODO: better way to enable metrics
-            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+            if len(envs.TRTLLM_KVCACHE_TIME_OUTPUT_PATH) > 0:
                 sampling_params.return_perf_metrics = True
             self._validate_internal_disagg_request(request, raw_request)
             disaggregated_params = to_llm_disaggregated_params(
@@ -3279,7 +3278,7 @@ class OpenAIServer(_VideoRoutesMixin):
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
             # The server-level effective flag already enables engine metrics
             # for header or JSONL output.
-            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+            if len(envs.TRTLLM_KVCACHE_TIME_OUTPUT_PATH) > 0:
                 sampling_params.return_perf_metrics = True
             self._validate_internal_disagg_request(request, raw_request)
             disaggregated_params = to_llm_disaggregated_params(

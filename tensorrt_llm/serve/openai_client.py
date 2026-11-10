@@ -16,7 +16,6 @@
 import asyncio
 import errno
 import json
-import os
 import traceback
 import zlib
 from abc import ABC, abstractmethod
@@ -43,6 +42,7 @@ from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve import envs
 from tensorrt_llm.serve.conversation_id import get_request_conversation_id
 from tensorrt_llm.serve.disagg_auth import (
     build_internal_disagg_auth_headers,
@@ -268,7 +268,7 @@ class OpenAIHttpClient(OpenAIClient):
             timeout=aiohttp.ClientTimeout(total=timeout_secs),
             max_field_size=_PERF_METRICS_HEADER_BUDGET_BYTES,
         )
-        self._no_retry = os.getenv("TRTLLM_DISAGG_NO_RETRY", "0") == "1"
+        self._no_retry = envs.TRTLLM_DISAGG_NO_RETRY
         self._max_retries = 0 if self._no_retry else max_retries
         if self._no_retry:
             logger.info(

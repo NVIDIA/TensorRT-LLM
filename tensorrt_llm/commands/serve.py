@@ -77,7 +77,7 @@ from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
                                                   resolve_auto_reasoning_parser)
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
-from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
+from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer, envs
 from tensorrt_llm.serve._frontend_processes import (
     _frontend_affinity_sockets, _init_multi_frontend_mode,
     _signal_frontend_ready, _spawn_attached_frontends,
@@ -499,7 +499,7 @@ def _share_prometheus_multiproc_dir(llm, ipc_dir: str) -> None:
     Not via set_prometheus_multiproc_dir(): it keeps only its latest
     TemporaryDirectory alive, so OpenAIServer's later call would delete this one.
     """
-    if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+    if envs.PROMETHEUS_MULTIPROC_DIR:
         return
     if llm.args.return_perf_metrics or llm.args.perf_metrics_output_dir:
         path = tempfile.mkdtemp(prefix="prometheus_", dir=ipc_dir)
@@ -613,7 +613,7 @@ def _check_context_only_settings(llm_args: dict, *, warn: bool) -> None:
     """
     if not _dense_dwdp_setting(llm_args.get("dwdp_config")):
         return
-    role = _serving_role(os.environ.get(DisaggLauncherEnvs.TLLM_DISAGG_ROLE))
+    role = _serving_role(envs.TRTLLM_DISAGG_ROLE)
     if role == "generation":
         raise click.BadParameter(
             f"{_DENSE_DWDP_FOR_CONTEXT_ONLY} Remove it from this server's "
@@ -694,7 +694,7 @@ def launch_server(
     # launcher is its parent.
     multi_frontend_serving = None
     if multi_frontend.is_attached_frontend:
-        attached_launcher_uds = os.environ.pop(LAUNCHER_UDS_ENV, None)
+        attached_launcher_uds = envs.consume(LAUNCHER_UDS_ENV)
         if attached_launcher_uds is not None:
             multi_frontend_serving = MultiFrontendServing(
                 launcher_uds=attached_launcher_uds,
@@ -719,7 +719,7 @@ def launch_server(
         # frontends behind one SO_REUSEPORT port, a follow-up request may
         # land on a sibling that has no record of the previous response.
         # Disable storage group-wide (OpenAIServer.enable_store).
-        if not os.getenv("TRTLLM_RESPONSES_API_DISABLE_STORE"):
+        if not envs.TRTLLM_RESPONSES_API_DISABLE_STORE:
             logger.warning(
                 "num_serve_frontends > 1: stateful Responses API storage "
                 "(store/previous_response_id) is disabled; the per-frontend "
@@ -818,7 +818,7 @@ def launch_server(
                 _apply_fastapi_middlewares(server.app, middleware)
 
                 # Optionally disable GC (default: not disabled)
-                if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
+                if envs.TRTLLM_SERVER_DISABLE_GC:
                     gc.disable()
 
                 _signal_frontend_ready(multi_frontend)
@@ -1513,7 +1513,7 @@ def serve(
             "--enable_sleep_mode is only supported by the HTTP server.")
     runtime_control_api_key = None
     if enable_sleep_mode:
-        runtime_control_api_key = os.getenv("TRTLLM_RUNTIME_CONTROL_API_KEY")
+        runtime_control_api_key = envs.TRTLLM_RUNTIME_CONTROL_API_KEY
         if not runtime_control_api_key:
             raise click.UsageError(
                 "--enable_sleep_mode requires TRTLLM_RUNTIME_CONTROL_API_KEY.")
@@ -2339,7 +2339,7 @@ def disaggregated(
         #   increment, and observed that `count0` (obtained by `gc.get_count()`)
         #   increases by fewer than 1,000 after every 200,000 requests, while the
         #   maximum value of `count0` exceeded 3,000,000 during the test.
-        if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
+        if envs.TRTLLM_DISAGG_SERVER_DISABLE_GC:
             gc.disable()
 
         set_lifecycle_phase("serving")
@@ -2479,14 +2479,13 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 
     public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
-    coord_port = int(
-        os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_PORT,
-                       public_port - 1))
+    coord_port = envs.TRTLLM_DISAGG_COORDINATOR_PORT
+    if coord_port is None:
+        coord_port = public_port - 1
     # The fleet is co-located with the implicit coordinator, so route its hot
     # /select,/finish over a Unix domain socket (avoids the TCP loopback stack
     # that dominated per-request latency). Opt-out via the UDS env = "0".
-    use_uds = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_UDS,
-                             "1") == "1"
+    use_uds = envs.TRTLLM_DISAGG_COORDINATOR_UDS
     coord_uds = (
         f"/tmp/trtllm_disagg_coord_{public_port}.sock"  # nosec B108
         if use_uds else None)
@@ -2591,13 +2590,13 @@ def _init_fleet_worker_process():
     # A worker is a plain HTTP process, never an MPI rank; drop WEB_CONCURRENCY so
     # it is never itself re-forked into multiple uvicorn workers.
     os.environ.pop("WEB_CONCURRENCY", None)
-    if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
+    if envs.TRTLLM_DISAGG_SERVER_DISABLE_GC:
         gc.disable()
 
     # This is a fresh Python process, so the TRT-LLM logger defaults to WARNING
     # and would drop the workers' INFO logs (per-request [ttft_split] /
     # [coord_api]). Restore the parent's level.
-    _worker_log_level = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_LOG_LEVEL)
+    _worker_log_level = envs.TRTLLM_DISAGG_LOG_LEVEL
     if _worker_log_level:
         logger.set_level(_worker_log_level)
 
@@ -2621,18 +2620,14 @@ def _build_disagg_server_from_env() -> "OpenAIDisaggServer":
     disagg-id) is read from ``TLLM_DISAGG_WORKER_PROCESS_ID``, which the launcher
     set explicitly per worker (see ``worker_local_process_id``).
     """
-    config_file = os.environ[DisaggWorkerEnvs.TLLM_DISAGG_CONFIG_FILE]
-    coordinator_url = os.environ[DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_URL]
-    metadata_config_file = os.environ.get(
-        DisaggWorkerEnvs.TLLM_DISAGG_METADATA_CONFIG_FILE)
-    request_timeout = int(
-        os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_REQUEST_TIMEOUT, "180"))
-    server_start_timeout = int(
-        os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_SERVER_START_TIMEOUT,
-                       "180"))
+    config_file = envs.TRTLLM_DISAGG_CONFIG_FILE
+    coordinator_url = envs.TRTLLM_DISAGG_COORDINATOR_URL
+    metadata_config_file = envs.TRTLLM_DISAGG_METADATA_CONFIG_FILE
+    request_timeout = envs.TRTLLM_DISAGG_REQUEST_TIMEOUT
+    server_start_timeout = envs.TRTLLM_DISAGG_SERVER_START_TIMEOUT
 
     disagg_cfg = parse_disagg_config_file(config_file)
-    schedule_style = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_SCHEDULE_STYLE)
+    schedule_style = envs.TRTLLM_DISAGG_SCHEDULE_STYLE
     if schedule_style:
         disagg_cfg.schedule_style = schedule_style
     metadata_server_cfg = parse_metadata_server_config_file(
@@ -2685,7 +2680,7 @@ def _run_fleet_worker_impl():
     except OSError as e:
         raise RuntimeError(
             f"Fleet worker failed to SO_REUSEPORT-bind {host}:{port}: {e}")
-    pidx = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_WORKER_PROCESS_ID, "0")
+    pidx = envs.TRTLLM_DISAGG_WORKER_PROCESS_ID
     logger.info(f"Fleet worker process_id={pidx} bound {host}:{port} "
                 f"(SO_REUSEPORT)")
     set_lifecycle_phase("serving")
@@ -2693,10 +2688,10 @@ def _run_fleet_worker_impl():
 
 
 def set_cuda_device():
-    if (os.getenv("OMPI_COMM_WORLD_RANK")):
-        env_global_rank = int(os.environ["OMPI_COMM_WORLD_RANK"])
-    elif (os.getenv("SLURM_PROCID")):
-        env_global_rank = int(os.environ["SLURM_PROCID"])
+    if (envs.OMPI_COMM_WORLD_RANK):
+        env_global_rank = int(envs.OMPI_COMM_WORLD_RANK)
+    elif (envs.SLURM_PROCID):
+        env_global_rank = int(envs.SLURM_PROCID)
     else:
         raise RuntimeError("Could not determine rank from environment")
     device_id = env_global_rank % device_count()
@@ -2787,8 +2782,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
     _refuse_dense_dwdp_on_generation_servers(disagg_cfg)
 
     from tensorrt_llm._utils import mpi_rank
-    if os.environ.get(DisaggLauncherEnvs.
-                      TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
+    if envs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT != "1":
         set_cuda_device()
     # Importing mpi4py after setting CUDA device. This is needed to work around an issue with mpi4py and CUDA
     from mpi4py.futures import MPICommExecutor
@@ -2797,19 +2791,17 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
     from tensorrt_llm.llmapi.disagg_utils import split_world_comm
 
     blocker = _shared_draft_kv_blocker(disagg_cfg.server_configs)
-    if blocker is not None and os.environ.get(
-            "TRTLLM_DISAGG_SHARED_DRAFT_KV") == "1":
+    shared_draft_kv = envs.TRTLLM_DISAGG_SHARED_DRAFT_KV
+    if blocker is not None and shared_draft_kv == "1":
         raise click.UsageError(
             f"TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires {blocker}.")
-    if os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") in (None, "auto"):
+    if shared_draft_kv in (None, "auto"):
         os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = ("0"
                                                        if blocker else "auto")
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
-    if os.environ.get(DisaggLauncherEnvs.
-                      TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) == "1":
-        instance_idx = os.environ.get(
-            DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
+    if envs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT == "1":
+        instance_idx = envs.TLLM_DISAGG_INSTANCE_IDX
         server_cfg = disagg_cfg.server_configs[int(instance_idx)]
 
         llm_args = _build_llm_args_from_disagg_server_cfg(server_cfg.other_args)
@@ -2883,7 +2875,7 @@ class DisaggWorkerEnvs(StrEnum):
 
 def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     # Launching the server
-    instance_idx = os.environ.get(DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
+    instance_idx = envs.TLLM_DISAGG_INSTANCE_IDX
     assert instance_idx is not None, f"{DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX} should be set by the launcher"
     disagg_config = parse_disagg_config_file(disagg_config_file)
     server_cfg = disagg_config.server_configs[int(instance_idx)]
@@ -2934,8 +2926,7 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX] = str(instance_idx)
 
     logger.debug(
-        f"proxy controller address: {os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR]}"
-    )
+        f"proxy controller address: {envs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR}")
 
     # The MPI-related environment variables will invoke duplicate MPI_Init in
     # the forked process, so we need to remove them before launching the server

@@ -16,7 +16,6 @@
 # yapf: disable
 import asyncio
 import json
-import os
 import signal
 import socket
 import traceback
@@ -41,6 +40,7 @@ from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve import envs
 from tensorrt_llm.serve._telemetry import create_uvicorn_server
 from tensorrt_llm.serve.anthropic_adapter import (AnthropicRequestError,
                                                   AnthropicResponseError,
@@ -296,7 +296,7 @@ class OpenAIDisaggServer:
             await self._perf_metrics_writer.close()
 
         self.app = FastAPI(lifespan=lifespan)
-        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS", "0") == "1"
+        self.app.state.trust_kv_hints = envs.TRTLLM_TRUST_KV_HINTS
         self.app.router.route_class = KvHintsRoute
 
         if self._collect_perf_metrics:

@@ -4,7 +4,6 @@
 
 import asyncio
 import json
-import os
 import re
 import time
 import uuid
@@ -72,6 +71,7 @@ from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve import envs
 from tensorrt_llm.serve.chat_utils import (VALID_MESSAGE_CONTENT_MM_PART_TYPES,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
@@ -117,7 +117,7 @@ REASONING_EFFORT = {
 # prompt handed to the model. Off by default: it prints whole
 # conversations, so it is a debugging aid rather than something to leave
 # enabled on a shared server.
-ENABLE_RESPONSES_DEBUG_MSG = os.environ.get("TRTLLM_RESPONSES_DEBUG") == "1"
+ENABLE_RESPONSES_DEBUG_MSG = envs.TRTLLM_RESPONSES_DEBUG
 
 # The parameter a freeform custom tool is described with; see
 # _get_chat_completion_function_tools and _tool_call_output_item.
@@ -1563,7 +1563,7 @@ async def request_preprocess(
     prev_response_id = request.previous_response_id
 
     # TODO: better way to enable metrics
-    if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+    if len(envs.TRTLLM_KVCACHE_TIME_OUTPUT_PATH) > 0:
         sampling_params.return_perf_metrics = True
 
     prev_msgs = []

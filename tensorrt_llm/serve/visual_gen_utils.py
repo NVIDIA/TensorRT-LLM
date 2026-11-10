@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import os
 from collections.abc import Mapping
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -13,6 +12,7 @@ from PIL import Image, UnidentifiedImageError
 
 from tensorrt_llm.inputs.media_io import sniff_media_kind
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve import envs
 from tensorrt_llm.serve.openai_protocol import (
     ImageEditRequest,
     ImageGenerationRequest,
@@ -120,7 +120,7 @@ def local_media_path_is_disallowed() -> bool:
     default and turned off together with ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1``.
     The local Python API is unaffected: this gate is the HTTP boundary's.
     """
-    raw = os.environ.get("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "0")
+    raw = envs.TRTLLM_DISALLOW_LOCAL_MEDIA_PATH
     if raw not in ("0", "1"):
         logger.warning(
             "Unrecognized value for TRTLLM_DISALLOW_LOCAL_MEDIA_PATH: "
