@@ -18,9 +18,11 @@ The completion gate first observes genuine NIXL DONE, then withholds that eviden
 from the production sender. These are backend/ownership and software-containment
 tests, NOT outstanding-DMA, platform-fence, replacement, or initialized-executor tests.
 The cancellation/cleanup seam uses real PyExecutor methods on a model-free shell.
+The context-first profile uses BF16 K/V storage and two active TP ranks per job.
 Generic V2 NVFP4 key/scale storage isolates lifecycle coverage from the unfinished
 dense FP4 MLA manager/serving integration and its extra high-precision-tail roles.
-No transport environment is changed, and no replacement starts after fail-stop.
+FP4 transport settings stay unchanged; context-first explicitly selects its required
+UCX backend. No replacement starts after fail-stop.
 """
 
 from __future__ import annotations
@@ -63,6 +65,7 @@ _CASES = (
     "source_fatal",
     "destination_fatal",
 )
+_CONTEXT_FIRST_CASES = ("baseline", "cancel_late_kv", "source_fatal", "destination_fatal")
 _PHASE_TIMEOUT_S = 30.0
 _TIMEOUT_S = 4 * _PHASE_TIMEOUT_S
 _WORKER_TIMEOUT_S = 600.0
@@ -111,18 +114,24 @@ def _record(directory: Path, name: str, **fields: object) -> None:
     temporary.replace(target)
 
 
-def _report_startup_failure(jobs: dict[str, subprocess.Popen], directory: Path) -> None:
+def _report_startup_failure(
+    jobs: dict[str, subprocess.Popen], directory: Path, context_first: bool = False
+) -> None:
     """Include bounded worker diagnostics in captured CI output before cleanup.
 
     Args:
         jobs: Owned MPI launchers whose startup did not complete.
         directory: Per-rank markers and CTX/GEN logs for this test.
+        context_first: Whether both TP ranks own active transfer sessions.
     """
     for role, job in jobs.items():
         expected = [
             *(f"{role}.{rank}.{phase}" for rank in range(2) for phase in ("spawned", "ready")),
-            f"{role}.allocated",
-            f"{role}.1.blocked",
+            *(
+                (f"{rank}/{role}.allocated" for rank in range(2))
+                if context_first
+                else (f"{role}.allocated", f"{role}.1.blocked")
+            ),
         ]
         missing = [name for name in expected if not (directory / f"{name}.json").exists()]
         print(f"Startup failure: {role} launcher_exit={job.poll()}, missing={missing}")
@@ -319,17 +328,20 @@ def _pool_state(manager: KVCacheManagerV2) -> dict[str, int]:
     }
 
 
-def _new_request(role: str, request_id: int, unique_id: int, endpoint: str) -> LlmRequest:
-    """Construct a real model-free generation-first request.
+def _new_request(
+    role: str, request_id: int, unique_id: int, endpoint: str, context_first: bool = False
+) -> LlmRequest:
+    """Construct a real model-free request with an immutable selected CTX instance.
 
     Args:
         role: CTX or GEN endpoint role.
         request_id: Local manager request identity.
         unique_id: Global no-retry disaggregated identity.
         endpoint: Selected CTX instance discovery endpoint.
+        context_first: Select the ordinary BF16 context-first protocol.
 
     Returns:
-        Request with one immutable selected CTX attention-DP cohort.
+        Request with one immutable selected CTX cohort.
     """
     import tensorrt_llm.bindings as bindings
     from tensorrt_llm import DisaggregatedParams, SamplingParams
@@ -350,8 +362,12 @@ def _new_request(role: str, request_id: int, unique_id: int, endpoint: str) -> L
     )
     request.py_disaggregated_params = DisaggregatedParams(
         disagg_request_id=unique_id,
-        schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
-        ctx_request_id=1 if role == "gen" else None,
+        schedule_style=(
+            DisaggScheduleStyle.CONTEXT_FIRST
+            if context_first
+            else DisaggScheduleStyle.GENERATION_FIRST
+        ),
+        ctx_request_id=(unique_id if context_first else 1) if role == "gen" else None,
         ctx_dp_rank=0 if role == "gen" else None,
         ctx_info_endpoint=endpoint if role == "gen" else None,
     )
@@ -366,7 +382,7 @@ def _regions(transceiver: KvCacheTransceiverV2, request: LlmRequest) -> list[tor
         request: Allocated request whose complete transfer extent is inspected.
 
     Returns:
-        One-dimensional uint8 GPU views of key and block-scale bytes, excluding padding.
+        One-dimensional uint8 GPU views of both storage roles, excluding padding.
     """
     import torch
 
@@ -393,8 +409,13 @@ def _regions(transceiver: KvCacheTransceiverV2, request: LlmRequest) -> list[tor
                         result.append(
                             convert_to_torch_tensor(TensorWrapper(key[0], torch.uint8, [key[1]]))
                         )
-    assert roles == {str(Role.KEY), str(Role.KEY_BLOCK_SCALE)}
-    assert len(result) == 2, "one allocated block must expose both key and block-scale storage"
+    expected_roles = (
+        {str(Role.KEY), str(Role.VALUE)}
+        if transceiver._context_first_ownership
+        else {str(Role.KEY), str(Role.KEY_BLOCK_SCALE)}
+    )
+    assert roles == expected_roles
+    assert len(result) == 2, "one allocated block must expose both expected storage roles"
     return result
 
 
@@ -434,25 +455,29 @@ def _worker(args: argparse.Namespace) -> None:
     assert MPI.Is_initialized() and MPI.Query_thread() == MPI.THREAD_MULTIPLE
     assert world.size == 2
     rank, role, directory, case = world.rank, args.role, Path(args.directory), args.case
+    root_directory = directory
+    context_first = args.context_first
     torch.cuda.set_device(args.gpu_offset + rank)
-    mapping = Mapping(world_size=2, rank=rank, tp_size=2, pp_size=1, enable_attention_dp=True)
+    mapping = Mapping(
+        world_size=2, rank=rank, tp_size=2, pp_size=1, enable_attention_dp=not context_first
+    )
     manager = KVCacheManagerV2(
         KvCacheConfig(
             max_tokens=128,
-            dtype="nvfp4",
+            dtype="auto" if context_first else "nvfp4",
             enable_block_reuse=False,
             host_cache_size=0,
             max_util_for_resume=1.0,
         ),
-        CacheTypeCpp.SELFKONLY,
+        CacheTypeCpp.SELF if context_first else CacheTypeCpp.SELFKONLY,
         num_layers=1,
-        num_kv_heads=1,
-        head_dim=576,
+        num_kv_heads=4 if context_first else 1,
+        head_dim=128 if context_first else 576,
         tokens_per_block=128,
         max_seq_len=256,
         max_batch_size=2,
         mapping=mapping,
-        dtype=DataType.NVFP4,
+        dtype=DataType.BF16 if context_first else DataType.NVFP4,
         max_num_tokens=128,
         is_disagg=True,
     )
@@ -473,7 +498,8 @@ def _worker(args: argparse.Namespace) -> None:
         ),
     )
     worker = transceiver._transfer_worker
-    assert transceiver._fp4_mla_bridge_enabled
+    assert transceiver._context_first_ownership == context_first
+    assert transceiver._fp4_mla_bridge_enabled == (not context_first)
     assert isinstance(worker._agent, BindingsNixlTransferAgent)
     assert not worker._agent.bounce_enabled
     assert {registration.type for registration in worker._registered_mem} == {"VRAM", "DRAM"}
@@ -508,7 +534,7 @@ def _worker(args: argparse.Namespace) -> None:
     )
     endpoint = json.loads((directory / "endpoint.json").read_text())["endpoint"]
     world.Barrier()
-    if rank == 1:
+    if rank == 1 and not context_first:
         _record(directory, f"{role}.1.blocked", state="MPI_Barrier")
         world.Barrier()
         transceiver.shutdown()
@@ -516,7 +542,11 @@ def _worker(args: argparse.Namespace) -> None:
         _record(directory, f"{role}.1.clean")
         return
 
-    request = _new_request(role, 1 if role == "ctx" else 2, args.unique_id, endpoint)
+    if context_first:
+        # Both ranks perform real transfers and consensus. Keep per-rank evidence
+        # separate; a successful rank must not overwrite a failing rank's record.
+        directory = root_directory / str(rank)
+    request = _new_request(role, 1 if role == "ctx" else 2, args.unique_id, endpoint, context_first)
     if role == "ctx":
         assert manager.prepare_context(request)
         assert manager.resize_context(request, request.prompt_len)
@@ -526,8 +556,9 @@ def _worker(args: argparse.Namespace) -> None:
         assert manager.prepare_disagg_gen_init(request)
     regions = _regions(transceiver, request)
     addresses = tuple((region.data_ptr(), region.numel()) for region in regions)
+    source_byte = 123 + rank if context_first else 123
     for region in regions:
-        region.fill_(123 if role == "ctx" else 17)
+        region.fill_(source_byte if role == "ctx" else 17)
     torch.cuda.synchronize()
     # Native quota is rounded to GPU granularity, not one physical block. Pin its
     # spare slots before either request clock starts, so only the tested block can
@@ -550,11 +581,11 @@ def _worker(args: argparse.Namespace) -> None:
     executor.kv_cache_manager = manager
     executor.resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
     executor.dist = transceiver._dist
-    executor.enable_attention_dp = True
+    executor.enable_attention_dp = not context_first
     executor._is_kv_manager_v2 = True
     executor._prefetched_request_ids = {request.py_request_id}
     executor.gather_all_responses = False
-    executor.result_wait_queues = {request.py_request_id: None}
+    executor.result_wait_queues = {request.py_request_id: None} if rank == 0 else {}
     assert executor.disagg is not None
     _record(
         directory,
@@ -585,7 +616,7 @@ def _worker(args: argparse.Namespace) -> None:
         status = submit(transfer_request)
         submissions.append(status)
         if case not in ("baseline", "cancel_before_publication") and len(submissions) == (
-            1 if case == "cancel_late_kv" else 2
+            1 if context_first or case == "cancel_late_kv" else 2
         ):
             gate = _MaskedCompletion(status, directory)
             masked.append(gate)
@@ -609,6 +640,9 @@ def _worker(args: argparse.Namespace) -> None:
             receive_session.process_aux_agent_result = Mock(
                 wraps=receive_session.process_aux_agent_result
             )
+            receive_session.process_kv_agent_result = Mock(
+                wraps=receive_session.process_kv_agent_result
+            )
             return receive_session
 
         worker.create_rx_session = observed_rx
@@ -629,9 +663,14 @@ def _worker(args: argparse.Namespace) -> None:
         manager.free_resources(request)
     else:
         if role == "gen":
+            if context_first:
+                _wait(
+                    lambda: (directory / "ctx.published.json").exists(),
+                    "context-first publication precedes destination fetch",
+                )
             transceiver.request_and_receive_async(request)
             session = transceiver._recv_sessions[args.unique_id]
-        else:
+        elif not context_first:
             transceiver.prepare_context_requests([request])
 
             def receiver_ready() -> bool:
@@ -646,8 +685,24 @@ def _worker(args: argparse.Namespace) -> None:
             _wait(receiver_ready, "generation-first peer request")
             transceiver.respond_and_send_async(request)
             session = transceiver._send_sessions[args.unique_id]
+        else:
+            transceiver.respond_and_send_async(request)
+            session = transceiver._send_sessions[args.unique_id]
+            assert request.context_phase_params.req_id == args.unique_id
+            _record(directory, "ctx.published")
+        assert session._enforce_physical_ownership and session._retirement is not None
+        assert session._need_aux == (not context_first)
         _exercise_live_session(
-            args, transceiver, request, session, regions, masked, submissions, fatal_check, executor
+            args,
+            transceiver,
+            request,
+            session,
+            regions,
+            masked,
+            submissions,
+            fatal_check,
+            executor,
+            directory,
         )
 
     _record(directory, f"{role}.finished", submissions=len(submissions))
@@ -659,7 +714,7 @@ def _worker(args: argparse.Namespace) -> None:
     transceiver.shutdown()
     filler.close()
     manager.shutdown()
-    _record(directory, f"{role}.0.clean")
+    _record(root_directory, f"{role}.{rank}.clean")
 
 
 def _exercise_live_session(
@@ -672,6 +727,7 @@ def _exercise_live_session(
     submissions: list[object],
     fatal_check: list[Callable[[QuiescenceFatalEvent], None]],
     executor: PyExecutor,
+    directory: Path,
 ) -> None:
     """Assert real allocation retention, stable outcome, and exact late settlement.
 
@@ -685,12 +741,17 @@ def _exercise_live_session(
         submissions: Native status roots proving real backend submissions.
         fatal_check: Receives the pre-abort observer before any test wait.
         executor: Model-free shell prepared before starting either request clock.
+        directory: Rendezvous directory unique to this active TP rank.
     """
     import torch
 
     from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 
-    role, case, directory = args.role, args.case, Path(args.directory)
+    role, case = args.role, args.case
+    context_first = args.context_first
+    peer_rank = transceiver._mapping.rank if context_first else 0
+    kv_masked = context_first or case == "cancel_late_kv"
+    expected_byte = 123 + peer_rank
     worker, manager = transceiver._transfer_worker, transceiver._kv_cache_manager
     rid, slot = args.unique_id, session.aux_slot
     addresses = tuple((region.data_ptr(), region.numel()) for region in regions)
@@ -721,8 +782,8 @@ def _exercise_live_session(
         assert worker._agent.deregister_memory.call_count == 0
         assert worker._registered_mem and not session.resources_drained()
         if role == "ctx" and masked:
-            task = session.kv_tasks[0] if case == "cancel_late_kv" else session.aux_task
-            operation = task._physical_operations[0]
+            task = session.kv_tasks[0] if kv_masked else session.aux_task
+            operation = task._physical_operations[peer_rank]
             assert operation.status is masked[0] and operation.request is not None
             assert masked[0].status is submissions[-1]
 
@@ -742,7 +803,9 @@ def _exercise_live_session(
         assert event.deadline == event.started_at + _TIMEOUT_S
         assert _TIMEOUT_S <= event.expired_at - event.started_at <= _TIMEOUT_S + 2.0
         with pytest.raises(RuntimeError, match="admission is closed"):
-            worker.create_tx_session(_new_request("ctx", 5, rid + 2, ""))
+            worker.create_tx_session(_new_request("ctx", 5, rid + 2, "", context_first))
+        with pytest.raises(RuntimeError, match="admission is closed"):
+            worker.create_rx_session(_new_request("gen", 6, rid + 4, "", context_first))
         assert not session.close()
         _record(
             directory,
@@ -759,10 +822,10 @@ def _exercise_live_session(
             "real native submission and DONE",
         )
         if role == "ctx":
-            assert len(submissions) == (1 if case == "cancel_late_kv" else 2)
+            assert len(submissions) == (1 if kv_masked else 2)
             assert masked[0].observed_done.is_set()
         retained()
-        assert all(bool(torch.all(region == 123)) for region in regions)
+        assert all(bool(torch.all(region == expected_byte)) for region in regions)
         probe = _new_request(role, 3, rid + 1, "")
         assert manager.prepare_context_cache(probe) is not None
         assert not manager.kv_cache_map[3].resize(128, 127), "live pages reused under pressure"
@@ -830,18 +893,19 @@ def _exercise_live_session(
             "supervisor commits software ambiguity injection",
         )
         if role == "ctx":
-            task = session.kv_tasks[0] if case == "cancel_late_kv" else session.aux_task
+            task = session.kv_tasks[0] if kv_masked else session.aux_task
             _wait(
-                lambda: task._physical_operations[0].state.name == "IN_DOUBT",
+                lambda: task._physical_operations[peer_rank].state.name == "IN_DOUBT",
                 "retained native handle enters IN_DOUBT",
             )
         else:
             owner = (
-                session._kv_tasks[0]._physical_owner
-                if case == "cancel_late_kv"
-                else session._aux_physical_owner
+                session._kv_tasks[0]._physical_owner if kv_masked else session._aux_physical_owner
             )
-            _wait(lambda: 0 in owner._in_doubt_writers, "actual IN_DOUBT report reaches receiver")
+            _wait(
+                lambda: peer_rank in owner._in_doubt_writers,
+                "actual IN_DOUBT report reaches receiver",
+            )
         retained()
         if case.endswith("fatal"):
             assert retirement._drain_started is not None
@@ -852,7 +916,10 @@ def _exercise_live_session(
             fatal_role = "ctx" if case == "source_fatal" else "gen"
             if role != fatal_role:
                 _wait(
-                    lambda: (directory / f"{fatal_role}.fatal.json").exists(),
+                    lambda: any(
+                        (path / f"{fatal_role}.fatal.json").exists()
+                        for path in _evidence_directories(Path(args.directory), context_first)
+                    ),
                     "opposite endpoint fatal",
                     _TIMEOUT_S + _PHASE_TIMEOUT_S,
                 )
@@ -868,6 +935,9 @@ def _exercise_live_session(
         _wait(
             lambda: (directory / "allow_done.json").exists(), "release exact retained native status"
         )
+        assert retirement._drain_started is not None
+        assert time.monotonic() < retirement._drain_started + retirement.timeout_s
+        assert worker._retirement_watchdog.fatal is None
 
     terminal_before = session.status if case != "baseline" else SessionStatus.TRANSFERRED
     results = []
@@ -913,13 +983,14 @@ def _exercise_live_session(
     if case == "baseline":
         assert any(result[0] == [rid] for result in results)
         if role == "ctx":
-            assert len(submissions) == 2 and all(status.is_completed() for status in submissions)
-        else:
+            assert len(submissions) == (1 if context_first else 2)
+            assert all(status.is_completed() for status in submissions)
+        elif not context_first:
             assert request.context_phase_params.first_gen_tokens
     else:
         assert not any(result[0] for result in results), "late DONE revived logical success"
-    if case != "cancel_late_kv":
-        assert all(bool(torch.all(region == 123)) for region in regions)
+    if context_first or case != "cancel_late_kv":
+        assert all(bool(torch.all(region == expected_byte)) for region in regions)
 
     assert executor._try_cancel_request(request)
     executor._do_terminate_request(request)
@@ -940,17 +1011,22 @@ def _exercise_live_session(
     replacement_slots = [aux.alloc_slot().id for _ in range(len(aux._free_slots))]
     assert slot in replacement_slots
     aux._first_tokens_buffer[slot].fill_(77)
-    aux_result = session.process_aux_agent_result.call_args if role == "gen" else None
+    report = (
+        (session.process_kv_agent_result if context_first else session.process_aux_agent_result)
+        if role == "gen"
+        else None
+    )
+    duplicate_result = report.call_args if report is not None else None
     for _ in range(3):
         assert session.close()
         assert not any(poll(0))
         if role == "gen":
-            assert aux_result is not None
-            session.process_aux_agent_result(*aux_result.args, **aux_result.kwargs)
+            assert duplicate_result is not None
+            report(*duplicate_result.args, **duplicate_result.kwargs)
         elif masked:
             assert masked[0].is_completed()
-            task = session.kv_tasks[0] if case == "cancel_late_kv" else session.aux_task
-            assert not task.poll_in_doubt_physical_operation(0)
+            task = session.kv_tasks[0] if kv_masked else session.aux_task
+            assert not task.poll_in_doubt_physical_operation(peer_rank)
     assert worker._aux_buffer.free_slot.call_count == 1
     assert slot in aux._occupied_slots and bool(torch.all(aux._first_tokens_buffer[slot] == 77))
     assert sum(call.args[0] is request for call in manager.free_resources.call_args_list) == 1
@@ -961,14 +1037,26 @@ def _exercise_live_session(
     _record(directory, f"{role}.reused_after_done", stable_outcome=session.status.name, sentinel=77)
 
 
-@pytest.mark.timeout(_WORKER_TIMEOUT_S + 4 * _TIMEOUT_S, method="signal")
-@pytest.mark.parametrize("case", _CASES)
-def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
-    """Qualify real GPU/NIXL software lifecycle with four GPUs and separate MPI jobs.
+def _evidence_directories(directory: Path, context_first: bool) -> list[Path]:
+    """Locate separate evidence for every active rank without merging observations.
+
+    Args:
+        directory: Supervisor rendezvous directory.
+        context_first: Both ranks are active in the non-ADP context-first profile.
+
+    Returns:
+        One directory per active rank in each endpoint job.
+    """
+    return [directory / str(rank) for rank in range(2)] if context_first else [directory]
+
+
+def _run_transfer_lifecycle_gpu(case: str, tmp_path: Path, context_first: bool) -> None:
+    """Run the shared four-GPU supervisor with real, separate CTX/GEN MPI jobs.
 
     Args:
         case: Distinct baseline, cancellation, late-settlement or containment contract.
         tmp_path: Persistent-per-test logs and rendezvous artifacts.
+        context_first: BF16 TP2 profile rather than the original FP4 ADP profile.
     """
     import torch
 
@@ -981,12 +1069,34 @@ def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
     environment.update(
         TLLM_DISABLE_MPI="0",
         MPI4PY_RC_THREAD_LEVEL="multiple",
-        TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE="1",
+        TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE="0" if context_first else "1",
         TRTLLM_DISAGG_NO_RETRY="1",
         TRTLLM_USE_PY_NIXL_KVCACHE="0",
         TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP="0",
         TRTLLM_DISAGG_LAYERWISE="0",
     )
+    if context_first:
+        environment["TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT"] = "1"
+        environment["TRTLLM_NIXL_KVCACHE_BACKEND"] = "UCX"
+    else:
+        environment.pop("TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT", None)
+    evidence_dirs = _evidence_directories(tmp_path, context_first)
+    for directory in evidence_dirs:
+        directory.mkdir(exist_ok=True)
+
+    def all_recorded(phase: str) -> bool:
+        """Require evidence from every active rank on both endpoint jobs."""
+        return all(
+            (directory / f"{role}.{phase}.json").exists()
+            for directory in evidence_dirs
+            for role in ("ctx", "gen")
+        )
+
+    def release_gate(name: str) -> None:
+        """Release the same test gate for every active rank."""
+        for directory in evidence_dirs:
+            _record(directory, name)
+
     unique_id = uuid.uuid4().int & ((1 << 62) - 1)
     jobs = {}
     # All ranks are local, so their monotonic clocks share this startup budget.
@@ -1006,6 +1116,7 @@ def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
                         sys.executable,
                         str(Path(__file__).resolve()),
                         "--worker",
+                        *(["--context-first"] if context_first else []),
                         "--case",
                         case,
                         "--role",
@@ -1034,23 +1145,27 @@ def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
                 deadline=startup_deadline,
             )
             _wait(
-                lambda: all(
-                    (tmp_path / f"{role}.allocated.json").exists()
-                    and (tmp_path / f"{role}.1.blocked.json").exists()
-                    for role in jobs
+                lambda: (
+                    all_recorded("allocated")
+                    and (
+                        context_first
+                        or all((tmp_path / f"{role}.1.blocked.json").exists() for role in jobs)
+                    )
                 ),
-                "real V2 allocations and both idle peers entering MPI_Barrier",
+                "real V2 allocations on every active rank",
                 deadline=startup_deadline,
             )
-            _record(tmp_path, "start")
+            release_gate("start")
             startup_complete = True
             if case not in ("baseline", "cancel_before_publication"):
                 _wait(
-                    lambda: all((tmp_path / f"{role}.prepared.json").exists() for role in jobs),
+                    lambda: all_recorded("prepared"),
                     "native DONE and measured allocator pressure on both endpoints",
                 )
                 clocks = [
-                    json.loads((tmp_path / f"{role}.prepared.json").read_text()) for role in jobs
+                    json.loads((directory / f"{role}.prepared.json").read_text())
+                    for directory in evidence_dirs
+                    for role in jobs
                 ]
                 # Preserve enough grace for both independent timeouts plus bounded rendezvous.
                 assert (
@@ -1063,31 +1178,37 @@ def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
                     ) + 2 * _PHASE_TIMEOUT_S < min(
                         clock["request_deadline"] + clock["timeout"] for clock in clocks
                     ), clocks
-                _record(tmp_path, "transition")
+                release_gate("transition")
                 _wait(
-                    lambda: all((tmp_path / f"{role}.retained.json").exists() for role in jobs),
+                    lambda: all_recorded("retained"),
                     "both sides retain real resources",
                     _TIMEOUT_S + 2 * _PHASE_TIMEOUT_S,
                 )
-                _record(tmp_path, "report_ambiguous")
+                release_gate("report_ambiguous")
                 _wait(
-                    lambda: all((tmp_path / f"{role}.in_doubt.json").exists() for role in jobs),
+                    lambda: all_recorded("in_doubt"),
                     "both endpoints retain explicit IN_DOUBT ownership",
                 )
                 if not case.endswith("fatal"):
-                    _record(tmp_path, "allow_done")
+                    release_gate("allow_done")
             if case.endswith("fatal"):
                 fatal_role = "ctx" if case == "source_fatal" else "gen"
                 survivor = "gen" if fatal_role == "ctx" else "ctx"
                 _wait(
-                    lambda: (tmp_path / f"{fatal_role}.fatal.json").exists(),
+                    lambda: any(
+                        (directory / f"{fatal_role}.fatal.json").exists()
+                        for directory in evidence_dirs
+                    ),
                     "asserted fatal decision",
                     _TIMEOUT_S + _PHASE_TIMEOUT_S,
                 )
                 jobs[fatal_role].wait(timeout=15)
                 assert jobs[fatal_role].returncode != 0
                 _wait(
-                    lambda: (tmp_path / f"{survivor}.survived.json").exists(),
+                    lambda: all(
+                        (directory / f"{survivor}.survived.json").exists()
+                        for directory in evidence_dirs
+                    ),
                     "independent peer survives",
                 )
                 assert jobs[survivor].poll() is None
@@ -1102,14 +1223,43 @@ def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
         finally:
             try:
                 if not startup_complete:
-                    _report_startup_failure(jobs, tmp_path)
+                    _report_startup_failure(jobs, tmp_path, context_first)
             finally:
                 _stop_owned_jobs(jobs, tmp_path)
+
+
+@pytest.mark.timeout(_WORKER_TIMEOUT_S + 4 * _TIMEOUT_S, method="signal")
+@pytest.mark.parametrize("case", _CASES)
+def test_transfer_lifecycle_gpu(case: str, tmp_path: Path) -> None:
+    """Qualify the original generation-first FP4 ADP software lifecycle.
+
+    Args:
+        case: Baseline, cancellation, late-settlement or containment contract.
+        tmp_path: Persistent-per-test logs and rendezvous artifacts.
+    """
+    _run_transfer_lifecycle_gpu(case, tmp_path, context_first=False)
+
+
+@pytest.mark.gpu4
+@pytest.mark.timeout(_WORKER_TIMEOUT_S + 4 * _TIMEOUT_S, method="signal")
+@pytest.mark.parametrize("case", _CONTEXT_FIRST_CASES)
+def test_context_first_bf16_lifecycle_gpu(case: str, tmp_path: Path) -> None:
+    """Qualify K/V retention and late/fatal settlement with both TP2 ranks active.
+
+    Native DONE is masked only after the real write completes. Fatal cases prove
+    software fail-stop of both ranks, not outstanding-DMA fencing or replacement.
+
+    Args:
+        case: Baseline, late KV completion, or source/destination fatal contract.
+        tmp_path: Per-rank native identities, pool evidence, and pre-cleanup exit checks.
+    """
+    _run_transfer_lifecycle_gpu(case, tmp_path, context_first=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker", action="store_true", required=True)
+    parser.add_argument("--context-first", action="store_true")
     parser.add_argument("--case", choices=_CASES, required=True)
     parser.add_argument("--role", choices=("ctx", "gen"), required=True)
     parser.add_argument("--gpu-offset", type=int, required=True)

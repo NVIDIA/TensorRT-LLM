@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
 from ..attention.attention import _helix_cp_allgather_input, _helix_cp_output_projection
@@ -627,7 +628,7 @@ class LagunaForCausalLM(SpecDecOneEngineForCausalLM[LagunaModel, PretrainedConfi
 # ---------------------------------------------------------------------------
 
 
-@register_mapper("HF", "LagunaForCausalLM")
+@register_mapper(CheckpointFormat.HF, "LagunaForCausalLM")
 class LagunaHfWeightMapper(HfWeightMapper):
     def preprocess_weights(self, weights: dict) -> dict:
         weights = self.rename_by_params_map(
@@ -679,6 +680,6 @@ class LagunaHfWeightMapper(HfWeightMapper):
             module.load_weights(weights=[updated], allow_partial_loading=allow_partial_loading)
 
 
-@register_mapper("HF", "DFlashLagunaForCausalLM")
+@register_mapper(CheckpointFormat.HF, "DFlashLagunaForCausalLM")
 class DFlashLagunaHfWeightMapper(LagunaHfWeightMapper):
     """The DFlash drafter is a Laguna model; reuse Laguna's weight mapper."""

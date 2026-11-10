@@ -50,6 +50,7 @@ from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.distributed.ops import cp_allgather
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
 from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import CpType, Mapping
@@ -389,6 +390,10 @@ def _run_mla_distributed(
     # This decode fixture populates each rank's cache from a different token
     # chunk. Complete, replicated-input prefill outputs are checked separately.
     activate_all_ranks_for_context(attn_metadata, position_ids_ctx_rank)
+    # This disaggregated decode fixture already supplies rank-local token
+    # shards. Populate them directly; applying the aggregated owner plan
+    # again would shard the fixture's history twice.
+    attn_metadata.helix_context_local_slots = None
     ctx_output = input_ctx_rank.new_empty(
         [input_ctx_rank.shape[0], mla.mha.num_heads * mla.v_head_dim], dtype=input_ctx_rank.dtype
     )
@@ -413,8 +418,12 @@ def _run_mla_distributed(
         enable_context_mla_with_cached_kv=True,
     )
     extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
-    with model_extra_attrs(extra_attrs):
-        output = mla(position_ids_gen, input_gen, attn_metadata, latent_cache_gen=latent_cache_gen)
+    # The o_proj all-reduce returns NCCL-window tensors, whose leases must be released by a
+    # scope rather than a tensor destructor. The clone outlives the scope for the accuracy check.
+    with model_extra_attrs(extra_attrs), nccl_window_tensor_scope(input_gen):
+        output = mla(
+            position_ids_gen, input_gen, attn_metadata, latent_cache_gen=latent_cache_gen
+        ).clone()
     print(f"Rank {rank} {world_size}-GPU: result: {output[0, :8]} / {output[-1, -8:]}")
 
     kv_cache_manager.shutdown()
@@ -634,10 +643,18 @@ def _v_up_builder(kv_b_weight, kv_b_scale, *, num_heads, cp_size, cp_rank, nope,
     return module
 
 
+@pytest.mark.parametrize("obsolete_flag", [None, "0", "1"])
 @pytest.mark.parametrize("cp_rank", [0, 1])
-def test_helix_v_up_weight_from_fp8_kv_b(cp_rank: int):
+def test_helix_v_up_weight_from_fp8_kv_b(
+    cp_rank: int, obsolete_flag: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """MLA dequantizes every tp-local head's V weight from the loaded FP8 kv_b_proj; this rank's
     dequantized V chunk becomes a view of it."""
+    # K3 leaves loaded FP8 block scales for the MLA post-load walk to bind.
+    if obsolete_flag is None:
+        monkeypatch.delenv("TRTLLM_HELIX_V_UP_BEFORE_A2A", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_HELIX_V_UP_BEFORE_A2A", obsolete_flag)
     h, n, v, k, cp = 4, 128, 128, 256, 2
     generator = torch.Generator().manual_seed(cp_rank)
     weight = (torch.randn(h * (n + v), k, generator=generator) * 64).to(torch.float8_e4m3fn)
@@ -662,7 +679,15 @@ def test_helix_v_up_weight_from_fp8_kv_b(cp_rank: int):
     )
 
 
-def test_helix_v_up_weight_views_bf16_kv_b():
+@pytest.mark.parametrize("obsolete_flag", [None, "0", "1"])
+def test_helix_v_up_weight_views_bf16_kv_b(
+    obsolete_flag: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The common MLA binding owns the BF16 K3 layout as well.
+    if obsolete_flag is None:
+        monkeypatch.delenv("TRTLLM_HELIX_V_UP_BEFORE_A2A", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_HELIX_V_UP_BEFORE_A2A", obsolete_flag)
     h, n, v, k = 4, 64, 128, 256
     weight = torch.randn(h * (n + v), k, dtype=torch.bfloat16)
     module = _v_up_builder(weight, None, num_heads=h, cp_size=2, cp_rank=0, nope=n, v=v, k=k)

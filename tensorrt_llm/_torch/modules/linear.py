@@ -40,6 +40,7 @@ from ..._utils import get_sm_version, is_sm_100f, is_sm_120f
 from ...models.modeling_utils import QuantConfig
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
+from ..kernels.fused_ops.fp8_static_quant import fp8_static_quant
 from ..locality_domain.layout import (make_bf16_linear_output_layout,
                                       make_nvfp4_linear_output_layout)
 from ..locality_domain.policy import (DISABLED_PLAN, LinearPartitionPlan,
@@ -47,9 +48,9 @@ from ..locality_domain.policy import (DISABLED_PLAN, LinearPartitionPlan,
                                       LocalityDomainPolicy)
 from ..locality_domain.runtime import LocalityDomainRuntime
 from ..locality_domain_utils import _copy_to_new_cuda_allocation
-from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_torch_compiling, replace_parameter_and_save_metadata,
-                     unswizzle_sf)
+from ..utils import (Fp4QuantizedTensor, Fp8PerTokenQuantizedTensor,
+                     get_model_extra_attrs, is_torch_compiling,
+                     replace_parameter_and_save_metadata, unswizzle_sf)
 from .low_m_gemm import (_should_apply_low_m_gemm, apply_low_m_gemm,
                          low_m_gemm_dispatcher)
 
@@ -130,6 +131,23 @@ def _fp8_per_tensor_uses_cute_dsl_sm107() -> bool:
     # Opt-in until an LLM API option exists; SM107 only.
     return (get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
             and os.environ.get("USE_CUTE_DSL_FP8_PER_TENSOR_MM", "0") == "1")
+
+
+# Below this size the C++ quantize kernel is as fast on the GPU and cheaper to
+# launch; above it the Triton kernel sustains more HBM bandwidth.
+_TRITON_STATIC_FP8_QUANT_MIN_NUMEL = 1 << 23
+
+
+def _static_quantize_e4m3_per_tensor(input: torch.Tensor,
+                                     scale: torch.Tensor) -> torch.Tensor:
+    """FP8 per-tensor quantization of ``input`` with the static ``scale``."""
+    if (not is_torch_compiling() and input.dtype == torch.bfloat16
+            and input.is_contiguous()
+            and input.numel() >= _TRITON_STATIC_FP8_QUANT_MIN_NUMEL):
+        return fp8_static_quant(input, scale)
+    qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+        input, scale)
+    return qinput
 
 
 def _fp8_block_scales_uses_cute_dsl_sm107(module) -> bool:
@@ -887,7 +905,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         if input.dtype != torch.float8_e4m3fn:
             if static_input_scale is not None:
                 # Static quantization
-                qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                qinput = _static_quantize_e4m3_per_tensor(
                     input, static_input_scale)
             else:
                 # Dynamic quantization
@@ -1278,11 +1296,15 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
         # fp8_rowwise_gemm requires a 2D mat1; flatten here and unflatten the output below.
         orig_shape = input.shape
-        if input.dim() > 2:
+        if len(orig_shape) > 2:
+            assert not isinstance(input, Fp8PerTokenQuantizedTensor), (
+                "Fp8PerTokenQuantizedTensor must be [num_tokens, hidden]")
             input = input.reshape(-1, input.shape[-1])
 
+        if isinstance(input, Fp8PerTokenQuantizedTensor):
+            qinput, cur_input_scale = input.fp8_tensor, input.per_token_scale
         # FP8 tensor inputs are from attention. Directly use ones as scale.
-        if input.dtype == torch.float8_e4m3fn:
+        elif input.dtype == torch.float8_e4m3fn:
             qinput = input
             cur_input_scale = torch.ones(input.shape[0],
                                          device=input.device,
@@ -1293,7 +1315,7 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
                 qinput, cur_input_scale = torch.ops.trtllm.tunable_fp8_per_token_quant(
                     input)
             else:
-                qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(
+                qinput, cur_input_scale = torch.ops.tensorrt_llm.vectorized_per_token_fp8_quant(
                     input)
 
         # This op does not support bias now.
@@ -3182,23 +3204,27 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
         elm_packing = 2 if module.tp_mode == TensorParallelMode.COLUMN else 1
         load_weights_vanilla_helper(module, weights, elm_packing=elm_packing)
 
-        # Use the same device as the weight tensor
-        # as we register pre_quant_scale after sharded model weights are moved to respective gpus
-        device = module.weight.device
-        pre_quant_scale = module.load_shard(
-            weights[0]["pre_quant_scale"],
-            # pre_quant_scale applies to activation as opposed to weight, so flip tp_mode the other way around
-            flip_tp=True,
-            device=device,
-        )
+        pre_quant_scale = weights[0].get("pre_quant_scale")
+        if pre_quant_scale is not None:
+            # Use the device of the loaded weight for the activation scale.
+            device = module.weight.device
+            pre_quant_scale = module.load_shard(
+                pre_quant_scale,
+                # Activation scales shard along the input dimension.
+                flip_tp=True,
+                device=device,
+            )
 
-        module.pre_quant_scale = Parameter(
-            torch.ones((module.in_features, ), dtype=pre_quant_scale.dtype),
-            requires_grad=False).to(device=device)
+            module.pre_quant_scale = Parameter(
+                torch.ones((module.in_features, ), dtype=pre_quant_scale.dtype),
+                requires_grad=False).to(device=device)
+
+            copy_weight(module.pre_quant_scale, pre_quant_scale)
+        else:
+            module.pre_quant_scale = None
 
         weight_scale = self.load_weight_scales(module, weights)[0]
 
-        copy_weight(module.pre_quant_scale, pre_quant_scale)
         copy_weight(module.weight_scale, weight_scale.T.contiguous())
 
     def load_weights_fused_qkv_linear(self, module: Linear,
@@ -5187,18 +5213,19 @@ def is_static_nvfp4_input_eligible(linear) -> bool:
     eligible to have its input-quantize folded into a producing RMSNorm.
 
     Eligible iff the Linear quantizes activations to NVFP4, has a calibrated
-    (static) `input_scale`, has no AWQ `pre_quant_scale`, and is not forced to
-    dynamic quantization. This is the single canonical definition shared by
-    every NVFP4-fold site (the layer-boundary / dense folds in
-    modeling_deepseekv3.py and the q_a_layernorm -> q_b_proj fold in
-    attention.py's MLA) so the gate cannot drift between them.
+    (static) `input_scale`, has no AWQ `pre_quant_scale`, is not forced to
+    dynamic quantization, and accepts a pre-quantized input. This is the single
+    canonical definition shared by every NVFP4-fold site (the layer-boundary /
+    dense folds in modeling_deepseekv3.py and the q_a_layernorm -> q_b_proj fold
+    in attention.py's MLA) so the gate cannot drift between them.
     """
     if linear is None:
         return False
     return (getattr(linear, "has_nvfp4_activation_quantization", False)
             and not getattr(linear, "force_dynamic_quantization", False)
             and getattr(linear, "input_scale", None) is not None
-            and getattr(linear, "pre_quant_scale", None) is None)
+            and getattr(linear, "pre_quant_scale", None) is None
+            and not getattr(linear, "requires_unquantized_activation", False))
 
 
 def is_dynamic_nvfp4_input_eligible(linear) -> bool:
@@ -5215,6 +5242,7 @@ def is_dynamic_nvfp4_input_eligible(linear) -> bool:
 class NVFP4ARCLinearMethod(NVFP4LinearMethod):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
+    requires_unquantized_activation: ClassVar[bool] = True
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):

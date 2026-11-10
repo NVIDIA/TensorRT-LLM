@@ -1,0 +1,13 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+## Tag `feature` — one feature on the target
+
+The target's core is built and its gates pass. Your task adds one feature
+(your task's `ref`, one of `task.yaml`'s `features`), or makes the target
+serve one configuration variant as well. **Every check the target passed
+keeps passing**: with the feature off, the target runs as it did. Your task's
+checks say what the feature must pass. A feature that needs an entry the
+vocabulary lacks blocks as a `vocabulary_gap`, as the core would. **Load the
+`trtllm-modeling-v2-features` skill first**: where the feature lives in the
+engine, what the target must honour for it, and how to prove it from a CPU
+check up to its gate.

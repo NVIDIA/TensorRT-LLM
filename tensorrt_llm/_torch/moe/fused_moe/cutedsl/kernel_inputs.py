@@ -24,6 +24,7 @@ import torch
 
 from tensorrt_llm.math_utils import ceil_div
 
+from ....kernels.nvfp4_quant import can_use_nvfp4_quant, nvfp4_quant
 from ....utils import Fp4QuantizedTensor
 from ..impl_base import MoEImplBase
 from ..impl_contract import MoERunContext
@@ -41,6 +42,17 @@ class NvFp4WeightView:
     fc2_global_scale: torch.Tensor
     expert_size_per_partition: int
     slot_start: int
+
+
+def prequantized_nvfp4_input_scale(backend: MoEImplBase) -> torch.Tensor | None:
+    """``quantize_input_nvfp4`` passes an unswizzled ``Fp4QuantizedTensor`` through, except on
+    a layer with a pre-quant activation scale (NVFP4_AWQ / NVFP4_ARC).
+
+    Shared by the CuteDSL NVFP4 leaves through a direct binding, so the passthrough
+    rule has one owner next to :func:`quantize_input_nvfp4`."""
+    if getattr(backend, "fc31_act_scale", None) is not None:
+        return None
+    return backend.fc31_input_scale
 
 
 def finalize_routing_scales(backend: MoEImplBase, ctx: MoERunContext) -> torch.Tensor:
@@ -70,17 +82,21 @@ def quantize_input_nvfp4(
     self: MoEImplBase,
     x: torch.Tensor | Fp4QuantizedTensor,
     post_quant_comm: bool = True,
+    *,
+    enable_triton: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``x`` to NVFP4, or unpack an already-quantized input.
 
-    The ``quantize_input`` the CuteDSL NVFP4 leaves bind. On an NVFP4_AWQ /
-    NVFP4_ARC layer, ``x`` is first scaled by ``fc31_act_scale``, the
-    checkpoint's per-channel pre-quant scale.
+    The shared helper used by CuteDSL NVFP4 leaves through a direct binding
+    or wrapper. On an NVFP4_AWQ / NVFP4_ARC layer, ``x`` is first scaled by
+    ``fc31_act_scale``, the checkpoint's per-channel pre-quant scale.
 
     Args:
         x: ``[num_tokens, hidden_size]`` bfloat16 activations, or an
             unswizzled ``Fp4QuantizedTensor`` quantized upstream.
         post_quant_comm: Ignored; both paths produce the same layout.
+        enable_triton: Allow tiled quantization for eligible inputs on this
+            NVFP4-capable backend. False uses the CUDA quantizer.
 
     Returns:
         ``(x, x_sf)``: packed FP4 ``[num_tokens, hidden_size // 2]`` and linear
@@ -100,6 +116,12 @@ def quantize_input_nvfp4(
             "Fp4QuantizedTensor should not be swizzled before communication"
         )
         x, x_sf = x.fp4_tensor, x.scaling_factor
+    elif (
+        enable_triton
+        and self.scaling_vector_size == 16
+        and can_use_nvfp4_quant(x, self.fc31_input_scale)
+    ):
+        x, x_sf = nvfp4_quant(x, self.fc31_input_scale)
     else:
         x, x_sf = torch.ops.trtllm.fp4_quantize(
             x, self.fc31_input_scale, self.scaling_vector_size, False, False

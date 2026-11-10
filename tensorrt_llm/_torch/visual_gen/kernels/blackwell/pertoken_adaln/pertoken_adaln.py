@@ -408,8 +408,8 @@ def _launch(
         hash_key = (device, vec, *PerTokenAdaLN.make_hash_key(*torch_tensors))
         compiled_fn = _COMPILE_CACHE.get(hash_key)
         if compiled_fn is None:
-            if torch.cuda.get_device_capability(device) != (10, 0):
-                raise ValueError("fused per-token AdaLN requires an SM100 GPU")
+            if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
+                raise ValueError("fused per-token AdaLN requires an SM100 or SM103 GPU")
             kernel = PerTokenAdaLN(D, vec)
             fake_sig_args = [_to_fake_cute_arg(t) for t in torch_tensors]
             compiled_fn = cute.compile(kernel, *fake_sig_args, options="--enable-tvm-ffi")

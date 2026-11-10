@@ -37,6 +37,9 @@ struct LamportComm
     {
         counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
         flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
+        // Bytes the previous Lamport kernel wrote to its sub-buffer. Every Lamport kernel on this workspace reads and
+        // writes it, whatever its dtype, so it stays in bytes. Readers round it up to whole 16-byte stores: the scalar
+        // MiniMax kernel writes 4-byte words.
         clear_ptr = &reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[0];
         flag_value = *flag_ptr;
         auto comm_size = reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[1];
@@ -298,7 +301,7 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport(MiniMa
     }
 #endif
     LamportComm<NRanks> comm(params.workspace, params.rank);
-    int clear_access = comm.clear_size / kElemsPerAccess<DType>;
+    int clear_access = static_cast<int>((comm.clear_size + sizeof(float4) - 1) / sizeof(float4));
     for (int idx = access_id; idx < tot_access; idx += access_stride, token_id += token_stride)
     {
         alignas(16) DType vals[kElemsPerAccess<DType>];
@@ -380,7 +383,7 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport(MiniMa
         // Clear comm buffer that previous kernel used
         reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
     }
-    comm.update(tot_tokens * NRanks * sizeof(float) / sizeof(DType));
+    comm.update(static_cast<int64_t>(tot_tokens) * NRanks * sizeof(float));
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     if constexpr (TriggerCompletionAtEnd)
     {
@@ -682,7 +685,7 @@ __global__ void __launch_bounds__(1024) minimax_reduce_qk_rms_kernel_lamport_flo
     }
 
     // Clear comm buffer
-    int clear_access = static_cast<int>(comm.clear_size / (sizeof(float4) / sizeof(DType)));
+    int clear_access = static_cast<int>((comm.clear_size + sizeof(float4) - 1) / sizeof(float4));
     int clear_stride = group_stride * blockDim.x;
 
     for (int idx = group_id * blockDim.x + threadIdx.x; idx < clear_access; idx += clear_stride)
@@ -690,7 +693,7 @@ __global__ void __launch_bounds__(1024) minimax_reduce_qk_rms_kernel_lamport_flo
         reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
     }
 
-    comm.update((2 * tot_groups * TokenPerBlock * sizeof(float) / sizeof(DType) * NRanks));
+    comm.update(static_cast<int64_t>(2) * tot_groups * TokenPerBlock * sizeof(float) * NRanks);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     if constexpr (TriggerCompletionAtEnd)
     {

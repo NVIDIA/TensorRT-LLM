@@ -190,8 +190,6 @@ list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_blockscale_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fp4_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "allreduce_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "low_latency_gemm/.*")
-list(REMOVE_ITEM ALL_SRCS
-     "${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu")
 
 message(
   VERBOSE
@@ -219,11 +217,6 @@ set_cuda_architectures(fb_gemm_src ${CUTLASS_COMMON_ARCHS})
 
 add_library(fp8_blockscale_gemm_src STATIC ${FP8_BLOCKSCALE_GEMM_SRC_CU})
 set_cuda_architectures(fp8_blockscale_gemm_src ${CUTLASS_COMMON_ARCHS})
-
-set(GEMM_SWIGLU_SM90_SRC_CU
-    ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu)
-add_library(gemm_swiglu_sm90_src STATIC ${GEMM_SWIGLU_SM90_SRC_CU})
-set_cuda_architectures(gemm_swiglu_sm90_src 90)
 
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   file(GLOB LOW_LATENCY_GEMM_SRC_CU
@@ -311,8 +304,7 @@ endif()
 
 set(ALL_KERNELS_LIB)
 
-set(TARGET_LIB
-    fpA_intB_gemm_src;fb_gemm_src;fp8_blockscale_gemm_src;gemm_swiglu_sm90_src)
+set(TARGET_LIB fpA_intB_gemm_src;fb_gemm_src;fp8_blockscale_gemm_src)
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   list(APPEND TARGET_LIB low_latency_gemm_src)
 endif()

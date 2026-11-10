@@ -27,6 +27,7 @@ from torch._higher_order_ops.effects import _EffectType, _register_effectful_op
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm import deep_gemm
+from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
@@ -41,6 +42,7 @@ from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from . import mxfp8_cute_pinned_tactics as _mxfp8_cute_pinned
 from .fast_custom_op import fast_custom_op
 
 if IS_FLASHINFER_AVAILABLE:
@@ -395,7 +397,7 @@ def fused_moe(
     except RuntimeError as e:
         error_msg = str(e)
         if "DeepGEMM only supports Hopper" in error_msg:
-            raise RuntimeError(
+            raise UnsupportedError(
                 f"{error_msg}"
                 "Note: This is the Cutlass backend with DeepGemm JIT path. "
                 "For Blackwell (SM100+) support, please use the DEEPGEMM backend instead."
@@ -811,6 +813,13 @@ class FlashInferMXFP8GemmRunner(TunableRunner):
             backend = "cutlass"
             context = nullcontext()
         else:
+            # Above 32 rows on SM107, for a model that opts in: the pinned tuned tactic (bitwise the
+            # heuristic's output, faster); see mxfp8_cute_pinned_tactics. Otherwise, or with no entry:
+            # FlashInfer's heuristic config.
+            pinned = _mxfp8_cute_pinned.run(act, act_scale, weight,
+                                            weight_scale, self.output_dtype)
+            if pinned is not None:
+                return pinned
             # Skip FlashInfer's CuTeDSL config sweep; use its heuristic config.
             backend = "cute-dsl"
             context = _flashinfer_autotune(tune_mode=False,
@@ -2224,6 +2233,13 @@ class Fp8QuantKernelRunner(TunableRunner):
         return a
 
 
+# The deep_gemm package compiles each layout with nvcc and releases the GIL
+# meanwhile (its kernel caches are only touched with the GIL held), so the
+# autotuner drives the JIT of a sweep's distinct layouts on a thread pool
+# (TuningConfig.parallel_jit_warmup; -1 sizes it from this rank's CPUs).
+_DEEP_GEMM_JIT_WARMUP_THREADS = -1
+
+
 class fp8SwapABGemmRunner(TunableRunner):
     """Runs quantize + DeepGemm FP8 GEMM. Single tactic for JIT warmup."""
 
@@ -2239,6 +2255,7 @@ class fp8SwapABGemmRunner(TunableRunner):
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, deep_gemm_jit_warmup_buckets), ),
         exclude_from_cache=True,
+        parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
     )
 
     def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool,
@@ -2286,14 +2303,14 @@ class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
     """Runs DeepGemm with pre-quantized FP8 activations and packed scales."""
 
     # The same step-16 grid as the other two DeepGemm runners: a layout no
-    # bucket selects is compiled mid-inference instead, and DeepGemm forks
-    # nvcc while holding the GIL.
+    # bucket selects is compiled mid-inference instead.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, deep_gemm_jit_warmup_buckets), ),
         constraint_specs=(ConstraintSpec(
             1, 0, lambda input_shapes: input_shapes[0][0]), ),
         exclude_from_cache=True,
+        parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
     )
 
     def __init__(self, output_dtype: torch.dtype,
@@ -2438,7 +2455,10 @@ def _(
 # cubins and compiles nothing.
 class Fp8BlockScalingGemmRunner(TunableRunner):
     # Without exclude_from_cache, a warm disk cache short-circuits tuning and
-    # the JIT warmup never runs.
+    # the JIT warmup never runs. The warmup stays serial (no
+    # parallel_jit_warmup): on Hopper the kernels come from the C++ DeepGEMM
+    # JIT in cpp/include/tensorrt_llm/deep_gemm, whose runtime cache is not
+    # safe to use from several threads, and the op runs without the GIL.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, deep_gemm_jit_warmup_buckets), ),
@@ -2697,6 +2717,16 @@ def _(
     return gate.new_empty(gate.shape, dtype=o_dtype)
 
 
+# The AllReduce tuner profiles NCCL_SYMMETRIC by pre-allocating two NCCL window buffers of [2 x max_num_tokens, hidden]
+# (plus registration) inside the memory-profiling warm-up, so they shrink the KV pool even where NCCL_SYMMETRIC never
+# wins (agg TP2: only NCCL / ONESHOT are picked; ~1.24 GiB per rank of KV, GEMM-AR 803388).
+# TRTLLM_AR_TUNE_NCCL_SYMMETRIC=0 leaves it out of the candidates (no windows) and makes plain NCCL the cache-miss
+# fallback; the default keeps stock behavior.
+_AR_TUNE_NCCL_SYMMETRIC = os.environ.get("TRTLLM_AR_TUNE_NCCL_SYMMETRIC",
+                                         "1") == "1"
+_AR_TUNE_NCCL_SYMMETRIC_LOGGED = False
+
+
 class AllReduceRunner(TunableRunner):
     _prealloc_lock: ClassVar[threading.Lock] = threading.Lock()
     _prealloc_done: ClassVar[set] = set()
@@ -2745,7 +2775,7 @@ class AllReduceRunner(TunableRunner):
             self.input_dtype,
             self.op,
             self.input_uses_nccl_window,
-            self.exclude_nccl_symmetric,
+            self.exclude_nccl_symmetric or not _AR_TUNE_NCCL_SYMMETRIC,
         )
 
     @classmethod
@@ -2807,10 +2837,16 @@ class AllReduceRunner(TunableRunner):
         profile: OptimizationProfile,
         **kwargs,
     ) -> List[int]:
-        valid_strategies = [
-            AllReduceStrategy.NCCL_SYMMETRIC.value,
-            AllReduceStrategy.NCCL.value,
-        ]
+        global _AR_TUNE_NCCL_SYMMETRIC_LOGGED
+        valid_strategies = [AllReduceStrategy.NCCL.value]
+        if _AR_TUNE_NCCL_SYMMETRIC:
+            valid_strategies.insert(0, AllReduceStrategy.NCCL_SYMMETRIC.value)
+        elif not _AR_TUNE_NCCL_SYMMETRIC_LOGGED:
+            _AR_TUNE_NCCL_SYMMETRIC_LOGGED = True
+            logger.info(
+                "[tunable_allreduce] AR tuner: NCCL_SYMMETRIC left out (no NCCL window buffers "
+                "pre-allocated); cache-miss fallback is NCCL (TRTLLM_AR_TUNE_NCCL_SYMMETRIC=0)"
+            )
         if self.exclude_nccl_symmetric:
             valid_strategies = [AllReduceStrategy.NCCL.value]
         # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
@@ -2870,6 +2906,9 @@ class AllReduceRunner(TunableRunner):
             if cache_entry is None:
                 continue
             _, tactic, _ = cache_entry
+            if ((self.exclude_nccl_symmetric or not _AR_TUNE_NCCL_SYMMETRIC)
+                    and tactic == AllReduceStrategy.NCCL_SYMMETRIC.value):
+                tactic = AllReduceStrategy.NCCL.value
             torch.ops.trtllm.register_allreduce_tactic(input, residual,
                                                        norm_weight, scale, bias,
                                                        workspace, self.group,
@@ -2900,11 +2939,12 @@ class AllReduceRunner(TunableRunner):
             return input
         if tactic == -1:
             # tactic == -1 means the autotuner cache missed for this shape.
-            # Fall back to NCCL_SYMMETRIC; asymmetric ncclMemAlloc failures are handled
+            # Honor the environment policy; asymmetric ncclMemAlloc failures are handled
             # by a cross-rank barrier in NCCLWindowAllocator which falls back
             # to plain NCCL.
-            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
-        if (self.exclude_nccl_symmetric
+            tactic = (AllReduceStrategy.NCCL_SYMMETRIC.value if
+                      _AR_TUNE_NCCL_SYMMETRIC else AllReduceStrategy.NCCL.value)
+        if ((self.exclude_nccl_symmetric or not _AR_TUNE_NCCL_SYMMETRIC)
                 and tactic == AllReduceStrategy.NCCL_SYMMETRIC.value):
             tactic = AllReduceStrategy.NCCL.value
 

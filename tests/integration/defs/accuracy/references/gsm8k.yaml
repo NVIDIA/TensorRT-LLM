@@ -120,6 +120,15 @@ deepseek-ai/DeepSeek-V4-Flash:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 95.11
+  # MXFP4 routed experts served as NVFP4_PLUS (E2M1 activations with UE5M3
+  # block scales) on the CuteDSL MoE; the rest of the model is unchanged, so
+  # quant_algo still reports FP8_BLOCK_SCALES. test_nvfp4_plus measures 95.45
+  # on 4x Rubin (SM107) at TP=4/EP=4 with attention DP, and test_auto_dtype
+  # (MXFP4 W4A8 on the TRTLLM MoE) 95.75 on the same node, so the reference
+  # stays level with the FP8_BLOCK_SCALES row above.
+  - quant_algo: FP8_BLOCK_SCALES
+    extra_acc_spec: moe_quant_algo=NVFP4_PLUS
+    accuracy: 95.11
   # DeepSeek-V4-Flash-nvfp4-DSpark: the same weights plus the DSpark drafter
   # for target layers 40-42, with the routed experts cast MXFP4 -> NVFP4.
   # MIXED_PRECISION is what the checkpoint's hf_quant_config declares (NVFP4
@@ -384,6 +393,10 @@ google/gemma-3n-E2B-it:
   - accuracy: 72.176
 google/gemma-4-E2B-it:
   - accuracy: 85.709
+swiss-ai/Apertus-8B-Instruct-2509:
+  - accuracy: 57.56
+swiss-ai/Apertus-v1.5-8B:
+  - accuracy: 77.56
 mistralai/Ministral-8B-Instruct-2410:
   - accuracy: 79.25
   - quant_algo: FP8
@@ -616,3 +629,7 @@ zai-org/GLM-5.3-Flash:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 92.91
+  # RTX PRO 6000 TP4/EP4, NVFP4 checkpoint with FP8 KV cache, harness protocol.
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 92.87

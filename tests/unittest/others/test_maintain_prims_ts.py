@@ -320,6 +320,7 @@ class World(m.GitHub):
                 ["git", "-C", str(remote), "rev-parse", "--verify", f"refs/heads/{branch}"],
                 capture_output=True,
                 text=True,
+                timeout=60,
             )
             if result.returncode:
                 raise RuntimeError("HTTP 404")

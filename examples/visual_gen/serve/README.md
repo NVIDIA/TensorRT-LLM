@@ -359,7 +359,7 @@ Examples:
 - **LTX-2**: `stg_scale`, `stg_blocks`, `modality_scale`, `guidance_rescale`, `output_type`, ...
 - **Wan 2.2 A14B**: `guidance_scale_2`, `boundary_ratio`
 - **Wan 2.1 / Flux**: no model-specific `extra_params` declared
-- **Cosmos3**: `condition_video_latent_indexes`, `condition_video_keep` (V2V conditioning), `flow_shift`, `use_system_prompt`; Action's `action_mode`, `domain_name`, `domain_id`, `raw_action_dim`, `action_chunk_size`, `action`, `use_state`, `action_resolution`, `action_fps`; and the transfer hints `edge`/`blur`/`depth`/`seg`/`wsm` with `control_guidance`, `control_guidance_interval`, `num_video_frames_per_chunk`, ... (see below)
+- **Cosmos3**: `condition_video_latent_indexes`, `condition_video_keep` (V2V conditioning), `flow_shift`, `sigma_grid` (see the Cosmos3 example README), `use_system_prompt`; Action's `action_mode`, `domain_name`, `domain_id`, `raw_action_dim`, `action_chunk_size`, `action`, `use_state`, `action_resolution`, `action_fps`; and the transfer hints `edge`/`blur`/`depth`/`seg`/`wsm` with `control_guidance`, `control_guidance_interval`, `num_video_frames_per_chunk`, ... (see below)
 
 ##### Cosmos3 transfer hints
 
@@ -432,6 +432,32 @@ curl -X POST "http://localhost:8000/v1/videos" \
   -F "size=256x256" \
   -F "guidance_scale=5.0"
 ```
+
+### Omni inputs: text, image, video, and audio
+
+A single request can combine `prompt`, `image_reference`, `video_reference`, and
+`audio_reference`. This contract applies to any model that declares the relevant
+reference slots; unsupported modalities and model-specific reference limits are
+rejected. Both `/v1/videos` and `/v1/videos/sync` accept JSON reference objects
+(or lists of objects) and multipart uploads. Repeat a multipart reference field
+for multiple files. Uploads and JSON reference objects/lists can also be mixed
+under the same field, preserving their order within that modality.
+
+Start the server with a model and configuration that support the requested
+combination of inputs. Follow that model's setup instructions for media-decoding
+dependencies, supported formats, and sample rates. For example:
+
+```bash
+curl -X POST "http://localhost:8000/v1/videos" \
+  -F 'prompt=Animate the subject using the reference motion and sound.' \
+  -F 'image_reference=@./subject.png' \
+  -F 'image_reference=@./style.png' \
+  -F 'video_reference=@./motion.mp4' \
+  -F 'audio_reference=@./sound.wav'
+```
+
+Reference roles, count limits, and cross-modality ordering are defined by the
+loaded model. Pass any supported model-specific options through `extra_params`.
 
 ### Video-to-Video (Multipart with File Upload, Cosmos3)
 ```bash

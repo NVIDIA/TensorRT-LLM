@@ -48,6 +48,16 @@ QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen2-dense-target-layout-v1"
 # Stable contract for unquantized Qwen3 dense fused-QKV and fused-gate-up
 # tensors, Q/K norm state, and target-only receiver finalization.
 QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-dense-target-layout-v1"
+# Stable contract for Qwen3 dense rows with FP8 block-scale (128x128) weights:
+# every Linear the realized quant config quantizes holds E4M3 weights [N, K],
+# FP32 [ceil(N/128), ceil(K/128)] block scales, and 0-dim FP32 `input_scale`
+# and `inv_input_scale` as loaded (1.0 unless a non-fused projection's
+# checkpoint stores an input scale). All other tensors, the Q/K norm state, and
+# the target-only receiver finalization follow the Qwen3 dense contract, and no
+# one-shot transform changes them.
+QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1 = (
+    "trtllm-qwen3-dense-fp8-block128-fp32scale-target-layout-v1"
+)
 # Stable contract for unquantized Mistral dense fused-QKV and fused-gate-up
 # tensors plus target-only receiver finalization. Mistral shares the dense
 # decoder base class with Llama but is a distinct root with its own contract.
@@ -63,6 +73,13 @@ PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-phi3-dense-target-layout-v1"
 # Q/K norm state, fused gate-up MLP tensors, and complete-model receiver
 # finalization.
 QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3_5-dense-vl-complete-layout-v1"
+# Stable contract for unquantized Qwen3 MoE fused-QKV tensors, Q/K norm state,
+# the replicated router weight, CUTLASS routed-expert tensors (`w3_w1_weight`
+# with the up projection before the gate projection, and `w2_weight`)
+# partitioned by MoE TP or EP, and target-only receiver finalization. Routed
+# expert layouts differ per MoE implementation, so another implementation
+# needs its own ID.
+QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3-moe-cutlass-target-layout-v1"
 _MISSING = object()
 
 
@@ -132,6 +149,26 @@ def _canonical_optional_string(container: object, attribute: str) -> str | None:
     return "none" if value is None else _canonical_string(value)
 
 
+def _declared_weight_block_size(pretrained_config: object) -> tuple[int, ...] | None:
+    """Return the weight block size a checkpoint's quantization config declares.
+
+    Hugging Face FP8 checkpoints declare `weight_block_size` in
+    `quantization_config`, either as a dict entry or as an attribute of a parsed
+    config. The result is `None` when no block size is declared or the value is
+    not a non-empty sequence of `int`, so a row that constrains
+    `weight_block_sizes` rejects it.
+    """
+    quantization_config = getattr(pretrained_config, "quantization_config", None)
+    if isinstance(quantization_config, dict):
+        block_size = quantization_config.get("weight_block_size")
+    else:
+        block_size = getattr(quantization_config, "weight_block_size", None)
+    if not isinstance(block_size, (list, tuple)) or not block_size:
+        return None
+    canonical_block_size = tuple(_canonical_int(value) for value in block_size)
+    return None if None in canonical_block_size else canonical_block_size
+
+
 @dataclass(frozen=True)
 class PostTransformConfigIdentity:
     """Canonical model identity captured before constructor normalization."""
@@ -175,6 +212,8 @@ class PostTransformRuntimeConfig:
     cp_size: int | None
     moe_tp_size: int | None
     moe_ep_size: int | None
+    # MoE cluster (smart-router) parallel size from the final mapping.
+    moe_cluster_size: int | None
     attention_tp_size: int | None
     attention_cp_size: int | None
     attention_dp: bool | None
@@ -185,12 +224,36 @@ class PostTransformRuntimeConfig:
     # Realized sliding-window attention: `none`, `uniform`, `mixed`, or `None`
     # when the constructed model does not determine it.
     sliding_window: str | None
+    # SM version (`major * 10 + minor`) of the GPU that runs the load, or `None`
+    # when the caller did not supply it. Quantized transforms can realize a
+    # different tensor layout per architecture. A row that constrains
+    # `sm_versions` rejects an unknown SM, so the default fails closed.
+    sm_version: int | None = None
+    # Weight block size declared by the checkpoint's Hugging Face quantization
+    # config, or `None` when it declares none. A row that constrains
+    # `weight_block_sizes` rejects an undeclared block size.
+    weight_block_size: tuple[int, ...] | None = None
 
     @classmethod
     def from_model_config(
-        cls, model_config: object, *, model: nn.Module | None = None
+        cls,
+        model_config: object,
+        *,
+        model: nn.Module | None = None,
+        sm_version: int | None = None,
     ) -> "PostTransformRuntimeConfig":
-        """Capture the support-matrix dimensions from a final model config."""
+        """Capture the support-matrix dimensions from a final model config.
+
+        Args:
+            model_config: Final model config of the concrete load.
+            model: Constructed root model, used for dimensions that only the
+                built modules realize.
+            sm_version: SM version of the device that runs the load. The caller
+                supplies it so this module does not depend on CUDA.
+
+        Returns:
+            The canonical runtime dimensions of the load.
+        """
 
         pretrained_config = getattr(model_config, "pretrained_config", None)
         quant_config = getattr(model_config, "quant_config", None)
@@ -241,6 +304,7 @@ class PostTransformRuntimeConfig:
             cp_size=_canonical_int(getattr(mapping, "cp_size", None)),
             moe_tp_size=_canonical_int(getattr(mapping, "moe_tp_size", None)),
             moe_ep_size=_canonical_int(getattr(mapping, "moe_ep_size", None)),
+            moe_cluster_size=_canonical_int(getattr(mapping, "moe_cluster_size", None)),
             attention_tp_size=_canonical_int(getattr(mapping, "attn_tp_size", None)),
             attention_cp_size=_canonical_int(getattr(mapping, "attn_cp_size", None)),
             attention_dp=_canonical_bool(getattr(mapping, "enable_attention_dp", None)),
@@ -251,6 +315,8 @@ class PostTransformRuntimeConfig:
             rope_type=rope_type,
             rope_fusion=rope_fusion,
             sliding_window=sliding_window,
+            sm_version=_canonical_int(sm_version),
+            weight_block_size=_declared_weight_block_size(pretrained_config),
         )
 
 
@@ -273,6 +339,7 @@ class PostTransformRuntimeConstraints:
         ("cp_sizes", "cp_size"),
         ("moe_tp_sizes", "moe_tp_size"),
         ("moe_ep_sizes", "moe_ep_size"),
+        ("moe_cluster_sizes", "moe_cluster_size"),
         ("attention_tp_sizes", "attention_tp_size"),
         ("attention_cp_sizes", "attention_cp_size"),
         ("attention_dp", "attention_dp"),
@@ -281,6 +348,8 @@ class PostTransformRuntimeConstraints:
         ("rope_types", "rope_type"),
         ("rope_fusion", "rope_fusion"),
         ("sliding_windows", "sliding_window"),
+        ("sm_versions", "sm_version"),
+        ("weight_block_sizes", "weight_block_size"),
     )
 
     dtypes: frozenset[str | None] | None = None
@@ -297,6 +366,7 @@ class PostTransformRuntimeConstraints:
     cp_sizes: frozenset[int | None] | None = None
     moe_tp_sizes: frozenset[int | None] | None = None
     moe_ep_sizes: frozenset[int | None] | None = None
+    moe_cluster_sizes: frozenset[int | None] | None = None
     attention_tp_sizes: frozenset[int | None] | None = None
     attention_cp_sizes: frozenset[int | None] | None = None
     attention_dp: frozenset[bool | None] | None = None
@@ -305,6 +375,8 @@ class PostTransformRuntimeConstraints:
     rope_types: frozenset[str | None] | None = None
     rope_fusion: frozenset[bool | None] | None = None
     sliding_windows: frozenset[str | None] | None = None
+    sm_versions: frozenset[int | None] | None = None
+    weight_block_sizes: frozenset[tuple[int, ...] | None] | None = None
 
     def __post_init__(self) -> None:
         for constraint_name, _runtime_name in self._DIMENSIONS:
@@ -372,6 +444,12 @@ class PostTransformFeature(str, Enum):
 
     SEPARATE_DRAFT_MODEL = "separate_draft_model"
     LOCALITY_DOMAIN_LOCALIZED_WEIGHTS = "localized_weights"
+    # A realized MoE expert-parallel load balancer (EPLB) places experts in
+    # slots that can differ per rank and migrate at runtime.
+    MOE_LOAD_BALANCER = "moe_load_balancer"
+    # DWDP installs its own expert storage range on every MoE layer while the
+    # mapping reports MoE TP and EP sizes of 1.
+    DWDP = "dwdp"
 
 
 class PostTransformQualificationReason(str, Enum):
@@ -539,6 +617,24 @@ class PostTransformQualificationDecision:
         return (
             self.profile.transform_abi_id if self.qualified and self.profile is not None else None
         )
+
+    def describe(self) -> str:
+        """Render the reason and the details this decision reports, for logs and errors.
+
+        For example `reason=feature_not_supported; unsupported_features=dwdp`.
+        Empty details are omitted: `qualify()` stops at a runtime mismatch
+        before it checks features, so an empty feature set there does not mean
+        that no unsupported feature is active.
+        """
+
+        parts = [f"reason={self.reason.value}"]
+        if self.unsupported_runtime_dimensions:
+            dimensions = ",".join(sorted(self.unsupported_runtime_dimensions))
+            parts.append(f"unsupported_runtime_dimensions={dimensions}")
+        if self.unsupported_features:
+            features = ",".join(sorted(feature.value for feature in self.unsupported_features))
+            parts.append(f"unsupported_features={features}")
+        return "; ".join(parts)
 
 
 @dataclass(frozen=True)
