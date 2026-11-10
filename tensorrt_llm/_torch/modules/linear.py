@@ -649,6 +649,8 @@ class LinearMethodBase(ABC):
 
 
 # Rows in every GEMM when a row's output must not depend on its batch shape.
+# Larger values pad short batches more, smaller ones split long prompts into
+# more GEMMs.
 FIXED_GEMM_HEIGHT = 64
 
 

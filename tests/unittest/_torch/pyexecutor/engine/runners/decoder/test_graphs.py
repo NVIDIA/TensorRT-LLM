@@ -58,7 +58,6 @@ def test_cuda_graph_factory_preserves_input_preparer(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.cpu_only
 @pytest.mark.parametrize("switch", ["FORCE_DETERMINISTIC", "FORCE_KV_REUSE_DETERMINISTIC"])
 def test_batch_shape_determinism_keeps_final_context_on_context_path(
     monkeypatch: pytest.MonkeyPatch, switch: str
@@ -95,6 +94,7 @@ def test_batch_shape_determinism_keeps_final_context_on_context_path(
     assert promoted_ids == frozenset()
 
 
+@pytest.mark.cpu_only
 class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_generation_only_is_identity(self) -> None:
         generation = _make_request_stub(1)
