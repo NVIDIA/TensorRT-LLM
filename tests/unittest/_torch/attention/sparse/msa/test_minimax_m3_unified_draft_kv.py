@@ -1010,6 +1010,10 @@ def test_unify_gate(
         assert reason is None
     else:
         assert reason is not None and blocker in reason
+    if is_disagg and env == "1" and blocker is not None and creator._speculative_config is not None:
+        # Required sharing that a blocker refuses stops the worker at startup.
+        with pytest.raises(ValueError, match=re.escape(blocker)):
+            creator._check_shared_draft_kv_request()
     if unifies == _RAISES:
         match = re.escape(blocker) + r".*TRTLLM_DISAGG_SHARED_DRAFT_KV=0 on every worker"
         with pytest.raises(ValueError, match=match):
