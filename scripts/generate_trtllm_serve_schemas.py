@@ -195,7 +195,7 @@ def _dwdp_launch_rules() -> list[dict]:
 
 def generate_serve_schema() -> dict:
     """Describe the YAML fragment merged with ordinary serving CLI arguments."""
-    from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, InternalRequestAuthKey
+    from tensorrt_llm.commands.serve_cli._serve_options import LIVE_OBJECT_PATHS, yaml_options
     from tensorrt_llm.llmapi.llm_args import (
         SERVE_CONFIG_ALIASES,
         MoeLoadBalancerConfig,
@@ -210,12 +210,14 @@ def generate_serve_schema() -> dict:
     properties = schema["properties"]
     for alias, name in SERVE_CONFIG_ALIASES.items():
         properties[alias] = copy.deepcopy(properties[name])
-    # Keep server-only fields aligned with serve.py.
-    properties.update(
-        allow_request_chat_template={"type": "boolean", "default": False},
-        internal_request_auth_key=_schema_for(InternalRequestAuthKey),
-        disagg_cluster=_nullable(_schema_for(DisaggClusterConfig, schema)),
-    )
+    # Server-only keys and live objects are declared in
+    # tensorrt_llm/commands/serve_cli/_serve_options.py.
+    for option in yaml_options("serve"):
+        if option.yaml_json_schema is not None:
+            key_schema = copy.deepcopy(dict(option.yaml_json_schema))
+        else:
+            key_schema = _schema_for(option.yaml_type, schema)
+        properties[option.yaml_key] = _nullable(key_schema) if option.yaml_nullable else key_schema
     # Serving treats null as unset before constructing the non-optional telemetry model.
     properties["telemetry_config"] = _nullable(properties["telemetry_config"])
     # Keep accepted forms aligned with TorchLlmArgs.validate_load_balancer(): a mapping
@@ -282,18 +284,15 @@ def generate_serve_schema() -> dict:
         {"properties": {name: {"const": 0} for name in pair}},
         {"properties": {name: {"minimum": 1} for name in pair}, "required": list(pair)},
     ]
-    # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.
-    # Update these restrictions when hooks are added or gain YAML construction support.
-    for name in ("batched_logits_processor", "checkpoint_loader", "_mpi_session"):
-        properties[name] = {
-            "type": "null",
-            "description": "Live objects require the Python LLM API.",
-        }
+    # Live objects are Python API hooks, not arbitrary YAML mappings; their paths
+    # and schema fragments are declared next to the server-only options.
+    for live in LIVE_OBJECT_PATHS:
+        if live.schema_model is None:
+            holder = properties
+        else:
+            holder = schema["$defs"][live.schema_model]["properties"]
+        holder[live.schema_property] = copy.deepcopy(dict(live.json_schema))
     schema["allOf"] = _dwdp_launch_rules()
-    schema["$defs"]["RayPlacementConfig"]["properties"]["placement_groups"] = {"type": "null"}
-    user_draft = schema["$defs"]["UserProvidedDecodingConfig"]["properties"]
-    user_draft["drafter"] = {"not": {}, "description": "A Drafter requires the Python LLM API."}
-    user_draft["resource_manager"] = {"type": "null"}
     # Update this mapping exception when the YAML loader changes legacy DecodingConfig support.
     properties["decoding_config"] = {"type": ["object", "null"]}
     return schema

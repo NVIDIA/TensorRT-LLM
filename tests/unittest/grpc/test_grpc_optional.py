@@ -324,11 +324,6 @@ def test_serve_openengine_missing_grpc_shows_install_hint(
     monkeypatch.setattr(serve_module, "get_is_diffusion_only_model", lambda _model: False)
     monkeypatch.setattr(serve_module, "collect_explicit_cli_keys", lambda **_: set())
     monkeypatch.setattr(
-        serve_module,
-        "update_llm_args_with_extra_dict",
-        lambda llm_args, _extra, **_: llm_args,
-    )
-    monkeypatch.setattr(
         serve_module._command_telemetry,
         "apply_raw_config_telemetry_opt_out",
         lambda *_args, **_kwargs: None,

@@ -26,6 +26,8 @@ from typing import Any, NamedTuple
 import yaml
 from pydantic import BaseModel
 
+from tensorrt_llm.commands.serve_cli._serve_options import reserved_set_paths
+
 _PATH_COMPONENT_RE = re.compile(r"^[a-z_][A-Za-z0-9_]*$")
 _MAX_VALUE_DEPTH = 64
 _MAX_VALUE_NODES = 10_000
@@ -42,21 +44,9 @@ class ConfigOverrideError(ValueError):
     """A safe-to-display error in a configuration override."""
 
 
-_RESERVED_PATH_REASONS = {
-    ("model",): "use the MODEL positional argument",
-    ("backend",): "use --backend",
-    ("telemetry_config",): "use --telemetry or --no-telemetry",
-    ("env_overrides",): "set environment overrides in the YAML config",
-    ("internal_request_auth_key",): "keep authentication keys in the YAML config",
-    ("allow_request_chat_template",): "use --allow_request_chat_template",
-    ("disagg_cluster",): "use --disagg_cluster_uri or the YAML config",
-    ("batched_logits_processor",): "use the Python LLM API for live objects",
-    ("checkpoint_loader",): "use the Python LLM API for live objects",
-    ("mpi_session",): "use the Python LLM API for live objects",
-    ("ray_placement_config", "placement_groups"): "use the Python LLM API for live objects",
-    ("speculative_config", "drafter"): "use the Python LLM API for live objects",
-    ("speculative_config", "resource_manager"): "use the Python LLM API for live objects",
-}
+# CLI-owned paths, the server-only YAML keys and the live-object paths, each with
+# the reason shown when --set names it; declared in serve_cli/_serve_options.py.
+_RESERVED_PATH_REASONS = reserved_set_paths()
 
 
 def _format_path(path: Sequence[str]) -> str:

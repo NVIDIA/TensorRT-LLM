@@ -16,9 +16,9 @@
 
 Each test pins two things for one function on the serve config path: the
 mapping the caller passed in is unchanged after the call, and the value handed
-downstream is the one today's code hands down. ``_pop_bool_config_option`` is
-the one declared exception (removing the key from the caller's mapping is the
-effect both callers need) and has no test here.
+downstream is the one today's code hands down. The server-only YAML keys leave
+a copy of the YAML in ``ConfigSources.resolve()``, which has its own tests in
+``test_serve_cli_config_sources.py``.
 """
 
 import copy

@@ -599,7 +599,6 @@ def _assert_serving_fields_in_schema(source: str, function_name: str, properties
         if isinstance(node, ast.FunctionDef) and node.name == function_name
     )
     config_names = {"llm_args", "llm_args_dict", "llm_args_extra_dict", "raw_llm_args_extra_dict"}
-    helpers = {"_pop_bool_config_option"}
     fields = set()
     for node in ast.walk(function):
         mapping = key = None
@@ -610,8 +609,6 @@ def _assert_serving_fields_in_schema(source: str, function_name: str, properties
                 "setdefault",
             }:
                 mapping, key = node.func.value, node.args[0]
-            elif isinstance(node.func, ast.Name) and node.func.id in helpers and len(node.args) > 1:
-                mapping, key = node.args[:2]
         elif isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load):
             mapping, key = node.value, node.slice
         if (
@@ -653,7 +650,6 @@ def test_serving_yaml_fields_have_schema(
         'llm_args_extra_dict.pop("new_serving_option", None)',
         'llm_args_dict.setdefault("new_serving_option", False)',
         'llm_args["new_serving_option"]',
-        '_pop_bool_config_option(llm_args_extra_dict, "new_serving_option")',
         'validate_internal_request_auth_key(llm_args_extra_dict.pop("new_serving_option", None))',
     ],
 )
@@ -668,7 +664,7 @@ def test_serving_field_guard_ignores_unrelated_and_nested_keys() -> None:
     source = """
 def serve():
     request.get("not_a_config_field")
-    _pop_bool_config_option(other_mapping, "not_a_config_field")
+    other_mapping.pop("not_a_config_field", False)
     llm_args.get(dynamic_key)
     llm_args["internal_only_field"] = True
     llm_args["kv_cache_config"]["nested_field"]

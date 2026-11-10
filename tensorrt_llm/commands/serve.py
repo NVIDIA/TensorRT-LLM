@@ -48,23 +48,26 @@ from tensorrt_llm._utils import mpi_rank, set_prometheus_multiproc_dir
 from tensorrt_llm.commands import _telemetry as _command_telemetry
 from tensorrt_llm.commands._config_overrides import (ConfigOverride,
                                                      ConfigOverrideError,
-                                                     apply_config_overrides,
                                                      parse_config_overrides)
 from tensorrt_llm.commands._serve_stability import stability_option
 from tensorrt_llm.commands.mooncake import mooncake_master, mooncake_pool_report
+from tensorrt_llm.commands.serve_cli._config_sources import ConfigSources
 from tensorrt_llm.commands.serve_cli._net import (_bind_listener,
                                                   _diagnose_port_in_use,
                                                   _listener_address_family,
                                                   _publish_bound_address)
+from tensorrt_llm.commands.serve_cli._serve_options import \
+    first_unsupported_grpc_option
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
-from tensorrt_llm.llmapi.disagg_utils import (
-    DisaggClusterConfig, DisaggServerConfig, MetadataServerConfig, ServerRole,
-    extract_disagg_cluster_config, parse_disagg_config_file,
-    parse_metadata_server_config_file, validate_config_bool,
-    validate_internal_request_auth_key)
+from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
+                                              DisaggServerConfig,
+                                              MetadataServerConfig, ServerRole,
+                                              extract_disagg_cluster_config,
+                                              parse_disagg_config_file,
+                                              parse_metadata_server_config_file)
 from tensorrt_llm.llmapi.llm_args import (SERVE_CLI_CONFIG_FIELDS,
                                           KvCacheConnectorConfig, SleepConfig,
                                           TorchLlmArgs, build_cli_config)
@@ -164,10 +167,6 @@ def _apply_effective_telemetry_config(llm_args: dict,
     return llm_args
 
 
-def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
-    return validate_config_bool(config.pop(key, False), key)
-
-
 def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
     """Import and register middleware objects on a FastAPI app."""
     for middleware in middlewares:
@@ -247,15 +246,6 @@ def _parse_config_overrides(
             assignments,
             allowed_roots=_LLM_ARGS_FIELDS,
         )
-    except ConfigOverrideError as error:
-        raise click.BadParameter(str(error), param_hint="--set") from error
-
-
-def _apply_config_overrides(
-        config: Dict[str, Any],
-        overrides: Sequence[ConfigOverride]) -> Dict[str, Any]:
-    try:
-        return apply_config_overrides(config, overrides)
     except ConfigOverrideError as error:
         raise click.BadParameter(str(error), param_hint="--set") from error
 
@@ -1667,36 +1657,24 @@ def serve(
             agent_types=agent_types,
             explicit_cli_keys=explicit_cli_keys)
 
-        llm_args_extra_dict = dict(raw_llm_args_extra_dict)
-        extra_allow_request_chat_template = _pop_bool_config_option(
-            llm_args_extra_dict, "allow_request_chat_template")
-        allow_request_chat_template = (allow_request_chat_template
-                                       or extra_allow_request_chat_template)
-        internal_disagg_auth_key = validate_internal_request_auth_key(
-            llm_args_extra_dict.pop("internal_request_auth_key", None))
-        # Apply to the raw mapping first so a higher-precedence override can
-        # replace an invalid YAML value before nested config construction.
-        llm_args_extra_dict = _apply_config_overrides(llm_args_extra_dict,
-                                                      parsed_config_overrides)
-        set_top_level_fields = {
-            override.path[0]
-            for override in parsed_config_overrides if len(override.path) == 1
-        }
-        merge_explicit_cli_keys = explicit_cli_keys - set_top_level_fields
-        llm_args = update_llm_args_with_extra_dict(
-            llm_args,
-            llm_args_extra_dict,
-            explicit_cli_keys=merge_explicit_cli_keys)
-        # Reapply to the effective mapping so --set remains the final source
-        # even when an explicit convenience flag targets the same nested field.
-        llm_args = _apply_config_overrides(llm_args, parsed_config_overrides)
+        resolved = ConfigSources(command="serve",
+                                 yaml=raw_llm_args_extra_dict,
+                                 cli_llm_args=llm_args,
+                                 cli_explicit=frozenset(explicit_cli_keys),
+                                 overrides=parsed_config_overrides).resolve()
+        llm_args = resolved.llm_args
+        allow_request_chat_template = (
+            allow_request_chat_template
+            or resolved.server_yaml["allow_request_chat_template"])
+        internal_disagg_auth_key = resolved.server_yaml[
+            "internal_request_auth_key"]
         if enable_sleep_mode and llm_args.get("sleep_config") is None:
             llm_args = {**llm_args, "sleep_config": SleepConfig()}
 
         llm_args = _resolve_default_num_serve_frontends(
             llm_args,
             requested=("num_serve_frontends" in explicit_cli_keys
-                       or "num_serve_frontends" in llm_args_extra_dict),
+                       or "num_serve_frontends" in resolved.llm_yaml),
             port=port,
             grpc=grpc,
             report_addr=report_addr,
@@ -1716,8 +1694,7 @@ def serve(
 
         # Specify disagg_cluster_config in config file or through command line "--disagg_cluster_uri",
         # but disagg_cluster_uri takes precedence over cluster uri in config file
-        disagg_cluster_config = llm_args.get("disagg_cluster")
-        llm_args = {k: v for k, v in llm_args.items() if k != "disagg_cluster"}
+        disagg_cluster_config = resolved.server_yaml["disagg_cluster"]
         if disagg_cluster_config:
             disagg_cluster_config = extract_disagg_cluster_config(
                 disagg_cluster_config, disagg_cluster_uri)
@@ -1754,34 +1731,28 @@ def serve(
                     "Multiple gRPC frontends require --grpc-protocol openengine."
                 )
 
-            # gRPC mode: launch gRPC server instead of OpenAI HTTP server
-            # Check for unsupported arguments that are silently ignored in gRPC mode
-            unsupported_args = {
-                "tool_parser":
-                tool_parser,
-                "middleware":
-                middleware if middleware else None,
-                "chat_template":
-                chat_template,
-                "allow_request_chat_template":
-                allow_request_chat_template
-                if allow_request_chat_template else None,
-                "internal_request_auth_key":
-                internal_disagg_auth_key
-                if grpc_protocol != "openengine" else None,
-                "metadata_server_config_file":
-                metadata_server_config_file,
-                "server_role":
-                server_role,
-                "disagg_cluster_config":
-                disagg_cluster_config,
-            }
-            for name, value in unsupported_args.items():
-                if value is not None:
-                    raise ValueError(
-                        f"Argument '{name}' is not supported when running in gRPC mode. "
-                        f"The gRPC server is designed for use with external routers that handle "
-                        f"these features (e.g., tool parsing, chat templates).")
+            # gRPC mode: launch gRPC server instead of OpenAI HTTP server.
+            # Reject the HTTP-only options the gRPC server would silently
+            # ignore; which ones is declared in serve_cli/_serve_options.py.
+            unsupported = first_unsupported_grpc_option(
+                grpc_protocol, {
+                    "tool_parser": tool_parser,
+                    "middleware": middleware,
+                    "chat_template": chat_template,
+                    "allow_request_chat_template": allow_request_chat_template,
+                    "internal_request_auth_key": internal_disagg_auth_key,
+                    "metadata_server_config_file": metadata_server_config_file,
+                    "server_role": server_role,
+                    "disagg_cluster_config": disagg_cluster_config,
+                    "media_io_kwargs": media_io_kwargs,
+                    "num_input_processor_workers": num_input_processor_workers,
+                    "num_media_load_workers": num_media_load_workers,
+                })
+            if unsupported is not None:
+                raise ValueError(
+                    f"Argument '{unsupported}' is not supported when running in gRPC mode. "
+                    f"The gRPC server is designed for use with external routers that handle "
+                    f"these features (e.g., tool parsing, chat templates).")
             if grpc_protocol == "smg":
                 if find_spec("smg_grpc_proto") is None:
                     raise ValueError(
@@ -2023,12 +1994,15 @@ def serve_encoder(
         component="server",
         explicit_cli_telemetry="telemetry" in explicit_cli_keys,
     )
-    extra_allow_request_chat_template = _pop_bool_config_option(
-        encoder_args_extra_dict, "allow_request_chat_template")
-    allow_request_chat_template = (allow_request_chat_template
-                                   or extra_allow_request_chat_template)
-    encoder_args = update_llm_args_with_extra_dict(
-        llm_args, encoder_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
+    resolved = ConfigSources(
+        command="mm_embedding_serve",
+        yaml=encoder_args_extra_dict,
+        cli_llm_args=llm_args,
+        cli_explicit=frozenset(explicit_cli_keys)).resolve()
+    encoder_args = resolved.llm_args
+    allow_request_chat_template = (
+        allow_request_chat_template
+        or resolved.server_yaml["allow_request_chat_template"])
 
     encoder_args = _apply_effective_telemetry_config(encoder_args,
                                                      telemetry=telemetry)
@@ -2157,8 +2131,11 @@ def serve_embedding(
         component="server",
         explicit_cli_telemetry="telemetry" in explicit_cli_keys,
     )
-    llm_args = update_llm_args_with_extra_dict(
-        llm_args, extra_dict, explicit_cli_keys=explicit_cli_keys)
+    llm_args = ConfigSources(
+        command="embeddings",
+        yaml=extra_dict,
+        cli_llm_args=llm_args,
+        cli_explicit=frozenset(explicit_cli_keys)).resolve().llm_args
 
     llm_args = _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
 
