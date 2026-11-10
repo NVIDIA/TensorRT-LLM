@@ -645,8 +645,47 @@ def accuracy_test_path(repo_root: Path | str, family: str, target: str) -> str:
     return f"modeling_v2/{family}/{target}/test_accuracy.py"
 
 
-def check_test_registration(repo_root: Path, accuracy_test: str) -> list[Check]:
-    """The accuracy gate is on a list CI actually reads."""
+def _listed_stage_gpus(text: str, wanted: str) -> list[int | None]:
+    """The GPUs of each stage of one test list that runs ``wanted``.
+
+    A test list is blocks of a ``condition`` and the ``tests`` it selects. A block's
+    ``system_gpu_count`` range is the GPUs its stage has, every node's for a multi-node stage;
+    ``None`` stands for a block that does not say. A file that does not parse as such blocks
+    says nothing.
+    """
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return []
+    found: list[int | None] = []
+    for blocks in data.values() if isinstance(data, dict) else ():
+        for block in blocks if isinstance(blocks, list) else ():
+            if not isinstance(block, dict):
+                continue
+            paths = {
+                entry.split()[0].split("::")[0].rstrip("/")
+                for entry in block.get("tests") or ()
+                if isinstance(entry, str) and entry.strip()
+            }
+            if not any(wanted == path or wanted.startswith(f"{path}/") for path in paths):
+                continue
+            condition = block.get("condition")
+            ranges = condition.get("ranges") if isinstance(condition, dict) else None
+            count = ranges.get("system_gpu_count") if isinstance(ranges, dict) else None
+            upper = count.get("lte", count.get("gte")) if isinstance(count, dict) else None
+            found.append(upper if isinstance(upper, int) else None)
+    return found
+
+
+def check_test_registration(
+    repo_root: Path, accuracy_test: str, *, engine_gpus: int | None = None
+) -> list[Check]:
+    """The accuracy gate is on a list CI actually reads.
+
+    ``engine_gpus`` is the width of the widest gated member whose engine spans more than one
+    node: its cases run only in a stage that has that many GPUs, so one of the lists has to be
+    for such a stage (the tree's multi-node lists).
+    """
     test_path = repo_root / ACCURACY_TESTS_DIR / accuracy_test
     checks = [
         Check(
@@ -659,12 +698,16 @@ def check_test_registration(repo_root: Path, accuracy_test: str) -> list[Check]:
     # Test-db entries name tests relative to the defs root, by file or by a directory above it.
     wanted = f"{Path(ACCURACY_TESTS_DIR).name}/{accuracy_test}"
     listed: list[str] = []
+    stages: dict[str, list[int | None]] = {}
     if db.is_dir():
         for yml in sorted(db.glob("*.yml")):
-            entries = re.findall(r"^\s*-\s+(\S+)", yml.read_text(encoding="utf-8"), re.MULTILINE)
+            text = yml.read_text(encoding="utf-8")
+            entries = re.findall(r"^\s*-\s+(\S+)", text, re.MULTILINE)
             paths = {entry.split("::")[0].rstrip("/") for entry in entries}
             if any(wanted == path or wanted.startswith(f"{path}/") for path in paths):
                 listed.append(yml.name)
+                # A list that does not say how many GPUs its stage has is not held against it.
+                stages[yml.name] = _listed_stage_gpus(text, wanted) or [None]
     checks.append(
         Check(
             name="tests:test-db",
@@ -676,6 +719,29 @@ def check_test_registration(repo_root: Path, accuracy_test: str) -> list[Check]:
             ),
         )
     )
+    if engine_gpus and listed:
+        wide = [
+            name
+            for name, counts in stages.items()
+            if any(count is None or count >= engine_gpus for count in counts)
+        ]
+        most = max((count for counts in stages.values() for count in counts if count), default=0)
+        checks.append(
+            Check(
+                name="tests:test-db-width",
+                passed=bool(wide),
+                detail=(
+                    f"{accuracy_test} is listed for a stage of {engine_gpus} GPUs or more in "
+                    f"{', '.join(wide)}"
+                    if wide
+                    else f"the run gates a member of {engine_gpus} ranks, wider than one node, "
+                    f"and {accuracy_test} is listed only for stages of at most {most} GPUs "
+                    f"({', '.join(listed)}); CI would never run that member. List its cases on "
+                    f"a test list whose `system_gpu_count` admits {engine_gpus}, as the tree's "
+                    f"multi-node lists (`l0_*_multi_nodes_*.yml`) do"
+                ),
+            )
+        )
     return checks
 
 
@@ -766,8 +832,13 @@ def verify_delivery(
     model_key: str,
     accuracy_test: str,
     commit_policy: CommitPolicy | None = None,
+    engine_gpus: int | None = None,
 ) -> DeliveryReport:
-    """Run every mechanical delivery check and return the report."""
+    """Run every mechanical delivery check and return the report.
+
+    ``engine_gpus`` is the widest gated member's width when its engine spans more than one
+    node (:func:`check_test_registration`).
+    """
     root = Path(repo_root)
     checks: list[Check] = []
 
@@ -775,7 +846,7 @@ def verify_delivery(
     checks.extend(_dependency_checks(root, target_rel))
     checks.extend(check_routing(root, family, target_rel))
     checks.extend(check_accuracy_reference(root, reference_yaml, model_key))
-    checks.extend(check_test_registration(root, accuracy_test))
+    checks.extend(check_test_registration(root, accuracy_test, engine_gpus=engine_gpus))
     checks.extend(check_tree_committed(root, (target_rel, MODELING_V2_PACKAGE, CATALOG_TESTS_DIR)))
     if commit_policy is not None:
         checks.extend(check_commit_hygiene(root, commit_policy))

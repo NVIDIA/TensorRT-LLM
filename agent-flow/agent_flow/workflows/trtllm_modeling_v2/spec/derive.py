@@ -655,7 +655,19 @@ def derive_spec(
     options = _llm_api_options(runtime, built, kv_dtype, params, snapshot, max_batch_size)
     if goal.tune:
         draft = options[built[-1]].get("speculative_config") if built else None
-        spec["perf"] = _perf(site, workload, members, draft)
+        tuned = _tuned_members(spec, members, note, questions)
+        spec["perf"] = _perf(site, workload, tuned, draft)
+        if tuned != members:
+            # The keep gate defaults to the widest member, which spans nodes here.
+            spec["perf"]["campaign"] = {
+                "accuracy": {
+                    "members": note(
+                        "perf.campaign.accuracy.members",
+                        [max(tuned, key=lambda m: parse_parallel_segment(m)[1] or 1)],
+                        "the widest member on one node",
+                    )
+                }
+            }
         adp = [c["name"] for c in spec["perf"]["configs"] if c["name"].startswith("dep")]
         if adp:
             note(
@@ -824,6 +836,30 @@ def _spanning_members(
             f"environment.sessions (a `session_spool` environment), or name members that fit "
             f"one node"
         )
+
+
+def _tuned_members(
+    spec: Mapping[str, Any], members: list[str], note, questions: list[str]
+) -> list[str]:
+    """The members the tune campaign runs at: those whose engine fits one node.
+
+    The campaign measures, profiles and keep-gates on one node, so a member that spans nodes
+    (:func:`_spanning_members`) gets no perf config and is not the keep gate's.
+    """
+    per_node = spec["environment"].get("gpus_per_node")
+    fits = [m for m in members if nodes_for_width(parse_parallel_segment(m)[1], per_node) == 1]
+    spanning = [m for m in members if m not in fits]
+    if not spanning:
+        return members
+    if not fits:
+        questions.append(
+            f"tune is asked for and every member ({', '.join(spanning)}) is wider than one node "
+            f"of {per_node} GPUs: the tune campaign measures and keep-gates on one node. Name a "
+            f"member that fits one node, or leave tune out of the goal"
+        )
+        return members
+    note(f"perf (left out: {', '.join(spanning)})", "the tune campaign runs on one node", "default")
+    return fits
 
 
 def _disagg(

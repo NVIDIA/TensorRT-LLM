@@ -23,6 +23,7 @@ from .gang import AGENT_PARAMS, NO_TREE_SPAWN
 from .scheduler import SpoolPaths
 from .server_runtime import MULTI_TASK_SLURM_VARS, rank_launch
 from .sessions import (
+    GATE_ROLES,
     MERGED_ENV_VARS,
     SessionSpec,
     describe_sessions,
@@ -224,11 +225,18 @@ class RunEnvironment:
         wide = self.at_width(self.world_size)
         server = shlex.join([self.python, str(GANG_PATH), "lead", "--nodes", str(nodes)])
         narrow = replace(self, world_size=self.gpus_per_node, nodes=1)
+        # Only a session of that many nodes ever starts the job: anywhere else it waits for ever.
+        holding = ", ".join(
+            f"`{s.name}`: `SPOOL={s.spool}`"
+            for s in self.sessions
+            if s.role in GATE_ROLES and s.nodes >= nodes
+        )
         return (
             f"This run has an engine **wider than one node** ({self.gpus_per_node} GPUs): "
             f"{self.world_size} ranks span {nodes} nodes. Submit its work with "
             f"`--nodes {nodes}` and no `--gpus` (it holds every device of each node) to a "
-            "session of that many nodes, and launch the engine with:\n"
+            f"session of that many nodes{f' ({holding})' if holding else ''}; on any other "
+            "session the job waits for nodes that never come. Launch the engine with:\n"
             "\n"
             "```bash\n"
             f"{wide._gang_launch('<your command>', single_process=False)}\n"

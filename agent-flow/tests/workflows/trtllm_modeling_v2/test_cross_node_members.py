@@ -24,9 +24,11 @@ from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
     resolve_environment,
 )
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.scheduler import (
+    RC_MIXED_CHECKOUT,
     Scheduler,
     SchedulerConfig,
     SpoolPaths,
+    part_name,
 )
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.server_runtime import (
     GANG_MPI_HOSTS_ENV,
@@ -36,7 +38,11 @@ from agent_flow.workflows.trtllm_modeling_v2.infra.compute.server_runtime import
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as contract_mod
 from agent_flow.workflows.trtllm_modeling_v2.run.validation.check_runner import CheckRunner
 from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
-from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import member_nodes, nodes_for_width
+from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import (
+    member_nodes,
+    nodes_for_width,
+    widest_spanning_width,
+)
 
 _DEVICES = ("0", "1", "2", "3")
 _ALLOCATION = "5151"
@@ -57,6 +63,20 @@ def test_an_engine_spans_as_many_nodes_as_its_width_needs():
     assert member_nodes(spec, "dep4") == 1
     assert member_nodes({"environment": {"sessions": [{"gpus_per_node": 8}]}}, "tep8") == 1
     assert member_nodes(spec, None) == 1
+    # The widest member that spans is what a CI stage has to hold; none when all fit a node.
+    unified = {**spec, "parallel": "unified"}
+    assert widest_spanning_width({**unified, "members": ["tp4", "tep8", "dep16"]}) == 16
+    assert (
+        widest_spanning_width({**unified, "members": {"default": ["tp4"], "mtp": ["tep8"]}}) is None
+    )
+    wide_feature = {
+        **unified,
+        "members": {"default": ["tp4"], "mtp": ["tep8"]},
+        "features": ["mtp"],
+    }
+    assert widest_spanning_width(wide_feature) == 8
+    assert widest_spanning_width({**unified, "members": ["tp4", "tep4"]}) is None
+    assert widest_spanning_width({"parallel": "unified", "members": ["tep8"]}) is None
 
 
 # ------------------------------------------------------------------- launch
@@ -135,6 +155,14 @@ def test_the_prompt_says_how_to_run_an_engine_across_nodes(tmp_path):
     one_node = _spool_env(tmp_path, gpus_per_node=8).describe()
     assert "wider than one node" not in one_node
     assert "mpirun -n 8 --oversubscribe" in one_node
+    # Of several sessions, the prompt names the ones that hold the engine's nodes.
+    sessions = [
+        {"name": "wide", "spool": "/s/wide", "role": "gates", "nodes": 2, "gpus_per_node": 4},
+        {"name": "narrow", "spool": "/s/narrow", "role": "gates", "nodes": 1},
+        {"name": "bench", "spool": "/s/bench", "role": "work", "nodes": 2},
+    ]
+    several = _spool_env(tmp_path, sessions=sessions).describe()
+    assert "to a session of that many nodes (`wide`: `SPOOL=/s/wide`); on any other" in several
 
 
 # --------------------------------------------------------------- gang.lead()
@@ -382,6 +410,40 @@ def test_a_failure_on_another_node_is_the_jobs_failure(gang_spool):
     # mpirun on node 0 reports what its remote share returned, and the receipt names node 0.
     assert receipt["rc"] == 3 and receipt["detail"].startswith("node 0 (nodeA)")
     assert {p["rank"]: p["rc"] for p in receipt["parts"]}[0] == 3
+
+
+def test_what_another_nodes_ranks_imported_is_judged_with_node_zeros(gang_spool, tmp_path):
+    """Node 1's ranks import the package from another checkout: the job describes no one tree."""
+    trees = {}
+    for name in ("tree", "other"):
+        package = tmp_path / name / "tensorrt_llm"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(f"WHERE = {name!r}\n", encoding="utf-8")
+        trees[name] = tmp_path / name
+    # Each node's ranks import from their working directory: the job's tree, except on node 1.
+    (gang_spool.bin / "ranks").write_text(
+        "#!/bin/bash\n"
+        f'[ "$MV2FLOW_JOB_NODE_RANK" = 1 ] && cd {trees["other"]}\n'
+        f"exec {sys.executable} -c 'import tensorrt_llm'\n"
+    )
+    a, b = _node(gang_spool, "nodeA"), _node(gang_spool, "nodeB")
+    name = "wide"
+    text = (
+        f"#!/bin/bash\nset -u\n#spool: gpus=all nodes=2 wall=120s tree={trees['tree']}\n"
+        f"{_wide_command()}\n"
+    )
+    staging = gang_spool.root / "pending" / f".{name}.tmp"
+    staging.write_text(text)
+    os.replace(staging, gang_spool.root / "pending" / f"{name}.sh")
+    _pump([a, b], lambda: _receipt(gang_spool, name) is not None)
+    receipt = _receipt(gang_spool, name)
+    # Every part exited 0; what node 1's ranks imported is in its own part's log of imports.
+    assert {p["rank"]: p["rc"] for p in receipt["parts"]} == {0: 0, 1: 0}
+    paths = SpoolPaths(gang_spool.root)
+    assert str(trees["other"]) in paths.resolve_log(part_name(name, 1)).read_text()
+    assert str(trees["other"]) not in paths.resolve_log(name).read_text()
+    assert receipt["rc"] == RC_MIXED_CHECKOUT and receipt["reason"] == "mixed_checkout"
+    assert str(trees["other"]) in receipt["detail"] and str(trees["tree"]) in receipt["detail"]
 
 
 # ------------------------------------------------------------ placement

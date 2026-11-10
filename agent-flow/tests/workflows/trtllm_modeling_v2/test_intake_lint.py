@@ -350,8 +350,11 @@ def test_a_member_wider_than_a_node_needs_a_session_of_its_nodes():
     # The spec declares no multi-node gates session: preflight would stop.
     unavailable = findings["member-nodes-unavailable"]
     assert unavailable.severity == lint.BLOCK and "`nodes: 2`" in unavailable.fix
-    # The tune campaign's keep gate defaults to the widest member, which runs on one node.
-    assert "keep-gate member tep8" in findings["perf-member-spans-nodes"].message
+    # The tune campaign's keep gate defaults to the widest member, which runs on one node:
+    # its jobs would be refused, so this is no choice the notes can accept.
+    tuned = findings["perf-member-spans-nodes"]
+    assert tuned.severity == lint.BLOCK and "keep-gate member tep8" in tuned.message
+    assert tuned.rule not in lint.ACCEPTABLE_BLOCKS
 
     task["environment"]["sessions"] = [
         {"name": "g", "spool": "/s/g", "role": "gates", "nodes": 2, "gpus_per_node": 4}

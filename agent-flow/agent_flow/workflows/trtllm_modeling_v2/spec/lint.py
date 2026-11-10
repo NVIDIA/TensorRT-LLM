@@ -598,9 +598,10 @@ def _spanning_member_findings(
     if tuned:
         yield Finding(
             "perf-member-spans-nodes",
-            WARN,
+            BLOCK,
             f"the tune campaign would run {', '.join(tuned)} across nodes, and it measures, "
-            "profiles and keep-gates on one node: those jobs are refused",
+            "profiles and keep-gates on one node: those jobs are refused, so the campaign "
+            "ends `tune-failed` whatever the onboarding delivers",
             "name `perf.configs` and `perf.campaign.accuracy.members` at members that fit one "
             "node (the keep gate defaults to the widest member), or `gate: off`",
         )

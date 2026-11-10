@@ -446,6 +446,54 @@ def test_the_accuracy_test_path_follows_the_tree_layout(tmp_path):
     assert checks == {"tests:accuracy-file": True, "tests:test-db": False}
 
 
+def test_a_member_wider_than_a_node_is_listed_for_a_stage_that_holds_it(tmp_path):
+    """A stage of one node's GPUs never runs an engine that spans two: a wider list has to."""
+    accuracy_test = "modeling_v2/gpt_oss/t/test_accuracy.py"
+    path = tmp_path / delivery.ACCURACY_TESTS_DIR / accuracy_test
+    path.parent.mkdir(parents=True)
+    path.write_text("", encoding="utf-8")
+    db = tmp_path / delivery.TEST_DB_DIR
+    db.mkdir(parents=True)
+
+    def stage(name: str, gpus: dict, case: str) -> None:
+        block = {"condition": {"ranges": {"system_gpu_count": gpus}}, "tests": [case]}
+        (db / f"{name}.yml").write_text(yaml.safe_dump({"version": "0.0.1", name: [block]}))
+
+    def registration(**kwargs) -> dict[str, delivery.Check]:
+        found = delivery.check_test_registration(tmp_path, accuracy_test, **kwargs)
+        return {c.name: c for c in found}
+
+    stage("l0_gb300", {"gte": 1, "lte": 4}, f"accuracy/{accuracy_test}::TestT::test_gsm8k[tep4]")
+    # A run whose members all fit one node owes nothing more than being listed.
+    assert set(registration()) == {"tests:accuracy-file", "tests:test-db"}
+    width = registration(engine_gpus=8)["tests:test-db-width"]
+    assert not width.passed
+    assert "a member of 8 ranks" in width.detail and "at most 4 GPUs (l0_gb300.yml)" in width.detail
+    # Another target's cases on the multi-node list do not answer for this one.
+    stage(
+        "l0_gb300_multi_nodes_node2_gpu8",
+        {"gte": 8, "lte": 8},
+        "accuracy/modeling_v2/gpt_oss/other/test_accuracy.py::TestO::test_gsm8k[tep8] TIMEOUT (60)",
+    )
+    assert not registration(engine_gpus=8)["tests:test-db-width"].passed
+    stage(
+        "l0_gb300_multi_nodes_node2_gpu8",
+        {"gte": 8, "lte": 8},
+        f"accuracy/{accuracy_test}::TestT::test_gsm8k[tep8] TIMEOUT (60)",
+    )
+    width = registration(engine_gpus=8)["tests:test-db-width"]
+    assert width.passed and "l0_gb300_multi_nodes_node2_gpu8.yml" in width.detail
+    assert "l0_gb300.yml" not in width.detail
+    # A list that does not say how many GPUs its stage has is not held against the test.
+    (db / "l0_gb300_multi_nodes_node2_gpu8.yml").unlink()
+    (db / "l0_plain.yml").write_text(f"  - accuracy/{accuracy_test}\n", encoding="utf-8")
+    assert registration(engine_gpus=8)["tests:test-db-width"].passed
+    # Not listed at all is one finding, not two.
+    for yml in db.glob("*.yml"):
+        yml.unlink()
+    assert set(registration(engine_gpus=8)) == {"tests:accuracy-file", "tests:test-db"}
+
+
 @pytest.mark.skipif(
     not (_REPO_ROOT / catalog_paths.MODELING_V2_PACKAGE).is_dir(),
     reason="not running inside a TensorRT-LLM checkout with modeling_v2 present",

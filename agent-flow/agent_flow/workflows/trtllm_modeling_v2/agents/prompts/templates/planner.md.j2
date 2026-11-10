@@ -287,7 +287,10 @@ commit and the run is delivered at once; a campaign still running goes on
 after, and its outcome changes no verdict of yours. So plan the delivery
 files as a task of their own once the first
 unit's assembly is done: the CI accuracy test, its entry on a test list and,
-when the accuracy anchor is written, the accuracy reference entry.
+when the accuracy anchor is written, the accuracy reference entry. The cases
+of a member wider than one node go on a test list whose stage has that many
+GPUs (`system_gpu_count`), as the tree's multi-node lists do: delivery checks
+that one does.
 
 When a check fails, read its evidence and the previous task's receipt before
 adding work. Keep ordinary build, import and launch repairs in the existing

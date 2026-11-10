@@ -1486,6 +1486,14 @@ def member_nodes(data: Mapping[str, Any], member: str | None) -> int:
     return nodes_for_width(width, gpus_per_node(data))
 
 
+def widest_spanning_width(data: Mapping[str, Any]) -> int | None:
+    """The width of the widest gated member whose engine spans more than one node, else ``None``."""
+    world = widest_world_size(data, 1)
+    members = {m for unit in assembly_units(data) for m in members_for(data, unit, world)}
+    widths = [parse_parallel_segment(m)[1] or 0 for m in members if member_nodes(data, m) > 1]
+    return max(widths, default=0) or None
+
+
 def _require_disagg_test(data: Mapping[str, Any], errors: list[str]) -> None:
     """The ``disagg`` feature names the test that proves it: nothing else crosses the hop."""
     features = data.get(FEATURES_FIELD)
@@ -1762,6 +1770,7 @@ __all__ = [
     "gpus_per_node",
     "member_nodes",
     "nodes_for_width",
+    "widest_spanning_width",
     "COVERAGE_FIELD",
     "COVERAGE_KEYS",
     "resolve_gate_timeout",

@@ -31,6 +31,7 @@ from ...spec.task_schema import (
     assembly_units,
     profile_of,
     resolve_per_unit,
+    widest_spanning_width,
 )
 from ..records.state import WorkflowState
 from . import contract as contract_mod
@@ -136,7 +137,9 @@ def delivery_failures(workflow) -> list[str]:
 
 #: The delivery checks that set the target up for CI: its accuracy test, the test list that
 #: runs it and its anchor's row. A run whose every unit is ``smoke`` or ``bringup`` owes none.
-CI_DELIVERY_CHECKS = frozenset({"accuracy:reference", "tests:accuracy-file", "tests:test-db"})
+CI_DELIVERY_CHECKS = frozenset(
+    {"accuracy:reference", "tests:accuracy-file", "tests:test-db", "tests:test-db-width"}
+)
 _NO_CI_PROFILES = (PROFILE_SMOKE, PROFILE_BRINGUP)
 #: The most test modules of its own a target delivers that a reviewer accepts (10-15,
 #: consolidated by domain, is the aim): delivery warns past it and never fails on it.
@@ -183,6 +186,7 @@ def delivery_report(workflow, *, run_tests: bool = False) -> DeliveryReport:
             Path(workflow._preflight.target_rel).name,
         ),
         commit_policy=CommitPolicy.from_task(workflow.task_data, workspace=workflow.workspace),
+        engine_gpus=widest_spanning_width(workflow.task_data),
     )
     waiver = ci_waiver(workflow.task_data)
     if waiver:
