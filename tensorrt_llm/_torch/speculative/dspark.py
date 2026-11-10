@@ -988,6 +988,187 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._confidence_stamp[slots] = self._draft_seq_cuda
         return block_logits
 
+    def _snapshot_persistent_state(self) -> tuple:
+        """Copies of the state a forward advances, for a warmup pass to put back."""
+        return (
+            self._ctx_len.clone(),
+            self._valid_len.clone(),
+            self._position_initialized.clone(),
+            self._kv_windows.clone(),
+            # The confidence buffer is persistent state too; warmup scores
+            # must not reach the verification planner.
+            None if self._confidence_logits is None else self._confidence_logits.clone(),
+            None if self._confidence_stamp is None else self._confidence_stamp.clone(),
+        )
+
+    def _restore_persistent_state(self, saved: tuple) -> None:
+        ctx_len, valid_len, position_initialized, windows, confidence, stamp = saved
+        self._ctx_len.copy_(ctx_len)
+        self._valid_len.copy_(valid_len)
+        self._position_initialized.copy_(position_initialized)
+        self._kv_windows.copy_(windows)
+        if confidence is not None:
+            self._confidence_logits.copy_(confidence)
+        if stamp is not None:
+            self._confidence_stamp.copy_(stamp)
+
+    @staticmethod
+    def _all_rank_draft_tokens(
+        spec_metadata: "DSparkSpecMetadata", draft_model
+    ) -> Optional[List[int]]:
+        """Draft-MoE token count of every EP rank, or None without a cross-rank barrier.
+
+        A rank with zero local gen requests still has to cross the draft MoE's
+        cross-rank barrier, but DeepseekV4MoE's router / shared-expert dense
+        GEMMs reject a 0-row input (cuBLAS CUBLAS_STATUS_INVALID_VALUE), so such
+        a rank runs a single 1-row dummy through the MoE (like ADP padding).
+        Encode that as ``1`` in the globally-shared per-rank token list so every
+        rank agrees on the FUSED_COMM chunk count and per-rank slice.
+        """
+        all_rank_num_gens = getattr(spec_metadata, "all_rank_num_gens", None)
+        if all_rank_num_gens is None:
+            return None
+        block = int(draft_model.block_size)
+        return [max(1, int(g) * block) for g in all_rank_num_gens]
+
+    def _follow_target_step(
+        self,
+        draft_model,
+        spec_metadata: "DSparkSpecMetadata",
+        attn_metadata,
+        position_ids: torch.Tensor,
+        num_contexts: int,
+        batch_size: int,
+        total_target_tokens: int,
+    ) -> None:
+        """Advance the rolling windows by the one token each generation request committed.
+
+        Writes the frame the block forward writes for its bonus token -- the
+        captured target hidden state of the request's input token, one position
+        past the request's previous extent -- without running the block. Same
+        fixed shapes and tensor-only indexing as ``_draft_gen_block_batched``,
+        so it is CUDA-graph-safe.
+        """
+        captured = spec_metadata.get_hidden_states(total_target_tokens)
+        if captured is None:
+            raise RuntimeError(
+                "DSpark generation requires captured target hidden states; "
+                "check target_layer_ids and the target model's capture hooks."
+            )
+        num_gens = batch_size - num_contexts
+        slots = self._batch_to_slot[num_contexts:batch_size]  # [G]
+        # Without drafts every generation request submits exactly one token.
+        rows = attn_metadata.num_ctx_tokens + torch.arange(num_gens, device=captured.device)
+        # Graph-padding rows own only scratch state and may lie beyond the
+        # captured token extent.
+        is_scratch = slots == self._scratch_slot
+        rows = torch.where(is_scratch, torch.zeros_like(rows), rows)
+        input_positions = position_ids.reshape(-1).index_select(0, rows).long()
+        _old, start_pos = self._advance_generation_state(
+            slots, torch.ones_like(slots), input_positions
+        )
+        draft_model.write_context_windows_batched(
+            captured.index_select(0, rows).unsqueeze(1),
+            start_pos.unsqueeze(1),
+            slots,
+            (~is_scratch).unsqueeze(1),
+            self._kv_windows,
+        )
+
+    def _forward_without_drafting(
+        self,
+        input_ids,
+        position_ids,
+        hidden_states,
+        logits,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+    ):
+        """Run a step the draft length schedule leaves without speculation.
+
+        The target still commits one token per generation request, so the
+        rolling windows follow it: the next block a request drafts, once the
+        schedule turns speculation back on, attends to an unbroken context at
+        the right absolute positions.
+
+        Ranks that share the draft MoE's cross-rank barrier still run the
+        block and drop its proposal. Attention-DP ranks pick the draft length
+        from their own batch size, so a peer may be drafting this step, and
+        every rank has to make the same draft MoE calls.
+        """
+        outputs = self.skip_drafting(
+            input_ids,
+            position_ids,
+            hidden_states,
+            logits,
+            attn_metadata,
+            spec_metadata,
+            draft_model,
+        )
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+        num_gens = batch_size - num_contexts
+        total_target_tokens = input_ids.shape[0]
+
+        # Same warmup guard as the drafting path: synthetic warmup batches
+        # must not advance the persistent rolling-window state.
+        is_warmup = (
+            getattr(spec_metadata, "is_cuda_graph", False)
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        saved_state = self._snapshot_persistent_state() if is_warmup else None
+
+        if num_contexts > 0:
+            self._seed_context_windows(
+                draft_model,
+                spec_metadata,
+                attn_metadata,
+                position_ids,
+                total_target_tokens,
+            )
+
+        all_rank_draft_tokens = self._all_rank_draft_tokens(spec_metadata, draft_model)
+        if all_rank_draft_tokens is None:
+            if num_gens > 0:
+                self._follow_target_step(
+                    draft_model,
+                    spec_metadata,
+                    attn_metadata,
+                    position_ids,
+                    num_contexts,
+                    batch_size,
+                    total_target_tokens,
+                )
+        elif num_gens > 0:
+            self._draft_gen_block_batched(
+                draft_model,
+                spec_metadata,
+                attn_metadata,
+                outputs["new_tokens"],
+                outputs["new_tokens_lens"],
+                num_contexts,
+                batch_size,
+                total_target_tokens,
+                position_ids,
+                all_rank_num_tokens=all_rank_draft_tokens,
+            )
+        elif max(spec_metadata.all_rank_num_gens) > 0:
+            draft_model.run_moe_lockstep_noop(all_rank_draft_tokens, logits.device)
+
+        if saved_state is not None:
+            self._restore_persistent_state(saved_state)
+
+        # No drafts were verified, so every request ran a one-token window.
+        _publish_policy_window_output(
+            outputs,
+            None,
+            num_contexts=num_contexts,
+            num_generations=num_gens,
+            output_verify_lens=self._output_verify_lens,
+        )
+        return outputs
+
     def _sample_draft_tokens_guided(
         self,
         gen_logits: torch.Tensor,
@@ -1047,6 +1228,21 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # Backref so DSparkSpecMetadata.prepare() can maintain the host slot map
         # and mirror it into _batch_to_slot for the CUDA-graph-safe gen path.
         spec_metadata._dspark_worker = self
+
+        # A draft length schedule only narrows how many of the block's tokens
+        # the target verifies: the block is always drafted K wide. At zero the
+        # target verifies nothing, so no block is proposed either.
+        if spec_metadata.runtime_draft_len == 0:
+            return self._forward_without_drafting(
+                input_ids,
+                position_ids,
+                hidden_states,
+                logits,
+                attn_metadata,
+                spec_metadata,
+                draft_model,
+            )
+
         self._execute_guided_decoder_if_present(logits)
 
         # Target-verify acceptance via the unified SpecWorkerBase entry: it
@@ -1072,17 +1268,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             getattr(spec_metadata, "is_cuda_graph", False)
             and not torch.cuda.is_current_stream_capturing()
         )
-        if is_warmup:
-            saved_ctx_len = self._ctx_len.clone()
-            saved_valid_len = self._valid_len.clone()
-            saved_position_initialized = self._position_initialized.clone()
-            saved_windows = self._kv_windows.clone()
-            # The confidence buffer is persistent state too; warmup scores
-            # must not reach the verification planner.
-            saved_confidence = (
-                None if self._confidence_logits is None else self._confidence_logits.clone()
-            )
-            saved_stamp = None if self._confidence_stamp is None else self._confidence_stamp.clone()
+        saved_state = self._snapshot_persistent_state() if is_warmup else None
 
         # Assign / reset window slots for context (prefill) requests and seed each
         # request's rolling KV window from its prompt's captured context, so the
@@ -1107,19 +1293,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # gathered at metadata-prep time (model_engine, outside any CUDA-graph
         # capture region); it is None for non-ADP / single-rank runs, where the
         # local ``[num_tokens]`` fallback in ``_forward_stage`` is correct.
-        block = int(draft_model.block_size)
         all_rank_num_gens = getattr(spec_metadata, "all_rank_num_gens", None)
-        # A rank with zero local gen requests still has to cross the draft MoE's
-        # cross-rank barrier, but DeepseekV4MoE's router / shared-expert dense
-        # GEMMs reject a 0-row input (cuBLAS CUBLAS_STATUS_INVALID_VALUE), so such
-        # a rank runs a single 1-row dummy through the MoE (like ADP padding).
-        # Encode that as ``1`` in the globally-shared per-rank token list so every
-        # rank agrees on the FUSED_COMM chunk count and per-rank slice.
-        all_rank_draft_tokens = (
-            [max(1, int(g) * block) for g in all_rank_num_gens]
-            if all_rank_num_gens is not None
-            else None
-        )
+        all_rank_draft_tokens = self._all_rank_draft_tokens(spec_metadata, draft_model)
         global_has_gen = (
             max(all_rank_num_gens) > 0 if all_rank_num_gens is not None else num_gens > 0
         )
@@ -1192,15 +1367,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
             num_accepted_tokens,
         )
 
-        if is_warmup:
-            self._ctx_len.copy_(saved_ctx_len)
-            self._valid_len.copy_(saved_valid_len)
-            self._position_initialized.copy_(saved_position_initialized)
-            self._kv_windows.copy_(saved_windows)
-            if saved_confidence is not None:
-                self._confidence_logits.copy_(saved_confidence)
-            if saved_stamp is not None:
-                self._confidence_stamp.copy_(saved_stamp)
+        if saved_state is not None:
+            self._restore_persistent_state(saved_state)
 
         outputs = {
             "logits": raw_logits,

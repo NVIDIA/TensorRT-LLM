@@ -4027,6 +4027,13 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                 "native K1 layout; using the feature-off static K1 path.")
             self.enable_confidence_scheduling = False
             return self
+        if (self.draft_len_schedule is not None
+                or self.max_concurrency is not None):
+            raise ValueError(
+                "DSpark confidence scheduling cannot be combined with "
+                "draft_len_schedule or max_concurrency: each one selects how "
+                "many draft tokens a step verifies. Unset them or disable "
+                "confidence scheduling.")
         if not self.confidence_cost_table_path:
             raise ValueError(
                 "DSpark confidence scheduling requires confidence_cost_table_path. "
