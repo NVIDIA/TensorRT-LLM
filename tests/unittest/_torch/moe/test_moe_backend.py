@@ -146,6 +146,7 @@ from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.planner import (
 )
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
+    FusedMoEQuantScalesDeepSeekFP8BlockScales,
     NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
     NVFP4MegaMoECuteDslMethod,
@@ -5548,8 +5549,18 @@ def test_moe_backend(
         # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels
         use_flashinfer = getattr(backend, "use_flashinfer", False)
 
+        # The SM90 Triton FP8-activation leaf runs decode-sized batches without
+        # any autotuned op, so those runs leave nothing to capture.
+        runs_untuned_triton = (
+            isinstance(backend, TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl)
+            and seq_len <= backend.TRITON_FP8_ACT_MAX_TOKENS
+        )
+
         # Check if this backend+quant_algo combination supports autotuner capture/replay
-        if supports_autotuner_capture(backend_type, quant_algo, use_flashinfer):
+        if (
+            supports_autotuner_capture(backend_type, quant_algo, use_flashinfer)
+            and not runs_untuned_triton
+        ):
             # Capture phase: record which tactics are used (requires actual execution)
             with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
                 _ = run_moe()
@@ -7003,7 +7014,7 @@ def _sm90_triton_fp8_act_leaf_on_cpu(
     )
     calls = _record_fused_moe(monkeypatch)
     leaf = _cutlass_leaf_on_cpu(TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl)
-    leaf.quant_scales = SimpleNamespace(
+    leaf.quant_scales = FusedMoEQuantScalesDeepSeekFP8BlockScales(
         fc_weight_scales="fc31-scale", proj_weight_scales="fc2-scale"
     )
     leaf._triton_swiglu = (7.0, True)

@@ -307,10 +307,17 @@ def _dequant_blocks(w_fp8: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
 
 def _fake_quant_1x128(v: torch.Tensor) -> torch.Tensor:
     """Round a 1-D FP32 vector through FP8 with one scale per 128 elements, using the
-    CUTLASS MoE arithmetic (multiply by 448 / amax, dequantize by its reciprocal)."""
+    CUTLASS MoE arithmetic (multiply by 448 / amax, dequantize by its reciprocal).
+
+    Both divisions are tensor by tensor: torch evaluates ``scalar / tensor`` as
+    ``tensor.reciprocal() * scalar``, which is not correctly rounded, and one ulp
+    of scale moves values that sit on an FP8 rounding midpoint.
+    """
     groups = v.view(-1, 128)
-    quant_scale = 448.0 / groups.abs().amax(dim=1, keepdim=True).clamp(min=1e-10)
-    return ((groups * quant_scale).to(torch.float8_e4m3fn).float() * (1.0 / quant_scale)).view(-1)
+    amax = groups.abs().amax(dim=1, keepdim=True).clamp(min=1e-10)
+    quant_scale = torch.full_like(amax, 448.0) / amax
+    dequant_scale = torch.ones_like(quant_scale) / quant_scale
+    return ((groups * quant_scale).to(torch.float8_e4m3fn).float() * dequant_scale).view(-1)
 
 
 def _run_moe_fp8_act_reference(
