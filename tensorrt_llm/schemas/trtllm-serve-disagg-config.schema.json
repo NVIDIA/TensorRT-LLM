@@ -594,7 +594,7 @@
         },
         "mixed_precision_last_n": {
           "default": 0,
-          "description": "Number of most recent tokens per sequence kept unquantized in the cold tiers, in whole cache pages. Applies to full-attention layers; sliding-window layers are stored as ordinary cold pages. Rejected when a sliding-window layer keeps the same tokens (its window is this value plus one, with the same sink tokens): the high layers would share that layer's page group, which the cold-page codec cannot split.",
+          "description": "Number of most recent tokens per sequence kept unquantized in the cold tiers, in whole cache pages. Applies to full-attention layers; sliding-window layers are stored as ordinary cold pages. Rejected when a sliding-window layer keeps the same tokens (its window is this value plus one, with the same sink pages): the high layers would share that layer's page group, which the cold-page codec cannot split.",
           "minimum": 0,
           "status": "prototype",
           "title": "Mixed Precision Last N",
