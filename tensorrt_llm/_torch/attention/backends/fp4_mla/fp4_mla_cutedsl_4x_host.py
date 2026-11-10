@@ -44,7 +44,6 @@ __all__ = [
     "compile_variant",
     "run_fp4_mla_decode_4x_full",
     "compiled_variants",
-    "vpfl_decision",
     "envelope_reason_static",
     "device_unsupported_reason",
     "max_shared_memory_per_block",
@@ -286,9 +285,6 @@ class EnvelopeGeometry:
     output_dtype: torch.dtype
     max_kv_len: int
     device: torch.device = field(default_factory=lambda: torch.device("cpu"))
-    vpfl_enabled: bool = (
-        True  # runtime switch of the V L2 prefetch (vpfl_decision); not part of compile_key
-    )
     num_heads: int = HEADS  # rows mode: local heads (heads * q % 256 == 0); Constexpr of the kernel
     num_blocks: int = 0  # 128-row blocks = tokens * heads / 128 = runtime_l (grid z = blocks // 2)
     q_batch_blocks: int = 0  # q_tma_l in blocks
@@ -969,21 +965,11 @@ def device_unsupported_reason(device: torch.device) -> str | None:
     return None
 
 
-def vpfl_decision(geom: EnvelopeGeometry, use_vpfl: bool | None) -> tuple[bool, str]:
-    """(enable, reason) for the V L2 prefetch: off unless forced.  The four-bank V ring issues every V load a full
-    round before its PV, which is what the prefetch used to buy, without the prefetch requests."""
-    del geom
-    if use_vpfl is not None:
-        if type(use_vpfl) is not bool:
-            raise TypeError("use_vpfl must be a bool or None")
-        return use_vpfl, "forced"
-    return False, "off: the V ring loads a round ahead"
-
-
 def _scalar_args(geom: EnvelopeGeometry, stream, *, exemplar: bool = False) -> tuple:
-    """Wrapper args 17-30 (X79:1176-1189) in order.  With ``exemplar`` the page counts/strides are the type-only
-    stand-ins the template uses at compile time (compile_balanced_template.py:136-138); otherwise the real values
-    (X79:10513-10528 + requested_cut, dead in FULL-only -> 0)."""
+    """Wrapper args 17-29 in order (X79:1176-1189 without the retired prefetch switch).  With ``exemplar`` the page
+    counts/strides are the type-only stand-ins the template uses at compile time
+    (compile_balanced_template.py:136-138); otherwise the real values (X79:10513-10528 + requested_cut, dead in
+    FULL-only -> 0)."""
     import cutlass as ctm
 
     I32, I64, F32 = ctm.Int32, ctm.Int64, ctm.Float32
@@ -1004,7 +990,6 @@ def _scalar_args(geom: EnvelopeGeometry, stream, *, exemplar: bool = False) -> t
             I32(0),
             I32(1),
             I32(1),
-            I32(1),
             stream,
         )
     return (
@@ -1021,7 +1006,6 @@ def _scalar_args(geom: EnvelopeGeometry, stream, *, exemplar: bool = False) -> t
         F32(geom.softmax_scale_log2),  # X79:10525
         F32(1.0),  # pv_output_scale      X79:10526 / MUFU:8669
         I32(0),  # requested_cut: PREFIX cut, dead in FULL-only (X79:8743-8760)
-        I32(1 if geom.vpfl_enabled else 0),  # vpfl_enable (runtime; vpfl_decision)
         I32(
             max(int(geom.task_capacity), 1)
         ),  # task_capacity (split mode plan slots; 1 = unused in FULL mode)
@@ -1182,7 +1166,6 @@ def run_fp4_mla_decode_4x_full(
     partition_runtime_valid_k: bool = False,
     enable_mxi_imlp: bool = True,
     validate_contents: bool | None = None,
-    use_vpfl: bool | None = None,
     split: dict | None = None,
     _test_only_max_pairs: int | None = None,
 ) -> EnvelopeGeometry:
@@ -1191,7 +1174,6 @@ def run_fp4_mla_decode_4x_full(
     ``q_global_scale`` defaults to it (MUFU:8884-8885 / X79:10626-10627).
 
     ``validate_contents``: None = read the int32 tables once per new prepared call when not capturing;
-    ``use_vpfl``: None = host decision on the V pool span (``vpfl_decision``), True/False = force the V L2 prefetch;
     ``_test_only_max_pairs``: bypass of the 46-pair bound for the two-wave control run ONLY (never in production).
     """
     # interface-compatible no-ops, type-checked like MUFU:8161-8171 / X79:10175-10192 and then ignored
@@ -1275,9 +1257,6 @@ def run_fp4_mla_decode_4x_full(
         geom = dataclasses.replace(geom, split_mode=True, task_capacity=cap, used_tasks=used)
     if q_global_scale is None:
         q_global_scale = global_scale
-    vpfl_on, _vpfl_reason = vpfl_decision(geom, use_vpfl)
-    if vpfl_on != geom.vpfl_enabled:
-        geom = dataclasses.replace(geom, vpfl_enabled=vpfl_on)
     import cuda.bindings.driver as cuda
 
     stream = _current_cu_stream()
@@ -1363,7 +1342,6 @@ def run_fp4_mla_decode_4x_full(
         geom.softmax_scale_log2,
         output.dtype,
         bool(enable_mxi_imlp),
-        geom.vpfl_enabled,
         geom.split_mode,
         geom.task_capacity,
         geom.used_tasks,
