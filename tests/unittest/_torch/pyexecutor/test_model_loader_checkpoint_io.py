@@ -29,6 +29,7 @@ from tensorrt_llm._torch.models.checkpoints.weight_load_plan import (
     WeightLoadPlan,
     WeightLoadPlanCoverage,
 )
+from tensorrt_llm._torch.models.modeling_dspark import DSv4DSparkForCausalLM
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     ModelLoader,
@@ -880,19 +881,21 @@ def test_draft_load_reads_only_the_shards_holding_draft_keys(
     (checkpoint_dir / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": weight_map})
     )
-    draft_prefixes = ("mtp.0.", "mtp.1.")
+    dspark = object.__new__(DSv4DSparkForCausalLM)
+    torch.nn.Module.__init__(dspark)
+    dspark.num_stages = 2
     holders = [
         "model-00001-of-00005.safetensors",
         "model-00003-of-00005.safetensors",
         "model-00004-of-00005.safetensors",
     ]
 
-    def load_draft(key_prefixes: tuple[str, ...] | None) -> dict[str, torch.Tensor]:
+    def load_draft(draft_model: torch.nn.Module | None) -> dict[str, torch.Tensor]:
         received = {}
         read_files.clear()
         model = SimpleNamespace(
             draft_config=None,
-            draft_model=SimpleNamespace(checkpoint_key_prefixes=key_prefixes),
+            draft_model=draft_model,
             load_draft_weights=lambda weights, weight_mapper=None: received.update(weights.items()),
         )
         loader = ModelLoader.__new__(ModelLoader)
@@ -910,9 +913,9 @@ def test_draft_load_reads_only_the_shards_holding_draft_keys(
     def assert_same_draft_tensors(
         draft: dict[str, torch.Tensor], full: dict[str, torch.Tensor]
     ) -> None:
-        draft_keys = {key for key in full if key.startswith(draft_prefixes)}
-        assert {key for key in draft if key.startswith(draft_prefixes)} == draft_keys
-        for key in draft_keys:
+        # The two-stage draft gets exactly the stage 0 and 1 keys.
+        assert set(draft) == {key for key in full if key.startswith(("mtp.0.", "mtp.1."))}
+        for key in draft:
             assert draft[key].dtype == full[key].dtype
             assert draft[key].shape == full[key].shape
             assert torch.equal(
@@ -922,7 +925,6 @@ def test_draft_load_reads_only_the_shards_holding_draft_keys(
     full = load_draft(None)
     assert sorted(read_files) == sorted(shards)
     assert set(full) == {key for tensors in shards.values() for key in tensors}
-    draft = load_draft(draft_prefixes)
+    draft = load_draft(dspark)
     assert sorted(read_files) == holders
-    assert set(draft) == {key for name in holders for key in shards[name]}
     assert_same_draft_tensors(draft, full)
