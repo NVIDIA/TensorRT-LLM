@@ -54,10 +54,10 @@ the request's multimodal data before the forward stream reads any of them.
 Later chunks then read them without their own wait, and cleanup may drop them
 while forward-stream reads are still queued.
 
-A request holds encoder-cache references only for the items its remaining
-prefill uses. With KV cache manager V2 they are released as each chunk
-completes, and before item selection when KV reuse starts the prefill past
-items that were already bound.
+With KV cache manager V2, a request's encoder-cache references are released
+as each chunk completes. When KV reuse starts the prefill past items that were
+already bound, context-chunk item selection releases them first; whole-request
+selection keeps them until the request's next chunk completes.
 
 ## Item Metadata and Selection
 

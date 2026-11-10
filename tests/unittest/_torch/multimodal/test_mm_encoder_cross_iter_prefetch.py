@@ -619,7 +619,7 @@ def test_cross_iter_prefetch_does_not_rewrite_request_local_embedding():
 
 
 @requires_cuda
-def test_request_terminated_after_prefetch_holds_nothing():
+def test_request_terminated_after_prefetch_holds_nothing() -> None:
     """A request can be cancelled between its prefetch and its first prefill; the
     persistent cache keeps its own copy and no reference on the request's behalf."""
     model = _CacheStubModel(hidden_size=8, tokens_per_image=4)
