@@ -87,7 +87,9 @@ l0_gr100:
   - examples/visual_gen/test_visual_gen_wan.py::test_wan22_t2v_lpips_against_golden
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2i_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_lpips_against_golden
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va] TIMEOUT (60)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va] TIMEOUT (60)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[ref2va] TIMEOUT (30)
 - condition:
     ranges:
       system_gpu_count:
