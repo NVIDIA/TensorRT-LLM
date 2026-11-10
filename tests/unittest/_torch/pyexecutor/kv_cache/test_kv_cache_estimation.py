@@ -2231,14 +2231,18 @@ def _fp8_target_bf16_draft_specs(*, draft_window):
     ]
 
 
+@pytest.mark.parametrize("hosting", [False, True], ids=["plain-v2", "hosting"])
 @pytest.mark.parametrize("target_window", [None, 64])
-def test_unified_estimation_scales_by_target_pool_groups_only(target_window: int | None) -> None:
-    """Hosted draft layers do not scale the dummy workload; the target's own groups do.
+def test_unified_estimation_scales_by_target_pool_groups_only(
+    target_window: int | None, hosting: bool
+) -> None:
+    """A hosting manager's draft layers do not scale the dummy workload; the target's groups do.
 
     The FP8 target and the windowed BF16 draft land in two pool groups, but the
     quota from max_tokens already charges the draft lifecycle its pages, as a
     separate draft pool's quota would. A windowed target layer is a second
-    target group and still doubles the workload.
+    target group and still doubles the workload. A plain V2 manager scales by
+    every group, as before.
     """
     tpb = 32
     spec_config = SimpleNamespace(
@@ -2255,13 +2259,13 @@ def test_unified_estimation_scales_by_target_pool_groups_only(target_window: int
     # Fewer draft heads keep the draft pages apart from either target group's.
     specs[-1] = replace(specs[-1], num_kv_heads=2)
     unified._build_unified_dflash_layer_specs = lambda kv_cache_config: tuple(specs)
+    unified._kv_cache_manager_hosts_draft_layers = lambda: hosting
     target_groups = 1 if target_window is None else 2
 
     assert _get_num_storage_pool_groups(specs, tpb) == target_groups + 1
-    assert (
-        unified._get_token_num_for_estimation()
-        == target_groups * baseline._get_token_num_for_estimation()
-    )
+    assert unified._get_token_num_for_estimation() == (
+        target_groups + (0 if hosting else 1)
+    ) * baseline._get_token_num_for_estimation()
 
 
 def test_unified_fp8_target_bf16_draft_in_one_life_cycle_is_one_pool_group():
