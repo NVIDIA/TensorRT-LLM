@@ -363,14 +363,14 @@ def _run_worker(case: Case) -> dict:
 
         def record_dispatch(*args, **kwargs):
             # Record the actual op arguments, not just the wrapper's capability.
-            use_sentinel = args[14] if len(args) > 14 else kwargs.get("use_sentinel", False)
+            use_sentinel = kwargs.get("use_sentinel", False)
             launches.append(("dispatch", bool(use_sentinel)))
             result = dispatch_op(*args, **kwargs)
             combine_offsets.append(result[1])
             return result
 
         def record_combine(*args, **kwargs):
-            use_sentinel = args[13] if len(args) > 13 else kwargs.get("use_sentinel", False)
+            use_sentinel = kwargs.get("use_sentinel", False)
             launches.append(("combine", bool(use_sentinel)))
             return combine_op(*args, **kwargs)
 

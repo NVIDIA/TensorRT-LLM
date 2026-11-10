@@ -269,10 +269,38 @@ int64_t sentinelDispatchBlocksPerToken(SentinelRowBytes const& row)
 // then the uint64 receive-source mask of every token slot.
 constexpr int64_t kSentinelSourceMaskOffset = CACHELINE_ALIGNMENT;
 
+// Sentinel workspace bytes of one (source rank, token) row in each region: the landing rows (one set
+// of payload, scale and weight rows, two sets of expert-id rows), the combine landing row and the
+// receive rows (payload, scales, expert ids and weights as received). The region sizes and the
+// default token limit are both built from it.
+struct SentinelBytesPerRow
+{
+    int64_t payload, scale, weights, idsSet; // landing
+    int64_t combine;
+    int64_t recv;
+
+    int64_t total() const
+    {
+        return payload + scale + weights + 2 * idsSet + combine + recv;
+    }
+};
+
+SentinelBytesPerRow sentinelBytesPerRow(int64_t topK, SentinelRowBytes const& row, int64_t hiddenSize)
+{
+    int64_t const topkRowBytes = 16 * sentinel::topk_row_vectors(topK);
+    SentinelBytesPerRow bytes{};
+    bytes.payload = row.payload;
+    bytes.scale = row.wireScale;
+    bytes.weights = topkRowBytes;
+    bytes.idsSet = topkRowBytes;
+    bytes.combine = 2 * hiddenSize; // bf16
+    bytes.recv = row.payload + row.scale + 2 * topK * static_cast<int64_t>(sizeof(int32_t));
+    return bytes;
+}
+
 // Bytes of the sentinel regions of one rank for maxNumTokens tokens per source rank: the round
-// state, the landing rows (one set of payload, scale and weight rows, two sets of expert-id
-// rows), the combine landing rows and the receive buffers. Each region and each landing row
-// group starts on a kWorkspaceAlignment boundary.
+// state, then the per-row bytes times the rows. Each region and each landing row group starts on a
+// kWorkspaceAlignment boundary; the receive rows each start on their own cache line.
 struct SentinelRegionBytes
 {
     int64_t state;
@@ -287,29 +315,18 @@ SentinelRegionBytes sentinelRegionBytes(
 {
     auto aligned = [](int64_t bytes) { return static_cast<int64_t>(alignOffset(bytes, kWorkspaceAlignment)); };
     int64_t const rows = epSize * maxNumTokens; // (source rank, token)
-    int64_t const topkRowBytes = 16 * sentinel::topk_row_vectors(topK);
+    auto const perRow = sentinelBytesPerRow(topK, row, hiddenSize);
     SentinelRegionBytes bytes{};
     bytes.state = kSentinelSourceMaskOffset + maxNumTokens * static_cast<int64_t>(sizeof(uint64_t));
-    bytes.payload = aligned(rows * row.payload);
-    bytes.scale = aligned(rows * row.wireScale);
-    bytes.weights = aligned(rows * topkRowBytes);
-    bytes.idsSet = aligned(rows * topkRowBytes);
+    bytes.payload = aligned(rows * perRow.payload);
+    bytes.scale = aligned(rows * perRow.scale);
+    bytes.weights = aligned(rows * perRow.weights);
+    bytes.idsSet = aligned(rows * perRow.idsSet);
     bytes.landing = bytes.payload + bytes.scale + bytes.weights + 2 * bytes.idsSet;
-    bytes.combine = aligned(rows * 2 * hiddenSize);
-    // Payload, scale, expert-id and weight rows, each starting on its own cache line.
-    bytes.recv = rows * (row.payload + row.scale + 2 * topK * static_cast<int64_t>(sizeof(int32_t)))
+    bytes.combine = aligned(rows * perRow.combine);
+    bytes.recv = rows * perRow.recv
         + tensorrt_llm::kernels::moe_comm::kMaxPayloads * static_cast<int64_t>(CACHELINE_ALIGNMENT);
     return bytes;
-}
-
-// Sentinel workspace bytes per (source rank, token) row, alignment padding aside: what the token
-// limit multiplies.
-int64_t sentinelBytesPerRow(int64_t topK, SentinelRowBytes const& row, int64_t hiddenSize)
-{
-    int64_t const topkRowBytes = 16 * sentinel::topk_row_vectors(topK);
-    int64_t const landing = row.payload + row.wireScale + 3 * topkRowBytes;
-    int64_t const recv = row.payload + row.scale + 2 * topK * static_cast<int64_t>(sizeof(int32_t));
-    return landing + 2 * hiddenSize + recv;
 }
 
 // Append the sentinel regions for steps of at most maxNumTokens tokens per rank to `layout`, after
@@ -429,26 +446,27 @@ std::optional<SentinelRound> openSentinelRoundOf(uint8_t const* rankWorkspace)
 }
 
 // Append the sentinel regions to metainfo, a layout from moe_a2a_get_workspace_layout: landing rows
-// for steps of at most maxNumTokens tokens per rank in payloadFormat (sentinel::PayloadFormat) at
+// for steps of at most sentinelMaxTokens tokens per rank in payloadFormat (sentinel::PayloadFormat) at
 // hiddenSize.
 void moeA2ASentinelExtendWorkspaceLayoutOp(
-    torch::Tensor& metainfo, int64_t maxNumTokens, int64_t payloadFormat, int64_t hiddenSize)
+    torch::Tensor& metainfo, int64_t sentinelMaxTokens, int64_t payloadFormat, int64_t hiddenSize)
 {
     auto layout = readWorkspaceLayout(metainfo);
     auto const base = calculateWorkspaceLayout(layout[EP_SIZE_INDEX], layout[MAX_NUM_TOKENS_INDEX], layout[TOP_K_INDEX],
         layout[DISPATCH_PAYLOAD_SIZE_INDEX], layout[COMBINE_INPUT_SIZE_INDEX], layout[EPLB_STATS_NUM_EXPERTS_INDEX]);
     TORCH_CHECK(layout == base, "metainfo must be a layout from moe_a2a_get_workspace_layout");
-    appendSentinelRegions(layout, maxNumTokens, payloadFormat, hiddenSize);
+    appendSentinelRegions(layout, sentinelMaxTokens, payloadFormat, hiddenSize);
     std::copy(layout.begin(), layout.end(), metainfo.data_ptr<int64_t>());
 }
 
 // Row geometry of a sentinel payload format at hiddenSize, for the per-step choice and the default
 // token limit: (hidden-state row bytes, scale row bytes, dispatch blocks per token slot, workspace
 // bytes per (source rank, token) row). Raises for an unsupported hidden size.
-std::vector<int64_t> moeA2ASentinelRowBytesOp(int64_t payloadFormat, int64_t hiddenSize, int64_t topK)
+std::vector<int64_t> moeA2ASentinelRowGeometryOp(int64_t payloadFormat, int64_t hiddenSize, int64_t topK)
 {
     auto const row = sentinelRowBytes(payloadFormat, hiddenSize);
-    return {row.payload, row.scale, sentinelDispatchBlocksPerToken(row), sentinelBytesPerRow(topK, row, hiddenSize)};
+    return {row.payload, row.scale, sentinelDispatchBlocksPerToken(row),
+        sentinelBytesPerRow(topK, row, hiddenSize).total()};
 }
 
 // Whether the loaded code carries the sentinel kernels for the current device.
@@ -528,27 +546,12 @@ uint8_t* setSentinelWorkspace(
     return rankWorkspace;
 }
 
-// The active-rank mask of a sentinel step: one word, since it has at most 64 ranks.
-uint64_t sentinelActiveRankMask(
-    bool enableRankMask, torch::optional<torch::Tensor> const& activeRankMask, int64_t epRank)
-{
-    if (!enableRankMask)
-    {
-        TORCH_CHECK(!hasActiveRankMask(activeRankMask), "active_rank_mask requires enable_rank_mask=True");
-        return ~uint64_t{0};
-    }
-    uint64_t mask[tensorrt_llm::kernels::moe_comm::kRankMaskWords];
-    resolveActiveRankMask(activeRankMask, epRank, mask);
-    return mask[0];
-}
-
 // A sentinel dispatch. inputPayloads = hidden states, [scales,] expert ids, [weights] (the expert
 // ids at expertIdPayloadIndex); recvOffsets = their receive buffers in the sentinel receive region.
 void sentinelDispatch(torch::Tensor const& tokenSelectedExperts, std::vector<torch::Tensor> const& inputPayloads,
     int64_t expertIdPayloadIndex, torch::Tensor const& workspace, MoeA2AWorkspaceLayout const& layout,
     std::vector<size_t> const& recvOffsets, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize,
-    int64_t topK, int64_t numExperts, int64_t invalidExpertId, bool enableRankMask,
-    torch::optional<torch::Tensor> const& activeRankMask)
+    int64_t topK, int64_t numExperts, int64_t invalidExpertId)
 {
     sentinel::DispatchParams params{};
     uint8_t* rankWorkspace = setSentinelWorkspace(params, workspace, layout, epRank, epSize);
@@ -614,19 +617,19 @@ void sentinelDispatch(torch::Tensor const& tokenSelectedExperts, std::vector<tor
     params.wire_scale_vectors = static_cast<int>(row.wireScale / 16);
     params.blocks_per_token = static_cast<int>(sentinelDispatchBlocksPerToken(row));
     params.invalid_expert_id = static_cast<int32_t>(invalidExpertId);
-    params.active_rank_mask = sentinelActiveRankMask(enableRankMask, activeRankMask, epRank);
+    params.active_rank_mask = ~uint64_t{0}; // every rank: a sentinel step takes no rank mask
     params.timeout_cycles = gTimeoutCycles.load(std::memory_order_relaxed);
 
-    int const payloadKind = payloadFormat == sentinel::kBf16 ? sentinel::kKindBf16
-        : payloadFormat == sentinel::kNvfp4                  ? sentinel::kKindNvfp4
-                                                             : sentinel::kKindFp8;
-    sentinel::moe_a2a_sentinel_dispatch_launch(payloadKind, params, enableRankMask, at::cuda::getCurrentCUDAStream());
+    sentinel::PayloadKind const payloadKind = payloadFormat == sentinel::kBf16 ? sentinel::kKindBf16
+        : payloadFormat == sentinel::kNvfp4                                    ? sentinel::kKindNvfp4
+                                                                               : sentinel::kKindFp8;
+    sentinel::moe_a2a_sentinel_dispatch_launch(payloadKind, params, at::cuda::getCurrentCUDAStream());
 }
 
 // A sentinel combine of payload [ep_size, runtimeMaxTokensPerRank, hidden_size] bf16 into output.
 void sentinelCombine(torch::Tensor const& payload, int64_t localNumTokens, torch::Tensor const& workspace,
     MoeA2AWorkspaceLayout const& layout, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK,
-    bool enableRankMask, torch::optional<torch::Tensor> const& activeRankMask, torch::Tensor& output)
+    torch::Tensor& output)
 {
     sentinel::CombineParams params{};
     setSentinelWorkspace(params, workspace, layout, epRank, epSize);
@@ -644,10 +647,10 @@ void sentinelCombine(torch::Tensor const& payload, int64_t localNumTokens, torch
     params.hidden_size = static_cast<int>(hiddenSize);
     params.row_vectors = static_cast<int>(hiddenSize / 8);
     params.blocks_per_token = (params.row_vectors + sentinel::kNumThreads - 1) / sentinel::kNumThreads;
-    params.active_rank_mask = sentinelActiveRankMask(enableRankMask, activeRankMask, epRank);
+    params.active_rank_mask = ~uint64_t{0}; // every rank: a sentinel step takes no rank mask
     params.timeout_cycles = gTimeoutCycles.load(std::memory_order_relaxed);
 
-    sentinel::moe_a2a_sentinel_combine_launch(params, enableRankMask, at::cuda::getCurrentCUDAStream());
+    sentinel::moe_a2a_sentinel_combine_launch(params, at::cuda::getCurrentCUDAStream());
 }
 
 // MoE All-to-All Dispatch Operation
@@ -843,13 +846,13 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     {
         TORCH_CHECK(!enableEplb, "A sentinel dispatch does not gather EPLB statistics");
         // The sentinel kernels never drain or re-arm a masked peer's rows; fault tolerance uses fence.
-        TORCH_CHECK(!enableRankMask, "A sentinel dispatch does not take a rank mask");
+        TORCH_CHECK(
+            !enableRankMask && !hasActiveRankMask(activeRankMask), "A sentinel dispatch does not take a rank mask");
         TORCH_CHECK(sanitizeExpertIds,
             "A sentinel dispatch needs expert_id_payload_index and invalid_token_expert_id: it fills the expert ids of "
             "rows without a token");
         sentinelDispatch(tokenSelectedExperts, inputPayloads, expertIdPayloadIdx, workspace, offsets,
-            payloadRecvBufferOffsets, runtimeMaxTokensPerRank, epRank, epSize, topK, numExperts, invalidExpertId,
-            enableRankMask, activeRankMask);
+            payloadRecvBufferOffsets, runtimeMaxTokensPerRank, epRank, epSize, topK, numExperts, invalidExpertId);
         cudaError_t result = cudaGetLastError();
         TORCH_CHECK(
             result == cudaSuccess, "moe_a2a_dispatch sentinel kernel launch failed: ", cudaGetErrorString(result));
@@ -1066,9 +1069,10 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     if (useSentinel)
     {
         TORCH_CHECK(!useLowPrecision, "A sentinel combine does not use the FP8 wire format");
-        TORCH_CHECK(!enableRankMask, "A sentinel combine does not take a rank mask");
-        sentinelCombine(payload, localNumTokens, workspace, offsets, runtimeMaxTokensPerRank, epRank, epSize, topK,
-            enableRankMask, activeRankMask, output);
+        TORCH_CHECK(
+            !enableRankMask && !hasActiveRankMask(activeRankMask), "A sentinel combine does not take a rank mask");
+        sentinelCombine(
+            payload, localNumTokens, workspace, offsets, runtimeMaxTokensPerRank, epRank, epSize, topK, output);
         cudaError_t result = cudaGetLastError();
         TORCH_CHECK(
             result == cudaSuccess, "moe_a2a_combine sentinel kernel launch failed: ", cudaGetErrorString(result));
@@ -1242,11 +1246,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "int dispatch_payload_bytes, int combine_input_bytes, int? eplb_stats_num_experts=None) -> Tensor",
         &tensorrt_llm::torch_ext::moe_comm::moeA2AGetWorkspaceLayoutOp);
     module.def(
-        "moe_a2a_sentinel_extend_workspace_layout(Tensor(a!) metainfo, int max_num_tokens, int payload_format, "
+        "moe_a2a_sentinel_extend_workspace_layout(Tensor(a!) metainfo, int sentinel_max_tokens, int payload_format, "
         "int hidden_size) -> ()",
         &tensorrt_llm::torch_ext::moe_comm::moeA2ASentinelExtendWorkspaceLayoutOp);
-    module.def("moe_a2a_sentinel_row_bytes(int payload_format, int hidden_size, int top_k) -> int[]",
-        &tensorrt_llm::torch_ext::moe_comm::moeA2ASentinelRowBytesOp);
+    module.def("moe_a2a_sentinel_row_geometry(int payload_format, int hidden_size, int top_k) -> int[]",
+        &tensorrt_llm::torch_ext::moe_comm::moeA2ASentinelRowGeometryOp);
     module.def("moe_a2a_sentinel_available() -> bool", &tensorrt_llm::torch_ext::moe_comm::moeA2ASentinelAvailableOp);
 }
 

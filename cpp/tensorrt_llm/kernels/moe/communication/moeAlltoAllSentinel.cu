@@ -30,8 +30,13 @@
 #define DISABLE_TIMEOUT 0
 #endif
 
-// The kernels are built for compute capability 10.0, 10.3 and 10.7, where the transport is validated.
-// Other architectures get kernels that trap, and moe_a2a_sentinel_kernels_available() is false.
+// Device code for the 10.x targets carries the kernels; other targets get kernels that trap. TRT-LLM
+// builds sm_10x as the sm_100f family by default, so usually only the __CUDA_ARCH__ == 1000 branch is
+// compiled, and GPUs of compute capability 10.3 and 10.7 run that image; 1030 and 1070 apply to
+// builds that list those architectures (e.g. --cuda_architectures "107-real"). Which GPUs may use the
+// transport is decided at run time by moe_a2a_sentinel_kernels_available(), not here. (FlashInfer
+// builds native sm_107a for these kernels, noting that the driver rejects the sm_100f fallback on
+// SM107; if it does, the availability probe below fails and the transport stays off.)
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070)
 #define MOE_A2A_SENTINEL_COMPILE 1
 #else
@@ -926,23 +931,24 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
 // 1 in the code built for an architecture the kernels support.
 __device__ int g_kernels_compiled = MOE_A2A_SENTINEL_COMPILE;
 
-template <int TOP_K_CAPACITY, bool FIXED_TOP_K, bool ENABLE_RANK_MASK>
-void launch_dispatch(int payload_kind, DispatchParams const& params, cudaStream_t stream)
+// Only the all-ranks-active kernels (ENABLE_RANK_MASK = false) are instantiated: the ops reject a
+// rank mask on this transport, since the kernels never drain or re-arm a masked peer's rows.
+template <int TOP_K_CAPACITY, bool FIXED_TOP_K>
+void launch_dispatch(PayloadKind payload_kind, DispatchParams const& params, cudaStream_t stream)
 {
     void (*kernel)(DispatchParams) = payload_kind == kKindBf16
-        ? moeA2ASentinelDispatchKernel<TOP_K_CAPACITY, FIXED_TOP_K, kKindBf16, ENABLE_RANK_MASK>
-        : payload_kind == kKindFp8
-        ? moeA2ASentinelDispatchKernel<TOP_K_CAPACITY, FIXED_TOP_K, kKindFp8, ENABLE_RANK_MASK>
-        : moeA2ASentinelDispatchKernel<TOP_K_CAPACITY, FIXED_TOP_K, kKindNvfp4, ENABLE_RANK_MASK>;
+        ? moeA2ASentinelDispatchKernel<TOP_K_CAPACITY, FIXED_TOP_K, kKindBf16, false>
+        : payload_kind == kKindFp8 ? moeA2ASentinelDispatchKernel<TOP_K_CAPACITY, FIXED_TOP_K, kKindFp8, false>
+                                   : moeA2ASentinelDispatchKernel<TOP_K_CAPACITY, FIXED_TOP_K, kKindNvfp4, false>;
     launchWithPdlWhenEnabled("moeA2ASentinelDispatchKernel", kernel,
         dim3(params.max_tokens_per_rank * params.blocks_per_token), dim3(kNumThreads), 0, stream, params);
 }
 
-template <int TOP_K_CAPACITY, bool FIXED_TOP_K, bool ENABLE_RANK_MASK>
+template <int TOP_K_CAPACITY, bool FIXED_TOP_K>
 void launch_combine(CombineParams const& params, cudaStream_t stream)
 {
     launchWithPdlWhenEnabled("moeA2ASentinelCombineKernel",
-        moeA2ASentinelCombineKernel<TOP_K_CAPACITY, FIXED_TOP_K, ENABLE_RANK_MASK>,
+        moeA2ASentinelCombineKernel<TOP_K_CAPACITY, FIXED_TOP_K, false>,
         dim3(params.max_tokens_per_rank * params.blocks_per_token), dim3(kNumThreads), 0, stream, params);
 }
 
@@ -950,6 +956,21 @@ void launch_combine(CombineParams const& params, cudaStream_t stream)
 
 bool moe_a2a_sentinel_kernels_available()
 {
+    // The GPUs the transport is validated on.
+    int device = 0;
+    int major = 0;
+    int minor = 0;
+    if (cudaGetDevice(&device) != cudaSuccess
+        || cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess
+        || cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess)
+    {
+        cudaGetLastError();
+        return false;
+    }
+    if (major != 10 || (minor != 0 && minor != 3 && minor != 7))
+    {
+        return false;
+    }
     int compiled = 0;
     if (cudaMemcpyFromSymbol(&compiled, g_kernels_compiled, sizeof(compiled)) != cudaSuccess)
     {
@@ -959,34 +980,19 @@ bool moe_a2a_sentinel_kernels_available()
     return compiled != 0;
 }
 
-void moe_a2a_sentinel_dispatch_launch(
-    int payload_kind, DispatchParams const& params, bool enable_rank_mask, cudaStream_t stream)
+void moe_a2a_sentinel_dispatch_launch(PayloadKind payload_kind, DispatchParams const& params, cudaStream_t stream)
 {
-    MOE_A2A_SENTINEL_SWITCH_TOP_K(params.top_k, {
-        if (enable_rank_mask)
-        {
-            launch_dispatch<TOP_K_CAPACITY, FIXED_TOP_K, true>(payload_kind, params, stream);
-        }
-        else
-        {
-            launch_dispatch<TOP_K_CAPACITY, FIXED_TOP_K, false>(payload_kind, params, stream);
-        }
-    })
+    MOE_A2A_SENTINEL_SWITCH_TOP_K(
+        params.top_k, { launch_dispatch<TOP_K_CAPACITY, FIXED_TOP_K>(payload_kind, params, stream); })
 }
 
-void moe_a2a_sentinel_combine_launch(CombineParams const& params, bool enable_rank_mask, cudaStream_t stream)
+void moe_a2a_sentinel_combine_launch(CombineParams const& params, cudaStream_t stream)
 {
-    MOE_A2A_SENTINEL_SWITCH_TOP_K(params.top_k, {
-        if (enable_rank_mask)
-        {
-            launch_combine<TOP_K_CAPACITY, FIXED_TOP_K, true>(params, stream);
-        }
-        else
-        {
-            launch_combine<TOP_K_CAPACITY, FIXED_TOP_K, false>(params, stream);
-        }
-    })
+    MOE_A2A_SENTINEL_SWITCH_TOP_K(params.top_k, { launch_combine<TOP_K_CAPACITY, FIXED_TOP_K>(params, stream); })
 }
+
+#undef MOE_A2A_SENTINEL_SWITCH_TOP_K
+#undef MOE_A2A_SENTINEL_TOP_K_CASE
 
 } // namespace kernels::moe_comm::sentinel
 

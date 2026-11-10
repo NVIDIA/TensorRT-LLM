@@ -145,10 +145,8 @@ inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs(
         {"MOE_A2A_WORKSPACE_ALIGNMENT", kWorkspaceAlignment},
         // Limits of the sentinel transport and its payload formats.
         {"MOE_A2A_SENTINEL_MAX_RANKS", sentinel::kMaxRanks},
-        {"MOE_A2A_SENTINEL_MAX_TOP_K", sentinel::kMaxTopK},
         {"MOE_A2A_SENTINEL_MAX_TOKENS_PER_RANK", sentinel::kMaxTokensPerRank},
         {"MOE_A2A_SENTINEL_DISPATCH_BLOCKS_PER_SM", sentinel::kDispatchBlocksPerSM},
-        {"MOE_A2A_SENTINEL_IDS_SENTINEL", static_cast<int32_t>(sentinel::kIdsSentinel)},
         {"MOE_A2A_SENTINEL_FORMAT_BF16", sentinel::kBf16},
         {"MOE_A2A_SENTINEL_FORMAT_MXFP8", sentinel::kMxfp8},
         {"MOE_A2A_SENTINEL_FORMAT_FP8_BLOCK128", sentinel::kFp8Block128},

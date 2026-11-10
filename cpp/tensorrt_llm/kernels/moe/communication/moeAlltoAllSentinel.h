@@ -105,10 +105,10 @@ static constexpr uint32_t kNvfp4WireXor = 0x77777777u;
 enum PayloadFormat : int
 {
     kBf16 = 0,
-    kMxfp8 = 1,       // e4m3 [T, H] + UE8M0 scales [T, H / 32] (16-bit lanes on the wire)
-    kFp8Block128 = 2, // e4m3 [T, H] + fp32 scales [T, H / 128]
-    kNvfp4 = 3,       // e2m1 x2 [T, H / 2] + e4m3 scales [T, H / 16]
-    kNumPayloadFormats
+    kMxfp8 = 1, // e4m3 [T, H] + UE8M0 scales [T, H / 32] (16-bit lanes on the wire)
+    kFp8Block128
+    = 2,        // e4m3 [T, H] + fp32 scales [T, H / 128]; no quant algo maps to it yet (kept from FlashInfer, tested)
+    kNvfp4 = 3, // e2m1 x2 [T, H / 2] + e4m3 scales [T, H / 16]
 };
 
 // Kernel families by the payload's element width (scales are handled at run time).
@@ -125,7 +125,6 @@ enum RoundStateWord : int
     kEpoch = 0,
     kFinishedCombineBlocks = 1,
     kTimeoutReported = 2,
-    kRoundStateWords = 4
 };
 
 // Landing regions of every rank's workspace slice (byte offsets).
@@ -176,7 +175,7 @@ struct DispatchParams
     int wire_scale_vectors;
     int blocks_per_token;
     int32_t invalid_expert_id;
-    uint64_t active_rank_mask; // bit r: rank r takes part (rank-mask kernels only)
+    uint64_t active_rank_mask; // bit r: rank r takes part (all ranks: the ops take no rank mask)
     int64_t timeout_cycles;
 };
 
@@ -201,14 +200,15 @@ struct CombineParams
     int64_t timeout_cycles;
 };
 
-// Whether the code loaded for the current device carries the kernels. They are built for compute
-// capability 10.0, 10.3 and 10.7; other architectures get kernels that trap.
+// Whether the sentinel kernels can run on the current device: it has compute capability 10.0, 10.3
+// or 10.7 (where the transport is validated) and the code loaded for it carries the kernels (see
+// MOE_A2A_SENTINEL_COMPILE in moeAlltoAllSentinel.cu).
 bool moe_a2a_sentinel_kernels_available();
 
 // Grid max_tokens_per_rank * blocks_per_token; launched with PDL when TRTLLM_ENABLE_PDL is set.
-void moe_a2a_sentinel_dispatch_launch(
-    int payload_kind, DispatchParams const& params, bool enable_rank_mask, cudaStream_t stream);
-void moe_a2a_sentinel_combine_launch(CombineParams const& params, bool enable_rank_mask, cudaStream_t stream);
+// Only the all-ranks-active kernels are instantiated: the ops reject a rank mask on this transport.
+void moe_a2a_sentinel_dispatch_launch(PayloadKind payload_kind, DispatchParams const& params, cudaStream_t stream);
+void moe_a2a_sentinel_combine_launch(CombineParams const& params, cudaStream_t stream);
 
 } // namespace kernels::moe_comm::sentinel
 

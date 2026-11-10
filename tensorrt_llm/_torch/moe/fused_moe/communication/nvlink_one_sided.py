@@ -183,7 +183,7 @@ def sentinel_row(payload_format: str, hidden_size: int, top_k: int) -> SentinelR
     """Raises if the kernels do not take rows of ``hidden_size`` in ``payload_format``."""
     format_id = int(getattr(_tllm_internal.thop, f"MOE_A2A_SENTINEL_FORMAT_{payload_format}"))
     return SentinelRow(
-        *map(int, torch.ops.trtllm.moe_a2a_sentinel_row_bytes(format_id, hidden_size, top_k))
+        *map(int, torch.ops.trtllm.moe_a2a_sentinel_row_geometry(format_id, hidden_size, top_k))
     )
 
 
@@ -1099,11 +1099,11 @@ class NVLinkOneSided(Communication):
                 self.num_experts,
                 eplb_local_stats,
                 # A sentinel dispatch fills the expert IDs of rows without a token itself.
-                expert_id_payload_index if use_sentinel else None,
-                int(self.invalid_token_expert_id) if use_sentinel else None,
-                self._rank_mask_enabled,
-                active_rank_mask,
-                use_sentinel,
+                expert_id_payload_index=expert_id_payload_index if use_sentinel else None,
+                invalid_token_expert_id=int(self.invalid_token_expert_id) if use_sentinel else None,
+                enable_rank_mask=self._rank_mask_enabled,
+                active_rank_mask=active_rank_mask,
+                use_sentinel=use_sentinel,
             )
         )
         # A sentinel round writes no completion flags for the watchdog to observe.
@@ -1244,10 +1244,10 @@ class NVLinkOneSided(Communication):
             self.top_k,
             int(combine_payload_offset),
             bool(self.payload_in_workspace),
-            bool(self.use_low_precision_combine),
-            self._rank_mask_enabled,
-            active_rank_mask,
-            use_sentinel,
+            use_low_precision=bool(self.use_low_precision_combine),
+            enable_rank_mask=self._rank_mask_enabled,
+            active_rank_mask=active_rank_mask,
+            use_sentinel=use_sentinel,
         )
         if not use_sentinel:
             self._watchdog_coordinator.watch_collective(
