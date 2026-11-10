@@ -11,15 +11,21 @@ those its call signature has not listed yet. Worker threads then build them in p
 The op's own later call finds a kernel built, or waits on the op's own lock for a build
 that is still running.
 
+An op that goes through the autotuner builds through it instead: in the autotuner's
+build state (``autotuner.build_kernels``), ``choose_one`` queues here the builds of every
+shape, runner and tactic the op's tuning will time.
+
 A rehearsal is a build pass over the autotuner warmup's forwards on dummy weights, run
-before the checkpoint loads: the ops list their kernels without building or launching
-them, and the pass does not wait, so the builds run while the weights load. It runs for
-a model that one of the op families in ``_FAMILIES`` reaches.
+before the checkpoint loads, in the autotuner's build state: the ops list their kernels
+without building or launching them, and the pass does not wait, so the builds run while
+the weights load. It runs for a model that one of the op families in ``_FAMILIES``
+reaches.
 
 ``TLLM_KERNEL_BUILDER=0`` turns it off: no pass is active and nothing is submitted.
 ``TLLM_KERNEL_BUILDER_REHEARSAL=0`` keeps the builds but not the rehearsal: they start
 at the warmup. ``TLLM_KERNEL_BUILDER_THREADS`` sets the number of worker threads
-(default 8).
+(default: this rank's share of the CPUs, up to 32, as for the autotuner's parallel JIT
+warmup).
 """
 
 from __future__ import annotations
@@ -55,16 +61,17 @@ __all__ = ["BuildConfig", "DynamicSpec", "KernelBuilder"]
 _ENV = "TLLM_KERNEL_BUILDER"
 _REHEARSAL_ENV = "TLLM_KERNEL_BUILDER_REHEARSAL"
 _THREADS_ENV = "TLLM_KERNEL_BUILDER_THREADS"
-_DEFAULT_THREADS = 8
 _PROGRESS_EVERY_S = 60.0
 
 # The op families a rehearsal can reach: name -> "module:function". The function takes the
-# model config, returns True when the model reaches the op, and then queues the builds the
-# configuration alone determines. A module is imported only when asked.
+# model config and the model as created, returns True when the model reaches the op, and
+# then queues the builds the configuration alone determines. A module is imported only
+# when asked.
 _FAMILIES = {
     "fmha_sm100": (
         "tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_kernel_builds:reaches"
     ),
+    "deep_gemm": "tensorrt_llm._torch.modules.linear:deep_gemm_reaches",
 }
 
 # A build returns True when it compiled the kernel, False when the kernel was already there.
@@ -155,7 +162,12 @@ class KernelBuilder:
             rehearse = os.environ.get(_REHEARSAL_ENV, "1") != "0"
         self.rehearse = self.enabled and rehearse
         if threads is None:
-            threads = int(os.environ.get(_THREADS_ENV, str(_DEFAULT_THREADS)))
+            if _THREADS_ENV in os.environ:
+                threads = int(os.environ[_THREADS_ENV])
+            else:
+                from .autotuner import _default_parallel_jit_warmup_threads
+
+                threads = _default_parallel_jit_warmup_threads()
         self.threads = max(1, threads)
         self._lock = threading.Lock()
         self._idle = threading.Condition(self._lock)
@@ -165,6 +177,8 @@ class KernelBuilder:
         self._passes = 0
         self._rehearsals = 0
         self._pending = 0
+        # Queued and running builds per op.
+        self._pending_by_op: Dict[str, int] = {}
         # The shapes listed so far for each (op, call signature).
         self._listed: Dict[Tuple[str, Hashable], set] = {}
         self._states: Dict[Tuple[str, Hashable], str] = {}
@@ -226,9 +240,10 @@ class KernelBuilder:
         """True inside a rehearsal: an op lists its kernels, then skips its own launch."""
         return self.enabled and self._rehearsals > 0
 
-    def wants_rehearsal(self, model_config: Any) -> bool:
-        """True when the rehearsal is on and an op family in ``_FAMILIES`` reaches the
-        model. Each family that does queues the builds its configuration determines."""
+    def wants_rehearsal(self, model_config: Any, model: Any = None) -> bool:
+        """True when the rehearsal is on and an op family in ``_FAMILIES`` reaches
+        ``model``, as created from ``model_config``. Each family that does queues the
+        builds its configuration determines."""
         if not self.rehearse:
             return False
         wanted = False
@@ -236,7 +251,7 @@ class KernelBuilder:
             module_name, function = target.split(":")
             try:
                 reaches = getattr(importlib.import_module(module_name), function)
-                wanted = bool(reaches(model_config)) or wanted
+                wanted = bool(reaches(model_config, model)) or wanted
             except Exception as e:  # noqa: BLE001 - the family's kernels build at the warmup
                 logger.warning(
                     f"[KernelBuilder] {name}: could not tell whether the model reaches it; "
@@ -301,6 +316,7 @@ class KernelBuilder:
             self._states[(op, key)] = _QUEUED
             self._op_stats(op).submitted += 1
             self._pending += 1
+            self._pending_by_op[op] = self._pending_by_op.get(op, 0) + 1
             self._start_workers()
         self._queue.put((op, key, build))
         return True
@@ -337,21 +353,25 @@ class KernelBuilder:
 
     # Waiting and reporting.
 
-    def join(self, timeout: Optional[float] = None) -> float:
-        """Wait for every queued build; returns the seconds waited."""
+    def join(self, timeout: Optional[float] = None, prefix: Optional[str] = None) -> float:
+        """Wait for every queued build, or for those of the ops whose name starts with
+        ``prefix``; returns the seconds waited."""
         t0 = last = time.perf_counter()
         with self._idle:
-            while self._pending > 0:
+            while (pending := self._pending_for(prefix)) > 0:
                 now = time.perf_counter()
                 if timeout is not None and now - t0 >= timeout:
                     break
                 if now - last >= _PROGRESS_EVERY_S:
-                    logger.info(
-                        f"[KernelBuilder] waiting {now - t0:.0f}s for {self._pending} builds"
-                    )
+                    logger.info(f"[KernelBuilder] waiting {now - t0:.0f}s for {pending} builds")
                     last = now
                 self._idle.wait(timeout=1.0)
         return time.perf_counter() - t0
+
+    def _pending_for(self, prefix: Optional[str]) -> int:
+        if prefix is None:
+            return self._pending
+        return sum(n for op, n in self._pending_by_op.items() if op.startswith(prefix))
 
     def report(self, name: str, waited: float = 0.0) -> List[str]:
         with self._lock:
@@ -407,6 +427,8 @@ class KernelBuilder:
                     f"[KernelBuilder] {op} {key}: build failed; the op builds it on first use. "
                     f"{type(e).__name__}: {e}"
                 )
+            # A build can hold the tensors it was made from: drop it before the next get().
+            del build
             seconds = time.perf_counter() - t0
             with self._idle:
                 self._states[(op, key)] = state
@@ -419,5 +441,6 @@ class KernelBuilder:
                 else:
                     stats.present += 1
                 self._pending -= 1
-                if self._pending == 0:
-                    self._idle.notify_all()
+                self._pending_by_op[op] -= 1
+                # Waits by op prefix end as an op's builds finish, not only at idle.
+                self._idle.notify_all()

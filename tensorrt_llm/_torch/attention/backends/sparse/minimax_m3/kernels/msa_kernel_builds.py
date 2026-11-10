@@ -291,7 +291,7 @@ class _Package:
         return self.reduction_fn()
 
 
-def reaches(model_config: Any) -> bool:
+def reaches(model_config: Any, model: Any = None) -> bool:
     """True when the model runs MiniMax-M3's MSA attention on fmha_sm100, whose modules
     are then submitted."""
     from tensorrt_llm._utils import is_sm_100f

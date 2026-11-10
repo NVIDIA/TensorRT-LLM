@@ -207,18 +207,25 @@ curl http://localhost:8000/server_info
 
 An op that compiles its kernels on first use lists them when it runs, for every shape it
 sweeps down from that call's and has not listed yet, as the autotuner sweeps its tuning
-buckets; worker threads build them in parallel. For a model with such an op, the engine first loads dummy
-weights and runs the autotuner warmup's two forwards on them (a context batch at the maximum
-token count and one generation request), then loads the checkpoint while the kernels build.
-The startup log shows these as the `rehearsal` and `checkpoint` phases, which
-`model_engine_creation_seconds` then does not include. Supported ops: MiniMax-M3's MSA
-attention (`fmha_sm100`).
+buckets; worker threads build them in parallel. An op that the autotuner tunes has three
+states: the autotuner warmup tunes it, a build state builds the kernels of every shape,
+runner and tactic its tuning will time on the same worker threads without timing them, and
+serving runs the tuned tactic.
+
+For a model with such an op, the engine first loads dummy weights and runs the autotuner
+warmup's two forwards on them (a context batch at the maximum token count and one
+generation request) in the build state, then loads the checkpoint while the kernels build.
+The startup log shows these as the `rehearsal`, `checkpoint` and `autotuner_builds` phases,
+which `model_engine_creation_seconds` then does not include; `autotuner_builds` waits for
+the autotuned ops' builds. Supported ops: MiniMax-M3's MSA attention (`fmha_sm100`), and in
+the build state, DeepGEMM's FP8 block-scale GEMMs on Blackwell and FlashInfer's MXFP8 GEMM.
 
 | Environment variable | Default | Effect |
 |----------------------|---------|--------|
 | `TLLM_KERNEL_BUILDER` | `1` | `0` compiles each kernel on its first use instead. |
 | `TLLM_KERNEL_BUILDER_REHEARSAL` | `1` | `0` loads the checkpoint first; the kernels then build from the warmup on. |
-| `TLLM_KERNEL_BUILDER_THREADS` | `8` | Worker threads per process. |
+| `TLLM_KERNEL_BUILDER_AUTOTUNER` | `1` | `0` leaves the autotuned ops' kernels to the autotuner warmup. |
+| `TLLM_KERNEL_BUILDER_THREADS` | this rank's share of the CPUs, up to 32 | Worker threads per process. |
 
 ## Unified Cache for Compiled Artifacts
 

@@ -1541,7 +1541,7 @@ class ModelLoader:
                     and not requires_standard_hf_loading
                     and moe_load_balancer is None and getattr(
                         model.model_config, "modeling_v2_target", None) is None
-                    and KernelBuilder.get().wants_rehearsal(config)):
+                    and KernelBuilder.get().wants_rehearsal(config, model)):
                 self._deferred = self._load_rehearsal_weights(
                     model,
                     config,

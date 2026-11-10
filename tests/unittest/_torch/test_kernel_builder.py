@@ -167,15 +167,30 @@ def test_a_rehearsal_leaves_its_builds_running_for_the_next_pass():
 def test_the_rehearsal_runs_for_a_model_an_op_family_reaches(monkeypatch):
     reached = []
     family = types.ModuleType("family")
-    family.reaches = lambda model_config: reached.append(model_config) or model_config == "msa"
+    family.reaches = (
+        lambda model_config, model: reached.append((model_config, model)) or model_config == "msa"
+    )
     monkeypatch.setitem(sys.modules, "family", family)
     monkeypatch.setattr(kernel_builder, "_FAMILIES", {"op": "family:reaches"})
     builder = KernelBuilder(threads=1, enabled=True)
-    assert builder.wants_rehearsal("msa")
-    assert not builder.wants_rehearsal("dense")
-    assert reached == ["msa", "dense"]
+    assert builder.wants_rehearsal("msa", "model")
+    assert not builder.wants_rehearsal("dense", "model")
+    assert reached == [("msa", "model"), ("dense", "model")]
     assert not KernelBuilder(threads=1, enabled=True, rehearse=False).wants_rehearsal("msa")
     assert not KernelBuilder(threads=1, enabled=False).wants_rehearsal("msa")
+
+
+def test_join_waits_for_the_builds_of_the_ops_a_prefix_names():
+    builder = KernelBuilder(threads=2, enabled=True)
+    release = threading.Event()
+    builder.submit("other", "k", lambda: release.wait(timeout=30))
+    builder.submit("autotuner:op", "k", lambda: True)
+    assert builder.join(timeout=30, prefix="autotuner:") < 30
+    assert builder.state("autotuner:op", "k") == "done"
+    assert builder.state("other", "k") == "queued"
+    release.set()
+    builder.join(timeout=30)
+    assert builder.state("other", "k") == "done"
 
 
 def test_disabled():

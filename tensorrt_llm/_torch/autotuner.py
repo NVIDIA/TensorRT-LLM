@@ -22,13 +22,15 @@ import inspect
 import itertools
 import json
 import os
+import threading
 import time
 import zlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import (Any, Callable, Dict, Hashable, List, Optional, Set, Tuple,
+                    Union)
 
 import torch
 from cuda.bindings import driver
@@ -36,6 +38,7 @@ from cuda.bindings import driver
 import tensorrt_llm
 from tensorrt_llm import _jit_share as jit_share
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.kernel_builder import KernelBuilder
 from tensorrt_llm._torch.nccl_window_graph import (
     abandon_nccl_window_graph_owner, nccl_window_allocation_suppressed,
     nccl_window_graph_capture, release_nccl_window_graph_owner)
@@ -50,6 +53,10 @@ from tensorrt_llm.mapping import Mapping
 
 # Unique tag to avoid collisions with other comms
 PP_COMM_TAG_AUTOTUNING = 30000
+# TLLM_KERNEL_BUILDER_AUTOTUNER=0 keeps the build state from building anything.
+_BUILD_ENV = "TLLM_KERNEL_BUILDER_AUTOTUNER"
+# The KernelBuilder op name of the build state's builds is this plus the custom op.
+BUILD_OP_PREFIX = "autotuner:"
 
 
 class DistributedTuningStrategy(enum.Enum):
@@ -153,11 +160,13 @@ class TuningConfig:
         exclude_from_cache (bool): Skip disk persistence of tuning results for this op.
             Use for JIT-driven ops where caching the tactic across processes would skip
             the JIT warmup. In-process cache still works.
-        parallel_jit_warmup (int): Before profiling, run every not-yet-tuned profile once
-            on this many threads. For runners whose first call per shape JIT-compiles a
-            kernel and releases the GIL while compiling (DeepGEMM), those compiles then
-            overlap, and the profiling loop that follows finds them built. Opted-in
-            runners must be thread-safe and must not use NCCL windows. 0 disables; -1 uses
+        parallel_jit_warmup (int): Before profiling, build every not-yet-tuned profile
+            (``TunableRunner.build``) on this many threads. For runners whose first call
+            per shape JIT-compiles a kernel and releases the GIL while compiling
+            (DeepGEMM), those compiles then overlap, and the profiling loop that follows
+            finds them built. Nonzero also has the build state (``build_kernels``) build
+            the op's kernels on KernelBuilder's worker threads. Opted-in runners' ``build``
+            must be thread-safe and must not use NCCL windows. 0 disables; -1 uses
             the CPUs this rank may run on, divided by the ranks on the node unless the
             rank is pinned to a subset, up to 32: neighbouring sweep points often select
             the same kernel and compile it twice, so more threads keep paying off.
@@ -304,6 +313,48 @@ class TunableRunner(ABC):
             Any: The unique id of the runner, which can be converted to a string for the cache key.
         """
         return tuple(self.__dict__.values())
+
+    def build(self,
+              inputs: List[torch.Tensor],
+              *,
+              tactic: Any = -1,
+              **kwargs) -> None:
+        """Compile the kernels ``tactic`` runs on ``inputs``; the result is discarded.
+
+        The build state and the parallel JIT warmup call it on worker threads
+        (``TuningConfig.parallel_jit_warmup``). This default runs the tactic once,
+        which compiles what a first call compiles. A runner that can compile
+        without launching overrides it.
+        """
+        self(inputs, tactic=tactic, **kwargs)
+
+    def build_key(self, profile: OptimizationProfile, tactic: Any) -> Hashable:
+        """Builds with equal keys compile the same kernels, so only one of them runs.
+
+        This default distinguishes every profile and tactic.
+        """
+        return (profile.get_opt_shapes(), str(tactic))
+
+
+@contextlib.contextmanager
+def build_kernels():
+    """The autotuner's build state, for forwards whose outputs are discarded.
+
+    An op that tunes has three states: it tunes inside ``autotune()``, it builds
+    here, and otherwise it runs its tuned tactic. Here ``choose_one`` queues the
+    builds of every profile, runner and tactic the op's tuning would time on
+    KernelBuilder's worker threads (``AutoTuner.prebuild``), without timing them,
+    and returns the tactic the op would run. An op that builds this way returns
+    zeros of its output shape instead of running it. A nested ``autotune()`` leaves
+    the build state on.
+    """
+    autotuner = AutoTuner.get()
+    old_mode = autotuner.is_build_mode
+    autotuner.is_build_mode = True
+    try:
+        yield
+    finally:
+        autotuner.is_build_mode = old_mode
 
 
 @contextlib.contextmanager
@@ -967,6 +1018,28 @@ def _spec_in_bounds(spec, shapes_list) -> bool:
     return True
 
 
+def _interleaved(profiles: List[OptimizationProfile],
+                 num_threads: int) -> List[OptimizationProfile]:
+    """``profiles`` reordered for ``num_threads`` workers: one from each of as many
+    contiguous blocks of the sweep in turn, so the builds in flight come from
+    far-apart shapes and mostly select different kernels rather than several
+    threads compiling the same one."""
+    size = -(-len(profiles) // max(1, num_threads))
+    blocks = [profiles[i * size:(i + 1) * size] for i in range(num_threads)]
+    return [b[j] for j in range(size) for b in blocks if j < len(b)]
+
+
+_build_streams = threading.local()
+
+
+def _thread_build_stream() -> torch.cuda.Stream:
+    """The calling thread's own stream for builds, made on first use."""
+    stream = getattr(_build_streams, "stream", None)
+    if stream is None:
+        stream = _build_streams.stream = torch.cuda.Stream()
+    return stream
+
+
 def _default_parallel_jit_warmup_threads() -> int:
     """Threads for ``parallel_jit_warmup=-1``: this rank's CPUs, up to 32.
 
@@ -995,6 +1068,11 @@ class AutoTuner:
     This class handles automatic performance tuning of tensor operations by profiling
     different implementations and caching the best performing configurations.
 
+    ``choose_one`` behaves by state: inside ``autotune()`` it profiles and caches the
+    best (runner, tactic); inside ``build_kernels()`` it builds the kernels of every
+    one without timing them (``prebuild``); otherwise it returns the cached choice,
+    or the fallback.
+
     Args:
         warmup (int): Number of warmup iterations before profiling (default: 3)
         repeat (int): Number of profiling iterations for averaging (default: 10)
@@ -1018,7 +1096,13 @@ class AutoTuner:
         # has happened here), as opposed to keys loaded from disk or peers.
         self._keys_profiled_in_process: set[Tuple] = set()
         self.is_tuning_mode = False
+        self.is_build_mode = False
         self.skip_dynamic_tuning_buckets = False
+        # The build state's bookkeeping, shared with the worker threads: the
+        # choose_one calls that queued their builds, and the build keys built.
+        self._build_lock = threading.Lock()
+        self._build_calls: set[Tuple] = set()
+        self._built_keys: set[Tuple] = set()
 
         # Timing backend: globaltimer kernel vs cuda events.
         # TLLM_PROFILING_TIMER env var overrides auto-detection:
@@ -1223,6 +1307,18 @@ class AutoTuner:
             })
 
         input_shapes = tuple(self._get_input_sizes(inputs))
+
+        if self.is_build_mode:
+            # Build what the tuning would time, and return what the op runs now.
+            # Nothing is profiled or cached, and no rank waits for another.
+            self.prebuild(custom_op, runners, tuning_config, inputs, **kwargs)
+            _, best_runner_id, best_tactic, _ = self.profiling_cache.search_cache(
+                custom_op,
+                runners,
+                input_shapes,
+                tuning_config,
+                apply_map_to_tuning_buckets=True)
+            return (runners[best_runner_id], best_tactic)
 
         # For ops opted out of the persistent cache (e.g. JIT-driven
         # kernels whose "tuning" triggers compilation as a side effect),
@@ -1843,11 +1939,104 @@ class AutoTuner:
 
         return best_runner_id, best_tactic, min_time, has_tuning_failure_occurred
 
+    def prebuild(self, custom_op: str, runners: List[TunableRunner],
+                 tuning_config: TuningConfig, inputs: List[torch.Tensor],
+                 **kwargs) -> None:
+        """In the build state, queue the builds of every profile the op's tuning
+        would profile for ``inputs`` on KernelBuilder's worker threads.
+
+        Each build builds every runner's every valid tactic for its profile
+        (``_build_profile``). The profiles are swept down from the inputs' shapes,
+        whatever ``skip_dynamic_tuning_buckets`` is, since the tuning that follows
+        may tune each of them. Nothing is timed or cached. ``choose_one`` calls it in
+        the build state; an op calls it for a backend its forward does not run.
+
+        Only an op that opts in with ``TuningConfig.parallel_jit_warmup`` builds; a
+        MERGE-strategy op, whose runners are collective, does not. A call with the
+        runners and input shapes of an earlier one returns at once.
+        """
+        if (not self.is_build_mode or tuning_config.parallel_jit_warmup == 0
+                or tuning_config.distributed_tuning_strategy
+                == DistributedTuningStrategy.MERGE
+                or os.environ.get(_BUILD_ENV, "1") == "0"):
+            return
+        builder = KernelBuilder.get()
+        if not builder.enabled:
+            return
+        runner_ids = tuple((type(runner).__name__, str(runner.unique_id()))
+                           for runner in runners)
+        call = (custom_op, runner_ids, tuple(self._get_input_sizes(inputs)),
+                tuple(getattr(t, "dtype", None) for t in inputs))
+        with self._build_lock:
+            if call in self._build_calls:
+                return
+            self._build_calls.add(call)
+        profiles = self._optimization_profiles(
+            tuning_config, inputs, skip_dynamic_tuning_buckets=False)
+        # The builds read the inputs on streams of their own, after the work
+        # queued so far, which produced them.
+        ready = torch.cuda.Event()
+        ready.record()
+        queued = sum(
+            builder.submit(
+                BUILD_OP_PREFIX + custom_op, (runner_ids, p.get_opt_shapes()),
+                partial(self._build_profile,
+                        custom_op,
+                        runners,
+                        p,
+                        inputs,
+                        tuning_config,
+                        None,
+                        kwargs,
+                        ready=ready))
+            for p in _interleaved(profiles, builder.threads))
+        logger.info(f"[Autotuner] {custom_op}: {queued} of {len(profiles)} "
+                    "profiles queued to build")
+
+    def _build_profile(self,
+                       custom_op: str,
+                       runners: List[TunableRunner],
+                       profile: OptimizationProfile,
+                       inputs: List[torch.Tensor],
+                       tuning_config: TuningConfig,
+                       stream: Optional[torch.cuda.Stream],
+                       kwargs: Dict[str, Any],
+                       ready: Optional[torch.cuda.Event] = None) -> bool:
+        """Build every runner's every valid tactic for ``profile``, on its inputs.
+
+        A tactic whose ``TunableRunner.build_key`` this process built already is
+        skipped. Runs under inference mode on ``stream``, or else on a stream of
+        the calling thread's own, after ``ready``, and returns whether anything
+        was built.
+        """
+        stream = stream if stream is not None else _thread_build_stream()
+        if ready is not None:
+            stream.wait_event(ready)
+        built = False
+        with torch.inference_mode(), torch.cuda.stream(stream):
+            tensors = self._prepare_input_tensors(profile, inputs)
+            if tuning_config.inputs_pre_hook is not None:
+                tensors = tuning_config.inputs_pre_hook(tensors)
+            for runner in runners:
+                runner_id = (type(runner).__name__, str(runner.unique_id()))
+                for tactic in runner.get_valid_tactics(tensors, profile,
+                                                       **kwargs):
+                    key = (custom_op, runner_id,
+                           runner.build_key(profile, tactic))
+                    with self._build_lock:
+                        if key in self._built_keys:
+                            continue
+                        self._built_keys.add(key)
+                    runner.build(tensors, tactic=tactic, **kwargs)
+                    built = True
+            stream.synchronize()
+        return built
+
     def _parallel_jit_warmup(self, custom_op: str, runners: List[TunableRunner],
                              profiles: List[OptimizationProfile],
                              inputs: List[torch.Tensor],
                              tuning_config: TuningConfig, **kwargs) -> None:
-        """Run each not-yet-tuned profile once on a thread pool to drive its JIT.
+        """Build each not-yet-tuned profile on a thread pool to drive its JIT.
 
         See ``TuningConfig.parallel_jit_warmup``. Purely a warmup: results are
         discarded, and a failure here is left to the profiling loop, which
@@ -1872,12 +2061,7 @@ class AutoTuner:
         num_threads = min(num_threads, len(pending))
         if num_threads < 2:
             return
-        # Interleave contiguous blocks of the sweep, so the calls in flight
-        # come from far-apart shapes and mostly select different kernels
-        # rather than several threads compiling the same one.
-        size = -(-len(pending) // num_threads)
-        blocks = [pending[i * size:(i + 1) * size] for i in range(num_threads)]
-        order = [b[j] for j in range(size) for b in blocks if j < len(b)]
+        order = _interleaved(pending, num_threads)
         device = torch.cuda.current_device()
         # One stream for all workers: the allocator caches their blocks where
         # the profiling loop below allocates, and GPU time is not the cost here.
@@ -1887,15 +2071,8 @@ class AutoTuner:
         def warm(profile: OptimizationProfile) -> None:
             torch.cuda.set_device(device)
             try:
-                with torch.cuda.stream(stream):
-                    tensors = self._prepare_input_tensors(profile, inputs)
-                    if tuning_config.inputs_pre_hook is not None:
-                        tensors = tuning_config.inputs_pre_hook(tensors)
-                    for runner in runners:
-                        for tactic in runner.get_valid_tactics(
-                                tensors, profile, **kwargs):
-                            runner(tensors, tactic=tactic, **kwargs)
-                    stream.synchronize()
+                self._build_profile(custom_op, runners, profile, inputs,
+                                    tuning_config, stream, kwargs)
             except Exception as e:  # noqa: BLE001 - the profiling loop reports it
                 failures.append(e)
 
@@ -2115,13 +2292,18 @@ class AutoTuner:
         return avg_time
 
     def _optimization_profiles(
-            self, tuning_config: TuningConfig,
-            inputs: List[torch.Tensor]) -> List[OptimizationProfile]:
+        self,
+        tuning_config: TuningConfig,
+        inputs: List[torch.Tensor],
+        skip_dynamic_tuning_buckets: Optional[bool] = None
+    ) -> List[OptimizationProfile]:
         """Generate optimization profiles for autotuning.
 
         Args:
             tuning_config (TuningConfig): Tuning configuration
             inputs (List[torch.Tensor]): List of input tensors
+            skip_dynamic_tuning_buckets (Optional[bool]): Overrides the tuner's
+                ``skip_dynamic_tuning_buckets`` when given.
 
         Returns:
             List of OptimizationProfile objects representing different configurations
@@ -2142,13 +2324,15 @@ class AutoTuner:
         generated_profiles: List[OptimizationProfile] = []
 
         dynamic_dims = []
+        if skip_dynamic_tuning_buckets is None:
+            skip_dynamic_tuning_buckets = self.skip_dynamic_tuning_buckets
 
         for spec in tuning_config.dynamic_tensor_specs:
             assert callable(spec.gen_tuning_buckets) or isinstance(spec.gen_tuning_buckets, (list, tuple)), \
                 "The given dynamic dimension must provide a opt value generation function or a list of opt values"
             if not _spec_in_bounds(spec, base_profile.shapes):
                 continue
-            if self.skip_dynamic_tuning_buckets:
+            if skip_dynamic_tuning_buckets:
                 if spec.map_to_tuning_buckets is not None:
                     # Still include the bucketed value of the actual shape so the
                     # cache key used during profiling (raw) aligns with the key
@@ -2373,6 +2557,9 @@ class AutoTuner:
         """Clear the profiling cache."""
         self.profiling_cache.clear()
         self._keys_profiled_in_process.clear()
+        with self._build_lock:
+            self._build_calls.clear()
+            self._built_keys.clear()
         if hasattr(torch.ops.trtllm, "clear_allreduce_tactic_cache"):
             torch.ops.trtllm.clear_allreduce_tactic_cache()
 

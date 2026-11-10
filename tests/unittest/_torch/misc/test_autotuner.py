@@ -3026,3 +3026,201 @@ def test_shared_jit_builds_replace_the_warmup_pool(monkeypatch, tmp_path,
     assert on_caller == set(buckets)
     assert on_pool == ([] if sharing else sorted(buckets))
     tuner.clear_cache()
+
+
+@pytest.fixture
+def kernel_builder(monkeypatch):
+    """A KernelBuilder of the test's own, for the autotuner's build state."""
+    from tensorrt_llm._torch import kernel_builder as kb
+    builder = kb.KernelBuilder(threads=4, enabled=True)
+    monkeypatch.setattr(kb.KernelBuilder, "_instance", builder)
+    monkeypatch.delenv("TLLM_KERNEL_BUILDER_AUTOTUNER", raising=False)
+    monkeypatch.delenv("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP", raising=False)
+    AutoTuner.get().clear_cache()
+    yield builder
+    builder.join(timeout=600)
+    AutoTuner.get().clear_cache()
+
+
+_BUILD_BUCKETS = (4, 8, 16, 32, 64, 128)
+
+
+def _build_config(**kwargs) -> TuningConfig:
+    return TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, _BUILD_BUCKETS), ),
+                        **kwargs)
+
+
+def _build_inputs() -> List[torch.Tensor]:
+    return [
+        torch.randn(128, 64, device="cuda"),
+        torch.randn(64, 128, device="cuda")
+    ]
+
+
+def test_the_build_state_builds_every_profile_without_tuning(kernel_builder):
+    """In the build state, choose_one builds every profile its tuning would profile
+    on KernelBuilder's threads and returns the fallback without caching anything.
+    The tuning that follows still profiles every profile, and builds nothing again."""
+    tuner = AutoTuner.get()
+    ThreadRecordingRunner.calls.clear()
+    config = _build_config(parallel_jit_warmup=4)
+    inputs = _build_inputs()
+    op = "autotuner_test::build_state"
+    caller = threading.get_ident()
+    with autotuner.build_kernels():
+        assert tuner.is_build_mode
+        _, tactic = tuner.choose_one(op, [ThreadRecordingRunner()], config,
+                                     inputs)
+        # Another layer's call queues nothing more.
+        tuner.choose_one(op, [ThreadRecordingRunner()], config, inputs)
+    assert not tuner.is_build_mode
+    assert tactic == -1
+    kernel_builder.join(timeout=60)
+    assert sorted(
+        m for m, _ in ThreadRecordingRunner.calls) == sorted(_BUILD_BUCKETS)
+    assert all(t != caller for _, t in ThreadRecordingRunner.calls)
+    assert len(tuner.profiling_cache) == 0
+    stats = kernel_builder.stats(autotuner.BUILD_OP_PREFIX + op)
+    assert (stats.submitted, stats.failed) == (len(_BUILD_BUCKETS), 0)
+
+    ThreadRecordingRunner.calls.clear()
+    with autotune():
+        tuner.choose_one(op, [ThreadRecordingRunner()], config, inputs)
+    assert sorted(m for m, t in ThreadRecordingRunner.calls
+                  if t == caller) == sorted(_BUILD_BUCKETS)
+    assert all(t == caller for _, t in ThreadRecordingRunner.calls)
+
+
+@pytest.mark.parametrize("threads, strategy, env", [
+    (0, DistributedTuningStrategy.INDEPENDENT, None),
+    (4, DistributedTuningStrategy.MERGE, None),
+    (4, DistributedTuningStrategy.INDEPENDENT, "0"),
+])
+def test_the_build_state_builds_only_ops_that_opt_in(kernel_builder,
+                                                     monkeypatch, threads,
+                                                     strategy, env):
+    """An op that does not opt in with parallel_jit_warmup, a collective (MERGE)
+    op, and TLLM_KERNEL_BUILDER_AUTOTUNER=0 build nothing."""
+    if env is not None:
+        monkeypatch.setenv("TLLM_KERNEL_BUILDER_AUTOTUNER", env)
+    tuner = AutoTuner.get()
+    ThreadRecordingRunner.calls.clear()
+    config = _build_config(parallel_jit_warmup=threads,
+                           distributed_tuning_strategy=strategy)
+    op = f"autotuner_test::build_state_opt_in_{threads}_{strategy.value}_{env}"
+    with autotuner.build_kernels():
+        _, tactic = tuner.choose_one(op, [ThreadRecordingRunner()], config,
+                                     _build_inputs())
+    kernel_builder.join(timeout=60)
+    assert tactic == -1
+    assert kernel_builder.stats(autotuner.BUILD_OP_PREFIX + op).submitted == 0
+    assert ThreadRecordingRunner.calls == []
+
+
+def test_a_runner_builds_through_its_own_build_once_per_build_key(
+        kernel_builder):
+    """A runner that compiles without launching overrides build(); builds with
+    equal build_keys build once. A nested autotune(tune_mode=False) keeps the build
+    state, whose sweep ignores skip_dynamic_tuning_buckets."""
+    built = []
+
+    class ModuleRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs, profile, **kwargs):
+            return [-1, 0]
+
+        def forward(self, /, inputs, *, tactic=-1, **kwargs):
+            raise AssertionError("the build state launched the runner")
+
+        def build(self, inputs, *, tactic=-1, **kwargs):
+            built.append(tactic)
+
+        def build_key(self, profile, tactic):
+            return str(tactic)
+
+    tuner = AutoTuner.get()
+    op = "autotuner_test::build_state_build_key"
+    with autotuner.build_kernels(), autotune(tune_mode=False,
+                                             skip_dynamic_tuning_buckets=True):
+        assert tuner.is_build_mode
+        tuner.choose_one(op, [ModuleRunner()],
+                         _build_config(parallel_jit_warmup=4), _build_inputs())
+    kernel_builder.join(timeout=60)
+    assert sorted(built) == [-1, 0]
+    assert kernel_builder.stats(autotuner.BUILD_OP_PREFIX +
+                                op).submitted == len(_BUILD_BUCKETS)
+
+
+def test_a_failed_build_is_left_to_tuning(kernel_builder):
+    """A build that fails leaves its kernels to the tuning, which still profiles
+    every profile on the calling thread."""
+
+    class FailingBuildRunner(ThreadRecordingRunner):
+        calls: list[tuple[int, int]] = []
+
+        def build(self, inputs, *, tactic=-1, **kwargs):
+            raise RuntimeError("nvcc failed")
+
+    tuner = AutoTuner.get()
+    config = _build_config(parallel_jit_warmup=4)
+    op = "autotuner_test::build_state_failure"
+    with autotuner.build_kernels():
+        tuner.choose_one(op, [FailingBuildRunner()], config, _build_inputs())
+    kernel_builder.join(timeout=60)
+    assert kernel_builder.stats(autotuner.BUILD_OP_PREFIX +
+                                op).failed == len(_BUILD_BUCKETS)
+    with autotune():
+        tuner.choose_one(op, [FailingBuildRunner()], config, _build_inputs())
+    assert {m for m, _ in FailingBuildRunner.calls} == set(_BUILD_BUCKETS)
+    assert not tuner.stats.failed_profiling_count.get(op)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available()
+                    or torch.cuda.get_device_capability()[0] != 10,
+                    reason="DeepGEMM's FP8 block-scale GEMMs run on SM100f")
+def test_fp8_swap_ab_gemm_returns_zeros_and_builds_in_the_build_state(
+        kernel_builder):
+    """In the build state the DeepGEMM GEMM launches nothing: it returns zeros of
+    its output shape, and its sweep builds on KernelBuilder's threads."""
+    from _torch.helpers import per_block_cast_to_fp8_e8m0
+
+    import tensorrt_llm._torch.custom_ops.torch_custom_ops  # noqa: F401
+
+    m, n, k = 64, 1024, 1024
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    weight, weight_scale = per_block_cast_to_fp8_e8m0(
+        torch.randn((n, k), device="cuda", dtype=torch.bfloat16))
+    with autotuner.build_kernels():
+        output = torch.ops.trtllm.fp8_swap_ab_gemm(a, weight, weight_scale)
+    assert output.shape == (m, n) and output.dtype == torch.bfloat16
+    assert torch.count_nonzero(output) == 0
+    kernel_builder.join(timeout=600)
+    stats = kernel_builder.stats(autotuner.BUILD_OP_PREFIX +
+                                 "trtllm::fp8_swap_ab_gemm")
+    assert stats.submitted == len(set(deep_gemm_jit_warmup_buckets(m)) | {m})
+    assert stats.failed == 0
+
+
+def test_flashinfer_mxfp8_gemm_builds_its_module_without_a_launch(monkeypatch):
+    """FlashInfer's MXFP8 GEMM runner builds its CUTLASS tactic by loading the
+    module every shape uses, without running it; its CuTe DSL tactic builds
+    nothing."""
+    gemm_base = pytest.importorskip("flashinfer.gemm.gemm_base")
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
+        FlashInferMXFP8GemmRunner
+
+    loaded = []
+    monkeypatch.setattr(gemm_base, "get_cutlass_mxfp8_gemm_module",
+                        lambda sm_major: loaded.append(sm_major))
+    runner = FlashInferMXFP8GemmRunner(torch.bfloat16)
+    monkeypatch.setattr(
+        runner, "forward",
+        lambda *args, **kwargs: pytest.fail("the build launched the GEMM"))
+    for tactic in runner.get_valid_tactics([], OptimizationProfile()):
+        runner.build([], tactic=tactic)
+    assert loaded == [torch.cuda.get_device_capability()[0]]
+    small = OptimizationProfile([[DynamicDim(8, 8, 16)]])
+    large = OptimizationProfile([[DynamicDim(4096, 4096, 8192)]])
+    assert runner.build_key(small, runner.CUTLASS) == runner.build_key(
+        large, runner.CUTLASS)

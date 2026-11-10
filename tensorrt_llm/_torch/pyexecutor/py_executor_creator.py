@@ -67,7 +67,7 @@ from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .model_engine import ModelEngine
 from .model_loader import ModelLoader, construct_checkpoint_loader
 from .py_executor import PyExecutor
-from .rehearsal import rehearse
+from .rehearsal import join_autotuner_builds, rehearse
 from .scheduler import gen_preemption
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
@@ -1359,6 +1359,8 @@ def _create_py_executor(
                 rehearse(model_engine, kv_cache_creator)
             with _startup_timer.phase("checkpoint"):
                 model_engine.load_deferred_checkpoint()
+            with _startup_timer.phase("autotuner_builds"):
+                join_autotuner_builds()
 
         if not skip_est:
             log_memory_usage("after loading weights")

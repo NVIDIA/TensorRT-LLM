@@ -60,7 +60,7 @@ def test_a_deferred_load_matches_a_direct_one(checkpoint, monkeypatch):
     expected = _state(direct)
     del direct
 
-    monkeypatch.setattr(KernelBuilder, "wants_rehearsal", lambda self, model_config: True)
+    monkeypatch.setattr(KernelBuilder, "wants_rehearsal", lambda self, model_config, model: True)
     loader, model = _load(checkpoint, defer_checkpoint=True)
     assert loader.has_deferred_checkpoint
     rehearsal = _state(model)

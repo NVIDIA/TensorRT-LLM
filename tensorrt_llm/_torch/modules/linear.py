@@ -20,7 +20,7 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
-    BufferKind, mxfp8_quantize_gemm_autotuned)
+    BufferKind, mxfp8_quantize_gemm_autotuned, prebuild_flashinfer_mxfp8_gemm)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -1418,6 +1418,20 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
                     f"expected per-channel weight_scale [out] or [out, 1], got {tuple(scale.shape)}"
                 copy_weight_shard(module.weight_scale, scale.reshape(-1),
                                   shard_offset, shard_size)
+
+
+def deep_gemm_reaches(model_config, model) -> bool:
+    """Whether ``model`` runs an FP8 block-scale linear through DeepGEMM, whose
+    kernels the autotuner builds in its build state (a KernelBuilder op family)."""
+    del model_config
+    if model is None or not is_sm_100f():
+        return False
+    return any(
+        isinstance(getattr(module, "quant_method", None),
+                   FP8BlockScalesLinearMethod)
+        and not (getattr(module, "use_cute_dsl_blockscaling_mm", False)
+                 or getattr(module, "disable_deep_gemm", False))
+        for module in model.modules())
 
 
 class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
@@ -3817,6 +3831,13 @@ class MXFP8LinearMethod(LinearMethodBase):
                 # Dynamic MXFP8 activation quantization (swizzled SF layout),
                 # then the CUTLASS block-scaled e4m3xe4m3 GEMM.
                 act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(input, True)
+                if self.needs_flashinfer_autotune and not is_torch_compiling():
+                    # The warmup will tune FlashInfer's GEMM: in the autotuner's
+                    # build state, build it now.
+                    prebuild_flashinfer_mxfp8_gemm(act_e4m3, act_sf,
+                                                   module.weight,
+                                                   module.weight_scale,
+                                                   module.dtype)
                 use_flashinfer = self.backend == "flashinfer" or (
                     self.backend == "auto" and not is_torch_compiling() and
                     (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
