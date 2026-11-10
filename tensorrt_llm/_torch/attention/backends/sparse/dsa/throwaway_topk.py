@@ -166,6 +166,7 @@ class ThrowawayPrefillTopK:
             num_heads=n_heads,
             head_dim=_HEAD_DIM,
             top_k=index_topk,
+            math_mode="relu_fast",
             compression_ratio=compress_ratio,
             num_keys=self.num_keys,
             qkv_dtype=qkv_dtype,
