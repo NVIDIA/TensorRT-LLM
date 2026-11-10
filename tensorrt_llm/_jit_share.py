@@ -18,7 +18,9 @@ The ranks of a launch compile the same kernels, each on its own. With
 ``TLLM_JIT_SHARE_DIR`` set to a directory that every process of the launch
 can see (on a multi-node launch, a shared file system; use a fresh directory
 per launch), the first process to claim a kernel builds it and the others
-reuse the result. Two kinds of kernels are shared:
+reuse the result. Every process runs the kernels it finds there, so the
+directory must be one that only trusted users can write to. Two kinds of
+kernels are shared:
 
 * DeepGEMM's. DeepGEMM compiles a kernel the first time a shape selects it:
   it writes ``<tmp>/kernel.cu``, runs its compiler (``DG_JIT_NVCC_COMPILER``,
@@ -432,14 +434,8 @@ def install() -> bool:
         os.makedirs(os.path.join(share_dir, "kernels"), exist_ok=True)
     except OSError:
         return False
-    import tempfile
-
-    # The wrapper must sit on a file system that allows executing it.
     wrapper = None
-    for bin_dir in (
-        os.path.join(share_dir, "bin"),
-        os.path.join(tempfile.gettempdir(), f"tllm_jit_share_{os.getuid()}"),
-    ):
+    for bin_dir in _wrapper_dirs(share_dir):
         try:
             wrapper = _write_wrapper(bin_dir)
         except OSError:
@@ -472,6 +468,39 @@ def _default_compiler() -> str | None:
     return os.path.join(home, "bin", "nvcc") if home else None
 
 
+def _wrapper_dirs(share_dir: str) -> list[str]:
+    """Directories for the compiler wrapper, best first.
+
+    DeepGEMM runs the wrapper at its path for as long as the process lives, so the
+    wrapper must stay where no other user can replace it or a directory above it:
+    this user's directory in the system temporary directory, whose parent is sticky
+    (or private), first; the share directory's ``bin`` only if the share directory
+    is this user's alone (a temporary directory may not allow executing files).
+    """
+    import tempfile
+
+    tmp = tempfile.gettempdir()
+    dirs = []
+    try:
+        info = os.stat(tmp)
+        if info.st_mode & stat.S_ISVTX or not info.st_mode & 0o022:
+            dirs.append(os.path.join(tmp, f"tllm_jit_share_{os.getuid()}"))
+    except OSError:
+        pass
+    if _private_dir(share_dir):
+        dirs.append(os.path.join(share_dir, "bin"))
+    return dirs
+
+
+def _private_dir(path: str) -> bool:
+    """True for a directory (not a symlink) that this user owns and no one else can write to."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o022
+
+
 def _write_wrapper(bin_dir: str) -> str | None:
     """Write (once per interpreter and module path) the script DeepGEMM runs as its compiler.
 
@@ -493,11 +522,8 @@ def _write_wrapper(bin_dir: str) -> str | None:
 
         script = f'#!/bin/sh\nexec {shlex.join([interpreter, "-I", "-S", module])} "$@"\n'
     path = os.path.join(bin_dir, "nvcc-" + hashlib.sha256(script.encode()).hexdigest()[:16])
-    # The script found here runs as this user, so the directory must be one that only this
-    # user can write to: not a symlink, not another user's, not group- or other-writable.
     os.makedirs(bin_dir, mode=0o700, exist_ok=True)
-    info = os.lstat(bin_dir)
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+    if not _private_dir(bin_dir):
         return None
     if not os.path.exists(path):
         part = f"{path}.{os.getpid()}.part"

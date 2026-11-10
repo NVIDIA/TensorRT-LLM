@@ -2455,6 +2455,29 @@ def test_jit_share_wrapper_needs_a_private_directory(tmp_path):
     assert jit_share._write_wrapper(str(link)) is None
 
 
+def test_jit_share_wrapper_stays_where_only_this_user_can_replace_it(
+        tmp_path, monkeypatch):
+    """DeepGEMM runs the compiler wrapper at its path for the life of the
+    process, so the wrapper goes where no other user can rename a directory on
+    that path: this user's directory in a sticky (or private) temporary
+    directory first, the share directory only if no one else can write to it."""
+    sticky = tmp_path / "tmp"
+    sticky.mkdir()
+    sticky.chmod(0o1777)
+    monkeypatch.setattr(tempfile, "tempdir", str(sticky))
+    mine = str(sticky / f"tllm_jit_share_{os.getuid()}")
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o777)
+    assert jit_share._wrapper_dirs(str(shared)) == [mine]
+    private = tmp_path / "private"
+    private.mkdir()
+    private.chmod(0o700)
+    assert jit_share._wrapper_dirs(str(private)) == [mine, str(private / "bin")]
+    sticky.chmod(0o777)  # others could rename this user's directory in it
+    assert jit_share._wrapper_dirs(str(private)) == [str(private / "bin")]
+
+
 def test_shared_kernel_cache_exports_and_loads(monkeypatch, tmp_path):
     """A CuTe DSL kernel stored in a shared runner cache is exported, and the
     cache of another process (a second instance here) loads it instead of
