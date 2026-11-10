@@ -38,8 +38,10 @@ rejected at planning time.
 
 from __future__ import annotations
 
+import functools
 import math
 import os
+import weakref
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -53,7 +55,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import maybe_pin_memory, prefer_pinned
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
@@ -100,7 +102,9 @@ _FLOAT_WORKSPACE_BYTES = 128 * 1024 * 1024
 # The partial results are a few output-sized copies of every query row; a plan
 # of 128 requests x 96 beams needs about 3.3 of them.
 _SPLIT_KV_WORKSPACE_FACTOR = 4
-_float_workspace: Dict[torch.device, torch.Tensor] = {}
+# One buffer per KV cache manager: executors sharing a GPU must not share partials, and the buffer is
+# freed with its manager.
+_float_workspace: "weakref.WeakKeyDictionary[Any, torch.Tensor]" = weakref.WeakKeyDictionary()
 
 
 def _backend_from_env() -> str:
@@ -144,14 +148,14 @@ class _Config:
         return self.backend == FA4_BACKEND
 
 
-def _get_float_workspace(device: torch.device, min_bytes: int = 0) -> torch.Tensor:
-    """Shared FlashInfer float workspace of at least ``min_bytes``; it only grows, and earlier
-    wrappers keep the buffer they were created with so captured CUDA graphs stay valid."""
-    workspace = _float_workspace.get(device)
+def _get_float_workspace(manager: Any, device: torch.device, min_bytes: int = 0) -> torch.Tensor:
+    """The manager's FlashInfer float workspace, at least ``min_bytes``; it only grows, and
+    earlier wrappers keep the buffer they were created with so captured CUDA graphs stay valid."""
+    workspace = _float_workspace.get(manager)
     if workspace is None or workspace.numel() < min_bytes:
         size = max(_FLOAT_WORKSPACE_BYTES, min_bytes)
         workspace = torch.empty(size, dtype=torch.uint8, device=device)
-        _float_workspace[device] = workspace
+        _float_workspace[manager] = workspace
     return workspace
 
 
@@ -167,11 +171,17 @@ def _float_workspace_bytes(
     return _SPLIT_KV_WORKSPACE_FACTOR * max_rows * key.num_heads * key.head_dim * key.dtype.itemsize
 
 
-def _lib_enabled() -> bool:
-    """Whether ``TLLM_FMHA_LIBS`` enables this library."""
+@functools.lru_cache(maxsize=8)
+def _enabled_for(libs_env: Optional[str]) -> bool:
     from .registry import get_enabled_fmha_lib_classes
 
     return BeamSharedPrefixFmha in get_enabled_fmha_lib_classes()
+
+
+def _lib_enabled() -> bool:
+    """Whether ``TLLM_FMHA_LIBS`` enables this library; the parse is cached per value since this
+    runs every beam step."""
+    return _enabled_for(os.environ.get("TLLM_FMHA_LIBS"))
 
 
 class _PlanKey:
@@ -431,6 +441,15 @@ def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
             num_pages=int(pool.size(0)),
         )
         metadata.fmha_plan_caches[LIB_NAME] = state
+        max_seq_len = getattr(metadata, "max_seq_len", None)
+        if state.is_cuda_graph and max_seq_len and max_seq_len - 2 > state.config.max_tail:
+            logger.warning_once(
+                f"{LIB_NAME}: CUDA graphs are captured for beams that generate at most "
+                f"{state.config.max_tail} tokens ({MAX_TAIL_ENV}); a longer generation fails "
+                f"the step. Set {MAX_TAIL_ENV} to the largest max_tokens you serve (each extra "
+                "position costs a little per step).",
+                key=f"{LIB_NAME}_max_tail",
+            )
     state.step_counter += 1
 
     beam_width = metadata.beam_width
@@ -557,11 +576,24 @@ def _plan_wrapper(
 ) -> None:
     plan = state.plan
     assert plan is not None
+    qo_indptr = plan.qo_indptr
+    paged_kv_indptr = plan.paged_kv_indptr
+    paged_kv_indices = plan.paged_kv_indices
+    last_page_len = plan.paged_kv_last_page_len
+    if state.is_cuda_graph:
+        # A graph wrapper copies these into its static buffers on every replayed step. From
+        # pageable host memory that copy synchronizes the stream, so stage them pinned and hand
+        # FlashInfer the indices on the device (the rest it also reads on the host).
+        device = metadata.kv_cache_block_offsets.device
+        qo_indptr = maybe_pin_memory(qo_indptr)
+        paged_kv_indptr = maybe_pin_memory(paged_kv_indptr)
+        last_page_len = maybe_pin_memory(last_page_len)
+        paged_kv_indices = maybe_pin_memory(paged_kv_indices).to(device, non_blocking=True)
     wrapper.plan(
-        plan.qo_indptr,
-        plan.paged_kv_indptr,
-        plan.paged_kv_indices,
-        plan.paged_kv_last_page_len,
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        last_page_len,
         key.num_heads,
         key.num_kv_heads,
         key.head_dim,
@@ -600,7 +632,9 @@ def _create_wrapper(
     plan = state.plan
     assert plan is not None
     workspace = _get_float_workspace(
-        device, _float_workspace_bytes(key, metadata, plan.num_requests * plan.beam_width)
+        metadata.kv_cache_manager,
+        device,
+        _float_workspace_bytes(key, metadata, plan.num_requests * plan.beam_width),
     )
     return flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         workspace, "HND", backend=state.config.backend, **kwargs
@@ -1080,10 +1114,10 @@ class BeamSharedPrefixFmha(PhasedFmha):
             raise RuntimeError(f"{type(self).__name__} requires packed QKV input.")
         state: Optional[_BeamStepState] = metadata.fmha_plan_caches.get(LIB_NAME)
         if state is None or state.plan is None:
-            raise RuntimeError(
-                f"{type(self).__name__}: no step plan; TrtllmAttentionMetadata.prepare() "
-                "must run before the forward."
-            )
+            # The manager caches a selection by batch shape, so an unplanned batch of the same
+            # shape (single beam, ineligible) can land here: run the regular kernel.
+            self._context_impl.run_generation(params)
+            return
         plan = state.plan
         num_heads = attn.num_heads
         num_kv_heads = attn.num_kv_heads
