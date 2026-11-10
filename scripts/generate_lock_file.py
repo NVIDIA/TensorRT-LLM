@@ -56,7 +56,7 @@ project_constraints = {
 }
 
 target_env = {
-    "python_version": 310,
+    "python_version": 312,
     "platform_system": "",
     "platform_machine": "x86_64",
     "sys_platform": "linux",
