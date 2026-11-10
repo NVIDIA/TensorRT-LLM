@@ -400,7 +400,6 @@ def test_attention_cache_miss_rejects_cuda_graph_capture(monkeypatch):
 def test_preparation_cache_misses_reject_cuda_graph_capture(monkeypatch):
     preparation_op._compile_dspark_rmsnorm_rope_cache_write.cache_clear()
     preparation_op._compile_dspark_rmsnorm_rope_draft_block.cache_clear()
-    device = torch.cuda.current_device()
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
     def unexpected_compile(*args, **kwargs):
@@ -410,7 +409,7 @@ def test_preparation_cache_misses_reject_cuda_graph_capture(monkeypatch):
     with pytest.raises(RuntimeError, match="cache-write must be warmed up"):
         preparation_op._compile_dspark_rmsnorm_rope_cache_write(1e-6)
     with pytest.raises(RuntimeError, match="draft-block must be warmed up"):
-        preparation_op._compile_dspark_rmsnorm_rope_draft_block(5, 1e-6, device)
+        preparation_op._compile_dspark_rmsnorm_rope_draft_block(5, 1e-6)
 
 
 def test_preparation_self_jit_covers_dynamic_batches():

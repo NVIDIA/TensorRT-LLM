@@ -355,8 +355,7 @@ def _compile_dspark_rmsnorm_rope_cache_write(eps: float):
 
 
 @functools.cache
-def _compile_dspark_rmsnorm_rope_draft_block(block_size: int, eps: float, device: int):
-    # The device argument scopes this compilation cache to its CUDA device.
+def _compile_dspark_rmsnorm_rope_draft_block(block_size: int, eps: float):
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "DSpark RMSNorm/RoPE draft-block must be warmed up before CUDA graph capture"
@@ -603,8 +602,7 @@ def cute_dsl_dspark_rmsnorm_rope_draft_block(
     block_size = x.shape[1]
     if block_size not in (5, 6):
         raise ValueError("DSpark draft block size must be 5 or 6")
-    with torch.cuda.device(x.device):
-        compiled = _compile_dspark_rmsnorm_rope_draft_block(block_size, eps, x.device.index)
+    compiled = _compile_dspark_rmsnorm_rope_draft_block(block_size, eps)
     output = x.new_empty((x.shape[0], _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSV4_DSPARK_HEAD_DIM))
     compiled(
         x.view(-1, _DSV4_DSPARK_HEAD_DIM),
