@@ -27,11 +27,14 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     Role,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import mamba_cache_manager_v2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
     _insert_draft_pool_ratio,
 )
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.quantization.mode import QuantMode
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -148,6 +151,32 @@ def test_hybrid_target_gets_only_the_draft_layer_specs():
         assert spec.owner is KVCacheLayerOwner.DRAFT
         assert (spec.dtype, spec.num_kv_heads, spec.head_dim) == (DataType.FP8, 1, 576)
         assert spec.buffer_roles == (Role.KEY,)
+
+
+def test_hybrid_cache_size_per_token_adds_the_draft_layer_bytes(monkeypatch):
+    estimate_kwargs = []
+
+    def fake_estimate(*args, **kwargs):
+        estimate_kwargs.append(kwargs)
+        return 100, 7
+
+    monkeypatch.setattr(mamba_cache_manager_v2, "_estimate_mamba_hybrid_cache_cost", fake_estimate)
+    specs = (_draft_spec(_NUM_TARGET_LAYERS), _draft_spec(_NUM_TARGET_LAYERS + 1))
+    common = dict(max_batch_size=4, kv_cache_config=KvCacheConfig(), tokens_per_block=32)
+
+    without_draft = MambaHybridCacheManagerV2.get_cache_size_per_token(
+        SimpleNamespace(), Mapping(), **common
+    )
+    with_draft = MambaHybridCacheManagerV2.get_cache_size_per_token(
+        SimpleNamespace(), Mapping(), layer_specs=specs, shared_draft_block_width=16, **common
+    )
+
+    draft_bytes = sum(spec.bytes_per_token() for spec in specs)
+    assert draft_bytes > 0
+    assert with_draft == (without_draft[0] + draft_bytes, without_draft[1])
+    for kwargs in estimate_kwargs:
+        assert "layer_specs" not in kwargs
+        assert "shared_draft_block_width" not in kwargs
 
 
 def test_plain_target_still_gets_target_and_draft_specs():

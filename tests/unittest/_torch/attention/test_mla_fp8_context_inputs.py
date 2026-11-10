@@ -212,5 +212,7 @@ def test_mla_cached_kv_context_fp8_inputs_match_bf16_inputs(cached, new) -> None
 
         with pytest.raises(RuntimeError, match="same dtype"):
             run(_to_e4m3(k), v)
+        with pytest.raises(RuntimeError, match="same dtype"):
+            run(k, _to_e4m3(v))
     finally:
         manager.shutdown()

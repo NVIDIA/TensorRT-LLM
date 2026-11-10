@@ -198,14 +198,20 @@ dimension may differ, except that an NVFP4 target KV cache requires an
 identical draft layout unless both caches are K-only (MLA). Both servers must
 use the same layout.
 
-Hybrid recurrent/attention targets whose cache manager opts in (Kimi K3) keep
-a standalone DSpark MLA drafter's layers after their own, with the CUTEDSL,
-TRTLLM or VANILLA drafter backend.
+Hybrid recurrent/attention targets whose cache manager opts in (Kimi K3) also
+hold a standalone DSpark drafter's layers, after their own. In every case the
+drafter decides whether it shares: it declares whether its block attention reads
+the manager's pages at the run's `tokens_per_block`
+(`DFlashForCausalLM.reads_managed_ctx_pages`). By default only
+`attention_backend="TRTLLM"` does, at the page sizes its trtllm-gen kernels
+support; a drafter whose other backends read paged context declares that itself.
 
 The drafter keeps a separate draft KV cache manager instead when any of the
-following applies: context parallelism larger than 1, a per-layer KV-head count
-on the target or drafter, a specialized KV cache manager (for example, hybrid Mamba
-models), Gemma 4 hybrid attention, or, in disaggregated serving, a draft layout
+following applies: context parallelism larger than 1 (helix context parallelism
+is shared only with a drafter that reads a helix-sharded context), a per-layer
+KV-head count on the target or drafter, a specialized KV cache manager that does
+not opt in (for example, most hybrid Mamba models), Gemma 4 hybrid attention, or,
+in disaggregated serving, a draft layout
 that cannot be transferred with the target's. When the layers are shared, the
 worker log reports `target and draft KV layers share one KV cache manager` at
 startup.
