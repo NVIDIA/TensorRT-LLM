@@ -77,6 +77,7 @@ following its [Docker guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/do
 | ----- | ----------- | ---------------- | ----------------- |
 | Muse Spark Open | [`feat/musespark-open`](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/musespark-open) | [Muse Spark Open deployment guide](https://github.com/NVIDIA/TensorRT-LLM/blob/feat/musespark-open/docs/source/deployment-guide/deployment-guide-for-musespark-open-on-trtllm.md), [speculative decoding guide](https://github.com/NVIDIA/TensorRT-LLM/blob/feat/musespark-open/docs/source/deployment-guide/deployment-guide-for-musespark-open-speculative-decoding-on-trtllm.md) | `nvcr.io/nvidia/tensorrt-llm/release:1.4.0a0.dev202610171236` |
 | MiniMax-M3.1-Flash | [`feat/minimax-m3.1-flash`](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/minimax-m3.1-flash) | [Serving MiniMax-M3.1-Flash](https://github.com/NVIDIA/TensorRT-LLM/blob/feat/minimax-m3.1-flash/docs/source/deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.md#serving-minimax-m31-flash) in the MiniMax-M3 deployment guide | `nvcr.io/nvidia/tensorrt-llm/release:feat-minimax-m3.1-flash-1.4.0a0.dev202611050719` |
+| Kimi K3.1 Pro | [`feat/kimi-k3.1-pro`](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/kimi-k3.1-pro) | [Kimi K3.1 Pro deployment guide](https://github.com/NVIDIA/TensorRT-LLM/blob/feat/kimi-k3.1-pro/docs/source/deployment-guide/deployment-guide-for-kimi-k3.1-pro-on-trtllm.md) | `nvcr.io/nvidia/tensorrt-llm/release:feat-kimi-k3.1-pro-1.4.0a0.dev202611050000` |
 | Beam (Reflection AI) | [`feat/reflection-beam`](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/reflection-beam) | [Beam deployment guide](https://github.com/NVIDIA/TensorRT-LLM/blob/feat/reflection-beam/docs/source/deployment-guide/deployment-guide-for-beam-on-trtllm.md) | No container published yet — build from the branch sources per the guide |
 
 ## Model-Feature Support Matrix (Key Models)
@@ -292,6 +293,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
 | `Lightricks/LTX-2.3` | Text-to-Video (with Audio), Video-to-Video (with Audio) |
 | `MiniMaxAI/MiniMax-H3` | Text-to-Video, First/Last-Frame-to-Video, Reference-to-Video (all with Audio) |
+| `FastVideo/FastVideo-FastH3-8-Step-V2` | Text-to-Video (with Audio, 8-step distilled) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
 | `Qwen/Qwen-Image-Layered` | Image-to-Image |
@@ -313,6 +315,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **LTX-2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No |
 | **LTX-2.3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | No | No | No | No |
 | **MiniMax-H3** | Yes | Yes | No | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes |
+| **FastH3** | Yes | Yes | No | No | No | No | No | Yes | Yes | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
 | **Qwen-Image-Layered** | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No |

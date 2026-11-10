@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,7 +21,6 @@
 
 #include <cuda_runtime.h>
 #include <memory>
-#include <mutex>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/function.h>
 #include <nanobind/stl/optional.h>
@@ -95,9 +94,8 @@ std::optional<uintptr_t> launchHostFunc(uintptr_t streamPtr, bool freeUserData, 
 #else
     if (lowLatency)
     {
-        static std::once_flag sWarnOnce;
-        std::call_once(sWarnOnce,
-            []() { TLLM_LOG_WARNING("Low-latency host task dispatch requires CUDA 13.2+; falling back to default."); });
+        TLLM_LOG_WARNING_ONCE("nanobind/hostfunc/low_latency_cuda_version",
+            "Low-latency host task dispatch requires CUDA 13.2+; falling back to default.");
     }
     err = cudaLaunchHostFunc(stream, cudaHostFuncTrampoline, hostFuncUserData.get());
 #endif

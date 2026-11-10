@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import ast
+import concurrent.futures
 import contextlib
 import copy
 import enum
@@ -40,7 +41,8 @@ from tensorrt_llm._torch.nccl_window_graph import (
     nccl_window_graph_capture, release_nccl_window_graph_owner)
 from tensorrt_llm._torch.nccl_window_tensor_scope import \
     nccl_window_tensor_scope
-from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
+from tensorrt_llm._utils import (confidential_compute_enabled, local_mpi_size,
+                                 mpi_disabled, nvtx_range)
 from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
                                                     record_global_timer)
 from tensorrt_llm.logger import logger
@@ -148,6 +150,15 @@ class TuningConfig:
         exclude_from_cache (bool): Skip disk persistence of tuning results for this op.
             Use for JIT-driven ops where caching the tactic across processes would skip
             the JIT warmup. In-process cache still works.
+        parallel_jit_warmup (int): Before profiling, run every not-yet-tuned profile once
+            on this many threads. For runners whose first call per shape JIT-compiles a
+            kernel and releases the GIL while compiling (DeepGEMM), those compiles then
+            overlap, and the profiling loop that follows finds them built. Opted-in
+            runners must be thread-safe and must not use NCCL windows. 0 disables; -1 uses
+            the CPUs this rank may run on, divided by the ranks on the node unless the
+            rank is pinned to a subset, up to 32: neighbouring sweep points often select
+            the same kernel and compile it twice, so more threads keep paying off.
+            TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP overrides the thread count.
         share_jit_builds (bool): For runners whose kernels are DeepGEMM builds or CuTe DSL
             kernels kept in their class's ``kernel_cache``. When the processes of the launch
             share their JIT builds (TLLM_JIT_SHARE_DIR, see tensorrt_llm._jit_share), each
@@ -157,7 +168,8 @@ class TuningConfig:
             building, then the profiles other ranks claimed once those have run; for several
             tactics under INDEPENDENT tuning, a build pass first runs each (profile, runner,
             tactic) once on the rank that claims it, and the profiling that follows finds the
-            kernels built.
+            kernels built. The claims then take the place of the ``parallel_jit_warmup``
+            thread pool, which does not run.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -167,6 +179,7 @@ class TuningConfig:
     use_cuda_graph: bool = True
     distributed_tuning_strategy: DistributedTuningStrategy = DistributedTuningStrategy.INDEPENDENT
     exclude_from_cache: bool = False
+    parallel_jit_warmup: int = 0
     share_jit_builds: bool = False
 
 
@@ -949,6 +962,28 @@ def _spec_in_bounds(spec, shapes_list) -> bool:
     return True
 
 
+def _default_parallel_jit_warmup_threads() -> int:
+    """Threads for ``parallel_jit_warmup=-1``: this rank's CPUs, up to 32.
+
+    The compilers the warmup starts inherit this process's CPU affinity. A rank
+    pinned to a subset of the host's CPUs has that subset to itself; unpinned
+    ranks share all of them, so each takes its share by the ranks on the node.
+    """
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except AttributeError:  # no affinity API (non-Linux)
+        cpus = os.cpu_count() or 1
+    if cpus >= (os.cpu_count() or cpus):
+        local_ranks = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+        if not mpi_disabled():
+            try:
+                local_ranks = local_mpi_size()
+            except Exception:  # noqa: BLE001 - MPI cannot split by node here
+                pass
+        cpus //= max(1, local_ranks)
+    return min(32, cpus)
+
+
 class AutoTuner:
     """AutoTuner for optimizing TensorRT LLM operations.
 
@@ -1302,6 +1337,9 @@ class AutoTuner:
                     self._build_across_ranks(custom_op, runners, profiles,
                                              inputs, tuning_config, is_pending,
                                              **kwargs)
+            else:
+                self._parallel_jit_warmup(custom_op, runners, profiles, inputs,
+                                          tuning_config, **kwargs)
             with self._shared_profile_graph_pool():
                 if one_pair:
                     self._profile_sharing_jit_builds(custom_op, profiles,
@@ -1797,6 +1835,74 @@ class AutoTuner:
             )
 
         return best_runner_id, best_tactic, min_time, has_tuning_failure_occurred
+
+    def _parallel_jit_warmup(self, custom_op: str, runners: List[TunableRunner],
+                             profiles: List[OptimizationProfile],
+                             inputs: List[torch.Tensor],
+                             tuning_config: TuningConfig, **kwargs) -> None:
+        """Run each not-yet-tuned profile once on a thread pool to drive its JIT.
+
+        See ``TuningConfig.parallel_jit_warmup``. Purely a warmup: results are
+        discarded, and a failure here is left to the profiling loop, which
+        runs every profile again and handles errors as usual.
+        """
+        num_threads = int(
+            os.environ.get("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP",
+                           tuning_config.parallel_jit_warmup))
+        if num_threads < 0:
+            num_threads = _default_parallel_jit_warmup_threads()
+        if num_threads < 2:
+            return
+        pending = [
+            p for p in profiles if not self.profiling_cache.search_cache(
+                custom_op,
+                runners,
+                p.get_opt_shapes(),
+                tuning_config,
+                apply_map_to_tuning_buckets=False,
+            )[0]
+        ]
+        num_threads = min(num_threads, len(pending))
+        if num_threads < 2:
+            return
+        # Interleave contiguous blocks of the sweep, so the calls in flight
+        # come from far-apart shapes and mostly select different kernels
+        # rather than several threads compiling the same one.
+        size = -(-len(pending) // num_threads)
+        blocks = [pending[i * size:(i + 1) * size] for i in range(num_threads)]
+        order = [b[j] for j in range(size) for b in blocks if j < len(b)]
+        device = torch.cuda.current_device()
+        # One stream for all workers: the allocator caches their blocks where
+        # the profiling loop below allocates, and GPU time is not the cost here.
+        stream = torch.cuda.current_stream()
+        failures = []
+
+        def warm(profile: OptimizationProfile) -> None:
+            torch.cuda.set_device(device)
+            try:
+                with torch.cuda.stream(stream):
+                    tensors = self._prepare_input_tensors(profile, inputs)
+                    if tuning_config.inputs_pre_hook is not None:
+                        tensors = tuning_config.inputs_pre_hook(tensors)
+                    for runner in runners:
+                        for tactic in runner.get_valid_tactics(
+                                tensors, profile, **kwargs):
+                            runner(tensors, tactic=tactic, **kwargs)
+                    stream.synchronize()
+            except Exception as e:  # noqa: BLE001 - the profiling loop reports it
+                failures.append(e)
+
+        start = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=num_threads,
+                thread_name_prefix="autotuner_jit_warmup") as pool:
+            list(pool.map(warm, order))
+        logger.info(f"[Autotuner] {custom_op}: ran {len(order)} profiles on "
+                    f"{num_threads} threads to drive their JIT in "
+                    f"{time.perf_counter() - start:.1f}s" +
+                    (f"; {len(failures)} failed and are left to profiling "
+                     f"({type(failures[0]).__name__}: {failures[0]})"
+                     if failures else ""))
 
     @staticmethod
     def _run_profile_runner(runner: TunableRunner, inputs: List[torch.Tensor],
