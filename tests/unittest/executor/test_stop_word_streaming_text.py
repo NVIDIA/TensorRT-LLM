@@ -24,6 +24,7 @@ the stop word completes (a Thai digit such as ``"๒"``). CPU-only; no engine
 needed.
 """
 
+import itertools
 from types import SimpleNamespace
 
 import pytest
@@ -33,7 +34,8 @@ from tokenizers.models import WordLevel
 from transformers import PreTrainedTokenizerFast
 
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm.executor.result import DetokenizedGenerationResultBase
+from tensorrt_llm.executor.postprocessor_hook import emit
+from tensorrt_llm.executor.result import DetokenizedGenerationResultBase, _find_stop_string
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.tokenizer import TransformersTokenizer
 
@@ -270,3 +272,83 @@ def test_trimmed_candidate_is_decoded_once_when_siblings_stream_on(tokenizer, mo
     assert full_decodes == [THAI_GENERATED[:-3]]
     assert second.text == "ข้อ <answer>42"
     assert second.finish_reason == "length"
+
+
+def _stream_until_done(tokenizer, sampling_params, chunks, post_processor_hook=None):
+    """Feed one response per chunk and stop once the result is done, as its consumers do."""
+    result = DetokenizedGenerationResultBase(
+        0,
+        sampling_params,
+        tokenizer=tokenizer,
+        streaming=True,
+        post_processor_hook=post_processor_hook,
+    )
+    for index, chunk in enumerate(chunks):
+        is_final = index == len(chunks) - 1
+        finish_reason = tllm.FinishReason.LENGTH if is_final else tllm.FinishReason.NOT_FINISHED
+        result._handle_response(_response(chunk, is_final, finish_reason))
+        if result._done:
+            break
+    return result.outputs[0]
+
+
+# "<answer>42</answer> ข้อ ๑ ข้อ ๒". The engine reports no stop word, so these stop
+# strings are only found in the decoded text, most of them across responses.
+TEXT_STOP_GENERATED = [*ANSWER_GENERATED, 6, *THAI_GENERATED]
+
+
+@pytest.mark.parametrize("include_stop_str_in_output", [False, True])
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 5])
+@pytest.mark.parametrize(
+    "stop", ["42</", "2</ans", "> ข", "๑ ข้อ", "ข้อ ๒", "</answer> ข้อ ๑ ข้อ ๒", "zz"]
+)
+def test_streamed_text_stop_matches_non_streamed(
+    tokenizer, stop, chunk_size, include_stop_str_in_output
+):
+    def sampling_params():
+        return _sampling_params(stop, [], include_stop_str_in_output=include_stop_str_in_output)
+
+    output = _stream_until_done(
+        tokenizer, sampling_params(), _chunked(TEXT_STOP_GENERATED, chunk_size)
+    )
+    reference, _ = _run(
+        tokenizer,
+        sampling_params(),
+        [TEXT_STOP_GENERATED],
+        tllm.FinishReason.LENGTH,
+        streaming=False,
+    )
+
+    assert output.text == reference.text
+    assert output.finish_reason == reference.finish_reason
+    assert output.stop_reason == reference.stop_reason
+    if stop != "zz":
+        assert output.finish_reason == "stop"
+        assert output.stop_reason == stop
+
+
+def test_find_stop_string_matches_a_full_search():
+    """Searching only past a prefix known to hold no match finds what a full search finds."""
+    texts = ["".join(chars) for n in range(9) for chars in itertools.product("ab", repeat=n)]
+    stops = ["".join(chars) for n in range(4) for chars in itertools.product("ab", repeat=n)]
+    for text in texts:
+        for stop in stops:
+            for searched_len in range(len(text) + 1):
+                if stop and stop in text[:searched_len]:
+                    continue
+                assert _find_stop_string(text, stop, searched_len) == text.find(stop)
+
+
+def test_stop_string_emitted_by_post_processor_hook_is_found(tokenizer):
+    """The hook rewrites text after the stop search, so the next response searches it again."""
+
+    def hook(chunk):
+        return emit(chunk.text_diff.replace("42", "STOP"))
+
+    output = _stream_until_done(
+        tokenizer, _sampling_params("STOP", []), _chunked(ANSWER_GENERATED, 1), hook
+    )
+
+    assert output.text == "<answer>"
+    assert output.finish_reason == "stop"
+    assert output.stop_reason == "STOP"
