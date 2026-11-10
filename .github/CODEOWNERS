@@ -413,23 +413,6 @@
 # Domain-local overrides and co-ownership rules also live in the module sections.
 # Later sections can override these entries; keep intentional precedence explicit.
 # New files use directory rules unless another matching rule overrides them.
-/cpp/tensorrt_llm/kernels/moe/cutlass/include/moe_lora_grouped_gemm.h @NVIDIA/trt-llm-kernels-devs
-/cpp/tensorrt_llm/kernels/moe/cutlass/include/moe_lora_pointer_expand.h @NVIDIA/trt-llm-kernels-devs
-/cpp/tensorrt_llm/kernels/moe/cutlass/include/moe_lora_problem_builder.h @NVIDIA/trt-llm-kernels-devs
-/cpp/tensorrt_llm/kernels/moe/cutlass/include/moe_lora_slot_expand.h @NVIDIA/trt-llm-kernels-devs
-/cpp/tests/unit_tests/kernels/moe/blockScaleMoeActivationTest.cu @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-moe-devs
-/cpp/tests/unit_tests/kernels/moe/blockScaleMoeFinalizeTest.cu @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-moe-devs
-/cpp/tests/unit_tests/kernels/moe/fusedMoeCommKernelTest.cpp @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-moe-devs
-/cpp/tests/unit_tests/kernels/moe/mixtureOfExpertsTest.cu @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-moe-devs
-/cpp/tests/unit_tests/kernels/moe/moeLoadBalanceKernelTest.cpp @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-moe-devs
-/cpp/tests/unit_tests/kernels/moe/moeLoraPointerExpandTest.cu @NVIDIA/trt-llm-kernels-devs
-/cpp/tests/unit_tests/kernels/moe/moeLoraProblemBuilderTest.cu @NVIDIA/trt-llm-kernels-devs
-/cpp/tests/unit_tests/kernels/moe/moeLoraSlotExpandTest.cu @NVIDIA/trt-llm-kernels-devs
-/cpp/tests/unit_tests/kernels/moe/routing/routingCustomTest.cpp @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-moe-devs
-/cpp/tests/unit_tests/kernels/moe/routing/routingDeepSeekTest.cpp @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-moe-devs
-/cpp/tests/unit_tests/kernels/moe/routing/routingLlama4Test.cpp @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-moe-devs
-/cpp/tests/unit_tests/kernels/moe/routing/routingTest.cpp @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-moe-devs
-/cpp/tests/unit_tests/kernels/moe/routing/routingTest.h @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/_torch/attention/kernels/blackwell/__init__.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/attention/kernels/blackwell/dspark/attention.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/attention/kernels/blackwell/dspark/attention_kernel.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
@@ -441,19 +424,6 @@
 /tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/__init__.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/clc_tile_scheduler.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/kernel.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/moe/kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/moe/kernels/blackwell/blockscaled_contiguous_grouped_gemm.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/moe/kernels/blackwell/blockscaled_contiguous_grouped_gemm_finalize_fusion.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/moe/kernels/blackwell/blockscaled_contiguous_grouped_gemm_swiglu_fusion.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/moe/kernels/rubin/custom_pipeline.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/moe/kernels/rubin/inline_ptx.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/moe/kernels/rubin/manual_mma_128dp.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/moe/kernels/rubin/rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/moe/kernels/rubin/rubin_contiguous_gather_grouped_gemm_swiglu_fusion.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/moe/kernels/rubin/rubin_contiguous_grouped_blockscaled_gemm_finalize_fusion.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/moe/kernels/rubin/rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/moe/kernels/rubin/rubin_contiguous_grouped_gemm_finalize_fusion.py @NVIDIA/trt-llm-kernels-devs
-/tensorrt_llm/_torch/moe/kernels/rubin/utils.py @NVIDIA/trt-llm-kernels-devs
 /tensorrt_llm/_torch/visual_gen/kernels/blackwell/conv/__init__.py @NVIDIA/trt-llm-kernels-devs
 /tensorrt_llm/_torch/visual_gen/kernels/blackwell/conv/dense_blockscaled_implicit_gemm_fprop.py @NVIDIA/trt-llm-kernels-devs
 /tensorrt_llm/_torch/visual_gen/kernels/blackwell/conv/dense_gemm_persistent_dynamic.py @NVIDIA/trt-llm-kernels-devs
