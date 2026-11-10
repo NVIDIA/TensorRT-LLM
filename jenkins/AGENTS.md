@@ -32,8 +32,10 @@ Scope: this directory and its descendants. Supplements the repository-root
   H100_PCIe-PyTorch-1
   ```
 
-- `DGX_B200-*` matches all DGX B200 stages, including single-GPU, multi-GPU,
-  and post-merge variants. `DGX_B200-*_GPUs-*` matches only multi-GPU variants,
+- The following DGX B200 names and patterns are illustrative examples, not
+  entries to add by default. `DGX_B200-*` matches all DGX B200 stages, including
+  single-GPU, multi-GPU, and post-merge variants. `DGX_B200-*_GPUs-*` matches only
+  multi-GPU variants,
   such as `DGX_B200-2_GPUs-PyTorch-1` and `DGX_B200-4_GPUs-PyTorch-Post-Merge-1`.
   `DGX_B200-PyTorch-2` matches exactly that stage; append `*` only if runtime
   suffixes such as `-cbts` should also match. Only `*` is a wildcard, not `?`,
@@ -52,8 +54,14 @@ Scope: this directory and its descendants. Supplements the repository-root
 - Preparation merges the PR's config additions/deletions into the target branch's
   latest snapshot. After merge, older PRs with maintenance support pick it up
   without rebasing; builds that already took their snapshot are unaffected.
-  Remove entries to restore execution; dates in the reason do not expire them.
-  Keep the file and header when no entries remain.
+- To restore execution, remove the relevant entries in a recovery PR; dates in
+  the reason do not expire them. Keep the file and header when no entries remain.
+  Before merging, run `/bot run --stage-list "<affected-stage-names-or-patterns>" --disable-reuse-test`
+  on the recovery PR and verify every affected stage actually executes. The PR's
+  deletions take effect for its own validation before merge. Regressions may have
+  entered while coverage was disabled: fix failures or add approved, tracked test
+  waivers through the normal waiver process, then rerun and confirm the remaining
+  tests pass on the latest PR head before merging the maintenance removal.
 
 ## Path-valued pytest options
 
