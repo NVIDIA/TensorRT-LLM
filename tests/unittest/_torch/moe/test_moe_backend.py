@@ -4451,6 +4451,36 @@ def test_megamoe_helper_bearing_work_ids_keep_sm107_candidates() -> None:
     assert megamoe_op._with_atomic_counter_work_ids(sm107, 107) == list(sm107)
 
 
+def _megamoe_token_tile_pairs(tactics) -> List[Tuple[Tuple, Tuple]]:
+    """Every token-tile READY tactic of ``tactics`` with its twin that publishes per expert."""
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    by_base = collections.defaultdict(dict)
+    for tactic in tactics:
+        unpacked = megamoe_op._unpack_tactic(tactic)
+        by_base[repr(unpacked[:-1])][unpacked[-1]] = unpacked  # tactics hold lists: key by repr
+    return [
+        (g["expert"], g["token_tile"])
+        for g in by_base.values()
+        if {"expert", "token_tile"} <= g.keys()
+    ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_version", [100, 103])
+def test_megamoe_helper_bearing_candidates_pair_token_tile_tactics(sm_version: int) -> None:
+    """A load-balanced launch on SM100 / SM103 may pick token-tile READY tactics, each with an expert twin.
+
+    These are the tactics the GPU test below runs against their twins.
+    """
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    tactics = megamoe_op.enumerate_megamoe_candidate_tactics(
+        _MEGAMOE_HELPER_TOKENS, sm_version=sm_version, load_balance=True
+    )
+    assert len(_megamoe_token_tile_pairs(tactics)) == 4
+
+
 def _with_slot_copies(tensor: torch.Tensor, slots: int, sources: Tuple[int, ...]) -> torch.Tensor:
     """``tensor`` (expert-major over ``slots`` slots) with byte copies of slots ``sources`` appended."""
     if tensor.dim() == 0:
@@ -4482,8 +4512,9 @@ def test_megamoe_cutedsl_helper_bearing_tactics_match_the_helper_free_launch(
     the reference. The same launch is then repeated with two helper slots that hold byte copies of
     experts 0 and 1 and take every other row routed to them, with the READY flag already at the
     launch's generation. A copy computes its rows exactly as its original, so the output must equal
-    the reference bit for bit: under the default selection, and under the default tactic with
-    grid-stride and with atomic-counter work ids.
+    the reference bit for bit: under the default selection, under the default tactic with
+    grid-stride and with atomic-counter work ids, and under every token-tile READY tactic and its
+    expert twin.
     """
     from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
 
@@ -4682,6 +4713,13 @@ def test_megamoe_cutedsl_helper_bearing_tactics_match_the_helper_free_launch(
                 [default], sm_version
             )[-1],
         }
+        pairs = _megamoe_token_tile_pairs(
+            runner.get_valid_tactics(inputs(torch.empty_like(reference)), None)
+        )
+        assert len(pairs) == 4
+        for expert_twin, token_tile in pairs:
+            cases[f"expert READY {expert_twin}"] = expert_twin
+            cases[f"token-tile READY {token_tile}"] = token_tile
         mismatched = {}
         with torch.inference_mode():
             for name, tactic in cases.items():

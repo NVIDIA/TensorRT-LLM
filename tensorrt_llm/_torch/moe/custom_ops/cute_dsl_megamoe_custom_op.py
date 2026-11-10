@@ -1258,9 +1258,11 @@ def _expand_megamoe_ready_tactics(
 ) -> list[Tuple]:
     """Return canonical tactics for every legal token-back READY mode."""
     choices = _token_back_ready_granularity_choices(load_balance=load_balance)
-    if sm_version == 107 and choices != ("expert",):
+    if choices != ("expert",):
         # At every token bucket include a legal local-TMA/atomic-counter
-        # base; the curated SM107 candidates otherwise exclude token_tile.
+        # base; the curated candidates otherwise exclude token_tile. The
+        # SM100/SM103 and SM107 kernels share the token_tile contract, so
+        # they share the bases.
         for cluster, fallback, policy, mode, flag, epi in (
             ([2, 1, 1], None, ("grouped", 512), "reuse_dispatch_warps", 4, (1, 1)),
             ([2, 1, 1], None, ("grouped", 512), "reuse_dispatch_warps", 4, (2, 4)),
