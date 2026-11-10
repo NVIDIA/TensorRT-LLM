@@ -19,7 +19,10 @@ from tensorrt_llm._torch.pyexecutor.context_logits_plan import (
     context_logits_rows,
     store_context_logits_from_full_rows,
 )
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import (
+    DecoderRunner,
+    _holds_token_rows,
+)
 
 VOCAB = 4
 
@@ -166,3 +169,11 @@ def test_only_the_last_context_chunk_is_processed(last_chunk):
     _runner()._execute_logit_post_processors(_batch(context=[request]), {"logits": _rows(1)})
 
     assert seen == ([(1, [0.0])] if last_chunk else [])
+
+
+def test_only_plain_token_rows_are_stored_from():
+    # Models that do not generate text return other shapes; those stay as they are.
+    assert _holds_token_rows(_rows(3))
+    assert not _holds_token_rows(None)
+    assert not _holds_token_rows(torch.zeros(2, 3, VOCAB))
+    assert not _holds_token_rows(torch.nested.nested_tensor([torch.zeros(2), torch.zeros(3)]))
