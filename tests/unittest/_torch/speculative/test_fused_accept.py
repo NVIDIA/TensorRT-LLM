@@ -169,3 +169,49 @@ def test_step0_epilogue_matches_stock(num_contexts, num_gens, k, rows):
     ref_last = acc_tok[torch.arange(b, device="cuda"), num_acc.long() - 1]
     assert torch.equal(tok[0], ref_last)
     assert torch.all(tok[1:] == -5)  # draft rows untouched (written by the heads)
+
+
+def test_accept_kernels_compile_once_across_batch_splits():
+    """One compiled accept / step-0 kernel serves every batch split."""
+    import triton
+
+    from tensorrt_llm._torch.speculative import fused_accept
+
+    kernels = (fused_accept._strict_accept_kernel, fused_accept._step0_epilogue_kernel)
+    if getattr(kernels[0], "device_caches", None) is None:
+        pytest.skip("this Triton has no JITFunction.device_caches")
+    device = triton.runtime.driver.active.get_current_device()
+    k = 3
+
+    def i32(*shape):
+        return torch.zeros(shape, dtype=torch.int32, device="cuda")
+
+    def run(num_contexts, num_gens):
+        b = num_contexts + num_gens
+        target = torch.randint(0, 4, (num_contexts + num_gens * (k + 1),), device="cuda")
+        draft = torch.randint(0, 4, (num_gens, k), dtype=torch.int32, device="cuda")
+        for force in (None, (k, k, 0.0, None, None, 1, 1, 1)):
+            fused_accept.fused_strict_accept(target, draft, num_contexts, b, force)
+        seq_lens = torch.tensor([5] * num_contexts + [k + 1] * num_gens, device="cuda").int()
+        n_tok = int(seq_lens.sum())
+        hidden = torch.zeros(n_tok, 256, dtype=torch.bfloat16, device="cuda")
+        epilogue = fused_accept.step0_epilogue(
+            seq_lens,
+            i32(b) + 1,
+            hidden,
+            i32(n_tok),
+            i32(b),
+            i32(b),
+            num_contexts,
+            b,
+            k,
+            5 * num_contexts,
+        )
+        assert epilogue is not None
+
+    run(3, 2)
+    compiled = [len(kernel.device_caches[device][0]) for kernel in kernels]
+    # Up to 16 context requests: the step-0 context tile grows above that.
+    for num_contexts, num_gens in [(1, 0), (16, 0), (0, 1), (0, 16), (0, 17), (2, 5), (1, 130)]:
+        run(num_contexts, num_gens)
+    assert [len(kernel.device_caches[device][0]) for kernel in kernels] == compiled

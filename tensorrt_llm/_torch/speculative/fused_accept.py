@@ -37,7 +37,8 @@ import triton.language as tl
 MAX_DRAFT_LEN = 31  # columns of the accept tile (k + 1 <= 32)
 
 
-@triton.jit
+# The counts change every step: keep them out of the cache key.
+@triton.jit(do_not_specialize=["num_contexts", "num_gens"])
 def _strict_accept_kernel(
     target_ptr,  # [num_contexts + num_gens * (K + 1)] sampled target tokens (any int dtype)
     draft_ptr,  # [num_gens, K] draft tokens of the previous step
@@ -139,7 +140,8 @@ def fused_strict_accept(
             pool = counter = num_accepted  # unused in mode 1
         pool_mask = pool_size - 1
     draft = draft_tokens.contiguous() if num_gens > 0 else num_accepted
-    block_b = max(16, min(64, triton.next_power_of_2(max(num_gens, num_contexts, 1))))
+    # One tile for every batch: the kernel loops over row blocks.
+    block_b = 64
     _strict_accept_kernel[(1,)](
         target_tokens,
         draft,
@@ -165,7 +167,8 @@ def fused_strict_accept(
     return accepted, num_accepted
 
 
-@triton.jit
+# The counts change every step: keep them out of the cache key.
+@triton.jit(do_not_specialize=["num_contexts", "num_ctx_tokens", "batch_size"])
 def _step0_epilogue_kernel(
     seq_lens_ptr,
     num_accepted_ptr,
