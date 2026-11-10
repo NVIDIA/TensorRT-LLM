@@ -67,7 +67,9 @@ table (``_refresh_ctx_block_tables``, which the worker then skips; two launches 
 ``paged_ctx_block_tables``), and the commit
 is the worker's alone: the rows past the accepted count are not zeroed, since
 their columns are the drafter block append's, which overwrites them in the same
-step before anything reads them.
+step before anything reads them. Under ``drafter_kv_side_chain`` the store over pages
+is the fused one too (``_fused_side_chain_paged``), and under ``drafter_fc_early_fork``
+the page-table decode runs in the early part, ahead of the ``fc`` GEMM.
 """
 
 from __future__ import annotations
@@ -91,6 +93,7 @@ from ...ops.spec.context_kv_commit_paged import context_kv_commit_paged
 from ...ops.spec.context_kv_commit_windowed import context_kv_commit_windowed
 from ...ops.spec.ctx_block_tables_paged import MAX_REQUESTS as TABLES_MAX_REQUESTS
 from ...ops.spec.ctx_block_tables_paged import ctx_block_tables_paged
+from ...ops.spec.ctx_kv_prep_paged import ctx_kv_prep_paged
 from ...ops.spec.ctx_kv_store_paged import MAX_LAYERS as STORE_MAX_LAYERS
 from ...ops.spec.ctx_kv_store_paged import ctx_kv_store_paged
 
@@ -446,7 +449,8 @@ class ContextKvFork:
         Only for an armed step the side chain reproduces (``plan``) and that has not
         forked yet. The side stream waits for the main stream's work so far (the capture
         rows are complete); the projection gather and the rest fork at the step's fork point
-        (``fire``), behind another wait for the main stream.
+        (``fire``), behind another wait for the main stream. Over pages the early part also
+        decodes the step's page table, which its prologue reads.
         """
         if self._armed is None or self._launched is not None or self._early is not None:
             return
@@ -466,7 +470,14 @@ class ContextKvFork:
             return
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
-            early = _side_chain_early(self.worker, self.draft_model, spec_metadata, num_gens, k)
+            early = _side_chain_early(
+                self.worker,
+                self.draft_model,
+                spec_metadata,
+                num_gens,
+                k,
+                lambda: self._refresh_block_tables(attn_metadata, num_gens),
+            )
         if early is None:
             self._decline(
                 "drafter_fc_early_fork",
@@ -829,13 +840,15 @@ class ContextKvFork:
         """The built-in store of the step's context K/V, unmasked; runs on the side stream.
 
         The worker's ``_store_step_context`` without its mask, after this step's page
-        table decode over the KV cache manager's pages. Its first launch is a torch
-        kernel, so the fork is a plain dependency on the main stream's last kernel.
+        table decode over the KV cache manager's pages; under ``drafter_kv_side_chain`` its
+        fused form (``_fused_side_chain``, or ``_fused_side_chain_paged`` over those pages).
+        Its first launch is a torch or Triton kernel, so the fork is a plain dependency on
+        the main stream's last kernel.
         """
         worker, drafter = self.worker, self.draft_model
         refusal = _side_chain_refusal(worker, drafter) if self.side_chain_on else None
         if self.side_chain_on and refusal is None:
-            # The dense full-length arena only (``_side_chain_refusal``): no page table to decode.
+            # The dense full-length arena or the KV cache manager's pages (``_side_chain_refusal``).
             early = None
             if self._early is not None:
                 early, early_gens, early_k = self._early
@@ -844,6 +857,11 @@ class ContextKvFork:
                         "[musespark_open] context_kv_fork: the early side-chain part was launched for "
                         "another step or capture state than the one forking now"
                     )
+            if worker._ctx_paged:
+                if early is None:
+                    # The early part, when it ran, decoded the table ahead of its prologue.
+                    self._refresh_block_tables(attn_metadata, num_gens)
+                return _fused_side_chain_paged(worker, drafter, spec_metadata, num_gens, k, early)
             return _fused_side_chain(worker, drafter, spec_metadata, num_gens, k, early)
         if refusal is not None:
             self._decline("drafter_kv_side_chain", refusal, num_gens)
@@ -911,29 +929,46 @@ class ContextKvFork:
 
 
 def _side_chain_refusal(worker, drafter) -> Optional[str]:
-    """Why ``_fused_side_chain`` does not write out this drafter's ``precompute_context_kv``, or None.
+    """Why the fused side chain does not write out this drafter's ``precompute_context_kv``, or None.
 
-    The store it writes out is the dense full-length arena's (``context_kv_scatter`` at
-    columns ``min(ctx_len + r, max_ctx - 1)``): over the KV cache manager's pages or a
-    windowed arena the built-in ``_store_step_context`` runs (``ContextKvFork.side_chain``).
+    Its store is the dense full-length arena's (``_fused_side_chain``: ``context_kv_scatter``
+    at columns ``min(ctx_len + r, max_ctx - 1)``) or the KV cache manager's pages
+    (``_fused_side_chain_paged``: the worker's ``_store_context_kv_paged`` at columns clamped
+    to each request's allocation). Over a windowed arena or the worker's private pages the
+    built-in ``_store_step_context`` runs (``ContextKvFork.side_chain``).
     """
     from tensorrt_llm._torch.models import modeling_dflash
 
-    if worker._ctx_paged or worker._ctx_block_tables is not None:
-        return "the context is in the KV cache manager's pages"
     if worker._ctx_base is not None:
         return "the context arena is windowed"
+    if worker._ctx_paged:
+        if worker._ctx_block_tables is None:
+            return "the context is in the worker's private pages"
+        counts = worker._ctx_block_counts
+        if (
+            counts is None
+            or counts.dtype != torch.int64
+            or not counts.is_contiguous()
+            or worker._ctx_len.dtype != torch.int64
+            or worker._batch_to_slot.dtype != torch.int64
+        ):
+            return "the context lengths, slots or allocation extents are not int64"
+        cache_dtype = worker._ctx_kv_buf[0].dtype
+    elif worker._ctx_block_tables is not None:
+        return "the context is in the KV cache manager's pages"
+    else:
+        cache_dtype = worker._ctx_k_buf.dtype
     if modeling_dflash._flashinfer_rope is None:
         return "no flashinfer RoPE"
     if drafter._fused_kv_weight is None:
         drafter._build_fused_kv_buffers()
     if getattr(drafter, "_input_ln_eps", None) is not None:
         return "the drafter normalizes the projected rows before its K/V GEMM"
-    if drafter._fused_kv_weight.dtype != worker._ctx_k_buf.dtype:
+    if drafter._fused_kv_weight.dtype != cache_dtype:
         return "the K/V GEMM weight is not the arena dtype"
     if drafter._k_norm_stacked is None:
         return "no stacked K norm"
-    if worker._ctx_k_buf.dim() != 5 or worker._ctx_k_buf.stride(4) != 1:
+    if not worker._ctx_paged and (worker._ctx_k_buf.dim() != 5 or worker._ctx_k_buf.stride(4) != 1):
         return "the arena is not [slots, layers, capacity, kv_heads, head_dim]"
     if _kv_gemm(drafter) is None:
         return "precompute_context_kv is replaced by something other than drafter_fixed_gemms"
@@ -967,13 +1002,18 @@ def _kv_gemm(drafter):
 
 @dataclass
 class _SideChainPrologue:
-    """The side chain's first part: its prep kernel's outputs and the captured rows."""
+    """The side chain's first part: its prep kernel's outputs and the captured rows.
+
+    Over pages (``_side_chain_prologue_paged``) ``positions`` is None and ``keys`` holds each
+    entry's page-table row; over a dense arena ``keys`` is None.
+    """
 
     slots: torch.Tensor
-    positions: torch.Tensor
+    positions: Optional[torch.Tensor]
     col: torch.Tensor
     pos_i32: torch.Tensor
     gen_hs: torch.Tensor
+    keys: Optional[torch.Tensor] = None
 
 
 def _side_chain_prologue(
@@ -999,11 +1039,46 @@ def _side_chain_prologue(
     return _SideChainPrologue(slots, positions, col, pos_i32, gen_hs)
 
 
+def _side_chain_prologue_paged(
+    worker, drafter, spec_metadata, num_gens: int, k: int
+) -> _SideChainPrologue:
+    """``_side_chain_prologue`` over the KV cache manager's pages, after the step's table decode.
+
+    ``ctx_kv_prep_paged``: each entry's column clamped to its request's allocation
+    (``_ctx_block_counts``), its page-table row (the batch position) and the per-layer int32
+    RoPE positions, the values ``_store_step_context`` computes.
+    """
+    rows_per_req = k + 1
+    rows = num_gens * rows_per_req
+    layers = drafter._num_attn_layers
+    device = worker._ctx_len.device
+    slots = worker._batch_to_slot[:num_gens]
+    col = torch.empty(rows, dtype=torch.long, device=device)
+    keys = torch.empty(rows, dtype=torch.long, device=device)
+    pos_i32 = torch.empty(rows * layers, dtype=torch.int32, device=device)
+    ctx_kv_prep_paged(
+        worker._ctx_len,
+        slots,
+        worker._ctx_block_counts,
+        col,
+        keys,
+        pos_i32,
+        rows_per_req,
+        layers,
+        worker._ctx_page_size,
+    )
+    gen_hs = spec_metadata.captured_hidden_states[
+        :rows, : spec_metadata.hidden_size * spec_metadata.num_capture_layers
+    ]
+    return _SideChainPrologue(slots, None, col, pos_i32, gen_hs, keys)
+
+
 # ---- The early fc fork (``drafter_fc_early_fork``, ``ContextKvFork.early_fc_on``) ----
-# The fused side chain's local part -- the prep kernel and the drafter's sharded ``fc`` GEMM
-# on this rank's rows -- forks right after the last DFlash capture layer
-# (``ContextKvFork.fire_early``); the projection gather and everything after it still fork
-# at the LM-head point. Nothing in the early part waits on another rank or another kernel.
+# The fused side chain's local part -- the prep kernel (over pages: after the step's page-table
+# decode) and the drafter's sharded ``fc`` GEMM on this rank's rows -- forks right after the
+# last DFlash capture layer (``ContextKvFork.fire_early``); the projection gather and everything
+# after it still fork at the LM-head point. Nothing in the early part waits on another rank or
+# another kernel.
 
 
 @dataclass
@@ -1044,11 +1119,14 @@ def _sharded_fc(drafter, x: torch.Tensor):
     return weight.detach()[begin : begin + state.rows], state
 
 
-def _side_chain_early(worker, drafter, spec_metadata, num_gens: int, k: int):
+def _side_chain_early(
+    worker, drafter, spec_metadata, num_gens: int, k: int, refresh_tables: Callable[[], None]
+):
     """The side chain's local part, or None when the projection is not the sharded ``fc``.
 
     ``sharded_project_target_hidden``'s statements up to its gather: ``x = rows.to(weight
-    dtype)``, ``_gemm(x.contiguous(), shard, pdl)``.
+    dtype)``, ``_gemm(x.contiguous(), shard, pdl)``. Over pages ``refresh_tables`` (the step's
+    page-table decode) runs first, as the paged prologue reads the allocation extents.
     """
     from ... import spec_worker as _drafter_worker
 
@@ -1061,9 +1139,46 @@ def _side_chain_early(worker, drafter, spec_metadata, num_gens: int, k: int):
     if split is None:
         return None
     shard, state = split
-    prologue = _side_chain_prologue(worker, drafter, spec_metadata, num_gens, k)
+    if worker._ctx_paged:
+        refresh_tables()
+        prologue = _side_chain_prologue_paged(worker, drafter, spec_metadata, num_gens, k)
+    else:
+        prologue = _side_chain_prologue(worker, drafter, spec_metadata, num_gens, k)
     local = _drafter_worker._gemm(x.contiguous(), shard, state.enable_pdl)
     return _EarlyFc(prologue, local, state.gather, current_capture_id())
+
+
+def _side_chain_kv(drafter, projected: torch.Tensor, pos_i32: torch.Tensor):
+    """``precompute_context_kv``'s served branch (no input norm, the weight's dtype), written out.
+
+    Returns K (post norm and RoPE, ``[rows, layers, kv_heads, head_dim]``) and the fused K/V
+    GEMM's output ``[rows, layers * 2 * kv_heads * head_dim]``, from which V is read in place.
+    The RoPE is ``_fused_rope_inplace``'s flashinfer call with the prep kernel's positions.
+    """
+    from tensorrt_llm._torch.models import modeling_dflash
+
+    rows = projected.shape[0]
+    layers = drafter._num_attn_layers
+    nkv, hd = drafter._num_kv_heads, drafter._head_dim
+    kv_flat = _kv_gemm(drafter)(projected)
+    kv = kv_flat.view(rows, layers, 2, nkv, hd)
+    k_new = kv[:, :, 0].contiguous()
+    k_new = torch.nn.functional.rms_norm(k_new, (hd,), eps=drafter._k_norm_eps)
+    k_new = k_new * drafter._k_norm_stacked.view(1, layers, 1, hd)
+    k_flat = k_new.view(rows * layers, nkv * hd)
+    dummy_q = drafter._rope_dummy_q
+    if dummy_q is None or dummy_q.dtype != k_flat.dtype or dummy_q.shape[0] < k_flat.shape[0]:
+        dummy_q = k_flat.new_empty(k_flat.shape[0], drafter._head_dim)
+        drafter._rope_dummy_q = dummy_q
+    modeling_dflash._flashinfer_rope(
+        pos_i32,
+        dummy_q[: k_flat.shape[0]],
+        k_flat,
+        drafter._head_dim,
+        drafter._get_cos_sin_cache(),
+        drafter._is_neox,
+    )
+    return k_new, kv_flat
 
 
 def _fused_side_chain(
@@ -1081,53 +1196,52 @@ def _fused_side_chain(
     after the last capture layer; this continues from the projection gather
     (``hidden_norm(gather(local))``, the rest of ``sharded_project_target_hidden``).
     """
-    from tensorrt_llm._torch.models import modeling_dflash
-
     from ...ops.spec.context_kv_store import context_kv_scatter
 
-    rows_per_req = k + 1
-    rows = num_gens * rows_per_req
-    layers = drafter._num_attn_layers
-    nkv, hd = drafter._num_kv_heads, drafter._head_dim
     if early is not None:
         pro = early.prologue
         projected = drafter.hidden_norm(early.gather.gather(early.local))
     else:
         pro = _side_chain_prologue(worker, drafter, spec_metadata, num_gens, k)
         projected = drafter.project_target_hidden(pro.gen_hs.reshape(-1, pro.gen_hs.shape[-1]))
-    slots, col, pos_i32, gen_hs = pro.slots, pro.col, pro.pos_i32, pro.gen_hs
-    # precompute_context_kv, its served branch (no input norm, the weight's dtype).
-    projected = projected.to(worker._ctx_k_buf.dtype)
-    kv_flat = _kv_gemm(drafter)(projected)
-    kv = kv_flat.view(rows, layers, 2, nkv, hd)
-    k_new = kv[:, :, 0].contiguous()
-    k_new = torch.nn.functional.rms_norm(k_new, (hd,), eps=drafter._k_norm_eps)
-    k_new = k_new * drafter._k_norm_stacked.view(1, layers, 1, hd)
-    # _fused_rope_inplace's flashinfer call, positions from the prep kernel.
-    k_flat = k_new.view(rows * layers, nkv * hd)
-    dummy_q = drafter._rope_dummy_q
-    if dummy_q is None or dummy_q.dtype != k_flat.dtype or dummy_q.shape[0] < k_flat.shape[0]:
-        dummy_q = k_flat.new_empty(k_flat.shape[0], drafter._head_dim)
-        drafter._rope_dummy_q = dummy_q
-    modeling_dflash._flashinfer_rope(
-        pos_i32,
-        dummy_q[: k_flat.shape[0]],
-        k_flat,
-        drafter._head_dim,
-        drafter._get_cos_sin_cache(),
-        drafter._is_neox,
-    )
+    k_new, kv_flat = _side_chain_kv(drafter, projected.to(worker._ctx_k_buf.dtype), pro.pos_i32)
     context_kv_scatter(
         k_new,
         kv_flat,
-        slots,
-        col,
+        pro.slots,
+        pro.col,
         worker._ctx_k_buf,
         worker._ctx_v_buf,
-        rows_per_req,
+        k + 1,
         worker._max_ctx,
     )
-    return gen_hs
+    return pro.gen_hs
+
+
+def _fused_side_chain_paged(
+    worker, drafter, spec_metadata, num_gens: int, k: int, early: Optional[_EarlyFc] = None
+) -> torch.Tensor:
+    """``_fused_side_chain`` over the KV cache manager's pages, after the step's table decode.
+
+    ``_store_step_context``'s paged branch, unmasked: the same projection,
+    ``precompute_context_kv`` written out (``_side_chain_kv``), and the worker's
+    ``_store_context_kv_paged`` with K and V (read in place from the K/V GEMM's output)
+    at each entry's page-table row and its column clamped to the request's allocation.
+    The columns, the rows and the per-layer int32 RoPE positions come from one prep kernel
+    (``ctx_kv_prep_paged``) instead of the built-in's torch kernels, and V is not copied
+    contiguous. With ``early`` (``fire_early``), the table decode, the prep kernel and the
+    sharded ``fc`` GEMM already ran after the last capture layer.
+    """
+    if early is not None:
+        pro = early.prologue
+        projected = drafter.hidden_norm(early.gather.gather(early.local))
+    else:
+        pro = _side_chain_prologue_paged(worker, drafter, spec_metadata, num_gens, k)
+        projected = drafter.project_target_hidden(pro.gen_hs.reshape(-1, pro.gen_hs.shape[-1]))
+    k_new, kv_flat = _side_chain_kv(drafter, projected.to(worker._ctx_kv_buf[0].dtype), pro.pos_i32)
+    v_new = kv_flat.view(k_new.shape[0], k_new.shape[1], 2, *k_new.shape[2:])[:, :, 1]
+    worker._store_context_kv_paged(k_new, v_new, pro.keys, pro.col)
+    return pro.gen_hs
 
 
 # --------------------------------------------------------------------------

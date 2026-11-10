@@ -1389,9 +1389,9 @@ _SM107_LEVERS = frozenset(
         "head_sampler_coop_fold",
     }
 )
-#: The levers sm107 TEP8 adds: the drafter's fused context-K/V side chain, its early fc fork
-#: and the drafter preamble written by the folded commit (a dense arena), and the 8-row head
-#: logits gathered over MULTIMEM.
+#: The levers sm107 TEP8 adds: the drafter's fused context-K/V side chain and its early fc fork
+#: (a dense arena or pages), the drafter preamble written by the folded commit (a dense arena),
+#: and the 8-row head logits gathered over MULTIMEM.
 _SM107_TEP8_LEVERS = frozenset(
     {
         "drafter_kv_side_chain",

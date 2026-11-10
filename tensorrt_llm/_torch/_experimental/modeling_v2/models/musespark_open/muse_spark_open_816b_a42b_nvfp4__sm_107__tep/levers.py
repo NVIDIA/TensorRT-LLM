@@ -1071,7 +1071,9 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
             params=(Param("MAX_BATCH", 8, 1, 64),),
         ),
         "drafter_kv_side_chain": Rule(
-            "LL", Kind.BITWISE, _always("decode steps of 1..64 requests over a dense arena")
+            "LL",
+            Kind.BITWISE,
+            _always("decode steps of 1..64 requests over a dense arena or pages"),
         ),
         "drafter_fc_early_fork": Rule("LL", Kind.BITWISE, _always("forked side-chain steps")),
         "drafter_preamble_from_commit": Rule(
