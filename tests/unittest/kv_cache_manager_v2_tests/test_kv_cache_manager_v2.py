@@ -11586,8 +11586,20 @@ class TestNoBatchingDiskOptions(TestNoBatching):
         self.assertEqual(shrunk["retained"], 0)
         self._assert_copies_balance(shrunk)
         self.assertGreater(shrunk["reclaimed"], restored["reclaimed"])
+        # Push the prefix off the GPU and host again, then restore it from disk; refcheck verifies the KV. Only a
+        # restore from disk keeps a copy without writing one, so created copies exceed written-through pages.
+        for _ in range(4):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        evicted = _introspection.disk_copy_counters(self.manager)
         again = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(again.kv_cache.num_committed_tokens, 0)
         self._run_and_close(again)
+        reread = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(
+            reread["created"] - evicted["created"],
+            reread["write_through_pages"] - evicted["write_through_pages"],
+        )
+        self._assert_copies_balance(reread)
         self.manager.clear_reusable_blocks()
 
     def test_write_through_without_keep_copy(self) -> None:
@@ -11610,6 +11622,45 @@ class TestNoBatchingDiskOptions(TestNoBatching):
         reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
         self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
         self._run_and_close(reuse)
+        self.manager.clear_reusable_blocks()
+
+    def test_keep_copy_without_write_through(self) -> None:
+        # Keep-copy alone: nothing is copied early, a restore from disk keeps the disk copy, and when the restored
+        # page falls back to disk it takes that slot back instead of being written again.
+        self.disk_tier_options = {"num_io_threads": 4, "keep_copy_after_restore": True}
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        for _ in range(7):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        filled = _introspection.disk_copy_counters(self.manager)
+        self.assertEqual(filled["write_through_pages"], 0)
+        self.assertEqual(filled["created"], 0)
+
+        # Restore the first request's prefix from disk; refcheck verifies the restored KV.
+        prompt = first.kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
+        restored = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(restored["created"], 0)
+        self.assertGreater(restored["retained"], 0)
+        self._assert_copies_balance(restored)
+
+        # Push the restored prefix back down: its host -> disk eviction reuses the kept copies.
+        for _ in range(4):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        pushed = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(pushed["reused"], restored["reused"])
+        self.assertEqual(pushed["write_through_pages"], 0)
+        self._assert_copies_balance(pushed)
+
+        # The copies that were taken back hold the right bytes: restore from them again.
+        again = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(again.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(again)
         self.manager.clear_reusable_blocks()
 
     def test_full_disk_evicts_lru_pages_before_retained_copies(self) -> None:
