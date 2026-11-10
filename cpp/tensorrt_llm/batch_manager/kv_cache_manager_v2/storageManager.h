@@ -363,13 +363,13 @@ public:
     //! Retained disk copy counters. With one disk tier, retained == created - reused - reclaimed - dropped.
     struct DiskCopyCounters
     {
-        uint64_t retained;            //!< Retained copies held now.
-        uint64_t created;             //!< Copies created: kept after a restore or written through.
-        uint64_t reused;              //!< Evictions that took a copy's slot back instead of writing.
-        uint64_t reclaimed;           //!< Copies released to make room, on resize, or because their write failed.
-        uint64_t dropped;             //!< Copies released because their page was destroyed.
-        uint64_t writeThroughPages;   //!< Pages written through.
-        uint64_t writeThroughSkipped; //!< Eligible pages not written through: no free disk slot or budget.
+        uint64_t retained{0};            //!< Retained copies held now.
+        uint64_t created{0};             //!< Copies created: kept after a restore or written through.
+        uint64_t reused{0};              //!< Evictions that took a copy's slot back instead of writing.
+        uint64_t reclaimed{0};           //!< Copies released to make room, on resize, or because their write failed.
+        uint64_t dropped{0};             //!< Copies released because their page was destroyed.
+        uint64_t writeThroughPages{0};   //!< Pages written through.
+        uint64_t writeThroughSkipped{0}; //!< Eligible pages not written through: no free disk slot or budget.
     };
 
     [[nodiscard]] DiskCopyCounters diskCopyCounters() const noexcept;
@@ -581,14 +581,6 @@ private:
 
     using RetainedCopyList = std::list<RetainedCopy>;
 
-    struct KeepCopyStats
-    {
-        uint64_t created{0};
-        uint64_t reused{0};
-        uint64_t reclaimed{0};
-        uint64_t dropped{0};
-    };
-
     void addRetainedCopy(Page& page, CacheLevel level, PoolGroupIndex pgIdx, Slot slot);
     [[nodiscard]] std::optional<Slot> takeRetainedCopy(Page const& page, CacheLevel level);
     //! Whether \p page has a reusable retained copy at \p level. A copy whose write has not finished or failed is
@@ -604,7 +596,7 @@ private:
     RetainedCopyList mRetainedCopies;
     std::unordered_map<Page const*, RetainedCopyList::iterator> mRetainedByPage;
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> mNumRetainedCopies;
-    KeepCopyStats mKeepCopyStats;
+    DiskCopyCounters mDiskCopyCounters; // `retained` is filled in by diskCopyCounters()
 
     // Write-through: pages evicted GPU -> host are also copied to free disk slots as retained copies, as background
     // writes. It never evicts or reclaims anything to make room.
@@ -613,8 +605,6 @@ private:
     [[nodiscard]] CachedCudaEvent pendingDiskWrite(Page const& page) const;
     bool mDiskWriteThrough{false};              // any disk tier writes through
     TypedVec<CacheLevel, bool> mWriteThroughAt; // per level: writeThrough of that disk tier
-    uint64_t mWriteThroughPages{0};
-    uint64_t mWriteThroughSkipped{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

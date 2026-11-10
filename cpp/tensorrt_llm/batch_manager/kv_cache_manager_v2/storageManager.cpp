@@ -596,7 +596,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
             }
             mWriteThroughAt[level] = disk->writeThrough && hostAbove;
             mDiskWriteThrough = mDiskWriteThrough || mWriteThroughAt[level];
-            configureAsyncDiskIo(static_cast<size_t>(std::max(disk->numIoThreads, 0)));
+            configureAsyncDiskIo(static_cast<size_t>(disk->numIoThreads)); // validate() rejects negative values
         }
     }
     if (mDiskWriteThrough && !asyncDiskIoEnabled())
@@ -625,10 +625,7 @@ StorageManager::~StorageManager()
 
 void StorageManager::destroy()
 {
-    if (!mLevels.empty())
-    {
-        releaseAllRetainedCopies(/*level=*/std::nullopt);
-    }
+    releaseAllRetainedCopies(/*level=*/std::nullopt);
     for (auto& lvl : mLevels)
     {
         TLLM_CHECK_DEBUG(lvl.storage);
@@ -924,8 +921,9 @@ void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
 
 StorageManager::DiskCopyCounters StorageManager::diskCopyCounters() const noexcept
 {
-    return {mRetainedCopies.size(), mKeepCopyStats.created, mKeepCopyStats.reused, mKeepCopyStats.reclaimed,
-        mKeepCopyStats.dropped, mWriteThroughPages, mWriteThroughSkipped};
+    DiskCopyCounters counters = mDiskCopyCounters;
+    counters.retained = mRetainedCopies.size();
+    return counters;
 }
 
 SlotCount StorageManager::numRetainedCopies(CacheLevel level, std::optional<PoolGroupIndex> pgIdx) const
@@ -944,7 +942,7 @@ void StorageManager::addRetainedCopy(Page& page, CacheLevel level, PoolGroupInde
     if (auto it = mRetainedByPage.find(&page); it != mRetainedByPage.end())
     {
         eraseRetainedCopy(it->second);
-        ++mKeepCopyStats.reclaimed;
+        ++mDiskCopyCounters.reclaimed;
     }
     mRetainedCopies.push_back(RetainedCopy{&page, level, pgIdx, std::move(slot), false});
     try
@@ -959,7 +957,7 @@ void StorageManager::addRetainedCopy(Page& page, CacheLevel level, PoolGroupInde
         throw;
     }
     ++mNumRetainedCopies.at(level).at(pgIdx);
-    ++mKeepCopyStats.created;
+    ++mDiskCopyCounters.created;
 }
 
 bool StorageManager::validateRetainedCopy(Page const& page, CacheLevel level)
@@ -985,7 +983,7 @@ bool StorageManager::validateRetainedCopy(Page const& page, CacheLevel level)
     if (!usable)
     {
         eraseRetainedCopy(it->second);
-        ++mKeepCopyStats.reclaimed;
+        ++mDiskCopyCounters.reclaimed;
     }
     return usable;
 }
@@ -1052,7 +1050,7 @@ void StorageManager::releaseRetainedCopies(CacheLevel level, PoolGroupIndex pgId
         if (it->level == level && it->pgIdx == pgIdx && !it->reserved)
         {
             eraseRetainedCopy(it);
-            ++mKeepCopyStats.reclaimed;
+            ++mDiskCopyCounters.reclaimed;
             --count;
         }
         it = next;
@@ -1067,7 +1065,7 @@ void StorageManager::releaseAllRetainedCopies(std::optional<CacheLevel> level)
         if (!level.has_value() || it->level == *level)
         {
             eraseRetainedCopy(it);
-            ++mKeepCopyStats.reclaimed;
+            ++mDiskCopyCounters.reclaimed;
         }
         it = next;
     }
@@ -1086,7 +1084,7 @@ void StorageManager::onPageDestroyed(Page& page) noexcept
             if (it != mRetainedByPage.end())
             {
                 eraseRetainedCopy(it->second);
-                ++mKeepCopyStats.dropped;
+                ++mDiskCopyCounters.dropped;
             }
         });
 }
@@ -1128,7 +1126,7 @@ void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<Shared
         size_t const pageBytes = slotSize(diskLevel, pgIdx).at(PoolIndex{0});
         size_t const take = std::min({batch.size(), static_cast<size_t>(std::max<SlotCount>(free, 0)),
             pageBytes == 0 ? batch.size() : backgroundDiskWriteBudget() / pageBytes});
-        mWriteThroughSkipped += batch.size() - take;
+        mDiskCopyCounters.writeThroughSkipped += batch.size() - take;
         if (take == 0)
         {
             continue;
@@ -1165,10 +1163,10 @@ void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<Shared
                     }
                 }
             }
-            mWriteThroughSkipped += take - added;
+            mDiskCopyCounters.writeThroughSkipped += take - added;
             TLLM_LOG_WARNING("[KVCacheManagerV2] Disk write-through of %zu pages skipped: %s", take - added, e.what());
         }
-        mWriteThroughPages += added;
+        mDiskCopyCounters.writeThroughPages += added;
     }
 }
 
@@ -1551,7 +1549,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
                         if (auto found = mRetainedByPage.find(it->get()); found != mRetainedByPage.end())
                         {
                             eraseRetainedCopy(found->second);
-                            ++mKeepCopyStats.reclaimed;
+                            ++mDiskCopyCounters.reclaimed;
                             ++room;
                         }
                         fallenPages.at(lifeCycle).push_back(std::move(*it));
@@ -1863,6 +1861,7 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
             throw OutOfPagesError("Not enough free slots for migration");
         }
         auto freshSlots = dstPoolGroup.allocateMultiple(numNewSlots);
+        // A15: allocated slot count must match the request.
         TLLM_CHECK_DEBUG_WITH_INFO(slotCountValueFromSize(freshSlots.size()) == numNewSlots, "dst_slots size mismatch");
         std::size_t nextFresh = 0;
         for (std::size_t i = 0; i < srcPages.size(); ++i)
@@ -1872,32 +1871,16 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                 dstSlots.at(i) = std::move(freshSlots.at(nextFresh++));
             }
         }
-    }
-    catch (...)
-    {
-        for (auto& s : dstSlots)
-        {
-            if (s.hasValidSlot())
-            {
-                dstPoolGroup.release(std::move(s));
-            }
-        }
-        throw;
-    }
-    bool const retainSrcCopy = updateSrc && !defrag && dstLevel < srcLevel && cacheTier(srcLevel) == CacheTier::DISK
-        && mKeepCopyAfterRestoreAt.at(srcLevel);
-    try
-    {
+        bool const retainSrcCopy = updateSrc && !defrag && dstLevel < srcLevel && cacheTier(srcLevel) == CacheTier::DISK
+            && mKeepCopyAfterRestoreAt.at(srcLevel);
         thread_local std::vector<PageIndexPair> pageIndices;
         pageIndices.clear();
         pageIndices.reserve(srcPages.size());
-        size_t numReused = 0;
         for (std::size_t i = 0; i < srcPages.size(); ++i)
         {
             TLLM_CHECK_DEBUG(defrag || !srcPages.at(i)->scheduledForEviction());
             if (reusedCopy.at(i))
             {
-                ++numReused;
                 continue;
             }
             pageIndices.push_back(PageIndexPair{
@@ -2013,7 +1996,7 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                     scheduleForEviction(*srcPages.at(i));
             }
         }
-        mKeepCopyStats.reused += numReused;
+        mDiskCopyCounters.reused += static_cast<uint64_t>(numSlots - numNewSlots);
         return updateSrc ? std::nullopt : std::optional<std::vector<Slot>>{std::move(dstSlots)};
     }
     catch (...)
