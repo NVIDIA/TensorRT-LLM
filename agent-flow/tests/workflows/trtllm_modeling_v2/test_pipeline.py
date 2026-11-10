@@ -33,7 +33,6 @@ from ._helpers import (
     _state,
     _workflow,
     _write_vocabulary,
-    fake_git,
     passing_shell,
 )
 
@@ -315,6 +314,8 @@ def test_a_repair_runs_its_tasks_before_the_task_it_repairs(tmp_path, task_file,
     )
     assert _state(tmp_path).verdict == "delivered"
     assert order == ["core", "kx-1", "fix-1", "core"]
+    # The planner is told what the worker said it lacks, not only that it blocked.
+    assert "blocked_reason: vocabulary_gap; missing_entry: norm/my_norm" in asked[0]
     assert [t["id"] for t in _tasks(tmp_path)] == ["survey", "kx-1", "fix-1", "core"]
     assert "## Your last answer was refused" in asked[1] and "onboard:<category>/<name>" in asked[1]
 
@@ -871,7 +872,3 @@ def test_a_task_whose_branch_conflicts_goes_back_to_its_worker_once_and_then_lan
     assert certification["commit"] == head
     assert {v["tree"].split("+")[0] for v in _verdicts(tmp_path)} == {head}
     assert not (tmp_path / "ws" / "worktrees" / "core").exists()  # integrated, so closed
-
-
-def test_fake_git_default_is_a_stable_head():
-    assert fake_git()("/repo", "rev-parse", "HEAD") == "c0ffee1\n"

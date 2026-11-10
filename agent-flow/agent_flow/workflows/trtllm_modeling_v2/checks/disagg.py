@@ -34,7 +34,7 @@ from .verdict import GateResult, inspect_tree, lost_session, verdict_factory
 
 GATE_NAME = "disagg"
 #: Where the test keeps what it writes for after it: under the gate's work directory, never
-#: in the read-only snapshot it runs in, which is pruned once the gate ends.
+#: in the tree it runs in, which a check leaves as it found it.
 ARTIFACTS_ENV = "MV2FLOW_GATE_ARTIFACTS"
 #: Seconds the test may take: two engines to start and a benchmark to score.
 DEFAULT_TIMEOUT_S = 7200
@@ -118,7 +118,7 @@ def disagg_command(
     file, _, rest = spec.test.partition("::")
     root = pytest_root(repo, file)
     node = (Path(repo) / file).relative_to(root).as_posix() + (f"::{rest}" if rest else "")
-    # What the test keeps goes beside the report, outside the snapshot it runs in (pruned after).
+    # What the test keeps goes beside the report, outside the tree it runs in.
     kept = {ARTIFACTS_ENV: str(report.parent / f"{report.stem}.artifacts")}
     env = with_mode(
         replace(environment, env={**environment.env, **kept, **(spec.env or {})}), MODE_REQUIRE

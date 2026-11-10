@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 import threading
 import time
 import tomllib
@@ -422,3 +423,30 @@ def test_all_template_resources_are_declared_as_package_data() -> None:
     for name in loaded:
         assert (resources / name).is_file()
         _render._ENVIRONMENT.get_template(name)
+
+
+def test_the_feature_skill_names_only_paths_the_tree_has():
+    """The skill and the workers' reuse rule are maps of paths: a path the tree lost is stale."""
+    from agent_flow.workflows.trtllm_modeling_v2.agents.prompts import worker
+    from agent_flow.workflows.trtllm_modeling_v2.agents.roles import PACKAGED_SKILLS_DIR
+
+    root = Path(__file__).resolve().parents[4]
+    if not (root / "tensorrt_llm").is_dir():
+        pytest.skip("not inside a TensorRT-LLM checkout")
+    skill = PACKAGED_SKILLS_DIR / "trtllm-modeling-v2-features"
+    text = "\n".join(
+        [
+            *(p.read_text() for p in skill.rglob("*.md")),
+            Path(worker.__file__).read_text(),
+            Path(_common.__file__).read_text(),
+            *(p.read_text() for p in Path(_common.__file__).parent.rglob("*.j2")),
+        ]
+    )
+    named = set()
+    for found in re.findall(r"`((?:_torch|tensorrt_llm|tests|cpp|examples)/[^`\s]+)`", text):
+        path = found.split("::")[0].rstrip(".,;:)")
+        path = "tensorrt_llm/" + path if path.startswith("_torch/") else path
+        if not any(ch in path for ch in "*<{["):
+            named.add(path)
+    missing = sorted(p for p in named if not (root / p).exists())
+    assert not missing, f"the feature skill names paths this tree lacks: {missing}"

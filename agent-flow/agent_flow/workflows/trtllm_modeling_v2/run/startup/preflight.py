@@ -445,9 +445,8 @@ def check_accuracy_anchors(
         if uncommitted:
             raise PreflightError(
                 f"accuracy anchor for unit `{unit}`: the checkout holds {uncommitted} "
-                f"uncommitted. Each check measures a snapshot of a commit and reads the anchor "
-                f"table from it, so this row exists for preflight and not for any gate: commit "
-                f"it to the run's branch."
+                f"uncommitted. The certification reads the anchor table from the commit it "
+                f"measures and refuses a checkout with uncommitted changes: commit it."
             )
         notes.append(
             f"accuracy anchor [{unit}]: {benchmark or 'eval'} {model_key} "
@@ -463,7 +462,7 @@ def _uncommitted(task_data: Mapping[str, Any], declared: str) -> str:
     try:
         rel = path.resolve().relative_to(repo.resolve())
     except (OSError, ValueError):
-        return ""  # outside the checkout: a snapshot does not move it
+        return ""  # outside the checkout: no commit holds it
     dirt = git_output(repo, "status", "--porcelain", "--untracked-files=all", "--", str(rel))
     return str(rel) if dirt and dirt.strip() else ""
 

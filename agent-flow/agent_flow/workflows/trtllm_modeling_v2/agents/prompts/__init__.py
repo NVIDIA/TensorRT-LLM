@@ -84,7 +84,7 @@ DEFAULT_PROMPTS = _ROLE_PROMPTS.with_extensions(
 )
 
 
-#: Where the orchestrator snapshots the composed prompts inside the workspace.
+#: Where the composed prompts are written inside the workspace, as every role is told them.
 PROMPTS_DIRNAME = "prompts"
 
 
