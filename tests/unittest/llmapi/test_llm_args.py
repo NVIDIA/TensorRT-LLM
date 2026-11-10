@@ -2188,8 +2188,12 @@ class TestMultimodalConfig:
             setattr(llm, method, lambda *args, **kwargs: None)
         module = "mm_encoder" if encoder_only else "llm"
         with patch.object(BaseLLM, "_build_model"), patch(
-                f"tensorrt_llm.llmapi.{module}.create_input_processor",
-                side_effect=ValueError("input processor boundary")) as factory:
+                "tensorrt_llm.llmapi.llm.check_quantization_compute_capability"
+        ), patch(
+                "tensorrt_llm.llmapi.llm.check_architecture_registered"), patch(
+                    f"tensorrt_llm.llmapi.{module}.create_input_processor",
+                    side_effect=ValueError(
+                        "input processor boundary")) as factory:
             with pytest.raises(ValueError, match="input processor boundary"):
                 llm._build_model()
         kwargs = factory.call_args.kwargs
@@ -2465,6 +2469,48 @@ def test_SchedulerConfig_declaration() -> None:
     assert PybindMirror.pybind_equals(pybind_config.dynamic_batch_config,
                                       config.dynamic_batch_config._to_pybind())
     assert pybind_config.enable_prefix_aware_scheduling is False
+
+
+@pytest.mark.cpu_only
+def test_gen_preemption_config() -> None:
+    assert not SchedulerConfig().gen_preemption.enabled
+    merged = update_llm_args_with_extra_dict({"model": "dummy"},
+                                             yaml.safe_load("""
+scheduler_config:
+  gen_preemption:
+    target_output_tps: 32.5
+"""))
+    config = SchedulerConfig(**merged["scheduler_config"]).gen_preemption
+    assert config.target_output_tps == 32.5 and config.enabled
+    assert SchedulerConfig(gen_preemption={
+        "tpot_budget": 0.1
+    }).gen_preemption.enabled
+    for bad in ({
+            "target_output_tps": 0
+    }, {
+            "tpot_budget": 1.0
+    }, {
+            "tpot_budget": 0.1,
+            "target_output_tps": 40
+    }, {
+            "policy": "wait"
+    }):
+        with pytest.raises(ValidationError):
+            llm_args_mod.GenPreemptionConfig(**bad)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("parallel", [{
+    "pipeline_parallel_size": 2
+}, {
+    "tensor_parallel_size": 2,
+    "enable_attention_dp": True
+}])
+def test_gen_preemption_rejects_pp_and_attention_dp(parallel) -> None:
+    on = SchedulerConfig(gen_preemption={"target_output_tps": 40})
+    with pytest.raises(ValueError, match="does not support"):
+        TorchLlmArgs(model=llama_model_path, scheduler_config=on, **parallel)
+    TorchLlmArgs(model=llama_model_path, **parallel)  # off: no restriction
 
 
 @pytest.mark.cpu_only

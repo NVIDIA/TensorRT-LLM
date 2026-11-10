@@ -405,7 +405,9 @@ def test_prepared_launch_matches_the_full_path_per_layer():
     sinks_a = torch.randn(heads, dtype=torch.float32, device=device)
     sinks_b = torch.randn(heads, dtype=torch.float32, device=device)
     wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
-    wrapper.plan(device, rows, heads, max_topk=topk, max_extra_topk=extra_topk, has_sinks=True)
+    wrapper.plan(
+        device, rows, heads, max_topk=topk, max_extra_topk=extra_topk, use_attention_sinks=True
+    )
     prepared_launches = []
     original = wrapper._run_prepared
 
@@ -427,7 +429,7 @@ def test_prepared_launch_matches_the_full_path_per_layer():
             extra_lengths=sets[idx][3],
             softmax_scale=LATENT**-0.5,
             output_scale=1.0,
-            sinks=sinks,
+            attention_sinks=sinks,
             out=out,
             validate=validate,
         )
@@ -453,7 +455,9 @@ def test_prepared_launch_matches_the_full_path_per_layer():
     launch(sinks_a.clone())
     assert len(prepared_launches) == 3 and len(wrapper._prepared) == 4
     # Re-planning drops every prepared launch.
-    wrapper.plan(device, rows, heads, max_topk=topk, max_extra_topk=extra_topk, has_sinks=True)
+    wrapper.plan(
+        device, rows, heads, max_topk=topk, max_extra_topk=extra_topk, use_attention_sinks=True
+    )
     assert not wrapper._prepared
 
 
@@ -649,7 +653,7 @@ def test_fused_output_matches_trtllm_inverse_rope_quant(
     # on the softmax, the KV descale on the output), as the adapter passes them.
     run_scales = dict(softmax_scale=softmax_scale * descale * descale, output_scale=descale)
     sources = dict(extra_indices=extra_indices, extra_lengths=extra_lengths) if extra_topk else {}
-    plan_args = dict(max_topk=topk, max_extra_topk=extra_topk, max_seq_len_q=1, q_data_type=dtype)
+    plan_args = dict(max_topk=topk, max_extra_topk=extra_topk, max_q_len=1, q_dtype=dtype)
 
     reference = BatchSparseMLADecodePagedTSWrapper()
     reference.plan(device, rows, heads, **plan_args)
@@ -801,7 +805,7 @@ def test_speculative_decoding_rows_run_on_prims_ts(monkeypatch, generation_seq_l
     library default and the spy asserts that PrimTS served those steps with one
     row per query token (``rows = sum(generation_lens)``, not one per request),
     which is the per-token-row contract the kernel is planned for
-    (``max_seq_len_q = 1``).
+    (``max_q_len = 1``).
     """
     _skip_unless_toolchain()
     monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
@@ -1192,7 +1196,7 @@ def test_warm_up_fans_out_only_when_a_variant_is_missing(monkeypatch) -> None:
     payloads, workers = fanned[0]
     assert workers == 2  # capped by the env value, below the three variants
     assert [p["rows"] for p in payloads] == [20, 15, 7]
-    assert payloads[0]["plan_kwargs"]["q_data_type"] == "bfloat16"  # JSON-safe dtype
+    assert payloads[0]["plan_kwargs"]["q_dtype"] == "bfloat16"  # JSON-safe dtype
     assert payloads[0]["plan_kwargs"]["max_extra_topk"] == 32
     assert payloads[0]["device_index"] == 0
     import json
@@ -1301,7 +1305,7 @@ def test_precompile_worker_entry_compiles_its_shard_first_then_the_rest(monkeypa
     monkeypatch.setattr(cc, "expected_cache_meta", lambda: {"probe": "meta"})
     payloads = [
         pp.encode_payload(
-            0, rows, 16, dict(max_topk=128, max_extra_topk=512, q_data_type=torch.bfloat16)
+            0, rows, 16, dict(max_topk=128, max_extra_topk=512, q_dtype=torch.bfloat16)
         )
         for rows in (20, 15, 7, 3)
     ]

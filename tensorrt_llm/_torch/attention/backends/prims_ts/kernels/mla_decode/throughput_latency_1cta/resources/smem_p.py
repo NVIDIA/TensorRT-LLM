@@ -56,7 +56,7 @@ from ...helpers.math import (
     qkv_dtype,
 )
 from ...helpers.ops import (
-    fp8_log2_quant_scale,
+    fp8_log2_p_scale,
     pack_float4_to_fp8_e4m3,
     store_transposed_smem8b_x2,
     store_transposed_smem8b_x4,
@@ -248,7 +248,7 @@ class SmemPResource(MlaResource):
                 safe_new_max = Float32(0.0)
             neg_scaled_max[idx] = -self.scale_softmax_log2 * safe_new_max
             if cutlass.const_expr(cfg.is_fp8_qkv()):
-                neg_scaled_max[idx] += fp8_log2_quant_scale()
+                neg_scaled_max[idx] += fp8_log2_p_scale(cfg)
             local_sums[idx] = Float32(0.0)
 
         # Convert S registers to P and accumulate local softmax sums. FP8 packs

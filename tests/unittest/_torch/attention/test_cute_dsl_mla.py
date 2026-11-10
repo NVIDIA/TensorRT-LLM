@@ -204,8 +204,13 @@ def _select_mla_generation_fmha(
         (103, 96, 8, True, False, "cute_dsl_mla"),
         (100, 96, 8, True, False, "cute_dsl_mla"),
         (103, 96, 2, True, False, "cute_dsl_mla"),
-        # SM107 has no TRTLLM-Gen FMHA; the request keeps falling through.
-        (107, 96, 8, True, False, "trtllm_gen"),
+        # SM107 has no TRTLLM-Gen FMHA; the next library there is the generic
+        # fallback, so the verify group stays on the CuTe DSL kernel too
+        # (Kimi K3's FP8-KV layers under attention DP: H=96, MTP5 = 6 tokens).
+        (107, 96, 8, True, False, "cute_dsl_mla"),
+        (107, 96, 6, True, False, "cute_dsl_mla"),
+        # SM107 head counts outside the group keep the perf gate.
+        (107, 128, 8, True, False, "trtllm_gen"),
         # Helix H=96 verify groups are unchanged.
         (103, 96, 4, True, True, "cute_dsl_mla"),
         (107, 96, 4, True, True, "cute_dsl_mla"),
