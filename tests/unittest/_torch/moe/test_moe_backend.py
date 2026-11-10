@@ -4402,7 +4402,7 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
                 in_kernel_fc2_reduce=False,
                 combine_format="bf16",
             )
-            assert len(selected) == 11
+            assert len(selected) == 12
             assert selected == megamoe_op._unpack_tactic(tactic)
     invalid_tactic = list(megamoe_op.default_megamoe_tactic(64))
     invalid_tactic[3] = ("grouped", 0)
@@ -4411,9 +4411,10 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
     legacy = ([256, 128, 256], [2, 1, 1], 512, "static", "epi_warps", True, 1, (1, 1))
     megamoe_op.validate_megamoe_tactic(legacy, sm_version=sm_version)
     assert megamoe_op._unpack_tactic(legacy) == megamoe_op.default_megamoe_tactic(64)
-    v4 = megamoe_op.default_megamoe_tactic(64)[:-1]
-    megamoe_op.validate_megamoe_tactic(v4, sm_version=sm_version)
-    assert megamoe_op._unpack_tactic(v4) == megamoe_op.default_megamoe_tactic(64)
+    for legacy_len in (11, 10):  # v5 (no combine_dedup) and v4 (no READY granularity)
+        legacy = megamoe_op.default_megamoe_tactic(64)[:legacy_len]
+        megamoe_op.validate_megamoe_tactic(legacy, sm_version=sm_version)
+        assert megamoe_op._unpack_tactic(legacy) == megamoe_op.default_megamoe_tactic(64)
 
 
 @pytest.mark.cpu_only
