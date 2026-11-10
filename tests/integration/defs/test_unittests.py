@@ -578,6 +578,7 @@ def test_mpi_profiler(llm_root: str, llm_venv: "PythonVenvRunnerImpl",
             "error") is None, f"MPI rank {rank} errored in the smoke case"
 
 
+@pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("enabled", [False, True], ids=["off", "on"])
 def test_nccl_profiler_build_contract(llm_root: str,
                                       llm_venv: "PythonVenvRunnerImpl",
