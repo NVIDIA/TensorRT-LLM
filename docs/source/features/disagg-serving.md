@@ -272,7 +272,7 @@ The disaggregated server also serves `/v1/responses`, with both `context_first` 
 Two limitations apply to `/v1/responses` on every server, disaggregated or not:
 
 - A `tool_choice` other than `auto` or `none` on non-Harmony models is accepted but not enforced. The server logs a warning once.
-- `parallel_tool_calls: false` ends generation after the first tool call only when the tool parser declares the text that ends one call, as the DeepSeek DSML parsers (`deepseek_v32`, `deepseek_v4`, `deepseek_v41`) do. With other tool parsers, and on Harmony models, it is accepted but not enforced, and the server logs a warning once.
+- `parallel_tool_calls: false` ends generation after the first tool call only when the tool parser declares the text that ends one call, as the DeepSeek DSML parsers (`deepseek_v32`, `deepseek_v4`, `deepseek_v41`) and the Kimi K3 parser (`kimi_k3`) do. With other tool parsers, and on Harmony models, it is accepted but not enforced, and the server logs a warning once.
 
 #### Launching disaggregated servers on SLURM clusters
 

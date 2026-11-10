@@ -220,6 +220,8 @@ When the served model is Kimi K3, `trtllm-serve` applies Kimi/Moonshot API seman
 * **`TLLM_KIMI_K3_FP8_KV_LAYERS`** (NVFP4 KV cache only): comma-separated zero-based global MLA layer IDs to keep in an FP8 KV cache instead of the default last two MLA layers; an empty value keeps every MLA layer in NVFP4. The previous `TLLM_KIMI_K3_BF16_KV_LAYERS` is deprecated: it is still honored as this list, with a warning, when `TLLM_KIMI_K3_FP8_KV_LAYERS` is unset.
 * **`TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR`** (default `0`): opt-in constrained decoding for tools with `strict: true` (requires `guided_decoding_backend: xgrammar`). Disabled by default pending the investigation of a device-side assert observed under sustained concurrent guided load; strict tools otherwise fall back to warn-and-continue.
 
+Independently of the Kimi extensions, `parallel_tool_calls: false` ends generation after the model's first tool call on `/v1/chat/completions` and `/v1/responses`, as does `disable_parallel_tool_use` on `/v1/messages`; without it the model may return several tool calls in one turn.
+
 ## Testing API Endpoint
 
 The server (the OpenAI-compatible REST endpoint) runs on the rank-0 node, listening on port `8000`. Send requests to that node's hostname or IP; `localhost` only works from the rank-0 node itself.

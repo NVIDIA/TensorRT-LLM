@@ -16,6 +16,8 @@
 import abc
 import functools
 import json
+import logging
+import re
 import time
 from contextlib import AbstractContextManager
 from typing import Callable, Iterator, NamedTuple
@@ -23,6 +25,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
@@ -102,6 +105,35 @@ def sample_tools():
                 },
             ),
         ),
+    ]
+
+
+@pytest.fixture
+def trtllm_log(monkeypatch):
+    """The records the TRT-LLM logger emits during a test, debug level included."""
+    records = []
+
+    class Capture(logging.Handler):
+
+        def emit(self, record):
+            records.append(record)
+
+    handler = Capture(level=logging.DEBUG)
+    monkeypatch.setattr(logger, "_min_severity", "debug")
+    previous_level = logger._logger.level
+    logger._logger.setLevel(logging.DEBUG)
+    logger._logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger._logger.removeHandler(handler)
+        logger._logger.setLevel(previous_level)
+
+
+def _logged(records, level):
+    """The messages of ``records`` at exactly ``level``."""
+    return [
+        record.getMessage() for record in records if record.levelno == level
     ]
 
 
@@ -3784,14 +3816,19 @@ def test_dsml_open_block_without_a_complete_invoke_has_no_call(
     _assert_both_views(parser_cls, text, sample_tools, ("Checking.", []))
 
 
-def test_only_the_dsml_parsers_declare_single_call_stops():
-    """Other formats have no stop, so their requests keep every call."""
+def test_the_parsers_that_declare_single_call_stops():
+    """Formats whose markup ends each call with its own text.
+
+    Other formats have no stop, so their requests keep every call.
+    """
     declaring = {
         name
         for name, parser_cls in ToolParserFactory.parsers.items()
         if parser_cls().single_call_stops
     }
-    assert declaring == {"deepseek_v32", "deepseek_v4", "deepseek_v41"}
+    assert declaring == {
+        "deepseek_v32", "deepseek_v4", "deepseek_v41", "kimi_k3"
+    }
 
 
 # ============================================================================
@@ -6967,6 +7004,98 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
         warnings = [str(call.args[0]) for call in log.warning.call_args_list]
         assert any("'get_weather' read without <|close|>call<|sep|>" in warning
                    for warning in warnings)
+
+    # What a generation stopped after its first call leaves
+    # (parallel_tool_calls=false): the call, closed by the kept stop, in a
+    # tools section the stop left open.
+    STOPPED_CALL = WEATHER + LOCATION_LA + "<|close|>call<|sep|>"
+    _SPECIAL_TOKEN = re.compile(r"(<\|open\|>|<\|close\|>|<\|sep\|>)")
+
+    def _token_chunkings(self, text):
+        """Splits of ``text`` at its special tokens, which the model writes whole.
+
+        Every piece on its own, then every two-way cut at a piece boundary.
+        """
+        pieces = [piece for piece in self._SPECIAL_TOKEN.split(text) if piece]
+        yield pieces
+        for cut in range(1, len(pieces)):
+            yield ["".join(pieces[:cut]), "".join(pieces[cut:])]
+
+    def _stream(self, chunks, tools):
+        """Read ``chunks`` as a stream, finish included: (text, [(name, arguments)])."""
+        parser = self.make_parser()
+        results = [
+            parser.parse_streaming_increment(chunk, tools) for chunk in chunks
+        ]
+        results.append(parser.finish(tools))
+        return ("".join(result.normal_text for result in results),
+                [(call.name, json.loads(call.parameters)) for result in results
+                 for call in result.calls])
+
+    def test_the_single_call_stop_is_the_call_close_tag(self):
+        """parallel_tool_calls=false stops generation on this text, kept in the output."""
+        assert KimiK3ToolParser().single_call_stops == (
+            "<|close|>call<|sep|>", )
+
+    @pytest.mark.parametrize("trailing", ["", "\n"],
+                             ids=["at_the_stop", "newline_after_the_call"])
+    def test_a_generation_stopped_after_its_first_call_delivers_that_call_quietly(
+            self, sample_tools, trtllm_log, trailing):
+        """The kept stop completes the call; the section it leaves open is no error.
+
+        Whole and streamed alike deliver that call and nothing else. Every
+        parallel_tool_calls=false turn with a call ends this way, so the open
+        section is noted at debug, not warned about; so is a generation cut
+        right after the newline following the call.
+        """
+        content = "Checking." + self.BOT + self.STOPPED_CALL + trailing
+        (stop, ) = KimiK3ToolParser().single_call_stops
+        assert content.rstrip().endswith(stop)
+        expected = ("Checking.", [("get_weather", {"location": "LA"})])
+
+        whole = self.make_parser().detect_and_parse(content, sample_tools)
+        assert (whole.normal_text, [(call.name, json.loads(call.parameters))
+                                    for call in whole.calls]) == expected
+        for chunks in self._token_chunkings(content):
+            assert self._stream(chunks, sample_tools) == expected, chunks
+
+        assert _logged(trtllm_log, logging.WARNING) == []
+        assert any("stream ended before" in message
+                   for message in _logged(trtllm_log, logging.DEBUG))
+
+    def test_a_generation_stopped_after_its_first_call_reads_the_same_through_the_pipeline(
+            self, sample_tools):
+        """With the reasoning parser in front, as served: the reasoning, then the one call."""
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+
+        generation = self.PREFIX + self.BOT + self.STOPPED_CALL
+
+        reasoning = ReasoningParserFactory.create_reasoning_parser("kimi_k3")
+        assert reasoning.parse(
+            generation).reasoning_content == "Need the weather."
+        assert self._read_chained(generation, sample_tools) == ("Checking.", [
+            (0, "get_weather", {
+                "location": "LA"
+            })
+        ])
+
+    @pytest.mark.parametrize("ending", [
+        pytest.param(" and then I", id="prose_after_the_call"),
+        pytest.param('<|open|>call tool="search_web"', id="next_call_cut_off"),
+        pytest.param('<|open|>call tool="search_web" index="2"<|sep|>' +
+                     LOCATION + "New",
+                     id="next_call_value_cut_off"),
+    ])
+    def test_a_section_left_open_any_other_way_still_warns(
+            self, sample_tools, trtllm_log, ending):
+        """Only a section whose last content is a complete call is quiet."""
+        text, calls = self._stream(
+            ["Checking.", self.BOT + self.STOPPED_CALL, ending], sample_tools)
+
+        assert text == "Checking."
+        assert calls[:1] == [("get_weather", {"location": "LA"})]
+        assert any("stream ended before" in message
+                   for message in _logged(trtllm_log, logging.WARNING))
 
 
 class TestForcedToolChoicePostprocessing:

@@ -25,7 +25,10 @@ Attribute values are escaped (``&`` -> ``&amp;``, ``"`` -> ``&quot;``).
 every other type. The section arrives after the response body, so streaming
 buffers the section and emits complete calls once ``<|close|>tools<|sep|>``
 is seen. A call whose close tags the model left out is still read where its
-end is not in doubt (see ``KimiK3ToolParser._read_calls``).
+end is not in doubt (see ``KimiK3ToolParser._read_calls``). A generation ended
+after its first call (``parallel_tool_calls=false``) stops on that call's own
+close tag with the section left open; the complete calls of an open section
+are delivered (see ``KimiK3ToolParser.single_call_stops``).
 """
 
 import json
@@ -121,6 +124,15 @@ class KimiK3ToolParser(BaseToolParser):
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
+
+    @property
+    def single_call_stops(self) -> tuple[str, ...]:
+        # Each call block ends with its own close tag, so stopping there
+        # completes exactly one call; the tools section stays open, and the
+        # complete calls of an open section are delivered. The K3 tokenizer
+        # writes the tag as the three tokens <|close|>, call and <|sep|>,
+        # which is how the stop text tokenizes, so this one form matches.
+        return (self._CALL_CLOSE,)
 
     def supports_structural_tag(self) -> bool:
         # XTML argument bodies are tag-structured text, not JSON — the
@@ -432,10 +444,11 @@ class KimiK3ToolParser(BaseToolParser):
         """Emit whatever the buffer holds when the stream ends early.
 
         ``parse_streaming_increment`` buffers the whole tools section until
-        ``<|close|>tools<|sep|>``; if generation stops first (length limit,
-        cancellation), the buffered content would otherwise be dropped.
-        Complete call blocks are salvaged; a call truncated mid-block is
-        reported by the malformed-call warning in ``_parse_tools_section``.
+        ``<|close|>tools<|sep|>``; if generation stops first (the stop that
+        ends the first call, a length limit, cancellation), the buffered
+        content would otherwise be dropped. Complete call blocks are salvaged;
+        a call truncated mid-block is reported by the malformed-call warning
+        in ``_parse_tools_section``.
         """
         buffer, self._buffer = self._buffer, ""
         if not buffer:
@@ -446,7 +459,11 @@ class KimiK3ToolParser(BaseToolParser):
             # stream is over, so it is plain text after stripping any
             # trailing structural tokens (matching detect_and_parse).
             return StreamingParseResult(normal_text=self._trailing_structural.sub("", buffer))
-        logger.warning(
+        # A generation stopped after its first call (``single_call_stops``)
+        # ends on the call's close tag with the section open by design; a
+        # section left open any other way may have lost a call, so it warns.
+        ended_on_a_call = buffer.rstrip().endswith(self._CALL_CLOSE)
+        (logger.debug if ended_on_a_call else logger.warning)(
             f"kimi_k3 tool parser: stream ended before {self.eot_token}; "
             "parsing the partial tools section"
         )

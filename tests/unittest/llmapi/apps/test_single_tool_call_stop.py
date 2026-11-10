@@ -86,6 +86,7 @@ WEATHER_INVOKE = (
         ("DeepSeek_V41", V41_STOPS),
         ("deepseek_v4", ("</｜DSML｜invoke>\n", "</｜DSML｜invoke>")),
         ("deepseek_v32", ("</｜DSML｜invoke>\n", "</｜DSML｜invoke>")),
+        ("kimi_k3", ("<|close|>call<|sep|>",)),
         ("qwen3", ()),
         ("not_a_parser", ()),
         (None, ()),
@@ -268,6 +269,7 @@ def _warned(log, key):
     "fields, tool_parser, stop, enforced",
     [
         ({"parallel_tool_calls": False}, "deepseek_v41", list(V41_STOPS), True),
+        ({"parallel_tool_calls": False}, "kimi_k3", ["<|close|>call<|sep|>"], True),
         ({}, "deepseek_v41", [], False),
         ({"parallel_tool_calls": True}, "deepseek_v41", [], False),
         ({"parallel_tool_calls": False, "tool_choice": "none"}, "deepseek_v41", [], False),
@@ -283,6 +285,7 @@ def _warned(log, key):
     ],
     ids=[
         "asked",
+        "asked_kimi_k3",
         "omitted",
         "parallel_allowed",
         "tool_choice_none",
@@ -312,7 +315,9 @@ def test_chat_configures_the_stop_only_when_asked_and_possible(
     assert sampling_params.include_stop_str_in_output is (
         "include_stop_str_in_output" in fields or enforced
     )
-    assert seen["postproc_args"].single_call_stops == (V41_STOPS if enforced else ())
+    assert seen["postproc_args"].single_call_stops == (
+        _single_tool_call_stops(tool_parser) if enforced else ()
+    )
     asked = fields.get("parallel_tool_calls") is False and fields.get("tools", [WEATHER_TOOL])
     asked = asked and fields.get("tool_choice") != "none"
     assert _warned(server_logger, "chat_parallel_tool_calls_unenforced") is bool(
@@ -342,11 +347,18 @@ def test_a_stop_the_request_lists_itself_keeps_its_stop_reason(monkeypatch, serv
     "tool_parser, stop_sequences, enforced",
     [
         ("deepseek_v41", [], True),
+        ("kimi_k3", [], True),
         ("deepseek_v41", ["END"], False),
         ("qwen3", [], False),
         (None, [], False),
     ],
-    ids=["supported", "own_stops_dropped", "format_without_stop", "no_tool_parser"],
+    ids=[
+        "supported",
+        "supported_kimi_k3",
+        "own_stops_dropped",
+        "format_without_stop",
+        "no_tool_parser",
+    ],
 )
 def test_anthropic_disable_parallel_tool_use_configures_the_stop_when_possible(
     monkeypatch, server_logger, tool_parser, stop_sequences, enforced
@@ -363,9 +375,10 @@ def test_anthropic_disable_parallel_tool_use_configures_the_stop_when_possible(
     response = asyncio.run(server.anthropic_messages(request, _raw_request()))
 
     assert response.status_code == 200, response.body
-    assert seen["sampling_params"].stop == (list(V41_STOPS) if enforced else stop_sequences)
+    stops = _single_tool_call_stops(tool_parser) if enforced else ()
+    assert seen["sampling_params"].stop == (list(stops) if enforced else stop_sequences)
     assert seen["sampling_params"].include_stop_str_in_output is enforced
-    assert seen["postproc_args"].single_call_stops == (V41_STOPS if enforced else ())
+    assert seen["postproc_args"].single_call_stops == stops
     assert _warned(server_logger, "chat_parallel_tool_calls_unenforced") is not enforced
 
 
@@ -444,6 +457,35 @@ def test_a_streamed_chat_reply_reports_its_call_and_no_stop_the_server_added():
     assert "｜DSML｜" not in "".join(choice["delta"].get("content") or "" for choice in choices)
 
 
+# What a Kimi K3 generation stopped after its first call leaves: that call,
+# closed by the kept stop, in a tools section the stop left open.
+K3_STOPS = ("<|close|>call<|sep|>",)
+K3_STOPPED_REPLY = (
+    "Checking.<|open|>tools<|sep|>"
+    '<|open|>call tool="get_weather" index="1"<|sep|>'
+    '<|open|>argument key="location" type="string"<|sep|>NYC<|close|>argument<|sep|>'
+    "<|close|>call<|sep|>"
+)
+
+
+def test_a_kimi_k3_chat_reply_stopped_after_its_first_call_reports_that_call():
+    """The K3 stop is the call's own close tag, so the parser reads the call whole."""
+    args = _chat_args(K3_STOPS)
+    args.tool_parser = "kimi_k3"
+    rsp = SimpleNamespace(
+        outputs=[_output(K3_STOPPED_REPLY, "stop", K3_STOPS[0])],
+        prompt_token_ids=[1],
+        cached_tokens=0,
+    )
+    choice = chat_response_post_processor(rsp, args).choices[0]
+
+    assert choice.finish_reason == "tool_calls"
+    assert choice.stop_reason is None
+    assert choice.message.content == "Checking."
+    calls = [(c.function.name, json.loads(c.function.arguments)) for c in choice.message.tool_calls]
+    assert calls == [("get_weather", {"location": "NYC"})]
+
+
 # ---------------------------------------------------------------------------
 # Responses
 # ---------------------------------------------------------------------------
@@ -489,6 +531,7 @@ def _responses_server(monkeypatch, tool_parser):
     "fields, tool_parser, enforced, warned",
     [
         ({"parallel_tool_calls": False}, "deepseek_v41", True, False),
+        ({"parallel_tool_calls": False}, "kimi_k3", True, False),
         ({}, "deepseek_v41", False, False),
         ({"parallel_tool_calls": True}, "deepseek_v41", False, False),
         ({"parallel_tool_calls": False, "tool_choice": "none"}, "deepseek_v41", False, False),
@@ -498,6 +541,7 @@ def _responses_server(monkeypatch, tool_parser):
     ],
     ids=[
         "asked",
+        "asked_kimi_k3",
         "omitted",
         "parallel_allowed",
         "tool_choice_none",
@@ -526,6 +570,8 @@ def test_responses_configures_the_stop_only_when_asked_and_possible(
     asyncio.run(server.openai_responses(request, raw_request))
 
     sampling_params = seen["sampling_params"]
-    assert sampling_params.stop == (list(V41_STOPS) if enforced else None)
+    assert sampling_params.stop == (
+        list(_single_tool_call_stops(tool_parser)) if enforced else None
+    )
     assert sampling_params.include_stop_str_in_output is enforced
     assert _warned(server_logger, "responses_parallel_tool_calls_unenforced") is warned
