@@ -34,6 +34,7 @@ BACKEND = "trtllm-nixl-encoder-v1"
 _MAX_REFERENCE_BYTES = 64 * 1024
 _MAX_TENSOR_BYTES = 64 * 1024 * 1024
 _MAX_CACHE_BYTES = 256 * 1024 * 1024
+_MAX_RECEIVE_SLOTS = 8
 _MAX_TENSORS = 64
 _TTL_SECONDS = 300
 _TIMEOUT_SECONDS = 30
@@ -48,8 +49,8 @@ _DTYPES = {
         torch.uint8,
     )
 }
-# An uncertain remote WRITE may still touch these buffers. Admission is stopped;
-# retain registrations and tensors until process exit rather than recycle memory.
+# An uncertain remote WRITE may still touch these buffers. Retain registrations
+# and tensors until process exit; quarantined receives remain charged to quota.
 _QUARANTINED = []
 
 
@@ -128,6 +129,9 @@ class NixlEncoderCache:
         self._exports = {}
         self._claims = {}
         self._used = 0
+        self._receive_slots = 0
+        self._quarantined_receive_slots = 0
+        self._quarantined_receive_bytes = 0
         self.failed = False
         self._closed = False
         self._closing = False
@@ -149,6 +153,17 @@ class NixlEncoderCache:
         with self._lock:
             self.failed = True
             _QUARANTINED.append(resources)
+
+    def _quarantine_receive(self, total, agent, tensors, registration):
+        with self._lock:
+            self._quarantined_receive_slots += 1
+            self._quarantined_receive_bytes += total
+            if (
+                self._quarantined_receive_slots >= _MAX_RECEIVE_SLOTS
+                or self._quarantined_receive_bytes >= _MAX_CACHE_BYTES
+            ):
+                self.failed = True
+            _QUARANTINED.append((agent, tensors, registration))
 
     def _model_digest(self, llm):
         # The immutable revision is deployment-provided, independent of host paths.
@@ -394,9 +409,16 @@ class NixlEncoderCache:
             shapes.append((shape, dtype))
         with self._lock:
             self._healthy()
-            if total > _MAX_TENSOR_BYTES or self._used + total > _MAX_CACHE_BYTES:
+            if total > _MAX_TENSOR_BYTES:
                 raise ValueError("encoder receive exceeds the memory limit")
+            if self._used + total > _MAX_CACHE_BYTES:
+                raise RuntimeError("encoder receive cache is full")
+            if self._receive_slots >= _MAX_RECEIVE_SLOTS:
+                raise RuntimeError(
+                    "encoder receive slots exhausted; restart if transfers are quarantined"
+                )
             self._used += total
+            self._receive_slots += 1
         tensors = []
         agent = None
         registration = None
@@ -445,7 +467,7 @@ class NixlEncoderCache:
             raise
         finally:
             if uncertain:
-                self._quarantine(agent, tensors, registration)
+                self._quarantine_receive(total, agent, tensors, registration)
             else:
                 try:
                     if registered:
@@ -453,11 +475,12 @@ class NixlEncoderCache:
                     if agent is not None:
                         agent.shutdown()
                 except Exception:
-                    self._quarantine(agent, tensors, registration)
+                    self._quarantine_receive(total, agent, tensors, registration)
                     raise
                 else:
                     with self._lock:
                         self._used -= total
+                        self._receive_slots -= 1
         return tensors
 
     def prepare(

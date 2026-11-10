@@ -443,9 +443,14 @@ advertised gRPC and NIXL endpoints reachable across hosts.
 
 Pending exports expire after five minutes when the cache is collected, and
 owned tensor storage is bounded to 256 MiB per engine (64 MiB per request).
-An uncertain transfer stops admission and retains affected registrations and
-buffers until process exit. A missing RPC reply does not establish that a remote
-write stopped. Restart an unhealthy engine; do not retry a consumed handoff.
+An uncertain producer WRITE stops producer admission. An uncertain receive retains
+only that operation's registrations, buffers and agent until process exit; other
+receives can proceed within the memory quota and eight active-or-quarantined
+receive slots. Quarantined resources remain charged to both limits, including
+after shutdown, and require a process restart to reclaim. Exhausting the
+quarantine budget marks the cache unhealthy; a failed cache no longer advertises
+a transfer backend. A missing RPC reply does not establish that
+a remote write stopped. Do not retry a consumed handoff.
 The cross-host GPU path requires the matching protocol and serving changes;
 a published runtime containing them is not yet available.
 

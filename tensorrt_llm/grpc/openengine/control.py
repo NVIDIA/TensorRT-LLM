@@ -307,7 +307,11 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
                     schema_version=1,
                     encoder_only=role == "encode",
                     accepts_cache=role == "consume",
-                    transfer_backends=[self._inference._encoder_cache.backend],
+                    transfer_backends=(
+                        []
+                        if getattr(self._inference._encoder_cache, "failed", False)
+                        else [self._inference._encoder_cache.backend]
+                    ),
                     supports_abort_cleanup=role == "encode",
                     requires_cache=role == "consume",
                 )

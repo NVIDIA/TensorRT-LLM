@@ -1046,10 +1046,11 @@ async def test_abort_encoder_cache_over_real_grpc(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("role", ["", "encode", "consume"])
-async def test_encoder_cache_requirement_is_distinct_from_consumption_capability(role):
+@pytest.mark.parametrize("failed", [False, True])
+async def test_encoder_cache_requirement_is_distinct_from_consumption_capability(role, failed):
     inference = _inference()
     inference.encoder_role = role
-    inference._encoder_cache = SimpleNamespace(backend="test-encoder")
+    inference._encoder_cache = SimpleNamespace(backend="test-encoder", failed=failed)
     info = await _servicer(inference=inference).GetModelInfo(
         model_pb2.GetModelInfoRequest(model=MODEL), FakeServicerContext()
     )
@@ -1058,5 +1059,6 @@ async def test_encoder_cache_requirement_is_distinct_from_consumption_capability
     assert info.encoder.accepts_cache is (role == "consume")
     assert info.encoder.supports_abort_cleanup is (role == "encode")
     assert info.encoder.requires_cache is (role == "consume")
+    assert list(info.encoder.transfer_backends) == (["test-encoder"] if role and not failed else [])
     assert "trtllm_encoder_cache_release" not in info.extra
     assert "trtllm_requires_encoder_cache" not in info.extra

@@ -369,7 +369,7 @@ def test_unfinished_write_quarantines_both_sides(pair, monkeypatch):
     monkeypatch.setattr(FakeAgent, "submit_transfer_requests", incomplete)
     with pytest.raises(RuntimeError, match="did not complete"):
         consumer.prepare(ref, request(), llm, None)
-    assert producer.failed and consumer.failed
+    assert producer.failed and not consumer.failed
     assert _sender(producer).registration is not None
     assert _receiver(consumer).registration is not None
     assert producer._used > 0 and consumer._used > 0
@@ -392,8 +392,138 @@ def test_lost_success_reply_retains_destination_buffers(pair, monkeypatch):
     with pytest.raises(RuntimeError, match="connection lost"):
         consumer.prepare(ref, request(), llm, None)
     assert not producer.failed
-    assert consumer.failed and _receiver(consumer).registration is not None
+    assert not consumer.failed and _receiver(consumer).registration is not None
     assert producer._used == 0
+
+
+@pytest.mark.parametrize("code", [grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED])
+def test_unreachable_peer_quarantines_only_its_receive_and_late_write_remains_safe(
+    pair, monkeypatch, code
+):
+    producer, consumer = pair
+    llm, _ = model()
+    reference = producer.publish(native_result()[0], request(), llm)
+    pending = []
+
+    def fail_transfer(req, timeout):
+        pending.append(req)
+        raise RpcFailure("encoder endpoint unavailable", code)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            transport.encoder_transfer_pb2_grpc,
+            "EncoderTransferStub",
+            lambda channel: SimpleNamespace(Transfer=fail_transfer),
+        )
+        with pytest.raises(grpc.RpcError, match="endpoint unavailable"):
+            _receive(consumer, reference)
+    pinned = _receiver(consumer)
+    pinned_bytes = consumer._used
+    assert pinned.registrations and not pinned.stopped
+    assert pinned_bytes > 0 and consumer._receive_slots == 1 and not consumer.failed
+
+    fresh = producer.publish(native_result()[0], request(), llm)
+    actual = _receive(consumer, fresh)
+    assert _receiver(consumer) is not pinned and _receiver(consumer).stopped
+    assert consumer._used == pinned_bytes and consumer._receive_slots == 1
+    producer.transfer(pending[0].cache, pending[0].destination)
+    assert torch.equal(actual[0], torch.arange(8, dtype=torch.float32).reshape(2, 4))
+    consumer.close()
+    assert pinned.registrations and not pinned.stopped
+    assert consumer._used == pinned_bytes
+
+
+@pytest.mark.parametrize("limit", ["bytes", "slots"])
+def test_quarantined_receives_remain_charged_and_bound_future_allocations(pair, monkeypatch, limit):
+    producer, consumer = pair
+    llm, _ = model()
+    reference = producer.publish(native_result()[0], request(), llm)
+    original = producer.transfer
+
+    def lost_reply(*args):
+        original(*args)
+        raise RpcFailure("lost reply", grpc.StatusCode.UNAVAILABLE)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(producer, "transfer", lost_reply)
+        with pytest.raises(grpc.RpcError, match="lost reply"):
+            _receive(consumer, reference)
+    pinned = _receiver(consumer)
+    used, agents = consumer._used, len(consumer.test_agents)
+    fresh = producer.publish(native_result()[0], request(), llm)
+    if limit == "bytes":
+        monkeypatch.setattr(transport, "_MAX_CACHE_BYTES", used * 2 - 1)
+        message = "cache is full"
+    else:
+        monkeypatch.setattr(transport, "_MAX_RECEIVE_SLOTS", 1)
+        message = "slots exhausted"
+    with pytest.raises(RuntimeError, match=message):
+        _receive(consumer, fresh)
+    assert consumer._used == used and consumer._receive_slots == 1
+    assert len(consumer.test_agents) == agents and not consumer.failed
+    assert pinned.registrations and not pinned.stopped
+    assert json.loads(fresh.opaque_state)["id"] in producer._exports
+
+
+@pytest.mark.parametrize("operation", ["register_memory", "deregister_memory"])
+def test_receive_registration_failure_does_not_disable_unrelated_handoffs(
+    pair, monkeypatch, operation
+):
+    producer, consumer = pair
+    llm, _ = model()
+    reference = producer.publish(native_result()[0], request(), llm)
+    original = getattr(FakeAgent, operation)
+
+    def fail_receive(agent, registration):
+        if "-receive-" in agent.name:
+            if operation == "register_memory":
+                original(agent, registration)
+            raise RuntimeError("receive registration state uncertain")
+        return original(agent, registration)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(FakeAgent, operation, fail_receive)
+        with pytest.raises(RuntimeError, match="state uncertain"):
+            _receive(consumer, reference)
+    pinned = _receiver(consumer)
+    size = consumer._used
+    assert size > 0 and pinned.registrations and not pinned.stopped
+    assert not consumer.failed and consumer._receive_slots == 1
+    fresh = producer.publish(native_result()[0], request(), llm)
+    actual = _receive(consumer, fresh)
+    assert torch.equal(actual[0], torch.arange(8, dtype=torch.float32).reshape(2, 4))
+    assert consumer._used == size and consumer._receive_slots == 1
+
+
+@pytest.mark.parametrize("limit", ["bytes", "slots"])
+def test_exhausted_quarantine_budget_marks_cache_unhealthy_without_freeing_buffers(
+    pair, monkeypatch, limit
+):
+    producer, consumer = pair
+    llm, _ = model()
+    reference = producer.publish(native_result()[0], request(), llm)
+    size = producer._used
+    if limit == "bytes":
+        monkeypatch.setattr(transport, "_MAX_CACHE_BYTES", size)
+    else:
+        monkeypatch.setattr(transport, "_MAX_RECEIVE_SLOTS", 1)
+
+    def fail_transfer(req, timeout):
+        raise RpcFailure("lost peer", grpc.StatusCode.UNAVAILABLE)
+
+    monkeypatch.setattr(
+        transport.encoder_transfer_pb2_grpc,
+        "EncoderTransferStub",
+        lambda channel: SimpleNamespace(Transfer=fail_transfer),
+    )
+    with pytest.raises(grpc.RpcError, match="lost peer"):
+        _receive(consumer, reference)
+    pinned = _receiver(consumer)
+    assert consumer.failed and consumer._used == size and pinned.registrations
+    with pytest.raises(RuntimeError, match="transport unavailable"):
+        _receive(consumer, reference)
+    consumer.close()
+    assert pinned.registrations and not pinned.stopped
 
 
 def test_bad_destination_size_does_not_consume_export(pair):
@@ -714,7 +844,7 @@ def test_unproven_rpc_failure_after_write_quarantines_receiver(pair, monkeypatch
         _receive(consumer, reference)
     assert _writes(producer) == 1 and not producer.failed
     assert producer._used == 0
-    assert consumer.failed and consumer._used > 0 and _receiver(consumer).registrations
+    assert not consumer.failed and consumer._used > 0 and _receiver(consumer).registrations
     assert any(
         resource is _receiver(consumer)
         for entry in transport._QUARANTINED
@@ -737,7 +867,7 @@ def test_submit_can_post_write_then_raise_without_returning_status(pair, monkeyp
     with pytest.raises(RuntimeError, match="after posting WRITE"):
         _receive(consumer, reference)
     assert _writes(producer) == 1
-    assert producer.failed and consumer.failed
+    assert producer.failed and not consumer.failed
     assert producer._used > 0 and consumer._used > 0
     assert _sender(producer).registrations and _receiver(consumer).registrations
     assert not producer._exports
@@ -794,6 +924,29 @@ def test_parallel_receives_use_isolated_agents_while_state_locks_remain_responsi
         pending.result(timeout=5)
     assert _writes(producer) == 2 and consumer._used == producer._used == 0
     assert not first_receiver.registrations and first_receiver.stopped
+
+
+def test_receive_slots_are_reserved_during_inflight_transfers_and_returned_on_success(
+    pair, monkeypatch
+):
+    producer, consumer = pair
+    llm, _ = model()
+    references = [producer.publish(native_result()[0], request(), llm) for _ in range(2)]
+    monkeypatch.setattr(transport, "_MAX_RECEIVE_SLOTS", 1)
+    entered, release, _ = _blocked_write(monkeypatch, producer)
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        pending = workers.submit(_receive, consumer, references[0])
+        try:
+            assert entered.wait(5)
+            with pytest.raises(RuntimeError, match="slots exhausted"):
+                _receive(consumer, references[1])
+            assert consumer._receive_slots == 1 and len(consumer.test_agents) == 1
+        finally:
+            release.set()
+        pending.result(timeout=5)
+    assert consumer._receive_slots == 0
+    _receive(consumer, references[1])
+    assert consumer._receive_slots == 0 and consumer._used == 0
 
 
 def test_same_receiver_parallel_writes_use_isolated_producer_agents(pair, monkeypatch):
