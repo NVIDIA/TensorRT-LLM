@@ -116,7 +116,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_ra
     build as build_ix_topk_decode,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
+    build_split as build_ix_topk_verify,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.cute_dsl_radix_topk_decode import (
     cute_dsl_radix_topk_decode,
+    split_radix_topk_decode,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.ds_mla_dequant_gather import (
     ds_mla_dequant_gather,
@@ -318,13 +322,14 @@ _CTX_WORKSPACE_ROWS = 1 << 19
 # exits the process, raising nothing, past 11622 one-row sequences on sm_103.
 # capacity: fixed: the kernel's scheduler, not an engine limit.
 _CTX_DECODE_ROWS = 8192
-# The decode indexer's top-k: True runs cute_dsl_radix_topk_decode, one launch that selects the
-# trtllm indexer_topk_decode op's set (up to exact ties), False that op itself. The CuTe DSL
-# selector serves scorer rows from 4096 columns (where the op splits each row) to 65536 (one
-# CTA scans a whole row), the widths its cells cover; the scorer's column count is the engine's
-# max_seq_len, so an engine outside that range keeps the op (`_derive_first_step`).
+# CuTe decode selectors: one CTA per row for next_n=1 at 4K..64K columns, and ten
+# partitions plus a radix merge for DSpark verification at the padded 1M envelope.
+# Other shapes retain the native selector.
 _TOPK_DECODE_CUTE_DSL = True
 _TOPK_DECODE_COLUMNS = (4096, 65536)
+_TOPK_VERIFY_COLUMNS = 1048584
+_TOPK_VERIFY_ROW_STRIDE = 1048832
+_TOPK_VERIFY_ROWS = (4, 8, 16)
 # The attention block's glue as separate ops instead of the fused entries, for old-versus-new
 # verification (both compute the same bits; the fused entries' tests hold each pair equal):
 # ssmax_scaling plus the rope tail's copy or zero fill for ssmax_scaling_fused_q;
@@ -750,6 +755,7 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         self.ctx_workspace_rows = 0
         # The decode top-k's handle, built on the first step at a scorer width it serves.
         self._ix_topk = None
+        self._ix_topk_verify = None
         self._prefill = self._decode = None
 
     def post_load_weights(self) -> None:
@@ -839,6 +845,16 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
             self._ix_topk = None
         elif self._ix_topk is None:
             self._ix_topk = build_ix_topk_decode(dev, next_n=1)
+        if not (
+            _TOPK_DECODE_CUTE_DSL
+            and self._max_ctx_len == _TOPK_VERIFY_COLUMNS
+            and self.idx_topk == 2048
+        ):
+            self._ix_topk_verify = None
+        elif self._ix_topk_verify is None:
+            self._ix_topk_verify = build_ix_topk_verify(
+                dev, next_n=4, use_pdl=os.environ.get("TRTLLM_ENABLE_PDL") != "0"
+            )
         # Both key-pool layouts: a launcher compiled for a contiguous view addresses a strided
         # one as if it were dense.
         if self._ix_k is None:
@@ -847,6 +863,35 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
                 for contiguous in (False, True)
             }
         self._derived_for = md.kv_cache_manager
+
+    def _select_indexer_decode(
+        self,
+        logits: torch.Tensor,
+        kv_lens: torch.Tensor,
+        indices: torch.Tensor,
+        next_n: int,
+        aux_indices: torch.Tensor,
+        aux_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select generation rows with the compiled selector for their static shape."""
+        if (
+            self._ix_topk_verify is not None
+            and next_n == 4
+            and logits.shape[0] in _TOPK_VERIFY_ROWS
+            and logits.shape[1] == _TOPK_VERIFY_COLUMNS
+            and logits.stride() == (_TOPK_VERIFY_ROW_STRIDE, 1)
+            and logits.dtype == torch.float32
+        ):
+            return split_radix_topk_decode(
+                logits, kv_lens, indices, aux_indices, aux_logits, compiled=self._ix_topk_verify
+            )
+        if next_n != 1 or self._ix_topk is None:
+            return indexer_topk_decode(
+                logits, kv_lens, indices, next_n, self.idx_topk, 1, aux_indices, aux_logits
+            )
+        return cute_dsl_radix_topk_decode(
+            logits, kv_lens, indices, next_n=1, compiled=self._ix_topk
+        )
 
     def _select_target(self, attn_metadata) -> "PrefillTarget | DecodeTarget":
         """Which target runs this step: one host-side integer read. A mixed batch goes to
@@ -1027,15 +1072,10 @@ class PrefillTarget:
                 step["scheduler_metadata_buffer"],
                 core._max_ctx_len,
             )
-            if next_n != 1 or core._ix_topk is None:
-                indexer_topk_decode(
-                    logits, kv_lens, topk_buf[tc:], next_n, core.idx_topk, 1,
-                    step["radix_aux_indices"], step["radix_aux_logits"],
-                )  # fmt: skip
-            else:
-                cute_dsl_radix_topk_decode(
-                    logits, kv_lens, topk_buf[tc:], next_n=1, compiled=core._ix_topk
-                )
+            core._select_indexer_decode(
+                logits, kv_lens, topk_buf[tc:], next_n,
+                step["radix_aux_indices"], step["radix_aux_logits"],
+            )  # fmt: skip
 
     def _ix_plan(self, step) -> list[SimpleNamespace]:
         """Plan the context rows and key windows scored by each query tile.
@@ -1591,13 +1631,10 @@ class DecodeTarget:
             step["scheduler_metadata_buffer"],
             core._max_ctx_len,
         )
-        if next_n != 1 or core._ix_topk is None:
-            indexer_topk_decode(
-                logits, kv_lens, topk_buf, next_n, core.idx_topk, 1, step["radix_aux_indices"],
-                step["radix_aux_logits"],
-            )  # fmt: skip
-        else:
-            cute_dsl_radix_topk_decode(logits, kv_lens, topk_buf, next_n=1, compiled=core._ix_topk)
+        core._select_indexer_decode(
+            logits, kv_lens, topk_buf, next_n,
+            step["radix_aux_indices"], step["radix_aux_logits"],
+        )  # fmt: skip
 
     def _mlp(self, o, L):
         """This rank's share of the layer's MLP, a partial sum: the dense SwiGLU slice on the
