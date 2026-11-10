@@ -1261,6 +1261,21 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     """
 
     algorithm: Literal["minimax_m3"] = "minimax_m3"
+    enable_kv_cache_offload: bool = Field(
+        default=False,
+        description=
+        "Keep sparse main K/V history in host memory and fetch selected "
+        "blocks into a bounded GPU cache. Requires MSA, KV cache manager V2, "
+        "and single-token generation on a disaggregated generation worker. "
+        "Index keys and dense attention layers remain on the GPU.",
+        status="prototype",
+    )
+    kv_cache_offload_config: SparseKvCacheOffloadConfig = Field(
+        default_factory=SparseKvCacheOffloadConfig,
+        description=
+        "GPU cache and host history sizing when enable_kv_cache_offload is enabled.",
+        status="prototype",
+    )
     sparse_num_index_heads: PositiveInt = Field(
         default=4,
         description=
@@ -1340,6 +1355,23 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
 
     @model_validator(mode="after")
     def _validate_msa_configuration(self):
+        if self.enable_kv_cache_offload:
+            if self.implementation != "msa":
+                raise ValueError(
+                    "MiniMax-M3 KV cache offload requires implementation='msa'."
+                )
+            if not self.sparse_disable_index_value:
+                raise ValueError(
+                    "MiniMax-M3 KV cache offload requires sparse_disable_index_value=True."
+                )
+            if self.sparse_topk_blocks <= 0:
+                raise ValueError(
+                    "MiniMax-M3 KV cache offload requires positive sparse_topk_blocks."
+                )
+        elif self.kv_cache_offload_config != SparseKvCacheOffloadConfig():
+            raise ValueError(
+                "kv_cache_offload_config requires enable_kv_cache_offload=True."
+            )
         if self.implementation == "msa" and self.sparse_block_size != 128:
             raise ValueError(
                 "MiniMax-M3 'msa' implementation requires sparse_block_size == "
@@ -1360,6 +1392,10 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
                 "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
                 "indexer_kv_dtype='fp8'.")
         return self
+
+    def get_kv_cache_offload_config(
+            self) -> Optional[SparseKvCacheOffloadConfig]:
+        return self.kv_cache_offload_config if self.enable_kv_cache_offload else None
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"

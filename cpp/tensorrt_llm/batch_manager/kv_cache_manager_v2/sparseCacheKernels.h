@@ -140,6 +140,8 @@ struct SparseResolveArgs
     int32_t const* capacityTokens;
     //! tokens_per_block / unitsPerPage, a per-layer-group constant.
     int32_t unitTokens;
+    //! Round capacity up to a unit, restoring a partial history prefix on a miss.
+    bool includePartialUnits = false;
 
     //! [numRows][selectionWidth] entry index per selection, kNoSparseSlot where padded or
     //! where the row holds no reservation. One list serves every buffer of the layer.

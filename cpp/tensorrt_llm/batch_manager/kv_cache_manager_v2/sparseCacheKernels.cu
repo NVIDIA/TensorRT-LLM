@@ -273,7 +273,10 @@ __global__ __launch_bounds__(kThreads) void sparsePrepareWriteKernel(SparseResol
 
     gridDependencyWait();
     int32_t const historyUnits = args.historyTokens[row] / args.unitTokens;
-    int32_t const inFlight = args.capacityTokens[row] / args.unitTokens - historyUnits;
+    int32_t const capacity = args.capacityTokens[row];
+    int32_t const capacityUnits = capacity / args.unitTokens
+        + static_cast<int32_t>(args.includePartialUnits && capacity % args.unitTokens != 0);
+    int32_t const inFlight = capacityUnits - historyUnits;
     KVCM2_SPARSE_REQUIRE(inFlight >= 0 && inFlight <= 1);
     // The same bound the resolve's probe index imposes, since this ordinal is resolved
     // through it on every later step.
@@ -335,6 +338,15 @@ __global__ __launch_bounds__(kThreads) void sparsePrepareWriteKernel(SparseResol
         entry[slot]
             = SparseEntry::pack(SparseEntry::usedByte(stepAge, matched != 0), static_cast<uint32_t>(historyUnits));
         args.inFlightSlot[row] = slot;
+        if (args.includePartialUnits && matched == 0 && args.historyTokens[row] % args.unitTokens != 0)
+        {
+            int32_t const index = atomicAdd(args.work.total, 1);
+            KVCM2_SPARSE_REQUIRE(index < args.work.capacity);
+            args.work.row[index] = row;
+            args.work.ordinal[index] = historyUnits;
+            args.work.slot[index] = slot;
+            args.missCount[row] = 1;
+        }
     }
 }
 
@@ -370,7 +382,12 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     bool const rebase = SparseEntry::rebaseDue(stepAge);
 
     int32_t const historyUnits = args.historyTokens[row] / args.unitTokens;
-    int32_t const inFlight = args.capacityTokens[row] / args.unitTokens - historyUnits;
+    int32_t const capacity = args.capacityTokens[row];
+    int32_t const capacityUnits = capacity / args.unitTokens
+        + static_cast<int32_t>(args.includePartialUnits && capacity % args.unitTokens != 0);
+    int32_t const copyableUnits = historyUnits
+        + static_cast<int32_t>(args.includePartialUnits && args.historyTokens[row] % args.unitTokens != 0);
+    int32_t const inFlight = capacityUnits - historyUnits;
     // resize() rejects a gap wider than the cache can pin, so the check cannot fire.
     KVCM2_SPARSE_REQUIRE(inFlight >= 0 && inFlight <= args.maxInFlightUnits);
     // The probe walks one virtual list: the in-flight units, which must be resident before
@@ -519,7 +536,7 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         int32_t mine = 0;
         for (int32_t j = tid; j < numMiss; j += kResolveThreads)
         {
-            mine += missOrd[j] < historyUnits ? 1 : 0;
+            mine += missOrd[j] < copyableUnits ? 1 : 0;
         }
         int32_t scanned = 0;
         int32_t claimed = 0;
@@ -588,10 +605,10 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         int32_t const position = missIdx[j];
         entry[s] = SparseEntry::pack(SparseEntry::usedByte(stepAge, false), static_cast<uint32_t>(ordinal));
         (position < inFlight ? inFlightSlot[position] : outSlot[position - inFlight]) = s;
-        // Only history has anything to fetch. An in-flight unit's host page is not
-        // written until the watermark passes it, so copying from it would read stale
-        // bytes over the data the model is about to write.
-        if (ordinal < historyUnits)
+        // Fetch complete history and, when configured, the host prefix of a newly
+        // reserved partial unit. Resident units are hits, so a fetch never overwrites
+        // the token the model has just appended to its reserved cell.
+        if (ordinal < copyableUnits)
         {
             auto const c = copyBase + atomicAdd(&numCopy, 1);
             args.work.row[c] = row;
@@ -1109,7 +1126,7 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
     TLLM_CHECK_WITH_INFO(args.maxInFlightUnits >= 0, "launchSparseResolve: maxInFlightUnits must not be negative");
     TLLM_CHECK_WITH_INFO(args.stepAge != nullptr,
         "launchSparseResolve: the eviction clock is device-resident, so a captured graph reads the step's own value");
-    if (args.selectionWidth > 0)
+    if (args.selectionWidth > 0 || args.includePartialUnits)
     {
         checkWorkList(args.work, "launchSparseResolve");
         TLLM_CHECK_WITH_INFO(

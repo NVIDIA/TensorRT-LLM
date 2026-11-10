@@ -447,6 +447,38 @@ def test_batch_matches_native_layout() -> None:
 
 
 @pytest.mark.cpu_only
+def test_partial_blocks_reserve_a_prefix_fetch_per_batch_row() -> None:
+    def shape(partial):
+        return sparse_batch_shape(
+            [
+                _layer(
+                    0,
+                    ("key", 16384, True),
+                    ("value", 16384, True),
+                    ("indexer", 16384, False),
+                    sparse_cache=sparse_cache_config(
+                        num_selected_units=32,
+                        unit_tokens=128,
+                        tokens_per_block=128,
+                        gpu_cache_factor=1.0,
+                        include_partial_units=partial,
+                    ),
+                )
+            ],
+            tokens_per_block=128,
+            max_batch_size=4,
+            max_blocks_per_seq=1024,
+        )
+
+    partial, complete = shape(True), shape(False)
+    assert partial.partial_unit_groups == 1
+    # One row, ordinal and destination slot per request for a missing partial block.
+    assert partial.fetch_scratch_bytes - complete.fetch_scratch_bytes == 3 * 4 * 4
+    assert partial.device_bytes - complete.device_bytes == 3 * 4 * 4
+    assert partial.flush_capacities == complete.flush_capacities == (4,)
+
+
+@pytest.mark.cpu_only
 def test_the_token_budget_sizes_the_write_back_list() -> None:
     """A row advancing t tokens crosses at most t/unit_tokens + 1 units."""
     layers = _v4_flash_like_layers()

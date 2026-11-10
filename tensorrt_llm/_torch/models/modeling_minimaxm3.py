@@ -1583,6 +1583,7 @@ class MiniMaxM3Attention(Attention):
             or self.attn.indexer_kv_dtype != "fp8"
             or packed.dtype != torch.bfloat16
             or position_ids is None
+            or getattr(attn_metadata, "sparse_offload_state", None) is not None
         ):
             return None
         kv_cache_manager = attn_metadata.kv_cache_manager
@@ -2318,6 +2319,7 @@ class MiniMaxM3Attention(Attention):
                 and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
                 and (self.main_kv_is_fp8 or self.main_kv_is_nvfp4)
                 and self.attn.indexer_kv_dtype == "fp8"
+                and attn_metadata.sparse_offload_state is None
             ):
                 # Metadata stages these zero-copy views before compilation;
                 # tracing the cache manager's native pointer access is unsafe.

@@ -424,6 +424,35 @@ def _serve_schema() -> dict:
         {"properties": {name: {"const": 0} for name in pair}},
         {"properties": {name: {"minimum": 1} for name in pair}, "required": list(pair)},
     ]
+    # Mirror the M3 offload validator, including defaults when fields are omitted.
+    m3 = schema["$defs"]["MiniMaxM3SparseAttentionConfig"]
+    sizing = schema["$defs"]["SparseKvCacheOffloadConfig"]["properties"]
+    m3["allOf"] = [
+        {
+            "if": {
+                "properties": {"enable_kv_cache_offload": {"const": True}},
+                "required": ["enable_kv_cache_offload"],
+            },
+            "then": {
+                "properties": {
+                    "implementation": {"const": "msa"},
+                    "sparse_disable_index_value": {"const": True},
+                    "sparse_block_size": {"const": 128},
+                    "sparse_topk_blocks": {"minimum": 1},
+                },
+                "required": ["implementation"],
+            },
+            "else": {
+                "properties": {
+                    "kv_cache_offload_config": {
+                        "properties": {
+                            name: {"const": field["default"]} for name, field in sizing.items()
+                        },
+                    },
+                },
+            },
+        }
+    ]
     # Mirror the MoE tactic validators of MoeConfig and of every decoding
     # config as far as a schema can, and that a tactic excludes any backend
     # but AUTO (or unset, where that is allowed).

@@ -294,7 +294,8 @@ Batch::LayoutGenerator Batch::_layoutStepScratchForLifecycle(LifeCycleId lcId)
     // budget can carry across a watermark. The fetch's is the life cycle's, not the
     // selection's: every layer of the selection just resolved reads it, and the next
     // resolve of any selection here overwrites it.
-    scratch.fetchWork.capacity = static_cast<int32_t>(rows) * width;
+    scratch.fetchWork.capacity
+        = static_cast<int32_t>(rows) * (width + static_cast<int>(mManager->sparseCacheIncludesPartialUnits(lcId)));
     scratch.fetchWork.numLists = 1;
     scratch.flushWork.capacity = _flushCapacity(lcId);
     scratch.flushWork.numLists = scratch.numLayers;
@@ -656,6 +657,12 @@ void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
                     "Batch::flushSparseUnits: history length cannot be decreased");
                 fromUnit = kvCache->historyLength() / unitTokens;
                 toUnit = newHistoryLengths[toSizeT(row)] / unitTokens;
+                if (mManager->sparseCacheIncludesPartialUnits(lcId))
+                {
+                    toUnit = newHistoryLengths[toSizeT(row)] == kvCache->historyLength()
+                        ? fromUnit
+                        : toUnit + static_cast<int>(newHistoryLengths[toSizeT(row)] % unitTokens != 0);
+                }
 
                 crossed += toUnit - fromUnit;
                 anyWork = anyWork || toUnit > fromUnit;
@@ -1709,6 +1716,7 @@ void Batch::prepareSparseWriteIndices(
     resolve.historyTokens = reinterpret_cast<int32_t const*>(marks.historyLength);
     resolve.capacityTokens = reinterpret_cast<int32_t const*>(marks.capacity);
     resolve.unitTokens = mManager->config().tokensPerBlock / unitsPerPage;
+    resolve.includePartialUnits = mManager->sparseCacheIncludesPartialUnits(lcId);
     resolve.inFlightSlot = scratch.inFlightSlot;
     resolve.maxInFlightUnits = scratch.maxInFlightUnits;
     resolve.missCount = scratch.missCount;
@@ -1716,7 +1724,32 @@ void Batch::prepareSparseWriteIndices(
     // No selection on this path, so there is nothing to resolve into a slot.
     resolve.selected = nullptr;
     resolve.outSlot = nullptr;
+    if (resolve.includePartialUnits)
+    {
+        resolve.work = _sparseFetchWork(scratch, span.selectionSlot);
+        cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(resolve.work.total), 0U, 1, stream));
+    }
     launchSparseResolve(resolve, stream);
+
+    if (resolve.includePartialUnits)
+    {
+        // A newly seated request can start inside a block whose prefix arrived by
+        // transfer. Restore it before the model appends the next token. Cache hits
+        // contribute no copy, so repeated reservations cannot overwrite live writes.
+        SparseUnitCopyArgs copy;
+        copy.leases = leases;
+        copy.arena = arena;
+        copy.numRows = numRows;
+        copy.copyDesc = scratch.copyDesc;
+        copy.bufferBase = span.bufferBase;
+        copy.numBuffers = span.numBuffers;
+        copy.direction = SparseCopyDirection::kFetch;
+        copy.unitsPerPage = unitsPerPage;
+        copy.work = resolve.work;
+        copy.gridCtas = sparseCopyGridCtas(scratch.fetchWork.capacity, mManager->_smCount());
+        launchSparseUnitCopy(copy, stream);
+        cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(resolve.work.total), 0U, 1, stream));
+    }
 
     // The in-flight list stands in for a selection: the resolve writes kNoSparseSlot past the
     // span, so a row with nothing in flight needs no separate signal.
@@ -1896,6 +1929,7 @@ void Batch::resolveSparseSelection(std::vector<BufferId> const& buffers, int32_t
     resolve.historyTokens = reinterpret_cast<int32_t const*>(marks.historyLength);
     resolve.capacityTokens = reinterpret_cast<int32_t const*>(marks.capacity);
     resolve.unitTokens = mManager->config().tokensPerBlock / unitsPerPage;
+    resolve.includePartialUnits = mManager->sparseCacheIncludesPartialUnits(lcId);
     resolve.outSlot = scratch.outSlot;
     resolve.inFlightSlot = scratch.inFlightSlot;
     resolve.maxInFlightUnits = scratch.maxInFlightUnits;

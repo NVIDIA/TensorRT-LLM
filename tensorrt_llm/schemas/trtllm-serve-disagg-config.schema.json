@@ -6929,6 +6929,53 @@
     },
     "MiniMaxM3SparseAttentionConfig": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "else": {
+            "properties": {
+              "kv_cache_offload_config": {
+                "properties": {
+                  "gpu_cache_factor": {
+                    "const": 2.0
+                  },
+                  "host_history_size": {
+                    "const": null
+                  }
+                }
+              }
+            }
+          },
+          "if": {
+            "properties": {
+              "enable_kv_cache_offload": {
+                "const": true
+              }
+            },
+            "required": [
+              "enable_kv_cache_offload"
+            ]
+          },
+          "then": {
+            "properties": {
+              "implementation": {
+                "const": "msa"
+              },
+              "sparse_block_size": {
+                "const": 128
+              },
+              "sparse_disable_index_value": {
+                "const": true
+              },
+              "sparse_topk_blocks": {
+                "minimum": 1
+              }
+            },
+            "required": [
+              "implementation"
+            ]
+          }
+        }
+      ],
       "description": "Configuration for MiniMax-M3 block-sparse attention.\n\nDrives the two-step sparse attention used by MiniMax-M3 layers 3..N:\n\n  1. An index attention branch projects a per-head Q vector and a single\n     replicated K vector, scores main K/V cache blocks, and selects the\n     top-k blocks per (num_kv_heads, q_token) pair, with init_blocks forced\n     at the head and local_blocks forced at the tail.\n  2. A sparse GQA attention runs only over the selected blocks.\n\nAt runtime one of the MiniMax-M3 sparse attention backends under\ntensorrt_llm._torch.attention.backends.sparse.minimax_m3 is selected. The\nchosen backend runs on top of a MiniMaxM3KVCacheManagerV2 that allocates a\npaged side index-K cache of shape [num_slots, 1, sparse_index_dim] parallel\nto the main K/V cache. The M3 checkpoint sets disable_index_value=True on\nevery sparse layer, so no index V cache is allocated.",
       "properties": {
         "algorithm": {
@@ -6936,6 +6983,13 @@
           "default": "minimax_m3",
           "title": "Algorithm",
           "type": "string"
+        },
+        "enable_kv_cache_offload": {
+          "default": false,
+          "description": "Keep sparse main K/V history in host memory and fetch selected blocks into a bounded GPU cache. Requires MSA, KV cache manager V2, and single-token generation on a disaggregated generation worker. Index keys and dense attention layers remain on the GPU.",
+          "status": "prototype",
+          "title": "Enable Kv Cache Offload",
+          "type": "boolean"
         },
         "fuse_qkv_index_projection": {
           "default": false,
@@ -6965,6 +7019,11 @@
           "status": "prototype",
           "title": "Indexer Kv Dtype",
           "type": "string"
+        },
+        "kv_cache_offload_config": {
+          "$ref": "#/$defs/SparseKvCacheOffloadConfig",
+          "description": "GPU cache and host history sizing when enable_kv_cache_offload is enabled.",
+          "status": "prototype"
         },
         "num_attention_heads": {
           "anyOf": [

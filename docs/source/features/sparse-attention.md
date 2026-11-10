@@ -442,6 +442,38 @@ within the MSA backend. This does not select `implementation: triton`.
 The optional `fuse_qkv_index_projection: true` supports FP8 and NVFP4 main
 caches with an FP8 indexer.
 
+On a disaggregated generation worker, `enable_kv_cache_offload: true` keeps
+sparse main K/V history and its NVFP4 block scales in host memory. Decode
+fetches the union of the blocks selected by the local KV heads into a bounded
+GPU cache; each head still attends to its original selection. Dense attention
+layers and index keys remain resident. The growing 128-token block is restored
+before appending a token and written back after the step, including when a
+transferred prompt ends inside a block.
+
+```yaml
+kv_cache_config:
+  dtype: nvfp4  # fp8 is also supported
+  tokens_per_block: 128
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: false
+sparse_attention_config:
+  algorithm: minimax_m3
+  implementation: msa
+  indexer_kv_dtype: fp8
+  enable_kv_cache_offload: true
+  kv_cache_offload_config:
+    gpu_cache_factor: 2.0
+```
+
+Enable offload only on the generation worker and use matching KV precision
+on the context worker. Offload requires single-token, single-beam generation,
+pipeline parallel size 1, and no speculative decoding. `gpu_cache_factor`
+multiplies the maximum union size (`sparse_topk_blocks` times local KV heads),
+with one additional block reserved for writing. `host_history_size` optionally
+bounds the host history budget in bytes; when unset, sizing follows the shared
+sparse offload memory planner. CUDA graphs reuse the same arena and page-table
+allocations across batch changes.
+
 The sparse path has no dense fallback and does not support KV-cache reuse.
 Eagle3 supports one shared draft layer and linear drafting; other MTP/tree
 configurations are unsupported. NVFP4 KV with piecewise CUDA graphs is not

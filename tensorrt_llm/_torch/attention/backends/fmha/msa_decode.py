@@ -164,6 +164,8 @@ class MsaDecodeFmha(PhasedFmha):
 
         kv_block_indexes = params.fwd.sparse_runtime_params.sparse_attn_indices
         if kv_block_indexes is not None:
+            if metadata.sparse_offload_state is not None:
+                block_table = metadata.fetch_sparse_blocks(params.attn.layer_idx, kv_block_indexes)
             self._run_sparse(params, kv_block_indexes, block_table, seq_lens)
         else:
             self._run_dense(params, block_table, seq_lens)

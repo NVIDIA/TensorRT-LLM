@@ -1826,11 +1826,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("validate", &kv::RemoteCacheTierConfig::validate) DEF_COPY(kv::RemoteCacheTierConfig);
 
     nb::class_<kv::SparseCacheConfig>(m, "SparseCacheConfig")
-        .def(nb::init<int, int, int, std::optional<int>>(), nb::arg("num_selected_blocks"), nb::arg("max_cached_units"),
-            nb::arg("unit_tokens"), nb::arg("selection_id").none() = nb::none())
+        .def(nb::init<int, int, int, std::optional<int>, bool>(), nb::arg("num_selected_blocks"),
+            nb::arg("max_cached_units"), nb::arg("unit_tokens"), nb::arg("selection_id").none() = nb::none(),
+            nb::arg("include_partial_units") = false)
         .def_rw("num_selected_blocks", &kv::SparseCacheConfig::numSelectedBlocks)
         .def_rw("max_cached_units", &kv::SparseCacheConfig::maxCachedUnits)
         .def_rw("unit_tokens", &kv::SparseCacheConfig::unitTokens)
+        .def_rw("include_partial_units", &kv::SparseCacheConfig::includePartialUnits)
         .def_prop_ro(
             "max_unit_ordinal", [](kv::SparseCacheConfig const&) { return kv::SparseCacheConfig::kMaxUnitOrdinal; },
             "Largest zero-based unit ordinal supported by the sparse probe index.")

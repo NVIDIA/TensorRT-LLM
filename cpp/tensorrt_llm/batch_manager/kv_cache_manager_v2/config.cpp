@@ -103,6 +103,8 @@ void RegionConfig::validate() const
 
 void SparseCacheConfig::validate(int tokensPerBlock) const
 {
+    TLLM_CHECK_WITH_INFO(!includePartialUnits || !selectionId.has_value(),
+        "SparseCacheConfig: partial units require an independent selection per layer");
     TLLM_CHECK_WITH_INFO(numSelectedBlocks > 0 && maxCachedUnits > 0,
         "SparseCacheConfig: numSelectedBlocks and maxCachedUnits must be positive; omit sparse_cache "
         "entirely for a layer with no fetch path");
@@ -233,11 +235,11 @@ void _validateSelectionIds(std::vector<LayerConfig> const& layers)
         }
         auto const& first = *it->second;
         if (first.numSelectedBlocks != cache->numSelectedBlocks || first.maxCachedUnits != cache->maxCachedUnits
-            || first.unitTokens != cache->unitTokens)
+            || first.unitTokens != cache->unitTokens || first.includePartialUnits != cache->includePartialUnits)
         {
             throw AssertionError(
                 "KVCacheManagerConfig: layers sharing a selection_id must agree on "
-                "num_selected_blocks, max_cached_units and unit_tokens");
+                "num_selected_blocks, max_cached_units, unit_tokens and include_partial_units");
         }
     }
 

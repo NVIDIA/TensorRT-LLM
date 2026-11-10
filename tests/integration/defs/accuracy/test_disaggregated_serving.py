@@ -751,13 +751,16 @@ def _test_sparse_offload_long_context(
 
     Six complete documents cover the benchmark's domains. A repeated request
     checks determinism (all six repeat when testing block reuse), and two
-    concurrent 256-token continuations cover sustained decode under eviction.
+    concurrent long continuations cover sustained decode under eviction.
     The same prefill worker serves both generation configurations.
 
     Exact comparisons use eager, deterministic TP attention. CUDA graph replay
     and request remapping remain covered by the native offload component tests.
     """
-    output_len = 256
+    is_m3 = gen_server_config["sparse_attention_config"][
+        "algorithm"] == "minimax_m3"
+    output_len = 384 if is_m3 else 256
+    answer_len = 2048 if is_m3 else output_len
     tokens_per_block = 128
     max_batch_size = 2
     tokenizer = (DeepseekV4Tokenizer.from_pretrained(model_path)
@@ -768,7 +771,7 @@ def _test_sparse_offload_long_context(
     evaluator = LongBenchV2Evaluator(dataset_path=LongBenchV2.DATASET_DIR,
                                      length="short",
                                      max_input_length=32768,
-                                     max_output_length=output_len)
+                                     max_output_length=answer_len)
     by_id = {sample["_id"]: sample for sample in evaluator.dataset}
     samples, prompts = [], []
     for sample_id, (digest, answer) in LONGBENCH_CASES.items():
@@ -779,6 +782,11 @@ def _test_sparse_offload_long_context(
         text = evaluator._format_prompt(sample, evaluator.templates["0shot"])
         assert hashlib.sha256(text.encode()).hexdigest() == digest, (
             f"LongBench v2 prompt changed for {sample_id}")
+        template_args = {
+            "thinking_mode": "disabled"
+        } if is_m3 else {
+            "enable_thinking": False
+        }
         prompt = tokenizer.apply_chat_template([{
             "role": "user",
             "content": text
@@ -786,7 +794,7 @@ def _test_sparse_offload_long_context(
                                                tokenize=True,
                                                return_dict=False,
                                                add_generation_prompt=True,
-                                               enable_thinking=False)
+                                               **template_args)
         assert len(prompt) // unit_tokens > index_topk and len(
             prompt
         ) <= 32768, (
@@ -797,16 +805,18 @@ def _test_sparse_offload_long_context(
     # The single-row GVR path needs an aligned score width. Round the allocation,
     # never the input document, to a KV page so CR4 widths also stay aligned.
     max_seq_len = (
-        (max(map(len, prompts)) + output_len + tokens_per_block - 1) //
+        (max(map(len, prompts)) + answer_len + tokens_per_block - 1) //
         tokens_per_block * tokens_per_block)
     sparse_config = {
         **gen_server_config["sparse_attention_config"],
-        "index_topk": index_topk,
-        "enable_heuristic_topk": True,
-        "use_self_sampling_topk": True,
-        "gvr_deterministic_topk": True,
-        "enable_kv_cache_offload": False,
+        "enable_kv_cache_offload":
+        False,
     }
+    if not is_m3:
+        sparse_config.update(index_topk=index_topk,
+                             enable_heuristic_topk=True,
+                             use_self_sampling_topk=True,
+                             gvr_deterministic_topk=True)
     # Attention DP is off by design: the exact comparison uses TP attention.
     for config in (ctx_server_config, gen_server_config):
         config.update(max_batch_size=max_batch_size,
@@ -896,7 +906,8 @@ def _test_sparse_offload_long_context(
                 max_workers=max_batch_size,
                 extra_env=deterministic_env,
                 gen_extra_env=observer_env,
-                assert_worker_log_contains="self-sampling GVR top-K engaged",
+                assert_worker_log_contains=None
+                if is_m3 else "self-sampling GVR top-K engaged",
                 assert_worker_log_excludes=(
                     "falling back to the CUDA",
                     "using the CUDA radix")) as llm, openai.OpenAI(
@@ -906,9 +917,10 @@ def _test_sparse_offload_long_context(
                         max_retries=0) as client:
 
             def request(index: int, stress: bool) -> dict:
+                limit = output_len if stress else answer_len
                 response = client.completions.create(model=model_path,
                                                      prompt=prompts[index],
-                                                     max_tokens=output_len,
+                                                     max_tokens=limit,
                                                      temperature=0,
                                                      seed=0,
                                                      extra_body={
@@ -920,7 +932,7 @@ def _test_sparse_offload_long_context(
                 token_ids = choice.model_dump()["token_ids"]
                 assert response.usage.prompt_tokens == len(prompts[index])
                 assert response.usage.completion_tokens == len(token_ids)
-                assert 0 < len(token_ids) <= output_len
+                assert 0 < len(token_ids) <= limit
                 assert choice.finish_reason in ("length", "stop")
                 if stress:
                     assert len(
@@ -3283,6 +3295,56 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
 @skip_pre_blackwell
 class TestMiniMaxM3(LlmapiAccuracyTestHarness):
+
+    @pytest.mark.timeout(3600)
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("kv_dtype", ["fp8", "nvfp4"])
+    def test_kv_cache_offload(self, kv_dtype: str) -> None:
+        """LongBench answers and every output token match resident M3 decode."""
+        common = {
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "modeling_v2": "off",
+            "trust_remote_code": True,
+            "disable_overlap_scheduler": True,
+            "moe_config": {
+                "backend": "CUTLASS"
+            },
+            "kv_cache_config": {
+                "dtype": kv_dtype,
+                "free_gpu_memory_fraction": 0.6
+            },
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "kv_transfer_timeout_ms": 600000,
+            },
+            "sparse_attention_config": {
+                "algorithm": "minimax_m3",
+                "implementation": "msa",
+                "indexer_kv_dtype": "fp8",
+            },
+        }
+        disagg = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        _test_sparse_offload_long_context(
+            disagg,
+            copy.deepcopy(common),
+            copy.deepcopy(common),
+            f"{llm_models_root()}/MiniMax-M3-NVFP4",
+            model_name="nvidia/MiniMax-M3-NVFP4",
+            index_topk=16 * 2,
+            unit_tokens=128,
+        )
 
     @pytest.mark.skip_less_device(6)
     @pytest.mark.skip_less_device_memory(140000)

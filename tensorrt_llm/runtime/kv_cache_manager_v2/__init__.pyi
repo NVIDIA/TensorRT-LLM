@@ -451,6 +451,13 @@ class SparseCacheConfig:
     ``max_cached_units`` and ``unit_tokens``.
     """
 
+    include_partial_units: bool = False
+    """Restore a growing block's host prefix on reservation and flush it after every token.
+
+    False for compressed units that are produced only when complete. Partial units
+    require an independent selection per layer (``selection_id=None``).
+    """
+
 class ReusePolicy(enum.IntEnum):
     REQUIRED = 0
     PRIVATE = 1
@@ -1438,10 +1445,10 @@ class Batch:
         """Give each request's in-flight unit a cell, and report where to write it.
 
         The unit between the two watermarks is the one the model is about to produce. It
-        has no host copy yet -- a unit reaches its page only when :meth:`_KVCache.resize`
-        carries the watermark past it -- so nothing is fetched here. The call assigns a
-        cell and leaves its bytes to the model; reading one before the model writes it
-        yields whatever the cell last held.
+        has no complete host copy yet. By default the call assigns a cell and leaves
+        its bytes to the model. With ``SparseCacheConfig.include_partial_units=True``,
+        a newly reserved partial block restores its host prefix before returning the
+        write index. A block already resident keeps its live writes.
 
         Separate from :meth:`fetch_sparse_pages` because the orders differ. A fetch needs
         the selection, which the indexer produces from the previous layer's output; a write
@@ -1452,8 +1459,7 @@ class Batch:
         residency before taking a victim, so a later call -- including the one inside
         :meth:`fetch_sparse_pages` -- finds the entry and reuses it rather than assigning a
         second. The entry is pinned for as long as its unit is in flight, so no fetch can
-        evict it, and a fetch never copies over it: a unit at or above the watermark has no
-        written-back host page, so there is nothing it could be refilled from.
+        evict it. Subsequent fetches see it as a hit and never copy over the model's writes.
 
         The Batch's published rows own the arena leases; each seated cache uses its row's
         lease until it leaves the Batch.
@@ -1471,9 +1477,10 @@ class Batch:
                 is ever in flight.
 
                 ``BAD_PAGE_INDEX`` is an ordinary outcome, not an error. A unit is in flight
-                only once it is whole: with ``SparseCacheConfig.unit_tokens`` of 4, that is one
+                only once it is whole by default: with ``SparseCacheConfig.unit_tokens`` of 4, that is one
                 step in four, which is also the only step on which a ratio-4 compressor has
-                produced anything to write. With one token per unit it is every step.
+                produced anything to write. With one token per unit or with
+                ``include_partial_units=True`` it is every step.
             stream: the CUDA stream to enqueue on.
 
         Indices are in the same expanded index space :meth:`fetch_sparse_pages` produces

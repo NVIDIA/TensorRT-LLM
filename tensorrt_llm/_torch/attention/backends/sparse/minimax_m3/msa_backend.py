@@ -47,6 +47,11 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..offload import (
+    SparseOffloadState,
+    allocate_sparse_offload_state,
+    get_sparse_offload_metadata_layers,
+)
 from .common import (
     MiniMaxM3SparseConfig,
     MiniMaxM3SparseMetadataParams,
@@ -182,6 +187,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # Graph-stable buffers; consumers slice to the live count at the call
     # site. Filled once the current step's cache write is prepared.
     msa_out_cache_loc: Optional[torch.Tensor] = None
+    sparse_offload_state: Optional[SparseOffloadState] = None
     # Zero-copy pool views prepared outside Dynamo; PCG passes these explicitly
     # to its mutable producer instead of hiding writes behind runtime metadata.
     msa_layer_cache_tensors: Optional[
@@ -273,6 +279,65 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._msa_params = params if isinstance(params, MiniMaxM3SparseMetadataParams) else None
         self._create_msa_buffers()
         self._validate_decode_kernel_support()
+        self._init_sparse_offload_state()
+
+    def _init_sparse_offload_state(self) -> None:
+        manager = self.kv_cache_manager
+        self.sparse_offload_state = None
+        if not getattr(manager, "_enable_kv_cache_offload", False):
+            return
+        width = manager._sparse_offload_topk
+        layers = get_sparse_offload_metadata_layers(self, topk=width)
+        batch = manager.max_batch_size
+
+        def allocate(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+            return self.get_empty(
+                self.cuda_graph_buffers,
+                shape,
+                dtype=dtype,
+                cache_name=f"msa_sparse_offload_{name}",
+                capture_graph=self.is_cuda_graph,
+            )
+
+        self.sparse_offload_state = allocate_sparse_offload_state(
+            allocate,
+            layers,
+            max_batch_size=batch,
+            topk=width,
+        )
+        self.msa_sparse_write_slots = allocate("write_slots", (batch,), torch.int32)
+        self.msa_sparse_selected = allocate("selected", (batch, width), torch.int32)
+        self.msa_sparse_unit_lengths = allocate("unit_lengths", (batch,), torch.int32)
+        self.msa_sparse_request_indices = allocate("request_indices", (batch,), torch.int32)
+        self.msa_sparse_request_indices.copy_(
+            torch.arange(batch, dtype=torch.int32, device=self.msa_sparse_request_indices.device)
+        )
+        self.msa_sparse_block_table = allocate(
+            "block_table",
+            (batch, manager.max_blocks_per_seq),
+            torch.int32,
+        )
+        self.msa_sparse_block_table.fill_(-1)
+
+    def fetch_sparse_blocks(self, layer_idx: int, topk: torch.Tensor) -> torch.Tensor:
+        """Fetch the union of per-head blocks and return their arena page table."""
+        from .kernels.offload import build_block_table, prepare_selection
+
+        state = self.sparse_offload_state
+        if state is None or state.write_layer != layer_idx:
+            raise RuntimeError("MiniMax-M3 sparse fetch requires this layer's completed KV write")
+        prepare_selection(
+            topk, self.msa_seq_lens_cuda, self.msa_sparse_selected, self.msa_sparse_unit_lengths
+        )
+        self.kv_cache_manager.fetch_sparse_indices(
+            state,
+            layer_idx,
+            self.msa_sparse_selected,
+            self.msa_sparse_request_indices,
+            self.msa_sparse_unit_lengths,
+        )
+        build_block_table(state, layer_idx, self.msa_sparse_selected, self.msa_sparse_block_table)
+        return self.msa_sparse_block_table[: topk.shape[0]]
 
     @property
     def msa_qo_lens_cpu(self) -> Optional[torch.Tensor]:
@@ -749,6 +814,13 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._msa_short_ok = True
 
     def prepare(self) -> None:
+        if self.sparse_offload_state is not None:
+            self.sparse_offload_state.prepared = False
+            if self.num_contexts or not torch.all(self.seq_lens == 1):
+                raise NotImplementedError(
+                    "MiniMax-M3 sparse offload requires generation-only, single-token batches"
+                )
+            self.kv_cache_manager.prepare_sparse_batch(self.request_ids)
         super().prepare()
         self._check_beam_width()
         # Everything below reads these.
@@ -759,6 +831,12 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._build_msa_fields()
         self._check_capture_is_pure_decode()
         self._build_step_plans()
+        if self.sparse_offload_state is not None:
+            self.kv_cache_manager.prepare_sparse_offload(
+                self.sparse_offload_state,
+                self.request_ids,
+                beam_width=self.beam_width,
+            )
 
     def _check_beam_width(self) -> None:
         """Fail on beam search, which every MSA site assumes away.
@@ -1561,6 +1639,18 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
 
         layer_idx = self.layer_idx
         manager = metadata.kv_cache_manager
+        out_cache_loc = metadata.msa_out_cache_loc[: k.shape[0]]
+        if metadata.sparse_offload_state is not None and manager.offloads_layer(layer_idx):
+            from .kernels.offload import prepare_write_slots
+
+            manager.prepare_sparse_write_indices(metadata.sparse_offload_state, layer_idx)
+            prepare_write_slots(
+                metadata.sparse_offload_state, layer_idx, metadata.msa_sparse_write_slots
+            )
+            out_cache_loc = metadata.msa_sparse_write_slots[: k.shape[0]]
+            if idx_k is not None:
+                metadata.msa_write_idx_k(layer_idx, idx_k)
+                idx_k = None
         if getattr(manager, "is_nvfp4_layer", lambda _: False)(layer_idx):
             if kv_scale_orig_quant is None:
                 raise RuntimeError("NVFP4 cache writes require quantization scales")
@@ -1573,7 +1663,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
                 scales[:, 0],
                 scales[:, 1],
                 idx_cache,
-                metadata.msa_out_cache_loc[: k.shape[0]],
+                out_cache_loc,
                 k,
                 v,
                 idx_k,
@@ -1587,7 +1677,6 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         k_view, v_view = buffers[:, 0], buffers[:, 1]
         idx_cache = metadata.msa_idx_k_cache(layer_idx) if idx_k is not None else None
         num_tokens = int(k.shape[0])
-        out_cache_loc = metadata.msa_out_cache_loc[:num_tokens]
         if fused_write_layer_caches(k_view, v_view, idx_cache, out_cache_loc, k, v, idx_k):
             return
         num_kv_heads = int(k_view.shape[1])

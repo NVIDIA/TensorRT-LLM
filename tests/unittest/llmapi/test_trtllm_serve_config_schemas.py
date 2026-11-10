@@ -1397,6 +1397,72 @@ def test_sparse_offload_indexer_default(
         )
 
 
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    "values,valid",
+    [
+        ({}, True),
+        ({"enable_kv_cache_offload": False}, True),
+        ({"enable_kv_cache_offload": True}, False),
+        ({"implementation": "msa", "enable_kv_cache_offload": True}, True),
+        (
+            {
+                "implementation": "msa",
+                "enable_kv_cache_offload": True,
+                "kv_cache_offload_config": {"gpu_cache_factor": 1.0, "host_history_size": 1 << 30},
+            },
+            True,
+        ),
+        (
+            {
+                "implementation": "msa",
+                "enable_kv_cache_offload": True,
+                "sparse_disable_index_value": False,
+            },
+            False,
+        ),
+        (
+            {"implementation": "msa", "enable_kv_cache_offload": True, "sparse_topk_blocks": 0},
+            False,
+        ),
+        (
+            {"implementation": "msa", "enable_kv_cache_offload": True, "sparse_block_size": 64},
+            False,
+        ),
+        (
+            {
+                "implementation": "msa",
+                "enable_kv_cache_offload": True,
+                "kv_cache_offload_config": {"gpu_cache_factor": 0.5},
+            },
+            False,
+        ),
+        (
+            {"implementation": "msa", "kv_cache_offload_config": {"host_history_size": 1 << 30}},
+            False,
+        ),
+        ({"enable_kv_cache_offload": None}, False),
+        ({"enable_kv_cache_offload": "invalid"}, False),
+    ],
+)
+def test_minimax_m3_offload_schema_matches_validation(schemas, filename, values, valid):
+    from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
+
+    sparse = {"algorithm": "minimax_m3", **values}
+    assert (
+        Draft202012Validator(schemas[filename]).is_valid({"sparse_attention_config": sparse})
+        == valid
+    )
+    if valid:
+        config = MiniMaxM3SparseAttentionConfig.model_validate(sparse)
+        assert (config.get_kv_cache_offload_config() is not None) == bool(
+            values.get("enable_kv_cache_offload")
+        )
+    else:
+        with pytest.raises(ValueError):
+            MiniMaxM3SparseAttentionConfig.model_validate(sparse)
+
+
 def test_model_field_guard_detects_missing_fields_and_aliases() -> None:
     class Config(BaseModel):
         plain: int

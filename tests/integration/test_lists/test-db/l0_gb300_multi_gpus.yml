@@ -15,6 +15,8 @@ l0_gb300_multi_gpus:
       stage: post_merge
       backend: pytorch
   tests:
+  - accuracy/test_disaggregated_serving.py::TestMiniMaxM3::test_kv_cache_offload[kv_dtype=fp8] TIMEOUT (60)
+  - accuracy/test_disaggregated_serving.py::TestMiniMaxM3::test_kv_cache_offload[kv_dtype=nvfp4] TIMEOUT (60)
   # MiniMax-M3 target unit tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/comm
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/comm

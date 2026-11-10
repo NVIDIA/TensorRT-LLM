@@ -348,6 +348,11 @@ struct SparseCacheConfig
     //! nothing. Layers that do share must agree on the rest of this config.
     std::optional<int> selectionId;
 
+    //! Cache a growing block before its last token is written. On first reservation,
+    //! restore its existing prefix from host memory; flush it after every token. False
+    //! for compressed representations whose unit is produced only when complete.
+    bool includePartialUnits = false;
+
     //! The id this layer's selection goes by, which is its own when it named none.
     [[nodiscard]] int effectiveSelectionId(LayerId layerId) const noexcept
     {

@@ -117,6 +117,18 @@ TEST(KvCacheManagerV2ConfigTest, SparseCacheCapacityValidationRejectsNonPositive
     EXPECT_THROW(cache.validate(-1), std::runtime_error);
 }
 
+TEST(KvCacheManagerV2ConfigTest, PartialSparseUnitsRequireIndependentSelections)
+{
+    SparseCacheConfig cache{.numSelectedBlocks = 16, .maxCachedUnits = 17, .unitTokens = 128};
+    EXPECT_FALSE(cache.includePartialUnits);
+    cache.includePartialUnits = true;
+    EXPECT_NO_THROW(cache.validate(128));
+    cache.selectionId = 1;
+    EXPECT_THROW(cache.validate(128), std::runtime_error);
+    cache.includePartialUnits = false;
+    EXPECT_NO_THROW(cache.validate(128));
+}
+
 TEST(KvCacheManagerV2ConfigTest, OneLayerMayMixSparseAndDenseBuffers)
 {
     // Sparsity picks a buffer's pool and nothing above it, so an indexer and the data it

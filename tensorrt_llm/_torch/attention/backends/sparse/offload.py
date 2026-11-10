@@ -259,7 +259,9 @@ def allocate_sparse_offload_state(
     )
 
 
-def get_sparse_offload_metadata_layers(metadata) -> dict[int, SparseOffloadLayerDescriptor]:
+def get_sparse_offload_metadata_layers(
+    metadata, *, topk: int | None = None
+) -> dict[int, SparseOffloadLayerDescriptor]:
     """Validate an attention metadata's fixed offload configuration and return its layers.
 
     Offload runs single-beam and non-speculative, so per-batch beam and draft
@@ -273,7 +275,8 @@ def get_sparse_offload_metadata_layers(metadata) -> dict[int, SparseOffloadLayer
     if (
         metadata.beam_width != 1
         or manager.max_beam_width != 1
-        or metadata.max_draft_tokens
+        or getattr(metadata, "max_draft_tokens", 0)
+        or metadata.max_total_draft_tokens
         or manager.max_draft_len
         or manager.max_total_draft_tokens
         or metadata.draft_kv_cache_manager is not None
@@ -281,9 +284,9 @@ def get_sparse_offload_metadata_layers(metadata) -> dict[int, SparseOffloadLayer
         raise NotImplementedError("Sparse offload requires single-beam, non-speculative execution")
     manager._validate_sparse_history_policy()
     layers = manager.get_sparse_offload_descriptors()
-    if layers and (
-        metadata.sparse_mla_topk <= 0 or metadata.sparse_mla_topk != manager._sparse_offload_topk
-    ):
+    if topk is None:
+        topk = metadata.sparse_mla_topk
+    if layers and (topk <= 0 or topk != manager._sparse_offload_topk):
         raise ValueError("Sparse offload metadata must match the configured positive top-k")
     return layers
 
@@ -1018,7 +1021,8 @@ class SparseOffloadCacheMixin:
         before this call. Reservation must finish before either the writer or
         the history fetch; they may run concurrently because fetch excludes the
         protected in-flight row. Both must finish before attention or a history
-        update. No KV is fetched here.
+        update. Layers with ``include_partial_units`` restore a growing block's
+        host prefix here when the block is not already resident.
 
         Data and scale buffers use the same column when their arena indices coincide;
         the output-slot mapping follows the arena geometry and requires no device read.

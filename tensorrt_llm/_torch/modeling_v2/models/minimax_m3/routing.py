@@ -152,6 +152,11 @@ def route(
     Each target is imported where it is returned, so declining costs no import
     of modeling code.
     """
+    sparse = llm_args.sparse_attention_config or getattr(
+        model_config, "sparse_attention_config", None
+    )
+    if sparse is not None and sparse.get_kv_cache_offload_config() is not None:
+        raise NoTarget("MiniMax-M3 sparse KV offload requires the built-in MSA implementation")
     pretrained_config = model_config.pretrained_config
     mapping = model_config.mapping
     spec_config = model_config.spec_config

@@ -1111,6 +1111,18 @@ def _m3_llm_args(mode, kv_dtype):
     return _llm_args(mode, kv_cache_config=dict(dtype=kv_dtype))
 
 
+@pytest.mark.parametrize("tp", [4, 8])
+@pytest.mark.parametrize("kv_dtype", ["fp8", "nvfp4"])
+def test_minimax_m3_sparse_offload_uses_builtin_model(monkeypatch, tp, kv_dtype):
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import routing
+
+    monkeypatch.setattr(routing, "_quant_algo", lambda cfg: QuantAlgo.MIXED_PRECISION)
+    config = _m3_resolve_config(_m3_sparse(enable_kv_cache_offload=True), None, tp)
+    assert modeling_v2_resolve(config, _m3_llm_args("auto", kv_dtype)) is None
+    with pytest.raises(ValueError, match="sparse KV offload requires the built-in MSA"):
+        modeling_v2_resolve(config, _m3_llm_args("require", kv_dtype))
+
+
 @pytest.fixture
 def _minimax_m3_sm(_on_sm10x):
     """The MiniMax-M3 targets route on sm_103 only; on sm_100 they route nowhere."""

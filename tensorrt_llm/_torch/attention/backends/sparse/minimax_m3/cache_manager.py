@@ -63,6 +63,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 )
 
 from .common import get_sparse_layer_ids
+from .offload import MiniMaxM3SparseOffloadMixin
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -306,7 +307,7 @@ def _require_trtllm_gen_extra_page_route(tokens_per_block: int) -> None:
         )
 
 
-class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
+class MiniMaxM3KVCacheManagerV2(MiniMaxM3SparseOffloadMixin, KVCacheManagerV2):
     """KVCacheManagerV2 subclass with a V2-managed paged index-K cache
     per sparse layer.
 
@@ -377,6 +378,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # sparse_index_dim authoritative for the cache layout.
         # Peeked (not popped) so the base __init__ still receives them.
         sparse_attention_config = kwargs.get("sparse_attention_config")
+        self._init_m3_sparse_offload(sparse_attention_config)
+        if self._enable_kv_cache_offload:
+            kwargs["sparse_kv_offload_config"] = (
+                sparse_attention_config.get_kv_cache_offload_config()
+            )
         num_layers = kwargs.get("num_layers")
         implementation = getattr(sparse_attention_config, "implementation", "triton")
         self._main_kv_view_layout = "HND" if implementation == "msa" else "NHD"
@@ -589,27 +595,35 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             )
 
     def _build_cache_config(self, config):
-        """Use NVFP4 only on MSA sparse layers and FP8 on dense/Eagle layers.
+        """Separate sparse main K/V pools and keep dense/Eagle layers in FP8 for NVFP4.
 
         M3's 57 sparse target layers have a native MSA NVFP4 consumer.  The
         three dense target layers and the appended one-model Eagle layer do
         not have a matching TRTLLM-Gen NVFP4 cubin, so those buffers retain
         the proven FP8 representation.
-        """
-        if self.dtype != DataType.NVFP4:
-            return super()._build_cache_config(config)
 
+        Resident and offloaded workers must expose the same per-role layer
+        sets to disaggregated transfer. Sparse main K/V use their own
+        coalescing group even when their sizes match dense K/V or index keys.
+        """
         scale_roles = {Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE}
+        main_roles = {Role.KEY, Role.VALUE, *scale_roles}
         for layer in config.layers:
-            if int(self.pp_layers[int(layer.layer_id)]) in self.sparse_layer_ids:
-                continue
-            layer.buffers[:] = [
-                buffer for buffer in layer.buffers if buffer.role not in scale_roles
-            ]
+            sparse = int(self.pp_layers[int(layer.layer_id)]) in self.sparse_layer_ids
+            if self.dtype == DataType.NVFP4 and not sparse:
+                layer.buffers[:] = [
+                    buffer for buffer in layer.buffers if buffer.role not in scale_roles
+                ]
+            for buffer in layer.buffers:
+                buffer.coalescing_group = 2 * buffer.coalescing_group + int(
+                    sparse and buffer.role in main_roles
+                )
         return super()._build_cache_config(config)
 
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role) -> int:
         """Report the hybrid sparse-NVFP4 / dense-FP8 storage footprint."""
+        if data_role == Role.ALL and self.offloads_layer(self.pp_layers[local_layer_idx]):
+            return self._index_k_bytes_per_token()
         global_layer_idx = int(self.pp_layers[int(local_layer_idx)])
         has_index_k = global_layer_idx in self.sparse_layer_ids
         if data_role == Role.INDEX_KEY:
@@ -1186,6 +1200,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             kv_layout = self._main_kv_view_layout
         if kv_layout not in ("HND", "NHD"):
             raise ValueError(f"Unsupported kv_layout: {kv_layout}")
+        if self.offloads_layer(layer_idx):
+            view = self._m3_sparse_arena_view(layer_idx)
+            return view.transpose(2, 3) if kv_layout == "NHD" else view
         view = self._kv_buffers.get((layer_idx, kv_layout))
         if view is not None:
             return view
@@ -1323,6 +1340,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self, layer_idx: int, kv_layout: Optional[str] = None
     ) -> torch.Tensor:
         """Return paged NVFP4 K+V E4M3 scale-byte views for ``layer_idx``."""
+        if self.offloads_layer(layer_idx):
+            view = self._m3_sparse_arena_view(layer_idx, scales=True)
+            return view.transpose(2, 3) if kv_layout == "NHD" else view
         view = self._block_scale_buffers.get((layer_idx, kv_layout or self._main_kv_layout_name()))
         if view is not None:
             return view

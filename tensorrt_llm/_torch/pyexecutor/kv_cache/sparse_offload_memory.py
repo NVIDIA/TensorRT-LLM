@@ -239,15 +239,16 @@ def sparse_arena_shapes(
                 layer.sparse_cache.num_selected_blocks,
                 layer.sparse_cache.max_cached_units,
                 sparse_units_per_page(layer.sparse_cache.unit_tokens, tokens_per_block),
+                layer.sparse_cache.include_partial_units,
             )
             for layer in grouped_layers
         }
         if len(geometries) > 1:
             raise ValueError(
                 "Layers sharing a life cycle must declare the same sparse_cache; they share "
-                f"one arena. Got (selected, cached, units per page) {sorted(geometries)}."
+                f"one arena. Got (selected, cached, units per page, partial units) {sorted(geometries)}."
             )
-        ((_, max_cached_units, units_per_page),) = geometries
+        ((_, max_cached_units, units_per_page, _),) = geometries
         # An unset selection_id reads as the layer's own, so a layer that names
         # nothing keeps a row to itself and only an explicit id merges two.
         selections = {
@@ -415,6 +416,8 @@ class SparseBatchShape:
         index_table_entries: Entries of the converted index tables, summed over the
             tables; each entry is a page table's worth of indices. Required for the same
             reason as ``layer_counts``.
+        partial_unit_groups: Life cycles that restore a partially filled unit on
+            reservation, requiring one extra fetch work entry per row.
     """
 
     num_life_cycles: int
@@ -424,6 +427,7 @@ class SparseBatchShape:
     layer_counts: tuple[int, ...]
     flush_capacities: tuple[int, ...]
     index_table_entries: int
+    partial_unit_groups: int = 0
 
     @property
     def block_bytes(self) -> int:
@@ -484,7 +488,7 @@ class SparseBatchShape:
             total += 3 * rows * width + 1
             total += num_layers * (3 * flush_capacity + 1)
             total += rows * num_layers
-        return _INDEX_BYTES * total
+        return _INDEX_BYTES * (total + 3 * rows * self.partial_unit_groups)
 
 
 def sparse_batch_shape(
@@ -538,6 +542,9 @@ def sparse_batch_shape(
         index_table_entries=sum(
             index_table_entries(grouped_layers) for grouped_layers in fetch_groups
         ),
+        partial_unit_groups=sum(
+            group[0].sparse_cache.include_partial_units for group in fetch_groups
+        ),
     )
 
 
@@ -579,6 +586,7 @@ def sparse_cache_config(
     tokens_per_block: int,
     gpu_cache_factor: float,
     selection_id: int | None = None,
+    include_partial_units: bool = False,
 ) -> SparseCacheConfig:
     """Return a layer's sparse fetch path whose cache holds ``gpu_cache_factor`` selections.
 
@@ -600,6 +608,8 @@ def sparse_cache_config(
             layers an indexer selects for, and those layers must agree on every
             other argument here. None, the default, means the layer selects for
             itself; a layer that names nothing never shares.
+        include_partial_units: Restore a growing block's prefix on reservation and
+            write it back after each token, rather than waiting for a complete unit.
     """
     if unit_tokens is not None and (unit_tokens <= 0 or tokens_per_block % unit_tokens):
         raise ValueError(
@@ -614,6 +624,7 @@ def sparse_cache_config(
         # page is one of them. None is this helper's convenience, not the config's.
         unit_tokens=tokens_per_block // units_per_page,
         selection_id=selection_id,
+        include_partial_units=include_partial_units,
     )
 
 
