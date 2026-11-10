@@ -8,7 +8,7 @@ import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import PIL.Image
@@ -18,21 +18,28 @@ from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux
 from flux3_test_utils import (
     LATENT_CHANNELS,
     TEXT_DIM,
-    FakeTextEncoder,
     diffusers_weights,
+    load_gpu_pipeline,
+    lora_adapter,
     model_config,
-    pipeline_manifest,
+    patch_text_encoder_load,
     tiny_config,
     tiny_vae,
+    use_fake_text_encoder,
     write_checkpoint,
     write_gpu_checkpoint,
+    write_lora,
 )
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from tensorrt_llm._torch.attention.backends.fmha.prims_ts_block_sparse import PrimsTSBlockSparseFmha
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 
 # Importing the models package registers every pipeline.
 from tensorrt_llm._torch.visual_gen import models  # noqa: F401
+from tensorrt_llm._torch.visual_gen.attention.backends import trtllm as visual_trtllm
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.backend import SOLTrtllmAttention
+from tensorrt_llm._torch.visual_gen.cache import cache_dit_enablers
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm._torch.visual_gen.models.flux3 import pipeline_flux3
@@ -43,9 +50,6 @@ from tensorrt_llm._torch.visual_gen.models.flux3.pipeline_flux3 import (
     Flux3DistilledPipeline,
     Flux3Pipeline,
     Flux3References,
-    Flux3RequestError,
-    UnsupportedNumImagesError,
-    _manifest_subfolder,
     flux3_scheduler,
     load_reference_images,
     preprocess_references,
@@ -54,20 +58,26 @@ from tensorrt_llm._torch.visual_gen.models.flux3.pipeline_flux3 import (
 from tensorrt_llm._torch.visual_gen.models.flux3.text_encoder import (
     HIDDEN_STATE_LAYERS,
     TEXT_MAX_TOKENS,
-    Flux3TextEncoder,
     padded_text_length,
     trim_for_text,
 )
-from tensorrt_llm._torch.visual_gen.models.flux3.transformer_flux3 import Flux3Transformer2DModel
+from tensorrt_llm._torch.visual_gen.models.flux3.transformer_flux3 import (
+    Flux3Attention,
+    Flux3Transformer2DModel,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
-from tensorrt_llm.visual_gen import VisualGen
+from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline, PipelineComponent
 from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
+    CacheDiTConfig,
     CompilationConfig,
-    CpuOffloadConfig,
     CudaGraphConfig,
+    QuantAttentionConfig,
+    RuntimeLoRAConfig,
+    SkipSoftmaxAttentionConfig,
+    SolAttentionConfig,
     TorchCompileConfig,
+    VideoSparseAttentionConfig,
     VisualGenArgs,
 )
 from tensorrt_llm.visual_gen.params import MediaRef, VisualGenParams, validate_visual_gen_params
@@ -76,16 +86,14 @@ PIPELINES = [
     pytest.param(Flux3Pipeline, id="base"),
     pytest.param(Flux3DistilledPipeline, id="klein"),
 ]
-DOWNLOAD_PATTERNS = [
-    "modular_model_index.json",
-    "transformer/*",
-    "vae/*",
-    "text_encoder/*",
-    "LICENSE.md",
-    "NOTICE.md",
-    "README.md",
-]
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
+requires_sm100 = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="SOL attention and VC-Attention need SM100 or SM103",
+)
+# The documented FLUX.3 SOL and VC-Attention recipes.
+SOL_SETTINGS = dict(tau=1.0, disabled_until_timestep=0.96)
+VC_SETTINGS = dict(qk_dtype="fp8", v_dtype="fp8", vc_attention=True, vc_repair_budget=0.005)
 
 
 # =============================================================================
@@ -128,9 +136,10 @@ class FakeTransformer(torch.nn.Module):
         self.flow_map = flow_map
         self.content_channels = {"image": LATENT_CHANNELS, "image_cond": LATENT_CHANNELS}
         self.packed_channels = {**self.content_channels, "text": TEXT_DIM}
-        self.calls = []
+        self.calls, self.static_timesteps = [], []
 
-    def prepare_static_inputs(self, *, layout, **inputs):
+    def prepare_static_inputs(self, *, layout, timestep=None, **inputs):
+        self.static_timesteps.append(timestep)
         prepared = {"_flux3_joint_cos": torch.zeros(1), "_flux3_joint_sin": torch.zeros(1)}
         for name, lengths in layout:
             if any(lengths):
@@ -168,7 +177,7 @@ def cpu_pipeline(cls=Flux3Pipeline, config=None) -> Flux3Pipeline:
     """A CPU pipeline with a recording fake transformer and text encoder and a tiny real VAE."""
     pipeline = bare_pipeline(cls, config)
     pipeline.transformer = FakeTransformer(cls.flow_map)
-    pipeline.text_encoder = FakeTextEncoder()
+    use_fake_text_encoder(pipeline)
     pipeline.vae = tiny_vae()
     pipeline.scheduler = flux3_scheduler()
     return pipeline
@@ -212,44 +221,6 @@ def make_request(*references: bytes, height=None, width=None, num_images_per_pro
 def test_registry_routes_flux_generations(tmp_path, manifest, class_name, expected):
     (tmp_path / manifest).write_text(json.dumps({"_class_name": class_name}))
     assert AutoPipeline._detect_from_checkpoint(str(tmp_path)) == expected
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "hf_id, class_name, pipeline_cls",
-    [
-        ("black-forest-labs/flux-3-image-klein-base", "Flux3ModularPipeline", Flux3Pipeline),
-        (
-            "black-forest-labs/flux-3-image-klein",
-            "Flux3DistilledModularPipeline",
-            Flux3DistilledPipeline,
-        ),
-    ],
-)
-def test_hub_download_fetches_only_diffusers_components(
-    monkeypatch, tmp_path, hf_id, class_name, pipeline_cls
-):
-    entry = PIPELINE_REGISTRY[class_name]
-    assert entry.pipeline_cls is pipeline_cls
-    assert entry.hf_ids == [hf_id]
-    assert hf_id in VisualGen.supported_models()
-    assert VisualGen.pipeline_config(hf_id) == {"variant": None}
-
-    captured = {}
-
-    def download_partial(model, allow_patterns, revision=None):
-        captured.update(model=model, allow_patterns=allow_patterns, revision=revision)
-        return tmp_path
-
-    def download_full(*args, **kwargs):
-        raise AssertionError("FLUX.3 must not download the root BFL weights or variants")
-
-    loader_module = "tensorrt_llm._torch.visual_gen.pipeline_loader"
-    monkeypatch.setattr(f"{loader_module}.download_hf_partial", download_partial, raising=False)
-    monkeypatch.setattr(f"{loader_module}.download_hf_model", download_full)
-    loader = PipelineLoader(VisualGenArgs(model=hf_id), device="cpu")
-    assert loader._resolve_checkpoint_dir(hf_id) == str(tmp_path)
-    assert captured == {"model": hf_id, "allow_patterns": DOWNLOAD_PATTERNS, "revision": None}
 
 
 @pytest.mark.cpu_only
@@ -320,7 +291,7 @@ class FakeCompiled(torch.nn.Module):
 
 
 @pytest.mark.cpu_only
-def test_compile_covers_every_block_list_and_keeps_bf16_rounding(monkeypatch):
+def test_compile_covers_every_block_list(monkeypatch):
     monkeypatch.setattr(torch, "compile", lambda module, **kwargs: FakeCompiled(module, kwargs))
     config = tiny_config(flow_map=True)
     pipeline = bare_pipeline(Flux3DistilledPipeline)
@@ -328,22 +299,22 @@ def test_compile_covers_every_block_list_and_keeps_bf16_rounding(monkeypatch):
     pipeline.transformer = Flux3Transformer2DModel(
         model_config(config, skip_create_weights_in_init=True)
     )
-    paths = [
-        "mode_blocks.image",
-        "mode_blocks.image_cond",
+    names = [
+        "image_mode_blocks",
+        "image_cond_mode_blocks",
         "txt_mode_blocks",
         "single_transformer_blocks",
     ]
-    originals = {path: list(pipeline.transformer.get_submodule(path)) for path in paths}
+    originals = {name: list(getattr(pipeline.transformer, name)) for name in names}
 
     pipeline.torch_compile()
 
-    assert pipeline._find_transformer_blocks(pipeline.transformer) == paths
-    expected = {"dynamic": None, "fullgraph": False, "options": {"emulate_precision_casts": True}}
-    for path, blocks in originals.items():
-        compiled = list(pipeline.transformer.get_submodule(path))
-        assert [block.module for block in compiled] == blocks, path
-        assert all(block.kwargs == expected for block in compiled), path
+    assert pipeline._find_transformer_blocks(pipeline.transformer) == names
+    expected = {"dynamic": None, "fullgraph": False, "mode": "default"}
+    for name, blocks in originals.items():
+        compiled = list(getattr(pipeline.transformer, name))
+        assert [block.module for block in compiled] == blocks, name
+        assert all(block.kwargs == expected for block in compiled), name
 
 
 # =============================================================================
@@ -360,39 +331,57 @@ def test_compile_covers_every_block_list_and_keeps_bf16_rounding(monkeypatch):
             dict(cpu_offload_config=SimpleNamespace(enable=True)), "CPU offloading", id="offload"
         ),
         pytest.param(
-            dict(parallel=SimpleNamespace(parallel_vae_size=2)), "parallel VAE", id="parallel_vae"
+            dict(cache=SimpleNamespace(cache_backend="teacache")),
+            "no teacache coefficients",
+            id="teacache",
         ),
         pytest.param(
-            dict(cache=SimpleNamespace(cache_backend="teacache")), "teacache", id="teacache"
+            dict(cache=CacheDiTConfig(enable_separate_cfg=True)),
+            "enable_separate_cfg",
+            id="cache_dit_separate_cfg",
         ),
         pytest.param(
-            dict(cache=SimpleNamespace(cache_backend="cache_dit")), "cache_dit", id="cache_dit"
+            dict(cache=CacheDiTConfig(), cuda_graph=SimpleNamespace(enable=True)),
+            "cuda_graph_config.enable to false or remove cache_config",
+            id="cache_dit_cuda_graphs",
         ),
         pytest.param(
             dict(
                 attention=SimpleNamespace(
-                    sparse_attention_config=SimpleNamespace(algorithm="sol"),
+                    sparse_attention_config=SimpleNamespace(algorithm="vsa"),
                     quant_attention_config=None,
                 )
             ),
-            "sparse attention",
-            id="sparse_attention",
+            "Video Sparse Attention",
+            id="vsa",
         ),
         pytest.param(
-            dict(quant_config=SimpleNamespace(quant_algo="FP8")),
-            "on load only with quant_config.quant_algo FP8_PER_CHANNEL_PER_TOKEN, got static FP8",
+            dict(quant_config=SimpleNamespace(quant_algo="W4A16_AWQ"), dynamic_weight_quant=True),
+            "on load with quant_config.quant_algo FP8, FP8_BLOCK_SCALES, "
+            "FP8_PER_CHANNEL_PER_TOKEN, NVFP4, got W4A16_AWQ",
             id="quant",
         ),
         pytest.param(
             dict(
                 attention=SimpleNamespace(
-                    sparse_attention_config=None, quant_attention_config=SimpleNamespace()
-                )
+                    backend="TRTLLM",
+                    sparse_attention_config=None,
+                    quant_attention_config=SimpleNamespace(vc_attention=True),
+                ),
+                torch_compile=SimpleNamespace(enable=True),
+                cuda_graph=SimpleNamespace(enable=True),
             ),
-            "quantized attention",
-            id="quant_attention",
+            "torch_compile_config together with cuda_graph_config",
+            id="trtllm_quant_attention_compile_cuda_graph",
         ),
-        pytest.param(dict(runtime_lora=SimpleNamespace(path="lora")), "runtime LoRA", id="lora"),
+        pytest.param(
+            dict(
+                runtime_lora=SimpleNamespace(path="lora"),
+                visual_gen_mapping=VisualGenMapping(world_size=2, rank=0, tp_size=2),
+            ),
+            "runtime LoRA does not support tensor parallelism",
+            id="lora_tp2",
+        ),
         pytest.param(
             dict(visual_gen_mapping=VisualGenMapping(world_size=3, rank=0, ulysses_size=3)),
             "ulysses_size must be 1, 2, 4 or 8; got 3",
@@ -438,6 +427,20 @@ def test_klein_rejects_cfg_parallelism_and_base_accepts_it():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "mapping",
+    [None, VisualGenMapping(world_size=2, rank=0, ulysses_size=2)],
+    ids=["single_gpu", "ulysses2"],
+)
+def test_runtime_lora_is_accepted_without_tensor_parallelism(mapping):
+    for cls in (Flux3Pipeline, Flux3DistilledPipeline):
+        config = config_stub(
+            cls.flow_map, runtime_lora=SimpleNamespace(path="lora"), visual_gen_mapping=mapping
+        )
+        cls._check_pipeline_config(config)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("ulysses_size", [2, 4, 8])
 def test_sequence_parallel_sizes_that_divide_heads_and_text_windows_load(ulysses_size):
     mapping = VisualGenMapping(world_size=ulysses_size, rank=0, ulysses_size=ulysses_size)
@@ -445,9 +448,61 @@ def test_sequence_parallel_sizes_that_divide_heads_and_text_windows_load(ulysses
         cls._check_pipeline_config(config_stub(cls.flow_map, visual_gen_mapping=mapping))
 
 
-def load_pipeline_config(path: Path) -> DiffusionPipelineConfig:
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cls", PIPELINES)
+def test_cache_dit_is_accepted_and_caches_only_the_joint_blocks(cls):
+    cache = CacheDiTConfig(enable_separate_cfg=False)
+    cls._check_pipeline_config(
+        config_stub(cls.flow_map, cache=cache, cuda_graph=SimpleNamespace(enable=False))
+    )
+    pipeline = bare_pipeline(cls)
+    pipeline.transformer = Flux3Transformer2DModel(
+        model_config(tiny_config(cls.flow_map), skip_create_weights_in_init=True)
+    )
+    with (
+        patch.object(cache_dit_enablers, "BlockAdapter") as adapter,
+        patch.object(cache_dit_enablers, "cache_dit") as cache_dit,
+    ):
+        cache_dit_enablers.enable_cache_dit_for_pipeline(pipeline, CacheDiTConfig())
+    kwargs = adapter.call_args.kwargs
+    assert kwargs["transformer"] is pipeline.transformer
+    assert [id(blocks) for blocks in kwargs["blocks"]] == [
+        id(pipeline.transformer.single_transformer_blocks)
+    ]
+    assert kwargs["forward_pattern"] == [cache_dit_enablers.ForwardPattern.Pattern_3]
+    # Packed CFG samples share one call, so cond and uncond share one cache context.
+    assert cache_dit.enable_cache.call_args.kwargs["cache_config"].enable_separate_cfg is False
+
+
+class RecordingCacheAccelerator:
+    """Logs each refresh with the number of transformer calls made before it."""
+
+    def __init__(self, calls: list):
+        self.calls, self.refreshes = calls, []
+
+    def is_enabled(self) -> bool:
+        return True
+
+    def refresh(self, num_inference_steps: int, separate_cfg=None) -> None:
+        self.refreshes.append((num_inference_steps, len(self.calls)))
+
+    def get_stats(self) -> dict:
+        return {}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cls", PIPELINES)
+def test_each_request_refreshes_the_cache_before_its_first_step(cls):
+    pipeline = cpu_pipeline(cls)
+    pipeline.cache_accelerator = RecordingCacheAccelerator(pipeline.transformer.calls)
+    for _ in range(2):
+        pipeline.forward("a cat", height=64, width=64, num_inference_steps=3, seed=0)
+    assert pipeline.cache_accelerator.refreshes == [(3, 0), (3, 3)]
+
+
+def load_pipeline_config(path: Path, **args) -> DiffusionPipelineConfig:
     return DiffusionPipelineConfig.from_pretrained(
-        str(path), args=VisualGenArgs(model=str(path)), device="cpu"
+        str(path), args=VisualGenArgs(model=str(path), **args), device="cpu"
     )
 
 
@@ -485,17 +540,55 @@ def test_registered_manifest_names_must_agree_with_flow_map(
 
 
 @pytest.mark.cpu_only
-def test_real_config_fields_pass_the_check_and_offload_is_rejected(tmp_path):
-    config = tiny_config(flow_map=True)
+@pytest.mark.parametrize("backend", ["TRTLLM", "CUTEDSL"])
+@pytest.mark.parametrize("flow_map", [True, False], ids=["klein", "base"])
+def test_sol_and_skip_softmax_pass_the_check_and_vsa_is_rejected(tmp_path, flow_map, backend):
+    config = tiny_config(flow_map)
     write_checkpoint(tmp_path, config, diffusers_weights(config))
-    Flux3DistilledPipeline._check_pipeline_config(load_pipeline_config(tmp_path))
-    offload_config = DiffusionPipelineConfig.from_pretrained(
-        str(tmp_path),
-        args=VisualGenArgs(model=str(tmp_path), cpu_offload_config=CpuOffloadConfig(enable=True)),
-        device="cpu",
+    cls = Flux3DistilledPipeline if flow_map else Flux3Pipeline
+
+    def attention(sparse) -> DiffusionPipelineConfig:
+        attention_config = AttentionConfig(backend=backend, sparse_attention_config=sparse)
+        return load_pipeline_config(tmp_path, attention_config=attention_config)
+
+    cls._check_pipeline_config(attention(SolAttentionConfig(**SOL_SETTINGS)))
+    cls._check_pipeline_config(attention(SkipSoftmaxAttentionConfig(threshold_scale_factor=0.0)))
+    with pytest.raises(ValueError, match="Video Sparse Attention"):
+        cls._check_pipeline_config(attention(VideoSparseAttentionConfig()))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("flow_map", [True, False], ids=["klein", "base"])
+def test_quantized_attention_passes_the_check_unless_trtllm_is_compiled_and_graphed(
+    tmp_path, flow_map
+):
+    config = tiny_config(flow_map)
+    write_checkpoint(tmp_path, config, diffusers_weights(config))
+    cls = Flux3DistilledPipeline if flow_map else Flux3Pipeline
+
+    def load(
+        backend: str, quant: QuantAttentionConfig, compile: bool, graphs: bool
+    ) -> DiffusionPipelineConfig:
+        # The attention config validates the recipe against the GPU, so patch it to SM100.
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            return load_pipeline_config(
+                tmp_path,
+                attention_config=AttentionConfig(backend=backend, quant_attention_config=quant),
+                torch_compile_config=TorchCompileConfig(enable=compile),
+                cuda_graph_config=CudaGraphConfig(enable=graphs),
+            )
+
+    fp8 = dict(qk_dtype="fp8", v_dtype="fp8")
+    for quant in (QuantAttentionConfig(**VC_SETTINGS), QuantAttentionConfig(**fp8)):
+        cls._check_pipeline_config(load("TRTLLM", quant, compile=True, graphs=False))
+        cls._check_pipeline_config(load("TRTLLM", quant, compile=False, graphs=True))
+        with pytest.raises(
+            ValueError, match="torch_compile_config together with cuda_graph_config"
+        ):
+            cls._check_pipeline_config(load("TRTLLM", quant, compile=True, graphs=True))
+    cls._check_pipeline_config(
+        load("CUDNN", QuantAttentionConfig(**fp8), compile=True, graphs=True)
     )
-    with pytest.raises(ValueError, match="CPU offloading"):
-        Flux3DistilledPipeline(offload_config)
 
 
 # =============================================================================
@@ -509,14 +602,13 @@ def test_num_images_per_prompt_is_a_client_error_raised_first(num_images):
     pipeline = bare_pipeline()
     pipeline.forward = MagicMock(side_effect=AssertionError("must not generate"))
     req = make_request(png_bytes(64, 64), num_images_per_prompt=num_images)
-    with pytest.raises(UnsupportedNumImagesError, match="num_images_per_prompt") as error:
+    with pytest.raises(ValueError, match="num_images_per_prompt") as error:
         pipeline.prepare_request(req)
     assert req.prepared_inputs == {} and req.params.height is None
-    with pytest.raises(UnsupportedNumImagesError):
+    with pytest.raises(ValueError, match="num_images_per_prompt"):
         pipeline.infer(req)
-    assert isinstance(error.value, Flux3RequestError)
     assert pipeline.classify_request_failure(error.value) == "client"
-    assert pipeline.classify_request_failure(ValueError("internal")) is None
+    assert pipeline.classify_request_failure(RuntimeError("internal")) is None
 
 
 @pytest.mark.cpu_only
@@ -525,7 +617,7 @@ def test_infer_takes_one_prompt_per_request():
     pipeline.forward = MagicMock(side_effect=AssertionError("must not generate"))
     req = make_request()
     req.prompt = ["a", "b"]
-    with pytest.raises(Flux3RequestError, match="one prompt per request, got 2") as error:
+    with pytest.raises(ValueError, match="one prompt per request, got 2") as error:
         pipeline.infer(req)
     assert pipeline.classify_request_failure(error.value) == "client"
 
@@ -546,7 +638,7 @@ def test_infer_takes_one_prompt_per_request():
 def test_bad_references_are_client_errors_raised_while_preparing(references, message):
     pipeline = bare_pipeline()
     req = make_request(*references)
-    with pytest.raises(Flux3RequestError, match=message) as error:
+    with pytest.raises(ValueError, match=message) as error:
         pipeline.prepare_request(req)
     assert req.prepared_inputs == {}
     assert pipeline.classify_request_failure(error.value) == "client"
@@ -758,9 +850,9 @@ class FakeProcessor:
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("num_tokens", [8, 81, 9000])
 def test_tokenize_uses_the_chat_template_and_right_pads_to_the_window(num_tokens):
-    processor = FakeProcessor(num_tokens)
-    encoder = Flux3TextEncoder(model=torch.nn.Linear(1, 1), processor=processor)
-    input_ids, attention_mask = encoder.tokenize("a cat")
+    pipeline = bare_pipeline()
+    pipeline.processor = processor = FakeProcessor(num_tokens)
+    input_ids, attention_mask = pipeline._tokenize("a cat")
     window = padded_text_length(min(num_tokens, TEXT_MAX_TOKENS))
     assert input_ids.shape == attention_mask.shape == (1, window)
     assert processor.templates == [
@@ -806,7 +898,7 @@ def tiny_qwen3_vl(num_layers: int = 6):
 
 
 @pytest.mark.cpu_only
-def test_text_encoder_trim_keeps_selected_hidden_states_and_drops_vision():
+def test_text_encoder_trim_keeps_selected_hidden_states_and_drops_vision(monkeypatch):
     model = tiny_qwen3_vl()
     full = copy.deepcopy(model)
     layers = (2, 4)
@@ -817,11 +909,13 @@ def test_text_encoder_trim_keeps_selected_hidden_states_and_drops_vision():
     assert len(model.model.language_model.layers) == 4
     assert isinstance(model.model.language_model.norm, torch.nn.Identity)
 
-    encoder = Flux3TextEncoder(model, processor=None, hidden_state_layers=layers)
+    monkeypatch.setattr(pipeline_flux3, "HIDDEN_STATE_LAYERS", layers)
+    pipeline = bare_pipeline()
+    pipeline.text_encoder = model
     input_ids = torch.randint(0, 100, (1, 12), generator=torch.Generator().manual_seed(1))
     attention_mask = torch.ones_like(input_ids)
     attention_mask[:, 9:] = 0
-    actual = encoder.encode(input_ids, attention_mask)
+    actual = pipeline._encode_prompt(input_ids, attention_mask)
 
     # The reference runs the untrimmed model the way Diffusers calls it.
     position_ids = torch.arange(12)[None].masked_fill(attention_mask == 0, 1)
@@ -837,8 +931,8 @@ def test_text_encoder_trim_keeps_selected_hidden_states_and_drops_vision():
     assert actual.shape == (1, 12, 2 * 64)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-    encoder.model.to(torch.bfloat16)
-    assert encoder.encode(input_ids, attention_mask).dtype == torch.bfloat16
+    model.to(torch.bfloat16)
+    assert pipeline._encode_prompt(input_ids, attention_mask).dtype == torch.bfloat16
 
 
 @pytest.mark.cpu_only
@@ -853,40 +947,25 @@ def test_text_encoder_trim_limits():
 
 
 @pytest.mark.cpu_only
-def test_text_encoder_loads_in_the_requested_dtype_trimmed_and_without_vision(
-    tmp_path, monkeypatch
-):
-    from transformers import AutoProcessor
-
+def test_text_encoder_loads_in_the_pipeline_dtype_trimmed_and_without_vision(tmp_path, monkeypatch):
     num_layers = max(HIDDEN_STATE_LAYERS)
-    tiny_qwen3_vl(num_layers + 1).save_pretrained(str(tmp_path / "model"))
+    text_encoder_dir = str(tmp_path / "text_encoder")
+    tiny_qwen3_vl(num_layers + 1).save_pretrained(text_encoder_dir)
     processors = []
     monkeypatch.setattr(
-        AutoProcessor, "from_pretrained", lambda path: processors.append(path) or "processor"
+        pipeline_flux3.AutoProcessor,
+        "from_pretrained",
+        lambda path: processors.append(path) or "processor",
     )
-    encoder = Flux3TextEncoder.from_pretrained(
-        str(tmp_path / "model"), str(tmp_path / "processor"), dtype=torch.bfloat16, device="cpu"
-    )
-    model = encoder.model
-    assert processors == [str(tmp_path / "processor")] and encoder.processor == "processor"
+    pipeline = bare_pipeline()
+    skip = [PipelineComponent.VAE, PipelineComponent.SCHEDULER]
+    pipeline.load_standard_components(str(tmp_path), torch.device("cpu"), skip)
+    model = pipeline.text_encoder
+    assert processors == [text_encoder_dir] and pipeline.processor == "processor"
     assert model.model.visual is None and not model.training
     assert len(model.model.language_model.layers) == num_layers
     assert isinstance(model.model.language_model.norm, torch.nn.Identity)
     assert {parameter.dtype for parameter in model.parameters()} == {torch.bfloat16}
-
-
-@pytest.mark.cpu_only
-def test_processor_subfolder_comes_from_the_manifest(tmp_path):
-    def subfolder():
-        return _manifest_subfolder(str(tmp_path), "tokenizer", "fallback")
-
-    assert subfolder() == "fallback"
-    path = tmp_path / "modular_model_index.json"
-    # The released manifests keep the Qwen3-VL processor files under text_encoder/.
-    path.write_text(json.dumps(pipeline_manifest(flow_map=True)))
-    assert subfolder() == "text_encoder"
-    path.write_text(json.dumps({"_class_name": "Flux3DistilledModularPipeline"}))
-    assert subfolder() == "fallback"
 
 
 # =============================================================================
@@ -924,7 +1003,7 @@ def test_base_runs_the_unconditional_sample_only_with_guidance(
     assert len(calls) == 2
     for call in calls:
         assert dict(call["layout"])["text"] == (80,) * len(prompts)
-        assert "target_timesteps" not in call
+        assert "target_timestep" not in call
         assert "x_text" not in call and "_flux3_text_cos" not in call
 
 
@@ -980,13 +1059,41 @@ def test_klein_samples_one_context_and_targets_the_next_timestep():
     pipeline.forward("a cat", height=64, width=64, num_inference_steps=3, seed=0)
     assert pipeline.text_encoder.tokenized == ["a cat"]
     calls = pipeline.transformer.calls
-    timesteps = torch.stack([call["x_image_timesteps"] for call in calls])[:, 0]
-    targets = torch.stack([call["target_timesteps"] for call in calls])[:, 0]
+    timesteps = torch.stack([call["timestep"] for call in calls])
+    targets = torch.stack([call["target_timestep"] for call in calls])[:, 0]
     torch.testing.assert_close(targets[:-1], timesteps[1:])
     assert targets[-1].item() == 0.0
-    assert {"x_text", "x_text_timesteps", "_flux3_text_cos"} <= calls[0].keys()
+    assert {"x_text", "_flux3_text_cos"} <= calls[0].keys()
     assert calls[0]["x_text"].dtype == torch.bfloat16
-    assert not any(key.endswith("_ids") for key in calls[0])
+    assert not any(key.endswith(("_ids", "_timesteps")) for key in calls[0])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "cls, num_steps, dense_steps",
+    [
+        pytest.param(Flux3Pipeline, 50, {0.96: 12, 0.94: 16}, id="base"),
+        pytest.param(Flux3DistilledPipeline, 16, {0.96: 4, 0.94: 5}, id="klein"),
+    ],
+)
+def test_transformer_gets_the_normalized_step_time(cls, num_steps, dense_steps):
+    """Every call carries the shifted sigma as the image flow time ``timestep``, as SOL reads it."""
+    pipeline = cpu_pipeline(cls)
+    pipeline.forward("a cat", height=64, width=64, num_inference_steps=num_steps, seed=0)
+    calls = pipeline.transformer.calls
+    assert len(calls) == num_steps
+    for call in calls:
+        assert call["timestep"].shape == () and call["timestep"].dtype == torch.float32
+    times = torch.stack([call["timestep"] for call in calls])
+    linear = torch.linspace(1.0, 1.0 / num_steps, num_steps, dtype=torch.float64)
+    expected = linear * SCHEDULER_SHIFT / (1 + (SCHEDULER_SHIFT - 1) * linear)
+    torch.testing.assert_close(times.double(), expected, rtol=1e-6, atol=0)
+    assert times[0].item() == 1.0 and bool(torch.all(times[1:] < times[:-1]))
+    for cutoff, count in dense_steps.items():
+        assert int((times >= cutoff).sum()) == count, cutoff
+    # Klein Base's step-independent streams attend at the first step's time.
+    static = pipeline.transformer.static_timesteps
+    assert len(static) == 1 and static[0].item() == 1.0
 
 
 @pytest.mark.cpu_only
@@ -1022,7 +1129,7 @@ def test_request_content_errors_are_client_errors_raised_before_encoding(
 ):
     pipeline = cpu_pipeline(cls)
     kwargs = {"height": 64, "width": 64, **kwargs}
-    with pytest.raises(Flux3RequestError, match=message) as error:
+    with pytest.raises(ValueError, match=message) as error:
         pipeline.forward(prompt, seed=0, **kwargs)
     assert pipeline.classify_request_failure(error.value) == "client"
     assert pipeline.text_encoder.tokenized == []
@@ -1102,7 +1209,7 @@ def test_sequence_parallel_token_counts_are_checked_before_encoding(seq_size, kw
     mapping = SimpleNamespace(seq_size=seq_size, cfg_size=1)
     pipeline = cpu_pipeline(Flux3Pipeline, config_stub(visual_gen_mapping=mapping))
     pipeline.vae.encode = MagicMock(side_effect=AssertionError("must not encode"))
-    with pytest.raises(Flux3RequestError, match=message) as error:
+    with pytest.raises(ValueError, match=message) as error:
         pipeline.forward("a cat", seed=0, **kwargs)
     assert f"across {seq_size} ranks" in str(error.value)
     assert pipeline.classify_request_failure(error.value) == "client"
@@ -1123,6 +1230,43 @@ def test_sequence_parallel_accepts_even_targets_and_checks_total_reference_token
     assert dict(pipeline.transformer.calls[0]["layout"])["image_cond"] == (50, 50)
 
 
+SOL_ATTENTION_STUB = SimpleNamespace(
+    backend="TRTLLM",
+    sparse_attention_config=SimpleNamespace(algorithm="sol_attn"),
+    quant_attention_config=None,
+)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        pytest.param(dict(height=128, width=128), "more than 64 target tokens", id="target"),
+        pytest.param(
+            dict(height=256, width=256, image=png_bytes(64, 64)),
+            "more than 64 reference tokens",
+            id="reference",
+        ),
+    ],
+)
+def test_sol_rejects_one_block_streams_before_encoding(kwargs, message):
+    pipeline = cpu_pipeline(Flux3Pipeline, config_stub(attention=SOL_ATTENTION_STUB))
+    pipeline.vae.encode = MagicMock(side_effect=AssertionError("must not encode"))
+    with pytest.raises(ValueError, match=message) as error:
+        pipeline.forward("a cat", seed=0, **kwargs)
+    assert pipeline.classify_request_failure(error.value) == "client"
+    assert pipeline.text_encoder.tokenized == []
+    pipeline.validate_resolution(128, 144, 1)
+
+
+@pytest.mark.cpu_only
+def test_sol_warmup_skips_one_block_sizes():
+    compilation = SimpleNamespace(resolutions=[(128, 128), (256, 256)], num_frames=None)
+    config = config_stub(attention=SOL_ATTENTION_STUB, compilation=compilation)
+    shapes, _ = bare_pipeline(config=config).resolve_warmup_plan()
+    assert shapes == [(256, 256, 1)]
+
+
 @pytest.mark.cpu_only
 def test_warmup_plan_skips_sizes_the_sequence_parallel_size_cannot_split():
     config = config_stub(
@@ -1138,28 +1282,8 @@ def test_warmup_plan_skips_sizes_the_sequence_parallel_size_cannot_split():
 # =============================================================================
 
 
-def build_gpu_pipeline(tmp_path: Path, flow_map: bool, **args) -> Flux3Pipeline:
-    """Load a synthetic checkpoint through the pipeline; only the text encoder is faked."""
-    weights = write_gpu_checkpoint(tmp_path, flow_map)
-    visual_gen_args = VisualGenArgs(
-        model=str(tmp_path),
-        attention_config=AttentionConfig(backend="VANILLA"),
-        torch_compile_config=TorchCompileConfig(enable=False, enable_autotune=False),
-        **args,
-    )
-    pipeline_config = DiffusionPipelineConfig.from_pretrained(
-        str(tmp_path), args=visual_gen_args, device="cuda"
-    )
-    cls = Flux3DistilledPipeline if flow_map else Flux3Pipeline
-    pipeline = cls(pipeline_config)
-    pipeline.transformer.to("cuda")
-    pipeline.load_weights({"transformer": {k: v.cuda() for k, v in weights.items()}})
-    pipeline.post_load_weights()
-    pipeline.load_standard_components(
-        str(tmp_path), torch.device("cuda"), skip_components=["text_encoder"]
-    )
-    pipeline.text_encoder = FakeTextEncoder(device="cuda")
-    return pipeline
+# A checkpoint with the head_dim 128 that SOL and VC-Attention serve.
+HEAD_DIM_128 = {"attention_head_dim": 128, "axes_dims_rope": [32] * 4}
 
 
 def record_transformer_calls(pipeline: Flux3Pipeline) -> list:
@@ -1178,8 +1302,9 @@ FLOW_MAP = [pytest.param(True, id="klein"), pytest.param(False, id="base")]
 
 @requires_cuda
 @pytest.mark.parametrize("flow_map", FLOW_MAP)
-def test_text_to_image_and_edits_run_end_to_end(tmp_path, flow_map):
-    pipeline = build_gpu_pipeline(tmp_path, flow_map)
+def test_text_to_image_and_edits_run_end_to_end(tmp_path, monkeypatch, flow_map):
+    write_gpu_checkpoint(tmp_path, flow_map)
+    pipeline = load_gpu_pipeline(tmp_path, monkeypatch)
     assert isinstance(pipeline.vae, AutoencoderKLFlux2) and pipeline.vae.dtype == torch.float32
 
     def generate(**kwargs):
@@ -1202,27 +1327,29 @@ def test_text_to_image_and_edits_run_end_to_end(tmp_path, flow_map):
 @requires_cuda
 @pytest.mark.parametrize("edit", [False, True], ids=["t2i", "i2i"])
 @pytest.mark.parametrize("flow_map", FLOW_MAP)
-def test_transformer_receives_only_the_tensors_it_reads(tmp_path, flow_map, edit):
-    pipeline = build_gpu_pipeline(tmp_path, flow_map)
+def test_transformer_receives_only_the_tensors_it_reads(tmp_path, monkeypatch, flow_map, edit):
+    write_gpu_checkpoint(tmp_path, flow_map)
+    pipeline = load_gpu_pipeline(tmp_path, monkeypatch)
     calls = record_transformer_calls(pipeline)
     image = png_bytes(64, 64) if edit else None
     pipeline.forward("a red fox", height=64, width=64, num_inference_steps=2, seed=0, image=image)
 
     modalities = ("image", "image_cond", "text") if edit else ("image", "text")
     if flow_map:
-        expected = {"layout", "target_timesteps", "_flux3_joint_cos", "_flux3_joint_sin"}
+        expected = {
+            "layout",
+            "timestep",
+            "target_timestep",
+            "_flux3_joint_cos",
+            "_flux3_joint_sin",
+        }
         for name in modalities:
-            expected |= {
-                f"x_{name}",
-                f"x_{name}_timesteps",
-                f"_flux3_{name}_cos",
-                f"_flux3_{name}_sin",
-            }
+            expected |= {f"x_{name}", f"_flux3_{name}_cos", f"_flux3_{name}_sin"}
     else:
         expected = {
             "layout",
+            "timestep",
             "x_image",
-            "x_image_timesteps",
             "_flux3_image_cos",
             "_flux3_image_sin",
         }
@@ -1242,87 +1369,108 @@ def test_transformer_receives_only_the_tensors_it_reads(tmp_path, flow_map, edit
 
 
 @requires_cuda
-def test_base_without_guidance_runs_one_sample(tmp_path):
-    pipeline = build_gpu_pipeline(tmp_path, flow_map=False)
-    calls = record_transformer_calls(pipeline)
-    for guidance_scale, num_samples in ((1.0, 1), (3.5, 2)):
-        calls.clear()
-        pipeline.forward(
-            "a red fox",
-            height=64,
-            width=64,
-            num_inference_steps=1,
-            guidance_scale=guidance_scale,
-            seed=0,
-        )
-        assert len(dict(calls[0]["layout"])["text"]) == num_samples
-
-
-@requires_cuda
-@pytest.mark.parametrize("flow_map", FLOW_MAP)
-def test_warmup_registers_text_to_image_and_edit_keys(tmp_path, flow_map):
-    pipeline = build_gpu_pipeline(
-        tmp_path, flow_map, compilation_config=CompilationConfig(resolutions=[(64, 80)])
-    )
-    calls = record_transformer_calls(pipeline)
-    pipeline.warmup()
-    assert pipeline._warmed_up_shapes == {(64, 80), (64, 80, 1, ((64, 80),))}
-    assert len(calls) == 2 * len(WARMUP_TEXT_WINDOWS) * pipeline.default_warmup_steps
-
-    # A request whose reference matches the warmed edit reuses its key.
-    req = make_request(png_bytes(80, 64))
-    pipeline.prepare_request(req)
-    assert pipeline.request_warmup_cache_key(req) in pipeline._warmed_up_shapes
-    output = pipeline.infer(req)
-    assert output.image.shape == (1, 64, 80, 3)
-
-
-@requires_cuda
-@pytest.mark.parametrize("flow_map", FLOW_MAP)
-def test_pipeline_loader_compiles_warms_up_and_generates(tmp_path, monkeypatch, flow_map):
+@pytest.mark.parametrize(
+    "flow_map, sol",
+    [
+        pytest.param(True, False, id="klein"),
+        pytest.param(False, False, id="base"),
+        pytest.param(False, True, id="base-sol", marks=requires_sm100),
+    ],
+)
+def test_pipeline_loader_compiles_warms_up_and_generates(tmp_path, monkeypatch, flow_map, sol):
     # Two dual-stream layers, so every block list is long enough to be compiled per block.
-    weights = write_gpu_checkpoint(tmp_path, flow_map, num_layers=2)
+    overrides = HEAD_DIM_128 if sol else {}
+    weights = write_gpu_checkpoint(tmp_path, flow_map, num_layers=2, **overrides)
     loaded = []
-
-    def from_pretrained(cls, model_path, processor_path, dtype, device):
-        loaded.append((model_path, processor_path, dtype, device))
-        return FakeTextEncoder(device="cuda")
-
-    monkeypatch.setattr(Flux3TextEncoder, "from_pretrained", classmethod(from_pretrained))
+    patch_text_encoder_load(monkeypatch, loaded)
+    attention = AttentionConfig(backend="VANILLA")
+    if sol:
+        sparse = SolAttentionConfig(**SOL_SETTINGS)
+        attention = AttentionConfig(backend="TRTLLM", sparse_attention_config=sparse)
+    # SOL-Attn needs streams longer than one 64-token block.
+    height, width = (144, 160) if sol else (64, 80)
     args = VisualGenArgs(
         model=str(tmp_path),
-        attention_config=AttentionConfig(backend="VANILLA"),
+        attention_config=attention,
         torch_compile_config=TorchCompileConfig(enable=True, enable_autotune=False),
-        compilation_config=CompilationConfig(resolutions=[(64, 80)]),
+        compilation_config=CompilationConfig(resolutions=[(height, width)]),
     )
     pipeline = PipelineLoader(args).load()
 
     assert type(pipeline) is (Flux3DistilledPipeline if flow_map else Flux3Pipeline)
     text_encoder_dir = str(tmp_path / "text_encoder")
-    assert loaded == [(text_encoder_dir, text_encoder_dir, torch.bfloat16, torch.device("cuda"))]
+    assert loaded == [("model", text_encoder_dir, torch.bfloat16), ("processor", text_encoder_dir)]
+    assert pipeline.text_encoder.device.type == "cuda"
     assert pipeline.vae.dtype == torch.float32
     transformer = pipeline.transformer
     torch.testing.assert_close(
         transformer.context_embedder.weight, weights["context_embedder.weight"].cuda()
     )
-    paths = pipeline._find_transformer_blocks(transformer)
-    assert len(paths) == 4
-    blocks = [block for path in paths for block in transformer.get_submodule(path)]
+    names = pipeline._find_transformer_blocks(transformer)
+    assert len(names) == 4
+    blocks = [block for name in names for block in getattr(transformer, name)]
     assert len(blocks) == 3 * 2 + 2
     assert all(isinstance(block, torch._dynamo.eval_frame.OptimizedModule) for block in blocks)
-    assert pipeline._warmed_up_shapes == {(64, 80), (64, 80, 1, ((64, 80),))}
+    if sol:
+        attentions = [m for m in transformer.modules() if isinstance(m, Flux3Attention)]
+        assert attentions and all(isinstance(m.attn, SOLTrtllmAttention) for m in attentions)
+    size = (height, width)
+    assert pipeline._warmed_up_shapes == {size, (*size, 1, (size,))}
 
-    output = pipeline.forward("a red fox", height=64, width=80, num_inference_steps=2, seed=0)
-    assert output.image.shape == (1, 64, 80, 3) and output.image.dtype == torch.uint8
+    # A request whose reference matches the warmed edit reuses its key.
+    req = make_request(png_bytes(width, height))
+    pipeline.prepare_request(req)
+    assert pipeline.request_warmup_cache_key(req) in pipeline._warmed_up_shapes
+    output = pipeline.infer(req)
+    assert output.image.shape == (1, height, width, 3)
+
+    output = pipeline.forward(
+        "a red fox", height=height, width=width, num_inference_steps=2, seed=0
+    )
+    assert output.image.shape == (1, height, width, 3) and output.image.dtype == torch.uint8
 
 
 @requires_cuda
 @pytest.mark.parametrize("flow_map", FLOW_MAP)
-def test_cuda_graphs_match_eager_and_warmed_keys_replay(tmp_path, flow_map):
-    eager = build_gpu_pipeline(tmp_path, flow_map)
-    graphed = build_gpu_pipeline(
+def test_pipeline_loader_fuses_runtime_lora_in_both_formats(tmp_path, monkeypatch, flow_map):
+    weights = write_gpu_checkpoint(tmp_path / "checkpoint", flow_map)
+    patch_text_encoder_load(monkeypatch)
+    adapter = lora_adapter(weights)
+    modules = []
+
+    def generate(lora_path=None, scale=1.0):
+        lora = None if lora_path is None else RuntimeLoRAConfig(path=str(lora_path), scale=scale)
+        args = VisualGenArgs(
+            model=str(tmp_path / "checkpoint"),
+            attention_config=AttentionConfig(backend="VANILLA"),
+            torch_compile_config=TorchCompileConfig(enable=False, enable_autotune=False),
+            runtime_lora_config=lora,
+        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        modules.append([name for name, _ in pipeline.transformer.named_modules()])
+        kwargs = dict(height=64, width=64, num_inference_steps=2, seed=0)
+        return pipeline.forward("a red fox", **kwargs).image
+
+    base = generate()
+    images = {
+        form: generate(write_lora(tmp_path / form, adapter, alpha=8.0, bfl=form == "bfl"))
+        for form in ("diffusers", "bfl")
+    }
+    torch.testing.assert_close(images["bfl"], images["diffusers"], rtol=0, atol=0)
+    assert not torch.equal(images["diffusers"], base)
+    torch.testing.assert_close(generate(tmp_path / "bfl", scale=0.0), base, rtol=0, atol=0)
+    # Enabling LoRA leaves the fused QKV and gate/up topology as loaded.
+    assert all(names == modules[0] for names in modules)
+
+
+@requires_cuda
+@pytest.mark.parametrize("flow_map", FLOW_MAP)
+def test_cuda_graphs_match_eager_and_warmed_keys_replay(tmp_path, monkeypatch, flow_map):
+    write_gpu_checkpoint(tmp_path, flow_map)
+    eager = load_gpu_pipeline(tmp_path, monkeypatch)
+    graphed = load_gpu_pipeline(
         tmp_path,
-        flow_map,
+        monkeypatch,
         cuda_graph_config=CudaGraphConfig(enable=True),
         compilation_config=CompilationConfig(resolutions=[(64, 64)]),
     )
@@ -1341,10 +1489,129 @@ def test_cuda_graphs_match_eager_and_warmed_keys_replay(tmp_path, flow_map):
         runner.clear()
 
 
+@requires_sm100
+@pytest.mark.parametrize("flow_map", FLOW_MAP)
+def test_sol_pipeline_keeps_the_dense_prefix_and_graphs_match_eager(
+    tmp_path, monkeypatch, flow_map
+):
+    """Steps above the cutoff and Klein Base's cached streams run dense; graphs key each phase."""
+    sol = SolAttentionConfig(**SOL_SETTINGS)
+    attention = AttentionConfig(backend="TRTLLM", sparse_attention_config=sol)
+    write_gpu_checkpoint(tmp_path, flow_map, **HEAD_DIM_128)
+    eager = load_gpu_pipeline(tmp_path, monkeypatch, attention_config=attention)
+    launches = []
+    primts_forward = PrimsTSBlockSparseFmha.forward
+
+    def counted(*args, **kwargs):
+        launches[-1] += 1
+        return primts_forward(*args, **kwargs)
+
+    monkeypatch.setattr(PrimsTSBlockSparseFmha, "forward", counted)
+    transformer = eager.transformer
+    forward, prepare = transformer.forward, transformer.prepare_static_inputs
+
+    def recording(function):
+        def call(**kwargs):
+            launches.append(0)
+            return function(**kwargs)
+
+        return call
+
+    transformer.forward, transformer.prepare_static_inputs = recording(forward), recording(prepare)
+    kwargs = dict(height=256, width=256, num_inference_steps=4, seed=0)
+    expected = {None: eager.forward("a red fox", **kwargs).image}
+    # Static inputs are prepared at 1.0; the steps run at 1.0, 0.954, 0.874 and 0.698.
+    assert len(launches) == 5 and launches[:2] == [0, 0] and all(launches[2:]), launches
+    transformer.forward, transformer.prepare_static_inputs = forward, prepare
+
+    reference = png_bytes(256, 256)
+    expected[reference] = eager.forward("a red fox", image=reference, **kwargs).image
+    graphed = load_gpu_pipeline(
+        tmp_path,
+        monkeypatch,
+        attention_config=attention,
+        cuda_graph_config=CudaGraphConfig(enable=True),
+        compilation_config=CompilationConfig(resolutions=[(256, 256)]),
+    )
+    runner = graphed._cuda_graph_runners["transformer"]
+    try:
+        graphed.warmup()
+        # Warmup steps at 1.0 and 0.874 capture both phases per task and text window.
+        num_graphs = 2 * 2 * len(WARMUP_TEXT_WINDOWS)
+        assert len(runner.graphs) == num_graphs
+        for image, image_expected in expected.items():
+            actual = graphed.forward("a red fox", image=image, **kwargs).image
+            torch.testing.assert_close(actual, image_expected, rtol=0, atol=0)
+        assert len(runner.graphs) == num_graphs
+    finally:
+        runner.clear()
+
+
+@requires_sm100
+@pytest.mark.parametrize("flow_map", FLOW_MAP)
+def test_vc_attention_follows_the_denoise_schedule(tmp_path, monkeypatch, flow_map):
+    """Every attention call of every step prepares VC operands at that step."""
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
+    quant = QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8", vc_attention=True)
+    write_gpu_checkpoint(tmp_path, flow_map, **HEAD_DIM_128)
+    pipeline = load_gpu_pipeline(
+        tmp_path,
+        monkeypatch,
+        attention_config=AttentionConfig(backend="TRTLLM", quant_attention_config=quant),
+    )
+    steps, prepare = [], visual_trtllm.prepare_vc_operands
+
+    def recording(*args, denoise_step, **kwargs):
+        steps.append(denoise_step)
+        return prepare(*args, denoise_step=denoise_step, **kwargs)
+
+    monkeypatch.setattr(visual_trtllm, "prepare_vc_operands", recording)
+    output = pipeline.forward("a red fox", height=64, width=64, num_inference_steps=4, seed=0)
+    assert output.image.shape == (1, 64, 64, 3)
+    # Klein Base prepares its text stream once, before the first step.
+    first = steps.index((0, 4))
+    assert (first > 0) != flow_map and all(step is None for step in steps[:first])
+    assert set(steps[first:]) == {(step, 4) for step in range(4)}
+    assert pipeline.transformer.model_config.attention_metadata_state["denoise_step"] is None
+
+
+@requires_cuda
+@pytest.mark.parametrize("flow_map", FLOW_MAP)
+def test_cache_dit_matches_uncached_at_threshold_zero_and_stays_close_when_forced(
+    tmp_path, monkeypatch, flow_map
+):
+    kwargs = dict(height=64, width=64, num_inference_steps=8, seed=0)
+    write_gpu_checkpoint(tmp_path, flow_map)
+    uncached = load_gpu_pipeline(tmp_path, monkeypatch)
+    expected = uncached.forward("a red fox", **kwargs).image.float()
+    other_seed = uncached.forward("a red fox", **{**kwargs, "seed": 1}).image.float()
+    images, cached_steps = {}, {}
+    for threshold in (0.0, 1.0):
+        cache = CacheDiTConfig(
+            max_warmup_steps=2, residual_diff_threshold=threshold, max_continuous_cached_steps=-1
+        )
+        pipeline = load_gpu_pipeline(tmp_path, monkeypatch, cache_config=cache)
+        try:
+            outputs = [pipeline.forward("a red fox", **kwargs).image for _ in range(2)]
+            stats = pipeline.cache_accelerator.get_stats()["transformer_0"]
+        finally:
+            pipeline.cache_accelerator.unwrap()
+        # Each request refreshes the cache, so a repeated request repeats its image.
+        torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
+        images[threshold] = outputs[0].float()
+        cached_steps[threshold] = {tuple(entry.cached_steps) for entry in stats}
+    assert cached_steps == {0.0: {()}, 1.0: {tuple(range(2, 8))}}
+    torch.testing.assert_close(images[0.0], expected, rtol=0, atol=0)
+    # Forced caching changes the image, but far less than another seed does.
+    error = (images[1.0] - expected).abs().mean()
+    assert 0 < error < 0.5 * (other_seed - expected).abs().mean()
+
+
 @requires_cuda
 def test_fp32_vae_attention_runs_on_memory_efficient_sdpa(tmp_path, monkeypatch):
     """The FP32 VAE's attention needs no SDPA math fallback when encoding or decoding."""
-    pipeline = build_gpu_pipeline(tmp_path, flow_map=True)
+    write_gpu_checkpoint(tmp_path, flow_map=True)
+    pipeline = load_gpu_pipeline(tmp_path, monkeypatch)
     assert pipeline.vae.dtype == torch.float32
     # The released VAE's head size, which memory-efficient SDPA must support.
     pipeline.vae = tiny_vae(mid_channels=512).to("cuda")

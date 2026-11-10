@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FLUX.3 transformer with Diffusers module names.
+"""FLUX.3 transformer, loaded from Diffusers-format checkpoints.
 
 Per-mode blocks run within each modality; single blocks then attend jointly within each sample.
 """
@@ -9,7 +9,8 @@ Per-mode blocks run within each modality; single blocks then attend jointly with
 import dataclasses
 import itertools
 import math
-from typing import Any, Dict, List, Optional, Tuple
+import re
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple, TypeVar
 
 import torch
 import torch.nn.functional as F
@@ -22,6 +23,7 @@ from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode, Weigh
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode, apply_rotary_emb
 from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.flux.pos_embed_flux import FluxPosEmbed
 from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux2 import _split_linear_in_weights
 from tensorrt_llm._torch.visual_gen.models.flux3.packed import (
     NUM_POSITION_AXES,
@@ -47,6 +49,33 @@ OPTIONAL_MODALITIES = frozenset({IMAGE_COND})
 OUTPUT_MODALITY = IMAGE
 # Callers scale the h and w position ids of target and reference image tokens by this factor.
 IMAGE_ROPE_SCALE = 0.5
+# Top-level per-modality modules: per-mode block stacks, modulations and input embedders.
+_MODE_BLOCKS = {
+    IMAGE: "image_mode_blocks",
+    IMAGE_COND: "image_cond_mode_blocks",
+    TEXT: "txt_mode_blocks",
+}
+_EARLY_MODULATIONS = {
+    IMAGE: "image_early_modulation",
+    IMAGE_COND: "image_cond_early_modulation",
+    TEXT: "txt_early_modulation",
+}
+_SINGLE_MODULATIONS = {
+    IMAGE: "image_single_modulation",
+    IMAGE_COND: "image_cond_single_modulation",
+    TEXT: "txt_single_modulation",
+}
+_EMBEDDERS = {IMAGE: "image_embedder", IMAGE_COND: "image_cond_embedder", TEXT: "context_embedder"}
+# Diffusers names of the modules it keys by modality, and their module names.
+_CHECKPOINT_PREFIXES = (
+    *((f"mode_blocks.{name}", _MODE_BLOCKS[name]) for name in CONTENT_MODALITIES),
+    *((f"x_embedders.{name}", _EMBEDDERS[name]) for name in CONTENT_MODALITIES),
+    *(
+        (f"{stage}_stream_modulations.{'txt' if name == TEXT else name}", modules[name])
+        for stage, modules in (("early", _EARLY_MODULATIONS), ("single", _SINGLE_MODULATIONS))
+        for name in modules
+    ),
+)
 
 # Checkpoint sources of the fused Linears; linear_in is pre-split into gate and up halves.
 _PARAMS_MAP = {
@@ -59,13 +88,19 @@ _CHECKPOINT_MODULES = {
     "gate_up_proj": ("linear_in",),
     "down_proj": ("linear_out",),
 }
+# Algorithms that quantize BF16 checkpoint weights on load.
+LOAD_TIME_QUANT_ALGOS = (
+    QuantAlgo.FP8,
+    QuantAlgo.FP8_BLOCK_SCALES,
+    QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+    QuantAlgo.NVFP4,
+)
 # Modules that load-time quantization keeps in BF16, as BFL's FP8 rowwise export does.
 LOAD_TIME_QUANT_EXCLUDED_MODULES = (
-    "x_embedders",
-    "context_embedder",
+    *_EMBEDDERS.values(),
     "timestep_embedder",
     "target_timestep_embedder",
-    "txt_mode_blocks",
+    _MODE_BLOCKS[TEXT],
     "norm_out",
     "proj_out",
 )
@@ -139,34 +174,209 @@ class Flux3TransformerConfig:
         return int(self.hidden_size * self.mlp_ratio)
 
 
+def load_time_quant_excluded_modules(
+    arch: Flux3TransformerConfig, quant_algo: QuantAlgo
+) -> Tuple[str, ...]:
+    """Modules that load-time ``quant_algo`` keeps in BF16, as BFL's export at that precision does.
+
+    NVFP4 also keeps the modulations, the first image block and the last seventh of single blocks.
+    """
+    if quant_algo != QuantAlgo.NVFP4:
+        return LOAD_TIME_QUANT_EXCLUDED_MODULES
+    num_single = arch.num_single_layers
+    first_bf16_single = num_single - max(1, num_single // 7)
+    return (
+        *LOAD_TIME_QUANT_EXCLUDED_MODULES,
+        *_EARLY_MODULATIONS.values(),
+        *_SINGLE_MODULATIONS.values(),
+        f"{_MODE_BLOCKS[IMAGE]}.0",
+        *(f"single_transformer_blocks.{i}" for i in range(first_bf16_single, num_single)),
+    )
+
+
+def _replace_prefix(name: str, prefixes: Iterable[Tuple[str, str]]) -> str:
+    """``name`` with its first matching dotted ``(old, new)`` prefix replaced."""
+    for old, new in prefixes:
+        if name == old or name.startswith(old + "."):
+            return new + name[len(old) :]
+    return name
+
+
+def diffusers_to_module_name(name: str) -> str:
+    """Module or tensor name of a Diffusers checkpoint name, which differs only for modules keyed
+    by modality: ``x_embedders.image_cond.weight`` is ``image_cond_embedder.weight``.
+    """
+    return _replace_prefix(name, _CHECKPOINT_PREFIXES)
+
+
 # =============================================================================
-# RoPE and timestep embedding
+# BFL checkpoint names
 # =============================================================================
+# BFL-native and Diffusers tensor names map one to one; the output norm also swaps its
+# shift and scale rows (BFL: shift, scale; Diffusers: scale, shift).
+
+TensorT = TypeVar("TensorT", bound=torch.Tensor)
+
+BFL_NORM_OUT = "final_layer.image.adaLN_modulation.1"
+DIFFUSERS_NORM_OUT = "norm_out.linear"
+
+_TOP_LEVEL_MODULES: tuple[tuple[str, str], ...] = (
+    ("txt_in", "context_embedder"),
+    ("emb_in.image", "x_embedders.image"),
+    ("emb_in.image_cond", "x_embedders.image_cond"),
+    ("time_in.in_layer", "timestep_embedder.linear_1"),
+    ("time_in.out_layer", "timestep_embedder.linear_2"),
+    ("ref_time_in.in_layer", "target_timestep_embedder.linear_1"),
+    ("ref_time_in.out_layer", "target_timestep_embedder.linear_2"),
+    *(
+        (f"{stage}_stream_modulations.{mode}.lin", f"{stage}_stream_modulations.{mode}.linear")
+        for stage in ("early", "single")
+        for mode in ("image", "image_cond", "txt")
+    ),
+    (BFL_NORM_OUT, DIFFUSERS_NORM_OUT),
+    ("final_layer.image.linear", "proj_out"),
+)
+_BLOCK_STACKS: tuple[tuple[str, str], ...] = (
+    ("content_mode_blocks.image", "mode_blocks.image"),
+    ("content_mode_blocks.image_cond", "mode_blocks.image_cond"),
+    ("txt_mode_blocks", "txt_mode_blocks"),
+    ("single_blocks", "single_transformer_blocks"),
+)
+_BLOCK_MODULES: tuple[tuple[str, str], ...] = (
+    ("q_proj", "attn.to_q"),
+    ("k_proj", "attn.to_k"),
+    ("v_proj", "attn.to_v"),
+    ("attn_out", "attn.to_out.0"),
+    ("mlp_in", "ff.linear_in"),
+    ("mlp_out", "ff.linear_out"),
+)
+_BLOCK_TENSORS: tuple[tuple[str, str], ...] = (
+    ("norm.query_norm.scale", "attn.norm_q.weight"),
+    ("norm.key_norm.scale", "attn.norm_k.weight"),
+)
+_SUFFIX = re.compile(r"[A-Za-z_]\w*(?:\.\w+)*")
+# Output-norm tensors indexed by the shift and scale rows, and those that hold no such rows.
+_NORM_OUT_SWAPPED_SUFFIXES = frozenset({"weight", "bias", "lora_B.weight", "lora_up.weight"})
+_NORM_OUT_UNCHANGED_SUFFIXES = frozenset({"lora_A.weight", "lora_down.weight", "alpha"})
 
 
-def flux3_rope(pos: Tensor, dim: int, theta: float) -> Tensor:
-    """2x2 RoPE rotation matrices [..., dim / 2, 2, 2] (fp32) for positions ``pos``."""
-    assert dim % 2 == 0
-    scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
-    omega = 1.0 / (theta**scale)
-    out = torch.einsum("...n,d->...nd", pos.to(torch.float64), omega)
-    cos, sin = torch.cos(out), torch.sin(out)
-    out = torch.stack([cos, -sin, sin, cos], dim=-1)
-    out = out.reshape(*out.shape[:-1], 2, 2)
-    return out.float()
+class _Direction:
+    """Name tables for one direction of the mapping."""
+
+    def __init__(self, source: str, pairs_index: int) -> None:
+        def table(pairs: tuple[tuple[str, str], ...]) -> dict[str, str]:
+            return {pair[pairs_index]: pair[1 - pairs_index] for pair in pairs}
+
+        self.source = source
+        self.top_level = table(_TOP_LEVEL_MODULES)
+        self.stacks = table(_BLOCK_STACKS)
+        self.block_modules = table(_BLOCK_MODULES)
+        self.block_tensors = table(_BLOCK_TENSORS)
+        stacks = "|".join(re.escape(name) for name in self.stacks)
+        self.block = re.compile(rf"(?P<stack>{stacks})\.(?P<index>\d+)\.(?P<rest>.+)")
+
+    def _split(self, name: str) -> tuple[str, str, dict[str, str]]:
+        """Split ``name`` into a mapped block prefix, the name inside it, and its module table."""
+        match = self.block.fullmatch(name)
+        if match is None:
+            return "", name, self.top_level
+        prefix = f"{self.stacks[match['stack']]}.{match['index']}."
+        return prefix, match["rest"], self.block_modules
+
+    def module(self, name: str) -> str:
+        prefix, rest, modules = self._split(name)
+        if rest not in modules:
+            raise ValueError(f"Unknown {self.source} FLUX.3 module name: {name!r}")
+        return prefix + modules[rest]
+
+    def key(self, key: str) -> str:
+        prefix, rest, modules = self._split(key)
+        if prefix and rest in self.block_tensors:
+            return prefix + self.block_tensors[rest]
+        # Longest module name first, so no shorter name can claim part of a longer one.
+        for module_name in sorted(modules, key=len, reverse=True):
+            suffix = rest[len(module_name) + 1 :]
+            if rest.startswith(module_name + ".") and _SUFFIX.fullmatch(suffix):
+                return f"{prefix}{modules[module_name]}.{suffix}"
+        raise ValueError(f"Unknown {self.source} FLUX.3 tensor name: {key!r}")
 
 
-def flux3_pe_to_cos_sin(pe: Tensor) -> Tuple[Tensor, Tensor]:
-    """Rotation matrices [..., head_dim / 2, 2, 2] to interleaved (cos, sin) [..., head_dim]."""
-    cos = pe[..., 0, 0]
-    sin = pe[..., 1, 0]
-    return cos.repeat_interleave(2, dim=-1), sin.repeat_interleave(2, dim=-1)
+_BFL_TO_DIFFUSERS = _Direction("BFL", 0)
+_DIFFUSERS_TO_BFL = _Direction("Diffusers", 1)
 
 
-def _pe_to_block_freqs(pe: Tensor) -> Tuple[Tensor, Tensor]:
-    """pe [B, 1, S, head_dim / 2, 2, 2] to (cos, sin), each [B, S, 1, head_dim]."""
-    cos, sin = flux3_pe_to_cos_sin(pe)
-    return cos.transpose(1, 2).contiguous(), sin.transpose(1, 2).contiguous()
+def bfl_to_diffusers_module(name: str) -> str:
+    """Map a BFL module name, e.g. ``single_blocks.3.q_proj``, to Diffusers.
+
+    Raises ValueError if ``name`` is not a FLUX.3 BFL module.
+    """
+    return _BFL_TO_DIFFUSERS.module(name)
+
+
+def diffusers_to_bfl_module(name: str) -> str:
+    """Map a Diffusers module name, e.g. ``single_transformer_blocks.3.attn.to_q``, to BFL.
+
+    Raises ValueError if ``name`` is not a FLUX.3 Diffusers module.
+    """
+    return _DIFFUSERS_TO_BFL.module(name)
+
+
+def bfl_to_diffusers_key(key: str) -> str:
+    """Map a BFL tensor name to Diffusers, keeping its suffix; ValueError if unknown."""
+    return _BFL_TO_DIFFUSERS.key(key)
+
+
+def diffusers_to_bfl_key(key: str) -> str:
+    """Map a Diffusers tensor name to BFL, keeping its suffix; ValueError if unknown."""
+    return _DIFFUSERS_TO_BFL.key(key)
+
+
+def swap_norm_out_halves(value: TensorT) -> TensorT:
+    """Swap the shift and scale row halves of an output-norm tensor [2 * hidden, ...].
+
+    The swap is its own inverse.
+    """
+    rows = value.shape[0]
+    if rows % 2:
+        raise ValueError(f"FLUX.3 output-norm tensor needs an even row count, got {rows}")
+    # Rolling dim 0 by half its length swaps the two halves.
+    return value.roll(rows // 2, dims=0)
+
+
+def _convert_state_dict(
+    state_dict: Mapping[str, TensorT], convert_key: Callable[[str], str], norm_out: str
+) -> dict[str, TensorT]:
+    converted = {}
+    for key, value in state_dict.items():
+        if key.startswith(norm_out + "."):
+            suffix = key[len(norm_out) + 1 :]
+            if suffix in _NORM_OUT_SWAPPED_SUFFIXES:
+                value = swap_norm_out_halves(value)
+            elif suffix not in _NORM_OUT_UNCHANGED_SUFFIXES:
+                raise ValueError(f"No shift/scale order transform for FLUX.3 tensor {key!r}")
+        converted[convert_key(key)] = value
+    return converted
+
+
+def bfl_to_diffusers_state_dict(state_dict: Mapping[str, TensorT]) -> dict[str, TensorT]:
+    """Rename a BFL state dict to Diffusers names and reorder the output norm to scale, shift.
+
+    Raises ValueError for unknown names and for output-norm tensors without a known row order.
+    """
+    return _convert_state_dict(state_dict, bfl_to_diffusers_key, BFL_NORM_OUT)
+
+
+def diffusers_to_bfl_state_dict(state_dict: Mapping[str, TensorT]) -> dict[str, TensorT]:
+    """Rename a Diffusers state dict to BFL names and reorder the output norm to shift, scale.
+
+    Raises ValueError for unknown names and for output-norm tensors without a known row order.
+    """
+    return _convert_state_dict(state_dict, diffusers_to_bfl_key, DIFFUSERS_NORM_OUT)
+
+
+# =============================================================================
+# Timestep embedding
+# =============================================================================
 
 
 def flux3_timestep_embedding(
@@ -201,23 +411,6 @@ def _select_rows(value: Tensor, rows: List[int]) -> Tensor:
 def _expand_rows(value: Tensor, lengths: List[int]) -> Tensor:
     """Rows [n, hidden] repeated over each sample's tokens, as [1, sum(lengths), hidden]."""
     return torch.cat([row.expand(length, -1) for row, length in zip(value, lengths)]).unsqueeze(0)
-
-
-class Flux3PosEmbed(nn.Module):
-    """RoPE rotation matrices for (t, h, w, l) position ids."""
-
-    def __init__(self, theta: float, axes_dim: Tuple[int, ...]):
-        super().__init__()
-        self.theta = theta
-        self.axes_dim = axes_dim
-
-    def forward(self, ids: Tensor) -> Tensor:
-        """ids [B, S, 4] to rotation matrices [B, 1, S, head_dim / 2, 2, 2]."""
-        emb = torch.cat(
-            [flux3_rope(ids[..., i], dim, self.theta) for i, dim in enumerate(self.axes_dim)],
-            dim=-3,
-        )
-        return emb.unsqueeze(1)
 
 
 # =============================================================================
@@ -261,15 +454,14 @@ class Flux3TimestepEmbedder(nn.Module):
 
 
 class Flux3Modulation(nn.Module):
-    """Projects per-sample conditioning rows [n, hidden] to shift, scale and gate rows."""
+    """Projects SiLU-activated conditioning rows [n, hidden] to shift, scale and gate rows."""
 
     def __init__(self, hidden_size: int, config: DiffusionModelConfig):
         super().__init__()
         self.linear = Linear(hidden_size, 3 * hidden_size, **_linear_kwargs(config))
 
-    def forward(self, vec: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        shift, scale, gate = self.linear(F.silu(vec)).chunk(3, dim=-1)
-        return shift, scale, gate
+    def forward(self, temb: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        return self.linear(temb).chunk(3, dim=-1)
 
 
 class Flux3AdaLayerNorm(nn.Module):
@@ -361,16 +553,16 @@ class Flux3Attention(Attention):
     def attend(
         self,
         hidden_states: Tensor,
-        freqs: Tuple[Tensor, Tensor],
+        image_rotary_emb: Tuple[Tensor, Tensor],
         sample_bounds: Optional[Bounds] = None,
         timestep: Optional[Tensor] = None,
     ) -> Tensor:
         """Attention before the output projection: [B, S, hidden] to [B, S, local heads * head_dim].
 
-        ``freqs`` are RoPE (cos, sin), each [B, S, 1, head_dim]; ``sample_bounds`` limits attention.
+        ``image_rotary_emb`` (cos, sin) are [B, S, 1, head_dim]; ``sample_bounds`` limits attention.
         """
         b = hidden_states.shape[0]
-        cos, sin = freqs
+        cos, sin = image_rotary_emb
         if self.fuse_qk_norm_rope:
             qkv = self.qkv_proj(hidden_states)
             self.apply_packed_qk_norm_rope(
@@ -485,20 +677,24 @@ class _Flux3Block(nn.Module):
 
     def _update(
         self,
-        x: Tensor,
-        freqs: Tuple[Tensor, Tensor],
+        hidden_states: Tensor,
+        image_rotary_emb: Tuple[Tensor, Tensor],
         mod: Tuple[Tensor, Tensor, Tensor],
         sample_bounds: Optional[Bounds],
         timestep: Optional[Tensor],
     ) -> Tensor:
         shift, scale, gate = mod
-        x_mod = (1 + scale) * self.norm(x) + shift
-        attn = self.attn.attend(x_mod, freqs, sample_bounds=sample_bounds, timestep=timestep)
-        mlp_out = self.ff(x_mod.reshape(-1, x_mod.shape[-1])).reshape(*x_mod.shape[:-1], -1)
+        norm_hidden_states = (1 + scale) * self.norm(hidden_states) + shift
+        attn = self.attn.attend(
+            norm_hidden_states, image_rotary_emb, sample_bounds=sample_bounds, timestep=timestep
+        )
+        mlp_out = self.ff(norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])).reshape(
+            *norm_hidden_states.shape[:-1], -1
+        )
         output = self.attn.to_out[0](attn) + mlp_out
         if self._allreduce is not None:
             output = self._allreduce(output)
-        return x + gate * output
+        return hidden_states + gate * output
 
 
 class Flux3ModeTransformerBlock(_Flux3Block):
@@ -509,13 +705,13 @@ class Flux3ModeTransformerBlock(_Flux3Block):
 
     def forward(
         self,
-        x: Tensor,
-        freqs: Tuple[Tensor, Tensor],
+        hidden_states: Tensor,
+        image_rotary_emb: Tuple[Tensor, Tensor],
         mod: Tuple[Tensor, Tensor, Tensor],
         sample_bounds: Optional[Bounds] = None,
         timestep: Optional[Tensor] = None,
     ) -> Tensor:
-        return self._update(x, freqs, mod, sample_bounds, timestep)
+        return self._update(hidden_states, image_rotary_emb, mod, sample_bounds, timestep)
 
 
 class Flux3SingleTransformerBlock(_Flux3Block):
@@ -523,13 +719,13 @@ class Flux3SingleTransformerBlock(_Flux3Block):
 
     def forward(
         self,
-        x: Tensor,
-        freqs: Tuple[Tensor, Tensor],
+        hidden_states: Tensor,
+        image_rotary_emb: Tuple[Tensor, Tensor],
         mod: Tuple[Tensor, Tensor, Tensor],
         sample_bounds: Optional[Bounds] = None,
         timestep: Optional[Tensor] = None,
     ) -> Tensor:
-        return self._update(x, freqs, mod, sample_bounds, timestep)
+        return self._update(hidden_states, image_rotary_emb, mod, sample_bounds, timestep)
 
 
 # =============================================================================
@@ -537,12 +733,9 @@ class Flux3SingleTransformerBlock(_Flux3Block):
 # =============================================================================
 
 
-def _modulation_key(name: str) -> str:
-    return "txt" if name == TEXT else name
-
-
 def _checkpoint_key(key: str) -> str:
     """Name of a loader-side tensor key in the Diffusers checkpoint."""
+    key = _replace_prefix(key, ((new, old) for old, new in _CHECKPOINT_PREFIXES))
     for old, new in (
         (".ff.linear_in_gate.", ".ff.linear_in."),
         (".ff.linear_in_up.", ".ff.linear_in."),
@@ -553,16 +746,28 @@ def _checkpoint_key(key: str) -> str:
 
 
 def _checkpoint_module_names(name: str) -> Tuple[str, ...]:
-    """Diffusers checkpoint module names a TRT-LLM Linear is loaded from."""
+    """Checkpoint Linears that a TRT-LLM Linear loads from, under TRT-LLM block names."""
     parent, _, leaf = name.rpartition(".")
     if leaf not in _CHECKPOINT_MODULES:
         return (name,)
     return tuple(f"{parent}.{source}" if parent else source for source in _CHECKPOINT_MODULES[leaf])
 
 
-def _format_keys(keys: List[str], limit: int = 10) -> str:
-    shown = ", ".join(keys[:limit])
-    return f"{len(keys)} [{shown}{', ...' if len(keys) > limit else ''}]"
+def _mode_block_list(
+    arch: Flux3TransformerConfig, config: DiffusionModelConfig, stack: str, layer_idx: Iterator[int]
+) -> nn.ModuleList:
+    """``arch.num_layers`` per-mode blocks named ``{stack}.{i}``, numbered from ``layer_idx``."""
+    return nn.ModuleList(
+        [
+            Flux3ModeTransformerBlock(arch, config, f"{stack}.{i}", next(layer_idx))
+            for i in range(arch.num_layers)
+        ]
+    )
+
+
+def format_names(names: List[str], limit: int = 10) -> str:
+    """``3 [a, b, c]``: the count and at most ``limit`` of ``names``."""
+    return f"{len(names)} [{', '.join(names[:limit])}{', ...' if len(names) > limit else ''}]"
 
 
 class Flux3Transformer2DModel(BaseDiffusionModel):
@@ -577,7 +782,8 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         quant_config = model_config.quant_config
         if model_config.dynamic_weight_quant and quant_config.quant_algo is not None:
             excluded = list(quant_config.exclude_modules or [])
-            excluded += [name for name in LOAD_TIME_QUANT_EXCLUDED_MODULES if name not in excluded]
+            defaults = load_time_quant_excluded_modules(arch, quant_config.quant_algo)
+            excluded += [name for name in defaults if name not in excluded]
             model_config.quant_config = quant_config.model_copy(
                 update={"exclude_modules": excluded}
             )
@@ -589,7 +795,7 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         self.content_channels = {IMAGE: arch.in_channels, IMAGE_COND: arch.cond_in_channels}
         self.context_in_dim = arch.joint_attention_dim
 
-        self.pos_embed = Flux3PosEmbed(arch.rope_theta, arch.axes_dims_rope)
+        self.pos_embed = FluxPosEmbed(theta=arch.rope_theta, axes_dim=list(arch.axes_dims_rope))
         self.timestep_embedder = Flux3TimestepEmbedder(
             arch.timestep_channels, hidden_size, model_config
         )
@@ -598,50 +804,28 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
             if arch.flow_map
             else None
         )
-        self.early_stream_modulations = nn.ModuleDict(
-            {
-                _modulation_key(name): Flux3Modulation(hidden_size, model_config)
-                for name in (*CONTENT_MODALITIES, TEXT)
-            }
-        )
-        self.single_stream_modulations = nn.ModuleDict(
-            {
-                _modulation_key(name): Flux3Modulation(hidden_size, model_config)
-                for name in (*CONTENT_MODALITIES, TEXT)
-            }
-        )
-        self.x_embedders = nn.ModuleDict(
-            {
-                name: Linear(channels, hidden_size, **_linear_kwargs(model_config))
-                for name, channels in self.content_channels.items()
-            }
+        self.image_early_modulation = Flux3Modulation(hidden_size, model_config)
+        self.image_cond_early_modulation = Flux3Modulation(hidden_size, model_config)
+        self.txt_early_modulation = Flux3Modulation(hidden_size, model_config)
+        self.image_single_modulation = Flux3Modulation(hidden_size, model_config)
+        self.image_cond_single_modulation = Flux3Modulation(hidden_size, model_config)
+        self.txt_single_modulation = Flux3Modulation(hidden_size, model_config)
+        self.image_embedder = Linear(arch.in_channels, hidden_size, **_linear_kwargs(model_config))
+        self.image_cond_embedder = Linear(
+            arch.cond_in_channels, hidden_size, **_linear_kwargs(model_config)
         )
         self.context_embedder = Linear(
             arch.joint_attention_dim, hidden_size, **_linear_kwargs(model_config)
         )
         # Layer indices are unique across all block stacks, in module order.
         layer_idx = itertools.count()
-        self.mode_blocks = nn.ModuleDict(
-            {
-                name: nn.ModuleList(
-                    [
-                        Flux3ModeTransformerBlock(
-                            arch, model_config, f"mode_blocks.{name}.{i}", next(layer_idx)
-                        )
-                        for i in range(arch.num_layers)
-                    ]
-                )
-                for name in CONTENT_MODALITIES
-            }
+        self.image_mode_blocks = _mode_block_list(
+            arch, model_config, _MODE_BLOCKS[IMAGE], layer_idx
         )
-        self.txt_mode_blocks = nn.ModuleList(
-            [
-                Flux3ModeTransformerBlock(
-                    arch, model_config, f"txt_mode_blocks.{i}", next(layer_idx)
-                )
-                for i in range(arch.num_layers)
-            ]
+        self.image_cond_mode_blocks = _mode_block_list(
+            arch, model_config, _MODE_BLOCKS[IMAGE_COND], layer_idx
         )
+        self.txt_mode_blocks = _mode_block_list(arch, model_config, _MODE_BLOCKS[TEXT], layer_idx)
         self.single_transformer_blocks = nn.ModuleList(
             [
                 Flux3SingleTransformerBlock(
@@ -683,7 +867,7 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
                 module.quant_config = no_quant_config
 
     def checkpoint_quantization(self) -> Dict[str, bool]:
-        """Whether each Linear's Diffusers checkpoint module holds quantized weights."""
+        """Whether each checkpoint Linear named by ``_checkpoint_module_names`` is quantized."""
         quantized = {}
         for name, module in self.named_modules():
             if isinstance(module, Linear):
@@ -699,15 +883,19 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         super().register_cuda_graph_extra_key_fns(runner)
         runner.register_extra_key_fn("flux3_layout", lambda *args, **kwargs: kwargs.get("layout"))
 
-    def _mode_blocks(self, name: str) -> nn.ModuleList:
-        return self.txt_mode_blocks if name == TEXT else self.mode_blocks[name]
-
-    def _check_inputs(self, inputs: dict, layout: Layout) -> None:
-        """Validate the packed layout and every input tensor this call reads."""
+    def _check_inputs(self, inputs: dict, layout: Layout, timestep: Optional[Tensor]) -> None:
+        """Validate the packed layout, ``timestep`` and every input tensor this call reads."""
         names = tuple(name for name, _ in layout)
         if names != PACKED_MODALITIES:
             raise ValueError(f"FLUX.3 packed layout must list {PACKED_MODALITIES}, got {names}")
         num_samples = len(layout[0][1])
+        if timestep is None:
+            raise ValueError("FLUX.3 transformer inputs need timestep, the image flow time")
+        if tuple(timestep.shape) not in ((), (1,), (num_samples,)):
+            raise ValueError(
+                f"FLUX.3 timestep must be a scalar or have shape ({num_samples},), "
+                f"got {tuple(timestep.shape)}"
+            )
         for name, lengths in layout:
             if len(lengths) != num_samples:
                 raise ValueError(f"FLUX.3 layout lists {num_samples} samples, {name} has {lengths}")
@@ -718,7 +906,6 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
             expected = {}
             if self.flow_map or f"_flux3_{name}_tokens" not in inputs:
                 expected[f"x_{name}"] = (sum(lengths), self.packed_channels[name])
-                expected[f"x_{name}_timesteps"] = (num_samples,)
             if "_flux3_joint_cos" not in inputs:
                 expected[f"x_{name}_ids"] = (sum(lengths), NUM_POSITION_AXES)
             for key, shape in expected.items():
@@ -758,33 +945,41 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         inputs: dict,
         lengths: Tuple[int, ...],
         local_lengths: Tuple[int, ...],
-        freqs: Tuple[Tensor, Tensor],
+        rotary_emb: Tuple[Tensor, Tensor],
         target: Optional[Tensor],
-        timestep: Optional[Tensor],
+        timestep: Tensor,
     ) -> Dict[str, Tensor]:
-        """Embed one modality and run its per-mode blocks; conditioning is one row per sample."""
+        """Embed one modality and run its per-mode blocks; conditioning is one row per sample.
+
+        Image tokens flow at ``timestep``; text and reference tokens sit at timestep 0.
+        """
         rows = [index for index, length in enumerate(lengths) if length]
         row_lengths = [local_lengths[index] for index in rows]
         tokens = inputs[f"x_{name}"]
-        timesteps = _select_rows(inputs[f"x_{name}_timesteps"], rows).to(tokens.dtype)
+        if name == OUTPUT_MODALITY:
+            timesteps = _select_rows(timestep.reshape(-1).expand(len(lengths)), rows)
+        else:
+            timesteps = tokens.new_zeros(len(rows))
         vec = self.timestep_embedder(
-            flux3_timestep_embedding(timesteps, self.timestep_channels, out_dtype=tokens.dtype)
+            flux3_timestep_embedding(
+                timesteps.to(tokens.dtype), self.timestep_channels, out_dtype=tokens.dtype
+            )
         )
         if target is not None:
             vec = vec + _select_rows(target, rows)
-        key = _modulation_key(name)
+        act = F.silu(vec)
         early = tuple(
-            _expand_rows(value, row_lengths) for value in self.early_stream_modulations[key](vec)
+            _expand_rows(value, row_lengths)
+            for value in getattr(self, _EARLY_MODULATIONS[name])(act)
         )
-        embedder = self.context_embedder if name == TEXT else self.x_embedders[name]
+        embedder = getattr(self, _EMBEDDERS[name])
         x = self._shard_packed(embedder(tokens).unsqueeze(0), lengths, 1)
         sample_bounds = bounds(local_lengths)
-        for block in self._mode_blocks(name):
-            x = block(x, freqs, early, sample_bounds=sample_bounds, timestep=timestep)
+        for block in getattr(self, _MODE_BLOCKS[name]):
+            x = block(x, rotary_emb, early, sample_bounds=sample_bounds, timestep=timestep)
         state = {"tokens": x}
-        for field, value in zip(
-            ("shift", "scale", "gate"), self.single_stream_modulations[key](vec)
-        ):
+        single = getattr(self, _SINGLE_MODULATIONS[name])(act)
+        for field, value in zip(("shift", "scale", "gate"), single):
             state["single_" + field] = _expand_rows(value, row_lengths)
         if name == OUTPUT_MODALITY:
             state["vec"] = vec
@@ -805,26 +1000,31 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         return chunks, bounds(tuple(lengths))
 
     def _packed_positions(self, inputs: dict, layout: Layout) -> Dict[str, Tensor]:
-        prepared, positions = {}, {}
+        prepared = {}
         for name, lengths in layout:
             if not any(lengths):
                 continue
-            pe = self.pos_embed(inputs["x_" + name + "_ids"].unsqueeze(0))
-            pe = self._shard_packed(pe, lengths, 2)
-            positions[name] = pe
-            prepared[f"_flux3_{name}_cos"], prepared[f"_flux3_{name}_sin"] = _pe_to_block_freqs(pe)
+            cos, sin = self.pos_embed(inputs["x_" + name + "_ids"])
+            prepared[f"_flux3_{name}_cos"] = self._shard_packed(cos, lengths, 1)
+            prepared[f"_flux3_{name}_sin"] = self._shard_packed(sin, lengths, 1)
         chunks, _ = self._joint_chunks(self._local_layout(layout))
-        pe = torch.cat([positions[name][:, :, start:end] for name, start, end in chunks], dim=2)
-        prepared["_flux3_joint_cos"], prepared["_flux3_joint_sin"] = _pe_to_block_freqs(pe)
+        for field in ("cos", "sin"):
+            prepared[f"_flux3_joint_{field}"] = torch.cat(
+                [prepared[f"_flux3_{name}_{field}"][:, start:end] for name, start, end in chunks],
+                dim=1,
+            )
         return prepared
 
-    def prepare_static_inputs(self, *, layout: Layout, **inputs) -> Dict[str, Tensor]:
+    def prepare_static_inputs(
+        self, *, layout: Layout, timestep: Optional[Tensor] = None, **inputs
+    ) -> Dict[str, Tensor]:
         """Precompute RoPE tables and, without flow map, the step-independent text and reference
-        streams. Pass the result to every forward call of the request.
+        streams, which attend at the first step's normalized ``timestep``. Every forward call of
+        the request takes the result.
         """
         if torch.is_grad_enabled():
             return {}
-        self._check_inputs(inputs, layout)
+        self._check_inputs(inputs, layout, timestep)
         local_lengths = dict(self._local_layout(layout))
         prepared = self._packed_positions(inputs, layout)
         if self.flow_map:
@@ -832,9 +1032,9 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         for name, lengths in layout:
             if name == OUTPUT_MODALITY or not any(lengths):
                 continue
-            freqs = prepared[f"_flux3_{name}_cos"], prepared[f"_flux3_{name}_sin"]
+            rotary_emb = prepared[f"_flux3_{name}_cos"], prepared[f"_flux3_{name}_sin"]
             state = self._mode_stream(
-                name, inputs, lengths, local_lengths[name], freqs, target=None, timestep=None
+                name, inputs, lengths, local_lengths[name], rotary_emb, None, timestep
             )
             prepared.update({f"_flux3_{name}_{field}": state[field] for field in _JOINT_FIELDS})
         return prepared
@@ -843,27 +1043,27 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         self,
         *,
         layout: Layout,
-        target_timesteps: Optional[Tensor] = None,
         timestep: Optional[Tensor] = None,
+        target_timestep: Optional[Tensor] = None,
         **inputs,
     ) -> Dict[str, Tensor]:
         """Image velocity ``{"x_image": [image tokens, in_channels]}`` from ``pack(...).kwargs()``.
 
-        ``target_timesteps`` [num_samples] is for flow map only; ``timestep`` reaches the attention.
+        Image flow time ``timestep``: scalar or [num_samples]; ``target_timestep``: flow map only.
         """
-        self._check_inputs(inputs, layout)
-        if (target_timesteps is not None) != self.flow_map:
-            raise ValueError("target_timesteps is required by, and only by, a flow-map FLUX.3 DiT")
+        self._check_inputs(inputs, layout, timestep)
+        if (target_timestep is not None) != self.flow_map:
+            raise ValueError("target_timestep is required by, and only by, a flow-map FLUX.3 DiT")
         output_tokens = inputs[f"x_{OUTPUT_MODALITY}"]
         target = None
-        if target_timesteps is not None:
+        if target_timestep is not None:
             num_samples = len(layout[0][1])
-            if target_timesteps.shape != (num_samples,):
-                raise ValueError(f"target_timesteps must have shape ({num_samples},)")
-            target_timesteps = target_timesteps.to(output_tokens)
+            if target_timestep.shape != (num_samples,):
+                raise ValueError(f"target_timestep must have shape ({num_samples},)")
+            target_timestep = target_timestep.to(output_tokens)
             target = self.target_timestep_embedder(
                 flux3_timestep_embedding(
-                    target_timesteps, self.timestep_channels, out_dtype=output_tokens.dtype
+                    target_timestep, self.timestep_channels, out_dtype=output_tokens.dtype
                 )
             )
         local_layout = self._local_layout(layout)
@@ -879,8 +1079,6 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
             if not self.flow_map and prefix + "tokens" in inputs:
                 streams[name] = {field: inputs[prefix + field] for field in _JOINT_FIELDS}
                 continue
-            # Without flow map, text and reference streams do not depend on the step, as cached.
-            step_dependent = self.flow_map or name == OUTPUT_MODALITY
             streams[name] = self._mode_stream(
                 name,
                 inputs,
@@ -888,7 +1086,7 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
                 local_lengths[name],
                 (prepared[prefix + "cos"], prepared[prefix + "sin"]),
                 target=target,
-                timestep=timestep if step_dependent else None,
+                timestep=timestep,
             )
 
         chunks, sample_bounds = self._joint_chunks(local_layout)
@@ -900,9 +1098,11 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
 
         combined = joint("tokens")
         mod = tuple(joint("single_" + field) for field in ("shift", "scale", "gate"))
-        freqs = prepared["_flux3_joint_cos"], prepared["_flux3_joint_sin"]
+        rotary_emb = prepared["_flux3_joint_cos"], prepared["_flux3_joint_sin"]
         for block in self.single_transformer_blocks:
-            combined = block(combined, freqs, mod, sample_bounds=sample_bounds, timestep=timestep)
+            combined = block(
+                combined, rotary_emb, mod, sample_bounds=sample_bounds, timestep=timestep
+            )
 
         vec = streams[OUTPUT_MODALITY]["vec"]
         parts, offset = [], 0
@@ -921,10 +1121,11 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
     def load_weights(self, weights: Dict[str, Tensor]) -> None:
         """Load a Diffusers-format FLUX.3 transformer state dict.
 
-        Raises ValueError, naming the tensors, if the checkpoint misses or adds any tensor.
+        Raises ValueError, naming the checkpoint tensors, if it misses or adds any tensor.
         """
         weights = {
-            key.replace(".ff.linear_out.", ".ff.down_proj."): v for key, v in weights.items()
+            diffusers_to_module_name(key).replace(".ff.linear_out.", ".ff.down_proj."): v
+            for key, v in weights.items()
         }
         weights = _split_linear_in_weights(weights)
         loader = DynamicLinearWeightLoader(self.model_config, params_map=_PARAMS_MAP)
@@ -959,7 +1160,7 @@ class Flux3Transformer2DModel(BaseDiffusionModel):
         if missing or unexpected:
             raise ValueError(
                 "FLUX.3 checkpoint does not match the transformer: "
-                f"missing {_format_keys(missing)}, unexpected {_format_keys(unexpected)}"
+                f"missing {format_names(missing)}, unexpected {format_names(unexpected)}"
             )
         for name, module, weight_dicts in linear_loads:
             loader.load_linear_weights(module, name, weight_dicts)

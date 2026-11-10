@@ -9,7 +9,7 @@ import pytest
 import torch
 from flux3_test_utils import KLEIN_BASE_CONFIG, KLEIN_CONFIG, diffusers_shapes, tiny_config
 
-from tensorrt_llm._torch.visual_gen.models.flux3.bfl_keys import (
+from tensorrt_llm._torch.visual_gen.models.flux3.transformer_flux3 import (
     bfl_to_diffusers_key,
     bfl_to_diffusers_module,
     bfl_to_diffusers_state_dict,

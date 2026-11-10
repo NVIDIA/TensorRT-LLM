@@ -507,7 +507,8 @@ class TestCacheDiTEnablerRegistry:
         )
         from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY
 
-        unknown = sorted(set(CUSTOM_CACHE_DIT_ENABLERS) - set(PIPELINE_REGISTRY))
+        class_names = {entry.pipeline_cls.__name__ for entry in PIPELINE_REGISTRY.values()}
+        unknown = sorted(set(CUSTOM_CACHE_DIT_ENABLERS) - class_names)
         assert not unknown, (
             f"CUSTOM_CACHE_DIT_ENABLERS keys not in the pipeline registry: {unknown}"
         )

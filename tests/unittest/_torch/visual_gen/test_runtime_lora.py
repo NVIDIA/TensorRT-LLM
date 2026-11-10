@@ -69,6 +69,19 @@ class TinyMiniMaxH3Transformer(nn.Module):
         self.norm_out.linear = nn.Linear(2, 3, bias=False)
 
 
+class TinyFlux2Transformer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        block = nn.Module()
+        block.ff = nn.Module()
+        block.ff.gate_up_proj = nn.Linear(2, 3, bias=False)
+        block.ff.down_proj = nn.Linear(2, 3, bias=False)
+        self.transformer_blocks = nn.ModuleList([block])
+        self.single_transformer_blocks = nn.ModuleList([TinyAttention()])
+        self.norm_out = nn.Module()
+        self.norm_out.linear = nn.Linear(2, 3, bias=False)
+
+
 def _add_rank_one_lora_pair(
     tensors: dict[str, torch.Tensor],
     name: str,
@@ -310,6 +323,24 @@ def test_runtime_lora_does_not_map_minimax_aliases_for_other_transformers(
         },
         str(lora_path),
     )
+
+    with pytest.raises(ValueError, match="Runtime LoRA skipped 3 adapter target"):
+        apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
+
+
+def test_runtime_lora_does_not_map_flux3_aliases_for_other_transformers(
+    tmp_path: Path,
+) -> None:
+    model = TinyFlux2Transformer()
+    lora_path = tmp_path / "adapter.safetensors"
+    tensors: dict[str, torch.Tensor] = {}
+    for name in (
+        "transformer_blocks.0.ff.linear_in",
+        "transformer_blocks.0.ff.linear_out",
+        "diffusion_model.final_layer.image.adaLN_modulation.1",
+    ):
+        _add_rank_one_lora_pair(tensors, name)
+    save_file(tensors, str(lora_path))
 
     with pytest.raises(ValueError, match="Runtime LoRA skipped 3 adapter target"):
         apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))

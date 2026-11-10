@@ -3,8 +3,7 @@
 
 """FLUX.3 Klein pipelines for text-to-image and reference-image generation.
 
-Sampling follows the Diffusers FLUX.3 modular pipelines: Klein Base uses classifier-free guidance,
-Klein is a step-distilled flow map sampled without it.
+Klein Base samples with classifier-free guidance; Klein is a step-distilled flow map without it.
 """
 
 import dataclasses
@@ -24,17 +23,34 @@ from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux
 from diffusers.utils.torch_utils import randn_tensor
 from PIL import ImageOps
 from torch import Tensor
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
+from tensorrt_llm._torch.visual_gen.attention.backends.sparse.sol.predictor import (
+    BLOCK_SIZE as SOL_BLOCK_SIZE,
+)
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
-from tensorrt_llm._torch.visual_gen.utils import make_noise_generator
+from tensorrt_llm._torch.visual_gen.utils import classify_worker_error, make_noise_generator
 from tensorrt_llm.logger import logger
-from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .packed import pack
-from .text_encoder import TEXT_MAX_TOKENS, TEXT_PAD_MULTIPLE, Flux3TextEncoder
-from .transformer_flux3 import IMAGE, IMAGE_COND, IMAGE_ROPE_SCALE, TEXT, Flux3Transformer2DModel
+from .text_encoder import (
+    HIDDEN_STATE_LAYERS,
+    PADDING_POSITION_ID,
+    TEXT_MAX_TOKENS,
+    TEXT_PAD_MULTIPLE,
+    padded_text_length,
+    trim_for_text,
+)
+from .transformer_flux3 import (
+    IMAGE,
+    IMAGE_COND,
+    IMAGE_ROPE_SCALE,
+    LOAD_TIME_QUANT_ALGOS,
+    TEXT,
+    Flux3Transformer2DModel,
+)
 from .variants import check_variant, load_variant_weights, resolve_variant_quantization_config
 
 # Constant timestep shift of the FLUX.3 sampling recipe.
@@ -68,20 +84,11 @@ _COND, _UNCOND = "conditional", "unconditional"
 ReferenceInput = Union[PIL.Image.Image, bytes]
 
 
-class Flux3RequestError(ValueError):
-    """A request FLUX.3 rejects because of its own content; served as a client error."""
-
-
-class UnsupportedNumImagesError(Flux3RequestError):
-    """A request for other than one image per prompt."""
-
-
 @dataclasses.dataclass(frozen=True, eq=False)
 class Flux3References:
     """Preprocessed reference images, each [1, 3, H, W] in [-1, 1], and the output crop box.
 
-    ``crop`` (left, top, right, bottom) crops the decoded image back to a single padded reference
-    when the output size was taken from it; otherwise it is None.
+    ``crop`` (left, top, right, bottom) crops the output back to a single padded reference, or None.
     """
 
     images: Tuple[Tensor, ...]
@@ -109,7 +116,7 @@ def load_reference_images(
     decoded = []
     for index, item in enumerate(items):
         if not isinstance(item, (bytes, PIL.Image.Image)):
-            raise Flux3RequestError(
+            raise ValueError(
                 "FLUX.3 reference images must be PIL images or encoded bytes; "
                 f"item {index} is {type(item).__name__}."
             )
@@ -117,9 +124,7 @@ def load_reference_images(
             image = PIL.Image.open(BytesIO(item)) if isinstance(item, bytes) else item
             decoded.append(ImageOps.exif_transpose(image).convert("RGB"))
         except (OSError, PIL.Image.DecompressionBombError) as exc:
-            raise Flux3RequestError(
-                f"Unable to decode FLUX.3 reference image {index}: {exc}"
-            ) from exc
+            raise ValueError(f"Unable to decode FLUX.3 reference image {index}: {exc}") from exc
     return decoded
 
 
@@ -173,7 +178,7 @@ def _crop_multi_reference(image: PIL.Image.Image) -> PIL.Image.Image:
     crop_width = width // PATCH_SIZE * PATCH_SIZE
     crop_height = height // PATCH_SIZE * PATCH_SIZE
     if not crop_width or not crop_height:
-        raise Flux3RequestError(
+        raise ValueError(
             f"Each reference of a FLUX.3 multi-reference edit needs sides of at least "
             f"{PATCH_SIZE} pixels, got {width} x {height}."
         )
@@ -188,15 +193,13 @@ def _image_to_tensor(image: PIL.Image.Image) -> Tensor:
 
 
 def preprocess_references(images: Sequence[PIL.Image.Image]) -> Flux3References:
-    """Prepare decoded references with the Diffusers and BFL rules.
-
-    One reference is fitted so that its 16-pixel canvas is at most 4 MP (sides 64-4096) and
-    reflect-padded to it; several are each fitted under 1 MP and center-cropped to the grid.
+    """Fit one reference to a 16-pixel canvas of at most 4 MP (sides 64-4096) and reflect-pad it,
+    or fit each of several under 1 MP and center-crop it to the grid, as Diffusers and BFL do.
     """
     if not images:
-        raise Flux3RequestError("FLUX.3 image-to-image needs at least one reference image.")
+        raise ValueError("FLUX.3 image-to-image needs at least one reference image.")
     if len(images) > MAX_REFERENCES:
-        raise Flux3RequestError(
+        raise ValueError(
             f"FLUX.3 accepts at most {MAX_REFERENCES} reference images, got {len(images)}."
         )
     if len(images) == 1:
@@ -225,7 +228,7 @@ def set_flux3_timesteps(
     return scheduler.timesteps
 
 
-def _image_ids(height: int, width: int, device: torch.device, l_coord: int = 0) -> Tensor:
+def _prepare_image_ids(height: int, width: int, device: torch.device, l_coord: int = 0) -> Tensor:
     """(t, h, w, l) ids [height * width, 4] of a token grid, h and w scaled for RoPE."""
     ids = torch.cartesian_prod(
         torch.arange(1), torch.arange(height), torch.arange(width), torch.tensor([l_coord])
@@ -234,21 +237,21 @@ def _image_ids(height: int, width: int, device: torch.device, l_coord: int = 0) 
     return ids.to(device)
 
 
-def _text_ids(length: int, device: torch.device) -> Tensor:
+def _prepare_text_ids(length: int, device: torch.device) -> Tensor:
     """(t, h, w, l) ids [length, 4] of text tokens, which advance along l."""
     ids = torch.zeros(length, 4, device=device)
     ids[:, 3] = torch.arange(length, device=device)
     return ids
 
 
-def _patchify(latents: Tensor) -> Tensor:
+def _patchify_latents(latents: Tensor) -> Tensor:
     """VAE latents [B, C, H, W] to packed latents [B, 4C, H / 2, W / 2]."""
     batch, channels, height, width = latents.shape
     latents = latents.view(batch, channels, height // 2, 2, width // 2, 2)
     return latents.permute(0, 1, 3, 5, 2, 4).reshape(batch, channels * 4, height // 2, width // 2)
 
 
-def _unpatchify(latents: Tensor) -> Tensor:
+def _unpatchify_latents(latents: Tensor) -> Tensor:
     """Packed latents [B, 4C, H, W] to VAE latents [B, C, 2H, 2W]."""
     batch, channels, height, width = latents.shape
     latents = latents.reshape(batch, channels // 4, 2, 2, height, width)
@@ -258,7 +261,7 @@ def _unpatchify(latents: Tensor) -> Tensor:
 def _transformer_inputs(inputs: Dict[str, Any], prepared: Dict[str, Tensor]) -> Dict[str, Any]:
     """The packed inputs and prepared tensors the transformer forward reads.
 
-    A prepared stream replaces its modality's raw tokens, timesteps and RoPE tables.
+    A prepared stream replaces its modality's raw tokens and RoPE tables.
     """
     call = {"layout": inputs["layout"], **prepared}
     for name, lengths in inputs["layout"]:
@@ -268,7 +271,6 @@ def _transformer_inputs(inputs: Dict[str, Any], prepared: Dict[str, Tensor]) -> 
             del call[f"_flux3_{name}_cos"], call[f"_flux3_{name}_sin"]
         else:
             call[f"x_{name}"] = inputs[f"x_{name}"]
-            call[f"x_{name}_timesteps"] = inputs[f"x_{name}_timesteps"]
     return call
 
 
@@ -280,19 +282,6 @@ def _read_manifest(checkpoint_dir: str) -> Dict[str, Any]:
             with open(path) as f:
                 return json.load(f)
     return {}
-
-
-def _manifest_subfolder(checkpoint_dir: str, component: str, default: str) -> str:
-    """Subfolder that the manifest names for ``component``, else ``default``."""
-    entry = _read_manifest(checkpoint_dir).get(component)
-    spec = entry[2] if isinstance(entry, list) and len(entry) > 2 else None
-    return (spec.get("subfolder") if isinstance(spec, dict) else None) or default
-
-
-def _format_choices(values: Sequence[int]) -> str:
-    """``1, 2, 4 or 8`` for (1, 2, 4, 8)."""
-    words = [str(value) for value in values]
-    return words[0] if len(words) == 1 else f"{', '.join(words[:-1])} or {words[-1]}"
 
 
 # =============================================================================
@@ -319,6 +308,7 @@ class Flux3Pipeline(BasePipeline):
     def __init__(self, pipeline_config):
         self._check_pipeline_config(pipeline_config)
         super().__init__(pipeline_config)
+        self.processor: Optional[Any] = None
         self._warmup_reference_keys: Set[tuple] = set()
 
     @classmethod
@@ -384,40 +374,54 @@ class Flux3Pipeline(BasePipeline):
             raise ValueError(
                 "FLUX.3 does not support CPU offloading; set cpu_offload_config.enable to false."
             )
-        if config.parallel.parallel_vae_size > 1:
+        cache = config.cache
+        if cache is not None and cache.cache_backend != "cache_dit":
             raise ValueError(
-                "FLUX.3 does not support parallel VAE; set parallel_config.parallel_vae_size to 1."
+                f"FLUX.3 has no {cache.cache_backend} coefficients; set "
+                "cache_config.cache_backend to cache_dit or remove cache_config."
             )
-        if config.cache is not None:
+        if cache is not None and cache.enable_separate_cfg:
             raise ValueError(
-                f"FLUX.3 does not support {config.cache.cache_backend} yet; remove cache_config."
+                "FLUX.3 runs all CFG samples in one transformer call per step; "
+                "leave cache_config.enable_separate_cfg unset."
             )
-        if config.attention.sparse_attention_config is not None:
+        if cache is not None and config.cuda_graph.enable:
+            # Capture would freeze one per-step cache decision into every replay.
             raise ValueError(
-                "FLUX.3 does not support sparse attention yet; "
-                "remove attention_config.sparse_attention_config."
+                "FLUX.3 Cache-DiT decides on the host each step, which CUDA graph replay "
+                "skips; set cuda_graph_config.enable to false or remove cache_config."
+            )
+        sparse = config.attention.sparse_attention_config
+        if sparse is not None and sparse.algorithm == "vsa":
+            raise ValueError(
+                "Video Sparse Attention (sparse_attention_config.algorithm='vsa') is "
+                "only supported by the Wan 2.1 T2V 14B (720P) pipeline. Remove "
+                "sparse_attention_config for FLUX.3."
             )
         quant_algo = config.quant_config.quant_algo
-        if check_variant(config.extra_attrs.get("variant")) is None and not (
-            quant_algo is None
-            or (quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN and config.dynamic_weight_quant)
+        if config.dynamic_weight_quant and quant_algo not in (None, *LOAD_TIME_QUANT_ALGOS):
+            raise ValueError(
+                "FLUX.3 quantizes BF16 weights on load with quant_config.quant_algo "
+                f"{', '.join(LOAD_TIME_QUANT_ALGOS)}, got {quant_algo}."
+            )
+        if (
+            config.attention.quant_attention_config is not None
+            and config.attention.backend == "TRTLLM"
+            and config.torch_compile.enable
+            and config.cuda_graph.enable
         ):
-            mode = "" if config.dynamic_weight_quant else "static "
             raise ValueError(
-                "FLUX.3 quantizes BF16 weights on load only with quant_config.quant_algo "
-                f"FP8_PER_CHANNEL_PER_TOKEN, got {mode}{quant_algo}; for pre-quantized NVFP4 or FP8 "
-                "rowwise weights, set pipeline_config.variant to 'nvfp4' or 'fp8r'."
-            )
-        if config.attention.quant_attention_config is not None:
-            raise ValueError(
-                "FLUX.3 does not support quantized attention yet; "
-                "remove attention_config.quant_attention_config."
-            )
-        if config.runtime_lora is not None:
-            raise ValueError(
-                "FLUX.3 does not support runtime LoRA yet; remove runtime_lora_config."
+                "FLUX.3 quantized TRTLLM attention does not support torch_compile_config together "
+                "with cuda_graph_config: compiled PrimTS cache-free attention is not planned "
+                "before CUDA graph capture. Disable torch_compile_config.enable or "
+                "cuda_graph_config.enable."
             )
         vgm = config.visual_gen_mapping
+        if config.runtime_lora is not None and vgm is not None and vgm.tp_size > 1:
+            raise ValueError(
+                "FLUX.3 runtime LoRA does not support tensor parallelism; set "
+                "parallel_config.tp_size to 1 or remove runtime_lora_config."
+            )
         if flow_map and vgm is not None and vgm.cfg_size > 1:
             raise ValueError(
                 "FLUX.3 Klein samples without classifier-free guidance, so CFG parallelism "
@@ -433,11 +437,12 @@ class Flux3Pipeline(BasePipeline):
         # Ulysses splits attention heads, and every padded prompt window, across its ranks.
         max_size = math.gcd(TEXT_TOKEN_MULTIPLE, num_heads)
         if max_size % seq_size:
-            sizes = [size for size in range(1, max_size + 1) if max_size % size == 0]
+            sizes = [str(size) for size in range(1, max_size + 1) if max_size % size == 0]
+            choices = sizes[0] if len(sizes) == 1 else f"{', '.join(sizes[:-1])} or {sizes[-1]}"
             raise ValueError(
                 f"FLUX.3 Ulysses splits {num_heads} attention heads and prompts padded to "
                 f"multiples of {TEXT_PAD_MULTIPLE} tokens (at most {TEXT_MAX_TOKENS}) across "
-                f"ranks, so ulysses_size must be {_format_choices(sizes)}; got {seq_size}."
+                f"ranks, so ulysses_size must be {choices}; got {seq_size}."
             )
 
     # -------------------------------------------------------------------------
@@ -468,20 +473,18 @@ class Flux3Pipeline(BasePipeline):
         device: torch.device,
         skip_components: Optional[list] = None,
     ) -> None:
-        """Load the Qwen3-VL text encoder, the FP32 VAE and the scheduler."""
+        """Load the Qwen3-VL text encoder and its processor, the FP32 VAE and the scheduler."""
         skip_components = skip_components or []
         if PipelineComponent.TEXT_ENCODER not in skip_components:
             logger.info("Loading FLUX.3 text encoder...")
-            text_encoder = PipelineComponent.TEXT_ENCODER.value
-            processor_dir = _manifest_subfolder(
-                checkpoint_dir, PipelineComponent.TOKENIZER.value, text_encoder
+            text_encoder_dir = os.path.join(checkpoint_dir, PipelineComponent.TEXT_ENCODER.value)
+            text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+                text_encoder_dir, dtype=self.dtype
             )
-            self.text_encoder = Flux3TextEncoder.from_pretrained(
-                os.path.join(checkpoint_dir, text_encoder),
-                os.path.join(checkpoint_dir, processor_dir),
-                dtype=self.dtype,
-                device=device,
-            )
+            # Trimmed on the host, so the dropped layers and vision tower never reach the GPU.
+            trim_for_text(text_encoder, max(HIDDEN_STATE_LAYERS))
+            self.processor = AutoProcessor.from_pretrained(text_encoder_dir)
+            self.text_encoder = text_encoder.to(device).eval()
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading FLUX.3 VAE...")
             self.vae = (
@@ -492,11 +495,8 @@ class Flux3Pipeline(BasePipeline):
                 .to(device)
                 .eval()
             )
-        self.scheduler = flux3_scheduler()
-
-    def torch_compile_options(self) -> Optional[Dict[str, Any]]:
-        # Keep the BF16 rounding of intermediates that eager execution has.
-        return {"emulate_precision_casts": True}
+        if PipelineComponent.SCHEDULER not in skip_components:
+            self.scheduler = flux3_scheduler()
 
     # -------------------------------------------------------------------------
     # Request contract
@@ -535,11 +535,8 @@ class Flux3Pipeline(BasePipeline):
         return (PATCH_SIZE, PATCH_SIZE)
 
     def validate_resolution(self, height: int, width: int, num_frames: int = 1) -> None:
-        try:
-            super().validate_resolution(height, width, num_frames)
-        except ValueError as exc:
-            raise Flux3RequestError(str(exc)) from exc
-        self._check_sequence_parallel({"target": (height // PATCH_SIZE) * (width // PATCH_SIZE)})
+        super().validate_resolution(height, width, num_frames)
+        self._check_token_counts({"target": (height // PATCH_SIZE) * (width // PATCH_SIZE)})
 
     def warmup_cache_key(self, height: int, width: int, num_frames: int = 1) -> tuple:
         return (height, width)
@@ -555,12 +552,12 @@ class Flux3Pipeline(BasePipeline):
         return self._reference_cache_key(req.params.height, req.params.width, references)
 
     def classify_request_failure(self, exc: BaseException) -> Optional[str]:
-        return "client" if isinstance(exc, Flux3RequestError) else None
+        return classify_worker_error(exc)
 
     @staticmethod
     def _check_num_images(num_images_per_prompt: int) -> None:
         if num_images_per_prompt != 1:
-            raise UnsupportedNumImagesError(
+            raise ValueError(
                 "FLUX.3 generates one image per request; num_images_per_prompt must be 1, "
                 f"got {num_images_per_prompt}."
             )
@@ -581,9 +578,7 @@ class Flux3Pipeline(BasePipeline):
         self._check_num_images(params.num_images_per_prompt)
         prompts = [req.prompt] if isinstance(req.prompt, str) else list(req.prompt)
         if len(prompts) != 1:
-            raise Flux3RequestError(
-                f"FLUX.3 generates from one prompt per request, got {len(prompts)}."
-            )
+            raise ValueError(f"FLUX.3 generates from one prompt per request, got {len(prompts)}.")
         image = req.prepared_inputs.get("references")
         if image is None and params.image_reference:
             image = [ref.content for ref in params.image_reference]
@@ -630,7 +625,7 @@ class Flux3Pipeline(BasePipeline):
     def _warmup_prompt(self, window: int) -> str:
         """The shortest prompt of repeated "warmup" words whose text window is ``window``."""
         words = ["warmup"]
-        while self.text_encoder.tokenize(" ".join(words))[0].shape[1] < window:
+        while self._tokenize(" ".join(words))[0].shape[1] < window:
             words.append("warmup")
         return " ".join(words)
 
@@ -646,8 +641,7 @@ class Flux3Pipeline(BasePipeline):
     ) -> Tuple[Optional[Flux3References], int, int]:
         """References and output size; an omitted side takes the first reference's, else 1024.
 
-        A given side drops the crop-back of a single padded reference, as in Diffusers.
-        Flux3References from :meth:`prepare_request` already carry their final crop box.
+        A given side drops a single padded reference's crop-back; prepared references keep theirs.
         """
         if image is None:
             return None, height or DEFAULT_SIZE, width or DEFAULT_SIZE
@@ -665,15 +659,23 @@ class Flux3Pipeline(BasePipeline):
         vgm = self.pipeline_config.visual_gen_mapping
         return vgm.seq_size if vgm is not None else 1
 
-    def _check_sequence_parallel(self, token_counts: Dict[str, int]) -> None:
-        """Reject token counts that the sequence-parallel size does not divide."""
+    def _check_token_counts(self, token_counts: Dict[str, int]) -> None:
+        """Reject token counts that sequence parallelism or SOL-Attn cannot split."""
         size = self._sequence_parallel_size
+        sparse = self.pipeline_config.attention.sparse_attention_config
+        sol = sparse is not None and sparse.algorithm == "sol_attn"
         for modality, count in token_counts.items():
             if count % size:
-                raise Flux3RequestError(
+                raise ValueError(
                     f"FLUX.3 sequence parallelism splits each sample's {modality} tokens across "
                     f"{size} ranks, but this request has {count} {modality} tokens; an image "
                     f"token covers {PATCH_SIZE} x {PATCH_SIZE} pixels."
+                )
+            if sol and count <= SOL_BLOCK_SIZE:
+                raise ValueError(
+                    f"FLUX.3 SOL-Attn needs more than {SOL_BLOCK_SIZE} {modality} tokens, "
+                    f"but this request has {count}; an image token covers "
+                    f"{PATCH_SIZE} x {PATCH_SIZE} pixels."
                 )
 
     def _resolve_guidance(
@@ -681,11 +683,11 @@ class Flux3Pipeline(BasePipeline):
     ) -> float:
         if self.flow_map:
             if guidance_scale not in (None, 1.0):
-                raise Flux3RequestError(
+                raise ValueError(
                     "FLUX.3 Klein samples without classifier-free guidance; omit guidance_scale."
                 )
             if negative_prompt:
-                raise Flux3RequestError(
+                raise ValueError(
                     "FLUX.3 Klein samples without classifier-free guidance and takes no "
                     "negative prompt."
                 )
@@ -718,37 +720,34 @@ class Flux3Pipeline(BasePipeline):
         seed: int,
         image: Union[None, Flux3References, ReferenceInput, Sequence[ReferenceInput]] = None,
     ) -> PipelineOutput:
-        """Generate one image; with reference ``image`` inputs, an image-to-image edit.
+        """Generate one image; with up to 10 reference ``image`` inputs, an image-to-image edit.
 
-        ``image`` takes up to 10 PIL images or encoded images, or references from prepare_request.
         Returns a PipelineOutput whose image is uint8 [1, H, W, 3] on the decoding rank.
         """
         timer = CudaPhaseTimer()
         timer.mark_pre_start()
         start = time.time()
         if not isinstance(prompt, str):
-            raise Flux3RequestError("FLUX.3 takes one prompt string per request.")
+            raise ValueError("FLUX.3 takes one prompt string per request.")
         if num_inference_steps is None:
             num_inference_steps = self.default_num_inference_steps
         if num_inference_steps < 1:
-            raise Flux3RequestError(
-                f"num_inference_steps must be positive, got {num_inference_steps}."
-            )
+            raise ValueError(f"num_inference_steps must be positive, got {num_inference_steps}.")
         guidance_scale = self._resolve_guidance(guidance_scale, negative_prompt)
 
         # Size and token checks come before any encoder runs.
         references, height, width = self._prepare_references(image, height, width)
         self.validate_resolution(height, width, 1)
         if references is not None:
-            self._check_sequence_parallel({"reference": references.num_tokens})
+            self._check_token_counts({"reference": references.num_tokens})
         samples, cfg_parallel = self._cfg_samples(guidance_scale)
         prompts = {_COND: prompt, _UNCOND: negative_prompt or ""}
-        tokens = [self.text_encoder.tokenize(prompts[sample]) for sample in samples]
-        self._check_sequence_parallel(
+        tokens = [self._tokenize(prompts[sample]) for sample in samples]
+        self._check_token_counts(
             {f"{sample} text": ids.shape[1] for sample, (ids, _) in zip(samples, tokens)}
         )
 
-        contexts = [self.text_encoder.encode(ids, mask)[0].to(self.dtype) for ids, mask in tokens]
+        contexts = [self._encode_prompt(ids, mask)[0].to(self.dtype) for ids, mask in tokens]
         conditioning = self._encode_references(references) if references is not None else None
         latents, latent_ids = self._prepare_latents(height, width, seed)
 
@@ -774,6 +773,46 @@ class Flux3Pipeline(BasePipeline):
             )
         return timer.fill(PipelineOutput(image=output))
 
+    def _tokenize(self, prompt: str) -> Tuple[Tensor, Tensor]:
+        """Token ids and attention mask, each [1, L], of the chat-templated, right-padded prompt."""
+        text = self.processor.apply_chat_template(
+            [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
+        )
+        tokenizer = self.processor.tokenizer
+        num_tokens = tokenizer(
+            text, return_tensors="pt", truncation=True, max_length=TEXT_MAX_TOKENS
+        )["input_ids"].shape[1]
+        length = padded_text_length(num_tokens)
+        inputs = tokenizer(
+            text,
+            return_tensors="pt",
+            padding="max_length",
+            padding_side="right",
+            truncation=True,
+            max_length=length,
+        )
+        return inputs["input_ids"], inputs["attention_mask"]
+
+    @torch.inference_mode()
+    def _encode_prompt(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
+        """Stacked HIDDEN_STATE_LAYERS hidden states [1, L, layers * hidden], text encoder dtype."""
+        device = self.text_encoder.device
+        input_ids, attention_mask = input_ids.to(device), attention_mask.to(device)
+        position_ids = torch.arange(input_ids.shape[1], device=device)[None].masked_fill(
+            attention_mask == 0, PADDING_POSITION_ID
+        )
+        output = self.text_encoder.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+        stacked = torch.stack([output.hidden_states[k] for k in HIDDEN_STATE_LAYERS], dim=1)
+        stacked = stacked.to(self.text_encoder.dtype)
+        batch, num_layers, length, hidden = stacked.shape
+        return stacked.permute(0, 2, 1, 3).reshape(batch, length, num_layers * hidden)
+
     def _prepare_latents(self, height: int, width: int, seed: int) -> Tuple[Tensor, Tensor]:
         """Initial noise tokens [H/16 * W/16, C] in the compute dtype and their ids."""
         latent_height, latent_width = height // PATCH_SIZE, width // PATCH_SIZE
@@ -788,7 +827,7 @@ class Flux3Pipeline(BasePipeline):
             dtype=torch.float32,
         )
         latents = noise.to(self.dtype).flatten(2).transpose(1, 2)[0].contiguous()
-        return latents, _image_ids(latent_height, latent_width, self.device)
+        return latents, _prepare_image_ids(latent_height, latent_width, self.device)
 
     def _encode_references(self, references: Flux3References) -> Tuple[Tensor, Tensor]:
         """Normalized packed reference tokens [N, C] and ids; references differ on the l axis."""
@@ -800,10 +839,12 @@ class Flux3Pipeline(BasePipeline):
         tokens, ids = [], []
         for index, image in enumerate(references.images):
             latents = vae.encode(image.to(self.device, vae.dtype)).latent_dist.mode()
-            latents = (_patchify(latents) - mean) / std
+            latents = (_patchify_latents(latents) - mean) / std
             latent_height, latent_width = latents.shape[-2:]
             tokens.append(latents.flatten(2).transpose(1, 2)[0])
-            ids.append(_image_ids(latent_height, latent_width, self.device, l_coord=-(1 + index)))
+            ids.append(
+                _prepare_image_ids(latent_height, latent_width, self.device, l_coord=-(1 + index))
+            )
         return torch.cat(tokens).to(self.dtype), torch.cat(ids)
 
     def _denoise(
@@ -821,30 +862,37 @@ class Flux3Pipeline(BasePipeline):
         for context in contexts:
             sample = {
                 IMAGE: (latents, latent_ids),
-                TEXT: (context, _text_ids(context.shape[0], self.device)),
+                TEXT: (context, _prepare_text_ids(context.shape[0], self.device)),
             }
             if conditioning is not None:
                 sample[IMAGE_COND] = conditioning
             samples.append(sample)
+        timesteps = set_flux3_timesteps(self.scheduler, num_inference_steps, self.device)
         inputs = pack(samples, self.transformer.packed_channels).kwargs()
-        call = _transformer_inputs(inputs, self.transformer.prepare_static_inputs(**inputs))
+        prepared = self.transformer.prepare_static_inputs(**inputs, timestep=timesteps[0] / 1000)
+        call = _transformer_inputs(inputs, prepared)
 
         num_samples = len(samples)
-        timesteps = set_flux3_timesteps(self.scheduler, num_inference_steps, self.device)
         targets = None
         if self.flow_map:
             # A flow-map step jumps to the next timestep, and the last one to zero.
             targets = torch.cat([timesteps[1:], timesteps.new_zeros(1)]) / 1000
+        cache_acc = getattr(self, "cache_accelerator", None)
+        if cache_acc is not None and cache_acc.is_enabled():
+            cache_acc.refresh(len(timesteps))
         for step, timestep in self._profile_denoise_steps(timesteps):
+            # The image flow time, also read by attention; larger is noisier.
+            call["timestep"] = timestep / 1000
             call["x_image"] = latents.repeat(num_samples, 1)
-            call["x_image_timesteps"] = (timestep / 1000).repeat(num_samples)
             if targets is not None:
-                call["target_timesteps"] = targets[step].repeat(num_samples)
+                call["target_timestep"] = targets[step].repeat(num_samples)
             prediction = self.transformer(**call)[f"x_{IMAGE}"]
             velocity = self._guide(prediction, num_samples, guidance_scale, cfg_parallel)
-            latents, _, _ = self._scheduler_step(
-                latents, {}, velocity, {}, timestep, self.scheduler, {}
-            )
+            latents = self.scheduler.step(velocity, timestep, latents, return_dict=False)[0]
+        if cache_acc is not None and cache_acc.is_enabled() and self.rank == 0:
+            stats = cache_acc.get_stats()
+            if stats:
+                logger.info(f"Cache-DiT stats: {stats}")
         return latents
 
     def _guide(
@@ -877,7 +925,7 @@ class Flux3Pipeline(BasePipeline):
         std = torch.sqrt(vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps).to(
             latents.device, latents.dtype
         )
-        latents = _unpatchify(latents * std + mean)
+        latents = _unpatchify_latents(latents * std + mean)
         image = vae.decode(latents.to(vae.dtype), return_dict=False)[0]
         if crop is not None:
             left, top, right, bottom = crop

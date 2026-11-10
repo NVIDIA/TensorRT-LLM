@@ -46,11 +46,11 @@ def test_packing_preserves_sample_boundaries() -> None:
             if end > start:
                 torch.testing.assert_close(actual.data[name][start:end], inputs[index][name][0])
                 torch.testing.assert_close(actual.ids[name][start:end], inputs[index][name][1])
-        assert actual.timesteps[name].shape == (2,)
-        assert not actual.timesteps[name].any()
     kwargs = actual.kwargs()
     assert kwargs["layout"] == actual.layout
-    assert kwargs["x_image_cond_timesteps"] is actual.timesteps["image_cond"]
+    names = {f"x_{name}{suffix}" for name in CHANNELS for suffix in ("", "_ids")}
+    assert kwargs.keys() == {"layout", *names}
+    assert kwargs["x_image_cond_ids"] is actual.ids["image_cond"]
 
 
 def test_absent_modality_is_empty_with_input_dtypes() -> None:
@@ -60,7 +60,6 @@ def test_absent_modality_is_empty_with_input_dtypes() -> None:
     assert packed.data["image_cond"].dtype == torch.bfloat16
     assert packed.ids["image_cond"].shape == (0, 4)
     assert packed.ids["image_cond"].dtype == torch.float32
-    assert packed.timesteps["image"].dtype == torch.bfloat16
 
 
 @pytest.mark.parametrize(

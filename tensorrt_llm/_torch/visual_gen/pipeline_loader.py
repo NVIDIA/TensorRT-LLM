@@ -98,8 +98,7 @@ class PipelineLoader:
         Other existing local paths are returned unchanged. Hub downloads use
         the file-lock-protected download utility. Pipelines may register an
         allow-list so repositories with multiple checkpoint variants only
-        fetch the components supported by TRT-LLM; the pipeline's
-        ``hf_download_patterns`` adapts it to ``pipeline_config``.
+        fetch the components supported by TRT-LLM.
 
         Args:
             checkpoint_dir: Local path or HuggingFace Hub model ID.
@@ -133,22 +132,15 @@ class PipelineLoader:
             f"'{checkpoint_dir}' not found locally; "
             f"attempting HuggingFace Hub download (revision={revision})"
         )
-        entry = next(
-            (
-                candidate
-                for candidate in PIPELINE_REGISTRY.values()
-                if checkpoint_dir in candidate.hf_ids
-            ),
-            None,
-        )
-        download_patterns = (
-            entry.pipeline_cls.hf_download_patterns(
-                list(entry.download_patterns), {**entry.defaults, **self.args.pipeline_config}
-            )
-            if entry is not None
-            else []
-        )
         try:
+            entry = next(
+                (
+                    candidate
+                    for candidate in PIPELINE_REGISTRY.values()
+                    if checkpoint_dir in candidate.hf_ids
+                ),
+                None,
+            )
             if entry is not None and entry.pipeline_cls.__name__ in (
                 "LTX23Pipeline",
                 "LTX23RetakePipeline",
@@ -160,6 +152,9 @@ class PipelineLoader:
                     ),
                     revision=revision,
                 )
+            download_patterns = entry and entry.pipeline_cls.hf_download_patterns(
+                list(entry.download_patterns), {**entry.defaults, **self.args.pipeline_config}
+            )
             if download_patterns:
                 local_dir = download_hf_partial(
                     checkpoint_dir,
