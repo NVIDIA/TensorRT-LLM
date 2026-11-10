@@ -53,6 +53,10 @@ def test_model(backend, model_name, attention_backend, monkeypatch):
     model_dir = str(llm_models_root() / model_name)
     max_batch_size = 16
     max_output_tokens = 128
+    # The answer takes a few tokens. On TRTLLM, decode past it so that every
+    # request's KV and KT caches grow over several KV cache blocks; Vanilla
+    # decodes too slowly for that.
+    decode_all_tokens = attention_backend == "TRTLLM"
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7, enable_block_reuse=False)
 
     kt_cache_dtype = "float8_e5m2" if attention_backend == "TRTLLM" else "bfloat16"
@@ -100,7 +104,11 @@ def test_model(backend, model_name, attention_backend, monkeypatch):
             inputs,
             use_tqdm=True,
             sampling_params=SamplingParams(
-                add_special_tokens=False, max_tokens=max_output_tokens, temperature=0.8, top_p=0.95
+                add_special_tokens=False,
+                max_tokens=max_output_tokens,
+                temperature=0.8,
+                top_p=0.95,
+                ignore_eos=decode_all_tokens,
             ),
         )
 
@@ -113,6 +121,10 @@ def test_model(backend, model_name, attention_backend, monkeypatch):
 
     assert created_manager_types
     assert set(created_manager_types) == {RocketKVCacheManagerV2}
+    if decode_all_tokens:
+        assert [len(ret.outputs[0].token_ids) for ret in outputs] == (
+            [max_output_tokens] * len(outputs)
+        )
     assert acc >= 0.9, (
         f"RocketKV NIAH accuracy {acc:.4f} < 0.9; missed (reference, output): {misses}"
     )

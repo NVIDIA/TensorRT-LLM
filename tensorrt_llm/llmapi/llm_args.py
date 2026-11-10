@@ -7964,6 +7964,8 @@ class TorchLlmArgs(BaseLlmArgs):
             unsupported.append("kv_cache_compression_config")
         if self.kv_cache_config.enable_swa_scratch_reuse:
             unsupported.append("kv_cache_config.enable_swa_scratch_reuse")
+        if self.max_beam_width is not None and self.max_beam_width > 1:
+            unsupported.append("max_beam_width > 1 (beam search)")
         if unsupported:
             raise ValueError("RocketKV sparse attention does not support " +
                              ", ".join(unsupported) + ".")

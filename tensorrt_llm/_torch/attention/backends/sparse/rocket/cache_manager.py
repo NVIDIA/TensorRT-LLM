@@ -525,9 +525,13 @@ class RocketKVCacheManagerV2(KVCacheManagerV2):
         num_seqs = len(request_ids)
         if num_seqs == 0:
             return
-        copy_idx = self.index_mapper.get_copy_index(list(request_ids), num_seqs, 1)
-        copy_idx = copy_idx.to(device="cpu", dtype=torch.long)
-        base_page_indices = self.host_kv_cache_block_offsets[0, copy_idx, 0, :]
+        # Read each request's beam-0 row (not get_copy_index: its buffer is
+        # shared with in-flight block-offset copies).
+        rows = [
+            self.index_mapper.get_index(request_id) * self.max_beam_width
+            for request_id in request_ids
+        ]
+        base_page_indices = self.host_kv_cache_block_offsets[0, rows, 0, :]
         block_offsets[:num_seqs, : base_page_indices.shape[1]].copy_(
             torch.where(
                 base_page_indices == BAD_PAGE_INDEX,

@@ -176,6 +176,18 @@ def kv_cache_manager_v2_incompatible_features(
     return ["SleepConfig"] if enable_sleep else []
 
 
+def _sparse_attn_has_v1_kv_cache_manager(
+        sparse_attn_config: SparseAttentionConfig) -> bool:
+    """Whether a sparse algorithm also has a V1 KV cache manager to select."""
+    try:
+        manager_cls = get_sparse_attn_kv_cache_manager(
+            sparse_attn_config, use_kv_cache_manager_v2=False)
+    except ValueError:
+        # The algorithm has no manager for V1.
+        return False
+    return not issubclass(manager_cls, KVCacheManagerV2)
+
+
 def resolved_kv_cache_manager_is_v2(kv_cache_config: KvCacheConfig,
                                     max_beam_width: Optional[int],
                                     *,
@@ -1168,12 +1180,22 @@ class KvCacheCreator:
                 # that support both managers, fallback would ignore the user's
                 # explicit manager selection.
                 if sparse_attn_config is not None:
+                    # Sleep mode is the one feature here that the V1 managers
+                    # serve, so name V1 for the algorithms that have one.
+                    v1_hint = ""
+                    if (incompat == ["SleepConfig"]
+                            and _sparse_attn_has_v1_kv_cache_manager(
+                                sparse_attn_config)):
+                        v1_hint = (
+                            ", or set "
+                            "kv_cache_config.use_kv_cache_manager_v2=False to "
+                            "use this algorithm's V1 KV cache manager")
                     raise NotImplementedError(
                         f"KVCacheManagerV2 for sparse-attention models "
                         f"(algorithm={sparse_attn_config.algorithm!r}) is not "
                         f"supported with "
                         f"{incompat_str}. Disable the incompatible features to "
-                        f"run sparse-attention models.")
+                        f"run sparse-attention models{v1_hint}.")
                 if _has_variable_kv_cache_geometry(model_config):
                     raise NotImplementedError(
                         f"Variable per-layer KV geometry requires KVCacheManagerV2, "
