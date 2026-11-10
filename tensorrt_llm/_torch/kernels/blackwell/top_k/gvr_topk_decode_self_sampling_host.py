@@ -1584,6 +1584,16 @@ def _route_16bit(
                 "smem": (3 * NB + 2 * CMPC) * 4,
                 "ws": False,
             }
+        if (
+            k == 2048
+            and n <= 262144
+            and sm_version not in _BLACKWELL_SM_VERSIONS
+            and not cluster_fits(4, b, num_sms, sm_version)
+            and cluster_fits(2, b, num_sms, sm_version)
+        ):
+            # Hopper K=2048 rows whose 4-CTA clusters do not co-reside (32 rows) stream through
+            # 2-CTA clusters, which is faster than the split main slab
+            return _halve_u_streaming_16bit(_clus_plan_bf16(b, n, npad, k, 2, wave), b, n, k)
     if plan["kernel"] in ("main", "clus"):
         plan = _halve_u_streaming_16bit(plan, b, n, k)
     elif plan["kernel"] == "reg_clus":
@@ -3059,14 +3069,22 @@ def _varlen_launcher(
             and int(plan_free["tpl"][4]) == 4
             and (k >= 1024 or n_kernel <= 196608)
         ):
-            clus_options["sample_floor_bf16"] = 3072
+            clus_options["sample_floor"] = 3072
         if (
             dtype is torch.bfloat16
             and int(plan_free["tpl"][4]) == 8
             and k == 1024
             and n_kernel > 196608
         ):
-            clus_options["sample_floor_bf16"] = 3072
+            clus_options["sample_floor"] = 3072
+        if (
+            low
+            and int(plan_free["tpl"][4]) == 2
+            and k == 2048
+            and sm_version not in _BLACKWELL_SM_VERSIONS
+        ):
+            # the Hopper 2-CTA fallback of 32-row K=2048 batches samples like the 4-CTA K=2048 rung
+            clus_options["sample_floor"] = 3072
         if dtype is torch.bfloat16:
             clus_options["envf"] = True
         if dtype is torch.bfloat16:
@@ -3095,7 +3113,7 @@ def _varlen_launcher(
                 int(plan_free["tpl"][4]),
                 num_rows,
                 rt_f["SCAP"],
-                int(clus_options.get("sample_floor_bf16", 256)),
+                int(clus_options.get("sample_floor", 256)),
                 wave,
             )
         lc = (

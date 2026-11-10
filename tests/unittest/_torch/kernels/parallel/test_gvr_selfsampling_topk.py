@@ -916,6 +916,15 @@ def test_selfsampling_hopper_clusters_are_coresident() -> None:
     assert ss_host._code_radix_cluster_plan_fp16(1024, 32771, 32, 132, 90)[2] == 2
     assert ss_host._code_radix_cluster_plan_fp16(2048, 163775, 8, 148, 100)[2] == 10
     assert ss_host._code_radix_cluster_plan_fp16(2048, 163775, 8, 132, 90)[2] == 5
+    # K=2048: 32 rows of 4-CTA clusters do not co-reside on Hopper, so 16-bit rows that no 2-CTA
+    # register cluster holds stream through 2-CTA clusters there; Blackwell keeps its plans
+    for dtype in (torch.bfloat16, torch.float16):
+        for n in (65551, 131087, 163775):
+            plan = ss_host._route_16bit(32, n, n, 2048, 132, 90, dtype=dtype)
+            assert (plan["kernel"], plan["cluster"]) == ("clus", 2), (dtype, n, plan)
+    for n in (65551, 131087, 163775):
+        plan = ss_host._route_16bit(32, n, n, 2048, 148, 100, dtype=torch.bfloat16)
+        assert plan["cluster"] == 4, (n, plan)
 
 
 def test_selfsampling_bf16_partitioned_rows_cluster_on_blackwell_only(monkeypatch) -> None:

@@ -16270,10 +16270,10 @@ class GvrClusKernel:
 
     ``dtype`` is Float32, BFloat16 or Float16. 16-bit builds read 16-byte vectors of
     eight elements and require ``hint_free``; ``det`` is FP32-only (the host never
-    builds it for 16-bit logits). ``envf`` and the ``*_bf16`` knobs act only on
-    BFloat16 with ``det`` off:
+    builds it for 16-bit logits). ``sample_floor`` is the minimum sample count of the
+    varlen ladder of 16-bit builds (FP32: 256). ``envf`` and the ``*_bf16`` knobs act
+    only on BFloat16 with ``det`` off:
 
-    - ``sample_floor_bf16``: minimum sample count of the varlen ladder (else 256).
     - ``envf`` (varlen only): SMP/TGT/SS2/TGT2 carry the ladder of the envelope
       length ``n``; its sample is loaded before the prologue, and rows of length
       ``n`` reuse both.
@@ -16304,7 +16304,7 @@ class GvrClusKernel:
         hint_free: bool = False,
         det: bool = False,
         dtype=cutlass.Float32,
-        sample_floor_bf16: int = 256,
+        sample_floor: int = 256,
         envf: bool = False,
         async_refine_bf16: bool = False,
         fused_merge_bf16: bool = False,
@@ -16316,7 +16316,7 @@ class GvrClusKernel:
         self.push_merge_bf16 = (
             bool(push_merge_bf16) and dtype is cutlass.BFloat16 and not self.det and nbs == 256
         )
-        self.sample_floor_bf16 = int(sample_floor_bf16)
+        self.sample_floor = 256 if dtype is cutlass.Float32 else int(sample_floor)
         self.envf = bool(envf) and dtype is cutlass.BFloat16 and bool(varlen) and not bool(det)
         self.async_refine_bf16 = (
             bool(async_refine_bf16) and dtype is cutlass.BFloat16 and not self.det
@@ -16715,12 +16715,8 @@ class GvrClusKernel:
                     * cutlass.Float32(32.0 if self.cs == 2 else 16.0)
                     * cute.arch.rcp_approx(cutlass.Float32(aim))
                 )
-                if cutlass.const_expr(self.dtype == cutlass.BFloat16):
-                    if sel < cutlass.Int32(self.sample_floor_bf16):
-                        sel = cutlass.Int32(self.sample_floor_bf16)
-                else:
-                    if sel < cutlass.Int32(256):
-                        sel = cutlass.Int32(256)
+                if sel < cutlass.Int32(self.sample_floor):
+                    sel = cutlass.Int32(self.sample_floor)
                 nh = nv >> cutlass.Int32(1)
                 if sel > nh:
                     sel = nh
@@ -18838,7 +18834,7 @@ def get_compiled__clus(
     hint_free: bool = False,
     det: bool = False,
     dtype: str = "f32",
-    sample_floor_bf16: int = 256,
+    sample_floor: int = 256,
     async_refine_bf16: bool = False,
     fused_merge_bf16: bool = False,
     envf: bool = False,
@@ -18851,8 +18847,8 @@ def get_compiled__clus(
     host route's wave budget (``wave_sms()`` in the host module).
 
     ``dtype`` is the logits tag ('f32', 'bf16' or 'f16'); 16-bit tags need
-    ``hint_free`` and ``det=False``. ``envf`` and the ``*_bf16`` options apply
-    to 'bf16' only; see GvrClusKernel.
+    ``hint_free`` and ``det=False``. ``sample_floor`` applies to the 16-bit tags,
+    ``envf`` and the ``*_bf16`` options to 'bf16' only; see GvrClusKernel.
     """
     if det:
         assert dtype == "f32", "deterministic mode is fp32-only"
@@ -18861,7 +18857,7 @@ def get_compiled__clus(
             tuple(tpl),
             scap,
             cmp_,
-            int(sample_floor_bf16) if dtype == "bf16" else 256,
+            int(sample_floor) if dtype != "f32" else 256,
             bool(async_refine_bf16) if dtype == "bf16" else False,
             bool(fused_merge_bf16) if dtype == "bf16" else False,
             options_extra,
@@ -18894,7 +18890,7 @@ def get_compiled__clus(
         hint_free=hint_free,
         det=det,
         dtype=_dtype_of(dtype),
-        sample_floor_bf16=sample_floor_bf16 if dtype == "bf16" else 256,
+        sample_floor=sample_floor,
         async_refine_bf16=bool(async_refine_bf16) if dtype == "bf16" else False,
         fused_merge_bf16=bool(fused_merge_bf16) if dtype == "bf16" else False,
         envf=bool(envf),
