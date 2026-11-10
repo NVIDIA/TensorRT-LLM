@@ -62,39 +62,8 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.testing
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cutlass_dsl import dsl_user_op
-
-
-@dsl_user_op
-def _mbarrier_wait_acquire_cluster(mbar_ptr, phase: int, *, loc=None, ip=None) -> None:
-    """Spin until ``phase`` of a local mbarrier completes, acquiring at cluster scope.
-
-    ``cute.arch.mbarrier_wait`` acquires at CTA scope. A phase completed by a peer
-    CTA's ``st.async ... mbarrier::complete_tx`` is a release at cluster scope, and
-    only a cluster-scope acquire orders the peer's payload before the reads that
-    follow the wait.
-    """
-    llvm.inline_asm(
-        None,
-        [
-            mbar_ptr.toint(loc=loc, ip=ip).ir_value(),
-            cutlass.Int32(phase).ir_value(loc=loc, ip=ip),
-        ],
-        "{\n"
-        ".reg .pred P1;\n"
-        "LAB_WAIT:\n"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, [$0], $1;\n"
-        "@P1 bra DONE;\n"
-        "bra LAB_WAIT;\n"
-        "DONE:\n"
-        "}",
-        "r,r,~{memory}",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
+from cutlass.experimental import primitives as prims
 
 
 class WorkTileInfo(NamedTuple):
@@ -1223,9 +1192,18 @@ class TgvGemmKernel:
                         )
 
             # wait for all peer shards to arrive in our local mailbox. The peers'
-            # st.async complete-tx releases at cluster scope, so the wait must acquire
-            # at cluster scope for the mailbox reads below to be ordered after it.
-            _mbarrier_wait_acquire_cluster(dsmem_mailbox_mbar, 0)
+            # st.async complete-tx releases at cluster scope, so the mailbox reads below
+            # must be ordered by a cluster-scope acquire: a relaxed cluster-scope wait
+            # followed by an acquire fence restricted to shared::cluster. The fence
+            # avoids the L1 invalidation that an acquire-qualified try_wait incurs.
+            while not prims.mbarrier_try_wait_parity(
+                dsmem_mailbox_mbar,
+                0,
+                scope=prims.MBarrierScope.CLUSTER,
+                order=prims.MemOrder.RELAXED,
+            ):
+                pass
+            prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
             # reduce: accumulate received shards with our own partial
             my_shard_start = split_rank * shard_ept

@@ -18,9 +18,11 @@ CUDA and no cutlass import are needed.
    arrive, wait for phase 0, load the accumulator, fence that load with
    ``fence_view_async_tmem_load`` and arrive again.
 2. Split-K mailbox wait. Peer CTAs fill this CTA's mailbox with ``st.async``, whose
-   complete-tx releases at cluster scope, so the owner's wait has to acquire at
-   cluster scope (``mbarrier.try_wait.parity.acquire.cluster``).
-   ``cute.arch.mbarrier_wait`` acquires at CTA scope only.
+   complete-tx releases at cluster scope, so the owner's mailbox reads must be
+   ordered by a cluster-scope acquire. ``cute.arch.mbarrier_wait`` acquires at CTA
+   scope only. The kernel uses a relaxed cluster-scope try-wait followed by
+   ``fence.acquire.sync_restrict::shared::cluster.cluster``, which orders the reads
+   without the L1 invalidation an acquire-qualified try-wait incurs.
 """
 
 import ast
@@ -45,7 +47,8 @@ _KERNEL = (
 
 _ALLOC_BAR = "tmem_alloc_result_bar"
 _MAILBOX_BAR = "dsmem_mailbox_mbar"
-_HELPER = "_mbarrier_wait_acquire_cluster"
+_WAIT = "prims.mbarrier_try_wait_parity"
+_FENCE = "prims.fence_sync_restrict"
 
 
 @pytest.fixture(scope="module")
@@ -159,7 +162,7 @@ def test_epilog_warp_fences_its_tmem_load_before_releasing(module) -> None:
 
 
 def test_split_k_mailbox_wait_acquires_at_cluster_scope(module) -> None:
-    """Only the cluster-scope helper waits on the mailbox barrier, after the scatter and before the reads."""
+    """A relaxed cluster-scope wait plus a cluster acquire fence, after the scatter and before the reads."""
     calls = _calls(module)
 
     cta_scope_waits = [
@@ -173,10 +176,21 @@ def test_split_k_mailbox_wait_acquires_at_cluster_scope(module) -> None:
     )
 
     wait = _only(
-        [c for c in calls if _callee(c) == _HELPER and _first_arg(c) == _MAILBOX_BAR],
-        f"{_HELPER} on {_MAILBOX_BAR}",
+        [c for c in calls if _callee(c) == _WAIT and _first_arg(c) == _MAILBOX_BAR],
+        f"{_WAIT} on {_MAILBOX_BAR}",
     )
     assert isinstance(wait.args[1], ast.Constant) and wait.args[1].value == 0
+    keywords = {k.arg: ast.unparse(k.value) for k in wait.keywords}
+    assert keywords.get("scope") == "prims.MBarrierScope.CLUSTER", keywords
+    assert keywords.get("order") == "prims.MemOrder.RELAXED", (
+        "an acquire-qualified cluster-scope try_wait invalidates L1 on every attempt; "
+        "wait relaxed and acquire with the fence instead"
+    )
+
+    fence = _only(
+        [c for c in calls if _callee(c) == _FENCE and _first_arg(c) == "prims.MemOrder.ACQUIRE"],
+        f"{_FENCE}(prims.MemOrder.ACQUIRE)",
+    )
 
     scatters = [c for c in calls if _callee(c) == "cute.arch.store_async_dsmem"]
     reads = [
@@ -187,22 +201,6 @@ def test_split_k_mailbox_wait_acquires_at_cluster_scope(module) -> None:
         and "dsmem_mailbox_ptr" in ast.unparse(c.func.value)
     ]
     assert scatters and reads, "the split-K scatter and the mailbox reads could not be located"
-    assert max(c.lineno for c in scatters) < wait.lineno < min(c.lineno for c in reads)
-
-
-def test_cluster_acquire_helper_emits_the_cluster_scope_try_wait(module) -> None:
-    """The helper's inline PTX is the cluster-scope acquire try-wait with a memory clobber."""
-    helper = _function(module, _HELPER)
-    asm = _only([c for c in _calls(helper) if _callee(c) == "llvm.inline_asm"], "llvm.inline_asm")
-
-    strings = [
-        a.value for a in asm.args if isinstance(a, ast.Constant) and isinstance(a.value, str)
-    ]
-    assert any("mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64" in s for s in strings), (
-        strings
+    assert (
+        max(c.lineno for c in scatters) < wait.lineno < fence.lineno < min(c.lineno for c in reads)
     )
-    assert any("~{memory}" in s for s in strings), (
-        "the spin needs a memory clobber so the mailbox reads stay after it"
-    )
-    side_effects = {k.arg: k.value for k in asm.keywords}.get("has_side_effects")
-    assert isinstance(side_effects, ast.Constant) and side_effects.value is True
