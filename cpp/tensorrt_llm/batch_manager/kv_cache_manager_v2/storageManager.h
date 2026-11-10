@@ -354,8 +354,6 @@ public:
     // are evicted first (least recently used first): retained copies belong to more recently used pages. Retained
     // copies are then reclaimed oldest first.
 
-    [[nodiscard]] bool keepDiskCopyEnabled() const noexcept;
-
     // Called from Page::~Page: releases the page's retained copy, if any.
     void onPageDestroyed(Page const& page) noexcept;
 
@@ -600,7 +598,7 @@ private:
     void releaseAllRetainedCopies(std::optional<CacheLevel> level);
     void eraseRetainedCopy(RetainedCopyList::iterator iter);
 
-    bool mKeepDiskCopy{false};
+    TypedVec<CacheLevel, bool> mKeepDiskCopyAt; // per level: keepCopyAfterRestore of that disk tier
     // Oldest first.
     RetainedCopyList mRetainedCopies;
     std::unordered_map<Page const*, RetainedCopyList::iterator> mRetainedByPage;
@@ -612,7 +610,8 @@ private:
     void writeThroughToDisk(CacheLevel hostLevel, std::vector<SharedPtr<Page>> const& pages);
     // Completion event of a write-through still reading this host page, or a null event.
     [[nodiscard]] CachedCudaEvent pendingDiskWrite(Page const& page) const;
-    bool mDiskWriteThrough{false};
+    bool mDiskWriteThrough{false};              // any disk tier writes through
+    TypedVec<CacheLevel, bool> mWriteThroughAt; // per level: writeThrough of that disk tier
     uint64_t mWriteThroughPages{0};
     uint64_t mWriteThroughSkipped{0};
 };

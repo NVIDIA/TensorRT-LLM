@@ -576,13 +576,23 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     {
         mNumRetainedCopies[level].resize(numPoolGroups(level), 0);
     }
-    for (auto const& tierConfig : config.cacheTiers)
+    // The options are per disk tier: a tier that does not set them gets neither retained copies nor write-through.
+    mKeepDiskCopyAt = TypedVec<CacheLevel, bool>(numCacheLevels(), false);
+    mWriteThroughAt = TypedVec<CacheLevel, bool>(numCacheLevels(), false);
+    for (CacheLevel level{0}; level < config.cacheTiers.size(); ++level)
     {
-        if (auto const* disk = std::get_if<DiskCacheTierConfig>(&tierConfig))
+        if (auto const* disk = std::get_if<DiskCacheTierConfig>(&config.cacheTiers[level]))
         {
-            mKeepDiskCopy = mKeepDiskCopy || disk->keepCopyAfterRestore;
+            mKeepDiskCopyAt[level] = disk->keepCopyAfterRestore;
+            mWriteThroughAt[level] = disk->writeThrough;
             mDiskWriteThrough = mDiskWriteThrough || disk->writeThrough;
             configureAsyncDiskIo(static_cast<size_t>(std::max(disk->numIoThreads, 0)));
+            if (disk->keepCopyAfterRestore || disk->writeThrough)
+            {
+                TLLM_LOG_INFO("[kvCacheManagerV2] disk tier %d: keep_copy_after_restore=%d write_through=%d",
+                    static_cast<int>(level.value()), static_cast<int>(disk->keepCopyAfterRestore),
+                    static_cast<int>(disk->writeThrough));
+            }
         }
     }
     if (mDiskWriteThrough && !asyncDiskIoEnabled())
@@ -591,11 +601,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         // function, ahead of restores.
         TLLM_LOG_WARNING("[kvCacheManagerV2] disk write_through needs async disk I/O (num_io_threads > 0); disabled");
         mDiskWriteThrough = false;
-    }
-    if (mKeepDiskCopy || mDiskWriteThrough)
-    {
-        TLLM_LOG_INFO("[kvCacheManagerV2] disk tier: keep_copy_after_restore=%d write_through=%d",
-            static_cast<int>(mKeepDiskCopy), static_cast<int>(mDiskWriteThrough));
+        mWriteThroughAt = TypedVec<CacheLevel, bool>(numCacheLevels(), false);
     }
 }
 
@@ -903,11 +909,6 @@ void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
     mLevels.at(level).storage->release(pg, std::move(slot));
 }
 
-bool StorageManager::keepDiskCopyEnabled() const noexcept
-{
-    return mKeepDiskCopy;
-}
-
 StorageManager::DiskCopyCounters StorageManager::diskCopyCounters() const noexcept
 {
     return {mRetainedCopies.size(), mKeepCopyStats.created, mKeepCopyStats.reused, mKeepCopyStats.reclaimed,
@@ -1091,7 +1092,7 @@ void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<Shared
 {
     CacheLevel const diskLevel = hostLevel + 1;
     if (diskLevel >= numCacheLevels() || cacheTier(hostLevel) != CacheTier::HOST_MEM
-        || cacheTier(diskLevel) != CacheTier::DISK)
+        || cacheTier(diskLevel) != CacheTier::DISK || !mWriteThroughAt.at(diskLevel))
     {
         return;
     }
@@ -1855,8 +1856,8 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
         }
         throw;
     }
-    bool const retainSrcCopy
-        = mKeepDiskCopy && updateSrc && !defrag && dstLevel < srcLevel && cacheTier(srcLevel) == CacheTier::DISK;
+    bool const retainSrcCopy = updateSrc && !defrag && dstLevel < srcLevel && cacheTier(srcLevel) == CacheTier::DISK
+        && mKeepDiskCopyAt.at(srcLevel);
     try
     {
         thread_local std::vector<PageIndexPair> pageIndices;
