@@ -188,11 +188,8 @@ struct MoeA2ACombineParams
     // the host determines all storage strides before launching any kernel.
     void const* source_payload;
     int source_stride_per_token;
-    int workspace_stride_per_token;
-    int wire_bytes_per_token;
-    int prepare_first_token;
+    int workspace_stride_per_token; // prepare writes and combine reads the combine input at this stride
     int prepare_num_tokens;
-    int reduce_stride_per_token;
 
     // Output tensor
     void* output_data; // Output buffer [local_num_tokens, elements_per_token]

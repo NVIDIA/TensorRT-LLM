@@ -1006,7 +1006,7 @@ __device__ void vectorized_quant(DstT* dst, SrcT const* src, int num_elements)
 template <bool LOW_PRECISION, typename SrcT>
 __global__ void moeA2APrepareCombineKernel(uint8_t* combine_input_base, void const* source_payload,
     int elements_per_token, int ep_size, int max_tokens_per_rank, uint32_t* flag_val_ptr, int const* recv_counters,
-    int source_stride_per_token, int workspace_stride_per_token, int prepare_first_token, int prepare_num_tokens)
+    int source_stride_per_token, int workspace_stride_per_token, int prepare_num_tokens)
 {
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaGridDependencySynchronize();
@@ -1022,7 +1022,7 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* combine_input_base, void con
 
     if (blockIdx.x >= prepare_num_tokens)
         return;
-    int const global_token_idx = prepare_first_token + blockIdx.x;
+    int const global_token_idx = blockIdx.x;
 
     // Map global_token_idx to (rank_idx, local_token_idx)
     int rank_idx = global_token_idx / max_tokens_per_rank;
@@ -1164,7 +1164,7 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
             launchWithPdlWhenEnabled("moeA2APrepareCombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream,
                 combine_input_base, params.source_payload, params.elements_per_token, params.ep_size,
                 params.max_tokens_per_rank, params.flag_val, params.recv_counters, params.source_stride_per_token,
-                params.workspace_stride_per_token, params.prepare_first_token, params.prepare_num_tokens);
+                params.workspace_stride_per_token, params.prepare_num_tokens);
         });
     });
 }
@@ -1207,7 +1207,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
 
     // Each expert rank stores this origin rank's tokens in its own combine input region.
     int64_t const origin_offset
-        = static_cast<int64_t>(params.ep_rank) * params.max_tokens_per_rank * params.reduce_stride_per_token;
+        = static_cast<int64_t>(params.ep_rank) * params.max_tokens_per_rank * params.workspace_stride_per_token;
     for (int rank = 0; rank < params.ep_size; rank++)
     {
         kernel_ptrs.source_buffers[rank] = params.combine_input_buffers[rank] + origin_offset;
@@ -1237,7 +1237,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
                     auto kernel_fn = moeA2ACombineKernel<T, TOP_K, LOW_PRECISION, ENABLE_RANK_MASK>;
                     launchWithPdlWhenEnabled("moeA2ACombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream,
                         kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
-                        params.ep_rank, params.ep_size, params.reduce_stride_per_token);
+                        params.ep_rank, params.ep_size, params.workspace_stride_per_token);
                 });
             });
         });

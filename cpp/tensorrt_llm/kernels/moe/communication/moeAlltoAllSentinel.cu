@@ -26,6 +26,10 @@
 #include <cstdint>
 #include <cstdio>
 
+#ifndef DISABLE_TIMEOUT
+#define DISABLE_TIMEOUT 0
+#endif
+
 // The kernels are built for compute capability 10.0, 10.3 and 10.7, where the transport is validated.
 // Other architectures get kernels that trap, and moe_a2a_sentinel_kernels_available() is false.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070)
@@ -115,7 +119,8 @@ __device__ __forceinline__ uint32_t poll_until_arrived(uint32_t pending, uint32_
         for (int i = 0; i < NUM_VECTORS; ++i)
             if (((pending >> i) & 1u) && has_arrived(vectors[i], sentinel_word))
                 pending &= ~(1u << i);
-        if (pending && spins % 64 == 0 && clock64() - wait_start > timeout_cycles)
+        // A -DDISABLE_TIMEOUT=1 debug build waits forever, as the fence kernels do.
+        if (!DISABLE_TIMEOUT && pending && spins % 64 == 0 && clock64() - wait_start > timeout_cycles)
             break;
     }
     return pending;

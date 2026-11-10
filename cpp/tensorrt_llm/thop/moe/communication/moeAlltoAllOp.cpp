@@ -29,9 +29,10 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <torch/extension.h>
 #include <torch/types.h>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -221,6 +222,9 @@ torch::Tensor moeA2AGetWorkspaceLayoutOp(int64_t epSize, int64_t maxNumTokens, i
 // ============================================================================
 
 namespace sentinel = tensorrt_llm::kernels::moe_comm::sentinel;
+// The sentinel kernels take every top_k the one-sided ops do, so the op's top_k check covers them.
+static_assert(
+    sentinel::kMaxTopK == tensorrt_llm::kernels::moe_comm::kMaxTopK, "sentinel and fence top_k bounds differ");
 
 // Bytes of one row of a sentinel payload format: the payload (landing and receive rows), its
 // scales as received, and its scales on the wire (MXFP8 scale bytes travel as 16-bit lanes).
@@ -318,7 +322,6 @@ void appendSentinelRegions(
     TORCH_CHECK(layout[SENTINEL_MAX_NUM_TOKENS_INDEX] == 0, "The workspace layout already has sentinel regions");
     TORCH_CHECK(
         epSize <= sentinel::kMaxRanks, "The sentinel transport supports at most ", sentinel::kMaxRanks, " EP ranks");
-    TORCH_CHECK(topK <= sentinel::kMaxTopK, "The sentinel transport supports top_k <= ", sentinel::kMaxTopK);
     TORCH_CHECK(
         maxNumTokens > 0 && maxNumTokens <= sentinel::kMaxTokensPerRank && maxNumTokens <= layout[MAX_NUM_TOKENS_INDEX],
         "Sentinel token capacity must be in [1, min(", sentinel::kMaxTokensPerRank, ", max_num_tokens)], got ",
@@ -370,39 +373,59 @@ sentinel::LandingLayout sentinelLandingLayout(MoeA2AWorkspaceLayout const& layou
 void armSentinelRegions(uint8_t* rankWorkspace, MoeA2AWorkspaceLayout const& layout, cudaStream_t stream)
 {
     auto const landing = sentinelLandingLayout(layout);
-    auto memset = [&](int64_t begin, int value, int64_t end)
+    // cudaMemsetAsync fills bytes, so each sentinel word must be one byte repeated.
+    constexpr auto repeatedByte = [](uint32_t word) { return (word & 0xFFu) * 0x01010101u == word; };
+    static_assert(repeatedByte(sentinel::kDataSentinel) && repeatedByte(sentinel::kIdsSentinel),
+        "sentinel words must be a repeated byte");
+    constexpr int kDataByte = static_cast<int>(sentinel::kDataSentinel & 0xFFu);
+    constexpr int kIdsByte = static_cast<int>(sentinel::kIdsSentinel & 0xFFu);
+    auto fillRange = [&](int64_t begin, int value, int64_t end)
     {
         TORCH_CHECK(cudaMemsetAsync(rankWorkspace + begin, value, end - begin, stream) == cudaSuccess,
             "cudaMemsetAsync failed");
     };
-    memset(landing.payload_offset, 0xFF, landing.ids_offset); // payload, scale and weight rows
-    memset(landing.ids_offset, 0x88, landing.ids_offset + 2 * landing.ids_set_bytes);
-    memset(landing.combine_offset, 0xFF, layout[SENTINEL_RECV_OFFSET_INDEX]);
+    fillRange(landing.payload_offset, kDataByte, landing.ids_offset); // payload, scale and weight rows
+    fillRange(landing.ids_offset, kIdsByte, landing.ids_offset + 2 * landing.ids_set_bytes);
+    fillRange(landing.combine_offset, kDataByte, layout[SENTINEL_RECV_OFFSET_INDEX]);
 }
 
-// Workspace slices with a sentinel dispatch not combined yet. A sentinel combine reads routing state
-// only a sentinel dispatch writes, and a sentinel round must end before the next dispatch. The ops
-// run on the host in stream order, also while a CUDA graph is captured.
+// Workspace slices with a sentinel dispatch not combined yet, with the dispatch's step geometry. A
+// sentinel combine reads routing state only its dispatch writes and re-arms the rows that dispatch
+// used, so it must run on the same geometry, and a sentinel round must end before the next dispatch.
+// The ops run on the host in stream order, also while a CUDA graph is captured.
+struct SentinelRound
+{
+    int64_t runtimeMaxTokensPerRank;
+    int64_t localNumTokens;
+    bool enableRankMask;
+
+    bool operator==(SentinelRound const& other) const
+    {
+        return runtimeMaxTokensPerRank == other.runtimeMaxTokensPerRank && localNumTokens == other.localNumTokens
+            && enableRankMask == other.enableRankMask;
+    }
+};
+
 std::mutex gOpenSentinelRoundsMutex;
-std::unordered_set<uint8_t const*> gOpenSentinelRounds;
+std::unordered_map<uint8_t const*, SentinelRound> gOpenSentinelRounds;
 
-void setSentinelRoundOpen(uint8_t const* rankWorkspace, bool open)
+void openSentinelRound(uint8_t const* rankWorkspace, SentinelRound const& round)
 {
     std::lock_guard<std::mutex> lock(gOpenSentinelRoundsMutex);
-    if (open)
-    {
-        gOpenSentinelRounds.insert(rankWorkspace);
-    }
-    else
-    {
-        gOpenSentinelRounds.erase(rankWorkspace);
-    }
+    gOpenSentinelRounds[rankWorkspace] = round;
 }
 
-bool isSentinelRoundOpen(uint8_t const* rankWorkspace)
+void closeSentinelRound(uint8_t const* rankWorkspace)
 {
     std::lock_guard<std::mutex> lock(gOpenSentinelRoundsMutex);
-    return gOpenSentinelRounds.count(rankWorkspace) != 0;
+    gOpenSentinelRounds.erase(rankWorkspace);
+}
+
+std::optional<SentinelRound> openSentinelRoundOf(uint8_t const* rankWorkspace)
+{
+    std::lock_guard<std::mutex> lock(gOpenSentinelRoundsMutex);
+    auto const it = gOpenSentinelRounds.find(rankWorkspace);
+    return it == gOpenSentinelRounds.end() ? std::nullopt : std::optional<SentinelRound>(it->second);
 }
 
 // Append the sentinel regions to metainfo, a layout from moe_a2a_get_workspace_layout: landing rows
@@ -466,7 +489,7 @@ void moeA2AInitializeOp(torch::Tensor const& workspace, torch::Tensor const& met
     {
         armSentinelRegions(rankWorkspace, layout, at::cuda::getCurrentCUDAStream());
     }
-    setSentinelRoundOpen(rankWorkspace, false);
+    closeSentinelRound(rankWorkspace);
     // Synchronize among ranks. Under a non-MPI orchestrator (Ray) MpiComm throws
     // "MPI is disabled, DON'T USE MPI" from mpiUtils.h, which made the whole
     // NVLinkOneSided strategy unusable there; fall back to the Torch process
@@ -560,6 +583,9 @@ void sentinelDispatch(torch::Tensor const& tokenSelectedExperts, std::vector<tor
             "Sentinel routing weights must be 4-byte or bf16 [local_num_tokens, top_k]");
     }
     TORCH_CHECK(numExperts % epSize == 0, "The sentinel transport needs num_experts divisible by ep_size");
+    // Receivers tell a row without a token by its invalid id, so it must name no expert.
+    TORCH_CHECK(invalidExpertId < 0 || invalidExpertId >= numExperts,
+        "A sentinel dispatch needs invalid_expert_id outside [0, num_experts), got ", invalidExpertId);
     TORCH_CHECK(static_cast<uint32_t>(invalidExpertId) != sentinel::kIdsSentinel,
         "invalid_expert_id must differ from the sentinel expert-id sentinel");
 
@@ -796,7 +822,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     uint8_t* rankWorkSpacePtr = workspacePtr + epRank * workspace.stride(0);
     TORCH_CHECK(reinterpret_cast<uintptr_t>(rankWorkSpacePtr) % CACHELINE_ALIGNMENT == 0,
         "rankWorkSpacePtr must be %d-byte aligned", CACHELINE_ALIGNMENT);
-    TORCH_CHECK(!isSentinelRoundOpen(rankWorkSpacePtr),
+    TORCH_CHECK(!openSentinelRoundOf(rankWorkSpacePtr).has_value(),
         "A sentinel dispatch must be followed by its sentinel combine before the next dispatch");
 
     // Create tensor views for the current rank's receive buffers only
@@ -816,6 +842,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     if (useSentinel)
     {
         TORCH_CHECK(!enableEplb, "A sentinel dispatch does not gather EPLB statistics");
+        // The sentinel kernels never drain or re-arm a masked peer's rows; fault tolerance uses fence.
+        TORCH_CHECK(!enableRankMask, "A sentinel dispatch does not take a rank mask");
         TORCH_CHECK(sanitizeExpertIds,
             "A sentinel dispatch needs expert_id_payload_index and invalid_token_expert_id: it fills the expert ids of "
             "rows without a token");
@@ -825,7 +853,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         cudaError_t result = cudaGetLastError();
         TORCH_CHECK(
             result == cudaSuccess, "moe_a2a_dispatch sentinel kernel launch failed: ", cudaGetErrorString(result));
-        setSentinelRoundOpen(rankWorkSpacePtr, true);
+        openSentinelRound(rankWorkSpacePtr, SentinelRound{runtimeMaxTokensPerRank, localNumTokens, enableRankMask});
         return std::make_tuple(
             makeRecvTensors(), combinePayloadOffset, torch::empty({0}, workspace.options().dtype(torch::kInt32)));
     }
@@ -1020,9 +1048,14 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     int64_t payloadSize = payload.numel() * payload.element_size();
     TORCH_CHECK(payloadSize <= regionSize, "Combine payload exceeds its fixed workspace region: need ", payloadSize,
         " bytes, capacity ", regionSize);
-    TORCH_CHECK(useSentinel == isSentinelRoundOpen(rankWorkSpacePtr),
+    auto const openRound = openSentinelRoundOf(rankWorkSpacePtr);
+    TORCH_CHECK(useSentinel == openRound.has_value(),
         useSentinel ? "A sentinel combine needs a sentinel dispatch before it"
                     : "A sentinel dispatch must be followed by a sentinel combine");
+    SentinelRound const thisRound{runtimeMaxTokensPerRank, localNumTokens, enableRankMask};
+    TORCH_CHECK(!useSentinel || *openRound == thisRound,
+        "A sentinel combine must use its dispatch's runtime_max_tokens_per_rank, local token count and rank-mask "
+        "mode");
 
     // Create output tensor (local on current rank), no need for initialization
     // Typically, newly allocated GPU torch tensors are at least 16-byte aligned.
@@ -1033,12 +1066,13 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     if (useSentinel)
     {
         TORCH_CHECK(!useLowPrecision, "A sentinel combine does not use the FP8 wire format");
+        TORCH_CHECK(!enableRankMask, "A sentinel combine does not take a rank mask");
         sentinelCombine(payload, localNumTokens, workspace, offsets, runtimeMaxTokensPerRank, epRank, epSize, topK,
             enableRankMask, activeRankMask, output);
         cudaError_t result = cudaGetLastError();
         TORCH_CHECK(
             result == cudaSuccess, "moe_a2a_combine sentinel kernel launch failed: ", cudaGetErrorString(result));
-        setSentinelRoundOpen(rankWorkSpacePtr, false);
+        closeSentinelRound(rankWorkSpacePtr);
         return output;
     }
 
@@ -1055,10 +1089,10 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     params.dtype = nvDtype;
     params.use_low_precision = useLowPrecision;
     params.source_stride_per_token = static_cast<int>(elementsPerToken * payload.element_size());
-    params.wire_bytes_per_token
-        = static_cast<int>(elementsPerToken) * (useLowPrecision ? 1 : static_cast<int>(payload.element_size()));
+    // FP8 staged out of an external payload is packed at one byte per element; otherwise the combine
+    // input keeps the payload's stride.
     params.workspace_stride_per_token
-        = useLowPrecision && !inputIsWorkspace ? params.wire_bytes_per_token : params.source_stride_per_token;
+        = useLowPrecision && !inputIsWorkspace ? static_cast<int>(elementsPerToken) : params.source_stride_per_token;
 
     params.flag_val = reinterpret_cast<uint32_t*>(rankWorkSpacePtr + offsets[FLAG_VAL_OFFSET_INDEX]);
     params.topk_target_ranks = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_RANKS_OFFSET_INDEX]);
@@ -1086,7 +1120,6 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
 
     // Resolve the complete payload plan once. Prepare always launches at least one block to
     // advance flag_val, but prepare_num_tokens=0 performs no payload work.
-    params.prepare_first_token = 0;
     if (params.use_low_precision)
     {
         params.prepare_num_tokens = params.ep_size * params.max_tokens_per_rank;
@@ -1095,8 +1128,6 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     {
         params.prepare_num_tokens = inputIsWorkspace ? 0 : params.ep_size * params.max_tokens_per_rank;
     }
-
-    params.reduce_stride_per_token = params.workspace_stride_per_token;
 
     params.stream = at::cuda::getCurrentCUDAStream();
     params.timeout_cycles = gTimeoutCycles.load(std::memory_order_relaxed);
