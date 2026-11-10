@@ -723,6 +723,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             **kwargs):
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
+        self.py_watermarking: bool | None = kwargs.pop("py_watermarking", None)
         # Owned entirely on the Python side: the TorchSampler is the only
         # consumer, so the C++ request no longer carries a copy.
         self.py_embedding_bias: Optional[torch.Tensor] = kwargs.pop(
@@ -1260,6 +1261,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             py_logits_post_processors=(self.py_logits_post_processors.copy()
                                        if self.py_logits_post_processors
                                        is not None else None),
+            py_watermarking=self.py_watermarking,
             py_multimodal_data=deepcopy(self.py_multimodal_data),
             encoder_input_features=self.py_encoder_input_features,
         )
@@ -1720,6 +1722,7 @@ def executor_request_to_llm_request(
         exclude_input_from_output,
         guided_decoding_params=executor_request.guided_decoding_params,
         py_logits_post_processors=inputs.logits_post_processors,
+        py_watermarking=inputs.watermarking,
         encoder_input_tokens=executor_request.encoder_input_token_ids,
         encoder_input_features=encoder_input_features,
         encoder_output_len=encoder_output_len,

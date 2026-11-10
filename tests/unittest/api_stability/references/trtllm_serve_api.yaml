@@ -55,6 +55,12 @@
 models:
   CompletionRequest:
     fields:
+      watermarking:
+        kind: extension
+        type: Optional[bool]
+        default: null
+        status: prototype
+        required: false
       kv_hints:
         kind: extension
         type: Optional[KvHintsEnvelope]
@@ -514,6 +520,12 @@ models:
 
   ChatCompletionRequest:
     fields:
+      watermarking:
+        kind: extension
+        type: Optional[bool]
+        default: null
+        status: prototype
+        required: false
       kv_hints:
         kind: extension
         type: Optional[KvHintsEnvelope]

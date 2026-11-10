@@ -101,6 +101,10 @@ methods:
         default: null
         status: prototype
       # Runtime behavior
+      watermark_config:
+        annotation: Optional[tensorrt_llm.watermarking.config.WatermarkConfig]
+        default: null
+        status: prototype
       generation_config:
         annotation: Literal['auto', 'trtllm']
         default: trtllm

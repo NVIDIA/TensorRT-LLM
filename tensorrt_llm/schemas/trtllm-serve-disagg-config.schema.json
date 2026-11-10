@@ -3537,6 +3537,22 @@
           "description": "Pruning rate for video frames in multimodal models for Efficient Video Sampling (EVS). NOTE: this is currently only implemented in nemotron multimodal models. None (default) disables EVS, values in [0, 1) enable pruning.",
           "status": "prototype",
           "title": "Video Pruning Rate"
+        },
+        "watermark_config": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WatermarkConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Text watermark configuration. Enables watermarking by default for ordinary sampling; requests may opt out with watermarking=False.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          }
         }
       },
       "type": "object"
@@ -8552,6 +8568,60 @@
       ],
       "title": "WaitingQueuePolicy",
       "type": "string"
+    },
+    "WatermarkConfig": {
+      "additionalProperties": false,
+      "description": "Configure a context-keyed watermark for ordinary token sampling.\n\nThe generation and detection configurations must match, including the\ntokenizer used to produce the token IDs. Keep the key private.",
+      "properties": {
+        "algorithm": {
+          "default": "gumbel",
+          "description": "Text watermark sampling algorithm.",
+          "enum": [
+            "gumbel",
+            "dual_key_gumbel"
+          ],
+          "title": "Algorithm",
+          "type": "string"
+        },
+        "alpha": {
+          "default": 0.1,
+          "description": "Mixing parameter for dual-key Gumbel watermark sampling.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Alpha",
+          "type": "number"
+        },
+        "context_width": {
+          "default": 4,
+          "description": "Number of preceding token IDs used to derive each watermark seed.",
+          "maximum": 16,
+          "minimum": 1,
+          "title": "Context Width",
+          "type": "integer"
+        },
+        "deduplicate_contexts_max_history": {
+          "default": 8192,
+          "description": "Maximum number of recent contexts excluded from repeated watermarking.",
+          "minimum": 1,
+          "title": "Deduplicate Contexts Max History",
+          "type": "integer"
+        },
+        "key": {
+          "description": "Secret unsigned 64-bit key shared by generation and detection.",
+          "maximum": 18446744073709551615,
+          "minimum": 0,
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Key",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "title": "WatermarkConfig",
+      "type": "object"
     }
   },
   "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc4/_static/schemas/trtllm-serve-disagg-config.schema.json",
@@ -10482,6 +10552,22 @@
       "description": "Pruning rate for video frames in multimodal models for Efficient Video Sampling (EVS). NOTE: this is currently only implemented in nemotron multimodal models. None (default) disables EVS, values in [0, 1) enable pruning.",
       "status": "prototype",
       "title": "Video Pruning Rate"
+    },
+    "watermark_config": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WatermarkConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Text watermark configuration. Enables watermarking by default for ordinary sampling; requests may opt out with watermarking=False.",
+      "status": "prototype",
+      "telemetry": {
+        "exclude": true
+      }
     }
   },
   "required": [],

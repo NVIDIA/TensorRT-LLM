@@ -1504,6 +1504,10 @@ class BaseLLM:
         if sampling_params is None:
             sampling_params = SamplingParams()
         if isinstance(sampling_params, SamplingParams):
+            if (sampling_params.watermarking is True
+                    and getattr(self.args, "watermark_config", None) is None):
+                raise ValueError(
+                    "watermarking=True requires an engine watermark_config")
             self._apply_generation_config_sampling_defaults(sampling_params)
             if sampling_params.end_id is None:
                 if self.tokenizer is None:

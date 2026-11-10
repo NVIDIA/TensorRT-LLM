@@ -932,6 +932,7 @@ def test_worker_enqueues_serializable_python_input_envelope(
             logprobs_mode=LogprobMode.PROCESSED,
             logprobs_simple_format=simple,
             return_routed_experts=True,
+            watermarking=True,
         ),
         multimodal_params=MultimodalParams(
             multimodal_data={"embedding": torch.ones(2, 4)}),
@@ -953,5 +954,6 @@ def test_worker_enqueues_serializable_python_input_envelope(
         assert translated.py_logprobs_simple_format is simple
         assert translated.py_num_logprobs == (0 if simple else 2)
         assert translated.py_return_routed_experts
+        assert translated.py_watermarking is True
         torch.testing.assert_close(translated.py_multimodal_data["embedding"],
                                    torch.ones(2, 4))

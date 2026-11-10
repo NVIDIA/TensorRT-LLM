@@ -75,6 +75,7 @@ from ..tokenizer import TOKENIZER_ALIASES  # noqa: F401
 from ..tokenizer import load_custom_tokenizer
 from ..usage.config import UsageContext  # noqa: F401
 from ..usage.config import TelemetryConfig, TelemetryField
+from ..watermarking.config import WatermarkConfig
 from .tokenizer import TokenizerBase, tokenizer_factory
 from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
                     get_type_repr)
@@ -7003,6 +7004,27 @@ TORCH_LLMARGS_REMOVED_ARGS = frozenset(_TORCH_LLMARGS_REMOVED_ARG_CHECKS)
 
 class TorchLlmArgs(BaseLlmArgs):
     # PyTorch backend specific configurations
+    watermark_config: Optional[WatermarkConfig] = Field(
+        default=None,
+        description="Text watermark configuration. Enables watermarking by default "
+        "for ordinary sampling; requests may opt out with watermarking=False.",
+        telemetry=False,
+        status="prototype")
+
+    @model_validator(mode="after")
+    def validate_watermark_config(self) -> 'TorchLlmArgs':
+        if self.watermark_config is None:
+            return self
+        if self.speculative_config is not None:
+            raise ValueError(
+                "Text watermarking does not support speculative decoding. "
+                "Remove speculative_config to enable watermark_config.")
+        if self.cache_transceiver_config is not None:
+            raise ValueError(
+                "Text watermarking does not support disaggregated serving. "
+                "Remove cache_transceiver_config to enable watermark_config.")
+        return self
+
     generation_config: Literal["auto", "trtllm"] = Field(
         default="trtllm",
         description=

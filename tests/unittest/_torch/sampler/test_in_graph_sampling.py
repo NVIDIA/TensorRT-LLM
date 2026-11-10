@@ -40,12 +40,15 @@ from typing import Any, cast
 import pytest
 import torch
 
+import tensorrt_llm._torch.pyexecutor.sampler.sampler as sampler_module
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LogprobMode, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.sampler.sampler import TorchSampler
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.sampler.sampling_resolution import SlotSamplingParams
 from tensorrt_llm._torch.pyexecutor.sampler.seed_manager import _SeedManager
+from tensorrt_llm._torch.pyexecutor.sampler.watermark import WatermarkHandler
 from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm.watermarking import WatermarkConfig
 
 # Params that are expressible as per-row (temperature, top_k, top_p) and so
 # qualify for the in-graph tier on their own.
@@ -71,6 +74,10 @@ class _Request:
     py_logits_post_processors: Any = None
     py_guided_decoding_params: Any = None
     py_embedding_bias: Any = None
+    py_watermarking: bool | None = None
+    py_draft_tokens: list[int] | None = None
+    is_context_only_request: bool = False
+    is_generation_only_request: bool = False
 
     def get_beam_width_by_iter(self, for_next_iteration: bool = False) -> int:
         return self.sampling_config.beam_width
@@ -96,6 +103,7 @@ class _Sampler(TorchSampler):
         self._slot_params = SlotSamplingParams(self.NUM_SLOTS, device=device)
         # No request in these tests uses top-p decay.
         self._top_p_decay = SimpleNamespace(uses_decay=lambda slot: False)
+        self._watermark = WatermarkHandler(None, device=device)
         # Declared by the real __init__, which also allocates device buffers.
         self._in_graph_dest_indices = None
         self._in_graph_staged = False
@@ -166,6 +174,105 @@ class TestTierSelection:
             sample_type(sampler, [make_request(py_stop_words_list=([[13]], [1]))])
             is SampleType.FAST
         )
+
+
+@pytest.mark.cpu_only
+class TestWatermarkTierSelection:
+    def test_engine_default_and_request_optout(self, sampler):
+        sampler._watermark = WatermarkHandler(WatermarkConfig(key=42), device="cpu")
+        assert sample_type(sampler, [make_request()]) is SampleType.FULL
+        assert sample_type(sampler, [make_request(py_watermarking=False)]) is SampleType.FAST
+
+    def test_pinned_fast_cannot_bypass_watermark(self, sampler):
+        sampler._watermark = WatermarkHandler(WatermarkConfig(key=42), device="cpu")
+        request = make_request()
+        sampler.admit(request)
+        scheduled = SimpleNamespace(num_context_requests=0, generation_requests=[request])
+        assert sampler.resolve_in_graph_sample_type(scheduled, SampleType.FAST) is SampleType.FULL
+        scheduled.generation_requests = [make_request(is_dummy=True)]
+        assert sampler.resolve_in_graph_sample_type(scheduled, SampleType.FAST) is SampleType.FAST
+
+    def test_grouping_separates_watermark_and_optout_and_bypasses_greedy(self, sampler):
+        sampler._watermark = WatermarkHandler(WatermarkConfig(key=42), device="cpu")
+        requests = [
+            make_request(py_seq_slot=0),
+            make_request(py_seq_slot=1, py_watermarking=False),
+            make_request(dict(temperature=0.0), py_seq_slot=2),
+            make_request(py_seq_slot=3, py_watermarking=True),
+        ]
+        sampler.admit(*requests)
+        groups = sampler._group_requests(requests, [0, 1, 2, 3])
+        assert [(group.req_indices, group.watermarked) for group in groups] == [
+            ([0, 3], True),
+            ([1], False),
+            ([2], False),
+        ]
+
+    def test_explicit_enable_without_engine_and_disagg_are_rejected(self, sampler):
+        sampler._top_p_decay.validate_request = lambda request: None
+        with pytest.raises(ValueError, match="engine watermark_config"):
+            sampler.validate_request(make_request(py_watermarking=True))
+        sampler._watermark = WatermarkHandler(WatermarkConfig(key=42), device="cpu")
+        with pytest.raises(ValueError, match="disaggregated"):
+            sampler.validate_request(make_request(is_generation_only_request=True))
+        with pytest.raises(ValueError, match="single-beam"):
+            sampler.validate_request(make_request(py_beam_width=2))
+
+    def test_fused_selection_consumes_native_probs_and_preserves_optout_seed_path(
+        self, sampler, monkeypatch
+    ):
+        request = make_request()
+        sampler.admit(request)
+        config = WatermarkConfig(key=42)
+        sampler._watermark = WatermarkHandler(config, device="cpu")
+        sampler._watermark.setup_request(
+            SimpleNamespace(
+                py_seq_slot=0,
+                py_request_id=0,
+                py_orig_prompt_len=4,
+                get_tokens=lambda beam: [1, 2, 3, 4],
+                is_dummy=False,
+            )
+        )
+        calls = []
+        seeds = SimpleNamespace(seed=torch.tensor([77]), offset=torch.tensor([99]))
+        sampler._seed_manager = SimpleNamespace(
+            take_row_seeds=lambda slots, device: calls.append(("seeds", slots)) or seeds
+        )
+        sampler._top_p_decay.override_top_p = lambda top_p, slots: top_p
+        probabilities = torch.tensor([[0.0, 0.7, 0.3, 0.0]])
+        stock = torch.tensor([2], dtype=torch.int32)
+
+        def native_with_probs(*params, **kwargs):
+            calls.append(("probs", params, kwargs))
+            return stock, probabilities
+
+        def native_tokens_only(*params, **kwargs):
+            calls.append(("tokens", params, kwargs))
+            return stock
+
+        monkeypatch.setattr(
+            sampler_module, "fused_sample_from_logits_with_probs", native_with_probs
+        )
+        monkeypatch.setattr(sampler_module, "fused_sample_from_logits", native_tokens_only)
+        logits = torch.tensor([[100.0, 2.0, 1.0, 100.0]])
+        marked, returned_probs, _ = sampler._sample_fused(
+            logits, [0], return_probs=True, watermarked=True
+        )
+        assert marked.item() in (1, 2)
+        assert returned_probs is probabilities
+        assert calls[1][0] == "probs"
+        assert calls[1][1][0] is logits
+        assert calls[1][2]["seed"] is seeds.seed
+        assert calls[1][2]["offset"] is seeds.offset
+        calls.clear()
+        opted_out, returned_probs, _ = sampler._sample_fused(logits, [0], return_probs=False)
+        assert torch.equal(opted_out, stock)
+        assert returned_probs is None
+        assert calls[0] == ("seeds", [0])
+        assert calls[1][0] == "tokens"
+        assert calls[1][2]["seed"] is seeds.seed
+        assert calls[1][2]["offset"] is seeds.offset
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="staging writes CUDA buffers")

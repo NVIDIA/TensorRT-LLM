@@ -685,6 +685,10 @@ class CompletionRequest(OpenAIBaseModel):
     prompt_ignore_length: Optional[int] = 0
 
     # doc: begin-completion-sampling-params
+    watermarking: Optional[bool] = Field(
+        default=None,
+        strict=True,
+        description="Override the engine's configured text watermark for this request.")
     use_beam_search: bool = False
     top_k: int = 0
     top_p_min: float = 0.0
@@ -771,6 +775,7 @@ class CompletionRequest(OpenAIBaseModel):
             prompt_ignore_length=self.prompt_ignore_length,
 
             # completion-sampling-params
+            watermarking=self.watermarking,
             use_beam_search=self.use_beam_search,
             top_k=self.top_k,
             top_p_min=self.top_p_min if self.top_p_min > 0 else None,
@@ -1178,6 +1183,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
                      "Accepted and ignored."))
 
     # doc: begin-chat-completion-sampling-params
+    watermarking: Optional[bool] = Field(
+        default=None,
+        strict=True,
+        description="Override the engine's configured text watermark for this request.")
     best_of: Optional[int] = None
     use_beam_search: bool = False
     top_k: int = 0
@@ -1334,6 +1343,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             prompt_ignore_length=self.prompt_ignore_length,
 
             # chat-completion-sampling-params
+            watermarking=self.watermarking,
             best_of=self.best_of,
             use_beam_search=self.use_beam_search,
             top_k=self.top_k,

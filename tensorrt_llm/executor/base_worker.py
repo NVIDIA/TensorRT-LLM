@@ -546,6 +546,7 @@ class BaseWorker(GenerationExecutor):
             executor_request = ExecutorRequest(
                 executor_request,
                 PythonRequestInputs(
+                    watermarking=request.sampling_params.watermarking,
                     original_end_id=request.sampling_params.end_id,
                     num_logprobs=request.sampling_params.logprobs,
                     lora_path=py_lora_path,

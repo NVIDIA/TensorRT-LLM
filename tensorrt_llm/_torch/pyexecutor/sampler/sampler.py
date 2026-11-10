@@ -38,6 +38,7 @@ from tensorrt_llm.bindings.internal.batch_manager import add_new_tokens_to_reque
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.logger import logger
+from tensorrt_llm.watermarking.config import WatermarkConfig
 
 from ...utils import torch_multi_arange
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
@@ -84,6 +85,7 @@ from .sampling_resolution import SamplingMode, SlotSamplingParams, request_row_p
 from .seed_manager import _SeedManager
 from .token_ban import OverlappedTokenBanHandler, SynchronousTokenBanHandler, TokenBanHandler
 from .top_p_decay import TopPDecayHandler
+from .watermark import WatermarkHandler
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -200,6 +202,7 @@ class _SamplingGroup:
 
     mode: SamplingMode
     needs_probs: bool
+    watermarked: bool = False
     req_indices: list[int] = field(default_factory=list)
     """Indices into the batch's requests, ascending."""
     beam_params: list[BeamSearchParams] = field(default_factory=list)
@@ -643,6 +646,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         disable_overlap_scheduler: bool = False
         enable_async_worker: bool = False
         enable_speculative_beam_history_d2h: bool = False
+        watermark_config: WatermarkConfig | None = None
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
@@ -694,6 +698,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # Per-slot Top-P Decay runtime state. Allocated for all
         # sampler instances; only decay-admitted slots are ever read.
         self._top_p_decay = TopPDecayHandler(self.max_num_sequences)
+        self._watermark = WatermarkHandler(args.watermark_config)
 
         # Token-ban handling (bad words, no-repeat ngram). The overlap-aware
         # variant is selected once here from whether the overlap scheduler is
@@ -891,7 +896,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         A batch runs at the capability of its most demanding request, so a tier
         is chosen only when *every* request in the batch fits it.
         """
-        if any(self._request_bypasses_in_graph_sampling(request) for request in requests):
+        if any(
+            self._watermark.enabled(request) or self._request_bypasses_in_graph_sampling(request)
+            for request in requests
+        ):
             return SampleType.FULL
         if self._can_use_fast_path(requests):
             return SampleType.FAST
@@ -947,6 +955,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # An all-dummy batch is a capture pass: the pinned tier decides,
             # since the warmup requests carry no sampling params of their own.
             return pinned_sample_type or SampleType.FULL
+        if any(self._watermark.enabled(request) for request in live_requests):
+            return SampleType.FULL
         if any(request.is_dummy for request in requests[: len(live_requests)]):
             # Dummies are expected to be a trailing run; the live rows are taken
             # to be the leading prefix when the results are read back.
@@ -1313,6 +1323,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # left: beam search is supported, and beam search with speculative decoding is
         # rejected for the whole sampler in __init__.
         self._top_p_decay.validate_request(request)
+        if getattr(request, "py_watermarking", None) is True and self._watermark.config is None:
+            raise ValueError("watermarking=True requires an engine watermark_config")
+        if self._watermark.enabled(request):
+            if request.py_beam_width != 1 or get_draft_token_length(request) != 0:
+                raise ValueError("Watermarking supports ordinary single-beam decoding only")
+            if request.is_context_only_request or request.is_generation_only_request:
+                raise ValueError("Watermarking does not support disaggregated requests")
         if self._use_beam_search:
             if request.py_return_log_probs:
                 if request.py_num_logprobs > 1:
@@ -1330,6 +1347,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     @override
     def release_request(self, request: LlmRequest) -> None:
         self._finish_reasons_handler.release_request(request)
+        self._watermark.release_request(request)
 
     @override
     @nvtx_range("setup_sampler_step")
@@ -1368,6 +1386,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     self._beam_search.clear_slot(slot)
 
             self._penalty_handler.prepare_for_new_request(request, slot)
+            self._watermark.setup_request(request)
 
         max_lens = self._finish_reasons_handler.new_max_lens
         end_ids = self._finish_reasons_handler.new_end_ids
@@ -1853,16 +1872,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             slot_params.assert_admitted(request, slot)
             mode = modes[slot]
             needs_probs = need_processed_logprobs[slot]
+            watermarked = mode is SamplingMode.SAMPLING and self._watermark.enabled(request)
             beam_params = None
             key: Hashable
             if mode is SamplingMode.BEAM:
                 beam_params = BeamSearchParams.from_request(request)
                 key = (mode, needs_probs, beam_params.group_key)
             else:
-                key = (mode, needs_probs)
+                key = (mode, needs_probs, watermarked)
             group = groups.get(key)
             if group is None:
-                group = groups[key] = _SamplingGroup(mode=mode, needs_probs=needs_probs)
+                group = groups[key] = _SamplingGroup(
+                    mode=mode, needs_probs=needs_probs, watermarked=watermarked
+                )
             group.req_indices.append(req_idx)
             if beam_params is not None:
                 group.beam_params.append(beam_params)
@@ -1874,6 +1896,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         slots_per_row: list[int],
         *,
         return_probs: bool,
+        watermarked: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         """Sample rows with the fused kernel, from their slots' params and seeds.
 
@@ -1891,11 +1914,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # device sync on every call.
         torch._assert_async(~torch.any(torch.isnan(logits_cuda)))
         params = (logits_cuda, temperature, top_k, top_p, min_p)
-        if return_probs:
+        if return_probs or watermarked:
             tokens, probs = fused_sample_from_logits_with_probs(
                 *params, seed=seeds.seed, offset=seeds.offset
             )
-            return tokens, probs, temperature
+            if watermarked:
+                tokens = self._watermark.sample(probs, tokens, slots_per_row)
+            return tokens, probs if return_probs else None, temperature
         return (
             fused_sample_from_logits(*params, seed=seeds.seed, offset=seeds.offset),
             None,
@@ -1999,11 +2024,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     )
                     for _ in range(steps)
                 ]
-                group_next_tokens_cuda, group_softmax_cuda, group_temperature_cuda = (
-                    self._sample_fused(
+                if group.watermarked:
+                    group_result = self._sample_fused(
+                        group_logits_cuda,
+                        group_slots_per_step,
+                        return_probs=group.needs_probs,
+                        watermarked=True,
+                    )
+                else:
+                    group_result = self._sample_fused(
                         group_logits_cuda, group_slots_per_step, return_probs=group.needs_probs
                     )
-                )
+                group_next_tokens_cuda, group_softmax_cuda, group_temperature_cuda = group_result
             else:
                 stop_words_metadata_cuda: torch.Tensor | None = None
                 if self._finish_reasons_handler.has_stop_word_history:

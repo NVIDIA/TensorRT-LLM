@@ -24,6 +24,7 @@ class PythonRequestInputs:
     """
 
     logits_post_processors: list[LogitsProcessor] | None = None
+    watermarking: bool | None = None
     multimodal_data: dict[str, Any] | None = None
     scheduling_params: SchedulingParams | None = None
     num_logprobs: int | None = 0
@@ -48,6 +49,7 @@ class PythonRequestInputs:
         """
         return cls(
             logits_post_processors=getattr(request, "py_logits_post_processors", None),
+            watermarking=getattr(request, "py_watermarking", None),
             multimodal_data=getattr(request, "py_multimodal_data", None),
             scheduling_params=getattr(request, "py_scheduling_params", None),
             num_logprobs=getattr(request, "py_num_logprobs", 0),

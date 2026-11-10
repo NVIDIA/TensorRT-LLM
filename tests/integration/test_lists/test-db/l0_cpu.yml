@@ -12,6 +12,8 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
+  - unittest/watermarking/test_watermarking.py
+  - unittest/_torch/sampler/test_in_graph_sampling.py::TestWatermarkTierSelection
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_collective_launcher_cleanup.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_modeling_v2_eagle3_worker_api.py
@@ -362,6 +364,7 @@ l0_cpu:
   - unittest/llmapi/test_runtime_control.py
   - unittest/llmapi/test_runtime_memory_api.py
   - unittest/llmapi/test_sampling_params.py
+  - unittest/llmapi/test_watermark_config.py
   - unittest/llmapi/test_serialization.py
   - unittest/llmapi/test_serve_frontend_affinity.py
   - unittest/llmapi/test_serve_context_only_settings.py

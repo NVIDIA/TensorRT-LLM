@@ -16,6 +16,7 @@ l0_h100:
       backend: pytorch
       orchestrator: mpi
   tests:
+  - unittest/watermarking/test_watermarking.py::test_gpu_prf_and_sampling_match_cpu
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
   # Covers the GPU cases of tests/unittest/_torch/attention/ on H100; its cpu_only cases

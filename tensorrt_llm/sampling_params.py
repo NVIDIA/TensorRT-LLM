@@ -209,6 +209,7 @@ class SamplingParams:
             If a list, each processor is applied in order during generation (supported in PyTorch backend only).
         apply_batched_logits_processor (bool): Whether to apply batched logits postprocessor callback. Defaults to False.
             The BatchedLogitsProcessor class is recommended for callback creation. The callback must be provided when initializing LLM.
+        watermarking (bool, optional): Enable or disable the engine's configured text watermark for this request. None follows the engine default. Enabling requires watermark_config at engine startup. Beam search and speculative decoding are unsupported. Defaults to None.
 
         n (int): Number of sequences to generate. Defaults to 1.
         best_of (int, optional): Number of sequences to consider for best output. Defaults to None.
@@ -294,6 +295,7 @@ class SamplingParams:
     embedding_bias: Optional[torch.Tensor] = None
     logits_processor: Optional[Union[LogitsProcessor, List[LogitsProcessor]]] = None
     apply_batched_logits_processor: bool = False
+    watermarking: Optional[bool] = None
 
     n: int = 1
     best_of: Optional[int] = None
@@ -391,6 +393,11 @@ class SamplingParams:
         For instance, while the greedy decoding with n > 1 is capable in the
         Executor class of C++ runtime, the LLM API disallows such combination.
         """
+        if self.watermarking is not None and type(self.watermarking) is not bool:
+            raise ValueError("watermarking must be a bool or None")
+        if self.watermarking and self.use_beam_search:
+            raise ValueError("Text watermarking does not support beam search")
+
         # These bounds are written as negated range checks rather than as
         # `value < low or value > high`, so that NaN is rejected too: every
         # comparison against NaN is False, which lets it slip through the
