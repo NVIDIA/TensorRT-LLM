@@ -61,12 +61,12 @@ def is_gen_node():
 
 
 def is_disagg_node():
-    return NODE_RANK == 0
+    return RANK == 0
 
 
 # The test is run on multinodes but only the first node's output is used for assertion
 def is_pytest_node():
-    return NODE_RANK == 0
+    return RANK == 0
 
 
 def env():
@@ -125,6 +125,7 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
         "kv_cache_config": {
             "free_gpu_memory_fraction": 0.8,
             "enable_block_reuse": False,
+            "avg_seq_len": 128,
         },
         "disable_overlap_scheduler": True,
         # Qwen3.5 reserves recurrent state for max_batch_size * pp_size
@@ -217,9 +218,10 @@ def test_completion(client: openai.OpenAI,
         time.sleep(10)
         disagg_server.terminate()
 
-    elif is_gen_node():
-        # keep gen workers alive until the test ends, again we hope the NODE_LIST is ordered by NODE_RANK
-        url = f"http://{get_the_other_host(0)}:{DISAGG_SERVER_PORT}/health/"
+    elif is_ctx_node() or is_gen_node():
+        # Keep all workers alive until the disaggregated server exits.
+        host = "localhost" if is_ctx_node() else get_the_other_host(0)
+        url = f"http://{host}:{DISAGG_SERVER_PORT}/health/"
         wait_for_endpoint_ready(url)
         wait_for_endpoint_down(url)
         assert True
