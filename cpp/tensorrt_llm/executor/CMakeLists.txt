@@ -96,7 +96,23 @@ target_link_libraries(
   PUBLIC tllm::common_logging CUDA::cuda_driver
   PRIVATE ${CMAKE_DL_LIBS})
 
-foreach(component tllm_executor_values tllm_executor_transfer_agent)
+add_library(tllm_executor_memory_desc STATIC memoryDesc.cpp)
+add_library(tllm::executor_memory_desc ALIAS tllm_executor_memory_desc)
+target_link_libraries(
+  tllm_executor_memory_desc
+  PUBLIC tllm::common_error
+  PRIVATE tllm::executor_values tllm::runtime_distributed)
+
+add_library(tllm_executor_agent_name STATIC
+            cache_transmission/agent_utils/agentName.cpp)
+add_library(tllm::executor_agent_name ALIAS tllm_executor_agent_name)
+target_link_libraries(
+  tllm_executor_agent_name
+  PUBLIC tllm::common_headers
+  PRIVATE Threads::Threads)
+
+foreach(component tllm_executor_values tllm_executor_transfer_agent
+                  tllm_executor_agent_name tllm_executor_memory_desc)
   target_compile_features(${component} PUBLIC cxx_std_20)
   set_target_properties(${component} PROPERTIES CXX_EXTENSIONS OFF
                                                 POSITION_INDEPENDENT_CODE ON)
@@ -104,8 +120,9 @@ endforeach()
 
 add_library(${EXECUTOR_STATIC_TARGET} STATIC ${SRCS})
 target_link_libraries(
-  ${EXECUTOR_STATIC_TARGET} PUBLIC tllm::executor_values
-                                   tllm::executor_transfer_agent)
+  ${EXECUTOR_STATIC_TARGET}
+  PUBLIC tllm::executor_values tllm::executor_transfer_agent
+         tllm::executor_agent_name tllm::executor_memory_desc)
 set_target_properties(
   ${EXECUTOR_STATIC_TARGET}
   PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"

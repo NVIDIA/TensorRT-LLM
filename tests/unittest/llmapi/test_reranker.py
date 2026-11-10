@@ -79,8 +79,8 @@ def _server(logits, *, max_seq_len=4096, max_num_tokens=4096):
     server.tokenizer = CharacterTokenizer()
     server.encode_batcher = FakeBatcher(logits)
     server._input_proc_executor = None
-    engine = SimpleNamespace(max_seq_len=max_seq_len, max_num_tokens=max_num_tokens)
-    server.generator = SimpleNamespace(_encoder_executor=SimpleNamespace(model_engine=engine))
+    encoder_executor = SimpleNamespace(max_seq_len=max_seq_len, max_num_tokens=max_num_tokens)
+    server.generator = SimpleNamespace(_encoder_executor=encoder_executor)
     return server
 
 

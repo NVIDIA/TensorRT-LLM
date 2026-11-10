@@ -39,6 +39,7 @@ from transformers import AutoProcessor
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm._utils import EnergyMonitor
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
@@ -607,7 +608,15 @@ class OpenAIServer(_VideoRoutesMixin):
             rl_control_api_key: Optional[str] = None,
             enable_runtime_control_endpoints: bool = False,
             runtime_control_api_key: Optional[str] = None,
-            multi_frontend_serving: Optional[MultiFrontendServing] = None):
+            multi_frontend_serving: Optional[MultiFrontendServing] = None,
+            graceful_shutdown_timeout: Optional[int] = None):
+        if graceful_shutdown_timeout is not None and graceful_shutdown_timeout <= 0:
+            raise ValueError(
+                "graceful_shutdown_timeout must be a positive number of "
+                f"seconds, got {graceful_shutdown_timeout}")
+        # Seconds uvicorn waits after a shutdown signal for request handlers
+        # still running before it cancels them; None waits for every handler.
+        self.graceful_shutdown_timeout = graceful_shutdown_timeout
         if enable_rl_control_endpoints:
             logger.warning(
                 "RL control endpoints are deprecated; use generic runtime "
@@ -977,7 +986,8 @@ class OpenAIServer(_VideoRoutesMixin):
         trust_remote_code = self.generator.args.trust_remote_code
         checkpoint_format = getattr(self.generator.args, "checkpoint_format",
                                     None)
-        if checkpoint_format in ("mistral", "mistral_large_3"):
+        if checkpoint_format in (CheckpointFormat.MISTRAL,
+                                 CheckpointFormat.MISTRAL_LARGE_3):
             # Do not load HF processor for mistral native checkpoints
             # even if it is available
             self.processor = None
@@ -1471,20 +1481,19 @@ class OpenAIServer(_VideoRoutesMixin):
             # returns one EncoderOutput per item, in input order.
             return self.generator.encode(token_ids_batch)
 
-        # Source the batch limits from the resolved encoder engine — the same
-        # attributes encode() validates against (llm.py: engine.max_seq_len /
-        # max_num_tokens / batch_size). LlmArgs.max_seq_len/max_num_tokens default
+        # Source the batch limits from the encoder executor's resolved limits —
+        # the same attributes encode() validates against. LlmArgs.max_seq_len/max_num_tokens default
         # to None and are not written back to args, so reading them from args
         # would leave the batcher's seq-len/token-budget guards inert (typed 400s
         # would never fire) and could let it form a batch encode() then rejects.
-        engine = self.generator._encoder_executor.model_engine
+        encoder_executor = self.generator._encoder_executor
         self.encode_batcher = EncodeBatcher(
             encode_fn,
-            max_batch_size=engine.batch_size,
+            max_batch_size=encoder_executor.max_batch_size,
             max_queue_delay=self._encode_max_queue_delay,
             max_queue_size=self._encode_max_queue_size,
-            max_num_tokens=engine.max_num_tokens,
-            max_seq_len=engine.max_seq_len,
+            max_num_tokens=encoder_executor.max_num_tokens,
+            max_seq_len=encoder_executor.max_seq_len,
         )
 
     def register_embedding_routes(self):
@@ -1614,8 +1623,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 doc if isinstance(doc, str) else doc.text
                 for doc in request.documents
             ]
-            engine = self.generator._encoder_executor.model_engine
-            max_prompt_length = min(engine.max_seq_len, engine.max_num_tokens)
+            encoder_executor = self.generator._encoder_executor
+            max_prompt_length = min(encoder_executor.max_seq_len,
+                                    encoder_executor.max_num_tokens)
             loop = asyncio.get_running_loop()
             try:
                 input_builder = await loop.run_in_executor(
@@ -2613,6 +2623,13 @@ class OpenAIServer(_VideoRoutesMixin):
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
+            if raw_request is not None:
+                # The executor client id, which the perf metrics, the
+                # post-processor hook records and the disconnect log carry. A
+                # caller that names its reply after the request (the Anthropic
+                # route) reads it here; a non-streamed chat completion's own id
+                # is random.
+                raw_request.state.executor_client_id = promise.request_id
             if not self.postproc_worker_enabled:
                 postproc_args.tokenizer = self.tokenizer
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
@@ -2673,10 +2690,14 @@ class OpenAIServer(_VideoRoutesMixin):
             return anthropic_error_response("Internal server error",
                                             "api_error", 500)
 
+        # The reply is named after the request (see anthropic_message_id).
+        executor_client_id = getattr(raw_request.state, "executor_client_id",
+                                     None)
         if isinstance(response, StreamingResponse):
             return StreamingResponse(
                 content=reframe_openai_stream(response.body_iterator,
-                                              model=self.model),
+                                              model=self.model,
+                                              request_id=executor_client_id),
                 media_type="text/event-stream",
             )
 
@@ -2693,7 +2714,8 @@ class OpenAIServer(_VideoRoutesMixin):
 
         try:
             chat_response = ChatCompletionResponse(**json.loads(response.body))
-            anthropic_response = convert_chat_response(chat_response)
+            anthropic_response = convert_chat_response(
+                chat_response, request_id=executor_client_id)
         except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
             logger.error("Invalid response from OpenAI chat pipeline:\n"
                          f"{traceback.format_exc()}")
@@ -2843,7 +2865,10 @@ class OpenAIServer(_VideoRoutesMixin):
 
         try:
             chat_response = ChatCompletionResponse(**json.loads(response.body))
-            anthropic_response = convert_chat_response(chat_response)
+            anthropic_response = convert_chat_response(
+                chat_response,
+                request_id=getattr(raw_request.state, "executor_client_id",
+                                   None))
         except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
             logger.error(
                 "Invalid response from OpenAI chat pipeline in batch:\n"
@@ -4366,18 +4391,28 @@ class OpenAIServer(_VideoRoutesMixin):
             )
 
     async def __call__(self,
-                       host,
-                       port,
-                       sockets: list[socket.socket] | None = None):
+                       host: str,
+                       port: int,
+                       sockets: list[socket.socket] | None = None) -> None:
         # Store the binding address for server registration
         self.binding_addr = f"http://{host}:{port}"
         self.host = host
         self.port = port
+        # Without graceful_shutdown_timeout, uvicorn keeps its default and
+        # waits for every request handler during graceful shutdown.
+        config_kwargs = {}
+        shutdown_timeout = self.graceful_shutdown_timeout
+        if shutdown_timeout is not None:
+            config_kwargs["timeout_graceful_shutdown"] = shutdown_timeout
+            logger.info(f"graceful_shutdown_timeout={shutdown_timeout}: "
+                        "uvicorn graceful shutdown cancels request handlers "
+                        f"still running after {shutdown_timeout}s")
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
                                 log_level="info",
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+                                **config_kwargs)
         server = create_uvicorn_server(config)
 
         async def _register_after_serving():

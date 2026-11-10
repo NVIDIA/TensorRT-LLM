@@ -108,8 +108,10 @@ def _loop_executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     executor.kv_cache_transceiver = None
     executor.kv_connector_manager = None
     executor.guided_decoder = None
+    executor.capturable_guided_decoder = None
     executor.drafter = None
     executor.dwdp_manager = None
+    executor.dense_dwdp_manager = None
     executor.speculation_gate = None
     executor.model_engine = SimpleNamespace(
         attn_metadata=None, kv_cache_dtype_byte_size=None, spec_metadata=None

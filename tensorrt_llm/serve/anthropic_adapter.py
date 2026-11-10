@@ -624,6 +624,29 @@ def convert_usage(usage: Optional[UsageInfo]) -> AnthropicUsage:
     return anthropic_usage
 
 
+def anthropic_message_id(request_id: Optional[int]) -> str:
+    """The Anthropic message id for a generation.
+
+    The message keeps the server's id for the request, ``msg_<request id>_<random
+    hex>``, so a reply can be matched with the server's records of the same
+    request; the random part keeps the id unique across server restarts, which
+    restart the count. Without ``request_id`` the message id is random.
+
+    A single server passes the executor client id (``RequestOutput.request_id``).
+    The perf metrics, the post-processor hook records and the disconnect log
+    name the request by it; PyExecutor numbers its requests on its own, so its
+    log lines carry a different id.
+
+    A disaggregated server passes its disaggregated request id: each worker
+    numbers its own requests, so a worker's id can name different requests on
+    different workers, while the disaggregated request id is unique across the
+    deployment and is the one its perf metrics record.
+    """
+    if request_id is not None:
+        return f"msg_{request_id}_{uuid.uuid4().hex[:16]}"
+    return f"msg_{uuid.uuid4().hex}"
+
+
 def thinking_signature(thinking: str) -> str:
     """The signature of a thinking block this server generated.
 
@@ -639,8 +662,14 @@ def thinking_signature(thinking: str) -> str:
     return base64.b64encode(digest).decode("ascii")
 
 
-def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMessagesResponse:
-    """Translate a non-streaming chat completion into an Anthropic message."""
+def convert_chat_response(
+    chat_response: ChatCompletionResponse, request_id: Optional[int] = None
+) -> AnthropicMessagesResponse:
+    """Translate a non-streaming chat completion into an Anthropic message.
+
+    ``request_id`` is the server's id for the request, when the caller has it;
+    the message id carries it (see ``anthropic_message_id``).
+    """
     content: List[Any] = []
     stop_reason: AnthropicStopReason = "end_turn"
     stop_sequence: Optional[str] = None
@@ -686,6 +715,7 @@ def convert_chat_response(chat_response: ChatCompletionResponse) -> AnthropicMes
         content.append(AnthropicTextBlock(text=""))
 
     return AnthropicMessagesResponse(
+        id=anthropic_message_id(request_id),
         model=chat_response.model,
         content=content,
         stop_reason=stop_reason,
@@ -746,9 +776,9 @@ class AnthropicStreamReframer:
     ``partial_json`` is exactly what upstream sent for it.
     """
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, request_id: Optional[int] = None):
         self.model = model
-        self.message_id = f"msg_{uuid.uuid4().hex}"
+        self.message_id = anthropic_message_id(request_id)
         self.message_started = False
         self.block_index = -1
         self.open_block_type: Optional[str] = None
@@ -1200,9 +1230,11 @@ async def _with_ticks(
 
 
 async def reframe_openai_stream(
-    openai_sse: AsyncIterator[Union[str, bytes]], model: str
+    openai_sse: AsyncIterator[Union[str, bytes]], model: str, request_id: Optional[int] = None
 ) -> AsyncIterator[str]:
     """Translate an OpenAI SSE stream into Anthropic SSE frames.
+
+    ``request_id`` names the message as in ``convert_chat_response``.
 
     Until [DONE], a ping goes out whenever no other event has for
     ``STREAM_PING_INTERVAL_S`` seconds, before ``message_start`` too: the message
@@ -1210,7 +1242,7 @@ async def reframe_openai_stream(
     slow first token would otherwise leave the stream silent. Clients skip
     pings wherever they appear.
     """
-    reframer = AnthropicStreamReframer(model=model)
+    reframer = AnthropicStreamReframer(model=model, request_id=request_id)
     done = False
     # The frames that close the message, held from [DONE] until the upstream
     # has been read to its end.
