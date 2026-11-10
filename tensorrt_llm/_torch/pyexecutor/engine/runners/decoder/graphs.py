@@ -385,11 +385,10 @@ class DecoderCudaGraphs:
 
         The graphs are kept only if, on every rank, no captured graph's top-level attention or
         speculative-decoding metadata tensor moved by the last capture; buffers held elsewhere are
-        not checked. On False no graph is left.
+        not checked. On False the graphs it captured are discarded.
         """
         if not self.cuda_graph_runner.enabled:
             return False
-        assert not self.cuda_graph_runner.graphs, "Decode CUDA graphs are captured once per warmup"
         # Every rank joins, so a rank without the switch keeps all ranks on two passes.
         requested = _skip_warmup_pass_requested()
         blocker = self._single_pass_blocker() if requested else None
@@ -430,6 +429,8 @@ class DecoderCudaGraphs:
     def _single_pass_blocker(self) -> str | None:
         """Why this rank may not try the single pass; None when nothing only the warmup-only
         pass does is needed and the ranks can agree."""
+        if self.cuda_graph_runner.graphs:
+            return "decode CUDA graphs were already captured"
         # One gate per duty of the warmup-only pass in run_cuda_graph_warmup.
         if self._lora.cuda_graph_manager is not None:
             return "LoRA CUDA graphs tune their kernels in the warmup-only pass"
@@ -673,6 +674,7 @@ class DecoderCudaGraphs:
                     postprocess_fn=postprocess_inputs,
                     # Serving replays the timeouts current at capture.
                     capture_scope=functools.partial(moe_comm_serving_timeouts, quiet=True),
+                    record_tensor_ptrs=self._capturing_in_one_pass,
                 )
 
             if self.cuda_graph_runner.is_warmup_only:

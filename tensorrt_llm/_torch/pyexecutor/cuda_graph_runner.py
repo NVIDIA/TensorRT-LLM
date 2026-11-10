@@ -827,13 +827,15 @@ class CUDAGraphRunner:
         enable_spec_decode: bool = False,
         postprocess_fn: Optional[Callable] = None,
         capture_scope: Callable[
-            [], contextlib.AbstractContextManager] = contextlib.nullcontext
+            [], contextlib.AbstractContextManager] = contextlib.nullcontext,
+        record_tensor_ptrs: bool = False,
     ) -> Any:
         """Warm up and/or capture the forward pass for a graph key.
 
         ``capture_scope`` encloses the graph capture but not the warmup
         forwards before it. It is entered before the stream capture begins, so
-        it may switch the MoE communication timeouts.
+        it may switch the MoE communication timeouts. ``record_tensor_ptrs``
+        records the graph's metadata tensor addresses for moved_graph_tensors().
         """
         batch_size = key.batch_size
         # [CUDA graph spec decode padding]
@@ -928,7 +930,8 @@ class CUDAGraphRunner:
                 if prologue_pack is not None:
                     self._step_input_prologue_keys[key] = prologue_pack
                 output = forward_fn(capture_inputs)
-            self._record_graph_tensor_ptrs(key)
+            if record_tensor_ptrs or _STRICT_BUFFER_CHECK:
+                self._record_graph_tensor_ptrs(key)
             _restore_spec_decode_capture_state(attn_metadata,
                                                saved_kv_lens_cuda)
 
@@ -1106,12 +1109,13 @@ class CUDAGraphRunner:
 
         These are the addresses the captured graph's kernels may have baked
         in; any of them changing before a later replay means the graph would
-        read stale (or freed) memory. obj.graph_temporary_attrs are skipped.
+        read stale (or freed) memory. obj.graph_temporary_attrs are skipped,
+        and an object without a __dict__ records nothing.
         """
         graph_temporary_attrs = getattr(obj, "graph_temporary_attrs", ())
         return {
             name: value.data_ptr()
-            for name, value in vars(obj).items()
+            for name, value in getattr(obj, "__dict__", {}).items()
             if isinstance(value, torch.Tensor) and value.is_cuda
             and name not in graph_temporary_attrs
         }
