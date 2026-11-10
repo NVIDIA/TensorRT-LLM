@@ -142,9 +142,14 @@ def serve_args(
     member: str | None,
     options: str | Path,
 ) -> list[str]:
-    """Public config plus accuracy-specific request limits."""
+    """Public config plus accuracy-specific request limits, on one HTTP frontend.
+
+    The gate asks a handful of requests, which one frontend serves. Several need the
+    classic IPC executor proxy, which a one-rank engine on the single-process worker
+    does not have (`num_serve_frontends > 1 requires the classic IPC executor proxy`).
+    """
     accuracy = task_data.get("accuracy") or {}
-    args = ["--config", str(options)]
+    args = ["--config", str(options), "--num_serve_frontends=1"]
     for flag in ("max_seq_len", "max_batch_size"):
         if accuracy.get(flag) is not None:
             args.append(f"--{flag}={accuracy[flag]}")

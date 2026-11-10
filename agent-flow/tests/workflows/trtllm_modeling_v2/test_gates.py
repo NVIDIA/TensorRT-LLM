@@ -188,10 +188,14 @@ def test_the_gate_reads_the_driver_and_names_the_member(tmp_path):
         f"{serve_driver.SERVER_MARKER} {json.dumps({'healthy': True, 'boot_s': 3.0})}\n"
     )
     block = {"kind": "local", "python": "/venv/bin/python", "env": {"HF_HUB_OFFLINE": "1"}}
+
+    def runner(command, env=None, timeout=0):
+        return CommandResult(returncode=0, stdout=stdout)
+
     result = sg.run_serve_gate(
         resolve_environment({"environment": block}, devices=(), world_size=1),
         task_data=task,
-        runner=lambda command, env=None, timeout=0: CommandResult(returncode=0, stdout=stdout),
+        runner=runner,
         features=[],
         unit="core",
         member="tp1",
@@ -199,6 +203,12 @@ def test_the_gate_reads_the_driver_and_names_the_member(tmp_path):
     )
     assert result.passed, result.detail
     assert result.summary().startswith("[PASS] serve@tp1: trtllm-serve healthy after 3.0s")
+    # One frontend: several need the classic IPC proxy a one-rank engine does not have.
+    assert sg.serve_args(task, None, member="tp1", options=options)[:3] == [
+        "--config",
+        str(options),
+        "--num_serve_frontends=1",
+    ]
 
 
 NODE = "tests/integration/defs/accuracy/test_disaggregated_multinode.py::TestStep5::test_dep4"
