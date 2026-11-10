@@ -198,7 +198,10 @@ def test_quantization_passes_match_declared_fused_checkpoint_names(
     prefix = "model.layers.3.self_attn"
     declared = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
     other = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    legacy = QuantConfig(quant_algo=QuantAlgo.FP8)
     quant_config_dict = {
+        # The undeclared gate/up projection keeps its by-name match.
+        "model.layers.3.mlp.gate_proj": legacy,
         # Another layer's entries never reach this projection.
         "model.layers.2.self_attn.index_q_proj": other,
         "model.layers.2.self_attn.index_k_proj": other,
@@ -214,7 +217,7 @@ def test_quantization_passes_match_declared_fused_checkpoint_names(
     )
     model_config = SimpleNamespace(quant_config=global_config, quant_config_dict=quant_config_dict)
     projection = _fused_index_projection(declare_names=True)
-    # Without declared names the passes never look at the index entries.
+    # Without declared names a fused projection keeps the gate/up name match.
     undeclared = _fused_index_projection(declare_names=False)
     modules = [
         (f"{prefix}.index_qk_proj", projection),
@@ -231,7 +234,7 @@ def test_quantization_passes_match_declared_fused_checkpoint_names(
             run_passes()
         return
     run_passes()
-    assert undeclared.quant_config is None
+    assert undeclared.quant_config is legacy
     if expected == "declared":
         assert projection.quant_config is declared
     elif expected == "excluded":

@@ -91,7 +91,12 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     is_minimax_m3_vl_config,
 )
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
-from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2, fused_checkpoint_names
+from tensorrt_llm._torch.models.modeling_utils import (
+    _load_weights_impl_v2,
+    apply_layerwise_quant_config,
+    apply_quant_config_exclude_modules,
+    fused_checkpoint_names,
+)
 from tensorrt_llm._torch.modules.linear import _load_kv_cache_scales
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
@@ -3275,6 +3280,10 @@ def test_packaged_index_projection_keeps_mxfp8_scales_per_tp4_rank(
             disable_index_value=True,
         )
         proj = attn.index_qk_proj
+        # The enclosing model's __post_init__ applies the per-layer entries.
+        named = [("model.layers.3.self_attn.index_qk_proj", proj)]
+        apply_layerwise_quant_config(model_cfg, iter(named))
+        apply_quant_config_exclude_modules(model_cfg, iter(named))
         assert proj.quant_config.quant_algo == QuantAlgo.MXFP8
         proj.create_weights()
         assert type(proj.quant_method).__name__ == "MXFP8LinearMethod"
