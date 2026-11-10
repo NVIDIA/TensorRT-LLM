@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from enum import IntEnum
 from functools import partial, wraps
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import aiohttp
@@ -883,15 +883,16 @@ class Etcd3ClusterStorage(ClusterStorage):
                 "and worker of the cluster uses the same record_auth_key")
         return record["value"]
 
-    def _read_prefix(self, key_prefix: str) -> Dict[str, str]:
-        """The valid records under ``key_prefix``."""
+    def _read_prefix(self, key_prefix: str) -> Tuple[Dict[str, str], int]:
+        """The valid records under ``key_prefix`` and the etcd revision of the read."""
+        response = self.client.get_prefix_response(key_prefix)
         records = {}
-        for stored, metadata in self.client.get_prefix(key_prefix):
-            key = _decode_key(metadata.key)
-            value = None if key is None else self._decode_record(key, stored)
+        for kv in response.kvs:
+            key = _decode_key(kv.key)
+            value = None if key is None else self._decode_record(key, kv.value)
             if value is not None:
                 records[key] = value
-        return records
+        return records, response.header.revision
 
     async def start(self):
         # nothing to do
@@ -939,7 +940,7 @@ class Etcd3ClusterStorage(ClusterStorage):
     async def get_prefix(self,
                          key_prefix: str,
                          keys_only: bool = False) -> Dict[str, str]:
-        records = self._read_prefix(key_prefix)
+        records, _ = self._read_prefix(key_prefix)
         return {key: "" for key in records} if keys_only else records
 
     @handle_etcd_error(return_on_error=None)
@@ -956,14 +957,22 @@ class Etcd3ClusterStorage(ClusterStorage):
             self._on_watch_stream_end(watch_handle, watch_handle.stream)
         return watch_handle
 
-    async def _start_watch(self, handle: Etcd3WatchEventQueue) -> None:
-        """Fill ``handle`` from a new watch stream on the current client."""
+    async def _start_watch(self,
+                           handle: Etcd3WatchEventQueue,
+                           start_revision: Optional[int] = None) -> None:
+        """Fill ``handle`` from a new watch stream on the current client.
+
+        The stream reports the changes from etcd revision ``start_revision`` on, or from now on
+        if it is None.
+        """
         handle.cancel_event()
         handle.stream += 1
         client = self.client
-        watch_id = await asyncio.to_thread(
-            client.add_watch_prefix_callback, handle.key_prefix,
-            partial(handle.add_events_from_resp, handle.stream))
+        watch_id = await asyncio.to_thread(client.add_watch_prefix_callback,
+                                           handle.key_prefix,
+                                           partial(handle.add_events_from_resp,
+                                                   handle.stream),
+                                           start_revision=start_revision)
         # Cancel on the client that owns the watch, also after a reconnect.
         handle.set_cancel_event(partial(client.cancel_watch, watch_id))
 
@@ -987,16 +996,21 @@ class Etcd3ClusterStorage(ClusterStorage):
                 self._restart_watch(handle))
 
     async def _restart_watch(self, handle: Etcd3WatchEventQueue) -> None:
-        """Watch on a new stream until one starts, then queue what changed meanwhile."""
+        """Queue what changed meanwhile, then watch on a new stream from there until one starts."""
         delay = _WATCH_RETRY_MIN_SEC
         while self._watch_handles.get(handle.key_prefix) is handle:
             handle.stream_ended = False
             try:
                 await self.connect()
-                await self._start_watch(handle)
-                # A read with the current login also catches a watch that etcd
-                # did not start because it rejected the login token.
-                handle.resync(self._read_prefix(handle.key_prefix))
+                client = self.client
+                records, revision = self._read_prefix(handle.key_prefix)
+                # The new stream reports the changes made after the read, so
+                # the consumer gets them after the resync, in etcd's order.
+                handle.resync(records)
+                await self._start_watch(handle, start_revision=revision + 1)
+                # etcd does not report a watch that it did not start because
+                # it rejected the login token; a read with the same login does.
+                client.get(handle.key_prefix)
             except (etcd3.Etcd3Exception, grpc.RpcError, OSError,
                     ValueError) as e:
                 handle.stream_ended = True

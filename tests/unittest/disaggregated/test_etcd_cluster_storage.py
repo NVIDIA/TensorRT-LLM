@@ -207,31 +207,40 @@ class FakeEtcdClient:
 
     def __init__(self, data=None):
         self.data = {} if data is None else data
+        # etcd revision, counted by the writes made through this client.
+        self.revision = 0
         self.callbacks = {}
+        # start_revision of each watch created, in order.
+        self.start_revisions = []
         self.cancelled = []
 
     def put(self, key, value, lease=None):
         self.data[key] = value
+        self.revision += 1
 
     def put_if_not_exists(self, key, value, lease=None):
         if key in self.data:
             return False
-        self.data[key] = value
+        self.put(key, value)
         return True
 
     def get(self, key):
         value = self.data.get(key)
         return (None if value is None else _bytes(value)), None
 
-    def get_prefix(self, prefix):
-        return [
-            (_bytes(value), SimpleNamespace(key=_bytes(key)))
-            for key, value in self.data.items()
-            if _bytes(key).startswith(prefix.encode())
-        ]
+    def get_prefix_response(self, prefix):
+        return SimpleNamespace(
+            header=SimpleNamespace(revision=self.revision),
+            kvs=[
+                SimpleNamespace(key=_bytes(key), value=_bytes(value))
+                for key, value in self.data.items()
+                if _bytes(key).startswith(prefix.encode())
+            ],
+        )
 
-    def add_watch_prefix_callback(self, prefix, callback):
+    def add_watch_prefix_callback(self, prefix, callback, start_revision=None):
         self.callbacks[prefix] = callback
+        self.start_revisions.append(start_revision)
         return prefix
 
     def cancel_watch(self, watch_id):
@@ -411,6 +420,8 @@ async def test_watch_continues_on_a_new_stream_with_the_changes_made_meanwhile(s
         ("SET", f"{PREFIX}/c", "value-c2"),
         ("SET", f"{PREFIX}/d", "value-d"),
     ]
+    # The new stream starts after the read, which saw revision 5.
+    assert client.start_revisions == [None, 6]
     # Events of the ended stream are ignored; the new stream fills the queue.
     late = {"value": "late", "signature": sign_record(RECORD_KEY, f"{PREFIX}/e", "late")}
     first_stream(SimpleNamespace(events=[PutEvent(f"{PREFIX}/e", json.dumps(late))]))
@@ -461,31 +472,82 @@ async def test_watch_is_tried_again_until_etcd_answers(monkeypatch):
     assert connect.call_count == 3 and PREFIX in second.callbacks
 
 
-class _EndsOnFirstWatch(FakeEtcdClient):
-    """A client whose first watch stream ends while the watch is being created."""
+class _OnWatch(FakeEtcdClient):
+    """A client that calls ``hooks[n]`` with the callback of its n-th watch as it creates it."""
 
-    def __init__(self):
+    def __init__(self, hooks):
         super().__init__()
-        self.watches = 0
+        self.hooks = hooks
 
-    def add_watch_prefix_callback(self, prefix, callback):
-        watch_id = super().add_watch_prefix_callback(prefix, callback)
-        self.watches += 1
-        if self.watches == 1:
-            callback(None)
+    def add_watch_prefix_callback(self, prefix, callback, start_revision=None):
+        watch_id = super().add_watch_prefix_callback(prefix, callback, start_revision)
+        hook = self.hooks.get(len(self.start_revisions))
+        if hook:
+            hook(callback)
         return watch_id
 
 
 @pytest.mark.asyncio
 async def test_watch_whose_stream_ends_before_watch_returns_is_watched_again():
-    client, storage = _storage(client=_EndsOnFirstWatch())
+    # The first stream ends while the watch is being created.
+    client, storage = _storage(client=_OnWatch({1: lambda callback: callback(None)}))
     await storage.set(f"{PREFIX}/a", "value-a")
     handle = await storage.watch(PREFIX)
     assert handle.restart_task is not None
     await asyncio.wait_for(handle.restart_task, 1)
-    assert client.watches == 2
+    assert client.start_revisions == [None, 2]
     assert _changes(await asyncio.wait_for(handle.drain(), 1)) == [
         ("SET", f"{PREFIX}/a", "value-a")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_watch_that_etcd_did_not_start_for_the_login_token_is_created_again(monkeypatch):
+    monkeypatch.setattr(cluster_storage, "_WATCH_RETRY_MIN_SEC", 0)
+
+    def reject_login(callback):
+        # etcd stops accepting the login as the new watch is created, and answers the watch as
+        # if it had started it; reads with that login fail.
+        stale.get = stale.get_prefix_response = mock.Mock(
+            side_effect=_RpcError(
+                grpc.StatusCode.INVALID_ARGUMENT, "etcdserver: revision of auth store is old"
+            )
+        )
+
+    stale, fresh = _OnWatch({2: reject_login}), FakeEtcdClient()
+    with _connect(stale, fresh) as connect:
+        storage = Etcd3ClusterStorage(ETCD_URI, "c", **LOGIN)
+        handle = await storage.watch(PREFIX)
+        stale.callbacks[PREFIX](None)
+        await asyncio.sleep(0)
+        await asyncio.wait_for(handle.restart_task, 1)
+    assert connect.call_count == 2 and PREFIX in fresh.callbacks
+
+
+@pytest.mark.asyncio
+async def test_changes_reported_by_the_new_stream_are_queued_after_the_resync():
+    old, new = f"{PREFIX}/old", f"{PREFIX}/new"
+
+    def worker_comes_back(callback):
+        # The new stream reports a worker that came back on the address of the old one.
+        record = {"value": "host:8001", "signature": sign_record(RECORD_KEY, new, "host:8001")}
+        client.put(new, json.dumps(record))
+        callback(SimpleNamespace(events=[PutEvent(new, client.data[new])]))
+
+    client, storage = _storage(client=_OnWatch({2: worker_comes_back}))
+    await storage.set(old, "host:8001")
+    handle = await storage.watch(PREFIX)
+    client.send(PREFIX, PutEvent(old, client.data[old]))
+    assert len(await asyncio.wait_for(handle.drain(), 1)) == 1
+
+    del client.data[old]  # while the stream is down
+    client.callbacks[PREFIX](None)
+    await asyncio.sleep(0)
+    await asyncio.wait_for(handle.restart_task, 1)
+    # A consumer that keys workers by address removes the old worker before adding the new.
+    assert _changes(await asyncio.wait_for(handle.drain(), 1)) == [
+        ("DELETE", old, ""),
+        ("SET", new, "host:8001"),
     ]
 
 
