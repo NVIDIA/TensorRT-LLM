@@ -334,6 +334,21 @@ struct DiskTransfer
         return ok;
     }
 
+    //! Runs the piece unless the transfer has already failed. A skipped write leaves its page incomplete, so it is
+    //! recorded as failed like the piece that failed, as the synchronous path does for the tasks after a failure.
+    bool runPieceUnlessFailed(size_t task, ssize_t offset, ssize_t length) noexcept
+    {
+        if (ok.load())
+        {
+            return runPiece(task, offset, length);
+        }
+        if (!isRead)
+        {
+            recordFailedDiskWrite(writes[task].dst.fd, writes[task].dst.pos);
+        }
+        return false;
+    }
+
     void finish() noexcept
     {
         if (!ok.load())
@@ -466,7 +481,8 @@ private:
                 queue.pop_front();
             }
             DiskTransfer& transfer = *piece.transfer;
-            if (!transfer.runPiece(piece.task, piece.offset, piece.length))
+            // Once a piece has failed, the transfer has failed: skip the syscalls of its remaining pieces.
+            if (!transfer.runPieceUnlessFailed(piece.task, piece.offset, piece.length))
             {
                 transfer.ok.store(false);
             }
