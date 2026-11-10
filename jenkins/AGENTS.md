@@ -56,10 +56,10 @@ Scope: this directory and its descendants. Supplements the repository-root
   without rebasing; builds that already took their snapshot are unaffected.
 - To restore execution, remove the relevant entries in a recovery PR; dates in
   the reason do not expire them. Keep the file and header when no entries remain.
-  Before merging, run `/bot run --stage-list "<affected-stage-names-or-patterns>" --disable-reuse-test`
+  Before merging, run `/bot run --stage-list "<affected-stage-names-or-patterns>"`
   on the recovery PR and verify every affected stage actually executes. The PR's
   deletions take effect for its own validation before merge. Regressions may have
-  entered while coverage was disabled: fix failures or add approved, tracked test
+  entered while coverage was disabled: fix failures or add tracked test
   waivers through the normal waiver process, then rerun and confirm the remaining
   tests pass on the latest PR head before merging the maintenance removal.
 
