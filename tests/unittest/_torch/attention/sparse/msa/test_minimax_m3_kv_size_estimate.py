@@ -119,10 +119,16 @@ def test_estimate_matches_nondefault_cache_layout(monkeypatch, dense_layers, exp
         "get_layer_bytes_per_token",
         lambda self, layer, role: generic_layer_bytes,
     )
-    kv_bytes = sum(manager.get_layer_bytes_per_token(i, cache_manager.Role.ALL) for i in range(60))
+    # Role.ALL includes each sparse layer's index-K row, so it is the full allocation.
+    layer_bytes = sum(
+        manager.get_layer_bytes_per_token(i, cache_manager.Role.ALL) for i in range(60)
+    )
     index_buffers = manager._extra_buffers_per_layer(tokens_per_block=128)
     index_bytes = (
         sum(buffer.size for buffers in index_buffers.values() for buffer in buffers) // 128
     )
+    assert index_bytes == sum(
+        manager.get_layer_bytes_per_token(i, cache_manager.Role.INDEX_KEY) for i in range(60)
+    )
     extra = KVM._extra_bytes_per_token(config, _mapping(2, False), None, kwargs)
-    assert 60 * generic_layer_bytes + extra == kv_bytes + index_bytes
+    assert 60 * generic_layer_bytes + extra == layer_bytes
