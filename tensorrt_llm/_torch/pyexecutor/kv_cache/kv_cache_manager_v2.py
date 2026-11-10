@@ -4177,7 +4177,9 @@ class KVCacheManagerV2(BaseResourceManager):
         needs_extra_leases = self.is_disagg or (
             not self._disable_overlap_scheduler and not self.mapping.has_pp()
         )
-        num_sequences = self.max_batch_size * self.mapping.pp_size * (2 if needs_extra_leases else 1)
+        num_sequences = (
+            self.max_batch_size * self.mapping.pp_size * (2 if needs_extra_leases else 1)
+        )
         draft_bytes = (
             window_bytes_per_sequence * num_sequences + sum(draft_sizes) * self.max_num_tokens
         ) / max_util_for_resume
