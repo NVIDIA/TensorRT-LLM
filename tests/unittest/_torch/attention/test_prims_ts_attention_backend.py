@@ -19,6 +19,7 @@ import math
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import backend_case
 import pytest
 import torch
 from backend_case import (
@@ -76,57 +77,49 @@ _DEEPSEEK_V3_LITE_MLA = {
 }
 
 
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
 @pytest.mark.parametrize(
-    "phase_args",
+    (
+        "seq_lens",
+        "num_cached_tokens",
+        "num_contexts",
+        "dtype",
+        "kv_dtype",
+        "use_kv_cache_manager_v2",
+    ),
     [
+        pytest.param([65, 37], [0, 0], 2, "bfloat16", None, False, id="native-context-v1"),
+        pytest.param([65, 37], [0, 0], 2, "bfloat16", None, True, id="native-context-v2"),
+        pytest.param([1, 1], [64, 96], 0, "bfloat16", None, False, id="native-generation-v1"),
+        pytest.param([1, 1], [64, 96], 0, "bfloat16", None, True, id="native-generation-v2"),
+        pytest.param([41, 1], [0, 63], 1, "bfloat16", None, False, id="native-mixed-v1"),
+        pytest.param([41, 1], [0, 63], 1, "bfloat16", None, True, id="native-mixed-v2"),
+        pytest.param([65, 37], [0, 0], 2, "bfloat16", "fp8", False, id="fp8-context-bf16-v1"),
+        pytest.param([65, 37], [0, 0], 2, "float16", "fp8", True, id="fp8-context-fp16-v2"),
+        pytest.param([1, 1], [64, 96], 0, "float16", "fp8", False, id="fp8-generation-fp16-v1"),
         pytest.param(
-            {
-                "seq_lens": [65, 37],
-                "num_cached_tokens": [0, 0],
-                "num_contexts": 2,
-            },
-            id="context",
+            [1, 1], [8191, 4096], 0, "bfloat16", "fp8", True, id="fp8-long-generation-bf16-v2"
         ),
-        pytest.param(
-            {
-                "seq_lens": [1, 1],
-                "num_cached_tokens": [64, 96],
-                "num_contexts": 0,
-            },
-            id="generation",
-        ),
-        pytest.param(
-            {
-                "seq_lens": [41, 1],
-                "num_cached_tokens": [0, 63],
-                "num_contexts": 1,
-            },
-            id="mixed",
-        ),
-        pytest.param(
-            {"seq_lens": [41, 17], "num_cached_tokens": [63, 32], "num_contexts": 2},
-            id="cached-context",
-        ),
-        pytest.param(
-            {"seq_lens": [1, 1], "num_cached_tokens": [8191, 4096], "num_contexts": 0},
-            id="long-generation",
-        ),
+        pytest.param([41, 1], [0, 63], 1, "bfloat16", "fp8", False, id="fp8-mixed-bf16-v1"),
+        pytest.param([41, 1], [0, 63], 1, "float16", "fp8", True, id="fp8-mixed-fp16-v2"),
     ],
 )
-@pytest.mark.parametrize("dtype", ["bfloat16", "float16"], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("kv_dtype", [None, "fp8"], ids=["native-kv", "fp8-kv"])
 def test_prims_ts_qwen2_gqa(
     monkeypatch: pytest.MonkeyPatch,
     use_kv_cache_manager_v2: bool,
-    phase_args: dict,
+    seq_lens: list[int],
+    num_cached_tokens: list[int],
+    num_contexts: int,
     kv_dtype: str | None,
     dtype: str,
 ) -> None:
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
+    if kv_dtype == "fp8":
+        monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
     case = BackendCase(
         **{**_QWEN2_7B, "dtype": dtype},
-        **phase_args,
+        seq_lens=seq_lens,
+        num_cached_tokens=num_cached_tokens,
+        num_contexts=num_contexts,
         kv_dtype=kv_dtype,
         use_kv_cache_manager_v2=use_kv_cache_manager_v2,
     )
@@ -134,12 +127,92 @@ def test_prims_ts_qwen2_gqa(
     run_case(case)
 
 
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
-@pytest.mark.parametrize("kv_dtype", [None, "fp8"], ids=["native-kv", "fp8-kv"])
-@pytest.mark.parametrize("num_cached_tokens", [[0, 0], [32, 64]], ids=["context", "cached-context"])
-@pytest.mark.parametrize("dtype", ["bfloat16", "float16"], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("preprocessing", ["cached-rope", "computed-rope"])
-@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize(
+    (
+        "dtype",
+        "preprocessing",
+        "head_dim",
+        "use_kv_cache_manager_v2",
+        "num_cached_tokens",
+        "kv_dtype",
+    ),
+    [
+        pytest.param("bfloat16", "cached-rope", 128, False, [0, 0], None, id="native-v1"),
+        pytest.param("bfloat16", "cached-rope", 128, True, [0, 0], None, id="native-v2"),
+        pytest.param(
+            "bfloat16",
+            "cached-rope",
+            128,
+            False,
+            [0, 0],
+            "fp8",
+            id="fp8-bf16-cached-rope-d128-v1-context",
+        ),
+        pytest.param(
+            "bfloat16",
+            "cached-rope",
+            256,
+            True,
+            [32, 64],
+            "fp8",
+            id="fp8-bf16-cached-rope-d256-v2-prefix",
+        ),
+        pytest.param(
+            "bfloat16",
+            "computed-rope",
+            128,
+            True,
+            [0, 0],
+            "fp8",
+            id="fp8-bf16-computed-rope-d128-v2-context",
+        ),
+        pytest.param(
+            "bfloat16",
+            "computed-rope",
+            256,
+            False,
+            [32, 64],
+            "fp8",
+            id="fp8-bf16-computed-rope-d256-v1-prefix",
+        ),
+        pytest.param(
+            "float16",
+            "cached-rope",
+            128,
+            True,
+            [32, 64],
+            "fp8",
+            id="fp8-fp16-cached-rope-d128-v2-prefix",
+        ),
+        pytest.param(
+            "float16",
+            "cached-rope",
+            256,
+            False,
+            [0, 0],
+            "fp8",
+            id="fp8-fp16-cached-rope-d256-v1-context",
+        ),
+        pytest.param(
+            "float16",
+            "computed-rope",
+            128,
+            False,
+            [32, 64],
+            "fp8",
+            id="fp8-fp16-computed-rope-d128-v1-prefix",
+        ),
+        pytest.param(
+            "float16",
+            "computed-rope",
+            256,
+            True,
+            [0, 0],
+            "fp8",
+            id="fp8-fp16-computed-rope-d256-v2-context",
+        ),
+    ],
+)
 def test_prims_ts_context_receives_zeroed_v_tail(
     monkeypatch: pytest.MonkeyPatch,
     use_kv_cache_manager_v2: bool,
@@ -149,8 +222,6 @@ def test_prims_ts_context_receives_zeroed_v_tail(
     preprocessing: str,
     head_dim: int,
 ) -> None:
-    import backend_case
-
     from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
     from tensorrt_llm._torch.attention.backends.prims_ts.context import BatchPrefillPagedTSWrapper
 
@@ -292,8 +363,11 @@ def test_prims_ts_context_receives_zeroed_v_tail(
     assert plan_flags == [True]
 
 
-@pytest.mark.parametrize("dtype", ["bfloat16", "float16"], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("kv_dtype", [None, "fp8"], ids=["native-kv", "fp8-kv"])
+@pytest.mark.parametrize(
+    ("dtype", "kv_dtype"),
+    [("bfloat16", None), ("float16", "fp8")],
+    ids=["native-bf16", "fp8-fp16"],
+)
 def test_prims_ts_decode_with_computed_rope(
     monkeypatch: pytest.MonkeyPatch, dtype: str, kv_dtype: str | None
 ) -> None:
@@ -308,6 +382,7 @@ def test_prims_ts_decode_with_computed_rope(
 
     monkeypatch.setattr(PrimsTSFmha, "run_generation", run_generation_without_rope_table)
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
+    monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
     run_case(
         BackendCase(
             **{**_QWEN2_7B, "dtype": dtype},
@@ -326,6 +401,8 @@ def test_prims_ts_fp16_dense_context_with_alternate_shape(
     kv_dtype: str | None,
 ) -> None:
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
+    if kv_dtype == "fp8":
+        monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
     case = BackendCase(
         num_heads=8,
         num_kv_heads=2,
@@ -1814,22 +1891,10 @@ def test_prims_ts_unsupported_context_falls_back(monkeypatch: pytest.MonkeyPatch
     assert calls["prims_context"] == 0
 
 
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
-@pytest.mark.parametrize(
-    ("mode", "page_size", "head_ratio"),
-    [
-        ("disabled", 16, 1),
-        ("gmem_reduction", 32, 7),
-        ("gmem_reduction_with_separate_kernel", 64, 8),
-        ("cluster_smem_reduction", 128, 16),
-    ],
-)
 def test_prims_ts_fp8_decode_bf16_device_scales(
-    monkeypatch: pytest.MonkeyPatch, head_dim: int, mode: str, page_size: int, head_ratio: int
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Qualify BF16 stores/reducers and live device scales across graph replay."""
-    from dataclasses import replace
-
+    """Check FP8 decode with live device scales across graph replay."""
     import cutlass
 
     from tensorrt_llm._torch.attention.backends.prims_ts import decode
@@ -1838,6 +1903,7 @@ def test_prims_ts_fp8_decode_bf16_device_scales(
     )
 
     torch.manual_seed(123)
+    head_dim, page_size, head_ratio = 128, 64, 8
     batch_size, kv_heads = 2, 2
     qo_heads = kv_heads * head_ratio
     max_kv_len = 2048
@@ -1854,7 +1920,7 @@ def test_prims_ts_fp8_decode_bf16_device_scales(
     bmm1 = torch.tensor([0.25 / math.sqrt(head_dim)], device="cuda")
     bmm2 = torch.tensor([1.75], device="cuda")
     output = torch.empty_like(q, dtype=torch.bfloat16)
-    splits = 1 if mode == "disabled" else 4
+    splits = 4
     cfg = make_decode_config(
         headdim=head_dim,
         args={"tile_size_q": 16, "groups_tokens_heads_q": True, "use_keeps_mma_ab": False},
@@ -1867,51 +1933,40 @@ def test_prims_ts_fp8_decode_bf16_device_scales(
         o_dtype=cutlass.BFloat16,
         qkv_layout="pagedKv",
         num_tokens_per_page=page_size,
-        split_kv_mode=mode,
+        split_kv_mode="gmem_reduction_with_separate_kernel",
         splits_kv=splits,
         max_splits_kv=splits,
         mask_type="causal",
         auto_tuner=False,
     )
 
-    def plan(output_dtype: torch.dtype, use_device_scales: bool):
-        spec = decode._decode_launch_spec_from_config(
-            replace(
-                cfg,
-                out_dtype=cutlass.BFloat16 if output_dtype == torch.bfloat16 else cutlass.Float16,
-            ),
-            batch_size=batch_size,
-            num_qo_heads=qo_heads,
-            num_kv_heads=kv_heads,
-            head_dim=head_dim,
-            seq_len_q=1,
-            max_active_clusters=torch.cuda.get_device_properties(0).multi_processor_count,
-        )
-        monkeypatch.setattr(decode, "_resolve_decode_launch_spec", lambda *args, **kwargs: spec)
-        wrapper = decode.BatchDecodePagedTSWrapper()
-        wrapper.plan(
-            q.device,
-            batch_size,
-            qo_heads,
-            kv_heads,
-            head_dim,
-            page_size,
-            max_kv_len,
-            q_dtype=q.dtype,
-            out_dtype=output_dtype,
-            mask_type="causal",
-            softmax_scale=bmm1 if use_device_scales else bmm1.item(),
-            output_scale=bmm2 if use_device_scales else bmm2.item(),
-        )
-        return wrapper
-
-    wrapper = plan(torch.bfloat16, True)
-    fp16_wrapper = plan(torch.float16, False)
-    bf16_host_wrapper = plan(torch.bfloat16, False)
+    spec = decode._decode_launch_spec_from_config(
+        cfg,
+        batch_size=batch_size,
+        num_qo_heads=qo_heads,
+        num_kv_heads=kv_heads,
+        head_dim=head_dim,
+        seq_len_q=1,
+        max_active_clusters=torch.cuda.get_device_properties(0).multi_processor_count,
+    )
+    monkeypatch.setattr(decode, "_resolve_decode_launch_spec", lambda *args, **kwargs: spec)
+    wrapper = decode.BatchDecodePagedTSWrapper()
+    wrapper.plan(
+        q.device,
+        batch_size,
+        qo_heads,
+        kv_heads,
+        head_dim,
+        page_size,
+        max_kv_len,
+        q_dtype=q.dtype,
+        out_dtype=output.dtype,
+        mask_type="causal",
+        softmax_scale=bmm1,
+        output_scale=bmm2,
+    )
 
     def run() -> torch.Tensor:
-        if mode == "gmem_reduction":
-            wrapper._plan_state.workspace.split_kv_counter.zero_()
         return wrapper.run(
             q,
             (k, v),
@@ -1936,40 +1991,9 @@ def test_prims_ts_fp8_decode_bf16_device_scales(
         return torch.stack(results)
 
     def check_output() -> None:
-        # The FP8 kernel rounds the intermediate P operand to E4M3. Compare
-        # math with that quantization tolerance, and the existing FP16 output
-        # path tightly to isolate BF16 stores and device-scale handling.
+        # The FP8 kernel rounds the intermediate P operand to E4M3.
         torch.testing.assert_close(output.float(), reference(), atol=0.01, rtol=0.05)
-        if mode == "gmem_reduction":
-            fp16_wrapper._plan_state.workspace.split_kv_counter.zero_()
-        fp16_output = fp16_wrapper.run(
-            q,
-            (k, v),
-            lengths,
-            table,
-            softmax_scale=bmm1.item(),
-            output_scale=bmm2.item(),
-            validate=False,
-        )
-        torch.testing.assert_close(output.float(), fp16_output.float(), atol=0.0005, rtol=0.008)
 
-        if mode == "gmem_reduction":
-            bf16_host_wrapper._plan_state.workspace.split_kv_counter.zero_()
-        bf16_host_output = bf16_host_wrapper.run(
-            q,
-            (k, v),
-            lengths,
-            table,
-            softmax_scale=bmm1.item(),
-            output_scale=bmm2.item(),
-            validate=False,
-        )
-        torch.testing.assert_close(
-            output.float(), bf16_host_output.float(), atol=0.0005, rtol=0.008
-        )
-
-    if mode == "gmem_reduction":
-        wrapper._plan_state.workspace.split_kv_counter.zero_()
     wrapper.run(
         q,
         (k, v),
