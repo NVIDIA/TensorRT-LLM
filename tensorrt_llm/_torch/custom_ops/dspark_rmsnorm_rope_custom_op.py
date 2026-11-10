@@ -4,6 +4,7 @@
 """Torch custom op for fused DSpark RMSNorm and RoPE."""
 
 import functools
+from collections.abc import Callable
 
 import cutlass
 import cutlass.cute as cute
@@ -198,7 +199,7 @@ def _compile_fused_dspark_rmsnorm_rope(
     inverse_rope: bool,
     norm_dim: int,
     strided_rows: bool = False,
-):
+) -> Callable[[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor], None]:
     """Compile the fused RMSNorm+RoPE kernel."""
     rows = cute.sym_int()
     freq_rows = cute.sym_int()
@@ -484,9 +485,9 @@ def cute_dsl_dspark_rmsnorm_rope(
         )
 
     original_shape = x.shape
-    # Fused QKV projections supply regular strided views; this specialization
-    # uses compact rows in its compiled signature.
-    x_flat = x.view(-1, x.shape[-1]).contiguous()
+    # Fused QKV projections accept strided rows as input; the kernel reads
+    # them in place through a runtime row stride. The output rows are compact.
+    x_flat = x.view(-1, x.shape[-1])
     output = torch.empty_like(x_flat)
     compiled = _compile_fused_dspark_rmsnorm_rope(
         x.shape[-1],
@@ -516,7 +517,7 @@ def _(
     inverse_rope: bool,
     norm_dim: int | None = None,
 ) -> torch.Tensor:
-    return torch.empty_like(x)
+    return x.new_empty(x.shape)
 
 
 @torch.library.custom_op(
