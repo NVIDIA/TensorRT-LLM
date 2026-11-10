@@ -207,7 +207,7 @@ class CommunicationFactory:
                 payload_in_workspace,
                 alltoall_result_do_sum,
                 hidden_size=hidden_size,
-                sentinel_format=sentinel_format,
+                layer_quant_config=layer_quant_config,
             )
             logger.info(
                 f"Selected communication strategy: {strategy.__class__.__name__} "
@@ -357,10 +357,13 @@ class CommunicationFactory:
         payload_in_workspace: bool,
         alltoall_result_do_sum: bool,
         hidden_size: Optional[int] = None,
-        sentinel_format: Optional[str] = "BF16",
+        layer_quant_config: Optional["QuantConfig"] = None,
     ) -> Communication:
         """
         Create a specific method (for debugging/testing)
+
+        ``layer_quant_config`` is the MoE layer's own quantization config when it overrides the
+        model's; the NVLinkOneSided sentinel payload format follows it.
 
         Raises:
             RuntimeError: If the forced method is not supported on this platform
@@ -376,6 +379,12 @@ class CommunicationFactory:
         moe_max_num_tokens = model_config.moe_max_num_tokens
         use_cuda_graph = model_config.use_cuda_graph
         use_low_precision_combine = model_config.use_low_precision_moe_combine
+        dispatch_quant_config = (
+            layer_quant_config if layer_quant_config is not None else quant_config
+        )
+        sentinel_format = sentinel_payload_format(
+            dispatch_quant_config.quant_algo if dispatch_quant_config is not None else None
+        )
 
         method = method.upper()
 
