@@ -652,8 +652,8 @@ class HfWeightLoader(BaseWeightLoader):
         selected = [
             path for path in weight_files if os.path.basename(path) in needed
         ]
-        logger.info(f"Reading {len(selected)} of {len(weight_files)} "
-                    f"checkpoint files that hold {key_prefixes} keys.")
+        logger.debug(f"Reading {len(selected)} of {len(weight_files)} "
+                     f"checkpoint files that hold {key_prefixes} keys.")
         return selected
 
     def build_checkpoint_catalog(
