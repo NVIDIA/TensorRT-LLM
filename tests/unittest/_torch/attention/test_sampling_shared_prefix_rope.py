@@ -25,9 +25,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_kernels import fused_rope_supported
 from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix import (
     SamplingSharedPrefixFmha,
-    _fused_rope_supported,
 )
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
@@ -89,9 +89,7 @@ def test_rope_write_kv_paged_matches_fp32_reference(
     HF-style fp32 rotation at the absolute positions ``kv_len - q_len + j``, around page
     boundaries: Q rotated in place, the rotated K and the V written at slot ``page_len - q_len + j``
     of the private pages, dimensions past the rotary dim untouched."""
-    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import (
-        rope_write_kv_paged,
-    )
+    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_kernels import rope_write_kv_paged
 
     theta = 1000000.0
     _, table = _rope_params(rotary_dim, theta, scale_type, scale).create_rope_const_params()
@@ -189,7 +187,7 @@ def test_library_accepts_supported_rope_and_declines_the_rest():
         RotaryScalingType.mrope,
     ):
         attn = _fake_attn(rope=_rope_params(64, scale_type=scale_type, scale=2.0))
-        assert not _fused_rope_supported(attn), scale_type
+        assert not fused_rope_supported(attn), scale_type
         assert not SamplingSharedPrefixFmha._is_available(attn), scale_type
     for position_type in (
         PositionEmbeddingType.rope_gptj,
