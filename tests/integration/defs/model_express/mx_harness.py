@@ -690,9 +690,11 @@ def mx_transfer_upper_bound(manifest: WeightManifest) -> tuple[int, int]:
     no buffers. Non-empty parameters that view one storage at the same offset,
     such as a tied LM head and its token-embedding table, are one view and
     count once, at the largest of their sizes, because ModelExpress registers
-    whichever of them comes first in module order. Empty parameters count once
-    each, although they can share the null data pointer, so the result bounds
-    the transfer from above.
+    whichever of them comes first in module order. Two cases can count more
+    than ModelExpress registers, so the result bounds the transfer from above:
+    empty parameters, which count once each but can share the null data
+    pointer, and parameters of different dtypes that start at one address,
+    which count once per dtype.
     """
     storage_of = {fqn: index for index, group in enumerate(manifest.alias_groups) for fqn in group}
     views: dict[tuple[object, ...], int] = {}

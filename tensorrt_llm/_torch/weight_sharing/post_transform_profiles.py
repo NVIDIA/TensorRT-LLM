@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, ClassVar
 
+from tensorrt_llm.logger import logger
+
 if TYPE_CHECKING:
     from torch import nn
 
@@ -186,6 +188,11 @@ def _realized_tied_word_embeddings(model: nn.Module) -> bool | None:
     their weights are the same tensor or identical views of the same memory,
     and `False` when they are distinct tensors. It is `None` when the model
     does not have exactly one of each, or when either has no tensor weight.
+
+    Matching by trailing name is deliberate: a root that holds a second head
+    or table, such as an in-tree MTP or draft model, always gets `None`, so no
+    profile that constrains the tie qualifies it. Such a root needs its own
+    rule for which head and table to compare before a profile can qualify it.
     """
     weights: dict[str, list[object]] = {"lm_head": [], "embed_tokens": []}
     for name, module in model.named_modules():
@@ -198,6 +205,18 @@ def _realized_tied_word_embeddings(model: nn.Module) -> bool | None:
     if head_weights[0] is None or table_weights[0] is None:
         return None
     return _same_weight_memory(head_weights[0], table_weights[0])
+
+
+def _tie_mismatch_reason(declared: bool | None, realized: bool | None) -> str:
+    """Explain, for logs, how a declared embedding tie and the realized one disagree."""
+    if realized is None:
+        found = "the model has no single lm_head and embed_tokens weight pair to compare"
+    else:
+        sharing = "shared" if realized else "distinct"
+        found = f"the model's lm_head and embed_tokens weights are {sharing}"
+    if declared is None:
+        return f"the config declares no boolean tie_word_embeddings, and {found}"
+    return f"the config declares tie_word_embeddings={declared}, but {found}"
 
 
 def _canonical_optional_string(container: object, attribute: str) -> str | None:
@@ -347,8 +366,16 @@ class PostTransformRuntimeConfig:
         tied_word_embeddings = _canonical_bool(
             getattr(pretrained_config, "tie_word_embeddings", None)
         )
-        if model is not None and _realized_tied_word_embeddings(model) != tied_word_embeddings:
-            tied_word_embeddings = None
+        if model is not None:
+            realized_tie = _realized_tied_word_embeddings(model)
+            if realized_tie != tied_word_embeddings:
+                # Qualification reports only the dimension; log the cause at
+                # debug level, since loads that never use MX also get here.
+                logger.debug(
+                    "Post-transform qualification treats tied_word_embeddings as unknown: "
+                    + _tie_mismatch_reason(tied_word_embeddings, realized_tie)
+                )
+                tied_word_embeddings = None
 
         return cls(
             dtype=_canonical_string(getattr(model_config, "torch_dtype", None)),

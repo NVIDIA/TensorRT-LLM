@@ -33,6 +33,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformRuntimeConstraints,
     PostTransformTransferScope,
 )
+from tensorrt_llm.logger import logger
 
 
 class _Model(nn.Module):
@@ -800,6 +801,68 @@ def test_runtime_config_keeps_declared_tie_without_model() -> None:
         )
 
         assert runtime_config.tied_word_embeddings is declared_tie
+
+
+@pytest.mark.parametrize(
+    "model_factory, declared_tie, expected_reason",
+    [
+        pytest.param(
+            lambda: _CausalLM(tied=False),
+            True,
+            "the config declares tie_word_embeddings=True, but the model's lm_head and "
+            "embed_tokens weights are distinct",
+            id="declared-tie-not-realized",
+        ),
+        pytest.param(
+            lambda: _CausalLM(tied=True),
+            None,
+            "the config declares no boolean tie_word_embeddings, and the model's lm_head and "
+            "embed_tokens weights are shared",
+            id="realized-tie-not-declared",
+        ),
+        pytest.param(
+            _model_with_two_heads,
+            False,
+            "the config declares tie_word_embeddings=False, but the model has no single "
+            "lm_head and embed_tokens weight pair to compare",
+            id="ambiguous-heads",
+        ),
+    ],
+)
+def test_runtime_config_logs_why_the_tie_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    model_factory: object,
+    declared_tie: bool | None,
+    expected_reason: str,
+) -> None:
+    messages: list[str] = []
+    monkeypatch.setattr(logger, "debug", messages.append)
+
+    runtime_config = PostTransformRuntimeConfig.from_model_config(
+        SimpleNamespace(pretrained_config=SimpleNamespace(tie_word_embeddings=declared_tie)),
+        model=model_factory(),
+    )
+
+    assert runtime_config.tied_word_embeddings is None
+    assert messages == [
+        f"Post-transform qualification treats tied_word_embeddings as unknown: {expected_reason}"
+    ]
+
+
+def test_runtime_config_logs_nothing_when_the_model_realizes_the_declared_tie(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    messages: list[str] = []
+    monkeypatch.setattr(logger, "debug", messages.append)
+
+    for declared_tie in (True, False):
+        runtime_config = PostTransformRuntimeConfig.from_model_config(
+            SimpleNamespace(pretrained_config=SimpleNamespace(tie_word_embeddings=declared_tie)),
+            model=_CausalLM(tied=declared_tie),
+        )
+
+        assert runtime_config.tied_word_embeddings is declared_tie
+    assert messages == []
 
 
 def test_registry_rejects_duplicate_profile_id() -> None:
