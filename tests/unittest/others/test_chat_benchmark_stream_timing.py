@@ -93,6 +93,7 @@ def test_metadata_events_do_not_count_as_generated_output(monkeypatch):
         {"tool_calls": [{"index": 0, "function": {"name": "weather"}}]},
         {"function_call": {"arguments": "{}"}},
         {"refusal": "cannot comply"},
+        {"audio": {"id": "audio_0", "data": "UklGRg=="}},
     ],
 )
 def test_nonempty_output_types_set_ttft(monkeypatch, delta):
@@ -130,7 +131,29 @@ def test_no_output_has_no_first_token_or_intervals(monkeypatch):
         monkeypatch,
         [(101.0, _choice({"role": "assistant"})), (102.0, _choice({}, finish_reason="stop"))],
     )
-    assert out.success
+    assert not out.success
+    assert "output-bearing chunk" in out.error
     assert out.ttft == 0.0
     assert out.itl == []
     assert out.latency == 2.0
+
+
+def test_no_output_with_usage_is_excluded_from_metrics(monkeypatch):
+    """Usage alone must not make a stream without output count as successful.
+
+    ``calculate_metrics`` only aggregates successful requests, so marking this
+    response failed keeps its default TTFT of 0.0 out of the TTFT and TPOT
+    statistics.
+    """
+    out = _request(
+        monkeypatch,
+        [
+            (101.0, _choice({"role": "assistant"})),
+            (150.0, _choice({}, finish_reason="stop")),
+            (151.0, {"choices": [], "usage": {"completion_tokens": 5}}),
+        ],
+    )
+    assert not out.success
+    assert out.output_tokens == 5
+    assert out.itl == []
+    assert out.latency == 51.0

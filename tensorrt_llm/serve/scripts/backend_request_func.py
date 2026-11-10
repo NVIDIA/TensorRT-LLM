@@ -384,6 +384,15 @@ async def async_request_openai_chat_completions(
 
                         most_recent_timestamp = timestamp
 
+                    # Without an output-bearing event there is no TTFT, and
+                    # the default of 0.0 would skew the aggregated TTFT and
+                    # TPOT, so the response is marked as failed instead.
+                    if last_output_timestamp is None:
+                        output.success = False
+                        output.error = (
+                            "Never received an output-bearing chunk to "
+                            "calculate TTFT. This response will be marked "
+                            "as failed!")
                     output.generated_text = generated_text
                     output.latency = most_recent_timestamp - st
                 else:
