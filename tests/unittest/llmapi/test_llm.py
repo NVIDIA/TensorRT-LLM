@@ -680,13 +680,18 @@ class MyLogitsProcessor(LogitsProcessor):
             logits[..., self.biased_word_id] = 0
 
 
-def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
+def tinyllama_logits_processor_test_harness(backend=None,
+                                            return_context_logits=False,
+                                            **llm_kwargs):
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
     max_tokens = 6
+    # With context logits the step holds a row per prompt token, so the
+    # processor must still edit the row the first token is sampled from.
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
-        logits_processor=MyLogitsProcessor(biased_word_id))
+        logits_processor=MyLogitsProcessor(biased_word_id),
+        return_context_logits=return_context_logits)
 
     prompts = ["A B C"]
     if llm_kwargs.get('enable_chunked_prefill', None):
@@ -698,12 +703,15 @@ def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
     # rather than hardcoding a particular tokenizer's rendering.
     expected_output = tokenizer.decode([biased_word_id] * max_tokens)
 
+    # Every token is forced, so the output must match exactly: a fuzzy match
+    # would pass when one token (e.g. the first) misses the processor.
     llm_test_harness(
         llama_model_path,
         prompts, [expected_output],
         sampling_params=sampling_params,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
         backend=backend,
+        similar_threshold=1.0,
         **llm_kwargs)
 
 

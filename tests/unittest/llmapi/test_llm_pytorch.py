@@ -66,11 +66,15 @@ from dataclasses import replace
 
 
 @force_ampere
+@pytest.mark.parametrize("return_context_logits", [False, True])
 @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
 @pytest.mark.part2
-def test_tinyllama_logits_processor(enable_chunked_prefill):
+def test_tinyllama_logits_processor(enable_chunked_prefill,
+                                    return_context_logits):
     tinyllama_logits_processor_test_harness(
-        backend="pytorch", enable_chunked_prefill=enable_chunked_prefill)
+        backend="pytorch",
+        enable_chunked_prefill=enable_chunked_prefill,
+        return_context_logits=return_context_logits)
 
 
 @skip_ray
