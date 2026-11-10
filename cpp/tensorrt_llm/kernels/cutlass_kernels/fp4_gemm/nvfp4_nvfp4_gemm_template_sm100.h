@@ -189,6 +189,9 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
                 {                                                                                                      \
                     if constexpr (std::is_same_v<Arch, cutlass::arch::Sm103>)                                          \
                     {                                                                                                  \
+                        /* CUTLASS 4.4.2's SM103 scale-factor load warp does not wait for PDL producers. */            \
+                        /* Waiting here also protects the epilogue constructor's read of a produced alpha. */          \
+                        /* Revisit with CUTLASS >= 4.8: its scale-warp wait alone does not protect alpha. */           \
                         cutlass::arch::wait_on_dependent_grids();                                                      \
                     }                                                                                                  \
                     this->Base::operator()(params, smem_buf);                                                          \

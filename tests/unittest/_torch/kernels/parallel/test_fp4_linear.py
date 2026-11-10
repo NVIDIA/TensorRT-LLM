@@ -17,12 +17,15 @@ import sys
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 from utils.util import skip_pre_blackwell
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                                                 IS_CUTLASS_DSL_RUBIN_AVAILABLE)
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
 from tensorrt_llm._torch.modules.linear import (Linear, WeightMode,
@@ -34,6 +37,109 @@ from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 scaling_vector_size = 16
+
+
+@triton.jit
+def _delayed_fp4_gemm_input(source: tl.tensor, destination: tl.tensor,
+                            element_count: tl.constexpr,
+                            block_size: tl.constexpr) -> None:
+    """Release the consumer before publishing one delayed GEMM input."""
+    tl.extra.cuda.gdc_wait()
+    tl.extra.cuda.gdc_launch_dependents()
+    tl.inline_asm_elementwise(
+        """{
+            .reg .u64 start, current, elapsed;
+            .reg .pred waiting;
+            mov.u64 start, %globaltimer;
+        delay:
+            nanosleep.u32 1000;
+            mov.u64 current, %globaltimer;
+            sub.u64 elapsed, current, start;
+            setp.lt.u64 waiting, elapsed, 10000000;
+            @waiting bra delay;
+            mov.u32 $0, 0;
+        }""",
+        constraints="=r,~{memory}",
+        args=[],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+    offsets = tl.arange(0, block_size)
+    values = tl.load(source + offsets, offsets < element_count, other=0)
+    tl.store(destination + offsets, values, offsets < element_count)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or get_sm_version() != 103,
+                    reason="Requires SM103")
+@pytest.mark.parametrize("delayed_input", ["scale_factors", "alpha"])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_fp4_gemm_pdl_producer_dependency(delayed_input: str,
+                                          use_cuda_graph: bool) -> None:
+    """An early PDL trigger must not expose unfinished inputs to CUTLASS."""
+    if not get_env_enable_pdl():
+        pytest.skip("Requires programmatic dependent launch")
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    activations = torch.randn(8,
+                              1024,
+                              device="cuda",
+                              dtype=torch.bfloat16,
+                              generator=generator)
+    weights = torch.randn(1024,
+                          1024,
+                          device="cuda",
+                          dtype=torch.bfloat16,
+                          generator=generator)
+    activation_scale = torch.tensor([100.0], device="cuda")
+    weight_scale = torch.tensor([100.0], device="cuda")
+    activation_fp4, activation_sf = torch.ops.trtllm.fp4_quantize(
+        activations, activation_scale, scaling_vector_size, False)
+    weight_fp4, weight_sf = torch.ops.trtllm.fp4_quantize(
+        weights, weight_scale, scaling_vector_size, False)
+    alpha = 1.0 / (activation_scale * weight_scale)
+    source = activation_sf if delayed_input == "scale_factors" else alpha
+    delayed = torch.empty_like(source)
+    poison = 0x7F if delayed_input == "scale_factors" else float("nan")
+
+    def gemm(scale_factors: torch.Tensor,
+             global_scale: torch.Tensor) -> torch.Tensor:
+        """Exercise the public GEMM entry point with CUTLASS forced."""
+        return torch.ops.trtllm.nvfp4_gemm(activation_fp4,
+                                           weight_fp4,
+                                           scale_factors,
+                                           weight_sf,
+                                           global_scale,
+                                           torch.bfloat16,
+                                           allowed_backends="cutlass")
+
+    def chain() -> torch.Tensor:
+        """Keep one input poisoned until its PDL producer finishes."""
+        delayed.fill_(poison)
+        _delayed_fp4_gemm_input[(1, )](source,
+                                       delayed,
+                                       source.numel(),
+                                       triton.next_power_of_2(source.numel()),
+                                       launch_pdl=True)
+        return gemm(
+            delayed if delayed_input == "scale_factors" else activation_sf,
+            delayed if delayed_input == "alpha" else alpha)
+
+    with autotune(False):
+        torch.cuda.synchronize()
+        expected = gemm(activation_sf, alpha)
+        for _ in range(3):
+            chain()
+        torch.cuda.synchronize()
+        if use_cuda_graph:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                actual = chain()
+            for _ in range(3):
+                graph.replay()
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        else:
+            for _ in range(3):
+                torch.testing.assert_close(chain(), expected, rtol=0, atol=0)
 
 
 @skip_pre_blackwell
