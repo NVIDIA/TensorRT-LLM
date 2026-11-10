@@ -464,6 +464,45 @@ def test_small_payload_retains_native_or_chunked_collective(
     assert _fields(record)["mpi.operation"] == f"{group_name}_allgather"
 
 
+def test_world_typed_broadcast_preserves_parent_root_and_int64_buffer(
+    active: tuple[Mock, MagicMock, Mock],
+) -> None:
+    """Keep typed world broadcast on the parent communicator with its actual metadata."""
+    record, _, parent = active
+    values = np.array([3, 4], dtype=np.int32)
+
+    def bcast(buf: list[object], *, root: int) -> None:
+        assert root == 5
+        assert buf[1] == communicator.MPI.INT64_T
+        array = cast(np.ndarray, buf[0])
+        assert array.dtype == np.int64 and array.flags.c_contiguous
+        np.testing.assert_array_equal(array, [3, 4])
+        array[:] = [7, 8]
+
+    parent.Bcast.side_effect = bcast
+    result = _dist().broadcast_int64(values, root=5)
+    parent.Bcast.assert_called_once()
+    parent.bcast.assert_not_called()
+    assert result is parent.Bcast.call_args.args[0][0]
+    np.testing.assert_array_equal(result, [7, 8])
+    np.testing.assert_array_equal(values, [3, 4])
+    assert record.call_count == 1
+    assert record.call_args.args == ("trtllm::mpi_broadcast_int64",)
+    assert _fields(record) == {
+        "mpi.operation": "broadcast_int64",
+        "mpi.communicator": "world",
+        "mpi.group": "0,1,2,3,4,5,6,7",
+        "mpi.kind": "collective",
+        "mpi.rank": 3,
+        "mpi.root": 5,
+        "mpi.payload.type": "ndarray",
+        "mpi.payload.shape": [2],
+        "mpi.payload.dtype": "int32",
+        "mpi.payload.numel": 2,
+        "mpi.payload.bytes": 8,
+    }
+
+
 def test_typed_broadcast_retains_tp_then_cp_and_int64_buffer(
     active: tuple[Mock, MagicMock, Mock],
 ) -> None:
