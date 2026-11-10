@@ -206,7 +206,7 @@ def _chat_server(monkeypatch, tool_parser):
 
     def generate_async(*, inputs, **kwargs):
         seen["sampling_params"] = kwargs["sampling_params"]
-        return SimpleNamespace(prompt_token_ids=[1, 2, 3], finished=True)
+        return SimpleNamespace(request_id=1, prompt_token_ids=[1, 2, 3], finished=True)
 
     async def create_chat_response(promise, postproc_params, raw_request, disaggregated_params):
         seen["postproc_args"] = postproc_params.postproc_args
