@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # KV Cache System
 
 The KV cache stores previously computed key-value pairs for reuse during generation in order to avoid redundant calculations. The TensorRT LLM KV cache system also supports reuse across requests and uses a suite of tools like offloading and prioritized eviction to increase reuse. It supports variable attention window sizes and Multi-Head Attention (MHA) optimization techniques such as MQA and GQA.
@@ -128,6 +133,25 @@ and pipelined KV transfer remain unsupported with V2 beam search.
 
 For the native V2 cold-storage representation and codec extension contract, see
 [KVCacheManagerV2 Cold-Page Codec Design](../developer-guide/kv-cache-cold-page-codec.md).
+
+### KV Pool Rebalancing
+
+`kv_cache_config.enable_kv_pool_rebalance` enables runtime adjustment of the
+V2 cache-pool split. It defaults to `false`.
+
+Nemotron/Mamba2 speculative replay requires this option to remain `false`.
+Replay history uses a fixed pool of request-owned slots, but the lookup from
+SSM state slots to replay slots and the random-seed buffer are sized from the
+initial SSM pool. Pool growth can exceed those sizes, and captured CUDA graphs
+also depend on the lookup address and recurrent-state bounds. Enabling
+rebalancing with Nemotron replay therefore raises an error at startup.
+KDA replay also rejects pool rebalancing.
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  enable_kv_pool_rebalance: false
+```
 
 ### Mixed-Precision KV Cache (Prototype)
 

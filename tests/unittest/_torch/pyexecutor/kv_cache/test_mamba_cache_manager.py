@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from transformers import PretrainedConfig
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.fp4_mla import (
@@ -30,6 +31,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fla.cache_manager import (
     GDNReplayState,
     Qwen35HybridCacheManager,
@@ -51,9 +53,15 @@ from tensorrt_llm._torch.modules.mamba.cache_manager import (
     ReplayHistory,
     ReplayStateUpdateMetadata,
     _advance_replay_state,
+    _mamba_replay_disabled_reason,
+    _mamba_replay_history_bytes,
 )
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
+    REPLAY_WORK_CACHE_SLOT,
+    REPLAY_WORK_PNAT,
+    Mamba2Metadata,
+)
 from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
     _create_kv_cache_manager,
@@ -3758,6 +3766,7 @@ def _build_v2_hybrid_with_mamba_layer(
     mamba_d_state: int = 8,
     mamba_head_dim: int = 8,
     max_num_tokens: int = 8192,
+    gen_preemption_headroom: int = 0,
 ) -> MambaHybridCacheManagerV2:
     """Construct a real MambaHybridCacheManagerV2."""
     # Draft layers of a combined speculative manager follow the model's layers in both masks.
@@ -3844,6 +3853,7 @@ def _build_v2_hybrid_with_mamba_layer(
         tokens_per_block=32,
         max_seq_len=128,
         max_num_tokens=max_num_tokens,
+        gen_preemption_headroom=gen_preemption_headroom,
         max_batch_size=max_batch_size,
         mapping=mapping,
         spec_config=spec_config,
@@ -4022,8 +4032,8 @@ def _assert_replay_layer_cache_uses_history_size(layer_cache, history_size):
     assert layer_cache.cache_buf_idx is not None
     assert layer_cache.prev_num_accepted_tokens is not None
     assert layer_cache.old_x.dim() == 5
-    cache_size = layer_cache.temporal.shape[0]
-    assert layer_cache.old_x.shape[0] == cache_size
+    cache_size = layer_cache.old_x.shape[0]
+    assert cache_size <= layer_cache.temporal.shape[0]
     assert layer_cache.old_B.shape[0] == cache_size
     assert layer_cache.old_dt.shape[0] == cache_size
     assert layer_cache.old_dA_cumsum.shape[0] == cache_size
@@ -8002,3 +8012,495 @@ def test_v2_hybrid_mixed_precision_eagle3_layer_stays_plain():
         assert mgr.mixed_precision_high_layers == {1: 3}
     finally:
         mgr.shutdown()
+
+
+def _replay_buffers(manager) -> list[tuple[torch.Tensor, int]]:
+    """Return each compact replay buffer with its replay-slot dimension."""
+    state = manager._speculative_state
+    return [
+        (state.old_x, 1),
+        (state.old_B, 1),
+        (state.old_dt, 1),
+        (state.old_dA_cumsum, 1),
+        (state.prev_num_accepted_tokens, 0),
+        (state.cache_buf_idx, 0),
+    ]
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "max_batch_size,pp_size,attention_dp,headroom",
+    [
+        (1, 1, False, 0),
+        (1, 1, True, 0),
+        (1, 2, False, 0),
+        (1, 2, True, 0),
+        (4, 1, False, 0),
+        (4, 1, True, 0),
+        (4, 2, False, 0),
+        (4, 2, True, 0),
+        (2, 1, False, 3),
+    ],
+)
+def test_v2_mamba_replay_capacity_and_budget(
+    max_batch_size: int,
+    pp_size: int,
+    attention_dp: bool,
+    headroom: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quotas = []
+    build_config = NemotronHybridCacheManager._build_cache_config
+
+    def record_quota(manager, config):
+        before = config.cache_tiers[0].quota
+        result = build_config(manager, config)
+        quotas.append((before, result.cache_tiers[0].quota))
+        return result
+
+    monkeypatch.setattr(NemotronHybridCacheManager, "_build_cache_config", record_quota)
+    manager = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=max_batch_size,
+        gen_preemption_headroom=headroom,
+        num_mamba_layers=pp_size,
+        num_attention_layers=pp_size,
+        mapping=Mapping(
+            world_size=pp_size,
+            rank=0,
+            tp_size=1,
+            pp_size=pp_size,
+            enable_attention_dp=attention_dp,
+        ),
+        spec_config=MTPDecodingConfig(max_draft_len=3),
+        use_replay_state_update=True,
+        enable_block_reuse=True,
+        periodic_snapshot_interval=32,
+        max_gpu_total_bytes=16 << 20,
+    )
+    try:
+        capacity = max_batch_size * pp_size + headroom + manager._num_reserved_dummy_slots
+        assert manager._replay_capacity == capacity
+        assert manager._speculative_state.old_x.shape[1] == capacity
+        assert manager.all_ssm_states[0].shape[0] > capacity
+        actual = sum(
+            buffer.numel() * buffer.element_size() for buffer, _ in _replay_buffers(manager)
+        )
+        expected = _mamba_replay_history_bytes(
+            manager.local_num_mamba_layers, capacity, 16, 4, 8, 8, 1, torch.float16
+        )
+        assert actual == expected == manager._replay_history_bytes
+        assert manager.get_kv_cache_stats().allocated_bytes == manager.impl.get_quota(0) + actual
+        assert quotas[0][0] - quotas[0][1] == actual
+        resumable_quota = quotas[0][0] * manager.kv_cache_config.max_util_for_resume
+        assert manager._get_quota_from_max_tokens(512) == pytest.approx(resumable_quota, abs=1)
+        # Fill admitted-request slots across PP batches and preemption headroom,
+        # then reserved dummy slots. Suspension must retain replay ownership.
+        requests = []
+        for batch_idx in range(pp_size):
+            batch = manager.add_dummy_requests(
+                list(range(10 + batch_idx * max_batch_size, 10 + (batch_idx + 1) * max_batch_size)),
+                is_gen=True,
+            )
+            requests.extend(batch)
+            for request in batch:
+                manager.suspend_request(request)
+        for i in range(headroom):
+            batch = manager.add_dummy_requests([50 + i], is_gen=True)
+            requests.extend(batch)
+            manager.suspend_request(batch[0])
+        for i in range(manager._num_reserved_dummy_slots):
+            requests.extend(manager.add_dummy_requests([100 + i], is_gen=True))
+        assert len(manager._request_id_to_replay_slot) == capacity
+        assert not manager._free_replay_slots
+        # Exceeding admission plus dummy capacity must fail without recycling
+        # a suspended request's history.
+        with pytest.raises(AssertionError, match="including suspended requests"):
+            manager._setup_compact_replay_slots(
+                [_make_v2_conversation_request(200, [1, 2], "overflow")], [0], num_contexts=0
+            )
+        for request in requests:
+            manager.free_resources(request)
+        assert not manager._request_id_to_replay_slot
+        assert len(manager._free_replay_slots) == capacity
+    finally:
+        manager.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("resume_slot", [0, 1])
+def test_v2_mamba_replay_relocation_suspend_and_recycling(resume_slot, monkeypatch):
+    manager = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=2,
+        num_mamba_layers=2,
+        spec_config=MTPDecodingConfig(max_draft_len=3),
+        use_replay_state_update=True,
+    )
+    request = _make_v2_conversation_request(10, [1, 2], "replay")
+    other = _make_v2_conversation_request(11, [3, 4], "other")
+    high_slot = manager.all_ssm_states[0].shape[0] - 1
+    cache = _SlotCache(high_slot)
+    manager.kv_cache_map[10] = cache
+    try:
+        manager._setup_state_indices([request])
+        replay_slot = manager._request_id_to_replay_slot[10]
+        assert replay_slot < manager._speculative_state.old_x.shape[1] < high_slot
+        for buffer, dim in _replay_buffers(manager):
+            buffer.select(dim, replay_slot).fill_(1)
+        manager._speculative_state.prev_num_accepted_tokens[replay_slot] = 7
+        with monkeypatch.context() as stable_mapping:
+            stable_mapping.setattr(
+                "tensorrt_llm._torch.modules.mamba.cache_manager._host_slots_to_device",
+                lambda *args: pytest.fail("Stable replay mappings must not stage or copy slot IDs"),
+            )
+            manager._setup_state_indices([request])
+        assert manager._speculative_state.prev_num_accepted_tokens[replay_slot].item() == 7
+        # Acceptance and work-item construction must both translate high SSM slots.
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.modules.mamba.cache_manager._promote_intermediate_states",
+            lambda *args: None,
+        )
+        manager.update_mamba_states(
+            SimpleNamespace(num_seqs=1, num_contexts=0),
+            torch.tensor([2], dtype=torch.int32, device="cuda"),
+        )
+        assert manager._speculative_state.prev_num_accepted_tokens[replay_slot].item() == 9
+        manager._dummy_request_mask.fill_(True)
+        manager.update_mamba_states(
+            SimpleNamespace(num_seqs=1, num_contexts=0),
+            torch.tensor([3], dtype=torch.int32, device="cuda"),
+        )
+        assert manager._speculative_state.prev_num_accepted_tokens[replay_slot].item() == 9
+        manager._dummy_request_mask.fill_(False)
+        metadata = Mamba2Metadata(max_batch_size=1, chunk_size=8)
+        metadata.state_indices = manager.cuda_state_indices[:1]
+        metadata._prepare_replay_work_items(manager, batch_size=1, num_contexts=0)
+        assert metadata.replay_work_items[0, REPLAY_WORK_CACHE_SLOT].item() == replay_slot
+        assert metadata.replay_work_items[0, REPLAY_WORK_PNAT].item() == 9
+        seeds = manager.get_mamba_ssm_rand_seed().clone()
+        original = [
+            buffer.select(dim, replay_slot).clone() for buffer, dim in _replay_buffers(manager)
+        ]
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            metadata._prepare_replay_work_items(manager, batch_size=1, num_contexts=0)
+        torch.cuda.current_stream().wait_stream(stream)
+        with torch.cuda.graph(graph):
+            metadata._prepare_replay_work_items(manager, batch_size=1, num_contexts=0)
+            mapped = metadata.replay_state_indices[:1]
+        cache.slot = 0
+        manager._setup_state_indices([request])
+        graph.replay()
+        assert mapped.item() == replay_slot
+        torch.testing.assert_close(manager.get_mamba_ssm_rand_seed(), seeds)
+        for (buffer, dim), expected in zip(_replay_buffers(manager), original):
+            torch.testing.assert_close(buffer.select(dim, replay_slot), expected)
+
+        previous_mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            manager.suspend_request(request)
+        finally:
+            torch.cuda.set_sync_debug_mode(previous_mode)
+        assert manager._request_id_to_replay_slot[10] == replay_slot
+        assert manager._request_id_to_state_index[10] == 0
+        for (buffer, dim), expected in zip(_replay_buffers(manager), original):
+            torch.testing.assert_close(buffer.select(dim, replay_slot), expected)
+        other_cache = _SlotCache(0)
+        manager.kv_cache_map[11] = other_cache
+        manager._setup_state_indices([other])
+        other_replay_slot = manager._request_id_to_replay_slot[11]
+        assert other_replay_slot != replay_slot
+        assert manager._speculative_state.prev_num_accepted_tokens[other_replay_slot].item() == 0
+        reused_slot = torch.tensor([0], dtype=torch.int32, device="cuda")
+        assert manager.get_replay_state_indices(reused_slot).item() == other_replay_slot
+        for buffer, dim in _replay_buffers(manager):
+            buffer.select(dim, other_replay_slot).fill_(2)
+        other_cache.slot = high_slot
+        manager._setup_state_indices([other])
+        # Resume with the same replay slot, even after its old SSM lookup was
+        # overwritten. Exercise both the same and a different SSM index.
+        cache.is_active = True
+        cache.slot = resume_slot
+        manager.get_mamba_ssm_rand_seed().add_(5)
+        seeds.add_(5)
+        manager._setup_state_indices([request])
+        resumed_slot = manager._request_id_to_replay_slot[10]
+        assert resumed_slot == replay_slot
+        graph.replay()
+        assert mapped.item() == resumed_slot
+        for (buffer, dim), expected in zip(_replay_buffers(manager), original):
+            torch.testing.assert_close(buffer.select(dim, resumed_slot), expected)
+        torch.testing.assert_close(manager.get_mamba_ssm_rand_seed(), seeds)
+        for buffer, dim in _replay_buffers(manager):
+            assert torch.all(buffer.select(dim, other_replay_slot) == 2)
+        monkeypatch.setattr(KVCacheManagerV2, "free_resources", lambda *args: None)
+        monkeypatch.setattr(manager, "try_commit_blocks", lambda *args: None)
+        manager.free_resources(other)
+        assert other_replay_slot in manager._free_replay_slots
+        assert replay_slot not in manager._free_replay_slots
+        # Completion/cancellation while suspended releases the retained slot.
+        manager.suspend_request(request)
+        manager.free_resources(request)
+        assert replay_slot in manager._free_replay_slots
+        assert not manager._request_id_to_replay_slot
+        assert len(manager._free_replay_slots) == manager._replay_capacity
+    finally:
+        manager.kv_cache_map.clear()
+        manager.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "rollback_path", ["rollback", "rollback_then_suspend", "already_suspended"]
+)
+def test_v2_mamba_replay_context_rollback_refreshes_same_ssm_slot(rollback_path: str) -> None:
+    """A rolled-back chunk must refresh its lookup even when it resumes at the same SSM index."""
+    manager = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=2,
+        spec_config=MTPDecodingConfig(max_draft_len=3),
+        use_replay_state_update=True,
+    )
+    request = _make_v2_conversation_request(10, list(range(64)), "rollback")
+    other = _make_v2_conversation_request(11, [65, 66], "other")
+    try:
+        assert manager.prepare_context(request)
+        assert manager.resize_context(request, num_tokens=32)
+        batch = ScheduledRequests()
+        batch.append_context_request(request)
+        manager.prepare_resources(batch)
+        request.context_current_position = 32
+        manager.update_context_resources(batch)
+        state_slot = manager._request_id_to_state_index[10]
+        replay_slot = manager._request_id_to_replay_slot[10]
+        _run_v2_hybrid_context(manager, other)
+        other_replay_slot = manager._request_id_to_replay_slot[11]
+        assert other_replay_slot != replay_slot
+        for buffer, dim in _replay_buffers(manager):
+            buffer.select(dim, replay_slot).fill_(1)
+            buffer.select(dim, other_replay_slot).fill_(1)
+
+        assert manager.resize_context(request, num_tokens=32)
+        if rollback_path == "already_suspended":
+            assert KVCacheManagerV2.revert_allocate_context(manager, request)
+        else:
+            assert manager.revert_allocate_context(request)
+        assert not manager.kv_cache_map[10].is_active
+        if rollback_path != "rollback":
+            manager.suspend_request(request)
+        assert manager._request_id_to_state_index[10] == state_slot
+        assert manager._request_id_to_replay_slot[10] == replay_slot
+
+        # Simulate another owner visiting S while A is suspended, then moving
+        # away. Its last lookup remains until the resumed owner refreshes it.
+        manager._setup_compact_replay_slots([other], [state_slot], num_contexts=0)
+        manager._setup_state_indices([other], num_contexts=1)
+        assert manager._ssm_to_replay_slot_host[state_slot] == other_replay_slot
+        assert manager.prepare_context(request)
+        assert manager.resize_context(request, num_tokens=32)
+        manager.prepare_resources(batch)
+        assert manager._request_id_to_state_index[10] == state_slot
+        assert (
+            manager.get_replay_state_indices(manager.cuda_state_indices[:1]).item() == replay_slot
+        )
+        for buffer, dim in _replay_buffers(manager):
+            assert torch.count_nonzero(buffer.select(dim, replay_slot)).item() == 0
+            assert torch.all(buffer.select(dim, other_replay_slot) == 1)
+    finally:
+        manager.free_resources(request)
+        manager.free_resources(other)
+        manager.shutdown()
+
+
+@skip_no_cuda
+def test_v2_mamba_replay_context_transfer_releases_history_before_kv() -> None:
+    """Completed prefills can retain transfer KV beyond replay capacity without retaining history."""
+    manager = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=1,
+        spec_config=MTPDecodingConfig(max_draft_len=3),
+        use_replay_state_update=True,
+        max_gpu_total_bytes=16 << 20,
+        is_disagg=True,
+    )
+    requests = []
+    try:
+        dummy = manager.add_dummy_requests([CUDA_GRAPH_DUMMY_REQUEST_ID], is_gen=True)[0]
+        requests.append(dummy)
+        dummy_slot = manager._request_id_to_replay_slot[dummy.py_request_id]
+        for buffer, dim in _replay_buffers(manager):
+            buffer.select(dim, dummy_slot).fill_(1)
+        transfer_states = []
+        for request_id in range(10, 10 + manager._replay_capacity + 3):
+            request = _make_v2_conversation_request(request_id, [1, 2], "transfer")
+            requests.append(request)
+            _run_v2_hybrid_context(manager, request)
+            state_slot = manager._request_id_to_state_index[request_id]
+            manager.all_ssm_states[0][state_slot].fill_(request_id)
+            manager.all_conv_states[0][state_slot].fill_(request_id)
+            transfer_states.append((state_slot, request_id))
+
+            # The final-context send hook releases execution resources, while
+            # KV pages stay live until the asynchronous transfer completes.
+            manager.release_index_slot(request_id)
+            assert request_id in manager.kv_cache_map
+            assert request_id in manager._early_freed_index_requests
+            assert manager._request_id_to_state_index[request_id] == state_slot
+            assert request_id not in manager._request_id_to_replay_slot
+            assert manager._request_id_to_replay_slot == {dummy.py_request_id: dummy_slot}
+            assert len(manager._free_replay_slots) == manager._replay_capacity - 1
+            for buffer, dim in _replay_buffers(manager):
+                assert torch.all(buffer.select(dim, dummy_slot) == 1)
+            for slot, value in transfer_states:
+                assert torch.all(manager.all_ssm_states[0][slot] == value)
+                assert torch.all(manager.all_conv_states[0][slot] == value)
+
+        # Late transfer completion must not release a slot recycled to a new
+        # active request, or return any replay slot to the free list twice.
+        current = _make_v2_conversation_request(100, [3, 4], "current")
+        requests.append(current)
+        _run_v2_hybrid_context(manager, current)
+        current_slot = manager._request_id_to_replay_slot[100]
+        for request in requests[1:-1]:
+            manager.free_resources(request)
+        assert manager._request_id_to_replay_slot[100] == current_slot
+        assert current_slot not in manager._free_replay_slots
+        assert dummy_slot not in manager._free_replay_slots
+        manager.free_resources(current)
+        manager.free_resources(dummy)
+        assert not manager._request_id_to_replay_slot
+        assert len(set(manager._free_replay_slots)) == len(manager._free_replay_slots)
+        assert len(manager._free_replay_slots) == manager._replay_capacity
+    finally:
+        for request in requests:
+            manager.free_resources(request)
+        manager.shutdown()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "pp_size,attention_dp,replay_bytes",
+    [(1, False, 20520), (1, True, 49200), (2, False, 18504), (2, True, 41040)],
+)
+@pytest.mark.parametrize("headroom", [0, 3])
+def test_v2_mamba_replay_estimator_accounts_for_worker_geometry(
+    monkeypatch, pp_size, attention_dp, replay_bytes, headroom
+):
+    # History uses 2048 (TP=2) or 4096 (attention DP) bytes per local layer/slot,
+    # plus two int32 counters per slot. PP changes both local layers and capacity.
+    config = PretrainedConfig(
+        architectures=["NemotronHForCausalLM"],
+        hybrid_override_pattern="M*M*",
+        num_hidden_layers=4,
+        ssm_state_size=8,
+        conv_kernel=4,
+        mamba_num_heads=4,
+        n_groups=2,
+        mamba_head_dim=8,
+        num_key_value_heads=2,
+        num_attention_heads=4,
+        hidden_size=32,
+        torch_dtype=torch.float16,
+    )
+    model_config = ModelConfig(pretrained_config=config)
+    mapping = Mapping(
+        world_size=2 * pp_size,
+        tp_size=2,
+        pp_size=pp_size,
+        rank=0,
+        enable_attention_dp=attention_dp,
+        pp_partition=[4 // pp_size] * pp_size,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.mamba.cache_manager.get_sm_version", lambda: 90
+    )
+    kwargs = dict(
+        max_batch_size=4,
+        gen_preemption_headroom=headroom,
+        max_seq_len=128,
+        tokens_per_block=32,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=True),
+        spec_config=MTPDecodingConfig(max_draft_len=3),
+    )
+    monkeypatch.setenv("TRTLLM_USE_MAMBA_REPLAY", "0")
+    baseline_slope, baseline_intercept = NemotronHybridCacheManager.get_cache_size_per_token(
+        model_config, mapping, **kwargs
+    )
+    monkeypatch.setenv("TRTLLM_USE_MAMBA_REPLAY", "1")
+    slope, intercept = NemotronHybridCacheManager.get_cache_size_per_token(
+        model_config, mapping, **kwargs
+    )
+    assert slope == baseline_slope
+    capacity = 4 * pp_size + 1 + int(attention_dp)
+    assert intercept - baseline_intercept == replay_bytes + replay_bytes // capacity * headroom
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sm,dtype,stochastic,spec_kind,replay_env,reason",
+    [
+        (90, torch.float16, False, "linear", "1", None),
+        (90, torch.float16, True, "linear", "1", "stochastic rounding"),
+        (100, torch.float16, True, "linear", "1", None),
+        (120, torch.float16, True, "linear", "1", "stochastic rounding"),
+        (90, torch.bfloat16, True, "linear", "1", None),
+        (90, torch.float16, False, "tree", "1", "dynamic tree"),
+        (75, torch.float16, False, "linear", "1", "SM80"),
+        (90, torch.float16, False, None, "1", "not configured"),
+        (90, torch.float16, False, "linear", "0", "TRTLLM_USE_MAMBA_REPLAY=0"),
+    ],
+)
+def test_mamba_replay_eligibility_and_disabled_reasons(
+    monkeypatch, sm, dtype, stochastic, spec_kind, replay_env, reason
+):
+    spec = (
+        MTPDecodingConfig(
+            max_draft_len=3,
+            use_dynamic_tree=spec_kind == "tree",
+            dynamic_tree_max_topK=4 if spec_kind == "tree" else 0,
+        )
+        if spec_kind is not None
+        else None
+    )
+    monkeypatch.setenv("TRTLLM_USE_MAMBA_REPLAY", replay_env)
+    actual_reason = _mamba_replay_disabled_reason(spec, dtype, stochastic, sm)
+    if reason is None:
+        assert actual_reason is None
+    else:
+        assert reason in actual_reason
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("num_mamba_layers", [1, 8])
+@pytest.mark.parametrize("one_byte_short", [False, True])
+def test_v2_mamba_replay_preserves_minimum_attention_quota(
+    num_mamba_layers: int, one_byte_short: bool
+) -> None:
+    capacity = 5
+    state_bytes = capacity * num_mamba_layers * (4 * 8 * 8 * 2 + 48 * 3 * 2)
+    page_bytes = 4 * 64 * 2 * 2 * 32
+    replay_bytes = _mamba_replay_history_bytes(
+        num_mamba_layers, capacity, 16, 4, 8, 8, 1, torch.float16
+    )
+    quota = (
+        state_bytes + replay_bytes + page_bytes - 1
+        if one_byte_short
+        else state_bytes + max(replay_bytes, page_bytes)
+    )
+    with pytest.raises(ValueError, match="quota is too small"):
+        _build_v2_hybrid_with_mamba_layer(
+            num_mamba_layers=num_mamba_layers,
+            spec_config=MTPDecodingConfig(max_draft_len=3),
+            use_replay_state_update=True,
+            max_gpu_total_bytes=quota,
+        )
+
+
+@skip_no_cuda
+def test_v2_mamba_replay_refuses_kv_pool_rebalance():
+    with pytest.raises(ValueError, match="enable_kv_pool_rebalance=False"):
+        _build_v2_hybrid_with_mamba_layer(
+            spec_config=MTPDecodingConfig(max_draft_len=2),
+            use_replay_state_update=True,
+            enable_kv_pool_rebalance=True,
+        )

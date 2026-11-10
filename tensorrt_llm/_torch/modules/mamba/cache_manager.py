@@ -21,17 +21,83 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     MambaLayerCache,
     MambaStateLayout,
+    _get_local_mamba_cache_layout,
+    _get_num_cuda_graph_padding_dummy_slots,
+    _host_slots_to_device,
+    _mamba_effective_tp_size,
     _promote_intermediate_states,
     _stack_state_views,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
 )
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig
 
 MIN_REPLAY_HISTORY_SIZE = 16
+
+
+def _mamba_replay_disabled_reason(
+    spec_config: object | None,
+    ssm_dtype: torch.dtype,
+    stochastic_rounding: bool,
+    sm: int,
+) -> str | None:
+    """Why Nemotron's linear replay path is disabled, or None if enabled.
+
+    Shared by the cache manager factory and the cache budget estimator.
+    """
+    if spec_config is None:
+        return "speculative decoding is not configured"
+    if sm < 80:
+        return "replay requires SM80 or newer"
+    if getattr(spec_config, "use_dynamic_tree", False):
+        return "dynamic tree verification is unsupported"
+    if os.environ.get("TRTLLM_USE_MAMBA_REPLAY", "1") == "0":
+        return "TRTLLM_USE_MAMBA_REPLAY=0"
+    if stochastic_rounding and ssm_dtype == torch.float16 and not (100 <= sm < 120):
+        return f"FP16 replay stochastic rounding is unsupported on SM{sm}"
+    return None
+
+
+def _mamba_replay_capacity(
+    max_batch_size: int, mapping: Mapping, spec_config: object | None, headroom: int
+) -> int:
+    """Replay slots for admitted requests, preemption headroom and padding dummies.
+
+    Shared by the cache manager and the cache budget estimator.
+    """
+    return (
+        max_batch_size * mapping.pp_size
+        + headroom
+        + _get_num_cuda_graph_padding_dummy_slots(spec_config, max_batch_size)
+        + int(mapping.enable_attention_dp)
+    )
+
+
+def _mamba_replay_history_bytes(
+    num_layers: int,
+    capacity: int,
+    history_size: int,
+    nheads: int,
+    head_dim: int,
+    d_state: int,
+    n_groups: int,
+    dtype: torch.dtype,
+) -> int:
+    """Exact tensor bytes for double-buffered history and its two counters."""
+    values_per_token = nheads * head_dim + n_groups * d_state
+    history_bytes = (
+        num_layers
+        * capacity
+        * 2
+        * history_size
+        * (values_per_token * dtype.itemsize + 2 * nheads * torch.float32.itemsize)
+    )
+    return history_bytes + capacity * 2 * torch.int32.itemsize
 
 
 class ReplayStateUpdateMetadata(NamedTuple):
@@ -271,6 +337,8 @@ class ReplayHistory:
         return None
 
     def __init__(self, tokens_per_gen_step: int) -> None:
+        self.capacity: int | None = None
+        self.ssm_to_replay_slot: torch.Tensor | None = None
         self._ssm_states: tuple[torch.Tensor, ...] = ()
         self._conv_states: tuple[torch.Tensor, ...] = ()
         self._stacked_conv: torch.Tensor | None = None
@@ -335,9 +403,14 @@ class ReplayHistory:
         self.rand_seed = allocate_mamba_seed_buffer(cache_size, self._seed_rank_offset, device)
 
         num_heads, head_dim, d_state = context.ssm_state_shape
-        common_replay_shape = [len(context.mamba_pp_layers), cache_size, 2]
-        self.prev_num_accepted_tokens = torch.zeros(cache_size, dtype=torch.int32, device=device)
-        self.cache_buf_idx = torch.zeros(cache_size, dtype=torch.int32, device=device)
+        history_capacity = self.capacity if self.capacity is not None else cache_size
+        if self.capacity is not None:
+            self.ssm_to_replay_slot = torch.zeros(cache_size, dtype=torch.int32, device=device)
+        common_replay_shape = [len(context.mamba_pp_layers), history_capacity, 2]
+        self.prev_num_accepted_tokens = torch.zeros(
+            history_capacity, dtype=torch.int32, device=device
+        )
+        self.cache_buf_idx = torch.zeros(history_capacity, dtype=torch.int32, device=device)
         self.old_x = torch.zeros(
             common_replay_shape + [self.replay_history_size, num_heads, head_dim],
             dtype=context.conv_state_dtype,
@@ -382,10 +455,11 @@ class ReplayHistory:
     def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
         if self.prev_num_accepted_tokens is None:
             return
-        self.prev_num_accepted_tokens.index_fill_(0, slots, 0)
-        self.cache_buf_idx.index_fill_(0, slots, 0)
+        replay_slots = self.get_replay_state_indices(slots).long()
+        self.prev_num_accepted_tokens.index_fill_(0, replay_slots, 0)
+        self.cache_buf_idx.index_fill_(0, replay_slots, 0)
         for buffer in (self.old_x, self.old_B, self.old_dt, self.old_dA_cumsum):
-            buffer.index_fill_(1, slots, 0)
+            buffer.index_fill_(1, replay_slots, 0)
         if self.rand_seed is not None:
             self._seed_request_counter += 1
             _reset_mamba_seed_buffer(
@@ -402,13 +476,18 @@ class ReplayHistory:
             raise RuntimeError("Mamba2 replay buffers are not bound")
         _advance_replay_state(
             metadata,
-            batch.destination_state_indices,
+            self.get_replay_state_indices(batch.destination_state_indices),
             batch.num_accepted_tokens,
             batch.is_dummy_request,
         )
         _promote_intermediate_states(
             self._conv_states, self.intermediate_conv, batch, self._stacked_conv
         )
+
+    def get_replay_state_indices(self, state_indices: torch.Tensor) -> torch.Tensor:
+        if self.ssm_to_replay_slot is None:
+            return state_indices
+        return self.ssm_to_replay_slot[state_indices.long()]
 
     def get_replay_metadata(self) -> ReplayStateUpdateMetadata | None:
         if self.prev_num_accepted_tokens is None or self.cache_buf_idx is None:
@@ -433,6 +512,7 @@ class ReplayHistory:
         self.old_B = None
         self.old_dt = None
         self.old_dA_cumsum = None
+        self.ssm_to_replay_slot = None
 
 
 def create_mamba2_state(
@@ -453,24 +533,12 @@ def select_mamba2_state(
     stochastic_rounding: bool,
 ) -> Mamba2State | ReplayHistory:
     """Apply Mamba2 replay gates and return its selected update policy."""
-    sm = get_sm_version()
-    use_replay = spec_config is not None and sm >= 80
-    if spec_config is None:
-        logger.info("Replay kernel requires speculative decoding; using non-replay path")
-    if spec_config is not None and (getattr(spec_config, "use_dynamic_tree", False)):
-        logger.info("Replay kernel incompatible with tree attention; using legacy MTP path")
-        use_replay = False
-    if stochastic_rounding and ssm_cache_dtype == torch.float16 and not (100 <= sm < 120):
-        logger.info(
-            "Replay kernel Philox requires 100 <= sm < 120; "
-            "using legacy MTP path for stochastic rounding support"
-        )
-        use_replay = False
-    if os.environ.get("TRTLLM_USE_MAMBA_REPLAY", "1") == "0":
-        logger.info("Replay kernel is disabled by TRTLLM_USE_MAMBA_REPLAY=0")
-        use_replay = False
-    else:
-        logger.info("Replay kernel is not changed since TRTLLM_USE_MAMBA_REPLAY=1")
+    disabled_reason = _mamba_replay_disabled_reason(
+        spec_config, ssm_cache_dtype, stochastic_rounding, get_sm_version()
+    )
+    use_replay = disabled_reason is None
+    status = "ENABLED" if use_replay else f"DISABLED ({disabled_reason})"
+    logger.info(f"Mamba replay state update: {status}")
     return create_mamba2_state(
         spec_config=spec_config, use_replay=use_replay, stochastic_rounding=stochastic_rounding
     )
@@ -485,6 +553,12 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
     def __init__(self, *args, use_replay_state_update: bool | None = None, **kwargs) -> None:
         self._mamba_ssm_stochastic_rounding = kwargs.pop("mamba_ssm_stochastic_rounding", False)
         self._requested_replay = use_replay_state_update
+        self._replay_headroom = kwargs.get("gen_preemption_headroom", 0)
+        self._replay_capacity = 0
+        self._replay_history_bytes = 0
+        self._request_id_to_replay_slot: dict[int, int] = {}
+        self._free_replay_slots: list[int] = []
+        self._ssm_to_replay_slot_host: dict[int, int] = {}
         kwargs.setdefault("conv_state_layout", "x_b_c")
         super().__init__(*args, **kwargs)
 
@@ -504,15 +578,29 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
             )
 
         if isinstance(state, ReplayHistory):
-            from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
-                _mamba_effective_tp_size,
-            )
-
             if self.local_num_mamba_layers and self._global_n_groups % _mamba_effective_tp_size(
                 self._state_layout.mapping
             ):
                 raise ValueError("Replay state groups must be divisible by the effective TP size")
             state.validate(self._state_layout)
+            if self.local_num_mamba_layers:
+                layout = self._state_layout
+                self._replay_capacity = _mamba_replay_capacity(
+                    layout.max_batch_size, layout.mapping, layout.spec_config, self._replay_headroom
+                )
+                state.capacity = self._replay_capacity
+                self._free_replay_slots = list(reversed(range(self._replay_capacity)))
+                nheads, head_dim, d_state = self.ssm_state_shape
+                self._replay_history_bytes = _mamba_replay_history_bytes(
+                    self.local_num_mamba_layers,
+                    self._replay_capacity,
+                    state.replay_history_size,
+                    nheads,
+                    head_dim,
+                    d_state,
+                    self._n_groups_per_rank,
+                    self.conv_state_dtype,
+                )
         return state
 
     def get_replay_state_update_metadata(self) -> ReplayStateUpdateMetadata | None:
@@ -521,6 +609,136 @@ class NemotronHybridCacheManager(MambaHybridCacheManagerV2):
 
     def get_mamba_ssm_rand_seed(self) -> torch.Tensor | None:
         return self._speculative_state.rand_seed
+
+    @property
+    def _compact_replay(self) -> bool:
+        return self._replay_capacity > 0
+
+    @override
+    def get_replay_state_indices(self, state_indices: torch.Tensor) -> torch.Tensor:
+        if not self._compact_replay:
+            return state_indices
+        return self._speculative_state.get_replay_state_indices(state_indices)
+
+    @override
+    def _fixed_external_cache_bytes(self) -> int:
+        return self._replay_history_bytes
+
+    def _release_replay_slot(self, request_id: int) -> None:
+        slot = self._request_id_to_replay_slot.pop(request_id, None)
+        if slot is not None:
+            self._free_replay_slots.append(slot)
+
+    def _setup_compact_replay_slots(
+        self, requests: list[LlmRequest], state_values: list[int], num_contexts: int
+    ) -> None:
+        changed_states = []
+        changed_slots = []
+        new_generation_slots = []
+        state = self._speculative_state
+        device = state.ssm_to_replay_slot.device
+        for i, (request, state_slot) in enumerate(zip(requests, state_values)):
+            request_id = request.py_request_id
+            slot = self._request_id_to_replay_slot.get(request_id)
+            if slot is None:
+                assert self._free_replay_slots, (
+                    "Mamba replay capacity exhausted: admitted requests "
+                    "(including suspended requests) and padding dummies must "
+                    f"fit within {self._replay_capacity} replay slots"
+                )
+                slot = self._free_replay_slots.pop()
+                self._request_id_to_replay_slot[request_id] = slot
+                if i >= num_contexts:
+                    new_generation_slots.append(slot)
+            if self._ssm_to_replay_slot_host.get(state_slot) == slot:
+                continue
+            changed_states.append(state_slot)
+            changed_slots.append(slot)
+            self._ssm_to_replay_slot_host[state_slot] = slot
+        # Stable resident batches need no mapping transfers or metadata resets.
+        # Fresh pinned staging is owned by the async copy until DMA completes.
+        if changed_states:
+            state.ssm_to_replay_slot.index_copy_(
+                0,
+                _host_slots_to_device(changed_states, device),
+                _host_slots_to_device(changed_slots, device, dtype=torch.int32),
+            )
+        if new_generation_slots:
+            slots = _host_slots_to_device(new_generation_slots, device)
+            state.prev_num_accepted_tokens.index_fill_(0, slots, 0)
+            state.cache_buf_idx.index_fill_(0, slots, 0)
+
+    @override
+    def release_index_slot(self, request_id: int) -> None:
+        """Release context-only replay ownership while retaining transfer KV."""
+        super().release_index_slot(request_id)
+        # Final context forward is complete; transfers read the recurrent
+        # KV state, not replay history. New prefills can reuse that history.
+        self._release_replay_slot(request_id)
+
+    @override
+    def _setup_state_indices(self, requests: list[LlmRequest], num_contexts: int = 0) -> None:
+        super()._setup_state_indices(requests, num_contexts)
+        if self._compact_replay:
+            self._setup_compact_replay_slots(
+                requests,
+                [self._request_id_to_state_index[req.py_request_id] for req in requests],
+                num_contexts,
+            )
+
+    @override
+    def free_resources(self, request: LlmRequest, pin_on_release: bool = False) -> None:
+        super().free_resources(request, pin_on_release)
+        self._release_replay_slot(request.py_request_id)
+
+    @override
+    def _build_cache_config(self, config: KVCacheManagerConfig) -> KVCacheManagerConfig:
+        if self._compact_replay and self.kv_cache_config.enable_kv_pool_rebalance:
+            raise ValueError(
+                "Replay slot maps are sized once from the SSM pool: set "
+                "kv_cache_config.enable_kv_pool_rebalance=False."
+            )
+        return super()._build_cache_config(config)
+
+    @classmethod
+    @override
+    def get_cache_size_per_token(cls, model_config, mapping: Mapping, **kwargs) -> tuple[int, int]:
+        slope, intercept = super().get_cache_size_per_token(model_config, mapping, **kwargs)
+        spec = kwargs.get("spec_config")
+        params, layers, _ = _get_local_mamba_cache_layout(
+            model_config,
+            mapping,
+            spec_config=spec,
+            is_draft=kwargs.get("is_draft", False),
+            use_separate_draft_kv_cache=kwargs.get("use_separate_draft_kv_cache", False),
+        )
+        quant = model_config.quant_config
+        stochastic = quant is not None and quant.mamba_ssm_stochastic_rounding
+        if (
+            layers
+            and _mamba_replay_disabled_reason(
+                spec, params.mamba_ssm_cache_dtype, stochastic, get_sm_version()
+            )
+            is None
+        ):
+            capacity = _mamba_replay_capacity(
+                kwargs["max_batch_size"],
+                mapping,
+                spec,
+                kwargs.get("gen_preemption_headroom", 0),
+            )
+            tp_size = _mamba_effective_tp_size(mapping)
+            intercept += _mamba_replay_history_bytes(
+                layers,
+                capacity,
+                max(MIN_REPLAY_HISTORY_SIZE, spec.tokens_per_gen_step),
+                params.num_heads // tp_size,
+                params.head_dim,
+                params.state_size,
+                params.n_groups // tp_size,
+                params.dtype,
+            )
+        return slope, intercept
 
 
 def get_nemotron_cache_params(config, *, spec_config=None, quant_config=None):
