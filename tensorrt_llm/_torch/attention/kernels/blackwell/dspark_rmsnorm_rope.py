@@ -337,3 +337,189 @@ class DSparkRMSNormRoPEDraftBlockKernel(DSparkRMSNormRoPEKernel):
             for item in cutlass.range_constexpr(self.elements_per_thread):
                 dim = tidx + item * self.num_threads
                 output[batch, page_row, dim] = cutlass.BFloat16(0.0)
+
+
+class DSparkRMSNormFP8QuantKernel:
+    """Apply RMSNorm and emit packed 1x128 MXFP8 activations."""
+
+    num_threads = cute.arch.WARP_SIZE
+    quant_block = 128
+
+    def __init__(self, hidden_dim: int, eps: float):
+        if hidden_dim % self.quant_block != 0:
+            raise ValueError(
+                f"hidden_dim must be divisible by {self.quant_block}; got {hidden_dim}"
+            )
+        self.hidden_dim = hidden_dim
+        self.num_quant_blocks = hidden_dim // self.quant_block
+        self.values_per_thread = self.quant_block // self.num_threads
+        self.eps = eps
+
+    @cute.jit
+    def __call__(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        output: cute.Tensor,
+        output_scale: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(x, weight, output, output_scale).launch(
+            grid=[x.shape[0], 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        output: cute.Tensor,
+        output_scale: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        row, _, _ = cute.arch.block_idx()
+
+        if cutlass.dynamic_expr(row < x.shape[0]):
+            sum_sq = cutlass.Float32(0.0)
+            for quant_block in cutlass.range_constexpr(self.num_quant_blocks):
+                block_base = quant_block * self.quant_block
+                for item in cutlass.range_constexpr(self.values_per_thread):
+                    dim = block_base + tidx * self.values_per_thread + item
+                    value = cutlass.Float32(x[row, dim])
+                    sum_sq += value * value
+            sum_sq = cute.arch.warp_reduction_sum(sum_sq)
+            inverse_rms = cute.math.rsqrt(sum_sq / self.hidden_dim + self.eps)
+
+            for quant_block in cutlass.range_constexpr(self.num_quant_blocks):
+                block_base = quant_block * self.quant_block
+                values = cute.make_rmem_tensor((self.values_per_thread,), cutlass.BFloat16)
+                local_absmax = cutlass.Float32(0.0)
+                for item in cutlass.range_constexpr(self.values_per_thread):
+                    dim = block_base + tidx * self.values_per_thread + item
+                    value = (
+                        cutlass.Float32(x[row, dim]) * inverse_rms * cutlass.Float32(weight[dim])
+                    ).to(cutlass.BFloat16)
+                    values[item] = value
+                    value_f32 = cutlass.Float32(value)
+                    local_absmax = cute.arch.fmax(
+                        local_absmax,
+                        cute.arch.fmax(value_f32, -value_f32),
+                    )
+
+                block_absmax = cute.arch.warp_reduction_max(local_absmax)
+                block_absmax = cute.arch.fmax(block_absmax, cutlass.Float32(1e-10))
+                scale = (block_absmax * cutlass.Float32(1.0 / 448.0)).to(cutlass.Float8E8M0FNU)
+                quant_scale = cute.arch.rcp_approx(cutlass.Float32(scale))
+
+                for item in cutlass.range_constexpr(self.values_per_thread):
+                    dim = block_base + tidx * self.values_per_thread + item
+                    output[row, dim] = (cutlass.Float32(values[item]) * quant_scale).to(
+                        output.element_type
+                    )
+
+                if tidx == 0:
+                    scale_offset = (
+                        (row // 128) * self.num_quant_blocks * 512
+                        + quant_block * 512
+                        + (row % 32) * 16
+                        + ((row % 128) // 32) * 4
+                    )
+                    for replica in cutlass.range_constexpr(4):
+                        output_scale[scale_offset + replica] = scale
+
+
+class DSparkConcatFP8QuantKernel:
+    """Concatenate two row ranges while producing packed 1x128 MXFP8."""
+
+    num_threads = 4 * cute.arch.WARP_SIZE
+    num_warps = 4
+    quant_block = 128
+    values_per_thread = quant_block // cute.arch.WARP_SIZE
+
+    def __init__(self, hidden_dim: int):
+        if hidden_dim % self.quant_block != 0:
+            raise ValueError(
+                f"hidden_dim must be divisible by {self.quant_block}; got {hidden_dim}"
+            )
+        self.hidden_dim = hidden_dim
+        self.num_quant_blocks = hidden_dim // self.quant_block
+
+    @cute.jit
+    def __call__(
+        self,
+        first: cute.Tensor,
+        second: cute.Tensor,
+        output: cute.Tensor,
+        output_scale: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        total_rows = first.shape[0] + second.shape[0]
+        self.kernel(first, second, output, output_scale).launch(
+            grid=[self.num_quant_blocks, cute.ceil_div(total_rows, self.num_warps), 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        first: cute.Tensor,
+        second: cute.Tensor,
+        output: cute.Tensor,
+        output_scale: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        quant_block, row_block, _ = cute.arch.block_idx()
+        warp = tidx // cute.arch.WARP_SIZE
+        lane = tidx % cute.arch.WARP_SIZE
+        row = row_block * self.num_warps + warp
+        total_rows = first.shape[0] + second.shape[0]
+        scale = cutlass.Float8E8M0FNU(0.0)
+
+        if cutlass.dynamic_expr(row < total_rows):
+            values = cute.make_rmem_tensor((self.values_per_thread,), cutlass.BFloat16)
+            local_absmax = cutlass.Float32(0.0)
+            block_base = quant_block * self.quant_block
+            if cutlass.dynamic_expr(row < first.shape[0]):
+                for item in cutlass.range_constexpr(self.values_per_thread):
+                    dim = block_base + lane * self.values_per_thread + item
+                    value = first[row, dim]
+                    values[item] = value
+                    value_f32 = cutlass.Float32(value)
+                    local_absmax = cute.arch.fmax(
+                        local_absmax,
+                        cute.arch.fmax(value_f32, -value_f32),
+                    )
+            else:
+                second_row = row - first.shape[0]
+                for item in cutlass.range_constexpr(self.values_per_thread):
+                    dim = block_base + lane * self.values_per_thread + item
+                    value = second[second_row, dim]
+                    values[item] = value
+                    value_f32 = cutlass.Float32(value)
+                    local_absmax = cute.arch.fmax(
+                        local_absmax,
+                        cute.arch.fmax(value_f32, -value_f32),
+                    )
+
+            block_absmax = cute.arch.warp_reduction_max(local_absmax)
+            block_absmax = cute.arch.fmax(block_absmax, cutlass.Float32(1e-10))
+            scale = (block_absmax * cutlass.Float32(1.0 / 448.0)).to(cutlass.Float8E8M0FNU)
+            quant_scale = cute.arch.rcp_approx(cutlass.Float32(scale))
+            for item in cutlass.range_constexpr(self.values_per_thread):
+                dim = block_base + lane * self.values_per_thread + item
+                output[row, dim] = (cutlass.Float32(values[item]) * quant_scale).to(
+                    output.element_type
+                )
+
+            if lane == 0:
+                scale_offset = (
+                    (row // 128) * self.num_quant_blocks * 512
+                    + quant_block * 512
+                    + (row % 32) * 16
+                    + ((row % 128) // 32) * 4
+                )
+                for replica in cutlass.range_constexpr(4):
+                    output_scale[scale_offset + replica] = scale
