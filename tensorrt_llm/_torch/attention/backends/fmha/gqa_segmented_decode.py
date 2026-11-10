@@ -22,7 +22,7 @@ At small batch the trtllm-gen in-kernel split-KV reduction dominates. Instead:
 """
 
 import math
-from typing import Dict, List, Optional, Union
+from typing import Optional, Union
 
 import torch
 import triton
@@ -37,51 +37,29 @@ if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
 LOG2E = 1.4426950408889634
-# Query rows of a segmented call folded per KV head (q_len x heads per KV head).
+# Largest q_len of a segmented call.
+MAX_Q_LEN = 16
+# Most query rows (q_len x query heads per KV head) a segmented call folds onto one KV head.
 MAX_FOLDED_ROWS = 64
 
-# FlashInfer's trtllm-gen decode with an LSE output (csrc/trtllm_fmha_kernel_launcher.cu) takes float2 softmax stats
-# for round_up(max_q_len, 256) rows of every (request, head) plus a 1 MiB guard off the front of its workspace; the
-# multi-CTA scratch gets the rest.
-_SOFTMAX_STATS_ROWS = 256  # round_up(max_q_len = 1, 256)
+# A segment is a one-token FMHA request: its q_len tokens are folded into the head dimension.
+_SEGMENT_MAX_Q_LEN = 1
+# FlashInfer's trtllm-gen decode with an LSE output (csrc/trtllm_fmha_kernel_launcher.cu) takes its softmax stats off
+# the front of the workspace: a float2 per (request, head) and row, for max_q_len rounded up to a multiple of 256 rows,
+# plus a 1 MiB guard. The multi-CTA scratch gets the rest, unchecked.
+_SOFTMAX_STAT_BYTES = 8  # float2
+_SOFTMAX_STATS_ROW_MULTIPLE = 256
 _SOFTMAX_STATS_GUARD_BYTES = 1 << 20
 
-# device index -> workspace of the segment attention calls, shared by every layer: the calls are ordered on one stream.
-_WORKSPACES: Dict[int, torch.Tensor] = {}
-# Workspaces replaced by a larger reservation, kept for the process lifetime: a CUDA graph captured before the growth
-# still reads and writes them on replay.
-_RETIRED_WORKSPACES: List[torch.Tensor] = []
 
-
-def segment_attention_softmax_bytes(num_requests: int, num_heads: int) -> int:
-    """Workspace bytes FlashInfer takes for the softmax stats of a segment_attention call of num_requests one-token
-    requests of num_heads (folded) heads, ahead of the multi-CTA scratch."""
-    return 8 * _SOFTMAX_STATS_ROWS * num_requests * num_heads + _SOFTMAX_STATS_GUARD_BYTES
-
-
-def _device_index(device: torch.device) -> int:
-    return device.index if device.index is not None else torch.cuda.current_device()
-
-
-def reserve_segment_attention_workspace(device: torch.device, nbytes: int) -> None:
-    """Grow this device's segment attention workspace to at least nbytes. Only outside CUDA graph capture: callers
-    reserve their largest call before capture. A replaced workspace stays allocated, so graphs captured on it remain
-    valid."""
-    idx = _device_index(device)
-    workspace = _WORKSPACES.get(idx)
-    if workspace is None or workspace.numel() < nbytes:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "The segmented decode workspace must be allocated before CUDA graph capture."
-            )
-        if workspace is not None:
-            _RETIRED_WORKSPACES.append(workspace)
-        _WORKSPACES[idx] = torch.empty(nbytes, dtype=torch.uint8, device=torch.device("cuda", idx))
-
-
-def segment_attention_workspace(device: torch.device) -> Optional[torch.Tensor]:
-    """This device's segment attention workspace (reserve_segment_attention_workspace), None before a reservation."""
-    return _WORKSPACES.get(_device_index(device))
+def segment_attention_softmax_bytes(num_fmha_requests: int, num_folded_heads: int) -> int:
+    """Workspace bytes FlashInfer takes for the softmax stats of a segment_attention call of num_fmha_requests
+    segments of num_folded_heads heads, ahead of the multi-CTA scratch."""
+    rows = math.ceil(_SEGMENT_MAX_Q_LEN / _SOFTMAX_STATS_ROW_MULTIPLE) * _SOFTMAX_STATS_ROW_MULTIPLE
+    return (
+        _SOFTMAX_STAT_BYTES * rows * num_fmha_requests * num_folded_heads
+        + _SOFTMAX_STATS_GUARD_BYTES
+    )
 
 
 @triton.jit
@@ -349,8 +327,11 @@ def segment_attention(
 
     Calls FlashInfer's trtllm-gen decode op directly (the op behind ``trtllm_batch_decode_with_kv_cache``), skipping
     the public wrapper's per-call argument validation. Launched without PDL: the FMHA may read the segment tables /
-    lengths, which the kernel right before it writes, before its dependency wait. The workspace holds
-    segment_attention_softmax_bytes(seg_q.shape[0], seg_q.shape[1]) of softmax stats ahead of the multi-CTA scratch.
+    lengths, which the kernel right before it writes, before its dependency wait.
+
+    Args:
+        workspace: the trtllm-gen decode's FMHA workspace plus segment_attention_softmax_bytes(*seg_q.shape[:2])
+            bytes: FlashInfer takes the softmax stats of the LSE off its front.
     """
     num_requests, num_heads, _ = seg_q.shape
     sm_count = flashinfer.decode.get_device_sm_count(seg_q.device)
@@ -367,7 +348,7 @@ def segment_attention(
         counter,
         seg_table,
         seg_lens,
-        1,  # max_q_len
+        _SEGMENT_MAX_Q_LEN,  # max_q_len
         max_seg_len,
         _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale,
         bmm2_scale,
@@ -413,7 +394,7 @@ def segmented_decode_supported(
     return (
         num_segments > 1
         and batch * num_segments <= 256
-        and 1 <= q_len <= 16
+        and 1 <= q_len <= MAX_Q_LEN
         and num_heads % num_kv_heads == 0
         and q_len * (num_heads // num_kv_heads) <= MAX_FOLDED_ROWS
         and head_dim in (64, 128, 256)
