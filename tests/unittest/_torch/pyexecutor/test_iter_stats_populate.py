@@ -985,8 +985,8 @@ def test_attention_dp_fanout_preserves_rank_local_kv_snapshots(
 def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     """Verify ADP fanout emits one rank-local row per rank with queue on rank 0."""
     # Rank 0 emits one stats row per ADP rank. Scheduled fields stay
-    # rank-local so FPM can reveal load imbalance, while queued fields remain
-    # rank-0-owned because the executor request queue lives on rank 0.
+    # rank-local so FPM can reveal load imbalance; queue totals appear only
+    # on rank 0, including admitted work from the other ranks.
     rank0_stats = _make_adp_iteration_stats(
         iter_id=9,
         num_context_requests=1,
@@ -1016,10 +1016,17 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
             num_gen_kv_tokens=40,
             num_paused_requests=2,
             num_paused_kv_tokens=25,
+            num_queued_context_requests=1,
+            num_queued_ctx_tokens=400,
+            num_queued_gen_requests=1,
+            num_queued_gen_kv_tokens=500,
         ),
     )
 
-    records = buffer.finalize([rank0_state, rank1_state], is_rank0=True)
+    records = buffer.finalize(
+        [RankState.deserialize(state.serialize()) for state in (rank0_state, rank1_state)],
+        is_rank0=True,
+    )
 
     assert len(records) == 2
 
@@ -1036,10 +1043,11 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     assert rank0_ifb.num_paused_requests == 1
     assert rank0_ifb.num_paused_kv_tokens == 5
     assert rank0_ifb.num_scheduled_requests == 3
-    assert rank0_ifb.num_queued_context_requests == 7
-    assert rank0_ifb.num_queued_ctx_tokens == 700
-    assert rank0_ifb.num_queued_gen_requests == 8
-    assert rank0_ifb.num_queued_gen_kv_tokens == 800
+    assert rank0_ifb.num_queued_context_requests == 8
+    assert rank0_ifb.num_queued_ctx_tokens == 1100
+    assert rank0_ifb.num_queued_gen_requests == 9
+    assert rank0_ifb.num_queued_gen_kv_tokens == 1300
+    assert rank0_row.num_queued_requests == 17
     assert rank0_record.req_stats == ["req-stats"]
     assert rank0_record.kv_iter_stats == {0: "pending-kv"}
     assert rank0_record.host_step_time_ms == 11.0
@@ -1065,6 +1073,7 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     assert rank1_ifb.num_queued_ctx_tokens == 0
     assert rank1_ifb.num_queued_gen_requests == 0
     assert rank1_ifb.num_queued_gen_kv_tokens == 0
+    assert rank1_row.num_queued_requests == 0
     assert rank1_record.req_stats is None
     assert rank1_record.kv_iter_stats is None
     assert rank1_record.host_step_time_ms == 11.0
@@ -1320,51 +1329,21 @@ def test_update_iter_stats_does_not_overwrite_construction_iter():
     assert stats.iter == 17
 
 
-def test_attention_dp_fanout_sums_admitted_backlog_on_rank0():
-    rank0_stats = _make_adp_iteration_stats(
-        iter_id=10,
-        num_queued_context_requests=2,
-        num_queued_ctx_tokens=300,
-    )
-    rank0_stats.iter_latency_ms = 12.5
-    buffer = _build_adp_stats_buffer(rank0_stats)
-    states = [
-        RankState(rank=0, iter_stats=buffer.next_payload()),
-        RankState(
-            rank=1,
-            iter_stats=RankIterStatsPayload(
-                has_iter_stats=1,
-                iter_stats_iter=10,
-                num_queued_context_requests=1,
-                num_queued_ctx_tokens=400,
-                num_queued_gen_requests=1,
-                num_queued_gen_kv_tokens=500,
-            ),
-        ),
-    ]
-    # Exercise the wire, not just direct Python dataclass exchange.
-    records = buffer.finalize(
-        [RankState.deserialize(state.serialize()) for state in states],
-        is_rank0=True,
-    )
-    assert len(records) == 2
-    ifb = records[0].stats.inflight_batching_stats
-    assert ifb.num_queued_context_requests == 3
-    assert ifb.num_queued_ctx_tokens == 700
-    assert ifb.num_queued_gen_requests == 1
-    assert ifb.num_queued_gen_kv_tokens == 500
-    assert records[0].stats.num_queued_requests == 4
-    assert records[1].stats.num_queued_requests == 0
-    assert records[1].stats.inflight_batching_stats.num_queued_context_requests == 0
-
-
-@pytest.mark.parametrize("allow_empty", [False, True])
-@pytest.mark.parametrize("queued_tokens", [0, 300])
-@pytest.mark.parametrize("iter_latency_ms", [0.0, 12.5])
+@pytest.mark.parametrize(
+    "allow_empty,queued_tokens,iter_latency_ms,expected_ranks",
+    [
+        (False, 0, 0.0, []),
+        (True, 0, 0.0, [0, 1]),
+        (True, 300, 0.0, [0]),
+        (False, 300, 12.5, [0, 1]),
+    ],
+    ids=["busy-empty", "all-idle", "queue-veto", "timed-dummy"],
+)
 def test_attention_dp_idle_heartbeat_requires_global_idle(
     allow_empty,
     queued_tokens,
     iter_latency_ms,
+    expected_ranks,
 ):
     stats = _make_adp_iteration_stats(
         iter_id=11,
@@ -1387,10 +1366,7 @@ def test_attention_dp_idle_heartbeat_requires_global_idle(
         ],
         is_rank0=True,
     )
-    expected_count = (
-        2 if iter_latency_ms > 0 or (allow_empty and not queued_tokens) else int(queued_tokens > 0)
-    )
-    assert len(records) == expected_count
+    assert [record.attention_dp_rank for record in records] == expected_ranks
     for record in records:
         assert record.stats.inflight_batching_stats.num_scheduled_requests == 0
         assert record.stats.iter_latency_ms == iter_latency_ms

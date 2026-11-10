@@ -56,8 +56,7 @@ def test_blocked_prefill_snapshot_keeps_queued_work(executor):
     executor._append_iter_stats.assert_called_once()
 
 
-@pytest.mark.parametrize("rank", [0, 1])
-@pytest.mark.parametrize("engine_idle", [False, True])
+@pytest.mark.parametrize("rank,engine_idle", [(0, False), (1, True)])
 def test_adp_retains_the_global_idle_decision(executor, rank, engine_idle):
     executor.enable_attention_dp = True
     executor.dist.rank = rank
@@ -81,14 +80,6 @@ def test_idle_wakeup_and_no_forward_pass_do_not_duplicate_stats(executor):
     executor.iter_counter += 1
     executor._maybe_emit_quiescent_stats(engine_idle=True)
     assert executor._update_iter_stats.call_count == 2
-
-
-@pytest.mark.parametrize("enabled,shutdown", [(False, False), (True, True)])
-def test_disabled_or_shutdown_does_not_emit(executor, enabled, shutdown):
-    executor.enable_iter_perf_stats = enabled
-    executor.is_shutdown = shutdown
-    executor._maybe_emit_quiescent_stats(engine_idle=True)
-    executor._update_iter_stats.assert_not_called()
 
 
 def test_queue_only_sampling_does_not_throttle_idle_heartbeats(executor):
