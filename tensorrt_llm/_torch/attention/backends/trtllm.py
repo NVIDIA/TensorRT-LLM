@@ -218,8 +218,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # workspaces that CUDA graphs capture, so it lives exactly as long as this
     # metadata; every layer that runs with this metadata reuses it.
     fmha_plan_caches: Dict[str, Any] = field(default_factory=dict,
-                                              init=False,
-                                              repr=False)
+                                             init=False,
+                                             repr=False)
     # Context-only plan shared by the layers of one forward (TrtllmAttention.cache_context_plan).
     context_plan: Optional[_ContextPlan] = field(init=False,
                                                  default=None,
