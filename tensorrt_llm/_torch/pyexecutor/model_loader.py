@@ -23,6 +23,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, LazyRootModelIdentity, PostTransformConfigIdentity,
@@ -32,6 +33,7 @@ from tensorrt_llm._torch.weight_sharing import (
     WeightManifestWriteResult, check_weight_sharing_compatibility,
     maybe_write_weight_manifest)
 from tensorrt_llm._utils import get_sm_version, str_dtype_to_torch
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
                                           ModelExpressConfig,
@@ -153,6 +155,44 @@ def _reject_unsupported_model_llm_args(llm_args: TorchLlmArgs,
     for name in _MODEL_SPECIFIC_LLM_ARGS:
         if getattr(llm_args, name) and name not in supported:
             raise ValueError(f"{name} is not supported by {model_cls.__name__}")
+
+
+def _with_fp8_block_scale_weights(
+    constraints: PostTransformRuntimeConstraints,
+    sm_versions: frozenset[int] | set[int],
+) -> PostTransformRuntimeConstraints:
+    """Admit FP8 block-scale (128x128) weights to an unquantized dense row.
+
+    FP8BlockScalesLinearMethod realizes a different weight and scale layout
+    per GPU architecture: SM90 keeps checkpoint-layout E4M3 weights and FP32
+    block scales, while other architectures can resmooth the weights and
+    repack the scales in transform_weights(). Each FP8 row therefore pins the
+    SM versions whose layout its transform-layout ABI describes. It also
+    requires the checkpoint to declare 128x128 weight blocks in its Hugging
+    Face quantization config, so a source that declares no block size or
+    another one falls back. The KV cache, activation dtype, and every other
+    dimension keep the base row's constraints, so `force_dynamic_quantization`
+    stays excluded.
+
+    Args:
+        constraints: An unquantized dense row's runtime constraints.
+        sm_versions: SM versions that realize the row's FP8 layout.
+
+    Returns:
+        The same constraints with declared 128x128 FP8 block-scale weights on
+        `sm_versions`.
+    """
+    return replace(
+        constraints,
+        quant_algorithms=frozenset({QuantAlgo.FP8_BLOCK_SCALES.value}),
+        sm_versions=frozenset(sm_versions),
+        weight_block_sizes=frozenset({(128, 128)}),
+    )
+
+
+_MX_QWEN3_FP8_BLOCK_SM90_DENSE_RUNTIME_CONSTRAINTS = (
+    _with_fp8_block_scale_weights(_MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS,
+                                  {90}))
 
 
 def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
@@ -508,67 +548,88 @@ def get_rank_model_storage(model):
     return total_bytes
 
 
+def _checkpoint_io_incompatibility_reason(
+    checkpoint_loader: Optional[BaseCheckpointLoader],
+    checkpoint_format: CheckpointFormat | str | None,
+    load_format: LoadFormat,
+    requested_policy: CheckpointIOPolicy,
+    partial_model_loading: bool,
+) -> Optional[str]:
+    """Return the first unmet requirement for optimized checkpoint I/O.
+
+    This function is called only when requested_policy is not CheckpointIOPolicy.NATIVE.
+    """
+    if checkpoint_loader is not None:
+        return "an explicit checkpoint loader was provided"
+    if checkpoint_format != CheckpointFormat.HF:
+        return (
+            f"checkpoint_io_policy={requested_policy.value!r} requires checkpoint_format='HF' "
+            f"(received '{checkpoint_format}')")
+
+    if load_format != LoadFormat.AUTO:
+        return (
+            f"checkpoint_io_policy={requested_policy.value!r} requires load_format='auto' "
+            f"(received {load_format.name!r})")
+    if partial_model_loading:
+        return "partial model loading was requested"
+
+    from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import \
+        HfCheckpointLoader
+    from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import \
+        HfWeightLoader
+    from tensorrt_llm._torch.models.modeling_utils import (
+        CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING, get_checkpoint_weight_loader)
+
+    if (CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING.get(CheckpointFormat.HF)
+            is not HfCheckpointLoader):
+        return "the registered HF checkpoint loader is not the built-in loader"
+    if get_checkpoint_weight_loader(CheckpointFormat.HF) is not HfWeightLoader:
+        return "the registered HF weight loader is not the built-in loader"
+    return None
+
+
 def _resolve_checkpoint_io_policy(
     checkpoint_loader: Optional[BaseCheckpointLoader],
-    checkpoint_format: Optional[str],
-    load_format: LoadFormat | str,
+    checkpoint_format: CheckpointFormat | str | None,
+    load_format: LoadFormat,
     requested_policy: CheckpointIOPolicy,
     partial_model_loading: bool,
 ) -> tuple[CheckpointIOPolicy, Optional[str]]:
-    """Select a safe executable policy before checkpoint loading starts."""
+    """Return the policy to use and the reason for a fallback, if any."""
+
     if requested_policy == CheckpointIOPolicy.NATIVE:
         return CheckpointIOPolicy.NATIVE, None
 
-    reason = None
-    if checkpoint_loader is not None:
-        reason = "an explicit checkpoint loader was provided"
-    elif checkpoint_format != "HF":
-        reason = ("rank-striped read-ahead requires checkpoint_format='HF' "
-                  f"(received {checkpoint_format!r})")
-    else:
-        normalized_load_format = getattr(load_format, "name", load_format)
-        if str(normalized_load_format).lower() != "auto":
-            reason = ("rank-striped read-ahead requires load_format='auto' "
-                      f"(received {normalized_load_format!r})")
-        elif partial_model_loading:
-            reason = "partial model loading was requested"
+    # requested_policy can be AUTO or RANK_STRIPED_READ_AHEAD:
+    reason = _checkpoint_io_incompatibility_reason(checkpoint_loader,
+                                                   checkpoint_format,
+                                                   load_format,
+                                                   requested_policy,
+                                                   partial_model_loading)
 
     if reason is None:
-        from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import \
-            HfCheckpointLoader
-        from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import \
-            HfWeightLoader
-        from tensorrt_llm._torch.models.modeling_utils import (
-            CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING,
-            get_checkpoint_weight_loader)
+        # Compatible: AUTO and RANK_STRIPED_READ_AHEAD both use read-ahead.
+        return CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD, None
 
-        if (CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING.get("HF")
-                is not HfCheckpointLoader):
-            reason = "the registered HF checkpoint loader is not the built-in loader"
-        elif get_checkpoint_weight_loader("HF") is not HfWeightLoader:
-            reason = "the registered HF weight loader is not the built-in loader"
-
-    if reason is not None:
-        message = ("Checkpoint I/O policy resolved before loading: "
-                   f"requested={requested_policy}, "
-                   f"selected={CheckpointIOPolicy.NATIVE}, "
-                   f"reason={reason}.")
-        if requested_policy == CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD:
-            logger.warning(message)
-        else:
-            logger.info(message)
-        return CheckpointIOPolicy.NATIVE, reason
-
-    return CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD, None
+    # Not compatible: fall back to native I/O.
+    message = ("Checkpoint I/O policy resolved before loading: "
+               f"requested={requested_policy}, "
+               f"selected={CheckpointIOPolicy.NATIVE}, "
+               f"reason={reason}.")
+    if requested_policy == CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD:
+        logger.warning(message)
+    else:
+        logger.info(message)
+    return CheckpointIOPolicy.NATIVE, reason
 
 
-def _construct_checkpoint_loader(
+def construct_checkpoint_loader(
     checkpoint_loader: Optional[BaseCheckpointLoader],
-    checkpoint_format: Optional[str],
+    checkpoint_format: CheckpointFormat | str | None,
     *,
     mx_config: Optional[ModelExpressConfig] = None,
     checkpoint_io_policy: CheckpointIOPolicy = CheckpointIOPolicy.NATIVE,
-    load_format: LoadFormat | str = LoadFormat.AUTO,
+    load_format: LoadFormat = LoadFormat.AUTO,
     partial_model_loading: bool = False,
 ) -> BaseCheckpointLoader:
     # Just in case someone wrongly passes a str instead of a CheckpointIOPolicy.
@@ -614,7 +675,7 @@ def _construct_checkpoint_loader(
 
     # Pass extra kwargs for format-specific loaders (e.g. MX).
     extra_kwargs: dict = {}
-    if checkpoint_format == "MX":
+    if checkpoint_format == CheckpointFormat.MX:
         if mx_config is not None:
             extra_kwargs["mx_server_url"] = mx_config.server_url
 
@@ -810,12 +871,11 @@ class ModelLoaderMetricNames(Enum):
 
 def _checkpoint_startup_metadata(
     checkpoint_loader: BaseCheckpointLoader,
-    load_format: LoadFormat | str,
+    load_format: LoadFormat,
 ) -> dict[str, str]:
     """Describe the concrete checkpoint source selected for this load."""
     weight_loader = getattr(checkpoint_loader, "weight_loader", None)
     source_kind = getattr(checkpoint_loader, "checkpoint_format", None)
-    load_format_name = getattr(load_format, "name", load_format)
     return {
         "checkpoint_loader_kind":
         type(checkpoint_loader).__name__,
@@ -825,7 +885,7 @@ def _checkpoint_startup_metadata(
         "checkpoint_source_kind":
         str(source_kind or "unknown"),
         "load_format":
-        str(load_format_name).lower(),
+        load_format.name.lower(),
     }
 
 
@@ -864,6 +924,24 @@ class ModelLoader:
             transform_abi_id=QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             runtime_constraints=_MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+        ),
+        # Ahead of the BF16 Qwen3 row: when both rows miss by one dimension,
+        # qualify() reports the first, so an FP8 load on another SM reports
+        # `sm_version` rather than `quant_algorithm`.
+        PostTransformProfile(
+            profile_id="qwen3-for-causal-lm-fp8-block-sm90-target-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_qwen3",
+                "Qwen3ForCausalLM"),
+            architecture="Qwen3ForCausalLM",
+            model_type="qwen3",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=
+            QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=
+            _MX_QWEN3_FP8_BLOCK_SM90_DENSE_RUNTIME_CONSTRAINTS,
         ),
         PostTransformProfile(
             profile_id="qwen3-for-causal-lm-bf16-target-v1",
@@ -1102,7 +1180,7 @@ class ModelLoader:
         only by MX (pre-transfer fallback gate) and GMS (pre-materialize
         strict gate), so default HF/AUTO paths should not even build one.
         """
-        return load_format == LoadFormat.GMS or checkpoint_loader.checkpoint_format == "MX"
+        return load_format == LoadFormat.GMS or checkpoint_loader.checkpoint_format == CheckpointFormat.MX
 
     @staticmethod
     def _build_source_identity(
@@ -1205,7 +1283,7 @@ class ModelLoader:
             # AUTO may still resolve to MX, so check the resolved format too.
             uses_standard_hf_loader = (load_format == LoadFormat.AUTO
                                        and checkpoint_loader.checkpoint_format
-                                       != "MX")
+                                       != CheckpointFormat.MX)
             if requires_standard_hf_loading and not uses_standard_hf_loader:
                 raise ValueError(
                     "Host-resident model weights currently require the standard "
@@ -1241,7 +1319,8 @@ class ModelLoader:
                         post_transform_qualification.transform_abi_id),
                     fallback_on_artifact_error=(
                         load_format != LoadFormat.GMS
-                        and checkpoint_loader.checkpoint_format == "MX"),
+                        and checkpoint_loader.checkpoint_format
+                        == CheckpointFormat.MX),
                 )
 
             memo: dict[torch.Tensor, torch.Tensor] = {}
@@ -1336,7 +1415,7 @@ class ModelLoader:
                     # Generic loaders ignore it; MXCheckpointLoader pops it.
                     "source_identity": self._source_identity,
                 }
-                if checkpoint_loader.checkpoint_format == "MX":
+                if checkpoint_loader.checkpoint_format == CheckpointFormat.MX:
                     load_weights_kwargs["model_config"] = config
                     load_weights_kwargs["load_config"] = self.llm_args
                     load_weights_kwargs[
@@ -1443,7 +1522,7 @@ class ModelLoader:
                                 "model": model,
                                 "source_identity": self._source_identity,
                             }
-                            if checkpoint_loader.checkpoint_format == "MX":
+                            if checkpoint_loader.checkpoint_format == CheckpointFormat.MX:
                                 load_weights_kwargs["model_config"] = config
                                 load_weights_kwargs[
                                     "load_config"] = self.llm_args
@@ -1735,7 +1814,7 @@ class ModelLoader:
         that combination, so this post-load branch should never see an unsafe
         post-transform receiver in normal use.
         """
-        if checkpoint_loader.checkpoint_format != "MX" or not weights_preloaded:
+        if checkpoint_loader.checkpoint_format != CheckpointFormat.MX or not weights_preloaded:
             return False
 
         method = getattr(type(checkpoint_loader),
@@ -1789,7 +1868,7 @@ class ModelLoader:
         MTP weights use the draft's quantization and MoE backend.
         """
         draft_load_kwargs = {}
-        if checkpoint_loader.checkpoint_format == "MX":
+        if checkpoint_loader.checkpoint_format == CheckpointFormat.MX:
             # This loader instance still owns the target model's MX session.
             # Preserve it while the native loader reads the auxiliary draft
             # checkpoint so the finalized target can publish through it.
@@ -1895,7 +1974,7 @@ class ModelLoader:
             transfer_scope=cls._post_transform_transfer_scope(model),
             enabled_features=frozenset(enabled_features),
             runtime_config=PostTransformRuntimeConfig.from_model_config(
-                model.model_config, model=model),
+                model.model_config, model=model, sm_version=get_sm_version()),
         )
 
     def _dump_final_weight_manifest(
@@ -1935,7 +2014,7 @@ class ModelLoader:
             "checkpoint_dir": checkpoint_dir,
             "weights_preloaded": weights_preloaded,
         }
-        if checkpoint_loader.checkpoint_format == "MX":
+        if checkpoint_loader.checkpoint_format == CheckpointFormat.MX:
             if not qualification.qualified:
                 if not weights_preloaded:
                     logger.info("Skipping MX post-transform publish for "

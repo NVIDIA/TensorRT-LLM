@@ -7,14 +7,19 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency._full_context import (  # noqa: E501
-    FullContextIndexer,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa._full_context_topk import (  # noqa: E501
-    full_context_topk,
-    streaming_plan,
-    workspace_bytes,
-)
+from tensorrt_llm._torch._experimental.modeling_v2._native import NoTarget
+
+try:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency._full_context import (  # noqa: E501
+        FullContextIndexer,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa._full_context_topk import (  # noqa: E501
+        full_context_topk,
+        streaming_plan,
+        workspace_bytes,
+    )
+except NoTarget as exc:
+    pytest.skip(str(exc), allow_module_level=True)
 from tensorrt_llm._torch.kernels.blackwell.top_k.gvr_topk_decode_self_sampling_host import (
     route_streaming,
 )

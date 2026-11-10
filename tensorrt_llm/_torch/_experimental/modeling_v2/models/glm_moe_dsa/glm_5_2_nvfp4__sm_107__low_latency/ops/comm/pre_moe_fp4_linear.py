@@ -6,6 +6,7 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
+from ... import native_ops
 from ._ipc_workspace import residual_norm_reference, validate_ipc_operands
 
 
@@ -31,7 +32,7 @@ class GlmPreMoeFp4Linear(OpWrapper):
         nranks,
         buffer_bytes,
     ):
-        return torch.ops.trtllm.glm_pre_moe_fp4_linear(
+        return native_ops.glm_pre_moe_fp4_linear(
             input, residual, gamma, epsilon, scale, table, flags, layout, rank, nranks, buffer_bytes
         )
 

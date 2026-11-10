@@ -14,13 +14,21 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.gemm.dense_mlp_small_m import (  # noqa: E501
-    HIDDEN,
-    INTER_PER_RANK,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.gemm.dense_mlp_small_m import (  # noqa: E501
-    dense_mlp_small_m as op,
-)
+from tensorrt_llm._torch._experimental.modeling_v2._native import NoTarget
+
+try:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency import (
+        native_ops,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.gemm.dense_mlp_small_m import (  # noqa: E501
+        HIDDEN,
+        INTER_PER_RANK,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.gemm.dense_mlp_small_m import (  # noqa: E501
+        dense_mlp_small_m as op,
+    )
+except NoTarget as exc:
+    pytest.skip(str(exc), allow_module_level=True)
 from tensorrt_llm._utils import get_sm_version
 
 __extra_import_path__ = ["../../../.."]
@@ -30,7 +38,8 @@ pytestmark = pytest.mark.skipif(
     get_sm_version() != 107, reason="the GLM-5.2 tp16 target's entries are certified on sm_107"
 )
 
-assert torch.cuda.is_available(), "dense_mlp_small_m requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("dense_mlp_small_m requires a CUDA device", allow_module_level=True)
 
 #: The c1 cell: the shape and scales every non-cell test below reuses.
 C1 = op.CELLS[0]
@@ -192,7 +201,7 @@ def test_cuda_graph_capture_and_replay() -> None:
 def test_the_supported_predicate(rows, hidden, inter, served) -> None:
     """The host-side answer the caller routes on: 1-8 rows of the TP16 slice
     only. TP4 is what a dense MLP capped at the node's 4 GPUs would hand over."""
-    assert torch.ops.trtllm.glm_dense_mlp_small_m_supported(rows, hidden, inter) is served
+    assert native_ops.glm_dense_mlp_small_m_supported(rows, hidden, inter) is served
 
 
 def _strided_x():
