@@ -1073,18 +1073,12 @@ def test_cosmos3_edge_t2i_lpips_against_golden(request, tmp_path):
     _assert_lpips_below_threshold(score, COSMOS3_EDGE_T2I_LPIPS_THRESHOLD)
 
 
-def _drop_unit_batch(tensor):
-    """Drop a leading batch of 1 from ``(1, T, H, W, C)`` or ``(1, H, W, C)``."""
-    if tensor.ndim in (4, 5) and tensor.shape[0] == 1:
-        return tensor[0]
-    return tensor
-
-
 def _assert_finite_media(tensor, shape):
-    media = _drop_unit_batch(tensor)
-    assert tuple(media.shape) == shape, tuple(media.shape)
-    assert media.numel() > 0
-    assert torch.isfinite(media.float()).all()
+    """Require the ``PipelineOutput`` contract: a leading batch and ``uint8``."""
+    assert tuple(tensor.shape) == (1, *shape), tuple(tensor.shape)
+    assert tensor.dtype == torch.uint8
+    assert tensor.numel() > 0
+    assert torch.isfinite(tensor.float()).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
