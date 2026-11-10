@@ -422,10 +422,16 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         # Shared caches are declared by their owner before dependent layers.
         for (model_layer, _attn_type), internal_layer_id in virtual_layer_mapping.items():
             model_layer_by_internal_id.setdefault(int(internal_layer_id), int(model_layer))
+    # A mixed-precision high layer has the head geometry of the local layer it belongs to.
+    local_layer_by_mixed_precision_high_layer = {
+        int(high_layer): int(local_layer)
+        for local_layer, high_layer in manager.mixed_precision_high_layers.items()
+    }
 
     def _kv_heads_for_layer(internal_layer_id: int) -> int:
-        local_layer_id = internal_layer_id
-        if virtual_layer_mapping is not None:
+        if internal_layer_id in local_layer_by_mixed_precision_high_layer:
+            local_layer_id = local_layer_by_mixed_precision_high_layer[internal_layer_id]
+        elif virtual_layer_mapping is not None:
             model_layer = model_layer_by_internal_id.get(internal_layer_id)
             if model_layer is None:
                 raise ValueError(
@@ -438,6 +444,9 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                     f"Cannot resolve KV-head count for internal layer {internal_layer_id}: "
                     f"model layer {model_layer} is not local to this rank"
                 )
+        else:
+            # Without a virtual layer mapping, the internal id is the layer offset.
+            local_layer_id = internal_layer_id
         heads = manager.num_kv_heads_per_layer
         if not 0 <= local_layer_id < len(heads):
             raise ValueError(

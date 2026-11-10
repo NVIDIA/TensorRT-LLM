@@ -53,7 +53,9 @@ from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import FP8QDQLinearMethod, Linear, TensorParallelMode
+from ..modules.linear import (FP8QDQLinearMethod, FP8RowwiseLinearMethod,
+                              Linear, TensorParallelMode,
+                              is_static_nvfp4_input_eligible)
 from ..modules.low_m_gemm import (_should_apply_low_m_gemm, apply_low_m_gemm,
                                   low_m_gemm_dispatcher, prepare_low_m_gemm)
 from ..modules.low_m_mma_gemm import (fused_shared_expert,
@@ -816,7 +818,8 @@ class _Qwen3NextDecoderLayerBase(DecoderLayer):
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype,
-                                                use_gemma=True)
+                                                use_gemma=True,
+                                                quantize_type="nvfp4")
         self.layer_idx = layer_idx
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
@@ -1503,3 +1506,19 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
     def cache_derived_state(self) -> None:
         super().cache_derived_state()
         _precompute_fused_norm_weights(self)
+        # Fold the static NVFP4 input quantize of a dense gate_up_proj into the
+        # preceding add + RMSNorm.
+        for layer in self.model.layers[:self.config.num_hidden_layers]:
+            mlp = getattr(layer, "mlp", None)
+            norm = getattr(layer, "post_attention_layernorm", None)
+            if (isinstance(mlp, _DenseMlpAdapter) and norm is not None
+                    and norm.is_nvfp4
+                    and is_static_nvfp4_input_eligible(mlp.mlp.gate_up_proj)):
+                norm.nvfp4_scale = mlp.mlp.gate_up_proj.input_scale
+        # Quantize per token in the input norm when in_proj_qkvz is FP8 rowwise.
+        for layer in self.model.layers[:self.config.num_hidden_layers]:
+            linear_attn = getattr(layer, "linear_attn", None)
+            if linear_attn is not None:
+                layer.input_layernorm.fp8_per_token_out = isinstance(
+                    linear_attn.in_proj_qkvz.quant_method,
+                    FP8RowwiseLinearMethod)

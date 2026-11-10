@@ -21,9 +21,30 @@ import cutlass.cute as cute
 from cutlass import Int32, Int64
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
+from cutlass.experimental import cuda
+
+from ...tensor_map import create_tensor_map_tiled_from_view
 
 from .constants import TMA_GATHER_ROWS
 from .sparse_indices import SparseKVIndices, SparseSourceTile
+
+
+@cute.jit
+def make_sparse_rope_map(cache: cute.Tensor, dtype_bytes: cutlass.Constexpr[int]):
+    """Map the QK-only tail of compact D576 storage for gather4 loads."""
+    rope = cute.make_tensor(
+        cache.iterator + 512,
+        cute.make_layout((64, cache.shape[2]), stride=(1, cache.stride[2])),
+    )
+    return create_tensor_map_tiled_from_view(
+        rope,
+        box_dims=(64, 1),
+        stride_order=(0, 1),
+        swizzle=cuda.TensorMapSwizzle.s64b
+        if dtype_bytes == 1
+        else cuda.TensorMapSwizzle.s128b,
+        l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+    )
 
 
 @dsl_user_op

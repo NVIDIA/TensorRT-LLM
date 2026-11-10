@@ -596,14 +596,17 @@ class LowMGemmDispatcher:
             # included: eager timing adds each runner's host launch cost, which
             # exceeds these kernels' device time and the graphs never pay.
             use_cuda_graph=True,
-            # Every rank of the group runs the winner of rank 0's race: ranks
-            # timing the same shape differently would run different kernels,
-            # and the slowest rank sets the pace of each collective. Under
+            # The ranks of the group split the race: each builds and times its
+            # share of every runner's tactics, and the merge keeps the fastest,
+            # so every rank runs the same winner (ranks running different
+            # kernels would let the slowest set the pace of each collective).
+            # The direct kernel is built per exact (M, N, K, tactic), so one
+            # rank racing every candidate alone takes most of warmup. Under
             # attention DP the ranks' shapes differ, so each tunes its own.
             distributed_tuning_strategy=(
                 DistributedTuningStrategy.INDEPENDENT
                 if self.per_rank_tuning
-                else DistributedTuningStrategy.BROADCAST
+                else DistributedTuningStrategy.PARALLEL
             ),
         )
         # Mark prepared only after all runners and the tuning config exist so the
