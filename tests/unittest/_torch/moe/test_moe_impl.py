@@ -449,6 +449,87 @@ def test_per_layer_dynamic_eplb_filters_backends_by_declared_capability():
     assert [item.reason for item in rejected.rejected] == [MoERejectReason.EPLB_UNSUPPORTED]
 
 
+def test_adaptive_eplb_filters_backends_by_declared_capability():
+    assert TrtllmCutedslMegaMoeNvfp4Impl.capabilities.supports_adaptive_eplb
+    assert not DeepgemmCudaW4a8Mxfp4Mxfp8Impl.capabilities.supports_adaptive_eplb
+    deployment = dataclasses.replace(
+        _megamoe_cutedsl_deployment(),
+        eplb_enabled=True,
+        eplb_mode="adaptive",
+    )
+    accepted = resolve_moe_impl(
+        _megamoe_cutedsl_model_config(),
+        problem=_megamoe_cutedsl_problem(),
+        deployment=deployment,
+        impl_id=_MEGAMOE_CUTEDSL_IMPL_ID,
+    )
+    assert impl_class_for(accepted) is TrtllmCutedslMegaMoeNvfp4Impl
+
+    rejected = resolve_moe_impl(
+        _deepgemm_model_config(QuantAlgo.W4A8_MXFP4_MXFP8),
+        problem=_megamoe_cutedsl_problem(QuantAlgo.W4A8_MXFP4_MXFP8),
+        deployment=deployment,
+        impl_id="deepgemm.cuda.mega_moe.w4a8_mxfp4_mxfp8",
+    )
+    assert rejected.winner is None
+    assert [item.reason for item in rejected.rejected] == [MoERejectReason.EPLB_UNSUPPORTED]
+
+
+def test_adaptive_eplb_runs_a_layer_no_adaptive_backend_serves_as_plain_ep():
+    """MXFP4 experts (the MTP layer of an NVFP4 DeepSeek-V4 export) have no implementation that
+    supports adaptive EPLB: the layer runs on the TRTLLM-Gen leaf for its format as plain EP, its
+    deployment without the balancer, and the report says why. An NVFP4 layer of the same model
+    stays on MegaMoE under the balancer."""
+    deployment = dataclasses.replace(
+        _megamoe_cutedsl_deployment(),
+        eplb_enabled=True,
+        eplb_mode="adaptive",
+        num_slots=12,
+    )
+    report = resolve_moe_impl(
+        _megamoe_cutedsl_model_config(),
+        problem=_megamoe_cutedsl_problem(QuantAlgo.W4A8_MXFP4_MXFP8),
+        deployment=deployment,
+        layer_idx=61,
+    )
+    assert impl_class_for(report) is TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl
+    assert "supports adaptive EPLB" in report.load_balancer_off
+    assert TrtllmCutedslMegaMoeNvfp4Impl.__name__ in report.load_balancer_off
+    assert (report.deployment.eplb_enabled, report.deployment.eplb_mode) == (False, "disabled")
+    assert report.deployment.num_slots == _megamoe_cutedsl_problem().num_experts
+    assert "plain EP outside the load balancer" in report.describe()
+    assert report.to_dict()["load_balancer_off"] == report.load_balancer_off
+
+    balanced = resolve_moe_impl(
+        _megamoe_cutedsl_model_config(),
+        problem=_megamoe_cutedsl_problem(),
+        deployment=deployment,
+    )
+    assert impl_class_for(balanced) is TrtllmCutedslMegaMoeNvfp4Impl
+    assert balanced.load_balancer_off is None
+    assert balanced.deployment is deployment
+
+
+def test_adaptive_eplb_builds_on_a_gpu_without_a_time_model(monkeypatch):
+    """A GPU without a calibrated decode time model does not reject the backend: adaptive EPLB
+    logs why and stays off at start-up (``AdaptiveMoeLoadBalancer.prepare_runtime``)."""
+    deployment = dataclasses.replace(
+        _megamoe_cutedsl_deployment(),
+        eplb_enabled=True,
+        eplb_mode="adaptive",
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    for device in ("NVIDIA GB300", "NVIDIA A100-SXM4-80GB"):
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda *args, name=device: name)
+        report = resolve_moe_impl(
+            _megamoe_cutedsl_model_config(),
+            problem=_megamoe_cutedsl_problem(),
+            deployment=deployment,
+            impl_id=_MEGAMOE_CUTEDSL_IMPL_ID,
+        )
+        assert impl_class_for(report) is TrtllmCutedslMegaMoeNvfp4Impl
+
+
 def test_pinned_megamoe_cutedsl_identity_fails_hard_on_another_format():
     """A pin that cannot run must fail, not widen to the sibling that can.
 

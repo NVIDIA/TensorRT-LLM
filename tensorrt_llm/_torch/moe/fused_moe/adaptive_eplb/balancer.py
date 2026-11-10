@@ -68,6 +68,10 @@ def time_layer_copy(
     return max(transport.allgather(start.elapsed_time(end)))
 
 
+NO_LAYER = "no MoE layer runs on an implementation that supports adaptive EPLB"
+"""Why adaptive EPLB stays off on a model whose MoE layers all run outside the balancer."""
+
+
 class AdaptiveMoeLayerLoadBalancer:
     """Handle of one MoE layer (a :class:`~..moe_load_balancer.MoeLayerLoadBalancer`): records its
     routes and maps experts to slots on the device, inside CUDA graphs. Its slot weights move whole
@@ -312,15 +316,17 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         (:func:`time_layer_copy`) and start the runtime under the backend's time model. Collective
         over EP; runs before the KV cache is sized.
 
-        Where any EP rank cannot run adaptive EPLB (:meth:`platform_gap`), every rank logs why and
-        keeps it off: the layers serve their home layouts and record no statistics.
+        Where any EP rank cannot run adaptive EPLB (:meth:`platform_gap`) or balances no layer,
+        every rank logs why and keeps it off: the layers serve their home layouts and record no
+        statistics.
         """
         backends = find_backends(model, self.layers)
-        first = self.layers[0].layer_idx
         device = torch.device("cuda", torch.cuda.current_device())
         prepare_layers(backends, self.layers, device)
         transport = PeerSlotTransport(self.mapping)
-        gaps = transport.allgather(self.platform_gap(backends[first]))
+        # A rank that balances no layer votes too, so no rank waits for it.
+        vote = self.platform_gap(backends[self.layers[0].layer_idx]) if self.layers else NO_LAYER
+        gaps = transport.allgather(vote)
         stopped = [f"{gap} (EP rank {rank})" for rank, gap in enumerate(gaps) if gap is not None]
         if stopped:
             self.off_reason = stopped[0]
@@ -328,6 +334,7 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
                 f"adaptive EPLB is off: {self.off_reason}; the MoE layers keep their home layouts"
             )
             return
+        first = self.layers[0].layer_idx
         self.transport = transport
         self.copy_stream = migrate_model_weights(backends, transport, device)
         time_model = backends[first].decode_time_model(
@@ -335,7 +342,10 @@ class AdaptiveMoeLoadBalancer(BaseMoeLoadBalancer):
         )
         geometry = ExpertGeometry(self.layers[0].expert_count, self.num_slots, self.ep_size)
         copy_ms = time_layer_copy(transport, first, geometry, self.copy_stream)
-        logger.info(f"adaptive EPLB: one layer's install copy takes {copy_ms:.3f} ms at start-up")
+        logger.info(
+            f"adaptive EPLB balances {len(self.layers)} MoE layers; one layer's install copy "
+            f"takes {copy_ms:.3f} ms at start-up"
+        )
         self.start_runtime(TimeModel(**time_model), self.mapping.gpus_per_node, copy_ms)
 
     def platform_gap(self, backend: AdaptiveEplbBackend) -> str | None:

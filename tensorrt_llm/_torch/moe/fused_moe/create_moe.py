@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+import copy
+from contextlib import nullcontext
 from typing import Callable, Dict, Optional
 
 import torch
@@ -24,8 +26,9 @@ from .interface import MoE, MoEWeightLoadingMode
 from .mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from .moe_load_balancer import get_moe_load_balancer
 from .moe_resolution import (WIDEEP_DEPRECATION_MESSAGE, MoEImplClass,
-                             derive_moe_layer_shapes, infer_swiglu_gptoss_style,
-                             resolve_moe_cls, resolve_moe_impl)
+                             derive_moe_layer_shapes, impl_class_for,
+                             infer_swiglu_gptoss_style, resolve_moe_cls,
+                             resolve_moe_impl)
 from .routing import BaseMoeRoutingMethod
 
 __all__ = [
@@ -352,7 +355,13 @@ def create_moe(
         "must expose moe_intermediate_size / intermediate_size")
 
     # Pass the same shapes / activation package the layer will be built with.
-    moe_cls = resolve_moe_cls(
+    # Adaptive EPLB may leave a layer outside its balancer, which only the
+    # full resolution report says; every other configuration needs the class.
+    load_balancer_config = getattr(model_config, "moe_load_balancer", None)
+    adaptive_eplb = (get_moe_load_balancer() is not None and getattr(
+        load_balancer_config, "mode", None) == "adaptive")
+    resolve = resolve_moe_impl if adaptive_eplb else resolve_moe_cls
+    resolved = resolve(
         model_config,
         override_quant_config=override_quant_config,
         dtype=dtype,
@@ -369,13 +378,52 @@ def create_moe(
         layer_idx=layer_idx,
         allow_degradation=allow_backend_degradation,
     )
+    moe_cls = impl_class_for(resolved) if adaptive_eplb else resolved
 
-    # This dispatch needs no per-class entry: inheriting ``MoEImplBase`` is
-    # enough to be wrapped. Becoming *selectable* still needs the constructor
-    # branch in ``create_moe_backend`` above plus ``moe_resolution``'s
-    # ``IMPL_PRIORITY`` / ``BACKEND_FAMILY``.
-    if issubclass(moe_cls, MoEImplBase):
-        return ConfigurableMoE(
+    # A layer no implementation supporting the balancer's mode can serve runs
+    # as plain EP: built without the balancer, which covers the other layers.
+    balancer_scope = nullcontext()
+    if adaptive_eplb and resolved.load_balancer_off is not None:
+        balancer_scope = get_moe_load_balancer().unbalanced_layer()
+        model_config = copy.copy(model_config)
+        model_config._frozen = False
+        model_config.moe_load_balancer = None
+        model_config._frozen = True
+
+    with balancer_scope:
+        # This dispatch needs no per-class entry: inheriting ``MoEImplBase`` is
+        # enough to be wrapped. Becoming *selectable* still needs the constructor
+        # branch in ``create_moe_backend`` above plus ``moe_resolution``'s
+        # ``IMPL_PRIORITY`` / ``BACKEND_FAMILY``.
+        if issubclass(moe_cls, MoEImplBase):
+            return ConfigurableMoE(
+                moe_cls=moe_cls,
+                routing_method=routing_method,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                dtype=dtype,
+                reduce_results=reduce_results,
+                model_config=model_config,
+                aux_stream_dict=aux_stream_dict,
+                weight_loading_mode=weight_loading_mode,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                layer_idx=layer_idx,
+                override_quant_config=override_quant_config,
+                bias=bias,
+                activation=activation,
+                communication_method=communication_method,
+                unfinalized_combine_fn=unfinalized_combine_fn,
+                accepts_global_routed_output=accepts_global_routed_output,
+            )
+
+        # TritonFusedMoE and VanillaMoE are not wrapped by ConfigurableMoE
+        # and own their communication and forward paths.
+        if communication_method is not None:
+            raise ValueError("communication_method requires ConfigurableMoE.")
+        if unfinalized_combine_fn is not None:
+            raise ValueError("unfinalized_combine_fn requires ConfigurableMoE.")
+        return create_moe_backend(
             moe_cls=moe_cls,
             routing_method=routing_method,
             num_experts=num_experts,
@@ -386,35 +434,8 @@ def create_moe(
             model_config=model_config,
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
+            bias=bias,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
-            override_quant_config=override_quant_config,
-            bias=bias,
             activation=activation,
-            communication_method=communication_method,
-            unfinalized_combine_fn=unfinalized_combine_fn,
-            accepts_global_routed_output=accepts_global_routed_output,
         )
-
-    # TritonFusedMoE and VanillaMoE are not wrapped by ConfigurableMoE
-    # and own their communication and forward paths.
-    if communication_method is not None:
-        raise ValueError("communication_method requires ConfigurableMoE.")
-    if unfinalized_combine_fn is not None:
-        raise ValueError("unfinalized_combine_fn requires ConfigurableMoE.")
-    return create_moe_backend(
-        moe_cls=moe_cls,
-        routing_method=routing_method,
-        num_experts=num_experts,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        dtype=dtype,
-        reduce_results=reduce_results,
-        model_config=model_config,
-        aux_stream_dict=aux_stream_dict,
-        weight_loading_mode=weight_loading_mode,
-        bias=bias,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-        layer_idx=layer_idx,
-        activation=activation,
-    )

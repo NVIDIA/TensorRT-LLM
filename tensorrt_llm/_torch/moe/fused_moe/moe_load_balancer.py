@@ -5,7 +5,7 @@ import gc
 import os
 import threading
 from abc import ABC, abstractmethod
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from multiprocessing import resource_tracker, shared_memory
 from typing import (Callable, Dict, List, Optional, Protocol, Sequence, Tuple,
                     runtime_checkable)
@@ -837,7 +837,8 @@ class BaseMoeLoadBalancer(ABC):
     ``start_iter``, and ``end_iter`` or, when the forward raises,
     ``abort_iter``), and workers release resources with a collective
     ``shutdown``. Subclasses initialize ``_previous_balancer``,
-    ``enable_statistic`` and ``enable_update_weights``.
+    ``enable_statistic``, ``enable_update_weights`` and
+    ``next_layer_repeated_count``.
     """
 
     @abstractmethod
@@ -850,6 +851,27 @@ class BaseMoeLoadBalancer(ABC):
     @abstractmethod
     def set_repeated_for_next_layer(self, repeated_count: int) -> None:
         """Set how many times the next added layer is invoked per forward."""
+
+    @contextmanager
+    def unbalanced_layer(self):
+        """Build the next MoE layer as plain EP, outside this balancer.
+
+        For a layer no implementation supporting this balancer's mode can
+        serve (``moe_resolution.resolve_moe_impl``). While the context is open
+        this balancer is not the current one, so the layer registers nothing:
+        no slots, statistics or decisions cover it. The repeat count set for
+        the next layer was meant for that layer and is dropped with it. The
+        balancer is current again afterwards, also on error.
+        """
+        if get_moe_load_balancer() is not self:
+            raise RuntimeError(
+                "only the current load balancer can build a layer outside it")
+        del _current_moe_load_balancer.instance
+        try:
+            yield
+        finally:
+            _current_moe_load_balancer.instance = self
+            self.next_layer_repeated_count = None
 
     @abstractmethod
     def add_layer(self,

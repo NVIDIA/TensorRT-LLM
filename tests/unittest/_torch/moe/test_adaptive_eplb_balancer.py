@@ -49,6 +49,26 @@ def _counts(*values: float) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.float32)
 
 
+def test_a_layer_built_outside_the_balancer_registers_nothing():
+    """``unbalanced_layer`` hides the balancer while a layer no adaptive backend serves is built,
+    drops the repeat count that was set for that layer and restores the balancer, also on error."""
+    balancer = _balancer()
+    with balancer:
+        balancer.set_repeated_for_next_layer(3)
+        with balancer.unbalanced_layer():
+            assert base.get_moe_load_balancer() is None
+        assert base.get_moe_load_balancer() is balancer
+        layer = balancer.add_layer(NUM_EXPERTS, TOP_K, NUM_SLOTS // EP_SIZE)
+        assert layer.repeated_count == 1
+        assert balancer.layers == [layer]
+        with pytest.raises(KeyError), balancer.unbalanced_layer():
+            raise KeyError("construction failed")
+        assert base.get_moe_load_balancer() is balancer
+    with pytest.raises(RuntimeError, match="only the current"):
+        with balancer.unbalanced_layer():
+            pass
+
+
 def test_layers_are_checked_against_the_slots():
     balancer = _balancer()
     with pytest.raises(ValueError, match="multiple of `ep_size`"):
@@ -148,15 +168,15 @@ def test_layer_route_stages_into_the_backend_and_records_the_statistics():
     assert layer.statistics.forwards.item() == 2
 
 
-def _prepare(monkeypatch, gaps, calibrated=True):
-    """``prepare_runtime`` of rank 0 of a balancer of one layer whose backend has a time model for
-    ``calibrated`` GPUs, the EP ranks reporting ``gaps`` (:meth:`platform_gap`) -> the balancer,
-    its layer and what the runtime start-up saw."""
+def _prepare(monkeypatch, gaps, calibrated=True, layers=1):
+    """``prepare_runtime`` of rank 0 of a balancer of ``layers`` layers whose backend has a time
+    model for ``calibrated`` GPUs, the EP ranks reporting ``gaps`` (:meth:`platform_gap`; ``None``:
+    every rank reports what rank 0 does) -> the balancer, its layer and what the start-up saw."""
     from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb import balancer as module
 
     balancer = _balancer(ep_rank=0)
     balancer.mapping = SimpleNamespace(gpus_per_node=4)
-    layer = balancer.add_layer(NUM_EXPERTS, TOP_K, NUM_SLOTS // EP_SIZE)
+    layer = balancer.add_layer(NUM_EXPERTS, TOP_K, NUM_SLOTS // EP_SIZE) if layers else None
     seen = {}
     fields = dict(
         per_active_slot_us=1.0,
@@ -182,7 +202,9 @@ def _prepare(monkeypatch, gaps, calibrated=True):
     def allgather(value):
         """The platform gaps first, then the copy times, of which the slowest 2.0 is agreed."""
         gathered.append(value)
-        return gaps if len(gathered) == 1 else [value, 2.0, 1.0, 1.5]
+        if len(gathered) == 1:
+            return [value] * EP_SIZE if gaps is None else gaps
+        return [value, 2.0, 1.0, 1.5]
 
     transport.allgather = allgather
     transport.copy = lambda experts, *args: seen.setdefault("copies", []).append(experts)
@@ -191,7 +213,9 @@ def _prepare(monkeypatch, gaps, calibrated=True):
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "NVIDIA GB300")
-    monkeypatch.setattr(module, "find_backends", lambda model, layers: {layer.layer_idx: backend})
+    monkeypatch.setattr(
+        module, "find_backends", lambda model, handles: {h.layer_idx: backend for h in handles}
+    )
     monkeypatch.setattr(module, "PeerSlotTransport", lambda mapping: transport)
     monkeypatch.setattr(module, "peer_copy_gap", lambda mapping: None)
     monkeypatch.setattr(
@@ -239,6 +263,16 @@ def test_adaptive_eplb_stays_off_where_any_rank_cannot_run_it(monkeypatch, calib
     assert layer.route(experts).tolist() == [[1, 3], [10, 6]]
     assert layer.statistics.forwards.item() == 0
     assert balancer.shutdown() is True
+
+
+def test_a_model_without_a_balanced_layer_serves_with_adaptive_eplb_off(monkeypatch):
+    """Every MoE layer runs outside the balancer: the ranks still vote and nothing starts."""
+    from tensorrt_llm._torch.moe.fused_moe.adaptive_eplb.balancer import NO_LAYER
+
+    balancer, _, seen, _, _ = _prepare(monkeypatch, None, layers=0)
+    assert balancer.off_reason == f"{NO_LAYER} (EP rank 0)" and "start" not in seen
+    _observe(balancer, 4)
+    assert not balancer.recording and balancer.shutdown() is True
 
 
 def test_start_runtime_needs_torch_distributed(monkeypatch):

@@ -883,6 +883,20 @@ def _launch_cluster_configuration(
     )
 
 
+def megamoe_kernel_classes(sm_version: int) -> Tuple[type, ...]:
+    """The kernel classes MegaMoE launches on SM ``sm_version``: the bucket-specialized one
+    first where there is one, the generic one last."""
+    from tensorrt_llm._torch.moe.kernels.megamoe_kernels import (
+        BlackwellInferenceMegaMoE,
+        RubinInferenceGenphaseMegaMoE,
+        RubinInferenceMegaMoE,
+    )
+
+    if sm_version == 107:
+        return RubinInferenceGenphaseMegaMoE, RubinInferenceMegaMoE
+    return (BlackwellInferenceMegaMoE,)
+
+
 def _construct_megamoe_kernel(
     *, sm_version: int, common: dict, combine_format: str
 ) -> Tuple[Any, Optional[Exception]]:
@@ -891,11 +905,8 @@ def _construct_megamoe_kernel(
 
     from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.api import ImplDesc, ProblemDesc
     from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.quant_def import CombineFormat, QuantKind
-    from tensorrt_llm._torch.moe.kernels.megamoe_kernels import (
-        BlackwellInferenceMegaMoE,
-        RubinInferenceGenphaseMegaMoE,
-        RubinInferenceMegaMoE,
-    )
+
+    *specialized, generic = megamoe_kernel_classes(sm_version)
 
     local_experts, intermediate_gateup_size, hidden_size = common["static_expert_shape"]
     problem_desc = ProblemDesc(
@@ -968,11 +979,10 @@ def _construct_megamoe_kernel(
     rejection = None
     if bucket is not None and bucket not in _SM107_GENERIC_KERNEL_BUCKETS:
         try:
-            return construct(RubinInferenceGenphaseMegaMoE), None
+            return construct(specialized[0]), None
         except (ValueError, TypeError, NotImplementedError) as exc:
             rejection = exc
-    kernel_cls = RubinInferenceMegaMoE if sm_version == 107 else BlackwellInferenceMegaMoE
-    return construct(kernel_cls), rejection
+    return construct(generic), rejection
 
 
 def _megamoe_barrier_reset_slices(kernel) -> Tuple[int, int, int, int, str]:

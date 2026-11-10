@@ -165,6 +165,7 @@ Wide-EP introduces the concept of **expert slots** that are decoupled from speci
 - **Offline EPLB**: Pre-computed expert placement based on historical workload statistics
 - **Online EPLB**: Dynamic expert placement that adapts to real-time traffic patterns
 - **Per-layer dynamic EPLB**: Expert placement re-planned for every MoE layer on every forward pass, with hot-expert weights copied into helper slots on the GPU (`MEGAMOE_CUTEDSL` backend only)
+- **Adaptive EPLB**: During decode, hot experts are replicated into spare slots when a time model of the MoE backend predicts that the replication repays its copy cost; routing and statistics run inside CUDA graphs (backends that declare `supports_adaptive_eplb`, currently `MEGAMOE_CUTEDSL`)
 - Layer-wise weight redistribution to minimize inference disruption
 
 ### Architecture Overview
@@ -181,9 +182,10 @@ The system maintains a routing table that maps Expert IDs to Slot IDs, which can
 1. **Start with offline EPLB** for production deployments with known workload patterns
 2. **Use online EPLB** for dynamic workloads or when traffic patterns change frequently
 3. **Use per-layer dynamic EPLB** for context-heavy (prefill) serving on the `MEGAMOE_CUTEDSL` backend when the hot experts change from one batch to the next. Online EPLB refreshes a few layers per iteration from decayed statistics, so it follows the recent average load; per-layer dynamic EPLB re-plans each layer from the routing of the current forward pass. It runs without CUDA graphs, so prefer online EPLB for generation-heavy deployments that rely on them. See [Per-Layer Dynamic EP Load Balancer](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#per-layer-dynamic-ep-load-balancer) for its requirements.
-4. **Monitor expert statistics** to understand workload distribution
-5. **Tune max_num_tokens** based on your memory constraints and EP size
-6. **Test with representative datasets** to validate load balancing effectiveness
+4. **Use adaptive EPLB** for generation-heavy serving with CUDA graphs on `MEGAMOE_CUTEDSL` when the expert load shifts over a run. It decides from statistics windows of the decode steps and installs a new placement only when its predicted gain, over the decode steps the running requests still have, repays the measured copy cost. See [Adaptive EP Load Balancer](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#adaptive-ep-load-balancer) for its requirements.
+5. **Monitor expert statistics** to understand workload distribution
+6. **Tune max_num_tokens** based on your memory constraints and EP size
+7. **Test with representative datasets** to validate load balancing effectiveness
 
 ### References
 
