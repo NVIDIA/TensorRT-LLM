@@ -538,18 +538,17 @@ class CuteDslMlaFmha(PhasedFmha):
         # The same failure without Helix: an FP8-KV multi-token verify group
         # (e.g. DSpark under attention DP, where every rank keeps all 96 heads)
         # is not in the FP8 perf table, and on SM100/SM103 the next library is
-        # FlashInfer TRTLLM-Gen, which rejects these head counts. The kernel
-        # packs (token, head) rows into 128-row M tiles, so any H <= 128 with a
+        # FlashInfer TRTLLM-Gen, which rejects these head counts. SM107 has no
+        # TRTLLM-Gen FMHA, so there the next library is the generic fallback,
+        # which is several times slower on these groups. The kernel packs
+        # (token, head) rows into 128-row M tiles, so any H <= 128 with a
         # linear-chain causal verify is valid (can_implement below still has the
-        # final say). SM107 is left out on purpose: TRTLLM-Gen FMHA is
-        # unavailable there and such a request already reaches the default
-        # TRTLLM path.
+        # final say).
         fp8_wide_head_verify_group = (
             64 < attn.num_heads < 128
             and seq_len_q > 1
             and meta.helix_position_offsets is None
             and self._get_kernel_dtype(attn, q) == torch.float8_e4m3fn
-            and get_sm_version() in (100, 103)
         )
         if not (helix_h96_verify_group or fp8_wide_head_verify_group or exclusive_page_size):
             # Perf gate (NOT a correctness limit).

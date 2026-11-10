@@ -205,6 +205,7 @@ def _compute_index_mapper_capacity(
     disable_overlap_scheduler: bool,
     num_reserved_index_slots: int,
     has_guard_page: bool,
+    gen_preemption_headroom: int = 0,
 ) -> tuple[int, int]:
     """Return ``(max_admissible_sequences, IndexMapper capacity)``.
 
@@ -220,12 +221,14 @@ def _compute_index_mapper_capacity(
     the same coefficient. Persistent request IDs such as CUDA-graph padding
     requests get reserved slots, and the guard page, held by a permanent
     sequence, gets a slot of its own so that it does not change which requests
-    the scheduler admits.
+    the scheduler admits. Requests paused in place by GEN slot preemption stay
+    resident, so ``gen_preemption_headroom`` more sequences are admissible.
     """
     assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
     max_num_sequences = max_batch_size * mapping.pp_size
     needs_extra_leases = is_disagg or (not disable_overlap_scheduler and not mapping.has_pp())
     max_admissible_sequences = max_num_sequences * (2 if needs_extra_leases else 1)
+    max_admissible_sequences += gen_preemption_headroom
     capacity = max_admissible_sequences + num_reserved_index_slots + int(has_guard_page)
     return max_admissible_sequences, capacity
 
@@ -1882,6 +1885,7 @@ class _BasePageTableMaterializer:
 
 
 class KVCacheManagerV2(BaseResourceManager):
+    gen_preemption_headroom: int = 0
     # Sparse managers attach a metadata batch during initialization.
     sparse_metadata_batch: Batch | None = None
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
@@ -1984,9 +1988,11 @@ class KVCacheManagerV2(BaseResourceManager):
         max_cuda_graph_batch_size: Optional[int] = None,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         shared_draft_block_width: Optional[int] = None,
+        gen_preemption_headroom: int = 0,
         **kwargs,
     ) -> None:
         self.mapping = mapping
+        self.gen_preemption_headroom = gen_preemption_headroom
         self.dtype = dtype
         self._declared_target_layer_count = num_layers
         self.layer_specs = tuple(layer_specs) if layer_specs is not None else None
@@ -2419,6 +2425,7 @@ class KVCacheManagerV2(BaseResourceManager):
             disable_overlap_scheduler=disable_overlap_scheduler,
             num_reserved_index_slots=num_reserved_index_slots,
             has_guard_page=self._guard_page_value is not None,
+            gen_preemption_headroom=self.gen_preemption_headroom,
         )
         # Costing the memory budget below already reads the declared regions.
         self._declare_regions()
@@ -3457,7 +3464,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_generation_request_capacity(self) -> int:
         """Return the resident generation requests used for SWA sizing."""
-        return self.max_batch_size
+        return self.max_batch_size + self.gen_preemption_headroom
 
     def _gpu_quota_for_max_tokens(self, max_tokens: float, max_util_for_resume: float) -> int:
         """GPU quota holding ``max_tokens`` at ``max_util_for_resume``, plus the fixed regions."""
@@ -7978,6 +7985,7 @@ class KVCacheManagerV2(BaseResourceManager):
         is_draft: bool = False,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         shared_draft_block_width: Optional[int] = None,
+        gen_preemption_headroom: int = 0,
         **kwargs,
     ):
         if layer_specs is not None:
@@ -8044,8 +8052,9 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         # The affine slope covers all tokens; context additionally retains SWA
         # pages for the current token batch beyond the generation windows.
+        resident_capacity = max_batch_size + gen_preemption_headroom
         fixed_cost = (
-            swa_size_per_request * max_batch_size
+            swa_size_per_request * resident_capacity
             + (context_size_per_token - cache_size_per_token) * max_num_tokens
         )
         bytes_per_slot = _get_single_swa_pool_slot_bytes(
@@ -8071,7 +8080,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                     costs.append(
                         (
-                            layer_size * max_num_tokens + retained_bytes * max_batch_size,
+                            layer_size * max_num_tokens + retained_bytes * resident_capacity,
                             layer_size * tokens_per_block,
                         )
                     )

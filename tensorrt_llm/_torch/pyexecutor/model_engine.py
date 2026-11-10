@@ -322,11 +322,15 @@ class ModelEngine:
             is_hybrid=is_hybrid_linear(pretrained_config),
             has_mrope_delta_cache=resolve_mrope_position_deltas_cache(self.model) is not None,
         )
+        from .scheduler.gen_preemption import headroom_for_args
+
+        self.gen_preemption_headroom = headroom_for_args(self.batch_size, self.llm_args)
         self.max_num_seq_slots = compute_max_num_sequences(
             self.mapping,
             self.batch_size,
             self.llm_args.disable_overlap_scheduler,
             enable_overlap_headroom=self.enable_overlap_headroom,
+            gen_preemption_headroom=self.gen_preemption_headroom,
         )
         prepare_loaded_model(self.model, self.llm_args)
         # Router Replay (R3) capturer owned by this engine (None when disabled).
