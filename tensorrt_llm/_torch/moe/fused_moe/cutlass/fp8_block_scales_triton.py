@@ -16,12 +16,10 @@
 
 import torch
 
-from tensorrt_llm.math_utils import ceil_div
-
 from ....utils import ActivationType
 from ..activation import ActivationParamShape, MoEActivationSupport
 from ..fused_moe_triton_fp8_block_scale import (
-    _LARGE_M_MIN_ROWS,
+    _BLOCK_SIZE_M,
     _block_size_m,
     run_triton_fp8_block_scale_moe,
 )
@@ -91,19 +89,17 @@ class TrtllmTritonFp8BlockScalesImpl(CutlassFusedMoEBase):
         that defines it. Otherwise each tile height is tuned by the first forward
         that reaches it, which is a served batch when the general warmup is
         skipped (e.g. with guided decoding) and CUDA graphs are off. The small
-        tile is tuned at one token and the large one at ``max_num_tokens``, the
-        shapes the warmups would otherwise tune them at.
+        tile is tuned at one token and the large one at the most rows a forward
+        computes: ``max_num_tokens``, times the ranks under attention DP.
         """
         del verify_batches
         num_local_experts, _, hidden_size = self.w3_w1_weight.shape
         top_k = self.routing_method.top_k
         # Under attention DP a rank's MoE also computes the other ranks' tokens.
         max_rows = max_num_tokens * (self.parallel_size if self.use_dp else 1)
-        # The fewest tokens that take the large tile
-        large_tile_tokens = ceil_div(_LARGE_M_MIN_ROWS * num_local_experts, top_k)
         token_counts = [1]
-        if max_rows >= large_tile_tokens:
-            token_counts.append(min(max_rows, max(max_num_tokens, large_tile_tokens)))
+        if _block_size_m(max_rows, top_k, num_local_experts) != _BLOCK_SIZE_M:
+            token_counts.append(max_rows)
 
         device = self.w3_w1_weight.device
         tuned = 0

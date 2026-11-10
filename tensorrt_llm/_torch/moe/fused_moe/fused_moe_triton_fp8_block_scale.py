@@ -261,7 +261,10 @@ def _prune_moe_gemm_configs(configs, named_args, **kwargs):
     # from zero instead of accumulating on the previous trial's output.
     reset_to_zero=["c_ptr"],
     # Each tile height sweeps every config; keep the winners in the Triton
-    # cache so that a restart does not repeat the sweeps.
+    # cache so that a restart does not repeat the sweeps. M is not in the key,
+    # so a height keeps the config tuned at the first M that reached it, also
+    # across deployments with another max_num_tokens or parallel layout. Clear
+    # the Triton cache to retune.
     cache_results=True,
 )
 @triton.jit
