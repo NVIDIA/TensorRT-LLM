@@ -101,9 +101,10 @@ def can_fuse_fp4_mla_q_quant(
 ) -> bool:
     """Return whether generation can quantize Q in the fused cache update."""
     num_gen = metadata.num_seqs - metadata.num_contexts
+    backend = _fp4_mla_attention_backend()
     return bool(
-        _fp4_mla_attention_backend() in _FP4_MLA_K_RESIDUAL_BACKENDS
-        and get_sm_version() == 107
+        backend in _FP4_MLA_K_RESIDUAL_BACKENDS
+        and (get_sm_version() == 107 or (backend == "triton" and get_sm_version() in (100, 103)))
         and num_gen > 0
         and getattr(metadata, "kv_cache_manager", None) is not None
         and q.shape[0] > 0
