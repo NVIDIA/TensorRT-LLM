@@ -147,10 +147,10 @@ inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs(
         {"MOE_A2A_SENTINEL_MAX_RANKS", sentinel::kMaxRanks},
         {"MOE_A2A_SENTINEL_MAX_TOKENS_PER_RANK", sentinel::kMaxTokensPerRank},
         {"MOE_A2A_SENTINEL_DISPATCH_BLOCKS_PER_SM", sentinel::kDispatchBlocksPerSM},
-        {"MOE_A2A_SENTINEL_FORMAT_BF16", sentinel::kBf16},
-        {"MOE_A2A_SENTINEL_FORMAT_MXFP8", sentinel::kMxfp8},
-        {"MOE_A2A_SENTINEL_FORMAT_FP8_BLOCK128", sentinel::kFp8Block128},
-        {"MOE_A2A_SENTINEL_FORMAT_NVFP4", sentinel::kNvfp4},
+        {"MOE_A2A_SENTINEL_FORMAT_BF16", static_cast<int>(sentinel::PayloadFormat::kBf16)},
+        {"MOE_A2A_SENTINEL_FORMAT_MXFP8", static_cast<int>(sentinel::PayloadFormat::kMxfp8)},
+        {"MOE_A2A_SENTINEL_FORMAT_FP8_BLOCK128", static_cast<int>(sentinel::PayloadFormat::kFp8Block128)},
+        {"MOE_A2A_SENTINEL_FORMAT_NVFP4", static_cast<int>(sentinel::PayloadFormat::kNvfp4)},
     };
 }
 

@@ -34,7 +34,7 @@
 // builds sm_10x as the sm_100f family by default, so usually only the __CUDA_ARCH__ == 1000 branch is
 // compiled, and GPUs of compute capability 10.3 and 10.7 run that image; 1030 and 1070 apply to
 // builds that list those architectures (e.g. --cuda_architectures "107-real"). Which GPUs may use the
-// transport is decided at run time by moe_a2a_sentinel_kernels_available(), not here. (FlashInfer
+// transport is decided at run time by moeA2ASentinelKernelsAvailable(), not here. (FlashInfer
 // builds native sm_107a for these kernels, noting that the driver rejects the sm_100f fallback on
 // SM107; if it does, the availability probe below fails and the transport stays off.)
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070)
@@ -53,7 +53,7 @@ namespace
 
 #if MOE_A2A_SENTINEL_COMPILE
 // ================================================================================ PTX helpers
-__device__ __forceinline__ uint4 load_volatile(void const* ptr)
+__device__ __forceinline__ uint4 loadVolatile(void const* ptr)
 {
     uint4 v;
     asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];"
@@ -63,14 +63,14 @@ __device__ __forceinline__ uint4 load_volatile(void const* ptr)
     return v;
 }
 
-__device__ __forceinline__ int load_volatile_int(int const* ptr)
+__device__ __forceinline__ int loadVolatileInt(int const* ptr)
 {
     int v;
     asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(v) : "l"(ptr) : "memory");
     return v;
 }
 
-__device__ __forceinline__ void store_volatile(void* ptr, uint4 v)
+__device__ __forceinline__ void storeVolatile(void* ptr, uint4 v)
 {
     asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" ::"l"(ptr), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
                  : "memory");
@@ -78,12 +78,12 @@ __device__ __forceinline__ void store_volatile(void* ptr, uint4 v)
 
 // Programmatic dependent launch: every kernel waits for its predecessor before it touches a
 // buffer or the epoch, and lets its successor launch once its own stores are issued.
-__device__ __forceinline__ void wait_for_previous_kernel()
+__device__ __forceinline__ void waitForPreviousKernel()
 {
     asm volatile("griddepcontrol.wait;" ::: "memory");
 }
 
-__device__ __forceinline__ void allow_next_kernel()
+__device__ __forceinline__ void allowNextKernel()
 {
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 }
@@ -93,40 +93,50 @@ __device__ __forceinline__ uint4 splat(uint32_t word)
     return make_uint4(word, word, word, word);
 }
 
-__device__ __forceinline__ bool has_arrived(uint4 v, uint32_t sentinel_word)
+__device__ __forceinline__ bool hasArrived(uint4 v, uint32_t sentinelWord)
 {
-    return v.x != sentinel_word && v.y != sentinel_word && v.z != sentinel_word && v.w != sentinel_word;
+    return v.x != sentinelWord && v.y != sentinelWord && v.z != sentinelWord && v.w != sentinelWord;
 }
 
 // Row (source, token) of the landing regions: a token slot's rows from every source are adjacent.
-__device__ __forceinline__ int64_t landing_row(int ep_size, int source, int token)
+__device__ __forceinline__ int64_t landingRow(int epSize, int source, int token)
 {
-    return static_cast<int64_t>(token) * ep_size + source;
+    return static_cast<int64_t>(token) * epSize + source;
 }
 
 // Polls the landing vectors whose bits are set in `pending` until each has arrived, every load in
-// flight before any check; address(i) is vector i's address, and before_each_spin() runs at the
+// flight before any check; address(i) is vector i's address, and beforeEachSpin() runs at the
 // start of every spin (e.g. to re-read address(i)'s inputs from shared memory, all before the
 // first load). Returns the bits still pending when the wait timed out (0: all arrived).
 template <int NUM_VECTORS, typename BeforeEachSpin, typename Address>
-__device__ __forceinline__ uint32_t poll_until_arrived(uint32_t pending, uint32_t sentinel_word,
-    BeforeEachSpin const& before_each_spin, Address const& address, uint4 (&vectors)[NUM_VECTORS], long long wait_start,
-    int64_t timeout_cycles)
+__device__ __forceinline__ uint32_t pollUntilArrived(uint32_t pending, uint32_t sentinelWord,
+    BeforeEachSpin const& beforeEachSpin, Address const& address, uint4 (&vectors)[NUM_VECTORS], long long waitStart,
+    int64_t timeoutCycles)
 {
     for (int spins = 1; pending; ++spins)
     {
-        before_each_spin();
+        beforeEachSpin();
 #pragma unroll
         for (int i = 0; i < NUM_VECTORS; ++i)
-            if ((pending >> i) & 1u)
-                vectors[i] = load_volatile(address(i));
+        {
+            if ((pending >> i) & 1U)
+            {
+                vectors[i] = loadVolatile(address(i));
+            }
+        }
 #pragma unroll
         for (int i = 0; i < NUM_VECTORS; ++i)
-            if (((pending >> i) & 1u) && has_arrived(vectors[i], sentinel_word))
-                pending &= ~(1u << i);
+        {
+            if (((pending >> i) & 1U) && hasArrived(vectors[i], sentinelWord))
+            {
+                pending &= ~(1U << i);
+            }
+        }
         // A -DDISABLE_TIMEOUT=1 debug build waits forever, as the fence kernels do.
-        if (!DISABLE_TIMEOUT && pending && spins % 64 == 0 && clock64() - wait_start > timeout_cycles)
+        if (!DISABLE_TIMEOUT && pending && spins % 64 == 0 && clock64() - waitStart > timeoutCycles)
+        {
             break;
+        }
     }
     return pending;
 }
@@ -134,10 +144,12 @@ __device__ __forceinline__ uint32_t poll_until_arrived(uint32_t pending, uint32_
 // A peer that never arrives: report once per launch, then trap (the CUDA context is lost, as in
 // the fence kernels). [[noreturn]]: callers keep no register live
 // across the call.
-[[noreturn]] static __device__ __noinline__ void report_and_trap(int32_t* round_state, int ep_rank, char const* what)
+[[noreturn]] static __device__ __noinline__ void reportAndTrap(int32_t* roundState, int epRank, char const* what)
 {
-    if (atomicExch(round_state + kTimeoutReported, 1) == 0)
-        printf("sentinel transport: rank %d %s\n", ep_rank, what);
+    if (atomicExch(roundState + kTimeoutReported, 1) == 0)
+    {
+        printf("sentinel transport: rank %d %s\n", epRank, what);
+    }
     __threadfence_system();
     __trap();
 }
@@ -145,11 +157,11 @@ __device__ __forceinline__ uint32_t poll_until_arrived(uint32_t pending, uint32_
 // The rank mask is passed by value, as the fence kernels' is. Nothing is stored to or polled
 // from a masked rank; a route to it is dropped like a repeated one.
 template <bool ENABLE_RANK_MASK>
-__device__ __forceinline__ bool is_rank_alive(uint64_t active_rank_mask, int rank)
+__device__ __forceinline__ bool isRankAlive(uint64_t activeRankMask, int rank)
 {
     if constexpr (ENABLE_RANK_MASK)
     {
-        return (active_rank_mask >> rank) & 1ull;
+        return (activeRankMask >> rank) & 1ULL;
     }
     else
     {
@@ -159,39 +171,42 @@ __device__ __forceinline__ bool is_rank_alive(uint64_t active_rank_mask, int ran
 
 // Removes the lowest rank from a rank mask and returns it: successive calls walk the ranks in
 // ascending order, at a cost per rank in the mask rather than per rank of the EP group.
-__device__ __forceinline__ int pop_lowest_rank(uint64_t& ranks)
+__device__ __forceinline__ int popLowestRank(uint64_t& ranks)
 {
     int const rank = __ffsll(static_cast<long long>(ranks)) - 1;
     ranks &= ranks - 1;
     return rank;
 }
 
-// Row vector `vec` (top-k slots 4 vec .. 4 vec + 3) into a receive row of top_k words.
-__device__ __forceinline__ void store_topk_words(uint32_t* row, int top_k, int vec, uint4 v)
+// Row vector `vec` (top-k slots 4 vec .. 4 vec + 3) into a receive row of topK words.
+__device__ __forceinline__ void storeTopkWords(uint32_t* row, int topK, int vec, uint4 v)
 {
     uint32_t const words[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
     for (int w = 0; w < 4; ++w)
-        if (4 * vec + w < top_k)
+    {
+        if (4 * vec + w < topK)
+        {
             row[4 * vec + w] = words[w];
+        }
+    }
 }
 
-// Routing weights of row vector `vec` into a receive row of top_k weights. bf16 weights travel as
+// Routing weights of row vector `vec` into a receive row of topK weights. bf16 weights travel as
 // the fp32 words of their values (bits << 16), so the high halves are the bf16 values exactly.
-__device__ __forceinline__ void store_topk_weights(
-    DispatchParams const& p, int64_t recv_row, int top_k, int vec, uint4 v)
+__device__ __forceinline__ void storeTopkWeights(DispatchParams const& p, int64_t recvRow, int topK, int vec, uint4 v)
 {
-    if (!p.weights_bf16)
+    if (!p.weightsBf16)
     {
-        store_topk_words(p.recv_topk_weights + recv_row * top_k, top_k, vec, v);
+        storeTopkWords(p.recvTopkWeights + recvRow * topK, topK, vec, v);
         return;
     }
-    uint16_t* const row = reinterpret_cast<uint16_t*>(p.recv_topk_weights) + recv_row * top_k;
+    uint16_t* const row = reinterpret_cast<uint16_t*>(p.recvTopkWeights) + recvRow * topK;
     uint32_t const words[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
     for (int w = 0; w < 4; ++w)
     {
-        if (4 * vec + w < top_k)
+        if (4 * vec + w < topK)
         {
             row[4 * vec + w] = static_cast<uint16_t>(words[w] >> 16);
         }
@@ -201,477 +216,527 @@ __device__ __forceinline__ void store_topk_weights(
 // ============================================== sender-side rewrites: no wire word is a sentinel
 // BF16 0xFFFFFFFF (two NaNs) -> 0x7FFF7FFF; FP8 data and fp32 / e4m3 scale or weight words
 // 0xFFFFFFFF -> 0x7FFFFFFF (NaN stays NaN); an id equal to kIdsSentinel (an invalid id) ->
-// invalid_expert_id. MXFP8 scales travel as 16-bit lanes 0x00XX, which never match.
-__device__ __forceinline__ uint32_t canonicalize_bf16x2(uint32_t word)
+// invalidExpertId. MXFP8 scales travel as 16-bit lanes 0x00XX, which never match.
+__device__ __forceinline__ uint32_t canonicalizeBf16x2(uint32_t word)
 {
-    return word == kDataSentinel ? 0x7FFF7FFFu : word;
+    return word == kDataSentinel ? 0x7FFF7FFFU : word;
 }
 
-__device__ __forceinline__ uint32_t canonicalize_word(uint32_t word)
+__device__ __forceinline__ uint32_t canonicalizeWord(uint32_t word)
 {
-    return word == kDataSentinel ? 0x7FFFFFFFu : word;
+    return word == kDataSentinel ? 0x7FFFFFFFU : word;
 }
 
-__device__ __forceinline__ uint32_t canonicalize_expert_id(uint32_t id, uint32_t invalid_id)
+__device__ __forceinline__ uint32_t canonicalizeExpertId(uint32_t id, uint32_t invalidId)
 {
-    return id == kIdsSentinel ? invalid_id : id;
+    return id == kIdsSentinel ? invalidId : id;
 }
 
 // NVFP4: every -0 nibble (1000b) becomes +0; the wire word is this XOR kNvfp4WireXor.
-__device__ __forceinline__ uint32_t canonicalize_fp4x8(uint32_t word)
+__device__ __forceinline__ uint32_t canonicalizeFp4x8(uint32_t word)
 {
-    uint32_t const magnitude = word & 0x77777777u;
-    uint32_t const nonzero = (magnitude | (magnitude >> 1) | (magnitude >> 2)) & 0x11111111u;
-    return word & (0x77777777u | (nonzero << 3));
+    uint32_t const magnitude = word & 0x77777777U;
+    uint32_t const nonzero = (magnitude | (magnitude >> 1) | (magnitude >> 2)) & 0x11111111U;
+    return word & (0x77777777U | (nonzero << 3));
 }
 
 // Wire <-> raw NVFP4 vector (an involution).
-__device__ __forceinline__ uint4 nvfp4_wire_xor(uint4 v)
+__device__ __forceinline__ uint4 nvfp4WireXor(uint4 v)
 {
     return make_uint4(v.x ^ kNvfp4WireXor, v.y ^ kNvfp4WireXor, v.z ^ kNvfp4WireXor, v.w ^ kNvfp4WireXor);
 }
 
 // Combine partials: every bf16 lane 0xFFFF (a NaN) -> 0x7FFF.
-__device__ __forceinline__ uint32_t canonicalize_bf16_lanes(uint32_t word)
+__device__ __forceinline__ uint32_t canonicalizeBf16Lanes(uint32_t word)
 {
-    if ((word & 0xFFFFu) == 0xFFFFu)
-        word = (word & 0xFFFF0000u) | 0x7FFFu;
-    if ((word >> 16) == 0xFFFFu)
-        word = (word & 0x0000FFFFu) | 0x7FFF0000u;
+    if ((word & 0xFFFFU) == 0xFFFFU)
+    {
+        word = (word & 0xFFFF0000U) | 0x7FFFU;
+    }
+    if ((word >> 16) == 0xFFFFU)
+    {
+        word = (word & 0x0000FFFFU) | 0x7FFF0000U;
+    }
     return word;
 }
 
-__device__ __forceinline__ uint4 canonicalize_partial(uint4 v)
+__device__ __forceinline__ uint4 canonicalizePartial(uint4 v)
 {
-    return make_uint4(canonicalize_bf16_lanes(v.x), canonicalize_bf16_lanes(v.y), canonicalize_bf16_lanes(v.z),
-        canonicalize_bf16_lanes(v.w));
+    return make_uint4(
+        canonicalizeBf16Lanes(v.x), canonicalizeBf16Lanes(v.y), canonicalizeBf16Lanes(v.z), canonicalizeBf16Lanes(v.w));
 }
 
 // MXFP8 scales: 8 UE8M0 bytes (raw) <-> 8 16-bit lanes 0x00XX (wire).
-__device__ __forceinline__ uint4 mx_scales_to_wire(uint2 raw)
+__device__ __forceinline__ uint4 mxScalesToWire(uint2 raw)
 {
-    return make_uint4((raw.x & 0xFFu) | ((raw.x & 0xFF00u) << 8), ((raw.x >> 16) & 0xFFu) | ((raw.x >> 8) & 0xFF0000u),
-        (raw.y & 0xFFu) | ((raw.y & 0xFF00u) << 8), ((raw.y >> 16) & 0xFFu) | ((raw.y >> 8) & 0xFF0000u));
+    return make_uint4((raw.x & 0xFFU) | ((raw.x & 0xFF00U) << 8), ((raw.x >> 16) & 0xFFU) | ((raw.x >> 8) & 0xFF0000U),
+        (raw.y & 0xFFU) | ((raw.y & 0xFF00U) << 8), ((raw.y >> 16) & 0xFFU) | ((raw.y >> 8) & 0xFF0000U));
 }
 
-__device__ __forceinline__ uint2 mx_scales_from_wire(uint4 wire)
+__device__ __forceinline__ uint2 mxScalesFromWire(uint4 wire)
 {
     return make_uint2(
-        (wire.x & 0xFFu) | ((wire.x >> 8) & 0xFF00u) | ((wire.y & 0xFFu) << 16) | (((wire.y >> 16) & 0xFFu) << 24),
-        (wire.z & 0xFFu) | ((wire.z >> 8) & 0xFF00u) | ((wire.w & 0xFFu) << 16) | (((wire.w >> 16) & 0xFFu) << 24));
+        (wire.x & 0xFFU) | ((wire.x >> 8) & 0xFF00U) | ((wire.y & 0xFFU) << 16) | (((wire.y >> 16) & 0xFFU) << 24),
+        (wire.z & 0xFFU) | ((wire.z >> 8) & 0xFF00U) | ((wire.w & 0xFFU) << 16) | (((wire.w >> 16) & 0xFFU) << 24));
 }
 
 // ============================================================================ dispatch phases
 // D1, warp 0, lane k = top-k slot k. Returns the token's target-rank mask (0 for a padding slot,
-// token >= local_num_tokens). Stages the token's wire ids row for D3 in s_ids_row_words
-// (canonical ids, invalid_expert_id past top_k) and, if topk_target_ranks_row is set, writes the
+// token >= localNumTokens). Stages the token's wire ids row for D3 in sIdsRowWords
+// (canonical ids, invalidExpertId past topK) and, if topkTargetRanksRow is set, writes the
 // rank of every slot at its first occurrence (else -1).
 template <int TOP_K_CAPACITY, bool FIXED_TOP_K, bool ENABLE_RANK_MASK>
-__device__ __forceinline__ uint64_t route_token(
-    DispatchParams const& p, int token, int lane, uint32_t* s_ids_row_words, int32_t* topk_target_ranks_row)
+__device__ __forceinline__ uint64_t routeToken(
+    DispatchParams const& p, int token, int lane, uint32_t* sIdsRowWords, int32_t* topkTargetRanksRow)
 {
-    int const top_k = FIXED_TOP_K ? TOP_K_CAPACITY : p.top_k;
-    int expert_id = -1, rank = -1;
-    if (token < p.local_num_tokens && lane < top_k)
+    int const topK = FIXED_TOP_K ? TOP_K_CAPACITY : p.topK;
+    int expertId = -1, rank = -1;
+    if (token < p.localNumTokens && lane < topK)
     {
-        expert_id = p.token_selected_experts[static_cast<int64_t>(token) * top_k + lane];
+        expertId = p.tokenSelectedExperts[static_cast<int64_t>(token) * topK + lane];
         // Experts split evenly (checked on the host). The fence kernels' compute_target_rank_id also
         // handles uneven splits, but its extra branch measurably slows this dispatch at decode sizes.
-        rank = (expert_id >= 0 && expert_id < p.num_experts) ? expert_id / p.experts_per_rank : -1;
+        rank = (expertId >= 0 && expertId < p.numExperts) ? expertId / p.expertsPerRank : -1;
     }
-    uint32_t const same_rank_lanes = __match_any_sync(0xFFFFFFFFu, rank);
-    int target_rank = (rank >= 0 && __ffs(same_rank_lanes) - 1 == lane) ? rank : -1;
-    uint32_t const low_ranks = __reduce_or_sync(0xFFFFFFFFu, rank >= 0 && rank < 32 ? 1u << rank : 0u);
-    uint32_t const high_ranks = __reduce_or_sync(0xFFFFFFFFu, rank >= 32 ? 1u << (rank - 32) : 0u);
-    uint64_t target_mask = static_cast<uint64_t>(low_ranks) | static_cast<uint64_t>(high_ranks) << 32;
+    uint32_t const sameRankLanes = __match_any_sync(0xFFFFFFFFU, rank);
+    int targetRank = (rank >= 0 && __ffs(sameRankLanes) - 1 == lane) ? rank : -1;
+    uint32_t const lowRanks = __reduce_or_sync(0xFFFFFFFFU, rank >= 0 && rank < 32 ? 1U << rank : 0U);
+    uint32_t const highRanks = __reduce_or_sync(0xFFFFFFFFU, rank >= 32 ? 1U << (rank - 32) : 0U);
+    uint64_t targetMask = static_cast<uint64_t>(lowRanks) | static_cast<uint64_t>(highRanks) << 32;
     if constexpr (ENABLE_RANK_MASK)
     {
-        target_mask &= p.active_rank_mask;
-        if (target_rank >= 0 && !is_rank_alive<true>(p.active_rank_mask, target_rank))
-            target_rank = -1;
+        targetMask &= p.activeRankMask;
+        if (targetRank >= 0 && !isRankAlive<true>(p.activeRankMask, targetRank))
+        {
+            targetRank = -1;
+        }
     }
-    uint32_t const invalid_id = static_cast<uint32_t>(p.invalid_expert_id);
-    if (lane < 4 * topk_row_vectors(TOP_K_CAPACITY))
-        s_ids_row_words[lane]
-            = lane < top_k ? canonicalize_expert_id(static_cast<uint32_t>(expert_id), invalid_id) : invalid_id;
-    if (lane < top_k && topk_target_ranks_row != nullptr && token < p.local_num_tokens)
-        topk_target_ranks_row[lane] = target_rank;
-    return target_mask;
+    uint32_t const invalidId = static_cast<uint32_t>(p.invalidExpertId);
+    if (lane < 4 * topkRowVectors(TOP_K_CAPACITY))
+    {
+        sIdsRowWords[lane] = lane < topK ? canonicalizeExpertId(static_cast<uint32_t>(expertId), invalidId) : invalidId;
+    }
+    if (lane < topK && topkTargetRanksRow != nullptr && token < p.localNumTokens)
+    {
+        topkTargetRanksRow[lane] = targetRank;
+    }
+    return targetMask;
 }
 
 // D2 / D5: where vector `vec` of a wire row lives (payload vectors first, then scale vectors).
 struct WireVector
 {
-    bool is_payload;
-    int64_t region_offset; // the landing region
-    int row_bytes;         // landing row
-    int offset_in_row;     // bytes
+    bool isPayload;
+    int64_t regionOffset; // the landing region
+    int rowBytes;         // landing row
+    int offsetInRow;      // bytes
 };
 
-__device__ __forceinline__ WireVector locate_wire_vector(DispatchParams const& p, int vec)
+__device__ __forceinline__ WireVector locateWireVector(DispatchParams const& p, int vec)
 {
-    if (vec < p.payload_vectors)
-        return {true, p.landing.payload_offset, p.payload_row_bytes, vec * 16};
-    return {false, p.landing.scale_offset, p.wire_scale_row_bytes, (vec - p.payload_vectors) * 16};
+    if (vec < p.payloadVectors)
+    {
+        return {true, p.landing.payloadOffset, p.payloadRowBytes, vec * 16};
+    }
+    return {false, p.landing.scaleOffset, p.wireScaleRowBytes, (vec - p.payloadVectors) * 16};
 }
 
 // D2: vector `vec` of the token's wire row, canonicalised.
-template <int PAYLOAD_KIND>
-__device__ __forceinline__ uint4 load_wire_vector(DispatchParams const& p, int token, WireVector const& wv)
+template <PayloadKind PAYLOAD_KIND>
+__device__ __forceinline__ uint4 loadWireVector(DispatchParams const& p, int token, WireVector const& wv)
 {
-    if (wv.is_payload)
+    if (wv.isPayload)
     {
         uint4 const v = *reinterpret_cast<uint4 const*>(
-            p.hidden_states + static_cast<int64_t>(token) * p.payload_row_bytes + wv.offset_in_row);
-        if constexpr (PAYLOAD_KIND == kKindBf16)
+            p.hiddenStates + static_cast<int64_t>(token) * p.payloadRowBytes + wv.offsetInRow);
+        if constexpr (PAYLOAD_KIND == PayloadKind::kBf16)
         {
             return make_uint4(
-                canonicalize_bf16x2(v.x), canonicalize_bf16x2(v.y), canonicalize_bf16x2(v.z), canonicalize_bf16x2(v.w));
+                canonicalizeBf16x2(v.x), canonicalizeBf16x2(v.y), canonicalizeBf16x2(v.z), canonicalizeBf16x2(v.w));
         }
-        else if constexpr (PAYLOAD_KIND == kKindFp8)
+        else if constexpr (PAYLOAD_KIND == PayloadKind::kFp8)
         {
             return make_uint4(
-                canonicalize_word(v.x), canonicalize_word(v.y), canonicalize_word(v.z), canonicalize_word(v.w));
+                canonicalizeWord(v.x), canonicalizeWord(v.y), canonicalizeWord(v.z), canonicalizeWord(v.w));
         }
         else
         {
-            return nvfp4_wire_xor(make_uint4(
-                canonicalize_fp4x8(v.x), canonicalize_fp4x8(v.y), canonicalize_fp4x8(v.z), canonicalize_fp4x8(v.w)));
+            return nvfp4WireXor(make_uint4(
+                canonicalizeFp4x8(v.x), canonicalizeFp4x8(v.y), canonicalizeFp4x8(v.z), canonicalizeFp4x8(v.w)));
         }
     }
-    uint8_t const* scale_row = p.hidden_states_scale + static_cast<int64_t>(token) * p.scale_row_bytes;
-    if (p.mx_scales) // a wire vector = 8 raw UE8M0 bytes
-        return mx_scales_to_wire(*reinterpret_cast<uint2 const*>(scale_row + wv.offset_in_row / 2));
-    uint4 const v = *reinterpret_cast<uint4 const*>(scale_row + wv.offset_in_row);
-    return make_uint4(canonicalize_word(v.x), canonicalize_word(v.y), canonicalize_word(v.z), canonicalize_word(v.w));
+    uint8_t const* scaleRow = p.hiddenStatesScale + static_cast<int64_t>(token) * p.scaleRowBytes;
+    if (p.mxScales) // a wire vector = 8 raw UE8M0 bytes
+    {
+        return mxScalesToWire(*reinterpret_cast<uint2 const*>(scaleRow + wv.offsetInRow / 2));
+    }
+    uint4 const v = *reinterpret_cast<uint4 const*>(scaleRow + wv.offsetInRow);
+    return make_uint4(canonicalizeWord(v.x), canonicalizeWord(v.y), canonicalizeWord(v.z), canonicalizeWord(v.w));
 }
 
-// D2 / D5: store a wire vector (own or received) into receive row `recv_row`, in raw format.
-template <int PAYLOAD_KIND>
-__device__ __forceinline__ void store_received_vector(
-    DispatchParams const& p, int64_t recv_row, WireVector const& wv, uint4 wire)
+// D2 / D5: store a wire vector (own or received) into receive row `recvRow`, in raw format.
+template <PayloadKind PAYLOAD_KIND>
+__device__ __forceinline__ void storeReceivedVector(
+    DispatchParams const& p, int64_t recvRow, WireVector const& wv, uint4 wire)
 {
-    if (wv.is_payload)
+    if (wv.isPayload)
     {
-        *reinterpret_cast<uint4*>(p.recv_hidden_states + recv_row * p.payload_row_bytes + wv.offset_in_row)
-            = PAYLOAD_KIND == kKindNvfp4 ? nvfp4_wire_xor(wire) : wire;
+        *reinterpret_cast<uint4*>(p.recvHiddenStates + recvRow * p.payloadRowBytes + wv.offsetInRow)
+            = PAYLOAD_KIND == PayloadKind::kNvfp4 ? nvfp4WireXor(wire) : wire;
         return;
     }
-    uint8_t* scale_row = p.recv_hidden_states_scale + recv_row * p.scale_row_bytes;
-    if (p.mx_scales)
+    uint8_t* scaleRow = p.recvHiddenStatesScale + recvRow * p.scaleRowBytes;
+    if (p.mxScales)
     {
-        *reinterpret_cast<uint2*>(scale_row + wv.offset_in_row / 2) = mx_scales_from_wire(wire);
+        *reinterpret_cast<uint2*>(scaleRow + wv.offsetInRow / 2) = mxScalesFromWire(wire);
     }
     else
     {
-        *reinterpret_cast<uint4*>(scale_row + wv.offset_in_row) = wire;
+        *reinterpret_cast<uint4*>(scaleRow + wv.offsetInRow) = wire;
     }
 }
 
-// D2: store `wire` into the landing row (ep_rank, token) of every target rank; this rank's own
-// copy goes straight into its receive row `recv_row`.
-template <int PAYLOAD_KIND>
-__device__ __forceinline__ void push_vector(
-    DispatchParams const& p, uint64_t target_mask, int token, int64_t recv_row, WireVector const& wv, uint4 wire)
+// D2: store `wire` into the landing row (epRank, token) of every target rank; this rank's own
+// copy goes straight into its receive row `recvRow`.
+template <PayloadKind PAYLOAD_KIND>
+__device__ __forceinline__ void pushVector(
+    DispatchParams const& p, uint64_t targetMask, int token, int64_t recvRow, WireVector const& wv, uint4 wire)
 {
-    int64_t const offset
-        = wv.region_offset + landing_row(p.ep_size, p.ep_rank, token) * wv.row_bytes + wv.offset_in_row;
-    for (uint64_t targets = target_mask; targets;)
+    int64_t const offset = wv.regionOffset + landingRow(p.epSize, p.epRank, token) * wv.rowBytes + wv.offsetInRow;
+    for (uint64_t targets = targetMask; targets;)
     {
-        int const target = pop_lowest_rank(targets);
-        if (target == p.ep_rank)
+        int const target = popLowestRank(targets);
+        if (target == p.epRank)
         {
-            store_received_vector<PAYLOAD_KIND>(p, recv_row, wv, wire);
+            storeReceivedVector<PAYLOAD_KIND>(p, recvRow, wv, wire);
         }
         else
         {
-            store_volatile(p.rank_workspaces[target] + offset, wire);
+            storeVolatile(p.rankWorkspaces[target] + offset, wire);
         }
     }
 }
 
-// D3, chunk-0 block: the ids row (ep_rank, token) goes to EVERY alive peer (all invalid_expert_id
+// D3, chunk-0 block: the ids row (epRank, token) goes to EVERY alive peer (all invalidExpertId
 // where the peer is no target; it still signals arrival), the weights row to the targets only;
 // own rows go straight to the receive buffers. The (peer, vector) items are spread over the
-// block's threads. s_ids_row / s_weights_row: the rows staged in D1.
+// block's threads. sIdsRow / sWeightsRow: the rows staged in D1.
 template <bool ENABLE_RANK_MASK>
-__device__ __forceinline__ void push_ids_and_weights(DispatchParams const& p, int top_k, int ids_row_vectors,
-    uint64_t target_mask, int token, int64_t recv_row, int64_t ids_set_offset, uint4 const* s_ids_row,
-    uint4 const* s_weights_row)
+__device__ __forceinline__ void pushIdsAndWeights(DispatchParams const& p, int topK, int idsRowVectors,
+    uint64_t targetMask, int token, int64_t recvRow, int64_t idsSetOffset, uint4 const* sIdsRow,
+    uint4 const* sWeightsRow)
 {
-    uint4 const no_target_ids = splat(static_cast<uint32_t>(p.invalid_expert_id));
-    int64_t const offset = landing_row(p.ep_size, p.ep_rank, token) * (16 * ids_row_vectors); // ids / weights row
-    for (int item = threadIdx.x; item < p.ep_size * ids_row_vectors; item += kNumThreads)
+    uint4 const noTargetIds = splat(static_cast<uint32_t>(p.invalidExpertId));
+    int64_t const offset = landingRow(p.epSize, p.epRank, token) * (16 * idsRowVectors); // ids / weights row
+    for (int item = threadIdx.x; item < p.epSize * idsRowVectors; item += kNumThreads)
     {
-        int const peer = item / ids_row_vectors, vec = item % ids_row_vectors;
-        bool const is_target = (target_mask >> peer) & 1ull;
-        uint4 const ids = is_target ? s_ids_row[vec] : no_target_ids;
-        bool const sends_weights = is_target && p.has_topk_weights;
-        if (peer == p.ep_rank)
+        int const peer = item / idsRowVectors, vec = item % idsRowVectors;
+        bool const isTarget = (targetMask >> peer) & 1ULL;
+        uint4 const ids = isTarget ? sIdsRow[vec] : noTargetIds;
+        bool const sendsWeights = isTarget && p.hasTopkWeights;
+        if (peer == p.epRank)
         {
-            store_topk_words(reinterpret_cast<uint32_t*>(p.recv_topk_ids) + recv_row * top_k, top_k, vec, ids);
-            if (sends_weights)
-                store_topk_weights(p, recv_row, top_k, vec, s_weights_row[vec]);
+            storeTopkWords(reinterpret_cast<uint32_t*>(p.recvTopkIds) + recvRow * topK, topK, vec, ids);
+            if (sendsWeights)
+            {
+                storeTopkWeights(p, recvRow, topK, vec, sWeightsRow[vec]);
+            }
             continue;
         }
-        if (!is_rank_alive<ENABLE_RANK_MASK>(p.active_rank_mask, peer))
+        if (!isRankAlive<ENABLE_RANK_MASK>(p.activeRankMask, peer))
+        {
             continue;
-        uint8_t* const peer_workspace = p.rank_workspaces[peer] + offset + vec * 16;
-        store_volatile(peer_workspace + p.landing.ids_offset + ids_set_offset, ids);
-        if (sends_weights)
-            store_volatile(peer_workspace + p.landing.weights_offset, s_weights_row[vec]);
+        }
+        uint8_t* const peerWorkspace = p.rankWorkspaces[peer] + offset + vec * 16;
+        storeVolatile(peerWorkspace + p.landing.idsOffset + idsSetOffset, ids);
+        if (sendsWeights)
+        {
+            storeVolatile(peerWorkspace + p.landing.weightsOffset, sWeightsRow[vec]);
+        }
     }
 }
 
 // D4: record one received ids vector (source, vec): a source with any id other than
-// invalid_expert_id sent a token; the chunk-0 block copies the ids out.
-__device__ __forceinline__ void accept_ids_vector(DispatchParams const& p, int top_k, int token, int chunk, int source,
-    int vec, uint4 ids, uint64_t& s_recv_source_mask)
+// invalidExpertId sent a token; the chunk-0 block copies the ids out.
+__device__ __forceinline__ void acceptIdsVector(
+    DispatchParams const& p, int topK, int token, int chunk, int source, int vec, uint4 ids, uint64_t& sRecvSourceMask)
 {
-    uint32_t const invalid_id = static_cast<uint32_t>(p.invalid_expert_id);
-    if (ids.x != invalid_id || ids.y != invalid_id || ids.z != invalid_id || ids.w != invalid_id)
-        atomicOr(reinterpret_cast<unsigned long long*>(&s_recv_source_mask), 1ull << source);
+    uint32_t const invalidId = static_cast<uint32_t>(p.invalidExpertId);
+    if (ids.x != invalidId || ids.y != invalidId || ids.z != invalidId || ids.w != invalidId)
+    {
+        atomicOr(reinterpret_cast<unsigned long long*>(&sRecvSourceMask), 1ULL << source);
+    }
     if (chunk != 0)
+    {
         return;
-    int64_t const recv_row = static_cast<int64_t>(source) * p.max_tokens_per_rank + token;
-    store_topk_words(reinterpret_cast<uint32_t*>(p.recv_topk_ids) + recv_row * top_k, top_k, vec, ids);
+    }
+    int64_t const recvRow = static_cast<int64_t>(source) * p.maxTokensPerRank + token;
+    storeTopkWords(reinterpret_cast<uint32_t*>(p.recvTopkIds) + recvRow * topK, topK, vec, ids);
 }
 
 // D4, a masked source: never polled, its row holds invalid ids.
-__device__ __forceinline__ void reject_masked_source(
-    DispatchParams const& p, int top_k, int token, int chunk, int source, int vec)
+__device__ __forceinline__ void rejectMaskedSource(
+    DispatchParams const& p, int topK, int token, int chunk, int source, int vec)
 {
     if (chunk != 0)
+    {
         return;
-    int64_t const recv_row = static_cast<int64_t>(source) * p.max_tokens_per_rank + token;
-    store_topk_words(reinterpret_cast<uint32_t*>(p.recv_topk_ids) + recv_row * top_k, top_k, vec,
-        splat(static_cast<uint32_t>(p.invalid_expert_id)));
+    }
+    int64_t const recvRow = static_cast<int64_t>(source) * p.maxTokensPerRank + token;
+    storeTopkWords(reinterpret_cast<uint32_t*>(p.recvTopkIds) + recvRow * topK, topK, vec,
+        splat(static_cast<uint32_t>(p.invalidExpertId)));
 }
 
 // D4: poll the ids rows (source, token) of every peer: ITEMS_PER_THREAD ids vectors (items) per
-// thread, ep_size * ids_row_vectors items in all.
+// thread, epSize * idsRowVectors items in all.
 template <int ITEMS_PER_THREAD, bool ENABLE_RANK_MASK>
-__device__ __forceinline__ void poll_ids_rows(DispatchParams const& p, int top_k, int ids_row_vectors, int token,
-    int chunk, int64_t ids_set_offset, long long wait_start, uint64_t& s_recv_source_mask, bool& timed_out)
+__device__ __forceinline__ void pollIdsRows(DispatchParams const& p, int topK, int idsRowVectors, int token, int chunk,
+    int64_t idsSetOffset, long long waitStart, uint64_t& sRecvSourceMask, bool& timedOut)
 {
-    uint8_t const* ids_rows = p.rank_workspaces[p.ep_rank] + p.landing.ids_offset + ids_set_offset;
-    int const num_items = p.ep_size * ids_row_vectors; // item = (source, vec)
-    int64_t const ids_row_bytes = 16 * ids_row_vectors;
+    uint8_t const* idsRows = p.rankWorkspaces[p.epRank] + p.landing.idsOffset + idsSetOffset;
+    int const numItems = p.epSize * idsRowVectors; // item = (source, vec)
+    int64_t const idsRowBytes = 16 * idsRowVectors;
     uint32_t pending = 0;
 #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i)
     {
         int const item = threadIdx.x + i * kNumThreads;
-        int const source = item / ids_row_vectors;
-        if (item >= num_items || source == p.ep_rank)
-            continue;
-        if (!is_rank_alive<ENABLE_RANK_MASK>(p.active_rank_mask, source))
+        int const source = item / idsRowVectors;
+        if (item >= numItems || source == p.epRank)
         {
-            reject_masked_source(p, top_k, token, chunk, source, item % ids_row_vectors);
             continue;
         }
-        pending |= 1u << i;
+        if (!isRankAlive<ENABLE_RANK_MASK>(p.activeRankMask, source))
+        {
+            rejectMaskedSource(p, topK, token, chunk, source, item % idsRowVectors);
+            continue;
+        }
+        pending |= 1U << i;
     }
     uint32_t const polled = pending;
     uint4 ids[ITEMS_PER_THREAD];
     auto address = [&](int i)
     {
         int const item = threadIdx.x + i * kNumThreads;
-        return ids_rows + landing_row(p.ep_size, item / ids_row_vectors, token) * ids_row_bytes
-            + (item % ids_row_vectors) * 16;
+        return idsRows + landingRow(p.epSize, item / idsRowVectors, token) * idsRowBytes + (item % idsRowVectors) * 16;
     };
-    pending = poll_until_arrived(
-        pending, kIdsSentinel, [] {}, address, ids, wait_start, p.timeout_cycles);
-    timed_out = pending != 0;
+    pending = pollUntilArrived(
+        pending, kIdsSentinel, [] {}, address, ids, waitStart, p.timeoutCycles);
+    timedOut = pending != 0;
 #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i)
     {
-        if (!(((polled & ~pending) >> i) & 1u))
+        if (!(((polled & ~pending) >> i) & 1U))
+        {
             continue;
+        }
         int const item = threadIdx.x + i * kNumThreads;
-        accept_ids_vector(
-            p, top_k, token, chunk, item / ids_row_vectors, item % ids_row_vectors, ids[i], s_recv_source_mask);
+        acceptIdsVector(p, topK, token, chunk, item / idsRowVectors, item % idsRowVectors, ids[i], sRecvSourceMask);
     }
 }
 
-// D4 -> D5, warp 0: the ranks of source_mask in ascending order into s_sources[0, n); lane 0
+// D4 -> D5, warp 0: the ranks of sourceMask in ascending order into sSources[0, n); lane 0
 // stores n.
-__device__ __forceinline__ void list_sources(uint64_t source_mask, int* s_sources, int* s_num_sources)
+__device__ __forceinline__ void listSources(uint64_t sourceMask, int* sSources, int* sNumSources)
 {
     int const lane = threadIdx.x;
-    uint32_t const low = static_cast<uint32_t>(source_mask), high = source_mask >> 32;
-    uint32_t const below = (1u << lane) - 1u;
-    if ((low >> lane) & 1u)
-        s_sources[__popc(low & below)] = lane;
-    if ((high >> lane) & 1u)
-        s_sources[__popc(low) + __popc(high & below)] = 32 + lane;
+    uint32_t const low = static_cast<uint32_t>(sourceMask), high = sourceMask >> 32;
+    uint32_t const below = (1U << lane) - 1U;
+    if ((low >> lane) & 1U)
+    {
+        sSources[__popc(low & below)] = lane;
+    }
+    if ((high >> lane) & 1U)
+    {
+        sSources[__popc(low) + __popc(high & below)] = 32 + lane;
+    }
     if (lane == 0)
-        *s_num_sources = __popc(low) + __popc(high);
+    {
+        *sNumSources = __popc(low) + __popc(high);
+    }
 }
 
 // D5 / D6: poll, copy out (wire -> raw) and re-arm this thread's wire vector of every source in
-// s_sources[0, num_sources), 8 sources per round with every load in flight: n sources take
+// sSources[0, numSources), 8 sources per round with every load in flight: n sources take
 // ceil(n / 8) rounds whatever their ranks. A round's sources are re-read from shared memory before
 // every spin's loads and before its copy-out (holding them across the round would exceed the
 // dispatch's register bound). A thread
-// with polls_weights (chunk 0, t < 8 * ids_row_vectors) also polls, as the round's vector 8,
-// weights vector t % ids_row_vectors of the round's source t / ids_row_vectors.
-template <int PAYLOAD_KIND>
-__device__ __forceinline__ void receive_vectors(DispatchParams const& p, int top_k, int ids_row_vectors, int token,
-    int vec, bool polls_weights, int const* s_sources, int num_sources, long long wait_start, bool& timed_out)
+// with pollsWeights (chunk 0, t < 8 * idsRowVectors) also polls, as the round's vector 8,
+// weights vector t % idsRowVectors of the round's source t / idsRowVectors.
+template <PayloadKind PAYLOAD_KIND>
+__device__ __forceinline__ void receiveVectors(DispatchParams const& p, int topK, int idsRowVectors, int token, int vec,
+    bool pollsWeights, int const* sSources, int numSources, long long waitStart, bool& timedOut)
 {
     constexpr int kWeights = 8; // the round's vector 8: this thread's weights vector
-    bool const has_vector = vec < p.payload_vectors + p.wire_scale_vectors;
-    WireVector const wv = locate_wire_vector(p, vec);
-    uint8_t* const landing = p.rank_workspaces[p.ep_rank];
-    uint8_t* const vector_column = landing + wv.region_offset + wv.offset_in_row;
-    int const weights_round_slot
-        = polls_weights ? static_cast<int>(threadIdx.x) / ids_row_vectors : kWeights; // 8: none
-    int const weights_vec = static_cast<int>(threadIdx.x) % ids_row_vectors;
-    int64_t const ids_row_bytes = 16 * ids_row_vectors;
-    uint8_t* const weights_column = landing + p.landing.weights_offset + weights_vec * 16;
-    for (int first = 0; first < num_sources && !timed_out; first += 8)
+    bool const hasVector = vec < p.payloadVectors + p.wireScaleVectors;
+    WireVector const wv = locateWireVector(p, vec);
+    uint8_t* const landing = p.rankWorkspaces[p.epRank];
+    uint8_t* const vectorColumn = landing + wv.regionOffset + wv.offsetInRow;
+    int const weightsRoundSlot = pollsWeights ? static_cast<int>(threadIdx.x) / idsRowVectors : kWeights; // 8: none
+    int const weightsVec = static_cast<int>(threadIdx.x) % idsRowVectors;
+    int64_t const idsRowBytes = 16 * idsRowVectors;
+    uint8_t* const weightsColumn = landing + p.landing.weightsOffset + weightsVec * 16;
+    for (int first = 0; first < numSources && !timedOut; first += 8)
     {
-        int const round_size = min(8, num_sources - first);
-        uint32_t pending = has_vector ? (1u << round_size) - 1u : 0u;
-        int weights_source = 0;
-        if (weights_round_slot < round_size)
+        int const roundSize = min(8, numSources - first);
+        uint32_t pending = hasVector ? (1U << roundSize) - 1U : 0U;
+        int weightsSource = 0;
+        if (weightsRoundSlot < roundSize)
         {
-            weights_source = s_sources[first + weights_round_slot];
-            pending |= 1u << kWeights;
+            weightsSource = sSources[first + weightsRoundSlot];
+            pending |= 1U << kWeights;
         }
         uint32_t const polled = pending;
         uint4 vectors[kWeights + 1];
-        int sources[8]; // the round's sources (past round_size: unused)
-        auto read_sources = [&]
+        int sources[8]; // the round's sources (past roundSize: unused)
+        auto readSources = [&]
         {
 #pragma unroll
             for (int j = 0; j < 8; ++j)
-                sources[j] = s_sources[first + j];
+                sources[j] = sSources[first + j];
         };
         auto address = [&](int i)
         {
             if (i == kWeights)
-                return weights_column + landing_row(p.ep_size, weights_source, token) * ids_row_bytes;
-            return vector_column + landing_row(p.ep_size, sources[i], token) * wv.row_bytes;
+            {
+                return weightsColumn + landingRow(p.epSize, weightsSource, token) * idsRowBytes;
+            }
+            return vectorColumn + landingRow(p.epSize, sources[i], token) * wv.rowBytes;
         };
-        pending
-            = poll_until_arrived(pending, kDataSentinel, read_sources, address, vectors, wait_start, p.timeout_cycles);
-        timed_out = pending != 0;
+        pending = pollUntilArrived(pending, kDataSentinel, readSources, address, vectors, waitStart, p.timeoutCycles);
+        timedOut = pending != 0;
         uint32_t const received = polled & ~pending;
-        read_sources();
+        readSources();
 #pragma unroll
         for (int j = 0; j < kWeights; ++j)
         {
-            if (!((received >> j) & 1u))
+            if (!((received >> j) & 1U))
+            {
                 continue;
-            int64_t const recv_row = static_cast<int64_t>(sources[j]) * p.max_tokens_per_rank + token;
-            store_received_vector<PAYLOAD_KIND>(p, recv_row, wv, vectors[j]);
-            store_volatile(address(j), splat(kDataSentinel));
+            }
+            int64_t const recvRow = static_cast<int64_t>(sources[j]) * p.maxTokensPerRank + token;
+            storeReceivedVector<PAYLOAD_KIND>(p, recvRow, wv, vectors[j]);
+            storeVolatile(address(j), splat(kDataSentinel));
         }
-        if ((received >> kWeights) & 1u)
+        if ((received >> kWeights) & 1U)
         {
-            int64_t const recv_row = static_cast<int64_t>(weights_source) * p.max_tokens_per_rank + token;
-            store_topk_weights(p, recv_row, top_k, weights_vec, vectors[kWeights]);
-            store_volatile(address(kWeights), splat(kDataSentinel));
+            int64_t const recvRow = static_cast<int64_t>(weightsSource) * p.maxTokensPerRank + token;
+            storeTopkWeights(p, recvRow, topK, weightsVec, vectors[kWeights]);
+            storeVolatile(address(kWeights), splat(kDataSentinel));
         }
     }
 }
 
 // D4-D6 of every dispatch kernel, after the block's own pushes.
-template <int PAYLOAD_KIND, bool ENABLE_RANK_MASK>
-__device__ __forceinline__ void receive_token_slot(DispatchParams const& p, int top_k, int ids_row_vectors, int token,
-    int chunk, int vec, uint64_t target_mask, int64_t ids_set_offset, uint64_t& s_recv_source_mask)
+template <PayloadKind PAYLOAD_KIND, bool ENABLE_RANK_MASK>
+__device__ __forceinline__ void receiveTokenSlot(DispatchParams const& p, int topK, int idsRowVectors, int token,
+    int chunk, int vec, uint64_t targetMask, int64_t idsSetOffset, uint64_t& sRecvSourceMask)
 {
-    __shared__ __align__(16) int s_sources[kMaxRanks];
-    __shared__ int s_num_sources;
-    long long const wait_start = clock64();
-    bool timed_out = false;
-    if (threadIdx.x == 0 && ((target_mask >> p.ep_rank) & 1ull))
-        atomicOr(reinterpret_cast<unsigned long long*>(&s_recv_source_mask), 1ull << p.ep_rank);
-    if (p.ep_size * ids_row_vectors <= kNumThreads)
+    __shared__ __align__(16) int sSources[kMaxRanks];
+    __shared__ int sNumSources;
+    long long const waitStart = clock64();
+    bool timedOut = false;
+    if (threadIdx.x == 0 && ((targetMask >> p.epRank) & 1ULL))
+    {
+        atomicOr(reinterpret_cast<unsigned long long*>(&sRecvSourceMask), 1ULL << p.epRank);
+    }
+    if (p.epSize * idsRowVectors <= kNumThreads)
     { // D4
-        poll_ids_rows<1, ENABLE_RANK_MASK>(
-            p, top_k, ids_row_vectors, token, chunk, ids_set_offset, wait_start, s_recv_source_mask, timed_out);
+        pollIdsRows<1, ENABLE_RANK_MASK>(
+            p, topK, idsRowVectors, token, chunk, idsSetOffset, waitStart, sRecvSourceMask, timedOut);
     }
     else
     {
-        poll_ids_rows<4, ENABLE_RANK_MASK>(
-            p, top_k, ids_row_vectors, token, chunk, ids_set_offset, wait_start, s_recv_source_mask, timed_out);
+        pollIdsRows<4, ENABLE_RANK_MASK>(
+            p, topK, idsRowVectors, token, chunk, idsSetOffset, waitStart, sRecvSourceMask, timedOut);
     }
     __syncthreads();
-    uint64_t const recv_source_mask = s_recv_source_mask;
+    uint64_t const recvSourceMask = sRecvSourceMask;
     if (chunk == 0 && threadIdx.x == 0)
-        p.recv_source_mask[token] = recv_source_mask;
+    {
+        p.recvSourceMask[token] = recvSourceMask;
+    }
     if (threadIdx.x < 32) // this rank's own row was received in D2
-        list_sources(recv_source_mask & ~(1ull << p.ep_rank), s_sources, &s_num_sources);
+    {
+        listSources(recvSourceMask & ~(1ULL << p.epRank), sSources, &sNumSources);
+    }
     __syncthreads();
-    bool const polls_weights = chunk == 0 && p.has_topk_weights && static_cast<int>(threadIdx.x) < 8 * ids_row_vectors;
-    if ((vec < p.payload_vectors + p.wire_scale_vectors || polls_weights) && !timed_out) // D5, D6
-        receive_vectors<PAYLOAD_KIND>(
-            p, top_k, ids_row_vectors, token, vec, polls_weights, s_sources, s_num_sources, wait_start, timed_out);
-    if (timed_out)
-        report_and_trap(p.round_state, p.ep_rank, "timed out waiting for a peer (dispatch)");
+    bool const pollsWeights = chunk == 0 && p.hasTopkWeights && static_cast<int>(threadIdx.x) < 8 * idsRowVectors;
+    if ((vec < p.payloadVectors + p.wireScaleVectors || pollsWeights) && !timedOut) // D5, D6
+    {
+        receiveVectors<PAYLOAD_KIND>(
+            p, topK, idsRowVectors, token, vec, pollsWeights, sSources, sNumSources, waitStart, timedOut);
+    }
+    if (timedOut)
+    {
+        reportAndTrap(p.roundState, p.epRank, "timed out waiting for a peer (dispatch)");
+    }
 }
 #endif // MOE_A2A_SENTINEL_COMPILE
 
 // ============================================================================= dispatch kernel
 // Any payload format and top-k (fixed at compile time, or at most TOP_K_CAPACITY).
-template <int TOP_K_CAPACITY, bool FIXED_TOP_K, int PAYLOAD_KIND, bool ENABLE_RANK_MASK>
+template <int TOP_K_CAPACITY, bool FIXED_TOP_K, PayloadKind PAYLOAD_KIND, bool ENABLE_RANK_MASK>
 __global__ void __launch_bounds__(kNumThreads, kDispatchBlocksPerSM)
     moeA2ASentinelDispatchKernel(DispatchParams const p)
 {
 #if MOE_A2A_SENTINEL_COMPILE
-    constexpr int kRowCapacity = topk_row_vectors(TOP_K_CAPACITY);
-    int const top_k = FIXED_TOP_K ? TOP_K_CAPACITY : p.top_k;
-    int const ids_row_vectors = topk_row_vectors(top_k);
-    int const token = blockIdx.x / p.blocks_per_token, chunk = blockIdx.x % p.blocks_per_token;
+    constexpr int kRowCapacity = topkRowVectors(TOP_K_CAPACITY);
+    int const topK = FIXED_TOP_K ? TOP_K_CAPACITY : p.topK;
+    int const idsRowVectors = topkRowVectors(topK);
+    int const token = blockIdx.x / p.blocksPerToken, chunk = blockIdx.x % p.blocksPerToken;
     int const vec = chunk * kNumThreads + threadIdx.x;
-    __shared__ uint64_t s_target_mask, s_recv_source_mask;
-    __shared__ int s_landing_set;
-    __shared__ uint4 s_ids_row[kRowCapacity], s_weights_row[kRowCapacity]; // wire rows for D3
-    wait_for_previous_kernel();
+    __shared__ uint64_t sTargetMask, sRecvSourceMask;
+    __shared__ int sLandingSet;
+    __shared__ uint4 sIdsRow[kRowCapacity], sWeightsRow[kRowCapacity]; // wire rows for D3
+    waitForPreviousKernel();
     if (threadIdx.x < 32)
     { // D1
         int const lane = threadIdx.x;
         int epoch = 0;
         if (lane == 0)
-            epoch = load_volatile_int(p.round_state + kEpoch);
-        uint32_t weight = 0; // loaded before routing, so that it is in flight with the expert id
-        if (chunk == 0 && p.has_topk_weights && token < p.local_num_tokens && lane < top_k)
         {
-            int64_t const index = static_cast<int64_t>(token) * top_k + lane;
-            weight = p.weights_bf16
-                ? static_cast<uint32_t>(reinterpret_cast<uint16_t const*>(p.topk_weights)[index]) << 16
-                : p.topk_weights[index];
+            epoch = loadVolatileInt(p.roundState + kEpoch);
         }
-        uint64_t const target_mask = route_token<TOP_K_CAPACITY, FIXED_TOP_K, ENABLE_RANK_MASK>(p, token, lane,
-            reinterpret_cast<uint32_t*>(s_ids_row),
-            chunk == 0 ? p.topk_target_ranks + static_cast<int64_t>(token) * top_k : nullptr);
+        uint32_t weight = 0; // loaded before routing, so that it is in flight with the expert id
+        if (chunk == 0 && p.hasTopkWeights && token < p.localNumTokens && lane < topK)
+        {
+            int64_t const index = static_cast<int64_t>(token) * topK + lane;
+            weight = p.weightsBf16
+                ? static_cast<uint32_t>(reinterpret_cast<uint16_t const*>(p.topkWeights)[index]) << 16
+                : p.topkWeights[index];
+        }
+        uint64_t const targetMask = routeToken<TOP_K_CAPACITY, FIXED_TOP_K, ENABLE_RANK_MASK>(p, token, lane,
+            reinterpret_cast<uint32_t*>(sIdsRow),
+            chunk == 0 ? p.topkTargetRanks + static_cast<int64_t>(token) * topK : nullptr);
         if (lane < 4 * kRowCapacity) // padding: weight 0
-            reinterpret_cast<uint32_t*>(s_weights_row)[lane] = lane < top_k ? canonicalize_word(weight) : 0u;
+        {
+            reinterpret_cast<uint32_t*>(sWeightsRow)[lane] = lane < topK ? canonicalizeWord(weight) : 0U;
+        }
         if (lane == 0)
         {
-            s_landing_set = epoch & 1;
-            s_target_mask = target_mask;
-            s_recv_source_mask = 0;
+            sLandingSet = epoch & 1;
+            sTargetMask = targetMask;
+            sRecvSourceMask = 0;
         }
     }
     __syncthreads();
-    uint64_t const target_mask = s_target_mask;
-    int64_t const ids_set_offset = s_landing_set * p.landing.ids_set_bytes;
-    int64_t const recv_row = static_cast<int64_t>(p.ep_rank) * p.max_tokens_per_rank + token;
-    if (target_mask && vec < p.payload_vectors + p.wire_scale_vectors)
+    uint64_t const targetMask = sTargetMask;
+    int64_t const idsSetOffset = sLandingSet * p.landing.idsSetBytes;
+    int64_t const recvRow = static_cast<int64_t>(p.epRank) * p.maxTokensPerRank + token;
+    if (targetMask && vec < p.payloadVectors + p.wireScaleVectors)
     { // D2
-        WireVector const wv = locate_wire_vector(p, vec);
-        push_vector<PAYLOAD_KIND>(p, target_mask, token, recv_row, wv, load_wire_vector<PAYLOAD_KIND>(p, token, wv));
+        WireVector const wv = locateWireVector(p, vec);
+        pushVector<PAYLOAD_KIND>(p, targetMask, token, recvRow, wv, loadWireVector<PAYLOAD_KIND>(p, token, wv));
     }
     if (chunk == 0) // D3
-        push_ids_and_weights<ENABLE_RANK_MASK>(
-            p, top_k, ids_row_vectors, target_mask, token, recv_row, ids_set_offset, s_ids_row, s_weights_row);
-    allow_next_kernel();
-    receive_token_slot<PAYLOAD_KIND, ENABLE_RANK_MASK>(
-        p, top_k, ids_row_vectors, token, chunk, vec, target_mask, ids_set_offset, s_recv_source_mask);
+    {
+        pushIdsAndWeights<ENABLE_RANK_MASK>(
+            p, topK, idsRowVectors, targetMask, token, recvRow, idsSetOffset, sIdsRow, sWeightsRow);
+    }
+    allowNextKernel();
+    receiveTokenSlot<PAYLOAD_KIND, ENABLE_RANK_MASK>(
+        p, topK, idsRowVectors, token, chunk, vec, targetMask, idsSetOffset, sRecvSourceMask);
 #else
     __trap(); // not built for this architecture (see MOE_A2A_SENTINEL_COMPILE)
 #endif
@@ -679,141 +744,170 @@ __global__ void __launch_bounds__(kNumThreads, kDispatchBlocksPerSM)
 
 #if MOE_A2A_SENTINEL_COMPILE
 // ============================================================================= combine phases
-// C1, warp 0: the ranks of the token's target slots (topk_target_ranks >= 0) in top-k slot
-// order into s_sources[0, n); lane 0 stores n.
-__device__ __forceinline__ void list_target_ranks(
-    CombineParams const& p, int token, int top_k, int* s_sources, int* s_num_sources)
+// C1, warp 0: the ranks of the token's target slots (topkTargetRanks >= 0) in top-k slot
+// order into sSources[0, n); lane 0 stores n.
+__device__ __forceinline__ void listTargetRanks(
+    CombineParams const& p, int token, int topK, int* sSources, int* sNumSources)
 {
     int const lane = threadIdx.x;
-    int const rank = (lane < top_k && token < p.local_num_tokens)
-        ? p.topk_target_ranks[static_cast<int64_t>(token) * top_k + lane]
-        : -1;
-    uint32_t const source_lanes = __ballot_sync(0xFFFFFFFFu, rank >= 0);
+    int const rank
+        = (lane < topK && token < p.localNumTokens) ? p.topkTargetRanks[static_cast<int64_t>(token) * topK + lane] : -1;
+    uint32_t const sourceLanes = __ballot_sync(0xFFFFFFFFU, rank >= 0);
     if (rank >= 0)
-        s_sources[__popc(source_lanes & ((1u << lane) - 1u))] = rank;
+    {
+        sSources[__popc(sourceLanes & ((1U << lane) - 1U))] = rank;
+    }
     if (lane == 0)
-        *s_num_sources = __popc(source_lanes);
+    {
+        *sNumSources = __popc(sourceLanes);
+    }
 }
 
 // C2: push the expert output of row (source, token) to source's combine landing row
-// (ep_rank, token), for every source that sent this slot a token but this rank (whose partial
+// (epRank, token), for every source that sent this slot a token but this rank (whose partial
 // C3 reads directly). 8 sources at a time, every load issued before the stores (a store's
 // "memory" clobber would otherwise wait for one load after another).
-__device__ __forceinline__ void push_partials(CombineParams const& p, int token, int vec, uint64_t recv_source_mask)
+__device__ __forceinline__ void pushPartials(CombineParams const& p, int token, int vec, uint64_t recvSourceMask)
 {
-    int64_t const row_bytes = static_cast<int64_t>(p.hidden_size) * 2;
-    int64_t const landing_offset = p.landing.combine_offset
-        + (static_cast<int64_t>(p.ep_rank) * p.max_tokens_per_rank + token) * row_bytes + vec * 16;
-    for (uint64_t unsent = recv_source_mask & ~(1ull << p.ep_rank); unsent;)
+    int64_t const rowBytes = static_cast<int64_t>(p.hiddenSize) * 2;
+    int64_t const landingOffset
+        = p.landing.combineOffset + (static_cast<int64_t>(p.epRank) * p.maxTokensPerRank + token) * rowBytes + vec * 16;
+    for (uint64_t unsent = recvSourceMask & ~(1ULL << p.epRank); unsent;)
     {
         int sources[8]; // the round's sources, -1 past the last
         uint4 partials[8];
 #pragma unroll
         for (int j = 0; j < 8; ++j)
         {
-            sources[j] = unsent ? pop_lowest_rank(unsent) : -1;
+            sources[j] = unsent ? popLowestRank(unsent) : -1;
             if (sources[j] >= 0)
-                partials[j] = *reinterpret_cast<uint4 const*>(p.expert_output
-                    + (static_cast<int64_t>(sources[j]) * p.max_tokens_per_rank + token) * row_bytes + vec * 16);
+            {
+                partials[j] = *reinterpret_cast<uint4 const*>(p.expertOutput
+                    + (static_cast<int64_t>(sources[j]) * p.maxTokensPerRank + token) * rowBytes + vec * 16);
+            }
         }
 #pragma unroll
         for (int j = 0; j < 8; ++j)
+        {
             if (sources[j] >= 0)
-                store_volatile(p.rank_workspaces[sources[j]] + landing_offset, canonicalize_partial(partials[j]));
+            {
+                storeVolatile(p.rankWorkspaces[sources[j]] + landingOffset, canonicalizePartial(partials[j]));
+            }
+        }
     }
 }
 
 // Fence-combine order of up to 8 sources (zero-filled): s0 + s1 for n <= 2, else the pairwise
 // tree ((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7)). __fadd_rn is never fused and, like the
 // fence combine's adds, flushes subnormals exactly when the module builds with -ftz (fast math).
-__device__ __forceinline__ float sum_group(float const (&values)[8], int num_sources)
+__device__ __forceinline__ float sumGroup(float const (&values)[8], int numSources)
 {
-    if (num_sources <= 2)
+    if (numSources <= 2)
+    {
         return __fadd_rn(values[0], values[1]);
+    }
     return __fadd_rn(__fadd_rn(__fadd_rn(values[0], values[1]), __fadd_rn(values[2], values[3])),
         __fadd_rn(__fadd_rn(values[4], values[5]), __fadd_rn(values[6], values[7])));
 }
 
 // C3, sources 8 * group .. 8 * group + 7 of the slot-ordered list: poll their partials of this
 // rank's token (every load in flight), re-arm them, and sum each of the vector's 8 elements.
-__device__ __forceinline__ void receive_group(CombineParams const& p, int token, int vec, int group, int num_sources,
-    int const* s_sources, long long wait_start, bool& timed_out, float (&sums)[8])
+__device__ __forceinline__ void receiveGroup(CombineParams const& p, int token, int vec, int group, int numSources,
+    int const* sSources, long long waitStart, bool& timedOut, float (&sums)[8])
 {
 #pragma unroll
     for (int e = 0; e < 8; ++e)
-        sums[e] = 0.f;
-    if (8 * group >= num_sources)
+    {
+        sums[e] = 0.F;
+    }
+    if (8 * group >= numSources)
+    {
         return;
-    int64_t const row_bytes = static_cast<int64_t>(p.hidden_size) * 2;
-    uint8_t* combine_rows = p.rank_workspaces[p.ep_rank] + p.landing.combine_offset + vec * 16;
+    }
+    int64_t const rowBytes = static_cast<int64_t>(p.hiddenSize) * 2;
+    uint8_t* combineRows = p.rankWorkspaces[p.epRank] + p.landing.combineOffset + vec * 16;
     int ranks[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j)
-        ranks[j] = 8 * group + j < num_sources ? s_sources[8 * group + j] : -1;
+    {
+        ranks[j] = 8 * group + j < numSources ? sSources[8 * group + j] : -1;
+    }
     uint4 partials[8];
     uint32_t pending = 0;
 #pragma unroll
     for (int j = 0; j < 8; ++j)
     {
         partials[j] = make_uint4(0, 0, 0, 0); // a missing source adds +0
-        if (ranks[j] == p.ep_rank)
+        if (ranks[j] == p.epRank)
         {
-            partials[j] = canonicalize_partial(*reinterpret_cast<uint4 const*>(p.expert_output
-                + (static_cast<int64_t>(p.ep_rank) * p.max_tokens_per_rank + token) * row_bytes + vec * 16));
+            partials[j] = canonicalizePartial(*reinterpret_cast<uint4 const*>(
+                p.expertOutput + (static_cast<int64_t>(p.epRank) * p.maxTokensPerRank + token) * rowBytes + vec * 16));
         }
         else if (ranks[j] >= 0)
         {
-            pending |= 1u << j;
+            pending |= 1U << j;
         }
     }
     uint32_t const polled = pending;
-    auto address = [&](int j)
-    { return combine_rows + (static_cast<int64_t>(ranks[j]) * p.max_tokens_per_rank + token) * row_bytes; };
-    if (poll_until_arrived(
-            pending, kDataSentinel, [] {}, address, partials, wait_start, p.timeout_cycles))
-        timed_out = true;
+    auto address
+        = [&](int j) { return combineRows + (static_cast<int64_t>(ranks[j]) * p.maxTokensPerRank + token) * rowBytes; };
+    if (pollUntilArrived(
+            pending, kDataSentinel, [] {}, address, partials, waitStart, p.timeoutCycles))
+    {
+        timedOut = true;
+    }
 #pragma unroll
     for (int j = 0; j < 8; ++j)
-        if ((polled >> j) & 1u)
-            store_volatile(address(j), splat(kDataSentinel));
+    {
+        if ((polled >> j) & 1U)
+        {
+            storeVolatile(address(j), splat(kDataSentinel));
+        }
+    }
 #pragma unroll
     for (int e = 0; e < 8; ++e)
     {
         float values[8];
 #pragma unroll
         for (int j = 0; j < 8; ++j)
+        {
             values[j] = __bfloat162float(reinterpret_cast<__nv_bfloat16 const*>(&partials[j])[e]);
-        sums[e] = sum_group(values, num_sources);
+        }
+        sums[e] = sumGroup(values, numSources);
     }
 }
 
 // C3: join the group sums as the fence combine joins its lanes (n <= 8: g0; n <= 16: g0 + g1;
 // else (g0 + g1) + (g2 + g3)) and round to bf16.
 template <int NUM_GROUPS>
-__device__ __forceinline__ uint4 join_groups(float const (&group_sums)[NUM_GROUPS][8], int num_sources)
+__device__ __forceinline__ uint4 joinGroups(float const (&groupSums)[NUM_GROUPS][8], int numSources)
 {
     uint4 out;
-    __nv_bfloat16* out_elements = reinterpret_cast<__nv_bfloat16*>(&out);
+    __nv_bfloat16* outElements = reinterpret_cast<__nv_bfloat16*>(&out);
 #pragma unroll
     for (int e = 0; e < 8; ++e)
     {
-        float sum = group_sums[0][e];
+        float sum = groupSums[0][e];
         if constexpr (NUM_GROUPS > 1)
         {
-            if (num_sources > 8)
-                sum = __fadd_rn(sum, group_sums[1][e]);
+            if (numSources > 8)
+            {
+                sum = __fadd_rn(sum, groupSums[1][e]);
+            }
         }
         if constexpr (NUM_GROUPS > 2)
         {
-            if (num_sources > 16)
+            if (numSources > 16)
             {
-                float last = 0.f;
+                float last = 0.F;
                 if constexpr (NUM_GROUPS > 3)
-                    last = group_sums[3][e];
-                sum = __fadd_rn(sum, __fadd_rn(group_sums[2][e], last));
+                {
+                    last = groupSums[3][e];
+                }
+                sum = __fadd_rn(sum, __fadd_rn(groupSums[2][e], last));
             }
         }
-        out_elements[e] = __float2bfloat16_rn(sum);
+        outElements[e] = __float2bfloat16_rn(sum);
     }
     return out;
 }
@@ -821,31 +915,32 @@ __device__ __forceinline__ uint4 join_groups(float const (&group_sums)[NUM_GROUP
 // C4: re-arm this slot's ids rows of the round's landing set (their readers, the dispatch
 // blocks, have all ended), then the last block closes the round and advances the epoch (every
 // block read it first).
-__device__ __forceinline__ void rearm_ids_and_advance_epoch(
-    CombineParams const& p, int token, int chunk, int ids_row_vectors, int landing_set)
+__device__ __forceinline__ void rearmIdsAndAdvanceEpoch(
+    CombineParams const& p, int token, int chunk, int idsRowVectors, int landingSet)
 {
     if (chunk == 0)
     {
-        uint8_t* ids_rows = p.rank_workspaces[p.ep_rank] + p.landing.ids_offset + landing_set * p.landing.ids_set_bytes;
-        int64_t const ids_row_bytes = 16 * ids_row_vectors;
-        for (int item = threadIdx.x; item < p.ep_size * ids_row_vectors; item += kNumThreads)
+        uint8_t* idsRows = p.rankWorkspaces[p.epRank] + p.landing.idsOffset + landingSet * p.landing.idsSetBytes;
+        int64_t const idsRowBytes = 16 * idsRowVectors;
+        for (int item = threadIdx.x; item < p.epSize * idsRowVectors; item += kNumThreads)
         {
-            int const source = item / ids_row_vectors, vec = item % ids_row_vectors;
-            if (source == p.ep_rank)
+            int const source = item / idsRowVectors, vec = item % idsRowVectors;
+            if (source == p.epRank)
+            {
                 continue; // never written: own rows go to the receive buffers
-            store_volatile(
-                ids_rows + landing_row(p.ep_size, source, token) * ids_row_bytes + vec * 16, splat(kIdsSentinel));
+            }
+            storeVolatile(idsRows + landingRow(p.epSize, source, token) * idsRowBytes + vec * 16, splat(kIdsSentinel));
         }
     }
     __syncthreads();
     if (threadIdx.x == 0)
     {
         __threadfence();
-        int const finished_before = atomicAdd(p.round_state + kFinishedCombineBlocks, 1);
-        if (finished_before == static_cast<int>(gridDim.x) - 1)
+        int const finishedBefore = atomicAdd(p.roundState + kFinishedCombineBlocks, 1);
+        if (finishedBefore == static_cast<int>(gridDim.x) - 1)
         {
-            atomicExch(p.round_state + kFinishedCombineBlocks, 0);
-            atomicAdd(p.round_state + kEpoch, 1);
+            atomicExch(p.roundState + kFinishedCombineBlocks, 0);
+            atomicAdd(p.roundState + kEpoch, 1);
         }
     }
 }
@@ -857,71 +952,79 @@ __global__ void __launch_bounds__(kNumThreads) moeA2ASentinelCombineKernel(Combi
 {
 #if MOE_A2A_SENTINEL_COMPILE
     constexpr int kNumGroups = (TOP_K_CAPACITY + 7) / 8;
-    int const top_k = FIXED_TOP_K ? TOP_K_CAPACITY : p.top_k;
-    int const token = blockIdx.x / p.blocks_per_token, chunk = blockIdx.x % p.blocks_per_token;
+    int const topK = FIXED_TOP_K ? TOP_K_CAPACITY : p.topK;
+    int const token = blockIdx.x / p.blocksPerToken, chunk = blockIdx.x % p.blocksPerToken;
     int const vec = chunk * kNumThreads + threadIdx.x;
-    __shared__ uint64_t s_recv_source_mask;
-    __shared__ int s_sources[TOP_K_CAPACITY];
-    __shared__ int s_num_sources, s_landing_set;
-    wait_for_previous_kernel(); // the expert output, and the dispatch's routing state
+    __shared__ uint64_t sRecvSourceMask;
+    __shared__ int sSources[TOP_K_CAPACITY];
+    __shared__ int sNumSources, sLandingSet;
+    waitForPreviousKernel(); // the expert output, and the dispatch's routing state
     if (threadIdx.x < 32)
-    {                           // C1
-        list_target_ranks(p, token, top_k, s_sources, &s_num_sources);
+    {                        // C1
+        listTargetRanks(p, token, topK, sSources, &sNumSources);
         if (threadIdx.x == 0)
         {
-            s_landing_set = load_volatile_int(p.round_state + kEpoch) & 1;
-            uint64_t mask = p.recv_source_mask[token];
+            sLandingSet = loadVolatileInt(p.roundState + kEpoch) & 1;
+            uint64_t mask = p.recvSourceMask[token];
             if constexpr (ENABLE_RANK_MASK)
-                mask &= p.active_rank_mask; // never push to a masked rank
-            s_recv_source_mask = mask;
+            {
+                mask &= p.activeRankMask; // never push to a masked rank
+            }
+            sRecvSourceMask = mask;
         }
     }
     __syncthreads();
-    if (vec < p.row_vectors)
-        push_partials(p, token, vec, s_recv_source_mask); // C2
-    allow_next_kernel();
-    bool timed_out = false;
-    if (token < p.local_num_tokens && vec < p.row_vectors)
+    if (vec < p.rowVectors)
+    {
+        pushPartials(p, token, vec, sRecvSourceMask); // C2
+    }
+    allowNextKernel();
+    bool timedOut = false;
+    if (token < p.localNumTokens && vec < p.rowVectors)
     { // C3
-        long long const wait_start = clock64();
-        float group_sums[kNumGroups][8];
+        long long const waitStart = clock64();
+        float groupSums[kNumGroups][8];
 #pragma unroll
         for (int group = 0; group < kNumGroups; ++group)
-            receive_group(p, token, vec, group, s_num_sources, s_sources, wait_start, timed_out, group_sums[group]);
-        *reinterpret_cast<uint4*>(p.output + (static_cast<int64_t>(token) * p.hidden_size) * 2 + vec * 16)
-            = join_groups<kNumGroups>(group_sums, s_num_sources);
+        {
+            receiveGroup(p, token, vec, group, sNumSources, sSources, waitStart, timedOut, groupSums[group]);
+        }
+        *reinterpret_cast<uint4*>(p.output + (static_cast<int64_t>(token) * p.hiddenSize) * 2 + vec * 16)
+            = joinGroups<kNumGroups>(groupSums, sNumSources);
     }
-    if (timed_out)
-        report_and_trap(p.round_state, p.ep_rank, "timed out waiting for a peer (combine)");
-    rearm_ids_and_advance_epoch(p, token, chunk, topk_row_vectors(top_k), s_landing_set); // C4
+    if (timedOut)
+    {
+        reportAndTrap(p.roundState, p.epRank, "timed out waiting for a peer (combine)");
+    }
+    rearmIdsAndAdvanceEpoch(p, token, chunk, topkRowVectors(topK), sLandingSet); // C4
 #else
     __trap(); // not built for this architecture (see MOE_A2A_SENTINEL_COMPILE)
 #endif
 }
 
 // Runs the statements __VA_ARGS__ with TOP_K_CAPACITY and FIXED_TOP_K of the kernels serving
-// top_k: top_k 6, 8, 10, 16 and 22 have their own kernels, the others share a kernel with a
-// runtime top_k of at most 8, 16 or 24.
+// topK: topK 6, 8, 10, 16 and 22 have their own kernels, the others share a kernel with a
+// runtime topK of at most 8, 16 or 24.
 #define MOE_A2A_SENTINEL_TOP_K_CASE(CAPACITY, FIXED, ...)                                                              \
     {                                                                                                                  \
         constexpr int TOP_K_CAPACITY = CAPACITY;                                                                       \
         constexpr bool FIXED_TOP_K = FIXED;                                                                            \
         __VA_ARGS__;                                                                                                   \
     }
-#define MOE_A2A_SENTINEL_SWITCH_TOP_K(top_k, ...)                                                                      \
-    if ((top_k) == 6)                                                                                                  \
+#define MOE_A2A_SENTINEL_SWITCH_TOP_K(topK, ...)                                                                       \
+    if ((topK) == 6)                                                                                                   \
         MOE_A2A_SENTINEL_TOP_K_CASE(6, true, __VA_ARGS__)                                                              \
-    else if ((top_k) == 8)                                                                                             \
+    else if ((topK) == 8)                                                                                              \
         MOE_A2A_SENTINEL_TOP_K_CASE(8, true, __VA_ARGS__)                                                              \
-    else if ((top_k) == 10)                                                                                            \
+    else if ((topK) == 10)                                                                                             \
         MOE_A2A_SENTINEL_TOP_K_CASE(10, true, __VA_ARGS__)                                                             \
-    else if ((top_k) == 16)                                                                                            \
+    else if ((topK) == 16)                                                                                             \
         MOE_A2A_SENTINEL_TOP_K_CASE(16, true, __VA_ARGS__)                                                             \
-    else if ((top_k) == 22)                                                                                            \
+    else if ((topK) == 22)                                                                                             \
         MOE_A2A_SENTINEL_TOP_K_CASE(22, true, __VA_ARGS__)                                                             \
-    else if ((top_k) <= 8)                                                                                             \
+    else if ((topK) <= 8)                                                                                              \
         MOE_A2A_SENTINEL_TOP_K_CASE(8, false, __VA_ARGS__)                                                             \
-    else if ((top_k) <= 16)                                                                                            \
+    else if ((topK) <= 16)                                                                                             \
         MOE_A2A_SENTINEL_TOP_K_CASE(16, false, __VA_ARGS__)                                                            \
     else                                                                                                               \
         MOE_A2A_SENTINEL_TOP_K_CASE(24, false, __VA_ARGS__)
@@ -929,32 +1032,33 @@ __global__ void __launch_bounds__(kNumThreads) moeA2ASentinelCombineKernel(Combi
 using tensorrt_llm::common::launchWithPdlWhenEnabled;
 
 // 1 in the code built for an architecture the kernels support.
-__device__ int g_kernels_compiled = MOE_A2A_SENTINEL_COMPILE;
+__device__ int gKernelsCompiled = MOE_A2A_SENTINEL_COMPILE;
 
 // Only the all-ranks-active kernels (ENABLE_RANK_MASK = false) are instantiated: the ops reject a
 // rank mask on this transport, since the kernels never drain or re-arm a masked peer's rows.
 template <int TOP_K_CAPACITY, bool FIXED_TOP_K>
-void launch_dispatch(PayloadKind payload_kind, DispatchParams const& params, cudaStream_t stream)
+void launchDispatch(PayloadKind payloadKind, DispatchParams const& params, cudaStream_t stream)
 {
-    void (*kernel)(DispatchParams) = payload_kind == kKindBf16
-        ? moeA2ASentinelDispatchKernel<TOP_K_CAPACITY, FIXED_TOP_K, kKindBf16, false>
-        : payload_kind == kKindFp8 ? moeA2ASentinelDispatchKernel<TOP_K_CAPACITY, FIXED_TOP_K, kKindFp8, false>
-                                   : moeA2ASentinelDispatchKernel<TOP_K_CAPACITY, FIXED_TOP_K, kKindNvfp4, false>;
+    void (*kernel)(DispatchParams) = payloadKind == PayloadKind::kBf16
+        ? moeA2ASentinelDispatchKernel<TOP_K_CAPACITY, FIXED_TOP_K, PayloadKind::kBf16, false>
+        : payloadKind == PayloadKind::kFp8
+        ? moeA2ASentinelDispatchKernel<TOP_K_CAPACITY, FIXED_TOP_K, PayloadKind::kFp8, false>
+        : moeA2ASentinelDispatchKernel<TOP_K_CAPACITY, FIXED_TOP_K, PayloadKind::kNvfp4, false>;
     launchWithPdlWhenEnabled("moeA2ASentinelDispatchKernel", kernel,
-        dim3(params.max_tokens_per_rank * params.blocks_per_token), dim3(kNumThreads), 0, stream, params);
+        dim3(params.maxTokensPerRank * params.blocksPerToken), dim3(kNumThreads), 0, stream, params);
 }
 
 template <int TOP_K_CAPACITY, bool FIXED_TOP_K>
-void launch_combine(CombineParams const& params, cudaStream_t stream)
+void launchCombine(CombineParams const& params, cudaStream_t stream)
 {
     launchWithPdlWhenEnabled("moeA2ASentinelCombineKernel",
         moeA2ASentinelCombineKernel<TOP_K_CAPACITY, FIXED_TOP_K, false>,
-        dim3(params.max_tokens_per_rank * params.blocks_per_token), dim3(kNumThreads), 0, stream, params);
+        dim3(params.maxTokensPerRank * params.blocksPerToken), dim3(kNumThreads), 0, stream, params);
 }
 
 } // namespace
 
-bool moe_a2a_sentinel_kernels_available()
+bool moeA2ASentinelKernelsAvailable()
 {
     // The GPUs the transport is validated on.
     int device = 0;
@@ -972,7 +1076,7 @@ bool moe_a2a_sentinel_kernels_available()
         return false;
     }
     int compiled = 0;
-    if (cudaMemcpyFromSymbol(&compiled, g_kernels_compiled, sizeof(compiled)) != cudaSuccess)
+    if (cudaMemcpyFromSymbol(&compiled, gKernelsCompiled, sizeof(compiled)) != cudaSuccess)
     {
         cudaGetLastError(); // no code for this device at all
         return false;
@@ -980,15 +1084,15 @@ bool moe_a2a_sentinel_kernels_available()
     return compiled != 0;
 }
 
-void moe_a2a_sentinel_dispatch_launch(PayloadKind payload_kind, DispatchParams const& params, cudaStream_t stream)
+void moeA2ASentinelDispatchLaunch(PayloadKind payloadKind, DispatchParams const& params, cudaStream_t stream)
 {
     MOE_A2A_SENTINEL_SWITCH_TOP_K(
-        params.top_k, { launch_dispatch<TOP_K_CAPACITY, FIXED_TOP_K>(payload_kind, params, stream); })
+        params.topK, { launchDispatch<TOP_K_CAPACITY, FIXED_TOP_K>(payloadKind, params, stream); })
 }
 
-void moe_a2a_sentinel_combine_launch(CombineParams const& params, cudaStream_t stream)
+void moeA2ASentinelCombineLaunch(CombineParams const& params, cudaStream_t stream)
 {
-    MOE_A2A_SENTINEL_SWITCH_TOP_K(params.top_k, { launch_combine<TOP_K_CAPACITY, FIXED_TOP_K>(params, stream); })
+    MOE_A2A_SENTINEL_SWITCH_TOP_K(params.topK, { launchCombine<TOP_K_CAPACITY, FIXED_TOP_K>(params, stream); })
 }
 
 #undef MOE_A2A_SENTINEL_SWITCH_TOP_K

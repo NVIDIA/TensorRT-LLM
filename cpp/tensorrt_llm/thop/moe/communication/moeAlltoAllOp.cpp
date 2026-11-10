@@ -239,21 +239,22 @@ SentinelRowBytes sentinelRowBytes(int64_t payloadFormat, int64_t hiddenSize)
 {
     // Row bytes are kernel ints: hidden sizes beyond this bound are rejected, not wrapped.
     TORCH_CHECK(hiddenSize > 0 && hiddenSize <= (1 << 24), "Invalid sentinel hidden size ", hiddenSize);
-    switch (payloadFormat)
+    TORCH_CHECK(payloadFormat >= 0 && payloadFormat <= static_cast<int64_t>(sentinel::PayloadFormat::kNvfp4),
+        "Unknown sentinel payload format ", payloadFormat);
+    switch (static_cast<sentinel::PayloadFormat>(payloadFormat))
     {
-    case sentinel::kBf16:
+    case sentinel::PayloadFormat::kBf16:
         TORCH_CHECK(hiddenSize % 8 == 0, "sentinel BF16 rows need hidden_size % 8 == 0, got ", hiddenSize);
         return {2 * hiddenSize, 0, 0};
-    case sentinel::kMxfp8:
+    case sentinel::PayloadFormat::kMxfp8:
         TORCH_CHECK(hiddenSize % 256 == 0, "sentinel MXFP8 rows need hidden_size % 256 == 0, got ", hiddenSize);
         return {hiddenSize, hiddenSize / 32, hiddenSize / 16};
-    case sentinel::kFp8Block128:
+    case sentinel::PayloadFormat::kFp8Block128:
         TORCH_CHECK(hiddenSize % 512 == 0, "sentinel FP8 block-128 rows need hidden_size % 512 == 0, got ", hiddenSize);
         return {hiddenSize, hiddenSize / 32, hiddenSize / 32};
-    case sentinel::kNvfp4:
+    case sentinel::PayloadFormat::kNvfp4:
         TORCH_CHECK(hiddenSize % 256 == 0, "sentinel NVFP4 rows need hidden_size % 256 == 0, got ", hiddenSize);
         return {hiddenSize / 2, hiddenSize / 16, hiddenSize / 16};
-    default: TORCH_CHECK(false, "Unknown sentinel payload format ", payloadFormat);
     }
     return {};
 }
@@ -287,7 +288,7 @@ struct SentinelBytesPerRow
 
 SentinelBytesPerRow sentinelBytesPerRow(int64_t topK, SentinelRowBytes const& row, int64_t hiddenSize)
 {
-    int64_t const topkRowBytes = 16 * sentinel::topk_row_vectors(topK);
+    int64_t const topkRowBytes = 16 * sentinel::topkRowVectors(topK);
     SentinelBytesPerRow bytes{};
     bytes.payload = row.payload;
     bytes.scale = row.wireScale;
@@ -376,12 +377,12 @@ sentinel::LandingLayout sentinelLandingLayout(MoeA2AWorkspaceLayout const& layou
     auto const bytes = sentinelRegionBytes(layout[EP_SIZE_INDEX], layout[SENTINEL_MAX_NUM_TOKENS_INDEX],
         layout[TOP_K_INDEX], sentinelRowBytes(layout[SENTINEL_PAYLOAD_FORMAT_INDEX], hiddenSize), hiddenSize);
     sentinel::LandingLayout landing{};
-    landing.payload_offset = layout[SENTINEL_LANDING_OFFSET_INDEX];
-    landing.scale_offset = landing.payload_offset + bytes.payload;
-    landing.weights_offset = landing.scale_offset + bytes.scale;
-    landing.ids_offset = landing.weights_offset + bytes.weights;
-    landing.ids_set_bytes = bytes.idsSet;
-    landing.combine_offset = layout[SENTINEL_COMBINE_LANDING_OFFSET_INDEX];
+    landing.payloadOffset = layout[SENTINEL_LANDING_OFFSET_INDEX];
+    landing.scaleOffset = landing.payloadOffset + bytes.payload;
+    landing.weightsOffset = landing.scaleOffset + bytes.scale;
+    landing.idsOffset = landing.weightsOffset + bytes.weights;
+    landing.idsSetBytes = bytes.idsSet;
+    landing.combineOffset = layout[SENTINEL_COMBINE_LANDING_OFFSET_INDEX];
     return landing;
 }
 
@@ -401,9 +402,9 @@ void armSentinelRegions(uint8_t* rankWorkspace, MoeA2AWorkspaceLayout const& lay
         TORCH_CHECK(cudaMemsetAsync(rankWorkspace + begin, value, end - begin, stream) == cudaSuccess,
             "cudaMemsetAsync failed");
     };
-    fillRange(landing.payload_offset, kDataByte, landing.ids_offset); // payload, scale and weight rows
-    fillRange(landing.ids_offset, kIdsByte, landing.ids_offset + 2 * landing.ids_set_bytes);
-    fillRange(landing.combine_offset, kDataByte, layout[SENTINEL_RECV_OFFSET_INDEX]);
+    fillRange(landing.payloadOffset, kDataByte, landing.idsOffset); // payload, scale and weight rows
+    fillRange(landing.idsOffset, kIdsByte, landing.idsOffset + 2 * landing.idsSetBytes);
+    fillRange(landing.combineOffset, kDataByte, layout[SENTINEL_RECV_OFFSET_INDEX]);
 }
 
 // Workspace slices with a sentinel dispatch not combined yet, with the dispatch's step geometry. A
@@ -472,7 +473,7 @@ std::vector<int64_t> moeA2ASentinelRowGeometryOp(int64_t payloadFormat, int64_t 
 // Whether the loaded code carries the sentinel kernels for the current device.
 bool moeA2ASentinelAvailableOp()
 {
-    return sentinel::moe_a2a_sentinel_kernels_available();
+    return sentinel::moeA2ASentinelKernelsAvailable();
 }
 
 // Initialize control state after allocation; layout construction itself is CPU-only.
@@ -533,16 +534,16 @@ uint8_t* setSentinelWorkspace(
         CACHELINE_ALIGNMENT, "-byte aligned");
     for (int rank = 0; rank < epSize; ++rank)
     {
-        params.rank_workspaces[rank] = workspacePtr + rank * workspace.stride(0);
+        params.rankWorkspaces[rank] = workspacePtr + rank * workspace.stride(0);
     }
     params.landing = sentinelLandingLayout(layout);
     int64_t const state = layout[SENTINEL_STATE_OFFSET_INDEX];
-    params.round_state = reinterpret_cast<int32_t*>(rankWorkspace + state);
-    params.recv_source_mask = reinterpret_cast<uint64_t*>(rankWorkspace + state + kSentinelSourceMaskOffset);
+    params.roundState = reinterpret_cast<int32_t*>(rankWorkspace + state);
+    params.recvSourceMask = reinterpret_cast<uint64_t*>(rankWorkspace + state + kSentinelSourceMaskOffset);
     // The fence path's routing table: a sentinel round fills and reads it like a fence round.
-    params.topk_target_ranks = reinterpret_cast<int32_t*>(rankWorkspace + layout[TOPK_TARGET_RANKS_OFFSET_INDEX]);
-    params.ep_size = static_cast<int>(epSize);
-    params.ep_rank = static_cast<int>(epRank);
+    params.topkTargetRanks = reinterpret_cast<int32_t*>(rankWorkspace + layout[TOPK_TARGET_RANKS_OFFSET_INDEX]);
+    params.epSize = static_cast<int>(epSize);
+    params.epRank = static_cast<int>(epRank);
     return rankWorkspace;
 }
 
@@ -557,10 +558,10 @@ void sentinelDispatch(torch::Tensor const& tokenSelectedExperts, std::vector<tor
     uint8_t* rankWorkspace = setSentinelWorkspace(params, workspace, layout, epRank, epSize);
     TORCH_CHECK(runtimeMaxTokensPerRank <= layout[SENTINEL_MAX_NUM_TOKENS_INDEX], "A sentinel step takes at most ",
         layout[SENTINEL_MAX_NUM_TOKENS_INDEX], " tokens per rank, got ", runtimeMaxTokensPerRank);
-    int64_t const payloadFormat = layout[SENTINEL_PAYLOAD_FORMAT_INDEX];
-    auto const row = sentinelRowBytes(payloadFormat, layout[SENTINEL_HIDDEN_SIZE_INDEX]);
+    auto const row = sentinelRowBytes(layout[SENTINEL_PAYLOAD_FORMAT_INDEX], layout[SENTINEL_HIDDEN_SIZE_INDEX]);
+    auto const payloadFormat = static_cast<sentinel::PayloadFormat>(layout[SENTINEL_PAYLOAD_FORMAT_INDEX]);
     int64_t const numPayloads = static_cast<int64_t>(inputPayloads.size());
-    bool const hasScale = payloadFormat != sentinel::kBf16;
+    bool const hasScale = payloadFormat != sentinel::PayloadFormat::kBf16;
     TORCH_CHECK(expertIdPayloadIndex == (hasScale ? 2 : 1) && numPayloads >= expertIdPayloadIndex + 1
             && numPayloads <= expertIdPayloadIndex + 2,
         "A sentinel dispatch carries hidden states, ", (hasScale ? "their scales, " : ""),
@@ -592,38 +593,39 @@ void sentinelDispatch(torch::Tensor const& tokenSelectedExperts, std::vector<tor
     TORCH_CHECK(static_cast<uint32_t>(invalidExpertId) != sentinel::kIdsSentinel,
         "invalid_expert_id must differ from the sentinel expert-id sentinel");
 
-    params.hidden_states = static_cast<uint8_t const*>(inputPayloads[0].data_ptr());
-    params.hidden_states_scale = hasScale ? static_cast<uint8_t const*>(inputPayloads[1].data_ptr()) : nullptr;
-    params.token_selected_experts = tokenSelectedExperts.data_ptr<int32_t>();
-    params.topk_weights
+    params.hiddenStates = static_cast<uint8_t const*>(inputPayloads[0].data_ptr());
+    params.hiddenStatesScale = hasScale ? static_cast<uint8_t const*>(inputPayloads[1].data_ptr()) : nullptr;
+    params.tokenSelectedExperts = tokenSelectedExperts.data_ptr<int32_t>();
+    params.topkWeights
         = hasWeights ? static_cast<uint32_t const*>(inputPayloads[expertIdPayloadIndex + 1].data_ptr()) : nullptr;
-    params.recv_hidden_states = rankWorkspace + recvOffsets[0];
-    params.recv_hidden_states_scale = hasScale ? rankWorkspace + recvOffsets[1] : nullptr;
-    params.recv_topk_ids = reinterpret_cast<int32_t*>(rankWorkspace + recvOffsets[expertIdPayloadIndex]);
-    params.recv_topk_weights
+    params.recvHiddenStates = rankWorkspace + recvOffsets[0];
+    params.recvHiddenStatesScale = hasScale ? rankWorkspace + recvOffsets[1] : nullptr;
+    params.recvTopkIds = reinterpret_cast<int32_t*>(rankWorkspace + recvOffsets[expertIdPayloadIndex]);
+    params.recvTopkWeights
         = hasWeights ? reinterpret_cast<uint32_t*>(rankWorkspace + recvOffsets[expertIdPayloadIndex + 1]) : nullptr;
-    params.num_experts = static_cast<int>(numExperts);
-    params.experts_per_rank = static_cast<int>(numExperts / epSize);
-    params.top_k = static_cast<int>(topK);
-    params.local_num_tokens = static_cast<int>(tokenSelectedExperts.size(0));
-    params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
-    params.has_topk_weights = hasWeights;
-    params.weights_bf16 = weightsBf16;
-    params.mx_scales = payloadFormat == sentinel::kMxfp8;
-    params.payload_row_bytes = static_cast<int>(row.payload);
-    params.scale_row_bytes = static_cast<int>(row.scale);
-    params.wire_scale_row_bytes = static_cast<int>(row.wireScale);
-    params.payload_vectors = static_cast<int>(row.payload / 16);
-    params.wire_scale_vectors = static_cast<int>(row.wireScale / 16);
-    params.blocks_per_token = static_cast<int>(sentinelDispatchBlocksPerToken(row));
-    params.invalid_expert_id = static_cast<int32_t>(invalidExpertId);
-    params.active_rank_mask = ~uint64_t{0}; // every rank: a sentinel step takes no rank mask
-    params.timeout_cycles = gTimeoutCycles.load(std::memory_order_relaxed);
+    params.numExperts = static_cast<int>(numExperts);
+    params.expertsPerRank = static_cast<int>(numExperts / epSize);
+    params.topK = static_cast<int>(topK);
+    params.localNumTokens = static_cast<int>(tokenSelectedExperts.size(0));
+    params.maxTokensPerRank = static_cast<int>(runtimeMaxTokensPerRank);
+    params.hasTopkWeights = hasWeights;
+    params.weightsBf16 = weightsBf16;
+    params.mxScales = payloadFormat == sentinel::PayloadFormat::kMxfp8;
+    params.payloadRowBytes = static_cast<int>(row.payload);
+    params.scaleRowBytes = static_cast<int>(row.scale);
+    params.wireScaleRowBytes = static_cast<int>(row.wireScale);
+    params.payloadVectors = static_cast<int>(row.payload / 16);
+    params.wireScaleVectors = static_cast<int>(row.wireScale / 16);
+    params.blocksPerToken = static_cast<int>(sentinelDispatchBlocksPerToken(row));
+    params.invalidExpertId = static_cast<int32_t>(invalidExpertId);
+    params.activeRankMask = ~uint64_t{0}; // every rank: a sentinel step takes no rank mask
+    params.timeoutCycles = gTimeoutCycles.load(std::memory_order_relaxed);
 
-    sentinel::PayloadKind const payloadKind = payloadFormat == sentinel::kBf16 ? sentinel::kKindBf16
-        : payloadFormat == sentinel::kNvfp4                                    ? sentinel::kKindNvfp4
-                                                                               : sentinel::kKindFp8;
-    sentinel::moe_a2a_sentinel_dispatch_launch(payloadKind, params, at::cuda::getCurrentCUDAStream());
+    sentinel::PayloadKind const payloadKind = payloadFormat == sentinel::PayloadFormat::kBf16
+        ? sentinel::PayloadKind::kBf16
+        : payloadFormat == sentinel::PayloadFormat::kNvfp4 ? sentinel::PayloadKind::kNvfp4
+                                                           : sentinel::PayloadKind::kFp8;
+    sentinel::moeA2ASentinelDispatchLaunch(payloadKind, params, at::cuda::getCurrentCUDAStream());
 }
 
 // A sentinel combine of payload [ep_size, runtimeMaxTokensPerRank, hidden_size] bf16 into output.
@@ -639,18 +641,18 @@ void sentinelCombine(torch::Tensor const& payload, int64_t localNumTokens, torch
     TORCH_CHECK(payload.scalar_type() == at::kBFloat16, "A sentinel combine takes bf16 expert outputs");
     TORCH_CHECK(payload.size(2) == hiddenSize, "A sentinel combine takes rows of the workspace's hidden size");
 
-    params.expert_output = static_cast<uint8_t const*>(payload.data_ptr());
+    params.expertOutput = static_cast<uint8_t const*>(payload.data_ptr());
     params.output = static_cast<uint8_t*>(output.data_ptr());
-    params.top_k = static_cast<int>(topK);
-    params.local_num_tokens = static_cast<int>(localNumTokens);
-    params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
-    params.hidden_size = static_cast<int>(hiddenSize);
-    params.row_vectors = static_cast<int>(hiddenSize / 8);
-    params.blocks_per_token = (params.row_vectors + sentinel::kNumThreads - 1) / sentinel::kNumThreads;
-    params.active_rank_mask = ~uint64_t{0}; // every rank: a sentinel step takes no rank mask
-    params.timeout_cycles = gTimeoutCycles.load(std::memory_order_relaxed);
+    params.topK = static_cast<int>(topK);
+    params.localNumTokens = static_cast<int>(localNumTokens);
+    params.maxTokensPerRank = static_cast<int>(runtimeMaxTokensPerRank);
+    params.hiddenSize = static_cast<int>(hiddenSize);
+    params.rowVectors = static_cast<int>(hiddenSize / 8);
+    params.blocksPerToken = (params.rowVectors + sentinel::kNumThreads - 1) / sentinel::kNumThreads;
+    params.activeRankMask = ~uint64_t{0}; // every rank: a sentinel step takes no rank mask
+    params.timeoutCycles = gTimeoutCycles.load(std::memory_order_relaxed);
 
-    sentinel::moe_a2a_sentinel_combine_launch(params, at::cuda::getCurrentCUDAStream());
+    sentinel::moeA2ASentinelCombineLaunch(params, at::cuda::getCurrentCUDAStream());
 }
 
 // MoE All-to-All Dispatch Operation
