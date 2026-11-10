@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The Kimi K3 `tp16_moetp16ep1` target is a copy of `tp16_moetp4ep4`'s files, changed only in marked blocks.
 
-Targets share no files (test_modeling_v2_claims.py), so `tp16_moetp16ep1` (route B) ships its own copy of every
+Targets share no files, so `tp16_moetp16ep1` (route B) ships its own copy of every
 module of `tp16_moetp4ep4` (route A). Each place the copy differs is a block:
 
     # >>> route B: <why it differs>

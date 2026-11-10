@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
@@ -43,10 +44,12 @@ from .measure import (
     MeasurementUnavailable,
     SpoolRunner,
     archive_evidence,
+    archive_parts,
     evidence_key,
     host_controls,
     load_measurement,
     measurement_hosts,
+    part_keys,
     spool_host,
     validate_measurement,
 )
@@ -70,10 +73,16 @@ from .requests import (
 )
 from .schema import campaign_max_hours, validate_perf_block
 from .sol_consensus import METHODS, TOLERANCE, read_rulings, reconcile
-from .spec import TuneSpec
+from .spec import TuneSpec, capture_shortfalls
 from .worktree import measured_tree, open_candidate, tree_in_use
 
 PACKAGE = Path(__file__).resolve().parent.parent
+#: A roadmap's list of items: ``roadmap.yaml``, ``roadmap-<n>.yaml``.
+ROADMAP_FILE = re.compile(r"roadmap(-\d+)?\.yaml")
+#: ``perf.campaign.retry_wait_s``: how long the stage waits out a transient deferral before it
+#: resumes in process, and ``max_retries``: how many such waits one process makes.
+RETRY_WAIT_S = 600.0
+MAX_RETRIES = 24
 
 
 def _same_commit(a: str, b: str) -> bool:
@@ -195,7 +204,12 @@ class TuneStage:
             names = [f"{kind}{run}", *(f"{kind}{run}a{n}" for n in range(2, self.attempt + 1))]
             if runner_factory is not None:
                 return runner_factory(spools, names[-1])
-            runner = SpoolRunner(spools, prefix=names[-1], earlier=names[:-1])
+            runner = SpoolRunner(
+                spools,
+                prefix=names[-1],
+                earlier=names[:-1],
+                note=lambda said: self.log(f"[tune] waiting: {said}"),
+            )
             if "idle_settle_s" in spec.campaign:
                 runner.settle_s = float(spec.campaign["idle_settle_s"])
             return runner
@@ -343,7 +357,14 @@ class TuneStage:
         target = self.spec.target.replace(MODELING_V2_PACKAGE, CATALOG_TESTS_DIR)
         shared = [
             f"{CATALOG_TESTS_DIR}/test_modeling_v2_{name}.py"
-            for name in ("claims", "no_stale_claims", "target_contract", "routing")
+            for name in (
+                "claims",
+                "no_stale_claims",
+                "ci_selection",
+                "contracts",
+                "target_contract",
+                "routing",
+            )
         ]
         # The target path is required even when absent: the gate must fail closed. Shared
         # contracts vary across source revisions and are discovered on the tree being gated.
@@ -446,23 +467,77 @@ class TuneStage:
             self.log(f"[tune] sol: ruling left out: {problem}")
         return rulings
 
-    def _invalidate_profile(self, reason: str) -> None:
-        """Archive profile-derived answers so a changed source/config cannot reuse their shares."""
-        for path in self.spec.workdir.glob("roadmap*.yaml"):
-            archive_evidence(path)
+    def _invalidate_profile(self, reason: str, configs: Sequence[str] | None = None) -> None:
+        """Archive profile-derived answers so a changed source/config cannot reuse their shares.
+
+        ``configs``: only these perf configs changed (or came or went). The roadmaps then stay,
+        each item with its hypothesis and the other configs' step shares (:meth:`_drop_shares`).
+        The SOL analyses go either way: each is one work model and one hardware block over
+        every perf point, reconciled and ruled on with the others, so one config's ceilings
+        cost the same turns as all of them.
+        """
+        if configs is None:
+            for path in self.spec.workdir.glob("roadmap*.yaml"):
+                archive_evidence(path)
+            archive_evidence(self.spec.workdir / "roadmap")
+            for key in list(self.t):
+                if key.startswith("roadmap") and key.endswith("_ledger_checked"):
+                    self.t.pop(key)
+            self.t["roadmaps"] = 1
+        else:
+            self._drop_shares(configs)
         archive_evidence(self.spec.workdir / "sol")
-        archive_evidence(self.spec.workdir / "roadmap")
         for path in self.spec.workdir.glob("sol-*-decision.yaml"):
             archive_evidence(path)
-        for key in list(self.t):
-            if key.startswith("roadmap") and key.endswith("_ledger_checked"):
-                self.t.pop(key)
-        self.t["roadmaps"] = 1
         self.t.pop("sol", None)
         self.t.pop("final_accuracy", None)
         self.t.pop("final_validation", None)
         self.t["goal_reached"] = False
-        self.ledger.append("profile_invalidated", reason=reason)
+        scope = {} if configs is None else {"configs": sorted(configs), "kept": ["roadmap"]}
+        self.ledger.append("profile_invalidated", reason=reason, **scope)
+
+    def _drop_shares(self, configs: Sequence[str]) -> None:
+        """Take ``configs``' points out of every roadmap item's ``share``: their profile moved.
+
+        A roadmap as its turn wrote it is set aside as ``<name>.stale-<time>``.
+        """
+        stale = tuple(f"{name}." for name in configs)
+        for path in sorted(self.spec.workdir.glob("roadmap*.yaml")):
+            if not ROADMAP_FILE.fullmatch(path.name):
+                continue
+            items = yaml.safe_load(path.read_text()) or []
+            if not isinstance(items, list):
+                continue
+            kept = [
+                {
+                    **item,
+                    "share": {
+                        point: fraction
+                        for point, fraction in item["share"].items()
+                        if not str(point).startswith(stale)
+                    },
+                }
+                if isinstance(item, dict) and isinstance(item.get("share"), dict)
+                else item
+                for item in items
+            ]
+            if kept != items:
+                archive_evidence(path)
+                path.write_text(yaml.safe_dump(kept, sort_keys=False))
+
+    def _stale_configs(self, parts: Mapping[str, str]) -> list[str] | None:
+        """The perf configs whose measurements ``parts`` no longer describe; None for all of them.
+
+        A config that changed, came or went. All of them when the measurement inputs before are
+        not known per config, a campaign of one workload, or every config changed.
+        """
+        before = self.t.get("measurement_parts")
+        if not isinstance(before, dict) or "" in parts:
+            return None
+        changed = {name for name in parts if before.get(name) != parts[name]}
+        if changed == set(parts):
+            return None
+        return sorted(changed | (set(before) - set(parts)))
 
     def _roadmap(self, n: int = 1, attempts: str = "", ask: bool = True) -> list[dict]:
         """Roadmap ``n``: the first from the baseline profile, later ones from the moved best tree.
@@ -641,7 +716,10 @@ class TuneStage:
             checkpoint_gain=float(cfg.get("checkpoint_gain", 0.05)),
         )  # fmt: skip
         if camp.evidence_changed:
-            self._invalidate_profile("campaign evidence changed")
+            # The candidates are judged again. The profile stays: changed measurement inputs
+            # moved it already (:meth:`_run`), and the judgment policy is no part of it.
+            self.t.pop("final_accuracy", None)
+            self.t.pop("final_validation", None)
             self.keep_gate = camp.keep_gate
             self.checkpoint()
         worktrees = s.workdir / "worktrees"
@@ -777,7 +855,8 @@ class TuneStage:
                             if not self._answered_candidate(slug):
                                 camp.state.save(camp.state_path)
                                 raise MeasurementUnavailable(
-                                    f"{slug}: tuner unavailable ({type(exc).__name__}: {exc})"
+                                    f"{slug}: tuner unavailable ({type(exc).__name__}: {exc})",
+                                    transient=True,
                                 ) from exc
                         decision = s.workdir / "candidates" / slug / "decision.yaml"
                         try:
@@ -888,7 +967,9 @@ class TuneStage:
         final = camp.final_accuracy(lambda: time.sleep(self.poll_s))
         if final is not None:
             if final.get("verdict") == "ERROR":
-                raise MeasurementUnavailable(f"final accuracy unavailable: {final.get('reason')}")
+                raise MeasurementUnavailable(
+                    f"final accuracy unavailable: {final.get('reason')}", transient=True
+                )
             self.t["final_accuracy"] = {
                 k: final.get(k) for k in ("verdict", "score", "floor", "reason", "commit")
             }
@@ -1143,7 +1224,9 @@ class TuneStage:
             free = self.perf.free_spools()
             if not free:
                 if not any(self.perf.alive(sp) for sp in self.perf.spools):
-                    raise MeasurementUnavailable("no live session for final same-host validation")
+                    raise MeasurementUnavailable(
+                        "no live session for final same-host validation", transient=True
+                    )
                 time.sleep(self.poll_s)
                 continue
             hosts = set(measurement_hosts(final).values())
@@ -1158,7 +1241,9 @@ class TuneStage:
                 return final, control
             baseline = control
             moves += 1
-        raise MeasurementUnavailable("final A/B moved between hosts; resume same-host validation")
+        raise MeasurementUnavailable(
+            "final A/B moved between hosts; resume same-host validation", transient=True
+        )
 
     def _final_on_spool(self, spool: str, label: str, commit: str) -> Measurement:
         """One serialized serving measurement, with a clean immutable snapshot and receipt."""
@@ -1176,7 +1261,7 @@ class TuneStage:
                     else:
                         return measured
                 if not self.perf.alive(spool):
-                    raise MeasurementUnavailable("final validation session left")
+                    raise MeasurementUnavailable("final validation session left", transient=True)
                 self.perf.submit(
                     spool,
                     label,
@@ -1190,7 +1275,9 @@ class TuneStage:
                 _, receipt = self.perf.output(done)
                 if rc != 0 or receipt.get("rc") != 0:
                     archive_evidence(self.data / label)
-                    raise MeasurementUnavailable(f"{label}: final validation unavailable (rc={rc})")
+                    raise MeasurementUnavailable(
+                        f"{label}: final validation unavailable (rc={rc})", transient=True
+                    )
                 if load_measurement(self.data, label) is None:
                     raise MeasurementUnavailable(
                         f"{label}: final validation produced no measurement"
@@ -1317,10 +1404,14 @@ class TuneStage:
         if camp is None:
             # No baseline yet: pin directly without ever moving an existing job's tree.
             if self.perf.inflight:
-                raise MeasurementUnavailable("source synchronization waits for baseline jobs")
+                raise MeasurementUnavailable(
+                    "source synchronization waits for baseline jobs", transient=True
+                )
             tree = self._best_tree()
             if tree_in_use(tree, [*self.spec.spools, *self.spec.dev_spools]):
-                raise MeasurementUnavailable("initial tune best is held by an older job")
+                raise MeasurementUnavailable(
+                    "initial tune best is held by an older job", transient=True
+                )
             if git_checked(tree, "rev-parse", "HEAD") != before:
                 raise MeasurementUnavailable("initial tune best differs from its source")
             if git_checked(tree, "status", "--porcelain", "-uno"):
@@ -1344,19 +1435,54 @@ class TuneStage:
         return True
 
     def run(self) -> str | None:
-        try:
-            return self._run()
-        except MeasurementUnavailable as exc:
-            self.t["deferred"] = str(exc)
-            self.t.pop("failure", None)
-            self.log(f"[tune] no verdict; resume from {self.t['phase']}: {exc}")
-            self.checkpoint()
-            return None
+        """The campaign to its verdict; ``None`` when it ends without one, to resume later.
+
+        A perf config whose decode runs eager for part of its load is journaled first
+        (:func:`capture_shortfalls`): a warning, the campaign measures it as it is.
+
+        A transient deferral (:attr:`MeasurementUnavailable.transient`: a job to finish, a
+        session to come back, a run or gate that ended without a verdict) is waited out here,
+        ``perf.campaign.retry_wait_s`` at a time and at most ``max_retries`` times in one
+        process, each wait journaled with its reason; then the campaign resumes from its
+        checkpoint as a new process would. One that needs someone to act first, or one past
+        those waits, ends the process without a verdict, and the next invocation resumes.
+        """
+        for why, fix in capture_shortfalls(self.spec.serving_options()):
+            self.log(f"[tune] warning: {why}. Fix: {fix}")
+            self.ledger.append("config_warning", warning=why)
+        wait_s = float(self.spec.campaign.get("retry_wait_s", RETRY_WAIT_S))
+        retries = int(self.spec.campaign.get("max_retries", MAX_RETRIES))
+        waited = 0
+        while True:
+            try:
+                return self._run()
+            except MeasurementUnavailable as exc:
+                self.t["deferred"] = str(exc)
+                self.t.pop("failure", None)
+                phase = self.t["phase"]
+                if not exc.transient or waited >= retries:
+                    after = f" (after {waited} waits in this process)" if waited else ""
+                    self.log(f"[tune] no verdict; resume from {phase}{after}: {exc}")
+                    self.checkpoint()
+                    return None
+                waited += 1
+                self.ledger.append(
+                    "deferred", reason=str(exc), phase=phase, wait_s=wait_s, wait=waited
+                )
+                self.log(
+                    f"[tune] no verdict yet; waiting {wait_s:g} s, then resuming from {phase} "
+                    f"in this process (wait {waited} of {retries}): {exc}"
+                )
+                self.checkpoint()
+                time.sleep(wait_s)
+                # What this process gave up on is measured again, as a new process would.
+                self.failed.clear()
 
     def _run(self) -> str | None:
         self.t.pop("failure", None)
         self.t.pop("deferred", None)
         inputs = evidence_key(self.spec.bench(), self.spec.identity_configs)
+        parts = part_keys(self.spec.bench(), self.spec.identity_configs)
         previous = self.t.get("measurement_inputs")
         changed = previous is not None and previous != inputs
         baseline = self._baseline()
@@ -1372,12 +1498,27 @@ class TuneStage:
                 self.perf.adopt(job)
             self.perf.poll()
             if self.perf.inflight:
-                raise MeasurementUnavailable("measurement inputs changed; earlier jobs must finish")
-            self._invalidate_profile("measurement configuration or constraints changed")
-            archive_evidence(self.data / "t-baseline")
-            archive_evidence(self.data / "t-final")
+                raise MeasurementUnavailable(
+                    "measurement inputs changed; earlier jobs must finish", transient=True
+                )
+            stale = self._stale_configs(parts)
+            self._invalidate_profile(
+                "measurement configuration or constraints changed", configs=stale
+            )
+            for label in ("t-baseline", "t-final"):
+                if stale is None:
+                    archive_evidence(self.data / label)
+                else:
+                    # Only these configs are measured again; the others' runs stand.
+                    archive_parts(self.data / label, stale)
+            if stale is not None:
+                self.log(
+                    f"[tune] perf configs {stale} changed: only their baseline is measured "
+                    "again; the roadmap stays without their step shares, the SOL is asked again"
+                )
             self.t["phase"] = "ground"
         self.t["measurement_inputs"] = inputs
+        self.t["measurement_parts"] = parts
         if self.t["phase"] == "ground":
             # Adopt any older baseline job before considering a source move.
             self.perf.adopt("t-baseline")
@@ -1399,6 +1540,7 @@ class TuneStage:
                 self.spec.repo, self.spec.workdir / "worktrees", str(self.t["source_commit"])
             )
             if not self.ground(tree=source):
+                # The job ran and failed, or measured something else: no wait brings it back.
                 raise MeasurementUnavailable(str(self.t.pop("failure", "baseline unavailable")))
         if self.t["phase"] == "campaign":
             self.campaign()
@@ -1427,31 +1569,63 @@ def _stage_for(
         with turn_priority(Priority.BACKGROUND):
             return wf._run_turn(role, what, prompt, unit="tune")
 
-    def tested_source() -> str:
-        # The core's passing checks establish the code identity. Features and variants
-        # continue beside tune and never become a global prerequisite.
-        from ..run.validation import contract as contract_mod
+    source = spec.source_workspace or Path(wf.workspace)
+    if spec.source_workspace is not None and not _is_workspace(source):
+        # A relative path resolves against the working directory: say so now rather than
+        # wait for verdicts a directory that holds no run will never record.
+        wf.journal.event(
+            "tune not started",
+            f"perf.source_workspace `{source}` holds no run (no task.yaml or state file there); "
+            "name the onboarding's workspace, by an absolute path",
+        )
+        return "tune-failed:spec"
+    stage = TuneStage(spec, state.tune, dispatch=dispatch, checkpoint=lambda: wf._checkpoint(state),
+                      log=lambda m: wf.journal.event("tune", m), attempt=attempt,
+                      tested_source=lambda: tested_source(wf, source))  # fmt: skip
+    if source.resolve() != Path(wf.workspace).resolve():
+        stage.log(
+            f"[tune] the tested source is the one the core's verdicts in `{source}` establish "
+            "(perf.source_workspace)"
+        )
+    return stage
 
-        latest = contract_mod.latest_milestone(wf.workspace)
-        head = wf._head()
-        marker = wf._commit_marker(head) if head else ""
-        contract = getattr(wf, "_contract", None)
-        if contract is not None and marker:
-            evaluation = contract_mod.evaluate(
-                contract_mod.Contract(contract_mod.core_checks(contract)),
-                wf._contract_status(),
-                marker=marker,
-                holds=getattr(wf, "_verdict_holds", None),
-            )
-            if evaluation.holds:
-                return head
-        if latest is not None and wf._commit_marker(latest.sha) == latest.marker:
-            return latest.sha
-        return ""
 
-    return TuneStage(spec, state.tune, dispatch=dispatch, checkpoint=lambda: wf._checkpoint(state),
-                     log=lambda m: wf.journal.event("tune", m), attempt=attempt,
-                     tested_source=tested_source)  # fmt: skip
+def _is_workspace(path: Path) -> bool:
+    """Whether ``path`` is a run's workspace: it holds the run's task or its state."""
+    from ..run.records.state import STATE_FILENAME
+
+    return any((Path(path) / name).is_file() for name in ("task.yaml", STATE_FILENAME))
+
+
+def tested_source(wf: Any, workspace: Path) -> str:
+    """The commit the core's passing checks recorded in ``workspace`` establish; ``""`` for none.
+
+    The checkout's ``HEAD`` when the core's required checks hold there, else the latest
+    correctness milestone while its commit is the state it recorded. Features and variants go on
+    beside tune and never become its prerequisite. ``workspace`` is the run's own, or the
+    onboarding beside a standalone tune (``perf.source_workspace``), whose verdicts are read again
+    on every call: that run goes on recording them.
+    """
+    from ..run.validation import contract as contract_mod
+
+    own = Path(workspace).resolve() == Path(wf.workspace).resolve()
+    latest = contract_mod.latest_milestone(workspace)
+    head = wf._head()
+    marker = wf._commit_marker(head) if head else ""
+    contract = getattr(wf, "_contract", None)
+    if contract is not None and marker:
+        holds = getattr(wf, "_verdict_holds", None)
+        evaluation = contract_mod.evaluate(
+            contract_mod.Contract(contract_mod.core_checks(contract)),
+            wf._contract_status() if own else contract_mod.ContractStatus.load(workspace),
+            marker=marker,
+            holds=None if holds is None else (lambda verdict: holds(verdict, workspace)),
+        )
+        if evaluation.holds:
+            return head
+    if latest is not None and wf._commit_marker(latest.sha) == latest.marker:
+        return latest.sha
+    return ""
 
 
 def run_tune_phase(wf: Any, state: Any, log: Any) -> str | None:

@@ -65,6 +65,7 @@ from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 from tensorrt_llm.llmapi import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfig
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
@@ -146,6 +147,7 @@ def test_shutdown_graph_lifecycle(shutdown_method: str, releases_model_owned_gra
     executor.virtual_memory_pools = None
     executor.sampler = object()
     executor.dwdp_manager = None
+    executor.dense_dwdp_manager = None
     executor._profile_manager = Mock()
 
     with patch("torch.cuda.is_available", return_value=False):
@@ -3625,6 +3627,25 @@ def test_update_request_states_uses_common_dummy_cleanup():
     stub._terminate_attention_dp_dummy_requests.assert_called_once_with()
 
 
+@pytest.mark.parametrize("cp_type", [CpType.ULYSSES, CpType.RING, CpType.HELIX])
+def test_update_request_states_single_cp_rank_takes_tp_path(cp_type):
+    stub = Mock(dist=Mock(cp_config={"cp_type": cp_type}, cp_size=1))
+    scheduled_requests = Mock(context_requests=[])
+
+    PyExecutor._update_request_states(stub, scheduled_requests)
+
+    stub._update_request_states_tp.assert_called_once_with(scheduled_requests)
+
+
+def test_update_request_states_rejects_unsupported_cp_type_with_context_parallelism():
+    stub = Mock(dist=Mock(cp_config={"cp_type": CpType.ULYSSES}, cp_size=2))
+
+    with pytest.raises(NotImplementedError, match="Unsupported cp type ULYSSES"):
+        PyExecutor._update_request_states(stub, Mock(context_requests=[]))
+
+    stub._update_request_states_tp.assert_not_called()
+
+
 def test_overlap_adp_preserves_legacy_role_without_forward_intent_collective():
     stub = _StubADPExecutor(
         max_num_tokens=4096,
@@ -4579,6 +4600,7 @@ def test_v2_generation_update_runs_before_cancel_and_responses(loop):
     executor.resource_manager = Mock()
     executor.enable_kv_cache_events = False
     executor.enable_iter_perf_stats = False
+    executor.capturable_guided_decoder = None
     events = []
     executor._handle_canceled_requests = Mock(side_effect=lambda: events.append("cancel"))
     executor.kv_cache_manager.update_resources.side_effect = lambda *args: events.append(
@@ -4590,7 +4612,9 @@ def test_v2_generation_update_runs_before_cancel_and_responses(loop):
     )
 
     if loop == "overlap":
-        executor.previous_batch = types.SimpleNamespace(scheduled_requests=batch)
+        executor.previous_batch = types.SimpleNamespace(
+            scheduled_requests=batch, guided_batch_id=None, guided_failures=None
+        )
         executor.enable_early_first_token_response = False
         executor._process_previous_batch()
     else:
@@ -4605,7 +4629,7 @@ def test_v2_generation_update_runs_before_cancel_and_responses(loop):
         executor._flush_iter_stats_synced = Mock()
         executor._disagg_pp_termination_handler = None
         executor._handle_executed_batch(
-            types.SimpleNamespace(scheduled_requests=batch, sample_state=None)
+            types.SimpleNamespace(scheduled_requests=batch, sample_state=None, guided_batch_id=None)
         )
 
     assert events == ["target_update", "cancel", "responses", "other_updates"]

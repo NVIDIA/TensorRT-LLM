@@ -538,10 +538,10 @@ class PrimsTSSparseMlaFmha(Fmha):
         plan_kwargs = dict(
             max_topk=int(self.attn.sparse_attention_config.window_size),
             max_extra_topk=extra,
-            max_seq_len_q=1,
-            q_data_type=q_dtype,
+            max_q_len=1,
+            q_dtype=q_dtype,
             kv_layout="NHD",
-            has_sinks=has_sinks,
+            use_attention_sinks=has_sinks,
             return_lse=False,
             assume_valid_prefix=not holes_possible,
         )
@@ -879,7 +879,7 @@ class PrimsTSSparseMlaFmha(Fmha):
             extra_pool,
             softmax_scale=softmax_scale,
             output_scale=output_scale,
-            sinks=sinks,
+            attention_sinks=sinks,
             validate=validate,
             **run_kwargs,
         )

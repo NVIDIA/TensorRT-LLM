@@ -38,9 +38,6 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     modeling_v2_resolve,
     resolved_mode,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp import (
-    routing as qwen4_exp_routing,
-)
 from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -181,6 +178,19 @@ def _qwen4_exp_config(**vision_overrides):
         num_attention_heads=24,
         linear_num_value_heads=48,
         vocab_size=248320,
+        # The settings the target pins (`modeling._TEXT_SETTINGS`), as the normalized config
+        # carries them: rope theta and partial factor flattened to the top level.
+        norm_topk_prob=True,
+        num_experts_per_tok=10,
+        hidden_act="silu",
+        num_key_value_heads=2,
+        head_dim=256,
+        attention_bias=False,
+        output_gate_type="sigmoid",
+        tie_word_embeddings=False,
+        rope_theta=10000000,
+        partial_rotary_factor=0.25,
+        rope_scaling=dict(type="mrope", mrope_section=[11, 11, 10], mrope_interleaved=True),
     )
     vision = dict(
         depth=27,
@@ -1152,7 +1162,7 @@ def test_kimi_k3_on_another_sm_does_not_match(monkeypatch):
 
 # --- qwen4_exp: one-model MTP-Eagle over a linear chain, one rank ---------------
 
-_QWEN4_EXP_TARGET = "models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.modeling."
+_QWEN4_EXP_TARGET = "models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.modeling."
 
 
 @pytest.fixture
@@ -1266,11 +1276,8 @@ def test_qwen4_exp_quantized_kv_cache_dtypes_match(algo):
 @pytest.mark.usefixtures("_qwen4_exp_sm")
 @pytest.mark.parametrize("algo", [QuantAlgo.INT8, QuantAlgo.FP8_BLOCK_SCALES])
 def test_qwen4_exp_other_kv_cache_algorithms_are_declined(algo):
-    choices = qwen4_exp_routing.engine_choices(
-        _model_config(_qwen4_exp_config()), _llm_args("auto")
-    )
-    with pytest.raises(NoTarget, match="KV cache"):
-        qwen4_exp_routing._check_engine(None, algo, choices)
+    """`kv_cache_config.dtype: auto` keeps the checkpoint's own KV-cache algorithm."""
+    _declined(_model_config(_qwen4_exp_config(), kv_cache_quant_algo=algo), match="KV cache")
 
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")
@@ -1319,10 +1326,10 @@ def test_qwen4_exp_runtime_draft_length_falls_back(spec_kwargs):
 
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")
-@pytest.mark.parametrize("max_draft_len", [4, 7])
-def test_qwen4_exp_draft_beyond_three_needs_the_cached_replay(monkeypatch, max_draft_len):
-    """The legacy per-step recurrent states are certified at up to three drafted tokens and
-    hold one fp32 state per verify row."""
+@pytest.mark.parametrize("max_draft_len", [1, 3, 7])
+def test_qwen4_exp_mtp_needs_the_cached_replay(monkeypatch, max_draft_len):
+    """The target verifies on the GDN cached replay only, never on the legacy per-step
+    recurrent states."""
     monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
     config = _model_config(
         _qwen4_exp_config(), spec_config=MTPDecodingConfig(max_draft_len=max_draft_len)
@@ -1331,13 +1338,6 @@ def test_qwen4_exp_draft_beyond_three_needs_the_cached_replay(monkeypatch, max_d
     _declined(config, dict(kv_cache_config=kv_cache_config), match="TRTLLM_USE_GDN_REPLAY=0")
     monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY")
     _claimed(config, dict(kv_cache_config=kv_cache_config))
-
-
-@pytest.mark.usefixtures("_qwen4_exp_sm")
-def test_qwen4_exp_legacy_verify_matches_up_to_three_drafted_tokens(monkeypatch):
-    monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
-    config = _model_config(_qwen4_exp_config(), spec_config=MTPDecodingConfig(max_draft_len=3))
-    _claimed(config, dict(kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype="float32")))
 
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")
@@ -1396,10 +1396,9 @@ def test_qwen4_exp_mtp_on_a_float16_state_cache_declines_with_replay_off(monkeyp
 
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")
-def test_qwen4_exp_mtp_on_a_bf16_state_cache_matches_with_replay_off(monkeypatch):
+def test_qwen4_exp_without_speculation_matches_with_replay_off(monkeypatch):
     monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
-    config = _model_config(_qwen4_exp_config(), spec_config=MTPDecodingConfig(max_draft_len=3))
-    _claimed(config)
+    _claimed(_model_config(_qwen4_exp_config()))
 
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")

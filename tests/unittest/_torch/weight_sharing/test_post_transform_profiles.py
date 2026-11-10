@@ -27,6 +27,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformFeature,
     PostTransformProfile,
     PostTransformProfileRegistry,
+    PostTransformQualificationDecision,
     PostTransformQualificationReason,
     PostTransformRuntimeConfig,
     PostTransformRuntimeConstraints,
@@ -85,6 +86,7 @@ def _runtime_config(**overrides: object) -> PostTransformRuntimeConfig:
         "cp_size": 1,
         "moe_tp_size": 1,
         "moe_ep_size": 1,
+        "moe_cluster_size": 1,
         "attention_tp_size": 1,
         "attention_cp_size": 1,
         "attention_dp": False,
@@ -209,7 +211,10 @@ def test_registry_selects_exact_speculative_mode_profile() -> None:
     assert decision.profile is mtp_profile
 
 
-def test_optional_feature_requires_explicit_profile_support() -> None:
+@pytest.mark.parametrize("feature", list(PostTransformFeature))
+def test_optional_feature_requires_explicit_profile_support(
+    feature: PostTransformFeature,
+) -> None:
     profile = _profile()
     registry = PostTransformProfileRegistry((profile,))
 
@@ -220,13 +225,50 @@ def test_optional_feature_requires_explicit_profile_support() -> None:
         speculative_mode=None,
         protocol_version=1,
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
-        enabled_features=frozenset({PostTransformFeature.SEPARATE_DRAFT_MODEL}),
+        enabled_features=frozenset({feature}),
     )
 
     assert not decision.qualified
     assert decision.reason is PostTransformQualificationReason.FEATURE_NOT_SUPPORTED
     assert decision.profile is profile
-    assert decision.unsupported_features == frozenset({PostTransformFeature.SEPARATE_DRAFT_MODEL})
+    assert decision.unsupported_features == frozenset({feature})
+
+
+@pytest.mark.parametrize(
+    "decision, expected",
+    [
+        pytest.param(
+            PostTransformQualificationDecision(
+                PostTransformQualificationReason.ROOT_MODEL_CLASS_NOT_REGISTERED
+            ),
+            "reason=root_model_class_not_registered",
+            id="reason-only",
+        ),
+        pytest.param(
+            PostTransformQualificationDecision(
+                PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED,
+                unsupported_runtime_dimensions=frozenset({"tp_size", "moe_backend"}),
+            ),
+            "reason=runtime_config_not_supported; "
+            "unsupported_runtime_dimensions=moe_backend,tp_size",
+            id="runtime-dimensions",
+        ),
+        pytest.param(
+            PostTransformQualificationDecision(
+                PostTransformQualificationReason.FEATURE_NOT_SUPPORTED,
+                unsupported_features=frozenset(
+                    {PostTransformFeature.MOE_LOAD_BALANCER, PostTransformFeature.DWDP}
+                ),
+            ),
+            "reason=feature_not_supported; unsupported_features=dwdp,moe_load_balancer",
+            id="features",
+        ),
+    ],
+)
+def test_decision_describes_only_the_details_it_reports(
+    decision: PostTransformQualificationDecision, expected: str
+) -> None:
+    assert decision.describe() == expected
 
 
 def test_explicitly_supported_optional_feature_is_qualified() -> None:
@@ -277,6 +319,7 @@ def test_runtime_constraints_qualify_only_declared_rows() -> None:
         pytest.param({"tp_size": 4}, "tp_size", id="tp-size"),
         pytest.param({"rope_type": "yarn"}, "rope_type", id="rope-type"),
         pytest.param({"sliding_window": "uniform"}, "sliding_window", id="sliding-window"),
+        pytest.param({"moe_cluster_size": 2}, "moe_cluster_size", id="moe-cluster-size"),
     ],
 )
 def test_runtime_constraints_report_unsupported_dimension(
@@ -289,6 +332,7 @@ def test_runtime_constraints_report_unsupported_dimension(
             tp_sizes=frozenset({1, 2}),
             rope_types=frozenset({"default"}),
             sliding_windows=frozenset({"none"}),
+            moe_cluster_sizes=frozenset({1}),
         )
     )
     registry = PostTransformProfileRegistry((profile,))
@@ -408,6 +452,7 @@ def test_runtime_config_is_captured_from_final_model_config() -> None:
             cp_size=1,
             moe_tp_size=2,
             moe_ep_size=1,
+            moe_cluster_size=1,
             attn_tp_size=2,
             attn_cp_size=1,
             enable_attention_dp=False,
@@ -421,6 +466,23 @@ def test_runtime_config_is_captured_from_final_model_config() -> None:
         rope_fusion=None,
         sliding_window=None,
     )
+
+
+@pytest.mark.parametrize(
+    "mapping, expected_cluster_size",
+    [
+        pytest.param(SimpleNamespace(moe_cluster_size=2), 2, id="cluster-2"),
+        pytest.param(SimpleNamespace(), None, id="missing"),
+    ],
+)
+def test_runtime_config_captures_moe_cluster_size(
+    mapping: SimpleNamespace,
+    expected_cluster_size: int | None,
+) -> None:
+    mapping.is_multi_node = lambda: False
+    runtime_config = PostTransformRuntimeConfig.from_model_config(SimpleNamespace(mapping=mapping))
+
+    assert runtime_config.moe_cluster_size == expected_cluster_size
 
 
 def test_runtime_config_uses_resolved_dtype_when_checkpoint_dtype_is_missing() -> None:
@@ -519,6 +581,138 @@ def test_full_attention_constraint_rejects_other_sliding_windows(
         _runtime_config(sliding_window=sliding_window)
     ) == frozenset({"sliding_window"})
     assert "sliding_window" in constraints.unsupported_dimensions(None)
+
+
+@pytest.mark.parametrize(
+    "sm_version, expected",
+    [
+        pytest.param(90, 90, id="sm90"),
+        pytest.param(100, 100, id="sm100"),
+        pytest.param(-1, -1, id="no-cuda-device"),
+        pytest.param(None, None, id="not-supplied"),
+        pytest.param(True, None, id="bool"),
+        pytest.param("90", None, id="string"),
+        pytest.param(9.0, None, id="float"),
+    ],
+)
+def test_runtime_config_records_canonical_sm_version(
+    sm_version: object,
+    expected: int | None,
+) -> None:
+    runtime_config = PostTransformRuntimeConfig.from_model_config(
+        SimpleNamespace(),
+        sm_version=sm_version,
+    )
+
+    assert runtime_config.sm_version == expected
+
+
+def test_runtime_config_leaves_sm_version_unknown_by_default() -> None:
+    assert PostTransformRuntimeConfig.from_model_config(SimpleNamespace()).sm_version is None
+    assert _runtime_config().sm_version is None
+
+
+@pytest.mark.parametrize("sm_version", [None, -1, 89, 100, 103, 107, 120, 121])
+def test_sm_version_constraint_rejects_other_architectures(sm_version: int | None) -> None:
+    constraints = PostTransformRuntimeConstraints(sm_versions=frozenset({90}))
+
+    assert constraints.unsupported_dimensions(_runtime_config(sm_version=90)) == frozenset()
+    assert constraints.unsupported_dimensions(_runtime_config(sm_version=sm_version)) == frozenset(
+        {"sm_version"}
+    )
+
+
+@pytest.mark.parametrize("sm_version", [None, -1, 90, 100, 120])
+def test_unconstrained_sm_version_admits_every_architecture(sm_version: int | None) -> None:
+    constraints = PostTransformRuntimeConstraints(dtypes=frozenset({"bfloat16"}))
+
+    assert constraints.unsupported_dimensions(_runtime_config(sm_version=sm_version)) == frozenset()
+
+
+@pytest.mark.parametrize(
+    "quantization_config, expected",
+    [
+        pytest.param(
+            {"quant_method": "fp8", "weight_block_size": [128, 128]}, (128, 128), id="hf-dict"
+        ),
+        pytest.param(SimpleNamespace(weight_block_size=(128, 128)), (128, 128), id="parsed-config"),
+        pytest.param({"quant_method": "fp8", "weight_block_size": [1, 128]}, (1, 128), id="1x128"),
+        pytest.param({"quant_method": "fp8", "activation_scheme": "static"}, None, id="undeclared"),
+        pytest.param({"weight_block_size": []}, None, id="empty"),
+        pytest.param({"weight_block_size": ["128", 128]}, None, id="string-entry"),
+        pytest.param({"weight_block_size": [True, 128]}, None, id="bool-entry"),
+        pytest.param({"weight_block_size": 128}, None, id="scalar"),
+        pytest.param(None, None, id="unquantized"),
+    ],
+)
+def test_runtime_config_records_declared_weight_block_size(
+    quantization_config: object,
+    expected: tuple[int, ...] | None,
+) -> None:
+    runtime_config = PostTransformRuntimeConfig.from_model_config(
+        SimpleNamespace(pretrained_config=SimpleNamespace(quantization_config=quantization_config))
+    )
+
+    assert runtime_config.weight_block_size == expected
+
+
+def test_runtime_config_leaves_weight_block_size_unknown_by_default() -> None:
+    assert PostTransformRuntimeConfig.from_model_config(SimpleNamespace()).weight_block_size is None
+    assert _runtime_config().weight_block_size is None
+
+
+@pytest.mark.parametrize("weight_block_size", [None, (1, 128), (64, 64), (128,), (128, 128, 1)])
+def test_weight_block_size_constraint_rejects_other_block_sizes(
+    weight_block_size: tuple[int, ...] | None,
+) -> None:
+    constraints = PostTransformRuntimeConstraints(weight_block_sizes=frozenset({(128, 128)}))
+
+    assert (
+        constraints.unsupported_dimensions(_runtime_config(weight_block_size=(128, 128)))
+        == frozenset()
+    )
+    assert constraints.unsupported_dimensions(
+        _runtime_config(weight_block_size=weight_block_size)
+    ) == frozenset({"weight_block_size"})
+
+
+@pytest.mark.parametrize("weight_block_size", [None, (1, 128), (128, 128)])
+def test_unconstrained_weight_block_size_admits_every_block_size(
+    weight_block_size: tuple[int, ...] | None,
+) -> None:
+    constraints = PostTransformRuntimeConstraints(dtypes=frozenset({"bfloat16"}))
+
+    assert (
+        constraints.unsupported_dimensions(_runtime_config(weight_block_size=weight_block_size))
+        == frozenset()
+    )
+
+
+def test_rows_pinned_to_different_sm_versions_do_not_overlap() -> None:
+    sm90 = PostTransformRuntimeConstraints(sm_versions=frozenset({90}))
+    sm100 = PostTransformRuntimeConstraints(sm_versions=frozenset({100, 103}))
+    unconstrained = PostTransformRuntimeConstraints()
+
+    assert not sm90.overlaps(sm100)
+    assert sm90.overlaps(unconstrained)
+    registry = PostTransformProfileRegistry(
+        (
+            _profile(runtime_constraints=sm90),
+            _profile(profile_id="model-sm100-target-v1", runtime_constraints=sm100),
+        )
+    )
+    decision = registry.qualify(
+        root_model_class=_Model,
+        architecture="ModelForCausalLM",
+        model_type="model",
+        speculative_mode=None,
+        protocol_version=1,
+        transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+        runtime_config=_runtime_config(sm_version=103),
+    )
+    assert decision.qualified
+    assert decision.profile is not None
+    assert decision.profile.profile_id == "model-sm100-target-v1"
 
 
 def test_registry_rejects_duplicate_profile_id() -> None:
