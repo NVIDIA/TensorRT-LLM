@@ -252,7 +252,11 @@ def _eager_execute(decoder):
 def _decoder_after_an_eager_step():
     decoder = _decoder(CapturableGuidedDecoder)
     _add_batch(decoder, guided=False)
-    _eager_execute(decoder)  # The first eager step keeps the normal path.
+    _eager_execute(decoder)
+    # The first eager step follows a step that wasn't eager, so it keeps the normal path.
+    decoder.build.assert_called_once()
+    decoder.apply_bitmask.assert_called_once()
+    decoder.bitmask_event.synchronize.assert_called_once_with()
     decoder.build.reset_mock()
     decoder.apply_bitmask.reset_mock()
     decoder.bitmask_event.synchronize.reset_mock()
@@ -307,6 +311,20 @@ def test_batch_add_on_a_skipped_step_copies_nothing(method):
     decoder.new_tokens.__getitem__.assert_not_called()
     decoder.num_accepted_tokens.__getitem__.assert_not_called()
     decoder.token_event.record.assert_not_called()
+
+
+@pytest.mark.parametrize("method", _BATCH_ADD_METHODS)
+def test_batch_add_while_capturing_copies_and_records(method):
+    """A captured step never skips, even when its batch is unguided."""
+    decoder = _batch_add_decoder()
+    _unguided_eager_step(decoder)
+    _run(lambda: _BATCH_ADD_METHODS[method](decoder), capturing=True)
+
+    decoder.num_accepted_tokens.__getitem__.return_value.copy_.assert_called_once()
+    if method == "add_draft_batch":
+        decoder.new_tokens.__getitem__.return_value.copy_.assert_called_once()
+    decoder.token_event.record.assert_called_once_with()
+    assert decoder._step_skip is None
 
 
 @pytest.mark.parametrize("method", _BATCH_ADD_METHODS)
