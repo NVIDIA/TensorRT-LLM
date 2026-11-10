@@ -947,8 +947,7 @@ class EncoderDecoderCudaGraphs(DecoderCudaGraphs):
     from the encoder graph shapes.
     """
 
-    # The mixed shapes rely on the warmup-only pass, and the single pass's move check does not
-    # cover the cross-attention metadata.
+    # Mixed shapes need the warmup-only pass; the move check misses the cross-attention metadata.
     supports_single_pass_capture: ClassVar[bool] = False
 
     def __init__(
