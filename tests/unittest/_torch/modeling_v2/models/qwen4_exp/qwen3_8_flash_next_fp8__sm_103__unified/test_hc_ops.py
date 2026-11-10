@@ -278,7 +278,9 @@ def _inject_norm_launch(rows, kind):
     for warps in (M._HC_INJECT_WARPS, 2):
         hc_w, normed_w = M._hc_inject_norm_launch(*args, warps)
         assert torch.equal(hc_w, hc8)
-        assert_within_ulp(normed_w, normed8, element_ulp=1.0, rms_ulp=0.25)
+        # One bf16 rounding of an element is at most 2^-7 of its magnitude, so up to 2 ulp of the
+        # row's largest one (B300: one element of 288 x 10240 one rounding apart, 1.14 ulp).
+        assert_within_ulp(normed_w, normed8, element_ulp=2.0, rms_ulp=0.25)
     o, args = inputs(700 + rows)
     hc8, normed8 = qwen4_exp_hc_inject_norm(*args)
     hc_l, normed_l = M._hc_inject_norm_launch(*args, 8)
