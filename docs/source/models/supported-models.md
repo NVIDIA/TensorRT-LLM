@@ -307,8 +307,8 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 |---|---|---|---|---|---|---|---|---|---|--|--|--|---|
 | **FLUX.1** | Yes | Yes | Yes | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **FLUX.2** | Yes | Yes | Yes | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **FLUX.3 Klein Base** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | Yes | No |
-| **FLUX.3 Klein** | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | No | No | Yes | No |
+| **FLUX 3 Klein Base** | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | No | No | Yes | No |
+| **FLUX 3 Klein** | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | No | No | Yes | No |
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **LTX-2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No |

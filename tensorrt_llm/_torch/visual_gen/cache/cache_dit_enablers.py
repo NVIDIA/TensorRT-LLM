@@ -318,7 +318,7 @@ def enable_cache_dit_for_flux(
 def enable_cache_dit_for_flux3(
     pipeline: Any, cache_dit_cfg: CacheDiTConfig
 ) -> CacheDiTEnableResult:
-    """FLUX.3: Pattern_3 BlockAdapter over the joint single-stream blocks."""
+    """FLUX 3: Pattern_3 BlockAdapter over the joint single-stream blocks."""
     calibrator = _maybe_calibrator(cache_dit_cfg)
     # Every packed sample, CFG included, runs in one transformer call per step.
     db_cfg = _build_db_cache_config(cache_dit_cfg, enable_separate_cfg=False)
@@ -333,7 +333,7 @@ def enable_cache_dit_for_flux3(
     compiled_blocks = _has_compiled_blocks(transformer.single_transformer_blocks)
     if compiled_blocks:
         logger.info(
-            "Cache-DiT: FLUX.3 blocks are torch.compile'd; skipping forward-pattern checks."
+            "Cache-DiT: FLUX 3 blocks are torch.compile'd; skipping forward-pattern checks."
         )
     adapter = BlockAdapter(
         transformer=transformer,
@@ -345,7 +345,7 @@ def enable_cache_dit_for_flux3(
     )
 
     logger.info(
-        f"Cache-DiT: FLUX.3 Fn={db_cfg.Fn_compute_blocks}, Bn={db_cfg.Bn_compute_blocks}, "
+        f"Cache-DiT: FLUX 3 Fn={db_cfg.Fn_compute_blocks}, Bn={db_cfg.Bn_compute_blocks}, "
         f"W={db_cfg.max_warmup_steps}, R={cache_dit_cfg.residual_diff_threshold:.3f}",
     )
 

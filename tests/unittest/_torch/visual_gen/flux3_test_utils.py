@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Synthetic Diffusers-format FLUX.3 checkpoints and BFL variants for unit tests."""
+"""Synthetic Diffusers-format FLUX 3 checkpoints and BFL variants for unit tests."""
 
 import json
 import zlib
@@ -118,7 +118,7 @@ def _swap_prefix(name: str, old: str, new: str) -> Optional[str]:
 
 
 def to_module_name(name: str) -> str:
-    """TRT-LLM module or tensor name of a Diffusers FLUX.3 name."""
+    """TRT-LLM module or tensor name of a Diffusers FLUX 3 name."""
     for diffusers_prefix, module_prefix in MODULE_PREFIXES:
         renamed = _swap_prefix(name, diffusers_prefix, module_prefix)
         if renamed is not None:
@@ -127,7 +127,7 @@ def to_module_name(name: str) -> str:
 
 
 def to_diffusers_name(name: str) -> str:
-    """Diffusers name of a TRT-LLM FLUX.3 module or tensor name."""
+    """Diffusers name of a TRT-LLM FLUX 3 module or tensor name."""
     for diffusers_prefix, module_prefix in MODULE_PREFIXES:
         renamed = _swap_prefix(name, module_prefix, diffusers_prefix)
         if renamed is not None:
@@ -136,7 +136,7 @@ def to_diffusers_name(name: str) -> str:
 
 
 def diffusers_shapes(config: dict[str, Any]) -> dict[str, tuple[int, ...]]:
-    """Tensor names and shapes of a BF16 Diffusers FLUX.3 transformer checkpoint."""
+    """Tensor names and shapes of a BF16 Diffusers FLUX 3 transformer checkpoint."""
     hidden = config["num_attention_heads"] * config["attention_head_dim"]
     mlp_hidden = int(hidden * config["mlp_ratio"])
     head_dim = config["attention_head_dim"]

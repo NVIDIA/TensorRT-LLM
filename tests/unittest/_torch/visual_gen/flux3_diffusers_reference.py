@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""One-sample FLUX.3 forward in plain PyTorch, following Diffusers ``Flux3Transformer2DModel``.
+"""One-sample FLUX 3 forward in plain PyTorch, following Diffusers ``Flux3Transformer2DModel``.
 
 Uses no TRT-LLM module; dtypes follow Diffusers (model dtype, fp32 QK-norm and RoPE).
 """
@@ -44,7 +44,7 @@ def _apply_rope(x: Tensor, rope: tuple[Tensor, Tensor]) -> Tensor:
 
 
 class Flux3Reference:
-    """Diffusers FLUX.3 math over a Diffusers-named state dict."""
+    """Diffusers FLUX 3 math over a Diffusers-named state dict."""
 
     def __init__(self, weights: dict[str, Tensor], config: dict[str, Any]):
         self.weights = weights

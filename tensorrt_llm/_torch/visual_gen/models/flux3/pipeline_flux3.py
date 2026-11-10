@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FLUX.3 Klein pipelines for text-to-image and reference-image generation.
+"""FLUX 3 Klein pipelines for text-to-image and reference-image generation.
 
 Klein Base samples with classifier-free guidance; Klein is a step-distilled flow map without it.
 """
@@ -53,7 +53,7 @@ from .transformer_flux3 import (
 )
 from .variants import check_variant, load_variant_weights, resolve_variant_quantization_config
 
-# Constant timestep shift of the FLUX.3 sampling recipe.
+# Constant timestep shift of the FLUX 3 sampling recipe.
 SCHEDULER_SHIFT = 6.93
 DEFAULT_SIZE = 1024
 # One image token covers 16 x 16 pixels: 8x VAE downsampling, then 2 x 2 latent packing.
@@ -117,14 +117,14 @@ def load_reference_images(
     for index, item in enumerate(items):
         if not isinstance(item, (bytes, PIL.Image.Image)):
             raise ValueError(
-                "FLUX.3 reference images must be PIL images or encoded bytes; "
+                "FLUX 3 reference images must be PIL images or encoded bytes; "
                 f"item {index} is {type(item).__name__}."
             )
         try:
             image = PIL.Image.open(BytesIO(item)) if isinstance(item, bytes) else item
             decoded.append(ImageOps.exif_transpose(image).convert("RGB"))
         except (OSError, PIL.Image.DecompressionBombError) as exc:
-            raise ValueError(f"Unable to decode FLUX.3 reference image {index}: {exc}") from exc
+            raise ValueError(f"Unable to decode FLUX 3 reference image {index}: {exc}") from exc
     return decoded
 
 
@@ -179,7 +179,7 @@ def _crop_multi_reference(image: PIL.Image.Image) -> PIL.Image.Image:
     crop_height = height // PATCH_SIZE * PATCH_SIZE
     if not crop_width or not crop_height:
         raise ValueError(
-            f"Each reference of a FLUX.3 multi-reference edit needs sides of at least "
+            f"Each reference of a FLUX 3 multi-reference edit needs sides of at least "
             f"{PATCH_SIZE} pixels, got {width} x {height}."
         )
     left, top = (width - crop_width) // 2, (height - crop_height) // 2
@@ -197,10 +197,10 @@ def preprocess_references(images: Sequence[PIL.Image.Image]) -> Flux3References:
     or fit each of several under 1 MP and center-crop it to the grid, as Diffusers and BFL do.
     """
     if not images:
-        raise ValueError("FLUX.3 image-to-image needs at least one reference image.")
+        raise ValueError("FLUX 3 image-to-image needs at least one reference image.")
     if len(images) > MAX_REFERENCES:
         raise ValueError(
-            f"FLUX.3 accepts at most {MAX_REFERENCES} reference images, got {len(images)}."
+            f"FLUX 3 accepts at most {MAX_REFERENCES} reference images, got {len(images)}."
         )
     if len(images) == 1:
         image, crop = _pad_single_reference(images[0])
@@ -214,7 +214,7 @@ def preprocess_references(images: Sequence[PIL.Image.Image]) -> Flux3References:
 
 
 def flux3_scheduler() -> FlowMatchEulerDiscreteScheduler:
-    """Flow-match Euler scheduler with the FLUX.3 constant shift."""
+    """Flow-match Euler scheduler with the FLUX 3 constant shift."""
     return FlowMatchEulerDiscreteScheduler(shift=SCHEDULER_SHIFT)
 
 
@@ -294,10 +294,10 @@ def _read_manifest(checkpoint_dir: str) -> Dict[str, Any]:
     hf_ids=["black-forest-labs/flux-3-image-klein-base"],
     defaults={"variant": None},
     download_patterns=_DOWNLOAD_PATTERNS,
-    doc="Black Forest Labs FLUX.3 Klein Base (text-to-image and reference-image generation).",
+    doc="Black Forest Labs FLUX 3 Klein Base (text-to-image and reference-image generation).",
 )
 class Flux3Pipeline(BasePipeline):
-    """FLUX.3 Klein Base: classifier-free guidance over packed per-sample prompts and references."""
+    """FLUX 3 Klein Base: classifier-free guidance over packed per-sample prompts and references."""
 
     supports_image_edit = True
     derive_output_size_from_reference = True
@@ -350,7 +350,7 @@ class Flux3Pipeline(BasePipeline):
         )
         if user_algo is not None:
             raise ValueError(
-                f"FLUX.3 variant {variant!r} is pre-quantized; remove quant_config.quant_algo or "
+                f"FLUX 3 variant {variant!r} is pre-quantized; remove quant_config.quant_algo or "
                 "pipeline_config.variant."
             )
         name = PipelineComponent.TRANSFORMER.value
@@ -372,23 +372,23 @@ class Flux3Pipeline(BasePipeline):
             )
         if config.cpu_offload_config.enable:
             raise ValueError(
-                "FLUX.3 does not support CPU offloading; set cpu_offload_config.enable to false."
+                "FLUX 3 does not support CPU offloading; set cpu_offload_config.enable to false."
             )
         cache = config.cache
         if cache is not None and cache.cache_backend != "cache_dit":
             raise ValueError(
-                f"FLUX.3 has no {cache.cache_backend} coefficients; set "
+                f"FLUX 3 has no {cache.cache_backend} coefficients; set "
                 "cache_config.cache_backend to cache_dit or remove cache_config."
             )
         if cache is not None and cache.enable_separate_cfg:
             raise ValueError(
-                "FLUX.3 runs all CFG samples in one transformer call per step; "
+                "FLUX 3 runs all CFG samples in one transformer call per step; "
                 "leave cache_config.enable_separate_cfg unset."
             )
         if cache is not None and config.cuda_graph.enable:
             # Capture would freeze one per-step cache decision into every replay.
             raise ValueError(
-                "FLUX.3 Cache-DiT decides on the host each step, which CUDA graph replay "
+                "FLUX 3 Cache-DiT decides on the host each step, which CUDA graph replay "
                 "skips; set cuda_graph_config.enable to false or remove cache_config."
             )
         sparse = config.attention.sparse_attention_config
@@ -396,12 +396,12 @@ class Flux3Pipeline(BasePipeline):
             raise ValueError(
                 "Video Sparse Attention (sparse_attention_config.algorithm='vsa') is "
                 "only supported by the Wan 2.1 T2V 14B (720P) pipeline. Remove "
-                "sparse_attention_config for FLUX.3."
+                "sparse_attention_config for FLUX 3."
             )
         quant_algo = config.quant_config.quant_algo
         if config.dynamic_weight_quant and quant_algo not in (None, *LOAD_TIME_QUANT_ALGOS):
             raise ValueError(
-                "FLUX.3 quantizes BF16 weights on load with quant_config.quant_algo "
+                "FLUX 3 quantizes BF16 weights on load with quant_config.quant_algo "
                 f"{', '.join(LOAD_TIME_QUANT_ALGOS)}, got {quant_algo}."
             )
         if (
@@ -411,7 +411,7 @@ class Flux3Pipeline(BasePipeline):
             and config.cuda_graph.enable
         ):
             raise ValueError(
-                "FLUX.3 quantized TRTLLM attention does not support torch_compile_config together "
+                "FLUX 3 quantized TRTLLM attention does not support torch_compile_config together "
                 "with cuda_graph_config: compiled PrimTS cache-free attention is not planned "
                 "before CUDA graph capture. Disable torch_compile_config.enable or "
                 "cuda_graph_config.enable."
@@ -419,17 +419,17 @@ class Flux3Pipeline(BasePipeline):
         vgm = config.visual_gen_mapping
         if config.runtime_lora is not None and vgm is not None and vgm.tp_size > 1:
             raise ValueError(
-                "FLUX.3 runtime LoRA does not support tensor parallelism; set "
+                "FLUX 3 runtime LoRA does not support tensor parallelism; set "
                 "parallel_config.tp_size to 1 or remove runtime_lora_config."
             )
         if flow_map and vgm is not None and vgm.cfg_size > 1:
             raise ValueError(
-                "FLUX.3 Klein samples without classifier-free guidance, so CFG parallelism "
+                "FLUX 3 Klein samples without classifier-free guidance, so CFG parallelism "
                 "does not apply; set parallel_config.cfg_size to 1."
             )
         if vgm is not None and vgm.cp_size > 1:
             raise ValueError(
-                "FLUX.3 does not support Ring Attention or Attention2D; set "
+                "FLUX 3 does not support Ring Attention or Attention2D; set "
                 "parallel_config.ring_size to 1 and attn2d_size to [1, 1]."
             )
         seq_size = vgm.seq_size if vgm is not None else 1
@@ -440,7 +440,7 @@ class Flux3Pipeline(BasePipeline):
             sizes = [str(size) for size in range(1, max_size + 1) if max_size % size == 0]
             choices = sizes[0] if len(sizes) == 1 else f"{', '.join(sizes[:-1])} or {sizes[-1]}"
             raise ValueError(
-                f"FLUX.3 Ulysses splits {num_heads} attention heads and prompts padded to "
+                f"FLUX 3 Ulysses splits {num_heads} attention heads and prompts padded to "
                 f"multiples of {TEXT_PAD_MULTIPLE} tokens (at most {TEXT_MAX_TOKENS}) across "
                 f"ranks, so ulysses_size must be {choices}; got {seq_size}."
             )
@@ -476,7 +476,7 @@ class Flux3Pipeline(BasePipeline):
         """Load the Qwen3-VL text encoder and its processor, the FP32 VAE and the scheduler."""
         skip_components = skip_components or []
         if PipelineComponent.TEXT_ENCODER not in skip_components:
-            logger.info("Loading FLUX.3 text encoder...")
+            logger.info("Loading FLUX 3 text encoder...")
             text_encoder_dir = os.path.join(checkpoint_dir, PipelineComponent.TEXT_ENCODER.value)
             text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
                 text_encoder_dir, dtype=self.dtype
@@ -486,7 +486,7 @@ class Flux3Pipeline(BasePipeline):
             self.processor = AutoProcessor.from_pretrained(text_encoder_dir)
             self.text_encoder = text_encoder.to(device).eval()
         if PipelineComponent.VAE not in skip_components:
-            logger.info("Loading FLUX.3 VAE...")
+            logger.info("Loading FLUX 3 VAE...")
             self.vae = (
                 AutoencoderKLFlux2.from_pretrained(
                     os.path.join(checkpoint_dir, PipelineComponent.VAE.value),
@@ -558,7 +558,7 @@ class Flux3Pipeline(BasePipeline):
     def _check_num_images(num_images_per_prompt: int) -> None:
         if num_images_per_prompt != 1:
             raise ValueError(
-                "FLUX.3 generates one image per request; num_images_per_prompt must be 1, "
+                "FLUX 3 generates one image per request; num_images_per_prompt must be 1, "
                 f"got {num_images_per_prompt}."
             )
 
@@ -578,7 +578,7 @@ class Flux3Pipeline(BasePipeline):
         self._check_num_images(params.num_images_per_prompt)
         prompts = [req.prompt] if isinstance(req.prompt, str) else list(req.prompt)
         if len(prompts) != 1:
-            raise ValueError(f"FLUX.3 generates from one prompt per request, got {len(prompts)}.")
+            raise ValueError(f"FLUX 3 generates from one prompt per request, got {len(prompts)}.")
         image = req.prepared_inputs.get("references")
         if image is None and params.image_reference:
             image = [ref.content for ref in params.image_reference]
@@ -667,13 +667,13 @@ class Flux3Pipeline(BasePipeline):
         for modality, count in token_counts.items():
             if count % size:
                 raise ValueError(
-                    f"FLUX.3 sequence parallelism splits each sample's {modality} tokens across "
+                    f"FLUX 3 sequence parallelism splits each sample's {modality} tokens across "
                     f"{size} ranks, but this request has {count} {modality} tokens; an image "
                     f"token covers {PATCH_SIZE} x {PATCH_SIZE} pixels."
                 )
             if sol and count <= SOL_BLOCK_SIZE:
                 raise ValueError(
-                    f"FLUX.3 SOL-Attn needs more than {SOL_BLOCK_SIZE} {modality} tokens, "
+                    f"FLUX 3 SOL-Attn needs more than {SOL_BLOCK_SIZE} {modality} tokens, "
                     f"but this request has {count}; an image token covers "
                     f"{PATCH_SIZE} x {PATCH_SIZE} pixels."
                 )
@@ -684,18 +684,18 @@ class Flux3Pipeline(BasePipeline):
         if self.flow_map:
             if guidance_scale not in (None, 1.0):
                 raise ValueError(
-                    "FLUX.3 Klein samples without classifier-free guidance; omit guidance_scale."
+                    "FLUX 3 Klein samples without classifier-free guidance; omit guidance_scale."
                 )
             if negative_prompt:
                 raise ValueError(
-                    "FLUX.3 Klein samples without classifier-free guidance and takes no "
+                    "FLUX 3 Klein samples without classifier-free guidance and takes no "
                     "negative prompt."
                 )
             return 1.0
         if guidance_scale is None:
             guidance_scale = self.default_guidance_scale
         if negative_prompt and math.isclose(guidance_scale, 1.0):
-            logger.warning("FLUX.3 ignores negative_prompt at guidance_scale 1 (no CFG).")
+            logger.warning("FLUX 3 ignores negative_prompt at guidance_scale 1 (no CFG).")
         return guidance_scale
 
     def _cfg_samples(self, guidance_scale: float) -> Tuple[Tuple[str, ...], bool]:
@@ -728,7 +728,7 @@ class Flux3Pipeline(BasePipeline):
         timer.mark_pre_start()
         start = time.time()
         if not isinstance(prompt, str):
-            raise ValueError("FLUX.3 takes one prompt string per request.")
+            raise ValueError("FLUX 3 takes one prompt string per request.")
         if num_inference_steps is None:
             num_inference_steps = self.default_num_inference_steps
         if num_inference_steps < 1:
@@ -767,7 +767,7 @@ class Flux3Pipeline(BasePipeline):
         timer.mark_end()
         if self.rank == 0:
             logger.info(
-                f"FLUX.3 generated {height}x{width} with {num_inference_steps} steps and "
+                f"FLUX 3 generated {height}x{width} with {num_inference_steps} steps and "
                 f"{len(references.images) if references is not None else 0} reference(s) "
                 f"in {time.time() - start:.2f}s"
             )
@@ -939,11 +939,11 @@ class Flux3Pipeline(BasePipeline):
     hf_ids=["black-forest-labs/flux-3-image-klein"],
     defaults={"variant": None},
     download_patterns=_DOWNLOAD_PATTERNS,
-    doc="Black Forest Labs FLUX.3 Klein, step-distilled (text-to-image and reference-image "
+    doc="Black Forest Labs FLUX 3 Klein, step-distilled (text-to-image and reference-image "
     "generation).",
 )
 class Flux3DistilledPipeline(Flux3Pipeline):
-    """FLUX.3 Klein: a step-distilled flow map, sampled without classifier-free guidance."""
+    """FLUX 3 Klein: a step-distilled flow map, sampled without classifier-free guidance."""
 
     flow_map = True
     default_num_inference_steps = 16

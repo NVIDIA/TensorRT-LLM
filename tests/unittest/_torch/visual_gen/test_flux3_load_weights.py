@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU tests for building FLUX.3 from its config and loading Diffusers checkpoints."""
+"""CPU tests for building FLUX 3 from its config and loading Diffusers checkpoints."""
 
 import re
 from types import SimpleNamespace
@@ -534,5 +534,5 @@ def test_runtime_lora_rejects_bfl_and_diffusers_names_for_one_module(tmp_path) -
         **lora_tensors("transformer.", "proj_out", a, b),
     }
     save_file(tensors, str(tmp_path / "lora.safetensors"))
-    with pytest.raises(ValueError, match="both target FLUX.3 module 'proj_out'"):
+    with pytest.raises(ValueError, match="both target FLUX 3 module 'proj_out'"):
         apply_runtime_lora(model, RuntimeLoRAConfig(path=str(tmp_path / "lora.safetensors")))

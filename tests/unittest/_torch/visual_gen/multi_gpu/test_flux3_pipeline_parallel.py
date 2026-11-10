@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FLUX.3 pipelines loaded with Ulysses, TP or CFG parallelism versus the single-GPU output."""
+"""FLUX 3 pipelines loaded with Ulysses, TP or CFG parallelism versus the single-GPU output."""
 
 import os
 from collections import defaultdict

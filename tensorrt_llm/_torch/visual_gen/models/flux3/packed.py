@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Mode-major FLUX.3 tokens and immutable per-sample layout."""
+"""Mode-major FLUX 3 tokens and immutable per-sample layout."""
 
 from dataclasses import dataclass
 
@@ -49,16 +49,16 @@ def pack(
     ``channels`` gives every modality's width C.
     """
     if not samples:
-        raise ValueError("FLUX.3 requires at least one packed sample")
+        raise ValueError("FLUX 3 requires at least one packed sample")
     first = next((item for sample in samples for item in sample.values() if item is not None), None)
     if first is None:
-        raise ValueError("FLUX.3 requires nonempty packed conditioning")
+        raise ValueError("FLUX 3 requires nonempty packed conditioning")
     # Empty modalities take the device and dtypes of the first present sample.
     first_tokens, first_ids = first
     data, ids, layout = {}, {}, []
     for sample in samples:
         if sample.keys() - channels.keys():
-            raise ValueError("Unknown FLUX.3 packed modality")
+            raise ValueError("Unknown FLUX 3 packed modality")
     for name, width in sorted(channels.items()):
         tokens, positions, lengths = [], [], []
         for sample in samples:
@@ -71,7 +71,7 @@ def pack(
                     or value.shape[1] != width
                     or position.shape != (value.shape[0], NUM_POSITION_AXES)
                 ):
-                    raise ValueError(f"Invalid packed FLUX.3 {name} tokens or positions")
+                    raise ValueError(f"Invalid packed FLUX 3 {name} tokens or positions")
                 tokens.append(value)
                 positions.append(position)
                 length = value.shape[0]

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FLUX.3 text encoder helpers: Qwen3-VL trimming and prompt padding windows."""
+"""FLUX 3 text encoder helpers: Qwen3-VL trimming and prompt padding windows."""
 
 import math
 
@@ -13,7 +13,7 @@ HIDDEN_STATE_LAYERS = (4, 8, 12, 16, 20, 24, 28, 32)
 # The DiT attends to the padding, so the padded length is part of the conditioning.
 TEXT_PAD_MULTIPLE = 80
 TEXT_MAX_TOKENS = 8192
-# Padding token position id; matches the transformers version FLUX.3 was trained with.
+# Padding token position id; matches the transformers version FLUX 3 was trained with.
 PADDING_POSITION_ID = 1
 
 
@@ -32,9 +32,9 @@ def trim_for_text(model: nn.Module, last_layer: int) -> None:
     language_model = model.model.language_model
     num_layers = len(language_model.layers)
     if not 1 <= last_layer <= num_layers:
-        raise ValueError(f"FLUX.3 text encoder layer {last_layer} is not in 1..{num_layers}")
+        raise ValueError(f"FLUX 3 text encoder layer {last_layer} is not in 1..{num_layers}")
     if last_layer < num_layers:
         language_model.layers = language_model.layers[:last_layer]
         language_model.norm = nn.Identity()
-    # FLUX.3 encodes text only; the vision tower is never called.
+    # FLUX 3 encodes text only; the vision tower is never called.
     model.model.visual = None
