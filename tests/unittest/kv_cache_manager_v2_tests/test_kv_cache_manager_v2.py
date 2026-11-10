@@ -11540,7 +11540,13 @@ class TestNoBatchingDiskOptions(TestNoBatching):
         restored = _introspection.disk_copy_counters(self.manager)
         self.assertGreater(restored["retained"], 0)
 
-        # Resizing the disk tier drops every retained copy; the pages themselves stay valid.
+        # Growing the disk tier keeps the retained copies.
+        self.assertTrue(self.manager.resize(CacheLevel(2), 2 << 30))
+        grown = _introspection.disk_copy_counters(self.manager)
+        self.assertEqual(grown["retained"], restored["retained"])
+        self.assertEqual(grown["reclaimed"], restored["reclaimed"])
+
+        # Shrinking the disk tier drops its retained copies; the pages themselves stay valid.
         self.assertTrue(self.manager.resize(CacheLevel(2), 512 << 20))
         shrunk = _introspection.disk_copy_counters(self.manager)
         self.assertEqual(shrunk["retained"], 0)

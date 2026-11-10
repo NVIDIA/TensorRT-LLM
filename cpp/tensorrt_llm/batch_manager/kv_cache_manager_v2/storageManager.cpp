@@ -2341,8 +2341,6 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     TypedVec<PoolGroupIndex, float> const& ratioList,
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages)
 {
-    // Resizing moves or frees slots; retained copies are duplicates, so drop them rather than relocate them.
-    releaseAllRetainedCopies(level);
     auto& lvlStorage = *mLevels.at(level).storage;
     auto oldNumSlots = lvlStorage.slotCountList();
     size_t quota = newQuota.has_value()
@@ -2378,6 +2376,9 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     {
         if (newNumSlots[pgIdx] >= oldNumSlots[pgIdx])
             continue;
+        // Shrinking moves or frees this group's slots. Retained copies are duplicates, so drop them rather than
+        // relocate them; groups that keep or grow their size keep their copies.
+        releaseRetainedCopies(level, pgIdx, numRetainedCopies(level, pgIdx));
         std::vector<SharedPtr<Page>> pages;
         if (persistentPages)
             pages = (*persistentPages)[pgIdx];
