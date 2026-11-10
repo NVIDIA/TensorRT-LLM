@@ -139,6 +139,7 @@ from ..modules.linear import (
 )
 from ..modules.linear import Linear as TrtllmLinear
 from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
+from ..modules.mxfp8_fused_mlp import Mxfp8SharedExpertMLP
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
 from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, create_moe
@@ -180,6 +181,10 @@ _KIMI_K3_MLA_DERIVED_PARAM_SUFFIXES = (
 # BF16 shared/latent MLP weights are optionally quantized once after loading.
 # Checkpoint-native attention FP8 is independent of this lossy conversion.
 _KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV = "KIMI_K3_FP8_WEIGHT_READ_MOE_MLP"
+# On SM107 with the CuTe DSL Rubin package, runs the shared experts on packed
+# MXFP8 weights (fused FC12 for large eager batches, two MXFP8 GEMMs otherwise).
+# Experts it cannot take keep the path the variable above selects.
+_KIMI_K3_MXFP8_SHARED_EXPERT_ENV = "KIMI_K3_MXFP8_SHARED_EXPERT"
 
 # The two token-count bounds of the MoE front's issue order (``KimiK3MoERuntime._front_plan``).
 # Expected routed rows per rank (tokens x top-k x local experts / experts) from which the routed
@@ -1433,13 +1438,43 @@ def _has_weights(module: nn.Module) -> bool:
     return not getattr(module, "_weights_removed", False)
 
 
+def _convert_shared_experts_to_mxfp8(model: nn.Module) -> Tuple[int, Dict[str, int]]:
+    """Swap each loaded shared-expert GatedMLP for its SM107 MXFP8 module.
+
+    A replicated expert also frees its BF16 weights. Returns the number of
+    experts converted and, for the rest, how many each unmet condition kept.
+    """
+    converted = 0
+    kept: Dict[str, int] = {}
+    for layer in model.layers:
+        if not _has_weights(layer):
+            continue
+        moe = getattr(layer, "block_sparse_moe", None)
+        shared = getattr(moe, "shared_experts", None)
+        if not isinstance(shared, GatedMLP):
+            continue
+        reason = Mxfp8SharedExpertMLP.unsupported_reason(shared)
+        if reason is not None:
+            kept[reason] = kept.get(reason, 0) + 1
+            continue
+        moe.shared_experts = Mxfp8SharedExpertMLP(shared)
+        if moe.shared_experts.bf16_fallback is None:
+            for projection in (shared.gate_up_proj, shared.down_proj):
+                projection.weight.data = projection.weight.data.new_empty(0)
+        converted += 1
+    if converted:
+        gc.collect()
+        torch.cuda.empty_cache()
+    return converted, kept
+
+
 def _convert_moe_mlps_to_fp8_weight_read(
     model: nn.Module, include_fused_gate_up: bool = True
 ) -> int:
     """Swap the replicated MoE-layer MLP projections to an FP8 weight read.
 
-    Targets the shared-expert MLP (gate/up/down) and the latent up/down
-    projection on every MoE layer — the bias-free BF16 projections that
+    Targets the shared-expert MLP (gate/up/down), unless it already runs MXFP8,
+    and the latent up/down projection on every MoE layer — the bias-free BF16 projections that
     attention data-parallelism re-reads in full each decode step. Attention
     follows checkpoint quantization separately. Routed experts and the dense
     layer-0 MLP are not converted. Returns the number of projections converted.
@@ -1453,7 +1488,7 @@ def _convert_moe_mlps_to_fp8_weight_read(
         if moe is None:
             continue
         shared = getattr(moe, "shared_experts", None)
-        if shared is not None:
+        if shared is not None and not isinstance(shared, Mxfp8SharedExpertMLP):
             # GatedMLP fuses gate and up into gate_up_proj; keep the split
             # names too so either MLP layout converts. The fused gate_up read
             # only pays off when attention DP re-reads it per rank per step;
@@ -2144,13 +2179,16 @@ class KimiK3MoERuntime(nn.Module):
         ``do_multi_stream``, or an AutoTuner pass, which must profile the shrunk
         FC12 grid the captured graphs go on to launch -- or when the shared
         projections no longer go through torch's cuBLAS (``F.linear``): the FP8
-        weight-read swap can have replaced them with a CuTe DSL GEMM after
-        construction, and those kernels ignore the carveout."""
+        weight-read or MXFP8 shared-expert swap can have replaced them with CuTe
+        DSL GEMMs after construction, and those kernels ignore the carveout."""
         from ..autotuner import AutoTuner
 
         if not (do_multi_stream() or AutoTuner.get().is_tuning_mode):
             return 0
-        down = self.shared_experts.down_proj
+        shared = self.shared_experts
+        if isinstance(shared, Mxfp8SharedExpertMLP) and shared.bf16_fallback is None:
+            return 0
+        down = shared.down_proj
         if (
             isinstance(down, _Fp8BlockScaleWeightReadLinear)
             or getattr(down, "use_cute_dsl_bf16_gemm", False)
@@ -3463,6 +3501,12 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 f"{_KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV} must be 0 or 1; got {mlp_fp8!r}"
             )
         self._fp8_weight_read_moe_mlp = mlp_fp8 == "1"
+        mxfp8_shared = os.environ.get(_KIMI_K3_MXFP8_SHARED_EXPERT_ENV, "0")
+        if mxfp8_shared not in ("0", "1"):
+            raise ValueError(
+                f"{_KIMI_K3_MXFP8_SHARED_EXPERT_ENV} must be 0 or 1; got {mxfp8_shared!r}"
+            )
+        self._mxfp8_shared_expert = mxfp8_shared == "1"
         cfg = _get_text_config(model_config.pretrained_config)
         assert model_config.mapping.pp_size == 1, "Kimi K3 does not support pipeline parallelism"
         spec_config = getattr(model_config, "spec_config", None)
@@ -4538,6 +4582,17 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         logger.info(
             f"Kimi K3: loaded {num_params} parameters and expert slices of {num_moe_layers} layers"
         )
+        if self._mxfp8_shared_expert:
+            if _rubin_mxfp8_is_available():
+                converted, kept = _convert_shared_experts_to_mxfp8(self.model)
+                fallback = "FP8 weight read" if self._fp8_weight_read_moe_mlp else "BF16"
+                kept_note = f"; {sum(kept.values())} kept on {fallback}: {kept}" if kept else ""
+                logger.info(f"Kimi K3: {converted} shared experts run SM107 MXFP8{kept_note}")
+            else:
+                logger.warning(
+                    f"{_KIMI_K3_MXFP8_SHARED_EXPERT_ENV}=1 needs SM107 with the CuTe DSL "
+                    "Rubin package; shared experts keep their previous path"
+                )
         if self._fp8_weight_read_moe_mlp and is_sm_100f():
             converted = _convert_moe_mlps_to_fp8_weight_read(
                 self.model, include_fused_gate_up=self.model_config.mapping.enable_attention_dp
