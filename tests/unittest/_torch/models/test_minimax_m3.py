@@ -177,8 +177,10 @@ def test_nvfp4_cache_fused_layout_validation(layout: str, expected: bool | None)
         ),
     ],
 )
+# A warmup forward creates the scale buffer inside inference mode.
+@pytest.mark.parametrize("inference_mode", [False, True], ids=["eager", "inference_mode"])
 def test_nvfp4_reload_preserves_attention_scale_storage(
-    monkeypatch: pytest.MonkeyPatch, device: str
+    monkeypatch: pytest.MonkeyPatch, device: str, inference_mode: bool
 ) -> None:
     """The model reload hook updates eager and captured readers at stable addresses."""
     target = MiniMaxM3ForCausalLM.__new__(MiniMaxM3ForCausalLM)
@@ -201,7 +203,10 @@ def test_nvfp4_reload_preserves_attention_scale_storage(
 
     monkeypatch.setattr(SpecDecOneEngineForCausalLM, "load_weights", load_scales)
     monkeypatch.setenv("TRTLLM_LOAD_KV_SCALES", "1")
-    k_scale, v_scale = _aligned_nvfp4_dequant_scales(decoder.self_attn.attn, projection.kv_scales)
+    with torch.inference_mode(inference_mode):
+        k_scale, v_scale = _aligned_nvfp4_dequant_scales(
+            decoder.self_attn.attn, projection.kv_scales
+        )
     pointers = [
         x.data_ptr() for x in (projection.kv_scales, projection.inv_kv_scales, k_scale, v_scale)
     ]

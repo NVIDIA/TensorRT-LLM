@@ -8,19 +8,27 @@ op lists every kernel that signature reaches over its runtime shapes; worker thr
 then build them in parallel. The op's own later call finds a kernel built, or waits on
 the op's own lock for a build that is still running.
 
+A rehearsal is a build pass over forwards on dummy weights, run before the checkpoint
+loads: the ops list their kernels without building or launching them, and the pass does
+not wait, so the builds run while the weights load. It runs for a model that one of the
+op families in ``_FAMILIES`` reaches.
+
 ``TLLM_KERNEL_BUILDER=0`` turns it off: no pass is active and nothing is submitted.
-``TLLM_KERNEL_BUILDER_THREADS`` sets the number of worker threads (default 8).
+``TLLM_KERNEL_BUILDER_REHEARSAL=0`` keeps the builds but not the rehearsal: they start
+at the warmup. ``TLLM_KERNEL_BUILDER_THREADS`` sets the number of worker threads
+(default 8).
 """
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
+import importlib
 import os
 import queue
 import threading
 import time
-from typing import Callable, Dict, Hashable, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Hashable, Iterable, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -29,9 +37,19 @@ from tensorrt_llm.logger import logger
 __all__ = ["KernelBuilder"]
 
 _ENV = "TLLM_KERNEL_BUILDER"
+_REHEARSAL_ENV = "TLLM_KERNEL_BUILDER_REHEARSAL"
 _THREADS_ENV = "TLLM_KERNEL_BUILDER_THREADS"
 _DEFAULT_THREADS = 8
 _PROGRESS_EVERY_S = 60.0
+
+# The op families a rehearsal can reach: name -> "module:function". The function takes the
+# model config, returns True when the model reaches the op, and then queues the builds the
+# configuration alone determines. A module is imported only when asked.
+_FAMILIES = {
+    "fmha_sm100": (
+        "tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_kernel_builds:reaches"
+    ),
+}
 
 # A build returns True when it compiled the kernel, False when the kernel was already there.
 Build = Callable[[], bool]
@@ -77,8 +95,16 @@ class KernelBuilder:
     _instance: Optional["KernelBuilder"] = None
     _instance_lock = threading.Lock()
 
-    def __init__(self, threads: Optional[int] = None, enabled: Optional[bool] = None):
+    def __init__(
+        self,
+        threads: Optional[int] = None,
+        enabled: Optional[bool] = None,
+        rehearse: Optional[bool] = None,
+    ):
         self.enabled = os.environ.get(_ENV, "1") != "0" if enabled is None else enabled
+        if rehearse is None:
+            rehearse = os.environ.get(_REHEARSAL_ENV, "1") != "0"
+        self.rehearse = self.enabled and rehearse
         if threads is None:
             threads = int(os.environ.get(_THREADS_ENV, str(_DEFAULT_THREADS)))
         self.threads = max(1, threads)
@@ -88,6 +114,7 @@ class KernelBuilder:
         self._workers: List[threading.Thread] = []
         self._device: Optional[int] = None
         self._passes = 0
+        self._rehearsals = 0
         self._pending = 0
         self._signatures: set = set()
         self._states: Dict[Tuple[str, Hashable], str] = {}
@@ -104,9 +131,9 @@ class KernelBuilder:
     # Build passes.
 
     @contextlib.contextmanager
-    def build_pass(self, name: str) -> Iterator[None]:
-        """Ops list their kernels on first sight inside; the outermost pass waits for the
-        builds at its end and logs what was built."""
+    def build_pass(self, name: str, wait: bool = True) -> Iterator[None]:
+        """Ops list their kernels on first sight inside. The outermost pass logs what was
+        built at its end, after waiting for the builds unless ``wait`` is False."""
         if not self.enabled:
             yield
             return
@@ -122,12 +149,50 @@ class KernelBuilder:
             self._passes -= 1
             last = self._passes == 0
         if last:
-            waited = self.join()
+            waited = self.join() if wait else 0.0
             for line in self.report(name, waited):
                 logger.info(line)
 
+    @contextlib.contextmanager
+    def rehearsal(self) -> Iterator[None]:
+        """A build pass over forwards on dummy weights. Ops list their kernels without
+        building or launching them, and the pass does not wait for the builds."""
+        if not self.enabled:
+            yield
+            return
+        with self._lock:
+            self._rehearsals += 1
+        try:
+            with self.build_pass("rehearsal", wait=False):
+                yield
+        finally:
+            with self._lock:
+                self._rehearsals -= 1
+
     def active(self) -> bool:
         return self.enabled and self._passes > 0
+
+    def rehearsing(self) -> bool:
+        """True inside a rehearsal: an op lists its kernels, then skips its own launch."""
+        return self.enabled and self._rehearsals > 0
+
+    def wants_rehearsal(self, model_config: Any) -> bool:
+        """True when the rehearsal is on and an op family in ``_FAMILIES`` reaches the
+        model. Each family that does queues the builds its configuration determines."""
+        if not self.rehearse:
+            return False
+        wanted = False
+        for name, target in _FAMILIES.items():
+            module_name, function = target.split(":")
+            try:
+                reaches = getattr(importlib.import_module(module_name), function)
+                wanted = bool(reaches(model_config)) or wanted
+            except Exception as e:  # noqa: BLE001 - the family's kernels build at the warmup
+                logger.warning(
+                    f"[KernelBuilder] {name}: could not tell whether the model reaches it; "
+                    f"its kernels build at the warmup. {type(e).__name__}: {e}"
+                )
+        return wanted
 
     # Registration.
 
@@ -236,8 +301,11 @@ class KernelBuilder:
                 f"[KernelBuilder] {name}: {op}: {stats.summary()}"
                 for op, stats in sorted(self._stats.items())
             ]
+            pending = self._pending
         if lines and waited >= 0.1:
             lines.append(f"[KernelBuilder] {name}: waited {waited:.1f}s for the builds at its end")
+        if pending:
+            lines.append(f"[KernelBuilder] {name}: {pending} builds continue after it")
         return lines
 
     # Workers.

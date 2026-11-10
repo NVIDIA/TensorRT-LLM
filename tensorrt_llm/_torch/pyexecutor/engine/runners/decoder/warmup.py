@@ -304,6 +304,46 @@ class DecoderWarmup:
         with self._warmup_timer, KernelBuilder.get().build_pass("warmup"):
             return self._warmup_scheduled(resource_manager, kv_cache_manager)
 
+    def rehearse(self, resource_manager: ResourceManager) -> None:
+        """The MSA indexer prewarm and the attention warmup forwards, run eagerly on
+        whatever weights the model holds, inside the caller's KernelBuilder rehearsal.
+
+        Every rank calls it. Its requests are released and its workspaces freed.
+        """
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        if kv_cache_manager is None or not self._context_warmups_supported:
+            return
+        if self.mapping.cp_size > 1 and self.mapping.cp_config.get("cp_type") != CpType.HELIX:
+            return
+        AutoTuner.get()
+        can_run_general_warmup = self._agreement.agree_flag(
+            not self.mapping.has_cp_helix()
+            and self.guided_decoder is None
+            and not isinstance(kv_cache_manager, MambaHybridCacheManager)
+        )
+        from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
+        try:
+            # force_eager: no torch.compile traces, whole-model or op-level.
+            with (
+                torch.inference_mode(),
+                torch.compiler.set_stance("force_eager"),
+                self._torch_compile_bypass(),
+            ):
+                self._prewarm_minimax_m3_msa_indexer(kv_cache_manager)
+                self._run_attention_warmup(resource_manager, can_run_general_warmup)
+        except BaseException:
+            self._reset_moe_alltoall_state()
+            raise
+        finally:
+            torch.cuda.synchronize()
+            MoERunner.clear_all_workspaces()
+            clear_memory_buffers()
+            gc.collect()
+            torch.cuda.empty_cache()
+
     def _get_max_shape_warmup_requests(
         self, resource_manager: ResourceManager
     ) -> list[tuple[int, int]]:

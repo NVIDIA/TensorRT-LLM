@@ -12,8 +12,11 @@ of each call signature in a build pass, the plan and the run are replayed for on
 segment of every length in ``_QUERY_LENS``, with the package's variant lookup recording
 the variant it is asked for instead of compiling it. Each variant found is submitted to
 ``KernelBuilder``, whose workers compile it in the directory and under the file lock the
-package's own lookup uses. The first run in a build pass also submits the plan, split-KV
-reduction and sparse top-k modules, which need nothing from a call.
+package's own lookup uses. The plan, split-KV reduction and sparse top-k modules need
+nothing from a call: ``reaches`` submits them, or else the first run in a build pass.
+
+In a rehearsal every run is such a replay: it compiles and launches nothing, and its
+outputs hold zeros and an empty maximum score.
 """
 
 from __future__ import annotations
@@ -101,6 +104,16 @@ class _Package:
                 sub_plan[_PLAN_ARGS] = (args, options)
         return plan_info
 
+    def submit_modules(self) -> None:
+        if self.modules_submitted:
+            return
+        self.modules_submitted = True
+        builder = KernelBuilder.get()
+        for name, library, compile_fn in _MODULES:
+            builder.submit(
+                _OP, name, functools.partial(self.build_module, name, library, compile_fn)
+            )
+
     def run(self, q, k, v, plan_info, *args, **kwargs):
         builder = KernelBuilder.get()
         if (
@@ -109,12 +122,7 @@ class _Package:
             and isinstance(plan_info, tuple)
             and not torch.cuda.is_current_stream_capturing()
         ):
-            if not self.modules_submitted:
-                self.modules_submitted = True
-                for name, library, compile_fn in _MODULES:
-                    builder.submit(
-                        _OP, name, functools.partial(self.build_module, name, library, compile_fn)
-                    )
+            self.submit_modules()
             planned = next(
                 (p[_PLAN_ARGS] for p in plan_info[3:] if isinstance(p, dict) and _PLAN_ARGS in p),
                 None,
@@ -136,7 +144,28 @@ class _Package:
                     signature,
                     functools.partial(self._list, q, k, v, plan_args, plan_options, run_options),
                 )
+        if builder.rehearsing():
+            return self._rehearse(q, k, v, plan_info, *args, **kwargs)
         return self.run_fn(q, k, v, plan_info, *args, **kwargs)
+
+    def _rehearse(self, q, k, v, plan_info, *args, **kwargs):
+        """The package's run with its variant and split-KV reduction stubbed; its outputs
+        are set to what a run over no keys gives: zeros and a maximum score of -inf."""
+        _replay.found = {}
+        try:
+            result = self.run_fn(q, k, v, plan_info, *args, **kwargs)
+        finally:
+            _replay.found = None
+        out, max_score = result if isinstance(result, tuple) else (result, None)
+        for tensor, value in (
+            (out, 0.0),
+            (kwargs.get("out"), 0.0),
+            (max_score, float("-inf")),
+            (kwargs.get("max_score"), float("-inf")),
+        ):
+            if isinstance(tensor, torch.Tensor):
+                tensor.fill_(value)
+        return result
 
     def _list(self, q, k, v, plan_args, plan_options, run_options) -> List[Tuple[str, Callable]]:
         """Replay the plan and the run for each query length; return the variants asked for.
@@ -227,6 +256,26 @@ class _Package:
         if getattr(_replay, "found", None) is not None:
             return _Stub()
         return self.reduction_fn()
+
+
+def reaches(model_config: Any) -> bool:
+    """True when the model runs MiniMax-M3's MSA attention on fmha_sm100, whose modules
+    are then submitted."""
+    from tensorrt_llm._utils import is_sm_100f
+    from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
+
+    from .msa_utils import msa_package_available, require_msa_module
+
+    config = getattr(model_config, "sparse_attention_config", None)
+    if not isinstance(config, MiniMaxM3SparseAttentionConfig) or config.implementation != "msa":
+        return False
+    if not is_sm_100f() or not msa_package_available():
+        return False
+    require_msa_module()
+    if _package is None:
+        return False
+    _package.submit_modules()
+    return True
 
 
 def install(module: types.ModuleType) -> None:

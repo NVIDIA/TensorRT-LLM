@@ -205,13 +205,17 @@ curl http://localhost:8000/server_info
 
 ### Kernel builds ahead of first use
 
-During the warmup, an op that compiles its kernels on first use lists them the first time
-it runs, and worker threads build them in parallel. Supported ops: MiniMax-M3's MSA
+An op that compiles its kernels on first use lists them the first time it runs, and worker
+threads build them in parallel. For a model with such an op, the engine first loads dummy
+weights and runs the attention warmup forwards on them, then loads the checkpoint while the
+kernels build. The startup log shows these as the `rehearsal` and `checkpoint` phases, which
+`model_engine_creation_seconds` then does not include. Supported ops: MiniMax-M3's MSA
 attention (`fmha_sm100`).
 
 | Environment variable | Default | Effect |
 |----------------------|---------|--------|
 | `TLLM_KERNEL_BUILDER` | `1` | `0` compiles each kernel on its first use instead. |
+| `TLLM_KERNEL_BUILDER_REHEARSAL` | `1` | `0` loads the checkpoint first; the kernels then build from the warmup on. |
 | `TLLM_KERNEL_BUILDER_THREADS` | `8` | Worker threads per process. |
 
 ## Unified Cache for Compiled Artifacts

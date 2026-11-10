@@ -2,10 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """KernelBuilder: builds listed by an op on first sight, run on worker threads."""
 
+import sys
 import threading
+import types
 
 import pytest
 
+from tensorrt_llm._torch import kernel_builder
 from tensorrt_llm._torch.kernel_builder import KernelBuilder
 
 pytestmark = pytest.mark.cpu_only
@@ -97,11 +100,50 @@ def test_the_op_waits_for_a_build_in_flight():
     assert (stats.built, stats.waited, stats.waited_s, stats.late) == (1, 1, 5.0, 0)
 
 
+def test_a_rehearsal_leaves_its_builds_running_for_the_next_pass():
+    builder = KernelBuilder(threads=1, enabled=True)
+    release = threading.Event()
+
+    def slow():
+        release.wait(timeout=30)
+        return True
+
+    assert not builder.rehearsing()
+    with builder.rehearsal():
+        assert builder.rehearsing() and builder.active()
+        builder.prebuild("op", "sig", lambda: [("k", slow)])
+    # The rehearsal did not wait: the build is still running.
+    assert not builder.rehearsing() and not builder.active()
+    assert builder.state("op", "k") == "queued"
+    release.set()
+    with builder.build_pass("warmup"):
+        # The signature was listed in the rehearsal.
+        builder.prebuild("op", "sig", lambda: pytest.fail("listed twice"))
+    # The warmup pass waited for it.
+    assert builder.state("op", "k") == "done"
+
+
+def test_the_rehearsal_runs_for_a_model_an_op_family_reaches(monkeypatch):
+    reached = []
+    family = types.ModuleType("family")
+    family.reaches = lambda model_config: reached.append(model_config) or model_config == "msa"
+    monkeypatch.setitem(sys.modules, "family", family)
+    monkeypatch.setattr(kernel_builder, "_FAMILIES", {"op": "family:reaches"})
+    builder = KernelBuilder(threads=1, enabled=True)
+    assert builder.wants_rehearsal("msa")
+    assert not builder.wants_rehearsal("dense")
+    assert reached == ["msa", "dense"]
+    assert not KernelBuilder(threads=1, enabled=True, rehearse=False).wants_rehearsal("msa")
+    assert not KernelBuilder(threads=1, enabled=False).wants_rehearsal("msa")
+
+
 def test_disabled():
     builder = KernelBuilder(threads=1, enabled=False)
     listed = []
     with builder.build_pass("test"):
         assert not builder.active()
         builder.prebuild("op", "sig", lambda: listed.append(True) or [])
+    with builder.rehearsal():
+        assert not builder.rehearsing()
     assert listed == []
     assert not builder.submit("op", "k", lambda: True)

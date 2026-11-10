@@ -53,6 +53,40 @@ def test_listing_replays_every_query_length_without_compiling(fmha_sm100, monkey
     assert jit._variant_manager._run_template is not None
 
 
+def test_a_rehearsal_run_lists_and_launches_nothing(fmha_sm100, monkeypatch):
+    from fmha_sm100 import jit
+
+    def no_compile(name, params):
+        raise AssertionError(f"compiled {name}")
+
+    monkeypatch.setattr(jit._variant_manager, "_compile_only", no_compile)
+    builder = kernel_builder.KernelBuilder.get()
+    submitted = []
+    monkeypatch.setattr(builder, "submit", lambda op, key, build: submitted.append(key) or True)
+    page_size = head_dim = 128
+    num_heads, num_kv_heads, qo_len = 8, 1, 100
+    q = torch.ones(qo_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.ones(4, num_kv_heads, page_size, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv_indices = torch.arange(4, dtype=torch.int32, device="cuda")
+    lens = torch.tensor([qo_len], dtype=torch.int32)
+    out = torch.full_like(q, float("nan"))
+    with builder.rehearsal():
+        plan = fmha_sm100.fmha_sm100_plan(
+            lens,
+            lens.clone(),
+            num_heads,
+            num_kv_heads=num_kv_heads,
+            page_size=page_size,
+            num_kv_splits=1,
+            causal=True,
+        )
+        fmha_sm100.fmha_sm100(q, k, k, plan, kv_indices=kv_indices, out=out, output_maxscore=False)
+    # The run listed its variants, compiled none, and left zeros where its output goes.
+    modules = {name for name, _, _ in msa_kernel_builds._MODULES}
+    assert len([key for key in submitted if key not in modules]) >= 2
+    assert torch.equal(out, torch.zeros_like(out))
+
+
 def test_kernels_are_built_once_where_the_package_loads_them(fmha_sm100, monkeypatch, tmp_path):
     from fmha_sm100 import jit
 

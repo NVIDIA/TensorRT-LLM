@@ -67,6 +67,7 @@ from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .model_engine import ModelEngine
 from .model_loader import ModelLoader, construct_checkpoint_loader
 from .py_executor import PyExecutor
+from .rehearsal import rehearse
 from .scheduler import gen_preemption
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
@@ -939,6 +940,11 @@ def _create_py_executor(
             model_weights_restore_mode = sleep_config.restore_modes[
                 ExecutorMemoryType.MODEL_WEIGHTS_MAIN]
 
+        # A model a KernelBuilder rehearsal reaches is built on dummy weights; its
+        # checkpoint loads after the rehearsal below. Not with what takes the
+        # weights over as they load (DWDP) or captures graphs on them (the
+        # multimodal encoders' CUDA graphs).
+        mm_config = llm_args.multimodal_config
         model_engine = ModelEngine(
             model_path=checkpoint_dir,
             llm_args=llm_args,
@@ -949,6 +955,10 @@ def _create_py_executor(
             checkpoint_loader=checkpoint_loader,
             model_weights_memory_tag=model_weights_memory_tag,
             model_weights_restore_mode=model_weights_restore_mode,
+            defer_checkpoint=(dwdp_manager is None
+                              and dense_dwdp_manager is None
+                              and (mm_config is None
+                                   or not mm_config.encoder_cuda_graph)),
         )
 
     is_generation = model_engine.model.model_config.is_generation
@@ -1343,6 +1353,12 @@ def _create_py_executor(
             skip_est=skip_est,
             is_disagg=is_disagg,
         )
+
+        if model_engine.has_deferred_checkpoint:
+            with _startup_timer.phase("rehearsal"):
+                rehearse(model_engine, kv_cache_creator)
+            with _startup_timer.phase("checkpoint"):
+                model_engine.load_deferred_checkpoint()
 
         if not skip_est:
             log_memory_usage("after loading weights")

@@ -21,6 +21,7 @@ module-scope import here would close a cycle.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 from types import ModuleType
 from typing import TYPE_CHECKING, Optional
@@ -147,7 +148,10 @@ def _aligned_nvfp4_dequant_scales(
     if cache.device != kv_scale_quant_orig.device:
         raise ValueError("MiniMax-M3 NVFP4 scale reload must preserve the scale buffer device")
     if refresh or getattr(attn, "_msa_nvfp4_dequant_scale_source_ptr", None) != source_ptr:
-        cache[:, 0].copy_(kv_scale_quant_orig[1:3])
+        # A buffer a forward created is an inference tensor, which only inference mode
+        # may update in place.
+        with torch.inference_mode() if cache.is_inference() else contextlib.nullcontext():
+            cache[:, 0].copy_(kv_scale_quant_orig[1:3])
         attn._msa_nvfp4_dequant_scale_source_ptr = source_ptr
 
     k_global_scale = cache[0, :1]
