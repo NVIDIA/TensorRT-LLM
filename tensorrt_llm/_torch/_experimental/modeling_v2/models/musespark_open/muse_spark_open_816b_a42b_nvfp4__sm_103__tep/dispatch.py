@@ -411,6 +411,19 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     ),
     FastPath("fused_accept", "acceptance and forced acceptance in one launch", "draft"),
     FastPath("drafter_fixed_gemms", "drafter GEMMs on fixed low-M tactics", "draft"),
+    FastPath(
+        "drafter_conv_epilogue",
+        "the drafter coefficient GEMM of 9..32-row blocks with the input-side convolution in "
+        "its epilogue",
+        "draft",
+        ("drafter_block_conv", "drafter_fixed_gemms"),
+    ),
+    FastPath(
+        "drafter_finish_norm",
+        "each drafter hop's finish convolution, residual add and RMSNorm as one launch",
+        "draft",
+        ("drafter_block_decode",),
+    ),
     FastPath("context_kv_fork", "drafter context-K/V store on a side stream", "draft"),
     FastPath(
         "drafter_fused_prep",

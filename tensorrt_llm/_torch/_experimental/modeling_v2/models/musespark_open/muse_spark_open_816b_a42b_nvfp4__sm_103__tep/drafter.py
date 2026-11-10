@@ -22,7 +22,13 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
     if block_conv or block_decode:
         from .kernels.drafter_block_decode import block_decode as _draft
 
-        _draft.install(shell.llm.draft_model, block_conv, block_decode)
+        _draft.install(
+            shell.llm.draft_model,
+            block_conv,
+            block_decode,
+            conv_epilogue=plan.enabled("drafter_conv_epilogue"),
+            finish_norm=plan.enabled("drafter_finish_norm"),
+        )
     if plan.enabled("wide_drafter_window_attention"):
         # On the block decode drafter_block_decode just bound.
         from .kernels.wide_drafter_window_attention import attention as _wide_window

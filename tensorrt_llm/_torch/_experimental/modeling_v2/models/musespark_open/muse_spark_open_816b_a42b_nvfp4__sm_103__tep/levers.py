@@ -136,6 +136,8 @@ RETIRED: Mapping[str, str] = types.MappingProxyType(
         "TRTLLM_MUSESPARK_TEP8_EXPERTS_INTERLEAVED_FETCH": (
             PREFIX + "TEP8_EXPERTS_INTERLEAVED_FETCH=on"
         ),
+        "TRTLLM_MUSESPARK_DRAFTER_CONV_EPILOGUE": PREFIX + "DRAFTER_CONV_EPILOGUE=on",
+        "TRTLLM_MUSESPARK_DRAFTER_FINISH_NORM": PREFIX + "DRAFTER_FINISH_NORM=on",
     }
 )
 #: Name prefixes only retired switches carry; any other name under them raises too.
@@ -704,6 +706,9 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         "tep8_experts_interleaved_fetch": _ported_tep8(
             Kind.FLAGGED, "the expert kernel's interleaved weight fetch"
         ),
+        # New this round: default off, not covered by the TP8 default-on gate.
+        "drafter_conv_epilogue": _ported(Kind.BITWISE),
+        "drafter_finish_norm": _ported(Kind.BITWISE),
         **{name: _tep4_path_rule() for name in TEP4_PATHS},
     }
 )
