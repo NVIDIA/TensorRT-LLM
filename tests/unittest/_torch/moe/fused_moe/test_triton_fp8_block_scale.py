@@ -233,9 +233,9 @@ def _local_slot_inputs(
 
 
 def _assert_matches_reference(out: torch.Tensor, ref: torch.Tensor, name: str) -> None:
-    """Cosine difference of the whole output and of every token, so that one
-    wrong or missing row cannot hide in the aggregate, and the ratio of the
-    norms, which the cosine difference barely sees: 10% too large is 4.5e-3."""
+    """Cosine difference and norms of the whole output and of every token, so
+    that one wrong, missing or wrongly scaled row cannot hide in the aggregate.
+    The cosine difference barely sees scale: 10% too large is 4.5e-3."""
     diff = calc_diff(out, ref).item()
     assert diff < 1e-2, f"shape={name} cosine-diff={diff:.4e} exceeds 1e-2"
     norm_ratio = (out.double().norm() / ref.double().norm()).item()
@@ -253,6 +253,15 @@ def _assert_matches_reference(out: torch.Tensor, ref: torch.Tensor, name: str) -
     worst_diff = row_diff[worst].item()
     assert worst_diff < 1e-2, (
         f"shape={name} token {worst} cosine-diff={worst_diff:.4e} exceeds 1e-2"
+    )
+
+    # Rows the reference leaves near zero are held to a bound relative to the
+    # largest row instead.
+    out_norms, ref_norms = x.norm(dim=-1), y.norm(dim=-1)
+    excess = (out_norms - ref_norms).abs() - (5e-2 * ref_norms + 1e-2 * ref_norms.max())
+    worst = excess.argmax().item()
+    assert excess[worst] <= 0, (
+        f"shape={name} token {worst} norm {out_norms[worst]:.4e}, reference {ref_norms[worst]:.4e}"
     )
 
 
@@ -440,5 +449,22 @@ def test_prewarm_tunes_each_tile_height_once(
         2 * len(token_counts)
     )
     assert calls == token_counts * 2
-    # top_k is a constexpr of the GEMM kernels, so another top_k compiles anew.
-    assert prewarm(_prewarm_stub(intermediate=512, use_dp=use_dp, top_k=1), max_num_tokens, False)
+
+
+@pytest.mark.cpu_only
+def test_prewarm_tunes_each_top_k(monkeypatch) -> None:
+    """top_k is a constexpr of the GEMM kernels, so a layer of the same shapes
+    and another top_k is tuned again, at both tile heights."""
+    calls = []
+    monkeypatch.setattr(
+        triton_impl, "run_triton_fp8_block_scale_moe", lambda x, *a, **kw: calls.append(x.shape[0])
+    )
+    monkeypatch.setattr(triton_impl, "_prewarmed_gemm_keys", set())
+    prewarm = triton_impl.TrtllmTritonFp8BlockScalesImpl.prewarm_decode_kernels
+
+    for top_k in (2, 1):
+        layer = _prewarm_stub(intermediate=512, use_dp=False, top_k=top_k)
+        assert prewarm(layer, 4096, False) == 4
+        assert prewarm(layer, 4096, False) == 0
+    # 4,096 tokens take the large tile at either top_k.
+    assert calls == [1, 4096, 1, 4096]
