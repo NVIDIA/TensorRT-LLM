@@ -479,7 +479,7 @@ def _rmsnorm_rope_batched(
     return t
 
 
-def _dspark_attention_forward_legacy(
+def dspark_attention_forward(
     x: torch.Tensor,
     main_x: torch.Tensor,
     start_pos: int,
@@ -662,7 +662,7 @@ def dspark_attention_forward_batched(
     This path belongs to the embedded DeepSeek-V4-Pro draft. Standalone DSpark
     drafters (including Kimi-K3-DSpark) use the DFlash paged-KV decode instead.
 
-    Numerically identical, per request, to :func:`_dspark_attention_forward_legacy`, but
+    Numerically identical, per request, to :func:`dspark_attention_forward`, but
     free of host syncs and data-dependent shapes so it can be captured into a CUDA
     graph (the one-engine drafter runs inside the target's graph). The differences
     from the scalar path are purely mechanical:
@@ -1600,7 +1600,7 @@ class DSv4DSparkDraftModel(nn.Module):
         """Write captured-context ``main_kv`` into the rolling per-stage KV windows.
 
         Replicates exactly the per-position context write that
-        :func:`_dspark_attention_forward_legacy` performs each generation step
+        :func:`dspark_attention_forward` performs each generation step
         (``main_kv = RoPE_pos(rmsnorm(wkv @ main_x))`` written at
         ``window[pos % window_size]``), but for an arbitrary set of
         ``(captured-hidden, position)`` pairs. Used to (a) seed a request's
@@ -1801,7 +1801,7 @@ class DSv4DSparkDraftModel(nn.Module):
                 **self._attn_params,
             )
         else:
-            attn = _dspark_attention_forward_legacy(
+            attn = dspark_attention_forward(
                 layer_input,
                 main_x,
                 start_pos,
@@ -4246,6 +4246,7 @@ __all__ = [
     "precompute_dspark_freqs_cis",
     "apply_dspark_rotary",
     "apply_dspark_rotary_batched",
+    "dspark_attention_forward",
     "dspark_attention_forward_batched",
     # Block draft I/O.
     "build_draft_input_ids",

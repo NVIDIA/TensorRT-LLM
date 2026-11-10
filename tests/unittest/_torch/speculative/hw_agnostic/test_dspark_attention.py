@@ -30,10 +30,10 @@ import torch.nn.functional as F
 import tensorrt_llm._torch.models.modeling_dspark as modeling_dspark
 from tensorrt_llm._torch.models.modeling_dspark import (
     DSv4DSparkDraftModel,
-    _dspark_attention_forward_legacy,
     _output_projection,
     _qkv_projections,
     apply_dspark_rotary,
+    dspark_attention_forward,
     dspark_sparse_attn,
     get_dspark_topk_idxs,
     precompute_dspark_freqs_cis,
@@ -487,7 +487,7 @@ def _make_attn_inputs(seed=0):
 
 
 def _run(g):
-    return _dspark_attention_forward_legacy(
+    return dspark_attention_forward(
         g["x"],
         g["main_x"],
         g["start_pos"],
@@ -1250,7 +1250,7 @@ def test_rolling_attention_uses_projection_modules(monkeypatch, batched):
         args = (torch.full((g["b"],), g["start_pos"]),)
         tail = (torch.arange(g["b"]),)
     else:
-        fn = _dspark_attention_forward_legacy
+        fn = dspark_attention_forward
         args = (g["start_pos"],)
         tail = ()
     expected = fn(g["x"], g["main_x"], *args, expected_cache, *tail, **weights)
