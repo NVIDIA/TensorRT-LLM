@@ -7223,7 +7223,40 @@ def _seed(cell) -> None:
     torch.manual_seed(zlib.crc32(cell.why.encode()))
 
 
-def _cell_paged(cell, arm) -> None:
+def _compare_split_softmax(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """The e4m3 band for 8 q heads per kv head at d128 over an fp8 pool, where the decode
+    kernel rounds the softmax probabilities against maxima `reference` cannot reproduce.
+
+    On the e4m3 paths the probabilities are an MMA operand: `exp(s - m)` scaled by 448 and
+    rounded to e4m3, `m` a running maximum. `reference` takes `m` as the row's maximum. The
+    `QkvE4m3` decode kernels at this geometry instead deal 128-key tiles round-robin to two
+    softmax groups, each with its own running maximum, and split a long KV range across CTAs
+    in chunks whose count the launch heuristic picks -- not something a reference should
+    encode. Within one tile the two agree.
+
+    So the band is e4m3's own rounding. A key whose group maximum is not the row maximum is
+    rounded independently on the two sides. e4m3's relative rounding error is uniform within
+    half its 2^-3 mantissa spacing, RMS 2^-4 * sqrt(0.541 / 3) = 0.0265 over log-uniform
+    mantissas, so two independent roundings differ by 0.0375 RMS, carried straight into the
+    output: 9.6 bf16 ulp of relative RMS when every key differs, the ceiling. Gated at 12.
+    Element-wise 2^-4 of the row scale, 16 ulp. Measured before the rebase onto
+    FallbackFmha: 10 ulp worst at this geometry, outside `_compare`'s 8, inside this band.
+
+    What it still separates: a wrong scale, page, kv head or mask moves the output by O(1).
+    """
+    assert_within_ulp(out, ref, element_ulp=16.0, rms_ulp=12.0, ulp=ULP[torch.bfloat16])
+
+
+def _e4m3_compare_for(spec):
+    """The band a paged cell's output is gated in: `_compare_split_softmax` for the
+    Nemotron-3 Ultra BF16 checkpoint's 8:1 d128 geometry over an fp8 pool, `_compare`
+    for every other cell."""
+    fp8 = bool(spec["quant_mode"] & QUANT_MODE_FP8_KV_CACHE)
+    geometry = (spec["num_heads"], spec["num_kv_heads"], spec["head_size"])
+    return _compare_split_softmax if fp8 and geometry == (8, 1, 128) else _compare
+
+
+def _cell_paged(cell, arm, compare=_compare) -> None:
     """A standard-configuration cell over a single-layer paged pool.
 
     A first, uncertified context call fills each sequence's `cached` tokens;
@@ -7289,7 +7322,7 @@ def _cell_paged(cell, arm) -> None:
     ref = _op_reference(
         env, qkv, list(new), rids, causal=causal, e4m3=e4m3, window=spec["window"], nvfp4=nvfp4
     )
-    _compare(out, ref)
+    compare(out, ref)
     for rid in rids:
         env.check_cache(rid)
     env.check_unwritten_pool_zero()
@@ -7424,6 +7457,110 @@ def _spread(batch: int, longest: int) -> tuple[int, ...]:
 
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+#: Nemotron-3 Ultra BF16's attention layer at tp8, per rank: the 64 q / 2 kv heads split eight
+#: ways are 8 q heads over one kv head (each kv head replicated across four ranks), head_size
+#: 128, no positional encoding, a bf16 pool. Pool sizes are chosen: 48 block-offset columns per
+#: sequence (1536 tokens) and 32 rows, the targets' smallest CUDA-graph batch ceiling.
+_ULTRA_BF16_8_1_128 = dict(
+    input_type=STANDARD,
+    num_heads=8,
+    num_kv_heads=1,
+    head_size=128,
+    v_head_dim=128,
+    sinks=False,
+    window=None,
+    quant_mode=0,
+    mask_type=1,
+    tokens_per_block=32,
+    num_blocks=640,
+    max_num_requests=32,
+    max_blocks_per_seq=48,
+    use_paged_context_fmha=False,
+)
+#: The same layer over an fp8-e4m3 pool at unit kv scales (`kv_cache_config.dtype: fp8`), which
+#: only the tp8ep2 target binds.
+_ULTRA_BF16_FP8KV_8_1_128 = dict(_ULTRA_BF16_8_1_128, quant_mode=QM_FP8_KV_CACHE, kv_scale=1.0)
+#: The 32 histories of the batch-32 decode cells: every one past its first page, from 33 (one
+#: row into the second page) up to 512, with page fills that differ.
+_ULTRA_DECODE_HISTORIES = tuple(33 + (i * 97) % 480 for i in range(32))
+#: 256 decode rows (the BF16 targets' serving envelope), histories 33..1500: 6257 pages.
+_ULTRA_DECODE_HISTORIES_256 = tuple(33 + (i * 97) % 1468 for i in range(256))
+_ULTRA_256 = dict(max_num_requests=256, num_blocks=6400)
+
+
+def _ultra_bf16_cells(base: dict, label: str, mixed_packed: bool) -> tuple[Cell, ...]:
+    """The call sites of one Ultra BF16 pool: packed prefill, decode at 1, 32 and 256 rows,
+    a packed mixed step (bf16 pool only: over an fp8 pool a packed call reads its context rows
+    in bf16 and its generation rows in e4m3, which one comparison cannot gate), and the
+    paged-context prefill of chunked prefill."""
+    cells = (
+        Cell(
+            why=f"nemotron_h ultra {label} packed prefill: GQA 8q/1kv d128, no rope; fresh "
+            "contexts of 1, 1100, 77 and 300 rows",
+            spec=dict(
+                base,
+                cached=(0, 0, 0, 0),
+                new=(1, 1100, 77, 300),
+                num_contexts=4,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why=f"nemotron_h ultra {label} decode, batch 1: one row over an 1100-token history",
+            spec=dict(base, cached=(1100,), new=(1,), num_contexts=0, predicted_tokens_per_seq=1),
+        ),
+        Cell(
+            why=f"nemotron_h ultra {label} decode, batch 32: histories 33..512",
+            spec=dict(
+                base,
+                cached=_ULTRA_DECODE_HISTORIES,
+                new=(1,) * 32,
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why=f"nemotron_h ultra {label} decode, batch 256, the serving envelope's "
+            "CUDA-graph ceiling: histories 33..1500",
+            spec=dict(
+                base,
+                **_ULTRA_256,
+                cached=_ULTRA_DECODE_HISTORIES_256,
+                new=(1,) * 256,
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+        Cell(
+            why=f"nemotron_h ultra {label} paged-context prefill (chunked prefill): 512 rows "
+            "over a 640-token cached prefix beside a fresh 1-row context",
+            spec=dict(
+                base,
+                use_paged_context_fmha=True,
+                cached=(640, 0),
+                new=(512, 1),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+    )
+    if not mixed_packed:
+        return cells
+    return cells + (
+        Cell(
+            why=f"nemotron_h ultra {label} mixed step, packed: fresh 1- and 1031-row contexts "
+            "ahead of six decode rows over histories 33..700",
+            spec=dict(
+                base,
+                cached=(0, 0, 33, 64, 65, 200, 511, 700),
+                new=(1, 1031, 1, 1, 1, 1, 1, 1),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+            ),
+        ),
+    )
+
+
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
     "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
         Cell(
@@ -7904,6 +8041,14 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ),
         ),
     ),
+    # Both BF16 targets bind the bf16 pool; the cells sit under tep8, the duplicates under
+    # tp8ep2 would run once anyway. Only tp8ep2 binds the fp8 pool.
+    "nemotron_h/nemotron3_ultra_bf16__sm_100__tep8": _ultra_bf16_cells(
+        _ULTRA_BF16_8_1_128, "BF16 tp8", mixed_packed=True
+    ),
+    "nemotron_h/nemotron3_ultra_bf16__sm_100__tp8ep2": _ultra_bf16_cells(
+        _ULTRA_BF16_FP8KV_8_1_128, "BF16 tp8 fp8KV", mixed_packed=False
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)
@@ -7930,7 +8075,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     elif "pool_layout" in spec:
         _cell_layered(cell, certifying)
     elif "cached" in spec:
-        _cell_paged(cell, certifying)
+        _cell_paged(cell, certifying, _e4m3_compare_for(spec))
     elif kind == STANDARD:
         _cell_standard(cell)
     elif kind == MLA_CONTEXT:

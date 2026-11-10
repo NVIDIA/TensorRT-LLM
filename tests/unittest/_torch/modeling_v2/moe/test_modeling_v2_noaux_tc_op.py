@@ -14,18 +14,58 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op impor
 
 __extra_import_path__ = [".."]
 from _cells import certified_cells  # noqa: E402 — needs the path declared above
-from _validating import validating  # noqa: E402 — needs the path declared above
+from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "noaux_tc_op requires a CUDA device"
 
 
 def _build(spec, seed):
+    """One cell's arguments. `logit_std` scales the logits and `bias` draws a synthetic
+    correction bias (`("uniform", lo, hi)`, or `("levels", lo, hi, n)`: n evenly spaced
+    values); without them the draws are the standard normal ones every other cell uses."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     logits = torch.randn(
         spec["tokens"], spec["experts"], generator=g, device="cuda", dtype=torch.float32
-    ).to(spec.get("logits_dtype", torch.bfloat16))
-    bias = torch.randn(spec["experts"], generator=g, device="cuda", dtype=torch.float32)
+    )
+    if "logit_std" in spec:
+        logits = logits * spec["logit_std"]
+    logits = logits.to(spec.get("logits_dtype", torch.bfloat16))
+    kind, *params = spec.get("bias", ("normal",))
+    if kind == "normal":
+        bias = torch.randn(spec["experts"], generator=g, device="cuda", dtype=torch.float32)
+    elif kind == "uniform":
+        lo, hi = params
+        bias = torch.rand(spec["experts"], generator=g, device="cuda") * (hi - lo) + lo
+    else:
+        assert kind == "levels", f"unknown bias kind {kind!r}"
+        lo, hi, n = params
+        levels = torch.linspace(lo, hi, n, device="cuda", dtype=torch.float32)
+        pick = torch.randint(n, (spec["experts"],), generator=g, device="cuda")
+        bias = levels[pick]
     return logits, bias, spec["n_group"], spec["topk_group"], spec["topk"], spec["scale"]
+
+
+#: The weights band of the cells that name one, here Nemotron-3 Ultra's router (top-22 of
+#: 512, scale 5.0, fp32 logits). The kernel sums the 22 selected weights as a tree in fp32
+#: (relative error at most 5u, u = 2^-24) and `reference` sums them in fp32 in torch's own
+#: order (at most 5u more), then each side divides and scales with a rounding or two: about
+#: 14u of each weight, 7 ULP (ULP = 2u) of the row's largest. Gated at 8, element-wise and
+#: RMS; a wrong expert or a wrong scale moves a weight by orders of magnitude more.
+_ULTRA_WEIGHT_BAND = dict(element_ulp=8.0, rms_ulp=8.0)
+
+#: Nemotron-3 Ultra's router: one group, top-22 of 512 experts, scale 5.0, fp32 logits. The
+#: BF16 release's correction biases sit near 25.31 (layer 1, 23 distinct values over 0.0022)
+#: and 38 (layer 107, 394 values over 0.35); the synthetic draws below reproduce those ranges
+#: rather than read the 1.1 TB checkpoint.
+_ULTRA_ROUTER = dict(
+    experts=512,
+    n_group=1,
+    topk_group=1,
+    topk=22,
+    scale=5.0,
+    logits_dtype=torch.float32,
+    weight_band=_ULTRA_WEIGHT_BAND,
+)
 
 
 # The shapes each shipped target calls this entry with, by target directory
@@ -50,6 +90,30 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ),
         ),
     ),
+    "nemotron_h/nemotron3_ultra_bf16__sm_100__tep8": (
+        Cell(
+            why="nemotron-3 ultra BF16 prefill, 8192 tokens, layer 107's bias range: above 256 "
+            "tokens the kernel switches to its single-warp iterated top-k",
+            spec=dict(_ULTRA_ROUTER, tokens=8192, logit_std=1.3, bias=("uniform", 37.83, 38.18)),
+        ),
+        Cell(
+            why="nemotron-3 ultra BF16 layer 1's bias range at its own logit scale: scores "
+            "crowd 0.5 and the 23 bias levels decide near-ties",
+            spec=dict(
+                _ULTRA_ROUTER, tokens=8192, logit_std=0.004, bias=("levels", 25.3119, 25.3141, 23)
+            ),
+        ),
+        Cell(
+            why="nemotron-3 ultra BF16 decode at 256 tokens, the serving envelope's ceiling "
+            "and the last row count the small-batch top-k serves",
+            spec=dict(_ULTRA_ROUTER, tokens=256, logit_std=1.3, bias=("uniform", 37.83, 38.18)),
+        ),
+        Cell(
+            why="nemotron-3 ultra BF16 decode at 32 tokens, where the fp32 bias add keeps the "
+            "score only to 2^-18",
+            spec=dict(_ULTRA_ROUTER, tokens=32, logit_std=1.3, bias=("uniform", 37.83, 38.18)),
+        ),
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)
@@ -66,7 +130,10 @@ def test_certified_cells(cell) -> None:
     # not, and a near-miss here is a different set of experts, not a rounding.
     assert torch.equal(ids, ref_ids), "selected experts differ from the reference"
     assert ids.dtype is torch.int32
-    torch.testing.assert_close(weights, ref_weights)
+    if "weight_band" in cell.spec:
+        assert_within_ulp(weights, ref_weights, **cell.spec["weight_band"])
+    else:
+        torch.testing.assert_close(weights, ref_weights)
 
 
 def test_the_sigmoid_is_the_tanh_form() -> None:
