@@ -139,6 +139,25 @@ public:
     virtual bool decode(LayerGroupId layerGroupId, void const* srcBasePtr, PageIndexPair const* pageIndices,
         size_t numBasePages, cudaStream_t stream) noexcept
         = 0;
+
+    //! Whether encodePools() and decodePools() accept page-index arrays that differ between pools.
+    //!
+    //! Copy-based rebalancing with several pools in a hot pool group gives each pool its own slot ids ("bound
+    //! pools"), so one logical page has a different hot index in each pool. KVCM builds such an arena with a cold
+    //! tier only when the codec supports this. The default implementation does not.
+    [[nodiscard]] virtual bool supportsPerPoolPageIndices() const noexcept;
+
+    //! encode() with one page-index array per pool of the layer group's hot pool group, in pool order:
+    //! perPoolIndices[p][i] holds cold page i's index (the same in every array) and pool p's hot index for it.
+    //! Each array has numBasePages entries and follows the same location and lifetime rules as encode()'s.
+    //!
+    //! The default implementation calls encode() when every array is the same pointer and fails otherwise.
+    virtual bool encodePools(LayerGroupId layerGroupId, void* dstBasePtr, PageIndexPair const* const* perPoolIndices,
+        size_t numPools, size_t numBasePages, cudaStream_t stream) noexcept;
+
+    //! decode() with one page-index array per pool; see encodePools().
+    virtual bool decodePools(LayerGroupId layerGroupId, void const* srcBasePtr,
+        PageIndexPair const* const* perPoolIndices, size_t numPools, size_t numBasePages, cudaStream_t stream) noexcept;
 };
 
 //! Creates the lossless default codec that concatenates hot pools into one cold-page blob.

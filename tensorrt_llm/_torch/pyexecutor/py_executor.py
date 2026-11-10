@@ -6997,6 +6997,17 @@ class PyExecutor:
         """
         mgr = self.kv_cache_manager
 
+        if mgr.impl.init_config.pool_rebalance.in_place_relocation:
+            # Copy-based rebalancing, in place: adjust() copies the blocks of active requests on
+            # the execution stream's timeline and rewrites their block indices, so nothing is
+            # suspended. Quiescence is still required: no forward may be in flight.
+            try:
+                mgr.impl.adjust()
+            except OutOfPagesError as e:
+                logger.warning(f"KV pool adjust() failed: {e!r}")
+            self._kv_cache_capacity = self._read_kv_cache_capacity()
+            return
+
         paused: List[LlmRequest] = []
         for req in self.active_requests:
             if mgr.is_request_active(req.py_request_id):

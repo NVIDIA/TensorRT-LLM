@@ -26,6 +26,8 @@
 #include "kv_cache_manager_v2/utils/math.h"
 #include "tensorrt_llm/common/assert.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -35,6 +37,65 @@
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+
+// ---------------------------------------------------------------------------
+// SlotWindow — half-open range [begin, end) of slot ids a pool group owns.
+//
+// Ordinary pools always own [0, numSlots). With copy-based rebalancing every GPU
+// pool group addresses the same arena from the same base, so its ids are
+// arena-relative and the window starts wherever the group's part of the arena
+// does. A rebalance moves the window; ids of slots that stay inside it are kept.
+// ---------------------------------------------------------------------------
+struct SlotWindow
+{
+    SlotId begin{0};
+    SlotId end{0};
+
+    [[nodiscard]] SlotCount size() const noexcept
+    {
+        return end - begin;
+    }
+
+    [[nodiscard]] bool empty() const noexcept
+    {
+        return !(begin < end);
+    }
+
+    [[nodiscard]] bool contains(SlotId id) const noexcept
+    {
+        return id >= begin && id < end;
+    }
+
+    [[nodiscard]] bool contains(SlotWindow const& other) const noexcept
+    {
+        return other.begin >= begin && other.end <= end;
+    }
+
+    //! Overlap of two windows. When they are disjoint the result is empty and anchored at the larger
+    //! begin, which need not lie inside either window.
+    [[nodiscard]] SlotWindow intersect(SlotWindow const& other) const noexcept
+    {
+        SlotId const b = std::max(begin, other.begin);
+        SlotId const e = std::min(end, other.end);
+        return b < e ? SlotWindow{b, e} : SlotWindow{b, b};
+    }
+
+    //! Smallest window covering both.
+    [[nodiscard]] SlotWindow hull(SlotWindow const& other) const noexcept
+    {
+        return SlotWindow{std::min(begin, other.begin), std::max(end, other.end)};
+    }
+
+    bool operator==(SlotWindow const& other) const noexcept
+    {
+        return begin == other.begin && end == other.end;
+    }
+
+    bool operator!=(SlotWindow const& other) const noexcept
+    {
+        return !(*this == other);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Slot — represents ownership of one allocated slot in a pool group.
@@ -131,44 +192,112 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// SlotAllocator — manages a fixed-capacity array of slot ids.
-// Mirrors _storage/_core.py::SlotAllocator.
+// SlotAllocator — manages the slot ids of one window [begin, end).
+// Mirrors _storage/_core.py::SlotAllocator, generalized to windows that need not
+// start at 0 and may move at either end (copy-based rebalancing).
+//
+// Ids are issued lazily: the ids handed out at least once form one contiguous
+// run inside the target window ("issued"), and new ids extend that run at the end
+// the growth direction prefers. Released ids are recycled before new ones are
+// issued. A shrink sets a smaller target window first; ids outside it are
+// overflow until every one of them has been released, then finishShrink() adopts
+// the target.
 // ---------------------------------------------------------------------------
 class SlotAllocator
 {
 public:
+    //! Which end of the window fresh ids are taken from.
+    //!
+    //! Under copy-based rebalancing a window's edges move, and any block sitting
+    //! next to a moving edge may have to be copied. Issuing ids away from the edge
+    //! that moves keeps that region cold for as long as possible.
+    enum class Growth
+    {
+        kAscending,  //!< from begin upward: the end edge is the one that moves
+        kDescending, //!< from end downward: the begin edge is the one that moves
+    };
+
+    //! Which free slot allocate() hands out.
+    enum class Recycling
+    {
+        //! A recycled slot whose ready event has completed, else a fresh id, else the oldest recycled slot.
+        //! Avoids waiting on pending work, but which id comes back depends on GPU timing.
+        kReadyFirst,
+        //! The oldest recycled slot, ready or not (the caller waits on its event); fresh ids only once none is
+        //! recycled. The slot layout then depends only on the sequence of allocations and releases, so ranks
+        //! that process the same requests (tensor parallelism) end up with identical layouts. Copy-based
+        //! rebalancing needs this: a window shrink vacates slots by position, so different layouts would
+        //! become different cache contents on different ranks.
+        kReleaseOrder,
+    };
+
     explicit SlotAllocator(SlotCount capacity);
+    SlotAllocator(SlotWindow window, Growth growth, Recycling recycling = Recycling::kReadyFirst);
     ~SlotAllocator();
 
     [[nodiscard]] SlotCount numFreeSlots() const noexcept;
     [[nodiscard]] SlotCount numOccupiedSlots() const noexcept;
 
+    //! Number of slots in the window (not an id bound unless the window starts at 0).
     [[nodiscard]] SlotCount numSlots() const noexcept
     {
-        return mCapacity;
+        return mWindow.size();
+    }
+
+    [[nodiscard]] SlotWindow window() const noexcept
+    {
+        return mWindow;
+    }
+
+    [[nodiscard]] SlotWindow targetWindow() const noexcept
+    {
+        return mTarget;
+    }
+
+    [[nodiscard]] Growth growth() const noexcept
+    {
+        return mGrowth;
+    }
+
+    [[nodiscard]] Recycling recycling() const noexcept
+    {
+        return mRecycling;
     }
 
     // SlotId is signed, so a bare `slot < numSlots()` admits negatives. Both ends are checked
     // here so no caller has to remember the lower one.
     [[nodiscard]] bool isValidSlotId(SlotId slot) const noexcept
     {
-        return slot >= SlotId{0} && slot < numSlots();
+        return mWindow.contains(slot);
     }
 
     Slot allocate();
     std::vector<Slot> allocateMultiple(SlotCount numSlots);
     void release(Slot slot);
 
+    //! Grow the window to newNumSlots, keeping its begin.
     void expand(SlotCount newNumSlots);
+    //! Grow the window to `window`, which must contain the current one.
+    void expandWindow(SlotWindow window);
+    //! Start shrinking the window to newNumSlots, keeping its begin.
     void prepareForShrink(SlotCount newNumSlots);
+    //! Start shrinking the window to `target`, which must lie inside the current one.
+    void prepareForShrinkWindow(SlotWindow target);
     bool finishShrink();
 
     [[nodiscard]] bool shrinkInProgress() const noexcept
     {
-        return mTargetCapacity < mCapacity;
+        return mTarget != mWindow;
     }
 
     [[nodiscard]] std::vector<SlotId> getSlotsBlockingShrink() const;
+
+    //! How many ids issued so far lie outside `target`; these must all be vacated before the
+    //! window can shrink to it.
+    [[nodiscard]] SlotCount numIssuedOutside(SlotWindow target) const noexcept;
+
+    //! Ids currently held by a Slot (allocated and not yet released), in ascending order.
+    [[nodiscard]] std::vector<SlotId> occupiedSlotIds() const;
 
     // Read-only accessors for debug assertions (mirrors Python's direct attribute access).
     [[nodiscard]] SlotCount numOverflowSlots() const noexcept
@@ -176,14 +305,21 @@ public:
         return slotCountValueFromSize(mOverflowSlots.size());
     }
 
+    //! Number of ids issued at least once and still inside the window.
     [[nodiscard]] SlotCount numActiveSlots() const noexcept
     {
-        return mNumActiveSlots;
+        return mIssued.size() + mNumIssuedOutsideTarget;
+    }
+
+    //! Issued ids outside the target window during a shrink; zero otherwise.
+    [[nodiscard]] SlotCount numIssuedOutsideTarget() const noexcept
+    {
+        return mNumIssuedOutsideTarget;
     }
 
     [[nodiscard]] SlotCount targetCapacity() const noexcept
     {
-        return mTargetCapacity;
+        return mTarget.size();
     }
 
     void synchronize();
@@ -191,13 +327,20 @@ public:
 private:
     void scrubEvents();
     [[nodiscard]] bool check() const noexcept;
+    [[nodiscard]] SlotId issueFreshId();
 
-    SlotCount mCapacity;
-    SlotCount mTargetCapacity;
-    SlotCount mNumActiveSlots;
+    SlotWindow mWindow;
+    SlotWindow mTarget;
+    //! Ids issued at least once that lie inside the target window: always one contiguous run.
+    SlotWindow mIssued;
+    //! Ids issued at least once that lie outside the target window (shrink in progress).
+    SlotCount mNumIssuedOutsideTarget = 0;
+    Growth mGrowth = Growth::kAscending;
+    Recycling mRecycling = Recycling::kReadyFirst;
     SlotCount mNumReadyRecycledSlots;
     std::deque<Slot> mRecycledSlots;
     std::vector<Slot> mOverflowSlots;
+    //! Indexed by slot id, so sized to the window's end rather than its size.
     DynamicBitset mOccupiedMask;
 };
 
@@ -249,11 +392,24 @@ public:
 
     virtual SlotCount numSlots() const noexcept = 0;
 
+    //! First slot id of the pool: its ids are [slotBegin(), slotBegin() + numSlots()).
+    [[nodiscard]] virtual SlotId slotBegin() const noexcept
+    {
+        return SlotId{0};
+    }
+
+    //! Exclusive bound on every slot id this pool can ever hold, at any size. Kernels index
+    //! the pool from baseAddress(), so views over it must extend this far.
+    [[nodiscard]] virtual SlotCount slotIdUpperBound() const noexcept
+    {
+        return numSlots();
+    }
+
     // SlotId is signed, so a bare `slot < numSlots()` admits negatives, which then convert to a
     // huge size_t offset. Both ends are checked here so no caller has to remember the lower one.
     [[nodiscard]] bool isValidSlotId(SlotId slot) const noexcept
     {
-        return slot >= SlotId{0} && slot < numSlots();
+        return slot >= slotBegin() && slot < slotBegin() + numSlots();
     }
 
     size_t numBytes() const noexcept
@@ -279,6 +435,27 @@ public:
     virtual void destroy() = 0;
     virtual void resize(SlotCount newNumSlots) = 0;
     virtual Address slotAddress(SlotId slot) const = 0;
+
+    //! Address of slot id 0, from which every slot address is base + id * slotSize. For an
+    //! arena pool that is the arena start, which may lie outside the pool's own window.
+    [[nodiscard]] virtual Address baseAddress() const
+    {
+        return slotAddress(SlotId{0});
+    }
+
+    //! Move the pool to `window`. Pools that are not arena-backed always start at 0.
+    virtual void setWindow(SlotWindow window)
+    {
+        TLLM_CHECK_WITH_INFO(window.begin == SlotId{0}, "Only arena pools have windows that do not start at 0");
+        resize(window.size());
+    }
+
+    //! Whether the pool addresses its slots through its own ids, bound to the group's slot ids
+    //! (see ArenaGpuSlotPool). Such a pool's window is not the group's window.
+    [[nodiscard]] virtual bool isBound() const noexcept
+    {
+        return false;
+    }
 
 protected:
     size_t mSlotSize;
@@ -313,6 +490,108 @@ public:
 
 private:
     VirtMem mVirtMem;
+};
+
+// ---------------------------------------------------------------------------
+// ArenaGpuSlotPool — a window into a GPU arena shared by every pool group.
+//
+// The pool owns no memory. Its slot ids are arena-relative, slot `id` lives at
+// arenaBase + id * slotSize, and the pool may use only ids inside its window.
+// Moving the window maps or unmaps nothing.
+//
+// In a group with several pools, pool 0's ids are the group's slot ids (the ids
+// V2 allocates and publishes). Every other pool is *bound*: it has its own ids
+// and window, and each group slot id in use is bound to one of them, so that each
+// pool can sit anywhere in the arena. slotAddress() takes a group slot id and
+// resolves the binding; a binding stays with its group slot id across allocation
+// and release, so it changes only when a rebalance moves the pool.
+// ---------------------------------------------------------------------------
+class ArenaGpuSlotPool : public SlotPoolBase
+{
+public:
+    //! `granularity` is the arena's allocation unit, the grain its bytes are counted in. `medium` is what the
+    //! arena's memory is (a host arena reuses this pool type), and `fill`, when set, is a host arena filled in
+    //! the background, which a slot must wait for before it is used.
+    ArenaGpuSlotPool(size_t slotSize, MemAddress arenaBase, size_t arenaBytes, SlotWindow window, size_t granularity,
+        CacheTier medium = CacheTier::GPU_MEM, HostMem const* fill = nullptr);
+
+    [[nodiscard]] size_t sizeGranularity() const noexcept override
+    {
+        return mGranularity;
+    }
+
+    [[nodiscard]] CacheTier medium() const noexcept override
+    {
+        return mMedium;
+    }
+
+    void waitSlotUsable(SlotId slot) const override;
+
+    SlotCount numSlots() const noexcept override
+    {
+        return mWindow.size();
+    }
+
+    SlotId slotBegin() const noexcept override
+    {
+        return mWindow.begin;
+    }
+
+    SlotCount slotIdUpperBound() const noexcept override
+    {
+        return slotCountValueFromSize(mArenaBytes / mSlotSize);
+    }
+
+    void destroy() override;
+    void resize(SlotCount newNumSlots) override;
+    Address slotAddress(SlotId slot) const override;
+    Address baseAddress() const override;
+    void setWindow(SlotWindow window) override;
+
+    [[nodiscard]] bool isBound() const noexcept override
+    {
+        return mBound;
+    }
+
+    [[nodiscard]] SlotWindow window() const noexcept
+    {
+        return mWindow;
+    }
+
+    //! Make this a bound pool. Group slot ids [groupWindow.begin, groupWindow.end) are bound in order to
+    //! this pool's window, which must have the same size; groupIdBound bounds every group slot id.
+    void bindInOrder(SlotWindow groupWindow, SlotCount groupIdBound);
+
+    //! The pool's own id bound to group slot id `slot`, if any.
+    [[nodiscard]] std::optional<SlotId> localId(SlotId slot) const noexcept;
+    //! The group slot id bound to this pool's id `local`, if any.
+    [[nodiscard]] std::optional<SlotId> groupId(SlotId local) const noexcept;
+    //! Bind group slot id `slot` (unbound) to this pool's id `local` (unbound).
+    void bind(SlotId slot, SlotId local);
+    //! Drop the binding of group slot id `slot`, if any.
+    void unbind(SlotId slot);
+    //! Exchange the bindings of two group slot ids; either may be unbound.
+    void swapBindings(SlotId a, SlotId b);
+
+    //! Address of this pool's own id `local`, which need not be bound.
+    [[nodiscard]] MemAddress localAddress(SlotId local) const;
+
+    //! Binding table indexed by group slot id: this pool's id, or -1 where unbound.
+    [[nodiscard]] std::vector<int32_t> const& bindings() const noexcept
+    {
+        return mGroupToLocal;
+    }
+
+private:
+    MemAddress mArenaBase;
+    size_t mArenaBytes;
+    SlotWindow mWindow;
+    size_t mGranularity;
+    CacheTier mMedium = CacheTier::GPU_MEM;
+    HostMem const* mFill = nullptr;
+    bool mBound = false;
+    std::vector<int32_t> mGroupToLocal; //!< by group slot id; -1 = unbound
+    std::vector<int32_t> mLocalToGroup; //!< by own id; -1 = unbound
 };
 
 // ---------------------------------------------------------------------------
@@ -405,6 +684,7 @@ class PoolGroupBase
 {
 public:
     explicit PoolGroupBase(SlotCount numSlots);
+    PoolGroupBase(SlotWindow window, SlotAllocator::Growth growth);
     virtual ~PoolGroupBase();
 
     //! The tier this pool group belongs to, which is what names it to the levels above:
@@ -456,9 +736,53 @@ public:
     void release(Slot slot);
     void destroy();
     void resizePools(std::optional<SlotCount> newNumSlots = std::nullopt);
+    //! Move every pool that uses the group's slot ids to `window`; bound pools keep their own
+    //! windows. The slot allocator is moved separately, as with resizePools.
+    void setPoolWindows(SlotWindow window);
+
+    //! Address of slot id 0 of pool `poolIdx` (see SlotPoolBase::baseAddress).
+    Address baseAddress(PoolIndex poolIdx) const
+    {
+        return mPools.at(poolIdx)->baseAddress();
+    }
+
+    //! Exclusive bound on the ids pool `poolIdx` can ever use (its own ids, if it is bound).
+    SlotCount slotIdUpperBound(PoolIndex poolIdx) const noexcept
+    {
+        return mPools.at(poolIdx)->slotIdUpperBound();
+    }
+
+    //! Whether pool `poolIdx` has its own ids bound to the group's (see ArenaGpuSlotPool).
+    bool isBoundPool(PoolIndex poolIdx) const noexcept
+    {
+        return mPools.at(poolIdx)->isBound();
+    }
+
+    //! Whether any pool of the group is bound.
+    bool hasBoundPools() const noexcept;
+
+    //! Pool `poolIdx` of an arena group. Throws for other kinds of pool.
+    ArenaGpuSlotPool& arenaPool(PoolIndex poolIdx);
+    ArenaGpuSlotPool const& arenaPool(PoolIndex poolIdx) const;
+
+    //! Moving a block from group slot id `src` to `dst` without copying the bound pools' data:
+    //! the bindings are exchanged, so the block's data in those pools stays where it is.
+    void swapBoundPoolBindings(SlotId dst, SlotId src);
+
+    //! Bind every slot id in the group's window that is unbound to a free id in each bound pool's
+    //! window, and unbind every id outside it. The window must not hold more bound ids than fit.
+    void completeBindings();
 
     // Addresses for all pools at a given slot id.
     TypedVec<PoolIndex, Address> slotAddress(SlotId slotId) const;
+
+    // Address in one pool at a given slot id. A bound pool resolves the binding, which only this
+    // overload leaves unrequested when the caller needs another pool (the id may not be bound).
+    Address slotAddress(SlotId slotId, PoolIndex poolIdx) const
+    {
+        return mPools.at(poolIdx)->slotAddress(slotId);
+    }
+
     // Sizes per pool.
     TypedVec<PoolIndex, size_t> slotSize() const;
 
@@ -568,6 +892,13 @@ public:
         PooledPhysMemAllocator& physMemAllocator, TypedVec<PoolIndex, bool> sparsity = {},
         HostMemBackingOptions const& hostOptions = {}, std::optional<size_t> sparseReservation = std::nullopt);
 
+    //! Arena-backed group: each pool is a window into the arena at [arenaBase, arenaBase + arenaBytes).
+    //! Pool 0's window is the group's; the others, all the same size, are bound pools. Device pools
+    //! only; sparse (host-backed) pools are rejected by ArenaGpuCacheLevelStorage.
+    GpuPoolGroup(TypedVec<PoolIndex, SlotWindow> const& poolWindows, SlotAllocator::Growth growth,
+        TypedVec<PoolIndex, size_t> const& slotSizeList, MemAddress arenaBase, size_t arenaBytes,
+        size_t arenaGranularity);
+
     [[nodiscard]] CacheTier cacheTier() const noexcept override
     {
         return CacheTier::GPU_MEM;
@@ -591,6 +922,11 @@ public:
     //! pool today, which makes the two equal.
     HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t groupVmSize,
         HostMemBackingOptions const& options = {});
+
+    //! Arena-backed group (copy-based rebalancing): one pool, a window into `arena`, whose start is slot id 0
+    //! of every group. The arena is filled from its start, so a slot is usable once the fill passes its end.
+    HostPoolGroup(
+        SlotWindow window, SlotAllocator::Growth growth, size_t slotSize, HostMem const& arena, size_t unitBytes);
 
     [[nodiscard]] CacheTier cacheTier() const noexcept override
     {
@@ -691,9 +1027,17 @@ public:
         return *mPoolGroups.at(pgIdx);
     }
 
+    PoolGroupBase const& poolGroup(PoolGroupIndex pgIdx) const
+    {
+        return *mPoolGroups.at(pgIdx);
+    }
+
+    //! Address of slot `slotId` of one pool, computed from the pool's base (slot id 0) so that it
+    //! is defined even for ids outside the pool's window, as an arena pool's base is.
     MemAddress getBaseAddress(PoolGroupIndex pgIdx, PoolIndex poolIdx, SlotId slotId) const
     {
-        return std::get<MemAddress>(mPoolGroups.at(pgIdx)->slotAddress(slotId).at(poolIdx));
+        auto const& pg = *mPoolGroups.at(pgIdx);
+        return std::get<MemAddress>(pg.baseAddress(poolIdx)) + pg.slotSize().at(poolIdx) * toSizeT(slotId);
     }
 
     //! Bytes this level holds in pools whose pages are `medium`, each rounded to that
@@ -704,7 +1048,7 @@ public:
     //! At cacheTier() this is what the level's quota pays for. Host-backed pools of a
     //! device level fall outside it, which is the point: a rebalance given an inflated
     //! figure would hand the level more slots than the device can hold.
-    [[nodiscard]] size_t roundedNumBytes(CacheTier medium) const
+    [[nodiscard]] virtual size_t roundedNumBytes(CacheTier medium) const
     {
         size_t total = 0;
         for (auto const& pg : mPoolGroups)
@@ -919,6 +1263,116 @@ private:
     PooledPhysMemAllocator& mPhysMemAllocator;
 };
 
+// ---------------------------------------------------------------------------
+// ArenaGpuCacheLevelStorage — GPU level for copy-based rebalancing (CoReba).
+//
+// One VA range, mapped in full at construction and never remapped, holds every
+// pool group. Groups are laid out in PoolGroupIndex order, each owning a window
+// of arena-relative slot ids; every group's base pointer is the arena start, so
+// slot `id` of a group with slot size S is at arenaBase + id * S. A rebalance
+// recomputes the windows (computeArenaWindows) and moves blocks out of the parts
+// that change owner; base pointers never change.
+//
+// A group with several pools gives each pool its own window, laid out one after
+// another in pool order (computeArenaPoolWindows); pools after the first are
+// bound pools (see ArenaGpuSlotPool), so each window moves on its own.
+// ---------------------------------------------------------------------------
+class ArenaGpuCacheLevelStorage : public CacheLevelStorage
+{
+public:
+    //! arenaBytes must be a multiple of the allocator's physical chunk size.
+    ArenaGpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, size_t arenaBytes,
+        TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+        PooledPhysMemAllocator& physMemAllocator);
+    //! Destroys the pool groups before the arena they point into.
+    ~ArenaGpuCacheLevelStorage() override;
+
+    CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::GPU_MEM;
+    }
+
+    //! The arena is the quota and cannot change size: every byte of it is paid for by the GPU
+    //! tier, whatever share the windows give each group. It holds no pool of any other medium.
+    [[nodiscard]] size_t roundedNumBytes(CacheTier medium) const override
+    {
+        return medium == CacheTier::GPU_MEM ? mArenaBytes : 0;
+    }
+
+    [[nodiscard]] std::optional<size_t> maxQuota() const noexcept override
+    {
+        return mArenaBytes;
+    }
+
+    void destroy() override;
+
+    [[nodiscard]] MemAddress arenaBase() const noexcept
+    {
+        return mArena.address();
+    }
+
+    //! Window of each pool group: its slot ids (pool 0's window).
+    [[nodiscard]] TypedVec<PoolGroupIndex, SlotWindow> windows() const;
+
+    //! Window of every pool, in that pool's own ids.
+    [[nodiscard]] TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> poolWindows() const;
+
+    //! The pool windows this arena would get for `ratioList`.
+    [[nodiscard]] TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> computePoolWindows(
+        TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
+
+    //! Whether some pool group has more than one pool.
+    [[nodiscard]] bool hasBoundPools() const noexcept;
+
+    //! Incremented whenever a binding of a bound pool may have changed.
+    [[nodiscard]] uint64_t bindingVersion() const noexcept
+    {
+        return mBindingVersion;
+    }
+
+    void bumpBindingVersion() noexcept
+    {
+        ++mBindingVersion;
+    }
+
+    //! Split an arena of arenaBytes between pool groups laid out in index order, in proportion
+    //! to ratioList (byte shares), giving every group at least minSlots slots.
+    //!
+    //! Each boundary is snapped to a whole block of the larger of its two neighbours' slot sizes;
+    //! the other neighbour's window then stops at its last whole block before (or starts at its
+    //! first whole block after) it, so a boundary wastes less than one block of the smaller size.
+    //! Because the grid is fixed, a boundary that does not move leaves every block where it was.
+    static TypedVec<PoolGroupIndex, SlotWindow> computeArenaWindows(size_t arenaBytes,
+        TypedVec<PoolGroupIndex, size_t> const& slotSizes, TypedVec<PoolGroupIndex, float> const& ratioList,
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots);
+
+    //! computeArenaWindows for groups with any number of pools; returns every pool's window.
+    //!
+    //! With one pool per group this is computeArenaWindows. Otherwise the pools are laid out one
+    //! after another, group by group in pool order, each group's byte share split between its
+    //! pools in proportion to their slot sizes. A pool starts at its first whole block after its
+    //! share begins, and all pools of a group get the same number of slots, the most every one of
+    //! them fits before its share ends: a pool wastes under two of its own blocks.
+    static TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> computeArenaPoolWindows(size_t arenaBytes,
+        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizes,
+        TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots);
+
+    //! Smallest arena for which computeArenaPoolWindows can give every group minSlots slots, for any
+    //! ratios (the sum of the per-group floors both layouts pin groups to).
+    static size_t minArenaBytes(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizes,
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots);
+
+    //! Growth direction for the group at pgIdx: away from the boundary that moves.
+    static SlotAllocator::Growth growthFor(PoolGroupIndex pgIdx, PoolGroupIndex numPoolGroups) noexcept;
+
+private:
+    [[nodiscard]] TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> slotSizes() const;
+
+    size_t mArenaBytes;
+    VirtMem mArena;
+    uint64_t mBindingVersion = 0;
+};
+
 class HostCacheLevelStorage : public CacheLevelStorage
 {
 public:
@@ -943,6 +1397,70 @@ public:
 private:
     HostMemBackingOptions mOptions;
     size_t mMaxQuota = 0;
+};
+
+// ---------------------------------------------------------------------------
+// ArenaHostCacheLevelStorage — host level for copy-based rebalancing (CoReba).
+//
+// The host counterpart of ArenaGpuCacheLevelStorage, for groups of one pool (every cold level has one pool per
+// group): one host range, committed and registered in full at construction (filled in the background, like a
+// host pool) and never resized, holds every pool group in a window of arena-relative slot ids, laid out by
+// computeArenaWindows. A rebalance moves the windows and the blocks in the parts that change owner, instead of
+// releasing one pool's memory and committing (populating and registering) another's.
+//
+// The range is registered in units of unitBytes, which no slot size need divide, so a page can straddle two
+// registrations; the range is listed with addHostCopySplitRange so that copy-engine copies are split there.
+// ---------------------------------------------------------------------------
+class ArenaHostCacheLevelStorage : public CacheLevelStorage
+{
+public:
+    //! arenaBytes must be a positive multiple of unitBytes.
+    ArenaHostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, size_t arenaBytes,
+        size_t unitBytes, TypedVec<PoolGroupIndex, float> const& ratioList,
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots, HostMemBackingOptions const& options);
+    //! Destroys the pool groups before the arena they point into.
+    ~ArenaHostCacheLevelStorage() override;
+
+    CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::HOST_MEM;
+    }
+
+    //! The arena is the quota and cannot change size. Its pools count in mUnitBytes, so
+    //! poolSizeGranularity(HOST_MEM) is the unit.
+    [[nodiscard]] size_t roundedNumBytes(CacheTier medium) const override
+    {
+        return medium == CacheTier::HOST_MEM ? mArenaBytes : 0;
+    }
+
+    [[nodiscard]] std::optional<size_t> maxQuota() const noexcept override
+    {
+        return mArenaBytes;
+    }
+
+    void destroy() override;
+
+    [[nodiscard]] MemAddress arenaBase() const noexcept
+    {
+        return mArena.address();
+    }
+
+    //! Window of each pool group.
+    [[nodiscard]] TypedVec<PoolGroupIndex, SlotWindow> windows() const;
+
+    //! The windows this arena would get for `ratioList` (computeArenaWindows).
+    [[nodiscard]] TypedVec<PoolGroupIndex, SlotWindow> computeWindows(
+        TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
+
+    //! Registration unit for an arena of a host tier whose own commit unit is tierUnitBytes: large, so that
+    //! few pages straddle a unit and the arena needs few registrations, and under the per-call pinning limit.
+    static size_t arenaUnitBytes(size_t tierUnitBytes) noexcept;
+
+private:
+    size_t mArenaBytes;
+    size_t mUnitBytes;
+    HostMem mArena;
+    bool mSplitRangeAdded = false;
 };
 
 class DiskCacheLevelStorage : public CacheLevelStorage

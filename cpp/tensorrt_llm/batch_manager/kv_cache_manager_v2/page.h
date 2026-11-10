@@ -199,6 +199,15 @@ public:
 // Owns finish events from all SharedPageLocks it issued.
 // Mirrors Python's _UniqPageLock.
 // ---------------------------------------------------------------------------
+struct LockOwner
+{
+    KvCache* kvCache;
+    BeamIndex beamIndex;
+    BlockOrdinal ordinal;
+    LifeCycleId lifeCycle;
+    bool operator==(LockOwner const&) const = default;
+};
+
 class UniqPageLock : public EnableSharedFromThis<UniqPageLock>
 {
 public:
@@ -217,20 +226,32 @@ public:
     // Append a finish event, merging when count exceeds 32 to prevent unbounded growth.
     void notifyFinish(CachedCudaEvent event);
 
+    //! Record a copy ordered after page readiness, finished readers, and all live owners' prior work.
+    void recordMigrationEvent(CachedCudaEvent const& event);
+
+    //! Move the locked page to another slot at the same level (copy-based rebalancing, in place),
+    //! republish its index to every owner, and return the source slot. The copy must already be
+    //! fenced through recordMigrationEvent(). Caller holds the API lock.
+    [[nodiscard]] Slot relocate(Slot&& slot);
+
+    //! Every (cache, beam, ordinal, life cycle) currently holding a shared lock on this page.
+    std::vector<LockOwner> const& owners() const noexcept
+    {
+        return mOwners;
+    }
+
     SharedPtr<PageHolder> holder;
     std::vector<CachedCudaEvent> finishEvents;
+
+private:
+    friend class SharedPageLock;
+    void removeOwner(LockOwner const& owner);
+    std::vector<LockOwner> mOwners;
 };
 
 // ---------------------------------------------------------------------------
 // LockOwner — identifies who holds a SharedPageLock.
 // ---------------------------------------------------------------------------
-struct LockOwner
-{
-    KvCache* kvCache;
-    BeamIndex beamIndex;
-    BlockOrdinal ordinal;
-    LifeCycleId lifeCycle;
-};
 
 // ---------------------------------------------------------------------------
 // SharedPageLock — one user's hold on an active page lock.
@@ -311,9 +332,24 @@ public:
     // Release the slot back to storage manager.
     void unlock();
 
+    //! In-place relocation: take over `slot` (same pool group, its data already copied there) and
+    //! return the previous one for the caller to release. Scratch slot ids are read afresh from
+    //! KvCache::getScratchDesc() each step, so there is no page-index buffer to republish to.
+    [[nodiscard]] Slot relocate(Slot&& slot);
+
     Slot const& slot() const noexcept
     {
         return mSlot;
+    }
+
+    KvCache& owner() const noexcept
+    {
+        return *mOwner;
+    }
+
+    LifeCycleId lifeCycle() const noexcept
+    {
+        return mLifeCycle;
     }
 
 private:

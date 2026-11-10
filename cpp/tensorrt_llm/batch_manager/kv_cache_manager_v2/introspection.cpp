@@ -630,6 +630,46 @@ void KvCacheIntrospection::setLastAdjustmentTime(KvCacheManager& manager, double
 void KvCacheIntrospection::setTargetRatioListGpu(KvCacheManager& manager, TypedVec<PoolGroupIndex, float> value)
 {
     manager.mTargetRatioListHot = std::move(value);
+    ++manager.mTargetRatioGeneration;
+}
+
+void KvCacheIntrospection::setTargetRatioListCold(KvCacheManager& manager, TypedVec<PoolGroupIndex, float> value)
+{
+    manager.mTargetRatioListCold = std::move(value);
+    ++manager.mTargetRatioGeneration;
+}
+
+std::vector<std::pair<SlotCount, SlotCount>> KvCacheIntrospection::slotWindows(
+    KvCacheManager& manager, CacheLevel level)
+{
+    std::vector<std::pair<SlotCount, SlotCount>> result;
+    for (auto const& window : manager.mStorage->levelWindows(level))
+    {
+        result.emplace_back(window.begin.value(), window.end.value());
+    }
+    return result;
+}
+
+std::vector<std::pair<SlotCount, SlotCount>> KvCacheIntrospection::gpuSlotWindows(KvCacheManager& manager)
+{
+    std::vector<std::pair<SlotCount, SlotCount>> result;
+    for (auto const& window : manager.mStorage->hotWindows())
+    {
+        result.emplace_back(window.begin.value(), window.end.value());
+    }
+    return result;
+}
+
+std::vector<std::vector<std::pair<SlotCount, SlotCount>>> KvCacheIntrospection::gpuPoolWindows(KvCacheManager& manager)
+{
+    std::vector<std::vector<std::pair<SlotCount, SlotCount>>> result;
+    for (auto const& pools : manager.mStorage->hotPoolWindows())
+    {
+        auto& out = result.emplace_back();
+        for (auto const& window : pools)
+            out.emplace_back(window.begin.value(), window.end.value());
+    }
+    return result;
 }
 
 namespace

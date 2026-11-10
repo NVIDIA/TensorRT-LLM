@@ -42,6 +42,10 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // Forward declarations.
 class Page;
 class KvCache;
+class ScratchSlotLock;
+
+//! In-place relocation: SWA scratch slots held by ACTIVE caches (not owned; they live in the caches).
+using ScratchSlotLockList = std::vector<ScratchSlotLock*>;
 class CopyEngine;
 class StagingBufferManager;
 
@@ -102,6 +106,10 @@ public:
         CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
         TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr,
         HostMemBackingOptions const& options = {}, std::optional<size_t> sparseReservation = std::nullopt);
+
+    //! A level whose storage was built by the caller (the copy-based rebalancing arena).
+    CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel,
+        std::unique_ptr<CacheLevelStorage> storage);
 
     CacheLevel cacheLevel;
     CacheTier cacheTier;
@@ -186,12 +194,61 @@ public:
         DropRecorder const& dropRecorder = {});
 
     // Dynamic cache level resizing.
+    //! lockedPages (in-place relocation only): hot-level pages locked by ACTIVE caches, per pool
+    //! group. They are never evicted; any outside a group's new window is relocated in place.
+    //! scratchSlots (in-place relocation only): the SWA scratch slots ACTIVE caches hold, per pool
+    //! group; treated like locked pages.
     void adjustCacheLevel(CacheLevel level, std::optional<size_t> newQuota,
         TypedVec<PoolGroupIndex, float> const& ratioList,
-        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages);
+        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages,
+        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* lockedPages = nullptr,
+        TypedVec<PoolGroupIndex, ScratchSlotLockList> const* scratchSlots = nullptr);
     void shrinkPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots,
         std::vector<SharedPtr<Page>> const& persistentPages);
     void expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots);
+
+    //! Shrink a pool group to `target`, a window inside its current one, at either or both ends.
+    //! Pages outside the target are dropped (copy-based rebalancing with the drop flag, droppable
+    //! pages only), evicted, or copied into free slots inside it, and their slot ids change.
+    void shrinkPoolGroupToWindow(CacheLevel level, PoolGroupIndex pgIdx, SlotWindow target,
+        std::vector<SharedPtr<Page>> const& persistentPages, std::vector<SharedPtr<Page>> const& lockedPages = {},
+        ScratchSlotLockList const& scratchSlots = {});
+
+    //! Whether the GPU level is a copy-based rebalancing arena.
+    [[nodiscard]] bool isGpuArena() const noexcept
+    {
+        return mGpuArena;
+    }
+
+    //! Whether `level` is a copy-based rebalancing arena (the GPU level, or a host level built with it).
+    [[nodiscard]] bool isArenaLevel(CacheLevel level) const;
+
+    //! Whether adjust() relocates the blocks of ACTIVE caches instead of requiring them suspended.
+    [[nodiscard]] bool isInPlaceRelocation() const noexcept
+    {
+        return mInPlaceRelocation;
+    }
+
+    //! Exclusive bound on the hot-level ids pool poolIdx of group pgIdx can ever use; kernel views
+    //! over the pool must extend this far. For an arena that is the arena end, in that pool's slots;
+    //! otherwise the group's hot slot count (VMM pools share the group's ids).
+    [[nodiscard]] SlotCount slotIdUpperBound(PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
+
+    //! Current hot-level window of each pool group.
+    [[nodiscard]] TypedVec<PoolGroupIndex, SlotWindow> hotWindows() const;
+
+    //! Current window of each pool group at `level` (arena-relative in an arena, [0, numSlots) otherwise).
+    [[nodiscard]] TypedVec<PoolGroupIndex, SlotWindow> levelWindows(CacheLevel level) const;
+
+    //! Current hot-level window of every pool, in its own ids (bound pools have their own).
+    [[nodiscard]] TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> hotPoolWindows() const;
+
+    //! For a bound pool of the GPU arena: its id for each of the group's slot ids (-1 where unbound).
+    //! std::nullopt for any other pool, whose ids are the group's.
+    [[nodiscard]] std::optional<std::vector<int32_t>> hotPoolBindings(PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
+
+    //! Changes whenever hotPoolBindings() may return something different.
+    [[nodiscard]] uint64_t hotPoolBindingVersion() const noexcept;
 
     // ---- Migration ---------------------------------------------------------
 
@@ -411,6 +468,13 @@ private:
     [[nodiscard]] size_t minQuotaForLevel(CacheLevel level) const;
 
     //! Slot counts `quota` buys at `ratio`, for a level that exists.
+    //! Raise the hot-level slot floors (the ones built from the construction constraints, which
+    //! slotCountsForLevel and constrainPoolGroupRatio clamp rebalancing targets to) to what `batch` needs,
+    //! scaled by 1/maxUtilForResume like the construction constraints. Each raised floor is capped at the
+    //! group's current slot count, so the current layout stays feasible and nothing has to move. Floors
+    //! never drop. Returns the resulting hot-level floors.
+    TypedVec<PoolGroupIndex, SlotCount> raiseHotMinSlots(BatchDesc const& batch, int tokensPerBlock);
+
     [[nodiscard]] TypedVec<PoolGroupIndex, SlotCount> slotCountsForLevel(
         CacheLevel level, size_t quota, TypedVec<PoolGroupIndex, float> const& ratio) const;
 
@@ -449,14 +513,53 @@ private:
         bool defrag = false);
     [[nodiscard]] LayerGroupId getMigrationBatchingLayerGroupId(
         CacheLevel dstLevel, CacheLevel srcLevel, LifeCycleId lifeCycle) const;
+    //! move: the source slots are given up afterwards (defragmentation, in-place relocation). In a
+    //! GPU arena the bound pools' data then stays put and the bindings are exchanged instead.
     void submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
-        PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
+        PageIndexPair const* pageIndices, size_t numPages, CUstream stream, bool move = false);
+
+    //! Hot<->cold codec call for a hot pool group with bound pools (copy-based rebalancing, several pools per group):
+    //! `pageIndices` carry the group's slot ids on the hot side; each pool gets its own array with the hot side
+    //! translated to that pool's ids (encodePools/decodePools). `coldBase` is the cold base (encode: destination).
+    bool submitBoundPoolColdPageCodec(bool encode, LayerGroupId batchingLayerGroupId, PoolGroupIndex hotPgIdx,
+        void const* coldBase, PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
 
     template <typename Submit>
     bool submitColdPageCodec(PageIndexLocation location, PageIndexPair const* pageIndices, size_t numPages,
         CUstream stream, Submit&& submit);
 
     PoolGroupBase& poolGroup(CacheLevel lvl, PoolGroupIndex pgIdx);
+
+    //! Copy-based rebalancing of an arena level (GPU or host): move the window boundaries to `ratioList`.
+    void adjustArenaLevel(CacheLevel level, std::optional<size_t> newQuota,
+        TypedVec<PoolGroupIndex, float> const& ratioList,
+        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages,
+        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* lockedPages,
+        TypedVec<PoolGroupIndex, ScratchSlotLockList> const* scratchSlots);
+    //! Move one arena pool group from `from` to `to`: grow over any space gained, then shrink off
+    //! any space lost. Space gained must already have been vacated by its previous owner.
+    void moveArenaWindow(CacheLevel level, PoolGroupIndex pgIdx, SlotWindow from, SlotWindow to,
+        std::vector<SharedPtr<Page>> const& persistentPages, std::vector<SharedPtr<Page>> const& lockedPages,
+        ScratchSlotLockList const& scratchSlots);
+    //! In-place relocation: copy locked pages and scratch slots (of ACTIVE caches) into free slots of
+    //! their own pool group at the same level, republish the pages' new indices to every owner and
+    //! hand each scratch lock its new slot. The copy runs after the owners' prior work and their
+    //! readers, and every owner's stream waits for it.
+    void _relocateLockedPages(CacheLevel level, PoolGroupIndex pgIdx, std::vector<SharedPtr<Page>> const& pages,
+        ScratchSlotLockList const& scratchSlots = {});
+    //! Move bound pool poolIdx of arena group pgIdx to `target`, its own new window: every group slot
+    //! id in use whose data lies outside it is rebound to a free id inside it and its data copied
+    //! there. Free group slot ids lose their bindings (completeBindings() restores them). Runs
+    //! synchronously, at the rebalance's quiescence point.
+    void remapArenaPool(PoolGroupIndex pgIdx, PoolIndex poolIdx, SlotWindow target);
+    //! adjustArenaLevel for an arena with bound pools: every pool moves on its own.
+    void adjustArenaPools(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> const& newWindows,
+        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages,
+        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* lockedPages,
+        TypedVec<PoolGroupIndex, ScratchSlotLockList> const* scratchSlots);
+    //! Drop the droppable (unreferenced) pages of a pool group whose slots lie outside `target`.
+    //! Returns how many were dropped.
+    SlotCount dropUnreferencedPagesOutside(CacheLevel level, PoolGroupIndex pgIdx, SlotWindow target);
 
     LifeCyclePoolGroupMapping const& poolGroupMapping(CacheLevel level) const
     {
@@ -510,6 +613,8 @@ private:
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>>> mSlotSizes;
     //! Hot-level slot floors, from the batch constraints and scaled by 1/maxUtilForResume.
     TypedVec<PoolGroupIndex, SlotCount> mHotMinSlots;
+    // KvCache::resume rejects a pool group above this utilization; floors are scaled by its inverse.
+    float mMaxUtilForResume{1.f};
 
     //! Host memory the hot level's host-backed pools may take: the configured quota, or the
     //! default construction fills in when it is unset. Kept because a rebalance moves the
@@ -517,6 +622,10 @@ private:
     //! still satisfied.
     size_t mHostSparsePoolQuota = 0;
 
+    // Copy-based rebalancing (StorageConfig::gpuArena / dropUnreferencedOnRebalance).
+    bool mGpuArena = false;
+    bool mDropUnreferencedOnRebalance = false;
+    bool mInPlaceRelocation = false;
     // All GPU cache levels borrow this allocator. It must outlive mLevels.
     std::unique_ptr<PooledPhysMemAllocator> mGpuPhysMemAllocator;
     RetentionExpiryQueue mRetentionExpiries;

@@ -23,6 +23,7 @@
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
 #include "kv_cache_manager_v2/utils/cudaContextScope.h"
+#include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/math.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -33,6 +34,8 @@
 #include <map>
 #include <memory>
 #include <new>
+#include <numeric>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -658,11 +661,42 @@ size_t KvCacheManager::getPageIndexUpperBound(LayerId layerId, DataRole role) co
     auto const& attr = mStorage->getBufferAttr(layerId, role);
     LifeCycleId lc = attr.lifeCycleId;
     PoolGroupIndex pg = mStorage->getPoolGroupIndex(lc);
-    SlotCount const numSlots = mStorage->numSlots(pg, kHotLevel);
+    // An id bound, not a count: with copy-based rebalancing a pool's ids are arena-relative and
+    // the bound is the arena end, so views over the pool cover every id it may ever be given.
+    SlotCount const numSlots = mStorage->slotIdUpperBound(pg, attr.poolIndex);
     auto slotSizes = mStorage->slotSize(pg);
     size_t slotSize = slotSizes.at(attr.poolIndex);
     return (exactDiv(slotSize, attr.size) * slotCountToSizeT(numSlots) - exactDiv(attr.offset, attr.size))
         * static_cast<size_t>(attr.expansion);
+}
+
+std::pair<size_t, size_t> KvCacheManager::getPageIndexRange(LayerId layerId, DataRole role) const
+{
+    auto const apiLock = lockShared();
+    auto const& attr = mStorage->getBufferAttr(layerId, role);
+    PoolGroupIndex const pg = mStorage->getPoolGroupIndex(attr.lifeCycleId);
+    SlotWindow const window = mStorage->hotPoolWindows().at(pg).at(attr.poolIndex);
+    // As in getPageIndexUpperBound: slot s starts at page s * perSlot - lead of a view rooted at the buffer.
+    size_t const perSlot = exactDiv(mStorage->slotSize(pg).at(attr.poolIndex), attr.size);
+    size_t const lead = exactDiv(attr.offset, attr.size);
+    auto const page = [&](auto slot) { return toSizeT(slot) * perSlot; };
+    size_t const first = page(window.begin) > lead ? page(window.begin) - lead : 0;
+    size_t const last = page(window.end) - lead;
+    auto const expansion = static_cast<size_t>(attr.expansion);
+    return {first * expansion, last * expansion};
+}
+
+std::optional<std::vector<int32_t>> KvCacheManager::getPageIndexBindings(LayerId layerId, DataRole role) const
+{
+    auto const apiLock = lockShared();
+    auto const& attr = mStorage->getBufferAttr(layerId, role);
+    return mStorage->hotPoolBindings(mStorage->getPoolGroupIndex(attr.lifeCycleId), attr.poolIndex);
+}
+
+uint64_t KvCacheManager::getPageIndexBindingVersion() const
+{
+    auto const apiLock = lockShared();
+    return mStorage->hotPoolBindingVersion();
 }
 
 int KvCacheManager::getPageIndexScale(LayerId layerId, DataRole role) const
@@ -1399,7 +1433,81 @@ void KvCacheManager::_adjustLevel(CacheLevel level, size_t quota)
         persistentPages = _gatherLastLevelPersistentPages();
         persistent = &persistentPages;
     }
-    mStorage->adjustCacheLevel(level, quota, ratioList, persistent);
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* locked = nullptr;
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> lockedPages;
+    TypedVec<PoolGroupIndex, ScratchSlotLockList> const* scratch = nullptr;
+    TypedVec<PoolGroupIndex, ScratchSlotLockList> scratchSlots;
+    if (mStorage->isInPlaceRelocation() && mStorage->isArenaLevel(level))
+    {
+        // A host arena holds locked pages too: DSA sparse history keeps an active request's pages locked there.
+        lockedPages = _gatherLockedPages(level);
+        locked = &lockedPages;
+        if (level == kHotLevel)
+        {
+            scratchSlots = _gatherActiveScratchSlots();
+            scratch = &scratchSlots;
+        }
+    }
+    // Relocated scratch slots change only their locks; each cache's index mirror (which may be a
+    // caller-bound buffer) is rewritten from them afterwards, even if the adjust stops part way.
+    auto republishScratch = FuncGuard(
+        [this, scratch]()
+        {
+            if (scratch == nullptr)
+                return;
+            for (KvCache* kvc : mLivingKvCaches)
+            {
+                if (!kvc->isActive())
+                    continue;
+                for (auto& slots : kvc->scratchSlotLocks())
+                    slots.republish();
+            }
+        });
+    mStorage->adjustCacheLevel(level, quota, ratioList, persistent, locked, scratch);
+}
+
+TypedVec<PoolGroupIndex, ScratchSlotLockList> KvCacheManager::_gatherActiveScratchSlots() const
+{
+    TypedVec<PoolGroupIndex, ScratchSlotLockList> result(mStorage->numPoolGroups(kHotLevel));
+    for (KvCache* kvc : mLivingKvCaches)
+    {
+        if (!kvc->isActive())
+            continue;
+        auto& perLifeCycle = kvc->scratchSlotLocks();
+        for (LifeCycleId lc{0}; lc < perLifeCycle.size(); ++lc)
+        {
+            for (auto& lock : perLifeCycle[lc].locksForRelocation())
+                result[mStorage->getPoolGroupIndex(kHotLevel, lc)].push_back(&lock);
+        }
+    }
+    return result;
+}
+
+TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherLockedPages(CacheLevel level) const
+{
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> result(mStorage->numPoolGroups(level));
+    std::set<Page const*> seen; // a page shared by several owners has one lock
+    for (KvCache* kvc : mLivingKvCaches)
+    {
+        if (!kvc->isActive())
+            continue;
+        for (auto const& sb : kvc->blocks())
+        {
+            for (auto const& beamPages : sb.pages)
+            {
+                for (LifeCycleId lc{0}; lc < beamPages.size(); ++lc)
+                {
+                    if (!std::holds_alternative<SharedPageLock>(beamPages[lc]))
+                        continue;
+                    auto const& pg = blockPageGetPage(beamPages[lc]);
+                    if (!pg || pg->cacheLevel != level || !seen.insert(pg.get()).second)
+                        continue;
+                    result[mStorage->getPoolGroupIndex(level, lc)].push_back(pg);
+                }
+            }
+        }
+    }
+    return result;
 }
 
 TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherLastLevelPersistentPages() const
@@ -1407,10 +1515,15 @@ TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherLa
     CacheLevel lastLevel = mStorage->numCacheLevels() - 1;
     PoolGroupIndex numPg = mStorage->numPoolGroups(lastLevel);
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> result(numPg);
+    // A page several suspended caches hold (a shared prefix) has one holder and must be listed once.
+    std::set<Page const*> seen;
 
     for (KvCache* kvc : mLivingKvCaches)
     {
-        TLLM_CHECK_DEBUG(kvc->status() == KvCache::Status::SUSPENDED);
+        // With in-place relocation ACTIVE caches stay active; their locked pages are gathered by
+        // _gatherLockedPages() and only the pages they merely hold are persistent here.
+        bool const active = kvc->isActive();
+        TLLM_CHECK_DEBUG(active ? mStorage->isInPlaceRelocation() : kvc->status() == KvCache::Status::SUSPENDED);
         for (auto const& sb : kvc->blocks())
         {
             for (auto const& beamPages : sb.pages)
@@ -1422,11 +1535,20 @@ TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherLa
                     {
                         continue;
                     }
+                    if (active && std::holds_alternative<SharedPageLock>(beamPages[lc]))
+                    {
+                        continue;
+                    }
                     TLLM_CHECK_DEBUG_WITH_INFO(std::holds_alternative<SharedPtr<PageHolder>>(beamPages[lc]),
                         "Non-null holder must be PageHolder in suspended state");
                     auto const& pg = blockPageGetPage(beamPages[lc]);
-                    if (!pg)
+                    if (!pg || !seen.insert(pg.get()).second)
                     {
+                        continue;
+                    }
+                    if (active && pg->status() == PageStatus::LOCKED)
+                    {
+                        // Held here but locked by another active cache: relocated with the locked pages.
                         continue;
                     }
                     // Mirrors Python assertions for invariant checking.
@@ -1474,6 +1596,10 @@ void KvCacheManager::tryUpdateTargetRatios()
     int avgHistoryLength = static_cast<int>(std::round(std::sqrt(mAvgSqrHistoryLength.value())));
     int avgBeamWidth = std::max(1, static_cast<int>(std::round(mAvgBeamWidth.value())));
     int avgPromptLength = std::max(0, static_cast<int>(std::round(mAvgPromptLength.value())));
+    if (avgCapacity > 0 || avgReusedLength > 0)
+    {
+        ++mTargetRatioGeneration;
+    }
     if (avgCapacity > 0)
     {
         auto const lifeCycleRatio = mStorage->ratioFromLength(
@@ -1551,6 +1677,9 @@ bool KvCacheManager::needAdjustment() const
     auto const apiLock = lockShared();
     if (mNumSampledKvCaches < mConfig.poolRebalance.minSampledKvCaches)
         return false;
+    // One attempt per target: wait until the target has been recomputed since the last adjust().
+    if (mAdjustedTargetRatioGeneration == mTargetRatioGeneration)
+        return false;
     double now = nowSeconds();
     if (now - mLastAdjustmentTime < mConfig.poolRebalance.cooldownSecs)
         return false;
@@ -1558,14 +1687,25 @@ bool KvCacheManager::needAdjustment() const
     return _needAdjustment(kHotLevel) || _needAdjustment(lastLevel);
 }
 
+TypedVec<PoolGroupIndex, SlotCount> KvCacheManager::raiseHotMinSlots(BatchDesc const& batch)
+{
+    auto const apiLock = lockExclusive();
+    return mStorage->raiseHotMinSlots(batch, tokensPerBlock());
+}
+
 void KvCacheManager::adjust()
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
-    for (KvCache* kvc : mLivingKvCaches)
-        TLLM_CHECK_WITH_INFO(kvc->status() == KvCache::Status::SUSPENDED,
-            "level adjustment requires every KvCache to be SUSPENDED: _adjustLevel may "
-            "defragment, which relocates pages and invalidates indices an ACTIVE cache holds");
+    // In-place relocation rewrites the indices ACTIVE caches hold, so they may stay active; the
+    // caller must still be between iterations (no forward reading or writing their pages).
+    if (!mStorage->isInPlaceRelocation())
+    {
+        for (KvCache* kvc : mLivingKvCaches)
+            TLLM_CHECK_WITH_INFO(kvc->status() == KvCache::Status::SUSPENDED,
+                "level adjustment requires every KvCache to be SUSPENDED: _adjustLevel may "
+                "defragment, which relocates pages and invalidates indices an ACTIVE cache holds");
+    }
 
     CacheLevel numLevels = mStorage->numCacheLevels();
     for (CacheLevel level{0}; level < numLevels; ++level)
@@ -1574,6 +1714,7 @@ void KvCacheManager::adjust()
             _adjustLevel(level, getQuota(level));
     }
     mLastAdjustmentTime = nowSeconds();
+    mAdjustedTargetRatioGeneration = mTargetRatioGeneration;
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -477,6 +477,9 @@ class PoolRebalanceConfig:
     target_ratio_update_interval: int = 100
     ratio_tolerance: float = 0.25
     moving_average_decay: float = 0.9999
+    copy_based_rebalancing: bool = False
+    drop_unreferenced_on_rebalance: bool = False
+    in_place_relocation: bool = False
 
 @dataclass(slots=True)
 class KVCacheManagerConfig:
@@ -1765,7 +1768,17 @@ class KVCacheManager:
         pool layout to restate it.
         """
     def get_page_index_upper_bound(self, layer_id: LayerId, data_role: DataRole) -> int: ...
+    def get_page_index_range(self, layer_id: LayerId, data_role: DataRole) -> tuple[int, int]: ...
     def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int: ...
+    def get_page_index_bindings(self, layer_id: LayerId, data_role: DataRole) -> list[int] | None:
+        """Slot-id bindings of the buffer's pool, or None if it uses the base page indices.
+
+        Copy-based rebalancing with several pools in a pool group: the buffer's pool has its own
+        slot ids, and its kernel page index is ``bindings[base_page_index] * scale`` (plus the
+        converter's layer offset). None when the pool uses the base page indices directly. Changes
+        when a rebalance moves the pool, as does ``get_page_index_binding_version()``.
+        """
+    def get_page_index_binding_version(self) -> int: ...
     def get_page_index_converter(
         self, layer_id: LayerId, data_role: DataRole
     ) -> PageIndexConverter: ...
@@ -1893,6 +1906,12 @@ class KVCacheManager:
     def pool_group_descs(self) -> Sequence[PoolGroupDesc]: ...
     def clamp_max_seq_len_for_mem(self, batch_size: int, token_num_upper_bound: int) -> int: ...
     def adjust(self) -> None: ...
+    def raise_hot_min_slots(self, batch: BatchDesc) -> list[int]:
+        """Raise the hot-level slot floors that rebalancing respects to what ``batch`` needs.
+
+        The floors are scaled by 1/max_util_for_resume and each capped at the group's current slot
+        count. Returns the floors.
+        """
     @property
     def need_adjustment(self) -> bool: ...
     @property
