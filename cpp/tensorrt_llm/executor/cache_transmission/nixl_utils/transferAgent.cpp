@@ -274,7 +274,9 @@ std::optional<bounce::BounceRejectReason> NixlTransferAgent::bounceRejectReason(
     {
         return BounceRejectReason::kNotWrite;
     }
-    if (request.getSrcDescs().getType() != MemoryType::kVRAM || request.getDstDescs().getType() != MemoryType::kVRAM)
+    if (request.getSrcDescs().getType() != MemoryType::kVRAM
+        || (request.getDstDescs().getType() != MemoryType::kVRAM
+            && request.getDstDescs().getType() != MemoryType::kDRAM))
     {
         return BounceRejectReason::kNotVram;
     }
@@ -1042,6 +1044,11 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     if (shouldUseBounce(request))
     {
         mBounceSubmitCount.fetch_add(1, std::memory_order_relaxed);
+        if (request.getDstDescs().getType() == MemoryType::kDRAM
+            && mBounceHostSubmitCount.fetch_add(1, std::memory_order_relaxed) == 0)
+        {
+            TLLM_LOG_INFO("NixlTransferAgent(%s): bounce host destination engaged", mName.c_str());
+        }
         // Debug-level so it's silent by default but lets ops confirm the bounce fast path actually
         // engaged for a given write (enable via TLLM_LOG_LEVEL_BY_MODULE "debug:executor").
         // Programmatic check: getBounceSubmitCount() / bounce_submit_count on the Python binding.

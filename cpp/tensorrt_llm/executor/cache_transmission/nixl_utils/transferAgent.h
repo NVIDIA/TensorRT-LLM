@@ -167,6 +167,12 @@ public:
         return mBounceSubmitCount.load(std::memory_order_relaxed);
     }
 
+    /// Number of bounced writes whose destination is host memory.
+    [[nodiscard]] std::uint64_t getBounceHostSubmitCount() const noexcept
+    {
+        return mBounceHostSubmitCount.load(std::memory_order_relaxed);
+    }
+
     /// snake_case name of a reject reason (also the key of the Python `bounce_reject_counts` dict).
     [[nodiscard]] static char const* bounceRejectReasonName(bounce::BounceRejectReason reason) noexcept;
 
@@ -196,6 +202,7 @@ public:
 private:
     /// Counts requests admitted by shouldUseBounce (see getBounceSubmitCount).
     std::atomic<std::uint64_t> mBounceSubmitCount{0};
+    std::atomic<std::uint64_t> mBounceHostSubmitCount{0};
     /// Per-reason rejections by shouldUseBounce; mBounceRejectWarned makes the first one per reason
     /// a WARNING (later ones are DEBUG). Present in every build so the bindings always link.
     /// mutable: bumped from the const admission gate (observability only, not logical state).
@@ -226,9 +233,9 @@ private:
     /// Per-agent maps because different remote agents may have overlapping virtual addresses.
     std::unordered_map<std::string, VramRegionMap> mRemoteVramRegionInfo;
 
-    /// Bounce v2 transport (opt-in via CacheTransceiverConfig.kv_cache_bounce_size_mb > 0). Null
-    /// unless enabled & built; when null the agent behaves exactly as before. See the design overview
-    /// at the top of bounce/BounceTransport.h.
+    /// Bounce v2 transport (opt-in via CacheTransceiverConfig.kv_cache_bounce_size_mb). Null unless
+    /// enabled & built; when null the agent behaves exactly as before. See the design overview at
+    /// the top of bounce/BounceTransport.h.
     std::unique_ptr<bounce::NixlBounceState> mBounce;
 
     /// Lazily create the bounce transport (ctor, before any metadata exchange) when enabled.

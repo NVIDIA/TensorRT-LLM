@@ -707,7 +707,7 @@ void BounceReceiver::scatterWorkerLoop()
                     // .. +pieceSize). count-1 and bounceStride are both u32 so the span product cannot
                     // overflow u64. A count of 0 is malformed (a run always carries >= 1 piece).
                     std::uint64_t const span = static_cast<std::uint64_t>(e.count - 1) * e.bounceStride + e.pieceSize;
-                    srcInBounds = srcInBounds && e.count >= 1 && e.bounceOffset <= job.regionBytes
+                    srcInBounds = srcInBounds && e.count >= 1 && e.pieceSize >= 1 && e.bounceOffset <= job.regionBytes
                         && span <= job.regionBytes - e.bounceOffset;
                     rawPieces += std::max<std::uint32_t>(e.count, 1);
                 }
@@ -741,19 +741,59 @@ void BounceReceiver::scatterWorkerLoop()
                     auto const bufs = planBufs(ctx, nTotal);
                     std::size_t idx = 0;
                     seen = 0;
-                    for (std::uint32_t i = 0; i < n; ++i)
+                    for (std::uint32_t i = 0; i < n && srcInBounds; ++i)
                     {
                         auto const& e = job.entries[i];
+                        if (e.dstMemoryType > 1)
+                        {
+                            srcInBounds = false;
+                            break;
+                        }
                         for (std::uint32_t p = 0; p < e.count; ++p)
                         {
                             ++seen;
+                            auto dstAddr = e.dstAddr + static_cast<std::uint64_t>(p) * e.dstStride;
+                            if (e.dstMemoryType == 1)
+                            {
+                                void* devicePtr = nullptr;
+                                auto const mapErr
+                                    = cudaHostGetDevicePointer(&devicePtr, reinterpret_cast<void*>(dstAddr), 0);
+                                if (mapErr != cudaSuccess)
+                                {
+                                    TLLM_LOG_WARNING(
+                                        "BounceTransport(%s): host destination mapping failed (%d) "
+                                        "rid=%llu chunk=%u",
+                                        mCtx.selfName.c_str(), static_cast<int>(mapErr),
+                                        static_cast<unsigned long long>(job.rid), job.chunkIdx);
+                                    srcInBounds = false;
+                                    break;
+                                }
+                                void* lastDevicePtr = nullptr;
+                                auto const lastHostAddr = dstAddr + e.pieceSize - 1;
+                                auto const lastMapErr = cudaHostGetDevicePointer(
+                                    &lastDevicePtr, reinterpret_cast<void*>(lastHostAddr), 0);
+                                if (lastMapErr != cudaSuccess
+                                    || reinterpret_cast<std::uintptr_t>(lastDevicePtr)
+                                        != reinterpret_cast<std::uintptr_t>(devicePtr) + e.pieceSize - 1)
+                                {
+                                    TLLM_LOG_WARNING(
+                                        "BounceTransport(%s): host destination alias is not contiguous "
+                                        "rid=%llu chunk=%u",
+                                        mCtx.selfName.c_str(), static_cast<unsigned long long>(job.rid), job.chunkIdx);
+                                    srcInBounds = false;
+                                    break;
+                                }
+                                dstAddr = reinterpret_cast<std::uintptr_t>(devicePtr);
+                            }
                             appendSplitInto(bufs, idx,
-                                regionBase + e.bounceOffset + static_cast<std::uint64_t>(p) * e.bounceStride,
-                                e.dstAddr + static_cast<std::uint64_t>(p) * e.dstStride, e.pieceSize,
-                                splitBudget(idx, static_cast<std::size_t>(rawPieces - seen), maxEntries));
+                                regionBase + e.bounceOffset + static_cast<std::uint64_t>(p) * e.bounceStride, dstAddr,
+                                e.pieceSize, splitBudget(idx, static_cast<std::size_t>(rawPieces - seen), maxEntries));
                         }
                     }
-                    launchErr = launchPrepared(ctx, nTotal, mCtx.cfg.useZeroCopyArguments);
+                    if (srcInBounds)
+                    {
+                        launchErr = launchPrepared(ctx, nTotal, mCtx.cfg.useZeroCopyArguments);
+                    }
                 }
                 else if (srcInBounds && nTotal == 0)
                 {
@@ -1940,9 +1980,9 @@ bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string
     if (blob.empty())
     {
         TLLM_LOG_WARNING(
-            "BounceTransport(%s): peer %s does not advertise bounce, so this agent uses standard NIXL for it and "
-            "its bounce arena stays idle for that peer. Possible causes on the peer: kv_cache_bounce_size_mb is 0, "
-            "the build has no bounce support (libzmq), or bounce init failed",
+            "BounceTransport(%s): peer %s does not advertise bounce (kv_cache_bounce_size_mb 0, bounce not "
+            "built, or bounce init failed on that side) -> standard NIXL for this peer; this agent's bounce arena "
+            "stays idle for it",
             mCtx.selfName.c_str(), peer.c_str());
         return false;
     }

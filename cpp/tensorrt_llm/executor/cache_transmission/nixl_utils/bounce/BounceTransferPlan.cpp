@@ -85,7 +85,8 @@ void buildScatterRuns(BounceChunk& chunk)
                 continue;
             }
         }
-        chunk.scatterRuns.push_back(BounceScatterRun{bounce, dst, 0, 0, size, 1});
+        chunk.scatterRuns.push_back(BounceScatterRun{
+            bounce, dst, 0, 0, size, 1, static_cast<std::uint32_t>(chunk.dstMemoryType == MemoryType::kDRAM)});
     }
 }
 } // namespace
@@ -117,6 +118,7 @@ BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, Tran
     auto const destinationDeviceId = dstVec.front().getDeviceId();
     BounceChunk current;
     current.dstDeviceId = destinationDeviceId;
+    current.dstMemoryType = dstDescs.getType();
     std::uint64_t cursor = 0; // running write offset within the current chunk region (aligned)
 
     auto flush = [&]()
@@ -126,6 +128,7 @@ BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, Tran
             buildScatterRuns(current);
             plan.mChunks.emplace_back(std::move(current));
             current = BounceChunk{};
+            current.dstMemoryType = dstDescs.getType();
             cursor = 0;
         }
     };

@@ -61,6 +61,18 @@ TEST(BounceTransferPlan, SingleDescOneChunk)
     EXPECT_EQ(c.dstPtrs[0], 0x9000u);
 }
 
+TEST(BounceTransferPlan, HostDestinationMarksScatterRuns)
+{
+    kvc::TransferDescs const dst{
+        kvc::MemoryType::kDRAM, {kvc::MemoryDesc{0x9000, 100, 0}, kvc::MemoryDesc{0xA000, 100, 0}}};
+    auto plan = b::BounceTransferPlan::build(makeDescs({{0x1000, 100, 0}, {0x2000, 100, 0}}), dst, 1024, 64);
+    ASSERT_EQ(plan.numChunks(), 1u);
+    for (auto const& run : plan.chunks()[0].scatterRuns)
+    {
+        EXPECT_EQ(run.dstMemoryType, 1u);
+    }
+}
+
 TEST(BounceTransferPlan, TwoDescsPackOneChunkWith32ByteAlignedOffsets)
 {
     // len 100 -> next offset aligns up to 128 (multiple of 32).

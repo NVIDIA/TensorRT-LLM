@@ -112,12 +112,25 @@ TEST(BounceMessageCodec, DataRoundTrip)
     ASSERT_TRUE(b::decodeScatter(blob, h, out));
     ASSERT_EQ(out.size(), 2u);
     EXPECT_EQ(out[0].dstAddr, 0xD000u);
+    EXPECT_EQ(out[0].dstMemoryType, 0u);
     EXPECT_EQ(out[0].count, 1u);
     EXPECT_EQ(out[1].bounceOffset, 128u);
     EXPECT_EQ(out[1].dstStride, 4096u);
     EXPECT_EQ(out[1].bounceStride, 128u);
     EXPECT_EQ(out[1].pieceSize, 64u);
     EXPECT_EQ(out[1].count, 3u);
+    EXPECT_EQ(out[1].dstMemoryType, 0u);
+}
+
+TEST(BounceMessageCodec, HostDestinationRoundTrip)
+{
+    std::vector<b::BounceScatterRun> entries{{0, 0xD000, 4096, 128, 64, 3, 1}};
+    auto blob = b::encodeData(/*rid=*/7, /*chunk=*/0, /*numChunks=*/1, /*regionHandle=*/4, entries);
+    auto h = decodeOk(blob, b::BounceMsgType::kDATA);
+    std::vector<b::BounceScatterRun> out;
+    ASSERT_TRUE(b::decodeScatter(blob, h, out));
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_EQ(out[0].dstMemoryType, 1u);
 }
 
 TEST(BounceMessageCodec, AckRoundTrip)

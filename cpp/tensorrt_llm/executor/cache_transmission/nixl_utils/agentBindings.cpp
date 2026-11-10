@@ -306,6 +306,7 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         // Programmatic bounce v2 observability (deployment checks and tests; no log parsing).
         .def_prop_ro("bounce_enabled", &kvc::NixlTransferAgent::isBounceEnabled)
         .def_prop_ro("bounce_submit_count", &kvc::NixlTransferAgent::getBounceSubmitCount)
+        .def_prop_ro("bounce_host_submit_count", &kvc::NixlTransferAgent::getBounceHostSubmitCount)
         .def_prop_ro("bounce_reject_count", &kvc::NixlTransferAgent::getBounceRejectCount)
         .def_prop_ro("bounce_reject_counts",
             [](kvc::NixlTransferAgent const& self)

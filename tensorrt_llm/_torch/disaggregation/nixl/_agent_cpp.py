@@ -179,6 +179,11 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
         return self._cpp_agent.bounce_submit_count
 
     @property
+    def bounce_host_submit_count(self) -> int:
+        """Number of bounced writes with a host-memory destination."""
+        return self._cpp_agent.bounce_host_submit_count
+
+    @property
     def bounce_reject_count(self) -> int:
         """Number of transfer requests the bounce admission gate declined (bounce enabled)."""
         return self._cpp_agent.bounce_reject_count

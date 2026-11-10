@@ -2634,16 +2634,35 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
 
     @pytest.mark.timeout(1800)
     @pytest.mark.skip_less_device(4)
-    def test_kv_cache_offload(self) -> None:
+    @pytest.mark.parametrize(
+        "bounce_config",
+        [
+            pytest.param({}, id="without_bouncer"),
+            pytest.param(
+                {
+                    "kv_cache_bounce_size_mb": 256,
+                    "agent_bounce_params": {
+                        "min_descriptor_count": "1",
+                        "max_average_descriptor_size": "1MB",
+                    },
+                },
+                id="with_bouncer",
+            ),
+        ],
+    )
+    def test_kv_cache_offload(self, bounce_config: dict[str, Any]) -> None:
         """GovReport summary quality is preserved with ratio-4 history offloaded.
 
         Each decode step fetches the indexer-selected units into a GPU cache.
         Only a decode-only worker can offload, so the context server keeps its
-        history resident. Offload takes no block reuse.
+        history resident. Offload takes no block reuse. Run with direct NIXL and
+        with the bounce agent to compare both transfer paths at the same accuracy
+        workload.
         """
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
+            **copy.deepcopy(bounce_config),
         }
         # Both servers lay out the NVFP4 KV cache alike for the transfer.
         kv_cache_config = {

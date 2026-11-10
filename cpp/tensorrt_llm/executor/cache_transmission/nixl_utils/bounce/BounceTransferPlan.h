@@ -45,6 +45,7 @@ struct BounceChunk
     std::uint64_t totalBytes{0};  // sum of desc sizes (payload only, excludes padding)
     std::uint64_t packedBytes{0}; // region extent to RDMA-write: last bounceOffset + its size
     std::uint32_t dstDeviceId{0}; // receiver device id (uniform across the entire request)
+    MemoryType dstMemoryType{MemoryType::kVRAM};
 };
 
 /// Pure bin-packing of a TransferRequest's (src,dst) descriptor pairs into chunks that each

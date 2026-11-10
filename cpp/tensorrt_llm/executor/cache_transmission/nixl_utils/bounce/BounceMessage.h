@@ -82,25 +82,27 @@ struct BounceCreditEntry
 /// handful of runs instead of one entry per desc, keeping the DATA message (ACK critical path) tiny.
 struct BounceScatterRun
 {
-    std::uint64_t bounceOffset; // first piece's offset within the granted region
-    std::uint64_t dstAddr;      // first piece's destination address
-    std::uint64_t dstStride;    // dst step between pieces (0 when count==1)
-    std::uint32_t bounceStride; // region-offset step between pieces (0 when count==1)
-    std::uint32_t pieceSize;    // bytes per piece
-    std::uint32_t count;        // number of pieces (>= 1)
+    std::uint64_t bounceOffset;     // first piece's offset within the granted region
+    std::uint64_t dstAddr;          // first piece's destination address
+    std::uint64_t dstStride;        // dst step between pieces (0 when count==1)
+    std::uint32_t bounceStride;     // region-offset step between pieces (0 when count==1)
+    std::uint32_t pieceSize;        // bytes per piece
+    std::uint32_t count;            // number of pieces (>= 1)
+    std::uint32_t dstMemoryType{0}; // 0: device, 1: CUDA-mapped host memory
 };
 
 #pragma pack(pop)
 
 static_assert(sizeof(BounceMsgHeader) == 40, "BounceMsgHeader must be 40 bytes");
 static_assert(sizeof(BounceCreditEntry) == 24, "BounceCreditEntry must be 24 bytes");
-static_assert(sizeof(BounceScatterRun) == 36, "BounceScatterRun must be 36 bytes");
+static_assert(sizeof(BounceScatterRun) == 40, "BounceScatterRun must be 40 bytes");
 
 inline constexpr std::uint32_t kBounceMagic = 0x424E4332U; // 'B''N''C''2'
-// v2: DATA scatter entries became strided RUNS (BounceScatterRun). The out-of-band capability
-// handshake checks this version before bounce is selected; decodeHeader also rejects a mismatched
-// control message defensively.
-inline constexpr std::uint16_t kBounceVersion = 2U;
+// v2: DATA scatter entries became strided RUNS (BounceScatterRun), keeping the ACK-critical-path
+// DATA message compact. v3 adds the destination memory type so the receiver can map CUDA-registered
+// host pointers before scattering. The out-of-band capability handshake checks this version before
+// bounce is selected; decodeHeader also rejects a mismatched control message defensively.
+inline constexpr std::uint16_t kBounceVersion = 3U;
 
 // ---- encode (each returns a self-contained blob: header + payload) ----
 /// WANT carries the per-chunk byte sizes the sender will write (the receiver allocates a region of

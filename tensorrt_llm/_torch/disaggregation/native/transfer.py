@@ -4325,7 +4325,10 @@ class TransferWorker:
                 if getattr(agent, "bounce_enabled", False):
                     logger.info(
                         f"TransferWorker.shutdown: agent {agent.name} bounce_submit_count="
-                        f"{agent.bounce_submit_count} bounce_reject_count={agent.bounce_reject_count}"
+                        f"{agent.bounce_submit_count} bounce_host_submit_count="
+                        f"{agent.bounce_host_submit_count} bounce_reject_count="
+                        f"{agent.bounce_reject_count} bounce_reject_counts="
+                        f"{agent.bounce_reject_counts}"
                     )
             except Exception as e:  # observability only; never skip deregister/shutdown below
                 logger.debug(f"TransferWorker.shutdown: bounce counters unavailable: {e}")
