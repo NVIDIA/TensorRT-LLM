@@ -44,9 +44,8 @@ class MsaCopySite(CopySiteEnum):
     OUT_CACHE_LOC_TAIL = ("msa.out_cache_loc_tail", Direction.FILL)
     # Flattened page table (fmha_sm100 only), 2-D page table, per-request attended lengths.
     KV_INDICES = ("msa.kv_indices", Direction.H2D)
-    # Read on the device before the replay by write_subpage_block_table when the pool has sub-pages
-    # (uniform_subpages_per_slot > 0), only on a step whose copy was issued: a plan for such a pool that merges it must
-    # also list it in flush_after, so that copy lands before that reader (which asserts it with expect_landed).
+    # Read on the device only inside the forward: a pool with sub-pages (uniform_subpages_per_slot > 0) expands it
+    # into the sub-page table there (msa_subpage_rows), so a plan that merges it needs no flush_after barrier.
     BLOCK_TABLE = ("msa.block_table", Direction.H2D)
     # MSA stages the KV prefix sums from the host lengths, so nothing reads this on the device before the replay.
     SEQ_LENS = ("msa.seq_lens", Direction.H2D)

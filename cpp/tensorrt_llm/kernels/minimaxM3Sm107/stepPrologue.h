@@ -29,10 +29,11 @@ namespace kernels
 namespace minimaxM3Sm107
 {
 
-//! The decode graph's step-input prologue in one launch (step_inputs.StepInputPack with early_copy): the work of the
-//! two parallel scatter launches and the header clear that follow them, in that order.
+//! The decode graph's step-input prologue in one launch (the `InGraph.prologue_op` of a device_copy plan with
+//! `early_copy`): the work of the two parallel scatter launches and the header clear that the pack's prologue issues
+//! without it, in that order.
 //!
-//! The window is the pack's staging layout (kernels/stepInputsScatter.h): an int64 header `[numHostCopies,
+//! The window is the pack's staging layout (kernels/deviceCopyScatter.h): an int64 header `[numHostCopies,
 //! numDeviceCopies]`, then one `(dst, src, bytes)` int64 triple per copy, host copies first; a host copy's `src` is a
 //! byte offset into the window, a device copy's a device address. Up to `maxDesc` copies of each kind are written (the
 //! slots the parallel scatter's grid covers), every host copy before any device copy, so a device copy may read a
