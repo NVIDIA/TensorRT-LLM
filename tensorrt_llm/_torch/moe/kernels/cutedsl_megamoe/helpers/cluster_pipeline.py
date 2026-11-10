@@ -25,62 +25,47 @@ the other thread, so neither half of such a handoff is ordered without cluster s
 The helpers here keep the pipeline object and its state and change only the scope: the full
 and empty barriers, stage index and phase are the pipeline's own. For a static single-CTA
 cluster they fall back to the pipeline's default operations, which are correct and cheaper.
+
+The cluster-scope acquire is a relaxed cluster-scope ``mbarrier.try_wait`` followed by one
+``fence.acquire.sync_restrict::shared::cluster.cluster``, the PTX ISA's acquire pattern for an
+observed release (memory consistency model, release and acquire patterns). The
+``.acquire.cluster`` qualifier on the wait itself would give the same ordering, but the
+assembler then adds an L1 invalidation after every try of the wait loop; the restricted fence
+after the loop costs nothing in the generated code.
 """
 
-from typing import Optional, Union
+from typing import Union
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-from cutlass._mlir import ir
 from cutlass._mlir.dialects import nvvm as _nvvm
-from cutlass.cutlass_dsl import Boolean, Int32, dsl_user_op
-
-# The suspend hint of the pipeline's default wait (``cute.arch.mbarrier_wait``).
-_WAIT_TIME_LIMIT_NS = 10_000_000
+from cutlass.cutlass_dsl import Int32
+from cutlass.experimental import primitives as prims
 
 
 def _is_static_single_cta(cluster_size: Union[int, Int32, None]) -> bool:
     return isinstance(cluster_size, int) and cluster_size == 1
 
 
-@dsl_user_op
-def mbarrier_try_wait_acquire_cluster(
-    mbar_ptr: cute.Pointer,
-    phase: Int32,
-    *,
-    loc: Optional[ir.Location] = None,
-    ip: Optional[ir.InsertionPoint] = None,
-) -> Boolean:
-    """Test one phase of this CTA's mbarrier with ``.acquire.cluster`` semantics.
-
-    Emits ``mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64`` through the NVVM
-    dialect, with the default wait's suspend hint. Returns whether the phase completed.
-    """
-    return Boolean(
-        _nvvm.mbarrier_try_wait_parity_timelimit(
-            mbar_ptr.to_llvm_ptr(loc=loc, ip=ip),
-            Int32(phase).ir_value(loc=loc, ip=ip),
-            Int32(_WAIT_TIME_LIMIT_NS).ir_value(loc=loc, ip=ip),
-            scope=_nvvm.MBarrierScopeKind.CLUSTER,
-            order=_nvvm.MemOrderKind.ACQUIRE,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
 @cute.jit
 def mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: Int32) -> None:
-    """Wait for a phase of this CTA's mbarrier with ``.acquire.cluster`` semantics.
+    """Wait for a phase of this CTA's mbarrier with cluster-scope acquire semantics.
 
     Use it where the phase is completed by a thread of another CTA: a peer's ``st.async``
     complete-tx or a peer's remote arrive. The default ``.acquire.cta`` wait does not
     synchronize with those releases, so shared memory they wrote would be read unordered.
+    Spins on ``mbarrier.try_wait.parity.relaxed.cluster.shared::cta.b64`` (the default wait's
+    suspend hint) and then issues ``fence.acquire.sync_restrict::shared::cluster.cluster``.
     """
-    phase_complete = mbarrier_try_wait_acquire_cluster(mbar_ptr, phase)
+    phase_complete = prims.mbarrier_try_wait_parity(
+        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED
+    )
     while not phase_complete:
-        phase_complete = mbarrier_try_wait_acquire_cluster(mbar_ptr, phase)
+        phase_complete = prims.mbarrier_try_wait_parity(
+            mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED
+        )
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 @cute.jit
@@ -179,7 +164,6 @@ def producer_tail_cluster(
 __all__ = [
     "consumer_release_cluster",
     "consumer_wait_cluster",
-    "mbarrier_try_wait_acquire_cluster",
     "mbarrier_wait_acquire_cluster",
     "producer_acquire_cluster",
     "producer_tail_cluster",
