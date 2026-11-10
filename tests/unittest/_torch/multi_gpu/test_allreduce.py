@@ -1130,34 +1130,3 @@ def test_nccl_symmetric_unregistered_small_input(mpi_pool_executor):
     )
     for r in results:
         assert r is True
-
-
-@torch.inference_mode()
-def run_nccl_window_request_recorded(tensor_parallel_size: int) -> bool:
-    rank = tensorrt_llm.mpi_rank()
-    torch.cuda.set_device(rank)
-
-    # cloudpickle pickles this module by value, and a direct reference to
-    # torch.ops here would make it pickle torch.ops itself.
-    def request_window_buffer() -> bool:
-        like = torch.empty((16, 4096), dtype=torch.bfloat16, device="cuda")
-        # Each rank requests one window buffer for the group, then returns it to the pool.
-        torch.ops.trtllm.preallocate_nccl_window_buffer(
-            like, list(range(tensor_parallel_size)), 1)
-        return torch.ops.trtllm.has_requested_nccl_window_buffers()
-
-    return request_window_buffer()
-
-
-@pytest.mark.skipif(torch.cuda.device_count() < 2,
-                    reason="Requires at least 2 GPUs for this test")
-@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_nccl_window_request_is_recorded(mpi_pool_executor):
-    """The op that gates eager layer scopes reports a window request made through the allocator."""
-    tensor_parallel_size = mpi_pool_executor.num_workers
-    results = mpi_pool_executor.map(
-        run_nccl_window_request_recorded,
-        *zip(*[(tensor_parallel_size, )] * tensor_parallel_size),
-    )
-    for r in results:
-        assert r is True

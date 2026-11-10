@@ -630,22 +630,40 @@ def test_module_hooks_scope_arbitrary_modules(tensor_scope_events):
     assert tensor_scope_events[-1][-1] is False
 
 
-def test_eager_decoder_layer_scopes_after_first_window_request(tensor_scope_events, monkeypatch):
+def test_eager_decoder_layer_scopes_after_first_window_request(
+    tensor_scope_events: list[tuple], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An eager layer runs unscoped until the first window request, then scopes every call.
+
+    The call that makes the first request releases what it leased, except its outputs.
+    """
     from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 
     class TestLayer(DecoderLayer):
-        def forward(self, hidden_states, **kwargs):
+        def forward(self, hidden_states: list[object], **kwargs: object) -> list[object]:
             return hidden_states
 
-    requested_states = [False, True]
+    # Before and after the first call, which requests nothing; before and after the second,
+    # which makes the first request.
+    requested_states = [False, False, False, True]
     queries = []
 
-    def has_requested_nccl_window_buffers():
+    def has_requested_nccl_window_buffers() -> bool:
         queries.append(requested_states[len(queries)])
         return queries[-1]
 
+    def release_nccl_window_tensor_scope_leases(
+        inputs: list[object], outputs: list[object]
+    ) -> None:
+        tensor_scope_events.append(("release", inputs, outputs))
+
     monkeypatch.setattr(
         torch.ops.trtllm, "has_requested_nccl_window_buffers", has_requested_nccl_window_buffers
+    )
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "release_nccl_window_tensor_scope_leases",
+        release_nccl_window_tensor_scope_leases,
     )
     layer = TestLayer()
     handles = nccl_window_tensor_scope.install_eager_nccl_window_tensor_scopes(layer)
@@ -654,15 +672,24 @@ def test_eager_decoder_layer_scopes_after_first_window_request(tensor_scope_even
         assert layer(output) is output
         assert tensor_scope_events == []
         assert layer(output) is output
-        assert [event[0] for event in tensor_scope_events] == ["begin", "end"]
+        assert [event[0] for event in tensor_scope_events] == ["release"]
+        assert tensor_scope_events[0][2] == output
+        assert layer(output) is output
+        assert [event[0] for event in tensor_scope_events] == ["release", "begin", "end"]
         assert layer(output) is output
     finally:
         for handle in handles:
             handle.remove()
 
     # A request is never undone, so the allocator is not queried again.
-    assert queries == [False, True]
-    assert [event[0] for event in tensor_scope_events] == ["begin", "end", "begin", "end"]
+    assert queries == [False, False, False, True]
+    assert [event[0] for event in tensor_scope_events] == [
+        "release",
+        "begin",
+        "end",
+        "begin",
+        "end",
+    ]
 
 
 def test_eager_decoder_layer_hook_allows_no_cuda_output(tensor_scope_events):

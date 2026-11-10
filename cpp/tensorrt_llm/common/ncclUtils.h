@@ -237,6 +237,9 @@ public:
     // New allocation/registration is prohibited during capture.
     // Uses the supplied stream for capture detection, stream-scoped reuse eligibility, and allocation
     // synchronization. Callers using a non-default stream must pass it explicitly.
+    // Every rank of comm makes each request at the same point: a new allocation is collective, and
+    // the first request also changes hasRequestedBuffers(). A request that only some ranks make must
+    // run with allocation suppressed (setWindowAllocationSuppressed).
     NCCLWindowBuffer requestBuffer(ncclComm_t comm, size_t size, cudaStream_t stream = nullptr);
 
     // Select the allocation domain on this host thread. owner == -1 explicitly selects eager;
@@ -290,6 +293,12 @@ public:
     void endTensorLeaseScope(std::vector<c10::StorageImpl const*> const& outputStorages, int device,
         cudaStream_t stream, bool failed, std::optional<size_t> entryDepth = std::nullopt);
 
+    //! Release the leases of the calling thread's innermost scope on \p device on \p stream, as a
+    //! successful exit of that scope would, except those of \p keptStorages, which stay with the
+    //! scope. The scope stays open. Does nothing without an open scope.
+    void releaseTensorLeaseScopeLeases(
+        std::vector<c10::StorageImpl const*> const& keptStorages, int device, cudaStream_t stream);
+
     // Destructor fallback. The lease ID prevents a late tensor destructor from releasing a newer
     // checkout of the same allocation. Fallback-released buffers are quarantined until communicator
     // teardown because destructor timing and stream identity are not rank-deterministic.
@@ -307,10 +316,10 @@ public:
     // Get the number of buffers allocated for a communicator
     size_t getBufferCount(ncclComm_t comm) const;
 
-    // Whether this process has requested a window buffer outside a suppressed section, whatever the
-    // outcome. No tensor can hold a window lease before the first such request. Ranks make these
-    // requests from the same operations, so the answer changes at the same point on every rank, and
-    // it never reverts.
+    //! Whether this process has made a window request while NCCL windows are supported and allocation
+    //! is not suppressed on the calling thread, whatever the request's outcome. No tensor can hold a
+    //! window lease before the first such request. Every rank makes its requests at the same points
+    //! (see requestBuffer), so the answer changes at the same point on every rank. It never reverts.
     bool hasRequestedBuffers() const noexcept;
 
     // Get the number of buffers in use for a communicator

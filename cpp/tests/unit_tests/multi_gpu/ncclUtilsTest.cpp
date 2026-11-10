@@ -1389,6 +1389,43 @@ TEST_F(CreateNCCLWindowTensorTest, TensorLeaseScopeReleasesTemporariesAndEscapes
     EXPECT_TRUE(allocator.releaseTensorBuffer(output.storage().unsafeGetStorageImpl(), stream));
 }
 
+TEST_F(CreateNCCLWindowTensorTest, ScopeLeaseReleaseKeepsScopeAndKeptStorages)
+{
+    using nccl_util::createNCCLWindowTensor;
+
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    int const device = at::cuda::current_device();
+    cudaStream_t const stream = at::cuda::getCurrentCUDAStream();
+    std::vector<int64_t> shape = {16, 16};
+
+    allocator.beginTensorLeaseScope({}, device);
+    nccl_util::NCCLWindowBuffer temporaryBuffer;
+    {
+        auto [temporary, buffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
+        temporaryBuffer = buffer;
+        ASSERT_TRUE(temporaryBuffer.isValid());
+    }
+    auto [live, liveBuffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
+    auto [output, outputBuffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
+    ASSERT_TRUE(liveBuffer.isValid());
+    ASSERT_TRUE(outputBuffer.isValid());
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 3);
+
+    // As at a successful scope exit, the dead temporary and the live tensor that is not kept become
+    // reusable on the stream. The kept output stays with the scope, which stays open.
+    allocator.releaseTensorLeaseScopeLeases({output.storage().unsafeGetStorageImpl()}, device, stream);
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 1);
+    EXPECT_TRUE(
+        nccl_util::NCCLWindowAllocatorTestAccess::isReusableOnStream(allocator, *mComm, temporaryBuffer.ptr, stream));
+    EXPECT_TRUE(
+        nccl_util::NCCLWindowAllocatorTestAccess::isReusableOnStream(allocator, *mComm, liveBuffer.ptr, stream));
+
+    allocator.endTensorLeaseScope({}, device, stream, false);
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 0);
+    EXPECT_TRUE(
+        nccl_util::NCCLWindowAllocatorTestAccess::isReusableOnStream(allocator, *mComm, outputBuffer.ptr, stream));
+}
+
 TEST_F(CreateNCCLWindowTensorTest, AuxiliaryStreamTensorJoinsCurrentThreadScope)
 {
     using nccl_util::createNCCLWindowTensor;
