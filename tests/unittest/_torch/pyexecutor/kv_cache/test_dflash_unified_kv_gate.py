@@ -278,6 +278,24 @@ def test_launcher_rejects_dflash_on_generation_worker_only(
         )
 
 
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_embedded_dspark_draft_keeps_its_own_window(is_disagg: bool) -> None:
+    """An embedded DSpark draft (DeepSeek-V4) is not a DFlashForCausalLM: the
+    gate reports why it keeps its own window instead of calling hooks it lacks."""
+    layout = _model_config(kv_heads=8, head_dim=128)
+    creator = _creator(is_disagg=is_disagg, target=layout, draft=layout)
+    creator._speculative_config.spec_dec_mode = SimpleNamespace(
+        is_dflash=lambda: False, is_dspark=lambda: True, is_external_drafter=lambda: False
+    )
+    creator._speculative_config.draft_is_embedded_in_target = True
+    creator._model_engine.model.draft_model = object()
+
+    assert creator._loaded_standalone_dspark_drafter() is None
+    assert creator._dflash_unify_blocker() is not None
+    assert not creator._should_unify_dflash_kv_cache()
+    creator._check_shared_draft_kv_request()
+
+
 def test_disagg_without_shared_draft_kv_env_keeps_separate_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

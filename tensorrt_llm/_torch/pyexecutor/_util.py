@@ -2339,9 +2339,16 @@ class KvCacheCreator:
 
     def _loaded_standalone_dspark_drafter(self):
         """The loaded standalone DSpark drafter, whose declarations decide how
-        it reads its context, or None (DFlash keeps its configured backend)."""
-        spec_dec_mode = self._speculative_config.spec_dec_mode
-        if spec_dec_mode.is_dflash() or not spec_dec_mode.is_dspark():
+        it reads its context, or None.
+
+        DFlash keeps its configured backend. An embedded DSpark draft is not a
+        ``DFlashForCausalLM`` and declares nothing: its context lives in a
+        worker-owned rolling window.
+        """
+        spec_config = self._speculative_config
+        spec_dec_mode = spec_config.spec_dec_mode
+        if (spec_dec_mode.is_dflash() or not spec_dec_mode.is_dspark()
+                or spec_config.draft_is_embedded_in_target):
             return None
         return getattr(self._model_engine.model, "draft_model", None)
 
@@ -2417,6 +2424,8 @@ class KvCacheCreator:
         if spec_config is None:
             return "speculative decoding is not enabled"
         backend = self._unified_drafter_attention_backend()
+        if backend is None:
+            return "the drafter has no block attention over paged draft KV"
         if not self._unified_drafter_reads_paged_kv(backend):
             return (f"the drafter's {backend} block attention does not read "
                     "paged draft KV from a KV cache manager at "
