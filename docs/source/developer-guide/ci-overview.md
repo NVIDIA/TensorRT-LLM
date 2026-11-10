@@ -120,8 +120,13 @@ Use one waive per line, with a bug link or a brief explanation in parentheses:
 accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[False] SKIP (https://nvbugs/6120535)
 ```
 
-Blank lines and `#` comments are ignored. The examples below use illustrative
-test names and reasons; replace them with the actual test and tracking reference.
+Blank lines are ignored. `#` starts a comment anywhere on a line, even inside
+quotes or a reason. Use tracking URLs without `#fragment` and avoid `#` in test
+names or `-k` expressions. A URL fragment can truncate a reason before its closing
+parenthesis and make the whole waive file fail to parse.
+
+The examples below use illustrative test names and reasons; replace them with
+the actual test and tracking reference.
 These rules describe `SKIP` waives.
 
 ### Test names and test-list metadata
@@ -294,6 +299,12 @@ unprefixed waive and the `full:DGX_H100/` waive above produce:
 ```text
 DGX_H100-PyTorch-1/test_unittests.py::test_unittests_v2[unittest/_torch/modeling -k "modeling_llama"]
 ```
+
+Expansion currently replaces every occurrence of the platform string in the name.
+If it also appears in a path or parameter ID (for example,
+`full:CPU/test_example.py::test_device[CPU]`), that text is rewritten too and can
+prevent a match. SM-qualified waives have the same limitation for repeated
+`smXX` strings.
 
 With `--test-prefix=A100X-PyTorch-1`, the unprefixed waive follows that prefix,
 while `full:DGX_H100/` does not match. Platform names are case-sensitive strings
