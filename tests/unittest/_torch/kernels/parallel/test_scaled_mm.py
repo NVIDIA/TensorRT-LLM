@@ -174,6 +174,10 @@ def test_fp8_scaled_mm_epilogue(m, n, k, gelu, out_fp8):
     result = out.float() / d_scale if out_fp8 else out.float()
     cosine = F.cosine_similarity(result.flatten(), ref.flatten(), dim=0).item()
     assert cosine > (0.998 if out_fp8 else 0.9999)
+    # Cosine ignores a uniform scale error (wrong d_scale or bias scale);
+    # check the magnitude too.
+    rel_l2 = ((result - ref).norm() / ref.norm()).item()
+    assert rel_l2 < (0.05 if out_fp8 else 0.01), f"relative L2 {rel_l2}"
 
 
 @_SM89_PLUS

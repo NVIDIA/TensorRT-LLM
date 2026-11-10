@@ -1080,6 +1080,7 @@ def _logic_attn2d_runs_on_cudnn_fp8(rank, world_size):
     )
     assert isinstance(attn.attn, Attention2DAttention)
     assert isinstance(attn.attn.inner_backend, CuDNNAttention)
+    assert attn.attn.inner_backend.quant_dtype == "fp8"
     assert not attn._fp8_qkv_producer
 
     hidden, cos, sin = _fp8_inputs(batch, seq)
