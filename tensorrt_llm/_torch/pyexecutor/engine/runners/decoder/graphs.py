@@ -734,7 +734,9 @@ class DecoderCudaGraphs:
                     with (
                         flashinfer_autotune_context,
                         flashinfer_mxfp8_decode_graph_capture(),
-                        cuda_graph_gemm_tuning(tune=is_warmup_only),
+                        cuda_graph_gemm_tuning(
+                            tune=is_warmup_only, world_size=self.mapping.world_size
+                        ),
                     ):
                         self._capture_generation_cuda_graphs(resource_manager)
                     if (

@@ -23,6 +23,9 @@ def _request(request_id, *, streaming, finished=False, perf_metrics=False, decod
     request.streaming = streaming
     request.is_finished = finished
     request.return_perf_metrics = perf_metrics
+    request.py_total_draft_tokens = 0
+    request.is_disagg_context_complete_state = False
+    request.is_disagg_context_transmission_state = False
     request.create_response.return_value = None
     return request
 
@@ -40,6 +43,9 @@ def _executor(requests, *, stream_interval=1, pending_preemption=False):
     executor.kv_cache_transceiver = None
     executor.enable_attention_dp = False
     executor._enqueue_responses = MagicMock()
+    executor._terminate_request = MagicMock()
+    executor._maybe_attach_ctx_usage = MagicMock()
+    executor.force_terminate_ctx_for_partial_reuse = False
     executor._is_kv_manager_v2 = True
     executor.kv_cache_manager = MagicMock()
     executor.kv_cache_manager.has_pending_preemption.return_value = pending_preemption
@@ -56,7 +62,6 @@ def test_non_streaming_request_in_progress_creates_no_response():
 @pytest.mark.parametrize(
     "kwargs",
     [
-        dict(streaming=False, finished=True),  # a finished request always reports
         dict(streaming=True),  # streaming reports each stream_interval step
         dict(streaming=False, perf_metrics=True),  # perf metrics finalize ctx totals
     ],
@@ -65,6 +70,17 @@ def test_response_still_created(kwargs):
     request = _request(1, **kwargs)
     PyExecutor._handle_responses(_executor([request]))
     request.create_response.assert_called_once()
+
+
+def test_finished_non_streaming_request_publishes_its_response():
+    request = _request(1, streaming=False, finished=True)
+    response = MagicMock()
+    request.create_response.return_value = response
+    executor = _executor([request])
+    PyExecutor._handle_responses(executor)
+    executor._enqueue_responses.assert_called_once_with([(1, response)])
+    executor._terminate_request.assert_called_once_with(request)
+    assert executor.active_requests == []
 
 
 def test_preemption_lookup_skipped_when_nothing_is_parked():

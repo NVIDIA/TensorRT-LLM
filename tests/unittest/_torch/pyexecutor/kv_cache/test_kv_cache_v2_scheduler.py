@@ -4611,10 +4611,11 @@ class TestPrefixAwareSkip:
         sched = make_scheduler(mgr, max_num_tokens=10000)
         reqs = [make_ctx_request(i, 40) for i in range(4)]
         assert ids(sched.schedule_request(reqs, set()).context_requests) == [0]
-        # req0 ran its whole context and is generating; the block is still not in the tree.
+        # req0 ran its whole context and is generating (still active, in flight); the block is
+        # still not in the tree.
         reqs[0].state_value = make_gen_request(0).state_value
         reqs[0].is_context_init_state = False
-        out = sched.schedule_request(reqs[1:], {0})
+        out = sched.schedule_request(reqs, {0})
         assert ids(out.context_requests) == [1, 2, 3]
 
     def test_deferral_kept_while_contributor_is_still_in_context(self):

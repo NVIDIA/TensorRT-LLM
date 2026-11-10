@@ -3631,23 +3631,38 @@ def cuda_graph_gemm_tuning_enabled() -> bool:
 
 
 @contextmanager
-def cuda_graph_gemm_tuning(tune: bool) -> Iterator[None]:
+def cuda_graph_gemm_tuning(tune: bool, world_size: int = 1) -> Iterator[None]:
     """PyTorch TunableOp around the generation CUDA-graph passes (``TLLM_CUDA_GRAPH_GEMM_TUNING``).
 
     With ``tune`` (the warmup pass), every new GEMM shape is benchmarked over cuBLAS/cuBLASLt
     candidates and the fastest is kept in memory; without it (the capture pass), known shapes
     use their tuned algorithm, which the captured graph records, and other shapes cuBLASLt's
-    heuristic. TunableOp is off again afterwards, so eager steps keep the heuristic and pay no
-    lookup; nothing is written to disk.
+    heuristic. TunableOp's enabled and tuning flags and its results filename are restored
+    afterwards, so eager steps keep the heuristic and pay no lookup.
+
+    Single-rank runs only: each rank tunes from its own timings, and unlike the AutoTuner
+    tactics the results cannot be merged across ranks, so ranks could pick different
+    algorithms, with different rounding, for a GEMM they all compute on the same input.
+    With ``world_size > 1`` the knob is ignored.
     """
     if not cuda_graph_gemm_tuning_enabled():
+        yield
+        return
+    if world_size > 1:
+        logger.warning_once(
+            f"{CUDA_GRAPH_GEMM_TUNING_ENV}=1 is ignored with world size {world_size}: "
+            "TunableOp results are tuned per rank and cannot be kept the same across ranks.",
+            key="cuda_graph_gemm_tuning_multi_rank")
         yield
         return
     from torch.cuda import tunable
 
     was_enabled, was_tuning = tunable.is_enabled(), tunable.tuning_is_enabled()
-    # TunableOp reads its results file when first used and writes it at exit. Without
-    # TLLM_CUDA_GRAPH_GEMM_TUNING_FILE the results stay in memory only.
+    # get_filename() holds any device ordinal already, so it is restored without one.
+    was_filename = tunable.get_filename()
+    # TunableOp reads its results file when first used and writes it at exit, also after the
+    # filename below is restored. Without TLLM_CUDA_GRAPH_GEMM_TUNING_FILE the results stay
+    # in memory only.
     results_file = os.environ.get(CUDA_GRAPH_GEMM_TUNING_FILE_ENV)
     if results_file:
         tunable.set_filename(results_file, True)
@@ -3660,6 +3675,7 @@ def cuda_graph_gemm_tuning(tune: bool) -> Iterator[None]:
     finally:
         tunable.tuning_enable(was_tuning)
         tunable.enable(was_enabled)
+        tunable.set_filename(was_filename, False)
 
 
 @contextmanager
