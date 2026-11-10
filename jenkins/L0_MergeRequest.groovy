@@ -2159,28 +2159,33 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
         pipeline.echo("Force set ONLY_ONE_GROUP_CHANGED \"\".")
         return ""
     }
+    // Any prefix or suffix can match a file (OR); all changed files must match the group.
     def groupFileMap = [
         "Docs": [
-            // Matched by prefix here, plus any "*.md" file anywhere in the repo (handled below).
-            "docs/",
+            prefixes: ["docs/"],
+            suffixes: [".md"],
         ],
         "PyTorch": [
-            "tensorrt_llm/_torch/",
-            "tensorrt_llm/scaffolding/",
-            "tests/unittest/_torch/",
-            "tests/unittest/scaffolding/",
-            "tests/unittest/llmapi/test_llm_pytorch.py",
-            "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
-            "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
-            "tests/integration/defs/disaggregated/",
-            "examples/disaggregated",
-            "examples/pytorch/",
-            "examples/scaffolding/",
-            "docs/",
+            prefixes: [
+                "tensorrt_llm/_torch/",
+                "tensorrt_llm/scaffolding/",
+                "tests/unittest/_torch/",
+                "tests/unittest/scaffolding/",
+                "tests/unittest/llmapi/test_llm_pytorch.py",
+                "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
+                "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
+                "tests/integration/defs/disaggregated/",
+                "examples/disaggregated",
+                "examples/pytorch/",
+                "examples/scaffolding/",
+                "docs/",
+            ],
         ],
         "Triton": [
-            "tests/integration/defs/triton_server/",
-            "triton_backend/",
+            prefixes: [
+                "tests/integration/defs/triton_server/",
+                "triton_backend/",
+            ],
         ],
     ]
 
@@ -2190,13 +2195,10 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
     }
 
     for (group in groupFileMap.keySet()) {
-        def groupPrefixes = groupFileMap[group]
+        def groupRules = groupFileMap[group]
         def matchesGroup = { file ->
-            // Any *.md file, anywhere in the repo, counts as Docs-only.
-            if (group == "Docs" && file.endsWith(".md")) {
-                return true
-            }
-            return groupPrefixes.any { prefix -> file.startsWith(prefix) }
+            return groupRules.prefixes?.any { prefix -> file.startsWith(prefix) } ||
+                groupRules.suffixes?.any { suffix -> file.endsWith(suffix) }
         }
         def allFilesInGroup = changedFileList.every(matchesGroup)
 
