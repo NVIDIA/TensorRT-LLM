@@ -143,11 +143,15 @@ The Ultra config is a starting point tuned for max throughput on 4x B200; adjust
 
 For [NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4) on a single GPU, the Hyperdrive configs are max-throughput starting points from community tuning on 1.4.0rc1. They use stock settings only:
 
-```shell
-# Nemotron 3.5 Super VL, 1x B200
-EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/nemotron-3.5-super-vl-hyperdrive-b200.yaml
+On one B200:
 
-# Nemotron 3.5 Super VL, 1x B300
+```shell
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/nemotron-3.5-super-vl-hyperdrive-b200.yaml
+```
+
+On one B300:
+
+```shell
 EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/nemotron-3.5-super-vl-hyperdrive-b300.yaml
 ```
 
@@ -175,6 +179,12 @@ trtllm-serve nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 --host 0.0.0.0 --por
 
 ```shell
 trtllm-serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 --host 0.0.0.0 --port 8000 --reasoning_parser nano-v3 --tool_parser qwen3_coder --config ${EXTRA_LLM_API_FILE}
+```
+
+**Nemotron 3.5 Super VL — NVFP4 model, with one of the Hyperdrive configs above:**
+
+```shell
+trtllm-serve nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 --host 0.0.0.0 --port 8000 --reasoning_parser nemotron-v3 --tool_parser qwen3_coder --config ${EXTRA_LLM_API_FILE}
 ```
 
 The `nemotron-v3` and `nano-v3` reasoning parsers are aliases for the same Nemotron v3 parser and are interchangeable. Reasoning can be toggled per request by passing `enable_thinking` through `chat_template_kwargs` in the request body, for example `{"chat_template_kwargs": {"enable_thinking": true}}` (set it to `false` to disable reasoning).
