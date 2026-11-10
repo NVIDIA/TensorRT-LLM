@@ -233,6 +233,13 @@ class AutoPipeline:
         1. ``model_index.json`` or ``modular_model_index.json``
         2. Safetensors metadata (LTX-2 native single-file format)
         """
+        from pathlib import Path
+
+        from .models.minimax_h3.vdn_checkpoint import is_vdn_checkpoint
+
+        if is_vdn_checkpoint(Path(checkpoint_dir)):
+            return "VDNMiniMaxH3Transformer3DModel"
+
         index_paths = [
             os.path.join(checkpoint_dir, "model_index.json"),
             os.path.join(checkpoint_dir, "modular_model_index.json"),
