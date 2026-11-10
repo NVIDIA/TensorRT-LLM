@@ -5401,8 +5401,9 @@ def _adjust_torch_mem_fraction():
     mem_reserved = torch.cuda.memory_reserved()
     mem_free, mem_total = torch.cuda.mem_get_info()
     # Keep room outside the PyTorch cap for driver allocations made after setup
-    # (streams, events, copy launches in the KV cache manager and transfer agents).
-    safety_margin = 1024**3
+    # (streams, events, copy launches in the KV cache manager and transfer agents),
+    # up to the free memory, so the cap never drops below what PyTorch holds.
+    safety_margin = min(1024**3, mem_free)
     mem_torch_max = mem_free + mem_reserved - safety_margin
     mem_torch_fraction = mem_torch_max / mem_total
     logger.info(
