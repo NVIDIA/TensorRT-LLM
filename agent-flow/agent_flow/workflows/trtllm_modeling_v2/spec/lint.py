@@ -38,7 +38,6 @@ import yaml
 
 from ..checks import accuracy_policy, check_config
 from ..checks import disagg as disagg_checks
-from ..infra.compute.sessions import GATE_ROLES
 from ..operators import prior_art, tree_anchors
 from . import variants as variants_mod
 from .task_schema import (
@@ -276,17 +275,6 @@ def _gib(nbytes: float) -> str:
     return f"{nbytes / 2**30:.0f} GiB"
 
 
-def _session_nodes(task: Mapping[str, Any]) -> int:
-    """The most nodes one session the gates run on holds (``environment.sessions[].nodes``)."""
-    sessions = (task.get("environment") or {}).get("sessions") or ()
-    nodes = [
-        s.get("nodes") or 1
-        for s in sessions
-        if isinstance(s, Mapping) and s.get("role", "any") in GATE_ROLES
-    ]
-    return max([n for n in nodes if isinstance(n, int)] or [1])
-
-
 def _host_path(environment: Mapping[str, Any], path: str) -> Path | None:
     """Where ``path``, as the run's commands see it, lives on this host; ``None``: in the image only."""
     if not environment.get("container_image"):
@@ -408,17 +396,6 @@ def placement_rules(ctx: LintContext) -> Iterator[Finding]:
     per_node = _gpus_per_node(task)
     if not per_node:
         return
-    nodes = _session_nodes(task)
-    disagg_spec = disagg_checks.DisaggSpec.from_task(task)
-    if nodes > 1 and not (disagg_spec and disagg_spec.nodes > 1):
-        yield Finding(
-            "session-nodes-unneeded",
-            INFO,
-            f"a gates session holds {nodes} nodes, but no check needs more than one (the "
-            "disaggregated-serving test runs on one node): a multi-node allocation waits "
-            "longer to start and to renew than single-node ones",
-            "use single-node sessions",
-        )
     if "disagg" not in assembly_units(task):
         return
     spec = disagg_checks.DisaggSpec.from_task(task) or disagg_checks.DisaggSpec(
@@ -968,14 +945,6 @@ def lint_task(
     return report
 
 
-def _planned_sessions(schema_error: str) -> tuple[list[str], list[str]]:
-    """Split a schema error into its other problems and the spools of sessions not started yet."""
-    head, _, rest = schema_error.partition("\n  - ")
-    problems = [p for p in rest.split("\n  - ") if p] if rest else [head]
-    spools = [p for p in problems if re.match(r"'environment\.spool' does not exist", p)]
-    return [p for p in problems if p not in spools], spools
-
-
 def main(argv: list[str] | None = None) -> int:
     """``trtllm-modeling-v2 intake lint``: print the report; exit 1 while a finding stands."""
     import argparse
@@ -992,12 +961,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--checkpoint", type=Path, default=None, help="Default: checkpoint_path.")
     parser.add_argument("--repo", type=Path, default=None, help="Default: trtllm_repo_path.")
     parser.add_argument("--report", type=Path, default=None, help="Also write the report here.")
-    parser.add_argument(
-        "--sessions-planned",
-        action="store_true",
-        help="The compute sessions are not started yet: a missing environment.spool is "
-        "reported as info instead of failing the schema.",
-    )
     args = parser.parse_args(argv)
     try:
         task = load_and_validate_task_yaml(args.task)
@@ -1015,20 +978,7 @@ def main(argv: list[str] | None = None) -> int:
         task, checkpoint=args.checkpoint, repo=args.repo, base=args.task.resolve().parent
     )
     if schema_error:
-        problems, spools = _planned_sessions(schema_error)
-        if not args.sessions_planned:
-            problems, spools = [schema_error], []
-        if problems:
-            report.findings.insert(0, Finding("schema", BLOCK, "\n  - ".join(problems)))
-        for spool in spools:
-            report.findings.insert(
-                0,
-                Finding(
-                    "sessions-planned",
-                    INFO,
-                    spool.split(". ")[0] + ": start its compute session before launch",
-                ),
-            )
+        report.findings.insert(0, Finding("schema", BLOCK, schema_error))
     text = report.render()
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)

@@ -67,7 +67,7 @@ def derive_main(argv: list[str]) -> int:
     if args.site is None:
         derivation.questions.append(
             "environment: no --site was given, so the spec carries `environment: {kind: local}`; "
-            "replace it with the cluster's (session_spool, its sessions, image, mounts)"
+            "replace it with the cluster's (its interpreter, image, mounts)"
         )
     path = derive_mod.write_derivation(args.out, derivation)
     task = yaml.safe_load(path.read_text(encoding="utf-8")) or {}

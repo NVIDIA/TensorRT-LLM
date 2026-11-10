@@ -26,7 +26,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from ..infra.compute.environment import resolve_environment, scheduler_owns_devices
+from ..infra.compute.environment import resolve_environment
 from ..infra.compute.executor import select_command_executor, shell_runner_for
 from ..infra.files import read_json
 from ..spec import variants as variants_mod
@@ -202,14 +202,10 @@ def run_check(
     # The disaggregated-serving test starts two engines, so it asks for both.
     disagg_spec = disagg.DisaggSpec.from_task(spec) if name == "disagg" else None
     gpus = (disagg_spec.device_count(member) if disagg_spec else None) or world
-    kind = str((spec.get("environment") or {}).get("kind", "local"))
     if devices is None:
         devices = claimed_devices(workspace)
-    if scheduler_owns_devices(kind):
-        # A scheduler hands each job its devices; naming them here would mask its choice.
-        devices = ()
-    elif not devices:
-        devices = tuple(range(gpus))
+    # A check takes as many of the run's devices as its member is wide: the first ones.
+    devices = tuple(devices)[:gpus] if len(devices) >= gpus else tuple(range(gpus))
     repo = Path(str(spec.get("trtllm_repo_path") or "."))
     tree = Path(tree).resolve() if tree is not None else repo.resolve()
     spec = {**spec, "trtllm_repo_path": str(tree)}
@@ -220,14 +216,7 @@ def run_check(
         environment = replace(environment, python=python)
         unit_environment = replace(unit_environment, python=python)
     if runner is None:
-        executor = select_command_executor(
-            environment,
-            name_prefix=f"gate-{name}",
-            gpus=str(gpus),
-            tree=tree,
-            nodes=disagg_spec.nodes if disagg_spec else 1,
-        )
-        runner = shell_runner_for(executor)
+        runner = shell_runner_for(select_command_executor(environment))
     runner = check_runtime.in_tree(runner, tree)
     if features is None:
         features = features_for(spec, unit)

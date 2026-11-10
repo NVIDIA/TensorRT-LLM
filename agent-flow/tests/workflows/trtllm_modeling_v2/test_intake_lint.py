@@ -70,7 +70,7 @@ _GOOD = {
             "gates": ["accuracy"],
         },
     },
-    "environment": {"kind": "session_spool", "gpus_per_node": 4},
+    "environment": {"kind": "local", "gpus_per_node": 4},
     "accuracy": {"benchmark": "gsm8k"},
     # tp4 / tep4 are text-only: core alone. disagg's test runs once, at dep4.
     "coverage": {"accept": ["kv_fp8@tp4", "kv_fp8@tep4", "chunked@tp4", "chunked@tep4"]},

@@ -163,10 +163,8 @@ benchmark you start by hand runs captured too.
   checkpoint's architecture (the lint checks): a small checkpoint the stock path supports, on this
   cluster. Preflight's substrate gate boots it instead; skipping the gate also drops its MPI and
   NVRTC checks.
-- A `session_spool` environment's spools exist once their sessions run. Until then lint with
-  `--sessions-planned`; start the sessions before launch.
-- Gate jobs go to `environment.spool` and every `gates` or `any` session; a `work` session gets
-  only what a worker submits to it.
+- `environment.kind` is `local`: every command runs on the orchestrator's host. On a cluster,
+  launch the workflow inside the allocation that holds the GPUs.
 
 ## 7. Agents: yours
 
@@ -216,7 +214,7 @@ as standing orders, so "no build is allowed" written for the intake stops the ru
 ## 9. Lint, then launch
 
 ```bash
-trtllm-modeling-v2 intake lint --task task.yaml --report intake.report.md [--sessions-planned]
+trtllm-modeling-v2 intake lint --task task.yaml --report intake.report.md
 ```
 
 Fix every `block` and every `warn`, or keep one on purpose with a line in `notes`:

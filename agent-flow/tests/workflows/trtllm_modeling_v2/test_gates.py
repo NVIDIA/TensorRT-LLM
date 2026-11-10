@@ -233,7 +233,7 @@ def test_every_node_must_have_a_fresh_successful_report(tmp_path, second, code, 
         return CommandResult(returncode=code)
 
     result = disagg.run_disagg_gate(
-        RunEnvironment(kind="session_spool", python="python3"),
+        RunEnvironment(kind="local", python="python3"),
         task_data={"trtllm_repo_path": str(tmp_path)},
         workdir=work,
         runner=runner,
@@ -1304,7 +1304,6 @@ def _spec(tmp_path) -> dict:
     checkpoint, repo = tmp_path / "ckpt", tmp_path / "repo"
     checkpoint.mkdir(exist_ok=True)
     repo.mkdir(exist_ok=True)
-    (tmp_path / "spool").mkdir(exist_ok=True)
     (tmp_path / "mtp.yaml").write_text(
         yaml.safe_dump({"speculative_config": {"decoding_type": "MTP", "max_draft_len": 3}})
     )
@@ -1316,8 +1315,7 @@ def _spec(tmp_path) -> dict:
         "trtllm_repo_path": str(repo),
         "features": ["mtp"],
         "environment": {
-            "kind": "session_spool",
-            "spool": str(tmp_path / "spool"),
+            "kind": "local",
             "python": "/usr/bin/python3",
             "env": {"TMPDIR": "/scratch/tmp"},
         },
@@ -1388,7 +1386,6 @@ def test_the_stock_leg_is_asked_once_per_checkpoint(tmp_path, monkeypatch):
 def test_each_member_is_launched_at_its_own_width(tmp_path):
     """One shared runner resolves a check: a wider member's command starts its own ranks."""
     data = _load(tmp_path, _spec(tmp_path))
-    data["environment"] = {"kind": "local", "python": "/usr/bin/python3", "env": {}}
     seen: dict[str, list[str]] = {}
     for member in ("tp1", "tep2"):
         runner = _gates_recorder(CommandResult(returncode=0, stdout=""))

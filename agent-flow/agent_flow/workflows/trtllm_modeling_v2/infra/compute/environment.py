@@ -4,9 +4,9 @@
 """How GPU work is launched — resolved once, then handed to every agent.
 
 The ``environment`` block of ``task.yaml`` becomes a :class:`RunEnvironment`, whose ``prefix``
-every GPU command is prepended with; the agent prompts carry that string. ``local`` runs on this
-host's claimed devices, ``session_spool`` through a compute session's spool. This module only
-builds commands; :mod:`.executor` runs them.
+every GPU command is prepended with; the agent prompts carry that string. The one kind is
+``local``: commands run on this host's claimed devices. This module only builds commands;
+:mod:`.executor` runs them.
 """
 
 from __future__ import annotations
@@ -17,17 +17,42 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from ..files import read_json
-from . import SPOOLCTL_PATH
-from .scheduler import SpoolPaths
 from .server_runtime import MULTI_TASK_SLURM_VARS, rank_launch
-from .sessions import (
-    MERGED_ENV_VARS,
-    SessionSpec,
-    describe_sessions,
-    env_assignments,
-    sessions_from_task,
-)
+
+# Variables whose declared value EXTENDS the inherited one. A plain `PATH: <venv>/bin:/usr/bin`
+# drops `/usr/local/mpi/bin`, and the next launcher line dies `mpirun: command not found` (rc
+# 127). `PYTHONPATH` already holds the gates' rank hook (`checks/check_runtime.RANK_HOOK_DIR`) and the
+# tree a check measures; unset, it must not leave a trailing `:`, which
+# Python reads as the working directory.
+MERGED_ENV_VARS: tuple[str, ...] = ("PATH", "PYTHONPATH")
+#: Merged variables whose inherited value is appended only when it is set.
+_SEPARATOR_WHEN_SET: tuple[str, ...] = ("PYTHONPATH",)
+
+
+def prepend_to_inherited(name: str, value: str) -> str:
+    """``/a:/b`` -> ``/a:/b:"$PATH"`` (the value shell-quoted), idempotent against a ``:$PATH``.
+
+    The expansion stays outside the quoting so that the shell expands it. ``PYTHONPATH`` becomes
+    ``/a:/b"${PYTHONPATH:+:$PYTHONPATH}"``: nothing is appended when it is unset or empty.
+    """
+    for suffix in (f":${name}", f":${{{name}}}"):
+        if value.endswith(suffix):
+            value = value[: -len(suffix)]
+            break
+    if not value or value in (f"${name}", f"${{{name}}}"):
+        return f'"${name}"'
+    if name in _SEPARATOR_WHEN_SET:
+        return f'{shlex.quote(value)}"${{{name}:+:${name}}}"'
+    return f'{shlex.quote(value)}:"${name}"'
+
+
+def env_assignments(env: Mapping[str, str]) -> list[str]:
+    """Stable shell assignments; path variables prepend rather than erase inherited values."""
+    return [
+        f"{key}={prepend_to_inherited(key, str(value)) if key in MERGED_ENV_VARS else shlex.quote(str(value))}"
+        for key, value in sorted(env.items())
+    ]
+
 
 #: The wrapper that makes a pre-launched MPI world work: rank 0 runs the leader and the task,
 #: every other rank a worker.
@@ -67,7 +92,8 @@ SINGLE_TASK_MPI_SCRUB = single_task_scrub()
 # Above one task, under `mpirun`, the misleading variables are the Slurm task ones:
 # `trtllm-llmapi-launch` reads `SLURM_PROCID` before `OMPI_COMM_WORLD_RANK` for its rank and
 # `SLURM_NTASKS` before `OMPI_COMM_WORLD_SIZE` for `mpi_world_size`. Right under `srun`, wrong
-# under an `mpirun` inside a one-task allocation, which is what a `session_spool` job is.
+# under an `mpirun` inside a one-task allocation, which is where an orchestrator started in an
+# allocation runs.
 # Unscrubbed, every rank reads rank 0 of a world of 1 and becomes a `mgmn_leader_node` waiting
 # for workers that never come: no error, no exit, a hang.
 MULTI_TASK_SLURM_SCRUB = "env " + " ".join(f"-u {name}" for name in MULTI_TASK_SLURM_VARS)
@@ -84,10 +110,6 @@ class RunEnvironment:
     world_size: int = 1
     # The image the GPU jobs run in, if any: an interpreter path above is a path inside it.
     container_image: str | None = None
-    # ``session_spool`` only: the spool a long-lived compute session watches.
-    spool: str | None = None
-    # Every declared session an agent may submit to.
-    sessions: tuple[SessionSpec, ...] = ()
 
     @property
     def ntasks(self) -> int:
@@ -130,12 +152,11 @@ class RunEnvironment:
 
         Without it the LLM API finds a world size of 1, tries to create the other ranks itself,
         and dies with ``MPI_ERR_SPAWN``. ``--oversubscribe``: Open MPI takes its slot count from
-        Slurm, and a spool session is **one task** that owns the node, so ``-n 4`` asks for four
-        slots against one and dies before any Python runs. Raising the session's
-        ``ntasks_per_node`` instead would start four spool watchers racing for every job.
+        Slurm, and inside a one-task allocation ``-n 4`` asks for four slots against one and
+        dies before any Python runs.
         """
         launch = f"{shlex.join(rank_launch(self.ntasks, LLMAPI_LAUNCH))} {argv}"
-        # The launcher is installed beside the interpreter; a session's PATH need not hold it
+        # The launcher is installed beside the interpreter; the inherited PATH need not hold it
         # (`mpirun` reports `trtllm-llmapi-launch` not found), so its directory goes first.
         if os.path.isabs(self.python):
             return f'PATH={shlex.quote(os.path.dirname(self.python))}:"$PATH" {launch}'
@@ -157,8 +178,8 @@ class RunEnvironment:
         if self.needs_llmapi_launch:
             argv = self._mpirun_launch(argv)
         elif single_process:
-            # The process inherits a step's PMI variables: a spool script runs inside the
-            # session's own allocation.
+            # The process inherits a step's PMI variables when the orchestrator runs inside
+            # an allocation.
             argv = self._scrub_and_exec(argv)
         prefix = self.prefix
         return f"{prefix} {argv}".strip()
@@ -171,8 +192,6 @@ class RunEnvironment:
 
     def describe(self) -> str:
         """The block injected verbatim into every agent's prompt."""
-        if self.kind == "session_spool":
-            return self._describe_spool()
         device_line = ", ".join(str(d) for d in self.devices) if self.devices else "(none)"
         return (
             "## Running GPU work\n"
@@ -192,119 +211,6 @@ class RunEnvironment:
             "is a **symptom to report in your final message** — not a problem to solve.\n"
         )
 
-    def _describe_spool(self) -> str:
-        """The prompt block for a long-lived compute session watching a spool."""
-        spool = self.spool or "<spool>"
-        exports = "\n".join(f"export {part}" for part in env_assignments(self.launch_env))
-        if not exports:
-            exports = "# no extra environment"
-        submit = f"python3 {SPOOLCTL_PATH} submit"
-        control = f"python3 {SPOOLCTL_PATH}"
-        return (
-            "## Running GPU work\n"
-            "\n"
-            "A compute session is already running and its scheduler watches a spool "
-            "directory. You do **not** allocate nodes or start GPU work any other way: "
-            "no cluster scheduler commands, no GPU process of your own. Work is a file.\n"
-            "\n"
-            "Run something and wait for it (prints the log, exits with the job's code):\n"
-            "\n"
-            "```bash\n"
-            f"SPOOL={spool} {submit} --gpus <N|all> --wall <limit> <name> '<command>'\n"
-            "```\n"
-            "\n"
-            "- `--gpus N` asks for N devices; the scheduler exports `CUDA_VISIBLE_DEVICES` to "
-            "exactly those. **Never set `CUDA_VISIBLE_DEVICES` yourself.** `--gpus all` holds "
-            "the whole node, exclusively — use it for anything that loads the full model. "
-            "Without `--gpus`, a `free-` name holds no device and any other name holds the "
-            "whole node.\n"
-            "- `--wall` is counted from the job's start; time spent queued is free. A job "
-            "past its limit is stopped and reported as timed out.\n"
-            "- **A job waiting in the queue is not a block.** Other tasks share these "
-            "devices; yours starts when they free. Do the rest of your task meanwhile and "
-            "poll its log or `status`; the site blocks you only when it refuses the job or "
-            "no session runs.\n"
-            "- `<name>` must be unique to what you are doing and must start with your "
-            "request's prefix when one is set (`$MV2FLOW_JOB_PREFIX`). Its log is "
-            f"`{spool}/logs/<name>.log` and **that file is the result**; your recollection of "
-            "what scrolled past is not.\n"
-            f"- `{control} status` shows what runs, what waits and why. "
-            f"`{control} cancel <name>` is the only way to stop a job: never `kill`, "
-            "`pkill` or time out a process yourself.\n"
-            "\n"
-            "The script runs inside the container on the compute node, so it sees the same "
-            "filesystem you do. Start it with:\n"
-            "\n"
-            "```bash\n"
-            f"{exports}\n"
-            "```\n"
-            "\n"
-            f"The Python interpreter is `{self.python}`. World size {self.world_size}.\n"
-            "\n"
-            + describe_sessions(self.sessions)
-            + (
-                "This run is **multi-rank**, so an engine command has to be launched with "
-                "the ranks already in place:\n"
-                "\n"
-                "```bash\n"
-                f"{self._mpirun_launch('<your command>')}\n"
-                "```\n"
-                "\n"
-                "Without the wrapper the LLM API sees a world size of 1, concludes it must "
-                "create the other ranks itself, and dies with `MPI_ERR_SPAWN` — which the "
-                "container runtime forbids. Do not work around that by reducing the world "
-                "size.\n"
-                "\n"
-                "**Copy that line whole.** The `env -u SLURM_...` prefix and "
-                "`--oversubscribe` are not decoration: this `mpirun` runs inside the "
-                "session's own one-task Slurm allocation, so without them it either "
-                "refuses to start (*not enough slots*) or starts "
-                f"{self.ntasks} processes that each believe they are rank 0 of a world "
-                "of 1 and hang forever with no error.\n"
-                "\n"
-                if self.needs_llmapi_launch
-                else ""
-            )
-            + "**Do not construct a launcher command, do not probe for one, and do not call a "
-            "test-runner skill.** The session was resolved before you started and it is not "
-            "yours to rediscover. If this protocol does not fit what you need to run, that "
-            "is a **symptom to report in your final message** — not a problem to solve.\n"
-        )
-
-
-def shares_allocation_with_spool(env: "RunEnvironment") -> str | None:
-    """Warn when the orchestrator lives inside the allocation it dispatches to.
-
-    The evidence is the ``slurm_job`` of the spool's ``status.json``; only two known, equal job ids
-    warn.
-    """
-    if env.kind != "session_spool" or not env.spool:
-        return None
-    # A spool job has no SLURM_* variables (they are scrubbed) and carries the session's job id
-    # under this name instead.
-    mine = os.environ.get("SLURM_JOB_ID") or os.environ.get("MV2FLOW_SPOOL_SESSION_JOBID")
-    if not mine:
-        return None
-    theirs = str((read_json(SpoolPaths(env.spool).snapshot) or {}).get("slurm_job") or "")
-    if not theirs or theirs == "unknown" or theirs != mine:
-        return None
-    return (
-        f"the orchestrator is running inside Slurm job {mine}, which is also the "
-        f"compute session watching {env.spool}. They will die together, and this "
-        f"process needs no GPU: launch it in its own allocation "
-        f"(`--gpus-per-node=0`) so a preempted session costs you the work in "
-        f"flight and not the run."
-    )
-
-
-def scheduler_owns_devices(kind: str) -> bool:
-    """Whether a scheduler, not this process, decides the devices and the host.
-
-    "Not local" rather than a list of remote kinds: a kind added later is remote until someone
-    says otherwise, the safe default.
-    """
-    return kind != "local"
-
 
 def resolve_environment(
     task_data: Mapping[str, Any],
@@ -316,7 +222,6 @@ def resolve_environment(
     block = dict(task_data.get("environment") or {})
     env = {str(k): str(v) for k, v in (block.get("env") or {}).items()}
 
-    declared = sessions_from_task({"environment": block}) if block.get("sessions") else ()
     return RunEnvironment(
         kind=str(block.get("kind", "local")),
         python=str(block.get("python", "python3")),
@@ -324,8 +229,6 @@ def resolve_environment(
         devices=tuple(int(d) for d in devices),
         world_size=max(1, int(world_size)),
         container_image=block.get("container_image"),
-        spool=block.get("spool"),
-        sessions=declared,
     )
 
 
@@ -394,7 +297,7 @@ __all__ = [
     "MPI_SETTINGS_KEPT",
     "SINGLE_TASK_MPI_SCRUB",
     "single_task_scrub",
+    "env_assignments",
+    "prepend_to_inherited",
     "resolve_environment",
-    "scheduler_owns_devices",
-    "shares_allocation_with_spool",
 ]

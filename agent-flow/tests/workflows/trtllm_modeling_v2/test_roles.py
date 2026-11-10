@@ -355,13 +355,13 @@ def kernel_context() -> kernel.KernelContext:
     )
 
 
-@pytest.mark.parametrize("environment,devices", [("local", 1), ("local", 4), ("session_spool", 4)])
-def test_kernel_device_assignment_respects_scheduler_and_device_zero(
+@pytest.mark.parametrize("environment,devices", [("local", 1), ("local", 4)])
+def test_kernel_writers_are_spread_over_the_hosts_devices(
     kernel_context: kernel.KernelContext, environment: str, devices: int
 ) -> None:
     ctx = replace(kernel_context, environment_kind=environment, devices=devices)
     text = kernel.kernel_prompt(ctx)
-    assert ("CUDA_VISIBLE_DEVICES=0" in text) is (environment == "local" and devices > 1)
+    assert ("CUDA_VISIBLE_DEVICES=0" in text) is (devices > 1)
     assert text.index(ctx.note) < text.index("## Your task")
     assert text.index("## Tag `kernel`") < text.index("## Tag `fix`")
     assert "from .ops.norm.rmsnorm__r4 import rmsnorm" in text

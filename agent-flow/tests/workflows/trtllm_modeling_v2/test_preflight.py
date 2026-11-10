@@ -111,29 +111,6 @@ def test_a_relative_variant_needs_its_units_benchmark_and_disagg_one_node(tmp_pa
         preflight.check_disagg_placement(task)
 
 
-def test_a_gate_longer_than_one_gates_allocation_is_refused_before_it_waits_for_ever():
-    task = {
-        "environment": {
-            "kind": "session_spool",
-            "sessions": [
-                {"name": "gates", "spool": "/g", "role": "gates", "time_limit": "02:00:00"},
-                {"name": "work", "spool": "/w", "role": "work", "time_limit": "08:00:00"},
-            ],
-        },
-        "accuracy": {},
-    }
-    with pytest.raises(preflight.PreflightError, match="accuracy.timeout is 14400s"):
-        preflight.check_gate_budgets(task)
-    task["accuracy"]["timeout"] = 5400
-    (note,) = preflight.check_gate_budgets(task)
-    assert "accuracy.timeout 5400s" in note and "7200s" in note
-    # A slow load gets a longer boot or acceptance leg; the longest one declared counts.
-    task["accuracy"]["boot"] = {"timeout": 3600, "core": {"timeout": 9000}}
-    with pytest.raises(preflight.PreflightError, match="accuracy.boot.timeout is 9000s"):
-        preflight.check_gate_budgets(task)
-    assert preflight.check_gate_budgets({"environment": {"kind": "local"}}) == []
-
-
 def _fake_boot(fails: dict[str, str], booted: list):
     """A boot gate that fails the members named in ``fails`` with their detail."""
 
@@ -174,49 +151,6 @@ def test_a_unified_substrate_is_proven_by_the_first_member_the_stock_path_serves
     monkeypatch.setattr(preflight.boot_checks, "run_boot_gate", _fake_boot({}, booted))
     preflight.substrate_gate(task, environment, shell_runner=None, workdir=tmp_path, notes=notes)
     assert booted == [None]
-
-
-def test_a_substrate_pass_stands_for_more_sessions_but_not_for_another_environment(tmp_path):
-    """Sessions and spools are where jobs queue; every other environment field is the boot's."""
-    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
-        resolve_environment,
-    )
-    from agent_flow.workflows.trtllm_modeling_v2.run.startup.bootstrap import (
-        substrate_inputs,
-        substrate_reuse,
-    )
-
-    def inputs(**environment):
-        task = _task(tmp_path, environment=environment)
-        return substrate_inputs(task, resolve_environment(task, world_size=4))
-
-    gates = {"name": "gates", "spool": "/s/gates", "env": {"A": "1"}, "setup": ["source /e.sh"]}
-    block = {
-        "kind": "session_spool",
-        "python": "/venv/bin/python",
-        "container_image": "/images/trtllm.sqsh",
-        "mounts": ["/data:/data"],
-        "env": {"TMPDIR": _SCRATCH},
-        "sessions": [gates],
-    }
-    record = {"at": 0.0, "inputs": inputs(**block)}
-    perf = [
-        {**gates, "name": f"perf{n}", "spool": f"/s/perf{n}", "time_limit": "4h"} for n in (1, 2)
-    ]
-    resized = {**gates, "role": "gates", "nodes": 2, "gpus_per_node": 8, "handover_lead": "30m"}
-    grown = {**block, "sessions": [{**resized, "scheduler": {"default_wall": "3h"}}, *perf]}
-    assert substrate_reuse(record, inputs(**grown), now=60.0)[0]
-    for changed in (
-        {"container_image": "/images/other.sqsh"},
-        {"mounts": ["/data:/data", "/models:/models"]},
-        {"env": {"TMPDIR": _SCRATCH, "NCCL_DEBUG": "INFO"}},
-        {"python": "/other/bin/python"},
-        {"sessions": [gates, {**gates, "name": "perf1", "setup": ["source /other.sh"]}]},
-        # A field no list names counts too.
-        {"gpu_memory_gib": 80},
-    ):
-        reusable, why = substrate_reuse(record, inputs(**{**block, **changed}), now=60.0)
-        assert not reusable and "environment" in why, changed
 
 
 def test_multirank_probe_launches_the_run_interpreter_on_claimed_devices():

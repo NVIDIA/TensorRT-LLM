@@ -105,8 +105,8 @@ trtllm_repo_path: /path/to/TensorRT-LLM
 # REQUIRED: how GPU work is launched, resolved once into the command prefix every prompt carries.
 
 environment:
-  # REQUIRED. `local`: this host, the devices preflight claims. `session_spool`: long-lived compute
-  # sessions whose spool scheduler runs every job (infra/compute/sessions.py).
+  # REQUIRED. `local`, the one kind: every command runs on the orchestrator's own host, on the
+  # devices preflight claims. On a cluster, start the orchestrator inside the allocation.
   kind: local
 
   # REQUIRED: the interpreter every Python command runs under, the editable install to measure.
@@ -124,41 +124,12 @@ environment:
   # which also gives up the MPI spawn and NVRTC checks.
   # substrate_checkpoint: /path/to/Qwen3-30B-A3B
 
-  # --- session_spool ------------------------------------------------------
-  # REQUIRED with session_spool: the gate spool, a directory a running session watches.
-  # spool: /path/to/scratch/spool
-  # gpus_per_node: 4
+  # gpus_per_node: 4                        # the devices this host holds
   # gpu_memory_gib: 288                     # per device: the lint sizes engines and disagg by it
-  # time_limit: "04:00:00"                  # the bare spool's own session
   # The image the GPU jobs run in, if any, and how host paths appear inside it: the intake lint
   # checks the run's paths through them. How the image is started is yours.
   # container_image: /path/to/image
   # mounts: [/data:/data]
-  #
-  # The sessions the run stands on, each a process on a GPU node whose main process is the spool
-  # scheduler (a bare `spool` is one, `default`); `trtllm-modeling-v2 session render --task
-  # task.yaml --name a` writes its entry script, and you start it however your cluster starts
-  # work. With a `time_limit` it is in hand-over `handover_lead` before its end: start the next
-  # session on the same spool before then and it takes the jobs that no longer fit.
-  # `nodes: N` runs the entry once on each of N nodes, each a watcher of the spool: a job submitted
-  # with `--nodes N` holds them all. No check of this workflow needs more than one node.
-  # sessions:
-  #   - name: a
-  #     spool: /path/to/scratch/spool          # the gate spool above; absolute, one per session
-  #     role: gates                            # gates | work | any (the default)
-  #     # Gates run on environment.spool and every `gates` or `any` session; a `work` session
-  #     # gets only what a worker submits to it.
-  #     nodes: 1                               # default 1
-  #     gpus_per_node: 4
-  #     time_limit: "24:00:00"
-  #     handover_lead: "01:00:00"              # default 1h
-  #     env: {}                                # over environment.env
-  #     setup: []                              # shell lines the entry script runs first
-  #     scheduler: {default_wall: 2h}          # wall limit for GPU jobs that set none; the only option
-  #   - {name: b, spool: /path/to/scratch/spool-b, role: work}   # catalog tests, microbenchmarks
-  # How long a gate lost to its session waits for one to heart-beat again before the check is left
-  # without a verdict, to run again later: seconds, 90m, 2h or HH:MM:SS. Default 1h.
-  # session_wait: 1h
 
 # ---------------------------------------------------------------- accuracy
 # REQUIRED. The release criterion: measured >= reference - k x SE (see `floor`). The anchor comes
@@ -182,8 +153,7 @@ accuracy:
   # In benchmark points; read only under `floor.rule: tolerance`. Default 5.0.
   tolerance: 5.0
 
-  # Seconds one complete benchmark command may take (default 14400, four hours). Preflight refuses
-  # a timeout longer than a gates session's time limit: leave room in it for loading and teardown.
+  # Seconds one complete benchmark command may take (default 14400, four hours).
   # timeout: 14400
 
   # The sample count for the SE where the eval's output and `--num_samples` do not say it and the
@@ -217,8 +187,7 @@ accuracy:
   #   test: tests/integration/defs/accuracy/test_disaggregated_serving.py::TestMyModel::test_auto_dtype
   #   env: {LLM_MODELS_ROOT: /path/to/models}   # what the test reads
   #   devices: 4                   # per node; default: two engines at the member's width, at most a node
-  #   nodes: 1                     # default; N > 1 runs one pytest per node of a gates session of N
-  #                                # nodes (MV2FLOW_JOB_NODE_RANK/HOSTS/NODES); every node's report must pass
+  #   nodes: 1                     # the default and the only value: every check runs on one host
   #   tests: []                    # more node ids, each run as a job of its own
   #   timeout: 7200                # default, seconds
 

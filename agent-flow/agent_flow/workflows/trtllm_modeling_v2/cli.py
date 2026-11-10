@@ -56,7 +56,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--site",
         type=Path,
         default=None,
-        help="With --checkpoint: the cluster's site.yaml, the environment, sessions, device "
+        help="With --checkpoint: the site.yaml, the environment, device "
         "and defaults the spec is derived with.",
     )
     parser.add_argument(
@@ -111,15 +111,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run preflight, resolve the environment, print the plan of "
         "record, and stop before the first agent turn. The fastest way to "
         "find out whether this host can host this run.",
-    )
-    parser.add_argument(
-        "--wait-for-spool",
-        type=float,
-        default=0.0,
-        metavar="MINUTES",
-        help="With a session_spool environment, wait up to MINUTES for the "
-        "spool to appear (its compute session is still importing the image) "
-        "instead of failing validation at once.",
     )
     parser.add_argument(
         "--skip-substrate-gate",
@@ -291,37 +282,11 @@ SUBCOMMANDS = {
     # From a request to a spec, before launch: `intake derive|lint ...` (spec/INTAKE.md).
     "intake": _lazy_main(".spec.intake"),
     "gate": _lazy_main(".checks.gate_cli"),
-    # Compute sessions: render entry scripts, hand-over.
-    "session": _lazy_main(".infra.compute.sessions"),
-    # Jobs in a session's spool: `spool submit|launch|wait|status|cancel ...`.
-    "spool": _lazy_main(".infra.compute.spoolctl"),
     # The operator's loop of a run: wait, status.
     "monitor": _lazy_main(".infra.monitor.status"),
     # A message for the planner of a running run: `feedback --workspace W "..."`.
     "feedback": _feedback,
 }
-
-
-def _wait_for_spool(task: Path, timeout_s: float, poll_s: float = 15.0) -> bool:
-    """Wait for a session_spool environment's spool directory; validation still owns the verdict."""
-    import time
-
-    import yaml
-
-    try:
-        env = (yaml.safe_load(task.read_text()) or {}).get("environment") or {}
-    except (OSError, yaml.YAMLError):
-        return False
-    spool = env.get("spool") if env.get("kind") == "session_spool" else None
-    if not isinstance(spool, str) or Path(spool).is_dir():
-        return True
-    print(f"→ waiting up to {timeout_s / 60:g} min for the spool {spool} (its session is starting)")
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        time.sleep(poll_s)
-        if Path(spool).is_dir():
-            return True
-    return False
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -330,11 +295,6 @@ def main(argv: list[str] | None = None) -> None:
     if argv and argv[0] in SUBCOMMANDS:
         sys.exit(SUBCOMMANDS[argv[0]](argv[1:]))
     args = _parse_args(argv)
-    if args.wait_for_spool > 0:
-        # A derived task takes its environment from the site.
-        spec = args.site if args.checkpoint is not None else args.task
-        _wait_for_spool(Path(spec), args.wait_for_spool * 60)
-
     # Validate at the CLI boundary: an invalid spec must abort before any
     # agent is constructed.
     from .spec.derive import DeriveError

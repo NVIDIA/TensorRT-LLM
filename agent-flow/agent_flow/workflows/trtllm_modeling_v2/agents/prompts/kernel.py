@@ -7,7 +7,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from ...infra.compute.environment import scheduler_owns_devices
 from ...operators.coverage import (
     HIGHEST_REUSING_TIER,
     MODE_ONBOARD,
@@ -53,14 +52,9 @@ def _tier(value: Any) -> int | None:
 
 
 def kernel_prompt(ctx: KernelContext) -> str:
-    """Render the dispatch, assigning local devices only when no scheduler owns them."""
-    # Concurrent local writers otherwise take the same device. A scheduler
-    # assigns devices itself, which a local index would mask.
-    device = (
-        ctx.item.n % ctx.devices
-        if ctx.devices > 1 and not scheduler_owns_devices(ctx.environment_kind)
-        else None
-    )
+    """Render the dispatch, spreading kernel writers over the host's devices."""
+    # Kernel tasks of one unit run beside each other: without an index each would take device 0.
+    device = ctx.item.n % ctx.devices if ctx.devices > 1 else None
     tier = _tier(ctx.tier)
     local_variant = ctx.paths is not None and ctx.landing != ctx.item.target
     row_note = (ctx.item.note or "").strip()

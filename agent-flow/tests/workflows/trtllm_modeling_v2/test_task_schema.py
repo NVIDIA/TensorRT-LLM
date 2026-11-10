@@ -115,13 +115,11 @@ def _checkpoint(root: Path) -> Path:
 def _site(root: Path, **changes) -> Path:
     repo = root / "repo"
     repo.mkdir(parents=True, exist_ok=True)
-    (root / "spool").mkdir(exist_ok=True)
     site = {
         "trtllm_repo_path": str(repo),
         "environment": {
-            "kind": "session_spool",
+            "kind": "local",
             "python": "/opt/venv/bin/python",
-            "spool": str(root / "spool"),
             "env": {"TMPDIR": SCRATCH, "CLAUDE_CODE_TMPDIR": SCRATCH},
         },
         "device": {"arch": "sm_100"},

@@ -36,8 +36,7 @@ from ...checks.check_config import resolve_llm_api_options, speculation_flags
 from ...checks.runtime_evidence import reports_unsupported_architecture
 from ...infra.compute import environment as environment_mod
 from ...infra.compute.commands import CommandResult, CommandSpec, LocalCommandExecutor
-from ...infra.compute.environment import RunEnvironment, resolve_environment, scheduler_owns_devices
-from ...infra.compute.sessions import GATE_ROLES, sessions_from_task
+from ...infra.compute.environment import RunEnvironment, resolve_environment
 from ...infra.git import git_output
 from ...operators.coverage import MODELING_V2_PACKAGE
 from ...spec.derive import hybrid_marker
@@ -517,21 +516,11 @@ def check_disagg_placement(task_data: Mapping[str, Any]) -> list[str]:
     if spec is None:
         return []
     if spec.nodes > 1:
-        environment = task_data.get("environment") or {}
-        sessions = environment.get("sessions") or ()
-        available = max(
-            [
-                int(session.get("nodes", 1))
-                for session in sessions
-                if session.get("role", "any") in GATE_ROLES
-            ]
-            or [1]
+        raise PreflightError(
+            f"accuracy.disagg.nodes is {spec.nodes}: the workflow runs every check on the "
+            "orchestrator's own host, one node. Write the disaggregated test for one node "
+            "(its context and generation engines on that node's devices)."
         )
-        if environment.get("kind") != "session_spool" or available < spec.nodes:
-            raise PreflightError(
-                f"disagg needs {spec.nodes} nodes in one session_spool allocation; "
-                f"the declared gate sessions provide {available}"
-            )
     if not spec.devices or not spec.node_gpus:
         return []
     if spec.devices > spec.node_gpus:
@@ -543,52 +532,6 @@ def check_disagg_placement(task_data: Mapping[str, Any]) -> list[str]:
         )
     return [
         f"disagg: the test {spec.test} runs on {spec.devices} devices per node across {spec.nodes} node(s)"
-    ]
-
-
-def check_gate_budgets(task_data: Mapping[str, Any]) -> list[str]:
-    """Every gate's time limit fits in one allocation of the sessions that run the gates.
-
-    The spool admits a job only where it can finish before its allocation ends, so a
-    gate whose limit is longer than a whole allocation is never admitted: it would wait
-    for ever. The benchmark's limit is ``accuracy.timeout`` (default four hours), the
-    disaggregated test's ``accuracy.disagg.timeout``, and a boot's or an acceptance leg's
-    the longest ``timeout`` ``accuracy.boot`` or ``accuracy.acceptance`` declares.
-    """
-    sessions = [s for s in sessions_from_task(task_data) if s.role in GATE_ROLES and s.time_limit_s]
-    if not sessions:
-        return []
-    budget = int(max(s.time_limit_s for s in sessions))
-    accuracy = task_data.get("accuracy") or {}
-    limits = {
-        "accuracy.timeout": int(accuracy.get("timeout") or accuracy_checks.ACCURACY_TIMEOUT_S)
-    }
-    disagg = disagg_checks.DisaggSpec.from_task(task_data)
-    if disagg is not None:
-        limits["accuracy.disagg.timeout"] = int(disagg.timeout)
-    for block in ("boot", "acceptance"):
-        level = accuracy.get(block)
-        levels = [level, *level.values()] if isinstance(level, Mapping) else []
-        declared = [
-            int(entry["timeout"])
-            for entry in levels
-            if isinstance(entry, Mapping) and entry.get("timeout") is not None
-        ]
-        if declared:
-            limits[f"accuracy.{block}.timeout"] = max(declared)
-    over = {key: limit for key, limit in limits.items() if limit > budget}
-    if over:
-        raise PreflightError(
-            "; ".join(f"{key} is {limit}s" for key, limit in over.items())
-            + f", longer than one gates allocation ({budget}s): the spool never admits a job "
-            f"that cannot finish in its allocation, so it would wait for ever. Set it below "
-            f"{budget}s (with room for loading the model), or give the gates sessions a longer "
-            "time_limit."
-        )
-    return [
-        "gate time limits within one gates allocation ("
-        + ", ".join(f"{key} {limit}s" for key, limit in limits.items())
-        + f" <= {budget}s)"
     ]
 
 
@@ -1063,7 +1006,6 @@ def run_preflight(
     notes.extend(check_variant_anchors(task_data, world_size))
     notes.extend(check_launch_settings(task_data))
     notes.extend(check_disagg_placement(task_data))
-    notes.extend(check_gate_budgets(task_data))
     notes.extend(check_speculation_support(task_data))
     notes.extend(check_capture_lists(task_data))
     notes.extend(check_kv_cache_configs(task_data, checkpoint_config))
@@ -1076,23 +1018,10 @@ def run_preflight(
         raise PreflightError(str(exc)) from exc
 
     python = str(env_block.get("python", "python3"))
-    # A device claim only means anything when the orchestrator and the GPUs
-    # are the *same machine* (`local`); under a scheduler the allocation is the claim.
-    scheduled = scheduler_owns_devices(str(env_block.get("kind", "local")))
-    devices: tuple[int, ...] = ()
-    if not scheduled:
-        devices = claim_devices(world_size, arch, python, runner=runner, notes=notes)
-    if scheduled:
-        notes.append(
-            f"{env_block.get('kind')}: devices are the scheduler's to allocate, so "
-            f"preflight claims none and asserts no architecture locally. `arch: {arch}` "
-            f"is taken on trust here and is what the receipts will be keyed by."
-        )
-
+    # The orchestrator and the GPUs are the same machine: the devices are claimed here.
+    devices = claim_devices(world_size, arch, python, runner=runner, notes=notes)
     environment = resolve_environment(task_data, devices=devices, world_size=world_size)
-
-    if not scheduled:
-        check_multirank_substrate(world_size, environment, runner)
+    check_multirank_substrate(world_size, environment, runner)
 
     slug = derive_slug(task_data)
     family, target_rel = resolve_target_identity(task_data, checkpoint_config)
@@ -1146,7 +1075,7 @@ def format_preflight_report(result: PreflightResult) -> str:
         f"branch:      {result.branch}",
         f"target:      {result.target_rel}",
         f"world size:  {result.world_size}",
-        f"devices:     {', '.join(str(d) for d in result.devices) or '(assigned by compute sessions)'}",
+        f"devices:     {', '.join(str(d) for d in result.devices) or '(none)'}",
         f"launch:      {result.environment.kind}",
         f"prefix:      {result.environment.prefix or '(none)'}",
         f"interpreter: {shlex.quote(result.environment.python)}",
@@ -1170,7 +1099,6 @@ __all__ = [
     "UnsupportedSpeculationError",
     "check_capture_lists",
     "check_disagg_placement",
-    "check_gate_budgets",
     "check_variant_anchors",
     "check_kv_cache_configs",
     "check_speculation_support",

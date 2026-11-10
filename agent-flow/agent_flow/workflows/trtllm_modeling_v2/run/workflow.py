@@ -242,15 +242,12 @@ class TrtllmModelingV2Workflow:
         )
 
     def _writable_roots(self) -> tuple[str, ...]:
-        """What a role writes outside the workspace: the checkout and the run's spools.
+        """What a role writes outside the workspace: the checkout.
 
         A task's worktree commits into the checkout's ``.git``.
         """
-        roots = [self.task_data.get("trtllm_repo_path")]
-        if self.environment is not None:
-            env = self.environment
-            roots += [env.spool, *(session.spool for session in env.sessions)]
-        return tuple(dict.fromkeys(str(root) for root in roots if root and Path(root).is_dir()))
+        root = self.task_data.get("trtllm_repo_path")
+        return (str(root),) if root and Path(root).is_dir() else ()
 
     def _layer(self, name: str) -> AgentLayer:
         """Build a role's layer on first use and keep it for the run."""

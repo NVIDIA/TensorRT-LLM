@@ -16,7 +16,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
 import yaml
 from rich.markup import escape as escape_markup
@@ -29,11 +29,7 @@ from ...agents.roles import packaged_skills
 from ...agents.turns import TURNS_DIRNAME
 from ...checks import check_config, gate_cli
 from ...checks import datasets as datasets_mod
-from ...infra.compute.environment import (
-    MAX_TMPDIR_LEN,
-    RunEnvironment,
-    shares_allocation_with_spool,
-)
+from ...infra.compute.environment import MAX_TMPDIR_LEN, RunEnvironment
 from ...infra.compute.executor import select_command_executor, shell_runner_for
 from ...infra.files import read_json, write_json_atomic
 from ...operators import prior_art, tree_anchors
@@ -87,12 +83,7 @@ def substrate_inputs(task_data: Mapping[str, Any], environment: RunEnvironment) 
       ``options``, the options file it reads, by content;
     - ``checkout``: the checkout it ran in, by path.
 
-    Not by where jobs queue: of the sessions only the env and setup lines
-    their processes start with count, as a set (a session added like the
-    others adds nothing). Not by the
-    checkout's content: the tree changes with every integration, and every
-    gate of the run measures it on this same substrate under the tree's own
-    marker.
+    Not by the checkout's content: the tree changes with every integration.
     """
     accuracy = task_data.get("accuracy") or {}
     options = check_config.resolve_llm_api_options(accuracy, None)
@@ -100,16 +91,9 @@ def substrate_inputs(task_data: Mapping[str, Any], environment: RunEnvironment) 
     if options and Path(str(options)).is_file():
         options_text = Path(str(options)).read_text(encoding="utf-8", errors="replace")
     block = dict(task_data.get("environment") or {})
-    resolved = dataclasses.asdict(dataclasses.replace(environment, sessions=()))
     parts: dict[str, Any] = {
-        "environment": {
-            **resolved,
-            "sessions": _session_runtimes(dataclasses.asdict(s) for s in environment.sessions),
-        },
-        "spec_environment": {
-            **block,
-            "sessions": _session_runtimes(s for s in block.get("sessions") or () if s),
-        },
+        "environment": dataclasses.asdict(environment),
+        "spec_environment": block,
         "engine": {
             "checkpoint_path": task_data.get("checkpoint_path"),
             "parallel": task_data.get("parallel"),
@@ -119,16 +103,6 @@ def substrate_inputs(task_data: Mapping[str, Any], environment: RunEnvironment) 
         "checkout": task_data.get("trtllm_repo_path"),
     }
     return agent_probe.part_digests(parts)
-
-
-def _session_runtimes(sessions: Iterable[Mapping[str, Any]]) -> list[str]:
-    """The distinct env and setup lines ``sessions`` start their processes with."""
-    return sorted(
-        {
-            json.dumps([dict(s.get("env") or {}), list(s.get("setup") or ())], sort_keys=True)
-            for s in sessions
-        }
-    )
 
 
 def substrate_reuse(
@@ -213,21 +187,9 @@ def _run_preflight(workflow, state: WorkflowState, log) -> bool:
 
     # Where this run's commands land, decided once, from the resolved
     # environment. An explicitly injected runner still wins.
-    workflow._command_executor = select_command_executor(
-        result.environment,
-        # The checkout under test: gates run in it and the session refuses
-        # a result whose ranks imported the engine from anywhere else.
-        tree=workflow.task_data.get("trtllm_repo_path"),
-        note=lambda said: workflow.journal.event("waiting", said),
-    )
+    workflow._command_executor = select_command_executor(result.environment)
     if workflow._shell_runner_override is None:
         workflow._shell_runner = shell_runner_for(workflow._command_executor)
-
-    # Legal configurations that cost hours: notes, not errors.
-    for warning in (shares_allocation_with_spool(result.environment),):
-        if warning:
-            result.notes.append(warning)
-            print_message(f"[bold yellow]⚠ {warning}[/bold yellow]", log)
 
     # A dry run proves the agents too: whether turns work is what it asks.
     if not _prove_agents(workflow, log):
@@ -266,17 +228,10 @@ def _run_preflight(workflow, state: WorkflowState, log) -> bool:
 
 
 def _cpu_probe_runner(workflow, result: PreflightResult):
-    """Run build and processor introspection in the session without reserving a GPU."""
+    """The runner for build and processor introspection: one CPU process on this host."""
     if workflow._shell_runner_override is not None:
         return workflow._shell_runner_override
-    return shell_runner_for(
-        select_command_executor(
-            result.environment,
-            name_prefix="preflight-cpu",
-            tree=workflow.task_data.get("trtllm_repo_path"),
-            gpus="0",
-        )
-    )
+    return shell_runner_for(select_command_executor(result.environment))
 
 
 def _check_processor(workflow, result: PreflightResult, log) -> bool:
@@ -568,8 +523,6 @@ TREE_MAP_FILENAME = "tree_map.md"
 
 def _checkpoint_config(task_data: Mapping[str, Any]) -> dict[str, Any]:
     """The checkpoint's ``config.json``, or ``{}`` when it cannot be read here."""
-    import json
-
     try:
         path = Path(str(task_data.get("checkpoint_path") or "")) / "config.json"
         config = json.loads(path.read_text(encoding="utf-8"))

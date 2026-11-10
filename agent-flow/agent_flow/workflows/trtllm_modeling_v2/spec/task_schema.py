@@ -24,7 +24,6 @@ from agent_flow.agent_runtime import AGENTS_FIELD, validate_agents
 from ..agents.roles import ROLES
 from ..checks import accuracy_policy
 from ..infra.compute.environment import EnvironmentError, check_tmpdir
-from ..infra.compute.sessions import validate_sessions
 from ..infra.git import COMMIT_POLICY_FIELD, validate_commit_policy_block
 from .schema_keys import reject_unknown_keys
 from .variants import ANCHOR_RECORDED, ANCHOR_RELATIVE, VARIANTS_FIELD, validate_variants
@@ -307,12 +306,10 @@ ENVIRONMENT_KEYS: tuple[str, ...] = (
     "kind",
     "python",
     "env",
-    "spool",
     # The image the GPU jobs run in, if any, and how host paths appear inside it
     # (`host:inside`): the intake lint checks the run's paths through them.
     "container_image",
     "mounts",
-    "time_limit",
     "gpus_per_node",
     # Each device's memory, GiB: the intake lint sizes engines and disaggregation by it.
     "gpu_memory_gib",
@@ -320,14 +317,14 @@ ENVIRONMENT_KEYS: tuple[str, ...] = (
     # `preflight.substrate_gate` when the run's own checkpoint has an
     # architecture that path has never heard of.
     "substrate_checkpoint",
-    # The compute sessions the run stands on.
-    "sessions",
-    # How long the orchestrator waits for a gate session that stopped
-    # heart-beating before it closes the run resumably.
-    "session_wait",
 )
 
-ENVIRONMENT_KINDS: tuple[str, ...] = ("local", "session_spool")
+#: Where the run's commands land: on the orchestrator's own host. Running them anywhere else
+#: (a queue of compute sessions, a batch scheduler) is not this workflow's: start the
+#: orchestrator where the GPUs are.
+ENVIRONMENT_KINDS: tuple[str, ...] = ("local",)
+#: Keys of the compute-session executor the workflow no longer ships, refused with why.
+REMOVED_ENVIRONMENT_KEYS: tuple[str, ...] = ("spool", "sessions", "session_wait")
 ENVIRONMENT_REQUIRED_FIELDS: tuple[str, ...] = ("kind", "python")
 
 # Accuracy tolerance, in benchmark points, under `accuracy.floor.rule:
@@ -589,17 +586,6 @@ def _validate_members(
                 continue
             world_sizes[entry] = size
 
-    if len(set(world_sizes.values())) > 1 and environment_kind == "local":
-        widest = max(world_sizes, key=lambda m: world_sizes[m])
-        narrowest = min(world_sizes, key=lambda m: world_sizes[m])
-        errors.append(
-            f"'{MEMBERS_FIELD}' mixes world sizes: {narrowest} wants "
-            f"{world_sizes[narrowest]} device(s) and {widest} wants {world_sizes[widest]}. "
-            f"A local run claims one set of devices for every member, so they must all "
-            f"declare the same world size; under `environment.kind: session_spool` each "
-            f"gate asks the scheduler for its own member's devices."
-        )
-
 
 def _validate_environment(block: Any, errors: list[str]) -> None:
     """Validate the ``environment`` block in place, appending to ``errors``."""
@@ -608,9 +594,22 @@ def _validate_environment(block: Any, errors: list[str]) -> None:
             f"'{ENVIRONMENT_FIELD}' must be a mapping, got {type(block).__name__}"
         )
 
-    reject_unknown_keys(block, ENVIRONMENT_KEYS, errors, where=ENVIRONMENT_FIELD)
-
-    validate_sessions(block, errors, where=ENVIRONMENT_FIELD)
+    removed = [key for key in REMOVED_ENVIRONMENT_KEYS if key in block]
+    if removed or block.get("kind") == "session_spool":
+        named = (
+            ", ".join(f"'{ENVIRONMENT_FIELD}.{key}'" for key in removed) or "kind: session_spool"
+        )
+        errors.append(
+            f"{named}: the compute-session executor is no longer part of this workflow. "
+            f"Use `kind: local` and start the orchestrator on the host that holds the GPUs "
+            f"(inside the allocation, on a cluster)."
+        )
+    reject_unknown_keys(
+        {k: v for k, v in block.items() if k not in REMOVED_ENVIRONMENT_KEYS},
+        ENVIRONMENT_KEYS,
+        errors,
+        where=ENVIRONMENT_FIELD,
+    )
 
     for name in ENVIRONMENT_REQUIRED_FIELDS:
         value = block.get(name)
@@ -618,7 +617,7 @@ def _validate_environment(block: Any, errors: list[str]) -> None:
             errors.append(f"'{ENVIRONMENT_FIELD}.{name}' must be a non-empty string")
 
     kind = block.get("kind")
-    if isinstance(kind, str) and kind not in ENVIRONMENT_KINDS:
+    if isinstance(kind, str) and kind not in (*ENVIRONMENT_KINDS, "session_spool"):
         errors.append(
             f"'{ENVIRONMENT_FIELD}.kind' must be one of {ENVIRONMENT_KINDS}; got {kind!r}"
         )
@@ -663,16 +662,6 @@ def _validate_environment(block: Any, errors: list[str]) -> None:
                 f"The substrate gate falls back to it only after the run's own "
                 f"checkpoint has already failed, so a missing proxy turns the "
                 f"longest step in preflight into two failures instead of one."
-            )
-
-    if kind == "session_spool":
-        spool = block.get("spool")
-        if not isinstance(spool, str) or not spool.strip():
-            errors.append(f"'{ENVIRONMENT_FIELD}.spool' is required when kind is 'session_spool'")
-        elif not Path(spool).is_dir():
-            errors.append(
-                f"'{ENVIRONMENT_FIELD}.spool' does not exist: {spool}. Start the compute "
-                f"session first — an unwatched spool accepts work and never completes it."
             )
 
 
@@ -1465,13 +1454,9 @@ def _require_relative_on_variants(data: Mapping[str, Any], errors: list[str]) ->
 
 
 def gpus_per_node(data: Mapping[str, Any]) -> int | None:
-    """The most devices one node of the run holds: ``environment`` or one of its sessions."""
-    env = data.get(ENVIRONMENT_FIELD) or {}
-    sizes = [env.get("gpus_per_node")] + [
-        s.get("gpus_per_node") for s in env.get("sessions") or () if isinstance(s, Mapping)
-    ]
-    sizes = [s for s in sizes if isinstance(s, int) and not isinstance(s, bool) and s > 0]
-    return max(sizes) if sizes else None
+    """The devices the run's host holds (``environment.gpus_per_node``), when the spec says."""
+    size = (data.get(ENVIRONMENT_FIELD) or {}).get("gpus_per_node")
+    return size if isinstance(size, int) and not isinstance(size, bool) and size > 0 else None
 
 
 def _require_disagg_test(data: Mapping[str, Any], errors: list[str]) -> None:
