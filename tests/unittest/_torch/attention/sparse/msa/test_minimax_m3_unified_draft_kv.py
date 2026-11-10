@@ -667,6 +667,7 @@ def test_window_sized_draft_ratio(pp_size: int) -> None:
     manager._disable_overlap_scheduler = False
     manager._generation_kv_capacity_headroom = 1
     manager.num_extra_kv_tokens = 0
+    manager.gen_preemption_headroom = 0
     configs = _configs(manager.layer_specs)
     draft_bytes_per_token = 2 * HEADS * HEAD_DIM * 2 * NUM_DRAFT
     token_share = draft_bytes_per_token / sum(
@@ -680,6 +681,13 @@ def test_window_sized_draft_ratio(pp_size: int) -> None:
         draft_bytes_per_token
     )
     assert windows_and_chunk <= draft_ratio * quota < token_share * quota
+    # Requests paused in place by GEN slot preemption keep their windows.
+    manager.gen_preemption_headroom = 2
+    paused_ratio = manager._windowed_draft_pool_ratio(configs, quota, 128)[1]
+    paused = windows_and_chunk + 2 * DRAFT_WINDOW * draft_bytes_per_token
+    assert paused <= paused_ratio * quota < token_share * quota
+    assert paused_ratio > draft_ratio
+    manager.gen_preemption_headroom = 0
     # Without the overlap scheduler a single-stage batch's retiring request frees its KV at once,
     # so half as many sequences hold a window.
     manager._disable_overlap_scheduler = True

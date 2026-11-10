@@ -4178,12 +4178,14 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_specs=draft_specs,
         )
         # Sequences that can hold KV at once, as max_admissible_sequences counts them: transfers
-        # in flight (disagg) or the overlap scheduler's retiring request double them.
+        # in flight (disagg) or the overlap scheduler's retiring request double them, and
+        # requests paused by GEN slot preemption stay resident.
         needs_extra_leases = self.is_disagg or (
             not self._disable_overlap_scheduler and not self.mapping.has_pp()
         )
         num_sequences = (
             self.max_batch_size * self.mapping.pp_size * (2 if needs_extra_leases else 1)
+            + self.gen_preemption_headroom
         )
         draft_bytes = (
             window_bytes_per_sequence * num_sequences + sum(draft_sizes) * self.max_num_tokens
