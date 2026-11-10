@@ -2804,6 +2804,11 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
                              telemetry: bool):
     """Launching disaggregated MPI worker"""
 
+    # Removed when the remaining serve commands move to commands/serve_cli/.
+    from tensorrt_llm.commands.serve import (
+        _build_llm_args_from_disagg_server_cfg,
+        _refuse_dense_dwdp_on_generation_servers)
+
     _command_telemetry.apply_disaggregated_telemetry_config(
         config_file,
         telemetry=telemetry,
@@ -2915,6 +2920,9 @@ class DisaggWorkerEnvs(StrEnum):
 
 
 def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
+    # Removed when the remaining serve commands move to commands/serve_cli/.
+    from tensorrt_llm.commands.serve import _DISAGG_SERVER_ROLES, launch_server
+
     # Launching the server
     instance_idx = os.environ.get(DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
     assert instance_idx is not None, f"{DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX} should be set by the launcher"
