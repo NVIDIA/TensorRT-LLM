@@ -3153,7 +3153,7 @@ class TestDeepseekV4CacheManager:
         num_generation_steps: int,
         dtype: DataType,
         compressor_dtype: DataType,
-        scratch_reuse_enabled: bool,
+        scratch_reuse_enabled: bool = True,
     ):
         max_batch_size = len(prompt_lens)
         max_seq_len = max(prompt_lens) + num_generation_steps + 1

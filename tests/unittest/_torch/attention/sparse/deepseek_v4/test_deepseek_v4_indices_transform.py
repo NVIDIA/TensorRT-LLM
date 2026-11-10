@@ -242,10 +242,12 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
     swa_buffer = cache_manager.get_buffers(layer_idx, DeepseekV4AttentionType.SWA)
     swa_buffer.copy_(torch.randn_like(swa_buffer))
 
+    compressed_buffer_flat = None
     if has_compressed:
         compressed_buffer = cache_manager.get_buffers(layer_idx, compressed_attn_type)
         # Generate random data in float32 first, then convert to target dtype (for FP8 support)
         random_data = torch.randn(compressed_buffer.shape, dtype=torch.float32, device=device)
+        compressed_buffer_flat = compressed_buffer.view(-1, scenario.head_dim)
         compressed_buffer.copy_(random_data.to(compressed_buffer.dtype))
 
     # Get block tables
@@ -264,8 +266,6 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
 
     # Flatten buffers for access
     swa_buffer_flat = swa_buffer.view(-1, scenario.head_dim)
-    if has_compressed:
-        compressed_buffer_flat = compressed_buffer.view(-1, scenario.head_dim)
 
     # Pad and convert block tables to tensors
     max_blocks_swa = max(len(bt) for bt in block_tables_swa)
@@ -386,6 +386,7 @@ def _run_test(scenario: Scenario, context_lengths: List[int]):
                         f"Token {t} compress out[{out_pos}]: expected valid index, got {global_idx}"
                     )
                     pool_based_idx = global_idx - compressed_offset
+                    assert compressed_buffer_flat is not None
                     actual = compressed_buffer_flat[pool_based_idx]
 
                     physical_idx = _local_to_physical_idx(

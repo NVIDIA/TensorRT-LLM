@@ -494,9 +494,6 @@ def _time_dispatch_and_combine(
         l2_flush_size = (l2_size * 2) // 4
         l2_buffer = torch.empty(l2_flush_size, dtype=torch.int32, device=device)
 
-    if cupti_ctx is not None:
-        cupti, cupti_kernels, cupti_events = cupti_ctx
-
     # ---- 1. Discover receive shape and allocate the combine payload ----
     backend.prepare_dispatch(token_selected_slots, all_rank_num_tokens)
     recv_hidden_states, _, _, _ = backend.dispatch(
@@ -558,6 +555,7 @@ def _time_dispatch_and_combine(
 
     phase_event_ids = []
     if cupti_ctx is not None:
+        cupti, cupti_kernels, cupti_events = cupti_ctx
         for i in range(iters):
             phase_event_ids.append(
                 (
@@ -605,6 +603,7 @@ def _time_dispatch_and_combine(
             backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
             _record_event(c_ends[i])
 
+    big_graph = None
     if use_cuda_graph:
         # Keep warmup and timed iterations in one replay to avoid a host-side gap.
         big_graph = torch.cuda.CUDAGraph()
@@ -613,16 +612,18 @@ def _time_dispatch_and_combine(
 
     # ---- 4. Clear setup records, synchronize, and execute ----
     if cupti_ctx is not None:
+        cupti, cupti_kernels, cupti_events = cupti_ctx
         cupti.activity_flush_all(0)
         cupti_kernels.clear()
         cupti_events.clear()
     _sync()
-    if use_cuda_graph:
+    if big_graph is not None:
         big_graph.replay()
     else:
         _run_iterations()
     _sync()
     if cupti_ctx is not None:
+        cupti, cupti_kernels, cupti_events = cupti_ctx
         cupti.activity_flush_all(0)
 
     # ---- 5. Read per-iteration CUDA-event timings ----
@@ -632,6 +633,7 @@ def _time_dispatch_and_combine(
     # ---- 6. Attribute CUPTI kernels to dispatch/combine phases ----
     detailed_stats = {"dispatch_kernels": [], "combine_kernels": [], "other_kernels": []}
     if cupti_ctx is not None:
+        cupti, cupti_kernels, cupti_events = cupti_ctx
         try:
             detailed_stats = _build_kernel_stats_cupti(cupti_kernels, cupti_events, phase_event_ids)
         except RuntimeError as exc:

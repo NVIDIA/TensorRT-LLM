@@ -1291,6 +1291,7 @@ def test_promotion_record_rejects_reversed_markers() -> None:
 def test_open_pr_checks_live_dev_tip_before_valid_feedback(
     world: World, monkeypatch: pytest.MonkeyPatch, consumer_base: str, case: str
 ) -> None:
+    tip = None
     world.base_branch = consumer_base
     args = world.args(publish=True)
     args.workdir = world.root
@@ -1346,6 +1347,7 @@ def test_open_pr_checks_live_dev_tip_before_valid_feedback(
                 assert "latest canonical branch tip" in message
                 assert "rebase" in message and "scripts/vendor/manage.py" in message
             if case in ("stale", "diverged"):
+                assert tip is not None
                 assert tip in message
     assert bool(matches) == (case in ("contained", "advance-during-attribution"))
     assert not any(call[0] == "push" for call in world.git_calls)
@@ -1801,6 +1803,8 @@ def test_interrupted_preparation_resumes_without_extra_commits(
 def test_incomplete_recovery_preserves_unexpected_edits(
     world: World, monkeypatch: pytest.MonkeyPatch, edit: str
 ) -> None:
+    preserved = None
+
     def interrupted(repo: Path, *args: str, text: str | None = None) -> str:
         if args[0] == "commit":
             raise RuntimeError("simulated interruption")
@@ -1829,6 +1833,7 @@ def test_incomplete_recovery_preserves_unexpected_edits(
     with pytest.raises(ValueError):
         m._publish(args, world, m._make_plan(args, world))
     if edit.startswith("index_only"):
+        assert preserved is not None
         assert _git(args.worktree, "show", f":{file}") == preserved
     else:
         assert (args.worktree / file).read_text() == "preserve this edit\n"

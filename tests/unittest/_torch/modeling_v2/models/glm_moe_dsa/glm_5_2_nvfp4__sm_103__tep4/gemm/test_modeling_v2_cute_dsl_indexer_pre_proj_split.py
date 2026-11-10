@@ -102,6 +102,7 @@ def test_a_handle_refuses_another_row_count() -> None:
     step's rows, so a mismatch must raise rather than compute a partial tile."""
     compiled = compile_handle(torch.cuda.current_device(), 2)
     with pytest.raises(ValueError, match="compiled for M=2"):
+        # pyrefly: ignore [bad-argument-count]
         op(*_build(4, seed=4), compiled)
 
 

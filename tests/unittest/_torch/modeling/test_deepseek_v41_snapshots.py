@@ -304,6 +304,7 @@ def test_encoder_snapshot_resumes_without_replay(
             assert manager.prepare_context(fresh)
             assert fresh.py_ced_replay is plan
             assert manager.context_replay_tokens(fresh) == 0
+        output = None
         start = 256
         for i, length in enumerate(chunks):
             final = i == len(chunks) - 1
@@ -320,6 +321,7 @@ def test_encoder_snapshot_resumes_without_replay(
                 model, metadata, [fresh], ids[start : start + length], [start], [length], 1
             )
             start += length
+        assert output is not None, "Expected at least one input chunk"
         torch.testing.assert_close(output, expected, rtol=3e-2, atol=3e-2)
         for layer, role, slot, before in saved:
             torch.testing.assert_close(

@@ -571,5 +571,6 @@ def test_mixed_precision_high_window_covers_every_draft_step(make_manager):
             assert all(held), (history, first_read, last_write, pages)
             assert pages[0] != kv.BAD_PAGE_INDEX  # the first_n sink
             history += 1 + rng.randint(0, draft)
+        pages = list(kv_cache.get_base_page_indices(high_group))
         # The window is tight: pages well before the last_n tokens were released.
         assert pages[2] == kv.BAD_PAGE_INDEX

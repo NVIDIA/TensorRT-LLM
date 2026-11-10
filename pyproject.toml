@@ -852,7 +852,7 @@ max-args = 10
 [tool.pyrefly]
 # Keep the existing diagnostic scope while adopting Pyrefly's error names.
 preset = "off"
-project-includes = ["tensorrt_llm"]
+project-includes = ["tensorrt_llm", "tests"]
 # Shared by Pyrefly project checks and the changed-file/report filters.
 project-excludes = [
     "tensorrt_llm/_torch/kernels/**",
@@ -863,7 +863,32 @@ project-excludes = [
     "tensorrt_llm/_torch/attention/backends/prims_ts/kernels/**",
     "tensorrt_llm/_torch/_experimental/**",
 ]
-search-path = ["."]
+# Shared test packages and cross-directory helpers used by pytest's import setup.
+search-path = [
+    ".",
+    "tests",
+    "tests/unittest",
+    "tests/integration",
+    "examples",
+    "examples/llm-api",
+    "examples/llm-api/out_of_tree_example",
+    "examples/disaggregated/slurm/cache_transceiver_test",
+    "scripts",
+    "jenkins/scripts/cbts",
+    "tests/unittest/llmapi/apps",
+    "tests/unittest/_torch/pyexecutor",
+    "tests/unittest/_torch/modeling_v2/comm",
+    "tests/unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/comm",
+    "tests/unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/moe",
+    "tests/unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/moe",
+    "tests/integration/defs/disaggregated",
+    "tests/integration/defs/llmapi",
+    "tests/integration/defs/sysinfo",
+    "tests/integration/defs/utils",
+    "tests/scripts/perf-sanity/cache_transceiver_precheck",
+]
+# Resolve sibling test helpers relative to each importing file.
+enable-fallback-search-path = true
 python-version = "3.10"
 check-unannotated-defs = true
 infer-return-types = "never"
@@ -918,6 +943,15 @@ ignore-missing-imports = [
     "smg_grpc_proto.*",
     "transformers_modules",
     "transformers_modules.*",
+    "requests.packages.urllib3.util.retry",
+    "imageio",
+    "imageio.v3",
+    "causal_conv1d",
+    "mamba_ssm",
+    "nemo_rl.models.generation.trtllm.trtllm_backend",
+    "modelexpress.load_strategy",
+    "modelexpress.engines",
+    "bindings.internal.batch_manager.kv_cache_manager_v2",
 ]
 
 [tool.pyrefly.errors]
@@ -930,10 +964,19 @@ missing-argument = "error"
 unexpected-keyword = "error"
 unexpected-positional-argument = "error"
 
+[[tool.pyrefly.sub-config]]
+matches = "tests/**"
+
+[tool.pyrefly.sub-config.errors]
+missing-argument = "ignore"
+unexpected-keyword = "ignore"
+bad-argument-count = "ignore"
+
 # Diagnostics for dynamically loaded modules and unresolved names.
 [tool.pyrefly-exclusions]
 symbols = [
     "etcd3.*",
+    "nvrtc",
     "PreTrainedConfig",
     "CSA2TrtllmMetadata",
     "MoEImplBase",

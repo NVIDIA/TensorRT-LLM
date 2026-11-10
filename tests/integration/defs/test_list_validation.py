@@ -90,16 +90,7 @@ def validate_perf_tests(perf_test_names) -> bool:
     return passed
 
 
-def test_list_validation(test_root, all_pytest_items, trt_config,
-                         is_trt_environment):
-
-    # Don't run test list validation in TRT environment because TRT uses
-    # YAML-based test-db for test lists.
-    if is_trt_environment:
-        print(
-            "Skipped TRT-LLM test list validation because the pipeline is running in TRT environment."
-        )
-        return
+def test_list_validation(test_root, all_pytest_items, trt_config):
 
     # Glob all the test list files.
     test_list_path = os.path.join(test_root, "test_lists", "*", "*.txt")

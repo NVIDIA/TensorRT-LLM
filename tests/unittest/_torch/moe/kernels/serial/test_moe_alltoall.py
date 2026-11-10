@@ -471,6 +471,7 @@ class TestMoeAlltoAllFP8SingleGPU(unittest.TestCase):
     def test_moe_alltoall_prepare(self, ep_rank: int, ep_size: int,
                                   expert_count: int, slot_count: int,
                                   top_k: int, max_token_count_per_rank: int):
+        gathered_expert_statics = None
         torch.cuda.set_device(0)
 
         cpu_expert_ids_all_ranks_lists = []
@@ -664,6 +665,7 @@ class TestMoeAlltoAllFP8SingleGPU(unittest.TestCase):
         for rank in range(ep_size):
             cuda_streams_all_ranks[rank].synchronize()
 
+        assert gathered_expert_statics is not None
         gathered_expert_statics_cpu = gathered_expert_statics.cpu()
         for rank in range(ep_size):
             for i in range(expert_count):

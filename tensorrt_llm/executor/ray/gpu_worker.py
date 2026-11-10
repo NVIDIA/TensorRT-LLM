@@ -18,7 +18,7 @@ import os
 from functools import wraps
 from pathlib import Path
 from queue import Queue
-from typing import Any, List, Optional, Type
+from typing import TYPE_CHECKING, Any, List, Optional, Type
 
 import ray
 import torch
@@ -41,6 +41,11 @@ from ..postproc_worker import PostprocWorkerConfig
 from ..request import GenerationRequest
 from ..result import GenerationResult
 from ..rpc_worker_mixin import RpcWorkerMixin
+
+if TYPE_CHECKING:
+    from tensorrt_llm.logger import Logger
+
+logger: "Logger"
 
 __all__ = [
     "RayGPUWorker",

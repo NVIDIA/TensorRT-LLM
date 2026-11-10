@@ -210,4 +210,5 @@ def test_guard_refuses_an_int64_slot_map() -> None:
     """The fold's slot map is the runner's int32 index map; `is_valid` refuses an int64 one."""
     fold = _build(dict(rows=4, moe=True, fold=10), seed=9)
     with validating(op), pytest.raises(AssertionError, match="int32"):
+        # pyrefly: ignore [bad-argument-count]
         op(*fold[:9], fold[9].long())

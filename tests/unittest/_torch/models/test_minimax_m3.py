@@ -210,6 +210,8 @@ def test_nvfp4_reload_preserves_attention_scale_storage(
     def read_scales():
         return torch.cat((k_scale, v_scale, projection.inv_kv_scales[1:]))
 
+    graph = None
+    captured = None
     if device == "cuda":
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
@@ -224,7 +226,8 @@ def test_nvfp4_reload_preserves_attention_scale_storage(
     ] == pointers
     expected = torch.tensor([0.5, 0.25, 2.0, 4.0], device=device)
     torch.testing.assert_close(read_scales(), expected)
-    if device == "cuda":
+    if graph is not None:
+        assert captured is not None
         graph.replay()
         torch.testing.assert_close(captured, expected)
 

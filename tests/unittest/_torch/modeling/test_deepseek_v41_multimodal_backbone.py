@@ -242,6 +242,7 @@ def test_engram_image_boundaries_survive_request_lifecycle(monkeypatch: pytest.M
 
     # Disagg restores a bounded seed; refresh inserts an image, then decodes without a mask.
     provider.queue_history_seed(29, 4, ids[4:7], token_mask=mask[4:7])
+    addresses = None
     for start in (7, 9, 11):
         compute = provider.compute_hashes if start == 7 else provider.refresh_captured_hashes
         chunk_mask = torch.tensor(mask[start : start + 2])
@@ -259,6 +260,7 @@ def test_engram_image_boundaries_survive_request_lifecycle(monkeypatch: pytest.M
         if start == 7:
             addresses = {layer: hashes.data_ptr() for layer, hashes in actual.items()}
         else:
+            assert addresses is not None
             assert {layer: hashes.data_ptr() for layer, hashes in actual.items()} == addresses
 
 

@@ -41,6 +41,7 @@ def independent_window_reference(model, metadata, ids, window=128, chunks=None):
     body = model.model
     positions = torch.arange(len(ids), device=ids.device, dtype=torch.int32).view(1, -1)
     offset = 0
+    state = None
     residuals, pre_mix = [], []
     for length in chunks or (len(ids),):
         end = offset + length
@@ -92,6 +93,7 @@ def independent_window_reference(model, metadata, ids, window=128, chunks=None):
                     attn_metadata=metadata,
                     input_ids=ids[start:end],
                 )
+    assert state is not None, "Reference requires at least one input chunk"
     hidden = body._finalize_hc_state(state)[-1:]
     return model.logits_processor(hidden, model.lm_head, None, return_context_logits=True)
 
@@ -424,6 +426,7 @@ def test_chunked_ced_matches_independent_window_reference(
             with patch.object(
                 owner.self_attn.compressor, "forward", wraps=owner.self_attn.compressor.forward
             ) as production:
+                out = None
                 for j, n in enumerate(chunks):
                     final = j == len(chunks) - 1
                     # Exercise actual history reclamation between chunks.
@@ -461,4 +464,5 @@ def test_chunked_ced_matches_independent_window_reference(
                     offset += n
                 assert production.call_count == len(chunks)
                 assert [c.args[0].shape[0] for c in production.call_args_list] == list(chunks)
+            assert out is not None, "Expected at least one input chunk"
             torch.testing.assert_close(out, ref, rtol=0.02, atol=0.02)

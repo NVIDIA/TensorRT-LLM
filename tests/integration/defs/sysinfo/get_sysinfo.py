@@ -199,6 +199,7 @@ def construct_gpu_properties(mako_opts, device_index=0):
             # Use chip name to get the GPU name
             pci_info = pynvml.nvmlDeviceGetPciInfo(handle)
             if pci_info is None:
+                pci_device_id = None
                 logger.warning(
                     "Failed to get PCI information. PCI parameters and chip name won't be reported"
                 )

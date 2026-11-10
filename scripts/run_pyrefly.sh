@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Run Pyrefly on supplied product Python files, or the whole project when
+# Run Pyrefly on supplied product or test Python files, or the whole project when
 # --full-project is used. With no eligible file paths, return success without
 # checking. Pre-commit supplies the file list with pass_filenames: true.
 # Paths from tool.pyrefly.project-excludes and symbols from
@@ -37,13 +37,13 @@ while (( $# > 0 )); do
             ;;
         --help|-h)
             cat <<'EOF'
-Run Pyrefly on supplied product Python files, or the whole project.
+Run Pyrefly on supplied product or test Python files, or the whole project.
 
 Pre-commit passes filenames to this script. With no eligible filenames, skip
 the check. Use --full-project to check all configured sources explicitly.
 
 Options:
-  --full-project           Check all product Python files.
+  --full-project           Check all configured product and test Python files.
   --strict                 Fail file-list checks on diagnostics or check failures.
   --no-diff-filter         Keep diagnostics from all lines in supplied files.
   --no-path-module-filter  Include diagnostics from excluded paths and modules.
@@ -140,7 +140,7 @@ for argument in "$@"; do
             > "$REPORT_FILE"
         exit 2
     fi
-    if (( ! FULL_PROJECT )) && [[ "$argument" != tensorrt_llm/* ]]; then
+    if (( ! FULL_PROJECT )) && [[ "$argument" != tensorrt_llm/* && "$argument" != tests/* ]]; then
         continue
     fi
     if (( ! FULL_PROJECT )) && [[ "$argument" != *.py && "$argument" != *.pyi ]]; then
@@ -173,7 +173,7 @@ fi
 
 if (( ! FULL_PROJECT && FILTERED_ARG_COUNT == 0 )); then
     SKIP_CHECK=1
-    printf 'No eligible supplied product Python files; skipping Pyrefly check.\n' >&3
+    printf 'No eligible supplied product or test Python files; skipping Pyrefly check.\n' >&3
     exit 0
 fi
 if (( FULL_PROJECT )); then

@@ -66,7 +66,9 @@ def _instance_mapping(**kwargs) -> Mapping:
 
 def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = None) -> str:
     """Broadcast a string from src rank to all other ranks in the group."""
+    encoded = None
     if dist.get_rank(group) == src:
+        assert s is not None, "Source rank must provide the string"
         encoded = s.encode("utf-8")
         length = torch.tensor([len(encoded)], dtype=torch.long)
     else:
@@ -74,7 +76,7 @@ def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = 
 
     dist.broadcast(length, src=src, group=group)
 
-    if dist.get_rank(group) == src:
+    if encoded is not None:
         data = torch.tensor(list(encoded), dtype=torch.uint8)
     else:
         data = torch.empty(length.item(), dtype=torch.uint8)
@@ -967,9 +969,8 @@ def _run_gen_first1_transfer(rank, is_ctx, transceiver, my_requests):
     """Generation-first transfer: ctx prepares first, then gen receives and ctx sends."""
     # Step 1: Context side calls prepare_context_requests, no kvcache request is sent, thus no request
     # can reach CONTEXT_INIT state.
+    ctx_my_requests = [req for _, req in my_requests] if is_ctx else []
     if is_ctx:
-        ctx_my_requests = [req for _, req in my_requests]
-
         transceiver.prepare_context_requests(ctx_my_requests)
         print(f"[Rank {rank}] CTX: Called prepare_context_requests", flush=True)
 

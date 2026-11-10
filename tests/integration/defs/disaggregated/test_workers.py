@@ -335,6 +335,9 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
         tokens_per_block = 32  # TODO: read from config
         prev_ctx_match_count = 0
         prev_gen_match_count = 0
+        ctx_match_count = 0
+        gen_match_count = 0
+        gen_evicted = False
         assert len(self.ctx_servers) == 1 and len(self.gen_servers) == 1, \
             "This test assumes 1P1D"
         ctx_server = self.ctx_servers[0]

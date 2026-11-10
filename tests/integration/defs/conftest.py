@@ -59,10 +59,7 @@ from .trt_test_alternative import (check_output, exists, is_windows, is_wsl,
 from .utils.periodic_junit import (PeriodicJUnitXML,
                                    register_pytest_timeout_evidence)
 
-try:
-    from llm import trt_environment
-except ImportError:
-    trt_environment = None
+ALL_PYTEST_ITEMS: list[pytest.Item] | None = None
 
 # Logger
 logger = logging.getLogger(__name__)
@@ -181,17 +178,9 @@ def cached_in_llm_models_root(path_relative_to_llm_models_root,
     return wrapper
 
 
-# Fixture about whether the current pipeline is running in TRT environment.
-@pytest.fixture(scope="session")
-def is_trt_environment():
-    return trt_environment is not None
-
-
 # Helper function to get llm_root. Do not define it as a fixture so that this
 # function can be used during test collection phase.
-def get_llm_root(trt_config=None, gitlab_token=None):
-    if trt_environment:
-        return trt_environment.setup_tensorrt_llm_repo(trt_config, gitlab_token)
+def get_llm_root():
     llm_repo_root = os.environ.get("LLM_ROOT", None)
     if llm_repo_root is None:
         llm_repo_root = os.path.dirname(

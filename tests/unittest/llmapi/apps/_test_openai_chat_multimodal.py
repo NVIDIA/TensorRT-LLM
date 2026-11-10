@@ -449,6 +449,7 @@ async def test_chat_streaming_image(async_client: openai.AsyncOpenAI,
     str_chunks: List[str] = []
 
     finish_reason_counter = 0
+    delta = None
     finish_reason: str = None
     async for chunk in stream:
         choice = chunk.choices[0]
@@ -461,6 +462,7 @@ async def test_chat_streaming_image(async_client: openai.AsyncOpenAI,
         if delta.content:
             str_chunks.append(delta.content)
     # test finish_reason
+    assert delta is not None, "Expected at least one streaming response"
     if delta.content == "":
         assert finish_reason == "stop"
     assert finish_reason_counter == 1

@@ -1482,6 +1482,7 @@ def test_prefix_load_recovery_lifetime(
     manager.accept_prefix_load(request, 0, 4, [[2, 3]])
     batch = ScheduledRequests()
     batch.context_requests_last_chunk = [request]
+    context = generation = None
     if mixed_batch:
         context, generation = _request(8), _request(9)
         generation.state = LlmRequestState.GENERATION_IN_PROGRESS
@@ -1585,6 +1586,7 @@ def test_prefix_load_recovery_lifetime(
                 if not is_async or not mixed_batch:
                     assert not output.prefix_loads
                 if mixed_batch:
+                    assert context is not None and generation is not None
                     assert batch.context_requests == [context]
                     assert batch.generation_requests == [generation]
                     assert {

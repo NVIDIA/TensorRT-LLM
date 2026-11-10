@@ -1244,6 +1244,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
                     ced_kv_precompute=True, decoder_replay_split=20
                 )
                 scheduled = ScheduledRequests()
+                context = None
                 if mixed:
                     context = _create_request_with_tokens(list(range(5000)), 7)
                     context.context_current_position = 4000
@@ -1277,6 +1278,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
                     expected_context + ([20, 30] if overlap else [19, 29]),
                 )
                 if mixed:
+                    assert context is not None
                     self.assertEqual(inputs["context_requests"], [context])
                     self.assertEqual(metadata.seq_lens.tolist(), [1128, 1, 1])
                     self.assertEqual(context.context_current_position, 4000)

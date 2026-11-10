@@ -7122,6 +7122,7 @@ def test_v2_kda_admission_slot_updates_without_sync(device):
     policy._conv_section_dims = tuple(mgr.conv_section_dims)
     policy._committed_window = window
 
+    previous_mode = None
     if device == "cuda":
         torch.cuda.synchronize()
         previous_mode = torch.cuda.get_sync_debug_mode()
@@ -7132,7 +7133,7 @@ def test_v2_kda_admission_slot_updates_without_sync(device):
         policy.relocate_slots([1], [6])
         mgr.seed_kda_replay_caches_for_disagg_gen([10, 11])
     finally:
-        if device == "cuda":
+        if previous_mode is not None:
             torch.cuda.set_sync_debug_mode(previous_mode)
 
     # Reset 5, 1 and 3; slot 6 takes slot 1's (reset) count; seeding resets 4 and 2; 7 untouched.

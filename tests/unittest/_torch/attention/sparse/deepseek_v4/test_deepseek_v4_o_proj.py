@@ -247,6 +247,7 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
                 )
                 * nn_init_std
             )
+            o_a_proj_ref = mla.o_a_proj.data
         elif dtype_str == "fp8":
             dim = num_heads * qk_head_dim // num_groups
             o_a_proj_bf16 = (
@@ -260,6 +261,20 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
             mla.o_a_proj_scale.data = fp8_a_scale
             if not has_native_fp8_o_proj:
                 mla.o_a_proj_dequant.data = o_a_proj_bf16
+            if has_native_fp8_o_proj:
+                # Match the native path's quantized weight and block scales.
+                o_a_proj_ref = (
+                    weight_dequant(
+                        fp8_a_weight.reshape(-1, dim).contiguous(),
+                        fp8_a_scale.contiguous(),
+                    )
+                    .bfloat16()
+                    .reshape(o_a_proj_bf16.shape)
+                )
+            else:
+                o_a_proj_ref = o_a_proj_bf16
+        else:
+            raise ValueError(f"Unsupported dtype: {dtype_str}")
 
         # Initialize o_b_proj weights
         if dtype_str == "bf16":
@@ -267,6 +282,7 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
                 torch.randn(hidden_size, num_groups * o_lora_rank, dtype=dtype, device=device)
                 * nn_init_std
             )
+            o_b_proj_weight_ref = mla.o_b_proj.weight.data
         elif dtype_str == "fp8":
             # For FP8, properly quantize using fp8_quantize_1x128_sf_transpose
             o_b_proj_weight_bf16 = (
@@ -278,11 +294,13 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
 
             # Quantize the weight
             fp8_b_weight, fp8_b_scale = per_block_cast_to_fp8_e8m0(o_b_proj_weight_bf16)
-            fp8_b_weight_dequant = weight_dequant(fp8_b_weight, fp8_b_scale).bfloat16()
+            o_b_proj_weight_ref = weight_dequant(fp8_b_weight, fp8_b_scale).bfloat16()
             mla.o_b_proj.weight.data = fp8_b_weight
             mla.o_b_proj.weight_scale.data = fp8_b_scale
             # SM107 re-lays weight_scale to UE8M0 K32 at load time; mirror the loader.
             mla.o_b_proj.quant_method.post_load_weights(mla.o_b_proj)
+        else:
+            raise ValueError(f"Unsupported dtype: {dtype_str}")
 
     # Generate test inputs
     # Note: for deepseek_v4, kv_lora_rank equals qk_head_dim
@@ -292,26 +310,6 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
     # The non-fused MLA path stores attention output as a flattened 2D buffer.
     # mla_rope_inplace modifies it in place, so preserve the 3D reference input.
     output = project_sparse_attn_output(mla, [attn_out_latent.clone().flatten(1)], position_ids)
-
-    # Calculate reference output
-    if dtype_str == "bf16":
-        o_a_proj_ref = mla.o_a_proj.data
-        o_b_proj_weight_ref = mla.o_b_proj.weight.data
-    else:
-        if has_native_fp8_o_proj:
-            # Match the native path, which consumes the quantized weight and
-            # its block scales rather than the original BF16 values.
-            o_a_proj_ref = (
-                weight_dequant(
-                    fp8_a_weight.reshape(-1, dim).contiguous(),
-                    fp8_a_scale.contiguous(),
-                )
-                .bfloat16()
-                .reshape(o_a_proj_bf16.shape)
-            )
-        else:
-            o_a_proj_ref = o_a_proj_bf16
-        o_b_proj_weight_ref = fp8_b_weight_dequant
 
     freqs_cis = precompute_freqs_cis(
         qk_rope_head_dim,

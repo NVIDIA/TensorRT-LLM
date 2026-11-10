@@ -231,6 +231,7 @@ def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
 
             req = admit(2)
             try:
+                output = None
                 offset = prefix
                 for chunk in chunks:
                     req.context_current_position = offset
@@ -255,6 +256,7 @@ def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
                     assert encoder_replay_tokens(req) == 0
                     for key, value in global_bytes(metadata, 0, prefix).items():
                         torch.testing.assert_close(value, frozen[key], rtol=0, atol=0)
+                assert output is not None, "Expected at least one input chunk"
                 torch.testing.assert_close(output, expected, rtol=0, atol=0)
                 for key, value in global_bytes(metadata, prefix, total).items():
                     torch.testing.assert_close(value, expected_global[key], rtol=0, atol=0)

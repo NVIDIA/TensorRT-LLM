@@ -163,6 +163,7 @@ def test_distributed_sampled_reference(nreq: int, top_p: float, graph_mode: bool
         peers = _COMM.allgather(_digest(warm_cpu))
         _collective_check(len(set(peers)) == 1, "warm outputs disagree")
         draft.copy_(warm[-1].reshape(nreq, _DRAFT + 1)[:, :_DRAFT])
+        outputs = None
         if graph_mode:
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
@@ -184,6 +185,7 @@ def test_distributed_sampled_reference(nreq: int, top_p: float, graph_mode: bool
                 graph.replay()
             else:
                 outputs = call()
+            assert outputs is not None
             for destination, output in zip(records, outputs):
                 destination[draw].copy_(output)
         torch.cuda.synchronize()

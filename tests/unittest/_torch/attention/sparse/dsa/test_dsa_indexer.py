@@ -4559,6 +4559,7 @@ def test_indexer_decode_custom_vs_fallback(
     )
 
     # Test with indexer skip enabled
+    topk_indices_skip = None
     if enable_indexer_skip:
         metadata_skip = _create_mock_metadata(
             request_ids,
@@ -4601,6 +4602,7 @@ def test_indexer_decode_custom_vs_fallback(
     )
     ## Custom vs skip
     if enable_indexer_skip:
+        assert topk_indices_skip is not None
         skip_decode = topk_indices_skip[num_ctx_tokens : num_ctx_tokens + num_gen_tokens, :]
         num_exact_matches, total_similarity, _ = validate_topk_indices(
             custom_decode, skip_decode, num_gen_tokens
@@ -5161,6 +5163,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip, ds
     )
 
     # Test with indexer skip enabled
+    topk_indices_skip = None
     if enable_indexer_skip:
         metadata_skip = _create_mock_metadata(
             request_ids,
@@ -5241,6 +5244,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip, ds
     )
 
     if enable_indexer_skip:
+        assert topk_indices_skip is not None
         num_exact_matches, total_similarity, min_similarity = validate_topk_indices(
             topk_custom, topk_indices_skip, total_tokens
         )

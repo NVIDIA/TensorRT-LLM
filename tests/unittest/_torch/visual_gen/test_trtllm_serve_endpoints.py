@@ -3534,6 +3534,7 @@ async def test_video_omni_inputs(endpoint, transport, omni_generator, omni_refer
                 files.append((field, (None, json.dumps([obj]), "application/json")))
                 expected[field].append(base64.b64decode(obj["content"]))
         kwargs = {"data": body, "files": files}
+    order = None
     if omni_generator._model == "minimax-h3-ref2va":
         order = ["audio:0", "video:0", "image:0"]
         if transport in ("multipart_mixed", "multipart_repeated"):
@@ -3557,6 +3558,7 @@ async def test_video_omni_inputs(endpoint, transport, omni_generator, omni_refer
     assert omni_generator.last_inputs == prompt
     assert omni_generator.last_ref_bytes == expected
     if omni_generator._model == "minimax-h3-ref2va":
+        assert order is not None
         assert omni_generator.last_params.extra_params["reference_order"] == order
 
 

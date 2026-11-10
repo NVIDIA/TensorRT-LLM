@@ -149,6 +149,7 @@ def test_split_conv_states_match_two_iterations():
     expected_stage = stage.clone()
     start = 0
     for _, slot, length, entry in _BATCH:
+        at_point = None
         cuts = [0, length] if entry is None else [0, entry.num_before, length]
         for lo, hi in zip(cuts[:-1], cuts[1:]):
             x = mixed_qkv[start + lo : start + hi].t().contiguous()
@@ -165,6 +166,7 @@ def test_split_conv_states_match_two_iterations():
                 at_point = expected_live[slot].clone()
         if entry is not None:
             expected_stage[entry.row] = expected_live[slot]
+            assert at_point is not None
             expected_live[slot] = at_point
         start += length
 

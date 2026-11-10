@@ -88,7 +88,9 @@ def _instance_mapping(**kwargs) -> Mapping:
 def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = None) -> str:
     """Broadcast a string from src rank to all other ranks in the group."""
     # Use CPU tensors for gloo backend compatibility
+    encoded = None
     if dist.get_rank(group) == src:
+        assert s is not None, "Source rank must provide the string"
         encoded = s.encode("utf-8")
         length = torch.tensor([len(encoded)], dtype=torch.long)
     else:
@@ -96,7 +98,7 @@ def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = 
 
     dist.broadcast(length, src=src, group=group)
 
-    if dist.get_rank(group) == src:
+    if encoded is not None:
         data = torch.tensor(list(encoded), dtype=torch.uint8)
     else:
         data = torch.empty(length.item(), dtype=torch.uint8)
@@ -195,6 +197,7 @@ def worker_fn(
 ):
     """Worker function for each process."""
     # Set environment variables for distributed
+    gen_layer_num_per_pp = None
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = str(master_port)
     os.environ["RANK"] = str(rank)
@@ -406,6 +409,7 @@ def worker_fn(
     if rank in [0] + gen_ranks:
         if rank == ctx_instance_num:
             # gen rank 0 sends
+            assert gen_layer_num_per_pp is not None
             gen_layer_num_per_pp_tensor = torch.tensor(gen_layer_num_per_pp, dtype=torch.long)
         else:
             gen_layer_num_per_pp_tensor = torch.zeros(gen_pp, dtype=torch.long)

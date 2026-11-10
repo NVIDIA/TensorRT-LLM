@@ -1635,6 +1635,6 @@ repos:
         language: script
         verbose: true
         require_serial: true
-        # Pass changed paths; the wrapper skips non-product Python inputs.
+        # Pass changed paths; the wrapper accepts product and test Python inputs.
         pass_filenames: true
-        files: ^(tensorrt_llm/.*\.pyi?$|pyproject\.toml$|scripts/(run_pyrefly\.sh|pyrefly_exclusion\.py)$|\.pre-commit-config\.yaml$)
+        files: ^((tensorrt_llm|tests)/.*\.pyi?$|pyproject\.toml$|scripts/(run_pyrefly\.sh|pyrefly_exclusion\.py)$|\.pre-commit-config\.yaml$)

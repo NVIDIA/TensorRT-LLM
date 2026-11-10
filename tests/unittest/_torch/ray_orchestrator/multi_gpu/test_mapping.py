@@ -96,6 +96,7 @@ class TestMapping(unittest.TestCase):
         os.environ["LOCAL_RANK"] = str(rank)
         torch.cuda.set_device(rank)
 
+        mapping_mpi = None
         if test_type == "parity":
             if "TLLM_DISABLE_MPI" in os.environ:
                 del os.environ["TLLM_DISABLE_MPI"]
@@ -126,6 +127,7 @@ class TestMapping(unittest.TestCase):
         )
 
         if test_type == "parity":
+            assert mapping_mpi is not None
             mapping_device_mesh.build_mesh()
 
             properties = []

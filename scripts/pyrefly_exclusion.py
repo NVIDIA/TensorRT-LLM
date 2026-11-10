@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Apply path and third-party symbol exclusions to Pyrefly JSON reports."""
+"""Apply path, symbol, and Pydantic alias filters to Pyrefly JSON reports."""
 
 import argparse
 import ast
@@ -233,6 +233,301 @@ def is_excluded_symbol(
     return False
 
 
+class PydanticAliasFilter:
+    """Recognize explicitly supplied validation aliases without importing project code."""
+
+    def __init__(self, project_root: Path) -> None:
+        self.root = project_root.resolve()
+        self.modules: dict[str, ast.Module | None] = {}
+        self.scopes: dict[str, ImportScope] = {}
+
+    def _module(self, name: str) -> ast.Module | None:
+        if name not in self.modules:
+            self.modules[name] = None
+            if re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", name):
+                base = self.root.joinpath(*name.split("."))
+                for path in (base.with_suffix(".py"), base / "__init__.py"):
+                    if relative_source_path(str(path), self.root) is None:
+                        continue
+                    try:
+                        tree = ast.parse(path.read_text())
+                    except (OSError, SyntaxError, UnicodeError):
+                        continue
+                    package = name if path.name == "__init__.py" else name.rpartition(".")[0]
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.ImportFrom) and node.level:
+                            parts = package.split(".") if package else []
+                            if node.level <= len(parts):
+                                prefix = parts[: len(parts) - node.level + 1]
+                                node.module = ".".join(
+                                    prefix + ([node.module] if node.module else [])
+                                )
+                                node.level = 0
+                    self.modules[name] = tree
+                    self.scopes[name] = ImportScope(tree)
+                    break
+        return self.modules[name]
+
+    def _resolve(self, node: ast.expr, module: str) -> str | None:
+        if isinstance(node, ast.Attribute):
+            parent = self._resolve(node.value, module)
+            return f"{parent}.{node.attr}" if parent else None
+        if not isinstance(node, ast.Name):
+            return None
+        tree = self._module(module)
+        if tree is None:
+            return None
+        imported = self.scopes[module].resolve(node.id, node.lineno)
+        if imported:
+            return imported
+        definitions = [
+            item
+            for item in tree.body
+            if isinstance(item, (ast.ClassDef, ast.FunctionDef)) and item.name == node.id
+        ]
+        # A rebound class name is ambiguous, so leave its diagnostics untouched.
+        if len(definitions) == 1 and not any(
+            (isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store) and item.id == node.id)
+            or (isinstance(item, ast.arg) and item.arg == node.id)
+            for item in ast.walk(tree)
+        ):
+            return f"{module}.{node.id}"
+        return None
+
+    def _lineage(
+        self, symbol: str, seen: frozenset[str] = frozenset()
+    ) -> list[tuple[str, ast.ClassDef]] | None:
+        if symbol in ("pydantic.BaseModel", "pydantic.main.BaseModel"):
+            return []
+        if symbol in seen:
+            return None
+        module, _, name = symbol.rpartition(".")
+        tree = self._module(module)
+        if tree is None:
+            return None
+        definitions = [
+            node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name
+        ]
+        if len(definitions) != 1:
+            return None
+        cls = definitions[0]
+        # Decorators, multiple inheritance, and custom constructors can change
+        # which keywords are accepted at runtime.
+        if len(cls.bases) != 1 or cls.decorator_list:
+            return None
+        for node in cls.body:
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "__init__"
+            ):
+                return None
+        base = self._resolve(cls.bases[0], module)
+        parents = self._lineage(base, seen | {symbol}) if base else None
+        return [(module, cls), *parents] if parents is not None else None
+
+    @staticmethod
+    def _literal_mapping(node: ast.expr | None) -> dict[str | int, ast.expr] | None:
+        if not isinstance(node, ast.Dict) or any(
+            not isinstance(key, ast.Constant) or type(key.value) not in (str, int)
+            for key in node.keys
+        ):
+            return None
+        return {key.value: value for key, value in zip(node.keys, node.values)}
+
+    def _aliases_enabled(self, lineage: list[tuple[str, ast.ClassDef]]) -> bool:
+        config: dict[str, ast.expr] = {}
+        for module, cls in reversed(lineage):
+            for node in cls.body:
+                if isinstance(node, ast.ClassDef) and node.name == "Config":
+                    if node.bases or node.decorator_list or node.keywords:
+                        return False
+                    for setting in node.body:
+                        if not isinstance(setting, ast.Assign) or len(setting.targets) != 1:
+                            return False
+                        target = setting.targets[0]
+                        if not isinstance(target, ast.Name):
+                            return False
+                        config[target.id] = setting.value
+                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    continue
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if not any(
+                    isinstance(target, ast.Name) and target.id == "model_config"
+                    for target in targets
+                ):
+                    continue
+                value = node.value
+                if isinstance(value, ast.Call) and self._resolve(value.func, module) in (
+                    "pydantic.ConfigDict",
+                    "pydantic.config.ConfigDict",
+                ):
+                    if value.args or any(keyword.arg is None for keyword in value.keywords):
+                        return False
+                    config.update({keyword.arg: keyword.value for keyword in value.keywords})
+                else:
+                    mapping = self._literal_mapping(value)
+                    if mapping is None or any(not isinstance(key, str) for key in mapping):
+                        return False
+                    config.update(mapping)
+            if any(keyword.arg is None for keyword in cls.keywords):
+                return False
+            config.update({keyword.arg: keyword.value for keyword in cls.keywords})
+        by_alias = config.get("validate_by_alias", ast.Constant(value=True))
+        generator = config.get("alias_generator", ast.Constant(value=None))
+        # Config.fields and generators can replace explicit field aliases.
+        return (
+            isinstance(by_alias, ast.Constant)
+            and by_alias.value is True
+            and isinstance(generator, ast.Constant)
+            and generator.value is None
+            and "fields" not in config
+        )
+
+    def _alias_paths(self, node: ast.expr, module: str) -> set[tuple[str | int, ...]]:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return {(node.value,)}
+        if not isinstance(node, ast.Call) or node.keywords:
+            return set()
+        constructor = self._resolve(node.func, module)
+        if constructor in ("pydantic.AliasChoices", "pydantic.aliases.AliasChoices"):
+            return {path for choice in node.args for path in self._alias_paths(choice, module)}
+        if constructor in ("pydantic.AliasPath", "pydantic.aliases.AliasPath") and node.args:
+            try:
+                path = tuple(ast.literal_eval(part) for part in node.args)
+            except (ValueError, TypeError, SyntaxError):
+                return set()
+            if isinstance(path[0], str) and all(type(part) in (str, int) for part in path):
+                return {path}
+        return set()
+
+    def _aliases(self, symbol: str, field: str) -> set[tuple[str | int, ...]]:
+        lineage = self._lineage(symbol)
+        if lineage is None or not self._aliases_enabled(lineage):
+            return set()
+        for module, cls in lineage:
+            for node in reversed(cls.body):
+                if isinstance(node, ast.Assign) and any(
+                    isinstance(target, ast.Name) and target.id == field for target in node.targets
+                ):
+                    return set()
+                if not (
+                    isinstance(node, ast.AnnAssign)
+                    and isinstance(node.target, ast.Name)
+                    and node.target.id == field
+                ):
+                    continue
+                value = node.value
+                if not isinstance(value, ast.Call) or self._resolve(value.func, module) not in (
+                    "pydantic.Field",
+                    "pydantic.fields.Field",
+                    # This project wrapper forwards aliases to PydanticField unchanged.
+                    "tensorrt_llm.llmapi.llm_args.Field",
+                ):
+                    return set()
+                if any(keyword.arg is None for keyword in value.keywords):
+                    return set()
+                keywords = {keyword.arg: keyword.value for keyword in value.keywords}
+                alias = keywords.get("validation_alias")
+                if alias is not None and not (
+                    isinstance(alias, ast.Constant) and alias.value is None
+                ):
+                    return self._alias_paths(alias, module)
+                alias = keywords.get("alias")
+                # When validation_alias is unset, Pydantic uses alias for validation too.
+                return self._alias_paths(alias, module) if alias is not None else set()
+        return set()
+
+    def _has_path(self, value: ast.expr, path: tuple[str | int, ...]) -> bool:
+        if not path:
+            return True
+        key, *rest = path
+        mapping = self._literal_mapping(value)
+        if mapping is not None:
+            return key in mapping and self._has_path(mapping[key], tuple(rest))
+        if isinstance(value, (ast.List, ast.Tuple)) and isinstance(key, int):
+            if any(isinstance(element, ast.Starred) for element in value.elts):
+                return False
+            if -len(value.elts) <= key < len(value.elts):
+                return self._has_path(value.elts[key], tuple(rest))
+        return False
+
+    def _supplied_alias(self, call: ast.Call, paths: set[tuple[str | int, ...]]) -> bool:
+        supplied: dict[str, ast.expr] = {}
+        for keyword in call.keywords:
+            if keyword.arg is not None:
+                supplied[keyword.arg] = keyword.value
+            else:
+                mapping = self._literal_mapping(keyword.value)
+                if mapping is None or any(not isinstance(key, str) for key in mapping):
+                    return False
+                supplied.update(mapping)
+        return any(
+            path[0] in supplied and self._has_path(supplied[path[0]], path[1:]) for path in paths
+        )
+
+    def matches(self, error: dict[str, Any]) -> bool:
+        """Suppress constructor-name diagnostics only for statically verified input aliases."""
+        kind = error.get("name")
+        if kind not in ("missing-argument", "unexpected-keyword"):
+            return False
+        message = str(error.get("concise_description") or error.get("description", ""))
+        prefix = "Missing argument" if kind == "missing-argument" else "Unexpected keyword argument"
+        match = re.fullmatch(rf"{prefix} `([\w]+)` in function `([\w.]+)\.__init__`", message)
+        if match is None:
+            return False
+        field, symbol = match.groups()
+        if kind == "missing-argument":
+            aliases = self._aliases(symbol, field)
+        else:
+            lineage = self._lineage(symbol)
+            if lineage is None:
+                return False
+            fields = {
+                node.target.id
+                for _, cls in lineage
+                for node in cls.body
+                if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+            }
+            aliases = {
+                path for name in fields for path in self._aliases(symbol, name) if path[0] == field
+            }
+        if not aliases:
+            return False
+        path = relative_source_path(str(error.get("path", "")), self.root)
+        if path is None or path.suffix != ".py":
+            return False
+        module = ".".join(path.with_suffix("").parts)
+        if module.endswith(".__init__"):
+            module = module.removesuffix(".__init__")
+        tree = self._module(module)
+        if tree is None:
+            return False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if kind == "missing-argument":
+                # Pyrefly's missing-argument span starts at the opening parenthesis.
+                if (node.func.end_lineno, node.func.end_col_offset + 1) != (
+                    error.get("line"),
+                    error.get("column"),
+                ) or (node.end_lineno, node.end_col_offset + 1) != (
+                    error.get("stop_line"),
+                    error.get("stop_column"),
+                ):
+                    continue
+            elif not any(
+                keyword.arg == field
+                and (keyword.lineno, keyword.col_offset + 1)
+                == (error.get("line"), error.get("column"))
+                for keyword in node.keywords
+            ):
+                continue
+            if self._resolve(node.func, module) != symbol:
+                return False
+            return self._supplied_alias(node, aliases)
+        return False
+
+
 def filter_report(
     input_path: Path,
     output_path: Path,
@@ -251,6 +546,7 @@ def filter_report(
         symbols = load_exclusions(config_path)
         excluded_paths = load_excluded_paths(config_path)
         scopes_by_path: dict[str, ImportScope | None] = {}
+        pydantic_aliases = PydanticAliasFilter(project_root)
         filtered_errors = []
         excluded_count = 0
         for error in result["errors"]:
@@ -259,7 +555,11 @@ def filter_report(
             excluded_path = is_excluded_path(
                 str(error.get("path", "")), project_root, excluded_paths
             )
-            if excluded_path or is_excluded_symbol(error, symbols, project_root, scopes_by_path):
+            if (
+                excluded_path
+                or is_excluded_symbol(error, symbols, project_root, scopes_by_path)
+                or pydantic_aliases.matches(error)
+            ):
                 excluded_count += 1
             else:
                 filtered_errors.append(error)

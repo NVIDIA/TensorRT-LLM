@@ -33,7 +33,7 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
 
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
-from ..conftest import get_device_count, llm_models_root, trt_environment
+from ..conftest import get_device_count, llm_models_root
 from ._model_paths import HF_MODEL_PATH, LORA_MODEL_PATH, MODEL_PATH_DICT
 from .pytorch_model_config import PERF_CONFIG_PRESETS, get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
@@ -185,15 +185,12 @@ def cpu_socket_count_gt_1():
 
 # A helper function to import allowed_configs.py.
 def import_allowed_perf_config():
-    if trt_environment:
-        from llm import allowed_configs
+    global ALLOWED_CONFIGS_CACHE
+    if ALLOWED_CONFIGS_CACHE is None:
+        import allowed_configs
+        ALLOWED_CONFIGS_CACHE = allowed_configs
     else:
-        global ALLOWED_CONFIGS_CACHE
-        if ALLOWED_CONFIGS_CACHE is None:
-            import allowed_configs
-            ALLOWED_CONFIGS_CACHE = allowed_configs
-        else:
-            allowed_configs = ALLOWED_CONFIGS_CACHE
+        allowed_configs = ALLOWED_CONFIGS_CACHE
     return allowed_configs
 
 

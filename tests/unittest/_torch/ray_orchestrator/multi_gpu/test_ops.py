@@ -135,6 +135,7 @@ def test_allgather_pg_op(setup_ray_cluster, seq_len, hidden_size, var_len):
     else:
         test_tensor = torch.randn((seq_len, hidden_size), dtype=dtype)
         expected_result = test_tensor.repeat(world_size, 1)
+        test_tensor_list = [test_tensor] * world_size
         sizes = None
 
     remotePGTests = []
@@ -158,22 +159,13 @@ def test_allgather_pg_op(setup_ray_cluster, seq_len, hidden_size, var_len):
         for remotePGTest in remotePGTests
     ])
 
-    if var_len:
-        results = ray.get([
-            remotePGTest.run.remote("allgather_pg",
-                                    test_tensor,
-                                    expected_result,
-                                    sizes=sizes) for remotePGTest, test_tensor
-            in zip(remotePGTests, test_tensor_list)
-        ])
-    else:
-        results = ray.get([
-            remotePGTest.run.remote("allgather_pg",
-                                    test_tensor,
-                                    expected_result,
-                                    sizes=sizes)
-            for remotePGTest in remotePGTests
-        ])
+    results = ray.get([
+        remotePGTest.run.remote("allgather_pg",
+                                test_tensor,
+                                expected_result,
+                                sizes=sizes)
+        for remotePGTest, test_tensor in zip(remotePGTests, test_tensor_list)
+    ])
     for r in results:
         assert r is True
 

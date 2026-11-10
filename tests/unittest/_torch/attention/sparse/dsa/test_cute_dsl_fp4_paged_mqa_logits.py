@@ -835,6 +835,8 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
         seed_thr[row, 1] = torch.quantile(vals, 0.90)
         seed_thr[row, 2] = torch.quantile(vals, 0.998)
 
+    seed_row = None
+    seed_counts = None
     if packed:
         # Packed contract: one [rows, 8] fp32 seed row, lines at cols
         # 0..2, counts accumulate as fp32 at cols 3..5 (caller zeroes).
@@ -870,7 +872,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
     for row in range(num_rows):
         ctx = int(context_lens[row // next_n].item())
         torch.testing.assert_close(lf[row, :ctx], lf0[row, :ctx], atol=0.0, rtol=0.0)
-    if packed:
+    if seed_row is not None:
         assert torch.equal(seed_row[:, 0:3], seed_thr), "lines clobbered"
         # col 6 carries the adaptive-skip pass count (lane0-accumulated
         # diagnostic; the top-k consumer reads it when block_max rides
@@ -882,6 +884,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
             "adaptive-skip pass count out of range"
         )
         seed_counts = seed_row[:, 3:6].to(torch.int32)
+    assert seed_counts is not None
     for row in range(num_rows):
         ctx = int(context_lens[row // next_n].item())
         tag = f"row={row} ctx={ctx} next_n={next_n} pbk={phys_block_kv}"

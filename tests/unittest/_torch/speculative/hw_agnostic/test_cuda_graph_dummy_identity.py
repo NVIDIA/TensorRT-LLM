@@ -50,6 +50,8 @@ def test_target_only_dummy_identity_is_unchanged():
 
 @pytest.mark.parametrize("physical_k", [1, 3, 8])
 def test_padding_families_never_consume_real_worker_slots(monkeypatch, physical_k):
+    dummy_id = None
+
     def cpu_allocator(original):
         def allocate(*args, **kwargs):
             kwargs["device"] = "cpu"
@@ -91,6 +93,7 @@ def test_padding_families_never_consume_real_worker_slots(monkeypatch, physical_
             assert list(worker._free_slots) == [1, 2, 3]
             assert worker._batch_to_slot[:3].tolist() == [0, 4, 4]
 
+    assert dummy_id is not None
     metadata.request_ids = [0, dummy_id]
     metadata.num_generations = 2
     DSparkSpecMetadata.prepare(metadata)

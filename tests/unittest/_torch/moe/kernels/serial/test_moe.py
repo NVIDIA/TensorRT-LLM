@@ -1433,6 +1433,9 @@ class TestMoeFp4:
         elif routing_method_type == RoutingMethodType.RenormalizeNaive or routing_method_type == RoutingMethodType.Renormalize:
             expert_logits = torch.randn((num_tokens, num_experts),
                                         device='cuda').to(torch.bfloat16)
+        else:
+            raise ValueError(
+                f"Unsupported routing_method_type: {routing_method_type}")
 
         if has_routing_bias:
             routing_bias = torch.randn(num_experts,
@@ -1542,6 +1545,9 @@ class TestMoeFp4:
         elif routing_method_type == RoutingMethodType.RenormalizeNaive:
             permute_info, scores = routing_reference_renormalize_naive(
                 expert_logits, top_k, padding)
+        else:
+            raise ValueError(
+                f"Unsupported routing_method_type: {routing_method_type}")
 
         args = moe_args(num_tokens,
                         num_experts,
@@ -1688,6 +1694,8 @@ class TestMoeFp4:
         elif act_type in [ActType.Relu2, ActType.Silu]:
             scale_c_fc1 = torch.full_like(args.gemm1_scales_global,
                                           args_dequant.c_global_sf)
+        else:
+            raise ValueError(f"Unsupported act_type: {act_type}")
         # self.fc31_alpha
         scale_gate_fc1 = (1.0 / args.gemm1_scales_global) * (
             1.0 / args.hidden_states_scale_global)
@@ -1803,6 +1811,9 @@ class TestMoeFp4:
         elif routing_method_type == RoutingMethodType.RenormalizeNaive or routing_method_type == RoutingMethodType.Renormalize:
             expert_logits = torch.randn((num_tokens, num_experts),
                                         device='cuda').to(torch.bfloat16)
+        else:
+            raise ValueError(
+                f"Unsupported routing_method_type: {routing_method_type}")
 
         if has_routing_bias:
             routing_bias = torch.randn(num_experts,
@@ -1868,6 +1879,9 @@ class TestMoeFp4:
         elif routing_method_type == RoutingMethodType.RenormalizeNaive:
             permute_info, scores = routing_reference_renormalize_naive(
                 expert_logits, top_k, padding)
+        else:
+            raise ValueError(
+                f"Unsupported routing_method_type: {routing_method_type}")
 
         args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
                         top_k, padding, hidden_states_fp8, None,
@@ -2106,6 +2120,9 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
     elif routing_method_type == RoutingMethodType.RenormalizeNaive or routing_method_type == RoutingMethodType.Renormalize:
         expert_logits = torch.randn((num_tokens, num_experts),
                                     device='cuda').to(torch.bfloat16)
+    else:
+        raise ValueError(
+            f"Unsupported routing_method_type: {routing_method_type}")
 
     routing_bias = torch.randn(num_experts, device='cuda', dtype=torch.bfloat16)
 
@@ -2141,6 +2158,9 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
         permute_info, scores = routing_reference_no_aux(
             expert_logits, routing_bias, top_k, n_groups, top_k_groups,
             routed_scaling, tile_tokens_dim, use_routing_scales_on_input)
+    else:
+        raise ValueError(
+            f"Unsupported routing_method_type: {routing_method_type}")
 
     args = moe_args(num_tokens, num_experts, hidden_size, intermediate_size,
                     top_k, tile_tokens_dim, hidden_states_quant, None,
@@ -2591,6 +2611,7 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     gemm2_bias_shuffled = (torch.stack(gemm2_bias_shuffled).reshape(
         num_experts, -1) if gemm2_bias_shuffled else None)
 
+    scale_c_fc1 = scale_gate_fc1 = scale_c_fc2 = None
     if dtype_activation == "fp8":
         # c_global_sf: fc2_input_scale
         scale_c_fc1 = (
@@ -2656,6 +2677,8 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 intermediate_size, None, None, 0, num_experts, routed_scaling,
                 routing_method_type, act_type.value, topk_weights, topk_ids)
         elif dtype_activation == "fp8":
+            assert scale_c_fc1 is not None
+            assert scale_gate_fc1 is not None and scale_c_fc2 is not None
             output = torch.ops.trtllm.e4m3_mxe2m1_block_scale_moe_runner(
                 expert_logits, routing_bias,
                 input_hidden_states.cuda().to(torch.float8_e4m3fn),

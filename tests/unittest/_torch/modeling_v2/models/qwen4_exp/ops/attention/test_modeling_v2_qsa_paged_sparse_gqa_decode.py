@@ -115,4 +115,5 @@ def test_guard_refuses_rows_past_max_rows() -> None:
     args = _build(dict(pos=(8700,), gated=True), seed=5)
     many = [a.expand(300, *a.shape[1:]) if i in (0, 4, 5) else a for i, a in enumerate(args[:6])]
     with validating(op), pytest.raises(AssertionError):
+        # pyrefly: ignore [bad-argument-count]
         op(*many, *args[6:8], None)  # 300 rows: past MAX_ROWS

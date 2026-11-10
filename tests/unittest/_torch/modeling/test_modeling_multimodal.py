@@ -703,6 +703,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         # Context Phase
         print("  Running context phase...")
         with torch.inference_mode():
+            logits = None
             if scenario.chunked_prefill:
                 chunk_size = 128
                 total_prompt_len = len(trtllm_input_ids)
@@ -738,6 +739,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
                 )
                 logits = self.run_trtllm_forward(ctx_trtllm_inputs, use_cuda_graph=False)
 
+            assert logits is not None, "Context phase produced no logits"
             # Compare context outputs
             hf_inputs = self.get_hf_inputs(scenario.modality, prompts, media)
             if self.skip_hf_inference:

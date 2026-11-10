@@ -128,6 +128,7 @@ def test_refuses_more_than_six_tokens() -> None:
     """Verify rows need another MoE path; no silent token-zero-only result."""
     with pytest.raises(RuntimeError, match="takes 1 to 6 tokens"):
         with validating(op):
+            # pyrefly: ignore [bad-argument-count]
             op(*_small(tokens=7), TOP_K, ROUTED_SCALING_FACTOR)
 
 
@@ -135,12 +136,14 @@ def test_refuses_an_expert_slice_it_does_not_serve() -> None:
     """The FC2 kernel walks the expert slice in 64-element K steps."""
     with pytest.raises(RuntimeError, match="unsupported hidden size"):
         with validating(op):
+            # pyrefly: ignore [bad-argument-count]
             op(*_small(inter=96), TOP_K, ROUTED_SCALING_FACTOR)
 
 
 def test_refuses_another_top_k() -> None:
     with pytest.raises(RuntimeError, match="top-8"):
         with validating(op):
+            # pyrefly: ignore [bad-argument-count]
             op(*_small(), 6, ROUTED_SCALING_FACTOR)
 
 
