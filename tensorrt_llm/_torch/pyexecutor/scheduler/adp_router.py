@@ -452,6 +452,23 @@ class ADPRouter(ABC):
             self._use_max_load_across_cp(local_state)
         return local_state
 
+    def gather_iter_stats(self, iter_stats_payload: RankIterStatsPayload | None) -> list[RankState]:
+        """Allgather only this rank's pending iteration stats across DP ranks.
+
+        Unlike ``gather_all_rank_states`` this enters no CP collective, so
+        under helix CP each TP group can call it a different number of times.
+
+        Args:
+            iter_stats_payload: Pending iteration stats payload, if any.
+
+        Returns:
+            One state per DP rank, holding its rank and iteration stats and no load.
+        """
+        local_state = RankState(rank=self.dist.tp_rank)
+        local_state.copy_iter_stats_from(iter_stats_payload)
+        responses = self.dist.tp_allgather(local_state.serialize())
+        return [RankState.deserialize(data=resp) for resp in responses]
+
     def _use_max_load_across_cp(self, local_state: RankState) -> None:
         """Replace this DP rank's request and token counts with their CP-group maximum.
 

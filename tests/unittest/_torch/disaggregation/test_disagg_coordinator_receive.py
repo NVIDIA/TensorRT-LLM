@@ -32,14 +32,21 @@ from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
     DisaggTransferCoordinator,
     NoopDisaggCoordinator,
 )
+from tensorrt_llm._torch.pyexecutor.adp_iter_stats import ADPIterStatsBuffer
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmResponse
 from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
 from tensorrt_llm._torch.pyexecutor.request_utils import partition_context_for_helix
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings import executor as trtllm
-from tensorrt_llm.bindings.executor import FinishReason, IterationStats, RequestStage
+from tensorrt_llm.bindings.executor import (
+    FinishReason,
+    InflightBatchingStats,
+    IterationStats,
+    RequestStage,
+)
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
 pytestmark = pytest.mark.cpu_only
@@ -1424,6 +1431,107 @@ def test_close_outs_are_reported_by_rank0_under_attention_dp(rank, reports) -> N
 
     assert executor._adp_iter_stats.queue.called is reports
     executor._append_iter_stats.assert_not_called()
+
+
+def _adp_stats_rank(
+    group: FakeDistGroup, rank: int, pending_iters: tuple, helix_cp: bool = False
+) -> PyExecutor:
+    """Bare attention-DP executor on fake rank ``rank`` holding queued iteration
+    stats for ``pending_iters``; fanned-out rows reach ``_append_iter_stats``,
+    a mock."""
+    executor = object.__new__(PyExecutor)
+    executor.dist = group.rank(rank)
+    executor.dist.has_cp_helix = helix_cp
+    if helix_cp:
+        # FakeDist has no CP group. A collective over every fake rank stands in
+        # for the CP one: both need ranks outside the TP group.
+        def cp_allgather_int64(values) -> np.ndarray:
+            executor.dist.allreduce(0)
+            return np.asarray([values], dtype=np.int64)
+
+        executor.dist.cp_allgather_int64 = cp_allgather_int64
+    executor.adp_router = DefaultADPRouter(executor.dist)
+    executor._adp_iter_stats = ADPIterStatsBuffer()
+    executor._append_iter_stats = Mock()
+    for iter_id in pending_iters:
+        stats = IterationStats()
+        stats.iter = iter_id
+        stats.inflight_batching_stats = InflightBatchingStats()
+        executor._adp_iter_stats.queue(stats, is_rank0=rank == 0)
+    return executor
+
+
+def _exchange_and_publish_adp_stats(executor: PyExecutor, idle_wait_follows: bool) -> None:
+    """The rank-state exchange of ``_fetch_new_requests`` and the publishing after it."""
+    states = executor.adp_router.gather_all_rank_states(
+        [], iter_stats_payload=executor._adp_iter_stats.next_payload(), iter_stats_enabled=True
+    )
+    executor._publish_adp_iter_stats(states, idle_wait_follows=idle_wait_follows)
+
+
+def _published_adp_rows(executor: PyExecutor) -> list:
+    """(iteration, attention-DP rank) of every stats row ``executor`` appended."""
+    return [
+        (appended.args[0].iter, appended.kwargs["attention_dp_rank"])
+        for appended in executor._append_iter_stats.call_args_list
+    ]
+
+
+@pytest.mark.parametrize(
+    ("idle_wait_follows", "published", "exchanges"),
+    [
+        # Iteration 7: one exchange to reach rank 1, one to fan out. Iteration 8
+        # the same, and a last exchange shows rank 0 has nothing left.
+        pytest.param(True, [(7, 0), (7, 1), (8, 0), (8, 1)], 5, id="before_an_idle_wait"),
+        # The next iterations' exchanges carry them on.
+        pytest.param(False, [], 1, id="with_requests_still_live"),
+    ],
+)
+def test_adp_close_out_stats_are_published_before_the_idle_wait(
+    idle_wait_follows, published, exchanges
+) -> None:
+    """Requests finished at their first token run no batch, so only rank 0
+    queues their iteration stats, and such a record needs one more exchange
+    than the one that carried it. When the fleet goes idle the ranks finish
+    those exchanges first, in step, so the stats do not wait for the next
+    request; under load no exchange is added."""
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    executors = [
+        _adp_stats_rank(group, 0, pending_iters=(7, 8)),
+        _adp_stats_rank(group, 1, pending_iters=()),
+    ]
+
+    group.run(lambda rank: _exchange_and_publish_adp_stats(executors[rank], idle_wait_follows))
+
+    assert _published_adp_rows(executors[0]) == published
+    executors[1]._append_iter_stats.assert_not_called()
+    assert [len(executor.dist.calls) for executor in executors] == [exchanges] * 2
+    pending = [executor._adp_iter_stats.next_payload() is not None for executor in executors]
+    assert pending == [not idle_wait_follows] * 2
+
+
+def test_adp_idle_stats_exchanges_do_not_wait_for_helix_cp_peers() -> None:
+    """Under helix CP every TP group exchanges its own iteration stats, and only
+    rank 0's group holds a record for requests finished at their first token.
+    The other group has nothing pending and goes on to the idle wait, so the
+    extra exchanges of rank 0's group must not enter a CP collective."""
+    # Fake ranks 0-1 are rank 0's TP group, fake ranks 2-3 the other one.
+    group = FakeDistGroup(world_size=4, tp_size=2)
+    executors = [
+        _adp_stats_rank(group, rank, pending_iters=(7,) if rank == 0 else (), helix_cp=True)
+        for rank in range(4)
+    ]
+
+    group.run(lambda rank: _exchange_and_publish_adp_stats(executors[rank], True))
+
+    assert _published_adp_rows(executors[0]) == [(7, 0), (7, 1)]
+    tp_exchanges = [
+        sum(collective == "tp_allgather" for collective, _ in executor.dist.calls)
+        for executor in executors
+    ]
+    # Rank 0's group: one exchange to reach its peer, one to fan out, one that
+    # shows rank 0 has nothing left.
+    assert tp_exchanges == [3, 3, 1, 1]
 
 
 def test_close_out_rebuilds_derived_cache_state_before_committing_blocks() -> None:

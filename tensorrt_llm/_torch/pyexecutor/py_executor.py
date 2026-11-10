@@ -8945,6 +8945,41 @@ class PyExecutor:
             return new_requests, {}
         return self._apply_mm_encoder_admission(waiting_queue, new_requests), {}
 
+    def _publish_adp_iter_stats(self, all_rank_states: List[RankState],
+                                idle_wait_follows: bool) -> None:
+        """Append the iteration stats rows the rank-state exchange completes.
+
+        Each exchange carries one iteration, and an iteration that only rank 0
+        queued (requests finished at their first token run no batch) is fanned
+        out on the exchange after the one that carried it. Before an idle
+        wait, which would put those exchanges off until the next request
+        arrives, exchange again until the TP group's first rank has nothing
+        pending. The ranks of a TP group derive that from the same gathered
+        states, so they exchange the same number of times. Under helix CP the
+        other TP groups may need a different number, so these exchanges stay
+        inside the TP group.
+
+        Args:
+            all_rank_states: Rank states this iteration's exchange gathered.
+            idle_wait_follows: Whether the fleet has no live or waiting request.
+        """
+        while True:
+            for record in self._adp_iter_stats.finalize(
+                    all_rank_states, is_rank0=self.dist.rank == 0):
+                self._append_iter_stats(
+                    record.stats,
+                    record.req_stats,
+                    kv_iter_stats=record.kv_iter_stats,
+                    attention_dp_rank=record.attention_dp_rank,
+                    host_step_time_ms=record.host_step_time_ms,
+                    prev_device_step_time_ms=record.prev_device_step_time_ms,
+                    gpu_forward_time_ms=record.gpu_forward_time_ms)
+            if not (idle_wait_follows
+                    and ADPIterStatsBuffer.rank0_sent_payload(all_rank_states)):
+                return
+            all_rank_states = self.adp_router.gather_iter_stats(
+                self._adp_iter_stats.next_payload())
+
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
             self, waiting_queue: WaitingQueue,
@@ -9040,22 +9075,17 @@ class PyExecutor:
                 self._kv_connector_deadlines.clear()
             if self._kv_load_tracker.enabled and self.dist.rank == 0:
                 self._kv_load_tracker.record_rank_states(all_rank_states)
-            if self.enable_iter_perf_stats:
-                for record in self._adp_iter_stats.finalize(
-                        all_rank_states, is_rank0=self.dist.rank == 0):
-                    self._append_iter_stats(
-                        record.stats,
-                        record.req_stats,
-                        kv_iter_stats=record.kv_iter_stats,
-                        attention_dp_rank=record.attention_dp_rank,
-                        host_step_time_ms=record.host_step_time_ms,
-                        prev_device_step_time_ms=record.
-                        prev_device_step_time_ms,
-                        gpu_forward_time_ms=record.gpu_forward_time_ms)
             total_num_active_requests = sum(s.num_active_requests
                                             for s in all_rank_states)
             total_num_live_requests = total_num_active_requests + sum(
                 s.num_retiring_requests for s in all_rank_states)
+            if self.enable_iter_perf_stats:
+                # With no live or waiting request, the fetch below waits for
+                # the next one.
+                self._publish_adp_iter_stats(
+                    all_rank_states,
+                    idle_wait_follows=(total_num_live_requests == 0
+                                       and len(waiting_queue) == 0))
             new_requests_hint = None
             if self._fetch_hint_enabled:
                 # RankState.rank is the TP rank; with the hint enabled the TP
