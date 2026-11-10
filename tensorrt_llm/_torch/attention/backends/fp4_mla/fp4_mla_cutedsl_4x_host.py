@@ -46,10 +46,13 @@ __all__ = [
     "compiled_variants",
     "vpfl_decision",
     "envelope_reason_static",
+    "device_unsupported_reason",
+    "max_shared_memory_per_block",
     "use_split_mode",
     "split_enabled",
     "pair_tasks",
     "MIN_SM_COUNT",
+    "SMEM_BYTES_PER_CTA",
     "SPLIT_MAX_PAIRS",
 ]
 
@@ -94,6 +97,9 @@ V_PAGE_BYTES = OUT_COLS * (
 VPFL_MAX_V_SPAN_ENV = "TRTLLM_FP4_MLA_4X_VPFL_MAX_V_SPAN_MB"
 VPFL_MAX_V_SPAN_BYTES = int(float(os.environ.get(VPFL_MAX_V_SPAN_ENV, "1024")) * 1024 * 1024)
 MIN_SM_COUNT = 4 * FULL_ONLY_MAX_PAIRS  # 184: one wave of 46 four-CTA clusters must be co-resident
+# Shared memory one CTA of the kernel declares (bytes).  A device whose blocks cannot have that much keeps every call
+# on the 2x kernel (``device_unsupported_reason``).
+SMEM_BYTES_PER_CTA = 231712
 # --- split mode (Milestone 2): plan-driven KV split tasks + FP32 partials merged by fp4_mla_packed_reduce ----------
 SPLIT_ENV = "TRTLLM_FP4_MLA_4X_SPLIT"  # default on; 0 keeps the one-wave FULL-only kernel (and its envelope) only
 SPLIT_MAX_PAIRS = 512  # partial workspace bound (<= ~0.5 GB of FP32 partials at 128 heads x q4)
@@ -922,6 +928,49 @@ def envelope_reason_static(
                 f"{pairs} pairs > one wave and max_kv_len {max_kv_len} < {min_kv}: the per-task fixed cost "
                 f"of the extra waves outweighs the 4x per-tile edge ({SPLIT_MIN_KV_MULTIWAVE_ENV})"
             )
+    return None
+
+
+_SMEM_PER_BLOCK_CACHE: dict[int, int] = {}
+
+
+def max_shared_memory_per_block(device: torch.device) -> int:
+    """Most shared memory one block may use on ``device`` (bytes), cached per device index: the oversized limit
+    where the CUDA driver reports one (Rubin: 327 KiB per block, taken from the L1 cache), else the opt-in limit."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    limit = _SMEM_PER_BLOCK_CACHE.get(index)
+    if limit is None:
+        limit = int(torch.cuda.get_device_properties(index).shared_memory_per_block_optin)
+        import cuda.bindings.driver as cuda
+
+        # Bindings older than CUDA 13 do not know the attribute; a driver without the mode reports 0.
+        oversized = getattr(
+            cuda.CUdevice_attribute,
+            "CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK",
+            None,
+        )
+        if oversized is not None:
+            err, cu_device = cuda.cuDeviceGet(index)
+            if err == cuda.CUresult.CUDA_SUCCESS:
+                err, value = cuda.cuDeviceGetAttribute(oversized, cu_device)
+                if err == cuda.CUresult.CUDA_SUCCESS:
+                    limit = max(limit, int(value))
+        _SMEM_PER_BLOCK_CACHE[index] = limit
+    return limit
+
+
+def device_unsupported_reason(device: torch.device) -> str | None:
+    """None when ``device`` can host the kernel, else why it cannot: the dispatcher's ``four_x_unavailable``.
+
+    Device properties only, nothing about the call.  The SM count is not checked here: the envelope takes it with
+    the shapes (``envelope_reason_static``), because the two-stream planner sizes its lanes from the same number.
+    """
+    limit = max_shared_memory_per_block(device)
+    if limit < SMEM_BYTES_PER_CTA:
+        return (
+            f"the 4x kernel declares {SMEM_BYTES_PER_CTA} B of shared memory per block, "
+            f"the device allows {limit}"
+        )
     return None
 
 

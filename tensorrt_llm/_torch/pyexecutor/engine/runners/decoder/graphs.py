@@ -778,6 +778,15 @@ class DecoderCudaGraphs:
             torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
         )
 
+    @staticmethod
+    def _fp4_mla_4x_unavailable() -> str | None:
+        """Why the device the decode graphs replay on cannot host the FP4 MLA 4x kernel; None when it can."""
+        from tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_cutedsl_4x_host import (
+            device_unsupported_reason,
+        )
+
+        return device_unsupported_reason(torch.device("cuda", torch.cuda.current_device()))
+
     def _fp4_mla_decode_heads(self) -> int | None:
         """Attention heads this rank's MLA layers decode with; None without MLA layers or with unequal ones."""
         from tensorrt_llm._torch.attention.mla import MLA
@@ -832,6 +841,7 @@ class DecoderCudaGraphs:
 
         capacity = int(kv_cache_manager.max_blocks_per_seq) * FP4_MLA_TOKENS_PER_BLOCK
         sm_count = self._decode_sm_count()
+        four_x_unavailable = self._fp4_mla_4x_unavailable()
 
         @functools.cache
         def resolver(batch_size: int, draft_len: int) -> tuple[int, ...]:
@@ -844,6 +854,7 @@ class DecoderCudaGraphs:
                 kv_capacity=capacity,
                 sm_count=sm_count,
                 envelope_reason=envelope_reason_static,
+                four_x_unavailable=four_x_unavailable,
             )
 
         return resolver

@@ -591,6 +591,7 @@ def test_kv_regime_resolver_resolves_only_for_the_fp4_mla_4x_decode() -> None:
         patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=True),
         patch(f"{config_module}._fp4_mla_packed_q_enabled", return_value=True),
         patch.object(runner, "_decode_sm_count", return_value=212),
+        patch.object(runner, "_fp4_mla_4x_unavailable", return_value=None),
     ):
         resolver = runner._kv_regime_resolver(resource_manager)
         # capacity = blocks per sequence x 128 tokens; the regimes of a shape follow its 4x KV floor: 128 requests
@@ -614,6 +615,11 @@ def test_kv_regime_resolver_resolves_only_for_the_fp4_mla_4x_decode() -> None:
         model.modules.return_value = [mla_layer, other_layer]
         assert runner._kv_regime_resolver(resource_manager) is None
         model.modules.return_value = [mla_layer]
+        # a device that cannot host the 4x kernel decodes every step on 2x: one regime per shape
+        with patch.object(
+            runner, "_fp4_mla_4x_unavailable", return_value="too little shared memory"
+        ):
+            assert runner._kv_regime_resolver(resource_manager)(128, 3) == (30080,)
     # the dispatcher runs only behind the packed-Q cutedsl decode
     with (
         patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=True),

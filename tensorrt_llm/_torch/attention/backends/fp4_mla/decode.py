@@ -1295,7 +1295,7 @@ def run_fp4_mla_attention_decode(
                 helix=helix_kv_bounds is not None,
                 softmax_stats=softmax_stats_tensor is not None,
                 v_packed=core_v_packed is not None,
-                four_x_enabled=True,
+                four_x_unavailable=_host_4x.device_unsupported_reason(q.device),
             )
             _decode_4x._fp4_mla_4x_record(
                 None if strategy.path != _dispatch.PATH_2X else strategy.reason,

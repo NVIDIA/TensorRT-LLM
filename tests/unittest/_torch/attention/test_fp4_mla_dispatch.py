@@ -11,7 +11,7 @@ SM = 212
 ROWS_Q4, ROWS_Q2 = 512, 256
 
 
-def _choose(num_requests, query_len, kv_capacity, *, live=None, four_x=True, **kw):
+def _choose(num_requests, query_len, kv_capacity, *, live=None, unavailable=None, **kw):
     rows = 128 * query_len
     return dp.choose_decode_strategy(
         num_requests=num_requests,
@@ -22,7 +22,7 @@ def _choose(num_requests, query_len, kv_capacity, *, live=None, four_x=True, **k
         sm_count=SM,
         envelope_reason=host_4x.envelope_reason_static,
         live_max_kv=live,
-        four_x_enabled=four_x,
+        four_x_unavailable=unavailable,
         **kw,
     )
 
@@ -43,9 +43,28 @@ def _clean_env(monkeypatch):
     monkeypatch.setenv("TRTLLM_FP4_MLA_TWOSTREAM_T2_SCALE", "1.0")
 
 
-def test_knob_off_is_2x():
-    s = _choose(128, 4, 30080, four_x=False)
-    assert s.path == dp.PATH_2X
+def test_unavailable_4x_is_2x(monkeypatch):
+    s = _choose(128, 4, 30080, unavailable="no 4x kernel on this device")
+    assert s.path == dp.PATH_2X and s.reason == "no 4x kernel on this device"
+    # a forced path cannot bring the kernel back, and the shape keeps the single regime of its capacity
+    monkeypatch.setenv(dp.DECODE_PATH_ENV, "4x")
+    assert _choose(128, 4, 30080, unavailable="no 4x kernel on this device").path == dp.PATH_2X
+    monkeypatch.delenv(dp.DECODE_PATH_ENV)
+    assert _regimes(128, 4, 30080, unavailable="no 4x kernel on this device") == (30080,)
+
+
+def test_device_unsupported_reason(monkeypatch):
+    # the host names what the device lacks; a block with room for the kernel's shared memory is no reason
+    monkeypatch.setattr(
+        host_4x, "max_shared_memory_per_block", lambda device: host_4x.SMEM_BYTES_PER_CTA
+    )
+    assert host_4x.device_unsupported_reason(None) is None
+    monkeypatch.setattr(
+        host_4x, "max_shared_memory_per_block", lambda device: host_4x.SMEM_BYTES_PER_CTA - 1
+    )
+    reason = host_4x.device_unsupported_reason(None)
+    assert reason is not None and str(host_4x.SMEM_BYTES_PER_CTA) in reason
+    assert _choose(128, 4, 30080, unavailable=reason).reason == reason
 
 
 def test_b128_q4_long_kv_is_two_stream():
@@ -186,7 +205,7 @@ def test_main_tree_2x_calibration_keeps_plain_4x_at_b128(monkeypatch):
     assert _choose(48, 4, 30080).path == dp.PATH_TWO_STREAM
 
 
-def _regimes(num_requests, query_len, capacity, num_heads=128):
+def _regimes(num_requests, query_len, capacity, num_heads=128, unavailable=None):
     rows = num_heads * query_len
     return dp.kv_regimes_for_batch(
         num_requests=num_requests,
@@ -196,6 +215,7 @@ def _regimes(num_requests, query_len, capacity, num_heads=128):
         kv_capacity=capacity,
         sm_count=SM,
         envelope_reason=host_4x.envelope_reason_static,
+        four_x_unavailable=unavailable,
     )
 
 

@@ -47,6 +47,10 @@ small-batch rules, Helix / softmax-stats / packed-V requirements, split-mode bou
 may run, and the two-stream planner (``fp4_mla_twostream``) decides whether handing the last requests to the 2x
 kernel on a concurrent stream drops a whole 4x wave.
 
+Whether the 4x kernel can run here at all is not this module's knowledge either: the caller passes the reason it
+cannot as ``four_x_unavailable`` (``fp4_mla_cutedsl_4x_host.device_unsupported_reason``: what the kernel needs from
+the device, today the shared memory a block may use), and every call then stays on ``2x`` with that reason.
+
 KV length used for the decision: ``live_max_kv``, the ceiling of the KV regime a CUDA graph runner keys its decode
 graphs by (``set_decode_kv_regime`` on the graph's attention metadata stores it in ``Fp4MlaState.kv_regime_max_kv``),
 an upper bound of the step's longest live KV; without one, eager steps included, the page-table capacity.  The
@@ -175,21 +179,23 @@ def kv_regimes_for_batch(
     kv_capacity: int,
     sm_count: int,
     envelope_reason: Callable[..., Optional[str]],
+    four_x_unavailable: Optional[str] = None,
 ) -> tuple[int, ...]:
     """Ceilings of the KV regimes a graph runner captures one decode graph of this batch shape for.
 
     Ascending, the page-table capacity last.  Only regimes whose graphs would decide differently earn one: a shape
-    the 4x paths can never take (a forced ``2x`` / ``4x`` path, a shape outside the static envelope on the capacity,
+    the 4x paths can never take (``four_x_unavailable``, a forced ``2x`` / ``4x`` path, a shape outside the static
+    envelope on the capacity,
     among them every ``query_len`` whose rows are no multiple of 256 and every batch over the split-mode pair bound)
     or always may (floor 0) has the single regime of the capacity; otherwise the 2x regime ends right under the
     shape's KV floor, the 4x-eligible span above it is split wherever the two-stream plan changes (the plan is taken
     on the regime ceiling, and ``plan_two_stream`` drops the split at long KV where its gain fades below the gate:
     B48/q4 keeps r2 = 2 up to ~50K and runs plain 4x beyond, so a 160K page table gets a two-stream regime for the
-    short steps), ``kv_regime_grid`` adds its points, and the capacity closes the list.  ``envelope_reason`` as in
-    ``choose_decode_strategy``.
+    short steps), ``kv_regime_grid`` adds its points, and the capacity closes the list.  ``envelope_reason`` and
+    ``four_x_unavailable`` as in ``choose_decode_strategy``.
     """
     capacity = int(kv_capacity)
-    if _env_path() in (PATH_2X, PATH_4X):
+    if four_x_unavailable is not None or _env_path() in (PATH_2X, PATH_4X):
         return (capacity,)
     reason = envelope_reason(
         num_heads=num_heads,
@@ -290,7 +296,7 @@ def choose_decode_strategy(
     helix: bool = False,
     softmax_stats: bool = False,
     v_packed: bool = True,
-    four_x_enabled: bool = True,
+    four_x_unavailable: Optional[str] = None,
 ) -> DecodeStrategy:
     """Pick the decode path for one packed-Q decode call.
 
@@ -298,7 +304,8 @@ def choose_decode_strategy(
     importable without the kernel host); it is always evaluated on the page-table capacity, the geometry the
     kernels are compiled for.  ``live_max_kv`` is an upper bound of the call's longest KV (the KV regime ceiling of
     a regime-keyed CUDA graph) that the floor and the two-stream plan are taken on instead of the capacity; None
-    keeps the capacity.
+    keeps the capacity.  ``four_x_unavailable`` is why the 4x kernel cannot run at all where the call executes
+    (None when it can): it wins over a forced path, and becomes the strategy's reason.
     """
     forced = _env_path()
     kv_source = "capacity"
@@ -310,8 +317,8 @@ def choose_decode_strategy(
     def two_x(reason: str) -> DecodeStrategy:
         return DecodeStrategy(PATH_2X, 0, reason, kv_decision, kv_source, None)
 
-    if not four_x_enabled:
-        return two_x("TRTLLM_FP4_MLA_CUTEDSL_4X=0")
+    if four_x_unavailable is not None:
+        return two_x(four_x_unavailable)
     if forced == PATH_2X:
         return DecodeStrategy(
             PATH_2X, 0, f"forced by {DECODE_PATH_ENV}", kv_decision, "forced", None
