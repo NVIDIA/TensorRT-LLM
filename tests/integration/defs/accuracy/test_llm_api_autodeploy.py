@@ -18,23 +18,18 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
+from defs.conftest import (get_device_count, get_device_memory, get_llm_root,
+                           llm_models_root, skip_pre_ada, skip_pre_blackwell,
+                           skip_pre_hopper)
 from test_common.llm_data import hf_id_to_local_model_dir
 
-from defs.conftest import (
-    get_device_count,
-    get_device_memory,
-    get_llm_root,
-    llm_models_root,
-    skip_pre_ada,
-    skip_pre_blackwell,
-    skip_pre_hopper,
-)
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.llmapi import Eagle3DecodingConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
-from .accuracy_core import GSM8K, MMLU, MMMU, CnnDailymail, LlmapiAccuracyTestHarness
+from .accuracy_core import (GSM8K, MMLU, MMMU, CnnDailymail,
+                            LlmapiAccuracyTestHarness)
 
 _AD_CONFIGS_DIR = (Path(get_llm_root()) / 'examples' / 'auto_deploy' /
                    'model_registry' / 'configs')
