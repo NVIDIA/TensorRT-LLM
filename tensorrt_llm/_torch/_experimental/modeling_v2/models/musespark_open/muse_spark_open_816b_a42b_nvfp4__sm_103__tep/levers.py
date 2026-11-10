@@ -444,6 +444,34 @@ def _knob_only(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bo
     return False, "flagged: on only by its knob, until it is gated on this target"
 
 
+def _tep8_only(what: str) -> RuleFn:
+    """On at TP8, the size this path was written and measured for; off elsewhere by its knob only.
+
+    The ported decode stack was built for the sm103 TP8 composition over two trays. At TP4 these
+    paths are either unserved by the composition or untuned, so they stay knob-only there.
+
+    What carries this default is the acceptance evidence: on the SPEED-Bench 80-row coding set
+    (chat-templated, rejection sampling, DFlash d7, concurrency 1) every lever listed below runs
+    **token-identical** to the stack with all of them off -- 4.6303 AL, the same 3623/6986
+    accepted/drafted, on GB300 TEP8. Every arm there repeats bitwise, so that is an exact result,
+    not one inside a noise band; and because the emitted tokens are identical, it does not depend
+    on the baseline's absolute level. A lever is default-on here only if it was in a measured arm.
+
+    The decode-step speedup measured for this stack (12.23 -> 11.04 ms at bs4) was taken with
+    ``TRTLLM_MULTI_INSTANCE_CONTEXT_FMHA=1`` also set. That switch is **not** a lever and is not
+    enabled here: it is the one component that moves acceptance (-3.79 % AL on the same gate, all
+    of the loss). So the levers' own share of that speedup is not yet separated, and this
+    docstring does not claim it.
+    """
+
+    def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+        if d.tp == 8:
+            return True, what
+        return False, f"tep{d.tp}: on only by its knob (written for the tep8 composition)"
+
+    return rule
+
+
 def _tep4_only(what: str) -> RuleFn:
     """On at TP4, where the composition carries the path; off at any other size by its knob only.
 
@@ -458,6 +486,11 @@ def _tep4_only(what: str) -> RuleFn:
         return False, f"tep{d.tp}: on only by its knob (the tep4 composition's path)"
 
     return rule
+
+
+def _ported_tep8(kind: Kind, what: str, params: Tuple[Param, ...] = ()) -> Rule:
+    """A ported switch that is ON by default at TP8 -- the parallelism it was written for."""
+    return Rule("LL", kind, _tep8_only(what), params=params)
 
 
 def _ported(kind: Kind, params: Tuple[Param, ...] = ()) -> Rule:
@@ -606,37 +639,56 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
             params=(Param("TP8_MAX_ROWS", FINALIZE_TWO_SHOT_TP8_ROWS, 24, 152),),
         ),
         # The sm103 decode-stack switches, ported from environment variables: default off.
-        "tep8_fc_shard_wide": _ported(
-            Kind.FLAGGED, (Param("MAX_ROWS", FC_SHARD_TP8_ROWS, 9, 128),)
+        "tep8_fc_shard_wide": _ported_tep8(
+            Kind.FLAGGED,
+            "the TP8 sharded drafter fc over the tray's NVLink",
+            (Param("MAX_ROWS", FC_SHARD_TP8_ROWS, 9, 128),),
         ),
-        "tep8_persistent_batch_experts": _ported(
-            Kind.FLAGGED, (Param("MAX_ROWS", PERSISTENT_BATCH_ROWS, 9, 32),)
+        "tep8_persistent_batch_experts": _ported_tep8(
+            Kind.FLAGGED,
+            "the persistent expert kernel's batch builds at TP8",
+            (Param("MAX_ROWS", PERSISTENT_BATCH_ROWS, 9, 32),),
         ),
-        "tep8_experts_early_start": _ported(Kind.FLAGGED),
-        "tep8_router_shard": _ported(Kind.FLAGGED),
-        "tep8_router_shard_wide": _ported(Kind.FLAGGED),
-        "tep8_wide_direct_pool": _ported(Kind.FLAGGED),
+        "tep8_experts_early_start": _ported_tep8(
+            Kind.FLAGGED, "the stacked expert call launched with its placement's early trigger"
+        ),
+        "tep8_router_shard": _ported_tep8(Kind.FLAGGED, "the TP8 wide-prologue router shard"),
+        "tep8_router_shard_wide": _ported_tep8(
+            Kind.FLAGGED, "router_shard_wide's built-in bits on the TP8 wide prologue"
+        ),
+        "tep8_wide_direct_pool": _ported_tep8(
+            Kind.FLAGGED, "pool_into_route's TP8 wide direct sites"
+        ),
         "tep8_wide_direct_transports": _ported(
             Kind.FLAGGED, (Param("SITES", WIDE_DIRECT_SITES, choices=WIDE_DIRECT_SITES),)
         ),
-        "tep8_batch_splitk": _ported(Kind.BITWISE),
-        "finalize_entry_trigger": _ported(Kind.BITWISE),
-        "tep8_finalize_transport_wide": _ported(
-            Kind.FLAGGED, (Param("MAX_TOKENS", FINALIZE_TRANSPORT_TOKENS, 17, 40),)
+        "tep8_batch_splitk": _ported_tep8(Kind.BITWISE, "the TP8 batch split-K projection kernels"),
+        "finalize_entry_trigger": _ported_tep8(
+            Kind.BITWISE, "the finalize transport's entry trigger"
+        ),
+        "tep8_finalize_transport_wide": _ported_tep8(
+            Kind.FLAGGED,
+            "the widened TP8 finalize transport",
+            (Param("MAX_TOKENS", FINALIZE_TRANSPORT_TOKENS, 17, 40),),
         ),
         "multi_request_combine_gate": _ported(Kind.BITWISE),
         "router_staged_gemm": _ported(
             Kind.FLAGGED,
             (Param("BUILD", (ROUTER_STAGED_BUILD,), choices=ROUTER_STAGED_BUILDS),),
         ),
+        # NOT default-on: it resolved off (dependency) in BOTH measured arms, so the
+        # bitwise-clean SPEED-Bench result does not cover it.  Knob-only until it does.
         "drafter_fused_prep": _ported(
             Kind.FLAGGED, (Param("MIN_REQUESTS", DRAFTER_PREP_MIN_REQUESTS, 1, 64),)
         ),
-        "tep8_ring_buddy_wide": _ported(
-            Kind.FLAGGED, (Param("MAX_ROWS", RING_BUDDY_MAX_ROWS, 1, RING_BUDDY_ROW_CEILING),)
-        ),
-        "tep8_wide_balance": _ported(
+        "tep8_ring_buddy_wide": _ported_tep8(
             Kind.FLAGGED,
+            "the TP8 ring-buddy placement's wide row cap",
+            (Param("MAX_ROWS", RING_BUDDY_MAX_ROWS, 1, RING_BUDDY_ROW_CEILING),),
+        ),
+        "tep8_wide_balance": _ported_tep8(
+            Kind.FLAGGED,
+            "the 256-row wide balance",
             (Param("MAX_ROWS", WIDE_BALANCE_ROWS, WIDE_BALANCE_MIN_ROWS, RING_BUDDY_ROW_CEILING),),
         ),
         # Diagnostics: one extra assign launch per placement, and the in-kernel placement
@@ -646,8 +698,12 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
             Kind.FLAGGED,
             (Param("INTERVAL_S", RING_BUDDY_STATS_INTERVAL_S, 1, 86400),),
         ),
-        "tep8_experts_in_kernel_placement": _ported(Kind.FLAGGED),
-        "tep8_experts_interleaved_fetch": _ported(Kind.FLAGGED),
+        "tep8_experts_in_kernel_placement": _ported_tep8(
+            Kind.FLAGGED, "placement computed inside the expert kernel"
+        ),
+        "tep8_experts_interleaved_fetch": _ported_tep8(
+            Kind.FLAGGED, "the expert kernel's interleaved weight fetch"
+        ),
         **{name: _tep4_path_rule() for name in TEP4_PATHS},
     }
 )
