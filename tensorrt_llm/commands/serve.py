@@ -52,6 +52,10 @@ from tensorrt_llm.commands._config_overrides import (ConfigOverride,
                                                      parse_config_overrides)
 from tensorrt_llm.commands._serve_stability import stability_option
 from tensorrt_llm.commands.mooncake import mooncake_master, mooncake_pool_report
+from tensorrt_llm.commands.serve_cli._net import (_bind_failure,
+                                                  _diagnose_port_in_use,
+                                                  _listener_address_family,
+                                                  _publish_bound_address)
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
@@ -406,121 +410,6 @@ def _build_llm_args_from_disagg_server_cfg(other_args: Dict) -> Dict:
     llm_args, llm_args_extra_dict = get_llm_args(
         **other_args, explicit_cli_keys=disagg_explicit_keys)
     return update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
-
-
-def _publish_bound_address(report_addr: Optional[str], host: str,
-                           port: int) -> None:
-    """Write the address this server actually bound to ``report_addr``.
-
-    Lets a launcher pass ``--port 0`` and learn the kernel-assigned port
-    afterwards, instead of picking a port up front and racing whoever grabs it
-    before this process binds. The write is atomic (temp file in the same
-    directory, then rename) so a reader never observes a partial line, which
-    matters on the shared filesystems multi-node tests coordinate through.
-
-    The caller is responsible for making the path unique per run: a stale file
-    from an earlier run points at a dead server, which fails far less obviously
-    than a port conflict.
-
-    A wildcard bind host is replaced by this machine's hostname, since readers
-    use the published value as a URL authority and cannot dial 0.0.0.0 or ::.
-    """
-    if not report_addr:
-        return
-    if host in ("0.0.0.0", "::", ""):  # nosec B104 - reporting, not binding
-        resolved = socket.gethostname()
-        logger.info(f"Reporting hostname {resolved} instead of wildcard bind "
-                    f"address {host!r}, which a reader cannot dial")
-        host = resolved
-    report_addr = os.path.abspath(report_addr)
-    parent = os.path.dirname(report_addr)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=parent or None,
-                                    prefix=os.path.basename(report_addr) + ".",
-                                    suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            # Bracket IPv6 literals so the value is a usable URL authority:
-            # readers build "http://<reported>/..." from it verbatim.
-            reported_host = f"[{host}]" if ":" in host else host
-            f.write(f"{reported_host}:{port}\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, report_addr)
-    finally:
-        # A successful replace already consumed tmp_path; this only cleans up
-        # after a failed write so a partial file is not left behind.
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_path)
-    logger.info(f"Reported bound address {host}:{port} to {report_addr}")
-
-
-def _diagnose_port_in_use(port: int) -> str:
-    """Describe which process currently holds the given port, best effort."""
-    try:
-        import psutil
-    except ImportError:
-        return "psutil unavailable; cannot identify the process holding the port"
-
-    details = []
-    try:
-        for conn in psutil.net_connections(kind="inet"):
-            if conn.laddr and conn.laddr.port == port:
-                holder = ""
-                if conn.pid is not None:
-                    try:
-                        proc = psutil.Process(conn.pid)
-                        holder = (f" pid={conn.pid} name={proc.name()} "
-                                  f"cmdline={' '.join(proc.cmdline())}")
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        holder = f" pid={conn.pid}"
-                details.append(
-                    f"{conn.laddr.ip}:{conn.laddr.port} status={conn.status}{holder}"
-                )
-    except (psutil.Error, OSError) as e:
-        return f"failed to inspect port holders: {e}"
-
-    if not details:
-        return ("no listening socket found for this port; it may have already "
-                "been released, indicating a transient race")
-    return "; ".join(details)
-
-
-def _bind_failure(kind: str, host: str, port: int,
-                  error: OSError) -> RuntimeError:
-    """Log a failed listener bind and return the exception to raise.
-
-    An address lookup failure (``socket.gaierror``) is an ``OSError`` too, but
-    no port was ever tried, so it is reported as such instead of being
-    diagnosed as a port conflict. It covers both a name that does not resolve
-    and an address of a family the socket cannot use, such as an IPv6 literal
-    on an IPv4-only listener.
-    """
-    if isinstance(error, socket.gaierror):
-        reason = f"address lookup failed for host {host!r}: {error}"
-        logger.error(f"Failed to bind {kind} socket to {host}:{port} "
-                     f"(pid={os.getpid()}): {reason}")
-        return RuntimeError(f"Failed to bind socket to {host}:{port}: {reason}")
-    holder = _diagnose_port_in_use(port)
-    logger.error(
-        f"Failed to bind {kind} socket to {host}:{port} (pid={os.getpid()}): "
-        f"{error}. Current port holder(s): {holder}")
-    return RuntimeError(f"Failed to bind socket to {host}:{port}: {error}. "
-                        f"Port holder(s): {holder}")
-
-
-def _listener_address_family(kind: str, host: str,
-                             port: int) -> socket.AddressFamily:
-    """The family to bind ``host`` with: IPv6 only if it resolves to nothing else."""
-    try:
-        addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
-                                       socket.SOCK_STREAM)
-    except socket.gaierror as e:
-        raise _bind_failure(kind, host, port, e) from e
-    if all(info[0] == socket.AF_INET6 for info in addr_info):
-        return socket.AF_INET6
-    return socket.AF_INET
 
 
 def _reserve_multi_frontend_port(host: str, port: int,

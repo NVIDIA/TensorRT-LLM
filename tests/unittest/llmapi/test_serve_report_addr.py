@@ -33,13 +33,8 @@ import yaml
 from click.testing import CliRunner
 
 import tensorrt_llm.commands.serve as serve_module
-from tensorrt_llm.commands.serve import (
-    _bind_failure,
-    _publish_bound_address,
-    disaggregated,
-    launch_server,
-    launch_visual_gen_server,
-)
+from tensorrt_llm.commands.serve import disaggregated, launch_server, launch_visual_gen_server
+from tensorrt_llm.commands.serve_cli._net import _bind_failure, _publish_bound_address
 
 # The reader half lives with the integration helpers, so both halves of the
 # round trip are exercised together and a change to either side fails here.
