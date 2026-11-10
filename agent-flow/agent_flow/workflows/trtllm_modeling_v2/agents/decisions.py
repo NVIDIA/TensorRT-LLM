@@ -223,6 +223,38 @@ def read_decision(path: Path, role: str) -> dict[str, Any] | None:
     return {**raw, "decision": decision}
 
 
+def decision_problem(path: Path, role: str) -> str:
+    """Why ``path`` holds no decision ``role`` may give, in a sentence; ``""`` when it does."""
+    allowed = ", ".join(DECISIONS_BY_AGENT[role])
+    try:
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return f"there is no file at `{path}`"
+    except (OSError, UnicodeError) as exc:
+        return f"`{path}` cannot be read: {exc}"
+    except yaml.YAMLError as exc:
+        return f"`{path}` is not valid YAML: {clip(str(exc), 300)}"
+    if not isinstance(raw, dict):
+        return f"`{path}` is not a YAML mapping of keys to values"
+    if "decision" not in raw:
+        return f"`{path}` has no `decision` key; it must be one of {allowed}"
+    decision = str(raw.get("decision", "")).strip()
+    if decision not in DECISIONS_BY_AGENT[role]:
+        return f"`decision` is {decision!r} in `{path}`; it must be one of {allowed}"
+    return ""
+
+
+def decision_repair_block(problem: str) -> str:
+    """What a worker whose turn ended without a readable decision is told, for one short turn."""
+    return (
+        "## Your decision file is not valid\n\n"
+        f"Your turn ended, but {problem}. Do not do the task again: your work is in your "
+        "worktree. Write the decision file again, as YAML, with `decision:` and the keys your "
+        "decision carries (`summary` and the others the ending section of your instructions "
+        "names), saying what your earlier turn did. The orchestrator reads only this file."
+    )
+
+
 def clip(text: str, limit: int) -> str:
     """``text`` up to ``limit`` characters, an ellipsis marking what was cut."""
     text = str(text).strip()

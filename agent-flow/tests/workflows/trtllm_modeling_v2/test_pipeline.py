@@ -226,6 +226,26 @@ def test_kernel_tasks_run_one_at_a_time_in_queue_order(tmp_path, task_file, monk
     assert seen == [("k1-rms", 1), ("k2-scale", 1), ("k3-last", 1)]
 
 
+def test_a_decision_file_without_its_decision_gets_one_turn_to_write_it(
+    tmp_path, task_file, monkeypatch
+):
+    prompts: list[str] = []
+
+    def assembler(turn, prompt):
+        prompts.append(prompt)
+        if turn == 1:
+            return {"summary": "UNIT_READY: assembled, boot passed"}  # the key forgotten
+        return {"decision": "UNIT_READY", "summary": "assembled, boot passed"}
+
+    _run(tmp_path, task_file, monkeypatch, Script(assembler=assembler))
+    assert _state(tmp_path).verdict == "delivered"
+    assert len(prompts) == 2
+    assert "## Your decision file is not valid" in prompts[1]
+    assert "has no `decision` key" in prompts[1] and "Do not do the task again" in prompts[1]
+    [core] = [t for t in _tasks(tmp_path) if t["id"] == "core"]
+    assert (core["status"], core["attempts"]) == ("done", 1)
+
+
 # -------------------------------------------------------------------------- the planner
 
 
@@ -339,7 +359,8 @@ def test_a_turn_with_no_decision_runs_again_by_itself_and_a_spent_task_can_only_
         Script(assembler=lambda turn, prompt: None, planner=planner),
         max_attempts=2,
     )
-    assert [role for role, _ in calls] == ["assembler", "assembler", "planner", "planner"]
+    # Each attempt is its turn and one short turn to write the missing file.
+    assert [role for role, _ in calls] == ["assembler"] * 4 + ["planner"] * 2
     assert "It has no attempt left" in asked[0]
     assert "Answer with exactly one of: `ESCALATE`." in asked[0]
     assert "CONTINUE is not possible here" in asked[1]

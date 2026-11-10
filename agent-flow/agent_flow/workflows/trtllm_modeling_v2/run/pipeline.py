@@ -53,6 +53,8 @@ from ..agents.decisions import (
     clip,
     decision_file_instruction,
     decision_path,
+    decision_problem,
+    decision_repair_block,
     first_paragraph,
     read_decision,
 )
@@ -434,6 +436,13 @@ class Pipeline:
             path.unlink(missing_ok=True)
             self._dispatch(task, role, self._prompt(task, block), path)
             data = read_decision(path, role)
+            problem = decision_problem(path, role) if data is None else ""
+            if problem:
+                # The work may be done though the file is wrong: one short turn to say so.
+                self.w.journal.event("task", f"{task.id}: decision file not valid: {problem}")
+                note = decision_repair_block(problem)
+                self._dispatch(task, role, self._prompt(task, f"{block}\n\n{note}"), path)
+                data = read_decision(path, role)
         if data is None:
             return TurnResult(
                 error=f"its turn wrote no valid decision file at {path} "
