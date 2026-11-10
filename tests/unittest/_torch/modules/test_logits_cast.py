@@ -17,6 +17,7 @@
 
 import pytest
 import torch
+import triton
 
 from tensorrt_llm._torch.modules import logits_cast, logits_processor
 
@@ -60,8 +61,8 @@ def _special_values(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-# A partial last block in 2D, and a 3D tensor that spans many blocks.
-@pytest.mark.parametrize("shape", [(7, 1001), (3, 5, 4099)])
+# A partial last block in 2D, full blocks only, and a 3D tensor that spans many blocks.
+@pytest.mark.parametrize("shape", [(7, 1001), (4, 4096), (3, 5, 4099)])
 def test_widen_matches_float_bitwise(dtype, shape, kernel_launches):
     torch.manual_seed(0)
     x = (torch.randn(shape, device="cuda") * 30).to(dtype)
@@ -102,14 +103,26 @@ def test_logits_processor_takes_kernel(kernel_launches):
     assert torch.equal(out.view(torch.int32), ref.view(torch.int32))
 
 
-def test_capturable_in_cuda_graph():
-    x = torch.randn(16, 163840, device="cuda", dtype=torch.bfloat16)
-    logits_cast.widen_logits_to_fp32(x)  # compile outside the capture
+# A vocab that is a multiple of 16, and one that is not, so numel is odd for
+# 7 rows and a multiple of 16 for 16 rows.
+@pytest.mark.parametrize("vocab", [163840, 1001])
+def test_capturable_in_cuda_graph(vocab, monkeypatch):
+    # Compile for one row count outside the capture; the captured row counts reuse it.
+    logits_cast.widen_logits_to_fp32(torch.randn(1, vocab, device="cuda", dtype=torch.bfloat16))
     torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out = logits_cast.widen_logits_to_fp32(x)
-    x.copy_(torch.randn_like(x))
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(out, x.float())
+    compiles = []
+    monkeypatch.setattr(
+        triton.knobs.runtime,
+        "jit_post_compile_hook",
+        lambda **kwargs: compiles.append(kwargs["repr"]),
+    )
+    for rows in (7, 16):
+        x = torch.randn(rows, vocab, device="cuda", dtype=torch.bfloat16)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = logits_cast.widen_logits_to_fp32(x)
+        x.copy_(torch.randn_like(x))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, x.float())
+    assert not compiles
