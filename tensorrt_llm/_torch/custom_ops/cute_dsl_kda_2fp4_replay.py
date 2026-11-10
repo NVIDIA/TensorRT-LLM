@@ -1,6 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Fused Conv4, native 2FP4 KDA replay, and gated output RMSNorm."""
+"""Fused Conv4, native 2FP4 KDA replay, gated output RMSNorm, and window commit.
+
+One CTA per (batch row, head). The CTA that appends the sixteenth history
+entry of its head also commits the full window into both checkpoint terms,
+so ordinary decode needs a single launch. History lengths are advanced by
+the last CTA of each batch row to arrive, which keeps every CTA's length
+read ahead of the update without a separate launch.
+
+With PDL, everything except the current step's projections (slot mapping,
+history length, checkpoint and history copies, Conv window and constants)
+is issued before ``griddepcontrol.wait``; all stores follow it.
+"""
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -8,18 +19,186 @@ import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda_exp
 import cutlass.utils as utils
 import torch
+from cutlass import Float32, Int32, Int64, Uint32
 from cutlass._mlir import ir as mlir_ir
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import make_fake_tensor
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.experimental import primitives as prims
+
+from ..flashinfer_utils import get_env_enable_pdl
+from .cute_dsl_kda_2fp4_commit import (
+    _decode8,
+    _dequant8,
+    _expand4,
+    _f_abs,
+    _f_div,
+    _f_exp,
+    _f_fma,
+    _f_min,
+    _f_mul,
+    _f_neg,
+    _ld_global_u32,
+    _ld_global_v4,
+    _pack_e2m1x8,
+    _pack_e4m3x2,
+    _pack_e4m3x4,
+    _sel_eq0,
+    _st_global_u32,
+    _st_outer_pad,
+    _tmem_st32,
+    _tree_max,
+    _warp_max_f32,
+)
 
 THREADS = 128
 K = 128
 N = 16
 STATE_BYTES = 18448
+VALUES_BYTES = 8192
 PRIMARY_SCALE = 16384
+RESIDUAL_SCALE = 17408
 OUTER_SCALE = 18432
+# Commit operand panels: K-major, no swizzle, 8-row x 16 B core matrices.
+PANEL_LBO = 128
+PANEL_SBO = 256
+PANEL_BYTES = K * N * 2
 
 _compiled = {}
+
+
+def _ir(x, loc=None, ip=None):
+    return x.ir_value(loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _st_global_v2(addr: Int64, a: Uint32, b: Uint32, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [_ir(Int64(addr), loc, ip), _ir(Uint32(a), loc, ip), _ir(Uint32(b), loc, ip)],
+        "st.global.v2.b32 [$0], {$1, $2};",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_global_u8(addr: Int64, v: Uint32, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [_ir(Int64(addr), loc, ip), _ir(Uint32(v), loc, ip)],
+        "{ .reg .b16 t; cvt.u16.u32 t, $1; st.global.b8 [$0], t; }",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_shared_v4(addr: Int32, a: Uint32, b: Uint32, c: Uint32, d: Uint32, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            _ir(Int32(addr), loc, ip),
+            _ir(Uint32(a), loc, ip),
+            _ir(Uint32(b), loc, ip),
+            _ir(Uint32(c), loc, ip),
+            _ir(Uint32(d), loc, ip),
+        ],
+        "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _pack_bf16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Uint32:
+    """RN BF16 pair, ``lo`` in the low half (the lower K index)."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [_ir(Float32(lo), loc, ip), _ir(Float32(hi), loc, ip)],
+            "cvt.rn.bf16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+# Batch indices, slot map and history lengths are a few bytes read by every
+# layer; keep them in L2 across the weight traffic between KDA layers.
+_EVICT_LAST = "createpolicy.fractional.L2::evict_last.b64 p, 1.0;"
+
+
+@dsl_user_op
+def _ld_keep_s32(addr: Int64, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [_ir(Int64(addr), loc, ip)],
+            "{ .reg .b64 p; " + _EVICT_LAST + " ld.global.L2::cache_hint.b32 $0, [$1], p; }",
+            "=r,l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_keep_u8(addr: Int64, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [_ir(Int64(addr), loc, ip)],
+            "{ .reg .b64 p; .reg .b16 t; "
+            + _EVICT_LAST
+            + " ld.global.L2::cache_hint.b8 t, [$1], p; cvt.u32.u16 $0, t; }",
+            "=r,l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _st_keep_s32(addr: Int64, v: Int32, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [_ir(Int64(addr), loc, ip), _ir(Int32(v), loc, ip)],
+        "{ .reg .b64 p; " + _EVICT_LAST + " st.global.L2::cache_hint.b32 [$0], $1, p; }",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cute.jit
+def _addr(tensor, index):
+    return Int64((tensor.iterator + index).toint())
 
 
 @cute.jit
@@ -41,26 +220,216 @@ def _warp_sum_products(lhs, rhs):
 
 
 @cute.jit
-def _store_bf16(ptr, value):
-    typed_ptr = cutlass.inttoptr(ptr.toint(), cutlass.AddressSpace.smem, cutlass.BFloat16)
-    typed_ptr.store(cutlass.Vector.from_elements((value,), dtype=cutlass.BFloat16))
+def _smem_u32(ptr):
+    return Int32(ptr.toint())
 
 
 @cute.jit
-def _store_bf16x2(ptr, value0, value1):
-    typed_ptr = cutlass.inttoptr(ptr.toint(), cutlass.AddressSpace.smem, cutlass.BFloat16)
-    typed_ptr.store(
-        cutlass.Vector.from_elements((value0, value1), dtype=cutlass.BFloat16),
-        alignment=4,
+def _panel_offset(row, chunk):
+    return (row // 8) * PANEL_SBO + chunk * PANEL_LBO + (row % 8) * 16
+
+
+@cute.jit
+def _commit_window(
+    tidx,
+    warp,
+    lane,
+    tmem_raw,
+    head_base,
+    state_outer,
+    cumulative,
+    kn,
+    update,
+    primary_image,
+    cache_hk,
+    cache_hg,
+    cache_hu,
+    s_exp,
+    s_red,
+    commit_mbar,
+):
+    """Fold the 16-entry window into both checkpoint terms.
+
+    The calculation and rounding are those of ``cute_dsl_kda_2fp4_commit``:
+    the decayed primary+residual state seeds the TMEM accumulator, one BF16
+    UMMA adds U^T @ bf16(K * exp(G_end - G)), and both FP4 terms are
+    repacked with a shared outer scale. Thread ``tidx`` owns value row and
+    key column ``tidx``. Entry 15 is the current token, still in registers.
+    """
+    v = tidx
+    s_exp[v] = _f_exp(cumulative)
+    # Residual row (prefetched to L2 at kernel start) and both scale rows.
+    row_base = head_base + Int64(v) * 64
+    residual_row = [_ld_global_v4(row_base + VALUES_BYTES + 16 * c) for c in range(4)]
+    psw = [_ld_global_u32(head_base + PRIMARY_SCALE + Int64(v) * 8 + 4 * j) for j in range(2)]
+    rsw = [_ld_global_u32(head_base + RESIDUAL_SCALE + Int64(v) * 8 + 4 * j) for j in range(2)]
+
+    # B operand rows (key k): bf16(K_i[k] * exp(G_end[k] - G_i[k])).
+    adj = []
+    for i in cutlass.range_constexpr(N):
+        kv = kn.to(Float32)
+        gv = cumulative
+        if cutlass.const_expr(i < N - 1):
+            kv = cache_hk[i * K + v].to(Float32)
+            gv = cache_hg[i * K + v]
+        adj.append(_f_mul(kv, _f_exp(cumulative - gv)))
+    # A operand rows (value v): cached BF16 updates.
+    upd = []
+    for i in cutlass.range_constexpr(N):
+        uv = update.to(cutlass.BFloat16).to(Float32)
+        if cutlass.const_expr(i < N - 1):
+            uv = cache_hu[i * K + v].to(Float32)
+        upd.append(uv)
+    bws = []
+    aws = []
+    for chunk in cutlass.range_constexpr(2):
+        bws.append(
+            [_pack_bf16x2(adj[chunk * 8 + 2 * j], adj[chunk * 8 + 2 * j + 1]) for j in range(4)]
+        )
+        aws.append(
+            [_pack_bf16x2(upd[chunk * 8 + 2 * j], upd[chunk * 8 + 2 * j + 1]) for j in range(4)]
+        )
+    # The G rows are consumed: they become the two 4 KB operand panels.
+    cute.arch.barrier()
+    panel_a = cutlass.Array(cache_hg.data_ptr(), shape=PANEL_BYTES // 2, dtype=cutlass.BFloat16)
+    panel_b = cutlass.Array(
+        cache_hg.subview(PANEL_BYTES // 4).data_ptr(),
+        shape=PANEL_BYTES // 2,
+        dtype=cutlass.BFloat16,
     )
+    for chunk in cutlass.range_constexpr(2):
+        off = _panel_offset(v, chunk)
+        bw = bws[chunk]
+        aw = aws[chunk]
+        _st_shared_v4(_smem_u32(panel_b.data_ptr()) + off, bw[0], bw[1], bw[2], bw[3])
+        _st_shared_v4(_smem_u32(panel_a.data_ptr()) + off, aw[0], aw[1], aw[2], aw[3])
+    cute.arch.barrier()
+
+    # Seed TMEM row v with dequant(primary + residual) * exp(G_end). The
+    # primary row comes from the SW64 TMA image.
+    swizzle_s64 = cutlass.Swizzle.from_name("s64b")
+    ep = list(_expand4(psw[0], state_outer)) + list(_expand4(psw[1], state_outer))
+    er = list(_expand4(rsw[0], state_outer)) + list(_expand4(rsw[1], state_outer))
+    tmem_lane = ((tmem_raw >> Int32(16)) + warp * Int32(32)) << Int32(16)
+    tmem_row = Uint32(tmem_lane | (tmem_raw & Int32(0xFFFF)))
+    for c in cutlass.range_constexpr(4):
+        pw_ptr = primary_image.subview(v * 64 + c * 16).data_ptr().apply_swizzle(swizzle_s64)
+        pw = pw_ptr.load(count=16, alignment=16).bitcast(Uint32)
+        rw = residual_row[c]
+        seed = []
+        for jj in cutlass.range_constexpr(4):
+            g = 2 * c + jj // 2
+            old8 = _dequant8(pw[jj], rw[jj], ep[g], er[g])
+            for t in cutlass.range_constexpr(8):
+                seed.append(_f_mul(old8[t], s_exp[32 * c + 8 * jj + t]))
+        _tmem_st32(tmem_row + Uint32(32 * c), seed)
+    cute.arch.fence_view_async_shared()
+    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+    cute.arch.barrier()
+
+    if warp == 0:
+        prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+        idesc = prims.Tcgen05InstrDesc.build(
+            c_dtype=Float32,
+            a_dtype=cutlass.BFloat16,
+            b_dtype=cutlass.BFloat16,
+            n_dim=K,
+            m_dim=K,
+        )
+        desc_a = prims.Tcgen05SmemDesc.build(
+            panel_a,
+            leading_byte_offset=PANEL_LBO,
+            stride_byte_offset=PANEL_SBO,
+            layout=prims.Tcgen05SmemSwizzle.NONE,
+        )
+        desc_b = prims.Tcgen05SmemDesc.build(
+            panel_b,
+            leading_byte_offset=PANEL_LBO,
+            stride_byte_offset=PANEL_SBO,
+            layout=prims.Tcgen05SmemSwizzle.NONE,
+        )
+        if prims.elect_sync():
+            prims.tcgen05_mma(
+                prims.Tcgen05MMAKind.F16,
+                prims.CTAGroup.CTA_1,
+                cutlass.inttoptr(tmem_raw, 6, Float32),
+                desc_a,
+                desc_b,
+                idesc,
+                True,
+            )
+            prims.tcgen05_commit(commit_mbar, group=prims.CTAGroup.CTA_1)
+    while not prims.mbarrier_try_wait_parity(commit_mbar, Int32(0)):
+        pass
+    prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+
+    # Shared outer scale from the block amax of every 16-key group.
+    bam = []
+    for c in cutlass.range_constexpr(4):
+        sn = prims.tcgen05_ld(
+            "32x32b", cutlass.inttoptr(tmem_row + Uint32(32 * c), 6, Float32), num=32
+        )
+        prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
+        for h in cutlass.range_constexpr(2):
+            bam.append(_tree_max([_f_abs(sn[16 * h + t]) for t in range(16)]))
+    m = _warp_max_f32(_tree_max(bam))
+    if lane == 0:
+        s_red[warp] = m
+    cute.arch.barrier()
+    gmax = _tree_max([s_red[w] for w in range(4)])
+    outer_new = _f_div(gmax, Float32(2688.0))
+    t6 = _f_mul(Float32(6.0), _sel_eq0(outer_new, Float32(1.0), outer_new))
+    inv_t6 = _f_div(Float32(1.0), t6)
+
+    psc = [_f_min(Float32(448.0), _f_mul(bam[g], inv_t6)) for g in range(8)]
+    pscp = [
+        _pack_e4m3x4(psc[4 * j], psc[4 * j + 1], psc[4 * j + 2], psc[4 * j + 3]) for j in range(2)
+    ]
+    for j in cutlass.range_constexpr(2):
+        _st_global_u32(head_base + PRIMARY_SCALE + Int64(v) * 8 + 4 * j, pscp[j])
+    pe = list(_expand4(pscp[0], outer_new)) + list(_expand4(pscp[1], outer_new))
+
+    for g in cutlass.range_constexpr(8):
+        sn = prims.tcgen05_ld(
+            "32x32b", cutlass.inttoptr(tmem_row + Uint32(16 * g), 6, Float32), num=16
+        )
+        prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
+        e = pe[g]
+        pinv = Float32(0.0)
+        if e != Float32(0.0):
+            pinv = _f_div(Float32(1.0), e)
+        pwords = []
+        for h in cutlass.range_constexpr(2):
+            nv = [_sel_eq0(e, Float32(0.0), _f_mul(sn[8 * h + t], pinv)) for t in range(8)]
+            pwords.append(_pack_e2m1x8(nv))
+        _st_global_v2(row_base + 8 * g, pwords[0], pwords[1])
+
+        neg_e = _f_neg(e)
+        rem = []
+        for h in cutlass.range_constexpr(2):
+            mg = _decode8(pwords[h])
+            for t in cutlass.range_constexpr(8):
+                rem.append(_f_fma(mg[t], neg_e, sn[8 * h + t]))
+        rb = _tree_max([_f_abs(x) for x in rem])
+        rs = _f_min(Float32(448.0), _f_mul(rb, inv_t6))
+        rbyte = _pack_e4m3x2(rs, rs) & Uint32(0xFF)
+        _st_global_u8(head_base + RESIDUAL_SCALE + Int64(v) * 8 + g, rbyte)
+        re = _expand4(rbyte, outer_new)[0]
+        rinv = Float32(0.0)
+        if re != Float32(0.0):
+            rinv = _f_div(Float32(1.0), re)
+        rwords = []
+        for h in cutlass.range_constexpr(2):
+            nv = [_sel_eq0(re, Float32(0.0), _f_mul(rem[8 * h + t], rinv)) for t in range(8)]
+            rwords.append(_pack_e2m1x8(nv))
+        _st_global_v2(row_base + VALUES_BYTES + 8 * g, rwords[0], rwords[1])
+    if tidx == 0:
+        _st_outer_pad(head_base + OUTER_SCALE, outer_new)
 
 
 @cute.jit
 def _kda_scalar_active(
     tma_state: cutlass.GridConstant[cuda_exp.TensorMap],
-    tma_hk: cutlass.GridConstant[cuda_exp.TensorMap],
-    tma_hu: cutlass.GridConstant[cuda_exp.TensorMap],
-    tma_hg: cutlass.GridConstant[cuda_exp.TensorMap],
     x,
     conv_state,
     conv_weight,
@@ -69,8 +438,6 @@ def _kda_scalar_active(
     z,
     norm_weight,
     pool,
-    slots,
-    dummy,
     slot_map,
     hk,
     hu,
@@ -79,11 +446,13 @@ def _kda_scalar_active(
     a_log,
     dt_bias,
     out,
-    old_lengths,
+    arrivals,
+    slot,
     lower_bound: cutlass.Float32,
     norm_eps: cutlass.Float32,
     heads: cutlass.Constexpr,
     bounded: cutlass.Constexpr,
+    pdl: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     block, _, _ = cute.arch.block_idx()
@@ -92,21 +461,22 @@ def _kda_scalar_active(
     batch = block // heads
     head = block - batch * heads
 
-    slot = slots[batch].to(cutlass.Int32)
-    live = slot_map[slot].to(cutlass.Int32)
-    length = lengths[live].to(cutlass.Int32)
+    live = _ld_keep_s32(_addr(slot_map, slot))
+    pool_off = cute.crd2idx((slot, head, 0), pool.layout)
+    pool_base = pool.iterator + pool_off
+
+    length = _ld_keep_s32(_addr(lengths, live))
+    commits = length == N - 1
 
     smem = utils.SmemAllocator()
-    s_q = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((K,)), byte_alignment=16)
-    s_k = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((K,)), byte_alignment=16)
-    s_cumulative = smem.allocate_tensor(cutlass.Float32, cute.make_layout((K,)), byte_alignment=16)
-    s_core = cute.make_tensor(
-        cute.recast_ptr(s_cumulative.iterator, dtype=cutlass.BFloat16),
-        cute.make_layout((K,)),
-    )
+    s_q = cutlass.Array(cutlass.BFloat16, K, space=cutlass.AddressSpace.smem, alignment=16)
+    s_k = cutlass.Array(cutlass.BFloat16, K, space=cutlass.AddressSpace.smem, alignment=16)
+    s_cumulative = cutlass.Array(cutlass.Float32, K, space=cutlass.AddressSpace.smem, alignment=16)
     # Four warp partials for two simultaneous reductions plus CTA scalars.
     s_red = smem.allocate_tensor(cutlass.Float32, cute.make_layout((16,)), byte_alignment=16)
     s_scalar = smem.allocate_tensor(cutlass.Float32, cute.make_layout((8,)), byte_alignment=16)
+    # BF16-rounded history coefficients for K then Q.
+    s_coef = cutlass.Array(cutlass.Float32, 2 * N, space=cutlass.AddressSpace.smem, alignment=16)
 
     mma_a = cutlass.Array(cutlass.Int8, 128 * 64, space=cutlass.AddressSpace.smem, alignment=128)
     mma_b = cutlass.Array(cutlass.Int8, 8 * 64, space=cutlass.AddressSpace.smem, alignment=128)
@@ -118,60 +488,28 @@ def _kda_scalar_active(
     )
     acc_mbar = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
     state_mbar = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
-    coeff_mbar = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
-    history_mbar = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
     history_load_mbar = cutlass.Array(
         cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8
     )
+    commit_mbar = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
     tmem_holding = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=4)
-    dense_a_storage = cutlass.Array(
-        cutlass.BFloat16, 144 * 64, space=cutlass.AddressSpace.smem, alignment=128
-    )
-    # The live coefficient panels occupy only the first 4 KB. Reuse padding
-    # consumed solely by ignored MMA rows for early HK/HG TMA staging.
     cache_hk = cutlass.Array(
-        dense_a_storage.subview(2048).data_ptr(),
-        shape=N * K,
-        dtype=cutlass.BFloat16,
-    )
-    cache_hg = cutlass.Array(
-        dense_a_storage.subview(4096).data_ptr(),
-        shape=N * K,
-        dtype=cutlass.Float32,
+        cutlass.BFloat16, N * K, space=cutlass.AddressSpace.smem, alignment=128
     )
     cache_hu = cutlass.Array(
         cutlass.BFloat16, N * K, space=cutlass.AddressSpace.smem, alignment=128
     )
-    dense_a0 = cutlass.Array(dense_a_storage.data_ptr(), shape=128 * 64, dtype=cutlass.BFloat16)
-    dense_a1 = cutlass.Array(
-        dense_a_storage.subview(16 * 64).data_ptr(),
-        shape=128 * 64,
-        dtype=cutlass.BFloat16,
-    )
-    dense_b_storage = cutlass.Array(
-        cutlass.BFloat16, 10 * 64, space=cutlass.AddressSpace.smem, alignment=128
-    )
-    dense_b0 = cutlass.Array(dense_b_storage.data_ptr(), shape=8 * 64, dtype=cutlass.BFloat16)
-    dense_b1 = cutlass.Array(
-        dense_b_storage.subview(2 * 64).data_ptr(),
-        shape=8 * 64,
-        dtype=cutlass.BFloat16,
-    )
+    cache_hg = cutlass.Array(cutlass.Float32, N * K, space=cutlass.AddressSpace.smem, alignment=128)
+    s_exp = cutlass.Array(mma_b.data_ptr(), shape=K, dtype=cutlass.Float32)
 
     if warp == 0:
         if prims.elect_sync():
             prims.mbarrier_init(acc_mbar, 1)
             prims.mbarrier_init(state_mbar, 1)
-            prims.mbarrier_init(coeff_mbar, 1)
-            prims.mbarrier_init(history_mbar, 1)
             prims.mbarrier_init(history_load_mbar, 1)
+            prims.mbarrier_init(commit_mbar, 1)
     prims.fence_mbarrier_init()
     prims.barrier_cta_sync(0)
-    if warp == 0:
-        prims.tcgen05_alloc(tmem_holding, 32, group="cta_1")
-    prims.barrier_cta_sync(0)
-    tmem_raw = tmem_holding.load()
-    prims.tcgen05_relinquish_alloc_permit(group="cta_1")
     if warp == 0:
         if prims.elect_sync():
             prims.mbarrier_arrive_expect_tx(state_mbar, tma_state.global_tx_bytes())
@@ -187,69 +525,45 @@ def _kda_scalar_active(
                 state_mbar,
             )
             if length > 0:
-                history_bytes = (
-                    tma_hk.global_tx_bytes() + tma_hu.global_tx_bytes() + tma_hg.global_tx_bytes()
+                # Only accepted rows: the window is contiguous per (row, head).
+                prims.mbarrier_arrive_expect_tx(history_load_mbar, length * (K * 8))
+                row = cute.crd2idx((live, head, 0, 0), hk.layout)
+                prims.cp_async_bulk_shared_cluster_global(
+                    cache_hk, hk.iterator.raw_ptr() + row, history_load_mbar, length * (K * 2)
                 )
-                prims.mbarrier_arrive_expect_tx(history_load_mbar, history_bytes)
-                prims.cp_async_bulk_tensor_shared_cta_global(
-                    cache_hk,
-                    tma_hk.get_ptr(),
-                    (
-                        cutlass.Int32(0),
-                        cutlass.Int32(0),
-                        head,
-                        live,
-                    ),
-                    history_load_mbar,
+                prims.cp_async_bulk_shared_cluster_global(
+                    cache_hu, hu.iterator.raw_ptr() + row, history_load_mbar, length * (K * 2)
                 )
-                prims.cp_async_bulk_tensor_shared_cta_global(
-                    cache_hg,
-                    tma_hg.get_ptr(),
-                    (
-                        cutlass.Int32(0),
-                        cutlass.Int32(0),
-                        cutlass.Int32(0),
-                        head,
-                        live,
-                    ),
-                    history_load_mbar,
+                prims.cp_async_bulk_shared_cluster_global(
+                    cache_hg, hg.iterator.raw_ptr() + row, history_load_mbar, length * (K * 4)
                 )
-                prims.cp_async_bulk_tensor_shared_cta_global(
-                    cache_hu,
-                    tma_hu.get_ptr(),
-                    (
-                        cutlass.Int32(0),
-                        cutlass.Int32(0),
-                        head,
-                        live,
-                    ),
-                    history_load_mbar,
+            if commits:
+                # Residual values and both scale rows, read only by the commit.
+                prims.cp_async_bulk_prefetch(
+                    pool_base.raw_ptr() + VALUES_BYTES, OUTER_SCALE - VALUES_BYTES
                 )
+    # A committing CTA holds a full 128x128 FP32 accumulator.
+    tmem_cols = cutlass.Int32(32)
+    if commits:
+        tmem_cols = cutlass.Int32(128)
+    if warp == 0:
+        prims.tcgen05_alloc(tmem_holding, tmem_cols, group="cta_1")
+    prims.barrier_cta_sync(0)
+    tmem_raw = tmem_holding.load()
+    prims.tcgen05_relinquish_alloc_permit(group="cta_1")
 
+    # Loads that need at most the slot are issued ahead of the
+    # slot -> live -> length chain and of every barrier.
     width = heads * K
     q_channel = head * K + tidx
     k_channel = width + head * K + tidx
     v_channel = 2 * width + head * K + tidx
-
-    # Conv4 uses the old window, then publishes [old1, old2, raw].
-    raw_q = x[(batch, q_channel)]
-    raw_k = x[(batch, k_channel)]
-    raw_v = x[(batch, v_channel)]
-    z_bf16 = z[(batch, head, tidx)]
     norm_bf16 = norm_weight[tidx]
-    beta_bf16 = beta[(batch, head)]
-    gate_bf16 = gate[(batch, head * K + tidx)]
     dt_value = dt_bias[head * K + tidx]
     a_log_value = a_log[head]
-    pool_off = cute.crd2idx((slot, head, 0), pool.layout)
-    pool_base = pool.iterator + pool_off
-    state_sf = cute.recast_ptr(pool_base + PRIMARY_SCALE, dtype=cutlass.Float8E4M3FN)
-    state_scale_vec = (state_sf.raw_ptr() + tidx * 8).load(count=8, alignment=8)
+    state_sf = cute.recast_ptr(pool_base + PRIMARY_SCALE, dtype=cutlass.Int32)
+    state_scale_words = (state_sf.raw_ptr() + tidx * 2).load(count=2, alignment=8)
     state_outer = cute.recast_ptr(pool_base + OUTER_SCALE, dtype=cutlass.Float32)[0]
-    prev_g_prefetch = cutlass.Float32(0.0)
-    if length > 0:
-        prev_g_prefetch = hg[(live, head, length - 1, tidx)]
-
     state_raw = conv_state.iterator.raw_ptr()
     q_state_ptr = state_raw + cute.crd2idx((slot, q_channel, 0), conv_state.layout)
     k_state_ptr = state_raw + cute.crd2idx((slot, k_channel, 0), conv_state.layout)
@@ -257,14 +571,38 @@ def _kda_scalar_active(
     q_state = q_state_ptr.load(count=3, alignment=2)
     k_state = k_state_ptr.load(count=3, alignment=2)
     v_state = v_state_ptr.load(count=3, alignment=2)
-    q0, q1, q2 = q_state[0], q_state[1], q_state[2]
-    k0, k1, k2 = k_state[0], k_state[1], k_state[2]
-    v0, v1, v2 = v_state[0], v_state[1], v_state[2]
-
     weight_raw = conv_weight.iterator.raw_ptr()
     wq = (weight_raw + q_channel * 4).load(count=4, alignment=8)
     wk = (weight_raw + k_channel * 4).load(count=4, alignment=8)
     wv = (weight_raw + v_channel * 4).load(count=4, alignment=8)
+
+    prev_g_prefetch = cutlass.Float32(0.0)
+    if length > 0:
+        prev_g_prefetch = hg[(live, head, length - 1, tidx)]
+    q0, q1, q2 = q_state[0], q_state[1], q_state[2]
+    k0, k1, k2 = k_state[0], k_state[1], k_state[2]
+    v0, v1, v2 = v_state[0], v_state[1], v_state[2]
+
+    # Clear both SFB atoms (the K/Q scales are written after the next barrier).
+    sfb_words = cutlass.inttoptr(
+        mma_sfb.subview(tidx * 8).data_ptr().toint(), cutlass.AddressSpace.smem, cutlass.Int32
+    )
+    sfb_words.store(
+        cutlass.Vector.from_elements((cutlass.Int32(0), cutlass.Int32(0)), dtype=cutlass.Int32),
+        alignment=8,
+    )
+
+    if cutlass.const_expr(pdl):
+        prims.griddepcontrol("wait")
+
+    # Conv4 uses the old window, then publishes [old1, old2, raw].
+    raw_q = x[(batch, q_channel)]
+    raw_k = x[(batch, k_channel)]
+    raw_v = x[(batch, v_channel)]
+    z_bf16 = z[(batch, head, tidx)]
+    beta_bf16 = beta[(batch, head)]
+    gate_bf16 = gate[(batch, head * K + tidx)]
+
     aq = cute.fma(wq[0].to(cutlass.Float32), q0.to(cutlass.Float32), cutlass.Float32(0.0))
     aq = cute.fma(wq[1].to(cutlass.Float32), q1.to(cutlass.Float32), aq)
     aq = cute.fma(wq[2].to(cutlass.Float32), q2.to(cutlass.Float32), aq)
@@ -281,9 +619,15 @@ def _kda_scalar_active(
     aq = aq * cute.rcp(cutlass.Float32(1.0) + cute.exp(-aq, fastmath=True))
     ak = ak * cute.rcp(cutlass.Float32(1.0) + cute.exp(-ak, fastmath=True))
     av = av * cute.rcp(cutlass.Float32(1.0) + cute.exp(-av, fastmath=True))
-    s_q[tidx] = aq.to(cutlass.BFloat16)
-    s_k[tidx] = ak.to(cutlass.BFloat16)
+    qf = aq.to(cutlass.BFloat16).to(cutlass.Float32)
+    kf = ak.to(cutlass.BFloat16).to(cutlass.Float32)
     v_bf16 = av.to(cutlass.BFloat16)
+    # Each warp reduces its own 32 keys; lane 0 publishes the warp partial.
+    q_partial = _warp_sum_squares(qf)
+    k_partial = _warp_sum_squares(kf)
+    if lane == 0:
+        s_red[8 + warp] = q_partial
+        s_red[12 + warp] = k_partial
 
     q_state_ptr.store(
         cutlass.Vector.from_elements((q1, q2, raw_q), dtype=cutlass.BFloat16),
@@ -299,19 +643,8 @@ def _kda_scalar_active(
     )
     cute.arch.barrier()
 
-    # Simultaneous Q/K norm reductions.
-    qf = s_q[tidx].to(cutlass.Float32)
-    kf = s_k[tidx].to(cutlass.Float32)
-    q0s = _warp_sum_squares(s_q[lane].to(cutlass.Float32))
-    q1s = _warp_sum_squares(s_q[lane + 32].to(cutlass.Float32))
-    q2s = _warp_sum_squares(s_q[lane + 64].to(cutlass.Float32))
-    q3s = _warp_sum_squares(s_q[lane + 96].to(cutlass.Float32))
-    k0s = _warp_sum_squares(s_k[lane].to(cutlass.Float32))
-    k1s = _warp_sum_squares(s_k[lane + 32].to(cutlass.Float32))
-    k2s = _warp_sum_squares(s_k[lane + 64].to(cutlass.Float32))
-    k3s = _warp_sum_squares(s_k[lane + 96].to(cutlass.Float32))
-    qr = (q0s + q2s) + (q1s + q3s)
-    kr = (k0s + k2s) + (k1s + k3s)
+    qr = (s_red[8] + s_red[10]) + (s_red[9] + s_red[11])
+    kr = (s_red[12] + s_red[14]) + (s_red[13] + s_red[15])
     qden = cutlass.Float32(0.0)
     kden = cutlass.Float32(0.0)
     if lane == 0:
@@ -377,18 +710,6 @@ def _kda_scalar_active(
     # Each half-warp is one 16-element FP4 scale group.
     group_max_k = cute.arch.warp_reduction_max(cute.abs(dyn_k), threads_in_group=16)
     group_max_q = cute.arch.warp_reduction_max(cute.abs(dyn_q), threads_in_group=16)
-    for ii in cutlass.range_constexpr(8):
-        zero_idx = tidx + ii * 128
-        if zero_idx < 126 * 8:
-            zero_row = zero_idx // 8 + 2
-            zero_group = zero_idx % 8
-            zero_offset = (
-                (zero_group // 4) * 512
-                + (zero_row % 32) * 16
-                + (zero_row // 32) * 4
-                + (zero_group % 4)
-            )
-            mma_sfb.subview(zero_offset).store(cutlass.Float8E4M3FN(0.0))
     sfk_raw = cute.div(group_max_k, cutlass.Float32(6.0) * safe_outer, full=True)
     sfq_raw = cute.div(group_max_q, cutlass.Float32(6.0) * safe_outer, full=True)
     sfk_e4 = cute.arch.fmin(sfk_raw, cutlass.Float32(448.0)).to(cutlass.Float8E4M3FN)
@@ -414,7 +735,6 @@ def _kda_scalar_active(
     # Native NVFP4 checkpoint projection. Operands use an s128b K-major
     # image padded privately to 256 logical K; only the first 128 K values
     # and two of the hardware-minimum eight N rows participate.
-    swizzle_s128 = cutlass.Swizzle.from_name("s128b")
     swizzle_s64 = cutlass.Swizzle.from_name("s64b")
 
     # Dynamic K/Q pair: exact RNE satfinite E2M1x2, earlier K in low nibble.
@@ -429,16 +749,24 @@ def _kda_scalar_active(
         (mma_b.subview(64 + byte)).data_ptr().apply_swizzle(swizzle_s64).store(
             cutlass.Int8(packed_q_ir)
         )
-    if tidx < 64:
-        # Private N padding rows must be true zero regardless of their scales.
-        for row in cutlass.range_constexpr(2, 8):
-            (mma_b.subview(row * 64 + tidx)).data_ptr().apply_swizzle(swizzle_s64).store(
-                cutlass.Int8(0)
-            )
-    # Repack plain row-major E4M3 scales into two 128x4 scale atoms.
-    for group in cutlass.range_constexpr(8):
-        sf_offset = (group // 4) * 512 + (tidx % 32) * 16 + (tidx // 32) * 4 + (group % 4)
-        mma_sfa.subview(sf_offset).store(state_scale_vec[group])
+    if tidx < 24:
+        # Private N padding rows 2..7 (bytes 128..511, any swizzle) must be true zero.
+        zero = cutlass.Int32(0)
+        cutlass.inttoptr(
+            mma_b.subview(128 + tidx * 16).data_ptr().toint(),
+            cutlass.AddressSpace.smem,
+            cutlass.Int32,
+        ).store(
+            cutlass.Vector.from_elements((zero, zero, zero, zero), dtype=cutlass.Int32),
+            alignment=16,
+        )
+    # Repack plain row-major E4M3 scales into two 128x4 scale atoms: each
+    # row's four scales of one 64-key block are one word.
+    for kblock in cutlass.range_constexpr(2):
+        sf_offset = kblock * 512 + (tidx % 32) * 16 + (tidx // 32) * 4
+        cutlass.inttoptr(
+            mma_sfa.subview(sf_offset).data_ptr().toint(), cutlass.AddressSpace.smem, cutlass.Int32
+        ).store(cutlass.Vector.from_elements((state_scale_words[kblock],), dtype=cutlass.Int32))
     while not prims.mbarrier_try_wait_parity(state_mbar, cutlass.Int32(0)):
         pass
     cute.arch.fence_view_async_shared()
@@ -514,86 +842,56 @@ def _kda_scalar_active(
                 )
             prims.tcgen05_commit(acc_mbar, group=prims.CTAGroup.CTA_1)
 
+    # History coefficients on the CUDA cores while the native MMA runs:
+    # c[i] = adjusted_bf16[i] . (kn, qn) with FP32 sums, rounded to BF16,
+    # then hist[v] = U[:, v] . c with FP32 accumulation.
+    hist_k = cutlass.Float32(0.0)
+    hist_q = cutlass.Float32(0.0)
     if length > 0:
         while not prims.mbarrier_try_wait_parity(history_load_mbar, cutlass.Int32(0)):
             pass
-
-    # First BF16 MMA: adjusted K [16,128] @ [kn,qn]^T. Two s128b
-    # K64 panels avoid any padding in the instruction's K dimension.
-    dense_col = tidx
-    if tidx >= 64:
-        dense_col = tidx - 64
-    for hist in cutlass.range_constexpr(N):
-        adjusted_bf16 = cutlass.BFloat16(0.0)
-        if hist < length:
-            cached_k = cache_hk[hist * K + tidx].to(cutlass.Float32)
-            cached_g = cache_hg[hist * K + tidx]
-            adjusted_bf16 = (cached_k * cute.exp(cumulative - cached_g, fastmath=True)).to(
-                cutlass.BFloat16
-            )
-        if tidx < 64:
-            dst = (dense_a0.subview(hist * 64 + dense_col)).data_ptr().apply_swizzle(swizzle_s128)
-            _store_bf16(dst, adjusted_bf16)
-        else:
-            dst = (dense_a1.subview(hist * 64 + dense_col)).data_ptr().apply_swizzle(swizzle_s128)
-            _store_bf16(dst, adjusted_bf16)
-    if tidx < 64:
-        _store_bf16((dense_b0.subview(dense_col)).data_ptr().apply_swizzle(swizzle_s128), kn)
-        _store_bf16((dense_b0.subview(64 + dense_col)).data_ptr().apply_swizzle(swizzle_s128), qn)
-    else:
-        _store_bf16((dense_b1.subview(dense_col)).data_ptr().apply_swizzle(swizzle_s128), kn)
-        _store_bf16((dense_b1.subview(64 + dense_col)).data_ptr().apply_swizzle(swizzle_s128), qn)
-    cute.arch.fence_view_async_shared()
-    prims.barrier_cta_sync(0)
-
-    if warp == 0:
-        dense_idesc = prims.Tcgen05InstrDesc.build(
-            c_dtype=cutlass.Float32,
-            a_dtype=cutlass.BFloat16,
-            b_dtype=cutlass.BFloat16,
-            n_dim=8,
-            m_dim=128,
-        )
-        da0 = prims.Tcgen05SmemDesc.build(
-            dense_a0, leading_byte_offset=128, stride_byte_offset=1024, layout=2
-        )
-        da1 = prims.Tcgen05SmemDesc.build(
-            dense_a1, leading_byte_offset=128, stride_byte_offset=1024, layout=2
-        )
-        db0 = prims.Tcgen05SmemDesc.build(
-            dense_b0, leading_byte_offset=128, stride_byte_offset=1024, layout=2
-        )
-        db1 = prims.Tcgen05SmemDesc.build(
-            dense_b1, leading_byte_offset=128, stride_byte_offset=1024, layout=2
-        )
-        base_col_dense = tmem_raw & cutlass.Int32(0xFFFF)
-        base_row_dense = tmem_raw >> cutlass.Int32(16)
-        coeff_addr = (base_row_dense << cutlass.Int32(16)) | (base_col_dense + cutlass.Int32(24))
-        coeff_ptr = cutlass.inttoptr(coeff_addr, 6, cutlass.Float32)
-        if prims.elect_sync():
-            for kb in cutlass.range_constexpr(4):
-                prims.tcgen05_mma(
-                    prims.Tcgen05MMAKind.F16,
-                    prims.CTAGroup.CTA_1,
-                    coeff_ptr,
-                    da0.advance_start_address(kb * 32),
-                    db0.advance_start_address(kb * 32),
-                    dense_idesc,
-                    kb != 0,
+        # Eight threads per history row, sixteen keys each.
+        hist_row = tidx // 8
+        key0 = (tidx % 8) * 16
+        dot_k = cutlass.Float32(0.0)
+        dot_q = cutlass.Float32(0.0)
+        if hist_row < length:
+            base = hist_row * K + key0
+            cached_k = [
+                (cache_hk.data_ptr() + base + 8 * c).load(count=8, alignment=16) for c in range(2)
+            ]
+            cached_g = [
+                (cache_hg.data_ptr() + base + 4 * c).load(count=4, alignment=16) for c in range(4)
+            ]
+            cum = [
+                (s_cumulative.data_ptr() + key0 + 4 * c).load(count=4, alignment=16)
+                for c in range(4)
+            ]
+            k_pair = [(s_k.data_ptr() + key0 + 8 * c).load(count=8, alignment=16) for c in range(2)]
+            q_pair = [(s_q.data_ptr() + key0 + 8 * c).load(count=8, alignment=16) for c in range(2)]
+            for j in cutlass.range_constexpr(16):
+                adjusted = (
+                    (
+                        cached_k[j // 8][j % 8].to(cutlass.Float32)
+                        * cute.exp(cum[j // 4][j % 4] - cached_g[j // 4][j % 4], fastmath=True)
+                    )
+                    .to(cutlass.BFloat16)
+                    .to(cutlass.Float32)
                 )
-            for kb in cutlass.range_constexpr(4):
-                prims.tcgen05_mma(
-                    prims.Tcgen05MMAKind.F16,
-                    prims.CTAGroup.CTA_1,
-                    coeff_ptr,
-                    da1.advance_start_address(kb * 32),
-                    db1.advance_start_address(kb * 32),
-                    dense_idesc,
-                    True,
-                )
-            prims.tcgen05_commit(coeff_mbar, group=prims.CTAGroup.CTA_1)
+                dot_k = cute.fma(adjusted, k_pair[j // 8][j % 8].to(cutlass.Float32), dot_k)
+                dot_q = cute.fma(adjusted, q_pair[j // 8][j % 8].to(cutlass.Float32), dot_q)
+        for offset in (4, 2, 1):
+            dot_k = dot_k + cute.arch.shuffle_sync_bfly(dot_k, offset)
+            dot_q = dot_q + cute.arch.shuffle_sync_bfly(dot_q, offset)
+        if (tidx % 8) == 0:
+            s_coef[hist_row] = dot_k.to(cutlass.BFloat16).to(cutlass.Float32)
+            s_coef[N + hist_row] = dot_q.to(cutlass.BFloat16).to(cutlass.Float32)
+        cute.arch.barrier()
+        for hist in cutlass.range(length, unroll=4):
+            cached_u = cache_hu[hist * K + tidx].to(cutlass.Float32)
+            hist_k = cute.fma(cached_u, s_coef[hist], hist_k)
+            hist_q = cute.fma(cached_u, s_coef[N + hist], hist_q)
 
-    # Drain the independent checkpoint result while the coefficient MMA runs.
     while not prims.mbarrier_try_wait_parity(acc_mbar, cutlass.Int32(0)):
         pass
     base_col = tmem_raw & cutlass.Int32(0xFFFF)
@@ -606,93 +904,10 @@ def _kda_scalar_active(
         num=8,
     )
     prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
+    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
     checkpoint_rescale = state_outer * outer
     cp_k = checkpoint_vec[0] * checkpoint_rescale
     cp_q = checkpoint_vec[1] * checkpoint_rescale
-
-    while not prims.mbarrier_try_wait_parity(coeff_mbar, cutlass.Int32(0)):
-        pass
-    coeff_row = (tmem_raw >> cutlass.Int32(16)) + warp * cutlass.Int32(32)
-    coeff_col = (tmem_raw & cutlass.Int32(0xFFFF)) + cutlass.Int32(24)
-    coeff_addr = (coeff_row << cutlass.Int32(16)) | coeff_col
-    coeff_vec = prims.tcgen05_ld("32x32b", cutlass.inttoptr(coeff_addr, 6, cutlass.Float32), num=8)
-    prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
-    coeff_k = cutlass.BFloat16(0.0)
-    coeff_q = cutlass.BFloat16(0.0)
-    if tidx < N:
-        coeff_k = coeff_vec[0].to(cutlass.BFloat16)
-        coeff_q = coeff_vec[1].to(cutlass.BFloat16)
-    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-
-    # Second BF16 MMA: U^T [128,16] @ coefficients [16,2]. Reuse the
-    # first dense panels and the coefficient accumulator columns.
-    for hist in cutlass.range_constexpr(N):
-        uval = cutlass.BFloat16(0.0)
-        if hist < length:
-            uval = cache_hu[hist * K + tidx]
-        dst = (dense_a0.subview(tidx * 64 + hist)).data_ptr().apply_swizzle(swizzle_s128)
-        _store_bf16(dst, uval)
-    if tidx < N:
-        _store_bf16(
-            (dense_b0.subview(tidx)).data_ptr().apply_swizzle(swizzle_s128),
-            coeff_k,
-        )
-        _store_bf16(
-            (dense_b0.subview(64 + tidx)).data_ptr().apply_swizzle(swizzle_s128),
-            coeff_q,
-        )
-    cute.arch.fence_view_async_shared()
-    prims.barrier_cta_sync(0)
-
-    if warp == 0:
-        dense_idesc2 = prims.Tcgen05InstrDesc.build(
-            c_dtype=cutlass.Float32,
-            a_dtype=cutlass.BFloat16,
-            b_dtype=cutlass.BFloat16,
-            n_dim=8,
-            m_dim=128,
-        )
-        da_hist = prims.Tcgen05SmemDesc.build(
-            dense_a0,
-            leading_byte_offset=128,
-            stride_byte_offset=1024,
-            layout=prims.Tcgen05SmemSwizzle.SWIZZLE_128B,
-        )
-        db_hist = prims.Tcgen05SmemDesc.build(
-            dense_b0,
-            leading_byte_offset=128,
-            stride_byte_offset=1024,
-            layout=prims.Tcgen05SmemSwizzle.SWIZZLE_128B,
-        )
-        base_col_hist = tmem_raw & cutlass.Int32(0xFFFF)
-        base_row_hist = tmem_raw >> cutlass.Int32(16)
-        history_addr = (base_row_hist << cutlass.Int32(16)) | (base_col_hist + cutlass.Int32(24))
-        if prims.elect_sync():
-            prims.tcgen05_mma(
-                prims.Tcgen05MMAKind.F16,
-                prims.CTAGroup.CTA_1,
-                cutlass.inttoptr(history_addr, 6, cutlass.Float32),
-                da_hist,
-                db_hist,
-                dense_idesc2,
-                False,
-            )
-            prims.tcgen05_commit(history_mbar, group=prims.CTAGroup.CTA_1)
-
-    while not prims.mbarrier_try_wait_parity(history_mbar, cutlass.Int32(0)):
-        pass
-    history_col = base_col + cutlass.Int32(24)
-    history_addr = (tmem_row << cutlass.Int32(16)) | history_col
-    history_vec = prims.tcgen05_ld(
-        "32x32b", cutlass.inttoptr(history_addr, 6, cutlass.Float32), num=8
-    )
-    prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
-    hist_k = history_vec[0]
-    hist_q = history_vec[1]
-    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-    prims.barrier_cta_sync(0)
-    if warp == 0:
-        prims.tcgen05_dealloc(cutlass.inttoptr(tmem_raw, 6, cutlass.Float32), 32, group="cta_1")
 
     beta_v = beta_bf16.to(cutlass.Float32)
     beta_sigmoid = cute.div(
@@ -703,7 +918,10 @@ def _kda_scalar_active(
     update = beta_sigmoid * (v_bf16.to(cutlass.Float32) - cp_k - hist_k)
     core = cp_q + hist_q + update * s_scalar[3]
     core_bf16 = core.to(cutlass.BFloat16)
-    s_core[tidx] = core_bf16
+    core_f = core_bf16.to(cutlass.Float32)
+    rms_partial = _warp_sum_squares(core_f)
+    if lane == 0:
+        s_red[8 + warp] = rms_partial
 
     hk[(live, head, length, tidx)] = kn
     hu[(live, head, length, tidx)] = update.to(cutlass.BFloat16)
@@ -711,12 +929,7 @@ def _kda_scalar_active(
     cute.arch.barrier()
 
     # RMSNorm is intentionally after the BF16 core boundary.
-    core_f = s_core[tidx].to(cutlass.Float32)
-    rms0 = _warp_sum_squares(s_core[lane].to(cutlass.Float32))
-    rms1 = _warp_sum_squares(s_core[lane + 32].to(cutlass.Float32))
-    rms2 = _warp_sum_squares(s_core[lane + 64].to(cutlass.Float32))
-    rms3 = _warp_sum_squares(s_core[lane + 96].to(cutlass.Float32))
-    total = (rms0 + rms2) + (rms1 + rms3)
+    total = (s_red[8] + s_red[10]) + (s_red[9] + s_red[11])
     rstd = cutlass.Float32(0.0)
     if lane == 0:
         variance = cute.div(total, cutlass.Float32(128.0), full=True)
@@ -738,16 +951,56 @@ def _kda_scalar_active(
     )
     result = core_f * rstd * norm_bf16.to(cutlass.Float32) * zg
     out[(batch, head, tidx)] = result.to(cutlass.BFloat16)
-    if head == 0 and tidx == 0:
-        old_lengths[batch] = length
+    if cutlass.const_expr(pdl):
+        prims.griddepcontrol("launch_dependents")
+
+    if commits:
+        _commit_window(
+            tidx,
+            warp,
+            lane,
+            tmem_raw,
+            Int64(pool_base.toint()),
+            state_outer,
+            cumulative,
+            kn,
+            update,
+            mma_a,
+            cache_hk,
+            cache_hg,
+            cache_hu,
+            s_exp,
+            s_red,
+            commit_mbar,
+        )
+        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+
+    prims.barrier_cta_sync(0)
+    if warp == 0:
+        prims.tcgen05_dealloc(
+            cutlass.inttoptr(tmem_raw, 6, cutlass.Float32), tmem_cols, group="cta_1"
+        )
+    # Every CTA of this row consumed its length before arriving (relaxed
+    # suffices); the last one to arrive advances it.
+    if tidx == 0:
+        arrived = prims.atomicrmw(
+            "add",
+            arrivals.iterator.raw_ptr() + batch,
+            cutlass.Int32(1),
+            mem_order="relaxed",
+            syncscope="gpu",
+        )
+        if arrived == heads - 1:
+            _st_keep_s32(_addr(arrivals, batch), cutlass.Int32(0))
+            next_length = length + 1
+            if commits:
+                next_length = cutlass.Int32(0)
+            _st_keep_s32(_addr(lengths, live), next_length)
 
 
 @cute.kernel
 def _kda_scalar_kernel(
     tma_state: cutlass.GridConstant[cuda_exp.TensorMap],
-    tma_hk: cutlass.GridConstant[cuda_exp.TensorMap],
-    tma_hu: cutlass.GridConstant[cuda_exp.TensorMap],
-    tma_hg: cutlass.GridConstant[cuda_exp.TensorMap],
     x,
     conv_state,
     conv_weight,
@@ -766,26 +1019,26 @@ def _kda_scalar_kernel(
     a_log,
     dt_bias,
     out,
-    old_lengths,
+    arrivals,
     lower_bound: cutlass.Float32,
     norm_eps: cutlass.Float32,
     heads: cutlass.Constexpr,
     bounded: cutlass.Constexpr,
+    pdl: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     block, _, _ = cute.arch.block_idx()
     batch = block // heads
-    if dummy[batch]:
+    # Fetched with the dummy flag; only live rows dereference it.
+    slot = _ld_keep_s32(_addr(slots, batch))
+    if _ld_keep_u8(_addr(dummy, batch)) != cutlass.Int32(0):
         head = block - batch * heads
+        if cutlass.const_expr(pdl):
+            prims.griddepcontrol("wait")
         out[(batch, head, tidx)] = cutlass.BFloat16(0.0)
-        if head == 0 and tidx == 0:
-            old_lengths[batch] = cutlass.Int32(0)
     else:
         _kda_scalar_active(
             tma_state,
-            tma_hk,
-            tma_hu,
-            tma_hg,
             x,
             conv_state,
             conv_weight,
@@ -794,8 +1047,6 @@ def _kda_scalar_kernel(
             z,
             norm_weight,
             pool,
-            slots,
-            dummy,
             slot_map,
             hk,
             hu,
@@ -804,11 +1055,13 @@ def _kda_scalar_kernel(
             a_log,
             dt_bias,
             out,
-            old_lengths,
+            arrivals,
+            slot,
             lower_bound,
             norm_eps,
             heads,
             bounded,
+            pdl,
         )
 
 
@@ -832,11 +1085,12 @@ def _launch_scalar(
     a_log,
     dt_bias,
     out,
-    old_lengths,
+    arrivals,
     lower_bound: cutlass.Float32,
     norm_eps: cutlass.Float32,
     heads: cutlass.Constexpr,
     bounded: cutlass.Constexpr,
+    pdl: cutlass.Constexpr,
     stream: cuda.CUstream,
 ):
     primary_layout = cute.make_layout(
@@ -850,44 +1104,8 @@ def _launch_scalar(
         stride_order=(0, 1, 2, 3),
         swizzle=cuda_exp.TensorMapSwizzle.s64b,
     )
-    hk_layout = cute.make_layout(
-        (K, N, heads, hk.shape[0]),
-        stride=(1, K, N * K, hk.layout.stride[0]),
-    )
-    hk_tensor = cute.make_tensor(hk.iterator, hk_layout)
-    tma_hk = cuda_exp.create_tensor_map_tiled_from_view(
-        hk_tensor,
-        box_dims=(K, N, 1, 1),
-        stride_order=(0, 1, 2, 3),
-        swizzle=cuda_exp.TensorMapSwizzle.none,
-    )
-    hu_layout = cute.make_layout(
-        (K, N, heads, hu.shape[0]),
-        stride=(1, K, N * K, hu.layout.stride[0]),
-    )
-    hu_tensor = cute.make_tensor(hu.iterator, hu_layout)
-    tma_hu = cuda_exp.create_tensor_map_tiled_from_view(
-        hu_tensor,
-        box_dims=(K, N, 1, 1),
-        stride_order=(0, 1, 2, 3),
-        swizzle=cuda_exp.TensorMapSwizzle.none,
-    )
-    hg_layout = cute.make_layout(
-        (64, 2, N, heads, hg.shape[0]),
-        stride=(1, 64, K, N * K, hg.layout.stride[0]),
-    )
-    hg_tensor = cute.make_tensor(hg.iterator, hg_layout)
-    tma_hg = cuda_exp.create_tensor_map_tiled_from_view(
-        hg_tensor,
-        box_dims=(64, 2, N, 1, 1),
-        stride_order=(0, 1, 2, 3, 4),
-        swizzle=cuda_exp.TensorMapSwizzle.none,
-    )
     kernel = _kda_scalar_kernel(
         tma_state,
-        tma_hk,
-        tma_hu,
-        tma_hg,
         x,
         conv_state,
         conv_weight,
@@ -906,25 +1124,19 @@ def _launch_scalar(
         a_log,
         dt_bias,
         out,
-        old_lengths,
+        arrivals,
         lower_bound,
         norm_eps,
         heads,
         bounded,
+        pdl,
     )
-    if cutlass.const_expr(heads == 96):
-        kernel.launch(
-            grid=[x.shape[0] * heads, 1, 1],
-            block=[THREADS, 1, 1],
-            min_blocks_per_mp=6,
-            stream=stream,
-        )
-    else:
-        kernel.launch(
-            grid=[x.shape[0] * heads, 1, 1],
-            block=[THREADS, 1, 1],
-            stream=stream,
-        )
+    kernel.launch(
+        grid=[x.shape[0] * heads, 1, 1],
+        block=[THREADS, 1, 1],
+        stream=stream,
+        use_pdl=pdl,
+    )
 
 
 def _fake_tensor_args(heads: int) -> tuple:
@@ -932,6 +1144,7 @@ def _fake_tensor_args(heads: int) -> tuple:
     b = cute.sym_int32(divisibility=1)
     s = cute.sym_int32(divisibility=1)
     r = cute.sym_int32(divisibility=1)
+    a = cute.sym_int32(divisibility=1)
 
     def row(divisibility: int = 1) -> cute.SymInt:
         return cute.sym_int64(divisibility=divisibility)
@@ -958,7 +1171,7 @@ def _fake_tensor_args(heads: int) -> tuple:
         make_fake_tensor(cutlass.Float32, (heads,), stride=(1,)),
         make_fake_tensor(cutlass.Float32, (width,), stride=(1,)),
         make_fake_tensor(cutlass.BFloat16, (b, heads, K), stride=(width, K, 1)),
-        make_fake_tensor(cutlass.Int32, (b,), stride=(1,)),
+        make_fake_tensor(cutlass.Int32, (a,), stride=(1,)),
     )
 
 
@@ -984,13 +1197,18 @@ def fused_replay(
     lower_bound: float | None,
     norm_eps: float,
     out: torch.Tensor,
-    old_lengths: torch.Tensor,
+    arrivals: torch.Tensor,
 ) -> None:
-    """Write BF16 [B,H,128] output and int32 [B] old lengths without advancing counters."""
+    """Write BF16 [B,H,128] output, append or commit the window, and advance lengths.
+
+    ``arrivals`` holds at least B zero-initialized int32 counters; every
+    launch returns them to zero.
+    """
     heads = a_log.numel()
     bounded = lower_bound is not None
     lower_bound = 0.0 if lower_bound is None else lower_bound
-    key = (heads, bounded)
+    pdl = get_env_enable_pdl()
+    key = (heads, bounded, pdl)
     tensor_args = (
         x,
         conv_state,
@@ -1010,7 +1228,7 @@ def fused_replay(
         a_log,
         dt_bias,
         out,
-        old_lengths,
+        arrivals,
     )
     if key not in _compiled:
         compile_args = _fake_tensor_args(heads)
@@ -1022,6 +1240,7 @@ def fused_replay(
             float(norm_eps),
             heads,
             bounded,
+            pdl,
             stream,
             options="--enable-tvm-ffi",
         )

@@ -640,7 +640,7 @@ class KDAKernelDispatch:
         num_sequences: int,
         num_tokens: int,
     ) -> bool:
-        """Return whether prefill can update this V-first pool directly."""
+        """Return whether prefill can update this V-first or packed 2FP4 pool directly."""
         if self.prefill_kernel_path != "optimized" or num_tokens == 0:
             return False
         if (
@@ -650,17 +650,31 @@ class KDAKernelDispatch:
             or not cu_seqlens.is_contiguous()
         ):
             return False
-        if state_pool.dtype not in (torch.bfloat16, torch.float32) or state_pool.ndim != 4:
+        if state_pool.dtype == torch.uint8:
+            from .kda_2fp4 import STATE_BYTES_PER_HEAD
+
+            if (
+                state_pool.ndim not in (3, 4)
+                or (state_pool.ndim == 4 and state_pool.shape[2] != 1)
+                or state_pool.shape[-1] != STATE_BYTES_PER_HEAD
+                or state_pool.stride(1) != STATE_BYTES_PER_HEAD
+                or state_pool.stride(-1) != 1
+                or state_pool.stride(0) < state_pool.shape[1] * STATE_BYTES_PER_HEAD
+                or state_pool.stride(0) % 16
+            ):
+                return False
+        elif state_pool.dtype not in (torch.bfloat16, torch.float32) or state_pool.ndim != 4:
             return False
-        _, H, V, K = state_pool.shape
-        if state_pool.stride()[1:] != (V * K, K, 1):
-            return False
-        if (
-            (V, K) != (128, 128)
-            or state_pool.stride(0) < H * V * K
-            or state_pool.stride(0) * state_pool.element_size() % 16
-        ):
-            return False
+        else:
+            _, H, V, K = state_pool.shape
+            if state_pool.stride()[1:] != (V * K, K, 1):
+                return False
+            if (
+                (V, K) != (128, 128)
+                or state_pool.stride(0) < H * V * K
+                or state_pool.stride(0) * state_pool.element_size() % 16
+            ):
+                return False
         if state_pool.data_ptr() % 16:
             return False
         if (
@@ -712,8 +726,9 @@ class KDAKernelDispatch:
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run prefill on raw Q/K/V and gate/beta logits.
 
-        FlashInfer updates indexed BF16/FP32 V-first state directly; FLA uses
-        dense FP32 initial/final states. Both normalize Q/K internally.
+        FlashInfer updates indexed BF16/FP32 V-first state or packed 2FP4
+        checkpoints directly; FLA uses dense FP32 initial/final states. Both
+        normalize Q/K internally.
 
         ``sm_reserve`` SMs are left out of the optimized kernels' persistent
         grids for a kernel that runs concurrently with prefill.

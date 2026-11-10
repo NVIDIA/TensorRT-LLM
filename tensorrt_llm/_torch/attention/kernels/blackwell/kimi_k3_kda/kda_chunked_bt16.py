@@ -102,6 +102,42 @@ import cutlass.experimental.primitives as prims
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 
+from cutlass import Float32 as _F32
+from cutlass import Int32 as _I32
+from cutlass import Int64 as Int64_
+from cutlass import Uint32 as _U32
+from cutlass._mlir.dialects import llvm as _llvm
+from cutlass.cutlass_dsl import T as _T
+from cutlass.cutlass_dsl import dsl_user_op as _dsl_user_op
+
+# Packed 2FP4 checkpoint codec shared with the decode commit kernel.
+from tensorrt_llm._torch.custom_ops.cute_dsl_kda_2fp4_commit import (
+    _decode8,
+    _dequant8,
+    _expand4,
+    _f_abs,
+    _f_div,
+    _f_fma,
+    _f_max,
+    _f_min,
+    _f_mul,
+    _f_neg,
+    _ld_global_f32,
+    _ld_global_u32,
+    _ld_global_v4,
+    _pack_e2m1x8,
+    _pack_e4m3x2,
+    _pack_e4m3x4,
+    _sel_eq0,
+    _st_global_u32,
+    _st_global_v4,
+    _st_outer_pad,
+    _tmem_ld32,
+    _tmem_st32,
+    _tree_max,
+    _warp_max_f32,
+)
+
 
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
@@ -264,6 +300,14 @@ DEFAULT_BATCH: int = 1
 DEFAULT_HEADS: int = 32
 DEFAULT_SCALE: float = 1.0 / (DK**0.5)
 L2_NORM_EPS: float = 1.0e-12
+# Packed 2FP4 checkpoint (V2 per-head payload): primary and residual E2M1
+# rows [128 x 64 B], their E4M3 block-16 scales [128 x 8 B], one FP32 outer
+# scale and 12 zero bytes. A state tensor with Uint8 elements selects it.
+FP4_STATE_BYTES: int = 18448
+FP4_VALUES_BYTES: int = 8192
+FP4_PRIMARY_SCALE: int = 16384
+FP4_RESIDUAL_SCALE: int = 17408
+FP4_OUTER_SCALE: int = 18432
 VERIFY_RTOL: float = 1.0e-2
 VERIFY_ATOL: float = 1.0e-3
 
@@ -279,6 +323,15 @@ NBAR_TMEM_LIFECYCLE_ID: int = 2
 NBAR_CG0_GROUP1_ID: int = 3
 # Third CG0 producer group (kernel 1 runs warps 8-11 as group 2).
 NBAR_CG0_GROUP2_ID: int = 4
+# CG1-only barrier for the packed final-state outer-scale reduction.
+NBAR_CG1_ID: int = 5
+# CG0 + CG1 barrier: CG0 has dequantized the packed initial state into TMEM.
+NBAR_FP4_INIT_ID: int = 6
+FP4_INIT_THREADS: int = 12 * THREADS_PER_WARP
+# tcgen05 warp + CG0 barrier: the TMEM base is allocated before CG0 writes the
+# dequantized initial state into it.
+NBAR_FP4_TMEM_ID: int = 7
+FP4_TMEM_THREADS: int = 9 * THREADS_PER_WARP
 KDA_CG0_REGS: int = 160
 KDA_CG1_REGS: int = 136
 KDA_SERVICE_REGS: int = 56
@@ -743,6 +796,7 @@ DTYPE_MAP: dict[type, torch.dtype] = {
     cutlass.Float16: torch.float16,
     cutlass.BFloat16: torch.bfloat16,
     cutlass.Float32: torch.float32,
+    cutlass.Uint8: torch.uint8,
 }
 
 CLI_DTYPES: dict[str, type] = {
@@ -4592,6 +4646,620 @@ def tcgen05_store_final_state_tmem(
                 )
 
 
+# ---------------------------------------------------------------------------
+# Packed 2FP4 recurrent state. A Uint8 state tensor selects the V2 checkpoint
+# layout (FP4_STATE_BYTES per head). The kernels dequantize it into the FP32
+# TMEM state before the first chunk and quantize the final state once, with
+# the decode commit kernel's numerics. state_indices holds ~slot for
+# sequences without an initial state; they start from zero.
+# ---------------------------------------------------------------------------
+def _irv(x, loc=None, ip=None):
+    return x.ir_value(loc=loc, ip=ip)
+
+
+@_dsl_user_op
+def _dsmem_send_f32(
+    slot_addr: _I32, mbar_addr: _I32, peer: _I32, value: _F32, *, loc=None, ip=None
+):
+    """st.async one FP32 into the peer CTA's slot, completing 4 tx bytes on its mbarrier."""
+    _llvm.inline_asm(
+        None,
+        [
+            _irv(_I32(slot_addr), loc, ip),
+            _irv(_I32(mbar_addr), loc, ip),
+            _irv(_I32(peer), loc, ip),
+            _irv(_F32(value), loc, ip),
+        ],
+        "{ .reg .b32 rs, rm, v; mapa.shared::cluster.u32 rs, $0, $2;\n"
+        " mapa.shared::cluster.u32 rm, $1, $2; mov.b32 v, $3;\n"
+        " st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [rs], v, [rm]; }",
+        "r,r,r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@_dsl_user_op
+def _mbar_arrive_expect_tx(mbar_addr: _I32, tx: _I32, *, loc=None, ip=None):
+    _llvm.inline_asm(
+        None,
+        [_irv(_I32(mbar_addr), loc, ip), _irv(_I32(tx), loc, ip)],
+        "mbarrier.arrive.expect_tx.shared::cta.b64 _, [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@_dsl_user_op
+def _ld_shared_f32(addr: _I32, *, loc=None, ip=None) -> _F32:
+    return _F32(
+        _llvm.inline_asm(
+            _T.f32(),
+            [_irv(_I32(addr), loc, ip)],
+            "ld.shared.f32 $0, [$1];",
+            "=f,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=_llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@_dsl_user_op
+def _cluster_sync_all(*, loc=None, ip=None):
+    _llvm.inline_asm(
+        None,
+        [],
+        "barrier.cluster.arrive.release.aligned;\nbarrier.cluster.wait.acquire.aligned;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@_dsl_user_op
+def _tmem_ld16(addr: _U32, *, loc=None, ip=None):
+    regs = ", ".join(f"${i}" for i in range(16))
+    r = _llvm.inline_asm(
+        _llvm.StructType.get_literal([_T.f32()] * 16),
+        [_irv(_U32(addr), loc, ip)],
+        f"tcgen05.ld.sync.aligned.32x32b.x16.b32 {{{regs}}}, [$16];\ntcgen05.wait::ld.sync.aligned;",
+        ",".join(["=f"] * 16) + ",r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return [_F32(_llvm.extractvalue(_T.f32(), r, [i], loc=loc, ip=ip)) for i in range(16)]
+
+
+@_dsl_user_op
+def _st_global_v2(addr: Int64_, a: _U32, b: _U32, *, loc=None, ip=None):
+    _llvm.inline_asm(
+        None,
+        [_irv(Int64_(addr), loc, ip), _irv(_U32(a), loc, ip), _irv(_U32(b), loc, ip)],
+        "st.global.v2.b32 [$0], {$1, $2};",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@_dsl_user_op
+def _max3_abs(a: _F32, b: _F32, c: _F32, *, loc=None, ip=None) -> _F32:
+    return _F32(
+        _llvm.inline_asm(
+            _T.f32(),
+            [_irv(_F32(a), loc, ip), _irv(_F32(b), loc, ip), _irv(_F32(c), loc, ip)],
+            "max.abs.f32 $0, $1, $2, $3;",
+            "=f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=_llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@_dsl_user_op
+def _ld_v4_pred(addr: Int64_, pred: _I32, *, loc=None, ip=None):
+    """16-byte global load, or zeros (no memory access) when pred == 0."""
+    r = _llvm.inline_asm(
+        _llvm.StructType.get_literal([_T.i32()] * 4),
+        [_irv(Int64_(addr), loc, ip), _irv(_I32(pred), loc, ip)],
+        "{ .reg .pred p; setp.ne.s32 p, $5, 0;\n"
+        " mov.b32 $0, 0; mov.b32 $1, 0; mov.b32 $2, 0; mov.b32 $3, 0;\n"
+        " @p ld.global.v4.b32 {$0, $1, $2, $3}, [$4]; }",
+        "=&r,=&r,=&r,=&r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return [_U32(_llvm.extractvalue(_T.i32(), r, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@_dsl_user_op
+def _ld_u32_pred(addr: Int64_, pred: _I32, *, loc=None, ip=None) -> _U32:
+    return _U32(
+        _llvm.inline_asm(
+            _T.i32(),
+            [_irv(Int64_(addr), loc, ip), _irv(_I32(pred), loc, ip)],
+            "{ .reg .pred p; setp.ne.s32 p, $2, 0; mov.b32 $0, 0; @p ld.global.b32 $0, [$1]; }",
+            "=&r,l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=_llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@_dsl_user_op
+def _tmem_st64(addr: _U32, vals, *, loc=None, ip=None):
+    regs = ", ".join(f"${i}" for i in range(64))
+    _llvm.inline_asm(
+        None,
+        [_irv(_F32(v), loc, ip) for v in vals] + [_irv(_U32(addr), loc, ip)],
+        f"tcgen05.st.sync.aligned.32x32b.x64.b32 [$64], {{{regs}}};\ntcgen05.wait::st.sync.aligned;",
+        ",".join(["f"] * 64) + ",r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@_dsl_user_op
+def _fma2(
+    a0: _F32, a1: _F32, b0: _F32, b1: _F32, c0: _F32, c1: _F32, *, loc=None, ip=None
+):
+    """Packed fma.rn.f32x2: (a0 * b0 + c0, a1 * b1 + c1)."""
+    r = _llvm.inline_asm(
+        _llvm.StructType.get_literal([_T.f32(), _T.f32()]),
+        [_irv(_F32(x), loc, ip) for x in (a0, a1, b0, b1, c0, c1)],
+        "{ .reg .b64 A, B, C, D; mov.b64 A, {$2, $3}; mov.b64 B, {$4, $5}; mov.b64 C, {$6, $7};\n"
+        " fma.rn.f32x2 D, A, B, C; mov.b64 {$0, $1}, D; }",
+        "=f,=f,f,f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        _F32(_llvm.extractvalue(_T.f32(), r, [0], loc=loc, ip=ip)),
+        _F32(_llvm.extractvalue(_T.f32(), r, [1], loc=loc, ip=ip)),
+    )
+
+
+@_dsl_user_op
+def _bitcast_f32(x: _U32, *, loc=None, ip=None) -> _F32:
+    return _F32(
+        _llvm.inline_asm(
+            _T.f32(), [_irv(_U32(x), loc, ip)], "mov.b32 $0, $1;", "=f,r",
+            has_side_effects=False, is_align_stack=False,
+            asm_dialect=_llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )
+
+
+@_dsl_user_op
+def _ld_slot_pred(addr: Int64_, pred: _I32, *, loc=None, ip=None):
+    """(slot, fresh) from an encoded state index (~slot = fresh); (0, 1) when pred == 0."""
+    r = _llvm.inline_asm(
+        _llvm.StructType.get_literal([_T.i32(), _T.i32()]),
+        [_irv(Int64_(addr), loc, ip), _irv(_I32(pred), loc, ip)],
+        "{ .reg .pred p; .reg .b32 v, m; setp.ne.s32 p, $3, 0; mov.b32 v, -1;\n"
+        " @p ld.global.b32 v, [$2];\n"
+        " shr.s32 m, v, 31; xor.b32 $0, v, m; and.b32 $1, m, 1; }",
+        "=r,=r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        _I32(_llvm.extractvalue(_T.i32(), r, [0], loc=loc, ip=ip)),
+        _I32(_llvm.extractvalue(_T.i32(), r, [1], loc=loc, ip=ip)),
+    )
+
+
+def _scale_pairs(vals, s):
+    """[RN(v * s) with exact zeros as +0] for a list of even length, packed f32x2."""
+    out = []
+    z = cutlass.Float32(0.0)
+    for i in range(0, len(vals), 2):
+        out.extend(_fma2(vals[i], vals[i + 1], s, s, z, z))
+    return out
+
+
+def _abs_max16(v):
+    """max |v_i| over 16 values with 3-input max.abs (exact)."""
+    m = [_max3_abs(v[3 * i], v[3 * i + 1], v[3 * i + 2]) for i in range(5)]
+    a = _max3_abs(m[0], m[1], m[2])
+    b = _max3_abs(m[3], m[4], v[15])
+    return _f_max(a, b)
+
+
+@cute.jit
+def smem_addr_i32(arr) -> cutlass.Int32:
+    return cutlass.Int32(arr.data_ptr().toint())
+
+
+@cute.jit
+def fp4_head_address(state: cute.Tensor, slot, head) -> cutlass.Int64:
+    """Byte address of the packed checkpoint ``state[slot, head, :]``."""
+
+    offset = cute.crd2idx((slot, head, 0), state.layout)
+    return cutlass.Int64((state.iterator + offset).toint())
+
+
+@cute.jit
+def tcgen05_load_initial_state_2fp4_dv2(
+    tmem_raw_addr,
+    initial_state: cute.Tensor,
+    state_slot,
+    state_fresh,
+    bidy,
+    dv_half,
+    warp_idx,
+    lane,
+) -> None:
+    """Dequantize packed checkpoint rows into the DV2 chain's recurrent TMEM.
+
+    Primary plus residual (fma(p, e_p, RN(r e_r)), as the decode commit).
+    Fresh rows skip the payload and start from zero. Quadrant lanes 0..15
+    own value rows dv_half * 64 + 16 * quadrant + lane (Layout F); lanes
+    16..31 repeat those loads but store zeros into their unused TMEM lanes.
+    """
+
+    base_col_id = tmem_raw_addr & 0xFFFF
+    base_row_id = tmem_raw_addr >> 16
+    tmem_sp = warp_idx % TCGEN05_STATE_K_TMEM_ROW_BLOCKS
+    row_id = base_row_id + tmem_sp * THREADS_PER_WARP
+    value_dim = (
+        dv_half * cutlass.Int32(DV_HALF)
+        + tmem_sp * ROWS_PER_WARP
+        + (lane % ROWS_PER_WARP)
+    )
+    word_mask = cutlass.Uint32(0) - (
+        cutlass.Uint32(1) - cutlass.Uint32(lane // ROWS_PER_WARP)
+    )
+    row_addr = cutlass.Uint32(
+        (row_id << 16) | (base_col_id + KDA_TMEM_STATE_COL_OFFSET)
+    )
+    if state_fresh == cutlass.Int32(0):
+        head = fp4_head_address(initial_state, state_slot, bidy)
+        pbase = head + cutlass.Int64(value_dim) * 64
+        rbase = pbase + FP4_VALUES_BYTES
+        sbase = head + cutlass.Int64(value_dim) * 8
+        pw = []
+        rw = []
+        for part in cutlass.range_constexpr(4):
+            pw.extend(_ld_global_v4(pbase + part * 16))
+        for part in cutlass.range_constexpr(4):
+            rw.extend(_ld_global_v4(rbase + part * 16))
+        psc0 = _ld_global_u32(sbase + FP4_PRIMARY_SCALE)
+        psc1 = _ld_global_u32(sbase + FP4_PRIMARY_SCALE + 4)
+        rsc0 = _ld_global_u32(sbase + FP4_RESIDUAL_SCALE)
+        rsc1 = _ld_global_u32(sbase + FP4_RESIDUAL_SCALE + 4)
+        outer = _ld_global_f32(head + FP4_OUTER_SCALE)
+        ep = list(_expand4(psc0, outer)) + list(_expand4(psc1, outer))
+        er = list(_expand4(rsc0, outer)) + list(_expand4(rsc1, outer))
+        for blk in cutlass.range_constexpr(4):
+            vals = []
+            for jj in cutlass.range_constexpr(4):
+                j = blk * 4 + jj
+                vals.extend(
+                    _dequant8(
+                        pw[j] & word_mask, rw[j] & word_mask, ep[j // 2], er[j // 2]
+                    )
+                )
+            _tmem_st32(row_addr + cutlass.Uint32(blk * 32), vals)
+    else:
+        zeros = [cutlass.Float32(0.0) for _ in range(32)]
+        for blk in cutlass.range_constexpr(4):
+            _tmem_st32(row_addr + cutlass.Uint32(blk * 32), zeros)
+
+
+@cute.jit
+def tcgen05_store_final_state_2fp4_dv2(
+    tmem_raw_addr,
+    state_col_offset,
+    final_state: cute.Tensor,
+    state_slot,
+    bidy,
+    dv_half,
+    warp_idx,
+    lane,
+    amax_smem,
+    xchg_slot,
+    xchg_mbar,
+) -> None:
+    """Pack the DV2 chain's recurrent TMEM state into primary + residual 2FP4.
+
+    Numerics follow store_checkpoint: the head outer scale is the head-wide
+    |state| maximum / 2688, block scales are E4M3(min(448, amax / (6 outer))),
+    and the residual is quantized with the same outer scale. The two DV
+    halves of a head form a (1, 2, 1) cluster and exchange their partial
+    maxima through distributed shared memory.
+    """
+
+    base_col_id = tmem_raw_addr & 0xFFFF
+    base_row_id = tmem_raw_addr >> 16
+    tmem_sp = warp_idx % TCGEN05_STATE_K_TMEM_ROW_BLOCKS
+    row_id = base_row_id + tmem_sp * THREADS_PER_WARP
+    value_dim = (
+        dv_half * cutlass.Int32(DV_HALF)
+        + tmem_sp * ROWS_PER_WARP
+        + (lane % ROWS_PER_WARP)
+    )
+    junk_lane = cutlass.Float32(lane // ROWS_PER_WARP)
+    row_addr = cutlass.Uint32((row_id << 16) | (base_col_id + state_col_offset))
+
+    bam = []
+    for blk in cutlass.range_constexpr(4):
+        sn = _tmem_ld32(row_addr + cutlass.Uint32(blk * 32))
+        aa = [_f_abs(x) for x in sn]
+        bam.append(_tree_max(aa[0:16]))
+        bam.append(_tree_max(aa[16:32]))
+    row_max = _sel_eq0(junk_lane, _tree_max(bam), cutlass.Float32(0.0))
+    row_max = _warp_max_f32(row_max)
+    if lane == cutlass.Int32(0):
+        amax_smem[tmem_sp] = row_max
+    prims.barrier_cta_sync(NBAR_CG1_ID, thread_count=4 * THREADS_PER_WARP)
+    gmax = _tree_max([amax_smem[i] for i in range(4)])
+    # Both halves pack with the same head outer scale.
+    if (tmem_sp == 0) & (lane == cutlass.Int32(0)):
+        _dsmem_send_f32(
+            smem_addr_i32(xchg_slot),
+            smem_addr_i32(xchg_mbar),
+            cutlass.Int32(1) - dv_half,
+            gmax,
+        )
+    state_input_ready_wait(xchg_mbar, cutlass.Int32(0))
+    gmax = _f_max(gmax, _ld_shared_f32(smem_addr_i32(xchg_slot)))
+    outer = _f_div(gmax, cutlass.Float32(2688.0))
+    t6 = _f_mul(
+        cutlass.Float32(6.0), _sel_eq0(outer, cutlass.Float32(1.0), outer)
+    )
+    inv_t6 = _f_div(cutlass.Float32(1.0), t6)
+
+    head = fp4_head_address(final_state, state_slot, bidy)
+    pbase = head + cutlass.Int64(value_dim) * 64
+    rbase = pbase + FP4_VALUES_BYTES
+    sbase = head + cutlass.Int64(value_dim) * 8
+
+    psc = [
+        _f_min(cutlass.Float32(448.0), _f_mul(bam[g], inv_t6)) for g in range(8)
+    ]
+    pscw0 = _pack_e4m3x4(psc[0], psc[1], psc[2], psc[3])
+    pscw1 = _pack_e4m3x4(psc[4], psc[5], psc[6], psc[7])
+    store_row = lane < ROWS_PER_WARP
+    if store_row:
+        _st_global_u32(sbase + FP4_PRIMARY_SCALE, pscw0)
+        _st_global_u32(sbase + FP4_PRIMARY_SCALE + 4, pscw1)
+    pe = list(_expand4(pscw0, outer)) + list(_expand4(pscw1, outer))
+    pinv = [
+        _sel_eq0(e, cutlass.Float32(0.0), _f_div(cutlass.Float32(1.0), e))
+        for e in pe
+    ]
+
+    rscw = []
+    for blk in cutlass.range_constexpr(4):
+        sn = _tmem_ld32(row_addr + cutlass.Uint32(blk * 32))
+        pwords = []
+        for jj in cutlass.range_constexpr(4):
+            g = blk * 2 + jj // 2
+            nv = [
+                _sel_eq0(pe[g], cutlass.Float32(0.0), _f_mul(sn[8 * jj + t], pinv[g]))
+                for t in range(8)
+            ]
+            pwords.append(_pack_e2m1x8(nv))
+        if store_row:
+            _st_global_v4(pbase + blk * 16, pwords[0], pwords[1], pwords[2], pwords[3])
+
+        rem = []
+        for jj in cutlass.range_constexpr(4):
+            g = blk * 2 + jj // 2
+            mg = _decode8(pwords[jj])
+            neg_e = _f_neg(pe[g])
+            for t in cutlass.range_constexpr(8):
+                rem.append(_f_fma(mg[t], neg_e, sn[8 * jj + t]))
+        ra = [_f_abs(x) for x in rem]
+        rs0 = _f_min(cutlass.Float32(448.0), _f_mul(_tree_max(ra[0:16]), inv_t6))
+        rs1 = _f_min(cutlass.Float32(448.0), _f_mul(_tree_max(ra[16:32]), inv_t6))
+        rscp = _pack_e4m3x2(rs0, rs1)
+        rscw.append(rscp)
+        re = _expand4(rscp, outer)
+        rinv = [
+            _sel_eq0(re[i], cutlass.Float32(0.0), _f_div(cutlass.Float32(1.0), re[i]))
+            for i in range(2)
+        ]
+        rwords = []
+        for jj in cutlass.range_constexpr(4):
+            nv = [
+                _sel_eq0(
+                    re[jj // 2],
+                    cutlass.Float32(0.0),
+                    _f_mul(rem[8 * jj + t], rinv[jj // 2]),
+                )
+                for t in range(8)
+            ]
+            rwords.append(_pack_e2m1x8(nv))
+        if store_row:
+            _st_global_v4(rbase + blk * 16, rwords[0], rwords[1], rwords[2], rwords[3])
+    if store_row:
+        _st_global_u32(
+            sbase + FP4_RESIDUAL_SCALE, rscw[0] | (rscw[1] << cutlass.Uint32(16))
+        )
+        _st_global_u32(
+            sbase + FP4_RESIDUAL_SCALE + 4, rscw[2] | (rscw[3] << cutlass.Uint32(16))
+        )
+    if (tmem_sp == 0) & (lane == cutlass.Int32(0)) & (dv_half == cutlass.Int32(0)):
+        _st_outer_pad(head + FP4_OUTER_SCALE, outer)
+
+
+# Engine-route packed-state I/O. The eight CG0 warps load the initial state:
+# warp w covers TMEM lane quadrant w % 4 (32 value rows) and the 64-column
+# half w // 4, i.e. four 16-column scale groups. The four CG1 warps pack the
+# final state, one quadrant (32 rows x 128 columns) each.
+
+
+@cute.jit
+def fp4_prefetch_rows(state: cute.Tensor, slot, fresh, bidy, warp_idx, lane):
+    """Issue this CG0 thread's checkpoint-row loads (zeros for fresh rows and non-CG0 warps)."""
+
+    quadrant = warp_idx % TCGEN05_STATE_K_TMEM_ROW_BLOCKS
+    half = (warp_idx // TCGEN05_STATE_K_TMEM_ROW_BLOCKS) % 2
+    value_dim = quadrant * THREADS_PER_WARP + lane
+    pred = cutlass.Int32(1) - fresh
+    if warp_idx > ROLES.compute_group0_last:
+        pred = cutlass.Int32(0)
+    head = fp4_head_address(state, slot, bidy)
+    pbase = head + cutlass.Int64(value_dim) * 64 + cutlass.Int64(half) * 32
+    sbase = head + cutlass.Int64(value_dim) * 8 + cutlass.Int64(half) * 4
+    words = (
+        _ld_v4_pred(pbase, pred)
+        + _ld_v4_pred(pbase + 16, pred)
+        + _ld_v4_pred(pbase + FP4_VALUES_BYTES, pred)
+        + _ld_v4_pred(pbase + FP4_VALUES_BYTES + 16, pred)
+    )
+    words.append(_ld_u32_pred(sbase + FP4_PRIMARY_SCALE, pred))
+    words.append(_ld_u32_pred(sbase + FP4_RESIDUAL_SCALE, pred))
+    words.append(_ld_u32_pred(head + FP4_OUTER_SCALE, pred))
+    return words
+
+
+@cute.jit
+def fp4_dequant_rows_to_tmem(tmem_raw_addr, words, warp_idx) -> None:
+    """Primary + residual (fma(p, e_p, RN(r e_r))) into this warp's 64 state columns."""
+
+    base_col_id = tmem_raw_addr & 0xFFFF
+    base_row_id = tmem_raw_addr >> 16
+    quadrant = warp_idx % TCGEN05_STATE_K_TMEM_ROW_BLOCKS
+    half = (warp_idx // TCGEN05_STATE_K_TMEM_ROW_BLOCKS) % 2
+    row_addr = cutlass.Uint32(
+        ((base_row_id + quadrant * THREADS_PER_WARP) << 16)
+        | (base_col_id + KDA_TMEM_STATE_COL_OFFSET + half * 64)
+    )
+    outer = cutlass.Float32(_bitcast_f32(words[18]))
+    ep = _expand4(words[16], outer)
+    er = _expand4(words[17], outer)
+    vals = []
+    for j in cutlass.range_constexpr(8):
+        vals.extend(_dequant8(words[j], words[8 + j], ep[j // 2], er[j // 2]))
+    _tmem_st64(row_addr, vals)
+
+
+@cute.jit
+def fp4_cg1_store_final_state(
+    tmem_raw_addr,
+    state_col_offset,
+    final_state: cute.Tensor,
+    state_slot,
+    bidy,
+    warp_idx,
+    lane,
+    amax_smem,
+) -> None:
+    """CG1 packs the whole state: warp w%4 owns 32 rows x 128 columns."""
+
+    prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+    base_col_id = tmem_raw_addr & 0xFFFF
+    base_row_id = tmem_raw_addr >> 16
+    quadrant = warp_idx % TCGEN05_STATE_K_TMEM_ROW_BLOCKS
+    value_dim = quadrant * THREADS_PER_WARP + lane
+    row_addr = cutlass.Uint32(
+        ((base_row_id + quadrant * THREADS_PER_WARP) << 16)
+        | (base_col_id + state_col_offset)
+    )
+    bam = [_abs_max16(_tmem_ld16(row_addr + cutlass.Uint32(16 * g))) for g in range(8)]
+    local = _warp_max_f32(
+        _f_max(
+            _f_max(_f_max(bam[0], bam[1]), _f_max(bam[2], bam[3])),
+            _f_max(_f_max(bam[4], bam[5]), _f_max(bam[6], bam[7])),
+        )
+    )
+    if lane == cutlass.Int32(0):
+        amax_smem[quadrant] = local
+    prims.barrier_cta_sync(NBAR_CG1_ID, thread_count=4 * THREADS_PER_WARP)
+    gmax = _f_max(_max3_abs(amax_smem[0], amax_smem[1], amax_smem[2]), amax_smem[3])
+    outer = _f_div(gmax, cutlass.Float32(2688.0))
+    t6 = _f_mul(cutlass.Float32(6.0), _sel_eq0(outer, cutlass.Float32(1.0), outer))
+    inv_t6 = _f_div(cutlass.Float32(1.0), t6)
+    psc = [_f_min(cutlass.Float32(448.0), _f_mul(bam[g], inv_t6)) for g in range(8)]
+    pscw0 = _pack_e4m3x4(psc[0], psc[1], psc[2], psc[3])
+    pscw1 = _pack_e4m3x4(psc[4], psc[5], psc[6], psc[7])
+    pe = list(_expand4(pscw0, outer)) + list(_expand4(pscw1, outer))
+    head = fp4_head_address(final_state, state_slot, bidy)
+    pbase = head + cutlass.Int64(value_dim) * 64
+    sbase = head + cutlass.Int64(value_dim) * 8
+    rsc_bytes = []
+    for g in cutlass.range_constexpr(8):
+        sn = _tmem_ld16(row_addr + cutlass.Uint32(16 * g))
+        e = pe[g]
+        pinv = _sel_eq0(e, cutlass.Float32(0.0), _f_div(cutlass.Float32(1.0), e))
+        q = _scale_pairs(sn, pinv)
+        w0 = _pack_e2m1x8(q[0:8])
+        w1 = _pack_e2m1x8(q[8:16])
+        _st_global_v2(pbase + 8 * g, w0, w1)
+        ne = _f_neg(e)
+        m = list(_decode8(w0)) + list(_decode8(w1))
+        r = []
+        for t in cutlass.range_constexpr(0, 16, 2):
+            r.extend(_fma2(m[t], m[t + 1], ne, ne, sn[t], sn[t + 1]))
+        rs = _f_min(cutlass.Float32(448.0), _f_mul(_abs_max16(r), inv_t6))
+        rsb = _pack_e4m3x2(rs, cutlass.Float32(0.0))
+        rsc_bytes.append(rsb)
+        er = _expand4(rsb, outer)[0]
+        rinv = _sel_eq0(er, cutlass.Float32(0.0), _f_div(cutlass.Float32(1.0), er))
+        qr = _scale_pairs(r, rinv)
+        _st_global_v2(
+            pbase + FP4_VALUES_BYTES + 8 * g, _pack_e2m1x8(qr[0:8]), _pack_e2m1x8(qr[8:16])
+        )
+    _st_global_u32(sbase + FP4_PRIMARY_SCALE, pscw0)
+    _st_global_u32(sbase + FP4_PRIMARY_SCALE + 4, pscw1)
+    _st_global_u32(
+        sbase + FP4_RESIDUAL_SCALE,
+        rsc_bytes[0]
+        | (rsc_bytes[1] << cutlass.Uint32(8))
+        | (rsc_bytes[2] << cutlass.Uint32(16))
+        | (rsc_bytes[3] << cutlass.Uint32(24)),
+    )
+    _st_global_u32(
+        sbase + FP4_RESIDUAL_SCALE + 4,
+        rsc_bytes[4]
+        | (rsc_bytes[5] << cutlass.Uint32(8))
+        | (rsc_bytes[6] << cutlass.Uint32(16))
+        | (rsc_bytes[7] << cutlass.Uint32(24)),
+    )
+    if (quadrant == 0) & (lane == cutlass.Int32(0)):
+        _st_outer_pad(head + FP4_OUTER_SCALE, outer)
+
+
 PACKED_METADATA_THREADS: int = 256
 
 
@@ -4696,6 +5364,29 @@ def kernel(
     sequence_end = cutlass.Int32(cu_seqlens[bidx + 1])
     seqlen = sequence_end - sequence_start
     num_chunks = cute.ceil_div(seqlen, BT)
+    fp4_slot = cutlass.Int32(0)
+    fp4_fresh = cutlass.Int32(0)
+    fp4_words = None
+    if cutlass.const_expr(
+        initial_state is not None and initial_state.element_type == cutlass.Uint8
+    ):
+        # Only CG0 reads the slot here; other warps must not stall before setup.
+        fp4_is_cg0 = cutlass.Int32(
+            cute.arch.make_warp_uniform(cute.arch.warp_idx())
+            <= ROLES.compute_group0_last
+        )
+        fp4_slot, fp4_fresh = _ld_slot_pred(
+            cutlass.Int64((state_indices.iterator + bidx).toint()), fp4_is_cg0
+        )
+        # Issued before setup so the checkpoint rows arrive during it.
+        fp4_words = fp4_prefetch_rows(
+            initial_state,
+            fp4_slot,
+            fp4_fresh,
+            bidy,
+            cute.arch.make_warp_uniform(cute.arch.warp_idx()),
+            tidx % THREADS_PER_WARP,
+        )
     input_dtype = q.element_type
     if cutlass.const_expr(
         k.element_type != input_dtype or v.element_type != input_dtype
@@ -4713,22 +5404,34 @@ def kernel(
         raise TypeError("KDA CUTLASS primitives kernel expects cu_seqlens to use int64")
     if cutlass.const_expr(initial_state is not None):
         if cutlass.const_expr(
-            initial_state.element_type not in (cutlass.BFloat16, cutlass.Float32)
+            initial_state.element_type
+            not in (cutlass.BFloat16, cutlass.Float32, cutlass.Uint8)
         ):
             raise TypeError(
-                "KDA CUTLASS primitives kernel input state dtype must be BF16 or FP32"
+                "KDA CUTLASS primitives kernel input state dtype must be BF16, FP32 or packed 2FP4"
             )
     if cutlass.const_expr(final_state is not None):
         if cutlass.const_expr(
-            final_state.element_type not in (cutlass.BFloat16, cutlass.Float32)
+            final_state.element_type
+            not in (cutlass.BFloat16, cutlass.Float32, cutlass.Uint8)
         ):
             raise TypeError(
-                "KDA CUTLASS primitives kernel output state dtype must be BF16 or FP32"
+                "KDA CUTLASS primitives kernel output state dtype must be BF16, FP32 or packed 2FP4"
             )
     if cutlass.const_expr(initial_state is not None and final_state is not None):
         if cutlass.const_expr(initial_state.element_type != final_state.element_type):
             raise TypeError(
                 "KDA CUTLASS primitives kernel expects matching state input/output dtypes"
+            )
+    state_is_fp4 = (
+        initial_state is not None and initial_state.element_type == cutlass.Uint8
+    )
+    if cutlass.const_expr(state_is_fp4):
+        if cutlass.const_expr(
+            final_state is None or state_ckpt is not None or state_indices is None
+        ):
+            raise TypeError(
+                "packed 2FP4 state requires indexed in-place state and no checkpoints"
             )
     # Buffers are declaration-ordered and intentionally non-aliased.
     tma_mbar = cutlass.Array(
@@ -4737,6 +5440,14 @@ def kernel(
         space=cutlass.AddressSpace.smem,
         alignment=8,
     )
+    fp4_amax_smem = None
+    if cutlass.const_expr(state_is_fp4):
+        fp4_amax_smem = cutlass.Array(
+            cutlass.Float32,
+            TCGEN05_STATE_K_TMEM_ROW_BLOCKS,
+            space=cutlass.AddressSpace.smem,
+            alignment=16,
+        )
     qstate_acc_ready_mbar = cutlass.Array(
         cutlass.Int64,
         1,
@@ -5047,6 +5758,8 @@ def kernel(
     if is_tmem_user_warp(warp_idx):
         if warp_idx == ROLES.tcgen05_mma:
             prims.tcgen05_alloc(tmem_ptr_i32, KDA_TMEM_ALLOC_COLS, group="cta_1")
+            if cutlass.const_expr(state_is_fp4):
+                prims.barrier_cta_arrive(NBAR_FP4_TMEM_ID, FP4_TMEM_THREADS)
         tmem_user_sync()
         if warp_idx == ROLES.tcgen05_mma:
             prims.tcgen05_relinquish_alloc_permit(group="cta_1")
@@ -5470,6 +6183,12 @@ def kernel(
         cg0_a_log_exp = cutlass.Float32(1.0)
         cg0_dt_bias_value = cutlass.Float32(0.0)
         tmem_raw_addr = cutlass.Int32(0)
+        if cutlass.const_expr(state_is_fp4):
+            prims.barrier_cta_sync(NBAR_FP4_TMEM_ID, thread_count=FP4_TMEM_THREADS)
+            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+            fp4_dequant_rows_to_tmem(tmem_ptr_i32.load(), fp4_words, warp_idx)
+            prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+            prims.barrier_cta_sync(NBAR_FP4_INIT_ID, thread_count=FP4_INIT_THREADS)
         if num_chunks > 0:
             raw_ready_wait(tma_mbar.subview(0), 0)
             prefix_dim = cg0_local_warp * THREADS_PER_WARP + lane
@@ -5725,12 +6444,20 @@ def kernel(
         state_slot = bidx
         if cutlass.const_expr(state_indices is not None):
             state_slot = cutlass.Int32(state_indices[bidx])
+        if cutlass.const_expr(state_is_fp4):
+            # Fresh packed rows are encoded as ~slot.
+            if state_slot < cutlass.Int32(0):
+                state_slot = cutlass.Int32(-1) - state_slot
         ckpt_slot = cutlass.Int32(0)
         if cutlass.const_expr(state_ckpt is not None):
             ckpt_stride = checkpoint_stride_chunks
             ckpt_next = ckpt_stride
             ckpt_slot = cutlass.Int32(cu_ckpts[bidx])
-        if cutlass.const_expr(checkpoint_state_indices is not None):
+        if cutlass.const_expr(state_is_fp4):
+            # CG0 dequantizes the checkpoint into the state columns.
+            prims.barrier_cta_sync(NBAR_FP4_INIT_ID, thread_count=FP4_INIT_THREADS)
+            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+        elif cutlass.const_expr(checkpoint_state_indices is not None):
             tcgen05_store_initial_state_tmem(
                 tmem_raw_addr,
                 initial_state,
@@ -6077,7 +6804,18 @@ def kernel(
             )
             output_ready_arrive(output_ready_mbar.subview(final_o_stage))
 
-        if cutlass.const_expr(final_state is not None):
+        if cutlass.const_expr(state_is_fp4):
+            fp4_cg1_store_final_state(
+                tmem_raw_addr,
+                KDA_TMEM_FINAL_STATE_ACC_COL_OFFSET,
+                final_state,
+                state_slot,
+                bidy,
+                warp_idx,
+                cute.arch.lane_idx(),
+                fp4_amax_smem,
+            )
+        elif cutlass.const_expr(final_state is not None):
             final_lane = cute.arch.lane_idx()
             tcgen05_store_final_state_tmem(
                 tmem_raw_addr,
@@ -8685,6 +9423,29 @@ def kernel_chain_dv2(
     chunk_base = cutlass.Int32(cu_chunks[bidx])
     input_dtype = v.element_type
 
+    state_is_fp4 = (
+        initial_state is not None and initial_state.element_type == cutlass.Uint8
+    )
+    if cutlass.const_expr(state_is_fp4):
+        if cutlass.const_expr(
+            final_state is None or state_ckpt is not None or state_indices is None
+        ):
+            raise TypeError(
+                "packed 2FP4 state requires indexed in-place state and no checkpoints"
+            )
+    fp4_amax_smem = None
+    fp4_xchg_slot = None
+    fp4_xchg_mbar = None
+    if cutlass.const_expr(state_is_fp4):
+        fp4_amax_smem = cutlass.Array(
+            cutlass.Float32, 4, space=cutlass.AddressSpace.smem, alignment=16
+        )
+        fp4_xchg_slot = cutlass.Array(
+            cutlass.Float32, 4, space=cutlass.AddressSpace.smem, alignment=16
+        )
+        fp4_xchg_mbar = cutlass.Array(
+            cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8
+        )
     # --- mbarriers (identical topology to the base chain) ----------------
     tma_mbar = cutlass.Array(
         cutlass.Int64,
@@ -8829,6 +9590,9 @@ def kernel_chain_dv2(
             prims.mbarrier_init(final_state_stored_mbar, 8)
             if cutlass.const_expr(state_ckpt is not None):
                 prims.mbarrier_init(checkpoint_read_done_mbar, 4)
+            if cutlass.const_expr(state_is_fp4):
+                prims.mbarrier_init(fp4_xchg_mbar, 1)
+                _mbar_arrive_expect_tx(smem_addr_i32(fp4_xchg_mbar), cutlass.Int32(4))
     elif warp_idx == ROLES.epilogue:
         if prims.elect_sync():
             for stage in cutlass.range_constexpr(K2_QSTATE_STAGE_COUNT):
@@ -8836,6 +9600,9 @@ def kernel_chain_dv2(
                 prims.mbarrier_init(output_consumed_mbar.subview(stage), 1)
     prims.fence_mbarrier_init()
     cta_sync()
+    if cutlass.const_expr(state_is_fp4):
+        # The peer half may signal our exchange barrier only after it exists.
+        _cluster_sync_all()
 
     if is_tmem_user_warp(warp_idx):
         if warp_idx == ROLES.tcgen05_mma:
@@ -9073,6 +9840,11 @@ def kernel_chain_dv2(
         state_slot = bidx
         if cutlass.const_expr(state_indices is not None):
             state_slot = cutlass.Int32(state_indices[bidx])
+        state_fresh = cutlass.Int32(0)
+        if cutlass.const_expr(state_is_fp4):
+            if state_slot < cutlass.Int32(0):
+                state_fresh = cutlass.Int32(1)
+                state_slot = cutlass.Int32(-1) - state_slot
         ckpt_slot = cutlass.Int32(0)
         if cutlass.const_expr(state_ckpt is not None):
             # cu_ckpts supplies the per-sequence base slot offsets.  A
@@ -9080,7 +9852,18 @@ def kernel_chain_dv2(
             ckpt_stride = checkpoint_stride_chunks
             ckpt_next = ckpt_stride
             ckpt_slot = cutlass.Int32(cu_ckpts[bidx])
-        if cutlass.const_expr(checkpoint_state_indices is not None):
+        if cutlass.const_expr(state_is_fp4):
+            tcgen05_load_initial_state_2fp4_dv2(
+                tmem_raw_addr,
+                initial_state,
+                state_slot,
+                state_fresh,
+                bidy,
+                dv_half,
+                warp_idx,
+                lane,
+            )
+        elif cutlass.const_expr(checkpoint_state_indices is not None):
             tcgen05_store_initial_state_tmem(
                 tmem_raw_addr,
                 initial_state,
@@ -9287,7 +10070,21 @@ def kernel_chain_dv2(
             tcgen05_wait_acc_buffer_ready(
                 k_restore_consumed_mbar.subview(last % 2), last_kr_phase
             )
-        if cutlass.const_expr(final_state is not None):
+        if cutlass.const_expr(state_is_fp4):
+            tcgen05_store_final_state_2fp4_dv2(
+                tmem_raw_addr,
+                KDA_TMEM_STATE_COL_OFFSET,
+                final_state,
+                state_slot,
+                bidy,
+                dv_half,
+                warp_idx,
+                cute.arch.lane_idx(),
+                fp4_amax_smem,
+                fp4_xchg_slot,
+                fp4_xchg_mbar,
+            )
+        elif cutlass.const_expr(final_state is not None):
             final_lane = cute.arch.lane_idx()
             tcgen05_store_final_state_tmem(
                 tmem_raw_addr,
@@ -9514,6 +10311,12 @@ def host_chain_dv2(
     ).launch(
         grid=(num_sequences, launch_heads * 2, 1),
         block=(THREADS, 1, 1),
+        cluster=(
+            (1, 2, 1)
+            if initial_state is not None
+            and initial_state.element_type == cutlass.Uint8
+            else None
+        ),
         stream=stream,
         min_blocks_per_mp=1,
         preferred_smem_carveout=100,
@@ -9608,63 +10411,7 @@ def host_unified(
     else:
         free_sms = sm_count - n_seq * heads * 2
         route_decomp = free_sms >= cutlass.Int32(0)
-    if route_decomp:
-        # ------------------------------ DECOMP ------------------------------
-        # PREP-FIRST on a single stream, always.  k1 runs its full grid and
-        # completes; k2 then reads a workspace that is already whole, so no
-        # flag-ring, no per-chunk fences and no cross-stream ordering are needed
-        # -- the kernel boundary supplies the visibility the flags used to.  The
-        # co-resident (chain-first, two-stream) variant was removed: it required
-        # the flag machinery on both kernels, and that cost more than the
-        # concurrency returned.
-        host_prep(
-            q,
-            k,
-            raw_gate,
-            a_log,
-            dt_bias,
-            beta,
-            cu_seqlens,
-            cu_chunks,
-            ws_kd,
-            ws_qd,
-            ws_w,
-            ws_qk,
-            ws_diag,
-            stream_a,
-            prep_num_ctas,
-            prep_cpc,
-            z,
-            h32,
-            SAFE_GATE,
-            GATE_SCALE_LOG2,
-            THREADS,
-            gate_dtype,
-        )
-        host_chain_dv2(
-            v,
-            cu_seqlens,
-            cu_chunks,
-            ws_kd,
-            ws_qd,
-            ws_w,
-            ws_qk,
-            ws_diag,
-            state_indices,
-            initial_state,
-            out,
-            final_state,
-            stream_a,
-            z,
-            h32,
-            scale,
-            state_ckpt,
-            cu_ckpts,
-            checkpoint_state_indices,
-            checkpoint_stride_chunks,
-            THREADS,
-        )
-    else:
+    if cutlass.const_expr(MODE == "engine"):
         # ------------------------------ ENGINE ------------------------------
         host(
             q,
@@ -9691,6 +10438,90 @@ def host_unified(
             THREADS,
             gate_dtype,
         )
+    else:
+        if route_decomp:
+            # ------------------------------ DECOMP ------------------------------
+            # PREP-FIRST on a single stream, always.  k1 runs its full grid and
+            # completes; k2 then reads a workspace that is already whole, so no
+            # flag-ring, no per-chunk fences and no cross-stream ordering are needed
+            # -- the kernel boundary supplies the visibility the flags used to.  The
+            # co-resident (chain-first, two-stream) variant was removed: it required
+            # the flag machinery on both kernels, and that cost more than the
+            # concurrency returned.
+            host_prep(
+                q,
+                k,
+                raw_gate,
+                a_log,
+                dt_bias,
+                beta,
+                cu_seqlens,
+                cu_chunks,
+                ws_kd,
+                ws_qd,
+                ws_w,
+                ws_qk,
+                ws_diag,
+                stream_a,
+                prep_num_ctas,
+                prep_cpc,
+                z,
+                h32,
+                SAFE_GATE,
+                GATE_SCALE_LOG2,
+                THREADS,
+                gate_dtype,
+            )
+            host_chain_dv2(
+                v,
+                cu_seqlens,
+                cu_chunks,
+                ws_kd,
+                ws_qd,
+                ws_w,
+                ws_qk,
+                ws_diag,
+                state_indices,
+                initial_state,
+                out,
+                final_state,
+                stream_a,
+                z,
+                h32,
+                scale,
+                state_ckpt,
+                cu_ckpts,
+                checkpoint_state_indices,
+                checkpoint_stride_chunks,
+                THREADS,
+            )
+        else:
+            # ------------------------------ ENGINE ------------------------------
+            host(
+                q,
+                k,
+                v,
+                raw_gate,
+                a_log,
+                dt_bias,
+                beta,
+                cu_seqlens,
+                seq_order,
+                state_indices,
+                initial_state,
+                out,
+                final_state,
+                stream_a,
+                scale,
+                state_ckpt,
+                cu_ckpts,
+                checkpoint_state_indices,
+                checkpoint_stride_chunks,
+                SAFE_GATE,
+                GATE_SCALE_LOG2,
+                THREADS,
+                gate_dtype,
+            )
 
 
 def _unified_fakes(
@@ -9750,6 +10581,13 @@ def _unified_fakes(
     )
 
     def state_pool_fake():
+        if state_dtype == cutlass.Uint8:
+            return cute.runtime.make_fake_tensor(
+                cutlass.Uint8,
+                shape=(sp, sh, FP4_STATE_BYTES),
+                stride=(cute.sym_int64(divisibility=16), FP4_STATE_BYTES, 1),
+                assumed_align=16,
+            )
         return cute.runtime.make_fake_tensor(
             state_dtype,
             shape=(sp, sh, DV, DK),
@@ -10325,8 +11163,10 @@ def compile(  # noqa: A001
 
     if dtype not in CLI_DTYPES.values():
         raise ValueError(f"Unsupported dtype: {dtype}")
-    if state_dtype not in (cutlass.BFloat16, cutlass.Float32):
+    if state_dtype not in (cutlass.BFloat16, cutlass.Float32, cutlass.Uint8):
         raise ValueError(f"Unsupported state dtype: {state_dtype}")
+    if state_dtype == cutlass.Uint8 and (has_state_ckpt or not has_state_indices):
+        raise ValueError("packed 2FP4 state requires indexed state without checkpoints")
     if has_checkpoint_state_indices and not has_state_ckpt:
         raise ValueError("checkpoint state indices require checkpoint state output")
     validate_gate_dtype(gate_dtype)
@@ -10432,8 +11272,16 @@ def _eager_module_load(
             gate_dtype=gate_dtype,
         )
         out = torch.zeros_like(v)
+        if state_dtype == cutlass.Uint8:
+            state = torch.zeros(
+                (1, heads, FP4_STATE_BYTES), dtype=torch.uint8, device=q.device
+            )
         initial_state = state if has_state_in else None
-        final_state = torch.zeros_like(state) if has_state_out else None
+        final_state = (
+            (state if state_dtype == cutlass.Uint8 else torch.zeros_like(state))
+            if has_state_out
+            else None
+        )
         ws_bytes = fn.workspace_size(cu_seqlens, heads)
         workspace = (
             torch.empty(ws_bytes, dtype=torch.uint8, device=cu_seqlens.device)

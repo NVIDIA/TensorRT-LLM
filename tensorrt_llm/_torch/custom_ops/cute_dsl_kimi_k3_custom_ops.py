@@ -4,7 +4,8 @@
 
 Inputs are raw BF16 Q/K/V, gate and beta logits. BT16 performs Q/K
 normalization and gate/beta activation. Recurrent state is updated directly
-in its resident BF16 or FP32 pool, with no FP32 staging/writeback.
+in its resident BF16 or FP32 pool, or in its packed 2FP4 checkpoint, with no
+FP32 staging/writeback.
 """
 
 import math
@@ -24,7 +25,11 @@ def _compile_prefill(device: torch.device, state_dtype: torch.dtype, lower_bound
     with torch.cuda.device(device):
         return compile(
             dtype=cutlass.BFloat16,
-            state_dtype=cutlass.BFloat16 if state_dtype == torch.bfloat16 else cutlass.Float32,
+            state_dtype={
+                torch.bfloat16: cutlass.BFloat16,
+                torch.float32: cutlass.Float32,
+                torch.uint8: cutlass.Uint8,
+            }[state_dtype],
             gate_dtype=cutlass.BFloat16,
             safe_gate=True,
             gate_lower_bound=lower_bound,
@@ -33,6 +38,27 @@ def _compile_prefill(device: torch.device, state_dtype: torch.dtype, lower_bound
             has_state_indices=True,
             mode=mode,
         )
+
+
+def _packed_state_rows(state_pool: torch.Tensor, heads: int) -> torch.Tensor | None:
+    """View a V2 2FP4 checkpoint pool as ``[slots, H, bytes]``; None if unsupported."""
+    from ..attention.kernels.blackwell.kimi_k3_kda.kda_chunked_bt16 import FP4_STATE_BYTES
+
+    if (
+        state_pool.ndim not in (3, 4)
+        or state_pool.shape[1] != heads
+        or state_pool.shape[-1] != FP4_STATE_BYTES
+        or (state_pool.ndim == 4 and state_pool.shape[2] != 1)
+        or state_pool.stride(1) != FP4_STATE_BYTES
+        or state_pool.stride(-1) != 1
+        or state_pool.stride(0) < heads * FP4_STATE_BYTES
+        or state_pool.stride(0) % 16
+        or state_pool.data_ptr() % 16
+    ):
+        return None
+    return state_pool.as_strided(
+        (state_pool.shape[0], heads, FP4_STATE_BYTES), (state_pool.stride(0), FP4_STATE_BYTES, 1)
+    )
 
 
 @torch.library.custom_op("trtllm::kda_prefill", mutates_args=("state_pool",), device_types="cuda")
@@ -59,7 +85,12 @@ def kda_prefill(
 
     The scheduler must prepare monotone int64 offsets and unique, nonnegative
     int32 slots outside execution. Empty sequences are allowed. Fresh rows
-    must be reset by the caller. Optional int32 ``seq_order`` (stable descending
+    must be reset by the caller. A uint8 ``state_pool`` holds V2 2FP4
+    checkpoints (``[slots, H, 1, bytes]`` or ``[slots, H, bytes]``); BT16
+    dequantizes them on load and quantizes the final state in place. There,
+    ``state_indices`` passes ``~slot`` for a sequence without an initial
+    state, which starts from zero without reading its checkpoint.
+    Optional int32 ``seq_order`` (stable descending
     length order) and ``cu_chunks`` (prefix sums of ceil(length / 16) in request
     order) are prepared once per batch and shared across layers. Both must be
     refreshed before replay when packed lengths change, retaining their storage.
@@ -98,7 +129,12 @@ def kda_prefill(
     if beta.shape != q.shape[:-1] or beta.dtype != torch.bfloat16:
         raise ValueError("KDA beta logits must be BF16 [1, T, H]")
     n, heads = state_indices.numel(), q.shape[2]
-    if (
+    kernel_state = state_pool
+    if state_pool.dtype == torch.uint8:
+        kernel_state = _packed_state_rows(state_pool, heads)
+        if kernel_state is None:
+            raise ValueError("KDA requires aligned 2FP4 checkpoint rows with dense heads")
+    elif (
         state_pool.dtype not in (torch.bfloat16, torch.float32)
         or state_pool.ndim != 4
         or state_pool.shape[1:] != (heads, 128, 128)
@@ -227,9 +263,9 @@ def kda_prefill(
         dt_bias.reshape(heads, 128),
         aligned_beta,
         cu_seqlens,
-        state_pool,
+        kernel_state,
         output,
-        state_pool,
+        kernel_state,
         workspace,
         torch.cuda.current_stream(device).cuda_stream,
         scale=scale,

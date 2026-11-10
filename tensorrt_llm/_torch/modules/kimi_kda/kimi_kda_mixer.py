@@ -818,7 +818,16 @@ class KimiKDALinearAttention(nn.Module):
         has_init = mamba_metadata.has_initial_states[:num_prefills]
         staged_state = None
         kernel_pool, kernel_indices = ssm_pool, slot_indices
-        if ssm_pool.dtype == torch.uint8:
+        packed_state = ssm_pool.dtype == torch.uint8
+        if packed_state and self._dispatch.prefill_kernel_path == "optimized":
+            # The kernel dequantizes and requantizes the checkpoint itself;
+            # sequences without an initial state pass ~slot.
+            kernel_indices = getattr(mamba_metadata, "kda_packed_state_indices", None)
+            if kernel_indices is None:
+                kernel_indices = torch.where(
+                    has_init, slot_indices, torch.bitwise_not(slot_indices)
+                )
+        elif packed_state:
             from .kda_2fp4 import materialize_checkpoint
 
             staged_state = materialize_checkpoint(ssm_pool, slot_indices, has_init)
@@ -836,8 +845,10 @@ class KimiKDALinearAttention(nn.Module):
             raise ValueError("Unsupported FlashInfer KDA state layout or prepared metadata")
         recurrent_in = None
         if use_indexed_state:
-            # The packed convolution clears fresh convolution rows itself.
-            reset_recurrent_state_rows(kernel_pool, kernel_indices, has_init)
+            # The packed convolution clears fresh convolution rows itself, and
+            # packed 2FP4 prefill starts ~slot rows from zero.
+            if not packed_state:
+                reset_recurrent_state_rows(kernel_pool, kernel_indices, has_init)
         elif mamba_metadata.use_initial_states:
             # The FLA core carries the state in fp32 (no-op for fp32 pools).
             recurrent_in = (
@@ -918,13 +929,15 @@ class KimiKDALinearAttention(nn.Module):
             sm_reserve=self._prefill_sm_reserve,
         )
 
-        # The packed convolution persisted the live convolution pool in place.
+        # The packed convolution persisted the live convolution pool in place;
+        # the optimized kernel updated a packed 2FP4 checkpoint in place.
         if ssm_pool.dtype == torch.uint8:
-            from .kda_2fp4 import store_checkpoint
+            if staged_state is not None:
+                from .kda_2fp4 import store_checkpoint
 
-            store_checkpoint(
-                ssm_pool, slot_indices, final_state if final_state is not None else kernel_pool
-            )
+                store_checkpoint(
+                    ssm_pool, slot_indices, final_state if final_state is not None else kernel_pool
+                )
         elif final_state is not None:
             _writeback_state_rows(ssm_pool, slot_indices, final_state)
         else:

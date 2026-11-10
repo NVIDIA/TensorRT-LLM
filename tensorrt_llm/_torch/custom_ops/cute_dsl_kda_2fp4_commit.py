@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """KDA native 2FP4 checkpoint commit, one CuTe DSL launch (SM100/SM103).
 
-One persistent kernel: per (batch, head) work item it reconstructs the FP4
-primary+residual checkpoint state, applies the cumulative log-decay, fuses the
-BF16 history update through one tcgen05 UMMA (accumulator pre-seeded in TMEM),
-repacks both FP4 components with a shared outer scale, and advances/resets the
-shared [R] length counters from the immutable old_lengths snapshot.
+One persistent kernel: per (layer, row, head) work item it reconstructs the
+FP4 primary+residual checkpoint state, applies the cumulative log-decay, fuses
+the BF16 history update through one tcgen05 UMMA (accumulator pre-seeded in
+TMEM), and repacks both FP4 components with a shared outer scale. The caller
+resets the history lengths after the launch.
 """
 
 import cutlass
@@ -88,13 +88,13 @@ def _ld_global_s32(addr: Int64, *, loc=None, ip=None) -> Int32:
 
 
 @dsl_user_op
-def _ld_global_u8(addr: Int64, *, loc=None, ip=None) -> Int32:
-    return Int32(
+def _ld_global_s64(addr: Int64, *, loc=None, ip=None) -> Int64:
+    return Int64(
         llvm.inline_asm(
-            T.i32(),
+            T.i64(),
             [_ir(Int64(addr), loc, ip)],
-            "{ .reg .b16 t; ld.global.b8 t, [$1]; cvt.u32.u16 $0, t; }",
-            "=r,l",
+            "ld.global.b64 $0, [$1];",
+            "=l,l",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -179,21 +179,6 @@ def _st_global_u16(addr: Int64, v: Uint32, *, loc=None, ip=None):
         None,
         [_ir(Int64(addr), loc, ip), _ir(Uint32(v), loc, ip)],
         "{ .reg .b16 t; cvt.u16.u32 t, $1; st.global.b16 [$0], t; }",
-        "l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _st_global_s32(addr: Int64, v: Int32, *, loc=None, ip=None):
-    llvm.inline_asm(
-        None,
-        [_ir(Int64(addr), loc, ip), _ir(Int32(v), loc, ip)],
-        "st.global.b32 [$0], $1;",
         "l,r",
         has_side_effects=True,
         is_align_stack=False,
@@ -691,20 +676,13 @@ def _tree_max(vals: list[Float32]) -> Float32:
 @cute.kernel
 def _commit_kernel(
     tiled_mma: cute.TiledMma,
-    pool_p: Int64,
     slots_p: Int64,
     slotmap_p: Int64,
-    hk_p: Int64,
-    hu_p: Int64,
-    hg_p: Int64,
-    lengths_p: Int64,
-    oldlen_p: Int64,
-    dummy_p: Int64,
-    slot_stride: Int64,
     total: Int32,
+    desc_p: Int64,
+    rows: Int32,
     H: cutlass.Constexpr,
     CAP: cutlass.Constexpr,
-    FULL: cutlass.Constexpr,
 ):
     atom_a = tcgen05.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.MN_INTER, cutlass.BFloat16)
     a_shape = cute.append(tiled_mma.partition_shape_A(cute.dice((128, 128, 16), (1, None, 1))), 1)
@@ -754,30 +732,26 @@ def _commit_kernel(
 
     idx = Int32(bidx)
     while idx < total:
-        b = idx // H
-        h = idx % H
+        # Work item (layer, row, head); the layer's buffers come from its
+        # descriptor [pool, slot stride, K, U, G, lengths].
+        layer = idx // (rows * H)
+        row_head = idx - layer * rows * H
+        b = row_head // H
+        h = row_head - b * H
+        desc = desc_p + Int64(layer) * 48
+        pool_l = _ld_global_s64(desc)
+        slot_stride_l = _ld_global_s64(desc + 8)
+        hk_l = _ld_global_s64(desc + 16)
+        hu_l = _ld_global_s64(desc + 24)
+        hg_l = _ld_global_s64(desc + 32)
+        lengths_l = _ld_global_s64(desc + 40)
         slot = _ld_global_s32(slots_p + Int64(b) * 4)
         live = _ld_global_s32(slotmap_p + Int64(slot) * 4)
         if live >= Int32(0):
-            old = _ld_global_s32(oldlen_p + Int64(b) * 4)
-            is_dummy = _ld_global_u8(dummy_p + Int64(b))
-            if h == Int32(0):
-                if tidx == Int32(0):
-                    if cutlass.const_expr(FULL):
-                        if is_dummy == Int32(0):
-                            _st_global_s32(lengths_p + Int64(live) * 4, (old + 1) % 16)
-                    else:
-                        _st_global_s32(lengths_p + Int64(live) * 4, Int32(0))
-
-            if cutlass.const_expr(FULL):
-                eligible = (is_dummy == Int32(0)) & (old == Int32(15))
-                n = Int32(16)
-            else:
-                eligible = old > Int32(0)
-                n = old
-
-            if eligible:
-                head_base = pool_p + Int64(slot) * slot_stride + Int64(h) * STATE_BYTES
+            # Lengths are reset by a separate launch, so read them directly.
+            n = _ld_global_s32(lengths_l + Int64(live) * 4)
+            if n > Int32(0):
+                head_base = pool_l + Int64(slot) * slot_stride_l + Int64(h) * STATE_BYTES
                 byteoff = Int64(v) * 64 + Int64(cg) * 32
                 pbase = head_base + byteoff
                 rbase = pbase + VALUES_BYTES
@@ -795,19 +769,17 @@ def _commit_kernel(
 
                 cute.arch.barrier()
                 if tidx < Int32(128):
-                    lgv = _ld_global_f32(hg_p + (hist_base + Int64(n - 1) * 128 + Int64(tidx)) * 4)
+                    lgv = _ld_global_f32(hg_l + (hist_base + Int64(n - 1) * 128 + Int64(tidx)) * 4)
                     sLg[tidx] = lgv
                     sExp[tidx] = _f_exp(lgv)
                 cute.arch.barrier()
 
                 # ---- B operand: adjusted_k[i, k] = bf16(hk * exp(last_g - hg)) ----
-                act = cutlass.Boolean(True)
-                if cutlass.const_expr(not FULL):
-                    act = ii < n
+                act = ii < n
                 if act:
-                    kw = _ld_global_v4(hk_p + (hist_base + Int64(ii) * 128 + Int64(k0)) * 2)
-                    ga = _ld_global_f32x4(hg_p + (hist_base + Int64(ii) * 128 + Int64(k0)) * 4)
-                    gb = _ld_global_f32x4(hg_p + (hist_base + Int64(ii) * 128 + Int64(k0) + 4) * 4)
+                    kw = _ld_global_v4(hk_l + (hist_base + Int64(ii) * 128 + Int64(k0)) * 2)
+                    ga = _ld_global_f32x4(hg_l + (hist_base + Int64(ii) * 128 + Int64(k0)) * 4)
+                    gb = _ld_global_f32x4(hg_l + (hist_base + Int64(ii) * 128 + Int64(k0) + 4) * 4)
                     gg = list(ga) + list(gb)
                     for m2 in cutlass.range_constexpr(4):
                         kv = _bf16x2_to_f32x2(kw[m2])
@@ -822,7 +794,7 @@ def _commit_kernel(
                 # ---- A operand: cached_u[v, i] = hu[i, v] ----
                 v0 = kg * 8
                 if act:
-                    uw = _ld_global_v4(hu_p + (hist_base + Int64(ii) * 128 + Int64(v0)) * 2)
+                    uw = _ld_global_v4(hu_l + (hist_base + Int64(ii) * 128 + Int64(v0)) * 2)
                     for m2 in cutlass.range_constexpr(4):
                         uv = _bf16x2_to_f32x2(uw[m2])
                         for s2 in cutlass.range_constexpr(2):
@@ -969,22 +941,15 @@ def _commit_kernel(
 
 @cute.jit
 def _commit_launch(
-    pool_p: Int64,
     slots_p: Int64,
     slotmap_p: Int64,
-    hk_p: Int64,
-    hu_p: Int64,
-    hg_p: Int64,
-    lengths_p: Int64,
-    oldlen_p: Int64,
-    dummy_p: Int64,
-    slot_stride: Int64,
     total: Int32,
     num_ctas: Int32,
+    desc_p: Int64,
+    rows: Int32,
     stream,
     H: cutlass.Constexpr,
     CAP: cutlass.Constexpr,
-    FULL: cutlass.Constexpr,
     SMEM: cutlass.Constexpr,
 ):
     tiled_mma = sm100_utils.make_trivial_tiled_mma(
@@ -998,20 +963,13 @@ def _commit_launch(
     )
     _commit_kernel(
         tiled_mma,
-        pool_p,
         slots_p,
         slotmap_p,
-        hk_p,
-        hu_p,
-        hg_p,
-        lengths_p,
-        oldlen_p,
-        dummy_p,
-        slot_stride,
         total,
+        desc_p,
+        rows,
         H,
         CAP,
-        FULL,
     ).launch(grid=[num_ctas, 1, 1], block=[NTHREADS, 1, 1], smem=SMEM, stream=stream)
 
 
@@ -1021,68 +979,53 @@ def _commit_launch(
 
 _CACHE = {}
 _SM = None
+_SMEM_BYTES = 4096 + 4096 + 512 + 512 + 64 + 64 + 1024
 
 
 @torch.no_grad()
-def commit(
-    pool: torch.Tensor,
+def commit_layers(
+    descriptors: torch.Tensor,
     slots: torch.Tensor,
     slot_map: torch.Tensor,
-    hk: torch.Tensor,
-    hu: torch.Tensor,
-    hg: torch.Tensor,
-    lengths: torch.Tensor,
-    old_lengths: torch.Tensor,
-    dummy: torch.Tensor,
-    full_only: bool,
+    heads: int,
+    capacity: int,
 ) -> None:
-    """Commit packed checkpoints and advance/reset counters from a stable [B] snapshot."""
+    """Commit every partial window of the addressed rows in all local layers.
+
+    One launch over (layer, row, head). Descriptor rows are int64
+    [checkpoint pointer, checkpoint slot stride in bytes, K, U, G, lengths]
+    of each layer. Lengths are read, not reset; the caller resets them after
+    this launch.
+    """
     global _SM
-    B = slots.shape[0]
-    H = pool.shape[1]
-    total = B * H
+    total = descriptors.shape[0] * slots.shape[0] * heads
     if total == 0:
         return
     if _SM is None:
-        _SM = torch.cuda.get_device_properties(pool.device).multi_processor_count
-    key = (int(H), int(hk.shape[2]), bool(full_only))
+        _SM = torch.cuda.get_device_properties(slots.device).multi_processor_count
+    key = (int(heads), int(capacity))
     fn = _CACHE.get(key)
     if fn is None:
-        smem_bytes = 4096 + 4096 + 512 + 512 + 64 + 64 + 1024
         fn = cute.compile(
             _commit_launch,
-            Int64(pool.data_ptr()),
             Int64(slots.data_ptr()),
             Int64(slot_map.data_ptr()),
-            Int64(hk.data_ptr()),
-            Int64(hu.data_ptr()),
-            Int64(hg.data_ptr()),
-            Int64(lengths.data_ptr()),
-            Int64(old_lengths.data_ptr()),
-            Int64(dummy.data_ptr()),
-            Int64(pool.stride(0)),
             Int32(total),
             Int32(1),
+            Int64(descriptors.data_ptr()),
+            Int32(slots.shape[0]),
             cutlass_torch.current_stream(),
-            int(H),
-            int(hk.shape[2]),
-            bool(full_only),
-            int(smem_bytes),
+            int(heads),
+            int(capacity),
+            int(_SMEM_BYTES),
         )
         _CACHE[key] = fn
-    num_ctas = min(total, _SM * 3)
     fn(
-        Int64(pool.data_ptr()),
         Int64(slots.data_ptr()),
         Int64(slot_map.data_ptr()),
-        Int64(hk.data_ptr()),
-        Int64(hu.data_ptr()),
-        Int64(hg.data_ptr()),
-        Int64(lengths.data_ptr()),
-        Int64(old_lengths.data_ptr()),
-        Int64(dummy.data_ptr()),
-        Int64(pool.stride(0)),
         Int32(total),
-        Int32(num_ctas),
+        Int32(min(total, _SM * 3)),
+        Int64(descriptors.data_ptr()),
+        Int32(slots.shape[0]),
         cutlass_torch.current_stream(),
     )

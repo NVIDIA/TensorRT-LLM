@@ -55,6 +55,7 @@ class ReplayHistory:
     slot_map: torch.Tensor  # [V2 slot capacity], int32; maps to live rows
     candidate_x: torch.Tensor | None = None  # [B_capacity, T_capacity, 3*H*128], BF16
     old_lengths: torch.Tensor | None = None  # [B_capacity], immutable verification snapshot
+    arrivals: torch.Tensor | None = None  # [B_capacity], int32 zeros; decode row arrival counters
 
 
 @triton.jit
@@ -160,15 +161,6 @@ def _pack_kernel(pool, slots, dense, slot_stride, H: tl.constexpr):
     _store_checkpoint(pool + slot * slot_stride + head * _STATE_BYTES, state)
 
 
-@triton.jit(do_not_specialize_on_alignment=["slots"])
-def _snapshot_lengths_kernel(slots, slot_map, lengths, old_lengths):
-    batch = tl.program_id(0)
-    slot = tl.load(slots + batch)
-    live = tl.load(slot_map + slot)
-    length = tl.load(lengths + live, mask=live >= 0, other=0)
-    tl.store(old_lengths + batch, length)
-
-
 def materialize_checkpoint(
     pool: torch.Tensor, slots: torch.Tensor, has_initial_state: torch.Tensor
 ) -> torch.Tensor:
@@ -193,47 +185,47 @@ def store_checkpoint(pool: torch.Tensor, slots: torch.Tensor, dense: torch.Tenso
     )
 
 
-def commit_history(
-    pool: torch.Tensor,
-    slots: torch.Tensor,
-    history: ReplayHistory,
-    *,
-    full_only: bool = False,
-    dummy: torch.Tensor | None = None,
-    old_lengths: torch.Tensor | None = None,
-) -> None:
-    """Commit and advance full histories, or flush before suspension/export.
+@triton.jit(do_not_specialize_on_alignment=["slots"])
+def _reset_lengths_kernel(descriptors, slots, slot_map, FIELDS: tl.constexpr):
+    layer, row = tl.program_id(0), tl.program_id(1)
+    live = tl.load(slot_map + tl.load(slots + row))
+    lengths = tl.load(descriptors + layer * FIELDS + FIELDS - 1).to(tl.pointer_type(tl.int32))
+    tl.store(lengths + live, 0, mask=live >= 0)
 
-    Normal decode supplies immutable [B] int32 lengths recorded by replay.
-    Standalone partial flushes snapshot the addressed lengths before the
-    commit kernel can advance/reset the live counters.
-    """
-    from ...custom_ops.cute_dsl_kda_2fp4_commit import commit
 
+def flush_descriptor(pool: torch.Tensor, history: ReplayHistory) -> tuple[int, ...]:
+    """One layer's int64 row for ``flush_histories``."""
     _validate_checkpoint(pool)
-    if full_only and dummy is None:
-        raise ValueError("Full rollover requires the replay batch's dummy mask.")
-    if slots.numel() == 0:
+    return (
+        pool.data_ptr(),
+        pool.stride(0),
+        history.k.data_ptr(),
+        history.u.data_ptr(),
+        history.g.data_ptr(),
+        history.length.data_ptr(),
+    )
+
+
+def flush_histories(
+    descriptors: torch.Tensor,
+    slots: torch.Tensor,
+    slot_map: torch.Tensor,
+    heads: int,
+    capacity: int,
+) -> None:
+    """Commit and reset the partial histories of ``slots`` in every described layer.
+
+    Two launches regardless of the layer count: one commit over
+    (layer, row, head), then one length reset. ``descriptors`` holds one
+    ``flush_descriptor`` row per layer; ``slots`` are int32.
+    """
+    from ...custom_ops.cute_dsl_kda_2fp4_commit import commit_layers
+
+    if slots.numel() == 0 or descriptors.shape[0] == 0:
         return
-    slots = slots.to(torch.int32)
-    if old_lengths is None:
-        old_lengths = torch.empty_like(slots)
-        _snapshot_lengths_kernel[(slots.numel(),)](
-            slots, history.slot_map, history.length, old_lengths
-        )
-    if dummy is None:
-        dummy = torch.zeros(slots.numel(), dtype=torch.bool, device=slots.device)
-    commit(
-        pool,
-        slots,
-        history.slot_map,
-        history.k,
-        history.u,
-        history.g,
-        history.length,
-        old_lengths,
-        dummy,
-        full_only,
+    commit_layers(descriptors, slots, slot_map, heads, capacity)
+    _reset_lengths_kernel[(descriptors.shape[0], slots.numel())](
+        descriptors, slots, slot_map, FIELDS=descriptors.shape[1]
     )
 
 
@@ -256,7 +248,7 @@ def replay(
     norm_eps: float,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Fused one-token Conv4, replay, and gated output norm.
+    """Fused one-token Conv4, replay, gated output norm, and full-window commit.
 
     Raw BF16 inputs are x [B,3*H*128], gate [B,H*128], beta [B,H],
     z [B,H,128], Conv4 weights [3*H*128,4], and norm weights [128].
@@ -264,6 +256,10 @@ def replay(
     slot strides. Projection row strides are preserved. The FP32 A_log
     and dt_bias contain H and H*128 values, respectively. The optional
     BF16 output [B,H,128] is written directly, including BCG output views.
+    ``history.arrivals`` holds persistent int32 zero counters for every row.
+    The kernel prefetches this layer's checkpoint, history and Conv rows
+    before its PDL wait, so it must not directly follow another replay of
+    the same layer in a stream.
     """
     from ...custom_ops.cute_dsl_kda_2fp4_replay import fused_replay
 
@@ -316,7 +312,9 @@ def replay(
     if batch == 0:
         return output
     slots = slots.to(torch.int32)
-    old_lengths = torch.empty_like(slots)
+    arrivals = history.arrivals
+    if arrivals is None or arrivals.numel() < batch or arrivals.dtype != torch.int32:
+        raise ValueError("KDA replay requires persistent int32 arrival counters for every row.")
     fused_replay(
         x,
         conv_state,
@@ -338,9 +336,8 @@ def replay(
         lower_bound,
         norm_eps,
         output,
-        old_lengths,
+        arrivals,
     )
-    commit_history(pool, slots, history, full_only=True, dummy=dummy, old_lengths=old_lengths)
     return output
 
 

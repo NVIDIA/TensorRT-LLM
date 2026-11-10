@@ -291,3 +291,37 @@ def test_k3_prepare_materializes_stable_aligned_generation_indices() -> None:
     metadata.prepare(attn_metadata)
 
     assert metadata.generation_state_indices is None
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_prepare_encodes_packed_prefill_state_indices(packed: bool) -> None:
+    metadata = KimiK3MambaMetadata(max_batch_size=4, chunk_size=128, max_num_tokens=512)
+    metadata.state_indices.copy_(torch.tensor([3, 1, 2, 0], dtype=torch.int32, device="cuda"))
+    attn_metadata = _make_attention_metadata([16, 32, 48])
+    attn_metadata.kv_cache_manager = SimpleNamespace(use_kda_2fp4_replay=packed)
+    attn_metadata.kv_cache_params.num_cached_tokens_per_seq = torch.tensor(
+        [5, 0, 7], dtype=torch.int
+    )
+
+    metadata.prepare(attn_metadata)
+
+    if not packed:
+        assert metadata.kda_packed_state_indices is None
+        return
+    # Contexts without an initial state are encoded as ~slot.
+    torch.testing.assert_close(
+        metadata.kda_packed_state_indices,
+        torch.tensor([3, -2, 2], dtype=torch.int32, device="cuda"),
+    )
+    data_ptr = metadata.kda_packed_state_indices.data_ptr()
+
+    attn_metadata.kv_cache_params.num_cached_tokens_per_seq = torch.zeros(3, dtype=torch.int)
+    metadata.prepare(attn_metadata)
+    assert metadata.kda_packed_state_indices.data_ptr() == data_ptr
+    torch.testing.assert_close(
+        metadata.kda_packed_state_indices,
+        torch.tensor([-4, -2, -3], dtype=torch.int32, device="cuda"),
+    )
+
+    metadata.prepare(_make_attention_metadata([]))
+    assert metadata.kda_packed_state_indices is None

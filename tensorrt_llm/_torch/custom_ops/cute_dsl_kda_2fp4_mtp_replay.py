@@ -17,8 +17,9 @@ from cutlass._mlir.dialects import nvvm as nvvm_raw
 from cutlass.cutlass_dsl import T as MT
 from cutlass.experimental import primitives as prims
 
+from ..flashinfer_utils import get_env_enable_pdl
 from . import cute_dsl_kda_2fp4_mtp_replay_packed as _packed
-from . import cute_dsl_kda_2fp4_mtp_replay_persistent as _persistent
+from .cute_dsl_kda_2fp4_mtp_replay_packed import _ld_keep_s32, _ld_keep_u8
 
 KD = 128  # K = V = 128
 HROWS = 16  # history window W
@@ -32,8 +33,6 @@ INV2688 = 1.0 / (6 * 448)
 GMEM = cutlass.AddressSpace.gmem
 TMEM_COLS = 32  # [0,16) accumulator, [16,24) SFA (2 k-blocks x 4 cols), [24,32) SFB
 WS_BLOCKS = 3  # CTAs per SM targeted by the 256-thread warp-specialized variant
-CTAS_PER_SM = 5  # resident packed CTAs per SM used for the scheduling threshold
-PACKED_MAX_WAVES = 8
 
 
 def _exp_tl(x):
@@ -448,6 +447,7 @@ def _replay_kernel(
     POOL_VEC: cutlass.Constexpr[int],
     CAP: cutlass.Constexpr[int],
     WS: cutlass.Constexpr[int],
+    PDL: cutlass.Constexpr[int],
 ):
     N2 = 2 * T
     MMA_N: cutlass.Constexpr[int] = 8 if cutlass.const_expr(T <= 4) else 16
@@ -513,46 +513,20 @@ def _replay_kernel(
         out_ptr = cutlass.inttoptr(p_out, GMEM, BFloat16)
         cand_ptr = cutlass.inttoptr(p_cand, GMEM, BFloat16)
         oldlen_ptr = cutlass.inttoptr(p_oldlen, GMEM, Int32)
-        dummy_ptr = cutlass.inttoptr(p_dummy, GMEM, Uint8)
         b64 = Int64(b)
         h64 = Int64(h)
         hoff = h * KD + tid
 
-        slots_ptr = cutlass.inttoptr(p_slots, GMEM, Int32)
         # the row's slot is fetched together with its dummy flag (one dependent round trip less);
         # it is only dereferenced on live rows
-        is_dummy = (dummy_ptr + b64).load()
-        slot = (slots_ptr + b64).load()
+        is_dummy = _ld_keep_u8(p_dummy + b64)
+        slot = _ld_keep_s32(p_slots + b64 * 4)
 
-        # Start all row-local, slot-independent reads before resolving the dummy predicate.  These
-        # addresses are in bounds even for dummy rows and hide the flag/slot round trip on live rows;
-        # no slot mapping or history is touched until after the branch.
         raw_ptr = cutlass.inttoptr(p_raw, GMEM, BFloat16)
         z_ptr = cutlass.inttoptr(p_z, GMEM, BFloat16)
         g_ptr = cutlass.inttoptr(p_g, GMEM, BFloat16)
         beta_ptr = cutlass.inttoptr(p_beta, GMEM, BFloat16)
         cw_ptr = cutlass.inttoptr(p_cw, GMEM, BFloat16)
-        xs = []
-        x_row0 = raw_ptr + (b64 * raw_bs + hoff)
-        for sec in cutlass.range_constexpr(3):
-            x_row = x_row0 + sec * HK
-            for t in cutlass.range_constexpr(T):
-                xs.append(x_row.load())
-                x_row = x_row + raw_rs
-        zs = []
-        gs = []
-        betas = []
-        if cutlass.const_expr(WS == 0):
-            z_row = z_ptr + (b64 * z_bs + hoff)
-            g_row = g_ptr + (b64 * g_bs + hoff)
-            b_row = beta_ptr + (b64 * beta_bs + h64)
-            for t in cutlass.range_constexpr(T):
-                zs.append(z_row.load())
-                gs.append(g_row.load())
-                betas.append(b_row.load())
-                z_row = z_row + z_rs
-                g_row = g_row + g_rs
-                b_row = b_row + beta_rs
         cws = []
         for sec in cutlass.range_constexpr(3):
             cws.append((cw_ptr + Int64(sec * HK + hoff) * 4).load(alignment=8, count=4))
@@ -571,7 +545,9 @@ def _replay_kernel(
             prims.mbarrier_init(s_mbar, 1)
             prims.fence_mbarrier_init()
 
-        if is_dummy != Uint8(0):
+        if is_dummy != Int32(0):
+            if cutlass.const_expr(PDL != 0):
+                prims.griddepcontrol("wait")
             # Dummy row: exact zeros for every destination element, nothing else touched.
             o_row = out_ptr + ((b64 * T * H + h64) * KD + tid)
             c_row = cand_ptr + (b64 * candidate_bs + hoff)
@@ -594,7 +570,7 @@ def _replay_kernel(
         else:
             # ---- slot-dependent loads ----
             slot64 = Int64(slot)
-            live = (cutlass.inttoptr(p_smap, GMEM, Int32) + slot64).load()
+            live = _ld_keep_s32(p_smap + slot64 * 4)
             pool_row = p_pool + slot64 * pool_ss + h64 * STATE_BYTES
             pool_u8 = cutlass.inttoptr(pool_row, GMEM, Uint8)
             # state primary values -> SW64 K-major smem tile (8 rows x 64B atoms, chunk ^= (row>>1)&3)
@@ -637,49 +613,9 @@ def _replay_kernel(
                 for p in cutlass.range_constexpr(3):
                     cs.append((conv_ptr + (cbase + p)).load())
 
-            # ---- slot-independent Conv4 + SiLU (tokens t >= 3 read only the raw projection) ----
-            # Computed while the slot -> live mapping is in flight; tokens t < 3 need the Conv state.
-            qd = {}
-            kd = {}
-            vd = {}
-
-            for t in cutlass.range_constexpr(3, T):
-                qd[t], kd[t], vd[t] = _conv_token(t, T, cs, xs, cws, WS == 0)
-            # (warp-specialized: gates, beta/z sigmoids and the candidate copy run on warps 4..7)
-            if cutlass.const_expr(WS == 0):
-                # epilogue gates depend only on row-local projections
-                bsigs = []
-                sgs = []
-                for t in cutlass.range_constexpr(T):
-                    bsigs.append(_rcpf(Float32(1.0) + _expf(-Float32(betas[t]))))
-                    sgs.append(_rcpf(Float32(1.0) + _expf(-Float32(zs[t]))))
-                cw_row = cand_ptr + (b64 * candidate_bs + hoff)
-                for t in cutlass.range_constexpr(T):
-                    for sec in cutlass.range_constexpr(3):
-                        (cw_row + sec * HK).store(xs[sec * T + t])
-                    cw_row = cw_row + C3
-
-                # ---- gates (Triton-pinned elementary ops) ----
-                # Its rare-range division branches also end the basic block before the first use of the
-                # slot -> live mapping, so ptxas cannot hoist that dependency above the independent work.
-                rate = _exp_tl(a_log)
-                gates = []
-                for t in cutlass.range_constexpr(T):
-                    shifted = Float32(gs[t]) + dtb
-                    if cutlass.const_expr(BOUNDED != 0):
-                        dgate = _add1_rn(_expf(_mul_rn(shifted, -rate)))
-                        rgate = _rcp_ge1(dgate)
-                        if dgate >= Float32(8.507059173023462e37):
-                            rgate = Float32(1.0) / dgate
-                        gates.append(_mul_rn(lower, rgate))
-                    else:
-                        spv = cute.log(Float32(1.0) + _exp_tl(shifted))
-                        sp = spv if shifted <= Float32(20.0) else shifted
-                        gates.append(-rate * sp)
-
             # ---- live-dependent loads: history rows (zero-filled past length) ----
             live64 = Int64(live)
-            length = (cutlass.inttoptr(p_hlen, GMEM, Int32) + live64).load()
+            length = _ld_keep_s32(p_hlen + live64 * 4)
             hrow = (live64 * H + h64) * CAP  # row index of (live, h, 0)
             hk_ptr = cutlass.inttoptr(p_hk, GMEM, BFloat16)
             hu_ptr = cutlass.inttoptr(p_hu, GMEM, BFloat16)
@@ -727,6 +663,68 @@ def _replay_kernel(
                         s_gh.data_ptr() + q * 4, hg_base + q * 4, 16, "cg", cp_size=nbytes
                     )
             prims.cp_async_commit_group()
+
+            # ---- current-step projections, behind the PDL wait (everything above
+            # depends only on earlier steps) ----
+            if cutlass.const_expr(PDL != 0):
+                prims.griddepcontrol("wait")
+            xs = []
+            x_row0 = raw_ptr + (b64 * raw_bs + hoff)
+            for sec in cutlass.range_constexpr(3):
+                x_row = x_row0 + sec * HK
+                for t in cutlass.range_constexpr(T):
+                    xs.append(x_row.load())
+                    x_row = x_row + raw_rs
+            zs = []
+            gs = []
+            betas = []
+            if cutlass.const_expr(WS == 0):
+                z_row = z_ptr + (b64 * z_bs + hoff)
+                g_row = g_ptr + (b64 * g_bs + hoff)
+                b_row = beta_ptr + (b64 * beta_bs + h64)
+                for t in cutlass.range_constexpr(T):
+                    zs.append(z_row.load())
+                    gs.append(g_row.load())
+                    betas.append(b_row.load())
+                    z_row = z_row + z_rs
+                    g_row = g_row + g_rs
+                    b_row = b_row + beta_rs
+            # ---- slot-independent Conv4 + SiLU (tokens t >= 3 read only the raw projection) ----
+            qd = {}
+            kd = {}
+            vd = {}
+
+            for t in cutlass.range_constexpr(3, T):
+                qd[t], kd[t], vd[t] = _conv_token(t, T, cs, xs, cws, WS == 0)
+            # (warp-specialized: gates, beta/z sigmoids and the candidate copy run on warps 4..7)
+            if cutlass.const_expr(WS == 0):
+                # epilogue gates depend only on row-local projections
+                bsigs = []
+                sgs = []
+                for t in cutlass.range_constexpr(T):
+                    bsigs.append(_rcpf(Float32(1.0) + _expf(-Float32(betas[t]))))
+                    sgs.append(_rcpf(Float32(1.0) + _expf(-Float32(zs[t]))))
+                cw_row = cand_ptr + (b64 * candidate_bs + hoff)
+                for t in cutlass.range_constexpr(T):
+                    for sec in cutlass.range_constexpr(3):
+                        (cw_row + sec * HK).store(xs[sec * T + t])
+                    cw_row = cw_row + C3
+
+                # ---- gates (Triton-pinned elementary ops) ----
+                rate = _exp_tl(a_log)
+                gates = []
+                for t in cutlass.range_constexpr(T):
+                    shifted = Float32(gs[t]) + dtb
+                    if cutlass.const_expr(BOUNDED != 0):
+                        dgate = _add1_rn(_expf(_mul_rn(shifted, -rate)))
+                        rgate = _rcp_ge1(dgate)
+                        if dgate >= Float32(8.507059173023462e37):
+                            rgate = Float32(1.0) / dgate
+                        gates.append(_mul_rn(lower, rgate))
+                    else:
+                        spv = cute.log(Float32(1.0) + _exp_tl(shifted))
+                        sp = spv if shifted <= Float32(20.0) else shifted
+                        gates.append(-rate * sp)
 
             # ---- Conv4 + SiLU of the state-dependent tokens ----
             for t in cutlass.range_constexpr(min(T, 3)):
@@ -1291,6 +1289,8 @@ def _replay_kernel(
                         TMEM_COLS,
                         group=prims.CTAGroup.CTA_1,
                     )
+            if cutlass.const_expr(PDL != 0):
+                prims.griddepcontrol("launch_dependents")
             nwf = Float32(nw)
             hu_w = hu_ptr + ((hrow + length) * KD + tid)
             o_row2 = out_ptr + ((b64 * T * H + h64) * KD + tid)
@@ -1310,7 +1310,7 @@ def _replay_kernel(
 
     if cutlass.const_expr(WS != 0):
         if tid >= NT:
-            if (cutlass.inttoptr(p_dummy, GMEM, Uint8) + Int64(b)).load() == Uint8(0):
+            if _ld_keep_u8(p_dummy + Int64(b)) == Int32(0):
                 # ---- coefficient warps: history adjusted keys, relative pairs, BF16 coefficient
                 # products and history-U contraction, concurrent with quantization / native MMA ----
                 ctid = tid - NT
@@ -1325,6 +1325,20 @@ def _replay_kernel(
                 z_row = cutlass.inttoptr(p_z, GMEM, BFloat16) + (b64 * z_bs + choff)
                 b_row = cutlass.inttoptr(p_beta, GMEM, BFloat16) + (b64 * beta_bs + h64)
                 x_row0 = cutlass.inttoptr(p_raw, GMEM, BFloat16) + (b64 * raw_bs + choff)
+                dtb = (cutlass.inttoptr(p_dtb, GMEM, Float32) + choff).load()
+                a_log = (cutlass.inttoptr(p_a_log, GMEM, Float32) + h).load()
+                cwv = (cutlass.inttoptr(p_cw, GMEM, BFloat16) + Int64(2 * HK + choff) * 4).load(
+                    alignment=8, count=4
+                )
+                # v-section Conv state of this (live) row's slot
+                vslot64 = Int64(_ld_keep_s32(p_slots + b64 * 4))
+                vcbase = vslot64 * conv_ss + Int64(2 * HK + choff) * 3
+                csv = []
+                for p in cutlass.range_constexpr(3):
+                    csv.append((cutlass.inttoptr(p_conv, GMEM, BFloat16) + (vcbase + p)).load())
+                # current-step projections, behind the PDL wait
+                if cutlass.const_expr(PDL != 0):
+                    prims.griddepcontrol("wait")
                 gs = []
                 zs = []
                 betas = []
@@ -1341,17 +1355,6 @@ def _replay_kernel(
                     for t in cutlass.range_constexpr(T):
                         xs.append(x_row.load())
                         x_row = x_row + raw_rs
-                dtb = (cutlass.inttoptr(p_dtb, GMEM, Float32) + choff).load()
-                a_log = (cutlass.inttoptr(p_a_log, GMEM, Float32) + h).load()
-                cwv = (cutlass.inttoptr(p_cw, GMEM, BFloat16) + Int64(2 * HK + choff) * 4).load(
-                    alignment=8, count=4
-                )
-                # v-section Conv state of this (live) row's slot
-                vslot64 = Int64((cutlass.inttoptr(p_slots, GMEM, Int32) + b64).load())
-                vcbase = vslot64 * conv_ss + Int64(2 * HK + choff) * 3
-                csv = []
-                for p in cutlass.range_constexpr(3):
-                    csv.append((cutlass.inttoptr(p_conv, GMEM, BFloat16) + (vcbase + p)).load())
                 cw_row = cutlass.inttoptr(p_cand, GMEM, BFloat16) + (b64 * candidate_bs + choff)
                 for t in cutlass.range_constexpr(T):
                     for sec in cutlass.range_constexpr(3):
@@ -1613,6 +1616,7 @@ def _replay_launch(
     POOL_VEC: cutlass.Constexpr[int],
     CAP: cutlass.Constexpr[int],
     WS: cutlass.Constexpr[int],
+    PDL: cutlass.Constexpr[int],
 ):
     _replay_kernel(
         p_raw,
@@ -1654,10 +1658,12 @@ def _replay_launch(
         POOL_VEC,
         CAP,
         WS,
+        PDL,
     ).launch(
         grid=(H, B, 1),
         block=(NT * 2 if cutlass.const_expr(WS != 0) else NT, 1, 1),
         stream=stream,
+        use_pdl=PDL != 0,
         min_blocks_per_mp=(1 if cutlass.const_expr(WS == 2) else WS_BLOCKS)
         if cutlass.const_expr(WS != 0)
         else 5,
@@ -1695,6 +1701,7 @@ def _get_compiled(
     z_rs,
     pool_ss,
     ws,
+    pdl,
 ):
     # Specialize only stable model topology and layout metadata.  Request shape B,
     # accepted lengths, slots, masks and every tensor value remain runtime inputs.
@@ -1716,6 +1723,7 @@ def _get_compiled(
         z_rs,
         pool_ss,
         ws,
+        pdl,
     )
     fn = _compiled.get(key)
     if fn is None:
@@ -1743,6 +1751,7 @@ def _get_compiled(
             pool_vec,
             CAP,
             ws,
+            pdl,
         )
         _compiled[key] = fn
     return fn
@@ -1789,8 +1798,7 @@ def fused_replay(
     n_items = batch * heads
     sms = _num_sms()
     if n_items > WS_BLOCKS * sms:
-        kernel = _persistent if n_items > PACKED_MAX_WAVES * CTAS_PER_SM * sms else _packed
-        kernel.fused_replay(
+        _packed.fused_replay(
             x,
             conv_state,
             conv_weight,
@@ -1845,7 +1853,14 @@ def fused_replay(
     ws = 2 if n_items <= sms and tokens > 4 else 1
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fn = _get_compiled(
-        tokens, int(lower_bound is not None), pool_vec, heads, capacity, *strides, ws
+        tokens,
+        int(lower_bound is not None),
+        pool_vec,
+        heads,
+        capacity,
+        *strides,
+        ws,
+        int(get_env_enable_pdl()),
     )
     fn(
         raw_x.data_ptr(),

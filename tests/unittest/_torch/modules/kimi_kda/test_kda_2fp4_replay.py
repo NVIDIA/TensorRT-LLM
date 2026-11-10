@@ -174,6 +174,7 @@ def _fixture(batch: int, heads: int) -> tuple:
         torch.empty(shape, dtype=torch.float32, device="cuda"),
         torch.zeros(batch, dtype=torch.int32, device="cuda"),
         slot_map,
+        arrivals=torch.zeros(batch, dtype=torch.int32, device="cuda"),
     )
     state = torch.randn((batch, heads, 128, 128), device="cuda") * 0.1
     ops.store_checkpoint(pool, slots, state)
@@ -243,10 +244,9 @@ def test_dspark_native_verify_acceptance_and_rollover(
     if scheduling_sms is not None:
         from tensorrt_llm._torch.custom_ops import cute_dsl_kda_2fp4_mtp_replay as replay_ops
 
-        # A small scheduling budget exercises packed and persistent grid-stride
-        # kernels without allocating a production-sized batch in this test.
+        # A small scheduling budget exercises the packed kernel without
+        # allocating a production-sized batch in this test.
         monkeypatch.setattr(replay_ops, "_num_sms", lambda: scheduling_sms)
-        monkeypatch.setattr(replay_ops._persistent, "_num_sms", lambda: scheduling_sms)
     batch, capacity = 3, 16 + tokens
     pool, slots, original, _ = _fixture(batch, heads)
     shape = (batch, heads, capacity, 128)
@@ -385,6 +385,7 @@ def test_dspark_native_verify_acceptance_and_rollover(
         history.g[:, :, : ops.HISTORY_SIZE].contiguous(),
         history.length.clone(),
         history.slot_map,
+        arrivals=torch.zeros(batch, dtype=torch.int32, device="cuda"),
     )
     next_raw = raw.reshape(batch, tokens, -1)[:, 0]
     kwargs = dict(
@@ -659,7 +660,10 @@ def test_native_replay_rollover_and_partial_flush(heads: int, lower_bound: float
         else:
             assert torch.equal(pool, before)
         assert torch.all(history.length == (step + 1) % 16)
-    ops.commit_history(pool, slots, history)
+    descriptors = torch.tensor(
+        [ops.flush_descriptor(pool, history)], dtype=torch.int64, device="cuda"
+    )
+    ops.flush_histories(descriptors, slots, history.slot_map, heads, ops.HISTORY_SIZE)
     assert torch.count_nonzero(history.length) == 0
     restored = ops.materialize_checkpoint(pool, slots, ~dummy)
     cumulative = gates[-1]

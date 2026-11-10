@@ -724,216 +724,222 @@ def _commit_kernel(
 
     C = nH * 384
 
-    # ================= phase A: Conv4 accepted-prefix commit (8 channels / thread, 2 octets in flight)
-    octs_lb = nH * 48
-    total_oct = nL * nB * octs_lb
-    gstride = nP * THREADS
-    for idx0 in cutlass.range(bid * THREADS + tid, total_oct, 2 * gstride):
-        metas = []
-        for u in cutlass.range_constexpr(2):
-            idx = idx0 + u * gstride
-            valid = Int32(1) if idx < total_oct else Int32(0)
-            idxc = idx if idx < total_oct else idx0
-            o = idxc % octs_lb
-            lb = idxc // octs_lb
-            b = lb % nB
-            layer = lb // nB
-            dm = ld_g_u8(p_dummy + Int64(b))
-            A = ld_g_s32(p_acc + Int64(b) * 4)
-            slot = ld_g_s32(p_slots + Int64(b) * 4)
-            coff = ld_g_s64(p_desc + Int64(layer) * 80 + 16)
-            cstr = ld_g_s64(p_desc + Int64(layer) * 80 + 24) * 2
-            metas.append((valid, o, lb, dm, A, slot, coff, cstr))
-        loaded_data = []
-        for u in cutlass.range_constexpr(2):
-            valid, o, lb, dm, A, slot, coff, cstr = metas[u]
-            act = valid if dm == 0 else Int32(0)
-            act = act if A != 0 else Int32(0)
-            slotc = slot if act != 0 else Int32(0)
-            addr = coff + Int64(slotc) * cstr + Int64(o) * 48
-            need_old = act if A < 3 else Int32(0)
-            w = (
-                ld_g_v4_pred(addr, need_old)
-                + ld_g_v4_pred(addr + 16, need_old)
-                + ld_g_v4_pred(addr + 32, need_old)
-            )
-            cand = ld_g_s64(p_desc + Int64(lb // nB) * 80 + 72)
-            crow_base = cand + (Int64(lb % nB) * Int64(nT)) * Int64(C) * 2 + Int64(o) * 16
-            crs = []
-            for j in cutlass.range_constexpr(3):
-                src = A + j
-                use_c = act if src >= 3 else Int32(0)
-                row = src - 3
-                row = row if row > 0 else Int32(0)
-                row = row if row < nT else nT - 1
-                crs.append(ld_g_v4_pred(crow_base + Int64(row) * Int64(C) * 2, use_c))
-            loaded_data.append((act, addr, A, w, crs))
-        for u in cutlass.range_constexpr(2):
-            act, addr, A, w, crs = loaded_data[u]
-            outs = []
-            for j in cutlass.range_constexpr(3):
-                src = A + j
-                use_c = Int32(1) if src >= 3 else Int32(0)
-                is0 = Int32(1) if src == 0 else Int32(0)
-                is1 = Int32(1) if src == 1 else Int32(0)
-                cr = crs[j]
-                col = []
-                for c in cutlass.range_constexpr(8):
-                    cv = (cr[c // 2] >> (16 * (c % 2))) & 0xFFFF
-                    x0 = 3 * c
-                    h0 = (w[x0 // 2] >> (16 * (x0 % 2))) & 0xFFFF
-                    h1 = (w[(x0 + 1) // 2] >> (16 * ((x0 + 1) % 2))) & 0xFFFF
-                    h2 = (w[(x0 + 2) // 2] >> (16 * ((x0 + 2) % 2))) & 0xFFFF
-                    ov = sel_i32(is0, h0, sel_i32(is1, h1, h2))
-                    col.append(sel_i32(use_c, cv, ov))
-                outs.append(col)
-            words = []
-            for m in cutlass.range_constexpr(12):
-                xa = 2 * m
-                xb = 2 * m + 1
-                words.append(outs[xa % 3][xa // 3] | (outs[xb % 3][xb // 3] << 16))
-            st_g_v4_pred(addr, words[0], words[1], words[2], words[3], act)
-            st_g_v4_pred(addr + 16, words[4], words[5], words[6], words[7], act)
-            st_g_v4_pred(addr + 32, words[8], words[9], words[10], words[11], act)
+    # Phase A (Conv window commit) is bandwidth bound and phase B (checkpoint rollover) is
+    # issue bound: half of the CTAs run B first so that every SM overlaps the two.
+    b_first = Int32(1) if bid * 2 < nP else Int32(0)
+    for ph in cutlass.range(2, unroll=1):
+        if ph == b_first:
+            # ================= phase A: Conv4 accepted-prefix commit (8 channels / thread, 2 octets in flight)
+            octs_lb = nH * 48
+            total_oct = nL * nB * octs_lb
+            gstride = nP * THREADS
+            for idx0 in cutlass.range(bid * THREADS + tid, total_oct, 2 * gstride):
+                metas = []
+                for u in cutlass.range_constexpr(2):
+                    idx = idx0 + u * gstride
+                    valid = Int32(1) if idx < total_oct else Int32(0)
+                    idxc = idx if idx < total_oct else idx0
+                    o = idxc % octs_lb
+                    lb = idxc // octs_lb
+                    b = lb % nB
+                    layer = lb // nB
+                    dm = ld_g_u8(p_dummy + Int64(b))
+                    A = ld_g_s32(p_acc + Int64(b) * 4)
+                    slot = ld_g_s32(p_slots + Int64(b) * 4)
+                    coff = ld_g_s64(p_desc + Int64(layer) * 80 + 16)
+                    cstr = ld_g_s64(p_desc + Int64(layer) * 80 + 24) * 2
+                    metas.append((valid, o, lb, dm, A, slot, coff, cstr))
+                loaded_data = []
+                for u in cutlass.range_constexpr(2):
+                    valid, o, lb, dm, A, slot, coff, cstr = metas[u]
+                    act = valid if dm == 0 else Int32(0)
+                    act = act if A != 0 else Int32(0)
+                    slotc = slot if act != 0 else Int32(0)
+                    addr = coff + Int64(slotc) * cstr + Int64(o) * 48
+                    need_old = act if A < 3 else Int32(0)
+                    w = (
+                        ld_g_v4_pred(addr, need_old)
+                        + ld_g_v4_pred(addr + 16, need_old)
+                        + ld_g_v4_pred(addr + 32, need_old)
+                    )
+                    cand = ld_g_s64(p_desc + Int64(lb // nB) * 80 + 72)
+                    crow_base = cand + (Int64(lb % nB) * Int64(nT)) * Int64(C) * 2 + Int64(o) * 16
+                    crs = []
+                    for j in cutlass.range_constexpr(3):
+                        src = A + j
+                        use_c = act if src >= 3 else Int32(0)
+                        row = src - 3
+                        row = row if row > 0 else Int32(0)
+                        row = row if row < nT else nT - 1
+                        crs.append(ld_g_v4_pred(crow_base + Int64(row) * Int64(C) * 2, use_c))
+                    loaded_data.append((act, addr, A, w, crs))
+                for u in cutlass.range_constexpr(2):
+                    act, addr, A, w, crs = loaded_data[u]
+                    outs = []
+                    for j in cutlass.range_constexpr(3):
+                        src = A + j
+                        use_c = Int32(1) if src >= 3 else Int32(0)
+                        is0 = Int32(1) if src == 0 else Int32(0)
+                        is1 = Int32(1) if src == 1 else Int32(0)
+                        cr = crs[j]
+                        col = []
+                        for c in cutlass.range_constexpr(8):
+                            cv = (cr[c // 2] >> (16 * (c % 2))) & 0xFFFF
+                            x0 = 3 * c
+                            h0 = (w[x0 // 2] >> (16 * (x0 % 2))) & 0xFFFF
+                            h1 = (w[(x0 + 1) // 2] >> (16 * ((x0 + 1) % 2))) & 0xFFFF
+                            h2 = (w[(x0 + 2) // 2] >> (16 * ((x0 + 2) % 2))) & 0xFFFF
+                            ov = sel_i32(is0, h0, sel_i32(is1, h1, h2))
+                            col.append(sel_i32(use_c, cv, ov))
+                        outs.append(col)
+                    words = []
+                    for m in cutlass.range_constexpr(12):
+                        xa = 2 * m
+                        xb = 2 * m + 1
+                        words.append(outs[xa % 3][xa // 3] | (outs[xb % 3][xb // 3] << 16))
+                    st_g_v4_pred(addr, words[0], words[1], words[2], words[3], act)
+                    st_g_v4_pred(addr + 16, words[4], words[5], words[6], words[7], act)
+                    st_g_v4_pred(addr + 32, words[8], words[9], words[10], words[11], act)
 
-    # ================= phase B: recurrent checkpoint commits (globally balanced)
-    # Every CTA scans all (layer,row) pairs, block-scans the rolling-pair counts and
-    # takes exactly every nP-th rolling (pair, head) item -> even split of heavy work.
-    LB = nL * nB
-    cs = (LB + THREADS - 1) // THREADS
-    p0 = tid * cs
-    p1 = p0 + cs
-    p1 = p1 if p1 < LB else LB
-    cnt_t = Int32(0)
-    scan_layer = p0 // nB
-    scan_batch = p0 - scan_layer * nB
-    for p in cutlass.range(p0, p1, unroll=4):
-        b = scan_batch
-        dm = ld_g_u8(p_dummy + Int64(b))
-        A = ld_g_s32(p_acc + Int64(b) * 4)
-        old = ld_g_s64(p_desc + Int64(p // nB) * 80 + 64)
-        n = ld_g_s32(old + Int64(b) * 4) + A
-        slot = ld_g_s32(p_slots + Int64(b) * 4)
-        rl = Int32(1) if n >= 16 else Int32(0)
-        if flush != 0:
-            rl = Int32(1) if n > 0 else Int32(0)
-        rl = rl if dm == 0 else Int32(0)
-        cnt_t = cnt_t + rl
-        if p % nP == bid:
-            if dm == 0:
-                layer = scan_layer
-                live = ld_g_s32(p_smap + Int64(slot) * 4)
-                hlen = ld_g_s64(p_desc + Int64(layer) * 80 + 56)
-                st_g_s32(hlen + Int64(live) * 4, Int32(0) if rl != 0 else n)
-        scan_batch = scan_batch + Int32(1)
-        if scan_batch == nB:
-            scan_batch = Int32(0)
-            scan_layer = scan_layer + Int32(1)
-    # block exclusive scan of cnt_t
-    v = cnt_t
-    for sh in cutlass.range_constexpr(5):
-        y = shfl_up_i32(v, 1 << sh)
-        v = v + (y if lane >= (1 << sh) else Int32(0))
-    if lane == 31:
-        st_s_u32(sb + SM_SCAN + warp * 4, v)
-    cute.arch.barrier()
-    wpre = Int32(0)
-    tot = Int32(0)
-    for w8 in cutlass.range_constexpr(8):
-        ws = ld_s_u32(sb + SM_SCAN + w8 * 4)
-        wpre = wpre + (ws if w8 < warp else Int32(0))
-        tot = tot + ws
-    excl = wpre + v - cnt_t
-    r_tot = tot * nH
-    my_total = Int32(0)
-    if bid < r_tot:
-        my_total = (r_tot - bid + nP - 1) // nP
-    seq = Int32(0)
-    g = lane // 4
-    t = lane % 4
-    mi = lane // 8
-    rr = lane % 8
-    # Conv-only/no-roll calls never touch the MMA staging ring.  Defer its
-    # clear and barrier initialization until this CTA actually owns work.
-    if my_total > 0:
-        for q in cutlass.range_constexpr(5):
-            zi = tid + q * THREADS
-            if zi < 1088:
-                st_s_v4(
-                    sb + (zi // 544) * STAGE + ST_U + (zi % 544) * 16,
-                    Int32(0),
-                    Int32(0),
-                    Int32(0),
-                    Int32(0),
-                )
-        if tid == 0:
-            mbar_init(sb + SM_MBAR, 1)
-            mbar_init(sb + SM_MBAR + 8, 1)
-            fence_mbar_init()
-        fence_proxy_async()
-        cute.arch.barrier()
-    for wbase in cutlass.range(0, my_total, THREADS):
-        cute.arch.barrier()
-        rho = excl
-        if cnt_t > 0:
-            list_layer = p0 // nB
-            list_batch = p0 - list_layer * nB
-            for p in cutlass.range(p0, p1):
-                b = list_batch
+        else:
+            # ================= phase B: recurrent checkpoint commits (globally balanced)
+            # Every CTA scans all (layer,row) pairs, block-scans the rolling-pair counts and
+            # takes exactly every nP-th rolling (pair, head) item -> even split of heavy work.
+            LB = nL * nB
+            cs = (LB + THREADS - 1) // THREADS
+            p0 = tid * cs
+            p1 = p0 + cs
+            p1 = p1 if p1 < LB else LB
+            cnt_t = Int32(0)
+            scan_layer = p0 // nB
+            scan_batch = p0 - scan_layer * nB
+            for p in cutlass.range(p0, p1, unroll=4):
+                b = scan_batch
                 dm = ld_g_u8(p_dummy + Int64(b))
                 A = ld_g_s32(p_acc + Int64(b) * 4)
                 old = ld_g_s64(p_desc + Int64(p // nB) * 80 + 64)
                 n = ld_g_s32(old + Int64(b) * 4) + A
+                slot = ld_g_s32(p_slots + Int64(b) * 4)
                 rl = Int32(1) if n >= 16 else Int32(0)
                 if flush != 0:
                     rl = Int32(1) if n > 0 else Int32(0)
                 rl = rl if dm == 0 else Int32(0)
-                if rl != 0:
-                    x = (rho * nH) % nP
-                    h0 = (bid - x + nP) % nP
-                    for h in cutlass.range(h0, nH, nP):
-                        kk = (rho * nH + h - bid) // nP - wbase
-                        if kk >= 0:
-                            if kk < THREADS:
-                                layer = list_layer
-                                slot = ld_g_s32(p_slots + Int64(b) * 4)
-                                live = ld_g_s32(p_smap + Int64(slot) * 4)
-                                state = ld_g_s64(p_desc + Int64(layer) * 80)
-                                sstr = ld_g_s64(p_desc + Int64(layer) * 80 + 8)
-                                hb = state + Int64(slot) * sstr + Int64(h) * STATE_BYTES
-                                hist = (Int64(live) * Int64(nH) + Int64(h)) * Int64(cap)
-                                hk = ld_g_s64(p_desc + Int64(layer) * 80 + 32)
-                                hu = ld_g_s64(p_desc + Int64(layer) * 80 + 40)
-                                hg = ld_g_s64(p_desc + Int64(layer) * 80 + 48)
-                                st_s_s64(sb + SM_LHB + kk * 8, hb)
-                                st_s_s64(sb + SM_LK + kk * 8, hk + hist * 256)
-                                st_s_s64(sb + SM_LU + kk * 8, hu + hist * 256)
-                                st_s_s64(sb + SM_LG + kk * 8, hg + hist * 512)
-                                st_s_u32(sb + SM_LN + kk * 4, n)
-                    rho = rho + 1
-                list_batch = list_batch + Int32(1)
-                if list_batch == nB:
-                    list_batch = Int32(0)
-                    list_layer = list_layer + Int32(1)
-        cute.arch.barrier()
-        cnt = my_total - wbase
-        cnt = cnt if cnt < THREADS else Int32(THREADS)
-        if tid == 0:
-            _issue_entry(sb, seq % 2, Int32(0))
-            if cnt > 1:
-                _issue_entry(sb, (seq + 1) % 2, Int32(1))
-        for jx in cutlass.range(cnt):
-            q = seq + jx
-            stg = q % 2
-            par = (q // 2) % 2
-            n = ld_s_u32(sb + SM_LN + jx * 4)
-            hb = ld_s_s64(sb + SM_LHB + jx * 8)
-            stb = sb + stg * STAGE
-            done = Int32(0)
-            while done == 0:
-                done = mbar_try_wait(sb + SM_MBAR + stg * 8, par)
-            _commit_one(sb, stb, hb, n, tid, warp, lane, g, t, mi, rr, stg, jx, cnt)
-        seq = seq + cnt
+                cnt_t = cnt_t + rl
+                if p % nP == bid:
+                    if dm == 0:
+                        layer = scan_layer
+                        live = ld_g_s32(p_smap + Int64(slot) * 4)
+                        hlen = ld_g_s64(p_desc + Int64(layer) * 80 + 56)
+                        st_g_s32(hlen + Int64(live) * 4, Int32(0) if rl != 0 else n)
+                scan_batch = scan_batch + Int32(1)
+                if scan_batch == nB:
+                    scan_batch = Int32(0)
+                    scan_layer = scan_layer + Int32(1)
+            # block exclusive scan of cnt_t
+            v = cnt_t
+            for sh in cutlass.range_constexpr(5):
+                y = shfl_up_i32(v, 1 << sh)
+                v = v + (y if lane >= (1 << sh) else Int32(0))
+            if lane == 31:
+                st_s_u32(sb + SM_SCAN + warp * 4, v)
+            cute.arch.barrier()
+            wpre = Int32(0)
+            tot = Int32(0)
+            for w8 in cutlass.range_constexpr(8):
+                ws = ld_s_u32(sb + SM_SCAN + w8 * 4)
+                wpre = wpre + (ws if w8 < warp else Int32(0))
+                tot = tot + ws
+            excl = wpre + v - cnt_t
+            r_tot = tot * nH
+            my_total = Int32(0)
+            if bid < r_tot:
+                my_total = (r_tot - bid + nP - 1) // nP
+            seq = Int32(0)
+            g = lane // 4
+            t = lane % 4
+            mi = lane // 8
+            rr = lane % 8
+            # Conv-only/no-roll calls never touch the MMA staging ring.  Defer its
+            # clear and barrier initialization until this CTA actually owns work.
+            if my_total > 0:
+                for q in cutlass.range_constexpr(5):
+                    zi = tid + q * THREADS
+                    if zi < 1088:
+                        st_s_v4(
+                            sb + (zi // 544) * STAGE + ST_U + (zi % 544) * 16,
+                            Int32(0),
+                            Int32(0),
+                            Int32(0),
+                            Int32(0),
+                        )
+                if tid == 0:
+                    mbar_init(sb + SM_MBAR, 1)
+                    mbar_init(sb + SM_MBAR + 8, 1)
+                    fence_mbar_init()
+                fence_proxy_async()
+                cute.arch.barrier()
+            for wbase in cutlass.range(0, my_total, THREADS):
+                cute.arch.barrier()
+                rho = excl
+                if cnt_t > 0:
+                    list_layer = p0 // nB
+                    list_batch = p0 - list_layer * nB
+                    for p in cutlass.range(p0, p1):
+                        b = list_batch
+                        dm = ld_g_u8(p_dummy + Int64(b))
+                        A = ld_g_s32(p_acc + Int64(b) * 4)
+                        old = ld_g_s64(p_desc + Int64(p // nB) * 80 + 64)
+                        n = ld_g_s32(old + Int64(b) * 4) + A
+                        rl = Int32(1) if n >= 16 else Int32(0)
+                        if flush != 0:
+                            rl = Int32(1) if n > 0 else Int32(0)
+                        rl = rl if dm == 0 else Int32(0)
+                        if rl != 0:
+                            x = (rho * nH) % nP
+                            h0 = (bid - x + nP) % nP
+                            for h in cutlass.range(h0, nH, nP):
+                                kk = (rho * nH + h - bid) // nP - wbase
+                                if kk >= 0:
+                                    if kk < THREADS:
+                                        layer = list_layer
+                                        slot = ld_g_s32(p_slots + Int64(b) * 4)
+                                        live = ld_g_s32(p_smap + Int64(slot) * 4)
+                                        state = ld_g_s64(p_desc + Int64(layer) * 80)
+                                        sstr = ld_g_s64(p_desc + Int64(layer) * 80 + 8)
+                                        hb = state + Int64(slot) * sstr + Int64(h) * STATE_BYTES
+                                        hist = (Int64(live) * Int64(nH) + Int64(h)) * Int64(cap)
+                                        hk = ld_g_s64(p_desc + Int64(layer) * 80 + 32)
+                                        hu = ld_g_s64(p_desc + Int64(layer) * 80 + 40)
+                                        hg = ld_g_s64(p_desc + Int64(layer) * 80 + 48)
+                                        st_s_s64(sb + SM_LHB + kk * 8, hb)
+                                        st_s_s64(sb + SM_LK + kk * 8, hk + hist * 256)
+                                        st_s_s64(sb + SM_LU + kk * 8, hu + hist * 256)
+                                        st_s_s64(sb + SM_LG + kk * 8, hg + hist * 512)
+                                        st_s_u32(sb + SM_LN + kk * 4, n)
+                            rho = rho + 1
+                        list_batch = list_batch + Int32(1)
+                        if list_batch == nB:
+                            list_batch = Int32(0)
+                            list_layer = list_layer + Int32(1)
+                cute.arch.barrier()
+                cnt = my_total - wbase
+                cnt = cnt if cnt < THREADS else Int32(THREADS)
+                if tid == 0:
+                    _issue_entry(sb, seq % 2, Int32(0))
+                    if cnt > 1:
+                        _issue_entry(sb, (seq + 1) % 2, Int32(1))
+                for jx in cutlass.range(cnt):
+                    q = seq + jx
+                    stg = q % 2
+                    par = (q // 2) % 2
+                    n = ld_s_u32(sb + SM_LN + jx * 4)
+                    hb = ld_s_s64(sb + SM_LHB + jx * 8)
+                    stb = sb + stg * STAGE
+                    done = Int32(0)
+                    while done == 0:
+                        done = mbar_try_wait(sb + SM_MBAR + stg * 8, par)
+                    _commit_one(sb, stb, hb, n, tid, warp, lane, g, t, mi, rr, stg, jx, cnt)
+                seq = seq + cnt
 
 
 @cute.jit
@@ -966,15 +972,10 @@ def _commit_one(sb, stb, hb, n, tid, warp, lane, g, t, mi, rr, stg, jx, cnt):
         ci = tid + q * THREADS
         i = ci // 16
         cch = ci % 16
-        block_active = Int32(1)
-        if q == 1:
-            block_active = Int32(1) if n > 16 else Int32(0)
-        if block_active != 0:
-            pr = Int32(1) if i < n else Int32(0)
-            il = i if i < n else n - 1
-            kv = ld_s_v4(stb + ST_K + il * 256 + cch * 16)
-            ga = ld_s_v4(stb + ST_G + il * 512 + cch * 32)
-            gbv = ld_s_v4(stb + ST_G + il * 512 + cch * 32 + 16)
+        if i < n:
+            kv = ld_s_v4(stb + ST_K + i * 256 + cch * 16)
+            ga = ld_s_v4(stb + ST_G + i * 512 + cch * 32)
+            gbv = ld_s_v4(stb + ST_G + i * 512 + cch * 32 + 16)
             ea = ld_s_v4(gend + cch * 32)
             eb = ld_s_v4(gend + cch * 32 + 16)
             gg = ga + gbv
@@ -987,7 +988,6 @@ def _commit_one(sb, stb, hb, n, tid, warp, lane, g, t, mi, rr, stg, jx, cnt):
                     bits_f32(ee[2 * m]),
                     bits_f32(ee[2 * m + 1]),
                 )
-                w = sel_i32(pr, w, Int32(0))
                 pp = cch * 4 + m
                 qp = (pp % 16) * 4 + pp // 16
                 qc = qp // 4

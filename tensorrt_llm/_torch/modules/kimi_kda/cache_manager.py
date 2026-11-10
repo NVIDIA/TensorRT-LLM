@@ -975,6 +975,8 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         self._kda_2fp4_candidates = None
         self._kda_2fp4_intermediate_indices = None
         self._kda_2fp4_commit_descriptors = None
+        self._kda_2fp4_arrivals = None
+        self._kda_2fp4_flush_descriptors = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
 
@@ -1033,6 +1035,12 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
                     )
                     self._kda_2fp4_buffers.append(buffers)
                     history_bytes += sum(t.numel() * t.element_size() for t in buffers)
+                if not self._kda_2fp4_mtp:
+                    # Decode row arrival counters, shared by the sequential layers.
+                    self._kda_2fp4_arrivals = torch.zeros(
+                        capacity, dtype=torch.int32, device="cuda"
+                    )
+                    history_bytes += capacity * 4
                 if self._kda_2fp4_mtp:
                     self._kda_2fp4_old_lengths = torch.empty(
                         (len(context.mamba_pp_layers), context.max_batch_size),
@@ -1160,12 +1168,21 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
                 self._kda_2fp4_commit_descriptors = torch.tensor(
                     descriptors, dtype=torch.int64, device="cuda"
                 )
-            from .kda_2fp4 import commit_history
+            from .kda_2fp4 import flush_descriptor, flush_histories
 
+            rows = []
+            for layer in self.mamba_pp_layers:
+                cache = self.mamba_layer_cache(layer)
+                rows.append(flush_descriptor(cache.temporal, cache.history))
+            self._kda_2fp4_flush_descriptors = torch.tensor(rows, dtype=torch.int64, device="cuda")
             # Compile the partial flush on an unmapped slot during initialization.
-            slots = torch.zeros(1, dtype=torch.long, device="cuda")
-            cache = self.mamba_layer_cache(self.mamba_pp_layers[0])
-            commit_history(cache.temporal, slots, cache.history)
+            flush_histories(
+                self._kda_2fp4_flush_descriptors,
+                torch.zeros(1, dtype=torch.int32, device="cuda"),
+                self._kda_2fp4_slot_map,
+                self.ssm_state_shape[0],
+                self._kda_2fp4_history_capacity,
+            )
 
     @override
     def _build_cache_config(self, config):
@@ -1295,13 +1312,17 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         slot = self._request_id_to_state_index.get(request_id, -1)
         if slot < 0 or cache is None or not cache.is_active:
             return
-        from .kda_2fp4 import commit_history
+        from .kda_2fp4 import flush_histories
 
         with KDAReplayState.on_cache_stream(self._stream):
-            slots = _host_slots_to_device([slot], self.all_ssm_states[0].device)
-            for layer in self.mamba_pp_layers:
-                layer_cache = self.mamba_layer_cache(layer)
-                commit_history(layer_cache.temporal, slots, layer_cache.history)
+            slots = _host_slots_to_device([slot], self.all_ssm_states[0].device, dtype=torch.int32)
+            flush_histories(
+                self._kda_2fp4_flush_descriptors,
+                slots,
+                self._kda_2fp4_slot_map,
+                self.ssm_state_shape[0],
+                self._kda_2fp4_history_capacity,
+            )
 
     def _release_2fp4_history(self, request_id: int) -> None:
         """Return the decode-only row while V2 retains the checkpoint."""
@@ -1332,6 +1353,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
                         if self._kda_2fp4_mtp
                         else None
                     ),
+                    arrivals=self._kda_2fp4_arrivals,
                 )
             return Kda2Fp4State(
                 conv=self.get_conv_states(layer_idx),
@@ -1350,6 +1372,8 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         self._kda_2fp4_candidates = None
         self._kda_2fp4_intermediate_indices = None
         self._kda_2fp4_commit_descriptors = None
+        self._kda_2fp4_arrivals = None
+        self._kda_2fp4_flush_descriptors = None
         super().shutdown()
 
     @override

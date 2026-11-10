@@ -33,6 +33,12 @@ class KimiK3MambaMetadata(Mamba2Metadata):
             max_batch_size, dtype=torch.int32, device="cuda"
         )
         self.generation_state_indices: torch.Tensor | None = None
+        # Packed 2FP4 prefill state indices: slot, or ~slot for a context
+        # without an initial state. Shared by all layers of a batch.
+        self._kda_packed_state_indices = torch.empty(
+            max_batch_size, dtype=torch.int32, device="cuda"
+        )
+        self.kda_packed_state_indices: torch.Tensor | None = None
 
     def prepare(self, attn_metadata: AttentionMetadata) -> None:
         context_lengths = attn_metadata.seq_lens[: attn_metadata.num_contexts].tolist()
@@ -60,8 +66,17 @@ class KimiK3MambaMetadata(Mamba2Metadata):
         n = len(context_lengths)
         self.kda_seq_order = self._kda_schedule[0, :n]
         self.kda_cu_chunks = self._kda_schedule[1, : n + 1]
+        self.kda_packed_state_indices = None
         if not n:
             return
+        if getattr(attn_metadata.kv_cache_manager, "use_kda_2fp4_replay", False):
+            slots = self.state_indices[:n]
+            self.kda_packed_state_indices = torch.where(
+                self.has_initial_states[:n],
+                slots,
+                torch.bitwise_not(slots),
+                out=self._kda_packed_state_indices[:n],
+            )
         order = sorted(range(n), key=lambda i: (-context_lengths[i], i))
         chunks = list(accumulate(((length + 15) // 16 for length in context_lengths), initial=0))
         width = self._kda_schedule.shape[1]

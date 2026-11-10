@@ -28,12 +28,15 @@ head uses 18,448 bytes, including alignment, versus 32,768 bytes for BF16.
 There is no persistent dense state mirror. `mamba_ssm_cache_dtype` selects
 the ordinary recurrent path's dtype; it does not change this packed format.
 
-Prefill reconstructs both primary and residual into temporary FP32 rows,
-runs the ordinary prefill calculation, and packs the final state. This
-also applies to chunked-prefill continuations and prefix-cache hits.
-Each scheduled prefill call reads/writes the V2-owned 2FP4 checkpoint;
-temporary internal KDA chunk states stay dense and are not separately
-quantized.
+Each scheduled prefill call reads and writes the V2-owned 2FP4 checkpoint
+directly. The optimized BT16 prefill kernel reconstructs primary plus
+residual into its FP32 recurrent state before the first chunk and packs
+the final state once after the last; sequences without an initial state
+start from zero without reading their checkpoint. This also applies to
+chunked-prefill continuations and prefix-cache hits. Temporary internal
+KDA chunk states stay dense and are not separately quantized. The FLA
+fallback reconstructs temporary FP32 rows instead and packs them after the
+call, with the same quantization points.
 
 Decode leaves the checkpoint unchanged between commits. It dynamically
 quantizes the decayed K/Q checkpoint operands to NVFP4 and uses native
@@ -41,12 +44,13 @@ block-scaled MMA. Only the primary checkpoint participates in replay.
 Accepted K/U are cached in BF16 and cumulative per-key G in FP32. The
 history window is 16; rollover reconstructs both checkpoint terms and
 commits the cached updates. Partial histories are flushed before suspension
-or request release. One CuTe DSL launch fuses Conv4, Q/K normalization,
-replay, and output RMSNorm/gating without changing their calculations.
-A second, guarded CuTe DSL launch commits eligible checkpoints and advances
-history lengths. Replay supplies an immutable length snapshot directly to
-commit, without a separate metadata launch. Batch size, slot-pool capacity,
-and cache/projection row strides are runtime parameters for both kernels.
+or request release. One CuTe DSL launch per layer fuses Conv4, Q/K
+normalization, replay, and output RMSNorm/gating without changing their
+calculations. The same launch commits a full window: the CTA that appends
+the sixteenth entry of a head repacks that head's checkpoint, and the last
+CTA of each batch row advances its history length. Batch size, slot-pool
+capacity, and cache/projection row strides are runtime parameters. With
+PDL, checkpoint and history loads overlap the preceding kernel.
 
 ## DSpark decoding
 
@@ -67,8 +71,9 @@ speculative_config:
 Verification uses the primary NVFP4 checkpoint and native NVFP4 projections,
 as ordinary decode does. It writes candidate K/U/G and compact raw Conv
 inputs without changing either live checkpoint or accepted history length.
-One post-sampling Triton launch commits the accepted Conv prefix across all
-local KDA layers and advances their history lengths. Rejected candidates
+One post-sampling CuTe DSL launch commits the accepted Conv prefix across all
+local KDA layers, advances their history lengths, and repacks the checkpoint
+of any history that reaches 16 tokens. Rejected candidates
 are ignored and overwritten by subsequent rounds.
 
 The single history allocation has capacity `16 + max_draft_len + 1`; there
