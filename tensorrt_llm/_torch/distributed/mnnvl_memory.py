@@ -1152,6 +1152,25 @@ class TpMnnvlMemory(MnnvlMemory):
         )
 
 
+class EpMnnvlMemory(MnnvlMemory):
+    """MNNVL memory shared by the ranks of a MoE expert-parallel group, ordered by EP rank.
+
+    Per-class state is separate from MnnvlMemory's, as for HelixCpMnnvlMemory.
+    """
+
+    @classmethod
+    def comm_process_group(cls, mapping: Mapping) -> Optional[Any]:
+        """ProcessGroup equivalent of comm_split_color_key for the non-MPI path."""
+        return mapping.moe_ep_group_pg
+
+    @classmethod
+    def comm_split_color_key(cls, mapping: Mapping) -> tuple[int, int]:
+        """Group ranks by PP, CP, MoE TP and MoE cluster, ordering each group by EP rank."""
+        color = (mapping.pp_rank * mapping.cp_size + mapping.cp_rank) * mapping.moe_tp_size
+        color = (color + mapping.moe_tp_rank) * mapping.moe_cluster_size + mapping.moe_cluster_rank
+        return color, mapping.moe_ep_rank
+
+
 def init_helix_cp_comm(mapping: Mapping) -> None:
     """Pre-initialize the Helix CP communicator.
 
