@@ -97,6 +97,27 @@ class FmhaParams:
     num_gen_tokens: int = 0
     # This layer's index within its KV-cache manager, from `attn.get_local_layer_idx(meta)`.
     local_layer_idx: int = 0
+    # Generation only, trtllm-gen only: the kernel query [num_tokens, num_heads_q, head_dim]
+    # with RoPE applied, in the generation kernels' query dtype, whose K/V the caller already
+    # appended to the cache. The op skips its decoder info and QKV preprocessing and runs only
+    # the kernel; qkv_input still names the layer's activation dtype.
+    prepared_query: Optional[torch.Tensor] = None
+    # Query heads of a prepared query; 0: the layer's. A segmented decode folds its draft
+    # tokens into the heads.
+    num_heads_q: int = 0
+    # Device scales of an FP8 prepared query: BMM1 [softmax scale, softmax scale * log2(e)]
+    # and the BMM2 output scale.
+    prepared_bmm1_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    prepared_bmm2_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    # The call's own page table [num_requests, 2, max_pages] (K and V pages of each request),
+    # in place of the layer's rows of `meta.kv_cache_block_offsets`.
+    kv_block_table: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
+    # Zero-initialized multi-CTA KV counters of a prepared-query call; None: the op's own.
+    multi_ctas_kv_counter: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
+    # Generation with one query token per request: receives the base-2 log-sum-exp
+    # [num_tokens, num_heads_q] of every (token, head) row, computed from the kernel's softmax
+    # statistics.
+    softmax_lse: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
 
 
 def get_spec_decoding_position_offsets(

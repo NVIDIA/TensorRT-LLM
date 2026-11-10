@@ -210,7 +210,7 @@ def _generation_step(use_gqa_decode_fmha: bool, cached: list, q_len: int):
         ([41000, 300, 40000, 39000], 7, None, "fold"),
         # a deferred prologue reaching another GQA decode library: it runs the prologue kernel itself
         ([5000], 7, "-gqa_split_kv", "append"),
-        # more: the module's prologue appends the FP8 K / V, trtllm-gen decodes
+        # more: the module's prologue appends the FP8 K / V, trtllm-gen decodes its prepared query
         ([900, 3000, 4100, 70, 8000], 7, None, "append"),
     ],
 )
@@ -221,19 +221,19 @@ def test_qwen3_next_generation_step_matches_stock(
         monkeypatch.setenv("TLLM_FMHA_LIBS", fmha_libs)
     taken = {"fold": [], "append": []}
     run_folded = GqaSplitKvFmha._run_folded
-    appended_preprocess = GqaDecodeFmha._appended_preprocess
+    plan_matches = GqaDecodeFmha._plan_matches
 
     def spy_folded(self, *args, **kwargs):
         taken["fold"].append(run_folded(self, *args, **kwargs))
         return taken["fold"][-1]
 
-    def spy_appended(self, *args, **kwargs):
-        result = appended_preprocess(self, *args, **kwargs)
-        taken["append"].append(result is not None)
+    def spy_appended(*args, **kwargs):
+        result = plan_matches(*args, **kwargs)
+        taken["append"].append(result)
         return result
 
     monkeypatch.setattr(GqaSplitKvFmha, "_run_folded", spy_folded)
-    monkeypatch.setattr(GqaDecodeFmha, "_appended_preprocess", spy_appended)
+    monkeypatch.setattr(GqaDecodeFmha, "_plan_matches", staticmethod(spy_appended))
 
     reference, reference_cache = _generation_step(False, cached, q_len)
     assert taken == {"fold": [], "append": []}

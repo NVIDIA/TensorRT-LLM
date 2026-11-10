@@ -8,9 +8,9 @@ configured. Without a fused context FMHA kernel for the configuration, the
 context phase would reach the unfused library, whose context path builds K/V
 from the current chunk only: the cached prefix would be dropped from attention
 and then overwritten by the chunk's write-back. ``unfused_is_supported``
-refuses that call with an error instead. A page size that only the trtllm-gen
-kernels outside the op read is declined by every native library, so selection
-continues to those kernels.
+refuses that call with an error instead. The trtllm-gen library serves paged
+KV at every page size: the cubin table carries 32-token pages, and NVRTC
+generates the kernels of the others.
 """
 
 import pytest
@@ -20,6 +20,7 @@ from fmha_test_utils import native_batch, native_forward_args
 from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 from tensorrt_llm._torch.attention.backends.fmha.trtllm_gen import TrtllmGenFmha
 from tensorrt_llm._torch.attention.backends.fmha.unfused import UnfusedFmha
+from tensorrt_llm._utils import get_sm_version
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -55,24 +56,22 @@ def test_generation_only_batch_skips_the_paged_context_refusal():
         assert _is_supported(FallbackFmha, batch)
 
 
-@pytest.mark.parametrize("fmha_cls", [FallbackFmha, TrtllmGenFmha, UnfusedFmha])
-def test_trtllm_gen_only_page_size_declines_paged_prefill(fmha_cls):
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not 100 <= get_sm_version() < 110,
+    reason="trtllm-gen kernels need an SM100-family GPU",
+)
+@pytest.mark.parametrize("tokens_per_block", [16, 64, 128])
+@pytest.mark.parametrize(
+    "num_contexts,num_generations", [(1, 0), (0, 2)], ids=["paged_prefill", "generation"]
+)
+def test_trtllm_gen_serves_page_sizes_outside_the_cubin_table(
+    tokens_per_block, num_contexts, num_generations
+):
     with native_batch(
         torch.bfloat16,
-        num_contexts=1,
-        num_generations=0,
+        num_contexts=num_contexts,
+        num_generations=num_generations,
         chunked_prefill=True,
-        extra_page_sizes=frozenset({32}),
+        tokens_per_block=tokens_per_block,
     ) as batch:
-        assert not _is_supported(fmha_cls, batch)
-
-
-def test_trtllm_gen_only_page_size_admits_generation():
-    with native_batch(
-        torch.bfloat16,
-        num_contexts=0,
-        num_generations=2,
-        chunked_prefill=True,
-        extra_page_sizes=frozenset({32}),
-    ) as batch:
-        assert _is_supported(FallbackFmha, batch)
+        assert _is_supported(TrtllmGenFmha, batch)

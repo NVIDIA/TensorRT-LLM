@@ -516,7 +516,6 @@ class FallbackFmha(PhasedFmha):
             trtllm_gen_jit_warmup=trtllm_gen_jit_warmup,
             helix_position_offsets=helix_position_offsets,
             helix_spec_tokens_valid=False,
-            uses_trtllm_gen_only_page_size=False,
             helix_is_inactive_rank=helix_is_inactive_rank,
             kv_cache_block_offsets=kv_cache_block_offsets,
             block_ids_per_seq=block_ids_per_seq,

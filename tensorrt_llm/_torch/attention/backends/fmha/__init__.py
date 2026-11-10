@@ -18,7 +18,6 @@ from .cute_dsl_mla import CuteDslMlaFmha
 from .fallback import NATIVE_FMHA_LIBS, FallbackFmha
 from .flash_mla import FlashMlaFmha
 from .flashinfer_sparse_mla import FlashInferSparseMlaFmha
-from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .fmha_v2 import FmhaV2Fmha
 from .fp4_mla import Fp4MlaFmha
 from .gqa_decode import GqaDecodeFmha
@@ -49,7 +48,6 @@ __all__ = [
     "FMHA_LIB_GROUPS",
     "FallbackFmha",
     "FlashInferSparseMlaFmha",
-    "FlashInferTrtllmGenFmha",
     "FlashMlaFmha",
     "Fmha",
     "FmhaCls",

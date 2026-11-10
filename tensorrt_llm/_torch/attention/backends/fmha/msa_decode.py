@@ -227,8 +227,8 @@ class MsaDecodeFmha(PhasedFmha):
     ) -> None:
         """Attend the full page table on trtllm-gen, for a dense M3 layer.
 
-        This is the kernel FlashInferTrtllmGenFmha runs, called directly rather
-        than through that library, which cannot address M3's pool. See the
+        The trtllm-gen decode kernel, called directly because the generic
+        trtllm-gen path cannot address M3's pool. See the
         trtllm_gen_dense_decode module docstring for why.
         """
         from ..sparse.minimax_m3.kernels.trtllm_gen_dense_decode import (

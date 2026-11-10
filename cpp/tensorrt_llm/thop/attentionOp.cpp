@@ -1274,6 +1274,7 @@ void MHA::prepareInputs(FmhaParams& p, bool isGen)
 
 void MHA::enqueueContext(FmhaParams& p, PhasedFmha<MHA>& fmha)
 {
+    TORCH_CHECK(!p.prepared_query.has_value(), "A prepared query is a generation-phase input.");
     auto const stream = at::cuda::getCurrentCUDAStream(p.getQueryInput().get_device());
     fmha.runContext(*this, p, stream);
     sync_check_cuda_error(stream);
@@ -1281,6 +1282,9 @@ void MHA::enqueueContext(FmhaParams& p, PhasedFmha<MHA>& fmha)
 
 void MHA::enqueueGeneration(FmhaParams& p, PhasedFmha<MHA>& fmha)
 {
+    TORCH_CHECK((!p.prepared_query.has_value() && !p.softmax_lse.has_value())
+            || &fmha == static_cast<PhasedFmha<MHA>*>(trtllmGen()),
+        "Only the trtllm-gen generation kernels take a prepared query or return softmax_lse.");
     auto const stream = at::cuda::getCurrentCUDAStream(p.getQueryInput().get_device());
     TLLM_CHECK_WITH_INFO(
         !p.attn.attention_chunk_size.has_value() || p.cyclic_attention_window_size >= p.max_past_kv_length,
@@ -2081,6 +2085,7 @@ INSTANTIATE_MLA_GENERATION_HELPERS(__nv_bfloat16)
 
 void MLA::enqueueContext(FmhaParams& p, PhasedFmha<MLA>& fmha)
 {
+    TORCH_CHECK(!p.prepared_query.has_value(), "MLA attention does not take a prepared query.");
     auto const stream = at::cuda::getCurrentCUDAStream(p.getQueryInput().get_device());
     fmha.runContext(*this, p, stream);
     sync_check_cuda_error(stream);
@@ -2088,6 +2093,8 @@ void MLA::enqueueContext(FmhaParams& p, PhasedFmha<MLA>& fmha)
 
 void MLA::enqueueGeneration(FmhaParams& p, PhasedFmha<MLA>& fmha)
 {
+    TORCH_CHECK(!p.prepared_query.has_value() && !p.softmax_lse.has_value(),
+        "MLA attention does not take a prepared query or return softmax_lse.");
     auto const stream = at::cuda::getCurrentCUDAStream(p.getQueryInput().get_device());
     fmha.runGeneration(*this, p, stream);
     {

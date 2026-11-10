@@ -7,15 +7,15 @@ they only run there because MsaPrefillFmha claims every M3 layer. MSA's kernel
 uses the context schedule, spending a 128-row Q tile on one decode token, while
 trtllm-gen has a generation tile scheduler for exactly this shape.
 
-FlashInferTrtllmGenFmha cannot be reused as-is. It reaches the pool through
+The generic trtllm-gen path cannot be reused as-is. It reaches the pool through
 build_trtllm_gen_kv_cache_metadata, which assumes each layer contributes
 exactly K+V to a pool slot. M3 packs K+V for every layer of a group into one
 slot, and sparse layers add an index-K sub-page on top, so there is no uniform
 per-layer stride and _kv_pool_mapping_offset is only a ranking, not an
 addressable offset. This module goes around that: it builds the same flat
 sub-page pool and [batch, 2, max_blocks] block table the kernel expects
-directly out of M3's own slot geometry, then calls the same flashinfer entry
-point the generic path calls.
+directly out of M3's own slot geometry, then calls FlashInfer's trtllm-gen
+decode entry point.
 """
 
 from __future__ import annotations
@@ -82,11 +82,13 @@ def _workspace(q_dtype: torch.dtype, num_heads: int, head_dim: int, num_kv_heads
     read, and the layout dict it builds, happen once instead of once per dense
     layer per step.
     """
-    from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
-        _get_generation_workspace_layout,
+    from tensorrt_llm._torch.attention.backends.fmha.utils import (
+        get_trtllm_gen_generation_workspace_layout,
     )
 
-    layout = _get_generation_workspace_layout(q_dtype, 1, 1, num_heads, head_dim, num_kv_heads, 0)
+    layout = get_trtllm_gen_generation_workspace_layout(
+        q_dtype, 1, 1, num_heads, head_dim, num_kv_heads, 0
+    )
     return int(layout["trtllm_gen_workspace_size"])
 
 

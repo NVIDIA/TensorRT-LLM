@@ -521,9 +521,7 @@ accepts separate Q/K/V only for cross attention or SageAttention, and `MLA`
 declines custom masks. Both then call `TrtllmAttention::checkFeatureParams()`,
 which declines raw FP8 E4M3 query input and runs the static `checkParams()`
 every `AttentionFeature` declares: `CustomMaskFeature` declines custom masks,
-`PagedKVCacheFeature` requires self-attention to update the KV cache and declines
-a paged prefill on a page size the KV manager lists in
-`trtllm_gen_extra_tokens_per_block`, `SpecDecodingFeature` declines a helix
+`PagedKVCacheFeature` requires self-attention to update the KV cache, `SpecDecodingFeature` declines a helix
 verify group whose KV straddles CP ranks, and `SparseMlaFeature` declines DSA
 and DeepSeek-V4 sparse MLA with an `fp8_ds_mla` KV cache or on SM120f.
 
@@ -664,9 +662,9 @@ The FMHA package is split by role:
   mixed context/generation batches, and skips its batch-size performance
   gate, only on the FP4 MLA 128-token KV pages when no other MLA
   generation library reads them (`_page_size_exclusive_to_cute_dsl`): the
-  fallback thop op has TRTLLM-Gen MLA generation kernels for 32-token pages
-  only, FlashInfer TRTLLM-Gen reads 128-token pages only when the KV cache
-  manager lists them in `trtllm_gen_extra_tokens_per_block`, and the opt-in
+  trtllm_gen library ships TRTLLM-Gen MLA generation cubins for 32-token pages
+  only and serves 128-token pages only when the KV cache manager lists them in
+  `trtllm_gen_extra_tokens_per_block`, and the opt-in
   PrimTS library reads them on SM100/SM103 from an FP8 or BF16 KV cache
   manager. Every other page size keeps the default routing.
 - `fmha/prims_ts_sparse_mla.py` runs DeepSeek-V4 generation on the vendored
@@ -690,17 +688,28 @@ The FMHA package is split by role:
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
 - `fmha/gqa_decode.py` serves the layers built with a `GqaDecodeSetup`:
-  `gqa_decode` is trtllm-gen that also consumes the module's FP8 KV append and
-  deferred prologue, and `gqa_kv_replica_fused`, `gqa_kv_replica`,
+  `gqa_decode` is native trtllm-gen that also consumes the module's FP8 KV
+  append and deferred prologue, and `gqa_kv_replica_fused`, `gqa_kv_replica`,
   `gqa_split_kv` and `gqa_segmented` take the generation calls their
   `_is_supported` declares with dedicated kernels (`fmha/gqa_*.py`). Their
   size conditions are evaluated at the upper bound of the selection-cache
   cell (`generation_selection_cell`).
-- `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
-  library.
+- The native trtllm-gen generation also takes a prepared query
+  (`FmhaParams.prepared_query`): RoPE applied, in the kernels' query dtype, K/V
+  already in the cache. The op then skips its decoder info and QKV
+  preprocessing and runs only the kernel, optionally over the call's own page
+  table (`kv_block_table`) and with folded heads (`num_heads_q`). With
+  `softmax_lse` it also returns the base-2 LSE of every row. The GQA decode
+  libraries run the module's KV-append plan this way, and the segmented and
+  KV-replica decodes run their per-segment attention this way.
 - The native op's libraries live one per module (`fmha/trtllm_gen.py`,
   `flash_mla.py`, `xqa.py`, `fmha_v2.py`, `mmha.py`, `unfused.py`);
   `fmha/fallback.py` holds the checks they share and the wrapper over them.
+  The trtllm-gen cubin table carries dense paged-KV kernels for 32-token pages
+  only. For any other page size the trtllm-gen runner generates the context
+  and generation kernels with NVRTC (`TllmGenFmhaKernel::shouldUseNvrtc()`),
+  except over an NVFP4 KV cache, and the TRTLLM-Gen JIT warmup compiles the
+  context ones before serving starts.
 - `fmha/registry.py` owns `TLLM_FMHA_LIBS` parsing and library ordering.
 
 Use `PhasedFmha` for libraries that implement one or more phase-specific entry

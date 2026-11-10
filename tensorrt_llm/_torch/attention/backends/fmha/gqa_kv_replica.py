@@ -31,6 +31,7 @@ import triton.language as tl
 from ....modules.fla.op import gdc_wait_with_memory_clobber
 from .gqa_kv_replica_fused import KvReplicaFusedState, kv_replica_fused_partial
 from .gqa_segmented_decode import draft_block, seg_geometry, segment_attention
+from .phased import FmhaParams
 
 # Channels of the KV group's exchange: 0 carries the q all-gather, 1 the all-to-all + merge.
 EXCHANGE_CHANNELS = 2
@@ -218,8 +219,8 @@ def _cp_prep_table(
             + dd
         )
         tl.store(seg_q + pid.to(tl.int64) * HH * D + e, tl.load(src, mask=em), mask=em)
-    if LAUNCH_WITH_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
+    # No early trigger: the trtllm-gen FMHA after this kernel may read seg_table / seg_lens before its dependency wait,
+    # so it starts only once this grid has finished.
 
 
 @triton.jit
@@ -337,11 +338,11 @@ def _cp_prep_draft(
         )
     tl.store(extra_o + (row.to(tl.int64) * HQL + h) * D + d, o_suf.to(extra_o.dtype.element_ty))
     tl.store(extra_lse + row.to(tl.int64) * HQL + h, lse_suf)
-    if LAUNCH_WITH_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
+    # No early trigger: the programs of this grid also write the trtllm-gen FMHA's segment tables (_cp_prep_table).
 
 
 def kv_replica_partial_merge_free(
+    params: FmhaParams,
     q_all: torch.Tensor,
     kv_pool: torch.Tensor,
     block_tables: torch.Tensor,
@@ -351,9 +352,8 @@ def kv_replica_partial_merge_free(
     cp_size: int,
     cp_rank: int,
     num_segments: int,
-    bmm1_scale: Union[float, torch.Tensor],
-    bmm2_scale: Union[float, torch.Tensor],
-    workspace: torch.Tensor,
+    bmm1_scale: torch.Tensor,
+    bmm2_scale: torch.Tensor,
     counter: torch.Tensor,
     enable_pdl: bool,
     out_dtype: torch.dtype = torch.bfloat16,
@@ -444,14 +444,13 @@ def kv_replica_partial_merge_free(
         launch_pdl=enable_pdl,
     )
     segment_attention(
+        params,
         seg_q,
-        kv_pool,
         seg_table,
         seg_lens,
         p_seg * page,
         bmm1_scale,
         bmm2_scale,
-        workspace,
         counter,
         seg_out,
         seg_lse,
@@ -524,6 +523,7 @@ def kv_replica_fused_decode(
 
 
 def kv_replica_decode(
+    params: FmhaParams,
     exchange,
     q: torch.Tensor,
     kv_pool: torch.Tensor,
@@ -532,9 +532,8 @@ def kv_replica_decode(
     max_kv_len: int,
     q_len: int,
     num_segments: int,
-    bmm1_scale: Union[float, torch.Tensor],
-    bmm2_scale: Union[float, torch.Tensor],
-    workspace: torch.Tensor,
+    bmm1_scale: torch.Tensor,
+    bmm2_scale: torch.Tensor,
     counter: torch.Tensor,
     out: torch.Tensor,
     enable_pdl: bool,
@@ -543,12 +542,13 @@ def kv_replica_decode(
     """KV-replica split generation attention of this rank's heads, partials from the segmented trtllm-gen decode.
 
     As kv_replica_fused_decode; no local merge kernel: the FMHA partials (num_segments per member) and the own-head
-    draft partial go straight into the one-launch all-to-all + merge.
+    draft partial go straight into the one-launch all-to-all + merge. params: the layer's generation call.
     """
     cp, cp_rank = exchange.group_size, exchange.grank
     rows, hq, d = q.shape
     q_all = _allgather_q(exchange, q, enable_pdl)
     o, lse, extra_o, extra_lse, valid = kv_replica_partial_merge_free(
+        params,
         q_all,
         kv_pool,
         block_tables,
@@ -560,7 +560,6 @@ def kv_replica_decode(
         num_segments,
         bmm1_scale,
         bmm2_scale,
-        workspace,
         counter,
         enable_pdl,
         out_dtype=out.dtype,

@@ -3252,12 +3252,13 @@ def test_minimax_m3_swiglu_oai_fused_matches_reference(dtype):
 @pytest.mark.parametrize(
     "libraries,available,extra_pages_only,use_native",
     [
-        ("flashinfer_trtllm_gen,fallback", True, False, True),
-        ("fallback,flashinfer_trtllm_gen", True, False, False),
-        ("fallback", True, False, False),
-        ("flashinfer_trtllm_gen,fallback", False, False, False),
-        # SM107: the library serves only extra page sizes; dense layers keep SDPA.
-        ("flashinfer_trtllm_gen,fallback", True, True, False),
+        ("fallback", True, False, True),
+        # Another native library ahead of trtllm_gen cannot serve P128 cached prefill.
+        ("fmha_v2,trtllm_gen", True, False, False),
+        ("-trtllm_gen", True, False, False),
+        ("fallback", False, False, False),
+        # SM107: only the Eagle3 draft layers run on trtllm-gen; dense layers keep SDPA.
+        ("fallback", True, True, False),
     ],
 )
 def test_minimax_m3_dense_backend_library_order(
@@ -3274,12 +3275,7 @@ def test_minimax_m3_dense_backend_library_order(
     construct = Mock(return_value=native)
     monkeypatch.setattr(model_module, "TrtllmAttention", construct)
     monkeypatch.setattr(
-        model_module.FlashInferTrtllmGenFmha,
-        "is_environment_available",
-        classmethod(lambda cls: available),
-    )
-    monkeypatch.setattr(
-        model_module.FlashInferTrtllmGenFmha,
+        model_module.TrtllmGenFmha,
         "is_available",
         classmethod(lambda cls, attn: available),
     )
@@ -3301,7 +3297,7 @@ def test_minimax_m3_dense_backend_library_order(
     )
     assert layer.attn is (native if use_native else legacy)
     assert layer.support_fused_qkv is use_native
-    if libraries == "flashinfer_trtllm_gen,fallback" and available and not extra_pages_only:
+    if libraries == "fallback" and not extra_pages_only:
         construct.assert_called_once()
         assert construct.call_args.kwargs["pos_embd_params"] is None
     else:

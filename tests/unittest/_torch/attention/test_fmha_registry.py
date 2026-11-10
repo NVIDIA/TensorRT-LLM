@@ -35,8 +35,7 @@ def _enabled_names() -> tuple[str, ...]:
 
 def test_prims_ts_precedes_trtllm_gen_in_canonical_order() -> None:
     names = _canonical_names()
-    assert names.index(PRIMS_TS) < names.index("flashinfer_trtllm_gen")
-    assert names.index(PRIMS_TS_SPARSE_MLA) < names.index("flashinfer_trtllm_gen")
+    assert names.index(PRIMS_TS) < names.index("trtllm_gen")
     assert names.index(PRIMS_TS_SPARSE_MLA) < names.index("trtllm_gen")
 
 

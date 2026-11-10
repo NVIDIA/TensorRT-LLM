@@ -31,6 +31,7 @@
 #include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaMaskSelection.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaSoftmaxStatsToLse.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/thop/attentionVariant.h"
 
@@ -1076,7 +1077,16 @@ void TrtllmGenFmha<MHA>::runGenerationImpl(MHA const& op, FmhaParams const& p, c
     int const num_kv_heads = op.mNumAttnKVHeads;
     int const head_size = op.mHeadSize;
     TLLM_CHECK_WITH_INFO(num_q_heads % num_kv_heads == 0, "numQHeads should be multiple of numKVHeads.");
-    unsigned int const num_q_heads_over_kv = num_q_heads / num_kv_heads;
+    // A prepared query (FmhaParams::prepared_query) already has RoPE applied and the kernel's dtype, and its K/V
+    // are in the cache: only the kernel runs, over the call's page table, possibly with draft tokens folded into
+    // its heads (num_heads_q).
+    bool const preparedQuery = p.prepared_query.has_value();
+    TLLM_CHECK_WITH_INFO(!preparedQuery || !multiQueryTokens,
+        "A prepared-query generation call does not take speculative-decoding lengths.");
+    int const kernel_num_q_heads = preparedQuery && p.num_heads_q > 0 ? static_cast<int>(p.num_heads_q) : num_q_heads;
+    TLLM_CHECK_WITH_INFO(
+        kernel_num_q_heads % num_kv_heads == 0, "The prepared query heads should be a multiple of numKVHeads.");
+    unsigned int const num_q_heads_over_kv = kernel_num_q_heads / num_kv_heads;
     int const batch_size = static_cast<int>(p.num_requests);
     unsigned int const beam_width = p.meta.effective_beam_width;
     unsigned int const batch_beam_size = batch_size * beam_width;
@@ -1141,7 +1151,7 @@ void TrtllmGenFmha<MHA>::runGenerationImpl(MHA const& op, FmhaParams const& p, c
     float const* rotary_inv_freq_buf = p.getRotaryInvFreq();
     // Use the nullptr for cu_seqlens when it is not computed.
     int const* cu_seqlens{nullptr};
-    if (decoder_params.isBuildDecoderInfoKernelNeeded())
+    if (!preparedQuery && decoder_params.isBuildDecoderInfoKernelNeeded())
     {
         rotary_inv_freq_buf = rotary_inv_freq_workspace;
         cu_seqlens = cu_seq_lens;
@@ -1215,8 +1225,23 @@ void TrtllmGenFmha<MHA>::runGenerationImpl(MHA const& op, FmhaParams const& p, c
     // Cross-attention only.
     preprocessingParms.encoder_seq_lens = cross_attention ? sequence_lengths : nullptr;
 
-    invokeQKVPreprocessing<T, KVBlockArray>(preprocessingParms, stream);
-    sync_check_cuda_error(stream);
+    if (preparedQuery)
+    {
+        auto const& query = p.prepared_query.value();
+        TLLM_CHECK_WITH_INFO(query.is_contiguous() && query.numel() == p.num_tokens * kernel_num_q_heads * head_size,
+            "The prepared query must be a contiguous [num_tokens, num_heads_q, head_size] tensor.");
+        bool const queryIsFp8 = query.scalar_type() == torch::kFloat8_e4m3fn;
+        TLLM_CHECK_WITH_INFO(queryIsFp8 == (mGenerationQDataType == DATA_TYPE_E4M3),
+            "The prepared query must have the dtype of the generation kernels' query.");
+        TLLM_CHECK_WITH_INFO(
+            !queryIsFp8 || (p.getPreparedBmm1Scale() != nullptr && p.getPreparedBmm2Scale() != nullptr),
+            "An FP8 prepared query requires prepared_bmm1_scale and prepared_bmm2_scale.");
+    }
+    else
+    {
+        invokeQKVPreprocessing<T, KVBlockArray>(preprocessingParms, stream);
+        sync_check_cuda_error(stream);
+    }
 
     // Build runner parameters.
     TllmGenFmhaRunnerParams tllmRunnerParams{};
@@ -1232,7 +1257,7 @@ void TrtllmGenFmha<MHA>::runGenerationImpl(MHA const& op, FmhaParams const& p, c
     tllmRunnerParams.seqLensKvPtr = sequence_lengths;
 
     // Q buffer.
-    tllmRunnerParams.qPtr = xqa_q_input_ptr;
+    tllmRunnerParams.qPtr = preparedQuery ? p.prepared_query.value().data_ptr() : xqa_q_input_ptr;
 
     // Use block sparse attention.
     tllmRunnerParams.mUseBlockSparseAttention = false;
@@ -1267,8 +1292,9 @@ void TrtllmGenFmha<MHA>::runGenerationImpl(MHA const& op, FmhaParams const& p, c
     }
 
     // The partial buffers' pointers when the multiCtasKv mode is enabled.
-    tllmRunnerParams.multiCtasKvCounterPtr
-        = op.getMultiCtasKvCounter(p.getMaxNumSequences(), p.getQueryInput().device());
+    tllmRunnerParams.multiCtasKvCounterPtr = preparedQuery && p.getMultiCtasKvCounter() != nullptr
+        ? p.getMultiCtasKvCounter()
+        : op.getMultiCtasKvCounter(p.getMaxNumSequences(), p.getQueryInput().device());
     tllmRunnerParams.multiCtasKvScratchPtr = scratch;
 
     tllmRunnerParams.attentionSinksPtr = p.getAttentionSinks();
@@ -1277,8 +1303,9 @@ void TrtllmGenFmha<MHA>::runGenerationImpl(MHA const& op, FmhaParams const& p, c
     // Attention scales device pointers (only fp8 kernels need to load scales from the device memory).
     if (mGenerationQDataType == DATA_TYPE_E4M3)
     {
-        tllmRunnerParams.outputScalePtr = bmm2_scale_ptr;
-        tllmRunnerParams.scaleSoftmaxLog2Ptr = bmm1_scale_ptr ? bmm1_scale_ptr + kIdxScaleSoftmaxLog2Ptr : nullptr;
+        float const* bmm1Scale = preparedQuery ? p.getPreparedBmm1Scale() : bmm1_scale_ptr;
+        tllmRunnerParams.outputScalePtr = preparedQuery ? p.getPreparedBmm2Scale() : bmm2_scale_ptr;
+        tllmRunnerParams.scaleSoftmaxLog2Ptr = bmm1Scale ? bmm1Scale + kIdxScaleSoftmaxLog2Ptr : nullptr;
     }
     tllmRunnerParams.oSfScalePtr = p.getOutSfScale();
 
@@ -1286,7 +1313,7 @@ void TrtllmGenFmha<MHA>::runGenerationImpl(MHA const& op, FmhaParams const& p, c
     tllmRunnerParams.oSfPtr = p.getOutputSf();
     tllmRunnerParams.mHeadDimQk = head_size;
     tllmRunnerParams.mHeadDimV = head_size;
-    tllmRunnerParams.mNumHeadsQ = num_q_heads;
+    tllmRunnerParams.mNumHeadsQ = kernel_num_q_heads;
     tllmRunnerParams.mNumHeadsKv = num_kv_heads;
     tllmRunnerParams.mNumHeadsQPerKv = num_q_heads_over_kv;
     tllmRunnerParams.mBatchSize = batch_size;
@@ -1382,7 +1409,32 @@ void TrtllmGenFmha<MHA>::runGenerationImpl(MHA const& op, FmhaParams const& p, c
     tllmRunnerParams.mSkipSoftmaxThresholdScaleFactor
         = static_cast<float>(p.fwd.sparse_runtime_params.threshold_scale_factor_decode);
     tllmRunnerParams.softmaxStatsPtr = p.getSoftmaxStatsTensor();
+    // The base-2 LSE of every row comes from the softmax statistics the kernel stores, in a buffer of
+    // their own when the call asks for none.
+    float* const softmaxLse = p.getSoftmaxLse();
+    torch::Tensor lseStats;
+    if (softmaxLse != nullptr)
+    {
+        TLLM_CHECK_WITH_INFO(p.input_seq_length == 1, "softmax_lse requires one query token per request.");
+        TLLM_CHECK_WITH_INFO(
+            p.softmax_lse->is_contiguous() && p.softmax_lse->numel() == p.num_tokens * kernel_num_q_heads,
+            "softmax_lse must be a contiguous [num_tokens, num_heads_q] float32 tensor.");
+        if (tllmRunnerParams.softmaxStatsPtr == nullptr)
+        {
+            // The kernels may touch up to kSoftmaxStatsGuardBytes past the [tokens, heads] statistics.
+            constexpr int64_t kSoftmaxStatsGuardBytes = 1 << 20;
+            lseStats = torch::empty(
+                {p.num_tokens * kernel_num_q_heads * static_cast<int64_t>(sizeof(float2)) + kSoftmaxStatsGuardBytes},
+                p.getQueryInput().options().dtype(torch::kUInt8));
+            tllmRunnerParams.softmaxStatsPtr = static_cast<float2*>(lseStats.data_ptr());
+        }
+    }
     mGenerationRunner->run(tllmRunnerParams);
+    if (softmaxLse != nullptr)
+    {
+        invokeFmhaSoftmaxStatsToLse(tllmRunnerParams.softmaxStatsPtr, softmaxLse, static_cast<int32_t>(p.num_tokens),
+            kernel_num_q_heads, kernel_num_q_heads, 1, stream);
+    }
 }
 
 template <>

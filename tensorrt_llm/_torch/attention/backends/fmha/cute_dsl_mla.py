@@ -272,10 +272,10 @@ class CuteDslMlaFmha(PhasedFmha):
         """Whether this layer's FP4 MLA 128-token KV pages are read by no other MLA generation library.
 
         Only ``FP4_MLA_TOKENS_PER_BLOCK`` can count as exclusive; every other
-        page size keeps the default routing. The fallback thop op has
-        TRTLLM-Gen MLA generation kernels for 32-token pages only. FlashInfer
-        TRTLLM-Gen reads 128-token pages only when the KV cache manager lists
-        them in ``trtllm_gen_extra_tokens_per_block``. PrimTS reads them on its
+        page size keeps the default routing. The trtllm_gen library ships
+        TRTLLM-Gen MLA generation cubins for 32-token pages only; the kernels it
+        generates with NVRTC for other page sizes count only where the KV cache
+        manager lists the page size in ``trtllm_gen_extra_tokens_per_block``. PrimTS reads them on its
         SMs from an FP8 or BF16 KV cache manager; it is opt-in, but it counts
         whether or not it is enabled.
         """

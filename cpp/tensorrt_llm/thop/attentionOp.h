@@ -321,9 +321,14 @@ struct FmhaParams
 
     // ---- hand-written accessors: sizes, derived pointers, and anything taking an index ----
     // Sequence lengths, windows, and paged-KV metadata.
-    /// Block offsets for this phase's sequences; `seq_offset` is applied here.
+    /// Block offsets for this phase's sequences; `seq_offset` is applied here. A call's own
+    /// page table (`kv_block_table`) replaces the layer's pool rows.
     [[nodiscard]] kernels::KVBlockArray::DataType* getKvCacheBlockOffsets(int32_t poolIndex) const
     {
+        if (kv_block_table.has_value())
+        {
+            return static_cast<kernels::KVBlockArray::DataType*>(kv_block_table.value().data_ptr());
+        }
         return meta.kv_cache_block_offsets.has_value() ? static_cast<kernels::KVBlockArray::DataType*>(
                    meta.kv_cache_block_offsets.value().index({poolIndex, seq_offset}).data_ptr())
                                                        : nullptr;
@@ -414,6 +419,10 @@ struct FmhaParams
 
     [[nodiscard]] int getMaxBlocksPerSequence() const
     {
+        if (kv_block_table.has_value())
+        {
+            return static_cast<int>(kv_block_table.value().size(-1));
+        }
         return meta.kv_cache_block_offsets.has_value() ? static_cast<int>(meta.kv_cache_block_offsets.value().size(-1))
                                                        : 0;
     }

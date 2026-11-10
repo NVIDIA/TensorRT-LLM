@@ -21,20 +21,18 @@ At small batch the trtllm-gen in-kernel split-KV reduction dominates. Instead:
   3. merge (Triton): LSE-weighted combine of the S segments plus the causal draft block KV[L - q_len, L) in fp32.
 """
 
+import dataclasses
 import math
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from tensorrt_llm.bindings.internal import thop
 
 from ....modules.fla.op import gdc_wait_with_memory_clobber
-from .flashinfer_trtllm_gen import _get_bmm1_scale_log2
-
-if IS_FLASHINFER_AVAILABLE:
-    import flashinfer
+from .phased import FmhaParams
 
 LOG2E = 1.4426950408889634
 
@@ -117,8 +115,8 @@ def _seg_prep_kernel(
     g = rem % G
     src = q + (r * QL + t).to(tl.int64) * q_stride_tok + (kvh * G + g) * q_stride_head + dd
     tl.store(seg_q + pid.to(tl.int64) * HH * D + e, tl.load(src, mask=em), mask=em)
-    if LAUNCH_WITH_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
+    # No early trigger: the trtllm-gen FMHA after this kernel may read seg_table / seg_lens before its dependency wait,
+    # so it starts only once this grid has finished.
 
 
 @triton.jit
@@ -288,66 +286,56 @@ def _seg_merge_kernel(
 
 
 def segment_attention(
+    params: FmhaParams,
     seg_q: torch.Tensor,
-    kv_pool: torch.Tensor,
     seg_table: torch.Tensor,
     seg_lens: torch.Tensor,
     max_seg_len: int,
-    bmm1_scale: Union[float, torch.Tensor],
-    bmm2_scale: Union[float, torch.Tensor],
-    workspace: torch.Tensor,
+    bmm1_scale: torch.Tensor,
+    bmm2_scale: torch.Tensor,
     counter: torch.Tensor,
     seg_out: torch.Tensor,
     seg_lse: torch.Tensor,
 ) -> None:
     """trtllm-gen decode of every segment as a one-token request of seg_q's folded heads, with its base-2 LSE.
 
-    Calls FlashInfer's trtllm-gen decode op directly (the op behind ``trtllm_batch_decode_with_kv_cache``), skipping
-    the public wrapper's per-call argument validation. Launched without PDL: the FMHA may read the segment tables /
-    lengths, which the kernel right before it writes, before its dependency wait.
+    Runs the layer's native trtllm-gen generation (``params``, the call the segments split) on the prepared folded
+    query over the segment page table. The FMHA may read the segment tables / lengths, which the kernel right before
+    it writes, before its dependency wait; that kernel therefore does not trigger its dependents early, and the FMHA
+    starts once it has finished.
     """
     num_requests, num_heads, _ = seg_q.shape
-    sm_count = flashinfer.decode.get_device_sm_count(seg_q.device)
-    assert counter.numel() * counter.element_size() >= 4 * max(
-        num_requests * num_heads, sm_count
-    ), "multi-CTA counter buffer too small for the segment attention call"
-    flashinfer.decode.get_trtllm_gen_fmha_module().trtllm_paged_attention_decode(
-        seg_out,
-        None,  # out_scale_factor
-        seg_q,
-        kv_pool,
-        kv_pool,
-        workspace,
-        counter,
-        seg_table,
-        seg_lens,
-        1,  # max_q_len
-        max_seg_len,
-        _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale,
-        bmm2_scale,
-        -1.0,  # o_sf_scale
-        -1,  # o_sf_vec_size
-        0,  # o_sf_start_index
-        num_requests,
-        -1,  # window_left
-        0,  # sparse_mla_top_k
-        sm_count,
-        False,  # enable_pdl
-        workspace.numel() * workspace.element_size(),
-        None,  # sinks
-        None,  # cum_seq_lens_q
-        None,  # k_block_scales
-        None,  # v_block_scales
-        None,  # skip_softmax_threshold_scale_factor
-        False,  # uses_shared_paged_kv_idx
-        seg_lse,
-        1.0,  # lse_scale
-        seg_lse.stride(0),
-        seg_lse.stride(1),
-        False,  # enable_block_sparse_attention
-        None,  # sparse_mla_top_k_lens
-        0,  # bf16q_fp8kv_transform_mode (FP8 query)
-        None,  # use_fp16_softmax
+    assert counter.numel() * counter.element_size() >= 4 * num_requests * num_heads, (
+        "multi-CTA counter buffer too small for the segment attention call"
+    )
+    thop.trtllm_gen_run_generation(
+        dataclasses.replace(
+            params,
+            prepared_query=seg_q,
+            num_heads_q=num_heads,
+            prepared_bmm1_scale=bmm1_scale,
+            prepared_bmm2_scale=bmm2_scale,
+            kv_block_table=seg_table,
+            multi_ctas_kv_counter=counter,
+            softmax_lse=seg_lse,
+            output=seg_out,
+            sequence_lengths=seg_lens,
+            context_lengths=None,
+            num_tokens=num_requests,
+            batch_size=num_requests,
+            num_requests=num_requests,
+            input_seq_length=1,
+            max_past_kv_length=max_seg_len,
+            seq_offset=0,
+            token_offset=0,
+            use_spec_decoding=False,
+            spec_decoding_generation_lengths=None,
+            spec_decoding_position_offsets=None,
+            spec_decoding_packed_mask=None,
+            spec_decoding_bl_tree_mask_offset=None,
+            spec_decoding_bl_tree_mask=None,
+            spec_bl_tree_first_sparse_mask_offset_kv=None,
+        )
     )
 
 
@@ -380,6 +368,7 @@ def segmented_decode_supported(
 
 
 def segmented_decode(
+    params: FmhaParams,
     q: torch.Tensor,
     kv_pool: torch.Tensor,
     block_tables: torch.Tensor,
@@ -388,9 +377,8 @@ def segmented_decode(
     q_len: int,
     num_kv_heads: int,
     num_segments: int,
-    bmm1_scale: Union[float, torch.Tensor],
-    bmm2_scale: Union[float, torch.Tensor],
-    workspace: torch.Tensor,
+    bmm1_scale: torch.Tensor,
+    bmm2_scale: torch.Tensor,
     counter: torch.Tensor,
     out: torch.Tensor,
     enable_pdl: bool,
@@ -399,9 +387,10 @@ def segmented_decode(
     """Segmented generation attention; writes `out` [b * q_len, Hq, D].
 
     Args:
-        q: [b * q_len, Hq, D] (FP8 when the KV cache is FP8); kv_pool: [blocks, Hkv, page, D].
+        params: The layer's generation call, whose K / V are in the cache.
+        q: [b * q_len, Hq, D] FP8 query; kv_pool: [blocks, Hkv, page, D] FP8.
         block_tables: [b, 2, max_pages] K / V page indices; seq_lens: [b] KV lengths including the new tokens.
-        bmm1_scale: float or the trtllm-gen [raw, log2] scale tensor.
+        bmm1_scale: the trtllm-gen [raw, log2] scale tensor; bmm2_scale: the output scale tensor.
         counter: zero-initialized trtllm-gen multi-CTA counters for b * num_segments requests of the folded heads.
         gate: [b * q_len, Hq, D] or [b * q_len, Hq * D]; the output is multiplied by sigmoid(gate).
     """
@@ -448,14 +437,13 @@ def segmented_decode(
         launch_pdl=enable_pdl,
     )
     segment_attention(
+        params,
         seg_q,
-        kv_pool,
         seg_table,
         seg_lens,
         p_seg * page,
         bmm1_scale,
         bmm2_scale,
-        workspace,
         counter,
         seg_out,
         seg_lse,

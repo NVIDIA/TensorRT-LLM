@@ -177,7 +177,6 @@ def native_batch(
     num_generations: int,
     chunked_prefill: bool = False,
     tokens_per_block: int = 32,
-    extra_page_sizes: frozenset[int] = frozenset(),
 ) -> Iterator[tuple[TrtllmAttention, TrtllmAttentionMetadata, torch.Tensor]]:
     """A TrtllmAttention layer and one prepared batch over a real KV cache.
 
@@ -197,7 +196,6 @@ def native_batch(
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         dtype=torch_dtype_to_binding(dtype),
     )
-    manager.trtllm_gen_extra_tokens_per_block = extra_page_sizes
     try:
         num_seqs = num_contexts + num_generations
         is_gen = [i >= num_contexts for i in range(num_seqs)]

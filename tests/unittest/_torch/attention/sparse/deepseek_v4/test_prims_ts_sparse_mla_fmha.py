@@ -58,7 +58,6 @@ def test_registry_entry_is_default_before_fallback(monkeypatch) -> None:
     assert registry.FMHA_LIBS[LIB_NAME] is PrimsTSSparseMlaFmha
     assert LIB_NAME in registry.DEFAULT_FMHA_LIBS
     names = tuple(registry.FMHA_LIBS)
-    assert names.index(LIB_NAME) < names.index("flashinfer_trtllm_gen")
     assert names.index(LIB_NAME) < names.index("trtllm_gen")
     assert PrimsTSSparseMlaFmha in registry.get_enabled_fmha_lib_classes()
     monkeypatch.setenv("TLLM_FMHA_LIBS", f"-{LIB_NAME}")

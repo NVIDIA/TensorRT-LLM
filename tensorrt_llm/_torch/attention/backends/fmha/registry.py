@@ -17,7 +17,6 @@ import os
 from typing import TypeAlias
 
 from .cute_dsl_mla import CuteDslMlaFmha
-from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .fp4_mla import Fp4MlaFmha
 from .interface import Fmha
 from .prims_ts import PrimsTSFmha
@@ -70,13 +69,12 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         # sees it; everything else keeps the TRTLLM-Gen libraries below.
         "prims_ts_sparse_mla": PrimsTSSparseMlaFmha,
         # GQA decode layers (GqaDecodeSetup) only: dedicated generation kernels in order of precedence, then
-        # trtllm-gen with the module's KV append / deferred prologue.
+        # native trtllm-gen with the module's KV append / deferred prologue.
         "gqa_kv_replica_fused": GqaKvReplicaFusedFmha,
         "gqa_kv_replica": GqaKvReplicaFmha,
         "gqa_split_kv": GqaSplitKvFmha,
         "gqa_segmented": GqaSegmentedFmha,
         "gqa_decode": GqaDecodeFmha,
-        "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
         # The native attention op's libraries. One order serves MHA and MLA:
         # fmha_v2 serves no MHA generation and XQA no context phase.
         "trtllm_gen": TrtllmGenFmha,

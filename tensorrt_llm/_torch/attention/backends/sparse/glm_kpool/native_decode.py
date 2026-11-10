@@ -42,14 +42,14 @@ class GlmKpoolNativeDecode:
     ) -> None:
         from flashinfer.utils import get_trtllm_gen_multi_ctas_kv_counter_bytes
 
-        from ...fmha.flashinfer_trtllm_gen import _get_generation_workspace_layout
+        from ...fmha.utils import get_trtllm_gen_generation_workspace_layout
 
         capturing = torch.cuda.is_current_stream_capturing()
         rows = max(max_query_rows, self._covered_rows)
         heads = max(q.shape[1], self._covered_heads)
         if (rows, heads) != (self._covered_rows, self._covered_heads):
             # Host-side queries; rerun only when the rows or heads outgrow the sizes.
-            layout = _get_generation_workspace_layout(
+            layout = get_trtllm_gen_generation_workspace_layout(
                 query_dtype or q.dtype, rows, rows, heads, 512, 1, 0
             )
             sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
