@@ -498,7 +498,7 @@ support at `max_seq_len`, so the choice holds for every KV history length that
 shares a selection cache key. Whether XQA is expected to outrun MMHA weighs the
 call's batch against its KV history; `XqaFmha.has_perf_gain` asks
 `thop.xqa_has_perf_gain` once per batch, history block and speculative mode,
-and `FmhaManager` keys selection on the answer. The native
+and `FmhaManager` keys selection on the answer once a selection reaches XQA. The native
 carrier behind the entry points is per host thread and never visible to
 Python. Generated nanobind readers
 (`scripts/generate_fmha_params.py`) copy the fields C++ reads from `attn`,

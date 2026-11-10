@@ -334,8 +334,16 @@ bool xqaHasPerfGain(nb::handle source)
         {
             if (p.attn.is_mla_enable)
             {
+                if (!torch_ext::MLA::checkParams(p, /*isGen=*/true))
+                {
+                    return false;
+                }
                 auto& op = getOp<torch_ext::MLA>(p);
                 return op.isFmhaSupported(op.xqa(), p, /*isGen=*/true) && op.xqa()->hasPerfGain(p);
+            }
+            if (!torch_ext::MHA::checkParams(p, /*isGen=*/true))
+            {
+                return false;
             }
             auto& op = getOp<torch_ext::MHA>(p);
             return op.isFmhaSupported(op.xqa(), p, /*isGen=*/true) && op.xqa()->hasPerfGain(p);

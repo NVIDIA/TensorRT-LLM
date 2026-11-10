@@ -28,6 +28,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PredefinedAttentionMask,
     RopeParams,
 )
+from tensorrt_llm._utils import is_sm_120f
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
@@ -51,7 +52,12 @@ if TYPE_CHECKING:
 
 def is_native_op_available(attn: "TrtllmAttention", *, serves_mha: bool, serves_mla: bool) -> bool:
     """Whether a library of the native op serves this layer's attention variant."""
-    return serves_mla if attn.is_mla_enable else serves_mha
+    if not (serves_mla if attn.is_mla_enable else serves_mha):
+        return False
+    if getattr(attn.sparse_params, "algorithm", None) in ("deepseek_v4", "dsa"):
+        if getattr(attn, "kv_cache_dtype", None) == "fp8_ds_mla" or is_sm_120f():
+            return False
+    return True
 
 
 def is_native_call_supported(
