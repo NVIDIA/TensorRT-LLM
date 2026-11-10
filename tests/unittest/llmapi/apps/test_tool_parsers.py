@@ -43,6 +43,7 @@ from tensorrt_llm.serve.tool_parser.glm47_parser import Glm47ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser import KimiK3ToolParser
 from tensorrt_llm.serve.tool_parser.minimax_m2_parser import MiniMaxM2ToolParser
+from tensorrt_llm.serve.tool_parser.minimax_m3_parser import MiniMaxM3ToolParser
 from tensorrt_llm.serve.tool_parser.poolside_v1_parser import \
     PoolsideV1ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
@@ -8665,3 +8666,55 @@ def test_deepseek_streaming_reports_each_call_of_the_last_increment(
 
     assert len(streamed) > 1
     assert streamed == _whole_calls(test.make_parser(), text, sample_tools)
+
+
+def _minimax_m2_invoke(name, key, value):
+    """A MiniMax-M2 invocation of ``name`` with one parameter."""
+    return (f'<invoke name="{name}">'
+            f'<parameter name="{key}">{value}</parameter></invoke>')
+
+
+def _minimax_m3_invoke(name, key, value):
+    """A MiniMax-M3 invocation of ``name`` with one parameter."""
+    ns = "]<]minimax[>["
+    return (f'{ns}<invoke name="{name}">'
+            f'{ns}<{key}>{value}{ns}</{key}>{ns}</invoke>')
+
+
+# Per MiniMax format: the parser, the tags that open and close a tool-call
+# block, and the invocation builder.
+_MINIMAX_FORMATS = {
+    "m2": (MiniMaxM2ToolParser, "<minimax:tool_call>", "</minimax:tool_call>",
+           _minimax_m2_invoke),
+    "m3": (MiniMaxM3ToolParser, "]<]minimax[>[<tool_call>",
+           "]<]minimax[>[</tool_call>", _minimax_m3_invoke),
+}
+
+
+@pytest.mark.parametrize("model", ["m2", "m3"])
+@pytest.mark.parametrize(
+    "calls", ["one_call", "two_calls_in_a_block", "a_block_per_call"])
+def test_minimax_streaming_reports_each_call_of_a_reply_in_one_increment(
+        sample_tools, model, calls):
+    """A reply in one increment: the stream and finish() give each call once.
+
+    The calls share one tool-call block or each have their own. They are those
+    detect_and_parse reads from the same text.
+    """
+    parser_cls, opener, closer, invoke = _MINIMAX_FORMATS[model]
+    weather = invoke("get_weather", "location", "NYC")
+    search = invoke("search_web", "query", "AI news")
+
+    def block(*invokes):
+        return opener + "".join(invokes) + closer
+
+    text = "Checking. " + {
+        "one_call": block(weather),
+        "two_calls_in_a_block": block(weather, search),
+        "a_block_per_call": block(weather) + block(search),
+    }[calls]
+
+    streamed = _streamed_calls(parser_cls(), [text], sample_tools)
+
+    assert len(streamed) == (1 if calls == "one_call" else 2)
+    assert streamed == _whole_calls(parser_cls(), text, sample_tools)
