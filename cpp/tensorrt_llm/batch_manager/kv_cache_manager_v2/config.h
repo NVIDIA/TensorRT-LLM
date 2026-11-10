@@ -100,15 +100,15 @@ struct DiskCacheTierConfig
     size_t quota = 0; // bytes
     std::string path; // directory for temp files
 
-    // Worker threads for asynchronous disk I/O. Process-wide: the first nonzero value starts the pool for the life
-    // of the process, and later values, including 0, do not change it. Without a pool, disk I/O is synchronous.
+    //! Worker threads for asynchronous disk I/O. Process-wide: the first nonzero value starts the pool for the life
+    //! of the process, and later values, including 0, do not change it. Without a pool, disk I/O is synchronous.
     int numIoThreads = 0;
 
-    // Keep a committed page's disk copy after a restore, so its next eviction to disk writes nothing.
+    //! Keep a committed page's disk copy after a restore, so its next eviction to disk writes nothing.
     bool keepCopyAfterRestore = false;
 
-    // Also copy pages evicted GPU -> host to disk in the background, into free disk slots only and behind restores
-    // and required writes. Requires numIoThreads > 0.
+    //! Also copy pages evicted GPU -> host to disk in the background, into free disk slots only and behind restores
+    //! and required writes. Requires numIoThreads > 0 and a host tier right above this disk tier.
     bool writeThrough = false;
 
     [[nodiscard]] CacheTier tier() const noexcept

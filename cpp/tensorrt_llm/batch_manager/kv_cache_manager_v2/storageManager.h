@@ -354,21 +354,22 @@ public:
     // are evicted first (least recently used first): retained copies belong to more recently used pages. Retained
     // copies are then reclaimed oldest first.
 
-    // Called from Page::~Page: releases the page's retained copy, if any.
-    void onPageDestroyed(Page const& page) noexcept;
+    //! Called from Page::~Page: releases the page's retained copy, if any.
+    void onPageDestroyed(Page& page) noexcept;
 
     [[nodiscard]] SlotCount numRetainedCopies(
         CacheLevel level, std::optional<PoolGroupIndex> pgIdx = std::nullopt) const;
 
+    //! Retained disk copy counters. With one disk tier, retained == created - reused - reclaimed - dropped.
     struct DiskCopyCounters
     {
-        uint64_t retained; // retained copies held now
-        uint64_t created;
-        uint64_t reused;   // evictions that took a retained slot back instead of writing
-        uint64_t reclaimed;
-        uint64_t dropped;
-        uint64_t writeThroughPages;
-        uint64_t writeThroughSkipped; // eligible pages not written through: no free disk slot or background budget
+        uint64_t retained;            //!< Retained copies held now.
+        uint64_t created;             //!< Copies created: kept after a restore or written through.
+        uint64_t reused;              //!< Evictions that took a copy's slot back instead of writing.
+        uint64_t reclaimed;           //!< Copies released to make room, on resize, or because their write failed.
+        uint64_t dropped;             //!< Copies released because their page was destroyed.
+        uint64_t writeThroughPages;   //!< Pages written through.
+        uint64_t writeThroughSkipped; //!< Eligible pages not written through: no free disk slot or budget.
     };
 
     [[nodiscard]] DiskCopyCounters diskCopyCounters() const noexcept;
@@ -570,7 +571,7 @@ private:
 
     struct RetainedCopy
     {
-        Page const* page;
+        Page* page;
         CacheLevel level;
         PoolGroupIndex pgIdx;
         Slot slot;
@@ -588,7 +589,7 @@ private:
         uint64_t dropped{0};
     };
 
-    void addRetainedCopy(Page const& page, CacheLevel level, PoolGroupIndex pgIdx, Slot slot);
+    void addRetainedCopy(Page& page, CacheLevel level, PoolGroupIndex pgIdx, Slot slot);
     [[nodiscard]] std::optional<Slot> takeRetainedCopy(Page const& page, CacheLevel level);
     //! Whether \p page has a reusable retained copy at \p level. A copy whose write has not finished or failed is
     //! released instead.
