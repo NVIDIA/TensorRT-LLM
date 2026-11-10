@@ -25,7 +25,8 @@ _QUALIFIED_NAME = re.compile(
 # or `</arg_value>`, which models sometimes emit unbalanced into a tool name.
 _MARKUP_TAG = re.compile(r"</?[A-Za-z_][A-Za-z0-9_-]*>")
 # A bound on the empty increments ``finish`` feeds. Each pass that changes the
-# state reports or consumes part of the buffer, so a reply ends far below it.
+# state reports or consumes part of the buffer, so a reply ends far below it;
+# a parser that reaches it never converges, and ``finish`` warns about it.
 _MAX_FINISH_PASSES = 1024
 
 
@@ -235,6 +236,14 @@ class BaseToolParser(ABC):
             calls.extend(result.calls)
             if self._streaming_state() == before:
                 break
+        else:
+            parser_name = type(self).__name__
+            logger.warning_once(
+                f"Tool parser {parser_name} still changed its streaming state "
+                f"after {_MAX_FINISH_PASSES} empty increments at the end of "
+                "the stream; the calls it reported may be incomplete. This is "
+                "a bug in the parser's parse_streaming_increment.",
+                key=f"{parser_name}.finish_did_not_converge")
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def _streaming_state(self) -> tuple:

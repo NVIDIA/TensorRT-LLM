@@ -28,7 +28,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
 from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
                                                      forced_tool_arguments_end)
-from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
+from tensorrt_llm.serve.tool_parser.base_tool_parser import (_MAX_FINISH_PASSES,
+                                                             BaseToolParser)
 from tensorrt_llm.serve.tool_parser.core_types import (StreamingParseResult,
                                                        StructureInfo)
 from tensorrt_llm.serve.tool_parser.deepseekv3_parser import DeepSeekV3Parser
@@ -363,14 +364,48 @@ class TestBaseToolParser:
 
     def test_finish_keeps_a_buffer_that_cannot_progress(self, sample_tools):
         """Only part of the start token is buffered: no increment could report anything."""
+        from unittest.mock import patch
+
         parser = ConcreteToolParser()
         parser._buffer = "[TOOL_"
 
-        result = parser.finish(sample_tools)
+        with patch("tensorrt_llm.serve.tool_parser.base_tool_parser.logger"
+                   ) as mock_logger:
+            result = parser.finish(sample_tools)
 
         assert result.normal_text == ""
         assert result.calls == []
         assert parser._buffer == "[TOOL_"
+        mock_logger.warning_once.assert_not_called()
+
+    def test_finish_warns_when_the_parser_never_converges(self, sample_tools):
+        """Every pass changes the state: finish() stops at the bound and warns once, naming the parser."""
+        from unittest.mock import patch
+
+        class NeverConvergingParser(ConcreteToolParser):
+
+            def __init__(self):
+                super().__init__()
+                self.passes = 0
+
+            def parse_streaming_increment(self, new_text, tools):
+                self.passes += 1
+                self._buffer += "x"
+                return StreamingParseResult()
+
+        parser = NeverConvergingParser()
+
+        with patch("tensorrt_llm.serve.tool_parser.base_tool_parser.logger"
+                   ) as mock_logger:
+            parser.finish(sample_tools)
+
+        assert parser.passes == _MAX_FINISH_PASSES
+        assert mock_logger.warning_once.call_count == 1
+        warning = mock_logger.warning_once.call_args
+        assert "NeverConvergingParser" in warning.args[0]
+        # De-duplicated per parser class, so a broken parser cannot log once
+        # per request.
+        assert "NeverConvergingParser" in warning.kwargs["key"]
 
     def test_finish_reports_the_call_the_last_increment_brought(
             self, sample_tools):
