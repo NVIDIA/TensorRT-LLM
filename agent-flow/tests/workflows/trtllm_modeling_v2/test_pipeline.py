@@ -1049,3 +1049,12 @@ def test_a_landed_unit_is_read_with_the_static_delivery_checks(tmp_path, task_fi
     waived = static_delivery_failures(workflow, tree)
     assert not any(f.startswith(("accuracy:reference", "tests:test-db")) for f in waived)
     assert any(f.startswith("target:modeling.py") for f in waived)
+
+
+def test_delivered_tests_run_with_the_tree_first_on_pythonpath(tmp_path):
+    from agent_flow.workflows.trtllm_modeling_v2.run.certify import test_job_line
+
+    line = test_job_line("python -m pytest t.py", tmp_path)
+    # Rank processes a test starts inherit it, as the gates' commands do.
+    assert line.startswith(f"cd {tmp_path.resolve()} && export PYTHONPATH={tmp_path.resolve()}")
+    assert line.endswith("&& python -m pytest t.py")

@@ -454,13 +454,26 @@ def tests_check(
     return DeliveryCheck("tests", found.verdict == "CLEAN", found.describe() + ran)
 
 
+def test_job_line(command: str, tree: Path) -> str:
+    """``command`` run from inside ``tree`` with the tree first on ``PYTHONPATH``, as the gates run.
+
+    pytest imports the tree's ``tensorrt_llm`` from its working directory, but a test that
+    starts rank processes runs them as scripts, which resolve ``tensorrt_llm`` from
+    ``PYTHONPATH`` and the installed package: without the tree there, they import another
+    checkout (the editable install's) and miss the target's modules.
+    """
+    root = shlex.quote(str(Path(tree).resolve()))
+    return f'cd {root} && export PYTHONPATH={root}"${{PYTHONPATH:+:$PYTHONPATH}}" && {command}'
+
+
 def _test_job(workflow, command: str, tree: Path, timeout_s: int) -> tuple[int, str]:
     """One test job in ``tree`` on this run's executor; its exit code and output tail."""
+    line = test_job_line(command, tree)
     if workflow._shell_runner_override is not None:
-        done = workflow._shell_runner(f"cd {shlex.quote(str(tree))} && {command}", None, timeout_s)
+        done = workflow._shell_runner(line, None, timeout_s)
     else:
         done = workflow._command_executor.execute(
-            CommandSpec(argv=command, cwd=str(tree), timeout_s=timeout_s)
+            CommandSpec(argv=line, cwd=str(tree), timeout_s=timeout_s)
         )
     return done.returncode, (done.stdout + done.stderr)[-2000:]
 
