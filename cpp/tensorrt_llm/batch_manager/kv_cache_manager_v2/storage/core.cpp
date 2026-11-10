@@ -471,6 +471,9 @@ void DiskSlotPool::destroy()
 {
     if (mFd != kBadFileDescriptor)
     {
+        // This file's transfers are normally done by now: the pool group synchronizes its slots' ready events, which
+        // are recorded after each transfer's completion wait, before destroying them. The wait guards the descriptor
+        // against any piece still in flight. It is process-wide, so it also waits for other managers' disk I/O.
         waitForDiskIo();
         ::close(mFd);
         mFd = kBadFileDescriptor;

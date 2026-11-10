@@ -379,7 +379,9 @@ struct DiskTransfer
 #if defined(__aarch64__)
             asm volatile("dmb oshst" ::: "memory");
 #endif
-            flagWord(*completionFlags(), ticket).store(ticket, std::memory_order_release);
+            auto word = flagWord(*completionFlags(), ticket);
+            word.store(ticket, std::memory_order_release);
+            word.notify_all(); // a launch may be waiting to reuse this word after the ring wrapped
         }
     }
 };
@@ -586,10 +588,12 @@ CUresult launchDiskTransfer(std::shared_ptr<DiskTransfer> transfer, CUstream str
     uint64_t const ticket = flags->nextTicket.fetch_add(1);
     if (ticket > kNumCompletionFlags)
     {
-        // Never reuse a flag word whose previous transfer is still in flight.
-        while (flagWord(*flags, ticket).load(std::memory_order_acquire) < ticket - kNumCompletionFlags)
+        // Never reuse a flag word whose previous transfer is still in flight. Whoever stores the word notifies.
+        auto word = flagWord(*flags, ticket);
+        for (uint64_t seen = word.load(std::memory_order_acquire); seen < ticket - kNumCompletionFlags;
+             seen = word.load(std::memory_order_acquire))
         {
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            word.wait(seen, std::memory_order_acquire);
         }
     }
     transfer->ticket = ticket;
@@ -599,7 +603,9 @@ CUresult launchDiskTransfer(std::shared_ptr<DiskTransfer> transfer, CUstream str
         result != CUDA_SUCCESS)
     {
         // Retire the ticket, or the transfer that reuses its word after the ring wraps would wait forever.
-        flagWord(*flags, ticket).store(ticket, std::memory_order_release);
+        auto word = flagWord(*flags, ticket);
+        word.store(ticket, std::memory_order_release);
+        word.notify_all();
         return result;
     }
     static_cast<void>(launch.release()); // owned by the callback now

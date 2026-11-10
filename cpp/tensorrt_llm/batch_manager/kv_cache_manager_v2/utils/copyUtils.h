@@ -66,6 +66,7 @@ private:
 
 //! Call before closing a disk pool file: waits until the async I/O pool has no queued or running pieces, since a
 //! piece for the file may still use its descriptor (and a closed descriptor number can be reused for another file).
+//! The pool is process-wide, so this also waits for other managers' pieces.
 void waitForDiskIo() noexcept;
 
 CUresult copyDiskToDisk(std::vector<Task<DiskAddress, DiskAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;
