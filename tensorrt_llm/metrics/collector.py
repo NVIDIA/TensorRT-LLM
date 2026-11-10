@@ -493,12 +493,12 @@ class MetricsCollector:
         # (TLLM_FMHA_LIBS=+sampling_shared_prefix). Each counts generation
         # requests per decode step: a request decoding for 100 steps adds 100.
         self.counters_shared_prefix_attn = {
-            key: Counter(name=self.metric_prefix + name,
-                         documentation=documentation,
-                         labelnames=iteration_labelnames)
+            key:
+            Counter(name=self.metric_prefix + name,
+                    documentation=documentation,
+                    labelnames=iteration_labelnames)
             for key, name, documentation in (
-                ("requestSteps",
-                 "shared_prefix_attn_request_steps_total",
+                ("requestSteps", "shared_prefix_attn_request_steps_total",
                  "Generation requests decoded, summed over decode steps"),
                 ("shareableRequestSteps",
                  "shared_prefix_attn_shareable_request_steps_total",
