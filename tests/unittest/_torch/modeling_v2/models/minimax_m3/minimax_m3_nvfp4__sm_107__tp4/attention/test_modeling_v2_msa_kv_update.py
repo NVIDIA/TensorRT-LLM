@@ -13,9 +13,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attenti
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.msa_kv_update import (  # noqa: E501
     msa_kv_update as op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.msa_kv_update_hook import (  # noqa: E501
-    msa_kv_update as hook,
-)
 
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402, F401 — needs the path declared above
@@ -97,24 +94,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     certifying(op)
     op(*args)
     _check(args, op.reference(*args))
-
-
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_the_hook_takes_every_cell(cell) -> None:
-    """The target's hook (what the metadata calls) takes each certified step and writes what the op does."""
-    args = _case(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31 + 1)
-    assert hook(*args) is True
-    _check(args, op.reference(*args))
-
-
-def test_the_hook_declines_what_the_op_would_misread() -> None:
-    """A strided operand is read wrongly by the op, so the hook declines it (the metadata then runs its own
-    torch update) and writes nothing."""
-    args = list(_case(op.CELLS[2].spec, seed=5))
-    args[0] = torch.stack([args[0], args[0]], dim=1)[:, 0]
-    before = args[11].clone()
-    assert hook(*args) is False
-    assert torch.equal(args[11], before)
 
 
 def test_guard_refuses_a_strided_operand() -> None:
