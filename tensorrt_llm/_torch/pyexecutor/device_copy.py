@@ -262,6 +262,11 @@ def _overlaps(r: tuple[int, int], ranges: list[tuple[int, int]]) -> bool:
     return any(r[0] < hi and lo < r[1] for lo, hi in ranges)
 
 
+def _capturing(t: torch.Tensor) -> bool:
+    """Whether a copy into ``t`` would be captured; a host tensor never is, and never initializes CUDA."""
+    return t.is_cuda and torch.cuda.is_current_stream_capturing()
+
+
 def _site_name(site: CopySiteEnum) -> str:
     return f"{type(site).__name__}.{site.name}"
 
@@ -890,7 +895,7 @@ def _check_unchanged_copy(
     site: CopySiteEnum, dst: torch.Tensor, src: torch.Tensor, copier: Optional[DeviceCopier]
 ) -> None:
     """An ``unchanged`` copy is refused during capture and, in check mode, verified against the device."""
-    if torch.cuda.is_current_stream_capturing():
+    if _capturing(dst):
         raise ValueError(
             f"{_site_name(site)}: unchanged=True during CUDA graph capture; a captured copy reruns on every "
             "replay, so it must be issued (and not recorded as skippable)"
@@ -916,7 +921,7 @@ def _fill_tail(
     if not unchanged:
         buf[start:].fill_(value)
         return
-    if torch.cuda.is_current_stream_capturing():
+    if _capturing(buf):
         raise ValueError(
             f"{_site_name(site)}: unchanged=True during CUDA graph capture; a captured fill reruns on every replay"
         )
@@ -1212,7 +1217,7 @@ class DeviceCopyBuffer:
             src, dst = host, view
             key, exact = _view_key(view), True
             self._tail = None
-        if torch.cuda.is_current_stream_capturing():
+        if _capturing(dst):
             self.invalidate()
             return copy(site, dst, src, snapshot=self._snapshot)
         if not force and self.matches(host, key=key, exact=exact):
@@ -1278,7 +1283,7 @@ class DeviceCopyBuffer:
     def fill_tail(self, site: CopySiteEnum, start: int, value: int) -> None:
         """``fill_tail(site, tensor, start, value)``, passing unchanged=True when the last fill was the same."""
         buf = self._tensor
-        if start >= buf.shape[0] or torch.cuda.is_current_stream_capturing():
+        if start >= buf.shape[0] or _capturing(buf):
             self._tail = None
             fill_tail(site, buf, start, value)
             return

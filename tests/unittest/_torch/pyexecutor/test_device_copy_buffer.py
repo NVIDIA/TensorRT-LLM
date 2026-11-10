@@ -77,6 +77,20 @@ def test_first_call_copies() -> None:
     assert dst.tolist() == [3, 1, 2, 0, 0, 0, 0, 0]
 
 
+def test_a_host_buffer_never_queries_cuda(monkeypatch) -> None:
+    def no_cuda() -> bool:
+        raise AssertionError("a host-only DeviceCopyBuffer queried CUDA")
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", no_cuda)
+    dst = torch.zeros(8, dtype=torch.int32)
+    buffer = DeviceCopyBuffer(dst)
+    buffer.update(_host([3, 1, 2]))
+    buffer.update(_host([3, 1, 2]))
+    buffer.fill_tail(_Site.TAIL, 3, 0)
+    buffer.fill_tail(_Site.TAIL, 3, 0)
+    assert dst.tolist() == [3, 1, 2, 0, 0, 0, 0, 0]
+
+
 def test_unchanged_values_skip_the_copy() -> None:
     dst = torch.zeros(8, dtype=torch.int32)
     buffer = DeviceCopyBuffer(dst)
