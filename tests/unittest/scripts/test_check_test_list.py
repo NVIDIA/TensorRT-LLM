@@ -443,6 +443,54 @@ def test_verify_qa_yaml_rejects_invalid_structure(mod, tmp_path, monkeypatch, co
     assert str(test_list) in str(exc.value)
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "invalid:\n  - test: []\n",
+        "invalid:\n  - tests: null\n",
+        "invalid:\n  - tests: [123]\n",
+        "tests:\n  - test: test_sample.py::test_case\n",
+    ],
+)
+def test_verify_qa_yaml_rejects_invalid_entries(mod, tmp_path, monkeypatch, content):
+    qa_dir = tmp_path / "tests" / "integration" / "test_lists" / "qa"
+    qa_dir.mkdir(parents=True)
+    (qa_dir / "invalid.yml").write_text(content, encoding="utf-8")
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: None)
+
+    with pytest.raises(ValueError, match="Invalid QA test list"):
+        mod.verify_qa_test_lists(str(tmp_path))
+
+
+@pytest.mark.parametrize("filename", ["llm_config_database.yml", "llm_spark_func.yml"])
+def test_verify_qa_grouped_yaml(mod, tmp_path, monkeypatch, filename):
+    import yaml
+
+    source = REPO_ROOT / "tests" / "integration" / "test_lists" / "qa" / filename
+    qa_dir = tmp_path / "tests" / "integration" / "test_lists" / "qa"
+    qa_dir.mkdir(parents=True)
+    (qa_dir / filename).write_text(source.read_text(), encoding="utf-8")
+    data = yaml.safe_load(source.read_text())
+    expected = [
+        case
+        for group in data[Path(filename).stem]
+        for case in group["tests"]
+        if not case.startswith("perf/")
+    ]
+    collected = []
+
+    def collect(llm_src, path):
+        collected.extend(Path(path).read_text().splitlines())
+
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "_run_collection_pytest", collect)
+    mod.verify_qa_test_lists(str(tmp_path))
+
+    assert collected == expected
+    result = tmp_path / "qa_test.txt"
+    assert (result.read_text().splitlines() if result.exists() else []) == expected
+
+
 # --------------------------------------------------------------------------
 # module-const soundness against in-place mutation / rebinding
 # --------------------------------------------------------------------------

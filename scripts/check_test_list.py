@@ -1067,12 +1067,40 @@ def verify_qa_test_lists(llm_src):
                     import yaml
 
                     data = yaml.safe_load(test_file)
-                    if not isinstance(data, dict) or not isinstance(
+                    group_key = Path(test_def_file).stem
+                    if isinstance(data, dict) and isinstance(
                             data.get("tests"), list):
+                        entries = data["tests"]
+                        valid = all(
+                            isinstance(entry, dict)
+                            and isinstance(entry.get("case"), str)
+                            for entry in entries)
+                        lines = [entry["case"]
+                                 for entry in entries] if valid else None
+                    elif isinstance(data, dict) and isinstance(
+                            data.get(group_key), list):
+                        groups = data[group_key]
+                        valid = all(
+                            isinstance(group, dict)
+                            and isinstance(group.get("tests"), list) and all(
+                                isinstance(case, str)
+                                for case in group["tests"]) for group in groups)
+                        lines = ([
+                            case for group in groups for case in group["tests"]
+                        ] if valid else None)
+                    else:
+                        lines = None
+                    if lines is None:
                         raise ValueError(
                             f"Invalid QA test list {test_def_file}: "
-                            "expected a mapping with a 'tests' list")
-                    lines = [entry["case"] for entry in data["tests"]]
+                            "expected a mapping with a 'tests' list of case entries "
+                            f"or a '{group_key}' list of test groups")
+                    lines = [
+                        line for line in lines
+                        if not line.startswith(_EXCLUDED_PATH_PREFIXES)
+                    ]
+                    if not lines:
+                        continue
                     collection_list = os.path.join(
                         text_lists_dir,
                         Path(test_def_file).stem + ".txt")
