@@ -33,11 +33,11 @@ Note that if chunked context is enabled, please set the `max_num_tokens` to be a
 
 Instead of splitting the input tokens into smaller chunks for the whole model, chunked attention is another method that is only applied to the attention layers in models.
 
-With chunked attention, the tokens in context requests are split into chunks of a specified size. Then tokens can only attend to other tokens in the same chunk. For example, if the chunk size is 3, we might have a mask illustrated in Figure 1. Each token only needs to attend to at most the past chunk-sized tokens. As a result, both the KV cache size and the attention computation can be significantly reduced.
+Chunked attention divides a sequence into chunks of a specified size. Each token attends only to itself and earlier tokens in its own chunk, as illustrated in Figure 1 for a chunk size of 3. This applies during context processing and, with the TRTLLM backend's native generation kernels (MMHA and TRTLLM-Gen through the XQA dispatcher), during generation. Both the KV cache size and the attention computation can be significantly reduced.
 
 Currently TensorRT LLM can only support chunked attention in llama4 model with TRTLLM attention backend. TensorRT LLM will read `attention_chunk_size` from the model config. If it is not None, the chunked attention will be enabled with chunk size `attention_chunk_size`. If you want to enable chunked attention to other models, you can set the `attention_chunk_size` in attention API to a valid value.
 
-On supported TRTLLM generation paths, chunked attention also applies during generation: generated tokens attend only within their current attention chunk.
+Generation chunking is not supported by the FlashInfer TRTLLM-Gen kernels, which are preferred by default for supported configurations with beam width 1 on Blackwell (SM100/SM103), or by tree-based speculative decoding. On Hopper, Llama4 disables chunked attention in both phases when speculative decoding is enabled. On the supported native generation paths, chunking is enabled by default; set `TRTLLM_DISABLE_CHUNKED_ATTENTION_IN_GEN_PHASE=1` to disable it during generation.
 
 ## Sliding Window Attention
 
