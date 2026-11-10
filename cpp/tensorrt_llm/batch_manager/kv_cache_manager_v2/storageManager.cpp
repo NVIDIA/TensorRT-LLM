@@ -1134,14 +1134,9 @@ void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<Shared
             continue;
         }
         batch.resize(take);
-        // Copy without moving, and keep the page's ready event so host -> GPU restores don't wait for this write.
-        // The write's completion lives on the retained slot; releases of the host slot merge it in (pendingDiskWrite).
-        std::vector<CachedCudaEvent> previousEvents;
-        previousEvents.reserve(take);
-        for (auto const& page : batch)
-        {
-            previousEvents.push_back(page->readyEvent);
-        }
+        // Copy without moving. The page's ready event is left alone, so host -> GPU restores don't wait for this
+        // write; its completion lives on the retained slot, and releases of the host slot merge it in
+        // (pendingDiskWrite).
         // The required GPU -> host eviction has already succeeded, so a failure here only costs the early copy:
         // give back the disk slots not yet retained and let these pages be written on their host -> disk eviction.
         std::optional<std::vector<Slot>> slots;
@@ -1152,10 +1147,6 @@ void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<Shared
                 BackgroundDiskWriteScope const background;
                 slots = _batchedMigrate(diskLevel, hostLevel, batch, /*updateSrc=*/false, MigrationRecorder{});
             }
-            for (size_t i = 0; i < take; ++i)
-            {
-                batch[i]->readyEvent = std::move(previousEvents[i]);
-            }
             TLLM_CHECK(slots.has_value() && slots->size() == take);
             for (; added < take; ++added)
             {
@@ -1164,7 +1155,6 @@ void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<Shared
         }
         catch (std::exception const& e)
         {
-            // A page whose ready event was not restored waits for the failed copy as well, which is only slower.
             if (slots.has_value())
             {
                 for (auto& slot : *slots)
@@ -1930,7 +1920,12 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                 for (std::size_t i = 0; i < srcPages.size(); ++i)
                 {
                     dstSlots.at(i).readyEvent = finishEvent;
-                    srcPages.at(i)->readyEvent = finishEvent;
+                    // A copy that leaves the page in place (write-through) must not hold up the page; its completion
+                    // lives on the destination slot.
+                    if (updateSrc)
+                    {
+                        srcPages.at(i)->readyEvent = finishEvent;
+                    }
                 }
             });
         {
@@ -1956,6 +1951,8 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
         std::set<std::pair<std::string, int>> emittedCacheLevelUpdates;
         bool const emitCacheLevelUpdates
             = updateSrc && !defrag && srcLevel != dstLevel && static_cast<bool>(mEventSink);
+        // Source slot event merged with a pending write-through, per (source event, pending write).
+        std::vector<std::pair<std::pair<CUevent, CUevent>, CachedCudaEvent>> mergedPendingWrites;
         for (std::size_t i = 0; i < srcPages.size(); ++i)
         {
             if (updateSrc)
@@ -1963,15 +1960,32 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                 bool wasScheduled = srcPages.at(i)->scheduledForEviction();
                 if (wasScheduled)
                     excludeFromEviction(*srcPages.at(i));
-                // Replace the page's source slot with its destination and release the source slot back to the pool.
-                Slot srcSlot = srcPages.at(i)->exchangeSlot(std::move(dstSlots.at(i)));
+                // A write-through may still be reading the source host slot, so whoever reuses that slot must wait
+                // for it too. Merge before exchangeSlot, so nothing that can throw runs between the exchange and the
+                // level update. The pages of a batch share one finish event, so this merges once per pending write.
+                std::optional<CachedCudaEvent> srcSlotReady;
                 if (mDiskWriteThrough && cacheTier(srcLevel) == CacheTier::HOST_MEM)
                 {
                     if (auto pending = pendingDiskWrite(*srcPages.at(i)); !pending.isClosed())
                     {
-                        std::vector<CachedCudaEvent> events{srcSlot.readyEvent, std::move(pending)};
-                        srcSlot.readyEvent = mergeEvents(events);
+                        auto const key = std::make_pair(srcPages.at(i)->readyEvent.handle(), pending.handle());
+                        auto merged = std::find_if(mergedPendingWrites.begin(), mergedPendingWrites.end(),
+                            [&key](auto const& entry) { return entry.first == key; });
+                        if (merged == mergedPendingWrites.end())
+                        {
+                            std::vector<CachedCudaEvent> events{srcPages.at(i)->readyEvent, std::move(pending)};
+                            merged = mergedPendingWrites.emplace(mergedPendingWrites.end(), key, mergeEvents(events));
+                        }
+                        srcSlotReady = merged->second;
                     }
+                }
+                // Replace the page's source slot with its destination. The source slot is released, or kept as a
+                // retained disk copy.
+                Slot srcSlot = srcPages.at(i)->exchangeSlot(std::move(dstSlots.at(i)));
+                srcPages.at(i)->cacheLevel = dstLevel;
+                if (srcSlotReady.has_value())
+                {
+                    srcSlot.readyEvent = std::move(*srcSlotReady);
                 }
                 if (retainSrcCopy && hasFinalContent(*srcPages.at(i)))
                 {
@@ -1982,7 +1996,6 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                 {
                     srcPoolGroup.release(std::move(srcSlot));
                 }
-                srcPages.at(i)->cacheLevel = dstLevel;
                 if (emitCacheLevelUpdates && srcPages.at(i)->isCommitted())
                 {
                     auto const& page = static_cast<CommittedPage const&>(*srcPages.at(i));
