@@ -19,6 +19,7 @@ import warnings
 from subprocess import CalledProcessError
 from typing import TYPE_CHECKING, NoReturn, Optional
 
+import pytest
 from defs.conftest import tests_path
 
 if TYPE_CHECKING:
@@ -575,3 +576,62 @@ def test_mpi_profiler(llm_root: str, llm_venv: "PythonVenvRunnerImpl",
             "failure") is None, f"MPI rank {rank} failed the smoke case"
         assert case_result.find(
             "error") is None, f"MPI rank {rank} errored in the smoke case"
+
+
+@pytest.mark.parametrize("enabled", [False, True], ids=["off", "on"])
+def test_nccl_profiler_build_contract(llm_root: str,
+                                      llm_venv: "PythonVenvRunnerImpl",
+                                      output_dir: str, enabled: bool) -> None:
+    """Require the requested native build and run all NCCL contracts without skips."""
+    import xml.etree.ElementTree as ET
+
+    from defs.common import venv_check_call
+
+    mode = "on" if enabled else "off"
+    os.makedirs(output_dir, exist_ok=True)
+    report_path = os.path.abspath(
+        os.path.join(output_dir, f"results-nccl-profiler-{mode}.xml"))
+    if os.path.exists(report_path):
+        os.remove(report_path)
+    test_root = os.path.join(llm_root, "tests", "unittest")
+    case = os.path.join(test_root, "_torch", "distributed",
+                        "test_nccl_profiler.py")
+    launcher = (
+        "import sys, pytest; from tensorrt_llm.bindings import BuildInfo; "
+        "from tensorrt_llm import _profiler; "
+        "assert BuildInfo.ENABLE_NCCL_PROFILING is (sys.argv[1] == 'on'), "
+        "'NCCL profiling build does not match the required CI mode'; "
+        "assert _profiler.custom_region_enabled('nccl'), "
+        "'CI must select nccl before importing the product'; "
+        "raise SystemExit(pytest.main(sys.argv[2:]))")
+    venv_check_call(
+        llm_venv,
+        [
+            "-c", launcher, mode, case, "-v", "--tb=short", "--timeout=300",
+            f"--junitxml={report_path}"
+        ],
+        env={
+            "PYTHONPATH":
+            os.pathsep.join([test_root,
+                             os.environ.get("PYTHONPATH", "")]),
+            "TLLM_PROFILE_CUSTOM_REGIONS":
+            "nccl",
+        },
+        timeout=900,
+    )
+    cases = ET.parse(report_path).findall(".//testcase")
+    assert cases, "NCCL profiler collected no tests"
+    p2p_cases = [
+        case for case in cases if case.get("name", "").startswith(
+            "test_nccl_owner_boundaries[point-to-point")
+    ]
+    assert len(
+        p2p_cases) == 2, "NCCL profiler must run eager and captured P2P cases"
+    assert any(
+        case.get("name", "").startswith(
+            "test_nccl_owner_boundaries[process-group") for case in
+        cases), "NCCL profiler must run the ProcessGroup ownership case"
+    for case_result in cases:
+        for status in ("skipped", "failure", "error"):
+            assert case_result.find(status) is None, (
+                f"NCCL profiler {case_result.get('name')} reported {status}")

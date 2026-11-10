@@ -300,6 +300,9 @@ def SINGLE_DEVICE_CONFIG = "SingleDevice"
 def LLVM_CONFIG = "LLVM"
 
 @Field
+def PROFILING_CONFIG = "Profiling"
+
+@Field
 def LINUX_AARCH64_CONFIG = "linux_aarch64"
 
 @Field
@@ -311,6 +314,7 @@ def BUILD_CONFIGS = [
   (VANILLA_CONFIG) : [(TARNAME) : "TensorRT-LLM.tar.gz"],
   (SINGLE_DEVICE_CONFIG) : [(TARNAME) : "single-device-TensorRT-LLM.tar.gz"],
   (LLVM_CONFIG) : [(TARNAME) : "llvm-TensorRT-LLM.tar.gz"],
+  (PROFILING_CONFIG) : [(TARNAME) : "profiling-TensorRT-LLM.tar.gz"],
   (LINUX_AARCH64_CONFIG) : [(TARNAME) : "TensorRT-LLM-GH200.tar.gz"],
 ]
 
@@ -7614,6 +7618,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_A100-FMHA-Post-Merge-1": ["auto:dgx-a100-x1", "l0_a100", 1, 1],
         "DGX_H100-2_GPUs-PyTorch-Others-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 2, 2],
         "DGX_H100-2_GPUs-PyTorch-Others-2": ["auto:dgx-h100-x2", "l0_dgx_h100", 2, 2, 2],
+        "DGX_H100-2_GPUs-PyTorch-Profiling-1": ["auto:dgx-h100-x2", "l0_nccl_profiler", 1, 1, 2],
         "DGX_H100-2_GPUs-PyTorch-GptOss-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
         "DGX_H100-2_GPUs-PyTorch-Ray-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
@@ -7681,6 +7686,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         }
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
+        }
+        if (key.contains("-Profiling-")) {
+            config = PROFILING_CONFIG
         }
         runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, attemptTag, false, retryContext?.infraRetryMax)
     }, [singleAttempt: true, slurmDispatcher: true]]]}
