@@ -192,31 +192,33 @@ integration conftest, helper modules in dirs no YAML mentions).
 
 ## When CBTS activates
 
-CBTS activates on bare `/bot run` and `/bot run --post-merge`. Any
-stage-selection flag (`--stage-list`, `--extra-stage`, `--gpu-type`,
-`--test-backend`, `--skip-test`, `--add-multi-gpu-test`, `--only-multi-gpu-test`,
-`--disable-multi-gpu-test`) makes `getCbtsResult` return null.
+CBTS activates for `/bot run` with any stage-selection or orthogonal flags.
+The command first determines the eligible stage scope (`--stage-list`,
+`--extra-stage`, GPU/backend filters, multi-GPU flags, and `--skip-test`).
+CBTS then selects affected cases and stages within that scope. Sanity and
+coverage-tier multi-GPU stages are retained only if they are in that scope.
+Explicitly selected OnDemand and Post-Merge stages are eligible as well.
 
-`--disable-cbts` is an explicit kill switch: `getCbtsResult` returns null
-before any narrowing, so the pipeline runs the full test set. The opt-out is
-recorded in OpenSearch with `s_cbts_status=disabled`.
+`--disable-cbts` remains the explicit kill switch. Official post-merge jobs
+and infrastructure dry runs retain their existing bypasses. Coverage rollout
+and auto-trigger retention policies remain in effect within the selected scope.
 
-Orthogonal flags (`--reuse-test`, `--disable-reuse-test`, `--debug`,
-`--detailed-log`, `--disable-fail-fast`, `--high-priority`) do not affect CBTS.
+A null decision or selector failure runs the full command-selected scope.
+Fallback never expands to stages outside that scope. Narrowed test-db artifact
+failures likewise use the source test-db within the selected stages.
+
+Stage patterns match original stage names even when narrowed stages have a
+`-cbts` suffix. Shard counts are reduced after stage selection, and cases are
+repartitioned across the selected shards. An explicitly selected shard 6 can
+therefore execute as group 1/1 while retaining its stage name with `-cbts`.
 
 ## Trigger-mode filter
 
-`pr.post_merge` (carried in INPUT_JSON) selects which stages survive:
-
-- `post_merge=False` (default for `/bot run`): drop every stage whose name
-  contains `Post-Merge`.
-- `post_merge=True` (`/bot run --post-merge`): keep all affected stages —
-  pre-merge plus `Post-Merge` (Post-Merge runs on top of pre-merge, matching
-  the non-CBTS baseline).
-
-Applied after rules union; rules see all stages so reasons report the
-pre-filter narrow. `_log_decision_to_stderr` prints the dropped set for
-Jenkins console diagnostics.
+The Python CLI's `pr.post_merge` input defaults to false, excluding Post-Merge
+stages. Jenkins requests decisions over both pre-merge and Post-Merge stages;
+its command-stage filter then determines which stages can actually run. This
+allows `--stage-list` and `--extra-stage` to select Post-Merge stages without
+requiring `--post-merge` or allowing other Post-Merge stages into the run.
 
 ## How it's invoked (CI)
 
@@ -300,8 +302,10 @@ a successful shadow candidate.
 `k = clamp(ceil(est_seconds / 2h), 1, stage.total_splits)` (cap parsed from
 `L0_Test.groovy`). `est_seconds` sums the `.test_durations` cache over the
 stage's kept entries (exact node-id, else subtree-sum, else average — over-counts
-toward the cap, never under-sizes). `launchTestJobs::cbtsResizeSplits` keeps only
-shards `1..k`; pytest-split then balances within them via `least_duration`.
+toward the cap, never under-sizes). After command-stage selection,
+`filterCbtsStageJobs` keeps at most `k` selected shards per stage family and
+assigns contiguous group IDs within that selection. pytest-split then balances
+within them via `least_duration`.
 
 `cbtsResizeSplits` also renames each narrowed stage with a `-cbts` suffix so its
 narrowed result is never reused (whole-stage `REUSE_STAGE_LIST` or per-test
@@ -396,3 +400,14 @@ Every fallback emits an `echo` log line.
 `getMakoArgsFromStageName` (~`L0_Test.groovy:2079`) and
 `parseTaskConfigFromStageName` (~`:2066`). Update both when adding new
 backends / orchestrators / stage-name conventions.
+
+### Pipeline stage-scope regression tests
+
+With Groovy installed (or `GROOVY_CLASSPATH` set to Groovy and groovy-json JARs), run:
+
+```bash
+python3 -m pytest -q --confcutdir=tests/unittest/scripts \
+  tests/unittest/scripts/test_cbts_stage_scope.py
+```
+
+These tests execute the pipeline's Groovy methods with Jenkins IO mocked.
