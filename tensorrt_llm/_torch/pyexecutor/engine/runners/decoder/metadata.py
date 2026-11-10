@@ -367,6 +367,8 @@ def create_spec_metadata(
     )
     if metadata is not None:
         metadata.samples_from_vocab_shards = config.samples_from_vocab_shards
+        listed = getattr(config.cuda_graph_config, "sampling_variants", None)
+        metadata.greedy_graphs = listed is None or "greedy" in listed
     return metadata
 
 
