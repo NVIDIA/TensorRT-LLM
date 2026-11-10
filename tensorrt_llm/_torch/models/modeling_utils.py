@@ -463,9 +463,8 @@ def apply_layerwise_quant_config(
                     # The parts load into one weight, so they must agree.
                     configs = [quant_config_dict.get(n) for n in fused_names]
                     if any(q is not None for q in configs):
-                        if any(q is None for q in configs) or len(
-                            {(q.quant_algo, q.group_size)
-                             for q in configs}) != 1:
+                        if any(q is None for q in configs) or any(
+                                q != configs[0] for q in configs[1:]):
                             raise ValueError(
                                 f"{', '.join(fused_names)} load into one fused "
                                 f"projection and need the same quantization, "

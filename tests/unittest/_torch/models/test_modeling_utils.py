@@ -185,6 +185,7 @@ def _fused_index_projection(declare_names: bool) -> nn.Module:
         ("matching", (), "declared"),
         ("absent", (), None),
         ("mismatched", (), ValueError),
+        ("zero_point", (), ValueError),
         ("missing_k", (), ValueError),
         ("matching", ("index_q_proj", "index_k_proj"), "excluded"),
         ("matching", ("index_q_proj",), ValueError),
@@ -208,8 +209,15 @@ def test_quantization_passes_match_declared_fused_checkpoint_names(
     }
     if entries != "absent":
         quant_config_dict[f"{prefix}.index_q_proj"] = declared
-    if entries in ("matching", "mismatched"):
-        quant_config_dict[f"{prefix}.index_k_proj"] = declared if entries == "matching" else other
+    k_configs = {
+        # Equal to the Q entry but a separate object, as a per-layer map holds it.
+        "matching": QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32),
+        "mismatched": other,
+        # Same algorithm and group size; any other differing field still conflicts.
+        "zero_point": QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32, has_zero_point=True),
+    }
+    if entries in k_configs:
+        quant_config_dict[f"{prefix}.index_k_proj"] = k_configs[entries]
     global_config = QuantConfig(
         quant_algo=QuantAlgo.MIXED_PRECISION,
         kv_cache_quant_algo=QuantAlgo.FP8,
