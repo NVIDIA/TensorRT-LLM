@@ -241,10 +241,19 @@ constexpr uint64_t kNumCompletionFlags = uint64_t{1} << 16;
 
 struct CompletionFlags
 {
-    std::atomic<uint64_t>* host = nullptr;
+    uint64_t* host = nullptr; // read through flagWord(); cuStreamWaitValue64 polls the same 8-byte words
     CUdeviceptr device = 0;
     std::atomic<uint64_t> nextTicket{1};
 };
+
+static_assert(std::atomic_ref<uint64_t>::is_always_lock_free && sizeof(uint64_t) == 8,
+    "host stores must land on the 8-byte word that cuStreamWaitValue64 polls");
+
+//! The flag word of transfer \p ticket.
+std::atomic_ref<uint64_t> flagWord(CompletionFlags const& flags, uint64_t ticket) noexcept
+{
+    return std::atomic_ref<uint64_t>(flags.host[ticket % kNumCompletionFlags]);
+}
 
 // nullptr when 64-bit stream memory operations are unavailable; transfers then run in the callback.
 CompletionFlags* completionFlags() noexcept
@@ -273,7 +282,7 @@ CompletionFlags* completionFlags() noexcept
                 "in the stream callback");
             return nullptr;
         }
-        std::memset(host, 0, kNumCompletionFlags * sizeof(uint64_t));
+        std::fill_n(static_cast<uint64_t*>(host), kNumCompletionFlags, uint64_t{0});
         CUdeviceptr devicePtr = 0;
         if (cuMemHostGetDevicePointer(&devicePtr, host, 0) != CUDA_SUCCESS)
         {
@@ -284,7 +293,7 @@ CompletionFlags* completionFlags() noexcept
             return nullptr;
         }
         auto* flags = new CompletionFlags; // lives for the process; worker threads may outlive static destruction
-        flags->host = static_cast<std::atomic<uint64_t>*>(host);
+        flags->host = static_cast<uint64_t*>(host);
         flags->device = devicePtr;
         return flags;
     }();
@@ -366,7 +375,7 @@ struct DiskTransfer
 #if defined(__aarch64__)
             asm volatile("dmb oshst" ::: "memory");
 #endif
-            completionFlags()->host[ticket % kNumCompletionFlags].store(ticket, std::memory_order_release);
+            flagWord(*completionFlags(), ticket).store(ticket, std::memory_order_release);
         }
     }
 };
@@ -490,6 +499,7 @@ private:
             if (transfer.remaining.fetch_sub(1) == 1)
             {
                 transfer.finish();
+                transfer.remaining.notify_all();
             }
             {
                 std::lock_guard<std::mutex> lock(mMutex);
@@ -533,9 +543,10 @@ CUDA_CB void hostFnSubmitDiskTransfer(void* userData) noexcept
 
 void waitForTransfer(DiskTransfer const& transfer) noexcept
 {
-    while (transfer.remaining.load() != 0)
+    // The worker that runs the last piece notifies.
+    for (size_t left = transfer.remaining.load(); left != 0; left = transfer.remaining.load())
     {
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        transfer.remaining.wait(left);
     }
 }
 
@@ -572,7 +583,7 @@ CUresult launchDiskTransfer(std::shared_ptr<DiskTransfer> transfer, CUstream str
     if (ticket > kNumCompletionFlags)
     {
         // Never reuse a flag word whose previous transfer is still in flight.
-        while (flags->host[ticket % kNumCompletionFlags].load(std::memory_order_acquire) < ticket - kNumCompletionFlags)
+        while (flagWord(*flags, ticket).load(std::memory_order_acquire) < ticket - kNumCompletionFlags)
         {
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
@@ -584,7 +595,7 @@ CUresult launchDiskTransfer(std::shared_ptr<DiskTransfer> transfer, CUstream str
         result != CUDA_SUCCESS)
     {
         // Retire the ticket, or the transfer that reuses its word after the ring wraps would wait forever.
-        flags->host[ticket % kNumCompletionFlags].store(ticket, std::memory_order_release);
+        flagWord(*flags, ticket).store(ticket, std::memory_order_release);
         return result;
     }
     static_cast<void>(launch.release()); // owned by the callback now
