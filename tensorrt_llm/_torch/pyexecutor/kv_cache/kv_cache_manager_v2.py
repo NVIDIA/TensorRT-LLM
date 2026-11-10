@@ -492,18 +492,6 @@ def _estimate_full_attn_size_per_token(
     )
 
 
-def _skips_auto_host_tier(has_cp_helix: bool, is_disagg: bool, spec_config) -> bool:
-    """Whether to leave out the automatic host tier.
-
-    Suspending a DSpark request under aggregated helix is not validated yet, so
-    that combination keeps a GPU-only pool, where recompute-pause reclaims
-    pages. An explicit ``host_cache_size`` still provisions a tier.
-    """
-    return (
-        has_cp_helix and not is_disagg and getattr(spec_config, "decoding_type", None) == "DSpark"
-    )
-
-
 def _compute_auto_host_tier_quota(
     quota: int,
     local_ranks: int,
@@ -2376,12 +2364,6 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         elif kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
             host_quota = kv_cache_config.host_cache_size
-        elif _skips_auto_host_tier(self._has_cp_helix, is_disagg, spec_config):
-            host_quota = 0
-            logger.info(
-                "KV cache manager v2 automatic host tier disabled under aggregated "
-                "helix with DSpark; set kv_cache_config.host_cache_size to enable one."
-            )
         else:
             # The V2 MAX_UTILIZATION scheduler relies on suspend/resume to
             # evict and later restore KV cache pages. Without a secondary
@@ -5628,6 +5610,16 @@ class KVCacheManagerV2(BaseResourceManager):
     def has_cache_tier_below_gpu(self) -> bool:
         """True when a suspended page has somewhere to be evicted to."""
         return len(self.impl.cache_tier_list) > 1
+
+    def has_evictable_gpu_pages(self) -> bool:
+        """True when some GPU page can still be evicted to make room.
+
+        Counts, across all pool groups, suspended pages still on GPU when a
+        tier below exists, and reusable cached blocks. False therefore means
+        no suspended request has pages left on GPU; True does not say whose
+        pages they are.
+        """
+        return any(stats.evictable > 0 for stats in self._get_storage_statistics(GPU_LEVEL))
 
     def has_pending_preemption(self) -> bool:
         """True while a deferred preemption is still waiting on a connector."""

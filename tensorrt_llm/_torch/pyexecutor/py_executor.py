@@ -11354,16 +11354,26 @@ class PyExecutor:
         Each rank runs its own scheduler, so the ranks agree only while every
         decision reads rank-invariant inputs; a divergence would otherwise show
         up as a hang or corrupt KV in the next CP collective. Every rank raises
-        together, since each compares the same gathered summaries.
+        together, since each compares the same gathered summaries. A paired
+        draft pool is not CP-sharded, so its committed depth is compared too:
+        ranks that reuse different draft prefixes draft from different K/V.
 
         Only the non-PP executor loops run it: with pipeline parallelism the
         first rank schedules and broadcasts the result. Set
         TLLM_HELIX_AGG_CHECK_SCHEDULE on every rank, since a rank without it
         skips the gather and the others wait on it.
         """
+        draft_caches = (self.draft_kv_cache_manager.kv_cache_map if getattr(
+            self, "enable_joint_kv_cache_reuse", False) else {})
+
+        def draft_committed_tokens(request: LlmRequest) -> Optional[int]:
+            kv_cache = draft_caches.get(request.py_request_id)
+            return None if kv_cache is None else kv_cache.num_committed_tokens
+
         summary = (
             tuple((r.py_request_id, r.context_current_position,
-                   r.context_chunk_size, r.prompt_len, r.total_input_len_cp)
+                   r.context_chunk_size, r.prompt_len, r.total_input_len_cp,
+                   draft_committed_tokens(r))
                   for r in scheduled_batch.context_requests),
             tuple((r.py_request_id, r.py_helix_decode_group_index)
                   for r in scheduled_batch.generation_requests),
@@ -11376,7 +11386,7 @@ class PyExecutor:
         # under-size the global ledger.
         sliced = [
             request_id
-            for request_id, _, _, prompt_len, total_len in summaries[0][0]
+            for request_id, _, _, prompt_len, total_len, _ in summaries[0][0]
             if prompt_len != total_len
         ]
         if sliced or any(s != summaries[0] for s in summaries[1:]):

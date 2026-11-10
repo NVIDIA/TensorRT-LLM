@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import random
+
 import pytest
 
 from tensorrt_llm import LLM
@@ -36,6 +38,8 @@ from .accuracy_core import (
     ForceTokenLogitsProcessor,
     GPQADiamond,
     LlmapiAccuracyTestHarness,
+    acceptance_length_from_iteration_stats,
+    assert_acceptance_length,
     assert_acceptance_length_for_llm,
     assert_guided_decoding_regex,
     assert_kv_cache_reuse_for_llm,
@@ -50,14 +54,20 @@ HELIX_CP_SIZE = 2
 LEDGER_TOKENS = HELIX_TOKENS_PER_BLOCK * HELIX_CP_SIZE
 
 
-def _assert_helix_reuse_blocks(llm: LLM, prompt_len: int) -> None:
+def _assert_helix_reuse_blocks(
+    llm: LLM,
+    prompt_len: int,
+    snapshot_interval: int = SNAPSHOT_INTERVAL,
+    ledger_tokens: int = LEDGER_TOKENS,
+) -> None:
     """Cold-then-warm run of a fresh prompt; check how deep the warm run reuses.
 
     A KDA state is reusable only at a snapshot point, and a reused prefix must
     end on a ledger block. The deepest usable point is the last multiple of
-    SNAPSHOT_INTERVAL strictly before the prompt end, so a prompt not longer
-    than one interval reuses nothing. Token output is not compared: greedy
-    decoding is not run-to-run deterministic on this config even without reuse.
+    snapshot_interval strictly before the prompt end, so a prompt not longer
+    than one interval reuses nothing. snapshot_interval must be a multiple of
+    ledger_tokens. Token output is not compared: greedy decoding is not
+    run-to-run deterministic on this config even without reuse.
     """
     # Distinct tokens per length so no earlier probe shares a prefix with this one.
     prompt = [prompt_len] + [1000 + prompt_len] * (prompt_len - 2) + [2000 + prompt_len]
@@ -68,9 +78,51 @@ def _assert_helix_reuse_blocks(llm: LLM, prompt_len: int) -> None:
     for _ in range(2):  # cold, then warm
         out = llm.generate([prompt], sampling_params=sampling_params, use_tqdm=False)[0]
         reused.append(out.outputs[0].request_perf_metrics.kv_cache_metrics.num_reused_blocks)
-    expected = (prompt_len - 1) // SNAPSHOT_INTERVAL * (SNAPSHOT_INTERVAL // LEDGER_TOKENS)
+    expected = (prompt_len - 1) // snapshot_interval * (snapshot_interval // ledger_tokens)
     assert reused == [0, expected], (
         f"prompt_len={prompt_len}: reused blocks (cold, warm) {reused}, expected [0, {expected}]"
+    )
+
+
+def _assert_drafter_reads_reused_prefix(
+    llm: LLM, snapshot_interval: int, ledger_tokens: int
+) -> None:
+    """Cold-then-warm run of a recall prompt; the warm run must keep its acceptance length.
+
+    The prompt lists facts and asks for them back, so the answer copies text
+    that lies inside the reused prefix. A drafter that cannot read the reused
+    prefix's K/V drafts that copy blind and its acceptance length drops, while
+    the target's output is unaffected because verification is lossless.
+    Repeated filler text would not show this: the recomputed tail alone lets
+    a drafter predict a repetition.
+    """
+    rng = random.Random(17645)
+    facts = " ".join(
+        f"Fact {i}: the access code for locker {i} is {rng.randrange(100000, 1000000)}."
+        for i in range(1, 91)
+    )
+    prompt = llm.tokenizer.encode(
+        f"{facts}\nRepeat every fact above exactly, starting from Fact 1.\nFact 1:"
+    )
+    sampling_params = SamplingParams(
+        max_tokens=128, temperature=0, ignore_eos=True, return_perf_metrics=True
+    )
+    results = [
+        llm.generate([prompt], sampling_params=sampling_params, use_tqdm=False)[0]
+        for _ in range(2)  # cold, then warm
+    ]
+    reused = [r.outputs[0].request_perf_metrics.kv_cache_metrics.num_reused_blocks for r in results]
+    cold_al, warm_al = (float(r.avg_decoded_tokens_per_iter) for r in results)
+    expected = (len(prompt) - 1) // snapshot_interval * (snapshot_interval // ledger_tokens)
+    print(
+        f"[reuse] recall prompt_len = {len(prompt)}, reused blocks (cold, warm) = {reused}, "
+        f"AL cold = {cold_al:.3f}, warm = {warm_al:.3f}"
+    )
+    assert reused == [0, expected], f"reused blocks (cold, warm) {reused}, expected [0, {expected}]"
+    assert cold_al > 1.0, f"cold AL {cold_al:.3f}: the drafter accepted nothing"
+    assert warm_al >= cold_al - 0.2, (
+        f"warm AL {warm_al:.3f} < cold AL {cold_al:.3f} - 0.2: the drafter does not "
+        "read the reused prefix's K/V"
     )
 
 
@@ -372,10 +424,12 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         the same GSM8K reference. KDA state is reusable only at snapshot points,
         and under Helix a reused prefix ends on a ledger block (tokens_per_block
         x cp_size = 128 tokens), so a misaligned snapshot restores the wrong
-        recurrent state and costs accuracy. The few-shot prompts share a long
-        prefix, so reuse is exercised on every request. reuse_preempt caps the
-        KV pool so requests are suspended and resumed while reused blocks are
-        claimed and evicted. Counters confirm reuse and preemption happened.
+        recurrent state. The probes on an idle engine check the reuse depth at
+        each prompt length. GSM8K checks accuracy with reuse enabled: its
+        few-shot exemplars differ per question, so it reuses almost nothing,
+        and its reuse counter is printed, not asserted. reuse_preempt caps the
+        KV pool so requests are suspended and resumed; counters confirm that
+        preemption happened.
         """
         kv_cache_kwargs = {
             # Without a snapshot cadence a hybrid model never reuses.
@@ -421,7 +475,8 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             llm.get_stats(timeout=2)  # keep the counters below GSM8K-only
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            # A pass must exercise reuse (and preemption), not just score well.
+            # Reuse counters are informational (see the docstring); the
+            # preemption counters are asserted for reuse_preempt.
             stats = llm.get_stats(timeout=2)
             windows = [w for s in stats for w in (s.get("kvCacheIterationStats") or {}).values()]
             reused_blocks = sum(w.get("iterReusedBlocks", 0) for w in windows)
@@ -442,7 +497,6 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                 f"[reuse] reused_blocks = {reused_blocks}, "
                 f"suspended = {suspended}, resumed = {resumed}, {totals}"
             )
-            assert reused_blocks > 0
             if mode == "reuse_preempt":
                 assert suspended > 0 and resumed > 0
 
@@ -569,6 +623,7 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
     # Blackwell deployment precision and nothing else covers it end to end.
     MODEL_PATH = f"{llm_models_root()}/Kimi-K3-NVFP4"
     DSPARK_MODEL_PATH = f"{llm_models_root()}/RadixArk-Kimi-K3-DSpark"
+    INFERACT_DSPARK_MODEL_PATH = f"{llm_models_root()}/Inferact-Kimi-K3-DSpark"
 
     @pytest.mark.skip_less_mpi_world_size(8)
     def test_gsm8k_tep8(self):
@@ -620,4 +675,186 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
             assert_acceptance_length_for_llm(
                 "TestKimiK3DSpark::test_gsm8k_tep8",
                 llm,
+            )
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.parametrize("tp_size,cp_size", [(4, 2), (1, 8)], ids=["tp4cp2", "tp1cp8"])
+    def test_gsm8k_nvfp4_helix_fp8kv(self, tp_size: int, cp_size: int):
+        """GSM8K plus an acceptance-length gate on aggregated Helix with DSpark.
+
+        Block reuse is off: this isolates DSpark x aggregated Helix (context
+        phase, mixed batches, verify groups) from the reuse path. Uses the
+        MLA-shaped Inferact drafter, whose block decode AUTO resolves to CUTEDSL.
+        Generation attention runs num_heads / tp_size heads per rank (24 at
+        TP4, 96 at TP1); CuTe DSL MLA serves the multi-token Helix verify
+        group at either. FP8 KV applies to the target only, the drafter keeps
+        its pool in bf16.
+        """
+        kv_cache_config = KvCacheConfig(
+            dtype="fp8",
+            enable_block_reuse=False,
+            free_gpu_memory_fraction=0.20,
+            tokens_per_block=64,
+            use_kv_cache_manager_v2=True,
+        )
+        spec_config = DSparkDecodingConfig(
+            max_draft_len=7, speculative_model=self.INFERACT_DSPARK_MODEL_PATH
+        )
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=tp_size,
+            context_parallel_size=cp_size,
+            moe_expert_parallel_size=8,
+            cp_config={"cp_type": "HELIX", "tokens_per_block": 64},
+            max_batch_size=8,
+            max_num_tokens=8192,
+            max_seq_len=8192,
+            trust_remote_code=True,
+            disable_overlap_scheduler=True,
+            enable_chunked_prefill=True,
+            cuda_graph_config=None,
+            moe_config=MoeConfig(backend="CUTLASS"),
+            kv_cache_config=kv_cache_config,
+            max_stats_len=-1,
+            enable_iter_perf_stats=True,
+            speculative_config=spec_config,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            assert_acceptance_length_for_llm(
+                f"TestKimiK3DSpark::test_gsm8k_nvfp4_helix_fp8kv[tp{tp_size}cp{cp_size}]", llm
+            )
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.parametrize("tp_size,cp_size", [(4, 2), (1, 8)], ids=["tp4cp2", "tp1cp8"])
+    def test_gsm8k_nvfp4_helix_fp8kv_block_reuse(self, tp_size: int, cp_size: int):
+        """test_gsm8k_nvfp4_helix_fp8kv with block reuse on.
+
+        The target pool reuses whole ledger blocks (64 x cp_size tokens) ending
+        at a KDA snapshot point, while the dense drafter's pool matches in
+        64-token pages. The scheduler pairs the two pools on one reuse depth,
+        so a target reuse hit means the drafter's K/V for that prefix was
+        reused too; a cold-then-warm recall prompt checks the drafter can read
+        it. GSM8K then checks accuracy with reuse on. Its few-shot exemplars
+        differ per question, so it reuses almost nothing and its counters are
+        not asserted.
+        """
+        ledger_tokens = HELIX_TOKENS_PER_BLOCK * cp_size
+        # Snapshot points are floored to ledger blocks, and points below the
+        # first block are dropped, so the interval must span a ledger block.
+        snapshot_interval = max(SNAPSHOT_INTERVAL, ledger_tokens)
+        kv_cache_config = KvCacheConfig(
+            dtype="fp8",
+            enable_block_reuse=True,
+            free_gpu_memory_fraction=0.20,
+            tokens_per_block=HELIX_TOKENS_PER_BLOCK,
+            use_kv_cache_manager_v2=True,
+            mamba_state_config=MambaStateConfig(periodic_snapshot_interval=snapshot_interval),
+        )
+        spec_config = DSparkDecodingConfig(
+            max_draft_len=7, speculative_model=self.INFERACT_DSPARK_MODEL_PATH
+        )
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=tp_size,
+            context_parallel_size=cp_size,
+            moe_expert_parallel_size=8,
+            cp_config={"cp_type": "HELIX", "tokens_per_block": HELIX_TOKENS_PER_BLOCK},
+            max_batch_size=8,
+            max_num_tokens=8192,
+            max_seq_len=8192,
+            trust_remote_code=True,
+            disable_overlap_scheduler=True,
+            enable_chunked_prefill=True,
+            cuda_graph_config=None,
+            moe_config=MoeConfig(backend="CUTLASS"),
+            kv_cache_config=kv_cache_config,
+            max_stats_len=-1,
+            enable_iter_perf_stats=True,
+            speculative_config=spec_config,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            assert llm.args.kv_cache_config.enable_block_reuse is True
+            # Nothing at one interval, then one interval of ledger blocks at a time.
+            for prompt_len in (
+                snapshot_interval,
+                snapshot_interval + 1,
+                2 * snapshot_interval + 1,
+                4 * snapshot_interval - 24,
+            ):
+                _assert_helix_reuse_blocks(llm, prompt_len, snapshot_interval, ledger_tokens)
+            _assert_drafter_reads_reused_prefix(llm, snapshot_interval, ledger_tokens)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_gsm8k_nvfp4_helix_fp8kv_kv_pressure(self):
+        """test_gsm8k_nvfp4_helix_fp8kv with a KV pool too small for the batch.
+
+        A burst of long prompts forces suspension to the host tier; GSM8K
+        accuracy and acceptance length must then hold, so a drafter resuming
+        with bad K/V shows up as an AL drop. TP4 x CP2 only: at CP8 no
+        max_tokens both fits one request and overflows eight.
+        """
+        kv_cache_config = KvCacheConfig(
+            dtype="fp8",
+            enable_block_reuse=False,
+            free_gpu_memory_fraction=0.20,
+            # Fits one 3072-token request; eight 1456-token ones fill it to
+            # within the per-step draft reservations, so the burst suspends.
+            max_tokens=12288,
+            avg_seq_len=1024,
+            tokens_per_block=HELIX_TOKENS_PER_BLOCK,
+            use_kv_cache_manager_v2=True,
+        )
+        spec_config = DSparkDecodingConfig(
+            max_draft_len=7, speculative_model=self.INFERACT_DSPARK_MODEL_PATH
+        )
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=4,
+            context_parallel_size=2,
+            moe_expert_parallel_size=8,
+            cp_config={"cp_type": "HELIX", "tokens_per_block": HELIX_TOKENS_PER_BLOCK},
+            max_batch_size=8,
+            max_num_tokens=8192,
+            max_seq_len=3072,
+            trust_remote_code=True,
+            disable_overlap_scheduler=True,
+            enable_chunked_prefill=True,
+            cuda_graph_config=None,
+            moe_config=MoeConfig(backend="CUTLASS"),
+            kv_cache_config=kv_cache_config,
+            max_stats_len=-1,
+            enable_iter_perf_stats=True,
+            speculative_config=spec_config,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            rng = random.Random(17645)
+            burst = [[rng.randrange(1000, 100000) for _ in range(1200)] for _ in range(8)]
+            burst_params = SamplingParams(max_tokens=256, temperature=0, ignore_eos=True)
+            outputs = llm.generate(burst, sampling_params=burst_params, use_tqdm=False)
+            assert all(len(o.outputs[0].token_ids) == 256 for o in outputs)
+            burst_stats = llm.get_stats(timeout=2)
+            burst_suspended = sum(s.get("iterSuspendedRequests", 0) for s in burst_stats)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            # A separate drain, so the AL gate scores GSM8K only.
+            stats = llm.get_stats(timeout=2)
+            suspended = sum(s.get("iterSuspendedRequests", 0) for s in stats)
+            resumed = sum(s.get("iterResumedRequests", 0) for s in stats)
+            acceptance_length = acceptance_length_from_iteration_stats(stats)
+            print(
+                f"[kv_pressure] burst suspended = {burst_suspended}, GSM8K "
+                f"suspended = {suspended}, resumed = {resumed}, "
+                f"acceptance_length = {acceptance_length:.6f}"
+            )
+            assert burst_suspended > 0
+            assert_acceptance_length(
+                "TestKimiK3DSpark::test_gsm8k_nvfp4_helix_fp8kv[tp4cp2]",
+                acceptance_length,
             )

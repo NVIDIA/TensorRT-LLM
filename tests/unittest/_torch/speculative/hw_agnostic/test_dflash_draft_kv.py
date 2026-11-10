@@ -435,3 +435,39 @@ def test_dflash_windows_span_a_page(windows: list | None, expected: bool) -> Non
     from tensorrt_llm._torch.speculative.dflash import dflash_windows_span_a_page
 
     assert dflash_windows_span_a_page(windows, 128) is expected
+
+
+@pytest.mark.parametrize(
+    ("addressable", "joins_reuse", "helix", "raises", "warns"),
+    [
+        (True, True, True, False, False),
+        (False, False, True, False, False),
+        (False, True, False, False, True),
+        (False, True, True, True, False),
+    ],
+    ids=["addressable", "unpaired", "paired_no_helix_warns", "paired_helix_raises"],
+)
+def test_dflash_unreachable_reused_prefix_raises_under_helix(
+    addressable: bool,
+    joins_reuse: bool,
+    helix: bool,
+    raises: bool,
+    warns: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A paired draft pool whose prefixes the drafter cannot read loses only
+    acceptance length: helix context parallelism refuses it, others warn."""
+    from tensorrt_llm._torch.speculative import dflash
+    from tensorrt_llm._torch.speculative.dspark import DSparkWorker
+
+    worker = object.__new__(DSparkWorker)
+    worker._ctx_reuse_addressable = addressable
+    worker.mapping = SimpleNamespace(has_cp_helix=lambda: helix)
+    warnings = []
+    monkeypatch.setattr(dflash.logger, "warning", warnings.append)
+    if raises:
+        with pytest.raises(ValueError, match="DSparkWorker: .*Helix context parallelism"):
+            worker._check_ctx_reuse_addressable(joins_reuse)
+    else:
+        worker._check_ctx_reuse_addressable(joins_reuse)
+    assert bool(warnings) == warns

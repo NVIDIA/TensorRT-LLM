@@ -624,6 +624,7 @@ def make_kv_cache_manager(
     first_new_block_fn=None,
     is_vswa=False,
     has_cache_tier_below_gpu=True,
+    gpu_evictable=True,
 ):
     mgr = Mock()
     mgr.kv_connector_manager = None
@@ -683,6 +684,8 @@ def make_kv_cache_manager(
     mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
     # The default here has a cache tier below GPU, which leaves preemption off.
     mgr.has_cache_tier_below_gpu = has_cache_tier_below_gpu
+    # Whether a suspended request still has pages on GPU to give back.
+    mgr.has_evictable_gpu_pages.return_value = gpu_evictable
 
     def preempt_request(req):
         """Release the pages now, as the real one does with no connector.
@@ -1350,6 +1353,78 @@ class TestKVCacheFailuresGen:
         assert recompute_pause_state.victim_indices == {0}
         mgr.free_resources.assert_called_once_with(victim)
         mgr.try_allocate_generation.assert_called_once_with(current)
+
+    def test_recompute_pause_takes_suspended_victim_without_host_tier(self):
+        """Without a tier below GPU a suspended request keeps its pages there,
+        so tearing it down frees GPU memory even though nothing counts as
+        evictable."""
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import _RecomputePauseState
+
+        current = make_gen_request(0)
+        suspended_tail = make_gen_request(1)
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lambda req: True,
+            can_evict=False,
+            has_cache_tier_below_gpu=False,
+            gpu_evictable=False,
+        )
+        mgr.kv_cache_map[suspended_tail.py_request_id].is_active = False
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        recompute_paused = []
+
+        req_it_end, success = sched._try_recompute_pause_for_gen(
+            current,
+            [current, suspended_tail],
+            req_it=0,
+            req_it_end=2,
+            recompute_pause_state=_RecomputePauseState(frontier=2),
+            evicted=[],
+            recompute_paused=recompute_paused,
+            inflight_request_ids=set(),
+        )
+
+        assert success
+        assert recompute_paused == [suspended_tail]
+        mgr.free_resources.assert_called_once_with(suspended_tail)
+
+    def test_recompute_pause_skips_suspended_victims_once_gpu_has_nothing_evictable(self):
+        """Once every suspended page sits below GPU, tearing a suspended
+        request down frees nothing there, so neither the frontier scan nor the
+        evicted fallback picks one."""
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import _RecomputePauseState
+
+        evicted_victim = make_gen_request(0)
+        current = make_gen_request(1)
+        suspended_tail = make_gen_request(2)
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lambda req: True,
+            can_evict=True,
+            gpu_evictable=False,
+        )
+        mgr.kv_cache_map[evicted_victim.py_request_id].is_active = False
+        mgr.kv_cache_map[suspended_tail.py_request_id].is_active = False
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        evicted = [evicted_victim]
+        recompute_paused = []
+        recompute_pause_state = _RecomputePauseState(frontier=3)
+
+        req_it_end, success = sched._try_recompute_pause_for_gen(
+            current,
+            [evicted_victim, current, suspended_tail],
+            req_it=1,
+            req_it_end=3,
+            recompute_pause_state=recompute_pause_state,
+            evicted=evicted,
+            recompute_paused=recompute_paused,
+            inflight_request_ids=set(),
+        )
+
+        assert not success
+        assert req_it_end == 3
+        assert evicted == [evicted_victim]
+        assert recompute_paused == []
+        assert recompute_pause_state.victim_indices == set()
+        mgr.free_resources.assert_not_called()
 
     def test_recompute_pause_does_not_shrink_scheduling_range(self):
         """Only the recompute victim is skipped; later work stays eligible."""

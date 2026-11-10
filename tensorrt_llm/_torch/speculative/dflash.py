@@ -1374,6 +1374,9 @@ class DFlashWorker(SpecWorkerBase):
         self, draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager=None
     ):
         self._validate_draft_attention_backend(draft_model)
+        # Read before any fallback below drops the manager: the scheduler pairs
+        # the two pools on this flag whatever the drafter ends up reading.
+        joins_reuse = bool(getattr(draft_kv_cache_manager, "enable_joint_kv_cache_reuse", False))
         self._ctx_unified_cache = (
             draft_kv_cache_manager is not None
             and draft_kv_cache_manager is getattr(attn_metadata, "kv_cache_manager", None)
@@ -1407,6 +1410,7 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_block_tables_read = None
         self._ctx_block_counts = None
         self._paged_latent_prepare = False
+        self._ctx_reuse_addressable = False
         max_batch = spec_metadata.max_num_requests
 
         # ctx_len is 1:1 with the target's positions, so max_seq_len bounds it.
@@ -1636,19 +1640,7 @@ class DFlashWorker(SpecWorkerBase):
             )
         self._ctx_buf_inited = True
 
-        if not self._ctx_reuse_addressable and getattr(
-            draft_kv_cache_manager, "enable_joint_kv_cache_reuse", False
-        ):
-            # Every fallback above (shape mismatch, stride mismatch, pool layer
-            # count) logs its own reason and then costs only memory -- except
-            # this one, where the scheduler goes on matching prefixes the
-            # drafter can no longer read. Silent, and it looks exactly like the
-            # unpaired build in every metric but acceptance length.
-            logger.warning(
-                "DFlash: the draft KV cache manager joins block reuse but the drafter "
-                "fell back to a private ctx arena, so a reused prefix's drafter K/V "
-                "stays unreachable and acceptance length drops as if unpaired."
-            )
+        self._check_ctx_reuse_addressable(joins_reuse)
 
         logger.info(
             f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
@@ -1656,6 +1648,31 @@ class DFlashWorker(SpecWorkerBase):
             f"dflash_attention_backend={self._dflash_attention_backend}, "
             f"reuse_addressable={self._ctx_reuse_addressable}"
         )
+
+    def _check_ctx_reuse_addressable(self, joins_reuse: bool) -> None:
+        """Flag a drafter that cannot read a reused prefix's K/V from its paired pool.
+
+        Every fallback in _lazy_init_ctx_buffers (no draft block offsets, shape
+        or stride mismatch, pool layer count) logs its own reason and then costs
+        only memory -- except under a paired draft pool, where the scheduler
+        goes on matching prefixes the drafter can no longer read. That shows in
+        no metric but acceptance length, so helix context parallelism raises
+        rather than serve at a silently lower acceptance rate.
+        """
+        if self._ctx_reuse_addressable or not joins_reuse:
+            return
+        message = (
+            f"{type(self).__name__}: the draft KV cache manager joins block reuse but "
+            "the drafter fell back to a private ctx arena, so a reused prefix's "
+            "drafter K/V stays unreachable and acceptance length drops as if unpaired."
+        )
+        if self.mapping is not None and self.mapping.has_cp_helix():
+            raise ValueError(
+                f"{message} Helix context parallelism with block reuse needs the drafter "
+                "to read the draft KV cache manager's pool; see the fallback reason "
+                "logged above, or set kv_cache_config.enable_block_reuse=False."
+            )
+        logger.warning(message)
 
     def _ctx_paged_index_args(self):
         """(kv_indices, kv_indptr) for the append op, and what ``rows`` means.
