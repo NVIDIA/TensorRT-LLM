@@ -181,6 +181,7 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
         struct Sm10xOnly : Base                                                                                        \
         {                                                                                                              \
             using typename Base::Params;                                                                               \
+            /** @brief Run the SM10x GEMM, waiting for producer grids on SM103. */                                     \
             CUTLASS_DEVICE                                                                                             \
             void operator()(Params const& params, char* smem_buf)                                                      \
             {                                                                                                          \
@@ -208,6 +209,7 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
         using Gemm = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;                                 \
     };                                                                                                                 \
                                                                                                                        \
+    /** @brief Build FP4 GEMM tensor, scale-factor, and scheduling arguments. */                                       \
     template <typename Gemm>                                                                                           \
     typename Gemm::Arguments                                                                                           \
         prepareGemmArgs_##ARCH_##_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_(void* D, \
@@ -266,6 +268,7 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
         return operator_args;                                                                                          \
     }                                                                                                                  \
                                                                                                                        \
+    /** @brief Query workspace or validate, initialize, and launch the FP4 GEMM. */                                    \
     template <>                                                                                                        \
     size_t genericFp4GemmKernelLauncher<cutlass::arch::ARCH_, T, cute::Int<CTA_M_>, cute::Int<CTA_N_>,                 \
         cute::Int<CTA_K_>, cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>, XSM_>(void* D, void const* A,      \
