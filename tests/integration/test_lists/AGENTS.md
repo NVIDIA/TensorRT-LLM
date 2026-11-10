@@ -35,4 +35,7 @@ Before editing `waives.txt` or changing a waived test-list entry, read the
   Use the actual stage prefix: `H100` is not an alias for `DGX_H100` or `H100_PCIe`.
   Repeated platform/SM strings in a name are also rewritten; verify the resulting match.
   For standard CPU stages use `full:CPU/`. List multiple platforms on separate lines.
-- Use the narrowest matching scope and include a bug link or brief reason.
+- Use case/function waives for isolated failures, or a temporary whole-entry
+  waive for widespread failures. Include tracking links or a reason and restore
+  the skipped coverage once the fixes are verified.
+- Keep this guide and the CI overview in sync when changing waive processing.
