@@ -566,7 +566,7 @@ def _step(text, diff, done):
         disaggregated_params=None,
     )
     return SimpleNamespace(
-        outputs=[output], _done=done, prompt_token_ids=[1], cached_tokens=0, finished=done
+        id=1, outputs=[output], _done=done, prompt_token_ids=[1], cached_tokens=0, finished=done
     )
 
 

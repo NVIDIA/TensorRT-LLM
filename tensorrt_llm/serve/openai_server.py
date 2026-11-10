@@ -136,7 +136,8 @@ from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
 from tensorrt_llm.serve.responses_utils import (guard_responses_stream,
-                                                keep_responses_stream_alive)
+                                                keep_responses_stream_alive,
+                                                name_responses_reply)
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
@@ -207,23 +208,6 @@ class _MsgspecRoute(KvHintsRoute):
 
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
-
-# The header in which a /v1/responses reply names the engine request it
-# answers; see _engine_request_id_headers.
-ENGINE_REQUEST_ID_HEADER = "x-trtllm-engine-request-id"
-
-
-def _engine_request_id_headers(promise: RequestOutput) -> Dict[str, str]:
-    """The response headers that name the engine request behind ``promise``.
-
-    A /v1/responses reply is named with a random ``resp_`` id, while the
-    server's log lines, perf metrics and post-processor hook name a request by
-    the id the engine gave it. ENGINE_REQUEST_ID_HEADER carries that id, so a
-    reply can be matched with them. The executor gives a request its id when
-    it accepts it, so ``promise`` always has one.
-    """
-    return {ENGINE_REQUEST_ID_HEADER: str(promise.request_id)}
-
 
 _warned_unresolvable_thinking = False
 
@@ -3563,6 +3547,14 @@ class OpenAIServer(_VideoRoutesMixin):
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,
             )
+            # The reply carries the executor client id (see
+            # name_responses_reply). The input messages were stored under the
+            # request's id before it was named.
+            stored_under = request.request_id
+            if (name_responses_reply(request, promise.request_id)
+                    and self.enable_store and request.store):
+                await self.conversation_store.rename_response(
+                    stored_under, request.request_id)
             if not self.postproc_worker_enabled:
                 # Set by the executor only for postprocessing it runs itself.
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
@@ -3574,7 +3566,6 @@ class OpenAIServer(_VideoRoutesMixin):
 
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
-            headers = _engine_request_id_headers(promise)
             if request.stream:
                 return ClosingStreamingResponse(
                     content=keep_responses_stream_alive(
@@ -3583,8 +3574,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                                        postproc_params),
                             streaming_processor.get_stream_failed_events,
                         )),
-                    media_type="text/event-stream",
-                    headers=headers)
+                    media_type="text/event-stream")
             else:
                 response = await create_response(promise, postproc_params)
                 # Context-only: the orchestrator may ask for the prompt as a
@@ -3598,8 +3588,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                    dtype=np.int32).tobytes()).decode("ascii")
                     response.prompt_token_ids = None
                 # by_alias: e.g. text.format.schema goes out under its wire name.
-                return JSONResponse(content=response.model_dump(by_alias=True),
-                                    headers=headers)
+                return JSONResponse(content=response.model_dump(by_alias=True))
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server

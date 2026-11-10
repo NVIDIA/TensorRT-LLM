@@ -1002,22 +1002,35 @@ def _as_a_worker_parses(request):
     return type(request).model_validate(msgspec.msgpack.decode(_encode_request_body(request)))
 
 
-async def _context_worker_answer(request, *_args, **_kwargs):
-    """A context worker's answer; a Responses one is named after the request_id it parsed."""
-    received = _as_a_worker_parses(request)
-    disagg_request_id = received.disaggregated_params.disagg_request_id
-    if not isinstance(received, ResponsesRequest):
-        return _make_chat_response("length", disagg_request_id=disagg_request_id)
-    response = _make_responses_response(status="incomplete")
-    response.id = received.request_id
-    response.finish_reason = "length"
-    response.prompt_token_ids = [1, 2, 3]
-    response.disaggregated_params = DisaggregatedParams(
-        request_type="context_only",
-        ctx_request_id=disagg_request_id,
-        disagg_request_id=disagg_request_id,
-    )
-    return response
+def _context_worker(finish_reason="length", retried_as=None):
+    """A context worker; a Responses answer is named after the request_id it parsed.
+
+    The request is handed off to generation unless ``finish_reason`` says the
+    context phase finished it. With ``retried_as``, the request reaches the
+    worker on a retry, which OpenAIHttpClient sends under a new disaggregated
+    request id, this one.
+    """
+
+    async def answer(request, *_args, **_kwargs):
+        if retried_as is not None:
+            request.disaggregated_params.disagg_request_id = retried_as
+        received = _as_a_worker_parses(request)
+        disagg_request_id = received.disaggregated_params.disagg_request_id
+        if not isinstance(received, ResponsesRequest):
+            return _make_chat_response(finish_reason, disagg_request_id=disagg_request_id)
+        handed_off = finish_reason == "length"
+        response = _make_responses_response(status="incomplete" if handed_off else "completed")
+        response.id = received.request_id
+        response.finish_reason = finish_reason
+        response.prompt_token_ids = [1, 2, 3]
+        response.disaggregated_params = DisaggregatedParams(
+            request_type="context_only",
+            ctx_request_id=disagg_request_id,
+            disagg_request_id=disagg_request_id,
+        )
+        return response
+
+    return answer
 
 
 async def _generation_worker_answer(request, *_args, **_kwargs):
@@ -1043,7 +1056,9 @@ async def _generation_worker_stream(request, *_args, **_kwargs):
     return _mock_streaming_response([b"data: " + msgspec.json.encode(created) + b"\n\n"])
 
 
-def _service_with_disagg_request_id_101(monkeypatch, schedule_style, generation_worker):
+def _service_with_disagg_request_id_101(
+    monkeypatch, schedule_style, generation_worker, context_worker=None
+):
     """A service that gives every request disaggregated request id 101."""
     monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
     service = _make_service(schedule_style)
@@ -1053,9 +1068,16 @@ def _service_with_disagg_request_id_101(monkeypatch, schedule_style, generation_
     service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {"server_info": {}}))
     service._ctx_client = AsyncMock()
     service._gen_client = AsyncMock()
-    service._ctx_client.send_request = AsyncMock(side_effect=_context_worker_answer)
+    service._ctx_client.send_request = AsyncMock(side_effect=context_worker or _context_worker())
     service._gen_client.send_request = AsyncMock(side_effect=generation_worker)
     return service
+
+
+def _names_sent(worker):
+    """The request_id of each request ``worker`` was sent, as it parsed them."""
+    return [
+        _as_a_worker_parses(call.args[0]).request_id for call in worker.send_request.call_args_list
+    ]
 
 
 @pytest.mark.asyncio
@@ -1119,6 +1141,77 @@ async def test_a_streamed_responses_reply_is_named_after_the_disagg_request_id(
     assert re.fullmatch(r"resp_101_[0-9a-f]{16}", name)
     for worker in (service._ctx_client, service._gen_client):
         assert _as_a_worker_parses(worker.send_request.call_args.args[0]).request_id == name
+
+
+@pytest.mark.asyncio
+async def test_a_reply_follows_a_retried_context_request_to_its_new_disagg_request_id(
+    monkeypatch,
+):
+    """The generation worker is sent ``resp_<new disagg_request_id>_<16 hex>``.
+
+    A retried context request gets a new disaggregated request id, which the
+    perf metrics record from then on; only that part of the name changes. A
+    request_id the client set is not renamed.
+    """
+    service = _service_with_disagg_request_id_101(
+        monkeypatch, "context_first", _generation_worker_answer, _context_worker(retried_as=202)
+    )
+
+    named = await service.openai_responses(ResponsesRequest(model="test-model", input="hello"))
+    client_named = await service.openai_responses(
+        ResponsesRequest(model="test-model", input="hello", request_id="resp_client")
+    )
+
+    assert re.fullmatch(r"resp_202_[0-9a-f]{16}", named.id)
+    assert _names_sent(service._gen_client) == [named.id, "resp_client"]
+    # The context worker was sent the name the request had before the retry.
+    assert _names_sent(service._ctx_client) == [
+        named.id.replace("resp_202_", "resp_101_"),
+        "resp_client",
+    ]
+    assert client_named.id == "resp_client"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True], ids=["non_streaming", "streaming"])
+async def test_a_reply_the_context_phase_finishes_after_a_retry_carries_the_new_id(
+    monkeypatch, stream
+):
+    """The context worker answered under the name from before the retry; the reply does not.
+
+    A request_id the client set is not renamed.
+    """
+    service = _service_with_disagg_request_id_101(
+        monkeypatch,
+        "context_first",
+        _generation_worker_answer,
+        _context_worker(finish_reason="stop", retried_as=202),
+    )
+
+    async def reply_names(**fields):
+        reply = await service.openai_responses(
+            ResponsesRequest(model="test-model", input="hello", stream=stream, **fields)
+        )
+        if not stream:
+            return [reply.id]
+        names = []
+        async for event in reply:
+            data = next(line for line in event.decode().splitlines() if line.startswith("data: "))
+            names.append(msgspec.json.decode(data.removeprefix("data: "))["response"]["id"])
+        assert len(names) == 3, names
+        return names
+
+    named = await reply_names()
+    client_named = await reply_names(request_id="resp_client")
+
+    service._gen_client.send_request.assert_not_awaited()
+    assert re.fullmatch(r"resp_202_[0-9a-f]{16}", named[0])
+    assert named == [named[0]] * len(named)
+    assert _names_sent(service._ctx_client) == [
+        named[0].replace("resp_202_", "resp_101_"),
+        "resp_client",
+    ]
+    assert client_named == ["resp_client"] * len(client_named)
 
 
 @pytest.mark.asyncio
