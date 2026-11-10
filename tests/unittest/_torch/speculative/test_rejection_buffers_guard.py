@@ -34,7 +34,7 @@ pytestmark = pytest.mark.skipif(
 R, K, V = 8, 4, 32  # max_num_requests, max_draft_len, vocab_size
 
 
-def _alloc_meta(**over):
+def _alloc_meta(**over: object) -> types.SimpleNamespace:
     base = dict(
         use_rejection_sampling=True,
         draft_probs=None,
@@ -51,7 +51,7 @@ def _alloc_meta(**over):
     return types.SimpleNamespace(**base)
 
 
-def test_padding_onehot_rejects_the_scratch_row():
+def test_padding_onehot_rejects_the_scratch_row() -> None:
     m = _alloc_meta(draft_probs_last_dim=0, dummy_slot_row=0, is_cuda_graph=False)
     SpecMetadata.prepare_rejection_sampling_buffers(m)
     assert m.dummy_slot_row == R
