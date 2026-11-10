@@ -2334,10 +2334,21 @@ class KvCacheCreator:
 
         Disaggregated serving shares only when TRTLLM_DISAGG_SHARED_DRAFT_KV
         is "1" or "auto". Unset, it is "auto" for a manager that hosts explicit
-        draft layers, whose separate draft pool is not transferred.
+        draft layers, whose separate draft pool is not transferred. Such a
+        manager's disaggregated workers must all decide alike, so a setting
+        each worker sets on its own raises here instead of falling back.
         """
-        blocker = self._dflash_unify_blocker()
+        blocker, worker_local = self._dflash_unify_blocker_and_scope()
         if blocker is not None:
+            if (worker_local and self._is_disagg and
+                    os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") != "0"):
+                raise ValueError(
+                    f"{self._unified_drafter_name()}: disaggregated workers "
+                    "keep the draft KV in the target's KV cache manager "
+                    "unless TRTLLM_DISAGG_SHARED_DRAFT_KV=0, but on this "
+                    f"worker {blocker}. Change that setting, or set "
+                    "TRTLLM_DISAGG_SHARED_DRAFT_KV=0 on every worker to keep "
+                    "a separate draft KV cache.")
             if (self._speculative_config is not None
                     and self._unified_drafter_attention_backend() is not None
                     and self._kv_cache_manager_hosts_draft_layers()):
@@ -2384,6 +2395,28 @@ class KvCacheCreator:
 
     def _dflash_unify_blocker(self) -> Optional[str]:
         """The reason target and drafter layers cannot share one manager, or None."""
+        return self._dflash_unify_blocker_and_scope()[0]
+
+    def _dflash_unify_blocker_and_scope(self) -> tuple[Optional[str], bool]:
+        """The unify blocker, and whether a worker-local setting causes it.
+
+        For a manager hosting draft layers, settings every disaggregated worker
+        shares (checkpoints, speculative config, attention implementation) are
+        checked first; settings each worker sets on its own (parallelism,
+        pool_ratio, sequence and window limits, KV compression or mixed
+        precision) count only when nothing shared blocks.
+        """
+        hosts_draft_layers = self._kv_cache_manager_hosts_draft_layers()
+        blocker = self._dflash_shared_unify_blocker(
+            defer_worker_local=hosts_draft_layers)
+        if blocker is not None or not hosts_draft_layers:
+            return blocker, False
+        blocker = self._hosting_worker_local_blocker()
+        return blocker, blocker is not None
+
+    def _dflash_shared_unify_blocker(self, *,
+                                     defer_worker_local: bool) -> Optional[str]:
+        """The unify blocker, skipping worker-local settings if deferred."""
         spec_config = self._speculative_config
         if spec_config is None:
             return "speculative decoding is not enabled"
@@ -2404,20 +2437,21 @@ class KvCacheCreator:
             return "draft_len_schedule is set"
         if self._draft_config is None:
             return "there is no draft model config"
-        if self._mapping.pp_size != 1:
+        if not defer_worker_local and self._mapping.pp_size != 1:
             return f"pipeline_parallel_size is {self._mapping.pp_size}, not 1"
-        if self._mapping.cp_size != 1:
+        if not defer_worker_local and self._mapping.cp_size != 1:
             return f"context_parallel_size is {self._mapping.cp_size}, not 1"
         if self._llm_args.attn_backend != "TRTLLM":
             return f"the target attn_backend is {self._llm_args.attn_backend}, not TRTLLM"
         if _has_variable_kv_cache_geometry(
                 self._model_engine.model.model_config):
             return "the target uses different KV cache geometry across layers"
-        if getattr(self._kv_cache_config, "mixed_precision_kv",
-                   None) is not None:
-            return "retained-token mixed-precision KV cache is enabled"
-        if self._llm_args.kv_cache_compression_config is not None:
-            return "KV cache compression is enabled"
+        if not defer_worker_local:
+            if getattr(self._kv_cache_config, "mixed_precision_kv",
+                       None) is not None:
+                return "retained-token mixed-precision KV cache is enabled"
+            if self._llm_args.kv_cache_compression_config is not None:
+                return "KV cache compression is enabled"
         # Specialized managers add cache roles and lifecycle protocols that an
         # external drafter cannot yet describe. Keep their existing fallback
         # unless the manager hosts explicit draft layer specs.
@@ -2440,23 +2474,15 @@ class KvCacheCreator:
             return "the target or drafter has variable per-layer KV geometry"
         # The drafter's shared context block table indexes all its layers
         # through one lifecycle; mixed windows need the separate manager.
-        draft_windows = _resolve_v2_max_attention_window_vec(
-            self._get_draft_max_attention_window(self._unification_max_seq_len,
-                                                 self._kv_cache_config),
-            self._unification_max_seq_len,
-            list(
-                self._mapping.pp_layers(
-                    int(draft_model_config.pretrained_config.num_hidden_layers))
-            ))
-        if len(set(draft_windows)) > 1:
+        if not defer_worker_local and len(set(
+                self._unified_draft_windows())) > 1:
             logger.info_once(
                 f"{self._unified_drafter_name()}: draft layers have different "
                 "effective attention windows; keeping a separate draft KV cache.",
                 key="dflash_mixed_draft_windows_fallback")
             return "the draft layers use different attention windows"
         if hosts_draft_layers:
-            blocker = self._hosting_manager_blocker(target_layout, draft_layout,
-                                                    draft_windows)
+            blocker = self._hosting_manager_blocker(target_layout, draft_layout)
             if blocker is not None:
                 return blocker
             target_heads, draft_heads = (getattr(
@@ -2484,14 +2510,54 @@ class KvCacheCreator:
                     "(kv_heads, head_dim, dtype, k_only)")
         return None
 
+    def _parallelism_or_kv_format_blocker(self) -> Optional[str]:
+        """A blocker from PP, CP, mixed-precision KV or KV compression, or None."""
+        if self._mapping.pp_size != 1:
+            return f"pipeline_parallel_size is {self._mapping.pp_size}, not 1"
+        if self._mapping.cp_size != 1:
+            return f"context_parallel_size is {self._mapping.cp_size}, not 1"
+        if getattr(self._kv_cache_config, "mixed_precision_kv",
+                   None) is not None:
+            return "retained-token mixed-precision KV cache is enabled"
+        if self._llm_args.kv_cache_compression_config is not None:
+            return "KV cache compression is enabled"
+        return None
+
+    def _unified_draft_windows(self) -> List[Optional[int]]:
+        """The draft layers' resolved attention windows on this rank."""
+        draft_model_config = self._get_draft_kv_model_config()
+        return _resolve_v2_max_attention_window_vec(
+            self._get_draft_max_attention_window(self._unification_max_seq_len,
+                                                 self._kv_cache_config),
+            self._unification_max_seq_len,
+            list(
+                self._mapping.pp_layers(
+                    int(draft_model_config.pretrained_config.num_hidden_layers))
+            ))
+
     def _hosting_manager_blocker(
-            self, target_layout: tuple[int, int, object,
-                                       bool], draft_layout: tuple[int, int,
-                                                                  object, bool],
-            draft_windows: List[Optional[int]]) -> Optional[str]:
+        self, target_layout: tuple[int, int, object, bool],
+        draft_layout: tuple[int, int, object, bool]
+    ) -> Optional[str]:
         """Why a manager hosting draft layer specs would refuse this layout, or None."""
         if draft_layout[2] == tensorrt_llm.bindings.DataType.NVFP4:
             return "the target's KV cache manager does not host NVFP4 draft layers"
+        head_major = getattr(self._kv_cache_manager_cls,
+                             "main_kv_is_head_major", None)
+        if (self._is_disagg and head_major is not None and not head_major(
+                self._sparse_attention_config, target_layout[2])):
+            return ("the target's KV cache manager transfers draft layers "
+                    "only with the HND K/V layout")
+        return None
+
+    def _hosting_worker_local_blocker(self) -> Optional[str]:
+        """Why a hosting manager would refuse this worker's own settings, or None."""
+        blocker = self._parallelism_or_kv_format_blocker()
+        if blocker is not None:
+            return blocker
+        draft_windows = self._unified_draft_windows()
+        if len(set(draft_windows)) > 1:
+            return "the draft layers use different attention windows"
         target_model_config = self._model_engine.model.model_config
         target_window_config = self._kv_cache_config.max_attention_window
         if target_window_config is None:
@@ -2516,12 +2582,6 @@ class KvCacheCreator:
             return (
                 f"kv_cache_config.pool_ratio has {len(pool_ratio)} entries, "
                 f"not one per lifecycle ({num_lifecycles})")
-        head_major = getattr(self._kv_cache_manager_cls,
-                             "main_kv_is_head_major", None)
-        if (self._is_disagg and head_major is not None and not head_major(
-                self._sparse_attention_config, target_layout[2])):
-            return ("the target's KV cache manager transfers draft layers "
-                    "only with the HND K/V layout")
         return None
 
     @staticmethod

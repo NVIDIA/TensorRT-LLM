@@ -14,6 +14,7 @@
 # limitations under the License.
 """A standalone DSpark drafter's layers as explicit draft layer specs of the MiniMax-M3 manager."""
 
+import re
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Optional
@@ -538,6 +539,7 @@ def _gate_creator(
     plain_v2: bool = False,
     nvfp4_target: bool = True,
     speculative: bool = True,
+    pp_size: int = 1,
 ) -> KvCacheCreator:
     """``_dspark_creator`` with one setting changed, for the unify-gate table."""
     creator = _dspark_creator(is_disagg=is_disagg, context_kernel=context_kernel)
@@ -554,6 +556,7 @@ def _gate_creator(
         creator._pool_ratio_in = pool_ratio
     creator._sparse_attention_config = SimpleNamespace(implementation=implementation)
     creator._mapping.tp_size = tp_size
+    creator._mapping.pp_size = pp_size
     if plain_v2:
         creator._kv_cache_manager_cls = KVCacheManagerV2
     if not nvfp4_target:
@@ -566,6 +569,8 @@ def _gate_creator(
 
 
 _BOTH = (False, True)
+# A disaggregated worker raises at startup rather than decide apart from its peer.
+_RAISES = "raises"
 # (id, workers, TRTLLM_DISAGG_SHARED_DRAFT_KV, creator settings, unifies, blocker substring or None)
 _GATE_CASES = [
     ("hosting-manager", _BOTH, "1", {}, True, None),
@@ -578,8 +583,21 @@ _GATE_CASES = [
     ("page-96", _BOTH, "1", dict(tokens_per_block=96), False, "96-token pages"),
     ("page-256", _BOTH, "1", dict(tokens_per_block=256), True, None),
     ("nvfp4-draft", _BOTH, "1", dict(nvfp4_draft=True), False, "NVFP4 draft layers"),
-    ("shared-lifecycle", _BOTH, "1", dict(draft_window=None), False, "share a KV cache lifecycle"),
-    ("pool-ratio-arity", _BOTH, "1", dict(pool_ratio=[1.0]), False, "pool_ratio has 1 entries"),
+    # Settings each disaggregated worker sets on its own: aggregated serving and an explicit
+    # opt-out fall back to the separate draft KV cache; otherwise the worker refuses to start.
+    ("shared-lifecycle", (False,), "1", dict(draft_window=None), False, "share a KV cache lifecycle"),
+    ("shared-lifecycle", (True,), "1", dict(draft_window=None), _RAISES, "share a KV cache lifecycle"),
+    ("shared-lifecycle-unset-env", (True,), None, dict(draft_window=None), _RAISES, "lifecycle"),
+    ("shared-lifecycle-opt-out", (True,), "0", dict(draft_window=None), False, "lifecycle"),
+    ("pool-ratio-arity", (False,), "1", dict(pool_ratio=[1.0]), False, "pool_ratio has 1 entries"),
+    ("pool-ratio-arity", (True,), "1", dict(pool_ratio=[1.0]), _RAISES, "pool_ratio has 1 entries"),
+    ("pool-ratio-arity-unset-env", (True,), None, dict(pool_ratio=[1.0]), _RAISES, "pool_ratio"),
+    ("pool-ratio-arity-opt-out", (True,), "0", dict(pool_ratio=[1.0]), False, "pool_ratio"),
+    ("pp2", (False,), None, dict(pp_size=2), False, "pipeline_parallel_size is 2"),
+    ("pp2", (True,), None, dict(pp_size=2), _RAISES, "pipeline_parallel_size is 2"),
+    ("pp2-opt-out", (True,), "0", dict(pp_size=2), False, "pipeline_parallel_size is 2"),
+    # A setting every worker shares decides first, so a worker-local one alongside it falls back.
+    ("pp2-nvfp4-draft", (True,), None, dict(pp_size=2, nvfp4_draft=True), False, "NVFP4 draft"),
     ("pool-ratio-per-lifecycle", _BOTH, "1", dict(pool_ratio=[0.9, 0.1]), True, None),
     ("triton-nhd", (False,), "1", dict(implementation="triton"), True, None),
     ("triton-nhd", (True,), "1", dict(implementation="triton"), False, "HND K/V layout"),
@@ -666,8 +684,8 @@ def test_unify_gate(
     """MiniMax-M3's manager hosts a DSpark drafter unless a layout it or transfer refuses applies.
 
     Disaggregated workers share a hosting manager's draft KV unless opted out, and a plain V2
-    manager's only on request; the refused layouts keep the separate draft KV cache instead of
-    failing at construction.
+    manager's only on request. Layouts refused for a reason every worker shares keep the separate
+    draft KV cache; a disaggregated worker whose own settings are refused fails at startup.
     """
     if env is None:
         monkeypatch.delenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", raising=False)
@@ -679,4 +697,9 @@ def test_unify_gate(
         assert reason is None
     else:
         assert reason is not None and blocker in reason
-    assert creator._should_unify_dflash_kv_cache() is unifies
+    if unifies == _RAISES:
+        match = re.escape(blocker) + r".*TRTLLM_DISAGG_SHARED_DRAFT_KV=0 on every worker"
+        with pytest.raises(ValueError, match=match):
+            creator._should_unify_dflash_kv_cache()
+    else:
+        assert creator._should_unify_dflash_kv_cache() is unifies
