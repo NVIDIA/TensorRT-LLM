@@ -2924,12 +2924,15 @@ def _drafter_reads_helix_sharded_context(
 
 
 def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
-    """What keeps the context and generation servers from sharing draft KV, or None."""
-    with_spec = {
-        cfg.type
-        for cfg in server_configs if cfg.other_args.get("speculative_config")
-    }
-    if with_spec != {"ctx", "gen"}:
+    """What keeps the context and generation servers from sharing draft KV, or None.
+
+    A config may list only one side: a DWDP context MPI world launches its
+    context servers from a config without generation servers, which run as a
+    separate launch. Such a config is checked for its own side; the peer
+    handshake rejects a pair whose sides disagree.
+    """
+    if not server_configs or not all(
+            cfg.other_args.get("speculative_config") for cfg in server_configs):
         return ("speculative_config in both context_servers and "
                 "generation_servers")
     # Ranks hold the same KV heads when their attention TP matches: attention

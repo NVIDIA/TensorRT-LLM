@@ -596,3 +596,36 @@ def test_shared_draft_kv_page_size_follows_the_dspark_drafter_backend(
     ]
     blocker = _shared_draft_kv_blocker(configs)
     assert (blocker is not None) == blocked
+
+
+@pytest.mark.parametrize(
+    "roles_with_spec, blocked",
+    [((("ctx", True), ), False), ((("ctx", True), ("ctx", True)), False),
+     ((("ctx", True), ("ctx", False)), True),
+     ((("ctx", True), ("gen", False)), True), ((("gen", True), ), False),
+     ((), True)],
+)
+def test_shared_draft_kv_checks_a_one_sided_config_for_its_own_side(
+        roles_with_spec, blocked):
+    """A DWDP context MPI world's config lists only its context servers."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm.commands.serve import _shared_draft_kv_blocker
+
+    spec = {"decoding_type": "DSpark", "attention_backend": "CUTEDSL"}
+    configs = [
+        SimpleNamespace(
+            type=role,
+            other_args={
+                "tensor_parallel_size": 1,
+                "kv_cache_config": {
+                    "tokens_per_block": 64
+                },
+                **({
+                    "speculative_config": spec
+                } if has_spec else {}),
+            },
+        ) for role, has_spec in roles_with_spec
+    ]
+    blocker = _shared_draft_kv_blocker(configs)
+    assert (blocker is not None) == blocked
