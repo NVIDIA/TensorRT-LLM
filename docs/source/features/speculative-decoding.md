@@ -53,7 +53,7 @@ EAGLE 3 can be combined with the [Suffix Automaton enhancement](#suffix-automato
 
 Dynamic tree mode enables tree-structured draft generation for EAGLE 3 and MTP-Eagle, where the drafter expands multiple candidate tokens at each layer instead of a single token. This can improve acceptance rates compared to linear drafting at the cost of additional compute per generation step.
 
-With `MTPDecodingConfig`, dynamic trees require a checkpoint with exactly one MTP layer and `use_mtp_vanilla=False` (MTP-Eagle). Vanilla MTP and multi-layer MTP checkpoints do not support this dynamic-tree path.
+With `MTPDecodingConfig`, dynamic trees require a checkpoint with exactly one MTP layer and `use_mtp_vanilla=False` (MTP-Eagle). Vanilla MTP and multi-layer MTP checkpoints do not support this dynamic-tree path. The MTP-Eagle dynamic-tree path supports greedy decoding only; non-greedy sampling is unsupported.
 
 To enable dynamic tree mode, set `use_dynamic_tree=True` on `Eagle3DecodingConfig` or a supported MTP-Eagle `MTPDecodingConfig` and provide the following parameters:
 
@@ -335,7 +335,13 @@ Other drafting configurations differ:
 
 ### Acceptance-rate cutoff
 
-For configurations that support disabling speculation, set both `acceptance_rate_window_size=N` (a positive integer) and `acceptance_rate_threshold` (between 0 and 1) to enable the rolling acceptance-rate cutoff. Each speculation-enabled decoding iteration contributes its true acceptance rate, `accepted_draft_tokens / drafted_tokens`. After at least `N` samples, speculation is disabled permanently for that executor once the average of the latest `N` samples falls below the threshold. Unlike the batch-size cutoff, this does not re-enable speculation when conditions improve.
+For configurations that support disabling speculation, set both `acceptance_rate_window_size=N` (a positive integer) and `acceptance_rate_threshold` (between 0 and 1) to enable the rolling acceptance-rate cutoff. After at least `N` recorded samples, speculation is disabled permanently for that executor once the average of the latest `N` recorded acceptance ratios falls below the threshold. Unlike the batch-size cutoff, this does not re-enable speculation when conditions improve.
+
+```{warning}
+The cutoff can underestimate acceptance when a batch-size schedule shortens the draft: it can divide the accepted-token count by the larger reserved draft-token count instead of the number actually verified in that iteration. With the schedule above at batch size 5, accepting both verified draft tokens per request can therefore record `2/3`. A window of 1 and a threshold of `0.9` then permanently disable speculation even though every verified draft token was accepted.
+
+Leave the acceptance-rate cutoff disabled when using `draft_len_schedule` or `max_concurrency` in the current implementation.
+```
 
 The feature is disabled when the window is unset or zero, or the threshold is unset. Model-specific restrictions still apply; for example, Kimi K3 helix rejects these acceptance-rate options.
 
