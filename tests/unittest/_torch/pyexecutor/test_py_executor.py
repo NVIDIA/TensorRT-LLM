@@ -1757,7 +1757,6 @@ def _make_transfer_coordinator(
     *,
     active_requests=None,
     canceled_request_ids=(),
-    force_terminate_ctx_for_partial_reuse: bool = False,
     tp_size: int = 1,
 ):
     """Coordinator over mocked services; returns (coordinator, transceiver, effects)."""
@@ -1780,7 +1779,6 @@ def _make_transfer_coordinator(
             canceled_request_ids=lambda: list(canceled_request_ids),
         ),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=force_terminate_ctx_for_partial_reuse,
     )
     return coordinator, transceiver, effects
 
@@ -1841,11 +1839,11 @@ class TestDisaggTerminationGuard:
         AND out of new_active_requests, so it is removed from active_requests
         but retained by AsyncTransferManager. The coordinator's release must
         then terminate it exactly once when the transfer completes
-        (force_terminate_ctx_for_partial_reuse=False)."""
+        (release_transfer terminates the departed request regardless of the
+        flag)."""
         req = Mock()
         coordinator, _, effects = _make_transfer_coordinator(
             active_requests=[],  # already removed by _handle_responses
-            force_terminate_ctx_for_partial_reuse=False,
         )
         coordinator._transfers.end_transfer.return_value = True
 
@@ -1860,7 +1858,6 @@ class TestDisaggTerminationGuard:
         req = Mock()
         coordinator, _, effects = _make_transfer_coordinator(
             active_requests=[],  # early termination deferred until transfer release
-            force_terminate_ctx_for_partial_reuse=True,
         )
         coordinator._transfers.end_transfer.return_value = True
 

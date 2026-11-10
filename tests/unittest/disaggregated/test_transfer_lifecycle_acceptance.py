@@ -191,7 +191,6 @@ class _ReceiveCase:
                 canceled_request_ids=lambda: self.cancelled_ids,
             ),
             enable_attention_dp=True,
-            force_terminate_ctx_for_partial_reuse=False,
         )
 
     def _publish(self, task: KVRecvTask) -> None:

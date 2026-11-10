@@ -108,7 +108,6 @@ def _coordinator(
         effects=SimpleNamespace(revert_ctx_alloc=Mock()),
         registry=SimpleNamespace(active_requests=lambda: list(active_requests)),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
         admission_controller=controller,
         is_kv_manager_v2=True,
     )
@@ -465,7 +464,6 @@ def test_gen_timeout_start_and_observation_share_request_identity(
         effects=SimpleNamespace(prepare_gen_resources=Mock()),
         registry=SimpleNamespace(active_requests=lambda: [request]),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
     )
     coordinator.reap_gen_receives = Mock()
 
@@ -601,7 +599,6 @@ def test_ctx_send_ready_and_timeout_start_follow_transfer_handoff(
         effects=None,
         registry=SimpleNamespace(canceled_request_ids=lambda: []),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
     )
 
     def emit_event(event: str, **kwargs) -> None:
@@ -670,7 +667,6 @@ def test_ctx_send_continues_when_diagnostic_preparation_fails(
         effects=None,
         registry=SimpleNamespace(canceled_request_ids=lambda: []),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
     )
 
     monkeypatch.setattr(diagnostics, "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
@@ -728,7 +724,6 @@ def test_bridge_validation_rejection_emits_failed_ctx_settlement_after_release(
         effects=None,
         registry=SimpleNamespace(canceled_request_ids=lambda: []),
         enable_attention_dp=False,
-        force_terminate_ctx_for_partial_reuse=False,
     )
     coordinator.release_transfer = lambda req: operations.append(("release", req))
 

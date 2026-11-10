@@ -31,6 +31,9 @@ if TYPE_CHECKING:
 
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 
+_LEGACY_RETIRE_RETRY_INTERVAL = 2
+"""Polls to wait between legacy cancel retries on an idle decode worker."""
+
 
 def is_gen_only_no_context_benchmark() -> bool:
     """Whether the ``gen_only_no_context`` benchmark skips KV transfer."""
@@ -94,7 +97,6 @@ class DisaggTransferCoordinator:
         effects: ExecutorEffects,
         registry: ActiveRequestRegistry,
         enable_attention_dp: bool,
-        force_terminate_ctx_for_partial_reuse: bool,
         draft_kv_cache_manager=None,
         admission_controller: Optional[DisaggTransferAdmissionController] = None,
         is_kv_manager_v2: bool = False,
@@ -108,7 +110,6 @@ class DisaggTransferCoordinator:
         self._effects = effects
         self._registry = registry
         self._enable_attention_dp = enable_attention_dp
-        self._force_terminate_ctx_for_partial_reuse = force_terminate_ctx_for_partial_reuse
         # Transfer-window budget; None or a disabled controller means no window.
         self._admission_controller = admission_controller
         self._is_kv_manager_v2 = is_kv_manager_v2
@@ -118,7 +119,12 @@ class DisaggTransferCoordinator:
         # Timed-out generation requests whose error response waits for the
         # ADP-safe consensus point.
         self._pending_timed_out_requests: List[LlmRequest] = []
-        # Requests whose timed-out transfer was already cancelled in flight.
+        # Retire attempts whose legacy cancel could not yet prove page release;
+        # retried only every second poll so an idle decode worker's re-poll
+        # loop (pace_idle sleeps ~1 ms) does not hammer transceivers that
+        # cannot cancel an already-started receive.
+        self._legacy_retire_retry: Dict[int, int] = {}
+        self._legacy_retire_poll_index = 0
         self._timed_out_ctx_cancelled_ids: Set[int] = set()
         self._timed_out_gen_cancelled_ids: Set[int] = set()
         self._inflight_cancel_unsupported_logged = False
@@ -257,6 +263,8 @@ class DisaggTransferCoordinator:
             return
         canceled_ids = set(self._registry.canceled_request_ids())
         retired = False
+        poll_index = self._legacy_retire_poll_index
+        self._legacy_retire_poll_index = poll_index + 1
         for request in list(self._registry.active_requests()):
             if not request.is_generation_only_request or self._vote_id(request) in canceled_ids:
                 continue
@@ -267,12 +275,20 @@ class DisaggTransferCoordinator:
                 or request.state == LlmRequestState.DISAGG_TRANS_ERROR
             ):
                 continue
+            request_id = request.py_request_id
+            if poll_index < self._legacy_retire_retry.get(request_id, 0):
+                continue
             if self.request_cancellation(request):
                 # The cancel contract proves no transfer still owns these KV
                 # pages. Clear the in-progress state before the error handler
                 # checks ownership, so it can terminate instead of parking.
                 request.state = LlmRequestState.DISAGG_TRANS_ERROR
+                self._legacy_retire_retry.pop(request_id, None)
                 retired = True
+            else:
+                # Legacy transceivers refuse receives that already started;
+                # retry later instead of on every idle poll.
+                self._legacy_retire_retry[request_id] = poll_index + _LEGACY_RETIRE_RETRY_INTERVAL
         if retired:
             self._check_transfer_errors("generation requests")
 
@@ -944,6 +960,7 @@ class DisaggTransferCoordinator:
         """Drop per-request cancellation bookkeeping once the request is freed."""
         self._timed_out_ctx_cancelled_ids.discard(request_id)
         self._timed_out_gen_cancelled_ids.discard(request_id)
+        self._legacy_retire_retry.pop(request_id, None)
         self._unpublished_gen_receives.pop(request_id, None)
 
     @nvtx_range("cancel_timed_out_gen_transfers")
@@ -1105,7 +1122,6 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
             effects=None,
             registry=None,
             enable_attention_dp=False,
-            force_terminate_ctx_for_partial_reuse=False,
         )
 
     def handle_errors_synced(self) -> bool:
