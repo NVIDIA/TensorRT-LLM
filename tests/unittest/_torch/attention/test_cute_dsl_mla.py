@@ -204,8 +204,13 @@ def _select_mla_generation_fmha(
         (103, 96, 8, True, False, "cute_dsl_mla"),
         (100, 96, 8, True, False, "cute_dsl_mla"),
         (103, 96, 2, True, False, "cute_dsl_mla"),
-        # SM107 has no TRTLLM-Gen FMHA; the request keeps falling through.
-        (107, 96, 8, True, False, "trtllm_gen"),
+        # SM107 has no TRTLLM-Gen FMHA; the next library there is the generic
+        # fallback, so the verify group stays on the CuTe DSL kernel too
+        # (Kimi K3's FP8-KV layers under attention DP: H=96, MTP5 = 6 tokens).
+        (107, 96, 8, True, False, "cute_dsl_mla"),
+        (107, 96, 6, True, False, "cute_dsl_mla"),
+        # SM107 head counts outside the group keep the perf gate.
+        (107, 128, 8, True, False, "trtllm_gen"),
         # Helix H=96 verify groups are unchanged.
         (103, 96, 4, True, True, "cute_dsl_mla"),
         (107, 96, 4, True, True, "cute_dsl_mla"),
@@ -391,6 +396,7 @@ def test_mixed_batch_gate_admits_only_page_sizes_exclusive_to_cute_dsl(
         (100, 128, DataType.FP8, (), False),
         (103, 128, DataType.BF16, (), False),
         (107, 128, DataType.FP8, (), True),
+        (107, 128, DataType.BF16, (), True),
         # An NVFP4 manager's FP8 fallback layers on the FP4 MLA pages.
         (100, 128, DataType.NVFP4, (), True),
         (103, 128, DataType.NVFP4, (), True),

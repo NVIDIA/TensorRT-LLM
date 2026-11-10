@@ -118,7 +118,7 @@ class MxE2ECase:
     `final_manifest_exempt_patterns` lists `fnmatch` patterns of tensor names
     whose final-tier digest may legitimately differ between roles (never a
     numeric tolerance, never at the transfer tier). Every pattern needs a code
-    comment explaining why; no current row uses any.
+    comment explaining why; the current rows use none.
 
     `probe` selects the worker's behavioral probe: `text` sends token-ID
     prompts, and `image` sends image prompts so that vision-language rows also

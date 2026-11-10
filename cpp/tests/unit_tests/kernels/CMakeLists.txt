@@ -203,15 +203,9 @@ add_tllm_gtest(
   kernel
   SOURCES
   fmhaHead104Test.cpp
-  ${PROJECT_SOURCE_DIR}/tensorrt_llm/kernels/fmhaDispatcher.cpp
-  LINK_LIBRARIES
-  context_attention_src
-  trtllm_gen_fmha
-  tllm::common_environment
-  CUDA::cuda_driver
-  $<$<BOOL:${ENABLE_MULTI_DEVICE}>:NCCL::nccl>
+  FULL_STACK
   LABELS
-  "unit;kernels;fmha;gpu")
+  "unit;kernels;fmha;full-stack;gpu")
 add_tllm_gtest(
   fmhaDispatcherTest
   OWNER

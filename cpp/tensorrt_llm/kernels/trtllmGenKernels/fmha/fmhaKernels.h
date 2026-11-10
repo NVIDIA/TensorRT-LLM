@@ -893,14 +893,15 @@ private:
         {
             return;
         }
+        // The split cap is only set by the static-scheduler pre-clamp above; the autotuner reads
+        // but never sets it. The caller that reaches this clamp with an INT_MAX cap is the
+        // sparse-context FMHA branch of FmhaDispatcher::run(), which enables multiCtasKv so the
+        // autotuner can promote to CgaSmemReduction; it uses the persistent scheduler, so the
+        // Static-only pre-clamp does not apply. Clamp silently: the cap is simply unset here, not
+        // an explicitly configured value, so there is nothing actionable to report. Taking the min
+        // with the divided limit also avoids the signed overflow of clusterDimX * INT_MAX.
         constexpr int kMaxCgaClusterDimX = 16;
-        if (options.mClusterDimX * options.mMaxNumCtasPerSeqKv > kMaxCgaClusterDimX)
-        {
-            TLLM_LOG_WARNING(
-                "CGA reduction is not supported when numCtasPerSeqKv * clusterDimX > 16. Set mMaxNumCtasPerSeqKv to "
-                "16 / clusterDimX");
-            options.mMaxNumCtasPerSeqKv = kMaxCgaClusterDimX / options.mClusterDimX;
-        }
+        options.mMaxNumCtasPerSeqKv = std::min(options.mMaxNumCtasPerSeqKv, kMaxCgaClusterDimX / options.mClusterDimX);
     }
 
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
