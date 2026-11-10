@@ -165,7 +165,7 @@ CUDA_CB void hostFnDiskToDiskCopy(void* userData) noexcept
 
 CUDA_CB void hostFnDiskToHostCopy(void* userData) noexcept
 {
-    // @TODO: enable multi-threading with a thread pool
+    // Synchronous path, used when no disk I/O pool is running (disk_io_threads == 0).
     using Data = UserData<MemAddress, DiskAddress>;
     auto const data = std::unique_ptr<Data>(static_cast<Data*>(userData));
     bool success = true;
@@ -181,7 +181,7 @@ CUDA_CB void hostFnDiskToHostCopy(void* userData) noexcept
 
 CUDA_CB void hostFnHostToDiskCopy(void* userData) noexcept
 {
-    // @TODO: enable multi-threading with a thread pool
+    // Synchronous path, used when no disk I/O pool is running (disk_io_threads == 0).
     using Data = UserData<DiskAddress, MemAddress>;
     auto const data = std::unique_ptr<Data>(static_cast<Data*>(userData));
     bool success = true;
@@ -211,13 +211,15 @@ CUDA_CB void hostFnHostToHostCopy(void* userData) noexcept
     }
 }
 
-// Asynchronous disk I/O. CUDA runs all host functions of a process on one thread, so with the synchronous path
-// every disk transfer waits for every other one. Here the host function only hands the transfer to a worker pool,
-// and the stream waits on a completion flag (cuStreamWaitValue64), so stream ordering is unchanged. Each transfer
-// is split into kDiskIoChunkBytes pieces.
+// Asynchronous disk I/O. CUDA may run host functions one at a time (in practice on one driver thread), so with the
+// synchronous path every disk transfer can wait for every other one. Here the host function only hands the transfer to
+// a worker pool, and the stream waits on a completion flag (cuStreamWaitValue64), so stream ordering is unchanged. Each
+// transfer is split into kDiskIoChunkBytes pieces.
 namespace
 {
 
+// Large enough that per-piece syscall and queueing costs are small next to the copy, small enough that one large
+// transfer spreads over several workers and a read never waits long behind a write piece.
 constexpr ssize_t kDiskIoChunkBytes = ssize_t{4} << 20;
 
 // Background (write-through) bytes issued but not yet written are capped. A required write can end up waiting for a
@@ -237,6 +239,8 @@ thread_local bool tBackgroundDiskWrites = false;
 
 // Completion flags: a ring of words in pinned, device-mapped host memory. Transfer t uses word t % kNumCompletionFlags
 // and is complete once the word is >= t.
+// 64 Ki words (512 KiB of pinned memory): far more than the transfers ever in flight, so launchDiskTransfer
+// rarely has to wait before reusing a word.
 constexpr uint64_t kNumCompletionFlags = uint64_t{1} << 16;
 
 struct CompletionFlags

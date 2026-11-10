@@ -81,7 +81,7 @@ struct StorageStatistics
     TypedVec<PoolIndex, size_t> slotSizes;
     SlotCount total;     // total slots
     SlotCount free;      // free (unallocated) slots
-    SlotCount evictable; // scheduled for eviction
+    SlotCount evictable; // scheduled for eviction, plus reclaimable retained copies at a disk level
 
     SlotCount available() const noexcept
     {

@@ -5336,8 +5336,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "Worker threads for asynchronous disk KV cache I/O. The pool is process-wide: the first KV cache manager "
         "that sets a nonzero value starts it for the life of the process, and later values, including 0, do not "
         "change it. Without a pool, each disk transfer is a blocking read/write loop in a CUDA host callback, "
-        "which serializes disk transfers. Only used by KV cache manager v2 with a disk cache."
-    )
+        "and CUDA may run host callbacks one at a time, so disk transfers can serialize. Only used by KV "
+        "cache manager v2 with a disk cache.")
     disk_keep_copy_after_restore: bool = Field(
         default=False,
         status="prototype",
