@@ -805,6 +805,7 @@ def _test_sparse_offload_long_context(
         "gvr_deterministic_topk": True,
         "enable_kv_cache_offload": False,
     }
+    # Attention DP is off by design: the exact comparison uses TP attention.
     for config in (ctx_server_config, gen_server_config):
         config.update(max_batch_size=max_batch_size,
                       max_seq_len=max_seq_len,
@@ -2754,7 +2755,6 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             "tensor_parallel_size": 2,
             "pipeline_parallel_size": 1,
             "moe_expert_parallel_size": 2,
-            "enable_attention_dp": True,
             "disable_overlap_scheduler": True,
             "enable_chunked_prefill": True,
             "cuda_graph_config": None,
@@ -2767,7 +2767,6 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             "tensor_parallel_size": 2,
             "pipeline_parallel_size": 1,
             "moe_expert_parallel_size": 2,
-            "enable_attention_dp": True,
             "disable_overlap_scheduler": False,
             "enable_chunked_prefill": True,
             "trust_remote_code": True,
@@ -2949,7 +2948,6 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "tensor_parallel_size": 2,
             "moe_expert_parallel_size": 2,
-            "enable_attention_dp": True,
             "disable_overlap_scheduler": True,
             "moe_config": {
                 "backend": "TRTLLM",

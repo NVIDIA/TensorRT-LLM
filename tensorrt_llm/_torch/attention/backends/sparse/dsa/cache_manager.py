@@ -868,6 +868,11 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
         """Describe each local layer's MLA latent arena, by global layer index."""
         if not self._enable_kv_cache_offload:
             raise ValueError("Sparse offload metadata requires an offload-enabled cache manager")
+        if self.mixed_precision_high_dtype is not None:
+            raise NotImplementedError(
+                "DSA KV cache offload does not support mixed-precision KV cache: the arena "
+                "path would read every row from the NVFP4 latent without the high-precision rows"
+            )
         layout = self._sparse_arena_layout()
         leaders = self._selection_leaders()
         return {

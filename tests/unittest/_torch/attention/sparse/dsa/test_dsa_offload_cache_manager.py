@@ -235,6 +235,12 @@ def test_offload_refuses_the_unified_pool_view(manager):
         manager.get_unique_primary_pool()
 
 
+def test_offload_refuses_mixed_precision_kv(manager):
+    manager.mixed_precision_high_dtype = DataType.FP8
+    with pytest.raises(NotImplementedError, match="mixed-precision"):
+        manager.get_sparse_offload_descriptors()
+
+
 def test_decode_step_writes_fetches_and_advances_history(manager):
     prompt_len = 3 * TOKENS_PER_BLOCK + 5
     request = _request(7, prompt_len)
