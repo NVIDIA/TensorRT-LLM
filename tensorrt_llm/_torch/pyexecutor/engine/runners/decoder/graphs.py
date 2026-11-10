@@ -976,7 +976,11 @@ class DecoderCudaGraphs:
         listed = getattr(self._config.cuda_graph_config, "sampling_variants", None)
         if listed is not None:
             # Judged from the config: the speculative metadata may not exist before the first pass.
-            temperature_only_graphs = supports_temperature_only_graphs(self._config, self.mapping)
+            # Batches never select temperature_only with rejection sampling or penalties.
+            spec_config = self._config.spec_config
+            temperature_only_graphs = supports_temperature_only_graphs(
+                self._config, self.mapping
+            ) and not (spec_config.use_rejection_sampling or spec_config.enable_penalty)
         supported = {"greedy"}
         if supports_advanced_draft_sampling(self._config.spec_config):
             supported.add("advanced")

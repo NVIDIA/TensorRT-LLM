@@ -289,6 +289,7 @@ class DecodeCudaGraphConfig(BaseCudaGraphConfig):
     @classmethod
     def validate_sampling_variants(
             cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        """Reject a repeated variant."""
         if v is not None and len(set(v)) != len(v):
             raise ValueError("sampling_variants must not repeat a variant")
         return v
@@ -8624,17 +8625,23 @@ class TorchLlmArgs(BaseLlmArgs):
                 "cuda_graph_config.sampling_variants does not apply with confidence "
                 "scheduling, which plans each step's CUDA graph before the step's "
                 "sampling variant is known")
+        if "temperature_only" not in variants:
+            return self
         from tensorrt_llm._torch.speculative.interface import \
             supports_sharded_target_sampling
-        if "temperature_only" in variants and not supports_sharded_target_sampling(
-                spec_config,
-                types.SimpleNamespace(
-                    tp_size=self.tensor_parallel_size,
-                    enable_attention_dp=self.enable_attention_dp)):
+
+        # Batches never select temperature_only with rejection sampling or penalties.
+        if (spec_config.use_rejection_sampling or spec_config.enable_penalty
+                or not supports_sharded_target_sampling(
+                    spec_config,
+                    types.SimpleNamespace(
+                        tp_size=self.tensor_parallel_size,
+                        enable_attention_dp=self.enable_attention_dp))):
             raise ValueError(
                 "cuda_graph_config.sampling_variants lists 'temperature_only', which "
-                "needs MTP-Eagle one-model decoding without relaxed acceptance, "
-                "with tensor parallelism and without attention DP")
+                "needs MTP-Eagle one-model decoding with tensor parallelism and without "
+                "attention DP, relaxed acceptance, rejection sampling or penalties"
+            )
         return self
 
     @model_validator(mode="after")
