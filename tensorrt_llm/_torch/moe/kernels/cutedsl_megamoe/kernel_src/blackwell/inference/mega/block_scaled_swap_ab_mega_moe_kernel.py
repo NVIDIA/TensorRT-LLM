@@ -193,9 +193,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         if type(self.helper_expert_count) is not int or self.helper_expert_count < 0:
             raise ValueError("helper_expert_count must be a non-negative exact int")
         # Opt-in persistent scheduler for the separate top-k reduce.
-        self.topk_reduce_persistent = bool(
-            impl_desc.get("topk_reduce_persistent") and not self.reduce_topk_in_kernel
-        )
+        self.topk_reduce_persistent = bool(impl_desc.get("topk_reduce_persistent"))
+        if self.topk_reduce_persistent and self.reduce_topk_in_kernel:
+            raise ValueError("topk_reduce_persistent applies to the separate top-k reduce; reduce_topk_in_kernel has none.")
 
         self.occupancy = 1
         self.architecture = "sm_100"
@@ -224,6 +224,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 "internode=True selects token_comm_kind='internode_gin' and internode=False (the default) "
                 f"'nvlink'; got internode={self.internode}, token_comm_kind={self.token_comm_kind!r}."
             )
+        if self.internode:
+            # Not supported in this copy: with more than one node the relay weights are zero when top-k
+            # is applied after FC2, reuse_dispatch_warps and the in-kernel reduce drop the remote
+            # partials, and the tail reset can race late fc2_done mirror increments.
+            raise NotImplementedError("internode=True is not supported by this MegaMoE kernel package.")
         if not self.internode:
             stray = [key for key in _INTERNODE_IMPL_KEYS if key in impl_desc]
             if impl_desc.get("ranks_per_node", self.world_size) != self.world_size:

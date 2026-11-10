@@ -386,6 +386,9 @@ class GenphaseTokenComm(KernelComponent):
         self.token_padding_block = impl_desc["token_padding_block"]
         self.sf_padding_block = impl_desc["sf_padding_block"]
         self.pusher_cta_count = impl_desc["pusher_cta_count"]
+        if self.pusher_cta_count <= self.sf_pusher_cta_count:
+            # The first sf_pusher_cta_count pushers carry the scale factors; at least one more pushes data.
+            raise ValueError(f"pusher_cta_count must exceed {self.sf_pusher_cta_count}, got {self.pusher_cta_count}.")
         self.refine_participant_groups = impl_desc["refine_participant_groups"]
         self.refine_output_stages = impl_desc["refine_output_stages"]
         self.smem_limit_bytes = impl_desc.get("smem_limit_bytes", self.default_smem_limit_bytes)

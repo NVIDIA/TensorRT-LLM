@@ -762,7 +762,12 @@ class TopkReduce:
             for k in cutlass.range_constexpr(0, num_topk, 1):
                 if cutlass.const_expr(topk_score is not None and not prefetch):
                     score_reg[k] = topk_score[token_idx, Int32(k)]
-                score_pair = (Float32(score_reg[k]), Float32(score_reg[k]))
+                # An invalid slot adds an exact zero: its cell is an encoded zero, and its score is
+                # dropped too so a NaN/Inf weight cannot leak into the row.
+                score = Float32(score_reg[k])
+                if (valid_slots >> Int32(k)) & Int32(1) == Int32(0):
+                    score = Float32(0.0)
+                score_pair = (score, score)
 
                 for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
                     value_pair = (
