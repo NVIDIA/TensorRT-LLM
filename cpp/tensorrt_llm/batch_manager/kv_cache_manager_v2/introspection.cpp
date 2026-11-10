@@ -630,6 +630,7 @@ void KvCacheIntrospection::setLastAdjustmentTime(KvCacheManager& manager, double
 void KvCacheIntrospection::setTargetRatioListGpu(KvCacheManager& manager, TypedVec<PoolGroupIndex, float> value)
 {
     manager.mTargetRatioListHot = std::move(value);
+    ++manager.mTargetRatioGeneration;
 }
 
 namespace

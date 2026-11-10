@@ -1352,14 +1352,32 @@ class KVCacheV2Scheduler(RequestScheduler):
         """Free a first-chunk context's caches in every pool and rewind its cursor.
 
         Its next admission then starts from a fresh prefix match.
+
+        The caches are marked stats-excluded before they are freed, so their
+        close() does not feed the pool-ratio auto-tuner. A failed admission's
+        cache only covers the aborted attempt (a few hundred tokens for a 16K
+        prompt), and a waiting request fails admission again on every retry:
+        sampled, these closes swamp the averages with tiny lengths, shrink the
+        target for the pools the waiting requests need, and can keep long
+        prompts starved. ``_remove_kv_cache`` clears the mark after close().
         """
+        rid = req.py_request_id
         for manager in (
             self.kv_cache_manager,
             self.draft_kv_cache_manager,
             self.cross_kv_cache_manager,
         ):
-            if manager is not None and req.py_request_id in manager.kv_cache_map:
-                manager.free_resources(req)
+            if manager is not None and rid in manager.kv_cache_map:
+                was_excluded = manager.impl.is_stats_excluded(rid)
+                manager.impl.mark_stats_excluded(rid)
+                try:
+                    manager.free_resources(req)
+                except BaseException:
+                    # The cache is kept (e.g. a connector load is pending); its
+                    # later, real close must still be sampled.
+                    if not was_excluded:
+                        manager.impl.clear_stats_excluded(rid)
+                    raise
         rewind_context_after_cache_drop(req, self.tokens_per_block)
 
     def _try_schedule_context_full(

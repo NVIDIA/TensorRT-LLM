@@ -399,6 +399,11 @@ public:
     // All KvCaches must be suspended before calling adjust().
     bool needAdjustment() const;
     void adjust();
+    // Raise the hot-level slot floors that pool rebalancing (tuner targets, adjust()) must respect to what
+    // `batch` needs, capped at the current slot counts (see StorageManager::raiseHotMinSlots). Meant for the
+    // executor right after it clamps max_seq_len to the initial split, so that rebalancing keeps one request
+    // of that length (and its prefill chunks) schedulable. Returns the hot-level floors.
+    TypedVec<PoolGroupIndex, SlotCount> raiseHotMinSlots(BatchDesc const& batch);
 
     // ---- Internals used by KvCache ----------------------------------------
 
@@ -731,6 +736,12 @@ private:
 
     TypedVec<PoolGroupIndex, float> mTargetRatioListHot;
     TypedVec<PoolGroupIndex, float> mTargetRatioListCold;
+    // Bumped whenever the target ratios are recomputed or set. adjust() records the generation it acted
+    // on and needAdjustment() waits for a newer one, so a target the pools cannot reach within the
+    // tolerance (min slots, granularity, the arena's clamping) is attempted once per recompute instead of
+    // on every check.
+    std::uint64_t mTargetRatioGeneration{0};
+    std::optional<std::uint64_t> mAdjustedTargetRatioGeneration;
 
     int mNumCreatedKvCaches{0};
     int mNumSampledKvCaches{0};
