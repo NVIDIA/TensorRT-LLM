@@ -1661,6 +1661,35 @@ class KvCacheCreator:
             reserve += 2 * chunk_output_bytes
         return reserve
 
+    def _get_eager_logits_memory_reserve(self, profiled: bool) -> int:
+        """Reserve a full eager logits batch, subtracting one profiled row."""
+        if not self._mapping.is_last_pp_rank():
+            return 0
+        model = self._model_engine.model
+        model = getattr(model, "_orig_mod", model)
+        model = getattr(model, "llm", model)
+        logits_processor = getattr(model, "logits_processor", None)
+        model = getattr(model, "language_model", model)
+        logits_processor = getattr(model, "logits_processor", logits_processor)
+        tokens_per_gen_step = (1 if self._speculative_config is None else
+                               self._speculative_config.tokens_per_gen_step)
+        num_rows = min(
+            self._max_num_tokens,
+            self._max_batch_size * self._max_beam_width * tokens_per_gen_step)
+        if profiled:
+            num_rows -= 1
+        get_logits_memory_per_token = getattr(logits_processor,
+                                              "get_logits_memory_per_token",
+                                              None)
+        if get_logits_memory_per_token is not None:
+            return num_rows * get_logits_memory_per_token()
+        lm_head = model.lm_head
+        output_dtype = lm_head.output_dtype or lm_head.dtype
+        bytes_per_logit = output_dtype.itemsize
+        if output_dtype != torch.float32:
+            bytes_per_logit += torch.float32.itemsize
+        return num_rows * lm_head.vocab_size_padded * bytes_per_logit
+
     def _get_penalty_workspace_reserve(self, py_executor) -> int:
         """Reserve the overlap-headroom seats' penalty workspace.
 
@@ -2014,6 +2043,14 @@ class KvCacheCreator:
             logger.info(
                 f"Reserving {mem_gb:.2f} GiB for multimodal encoder memory "
                 "not materialized by the profiling run.")
+
+        logits_memory_reserve = self._get_eager_logits_memory_reserve(
+            profiled=py_executor is not None and not self._skip_est)
+        peak_memory += logits_memory_reserve
+        if logits_memory_reserve:
+            logger.info(
+                f"Reserving {logits_memory_reserve / GB:.2f} GiB for eager logits "
+                "and their FP32 conversion at maximum batch size.")
 
         fixed_workspace_reserve = get_attention_workspace_fixed_bytes(
             self._model_engine.model.model_config,

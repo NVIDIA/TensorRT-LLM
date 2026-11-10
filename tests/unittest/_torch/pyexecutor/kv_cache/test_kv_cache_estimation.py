@@ -23,6 +23,7 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFea
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec as ModelKVCacheLayerSpec
 from tensorrt_llm._torch.model_config import ModelConfig, _get_kv_cache_layer_specs
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.pyexecutor._util import (
     CacheCost,
     KvCacheCreator,
@@ -1611,7 +1612,15 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
         avg_seq_len=avg_seq_len,
     )
     model_engine = Mock()
+    model_engine.model = SimpleNamespace(model_config=Mock())
     model_engine.model.model_config.attn_backend = "TRTLLM"
+    model_engine.model.vocab_size_padded = 64
+    model_engine.model.model_config.torch_dtype = torch.bfloat16
+    model_engine.model.model_config.lm_head_output_dtype = None
+    model_engine.model.lm_head = SimpleNamespace(
+        vocab_size_padded=64, dtype=torch.bfloat16, output_dtype=None
+    )
+    model_engine.model.logits_processor = LogitsProcessor()
     # Explicit False: try_prepare_estimation skips estimation for
     # encoder-decoder models, and a bare Mock attribute is truthy.
     model_engine.model.model_config.is_encoder_decoder = False

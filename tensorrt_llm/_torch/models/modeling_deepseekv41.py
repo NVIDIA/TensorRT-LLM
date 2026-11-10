@@ -2261,6 +2261,10 @@ class _ContextOnlyLogitsProcessor(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
 
+    def get_logits_memory_per_token(self) -> int:
+        """Return bytes for FP32 handoff logits without an LM-head output."""
+        return self.vocab_size * torch.float32.itemsize
+
     def forward(
         self,
         hidden_states: torch.Tensor,
