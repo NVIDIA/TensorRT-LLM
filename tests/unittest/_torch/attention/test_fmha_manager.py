@@ -234,10 +234,11 @@ def test_select_non_mla_fmha_preserves_registry_order() -> None:
     assert events == [("support", "non-phased", None)]
 
 
-class _ContextOnlyFakeFmha(FakeFmha):
-    """A whole-batch library that honours a context-only call (like the thop op)."""
-
-    serves_context_only_input = True
+def _whole_batch_fake(attn, events, supported_phases=None):
+    """A phased library that supports whole mixed batches and their phases (like the thop op)."""
+    if supported_phases is None:
+        supported_phases = {None, FmhaPhase.CONTEXT, FmhaPhase.GENERATION}
+    return FakePhasedFmha(attn, supported_phases, "fallback", events)
 
 
 class _PairingFakePhasedFmha(FakePhasedFmha):
@@ -262,12 +263,12 @@ def _select_mixed(manager, attn, *, num_contexts=1, num_generations=2):
 
 
 def test_select_non_mla_fmha_pairs_generation_library_with_whole_batch_context() -> None:
-    """A mixed batch: the opted-in generation library keeps its rows, the whole-batch library
-    (which honours a context-only call) takes only the context requests."""
+    """A mixed batch: the opted-in generation library keeps its rows, the phased whole-batch
+    library takes only the context requests."""
     events: list[tuple] = []
     attn, manager = _make_manager()
     generation_fmha = _PairingFakePhasedFmha(attn, {FmhaPhase.GENERATION}, "generation", events)
-    fallback_fmha = _ContextOnlyFakeFmha(attn, "fallback", events)
+    fallback_fmha = _whole_batch_fake(attn, events)
     manager.fmha_libs = [generation_fmha, fallback_fmha]
 
     selected = _select_mixed(manager, attn)
@@ -284,18 +285,20 @@ def test_select_non_mla_fmha_pairs_generation_library_with_whole_batch_context()
     ]
 
 
-@pytest.mark.parametrize("pairs, context_only", [(False, True), (True, False)])
+@pytest.mark.parametrize("pairs, phased", [(False, True), (True, False)])
 def test_select_non_mla_fmha_keeps_whole_batch_library_without_both_opt_ins(
-    pairs: bool, context_only: bool
+    pairs: bool, phased: bool
 ) -> None:
-    """Without the generation library's opt-in, or a whole-batch library that cannot take a
-    context-only call, the whole-batch library serves the mixed batch as before."""
+    """Without the generation library's opt-in, or with a whole-batch library that is not
+    phased (it cannot serve the context phase alone), the whole-batch library serves the
+    mixed batch as before."""
     events: list[tuple] = []
     attn, manager = _make_manager()
     generation_cls = _PairingFakePhasedFmha if pairs else FakePhasedFmha
-    fallback_cls = _ContextOnlyFakeFmha if context_only else FakeFmha
     generation_fmha = generation_cls(attn, {FmhaPhase.GENERATION}, "generation", events)
-    fallback_fmha = fallback_cls(attn, "fallback", events)
+    fallback_fmha = (
+        _whole_batch_fake(attn, events) if phased else FakeFmha(attn, "fallback", events)
+    )
     manager.fmha_libs = [generation_fmha, fallback_fmha]
 
     assert _select_mixed(manager, attn) is fallback_fmha
@@ -305,16 +308,8 @@ def test_select_non_mla_fmha_pairing_requires_context_phase_support() -> None:
     events: list[tuple] = []
     attn, manager = _make_manager()
     generation_fmha = _PairingFakePhasedFmha(attn, {FmhaPhase.GENERATION}, "generation", events)
-    fallback_fmha = _ContextOnlyFakeFmha(
-        attn,
-        "fallback",
-        events,
-        request_support_predicate=lambda q, metadata: True,
-    )
     # Whole batch supported, context phase alone refused.
-    fallback_fmha._is_supported = lambda q, k, v, metadata, forward_args, *, phase=None: (
-        phase is None
-    )
+    fallback_fmha = _whole_batch_fake(attn, events, supported_phases={None})
     manager.fmha_libs = [generation_fmha, fallback_fmha]
 
     assert _select_mixed(manager, attn) is fallback_fmha
@@ -324,20 +319,17 @@ def test_select_non_mla_fmha_pairing_leaves_pure_batches_alone() -> None:
     events: list[tuple] = []
     attn, manager = _make_manager()
     generation_fmha = _PairingFakePhasedFmha(attn, {FmhaPhase.GENERATION}, "generation", events)
-    fallback_fmha = _ContextOnlyFakeFmha(attn, "fallback", events)
+    fallback_fmha = _whole_batch_fake(attn, events)
     manager.fmha_libs = [generation_fmha, fallback_fmha]
 
     assert _select_mixed(manager, attn, num_contexts=0, num_generations=2) is generation_fmha
     assert _select_mixed(manager, attn, num_contexts=2, num_generations=0) is fallback_fmha
 
 
-def test_only_fallback_and_flash_attn4_take_part_in_whole_batch_pairing() -> None:
+def test_only_flash_attn4_opts_in_to_whole_batch_pairing() -> None:
     """Pairing is opt-in: with FA4 disabled no enabled library changes its mixed-batch selection."""
     from tensorrt_llm._torch.attention.backends.fmha.registry import FMHA_LIBS
 
-    assert {name for name, cls in FMHA_LIBS.items() if cls.serves_context_only_input} == {
-        "fallback"
-    }
     assert {
         name
         for name, cls in FMHA_LIBS.items()

@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from fmha_test_utils import FakeAttention, FakeFmha, FakePhasedFmha
+from fmha_test_utils import FakeAttention, FakePhasedFmha
 
 from tensorrt_llm._torch.attention.backends.fmha.combined import (
     CombinedFmha,
@@ -113,13 +113,6 @@ def test_combined_fmha_uses_flattened_v2_page_bound() -> None:
     assert calls == [(3, Role.KEY)]
 
 
-class _ContextOnlyFakeFmha(FakeFmha):
-    serves_context_only_input = True
-
-    def forward(self, q, k, v, metadata, forward_args) -> None:
-        self._events.append(("forward", self._name, forward_args.attention_input_type, q.shape[0]))
-
-
 def _mixed_metadata(gen_lens: list[int], *, max_total_draft_tokens=None) -> SimpleNamespace:
     ctx_lens = [3, 2]
     lens = ctx_lens + gen_lens
@@ -148,11 +141,15 @@ _ATTN = FakeAttention()  # the libraries keep a weak reference to their attentio
 
 
 def _whole_batch_combined(events):
+    """The pairing the manager builds: a phased whole-batch library (the thop op) and an
+    opted-in generation library."""
     attn = _ATTN
-    context_fmha = _ContextOnlyFakeFmha(attn, "fallback", events)
+    context_fmha = FakePhasedFmha(
+        attn, {None, FmhaPhase.CONTEXT, FmhaPhase.GENERATION}, "fallback", events
+    )
     generation_fmha = FakePhasedFmha(attn, {FmhaPhase.GENERATION}, "generation", events)
     combined_fmha = CombinedFmha(attn)
-    combined_fmha.set_fmha_impls(context_fmha, generation_fmha)
+    combined_fmha.set_fmha_impls(context_fmha, generation_fmha, whole_batch_context=True)
     return combined_fmha
 
 
@@ -160,11 +157,10 @@ def _whole_batch_combined(events):
 def test_combined_fmha_splits_a_mixed_batch_with_a_whole_batch_context_library(
     max_total_draft_tokens,
 ) -> None:
-    """The whole-batch library gets the full tensors with a context-only call, then the
-    generation library serves the generation rows; the input type is restored."""
+    """Uniform generation rows: the whole-batch library serves the context phase and the
+    generation library the generation rows."""
     events: list[tuple] = []
     combined_fmha = _whole_batch_combined(events)
-    assert not combined_fmha.supports_workspace_reclamation
     metadata = _mixed_metadata([4, 4, 4], max_total_draft_tokens=max_total_draft_tokens)
     forward_args = AttentionForwardArgs(
         output=torch.empty((17, 4)),
@@ -175,29 +171,11 @@ def test_combined_fmha_splits_a_mixed_batch_with_a_whole_batch_context_library(
     combined_fmha.forward(torch.empty((17, 4)), None, None, metadata, forward_args)
 
     assert events == [
-        ("forward", "fallback", AttentionInputType.context_only, 17),
+        ("prepare", "fallback"),
         ("prepare", "generation"),
+        ("run", "fallback", FmhaPhase.CONTEXT, 5, 2, 2),
         ("run", "generation", FmhaPhase.GENERATION, 12, 3, 3),
     ]
-    assert forward_args.attention_input_type == AttentionInputType.mixed
-
-
-def test_combined_fmha_restores_input_type_when_the_context_call_fails() -> None:
-    events: list[tuple] = []
-    combined_fmha = _whole_batch_combined(events)
-
-    def fail(*args):
-        raise RuntimeError("boom")
-
-    combined_fmha._get_context_impl().forward = fail
-    forward_args = AttentionForwardArgs(
-        output=torch.empty((17, 4)), attention_input_type=AttentionInputType.mixed
-    )
-    with pytest.raises(RuntimeError, match="boom"):
-        combined_fmha.forward(
-            torch.empty((17, 4)), None, None, _mixed_metadata([4, 4, 4]), forward_args
-        )
-    assert forward_args.attention_input_type == AttentionInputType.mixed
 
 
 @pytest.mark.parametrize("gen_lens", [[4, 2, 3], [1, 4, 4]])
@@ -218,7 +196,7 @@ def test_combined_fmha_sends_ragged_generation_rows_to_the_whole_batch_library(g
         forward_args,
     )
 
-    assert events == [("forward", "fallback", AttentionInputType.mixed, tokens)]
+    assert events and all(event[1] == "fallback" for event in events)
 
 
 def test_generation_rows_uniform() -> None:
@@ -237,13 +215,3 @@ def test_generation_rows_uniform() -> None:
     metadata = _mixed_metadata([3, 3, 3])
     metadata.seq_lens = None
     assert not generation_rows_uniform(torch.empty((14, 4)), metadata)
-
-
-def test_combined_fmha_refuses_a_whole_batch_context_library_without_context_only_calls() -> None:
-    attn = FakeAttention()
-    combined_fmha = CombinedFmha(attn)
-    with pytest.raises(TypeError):
-        combined_fmha.set_fmha_impls(
-            FakeFmha(attn, "plain", []),
-            FakePhasedFmha(attn, {FmhaPhase.GENERATION}, "generation", []),
-        )

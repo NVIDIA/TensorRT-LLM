@@ -135,10 +135,9 @@ class PhasedFmha(Fmha):
     # Required by backends that construct tensor views over the KV pool.
     NEEDS_BLOCK_EXTENT = True
     # Whether the manager may serve the generation rows of a mixed batch with this
-    # library while a whole-batch library that honours a context-only call
-    # (``Fmha.serves_context_only_input``, e.g. the thop op) serves the context
-    # requests; see ``FmhaManager._select_non_mla``. Opt-in per library so that the
-    # selection of every other library is unchanged.
+    # library while a phased library that supports the whole batch (e.g. the thop op)
+    # serves the context requests; see ``FmhaManager._select_non_mla``. Opt-in per
+    # library so that the selection of every other library is unchanged.
     pairs_with_whole_batch_context: ClassVar[bool] = False
 
     def serves_mixed_generation_rows(self, metadata: "TrtllmAttentionMetadata") -> bool:
@@ -343,20 +342,6 @@ class PhasedFmha(Fmha):
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
     ) -> None:
-        self._forward_phases(q, k, v, metadata, forward_args)
-
-    def _forward_phases(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        *,
-        run_context_phase: bool = True,
-    ) -> None:
-        """Run the phases of the batch; ``run_context_phase=False`` leaves the context
-        requests to a library that has already served them (``CombinedFmha``)."""
         attn = self.attn
         output = forward_args.output
         if output is None:
@@ -373,7 +358,7 @@ class PhasedFmha(Fmha):
         num_contexts = metadata.num_contexts
         num_ctx_tokens = metadata.num_ctx_tokens
         num_generations = metadata.num_generations
-        has_context = run_context_phase and num_contexts > 0 and not is_gen_only
+        has_context = num_contexts > 0 and not is_gen_only
         has_generation = (
             num_generations > 0 and attention_input_type != AttentionInputType.context_only
         )

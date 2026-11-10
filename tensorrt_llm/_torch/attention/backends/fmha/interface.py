@@ -50,11 +50,6 @@ class Fmha(ABC):
     # library (``AttentionForwardArgs.kv_append.fold``): the query input is then the raw QKV projection.
     supports_deferred_prologue: ClassVar[bool] = False
     supports_variable_window: ClassVar[bool] = False
-    # ``forward`` honours ``attention_input_type=context_only`` on the full tensors of a
-    # mixed batch: it serves only the context requests (tokens ``[0, num_ctx_tokens)``)
-    # and leaves the generation rows' outputs and KV untouched, so a phased library can
-    # serve those rows (``CombinedFmha``).
-    serves_context_only_input: ClassVar[bool] = False
 
     def __init__(self, attn: "TrtllmAttention"):
         self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)

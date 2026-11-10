@@ -581,9 +581,9 @@ class FmhaManager:
         forward_args: AttentionForwardArgs,
     ) -> bool:
         """Whether ``fmha``, which supports a whole mixed batch, can serve its context phase alone."""
-        if not (isinstance(fmha, PhasedFmha) or fmha.serves_context_only_input):
-            return False
-        return fmha.is_supported(q, k, v, metadata, forward_args, phase=FmhaPhase.CONTEXT)
+        return isinstance(fmha, PhasedFmha) and fmha.is_supported(
+            q, k, v, metadata, forward_args, phase=FmhaPhase.CONTEXT
+        )
 
     def _select_mla(
         self,
