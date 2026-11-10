@@ -85,6 +85,11 @@ l0_gb300_multi_gpus:
   - unittest/_torch/multi_gpu/test_ll_exchange.py
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
+  # Muse Spark Open's fused expert finalize + TP4 all-reduce over CUDA IPC; each
+  # test spawns its four ranks with MPIPoolExecutor.
+  - unittest/_torch/modeling/test_musespark_open_finalize_allreduce.py
+  - unittest/_torch/modeling/test_musespark_open_finalize_lifecycle.py
+  - unittest/_torch/modeling/test_musespark_open_finalize_stress.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_decode_dispatch.py
