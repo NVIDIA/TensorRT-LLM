@@ -944,13 +944,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     adaptive_eplb_block: Optional[object] = None
 
     _DECODE_DEVICES = {"GB300": (8.0e12, 15.0e15, 0.852)}
-    """The decode time model's calibration per GPU: the HBM bandwidth (bytes/s) and dense NVFP4
-    peak (FLOP/s) it prices the kernels at, GB300's datasheet values here, and ``scale``, the
-    measured decode time over the model's at those two rates
+    """The decode time model's built-in calibration per GPU: the HBM bandwidth (bytes/s) and
+    dense NVFP4 peak (FLOP/s) it prices the kernels at, GB300's datasheet values here, and
+    ``scale``, the measured decode time over the model's at those two rates
     (``examples/wide_ep/ep_load_balancer/measure_adaptive_eplb_time_model.py``). The three hold
     together: the scale was measured on GB300 against these two rates and does not carry over to
-    others. Adaptive EPLB logs why and stays off on a GPU without an entry
-    (:meth:`has_decode_time_model`).
+    others. A calibration file of that script prices any GPU instead; without either, adaptive
+    EPLB logs why and stays off (:meth:`has_decode_time_model`).
     """
 
     @classmethod
@@ -995,15 +995,22 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 "hold the current plane addresses, so its planes can no longer move"
             )
 
-    def decode_time_model(self, expert_bytes: int, device_name: str) -> Dict[str, float]:
+    def decode_time_model(
+        self,
+        expert_bytes: int,
+        device_name: str,
+        rates: Optional[Tuple[float, float, float]] = None,
+    ) -> Dict[str, float]:
         """Parameters of the decode kernels' time model on ``device_name`` (``policy.TimeModel``).
 
         A slot that receives rows streams its expert's ``expert_bytes`` from HBM once; a row costs
         its FC1 and FC2 FLOPs at the dense FP4 peak; every 256-row tile of a slot beyond its first
         costs a tile of rows, and every such tile of the GPU's busiest slot half a tile more, the
-        serial tail of that slot. Raises ``ValueError`` when the device has no calibration.
+        serial tail of that slot. ``rates`` (bandwidth, peak, scale) replace the device's entry, as
+        a calibration file gives them. Raises ``ValueError`` when the device has neither.
         """
-        for key, (bandwidth, peak, scale) in self._DECODE_DEVICES.items():
+        entries = {device_name: rates} if rates else self._DECODE_DEVICES
+        for key, (bandwidth, peak, scale) in entries.items():
             if key in device_name:
                 inner = int(self.expand_intermediate_size_per_partition) + int(
                     self.intermediate_size_per_partition
@@ -1018,6 +1025,35 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                     tile_rows=256,
                 )
         raise ValueError(f"no decode time model of MegaMoE for {device_name!r}")
+
+    def decode_calibration_identity(self, tokens: List[int]) -> Dict[str, object]:
+        """What a calibration of :meth:`decode_time_model` holds for: the kernels' geometry and
+        combine format, and the tactic a decode step of each of ``tokens`` tokens per GPU resolves
+        to, found without a launch."""
+        from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
+            _default_megamoe_tactic_for_problem,
+        )
+
+        tactics = {}
+        for t in tokens:
+            max_t = self._select_launch_max_tokens(int(t))
+            tactic = _default_megamoe_tactic_for_problem(
+                sm_version=get_sm_version(),
+                max_tokens_per_rank=max_t,
+                num_tokens=int(t),
+                apply_topk_in_fc1=bool(self.apply_topk_in_fc1),
+                in_kernel_fc2_reduce=self._use_in_kernel_fc2_reduce(max_t),
+                combine_format=self.combine_format,
+            )
+            tactics[str(int(t))] = "autotune" if self.tactic_autotune else repr(tactic)
+        return dict(
+            backend=type(self).__name__,
+            combine_format=self.combine_format,
+            hidden_size=int(self.hidden_size),
+            intermediate_size=int(self.intermediate_size_per_partition),
+            top_k=int(self.routing_method.experts_per_token),
+            tactics=tactics,
+        )
 
     def _supports_load_balancer(self) -> bool:
         # Both static and dynamic EPLB are supported: the four MegaMoE-

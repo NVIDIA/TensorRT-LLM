@@ -359,3 +359,15 @@ def test_rate_floor_follows_the_reading_interval():
     # A negative rate reading is no rate at all (a tracker that has learnt nothing yet).
     fresh = EvaluationScheduler(MODEL, GEOMETRY)
     assert fresh.plan(5, 5, 2, [1.0], [], CostGrowth(-0.5, 1, 1), None).interval == 3
+
+
+def test_a_step_takes_the_scale_of_the_bucket_it_pads_to():
+    model = TimeModel(1.0, 2.0, 3.0, 4.0, 1.0, 8, scales=((40.0, 0.8), (160.0, 1.1)))
+    assert [model.at(rows).scale for rows in (1.0, 40.0, 41.0, 160.0, 1e6)] == [
+        0.8,
+        0.8,
+        1.1,
+        1.1,
+        1.1,
+    ]
+    assert model.at(41.0).scales == () and model.at(41.0).at(1.0).scale == 1.1

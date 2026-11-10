@@ -11,12 +11,13 @@ The module imports numpy only: the operands import torch where they call the ops
 
 from __future__ import annotations
 
+import bisect
 import heapq
 import itertools
 import math
 import statistics
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
@@ -61,6 +62,8 @@ class TimeModel:
     rows (streaming its weights), ``per_extra_tile_us`` for every tile of ``tile_rows`` rows a slot
     needs beyond its first, ``per_row_us`` for every row, and ``hot_slot_extra_tile_us`` for every
     tile beyond the first of the GPU's busiest slot. A layer takes its busiest GPU's time.
+    ``scales`` holds ``(rows, scale)`` per calibrated CUDA graph bucket, ascending by the rows a
+    GPU's tokens route per forward in it (:meth:`at`); empty, ``scale`` holds at every size.
     """
 
     per_active_slot_us: float
@@ -69,6 +72,15 @@ class TimeModel:
     hot_slot_extra_tile_us: float
     scale: float
     tile_rows: int
+    scales: tuple[tuple[float, float], ...] = ()
+
+    def at(self, rows: float) -> TimeModel:
+        """The model at the scale of the smallest bucket of at least ``rows`` rows per GPU per
+        forward, the bucket a step of that size pads to (the largest bucket beyond them)."""
+        if not self.scales:
+            return self
+        i = bisect.bisect_left([size for size, _ in self.scales], rows)
+        return replace(self, scale=self.scales[min(i, len(self.scales) - 1)][1], scales=())
 
     @property
     def slope_us(self) -> float:
@@ -477,7 +489,8 @@ class EvaluationScheduler:
     """
 
     def __init__(self, model: TimeModel, geometry: ExpertGeometry) -> None:
-        self._model = model
+        self.model = model
+        """The time model of the latest window (:meth:`TimeModel.at` its size)."""
         self._geometry = geometry
         self._previous_load: dict[int, np.ndarray] = {}
         self._previous_open: int | None = None
@@ -501,13 +514,13 @@ class EvaluationScheduler:
             previous = np.zeros_like(load)
             for i in both:
                 previous[i] = self._previous_load[layers[i]]
-            balanced = self._model.balanced_time_us(load, self._geometry)
-            now = self._model.layer_time_us(slot_rows(load, layout, shares), ep) - balanced
+            balanced = self.model.balanced_time_us(load, self._geometry)
+            now = self.model.layer_time_us(slot_rows(load, layout, shares), ep) - balanced
             total = previous.sum(1)
             previous *= np.where(total > 0.0, load.sum(1) / np.where(total > 0.0, total, 1.0), 0.0)[
                 :, None
             ]
-            old = self._model.layer_time_us(slot_rows(previous, layout, shares), ep) - balanced
+            old = self.model.layer_time_us(slot_rows(previous, layout, shares), ep) - balanced
             cost_now = sum(float(now[i]) for i in both) / 1e3
             cost_prev = sum(float(old[i]) for i in both) / 1e3
             interval = int(open_call) - self._previous_open
@@ -520,7 +533,7 @@ class EvaluationScheduler:
     def min_resolvable_rate(self, layers: int, interval: int) -> float:
         """The smallest growth per call that a reading of ``layers`` layers over ``interval`` calls
         can show: one more row per layer over the interval, at the time of one row."""
-        return layers * self._model.slope_us / 1e3 / interval
+        return layers * self.model.slope_us / 1e3 / interval
 
     def plan(
         self,

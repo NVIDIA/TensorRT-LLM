@@ -2090,6 +2090,11 @@ class MoeAdaptiveLoadBalancerConfig(_MoeLoadBalancerConfigBase):
         description=
         "Total number of expert slots across all EP ranks. Must be divisible by `ep_size` and at least the number of experts; the slots beyond one per expert hold replicas. A placement fills at most half of the replica slots (rounded up per rank); the other half stays empty so that every install has free slots to copy new replicas into.",
         status="prototype")
+    time_model_file: Optional[str] = Field(
+        default=None,
+        description=
+        "Calibration file of the MoE backend's decode time model, written by `examples/wide_ep/ep_load_balancer/measure_adaptive_eplb_time_model.py` on this platform: one measured scale per CUDA graph bucket. Without it the backend's built-in calibration applies; when neither holds for the GPU, the EP group or a decode bucket of the deployment, adaptive EPLB stays off for the run with a warning.",
+        status="prototype")
 
     def validate_expert_capacity(self, num_experts: int) -> None:
         """Validate that every EP rank homes as many experts and every expert has a slot."""

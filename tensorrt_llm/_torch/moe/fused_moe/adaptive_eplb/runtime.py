@@ -249,7 +249,10 @@ class _Decider:
             new_layout[i] = plan_layout(rows[layer], geometry, homes, current, self.active).layout
             new_shares[i] = solve_shares(rows[layer], new_layout[i], geometry)
         current = (rows[planned], self.layout[planned], self.shares[planned])
-        gains = evaluate_gains(*current, new_layout, new_shares, cfg.model, geometry)
+        # The busiest rank's rows per forward size the CUDA graph bucket the steps pad to.
+        model = cfg.model.at(float((routed.sum(2) / forwards).mean(1).max()))
+        self.evaluations.model = model
+        gains = evaluate_gains(*current, new_layout, new_shares, model, geometry)
         previous_load = None
         for i, layer in enumerate(planned.tolist()):
             # The latest kept window that neither the installed layout (planned on the window the
@@ -264,7 +267,7 @@ class _Decider:
         if previous_load is not None:
             # A candidate must also gain on that window.
             previous_gains = evaluate_gains(
-                previous_load, *current[1:], new_layout, new_shares, cfg.model, geometry
+                previous_load, *current[1:], new_layout, new_shares, model, geometry
             )
             gains = np.minimum(gains, previous_gains)
         gain = dict(zip(planned.tolist(), gains.tolist()))

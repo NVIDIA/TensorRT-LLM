@@ -60,6 +60,7 @@ from .config_utils import (is_decode_only, is_hybrid_linear, is_minimax_m3,
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.registry import uses_connector
 from .dwdp import DwdpManager, get_global_dwdp_manager
+from .engine.cuda_graph import decode_tokens_per_forward
 from .engine.runners.decoder.inputs import uses_full_generation_page_table
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .hang_diagnostics import monitor_executor_initialization
@@ -1281,7 +1282,12 @@ def _create_py_executor(
     # A load balancer that moves weights (adaptive EPLB moves the MoE slot
     # planes into peer-mapped memory) does so before the KV cache is sized.
     if model_engine.moe_load_balancer is not None:
-        model_engine.moe_load_balancer.prepare_runtime(model_engine.model)
+        model_engine.moe_load_balancer.prepare_runtime(
+            model_engine.model,
+            decode_tokens=decode_tokens_per_forward(
+                model_engine.cuda_graph_batch_sizes or [],
+                model_engine.batch_size, model_engine.max_num_tokens,
+                1 + model_engine.original_max_total_draft_tokens))
 
     resources = {}
     estimating_kv_cache = False

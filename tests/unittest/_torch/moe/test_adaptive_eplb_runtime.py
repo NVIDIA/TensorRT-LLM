@@ -3,6 +3,7 @@
 """CPU tests of the adaptive EPLB runtime: statistics windows, the decision process and installs."""
 
 import contextlib
+import dataclasses
 import os
 import resource
 import subprocess
@@ -739,3 +740,20 @@ def test_a_runtime_left_open_ends_its_worker_before_the_interpreter_finalizes(tm
             break
         time.sleep(0.1)
     assert not os.path.exists(f"/proc/{pid}"), "the decision process outlived its rank"
+
+
+def test_a_window_prices_at_the_scale_of_the_bucket_its_busiest_rank_pads_to(monkeypatch):
+    gains = []
+    for scales in ((), ((100.0, 2.0), (200.0, 3.0))):
+        seen = {}
+        spy(monkeypatch, seen)
+        decider = FakeDecision(0).decider
+        decider.config = dataclasses.replace(
+            decider.config, model=dataclasses.replace(MODEL, scales=scales)
+        )
+        decider.next_forwards = FORWARDS  # an earlier window measured the rows per forward
+        window_stats(decider.stats)  # every rank: 2 x 400 + 6 rows per layer over 8 forwards
+        decider.decide(0)
+        gains.append(seen["gains"][0])
+    # 100.75 rows per forward on the busiest rank pad to the 200-row bucket: its scale 3.
+    assert gains[1] == pytest.approx({layer: 3.0 * gain for layer, gain in gains[0].items()})

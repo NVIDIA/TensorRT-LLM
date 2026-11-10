@@ -909,10 +909,14 @@ class BaseMoeLoadBalancer(ABC):
     def shutdown(self, local_safe: bool = True) -> bool:
         """Collectively release resources; return False if any rank is unsafe."""
 
-    def prepare_runtime(self, model: torch.nn.Module) -> None:
+    def prepare_runtime(
+        self, model: torch.nn.Module,
+        decode_tokens: Sequence[int] = ()) -> None:
         """Finish the setup that needs the loaded model, before the KV cache is sized.
 
-        Every rank must call it. Nothing by default.
+        ``decode_tokens`` are the tokens per GPU per forward of every CUDA graph
+        bucket the deployment decodes in. Every rank must call it. Nothing by
+        default.
         """
 
     def observe_scheduled_batch(

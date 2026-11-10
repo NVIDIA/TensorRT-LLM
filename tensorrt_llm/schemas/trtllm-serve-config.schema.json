@@ -4360,6 +4360,20 @@
           "status": "prototype",
           "title": "Num Slots",
           "type": "integer"
+        },
+        "time_model_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Calibration file of the MoE backend's decode time model, written by `examples/wide_ep/ep_load_balancer/measure_adaptive_eplb_time_model.py` on this platform: one measured scale per CUDA graph bucket. Without it the backend's built-in calibration applies; when neither holds for the GPU, the EP group or a decode bucket of the deployment, adaptive EPLB stays off for the run with a warning.",
+          "status": "prototype",
+          "title": "Time Model File"
         }
       },
       "required": [
