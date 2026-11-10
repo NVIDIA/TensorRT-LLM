@@ -935,6 +935,11 @@ def test_m3_budget_estimate_covers_actual_paged_buffers(
         assert all(buffer.role not in scale_roles for buffer in config.layers[0].buffers)
         assert all(buffer.role not in scale_roles for buffer in config.layers[2].buffers)
 
+    # The cache-created event sizes its block counts from the same per-token total.
+    assert manager.get_cache_bytes_per_token() == sum(actual_bytes_per_token)
+    tier = kv_cache_manager_v2.GpuCacheTierConfig(quota=sum(actual_bytes_per_token) * 128 * 10)
+    assert manager._get_event_num_blocks_per_cache_level([tier], 128) == [10]
+
     configured_footprint = sum(actual_bytes_per_token) * manager.max_num_tokens
     estimated_quota = manager._get_quota_from_max_tokens(manager.max_num_tokens)
     assert estimated_quota >= configured_footprint

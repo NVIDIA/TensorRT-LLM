@@ -562,6 +562,21 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             cache_bytes += self.get_layer_bytes_per_token(local_layer_idx, Role.INDEX_KEY)
         return cache_bytes
 
+    def get_cache_bytes_per_token(self) -> int:
+        """Bytes per token across the local layers, the sparse layers' index-K included.
+
+        The base sums the K/V roles only; the per-sparse-layer ``Role.INDEX_KEY``
+        buffers live in the same tiers, so the cache-created event's block count
+        divides each tier quota by this total. Layer specs already count index-K.
+        """
+        cache_bytes = super().get_cache_bytes_per_token()
+        if self.layer_specs is not None:
+            return cache_bytes
+        return cache_bytes + sum(
+            self.get_layer_bytes_per_token(local_layer_idx, Role.INDEX_KEY)
+            for local_layer_idx in range(self.num_local_layers)
+        )
+
     @classmethod
     def get_cache_size_per_token(cls, model_config, mapping, num_layers=None, **kwargs):
         """Pre-allocation bytes per token, including what the generic estimate leaves out.
