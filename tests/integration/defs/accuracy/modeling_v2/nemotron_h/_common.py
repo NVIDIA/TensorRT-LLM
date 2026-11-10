@@ -20,7 +20,8 @@ the built-in implementation and report its numbers as the target's. The target
 checks its step contract on the first forward; the switch travels to the ranks as
 ``env_overrides``, scoped to the engine.
 
-The BF16 targets run the deployment their route admits: the BF16 release over 8
+The NVFP4 targets run the NVFP4 release on 4 Rubin GPUs (sm_107) with its FP8 KV cache
+and an fp16 recurrent state. The BF16 targets run the deployment their route admits: the BF16 release over 8
 GB200 GPUs (two trays of four), tensor-parallel attention and mamba, the recurrent
 state in the checkpoint's fp32, block reuse off. GSM8K runs with thinking off, the
 protocol the built-in TestNemotronV3Ultra gates this model with.
@@ -42,12 +43,18 @@ from .._env import scoped_env_overrides
 # kv_cache_quant_algo.
 MODEL_NAME = "nvidia/Nemotron-Ultra-V3"
 BF16_MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"
+NVFP4_MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4"
 
 # The targets assert their own SM at construction: certification is per GPU
 # architecture, and only GB200 trays were measured for the BF16 targets.
 skip_not_gb200 = pytest.mark.skipif(
     get_sm_version() != 100 or not check_device_contain(["GB200"]),
     reason="the nemotron_h BF16 targets are certified on GB200 (sm_100) only",
+)
+
+skip_not_sm107 = pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="the nemotron_h NVFP4 targets are certified on sm_107 only",
 )
 
 _EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(enable_thinking=False))
@@ -82,6 +89,43 @@ class NemotronHBf16Target(LlmapiAccuracyTestHarness):
                 tensor_parallel_size=8,
                 moe_expert_parallel_size=self.MOE_EP,
                 enable_attention_dp=False,
+                cuda_graph_config=CudaGraphConfig(
+                    max_batch_size=max_batch_size, enable_padding=True
+                ),
+            ) as llm,
+        ):
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, extra_evaluator_kwargs=_EXTRA_EVALUATOR_KWARGS)
+
+
+class NemotronHNvfp4Target(LlmapiAccuracyTestHarness):
+    """One NVFP4 target on 4 Rubin GPUs: the subclass says whether attention is data
+    parallel (dep4) or tensor parallel (tep4). The routed experts are expert-parallel over
+    the 4 ranks either way, the KV cache is the checkpoint's FP8 and the recurrent state
+    fp16, the configuration of the built-in TestNemotronV3Ultra TEP4 runs these targets
+    were gated with."""
+
+    MODEL_NAME = MODEL_NAME
+    MODEL_PATH = NVFP4_MODEL_PATH
+    ATTENTION_DP = False
+
+    def _gsm8k(self, max_batch_size: int = 32) -> None:
+        # With attention DP every rank serves its own requests: max_batch_size is per rank.
+        with (
+            scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                modeling_v2="require",
+                env_overrides=rank_env,
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    mamba_ssm_cache_dtype="float16",
+                    free_gpu_memory_fraction=0.5,
+                ),
+                max_batch_size=max_batch_size,
+                tensor_parallel_size=4,
+                moe_expert_parallel_size=4,
+                enable_attention_dp=self.ATTENTION_DP,
                 cuda_graph_config=CudaGraphConfig(
                     max_batch_size=max_batch_size, enable_padding=True
                 ),

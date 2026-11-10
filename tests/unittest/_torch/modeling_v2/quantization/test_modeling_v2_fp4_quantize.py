@@ -27,8 +27,11 @@ _E2M1_VALUES = torch.tensor(
 def _build(spec, seed):
     g = torch.Generator(device="cuda").manual_seed(seed)
     x = torch.randn(spec["shape"], generator=g, device="cuda").to(spec["dtype"])
-    # The canonical NVFP4 activation global scale, 448*6/amax.
-    gs = (448.0 * 6.0 / x.abs().max().float()).reshape(1)
+    # The canonical NVFP4 activation global scale, 448*6/amax -- or, for a
+    # static checkpoint scale calibrated below this batch's amax, that scale
+    # over `amax_headroom` < 1, which pushes the largest blocks past e4m3's 448.
+    amax = x.abs().max().float() * spec.get("amax_headroom", 1.0)
+    gs = (448.0 * 6.0 / amax).reshape(1)
     return x, gs, spec["vec"], spec["swizzled"]
 
 
@@ -86,6 +89,69 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(shape=(8192, 6144), dtype=torch.bfloat16, vec=16, swizzled=False),
         ),
     ),
+    # Nemotron-3 Ultra NVFP4: the routed experts' 2048-wide latent input, quantized under the
+    # checkpoint's static 1 / input_scale. Both targets quantize it the same way; dep4 at the
+    # row counts its gathered tokens reach.
+    "nemotron_h/nemotron3_ultra_nvfp4__sm_107__tep4": (
+        Cell(
+            why="Nemotron-3 Ultra decode: 1 row of its 2048-wide latent, linear -- the "
+            "routed-expert input",
+            spec=dict(shape=(1, 2048), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="Ultra latent, 7 rows, linear: several rows at an odd count",
+            spec=dict(shape=(7, 2048), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="Ultra latent at its decode ceiling, 32 rows, linear",
+            spec=dict(shape=(32, 2048), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="Ultra latent at max_num_tokens 8192, linear",
+            spec=dict(shape=(8192, 2048), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="Ultra's static checkpoint scale, which a batch can outrun: at 2x its "
+            "calibrated amax the largest blocks saturate to scale 448, codes 6",
+            spec=dict(
+                shape=(300, 2048),
+                dtype=torch.bfloat16,
+                vec=16,
+                swizzled=False,
+                amax_headroom=0.5,
+            ),
+        ),
+    ),
+    "nemotron_h/nemotron3_ultra_nvfp4__sm_107__dep4": (
+        Cell(
+            why="Nemotron-3 Ultra decode: 1 row of its 2048-wide latent, linear -- the "
+            "routed-expert input",
+            spec=dict(shape=(1, 2048), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="Ultra latent, 7 rows, linear: several rows at an odd count",
+            spec=dict(shape=(7, 2048), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="Ultra latent at its decode ceiling, 32 rows, linear",
+            spec=dict(shape=(32, 2048), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="Ultra latent at max_num_tokens 8192, linear",
+            spec=dict(shape=(8192, 2048), dtype=torch.bfloat16, vec=16, swizzled=False),
+        ),
+        Cell(
+            why="Ultra's static checkpoint scale, which a batch can outrun: at 2x its "
+            "calibrated amax the largest blocks saturate to scale 448, codes 6",
+            spec=dict(
+                shape=(300, 2048),
+                dtype=torch.bfloat16,
+                vec=16,
+                swizzled=False,
+                amax_headroom=0.5,
+            ),
+        ),
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)
@@ -106,6 +172,9 @@ def test_certified_cells(cell) -> None:
     ref_packed, ref_sf = op.reference(x, gs, vec, False, swizzled)
 
     assert torch.equal(sf, ref_sf), "block scales are exact; a mismatch is a defect"
+    if cell.spec.get("amax_headroom", 1.0) < 1.0:
+        # e4m3's largest finite value, 448, is byte 0x7E; saturation must have happened
+        assert bool((sf == 0x7E).any()), "the outrun scale saturated no block"
 
     tie = op.near_tie(op.scaled(x, gs, vec))
     codes, ref_codes = _unpack(packed), _unpack(ref_packed)

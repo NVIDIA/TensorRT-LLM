@@ -477,6 +477,9 @@ accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_accuracy.py::
 accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_accuracy.py::TestModelingV2MiniMaxM3Nvfp4Sm107Tp2::test_eagle3_gsm8k_and_acceptance
 accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/test_accuracy.py::TestModelingV2MiniMaxM3Nvfp4Sm107Tp4::test_gsm8k
 accuracy/modeling_v2/minimax_m3/minimax_m3_nvfp4__sm_107__tp4/test_accuracy.py::TestModelingV2MiniMaxM3Nvfp4Sm107Tp4::test_eagle3_gsm8k_and_acceptance
+# ModelingV2 Nemotron-3 Ultra NVFP4: 4 Rubin GPUs (SM107).
+accuracy/modeling_v2/nemotron_h/nemotron3_ultra_nvfp4__sm_107__tep4/test_accuracy.py::TestModelingV2Nemotron3UltraNvfp4Sm107Tep4::test_gsm8k
+accuracy/modeling_v2/nemotron_h/nemotron3_ultra_nvfp4__sm_107__dep4/test_accuracy.py::TestModelingV2Nemotron3UltraNvfp4Sm107Dep4::test_gsm8k
 accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_fp8
 accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_fp8[latency_moe_deepgemm]

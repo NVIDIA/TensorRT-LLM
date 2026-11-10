@@ -134,6 +134,37 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
         )
         for m in (1, 32, 256, 8192)
     ),
+    # Nemotron-3 Ultra NVFP4 at tep4: its bf16 projections (attention, the latent pair and
+    # the fp32-out router; the mamba and shared-expert projections are FP8) at one row, the
+    # decode CUDA-graph ceiling and a max_num_tokens prefill step.
+    "nemotron_h/nemotron3_ultra_nvfp4__sm_107__tep4": tuple(
+        Cell(
+            why=f"nemotron_h NVFP4 tep4 {what}, T={m}",
+            spec=dict(m=m, k=k, n=n, dtype=torch.bfloat16, bias=False, out_dtype=out_dtype),
+        )
+        for what, k, n, out_dtype in (
+            ("qkv: 8192 -> (16 + 1 + 1) x 128", 8192, 2304, None),
+            ("o_proj: 2048 -> 8192, a row-parallel partial", 2048, 8192, None),
+            ("fc1_latent: 8192 -> 2048", 8192, 2048, None),
+            ("router: bf16 in, fp32 logits over 512 experts", 8192, 512, torch.float32),
+        )
+        for m in (1, 32, 8192)
+    ),
+    # ... and at dep4, where attention is replicated: a rank runs the unsharded qkv and
+    # o_proj over its own tokens.
+    "nemotron_h/nemotron3_ultra_nvfp4__sm_107__dep4": tuple(
+        Cell(
+            why=f"nemotron_h NVFP4 dep4 {what}, T={m}",
+            spec=dict(m=m, k=k, n=n, dtype=torch.bfloat16, bias=False, out_dtype=out_dtype),
+        )
+        for what, k, n, out_dtype in (
+            ("qkv: 8192 -> (64 + 2 + 2) x 128", 8192, 8704, None),
+            ("o_proj: 8192 -> 8192", 8192, 8192, None),
+            ("fc1_latent: 8192 -> 2048", 8192, 2048, None),
+            ("router: bf16 in, fp32 logits over 512 experts", 8192, 512, torch.float32),
+        )
+        for m in (1, 32, 8192)
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)

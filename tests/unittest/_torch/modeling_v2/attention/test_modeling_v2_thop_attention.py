@@ -7224,12 +7224,12 @@ def _seed(cell) -> None:
 
 
 def _compare_split_softmax(out: torch.Tensor, ref: torch.Tensor) -> None:
-    """The e4m3 band for 8 q heads per kv head at d128 over an fp8 pool, where the decode
+    """The e4m3 band for Nemotron-3 Ultra's d128 GQA over an fp8 pool, where the decode
     kernel rounds the softmax probabilities against maxima `reference` cannot reproduce.
 
     On the e4m3 paths the probabilities are an MMA operand: `exp(s - m)` scaled by 448 and
     rounded to e4m3, `m` a running maximum. `reference` takes `m` as the row's maximum. The
-    `QkvE4m3` decode kernels at this geometry instead deal 128-key tiles round-robin to two
+    `QkvE4m3` decode kernels at these geometries instead deal 128-key tiles round-robin to two
     softmax groups, each with its own running maximum, and split a long KV range across CTAs
     in chunks whose count the launch heuristic picks -- not something a reference should
     encode. Within one tile the two agree.
@@ -7240,7 +7240,8 @@ def _compare_split_softmax(out: torch.Tensor, ref: torch.Tensor) -> None:
     mantissas, so two independent roundings differ by 0.0375 RMS, carried straight into the
     output: 9.6 bf16 ulp of relative RMS when every key differs, the ceiling. Gated at 12.
     Element-wise 2^-4 of the row scale, 16 ulp. Measured before the rebase onto
-    FallbackFmha: 10 ulp worst at this geometry, outside `_compare`'s 8, inside this band.
+    FallbackFmha: 11.2 / 8.1 ulp worst at 16:1 (sm_107), 10.3 / 7.7 at 32:1 (dep4), 10 at
+    8:1 -- outside `_compare`'s 8 element-wise, inside this band.
 
     What it still separates: a wrong scale, page, kv head or mask moves the output by O(1).
     """
@@ -7249,11 +7250,12 @@ def _compare_split_softmax(out: torch.Tensor, ref: torch.Tensor) -> None:
 
 def _e4m3_compare_for(spec):
     """The band a paged cell's output is gated in: `_compare_split_softmax` for the
-    Nemotron-3 Ultra BF16 checkpoint's 8:1 d128 geometry over an fp8 pool, `_compare`
-    for every other cell."""
+    Nemotron-3 Ultra geometries over an fp8 pool (8:1 for the BF16 checkpoint at tp8, 16:1
+    for NVFP4 tep4, 64:2 for NVFP4 dep4, all d128), `_compare` for every other cell."""
     fp8 = bool(spec["quant_mode"] & QUANT_MODE_FP8_KV_CACHE)
     geometry = (spec["num_heads"], spec["num_kv_heads"], spec["head_size"])
-    return _compare_split_softmax if fp8 and geometry == (8, 1, 128) else _compare
+    ultra = geometry in ((8, 1, 128), (16, 1, 128), (64, 2, 128))
+    return _compare_split_softmax if fp8 and ultra else _compare
 
 
 def _cell_paged(cell, arm, compare=_compare) -> None:
@@ -7486,10 +7488,17 @@ _ULTRA_DECODE_HISTORIES = tuple(33 + (i * 97) % 480 for i in range(32))
 #: 256 decode rows (the BF16 targets' serving envelope), histories 33..1500: 6257 pages.
 _ULTRA_DECODE_HISTORIES_256 = tuple(33 + (i * 97) % 1468 for i in range(256))
 _ULTRA_256 = dict(max_num_requests=256, num_blocks=6400)
+#: Nemotron-3 Ultra NVFP4's attention layer over its fp8-e4m3 pool at unit kv scales (the
+#: checkpoint's): at tep4 the 64 q / 2 kv heads split four ways are 16 q over one kv head; at
+#: dep4 (attention data parallel) a rank runs the unsharded 64 over 2.
+_ULTRA_NVFP4_TEP4_16_1_128 = dict(_ULTRA_BF16_FP8KV_8_1_128, num_heads=16)
+_ULTRA_NVFP4_DEP4_64_2_128 = dict(_ULTRA_BF16_FP8KV_8_1_128, num_heads=64, num_kv_heads=2)
 
 
-def _ultra_bf16_cells(base: dict, label: str, mixed_packed: bool) -> tuple[Cell, ...]:
-    """The call sites of one Ultra BF16 pool: packed prefill, decode at 1, 32 and 256 rows,
+def _ultra_cells(
+    base: dict, label: str, mixed_packed: bool, decode_256: bool = True
+) -> tuple[Cell, ...]:
+    """The call sites of one Ultra pool: packed prefill, decode at 1, 32 and (BF16) 256 rows,
     a packed mixed step (bf16 pool only: over an fp8 pool a packed call reads its context rows
     in bf16 and its generation rows in e4m3, which one comparison cannot gate), and the
     paged-context prefill of chunked prefill."""
@@ -7520,18 +7529,6 @@ def _ultra_bf16_cells(base: dict, label: str, mixed_packed: bool) -> tuple[Cell,
             ),
         ),
         Cell(
-            why=f"nemotron_h ultra {label} decode, batch 256, the serving envelope's "
-            "CUDA-graph ceiling: histories 33..1500",
-            spec=dict(
-                base,
-                **_ULTRA_256,
-                cached=_ULTRA_DECODE_HISTORIES_256,
-                new=(1,) * 256,
-                num_contexts=0,
-                predicted_tokens_per_seq=1,
-            ),
-        ),
-        Cell(
             why=f"nemotron_h ultra {label} paged-context prefill (chunked prefill): 512 rows "
             "over a 640-token cached prefix beside a fresh 1-row context",
             spec=dict(
@@ -7544,6 +7541,21 @@ def _ultra_bf16_cells(base: dict, label: str, mixed_packed: bool) -> tuple[Cell,
             ),
         ),
     )
+    if decode_256:
+        cells += (
+            Cell(
+                why=f"nemotron_h ultra {label} decode, batch 256, the serving envelope's "
+                "CUDA-graph ceiling: histories 33..1500",
+                spec=dict(
+                    base,
+                    **_ULTRA_256,
+                    cached=_ULTRA_DECODE_HISTORIES_256,
+                    new=(1,) * 256,
+                    num_contexts=0,
+                    predicted_tokens_per_seq=1,
+                ),
+            ),
+        )
     if not mixed_packed:
         return cells
     return cells + (
@@ -8043,11 +8055,17 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
     ),
     # Both BF16 targets bind the bf16 pool; the cells sit under tep8, the duplicates under
     # tp8ep2 would run once anyway. Only tp8ep2 binds the fp8 pool.
-    "nemotron_h/nemotron3_ultra_bf16__sm_100__tep8": _ultra_bf16_cells(
+    "nemotron_h/nemotron3_ultra_bf16__sm_100__tep8": _ultra_cells(
         _ULTRA_BF16_8_1_128, "BF16 tp8", mixed_packed=True
     ),
-    "nemotron_h/nemotron3_ultra_bf16__sm_100__tp8ep2": _ultra_bf16_cells(
+    "nemotron_h/nemotron3_ultra_bf16__sm_100__tp8ep2": _ultra_cells(
         _ULTRA_BF16_FP8KV_8_1_128, "BF16 tp8 fp8KV", mixed_packed=False
+    ),
+    "nemotron_h/nemotron3_ultra_nvfp4__sm_107__tep4": _ultra_cells(
+        _ULTRA_NVFP4_TEP4_16_1_128, "NVFP4 tep4", mixed_packed=False, decode_256=False
+    ),
+    "nemotron_h/nemotron3_ultra_nvfp4__sm_107__dep4": _ultra_cells(
+        _ULTRA_NVFP4_DEP4_64_2_128, "NVFP4 dep4", mixed_packed=False, decode_256=False
     ),
 }
 
