@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 
 import numpy as np
 import pytest
@@ -733,7 +733,7 @@ def test_receiver_rejects_view_mismatch_before_registration(
         assert messenger_factory.call_count == 2  # Receiver listener and one info lookup.
         receiver._request_sender_data.assert_not_called()
         messengers[bad_endpoint].send.assert_called_once_with([MessageType.REQUEST_INSTANCE_INFO])
-        messengers[bad_endpoint].receive.assert_called_once_with()
+        messengers[bad_endpoint].receive.assert_called_once_with(timeout_ms=ANY)
         messengers[bad_endpoint].stop.assert_called_once_with()
         with pytest.raises(KeyError):
             registrar.get_peer_rank_info(bad_ri.instance_name, bad_ri.instance_rank)
@@ -748,7 +748,7 @@ def test_receiver_rejects_view_mismatch_before_registration(
         )
         assert receiver._get_sender_info(good_params) is sender_info
         assert messenger_factory.call_count == 4  # One more info lookup and one sender dealer.
-        messengers[good_endpoint].receive.assert_called_once_with()
+        messengers[good_endpoint].receive.assert_called_once_with(timeout_ms=ANY)
         with pytest.raises(KeyError):
             registrar.get_peer_rank_info(good_ri.instance_name, good_ri.instance_rank)
     finally:
