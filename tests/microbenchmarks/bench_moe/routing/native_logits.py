@@ -263,7 +263,10 @@ def _make_supplied_topk_apply(
 ):
     """Return a ``routing_method.apply`` wrapper returning the plan directly."""
 
-    def supplied_apply(router_logits):
+    def supplied_apply(
+        router_logits: Optional[torch.Tensor], input_ids: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        del input_ids
         local = materialized_ids
         scales = materialized_scales
         if router_logits is not None:
