@@ -28,12 +28,10 @@
 #include <cstring>
 #include <deque>
 #include <exception>
-#include <fcntl.h>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <set>
-#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -216,7 +214,7 @@ CUDA_CB void hostFnHostToHostCopy(void* userData) noexcept
 // Asynchronous disk I/O. CUDA runs all host functions of a process on one thread, so with the synchronous path
 // every disk transfer waits for every other one. Here the host function only hands the transfer to a worker pool,
 // and the stream waits on a completion flag (cuStreamWaitValue64), so stream ordering is unchanged. Each transfer
-// is split into kDiskIoChunkBytes pieces; aligned writes use O_DIRECT so eviction writes skip the page cache.
+// is split into kDiskIoChunkBytes pieces.
 namespace
 {
 
@@ -236,108 +234,6 @@ constexpr auto kBackgroundWriteMaxWait = std::chrono::milliseconds(100);
 std::atomic<size_t> gAsyncDiskIoThreads{0};
 std::atomic<size_t> gBackgroundDiskWriteBytes{0};
 thread_local bool tBackgroundDiskWrites = false;
-
-// O_DIRECT descriptors, reopened via /proc/self/fd and keyed by fd and inode, since a closed pool file's fd
-// number can be reused for another file.
-struct DirectFdEntry
-{
-    int direct = 0;        // direct fd + 1; 0 = not opened, -1 = open failed
-    bool rejected = false; // the file system rejected an aligned O_DIRECT write
-    dev_t dev = 0;
-    ino_t ino = 0;
-};
-
-std::mutex& directFdMutex()
-{
-    static std::mutex mutex;
-    return mutex;
-}
-
-std::vector<DirectFdEntry>& directFdTable() // indexed by the buffered fd
-{
-    static std::vector<DirectFdEntry> table;
-    return table;
-}
-
-int directFd(int fd) noexcept
-{
-    auto& mutex = directFdMutex();
-    auto& table = directFdTable();
-    struct stat st = {};
-    if (fd < 0 || ::fstat(fd, &st) != 0)
-    {
-        return -1;
-    }
-    std::lock_guard<std::mutex> lock(mutex);
-    if (static_cast<size_t>(fd) >= table.size())
-    {
-        table.resize(static_cast<size_t>(fd) + 1);
-    }
-    DirectFdEntry& entry = table[fd];
-    if (entry.direct != 0 && (entry.dev != st.st_dev || entry.ino != st.st_ino))
-    {
-        if (entry.direct > 0)
-        {
-            ::close(entry.direct - 1);
-        }
-        entry = DirectFdEntry{};
-    }
-    if (entry.direct == 0)
-    {
-        char path[64];
-        std::snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
-        int const direct = ::open(path, O_RDWR | O_DIRECT | O_CLOEXEC);
-        entry.direct = direct >= 0 ? direct + 1 : -1;
-        entry.dev = st.st_dev;
-        entry.ino = st.st_ino;
-        if (direct < 0)
-        {
-            TLLM_LOG_WARNING("[kvCacheManagerV2Utils] O_DIRECT reopen of fd %d failed (%s); using buffered I/O", fd,
-                strerror(errno));
-        }
-    }
-    return entry.direct > 0 && !entry.rejected ? entry.direct - 1 : -1;
-}
-
-// Other workers may still be using the direct fd, so it stays open until releaseDiskFile().
-void rejectDirectFd(int fd) noexcept
-{
-    std::lock_guard<std::mutex> lock(directFdMutex());
-    auto& table = directFdTable();
-    if (static_cast<size_t>(fd) < table.size() && !table[fd].rejected)
-    {
-        table[fd].rejected = true;
-        TLLM_LOG_WARNING("[kvCacheManagerV2Utils] O_DIRECT write to fd %d rejected; using buffered I/O", fd);
-    }
-}
-
-constexpr uintptr_t kDirectAlign = 4096;
-
-bool isDirectAligned(ssize_t pos, ssize_t size, void const* data) noexcept
-{
-    return pos >= 0 && size >= 0 && static_cast<uintptr_t>(pos) % kDirectAlign == 0
-        && static_cast<uintptr_t>(size) % kDirectAlign == 0 && reinterpret_cast<uintptr_t>(data) % kDirectAlign == 0;
-}
-
-bool writePiece(int fd, ssize_t pos, void const* data, ssize_t size) noexcept
-{
-    if (isDirectAligned(pos, size, data))
-    {
-        if (int const direct = directFd(fd); direct >= 0)
-        {
-            if (writeAll(direct, pos, data, size))
-            {
-                return true;
-            }
-            if (errno != EINVAL)
-            {
-                return false;
-            }
-            rejectDirectFd(fd);
-        }
-    }
-    return writeAll(fd, pos, data, size);
-}
 
 // Completion flags: a ring of words in pinned, device-mapped host memory. Transfer t uses word t % kFlagSlots
 // and is complete once the word is >= t.
@@ -429,7 +325,7 @@ struct DiskTransfer
         }
         auto const& t = writes[task];
         bool const ok = !takeInjectedWriteFailure()
-            && writePiece(t.dst.fd, t.dst.pos + offset, reinterpret_cast<std::byte const*>(t.src) + offset, length);
+            && writeAll(t.dst.fd, t.dst.pos + offset, reinterpret_cast<std::byte const*>(t.src) + offset, length);
         if (!ok)
         {
             // Recorded before finish() publishes completion, so whoever waits on the transfer sees the failure.
@@ -717,27 +613,11 @@ void injectDiskWriteFailuresForTesting(uint64_t count) noexcept
     gInjectedWriteFailures.store(count, std::memory_order_relaxed);
 }
 
-void releaseDiskFile(int fd) noexcept
+void waitForDiskIo() noexcept
 {
-    if (fd < 0)
-    {
-        return;
-    }
     if (asyncDiskIo())
     {
-        // Workers may still hold pieces for this file; let them finish before its descriptors go away.
         diskIoPool().waitIdle();
-    }
-    std::lock_guard<std::mutex> lock(directFdMutex());
-    auto& table = directFdTable();
-    if (static_cast<size_t>(fd) < table.size())
-    {
-        DirectFdEntry& entry = table[fd];
-        if (entry.direct > 0)
-        {
-            ::close(entry.direct - 1);
-        }
-        entry = DirectFdEntry{};
     }
 }
 

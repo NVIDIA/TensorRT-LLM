@@ -64,8 +64,9 @@ private:
 //! a process-wide cap on background bytes issued and not yet written.
 [[nodiscard]] size_t backgroundDiskWriteBudget() noexcept;
 
-//! Call before closing a disk pool file: waits for in-flight I/O and closes its cached O_DIRECT descriptor.
-void releaseDiskFile(int fd) noexcept;
+//! Call before closing a disk pool file: waits until the async I/O pool has no queued or running pieces, since a
+//! piece for the file may still use its descriptor (and a closed descriptor number can be reused for another file).
+void waitForDiskIo() noexcept;
 
 CUresult copyDiskToDisk(std::vector<Task<DiskAddress, DiskAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;
 CUresult copyDiskToHost(std::vector<Task<MemAddress, DiskAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;

@@ -471,7 +471,7 @@ void DiskSlotPool::destroy()
 {
     if (mFd != kBadFileDescriptor)
     {
-        releaseDiskFile(mFd);
+        waitForDiskIo();
         ::close(mFd);
         mFd = kBadFileDescriptor;
     }
