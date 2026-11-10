@@ -15,42 +15,25 @@
 
 """Beam-search generation attention that reads the shared prompt once per request.
 
-Every beam of a beam-search request attends to the same prompt KV, which the
-KV-cache manager stores once (beam 0's blocks) and shares across beams. The
-fallback decode kernel still walks that prompt once per (beam, head) pair; at
-wide beams the shared prefix dominates the step.
+A decode step is split in two parts and merged with the log-sum-exp recombination:
 
-This library splits a generation step into two parts and merges them with the
-standard log-sum-exp recombination:
+* **prefix**: one paged-prefill call (FlashInfer, or FA4 with ``TLLM_BEAM_SHARED_PREFIX_BACKEND=fa4``)
+  where a request's ``beam_width`` queries attend the shared prompt through beam 0's page table;
+* **tail**: the generated positions, gathered per beam through ``cache_indirection``, plus the
+  current token from the layer input.
 
-* **prefix**: one FlashInfer paged-prefill call per step where the request's
-  ``beam_width`` queries form the Q tile and the KV is the shared prompt
-  ``[0, prompt_len)`` read through beam 0's page table (no causal mask: every
-  beam sees the whole prompt);
-* **tail**: the few generated positions ``[prompt_len, kv_len - 1)``, gathered
-  per beam through ``cache_indirection`` (a generated token lives in the block
-  of the beam that produced it), plus the current token taken straight from
-  the layer input. This part is tiny, so it runs as plain tensor math.
+The current token's K/V is written into the beam's own block, as the fallback kernel does.
 
-The current token's K/V is written into the beam's own block at
-``kv_len - 1``, exactly as the fallback kernel does, so the two paths are
-interchangeable step by step.
+Scope: generation rows of a dense GQA/MHA model with an unquantized bf16/fp16 paged KV cache
+(KV cache manager V2 only: the legacy manager raises at planning), RoPE applied by the module,
+no sliding window, sinks, custom masks or speculative decoding. In a batch that also carries
+context requests, the context phase runs on the regular library. Per-step planning is host work
+driven from ``TrtllmAttentionMetadata.prepare``, which keeps captured CUDA graphs free of host
+synchronization.
 
-Scope: the generation phase of a dense GQA/MHA model with an unquantized
-bf16/fp16 paged KV cache (KV cache manager V2), RoPE already applied by the module
-(``pos_embd_params`` not handed to the backend), no sliding window, sinks,
-custom masks, or speculative decoding. In a batch that also carries context
-requests, the context phase runs on the regular library and only the generation
-rows come here. The per-step planning (page table of the prompt, tail length)
-is host work driven from ``TrtllmAttentionMetadata.prepare``, which keeps the
-captured CUDA graph free of host synchronization.
-
-Opt in with ``TLLM_FMHA_LIBS=+beam_shared_prefix``. The library supports
-KV cache manager V2 only: with the legacy manager, planning raises instead of
-silently falling back to the regular kernel.
-``TLLM_BEAM_SHARED_PREFIX_MAX_TAIL`` (default 8) bounds how many generated
-positions a beam may carry under CUDA graphs; longer generations are rejected
-loudly at planning time rather than truncated.
+Opt in with ``TLLM_FMHA_LIBS=+beam_shared_prefix``. ``TLLM_BEAM_SHARED_PREFIX_MAX_TAIL``
+(default 8) bounds the generated positions per beam under CUDA graphs; longer generations are
+rejected at planning time.
 """
 
 from __future__ import annotations
@@ -78,7 +61,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 from .fallback import FallbackFmha
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
-from .shared_prefix_fa4 import Fa4Prefix, PrefixGroups, prefix_request_tables
+from .shared_prefix_fa4 import Fa4Prefix, PrefixGroups, fa4_supported, prefix_request_tables
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
@@ -120,41 +103,50 @@ _SPLIT_KV_WORKSPACE_FACTOR = 4
 _float_workspace: Dict[torch.device, torch.Tensor] = {}
 
 
-def _check_enabled() -> bool:
-    return os.environ.get(CHECK_ENV, "0") == "1"
-
-
-def _fused_tail_enabled() -> bool:
-    return os.environ.get(FUSED_TAIL_ENV, "1") != "0"
-
-
 def _backend_from_env() -> str:
     value = os.environ.get(BACKEND_ENV, "").strip()
     return value or DEFAULT_BACKEND
 
 
 def _fa4_requested() -> bool:
+    """Used at layer selection only (the manager caches that decision); the forward reads
+    ``_Config`` instead."""
     return _backend_from_env() == FA4_BACKEND
 
 
-def _fa4_supported(head_dim: int, dtype: torch.dtype, device) -> bool:
-    """Whether the FlashAttention-4 prefix can serve this layer shape on this device."""
-    try:
-        from .shared_prefix_fa4 import fa4_supported
+_fa4_supported = fa4_supported
 
-        return fa4_supported(head_dim, dtype, device)
-    except ImportError:
-        # The FlashAttention-4 generation module is not part of this build.
-        return False
+
+@dataclass(frozen=True)
+class _Config:
+    """The environment settings, read once when a metadata object first plans, not per layer."""
+
+    backend: str
+    fused_tail: bool
+    check: bool
+    max_tail: int
+
+    @classmethod
+    def from_env(cls) -> "_Config":
+        value = os.environ.get(MAX_TAIL_ENV)
+        max_tail = DEFAULT_MAX_TAIL if value is None or not value.strip() else int(value)
+        if max_tail < 0:
+            raise ValueError(f"{MAX_TAIL_ENV} must be >= 0, got {max_tail}.")
+        return cls(
+            backend=_backend_from_env(),
+            fused_tail=os.environ.get(FUSED_TAIL_ENV, "1") != "0",
+            check=os.environ.get(CHECK_ENV, "0") == "1",
+            max_tail=max_tail,
+        )
+
+    @property
+    def fa4(self) -> bool:
+        return self.backend == FA4_BACKEND
 
 
 def _get_float_workspace(device: torch.device, min_bytes: int = 0) -> torch.Tensor:
-    """Shared FlashInfer float workspace of at least ``min_bytes``.
-
-    Every wrapper runs on the same stream sequentially, so one buffer per device
-    serves all plan states. The buffer only grows; a wrapper built earlier keeps
-    the buffer it was created with, which keeps its captured CUDA graphs valid.
-    """
+    """Shared FlashInfer float workspace of at least ``min_bytes``; it only grows, and earlier
+    wrappers keep the buffer they were created with so captured CUDA graphs stay valid."""
     workspace = _float_workspace.get(device)
     if workspace is None or workspace.numel() < min_bytes:
         size = max(_FLOAT_WORKSPACE_BYTES, min_bytes)
@@ -180,16 +172,6 @@ def _lib_enabled() -> bool:
     from .registry import get_enabled_fmha_lib_classes
 
     return BeamSharedPrefixFmha in get_enabled_fmha_lib_classes()
-
-
-def _max_tail_from_env() -> int:
-    value = os.environ.get(MAX_TAIL_ENV)
-    if value is None or not value.strip():
-        return DEFAULT_MAX_TAIL
-    tail = int(value)
-    if tail < 0:
-        raise ValueError(f"{MAX_TAIL_ENV} must be >= 0, got {tail}.")
-    return tail
 
 
 class _PlanKey:
@@ -325,12 +307,8 @@ class _Fa4Slot:
 
 @dataclass
 class _BeamStepState:
-    """Per-metadata plan state kept in ``metadata.fmha_plan_caches[LIB_NAME]``.
-
-    A metadata object belongs to exactly one execution mode (eager, or one
-    CUDA graph batch size), so the FlashInfer wrappers it owns are created with
-    the matching ``use_cuda_graph`` setting and, under graphs, a fixed batch.
-    """
+    """Per-metadata plan state in ``metadata.fmha_plan_caches[LIB_NAME]``; a metadata object
+    belongs to one execution mode (eager, or one CUDA graph batch size)."""
 
     is_cuda_graph: bool
     pool_index: int
@@ -339,7 +317,7 @@ class _BeamStepState:
     page_stride: int
     """Divisor turning a K entry of ``kv_cache_block_offsets`` (a base page index times the pool's
     page-index scale) into a page of the layer's ``get_buffers`` view: ``kv_factor``."""
-    max_tail: int
+    config: _Config
     num_pages: int
     """Pages in the primary pool; bounds every page index handed to a kernel."""
     plan: Optional[_HostPlan] = None
@@ -351,12 +329,9 @@ class _BeamStepState:
 
 
 def _pool_layout(metadata: "TrtllmAttentionMetadata", layer_idx: int) -> tuple[int, int, int]:
-    """(pool index, page-index scale, page stride) of a layer's KV pool.
-
-    KV cache manager V2 keeps a base page index per block. The device block-offset table holds it
-    times the pool's page-index scale (K entry), and a page of the layer's ``get_buffers`` view is
-    that entry divided by ``kv_factor``.
-    """
+    """(pool index, page-index scale, page stride) of a layer's KV pool. The block-offset table
+    holds the V2 base page index times the scale; a ``get_buffers`` page is that divided by
+    ``kv_factor``."""
     manager = metadata.kv_cache_manager
     pool_index = int(manager.layer_to_pool_mapping_dict[manager.layer_offsets[layer_idx]])
     return pool_index, manager.get_layer_page_index_scale(layer_idx), int(manager.kv_factor)
@@ -417,13 +392,14 @@ def metadata_eligible(metadata: "TrtllmAttentionMetadata") -> bool:
 
 
 def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
-    """Per-step host planning, called from ``TrtllmAttentionMetadata.prepare``.
-
-    Builds the shared-prompt page table of every request from the KV cache
-    manager's block table, decides the tail length, and re-plans the
-    FlashInfer wrappers the layers registered on earlier steps. Runs before any
-    forward of the step, so under CUDA graphs it precedes capture and replay.
-    """
+    """Per-step host planning, called from ``TrtllmAttentionMetadata.prepare`` before any forward
+    (so before CUDA graph capture and replay): builds each request's prompt page table, decides
+    the tail length and re-plans the layers' prefix wrappers."""
+    stale = metadata.fmha_plan_caches.get(LIB_NAME)
+    if stale is not None:
+        # A step that returns early below must not leave the previous step's plan in place.
+        stale.plan = None
+        stale.indices = None
     if metadata.beam_width <= 1 or metadata.num_generations == 0 or not _lib_enabled():
         return
     if metadata.kv_cache_manager is not None and not _is_kv_manager_v2(metadata.kv_cache_manager):
@@ -451,7 +427,7 @@ def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
             pool_index=pool_index,
             page_scale=page_scale,
             page_stride=page_stride,
-            max_tail=_max_tail_from_env(),
+            config=_Config.from_env(),
             num_pages=int(pool.size(0)),
         )
         metadata.fmha_plan_caches[LIB_NAME] = state
@@ -477,14 +453,14 @@ def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
     # instead; _step_indices flags the row and the merge drops its prefix.
     prompt_lens = prompt_lens.clamp(min=1)
     if state.is_cuda_graph:
-        if max_tail > state.max_tail:
+        if max_tail > state.config.max_tail:
             raise RuntimeError(
                 f"beam_shared_prefix: a beam carries {max_tail} generated positions but "
-                f"CUDA graphs were captured for at most {state.max_tail}. Raise "
+                f"CUDA graphs were captured for at most {state.config.max_tail}. Raise "
                 f"{MAX_TAIL_ENV} to the maximum number of generated tokens, or remove "
                 f"{LIB_NAME} from TLLM_FMHA_LIBS."
             )
-        tail_len = state.max_tail
+        tail_len = state.config.max_tail
     else:
         tail_len = max_tail
 
@@ -508,7 +484,14 @@ def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
         raise RuntimeError(
             f"{LIB_NAME}: the KV cache holds fewer prompt blocks than the batch's prompt lengths."
         )
-    paged_kv_indices = paged_kv_indices.clamp(0, state.num_pages - 1).to(torch.int32)
+    if paged_kv_indices.numel() and (
+        int(paged_kv_indices.min()) < 0 or int(paged_kv_indices.max()) >= state.num_pages
+    ):
+        raise RuntimeError(
+            f"{LIB_NAME}: the KV cache returned an invalid page index for a prompt block "
+            f"(valid range [0, {state.num_pages}))."
+        )
+    paged_kv_indices = paged_kv_indices.to(torch.int32)
     paged_kv_indptr = torch.zeros((num_requests + 1,), dtype=torch.int32)
     paged_kv_indptr[1:] = torch.cumsum(ctx_blocks, dim=0).to(torch.int32)
     qo_indptr = (torch.arange(num_requests + 1, dtype=torch.int32) * beam_width).to(torch.int32)
@@ -620,20 +603,15 @@ def _create_wrapper(
         device, _float_workspace_bytes(key, metadata, plan.num_requests * plan.beam_width)
     )
     return flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        workspace, "HND", backend=_backend_from_env(), **kwargs
+        workspace, "HND", backend=state.config.backend, **kwargs
     )
 
 
 def _step_indices(
     state: _BeamStepState, metadata: "TrtllmAttentionMetadata", num_pages: int
 ) -> _StepIndices:
-    """Device-side page/slot indices of the current token and the tail.
-
-    Everything derives from device tensors ``prepare`` refreshes each step
-    (``kv_lens_cuda_runtime``, ``prompt_lens_cuda_runtime``,
-    ``kv_cache_block_offsets``, ``cache_indirection``), so a CUDA graph that
-    captured this computation recomputes it correctly on replay.
-    """
+    """Device-side page/slot indices of the current token and the tail, derived from tensors
+    ``prepare`` refreshes each step, so a captured CUDA graph recomputes them on replay."""
     plan = state.plan
     assert plan is not None
     capturing = torch.cuda.is_current_stream_capturing()
@@ -713,23 +691,13 @@ def merge_prefix_and_tail(
     sm_scale: float,
     prefix_empty: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Attend ``q`` to the tail K/V and merge with the prefix partial state.
+    """Attend ``q`` to the tail K/V and merge with the prefix state; returns fp32
+    [rows, num_heads, head_dim].
 
-    Args:
-        q: [rows, num_heads, head_dim] queries (RoPE applied).
-        k_tail, v_tail: [rows, tail, num_kv_heads, head_dim] tail keys/values,
-            the current token included (last position).
-        tail_valid: [rows, tail] bool, or None when every position is valid.
-        prefix_out: [rows, num_heads, head_dim] normalized prefix attention.
-        prefix_lse: [rows, num_heads] fp32 log-sum-exp of the prefix scores
-            **in base 2**, FlashInfer's convention
-            (``lse = log2(sum_j 2^(s_j * log2(e)))`` with ``s_j`` the scaled
-            scores).
-        prefix_empty: [rows] bool, or None. Rows whose prefix state is a
-            placeholder and must not contribute.
-
-    Returns:
-        [rows, num_heads, head_dim] attention over prefix + tail, in fp32.
+    ``k_tail``/``v_tail`` are [rows, tail, num_kv_heads, head_dim] with the current token last;
+    ``tail_valid`` [rows, tail] marks valid positions (None: all). ``prefix_lse`` is the base-2
+    LSE [rows, num_heads] (FlashInfer's convention). ``prefix_empty`` [rows] marks rows whose
+    prefix is a placeholder.
     """
     rows, num_heads, head_dim = q.shape
     group = num_heads // num_kv_heads
@@ -925,6 +893,7 @@ def fused_tail_and_merge(
         assert tensor.stride(-1) == 1
     tail_page = indices.tail_page if tail_len > 0 else indices.write_page
     tail_slot = indices.tail_slot if tail_len > 0 else indices.write_slot
+    # With no tail the kernel never reads these three; any valid tensors of the right type do.
     tail_valid = (
         indices.tail_valid.view(torch.int8)
         if tail_len > 0
@@ -1013,9 +982,12 @@ class BeamSharedPrefixFmha(PhasedFmha):
                 "with the FlashAttention-4 kernels; the library declines this layer."
             )
             return False
-        # RoPE must already be applied by the module: this library never
-        # rotates Q/K itself.
-        if PositionEmbeddingType(getattr(attn, "position_embedding_type", 0)).is_rope():
+        # The module must apply any position embedding itself (it hands the backend none); this
+        # library implements neither RoPE nor ALiBi/relative bias.
+        if (
+            PositionEmbeddingType(getattr(attn, "position_embedding_type", 0))
+            != PositionEmbeddingType.learned_absolute
+        ):
             return False
         return True
 
@@ -1056,17 +1028,14 @@ class BeamSharedPrefixFmha(PhasedFmha):
         if _fa4_requested() and q.dtype != torch.bfloat16:
             return False
         window = forward_args.attention_window_size
-        if (
-            window is not None
-            and metadata.max_seq_len is not None
-            and window < metadata.max_seq_len
-        ):
+        if window is not None and (metadata.max_seq_len is None or window < metadata.max_seq_len):
             return False
         # One query token per beam row.
         if q.shape[0] - metadata.num_ctx_tokens != metadata.num_generations:
             return False
-        if metadata.fmha_plan_caches.get(LIB_NAME) is None:
-            # prepare() declined to plan this batch (see metadata_eligible).
+        state = metadata.fmha_plan_caches.get(LIB_NAME)
+        if state is None or state.plan is None:
+            # prepare() did not plan this step (see metadata_eligible).
             return False
         return True
 
@@ -1137,7 +1106,7 @@ class BeamSharedPrefixFmha(PhasedFmha):
 
         sm_scale = 1.0 / (math.sqrt(head_dim) * attn.q_scaling)
         key = _PlanKey(num_heads, num_kv_heads, head_dim, qkv.dtype, sm_scale)
-        use_fa4 = _fa4_requested()
+        use_fa4 = state.config.fa4
         wrapper = None
         slot = None
         if use_fa4:
@@ -1168,10 +1137,15 @@ class BeamSharedPrefixFmha(PhasedFmha):
         v = qkv[:, q_size + kv_size : q_size + 2 * kv_size].view(rows, num_kv_heads, head_dim)
 
         pool = self._pool_view(metadata)
+        if pool.dtype != qkv.dtype:
+            raise RuntimeError(
+                f"{type(self).__name__}: the KV pool is {pool.dtype} but the layer runs in "
+                f"{qkv.dtype}; the library needs an unquantized cache."
+            )
         # Checks synchronize and read device values, neither of which is
         # permitted inside CUDA graph capture; the capture's warmup runs the
         # same shapes eagerly first, so coverage is not lost.
-        check = _check_enabled() and not torch.cuda.is_current_stream_capturing()
+        check = state.config.check and not torch.cuda.is_current_stream_capturing()
         if check:
             _sync_checkpoint(f"layer {attn.layer_idx}: before step (error from an earlier op)")
             _check_plan(state, metadata, pool)
@@ -1180,26 +1154,27 @@ class BeamSharedPrefixFmha(PhasedFmha):
             _sync_checkpoint(f"layer {attn.layer_idx}: step indices")
             _check_indices(indices, pool, int(metadata.tokens_per_block))
 
-        fused = _fused_tail_enabled()
+        fused = state.config.fused_tail
         if not fused:
-            # 1. Persist the current token's K/V in the beam's own block.
+            # Persist the current token's K/V in the beam's own block.
             pool[indices.write_page, 0, :, indices.write_slot, :] = k
             pool[indices.write_page, 1, :, indices.write_slot, :] = v
             if check:
                 _sync_checkpoint(f"layer {attn.layer_idx}: KV write")
 
-        # 2. Shared prefix: all beams of a request against the prompt KV.
-        q_contig = q.contiguous()
+        # Shared prefix: all beams of a request against the prompt KV.
         if use_fa4:
             # FlashAttention-4: normalized output [rows, heads, dim] and natural-log LSE
             # [heads, rows] (the fused kernel reads it through strides).
             fa4 = slot.prefix
-            fa4.q[:rows].copy_(q_contig)
+            fa4.q[:rows].copy_(q)
+            q_contig = fa4.q[:rows]
             fa4.run(pool, sm_scale)
             prefix_out = fa4.out[:rows]
             prefix_lse = fa4.lse
             lse_scale = _LOG2E
         else:
+            q_contig = q.contiguous()
             prefix_out, prefix_lse = wrapper.run(q_contig, pool, return_lse=True)
             lse_scale = 1.0
         if check:
@@ -1222,9 +1197,8 @@ class BeamSharedPrefixFmha(PhasedFmha):
             raise RuntimeError(f"{type(self).__name__} requires an output tensor.")
         output = output.view(rows, num_heads, head_dim)
 
-        # 1+3+4. Tail attention (past generated positions via indirection, plus
-        # the current token) merged with the prefix state; the fused kernel also
-        # persists the current token's K/V in the beam's own block.
+        # Tail attention (generated positions via indirection, plus the current token) merged
+        # with the prefix state; the fused kernel also writes the current token's K/V.
         if fused:
             fused_tail_and_merge(
                 q,
@@ -1425,11 +1399,8 @@ def _check_prefix_against_reference(
         got_out = prefix_out[row0:row1].float().view(plan.beam_width, num_kv_heads, group, head_dim)
         got_lse = prefix_lse[row0:row1].view(plan.beam_width, num_kv_heads, group)
         keep = ~indices.prefix_empty[row0:row1].view(-1, 1, 1)
-        # The kernel writes bf16/fp16 output and keeps split-KV partial results
-        # in that dtype, so compare with a tolerance relative to the reference
-        # magnitude (bf16 keeps ~3 significant digits, and long prompts reach
-        # about 2% after the partial results are merged). A wrong page or length
-        # gives an error of order one, and the fp32 LSE must match tightly.
+        # bf16 output with split-KV partials: tolerance relative to the reference magnitude.
+        # A wrong page or length gives an error of order one; the fp32 LSE must match tightly.
         out_err = (ref_out - got_out).abs() / (ref_out.abs() + 1.0)
         worst_out = max(worst_out, float((out_err * keep.unsqueeze(-1)).max()))
         worst_lse = max(worst_lse, float(((ref_lse - got_lse).abs() * keep).max()))
@@ -1438,7 +1409,7 @@ def _check_prefix_against_reference(
         raise RuntimeError(
             f"{LIB_NAME} check: FlashInfer prefix attention disagrees with the dense reference "
             f"at layer {layer_idx}: max |out| diff / (1 + |ref|) {worst_out:.4f}, max |lse2| "
-            f"diff {worst_lse:.4f} (backend {_backend_from_env()})"
+            f"diff {worst_lse:.4f} (backend {state.config.backend})"
         )
     logger.info(
         f"{LIB_NAME} check: layer {layer_idx} prefix attention matches the dense "
@@ -1451,6 +1422,7 @@ __all__ = [
     "LIB_NAME",
     "MAX_TAIL_ENV",
     "BeamSharedPrefixFmha",
+    "fused_tail_and_merge",
     "merge_prefix_and_tail",
     "metadata_eligible",
     "plan_step",

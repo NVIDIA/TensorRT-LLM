@@ -29,14 +29,18 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.attention.backends.fmha.beam_shared_prefix import (
     LIB_NAME,
+    BeamSharedPrefixFmha,
     _StepIndices,
     fused_tail_and_merge,
     merge_prefix_and_tail,
     metadata_eligible,
     plan_step,
 )
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from tensorrt_llm.functional import PositionEmbeddingType
 
 _LOG2E = 1.4426950408889634
+needs_flashinfer = pytest.mark.skipif(not IS_FLASHINFER_AVAILABLE, reason="needs FlashInfer")
 
 
 def _reference_prefix_state(
@@ -153,12 +157,18 @@ def _beam_meta(manager, *, beam_width=4, request_ids=(7, 9), kv_lens=(11, 7),
     )
 
 
+# FlashInfer layout: the full product. FA4 layout (bf16 only, as FA4 is): group x tail x head size.
+_FUSED_CASES = [
+    (g, t, h, dt, False)
+    for g in (1, 2, 4, 8)
+    for t in (0, 1, 3)
+    for h in (64, 128)
+    for dt in (torch.bfloat16, torch.float16)
+] + [(g, t, h, torch.bfloat16, True) for g in (1, 2, 4, 8) for t in (0, 1, 3) for h in (64, 128)]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-@pytest.mark.parametrize("fa4_layout", [False, True])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("tail_len", [0, 1, 3])
-@pytest.mark.parametrize("group", [1, 2, 4, 8])
+@pytest.mark.parametrize("group, tail_len, head_dim, dtype, fa4_layout", _FUSED_CASES)
 def test_fused_tail_and_merge_matches_unfused_reference(
     group, tail_len, head_dim, dtype, fa4_layout
 ):
@@ -256,6 +266,7 @@ def test_fused_tail_and_merge_matches_unfused_reference(
     torch.testing.assert_close(pool[write_page, 1, :, write_slot, :], v, atol=0, rtol=0)
 
 
+@needs_flashinfer
 def test_only_kv_manager_v2_with_one_table_per_pool_is_eligible():
     """The library reads the V2 block table: a V1 manager (no index mapper) and a V2 manager with
     per-layer page tables (indexed by local layer, not by pool) are declined."""
@@ -267,6 +278,7 @@ def test_only_kv_manager_v2_with_one_table_per_pool_is_eligible():
     assert not metadata_eligible(_beam_meta(_ManagerV2({}), beam_width=1))
 
 
+@needs_flashinfer
 def test_plan_step_reads_beam0_prompt_pages_from_kv_manager_v2(monkeypatch):
     """The prefix page table holds beam 0's prompt pages of every request (from the V2 manager, in
     batch order), the last page's fill, ``beam_width`` queries per request and the tail length."""
@@ -289,6 +301,59 @@ def test_plan_step_reads_beam0_prompt_pages_from_kv_manager_v2(monkeypatch):
     assert off.fmha_plan_caches == {}
 
 
+@needs_flashinfer
+def test_plan_step_drops_the_previous_plan_when_a_step_is_not_planned(monkeypatch):
+    """A step that declines planning must not leave the last step's page table to be reused."""
+    monkeypatch.setenv("TLLM_FMHA_LIBS", f"+{LIB_NAME}")
+    manager = _ManagerV2({7: [40, 41, 42, 43], 9: [50, 51, 52]})
+    meta = _beam_meta(manager)
+    plan_step(meta)
+    state = meta.fmha_plan_caches[LIB_NAME]
+    assert state.plan is not None
+    declined = _beam_meta(manager, beam_width=1, request_ids=(7,), kv_lens=(11,), prompt_lens=(10,))
+    declined.fmha_plan_caches = meta.fmha_plan_caches
+    plan_step(declined)
+    assert state.plan is None
+
+
+@needs_flashinfer
+def test_plan_step_rejects_an_invalid_prompt_page_index(monkeypatch):
+    monkeypatch.setenv("TLLM_FMHA_LIBS", f"+{LIB_NAME}")
+    manager = _ManagerV2({7: [40, 41, -1, 43], 9: [50, 51, 52]})
+    with pytest.raises(RuntimeError, match="invalid page index"):
+        plan_step(_beam_meta(manager))
+
+
+@needs_flashinfer
+@pytest.mark.parametrize(
+    "position_embedding_type, available",
+    [
+        (PositionEmbeddingType.learned_absolute, True),
+        (PositionEmbeddingType.rope_gpt_neox, False),
+        (PositionEmbeddingType.alibi, False),
+        (PositionEmbeddingType.relative, False),
+        (PositionEmbeddingType.deferred, False),
+    ],
+)
+def test_library_serves_only_models_that_apply_position_embeddings_themselves(
+    position_embedding_type, available
+):
+    """The library implements neither RoPE nor ALiBi/relative bias, so any layer that needs one
+    from the attention backend must be declined rather than run without it."""
+    attn = SimpleNamespace(
+        is_mla_enable=False,
+        sparse_params=None,
+        predicted_tokens_per_seq=1,
+        attention_chunk_size=None,
+        head_dim=64,
+        num_heads=8,
+        num_kv_heads=2,
+        quant_mode=0,
+        position_embedding_type=position_embedding_type,
+    )
+    assert BeamSharedPrefixFmha._is_available(attn) is available
+
+
 def _qwen3_small_path():
     root = llm_models_root(check=False)
     if root is None:
@@ -305,7 +370,8 @@ def _run_beam_search(
     ``max_num_tokens`` below the whole prompt set makes later requests prefill
     while earlier ones decode. ``iterations`` (needs the single-process worker)
     gets the number of generation steps that carried context requests (``mixed``)
-    and that the library planned (``planned``).
+    and that the library planned (``planned``); ``served`` counts the layer calls the library
+    actually ran, so a test cannot pass by comparing the fallback with itself.
     """
     from tensorrt_llm import LLM, SamplingParams
     from tensorrt_llm._torch.attention.backends.fmha import beam_shared_prefix as lib
@@ -314,8 +380,15 @@ def _run_beam_search(
     previous = {key: os.environ.get(key) for key in env}
     os.environ.update(env)
     plan_step = lib.plan_step
+    run_generation = lib.BeamSharedPrefixFmha.run_generation
     if iterations is not None:
-        iterations.update(mixed=0, planned=0)
+        iterations.update(mixed=0, planned=0, served=0)
+
+        def counting_run_generation(self, params):
+            iterations["served"] += 1
+            return run_generation(self, params)
+
+        lib.BeamSharedPrefixFmha.run_generation = counting_run_generation
 
         def counting_plan_step(metadata):
             plan_step(metadata)
@@ -334,8 +407,7 @@ def _run_beam_search(
             kv_cache_config=KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.3),
             cuda_graph_config=CudaGraphConfig(batch_sizes=[len(prompts)]),
             skip_tokenizer_init=True,
-            # The autotuner times GEMM tactics at warmup; a different pick changes the model's
-            # bf16 numerics from process to process, which would mask what these tests compare.
+            # GEMM tactic choice changes bf16 numerics between processes.
             enable_autotuner=False,
         )
         with llm:
@@ -355,6 +427,7 @@ def _run_beam_search(
         ]
     finally:
         lib.plan_step = plan_step
+        lib.BeamSharedPrefixFmha.run_generation = run_generation
         for key, value in previous.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -367,13 +440,11 @@ def _assert_beams_match(reference, candidate, beam_width, min_overlap=0.9):
         assert len(cand_beams) == beam_width
         ref_tokens = [tokens for tokens, _ in ref_beams]
         cand_tokens = [tokens for tokens, _ in cand_beams]
-        # Kernel numerics differ slightly, so allow the ranking of a few
-        # near-tied beams to move; the sets must agree almost entirely.
+        # Near-tied beams may swap in or out; the sets must still agree almost entirely.
         overlap = len(set(ref_tokens) & set(cand_tokens)) / beam_width
         assert overlap >= min_overlap, (overlap, ref_tokens, cand_tokens)
         assert cand_tokens[0] == ref_tokens[0]
-        # Compare each beam present in both runs by its tokens: a near-tied pair
-        # that swaps rank must not pair up unrelated beams.
+        # Match beams by tokens, not rank.
         cand_logprobs = dict(cand_beams)
         for tokens, ref_lp in ref_beams:
             cand_lp = cand_logprobs.get(tokens)
@@ -401,8 +472,8 @@ def test_beam_shared_prefix_matches_fallback_e2e():
 
     base_env = {"TLLM_WORKER_USE_SINGLE_PROCESS": "1"}
     reference = _run_beam_search(model_path, prompts, beam_width, max_tokens, base_env)
-    # Check mode synchronizes after every stage and validates the page table
-    # and the prefix attention against dense references inside the library.
+    # Check mode validates the page table and prefix attention against dense references.
+    iterations = {}
     candidate = _run_beam_search(
         model_path,
         prompts,
@@ -414,8 +485,10 @@ def test_beam_shared_prefix_matches_fallback_e2e():
             "TLLM_BEAM_SHARED_PREFIX_CHECK": "1",
             "TLLM_BEAM_SHARED_PREFIX_MAX_TAIL": str(max_tokens - 1),
         },
+        iterations=iterations,
     )
 
+    assert iterations["served"] > 0, iterations
     _assert_beams_match(reference, candidate, beam_width)
 
 
@@ -442,6 +515,7 @@ def test_beam_shared_prefix_fa4_backend_matches_fallback_e2e():
 
     base_env = {"TLLM_WORKER_USE_SINGLE_PROCESS": "1"}
     reference = _run_beam_search(model_path, prompts, beam_width, max_tokens, base_env)
+    iterations = {}
     candidate = _run_beam_search(
         model_path,
         prompts,
@@ -454,12 +528,12 @@ def test_beam_shared_prefix_fa4_backend_matches_fallback_e2e():
             "TLLM_BEAM_SHARED_PREFIX_CHECK": "1",
             "TLLM_BEAM_SHARED_PREFIX_MAX_TAIL": str(max_tokens - 1),
         },
+        iterations=iterations,
     )
+    assert iterations["served"] > 0, iterations
 
-    # FA4's bf16 rounding differs from the fallback's by a few hundredths of a nat per beam, as
-    # accurate against an fp32 reference. Beam search prunes at near-ties, so up to a few of the 16
-    # beams can be different but equally good ones; the top beam and the scores of the shared
-    # beams must still agree.
+    # FA4 rounds differently, and beam search prunes at near-ties, so 1-2 of 16 beams may differ
+    # (equally accurate against fp32). The top beam and shared beams' scores must still agree.
     _assert_beams_match(reference, candidate, beam_width, min_overlap=0.75)
 
 
@@ -502,6 +576,7 @@ def test_beam_shared_prefix_matches_fallback_in_mixed_batches_e2e():
         iterations=iterations,
     )
 
+    assert iterations["served"] > 0, iterations
     assert iterations["mixed"] > 0, iterations
     assert iterations["planned"] >= iterations["mixed"], iterations
     _assert_beams_match(reference, candidate, beam_width)
