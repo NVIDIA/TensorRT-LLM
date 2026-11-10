@@ -5330,6 +5330,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     )
     disk_io_threads: NonNegativeInt = Field(
         default=0,
+        le=256,
         status="prototype",
         description=
         "Worker threads for asynchronous disk KV cache I/O. The pool is process-wide: the first KV cache manager "
@@ -5806,6 +5807,30 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.disk_write_through requires disk_io_threads > 0"
             )
+        disk_options = [
+            name for name, value in (
+                ("disk_io_threads", self.disk_io_threads > 0),
+                ("disk_keep_copy_after_restore",
+                 self.disk_keep_copy_after_restore),
+                ("disk_write_through", self.disk_write_through),
+            ) if value
+        ]
+        if disk_options:
+            if not self.disk_cache_size:
+                raise ValueError(
+                    f"kv_cache_config.{', '.join(disk_options)} requires disk_cache_size > 0"
+                )
+            if self.use_kv_cache_manager_v2 is False:
+                raise ValueError(
+                    f"kv_cache_config.{', '.join(disk_options)} requires use_kv_cache_manager_v2"
+                )
+            if not self.enable_block_reuse and (
+                    self.disk_keep_copy_after_restore
+                    or self.disk_write_through):
+                logger.warning(
+                    "kv_cache_config.disk_keep_copy_after_restore and disk_write_through have no effect with "
+                    "enable_block_reuse=False: they act only on reusable blocks."
+                )
         return self
 
     @model_validator(mode='after')

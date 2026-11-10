@@ -57,6 +57,22 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"max_batch_size": 8}, True),
         (generator.SERVE_SCHEMA, {"max_batch_szie": 8}, False),
         (generator.SERVE_SCHEMA, {"max_batch_size": "eight"}, False),
+        (generator.SERVE_SCHEMA, {"kv_cache_config": {"disk_io_threads": -1}}, False),
+        (generator.SERVE_SCHEMA, {"kv_cache_config": {"disk_io_threads": 257}}, False),
+        (generator.SERVE_SCHEMA, {"kv_cache_config": {"disk_write_through": "yes"}}, False),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "kv_cache_config": {
+                    "disk_cache_size": 1 << 30,
+                    "disk_cache_path": "/tmp",
+                    "disk_io_threads": 16,
+                    "disk_keep_copy_after_restore": True,
+                    "disk_write_through": True,
+                }
+            },
+            True,
+        ),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend": "CUTLASS"}}, True),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend_typo": "CUTLASS"}}, False),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend": "not-a-backend"}}, False),

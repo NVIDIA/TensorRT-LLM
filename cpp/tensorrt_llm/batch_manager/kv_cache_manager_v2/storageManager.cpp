@@ -584,15 +584,19 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         if (auto const* disk = std::get_if<DiskCacheTierConfig>(&config.cacheTiers[level]))
         {
             mKeepDiskCopyAt[level] = disk->keepCopyAfterRestore;
-            mWriteThroughAt[level] = disk->writeThrough;
-            mDiskWriteThrough = mDiskWriteThrough || disk->writeThrough;
-            configureAsyncDiskIo(static_cast<size_t>(std::max(disk->numIoThreads, 0)));
-            if (disk->keepCopyAfterRestore || disk->writeThrough)
+            // Write-through copies pages as they are evicted into the host tier right above this disk tier. Without
+            // one (no host cache, or a KV connector that takes the host tier's place) it would never run.
+            bool const hostAbove
+                = level.value() >= 1 && cacheTier(CacheLevel{level.value() - 1}) == CacheTier::HOST_MEM;
+            if (disk->writeThrough && !hostAbove)
             {
-                TLLM_LOG_INFO("[kvCacheManagerV2] disk tier %d: keep_copy_after_restore=%d write_through=%d",
-                    static_cast<int>(level.value()), static_cast<int>(disk->keepCopyAfterRestore),
-                    static_cast<int>(disk->writeThrough));
+                TLLM_LOG_WARNING(
+                    "[kvCacheManagerV2] disk tier %d: write_through needs a host tier right above it; disabled",
+                    static_cast<int>(level.value()));
             }
+            mWriteThroughAt[level] = disk->writeThrough && hostAbove;
+            mDiskWriteThrough = mDiskWriteThrough || mWriteThroughAt[level];
+            configureAsyncDiskIo(static_cast<size_t>(std::max(disk->numIoThreads, 0)));
         }
     }
     if (mDiskWriteThrough && !asyncDiskIoEnabled())
@@ -602,6 +606,15 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         TLLM_LOG_WARNING("[kvCacheManagerV2] disk write_through needs async disk I/O (num_io_threads > 0); disabled");
         mDiskWriteThrough = false;
         mWriteThroughAt = TypedVec<CacheLevel, bool>(numCacheLevels(), false);
+    }
+    for (CacheLevel level{0}; level < numCacheLevels(); ++level)
+    {
+        if (mKeepDiskCopyAt[level] || mWriteThroughAt[level])
+        {
+            TLLM_LOG_INFO("[kvCacheManagerV2] disk tier %d: keep_copy_after_restore=%d write_through=%d",
+                static_cast<int>(level.value()), static_cast<int>(mKeepDiskCopyAt[level]),
+                static_cast<int>(mWriteThroughAt[level]));
+        }
     }
 }
 

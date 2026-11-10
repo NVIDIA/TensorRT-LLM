@@ -2052,14 +2052,34 @@ def test_KvCacheConfig_disk_offload_options(tmp_path):
     assert config.disk_keep_copy_after_restore is True
     assert config.disk_write_through is True
 
+    disk = {"disk_cache_size": 2048, "disk_cache_path": str(tmp_path)}
     # Write-through does not need keep-copy, only the I/O pool.
-    config = KvCacheConfig(disk_io_threads=4, disk_write_through=True)
+    config = KvCacheConfig(**disk, disk_io_threads=4, disk_write_through=True)
     assert config.disk_write_through is True
     assert config.disk_keep_copy_after_restore is False
 
-    with pytest.raises(ValidationError) as exc_info:
-        KvCacheConfig(disk_write_through=True)
-    assert "disk_io_threads" in str(exc_info.value)
+    with pytest.raises(ValidationError,
+                       match="disk_write_through requires disk_io_threads"):
+        KvCacheConfig(**disk, disk_write_through=True)
+
+    # The options do nothing without a disk tier or with KV cache manager v1.
+    with pytest.raises(ValidationError,
+                       match="disk_io_threads requires disk_cache_size"):
+        KvCacheConfig(disk_io_threads=4)
+    with pytest.raises(
+            ValidationError,
+            match="disk_keep_copy_after_restore requires disk_cache_size"):
+        KvCacheConfig(disk_keep_copy_after_restore=True)
+    with pytest.raises(ValidationError,
+                       match="requires use_kv_cache_manager_v2"):
+        KvCacheConfig(**disk, disk_io_threads=4, use_kv_cache_manager_v2=False)
+    with pytest.raises(ValidationError):
+        KvCacheConfig(**disk, disk_io_threads=257)
+    KvCacheConfig(**disk, disk_io_threads=256)
+    # Without block reuse they only warn: there is nothing for them to act on.
+    KvCacheConfig(**disk,
+                  disk_keep_copy_after_restore=True,
+                  enable_block_reuse=False)
 
     with pytest.raises(ValidationError):
         KvCacheConfig(disk_io_threads=-1)
