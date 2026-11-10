@@ -56,7 +56,7 @@ import traceback
 from dataclasses import dataclass
 from functools import lru_cache
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Set, Tuple
+from typing import ContextManager, Dict, List, Optional, Set, Tuple
 from unittest.mock import MagicMock
 
 import cloudpickle
@@ -2585,6 +2585,29 @@ def _run_rank_mask_one_rank_masked_test(
     assert saw_dead, f"dead rank {dead_rank} did not appear in results"
 
 
+# These two use torch only through a local import: this module is pickled by value, and a function
+# that names torch.ops next to the global torch makes cloudpickle serialize the ops namespace.
+def _sentinel_available() -> bool:
+    import torch as _torch
+
+    return bool(_torch.ops.trtllm.moe_a2a_sentinel_available())
+
+
+def _record_sentinel_steps(steps: List[bool]) -> ContextManager:
+    """Patch moe_a2a_dispatch to append whether each launch takes the sentinel transport."""
+    from unittest import mock
+
+    import torch as _torch
+
+    dispatch_op = _torch.ops.trtllm.moe_a2a_dispatch
+
+    def record_dispatch(*args, **kwargs):
+        steps.append(bool(kwargs.get("use_sentinel", False)))
+        return dispatch_op(*args, **kwargs)
+
+    return mock.patch.object(_torch.ops.trtllm, "moe_a2a_dispatch", record_dispatch)
+
+
 def _exercise_mnnvl_checkpoint_graph_replay(
     config: CommTestConfig, rank: int, communication
 ) -> bool:
@@ -2650,25 +2673,10 @@ def _exercise_mnnvl_checkpoint_graph_replay(
         def any_allocation_is_mapped() -> bool:
             return communication.mnnvl_mem.mapped
 
-    record_sentinel_steps = contextlib.nullcontext
     sentinel_steps: List[bool] = []
-    if config.comm_type == COMM_NVLINK_ONE_SIDED:
-        # Import locally so cloudpickle does not serialize torch's dynamic ops namespace.
-        from unittest import mock
-
-        import torch as _torch
-
-        if _torch.ops.trtllm.moe_a2a_sentinel_available():
-            # The default policy carries these small steps on the sentinel transport.
-            assert communication.sentinel_max_tokens >= max(config.all_num_tokens)
-        dispatch_op = _torch.ops.trtllm.moe_a2a_dispatch
-
-        def record_dispatch(*args, **kwargs):
-            sentinel_steps.append(bool(kwargs.get("use_sentinel", False)))
-            return dispatch_op(*args, **kwargs)
-
-        def record_sentinel_steps():
-            return mock.patch.object(_torch.ops.trtllm, "moe_a2a_dispatch", record_dispatch)
+    if config.comm_type == COMM_NVLINK_ONE_SIDED and _sentinel_available():
+        # The default policy carries these small steps on the sentinel transport.
+        assert communication.sentinel_max_tokens >= max(config.all_num_tokens)
 
     for cycle in range(3):
         free_before_prepare = torch.cuda.mem_get_info()[0]
@@ -2693,7 +2701,12 @@ def _exercise_mnnvl_checkpoint_graph_replay(
         assert restored_addresses == stable_addresses
 
         sentinel_steps.clear()
-        with torch.inference_mode(), record_sentinel_steps():
+        record = (
+            _record_sentinel_steps(sentinel_steps)
+            if config.comm_type == COMM_NVLINK_ONE_SIDED
+            else contextlib.nullcontext()
+        )
+        with torch.inference_mode(), record:
             worker_inputs.hs.add_(cycle + 1)
             expected = forward().clone()
         if config.comm_type == COMM_NVLINK_ONE_SIDED:
