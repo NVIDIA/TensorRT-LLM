@@ -307,9 +307,6 @@ def _workflow(tmp_path, **kwargs):
     # Scripted like every other outside answer: the fixture repo is not a
     # checkout. An explicit `git_runner=None` selects the real, local git.
     kwargs.setdefault("git_runner", fake_git())
-    # The substrate gate issues a boot-shaped command of its own, which a shell
-    # scripted to fail a specific boot would answer; its test turns it on.
-    kwargs.setdefault("skip_substrate_gate", True)
     return TrtllmModelingV2Workflow(workspace=tmp_path / "ws", **kwargs)
 
 
@@ -352,7 +349,3 @@ def _git(repo: Path, *args: str) -> str:
 
 def _state(tmp_path):
     return load_state(tmp_path / "ws" / _STATE)
-
-
-def _substrate_boot(command: str) -> bool:
-    return "TRTLLM_MODELING_V2=off" in command and "engine_driver" in command

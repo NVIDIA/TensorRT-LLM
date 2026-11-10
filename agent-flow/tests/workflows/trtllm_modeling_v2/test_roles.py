@@ -42,10 +42,7 @@ from agent_flow.workflows.trtllm_modeling_v2.checks import check_config
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem
 from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import ROLE_BY_KIND, TAGS_BY_KIND
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import agent_probe, bootstrap
-from agent_flow.workflows.trtllm_modeling_v2.run.startup.agent_probe import (
-    AGENT_PROBE_RECORD,
-    AGENT_PROBE_SKIP_ENV,
-)
+from agent_flow.workflows.trtllm_modeling_v2.run.startup.agent_probe import AGENT_PROBE_SKIP_ENV
 
 from ._helpers import _workflow
 
@@ -133,9 +130,7 @@ def test_a_failed_probe_stops_the_run_before_any_planner_turn(tmp_path, task_fil
     monkeypatch.setattr(agent_probe, "make_probe_layer", lambda a, w: SayingLayer(a, w, said))
     shells: list[str] = []
     workflow = _workflow(
-        tmp_path,
-        skip_substrate_gate=False,
-        shell_runner=lambda command, env=None, timeout=0: shells.append(command),
+        tmp_path, shell_runner=lambda command, env=None, timeout=0: shells.append(command)
     )
     log = get_logger().console
     assert not bootstrap._run_preflight(workflow, workflow._init_state(task_file, log), log)
@@ -144,8 +139,7 @@ def test_a_failed_probe_stops_the_run_before_any_planner_turn(tmp_path, task_fil
     # The file never written fails the probe, whatever the turn said.
     assert "did not run the command" in journal
     assert "workflow does not change that policy" in journal
-    assert not (tmp_path / "ws" / AGENT_PROBE_RECORD).exists()
-    # Nothing past it ran: not the substrate gate, not the survey.
+    # Nothing past it ran: not the survey's inventory probe.
     assert shells == []
 
 

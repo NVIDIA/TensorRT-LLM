@@ -29,11 +29,9 @@ from typing import Any, Callable, Mapping, Sequence
 import yaml
 
 from ...checks import accuracy as accuracy_checks
-from ...checks import boot as boot_checks
-from ...checks import check_config, check_runtime
+from ...checks import check_config
 from ...checks import disagg as disagg_checks
 from ...checks.check_config import resolve_llm_api_options, speculation_flags
-from ...checks.runtime_evidence import reports_unsupported_architecture
 from ...infra.compute import environment as environment_mod
 from ...infra.compute.commands import CommandResult, CommandSpec, LocalCommandExecutor
 from ...infra.compute.environment import RunEnvironment, resolve_environment
@@ -41,8 +39,6 @@ from ...infra.git import git_output
 from ...operators.coverage import MODELING_V2_PACKAGE
 from ...spec.derive import hybrid_marker
 from ...spec.task_schema import (
-    PARALLEL_FIELD,
-    PARALLEL_UNIFIED,
     assembly_units,
     derive_checkpoint_segment,
     derive_family,
@@ -794,193 +790,18 @@ def check_multirank_substrate(
         )
 
 
-#: How long the substrate gate may take; it loads real weights.
-SUBSTRATE_TIMEOUT_S = 1800
-
-
-def _reports_unsupported_architecture(result: Any) -> bool:
-    """Whether this failure is *"the stock path does not know this model"*.
-
-    Narrow on purpose: a fallback keyed on any failure would answer a real
-    kvCache sizing fault by silently measuring a different model. Every other
-    failure the boot gate can produce is still a hard stop.
-    """
-    return reports_unsupported_architecture(result.detail, result.stdout_tail)
-
-
-def _substrate_members(
-    task_data: Mapping[str, Any], environment: RunEnvironment
-) -> list[str | None]:
-    """The parallel layouts the substrate gate may boot, in the order it tries them.
-
-    A concrete segment is booted as itself (``None``). A ``unified`` target
-    has no single layout: the stock path need not serve every member (a pure
-    TP split can break a stock kernel's alignment that the expert-parallel
-    members keep), so each default member is a candidate and the first that
-    generates proves the host.
-    """
-    if str(task_data.get(PARALLEL_FIELD) or "") != PARALLEL_UNIFIED:
-        return [None]
-    return list(members_for(task_data, None, environment.world_size))
-
-
-def _substrate_boot(
-    task_data: Mapping[str, Any],
-    environment: RunEnvironment,
-    shell_runner: Any,
-    workdir: str | Path,
-):
-    """One substrate boot, under the stock path and no features.
-
-    Returns ``(result, failures)``: the first member's result that passed, or
-    else the first member's failure, and ``(member, result)`` for every
-    member that failed before it.
-    """
-    members = _substrate_members(task_data, environment)
-    failures: list[tuple[str, Any]] = []
-    for member in members:
-        result = boot_checks.run_boot_gate(
-            environment,
-            task_data=task_data,
-            spec=boot_checks.BootSpec(prompts=("The capital of France is",), max_tokens=4),
-            runner=shell_runner,
-            timeout=SUBSTRATE_TIMEOUT_S,
-            mode=check_runtime.MODE_OFF,
-            features=[],
-            workdir=workdir,
-            member=member,
-        )
-        # An architecture the stock path does not know is unknown at every member.
-        if result.passed or member is None or _reports_unsupported_architecture(result):
-            return result, failures
-        failures.append((member, result))
-    return failures[0][1], failures
-
-
-def substrate_gate(
-    task_data: Mapping[str, Any],
-    environment: RunEnvironment,
-    *,
-    shell_runner: Any,
-    workdir: str | Path,
-    notes: list[str] | None = None,
-) -> None:
-    """Prove this host can *generate a token* under the run's exact config.
-
-    It catches failures that otherwise look like model defects
-    (``MPI_ERR_SPAWN``, a kvCache that cannot fit ``max_seq_len``, NVRTC's
-    missing ``cuda.h``, which appears only on the first generated token). It
-    runs the real checkpoint under the real ``runtime`` block. When the stock
-    path answers "I do not know this architecture" (and *only* then, see
-    :func:`_reports_unsupported_architecture`), the gate re-runs itself
-    against ``environment.substrate_checkpoint``, a proxy the stock path does
-    support; the kvCache fault is then unproven, and the note says so.
-
-    A ``unified`` target is proven by any one of its members
-    (:func:`_substrate_members`); the members the stock path failed at are
-    named in the note, since they are layouts the target must serve without
-    a stock reference to boot beside.
-
-    ``workdir`` is where the boot's driver spec is written. The proxy attempt
-    writes under ``workdir/proxy``.
-    """
-    result, failures = _substrate_boot(task_data, environment, shell_runner, workdir)
-    if not result.passed and not _reports_unsupported_architecture(result):
-        raise PreflightError(
-            "substrate gate failed: this host cannot generate a token under the "
-            "run's own environment and runtime block, using the STOCK modeling "
-            "path. Nothing here is about the target — no target exists yet — so "
-            "fix the host or the spec before dispatching an agent.\n\n"
-            f"{_failure_lines(result, failures)}\n\n"
-            f"command:\n  {result.command}\n\n"
-            f"last lines:\n{result.stdout_tail}"
-        )
-
-    if not result.passed:
-        proxy = str((task_data.get("environment") or {}).get("substrate_checkpoint") or "").strip()
-        if not proxy:
-            # Deliberately NOT the raw architecture error, which reads as a
-            # target defect when there is no target yet.
-            raise PreflightError(
-                "substrate gate: the stock modeling path does not know this "
-                "checkpoint's architecture, which is the normal state of affairs "
-                "for a model this workflow is onboarding — it is not a fault in "
-                "the checkpoint or the host. But it means the substrate cannot be "
-                "proven on this checkpoint at all.\n\n"
-                "Declare `environment.substrate_checkpoint`: a checkpoint the stock "
-                "path DOES support, which the gate will run under this same "
-                "environment and runtime block instead. Do not reach for "
-                "`--skip-substrate-gate` — that also gives up the MPI spawn and "
-                "NVRTC checks, which do not depend on the checkpoint at all.\n\n"
-                f"  {result.detail}\n\n"
-                f"last lines:\n{result.stdout_tail}"
-            )
-        proxy_result, proxy_failures = _substrate_boot(
-            {**dict(task_data), "checkpoint_path": proxy},
-            environment,
-            shell_runner,
-            Path(workdir) / "proxy",
-        )
-        if not proxy_result.passed:
-            raise PreflightError(
-                "substrate gate failed on the declared proxy checkpoint "
-                f"{proxy}: this host cannot generate a token under the run's own "
-                "environment and runtime block, using the STOCK modeling path and a "
-                "checkpoint that path supports. Nothing here is about the target — "
-                "no target exists yet — so fix the host or the spec before "
-                "dispatching an agent.\n\n"
-                f"{_failure_lines(proxy_result, proxy_failures)}\n\n"
-                f"command:\n  {proxy_result.command}\n\n"
-                f"last lines:\n{proxy_result.stdout_tail}"
-            )
-        if notes is not None:
-            # The weaker claim, stated in full.
-            notes.append(
-                f"substrate proven on `{proxy}`{_at_member(proxy_result)}; this "
-                f"checkpoint's own geometry is unverified, so a kvCache sizing fault "
-                f"will surface at the first boot gate rather than here."
-            )
-        return
-
-    if notes is not None:
-        notes.append(
-            f"substrate gate: stock path generated under the resolved environment"
-            f"{_at_member(result)} in {result.duration_s:.0f}s"
-        )
-        if failures:
-            notes.append(
-                "substrate gate: the stock path could not serve "
-                + "; ".join(
-                    f"`{member}` ({_first_line(failed.detail)})" for member, failed in failures
-                )
-                + ". The target must serve these members without a stock run to compare against."
-            )
-
-
-def _at_member(result: Any) -> str:
-    """`` at `<member>` `` for a result booted at a member, else empty."""
-    return f" at `{result.member}`" if getattr(result, "member", None) else ""
-
-
-def _first_line(text: str) -> str:
-    return (text or "").strip().splitlines()[0] if (text or "").strip() else "no detail"
-
-
-def _failure_lines(result: Any, failures: Sequence[tuple[str, Any]]) -> str:
-    """The failure detail: one line per member tried, or the lone result's own."""
-    if len(failures) <= 1:
-        return f"  {result.detail}"
-    return "every member failed:\n" + "\n".join(
-        f"  {member}: {failed.detail}" for member, failed in failures
-    )
-
-
 def run_preflight(
     task_data: Mapping[str, Any],
     *,
     runner: CommandRunner = _default_runner,
+    claim: bool = True,
 ) -> PreflightResult:
-    """Assert every precondition in order and resolve the run's identity."""
+    """Assert every precondition in order and resolve the run's identity.
+
+    Without ``claim`` (a dry run) nothing touches a GPU: no device is queried or
+    claimed and the multi-rank probe does not run; the devices are taken to be
+    the first ``world_size`` ones, for the commands the report shows.
+    """
     notes: list[str] = []
 
     checkpoint_config = check_checkpoint(task_data["checkpoint_path"])
@@ -1019,9 +840,17 @@ def run_preflight(
 
     python = str(env_block.get("python", "python3"))
     # The orchestrator and the GPUs are the same machine: the devices are claimed here.
-    devices = claim_devices(world_size, arch, python, runner=runner, notes=notes)
+    if claim:
+        devices = claim_devices(world_size, arch, python, runner=runner, notes=notes)
+    else:
+        devices = tuple(range(world_size))
+        notes.append(
+            "dry run: no device was queried or claimed, and the multi-rank probe did not run; "
+            "a real start does both"
+        )
     environment = resolve_environment(task_data, devices=devices, world_size=world_size)
-    check_multirank_substrate(world_size, environment, runner)
+    if claim:
+        check_multirank_substrate(world_size, environment, runner)
 
     slug = derive_slug(task_data)
     family, target_rel = resolve_target_identity(task_data, checkpoint_config)

@@ -108,25 +108,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run preflight, resolve the environment, print the plan of "
-        "record, and stop before the first agent turn. The fastest way to "
-        "find out whether this host can host this run.",
-    )
-    parser.add_argument(
-        "--skip-substrate-gate",
-        action="store_true",
-        help="Skip preflight's substrate gate — the cold start that proves "
-        "this host generates a token on the STOCK modeling path under this "
-        "run's runtime block. It is the single highest-value preflight "
-        "check and skipping it means the three failures it catches "
-        "(MPI_ERR_SPAWN, kvCache sizing, NVRTC's missing cuda.h) resurface "
-        "hours later inside an agent's turn, reading as target defects. "
-        "A resumed run already skips the gate when its last pass "
-        "(gates/substrate/pass.json) is under 12 h old in the same environment; "
-        "use this only when the gate itself is what is broken. It is "
-        "NOT the answer to an architecture the stock path does not know — "
-        "declare `environment.substrate_checkpoint` for that, which keeps "
-        "the two checks that do not depend on the checkpoint.",
+        help="Run preflight and stop before the first agent turn: the spec, the checkout, "
+        "the checkpoint, the contract and the agent probe. It touches no GPU (no device is "
+        "queried or claimed), so it also runs on a host without one.",
     )
     parser.add_argument(
         "--agent-turn-timeout",
@@ -343,7 +327,6 @@ def main(argv: list[str] | None = None) -> None:
         max_rounds=args.max_rounds,
         clean=args.clean,
         dry_run=args.dry_run,
-        skip_substrate_gate=args.skip_substrate_gate,
         agent_turn_timeout=args.agent_turn_timeout,
     ) as workflow:
         try:

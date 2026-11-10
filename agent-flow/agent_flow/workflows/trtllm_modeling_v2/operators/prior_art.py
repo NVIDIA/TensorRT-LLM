@@ -14,9 +14,6 @@ Intake reads it from disk only: no engine import, no GPU. Two products:
   geometry, read from the source that refuses it (a head dimension the
   trtllm-gen FMHA has no kernel for, say), with the design it usually implies.
   Each limit is one :data:`ENGINE_RULES` entry.
-- :func:`stock_supports` says whether the stock modeling path registers the
-  checkpoint's architecture, which decides whether preflight's substrate gate
-  needs a proxy checkpoint.
 
 All are printed by ``trtllm-modeling-v2 intake lint`` so the operator can put
 the leads that hold into the spec's ``notes``, which every role reads.
@@ -472,39 +469,6 @@ def survey_block(found: PriorArt | None, limits: Sequence[EngineLimit], *, limit
     return "\n".join(lines) + "\n"
 
 
-#: How a stock (non-modeling_v2) model module registers an architecture.
-_REGISTERED = re.compile(r"""register_auto_model\(\s*["']([^"']+)["']""")
-
-
-def stock_architectures(repo: str | Path) -> set[str] | None:
-    """The architectures the stock modeling path registers, or ``None`` when the tree has no zoo."""
-    zoo = tree_anchors.resolve(repo, "builtin_models")
-    index = tree_anchors.read(repo, "builtin_model_index")
-    if not zoo.found and index is None:
-        return None
-    found: set[str] = set()
-    for rel in zoo.paths:
-        for path in sorted((Path(repo) / rel).rglob("*.py")):
-            try:
-                found.update(
-                    _REGISTERED.findall(path.read_text(encoding="utf-8", errors="replace"))
-                )
-            except OSError:
-                continue
-    try:
-        tree = ast.parse(index[0]) if index is not None else None
-    except (SyntaxError, ValueError):
-        tree = None
-    for node in ast.walk(tree) if tree is not None else ():
-        target = node.targets[0] if isinstance(node, ast.Assign) else getattr(node, "target", None)
-        if isinstance(target, ast.Name) and target.id == "MODEL_ARCH_TO_MODULE":
-            try:
-                found.update(str(k) for k in ast.literal_eval(node.value))
-            except (ValueError, TypeError):
-                pass
-    return found
-
-
 #: The value of the PyTorch loader's list of ``kv_cache_config.dtype`` values.
 _KV_DTYPES = re.compile(r"_VALID_KV_CACHE_DTYPES\s*(?::[^=]*)?=\s*(\([^)]*\)|\[[^\]]*\])")
 
@@ -523,21 +487,10 @@ def engine_kv_dtypes(repo: str | Path | None) -> tuple[tuple[str, ...], str] | N
     return (values, where) if values else None
 
 
-def stock_supports(repo: str | Path, config: Mapping[str, Any]) -> bool | None:
-    """Whether the stock path registers one of the checkpoint's ``architectures``; ``None``: unknown."""
-    architectures = [str(a) for a in config.get("architectures") or ()]
-    known = stock_architectures(repo)
-    if not architectures or not known:
-        return None
-    return any(a in known for a in architectures)
-
-
 #: The anchors this module reads; the lint names each this checkout has nowhere.
 PRIOR_ART_ANCHORS: tuple[str, ...] = (
     *(key for key, _ in ENGINE_ANCHORS),
     "fmha_head_dims",
-    "builtin_models",
-    "builtin_model_index",
     "kv_cache_dtypes",
 )
 
@@ -559,8 +512,6 @@ __all__ = [
     "fmha_rule",
     "head_dims",
     "ranker",
-    "stock_architectures",
-    "stock_supports",
     "survey_block",
     "words",
 ]

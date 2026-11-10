@@ -114,7 +114,6 @@ class TrtllmModelingV2Workflow:
         max_rounds: int = DEFAULT_MAX_ROUNDS,
         clean: bool = False,
         dry_run: bool = False,
-        skip_substrate_gate: bool = False,
         prompts: PromptBundle | None = None,
         command_runner: Any | None = None,
         shell_runner: Any | None = None,
@@ -133,7 +132,6 @@ class TrtllmModelingV2Workflow:
         self.max_attempts = max(1, max_attempts)
         self.max_rounds = max(1, max_rounds)
         self.dry_run = dry_run
-        self.skip_substrate_gate = skip_substrate_gate
         self._prompts_override = prompts
 
         # Injected so every stage is testable without a GPU, a cluster, or a

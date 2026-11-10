@@ -313,18 +313,20 @@ ENVIRONMENT_KEYS: tuple[str, ...] = (
     "gpus_per_node",
     # Each device's memory, GiB: the intake lint sizes engines and disaggregation by it.
     "gpu_memory_gib",
-    # A checkpoint the STOCK modeling path already supports, used by
-    # `preflight.substrate_gate` when the run's own checkpoint has an
-    # architecture that path has never heard of.
-    "substrate_checkpoint",
 )
 
 #: Where the run's commands land: on the orchestrator's own host. Running them anywhere else
 #: (a queue of compute sessions, a batch scheduler) is not this workflow's: start the
 #: orchestrator where the GPUs are.
 ENVIRONMENT_KINDS: tuple[str, ...] = ("local",)
-#: Keys of the compute-session executor the workflow no longer ships, refused with why.
-REMOVED_ENVIRONMENT_KEYS: tuple[str, ...] = ("spool", "sessions", "session_wait")
+#: Keys of the compute-session executor and the substrate gate the workflow no longer ships:
+#: refused with why, so a spec written for them is not half-read.
+REMOVED_ENVIRONMENT_KEYS: tuple[str, ...] = (
+    "spool",
+    "sessions",
+    "session_wait",
+    "substrate_checkpoint",
+)
 ENVIRONMENT_REQUIRED_FIELDS: tuple[str, ...] = ("kind", "python")
 
 # Accuracy tolerance, in benchmark points, under `accuracy.floor.rule:
@@ -600,9 +602,9 @@ def _validate_environment(block: Any, errors: list[str]) -> None:
             ", ".join(f"'{ENVIRONMENT_FIELD}.{key}'" for key in removed) or "kind: session_spool"
         )
         errors.append(
-            f"{named}: the compute-session executor is no longer part of this workflow. "
-            f"Use `kind: local` and start the orchestrator on the host that holds the GPUs "
-            f"(inside the allocation, on a cluster)."
+            f"{named}: the compute-session executor and the substrate gate are no longer part "
+            f"of this workflow. Use `kind: local`, start the orchestrator on the host that "
+            f"holds the GPUs (inside the allocation, on a cluster), and drop these keys."
         )
     reject_unknown_keys(
         {k: v for k, v in block.items() if k not in REMOVED_ENVIRONMENT_KEYS},
@@ -648,21 +650,6 @@ def _validate_environment(block: Any, errors: list[str]) -> None:
     memory = block.get("gpu_memory_gib")
     if memory is not None and not (_number(memory) and memory > 0):
         errors.append(f"'{ENVIRONMENT_FIELD}.gpu_memory_gib' must be a positive number of GiB")
-
-    proxy = block.get("substrate_checkpoint")
-    if proxy is not None:
-        if not isinstance(proxy, str) or not proxy.strip():
-            errors.append(
-                f"'{ENVIRONMENT_FIELD}.substrate_checkpoint' must be a path to a "
-                f"checkpoint directory the stock modeling path supports"
-            )
-        elif not Path(proxy).exists():
-            errors.append(
-                f"'{ENVIRONMENT_FIELD}.substrate_checkpoint' does not exist: {proxy}. "
-                f"The substrate gate falls back to it only after the run's own "
-                f"checkpoint has already failed, so a missing proxy turns the "
-                f"longest step in preflight into two failures instead of one."
-            )
 
 
 def _positive_int(value: Any) -> bool:

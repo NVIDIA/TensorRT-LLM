@@ -27,7 +27,6 @@ import os
 import re
 import secrets
 import shlex
-import socket
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,9 +42,6 @@ from ...agents.turns import InProcessTurnExecutor, TurnRequest
 #: Where the probe's turns and files live, under the workspace.
 AGENT_PROBE_DIR = Path("gates") / "agent-probe"
 #: Where the last pass is recorded, under the workspace.
-AGENT_PROBE_RECORD = AGENT_PROBE_DIR / "pass.json"
-#: How long a recorded pass spares a resumed run the probe, in seconds.
-AGENT_PROBE_FRESH_S = 12 * 3600.0
 #: How long one probe turn may take. A CLI that cannot start fails in seconds.
 AGENT_PROBE_TIMEOUT_S = 600.0
 #: Set to skip the probe, for when the probe itself is what is broken.
@@ -124,49 +120,6 @@ def distinct_agents(
         key = json.dumps(dataclasses.asdict(agent), sort_keys=True, default=str)
         groups.setdefault(key, (agent, []))[1].append(role)
     return [ProbedAgent(agent, tuple(names)) for agent, names in groups.values()]
-
-
-def probe_inputs(
-    task_data: Mapping[str, Any],
-    agents: Sequence[ProbedAgent],
-    *,
-    environ: Mapping[str, str] | None = None,
-) -> dict[str, str]:
-    """What a probe pass stands for, one digest per part.
-
-    - ``agents``: each distinct configuration, and the roles on it;
-    - ``cli``: the ``claude`` binary a layer launches and its version, when an
-      agent is on Claude Code (``$AGENT_FLOW_CLAUDE_CLI`` moves it);
-    - ``process``: this host, whether this process runs inside another
-      agent's session, and the home and configuration directories the CLIs
-      authenticate from;
-    - ``checkout``: the checkout whose ``HEAD`` the probe reads, by path.
-    """
-    env = os.environ if environ is None else environ
-    claude = any(probed.agent.backend == "claude-code" for probed in agents)
-    parts: dict[str, Any] = {
-        "agents": [probed.as_dict() for probed in agents],
-        "cli": list(launched_cli()) if claude else None,
-        "process": {
-            "host": socket.gethostname(),
-            "nested": {name: env.get(name) for name in NESTED_SESSION_ENV},
-            "home": env.get("HOME"),
-            "config_dir": env.get("CLAUDE_CONFIG_DIR"),
-            "codex_home": env.get("CODEX_HOME"),
-        },
-        "checkout": task_data.get("trtllm_repo_path"),
-    }
-    return part_digests(parts)
-
-
-def part_digests(parts: Mapping[str, Any]) -> dict[str, str]:
-    """One short digest per part of what a recorded pass stands for (this probe's, the substrate gate's)."""
-    return {
-        name: hashlib.sha1(
-            json.dumps(value, sort_keys=True, default=str).encode("utf-8")
-        ).hexdigest()[:16]
-        for name, value in parts.items()
-    }
 
 
 def probe_command(nonce: str, out: Path, repo: str) -> str:
@@ -473,8 +426,6 @@ def format_failures(
 
 __all__ = [
     "AGENT_PROBE_DIR",
-    "AGENT_PROBE_FRESH_S",
-    "AGENT_PROBE_RECORD",
     "AGENT_PROBE_SKIP_ENV",
     "AGENT_PROBE_TIMEOUT_S",
     "NESTED_SESSION_ENV",
@@ -486,10 +437,8 @@ __all__ = [
     "format_failures",
     "hint_for",
     "make_probe_layer",
-    "part_digests",
     "probe_agents",
     "probe_command",
-    "probe_inputs",
     "probe_prompt",
     "read_probe_file",
 ]

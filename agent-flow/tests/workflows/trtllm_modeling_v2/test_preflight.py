@@ -124,35 +124,6 @@ def _fake_boot(fails: dict[str, str], booted: list):
     return run_boot_gate
 
 
-def test_a_unified_substrate_is_proven_by_the_first_member_the_stock_path_serves(
-    tmp_path, monkeypatch
-):
-    task = _task(tmp_path, parallel="unified", members=["tp4", "tep4", "dep4"])
-    environment = SimpleNamespace(world_size=4)
-    booted, notes = [], []
-    misaligned = {"tp4": "AssertionError: M % 128 == 0"}
-    monkeypatch.setattr(preflight.boot_checks, "run_boot_gate", _fake_boot(misaligned, booted))
-    preflight.substrate_gate(task, environment, shell_runner=None, workdir=tmp_path, notes=notes)
-    assert booted == ["tp4", "tep4"]
-    assert "at `tep4`" in notes[0]
-    assert "could not serve `tp4` (AssertionError: M % 128 == 0)" in notes[1]
-
-    # Every member failing is still a stop, and names what each member said.
-    booted.clear()
-    every = {member: f"{member} broke" for member in ("tp4", "tep4", "dep4")}
-    monkeypatch.setattr(preflight.boot_checks, "run_boot_gate", _fake_boot(every, booted))
-    with pytest.raises(PreflightError, match="every member failed:\n  tp4: tp4 broke\n  tep4"):
-        preflight.substrate_gate(task, environment, shell_runner=None, workdir=tmp_path)
-    assert booted == ["tp4", "tep4", "dep4"]
-
-    # A concrete segment is booted once, as itself.
-    booted.clear()
-    task["parallel"] = "dep4"
-    monkeypatch.setattr(preflight.boot_checks, "run_boot_gate", _fake_boot({}, booted))
-    preflight.substrate_gate(task, environment, shell_runner=None, workdir=tmp_path, notes=notes)
-    assert booted == [None]
-
-
 def test_multirank_probe_launches_the_run_interpreter_on_claimed_devices():
     from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
 

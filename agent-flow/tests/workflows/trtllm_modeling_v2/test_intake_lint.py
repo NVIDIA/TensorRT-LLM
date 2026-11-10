@@ -18,12 +18,6 @@ from agent_flow.workflows.trtllm_modeling_v2.spec import intake, lint
 FMHA_HEADER = tree_anchors.ANCHORS["fmha_head_dims"].hint
 
 
-STOCK_MODELS_DIR = tree_anchors.ANCHORS["builtin_models"].hint
-
-
-STOCK_ARCH_INDEX = tree_anchors.ANCHORS["builtin_model_index"].hint
-
-
 KV_DTYPES_SOURCE = tree_anchors.ANCHORS["kv_cache_dtypes"].hint
 
 
@@ -188,11 +182,6 @@ def test_intake_lint_cli_exits_one_while_a_finding_stands(tmp_path, capsys):
 
 def test_the_environment_can_start_the_run(tmp_path):
     repo = _tree(tmp_path)
-    zoo = repo / STOCK_MODELS_DIR
-    zoo.mkdir(parents=True)
-    (zoo / "modeling_other.py").write_text(
-        '@register_auto_model("OtherForCausalLM")\nclass M: ...\n'
-    )
     checkpoint = _checkpoint(tmp_path)
     task = copy.deepcopy(_GOOD)
     task["environment"].update(
@@ -201,20 +190,15 @@ def test_the_environment_can_start_the_run(tmp_path):
         python="/work/venv/bin/python",
     )
     rules = _rules(lint.lint_task(task, checkpoint=checkpoint, repo=repo))
-    assert {"environment-python-missing", "substrate-checkpoint-missing"} <= rules
+    assert "environment-python-missing" in rules
     assert "agents-model-missing" not in rules
     del task["agents"]
     assert "agents-model-missing" in _rules(lint.lint_task(task, checkpoint=checkpoint, repo=repo))
     task["agents"] = copy.deepcopy(_GOOD["agents"])
-    # The image's own interpreter is not on this host to check; a proxy answers the gate.
-    task["environment"].update(python="/usr/bin/python3", substrate_checkpoint=str(checkpoint))
+    # The image's own interpreter is not on this host to check.
+    task["environment"].update(python="/usr/bin/python3")
     rules = _rules(lint.lint_task(task, checkpoint=checkpoint, repo=repo))
-    assert not {"environment-python-missing", "substrate-checkpoint-missing"} & rules
-    # The lazy zoo's index registers architectures too.
-    (repo / STOCK_ARCH_INDEX).write_text(
-        'MODEL_ARCH_TO_MODULE = {"ToyForCausalLM": "modeling_toy"}\n'
-    )
-    assert prior_art.stock_supports(repo, _CONFIG) is True
+    assert "environment-python-missing" not in rules
 
 
 def test_a_kv_dtype_the_engine_refuses_is_a_block(tmp_path):

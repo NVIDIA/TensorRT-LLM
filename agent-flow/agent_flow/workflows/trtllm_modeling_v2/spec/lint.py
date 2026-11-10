@@ -367,8 +367,7 @@ def kv_cache_rules(ctx: LintContext) -> Iterator[Finding]:
                 "kv-cache-dtype",
                 BLOCK,
                 f"kv_cache_config.dtype {dtype!r} ({', '.join(where)}) is not one the engine "
-                f"loads a model with ({source}: {', '.join(values)}): every boot fails, "
-                "preflight's substrate gate first",
+                f"loads a model with ({source}: {', '.join(values)}): every boot fails",
                 f"use one of {', '.join(values)}; `auto` keeps the checkpoint's own KV dtype "
                 "(the model dtype, e.g. BF16, when the checkpoint names no KV quantization)",
             )
@@ -714,20 +713,6 @@ def environment_rules(ctx: LintContext) -> Iterator[Finding]:
             "it, so preflight fails at its first step",
             "create it before launch (the editable install of the checkout the run measures), "
             "or name an interpreter the image already has",
-        )
-    if ctx.config is None or not ctx.repo or env.get("substrate_checkpoint"):
-        return
-    if prior_art.stock_supports(ctx.repo, ctx.config) is False:
-        archs = (
-            ", ".join(str(a) for a in ctx.config.get("architectures") or ()) or "this architecture"
-        )
-        yield Finding(
-            "substrate-checkpoint-missing",
-            WARN,
-            f"the stock modeling path registers no {archs}: preflight's substrate gate cannot "
-            "boot this checkpoint, and without a proxy it stops the launch",
-            "set environment.substrate_checkpoint to a small checkpoint the stock path supports, "
-            "on this cluster (not --skip-substrate-gate, which also drops the MPI and NVRTC checks)",
         )
 
 

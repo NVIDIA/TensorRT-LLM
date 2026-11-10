@@ -1,20 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Preflight: the checks, the environment, the agent probe, host facts and the surface survey.
+"""Preflight: the spec, checkout and checkpoint checks, the environment, the agent probe, the survey material.
 
-The substrate gate, the one check that boots a GPU, runs last, unless a recent
-pass in this environment stands for it or the run is a dry run. Any failure
-here stops the run before its first turn; it stays open for the same command
-to resume.
+It runs on every start, a resume's included, and keeps no record of a pass:
+what it proves is proven again. Any failure stops the run before its first
+turn; the run stays open for the same command to resume. A dry run does the
+same without touching a GPU.
 """
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
-import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -27,11 +25,10 @@ from agent_flow.prompts import dump_prompt_bundle
 from ...agents.prompts import PROMPTS_DIRNAME, build_trtllm_modeling_v2_prompts
 from ...agents.roles import packaged_skills
 from ...agents.turns import TURNS_DIRNAME
-from ...checks import check_config, gate_cli
 from ...checks import datasets as datasets_mod
-from ...infra.compute.environment import MAX_TMPDIR_LEN, RunEnvironment
+from ...checks import gate_cli
+from ...infra.compute.environment import MAX_TMPDIR_LEN
 from ...infra.compute.executor import select_command_executor, shell_runner_for
-from ...infra.files import read_json, write_json_atomic
 from ...operators import prior_art, tree_anchors
 from ...operators.inventory import (
     format_surface,
@@ -51,7 +48,6 @@ from .preflight import (
     check_processor_dependencies,
     format_preflight_report,
     run_preflight,
-    substrate_gate,
 )
 
 #: Where to investigate a failed infrastructure probe.
@@ -66,79 +62,6 @@ HOST_FACTS_FILENAME = "host_facts.md"
 #: Everything below this line belongs to the roles; preflight preserves it on resume.
 HOST_FACTS_APPEND_MARKER = "<!-- roles append below this line; nothing above it is preserved -->"
 
-#: Where the substrate gate's last pass is recorded, under the workspace.
-SUBSTRATE_RECORD = Path("gates") / "substrate" / "pass.json"
-#: How long a recorded substrate pass spares a resumed run the gate, in seconds.
-SUBSTRATE_FRESH_S = 12 * 3600.0
-
-
-def substrate_inputs(task_data: Mapping[str, Any], environment: RunEnvironment) -> dict[str, str]:
-    """What a substrate pass proves something about, one digest per part.
-
-    - ``environment``: the launch environment as preflight resolved it, and
-      ``spec_environment``, the block it was resolved from, which also names
-      the proxy checkpoint;
-    - ``engine``: what the boot's command line is built from -- the
-      checkpoint, the parallel segment and the runtime block -- and
-      ``options``, the options file it reads, by content;
-    - ``checkout``: the checkout it ran in, by path.
-
-    Not by the checkout's content: the tree changes with every integration.
-    """
-    accuracy = task_data.get("accuracy") or {}
-    options = check_config.resolve_llm_api_options(accuracy, None)
-    options_text = None
-    if options and Path(str(options)).is_file():
-        options_text = Path(str(options)).read_text(encoding="utf-8", errors="replace")
-    block = dict(task_data.get("environment") or {})
-    parts: dict[str, Any] = {
-        "environment": dataclasses.asdict(environment),
-        "spec_environment": block,
-        "engine": {
-            "checkpoint_path": task_data.get("checkpoint_path"),
-            "parallel": task_data.get("parallel"),
-            "runtime": check_config.resolve_runtime(task_data, None),
-        },
-        "options": [options, options_text],
-        "checkout": task_data.get("trtllm_repo_path"),
-    }
-    return agent_probe.part_digests(parts)
-
-
-def substrate_reuse(
-    record: Mapping[str, Any] | None,
-    inputs: Mapping[str, str],
-    *,
-    now: float,
-    fresh_s: float = SUBSTRATE_FRESH_S,
-) -> tuple[bool, str]:
-    """Whether a recorded substrate pass stands for ``inputs`` at ``now``, and why.
-
-    It stands when it was recorded for the same :func:`substrate_inputs`
-    less than ``fresh_s`` ago. The window bounds what the inputs cannot see:
-    an image re-imported under the same name, a package installed into the
-    same interpreter, a driver update.
-    """
-    if not record:
-        return False, "no pass is recorded"
-    recorded = record.get("inputs") or {}
-    changed = sorted(
-        name for name in {*inputs, *recorded} if inputs.get(name) != recorded.get(name)
-    )
-    if changed:
-        verb = "differs" if len(changed) == 1 else "differ"
-        return False, f"the {', '.join(changed)} {verb} from the last pass's"
-    try:
-        age = now - float(record.get("at"))
-    except (TypeError, ValueError):
-        return False, "the last pass has no time"
-    if not 0 <= age < fresh_s:
-        return (
-            False,
-            f"the last pass is {age / 3600:.1f} h old, past the {fresh_s / 3600:g} h window",
-        )
-    return True, f"passed {age / 3600:.1f} h ago in this environment"
-
 
 def _run_preflight(workflow, state: WorkflowState, log) -> bool:
     """Resolve and prove what the run needs before its first turn; False stops the run."""
@@ -147,7 +70,8 @@ def _run_preflight(workflow, state: WorkflowState, log) -> bool:
     if workflow._command_runner is not None:
         kwargs["runner"] = workflow._command_runner
     try:
-        result = run_preflight(workflow.task_data, **kwargs)
+        # A dry run touches no GPU: it asks whether the spec, checkout and agents can run.
+        result = run_preflight(workflow.task_data, claim=not workflow.dry_run, **kwargs)
     except PreflightError as exc:
         # A spec that contradicts itself is fixed in the spec; the
         # infrastructure guide would send the operator the wrong way.
@@ -199,11 +123,6 @@ def _run_preflight(workflow, state: WorkflowState, log) -> bool:
     if not _check_coverage(workflow, log):
         return False
 
-    # Skipped on a dry run, which only asks whether the spec resolves.
-    if not workflow.dry_run and not workflow.skip_substrate_gate:
-        if not _prove_substrate(workflow, result, log):
-            return False
-
     _take_survey(workflow, result, log)
 
     gate_cli.install_cli(workflow.workspace)
@@ -251,62 +170,10 @@ def _check_processor(workflow, result: PreflightResult, log) -> bool:
     return True
 
 
-def _prove_substrate(workflow, result, log) -> bool:
-    """Run the substrate gate, or stand on a recent pass in this environment; False when it fails.
-
-    A resumed run does not run it when the last
-    pass (:data:`SUBSTRATE_RECORD`) stands for this environment
-    (:func:`substrate_reuse`), and carries that pass's notes into the host
-    facts. A new run always runs it. The journal says which happened and
-    why; a failure removes the record, so the next start runs it again.
-    """
-    record_path = workflow.workspace / SUBSTRATE_RECORD
-    inputs = substrate_inputs(workflow.task_data, result.environment)
-    if workflow.resume:
-        record = read_json(record_path)
-        reusable, why = substrate_reuse(record, inputs, now=time.time())
-    else:
-        record, reusable, why = None, False, "this is a new run"
-    if reusable:
-        result.notes.extend(str(note) for note in (record or {}).get("notes") or ())
-        workflow.journal.event("substrate gate not run", f"{why}; `{record_path}`")
-        print_message(f"[bold green]✔ substrate gate[/bold green] not run: {why}", log)
-        return True
-    # The boot takes minutes to an hour on a large checkpoint: say why it runs now, not only after.
-    workflow.journal.event("substrate gate running", f"{why}; `{record_path}`")
-    print_message(f"→ substrate gate running: {why}", log)
-    before = len(result.notes)
-    try:
-        substrate_gate(
-            workflow.task_data,
-            result.environment,
-            shell_runner=workflow._shell_runner,
-            notes=result.notes,
-            workdir=record_path.parent,
-        )
-    except PreflightError as exc:
-        record_path.unlink(missing_ok=True)
-        print_message(f"[bold red]✘ {exc}[/bold red]", log)
-        print_message(TROUBLESHOOTING_HINT, log)
-        workflow.journal.section("substrate gate failed", f"{exc}\n\n{TROUBLESHOOTING_HINT}")
-        return False
-    record_path.parent.mkdir(parents=True, exist_ok=True)
-    write_json_atomic(
-        record_path, {"at": time.time(), "inputs": inputs, "notes": result.notes[before:]}
-    )
-    workflow.journal.event("substrate gate passed", f"run because {why}; `{record_path}`")
-    return True
-
-
 def _prove_agents(workflow, log) -> bool:
-    """Probe every agent the roles resolve to, or stand on a recent pass; False when one fails.
+    """Probe every agent the roles resolve to, on every start; False when one fails.
 
-    A resumed run does not probe again while the last pass
-    (:data:`~..agent_probe.AGENT_PROBE_RECORD`) stands for the same
-    agents, CLI, host and checkout (:func:`~..agent_probe.probe_inputs`)
-    and is under :data:`~..agent_probe.AGENT_PROBE_FRESH_S` old. A failure
-    stops the run, says what each failed turn said and what to do, and
-    removes the record, so the next start probes again.
+    A failure stops the run and says what each failed turn said and what to do.
     """
     if os.environ.get(agent_probe.AGENT_PROBE_SKIP_ENV, "").strip() not in ("", "0"):
         why = f"${agent_probe.AGENT_PROBE_SKIP_ENV} is set"
@@ -314,30 +181,12 @@ def _prove_agents(workflow, log) -> bool:
         print_message(f"[bold yellow]⚠ agent probe not run: {why}[/bold yellow]", log)
         return True
     agents = agent_probe.distinct_agents(workflow.task_data, resolved=workflow._role_agents())
-    record_path = workflow.workspace / agent_probe.AGENT_PROBE_RECORD
-    inputs = agent_probe.probe_inputs(workflow.task_data, agents)
-    if workflow.resume:
-        reusable, why = substrate_reuse(
-            read_json(record_path),
-            inputs,
-            now=time.time(),
-            fresh_s=agent_probe.AGENT_PROBE_FRESH_S,
-        )
-    else:
-        reusable, why = False, "this is a new run"
-    if reusable:
-        recorded = (read_json(record_path) or {}).get("foreign_skills") or {}
-        workflow._foreign_skills = {str(k): tuple(v) for k, v in recorded.items()}
-        workflow.journal.event("agent probe not run", f"{why}; `{record_path}`")
-        print_message(f"[bold green]✔ agent probe[/bold green] not run: {why}", log)
-        return True
     repo = str(workflow.task_data.get("trtllm_repo_path") or "")
     outcomes = agent_probe.probe_agents(
         agents, workflow.workspace, repo=repo, head=workflow._head()
     )
     workflow._foreign_skills = agent_probe.foreign_skills(outcomes, packaged_skills())
     if not all(outcome.ok for outcome in outcomes):
-        record_path.unlink(missing_ok=True)
         report = agent_probe.format_failures(outcomes)
         failed = sum(1 for outcome in outcomes if not outcome.ok)
         print_message(
@@ -347,16 +196,6 @@ def _prove_agents(workflow, log) -> bool:
         )
         workflow.journal.section("agent probe failed", report)
         return False
-    record_path.parent.mkdir(parents=True, exist_ok=True)
-    write_json_atomic(
-        record_path,
-        {
-            "at": time.time(),
-            "inputs": inputs,
-            "agents": [a.as_dict() for a in agents],
-            "foreign_skills": {k: list(v) for k, v in workflow._foreign_skills.items()},
-        },
-    )
     proven = "; ".join(
         outcome.probed.label
         + (f" [{outcome.settings}]" if outcome.settings else "")
@@ -370,7 +209,7 @@ def _prove_agents(workflow, log) -> bool:
     )
     workflow.journal.event(
         "agent probe passed",
-        f"run because {why}; {proven}; `{record_path}`"
+        proven
         + (f"; the user's skills are off ({turned_off}), and their plugins" if turned_off else ""),
     )
     print_message(
