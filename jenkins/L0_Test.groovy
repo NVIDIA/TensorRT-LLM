@@ -3692,89 +3692,68 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     }
 }
 
-// CBTS Layer 2.5: rename narrowed stages (reuse-safety) and resize their splits to k.
+// Keep config tuples shared with the stage closures so splits can be resized
+// after command-stage selection, without moving work outside the selected scope.
+@Field
+def cbtsStageConfigs = [:]
+
+// Rename narrowed stages for reuse safety; defer split sizing until scope is known.
 def cbtsResizeSplits(configs) {
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts == null || !cbts.cbts_test_db_artifact_path) {
         return configs
     }
-    def kByStage = cbts.affected_stage_split_counts
-    if (!kByStage) {
-        return configs
-    }
-    def resized = [:]
-    configs.each { key, values ->
-        def k = kByStage[key]
-        if (k == null) {
-            resized[key] = values
-            return
+    def kByStage = cbts.affected_stage_split_counts ?: [:]
+    return configs.collectEntries { key, values ->
+        if (!kByStage.containsKey(key)) {
+            return [(key): values]
         }
-        int kk = Math.max(1, k as int)
-        if ((values[2] as int) > kk) {
-            echo "CBTS [${cbts.scope}]: ${key} narrowed -> ${kk} shard(s); dropping group ${values[2]}"
-            return
-        }
-        def v = values.collect()
-        v[3] = kk
-        resized[key + CBTS_STAGE_SUFFIX] = v
+        def stageName = key + CBTS_STAGE_SUFFIX
+        def config = values.collect()
+        cbtsStageConfigs[stageName] = config
+        return [(stageName): config]
     }
-    return resized
 }
 
-// CBTS Layer 2: replace the normal stage set with the selector's affected
-// stages while retaining the baseline sanity and multi-GPU gates.
-def filterCbtsStageJobs(parallelJobs, parallelJobsFiltered, multiGpuJobs, testFilter) {
+// CBTS can only narrow the stages selected by the command. A null decision
+// leaves that same scope intact, including on selector failure.
+def filterCbtsStageJobs(parallelJobsFiltered, testFilter) {
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts == null) {
         return parallelJobsFiltered
     }
 
-    // cbtsResizeSplits renames only narrowed stages (those in
-    // affected_stage_split_counts) to `-cbts`; affected-but-not-narrowed
-    // stages keep their original name, so match each per its actual key.
     def stageSuffix = cbts.cbts_test_db_artifact_path ? CBTS_STAGE_SUFFIX : ""
     def narrowed = (cbts.affected_stage_split_counts ?: [:]).keySet()
     def affectedSet = (cbts.affected_stages ?: []).collect {
         (stageSuffix && narrowed.contains(it)) ? (it + stageSuffix) : it
     } as Set
-    def needsSanity = cbts.sanity_required
-    def needsPerfSanity = cbts.perfsanity_required
-    def filtered = parallelJobs.findAll { key, _ ->
-        if (key.contains("-OnDemand-")) {
-            return false
-        }
-        if (key =~ /Post-Merge/) return affectedSet.contains(key)
-        return affectedSet.contains(key) ||
-               (needsSanity && key =~ /PackageSanityCheck/) ||
-               (needsPerfSanity && key =~ /PerfSanity/)
-    }
-    // Preserve baseline auto-triggered stages when coverage replaces the selected stage set.
-    if (cbts.scope == "coverage") {
-        def autoTriggerTags = testFilter[(AUTO_TRIGGER_TAG_LIST)] ?: []
-        filtered += parallelJobsFiltered.findAll { key, _ ->
-            autoTriggerTags.any { key.contains(it) }
-        }
-    }
-    if (affectedSet.isEmpty()) {
-        if (filtered.isEmpty()) {
-            echo "CBTS [${cbts.scope}]: trigger-mode mismatch + nothing force-kept → no-op"
-        } else {
-            echo "CBTS [${cbts.scope}]: trigger-mode mismatch — running " +
-                 "${filtered.size()} force-kept stage(s) only"
-        }
-    } else if (filtered) {
-        echo "CBTS [${cbts.scope}]: limiting to ${filtered.size()} stages " +
-             "(sanity_required=${needsSanity}, perfsanity_required=${needsPerfSanity})"
-    } else {
-        echo "CBTS [${cbts.scope}]: empty stage set after filtering"
+    def autoTriggerTags = cbts.scope == "coverage" ? (testFilter[(AUTO_TRIGGER_TAG_LIST)] ?: []) : []
+    def filtered = parallelJobsFiltered.findAll { key, _ ->
+        return autoTriggerTags.any { key.contains(it) } || affectedSet.contains(key) ||
+               (cbts.sanity_required && key =~ /PackageSanityCheck/) ||
+               (cbts.perfsanity_required && key =~ /PerfSanity/ && !key.contains("Post-Merge")) ||
+               (cbts.enable_multi_gpu && key =~ /\d+_GPUs/)
     }
 
-    // The coverage tier omits multi-GPU; re-add it under the baseline gate.
-    if (cbts.enable_multi_gpu && testFilter[(MULTI_GPU_FILE_CHANGED)]) {
-        filtered += multiGpuJobs
-        echo "CBTS [${cbts.scope}]: multi-GPU file changed → running " +
-             "${multiGpuJobs.size()} multi-GPU stage(s) at baseline"
+    // Repartition narrowed cases over the selected shards only. For example,
+    // --stage-list A10-PyTorch-6 must run group 1/1 when CBTS needs one shard,
+    // rather than moving its cases into an unselected A10-PyTorch-1 stage.
+    def narrowedJobs = filtered.findAll { key, _ -> cbtsStageConfigs.containsKey(key) }
+    narrowedJobs.keySet().groupBy { it.replaceFirst(/-\d+-cbts$/, "") }.each { _, names ->
+        def ordered = names.sort { cbtsStageConfigs[it][2] as int }
+        def original = ordered.first() - CBTS_STAGE_SUFFIX
+        int splits = Math.min(ordered.size(), Math.max(1, cbts.affected_stage_split_counts[original] as int))
+        ordered.eachWithIndex { name, index ->
+            if (index >= splits) {
+                filtered.remove(name)
+            } else {
+                cbtsStageConfigs[name][2] = index + 1
+                cbtsStageConfigs[name][3] = splits
+            }
+        }
     }
+    echo "CBTS [${cbts.scope}]: limiting command-selected scope to ${filtered.size()} stages"
     return filtered
 }
 
@@ -3940,7 +3919,10 @@ def stageMatchesPattern(String key, String pattern) {
 
 // Check if a stage key matches any pattern in the list.
 def stageMatchesAnyPattern(String key, List patterns) {
-    return patterns.any { pattern -> stageMatchesPattern(key, pattern) }
+    def originalKey = key.endsWith(CBTS_STAGE_SUFFIX) ? key - CBTS_STAGE_SUFFIX : key
+    return patterns.any { pattern ->
+        stageMatchesPattern(key, pattern) || stageMatchesPattern(originalKey, pattern)
+    }
 }
 
 // Return the OpenSearch regexp for sibling shards and their CBTS variants.
@@ -7511,6 +7493,7 @@ def infraDeferPredicate(def pipeline, Map stageScopes) {
 
 def launchTestJobs(pipeline, testFilter, globalVars)
 {
+    cbtsStageConfigs.clear()
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
     BOLT_TEST_BOLTED_TARBALL = globalVars[BOLT_PUBLISH_VARIANT] ?: false
@@ -7589,6 +7572,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
+    fullSet = x86TestConfigs.keySet() as Set
     x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, values.size() > 5 ? values[5] : false), { attemptTag, isFinalAttempt, retryContext = null ->
         def config = VANILLA_CONFIG
@@ -7600,7 +7584,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         }
         runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key, values[2], values[3], false, attemptTag, isFinalAttempt, retryContext)
     }]]}
-    fullSet = parallelJobs.keySet()
 
     x86SlurmTestConfigs = [
         "DGX_H100-PyTorch-1": ["auto:dgx-h100-x1", "l0_h100", 1, 6],
@@ -7665,8 +7648,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 1, 8, 1, true],
         "GR100-PyTorch-Post-Merge-1": ["auto:gr100-x1", "l0_gr100", 1, 1],
     ]
-    x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
     fullSet += x86SlurmTestConfigs.keySet()
+    x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
 
     parallelSlurmJobs = x86SlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(X86_64_DOCKER_IMAGE, "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
         // attemptTag comes from runKubernetesPodWithInfraRetry for the outer
@@ -7702,8 +7685,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // DGX Spark is also named as GB10 Grace Blackwell Superchip.
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
     ]
-    SBSATestConfigs = cbtsResizeSplits(SBSATestConfigs)
     fullSet += SBSATestConfigs.keySet()
+    SBSATestConfigs = cbtsResizeSplits(SBSATestConfigs)
 
     SBSASlurmTestConfigs = [
         // [platform, testList, splitId, splits, gpuCount, nodeCount?, runWithSbatch?, useClusterDurations?]
@@ -7729,8 +7712,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 5, 6, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 6, 6, 4, 1, true, false],
     ]
-    SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
+    SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
 
     multiNodesSBSAConfigs = [
         // Each GB200 testcase below uses 8 GPUs and 2 nodes.
@@ -7886,8 +7869,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // Nemotron-Ultra-V3 con9832 (8k64k) and con1197 (50k2k) are ctx_only-only:
     // their full 68-/72-GPU e2e+gen_only disagg topologies are intentionally not
     // created; the ctx_only ids run in the 4-GPU multi_gpus post-merge stage.
-    multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
     fullSet += multiNodesSBSAConfigs.keySet()
+    multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
 
     if (env.targetArch == AARCH64_TRIPLE) {
         parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
@@ -8358,7 +8341,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     }
 
     parallelJobsFiltered = filterCbtsStageJobs(
-        parallelJobs, parallelJobsFiltered, multiGpuJobs, testFilter)
+        parallelJobsFiltered, testFilter)
 
     if (globalVars[RUN_MODE] == "nightly_release") {
         parallelJobsFiltered = docBuildJobs + sanityCheckJobs

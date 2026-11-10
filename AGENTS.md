@@ -236,6 +236,8 @@ CI is triggered by posting comments on the PR. Basic commands:
 - `/bot run` — trigger the standard CI pipeline
 - `/bot run --disable-fail-fast` — run all stages even if earlier ones fail (only add when explicitly needed)
 
+CBTS remains enabled with stage-selection flags such as `--stage-list` and `--extra-stage`. It narrows cases within the command-selected stages; fallback runs that same stage scope. Use `--disable-cbts` to explicitly opt out.
+
 For a full list of up-to-date bot commands, post `/bot help` as a PR comment and check the bot's reply.
 
 ### Trouble Shooting
