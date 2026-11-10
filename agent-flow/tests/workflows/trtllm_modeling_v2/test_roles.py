@@ -345,20 +345,16 @@ def kernel_context() -> kernel.KernelContext:
         landing="ops/norm/rmsnorm__r4",
         paths=("entry.py", "test.py"),
         shared=("catalog/norm/rmsnorm.py", "catalog/test_rmsnorm.py"),
-        device_ids=(4, 5, 6, 7),
     )
 
 
-@pytest.mark.parametrize("claimed,device", [((4,), None), ((4, 5, 6, 7), 4), ((2, 3, 5), 3)])
-def test_kernel_writers_are_spread_over_the_devices_the_run_claimed(
-    kernel_context: kernel.KernelContext, claimed: tuple[int, ...], device: int | None
+def test_kernel_prompt_names_the_task_and_its_landing(
+    kernel_context: kernel.KernelContext,
 ) -> None:
-    ctx = replace(kernel_context, device_ids=claimed)
+    ctx = kernel_context
     text = kernel.kernel_prompt(ctx)
-    # Row 4 takes the claimed device at 4 modulo their count, never an index nobody claimed.
-    assert ("CUDA_VISIBLE_DEVICES=" in text) is (device is not None)
-    if device is not None:
-        assert f"**Use `CUDA_VISIBLE_DEVICES={device}` for this dispatch**" in text
+    # Tasks run one at a time: the launch protocol's devices are the dispatch's own.
+    assert "CUDA_VISIBLE_DEVICES=" not in text
     assert text.index(ctx.note) < text.index("## Your task")
     assert text.index("## Tag `kernel`") < text.index("## Tag `fix`")
     assert "from .ops.norm.rmsnorm__r4 import rmsnorm" in text

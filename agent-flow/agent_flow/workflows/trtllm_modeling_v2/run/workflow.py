@@ -50,7 +50,7 @@ from . import certify as certify_mod
 from . import contract as contract_mod
 from . import pipeline as pipeline_mod
 from .journal import Journal
-from .pipeline import DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_PARALLEL_TASKS, DEFAULT_MAX_ROUNDS, Pipeline
+from .pipeline import DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_ROUNDS, Pipeline
 from .startup import bootstrap
 from .startup.bootstrap import HOST_FACTS_FILENAME, TROUBLESHOOTING_HINT
 from .state import (
@@ -109,7 +109,6 @@ class TrtllmModelingV2Workflow:
         self,
         workspace: Path,
         *,
-        max_parallel_tasks: int = DEFAULT_MAX_PARALLEL_TASKS,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         max_rounds: int = DEFAULT_MAX_ROUNDS,
         clean: bool = False,
@@ -128,7 +127,6 @@ class TrtllmModelingV2Workflow:
         self.host_facts_path = self.workspace / HOST_FACTS_FILENAME
         self.state_path = self.workspace / STATE_FILENAME
 
-        self.max_parallel_tasks = max(1, max_parallel_tasks)
         self.max_attempts = max(1, max_attempts)
         self.max_rounds = max(1, max_rounds)
         self.dry_run = dry_run
@@ -474,7 +472,6 @@ class TrtllmModelingV2Workflow:
 
 __all__ = [
     "DEFAULT_MAX_ATTEMPTS",
-    "DEFAULT_MAX_PARALLEL_TASKS",
     "DEFAULT_MAX_ROUNDS",
     "HOST_FACTS_FILENAME",
     "SKILL_DIRS",

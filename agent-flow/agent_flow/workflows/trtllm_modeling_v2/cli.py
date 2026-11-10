@@ -22,7 +22,7 @@ from .infra.git import (
     trial_commit,
 )
 from .infra.monitor.heartbeat import ORCHESTRATOR_HEARTBEAT_S, start_orchestrator_heartbeat
-from .run.pipeline import DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_PARALLEL_TASKS, DEFAULT_MAX_ROUNDS
+from .run.pipeline import DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_ROUNDS
 from .run.state import STATE_FILENAME
 from .spec.task_schema import TaskSchemaError, load_and_validate_task_yaml
 
@@ -73,13 +73,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Workspace directory for the run's shared state (task.yaml, "
         "plan.md, vocabulary.yaml,journal.md, reports/). "
         "Created on demand.",
-    )
-    parser.add_argument(
-        "--max-parallel-tasks",
-        type=int,
-        default=DEFAULT_MAX_PARALLEL_TASKS,
-        help="How many kernel tasks of one unit run beside each other. Every other task "
-        f"runs alone, in the pipeline's order. Default {DEFAULT_MAX_PARALLEL_TASKS}.",
     )
     parser.add_argument(
         "--max-attempts",
@@ -322,7 +315,6 @@ def main(argv: list[str] | None = None) -> None:
 
     with TrtllmModelingV2Workflow(
         workspace=args.workspace,
-        max_parallel_tasks=args.max_parallel_tasks,
         max_attempts=args.max_attempts,
         max_rounds=args.max_rounds,
         clean=args.clean,

@@ -38,8 +38,8 @@ preflight -> tasks, in a fixed order -> certification of the final commit -> ver
      queue row the unit needs, then the unit itself;
    - one task per configuration variant.
 
-   Tasks run one at a time, except a unit's kernel tasks, which run beside each other
-   (`--max-parallel-tasks`). Each task is one agent turn in its own git worktree. When the worker
+   Tasks run one at a time, each starting from the commits of the tasks before it. Each task
+   is one agent turn in its own git worktree. When the worker
    says it finished, its commits are audited (who made them, the sign-off, and that they change
    only the run's own paths) and fast-forwarded into the checkout. **A worker checks its own task**
    with `trtllm-modeling-v2 gate` and its decision is trusted: no check runs between tasks.

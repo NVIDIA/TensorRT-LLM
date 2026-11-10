@@ -34,7 +34,6 @@ run resumes from it.
 from __future__ import annotations
 
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Mapping
@@ -114,8 +113,6 @@ FINISHED = decision_table.finishing()
 DEFAULT_MAX_ATTEMPTS = 3
 #: How many certification rounds a run gets, the first included: --max-rounds.
 DEFAULT_MAX_ROUNDS = 4
-#: How many kernel tasks run beside each other: --max-parallel-tasks.
-DEFAULT_MAX_PARALLEL_TASKS = 4
 #: How many times in a run the planner may add tasks, and how many each time.
 MAX_REPAIRS = 12
 MAX_REPAIR_TASKS = planner_prompt.MAX_REPAIR_TASKS
@@ -194,7 +191,6 @@ class Pipeline:
         self.units = assembly_units(workflow.task_data)
         self.max_attempts = max(1, int(workflow.max_attempts))
         self.max_rounds = max(1, int(workflow.max_rounds))
-        self.max_parallel = max(1, int(workflow.max_parallel_tasks))
         self._lock = threading.Lock()
         #: Whether the units' tasks were added (after the survey), how many times the
         #: planner added tasks, and how many turns it had: all kept in ``tasks.yaml``.
@@ -328,26 +324,9 @@ class Pipeline:
                 "pipeline", "no longer in the spec, skipped: " + ", ".join(t.id for t in dropped)
             )
 
-    def _next_batch(self) -> list[Task]:
-        """The task that runs next; a unit's kernel tasks that can run beside it, with it."""
-        first = next((t for t in self.tasks if t.open), None)
-        if first is None:
-            return []
-        if first.kind != "kernel" or self.max_parallel == 1:
-            return [first]
-        batch: list[Task] = []
-        for task in self.tasks[self.tasks.index(first) :]:
-            if task.kind != "kernel":
-                break
-            if not task.open:
-                continue
-            waits = {t.id for t in self.tasks if t.open and t.id in task.after}
-            if waits:
-                break  # it starts once the rows it builds on have ended
-            batch.append(task)
-            if len(batch) == self.max_parallel:
-                break
-        return batch or [first]
+    def _next_task(self) -> Task | None:
+        """The first open task: tasks run one at a time, in the pipeline's order."""
+        return next((t for t in self.tasks if t.open), None)
 
     # ----------------------------------------------------------------------- the loop
     def run(self) -> str:
@@ -366,25 +345,12 @@ class Pipeline:
             if verdict:
                 return verdict
         self._expand()
-        batch = self._next_batch()
-        if not batch:
+        task = self._next_task()
+        if task is None:
             return self._certify()
-        if len(batch) == 1:
-            self._run_task(batch[0])
-        else:
-            pool = ThreadPoolExecutor(max_workers=len(batch), thread_name_prefix="mv2-task")
-            try:
-                list(pool.map(self._run_task, batch))
-            except BaseException:
-                # An interrupt does not wait for the turns in flight: the next start resumes them.
-                pool.shutdown(wait=False, cancel_futures=True)
-                raise
-            pool.shutdown()
-        for task in batch:
-            if task.status == FAILED:
-                verdict = self._after_failure(task)
-                if verdict:
-                    return verdict
+        self._run_task(task)
+        if task.status == FAILED:
+            return self._after_failure(task) or ""
         return ""
 
     def _certify(self) -> str:
@@ -893,7 +859,6 @@ class Pipeline:
                 landing=landing,
                 paths=entry_paths(item, target_rel, repo),
                 shared=tuple(shared_entry_paths(item.target)) if landing != item.target else (),
-                device_ids=tuple(self.state.devices),
             )
         )
 
@@ -979,7 +944,6 @@ def _failure_note(result: TurnResult) -> str:
 
 __all__ = [
     "DEFAULT_MAX_ATTEMPTS",
-    "DEFAULT_MAX_PARALLEL_TASKS",
     "DEFAULT_MAX_ROUNDS",
     "FINISHED",
     "Pipeline",

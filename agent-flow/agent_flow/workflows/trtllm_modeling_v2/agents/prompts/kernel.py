@@ -38,8 +38,6 @@ class KernelContext:
     landing: str
     paths: tuple[str, ...] | None
     shared: tuple[str, ...]
-    #: The devices the run claimed: kernel writers running beside each other take one each.
-    device_ids: tuple[int, ...]
 
 
 def _tier(value: Any) -> int | None:
@@ -52,17 +50,13 @@ def _tier(value: Any) -> int | None:
 
 
 def kernel_prompt(ctx: KernelContext) -> str:
-    """Render the dispatch, spreading kernel writers over the host's devices."""
-    # Kernel tasks of one unit run beside each other: without an index each would take device 0.
-    ids = ctx.device_ids
-    device = ids[ctx.item.n % len(ids)] if len(ids) > 1 else None
+    """Render the dispatch."""
     tier = _tier(ctx.tier)
     local_variant = ctx.paths is not None and ctx.landing != ctx.item.target
     row_note = (ctx.item.note or "").strip()
     return render_template(
         "kernel.md.j2",
         ctx=ctx,
-        device=device,
         purpose_tags=", ".join(task_tags(ctx.task_kind, ctx.tags)),
         row_note=row_note if row_note != ctx.goal else "",
         tags=tag_section(task_tags("kernel", ctx.tags)),

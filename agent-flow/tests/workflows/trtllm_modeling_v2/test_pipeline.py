@@ -137,7 +137,7 @@ def test_the_tasks_run_in_the_fixed_order_and_every_check_runs_once_at_the_end(
 
     events: list[str] = []
     script, shell = _logging(events, Script(surveyor=surveyor))
-    calls = _run(tmp_path, task, monkeypatch, script, shell_runner=shell, max_parallel_tasks=1)
+    calls = _run(tmp_path, task, monkeypatch, script, shell_runner=shell)
 
     assert _state(tmp_path).verdict == "delivered"
     assert [t["id"] for t in _tasks(tmp_path)] == [
@@ -194,9 +194,7 @@ def test_a_kernel_row_runs_after_the_rows_it_depends_on_in_the_first_unit_that_n
     assert [q.n for q in grouped["mtp"]] == [2, 4, 7, 8]
 
 
-def test_kernel_tasks_of_one_unit_run_beside_each_other_and_a_dependent_row_waits(
-    tmp_path, task_file, monkeypatch
-):
+def test_kernel_tasks_run_one_at_a_time_in_queue_order(tmp_path, task_file, monkeypatch):
     import threading
 
     workspace = tmp_path / "ws"
@@ -209,19 +207,23 @@ def test_kernel_tasks_of_one_unit_run_beside_each_other_and_a_dependent_row_wait
             {"n": 3, "mode": "onboard", "target": "ops/norm/last", "depends_on": [1]},
         ],
     )
-    both = threading.Barrier(2, timeout=20)
-    seen: list[str] = []
+    lock = threading.Lock()
+    running: list[str] = []
+    seen: list[tuple[str, int]] = []
 
     def kernel_writer(turn, prompt):
         task = _task_id(prompt)
-        if task != "k3-last":
-            both.wait()  # k1 and k2 are in flight together, or this times out
-        seen.append(task)
+        with lock:
+            running.append(task)
+            seen.append((task, len(running)))
+        with lock:
+            running.remove(task)
         return {"decision": "LANDED", "summary": task}
 
     _run(tmp_path, task_file, monkeypatch, Script(kernel_writer=kernel_writer))
     assert _state(tmp_path).verdict == "delivered"
-    assert sorted(seen[:2]) == ["k1-rms", "k2-scale"] and seen[2] == "k3-last"
+    # Each task starts from the commits of the ones before it: never two in flight.
+    assert seen == [("k1-rms", 1), ("k2-scale", 1), ("k3-last", 1)]
 
 
 # -------------------------------------------------------------------------- the planner

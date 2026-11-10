@@ -8,8 +8,6 @@ Architecture: {{ ctx.arch }}
 Dispatch {{ ctx.item.n }}: **{{ ctx.item.mode }}** the catalog entry `{{ ctx.item.target }}`.
 {% if ctx.note %}
 {{ ctx.note }}
-{% endif %}{% if device is not none %}
-**Use `CUDA_VISIBLE_DEVICES={{ device }}` for this dispatch**, not the devices in the launch protocol above. The run holds {{ ctx.device_ids | length }} devices and other kernel tasks run beside yours; every kernel writer taking the same device turns a memory error into the symptom.
 {% endif %}{% if ctx.goal %}
 ## Your task: `{{ ctx.task_id }}` (tags: {{ purpose_tags }})
 
@@ -34,9 +32,8 @@ shared catalog's, or the copy another target keeps in its `ops/`), keeping its
 class and its instance name (`{{ entry_name }}`), and add your cells there.
 {% endif -%}
 Leave {% for path in ctx.shared %}`{{ path }}`{% if not loop.last %} and {% endif %}{% endfor %}
-as they are: other tasks on this entry run beside yours, each in a variant
-of its own. The target imports the variant (`from .{{ variant_module }} import {{ entry_name }}`)
-and is delivered with it; the shared catalog entry is not changed by this run.
+as they are: the shared catalog entry is not changed by this run. The target imports the variant (`from .{{ variant_module }} import {{ entry_name }}`)
+and is delivered with it.
 {% endif %}
 {% if ctx.item.surface %}The surface to certify: {{ ctx.item.surface }}
 {% endif %}{% if tier is none -%}
