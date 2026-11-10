@@ -390,6 +390,36 @@ def test_an_operator_message_is_put_to_the_planner_between_tasks(tmp_path, task_
     assert inbox.take(tmp_path / "ws") == []
 
 
+def test_work_an_operator_message_asks_for_runs_before_the_next_task(
+    tmp_path, task_file, monkeypatch
+):
+    (tmp_path / "ws").mkdir()
+    inbox.post(tmp_path / "ws", "onboard the gated norm first: the core will need it")
+    order: list[str] = []
+
+    def worker(turn, prompt):
+        order.append(_task_id(prompt))
+        return {"decision": "LANDED" if _task_id(prompt).startswith("kx") else "UNIT_READY"}
+
+    def planner(turn, prompt):
+        task = {"kind": "kernel", "ref": "onboard:norm/gated_norm", "goal": "the gated norm"}
+        return {"decision": "REPAIR", "summary": "added the entry", "tasks": [task]}
+
+    _run(
+        tmp_path,
+        task_file,
+        monkeypatch,
+        Script(planner=planner, kernel_writer=worker, assembler=worker),
+    )
+    assert _state(tmp_path).verdict == "delivered"
+    assert order == ["kx-1", "core"]
+    assert [(t["id"], t["kind"], t["unit"]) for t in _tasks(tmp_path)] == [
+        ("survey", "survey", ""),
+        ("kx-1", "kernel", "core"),
+        ("core", "assemble", "core"),
+    ]
+
+
 # ------------------------------------------------------------------------ certification
 
 

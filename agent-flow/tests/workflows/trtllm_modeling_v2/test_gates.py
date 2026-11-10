@@ -1383,6 +1383,62 @@ def test_the_stock_leg_is_asked_once_per_checkpoint(tmp_path, monkeypatch):
     assert "not run again" in result.detail
 
 
+def test_the_shared_runner_resolves_each_gate_the_way_a_worker_and_the_certification_ask(
+    tmp_path, monkeypatch
+):
+    """One function runs a check: the contract's gate name, the unit, the member, the tree."""
+    spec = _spec(tmp_path)
+    spec["features"] = ["mtp", "disagg"]
+    spec["accuracy"]["disagg"] = {"test": "tests/accuracy/test_disagg.py::TestToy::test_auto"}
+    spec["accuracy"]["serve"] = {"enabled": True}
+    data = _load(tmp_path, spec)
+    tree = tmp_path / "worktree"
+    tree.mkdir()
+    seen: dict[str, dict] = {}
+
+    def gate(name):
+        def run(environment, **kwargs):
+            seen[name] = {"environment": environment, **kwargs}
+            return check_result.GateResult(name=name, passed=True, detail="ok", member="tep4")
+
+        return run
+
+    monkeypatch.setattr(boot_checks, "run_boot_gate", gate("boot"))
+    monkeypatch.setattr(accuracy_checks, "run_accuracy_gate", gate("accuracy"))
+    monkeypatch.setattr(acceptance_checks, "run_acceptance_gate", gate("acceptance"))
+    monkeypatch.setattr(sg, "run_serve_gate", gate("serve"))
+    monkeypatch.setattr(disagg, "run_disagg_gate", gate("disagg"))
+    monkeypatch.setattr(accuracy_checks, "resolve_reference", lambda *a, **k: 85.6)
+    runner = _gates_recorder(CommandResult(returncode=0, stdout=""))
+    common = dict(workdir=tmp_path / "w", tree=tree, runner=runner, devices=(4, 5, 6, 7))
+
+    # The contract names a benchmark `accuracy[gsm8k]`; a worker types `accuracy`.
+    for name in ("boot", "accuracy[gsm8k]", "acceptance", "serve"):
+        assert gate_cli.run_check(data, name, "mtp", "tep4", **common).passed
+    assert gate_cli.run_check(data, "disagg", "disagg", "tep2", **common).passed
+    assert set(seen) == {"boot", "accuracy", "acceptance", "serve", "disagg"}
+    for name in ("boot", "accuracy", "acceptance", "serve"):
+        call = seen[name]
+        assert (call["unit"], call["member"]) == ("mtp", "tep4")
+        # The tree measured is the one named, not the spec's checkout; the member's width
+        # of the run's own devices, in their order.
+        assert call["task_data"]["trtllm_repo_path"] == str(tree.resolve())
+        assert call["environment"].devices == (4, 5, 6, 7)
+        assert call["environment"].world_size == 4
+        assert call["workdir"] == (tmp_path / "w").resolve() / "mtp"
+    assert seen["boot"]["features"] == seen["acceptance"]["features"] == ["mtp"]
+    assert seen["accuracy"]["reference"] == 85.6
+    # Two engines at the member's width for the disaggregated test: four devices, not two.
+    assert seen["disagg"]["environment"].devices == (4, 5, 6, 7)
+    assert seen["disagg"]["environment"].world_size == 2
+    assert (seen["disagg"]["unit"], seen["disagg"]["member"]) == ("disagg", "tep2")
+    # A narrower member takes the first of the run's devices.
+    gate_cli.run_check(data, "boot", "core", "tp1", **common)
+    assert seen["boot"]["environment"].devices == (4,)
+    with pytest.raises(task_schema.TaskSchemaError, match="names no gate"):
+        gate_cli.run_check(data, "perf", "core", "tp1", **common)
+
+
 def test_each_member_is_launched_at_its_own_width(tmp_path):
     """One shared runner resolves a check: a wider member's command starts its own ranks."""
     data = _load(tmp_path, _spec(tmp_path))

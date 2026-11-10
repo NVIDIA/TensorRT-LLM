@@ -70,8 +70,8 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
    manager test carrying the target's side buffer, a transfer test with its
    role. *Blind to* the target's forward under the real scheduler.
 3. **One-member boot with the feature on.** `trtllm-modeling-v2 gate boot
-   --task task.yaml --unit <unit or variant> --member <m>` runs it as the
-   orchestrator does, with `modeling_v2="require"` for target evidence;
+   --task task.yaml --unit <unit or variant> --member <m> --tree <your worktree>` runs it
+   as the final certification does, with `modeling_v2="require"` for target evidence;
    `--mode off` reruns the same command on the stock path as a control. Read the verdict's `[engine ...]` segment: every declared field is
    read back from every rank's worker (`MV2FLOW_RANK_ENGINE`), with the reuse
    probe and pool sizes. A field read as UNKNOWN, or only from the request, is
