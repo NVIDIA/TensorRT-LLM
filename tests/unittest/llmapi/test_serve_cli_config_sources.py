@@ -20,13 +20,16 @@ was declared once; nothing is computed from the code under test.
 """
 
 import copy
+import inspect
 import logging
+from pathlib import Path
 from typing import Any
 
 import click
 import pytest
 
 from tensorrt_llm.commands._config_overrides import ConfigOverride
+from tensorrt_llm.commands.serve import get_llm_args, main
 from tensorrt_llm.commands.serve_cli._config_sources import ConfigSources, ResolvedConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig
 from tensorrt_llm.logger import logger
@@ -239,7 +242,7 @@ def test_explicit_video_pruning_rate_wins_inside_multimodal_config_and_siblings_
 # --- --set beats both ---------------------------------------------------------------------------
 
 
-def test_top_level_set_beats_an_explicit_flag() -> None:
+def test_top_level_set_beats_an_explicit_flag(warning_records) -> None:
     resolved = _resolve(
         cli_llm_args={"max_batch_size": 8},
         cli_explicit=frozenset({"max_batch_size"}),
@@ -248,6 +251,27 @@ def test_top_level_set_beats_an_explicit_flag() -> None:
     )
     _check_llm_arg(
         resolved, "serve", "max_batch_size", 32, "--set beats an explicit flag of the same name"
+    )
+    assert _override_warnings(warning_records) == [], (
+        "a --set on the same key takes the flag out of the explicit set, so the merge must not "
+        "warn that the flag overrides the YAML; the positive control is "
+        "test_an_explicit_cli_flag_beats_the_yaml_and_warns"
+    )
+
+
+def test_top_level_set_on_an_untyped_key_logs_no_override_warning(warning_records) -> None:
+    resolved = _resolve(
+        cli_llm_args={"max_batch_size": 8},
+        yaml={"max_batch_size": 16},
+        overrides=(ConfigOverride(("max_batch_size",), 32),),
+    )
+    _check_llm_arg(
+        resolved, "serve", "max_batch_size", 32, "--set beats the YAML and the CLI default"
+    )
+    assert _override_warnings(warning_records) == [], (
+        "nobody typed --max_batch_size, so a --set on it must not produce an 'Explicit CLI "
+        "flag(s) ... override' warning; the positive control is "
+        "test_an_explicit_cli_flag_beats_the_yaml_and_warns"
     )
 
 
@@ -454,3 +478,63 @@ def test_inputs_are_left_unchanged_and_resolve_is_repeatable() -> None:
     )
     assert first == second, "ConfigSources.resolve() gave different results for the same sources"
     assert first.llm_args is not second.llm_args
+
+
+# --- the call sites: each subcommand resolves for itself -----------------------------------------
+
+
+def _record_launcher(monkeypatch: pytest.MonkeyPatch, subcommand: str, launcher: str) -> list:
+    """Replace the subcommand's launcher with a recorder of its keyword arguments."""
+    calls: list[dict[str, Any]] = []
+    module = inspect.getmodule(main.commands[subcommand].callback)
+    monkeypatch.setattr(module, launcher, lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(inspect.getmodule(get_llm_args), "device_count", lambda: 1)
+    return calls
+
+
+def test_mm_embedding_serve_takes_only_its_own_server_key_out_of_the_yaml(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = _record_launcher(monkeypatch, "mm_embedding_serve", "launch_mm_encoder_server")
+    config = tmp_path / "encoder.yaml"
+    config.write_text("allow_request_chat_template: true\ninternal_request_auth_key: key-x\n")
+
+    main(args=["mm_embedding_serve", "org/enc-x", "--config", str(config)], standalone_mode=False)
+
+    [call] = calls
+    assert call["allow_request_chat_template"] is True, _explain(
+        "mm_embedding_serve",
+        "allow_request_chat_template",
+        call["allow_request_chat_template"],
+        True,
+        "the YAML key is taken out and ORed with the flag",
+    )
+    assert "allow_request_chat_template" not in call["encoder_args"]
+    assert call["encoder_args"].get("internal_request_auth_key") == "key-x", _explain(
+        "mm_embedding_serve",
+        "internal_request_auth_key",
+        call["encoder_args"].get("internal_request_auth_key", _MISSING),
+        "key-x",
+        "only serve takes this key out of the YAML; from mm_embedding_serve it reaches the "
+        "encoder constructor, which rejects it",
+    )
+
+
+def test_embeddings_takes_no_server_key_out_of_the_yaml(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = _record_launcher(monkeypatch, "embeddings", "launch_embedding_server")
+    config = tmp_path / "embeddings.yaml"
+    config.write_text("allow_request_chat_template: true\n")
+
+    main(args=["embeddings", "org/emb-x", "--config", str(config)], standalone_mode=False)
+
+    [call] = calls
+    assert call["llm_args"].get("allow_request_chat_template") is True, _explain(
+        "embeddings",
+        "allow_request_chat_template",
+        call["llm_args"].get("allow_request_chat_template", _MISSING),
+        True,
+        "embeddings has no server-only YAML key; the key reaches the LLM constructor, which "
+        "rejects it",
+    )

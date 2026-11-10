@@ -34,7 +34,7 @@ only). ``ConfigSources.resolve()`` applies their precedence in one place:
   rejects unknown keys.
 
 The merge itself is ``update_llm_args_with_extra_dict``, which ``trtllm-eval``
-and ``trtllm-bench`` call directly; its semantics are not changed here.
+and ``trtllm-bench`` call directly.
 """
 
 from __future__ import annotations
