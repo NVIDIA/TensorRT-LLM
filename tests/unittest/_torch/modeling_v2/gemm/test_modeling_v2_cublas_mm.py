@@ -114,6 +114,26 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(m=16, k=2880, n=5120, dtype=torch.bfloat16, bias=True, out_dtype=None),
         ),
     ),
+    # Nemotron-3 Ultra BF16 at tp8: every dense projection a rank runs, at one row, the
+    # decode CUDA-graph ceilings (32 and 256 rows) and a max_num_tokens prefill step. The
+    # tp8ep2 target runs the same shapes (its experts differ, not its dense layers).
+    "nemotron_h/nemotron3_ultra_bf16__sm_100__tep8": tuple(
+        Cell(
+            why=f"nemotron_h BF16 tp8 {what}, T={m}",
+            spec=dict(m=m, k=k, n=n, dtype=torch.bfloat16, bias=False, out_dtype=out_dtype),
+        )
+        for what, k, n, out_dtype in (
+            ("mamba in_proj: 8192 -> 2 x 2048 + 2 x 128 + 32", 8192, 4384, None),
+            ("qkv: 8192 -> (8 + 1 + 1) x 128", 8192, 1280, None),
+            ("o_proj: 1024 -> 8192, a row-parallel partial", 1024, 8192, None),
+            ("shared up: 8192 -> 10240 / 8", 8192, 1280, None),
+            ("shared down: 1280 -> 8192, a row-parallel partial", 1280, 8192, None),
+            ("fc1_latent: 8192 -> 2048", 8192, 2048, None),
+            ("fc2_latent / mamba out_proj: 2048 -> 8192", 2048, 8192, None),
+            ("router: bf16 in, fp32 logits over 512 experts", 8192, 512, torch.float32),
+        )
+        for m in (1, 32, 256, 8192)
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)

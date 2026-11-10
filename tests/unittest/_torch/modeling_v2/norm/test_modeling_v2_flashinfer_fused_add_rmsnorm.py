@@ -49,6 +49,16 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(shape=(1, 2880), dtype=torch.bfloat16, eps=1e-5),
         ),
     ),
+    # Nemotron-3 Ultra BF16 (both tp8 targets): the residual add and the next block's norm
+    # after the all-reduce, over hidden 8192, at one row, the decode CUDA-graph ceilings (32
+    # and 256 rows) and a max_num_tokens prefill step.
+    "nemotron_h/nemotron3_ultra_bf16__sm_100__tep8": tuple(
+        Cell(
+            why=f"nemotron_h BF16 hidden 8192, T={rows}",
+            spec=dict(shape=(rows, 8192), dtype=torch.bfloat16, eps=1e-5),
+        )
+        for rows in (1, 32, 256, 8192)
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)
