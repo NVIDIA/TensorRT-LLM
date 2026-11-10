@@ -70,6 +70,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
@@ -77,6 +78,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 from .fallback import FallbackFmha
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
+from .shared_prefix_fa4 import Fa4Prefix, PrefixGroups, prefix_request_tables
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
@@ -96,8 +98,10 @@ DEFAULT_MAX_TAIL = 8
 BACKEND_ENV = "TLLM_BEAM_SHARED_PREFIX_BACKEND"
 """FlashInfer prefill backend for the prefix call. Default ``fa2``, the kernel
 family the TRTLLM FlashInfer backend pins for paged prefill; ``fa3`` or
-``auto`` select the Hopper kernels."""
+``auto`` select the Hopper kernels. ``fa4`` runs the prefix through the FlashAttention-4 kernels
+shared with the n-sample library (``shared_prefix_fa4``; SM90, bf16, head size 64 or 128)."""
 DEFAULT_BACKEND = "fa2"
+FA4_BACKEND = "fa4"
 FUSED_TAIL_ENV = "TLLM_BEAM_SHARED_PREFIX_FUSED_TAIL"
 """Set to 0 to run the tail attention and merge as separate PyTorch ops instead of
 the fused Triton kernel; the unfused path is the numerical reference."""
@@ -127,6 +131,21 @@ def _fused_tail_enabled() -> bool:
 def _backend_from_env() -> str:
     value = os.environ.get(BACKEND_ENV, "").strip()
     return value or DEFAULT_BACKEND
+
+
+def _fa4_requested() -> bool:
+    return _backend_from_env() == FA4_BACKEND
+
+
+def _fa4_supported(head_dim: int, dtype: torch.dtype, device) -> bool:
+    """Whether the FlashAttention-4 prefix can serve this layer shape on this device."""
+    try:
+        from .shared_prefix_fa4 import fa4_supported
+
+        return fa4_supported(head_dim, dtype, device)
+    except ImportError:
+        # The FlashAttention-4 generation module is not part of this build.
+        return False
 
 
 def _get_float_workspace(device: torch.device, min_bytes: int = 0) -> torch.Tensor:
@@ -245,6 +264,66 @@ class _StepIndices:
 
 
 @dataclass
+class _Fa4Slot:
+    """The FlashAttention-4 prefix call of one layer shape: its buffers and fixed-address tables.
+
+    ``upload`` stages the step's prefix groups in page-locked buffers and copies them to the
+    tables a captured graph reads; the plan issues it before the forward.
+    """
+
+    prefix: Fa4Prefix
+    rows: int
+    staging: tuple
+    copied: torch.cuda.Event
+    pending: bool = False
+
+    @classmethod
+    def create(
+        cls,
+        key: "_PlanKey",
+        rows: int,
+        num_requests: int,
+        max_pages: int,
+        tokens_per_block: int,
+        device: torch.device,
+    ) -> "_Fa4Slot":
+        prefix = Fa4Prefix(
+            rows,
+            key.num_heads,
+            key.head_dim,
+            1,
+            Fa4Prefix.num_requests_for(num_requests, rows, 1),
+            max_pages,
+            key.dtype,
+            device,
+            tokens_per_block,
+        )
+        pinned = prefer_pinned()
+        staging = tuple(
+            torch.zeros(t.shape, dtype=t.dtype, pin_memory=pinned) for t in prefix.table_arrays()
+        )
+        return cls(prefix=prefix, rows=rows, staging=staging, copied=torch.cuda.Event())
+
+    def upload(self, groups: PrefixGroups) -> None:
+        if self.pending:
+            # The previous copies out of the staging buffers must have run.
+            self.copied.synchronize()
+        prefix = self.prefix
+        host = prefix_request_tables(
+            groups,
+            prefix.tokens_per_block,
+            prefix.chunk_tokens,
+            prefix.num_requests,
+            prefix.block_tables.shape[1],
+        )
+        for staging, device, values in zip(self.staging, prefix.table_arrays(), host):
+            staging.numpy()[...] = values
+            device.copy_(staging, non_blocking=True)
+        self.copied.record()
+        self.pending = True
+
+
+@dataclass
 class _BeamStepState:
     """Per-metadata plan state kept in ``metadata.fmha_plan_caches[LIB_NAME]``.
 
@@ -265,6 +344,7 @@ class _BeamStepState:
     """Pages in the primary pool; bounds every page index handed to a kernel."""
     plan: Optional[_HostPlan] = None
     wrappers: Dict[_PlanKey, Any] = field(default_factory=dict)
+    fa4_slots: Dict[_PlanKey, _Fa4Slot] = field(default_factory=dict)
     planned_step: Dict[_PlanKey, int] = field(default_factory=dict)
     indices: Optional[_StepIndices] = None
     step_counter: int = 0
@@ -446,6 +526,47 @@ def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
     state.indices = None
     for key, wrapper in state.wrappers.items():
         _plan_wrapper(state, key, wrapper, metadata)
+    for key in list(state.fa4_slots):
+        _plan_fa4_slot(state, key)
+
+
+def _prefix_groups(plan: _HostPlan) -> PrefixGroups:
+    """One group per request: its beams' queries over the request's prompt pages."""
+    return PrefixGroups(
+        num_groups=plan.num_requests,
+        qo_indptr=plan.qo_indptr.numpy(),
+        prefix_indptr=plan.paged_kv_indptr.numpy(),
+        prefix_indices=plan.paged_kv_indices.numpy(),
+        prefix_last_page_len=plan.paged_kv_last_page_len.numpy(),
+    )
+
+
+def _plan_fa4_slot(state: _BeamStepState, key: _PlanKey) -> None:
+    plan = state.plan
+    assert plan is not None
+    slot = state.fa4_slots[key]
+    if plan.num_requests * plan.beam_width > slot.rows:
+        # Eager batches grow; a captured graph's batch is fixed. The next forward recreates it.
+        del state.fa4_slots[key]
+        state.planned_step.pop(key, None)
+        return
+    slot.upload(_prefix_groups(plan))
+    state.planned_step[key] = plan.step
+
+
+def _create_fa4_slot(
+    state: _BeamStepState, key: _PlanKey, metadata: "TrtllmAttentionMetadata"
+) -> _Fa4Slot:
+    plan = state.plan
+    assert plan is not None
+    return _Fa4Slot.create(
+        key,
+        plan.num_requests * plan.beam_width,
+        plan.num_requests,
+        int(metadata.kv_cache_manager.max_blocks_per_seq),
+        int(metadata.tokens_per_block),
+        metadata.kv_cache_block_offsets.device,
+    )
 
 
 def _plan_wrapper(
@@ -665,11 +786,13 @@ def _tail_merge_kernel(
     stride_prefix_row,
     stride_prefix_head,
     stride_lse_row,
+    stride_lse_head,
     stride_out_row,
     stride_out_head,
     stride_tail_row,
     tail_len,
     sm_scale_log2,
+    LSE_SCALE: tl.constexpr,
     GROUP: tl.constexpr,
     GROUP_PAD: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -706,8 +829,13 @@ def _tail_merge_kernel(
     tl.store(write_base + stride_pool_kv + dim, v_raw)
 
     empty = tl.load(prefix_empty_ptr + row) != 0
-    lse = tl.load(
-        prefix_lse_ptr + row * stride_lse_row + head, mask=group_mask, other=float("-inf")
+    lse = (
+        tl.load(
+            prefix_lse_ptr + row * stride_lse_row + head * stride_lse_head,
+            mask=group_mask,
+            other=float("-inf"),
+        )
+        * LSE_SCALE
     )
     acc = tl.load(
         prefix_out_ptr
@@ -759,6 +887,13 @@ def _tail_merge_kernel(
     )
 
 
+def _lse_rows_log2(lse: torch.Tensor, rows: int, lse_scale: float) -> torch.Tensor:
+    """The prefix LSE as [rows, heads] in base 2 (FlashInfer's layout), from either backend."""
+    if lse_scale == 1.0:
+        return lse
+    return lse[:, :rows].t().contiguous() * lse_scale
+
+
 def fused_tail_and_merge(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -772,13 +907,17 @@ def fused_tail_and_merge(
     tail_len: int,
     num_kv_heads: int,
     sm_scale: float,
+    lse_scale: float = 1.0,
+    lse_heads_first: bool = False,
 ) -> None:
     """Write the current K/V, attend the tail and merge with the prefix, in one launch.
 
     Same contract as ``merge_prefix_and_tail`` plus the KV write of the current
     token: ``q`` is [rows, heads, dim], ``k`` and ``v`` are [rows, kv_heads, dim],
     ``pool`` is the layer's [pages, 2, kv_heads, tokens_per_block, dim] view, and
-    ``output`` receives the merged [rows, heads, dim] result.
+    ``output`` receives the merged [rows, heads, dim] result. ``prefix_lse`` is [rows, heads]
+    (FlashInfer) or, with ``lse_heads_first``, [heads, capacity >= rows] (FlashAttention-4);
+    ``lse_scale`` turns it into base 2 (1 for FlashInfer, log2(e) for FA4's natural log).
     """
     rows, num_heads, head_dim = q.shape
     group = num_heads // num_kv_heads
@@ -817,12 +956,14 @@ def fused_tail_and_merge(
         pool.stride(3),
         prefix_out.stride(0),
         prefix_out.stride(1),
-        prefix_lse.stride(0),
+        prefix_lse.stride(1 if lse_heads_first else 0),
+        prefix_lse.stride(0 if lse_heads_first else 1),
         output.stride(0),
         output.stride(1),
         tail_page.stride(0) if tail_len > 0 else 0,
         tail_len,
         sm_scale * _LOG2E,
+        LSE_SCALE=lse_scale,
         GROUP=group,
         GROUP_PAD=triton.next_power_of_2(group),
         HEAD_DIM=head_dim,
@@ -866,6 +1007,12 @@ class BeamSharedPrefixFmha(PhasedFmha):
             return False
         if QuantMode(getattr(attn, "quant_mode", 0)).has_kv_cache_quant():
             return False
+        if _fa4_requested() and not _fa4_supported(head_dim, torch.bfloat16, None):
+            logger.warning(
+                f"{LIB_NAME}: {BACKEND_ENV}={FA4_BACKEND} needs SM90, bf16 and head size 64 or 128 "
+                "with the FlashAttention-4 kernels; the library declines this layer."
+            )
+            return False
         # RoPE must already be applied by the module: this library never
         # rotates Q/K itself.
         if PositionEmbeddingType(getattr(attn, "position_embedding_type", 0)).is_rope():
@@ -905,6 +1052,8 @@ class BeamSharedPrefixFmha(PhasedFmha):
         if forward_args.out_scale is not None or forward_args.output_sf is not None:
             return False
         if q.dtype not in (torch.bfloat16, torch.float16):
+            return False
+        if _fa4_requested() and q.dtype != torch.bfloat16:
             return False
         window = forward_args.attention_window_size
         if (
@@ -988,17 +1137,29 @@ class BeamSharedPrefixFmha(PhasedFmha):
 
         sm_scale = 1.0 / (math.sqrt(head_dim) * attn.q_scaling)
         key = _PlanKey(num_heads, num_kv_heads, head_dim, qkv.dtype, sm_scale)
-        wrapper = state.wrappers.get(key)
-        if wrapper is None or state.planned_step.get(key) != plan.step:
+        use_fa4 = _fa4_requested()
+        wrapper = None
+        slot = None
+        if use_fa4:
+            slot = state.fa4_slots.get(key)
+        else:
+            wrapper = state.wrappers.get(key)
+        if (slot if use_fa4 else wrapper) is None or state.planned_step.get(key) != plan.step:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
-                    f"{type(self).__name__}: FlashInfer plan requested during CUDA graph "
+                    f"{type(self).__name__}: the prefix plan was requested during CUDA graph "
                     "capture; the capture warmup must run this shape first."
                 )
-            if wrapper is None:
-                wrapper = _create_wrapper(state, key, metadata)
-                state.wrappers[key] = wrapper
-            _plan_wrapper(state, key, wrapper, metadata)
+            if use_fa4:
+                if slot is None:
+                    state.fa4_slots[key] = _create_fa4_slot(state, key, metadata)
+                _plan_fa4_slot(state, key)
+                slot = state.fa4_slots[key]
+            else:
+                if wrapper is None:
+                    wrapper = _create_wrapper(state, key, metadata)
+                    state.wrappers[key] = wrapper
+                _plan_wrapper(state, key, wrapper, metadata)
 
         q_size = num_heads * head_dim
         kv_size = num_kv_heads * head_dim
@@ -1029,7 +1190,18 @@ class BeamSharedPrefixFmha(PhasedFmha):
 
         # 2. Shared prefix: all beams of a request against the prompt KV.
         q_contig = q.contiguous()
-        prefix_out, prefix_lse = wrapper.run(q_contig, pool, return_lse=True)
+        if use_fa4:
+            # FlashAttention-4: normalized output [rows, heads, dim] and natural-log LSE
+            # [heads, rows] (the fused kernel reads it through strides).
+            fa4 = slot.prefix
+            fa4.q[:rows].copy_(q_contig)
+            fa4.run(pool, sm_scale)
+            prefix_out = fa4.out[:rows]
+            prefix_lse = fa4.lse
+            lse_scale = _LOG2E
+        else:
+            prefix_out, prefix_lse = wrapper.run(q_contig, pool, return_lse=True)
+            lse_scale = 1.0
         if check:
             _sync_checkpoint(f"layer {attn.layer_idx}: FlashInfer prefix attention")
             _check_prefix_against_reference(
@@ -1038,7 +1210,7 @@ class BeamSharedPrefixFmha(PhasedFmha):
                 pool,
                 q_contig,
                 prefix_out,
-                prefix_lse,
+                _lse_rows_log2(prefix_lse, rows, lse_scale),
                 indices,
                 num_kv_heads=num_kv_heads,
                 sm_scale=sm_scale,
@@ -1066,6 +1238,8 @@ class BeamSharedPrefixFmha(PhasedFmha):
                 tail_len=plan.tail_len,
                 num_kv_heads=num_kv_heads,
                 sm_scale=sm_scale,
+                lse_scale=lse_scale,
+                lse_heads_first=use_fa4,
             )
             merged = output
         else:
@@ -1077,7 +1251,7 @@ class BeamSharedPrefixFmha(PhasedFmha):
                 indices,
                 plan,
                 prefix_out,
-                prefix_lse,
+                _lse_rows_log2(prefix_lse, rows, lse_scale),
                 num_kv_heads=num_kv_heads,
                 sm_scale=sm_scale,
             )
