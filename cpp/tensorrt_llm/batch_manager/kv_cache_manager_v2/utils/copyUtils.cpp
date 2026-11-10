@@ -514,16 +514,28 @@ CUDA_CB void hostFnSubmitDiskTransfer(void* userData) noexcept
     diskIoPool().submit(launch->transfer);
 }
 
+void waitForTransfer(DiskTransfer const& transfer) noexcept
+{
+    while (transfer.remaining.load() != 0)
+    {
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+}
+
 // Fallback without stream memory operations: still parallel, but the callback waits for the transfer.
 CUDA_CB void hostFnRunDiskTransfer(void* userData) noexcept
 {
     std::unique_ptr<DiskLaunch> const launch(static_cast<DiskLaunch*>(userData));
     auto const transfer = launch->transfer;
     diskIoPool().submit(transfer);
-    while (transfer->remaining.load() != 0)
-    {
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
-    }
+    waitForTransfer(*transfer);
+}
+
+// Runs after hostFnSubmitDiskTransfer on the same stream, so the transfer's pieces are already counted.
+CUDA_CB void hostFnWaitDiskTransfer(void* userData) noexcept
+{
+    std::unique_ptr<DiskLaunch> const launch(static_cast<DiskLaunch*>(userData));
+    waitForTransfer(*launch->transfer);
 }
 
 CUresult launchDiskTransfer(std::shared_ptr<DiskTransfer> transfer, CUstream stream) noexcept
@@ -549,6 +561,7 @@ CUresult launchDiskTransfer(std::shared_ptr<DiskTransfer> transfer, CUstream str
         }
     }
     transfer->ticket = ticket;
+    auto const submitted = transfer;
     auto launch = std::make_unique<DiskLaunch>(DiskLaunch{std::move(transfer)});
     if (CUresult const result = cuLaunchHostFunc(stream, hostFnSubmitDiskTransfer, launch.get());
         result != CUDA_SUCCESS)
@@ -558,8 +571,24 @@ CUresult launchDiskTransfer(std::shared_ptr<DiskTransfer> transfer, CUstream str
         return result;
     }
     static_cast<void>(launch.release()); // owned by the callback now
-    return cuStreamWaitValue64(
+    CUresult const waitResult = cuStreamWaitValue64(
         stream, flags->device + (ticket % kFlagSlots) * sizeof(uint64_t), ticket, CU_STREAM_WAIT_VALUE_GEQ);
+    if (waitResult == CUDA_SUCCESS)
+    {
+        return CUDA_SUCCESS;
+    }
+    // The transfer will run regardless, so the stream must not move past it: wait in a host function instead.
+    auto waitLaunch = std::make_unique<DiskLaunch>(DiskLaunch{submitted});
+    if (cuLaunchHostFunc(stream, hostFnWaitDiskTransfer, waitLaunch.get()) != CUDA_SUCCESS)
+    {
+        return waitResult;
+    }
+    static_cast<void>(waitLaunch.release());
+    TLLM_LOG_WARNING(
+        "[kvCacheManagerV2Utils] cuStreamWaitValue64 failed (%d); the stream waits for the disk transfer in a host "
+        "function",
+        static_cast<int>(waitResult));
+    return CUDA_SUCCESS;
 }
 
 bool asyncDiskIo() noexcept
