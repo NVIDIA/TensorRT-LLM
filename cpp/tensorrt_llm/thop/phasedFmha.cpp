@@ -1604,7 +1604,7 @@ void FmhaV2Fmha<AttentionVariant>::initGeneration(AttentionVariant const& op)
 {
     if constexpr (std::is_same_v<AttentionVariant, MLA>)
     {
-        if (!op.mIsGenerationMLA || tc::isSM100Family(op.smVersion()) || FlashMlaFmha::isAvailable(op))
+        if (!op.mIsGenerationMLA || tc::isSM100Family(op.smVersion()))
         {
             return;
         }

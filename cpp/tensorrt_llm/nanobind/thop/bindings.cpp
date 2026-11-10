@@ -21,6 +21,7 @@
 #include <nanobind/stl/set.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
+#include <optional>
 #include <tensorrt_llm/common/cudaUtils.h>
 #include <tensorrt_llm/common/tllmDataType.h>
 #include <tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAConstants.h>
@@ -327,26 +328,36 @@ bool xqaIsSupported(nb::handle source, bool isGen)
         });
 }
 
-bool xqaHasPerfGain(nb::handle source)
+std::optional<bool> xqaHasPerfGain(nb::handle source)
 {
     return callFmha(source,
-        [](torch_ext::FmhaParams& p)
+        [](torch_ext::FmhaParams& p) -> std::optional<bool>
         {
             if (p.attn.is_mla_enable)
             {
                 if (!torch_ext::MLA::checkParams(p, /*isGen=*/true))
                 {
-                    return false;
+                    return std::nullopt;
                 }
                 auto& op = getOp<torch_ext::MLA>(p);
-                return op.isFmhaSupported(op.xqa(), p, /*isGen=*/true) && op.xqa()->hasPerfGain(p);
+                if (op.xqa() == nullptr)
+                {
+                    return std::nullopt;
+                }
+                op.preparePhase(p, /*isGen=*/true);
+                return op.xqa()->hasPerfGain(p);
             }
             if (!torch_ext::MHA::checkParams(p, /*isGen=*/true))
             {
-                return false;
+                return std::nullopt;
             }
             auto& op = getOp<torch_ext::MHA>(p);
-            return op.isFmhaSupported(op.xqa(), p, /*isGen=*/true) && op.xqa()->hasPerfGain(p);
+            if (op.xqa() == nullptr)
+            {
+                return std::nullopt;
+            }
+            op.preparePhase(p, /*isGen=*/true);
+            return op.xqa()->hasPerfGain(p);
         });
 }
 
@@ -486,7 +497,8 @@ void initBindings(nb::module_& m)
     m.def("xqa_is_supported", &xqaIsSupported, nb::arg("params"), nb::arg("is_gen"),
         "Whether the XQA kernels serve this phase call.");
     m.def("xqa_has_perf_gain", &xqaHasPerfGain, nb::arg("params"),
-        "Whether the XQA kernels are expected to outrun MMHA for this generation call.");
+        "Whether the XQA kernels are expected to outrun MMHA for this generation call, regardless of whether "
+        "they serve it; None when the native op does not take the call or its key does not admit XQA.");
     m.attr("xqa_min_history_tokens_per_block") = tensorrt_llm::kernels::kMinHistoryTokensPerBlock;
     m.def("xqa_run_generation", &xqaRunGeneration, nb::arg("params"), "Generation phase on the XQA kernels.");
     m.def("flash_mla_is_supported", &flashMlaIsSupported, nb::arg("params"), nb::arg("is_gen"),

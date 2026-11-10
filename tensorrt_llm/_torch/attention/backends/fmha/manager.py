@@ -141,6 +141,9 @@ class _FmhaCacheKey(NamedTuple):
     has_variable_window: bool
     use_spec_decoding: bool
     has_block_sparse_inputs: bool
+    # Skip-softmax thresholds can turn on mid-run, and only some kernels support them.
+    has_skip_softmax_prefill: bool
+    has_skip_softmax_decode: bool
     # LoRA can change the effective output from packed NVFP4 to unpacked BF16
     # without changing the request shape. Keep those selection regimes apart.
     output_dtype: torch.dtype | None
@@ -434,7 +437,8 @@ class FmhaManager:
                     metadata, forward_args
                 )
 
-        block_sparse_inputs = forward_args.sparse_runtime_params.block_sparse_inputs
+        sparse_runtime_params = forward_args.sparse_runtime_params
+        block_sparse_inputs = sparse_runtime_params.block_sparse_inputs
         return _FmhaCacheKey(
             context_batch_size=context_batch_size,
             generation_batch_size=generation_batch_size,
@@ -445,6 +449,8 @@ class FmhaManager:
             has_variable_window=forward_args.variable_window_token_starts is not None,
             use_spec_decoding=metadata.use_spec_decoding,
             has_block_sparse_inputs=block_sparse_inputs is not None,
+            has_skip_softmax_prefill=bool(sparse_runtime_params.threshold_scale_factor_prefill),
+            has_skip_softmax_decode=bool(sparse_runtime_params.threshold_scale_factor_decode),
             output_dtype=output_dtype,
             output_sf_dtype=output_sf_dtype,
             deferred_prologue=(

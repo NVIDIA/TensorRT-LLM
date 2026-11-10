@@ -497,7 +497,7 @@ eager under `torch.compile`. `XqaFmha` judges its generation
 support at `max_seq_len`, so the choice holds for every KV history length that
 shares a selection cache key. Whether XQA is expected to outrun MMHA weighs the
 call's batch against its KV history; `XqaFmha.has_perf_gain` asks
-`thop.xqa_has_perf_gain` once per batch, history block and speculative mode,
+`thop.xqa_has_perf_gain` once per batch, history block, speculative mode and output dtype,
 and `FmhaManager` keys selection on the answer once a selection reaches XQA. The native
 carrier behind the entry points is per host thread and never visible to
 Python. Generated nanobind readers

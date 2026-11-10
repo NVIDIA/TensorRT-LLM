@@ -51,8 +51,9 @@ class XqaFmha(PhasedFmha):
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
-        # has_perf_gain() by (generation batch, history in XQA multi-block units, spec decoding).
-        self._perf_gain: dict[tuple[int, int, bool], bool] = {}
+        # has_perf_gain() by (generation batch, history in XQA multi-block units, spec decoding,
+        # output dtype).
+        self._perf_gain: dict[tuple[int, int, bool, torch.dtype], bool] = {}
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -106,7 +107,8 @@ class XqaFmha(PhasedFmha):
         """Whether XQA is expected to outrun MMHA for this call's generation batch and history.
 
         The native op weighs the generation batch against the KV history in multi-block units,
-        so the answer is memoized on those and on speculative decoding.
+        so the answer is memoized on those, on speculative decoding and on the output dtype.
+        It does not check support; ``is_supported`` does.
         """
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
@@ -117,6 +119,7 @@ class XqaFmha(PhasedFmha):
             num_generations,
             max_kv_len // thop.xqa_min_history_tokens_per_block,
             bool(metadata.is_spec_decoding_enabled and metadata.use_spec_decoding),
+            forward_args.output.dtype,
         )
         gain = self._perf_gain.get(key)
         if gain is None:
@@ -126,6 +129,8 @@ class XqaFmha(PhasedFmha):
                 q, k, v, metadata, forward_args, metadata.effective_workspace, 0, num_gen_tokens
             )
             gain = thop.xqa_has_perf_gain(params)
+            if gain is None:
+                return False
             self._perf_gain[key] = gain
         return gain
 

@@ -163,7 +163,7 @@ def _legacy_forward_args(
 
 
 def _xqa_is_supported(params: FmhaParams, is_gen: bool) -> bool:
-    return thop.xqa_is_supported(params, is_gen) and thop.xqa_has_perf_gain(params)
+    return thop.xqa_is_supported(params, is_gen) and bool(thop.xqa_has_perf_gain(params))
 
 
 # The native op's library priorities. They agree phase by phase with the registry order,

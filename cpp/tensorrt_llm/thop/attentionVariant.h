@@ -78,6 +78,15 @@ public:
         return fmha->isSupported(p, isGen);
     }
 
+    /// Every phase call, launched or only queried: once-only phase initialization, feature
+    /// preparation, and the derived op's input validation and derived fields.
+    void preparePhase(FmhaParams& p, bool isGen)
+    {
+        initPhase(isGen);
+        (Features::prepare(p, isGen), ...);
+        derived().prepareInputs(p, isGen);
+    }
+
     /// Runs this call's context phase on \p fmha. The caller chose it with `isFmhaSupported()`,
     /// possibly for an earlier call of the same shape.
     void runContext(PhasedFmha<Derived>* fmha, FmhaParams& p)
@@ -199,15 +208,6 @@ protected:
             }
         }
         return bytes;
-    }
-
-    /// Every phase call, launched or only queried: once-only phase initialization, feature
-    /// preparation, and the derived op's input validation and derived fields.
-    void preparePhase(FmhaParams& p, bool isGen)
-    {
-        initPhase(isGen);
-        (Features::prepare(p, isGen), ...);
-        derived().prepareInputs(p, isGen);
     }
 
     /// Every launched phase: `preparePhase()`, then workspace growth. A context call that
