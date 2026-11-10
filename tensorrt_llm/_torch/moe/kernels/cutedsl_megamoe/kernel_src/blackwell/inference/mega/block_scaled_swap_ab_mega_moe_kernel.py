@@ -62,6 +62,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
     scheduler_consumer_thread_count: ClassVar[int] = 7 * 32
     epilogue_register_count: ClassVar[int] = 256
     scheduler_register_count: ClassVar[int] = 72
+    reads_live_row_word: ClassVar[bool] = True  # __call__ takes live_row_word
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, object]:
@@ -688,9 +689,12 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         hot_expert_weight_ready_generation: Optional[cutlass.Uint64] = None,
         # (tokens,) fp32, this rank's own tokens, plain local memory (the router reads it here and
         # pushes it to the pool). Required iff the descriptor enables fc1_activation_per_token_scale.
-        # Last on purpose: the AOT kwargs wrapper right-aligns its None defaults, so appending keeps
-        # every existing positional caller valid.
+        # Trailing on purpose: the AOT kwargs wrapper right-aligns its None defaults, so appending
+        # keeps every existing positional caller valid.
         fc1_activation_per_token_scale: Optional[cute.Tensor] = None,
+        # The forward's live-row word (helpers/live_rows.py): only the leading live rows of
+        # output_activation are routed and reduced, the others are written zero.
+        live_row_word: Optional[cute.Pointer] = None,
     ) -> None:
         """Launch router, fused MegaMoE compute, and optional TopK reduce."""
 
@@ -776,6 +780,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             self._device_workspace,
             stream,
             fc1_activation_per_token_scale,
+            live_row_word,
+            Int32(output_activation.shape[0]),  # the caller trims it to the launch's rows
         )
 
         peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_object()
@@ -987,7 +993,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         if cutlass.const_expr(not self.reduce_topk_in_kernel):
             reduce_scores = None if cutlass.const_expr(self.apply_topk_at_fc1) else topk_scores
             self._topk_reduce(
-                pre_reduced_activation, pre_reduced_activation_sf, output_activation, reduce_scores, stream
+                pre_reduced_activation, pre_reduced_activation_sf, output_activation, reduce_scores, stream, live_row_word
             )
 
     @cute.kernel

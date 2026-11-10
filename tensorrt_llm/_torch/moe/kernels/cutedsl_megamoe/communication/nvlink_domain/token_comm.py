@@ -19,6 +19,7 @@ from ...helpers.device_workspace import DeviceWorkspace
 from ...helpers.dsl_helpers import mark_alignment, smem_exclusive_prefix
 from ...helpers.iket_compat import iket
 from ...helpers.flag_batch import make_flag_batch_tracker
+from ...helpers.live_rows import live_row_count
 from ...helpers.software_sync import NvlinkBarrier
 from ...helpers.ptx_helpers import (
     cp_async_bulk_s2g,
@@ -392,6 +393,8 @@ class _MetadataPushRouter(KernelComponent):
         device_workspace: DeviceWorkspace,
         stream: cuda.CUstream,
         activation_scales: Optional[cute.Tensor] = None,  # (max_tokens_per_rank,) fp32, local
+        live_row_word: Optional[cute.Pointer] = None,  # helpers/live_rows.py: route the live rows only
+        token_rows: Optional[Int32] = None,  # the launch's rows, which the word's live rows lead
     ) -> None:
         """Launch counting-sort DATA, size-exchange HELPER, and metadata PUSH roles."""
         if cutlass.const_expr(self.apply_topk_at_fc1 and topk_scores is None):
@@ -408,6 +411,8 @@ class _MetadataPushRouter(KernelComponent):
             shared_workspace,
             peer_rank_ptr_mapper,
             device_workspace,
+            live_row_word,
+            token_rows,
         ).launch(
             grid=[self.router_grid_cta_count, 1, 1],
             block=[self.router_warps_per_cta * 32, 1, 1],
@@ -426,6 +431,8 @@ class _MetadataPushRouter(KernelComponent):
         shared_workspace: cute.Pointer,
         peer_rank_ptr_mapper: SymmetricBufferDevice,
         device_workspace: DeviceWorkspace,
+        live_row_word: Optional[cute.Pointer],
+        token_rows: Optional[Int32],
     ) -> None:
         thread_idx, _, _ = cute.arch.thread_idx()
         linear_cta_idx, _, _ = cute.arch.block_idx()
@@ -450,6 +457,8 @@ class _MetadataPushRouter(KernelComponent):
         self._router_warp_idx = warp_idx
         self._router_lane_idx = lane_idx
         self._router_activation_scales = activation_scales
+        self._router_live_row_word = live_row_word
+        self._router_token_rows = token_rows
 
         if cutlass.const_expr(self.router_data_cta_count == 1):
             self._router_single_cta(topk_indices, topk_scores, smem_base)
@@ -468,6 +477,8 @@ class _MetadataPushRouter(KernelComponent):
         self._router_warp_idx = None
         self._router_lane_idx = None
         self._router_activation_scales = None
+        self._router_live_row_word = None
+        self._router_token_rows = None
 
     @cute.jit
     def _router_single_cta(
@@ -944,6 +955,12 @@ class _MetadataPushRouter(KernelComponent):
         maximum_elements = self.max_tokens_per_rank * self.topk
         actual_token_count = Int32(self.max_tokens_per_rank)
         actual_elements = Int32(maximum_elements)
+        if cutlass.const_expr(self._router_live_row_word is not None):
+            # Padding rows are neither loaded nor routed: an unloaded register goes to the trash below.
+            actual_token_count = cutlass.min(
+                live_row_count(self._router_live_row_word, self._router_token_rows), actual_token_count
+            )
+            actual_elements = actual_token_count * Int32(self.topk)
         load_round_count = ceil_div(maximum_elements, tile_span)
         elements_per_thread = load_round_count * elements_per_vector
 
@@ -1528,6 +1545,8 @@ class TokenCommNonDeterministic(KernelComponent):
         device_workspace: DeviceWorkspace,
         stream: cuda.CUstream,
         activation_scales: Optional[cute.Tensor] = None,
+        live_row_word: Optional[cute.Pointer] = None,
+        token_rows: Optional[Int32] = None,
     ) -> None:
         self._router.launch_router(
             topk_indices,
@@ -1539,6 +1558,8 @@ class TokenCommNonDeterministic(KernelComponent):
             device_workspace,
             stream,
             activation_scales,
+            live_row_word,
+            token_rows,
         )
 
     @cute.jit
