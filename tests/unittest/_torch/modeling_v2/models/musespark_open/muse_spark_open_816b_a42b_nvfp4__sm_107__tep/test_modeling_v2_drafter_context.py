@@ -3,7 +3,8 @@
 """The musespark_open TEP target's DFlash drafter paths over each layout of the drafter's context.
 
 * ``dflash_window_attention`` and ``dflash_window_attention_wide`` (at its split geometry)
-  over pages are bitwise their dense calls, the appended block included.
+  over pages are bitwise their dense calls, the appended block included, also when the
+  split loads its first key tile through the page table before its wait (``split_pre_wait``).
 * ``context_kv_fork``'s commit empties the dummy slot, as the worker's own commit does.
 * The block decode over a unified target/draft ``KVCacheManagerV2`` is bitwise the dense one,
   also when it takes a preamble the folded commit wrote (``drafter_preamble_from_commit``).
@@ -58,11 +59,15 @@ def _randn(gen, *shape):
     return torch.randn(*shape, device="cuda", generator=gen).bfloat16()
 
 
+@pytest.mark.parametrize("pre_wait", [False, True], ids=["entry_wait", "pre_wait"])
 @pytest.mark.parametrize("append", [False, True], ids=["read", "append"])
 @pytest.mark.parametrize("wide", [False, True], ids=["single", "wide"])
-def test_the_window_ops_over_pages_are_their_dense_calls(wide, append):
+def test_the_window_ops_over_pages_are_their_dense_calls(wide, append, pre_wait):
     """``wide``: the wide op at its split geometry; otherwise the single-request op. Eight
-    requests, a TP4 rank's heads, the served window, PDL."""
+    requests, a TP4 rank's heads, the served window, PDL. ``pre_wait``: the paged call
+    with ``split_pre_wait`` against the dense call without it."""
+    if pre_wait and (wide or not append):
+        pytest.skip("split_pre_wait is the single-request op's, with the append")
     op = wide_ops.dflash_window_attention_wide if wide else dflash_window_attention
     gen = torch.Generator(device="cuda").manual_seed(0)
     # Windows starting inside a page; blocks inside one, straddling two or starting one.
@@ -85,8 +90,9 @@ def test_the_window_ops_over_pages_are_their_dense_calls(wide, append):
     seqlens = torch.tensor(ctx, dtype=torch.int32, device="cuda") + m
     call = (seqlens, (slots - 1 - torch.arange(batch, device="cuda")).int(), WINDOW, None, True)
     dense = op(q, k_arena, v_arena, *call, **new)
+    pre = dict(split_pre_wait=True) if pre_wait else {}
     with validating(op):
-        paged = op(q, k_pages, v_pages, *call, page_table=table, **new)
+        paged = op(q, k_pages, v_pages, *call, page_table=table, **new, **pre)
     assert torch.equal(paged, dense)
     # The blocks went to the requests' pages as to their slots, and nothing else moved.
     assert torch.equal(k_pages[rows], k_arena) and torch.equal(v_pages[rows], v_arena)

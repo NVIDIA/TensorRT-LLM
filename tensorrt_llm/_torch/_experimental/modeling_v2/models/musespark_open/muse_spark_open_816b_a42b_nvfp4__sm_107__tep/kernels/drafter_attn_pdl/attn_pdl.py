@@ -15,21 +15,21 @@ With this fast path (part of ``drafter_folds``; PDL on):
   place, plain RoPE) launched with PDL. Every CTA runs ``griddepcontrol.wait`` before its first global read
   and then ``griddepcontrol.launch_dependents``. Built with the shipped library's nvcc flags (no
   ``--use_fast_math``), it writes the shipped kernel's bits; the unit test checks that on random inputs.
-* The split kernel runs with ``split_pre_wait``: it loads the request length, the slot and the context part
-  of its first key tile before its wait, and the block's keys (``k_new`` / ``v_new``) and the queries after
-  it.
+* The split kernel runs with ``split_pre_wait``: it loads the request length, the slot, over pages the
+  request's page-table row, and the context part of its first key tile before its wait, and the block's keys
+  (``k_new`` / ``v_new``) and the queries after it.
 
 Why the pre-wait loads read final values: the split is released when every CTA of the QK norm + RoPE has
 passed its wait, i.e. when the qkv GEMV grid has completed. Each kernel of the chain waits for its own
 predecessor in every CTA that reads anything, so that grid's completion implies the completion of every
 earlier kernel on the stream, including the drafter preamble that wrote the lengths and the slot. The
-context K/V columns below the block were written by earlier kernels too (the context-K/V side chain, joined
-into the main stream before the drafter, or with ``drafter_preamble``'s deferred join right before layer 0's
-QK norm + RoPE, whose CTAs
-wait before their first read and release the split only after it; and earlier decode steps); the block columns
-``[L - M, L)`` the split reads from ``k_new`` / ``v_new`` and writes to the arena only after its wait. The
-values every kernel reads are those of the plain chain, so the drafter's output and the arena are bitwise
-those of the step without this fast path.
+context K/V columns below the block, and over pages the step's page table, were written by earlier kernels
+too (the context-K/V side chain, joined into the main stream before the drafter, or with
+``drafter_preamble``'s deferred join right before layer 0's QK norm + RoPE, whose CTAs wait before their
+first read and release the split only after it; and earlier decode steps); the block columns ``[L - M, L)``
+the split reads from ``k_new`` / ``v_new`` and writes to the context only after its wait. The values every
+kernel reads are those of the plain chain, so the drafter's output and its context are bitwise those of the
+step without this fast path.
 """
 
 from __future__ import annotations
