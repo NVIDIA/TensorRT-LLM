@@ -32,6 +32,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <set>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
@@ -85,6 +86,67 @@ struct UserData
     ssize_t numBytes;
 };
 
+// Disk pages whose last write failed, keyed by (fd, page offset). Leaked on purpose: I/O workers may record a
+// failure during static destruction.
+struct FailedDiskWrites
+{
+    std::mutex mutex;
+    std::set<std::pair<int, ssize_t>> pages;
+    std::atomic<size_t> size{0};
+};
+
+FailedDiskWrites& failedDiskWrites()
+{
+    static auto* const instance = new FailedDiskWrites;
+    return *instance;
+}
+
+void recordFailedDiskWrite(int fd, ssize_t pos) noexcept
+{
+    auto& failed = failedDiskWrites();
+    try
+    {
+        std::lock_guard<std::mutex> lock(failed.mutex);
+        failed.pages.emplace(fd, pos);
+        failed.size.store(failed.pages.size(), std::memory_order_release);
+    }
+    catch (...)
+    {
+        TLLM_LOG_ERROR("[kvCacheManagerV2Utils] could not record a failed disk write; its page may be reused\n");
+    }
+}
+
+// A new write to a page supersedes the failure of the previous one.
+void forgetFailedDiskWrites(std::vector<Task<DiskAddress, MemAddress>> const& tasks) noexcept
+{
+    auto& failed = failedDiskWrites();
+    if (failed.size.load(std::memory_order_acquire) == 0)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(failed.mutex);
+    for (auto const& t : tasks)
+    {
+        failed.pages.erase({t.dst.fd, t.dst.pos});
+    }
+    failed.size.store(failed.pages.size(), std::memory_order_release);
+}
+
+std::atomic<uint64_t> gInjectedWriteFailures{0};
+
+bool takeInjectedWriteFailure() noexcept
+{
+    uint64_t remaining = gInjectedWriteFailures.load(std::memory_order_relaxed);
+    while (remaining > 0)
+    {
+        if (gInjectedWriteFailures.compare_exchange_weak(remaining, remaining - 1, std::memory_order_relaxed))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 CUDA_CB void hostFnDiskToDiskCopy(void* userData) noexcept
 {
     // @TODO: enable multi-threading with a thread pool
@@ -127,7 +189,12 @@ CUDA_CB void hostFnHostToDiskCopy(void* userData) noexcept
     bool success = true;
     for (auto const& t : data->tasks)
     {
-        success = success && writeAll(t.dst.fd, t.dst.pos, reinterpret_cast<void const*>(t.src), data->numBytes);
+        success = success && !takeInjectedWriteFailure()
+            && writeAll(t.dst.fd, t.dst.pos, reinterpret_cast<void const*>(t.src), data->numBytes);
+        if (!success)
+        {
+            recordFailedDiskWrite(t.dst.fd, t.dst.pos);
+        }
     }
     if (!success)
     {
@@ -337,7 +404,14 @@ struct DiskTransfer
             return readAll(t.src.fd, t.src.pos + offset, reinterpret_cast<std::byte*>(t.dst) + offset, length);
         }
         auto const& t = writes[task];
-        return writePiece(t.dst.fd, t.dst.pos + offset, reinterpret_cast<std::byte const*>(t.src) + offset, length);
+        bool const ok = !takeInjectedWriteFailure()
+            && writePiece(t.dst.fd, t.dst.pos + offset, reinterpret_cast<std::byte const*>(t.src) + offset, length);
+        if (!ok)
+        {
+            // Recorded before finish() publishes completion, so whoever waits on the transfer sees the failure.
+            recordFailedDiskWrite(t.dst.fd, t.dst.pos);
+        }
+        return ok;
     }
 
     void finish() noexcept
@@ -543,6 +617,24 @@ bool asyncDiskIo() noexcept
 
 } // namespace
 
+bool consumeFailedDiskWrite(int fd, ssize_t pos) noexcept
+{
+    auto& failed = failedDiskWrites();
+    if (failed.size.load(std::memory_order_acquire) == 0)
+    {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(failed.mutex);
+    bool const found = failed.pages.erase({fd, pos}) > 0;
+    failed.size.store(failed.pages.size(), std::memory_order_release);
+    return found;
+}
+
+void injectDiskWriteFailuresForTesting(uint64_t count) noexcept
+{
+    gInjectedWriteFailures.store(count, std::memory_order_relaxed);
+}
+
 void releaseDiskFile(int fd) noexcept
 {
     if (fd < 0)
@@ -631,6 +723,7 @@ CUresult copyDiskToHost(std::vector<Task<MemAddress, DiskAddress>> tasks, ssize_
 
 CUresult copyHostToDisk(std::vector<Task<DiskAddress, MemAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept
 {
+    forgetFailedDiskWrites(tasks);
     if (asyncDiskIo())
     {
         auto transfer = std::make_shared<DiskTransfer>();

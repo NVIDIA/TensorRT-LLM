@@ -65,6 +65,11 @@ def poison_for_testing(reason: str) -> None:
     _cpp().poison_for_testing(reason)
 
 
+def inject_disk_write_failures_for_testing(count: int) -> None:
+    """Make the next ``count`` disk write pieces fail without writing."""
+    _cpp().inject_disk_write_failures_for_testing(count)
+
+
 def create_test_padding_cold_page_codec(cold_page_bytes_by_layer: dict[int, int]) -> Any:
     """Create the private native padding codec used by cold-tier end-to-end tests."""
     return _cpp().create_test_padding_cold_page_codec(cold_page_bytes_by_layer)

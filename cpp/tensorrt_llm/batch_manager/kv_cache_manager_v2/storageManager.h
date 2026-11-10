@@ -591,6 +591,9 @@ private:
 
     void addRetainedCopy(Page const& page, CacheLevel level, PoolGroupIndex pgIdx, Slot slot);
     [[nodiscard]] std::optional<Slot> takeRetainedCopy(Page const& page, CacheLevel level);
+    //! Whether \p page has a reusable retained copy at \p level. A copy whose write has not finished or failed is
+    //! released instead.
+    bool validateRetainedCopy(Page const& page, CacheLevel level);
     bool pinRetainedCopy(Page const& page, CacheLevel level, bool pin) noexcept;
     void releaseRetainedCopies(CacheLevel level, PoolGroupIndex pgIdx, SlotCount count);
     void releaseAllRetainedCopies(std::optional<CacheLevel> level);

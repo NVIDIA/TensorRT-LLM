@@ -11608,6 +11608,35 @@ class TestNoBatchingDiskOptions(TestNoBatching):
             cache.close()
         self.manager.clear_reusable_blocks()
 
+    def test_failed_write_through_copy_is_not_reused(self) -> None:
+        # A disk copy whose write failed holds stale bytes. When its page later falls to disk it must be written
+        # again rather than take the copy's slot back; restoring the prefix checks the KV.
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        # The next request evicts the first one's pages GPU -> host, and write-through copies them to disk.
+        # Fail those writes once, then let the disk recover.
+        _introspection.inject_disk_write_failures_for_testing(1 << 30)
+        try:
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        finally:
+            _introspection.inject_disk_write_failures_for_testing(0)
+        before = _introspection.disk_copy_counters(self.manager)
+        # Push the first request's pages from host to disk.
+        for _ in range(4):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        after = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(after["reclaimed"], before["reclaimed"])
+
+        prompt = first.kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
+        self.manager.clear_reusable_blocks()
+
+
     def test_held_pages_take_kept_copy_slots_on_a_full_disk(self) -> None:
         # Held pages of a suspended request and droppable pages whose disk copies are kept fall into a disk tier
         # filled with exactly those copies. A kept copy only saves a write, so the held pages must get its slot.
@@ -11635,15 +11664,11 @@ class TestNoBatchingDiskOptions(TestNoBatching):
             filler.close()
             # Restoring A keeps every disk slot as a copy of one of its pages.
             prompt = first.kv_cache.committed_tokens
-            restored = self.Request(
-                next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 0
-            )
+            restored = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 0)
             self.assertTrue(restored.kv_cache.resume(stream))
             self.run_request(restored, 32, False)
             restored.kv_cache.close()
-            self.assertEqual(
-                _introspection.disk_copy_counters(self.manager)["retained"], disk_pages
-            )
+            self.assertEqual(_introspection.disk_copy_counters(self.manager)["retained"], disk_pages)
             # A suspended request holds as many GPU pages as the disk has.
             held = self.manager.create_kv_cache(None, tokens(disk_pages))
             self.assertTrue(held.resume(stream))
@@ -11660,7 +11685,6 @@ class TestNoBatchingDiskOptions(TestNoBatching):
             held.close()
         s.take_finish_event()
         self.manager.clear_reusable_blocks()
-
 
 class TestResizeQuotaDiskOptions(TestResizeQuota):
     disk_tier_options = _ALL_DISK_OPTIONS

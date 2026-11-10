@@ -930,6 +930,34 @@ void StorageManager::addRetainedCopy(Page const& page, CacheLevel level, PoolGro
     ++mKeepCopyStats.created;
 }
 
+bool StorageManager::validateRetainedCopy(Page const& page, CacheLevel level)
+{
+    auto it = mRetainedByPage.find(&page);
+    if (it == mRetainedByPage.end() || it->second->level != level)
+    {
+        return false;
+    }
+    auto const& copy = *it->second;
+    // A copy can stand in for the page only once the write that made it has finished without error. A failure is
+    // recorded before the transfer publishes completion, so a finished event means the record is in place.
+    bool usable = copy.slot.readyEvent.isClosed() || copy.slot.readyEvent.queryComplete();
+    if (usable)
+    {
+        Address const address = slotAddress(copy.level, copy.pgIdx, copy.slot.slotId(), PoolIndex{0});
+        if (auto const* disk = std::get_if<DiskAddress>(&address); disk && consumeFailedDiskWrite(disk->fd, disk->pos))
+        {
+            TLLM_LOG_WARNING("[kvCacheManagerV2] discarding a disk copy whose write failed; the page is written again");
+            usable = false;
+        }
+    }
+    if (!usable)
+    {
+        eraseRetainedCopy(it->second);
+        ++mKeepCopyStats.reclaimed;
+    }
+    return usable;
+}
+
 std::optional<Slot> StorageManager::takeRetainedCopy(Page const& page, CacheLevel level)
 {
     auto it = mRetainedByPage.find(&page);
@@ -937,6 +965,12 @@ std::optional<Slot> StorageManager::takeRetainedCopy(Page const& page, CacheLeve
     {
         return std::nullopt;
     }
+    // Pinned copies were validated when pinned; check the others now.
+    if (!it->second->pinned && !validateRetainedCopy(page, level))
+    {
+        return std::nullopt;
+    }
+    it = mRetainedByPage.find(&page);
     auto entry = it->second;
     Slot slot = std::move(entry->slot);
     --mNumRetainedCopies.at(level).at(entry->pgIdx);
@@ -1414,7 +1448,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             {
                 auto page = std::move(pages.front());
                 pages.pop_front();
-                if (pinRetainedCopy(*page, lvlId, true))
+                if (validateRetainedCopy(*page, lvlId) && pinRetainedCopy(*page, lvlId, true))
                 {
                     keptPages.at(lifeCycle).push_back(std::move(page));
                 }

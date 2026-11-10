@@ -36,6 +36,13 @@ struct Task
 //! Process-wide: run host <-> disk copies on a pool of \p numThreads threads. The first nonzero call sizes it.
 void configureAsyncDiskIo(size_t numThreads) noexcept;
 
+//! Whether the last write to the disk page at (\p fd, \p pos) failed; reports each failure once. A disk copy made by
+//! a failed write holds stale bytes and must not be reused.
+[[nodiscard]] bool consumeFailedDiskWrite(int fd, ssize_t pos) noexcept;
+
+//! Testing only: make the next \p count disk write pieces fail without writing.
+void injectDiskWriteFailuresForTesting(uint64_t count) noexcept;
+
 //! Call before closing a disk pool file: waits for in-flight I/O and closes its cached O_DIRECT descriptor.
 void releaseDiskFile(int fd) noexcept;
 
