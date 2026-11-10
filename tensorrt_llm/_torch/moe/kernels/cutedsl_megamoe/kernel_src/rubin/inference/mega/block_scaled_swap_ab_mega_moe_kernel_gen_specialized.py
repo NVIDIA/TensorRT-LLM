@@ -1623,6 +1623,17 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         # CTAs with no work can finish the epilogue before gather warps pass
         # their readiness waits. Join every role before clearing those flags.
         cute.arch.sync_threads()
+        # No CTA may leave while a cluster peer can still touch its shared memory: the
+        # scheduler's work-id broadcast releases, the pipelines' consumer releases and the
+        # multicast legs arrive on peer CTAs, and the last of them are issued after the
+        # peer's own last tile is done. With one tiny tile per cluster the other CTA pair
+        # finished its epilogue and exited first ("cluster target block not present", seen
+        # at one or two tokens per rank). The tail below only touches global memory.
+        # Release / acquire (the defaults of barrier.cluster.arrive / wait): a relaxed
+        # arrive would order nothing, so a peer's remote mbarrier arrive issued before its
+        # arrive could still land after this CTA's wait returns.
+        cute.arch.cluster_arrive()
+        cute.arch.cluster_wait()
         if warp_idx < len(self.epilogue_warp_ids):
             epilogue_thread_count = 32 * len(self.epilogue_warp_ids)
 
@@ -1663,8 +1674,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
 
         if cutlass.const_expr(self.schedule_mode == "decode"):
             # Release/acquire keeps each CTA's shared memory alive through its peers'
-            # remote operations. Post-tail liveness: decode scheduler module, "Tail".
-            # grouped / phase_interleave builds exit without this barrier.
+            # remote operations issued by the tail itself. Post-tail liveness: decode
+            # scheduler module, "Tail". The pre-tail cluster barrier above covers every
+            # schedule; the grouped / phase_interleave tails only touch global memory.
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
         self._device_workspace.remove_device_members()
