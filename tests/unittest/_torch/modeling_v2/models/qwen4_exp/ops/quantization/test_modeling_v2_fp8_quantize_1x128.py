@@ -106,6 +106,42 @@ def _assert_misses_are_ties(x: torch.Tensor, data: torch.Tensor, ref_data: torch
     return rel
 
 
+def _capture(x: torch.Tensor, use_ue8m0: bool):
+    """Capture one call over a private copy of the step's activations after a side-stream
+    warmup: `(graph, static input, static outputs)`."""
+    static = x.clone()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        op(static, use_ue8m0)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = op(static, use_ue8m0)
+    return graph, static, out
+
+
+def _same(a: tuple[torch.Tensor, torch.Tensor], b: tuple[torch.Tensor, torch.Tensor]) -> bool:
+    """Codes and scales bitwise equal (codes compared as bytes)."""
+    return torch.equal(a[0].view(torch.uint8), b[0].view(torch.uint8)) and torch.equal(a[1], b[1])
+
+
+def _check_cell(label, x, use_ue8m0, data, scales) -> None:
+    """Shapes and layout, the gate against the entry's reference, and every miss a tie."""
+    nb = (x.shape[1] + 127) // 128
+    assert data.shape == x.shape and data.is_contiguous() and data.device == x.device
+    assert scales.shape == (nb, x.shape[0]) and scales.is_contiguous()
+    ref = op.reference(x, use_ue8m0)
+    _compare((data, scales), ref)
+    rel = _assert_misses_are_ties(x, data, ref[0]) if not use_ue8m0 else 0.0
+    exact = (data.view(torch.uint8) == ref[0].view(torch.uint8)).float().mean().item()
+    sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    print(
+        f"  {label}: {100 * exact:.4f}% bit-exact, worst tie {rel:.3e}, "
+        f"{x.shape[0] * nb} groups over a {sms * 8 * 8 * 2}-group grid sweep"
+    )
+
+
 # ── the certified cells ───────────────────────────────────────────────────
 
 
@@ -113,20 +149,29 @@ def _assert_misses_are_ties(x: torch.Tensor, data: torch.Tensor, ref_data: torch
 def test_certified_cells(cell, certifying):  # noqa: F811 — pytest resolves the fixture by this name
     certifying(op)
     spec = cell.spec
-    x = _input(spec["tokens"], spec["hidden"], seed=zlib.crc32(cell.why.encode()))
+    seed = zlib.crc32(cell.why.encode())
+    x = _input(spec["tokens"], spec["hidden"], seed=seed)
     data, scales = op(x, spec["use_ue8m0"])
-    nb = (spec["hidden"] + 127) // 128
-    assert data.shape == x.shape and data.is_contiguous() and data.device == x.device
-    assert scales.shape == (nb, spec["tokens"]) and scales.is_contiguous()
-    ref = op.reference(x, spec["use_ue8m0"])
-    _compare((data, scales), ref)
-    rel = _assert_misses_are_ties(x, data, ref[0]) if not spec["use_ue8m0"] else 0.0
-    exact = (data.view(torch.uint8) == ref[0].view(torch.uint8)).float().mean().item()
-    sms = torch.cuda.get_device_properties(x.device).multi_processor_count
-    print(
-        f"  {cell.why[:44]}: {100 * exact:.4f}% bit-exact, worst tie {rel:.3e}, "
-        f"{spec['tokens'] * nb} groups over a {sms * 8 * 8 * 2}-group grid sweep"
+    _check_cell(cell.why[:44], x, spec["use_ue8m0"], data, scales)
+    if not spec.get("capture"):
+        return
+
+    # The replay is bitwise the eager call; a second step's activations replay bitwise their own.
+    graph, static, replayed = _capture(x, spec["use_ue8m0"])
+    graph.replay()
+    torch.cuda.synchronize()
+    assert _same(replayed, (data, scales)), "the replay differs from the eager call it captured"
+    second = _input(spec["tokens"], spec["hidden"], seed=seed + 1)
+    assert not torch.equal(second, x), "the second step brings other activations"
+    static.copy_(second)
+    graph.replay()
+    torch.cuda.synchronize()
+    step2 = (replayed[0].clone(), replayed[1].clone())
+    assert _same(step2, op(second, spec["use_ue8m0"])), (
+        "the second replay differs from its eager call"
     )
+    assert not _same(step2, (data, scales)), "the second replay repeated the first step"
+    _check_cell(f"{cell.why[:44]} (second replay)", second, spec["use_ue8m0"], *step2)
 
 
 # ── what a cell cannot carry ──────────────────────────────────────────────

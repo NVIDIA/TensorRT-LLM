@@ -139,6 +139,29 @@ def test_wide_rows_equal_the_canonical_composition(width: int, distribution: str
     assert torch.equal(fused, composed), "fused token expansion"
 
 
+@pytest.mark.parametrize("rows", [149, 192, 288, 576])
+@pytest.mark.parametrize("distribution", ["relu_sum", "relu_sparse"])
+def test_wide_rows_past_one_wave_ordered_by_window(rows: int, distribution: str) -> None:
+    """`ordered_wide` past one wave of rows: block lists and token selections equal the default
+    launch's and the reference's, over ragged windows with ties."""
+    g = torch.Generator(device=DEV).manual_seed(rows)
+    pos = torch.randint(1, 262143, (rows,), generator=g, device=DEV)
+    pos[::17] = 99999  # ties of window length
+    pos[3] = 262143
+    spec = dict(rows=rows, pos=pos.tolist(), width=65568, **{distribution: True})
+    outs = []
+    for order in (True, False):
+        args = _build(spec, seed=rows + 1)
+        sel = op(*args, ordered_wide=order)
+        torch.cuda.synchronize()
+        outs.append((args[4].clone(), sel.clone()))
+    want_topk, want_sel = op.reference(*_build(spec, seed=rows + 1))
+    assert torch.equal(outs[0][0], outs[1][0]), "block list: ordered vs two CTAs an SM"
+    assert torch.equal(outs[0][1], outs[1][1]), "token selection: ordered vs two CTAs an SM"
+    assert torch.equal(outs[0][0], want_topk), "block list vs reference"
+    assert torch.equal(outs[0][1], want_sel.to(torch.int32)), "token selection vs reference"
+
+
 # The decode-path shapes, captured in the decode CUDA graph: tp1's one row at 2560 columns,
 # the default target's relu-sparse decode and verify cells (1 and 128 rows at core's width, 1024
 # at MTP's), and the wide tables' decode cells (`graph` in their spec).

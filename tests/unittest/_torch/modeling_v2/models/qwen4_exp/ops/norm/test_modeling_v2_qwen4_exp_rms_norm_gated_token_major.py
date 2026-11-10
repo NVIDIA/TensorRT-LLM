@@ -7,11 +7,13 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.norm.rms_norm_gated_token_major import (  # noqa: E501
     rms_norm_gated_token_major as op,
 )
 
 __extra_import_path__ = ["../../../.."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "rms_norm_gated_token_major requires a CUDA device"
@@ -58,10 +60,52 @@ def _build(spec, seed):
         z = randn(t, heads, n)
 
     weight = randn(n)
-    return x, z, weight, spec["eps"], None, spec["gate_activation"]
+    return (
+        x,
+        z,
+        weight,
+        spec["eps"],
+        None,
+        spec["gate_activation"],
+        spec.get("direct_launch", False),
+    )
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+#: The FP8 target's tp2/tep2 rank, called with `direct_launch=True`: 24 heads, `z` in its
+#: 8240-wide projection.
+_FP8_TP2 = dict(
+    heads=24,
+    width=128,
+    dtype=torch.bfloat16,
+    eps=1e-6,
+    gate_activation="sigmoid",
+    z="in_proj",
+    z_row_stride=8240,
+    direct_launch=True,
+)
+
+#: The shapes each target calls this entry with beyond its own cells, by target directory.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified": (
+        Cell(
+            why="fp8 tp2/tep2, one token: 24 heads, z at token stride 8240; 4-row kernel, PDL",
+            spec=dict(tokens=1, **_FP8_TP2),
+        ),
+        Cell(
+            why="fp8 tp2/tep2, 683 tokens (16392 rows): 4-row kernel, grid past the SM count",
+            spec=dict(tokens=683, **_FP8_TP2),
+        ),
+        Cell(
+            why="fp8 tp2/tep2 prefill at max_num_tokens 8192: 196608 rows on the 8-row kernel",
+            spec=dict(tokens=8192, **_FP8_TP2),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     certifying(op)
     args = _build(cell.spec, seed=_seed(cell.why))
@@ -84,7 +128,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
 
 def test_guard_refuses_a_weight_of_the_wrong_length() -> None:
     """Unguarded, a length-192 weight is silently truncated to weight[:128]."""
-    x, z, weight, eps, _, act = _build(_PACKED, seed=12)
+    x, z, weight, eps, _, act, _ = _build(_PACKED, seed=12)
     long_weight = torch.cat([weight, torch.randn(64, dtype=weight.dtype, device="cuda")])
     assert torch.equal(
         torch.ops.trtllm.rms_norm_gated_token_major(x, z, long_weight, eps, None, act),
