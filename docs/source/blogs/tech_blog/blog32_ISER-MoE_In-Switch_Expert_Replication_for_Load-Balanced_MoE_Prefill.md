@@ -1,8 +1,3 @@
-<!--
-SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-SPDX-License-Identifier: Apache-2.0
--->
-
 # ISER-MoE: In-Switch Expert Replication for Load-Balanced MoE Prefill
 
 *Per-Layer Dynamic Expert Load Balancing with NVLink Multicast in TensorRT LLM*
@@ -15,7 +10,7 @@ An expert-parallel mixture-of-experts (MoE) layer runs at the pace of its most l
 
 In simulated replay of that routing at 8,192 tokens/rank, HALO-Q removed **98–99% of the excess load** (the most loaded GPU's load above the mean) at EP4–EP24, with four helper slots (spare expert buffers) per rank. With attention data parallelism (DP) and EP8 (DEP8) on GB300, ISER-MoE raised DeepSeek-V4-Pro's context-only (prefill-only) throughput by **17.4% on GSM8K** (Grade School Math 8K) and **7.2% on agentic prompts** from [AgentPerf](https://artificialanalysis.ai/methodology/agentperf), Artificial Analysis's agentic benchmark (Figure 1). In disaggregated serving of agentic coding traces on a GB300 NVL72 rack, it improved P90 (90th-percentile) request latency by **3.1–4.3%** and output throughput per GPU by **1.4–1.9%**.
 
-![Grouped bars of context-only throughput gain over the load balancer off on GB300: ISER-MoE gains 17.4% (GSM8K) and 7.2% (AgentPerf) at DEP8 and 9.5% and 1.6% at DEP6; forced balanced routing gains 13.5%, 6.0%, 10.8% and 3.8%.](../media/tech_blog32_e2e_gb300.svg)
+![Grouped bars of context-only throughput gain over the load balancer off on GB300: ISER-MoE gains 17.4% (GSM8K) and 7.2% (AgentPerf) at DEP8 and 9.5% and 1.6% at DEP6; forced balanced routing gains 13.5%, 6.0%, 10.8% and 3.8%.](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_e2e_gb300.svg)
 
 *Figure 1. Context-only (prefill-only) serving of DeepSeek-V4-Pro (NVFP4) on GB300: end-to-end (E2E) throughput gain over OFF (load balancer off) of ON (ISER-MoE) and of FB (force expert balance: OFF with routing forced to be perfectly balanced; its outputs are not meaningful). Throughput counts computed (non-reused) tokens per GPU and second; all arms use a tile-wise FP4 combine. Labels above the AgentPerf bars: key-value (KV) cache reuse rate across the three arms.*
 
@@ -77,7 +72,7 @@ where $\bar{L}$ is the mean load; $R-1$ is the *excess*, and ranks above (below)
 
 DeepSeek-V4-Pro's prefill routing ([DeepSeek-V4 report](https://arxiv.org/abs/2606.19348): 61 MoE layers, $E=384$, $k=6$) was recorded before load balancing on random tokens and five public workloads: [GSM8K](https://arxiv.org/abs/2110.14168), Massive Multitask Language Understanding (MMLU), IFBench, SciCode and [agentic coding traces from SemiAnalysis](https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126). At EP8, the 61-layer mean of whole-trace $R$ was 1.40–1.45 for four workloads, 1.69 for GSM8K and 2.00 for random tokens (Figure 2); it ranged over 1.13–2.51 across the agentic traces' layers, and any two workloads share at most one of their five most imbalanced layers, much as [Part 1](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html#observation-over-gsm8k-dataset) saw DeepSeek-R1's hot layer move between datasets. The means also grow with EP size (Figure 2(b)).
 
-![Heat strips of per-layer R at EP8 for six workloads, with 61-layer means from 1.40 to 2.00, and lines in which every workload's mean R rises from EP4 to EP8.](../media/tech_blog32_rank_imbalance.svg)
+![Heat strips of per-layer R at EP8 for six workloads, with 61-layer means from 1.40 to 2.00, and lines in which every workload's mean R rises from EP4 to EP8.](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_rank_imbalance.svg)
 
 *Figure 2. Rank imbalance ratio R (the most loaded rank's routed tokens over the mean) of DeepSeek-V4-Pro prefill before load balancing (whole-trace loads, contiguous experts per rank): (a) per MoE layer at EP8, with 61-layer means; (b) 61-layer means at EP4, EP6 and EP8.*
 
@@ -87,7 +82,7 @@ DeepSeek-V4-Pro's prefill routing ([DeepSeek-V4 report](https://arxiv.org/abs/26
 
 Expert load is long-tailed (Figure 3): over the mixed trace, the four busiest of 384 experts received 13.02% of a layer's assignments on average (1.04% if uniform), and 13.6% per iteration (EP8, 16,384 tokens/rank). At EP8, the four busiest home experts of a layer's hottest rank carried at least that rank's load above the mean in 59 of the 61 layers.
 
-![Six panels of the cumulative share of a layer's assignments over experts sorted by load, all bowed above the uniform diagonal; in the mixed trace, the top 4 of 384 experts take 13.02%.](../media/tech_blog32_long_tail.svg)
+![Six panels of the cumulative share of a layer's assignments over experts sorted by load, all bowed above the uniform diagonal; in the mixed trace, the top 4 of 384 experts take 13.02%.](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_long_tail.svg)
 
 *Figure 3. Expert load is long-tailed (DeepSeek-V4-Pro, whole datasets): cumulative share of a layer's assignments over its 384 experts sorted by load. Thin lines: MoE layers; thick: 61-layer average, labeled with the Top-1 to Top-16 shares; dashed: uniform load. Mixed: the mixed trace.*
 
@@ -109,7 +104,7 @@ Communication hides at peak rates only if this ratio exceeds the *device ratio* 
 
 The shared expert needs neither the plan nor token communication, so it can run before dispatch while the links are idle. GB300 computes FP4 at three times its 8-bit floating-point (FP8) rate, so weighting the shared expert's FP8 FLOPs by 3 (FP8 shared experts assumed in both models) raises the math/comm ratio to 19,661–32,768 FLOP/B, and all 16 scenarios allow overlap (Figure 4(a), green). DeepSeek-V4-Pro's shared expert lasts 216.5 µs at 8,192 tokens/rank, room for about five more copies at line rate. **Copies should therefore start right after routing, beside the shared expert, not at the entry of MegaMoE.**
 
-![Bars of the math/comm ratio with 0 to 4 copies per rank: four routed-only bars fall below the 16,667 FLOP/B line, but no bar with the shared expert does; timelines show four copies delaying the combine but hiding beside the shared expert.](../media/tech_blog32_copy_vs_compute.svg)
+![Bars of the math/comm ratio with 0 to 4 copies per rank: four routed-only bars fall below the 16,667 FLOP/B line, but no bar with the shared expert does; timelines show four copies delaying the combine but hiding beside the shared expert.](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_copy_vs_compute.svg)
 
 *Figure 4. Peak-rate model per MoE layer and rank on GB300 (EP8, uniform routing, NVFP4). (a) Math/comm ratio with n copies per rank, routed experts only (orange) or with the FP8 shared expert weighted ×3 (green); hatched: below the device ratio (dashed). (b) DeepSeek-V4-Pro, 8,192 tokens/rank, four copies: they delay the combine beside the routed experts but hide beside the shared expert.*
 
@@ -121,7 +116,7 @@ Hot experts often need several replicas each, and a hot rank's busiest home expe
 
 In simulated replay of the mixed trace (8,192 tokens/rank, four helper slots per rank), a greedy point-to-point planner modeled on UltraEP and [MegaFlux](https://arxiv.org/abs/2610.00671), with no limit on an owner's send-outs, balanced slightly better than HALO-Q ($R$ = 1.001–1.009 against 1.006–1.020 at EP8–EP24), but its busiest owner sent 7/9/10 expert weights per invocation at EP8/16/24 at the 99th percentile, 289–413 µs at line rate and longer than the 216.5 µs shared-expert window, and up to 10/12/14, against four or fewer with multicast (Figure 5(c)).
 
-![Eight GPUs: point to point, GPU 0 sends hot expert A five times; with multicast, it sends once and the switch replicates. Bars of worst-case owner send-outs: 10, 12 and 14 point to point against 4 with multicast.](../media/tech_blog32_owner_hotspot.svg)
+![Eight GPUs: point to point, GPU 0 sends hot expert A five times; with multicast, it sends once and the switch replicates. Bars of worst-case owner send-outs: 10, 12 and 14 point to point against 4 with multicast.](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_owner_hotspot.svg)
 
 *Figure 5. Point-to-point replication makes the owner a hot spot. (a, b) Idealized EP8 example: point to point, GPU 0 sends hot expert A five times; with in-switch multicast, each owner sends once. (c) The greedy planner in simulated replay (DeepSeek-V4-Pro, mixed trace, 8,192 tokens/rank, four helper slots per rank), point to point or multicast: the busiest rank's worst-case expert send-outs per layer invocation.*
 
@@ -135,7 +130,7 @@ Multicast lets each byte leave the owner once, but each of the following three w
 - **B, software scatter + all-gather.** The classic large-message broadcast of [MPICH's collectives](https://doi.org/10.1177/1094342005051521) spreads injection over all $g$ ports but moves the payload twice in series, capping its bandwidth near half the link bandwidth.
 - **C, owner-direct (single-port) multicast issued by a copy engine (CE).** Everything enters the switch through one ingress port, replicated at a fixed rate: on four GB200 trays (160 MiB), the total output stayed at 2.0–2.1 TB/s, so each receiver got 535, 266 and 127 GB/s at $g$ = 4, 8 and 16.
 
-![Diagrams of a ring, a scatter + all-gather and a copy-engine write into one switch port, and a chart in which the ring falls to 250 GB/s at 16 GPUs and the single port from 535 to 127 GB/s.](../media/tech_blog32_broadcast_limits.svg)
+![Diagrams of a ring, a scatter + all-gather and a copy-engine write into one switch port, and a chart in which the ring falls to 250 GB/s at 16 GPUs and the single port from 535 to 127 GB/s.](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_broadcast_limits.svg)
 
 *Figure 6. Three ways to broadcast one expert, each limited by latency or bandwidth. (a) One expert in four slices, from GPU 0 to g = 4 GPUs: A, software ring; B, software scatter + all-gather; C, owner-direct (single-port) multicast issued by a CE. (b) Algorithm bandwidth (BW) against g: A and B modeled, C measured on four GB200 trays.*
 
@@ -145,7 +140,7 @@ Multicast lets each byte leave the owner once, but each of the following three w
 
 **ISER-MoE fixes the groups, not the replicas.** Right after routing, [HALO-Q](#halo-q-balance-first-then-keep-tokens-local) decides which hot experts to replicate where, bounding each owner's exports, and maps every route to an expert slot. A replication kernel then multicasts each replica with the Tensor Memory Accelerator (TMA) into one of a few [prebuilt aligned groups](#multi-level-symmetric-multicast-fix-the-groups-not-the-replicas), from its owner or through [SAMI](#in-switch-weight-replication-and-sami-spread-the-injection-over-the-group). Both [run beside the shared expert](#runtime-overlap-hide-the-copy-beside-the-shared-expert): MegaMoE waits only for the plan, and only its *helper tiles*, its work on replicas, wait for the weights (Figure 7).
 
-![Schematic: the MAIN and COPY streams of one rank with the READY gate; HALO-Q balancing four ranks to 1,000 routes each and repairing quotas; SAMI members multicasting slices; aligned groups of 16, 8 and 4 ranks.](../media/tech_blog32_design_overview.svg)
+![Schematic: the MAIN and COPY streams of one rank with the READY gate; HALO-Q balancing four ranks to 1,000 routes each and repairing quotas; SAMI members multicasting slices; aligned groups of 16, 8 and 4 ranks.](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_design_overview.svg)
 
 *Figure 7. ISER-MoE in one MoE layer (schematic). (a) One rank under DEP: the highest-priority COPY stream runs HALO-Q and the weight replication (one fused kernel in the merged implementation) beside the shared expert; helper tiles wait at the READY gate until every rank has reached READY counter γ, which advances once per invocation, and a reuse fence orders the next layer's HALO-Q after MegaMoE. (b) HALO-Q on ranks 0–3: balance to the water level T, then quota repair. (c) SAMI with g = 4 and owner GPU 0. (d) Aligned groups of P, P/2 and P/4 ranks at EP16 with S = 4 helper slots per rank (h0–h3).*
 
@@ -202,7 +197,7 @@ A simulator replays the mixed trace at 8,192 tokens/rank through HALO-Q's stages
 
 **With four helper slots per rank, HALO-Q removed 98.4–99.0% of the excess load**: the 61-layer mean $R$ fell from 1.20/1.44/1.84/2.24 to 1.002/1.006/1.010/1.020 at EP4/8/16/24, and every layer stayed within 13% of balance (Figure 8(a)); three slots removed 94.9–95.9%. An earlier *all-rank policy*, replicating four experts on every rank, left a mean $R$ of 1.038/1.193/1.348 at EP8/16/24.
 
-![Per-layer R at EP4 to EP24, flat near 1 with HALO-Q (means 1.002 to 1.020), and bars of the largest per-rank token send-out and receive-in, down 2–8% and 19–55%.](../media/tech_blog32_haloq_eval.svg)
+![Per-layer R at EP4 to EP24, flat near 1 with HALO-Q (means 1.002 to 1.020), and bars of the largest per-rank token send-out and receive-in, down 2–8% and 19–55%.](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_haloq_eval.svg)
 
 *Figure 8. HALO-Q in simulated trace replay (DeepSeek-V4-Pro, mixed trace, 8,192 tokens/rank). (a) Balance: per-layer R without balancing and with HALO-Q at four (solid) or three (dashed) helper slots per rank, sorted by R without balancing; labels: 61-layer means, three slots in parentheses. (b) Locality (four helper slots): the most routed tokens any rank sends out or receives in during dispatch, mean per iteration and layer, and the change from no balancing.*
 
@@ -216,7 +211,7 @@ HALO-Q's chosen group excluded the owner in 53% of broadcasts at EP8 and 76% at 
 
 These reference measurements, taken with a CE prototype and pre-merge builds of the replication kernel rather than the merged implementation, broadcast bundles from one owner to $g$ GPUs (Figure 9).
 
-![Four panels: SAMI 1.13×, 2.03× and 3.76× faster than owner-direct multicast at 4, 8 and 16 GPUs; SAMI at 481 GB/s from four copy SMs; SAMI above tuned ncclBroadcast; span increases of 2.0/0.6/0.3% for SAMI against 36.3/14.7/2.9%.](../media/tech_blog32_sami_eval.svg)
+![Four panels: SAMI 1.13×, 2.03× and 3.76× faster than owner-direct multicast at 4, 8 and 16 GPUs; SAMI at 481 GB/s from four copy SMs; SAMI above tuned ncclBroadcast; span increases of 2.0/0.6/0.3% for SAMI against 36.3/14.7/2.9%.](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_sami_eval.svg)
 
 *Figure 9. Broadcasts from one owner on GB200 (reference measurements). (a) CE prototype (g = 4: two trays, 144 MiB; g = 8, 16: four trays, 160 MiB). (b) Pre-merge replication kernel, standalone, slowest rank: eight 37.16 MB bundles (283.5 MiB) to 8 GPUs, owner included. (c) One broadcast at a time, until the slowest rank holds it: fastest SAMI variant against fastest tuned ncclBroadcast (nccl-tests, NCCL 2.31.2). (d) Time increase from the shared expert's start to the end of MegaMoE while the build of (b) copies four experts (4 × 36 MiB) during the shared expert (EP8). Labels in (a, d): SAMI's speedup.*
 
@@ -234,7 +229,7 @@ These reference measurements, taken with a CE prototype and pre-merge builds of 
 
 Each measurement times one MegaMoE call for a DeepSeek-V4-Pro layer on GB200, OFF and ON with four helper slots per rank, on a pre-merge revision with an FP4 combine instead of the default BF16. ON's replicas, routes (from the all-rank policy) and READY flags were installed before timing, so **the times exclude HALO-Q, the copy and any READY wait**; OFF ran before and after ON and was averaged, and outputs matched bitwise.
 
-![MegaMoE kernel time OFF and ON: 1.24×, 1.52×, 1.21× and 1.22× on power-law cells, ON near balanced routing; over 61 layers, mean 1,999 µs OFF against 1,624 µs ON (1.23×).](../media/tech_blog32_megamoe_kernel.svg)
+![MegaMoE kernel time OFF and ON: 1.24×, 1.52×, 1.21× and 1.22× on power-law cells, ON near balanced routing; over 61 layers, mean 1,999 µs OFF against 1,624 µs ON (1.23×).](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_megamoe_kernel.svg)
 
 *Figure 10. MegaMoE kernel time on GB200 (DeepSeek-V4-Pro layer, NVFP4, FP4 combine, four helper slots per rank; slowest rank, median of 20 iterations; replicas and routes from an earlier all-rank policy, installed before timing). (a) Power-law routing (exponent 0.8) at EP4 and EP8, 8K or 16K tokens/rank. (b) 61 layers, routes sampled from the trace (EP8, 8,192 tokens/rank); L20: layer 20. Dashes: balanced routing (OFF).*
 
@@ -267,7 +262,7 @@ In C3 and C4, ON kept replicas resident, as the merged implementation's default 
 
 </div>
 
-![Output throughput per GPU against P90 request latency for C1 to C4, each ON point above and left of its OFF point: P90 3.1–4.3% better and throughput 1.4–1.9% higher.](../media/tech_blog32_e2e_disagg.svg)
+![Output throughput per GPU against P90 request latency for C1 to C4, each ON point above and left of its OFF point: P90 3.1–4.3% better and throughput 1.4–1.9% higher.](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog32_e2e_disagg.svg)
 
 *Figure 11. Disaggregated serving of DeepSeek-V4-Pro (NVFP4) on a GB300 NVL72 rack with agentic coding traces: output throughput per GPU against P90 request E2E latency, OFF and ON, C1–C4 in order of concurrency. Labels: OFF/ON − 1 for latency and ON/OFF − 1 for throughput (tput); each arm's best run.*
 
@@ -371,8 +366,6 @@ Per-invocation replicas of hot experts can remove most of the rank imbalance in 
 The generation phase, training, attention-side imbalance, replication across NVLink domains and a hardware comparison with static plans remain future work. To try ISER-MoE, [enable](#enable-iser-moe-in-tensorrt-llm) `moe_config.load_balancer.mode: per_layer_dynamic` and compare it against OFF on your own traffic.
 
 ### Further Reading
-
-<!-- TODO: link the ISER-MoE paper once it is public -->
 
 Using per-layer dynamic EPLB:
 
