@@ -2007,6 +2007,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             tokens, probs = fused_sample_from_logits_with_probs(
                 *params, seed=seeds.seed, offset=seeds.offset
             )
+            if not return_probs and not all_enabled:
+                # Opted-out rows keep the native tokens-only draw. Marked rows
+                # retain the with-probs token as their repeated-context fallback.
+                stock_tokens = fused_sample_from_logits(
+                    *params, seed=seeds.seed, offset=seeds.offset
+                )
+                tokens = torch.where(wm_enabled, tokens, stock_tokens)
             tokens = watermark.sample_step(
                 probs, None, wm_slots, wm_enabled, tokens, from_probs=True
             )

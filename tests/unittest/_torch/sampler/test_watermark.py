@@ -20,11 +20,15 @@ import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.sampler import watermark as watermark_module
+from tensorrt_llm._torch.pyexecutor.sampler.sampler import TorchSampler
 from tensorrt_llm._torch.pyexecutor.sampler.watermark import (
     WatermarkHandler,
     request_wants_watermark,
 )
+from tensorrt_llm.bindings import SamplingConfig
+from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.watermark import GumbelWatermarkDetector, WatermarkConfig
 from tensorrt_llm.watermark.detector import _gamma_upper_tail, _max_pair_sum_tail
 from tensorrt_llm.watermark.prf import (
@@ -554,3 +558,51 @@ class TestRequestWantsWatermark:
         assert request_wants_watermark(on, _request(1, 0, [], watermarking=True))
         assert not request_wants_watermark(on, _request(1, 0, [], watermarking=False))
         assert request_wants_watermark(forced, _request(1, 0, [], watermarking=False))
+
+
+@requires_cuda
+def test_seeded_opt_out_matches_stock_sampling_in_a_mixed_batch():
+    """An opted-out row keeps the tokens a sampler without a watermark draws for its seed,
+    also when watermarked rows share a batch that uses top-k, top-p and min-p."""
+    num_rows, flags = 4, (True, False, True, False)
+
+    def make_sampler(config, row_flags):
+        sampler = TorchSampler(
+            TorchSampler.Args(
+                max_seq_len=128,
+                max_draft_len=0,
+                max_num_sequences=num_rows,
+                max_beam_width=1,
+                max_total_draft_tokens=0,
+                watermark_config=config,
+            )
+        )
+        requests = []
+        for slot, flag in enumerate(row_flags):
+            params = SamplingParams(
+                seed=431 + slot, temperature=0.9, top_k=100, top_p=0.98, min_p=0.01
+            )
+            requests.append(
+                LlmRequest(
+                    request_id=slot,
+                    max_new_tokens=64,
+                    input_tokens=[10, 10, 10, 10],
+                    sampling_config=SamplingConfig(params._get_sampling_config()),
+                    seq_slot=slot,
+                    is_streaming=False,
+                    watermarking=flag,
+                )
+            )
+        sampler._slot_params.admit(requests, torch.arange(num_rows, device="cuda"))
+        sampler._seed_manager.observe(requests)
+        if sampler._watermark is not None:
+            sampler._watermark.observe(requests, is_neutral=sampler._watermark_row_is_neutral)
+        return sampler, requests  # the handlers hold the requests weakly
+
+    stock, _stock_requests = make_sampler(None, (False,) * num_rows)
+    marked, _marked_requests = make_sampler(WatermarkConfig(key=99), flags)
+    logits = torch.randn(num_rows, 151936, device="cuda") * 0.2
+    for _ in range(16):
+        expected, _, _ = stock._sample_fused(logits, list(range(num_rows)), return_probs=False)
+        actual, _, _ = marked._sample_fused(logits, list(range(num_rows)), return_probs=False)
+        assert torch.equal(actual[[1, 3]], expected[[1, 3]])
