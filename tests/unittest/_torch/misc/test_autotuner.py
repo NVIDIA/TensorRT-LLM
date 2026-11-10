@@ -2359,11 +2359,13 @@ def test_share_jit_builds_sets_aside_profiles_built_elsewhere(
     assert jit_share._DEADLINE_ENV not in os.environ
 
 
-def test_deep_gemm_jit_share_builds_each_kernel_once(tmp_path):
+def test_deep_gemm_jit_share_builds_each_kernel_once(tmp_path, monkeypatch):
     """DeepGEMM's compiler wrapper builds a kernel in the process that claims
     it. Others copy the published cubin, report busy while it is being built if
     asked to defer, and build it themselves when the claimant does not publish
     it within their wait, which an enclosing deadline cuts short."""
+    # The keys computed here must match the wrapper's, which runs without the salt.
+    monkeypatch.delenv(jit_share._SALT_ENV, raising=False)
     calls = tmp_path / "calls"
     compiler = tmp_path / "fake_nvcc"
     compiler.write_text(
@@ -2432,6 +2434,25 @@ def test_deep_gemm_jit_share_builds_each_kernel_once(tmp_path):
     past = {jit_share._WAIT_ENV: "600", jit_share._DEADLINE_ENV: repr(0.0)}
     assert run(argv, **past).returncode == 0
     assert builds() == 3
+
+
+def test_jit_share_wrapper_needs_a_private_directory(tmp_path):
+    """DeepGEMM runs the compiler wrapper found in its directory, so the wrapper
+    is written to and used from a directory only this user can write to: one
+    another user could write to, or a symlink, is refused."""
+    if os.statvfs(tmp_path).f_flag & os.ST_NOEXEC:
+        pytest.skip("the temporary directory does not allow executing files")
+    private = tmp_path / "private"
+    wrapper = jit_share._write_wrapper(str(private))
+    assert wrapper is not None and os.access(wrapper, os.X_OK)
+    assert os.stat(private).st_mode & 0o077 == 0
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o777)
+    assert jit_share._write_wrapper(str(shared)) is None
+    link = tmp_path / "link"
+    link.symlink_to(private)
+    assert jit_share._write_wrapper(str(link)) is None
 
 
 def test_shared_kernel_cache_exports_and_loads(monkeypatch, tmp_path):

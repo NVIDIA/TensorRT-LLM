@@ -69,6 +69,7 @@ used, to keep the compiler's start-up short.
 
 import hashlib
 import os
+import stat
 import sys
 import threading
 import time
@@ -492,8 +493,13 @@ def _write_wrapper(bin_dir: str) -> str | None:
 
         script = f'#!/bin/sh\nexec {shlex.join([interpreter, "-I", "-S", module])} "$@"\n'
     path = os.path.join(bin_dir, "nvcc-" + hashlib.sha256(script.encode()).hexdigest()[:16])
+    # The script found here runs as this user, so the directory must be one that only this
+    # user can write to: not a symlink, not another user's, not group- or other-writable.
+    os.makedirs(bin_dir, mode=0o700, exist_ok=True)
+    info = os.lstat(bin_dir)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        return None
     if not os.path.exists(path):
-        os.makedirs(bin_dir, exist_ok=True)
         part = f"{path}.{os.getpid()}.part"
         with open(part, "w") as f:
             f.write(script)
