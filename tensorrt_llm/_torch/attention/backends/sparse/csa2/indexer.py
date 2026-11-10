@@ -130,18 +130,21 @@ class CSA2Indexer(Indexer):
         if not torch.cuda.is_available():
             exact = TopKImplementation.TORCH
         prefill, decode = exact, exact
-        if compatible and self.options.enable_heuristic_topk:
+        if self.options.enable_heuristic_topk:
+            # the self-sampling engine also runs on Hopper; the temporal-hint
+            # engine needs the datacenter Blackwell stack of the exact path
             if self.options.use_self_sampling_topk and use_self_sampling_gvr(
                 enable_heuristic_topk=True,
                 use_self_sampling_topk=True,
                 index_topk=self.index_topk,
                 compress_ratio=1,
-                is_cute_dsl_available=True,
+                is_cute_dsl_available=IS_CUTLASS_DSL_AVAILABLE,
                 sm_version=sm,
             ):
                 prefill = decode = TopKImplementation.CUTE_DSL_GVR
             elif (
-                not self.options.use_self_sampling_topk
+                compatible
+                and not self.options.use_self_sampling_topk
                 and layer.mode == CSA2Mode.FULL
                 and head_dim == 128
                 and self.index_topk in (512, 1024, 2048)

@@ -25,7 +25,7 @@ from ..offload import (
     allocate_sparse_offload_state,
     get_sparse_offload_metadata_layers,
 )
-from ..params import use_self_sampling_gvr
+from ..params import SELF_SAMPLING_GVR_SM_VERSIONS, TEMPORAL_GVR_SM_VERSIONS, use_self_sampling_gvr
 from .cache_manager import is_dsa_cache_manager
 from .indexer import (
     _DG_SCHEDULE_BLOCK_KV,
@@ -358,9 +358,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.use_cute_dsl_topk = (
             sparse_metadata_params.use_cute_dsl_topk and IS_CUTLASS_DSL_AVAILABLE
         )
-        self.enable_gvr_topk = (
-            sparse_metadata_params.enable_heuristic_topk and get_sm_version() >= 100
-        )
         self.kv_lens_row_reorder = None
         capture_graph = self.is_cuda_graph
         # Plain DSA has no compression and uses the default [1]. DeepSeek-V4's
@@ -380,17 +377,21 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # compress ratio matches every live indexer: the DeepSeek-V4 backend
         # only builds indexers on cr=4 layers and plain DSA uses cr=1.
         self.use_self_sampling_topk = use_self_sampling_gvr(
-            enable_heuristic_topk=self.enable_gvr_topk,
+            enable_heuristic_topk=sparse_metadata_params.enable_heuristic_topk,
             use_self_sampling_topk=sparse_metadata_params.use_self_sampling_topk,
             index_topk=self.num_sparse_topk,
             compress_ratio=self._indexer_compress_ratio,
             is_cute_dsl_available=IS_CUTLASS_DSL_AVAILABLE,
             sm_version=get_sm_version(),
         )
+        # Hopper has only the self-sampling engine.
+        self.enable_gvr_topk = sparse_metadata_params.enable_heuristic_topk and (
+            get_sm_version() >= 100 or self.use_self_sampling_topk
+        )
         self.needs_gvr_prior = (
             self.enable_gvr_topk
             and IS_CUTLASS_DSL_AVAILABLE
-            and get_sm_version() in (100, 103)
+            and get_sm_version() in TEMPORAL_GVR_SM_VERSIONS
             and not self.use_self_sampling_topk
         )
 
@@ -683,7 +684,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """
         # same two-level dispatch and hardware gates as the indexer __init__:
         # never compile these kernels on unsupported stacks during warmup
-        if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in (100, 103):
+        if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in SELF_SAMPLING_GVR_SM_VERSIONS:
             return
         if not self.enable_gvr_topk or self.kv_cache_manager is None:
             return

@@ -45,17 +45,17 @@ if not torch.cuda.is_available():
 if not IS_CUTLASS_DSL_AVAILABLE:
     pytest.skip("cutlass DSL is required for gvr_selfsampling_topk tests", allow_module_level=True)
 
-if getSMVersion() not in (100, 103):
-    pytest.skip(
-        "self-sampling GVR kernels target datacenter Blackwell (sm_100/103) "
-        "— same gate as the production dispatch; consumer Blackwell "
-        "(sm_120/121) lacks thread-block clusters",
-        allow_module_level=True,
-    )
-
 from tensorrt_llm._torch.kernels.blackwell.top_k import (
     gvr_topk_decode_self_sampling_host as ss_host,
 )
+
+if getSMVersion() not in ss_host.SUPPORTED_SM_VERSIONS:
+    pytest.skip(
+        "self-sampling GVR kernels target Hopper and datacenter Blackwell "
+        "(sm_90/100/103) — same gate as the production dispatch; consumer "
+        "Blackwell (sm_120/121) lacks thread-block clusters",
+        allow_module_level=True,
+    )
 
 _DEV = "cuda"
 
@@ -63,6 +63,15 @@ _DEV = "cuda"
 def _varlen_cache_key(*parts: int) -> tuple[int, ...]:
     device = torch.cuda.current_device()
     return (*parts, ss_host._device_profile_key(device))
+
+
+def _device_wave() -> int:
+    return ss_host._device_wave_sms(torch.cuda.current_device())
+
+
+def _prefill_key(*parts, **kwargs) -> tuple:
+    """Prefill launcher cache key on the current device (its wave budget)."""
+    return ss_host._prefill_cache_key(*parts, wave=_device_wave(), **kwargs)
 
 
 def _make_case(batch_size, n_valid, top_k, seed, hit_ratio=0.6):
@@ -840,6 +849,86 @@ def test_selfsampling_route_sm103_large_batch_k2048_register_rung() -> None:
             plan = ss_host.route(512, n, npad, 2048, 148, sm_version)
             assert plan["kernel"] == "reg"
             assert tuple(plan["tpl"][:3]) == expected, (n, sm_version, plan)
+
+
+def test_selfsampling_wave_budget_per_target() -> None:
+    """Blackwell keeps the 148-SM streaming and clustered wave budget on every SKU; Hopper
+    sizes those waves by its own SM count."""
+    assert ss_host.SUPPORTED_SM_VERSIONS == (90, 100, 103)
+    for num_sms in (132, 148, 160):
+        assert ss_host.wave_sms(num_sms, 100) == 148
+        assert ss_host.wave_sms(num_sms, 103) == 148
+        assert ss_host.wave_sms(num_sms, 90) == num_sms
+    # one deep single-row slab: a split CTA per SM of the target
+    assert ss_host.route(1, 1 << 20, 1 << 20, 1024, 132, 90)["rt"]["R"] == 132
+    assert ss_host.route(1, 1 << 20, 1 << 20, 1024, 160, 103)["rt"]["R"] == 148
+
+
+def test_selfsampling_hopper_split_plans_fit_one_wave() -> None:
+    """On a 132-SM Hopper every plan that splits a row over CTAs launches at most one CTA
+    per SM, and the factored route stays lossless."""
+    num_sms = 132
+    for b in (1, 2, 3, 4, 8, 15, 16, 31, 32, 33, 66, 67, 132):
+        for k in (512, 1024, 2048):
+            for n in (16400, 32768, 65536, 131072, 262144, 1 << 20):
+                plan = ss_host.route(b, n, n, k, num_sms, 90)
+                split = (
+                    plan["rt"]["R"]
+                    if plan["kernel"] == "main"
+                    else plan["cluster"]
+                    if plan["kernel"] in ("clus", "reg_clus")
+                    else 1
+                )
+                if split > 1:
+                    assert b * split <= num_sms, (b, n, k, plan)
+                assert ss_host.route_split(b, n, n, k, num_sms, 90) == plan
+
+
+def test_selfsampling_hopper_clusters_are_coresident() -> None:
+    """Hopper clustered plans launch no more clusters than the GPU co-schedules; Blackwell keeps
+    its tuned cluster rungs (32 rows of 4-CTA clusters)."""
+    assert ss_host.cluster_fits(4, 30, 132, 90) and not ss_host.cluster_fits(4, 32, 132, 90)
+    assert ss_host.cluster_fits(4, 32, 148, 100) and ss_host.cluster_fits(4, 32, 148, 103)
+    assert ss_host.cluster_fits(1, 1024, 132, 90)  # a single CTA is no cluster
+    for b in (8, 15, 16, 30, 31, 32, 33, 64):
+        for k in (512, 1024, 2048):
+            for n in (32771, 65539, 131075, 262127):
+                for dtype in (None, torch.bfloat16, torch.float16):
+                    plan = (
+                        ss_host.route(b, n, n, k, 132, 90)
+                        if dtype is None
+                        else ss_host._route_16bit(b, n, n, k, 132, 90, dtype=dtype)
+                    )
+                    if plan["kernel"] in ("clus", "reg_clus"):
+                        assert ss_host.cluster_fits(plan["cluster"], b, 132, 90), (b, n, k, plan)
+    assert ss_host.route(32, 32771, 32832, 1024, 148, 100)["cluster"] == 4
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 90
+    or torch.cuda.get_device_properties(0).multi_processor_count != ss_host._HOPPER_CLUSTER_SMS,
+    reason="requires a 132-SM Hopper GPU (the parts the cluster table was measured on)",
+)
+def test_selfsampling_hopper_cluster_table_within_device_occupancy() -> None:
+    """The Hopper cluster table never exceeds the clusters this GPU co-schedules at one
+    1024-thread CTA per SM."""
+    from cutlass.utils import HardwareInfo
+
+    hardware = HardwareInfo(torch.cuda.current_device())
+    for cluster_size, rows in ss_host._HOPPER_CLUSTER_ROWS.items():
+        assert rows <= hardware.get_max_active_clusters(cluster_size), (cluster_size, rows)
+
+
+def test_selfsampling_prefill_tiers_follow_wave() -> None:
+    """Prefill tier bands and representative rows scale with the wave budget; Blackwell keys
+    are unchanged and other budgets get their own keys."""
+    assert ss_host._prefill_tier_rows(148) == (75, 149, 297)
+    assert ss_host._prefill_tier_rows(132) == (67, 133, 265)
+    for rows, tier in ((1, 0), (132, 0), (133, 1), (264, 1), (265, 2)):
+        assert ss_host._prefill_tier(rows, 2048, 512, 132) == tier
+    key = ss_host._prefill_cache_key(0, 512, 4096, "f32")
+    assert ss_host._prefill_cache_key(0, 512, 4096, "f32", wave=148) == key
+    assert ss_host._prefill_cache_key(0, 512, 4096, "f32", wave=132) != key
 
 
 @pytest.mark.skipif(getSMVersion() not in (100, 103), reason="requires an SM100 or SM103 GPU")
@@ -2174,24 +2263,21 @@ def test_prefill_warmup_idempotent_and_no_rejit(dtype):
     # Every row stride here fits 16-bit indices, so the 16-bit tier-2 key is the v16 one.
     lo = ss_host._prefill_bucket(k + 1)
     want = {
-        ss_host._prefill_cache_key(1, k, 0, tag),
-        ss_host._prefill_cache_key(2, k, 0, tag, v16=dtype is not torch.float32),
+        _prefill_key(1, k, 0, tag),
+        _prefill_key(2, k, 0, tag, v16=dtype is not torch.float32),
     }
     bk = lo
     while bk <= 32768:
         for n_env in (bk // 2 + 1, bk):
-            if ss_host._prefill_tier(1, n_env, k) == 0:
-                want.add(ss_host._prefill_cache_key(0, k, bk, tag))
+            if ss_host._prefill_tier(1, n_env, k, _device_wave()) == 0:
+                want.add(_prefill_key(0, k, bk, tag))
         bk <<= 1
     # deterministic prefill keys carry a fifth element (True); an earlier
     # deterministic test in the same process must not enter the comparison
     have = {
         kk
         for kk in ss_host._PREFILL_CACHE
-        if (len(kk) == 4 or kk[4] == "v16")
-        and kk[1] == k
-        and kk[3] == tag
-        and (kk[0] != 0 or kk[2] >= lo)
+        if kk[4:5] != (True,) and kk[1] == k and kk[3] == tag and (kk[0] != 0 or kk[2] >= lo)
     }
     assert have == want, (have, want)
     # the capture-time readiness query agrees with the cache: warmed shape
@@ -2212,7 +2298,7 @@ def test_prefill_16bit_tier2_staging_follows_row_stride(dtype, monkeypatch):
     tag = _DTYPE_IDS[dtype]
     ss_host.warmup_prefill(k, 65400, num_rows_list=(297,), dtype=dtype)
     for v16 in (True, False):
-        assert ss_host._prefill_cache_key(2, k, 0, tag, v16=v16) in ss_host._PREFILL_CACHE
+        assert _prefill_key(2, k, 0, tag, v16=v16) in ss_host._PREFILL_CACHE
     looked = []
 
     class _Recording(dict):
@@ -2232,7 +2318,7 @@ def test_prefill_16bit_tier2_staging_follows_row_stride(dtype, monkeypatch):
         looked.clear()
         ss_host.run_prefill(lg, rs, re, out)
         # one lookup and no launcher build: the warmed engine of this row stride ran
-        assert looked == [ss_host._prefill_cache_key(2, k, 0, tag, v16=ncols == 8192)], looked
+        assert looked == [_prefill_key(2, k, 0, tag, v16=ncols == 8192)], looked
         torch.cuda.synchronize()
         _check_prefill_exact(lg, out, rs, re, k)
 
@@ -2297,7 +2383,7 @@ def test_prefill_small_envelope_tier0_uses_sampled_plan(dtype):
     rows = 64
     for k in (512, 1024, 2048):
         for n in (4099, 8192, 16384, 32768):
-            tier = ss_host._prefill_tier(rows, n, k)
+            tier = ss_host._prefill_tier(rows, n, k, _device_wave())
             assert tier == (
                 1 if ss_host._prefill_scpb_tier1(k) + ss_host._PREFILL_T1_MARGIN < n <= 16384 else 0
             )
@@ -2308,10 +2394,7 @@ def test_prefill_small_envelope_tier0_uses_sampled_plan(dtype):
             ss_host.run_prefill(lg, rs, re, out, max_row_len=n)
             torch.cuda.synchronize()
             bucket = ss_host._prefill_bucket(n)
-            assert (
-                ss_host._prefill_cache_key(tier, k, bucket, _DTYPE_IDS[dtype])
-                in ss_host._PREFILL_CACHE
-            )
+            assert _prefill_key(tier, k, bucket, _DTYPE_IDS[dtype]) in ss_host._PREFILL_CACHE
             assert ss_host.prefill_ready(lg, out, max_row_len=n)
             _check_prefill_exact(lg, out, rs, re, k)
         # prefix-cache-hit window on the small-envelope tier-1 engine: ks % 4 == 1

@@ -44,7 +44,11 @@ from tensorrt_llm.deep_gemm import (
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..params import get_indexer_mqa_logits_elem_budget, use_self_sampling_gvr
+from ..params import (
+    TEMPORAL_GVR_SM_VERSIONS,
+    get_indexer_mqa_logits_elem_budget,
+    use_self_sampling_gvr,
+)
 from .kernels import deterministic_indexer_projection
 from .params import DSAParams
 from .throwaway_topk import (
@@ -941,7 +945,6 @@ class Indexer(nn.Module):
         )
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
-        self._enable_heuristic_topk = sparse_params.enable_heuristic_topk and sm_version >= 100
         # Two-level GVR dispatch: enable_heuristic_topk selects the GVR
         # family over the exact radix path; use_self_sampling_topk (default
         # True) selects the hint-free self-sampling engine over the
@@ -951,12 +954,16 @@ class Indexer(nn.Module):
         # insertion/radix path with a one-time warning; contract violations
         # inside the engine raise.
         self._use_self_sampling_topk = use_self_sampling_gvr(
-            enable_heuristic_topk=self._enable_heuristic_topk,
+            enable_heuristic_topk=sparse_params.enable_heuristic_topk,
             use_self_sampling_topk=sparse_params.use_self_sampling_topk,
             index_topk=sparse_params.index_topk,
             compress_ratio=compress_ratio,
             is_cute_dsl_available=IS_CUTLASS_DSL_AVAILABLE,
             sm_version=sm_version,
+        )
+        # Hopper has only the self-sampling engine.
+        self._enable_heuristic_topk = sparse_params.enable_heuristic_topk and (
+            sm_version >= 100 or self._use_self_sampling_topk
         )
         if os.environ.get("TRTLLM_GVR_SELF_SAMPLING") is not None:
             logger.warning_once(
@@ -987,9 +994,9 @@ class Indexer(nn.Module):
         if (
             self._enable_heuristic_topk
             and IS_CUTLASS_DSL_AVAILABLE
-            # datacenter Blackwell only; consumer Blackwell (sm_120/121)
-            # lacks the thread-block clusters both GVR engines use
-            and sm_version in (100, 103)
+            # both GVR engines use thread-block clusters (none on consumer
+            # Blackwell sm_120/121); the self-sampling engine also runs on Hopper
+            and (self._use_self_sampling_topk or sm_version in TEMPORAL_GVR_SM_VERSIONS)
         ):
             decode_top_k_implementation = TopKImplementation.CUTE_DSL_GVR
         else:

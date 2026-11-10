@@ -63,6 +63,13 @@ class MTPIndexShareMetadata(Protocol):
         """Ask the indexer to reuse its captured selection instead of scoring."""
 
 
+# SM versions of the GVR Top-K engines. The self-sampling engine runs on Hopper
+# and datacenter Blackwell (SUPPORTED_SM_VERSIONS of its kernel host); the
+# temporal-hint engines run on datacenter Blackwell only.
+SELF_SAMPLING_GVR_SM_VERSIONS = (90, 100, 103)
+TEMPORAL_GVR_SM_VERSIONS = (100, 103)
+
+
 def use_self_sampling_gvr(
     *,
     enable_heuristic_topk: bool,
@@ -82,7 +89,7 @@ def use_self_sampling_gvr(
         enable_heuristic_topk
         and use_self_sampling_topk
         and is_cute_dsl_available
-        and sm_version in (100, 103)
+        and sm_version in SELF_SAMPLING_GVR_SM_VERSIONS
         and index_topk in (512, 1024, 2048)
         and compress_ratio in (1, 4)
     )

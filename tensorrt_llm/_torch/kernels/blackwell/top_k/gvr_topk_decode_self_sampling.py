@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Self-sampling GVR top-K decode kernels (CuTe DSL, Blackwell sm_100a).
+"""Self-sampling GVR top-K decode kernels (CuTe DSL, Hopper sm_90a and Blackwell sm_100a/sm_103a).
 
 Sample-calibrated threshold ladders for exact single-pass top-K: the kernel
 derives its selection threshold from an in-kernel sample of the row itself
@@ -16309,8 +16309,10 @@ class GvrClusKernel:
         async_refine_bf16: bool = False,
         fused_merge_bf16: bool = False,
         push_merge_bf16: bool = False,
+        wave_sms: int = 148,
     ) -> None:
         self.det = bool(det)
+        self.wave_sms = int(wave_sms)  # route() wave budget of the big-occupancy flag
         self.push_merge_bf16 = (
             bool(push_merge_bf16) and dtype is cutlass.BFloat16 and not self.det and nbs == 256
         )
@@ -18803,10 +18805,10 @@ class GvrClusKernel:
     ):
         # varlen grid rows = out.shape[0] (logits row count == out row count in
         # both modes); bigf = the route() `big` occupancy flag, a pure function
-        # of (rows, CS) so it is launch-computed, not an ABI scalar.
+        # of (rows, CS, wave budget) so it is launch-computed, not an ABI scalar.
         b = out.shape[0]
         bigf = cutlass.Int32(0)
-        if b * cutlass.Int32(self.cs) <= cutlass.Int32(148):
+        if b * cutlass.Int32(self.cs) <= cutlass.Int32(self.wave_sms):
             bigf = cutlass.Int32(1)
         self.kern(
             logits, pre_idx, kv_lens, out, n, npad, k, SCAP, CMP, SMP, TGT, Q, SS2, TGT2, bigf
@@ -18841,10 +18843,12 @@ def get_compiled__clus(
     fused_merge_bf16: bool = False,
     envf: bool = False,
     push_merge_bf16: bool = False,
+    wave_sms: int = 148,
 ) -> Any:
     """Compile (or fetch) the gvr_clus variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, CS); scap/cmp are smem-extent keys (every
-    reachable route has 8192/2048 — asserted by run__clus()).
+    reachable route has 8192/2048 — asserted by run__clus()). ``wave_sms`` is the
+    host route's wave budget (``wave_sms()`` in the host module).
 
     ``dtype`` is the logits tag ('f32', 'bf16' or 'f16'); 16-bit tags need
     ``hint_free`` and ``det=False``. ``envf`` and the ``*_bf16`` options apply
@@ -18870,6 +18874,7 @@ def get_compiled__clus(
         )
         + (("envf",) if envf else ())
         + (("push_merge_bf16",) if push_merge_bf16 and dtype == "bf16" else ())
+        + ((("wave_sms", int(wave_sms)),) if int(wave_sms) != 148 else ())
     )
     hit = _COMPILE_CACHE__clus.get(key)
     if hit is not None:
@@ -18894,6 +18899,7 @@ def get_compiled__clus(
         fused_merge_bf16=bool(fused_merge_bf16) if dtype == "bf16" else False,
         envf=bool(envf),
         push_merge_bf16=bool(push_merge_bf16) if dtype == "bf16" else False,
+        wave_sms=wave_sms,
     )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
