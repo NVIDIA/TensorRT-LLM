@@ -16,7 +16,7 @@
 import gc
 import weakref
 from collections.abc import Iterator, ValuesView
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -886,6 +886,48 @@ def test_factory_wraps_after_unchanged_runtime_selection(
         else (mapping, dist, manager, attention, config, None)
     )
     assert constructor.call_args.args == expected
+
+
+@pytest.mark.parametrize("body_error", [None, RuntimeError("body"), KeyboardInterrupt("body")])
+@pytest.mark.parametrize("active", [False, True])
+def test_factory_wrapper_context_manager_preserves_shutdown_and_body_error(
+    monkeypatch: pytest.MonkeyPatch, events: list, active: bool, body_error: BaseException | None
+) -> None:
+    """Return the factory wrapper and shut down once without suppressing body errors."""
+    backend = _ScriptedTransceiver()
+    monkeypatch.setattr(_profiler, "_CUSTOM_REGIONS", frozenset({"kv"}))
+    monkeypatch.setattr(torch.autograd, "_profiler_enabled", lambda: active)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.transceiver.KvCacheTransceiverV2",
+        Mock(return_value=backend),
+    )
+    wrapper = factory.create_kv_cache_transceiver(
+        SimpleNamespace(rank=3),
+        Mock(),
+        Mock(spec=factory.KVCacheManagerV2),
+        Mock(),
+        CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON"),
+    )
+    wrapper_shutdown = Mock(wraps=wrapper.shutdown)
+    backend_shutdown = Mock(wraps=backend.shutdown)
+    monkeypatch.setattr(wrapper, "shutdown", wrapper_shutdown)
+    monkeypatch.setattr(backend, "shutdown", backend_shutdown)
+    expected = pytest.raises(type(body_error)) if body_error is not None else nullcontext()
+    with expected as caught:
+        with wrapper as entered:
+            assert entered is wrapper and entered is not backend
+            entered.respond_and_send_async(_request())
+            if body_error is not None:
+                raise body_error
+    if body_error is not None:
+        assert caught.value is body_error
+    wrapper_shutdown.assert_called_once_with()
+    backend_shutdown.assert_called_once_with()
+    assert backend.call_log == ["send", "shutdown"]
+    assert not wrapper._records and not backend.observed
+    assert [name for name, _ in events] == (
+        ["trtllm::kv_transfer_submit", "trtllm::kv_transfer_cancelled"] if active else []
+    )
 
 
 def test_v2_outcome_observation_requires_opt_in_and_safe_close() -> None:
