@@ -577,13 +577,13 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         mNumRetainedCopies[level].resize(numPoolGroups(level), 0);
     }
     // The options are per disk tier: a tier that does not set them gets neither retained copies nor write-through.
-    mKeepDiskCopyAt = TypedVec<CacheLevel, bool>(numCacheLevels(), false);
+    mKeepCopyAfterRestoreAt = TypedVec<CacheLevel, bool>(numCacheLevels(), false);
     mWriteThroughAt = TypedVec<CacheLevel, bool>(numCacheLevels(), false);
     for (CacheLevel level{0}; level < config.cacheTiers.size(); ++level)
     {
         if (auto const* disk = std::get_if<DiskCacheTierConfig>(&config.cacheTiers[level]))
         {
-            mKeepDiskCopyAt[level] = disk->keepCopyAfterRestore;
+            mKeepCopyAfterRestoreAt[level] = disk->keepCopyAfterRestore;
             // Write-through copies pages as they are evicted into the host tier right above this disk tier. Without
             // one (no host cache, or a KV connector that takes the host tier's place) it would never run.
             bool const hostAbove
@@ -609,10 +609,10 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     }
     for (CacheLevel level{0}; level < numCacheLevels(); ++level)
     {
-        if (mKeepDiskCopyAt[level] || mWriteThroughAt[level])
+        if (mKeepCopyAfterRestoreAt[level] || mWriteThroughAt[level])
         {
             TLLM_LOG_INFO("[kvCacheManagerV2] disk tier %d: keep_copy_after_restore=%d write_through=%d",
-                static_cast<int>(level.value()), static_cast<int>(mKeepDiskCopyAt[level]),
+                static_cast<int>(level.value()), static_cast<int>(mKeepCopyAfterRestoreAt[level]),
                 static_cast<int>(mWriteThroughAt[level]));
         }
     }
@@ -997,8 +997,8 @@ std::optional<Slot> StorageManager::takeRetainedCopy(Page const& page, CacheLeve
     {
         return std::nullopt;
     }
-    // Pinned copies were validated when pinned; check the others now.
-    if (!it->second->pinned && !validateRetainedCopy(page, level))
+    // Reserved copies were validated when reserved; check the others now.
+    if (!it->second->reserved && !validateRetainedCopy(page, level))
     {
         return std::nullopt;
     }
@@ -1011,14 +1011,14 @@ std::optional<Slot> StorageManager::takeRetainedCopy(Page const& page, CacheLeve
     return slot;
 }
 
-bool StorageManager::pinRetainedCopy(Page const& page, CacheLevel level, bool pin) noexcept
+bool StorageManager::reserveRetainedCopy(Page const& page, CacheLevel level, bool reserve) noexcept
 {
     auto it = mRetainedByPage.find(&page);
     if (it == mRetainedByPage.end() || it->second->level != level)
     {
         return false;
     }
-    it->second->pinned = pin;
+    it->second->reserved = reserve;
     return true;
 }
 
@@ -1049,7 +1049,7 @@ void StorageManager::releaseRetainedCopies(CacheLevel level, PoolGroupIndex pgId
     for (auto it = mRetainedCopies.begin(); it != mRetainedCopies.end() && count > 0;)
     {
         auto next = std::next(it);
-        if (it->level == level && it->pgIdx == pgIdx && !it->pinned)
+        if (it->level == level && it->pgIdx == pgIdx && !it->reserved)
         {
             eraseRetainedCopy(it);
             ++mKeepCopyStats.reclaimed;
@@ -1466,19 +1466,19 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     };
 
     // Keep-disk-copy: a fallen page whose copy is retained at this level takes that slot back, so it needs no free
-    // slot here. Pin those copies, then reclaim other retained copies only for what eviction cannot cover.
+    // slot here. Reserve those copies, then reclaim other retained copies only for what eviction cannot cover.
     PagesByLifeCycle keptPages(numLifeCycles());
     // Kept pages came out of the caller's fallenPages, which may hold their only references. If this frame fails
     // before accepting them, hand them back so the caller's rollback reschedules them instead of dropping them.
     bool keptPagesAccepted = false;
-    auto unpinKeptPages = FuncGuard(
+    auto unreserveKeptPages = FuncGuard(
         [&]()
         {
             for (LifeCycleId lifeCycle{0}; lifeCycle < keptPages.size(); ++lifeCycle)
             {
                 for (auto& page : keptPages.at(lifeCycle))
                 {
-                    pinRetainedCopy(*page, lvlId, /*pin=*/false);
+                    reserveRetainedCopy(*page, lvlId, /*reserve=*/false);
                     if (!keptPagesAccepted)
                     {
                         try
@@ -1503,7 +1503,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             {
                 auto page = std::move(pages.front());
                 pages.pop_front();
-                if (validateRetainedCopy(*page, lvlId) && pinRetainedCopy(*page, lvlId, /*pin=*/true))
+                if (validateRetainedCopy(*page, lvlId) && reserveRetainedCopy(*page, lvlId, /*reserve=*/true))
                 {
                     keptPages.at(lifeCycle).push_back(std::move(page));
                 }
@@ -1530,7 +1530,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         }
         if (isLast)
         {
-            // Held pages must fit at the last level. A pinned copy of a droppable page only saves that page a
+            // Held pages must fit at the last level. A reserved copy of a droppable page only saves that page a
             // write, so when held pages need the room, give the copy up: the page then falls like any other
             // droppable page and is placed only if a slot is left.
             bool movedKeptPages = false;
@@ -1849,7 +1849,7 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
             {
                 auto it = mRetainedByPage.find(page.get());
                 if (it != mRetainedByPage.end() && it->second->level == dstLevel
-                    && (it->second->pinned || validateRetainedCopy(*page, dstLevel)))
+                    && (it->second->reserved || validateRetainedCopy(*page, dstLevel)))
                 {
                     ++numUsable;
                 }
@@ -1895,7 +1895,7 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
         throw;
     }
     bool const retainSrcCopy = updateSrc && !defrag && dstLevel < srcLevel && cacheTier(srcLevel) == CacheTier::DISK
-        && mKeepDiskCopyAt.at(srcLevel);
+        && mKeepCopyAfterRestoreAt.at(srcLevel);
     try
     {
         thread_local std::vector<PageIndexPair> pageIndices;

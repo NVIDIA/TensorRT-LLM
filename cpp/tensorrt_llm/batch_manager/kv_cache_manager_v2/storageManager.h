@@ -576,7 +576,7 @@ private:
         PoolGroupIndex pgIdx;
         Slot slot;
         // Set while a fallen page is about to take this slot back, so reclaiming skips it.
-        bool pinned;
+        bool reserved;
     };
 
     using RetainedCopyList = std::list<RetainedCopy>;
@@ -594,12 +594,12 @@ private:
     //! Whether \p page has a reusable retained copy at \p level. A copy whose write has not finished or failed is
     //! released instead.
     bool validateRetainedCopy(Page const& page, CacheLevel level);
-    bool pinRetainedCopy(Page const& page, CacheLevel level, bool pin) noexcept;
+    bool reserveRetainedCopy(Page const& page, CacheLevel level, bool reserve) noexcept;
     void releaseRetainedCopies(CacheLevel level, PoolGroupIndex pgIdx, SlotCount count);
     void releaseAllRetainedCopies(std::optional<CacheLevel> level);
     void eraseRetainedCopy(RetainedCopyList::iterator iter);
 
-    TypedVec<CacheLevel, bool> mKeepDiskCopyAt; // per level: keepCopyAfterRestore of that disk tier
+    TypedVec<CacheLevel, bool> mKeepCopyAfterRestoreAt; // per level: keepCopyAfterRestore of that disk tier
     // Oldest first.
     RetainedCopyList mRetainedCopies;
     std::unordered_map<Page const*, RetainedCopyList::iterator> mRetainedByPage;

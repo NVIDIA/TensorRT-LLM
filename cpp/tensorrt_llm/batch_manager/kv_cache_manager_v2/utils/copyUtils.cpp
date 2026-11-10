@@ -235,9 +235,9 @@ std::atomic<size_t> gAsyncDiskIoThreads{0};
 std::atomic<size_t> gBackgroundDiskWriteBytes{0};
 thread_local bool tBackgroundDiskWrites = false;
 
-// Completion flags: a ring of words in pinned, device-mapped host memory. Transfer t uses word t % kFlagSlots
+// Completion flags: a ring of words in pinned, device-mapped host memory. Transfer t uses word t % kNumCompletionFlags
 // and is complete once the word is >= t.
-constexpr uint64_t kFlagSlots = uint64_t{1} << 16;
+constexpr uint64_t kNumCompletionFlags = uint64_t{1} << 16;
 
 struct CompletionFlags
 {
@@ -264,7 +264,8 @@ CompletionFlags* completionFlags() noexcept
             return nullptr;
         }
         void* host = nullptr;
-        if (cuMemHostAlloc(&host, kFlagSlots * sizeof(uint64_t), CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP)
+        if (cuMemHostAlloc(
+                &host, kNumCompletionFlags * sizeof(uint64_t), CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP)
             != CUDA_SUCCESS)
         {
             TLLM_LOG_WARNING(
@@ -272,7 +273,7 @@ CompletionFlags* completionFlags() noexcept
                 "in the stream callback");
             return nullptr;
         }
-        std::memset(host, 0, kFlagSlots * sizeof(uint64_t));
+        std::memset(host, 0, kNumCompletionFlags * sizeof(uint64_t));
         CUdeviceptr devicePtr = 0;
         if (cuMemHostGetDevicePointer(&devicePtr, host, 0) != CUDA_SUCCESS)
         {
@@ -365,7 +366,7 @@ struct DiskTransfer
 #if defined(__aarch64__)
             asm volatile("dmb oshst" ::: "memory");
 #endif
-            completionFlags()->host[ticket % kFlagSlots].store(ticket, std::memory_order_release);
+            completionFlags()->host[ticket % kNumCompletionFlags].store(ticket, std::memory_order_release);
         }
     }
 };
@@ -568,10 +569,10 @@ CUresult launchDiskTransfer(std::shared_ptr<DiskTransfer> transfer, CUstream str
         return result;
     }
     uint64_t const ticket = flags->nextTicket.fetch_add(1);
-    if (ticket > kFlagSlots)
+    if (ticket > kNumCompletionFlags)
     {
         // Never reuse a flag word whose previous transfer is still in flight.
-        while (flags->host[ticket % kFlagSlots].load(std::memory_order_acquire) < ticket - kFlagSlots)
+        while (flags->host[ticket % kNumCompletionFlags].load(std::memory_order_acquire) < ticket - kNumCompletionFlags)
         {
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
@@ -583,12 +584,12 @@ CUresult launchDiskTransfer(std::shared_ptr<DiskTransfer> transfer, CUstream str
         result != CUDA_SUCCESS)
     {
         // Retire the ticket, or the transfer that reuses its word after the ring wraps would wait forever.
-        flags->host[ticket % kFlagSlots].store(ticket, std::memory_order_release);
+        flags->host[ticket % kNumCompletionFlags].store(ticket, std::memory_order_release);
         return result;
     }
     static_cast<void>(launch.release()); // owned by the callback now
     CUresult const waitResult = cuStreamWaitValue64(
-        stream, flags->device + (ticket % kFlagSlots) * sizeof(uint64_t), ticket, CU_STREAM_WAIT_VALUE_GEQ);
+        stream, flags->device + (ticket % kNumCompletionFlags) * sizeof(uint64_t), ticket, CU_STREAM_WAIT_VALUE_GEQ);
     if (waitResult == CUDA_SUCCESS)
     {
         return CUDA_SUCCESS;
