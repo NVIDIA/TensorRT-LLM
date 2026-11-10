@@ -19,6 +19,29 @@ limitations under the License.
 Scope: this directory and its descendants. Supplements the repository-root
 `AGENTS.md`.
 
+## Stage maintenance
+
+- Edit `jenkins/config/maintenance_stages.txt`. Blank lines and `#` comments
+  are ignored. The first active line must use the exact prefix `Reason:` with
+  a non-empty explanation on one physical line. This reason applies to all
+  subsequent entries; each entry is one exact runtime stage name or `*` wildcard
+  pattern, matched case-sensitively against the whole name. For example:
+
+  ```text
+  Reason: The affected H100 resource is temporarily unavailable.
+  H100_PCIe-PyTorch-1
+  ```
+
+- Matching stages show `Skip - Maintenance` and the reason, without launching
+  a test agent. The nested stage is red to show missing coverage, but the skip
+  alone does not fail the overall build. Previously successful stages may show
+  `Skip - Reused` instead. Explicit stage selection does not override maintenance.
+- Preparation merges the PR's config additions/deletions into the target branch's
+  latest snapshot. After merge, older PRs with maintenance support pick it up
+  without rebasing; builds that already took their snapshot are unaffected.
+  Remove entries to restore execution; dates in the reason do not expire them.
+  Keep the file and header when no entries remain.
+
 ## Path-valued pytest options
 
 - For new or modified long pytest options that take a single file or directory
