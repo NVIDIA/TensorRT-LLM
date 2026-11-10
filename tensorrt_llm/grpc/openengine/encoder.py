@@ -105,7 +105,7 @@ def _encoder_input_params(params: DisaggregatedParams | None) -> DisaggregatedPa
     if params is None:
         return DisaggregatedParams(request_type="context_and_generation")
     if params.request_type not in ("context_only", "context_and_generation"):
-        raise UnsupportedFeatureError("encoder caches require a prefill or aggregated request")
+        raise UnsupportedFeatureError("encoder handoffs require a prefill or aggregated request")
     return params
 
 
@@ -238,24 +238,24 @@ class EncoderCache:
         finally:
             temporary.unlink(missing_ok=True)
         reference = {"version": 1, "namespace": self.namespace, "host": self.host, "id": identity}
-        return generation_pb2.EncoderCacheRef(
+        return generation_pb2.EncoderHandoffRef(
             transfer_backend=BACKEND,
             opaque_state=json.dumps(reference, separators=(",", ":")).encode(),
         )
 
     def _path(self, reference: Any) -> Path:
         if reference.transfer_backend != BACKEND or len(reference.opaque_state) > 1024:
-            raise ValueError("unsupported encoder cache reference")
+            raise ValueError("unsupported encoder handoff reference")
         try:
             value = json.loads(reference.opaque_state)
         except (ValueError, UnicodeError, RecursionError) as error:
-            raise ValueError("invalid encoder cache reference") from error
+            raise ValueError("invalid encoder handoff reference") from error
         if (
             not isinstance(value, dict)
             or type(value.get("version")) is not int
             or value["version"] != 1
         ):
-            raise ValueError("unsupported encoder cache reference version")
+            raise ValueError("unsupported encoder handoff reference version")
         if value.get("namespace") != self.namespace or value.get("host") != self.host:
             raise ValueError(
                 "encoder and consumer require the same host and shared cache directory"
@@ -373,20 +373,24 @@ def validate_encoder(request: Any, role: str) -> str:
             and request.media
             and not (request.HasField("kv") and request.kv.HasField("session"))
         ):
-            raise UnsupportedFeatureError(
-                "encoder consumer requires an encoder cache reference for images"
-            )
+            raise UnsupportedFeatureError("encoder consumer requires an encoder handoff for images")
         if role == "encode":
             raise UnsupportedFeatureError("encoder-only engines require encoder.encode_only")
         return ""
-    options = request.encoder
-    if options.encode_only == options.HasField("cache"):
-        raise ValueError("set exactly one of encoder.encode_only or encoder.cache")
-    expected = "encode" if options.encode_only else "consume"
+    mode = request.encoder.WhichOneof("mode")
+    if mode is None:
+        raise ValueError("set exactly one of encoder.encode_only or encoder.handoff")
+    expected = "encode" if mode == "encode_only" else "consume"
     if role != expected:
         raise UnsupportedFeatureError(f"loaded engine does not support encoder role {expected}")
     if request.HasField("kv") and request.kv.HasField("session"):
-        raise UnsupportedFeatureError("KV decode requests must not consume an encoder cache")
+        raise UnsupportedFeatureError("KV decode requests must not consume an encoder handoff")
+    if expected == "encode":
+        for name in ("sampling", "stopping", "guided", "response"):
+            if getattr(request, name).ListFields():
+                raise UnsupportedFeatureError(f"encoder-only requests do not support {name}")
+        if request.lora_name:
+            raise UnsupportedFeatureError("encoder-only requests do not support LoRA selection")
     if not request.media or any(
         item.modality != generation_pb2.MODALITY_IMAGE for item in request.media
     ):

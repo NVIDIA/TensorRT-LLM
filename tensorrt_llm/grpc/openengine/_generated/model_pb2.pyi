@@ -79,20 +79,22 @@ class ModelInfo(_message.Message):
     def __init__(self, model_id: _Optional[str] = ..., served_model_name: _Optional[str] = ..., served_model_aliases: _Optional[_Iterable[str]] = ..., max_context_length: _Optional[int] = ..., max_output_tokens: _Optional[int] = ..., tokenizer_modes: _Optional[_Iterable[str]] = ..., supports_text_input: bool = ..., supports_token_ids_input: bool = ..., generation: _Optional[_Union[GenerationCapabilities, _Mapping]] = ..., supports_lora: bool = ..., supports_multimodal: bool = ..., reasoning_parser: _Optional[str] = ..., tool_call_parser: _Optional[str] = ..., extra: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., encoder: _Optional[_Union[EncoderCapabilities, _Mapping]] = ...) -> None: ...
 
 class EncoderCapabilities(_message.Message):
-    __slots__ = ("schema_version", "encoder_only", "accepts_cache", "transfer_backends", "supports_abort_cleanup", "requires_cache")
+    __slots__ = ("schema_version", "encoder_only", "accepts_handoff", "supported_transfer_backends", "supports_abort_cleanup", "requires_handoff", "transfer_backend")
     SCHEMA_VERSION_FIELD_NUMBER: _ClassVar[int]
     ENCODER_ONLY_FIELD_NUMBER: _ClassVar[int]
-    ACCEPTS_CACHE_FIELD_NUMBER: _ClassVar[int]
-    TRANSFER_BACKENDS_FIELD_NUMBER: _ClassVar[int]
+    ACCEPTS_HANDOFF_FIELD_NUMBER: _ClassVar[int]
+    SUPPORTED_TRANSFER_BACKENDS_FIELD_NUMBER: _ClassVar[int]
     SUPPORTS_ABORT_CLEANUP_FIELD_NUMBER: _ClassVar[int]
-    REQUIRES_CACHE_FIELD_NUMBER: _ClassVar[int]
+    REQUIRES_HANDOFF_FIELD_NUMBER: _ClassVar[int]
+    TRANSFER_BACKEND_FIELD_NUMBER: _ClassVar[int]
     schema_version: int
     encoder_only: bool
-    accepts_cache: bool
-    transfer_backends: _containers.RepeatedScalarFieldContainer[str]
+    accepts_handoff: bool
+    supported_transfer_backends: _containers.RepeatedScalarFieldContainer[str]
     supports_abort_cleanup: bool
-    requires_cache: bool
-    def __init__(self, schema_version: _Optional[int] = ..., encoder_only: bool = ..., accepts_cache: bool = ..., transfer_backends: _Optional[_Iterable[str]] = ..., supports_abort_cleanup: bool = ..., requires_cache: bool = ...) -> None: ...
+    requires_handoff: bool
+    transfer_backend: str
+    def __init__(self, schema_version: _Optional[int] = ..., encoder_only: bool = ..., accepts_handoff: bool = ..., supported_transfer_backends: _Optional[_Iterable[str]] = ..., supports_abort_cleanup: bool = ..., requires_handoff: bool = ..., transfer_backend: _Optional[str] = ...) -> None: ...
 
 class GenerationCapabilities(_message.Message):
     __slots__ = ("prompt_logprobs", "output_logprobs", "guided_decoding", "max_num_sequences", "supports_priority", "supports_stop_in_output", "supports_cache_salt", "supports_prefix_cache_bypass")

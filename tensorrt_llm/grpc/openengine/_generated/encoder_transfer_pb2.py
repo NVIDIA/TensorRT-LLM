@@ -28,7 +28,7 @@ _sym_db = _symbol_database.Default()
 from . import generation_pb2 as openengine_dot_v1_dot_generation__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n+trtllm/openengine/v1/encoder_transfer.proto\x12\x14trtllm.openengine.v1\x1a\x1eopenengine/v1/generation.proto\"a\n\x1bTransferEncoderCacheRequest\x12-\n\x05\x63\x61\x63he\x18\x01 \x01(\x0b\x32\x1e.openengine.v1.EncoderCacheRef\x12\x13\n\x0b\x64\x65stination\x18\x02 \x01(\x0c\"\x1e\n\x1cTransferEncoderCacheResponse2\x84\x01\n\x0f\x45ncoderTransfer\x12q\n\x08Transfer\x12\x31.trtllm.openengine.v1.TransferEncoderCacheRequest\x1a\x32.trtllm.openengine.v1.TransferEncoderCacheResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n+trtllm/openengine/v1/encoder_transfer.proto\x12\x14trtllm.openengine.v1\x1a\x1eopenengine/v1/generation.proto\"c\n\x1bTransferEncoderCacheRequest\x12/\n\x05\x63\x61\x63he\x18\x01 \x01(\x0b\x32 .openengine.v1.EncoderHandoffRef\x12\x13\n\x0b\x64\x65stination\x18\x02 \x01(\x0c\"\x1e\n\x1cTransferEncoderCacheResponse2\x84\x01\n\x0f\x45ncoderTransfer\x12q\n\x08Transfer\x12\x31.trtllm.openengine.v1.TransferEncoderCacheRequest\x1a\x32.trtllm.openengine.v1.TransferEncoderCacheResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -36,9 +36,9 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'tensorrt_llm.grpc.openengin
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_TRANSFERENCODERCACHEREQUEST']._serialized_start=101
-  _globals['_TRANSFERENCODERCACHEREQUEST']._serialized_end=198
-  _globals['_TRANSFERENCODERCACHERESPONSE']._serialized_start=200
-  _globals['_TRANSFERENCODERCACHERESPONSE']._serialized_end=230
-  _globals['_ENCODERTRANSFER']._serialized_start=233
-  _globals['_ENCODERTRANSFER']._serialized_end=365
+  _globals['_TRANSFERENCODERCACHEREQUEST']._serialized_end=200
+  _globals['_TRANSFERENCODERCACHERESPONSE']._serialized_start=202
+  _globals['_TRANSFERENCODERCACHERESPONSE']._serialized_end=232
+  _globals['_ENCODERTRANSFER']._serialized_start=235
+  _globals['_ENCODERTRANSFER']._serialized_end=367
 # @@protoc_insertion_point(module_scope)

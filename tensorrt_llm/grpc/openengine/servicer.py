@@ -515,7 +515,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                         def prepare_encoder_input() -> Any:
                             nonlocal disaggregated_params
                             inputs, disaggregated_params = self._encoder_cache.prepare(
-                                request.encoder.cache,
+                                request.encoder.handoff,
                                 request,
                                 self._llm,
                                 sampling_params,
@@ -775,7 +775,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                             responses.append(
                                 generation_pb2.GenerateResponse(
                                     request_id=request_id,
-                                    encoder_ready=generation_pb2.EncoderReady(cache=cache),
+                                    encode_ready=generation_pb2.EncodeReady(handoff=cache),
                                 )
                             )
                             publication.transfer()

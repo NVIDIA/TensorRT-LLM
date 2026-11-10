@@ -610,7 +610,7 @@ def test_receiver_quota_and_dtype_validation_precede_allocation(pair):
     ref = producer.publish(native_result()[0], request(), llm)
     state = json.loads(ref.opaque_state)
     state["metadata"]["tensors"][0]["shape"] = [2**30]
-    oversized = pb.EncoderCacheRef(
+    oversized = pb.EncoderHandoffRef(
         transfer_backend=transport.BACKEND, opaque_state=json.dumps(state).encode()
     )
     with pytest.raises(ValueError, match="memory limit"):
@@ -751,7 +751,7 @@ def test_native_nixl_between_separate_processes():
         assert producer_pid != os.getpid()
         consumer = transport.NixlEncoderCache("", "a" * 40, device="cpu")
         llm, seen = model()
-        consumer.prepare(pb.EncoderCacheRef.FromString(wire), request(), llm, None)
+        consumer.prepare(pb.EncoderHandoffRef.FromString(wire), request(), llm, None)
         expected = [
             torch.arange(8, dtype=torch.float32).reshape(2, 4),
             torch.arange(6, dtype=torch.int64).reshape(3, 1, 2),

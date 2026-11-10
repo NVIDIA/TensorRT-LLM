@@ -36,6 +36,7 @@ message KvConnectorInfo {
   optional bool supports_remote_prefill = 5;
   optional bool supports_decode_pull = 6;
   optional bool supports_abort_cleanup = 7;
+  // Changes only for incompatible contract semantics, not compatible additions.
   optional uint32 schema_version = 8;
 }
 

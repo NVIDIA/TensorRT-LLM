@@ -15,7 +15,7 @@ service EncoderTransfer {
 }
 
 message TransferEncoderCacheRequest {
-  .openengine.v1.EncoderCacheRef cache = 1;
+  .openengine.v1.EncoderHandoffRef cache = 1;
   bytes destination = 2;
 }
 

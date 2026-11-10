@@ -348,7 +348,7 @@ For disaggregated subagent context requests, configure `internal_request_auth_ke
 
 ## Image encoder handoff (experimental)
 
-Image E+PD and E+P+D use the `EncoderOptions` / `EncoderReady` contract proposed in
+Image E+PD and E+P+D use the `EncoderOptions` / `EncodeReady` contract proposed in
 [OpenEngine #35](https://github.com/ai-dynamo/openengine/pull/35), pinned to an
 immutable source revision in the vendor lock. Both client and server need the
 matching bindings; this proposal is not in a published BSR release or runtime.
@@ -359,14 +359,14 @@ immutable checkpoint revision and processor configuration on every engine.
 
 | Topology | Encoder | Language engines | Handoffs |
 | --- | --- | --- | --- |
-| E+PD | `mm_encoder_only: true` | One combined engine with `disable_mm_encoder: true` | Encoder cache to PD |
-| E+P+D | `mm_encoder_only: true` | Separate prefill and decode engines, both with `disable_mm_encoder: true` | Encoder cache to P; KV session and prepared decode metadata from P to D |
+| E+PD | `mm_encoder_only: true` | One combined engine with `disable_mm_encoder: true` | Encoder handoff to PD |
+| E+P+D | `mm_encoder_only: true` | Separate prefill and decode engines, both with `disable_mm_encoder: true` | Encoder handoff to P; KV session and prepared decode metadata from P to D |
 
 For E+P+D, configure a compatible native `cache_transceiver_config` on both P and
 D, independently of the encoder transfer backend. The prefill request sets
-`extra.request_type = "context_only"` and consumes the encoder cache. The decode
+`extra.request_type = "context_only"` and consumes the encoder handoff. The decode
 request carries the resulting `kv.session`, preserves the original prompt/media
-identity, and omits `encoder.cache`; an encoder reference must not be consumed
+identity, and omits `encoder.handoff`; an encoder reference must not be consumed
 twice. Decode reuses the expanded tokens and portable model state from prefill
 without fetching media or running the vision encoder.
 
@@ -379,11 +379,15 @@ Image E+PD and E+P+D have been manually validated with Qwen3-VL-2B across GPU
 hosts using matching source overlays. Focused CPU checks cover the final rebased
 branch; GPU validation of that branch has not been repeated.
 
-`ModelInfo.encoder` advertises the schema version, encoder-only or cache-consumer
-role, supported transfer backends, typed abort cleanup support and mandatory-cache
-policy. Producers advertise one backend; consumers may accept multiple. Encoder-only requests set
-`encoder.encode_only` and terminate with `EncoderReady`. The downstream request
-retains the original prompt and media identities and supplies `encoder.cache`
+`ModelInfo.encoder` advertises the schema version, encoder-only or handoff-consumer
+role, supported transfer backends, typed abort cleanup support and mandatory-handoff
+policy. Producers report a singular `transfer_backend`; consumers list
+`supported_transfer_backends`. Encoder-only requests set the `encode_only`
+message in `EncoderOptions.mode` and terminate with `EncodeReady` without usage;
+the consumer reports the expanded prompt and generation usage. Encoding rejects
+nonempty sampling, stopping, guided-decoding and response options, and LoRA
+selection. The downstream request repeats the same prompt or ordered token IDs
+and field-equal ordered media items and supplies `encoder.handoff`
 to PD or P; it does not fetch the image or run its own vision encoder. Text-only
 requests can bypass the encoder.
 

@@ -213,7 +213,7 @@ def test_openengine_server_serves_the_control_contract() -> None:
                 transfer=lambda cache, destination: transfers.append((cache, destination)),
                 close=lambda: None,
             )
-            reference = generation_pb2.EncoderCacheRef(
+            reference = generation_pb2.EncoderHandoffRef(
                 transfer_backend="test-encoder", opaque_state=b"reference"
             )
             peer = encoder_transfer_pb2_grpc.EncoderTransferStub(channel)

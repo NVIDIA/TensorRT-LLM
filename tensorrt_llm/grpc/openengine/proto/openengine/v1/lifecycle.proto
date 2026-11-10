@@ -50,7 +50,7 @@ message AbortRequest {
     AllRequests all_requests = 3;
     // Release an unclaimed single-use encoder export at its producer. This never
     // interrupts a claimed transfer or releases buffers still in use by it.
-    EncoderCacheRef encoder_cache = 4;
+    EncoderHandoffRef encoder_handoff = 4;
   }
 }
 

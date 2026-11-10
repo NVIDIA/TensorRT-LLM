@@ -302,18 +302,20 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         info.extra.update({"trtllm_supported_modalities": sorted(media_modalities)})
         role = getattr(self._inference, "encoder_role", "")
         if role:
+            backend = (
+                ""
+                if getattr(self._inference._encoder_cache, "failed", False)
+                else self._inference._encoder_cache.backend
+            )
             info.encoder.CopyFrom(
                 model_pb2.EncoderCapabilities(
                     schema_version=1,
                     encoder_only=role == "encode",
-                    accepts_cache=role == "consume",
-                    transfer_backends=(
-                        []
-                        if getattr(self._inference._encoder_cache, "failed", False)
-                        else [self._inference._encoder_cache.backend]
-                    ),
+                    accepts_handoff=role == "consume",
+                    supported_transfer_backends=[backend] if role == "consume" and backend else [],
+                    transfer_backend=backend if role == "encode" else None,
                     supports_abort_cleanup=role == "encode",
-                    requires_cache=role == "consume",
+                    requires_handoff=role == "consume",
                 )
             )
         if supports_image_routing(self._llm, media_modalities):
@@ -582,13 +584,13 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
     ) -> lifecycle_pb2.AbortResponse:
         target = request.WhichOneof("target")
 
-        if target == "encoder_cache":
+        if target == "encoder_handoff":
             cache = getattr(self._inference, "_encoder_cache", None)
             discard = getattr(cache, "discard", None)
             if discard is None or getattr(self._inference, "encoder_role", "") != "encode":
                 await context.abort(grpc.StatusCode.UNIMPLEMENTED, "encoder release is not enabled")
                 return
-            task = asyncio.create_task(asyncio.to_thread(discard, request.encoder_cache))
+            task = asyncio.create_task(asyncio.to_thread(discard, request.encoder_handoff))
             cleanup_tasks = getattr(self._inference, "_encoder_cleanup_tasks", None)
             if cleanup_tasks is not None:
                 cleanup_tasks.add(task)

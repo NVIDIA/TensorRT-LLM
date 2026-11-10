@@ -227,7 +227,7 @@ class NixlEncoderCache:
                 state = _encode(
                     {"version": 1, "endpoint": self.endpoint, "id": identity, "metadata": metadata}
                 )
-                reference = pb.EncoderCacheRef(transfer_backend=BACKEND, opaque_state=state)
+                reference = pb.EncoderHandoffRef(transfer_backend=BACKEND, opaque_state=state)
                 with self._lock:
                     self._healthy()
                     self._exports[identity] = _Export(tensors, metadata, time.monotonic(), total)

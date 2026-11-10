@@ -283,7 +283,7 @@ async def test_cancelled_encode_reclaims_native_exports(tmp_path, monkeypatch):
     context = FakeServicerContext()
     context.is_cancelled = True
     req = request()
-    req.encoder.encode_only = True
+    req.encoder.encode_only.SetInParent()
     inference = servicer.OpenEngineInferenceServicer(llm, "qwen")
     assert [value async for value in inference.Generate(req, context)] == []
     assert handle.aborted
@@ -308,12 +308,24 @@ async def test_encoder_capability_discovery_is_typed_and_role_specific(role, bac
     if role:
         assert info.encoder.schema_version == 1
         assert info.encoder.encoder_only is (role == "encode")
-        assert info.encoder.accepts_cache is (role == "consume")
+        assert info.encoder.accepts_handoff is (role == "consume")
         assert info.encoder.supports_abort_cleanup is (role == "encode")
-        assert info.encoder.requires_cache is (role == "consume")
+        assert info.encoder.requires_handoff is (role == "consume")
         assert "trtllm_encoder_cache_release" not in info.extra
         assert "trtllm_requires_encoder_cache" not in info.extra
-        assert list(info.encoder.transfer_backends) == [backend]
+        assert info.encoder.HasField("transfer_backend") is (role == "encode")
+        assert info.encoder.transfer_backend == (backend if role == "encode" else "")
+        assert list(info.encoder.supported_transfer_backends) == (
+            [backend] if role == "consume" else []
+        )
+        for name in (
+            "schema_version",
+            "encoder_only",
+            "accepts_handoff",
+            "supports_abort_cleanup",
+            "requires_handoff",
+        ):
+            assert info.encoder.HasField(name)
     if role == "encode":
         assert info.generation.output_logprobs.supported is False
         assert info.generation.guided_decoding.supported is False
@@ -375,7 +387,7 @@ async def test_cancel_during_publish_reclaims_the_completed_cache(tmp_path, monk
     monkeypatch.setattr(inference._encoder_cache, "publish", delayed_publish)
     monkeypatch.setattr(inference._encoder_cache, "discard", record_discard)
     req = request()
-    req.encoder.encode_only = True
+    req.encoder.encode_only.SetInParent()
 
     async def consume():
         return [value async for value in inference.Generate(req, FakeServicerContext())]

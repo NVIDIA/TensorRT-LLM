@@ -12,9 +12,9 @@ class TransferEncoderCacheRequest(_message.Message):
     __slots__ = ("cache", "destination")
     CACHE_FIELD_NUMBER: _ClassVar[int]
     DESTINATION_FIELD_NUMBER: _ClassVar[int]
-    cache: _generation_pb2.EncoderCacheRef
+    cache: _generation_pb2.EncoderHandoffRef
     destination: bytes
-    def __init__(self, cache: _Optional[_Union[_generation_pb2.EncoderCacheRef, _Mapping]] = ..., destination: _Optional[bytes] = ...) -> None: ...
+    def __init__(self, cache: _Optional[_Union[_generation_pb2.EncoderHandoffRef, _Mapping]] = ..., destination: _Optional[bytes] = ...) -> None: ...
 
 class TransferEncoderCacheResponse(_message.Message):
     __slots__ = ()

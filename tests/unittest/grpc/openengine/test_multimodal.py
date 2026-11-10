@@ -2661,13 +2661,14 @@ async def test_image_e_pd_over_grpc_uses_encoder_cache_without_downstream_fetch(
             media=[
                 generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image")
             ],
-            encoder=generation_pb2.EncoderOptions(encode_only=True),
+            encoder=generation_pb2.EncoderOptions(encode_only=generation_pb2.EncodeOnly()),
         )
         responses = [value async for value in clients[0].Generate(request, timeout=10)]
-        assert [value.WhichOneof("event") for value in responses] == ["encoder_ready"]
+        assert [value.WhichOneof("event") for value in responses] == ["encode_ready"]
+        assert not responses[0].HasField("usage")
         request.request_id = "pd"
         request.encoder.CopyFrom(
-            generation_pb2.EncoderOptions(cache=responses[0].encoder_ready.cache)
+            generation_pb2.EncoderOptions(handoff=responses[0].encode_ready.handoff)
         )
         if request_type:
             request.extra.update({"request_type": request_type})
@@ -2746,7 +2747,9 @@ async def test_encoder_prefill_rejects_unusable_decode_state_and_reclaims_inputs
             generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image")
         ],
         encoder=generation_pb2.EncoderOptions(
-            cache=generation_pb2.EncoderCacheRef(transfer_backend="unused", opaque_state=b"cache")
+            handoff=generation_pb2.EncoderHandoffRef(
+                transfer_backend="unused", opaque_state=b"cache"
+            )
         ),
         extra={"request_type": "context_only"},
     )
