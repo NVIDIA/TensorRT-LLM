@@ -869,6 +869,11 @@ class TestClaudeBackendCreateClient:
         options = await self._capture_options(monkeypatch)
         assert options.permission_mode is None
 
+    async def test_create_client_reads_large_cli_messages(self, monkeypatch):
+        # A tool result is one stream-json message; the SDK default (1 MiB) ends the turn.
+        options = await self._capture_options(monkeypatch)
+        assert options.max_buffer_size == cc_mod.CLI_MESSAGE_BUFFER_BYTES >= 64 << 20
+
     async def test_create_client_omits_shadowed_permission_callback(self, monkeypatch):
         # No tool-permission callback is installed to auto-approve native requests.
         options = await self._capture_options(monkeypatch)

@@ -383,6 +383,11 @@ def _claude_sdk_version() -> str:
         return ""
 
 
+#: The largest stream-json message read from the CLI. A tool result arrives as one message,
+#: and a turn ends with ``CLIJSONDecodeError`` past this size.
+CLI_MESSAGE_BUFFER_BYTES = 64 * 1024 * 1024
+
+
 #: A ``claude`` binary every layer launches instead of the SDK's own choice.
 CLI_PATH_ENV = "AGENT_FLOW_CLAUDE_CLI"
 
@@ -664,6 +669,9 @@ class ClaudeCodeBackend(Backend):
             # CLI finds that session by id and writes the fork under its own cwd.
             resume=fork_from,
             fork_session=fork_from is not None,
+            # One stream-json message carries a whole tool result; the SDK's 1 MiB
+            # default ends the turn on a large file read or command output.
+            max_buffer_size=CLI_MESSAGE_BUFFER_BYTES,
         )
 
         async with ClaudeSDKClient(options=options) as sdk_client:
