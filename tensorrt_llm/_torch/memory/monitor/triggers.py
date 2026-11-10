@@ -550,14 +550,27 @@ def install_oom_reporter(rank: int | None = None, device: int | None = None) -> 
 
     if device is None and torch.cuda.is_available():
         device = torch.cuda.current_device()
+    previous_device = _device
     _device = device
     _armed_count += 1
     # Armed even if torch's observer cannot be attached: errors from outside
     # the PyTorch allocator still arrive through notify_error.
     _enabled_flag = True
-    _install_error_hooks()
-    if full_mode(rank):
-        _start_periodic(rank, device)
+    try:
+        _install_error_hooks()
+        if full_mode(rank):
+            _start_periodic(rank, device)
+    except RuntimeError as exc:
+        # A diagnostic must not fail the executor it serves: undo this arming
+        # (another executor's stays) and report that it is off.
+        _armed_count -= 1
+        _device = previous_device
+        if _armed_count == 0:
+            _enabled_flag = False
+            _remove_error_hooks()
+            _stop_periodic()
+        logger.warning(f"memory monitor: could not arm out-of-memory reporting ({exc})")
+        return False
     if _attached:
         return True
 

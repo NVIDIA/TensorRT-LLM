@@ -66,9 +66,11 @@ def _fail_every(monkeypatch, nth: int) -> None:
 
     def flaky(handle):
         calls["n"] += 1
+        # Release for real either way, so the test leaks no device memory.
+        result = real(handle)
         if calls["n"] % nth == 0:
             raise RuntimeError("synthetic release failure")
-        return real(handle)
+        return result
 
     monkeypatch.setattr(mod, "release_handle", flaky)
 

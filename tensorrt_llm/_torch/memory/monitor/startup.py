@@ -52,6 +52,8 @@ from typing import Iterator
 
 import torch
 
+from tensorrt_llm.logger import logger
+
 from .capability import nvml_process_usage
 from .providers import collect_all
 from .schema import GIB, Group, Placement
@@ -172,12 +174,19 @@ def _known_outside_torch() -> int:
 
 
 def _reading() -> Reading | None:
-    process = _process_used()
-    if process is None:
-        return None
+    """This process's memory now, or ``None`` if it cannot be read.
+
+    Runs on failure paths (a failed step, the end of a region whose code
+    raised), so a failure here -- after a sticky CUDA error, say -- must
+    not replace the error being handled.
+    """
     try:
+        process = _process_used()
+        if process is None:
+            return None
         return Reading(process, torch.cuda.memory_reserved(), _known_outside_torch())
-    except RuntimeError:
+    except Exception as exc:  # diagnostic boundary: never replace the caller's error
+        logger.debug(f"memory monitor: no process reading ({type(exc).__name__}: {exc})")
         return None
 
 

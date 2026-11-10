@@ -58,8 +58,13 @@ class _AllReduce(torch.nn.Module):
 def test_symm_mem_walks_the_claimed_model_and_counts_shared_buffers_once():
     assert SymmMemProvider().available() is False, "no claimed model, nothing to walk"
 
-    tagging.claim_module_memory(torch.nn.Sequential(_AllReduce(None)), "WEIGHTS")
+    # Claims are weak: keep the model alive, or the provider would find no
+    # claimed model rather than one without symmetric memory.
+    unused = torch.nn.Sequential(_AllReduce(None))
+    tagging.claim_module_memory(unused, "WEIGHTS")
+    assert SymmMemProvider().available(), "the claimed model is walked"
     assert SymmMemProvider().collect() == [], "symmetric memory not in use"
+    del unused
     tagging.clear_claims()
 
     shared = _SymmInstance(8 * MB)

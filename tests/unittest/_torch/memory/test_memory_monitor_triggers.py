@@ -565,3 +565,32 @@ def test_executor_error_handler_passes_its_message_on(monkeypatch):
     except Exception:  # only the first statement matters here
         pass
     assert seen == ["CUDA error: out of memory"]
+
+
+@pytest.mark.cpu_only
+def test_a_failed_arming_is_undone_and_leaves_other_executors_armed(monkeypatch):
+    from tensorrt_llm._torch.memory.monitor import triggers
+
+    monkeypatch.setattr(triggers, "_attached", True)  # leave torch's observer alone
+    monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
+    monkeypatch.setenv(triggers.PERIODIC_INTERVAL_VAR, "60")
+    hooks_before = triggers._previous_thread_hook
+
+    def no_threads(*_args, **_kwargs):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(triggers, "_start_periodic", no_threads)
+    assert install_oom_reporter(rank=0) is False, "a failed arming reports reporting as off"
+    assert triggers._armed_count == 0 and triggers._enabled_flag is False
+    assert triggers._previous_thread_hook is hooks_before, "its hooks are removed again"
+
+    monkeypatch.delenv(triggers.PERIODIC_INTERVAL_VAR)
+    monkeypatch.undo()
+    monkeypatch.setattr(triggers, "_attached", True)
+    monkeypatch.setenv("TLLM_MEM_MONITOR", "oom")
+    assert install_oom_reporter(rank=0) is True
+    monkeypatch.setenv("TLLM_MEM_MONITOR", "1")
+    monkeypatch.setattr(triggers, "_start_periodic", no_threads)
+    assert install_oom_reporter(rank=0) is False
+    assert triggers._armed_count == 1 and triggers._enabled_flag, "the first executor stays armed"
+    release_oom_reporter()
