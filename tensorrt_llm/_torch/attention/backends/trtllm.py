@@ -768,6 +768,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         state = self.fp4_mla_state
         return None if state is None else state.kv_regime_max_kv
 
+    def set_decode_packed_split(self, packed_split: Optional[bool]) -> None:
+        # The FP4 MLA packed decode launches its split budget only when True.
+        state = self.fp4_mla_state
+        if state is not None:
+            state.packed_split = packed_split
+
+    @property
+    def decode_packed_split(self) -> Optional[bool]:
+        state = self.fp4_mla_state
+        return None if state is None else state.packed_split
+
     def _invalidate_mla_scheduler_buffers(self) -> None:
         # Spec-dec rewrites q_lens and kv_lens between sub-steps, so the cumulative
         # buffers below must be rebuilt before the next MLA layer reads them.

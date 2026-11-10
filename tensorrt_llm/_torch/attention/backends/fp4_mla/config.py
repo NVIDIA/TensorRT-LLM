@@ -150,6 +150,17 @@ def _fp4_mla_packed_wave_plan_enabled() -> bool:
     return _env_enabled_default(FP4_MLA_PACKED_WAVE_PLAN_ENV, False)
 
 
+# Packed decode launches its split budget (grid.z slots past one per request) only for steps whose balanced
+# plan splits a request; an even step launches one task per request, without plan, reduction or empty slots.
+# Decode graphs are keyed by that decision (packed_plan.packed_split_variants). 0 restores the budget always.
+FP4_MLA_SPLIT_ON_DEMAND_ENV = "TRTLLM_FP4_MLA_SPLIT_ON_DEMAND"
+
+
+def _fp4_mla_split_on_demand_enabled() -> bool:
+    """Whether the packed decode launches its split budget only for steps that split (default on)."""
+    return _env_enabled_default(FP4_MLA_SPLIT_ON_DEMAND_ENV, True)
+
+
 def _fp4_mla_cutedsl_4x_enabled() -> bool:
     """Whether the 4x kernel may replace the packed 2x decode inside its envelope (default off)."""
     return _env_enabled_default(FP4_MLA_CUTEDSL_4X_ENV, False)

@@ -1906,6 +1906,43 @@ def test_fp4_mla_decode_kv_regime_stays_on_the_graph_metadata(monkeypatch) -> No
         manager.shutdown()
 
 
+def test_fp4_mla_decode_packed_split_stays_on_the_graph_metadata(monkeypatch) -> None:
+    """A split-keyed CUDA graph fixes the packed split decision of its own metadata only.
+
+    Eager steps keep deciding per call on their host KV lengths.
+    """
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    manager = _create_fp4_mla_v2_manager(
+        max_tokens=1024,
+        max_seq_len=512,
+        max_batch_size=2,
+        spec_config=MTPDecodingConfig(max_draft_len=3, num_nextn_predict_layers=1),
+    )
+    try:
+        metadata = trtllm_backend.TrtllmAttentionMetadata(
+            max_num_requests=2,
+            max_num_tokens=1024,
+            kv_cache_manager=manager,
+            mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        )
+        graph_metadata = metadata.create_cuda_graph_metadata(2, False, 3)
+        eager_state = metadata.fp4_mla_state
+        graph_state = graph_metadata.fp4_mla_state
+        assert eager_state is not None and graph_state is not None
+        assert graph_state is not eager_state
+
+        graph_metadata.set_decode_packed_split(False)
+        assert graph_metadata.decode_packed_split is False
+        assert graph_state.packed_split is False
+        assert metadata.decode_packed_split is None
+        assert eager_state.packed_split is None
+
+        graph_metadata.set_decode_packed_split(None)
+        assert graph_metadata.decode_packed_split is None
+    finally:
+        manager.shutdown()
+
+
 def _create_fp4_mla_v2_manager(
     *,
     max_tokens: int,

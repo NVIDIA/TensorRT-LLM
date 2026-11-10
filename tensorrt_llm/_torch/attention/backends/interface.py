@@ -581,6 +581,23 @@ class AttentionMetadata:
         """The KV regime set by ``set_decode_kv_regime``; None when unset or ignored."""
         return None
 
+    def set_decode_packed_split(self, packed_split: Optional[bool]) -> None:
+        """Fix whether the decode launches its KV split budget.
+
+        A CUDA graph runner that keys its decode graphs by the split
+        decision passes the decision of the graph this metadata serves.
+
+        Args:
+            packed_split: True launches the split budget, False one task
+                per request; None restores the per-call decision. Backends
+                without a split decode ignore it.
+        """
+
+    @property
+    def decode_packed_split(self) -> Optional[bool]:
+        """The decision set by ``set_decode_packed_split``; None when unset or ignored."""
+        return None
+
     def prepare_for_spec_dec(self, *fields) -> None:
         assert len(self._saved_tensors) == 0, (
             "prepare_for_spec_dec called while fields "

@@ -53,6 +53,11 @@ class Fp4MlaState:
     # (fp4_mla_dispatch.kv_regimes_for_batch). None (eager metadata, graphs without regimes): decide on the
     # page-table capacity.
     kv_regime_max_kv: int | None = None
+    # Split decision of the packed decode this CUDA graph metadata serves, set through set_decode_packed_split by a
+    # graph runner that keys its decode graphs by it (packed_plan.packed_split_variants): True launches the split
+    # budget, False one task per request. None (eager metadata, graphs without it): decide per call
+    # (packed_plan._on_demand_split_count).
+    packed_split: bool | None = None
     generation_cache_scattered: bool = False
     device_page_table: bool = False
     device_page_table_valid: bool = False

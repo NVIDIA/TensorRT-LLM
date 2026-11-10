@@ -14,7 +14,7 @@ import torch
 from _torch.pyexecutor.engine.runners.decoder.utils import decoder_config, decoder_graphs
 from _torch.pyexecutor.engine_test_utils import _create_request_with_tokens, _make_request_stub
 
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, PackedSplitResolver
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import (
     DecoderCudaGraphs,
     _kv_regime_length_passes,
@@ -421,6 +421,120 @@ def test_generation_capture_runs_one_pass_per_kv_regime() -> None:
     assert warmup_lengths == [20000, 16384, 8192, 20000]
     pinned = [c.args[0] for c in graph_runner.set_capture_kv_regime.call_args_list]
     assert pinned == [20096, 16384, 8192, 20096, None]
+
+
+@pytest.mark.cpu_only
+def test_generation_capture_runs_one_pass_per_packed_split_variant() -> None:
+    runner = decoder_graphs(
+        decoder_config(max_seq_len=20000),
+        cuda_graph_runner=Mock(
+            enabled=True, is_warmup_only=False, short_long_seq_len_threshold=None
+        ),
+    )
+    resource_manager = Mock()
+    warmups = []
+
+    def create_request(
+        resources: ResourceManager,
+        batch_size: int,
+        draft_len: int,
+        max_seq_len: int,
+        **kwargs: object,
+    ) -> ScheduledRequests:
+        warmups.append((batch_size, max_seq_len))
+        return ScheduledRequests()
+
+    resolver = PackedSplitResolver(
+        variants=lambda batch_size, draft_len: (False, True) if batch_size == 2 else (True,),
+        decide=lambda batch_size, draft_len, kv_lens: True,
+    )
+
+    with (
+        patch.object(runner, "_kv_regime_resolver", return_value=None),
+        patch.object(runner, "_packed_split_resolver", return_value=resolver),
+        patch.object(runner, "_get_graphs_to_capture", return_value=[(2, 0), (1, 0)]),
+        patch.object(
+            runner._dummy_requests, "create_cuda_graph_warmup_request", side_effect=create_request
+        ),
+        patch.object(
+            runner._dummy_requests,
+            "release_batch_context",
+            side_effect=lambda request, resources: contextlib.nullcontext(request),
+        ),
+        patch.object(runner, "_forward_warmup", Mock()),
+        patch.object(torch.cuda, "synchronize"),
+    ):
+        runner._capture_generation_cuda_graphs(resource_manager)
+
+    graph_runner = runner.cuda_graph_runner
+    graph_runner.set_packed_split_resolver.assert_called_once_with(resolver)
+    graph_runner.set_capture_kv_regime.assert_not_called()
+    # one pass per decision of the shape; a shape with the split graph alone runs one pass
+    assert warmups == [(2, 20000), (2, 20000), (1, 20000)]
+    pinned = [c.args[0] for c in graph_runner.set_capture_packed_split.call_args_list]
+    assert pinned == [False, True, True, None]
+
+
+@pytest.mark.cpu_only
+def test_packed_split_resolver_resolves_only_for_the_fp4_mla_packed_decode(monkeypatch) -> None:
+    from tensorrt_llm._torch.attention.mla import MLA
+
+    monkeypatch.delenv("TRTLLM_FP4_MLA_SPLIT_KV", raising=False)
+    mla_layer = Mock(spec=MLA)
+    mla_layer.num_heads_tp = 128
+    model = Mock()
+    model.modules.return_value = [torch.nn.Identity(), mla_layer, mla_layer]
+    runner = decoder_graphs(decoder_config(), model=model)
+    fp4_kv_cache_manager = Mock(spec=["max_blocks_per_seq", "get_fp4_mla_page_table_spec"])
+    resource_manager = Mock()
+    config_module = "tensorrt_llm._torch.attention.backends.fp4_mla.config"
+
+    # a KV cache without the FP4 MLA page table (every other model) resolves nothing and never
+    # probes the FP4 MLA switches
+    resource_manager.get_resource_manager.return_value = Mock(spec=["max_blocks_per_seq"])
+    with patch(f"{config_module}._fp4_mla_split_on_demand_enabled", return_value=True) as enabled:
+        assert runner._packed_split_resolver(resource_manager) is None
+    enabled.assert_not_called()
+    resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
+
+    # TRTLLM_FP4_MLA_SPLIT_ON_DEMAND=0 resolves nothing
+    with patch(f"{config_module}._fp4_mla_split_on_demand_enabled", return_value=False):
+        assert runner._packed_split_resolver(resource_manager) is None
+
+    with (
+        patch(f"{config_module}._fp4_mla_split_on_demand_enabled", return_value=True),
+        patch(f"{config_module}._fp4_mla_packed_q_enabled", return_value=True),
+        patch.object(runner, "_decode_sm_count", return_value=212),
+    ):
+        resolver = runner._packed_split_resolver(resource_manager)
+        # q = 4 (4 m-tiles, 26 tasks per wave): an unsplit graph from 18 requests; q = 1 from 71
+        assert resolver.variants(128, 3) == (False, True)
+        assert resolver.variants(16, 3) == (True,)
+        assert resolver.variants(106, 0) == (False, True)
+        assert resolver.variants(70, 0) == (True,)
+        # the step decides on its rows' KV lengths through the plan mirror (tested with the plan)
+        from tensorrt_llm._torch.attention.backends.fp4_mla import packed_plan
+
+        with patch.object(packed_plan, "packed_split_needed", return_value=False) as needed:
+            assert resolver.decide(32, 3, [2048] * 32) is False
+        needed.assert_called_once_with([2048] * 32, query_len=4, m_tiles=4, sm_count=212)
+        # a fixed TRTLLM_FP4_MLA_SPLIT_KV keeps the budget: nothing to key by
+        monkeypatch.setenv("TRTLLM_FP4_MLA_SPLIT_KV", "3")
+        assert runner._packed_split_resolver(resource_manager) is None
+        monkeypatch.delenv("TRTLLM_FP4_MLA_SPLIT_KV")
+        # Helix keeps its split budget: nothing to key by
+        with patch.object(runner.mapping, "has_cp_helix", return_value=True):
+            assert runner._packed_split_resolver(resource_manager) is None
+        # a model without MLA layers has no FP4 MLA decode to key by
+        model.modules.return_value = [torch.nn.Identity()]
+        assert runner._packed_split_resolver(resource_manager) is None
+        model.modules.return_value = [mla_layer]
+    # the decision only exists behind the packed-Q cutedsl decode
+    with (
+        patch(f"{config_module}._fp4_mla_split_on_demand_enabled", return_value=True),
+        patch(f"{config_module}._fp4_mla_packed_q_enabled", return_value=False),
+    ):
+        assert runner._packed_split_resolver(resource_manager) is None
 
 
 @pytest.mark.cpu_only

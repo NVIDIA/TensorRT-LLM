@@ -26,7 +26,11 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.config_utils import is_decode_only
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, KeyType
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
+    CUDAGraphRunner,
+    KeyType,
+    PackedSplitResolver,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -844,6 +848,76 @@ class DecoderCudaGraphs:
 
         return resolver
 
+    def _packed_split_resolver(
+        self, resource_manager: ResourceManager
+    ) -> PackedSplitResolver | None:
+        """Packed split decisions the decode graphs are keyed by; None for every decode but the FP4 MLA packed one.
+
+        The FP4 MLA packed decode launches its KV split budget only for steps
+        whose balanced plan splits a request (``TRTLLM_FP4_MLA_SPLIT_ON_DEMAND``,
+        default on). A shape that fills two thirds of a 2-CTA wave captures an
+        unsplit and a split graph, a smaller one the split graph alone
+        (``packed_plan.packed_split_variants``); each step replays the graph of
+        its decision (``packed_plan.packed_split_needed``), agreed across
+        attention-DP ranks by the graph runner.
+        """
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        if not callable(getattr(kv_cache_manager, "get_fp4_mla_page_table_spec", None)):
+            return None
+        from tensorrt_llm._torch.attention.backends.fp4_mla import packed_plan
+        from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
+            _FP4_MLA_SPLIT_KV_ENV,
+            FP4_MLA_SCALE_ROW_GROUP,
+            _fp4_mla_packed_q_enabled,
+            _fp4_mla_packed_rows_per_seq,
+            _fp4_mla_split_on_demand_enabled,
+        )
+
+        # The decision only exists for the packed decode outside Helix (which
+        # keeps its split budget) and without a fixed split override. The
+        # environment and topology come first, then the model; the packed-Q
+        # check, which probes the device, last.
+        if not _fp4_mla_split_on_demand_enabled():
+            return None
+        if os.getenv(_FP4_MLA_SPLIT_KV_ENV, "auto") != "auto":
+            return None
+        if self.mapping.has_cp_helix():
+            return None
+        num_heads = self._fp4_mla_decode_heads()
+        if num_heads is None:
+            return None
+        if not _fp4_mla_packed_q_enabled():
+            return None
+        sm_count = self._decode_sm_count()
+
+        @functools.cache
+        def m_tiles(draft_len: int) -> int:
+            rows = _fp4_mla_packed_rows_per_seq(num_heads, int(draft_len) + 1)
+            return rows // FP4_MLA_SCALE_ROW_GROUP
+
+        @functools.cache
+        def variants(batch_size: int, draft_len: int) -> tuple[bool, ...]:
+            tiles = m_tiles(draft_len)
+            if tiles <= 0:
+                # No packed decode for this query width: one family.
+                return (True,)
+            return packed_plan.packed_split_variants(
+                int(batch_size), m_tiles=tiles, sm_count=sm_count
+            )
+
+        def decide(batch_size: int, draft_len: int, kv_lens: list[int]) -> bool:
+            del batch_size  # the step's rows are kv_lens
+            tiles = m_tiles(draft_len)
+            if tiles <= 0:
+                return True
+            return packed_plan.packed_split_needed(
+                kv_lens, query_len=int(draft_len) + 1, m_tiles=tiles, sm_count=sm_count
+            )
+
+        return PackedSplitResolver(variants=variants, decide=decide)
+
     def _capture_generation_cuda_graphs(self, resource_manager: ResourceManager) -> None:
         """Warm up or capture pure-generation CUDA graph shapes."""
         if not self.cuda_graph_runner.enabled:
@@ -911,6 +985,41 @@ class DecoderCudaGraphs:
                 f"{len(shapes)} generation graph shapes, {len(max_seq_len_list)} warm-up length(s) each."
             )
 
+        # Without a resolver (every decode but the FP4 MLA packed one with the
+        # on-demand split budget) the capture leaves the split state alone.
+        packed_split_resolver = self._packed_split_resolver(resource_manager)
+        if packed_split_resolver is not None:
+            self.cuda_graph_runner.set_packed_split_resolver(packed_split_resolver)
+            split_shapes = sorted(
+                {
+                    entry[:2]
+                    for entry in graphs_to_capture
+                    if entry[0] <= self._config.max_batch_size
+                }
+            )
+            unsplit_shapes = sum(
+                1
+                for bs, draft_len in split_shapes
+                if False in packed_split_resolver.variants(bs, draft_len)
+            )
+            logger.info(
+                f"FP4 MLA decode graphs keyed by the packed split decision: {unsplit_shapes} of "
+                f"{len(split_shapes)} generation graph shapes add an unsplit graph."
+            )
+
+        def _capture_passes(bs: int, draft_len: int) -> list[tuple[int, int | None, bool | None]]:
+            """(warm-up length, KV regime, packed split decision) passes of one graph shape."""
+            decisions = (
+                (None,)
+                if packed_split_resolver is None
+                else packed_split_resolver.variants(bs, draft_len)
+            )
+            return [
+                (max_seq_len, kv_regime, decision)
+                for max_seq_len, kv_regime in _length_passes(bs, draft_len)
+                for decision in decisions
+            ]
+
         def _run_capture_pass(
             force_non_greedy: bool,
             label: str,
@@ -934,9 +1043,11 @@ class DecoderCudaGraphs:
                     if bs > self._config.max_batch_size:
                         continue
 
-                    for max_seq_len, kv_regime in _length_passes(bs, draft_len):
+                    for max_seq_len, kv_regime, packed_split in _capture_passes(bs, draft_len):
                         if kv_regime_resolver is not None:
                             self.cuda_graph_runner.set_capture_kv_regime(kv_regime)
+                        if packed_split_resolver is not None:
+                            self.cuda_graph_runner.set_capture_packed_split(packed_split)
                         warmup_request = self._dummy_requests.create_cuda_graph_warmup_request(
                             resource_manager,
                             bs,
@@ -966,6 +1077,11 @@ class DecoderCudaGraphs:
                                 f"for batch size={bs}, draft_len={draft_len}, "
                                 f"max_seq_len={max_seq_len}"
                                 + (f", kv_regime={kv_regime}" if kv_regime is not None else "")
+                                + (
+                                    f", packed_split={packed_split}"
+                                    if packed_split is not None
+                                    else ""
+                                )
                             )
                             enable_spec_decode = draft_len > 0 or (
                                 self._config.spec_config is not None
@@ -994,6 +1110,8 @@ class DecoderCudaGraphs:
                 self.cuda_graph_runner.set_capture_sample_type(None)
                 if kv_regime_resolver is not None:
                     self.cuda_graph_runner.set_capture_kv_regime(None)
+                if packed_split_resolver is not None:
+                    self.cuda_graph_runner.set_capture_packed_split(None)
                 if self._inputs is not None and self._inputs._dspark_confidence_enabled:
                     self.cuda_graph_runner.agreed_ragged_bucket = None
 

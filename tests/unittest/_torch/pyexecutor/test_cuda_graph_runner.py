@@ -23,6 +23,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     EncoderCUDAGraphRunner,
     EncoderCUDAGraphRunnerConfig,
     KeyType,
+    PackedSplitResolver,
     SampleType,
     _restore_spec_decode_capture_state,
     _save_spec_decode_capture_state,
@@ -84,6 +85,7 @@ class GraphKeyTestCase(unittest.TestCase):
         runner._get_seq_len_mode.return_value = True
         runner._ragged_verify_bucket.return_value = None
         runner._kv_regime_for_batch.return_value = None
+        runner._packed_split_for_batch.return_value = None
         request = _make_request_stub(7)
         batch = ScheduledRequests()
         batch.generation_requests = [request]
@@ -109,6 +111,7 @@ class GraphKeyTestCase(unittest.TestCase):
         runner._get_seq_len_mode.return_value = False
         runner._ragged_verify_bucket.return_value = None
         runner._kv_regime_for_batch.return_value = None
+        runner._packed_split_for_batch.return_value = None
         context = _make_request_stub(1)
         context.encoder_output_len = 7
         context.py_skip_cross_kv_projection = False
@@ -134,6 +137,7 @@ class GraphKeyTestCase(unittest.TestCase):
         runner._get_seq_len_mode.return_value = False
         runner._ragged_verify_bucket.return_value = None
         runner._kv_regime_for_batch.return_value = None
+        runner._packed_split_for_batch.return_value = None
         first_context = _make_request_stub(1)
         first_context.encoder_output_len = 7
         first_context.py_skip_cross_kv_projection = False
@@ -178,6 +182,7 @@ class GraphKeyTestCase(unittest.TestCase):
         runner._get_seq_len_mode.return_value = False
         runner._ragged_verify_bucket.return_value = None
         runner._kv_regime_for_batch.return_value = None
+        runner._packed_split_for_batch.return_value = None
         request = _make_request_stub(7)
         batch = ScheduledRequests()
         batch.generation_requests = [request]
@@ -230,7 +235,7 @@ class GraphKeyTestCase(unittest.TestCase):
 
         self.assertEqual(result, (None, None, None))
         runner.get_graph_key.assert_called_once_with(
-            batch, None, None, None, frozenset(), torch.float8_e4m3fn, False, None, None
+            batch, None, None, None, frozenset(), torch.float8_e4m3fn, False, None, None, None
         )
 
     def test_graph_key_includes_lora_variant(self) -> None:
@@ -240,6 +245,7 @@ class GraphKeyTestCase(unittest.TestCase):
         runner._get_seq_len_mode.return_value = False
         runner._ragged_verify_bucket.return_value = None
         runner._kv_regime_for_batch.return_value = None
+        runner._packed_split_for_batch.return_value = None
         request = _make_request_stub(7)
         batch = ScheduledRequests()
         batch.generation_requests = [request]
@@ -294,7 +300,7 @@ class GraphKeyTestCase(unittest.TestCase):
             )
 
         runner.get_graph_key.assert_called_once_with(
-            batch, None, None, None, promoted_ids, None, False, None, None
+            batch, None, None, None, promoted_ids, None, False, None, None, None
         )
         self.assertEqual(result, (graph_attn_metadata, graph_spec_metadata, key))
 
@@ -844,7 +850,8 @@ class KvRegimeGraphKeyTestCase(unittest.TestCase):
         batch = self._batch(_make_request_stub(1, prompt_len=100))
         # the regime rides on the one shape exchange; the largest regime wins
         self.assertEqual(
-            runner._agree_graph_shape(batch, True, frozenset()), (True, SampleType.FULL, 32768)
+            runner._agree_graph_shape(batch, True, frozenset()),
+            (True, SampleType.FULL, 32768, None),
         )
         self.assertEqual(exchanges, [[True, 1, SampleType.FULL.value, 8192]])
         # a capture pass exchanges its pinned regime
@@ -855,12 +862,15 @@ class KvRegimeGraphKeyTestCase(unittest.TestCase):
         # without regimes the exchange keeps its three fields and agrees on no regime
         runner.set_kv_regime_resolver(None)
         self.assertEqual(
-            runner._agree_graph_shape(batch, True, frozenset()), (True, SampleType.FULL, None)
+            runner._agree_graph_shape(batch, True, frozenset()),
+            (True, SampleType.FULL, None, None),
         )
         self.assertEqual(exchanges[-1], [True, 1, SampleType.FULL.value])
         # a runner without attention DP never exchanges
         runner.config.enable_attention_dp = False
-        self.assertEqual(runner._agree_graph_shape(batch, True, frozenset()), (True, None, None))
+        self.assertEqual(
+            runner._agree_graph_shape(batch, True, frozenset()), (True, None, None, None)
+        )
         self.assertEqual(len(exchanges), 3)
 
     def _lookup_runner(self) -> Mock:
@@ -936,3 +946,193 @@ class KvRegimeGraphKeyTestCase(unittest.TestCase):
                 CUDAGraphRunner._check_kv_regime_metadata(key, other)
         with patch.object(cuda_graph_runner_module, "_STRICT_BUFFER_CHECK", False):
             CUDAGraphRunner._check_kv_regime_metadata(key, other)
+
+
+class PackedSplitGraphKeyTestCase(unittest.TestCase):
+    """Decode graphs keyed by the FP4 MLA packed split decision of the step."""
+
+    def _runner(self, variants: tuple[bool, ...] | None = (False, True)) -> CUDAGraphRunner:
+        runner = object.__new__(CUDAGraphRunner)
+        runner.config = SimpleNamespace(enable_in_graph_sampling=False, enable_attention_dp=False)
+        runner.enabled = True
+        runner.sparse_config = None
+        runner.spec_config = SimpleNamespace(
+            max_draft_len=3, spec_dec_mode=SimpleNamespace(use_one_engine=lambda: False)
+        )
+        runner.kv_regime_resolver = None
+        runner._capture_kv_regime = None
+        self.decisions = []
+
+        def decide(batch_size: int, draft_len: int, kv_lens: list[int]) -> bool:
+            self.decisions.append((batch_size, draft_len, list(kv_lens)))
+            return max(kv_lens) > 4096
+
+        runner.packed_split_resolver = (
+            None
+            if variants is None
+            else PackedSplitResolver(variants=lambda batch_size, draft_len: variants, decide=decide)
+        )
+        runner._capture_packed_split = None
+        runner._capture_allowed = False
+        runner.graph_metadata = {}
+        return runner
+
+    @staticmethod
+    def _batch(*requests: SimpleNamespace) -> ScheduledRequests:
+        batch = ScheduledRequests()
+        batch.generation_requests = list(requests)
+        return batch
+
+    def test_key_without_a_resolver_is_unchanged(self) -> None:
+        runner = self._runner(variants=None)
+        key = runner.get_graph_key(self._batch(_make_request_stub(1, prompt_len=9000)))
+        self.assertEqual(key, KeyType(batch_size=1, draft_len=0))
+        self.assertIsNone(key.packed_split)
+
+    def test_key_carries_the_decision_on_the_rows_kv_lengths(self) -> None:
+        runner = self._runner()
+        short = _make_request_stub(1, prompt_len=100)
+        long = _make_request_stub(2, prompt_len=9000)
+        self.assertIs(runner.get_graph_key(self._batch(short)).packed_split, False)
+        self.assertIs(runner.get_graph_key(self._batch(short, long)).packed_split, True)
+        # the resolver decides on every row's KV length, not only the longest
+        self.assertEqual(self.decisions, [(1, 0, [100]), (2, 0, [100, 9000])])
+        self.assertEqual(
+            runner.get_graph_key(self._batch(long)),
+            KeyType(batch_size=1, draft_len=0, packed_split=True),
+        )
+        # one-engine speculation reads max_draft_len - 1 KV tokens beyond each row
+        runner.spec_config.spec_dec_mode = SimpleNamespace(use_one_engine=lambda: True)
+        self.assertIs(
+            runner.get_graph_key(self._batch(_make_request_stub(3, prompt_len=4095))).packed_split,
+            True,
+        )
+        self.assertEqual(self.decisions[-1], (1, 0, [4097]))
+
+    def test_a_shape_with_one_variant_keys_it_without_measuring(self) -> None:
+        runner = self._runner(variants=(True,))
+        batch = self._batch(_make_request_stub(1, prompt_len=100))
+        with patch.object(runner, "_total_seq_lens", side_effect=AssertionError("measured")):
+            self.assertIs(runner.get_graph_key(batch).packed_split, True)
+        self.assertEqual(self.decisions, [])
+
+    def test_capture_pass_pins_the_decision(self) -> None:
+        runner = self._runner()
+        long_batch = self._batch(_make_request_stub(1, prompt_len=9000))
+        runner.set_capture_packed_split(False)
+        self.assertIs(runner.get_graph_key(long_batch).packed_split, False)
+        runner.set_capture_packed_split(None)
+        self.assertIs(runner.get_graph_key(long_batch).packed_split, True)
+        # an agreed (attention-DP) decision wins over the local one
+        short_batch = self._batch(_make_request_stub(2, prompt_len=100))
+        self.assertIs(
+            runner.get_graph_key(short_batch, forced_packed_split=True).packed_split, True
+        )
+        runner.set_packed_split_resolver(None)
+        self.assertIsNone(runner.get_graph_key(long_batch).packed_split)
+
+    def test_a_missing_unsplit_graph_falls_back_to_the_split_graph(self) -> None:
+        runner = self._runner()
+        split = KeyType(batch_size=1, draft_len=0, packed_split=True)
+        unsplit = split._replace(packed_split=False)
+        runner.graph_metadata = {split: object()}
+        self.assertEqual(runner._get_compatible_packed_split_key(unsplit), split)
+        self.assertEqual(runner._get_compatible_packed_split_key(split), split)
+        # an unsplit graph of another KV regime stays: the regime round-up finds it
+        regime_unsplit = KeyType(batch_size=2, draft_len=0, kv_regime=16384, packed_split=False)
+        runner.graph_metadata[regime_unsplit] = object()
+        missing_regime = regime_unsplit._replace(kv_regime=8192)
+        self.assertEqual(runner._get_compatible_packed_split_key(missing_regime), missing_regime)
+        # a capture pass captures the exact decision instead of falling back
+        runner._capture_allowed = True
+        self.assertEqual(runner._get_compatible_packed_split_key(unsplit), unsplit)
+
+    def test_attention_dp_ranks_replay_the_split_graph_when_any_rank_splits(self) -> None:
+        runner = self._runner()
+        exchanges = []
+        peer_split = [1]
+
+        def allgather(values: list[int]) -> np.ndarray:
+            exchanges.append(list(values))
+            peer = list(values)
+            peer[-1] = peer_split[0]
+            return np.array([list(values), peer], dtype=np.int64)
+
+        runner.config = SimpleNamespace(
+            enable_in_graph_sampling=False,
+            enable_attention_dp=True,
+            mapping=SimpleNamespace(tp_size=2),
+            dist=SimpleNamespace(tp_allgather_int64=allgather),
+        )
+        runner._resolve_sample_type = lambda *_args: SampleType.FULL
+        batch = self._batch(_make_request_stub(1, prompt_len=100))
+        # this rank keeps its rows whole, the peer splits: both replay the split graph
+        self.assertEqual(
+            runner._agree_graph_shape(batch, True, frozenset()),
+            (True, SampleType.FULL, None, True),
+        )
+        self.assertEqual(exchanges[-1], [True, 1, SampleType.FULL.value, 0])
+        # no rank splits: the unsplit graph
+        peer_split[0] = 0
+        self.assertIs(runner._agree_graph_shape(batch, True, frozenset())[3], False)
+        # the decision rides after the KV regime when both key the graphs
+        runner.kv_regime_resolver = lambda batch_size, draft_len: (8192, 16384)
+        peer_split[0] = 1
+        self.assertEqual(
+            runner._agree_graph_shape(batch, True, frozenset()),
+            (True, SampleType.FULL, 8192, True),
+        )
+        self.assertEqual(exchanges[-1], [True, 1, SampleType.FULL.value, 8192, 0])
+
+    def test_capture_writes_the_decision_into_the_graph_metadata(self) -> None:
+        runner = Mock()
+        runner.enabled = True
+        runner._dspark_confidence_enabled = False
+        runner.config = SimpleNamespace(enable_attention_dp=False, use_mrope=False)
+        runner._agree_graph_shape = CUDAGraphRunner._agree_graph_shape.__get__(runner)
+        runner._get_compatible_packed_split_key = (
+            CUDAGraphRunner._get_compatible_packed_split_key.__get__(runner)
+        )
+        runner._is_mixed_encoder_decoder_batch.return_value = False
+        runner._can_run_cuda_graph_batch.return_value = True
+        runner.supported_batch_sizes = {1}
+        runner.max_beam_width = 1
+        runner._capture_allowed = True
+        runner.graph_metadata = {}
+        key = KeyType(batch_size=1, draft_len=0, packed_split=False)
+        runner.get_graph_key.return_value = key
+        graph_metadata = SimpleNamespace(
+            is_cuda_graph=True, set_decode_kv_regime=Mock(), set_decode_packed_split=Mock()
+        )
+        attn_metadata = SimpleNamespace(
+            create_cuda_graph_metadata=Mock(return_value=graph_metadata)
+        )
+        batch = self._batch(_make_request_stub(1, prompt_len=100))
+
+        with patch(
+            "tensorrt_llm._torch.pyexecutor.cuda_graph_runner.ExpertStatistic.should_record",
+            return_value=False,
+        ):
+            result = CUDAGraphRunner.maybe_get_cuda_graph(
+                runner, batch, enable_spec_decode=False, attn_metadata=attn_metadata
+            )
+
+        self.assertEqual(result, (graph_metadata, None, key))
+        # the decode captured in this graph launches one task per request
+        graph_metadata.set_decode_packed_split.assert_called_once_with(False)
+        graph_metadata.set_decode_kv_regime.assert_not_called()
+
+    def test_strict_replay_rejects_metadata_of_another_decision(self) -> None:
+        key = KeyType(batch_size=1, draft_len=0, packed_split=False)
+        same = {"attn_metadata": SimpleNamespace(decode_packed_split=False)}
+        other = {"attn_metadata": SimpleNamespace(decode_packed_split=True)}
+        # a backend without a packed split decode ignores the decision
+        ignored = {"attn_metadata": SimpleNamespace(decode_packed_split=None)}
+        with patch.object(cuda_graph_runner_module, "_STRICT_BUFFER_CHECK", True):
+            CUDAGraphRunner._check_packed_split_metadata(key, same)
+            CUDAGraphRunner._check_packed_split_metadata(key, ignored)
+            CUDAGraphRunner._check_packed_split_metadata(key._replace(packed_split=None), other)
+            with self.assertRaises(AssertionError):
+                CUDAGraphRunner._check_packed_split_metadata(key, other)
+        with patch.object(cuda_graph_runner_module, "_STRICT_BUFFER_CHECK", False):
+            CUDAGraphRunner._check_packed_split_metadata(key, other)
