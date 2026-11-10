@@ -35,6 +35,7 @@ import tensorrt_llm.commands.serve as serve_module
 import tensorrt_llm.commands.serve_cli._net as net_module
 from tensorrt_llm.commands.serve import DisaggLauncherEnvs, DisaggWorkerEnvs
 from tensorrt_llm.commands.serve_cli._net import _bind_listener, _listener_address_family
+from tensorrt_llm.logger import Logger
 from tensorrt_llm.serve.multi_frontend import LAUNCHER_UDS_ENV
 
 pytestmark = pytest.mark.cpu_only
@@ -445,7 +446,13 @@ _SITES = [
 
 @pytest.fixture
 def restored_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Restore every environment variable the listeners read or write."""
+    """Keep the process state the listeners change out of later tests.
+
+    Every environment variable the listeners read or write is restored. The
+    disaggregated server also sets the level of the process-wide logger and the
+    context of a live usage session; neither belongs to a listener's behavior,
+    so both calls do nothing here.
+    """
     for name in (
         "TRTLLM_RESPONSES_API_DISABLE_STORE",
         "TLLM_EXECUTOR_ATTACH_INFO",
@@ -459,6 +466,13 @@ def restored_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         # Recording the variable makes monkeypatch put its old value back,
         # also when the listener sets it later in the test.
         monkeypatch.delenv(name, raising=False)
+    # Patched on the class, so undoing it leaves no attribute on the logger instance.
+    monkeypatch.setattr(Logger, "set_level", lambda self, min_severity: None)
+    monkeypatch.setattr(
+        inspect.getmodule(serve_module.disaggregated.callback),
+        "set_usage_context",
+        lambda usage_context: None,
+    )
 
 
 @pytest.mark.parametrize("site", _SITES, ids=lambda site: site.name)
