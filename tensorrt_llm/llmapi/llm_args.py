@@ -49,6 +49,7 @@ from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 
+from .._errors import ConfigInputError
 from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
                       prefer_pinned)
 
@@ -6657,7 +6658,7 @@ class BaseLlmArgs(StrictBaseModel):
         if config_dict is None:
             config_dict = {}
         elif not isinstance(config_dict, dict):
-            raise ValueError("Configuration file root must be a mapping.")
+            raise ConfigInputError("Configuration file root must be a mapping.")
         return cls(**config_dict)
 
     @field_validator("gpus_per_node", mode='before')
@@ -7675,7 +7676,7 @@ class TorchLlmArgs(BaseLlmArgs):
         self._quant_config = value
 
     modeling_v2: Literal["off", "auto", "require"] = Field(
-        default="off",
+        default="auto",
         status="prototype",
         description=
         "Whether to build the model from a modeling_v2 target (experimental) "
@@ -8928,7 +8929,7 @@ def update_llm_args_with_extra_options(
         if llm_args_dict is None:
             llm_args_dict = {}
         elif not isinstance(llm_args_dict, dict):
-            raise ValueError("Configuration file root must be a mapping.")
+            raise ConfigInputError("Configuration file root must be a mapping.")
         llm_args = update_llm_args_with_extra_dict(
             llm_args,
             llm_args_dict,

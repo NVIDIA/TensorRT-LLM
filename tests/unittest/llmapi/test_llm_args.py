@@ -2188,8 +2188,12 @@ class TestMultimodalConfig:
             setattr(llm, method, lambda *args, **kwargs: None)
         module = "mm_encoder" if encoder_only else "llm"
         with patch.object(BaseLLM, "_build_model"), patch(
-                f"tensorrt_llm.llmapi.{module}.create_input_processor",
-                side_effect=ValueError("input processor boundary")) as factory:
+                "tensorrt_llm.llmapi.llm.check_quantization_compute_capability"
+        ), patch(
+                "tensorrt_llm.llmapi.llm.check_architecture_registered"), patch(
+                    f"tensorrt_llm.llmapi.{module}.create_input_processor",
+                    side_effect=ValueError(
+                        "input processor boundary")) as factory:
             with pytest.raises(ValueError, match="input processor boundary"):
                 llm._build_model()
         kwargs = factory.call_args.kwargs
