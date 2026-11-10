@@ -249,6 +249,26 @@ def test_only_the_draft_layers_block_offset_rows_are_built() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+def test_draft_layers_keep_the_dense_target_subpage_factor() -> None:
+    """Explicit draft layers do not change the dense target layers' sub-page factor."""
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen_dense_decode import (  # noqa: E501
+        uniform_subpages_per_slot,
+    )
+
+    torch.cuda.init()
+    plain = None
+    unified = None
+    try:
+        plain = _manager(None)
+        unified = _manager(_specs())
+        assert uniform_subpages_per_slot(unified) == uniform_subpages_per_slot(plain) > 0
+    finally:
+        for manager in (unified, plain):
+            if manager is not None:
+                manager.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
 def test_warmup_scrub_clears_every_slot() -> None:
     """The post-warmup NaN/Inf scrub zeroes every slot of target and draft layers alike."""
     torch.cuda.init()
