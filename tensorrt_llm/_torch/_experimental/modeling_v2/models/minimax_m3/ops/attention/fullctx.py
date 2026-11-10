@@ -34,7 +34,7 @@ class FullCtxPlanBase:
         recipe: Mapping,
         own_reducer: bool,
         pdl: bool,
-    ):
+    ) -> None:
         from tensorrt_llm._torch.attention.backends.prims_ts import decode as tsdec
         from tensorrt_llm._torch.attention.backends.prims_ts.kernels.fmha_decode.fmha_decode_config import (
             get_max_active_clusters_for_cluster_size,
@@ -44,6 +44,7 @@ class FullCtxPlanBase:
         self._tsdec = tsdec
         self.qlen = qlen
         self.nreq = nreq
+        self.max_kv_len = max_kv_len
         self.pdl = pdl
         self.recipe = dict(recipe)
         splits = int(self.recipe["splits"])
@@ -89,6 +90,7 @@ class FullCtxPlanBase:
             head_dim=self.GEOMETRY.head_dim,
             seq_len_q=qlen,
             max_active_clusters=int(max_active),
+            requested_splits=splits,
         )
         compile_spec = tsdec._make_decode_compile_spec(
             spec,
@@ -97,13 +99,12 @@ class FullCtxPlanBase:
             num_kv_heads=self.GEOMETRY.kv_heads,
             head_dim=self.GEOMETRY.head_dim,
             page_size=self.GEOMETRY.page,
-            max_kv_len=max_kv_len,
-            seq_len_q=qlen,
             q_dtype_key="float8_e4m3fn",
             k_dtype_key="float8_e4m3fn",
             v_dtype_key="float8_e4m3fn",
-            output_dtype_key="float16",
-            use_packed_q=False,
+            out_dtype_key="float16",
+            packed_query=False,
+            runtime_kv_lengths=True,
             kv_prefix_mode="dynamic",
             kv_lengths_mode="dynamic",
         )
@@ -120,17 +121,15 @@ class FullCtxPlanBase:
         self.workspace.cu_seqlens_q.zero_()
         self.workspace.attention_sinks.zero_()
         rows = self.GEOMETRY.heads_per_kv * qlen
-        if tuple(self.workspace.partial_o.shape) != (
+        partial_shape = (
             nreq,
             self.GEOMETRY.kv_heads,
             splits,
             rows,
             self.GEOMETRY.head_dim,
-        ):
-            raise RuntimeError(
-                f"PrimTS split scratch {tuple(self.workspace.partial_o.shape)} is not the "
-                f"[requests, KV heads, splits, {rows} rows, {self.GEOMETRY.head_dim}] layout the BF16 merge reads"
-            )
+        )
+        self.partial_o = self.workspace.partial_o.view(partial_shape)
+        self.partial_stats = self.workspace.partial_stats.view(partial_shape[:-1])
         self.own_reducer = own_reducer
         self.q_tokens_per_cta = max(int(cfg.q_tokens_per_cta), 1)
         self.tile_kv = int(cfg.tile_size_kv)
@@ -142,6 +141,39 @@ class FullCtxPlanBase:
             else (nreq, self.GEOMETRY.heads, self.GEOMETRY.head_dim)
         )
         self.staging = torch.empty(shape, dtype=torch.float16, device=device)
+
+    def _run_primts(
+        self,
+        query: torch.Tensor,
+        key_pages: torch.Tensor,
+        value_pages: torch.Tensor,
+        block_table: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+        softmax_scale: float,
+    ) -> None:
+        """Launch the pinned plan through PrimTS's runtime decode ABI."""
+        query = query.reshape(self.staging.shape).contiguous()
+        runtime = self._tsdec._prepare_decode_runtime_unchecked(
+            query,
+            (key_pages, value_pages),
+            None,
+            out_dtype=torch.float16,
+            softmax_scale=softmax_scale,
+            output_scale=1.0,
+            out=self.staging,
+        )
+        self._tsdec._launch_decode(
+            runtime,
+            seq_lens_kv=sequence_lengths,
+            qo_indptr=None,
+            block_tables=block_table,
+            workspace=self.workspace,
+            compiled_main=self._main,
+            compiled_reducer=None if self.own_reducer else self._primts_reducer,
+            requested_splits=int(self.recipe["splits"]),
+            max_kv_len=self.max_kv_len,
+            max_q_len=self.qlen,
+        )
 
 
 def check_layout(cfg, qlen: int, splits: int, *, heads_per_kv: int) -> None:

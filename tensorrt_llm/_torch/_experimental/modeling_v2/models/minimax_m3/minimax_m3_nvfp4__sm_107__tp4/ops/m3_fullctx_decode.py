@@ -74,48 +74,11 @@ class FullCtxPlan(FullCtxPlanBase):
     ) -> bool:
         """Decodes into output; with mxfp8 (E4M3 rows, UE8M0 scales) and a merge op that takes them, the merge
         also writes the MXFP8 copy of output. Returns whether it did."""
-        # The kernel takes a compact query; a column view of the fused QKV projection is copied once.
-        q = q.reshape(self.staging.shape).contiguous()
-        runtime = self._tsdec._prepare_decode_runtime_unchecked(
-            q,
-            (k_pages, v_pages),
-            None,
-            output_dtype=torch.float16,
-            bmm1_scale=sm_scale,
-            bmm2_scale=1.0,
-            out=self.staging,
-        )
-        ws = self.workspace
-        self._main(
-            runtime.q,
-            runtime.k_cache,
-            runtime.v_cache,
-            runtime.k_sf_cache,
-            runtime.v_sf_cache,
-            runtime.out,
-            seq_lens,
-            ws.cu_seqlens_q,
-            block_table,
-            block_table,  # Dense decode constexpr-elides the membership table.
-            ws.partial_o,
-            ws.partial_stats,
-            ws.split_kv_counter,
-            ws.attention_sinks,
-            runtime.num_physical_pages,
-            runtime.k_page_stride,
-            runtime.k_head_stride,
-            runtime.k_token_stride,
-            runtime.v_page_stride,
-            runtime.v_head_stride,
-            runtime.v_token_stride,
-            runtime.bmm1_scale,
-            runtime.bmm2_scale,
-            (),
-        )
+        self._run_primts(q, k_pages, v_pages, block_table, seq_lens, sm_scale)
         if self.own_reducer:
             args = (
-                ws.partial_o,
-                ws.partial_stats,
+                self.partial_o,
+                self.partial_stats,
                 seq_lens,
                 output,
                 self.qlen,
@@ -130,17 +93,6 @@ class FullCtxPlan(FullCtxPlanBase):
                 return True
             torch.ops.trtllm.minimax_m3_sm107tp4_fullctx_reduce(*args)
             return False
-        self._primts_reducer(
-            runtime.out,
-            seq_lens,
-            ws.cu_seqlens_q,
-            ws.partial_o,
-            ws.partial_stats,
-            ws.attention_sinks,
-            runtime.bmm1_scale,
-            runtime.bmm2_scale,
-            (),
-        )
         output.view(self.staging.shape).copy_(self.staging)
         return False
 
