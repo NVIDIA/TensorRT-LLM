@@ -1961,6 +1961,7 @@ class _BasePageTableMaterializer:
 
 
 class KVCacheManagerV2(BaseResourceManager):
+    gen_preemption_headroom: int = 0
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
@@ -2092,9 +2093,11 @@ class KVCacheManagerV2(BaseResourceManager):
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         sparse_kv_offload_config: Optional[SparseKvCacheOffloadConfig] = None,
         shared_draft_block_width: Optional[int] = None,
+        gen_preemption_headroom: int = 0,
         **kwargs,
     ) -> None:
         self.mapping = mapping
+        self.gen_preemption_headroom = gen_preemption_headroom
         self.dtype = dtype
         self._declared_target_layer_count = num_layers
         self.layer_specs = tuple(layer_specs) if layer_specs is not None else None
@@ -2557,6 +2560,8 @@ class KVCacheManagerV2(BaseResourceManager):
         self._fresh_fill_announced = False
         self._fresh_fill_unavailable_announced = False
         self.max_admissible_sequences = max_num_sequences * (2 if needs_extra_index_slots else 1)
+        # Requests paused in place by GEN slot preemption stay resident.
+        self.max_admissible_sequences += self.gen_preemption_headroom
         # The guard page is held by a permanent sequence, so it needs an index
         # slot of its own. Taking one of the scheduler's would change which
         # requests get admitted, so a run with the diagnostic on would no
@@ -3654,7 +3659,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_generation_request_capacity(self) -> int:
         """Return the resident generation requests used for SWA sizing."""
-        return self.max_batch_size
+        return self.max_batch_size + self.gen_preemption_headroom
 
     def _get_max_tokens_from_quota(self, quota: int) -> float:
         """Rank-local byte quota -> token capacity (GLOBAL tokens under helix)."""
@@ -8641,6 +8646,7 @@ class KVCacheManagerV2(BaseResourceManager):
         is_draft: bool = False,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         shared_draft_block_width: Optional[int] = None,
+        gen_preemption_headroom: int = 0,
         **kwargs,
     ):
         if layer_specs is not None:
@@ -8707,8 +8713,9 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         # The affine slope covers all tokens; context additionally retains SWA
         # pages for the current token batch beyond the generation windows.
+        resident_capacity = max_batch_size + gen_preemption_headroom
         fixed_cost = (
-            swa_size_per_request * max_batch_size
+            swa_size_per_request * resident_capacity
             + (context_size_per_token - cache_size_per_token) * max_num_tokens
         )
         bytes_per_slot = _get_single_swa_pool_slot_bytes(
@@ -8734,7 +8741,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                     costs.append(
                         (
-                            layer_size * max_num_tokens + retained_bytes * max_batch_size,
+                            layer_size * max_num_tokens + retained_bytes * resident_capacity,
                             layer_size * tokens_per_block,
                         )
                     )

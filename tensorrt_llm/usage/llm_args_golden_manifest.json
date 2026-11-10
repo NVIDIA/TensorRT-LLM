@@ -1490,6 +1490,16 @@
       "path": "scheduler_config.enable_prefix_aware_scheduling"
     },
     {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "scheduler_config.gen_preemption.target_output_tps"
+    },
+    {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "scheduler_config.gen_preemption.tpot_budget"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "scheduler_config.use_python_scheduler"
