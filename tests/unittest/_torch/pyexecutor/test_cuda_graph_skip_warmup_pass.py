@@ -14,13 +14,25 @@
 # limitations under the License.
 """TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS=1 on a real model: same tokens, one capture pass, safe fallback."""
 
+import datetime
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
 import pytest
 import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+from tensorrt_llm._torch.moe.fused_moe import moe_comm_timeout_guard
+from tensorrt_llm._torch.moe.fused_moe.moe_comm_timeout_guard import MoECommTimeoutGuard
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, KeyType
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
+from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
+    ExecutorRequestQueue,
+    RequestQueueItem,
+)
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 
 PROMPTS = [
@@ -35,76 +47,162 @@ PROMPTS = [
 ]
 
 
-def _generate(skip_warmup_pass: bool, move_workspace: bool = False):
-    """Return the greedy tokens, the graph keys and each capture call's warm-up-only flag per pass.
-    ``move_workspace`` regrows the shared workspace before the second single-pass capture."""
+@dataclass(frozen=True)
+class _Run:
+    """What one LLM generated, and how its executors captured and replayed CUDA graphs."""
+
+    tokens: list[list[int]]
+    keys: set[KeyType]
+    # The graphs the generation replayed.
+    replayed: set[KeyType]
+    # Per executor, the is_warmup_only flag of each CUDA graph pass.
+    passes: list[list[bool]]
+    # Per executor, the (stream capturing, MoE warmup timeouts) pairs its capture forwards saw.
+    capture_timeouts: list[set[tuple[bool, bool]]]
+
+
+def _generate(skip_warmup_pass: bool, move_workspace: bool = False) -> _Run:
+    """Generate greedily; ``move_workspace`` regrows the shared workspace before the second
+    capture of the single pass, as a smaller shape needing more workspace would."""
     passes: list[list[bool]] = []
+    capture_timeouts: list[set[tuple[bool, bool]]] = []
+    replayed: list[KeyType] = []
     moved: list[bool] = []
+    generating: list[bool] = []
+    prompts_fetched: list[bool] = []
+    guard = MoECommTimeoutGuard(environ={})
     warmup_and_capture = DecoderCudaGraphs.warmup_and_capture
     run_cuda_graph_warmup = DecoderCudaGraphs.run_cuda_graph_warmup
     capture = CUDAGraphRunner.capture
+    replay = CUDAGraphRunner.replay
+    get_from_request_queue = ExecutorRequestQueue.get_from_request_queue
 
-    def record_warmup_and_capture(self, resource_manager, **kwargs):
+    def record_executor(
+        self: DecoderCudaGraphs, resource_manager: ResourceManager, **kwargs: bool
+    ) -> None:
+        """Start the records of one executor's CUDA graph capture."""
         passes.append([])
-        if kwargs.get("allow_single_pass") and move_workspace:
-            moved.append(False)
-        return warmup_and_capture(self, resource_manager, **kwargs)
+        capture_timeouts.append(set())
+        warmup_and_capture(self, resource_manager, **kwargs)
 
-    def record_pass(self, resource_manager, **kwargs):
+    def record_pass(
+        self: DecoderCudaGraphs, resource_manager: ResourceManager, **kwargs: bool
+    ) -> None:
+        """Record one pass; only the single pass leaves its prefill graphs to the caller."""
         passes[-1].append(self.cuda_graph_runner.is_warmup_only)
-        return run_cuda_graph_warmup(self, resource_manager, **kwargs)
+        if move_workspace and kwargs.get("capture_prefill") is False:
+            moved.append(False)
+        run_cuda_graph_warmup(self, resource_manager, **kwargs)
 
-    def capture_and_move_workspace(self, key, *args, **kwargs):
-        if moved == [False] and not self.is_warmup_only and self.graphs:
+    def record_capture(
+        self: CUDAGraphRunner,
+        key: KeyType,
+        forward_fn: Callable[[dict[str, Any]], Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Record the timeouts each capture forward sees, and move the workspace if asked."""
+        if moved == [False] and self.graphs:
             captured = next(iter(self.graph_metadata.values()))["attn_metadata"]
             workspace = captured.cuda_graph_workspace
             workspace.resize_(workspace.numel() + (1 << 20))
             moved[0] = True
-        return capture(self, key, *args, **kwargs)
+
+        def observed_forward(inputs: dict[str, Any]) -> Any:
+            capture_timeouts[-1].add((torch.cuda.is_current_stream_capturing(), guard.in_warmup))
+            return forward_fn(inputs)
+
+        return capture(self, key, observed_forward, *args, **kwargs)
+
+    def record_replay(self: CUDAGraphRunner, key: KeyType, *args: Any, **kwargs: Any) -> Any:
+        """Record the graphs the generation replays."""
+        if generating:
+            replayed.append(key)
+        return replay(self, key, *args, **kwargs)
+
+    def fetch_prompts_together(
+        self: ExecutorRequestQueue, timeout: datetime.timedelta | None
+    ) -> list[RequestQueueItem]:
+        """Schedule every prompt in the first batch, so each run steps through the same batches."""
+        items = get_from_request_queue(self, timeout)
+        if items and generating and not prompts_fetched:
+            prompts_fetched.append(True)
+            while len(items) < len(PROMPTS) and (
+                more := get_from_request_queue(self, datetime.timedelta(seconds=10))
+            ):
+                items += more
+        return items
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+        patch.delenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", raising=False)
         if skip_warmup_pass:
             patch.setenv("TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS", "1")
         else:
             patch.delenv("TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS", raising=False)
-        patch.setattr(DecoderCudaGraphs, "warmup_and_capture", record_warmup_and_capture)
+        patch.setattr(moe_comm_timeout_guard, "_DEFAULT_GUARD", guard)
+        patch.setattr(DecoderCudaGraphs, "warmup_and_capture", record_executor)
         patch.setattr(DecoderCudaGraphs, "run_cuda_graph_warmup", record_pass)
-        patch.setattr(CUDAGraphRunner, "capture", capture_and_move_workspace)
-        with LLM(
-            model=str(llm_models_root() / "llama-models-v2" / "TinyLlama-1.1B-Chat-v1.0"),
-            max_batch_size=8,
-            cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8], enable_padding=True),
-            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.3),
-        ) as llm:
-            # Requests finish one by one, so the decode batch replays every graph size.
-            outputs = llm.generate(
-                PROMPTS,
-                [
-                    SamplingParams(max_tokens=8 + 3 * i, temperature=0, ignore_eos=True)
-                    for i in range(len(PROMPTS))
-                ],
-            )
-            keys = set(llm._executor.engine.model_engine.cuda_graph_runner.graphs)
+        patch.setattr(CUDAGraphRunner, "capture", record_capture)
+        patch.setattr(CUDAGraphRunner, "replay", record_replay)
+        patch.setattr(ExecutorRequestQueue, "get_from_request_queue", fetch_prompts_together)
+        try:
+            with LLM(
+                model=str(llm_models_root() / "llama-models-v2" / "TinyLlama-1.1B-Chat-v1.0"),
+                max_batch_size=8,
+                cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8], enable_padding=True),
+                kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.3),
+            ) as llm:
+                generating.append(True)
+                # Requests finish one by one, so the decode batch replays every graph size.
+                outputs = llm.generate(
+                    PROMPTS,
+                    [
+                        SamplingParams(max_tokens=8 + 3 * i, temperature=0, ignore_eos=True)
+                        for i in range(len(PROMPTS))
+                    ],
+                )
+                keys = set(llm._executor.engine.model_engine.cuda_graph_runner.graphs)
+        finally:
+            # The in-process executor lowers the PyTorch memory fraction for the whole process.
+            torch.cuda.set_per_process_memory_fraction(1.0)
     assert moved == ([True] if move_workspace else [])
-    return [list(output.outputs[0].token_ids) for output in outputs], keys, passes
+    return _Run(
+        tokens=[list(output.outputs[0].token_ids) for output in outputs],
+        keys=keys,
+        replayed=set(replayed),
+        passes=passes,
+        capture_timeouts=capture_timeouts,
+    )
+
+
+@pytest.fixture(scope="module")
+def two_pass_run() -> _Run:
+    """The default two-pass capture that the single-pass runs are compared with."""
+    run = _generate(skip_warmup_pass=False)
+    # The KV-cache estimation executor and the final one.
+    assert run.passes == [[True, False], [True, False]]
+    return run
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_final_capture_skips_warmup_pass_and_falls_back_when_a_buffer_moves():
-    tokens, keys, passes = _generate(skip_warmup_pass=False)
-    assert passes[-1] == [True, False]
+def test_single_pass_capture_matches_two_passes(two_pass_run: _Run) -> None:
+    """The final executor captures in one pass and generates the same tokens from the same graphs."""
+    run = _generate(skip_warmup_pass=True)
+    # The KV-cache estimation executor keeps both passes.
+    assert run.passes == [[True, False], [False]]
+    assert run.keys == two_pass_run.keys
+    assert run.replayed == run.keys
+    assert run.tokens == two_pass_run.tokens
+    # Eager forwards keep the warmup MoE timeouts; each capture switches to the serving ones.
+    assert run.capture_timeouts[-1] == {(False, True), (True, False)}
 
-    single_tokens, single_keys, single_passes = _generate(skip_warmup_pass=True)
-    # Only the final executor skips the warm-up-only pass; a KV-cache profiling pass keeps both.
-    assert single_passes[-1] == [False]
-    assert single_passes[:-1] == passes[:-1]
-    assert single_keys == keys
-    assert single_tokens == tokens
 
-    fallback_tokens, fallback_keys, fallback_passes = _generate(
-        skip_warmup_pass=True, move_workspace=True
-    )
-    assert fallback_passes[-1] == [False, True, False]
-    assert fallback_keys == keys
-    assert fallback_tokens == tokens
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_single_pass_capture_falls_back_when_a_buffer_moves(two_pass_run: _Run) -> None:
+    """A metadata tensor moved after an earlier capture sends the final executor back to two passes."""
+    run = _generate(skip_warmup_pass=True, move_workspace=True)
+    assert run.passes == [[True, False], [False, True, False]]
+    assert run.keys == two_pass_run.keys
+    assert run.replayed == run.keys
+    assert run.tokens == two_pass_run.tokens
