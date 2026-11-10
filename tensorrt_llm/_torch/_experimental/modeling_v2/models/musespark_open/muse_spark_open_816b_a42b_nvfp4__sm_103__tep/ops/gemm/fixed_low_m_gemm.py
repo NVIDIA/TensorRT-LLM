@@ -19,6 +19,8 @@ elements -- the same distance from the fp64 product as cuBLAS.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
@@ -82,7 +84,85 @@ SPLITK_TACTICS_TP4: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
     (32, 8192, 14336): (128, 32, 1, 5),
 }
 
+
 #: The measured table of each ``(compute capability, drafter TP size)``.
+class OnBatchSplitK(tuple):
+    """A tactic ``(mma_m, mma_n, split_k, ab_stages)`` run on ``batch_splitk_gemm``'s copy of the
+    split-K kernel instead of flashinfer's.
+
+    The copy has the same tiles and the same summation (each output element the FP32 sum of the
+    ``split_k`` K-slice partials in cluster-rank order, rounded once), so its bits are flashinfer's
+    at the same ``split_k``; its epilogue reduce-scatters the partials over the cluster instead of
+    sending every peer's whole tile to one owner, which leaves room for a deeper ring. A plain
+    4-tuple everywhere else (``len``, unpacking, equality).
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, *fields: int) -> "OnBatchSplitK":
+        return super().__new__(cls, fields)
+
+    def __repr__(self) -> str:
+        return f"bsplitk{tuple(self)!r}"
+
+
+#: ``drafter_multi_request_cells`` (sm103 TP8 only): the blocks of 2..4 requests (16, 24 and 32
+#: rows) run these cells in place of the TP8 table's rows chosen from the shapes. Each qkv /
+#: gate_up / convolution coefficient cell keeps its row's ``split_k`` (bitwise the table's row).
+#: The o_proj and down_proj cells, which the low-M dispatcher's per-rank race served (cuBLAS on
+#: the measured ranks), are single K-slice GEMMs (``split_k`` 1). With every successor listed at a
+#: width, ``drafter_pdl_chain``'s entry triggers act on these widths too.
+MULTI_REQUEST_CELLS_TP8: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
+    # qkv_proj / context K/V: 16 rows one stage deeper; 24 / 32 rows on the reduce-scatter copy,
+    # one more stage than flashinfer fits.
+    (16, 8192, 1280): (64, 16, 4, 10),
+    (24, 8192, 1280): OnBatchSplitK(64, 32, 4, 9),
+    (32, 8192, 1280): OnBatchSplitK(64, 32, 4, 9),
+    # Convolution coefficient projection: 16 rows one stage deeper (``ConvEpilogue`` fits its
+    # stages beside its staging tile). The 24 / 32-row rows stay: ``mma_n`` 32 there was a large
+    # loss with the convolution epilogue.
+    (16, 8192, 2048): (64, 16, 4, 10),
+    # gate_up_proj: the same tiles on the reduce-scatter copy.
+    (16, 8192, 7168): OnBatchSplitK(128, 16, 2, 6),
+    (24, 8192, 7168): OnBatchSplitK(128, 32, 2, 5),
+    (32, 8192, 7168): OnBatchSplitK(128, 32, 2, 5),
+    # o_proj per rank: one K slice, the fastest tile per row count in the chain.
+    (16, 1024, 8192): OnBatchSplitK(128, 16, 1, 6),
+    (24, 1024, 8192): OnBatchSplitK(128, 32, 1, 5),
+    (32, 1024, 8192): (64, 32, 1, 8),
+    # down_proj per rank: one K slice, the fastest tile per row count in the chain.
+    (16, 3584, 8192): (64, 16, 1, 11),
+    (24, 3584, 8192): (64, 32, 1, 9),
+    (32, 3584, 8192): OnBatchSplitK(64, 32, 1, 9),
+}
+
+#: Whether ``splitk_tactics`` merges ``MULTI_REQUEST_CELLS_TP8`` into the sm103 TP8 table:
+#: ``drafter_multi_request_cells``, pushed here by ``lever_settings.apply`` (default off).
+_MULTI_REQUEST_CELLS = False
+
+
+def configure(*, multi_request_cells: bool) -> None:
+    """Set this module's lever-backed settings (``lever_settings.apply``), once per process."""
+    global _MULTI_REQUEST_CELLS
+    _MULTI_REQUEST_CELLS = bool(multi_request_cells)
+
+
+@functools.lru_cache(maxsize=None)
+def _with_multi_request_cells(key: tuple) -> dict:
+    """The table of ``key`` with ``MULTI_REQUEST_CELLS_TP8`` merged in; built (and logged) once per
+    process."""
+    from tensorrt_llm.logger import logger
+
+    logger.info(
+        "[musespark_open] drafter_multi_request_cells: drafter blocks of 16, 24 and 32 rows run "
+        f"{len(MULTI_REQUEST_CELLS_TP8)} measured TP8 cells (qkv / gate_up / coefficient rows at "
+        "their split_k, o_proj / down_proj on one K slice; "
+        f"{sum(isinstance(v, OnBatchSplitK) for v in MULTI_REQUEST_CELLS_TP8.values())} on the "
+        "reduce-scatter split-K copy)"
+    )
+    return {**SPLITK_TACTICS_BY_SM_TP[key], **MULTI_REQUEST_CELLS_TP8}
+
+
 SPLITK_TACTICS_BY_SM_TP: dict[
     tuple[tuple[int, int], int], dict[tuple[int, int, int], tuple[int, int, int, int]]
 ] = {
@@ -128,6 +208,8 @@ def splitk_tactics(
             f"fixed_low_m_gemm: no split-K tactics for SM {key[0]} at TP {key[1]} "
             f"(supported: {sorted(SPLITK_TACTICS_BY_SM_TP)})"
         )
+    if key == ((10, 3), 8) and _MULTI_REQUEST_CELLS:
+        return _with_multi_request_cells(key)
     return table
 
 
@@ -197,6 +279,12 @@ class FixedLowMGemm(OpWrapper):
         from .splitk_gemm import SplitKTactic, run_splitk_dense
 
         out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+        if isinstance(tactic, OnBatchSplitK):
+            from . import batch_splitk_gemm as _bsk
+
+            return _bsk.run(
+                x.detach(), weight.detach(), out, _bsk.BatchSplitKTactic(*tactic), enable_pdl
+            )
         # DLPack refuses tensors that require grad; a trainable nn.Linear
         # weight still does under inference mode.
         return run_splitk_dense(

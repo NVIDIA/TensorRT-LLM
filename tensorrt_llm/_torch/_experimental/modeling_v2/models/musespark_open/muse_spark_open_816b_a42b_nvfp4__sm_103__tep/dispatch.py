@@ -424,6 +424,25 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "draft",
         ("drafter_block_decode",),
     ),
+    FastPath(
+        "drafter_silu_epilogue",
+        "the drafter gate_up projection of 9..32-row blocks with silu(gate) * up in its epilogue",
+        "draft",
+        ("drafter_block_decode",),
+    ),
+    FastPath(
+        "tep8_attn_block_splitk",
+        "the TP8 attention block's QKV and o_proj of 9..32-row decode calls on batch split-K "
+        "cells, each staging its weight tile before its dependency wait",
+        "construct",
+        ("dense_gemms",),
+    ),
+    FastPath(
+        "drafter_multi_request_cells",
+        "the drafter GEMMs of 16, 24 and 32-row blocks on measured TP8 split-K cells",
+        "draft",
+        ("drafter_fixed_gemms",),
+    ),
     FastPath("context_kv_fork", "drafter context-K/V store on a side stream", "draft"),
     FastPath(
         "drafter_fused_prep",

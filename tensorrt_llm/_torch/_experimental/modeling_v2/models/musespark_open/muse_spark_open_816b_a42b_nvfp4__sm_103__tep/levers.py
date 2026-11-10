@@ -138,6 +138,9 @@ RETIRED: Mapping[str, str] = types.MappingProxyType(
         ),
         "TRTLLM_MUSESPARK_DRAFTER_CONV_EPILOGUE": PREFIX + "DRAFTER_CONV_EPILOGUE=on",
         "TRTLLM_MUSESPARK_DRAFTER_FINISH_NORM": PREFIX + "DRAFTER_FINISH_NORM=on",
+        "TRTLLM_MUSESPARK_DRAFTER_SILU_EPILOGUE": PREFIX + "DRAFTER_SILU_EPILOGUE=on",
+        "TRTLLM_MUSESPARK_TEP8_ATTN_BLOCK_SPLITK": PREFIX + "TEP8_ATTN_BLOCK_SPLITK=on",
+        "TRTLLM_MUSESPARK_DRAFTER_MULTI_REQUEST_CELLS": (PREFIX + "DRAFTER_MULTI_REQUEST_CELLS=on"),
     }
 )
 #: Name prefixes only retired switches carry; any other name under them raises too.
@@ -709,6 +712,12 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         # New this round: default off, not covered by the TP8 default-on gate.
         "drafter_conv_epilogue": _ported(Kind.BITWISE),
         "drafter_finish_norm": _ported(Kind.BITWISE),
+        "drafter_silu_epilogue": _ported(Kind.BITWISE),
+        "tep8_attn_block_splitk": _ported(Kind.BITWISE),
+        # The qkv / gate_up / coefficient cells keep their row's split_k and are bitwise the
+        # table's row; the o_proj and down_proj cells reproduced cuBLAS's bits on every checked
+        # shape, which cannot be proven against a closed library.
+        "drafter_multi_request_cells": _ported(Kind.FLAGGED),
         **{name: _tep4_path_rule() for name in TEP4_PATHS},
     }
 )

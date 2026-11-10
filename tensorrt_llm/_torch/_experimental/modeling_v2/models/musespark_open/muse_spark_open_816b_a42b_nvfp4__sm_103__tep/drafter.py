@@ -28,6 +28,7 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
             block_decode,
             conv_epilogue=plan.enabled("drafter_conv_epilogue"),
             finish_norm=plan.enabled("drafter_finish_norm"),
+            silu_epilogue=plan.enabled("drafter_silu_epilogue"),
         )
     if plan.enabled("wide_drafter_window_attention"):
         # On the block decode drafter_block_decode just bound.

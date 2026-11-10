@@ -88,8 +88,11 @@ def apply(plan: "_dispatch.Plan") -> None:
         # Dense GEMMs.
         (
             "kernels.dense_gemms.dispatcher",
-            dict(batch_splitk=on("tep8_batch_splitk")),
-            dict(batch_splitk=False),
+            dict(
+                batch_splitk=on("tep8_batch_splitk"),
+                attn_block_splitk=on("tep8_attn_block_splitk"),
+            ),
+            dict(batch_splitk=False, attn_block_splitk=False),
         ),
         # Attention.
         (
@@ -152,6 +155,11 @@ def apply(plan: "_dispatch.Plan") -> None:
             dict(tep8_max_rows=None),
         ),
         # Drafter.
+        (
+            "ops.gemm.fixed_low_m_gemm",
+            dict(multi_request_cells=on("drafter_multi_request_cells")),
+            dict(multi_request_cells=False),
+        ),
         (
             "ops.allreduce.drafter_hop",
             dict(

@@ -41,7 +41,7 @@ rows it takes calls it (``ops/spec/dflash_window_attention_wide``, the same
 attention and append on a multi-request split geometry) instead of
 ``dflash_window_attention``.
 
-Two levers refine them, each resolved by the plan and passed to ``install``:
+Three levers refine them, each resolved by the plan and passed to ``install``:
 
 * ``drafter_conv_epilogue`` (on ``drafter_block_conv`` and ``drafter_fixed_gemms``): on blocks of
   9..32 rows whose coefficient projection runs a ``drafter_fixed_gemms`` tactic, ``prepare`` is one
@@ -52,6 +52,11 @@ Two levers refine them, each resolved by the plan and passed to ``install``:
 * ``drafter_finish_norm`` (on ``drafter_block_decode``): on blocks the drafter
   hops do not take, each hop's finish convolution and the next norm's fused residual add + RMSNorm
   are one launch (``ops/spec/drafter_finish_norm.py``, ``FinishNorm``), bitwise the two.
+* ``drafter_silu_epilogue`` (on ``drafter_block_decode``): on blocks of 9..32
+  rows whose ``gate_up_proj`` runs a ``drafter_fixed_gemms`` tactic, the MLP's ``gate_up_proj`` and
+  ``silu(gate) * up`` are one launch (``ops/gemm/gate_up_silu_gemm.py``, ``SiluEpilogue``) over a
+  copy of the gate_up weight with gate and up rows interleaved (112 MiB per layer), bitwise the
+  fixed-tactic GEMM and the built-in ``silu_and_mul``.
 
 The fast paths compose. ``windowed_block_decode``, like the built-in forward,
 reaches the block convolutions through the modules' ``prepare`` / ``finish``,
@@ -92,6 +97,9 @@ SUPPORTED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 _ENTRY_ROWS = (8,)
 
 
+#: Block rows ``SiluEpilogue`` serves: two to four requests' blocks (the one-request block keeps
+#: the PDL chain's silu trigger).
+SILU_EPILOGUE_ROWS = (9, 32)
 #: Block rows ``ConvEpilogue`` serves: two to four requests' blocks (the one-request block keeps
 #: the PDL chain's convolution trigger).
 CONV_EPILOGUE_ROWS = (9, 32)
@@ -249,6 +257,153 @@ def _finish_norm_reason(draft_model: nn.Module) -> Optional[str]:
             if type(conv).finish is not DFlash2BlockConv.finish:
                 return f"{kind}.{index} overrides finish"
     return None
+
+
+class SiluEpilogue:
+    """One drafter MLP with ``gate_up_proj`` and ``silu(gate) * up`` as one launch.
+
+    Holds the ``interleave``d copy of the MLP's ``gate_up_proj`` weight. Called as the MLP is
+    (``x``, ``final_all_reduce_params``); a call it does not serve -- rows outside
+    ``SILU_EPILOGUE_ROWS``, operands the kernel does not take, a ``gate_up_proj`` not on a
+    ``drafter_fixed_gemms`` tactic at that row count (whose bits the kernel reproduces) or no longer
+    holding the copied weight -- runs the MLP itself.
+    """
+
+    logged = False
+
+    def __init__(self, mlp: nn.Module) -> None:
+        from ...ops.gemm import gate_up_silu_gemm as _gemm
+
+        weight = mlp.gate_up_proj.weight
+        self.mlp = mlp
+        self.weight = _gemm.interleave(weight.detach())
+        self.source = weight
+        self._errors: dict = {}
+
+    def _tactic(self, rows: int, k: int):
+        """The ``drafter_fixed_gemms`` tactic ``gate_up_proj`` runs at ``rows``, if the fused kernel
+        takes it, else None (cached per row count and tactic)."""
+        from ...spec_worker import FixedTacticLinearMethod
+
+        proj = self.mlp.gate_up_proj
+        method = proj.quant_method
+        if type(method) is not FixedTacticLinearMethod or proj.weight is not self.source:
+            return None
+        if getattr(proj, "use_custom_cublas_mm", False):
+            return None
+        tactic = method.tactic_for(rows, k, self.weight.shape[0])
+        if tactic is None:
+            return None
+        key = (rows, k, tuple(tactic))
+        error = self._errors.get(key, False)
+        if error is False:
+            from ...ops.gemm import batch_splitk_gemm as _bsk
+            from ...ops.gemm import gate_up_silu_gemm as _gemm
+
+            error = _gemm.tactic_error(
+                _bsk.BatchSplitKTactic(*tactic), rows, self.weight.shape[0], k
+            )
+            self._errors[key] = error
+        return None if error is not None else (tactic, method.enable_pdl)
+
+    def __call__(self, x: torch.Tensor, final_all_reduce_params=None) -> torch.Tensor:
+        rows = x.shape[0] if x.dim() == 2 else 0
+        picked = None
+        if (
+            SILU_EPILOGUE_ROWS[0] <= rows <= SILU_EPILOGUE_ROWS[1]
+            and x.dtype == torch.bfloat16
+            and x.is_cuda
+            and x.is_contiguous()
+            and x.data_ptr() % 32 == 0
+            and not torch.is_grad_enabled()
+        ):
+            picked = self._tactic(rows, x.shape[1])
+        if picked is None:
+            return self.mlp(x, final_all_reduce_params=final_all_reduce_params)
+        from ...ops.gemm import batch_splitk_gemm as _bsk
+        from ...ops.gemm import gate_up_silu_gemm as _gemm
+
+        tactic, enable_pdl = picked
+        activated = _gemm.run(x, self.weight, _bsk.BatchSplitKTactic(*tactic), enable_pdl)
+        if not SiluEpilogue.logged:
+            SiluEpilogue.logged = True
+            logger.info(
+                f"[musespark_open] drafter_silu_epilogue: the first fused gate_up ran ({rows} rows, "
+                f"split-K tactic {tuple(tactic)}): gate_up GEMM + silu(gate) * up in one launch"
+            )
+        mlp = self.mlp
+        return mlp.down_proj(
+            activated, all_reduce_params=final_all_reduce_params, layer_idx=mlp.layer_idx
+        )
+
+
+def _silu_epilogue_reason(draft_model: nn.Module) -> Optional[str]:
+    """Why ``SiluEpilogue`` cannot stand in for this drafter's MLPs, or None.
+
+    The MLP must run exactly ``down_proj(silu_and_mul(gate_up_proj(x)))``: the built-in
+    ``GatedMLP`` (or the PDL chain's re-class of it), a plain SwiGLU on a fused, bias-free BF16
+    ``gate_up_proj`` and a BF16 ``down_proj`` input.
+    """
+    from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+
+    for index, layer in enumerate(draft_model.model.layers):
+        mlp = layer.mlp
+        where = f"layers.{index}.mlp"
+        if not isinstance(mlp, GatedMLP) or type(mlp).forward is not GatedMLP.forward:
+            return f"{where} is {type(mlp).__name__}, not the built-in GatedMLP"
+        if (
+            mlp.activation is not torch.nn.functional.silu
+            or not mlp._is_plain_swiglu()
+            or mlp.swiglu_limit
+        ):
+            return f"{where} is not a plain SwiGLU"
+        if mlp.split_gate_up:
+            return f"{where} splits its gate/up projection"
+        if mlp._can_fuse_gate_up_swiglu() or mlp._can_fuse_swiglu_fp8_quant():
+            return f"{where} fuses its activation into a GEMM"
+        down = mlp.down_proj
+        if getattr(down, "has_fp8_qdq", False) or getattr(down, "has_w4a8_nvfp4_fp8", False):
+            return f"{where} quantizes the activation for down_proj"
+        weight = getattr(mlp.gate_up_proj, "weight", None)
+        if (
+            weight is None
+            or weight.dtype != torch.bfloat16
+            or weight.dim() != 2
+            or weight.shape[0] % 16
+            or mlp.gate_up_proj.bias is not None
+        ):
+            return f"{where}.gate_up_proj is not a bias-free BF16 [2d, K] projection"
+    return None
+
+
+def install_silu_epilogue(draft_model: nn.Module) -> int:
+    """Give every drafter MLP its ``SiluEpilogue``; return how many are new.
+
+    Idempotent (an MLP whose epilogue holds the current gate_up weight is left alone).
+
+    Raises:
+        ValueError: on an MLP the epilogue cannot stand in for (``_silu_epilogue_reason``), on
+            every rank alike.
+    """
+    reason = _silu_epilogue_reason(draft_model)
+    if reason is not None:
+        raise ValueError(f"[musespark_open] drafter_silu_epilogue cannot run here: {reason}")
+    added, total_bytes = 0, 0
+    for layer in draft_model.model.layers:
+        mlp = layer.mlp
+        fused = mlp.__dict__.get("_silu_epilogue")
+        if fused is None or fused.source is not mlp.gate_up_proj.weight:
+            mlp._silu_epilogue = SiluEpilogue(mlp)
+            added += 1
+            total_bytes += mlp._silu_epilogue.weight.numel() * 2
+    if added:
+        logger.info(
+            f"[musespark_open] drafter_silu_epilogue: drafter blocks of {SILU_EPILOGUE_ROWS[0]}.."
+            f"{SILU_EPILOGUE_ROWS[1]} rows run each MLP's gate_up_proj + silu(gate) * up as one launch "
+            f"on {len(draft_model.model.layers)} layers ({total_bytes / 2**20:.0f} MiB of interleaved "
+            "gate_up weights)"
+        )
+    return added
 
 
 class FusedDFlash2BlockConv(DFlash2BlockConv):
@@ -628,6 +783,8 @@ def windowed_block_decode(
             hidden_out, mlp_conv_coefficients = self.mlp_convs[layer_idx].prepare(
                 hidden_out, block_size
             )
+        # ``drafter_silu_epilogue``: gate_up_proj + silu(gate) * up in one launch.
+        mlp = layer.mlp.__dict__.get("_silu_epilogue") or layer.mlp
         if hops is not None:
             # The MLP, its all-reduce, the MLP finish convolution and the next
             # norm (the next layer's input_layernorm, or model.norm) in one hop.
@@ -638,7 +795,7 @@ def windowed_block_decode(
             )
             prenormed = hops.mlp(
                 layer_idx,
-                layer.mlp,
+                mlp,
                 hidden_out,
                 res_flat,
                 mlp_conv_coefficients,
@@ -647,7 +804,7 @@ def windowed_block_decode(
                 block_size,
             )
             continue
-        hidden_out = layer.mlp(hidden_out)
+        hidden_out = mlp(hidden_out)
         if finish_norm is not None:
             # The MLP finish convolution and the next norm (the next layer's input_layernorm,
             # or model.norm) in one launch, as the hop does; the residual is updated in place.
@@ -708,6 +865,7 @@ def install(
     *,
     conv_epilogue: bool = False,
     finish_norm: bool = False,
+    silu_epilogue: bool = False,
 ) -> None:
     """Install the fused block convolution and the windowed block decode on ``draft_model``.
 
@@ -726,7 +884,7 @@ def install(
     if block_conv:
         _install_fused_block_conv(draft_model, conv_epilogue)
     if block_decode:
-        _install_windowed_attention(draft_model, True, finish_norm)
+        _install_windowed_attention(draft_model, True, finish_norm, silu_epilogue)
 
 
 def _builtin_block_convs(draft_model: nn.Module) -> int:
@@ -794,7 +952,7 @@ def install_conv_epilogue(draft_model: nn.Module) -> int:
 
 
 def _install_windowed_attention(
-    draft_model: nn.Module | None, block_decode: bool, finish_norm: bool
+    draft_model: nn.Module | None, block_decode: bool, finish_norm: bool, silu_epilogue: bool
 ) -> None:
     enable_pdl = LAUNCH_PDL
     wrapped = isinstance(
@@ -829,3 +987,5 @@ def _install_windowed_attention(
                     "take run each hop's finish convolution + residual add + RMSNorm as one launch "
                     f"(pdl={enable_pdl}, dependents released at entry)"
                 )
+        if silu_epilogue:
+            install_silu_epilogue(draft_model)
