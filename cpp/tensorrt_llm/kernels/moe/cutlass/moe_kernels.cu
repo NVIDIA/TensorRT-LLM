@@ -1866,8 +1866,7 @@ __global__ void expandInputRowsFp8BlockScaleKernel(InputActivationsType const* u
     // first row's expert and the rest advance linearly instead of searching per row.
     int64_t const rows_per_block = ceilDiv(num_valid_tokens, static_cast<int64_t>(gridDim.x));
     int64_t const row_begin = blockIdx.x * rows_per_block;
-    int64_t const row_end
-        = row_begin + rows_per_block < num_valid_tokens ? row_begin + rows_per_block : num_valid_tokens;
+    int64_t const row_end = std::min(row_begin + rows_per_block, num_valid_tokens);
     int64_t expert = row_begin < row_end
         ? findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, row_begin + 1) - 1
         : 0;
@@ -2885,6 +2884,7 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
         }();
 
         static int32_t const sm_count = tensorrt_llm::common::getMultiProcessorCount();
+        TLLM_CHECK_WITH_INFO(num_elems_in_col > 0, "MoE activation requires a positive inter_size.");
         // A row narrower than the block (e.g. a tensor-parallel slice of the intermediate size) would leave the
         // remaining threads idle, so shrink the block to the row width, in whole warps.
         int32_t const threads = static_cast<int32_t>(
@@ -2915,12 +2915,12 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
             (GemmOutputType*) nullptr, fp8_block_scale_out);
     }; // end lambda doActivationKernelLauncher
 
-    // 256 threads per block * 256 blocks / 1 rows per block can be handled by 1-2 waves depending on SM arch
+    // Rows per CTA follow the total number of column vectors (num_elems_in_col * expanded_num_tokens), not the block
+    // width the launcher picks from the row width: one row per CTA below 64K vectors, two below 128K, four above.
     if (num_elems_in_col * expanded_num_tokens < 256 * 256)
     {
         doActivationKernelLauncher(std::integral_constant<int, 1>());
     }
-    // 256 threads per block * 512 blocks / 2 rows per block can be handled by 1-2 waves depending on SM arch
     else if (num_elems_in_col * expanded_num_tokens < 256 * 512)
     {
         doActivationKernelLauncher(std::integral_constant<int, 2>());
