@@ -144,9 +144,7 @@ def _columns_kernel(
 
 
 @triton.jit
-def _layer_offset(
-    layer, o0, o1, o2, o3, o4, o5, o6, o7
-):
+def _layer_offset(layer, o0, o1, o2, o3, o4, o5, o6, o7):
     offset = o0
     offset = tl.where(layer == 1, o1, offset)
     offset = tl.where(layer == 2, o2, offset)
@@ -330,7 +328,9 @@ class DrafterStepPrep:
 
         tables = worker._ctx_block_tables
         offsets_name = (
-            "kv_cache_block_offsets" if worker._ctx_unified_cache else "draft_kv_cache_block_offsets"
+            "kv_cache_block_offsets"
+            if worker._ctx_unified_cache
+            else "draft_kv_cache_block_offsets"
         )
         src = getattr(attn_metadata, offsets_name, None)
         if src is None or num_seqs <= 0 or src.dim() != 4:
@@ -360,7 +360,9 @@ class DrafterStepPrep:
         )
         return True
 
-    def store_step_context(self, worker, draft_model, gen_hs, slots, rows, per_request: int) -> None:
+    def store_step_context(
+        self, worker, draft_model, gen_hs, slots, rows, per_request: int
+    ) -> None:
         """``DFlashWorker._store_step_context`` without the mask (the fork's side chain) over the
         manager's pages: the positions and columns in one launch (from one read of the lengths,
         as the built-in's ``ctx_len``), the built-in projection and ``precompute_context_kv``,

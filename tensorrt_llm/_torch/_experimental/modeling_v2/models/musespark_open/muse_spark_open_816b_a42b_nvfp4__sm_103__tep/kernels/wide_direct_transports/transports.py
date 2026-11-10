@@ -109,7 +109,9 @@ def _cells(plan, site: str) -> List[str]:
     return [table[rows - WIDE_MIN_ROWS] for rows in ROWS]
 
 
-def refusal(model, plan, wide_projections, unpool_direct, sites: FrozenSet[str], capability) -> Optional[str]:
+def refusal(
+    model, plan, wide_projections, unpool_direct, sites: FrozenSet[str], capability
+) -> Optional[str]:
     """Why the path cannot run here, or None. Reads construction-time state only (rank-agnostic)."""
     layers = list(model.layers)
     mapping = layers[0].mapping
@@ -129,7 +131,9 @@ def refusal(model, plan, wide_projections, unpool_direct, sites: FrozenSet[str],
                     f"the {rows}-row {site} cell {cell} is not a flashinfer kernel, which alone stores "
                     "into a transport slot"
                 )
-    if "unpool" in sites and (unpool_direct is None or len(getattr(unpool_direct, "sites", ())) < 2):
+    if "unpool" in sites and (
+        unpool_direct is None or len(getattr(unpool_direct, "sites", ())) < 2
+    ):
         return "unpool_into_boundary (whose joins, sites and buffers the unpool site rides) is not installed"
     return None
 
@@ -222,7 +226,10 @@ class WideDirectTransports:
         chosen: List[int] = []
         for index, layer in enumerate(self._layers):
             moe = layer.feed_forward
-            if isinstance(moe, MuseSparkOpenTepGatherMoE) and _pool_args(moe, WIDE_MAX_ROWS) is not None:
+            if (
+                isinstance(moe, MuseSparkOpenTepGatherMoE)
+                and _pool_args(moe, WIDE_MAX_ROWS) is not None
+            ):
                 chosen.append(index)
         local = tuple(chosen)
         everyone = Distributed.get(self.mapping).tp_allgather(local, small_payload=True)
@@ -235,7 +242,9 @@ class WideDirectTransports:
             reason = pool_owner_conflict(self._layers[index] for index in chosen)
         if reason is None:
             for index in chosen:
-                dispatcher = getattr(self._layers[index].feed_forward.pooler, "_low_m_gemm_dispatcher", None)
+                dispatcher = getattr(
+                    self._layers[index].feed_forward.pooler, "_low_m_gemm_dispatcher", None
+                )
                 held = getattr(dispatcher, "publish_policy", None)
                 if dispatcher is None or not hasattr(dispatcher, "publish"):
                     reason = f"layer {index}'s pool projection is not on the dense GEMM dispatcher"
@@ -317,7 +326,11 @@ class WideDirectTransports:
         if buffer is None or module is not moe.pooler:
             return None
         rows = hidden_states.shape[0] if hidden_states.dim() == 2 else -1
-        if rows != self._rows or hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
+        if (
+            rows != self._rows
+            or hidden_states.dtype != torch.bfloat16
+            or not hidden_states.is_contiguous()
+        ):
             raise RuntimeError(
                 f"[musespark_open] wide_direct_transports: armed for {self._rows} rows, the pool "
                 f"projection got {tuple(hidden_states.shape)} {hidden_states.dtype}"

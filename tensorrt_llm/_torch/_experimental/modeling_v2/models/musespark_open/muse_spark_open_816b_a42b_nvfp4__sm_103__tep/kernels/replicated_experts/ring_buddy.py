@@ -108,6 +108,7 @@ import torch
 
 from tensorrt_llm._torch.distributed import allgather
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -1515,7 +1516,7 @@ class _PlacementStats:
         self.rank = rank
         self.layers = 0
         self.failed = False
-        self.acc = torch.zeros(2 * PLACEMENT_STATS_FIELDS, dtype=torch.int64, pin_memory=True)
+        self.acc = maybe_pin_memory(torch.zeros(2 * PLACEMENT_STATS_FIELDS, dtype=torch.int64))
 
     def add(self, stats: torch.Tensor, rows: int) -> None:
         if self.failed:

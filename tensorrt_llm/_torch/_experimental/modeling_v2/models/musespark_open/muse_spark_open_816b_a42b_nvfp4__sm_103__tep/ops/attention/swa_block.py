@@ -351,7 +351,9 @@ def _swa_split_kernel(
             mask=new[:, None],
             other=0.0,
         )
-        e_wk = _prep_rows_load(qkv_ptr, tok * qkv_stride, tl.zeros([8], tl.int32) + k_col, write_ok, 8)
+        e_wk = _prep_rows_load(
+            qkv_ptr, tok * qkv_stride, tl.zeros([8], tl.int32) + k_col, write_ok, 8
+        )
         e_wv = tl.load(
             qkv_ptr + tok[:, None] * qkv_stride + v_col + d[None, :],
             mask=write_ok[:, None],
@@ -1113,7 +1115,9 @@ def _swa_combine_kernel(
         if EARLY_LOADS:
             g = g_early.to(tl.float32)
         else:
-            g = tl.load(gate_ptr + t * gate_token_stride + head * gate_head_stride + d).to(tl.float32)
+            g = tl.load(gate_ptr + t * gate_token_stride + head * gate_head_stride + d).to(
+                tl.float32
+            )
         sigmoid = tl.sigmoid(g).to(tl.bfloat16)
         result = normed.to(tl.float32) * sigmoid.to(tl.float32)
         tl.store(out_ptr + t * out_stride + head * D + d, result)

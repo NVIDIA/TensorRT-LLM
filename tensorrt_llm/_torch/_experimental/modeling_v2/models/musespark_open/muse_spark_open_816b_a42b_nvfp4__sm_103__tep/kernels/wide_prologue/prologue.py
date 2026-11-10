@@ -237,7 +237,9 @@ def tep8_refusal(model: MuseSparkOpenModel) -> Optional[str]:
                 f"{layer.layer_idx} has {type(moe).__name__} without its inbox"
             )
         if moe._router_stream is None:
-            return f"the TEP8 router shard runs on the router fork; layer {layer.layer_idx} has none"
+            return (
+                f"the TEP8 router shard runs on the router fork; layer {layer.layer_idx} has none"
+            )
         if getattr(moe, "_wide", None) is None or moe._wide_pool_inbox is None:
             return (
                 "the TEP8 router shard takes the pool slices wide_projection_gathers defers; layer "

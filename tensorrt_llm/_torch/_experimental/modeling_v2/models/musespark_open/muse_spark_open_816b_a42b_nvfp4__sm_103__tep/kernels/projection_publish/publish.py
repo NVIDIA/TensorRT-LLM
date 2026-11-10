@@ -66,9 +66,7 @@ from ..projection_gathers.gathers import MuseSparkOpenTepGatedResidual, MuseSpar
 MIN_ROWS, MAX_ROWS = _publish.MIN_ROWS, 448
 
 
-def _pool_args(
-    moe, max_rows: int = MAX_ROWS
-) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+def _pool_args(moe, max_rows: int = MAX_ROWS) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """(gain, global scale) exactly when the built-in ``prepare_expert_input`` would quantize a
     BF16 ``[1..max_rows, 4096]`` pool output with flashinfer's fused ``rmsnorm_fp4quant``; else None.
 
