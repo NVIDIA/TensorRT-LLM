@@ -24,6 +24,9 @@ import pytest
 import torch
 import yaml
 
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
+    MiniMaxM3KVCacheManagerV2,
+)
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -662,3 +665,40 @@ def test_launcher_leaves_equal_page_sizes_to_the_worker_gates(
         creator._tokens_per_block = context_tokens_per_block
         assert "tokens_per_block is 128" in creator._dflash_unify_blocker()
         assert not creator._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize("request_mode", [None, "auto"], ids=["unset", "auto"])
+def test_launcher_leaves_tp_and_attention_dp_to_hosting_managers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, request_mode: str | None
+) -> None:
+    """Peers differing only in TP or attention DP leave the switch unset unless it is "auto".
+
+    Unset, a manager hosting draft layers shares on both peers (its decision compares global KV
+    heads), and a plain V2 manager keeps the separate draft KV cache, as an explicit "0" would.
+    """
+    if request_mode is None:
+        monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
+    else:
+        monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, request_mode)
+    spec = {"decoding_type": "DSpark", "attention_backend": "TRTLLM"}
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(
+            monkeypatch,
+            tmp_path,
+            {"speculative_config": spec, "tensor_parallel_size": 2},
+            {"speculative_config": spec, "tensor_parallel_size": 2, "enable_attention_dp": True},
+        )
+
+    assert os.environ.get(_SHARED_DRAFT_KV_ENV) == ("0" if request_mode else None)
+    layout = _model_config(kv_heads=8, head_dim=128)
+    for enable_attention_dp in (False, True):
+        plain = _creator(is_disagg=True, target=layout, draft=layout, tp_size=2)
+        plain._mapping.enable_attention_dp = enable_attention_dp
+        assert not plain._should_unify_dflash_kv_cache()
+        hosting = _creator(
+            is_disagg=True, target=layout, draft=layout, tp_size=2, draft_windows=[128]
+        )
+        hosting._mapping.enable_attention_dp = enable_attention_dp
+        hosting._kv_cache_manager_cls = MiniMaxM3KVCacheManagerV2
+        hosting._sparse_attention_config = SimpleNamespace(implementation="msa")
+        assert hosting._should_unify_dflash_kv_cache() is (request_mode is None)

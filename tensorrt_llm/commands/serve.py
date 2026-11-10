@@ -2819,7 +2819,15 @@ def set_cuda_device():
     torch.cuda.set_device(device_id)
 
 
-def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
+_TP_OR_ATTENTION_DP_MISMATCH = (
+    "the same tensor_parallel_size and enable_attention_dp in "
+    "context_servers and generation_servers")
+
+
+def _shared_draft_kv_blocker(server_configs,
+                             *,
+                             check_tp_and_attention_dp: bool = True
+                             ) -> Optional[str]:
     """What keeps the context and generation servers from sharing draft KV, or None."""
     with_spec = {
         cfg.type
@@ -2828,11 +2836,11 @@ def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
     if with_spec != {"ctx", "gen"}:
         return ("speculative_config in both context_servers and "
                 "generation_servers")
-    if len({(cfg.other_args.get("tensor_parallel_size", 1),
-             bool(cfg.other_args.get("enable_attention_dp", False)))
-            for cfg in server_configs}) != 1:
-        return ("the same tensor_parallel_size and enable_attention_dp in "
-                "context_servers and generation_servers")
+    if check_tp_and_attention_dp and len(
+        {(cfg.other_args.get("tensor_parallel_size", 1),
+          bool(cfg.other_args.get("enable_attention_dp", False)))
+         for cfg in server_configs}) != 1:
+        return _TP_OR_ATTENTION_DP_MISMATCH
     for cfg in server_configs:
         spec = cfg.other_args["speculative_config"]
         backend = spec.get("attention_backend")
@@ -2921,7 +2929,16 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
             "TRTLLM_DISAGG_SHARED_DRAFT_KV") == "1":
         raise click.UsageError(
             f"TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires {blocker}.")
-    if os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") in (None, "auto"):
+    shared_draft_kv = os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV")
+    # Left unset, a manager hosting draft layers shares across TP and attention
+    # DP (its gate compares global KV heads and the peers reshard them), while a
+    # plain KVCacheManagerV2 keeps a separate draft KV cache.
+    tp_or_attention_dp_only = (blocker == _TP_OR_ATTENTION_DP_MISMATCH
+                               and _shared_draft_kv_blocker(
+                                   disagg_cfg.server_configs,
+                                   check_tp_and_attention_dp=False) is None)
+    if shared_draft_kv == "auto" or (shared_draft_kv is None
+                                     and not tp_or_attention_dp_only):
         os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = ("0"
                                                        if blocker else "auto")
 
