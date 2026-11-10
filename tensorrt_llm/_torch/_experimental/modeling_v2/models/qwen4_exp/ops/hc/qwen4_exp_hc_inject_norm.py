@@ -32,8 +32,12 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.jit_variants import (
+    warm_variants,
+)
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
+from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber
 
 #: Trigger dependents at kernel start (`griddepcontrol.launch_dependents`); a no-op
 #: unless the next kernel is launched with programmatic dependent launch.
@@ -74,12 +78,16 @@ def _hc_inject_norm_kernel(
     TOPK: tl.constexpr,
     STREAMS_PER_PROGRAM: tl.constexpr,
     PDL_TRIGGER: tl.constexpr,
+    PDL_WAIT: tl.constexpr = False,
 ):
     if PDL_TRIGGER:
         # Release a programmatic-dependent-launch consumer (the decode mixer's
         # first projection) at once: it streams its static weights while this
         # kernel runs and waits for the grid to finish before reading `normed`.
         tl.extra.cuda.gdc_launch_dependents()
+    if PDL_WAIT:
+        # Every input may be the previous kernel's output: nothing is read before its grid ends.
+        gdc_wait_with_memory_clobber()
     # One program per `STREAMS_PER_PROGRAM` streams of a row; a stream's `HIDDEN`
     # columns are one RMS group. A row's programs are adjacent in launch order, so
     # the row's block output (and the combine's operands) come from HBM once and
@@ -1000,7 +1008,7 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
             # The fold gathers TOPK rows to form a row's block output: two streams a
             # program form it half as often (when hc_count is even).
             spp = 2 if top_k and hc_count % 2 == 0 else 1
-            _hc_inject_norm_kernel[(rows * hc_count // spp,)](
+            args = (
                 hyper_input,
                 block_out if has_inject else hyper_input,
                 inject if has_inject else hyper_input,
@@ -1021,6 +1029,8 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
                 hc_out.stride(0),
                 normed.stride(0),
                 eps,
+            )
+            constexprs = dict(
                 HC_COUNT=hc_count,
                 HIDDEN=hidden,
                 BLOCK=block,
@@ -1029,8 +1039,29 @@ class Qwen4ExpHcInjectNorm(OpWrapper):
                 TOPK=top_k,
                 STREAMS_PER_PROGRAM=spp,
                 PDL_TRIGGER=_PDL_TRIGGER,
-                num_warps=(2 if rows >= _FEW_WARPS_MIN_ROWS else 8) if block >= 2048 else 4,
             )
+            if block >= 2048:
+                # Both warp counts compile at a geometry's first call.
+                warps = 2 if rows >= _FEW_WARPS_MIN_ROWS else 8
+                warm_variants(
+                    _hc_inject_norm_kernel,
+                    (
+                        args[10:19],
+                        hyper_input.dtype,
+                        hc_count,
+                        hidden,
+                        has_inject,
+                        has_shared,
+                        top_k,
+                        spp,
+                    ),
+                    args,
+                    [{"num_warps": 8}, {"num_warps": 2}],
+                    **constexprs,
+                )
+            else:
+                warps = 4
+            _hc_inject_norm_kernel[(rows * hc_count // spp,)](*args, **constexprs, num_warps=warps)
         return hc_out, normed
 
     def reference(

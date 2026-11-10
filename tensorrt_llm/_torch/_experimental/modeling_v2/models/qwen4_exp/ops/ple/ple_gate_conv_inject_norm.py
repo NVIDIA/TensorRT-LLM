@@ -31,6 +31,10 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.jit_variants import (
+    compile_only,
+    first_time,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ngram_token_history import (
     DEP4_SLOTS,
     TEP4_SLOTS,
@@ -39,12 +43,47 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ple_
     PER_SEQ_MAX_ROWS,
     _seq_of_rows,
 )
+from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber
 
 
 @triton.jit
 def _rms(x, w, HIDDEN: tl.constexpr, eps):
     """Gemma RMS norm in fp32: `x * rsqrt(mean(x^2) + eps) * (1 + w)`."""
     return x * tl.rsqrt(tl.sum(x * x, axis=0) / HIDDEN + eps) * (1.0 + w)
+
+
+@triton.jit
+def _injected_stream(
+    hc_ptr,
+    row,
+    stride_hc,
+    ch,
+    cols,
+    m,
+    stream,
+    block_ptr,
+    inj_ptr,
+    sh_ptr,
+    gate_ptr,
+    stride_block,
+    stride_inj,
+    stride_sh,
+    stride_gate,
+    HAS_INJECT: tl.constexpr,
+    HAS_SHARED: tl.constexpr,
+):
+    """One stream of the residual, fp32. With `HAS_INJECT` the previous MoE block's injection
+    comes first, rounded as `qwen4_exp_hc_inject_norm` rounds it."""
+    x = tl.load(hc_ptr + row * stride_hc + ch, mask=m, other=0.0).to(tl.float32)
+    if HAS_INJECT:
+        b = tl.load(block_ptr + row * stride_block + cols, mask=m, other=0.0).to(tl.float32)
+        if HAS_SHARED:
+            sg = tl.sigmoid(tl.load(gate_ptr + row * stride_gate).to(tl.float32))
+            sh = tl.load(sh_ptr + row * stride_sh + cols, mask=m, other=0.0)
+            b = (b + sg * sh.to(tl.float32)).to(block_ptr.dtype.element_ty).to(tl.float32)
+        g = tl.load(inj_ptr + row * stride_inj + stream).to(tl.float32)
+        x = (x + b * g).to(hc_ptr.dtype.element_ty).to(tl.float32)
+    return x
 
 
 @triton.jit
@@ -64,22 +103,39 @@ def _ple_gate_kernel(
     eps,
     clamp_min,
     sqrt_d,
+    block_ptr,
+    inj_ptr,
+    sh_ptr,
+    gate_ptr,
+    stride_block,
+    stride_inj,
+    stride_sh,
+    stride_gate,
     HIDDEN: tl.constexpr,
     BLOCK: tl.constexpr,
+    HAS_INJECT: tl.constexpr,
+    HAS_SHARED: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """Per (row, stream): the key and query grouped norms, the gate, the gated
-    value and the conv-input grouped norm. Writes `gated` and `xc`."""
+    value and the conv-input grouped norm. Writes `gated` and `xc`. With `PDL` the norm
+    weights are read before the wait, everything else after it."""
     row = tl.program_id(0).to(tl.int64)
     stream = tl.program_id(1)
     cols = tl.arange(0, BLOCK)
     m = cols < HIDDEN
     ch = stream * HIDDEN + cols
-    x = tl.load(hc_ptr + row * stride_hc + ch, mask=m, other=0.0).to(tl.float32)
-    kp = tl.load(key_ptr + row * stride_key + ch, mask=m, other=0.0).to(tl.float32)
-    v = tl.load(value_ptr + row * stride_value + cols, mask=m, other=0.0).to(tl.float32)
     wk = tl.load(nk_ptr + ch, mask=m, other=0.0).to(tl.float32)
     wq = tl.load(nq_ptr + ch, mask=m, other=0.0).to(tl.float32)
     wc = tl.load(nc_ptr + ch, mask=m, other=0.0).to(tl.float32)
+    if PDL:
+        gdc_wait_with_memory_clobber()
+        tl.extra.cuda.gdc_launch_dependents()
+    x = _injected_stream(hc_ptr, row, stride_hc, ch, cols, m, stream, block_ptr, inj_ptr, sh_ptr,
+                         gate_ptr, stride_block, stride_inj, stride_sh, stride_gate, HAS_INJECT,
+                         HAS_SHARED)  # fmt: skip
+    kp = tl.load(key_ptr + row * stride_key + ch, mask=m, other=0.0).to(tl.float32)
+    v = tl.load(value_ptr + row * stride_value + cols, mask=m, other=0.0).to(tl.float32)
     kn = _rms(kp, wk, HIDDEN, eps).to(tl.bfloat16).to(tl.float32)
     qn = _rms(x, wq, HIDDEN, eps).to(tl.bfloat16).to(tl.float32)
     g = tl.sum(kn * qn, axis=0) / sqrt_d
@@ -91,7 +147,11 @@ def _ple_gate_kernel(
     tl.store(xc_ptr + row * stride_out + ch, xc, mask=m)
 
 
-@triton.jit
+# The per-sequence metadata may begin at any row of a mixed step's tensors.
+@triton.jit(
+    do_not_specialize=["publish_end"],
+    do_not_specialize_on_alignment=["slots_ptr", "carry_ptr", "qsl_ptr"],
+)
 def _ple_conv_kernel(
     xc_ptr,
     gated_ptr,
@@ -104,6 +164,7 @@ def _ple_conv_kernel(
     stride_out,
     stride_state,
     pad_slot,
+    publish_end,
     KSIZE: tl.constexpr,
     DIL: tl.constexpr,
     STATE: tl.constexpr,
@@ -111,16 +172,21 @@ def _ple_conv_kernel(
     MAX_P: tl.constexpr,
     ROWS: tl.constexpr,
     HAS_CARRY: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """Per (sequence, block of ROWS channels): the dilated depthwise conv of
     each of the sequence's rows against `[state | conv inputs]`, its SiLU added
-    to the gated value (`ple`), and the state advanced in place.
+    to the gated value (`ple`), and the state advanced in place for the
+    sequences below `publish_end` (the others' states are left as they were).
 
     A channel's state is `STATE` contiguous columns. The publish moves it as a
     `[ROWS, HEAD]` tile of the first HEAD (a power of two) columns plus, when
     `STATE == HEAD + 1`, one `[ROWS]` vector for the last, so no lane is spent
     on padding and every index is a plain 2-D offset. Every load is issued
     before the first store."""
+    if PDL:
+        gdc_wait_with_memory_clobber()
+        tl.extra.cuda.gdc_launch_dependents()
     s = tl.program_id(0)
     ch0 = tl.program_id(1) * ROWS
     begin = tl.load(qsl_ptr + s).to(tl.int64)
@@ -181,12 +247,17 @@ def _ple_conv_kernel(
     # Every read of these state rows -- `keep` and the taps -- lands before
     # the first store over them.
     tl.debug_barrier()
-    tl.store(block + r[:, None] * STATE + i[None, :], head, mask=live)
+    publish = live & (s < publish_end)
+    tl.store(block + r[:, None] * STATE + i[None, :], head, mask=publish)
     if STATE > HEAD:
-        tl.store(block + r * STATE + HEAD, tail, mask=live)
+        tl.store(block + r * STATE + HEAD, tail, mask=publish)
 
 
-@triton.jit
+# The packed row and sequence counts follow the step.
+@triton.jit(
+    do_not_specialize=["num_rows", "num_seqs"],
+    do_not_specialize_on_alignment=["slots_ptr", "carry_ptr", "qsl_ptr"],
+)
 def _ple_conv_rows_kernel(
     xc_ptr,
     gated_ptr,
@@ -262,23 +333,60 @@ def _ple_residual_norm_kernel(
     stride_hc_out,
     stride_normed,
     eps,
+    block_ptr,
+    inj_ptr,
+    sh_ptr,
+    gate_ptr,
+    stride_block,
+    stride_inj,
+    stride_sh,
+    stride_gate,
     HIDDEN: tl.constexpr,
     BLOCK: tl.constexpr,
+    HAS_INJECT: tl.constexpr,
+    HAS_SHARED: tl.constexpr,
+    PDL: tl.constexpr = False,
 ):
     """Per (row, stream): the PLE output added into the stream, then the next
-    site's grouped norm of the result."""
+    site's grouped norm of the result. With `PDL` the norm weight is read before the wait."""
     row = tl.program_id(0).to(tl.int64)
     stream = tl.program_id(1)
     cols = tl.arange(0, BLOCK)
     m = cols < HIDDEN
     ch = stream * HIDDEN + cols
-    x = tl.load(hc_ptr + row * stride_hc + ch, mask=m, other=0.0).to(tl.float32)
-    ple = tl.load(ple_ptr + row * stride_ple + ch, mask=m, other=0.0).to(tl.float32)
     wx = tl.load(nx_ptr + ch, mask=m, other=0.0).to(tl.float32)
+    if PDL:
+        gdc_wait_with_memory_clobber()
+        tl.extra.cuda.gdc_launch_dependents()
+    x = _injected_stream(hc_ptr, row, stride_hc, ch, cols, m, stream, block_ptr, inj_ptr, sh_ptr,
+                         gate_ptr, stride_block, stride_inj, stride_sh, stride_gate, HAS_INJECT,
+                         HAS_SHARED)  # fmt: skip
+    ple = tl.load(ple_ptr + row * stride_ple + ch, mask=m, other=0.0).to(tl.float32)
     hn = (x + ple).to(tl.bfloat16)
     tl.store(hc_out_ptr + row * stride_hc_out + ch, hn, mask=m)
     nrm = _rms(hn.to(tl.float32), wx, HIDDEN, eps)
     tl.store(normed_ptr + row * stride_normed + ch, nrm.to(tl.bfloat16), mask=m)
+
+
+def _inject_args(hc: torch.Tensor, inject_block: Optional[tuple]) -> tuple:
+    """`(block, inject, shared, gate)`, their row strides, `HAS_INJECT`, `HAS_SHARED` for the gate
+    and residual kernels (unused operands point at `hc`)."""
+    if inject_block is None:
+        return (hc, hc, hc, hc, 0, 0, 0, 0, False, False)
+    block_out, inject, shared, gate_logits = inject_block
+    has_shared = shared is not None
+    return (
+        block_out,
+        inject,
+        shared if has_shared else hc,
+        gate_logits if has_shared else hc,
+        block_out.stride(0),
+        inject.stride(0),
+        shared.stride(0) if has_shared else 0,
+        gate_logits.stride(0) if has_shared else 0,
+        True,
+        has_shared,
+    )
 
 
 def _state_head(state_len: int) -> int:
@@ -493,6 +601,9 @@ class PleGateConvInjectNorm(OpWrapper):
         has_initial_states: Optional[torch.Tensor] = None,
         conv_input: Optional[torch.Tensor] = None,
         out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        inject_block: Optional[tuple] = None,
+        pdl: bool = False,
+        publish_end: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         rows, width = hc.shape
         hidden = width // hc_count
@@ -514,6 +625,7 @@ class PleGateConvInjectNorm(OpWrapper):
         )
         block = triton.next_power_of_2(hidden)
         warps = 8 if block >= 2048 else 4
+        inj = _inject_args(hc, inject_block)
         _ple_gate_kernel[(rows, hc_count)](
             hc,
             key,
@@ -530,9 +642,14 @@ class PleGateConvInjectNorm(OpWrapper):
             eps,
             clamp_min,
             math.sqrt(hidden),
+            *inj[:-2],
             HIDDEN=hidden,
             BLOCK=block,
+            HAS_INJECT=inj[-2],
+            HAS_SHARED=inj[-1],
+            PDL=pdl,
             num_warps=warps,
+            launch_pdl=pdl,
         )
         # `ple` reuses `gated`'s storage row for row: each element is read by
         # the program that then writes it.
@@ -540,35 +657,34 @@ class PleGateConvInjectNorm(OpWrapper):
         has_carry = has_initial_states is not None
         carry = has_initial_states if has_carry else state_indices
         per_seq = max_rows <= PER_SEQ_MAX_ROWS
-        if not per_seq:
-            tile_ch = min(_ROWS_CHANNELS, width)
-            _ple_conv_rows_kernel[(triton.cdiv(rows, _ROWS_BLOCK_T), width // tile_ch)](
-                xc,
-                gated,
-                gated,
-                conv_weight,
-                conv_states,
-                state_indices,
-                carry,
-                query_start_loc,
-                rows,
-                num_seqs,
-                gated.stride(0),
-                conv_states.stride(0),
-                pad_slot_id,
-                KSIZE=ksize,
-                DIL=dilation,
-                STATE=state_len,
-                BLOCK_T=_ROWS_BLOCK_T,
-                ROWS=tile_ch,
-                LOG_S=max(_MIN_LOG_S, (num_seqs - 1).bit_length()),
-                HAS_CARRY=has_carry,
-                num_warps=_ROWS_WARPS,
-            )
-        # Per sequence: the rows (decode) and the state publish. On the
-        # context-shaped path it carries no rows and only publishes, after
-        # every program above has read the state.
-        _ple_conv_kernel[(num_seqs, width // conv_rows)](
+        tile_ch = min(_ROWS_CHANNELS, width)
+        log_s = max(_MIN_LOG_S, (num_seqs - 1).bit_length())
+        rows_args = (
+            xc,
+            gated,
+            gated,
+            conv_weight,
+            conv_states,
+            state_indices,
+            carry,
+            query_start_loc,
+            rows,
+            num_seqs,
+            gated.stride(0),
+            conv_states.stride(0),
+            pad_slot_id,
+        )
+        rows_constexprs = dict(
+            KSIZE=ksize,
+            DIL=dilation,
+            STATE=state_len,
+            BLOCK_T=_ROWS_BLOCK_T,
+            ROWS=tile_ch,
+            LOG_S=log_s,
+            HAS_CARRY=has_carry,
+            num_warps=_ROWS_WARPS,
+        )
+        conv_args = (
             xc,
             gated,
             gated,
@@ -580,6 +696,9 @@ class PleGateConvInjectNorm(OpWrapper):
             gated.stride(0),
             conv_states.stride(0),
             pad_slot_id,
+            num_seqs if publish_end is None else int(publish_end),
+        )
+        conv_constexprs = dict(
             KSIZE=ksize,
             DIL=dilation,
             STATE=state_len,
@@ -587,8 +706,43 @@ class PleGateConvInjectNorm(OpWrapper):
             MAX_P=max_rows if per_seq else 0,
             ROWS=conv_rows,
             HAS_CARRY=has_carry,
+            PDL=pdl,
             num_warps=_CONV_WARPS,
+            launch_pdl=pdl,
         )
+        # `MAX_P` follows the step's longest sequence (0 past PER_SEQ_MAX_ROWS): every value, and
+        # the context-shaped rows kernel, compile at a geometry's first call.
+        if first_time(
+            "ple_gate_conv_inject_norm",
+            (
+                xc.dtype,
+                conv_states.dtype,
+                carry.dtype,
+                state_indices.dtype,
+                query_start_loc.dtype,
+                gated.stride(0),
+                conv_states.stride(0),
+                pad_slot_id,
+                ksize,
+                dilation,
+                state_len,
+                conv_rows,
+                has_carry,
+                log_s,
+                pdl,
+            ),
+        ):
+            for max_p in range(PER_SEQ_MAX_ROWS + 1):
+                compile_only(_ple_conv_kernel, conv_args, **{**conv_constexprs, "MAX_P": max_p})
+            compile_only(_ple_conv_rows_kernel, rows_args, **rows_constexprs)
+        if not per_seq:
+            _ple_conv_rows_kernel[(triton.cdiv(rows, _ROWS_BLOCK_T), width // tile_ch)](
+                *rows_args, **rows_constexprs
+            )
+        # Per sequence: the rows (decode) and the state publish. On the
+        # context-shaped path it carries no rows and only publishes, after
+        # every program above has read the state.
+        _ple_conv_kernel[(num_seqs, width // conv_rows)](*conv_args, **conv_constexprs)
         _ple_residual_norm_kernel[(rows, hc_count)](
             hc,
             gated,
@@ -600,9 +754,14 @@ class PleGateConvInjectNorm(OpWrapper):
             hc_out.stride(0),
             normed.stride(0),
             eps,
+            *inj[:-2],
             HIDDEN=hidden,
             BLOCK=block,
+            HAS_INJECT=inj[-2],
+            HAS_SHARED=inj[-1],
+            PDL=pdl,
             num_warps=warps,
+            launch_pdl=pdl,
         )
         return hc_out, normed
 
@@ -628,6 +787,9 @@ class PleGateConvInjectNorm(OpWrapper):
         has_initial_states: Optional[torch.Tensor] = None,
         conv_input: Optional[torch.Tensor] = None,
         out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        inject_block: Optional[tuple] = None,
+        pdl: bool = False,
+        publish_end: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """`(hc_out, normed, conv_states)` as the call leaves them: float64
         throughout, rounded to the activation dtype exactly where the op (and
@@ -639,6 +801,17 @@ class PleGateConvInjectNorm(OpWrapper):
 
         def rnd(x):
             return x.to(dtype).double()
+
+        if inject_block is not None:
+            # The previous MoE block injected first (`qwen4_exp_hc_inject_norm`'s rounding).
+            block_out, inject, shared, gate_logits = inject_block
+            b = block_out.double()
+            if shared is not None:
+                b = rnd(b + torch.sigmoid(gate_logits.reshape(rows, 1).double()) * shared.double())
+            hc = hc.double().view(rows, hc_count, hidden) + b.unsqueeze(
+                1
+            ) * inject.double().unsqueeze(-1)
+            hc = hc.reshape(rows, width).to(dtype)
 
         def norm(x, w):
             w = w.double().view(hc_count, hidden)
@@ -677,7 +850,7 @@ class PleGateConvInjectNorm(OpWrapper):
             for k in range(ksize):
                 acc += w[:, k : k + 1] * window[:, k * dilation : k * dilation + n]
             conv[begin:end] = rnd(acc.t())
-            if live:
+            if live and (publish_end is None or s < publish_end):
                 pool[slot] = window[:, end - begin : end - begin + state_len].to(dtype)
         ple = rnd(gated.reshape(rows, width) + rnd(torch.nn.functional.silu(conv)))
         hc_out = (hc.double() + ple).to(dtype)
@@ -706,8 +879,25 @@ class PleGateConvInjectNorm(OpWrapper):
         has_initial_states: Optional[torch.Tensor] = None,
         conv_input: Optional[torch.Tensor] = None,
         out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        inject_block: Optional[tuple] = None,
+        pdl: bool = False,
+        publish_end: Optional[int] = None,
     ) -> None:
         rows, width = hc.shape
+        if inject_block is not None:
+            block_out, inject, shared, gate_logits = inject_block
+            hidden_ = width // hc_count
+            assert block_out.shape == (rows, hidden_) and block_out.stride(1) == 1, tuple(
+                block_out.shape
+            )
+            assert inject.shape == (rows, hc_count) and inject.stride(1) == 1, tuple(inject.shape)
+            assert block_out.dtype == inject.dtype == hc.dtype
+            if shared is not None:
+                assert shared.shape == (rows, hidden_) and shared.stride(1) == 1, tuple(
+                    shared.shape
+                )
+                assert shared.dtype == hc.dtype
+                assert gate_logits is not None and gate_logits.numel() == rows
         assert width % hc_count == 0, f"width {width} not divisible by hc_count {hc_count}"
         hidden = width // hc_count
         for name, t in (("hc", hc), ("key", key), ("value", value)):

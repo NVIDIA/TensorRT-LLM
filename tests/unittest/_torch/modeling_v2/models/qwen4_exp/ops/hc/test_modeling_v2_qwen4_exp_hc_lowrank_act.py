@@ -48,13 +48,52 @@ def _build(spec, seed):
     return logits, RANK, hc_count, spec.get("inject", True), spec.get("dtype", torch.bfloat16)
 
 
+def _capture(args):
+    """Capture one call over a private copy of the step's logits after a side-stream warmup:
+    `(graph, static logits, static outputs)`."""
+    static = args[0].clone()
+    rest = args[1:]
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        op(static, *rest)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = op(static, *rest)
+    return graph, static, out
+
+
+def _equal(a, b) -> bool:
+    """Both outputs bitwise equal (`inject` may be None on both sides)."""
+    return all((x is None and y is None) or torch.equal(x, y) for x, y in zip(a, b))
+
+
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
     certifying(op)
-    args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % (2**31))
+    seed = zlib.crc32(cell.why.encode()) % (2**31)
+    args = _build(cell.spec, seed=seed)
     low, inject = op(*args)
     assert low.shape == (cell.spec["rows"], RANK)
     _compare((low, inject), op.reference(*args))
+    if not cell.spec.get("capture"):
+        return
+
+    # The replay is bitwise the eager call; a second step's logits replay bitwise their own.
+    graph, static, replayed = _capture(args)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert _equal(replayed, (low, inject)), "the replay differs from the eager call it captured"
+    second = _build(cell.spec, seed=(seed + 1) % (2**31))
+    assert not torch.equal(second[0], args[0]), "the second step brings other logits"
+    static.copy_(second[0])
+    graph.replay()
+    torch.cuda.synchronize()
+    step2 = tuple(None if t is None else t.clone() for t in replayed)
+    assert _equal(step2, op(*second)), "the second replay differs from its eager call"
+    assert not _equal(step2, (low, inject)), "the second replay repeated the first step"
+    _compare(step2, op.reference(*second))
 
 
 def test_guard_refuses_bf16_logits() -> None:

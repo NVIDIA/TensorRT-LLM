@@ -54,6 +54,7 @@ TP4_SLOTS = TEP4_SLOTS
 #: Above this many rows per sequence (MTP verify carries at most 4) the call
 #: takes the context-shaped path: packed row tiles plus a separate publish.
 PER_SEQ_MAX_ROWS = 4
+_PER_SEQ_BLOCK_P = triton.next_power_of_2(PER_SEQ_MAX_ROWS)
 _ROWS_BLOCK_T = 32
 #: The row-to-sequence search covers at least 2^8 sequences, so one compiled
 #: variant serves every batch up to that size.
@@ -532,7 +533,8 @@ class PleNgramEmbed(OpWrapper):
                 BLOCK_H=triton.next_power_of_2(heads),
                 HEAD_DIM=head_dim,
                 BLOCK_D=triton.next_power_of_2(head_dim),
-                BLOCK_P=triton.next_power_of_2(max(max_rows, 1)),
+                # One compiled variant for every per-sequence row count (rows past `length` masked).
+                BLOCK_P=_PER_SEQ_BLOCK_P,
                 BLOCK_C=triton.next_power_of_2(ngram_size - 1),
                 HAS_CARRY=has_initial_states is not None,
                 num_warps=4,

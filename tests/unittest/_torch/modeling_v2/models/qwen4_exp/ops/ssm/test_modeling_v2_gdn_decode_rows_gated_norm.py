@@ -28,6 +28,7 @@ import cuda.bindings.driver as cuda_drv
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm import (
     gdn_decode_rows_gated_norm as rows_mod,
 )
@@ -39,6 +40,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.gdn_
 )
 
 __extra_import_path__ = ["../../../.."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "gdn_decode_rows_gated_norm requires a CUDA device"
@@ -269,7 +271,32 @@ def _stats(out, ref_out, pool, ref_pool) -> str:
     )
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+#: A tp2/tep2 rank of the FP8 target: 8 k / 24 v heads on its 8240-wide projection, bf16 state;
+#: the register variant up to 12 rows, the bulk copy from 13 (24 v heads x 13 rows > 2 x 152 SMs).
+_FP8_TP2 = dict(k_heads=8, v_heads=24, proj_width=8240, state="bf16")
+_FP8 = "qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified"
+
+#: The shapes each target calls `gdn_decode_rows_gated_norm` with beyond its own cells.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    _FP8: (
+        Cell(
+            why="fp8 tp2/tep2 decode, 1 row at 8 / 24 heads, slot 7193 of a 7194-slot bf16 page",
+            spec=dict(_FP8_TP2, rows=1, pool="coalesced", pool_slots=7194, member="tp2"),
+        ),
+        Cell(
+            why="fp8 tp2/tep2, 128 rows (the bulk copy) at 8 / 24 heads on the 7194-slot page, "
+            "row 1 a pad slot (-1)",
+            spec=dict(
+                _FP8_TP2, rows=128, pad=True, pool="coalesced", pool_slots=7194, member="tp2"
+            ),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
     certifying(op)
     args, engine = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % (2**31))
@@ -467,7 +494,24 @@ def _rows_args(spec, seed):
     return [proj, pool, slots, A_log, dt_bias, h, k, out], buf
 
 
-@pytest.mark.parametrize("cell", rows_op.CELLS, ids=[c.why[:44] for c in rows_op.CELLS])
+#: The shapes each target calls `gdn_decode_rows` with beyond its own cells.
+ROWS_TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    _FP8: (
+        Cell(
+            why="fp8 tp2/tep2 mixed step: 3 generation rows at 8 / 24 heads into a row range",
+            spec=dict(_FP8_TP2, rows=3, out="row_range"),
+        ),
+        Cell(
+            why="fp8 tp2/tep2 mixed step: 127 generation rows (the bulk copy) at 8 / 24 heads",
+            spec=dict(_FP8_TP2, rows=127, out="row_range"),
+        ),
+    ),
+}
+
+ROWS_CELLS = certified_cells(rows_op, ROWS_TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", ROWS_CELLS, ids=[c.why[:44] for c in ROWS_CELLS])
 def test_rows_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
     certifying(rows_op)
     args, buf = _rows_args(cell.spec, seed=zlib.crc32(cell.why.encode()) % (2**31))

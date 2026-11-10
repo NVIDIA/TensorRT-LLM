@@ -8,11 +8,16 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.quantization.bf16_to_fp32 import (  # noqa: E501
+    VOCAB,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.quantization.bf16_to_fp32 import (  # noqa: E501
     bf16_to_fp32 as op,
 )
 
 __extra_import_path__ = ["../../../.."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "bf16_to_fp32 requires a CUDA device"
@@ -35,7 +40,20 @@ def _bitwise(a: torch.Tensor, b: torch.Tensor) -> bool:
     return a.shape == b.shape and torch.equal(a.view(torch.int32), b.view(torch.int32))
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+#: The shapes each target calls this entry with beyond its own cells, by target directory.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified": (
+        Cell(
+            why="fp8 tep2 MTP-2 verify logits, 128 requests x 3 rows",
+            spec=dict(shape=(384, VOCAB)),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
     certifying(op)
     x = _build(cell.spec, zlib.crc32(cell.why.encode()))
