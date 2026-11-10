@@ -39,6 +39,8 @@ Currently TensorRT LLM can only support chunked attention in llama4 model with T
 
 Generation chunking is not supported by the FlashInfer TRTLLM-Gen kernels, which are preferred by default for supported configurations with beam width 1 on Blackwell (SM100/SM103), or by tree-based speculative decoding. On Hopper, Llama4 disables chunked attention in both phases when speculative decoding is enabled. On the supported native generation paths, chunking is enabled by default; set `TRTLLM_DISABLE_CHUNKED_ATTENTION_IN_GEN_PHASE=1` to disable it during generation.
 
+For configurations supported by the native fallback kernels, set `TLLM_FMHA_LIBS=fallback` before initializing the model to select that path. This setting also restricts kernel selection during context processing.
+
 ## Sliding Window Attention
 
 <div align="center">
