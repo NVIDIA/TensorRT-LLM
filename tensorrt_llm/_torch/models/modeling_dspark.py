@@ -138,24 +138,18 @@ from .modeling_utils import (
 _DSPARK_LINEAR_BACKEND_ENV = "TRTLLM_DSPARK_LINEAR_BACKEND"
 
 if IS_CUTLASS_DSL_AVAILABLE:
-    from ..custom_ops import dspark_attention_custom_op  # noqa: F401
-    from ..custom_ops.dspark_rmsnorm_rope_custom_op import (
-        cute_dsl_dspark_concat_fp8_quant,
-        cute_dsl_dspark_rmsnorm_fp8_quant,
-        cute_dsl_dspark_rmsnorm_rope,
-        cute_dsl_dspark_rmsnorm_rope_draft_block,
-        is_fused_dspark_rmsnorm_rope_supported,
-    )
-
-
-if IS_CUTLASS_DSL_AVAILABLE:
     from ..custom_ops.dspark_attention_custom_op import (
         fused_dsv4_dspark_attention,
         is_fused_dsv4_dspark_attention_supported,
     )
     from ..custom_ops.dspark_rmsnorm_rope_custom_op import (
+        cute_dsl_dspark_concat_fp8_quant,
+        cute_dsl_dspark_rmsnorm_fp8_quant,
+        cute_dsl_dspark_rmsnorm_rope,
         cute_dsl_dspark_rmsnorm_rope_cache_write,
+        cute_dsl_dspark_rmsnorm_rope_draft_block,
         is_fused_dspark_attention_preparation_supported,
+        is_fused_dspark_rmsnorm_rope_supported,
     )
 
 # ----------------------------------------------------------------------------
@@ -607,7 +601,15 @@ def _dspark_ring_attention_metadata(
     valid_len: torch.Tensor,
     window_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Map a rolling window to two aliases of the same physical page."""
+    """Map a rolling window to two aliases of the same physical page.
+
+    The paged kernel reads rows ``[end - 128, end)`` of a ``2 * window_size``
+    ring. Both page-table columns alias the request's one ``window_size``-row page
+    (the page size must equal the kernel's 128-row window), and ``end`` is shifted
+    by ``window_size`` so every window row lands in one of the two aliases and the
+    kernel's ``min(128, position)`` bound never truncates ``valid_len``. Capacity
+    ``2 * window_size`` keeps the capacity mask from dropping rows.
+    """
     slots_i32 = slots.to(torch.int32)
     return (
         torch.stack((slots_i32, slots_i32), dim=1),
@@ -2177,6 +2179,13 @@ class DSv4DSparkDraftModel(nn.Module):
                 )
             qkv_in_features = attn.kv_a_proj_with_mqa.in_features
             q_lora_rank = attn.q_a_layernorm.weight.shape[0]
+            # Every WKV consumer slices the trailing head_dim columns after q_lora_rank.
+            qkv_out_features = attn.kv_a_proj_with_mqa.out_features
+            if qkv_out_features != q_lora_rank + head_dim:
+                raise ValueError(
+                    "DSpark fused q_a+wkv projection must have q_lora_rank + head_dim = "
+                    f"{q_lora_rank} + {head_dim} outputs, got {qkv_out_features}"
+                )
             use_fused_qkv_input_projection = _can_use_fused_fp8_input_projection(
                 attn.kv_a_proj_with_mqa, qkv_in_features
             )

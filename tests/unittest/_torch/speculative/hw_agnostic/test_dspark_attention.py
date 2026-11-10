@@ -838,6 +838,7 @@ def test_bind_attn_projections_reuses_loaded_mla_modules(monkeypatch):
 
     qkv_proj = Mock()
     qkv_proj.in_features = 4
+    qkv_proj.out_features = 14
     q_b_proj = Mock()
     q_b_proj.in_features = 6
     o_b_proj = Mock()
@@ -933,6 +934,10 @@ def test_bind_attn_projections_reuses_loaded_mla_modules(monkeypatch):
     stack_projections.assert_called_once_with([qkv_proj], 8)
     assert model._context_wkv_fp8 is context_wkv
     assert stage._dspark_context_wkv_slice is None
+
+    qkv_proj.out_features = 15
+    with pytest.raises(ValueError, match="q_lora_rank \\+ head_dim"):
+        DSv4DSparkDraftModel._bind_attn_projections(model)
 
 
 @pytest.mark.cpu_only
