@@ -878,3 +878,35 @@ def test_a_split_candidate_gets_one_member_gated_variant_that_is_kept(tmp_path):
     assert "the requests this rank runs in the step >= 128" in request
     assert str(spec.workdir / "worktrees" / "fast-path-gated") in request
     assert f"--priority {TUNER}" in request
+
+
+def test_every_tuner_turn_queues_its_jobs_below_the_campaigns_measurement(tmp_path):
+    """A revise or a rebase turn's jobs queue at TUNER too, as a new candidate's do.
+
+    A tuner's job at the scheduler's default priority ranks ahead of the campaign's measurement,
+    which runs one candidate at a time, and holds back every candidate waiting behind it.
+    """
+    from agent_flow.workflows.trtllm_modeling_v2.tune.requests import (
+        CampaignContext,
+        render_rebase_request,
+        render_revise_request,
+        turn_prompt,
+    )
+
+    ctx = CampaignContext(
+        repo=tmp_path,
+        package=tmp_path,
+        campaign_dir=tmp_path / "campaign",
+        perf_root=tmp_path / "perf",
+        target_dir="t/",
+        target_tests="t/",
+        model="m",
+        dev_spools=[tmp_path / "s1"],
+        env_script=tmp_path / "env.sh",
+        workload="isl 8192, osl 1024",
+        standings_table="",
+    )
+    for render in (render_revise_request, render_rebase_request):
+        request = render(ctx, slug="x", worktree=tmp_path / "wt", best_branch="best", reason="r")
+        assert f"--priority {TUNER} --tree {tmp_path / 'wt'}" in request.read_text()
+        assert f"--priority {TUNER}" in turn_prompt(request)

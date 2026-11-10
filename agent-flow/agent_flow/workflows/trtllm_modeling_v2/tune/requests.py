@@ -244,11 +244,11 @@ outputs and projection per perf point). Then fix what failed in `{worktree}`:
   fix the declaration or the harness.
 
 Run the target tests on the dev spools ({", ".join(f"`{s}`" for s in ctx.dev_spools)}; launch + poll,
-`--tree {worktree}`, env script `{ctx.env_script}`), commit with `git -C {worktree} commit -s`, and
-update `{out_dir / "decision.yaml"}` in place: `commits:` = `git -C {worktree} rev-list --reverse
-{best_branch}..HEAD`, `decision: CANDIDATE`, or `DROPPED` when the failure is the idea's, not the
-code's. {FINDINGS_ASK} The stage measures the revision once more, the same way; there is no second
-revise.
+`--priority {TUNER} --tree {worktree}`, env script `{ctx.env_script}`), commit with
+`git -C {worktree} commit -s`, and update `{out_dir / "decision.yaml"}` in place: `commits:` =
+`git -C {worktree} rev-list --reverse {best_branch}..HEAD`, `decision: CANDIDATE`, or `DROPPED`
+when the failure is the idea's, not the code's. {FINDINGS_ASK} The stage measures the revision once
+more, the same way; there is no second revise.
 {_attempts_section(ctx)}"""
     path = out_dir / "revise-request.md"
     path.write_text(text)
@@ -266,8 +266,10 @@ the decision file you must write at the end.
 
 ## Operating rules
 
-- Run GPU work as jobs on the dev spools (`spoolctl.py launch ... --tree <worktree>`) and poll them;
-  the host your turn runs on may have no GPU.
+- Run GPU work as jobs on the dev spools (`spoolctl.py launch --priority {TUNER} ... --tree
+  <worktree>`) and poll them; the host your turn runs on may have no GPU. Every job takes
+  `--priority {TUNER}`: the campaign measures one candidate at a time, and a job at the default
+  priority queues ahead of that measurement and holds back every candidate behind it.
 - Never emit more than ~150 lines in a single Write/Edit call; build big files with several calls.
 - Always give grep/rg/find an explicit search root (your worktree's target dir, a shared module path, the
   package); never search from the repository root or the current directory: it is slow and floods the
@@ -301,8 +303,8 @@ Kind: REBASE. Your candidate does not stack on `{best_branch}` (the campaign's b
    to which it applies, including prefill/decode when separate). Read your own `decision.yaml` in `{out_dir}`
    for what the candidate does.
 2. Run the target tests covering both sides and the applicable shared contract tests in this checkout on the
-   dev spools ({", ".join(f"`{s}`" for s in ctx.dev_spools)}; launch + poll, `--tree {worktree}`, env script
-   `{ctx.env_script}`).
+   dev spools ({", ".join(f"`{s}`" for s in ctx.dev_spools)}; launch + poll,
+   `--priority {TUNER} --tree {worktree}`, env script `{ctx.env_script}`).
 3. Commit with `git -C {worktree} commit -s` if you changed code beyond the conflict markers. Do not push.
 4. Update `{out_dir / "decision.yaml"}` in place: `commits:` = `git -C {worktree} rev-list --reverse
    {best_branch}..HEAD`, `rebased_onto: <sha>`, a `notes` line on the conflict and its resolution;
