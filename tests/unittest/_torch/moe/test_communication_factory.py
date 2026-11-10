@@ -31,6 +31,7 @@ from tensorrt_llm._torch.moe.fused_moe.communication.allgather_reducescatter imp
     AllGatherReduceScatter,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
+from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -420,19 +421,27 @@ def test_nccl_ep_downgrades_unsupported_low_precision_combine(
     assert not strategy.use_low_precision_combine
 
 
-def test_nccl_ep_window_refusal_returns_persistent_dispatch_buffer(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("capturing", [False, True])
+@pytest.mark.parametrize("window_available", [False, True])
+def test_nccl_ep_dispatch_window(
+    monkeypatch: pytest.MonkeyPatch, capturing: bool, window_available: bool
 ):
-    """A rejected NCCL window must not replace the buffer written by dispatch."""
+    """Dispatch uses a registered window or its persistent fallback, including capture."""
 
     class FakeTensor:
-        def __init__(self, tensor, **_):
+        def __init__(self, tensor, **kwargs):
             self.tensor = tensor
+            self.__dict__.update(kwargs)
 
     class FakeHandle:
         def dispatch(self, _, outputs, **__):
-            assert outputs is context.dispatch_outputs
-            context.output_tokens_buf.fill_(7)
+            if window_available:
+                assert outputs.tokens.window.handle == 123
+                assert outputs.tokens.window_offset == 0
+                outputs.tokens.tensor.fill_(7)
+            else:
+                assert outputs is context.dispatch_outputs
+                context.output_tokens_buf.fill_(7)
 
     fake_ep = SimpleNamespace(
         DispatchInputs=lambda **kwargs: SimpleNamespace(**kwargs),
@@ -471,12 +480,13 @@ def test_nccl_ep_window_refusal_returns_persistent_dispatch_buffer(
     comm._dispatch_state = {}
     monkeypatch.setattr(comm, "_get_context", lambda: context)
     monkeypatch.setattr(comm, "_setup_handle", lambda *_: FakeHandle())
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    fallback_tokens = torch.zeros_like(persistent_tokens)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    window_tokens = torch.zeros_like(persistent_tokens)
+    window_kind = int(BufferKind.NCCL_WINDOW) if window_available else 0
     monkeypatch.setattr(
         torch.ops.trtllm,
         "allocate_output_with_nccl_window",
-        lambda *_: (fallback_tokens, 0, 0),
+        lambda *_: (window_tokens, window_kind, 123 if window_available else 0),
     )
 
     recv_hs, *_ = comm.dispatch(
@@ -488,6 +498,9 @@ def test_nccl_ep_window_refusal_returns_persistent_dispatch_buffer(
     )
 
     assert torch.equal(recv_hs, torch.full_like(recv_hs, 7))
+    expected = window_tokens if window_available else persistent_tokens
+    assert recv_hs.data_ptr() == expected.data_ptr()
+    assert context.output_tokens_buf is persistent_tokens
 
 
 def test_forced_nccl_ep_forwards_low_precision_combine(
