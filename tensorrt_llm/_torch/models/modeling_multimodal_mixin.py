@@ -411,8 +411,9 @@ class MultimodalModelMixin:
 
     Current limitations:
 
-    * For the time being, the persistent multimodal encoder cache stores per-item embeddings for
-      single-modality `MultimodalParams` objects. Mixed-modality objects bypass the cache.
+    * The persistent multimodal encoder cache stores per-item embeddings for the items in the
+      common item record, across modalities. A `MultimodalParams` object carrying a modality
+      payload that the record does not list bypasses the cache.
     * A partially cached `MultimodalParams` is handled by encoding only its miss items
       and interleaving cached items back in original per-item order. The default
       `build_multimodal_encoder_input` selects fields declared by
