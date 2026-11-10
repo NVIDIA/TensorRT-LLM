@@ -38,6 +38,23 @@ message ModelInfo {
   // contract: clients read it opportunistically and never depend on it for
   // correctness. Carried as a Struct so JSON types survive the wire.
   google.protobuf.Struct extra = 28;
+
+  // Negotiated encoder role and supported encoder-cache transports.
+  EncoderCapabilities encoder = 29;
+}
+
+message EncoderCapabilities {
+  uint32 schema_version = 1;
+  bool encoder_only = 2;
+  bool accepts_cache = 3;
+  // An encoder-only producer advertises exactly one backend. Consumers list
+  // the backends whose references they can accept.
+  repeated string transfer_backends = 4;
+  // The producer can release unclaimed references through Abort.encoder_cache.
+  bool supports_abort_cleanup = 5;
+  // Media generation requires encoder.cache; text-only and KV-session decode
+  // requests do not require an encoder reference. Requires accepts_cache.
+  bool requires_cache = 6;
 }
 
 message GenerationCapabilities {

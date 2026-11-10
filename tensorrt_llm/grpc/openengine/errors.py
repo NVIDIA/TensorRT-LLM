@@ -12,6 +12,13 @@ class MediaUnavailableError(RuntimeError):
     """Raised when fetching remote request media fails transiently."""
 
 
+ENCODER_TRANSFER_REJECTED_METADATA = ("trtllm-encoder-write", "not-started")
+
+
+class EncoderTransferRejected(ValueError):
+    """Reject a transfer before WRITE; receiver buffers can be released."""
+
+
 class AbortFailedError(RuntimeError):
     """Raised when an active request could not be aborted on the engine."""
 
@@ -22,6 +29,8 @@ class AbortFailedError(RuntimeError):
 
 __all__ = [
     "AbortFailedError",
+    "ENCODER_TRANSFER_REJECTED_METADATA",
+    "EncoderTransferRejected",
     "MediaUnavailableError",
     "UnsupportedFeatureError",
 ]

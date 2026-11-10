@@ -69,10 +69,14 @@ Set `failureThreshold * periodSeconds` to cover the longest expected model start
 
 OpenEngine gRPC does not yet expose sleep or weight updates. When those operations are added, they must publish `inference=NOT_SERVING` for their duration while keeping `liveness=SERVING`; the current executor health predicate alone does not detect those admission states. A sidecar that loses `Watch` or sees a new engine identity must validate health again.
 
-For models that do not accept token-ID input, including Whisper, the optional
-`Health(include_inference_probe=True)` check reports the inference probe as not
-applicable. It does not submit inference and does not establish inference liveness;
-the ordinary lifecycle and executor health checks still apply.
+For encoder-only engines and models that do not accept token-ID input, including
+Whisper, the optional `Health(include_inference_probe=True)` check reports the
+inference probe as not applicable. It does not submit inference and does not
+establish inference liveness; the ordinary lifecycle and executor health checks
+still apply.
+
+`Control.Shutdown` currently returns `UNIMPLEMENTED`. Stop the serving process
+through its supervisor or with SIGTERM to run the normal engine shutdown path.
 
 The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyTorch `LLM` API and streams incremental token and text events. It supports text and token-ID inputs, native sampling and stopping options, top-N prompt and output log probabilities, TensorRT-LLM guided-decoding modes, cache salt, trace-context propagation, multiple output sequences, finish reasons, and final usage.
 
@@ -304,9 +308,15 @@ Multiple frontends require the default classic IPC executor and a nonzero port. 
 
 ## Schema and binding provenance
 
-The schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository at signed Git tag [`v0.1.0`](https://github.com/ai-dynamo/openengine/releases/tag/v0.1.0), Git commit `b5f2bd93721f7b888d3e2440679e0ae7012939d1`. That release maps to the public [`buf.build/openengine/openengine`](https://buf.build/openengine/openengine) module at immutable BSR release `768a93c7b44e40f28c692ad0b471a8f2`.
+The baseline schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository at signed Git tag [`v0.1.0`](https://github.com/ai-dynamo/openengine/releases/tag/v0.1.0), Git commit `b5f2bd93721f7b888d3e2440679e0ae7012939d1`. That release maps to the public [`buf.build/openengine/openengine`](https://buf.build/openengine/openengine) module at immutable BSR release `768a93c7b44e40f28c692ad0b471a8f2`.
 
-TensorRT-LLM vendors that immutable schema under `tensorrt_llm/grpc/openengine/proto/`. `3rdparty/vendor_sources.lock.yaml` pins the upstream commit and verifies that the schema files are exact upstream copies. The adjacent `manifest.json` records protocol metadata, generator versions, and runtime floors. The deterministic private bindings under `tensorrt_llm.grpc.openengine._generated` are checked in so ordinary wheel and editable builds do not require a protocol compiler or network access.
+The encoder extension is pinned to canonical [OpenEngine #35](https://github.com/ai-dynamo/openengine/pull/35), which is not yet included in that BSR release. Its exact source revision is recorded in the vendor lock and schema manifest.
+
+Before releasing the encoder extension, pin the merged upstream schema revision
+and regenerate the vendored bindings. Draft revisions use the canonical
+`openengine.v1` namespace and must not be treated as a stable wire contract.
+
+TensorRT-LLM vendors the immutable schema under `tensorrt_llm/grpc/openengine/proto/`. `3rdparty/vendor_sources.lock.yaml` pins the upstream commit and verifies that the schema files are exact upstream copies. The adjacent `manifest.json` records protocol metadata, generator versions, and runtime floors. The deterministic private bindings under `tensorrt_llm.grpc.openengine._generated` are checked in so ordinary wheel and editable builds do not require a protocol compiler or network access.
 
 When changing the schema, generator, or `requirements-build-openengine.txt`, regenerate and commit the bindings:
 
@@ -335,3 +345,125 @@ For token-only clients, send boolean `extra["detokenize"] = false`. Omitted deto
 Conversation-affinity placement requires `attention_dp_config.kv_cache_routing_conversation_affinity: true` when using attention DP; it is disabled by default. Per-conversation cache retention requires block reuse to be enabled and `kv_cache_config.block_reuse_config.policy: per_conversation` with KV cache manager v2; the default policy is `all_reusable`. Forwarding a conversation ID does not enable either setting. These extensions do not require KV-event discovery, publication, or routing-load snapshots.
 
 For disaggregated subagent context requests, configure `internal_request_auth_key` in the `trtllm-serve` config and use the same key in the Dynamo sidecar's `TRTLLM_SUBAGENT_AFFINITY_AUTH_KEY`. The sidecar sends the parent session as signed `x-trtllm-subagent-affinity-id` and `x-trtllm-subagent-affinity-auth` gRPC metadata. OpenEngine accepts the hint only on `context_only` requests with a stable child `extra["conversation_id"]` and conversation-aware attention DP; it passes the parent to the ADP router without changing the child conversation ID. `ServerInfo.extra.trtllm_supports_subagent_affinity` reports whether the receiving server is configured for this extension. Keep the gRPC listener behind a trusted gateway: the signature authenticates the sidecar-to-engine hop, while the gateway must authorize the parent-child relationship. OpenEngine rejects `openengine-routing-key` and unknown `openengine-*` metadata rather than silently ignoring routing requests.
+
+## Image encoder handoff (experimental)
+
+Image E+PD and E+P+D use the `EncoderOptions` / `EncoderReady` contract proposed in
+[OpenEngine #35](https://github.com/ai-dynamo/openengine/pull/35), pinned to an
+immutable source revision in the vendor lock. Both client and server need the
+matching bindings; this proposal is not in a published BSR release or runtime.
+TP/PP/CP must each be 1.
+
+The model processor must support native multimodal disaggregation. Load the same
+immutable checkpoint revision and processor configuration on every engine.
+
+| Topology | Encoder | Language engines | Handoffs |
+| --- | --- | --- | --- |
+| E+PD | `mm_encoder_only: true` | One combined engine with `disable_mm_encoder: true` | Encoder cache to PD |
+| E+P+D | `mm_encoder_only: true` | Separate prefill and decode engines, both with `disable_mm_encoder: true` | Encoder cache to P; KV session and prepared decode metadata from P to D |
+
+For E+P+D, configure a compatible native `cache_transceiver_config` on both P and
+D, independently of the encoder transfer backend. The prefill request sets
+`extra.request_type = "context_only"` and consumes the encoder cache. The decode
+request carries the resulting `kv.session`, preserves the original prompt/media
+identity, and omits `encoder.cache`; an encoder reference must not be consumed
+twice. Decode reuses the expanded tokens and portable model state from prefill
+without fetching media or running the vision encoder.
+
+E+P+D requires the processor's decode-state capture and restore hooks. Missing
+capture hooks, missing state, or preparation metadata over the existing size bound cause
+the encoder-consuming prefill request to fail before language execution. These
+requirements do not change the ordinary PD preparation fallback or E+PD behavior.
+
+Image E+PD and E+P+D have been manually validated with Qwen3-VL-2B across GPU
+hosts using matching source overlays. Focused CPU checks cover the final rebased
+branch; GPU validation of that branch has not been repeated.
+
+`ModelInfo.encoder` advertises the schema version, encoder-only or cache-consumer
+role, supported transfer backends, typed abort cleanup support and mandatory-cache
+policy. Producers advertise one backend; consumers may accept multiple. Encoder-only requests set
+`encoder.encode_only` and terminate with `EncoderReady`. The downstream request
+retains the original prompt and media identities and supplies `encoder.cache`
+to PD or P; it does not fetch the image or run its own vision encoder. Text-only
+requests can bypass the encoder.
+
+For the optional shared-file backend, set `TRTLLM_OPENENGINE_ENCODER_CACHE_DIR`
+to the same private directory on the encoder and its consuming PD or P engine.
+They must run on the same host and use the same checkpoint path.
+
+The engine materializes native encoder exports into safetensors storage; tensor
+contents never pass through Dynamo. This baseline adds CPU copies and storage I/O.
+References are single-use and expire after five minutes; expired files are
+collected on the next cache operation. Published and claimed files are limited
+to 256 MiB, with at most one additional 64 MiB publication temporary under the
+cache lock. Tensor data is limited to 64 MiB per result. The shared-file backend
+rejects cross-host encoder references. Both backends reject video/audio inputs.
+
+### Networked encoder handoffs
+
+Set `TRTLLM_OPENENGINE_ENCODER_TRANSFER=nixl` on encoder and language engines.
+All must load the same immutable checkpoint revision and set
+`TRTLLM_OPENENGINE_ENCODER_MODEL_REVISION` to that revision. Load it with
+`--hf_revision`; this identity must not be a mutable branch name. On the encoder,
+set `TRTLLM_OPENENGINE_ENCODER_ENDPOINT` to its reachable OpenEngine `host:port`.
+The engines need compatible NIXL/UCX connectivity; no shared directory is used.
+The image-only and TP/PP/CP=1 restrictions still apply. In E+P+D, the encoder
+cache is transferred only to P; D receives the native KV handoff and does not
+request another encoder transfer.
+
+The encoder imports native exports into owned GPU tensors. Its single-use
+reference includes layout, dtype, shape,
+input/model identity and the producer endpoint, not source memory addresses.
+The consumer allocates/registers receive tensors and invokes
+the TensorRT-LLM-owned `trtllm.openengine.v1.EncoderTransfer.Transfer` RPC on
+the same gRPC listener; the producer writes to those buffers and returns
+only after native completion. Dynamo carries the opaque reference only. Metadata
+and mRoPE tensors are carried along with the image embeddings.
+
+Each send and receive owns its native agent and registrations through completion.
+Independent handoffs do not share imported peer metadata or hold the cache-state
+lock during network waits. Shutdown closes admission and drains active handoffs.
+Proven pre-WRITE rejections carry `INVALID_ARGUMENT` and trailing metadata
+`trtllm-encoder-write: not-started`; consumers release their receive buffers and
+report invalid input. Unmarked failures remain uncertain, including failures from
+older peers. Failed receiver setup preserves the source reference only after its
+request-owned agent has been retired.
+
+Language engines release transport request references after native enqueue
+accepts ownership. Context-only KV transfers continue making progress while the
+engine is idle and retire request resources on completion. OpenEngine reclaims
+unused prefill exports once and drains cleanup before engine shutdown. Healthy
+CUDA NIXL consumers then reclaim zero-reference CUDA IPC allocations after
+successful native shutdown.
+
+Only trusted engine peers may call the transfer RPC or provide handoff metadata;
+its private schema lives in `proto/trtllm/openengine/v1/`. Sharing the listener
+does not restrict access to the service. Deployment networking must make the
+advertised gRPC and NIXL endpoints reachable across hosts.
+
+Pending exports expire after five minutes when the cache is collected, and
+owned tensor storage is bounded to 256 MiB per engine (64 MiB per request).
+An uncertain producer WRITE stops producer admission. An uncertain receive retains
+only that operation's registrations, buffers and agent until process exit; other
+receives can proceed within the memory quota and eight active-or-quarantined
+receive slots. Quarantined resources remain charged to both limits, including
+after shutdown, and require a process restart to reclaim. Exhausting the
+quarantine budget marks the cache unhealthy; a failed cache no longer advertises
+a transfer backend. A missing RPC reply does not establish that
+a remote write stopped. Do not retry a consumed handoff.
+The cross-host GPU path requires the matching protocol and serving changes;
+a published runtime containing them is not yet available.
+
+### Encoder transport tests
+
+The CPU CI list collects `test_encoder_nixl.py`, but its two native NIXL/UCX
+transfer tests are opt-in local/QA tests. They require a compatible native runtime
+and are not enabled by the default CPU job. Run them explicitly with:
+
+```bash
+TRTLLM_TEST_NIXL_ENCODER=1 python3 -m pytest tests/unittest/grpc/openengine/test_encoder_nixl.py
+```
+
+These native tests use CPU buffers and exercise registration, WRITE, and
+release, including separate producer/consumer processes. Cross-host CUDA E+PD
+and E/P/D require separate GPU validation.

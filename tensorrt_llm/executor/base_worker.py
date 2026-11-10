@@ -590,6 +590,8 @@ class BaseWorker(GenerationExecutor):
                     executor_request, result_wait_queue=result_wait_queue)
             else:
                 req_id = self.engine.enqueue_request(executor_request)
+            # The input envelope now owns the restored media tensors.
+            request.multimodal_params = None
             return req_id
         except Exception as e:
             raise RequestError(str(e)) from e

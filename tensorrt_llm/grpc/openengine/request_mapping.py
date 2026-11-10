@@ -595,10 +595,11 @@ _MEDIA_HANDLERS: dict[int, _MediaHandler] = {
 }
 
 
-def media_capabilities_for_model(llm: Any) -> MediaCapabilities:
+def media_capabilities_for_model(llm: Any, *, encoder_handoff: bool = False) -> MediaCapabilities:
     return resolve_media_capabilities(
         llm,
         {handler.name for handler in _MEDIA_HANDLERS.values() if handler.runtime_available()},
+        encoder_handoff=encoder_handoff,
     )
 
 

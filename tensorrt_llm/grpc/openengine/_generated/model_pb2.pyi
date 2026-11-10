@@ -45,7 +45,7 @@ class GetModelInfoRequest(_message.Message):
     def __init__(self, model: _Optional[str] = ...) -> None: ...
 
 class ModelInfo(_message.Message):
-    __slots__ = ("model_id", "served_model_name", "served_model_aliases", "max_context_length", "max_output_tokens", "tokenizer_modes", "supports_text_input", "supports_token_ids_input", "generation", "supports_lora", "supports_multimodal", "reasoning_parser", "tool_call_parser", "extra")
+    __slots__ = ("model_id", "served_model_name", "served_model_aliases", "max_context_length", "max_output_tokens", "tokenizer_modes", "supports_text_input", "supports_token_ids_input", "generation", "supports_lora", "supports_multimodal", "reasoning_parser", "tool_call_parser", "extra", "encoder")
     MODEL_ID_FIELD_NUMBER: _ClassVar[int]
     SERVED_MODEL_NAME_FIELD_NUMBER: _ClassVar[int]
     SERVED_MODEL_ALIASES_FIELD_NUMBER: _ClassVar[int]
@@ -60,6 +60,7 @@ class ModelInfo(_message.Message):
     REASONING_PARSER_FIELD_NUMBER: _ClassVar[int]
     TOOL_CALL_PARSER_FIELD_NUMBER: _ClassVar[int]
     EXTRA_FIELD_NUMBER: _ClassVar[int]
+    ENCODER_FIELD_NUMBER: _ClassVar[int]
     model_id: str
     served_model_name: str
     served_model_aliases: _containers.RepeatedScalarFieldContainer[str]
@@ -74,7 +75,24 @@ class ModelInfo(_message.Message):
     reasoning_parser: str
     tool_call_parser: str
     extra: _struct_pb2.Struct
-    def __init__(self, model_id: _Optional[str] = ..., served_model_name: _Optional[str] = ..., served_model_aliases: _Optional[_Iterable[str]] = ..., max_context_length: _Optional[int] = ..., max_output_tokens: _Optional[int] = ..., tokenizer_modes: _Optional[_Iterable[str]] = ..., supports_text_input: bool = ..., supports_token_ids_input: bool = ..., generation: _Optional[_Union[GenerationCapabilities, _Mapping]] = ..., supports_lora: bool = ..., supports_multimodal: bool = ..., reasoning_parser: _Optional[str] = ..., tool_call_parser: _Optional[str] = ..., extra: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ...) -> None: ...
+    encoder: EncoderCapabilities
+    def __init__(self, model_id: _Optional[str] = ..., served_model_name: _Optional[str] = ..., served_model_aliases: _Optional[_Iterable[str]] = ..., max_context_length: _Optional[int] = ..., max_output_tokens: _Optional[int] = ..., tokenizer_modes: _Optional[_Iterable[str]] = ..., supports_text_input: bool = ..., supports_token_ids_input: bool = ..., generation: _Optional[_Union[GenerationCapabilities, _Mapping]] = ..., supports_lora: bool = ..., supports_multimodal: bool = ..., reasoning_parser: _Optional[str] = ..., tool_call_parser: _Optional[str] = ..., extra: _Optional[_Union[_struct_pb2.Struct, _Mapping]] = ..., encoder: _Optional[_Union[EncoderCapabilities, _Mapping]] = ...) -> None: ...
+
+class EncoderCapabilities(_message.Message):
+    __slots__ = ("schema_version", "encoder_only", "accepts_cache", "transfer_backends", "supports_abort_cleanup", "requires_cache")
+    SCHEMA_VERSION_FIELD_NUMBER: _ClassVar[int]
+    ENCODER_ONLY_FIELD_NUMBER: _ClassVar[int]
+    ACCEPTS_CACHE_FIELD_NUMBER: _ClassVar[int]
+    TRANSFER_BACKENDS_FIELD_NUMBER: _ClassVar[int]
+    SUPPORTS_ABORT_CLEANUP_FIELD_NUMBER: _ClassVar[int]
+    REQUIRES_CACHE_FIELD_NUMBER: _ClassVar[int]
+    schema_version: int
+    encoder_only: bool
+    accepts_cache: bool
+    transfer_backends: _containers.RepeatedScalarFieldContainer[str]
+    supports_abort_cleanup: bool
+    requires_cache: bool
+    def __init__(self, schema_version: _Optional[int] = ..., encoder_only: bool = ..., accepts_cache: bool = ..., transfer_backends: _Optional[_Iterable[str]] = ..., supports_abort_cleanup: bool = ..., requires_cache: bool = ...) -> None: ...
 
 class GenerationCapabilities(_message.Message):
     __slots__ = ("prompt_logprobs", "output_logprobs", "guided_decoding", "max_num_sequences", "supports_priority", "supports_stop_in_output", "supports_cache_salt", "supports_prefix_cache_bypass")

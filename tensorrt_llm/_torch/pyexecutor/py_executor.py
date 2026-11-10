@@ -2911,14 +2911,15 @@ class PyExecutor:
 
     def _has_pending_connector_transfers(self) -> bool:
         connector = getattr(self, "kv_connector_manager", None)
-        if connector is None:
+        if connector is None and self.dist.world_size != 1:
+            # Native-only idle polling currently requires a single-rank worker.
             return False
-        if self.enable_attention_dp:
+        if self.enable_attention_dp and connector is not None:
             # Fleet-wide snapshot from the routing allgather; a rank-local
             # decision here can strand peers in request broadcast or shutdown.
             return self._kv_connector_has_pending
         transfers = getattr(self, "async_transfer_manager", None)
-        return (connector.has_pending_loads()
+        return ((connector is not None and connector.has_pending_loads())
                 or (transfers is not None
                     and transfers.has_any_inflight_requests()))
 

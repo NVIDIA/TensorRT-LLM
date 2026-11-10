@@ -4,8 +4,9 @@
 """OpenEngine Inference service adapter for the TensorRT-LLM LLM API."""
 
 import asyncio
+import os
 import threading
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Coroutine
 from concurrent.futures import Executor
 from contextlib import aclosing
 from contextvars import copy_context
@@ -22,6 +23,7 @@ from tensorrt_llm.scheduling_params import SchedulingParams
 
 from .affinity import validate_parent_affinity
 from .bindings import error_pb2, generation_pb2, openengine_pb2_grpc
+from .capabilities import MediaCapabilities
 from .coordinator import (
     CoordinationError,
     DuplicateRequestError,
@@ -30,6 +32,13 @@ from .coordinator import (
     Reservation,
 )
 from .disagg import disaggregated_params_from_request
+from .encoder import (
+    EncoderCache,
+    PrefillResultExports,
+    encoder_role,
+    release_encoder_result,
+    validate_encoder,
+)
 from .errors import AbortFailedError, MediaUnavailableError, UnsupportedFeatureError
 from .formatting import _engine_error_response, _stop_texts
 from .metrics import OpenEngineMetrics, RequestMetrics
@@ -56,7 +65,8 @@ from .streaming import (
 class _PreprocessingWork:
     """Own exports until submission, including results from abandoned worker threads."""
 
-    def __init__(self) -> None:
+    def __init__(self, release: Callable[[Any], None] | None = None) -> None:
+        self._release_result = release or self._release
         self._lock = threading.Lock()
         self._abandoned = False
         self._result = None
@@ -76,7 +86,7 @@ class _PreprocessingWork:
             if not self._abandoned:
                 self._result = result
                 return result
-        self._release(result)
+        self._release_result(result)
         return None
 
     def transfer(self) -> None:
@@ -87,7 +97,7 @@ class _PreprocessingWork:
         with self._lock:
             self._abandoned = True
             result, self._result = self._result, None
-        self._release(result)
+        self._release_result(result)
 
 
 class _PreparationLease:
@@ -180,16 +190,50 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         self._media_executor = media_executor
         self._media_admission = asyncio.Semaphore(max_media_preparations)
         self._llm = llm
+        cache_directory = os.environ.get("TRTLLM_OPENENGINE_ENCODER_CACHE_DIR")
+        self._encoder_cache = EncoderCache(cache_directory) if cache_directory else None
+        encoder_transport = os.environ.get("TRTLLM_OPENENGINE_ENCODER_TRANSFER", "")
+        if encoder_transport not in ("", "nixl"):
+            raise ValueError("unsupported encoder transfer backend")
+        if encoder_transport == "nixl":
+            from .encoder_nixl import NixlEncoderCache
+
+            self._encoder_cache = NixlEncoderCache(
+                os.environ.get("TRTLLM_OPENENGINE_ENCODER_ENDPOINT", ""),
+                os.environ.get("TRTLLM_OPENENGINE_ENCODER_MODEL_REVISION", ""),
+            )
+        self.encoder_role = encoder_role(llm, self._encoder_cache)
+        if encoder_transport == "nixl" and (
+            not self.encoder_role
+            or (self.encoder_role == "encode" and not self._encoder_cache.endpoint)
+        ):
+            self._encoder_cache.close()
+            raise ValueError(
+                "NIXL encoder serving requires a supported role and a producer endpoint"
+            )
+        if getattr(llm.args, "mm_encoder_only", False) and self.encoder_role != "encode":
+            raise ValueError(
+                "encoder-only serving requires a shared cache, native MM disaggregation, and TP1"
+            )
         self._model = model
         # Informational label placed in the KvSessionRef of PrefillReady events so
         # a generation worker/orchestrator can see which KV transfer backend the
         # context worker uses. The actual transfer is driven by opaque_state.
         self._kv_transfer_backend = kv_transfer_backend
         self._guided_backend = llm.args.guided_decoding_backend
-        self._media_capabilities = media_capabilities_for_model(llm)
+        capabilities = media_capabilities_for_model(llm, encoder_handoff=bool(self.encoder_role))
+        self._media_capabilities = MediaCapabilities(
+            {
+                name: template
+                for name, template in capabilities.placeholder_templates.items()
+                if not self.encoder_role or name == "image"
+            }
+        )
         self.subagent_affinity_auth_key = subagent_affinity_auth_key
         self._active_requests: dict[str, Any] = {}
         self._metrics = metrics
+        self._encoder_cleanup_tasks: set[asyncio.Task] = set()
+        self._encoder_cleanup_failed = False
 
     @property
     def supported_media_modalities(self) -> frozenset[str]:
@@ -199,6 +243,20 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
     def active_request_count(self) -> int:
         """Requests accepted and not yet completed."""
         return len(self._active_requests)
+
+    async def _run_encoder_cleanup(self, operation: Coroutine[Any, Any, None]) -> None:
+        cleanup = asyncio.create_task(operation)
+        self._encoder_cleanup_tasks.add(cleanup)
+        cleanup.add_done_callback(self._encoder_cleanup_tasks.discard)
+        await asyncio.shield(cleanup)
+
+    async def drain_encoder_cleanup(self) -> None:
+        """Finish detached encoder cleanup before stopping the engine executors."""
+        while self._encoder_cleanup_tasks:
+            await asyncio.gather(*tuple(self._encoder_cleanup_tasks), return_exceptions=True)
+        close = getattr(self._encoder_cache, "close", None)
+        if close is not None:
+            await asyncio.to_thread(close)
 
     def track_request(self, request_id: str, handle: Any) -> bool:
         """Register an in-flight request. False when the id is already active.
@@ -332,6 +390,10 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         """Run a server-streaming OpenEngine generation request."""
         request_id = request.request_id
         try:
+            if self._encoder_cleanup_failed:
+                await context.abort(
+                    grpc.StatusCode.UNAVAILABLE, "encoder cleanup failed; restart the engine"
+                )
             if not request.model:
                 raise ValueError("model must be non-empty")
             # Like the HTTP /v1/completions single-model server, any non-empty
@@ -343,6 +405,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 if request.kv.HasField("bypass_prefix_cache") and request.kv.bypass_prefix_cache:
                     raise UnsupportedFeatureError("prefix cache bypass is not supported")
 
+            encoder_action = validate_encoder(request, self.encoder_role)
             prepared_input = _prepare_input_from_request(
                 request, self._llm, self._media_capabilities
             )
@@ -350,6 +413,20 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             trace_headers, target_dp_rank, affinity_headers = _metadata_from_context(context)
             conversation_params = conversation_params_from_request(request)
             disaggregated_params = disaggregated_params_from_request(request)
+            if encoder_action and disaggregated_params is not None:
+                if encoder_action != "consume" or disaggregated_params.request_type not in (
+                    "context_only",
+                    "context_and_generation",
+                ):
+                    raise UnsupportedFeatureError(
+                        "encoder handoffs require a prefill or aggregated request"
+                    )
+                if disaggregated_params.request_type == "context_only" and not callable(
+                    getattr(self._llm.input_processor, "capture_decode_state", None)
+                ):
+                    raise UnsupportedFeatureError(
+                        "encoder prefill requires portable decode preparation"
+                    )
             if request_metrics is not None:
                 request_metrics.begin(disaggregated_params)
             parent_affinity_id = validate_parent_affinity(
@@ -400,12 +477,57 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 else None
             )
 
+            def prepare_with_decode_state(prepare: Callable[[], Any]) -> Any:
+                capture_decode_state = getattr(
+                    self._llm.input_processor, "capture_decode_state", None
+                )
+                if (
+                    disaggregated_params is not None
+                    and disaggregated_params.request_type == "context_only"
+                    and callable(capture_decode_state)
+                ):
+                    with capture_decode_state() as capture:
+                        result = prepare()
+                    try:
+                        local_request.decode_preparation = _decode_preparation(
+                            request, self._llm, capture, result
+                        )
+                        if encoder_action == "consume" and local_request.decode_preparation is None:
+                            raise UnsupportedFeatureError(
+                                "encoder prefill requires portable decode preparation"
+                            )
+                    except Exception:
+                        _PreprocessingWork._release(result)
+                        raise
+                    return result
+                return prepare()
+
             async def prepare_inputs() -> Any:
+                nonlocal disaggregated_params
                 if not prepared_input.media:
                     return await _load_prepared_input(prepared_input, self._llm)
                 await self._media_admission.acquire()
                 lease = _PreparationLease(self._media_admission)
                 try:
+                    if encoder_action == "consume":
+                        work = local_request.preprocessing = _PreprocessingWork()
+
+                        def prepare_encoder_input() -> Any:
+                            nonlocal disaggregated_params
+                            inputs, disaggregated_params = self._encoder_cache.prepare(
+                                request.encoder.cache,
+                                request,
+                                self._llm,
+                                sampling_params,
+                                disaggregated_params,
+                            )
+                            return inputs
+
+                        return await lease.run(
+                            self._input_executor,
+                            work.run,
+                            partial(prepare_with_decode_state, prepare_encoder_input),
+                        )
                     if (
                         disaggregated_params is not None
                         and disaggregated_params.request_type == "generation_only"
@@ -444,33 +566,15 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                         inputs["prompt_token_ids"] = validated_ids
                     work = local_request.preprocessing = _PreprocessingWork()
 
-                    def preprocess() -> Any:
-                        capture_decode_state = getattr(
-                            self._llm.input_processor, "capture_decode_state", None
-                        )
-                        if (
-                            disaggregated_params is not None
-                            and disaggregated_params.request_type == "context_only"
-                            and callable(capture_decode_state)
-                        ):
-                            with capture_decode_state() as capture:
-                                result = self._llm.preprocess(
-                                    inputs, sampling_params, disaggregated_params
-                                )
-                            try:
-                                local_request.decode_preparation = _decode_preparation(
-                                    request, self._llm, capture, result
-                                )
-                            except Exception:
-                                _PreprocessingWork._release(result)
-                                raise
-                            return result
-                        return self._llm.preprocess(inputs, sampling_params, disaggregated_params)
-
                     return await lease.run(
                         self._input_executor,
                         work.run,
-                        preprocess,
+                        partial(
+                            prepare_with_decode_state,
+                            partial(
+                                self._llm.preprocess, inputs, sampling_params, disaggregated_params
+                            ),
+                        ),
                     )
                 finally:
                     lease.close()
@@ -526,22 +630,40 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             tokenizer=self._llm.tokenizer,
             decode_preparation=local_request.decode_preparation,
         )
+        prefill_exports = (
+            PrefillResultExports(disaggregated_params) if format_state.is_context_only else None
+        )
+        prefill_may_export = format_state.is_context_only and (
+            bool(prepared_input.media)
+            or encoder_action == "consume"
+            or getattr(inputs, "multimodal_params", None) is not None
+        )
+
+        async def release_prefill_result(result: Any) -> None:
+            if prefill_exports is not None and prefill_exports.has_exports(result):
+                if not await asyncio.to_thread(prefill_exports.release, result):
+                    self._encoder_cleanup_failed = True
 
         if local_request.aborted or (reservation is not None and reservation.aborted):
             await context.abort(grpc.StatusCode.CANCELLED, "Request aborted before submission")
 
         try:
-            result_handle = self._llm.generate_async(
-                inputs=inputs,
-                sampling_params=sampling_params,
-                streaming=True,
-                trace_headers=trace_headers,
-                scheduling_params=scheduling_params,
-                conversation_params=conversation_params,
-                cache_salt=cache_salt,
-                priority=DEFAULT_REQUEST_PRIORITY,
-                disaggregated_params=disaggregated_params,
-            )
+            if encoder_action == "encode":
+                result_handle = self._llm.generate_async(
+                    inputs=inputs, sampling_params=sampling_params
+                )
+            else:
+                result_handle = self._llm.generate_async(
+                    inputs=inputs,
+                    sampling_params=sampling_params,
+                    streaming=True,
+                    trace_headers=trace_headers,
+                    scheduling_params=scheduling_params,
+                    conversation_params=conversation_params,
+                    cache_salt=cache_salt,
+                    priority=DEFAULT_REQUEST_PRIORITY,
+                    disaggregated_params=disaggregated_params,
+                )
         except ValueError as error:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
             return
@@ -619,10 +741,49 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         try:
             watchdog.start()
             async for result in result_handle:
+                if prefill_exports is not None and prefill_exports.has_exports(result):
+                    await self._run_encoder_cleanup(release_prefill_result(result))
                 if context.cancelled():
+                    if encoder_action == "encode":
+                        await asyncio.to_thread(release_encoder_result, result)
                     abort_request("RPC cancelled")
                     return
-                responses = _format_result(result, format_state)
+                if encoder_action == "encode" and not result.error:
+                    responses = []
+                    if result.finished:
+                        await self._media_admission.acquire()
+                        lease = _PreparationLease(self._media_admission)
+
+                        def discard_publication(reference: Any) -> None:
+                            if reference is None:
+                                return
+                            try:
+                                self._encoder_cache.discard(reference)
+                            except Exception as error:
+                                self._encoder_cleanup_failed = True
+                                logger.error(f"Failed to reclaim abandoned encoder cache: {error}")
+
+                        publication = _PreprocessingWork(discard_publication)
+                        try:
+                            cache = await lease.run(
+                                self._input_executor,
+                                publication.run,
+                                partial(self._encoder_cache.publish, result, request, self._llm),
+                            )
+                            if context.cancelled():
+                                return
+                            responses.append(
+                                generation_pb2.GenerateResponse(
+                                    request_id=request_id,
+                                    encoder_ready=generation_pb2.EncoderReady(cache=cache),
+                                )
+                            )
+                            publication.transfer()
+                        finally:
+                            publication.abandon()
+                            lease.close()
+                else:
+                    responses = _format_result(result, format_state)
                 for resp in responses or ():
                     if request_metrics is not None:
                         request_metrics.observe_response(resp)
@@ -683,6 +844,36 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             watchdog.close()
             if not engine_terminal:
                 abort_request("response stream closed")
+            if encoder_action == "encode" or (
+                prefill_exports is not None
+                and (
+                    (abort_requested and prefill_may_export)
+                    or prefill_exports.has_exports(result_handle)
+                )
+            ):
+
+                async def reclaim_encoder(handle: Any) -> None:
+                    try:
+                        complete = getattr(handle, "aresult", None)
+                        if (
+                            abort_requested
+                            and complete is not None
+                            and (encoder_action == "encode" or prefill_may_export)
+                        ):
+                            await asyncio.wait_for(complete(), timeout=30)
+                    except asyncio.TimeoutError:
+                        self._encoder_cleanup_failed = True
+                        logger.error("Native export cleanup timed out; refusing further requests")
+                    except Exception:
+                        # Native abort completion may raise after updating the result.
+                        pass
+                    finally:
+                        if prefill_exports is None:
+                            await asyncio.to_thread(release_encoder_result, handle)
+                        else:
+                            await release_prefill_result(handle)
+
+                await self._run_encoder_cleanup(reclaim_encoder(result_handle))
             registration.release()
             # A task callback already scheduled on the event loop can still
             # hold this cell. abort_request is a no-op after this cleanup.

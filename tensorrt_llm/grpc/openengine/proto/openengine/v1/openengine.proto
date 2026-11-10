@@ -49,6 +49,8 @@ service Control {
   // Health and lifecycle.
   rpc Health(HealthRequest) returns (HealthResponse);
   rpc Abort(AbortRequest) returns (AbortResponse);
+  // Identity-fenced, idempotent shutdown of the entire engine serving group.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
 
   // LoRA lifecycle.
   rpc LoadLora(LoadLoraRequest) returns (LoadLoraResponse);

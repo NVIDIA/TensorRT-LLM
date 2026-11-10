@@ -24,11 +24,13 @@ with warnings.catch_warnings():
         message=(
             rf"^Protobuf gencode version {re.escape(_PROTOBUF_GENCODE)} is exactly one major "
             rf"version older than the runtime version {_PROTOBUF_RUNTIME_MAJOR}\.[0-9.]+ at "
-            r"openengine/v1/[A-Za-z0-9_]+\.proto\."
+            r"(?:openengine/v1|trtllm/openengine/v1)/[A-Za-z0-9_]+\.proto\."
         ),
         category=UserWarning,
     )
     from ._generated import (
+        encoder_transfer_pb2,
+        encoder_transfer_pb2_grpc,
         error_pb2,
         generation_pb2,
         kv_pb2,
@@ -45,6 +47,8 @@ __all__ = [
     "MINIMUM_CLIENT_REVISION",
     "SCHEMA_RELEASE",
     "SCHEMA_REVISION",
+    "encoder_transfer_pb2",
+    "encoder_transfer_pb2_grpc",
     "error_pb2",
     "generation_pb2",
     "kv_pb2",
@@ -58,4 +62,6 @@ __all__ = [
 
 SCHEMA_REVISION = int(_MANIFEST["schema_revision"])
 MINIMUM_CLIENT_REVISION = int(_MANIFEST["minimum_client_revision"])
-SCHEMA_RELEASE = str(_MANIFEST["bsr"]["release"])
+SCHEMA_RELEASE = str(
+    _MANIFEST["source"]["commit"] if "source" in _MANIFEST else _MANIFEST["bsr"]["release"]
+)

@@ -69,6 +69,27 @@ message GenerateRequest {
   // this field empty. Clients treat it as best-effort and never depend on it
   // for correctness. Carried as a Struct so JSON types survive the wire.
   google.protobuf.Struct extra = 12;
+
+  // Encoder execution or an engine-owned encoder-cache handoff. Consumers must
+  // negotiate support before setting this field; ignoring it is not valid.
+  EncoderOptions encoder = 13;
+}
+
+message EncoderCacheRef {
+  string transfer_backend = 1;
+  // Versioned, engine-specific reference. Tensor contents remain engine-owned.
+  bytes opaque_state = 2;
+}
+
+message EncoderOptions {
+  // Produce EncoderReady without generating language tokens.
+  bool encode_only = 1;
+  // Consume a previous encoder result. Mutually exclusive with encode_only.
+  EncoderCacheRef cache = 2;
+}
+
+message EncoderReady {
+  EncoderCacheRef cache = 1;
 }
 
 message SamplingParams {
@@ -148,7 +169,7 @@ message JsonObjectConstraint {}
 message GenerateResponse {
   string request_id = 1;
 
-  // PromptOutput, PrefillReady, and EngineError are request-scoped.
+  // PromptOutput, PrefillReady, EncoderReady, and EngineError are request-scoped.
   // TokenOutput and GenerationFinished are output-scoped.
   oneof event {
     PromptOutput prompt = 2;
@@ -156,6 +177,8 @@ message GenerateResponse {
     PrefillReady prefill_ready = 4;
     GenerationFinished finished = 5;
     EngineError error = 6;
+    // Request-scoped terminal for a successful encoder-only request.
+    EncoderReady encoder_ready = 7;
   }
 
   Usage usage = 10; // Cumulative request usage; only set on the final response.

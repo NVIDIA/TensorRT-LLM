@@ -31,6 +31,10 @@ pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
 from grpc_health.v1 import health_pb2, health_pb2_grpc  # noqa: E402
 
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
+    SCHEMA_RELEASE,
+    encoder_transfer_pb2,
+    encoder_transfer_pb2_grpc,
+    generation_pb2,
     kv_pb2,
     openengine_pb2_grpc,
     server_pb2,
@@ -79,6 +83,14 @@ def test_stop_drains_both_media_pools_even_if_shutdown_fails(
         )
         server._health = SimpleNamespace(enter_graceful_shutdown=AsyncMock())
         server._health_task = None
+        drain_started = asyncio.Event()
+        allow_drain = asyncio.Event()
+
+        async def drain_encoder_cleanup():
+            drain_started.set()
+            await allow_drain.wait()
+
+        server._inference = SimpleNamespace(drain_encoder_cleanup=drain_encoder_cleanup)
         server._metrics = SimpleNamespace(
             stop=AsyncMock(side_effect=RuntimeError("metrics failed") if fail_metrics else None)
         )
@@ -100,6 +112,9 @@ def test_stop_drains_both_media_pools_even_if_shutdown_fails(
             for event in started:
                 assert await asyncio.to_thread(event.wait, 5)
             stop_task = asyncio.create_task(server.stop(grace=0))
+            await asyncio.wait_for(drain_started.wait(), 5)
+            assert not any(pool.shutdown_started.is_set() for pool in pools)
+            allow_drain.set()
             await asyncio.wait_for(
                 asyncio.gather(*(pool.shutdown_started.wait() for pool in pools)), 5
             )
@@ -121,6 +136,7 @@ def test_stop_drains_both_media_pools_even_if_shutdown_fails(
             for future in futures:
                 future.result()
         finally:
+            allow_drain.set()
             for event in release:
                 event.set()
             if stop_task is not None:
@@ -187,7 +203,27 @@ def test_openengine_server_serves_the_control_contract() -> None:
             assert error.value.code() == grpc.StatusCode.UNIMPLEMENTED
             assert info.schema_revision == 1
             assert info.minimum_client_revision == 1
-            assert info.schema_release == "768a93c7b44e40f28c692ad0b471a8f2"
+            assert info.schema_release == SCHEMA_RELEASE
+            transfers = []
+            inference = server._control._inference
+            inference.encoder_role = "encode"
+            inference._encoder_cleanup_tasks = set()
+            inference._encoder_cache = SimpleNamespace(
+                backend="test-encoder",
+                transfer=lambda cache, destination: transfers.append((cache, destination)),
+                close=lambda: None,
+            )
+            reference = generation_pb2.EncoderCacheRef(
+                transfer_backend="test-encoder", opaque_state=b"reference"
+            )
+            peer = encoder_transfer_pb2_grpc.EncoderTransferStub(channel)
+            await peer.Transfer(
+                encoder_transfer_pb2.TransferEncoderCacheRequest(
+                    cache=reference, destination=b"destination"
+                ),
+                timeout=5,
+            )
+            assert transfers == [(reference, b"destination")]
         finally:
             await channel.close()
             await server.stop(grace=0)
@@ -643,6 +679,9 @@ def test_metrics_listener_preserves_engine_collection_config(
         def __init__(self, **kwargs) -> None:
             pass
 
+        def _needs_encoder_ipc_collection(self) -> bool:
+            return False
+
         async def start(self) -> None:
             raise _StopLaunch
 
@@ -734,6 +773,9 @@ def test_launch_server_disables_gc_only_when_requested(
         def __init__(self, **kwargs) -> None:
             seen["instance_id"] = kwargs["instance_id"]
 
+        def _needs_encoder_ipc_collection(self) -> bool:
+            return False
+
         async def start(self) -> None:
             seen["gc_enabled"] = gc.isenabled()
             raise _StopLaunch
@@ -756,3 +798,202 @@ def test_launch_server_disables_gc_only_when_requested(
 
     assert seen["gc_enabled"] is gc_enabled
     assert seen["instance_id"] == seen["engine_id"]
+
+
+@pytest.mark.parametrize(
+    ("role", "nixl", "device", "failed", "expected"),
+    [
+        ("consume", True, "cuda:0", False, True),
+        ("encode", True, "cuda:0", False, False),
+        ("", True, "cuda:0", False, False),
+        ("consume", False, "cuda:0", False, False),
+        ("consume", True, "cpu", False, False),
+        ("consume", True, "cuda:0", True, False),
+    ],
+)
+def test_encoder_ipc_collection_is_scoped_to_healthy_cuda_nixl_consumers(
+    role: str, nixl: bool, device: str, failed: bool, expected: bool
+) -> None:
+    import torch
+
+    from tensorrt_llm.grpc.openengine.encoder_nixl import NixlEncoderCache
+
+    cache = object.__new__(NixlEncoderCache) if nixl else SimpleNamespace()
+    cache.device = torch.device(device)
+    cache.failed = failed
+    server = object.__new__(OpenEngineServer)
+    server._inference = SimpleNamespace(encoder_role=role, _encoder_cache=cache)
+
+    assert server._needs_encoder_ipc_collection() is expected
+
+
+def _launch_encoder_cleanup_case(
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[str],
+    *,
+    eligible: bool = True,
+    initialized: bool = True,
+    shutdown_error: RuntimeError | None = None,
+    collect_error: RuntimeError | None = None,
+    stop_error: RuntimeError | None = None,
+    terminal_failure: bool = False,
+    failed_during_stop: bool = False,
+) -> None:
+    import tensorrt_llm.grpc.openengine.server as oe_server
+
+    handlers = {}
+    main_thread = threading.get_ident()
+
+    def signal(sig: int, handler) -> int:
+        if callable(handler):
+            handlers[sig] = handler
+        else:
+            events.append("signal_restore")
+        return 0
+
+    class Model:
+        def __init__(self, **kwargs) -> None:
+            self.llm_id = "test-instance"
+            self._executor = SimpleNamespace(_fatal_error=None, _engine_dead=False)
+
+        def _check_health(self) -> bool:
+            return True
+
+        def shutdown(self) -> None:
+            events.append("native_shutdown")
+            if shutdown_error is not None:
+                raise shutdown_error
+            self._executor = None
+
+    class Server:
+        def __init__(self, llm, **kwargs) -> None:
+            self.llm = llm
+            self.stopped = False
+
+        def _needs_encoder_ipc_collection(self) -> bool:
+            events.append("eligibility_after_shutdown" if self.stopped else "eligibility")
+            return eligible and not (self.stopped and failed_during_stop)
+
+        async def start(self) -> None:
+            events.append("server_start")
+            if terminal_failure:
+                self.llm._executor._fatal_error = RuntimeError("engine failed")
+                await asyncio.sleep(0)
+            else:
+                handlers[oe_server.signal.SIGTERM](oe_server.signal.SIGTERM, None)
+
+        async def stop(self) -> None:
+            self.stopped = True
+            events.append("server_stop")
+            if stop_error is not None:
+                raise stop_error
+
+    class Metrics:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def check_health(self) -> None:
+            pass
+
+        async def wait_for_collection(self) -> None:
+            events.append("metrics_wait")
+
+    class MetricsDirectory:
+        def __init__(self, *args) -> None:
+            pass
+
+        def close(self) -> None:
+            events.append("temp_close")
+
+    def is_initialized() -> bool:
+        events.append("initialized")
+        return initialized
+
+    def collect() -> None:
+        assert threading.get_ident() != main_thread
+        events.append("collect")
+        if collect_error is not None:
+            raise collect_error
+
+    def is_available() -> bool:
+        raise AssertionError("shutdown must not initialize or probe CUDA")
+
+    monkeypatch.delenv("TRTLLM_SERVER_DISABLE_GC", raising=False)
+    monkeypatch.setattr(oe_server, "PyTorchLLM", Model)
+    monkeypatch.setattr(oe_server, "OpenEngineServer", Server)
+    monkeypatch.setattr(oe_server, "OpenEngineMetrics", Metrics)
+    monkeypatch.setattr(oe_server, "MetricsDirectory", MetricsDirectory)
+    monkeypatch.setattr(oe_server.signal, "signal", signal)
+    monkeypatch.setattr(oe_server.torch.cuda, "is_initialized", is_initialized)
+    monkeypatch.setattr(oe_server.torch.cuda, "is_available", is_available)
+    monkeypatch.setattr(oe_server.torch.cuda, "ipc_collect", collect)
+    monkeypatch.setattr(oe_server.torch.cuda, "empty_cache", lambda: events.append("empty_cache"))
+    monkeypatch.setattr(oe_server.gc, "collect", lambda: events.append("forced_gc"))
+    oe_server.launch_server(
+        "127.0.0.1",
+        0,
+        {"backend": "pytorch", "model": "test-model", "return_perf_metrics": True},
+    )
+
+
+@pytest.mark.parametrize(
+    ("eligible", "initialized", "collects"),
+    [(True, True, True), (True, False, False), (False, True, False)],
+)
+def test_encoder_ipc_collection_follows_native_shutdown_before_final_cleanup(
+    monkeypatch: pytest.MonkeyPatch, eligible: bool, initialized: bool, collects: bool
+) -> None:
+    events = []
+    _launch_encoder_cleanup_case(monkeypatch, events, eligible=eligible, initialized=initialized)
+
+    assert events[:4] == ["server_start", "eligibility", "server_stop", "native_shutdown"]
+    assert events[-4:] == ["metrics_wait", "temp_close", "signal_restore", "signal_restore"]
+    assert events.count("collect") == int(collects)
+    if collects:
+        assert (
+            events.index("native_shutdown") < events.index("collect") < events.index("metrics_wait")
+        )
+    assert "forced_gc" not in events and "empty_cache" not in events
+
+
+@pytest.mark.parametrize("failure", ["native", "collect", "stop"])
+def test_encoder_ipc_cleanup_errors_preserve_native_and_final_cleanup(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    events = []
+    message = {"native": "native failed", "collect": "collect failed", "stop": "stop failed"}[
+        failure
+    ]
+    with pytest.raises(RuntimeError, match=message):
+        _launch_encoder_cleanup_case(
+            monkeypatch,
+            events,
+            shutdown_error=RuntimeError("native failed") if failure == "native" else None,
+            collect_error=RuntimeError("collect failed"),
+            stop_error=RuntimeError("stop failed") if failure == "stop" else None,
+        )
+    assert events[-4:] == ["metrics_wait", "temp_close", "signal_restore", "signal_restore"]
+    assert events.count("collect") == int(failure != "native")
+
+
+def test_encoder_ipc_cleanup_does_not_replace_recorded_terminal_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = []
+    with pytest.raises(RuntimeError, match="OpenEngine terminal engine failure"):
+        _launch_encoder_cleanup_case(
+            monkeypatch, events, terminal_failure=True, collect_error=RuntimeError("collect failed")
+        )
+    assert events.count("collect") == 1
+    assert events[-4:] == ["metrics_wait", "temp_close", "signal_restore", "signal_restore"]
+
+
+def test_encoder_ipc_collection_skips_transport_poisoned_during_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = []
+    _launch_encoder_cleanup_case(monkeypatch, events, failed_during_stop=True)
+    assert events.index("eligibility") < events.index("server_stop")
+    assert events.index("native_shutdown") < events.index("eligibility_after_shutdown")
+    assert "initialized" not in events and "collect" not in events
+    assert events[-4:] == ["metrics_wait", "temp_close", "signal_restore", "signal_restore"]

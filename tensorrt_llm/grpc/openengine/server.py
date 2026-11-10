@@ -9,6 +9,7 @@ import ipaddress
 import os
 import signal
 import socket
+import sys
 import tempfile
 import threading
 import uuid
@@ -18,10 +19,12 @@ from typing import Any
 
 import click
 import grpc
+import torch
 import uvloop
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm.grpc._protobuf import _warn_if_python_protobuf
 from tensorrt_llm.inputs.media_io import _close_aiohttp_session
 from tensorrt_llm.logger import logger
@@ -35,9 +38,11 @@ from tensorrt_llm.serve._frontend_processes import (
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 
 from ._health import OpenEngineHealthServicer
-from .bindings import openengine_pb2_grpc
+from .bindings import encoder_transfer_pb2_grpc, openengine_pb2_grpc
 from .control import OpenEngineControlServicer
 from .coordinator import CoordinationError, Coordinator, FrontendClient
+from .encoder_nixl import NixlEncoderCache
+from .encoder_transfer import EncoderTransferServicer
 from .kv_events import KvEventsUnavailableError, _format_host_port, events_config
 from .metrics import MetricsDirectory, OpenEngineMetrics
 from .servicer import OpenEngineInferenceServicer
@@ -161,6 +166,7 @@ class OpenEngineServer:
             max_media_preparations=max_media_preparations,
         )
         openengine_pb2_grpc.add_InferenceServicer_to_server(inference, self._server)
+        self._inference = inference
         # Control shares the inference servicer's in-flight request table so
         # Abort and GetLoad see the same requests Generate is serving.
         self._control = OpenEngineControlServicer(
@@ -172,6 +178,9 @@ class OpenEngineServer:
             instance_id=instance_id,
         )
         openengine_pb2_grpc.add_ControlServicer_to_server(self._control, self._server)
+        encoder_transfer_pb2_grpc.add_EncoderTransferServicer_to_server(
+            EncoderTransferServicer(inference), self._server
+        )
         bind_address = _format_bind_address(host, port)
         # Plaintext h2c with no authentication: any client that can reach this
         # port can run inference and call Control.Abort. It is meant to be
@@ -264,6 +273,15 @@ class OpenEngineServer:
         self._engine_health_task = None
         return task.result()
 
+    def _needs_encoder_ipc_collection(self) -> bool:
+        cache = self._inference._encoder_cache
+        return (
+            self._inference.encoder_role == "consume"
+            and isinstance(cache, NixlEncoderCache)
+            and cache.device.type == "cuda"
+            and not cache.failed
+        )
+
     @staticmethod
     def _consume_engine_health_result(task: asyncio.Task[bool]) -> None:
         if not task.cancelled():
@@ -292,7 +310,10 @@ class OpenEngineServer:
             if self._health_task is not None:
                 self._health_task.cancel()
                 await asyncio.gather(self._health_task, return_exceptions=True)
-            await self._server.stop(grace=grace)
+            try:
+                await self._server.stop(grace=grace)
+            finally:
+                await self._inference.drain_encoder_cleanup()
         finally:
             try:
                 if self._metrics is not None:
@@ -393,6 +414,7 @@ def launch_server(
         children = []
         failure = None
         serving = False
+        collect_encoder_ipc = False
         parent_pid = os.getppid()
 
         def fail(reason: str) -> None:
@@ -477,7 +499,12 @@ def launch_server(
                 "host": host,
                 "port": port,
             }
-            llm = PyTorchLLM(**llm_args)
+            if llm_args.get("mm_encoder_only"):
+                if mode.num_frontends != 1:
+                    raise ValueError("OpenEngine encoder-only serving requires one frontend")
+                llm = MultimodalEncoder(**llm_args)
+            else:
+                llm = PyTorchLLM(**llm_args)
             if stop_event.is_set():
                 if failure is not None:
                     raise RuntimeError(failure)
@@ -575,6 +602,7 @@ def launch_server(
                 await asyncio.gather(monitor, return_exceptions=True)
             try:
                 if server is not None:
+                    collect_encoder_ipc = server._needs_encoder_ipc_collection()
                     await server.stop()
             finally:
                 try:
@@ -588,6 +616,24 @@ def launch_server(
                     try:
                         if llm is not None:
                             await asyncio.to_thread(llm.shutdown)
+                            if (
+                                collect_encoder_ipc
+                                and server._needs_encoder_ipc_collection()
+                                and torch.cuda.is_initialized()
+                            ):
+                                preserve_failure = (
+                                    failure is not None or sys.exc_info()[0] is not None
+                                )
+                                try:
+                                    await asyncio.to_thread(torch.cuda.ipc_collect)
+                                except Exception as error:
+                                    if not preserve_failure:
+                                        raise
+                                    logger.error(f"Encoder CUDA IPC cleanup failed: {error}")
+                                else:
+                                    logger.info(
+                                        "Encoder CUDA IPC collection completed after LLM shutdown"
+                                    )
                     finally:
                         if metrics is not None:
                             await metrics.wait_for_collection()

@@ -157,6 +157,12 @@ cache_transceiver_config:
 
 `kv_transfer_timeout_ms` bounds the KV transfer wait. The default is `60000`. In ownership-enabled configurations, expiry cancels logical work but does not itself authorize releasing memory that a transfer may still access.
 
+Single-rank context workers keep polling pending native sends during shutdown.
+With the C++ transceiver, setting `kv_transfer_timeout_ms: null` removes the
+transfer deadline; an orphaned send can then keep shutdown waiting indefinitely.
+The sender-future polling interval does not impose an overall deadline. Use a
+finite transfer timeout when a bounded transfer wait is required.
+
 ```{warning}
 The C++ cache transceiver (`transceiver_runtime: CPP`, or `null`) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use the Python transceiver, the default, with `backend: NIXL` and KV cache manager V2 on both the context and the generation worker.
 
