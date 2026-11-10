@@ -431,7 +431,11 @@ class TestBaseToolParser:
 
 
 def _streamed_calls(parser, increments, tools):
-    """The calls a client assembles from the increments and finish(): (name, arguments)."""
+    """The calls a client assembles from the increments and finish(): (name, arguments).
+
+    A client appends every name delta of a tool index, so a second name for an
+    index fails here instead of replacing the first.
+    """
     results = [
         parser.parse_streaming_increment(piece, tools) for piece in increments
     ]
@@ -440,6 +444,9 @@ def _streamed_calls(parser, increments, tools):
     for result in results:
         for call in result.calls:
             if call.name:
+                assert call.tool_index not in names, (
+                    f"tool {call.tool_index} named twice: "
+                    f"{names[call.tool_index]!r}, then {call.name!r}")
                 names[call.tool_index] = call.name
             if call.parameters:
                 arguments[call.tool_index] = (
