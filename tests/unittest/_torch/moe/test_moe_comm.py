@@ -52,11 +52,12 @@ import pickle
 import sys
 import threading
 import traceback
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Set, Tuple
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import cloudpickle
 import pytest
@@ -94,6 +95,7 @@ from tensorrt_llm._torch.nccl_window_tensor_scope import (
     discard_nccl_window_tensor_outputs,
     nccl_window_tensor_scope,
 )
+from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.deep_ep.buffer import Buffer
 from tensorrt_llm.mapping import Mapping
 
@@ -1216,8 +1218,10 @@ def _nccl_ep_replay_slots(
     return (target_rank * experts_per_rank + local_experts).view(num_tokens, 1)
 
 
-def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: torch.dtype) -> dict:
-    """Capture LL dispatch, change routing, and verify replay sees the change."""
+def _worker_nccl_ep_cuda_graph_replay(
+    config: CommTestConfig, routing_dtype: torch.dtype, force_window_fallback: bool = False
+) -> dict:
+    """Verify captured LL routing updates with window-backed and fallback outputs."""
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
     comm = None
@@ -1258,20 +1262,41 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
 
         # Release the warmup lease before capture claims its graph-owned window.
         with discard_nccl_window_tensor_outputs(hidden_states):
-            comm.dispatch(
+            warmup_recv, *_ = comm.dispatch(
                 hidden_states,
                 None,
                 local_routes,
                 weights,
                 all_rank_num_tokens,
             )
+            warmup_uses_window = warmup_recv.data_ptr() != comm._ctx.output_tokens_buf.data_ptr()
         torch.cuda.synchronize()
+
+        availability = MPI.COMM_WORLD.allgather((comm._ctx.zerocopy_enabled, warmup_uses_window))
+        if not all(enabled for enabled, _ in availability):
+            return {"rank": rank, "skip_reason": "NCCL-EP zero-copy is unavailable"}
+        if not force_window_fallback and not all(available for _, available in availability):
+            return {"rank": rank, "skip_reason": "Warmup could not acquire an NCCL window"}
+
+        allocate = torch.ops.trtllm.allocate_output_with_nccl_window
+
+        def refuse_window(input_tensor, _kind, group):
+            """Use the native plain allocator to inject an ordinary window refusal."""
+            return allocate(input_tensor, int(BufferKind.DEFAULT), group)
+
+        allocation_context = (
+            patch.object(
+                torch.ops.trtllm, "allocate_output_with_nccl_window", side_effect=refuse_window
+            )
+            if force_window_fallback
+            else nullcontext()
+        )
 
         with nccl_window_tensor_scope(hidden_states):
             static_routes = local_routes.clone()
             graph = torch.cuda.CUDAGraph()
             pool = torch.cuda.graph_pool_handle()
-            with nccl_window_graph_capture(graph, pool):
+            with allocation_context as refused, nccl_window_graph_capture(graph, pool):
                 recv_hs, _, recv_slots, recv_scales = comm.dispatch(
                     hidden_states,
                     None,
@@ -1282,12 +1307,18 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
             torch.cuda.synchronize()
 
             uses_window = recv_hs.data_ptr() != comm._ctx.output_tokens_buf.data_ptr()
-            assert uses_window == comm._ctx.zerocopy_enabled
+            assert uses_window == (not force_window_fallback)
+            if force_window_fallback:
+                refused.assert_called_once()
             assert recv_scales.dtype == routing_dtype
+            output_ptr = recv_hs.data_ptr()
 
             def replay_and_check(expected_sender: int, expected_weight: float) -> dict:
                 graph.replay()
                 torch.cuda.synchronize()
+                assert recv_hs.data_ptr() == output_ptr
+                if force_window_fallback:
+                    assert output_ptr == comm._ctx.output_tokens_buf.data_ptr()
                 valid = recv_slots[:, 0] >= 0
                 received = recv_hs[valid, 0].to(torch.float32).round().to(torch.int64)
                 return {
@@ -1304,7 +1335,12 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
             static_routes.copy_(peer_routes)
             weights.fill_(0.25)
             peer_result = replay_and_check(peer_rank, 0.25)
-            return {"rank": rank, "local": local_result, "peer": peer_result}
+            return {
+                "rank": rank,
+                "uses_window": uses_window,
+                "local": local_result,
+                "peer": peer_result,
+            }
     except Exception:
         traceback.print_exc()
         raise
@@ -2460,7 +2496,9 @@ def _run_full_test_group(mpi_pool_executor, group: CommTestGroup):
     _verify_full_test_results(all_results, pending.config)
 
 
-def _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype: torch.dtype) -> None:
+def _run_nccl_ep_cuda_graph_replay_test(
+    mpi_pool_executor, routing_dtype: torch.dtype, force_window_fallback: bool
+) -> None:
     """Verify graph replay observes routing changed between replays."""
     ep_size = mpi_pool_executor.num_workers
     config = CommTestConfig(
@@ -2476,10 +2514,15 @@ def _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype: torch.
         pytest.skip(skip_reason)
 
     futures = [
-        mpi_pool_executor.submit(_worker_nccl_ep_cuda_graph_replay, config, routing_dtype)
+        mpi_pool_executor.submit(
+            _worker_nccl_ep_cuda_graph_replay, config, routing_dtype, force_window_fallback
+        )
         for _ in range(config.ep_size)
     ]
     results = sorted((future.result() for future in futures), key=lambda result: result["rank"])
+    for result in results:
+        if "skip_reason" in result:
+            pytest.skip(result["skip_reason"])
     for result in results:
         rank = result["rank"]
         for replay_name in ("local", "peer"):
@@ -3031,11 +3074,12 @@ class TestMoEComm:
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
     @pytest.mark.parametrize("routing_dtype", [torch.bfloat16, torch.float16, torch.float32])
+    @pytest.mark.parametrize("force_window_fallback", [False, True], ids=["window", "fallback"])
     def test_nccl_ep_cuda_graph_replay_uses_updated_routing(
-        self, mpi_pool_executor, routing_dtype: torch.dtype
+        self, mpi_pool_executor, routing_dtype: torch.dtype, force_window_fallback: bool
     ) -> None:
         """Verify LL CUDA graph replay reads routing written after capture."""
-        _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype)
+        _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype, force_window_fallback)
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
