@@ -16,6 +16,7 @@ from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime import kv_cache_manager_v2 as kv
+from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
@@ -355,18 +356,18 @@ def test_cold_page_window_high_pages_cross_the_host_tier_unchanged(make_manager)
                 pressure.append(cache)
                 assert cache.resume(stream) and cache.resize(256)
                 cache.suspend()
-                if kv._introspection.active_page_stats(source)[0][0] == 0:
+                if _introspection.active_page_stats(source)[0][0] == 0:
                     break
             torch.cuda.synchronize()
             # Five pages of the layer and the two the high layer kept, all on the host.
-            assert kv._introspection.active_page_stats(source)[0][:2] == [0, 7]
+            assert _introspection.active_page_stats(source)[0][:2] == [0, 7]
         finally:
             for cache in pressure:
                 cache.close()
         assert encode.call_count > 0 and decode.call_count == 0
         assert source.resume(stream, is_decoding=True)
         torch.cuda.synchronize()
-        assert kv._introspection.active_page_stats(source)[0][1] == 0
+        assert _introspection.active_page_stats(source)[0][1] == 0
         assert decode.call_count > 0
         # The high layer's pages never went through the codec, so the window's pages come back
         # bit-exact; the layer's own pages were quantized on the way out.

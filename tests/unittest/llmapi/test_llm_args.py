@@ -4832,7 +4832,7 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
          dict(kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=False))),
         ("TRTLLM attention backend;", dict(attn_backend="VANILLA")),
         ("TRTLLM attention backend;", dict(attn_backend="FLASHINFER")),
-        ("cold-page compression",
+        ("kv_cache_compression_config",
          dict(kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True,
                                             dtype="mixed_nvfp4_fp8"))),
         ("fp8_ds_mla",
