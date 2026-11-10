@@ -835,7 +835,7 @@ def mergeWaiveList(pipeline, globalVars)
             sh ': > waives.txt'
             writeFile file: "waives_TOT_initial_${env.gitlabCommit}.txt", text:
                 '# snapshot-time: 2026-10-01T00:00:00Z\n# validation-fixture: simulated-old-TOT\n'
-            sh "tar -czf waive_validation_scripts.tar.gz -C ${LLM_ROOT} jenkins/scripts/refresh_test_waives.py jenkins/scripts/open_search_db.py jenkins/scripts/test_rerun.py jenkins/scripts/waive_refresh_validation.py tests/integration/defs/test_unittests.py tests/integration/defs/utils/periodic_junit.py tests/unittest/conftest.py tests/test_common/waive.py"
+            sh "tar --exclude=__pycache__ -czf waive_validation_scripts.tar.gz -C ${LLM_ROOT} jenkins/scripts tests/integration/defs/test_unittests.py tests/integration/defs/utils/periodic_junit.py tests/unittest/conftest.py tests/test_common/waive.py"
             trtllm_utils.uploadArtifacts('waive_validation_scripts.tar.gz', "${UPLOAD_PATH}/waive-validation/", 'urm')
             echo '[WAIVE-VALIDATION] Empty waive list and simulated old TOT; refresh queries existing OpenDB records.'
         }
