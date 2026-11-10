@@ -2010,7 +2010,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             return err
         }
         try {
-            executeLLMTestOnSlurm(pipeline, platform, testList, config, stageName, splitId, splits, skipInstallWheel, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
+            withEnv(["TRTLLM_CI_RUNTIME_IMAGE=${LLM_DOCKER_IMAGE}"]) {
+                executeLLMTestOnSlurm(pipeline, platform, testList, config, stageName, splitId, splits, skipInstallWheel, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
+            }
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -2949,7 +2951,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     'JOB_NAME',
                     'globalVars',
                     'gitlabCommit',
-                    'TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY'
+                    'TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY',
+                    'TRTLLM_CI_RUNTIME_IMAGE'
                 ]
                 def srunArgs = [
                     "--container-name=multi_node_test-\${SLURM_JOB_ID}",
@@ -2975,7 +2978,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 }
 
                 def envExportStatements = envVarNames.collect { varName ->
-                    def escapedValue = env."${varName}"?.toString() ?: ''
+                    // Original OCI/base reference; derived .sqsh identity is not captured.
+                    def value = varName == 'TRTLLM_CI_RUNTIME_IMAGE' ? LLM_DOCKER_IMAGE : env."${varName}"
+                    def escapedValue = value?.toString() ?: ''
                     escapedValue = escapedValue
                         .replace('\\', '\\\\')    // Backslash
                         .replace('"', '\\"')      // Double quote
@@ -4967,6 +4972,8 @@ ${scratchUnreachableNodeAffinity}
                       valueFrom:
                         fieldRef:
                           fieldPath: spec.nodeName
+                    - name: TRTLLM_CI_RUNTIME_IMAGE
+                      value: "${image}"
                     ${extraDeviceEnv}
                   ${serviceContainerConfig}
                   - name: jnlp
