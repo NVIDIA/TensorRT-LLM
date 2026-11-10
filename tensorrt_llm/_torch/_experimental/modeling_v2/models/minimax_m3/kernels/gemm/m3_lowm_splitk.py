@@ -30,6 +30,7 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.experimental import primitives as prims
 
 #: Per-CTA SMEM capacity reported by CuTeDSL on SM100/SM103.
 _SMEM_CAPACITY_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
@@ -311,38 +312,6 @@ def _store_shared_remote_v4(
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@dsl_user_op
-def _mbarrier_wait_acquire_cluster(
-    mbar_ptr: "cute.Pointer",
-    phase: "Int32",
-    *,
-    loc=None,
-    ip=None,
-) -> None:
-    """``cute.arch.mbarrier_wait`` with ``.acquire.cluster`` semantics.
-
-    The peers' ``st.async`` complete-tx operations release at cluster scope; the
-    default ``.acquire.cta`` wait does not synchronize with other CTAs' threads.
-    """
-    llvm.inline_asm(
-        None,
-        [
-            mbar_ptr.toint(loc=loc, ip=ip).ir_value(),
-            phase.ir_value(loc=loc, ip=ip),
-        ],
-        "{\n\t.reg .pred P1;\n\tLAB_WAIT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
-        "P1, [$0], $1, 10000000;\n\t"
-        "@P1 bra DONE;\n\tbra LAB_WAIT;\n\tDONE:\n\t}",
-        "r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
     )
 
 
@@ -1085,9 +1054,20 @@ class SplitKDenseGemmKernel:
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         bar_reduce, self.expected_transaction_bytes
                     )
-                # The peers' st.async complete-tx releases at cluster scope: acquire
-                # at cluster scope before reading the mailbox.
-                _mbarrier_wait_acquire_cluster(bar_reduce, Int32(0))
+                # The peers' st.async complete-tx releases at cluster scope. A
+                # relaxed cluster-scope wait observes the completion, and the
+                # acquire fence restricted to shared::cluster orders the mailbox
+                # reads after it (PTX ISA memory model, acquire pattern). A
+                # cluster-scope acquire on the wait itself would also invalidate
+                # L1 for global data, which this reduction does not need.
+                while not prims.mbarrier_try_wait_parity(
+                    bar_reduce,
+                    0,
+                    scope=prims.MBarrierScope.CLUSTER,
+                    order=prims.MemOrder.RELAXED,
+                ):
+                    pass
+                prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
                 for peer in cutlass.range_constexpr(self.split_k - 1):
                     for value_idx in cutlass.range_constexpr(values_per_thread):
                         rAcc[value_idx] = (
