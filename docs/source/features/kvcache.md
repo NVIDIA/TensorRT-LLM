@@ -366,7 +366,7 @@ KV cache manager V2 (the default; see [Selecting the KV Cache Manager](#selectin
 
 With one-model speculative decoding, V2's draft-lookahead backoff can still shorten a block-aligned reuse match (by `max_draft_len` for vanilla MTP, or one token for the EAGLE3 and MTP-Eagle one-model modes), leaving a partial tail page that is copied even when `enable_partial_reuse=False`.
 
-KV cache manager V1 can reuse an unreferenced leaf directly, even with `copy_on_partial_reuse=True`. When direct reuse is not possible, enabling this property allows a new block to be allocated and the matched tokens to be copied into it. With `copy_on_partial_reuse=False`, partial reuse is restricted to unreferenced leaves.
+KV cache manager V1 can reuse an unreferenced leaf directly, even with `copy_on_partial_reuse=True`. When direct reuse is not possible, enabling this property allows a new block to be allocated and the matched tokens to be copied into it. With `copy_on_partial_reuse=False`, partial matching is restricted to unreferenced leaves. If two requests in one batch partially match the same unreferenced leaf, V1 copies the matched tokens for the earlier request even with `copy_on_partial_reuse=False`.
 
 ### Attention Window Size
 
