@@ -31,7 +31,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformRuntimeConstraints,
     PostTransformTransferScope,
 )
-from tensorrt_llm.llmapi.llm_args import LoadFormat
+from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, LoadFormat
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -837,3 +837,47 @@ def test_gms_rejects_localized_weights_before_model_init(monkeypatch):
 
     memory_init.AutoModelForCausalLM.from_config.assert_not_called()
     checkpoint_loader.load_weights.assert_not_called()
+
+
+def test_gms_rejects_megamoe_ugpu_layout_before_model_init(monkeypatch):
+    events = []
+    loader = _make_loader(monkeypatch, events=events)
+    monkeypatch.setenv("MEGAMOE_UGPU_LAYOUT", "n_split")
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "HF"
+
+    with pytest.raises(ValueError, match="LoadFormat.GMS is incompatible with MEGAMOE_UGPU_LAYOUT"):
+        loader.load("/ckpt", checkpoint_loader)
+
+    memory_init.AutoModelForCausalLM.from_config.assert_not_called()
+    checkpoint_loader.load_weights.assert_not_called()
+
+
+@pytest.mark.parametrize("layout", ["expert_half", "n_split"])
+def test_sleep_rejects_megamoe_ugpu_layout_before_model_init(monkeypatch, layout):
+    events = []
+    loader = _make_loader(monkeypatch, events=events)
+    loader.llm_args.load_format = LoadFormat.AUTO
+    loader.model_weights_memory_tag = ExecutorMemoryType.MODEL_WEIGHTS_MAIN
+    monkeypatch.setenv("MEGAMOE_UGPU_LAYOUT", layout)
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "HF"
+
+    with pytest.raises(ValueError, match="MEGAMOE_UGPU_LAYOUT is incompatible with sleep_config"):
+        loader.load("/ckpt", checkpoint_loader)
+
+    memory_init.AutoModelForCausalLM.from_config.assert_not_called()
+    checkpoint_loader.load_weights.assert_not_called()
+
+
+def test_release_localized_moe_weights_visits_every_module():
+    released = []
+
+    class Localized(nn.Module):
+        def release_ugpu_localized_weights(self):
+            released.append(self)
+
+    first, second = Localized(), Localized()
+    model = nn.Sequential(first, nn.Linear(2, 2), nn.Sequential(second))
+    model_loader_mod.release_localized_moe_weights(model)
+    assert released == [first, second]

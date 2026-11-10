@@ -69,7 +69,7 @@ from .engine.runners.encoder_decoder import EncoderDecoderRunner, EncoderDecoder
 from .engine.runners.interface import ModelRunner, ScheduledInputs, ScheduledModelRunner
 from .guided_decoder import CapturableGuidedDecoder
 from .llm_request import LlmRequest
-from .model_loader import ModelLoader
+from .model_loader import ModelLoader, release_localized_moe_weights
 from .resource_manager import ResourceManager, ResourceManagerType
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
@@ -970,6 +970,8 @@ class ModelEngine:
         self._mm_item_scheduler = None
         self._lora_model = None
         self._lora_owner = None
+        if self.model is not None:
+            release_localized_moe_weights(self.model)
         self.model = None
         self.input_processor = None
         release_gc()
