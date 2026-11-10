@@ -41,7 +41,6 @@ from ..pyexecutor.sampler import (
     SampleState,
     SampleStateTensors,
     TorchSampler,
-    add_token,
     int_tensor,
 )
 from ..pyexecutor.sampler.penalties import has_occurrence_penalty
@@ -433,11 +432,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     def _request_common_handling(
         self,
         request: LlmRequest,
-        next_draft_tokens: list[list[int]],
+        next_draft_tokens: list[int],
         runtime_draft_len: Optional[int],
     ) -> None:
         """Common handling for both context and generation requests."""
-        request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
+        request.py_draft_tokens = next_draft_tokens[:runtime_draft_len]
         request.py_decoding_iter += 1
 
     def update_requests(
@@ -456,21 +455,28 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         assert isinstance(state, SampleStateSpec)
 
         state.sampler_event.synchronize()
-        new_tokens = state.host.new_tokens.tolist()
-        new_tokens_lens_list = state.host.new_tokens_lens.tolist()
+        beam_idx = DEFAULT_BEAM_IDX
+        # The host copies hold every preallocated slot; convert only the batch's rows.
+        active_requests = [
+            (req_idx, req)
+            for req_idx, req in enumerate(state.requests)
+            if req.state != LlmRequestState.GENERATION_COMPLETE
+        ]
+        active_slots = torch.tensor(
+            [req.py_seq_slot for _, req in active_requests], dtype=torch.long
+        )
+        new_tokens_rows = state.host.new_tokens[:, active_slots, beam_idx].T.tolist()
+        new_tokens_lens_list = state.host.new_tokens_lens[active_slots].tolist()
         token_windows = (
             state.host.verify_lens.tolist() if state.host.verify_lens is not None else None
         )
-        next_draft_tokens_list = state.host.next_draft_tokens.tolist()
-        beam_idx = DEFAULT_BEAM_IDX
+        next_draft_tokens_rows = state.host.next_draft_tokens[active_slots].tolist()
         runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
 
         if token_windows is not None:
-            for request_index, request in enumerate(state.requests):
-                if request.state == LlmRequestState.GENERATION_COMPLETE:
-                    continue
+            for row, (request_index, request) in enumerate(active_requests):
                 token_window = token_windows[request_index]
-                num_new_tokens = new_tokens_lens_list[request.py_seq_slot]
+                num_new_tokens = new_tokens_lens_list[row]
                 max_new_tokens = min(token_window, self.max_accepted_path_len)
                 if state.draft_lens is not None:
                     max_new_tokens = min(max_new_tokens, state.draft_lens[request_index] + 1)
@@ -482,11 +488,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                         "the executed window, original proposals, and token storage"
                     )
 
-        for req_idx, req in enumerate(state.requests):
-            if req.state == LlmRequestState.GENERATION_COMPLETE:
-                continue
-            num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
-            # new_tokens is sized to this bound, and add_token indexes a plain
+        for row, (req_idx, req) in enumerate(active_requests):
+            num_new_tokens = new_tokens_lens_list[row]
+            # new_tokens is sized to this bound, and each row is a plain
             # host-side list, so a violation would otherwise surface as an
             # opaque IndexError.
             assert num_new_tokens <= self.max_accepted_path_len, (
@@ -494,7 +498,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 f"sized for {self.max_accepted_path_len}"
             )
             for i in range(num_new_tokens):
-                new_token = add_token(req, new_tokens, beam_idx=beam_idx, step=i)
+                new_token = new_tokens_rows[row][i]
+                req.add_new_token(new_token, beam_idx)
                 if handle_stop_criteria(
                     req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
                 ):
@@ -511,7 +516,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             drafted_len = state.draft_lens[req_idx] if state.draft_lens is not None else 0
             req.py_num_draft_tokens_verified = min(drafted_len, verified_len)
             req.py_rewind_len = verified_len - req.py_num_accepted_draft_tokens
-            self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
+            self._request_common_handling(req, next_draft_tokens_rows[row], runtime_draft_len)
 
     def _scatter_to_stores(
         self, outputs: dict[str, torch.Tensor], num_skip: int, slots: list[int]
