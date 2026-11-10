@@ -7510,8 +7510,8 @@ class TorchLlmArgs(BaseLlmArgs):
                 f"attention algorithms; got {sparse.algorithm!r}.")
         if hot and self.kv_cache_compression_config is not None:
             raise ValueError(
-                "Mixed-precision KV currently requires single-beam execution "
-                "without cold-page compression.")
+                "Mixed-precision KV (kv_cache_config.dtype=mixed_*) cannot be "
+                "combined with kv_cache_compression_config.")
         if self.max_beam_width != 1:
             raise ValueError(f"{feature} requires single-beam execution.")
         if getattr(self.speculative_config, "use_dynamic_tree", False):

@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 
 @triton.jit
-def _copy_rows(
+def copy_rows(
     kv_cache_ptr,
     slot,
     scratch_ptr,
@@ -81,7 +81,7 @@ def _store_mixed_precision_low_rows_kernel(
     token = (position % tokens_per_block) * token_stride
     for head in range(num_heads):
         offset = head * head_stride + token
-        _copy_rows(
+        copy_rows(
             rows_ptr,
             src_row + offset,
             rows_ptr,

@@ -479,7 +479,7 @@ def test_mixed_precision_public_options():
         (
             {"kv_cache_compression_config": {"algorithm": "quantization_for_cold_page"}},
             ValueError,
-            "single-beam",
+            "kv_cache_compression_config",
         ),
         ({"max_beam_width": 2}, ValueError, "single-beam"),
         ({"sparse_attention_config": {"algorithm": "rocket"}}, ValueError, "sparse attention"),
@@ -859,10 +859,15 @@ class _ColdPageProvider:
 
 
 def _small_manager(
-    block: int, mapping: Mapping, dtype: str = "mixed_nvfp4_bfloat16", layout: str = "gqa"
+    block: int,
+    mapping: Mapping,
+    dtype: str = "mixed_nvfp4_bfloat16",
+    layout: str = "gqa",
+    num_layers: int = 1,
 ):
-    """A one-layer BF16 cache; mixed precision ("mixed_*", or "cold" for the cold-page window)
-    keeps one page at each end in the high pool. "mla" is a single latent KV head of 576 (K only)."""
+    """A BF16 cache of `num_layers` layers; mixed precision ("mixed_*", or "cold" for the cold-page
+    window) keeps one page at each end in the high pool. "mla" is a single latent KV head of 576
+    (K only)."""
     mixed = (
         dict(mixed_precision_first_n=block, mixed_precision_last_n=block, pool_ratio=[0.75, 0.25])
         if dtype.startswith("mixed_")
@@ -877,7 +882,7 @@ def _small_manager(
             **(dict(pool_ratio=[0.75, 0.25]) if cold else mixed),
         ),
         CacheType.SELFKONLY if layout == "mla" else CacheType.SELF,
-        num_layers=1,
+        num_layers=num_layers,
         num_kv_heads=1 if layout == "mla" else 2,
         head_dim=576 if layout == "mla" else 64,
         tokens_per_block=block,
@@ -1169,11 +1174,12 @@ def test_steady_decode_step_skips_mixed_precision(dtype):
         manager.shutdown()
 
 
+@pytest.mark.parametrize("num_layers", (1, 2))
 @pytest.mark.parametrize("layout", ("gqa", "mla"))
-def test_cold_page_window_redirects_dense_block_offsets(layout):
+def test_cold_page_window_redirects_dense_block_offsets(layout, num_layers):
     """TRTLLM block offsets of the held blocks point at the high layer's blocks of the same pages;
     after attention the step's rows come back to the layer's own blocks. GQA has K and V blocks,
-    dense MLA one latent block per page."""
+    dense MLA one latent block per page; with two layers, each layer's own blocks of a page."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
         pytest.skip("Mixed-precision KV requires Blackwell")
     from tensorrt_llm._torch.attention.backends.mixed_precision_rows import (
@@ -1182,7 +1188,7 @@ def test_cold_page_window_redirects_dense_block_offsets(layout):
 
     block, cached = 32, 4 * 32 + 5
     mapping = Mapping(world_size=1, rank=0, tp_size=1)
-    manager = _small_manager(block, mapping, "cold", layout)
+    manager = _small_manager(block, mapping, "cold", layout, num_layers)
     try:
         # A decode request with 133 cached tokens writes one: the high pool holds the first block
         # (first_n) and the last two (last_n + 1 tokens); the window released blocks 1 and 2.
@@ -1203,54 +1209,59 @@ def test_cold_page_window_redirects_dense_block_offsets(layout):
         )
         metadata.prepare()
         blocks = -(-(cached + 1) // block)
-        pages = torch.full((2, 1, blocks), -1, dtype=torch.int32)
-        manager.fill_mixed_precision_page_tables([0], 0, pages.numpy())
-        low, high = pages[0, 0].tolist(), pages[1, 0].tolist()
-        assert metadata.mixed_precision_high_block_table[0, :blocks].tolist() == high
-        held = [i for i, page in enumerate(high) if page >= 0]
-        assert held == [0, 3, 4]
         kv_factor = manager.kv_factor
+        # The layers share the pool and its block-offset table; an offset counts blocks from
+        # the layer's own base, so one table addresses every layer's blocks.
         delta, kv_offset = manager.mixed_precision_high_block_deltas[0], int(manager.kv_offset[0])
         offsets = metadata.kv_cache_block_offsets[0, 0, :, :blocks].tolist()
         kept = metadata.mixed_precision_low_block_offsets[0, 0, :, :blocks].tolist()
-        for kv in range(kv_factor):
-            assert kept[kv] == [page * kv_factor + kv * kv_offset for page in low]
-            assert offsets[kv] == [
-                (high[i] * kv_factor + delta if i in held else low[i] * kv_factor) + kv * kv_offset
-                for i in range(blocks)
-            ]
-        # The redirected offsets address the high layer's blocks of those pages (HND: a block is
-        # heads x tokens rows of one head's bytes).
-        low_pool = manager.get_buffers(0, "HND", mixed_precision_pool="low")
-        high_pool = manager.get_buffers(0, "HND", mixed_precision_pool="high")
-        rows = low_pool.view(-1, low_pool.shape[4])
-        heads = high_pool.shape[2]
-        for i in held:
-            for kv in range(kv_factor):
-                assert (
-                    rows[offsets[kv][i] * heads * block].data_ptr()
-                    == high_pool[high[i], kv].data_ptr()
-                )
-        # Attention wrote this step's token (position 133: block 4, token 5) into the high layer;
-        # the copy back fills that token of every head in the layer's block and nothing else.
-        # Both views cover the shared pool, so only the layer's own pages take the sentinel.
-        for page in low:
-            low_pool[page].fill_(7)
-        torch.manual_seed(0)
-        written = torch.randn(kv_factor, heads, high_pool.shape[4], device="cuda").to(
-            torch.bfloat16
-        )
-        high_pool[high[4], :, :, 5].copy_(written)
-        high_pool[high[4], :, :, 4].fill_(1.0)
         # The MTP draft step corrects the query length (one new token) but not the metadata's
         # separate KV-length copy, which under CUDA graphs still says two; the copy back follows
         # the query length, so token 4 of the layer's block must stay untouched below.
         metadata.seq_lens_kv = torch.tensor([2], dtype=torch.int32)
         assert int(metadata.seq_lens_kv_cuda[0]) == 2 and int(metadata.seq_lens_cuda[0]) == 1
-        store_mixed_precision_low_rows(metadata, 0)
-        torch.cuda.synchronize()
-        assert torch.equal(low_pool[low[4], :, :, 5].view(torch.bfloat16), written)
-        assert (low_pool[low[4], :, :, 4] == 7).all() and (low_pool[low[3]] == 7).all()
-        assert (low_pool[low[0]] == 7).all()
+        torch.manual_seed(0)
+        for layer_idx in range(num_layers):
+            pages = torch.full((2, 1, blocks), -1, dtype=torch.int32)
+            manager.fill_mixed_precision_page_tables([0], layer_idx, pages.numpy())
+            low, high = pages[0, 0].tolist(), pages[1, 0].tolist()
+            assert metadata.mixed_precision_high_block_table[0, :blocks].tolist() == high
+            held = [i for i, page in enumerate(high) if page >= 0]
+            assert held == [0, 3, 4]
+            for kv in range(kv_factor):
+                assert kept[kv] == [page * kv_factor + kv * kv_offset for page in low]
+                assert offsets[kv] == [
+                    (high[i] * kv_factor + delta if i in held else low[i] * kv_factor)
+                    + kv * kv_offset
+                    for i in range(blocks)
+                ]
+            # The redirected offsets address the high layer's blocks of those pages (HND: a block
+            # is heads x tokens rows of one head's bytes), counted from the layer's own blocks.
+            low_pool = manager.get_buffers(layer_idx, "HND", mixed_precision_pool="low")
+            high_pool = manager.get_buffers(layer_idx, "HND", mixed_precision_pool="high")
+            rows = low_pool.view(-1, low_pool.shape[4])
+            heads = high_pool.shape[2]
+            for i in held:
+                for kv in range(kv_factor):
+                    assert (
+                        rows[offsets[kv][i] * heads * block].data_ptr()
+                        == high_pool[high[i], kv].data_ptr()
+                    )
+            # Attention wrote this step's token (position 133: block 4, token 5) into the high
+            # layer; the copy back fills that token of every head in the layer's block and nothing
+            # else. Both views cover the shared pool, so only the layer's own pages take the
+            # sentinel.
+            for page in low:
+                low_pool[page].fill_(7)
+            written = torch.randn(kv_factor, heads, high_pool.shape[4], device="cuda").to(
+                torch.bfloat16
+            )
+            high_pool[high[4], :, :, 5].copy_(written)
+            high_pool[high[4], :, :, 4].fill_(1.0)
+            store_mixed_precision_low_rows(metadata, layer_idx)
+            torch.cuda.synchronize()
+            assert torch.equal(low_pool[low[4], :, :, 5].view(torch.bfloat16), written)
+            assert (low_pool[low[4], :, :, 4] == 7).all() and (low_pool[low[3]] == 7).all()
+            assert (low_pool[low[0]] == 7).all()
     finally:
         manager.shutdown()

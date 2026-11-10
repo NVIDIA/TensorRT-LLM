@@ -947,13 +947,14 @@ def _derive_draft_max_attention_window(
     return None
 
 
-def _fit_draft_pool_ratio(draft_kv_config: KvCacheConfig,
-                          mixed_precision_high_window: bool = False) -> None:
+def _fit_draft_pool_ratio(
+        draft_kv_config: KvCacheConfig,
+        has_mixed_precision_high_layers: bool = False) -> None:
     """Adapt the target's pool_ratio to a separate one-model draft manager's pools."""
     if draft_kv_config.pool_ratio is None:
         return
     if (draft_kv_config.mixed_precision_kv is not None
-            or mixed_precision_high_window):
+            or has_mixed_precision_high_layers):
         # A mixed-precision draft manager has a high pool too; the target's ratio does not fit.
         logger.warning(
             f"kv_cache_config.pool_ratio {draft_kv_config.pool_ratio} sizes the "
@@ -1055,6 +1056,9 @@ class KvCacheCreator:
         self._disable_overlap_scheduler = llm_args.disable_overlap_scheduler
         self._draft_config = draft_config
         self._skip_est = skip_est
+        # Built once; the estimation build and the real build share it.
+        self._cold_page_codec_provider = None
+        self._cold_page_codec_provider_built = False
         # Admission cap (tokens of summed context attended-KV) that the fp8 context-MLA workspace reservation
         # covers, computed in configure_kv_cache_capacity and carried to the KV manager so the scheduler
         # reads it directly instead of re-deriving it from pool layout. None until reserved (or w == 0).
@@ -2654,12 +2658,15 @@ class KvCacheCreator:
                 draft_kv_config.max_attention_window,
                 spec_dec_layer_mask,
             ))
+        # An MTP draft manager under the cold-page window has high layers too.
+        cold_page_window = getattr(cold_page_codec_provider,
+                                   "mixed_precision_high_window", None)
+        draft_has_high_layers = (
+            self._speculative_config.spec_dec_mode.is_mtp_one_model()
+            and cold_page_window is not None)
         _fit_draft_pool_ratio(
             draft_kv_config,
-            mixed_precision_high_window=self._speculative_config.spec_dec_mode.
-            is_mtp_one_model()
-            and getattr(cold_page_codec_provider, "mixed_precision_high_window",
-                        None) is not None)
+            has_mixed_precision_high_layers=draft_has_high_layers)
         if uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window):
             logger.info(
                 f"Derived draft KV cache max_attention_window for separate "
@@ -3379,6 +3386,29 @@ class KvCacheCreator:
             return kv_cache_config
         return kv_cache_config.model_copy(update=dropped)
 
+    def _create_kv_cache_compression_manager(
+            self, kv_cache_config: KvCacheConfig
+    ) -> Optional[KVCacheCompressionManager]:
+        """Build the configured KV-cache compression manager.
+
+        The cold-page codec provider is built once: the estimation build needs
+        its first/last-N window too, and it loads the ModelOpt KV scales. The
+        other managers are built per build, as the estimation one is shut down.
+        """
+        config = self._llm_args.kv_cache_compression_config
+        if config is None or config.algorithm != "quantization_for_cold_page":
+            return create_kv_cache_compression_manager(
+                config,
+                model_engine=self._model_engine,
+                kv_cache_config=kv_cache_config)
+        if not self._cold_page_codec_provider_built:
+            self._cold_page_codec_provider = create_kv_cache_compression_manager(
+                config,
+                model_engine=self._model_engine,
+                kv_cache_config=kv_cache_config)
+            self._cold_page_codec_provider_built = True
+        return self._cold_page_codec_provider
+
     def build_managers(self,
                        resources: Dict,
                        estimating_kv_cache: bool = False) -> None:
@@ -3441,12 +3471,8 @@ class KvCacheCreator:
         if not estimating_kv_cache:
             self._warn_if_admitted_concurrency_outruns_graph_capture()
 
-        compression_config = self._llm_args.kv_cache_compression_config
-        compression_manager = create_kv_cache_compression_manager(
-            compression_config,
-            model_engine=self._model_engine,
-            kv_cache_config=self_kv_cache_config,
-        )
+        compression_manager = self._create_kv_cache_compression_manager(
+            self_kv_cache_config)
         cold_page_codec_provider = (
             compression_manager if compression_manager is not None
             and compression_manager.provides_cold_page_codec else None)

@@ -4107,9 +4107,6 @@ class KVCacheManagerV2(BaseResourceManager):
         mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
         # (first_n, last_n) of the cold-page compression config, if it asks for the window.
         cold_page_window = getattr(cold_page_codec_provider, "mixed_precision_high_window", None)
-        if not isinstance(cold_page_window, tuple):
-            # Providers without the property, and Mock providers in tests.
-            cold_page_window = None
         if mixed is None and cold_page_window is None:
             return
         requested = (

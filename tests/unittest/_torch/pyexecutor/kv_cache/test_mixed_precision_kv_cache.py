@@ -295,6 +295,91 @@ def test_cold_page_window_keeps_history_pool_native(make_manager, dtype):
     assert manager.mixed_precision_high_block_deltas == {0: 0}
 
 
+def test_cold_page_window_high_pages_cross_the_host_tier_unchanged(make_manager):
+    """With the real NVFP4 cold-page codec, a page the high layer holds comes back from the host
+    tier bit-exact, while the layer's own page of the same tokens comes back quantized."""
+    from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_quantization import (
+        Nvfp4ColdPageQuantizationCompression,
+    )
+    from tensorrt_llm.bindings.internal import kv_cache_compression as native_kvcc
+    from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
+
+    provider = Nvfp4ColdPageQuantizationCompression(
+        ColdPageQuantizationCompressionConfig(mixed_precision_first_n=1, mixed_precision_last_n=65),
+        pretrained_config=SimpleNamespace(model_type="qwen3"),
+    )
+    manager = make_manager(
+        config=cold_page_config(max_tokens=4096, host_cache_size=64 << 20),
+        cold_page_codec_provider=provider,
+    )
+    native = manager.impl
+    stream = torch.cuda.current_stream().cuda_stream
+    high_layer = manager.mixed_precision_high_layers[0]
+    low = manager.get_buffers(0, "NHD", mixed_precision_pool="low").view(torch.bfloat16)
+    high = manager.get_buffers(0, "NHD", mixed_precision_pool="high")
+
+    def view_pages(cache, layer):
+        """The cache's blocks as pages of the layer's pool view (-1 for a released block)."""
+        scale = int(native.get_page_index_converter(layer, Role.KEY).scale)
+        return [
+            page * scale // manager.kv_factor if page != kv.BAD_PAGE_INDEX else -1
+            for page in cache.get_base_page_indices(native.get_layer_group_id(layer))[:5]
+        ]
+
+    tokens = list(range(5 * 128))
+    with (
+        patch.object(
+            native_kvcc, "nvfp4_cold_page_encode", wraps=native_kvcc.nvfp4_cold_page_encode
+        ) as encode,
+        patch.object(
+            native_kvcc, "nvfp4_cold_page_decode", wraps=native_kvcc.nvfp4_cold_page_decode
+        ) as decode,
+        closing(native.create_kv_cache(None, [])) as source,
+    ):
+        assert source.resume(stream) and source.resize(len(tokens))
+        torch.manual_seed(0)
+        written = {}
+        for layer, pool in ((0, low), (high_layer, high)):
+            for ordinal, page in enumerate(view_pages(source, layer)):
+                pool[page].normal_()
+                written[layer, ordinal] = pool[page].clone()
+        torch.cuda.synchronize()
+        source.commit(tokens)
+        source.suspend()
+        # Fresh caches take the GPU pages one after another; the suspended cache's committed
+        # pages are the least recently used, so they leave for the host tier first.
+        pressure = []
+        try:
+            for _ in range(64):
+                cache = native.create_kv_cache(None, [])
+                pressure.append(cache)
+                assert cache.resume(stream) and cache.resize(256)
+                cache.suspend()
+                if kv._introspection.active_page_stats(source)[0][0] == 0:
+                    break
+            torch.cuda.synchronize()
+            # Five pages of the layer and the two the high layer kept, all on the host.
+            assert kv._introspection.active_page_stats(source)[0][:2] == [0, 7]
+        finally:
+            for cache in pressure:
+                cache.close()
+        assert encode.call_count > 0 and decode.call_count == 0
+        assert source.resume(stream, is_decoding=True)
+        torch.cuda.synchronize()
+        assert kv._introspection.active_page_stats(source)[0][1] == 0
+        assert decode.call_count > 0
+        # The high layer's pages never went through the codec, so the window's pages come back
+        # bit-exact; the layer's own pages were quantized on the way out.
+        high_pages = view_pages(source, high_layer)
+        assert [page >= 0 for page in high_pages] == [True, False, False, False, True]
+        for ordinal in (0, 4):
+            assert torch.equal(high[high_pages[ordinal]], written[high_layer, ordinal])
+        for ordinal, page in enumerate(view_pages(source, 0)):
+            restored, original = low[page].float(), written[0, ordinal].float()
+            assert not torch.equal(restored, original)
+            assert (restored - original).abs().mean() < 0.5 * original.abs().mean()
+
+
 def test_cold_page_mixed_precision_is_per_layer_and_skips_sliding_window_layers(make_manager):
     """First/last-N mixed precision is per layer: a sliding-window layer gets no high layer and
     stays an ordinary cold-page layer of the codec."""
@@ -721,7 +806,7 @@ def test_cold_page_window_separate_draft_manager(make_manager, drafter):
     )
     provider = _ColdPageProvider()
     config = cold_page_config()
-    _fit_draft_pool_ratio(config, mixed_precision_high_window=drafter == "mtp")
+    _fit_draft_pool_ratio(config, has_mixed_precision_high_layers=drafter == "mtp")
     assert config.pool_ratio == (None if drafter == "mtp" else [1.0])
     manager = make_manager(
         config=config,
@@ -854,7 +939,8 @@ def test_deepseek_v4_cold_page_window_high_layers_share_the_compress_pools():
 
 
 def test_deepseek_v4_cold_page_window_redirects_rows_into_the_high_layer():
-    """The redirected compressed rows read the high layer's pages through the COMPRESS pool."""
+    """The redirected compressed rows read the high layer's pages through the COMPRESS pool; a
+    second layer of a ratio, and its high layer, sit at their own offset inside that pool's pages."""
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
         DeepseekV4CacheManager,
     )
@@ -870,14 +956,14 @@ def test_deepseek_v4_cold_page_window_redirects_rows_into_the_high_layer():
     from tensorrt_llm._torch.metadata import KVCacheParams
     from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig
 
-    ratios = [1, 4, 128]
+    ratios = [1, 4, 128, 4]
     sparse_config = DeepSeekV4SparseAttentionConfig(
         index_head_dim=128, window_size=128, compress_ratios=ratios
     )
     manager = DeepseekV4CacheManager(
         kv_cache_config=cold_page_config(pool_ratio=None, enable_block_reuse=False),
         kv_cache_type=CacheType.SELFKONLY,
-        num_layers=3,
+        num_layers=4,
         num_kv_heads=1,
         head_dim=512,
         tokens_per_block=128,
@@ -889,7 +975,7 @@ def test_deepseek_v4_cold_page_window_redirects_rows_into_the_high_layer():
         max_input_len=4096,
         max_num_tokens=8192,
         sparse_attn_config=sparse_config,
-        pretrained_config=SimpleNamespace(num_hidden_layers=3),
+        pretrained_config=SimpleNamespace(num_hidden_layers=4),
         # The high layer holds the first page and a 128-token window: the last two pages here.
         cold_page_codec_provider=_ColdPageProvider(first_n=128, last_n=127),
     )
@@ -909,7 +995,18 @@ def test_deepseek_v4_cold_page_window_redirects_rows_into_the_high_layer():
             mapping=Mapping(),
         )
         metadata.prepare()
-        for layer_idx, ratio in ((1, 4), (2, 128)):
+        # The backend reads every layer of a ratio from that ratio's COMPRESS pool base, so the
+        # rows of the second ratio-4 layer (3), and of its high layer, carry a page offset.
+        pools = {
+            ratio: manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESS)
+            for layer_idx, ratio in ((1, 4), (2, 128))
+        }
+        assert [pools[ratio].data_ptr() for ratio in pools] == [
+            manager.compress_pool_ptrs[ratio] for ratio in pools
+        ]
+        high_offsets = manager.mixed_precision_high_layer_offsets
+        assert high_offsets[manager.layer_offsets[3]] > high_offsets[manager.layer_offsets[1]]
+        for layer_idx, ratio in ((1, 4), (2, 128), (3, 4)):
             local = manager.layer_offsets[layer_idx]
             rows_per_page = manager.compressed_block_sizes[layer_idx]
             high_table = metadata.mixed_precision_high_block_table[ratio].cpu()
@@ -925,23 +1022,27 @@ def test_deepseek_v4_cold_page_window_redirects_rows_into_the_high_layer():
                 pool_rows[None],
                 torch.ones(1, dtype=torch.int32, device="cuda"),
             )[0]
-            # Mark every held row through the high-pool view: value = row position.
+            # Mark every held row through the high-pool view: value = row position, shifted per
+            # layer so the two ratio-4 layers' pages tell apart.
             high = manager._get_mixed_precision_buffers(local, "NHD", "high")
             high = high.view(high.shape[0], rows_per_page, -1).view(torch.uint8)
             for position in range(6 * rows_per_page):
                 page, row = divmod(position, rows_per_page)
                 if page in held_pages:
-                    high[int(high_table[1, page]), row].fill_(position % 251)
-            # The COMPRESS pool, read at the redirected rows, shows the markers.
-            pool = manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESS)
-            pool = pool.reshape(-1, pool.shape[-1]).view(torch.uint8)
+                    high[int(high_table[1, page]), row].fill_((position + 97 * layer_idx) % 251)
+            # The ratio's COMPRESS pool, read at the redirected rows, shows the markers.
+            pool = pools[ratio].reshape(-1, pools[ratio].shape[-1]).view(torch.uint8)
             for position in range(6 * rows_per_page):
                 page = position // rows_per_page
                 row = int(rows[position])
                 if page in held_pages:
-                    assert torch.all(pool[row] == position % 251), (ratio, position, row)
+                    assert torch.all(pool[row] == (position + 97 * layer_idx) % 251), (
+                        layer_idx,
+                        position,
+                        row,
+                    )
                 else:
-                    assert row == -7, (ratio, position, row)
+                    assert row == -7, (layer_idx, position, row)
     finally:
         manager.shutdown()
 

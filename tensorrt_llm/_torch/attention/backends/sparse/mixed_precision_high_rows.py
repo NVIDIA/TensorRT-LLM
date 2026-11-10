@@ -13,7 +13,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ..mixed_precision_rows import _copy_rows
+from ..mixed_precision_rows import copy_rows
 
 if TYPE_CHECKING:
     from ..trtllm import TrtllmAttention
@@ -124,7 +124,7 @@ def _overlay_mixed_precision_high_rows_kernel(
         current = tl.load(claim_ptr + scratch_row, mask=valid, other=0)
         tl.store(claim_ptr + scratch_row, record, mask=valid & (current != record))
         return
-    _copy_rows(
+    copy_rows(
         kv_cache_ptr,
         slot,
         scratch_ptr,
@@ -155,7 +155,7 @@ def _copy_recorded_rows_kernel(
     rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     recorded = tl.load(claim_ptr + rows, mask=rows < scratch_rows, other=0)
     valid = (rows < scratch_rows) & ((recorded >> 32) == claim_epoch.to(tl.int64))
-    _copy_rows(
+    copy_rows(
         kv_cache_ptr,
         recorded & 0xFFFFFFFF,
         scratch_ptr,
@@ -486,8 +486,18 @@ def mixed_precision_high_row_indices(
 ) -> torch.Tensor:
     """Point the selected positions the mixed-precision high pool holds at its rows, in place.
 
-    `topk_indices` are the selected KV positions (-1 for none), `topk_indices_global` their pool
-    rows (rewritten and returned), `requests` the batch index of each query row.
+    Args:
+        metadata: The sparse attention metadata of the step.
+        attention: The calling attention layer; its `layer_idx` selects the layer's high layer
+            (and its `compress_ratio` the page table under DeepSeek-V4).
+        topk_indices: `[num_rows, topk]` int32 with stride-1 rows: the selected KV positions of
+            each query row, -1 for none.
+        topk_indices_global: `[num_rows, topk]` int32 with stride-1 rows: those positions' pool
+            rows, rewritten in place.
+        requests: `[num_rows]` int32: the batch index of each query row.
+
+    Returns:
+        `topk_indices_global`.
     """
     block_table = metadata.mixed_precision_high_block_table
     if isinstance(block_table, dict):

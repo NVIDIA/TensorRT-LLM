@@ -1322,6 +1322,8 @@ def _build_cold_creator(
 ) -> tuple[dict, util_mod.KvCacheCreator]:
     creator = object.__new__(util_mod.KvCacheCreator)
     creator._skip_est = skip_est
+    creator._cold_page_codec_provider = None
+    creator._cold_page_codec_provider_built = False
     creator._max_seq_len = 1024
     creator._kv_cache_config = SimpleNamespace(
         host_cache_size=None,
@@ -1354,9 +1356,15 @@ def test_cold_provider_is_kept_for_estimation_and_dropped_for_active_nvfp4(monke
     assert util_mod.ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER not in resources
     # The estimation KVCM gets the provider too: it reads the window and builds no codec.
     _, estimation_creator = build(estimating=True)
-    assert isinstance(
-        estimation_creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"],
-        Nvfp4ColdPageQuantizationCompression,
+    estimation_provider = estimation_creator._create_kv_cache_manager.call_args.kwargs[
+        "cold_page_codec_provider"
+    ]
+    assert isinstance(estimation_provider, Nvfp4ColdPageQuantizationCompression)
+    # The real build that follows takes the same provider instead of loading the scales again.
+    estimation_creator.build_managers({}, estimating_kv_cache=False)
+    assert (
+        estimation_creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"]
+        is estimation_provider
     )
     _, skip_est_creator = build(estimating=True, skip_est=True)
     assert isinstance(
