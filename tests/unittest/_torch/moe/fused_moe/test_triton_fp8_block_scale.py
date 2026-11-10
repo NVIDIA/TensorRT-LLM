@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """
-Unit tests for ``run_triton_fp8_block_scale_moe``.
+Unit tests for ``run_triton_fp8_block_scale_moe`` and ``moe_align_block_size``.
 
 Run as a pytest:
     pytest tests/unittest/_torch/moe/fused_moe/test_triton_fp8_block_scale.py -v
@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from _torch.helpers import calc_diff, per_block_cast_to_fp8_e8m0
 
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_triton_fp8_block_scale import (
+    moe_align_block_size,
     run_triton_fp8_block_scale_moe,
 )
 from tensorrt_llm._torch.moe.fused_moe.interface import ActivationType
@@ -26,6 +27,7 @@ skip_unsupported = pytest.mark.skipif(
     not torch.cuda.is_available() or not is_sm_120f(),
     reason="Requires CUDA SM120 for the Triton FP8 block-scale MoE path",
 )
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 
 
 def _run_moe_bf16_reference(
@@ -118,6 +120,8 @@ LAGUNA_TOP_K = 8
 SHAPES = [
     MoeShape("tiny", num_tokens=64, hidden=256, intermediate=512, num_experts=8, top_k=2),
     MoeShape("tiny_topk1", num_tokens=64, hidden=256, intermediate=512, num_experts=8, top_k=1),
+    # DeepSeek-V3-Lite routes over 72 experts, which is not a power of 2.
+    MoeShape("experts_72", num_tokens=64, hidden=256, intermediate=512, num_experts=72, top_k=6),
     MoeShape(
         "laguna_corr",
         num_tokens=64,
@@ -241,3 +245,37 @@ def test_clamp_is_rejected_for_a_non_swiglu_activation() -> None:
 
     with pytest.raises(ValueError, match="clamps SwiGLU only"):
         run_triton_fp8_block_scale_moe(**inputs)
+
+
+@requires_cuda
+@pytest.mark.parametrize("num_experts", [8, 60, 72, 256, 288])
+def test_moe_align_block_size_matches_reference(num_experts: int) -> None:
+    """Every expert gets a block-padded range of its own tokens, whatever the expert count.
+
+    The alignment kernels do not depend on the architecture, so unlike the MoE
+    tests above this runs on any CUDA GPU.
+    """
+    block_size = 16
+    g = torch.Generator(device="cuda").manual_seed(0)
+    topk_ids = torch.randint(0, num_experts, (64, 8), device="cuda", generator=g)
+
+    sorted_ids, expert_ids, num_post_pad = moe_align_block_size(topk_ids, block_size, num_experts)
+
+    flat_ids = topk_ids.flatten()
+    counts = torch.bincount(flat_ids, minlength=num_experts)
+    padded = (counts + block_size - 1) // block_size * block_size
+    offsets = torch.cumsum(padded, dim=0) - padded
+    assert num_post_pad.item() == padded.sum().item()
+
+    expected_expert_ids = torch.repeat_interleave(
+        torch.arange(num_experts, dtype=torch.int32, device="cuda"), padded // block_size
+    )
+    torch.testing.assert_close(expert_ids[: expected_expert_ids.numel()], expected_expert_ids)
+
+    for expert in range(num_experts):
+        start, count = offsets[expert].item(), counts[expert].item()
+        end = start + padded[expert].item()
+        expected_tokens = torch.nonzero(flat_ids == expert).flatten().to(torch.int32)
+        torch.testing.assert_close(sorted_ids[start : start + count].sort().values, expected_tokens)
+        # Padding slots hold the one-past-the-end token index.
+        assert (sorted_ids[start + count : end] == flat_ids.numel()).all()
