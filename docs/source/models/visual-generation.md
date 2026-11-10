@@ -67,7 +67,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes |
 | **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
 | **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
-| **LTX-2.3** | Yes | Yes | No | No | No | No | Yes | Yes | Yes | Yes | Yes | No | No | No | No | No |
+| **LTX-2.3** | Yes | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | No | No | No | No | No |
 | **MiniMax-H3** | Yes | Yes | No | No | Yes | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
 | **FastH3** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No | No |
@@ -351,8 +351,8 @@ cache_config:
 | `use_ret_steps` | bool | `false` | Enable retention-step caching variant. |
 | `coefficients` | list[float] | per-model | Polynomial coefficients used by the TeaCache decision function. When not supplied, filled automatically at load time if a built-in coefficient table matches the checkpoint; otherwise, set explicitly. |
 
-Wan 2.2 and LTX-2 have no built-in TeaCache coefficient tables. Set
-`cache_config.coefficients` explicitly for LTX-2 and Wan 2.2 TI2V-5B. Wan 2.2
+Wan 2.2, LTX-2, and LTX-2.3 have no built-in TeaCache coefficient tables. Set
+`cache_config.coefficients` explicitly for LTX-2, LTX-2.3, and Wan 2.2 TI2V-5B. Wan 2.2
 A14B models require both `cache_config.coefficients` for the high-noise
 transformer and `cache_config.coefficients_2` for the low-noise transformer.
 

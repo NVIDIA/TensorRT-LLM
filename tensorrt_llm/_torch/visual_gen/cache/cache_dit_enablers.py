@@ -316,7 +316,7 @@ def enable_cache_dit_for_flux(
 
 
 def enable_cache_dit_for_ltx2(pipeline: Any, cache_dit_cfg: CacheDiTConfig) -> CacheDiTEnableResult:
-    """Native LTX-2: Pattern_0 passes video latents and audio latents.
+    """Native LTX-2/2.3: Pattern_0 passes video latents and audio latents.
 
     Second arg uses cache-dit encoder_hidden_states slot.
     """
@@ -340,7 +340,8 @@ def enable_cache_dit_for_ltx2(pipeline: Any, cache_dit_cfg: CacheDiTConfig) -> C
     )
 
     logger.info(
-        f"Cache-DiT: LTX2 — Fn={db_cfg.Fn_compute_blocks}, Bn={db_cfg.Bn_compute_blocks}, "
+        f"Cache-DiT: {pipeline.__class__.__name__} — "
+        f"Fn={db_cfg.Fn_compute_blocks}, Bn={db_cfg.Bn_compute_blocks}, "
         f"W={db_cfg.max_warmup_steps}, R={cache_dit_cfg.residual_diff_threshold:.3f}",
     )
 
@@ -436,6 +437,7 @@ CUSTOM_CACHE_DIT_ENABLERS = {
     "FluxPipeline": lambda p, c: enable_cache_dit_for_flux(p, c, is_flux2=False),
     "Flux2Pipeline": lambda p, c: enable_cache_dit_for_flux(p, c, is_flux2=True),
     "LTX2Pipeline": enable_cache_dit_for_ltx2,
+    "LTX23Pipeline": enable_cache_dit_for_ltx2,
     "QwenImagePipeline": enable_cache_dit_for_qwen_image,
     "QwenImageLayeredPipeline": enable_cache_dit_for_qwen_image,
 }

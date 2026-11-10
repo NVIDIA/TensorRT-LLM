@@ -32,6 +32,7 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     REPO_ROOT,
     _assert_lpips_below_threshold,
     _cleanup_cuda,
+    _cleanup_single_device_feature_pipeline,
     _golden_media_path,
     _lpips_deterministic_algorithms,
     _lpips_model_path,
@@ -191,11 +192,13 @@ def _save_ltx23_retake_audio(
     _save_wav(audio.samples[..., : reference.frames], audio_path, audio.sample_rate)
 
 
-def _generate_ltx23_av(rank, world_size, *, video_out_path, audio_out_path, config_name):
-    """Render a configured golden-test candidate; only rank zero writes media."""
+def _generate_ltx23_av(
+    rank, world_size, *, video_out_path, audio_out_path, config_name, cache_backend=None
+):
+    """Render configured generation output; only rank zero writes media."""
     from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2_FORCE_ONE_STAGE_ENV
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-    from tensorrt_llm.visual_gen.args import VisualGenArgs
+    from tensorrt_llm.visual_gen.args import CacheDiTConfig, TeaCacheConfig, VisualGenArgs
 
     model_path, text_encoder_path = _ltx23_model_paths()
     _require_exists(model_path, "LTX-2.3 dev checkpoint")
@@ -219,6 +222,15 @@ def _generate_ltx23_av(rank, world_size, *, video_out_path, audio_out_path, conf
         }
         args.compilation_config.resolutions = [(LTX23_LPIPS_HEIGHT, LTX23_LPIPS_WIDTH)]
         args.compilation_config.num_frames = [LTX23_LPIPS_NUM_FRAMES]
+        if cache_backend is not None:
+            args.cuda_graph_config.enable = False
+            args.torch_compile_config.enable = False
+            args.compilation_config.skip_warmup = True
+            args.cache_config = {
+                "cache_dit": CacheDiTConfig(max_warmup_steps=0),
+                # Controlled smoke-test coefficients, not a calibrated model default.
+                "teacache": TeaCacheConfig(coefficients=[0.0]),
+            }[cache_backend]
         pipeline = PipelineLoader(args, device=f"cuda:{rank}").load()
         try:
             from tensorrt_llm._torch.visual_gen.models.ltx23.pipeline_ltx23_two_stages import (
@@ -226,6 +238,9 @@ def _generate_ltx23_av(rank, world_size, *, video_out_path, audio_out_path, conf
             )
 
             assert isinstance(pipeline, LTX23TwoStagesPipeline) is two_stage
+            if cache_backend is not None:
+                assert pipeline.cache_accelerator is not None
+                assert pipeline.cache_accelerator.is_enabled()
             with torch.no_grad():
                 out = pipeline.forward(
                     prompt=LTX23_LPIPS_PROMPT,
@@ -243,6 +258,8 @@ def _generate_ltx23_av(rank, world_size, *, video_out_path, audio_out_path, conf
                 audio = out.audio.detach().cpu() if out.audio is not None else None
                 audio_rate = out.audio_sample_rate
         finally:
+            if cache_backend is not None:
+                _cleanup_single_device_feature_pipeline(pipeline)
             del pipeline
             _cleanup_cuda()
 
@@ -259,6 +276,26 @@ def _generate_ltx23_av(rank, world_size, *, video_out_path, audio_out_path, conf
         assert torch.isfinite(audio).all(), "LTX-2.3 render returned non-finite audio"
         assert audio_rate == 48000
         _save_wav(audio, audio_out_path, audio_rate)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("cache_backend", ["teacache", "cache_dit"])
+def test_ltx23_example(cache_backend: str, llm_venv, _visual_gen_deps) -> None:
+    """Run single-stage caching and produce media without a quality-score gate."""
+    from defs.examples.visual_gen.test_visual_gen_multi_gpu import run_test_in_distributed
+
+    video_path = _visual_gen_output_path(llm_venv, f"ltx23_cache_{cache_backend}")
+    audio_path = os.path.splitext(video_path)[0] + ".wav"
+    run_test_in_distributed(
+        1,
+        _generate_ltx23_av,
+        video_out_path=video_path,
+        audio_out_path=audio_path,
+        config_name="bf16-1gpu",
+        cache_backend=cache_backend,
+    )
+    assert os.path.getsize(video_path) > 0
+    assert sf.info(audio_path).frames > 0
 
 
 @pytest.fixture(scope="session", params=LTX23_ACCURACY_CASES)

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 import torch
 
 from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.visual_gen.cache.teacache import register_extractor
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
@@ -32,6 +33,7 @@ from ..ltx2.ltx2_core.video_vae import TilingConfig
 from ..ltx2.parallel_vae import tile_parallel_decode
 from ..ltx2.pipeline_ltx2 import (
     LTX2Pipeline,
+    LTX2TeaCacheExtractor,
     _load_component_weights,
     _LTX2CUDAGraphRunner,
     ltx2_force_one_stage_enabled,
@@ -197,6 +199,11 @@ class LTX23Pipeline(BasePipeline):
     def __init__(self, pipeline_config: "DiffusionPipelineConfig") -> None:
         if pipeline_config.parallel.cfg_size != 1:
             raise NotImplementedError("LTX-2.3 generation requires parallel.cfg_size=1.")
+        if pipeline_config.cache_backend == "cache_dit" and pipeline_config.cuda_graph.enable:
+            raise NotImplementedError(
+                "LTX-2.3 Cache-DiT requires cuda_graph_config.enable=False; "
+                "per-step block-cache decisions cannot replay a full-transformer CUDA graph."
+            )
         super().__init__(pipeline_config)
 
     @classmethod
@@ -213,7 +220,10 @@ class LTX23Pipeline(BasePipeline):
             return LTX23RetakePipeline
         if workflow != "generation":
             raise ValueError(f"Unsupported LTX-2.3 workflow: {workflow!r}")
-        if ltx2_force_one_stage_enabled():
+        if (
+            getattr(config, "cache_backend", None) in ("teacache", "cache_dit")
+            or ltx2_force_one_stage_enabled()
+        ):
             return cls
         checkpoint_path = getattr(config.primary_pretrained_config, "_name_or_path", "")
         if checkpoint_path:
@@ -240,6 +250,15 @@ class LTX23Pipeline(BasePipeline):
     _setup_cuda_graphs = LTX2Pipeline._setup_cuda_graphs
     _transformer_class = LTX23Model
     _cuda_graph_runner_class = _LTX23CUDAGraphRunner
+
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        if self.pipeline_config.cache_backend == "teacache":
+            self._apply_teacache_coefficients()
+            register_extractor(
+                "LTX23Model",
+                LTX2TeaCacheExtractor(LTX2Pipeline._compute_ltx2_timestep_embedding),
+            )
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         self.forward(
