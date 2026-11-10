@@ -146,15 +146,18 @@ def wave_sms(num_sms: int, sm_version: int) -> int:
     return _BLACKWELL_WAVE_SMS if sm_version in _BLACKWELL_SM_VERSIONS else num_sms
 
 
-# Co-resident clusters of 1024-thread CTAs (one CTA per SM) per cluster size on the 132-SM
-# Hopper parts (H100 and H200 SXM, cudaOccupancyMaxActiveClusters). GPC floorsweeping hosts
-# fewer 4-CTA clusters than 132 / 4; other Hopper SM counts scale the table.
-_HOPPER_CLUSTER_ROWS = {2: 66, 4: 30, 8: 15, 10: 7, 16: 7}
+# Co-resident clusters at one CTA per SM per cluster size on the 132-SM Hopper parts (H100 and
+# H200 SXM, cudaOccupancyMaxActiveClusters). GPC floorsweeping hosts fewer 4-CTA clusters than
+# 132 / 4; other Hopper SM counts scale the table.
+_HOPPER_CLUSTER_ROWS = {
+    2: 66, 3: 39, 4: 30, 5: 22, 6: 17, 7: 15, 8: 15, 9: 9,
+    10: 7, 11: 7, 12: 7, 13: 7, 14: 7, 15: 7, 16: 7,
+}  # fmt: skip
 _HOPPER_CLUSTER_SMS = 132
 
 
 def cluster_fits(cluster_size: int, rows: int, num_sms: int, sm_version: int) -> bool:
-    """Whether ``rows`` clusters of ``cluster_size`` 1024-thread CTAs run in one wave.
+    """Whether ``rows`` clusters of ``cluster_size`` CTAs, one CTA per SM, run in one wave.
 
     Blackwell's clustered rungs carry their own tuned row limits, so this holds there, and a
     single CTA is no cluster.
@@ -2160,62 +2163,74 @@ def _main_samp_rounds_fp16(n, k, blk, kpt, split, r_const, aim_base, sfac, amin,
     return min(rounds, 4) if rounds >= 2 else 0
 
 
-def _code_radix_cluster_plan_fp16(k: int, n_kernel: int, num_rows: int, num_sms: int):
-    """FP16 cluster code-radix geometry ``(blk, vpt, cluster_size, candidate_list)``, or None.
+def _code_radix_cluster_plans_fp16(k: int, n_kernel: int, num_rows: int, num_sms: int):
+    """FP16 cluster code-radix geometries, preferred first.
 
-    Only envelopes just above 8K, 16K, 32K, 64K and 128K, or just below 160K and 256K, have one;
-    the choice depends on K and on how many rows fit the SMs.
+    Each is ``(blk, vpt, cluster_size, candidate_list)``. Only envelopes just above 8K, 16K, 32K,
+    64K and 128K, or just below 160K and 256K, have any; the choice depends on K and on how many
+    rows fit the SMs.
     """
     if 8192 < n_kernel <= 8192 + 64 and (
         (k == 512 and num_rows <= 32) or (k == 2048 and num_rows <= 2)
     ):
-        return (256, 2, 4, False)
+        yield (256, 2, 4, False)
     if k == 1024 and 8192 < n_kernel <= 8192 + 64:
         if num_rows * 4 <= num_sms:
-            return (256, 2, 4, False)
+            yield (256, 2, 4, False)
         if num_rows * 2 <= num_sms:
-            return (512, 2, 2, False)
+            yield (512, 2, 2, False)
     if 16384 < n_kernel <= 16384 + 512:
         if num_rows <= 8:
-            return (256, 2, 8, False)
+            yield (256, 2, 8, False)
         if num_rows * 4 <= num_sms:
-            return (512, 2, 4, False)
+            yield (512, 2, 4, False)
         if num_rows * 2 <= num_sms and k <= 1024:
-            return (512, 4, 2, False)
+            yield (512, 4, 2, False)
     if 32768 < n_kernel <= 32768 + 512:
         if num_rows <= 8:
-            return (512, 2, 8, False)
+            yield (512, 2, 8, False)
         if num_rows * 4 <= num_sms:
-            return (512, 4, 4, False)
+            yield (512, 4, 4, False)
         if k <= 1024 and num_rows * 2 <= num_sms:
-            return (512, 8, 2, True)
+            yield (512, 8, 2, True)
     if 65536 < n_kernel <= 65536 + 512:
         if num_rows <= 8 or (k == 2048 and num_rows <= 18):
-            return (512, 4, 8, True)
+            yield (512, 4, 8, True)
         if num_rows * 4 <= num_sms:
-            if k <= 1024:
-                return (512, 8, 4, True)
-            return (1024, 4, 4, True)
+            yield (512, 8, 4, True) if k <= 1024 else (1024, 4, 4, True)
         if num_rows <= 64:
-            return (512, 8, 4, True)
+            yield (512, 8, 4, True)
         if num_rows * 2 <= num_sms:
-            return (1024, 8, 2, True)
+            yield (1024, 8, 2, True)
     if 131072 < n_kernel <= 131072 + 512:
         if num_rows <= 8:
-            return (512, 8, 8, True)
+            yield (512, 8, 8, True)
         if num_rows * 4 <= num_sms:
-            return (1024, 8, 4, True)
+            yield (1024, 8, 4, True)
     if 163840 - 128 < n_kernel <= 163840 and num_rows <= 8:
-        return (512, 8, 10, True)
+        yield (512, 8, 10, True)
     if k == 2048 and 163840 - 128 < n_kernel <= 163840 and 9 <= num_rows <= 16:
-        return (1024, 7, 6, True)
+        yield (1024, 7, 6, True)
     if 163840 - 128 < n_kernel <= 163840 and num_rows * 5 <= num_sms and num_rows <= 16:
-        return (1024, 8, 5, True)
+        yield (1024, 8, 5, True)
     if 262144 - 64 < n_kernel <= 262144 and num_rows <= 4:
-        return (512, 8, 16, True)
+        yield (512, 8, 16, True)
     if 262144 - 64 < n_kernel <= 262144 and num_rows <= 8:
-        return (1024, 8, 8, True)
-    return None
+        yield (1024, 8, 8, True)
+
+
+def _code_radix_cluster_plan_fp16(
+    k: int, n_kernel: int, num_rows: int, num_sms: int, sm_version: int = 100
+):
+    """The first FP16 cluster code-radix geometry whose clusters run in one wave, or None."""
+    return next(
+        (
+            plan
+            for plan in _code_radix_cluster_plans_fp16(k, n_kernel, num_rows, num_sms)
+            if cluster_fits(plan[2], num_rows, num_sms, sm_version)
+        ),
+        None,
+    )
 
 
 def _row_window_16bit(blk: int, vpt: int, clus: int = 1) -> int:
@@ -2380,7 +2395,7 @@ def _varlen_launcher(
             "cr2_large": True,
         }
     crc = (
-        _code_radix_cluster_plan_fp16(k, n_kernel, num_rows, num_sms)
+        _code_radix_cluster_plan_fp16(k, n_kernel, num_rows, num_sms, sm_version)
         if dtype is torch.float16
         and _REG_CODE_RADIX_16BIT
         and _REG_CODE_RADIX_FORCE is not False
@@ -2958,7 +2973,11 @@ def _varlen_launcher(
                 warp_rank=n_kernel > k and sm_version in _TUNED_SM_VERSIONS,
                 parts=reg_parts,
                 pcw=pcw,
-                pcw_cluster=pcw and reg_parts > 1 and (reg_parts < 8 or reg_parts * num_rows <= 64),
+                # the cluster only co-schedules a row's parts, which pays off on Blackwell only
+                pcw_cluster=pcw
+                and reg_parts > 1
+                and (reg_parts < 8 or reg_parts * num_rows <= 64)
+                and sm_version in _BLACKWELL_SM_VERSIONS,
                 pcw_bins=512 if (pcw and dtype is torch.bfloat16 and k == 2048) else 1024,
                 **reg_options,
             )

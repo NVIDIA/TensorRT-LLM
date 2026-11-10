@@ -902,6 +902,60 @@ def test_selfsampling_hopper_clusters_are_coresident() -> None:
                     if plan["kernel"] in ("clus", "reg_clus"):
                         assert ss_host.cluster_fits(plan["cluster"], b, 132, 90), (b, n, k, plan)
     assert ss_host.route(32, 32771, 32832, 1024, 148, 100)["cluster"] == 4
+    # FP16 code-radix register clusters: Hopper takes the first geometry that fits, Blackwell its
+    # first preference (32 rows of 4-CTA clusters, 8 rows of 10-CTA clusters)
+    for b in (1, 8, 16, 32, 64):
+        for k in (512, 1024, 2048):
+            for n in (8195, 16387, 32771, 65539, 131075, 163775, 262127):
+                plan = ss_host._code_radix_cluster_plan_fp16(k, n, b, 132, 90)
+                if plan is not None:
+                    assert ss_host.cluster_fits(plan[2], b, 132, 90), (b, n, k, plan)
+                first = next(ss_host._code_radix_cluster_plans_fp16(k, n, b, 148), None)
+                assert ss_host._code_radix_cluster_plan_fp16(k, n, b, 148, 100) == first
+    assert ss_host._code_radix_cluster_plan_fp16(1024, 32771, 32, 148, 100)[2] == 4
+    assert ss_host._code_radix_cluster_plan_fp16(1024, 32771, 32, 132, 90)[2] == 2
+    assert ss_host._code_radix_cluster_plan_fp16(2048, 163775, 8, 148, 100)[2] == 10
+    assert ss_host._code_radix_cluster_plan_fp16(2048, 163775, 8, 132, 90)[2] == 5
+
+
+def test_selfsampling_bf16_partitioned_rows_cluster_on_blackwell_only(monkeypatch) -> None:
+    """BF16 rows split over CTAs launch each row's parts as one cluster on Blackwell; Hopper
+    launches them as plain CTAs (the cluster only co-schedules the parts, and 32 rows of 4-CTA
+    clusters would take two waves there)."""
+    real = ss_host._device()
+    requests = []
+
+    class RecordingDevice:
+        def __getattr__(self, name: str):
+            if not name.startswith("get_compiled"):
+                return getattr(real, name)
+
+            def compile_request(*args: object, **kwargs: object):
+                requests.append(kwargs)
+                return lambda *launch_args: None
+
+            return compile_request
+
+    monkeypatch.setattr(ss_host, "_device", RecordingDevice)
+    for rows in (8, 32):
+        for (num_sms, sm_version), clustered in (((148, 100), True), ((132, 90), False)):
+            monkeypatch.setattr(ss_host, "_VARLEN_CACHE_BF16", {})
+            requests.clear()
+            ss_host._varlen_launcher(
+                rows,
+                8256,
+                1024,
+                8195,
+                1,
+                4,
+                num_sms,
+                sm_version,
+                dtype=torch.bfloat16,
+                device_index=0,
+            )
+            partitioned = [r for r in requests if r.get("pcw")]
+            assert partitioned and partitioned[-1]["parts"] > 1, (rows, sm_version, requests)
+            assert partitioned[-1]["pcw_cluster"] is clustered, (rows, sm_version, partitioned[-1])
 
 
 @pytest.mark.skipif(
