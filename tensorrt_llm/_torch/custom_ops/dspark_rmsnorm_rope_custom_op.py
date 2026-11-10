@@ -629,22 +629,31 @@ def _(
 def _validate_dspark_preparation(
     x: torch.Tensor, weight: torch.Tensor, freqs: torch.Tensor
 ) -> None:
-    if (
-        x.ndim != 3
-        or x.shape[-1] != _DSV4_DSPARK_HEAD_DIM
-        or x.dtype != torch.bfloat16
-        or weight.dtype != x.dtype
-        or weight.shape != (_DSV4_DSPARK_HEAD_DIM,)
-        or freqs.dtype != torch.float32
-        or freqs.shape != (x.shape[0] * x.shape[1], _DSV4_DSPARK_ROPE_DIM // 2, 2)
-        or not all(
-            t.is_cuda and t.device == x.device and t.is_contiguous() for t in (x, weight, freqs)
-        )
-    ):
+    if x.ndim != 3 or x.shape[-1] != _DSV4_DSPARK_HEAD_DIM or x.dtype != torch.bfloat16:
         raise ValueError(
-            "DSpark preparation requires contiguous BF16 [batch, tokens, 512] inputs, "
-            "BF16 [512] weights and FP32 [batch * tokens, 32, 2] frequencies"
+            f"DSpark preparation input must be BF16 [batch, tokens, {_DSV4_DSPARK_HEAD_DIM}], "
+            f"got {x.dtype} {tuple(x.shape)}"
         )
+    if weight.dtype != x.dtype or weight.shape != (_DSV4_DSPARK_HEAD_DIM,):
+        raise ValueError(
+            f"DSpark preparation weight must be BF16 [{_DSV4_DSPARK_HEAD_DIM}], "
+            f"got {weight.dtype} {tuple(weight.shape)}"
+        )
+    expected_freqs_shape = (x.shape[0] * x.shape[1], _DSV4_DSPARK_ROPE_DIM // 2, 2)
+    if freqs.dtype != torch.float32 or freqs.shape != expected_freqs_shape:
+        raise ValueError(
+            f"DSpark preparation frequencies must be FP32 {list(expected_freqs_shape)}, "
+            f"got {freqs.dtype} {tuple(freqs.shape)}"
+        )
+    for name, tensor in (("input", x), ("weight", weight), ("frequencies", freqs)):
+        if not tensor.is_cuda or tensor.device != x.device:
+            raise ValueError(
+                f"DSpark preparation {name} must be on {x.device}, got {tensor.device}"
+            )
+        if not tensor.is_contiguous():
+            raise ValueError(
+                f"DSpark preparation {name} must be contiguous, got strides {tensor.stride()}"
+            )
 
 
 def precompile_dspark_fp8_input_fusions(

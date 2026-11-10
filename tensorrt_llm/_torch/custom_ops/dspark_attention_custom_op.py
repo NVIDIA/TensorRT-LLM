@@ -26,13 +26,6 @@ from .dspark_rmsnorm_rope_custom_op import (
     cute_dsl_dspark_rmsnorm_rope_draft_block,
 )
 
-_DSPARK_NUM_HEADS = 128
-_DSPARK_HEAD_DIM = 512
-_DSPARK_WINDOW_SIZE = 128
-_DSPARK_PAGE_SIZE = 8
-_DSPARK_BLOCK_SIZES = (5, 6)
-_DSPARK_ROPE_DIM = 64
-
 _DSPARK_CONTEXT_WKV_MIN_M_BUCKET = 128
 
 
@@ -51,12 +44,13 @@ def _gen_dspark_context_wkv_m_profiles(max_m: int) -> Tuple[int, ...]:
     return tuple(buckets)
 
 
-_DSV4_DSPARK_NUM_HEADS = (64, 128)
+_DSV4_DSPARK_SUPPORTED_NUM_HEADS = (64, 128)
 _DSV4_DSPARK_HEAD_DIM = 512
 _DSV4_DSPARK_WINDOW_SIZE = 128
 _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE = 8
 _DSV4_DSPARK_BLOCK_SIZES = (5, 6)
 _DSV4_DSPARK_ROPE_DIM = 64
+_DSV4_DSPARK_PAGE_SIZES = (16, 32, 64, 128, 256)
 
 
 _dspark_attention_kernel_cache: dict[
@@ -183,41 +177,71 @@ def _run_paged_dspark_attention(
         raise RuntimeError("DSpark fused FP8 output requires SM107")
     batch, block, heads, dim = q.shape
     page_size = kv_pages.shape[1]
-    if (
-        block not in _DSV4_DSPARK_BLOCK_SIZES
-        or heads not in _DSV4_DSPARK_NUM_HEADS
-        or dim != _DSV4_DSPARK_HEAD_DIM
-        or page_size not in (16, 32, 64, 128, 256)
-    ):
+    if block not in _DSV4_DSPARK_BLOCK_SIZES:
         raise ValueError(
-            "DSpark requires block 5/6, 64/128 heads, head_dim 512 and 16/32/64/128/256-token pages"
+            f"DSpark block size must be one of {_DSV4_DSPARK_BLOCK_SIZES}, got {block}"
         )
-    if q.dtype != torch.bfloat16 or draft_block.dtype != q.dtype or kv_pages.dtype != q.dtype:
-        raise ValueError("DSpark Q, draft KV and pages must use BF16")
-    if draft_block.shape != (batch, 8, dim) or kv_pages.shape[2] != dim:
-        raise ValueError("DSpark draft KV must have shape [batch, 8, 512]")
-    if (
-        block_tables.dtype != torch.int32
-        or block_tables.shape[0] != batch
-        or block_tables.stride(1) != 1
+    if heads not in _DSV4_DSPARK_SUPPORTED_NUM_HEADS:
+        raise ValueError(f"DSpark requires {_DSV4_DSPARK_SUPPORTED_NUM_HEADS} heads, got {heads}")
+    if dim != _DSV4_DSPARK_HEAD_DIM:
+        raise ValueError(f"DSpark head_dim must be {_DSV4_DSPARK_HEAD_DIM}, got {dim}")
+    if page_size not in _DSV4_DSPARK_PAGE_SIZES:
+        raise ValueError(
+            f"DSpark page size must be one of {_DSV4_DSPARK_PAGE_SIZES}, got {page_size}"
+        )
+    for name, value in (("Q", q), ("draft KV", draft_block), ("pages", kv_pages)):
+        if value.dtype != torch.bfloat16:
+            raise ValueError(f"DSpark {name} must use BF16, got {value.dtype}")
+    expected_draft_shape = (batch, _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE, dim)
+    if draft_block.shape != expected_draft_shape:
+        raise ValueError(
+            f"DSpark draft KV must have shape {expected_draft_shape}, got {tuple(draft_block.shape)}"
+        )
+    if kv_pages.ndim != 3 or kv_pages.shape[2] != dim:
+        raise ValueError(
+            f"DSpark pages must have shape [pages, page_size, {dim}], got {tuple(kv_pages.shape)}"
+        )
+    if block_tables.dtype != torch.int32 or block_tables.stride(1) != 1:
+        raise ValueError(
+            "DSpark page tables must have contiguous INT32 rows, got "
+            f"{block_tables.dtype} with strides {block_tables.stride()}"
+        )
+    if block_tables.shape[0] != batch:
+        raise ValueError(f"DSpark page tables must have {batch} rows, got {block_tables.shape[0]}")
+    for name, value in (
+        ("positions", positions),
+        ("valid lengths", valid_lengths),
+        ("capacities", capacities),
     ):
-        raise ValueError("DSpark page tables must have contiguous INT32 rows")
-    for value in (positions, valid_lengths, capacities):
         if value.dtype != torch.int64 or value.shape != (batch,) or not value.is_contiguous():
             raise ValueError(
-                "DSpark positions, lengths and capacities must be contiguous INT64 batch vectors"
+                f"DSpark {name} must be a contiguous INT64 [{batch}] vector, got "
+                f"{value.dtype} {tuple(value.shape)} with strides {value.stride()}"
             )
     if attn_sink.dtype != torch.float32 or attn_sink.shape != (heads,):
-        raise ValueError("DSpark attention sink must be FP32 with one entry per head")
-    if inverse_rope_freqs.dtype != torch.float32 or inverse_rope_freqs.shape != (
-        batch,
-        block,
-        32,
-        2,
+        raise ValueError(
+            f"DSpark attention sink must be FP32 [{heads}], got "
+            f"{attn_sink.dtype} {tuple(attn_sink.shape)}"
+        )
+    expected_freqs_shape = (batch, block, _DSV4_DSPARK_ROPE_DIM // 2, 2)
+    if (
+        inverse_rope_freqs.dtype != torch.float32
+        or inverse_rope_freqs.shape != expected_freqs_shape
     ):
-        raise ValueError("DSpark inverse RoPE frequencies must be FP32 [batch, block, 32, 2]")
-    if kv_pages.stride(1) != dim or kv_pages.stride(2) != 1 or kv_pages.stride(0) % 8:
-        raise ValueError("DSpark pages require contiguous tokens and an aligned page stride")
+        raise ValueError(
+            f"DSpark inverse RoPE frequencies must be FP32 {list(expected_freqs_shape)}, got "
+            f"{inverse_rope_freqs.dtype} {tuple(inverse_rope_freqs.shape)}"
+        )
+    if (
+        kv_pages.stride(0) <= 0
+        or kv_pages.stride(0) % 8
+        or kv_pages.stride(1) != dim
+        or kv_pages.stride(2) != 1
+    ):
+        raise ValueError(
+            "DSpark pages require contiguous tokens and a positive 16-byte-aligned page "
+            f"stride, got strides {kv_pages.stride()}"
+        )
     for value in (q, draft_block, attn_sink, inverse_rope_freqs):
         if not value.is_contiguous():
             raise ValueError("DSpark query, draft, sink and frequencies must be contiguous")
@@ -459,7 +483,7 @@ def is_dsv4_dspark_attention_config_supported(
     """Return whether static model geometry matches the DSV4 specialization."""
     return (
         block_size in _DSV4_DSPARK_BLOCK_SIZES
-        and num_heads in _DSV4_DSPARK_NUM_HEADS
+        and num_heads in _DSV4_DSPARK_SUPPORTED_NUM_HEADS
         and head_dim == _DSV4_DSPARK_HEAD_DIM
         and window_size == _DSV4_DSPARK_WINDOW_SIZE
     )
@@ -501,9 +525,9 @@ def is_fused_dsv4_dspark_attention_supported(
         )
     if q.shape[1] not in _DSV4_DSPARK_BLOCK_SIZES:
         return _log_unsupported(f"draft block size must be 5 or 6, got {q.shape[1]}", "block_size")
-    if q.shape[2] not in _DSV4_DSPARK_NUM_HEADS or q.shape[3] != _DSV4_DSPARK_HEAD_DIM:
+    if q.shape[2] not in _DSV4_DSPARK_SUPPORTED_NUM_HEADS or q.shape[3] != _DSV4_DSPARK_HEAD_DIM:
         return _log_unsupported(
-            "q must have 128 heads and head_dim 512; "
+            f"q must have {_DSV4_DSPARK_SUPPORTED_NUM_HEADS} heads and head_dim 512; "
             f"got {q.shape[2]} heads and head_dim {q.shape[3]}",
             "q_shape",
         )

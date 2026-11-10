@@ -183,16 +183,17 @@ def test_fused_dsv4_dspark_attention_support_gate_logs_rejection(monkeypatch, in
     "invalid_case,reason",
     [
         ("q_dtype", "must use BF16"),
-        ("block_size", "requires block 5/6"),
-        ("heads", "64/128 heads"),
-        ("page_size", "16/32/64/128/256-token pages"),
+        ("block_size", "block size must be one of"),
+        ("heads", r"requires \(64, 128\) heads"),
+        ("page_size", "page size must be one of"),
+        ("page_stride", "positive 16-byte-aligned page stride"),
         ("draft_shape", "draft KV must have shape"),
         ("draft_layout", "must be contiguous"),
         ("table_dtype", "contiguous INT32 rows"),
         ("table_layout", "contiguous INT32 rows"),
-        ("positions", "contiguous INT64 batch vectors"),
-        ("valid_lengths", "contiguous INT64 batch vectors"),
-        ("capacities", "contiguous INT64 batch vectors"),
+        ("positions", "positions must be a contiguous INT64"),
+        ("valid_lengths", "valid lengths must be a contiguous INT64"),
+        ("capacities", "capacities must be a contiguous INT64"),
         ("sink_dtype", "sink must be FP32"),
         ("freqs_shape", "inverse RoPE frequencies must be FP32"),
     ],
@@ -209,6 +210,8 @@ def test_fused_dsv4_dspark_attention_rejects_invalid_inputs_before_launch(
         inputs["q"] = inputs["q"][:, :, :24].contiguous()
     elif invalid_case == "page_size":
         inputs["kv_pages"] = inputs["kv_pages"][:, :24]
+    elif invalid_case == "page_stride":
+        inputs["kv_pages"] = inputs["kv_pages"][:1].expand_as(inputs["kv_pages"])
     elif invalid_case == "draft_shape":
         inputs["draft_block"] = inputs["draft_block"][:, :7].contiguous()
     elif invalid_case == "draft_layout":

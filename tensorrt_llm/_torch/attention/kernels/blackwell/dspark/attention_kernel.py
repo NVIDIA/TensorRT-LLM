@@ -58,12 +58,8 @@ Q*K^T matmul, attention-sink online softmax, P*V matmul, and the inverse-RoPE
 epilogue into a single launch. KV arrives as two paged streams (the 128-row
 context window and the draft block's own rows); see
 ``attention.py`` for the supported DSpark contract and
-``tests/unittest/_torch/speculative/test_dspark_paged_attention.py`` for
-validation coverage.
-
-The split-KV/LSE/variable-sequence machinery of the generic attention kernel and its
-standalone harness have been removed, and the inverse-RoPE epilogue fusion was
-added here.
+``tests/unittest/_torch/speculative/test_dspark_cute_dsl_attention.py`` for
+validation coverage. This specialization has no split-KV/LSE reduction.
 """
 
 LOG2_E = 1.4426950408889634074
@@ -150,7 +146,7 @@ class DSparkAttentionKernel:
         mma_pv_tiler_mn: Tuple[int, int],
         max_active_clusters: int,
         page_size_draft: int,
-        page_size_win: int,
+        window_len: int,
         skip_correction_threshold: float,
         *,
         arch_str: str,
@@ -181,7 +177,7 @@ class DSparkAttentionKernel:
         self.max_active_clusters = max_active_clusters
         self.skip_correction_threshold = skip_correction_threshold
         self.page_size_draft = page_size_draft
-        self.page_size_win = page_size_win
+        self.window_len = window_len
         # Physical page sizes define the page-table/cache ABI. TMA page spans
         # normally match them, but a specialization may use a wider logical
         # span so one OOB-zero-filling TMA replaces many tiny page copies.
@@ -1180,9 +1176,9 @@ class DSparkAttentionKernel:
             total_seq_len,
         )
         if cutlass.const_expr(self.window_valid_len_from_tensor):
-            age = (
-                window_end_pos - 1 - local_col + cutlass.Int32(self.page_size_win)
-            ) % cutlass.Int32(self.page_size_win)
+            age = (window_end_pos - 1 - local_col + cutlass.Int32(self.window_len)) % cutlass.Int32(
+                self.window_len
+            )
             valid = valid and (k_index != 0 or cute.elem_less(age, window_valid_len))
         return valid
 
@@ -2745,7 +2741,7 @@ class DSparkAttentionKernel:
 
     @staticmethod
     def _compute_grid(
-        o: cute.Tensor,
+        q_latent: cute.Tensor,
         cluster_shape_mnk: Tuple[int, int, int],
         max_active_clusters: int,
     ):

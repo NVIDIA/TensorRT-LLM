@@ -205,18 +205,18 @@ class DSparkAttention(DSparkAttentionKernel):
     pv_tiler_mn = (128, 256)
     qk_tiler_k = 128
     page_size_draft = 8
-    page_size_win = 128
+    window_len = 128
 
     @staticmethod
     def _compute_grid(
-        o: cute.Tensor,
+        q_latent: cute.Tensor,
         cluster_shape_mnk: cute.Shape,
         max_active_clusters: int,
     ) -> Tuple[DSparkPersistentTileSchedulerParams, cute.Shape]:
         """Build scheduler parameters and cap the persistent DSpark grid."""
         tile_sched_params = DSparkPersistentTileSchedulerParams(
-            cute.size(o.shape[3]),
-            cute.size(o.shape[2]),
+            cute.size(q_latent.shape[3]),
+            cute.size(q_latent.shape[2]),
             cluster_shape_mnk,
         )
         grid = DSparkPersistentTileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
@@ -237,7 +237,7 @@ class DSparkAttention(DSparkAttentionKernel):
         mma_pv_tiler_mn: Tuple[int, int],
         max_active_clusters: int,
         page_size_draft: int,
-        page_size_win: int,
+        window_len: int,
         skip_correction_threshold: float,
         *,
         arch_str: str,
@@ -256,7 +256,7 @@ class DSparkAttention(DSparkAttentionKernel):
             "mma_qk_tiler_mn": (mma_qk_tiler_mn, self.qk_tiler_mn),
             "mma_pv_tiler_mn": (mma_pv_tiler_mn, self.pv_tiler_mn),
             "page_size_draft": (page_size_draft, self.page_size_draft),
-            "page_size_win": (page_size_win, self.page_size_win),
+            "window_len": (window_len, self.window_len),
             "mma_qk_tiler_k": (mma_qk_tiler_k, self.qk_tiler_k),
         }
         mismatches = [
@@ -269,7 +269,9 @@ class DSparkAttention(DSparkAttentionKernel):
         if seq_len_q not in (5, 6):
             raise ValueError(f"DSpark block size must be 5 or 6, got {seq_len_q}")
         if history_page_size not in (16, 32, 64, 128, 256):
-            raise ValueError("DSpark history page size must be 16, 32, 64, 128, or 256")
+            raise ValueError(
+                f"DSpark history page size must be 16, 32, 64, 128, or 256, got {history_page_size}"
+            )
         if inverse_rope_dim not in (0, 64):
             raise ValueError(f"DSpark inverse_rope_dim must be 0 or 64, got {inverse_rope_dim}")
         if output_groups is not None and (
@@ -285,7 +287,7 @@ class DSparkAttention(DSparkAttentionKernel):
             mma_pv_tiler_mn,
             max_active_clusters,
             page_size_draft,
-            page_size_win,
+            window_len,
             skip_correction_threshold,
             arch_str=arch_str,
             seq_len_q=seq_len_q,
