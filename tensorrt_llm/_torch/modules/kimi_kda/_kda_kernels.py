@@ -46,8 +46,13 @@ def get_kda_sm_version() -> int:
 
 
 def is_kda_optimized_supported() -> bool:
-    """The optimized prefill/decode kernels need Blackwell sm_100 or Rubin sm_107."""
+    """The optimized prefill/verify kernels need Blackwell sm_100/sm_103 or Rubin sm_107."""
     return get_kda_sm_version() in (100, 103, 107)
+
+
+def is_kda_decode_supported() -> bool:
+    """The fused single-token decode kernel also runs on Hopper sm_90."""
+    return get_kda_sm_version() in (90, 100, 103, 107)
 
 
 def fused_kda_post_conv(
@@ -584,7 +589,7 @@ class KDAKernelDispatch:
         if use_optimized_prefill and optimized_supported and is_intree_prefill_available():
             self.prefill_kernel_path = "optimized"
         self.decode_kernel_path = (
-            "optimized" if use_optimized_decode and optimized_supported else "fla"
+            "optimized" if use_optimized_decode and is_kda_decode_supported() else "fla"
         )
         self.verify_kernel_path = "fla"
         if use_optimized_verify and optimized_supported and is_intree_mtp_available():

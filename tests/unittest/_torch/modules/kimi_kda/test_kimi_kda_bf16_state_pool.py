@@ -12,7 +12,7 @@ pytest.importorskip("fla")
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention  # noqa: E402
 from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (  # noqa: E402
     is_intree_prefill_available,
-    is_kda_optimized_supported,
+    is_kda_decode_supported,
 )
 
 HIDDEN_SIZE = 512
@@ -50,7 +50,7 @@ class _MambaMetadata:
 
 
 def _make_runtime() -> KimiKDALinearAttention:
-    if not torch.cuda.is_available() or not is_kda_optimized_supported():
+    if not torch.cuda.is_available() or not is_kda_decode_supported():
         pytest.skip("the fused KDA decode kernel needs a supported CUDA device")
     runtime = KimiKDALinearAttention(_Cfg(), layer_idx=0).to("cuda")
     # dt_bias expects a checkpoint; uninitialized values overflow the decay.
