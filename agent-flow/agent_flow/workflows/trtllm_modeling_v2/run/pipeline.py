@@ -64,6 +64,7 @@ from ..agents.prompts.survey import capture_lists_block
 from ..agents.prompts.tags import tag_section, task_tags
 from ..agents.turns import TurnTimeout
 from ..checks import gate_cli
+from ..checks.delivery import entry_contract
 from ..infra.files import write_text_atomic
 from ..operators.coverage import (
     QueueItem,
@@ -179,6 +180,19 @@ class Plan:
     summary: str = ""
     note: str = ""
     tasks: list[Task] = field(default_factory=list)
+
+
+def entry_repair_block(problems: list[str]) -> str:
+    """What a kernel writer whose landed entry the delivery check would refuse is told."""
+    listed = "\n".join(f"- {problem}" for problem in problems)
+    return (
+        "## Your landed entry is not valid as committed\n\n"
+        "Read statically, as the final certification reads it:\n\n"
+        f"{listed}\n\n"
+        "Do not start the task again. Put the entry right in your worktree (its `CELLS` name "
+        "the cells you drove and saw pass, its `ARCHS` this architecture), commit with "
+        "`git commit -s`, and write your decision file again."
+    )
 
 
 class Pipeline:
@@ -457,9 +471,47 @@ class Pipeline:
             except VocabularyError as exc:
                 result.error = f"vocabulary.yaml does not validate: {exc}"
             return result
+        if tree is not None and task.kind == "kernel":
+            problems = self._entry_problems(task, tree)
+            if problems:
+                # The delivery check would refuse it on the final commit: one short turn now.
+                said = "; ".join(problems)
+                self.w.journal.event("task", f"{task.id}: the landed entry is not valid: {said}")
+                note = entry_repair_block(problems)
+                self._dispatch(task, role, self._prompt(task, f"{block}\n\n{note}"), path)
+                data = read_decision(path, role)
+                if data is None or data["decision"] not in FINISHED:
+                    return TurnResult(
+                        error=f"its landed entry is not valid ({said}), and the "
+                        "turn asked to put it right did not finish"
+                    )
+                result = TurnResult(str(data["decision"]), data)
+                problems = self._entry_problems(task, tree)
+                if problems:
+                    result.error = f"its landed entry is not valid: {'; '.join(problems)}"
+                    return result
         if tree is not None:
             result.error = self._integrate(task, role, tree, block)
         return result
+
+    def _entry_problems(self, task: Task, tree: Path) -> list[str]:
+        """What the delivery check would refuse in a kernel task's entry, read statically."""
+        item = self._queue_item(task)
+        if item is None:
+            return []
+        target_rel = str(getattr(self.w._preflight, "target_rel", "") or "")
+        paths = entry_paths(item, target_rel, self.w.task_data.get("trtllm_repo_path") or None)
+        if not paths:
+            return []
+        module = Path(tree) / paths[0]
+        if not module.is_file():
+            return [f"`{paths[0]}` is not in your worktree"]
+        contract = entry_contract(module)
+        problems = list(contract.problems)
+        arch = str(self.w.task_data.get("arch") or "")
+        if arch and contract.archs and arch not in contract.archs:
+            problems.append(f"ARCHS names {', '.join(contract.archs)}, not {arch}")
+        return problems
 
     def _integrate(self, task: Task, role: str, tree: Path, block: str) -> str:
         """Audit and integrate ``task``'s branch; why it did not go in, or ``""``.

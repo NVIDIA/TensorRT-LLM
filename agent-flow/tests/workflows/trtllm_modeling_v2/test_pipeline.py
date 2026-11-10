@@ -953,3 +953,44 @@ def test_a_task_whose_branch_conflicts_goes_back_to_its_worker_once_and_then_lan
     assert certification["commit"] == head
     assert {v["tree"].split("+")[0] for v in _verdicts(tmp_path)} == {head}
     assert not (tmp_path / "ws" / "worktrees" / "core").exists()  # integrated, so closed
+
+
+def test_a_landed_entry_is_read_as_the_certification_reads_it(tmp_path):
+    from types import SimpleNamespace
+
+    from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem
+    from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import (
+        Pipeline,
+        Task,
+        entry_repair_block,
+    )
+
+    target = "tensorrt_llm/_torch/_experimental/modeling_v2/models/fam/tgt"
+    item = QueueItem(1, "onboard", "ops/norm/rms")
+    fake = SimpleNamespace(
+        _queue_item=lambda task: item,
+        w=SimpleNamespace(
+            _preflight=SimpleNamespace(target_rel=target),
+            task_data={"arch": "sm_103", "trtllm_repo_path": ""},
+        ),
+    )
+    task = Task(id="k1-rms", kind="kernel", unit="core", ref="1")
+    entry = tmp_path / target / "ops/norm/rms.py"
+
+    def problems():
+        return Pipeline._entry_problems(fake, task, tmp_path)
+
+    assert problems() == [f"`{target}/ops/norm/rms.py` is not in your worktree"]
+    entry.parent.mkdir(parents=True)
+    head = (
+        "class Rms(OpWrapper):\n    def __call__(self, x): ...\n    def reference(self, x): ...\n"
+    )
+    entry.write_text(head + "    ARCHS = frozenset({Arch.SM_103})\n")
+    assert problems() == ["Rms declares no CELLS: nothing is certified"]
+    cells = "    CELLS = (Cell(why='decode', spec={}),)\n"
+    entry.write_text(head + cells + "    ARCHS = frozenset({Arch.SM_100})\n")
+    assert problems() == ["ARCHS names sm_100, not sm_103"]
+    entry.write_text(head + cells + "    ARCHS = frozenset({Arch.SM_103})\n")
+    assert problems() == []
+    block = entry_repair_block(["Rms declares no CELLS: nothing is certified"])
+    assert "Do not start the task again" in block and "- Rms declares no CELLS" in block
