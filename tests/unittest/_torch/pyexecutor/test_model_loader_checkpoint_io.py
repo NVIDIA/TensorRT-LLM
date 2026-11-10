@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -826,12 +827,17 @@ def test_mtp_draft_session_reuses_target_mapper_during_materialization(
     assert "draft_checkpoint_finalization_seconds" in loader.metrics
 
 
-@pytest.mark.parametrize("policy", ["native", "rank_striped_read_ahead"])
+@pytest.mark.parametrize(
+    "entry, policy",
+    [("session", "native"), ("session", "rank_striped_read_ahead"), ("separate", "native")],
+)
 def test_draft_load_reads_only_the_shards_holding_draft_keys(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str, policy: str
 ) -> None:
     # One CPU rank without MPI, as in the rank-striped read-ahead tests.
     monkeypatch.delenv("TRTLLM_HF_WEIGHT_CACHE", raising=False)
+    monkeypatch.delenv("TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES", raising=False)
+    monkeypatch.setattr(weight_loader_module, "_WEIGHT_CACHE", OrderedDict())
     monkeypatch.setattr(weight_loader_module, "ENABLE_MULTI_DEVICE", False)
     monkeypatch.setattr(weight_loader_module, "local_mpi_rank", lambda: 0)
     monkeypatch.setattr(weight_loader_module, "local_mpi_size", lambda: 1)
@@ -890,7 +896,7 @@ def test_draft_load_reads_only_the_shards_holding_draft_keys(
         "model-00004-of-00005.safetensors",
     ]
 
-    def load_draft(draft_model: torch.nn.Module | None) -> dict[str, torch.Tensor]:
+    def load_draft(draft_model: torch.nn.Module | None) -> tuple[dict[str, torch.Tensor], str]:
         received = {}
         read_files.clear()
         model = SimpleNamespace(
@@ -903,12 +909,13 @@ def test_draft_load_reads_only_the_shards_holding_draft_keys(
         loader.spec_config = SimpleNamespace(speculative_model=str(checkpoint_dir))
         loader.mapping = Mapping()
         loader.weight_mapper = object()
-        checkpoint_loader = HfCheckpointLoader(
-            weight_loader=HfWeightLoader(checkpoint_io_policy=policy)
-        )
-        loader._materialize_draft_checkpoint_weights(checkpoint_loader, model)
-        assert checkpoint_loader.weight_loader.last_checkpoint_io_status.effective == policy
-        return received
+        weight_loader = HfWeightLoader(checkpoint_io_policy=policy)
+        checkpoint_loader = HfCheckpointLoader(weight_loader=weight_loader)
+        if entry == "session":
+            loader._materialize_draft_checkpoint_weights(checkpoint_loader, model)
+        else:
+            loader._load_separate_draft_weights(model, checkpoint_loader)
+        return received, weight_loader.last_checkpoint_io_status.effective
 
     def assert_same_draft_tensors(
         draft: dict[str, torch.Tensor], full: dict[str, torch.Tensor]
@@ -922,9 +929,20 @@ def test_draft_load_reads_only_the_shards_holding_draft_keys(
                 draft[key].reshape(-1).view(torch.uint8), full[key].reshape(-1).view(torch.uint8)
             )
 
-    full = load_draft(None)
+    full, effective = load_draft(None)
+    assert effective == policy
     assert sorted(read_files) == sorted(shards)
     assert set(full) == {key for tensors in shards.values() for key in tensors}
-    draft = load_draft(dspark)
+    draft, effective = load_draft(dspark)
+    assert effective == policy
     assert sorted(read_files) == holders
     assert_same_draft_tensors(draft, full)
+
+    # With the raw weight cache on, the draft keeps the full file set and reuses the target's entry.
+    monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "1")
+    load_draft(None)
+    assert sorted(read_files) == sorted(shards)
+    cached, effective = load_draft(dspark)
+    assert effective == "native"
+    assert read_files == []
+    assert_same_draft_tensors(cached, full)
