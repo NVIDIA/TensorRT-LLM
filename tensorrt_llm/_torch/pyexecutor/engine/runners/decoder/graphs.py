@@ -428,10 +428,8 @@ class DecoderCudaGraphs:
         return False
 
     def _single_pass_blocker(self) -> str | None:
-        """Why this rank may not try the single pass, or None.
-
-        It may when nothing only the warmup-only pass does is needed and the ranks can agree.
-        """
+        """Why this rank may not try the single pass; None when nothing only the warmup-only
+        pass does is needed and the ranks can agree."""
         # One gate per duty of the warmup-only pass in run_cuda_graph_warmup.
         if self._lora.cuda_graph_manager is not None:
             return "LoRA CUDA graphs tune their kernels in the warmup-only pass"
@@ -681,8 +679,7 @@ class DecoderCudaGraphs:
                 outputs = capture_outputs
             elif needs_capture:
                 if self._capturing_in_one_pass:
-                    # The replay waits for its peers under the serving timeouts it captured, so
-                    # line the ranks up first.
+                    # The replay waits on peers under serving timeouts, so line the ranks up first.
                     torch.cuda.synchronize()
                     self._agreement.agree_flag(True)
                 # Refresh attention metadata for the current batch's
@@ -837,8 +834,7 @@ class DecoderCudaGraphs:
                         # ranks before the capture pass reads them.
                         AutoTuner.get().post_tune_merge_tactics()
                     self._capture_additional_cuda_graphs(resource_manager)
-        # Piecewise graphs have separate capture machinery and do not use the
-        # whole-model attention workspace, so only a capture pass captures them.
+        # Piecewise graphs skip the attention workspace, so only a capture pass captures them.
         if not is_warmup_only and capture_prefill:
             self._capture_prefill_cuda_graphs(resource_manager)
 
