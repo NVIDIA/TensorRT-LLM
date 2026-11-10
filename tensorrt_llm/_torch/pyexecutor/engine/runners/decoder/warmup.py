@@ -1229,18 +1229,21 @@ class DecoderWarmup:
                                     ),
                                 )
                             ran_forward = True
+                            if synchronize_trtllm_cache:
+                                # pp_recv in AutoTuner choose_one will never be called if there
+                                # is no tuning op during the forward pass.
+                                # So we need to make an extra call to consume the previous rank's
+                                # pp_send to guarantee that the previous rank's pp_send is released.
+                                AutoTuner.get().cache_pp_recv()
+                                # Send the cache to the next PP rank before waiting for this
+                                # forward's GPU work: that work ends with the activation send to
+                                # the next rank, which may run a tuning op (such as the all-reduce
+                                # of a tied embedding) before its activation receive, and that op
+                                # waits for this cache.
+                                AutoTuner.get().cache_pp_send()
+                                # Clean the pp flag to avoid deadlock with synchronous send/recv
+                                AutoTuner.get().clean_pp_flag()
                             torch.cuda.synchronize()
-
-                if ran_forward and synchronize_trtllm_cache:
-                    # pp_recv in AutoTuner choose_one will never be called if there is no tuning op
-                    # during the forward pass.
-                    # So we need to make an extra call to consume the previous rank's pp_send to
-                    # guarantee that the previous rank's pp_send is released.
-                    AutoTuner.get().cache_pp_recv()
-                    # Send the cache after the tuning process to the next PP rank
-                    AutoTuner.get().cache_pp_send()
-                    # Clean the pp flag to avoid deadlock with synchronous send/recv
-                    AutoTuner.get().clean_pp_flag()
             return ran_forward
 
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)

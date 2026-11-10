@@ -40,7 +40,10 @@ from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import warmup as warmup_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import DecoderWarmup
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import (
+    DecoderWarmup,
+    WarmupAgreement,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS
@@ -48,6 +51,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
 from tensorrt_llm.llmapi.llm_args import DraftTargetDecodingConfig, PrefillCudaGraphBackend
+from tensorrt_llm.mapping import Mapping
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -680,6 +684,62 @@ def test_autotuner_warmup_leaves_out_generation_shape_on_context_only_cache(
     shapes = [args[1:] for args, _ in requests.create_warmup_request.call_args_list]
     assert shapes == ([(16, 0)] if context_only else [(16, 0), (1, 1)])
     assert engine._forward_warmup.call_count == len(shapes)
+
+
+@pytest.mark.cpu_only
+def test_autotuner_warmup_hands_pp_cache_off_before_waiting_on_gpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PP rank exchanges its tuning cache before it waits for the forward's GPU work.
+
+    That work ends with the activation send to the next PP rank, which may wait
+    for this rank's cache in a tuning op before it posts the receive.
+    """
+    events: list[str] = []
+    tuner = Mock(profiling_cache={})
+    tuner.cache_pp_recv.side_effect = lambda: events.append("cache_pp_recv")
+    tuner.cache_pp_send.side_effect = lambda: events.append("cache_pp_send")
+    requests = Mock()
+    requests.create_warmup_request.return_value = ScheduledRequests()
+    requests.release_batch_context.side_effect = lambda request, _resources: (
+        contextlib.nullcontext(request)
+    )
+    # The first rank of a two-stage pipeline; the other rank agrees with every
+    # warmup decision this rank reports.
+    mapping = Mapping(world_size=2, rank=0, pp_size=2)
+    peer_dist = SimpleNamespace(
+        world_size=2,
+        rank=0,
+        allgather=lambda value: [value, value],
+        pp_allgather=lambda value: [value, value],
+    )
+    warmup = decoder_warmup(
+        decoder_config(),
+        mapping=mapping,
+        agreement=WarmupAgreement(peer_dist, mapping),
+        dummy_requests=requests,
+        forward_warmup=Mock(),
+    )
+    cache = SimpleNamespace(get_num_available_tokens=lambda **_: 16)
+    resources = SimpleNamespace(
+        get_resource_manager=lambda key: (
+            cache if key == ResourceManagerType.KV_CACHE_MANAGER else None
+        )
+    )
+    monkeypatch.delenv("TLLM_AUTOTUNER_CACHE_PATH", raising=False)
+    monkeypatch.setattr(decoder_warmup_module.AutoTuner, "get", Mock(return_value=tuner))
+    monkeypatch.setattr(
+        decoder_warmup_module, "autotune", lambda **kwargs: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("synchronize"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(decoder_warmup_module, "clear_memory_buffers", Mock())
+
+    warmup._run_autotuner_warmup(resources)
+
+    assert {"cache_pp_recv", "cache_pp_send", "synchronize"} <= set(events)
+    assert events.index("cache_pp_recv") < events.index("synchronize")
+    assert events.index("cache_pp_send") < events.index("synchronize")
 
 
 @pytest.mark.parametrize("phase", ["general", "attention", "mamba", "prefill"])
