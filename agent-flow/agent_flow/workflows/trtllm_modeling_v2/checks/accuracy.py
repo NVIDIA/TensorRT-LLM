@@ -376,29 +376,6 @@ def run_accuracy_gate(
     )
 
 
-def check_systematic_shift(
-    results: Sequence[GateResult],
-    accuracy: Mapping[str, Any],
-    unit: str | None,
-) -> accuracy_policy.ShiftFinding | None:
-    """The cross-member check over one unit's accuracy verdicts (:func:`.accuracy_policy.systematic_shift`).
-
-    Verdicts without a measurement or an SE are left out.
-    """
-    policy = accuracy_policy.resolve_floor_policy(accuracy)
-    readings = {
-        str(r.member): (float(r.measured), float(r.reference), float(r.se))
-        for r in results
-        if r.measured is not None and r.reference is not None and r.se is not None
-    }
-    return accuracy_policy.systematic_shift(
-        unit,
-        readings,
-        min_members=policy.shift_min_members,
-        acknowledged=policy.acknowledged,
-    )
-
-
 #: The key a systematic-shift finding is recorded under, per unit.
 SHIFT_FINDING = "systematic_shift"
 
@@ -444,7 +421,6 @@ __all__ = [
     "resolve_model_key",
     "ACCURACY_TIMEOUT_S",
     "SHIFT_FINDING",
-    "check_systematic_shift",
     "eval_command",
     "eval_harness_command",
     "load_reference_score",

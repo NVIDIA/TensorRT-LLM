@@ -32,7 +32,6 @@ from ..operators.coverage import (
     CATALOG_TESTS_DIR,
     MODEL_OPS_DIRNAME,
     MODELING_V2_PACKAGE,
-    model_ops_tests_dir,
 )
 
 ACCURACY_REFERENCES_DIR = "tests/integration/defs/accuracy/references"
@@ -76,34 +75,6 @@ class DeliveryReport:
 
     def render(self) -> str:
         return "\n".join(check.render() for check in self.checks)
-
-
-def imported_model_ops(modeling_py: Path) -> list[tuple[str, str, str]]:
-    """Return ``(target_dir, category, name)`` for every ``ops/`` entry a target imports.
-
-    A target reaches its own ``ops/`` relatively (``from .ops.moe.x import X``)
-    or by absolute path; either way ``target_dir`` is the directory the entry
-    lives in, so an import of *another* target's op is visible as one.
-    """
-    tree = ast.parse(modeling_py.read_text(encoding="utf-8"))
-    own = modeling_py.parent.name
-    found: set[tuple[str, str, str]] = set()
-    for node in ast.walk(tree):
-        modules: list[str] = []
-        if isinstance(node, ast.ImportFrom) and node.module:
-            if node.level == 1:
-                match = _RELATIVE_OPS_IMPORT.match(node.module)
-                if match:
-                    found.add((own, match.group(1), match.group(2)))
-                continue
-            modules = [node.module]
-        elif isinstance(node, ast.Import):
-            modules = [alias.name for alias in node.names]
-        for module in modules:
-            match = _MODEL_OPS_IMPORT.search(module)
-            if match:
-                found.add((match.group(1), match.group(2), match.group(3)))
-    return sorted(found)
 
 
 @dataclass(frozen=True)
@@ -223,22 +194,6 @@ def _entry_problems(wrapper: Path) -> tuple[list[str], EntryContract | None]:
     return list(contract.problems), contract
 
 
-def check_catalog_entries(repo_root: Path, entries: Iterable[tuple[str, str]]) -> list[Check]:
-    """Every imported shared entry exists and states a certified contract."""
-    checks: list[Check] = []
-    for category, name in entries:
-        rel = f"{category}/{name}.py"
-        problems, contract = _entry_problems(repo_root / CATALOG_DIR / rel)
-        checks.append(
-            Check(
-                name=f"catalog:{rel}",
-                passed=not problems,
-                detail="; ".join(problems) or _contract_detail(contract),
-            )
-        )
-    return checks
-
-
 def check_model_ops(
     repo_root: Path, target_rel: str, ops: Iterable[tuple[str, str, str]]
 ) -> list[Check]:
@@ -311,32 +266,6 @@ def _test_check(repo_root: Path, tests_dir: str, label: str, category: str, name
         else f"{test} never reads the entry's .CELLS: parametrize it off them, or the "
         f"cells it claims were never driven",
     )
-
-
-def check_catalog_tests(repo_root: Path, entries: Iterable[tuple[str, str]]) -> list[Check]:
-    """Every shared entry has its GPU test, under the name CI matches, driving its cells.
-
-    A multi-rank entry's test is an op matrix over world sizes and is named
-    ``test_modeling_v2_<name>_op_matrix.py``, as the in-tree ``comm`` tests
-    are; either name satisfies the check.
-    """
-    return [
-        _test_check(repo_root, CATALOG_TESTS_DIR, f"test:{category}/{name}", category, name)
-        for category, name in entries
-    ]
-
-
-def check_model_op_tests(
-    repo_root: Path, target_rel: str, ops: Iterable[tuple[str, str, str]]
-) -> list[Check]:
-    """Every own ``ops/`` entry has its GPU test under the target's mirror of the tests tree."""
-    own = Path(target_rel.rstrip("/")).name
-    tests_dir = model_ops_tests_dir(target_rel)
-    return [
-        _test_check(repo_root, tests_dir, f"test:ops/{category}/{name}", category, name)
-        for target_dir, category, name in ops
-        if target_dir == own
-    ]
 
 
 def _dependency_checks(repo_root: Path, target_rel: str) -> list[Check]:
@@ -790,16 +719,12 @@ __all__ = [
     "EntryContract",
     "TEST_DB_DIR",
     "check_accuracy_reference",
-    "check_catalog_entries",
-    "check_catalog_tests",
     "check_commit_hygiene",
-    "check_model_op_tests",
     "check_model_ops",
     "check_routing",
     "check_target",
     "check_test_registration",
     "check_tree_committed",
     "entry_contract",
-    "imported_model_ops",
     "verify_delivery",
 ]

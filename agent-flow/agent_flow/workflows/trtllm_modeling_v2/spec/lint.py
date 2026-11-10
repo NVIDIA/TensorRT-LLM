@@ -186,11 +186,6 @@ class LintContext:
 Rule = Callable[[LintContext], Iterable[Finding]]
 
 
-def _flags(runtime: Mapping[str, Any]) -> dict[str, Any]:
-    options, _, _ = check_config.parse_runtime_flags(runtime.get("extra_flags") or ())
-    return options
-
-
 _gpus_per_node = gpus_per_node
 
 

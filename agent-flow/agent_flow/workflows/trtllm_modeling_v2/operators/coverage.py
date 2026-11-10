@@ -20,12 +20,11 @@ ladder (``TIER_*``). Only when **every** rung is exhausted is the verdict a
 
 from __future__ import annotations
 
-import ast
 import posixpath
 import re
 import zlib
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import yaml
@@ -131,12 +130,6 @@ MAX_ROW_CELLS = 64
 
 class VocabularyError(ValueError):
     """``vocabulary.yaml`` is malformed or internally inconsistent."""
-
-
-def split_variant(name: str) -> tuple[str, str | None]:
-    """``thop_attention__r7`` -> ``("thop_attention", "r7")``; a plain entry name -> ``(name, None)``."""
-    entry, sep, site = name.partition(VARIANT_SEPARATOR)
-    return (entry, site) if sep and entry and site else (name, None)
 
 
 def variant_target(target: str, site: str) -> str:
@@ -614,27 +607,6 @@ def queue_item_from_ref(ref: str, task_id: str, goal: str = "") -> QueueItem | N
     return QueueItem(n=n, mode=mode, target=target, note=goal, site=site or None)
 
 
-def imported_catalog_entries(modeling_py: Path) -> list[tuple[str, str]]:
-    """Return ``(category, name)`` for every catalog entry a target imports."""
-    tree = ast.parse(modeling_py.read_text(encoding="utf-8"))
-    found: list[tuple[str, str]] = []
-    for node in ast.walk(tree):
-        module = None
-        if isinstance(node, ast.ImportFrom) and node.module:
-            module = node.module
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                match = _CATALOG_IMPORT.search(alias.name)
-                if match:
-                    found.append((match.group(1), match.group(2)))
-            continue
-        if module:
-            match = _CATALOG_IMPORT.search(module)
-            if match:
-                found.append((match.group(1), match.group(2)))
-    return sorted(set(found))
-
-
 #: Where a target's CI accuracy test, its test list entry and its reference row live.
 INTEGRATION_TESTS_DIR = "tests/integration"
 
@@ -671,49 +643,7 @@ def model_ops_tests_dir(target_rel: str) -> str:
     return f"{CATALOG_TESTS_DIR}/{tail}"
 
 
-def entry_module(target: str) -> str:
-    """The tail every path of ``target``'s entry module ends in.
-
-    ``target`` is a dispatch's ``<category>/<name>`` (the shared catalog) or
-    ``ops/<category>/<name>`` (the run's target's own); see the entry spec.
-    """
-    parts = target.strip("/").split("/")
-    home = "ops" if parts[0] == "ops" and len(parts) > 2 else "catalog"
-    return f"{home}/{'/'.join(parts[-2:])}.py"
-
-
-def is_entry_file(path: str, target: str) -> bool:
-    """Whether the repo-relative ``path`` is one of the files ``target``'s entry spans.
-
-    The entry module, its GPU test (with a collective's rank body beside it),
-    and the ``__init__.py`` of a new ``ops/<category>/``: what a kernel writer writes
-    for one entry, in both trees.
-    """
-    parts = target.strip("/").split("/")
-    if len(parts) < 2:
-        return False
-    category, name = parts[-2], parts[-1]
-    file = PurePosixPath(path)
-    if path.startswith("tensorrt_llm/"):
-        if path.endswith("/" + entry_module(target)):
-            return True
-        return (
-            parts[0] == "ops"
-            and file.name == "__init__.py"
-            and path.endswith(f"/ops/{category}/__init__.py")
-        )
-    if path.startswith("tests/") and file.parent.name == category:
-        stem = file.stem
-        return stem == f"test_modeling_v2_{name}" or stem.startswith(
-            (f"test_modeling_v2_{name}_", f"_{name}_")
-        )
-    return False
-
-
 __all__ = [
-    "is_entry_file",
-    "entry_module",
-    "imported_catalog_entries",
     "INTEGRATION_TESTS_DIR",
     "model_ops_tests_dir",
     "own_paths",
@@ -741,6 +671,5 @@ __all__ = [
     "queue_item_from_ref",
     "shared_entry_paths",
     "site_slug",
-    "split_variant",
     "variant_target",
 ]

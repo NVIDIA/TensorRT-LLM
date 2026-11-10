@@ -68,14 +68,10 @@ class Journal:
 
         A ``--dry-run`` or a failed preflight opens the journal too, so its
         ``run opened`` says when the journal began, not when the run's work
-        did; the milestones are timed from this.
+        did.
         """
         if self._first(STARTED) is None:
             self.event(STARTED, "past preflight: the first agent turn follows")
-
-    def opened_at(self) -> datetime | None:
-        """When the run started: its first ``run started`` event, else its first ``run opened``."""
-        return self._first(STARTED) or self._first(OPENED)
 
     def _first(self, what: str) -> datetime | None:
         """When the journal's first ``what`` event was; ``None`` without one."""
@@ -137,26 +133,6 @@ class Journal:
         )
         self.event(f"dispatch {ordinal:02d} · {agent}", what)
         return path
-
-    def _reports(self, agent: str, what: str) -> list[Path]:
-        """The reports :meth:`record_dispatch` wrote for this agent and subject, oldest first."""
-        if not self.reports_dir.is_dir():
-            return []
-        name = f"{agent}-{_slugify(what)}.md"
-        found = sorted(
-            (int(match.group(1)), entry)
-            for entry in self.reports_dir.iterdir()
-            if (match := _REPORT_NAME.match(entry.name)) and entry.name[match.end() :] == name
-        )
-        return [entry for _, entry in found]
-
-    def returned_reports(self, agent: str, what: str) -> list[Path]:
-        """Every report for this agent and subject whose agent returned, oldest first."""
-        return [
-            entry
-            for entry in self._reports(agent, what)
-            if "## Result\n\n_pending_\n" not in entry.read_text(encoding="utf-8")
-        ]
 
     def record_result(self, report_path: Path, result: str) -> None:
         """Replace a dispatch report's pending result with the agent's final message."""

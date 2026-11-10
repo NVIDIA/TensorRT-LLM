@@ -51,11 +51,6 @@ def resolve_role_agents(
     return {role: resolve_agent_config(task_data, role) for role in roles}
 
 
-def resolve_role_agent(task_data: Mapping[str, Any], role: str) -> AgentConfig:
-    """Resolve one role; running workflows pin the full mapping with resolve_role_agents."""
-    return resolve_role_agents(task_data, roles=(role,))[role]
-
-
 def _model_configured(task_data: Mapping[str, Any], role: str) -> bool:
     """Whether the spec states the role's model: its own, or the defaults' on the same backend."""
     agents = task_data.get(AGENTS_FIELD)
@@ -78,6 +73,5 @@ __all__ = [
     "PACKAGED_SKILLS_DIR",
     "ROLES",
     "packaged_skills",
-    "resolve_role_agent",
     "resolve_role_agents",
 ]

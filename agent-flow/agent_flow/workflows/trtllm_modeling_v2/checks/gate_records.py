@@ -136,16 +136,10 @@ class GateRecords:
         return None
 
 
-def records_for(workspace: str | Path) -> GateRecords:
-    """The results file of a run's workspace."""
-    return GateRecords(Path(workspace) / RESULTS_FILENAME)
-
-
 __all__ = [
     "GateRecord",
     "GateRecords",
     "KIND_ACCEPTANCE",
     "KIND_STOCK_UNAVAILABLE",
     "RESULTS_FILENAME",
-    "records_for",
 ]

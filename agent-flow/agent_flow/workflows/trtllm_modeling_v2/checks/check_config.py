@@ -257,14 +257,6 @@ def share_batch(options: dict[str, Any], member: str | None, ranks: int | None =
         graphs["batch_sizes"] = kept
 
 
-def member_llm_api_overlay(member: str | None) -> dict[str, Any]:
-    """The LLM-API settings a member needs that its gate command cannot carry: attention DP."""
-    if not member:
-        return {}
-    kind, _ = parse_parallel_segment(member)
-    return {"enable_attention_dp": True} if kind == "dep" else {}
-
-
 #: Startup cost of a member's topology, cheapest first: ``tep`` partitions the
 #: experts and slices attention, ``dep`` replicates attention on every rank,
 #: ``tp`` holds a slice of every expert on every rank.
@@ -703,14 +695,6 @@ def engine_declaration(config: Mapping[str, Any], *, mode: str | None) -> dict[s
     return declared_engine(options)
 
 
-def llm_api_block_reuse(options: Mapping[str, Any]) -> bool:
-    """Whether LLM-API ``options`` ask for KV-cache block reuse (``enable_block_reuse``, default on)."""
-    kv_cache = options.get("kv_cache_config")
-    if not isinstance(kv_cache, Mapping):
-        return True
-    return bool(kv_cache.get("enable_block_reuse", True))
-
-
 def check_configuration(
     task_data: Mapping[str, Any],
     environment: RunEnvironment,
@@ -1001,9 +985,7 @@ __all__ = [
     "launch_conflicts",
     "launch_kv_caches",
     "llm_api_batch_sizes",
-    "llm_api_block_reuse",
     "load_llm_api_options",
-    "member_llm_api_overlay",
     "merge_options",
     "options_capture",
     "order_members_by_cost",

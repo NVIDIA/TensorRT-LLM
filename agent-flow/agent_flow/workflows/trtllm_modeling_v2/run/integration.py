@@ -28,14 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from ..infra.git import (
-    CommitPolicy,
-    audit_commits,
-    git_checked,
-    git_output,
-    link_native,
-    repo_lock,
-)
+from ..infra.git import CommitPolicy, audit_commits, git_checked, git_output, link_native, repo_lock
 
 WORKTREES_DIRNAME = "worktrees"
 #: Files one checkout writes at once (``checkout.workers``, git 2.32 or later).
@@ -148,11 +141,6 @@ class Integration:
         moved = self._git(tree, *_CHECKOUT, "reset", "--hard", "-q", head)
         if moved.returncode == 0:
             self.log(f"{tree.name}: moved to the integration head {head[:10]}")
-
-    def changed_paths(self, task_id: str) -> tuple[str, ...]:
-        """The files the task's branch changes since it left the integration head's history."""
-        listed = git_output(self.repo, "diff", "--name-only", f"HEAD...{self.branch(task_id)}")
-        return tuple(sorted({line.strip() for line in (listed or "").splitlines() if line.strip()}))
 
     def _create(self, task_id: str, tree: Path) -> None:
         """Register ``tree`` on the task's branch, then check it out whole.
@@ -361,8 +349,7 @@ def worktree_block(tree: Path, repo: Path) -> str:
         f"    git -C {tree} add <path> [path...] && git -C {tree} commit -s -m <message>\n\n"
         f"Run a check on your work with `--tree {tree}`. When you finish, the orchestrator "
         "audits your commits and rebases them onto the checkout; uncommitted changes are not "
-        "integrated and fail the task."
-        + _behind_note(tree, repo)
+        "integrated and fail the task." + _behind_note(tree, repo)
     )
 
 
