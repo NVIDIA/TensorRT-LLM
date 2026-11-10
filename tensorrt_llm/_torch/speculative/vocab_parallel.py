@@ -907,6 +907,10 @@ def markov_sampled_chain(
             HAS_SLOTS=has_slots,
             BLOCK_V=_LOCAL_BLOCK_V,
             num_warps=8,
+            # Left alone the compiler takes ~134 registers, so one 256-thread
+            # block per SM; 80 fits three, which is worth the few spills at
+            # batch >= 8.
+            maxnreg=80,
         )
         _markov_sample_reduce_kernel[(num_reqs,)](
             stats,
