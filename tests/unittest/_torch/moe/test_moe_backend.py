@@ -6470,19 +6470,17 @@ def test_cutedsl_fc12_outer_runner_unique_id_includes_epilogue():
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("num_tokens", [0, 4])
-@pytest.mark.parametrize("with_event", [False, True])
 @pytest.mark.parametrize("provided_output", [False, True])
 @pytest.mark.parametrize("sort_tile_size", [None, 128, 256])
 @pytest.mark.parametrize("tuning_dispatch", [False, True])
-def test_cutedsl_fc12_input_ready_event(
+def test_cutedsl_fc12_run_moe_sort_tables(
     monkeypatch: pytest.MonkeyPatch,
     num_tokens: int,
-    with_event: bool,
     provided_output: bool,
     sort_tile_size: int | None,
     tuning_dispatch: bool,
 ) -> None:
-    """Each forward joins before input consumption with cached or fresh sort tables."""
+    """Each forward reuses matching sort tables and skips empty batches."""
     backend = CuteDslFc12FusedMoE.__new__(CuteDslFc12FusedMoE)
     torch.nn.Module.__init__(backend)
     backend._weights_created = True
@@ -6529,9 +6527,6 @@ def test_cutedsl_fc12_input_ready_event(
     for _ in range(2):
         calls.clear()
         sort.reset_mock()
-        event = Mock() if with_event else None
-        if event is not None:
-            event.wait.side_effect = lambda: calls.append("wait")
         result = backend.run_moe(
             MoERunContext(
                 x=torch.zeros((num_tokens, backend.hidden_size // 2), dtype=torch.uint8),
@@ -6544,17 +6539,13 @@ def test_cutedsl_fc12_input_ready_event(
                     input_sf_swizzled=False,
                     payload_in_workspace=False,
                 ),
-                x_ready_event=event,
                 sort_tables=sort_tables,
             )
         )
         kernel_calls = 1 + int(tuning_dispatch) if num_tokens else 0
-        assert calls == (["wait"] if with_event else []) + ["kernel"] * kernel_calls
+        assert calls == ["kernel"] * kernel_calls
         expected_sorts = int(tuning_dispatch) + int(sort_tile_size != 128) if num_tokens else 0
         assert sort.call_count == expected_sorts
-        if event is not None:
-            event.wait.assert_called_once_with()
-        assert getattr(backend, "_pending_x_ready_event", None) is None
         assert result.shape == output.shape
         assert result.dtype == torch.bfloat16
         if provided_output:
