@@ -72,11 +72,11 @@ _REDUCE_BLOCK_ROWS = 32
 # Programs the local reductions aim for (rows x column splits): rows are few in
 # decode, so each row is split over several programs.
 _TARGET_PROGRAMS = 256
-# The pair layout follows the row count, so its offsets (and the slot count)
-# change with the batch. They are not specialized: a specialization flips when
-# a value becomes 1 or a multiple of 16 and would compile a kernel variant
-# mid-serving.
-_PAIR_LAYOUT_ARGS = ["slot0", "zero_lo", "zero_hi"]
+# The pair layout follows the row count, so its offsets, the slot count and the
+# row stride of a single shard's pair buffer (2 * splits) change with the batch.
+# They are not specialized: a specialization flips when a value becomes 1 or a
+# multiple of 16 and would compile a kernel variant mid-serving.
+_PAIR_LAYOUT_ARGS = ["stride_out", "slot0", "zero_lo", "zero_hi"]
 
 
 @triton.jit
@@ -253,7 +253,7 @@ def _local_sample_kernel(
     )
 
 
-@triton.jit(do_not_specialize=["n_rows", "n_slots"])
+@triton.jit(do_not_specialize=["stride_row", "n_rows", "n_slots"])
 def _reduce_pairs_kernel(
     pairs_ptr,
     stride_row,
@@ -274,7 +274,7 @@ def _reduce_pairs_kernel(
     tl.store(out_ptr + rows, best.to(out_ptr.dtype.element_ty), mask=rows < n_rows)
 
 
-@triton.jit(do_not_specialize=["n_slots"])
+@triton.jit(do_not_specialize=["stride_row", "n_slots"])
 def _markov_reduce_embed_kernel(
     pairs_ptr,
     stride_row,
