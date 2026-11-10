@@ -105,6 +105,7 @@ from .config_utils import is_decode_only
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.kv_cache_layout import (build_kv_cache_layout_v2,
                                          has_state_layers)
+from .context_logits_plan import context_logits_rows
 from .cuda_graph_runner import ADPShapeAgreement
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dwdp import DwdpManager
@@ -12544,7 +12545,8 @@ class PyExecutor:
                     "context_logits_handled", False)
                 for request in scheduled_batch.context_requests:
                     context_chunk_size = request.context_chunk_size
-                    prefix_sum += context_chunk_size if request.py_return_context_logits and not context_logits_handled else 1
+                    prefix_sum += context_logits_rows(
+                        request, context_logits_handled=context_logits_handled)
                     num_context_logits_prefix_sum.append(prefix_sum)
                     num_context_tokens += context_chunk_size
 
