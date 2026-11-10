@@ -15,7 +15,7 @@
 <polygon points="830,19.6 834,26.8 826,26.8" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
 <text x="839" y="28" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">TEP8</text>
 <text x="500" y="46" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#7a8399" text-anchor="middle">lines: envelope of each precision over the layouts; faded: points off the envelope</text>
-<text x="30" y="84" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">(a) Long-Sequence Reasoning · 8K in / 16K out</text>
+<text x="30" y="84" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">(a) 8K/16K Reasoning · 8K in / 16K out</text>
 <line x1="80" y1="100" x2="80" y2="364" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
 <text x="80" y="379" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">0</text>
 <line x1="135.7" y1="100" x2="135.7" y2="364" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>

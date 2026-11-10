@@ -54,10 +54,10 @@ In this blog, we introduce **NVFP4 MLA** in TensorRT LLM. It stores the MLA KV c
 The results, for DeepSeek-R1 on NVIDIA Rubin GPUs unless noted otherwise:
 
 - **Accuracy:** NVFP4 MLA **matches BF16 average accuracy** on DeepSeek-R1 and Kimi K3 across nine benchmarks covering reasoning, coding, instruction following, 128K-token long context and agentic tool use.
-- **Memory:** the cache takes **360 bytes per token and layer**, **3.20x smaller than BF16 and 1.60x smaller than FP8** on DeepSeek-R1, and 3.05x smaller than BF16 on Kimi K3.
-- **Attention kernel:** up to **1.70x faster** than FP8 MLA.
-- **Serving:** **2x the throughput per GPU at the same per-user generation rate** in the middle of the latency range of disaggregated serving with MTP, with each precision on its best generation layout, and 13% to 46% more throughput per GPU at the same high concurrency. FP8 MLA keeps the most interactive operating points.
-- **Agentic serving:** up to **3.5x lower p90 time to first token (TTFT)** in multi-turn agent replays, once FP8 starts evicting session histories.
+- **Memory:** the cache takes **360 bytes per token and layer**, **3.20x smaller than BF16 and 1.60x smaller than FP8** on DeepSeek-R1, and 3.05x and 1.52x smaller on Kimi K3.
+- **Attention kernel:** up to **1.61x faster** than FP8 MLA on DeepSeek-R1 and up to **2.74x faster** on Kimi K3.
+- **Serving:** up to **2.30x the throughput per GPU at the same per-user generation rate** in disaggregated DeepSeek-R1 serving with MTP, with each precision on its best generation layout, and 27% and 40% more on average over the measured rates of the two workloads.
+- **Agentic serving:** up to **3.5x lower p90 time to first token (TTFT)** on DeepSeek-R1 and 2.1x on Kimi K3 in multi-turn agent replays, once FP8 starts evicting session histories.
 
 NVFP4 MLA complements the [NVFP4 cold-page compression](blog30_KV_Cache_Compression_in_TensorRT-LLM.md#nvfp4-cold-page-compression) described in our previous blog. Cold-page compression keeps KV pages in NVFP4 only while they sit off the GPU, and attention still sees the model's normal KV format. NVFP4 MLA keeps the active cache on the GPU in NVFP4 and computes attention on it directly.
 
@@ -80,9 +80,9 @@ The same cached values are therefore consumed in two orientations, by two BMMs t
 
 Absorption trades bytes for math. For each cached token, one query position performs 278,528 FLOPs of BMM work in DeepSeek-R1 (2 × 128 heads × (576 + 512) channels), so FP8 MLA does 484 FLOPs per byte of cache. MTP raises this further. It scores several query positions, the next token and the draft tokens, against the same cache, and a kernel that reuses each cache read across all of them multiplies the arithmetic intensity. With MTP=3, four query positions share each read, and FP8 MLA does **1,934 FLOPs per byte**. That is more than twice the ridge point of a Rubin GPU, about 911 FLOPs per byte (17.5 PFLOP/s of dense FP8 compute over 19.2 TB/s of HBM bandwidth).
 
-Measurements confirm the analysis. At 30K tokens of context, the optimized FP8 MLA decode kernel reads its cache at 8.7 TB/s without MTP. With MTP=3, it reads at only 2.8 TB/s, 14% of peak bandwidth, while sustaining 5.3 PFLOP/s of BMM work: **with MTP, FP8 MLA decoding is limited by matrix throughput, not by memory bandwidth**.
+Measurements confirm the analysis. At 30K tokens of context, the optimized FP8 MLA decode kernel reads its cache at 10.4 TB/s without MTP. With MTP=3, it reads at only 2.7 TB/s, 14% of peak bandwidth, while sustaining 5.3 PFLOP/s of BMM work: **with MTP, FP8 MLA decoding is limited by matrix throughput, not by memory bandwidth**.
 
-This bounds any storage-only approach. An NVFP4 cache that is dequantized to FP8 before attention runs the same FP8 matrix multiplications and the same softmax as FP8 MLA, adds the dequantization, and only shortens memory reads that are not the bottleneck. On this workload (batch 26, MTP=3, 30K context), it therefore cannot beat the 163 µs of FP8 MLA. NVFP4 MLA completes the same work in **97 µs**, because its FP4 BMMs shorten the computation itself. Storage and compute have to move to 4 bits together.
+This bounds any storage-only approach. An NVFP4 cache that is dequantized to FP8 before attention runs the same FP8 matrix multiplications and the same softmax as FP8 MLA, adds the dequantization, and only shortens memory reads that are not the bottleneck. On this workload (batch 26, MTP=3, 30K context), it therefore cannot beat the 165 µs of FP8 MLA. NVFP4 MLA completes the same work in **107 µs**, because its FP4 BMMs shorten the computation itself. Storage and compute have to move to 4 bits together.
 
 ### NVFP4 in Brief
 
@@ -120,7 +120,7 @@ NVFP4 MLA therefore keeps one NVFP4 component for NoPE and adds a second FP4 com
 
 $$\widehat E_R = \mathcal Q_{1\times16}\left(C_R - \widehat C_R\right)$$
 
-where $C_R$ is the RoPE part of the cache, $\widehat C_R$ its NVFP4 base, and $\mathcal Q_{1\times16}$ NVFP4 quantization in 1×16 blocks. The residual uses the same blocks as the RoPE base, with its own scales. Compensating these 64 of the 576 channels lowers the mean reconstruction error (normalized mean squared error, NMSE) of the whole cache by **44.4%** on DeepSeek-R1 and **72.2%** on Kimi K3, with NoPE unchanged. On the RoPE channels themselves, the error drops by 66.8x and 70.4x, to 3.3x and 4.0x below that of keeping RoPE in FP8.
+where $C_R$ is the RoPE part of the cache, $\widehat C_R$ its NVFP4 base, and $\mathcal Q_{1\times16}$ NVFP4 quantization in 1×16 blocks. The residual uses the same blocks as the RoPE base, with its own scales. Compensating these 64 of the 576 channels lowers the mean reconstruction error (normalized mean squared error, NMSE) of the whole cache by **32.6%** on DeepSeek-R1 and **66.1%** on Kimi K3, with NoPE unchanged. On the RoPE channels themselves, the error drops by 115x and 116x on average. Keeping RoPE in FP8 instead would leave 9.5x and 9.1x as much error as the residual on average, and at least 7.9x as much in every layer.
 
 <div align="center">
 <figure>
@@ -187,7 +187,7 @@ A fast kernel is only part of the work. The FP4 cache also has to be written dur
 
 The cache is paged in blocks of 128 tokens, a page size that TensorRT LLM selects automatically for NVFP4 MLA. During prefill, context attention runs the existing FP8 MLA context kernel on an FP8 scratch cache, and a quantize-and-scatter kernel writes the completed 16-token blocks of the prompt into the paged NVFP4 cache. FP4 attention compute is used for decode, where cache reads and BMM work grow with every generated token.
 
-A 16×16 block can be quantized only once all 16 of its tokens exist, but decode adds one token per step. Each request therefore owns a slot in a **16-token BF16 tail**, a ring buffer that keeps the newest tokens at full precision. At each decode step, a fused pre-attention kernel applies RoPE, appends the new token to the tail, quantizes the queries, refreshes the active FP4 block from the BF16 values and writes the cache. Once a block has all 16 tokens, it is frozen. Every FP4 block is therefore quantized from BF16 values and never from FP4 values, and error cannot accumulate through repeated requantization. At 4K tokens of context and a batch of 128, this fused pre-attention kernel is 1.74x faster than the pre-attention work of FP8 MLA (see [Generation Step](#generation-step)).
+A 16×16 block can be quantized only once all 16 of its tokens exist, but decode adds one token per step. Each request therefore owns a slot in a **16-token BF16 tail**, a ring buffer that keeps the newest tokens at full precision. At each decode step, a fused pre-attention kernel applies RoPE, appends the new token to the tail, quantizes the queries, refreshes the active FP4 block from the BF16 values and writes the cache. Once a block has all 16 tokens, it is frozen. Every FP4 block is therefore quantized from BF16 values and never from FP4 values, and error cannot accumulate through repeated requantization. At 4K tokens of context and a batch of 128, this fused pre-attention kernel is 1.76x faster than the pre-attention work of FP8 MLA (see [Generation Step](#generation-step)).
 
 ### Speculative Decoding with MTP
 
@@ -197,15 +197,13 @@ MTP writes draft tokens into the cache before they are verified. Before these sp
 
 In disaggregated serving, context and generation run on separate workers, and the cache of every prompt crosses the network once. NVFP4 MLA transfers only the canonical state: the packed values, the BMM1-order block scales and the BF16 tail. For DeepSeek-R1, that is **360 bytes per token and layer instead of 576 bytes with FP8, 37.5% fewer bytes**. The BMM2-facing layout is derived from the canonical state, so the generation worker rebuilds it from the imported pages before the first decode step of the request; in a micro-benchmark, the batched rebuild costs about 0.15 ms of host time per request for all 62 cache layers. NVFP4 MLA moves its cache with the NIXL backend and the Python transceiver runtime.
 
-Context workers do not decode, so they keep only the canonical cache. As a result, a context worker holds about 1.6x as many tokens as with FP8 in the same memory, which matters for the [agentic workloads](#agentic-multi-turn-serving) below.
-
-<!-- TODO(before publishing): describe how a context-only cache is enabled once the context-only and block-reuse PRs are merged (#20888 and the dense FP4 MLA block-reuse PR), and add their links. With MTP, the context worker also runs draft steps on the MTP layer, which keeps its decode-time views. -->
+Context workers do not decode, so they keep only the canonical cache and omit the decode-time view of the generation workers. TensorRT LLM does this automatically on the context servers of a disaggregated deployment, whose role `trtllm-serve` takes from `--server_role CONTEXT` or from the server type of a disaggregated MPI launch. As a result, a context worker holds about 1.6x as many tokens as with FP8 in the same memory, which matters for the [agentic workloads](#agentic-multi-turn-serving) below.
 
 ### Prefix Reuse and Chunked Prefill
 
 Agentic and multi-turn workloads resend a growing history with every turn. Serving them efficiently depends on finding that history in the cache instead of prefilling it again. NVFP4 MLA supports KV cache block reuse and chunked prefill, together or separately. When a request finds cached blocks, context attention gathers the cached FP4 prefix into the operands of the FP8 context kernel and merges the attention over the prefix with the attention over the new tokens; the later chunks of a chunked prefill take the same path. Reuse works on whole 128-token blocks, and chunk boundaries align with the 16-token quantization tiles. Because the prefix is read back from the NVFP4 cache, context attention sees the same values that decode sees.
 
-<!-- TODO(before publishing): align this section with the merged block-reuse implementation. -->
+<!-- TODO(before publishing): block reuse for DeepSeek-V3 and DeepSeek-R1 lands with #21313; publish this section after it merges. -->
 
 ## How to Use
 
@@ -235,7 +233,7 @@ llm = LLM(
 )
 ```
 
-Run generation workers with attention data parallelism (`enable_attention_dp=True`), as in this example. With attention tensor parallelism, FP8 MLA is faster; see [Limitations and Future Work](#limitations-and-future-work).
+Run generation workers with attention data parallelism (`enable_attention_dp=True`), as in this example. NVFP4 MLA is designed for generation workers that decode all 128 heads of their requests; see [Limitations and Future Work](#limitations-and-future-work).
 
 TensorRT LLM then does the following automatically:
 
@@ -252,8 +250,6 @@ cache_transceiver_config:
 ```
 
 NVFP4 MLA supports DeepSeek-V3 and DeepSeek-R1 models and Kimi K3. For Kimi K3, NVFP4 is used in 22 of its 24 MLA layers, and the last two MLA layers keep an FP8 cache.
-
-<!-- TODO(before publishing): Kimi K3 support depends on #20888; on main today, `supports_fp4_mla_attention` excludes hybrid linear-attention models. -->
 
 Two environment variables control the kernels:
 
@@ -276,15 +272,17 @@ We recommend setting `TRTLLM_FP4_MLA_ATTENTION_BACKEND=cutedsl` in production de
 
 All configurations keep the weight format of the checkpoint.
 
-**Performance.** All performance results are for DeepSeek-R1 with MTP=3 on NVIDIA Rubin GPUs, served by TensorRT LLM. FP8 MLA and NVFP4 MLA share the same KV cache manager, NIXL transfer, runtime settings and parallel layout. They differ only in the cache and attention precision and in the page size: 128 tokens for NVFP4 MLA, and 32 tokens for FP8 MLA, whose decode kernel on this GPU does not support 128-token pages. The serving workloads use natural-text prompts, so that MTP acceptance reflects real text. In the table, DEP *n* denotes attention data parallelism with expert parallelism over *n* GPUs, and TEP *n* attention tensor parallelism with expert parallelism over *n* GPUs.
+**Performance.** All performance results are on NVIDIA Rubin GPUs, for DeepSeek-R1 with MTP=3 unless the table says otherwise, served by TensorRT LLM. FP8 MLA and NVFP4 MLA share the same KV cache manager, NIXL transfer, runtime settings and parallel layout. They differ only in the cache and attention precision and in the page size: 128 tokens for NVFP4 MLA, and 32 tokens for FP8 MLA, whose decode kernel on this GPU does not support 128-token pages. The serving workloads use natural-text prompts, so that MTP acceptance reflects real text. In the table, DEP *n* denotes attention data parallelism with expert parallelism over *n* GPUs, and TEP *n* attention tensor parallelism with expert parallelism over *n* GPUs.
 
 | Workload | Description | Layout |
 |---|---|---|
 | MLPerf | All 4,388 DeepSeek-R1 MLPerf evaluation prompts in a fixed random order. Inputs average 804 tokens. Outputs end naturally, average about 3.8K tokens and are capped at 20K tokens. Decode contexts average about 5K tokens. | One context worker (DEP2) and one generation worker with DEP16, DEP8 or TEP8, 18 or 10 GPUs |
-| Long-Sequence Reasoning | Problems from the same set packed into prompts of about 8K tokens, with about 16K output tokens per request. Decode contexts average about 16K tokens. | Two context workers (DEP2 each) and one generation worker with DEP16, DEP8 or TEP8, 20 or 12 GPUs |
-| AgentX | 123 recorded Claude Code sessions from the SemiAnalysis InferenceX AgentX benchmark that fit a 160K-token context, replayed with their recorded think times. Each operating point keeps a fixed number of sessions alive for 15 minutes. The context worker uses prefix reuse, chunked prefill and session affinity, with a KV cache budget of 43 or 12 GiB per GPU plus 8 GiB of host memory. | One context worker (DEP2) and one generation worker (DEP4) |
+| 8K/16K Reasoning | Problems from the same set packed into prompts of about 8K tokens, with about 16K output tokens per request. Decode contexts average about 16K tokens. | Two context workers (DEP2 each) and one generation worker with DEP16, DEP8 or TEP8, 20 or 12 GPUs |
+| AgentX, DeepSeek-R1 | 123 recorded Claude Code sessions from the SemiAnalysis InferenceX AgentX benchmark that fit a 160K-token context, replayed with their recorded think times. Each operating point keeps a fixed number of sessions alive for 15 minutes. The context worker uses prefix reuse, chunked prefill and session affinity, with a KV cache budget of 43 or 12 GiB per GPU plus 8 GiB of host memory. | One context worker (DEP2) and one generation worker (DEP4) |
+| AgentX, Kimi K3 | The same sessions, 128 of them kept alive for 30 minutes. Context serving only, with 47.4 GiB of KV cache memory per GPU, 41% of it for the state of the Kimi Delta Attention (KDA) layers, and no host cache. A cached prefix is reusable only if both its MLA cache and its KDA state remain. | 16 GPUs with [Distributed Weight Data Parallelism](blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.md) (DWDP16) |
 | Generation step | Aggregated server on one node. Each wave of 4*B* requests, with a per-GPU batch of *B* and *L* random input tokens per request, generates 1,024 tokens per request. We report the median device time of decode-only steps at the full batch. | DEP4 |
-| Attention kernel | One decode call of one MLA layer with 128 heads, captured in a CUDA Graph and timed with CUDA events. NVFP4 MLA times include its helper kernels; FP8 MLA times use the FP8 MLA kernel of the generation workers. Neither includes the pre-attention kernel. | One GPU |
+| Attention kernel, DeepSeek-R1 | One decode call of one MLA layer with 128 heads, on inputs captured from DeepSeek-R1 serving at seven layers. Each call is replayed in a CUDA Graph after a low-power spin kernel, as in serving, and we report the median of 1,000 calls. NVFP4 MLA times include its helper kernels; FP8 MLA times use the FP8 MLA kernel of the generation workers. Neither includes the pre-attention kernel. | One GPU |
+| Attention kernel, Kimi K3 | One decode call of one MLA layer with 96 heads at 13 per-GPU shapes. Under [Helix](https://arxiv.org/abs/2507.07120) context parallelism over 16 GPUs, each request holds 14,208 cached tokens per GPU and 8 query positions (MTP=7); under DEP, requests hold 4 to 8 query positions and 8K to 530K cached tokens. The L2 cache is flushed before each call. | One GPU |
 
 ### Accuracy
 
@@ -312,7 +310,7 @@ Kimi K3:
 
 ### KV Cache Footprint
 
-NVFP4 MLA reduces the canonical MLA cache to 20.5 GiB per million tokens on DeepSeek-R1 and 8.4 GiB on Kimi K3, **3.20x and 3.05x smaller than BF16**. On DeepSeek-R1, it is also 1.60x smaller than an FP8 cache.
+NVFP4 MLA reduces the canonical MLA cache to 20.5 GiB per million tokens on DeepSeek-R1 and 8.4 GiB on Kimi K3, **3.20x and 3.05x smaller than BF16** and 1.60x and 1.52x smaller than an FP8 cache. The RoPE residual accounts for 10% of each NVFP4 layer's cache.
 
 | Cache | DeepSeek-R1, GiB per 1M tokens | Reduction vs. BF16 | Kimi K3, GiB per 1M tokens | Reduction vs. BF16 |
 |---|---|---|---|---|
@@ -322,28 +320,44 @@ NVFP4 MLA reduces the canonical MLA cache to 20.5 GiB per million tokens on Deep
 
 <p align="center"><sub><em>The counts cover the MLA layers of the target model and include the RoPE residual and the physical BMM1 scale layout. DeepSeek-R1 uses NVFP4 in all 61 MLA layers. Kimi K3 has 24 MLA layers among its 93 layers, with NVFP4 in 22 and FP8 in the last two, and the counts exclude the recurrent state of its 69 Kimi Delta Attention layers. Update buffers, allocation padding and the decode-time view of generation workers are not included.</em></sub></p>
 
+On Kimi K3, the MLA cache shares the KV cache budget with the recurrent state of the KDA layers. Under the same budget, NVFP4 MLA holds 47% to 49% more cached tokens than FP8 MLA, depending on the share that the KDA state takes.
+
 ### Attention Kernel
 
 We first compare the two kernels on the largest batch that fits in one wave: batch 106 with one query per sequence (MTP=0) and batch 26 with four queries per sequence (MTP=3). Both workloads perform nearly the same BMM work, 106 and 104 query positions over the same context, but with MTP=3 each cache read serves four query positions.
 
 | Speedup over FP8 MLA | 4K context | 30K context |
 |---|---|---|
-| MTP=0, batch 106 | 1.09x | 1.10x |
-| MTP=3, batch 26 | 1.36x | **1.68x** |
+| MTP=0, batch 106 | 1.19x | 1.14x |
+| MTP=3, batch 26 | 1.35x | **1.53x** |
 
-With MTP=3, where FP8 MLA is compute-bound, NVFP4 MLA is **1.36x faster at 4K and 1.68x faster at 30K tokens of context**. The next table extends the MTP=3 comparison to the per-GPU batches of a generation worker, from 8 to 1,024 requests, and to KV lengths from 2K to 32K tokens:
+With MTP=3, where FP8 MLA is compute-bound, NVFP4 MLA is **1.35x faster at 4K and 1.53x faster at 30K tokens of context**, compared with 1.19x and 1.14x without MTP. The next table extends the MTP=3 comparison to the per-GPU batches of a generation worker, from 8 to 1,024 requests, and to KV lengths from 2K to 32K tokens:
 
 | KV length | B = 8 | B = 32 | B = 128 | B = 256 | B = 512 | B = 1,024 |
 |---|---|---|---|---|---|---|
-| 2K | 1.05x | 1.09x | 1.13x | 1.11x | 1.12x | 1.12x |
-| 4K | 1.02x | 1.37x | 1.29x | 1.26x | 1.26x | 1.24x |
-| 8K | 1.05x | 1.52x | 1.35x | 1.33x | 1.33x | – |
-| 16K | 1.23x | 1.63x | 1.37x | 1.34x | – | – |
-| 32K | 1.39x | **1.70x** | 1.35x | – | – | – |
+| 2K | 1.15x | 1.26x | 1.13x | 1.12x | 1.14x | 1.13x |
+| 4K | 1.15x | 1.39x | 1.29x | 1.30x | 1.32x | 1.33x |
+| 8K | 1.17x | 1.50x | 1.45x | 1.46x | 1.48x | – |
+| 16K | 1.25x | 1.58x | 1.54x | 1.56x | – | – |
+| 32K | 1.34x | **1.61x** | 1.60x | – | – | – |
 
-<p align="center"><sub><em>Speedup of one NVFP4 MLA decode call over FP8 MLA, with 128 heads and MTP=3. Each entry is the mean over CUDA Graph replays, as the median over the four GPUs of one node. Shapes whose cached tokens exceed the KV cache capacity of a generation GPU, about 5.6M tokens, are omitted.</em></sub></p>
+<p align="center"><sub><em>Speedup of one NVFP4 MLA decode call over FP8 MLA, with 128 heads and MTP=3, on inputs captured from DeepSeek-R1 serving; each entry compares medians of 1,000 calls. Shapes whose cached tokens exceed the KV cache capacity of a generation GPU, about 5.6M tokens, are omitted.</em></sub></p>
 
-For every batch size, the speedup grows with the context, from 1.05x to 1.13x at 2K tokens to between 1.24x and 1.70x at the longest context measured. It peaks at **1.70x at 32K tokens with a batch of 32**, where one call takes 200 µs instead of 339 µs. Longer contexts also raise the weight of attention in the whole step: at a batch of 128, one FP8 attention call grows from 123 µs at 4K to 431 µs at 16K, so the 62 attention calls of a generation step take about 27 ms at 16K, more than the 21.5 ms that the rest of the step takes at 4K (see the next section).
+NVFP4 MLA is faster at every shape, by 1.12x to 1.61x, with a geometric mean of 1.33x over the 24 shapes. For every batch size, the speedup at the longest context measured exceeds the one at 2K tokens: it rises from between 1.12x and 1.26x at 2K to between 1.33x and 1.61x. It peaks at **1.61x at 32K tokens with a batch of 32**, where one call takes 219 µs instead of 351 µs. Longer contexts also raise the weight of attention in the whole step: at a batch of 128, one FP8 attention call takes 3.5x as long at 16K as at 4K, 446 µs instead of 129 µs, so attention would take more than half of the generation step at 16K if the rest of the step stayed as at 4K (see the next section).
+
+**Kimi K3.** Kimi K3 decodes with up to eight query positions per request (MTP=7). Across its 13 per-GPU shapes under Helix and DEP, NVFP4 MLA is 1.05x to 2.74x faster than FP8 MLA, with a geometric mean of 1.75x. Seven of the shapes:
+
+| Parallelism | Batch | Query positions per request | KV length | NVFP4 MLA (µs) | FP8 MLA (µs) | Speedup |
+|---|---|---|---|---|---|---|
+| Helix | 1 | 8 | 14,208 | 24.2 | 25.3 | 1.05x |
+| Helix | 4 | 8 | 14,208 | 30.6 | 55.3 | 1.81x |
+| Helix | 16 | 8 | 14,208 | 59.4 | 142.6 | 2.40x |
+| DEP | 16 | 4 | 8,192 | 34.7 | 51.3 | 1.48x |
+| DEP | 16 | 8 | 32,768 | 92.3 | 252.9 | **2.74x** |
+| DEP | 8 | 6 | 180,607 | 204.7 | 376.9 | 1.84x |
+| DEP | 16 | 4 | 30K to 530K | 192.2 | 381.8 | 1.99x |
+
+<p align="center"><sub><em>Latency of one Kimi K3 MLA decode call on one Rubin GPU, with 96 heads and the cache read from HBM. Both kernels include their split reduction and exclude the pre-attention kernel. The last row mixes KV lengths from 30K to 530K tokens.</em></sub></p>
 
 ### Generation Step
 
@@ -351,35 +365,35 @@ The next table breaks down a DeepSeek-R1 generation step at 4K input tokens and 
 
 | Component | NVFP4 MLA | FP8 MLA | Speedup |
 |---|---|---|---|
-| Fused pre-attention kernel | 0.037 | 0.064 | 1.74x |
-| Core attention | 0.210 | 0.272 | 1.29x |
-| Rest of the step | 0.661 | 0.664 | 1.01x |
-| **Full step** | **0.907** | **1.000** | **1.10x** |
+| Fused pre-attention kernel | 0.037 | 0.065 | 1.76x |
+| Core attention | 0.213 | 0.273 | 1.28x |
+| Rest of the step | 0.662 | 0.662 | 1.00x |
+| **Full step** | **0.911** | **1.000** | **1.10x** |
 
-<p align="center"><sub><em>Generation step on four GPUs with DEP and MTP=3, in units of the FP8 MLA step (32.41 ms; NVFP4 MLA takes 29.41 ms). Full steps are median device times from an unprofiled run. The components come from a one-GPU Nsight Systems trace of 20 decode steps, counting overlaps once; the rest of the step is the remainder. Core attention includes the attention kernels, their helpers and the online quantization of the softmax weights; the rest of the step includes the mixture-of-experts (MoE) layers, projections, communication and sampling.</em></sub></p>
+<p align="center"><sub><em>Generation step on four GPUs with DEP and MTP=3, in units of the FP8 MLA step (32.16 ms; NVFP4 MLA takes 29.31 ms). Full steps are median device times from an unprofiled run. The components come from a one-GPU Nsight Systems trace, counting overlaps once; the rest of the step is the remainder. Core attention includes the attention kernels, their helpers and the online quantization of the softmax weights; the rest of the step includes the mixture-of-experts (MoE) layers, projections, communication and sampling.</em></sub></p>
 
-Core attention and the fused pre-attention kernel are 1.29x and 1.74x faster. Together, they account for about a third of the FP8 step and make the whole step 1.10x faster at 4K input tokens. The rest of the step runs the same kernels in both precisions and agrees within 1%, so the step speedup grows with the share of attention in the step, and that share rises with the context length.
+Core attention and the fused pre-attention kernel are 1.28x and 1.76x faster. Together, they account for about a third of the FP8 step and make the whole step 1.10x faster at 4K input tokens. The rest of the step runs the same kernels in both precisions and takes the same time, so the step speedup grows with the share of attention in the step, and that share rises with the context length.
 
 ### Disaggregated Serving Throughput
 
-We measure the throughput-latency trade-off of disaggregated DeepSeek-R1 serving on the MLPerf and Long-Sequence Reasoning workloads with each of the three generation layouts in the setup. Closed-loop clients sweep the number of requests in flight: from 16 to 2,048 with DEP16 and from 8 to 1,024 with DEP8, 1 to 128 per generation GPU, and with TEP8 from 4 to 256 on MLPerf and from 4 to 128 on Long-Sequence Reasoning. Each client slot issues at least twelve MLPerf requests or three Long-Sequence Reasoning requests in sequence, and we discard the first and last wave of each client to keep only the steady state. For a request with $o$ output tokens, time to first token $t$ and end-to-end latency $e$, the per-user generation rate is the median of $(o-1)/(e-t)$ over requests, and the throughput per GPU counts the output tokens of all requests over all context and generation GPUs. We interpolate each layout's sweep linearly between the measured loads, and a precision's envelope takes the highest throughput that any of its layouts reaches at a given per-user rate or above. Comparing the envelopes gives each precision its best layout at every rate.
+We measure the throughput-latency trade-off of disaggregated DeepSeek-R1 serving on the MLPerf and 8K/16K Reasoning workloads with each of the three generation layouts in the setup. Closed-loop clients sweep the number of requests in flight: from 16 to 2,048 with DEP16 and from 8 to 1,024 with DEP8, 1 to 128 per generation GPU, and with TEP8 from 4 to 256 on MLPerf and from 4 to 128 on 8K/16K Reasoning. Each client slot issues at least twelve MLPerf requests or three 8K/16K Reasoning requests in sequence, and we discard the first and last wave of each client to keep only the steady state. For a request with $o$ output tokens, time to first token $t$ and end-to-end latency $e$, the per-user generation rate is the median of $(o-1)/(e-t)$ over requests, and the throughput per GPU counts the output tokens of all requests over all context and generation GPUs. We interpolate each layout's sweep linearly between the measured loads, and a precision's envelope takes the highest throughput that any of its layouts reaches at a given per-user rate or above. Comparing the envelopes gives each precision its best layout at every rate.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog31_pareto.svg" width="1000">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 5: Measured throughput and per-user generation rate of disaggregated DeepSeek-R1 serving with MTP=3 on Rubin GPUs, for (a) Long-Sequence Reasoning with about 8K input and 16K output tokens per request and (b) the MLPerf DeepSeek-R1 dataset. Marker shapes give the generation layout, lines give each precision's envelope over the layouts, and faded points lie below the envelope of their precision. Throughput counts all context and generation GPUs.</em></sub></p>
+<p align="center"><sub><em>Figure 5: Measured throughput and per-user generation rate of disaggregated DeepSeek-R1 serving with MTP=3 on Rubin GPUs, for (a) 8K/16K Reasoning with about 8K input and 16K output tokens per request and (b) the MLPerf DeepSeek-R1 dataset. Marker shapes give the generation layout, lines give each precision's envelope over the layouts, and faded points lie below the envelope of their precision. Throughput counts all context and generation GPUs.</em></sub></p>
 
-With each precision on its best layout, NVFP4 MLA serves about twice the throughput per GPU at the same per-user rate in the middle of the range (Figure 5). On MLPerf, NVFP4 MLA with 1,024 requests in flight and FP8 MLA with 512 both generate 143 tokens/s/user, and NVFP4 MLA delivers 8,200 instead of 4,107 tokens/s/GPU. On Long-Sequence Reasoning, the same two loads both generate 109 tokens/s/user, at 5,762 and 2,886 tokens/s/GPU. Neither DEP8 nor TEP8 reaches these rates at a higher throughput with FP8 MLA. The envelopes are furthest apart at 162 tokens/s/user on MLPerf and 139 tokens/s/user on Long-Sequence Reasoning, where NVFP4 MLA delivers 2.30x and 2.25x the throughput of FP8 MLA. Averaged uniformly over the shared rate ranges, 86 to 302 tokens/s/user on MLPerf and 70 to 293 tokens/s/user on Long-Sequence Reasoning, the envelope gains are 27% and 40%.
+With each precision on its best layout, NVFP4 MLA serves about twice the throughput per GPU at the same per-user rate in the middle of the range (Figure 5). On MLPerf, NVFP4 MLA with 1,024 requests in flight and FP8 MLA with 512 both generate 143 tokens/s/user, and NVFP4 MLA delivers 8,200 instead of 4,107 tokens/s/GPU. On 8K/16K Reasoning, the same two loads both generate 109 tokens/s/user, at 5,762 and 2,886 tokens/s/GPU. Neither DEP8 nor TEP8 reaches these rates at a higher throughput with FP8 MLA. The envelopes are furthest apart at 162 tokens/s/user on MLPerf and 139 tokens/s/user on 8K/16K Reasoning, where NVFP4 MLA delivers 2.30x and 2.25x the throughput of FP8 MLA. Averaged uniformly over the shared rate ranges, 86 to 302 tokens/s/user on MLPerf and 70 to 293 tokens/s/user on 8K/16K Reasoning, the envelope gains are 27% and 40%.
 
-The gap comes from a decode step that grows more slowly with load. As the load rises from 5-8 to 9-16 requests per generation GPU with DEP16, the median FP8 MLA decode step grows from 13.1 to 16.9 ms on MLPerf and from 14.1 to 19.3 ms on Long-Sequence Reasoning, while the NVFP4 MLA step grows only from 13.0 to 14.7 ms and from 13.5 to 16.0 ms, so NVFP4 MLA sustains about twice the load at the same per-user rate. With at most eight requests per generation GPU, attention is a small part of the step, and the two precisions deliver the same throughput within about 5% at the same concurrency with DEP16 and DEP8.
+The gap comes from a decode step that grows more slowly with load. As the load rises from 5-8 to 9-16 requests per generation GPU with DEP16, the median FP8 MLA decode step grows from 13.1 to 16.9 ms on MLPerf and from 14.1 to 19.3 ms on 8K/16K Reasoning, while the NVFP4 MLA step grows only from 13.0 to 14.7 ms and from 13.5 to 16.0 ms, so NVFP4 MLA sustains about twice the load at the same per-user rate. With at most eight requests per generation GPU, attention is a small part of the step, and the two precisions deliver the same throughput within about 5% at the same concurrency with DEP16 and DEP8.
 
-DEP16 gives both precisions their highest throughput up to about 250 tokens/s/user. DEP8 never does, largely because its context workers take a larger share of the GPUs. TEP8 reaches higher per-user rates, and there FP8 MLA leads: at the same load with TEP8, NVFP4 MLA delivers 5% to 25% less throughput than FP8 MLA, and above about 214 tokens/s/user on MLPerf and 237 tokens/s/user on Long-Sequence Reasoning, the NVFP4 MLA envelope lies up to 28% below that of FP8 MLA. With attention tensor parallelism, each GPU decodes 16 of the 128 heads, which the NVFP4 MLA decode kernel of the measured build pads to 128.
+DEP16 gives both precisions their highest throughput up to about 250 tokens/s/user, and TEP8 at higher per-user rates. DEP8 never does, largely because its context workers take a larger share of the GPUs. At the highest per-user rates, which only TEP8 reaches, the FP8 MLA envelope lies above that of NVFP4 MLA in these measurements; see [Limitations and Future Work](#limitations-and-future-work).
 
-<!-- TODO(before publishing): re-measure TEP8 on main. With packed decode (#20576), the kernel pads the 64 [query token, head] rows of each request to 128 instead of padding the 16 heads of every query token to 128. -->
+<!-- TODO(before publishing): re-measure TEP8 on main. These TEP8 runs predate packed decode (#20576), with which the kernel pads the 64 [query token, head] rows of each request to 128 instead of padding the 16 heads of every query token to 128. -->
 
-At the same number of requests in flight, from 256 to 2,048 with DEP16, NVFP4 MLA raises both throughput and per-user generation rate. Throughput per GPU rises by 13.2% to 19.7% on MLPerf and by 20.3% to 45.8% on Long-Sequence Reasoning, and DEP8 shows the same pattern from 16 requests per generation GPU, with gains of 11% to 19% and 18% to 46%. With DEP16, both precisions accept 2.75 to 2.83 tokens per MTP step on Long-Sequence Reasoning, so the gains come from shorter decode steps, not from different MTP acceptance.
+At the same number of requests in flight, from 256 to 2,048 with DEP16, NVFP4 MLA raises both throughput and per-user generation rate. Throughput per GPU rises by 13.2% to 19.7% on MLPerf and by 20.3% to 45.8% on 8K/16K Reasoning, and DEP8 shows the same pattern from 16 requests per generation GPU, with gains of 11% to 19% and 18% to 46%. With DEP16, both precisions accept 2.75 to 2.83 tokens per MTP step on 8K/16K Reasoning, so the gains come from shorter decode steps, not from different MTP acceptance.
 
 | Workload | KV cache | In flight | tok/s/user | tok/s/GPU | Gain | TPOT p50 / p99 (ms) | MTP acceptance |
 |---|---|---|---|---|---|---|---|
@@ -387,12 +401,12 @@ At the same number of requests in flight, from 256 to 2,048 with DEP16, NVFP4 ML
 | | **NVFP4 MLA** | 256 | 185 | 2,647 | **+13.2%** | 5.41 / 6.55 | |
 | | FP8 MLA | 1,024 | 119 | 6,852 | | 8.38 / 10.15 | |
 | | **NVFP4 MLA** | 1,024 | 143 | 8,200 | **+19.7%** | 6.99 / 8.27 | |
-| Long-Sequence Reasoning | FP8 MLA | 256 | 139 | 1,819 | | 7.17 / 8.34 | 2.77 |
+| 8K/16K Reasoning | FP8 MLA | 256 | 139 | 1,819 | | 7.17 / 8.34 | 2.77 |
 | | **NVFP4 MLA** | 256 | 167 | 2,188 | **+20.3%** | 6.00 / 6.39 | 2.80 |
 | | FP8 MLA | 1,024 | 84 | 4,382 | | 11.94 / 13.72 | 2.75 |
 | | **NVFP4 MLA** | 1,024 | 109 | 5,762 | **+31.5%** | 9.13 / 9.91 | 2.79 |
 
-<p align="center"><sub><em>Disaggregated DeepSeek-R1 serving with MTP=3 and the DEP16 generation layout at the same number of requests in flight, over steady-state requests. Throughput counts all context and generation GPUs, and the gain is the throughput gain per GPU of NVFP4 MLA over FP8 MLA. TPOT is the time per output token. MTP acceptance is the mean number of tokens accepted per MTP step, recorded for Long-Sequence Reasoning.</em></sub></p>
+<p align="center"><sub><em>Disaggregated DeepSeek-R1 serving with MTP=3 and the DEP16 generation layout at the same number of requests in flight, over steady-state requests. Throughput counts all context and generation GPUs, and the gain is the throughput gain per GPU of NVFP4 MLA over FP8 MLA. TPOT is the time per output token. MTP acceptance is the mean number of tokens accepted per MTP step, recorded for 8K/16K Reasoning.</em></sub></p>
 
 ### Agentic Multi-Turn Serving
 
@@ -400,30 +414,35 @@ Agentic sessions add a capacity benefit. Context workers keep the KV cache of ea
 
 NVFP4 MLA delays cache eviction as the number of concurrent sessions grows. While both caches retain the session histories, both serve 93% to 95% of the prompt tokens from the cache and keep the p90 TTFT at 2 to 3 seconds. Once FP8 starts evicting histories, the larger effective cache of NVFP4 MLA sustains higher hit rates, so fewer prompt tokens have to be prefilled again. With 43 GiB and 48 sessions, the hit rate rises from 77.0% to 87.1%, and the p90 TTFT falls from 108 to 30.9 seconds. With 12 GiB, the transition starts at 12 sessions, where the p90 TTFT falls from 5.44 to 2.23 seconds. Across all measured points after FP8 starts evicting, NVFP4 MLA lowers the p90 TTFT by **1.5x to 3.5x**.
 
-| KV cache per context GPU | Sessions | p90 TTFT, FP8 MLA (s) | p90 TTFT, NVFP4 MLA (s) | Cache hit, FP8 MLA | Cache hit, NVFP4 MLA |
-|---|---|---|---|---|---|
-| 43 GiB | 16 | 2.98 | 1.99 | 95.2% | 95.1% |
-| | 24 | 2.68 | 2.41 | 93.6% | 94.4% |
-| | 32 | 11.9 | 5.36 | 87.6% | 92.4% |
-| | 40 | 36.6 | 23.7 | 82.3% | 87.9% |
-| | 48 | 108 | **30.9** | 77.0% | 87.1% |
-| | 64 | 178 | 79.8 | 54.1% | 79.6% |
-| 12 GiB | 12 | 5.44 | **2.23** | 89.9% | 94.8% |
-| | 16 | 7.73 | 4.23 | 87.5% | 91.3% |
-| | 20 | 12.8 | 5.62 | 81.6% | 88.7% |
-| | 24 | 32.5 | 13.0 | 73.1% | 85.5% |
+Kimi K3 shows the same effect. Its context servers hold 47.4 GiB of KV cache memory per GPU, shared with the KDA state, in which NVFP4 MLA keeps 47% to 49% more cached tokens than FP8 MLA. With 128 sessions, FP8 MLA already evicts histories: NVFP4 MLA raises the cache hit rate from 90.8% to 94.4%, close to the 95.4% that the trace allows, and lowers the p90 TTFT from 11.0 to 5.24 seconds, **a 2.1x reduction**.
 
-<p align="center"><sub><em>DeepSeek-R1 AgentX multi-turn replay with MTP=3 and prefix reuse. The KV cache budget per context GPU is the same for both precisions, and each context GPU also has 8 GiB of host memory. Sessions is the number of agent sessions kept alive. The cache hit rate is the server-reported share of prompt tokens served from the prefix cache, which the traces cap at about 94% to 96%.</em></sub></p>
+| Model | KV cache per context GPU | Sessions | p90 TTFT, FP8 MLA (s) | p90 TTFT, NVFP4 MLA (s) | Cache hit, FP8 MLA | Cache hit, NVFP4 MLA |
+|---|---|---|---|---|---|---|
+| DeepSeek-R1 | 43 GiB | 16 | 2.98 | 1.99 | 95.2% | 95.1% |
+| | | 24 | 2.68 | 2.41 | 93.6% | 94.4% |
+| | | 32 | 11.9 | 5.36 | 87.6% | 92.4% |
+| | | 40 | 36.6 | 23.7 | 82.3% | 87.9% |
+| | | 48 | 108 | **30.9** | 77.0% | 87.1% |
+| | | 64 | 178 | 79.8 | 54.1% | 79.6% |
+| | 12 GiB | 12 | 5.44 | **2.23** | 89.9% | 94.8% |
+| | | 16 | 7.73 | 4.23 | 87.5% | 91.3% |
+| | | 20 | 12.8 | 5.62 | 81.6% | 88.7% |
+| | | 24 | 32.5 | 13.0 | 73.1% | 85.5% |
+| Kimi K3 | 47.4 GiB | 128 | 11.0 | **5.24** | 90.8% | 94.4% |
 
-<!-- TODO(before publishing): these runs used the dense FP4 MLA block-reuse branch; re-validate on main once the block-reuse PR is merged. -->
+<p align="center"><sub><em>AgentX multi-turn replay with prefix reuse: DeepSeek-R1 with MTP=3, and Kimi K3 context serving on 16 GPUs. The KV cache budget per context GPU is the same for both precisions. Each DeepSeek-R1 context GPU also has 8 GiB of host memory; the Kimi K3 budget also holds the KDA state, and Kimi K3 uses no host cache. Sessions is the number of agent sessions kept alive. The cache hit rate is the server-reported share of prompt tokens served from the prefix cache, which the traces cap at about 94% to 96%.</em></sub></p>
+
+<!-- TODO(before publishing): the DeepSeek-R1 runs used the dense FP4 MLA block-reuse branch; re-validate on main once #21313 is merged. -->
 
 ## Limitations and Future Work
 
-**A decode-time V view on Rubin.** Two-dimensional blocks are valid for both BMMs, but on Rubin, unlike its FP8 counterpart, the NVFP4 Tensor Core instruction cannot consume the transposed V operand required by our BMM2 mapping. Transposing the packed V inside the attention kernel adds shared-memory traffic and synchronization on the critical path from BMM1 to BMM2. By default, generation workers therefore keep a persistent transposed copy of the NoPE values together with their BMM2-order scales, 288 additional bytes per token and layer. Decode-resident state then takes 648 bytes per token and layer instead of 576 bytes with FP8, so a generation GPU holds about 11% fewer cached tokens. All decode and serving results in this blog include this overhead. The canonical 360-byte state used for storage, transfer and prefix reuse is unaffected, and so are context workers. For capacity-bound deployments, `TRTLLM_FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE=1` decodes directly from the canonical cache with an in-kernel transpose, at a latency cost. The workaround reflects the instruction set of this GPU, not the representation: hardware that accepts transposed NVFP4 operands can decode from the canonical cache directly.
+**A decode-time V view on Rubin.** Two-dimensional blocks are valid for both BMMs, but on Rubin, unlike its FP8 counterpart, the NVFP4 Tensor Core instruction cannot consume the transposed V operand required by our BMM2 mapping. Transposing the packed V inside the attention kernel adds shared-memory traffic and synchronization on the critical path from BMM1 to BMM2. By default, generation workers therefore keep a decode-time copy of the NoPE values in the BMM2 operand layout together with their BMM2-order scales, 288 additional bytes per token and layer. The copy only rearranges existing values and scales, so it adds no quantization error. Decode-resident state then takes 648 bytes per token and layer instead of 576 bytes with FP8, so a generation GPU holds about 11% fewer cached tokens. All decode and serving results in this blog include this overhead. The canonical 360-byte state used for storage, transfer and prefix reuse is unaffected, and so are context workers. For capacity-bound deployments, `TRTLLM_FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE=1` decodes directly from the canonical cache with an in-kernel transpose, at a latency cost. The workaround reflects the instruction set of this GPU, not the representation: hardware that accepts transposed NVFP4 operands can decode from the canonical cache directly.
 
-**Short contexts and few requests.** The advantage of FP4 attention grows with the context length and the load. At 2K tokens of context, the attention kernel is only 1.05x to 1.13x faster, and with few requests per GPU, attention is a small share of the generation step, so NVFP4 MLA and FP8 MLA perform about the same there. NVFP4 MLA pays off most for long reasoning traces, high concurrency and agentic sessions.
+**Short contexts and few requests.** The advantage of FP4 attention grows with the context length and the load. At 2K tokens of context, the attention kernel is only 1.12x to 1.26x faster, and with few requests per GPU, attention is a small share of the generation step, so NVFP4 MLA and FP8 MLA perform about the same there. NVFP4 MLA pays off most for long reasoning traces, high concurrency and agentic sessions.
 
-**Attention tensor parallelism.** NVFP4 MLA targets generation with attention data parallelism, where each GPU decodes all 128 heads of its requests. With TEP8, NVFP4 MLA delivers 5% to 25% less throughput than FP8 MLA at the same load in our measurements, so FP8 MLA remains the better choice for the most interactive deployments.
+**Attention tensor parallelism.** NVFP4 MLA targets generation with attention data parallelism, where each GPU decodes all 128 heads of its requests. With attention tensor parallelism, each GPU decodes only 16 of the 128 heads, which leaves part of every 128-row Tensor Core tile empty, and in our TEP8 measurements FP8 MLA reaches the most interactive operating points.
+
+**One GPU generation.** Our performance evaluation covers NVIDIA Rubin only. Speedups on other GPUs depend on their FP4 and FP8 Tensor Core throughput and memory bandwidth.
 
 **Future work.** We plan to extend NVFP4 MLA to more models with MLA layers, to reduce the cost of writing the FP4 cache in the context phase, and to bring the same representation to future GPUs that can decode from the canonical cache directly.
 
@@ -438,8 +457,10 @@ NVFP4 MLA is a joint effort across NVIDIA, spanning the quantization recipe, the
 - DeepSeek-AI. DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model. [arXiv:2405.04434](https://arxiv.org/abs/2405.04434), 2024.
 - DeepSeek-AI. DeepSeek-V3 Technical Report. [arXiv:2412.19437](https://arxiv.org/abs/2412.19437), 2024.
 - DeepSeek-AI. DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning. [arXiv:2501.12948](https://arxiv.org/abs/2501.12948), 2025.
+- N. Bhatia et al. Helix Parallelism: Rethinking Sharding Strategies for Interactive Multi-Million-Token LLM Decoding. [arXiv:2507.07120](https://arxiv.org/abs/2507.07120), 2025.
 - Moonshot AI. [Kimi K3: Open Frontier Intelligence](https://github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf), 2026.
 - NVIDIA. Pretraining Large Language Models with NVFP4. [arXiv:2509.25149](https://arxiv.org/abs/2509.25149), 2025.
 - B. D. Rouhani et al. Microscaling Data Formats for Deep Learning. [arXiv:2310.10537](https://arxiv.org/abs/2310.10537), 2023.
 - NVIDIA. [Vera Rubin NVL72 product specifications](https://www.nvidia.com/en-us/data-center/vera-rubin-nvl72/), 2026.
+- TensorRT LLM. [DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72](blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.md), 2026.
 - TensorRT LLM. [KV Cache Compression in TensorRT LLM](blog30_KV_Cache_Compression_in_TensorRT-LLM.md), 2026.
