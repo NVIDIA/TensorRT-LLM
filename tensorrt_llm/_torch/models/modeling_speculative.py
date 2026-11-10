@@ -774,7 +774,10 @@ class Eagle3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         spec_metadata: SpecMetadata,
+        pick_rows: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """With ``pick_rows`` the attention runs on every input row and the
+        rest of the layer on ``pick_rows`` only."""
         residual = hidden_states
 
         hidden_states = self.hidden_norm(hidden_states)
@@ -787,6 +790,9 @@ class Eagle3DecoderLayer(DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
         )
+        if pick_rows is not None:
+            hidden_states = hidden_states[pick_rows]
+            residual = residual[pick_rows]
 
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
@@ -887,6 +893,10 @@ class Eagle3DraftModel(DecoderModel):
                 use_mla=use_mla,
                 aux_stream=self.aux_stream,
             )
+        # forward takes ``pick_rows`` (see speculative.mtp.
+        # draft_layer_picks_rows) with one decoder layer: a later layer's
+        # attention would need every row.
+        self.supports_pick_rows = self.num_layers == 1
 
         self.norm = RMSNorm(
             hidden_size=config.hidden_size,
@@ -943,7 +953,14 @@ class Eagle3DraftModel(DecoderModel):
         spec_metadata: Optional[SpecMetadata] = None,
         hidden_states: Optional[torch.Tensor] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
+        pick_rows: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """``pick_rows`` (single decoder layer only, see
+        ``supports_pick_rows``): the layer's attention runs on every input row,
+        everything after it on ``pick_rows`` only, so both outputs have
+        ``len(pick_rows)`` rows."""
+        if pick_rows is not None and not self.supports_pick_rows:
+            raise ValueError("pick_rows needs a single draft decoder layer")
         # When ``all_rank_num_tokens`` is supplied the caller wants this draft
         # forward to run with a different attention-DP token distribution
         # (e.g. the worker's per-step value); restore the original on exit so
@@ -991,6 +1008,7 @@ class Eagle3DraftModel(DecoderModel):
                     hidden_states=hidden_states,
                     attn_metadata=attn_metadata,
                     spec_metadata=spec_metadata,
+                    pick_rows=pick_rows,
                 )
 
             hidden_states, hidden_states_to_save = self.norm(

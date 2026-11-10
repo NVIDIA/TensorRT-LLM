@@ -169,3 +169,59 @@ def test_step0_epilogue_matches_stock(num_contexts, num_gens, k, rows):
     ref_last = acc_tok[torch.arange(b, device="cuda"), num_acc.long() - 1]
     assert torch.equal(tok[0], ref_last)
     assert torch.all(tok[1:] == -5)  # draft rows untouched (written by the heads)
+
+
+@pytest.mark.parametrize("num_contexts,num_gens,k", [(3, 5, 6), (2, 0, 7), (0, 64, 8), (1, 1, 1)])
+def test_step0_gather_ids_and_picked_epilogue(num_contexts, num_gens, k):
+    """``step0_gather_ids`` gives the epilogue's gather ids before the draft forward, and the epilogue of a
+    draft layer that kept only those rows (``hidden_rows_picked``) gives the same hidden rows as the stock
+    one."""
+    from tensorrt_llm._torch.speculative.fused_accept import step0_epilogue, step0_gather_ids
+
+    g = torch.Generator(device="cuda").manual_seed(num_contexts * 1000 + num_gens * 10 + k)
+    b, H = num_contexts + num_gens, 1024
+    ctx_lens = torch.randint(1, 300, (num_contexts,), generator=g, device="cuda", dtype=torch.int32)
+    seq_lens = torch.cat(
+        [ctx_lens, torch.full((num_gens,), k + 1, device="cuda", dtype=torch.int32)]
+    )
+    num_acc = torch.randint(1, k + 2, (b,), generator=g, device="cuda", dtype=torch.int32)
+    num_ctx_tokens = int(ctx_lens.sum())
+    n_tok = num_ctx_tokens + num_gens * (k + 1)
+    hidden = torch.randn((n_tok, H), generator=g, device="cuda").to(torch.bfloat16)
+    pos = torch.randint(0, 200000, (n_tok,), generator=g, device="cuda", dtype=torch.int32)
+    kv = torch.randint(1000, 5000, (b,), generator=g, device="cuda", dtype=torch.int32)
+
+    ids = step0_gather_ids(seq_lens, num_acc, num_contexts, b, k, num_ctx_tokens)
+    ref = step0_epilogue(
+        seq_lens,
+        num_acc,
+        hidden,
+        pos,
+        torch.zeros_like(seq_lens),
+        kv.clone(),
+        num_contexts,
+        b,
+        k,
+        num_ctx_tokens,
+    )
+    picked = step0_epilogue(
+        seq_lens,
+        num_acc,
+        hidden[ids],
+        pos,
+        torch.zeros_like(seq_lens),
+        kv.clone(),
+        num_contexts,
+        b,
+        k,
+        num_ctx_tokens,
+        hidden_rows_picked=True,
+    )
+    torch.cuda.synchronize()
+    assert ids is not None and ids.dtype == torch.int64
+    assert torch.equal(ids, ref.gather_ids)
+    assert torch.equal(picked.gather_ids, ref.gather_ids)
+    assert torch.equal(picked.hidden, ref.hidden)
+    for j in range(1, k):
+        assert torch.equal(picked.positions(j), ref.positions(j)), j
+    assert step0_gather_ids(seq_lens, num_acc, num_contexts, 2048, k, num_ctx_tokens) is None

@@ -166,6 +166,41 @@ def fused_strict_accept(
 
 
 @triton.jit
+def _step0_gather_id(
+    seq_lens_ptr, num_accepted_ptr, i, num_contexts, num_ctx_tokens, K, BLOCK_C: tl.constexpr
+):
+    """Step 0's row of request ``i`` and its accepted-token count."""
+    is_ctx = i < num_contexts
+    offs = tl.arange(0, BLOCK_C)
+    lens = tl.load(seq_lens_ptr + offs, mask=(offs <= i) & is_ctx, other=0).to(tl.int64)
+    acc = tl.load(num_accepted_ptr + i).to(tl.int64)
+    # contexts: cumsum(seq_lens)[i] - 1 (last prompt token); generations: last accepted token of the block
+    gid = tl.where(
+        is_ctx,
+        tl.sum(lens, axis=0) - 1,
+        num_ctx_tokens + (i - num_contexts).to(tl.int64) * (K + 1) + acc - 1,
+    )
+    return gid, acc
+
+
+@triton.jit
+def _step0_gather_ids_kernel(
+    seq_lens_ptr,
+    num_accepted_ptr,
+    ids_out_ptr,
+    num_contexts,
+    num_ctx_tokens,
+    K: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    i = tl.program_id(0)
+    gid, _ = _step0_gather_id(
+        seq_lens_ptr, num_accepted_ptr, i, num_contexts, num_ctx_tokens, K, BLOCK_C
+    )
+    tl.store(ids_out_ptr + i, gid)
+
+
+@triton.jit
 def _step0_epilogue_kernel(
     seq_lens_ptr,
     num_accepted_ptr,
@@ -190,24 +225,19 @@ def _step0_epilogue_kernel(
     BLOCK_C: tl.constexpr,
     BLOCK_H: tl.constexpr,
     LAST: tl.constexpr,
+    PICKED: tl.constexpr,  # hidden row i is request i's row (the draft layer kept only those)
 ):
     """One program per request ``i`` (every write is to row ``i`` only; ``seq_lens_ptr`` is never written)."""
     i = tl.program_id(0)
-    is_ctx = i < num_contexts
-    offs = tl.arange(0, BLOCK_C)
-    lens = tl.load(seq_lens_ptr + offs, mask=(offs <= i) & is_ctx, other=0).to(tl.int64)
-    acc = tl.load(num_accepted_ptr + i).to(tl.int64)
-    # contexts: cumsum(seq_lens)[i] - 1 (last prompt token); generations: last accepted token of the block
-    gid = tl.where(
-        is_ctx,
-        tl.sum(lens, axis=0) - 1,
-        num_ctx_tokens + (i - num_contexts).to(tl.int64) * (K + 1) + acc - 1,
+    gid, acc = _step0_gather_id(
+        seq_lens_ptr, num_accepted_ptr, i, num_contexts, num_ctx_tokens, K, BLOCK_C
     )
-    dkv = tl.where(is_ctx, 1, acc - K)
+    dkv = tl.where(i < num_contexts, 1, acc - K)
     tl.store(ids_out_ptr + i, gid)
     h = tl.arange(0, BLOCK_H)
     hm = h < H
-    v = tl.load(hid_ptr + gid * hid_stride + h, mask=hm)
+    hid_row = i.to(tl.int64) if PICKED else gid
+    v = tl.load(hid_ptr + hid_row * hid_stride + h, mask=hm)
     tl.store(hid_out_ptr + i.to(tl.int64) * H + h, v, mask=hm)
     for r in tl.static_range(R):
         p = tl.load(pos_ptr + r * pos_row_stride + gid)
@@ -254,11 +284,13 @@ def step0_epilogue(
     num_ctx_tokens: int,
     accepted_tokens: Optional[torch.Tensor] = None,
     last_out: Optional[torch.Tensor] = None,
+    hidden_rows_picked: bool = False,
 ) -> Optional[Step0Epilogue]:
     """``seq_lens`` must not alias ``seq_lens_out`` (read the pre-draft-loop copy). With ``accepted_tokens``
     ``[b, >= draft_len + 1]`` and ``last_out`` (contiguous ``[b]``), also ``last_out[i] =
-    accepted_tokens[i, num_accepted[i] - 1]``. Returns None when the shapes are not supported (caller keeps the
-    stock path)."""
+    accepted_tokens[i, num_accepted[i] - 1]``. ``hidden_rows_picked``: ``hidden_states`` holds only the
+    ``gather_ids`` rows (``[b, H]``, in request order) instead of every input row. Returns None when the
+    shapes are not supported (caller keeps the stock path)."""
     if (
         seq_lens.data_ptr() == seq_lens_out.data_ptr()
         or hidden_states.dim() != 2
@@ -311,14 +343,42 @@ def step0_epilogue(
         BLOCK_C=max(16, triton.next_power_of_2(max(num_contexts, 1))),
         BLOCK_H=triton.next_power_of_2(h),
         LAST=last,
+        PICKED=hidden_rows_picked,
         num_warps=4,
     )
     return Step0Epilogue(ids, hid, pos_all, tuple(position_ids.shape[:-1]))
+
+
+def step0_gather_ids(
+    seq_lens: torch.Tensor,
+    num_accepted: torch.Tensor,
+    num_contexts: int,
+    batch_size: int,
+    draft_len: int,
+    num_ctx_tokens: int,
+) -> Optional[torch.Tensor]:
+    """``step0_epilogue``'s ``gather_ids`` alone (``[b]`` int64), for use before the step-0 draft forward.
+    Returns None when the batch is not supported (caller computes them with the stock ops)."""
+    if batch_size < 1 or batch_size > 1024 or draft_len < 1:
+        return None
+    ids = torch.empty((batch_size,), dtype=torch.int64, device=num_accepted.device)
+    _step0_gather_ids_kernel[(batch_size,)](
+        seq_lens,
+        num_accepted,
+        ids,
+        num_contexts,
+        num_ctx_tokens,
+        K=draft_len,
+        BLOCK_C=max(16, triton.next_power_of_2(max(num_contexts, 1))),
+        num_warps=1,
+    )
+    return ids
 
 
 __all__ = [
     "MAX_DRAFT_LEN",
     "fused_strict_accept",
     "step0_epilogue",
+    "step0_gather_ids",
     "Step0Epilogue",
 ]

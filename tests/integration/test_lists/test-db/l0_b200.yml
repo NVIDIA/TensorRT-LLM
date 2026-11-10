@@ -320,6 +320,8 @@ l0_b200:
   - unittest/_torch/kernels/test_spec_step_copies.py
   - unittest/_torch/pyexecutor/engine/runners/decoder/test_inputs.py -k "test_spec_decode_graph_step_gather_kernel"
   - unittest/_torch/speculative/test_fused_accept.py
+  # Draft step 0 runs the draft layer after attention only on the rows it drafts from.
+  - unittest/_torch/speculative/test_draft_row_pick.py
   - unittest/_torch/pyexecutor/test_steady_spec_prepare.py
   - unittest/_torch/modules/test_mxfp8_draft_head.py
   # Shared fused_qk_norm_rope cells used by the K3 drafter.

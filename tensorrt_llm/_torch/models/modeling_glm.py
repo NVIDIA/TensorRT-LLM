@@ -847,6 +847,9 @@ class Glm4DecoderLayer(DecoderLayer):
 
 
 class Glm4MTP(Glm4DecoderLayer):
+    # forward takes ``pick_rows`` (see speculative.mtp.draft_layer_picks_rows).
+    supports_pick_rows = True
+
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -903,8 +906,16 @@ class Glm4MTP(Glm4DecoderLayer):
         attn_metadata: AttentionMetadata,
         all_rank_num_tokens: Optional[List[int]] = None,
         lora_params: Optional[dict] = None,
+        pick_rows: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        """With ``pick_rows`` (indices into the input rows) the attention runs on
+        every input row and the rest of the layer, which is per-token, on
+        ``pick_rows`` only; the output then has ``len(pick_rows)`` rows and
+        ``all_rank_num_tokens`` counts those rows."""
+        if pick_rows is not None and lora_params is not None:
+            raise ValueError("pick_rows does not support LoRA (per-request row layout)")
+
         def norm_embeds():
             return self.enorm(embed_tokens(input_ids))  # emdedding
 
@@ -941,6 +952,11 @@ class Glm4MTP(Glm4DecoderLayer):
             lora_params=lora_params,
             **kwargs,
         )
+        if pick_rows is not None:
+            # Row-wise: a TP partial sum not yet all-reduced (PRE_MOE_FUSION)
+            # picks the same as the reduced rows.
+            hidden_states = hidden_states[pick_rows]
+            residual = residual[pick_rows]
 
         # MTP Layer Must have sparse MOE
         if self.fusion_config.PRE_MOE_FUSION:

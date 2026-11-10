@@ -1742,6 +1742,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
 
 class DeepseekV3MTP(DeepseekV3DecoderLayer):
+    # forward takes ``pick_rows`` (see speculative.mtp.draft_layer_picks_rows).
+    supports_pick_rows = True
 
     def __init__(self,
                  model_config: ModelConfig[PretrainedConfig],
@@ -1807,8 +1809,13 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         attn_metadata: AttentionMetadata,
         all_rank_num_tokens: Optional[List[int]] = None,
         spec_metadata: Optional[SpecMetadata] = None,
+        pick_rows: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        """With ``pick_rows`` (indices into the input rows) the attention
+        runs on every input row and the rest of the layer, which is per-token,
+        on ``pick_rows`` only; the output then has ``len(pick_rows)`` rows and
+        ``all_rank_num_tokens`` counts those rows."""
 
         def norm_embeds():
             return self.enorm(embed_tokens(input_ids))  #emdedding
@@ -1846,6 +1853,11 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
+        if pick_rows is not None:
+            # Row-wise: a TP partial sum not yet all-reduced (PRE_MOE_FUSION)
+            # picks the same as the reduced rows.
+            hidden_states = hidden_states[pick_rows]
+            residual = residual[pick_rows]
 
         # MTP Layer Must have sparse MOE
         if self.fusion_config.PRE_MOE_FUSION:
