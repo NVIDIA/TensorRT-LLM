@@ -77,8 +77,18 @@ REPLACED_METHODS = (
 # Kernels
 # --------------------------------------------------------------------------
 @triton.jit
-def _refresh_kernel(src_ptr, src_row, src_col, table_ptr, table_row, counts_ptr, width, offset, divisor,
-                    BLOCK: tl.constexpr):
+def _refresh_kernel(
+    src_ptr,
+    src_row,
+    src_col,
+    table_ptr,
+    table_row,
+    counts_ptr,
+    width,
+    offset,
+    divisor,
+    BLOCK: tl.constexpr,
+):
     """``encoded = src - offset``; ``counts[r] = max((encoded >= 0) * (c + 1))``;
     ``table[r, c] = int32(max(encoded, 0) // divisor)``. ``counts[r]`` must be 0 on entry."""
     r = tl.program_id(0).to(tl.int64)
@@ -94,8 +104,20 @@ def _refresh_kernel(src_ptr, src_row, src_col, table_ptr, table_row, counts_ptr,
 
 
 @triton.jit
-def _columns_kernel(ctx_len_ptr, base_ptr, slots_ptr, rows_ptr, counts_ptr, pos_ptr, col_ptr, tokens, page_size,
-                    PER_REQUEST: tl.constexpr, HAS_BASE: tl.constexpr, BLOCK: tl.constexpr):
+def _columns_kernel(
+    ctx_len_ptr,
+    base_ptr,
+    slots_ptr,
+    rows_ptr,
+    counts_ptr,
+    pos_ptr,
+    col_ptr,
+    tokens,
+    page_size,
+    PER_REQUEST: tl.constexpr,
+    HAS_BASE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
     """Token ``t`` (request ``i = t // PER_REQUEST``, row ``r``): ``pos[t] = ctx_len[slots[i]] + r`` and
     ``col[t] = max(min(ctx_len[slots[i]] - base[slots[i]] + r, counts[rows[i]] * page - 1), 0)``."""
     t = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -127,11 +149,39 @@ def _layer_offset(layer, o0, o1, o2, o3, o4, o5, o6, o7):
 
 
 @triton.jit
-def _store_kernel(k_ptr, v_ptr, k_token, k_layer, k_head, v_token, v_layer, v_head, col_ptr, rows_ptr, table_ptr,
-                  table_row, pool_ptr, pool_page, pool_kv, pool_head, pool_entry, page_size,
-                  o0, o1, o2, o3, o4, o5, o6, o7,
-                  PER_REQUEST: tl.constexpr, HEADS: tl.constexpr, HEAD_DIM: tl.constexpr,
-                  HEADS_P2: tl.constexpr, DIM_P2: tl.constexpr):
+def _store_kernel(
+    k_ptr,
+    v_ptr,
+    k_token,
+    k_layer,
+    k_head,
+    v_token,
+    v_layer,
+    v_head,
+    col_ptr,
+    rows_ptr,
+    table_ptr,
+    table_row,
+    pool_ptr,
+    pool_page,
+    pool_kv,
+    pool_head,
+    pool_entry,
+    page_size,
+    o0,
+    o1,
+    o2,
+    o3,
+    o4,
+    o5,
+    o6,
+    o7,
+    PER_REQUEST: tl.constexpr,
+    HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    HEADS_P2: tl.constexpr,
+    DIM_P2: tl.constexpr,
+):
     """Token ``t`` (request ``t // PER_REQUEST``), layer ``l``: page ``table[rows[request], col[t] // page]``;
     ``pool_l[page, 0 / 1, h, col[t] % page, :] = k / v[t, l, h, :]`` (flashinfer's HND paged append)."""
     t = tl.program_id(0).to(tl.int64)
@@ -190,8 +240,16 @@ def pool_geometry(pool) -> Optional[tuple]:
             return None
         offsets.append((view.data_ptr() - first.data_ptr()) // size)
     offsets += [0] * (MAX_LAYERS - len(offsets))
-    return (first, tuple(offsets), first.stride(0), first.stride(1), first.stride(2), first.stride(3),
-            first.shape[2], first.shape[4])
+    return (
+        first,
+        tuple(offsets),
+        first.stride(0),
+        first.stride(1),
+        first.stride(2),
+        first.stride(3),
+        first.shape[2],
+        first.shape[4],
+    )
 
 
 def methods_unsupported_reason(worker) -> Optional[str]:
@@ -250,16 +308,23 @@ class DrafterStepPrep:
             return "the drafter context is not on the KV cache manager's pages"
         if tables.dtype != torch.int32 or tables.dim() != 2 or tables.stride(1) != 1:
             return "the page table is not a row-major int32 table"
-        if counts.dtype != torch.int64 or not counts.is_contiguous() or num_gens > counts.numel() \
-                or num_gens > tables.shape[0]:
+        if (
+            counts.dtype != torch.int64
+            or not counts.is_contiguous()
+            or num_gens > counts.numel()
+            or num_gens > tables.shape[0]
+        ):
             return "the page counts are not int64 per request"
         for name in ("_ctx_len", "_batch_to_slot"):
             tensor = getattr(worker, name, None)
             if tensor is None or tensor.dtype != torch.int64 or not tensor.is_contiguous():
                 return f"{name} is not a contiguous int64 tensor"
         base = getattr(worker, "_ctx_base", None)
-        if base is not None and (base.dtype != torch.int64 or not base.is_contiguous()
-                                 or base.shape != worker._ctx_len.shape):
+        if base is not None and (
+            base.dtype != torch.int64
+            or not base.is_contiguous()
+            or base.shape != worker._ctx_len.shape
+        ):
             return "_ctx_base is not a contiguous int64 tensor shaped as _ctx_len"
         if getattr(worker, "_dummy_slot", None) is None:
             return "the worker has no dummy slot"
@@ -276,8 +341,10 @@ class DrafterStepPrep:
         reason = self.unsupported_reason(worker, num_gens, per_request)
         if reason is not None and num_gens >= self.min_requests and not self._declined_logged:
             self._declined_logged = True
-            logger.warning(f"[musespark_open] drafter_fused_prep: a decode step keeps the built-in drafter "
-                           f"bookkeeping: {reason} (logged once)")
+            logger.warning(
+                f"[musespark_open] drafter_fused_prep: a decode step keeps the built-in drafter "
+                f"bookkeeping: {reason} (logged once)"
+            )
         return reason is None
 
     # -- the side chain --------------------------------------------------------
@@ -287,7 +354,11 @@ class DrafterStepPrep:
         from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 
         tables = worker._ctx_block_tables
-        offsets_name = "kv_cache_block_offsets" if worker._ctx_unified_cache else "draft_kv_cache_block_offsets"
+        offsets_name = (
+            "kv_cache_block_offsets"
+            if worker._ctx_unified_cache
+            else "draft_kv_cache_block_offsets"
+        )
         src = getattr(attn_metadata, offsets_name, None)
         if src is None or num_seqs <= 0 or src.dim() != 4:
             return DFlashWorker._refresh_ctx_block_tables(worker, attn_metadata, num_seqs)
@@ -303,11 +374,23 @@ class DrafterStepPrep:
         counts = worker._ctx_block_counts
         counts[:num_seqs].zero_()
         _refresh_kernel[(num_seqs, triton.cdiv(width, REFRESH_BLOCK))](
-            view, view.stride(0), view.stride(1), tables, tables.stride(0), counts, width,
-            int(worker._ctx_block_offset), int(worker._ctx_block_divisor), BLOCK=REFRESH_BLOCK, num_warps=4)
+            view,
+            view.stride(0),
+            view.stride(1),
+            tables,
+            tables.stride(0),
+            counts,
+            width,
+            int(worker._ctx_block_offset),
+            int(worker._ctx_block_divisor),
+            BLOCK=REFRESH_BLOCK,
+            num_warps=4,
+        )
         return True
 
-    def store_step_context(self, worker, draft_model, gen_hs, slots, rows, per_request: int) -> None:
+    def store_step_context(
+        self, worker, draft_model, gen_hs, slots, rows, per_request: int
+    ) -> None:
         """``DFlashWorker._store_step_context`` without the mask (the fork's side chain) over the manager's
         pages: positions and columns in one launch (from one read of the lengths), the built-in projection
         and ``precompute_context_kv``, then every layer's K/V append in one launch."""
@@ -317,9 +400,20 @@ class DrafterStepPrep:
         columns = torch.empty(tokens, dtype=torch.long, device=slots.device)
         base = worker._ctx_base
         _columns_kernel[(triton.cdiv(tokens, POSITIONS_BLOCK),)](
-            worker._ctx_len, worker._ctx_len if base is None else base, slots, rows, worker._ctx_block_counts,
-            positions, columns, tokens, int(worker._ctx_page_size), PER_REQUEST=per_request,
-            HAS_BASE=base is not None, BLOCK=POSITIONS_BLOCK, num_warps=4)
+            worker._ctx_len,
+            worker._ctx_len if base is None else base,
+            slots,
+            rows,
+            worker._ctx_block_counts,
+            positions,
+            columns,
+            tokens,
+            int(worker._ctx_page_size),
+            PER_REQUEST=per_request,
+            HAS_BASE=base is not None,
+            BLOCK=POSITIONS_BLOCK,
+            num_warps=4,
+        )
         projected = draft_model.project_target_hidden(gen_hs.reshape(-1, gen_hs.shape[-1]))
         cache_dtype = worker._ctx_kv_buf[0].dtype
         k_new, v_new = draft_model.precompute_context_kv(projected.to(cache_dtype), positions)
@@ -344,11 +438,32 @@ class DrafterStepPrep:
             return
         first, offsets, s_page, s_kv, s_head, s_entry, heads, head_dim = geometry
         _store_kernel[(tokens, k_new.shape[1])](
-            k_new, v_new, k_new.stride(0), k_new.stride(1), k_new.stride(2), v_new.stride(0), v_new.stride(1),
-            v_new.stride(2), columns, rows, worker._ctx_block_tables, worker._ctx_block_tables.stride(0), first,
-            s_page, s_kv, s_head, s_entry, int(worker._ctx_page_size), *offsets, PER_REQUEST=per_request,
-            HEADS=heads, HEAD_DIM=head_dim, HEADS_P2=_p2(heads), DIM_P2=_p2(head_dim),
-            num_warps=1 if heads * head_dim <= 256 else 4)
+            k_new,
+            v_new,
+            k_new.stride(0),
+            k_new.stride(1),
+            k_new.stride(2),
+            v_new.stride(0),
+            v_new.stride(1),
+            v_new.stride(2),
+            columns,
+            rows,
+            worker._ctx_block_tables,
+            worker._ctx_block_tables.stride(0),
+            first,
+            s_page,
+            s_kv,
+            s_head,
+            s_entry,
+            int(worker._ctx_page_size),
+            *offsets,
+            PER_REQUEST=per_request,
+            HEADS=heads,
+            HEAD_DIM=head_dim,
+            HEADS_P2=_p2(heads),
+            DIM_P2=_p2(head_dim),
+            num_warps=1 if heads * head_dim <= 256 else 4,
+        )
         self.stores += 1
 
     # -- the commit ------------------------------------------------------------
@@ -372,15 +487,26 @@ class DrafterStepPrep:
             out.copy_(worker._commit_context(slots, num_accepted.long(), rows))
             return
         context_kv_commit_paged(
-            worker._ctx_len, worker._ctx_base, slots, num_accepted, rows,
+            worker._ctx_len,
+            worker._ctx_base,
+            slots,
+            num_accepted,
+            rows,
             worker._ctx_block_counts if worker._ctx_block_tables is not None else None,
-            worker._ctx_page_size, worker._compute_block_size, worker._max_ctx, worker._dummy_slot,
-            worker._ctx_unified_cache, out)
+            worker._ctx_page_size,
+            worker._compute_block_size,
+            worker._max_ctx,
+            worker._dummy_slot,
+            worker._ctx_unified_cache,
+            out,
+        )
         self.steps += 1
         if self.steps == 1:
-            logger.info(f"[musespark_open] drafter_fused_prep: the first fused decode step ran ({requests} "
-                        "requests): page-table refresh, context positions and columns, every layer's context K/V "
-                        "store and the commit as Triton launches")
+            logger.info(
+                f"[musespark_open] drafter_fused_prep: the first fused decode step ran ({requests} "
+                "requests): page-table refresh, context positions and columns, every layer's context K/V "
+                "store and the commit as Triton launches"
+            )
 
 
 def from_env() -> Optional[DrafterStepPrep]:
@@ -396,9 +522,15 @@ def from_env() -> Optional[DrafterStepPrep]:
     try:
         min_requests = int(raw)
     except ValueError as error:
-        raise ValueError(f"[musespark_open] {MIN_REQUESTS_ENV}={raw!r} is not a whole number") from error
+        raise ValueError(
+            f"[musespark_open] {MIN_REQUESTS_ENV}={raw!r} is not a whole number"
+        ) from error
     if not 1 <= min_requests <= MAX_REQUESTS:
-        raise ValueError(f"[musespark_open] {MIN_REQUESTS_ENV}={raw!r} is outside 1..{MAX_REQUESTS}")
-    logger.info(f"[musespark_open] {ENV}=1: decode steps of {min_requests}..{MAX_REQUESTS} requests run the "
-                "drafter's paged context-K/V bookkeeping (page-table refresh, store, commit) as fused Triton launches")
+        raise ValueError(
+            f"[musespark_open] {MIN_REQUESTS_ENV}={raw!r} is outside 1..{MAX_REQUESTS}"
+        )
+    logger.info(
+        f"[musespark_open] {ENV}=1: decode steps of {min_requests}..{MAX_REQUESTS} requests run the "
+        "drafter's paged context-K/V bookkeeping (page-table refresh, store, commit) as fused Triton launches"
+    )
     return DrafterStepPrep(min_requests, MAX_REQUESTS)

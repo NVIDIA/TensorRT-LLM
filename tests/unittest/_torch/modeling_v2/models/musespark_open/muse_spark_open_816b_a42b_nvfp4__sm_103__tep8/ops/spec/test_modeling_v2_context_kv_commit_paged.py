@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for ``context_kv_commit_paged`` (served under ``MUSESPARK_OPEN_DRAFTER_FUSED_PREP``, ``ops/spec/drafter_step_prep.py``;
-backported from NVIDIA/TensorRT-LLM #21535, aaba1deabc).
+"""GPU test for ``context_kv_commit_paged`` (served under ``MUSESPARK_OPEN_DRAFTER_FUSED_PREP``,
+``ops/spec/drafter_step_prep.py``; backported from NVIDIA/TensorRT-LLM #21535, aaba1deabc).
 
 The commit over a paged drafter context must leave ``_ctx_len`` and the
 lengths the drafter reads bit for bit as ``DFlashWorker._commit_context`` does
@@ -14,7 +14,6 @@ device assert does.
 import subprocess
 import sys
 import textwrap
-import types
 
 import pytest
 import torch

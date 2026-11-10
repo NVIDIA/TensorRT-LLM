@@ -445,11 +445,7 @@ def _swa_endpoint_priority(
             ):
                 return 70
         point = None if branch is None else branch.point
-        if (
-            point is not None
-            and block_start < point
-            and block_end > point - life_cycle.window_size
-        ):
+        if point is not None and block_start < point and block_end > point - life_cycle.window_size:
             return 70
         return 0
 

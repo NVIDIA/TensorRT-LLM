@@ -25,7 +25,9 @@ def _pool(layers=L, pages=16, gap=64, dtype=torch.bfloat16):
     per = pages * 2 * NKV * PAGE * HD
     buf = torch.zeros(layers * (per + gap), dtype=dtype)
     order = list(reversed(range(layers)))
-    return buf, [buf[o * (per + gap): o * (per + gap) + per].view(pages, 2, NKV, PAGE, HD) for o in order]
+    return buf, [
+        buf[o * (per + gap) : o * (per + gap) + per].view(pages, 2, NKV, PAGE, HD) for o in order
+    ]
 
 
 def _worker(n_slots=9, width=64):
@@ -37,7 +39,9 @@ def _worker(n_slots=9, width=64):
     w._ctx_base = torch.zeros(n_slots, dtype=torch.int64)
     w._batch_to_slot = torch.zeros(n_slots - 1, dtype=torch.int64)
     w._dummy_slot = n_slots - 1
-    w.spec_config = types.SimpleNamespace(max_draft_len=K)  # _draft_tokens_per_req = K + 1 (a property)
+    w.spec_config = types.SimpleNamespace(
+        max_draft_len=K
+    )  # _draft_tokens_per_req = K + 1 (a property)
     w._ctx_kv_buf = _pool()[1]
     return w
 
@@ -56,7 +60,10 @@ def test_on_and_min_requests(monkeypatch):
     monkeypatch.setenv(prep.ENV, "1")
     monkeypatch.delenv(prep.MIN_REQUESTS_ENV, raising=False)
     p = prep.from_env()
-    assert p is not None and (p.min_requests, p.max_requests) == (prep.DEFAULT_MIN_REQUESTS, prep.MAX_REQUESTS)
+    assert p is not None and (p.min_requests, p.max_requests) == (
+        prep.DEFAULT_MIN_REQUESTS,
+        prep.MAX_REQUESTS,
+    )
     assert isinstance(fork_mod._fused_prep_from_env(), prep.DrafterStepPrep)
     monkeypatch.setenv(prep.MIN_REQUESTS_ENV, "2")
     assert prep.from_env().min_requests == 2

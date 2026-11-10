@@ -499,10 +499,7 @@ class ContextKvFork:
                 "the side chain cannot be forked from it"
             )
         capture = current_capture_id()
-        fused = (
-            self.prep is not None
-            and self.prep.takes(self.worker, num_gens, k + 1)
-        )
+        fused = self.prep is not None and self.prep.takes(self.worker, num_gens, k + 1)
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
             gen_hs = self.side_chain(spec_metadata, attn_metadata, num_gens, k, fused)
@@ -732,7 +729,9 @@ class ContextKvFork:
             gen_hs = spec_metadata.captured_hidden_states[
                 : num_gens * (k + 1), : spec_metadata.hidden_size * spec_metadata.num_capture_layers
             ]
-            self.prep.store_step_context(worker, drafter, gen_hs, slots, self.rows[:num_gens], k + 1)
+            self.prep.store_step_context(
+                worker, drafter, gen_hs, slots, self.rows[:num_gens], k + 1
+            )
             return gen_hs
         refusal = _side_chain_refusal(worker, drafter) if self.side_chain_on else None
         if self.side_chain_on and refusal is None:
