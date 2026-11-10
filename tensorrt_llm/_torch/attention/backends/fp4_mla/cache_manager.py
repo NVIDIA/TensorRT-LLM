@@ -14,7 +14,12 @@ from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLay
 from tensorrt_llm._torch.kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
-from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
+from tensorrt_llm._utils import (
+    TensorWrapper,
+    binding_to_torch_dtype,
+    convert_to_torch_tensor,
+    prefer_pinned,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -885,6 +890,21 @@ class Fp4MlaV2CacheLayoutPolicy:
                     self.tokens_per_block,
                     self.num_kv_heads_per_layer[fp8_local_layer],
                     self.head_dim_per_layer[fp8_local_layer],
+                ),
+            )
+        if self._draft_manager_layer_ids:
+            # Every appended draft layer lives in this one single-buffer pool.
+            draft_layer = self._draft_manager_layer_ids[0]
+            draft_spec = self._appended_draft_layer_specs[int(draft_layer)]
+            yield self._role_pool_base_view(
+                draft_layer,
+                Role.KEY,
+                binding_to_torch_dtype(draft_spec.dtype),
+                (
+                    draft_spec.kv_factor,
+                    self.tokens_per_block,
+                    draft_spec.num_kv_heads,
+                    draft_spec.head_dim,
                 ),
             )
         if not self.fp4_mla_context_only_cache:

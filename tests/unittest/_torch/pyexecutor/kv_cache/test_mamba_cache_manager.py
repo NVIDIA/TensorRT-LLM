@@ -2993,6 +2993,11 @@ def test_v2_hybrid_fp4_hosts_fp8_draft_layers_in_their_own_lifecycle(
         assert [view.pool_role for view in draft_groups[0].pool_views] == [
             frozenset({str(Role.KEY)})
         ]
+
+        # The warmup scrub reaches the draft pool as well as the target pools.
+        view.view(torch.uint8).fill_(0x3C)
+        mgr.check_invalid_values_in_kv_cache(fill_with_zero=True)
+        assert int(view.view(torch.uint8).count_nonzero()) == 0
     finally:
         mgr.shutdown()
 
