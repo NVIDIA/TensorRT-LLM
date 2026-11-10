@@ -841,6 +841,12 @@ class PyExecutor:
         self._resources_released = False
         self._closed = False
         self._gen_preemption_settings = gen_preemption
+        # Profiling and serving share the thread-local CUDA library state
+        # whose allocations were included in the memory budget.
+        self.worker_thread: Optional[threading.Thread] = None
+        self._worker_phases: Queue[bool] = Queue()
+        self._worker_phase_done = threading.Event()
+        self._worker_phase_done.set()
         self._initialize_execution(
             PyExecutorResources(
                 resource_manager=resource_manager,
@@ -2110,9 +2116,38 @@ class PyExecutor:
                 ". "
                 "Remove sleep_config to keep the current configuration.")
 
+    def _run_worker_phases(self) -> None:
+        while self._worker_phases.get():
+            try:
+                self._event_loop_wrapper()
+            except BaseException as error:
+                # Publish failure before waking teardown: the thread can
+                # still appear alive while unwinding and cannot be reused.
+                if self._event_loop_error is None:
+                    self._event_loop_error = error
+                raise
+            finally:
+                # Resource teardown must wait for the wrapper's cleanup,
+                # including on an exceptional exit, before rebinding.
+                self._worker_phase_done.set()
+
+    def _stop_worker_thread(self) -> None:
+        if self.worker_thread is not None:
+            self._worker_phases.put(False)
+            self.worker_thread.join()
+
     def start_worker(self):
         with self.worker_lock:
+            if self._closed or self._resources_released:
+                raise RuntimeError(
+                    "Cannot start an executor without bound resources")
+            if self._event_loop_error is not None or self._fatal_error is not None:
+                raise RuntimeError("Cannot restart a failed executor")
             if not self.worker_started:
+                if self.worker_thread is not None and not self.worker_thread.is_alive(
+                ):
+                    raise RuntimeError(
+                        "Cannot restart an exited executor thread")
                 # Model/KV-cache/transceiver construction can create threads
                 # after configure_cpu_affinity(). Refresh the existing-thread
                 # snapshot immediately before launching executor threads.
@@ -2189,9 +2224,12 @@ class PyExecutor:
                         self._sleep_wakeup_listener_thread.start()
                 if self.dist.pp_size > 1 and not self._disable_mpi:
                     self._start_mpi_progress_thread()
-                self.worker_thread = threading.Thread(
-                    target=self._event_loop_wrapper, daemon=True)
-                self.worker_thread.start()
+                if self.worker_thread is None:
+                    self.worker_thread = threading.Thread(
+                        target=self._run_worker_phases, daemon=True)
+                    self.worker_thread.start()
+                self._worker_phase_done.clear()
+                self._worker_phases.put(True)
                 self.worker_started = True
             # Start the sampler's async worker, if it is enabled
             if (isinstance(self.sampler, AsyncWorkerMixin)
@@ -2549,6 +2587,7 @@ class PyExecutor:
                     release_model_owned_graphs=True)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
+        self._stop_worker_thread()
         self._closed = True
         # The snapshot above keeps the model owners reachable for the outer
         # worker's collective terminal cleanup.
@@ -2599,11 +2638,11 @@ class PyExecutor:
             self._terminal_model_engines = ()
             return False
         if self.worker_started:
-            self.worker_thread.join()
+            self._worker_phase_done.wait()
         if self.kv_connector_manager is not None and not self._kv_connector_failed:
             self.kv_connector_manager.shutdown()
         if self.dist.pp_size > 1 and self.worker_started:
-            # The worker thread has exited, so no PP traffic needs progress.
+            # The execution phase has exited, so no PP traffic needs progress.
             self._pp_mpi_progress_stop.set()
             self.executed_batch_queue.put(None)
             self.broadcast_sample_state_handler.join()
@@ -2613,7 +2652,7 @@ class PyExecutor:
             self._pp_mpi_progress_quiesced.set()
             self._stop_mpi_progress_thread()
         # Signal non-rank-0 sleep/wakeup listener threads to exit.  This runs
-        # after the worker thread has joined, which guarantees that the non-rank-0
+        # after the execution phase has ended, which guarantees that the non-rank-0
         # executor loops have already processed the shutdown broadcast and are
         # no longer driving NCCL, so the send cannot deadlock.
         self._shutdown_sleep_wakeup_listeners()

@@ -878,7 +878,12 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
     executor_cls = _extract_class(
         _TORCH_ROOT / "pyexecutor/py_executor.py",
         "PyExecutor",
-        {"shutdown", "_release_execution_resources", "_release_execution_pools"},
+        {
+            "shutdown",
+            "_release_execution_resources",
+            "_release_execution_pools",
+            "_stop_worker_thread",
+        },
         {
             "AsyncWorkerMixin": AsyncWorkerMixin,
             "torch": SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
@@ -907,6 +912,8 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
     executor._profile_manager = SimpleNamespace(cleanup=lambda: events.append("profile_cleanup"))
     executor.hang_detector = SimpleNamespace(detected=lambda: False)
     executor.worker_thread = SimpleNamespace(join=lambda: events.append("worker_join"))
+    executor._worker_phase_done = SimpleNamespace(wait=lambda: events.append("worker_phase_done"))
+    executor._worker_phases = SimpleNamespace(put=lambda _command: None)
     executor.kv_connector_manager = None
     executor.enable_attention_dp = False
     executor._kv_connector_failed = False
@@ -951,7 +958,7 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
         "enqueue",
         "wait",
         "profile_cleanup",
-        "worker_join",
+        "worker_phase_done",
         "listener_shutdown",
         ("sampler_stop", 1),
         "release_graphs",
@@ -962,6 +969,7 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
         ("dwdp_exit", 1),
         ("terminal_cleanup", False),
         ("dwdp_exit", 2),
+        "worker_join",
         ("terminal_cleanup", True),
     ]
     assert executor.virtual_memory_pools == {}

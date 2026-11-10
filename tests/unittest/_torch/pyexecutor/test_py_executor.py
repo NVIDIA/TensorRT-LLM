@@ -149,6 +149,8 @@ def test_shutdown_graph_lifecycle(shutdown_method: str, releases_model_owned_gra
     executor.hang_detector = Mock()
     executor.hang_detector.detected.return_value = False
     executor.worker_thread = Mock()
+    executor._worker_phase_done = Mock()
+    executor._worker_phases = Mock()
     executor.dist = types.SimpleNamespace(pp_size=1)
     executor._shutdown_sleep_wakeup_listeners = Mock()
     executor.encoder_launch_executor = None

@@ -5,6 +5,7 @@
 import threading
 from contextlib import nullcontext
 from dataclasses import fields
+from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -22,6 +23,121 @@ from tensorrt_llm._torch.pyexecutor.sampler import AsyncWorkerMixin
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 
 pytestmark = pytest.mark.cpu_only
+
+
+def _enable_real_worker(executor, monkeypatch):
+    monkeypatch.setenv("TLLM_NUMA_AWARE_WORKER_AFFINITY", "0")
+    executor.worker_started = False
+    executor.worker_thread = None
+    executor.worker_lock = threading.Lock()
+    executor._worker_phases = Queue()
+    executor._worker_phase_done = threading.Event()
+    executor._worker_phase_done.set()
+    executor.dist = SimpleNamespace(pp_size=1, world_size=1)
+
+
+def test_profiling_worker_and_thread_local_state_survive_resource_rebind(executor, monkeypatch):
+    ex, _events = executor
+    _enable_real_worker(ex, monkeypatch)
+    local_state = threading.local()
+    marker = object()
+    entered = threading.Event()
+    stop_requested = threading.Event()
+    phases = []
+
+    def event_loop():
+        if not phases:
+            local_state.library_handle = marker
+        phases.append((threading.current_thread(), local_state.library_handle))
+        entered.set()
+        assert stop_requested.wait(5)
+        ex.shutdown_event.set()
+
+    def initialize_execution(_resources):
+        ex._shutdown_runtime_complete = False
+        ex.shutdown_event.clear()
+        entered.clear()
+        stop_requested.clear()
+
+    ex._event_loop_wrapper = event_loop
+    ex._initialize_execution = initialize_execution
+    ex.executor_request_queue.enqueue_shutdown_request.side_effect = stop_requested.set
+    try:
+        ex.start_worker()
+        assert entered.wait(5)
+        worker = ex.worker_thread
+        ex.release_resources()
+        assert worker.is_alive()
+        assert ex._worker_phase_done.is_set()
+
+        ex.rebind_resources(Mock())
+        ex.start_worker()
+        assert entered.wait(5)
+        assert phases == [(worker, marker), (worker, marker)]
+        ex.shutdown()
+        assert not worker.is_alive()
+        with pytest.raises(RuntimeError, match="without bound resources"):
+            ex.start_worker()
+    finally:
+        stop_requested.set()
+        ex._stop_worker_thread()
+
+
+def test_release_waits_for_phase_cleanup_before_freeing_resources(executor, monkeypatch):
+    ex, _events = executor
+    _enable_real_worker(ex, monkeypatch)
+    cleanup_started = threading.Event()
+    finish_cleanup = threading.Event()
+    released = threading.Event()
+
+    def event_loop():
+        ex.shutdown_event.set()
+        cleanup_started.set()
+        assert finish_cleanup.wait(5)
+
+    def release():
+        ex.release_resources()
+        released.set()
+
+    ex._event_loop_wrapper = event_loop
+    ex.start_worker()
+    assert cleanup_started.wait(5)
+    releaser = threading.Thread(target=release, daemon=True)
+    releaser.start()
+    try:
+        assert not released.wait(0.05)
+        ex.model_engine.release_executor_resources.assert_not_called()
+        finish_cleanup.set()
+        assert released.wait(5)
+        ex.model_engine.release_executor_resources.assert_called_once()
+    finally:
+        finish_cleanup.set()
+        releaser.join(5)
+        ex._stop_worker_thread()
+
+
+@pytest.mark.parametrize("error", [RuntimeError("cleanup failed"), SystemExit("cancelled")])
+def test_phase_failure_is_visible_before_rebind_can_restart(executor, monkeypatch, error):
+    ex, _events = executor
+    _enable_real_worker(ex, monkeypatch)
+    uncaught = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: uncaught.append(args.exc_value))
+
+    def fail():
+        raise error
+
+    ex._event_loop_wrapper = fail
+    ex.start_worker()
+    assert ex._worker_phase_done.wait(5)
+    assert ex._event_loop_error is error
+    ex._stop_worker_thread()
+    assert uncaught == [error]
+    ex._resources_released = True
+    with pytest.raises(RuntimeError, match="execution failure"):
+        ex.rebind_resources(Mock())
+    ex._resources_released = False
+    with pytest.raises(RuntimeError, match="failed executor"):
+        ex.start_worker()
 
 
 class _Engine(SimpleNamespace):
@@ -62,7 +178,9 @@ def executor(monkeypatch):
     ex._mpi_progress_thread = None
     ex._mpi_progress_thread_exit_hook = None
     ex.worker_thread = Mock()
-    ex.worker_thread.join.side_effect = lambda: events.append("join")
+    ex._worker_phase_done = Mock()
+    ex._worker_phases = Mock()
+    ex._worker_phase_done.wait.side_effect = lambda: events.append("phase_done")
     ex.executor_request_queue = Mock()
     ex.executor_request_queue.enqueue_shutdown_request.side_effect = lambda: events.append("stop")
     ex.shutdown_event = threading.Event()
@@ -133,7 +251,7 @@ def test_release_preserves_model_and_orders_gpu_teardown(executor):
     assert ex.finish_sample_event is sample_event
     assert events == [
         "stop",
-        "join",
+        "phase_done",
         "sampler_stop",
         "graphs",
         "draft_graphs",
@@ -450,7 +568,7 @@ def test_release_stops_pipeline_progress_before_gpu_teardown(executor):
 
     ex.release_resources()
 
-    assert events.index("join") < events.index("relay_join")
+    assert events.index("phase_done") < events.index("relay_join")
     assert events.index("relay_join") < events.index("progress_stop") < events.index("graphs")
     assert ex._pp_mpi_progress_stop.is_set()
     assert ex._pp_mpi_progress_quiesced.is_set()

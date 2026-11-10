@@ -118,6 +118,8 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor.draft_model_engine = None
     executor.sampler = None
     executor.worker_thread = MagicMock()
+    executor._worker_phase_done = MagicMock()
+    executor._worker_phases = MagicMock()
     executor._shutdown_sleep_wakeup_listeners = MagicMock()
     executor._pending_transfer_responses = []
     executor._pending_response_terminations = []
@@ -662,6 +664,8 @@ def test_shutdown_drains_save_before_loop_exit(
         executor._release_transfer = MagicMock()
         executor.shutdown_event = Event()
         executor.worker_thread = MagicMock()
+        executor._worker_phase_done = MagicMock()
+        executor._worker_phases = MagicMock()
         executor._profile_manager = MagicMock()
         executor._shutdown_sleep_wakeup_listeners = MagicMock()
         executor.model_engine = MagicMock()
@@ -734,7 +738,7 @@ def test_shutdown_drains_save_before_loop_exit(
             assert not executor._kv_connector_failed
             assert not executor.kv_connector_manager.get_pending_transfer_requests()
             assert not executor._kv_connector_deadlines
-            executor.worker_thread.join.assert_called_once()
+            executor._worker_phase_done.wait.assert_called_once()
             engine.release_executor_resources.assert_called_once_with(
                 release_model_owned_graphs=True
             )
@@ -756,7 +760,7 @@ def test_shutdown_drains_save_before_loop_exit(
         for executor, engine, resource in zip(executors, engines, resources):
             assert executor._kv_connector_failed
             executor._release_transfer.assert_not_called()
-            executor.worker_thread.join.assert_called_once()
+            executor._worker_phase_done.wait.assert_called_once()
             engine.release_executor_resources.assert_not_called()
             resource.shutdown.assert_not_called()
     executors[0]._release_transfer.assert_not_called()
@@ -1149,7 +1153,7 @@ def test_failed_executor_survives_outer_worker_gc(monkeypatch: pytest.MonkeyPatc
         with pytest.raises(RuntimeError, match="Process restart is required"):
             executor._kv_connector_terminate_requests()
     executor.shutdown()
-    executor.worker_thread.join.assert_called_once()
+    executor._worker_phase_done.wait.assert_called_once()
     executor._shutdown_sleep_wakeup_listeners.assert_called_once()
     executor._profile_manager.cleanup.assert_called_once()
     assert executor.encoder_launch_executor is None
