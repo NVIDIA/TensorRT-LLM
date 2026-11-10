@@ -497,7 +497,7 @@ def _write_wrapper(bin_dir: str) -> str | None:
         part = f"{path}.{os.getpid()}.part"
         with open(part, "w") as f:
             f.write(script)
-        os.chmod(part, 0o755)
+        os.chmod(part, 0o700)  # The processes of a launch run as this user.
         os.replace(part, path)
     if os.statvfs(bin_dir).f_flag & os.ST_NOEXEC or not os.access(path, os.X_OK):
         return None
@@ -573,7 +573,7 @@ def _publish(output: str, cubin: str) -> None:
 
 
 def _build(compiler: str, argv: list[str], output: str, cubin: str, failed: str) -> int:
-    import subprocess
+    import subprocess  # nosec B404 - runs the real compiler on the arguments DeepGEMM passed, no shell
 
     returncode = subprocess.run([compiler] + argv).returncode
     if returncode == 0 and os.path.isfile(output) and os.path.getsize(output) > 0:
@@ -620,7 +620,7 @@ def main(argv: list[str]) -> int:
     share_dir = os.environ.get(SHARE_DIR_ENV)
     source = next((a for a in argv if os.path.basename(a) == "kernel.cu"), None)
     if not share_dir or source is None or "--cubin" not in argv or "--output-file" not in argv:
-        os.execvp(compiler, [compiler] + argv)
+        os.execvp(compiler, [compiler] + argv)  # nosec B606 - becomes the real compiler, same arguments, no shell
     start = time.time()
     output = argv[argv.index("--output-file") + 1]
     key = _kernel_key(source, argv)
