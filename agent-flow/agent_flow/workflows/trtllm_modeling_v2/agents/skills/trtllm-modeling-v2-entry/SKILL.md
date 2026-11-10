@@ -105,8 +105,8 @@ file is reported to the planner for ownership; it is not silently omitted.
   boundaries. Probe those the runtime envelope reaches; record all limits,
   guarding measured silent failures. Size from measured `runtime_facts.yaml`.
 - Iterate with `pytest -k`; certify once after the last edit to entry **and**
-  test: run the whole test file and `test_modeling_v2_claims.py` /
-  `test_modeling_v2_no_stale_claims.py` under `tests/unittest/_torch/modeling_v2`.
+  test: run the whole test file and `test_modeling_v2_no_stale_claims.py` under
+  `tests/unittest/_torch/modeling_v2`.
   Batch compatible cells into one pytest process. Add the measured device to
   `ARCHS` only after passing; a missing `Arch` enum gets its own commit.
   Unmeasured cells/arches remain uncertified; report failures, never widen a
