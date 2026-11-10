@@ -340,6 +340,17 @@ class MegaMoECuteDslWeightView:
 
 
 @dataclass(frozen=True)
+class _StagingKey:
+    """Key of one local staging set (``_ensure_local_staging``)."""
+
+    max_T: int
+    top_k: int
+    hidden: int
+    device: str
+    output_dtype: torch.dtype
+
+
+@dataclass(frozen=True)
 class _MegaMoeBuffers:
     """Unified kernel-ABI view over MegaMoE CuteDSL's user-domain buffers.
 
@@ -806,6 +817,45 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         """
         self._active_launch_max_tokens = chunk_max_tokens
 
+    def _reads_inputs_in_place(self, num_tokens: int, bucket: int) -> bool:
+        """Whether a launch of ``num_tokens`` rows into ``bucket`` reads its inputs where they are
+        (an exact-size generation-phase bucket across ranks) instead of staging them."""
+        return (
+            self.ep_size > 1
+            and not self.tactic_autotune
+            and num_tokens == bucket
+            and bucket in self._genphase_direct_input_buckets
+        )
+
+    def _staging_of_next_run(self, num_tokens: int) -> Optional[Tuple[_MegaMoeBuffers, int]]:
+        """The buffers and bucket the next ``run_moe`` stages ``num_tokens`` rows into, or None
+        when it does not stage (no bucket hint, tactic autotuning, a bucket whose inputs are
+        read in place, buffers not built)."""
+        hint = self._active_launch_max_tokens
+        if hint is None or self.tactic_autotune or not self._weights_created:
+            return None
+        bucket = self._select_launch_max_tokens(hint)
+        if num_tokens > bucket or self._reads_inputs_in_place(num_tokens, bucket):
+            return None
+        output_dtype = self.dtype or torch.bfloat16
+        for key in self._local_staging_cache:
+            if (
+                key.max_T == bucket
+                and key.hidden == self.hidden_size
+                and key.output_dtype == output_dtype
+            ):
+                break
+        else:
+            return None
+        bufs = self._acquire_buffers(
+            top_k=key.top_k,
+            hidden=key.hidden,
+            device=torch.device(key.device),
+            output_dtype=output_dtype,
+            launch_max_T=bucket,
+        )
+        return bufs, bucket
+
     def _supports_load_balancer(self) -> bool:
         # Both static and dynamic EPLB are supported: the four MegaMoE-
         # format derived parameters (``mega_fc{1,2}_weight{,_sf}``) are
@@ -1188,6 +1238,20 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             # admits bf16 activations only, so ``fc31_act_scale``, created at
             # ``module.dtype``, is bf16 as well.
             x_bf16 = x_bf16 * fc31_act_scale
+        raw_cols = ceil_div(hidden, 16)
+        # A forward that run_moe stages: quantize straight into the bucket's activation
+        # rows, which run_moe recognizes by address and does not copy again.
+        staged = (
+            self._staging_of_next_run(x_bf16.shape[0])
+            if reserved_sms == 0 and sf_cols == raw_cols
+            else None
+        )
+        if staged is not None:
+            rows = x_bf16.shape[0]
+            x_fp4 = staged[0].activation[:rows]
+            x_sf = staged[0].activation_sf[:rows]
+            torch.ops.trtllm.fp4_quantize_into(x_bf16, self.fc31_input_scale, x_fp4, x_sf, False)
+            return x_fp4, x_sf
         # Leave a replica plan's SMs to its concurrent HALO-Q/TMA kernel. The
         # default overload remains unchanged without a plan.
         if reserved_sms > 0 and _fp4_quantize_has_sm_budget():
@@ -1209,7 +1273,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # (== ``megamoe_activation_sf_bytes_per_row``), so
         # 32-aligned-but-not-64-aligned hidden sizes (1568, 1632, 2080)
         # come back 2 bytes short; pad the tail before returning.
-        raw_cols = ceil_div(hidden, 16)
         x_sf_raw = x_sf.view(x_bf16.shape[0], raw_cols)
         if sf_cols == raw_cols:
             return x_fp4, x_sf_raw
@@ -1346,7 +1409,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         ``max_T`` so each bucket owns a distinct staging set.
         """
         max_T = int(max_T)
-        cache_key = (max_T, top_k, hidden, str(device), output_dtype)
+        cache_key = _StagingKey(max_T, top_k, hidden, str(device), output_dtype)
         cached = self._local_staging_cache
         if cache_key in cached:
             return cached[cache_key]
@@ -1912,10 +1975,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             launch_max_T=launch_max_T,
         )
         use_direct_inputs = (
-            self.ep_size > 1
-            and not self.tactic_autotune
-            and num_tokens == launch_max_T
-            and launch_max_T in self._genphase_direct_input_buckets
+            self._reads_inputs_in_place(num_tokens, launch_max_T)
             and x.shape == bufs.activation.shape
             and x_sf.shape == bufs.activation_sf.shape
             and x.is_contiguous()
@@ -1934,6 +1994,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             and topk_idx.data_ptr() % 16 == 0
             and topk_weights.data_ptr() % 16 == 0
         )
+        # Activation quantize_input wrote into this bucket's staging: the live rows of
+        # bufs.activation / activation_sf themselves.
+        activation_staged = (
+            x.data_ptr() == bufs.activation.data_ptr()
+            and x_sf.data_ptr() == bufs.activation_sf.data_ptr()
+        )
         if not use_direct_routing_inputs:
             self._stage_inputs(
                 bufs=bufs,
@@ -1943,7 +2009,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 topk_weights=topk_weights,
                 num_tokens=num_tokens,
                 top_k=top_k,
-                stage_activation=not use_direct_inputs,
+                stage_activation=not use_direct_inputs and not activation_staged,
                 replica_plan=replica_plan,
             )
         return self._launch_megamoe_kernel(

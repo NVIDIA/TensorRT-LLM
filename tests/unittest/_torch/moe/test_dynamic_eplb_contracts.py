@@ -1867,6 +1867,7 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(has_sm_budget):
     impl = _extract_class(source, "TrtllmCutedslMegaMoeNvfp4Impl", {"quantize_input"}, namespace)
     owner = impl()
     owner.fc31_input_scale = "scale"
+    owner._staging_of_next_run = lambda num_tokens: None  # a forward that run_moe does not stage
 
     owner.quantize_input(Activation(3, 64))
     owner.quantize_input(Activation(3, 64), reserved_sms=4)
@@ -2471,7 +2472,9 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     )
 
     assert out == "out"
-    tail = [("quantize", {}), ("bucket", 6)]
+    # The bucket hint precedes the quantization, which may write into that
+    # bucket's staging.
+    tail = [("bucket", 6), ("quantize", {})]
     if mode == "per_layer_dynamic":
         # The planner consumes the logical routes the calibrator records or
         # replays, and quantization leaves the plan's SMs to its copy kernel.
@@ -2481,8 +2484,8 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
             ("statistic", "logical"),
             ("calibrator", "logical"),
             ("route", "replayed logical"),
-            ("quantize", {"reserved_sms": 4}),
             ("bucket", 6),
+            ("quantize", {"reserved_sms": 4}),
             ("run_moe", "physical", plan),
             "start_set_cpu",
         ]

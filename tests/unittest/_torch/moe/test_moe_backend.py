@@ -2527,6 +2527,7 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(monkeypatch, requ
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)
     moe.fc31_input_scale = torch.ones(1)
+    moe._active_launch_max_tokens = None  # a forward that run_moe does not stage
     x = torch.zeros(3, 64, dtype=torch.bfloat16)
 
     moe.quantize_input(x)
@@ -3918,6 +3919,7 @@ def test_megamoe_cutedsl_quantize_input_applies_pre_quant_scale(
     backend = TrtllmCutedslMegaMoeNvfp4Impl.__new__(TrtllmCutedslMegaMoeNvfp4Impl)
     torch.nn.Module.__init__(backend)
     backend.fc31_input_scale = torch.nn.Parameter(torch.tensor(0.5), requires_grad=False)
+    backend._active_launch_max_tokens = None  # a forward that run_moe does not stage
     # Weight creation registers the slot as None, and only a checkpoint that
     # carries ``*.pre_quant_scale`` fills it, as ``NVFP4FusedMoEMethod`` does.
     backend.register_parameter("fc31_act_scale", None)

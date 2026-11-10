@@ -659,6 +659,14 @@ def _register_fake():
             return _fp4_quantize_fake(input, global_scale, sf_vec_size,
                                       sf_use_ue8m0, swizzled_layout)
 
+    @torch.library.register_fake("trtllm::fp4_quantize_into")
+    def _(input: torch.Tensor,
+          global_scale: torch.Tensor,
+          out: torch.Tensor,
+          out_sf: torch.Tensor,
+          is_sf_swizzled_layout: bool = False) -> None:
+        return None
+
     @torch.library.register_fake("trtllm::fp4_quantize_with_reorder_residual")
     def _(
         X: torch.Tensor,
