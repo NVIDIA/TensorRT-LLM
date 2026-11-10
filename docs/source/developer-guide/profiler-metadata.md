@@ -40,9 +40,9 @@ at their startup boundary. Native initialization is thread safe; probes remain
 inactive until initialization. Do not initialize from a collective, profiler
 callback, ABI entry point or shared-library static initializer.
 
-`ENABLE_NCCL_PROFILING` and `ENABLE_NANOBIND_PROFILING` default to OFF.
-Runtime selection cannot enable instrumentation omitted at build time. Build
-capabilities are exposed by `tensorrt_llm.bindings.BuildInfo`.
+Native NCCL and nanobind metadata scopes are not yet instrumented in this
+layer. Their selector tokens are reserved; selecting them does not add native
+probes.
 
 ## Capture prerequisites and output formats
 
