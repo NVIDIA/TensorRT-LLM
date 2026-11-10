@@ -218,6 +218,7 @@ class MLP(nn.Module):
             self.activation is gelu_tanh
             and up.quant_method.supports_cublas_epilogues(up)
             and isinstance(down.quant_method, FP8QDQLinearMethod)
+            and not down.quant_method.requires_unquantized_activation
             and down.quant_method.get_static_input_scale(down) is not None
             and not up.gather_output)
         return self._use_fp8_gelu_fusion

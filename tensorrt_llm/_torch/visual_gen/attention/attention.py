@@ -639,6 +639,7 @@ class Attention(nn.Module):
         skips its own quantization. Call after weights are loaded; returns whether it applies
         (FP8 Q/K/V producer on and a static FP8 to_out)."""
         to_out = self.to_out[0]
+        self._fp8_out_scale = None
         if self._fp8_qkv_producer and to_out.quant_method.supports_cublas_epilogues(to_out):
             self._fp8_out_scale = to_out.input_scale
         return self._fp8_out_scale is not None

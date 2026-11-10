@@ -70,6 +70,7 @@ std::tuple<torch::Tensor, torch::Tensor> fused_residual_norm_quant(torch::Tensor
     TORCH_CHECK(mode >= 0 && mode <= 2, "fused_residual_norm_quant: mode must be 0, 1 or 2");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be bfloat16");
     checkContiguousAligned(x, "x");
+    TORCH_CHECK(x.dim() >= 1 && x.size(-1) > 0, "fused_residual_norm_quant: x must have a non-empty last dimension");
     int64_t const hidden = x.size(-1);
     int64_t const rows = x.numel() / hidden;
     TORCH_CHECK(tk::residualNormQuantSupportsHidden(static_cast<int>(hidden)),
