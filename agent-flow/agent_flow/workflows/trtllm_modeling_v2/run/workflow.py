@@ -307,14 +307,15 @@ class TrtllmModelingV2Workflow:
 
     # ------------------------------------------------------------ orchestration
 
-    def run(self, task: str | Path) -> None:
+    def run(self, task: str | Path) -> bool:
+        """Run, or resume, to the verdict; whether the run is delivered (a dry run: preflight passed)."""
         log = get_logger().console
         state = self._init_state(task, log)
         if state is None:
-            return
+            return load_state(self.state_path).verdict == "delivered"
         self._role_agents()
         try:
-            self._run_stages(state, log)
+            return self._run_stages(state, log)
         except KeyboardInterrupt:
             print_message(
                 "[bold yellow]⚠ interrupted — re-run the same command to continue "
@@ -325,8 +326,8 @@ class TrtllmModelingV2Workflow:
             self.journal.event("run interrupted", f"stage={state.stage}")
             raise
 
-    def _run_stages(self, state: WorkflowState, log) -> None:
-        """Preflight, then the pipeline to the run's verdict.
+    def _run_stages(self, state: WorkflowState, log) -> bool:
+        """Preflight, then the pipeline to the run's verdict; whether it is delivered.
 
         Preflight runs on every start, a resume's included: every prompt and
         every check carries the environment it resolves. A failed preflight
@@ -334,14 +335,14 @@ class TrtllmModelingV2Workflow:
         """
         self._state = state
         if not bootstrap._run_preflight(self, state, log):
-            return
+            return False
         if self.dry_run:
             print_message(
                 "[bold cyan]→ --dry-run: preflight passed; stopping before the first agent "
                 "turn.[/bold cyan]",
                 log,
             )
-            return
+            return True
         if state.stage == STAGE_PREFLIGHT:
             state.stage = STAGE_EXECUTION
             self._checkpoint(state)
@@ -349,6 +350,7 @@ class TrtllmModelingV2Workflow:
         pipeline = Pipeline(self, state, log)
         verdict = pipeline.run()
         self._close_run(state, log, verdict=verdict, pipeline=pipeline)
+        return verdict == "delivered"
 
     # ------------------------------------------------------------------ helpers
 

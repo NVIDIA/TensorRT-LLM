@@ -668,8 +668,22 @@ def test_a_dry_run_stops_after_preflight_with_no_agent_turn_and_no_engine_comman
         ran.append(command)
         return CommandResult(returncode=0, stdout="ok\n")
 
-    calls = _run(tmp_path, task_file, monkeypatch, Script(), shell_runner=shell, dry_run=True)
-    assert calls == []
+    from agent_flow.workflows.trtllm_modeling_v2.checks import datasets
+
+    staged: list[str] = []
+    monkeypatch.setattr(datasets, "start", lambda *args, **kwargs: staged.append("started"))
+    devices: list[list[str]] = []
+
+    def no_gpu(argv, env=None, timeout=0):
+        devices.append(list(argv))
+        return CommandResult(returncode=127, stderr="nvidia-smi: command not found")
+
+    workflow = _workflow(tmp_path, shell_runner=shell, command_runner=no_gpu, dry_run=True)
+    calls = _install(monkeypatch, workflow, Script())
+    with workflow:
+        assert workflow.run(task_file) is True
+    # No device is queried or claimed, nothing is downloaded, no agent turn starts.
+    assert calls == [] and devices == [] and staged == []
     assert not any("engine_driver" in c or "trtllm-eval" in c or "trtllm-serve" in c for c in ran)
     state = _state(tmp_path)
     assert not state.done and state.stage == "preflight"

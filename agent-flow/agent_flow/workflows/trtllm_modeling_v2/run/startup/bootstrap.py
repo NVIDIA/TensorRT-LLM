@@ -100,13 +100,15 @@ def _run_preflight(workflow, state: WorkflowState, log) -> bool:
         ],
     )
     workflow.journal.section("preflight", f"```\n{format_preflight_report(result)}\n```")
-    # The benchmarks' datasets, staged beside the first turns: never a blocker.
-    datasets_mod.start(
-        workflow.task_data,
-        workflow.workspace,
-        python=getattr(result.environment, "python", None),
-        note=lambda said: workflow.journal.event("datasets", said),
-    )
+    # The benchmarks' datasets, staged beside the first turns: never a blocker. A dry run
+    # downloads nothing.
+    if not workflow.dry_run:
+        datasets_mod.start(
+            workflow.task_data,
+            workflow.workspace,
+            python=getattr(result.environment, "python", None),
+            note=lambda said: workflow.journal.event("datasets", said),
+        )
     print_message(f"[bold green]✔ preflight[/bold green]\n{format_preflight_report(result)}", log)
 
     # Where this run's commands land, decided once, from the resolved

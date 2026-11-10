@@ -330,7 +330,7 @@ def main(argv: list[str] | None = None) -> None:
         agent_turn_timeout=args.agent_turn_timeout,
     ) as workflow:
         try:
-            workflow.run(args.task)
+            delivered = workflow.run(args.task)
         except AgentConfigError as exc:
             print(f"error: {exc}", file=sys.stderr)
             sys.exit(2)
@@ -341,6 +341,9 @@ def main(argv: list[str] | None = None) -> None:
             sys.stderr.flush()
             heartbeat.mark_exit()
             os._exit(130)
+    # 0: delivered, or a dry run whose preflight passed. 1: anything else the run came to
+    # (a failed preflight, escalated, certification-failed); the journal and the report say what.
+    sys.exit(0 if delivered else 1)
 
 
 if __name__ == "__main__":
