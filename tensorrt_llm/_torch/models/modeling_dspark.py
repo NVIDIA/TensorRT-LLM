@@ -82,6 +82,7 @@ import json
 import math
 import os
 import re
+from contextlib import nullcontext
 from functools import lru_cache
 from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
@@ -752,12 +753,14 @@ def dspark_attention_forward_batched(
     block_rope_freqs = inverse_rope_freqs.reshape(-1, rd // 2, 2)
 
     # The K/V half (the wkv projections, the cache write and the draft-block RMSNorm/RoPE) runs
-    # on a side stream next to the query path and joins before attention.
-    main = torch.cuda.current_stream()
-    side = private_stream(x.device.index, "dspark_attn_kv")
+    # on a side stream next to the query path and joins before attention; CPU inputs run inline.
+    on_gpu = x.is_cuda
+    main = torch.cuda.current_stream() if on_gpu else None
+    side = private_stream(x.device.index, "dspark_attn_kv") if on_gpu else None
     if qkv_proj is None:
-        side.wait_stream(main)
-        with torch.cuda.stream(side):
+        if on_gpu:
+            side.wait_stream(main)
+        with torch.cuda.stream(side) if on_gpu else nullcontext():
             # Keep the two GEMM outputs live until dispatch so their RMSNorm/RoPE
             # kernels store directly into attention's physical inputs.
             main_kv_input = F.linear(main_x, wkv)
@@ -774,7 +777,8 @@ def dspark_attention_forward_batched(
             qkv_proj=qkv_proj,
             use_fused_fp8_input=use_fused_qkv_input_projection,
         )
-        side.wait_stream(main)
+        if on_gpu:
+            side.wait_stream(main)
 
     # Query: low-rank + per-head RMS + RoPE.
     q = _q_projection(
@@ -822,7 +826,7 @@ def dspark_attention_forward_batched(
             ring_attention_metadata = _dspark_ring_attention_metadata(
                 slots, start_pos, valid_len, window_size
             )
-        with torch.cuda.stream(side):
+        with torch.cuda.stream(side) if on_gpu else nullcontext():
             # The preparation kernels consume compact rows; fused QKV projections
             # return strided views into the shared projection output.
             cute_dsl_dspark_rmsnorm_rope_cache_write(
@@ -840,20 +844,21 @@ def dspark_attention_forward_batched(
                 block_rope_freqs,
                 eps,
             )
-        main.wait_stream(side)
-        for tensor in (
-            main_x,
-            x,
-            write_target,
-            slots,
-            start_pos,
-            main_rope_freqs,
-            block_rope_freqs,
-            main_kv_input,
-            block_kv_input,
-        ):
-            tensor.record_stream(side)
-        draft_block.record_stream(main)
+        if on_gpu:
+            main.wait_stream(side)
+            for tensor in (
+                main_x,
+                x,
+                write_target,
+                slots,
+                start_pos,
+                main_rope_freqs,
+                block_rope_freqs,
+                main_kv_input,
+                block_kv_input,
+            ):
+                tensor.record_stream(side)
+            draft_block.record_stream(main)
         block_tables, positions, valid_lengths, capacities = ring_attention_metadata
         o = fused_dsv4_dspark_attention(
             q,
@@ -868,11 +873,12 @@ def dspark_attention_forward_batched(
             softmax_scale,
         )
     else:
-        main.wait_stream(side)
-        for tensor in (main_x, x):
-            tensor.record_stream(side)
-        for tensor in (main_kv_input, block_kv_input):
-            tensor.record_stream(main)
+        if on_gpu:
+            main.wait_stream(side)
+            for tensor in (main_x, x):
+                tensor.record_stream(side)
+            for tensor in (main_kv_input, block_kv_input):
+                tensor.record_stream(main)
         main_kv = _rmsnorm_rope_batched(main_kv_input, kv_norm_w, eps, rd, main_freqs)
         kv = _rmsnorm_rope_batched(block_kv_input, kv_norm_w, eps, rd, blk_freqs)
         write_target[slots, start_pos % window_size] = main_kv.squeeze(1).to(write_target.dtype)
@@ -1824,6 +1830,11 @@ class DSv4DSparkDraftModel(nn.Module):
     # Native FP8 copies for the captured-row projections (set by _cache_fp8_prep_weights).
     _backfill_wkv_fp8: Optional[tuple] = None
     _main_proj_shard: Optional[tuple] = None
+    # The stacked back-fill wkv and K/V norms (_pack_backfill_wkv_weights), and the Rubin FP8
+    # stacked context wkv (_bind_attn_projections).
+    _backfill_wkv_weight: Optional[torch.Tensor] = None
+    _backfill_kv_norm_weight: Optional[torch.Tensor] = None
+    _context_wkv_fp8: Optional[tuple] = None
 
     def __init__(
         self,
@@ -1945,10 +1956,6 @@ class DSv4DSparkDraftModel(nn.Module):
         self._freqs_table_cache: Dict = {}
         self._context_wkv_fp8 = None
         self._use_bf16_linear = _use_dspark_bf16_linear(model_config.mapping)
-        self._backfill_wkv_weight: torch.Tensor | None = None
-        self._backfill_kv_norm_weight: torch.Tensor | None = None
-        self._backfill_wkv_fp8: Optional[tuple[torch.Tensor, torch.Tensor]] = None
-        self._main_proj_shard: Optional[tuple] = None
         self._tp_row_positions: torch.Tensor | None = None
         # The K-slice all-reduce on a workspace of its own, for the forked back-fill projection.
         self.prep_fork_allreduce: nn.Module | None = None
@@ -2013,14 +2020,10 @@ class DSv4DSparkDraftModel(nn.Module):
         from ..modules.low_m_gemm import lowm_fp8_supported, mxfp8_linear_scale
 
         self._tp_attention_ready = False
+        if not self.uses_lagged_pre or not IS_CUTLASS_DSL_AVAILABLE or not lowm_fp8_supported():
+            return
         mapping = self.model_config.mapping
-        if (
-            not self.uses_lagged_pre
-            or not IS_CUTLASS_DSL_AVAILABLE
-            or not lowm_fp8_supported()
-            or mapping.enable_attention_dp
-            or mapping.tp_size < 2
-        ):
+        if mapping.enable_attention_dp or mapping.tp_size < 2:
             return
         params = self._attn_params
         for stage in self.mtp_layers:
@@ -2272,19 +2275,15 @@ class DSv4DSparkDraftModel(nn.Module):
 
     def _pack_backfill_wkv_weights(self) -> None:
         """Share one loaded projection, and stack the K/V norms, across the backfill stages."""
-        self._backfill_kv_norm_weight = torch.stack(
-            [stage._dspark_attn["kv_norm_w"] for stage in self.mtp_layers]
-        )
         weights = [stage._dspark_attn["wkv"] for stage in self.mtp_layers]
-        if any(weight is None for weight in weights):
-            # Loaded FP8 projections back-fill through _project_context_wkv.
-            self._backfill_wkv_weight = None
-            return
         packed = torch.cat(weights, dim=0)
         # Stage attention and backfill share storage.
         for stage, weight in zip(self.mtp_layers, packed.split(weights[0].shape[0], dim=0)):
             stage._dspark_attn["wkv"] = weight
         self._backfill_wkv_weight = packed
+        self._backfill_kv_norm_weight = torch.stack(
+            [stage._dspark_attn["kv_norm_w"] for stage in self.mtp_layers]
+        )
 
     def cache_attn_weights_from_checkpoint(self, ckpt_dir: str, weight_map: Dict[str, str]) -> None:
         """Populate ``_dspark_attn`` by reading the ``mtp.{s}.attn.*`` tensors from the
@@ -2615,7 +2614,11 @@ class DSv4DSparkDraftModel(nn.Module):
         if main_x is None and kv is None:
             main_x = self.project_captured(main_hidden)  # [G, M, hidden]
         if kv is None:
-            if (
+            # [G, M, num_stages * head_dim]: every stage's wkv in one projection.
+            projected = self._project_context_wkv(main_x)
+            if projected is not None:
+                kv = projected.flatten(-2)
+            elif (
                 self._backfill_wkv_fp8 is not None
                 and G * M <= _TP_ATTN_ROW_LIMIT
                 and main_x.dtype == torch.bfloat16
@@ -2628,24 +2631,23 @@ class DSv4DSparkDraftModel(nn.Module):
             elif self._backfill_wkv_weight is not None:
                 kv = F.linear(main_x, self._backfill_wkv_weight)  # [G, M, num_stages * head_dim]
             else:
-                # Loaded FP8 projections: one stacked GEMM where available, else per stage.
-                projected = self._project_context_wkv(main_x)
-                kv = (
-                    projected.flatten(-2)
-                    if projected is not None
-                    else torch.cat(
-                        [
-                            self._project_context_wkv_stage(main_x, s, None)
-                            for s in range(len(self.mtp_layers))
-                        ],
-                        dim=-1,
-                    )
+                kv = torch.cat(
+                    [
+                        self._project_context_wkv_stage(main_x, s, None)
+                        for s in range(len(self.mtp_layers))
+                    ],
+                    dim=-1,
                 )
+        norm_weight = self._backfill_kv_norm_weight
+        if norm_weight is None:
+            norm_weight = torch.stack(
+                [stage._dspark_attn["kv_norm_w"] for stage in self.mtp_layers]
+            )
         eps = float(self._attn_params["eps"])
-        if IS_CUTLASS_DSL_AVAILABLE and _get_dspark_arch_str() is not None:
+        if kv.is_cuda and IS_CUTLASS_DSL_AVAILABLE and _get_dspark_arch_str() is not None:
             cute_dsl_dspark_backfill(
                 kv,
-                self._backfill_kv_norm_weight,
+                norm_weight,
                 torch.view_as_real(self._dspark_freqs_table(positions.device)),
                 mask,
                 positions.long(),
@@ -2663,7 +2665,7 @@ class DSv4DSparkDraftModel(nn.Module):
         ]
         rows, cols = slots.long()[:, None].expand(-1, M), positions % win
         stage_kvs = kv.chunk(len(self.mtp_layers), dim=-1)
-        for s, (stage_kv, norm_w) in enumerate(zip(stage_kvs, self._backfill_kv_norm_weight)):
+        for s, (stage_kv, norm_w) in enumerate(zip(stage_kvs, norm_weight)):
             stage_kv = _rope_last_dims_batched(_rmsnorm(stage_kv, norm_w, eps), rd, freqs)
             win_s = kv_windows[:, s]
             win_s[rows, cols] = torch.where(
@@ -3433,7 +3435,6 @@ class DSv4DSparkDraftModel(nn.Module):
             )
             else None
         )
-        self._pack_backfill_wkv_weights()
 
     def _project_context_wkv_stage(
         self,

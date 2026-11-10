@@ -1328,7 +1328,7 @@ def test_batched_fused_preparation_compacts_qkv_views(monkeypatch, batch, block)
         return draft.new_zeros(batch, 8, head_dim)
 
     monkeypatch.setattr(modeling_dspark, "IS_CUTLASS_DSL_AVAILABLE", True)
-    monkeypatch.setattr(modeling_dspark, "is_sm_100f", lambda: False)
+    monkeypatch.setattr(modeling_dspark, "_get_dspark_arch_str", lambda: None)
     monkeypatch.setattr(
         modeling_dspark, "is_fused_dspark_rmsnorm_rope_supported", lambda *args, **kwargs: False
     )
@@ -1395,9 +1395,12 @@ def test_forward_batched_reuses_ring_attention_metadata(monkeypatch, with_valid_
     stage_call = Mock(side_effect=lambda stage, h, *args, **kwargs: h)
     model = types.SimpleNamespace(
         mtp_layers=stages,
+        block_size=5,
         _attn_params={"window_size": 128},
         forward_embed=Mock(return_value=(hidden, torch.randn(2, 8), torch.zeros(2, 5))),
-        _dspark_freqs_table=Mock(return_value=torch.empty(0)),
+        _dspark_freqs_table=Mock(return_value=precompute_dspark_freqs_cis(2, 256)),
+        _tp_attention_ready=False,
+        _fuses_moe_boundary=Mock(return_value=False),
         _initial_pre_mix=Mock(return_value=None),
         _forward_stage=stage_call,
         uses_lagged_pre=False,

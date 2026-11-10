@@ -409,6 +409,7 @@ def drafter(kind, num_slots=4):
         worker._position_initialized = torch.zeros(rows, dtype=torch.bool)
         worker._kv_windows = torch.zeros(rows, 1, 2, 2)
         worker._batch_to_slot = torch.full((num_slots,), num_slots, dtype=torch.long)
+        worker._host_batch_to_slot = []
         meta = object.__new__(dspark.DSparkSpecMetadata)
         meta.batch_indices_cuda = torch.zeros(num_slots, dtype=torch.int)
         meta._dspark_worker = worker
@@ -433,6 +434,8 @@ def executor_for_preemption(p, reqs, scheduler):
         inflight_req_ids=set(),
         kv_cache_manager=Mock(spec=[]),
         kv_cache_transceiver=None,
+        _cancelled_disagg_model_request_ids=lambda: set(),
+        ctx_decoder_batcher=None,
         is_encoder_decoder=False,
         enable_attention_dp=False,
         enable_batch_waiting=False,
