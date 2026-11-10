@@ -72,16 +72,16 @@ class HealthCheck(_message.Message):
     def __init__(self, name: _Optional[str] = ..., state: _Optional[_Union[HealthState, str]] = ..., message: _Optional[str] = ...) -> None: ...
 
 class AbortRequest(_message.Message):
-    __slots__ = ("request_id", "kv_session", "all_requests", "encoder_cache")
+    __slots__ = ("request_id", "kv_session", "all_requests", "encoder_handoff")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     KV_SESSION_FIELD_NUMBER: _ClassVar[int]
     ALL_REQUESTS_FIELD_NUMBER: _ClassVar[int]
-    ENCODER_CACHE_FIELD_NUMBER: _ClassVar[int]
+    ENCODER_HANDOFF_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     kv_session: _kv_pb2.KvSessionRef
     all_requests: AllRequests
-    encoder_cache: _generation_pb2.EncoderCacheRef
-    def __init__(self, request_id: _Optional[str] = ..., kv_session: _Optional[_Union[_kv_pb2.KvSessionRef, _Mapping]] = ..., all_requests: _Optional[_Union[AllRequests, _Mapping]] = ..., encoder_cache: _Optional[_Union[_generation_pb2.EncoderCacheRef, _Mapping]] = ...) -> None: ...
+    encoder_handoff: _generation_pb2.EncoderHandoffRef
+    def __init__(self, request_id: _Optional[str] = ..., kv_session: _Optional[_Union[_kv_pb2.KvSessionRef, _Mapping]] = ..., all_requests: _Optional[_Union[AllRequests, _Mapping]] = ..., encoder_handoff: _Optional[_Union[_generation_pb2.EncoderHandoffRef, _Mapping]] = ...) -> None: ...
 
 class AllRequests(_message.Message):
     __slots__ = ()

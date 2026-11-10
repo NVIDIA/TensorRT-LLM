@@ -952,7 +952,7 @@ async def test_abort_encoder_cache_requires_encode_cleanup_support(role, has_dis
     context = FakeServicerContext()
     with pytest.raises(AbortError):
         await _servicer(inference=inference).Abort(
-            lifecycle_pb2.AbortRequest(encoder_cache={}), context
+            lifecycle_pb2.AbortRequest(encoder_handoff={}), context
         )
     assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
     if has_discard:
@@ -976,7 +976,7 @@ async def test_abort_encoder_cache_reports_release_and_idempotent_outcomes():
     inference._encoder_cache = SimpleNamespace(discard=discard)
     control = _servicer(inference=inference)
     req = lifecycle_pb2.AbortRequest(
-        encoder_cache=generation_pb2.EncoderCacheRef(transfer_backend="test-encoder")
+        encoder_handoff=generation_pb2.EncoderHandoffRef(transfer_backend="test-encoder")
     )
     for expected in (
         lifecycle_pb2.ABORT_STATUS_ABORTED,
@@ -1007,7 +1007,7 @@ async def test_abort_encoder_cache_preserves_failures(failure, code):
     context = FakeServicerContext()
     with pytest.raises(AbortError):
         await _servicer(inference=inference).Abort(
-            lifecycle_pb2.AbortRequest(encoder_cache={}), context
+            lifecycle_pb2.AbortRequest(encoder_handoff={}), context
         )
     assert context.abort_code == code
 
@@ -1032,7 +1032,7 @@ async def test_abort_encoder_cache_over_real_grpc(tmp_path):
     try:
         async with grpc.aio.insecure_channel(f"127.0.0.1:{port}") as channel:
             stub = openengine_pb2_grpc.ControlStub(channel)
-            req = lifecycle_pb2.AbortRequest(encoder_cache=reference)
+            req = lifecycle_pb2.AbortRequest(encoder_handoff=reference)
             for expected in (
                 lifecycle_pb2.ABORT_STATUS_ABORTED,
                 lifecycle_pb2.ABORT_STATUS_ALREADY_FINISHED,
@@ -1055,8 +1055,21 @@ async def test_encoder_cache_requirement_is_distinct_from_consumption_capability
     )
     assert info.HasField("encoder") is bool(role)
     assert info.encoder.encoder_only is (role == "encode")
-    assert info.encoder.accepts_cache is (role == "consume")
+    assert info.encoder.accepts_handoff is (role == "consume")
     assert info.encoder.supports_abort_cleanup is (role == "encode")
-    assert info.encoder.requires_cache is (role == "consume")
+    assert info.encoder.requires_handoff is (role == "consume")
+    for field in (
+        "schema_version",
+        "encoder_only",
+        "accepts_handoff",
+        "supports_abort_cleanup",
+        "requires_handoff",
+    ):
+        assert info.encoder.HasField(field) is bool(role)
+    assert info.encoder.HasField("transfer_backend") is (role == "encode")
+    assert info.encoder.transfer_backend == ("test-encoder" if role == "encode" else "")
+    assert list(info.encoder.supported_transfer_backends) == (
+        ["test-encoder"] if role == "consume" else []
+    )
     assert "trtllm_encoder_cache_release" not in info.extra
     assert "trtllm_requires_encoder_cache" not in info.extra

@@ -22,7 +22,7 @@
   ],
   "source": {
     "url": "https://github.com/ai-dynamo/openengine.git",
-    "commit": "4f2d17edc16d8b430df34c049c13cb5aedf0ba11",
+    "commit": "9d18a3859ea6b5b08d98038d80f1203add036ea8",
     "publication": "canonical review branch; not in a published BSR release"
   }
 }

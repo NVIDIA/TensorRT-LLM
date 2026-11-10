@@ -7,7 +7,6 @@ import base64
 import hashlib
 import json
 from dataclasses import asdict
-from itertools import chain
 from typing import Any
 
 import numpy as np
@@ -23,11 +22,29 @@ _MAX_DECODE_PREPARATION_BYTES = 2 * 1024 * 1024
 
 def _input_digest(request: Any) -> str:
     digest = hashlib.sha256()
+
+    def field(value: bytes) -> None:
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+
+    # Hash field values, not protobuf encoding or unknown extension fields.
     kind = request.WhichOneof("input")
-    data = request.prompt.encode() if kind == "prompt" else request.token_ids.SerializeToString()
-    for part in chain((kind.encode(), data), (item.SerializeToString() for item in request.media)):
-        digest.update(len(part).to_bytes(8, "big"))
-        digest.update(part)
+    if kind is None:
+        raise ValueError("encoder handoff requires prompt or token IDs")
+    field(kind.encode())
+    if kind == "prompt":
+        field(request.prompt.encode())
+    else:
+        field(np.asarray(request.token_ids.ids, dtype="<u4").tobytes())
+    digest.update(len(request.media).to_bytes(8, "big"))
+    for item in request.media:
+        digest.update(item.modality.to_bytes(4, "big", signed=True))
+        source = item.WhichOneof("source")
+        field((source or "").encode())
+        value = getattr(item, source) if source else b""
+        field(value if isinstance(value, bytes) else value.encode())
+        field(item.mime_type.encode())
+        field(item.uuid.encode())
     return digest.hexdigest()
 
 
