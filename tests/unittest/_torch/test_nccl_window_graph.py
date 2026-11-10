@@ -750,6 +750,76 @@ def test_eager_decoder_layer_scopes_after_failed_first_window_request(
     assert tensor_scope_events[-1][2:] == (output, False)
 
 
+def test_nested_eager_layers_release_after_first_window_request(
+    tensor_scope_events: list[tuple], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nested unscoped layer calls around the first window request each release their leases.
+
+    The inner call keeps its outputs, then the outer call keeps its own, as nested layer scopes
+    would at their exits. Later calls are scoped.
+    """
+    from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
+
+    class InnerLayer(DecoderLayer):
+        def forward(self, hidden_states: list[object]) -> list[object]:
+            return [object()]
+
+    class OuterLayer(DecoderLayer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.inner = InnerLayer()
+            self.inner_outputs: list[list[object]] = []
+
+        def forward(self, hidden_states: list[object]) -> list[object]:
+            self.inner_outputs.append(self.inner(hidden_states))
+            return hidden_states
+
+    # Before the outer and the inner call; after the inner call, which makes the first request;
+    # after the outer call.
+    requested_states = [False, False, True, True]
+    queries = []
+
+    def has_requested_nccl_window_buffers() -> bool:
+        queries.append(requested_states[len(queries)])
+        return queries[-1]
+
+    def release_nccl_window_tensor_scope_leases(
+        inputs: list[object], outputs: list[object]
+    ) -> None:
+        tensor_scope_events.append(("release", inputs, outputs))
+
+    monkeypatch.setattr(
+        torch.ops.trtllm, "has_requested_nccl_window_buffers", has_requested_nccl_window_buffers
+    )
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "release_nccl_window_tensor_scope_leases",
+        release_nccl_window_tensor_scope_leases,
+    )
+    layer = OuterLayer()
+    handles = nccl_window_tensor_scope.install_eager_nccl_window_tensor_scopes(layer)
+    output = [object()]
+    try:
+        assert layer(output) is output
+        assert [event[0] for event in tensor_scope_events] == ["release", "release"]
+        assert tensor_scope_events[0][2] == layer.inner_outputs[0]
+        assert tensor_scope_events[1][2] == output
+        assert layer(output) is output
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert queries == [False, False, True, True]
+    assert [event[0] for event in tensor_scope_events] == [
+        "release",
+        "release",
+        "begin",
+        "begin",
+        "end",
+        "end",
+    ]
+
+
 def test_eager_decoder_layer_hook_allows_no_cuda_output(tensor_scope_events):
     from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 

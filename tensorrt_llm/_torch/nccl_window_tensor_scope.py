@@ -323,7 +323,12 @@ def _install_forward_scope(module: torch.nn.Module) -> _ForwardScopeHandle:
 def install_eager_nccl_window_tensor_scopes(
     model: torch.nn.Module,
 ) -> list[_ForwardScopeHandle]:
-    """Install eager model scopes without exposing Python hooks to Dynamo."""
+    """Install eager model scopes without exposing Python hooks to Dynamo.
+
+    Run the model inside ``nccl_window_tensor_scope``, as ``ModelCaller`` does. Layer calls run
+    unscoped until the process's first window request, and the call that makes it releases its
+    window temporaries from that enclosing scope.
+    """
     return [
         _install_forward_scope(module)
         for module in model.modules()

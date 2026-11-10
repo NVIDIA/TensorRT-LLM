@@ -295,7 +295,8 @@ public:
 
     //! Release the leases of the calling thread's innermost scope on \p device on \p stream, as a
     //! successful exit of that scope would, except those of \p keptStorages, which stay with the
-    //! scope. The scope stays open. Does nothing without an open scope.
+    //! scope. The scope stays open. Without an open scope, this releases nothing and logs a warning
+    //! the first time.
     void releaseTensorLeaseScopeLeases(
         std::vector<c10::StorageImpl const*> const& keptStorages, int device, cudaStream_t stream);
 

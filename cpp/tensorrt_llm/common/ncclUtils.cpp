@@ -913,6 +913,15 @@ void NCCLWindowAllocator::releaseTensorLeaseScopeLeases(
     auto const stackIt = mTensorLeaseScopeStacks.find(getTensorLeaseScopeKey(device));
     if (stackIt == mTensorLeaseScopeStacks.end() || stackIt->second.empty())
     {
+        static std::once_flag noScopeWarning;
+        std::call_once(noScopeWarning,
+            []
+            {
+                TLLM_LOG_WARNING(
+                    "[NCCLUtil] No NCCL window tensor lease scope is open on this thread, so no lease is released. "
+                    "Window tensors created outside a scope stay leased until their destructors quarantine their "
+                    "buffers. Run eager models inside nccl_window_tensor_scope.");
+            });
         return;
     }
     auto& scope = stackIt->second.back();

@@ -1426,6 +1426,24 @@ TEST_F(CreateNCCLWindowTensorTest, ScopeLeaseReleaseKeepsScopeAndKeptStorages)
         nccl_util::NCCLWindowAllocatorTestAccess::isReusableOnStream(allocator, *mComm, outputBuffer.ptr, stream));
 }
 
+TEST_F(CreateNCCLWindowTensorTest, ScopeLeaseReleaseWithoutScopeReleasesNothing)
+{
+    using nccl_util::createNCCLWindowTensor;
+
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    int const device = at::cuda::current_device();
+    cudaStream_t const stream = at::cuda::getCurrentCUDAStream();
+    auto [tensor, buffer] = createNCCLWindowTensor(mComm, {16, 16}, torch::kFloat32);
+    ASSERT_TRUE(buffer.isValid());
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 1);
+
+    // No scope is open, so the unscoped lease stays in use.
+    allocator.releaseTensorLeaseScopeLeases({}, device, stream);
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 1);
+    releaseTensor(tensor);
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 0);
+}
+
 TEST_F(CreateNCCLWindowTensorTest, AuxiliaryStreamTensorJoinsCurrentThreadScope)
 {
     using nccl_util::createNCCLWindowTensor;
