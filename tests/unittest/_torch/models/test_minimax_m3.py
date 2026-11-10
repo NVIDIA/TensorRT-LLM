@@ -77,7 +77,6 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3QKVIndexerLinear,
     _build_swiglu_oai_dense_mlp,
     _dispatch_attention_over_live_tokens,
-    _get_index_projection_quant_config,
     _load_index_qk_proj_weights,
     _load_qkv_index_proj_weights,
     _minimax_m3_swiglu_oai,
@@ -93,7 +92,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     is_minimax_m3_vl_config,
 )
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
-from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
+from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2, fused_checkpoint_names
 from tensorrt_llm._torch.modules.linear import _load_kv_cache_scales
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
@@ -1521,33 +1520,6 @@ def test_modelopt_mixed_precision_map_is_normalized() -> None:
             assert (out[key].quant_algo, out[key].group_size) == (QuantAlgo.NVFP4, 16)
         else:
             assert key not in out
-
-
-@pytest.mark.cpu_only
-def test_index_projection_quant_config_follows_declared_entries() -> None:
-    _, layer_quant_config = _expand_packaged_quant_config(_packaged_vl_config())
-    declared = _get_index_projection_quant_config(
-        SimpleNamespace(quant_config_dict=layer_quant_config), 4
-    )
-    assert (declared.quant_algo, declared.group_size) == (QuantAlgo.MXFP8, 32)
-    # Checkpoints without per-layer entries keep the unquantized index projection.
-    for quant_config_dict in (None, {}):
-        assert (
-            _get_index_projection_quant_config(
-                SimpleNamespace(quant_config_dict=quant_config_dict), 4
-            )
-            is None
-        )
-
-    mismatched = dict(layer_quant_config)
-    mismatched["model.layers.4.self_attn.index_k_proj"] = QuantConfig(
-        quant_algo=QuantAlgo.NVFP4, group_size=16
-    )
-    with pytest.raises(ValueError, match="same quantization"):
-        _get_index_projection_quant_config(SimpleNamespace(quant_config_dict=mismatched), 4)
-    del mismatched["model.layers.4.self_attn.index_k_proj"]
-    with pytest.raises(ValueError, match="same quantization"):
-        _get_index_projection_quant_config(SimpleNamespace(quant_config_dict=mismatched), 4)
 
 
 # ---------------------------------------------------------------------------
@@ -3620,50 +3592,24 @@ def _stub_minimax_m3_attention_construction(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("entries", ["matching", "absent", "mismatched", "missing_k"])
-def test_minimax_m3_index_projection_quantization_follows_checkpoint_entries(
-    monkeypatch: pytest.MonkeyPatch, entries: str
+def test_minimax_m3_index_projection_declares_its_checkpoint_names(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """index_qk_proj is quantized exactly when the checkpoint declares matching per-layer entries."""
+    """index_qk_proj starts unquantized and names its checkpoint parts for the quantization passes."""
     _, model_config = _make_fused_qk_norm_rope_test_config()
-    # Other-layer entries must not affect the projection being constructed.
-    declared = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
-    other = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
-    layer_quant_config = {
-        "model.layers.2.self_attn.index_q_proj": other,
-        "model.layers.2.self_attn.index_k_proj": other,
-    }
-    if entries != "absent":
-        layer_quant_config["model.layers.3.self_attn.index_q_proj"] = declared
-    if entries in ("matching", "mismatched"):
-        layer_quant_config["model.layers.3.self_attn.index_k_proj"] = (
-            declared if entries == "matching" else other
-        )
-    model_config.quant_config_dict = layer_quant_config
     projection_factory = _stub_minimax_m3_attention_construction(monkeypatch)
-    lookup = Mock(wraps=_get_index_projection_quant_config)
-    monkeypatch.setattr(modeling_minimaxm3, "_get_index_projection_quant_config", lookup)
-    if entries in ("mismatched", "missing_k"):
-        with pytest.raises(ValueError, match="same quantization"):
-            MiniMaxM3Attention(
-                model_config=model_config,
-                layer_idx=3,
-                is_sparse_attention_layer=True,
-                disable_index_value=True,
-            )
-        projection_factory.assert_not_called()
-    else:
-        layer = MiniMaxM3Attention(
-            model_config=model_config,
-            layer_idx=3,
-            is_sparse_attention_layer=True,
-            disable_index_value=True,
-        )
-        projection_factory.assert_called_once()
-        expected = declared if entries == "matching" else None
-        assert layer.index_qk_proj.quant_config is expected
-        assert projection_factory.call_args.kwargs["quant_config"] is expected
-    lookup.assert_called_once_with(model_config, 3)
+    layer = MiniMaxM3Attention(
+        model_config=model_config,
+        layer_idx=3,
+        is_sparse_attention_layer=True,
+        disable_index_value=True,
+    )
+    projection_factory.assert_called_once()
+    assert projection_factory.call_args.kwargs["quant_config"] is None
+    assert layer.index_qk_proj.fused_checkpoint_names == ("index_q_proj", "index_k_proj")
+    assert fused_checkpoint_names(
+        layer.index_qk_proj, "model.layers.3.self_attn.index_qk_proj"
+    ) == ["model.layers.3.self_attn.index_q_proj", "model.layers.3.self_attn.index_k_proj"]
 
 
 def _dense_sdpa_decode_reference(q, k_ctx, v_ctx, seq_lens, num_kv_heads, head_dim):
