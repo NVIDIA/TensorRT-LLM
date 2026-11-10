@@ -14,15 +14,10 @@
 # limitations under the License.
 r"""End-to-end beam-search benchmark shaped like a generative-recommendation workload.
 
-Each request is a long prompt (a user's history as semantic-ID (SID) tokens,
-5 tokens per item) decoded for a few tokens with a wide beam, so every beam of
-a request shares one large prompt. This is the case the opt-in
-``beam_shared_prefix`` FMHA library targets (``TLLM_FMHA_LIBS=+beam_shared_prefix``).
-
-The model is a Qwen3 checkpoint whose embedding table is extended by the SID
-tokens; prompts are built directly as token ids, so no tokenizer is needed at
-run time. Run each arm (library on / off) in its own process: the library is
-selected from the environment when the engine is built.
+Each request is a long prompt (a user's history as semantic-ID (SID) tokens) decoded for a few
+tokens with a wide beam, the case the opt-in ``beam_shared_prefix`` library targets. The model is
+a Qwen3 checkpoint with its embedding table extended by the SID tokens; prompts are token ids.
+Run each arm (library on / off) in its own process: the library is chosen when the engine is built.
 
 Usage::
 
@@ -40,11 +35,9 @@ Usage::
     # 3. compare beams and throughput
     python beam_search_lrm_perf.py compare base.json cascade.json
 
-``TLLM_WORKER_USE_SINGLE_PROCESS=1`` is required for ``--count-iterations``: the
-counters wrap host-side code of the executor process.
-
-For an Nsight Systems trace of the measured batches only, pass ``--profile`` and
-launch under ``nsys profile -c cudaProfilerApi --cuda-graph-trace node``.
+``TLLM_WORKER_USE_SINGLE_PROCESS=1`` is required for ``--count-iterations``. For an Nsight
+Systems trace of the measured batches, pass ``--profile`` under
+``nsys profile -c cudaProfilerApi --cuda-graph-trace node``.
 
 Reported per arm (``run``):
 
@@ -190,12 +183,9 @@ def text_prompts(model_dir, num_prompts, min_tokens, max_tokens, seed):
 
 
 class IterationCounter:
-    """Counts executor iterations by batch composition at the plan hook.
+    """Counts executor iterations by batch composition at the library's plan hook.
 
-    ``TrtllmAttentionMetadata.prepare`` calls the library's ``plan_step`` once
-    per beam-search iteration on the host, before graph capture or replay, so
-    this sees every iteration even when the attention body is replayed from a
-    CUDA graph.
+    The hook runs on the host every iteration, even when attention is replayed from a CUDA graph.
     """
 
     def __init__(self):

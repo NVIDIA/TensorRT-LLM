@@ -217,7 +217,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # Plan caches of the FMHA libraries, keyed by library. A planned wrapper owns
     # workspaces that CUDA graphs capture, so it lives exactly as long as this
     # metadata; every layer that runs with this metadata reuses it.
-    fmha_plan_caches: Dict[str, dict] = field(default_factory=dict,
+    fmha_plan_caches: Dict[str, Any] = field(default_factory=dict,
                                               init=False,
                                               repr=False)
     # Context-only plan shared by the layers of one forward (TrtllmAttention.cache_context_plan).
