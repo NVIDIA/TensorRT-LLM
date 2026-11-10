@@ -624,6 +624,46 @@ def test_a_control_that_cannot_answer_leaves_the_keeps_standing_until_more_arriv
     assert camp.state.checkpoint["retry_after"] == 4
 
 
+def test_a_checkpoints_suite_job_holds_as_many_devices_as_the_widest_member(tmp_path):
+    """The checkpoint's gate drops the members (accuracy runs on the final tree), not their width.
+
+    The target's suite carries multi-rank tests; on one device they fail at every checkpoint
+    and every keep since the last one is rolled back.
+    """
+    gates = FakeRunner(["g1"], "campg", _effect)
+    asked: dict[str, str] = {}
+    submit = gates.submit
+
+    def recording(spool, label, command, **kw):
+        asked[label] = kw.get("gpus", "all")
+        return submit(spool, label, command, **kw)
+
+    gates.submit = recording
+    camp = _campaign(tmp_path, gates, [])
+    assert camp.keep_gate.members == ("dep4",) and camp.keep_gate.suite_devices == 4
+    suite = camp.keep_gate.tests_only()
+    assert suite.members == () and not suite.ungated
+    assert suite.suite_devices == 4 and suite.needs("tests")[0] == 4
+    (ck,) = _run(camp)
+    (label,) = [label for label in asked if label.startswith("gate-ckpt-")]
+    assert label.endswith("-tests") and asked[label] == "4"
+    assert ck["correctness"] == "PASS" and camp.state.kept == ["fast-path"]
+
+
+def test_the_suite_width_leaves_the_campaigns_evidence_inputs_as_they_were(tmp_path):
+    """The suite's width restates the members' width and changes nothing the gate judges.
+
+    It stays out of the evidence inputs, so a campaign resumed across a change of that field
+    keeps its controls and measurements instead of measuring them all again.
+    """
+    camp = _campaign(tmp_path, FakeRunner(["g1"], "campg", _effect), [])
+    before = camp.state.inputs
+    assert before
+    camp.keep_gate = replace(camp.keep_gate, suite_width=camp.keep_gate.suite_devices)
+    camp.refresh_inputs()
+    assert camp.state.inputs == before
+
+
 HOUR = 3600.0
 
 

@@ -129,6 +129,8 @@ class KeepGate:
     planned_floor: Mapping[str, Any] = field(default_factory=dict)
     #: Why this gate runs no accuracy part though the campaign has one (:meth:`tests_only`).
     skipped: str = ""
+    #: The suite's devices once the members are dropped (:meth:`tests_only`); 0: the members'.
+    suite_width: int = 0
 
     @property
     def suite_devices(self) -> int:
@@ -136,9 +138,10 @@ class KeepGate:
 
         The target's suite carries multi-rank tests (a collective's op matrix
         needs as many devices as the widest member); on fewer devices such a
-        test fails for the job's size, not for the candidate.
+        test fails for the job's size, not for the candidate. A checkpoint's
+        gate has no members (:meth:`tests_only`) and keeps their width.
         """
-        return max((_width(m) or 1 for m in self.members), default=1)
+        return self.suite_width or max((_width(m) or 1 for m in self.members), default=1)
 
     @property
     def ungated(self) -> bool:
@@ -149,7 +152,12 @@ class KeepGate:
         """The suite alone: a checkpoint's (accuracy runs once, on the final tree)."""
         if self.ungated:
             return self
-        return replace(self, members=(), skipped="accuracy runs once, on the final tree")
+        return replace(
+            self,
+            members=(),
+            skipped="accuracy runs once, on the final tree",
+            suite_width=self.suite_devices,
+        )
 
     def accuracy_only(self) -> "KeepGate":
         """The accuracy part alone: the final tree's, the suite having run at each checkpoint."""
