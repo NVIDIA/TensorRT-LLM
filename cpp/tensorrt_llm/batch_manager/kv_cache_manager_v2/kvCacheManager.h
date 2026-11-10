@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cuda.h>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -144,11 +145,22 @@ public:
 
     // ---- Lifecycle --------------------------------------------------------
 
+    //! Releases everything the manager holds with the driver. Call it with cudaContext() current,
+    //! after every KvCache is closed. Idempotent: a second call returns at once, and once it has
+    //! run the destructor has nothing left to do. The destructor calls it for a manager that
+    //! was never shut down, after making cudaContext() current itself.
     void shutdown();
 
     // Number of not-yet-destroyed managers in this process. A manager counts from the start of its
     // construction, so one whose constructor throws is counted for the duration of that attempt.
     [[nodiscard]] static uint32_t numLiveManagers() noexcept;
+
+    //! The CUDA context the manager's device resources live in: the one current when it was
+    //! constructed. Teardown that runs on another thread makes it current first.
+    [[nodiscard]] CUcontext cudaContext() const noexcept
+    {
+        return mCudaContext;
+    }
 
     // Clear all reusable (committed) blocks from the radix tree.
     void clearReusableBlocks();
@@ -624,6 +636,12 @@ private:
     // First member, so the registration covers the whole lifetime: it is taken before any state
     // this manager could leave behind exists, and dropped after ~KvCacheManager has run.
     PoisonHold mPoisonHold;
+
+    //! See cudaContext(). Never null: construction rejects a thread without a current context.
+    CUcontext mCudaContext = nullptr;
+
+    //! shutdown() has run; the destructor then has nothing to do.
+    bool mShutDown = false;
 
     //! Guards all mutable state reachable from this manager. See the scope note above.
     mutable ReentrantSharedMutex mApiMutex;

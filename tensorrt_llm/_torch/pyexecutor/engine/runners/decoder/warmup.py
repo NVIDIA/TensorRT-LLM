@@ -46,6 +46,7 @@ from tensorrt_llm.mapping import CpType, Mapping
 from .metadata import resolve_mamba_metadata_cls
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.modules.embedding import LMHead
     from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -259,6 +260,7 @@ class DecoderWarmup:
         context_warmups_supported: bool,
         eager_workspace_reclaimable: bool,
         warmup_inputs: torch.Tensor | None = None,
+        context_logits_heads: tuple[LMHead, ...] = (),
     ) -> None:
         self._config = config
         self.mapping = mapping
@@ -278,6 +280,9 @@ class DecoderWarmup:
         # Warmups that synthesize context batches.
         self._context_warmups_supported = context_warmups_supported
         self._eager_workspace_reclaimable = eager_workspace_reclaimable
+        # Heads that project context logits eagerly; their workspaces are
+        # reserved during warmup.
+        self._context_logits_heads = context_logits_heads
         # Token shape of the last autotuner warmup that ran a forward pass.
         self._completed_autotuner_warmup_num_tokens: int | None = None
 
@@ -370,6 +375,8 @@ class DecoderWarmup:
             warmup_sampling_module()
             if self._config.max_beam_width > 1:
                 warmup_topk_module()
+            for head in self._context_logits_heads:
+                head.prepare_context_logits_workspace()
             self._prewarm_engram_kernels(kv_cache_manager)
             self._prewarm_csa2_sparse_indexer(kv_cache_manager)
             self._prewarm_minimax_m3_msa_indexer(kv_cache_manager)
