@@ -180,16 +180,21 @@ class Plan:
     tasks: list[Task] = field(default_factory=list)
 
 
-def entry_repair_block(problems: list[str]) -> str:
-    """What a kernel writer whose landed entry the delivery check would refuse is told."""
+def static_repair_block(problems: list[str], *, entry: bool) -> str:
+    """What a worker whose landed work the final certification would refuse is told."""
     listed = "\n".join(f"- {problem}" for problem in problems)
+    what = (
+        "Put the entry right in your worktree (its `CELLS` name the cells you drove and saw "
+        "pass, its `ARCHS` this architecture)"
+        if entry
+        else "Put the tree right in your worktree (each finding names the file or list it reads)"
+    )
     return (
-        "## Your landed entry is not valid as committed\n\n"
+        "## Your landed work is not deliverable as committed\n\n"
         "Read statically, as the final certification reads it:\n\n"
         f"{listed}\n\n"
-        "Do not start the task again. Put the entry right in your worktree (its `CELLS` name "
-        "the cells you drove and saw pass, its `ARCHS` this architecture), commit with "
-        "`git commit -s`, and write your decision file again."
+        f"Do not start the task again. {what}, commit with `git commit -s`, and write your "
+        "decision file again."
     )
 
 
@@ -468,28 +473,42 @@ class Pipeline:
             except VocabularyError as exc:
                 result.error = f"vocabulary.yaml does not validate: {exc}"
             return result
-        if tree is not None and task.kind == "kernel":
-            problems = self._entry_problems(task, tree)
+        if tree is not None:
+            problems = self._static_problems(task, tree)
             if problems:
-                # The delivery check would refuse it on the final commit: one short turn now.
+                # The final certification would refuse it: one short turn now, no GPU.
                 said = "; ".join(problems)
-                self.w.journal.event("task", f"{task.id}: the landed entry is not valid: {said}")
-                note = entry_repair_block(problems)
+                self.w.journal.event("task", f"{task.id}: not deliverable as landed: {said}")
+                note = static_repair_block(problems, entry=task.kind == "kernel")
                 self._dispatch(task, role, self._prompt(task, f"{block}\n\n{note}"), path)
                 data = read_decision(path, role)
                 if data is None or data["decision"] not in FINISHED:
                     return TurnResult(
-                        error=f"its landed entry is not valid ({said}), and the "
+                        error=f"its landed work is not deliverable ({said}), and the "
                         "turn asked to put it right did not finish"
                     )
                 result = TurnResult(str(data["decision"]), data)
-                problems = self._entry_problems(task, tree)
+                problems = self._static_problems(task, tree)
                 if problems:
-                    result.error = f"its landed entry is not valid: {'; '.join(problems)}"
+                    result.error = f"its landed work is not deliverable: {'; '.join(problems)}"
                     return result
         if tree is not None:
             result.error = self._integrate(task, role, tree, block)
         return result
+
+    def _static_problems(self, task: Task, tree: Path) -> list[str]:
+        """What the final certification's static checks would refuse in a landed task.
+
+        A kernel task's entry by the one entry rule; a unit, variant or fix task's tree by
+        the delivery checks that read files (layout, routing, the anchor row, the accuracy
+        test and its test list, the entries the target imports), not the tests or the
+        commits, which certification and integration check.
+        """
+        if task.kind == "kernel":
+            return self._entry_problems(task, tree)
+        if task.kind in ("assemble", "feature", "variant", "fix") and self.w._preflight:
+            return certify_mod.static_delivery_failures(self.w, tree)
+        return []
 
     def _entry_problems(self, task: Task, tree: Path) -> list[str]:
         """What the delivery check would refuse in a kernel task's entry, read statically."""

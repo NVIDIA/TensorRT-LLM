@@ -962,7 +962,7 @@ def test_a_landed_entry_is_read_as_the_certification_reads_it(tmp_path):
     from agent_flow.workflows.trtllm_modeling_v2.run.pipeline import (
         Pipeline,
         Task,
-        entry_repair_block,
+        static_repair_block,
     )
 
     target = "tensorrt_llm/_torch/_experimental/modeling_v2/models/fam/tgt"
@@ -992,8 +992,11 @@ def test_a_landed_entry_is_read_as_the_certification_reads_it(tmp_path):
     assert problems() == ["ARCHS names sm_100, not sm_103"]
     entry.write_text(head + cells + "    ARCHS = frozenset({Arch.SM_103})\n")
     assert problems() == []
-    block = entry_repair_block(["Rms declares no CELLS: nothing is certified"])
+    block = static_repair_block(["Rms declares no CELLS: nothing is certified"], entry=True)
     assert "Do not start the task again" in block and "- Rms declares no CELLS" in block
+    assert "`CELLS` name the cells" in block
+    unit = static_repair_block(["tests:test-db: not listed"], entry=False)
+    assert "Put the tree right" in unit and "- tests:test-db: not listed" in unit
 
 
 def test_the_report_lists_what_the_workers_left_uncertified(tmp_path):
@@ -1013,3 +1016,29 @@ def test_the_report_lists_what_the_workers_left_uncertified(tmp_path):
         "- `core`: lm_head at M=8192",
         "- `k1-rms`: cached-prefix context (31+33 tokens) fails in shared code",
     ]
+
+
+def test_a_landed_unit_is_read_with_the_static_delivery_checks(tmp_path, task_file):
+    from types import SimpleNamespace
+
+    from agent_flow.workflows.trtllm_modeling_v2.run.certify import static_delivery_failures
+
+    spec = yaml.safe_load(task_file.read_text())
+    target = (
+        "tensorrt_llm/_torch/_experimental/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_103__tp1"
+    )
+    workflow = SimpleNamespace(
+        task_data=spec, _preflight=SimpleNamespace(target_rel=target, family="gpt_oss")
+    )
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    failures = static_delivery_failures(workflow, tree)
+    names = {f.split(":", 2)[0] + ":" + f.split(":", 2)[1] for f in failures}
+    # An empty tree misses what the final certification reads: the target and its accuracy row.
+    assert "target:modeling.py" in names
+    assert "accuracy:reference" in names
+    # Smoke and bringup runs owe no CI files: the same waiver as the certification's.
+    spec["profile"] = "bringup"
+    waived = static_delivery_failures(workflow, tree)
+    assert not any(f.startswith(("accuracy:reference", "tests:test-db")) for f in waived)
+    assert any(f.startswith("target:modeling.py") for f in waived)

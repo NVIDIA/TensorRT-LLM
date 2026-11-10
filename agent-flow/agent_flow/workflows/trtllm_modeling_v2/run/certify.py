@@ -367,6 +367,31 @@ def delivery_report(workflow, commit: str, round: int = 0) -> DeliveryReport:
     return DeliveryReport(checks=tuple(checks))
 
 
+def static_delivery_failures(workflow, tree: str | Path) -> list[str]:
+    """The delivery checks that read files, run on ``tree`` (a task's worktree): what fails.
+
+    The same checks the certification runs, less the commit audit (integration audits a
+    task's commits) and the delivered tests (they run at the certification); a CI waiver
+    applies as it does there.
+    """
+    task = workflow.task_data
+    target_rel = workflow._preflight.target_rel
+    family = workflow._preflight.family
+    report = verify_delivery(
+        repo_root=tree,
+        target_rel=target_rel,
+        family=family,
+        reference_yaml=resolve_per_unit(
+            task["accuracy"], "reference_yaml", (assembly_units(task) or [None])[-1]
+        ),
+        model_key=resolve_model_key(task),
+        accuracy_test=accuracy_test_path(tree, family, Path(target_rel).name),
+        arch=str(task.get("arch") or ""),
+    )
+    waived = CI_DELIVERY_CHECKS if ci_waiver(task) else ()
+    return [f"{c.name}: {c.detail}" for c in report.checks if not c.passed and c.name not in waived]
+
+
 def target_test_modules_check(repo_root: str | Path, target_rel: str) -> DeliveryCheck | None:
     """How many test modules the target delivers under its tests' directory, and their lines.
 
