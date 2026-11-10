@@ -53,7 +53,7 @@ pydantic>=2.9.1
 pydantic-settings[yaml]
 msgspec
 omegaconf
-pillow
+pillow>=13.0.0
 PyNvVideoCodec>=2.2.0
 optimum
 datasets
