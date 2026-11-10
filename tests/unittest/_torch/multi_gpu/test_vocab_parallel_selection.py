@@ -316,11 +316,108 @@ def _worker_accept_check(rank, tp, mnnvl):
     assert torch.equal(out[1], ref[1])
 
 
+@torch.inference_mode()
+def _worker_argmax_check(rank, tp, mnnvl):
+    """The vocab-parallel greedy argmax of the stock one-model workers
+    (``SpecWorkerBase.enable_vocab_parallel_argmax``), through the TP key
+    exchange and through the NCCL pair exchange: target and draft tokens equal
+    ``torch.argmax`` over the gathered logits, ties included, eagerly and under
+    CUDA-graph replay."""
+    from tensorrt_llm._torch.distributed.ll_exchange import TPKeyExchange
+    from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
+
+    class _Worker(SpecWorkerBase):
+        verifies_on_target_shard = True
+
+        @property
+        def max_draft_len(self):
+            return 4
+
+        def _forward_impl(self, *args, **kwargs):
+            raise NotImplementedError
+
+    head, vocab = _make_head(rank, tp, mnnvl)
+    lm_head = head.lm_head
+    mapping = lm_head.mapping
+    key_exchange = TPKeyExchange.create(mapping, max_rows=512)
+    assert key_exchange is not None, "no peer memory for the key exchange"
+    try:
+        for use_key_exchange in (True, False):
+            worker = _Worker()
+            assert worker.enable_vocab_parallel_argmax(
+                lm_head, key_exchange if use_key_exchange else None
+            )
+            assert (worker.key_exchange is not None) == use_key_exchange
+            assert worker.mapping is mapping
+            for rows in (1, 7, 64, 300):
+                gen = torch.Generator(device="cuda").manual_seed(rows)
+                full = torch.randint(-4, 4, (rows, vocab), device="cuda", generator=gen).to(
+                    torch.bfloat16
+                )
+                if rows >= 5:
+                    full = _special_rows(full)
+                    # NaN logits do not occur in decoding; the key exchange
+                    # orders them by their bit pattern.
+                    full[2] = 0.0
+                expected = torch.argmax(full.float(), dim=-1).to(torch.int32)
+                assert torch.equal(worker._sharded_argmax(_shard(full, rank)), expected)
+
+            # Through target_logits and the target sampler, from the real head.
+            md = SimpleNamespace(
+                is_all_greedy_sample=True,
+                temperature_only=False,
+                enable_penalty=False,
+                sharded_target_logits=False,
+                is_cuda_graph=False,
+                is_ragged_verify=False,
+            )
+            hidden = torch.randn(48, HIDDEN, device="cuda").to(torch.bfloat16)
+            expected = torch.argmax(lm_head(hidden).float(), dim=-1).to(torch.int32)
+
+            def target_tokens():
+                logits = worker.target_logits(hidden, lm_head, LogitsProcessor(), None, md, None)
+                assert md.sharded_target_logits and logits.shape[-1] == SHARD
+                return worker._sample_tokens_for_batch(logits, md, 0, hidden.shape[0])
+
+            assert torch.equal(target_tokens(), expected)
+            graph, out = _capture(target_tokens, hidden)
+            for _ in range(3):
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.equal(out, expected)
+
+            # Greedy draft tokens of a vocab-sharded draft head, then d2t.
+            gen = torch.Generator(device="cuda").manual_seed(3)
+            full = torch.randint(-4, 4, (33, vocab), device="cuda", generator=gen).to(
+                torch.bfloat16
+            )
+            full[0] = 1.0  # tied across every shard: id 0
+            full[1, SHARD - 1] = full[1, vocab - 1] = 9.0  # tied across shards: id SHARD - 1
+            worker._d2t = torch.arange(vocab, device="cuda") % 7
+            draft_md = SimpleNamespace(
+                wants_advanced_draft_sampling=False,
+                draft_vocab_size=vocab,
+                vocab_size=vocab,
+                is_cuda_graph=False,
+            )
+            greedy = torch.argmax(full.float(), dim=-1)
+            assert greedy[:2].tolist() == [0, SHARD - 1]
+            draft = worker.sample_draft_tokens(_shard(full, rank), draft_md, full.shape[0])
+            assert torch.equal(draft, (greedy + worker._d2t[greedy]).to(torch.int32))
+            gathered = MPI.COMM_WORLD.allgather(draft.cpu())
+            assert all(torch.equal(g, gathered[0]) for g in gathered)
+    finally:
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.barrier()
+        key_exchange.close()
+
+
 _CHECKS = {
     "argmax": _argmax_check,
     "sample": _sample_check,
     "markov": _markov_check,
     "worker_accept": _worker_accept_check,
+    "worker_argmax": _worker_argmax_check,
 }
 
 

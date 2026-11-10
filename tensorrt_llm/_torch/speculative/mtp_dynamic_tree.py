@@ -47,6 +47,9 @@ if TYPE_CHECKING:
 class MTPEagleDynamicTreeWorker(MTPEagleWorker):
     """MTP-Eagle worker with dynamic-tree draft and greedy verify."""
 
+    # Tree verification reads the target logits of every tree node itself.
+    verifies_on_target_shard = False
+
     def __init__(
         self,
         spec_config: "MTPDecodingConfig",
