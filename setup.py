@@ -211,6 +211,7 @@ package_data += [
     'grpc/openengine/_generated/*.pyi',
     'grpc/openengine/proto/manifest.json',
     'grpc/openengine/proto/openengine/v1/*.proto',
+    'grpc/openengine/proto/trtllm/openengine/v1/*.proto',
 ]
 
 

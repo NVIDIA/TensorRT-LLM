@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import base64
 import ctypes
 import json
@@ -13,12 +14,18 @@ from types import SimpleNamespace
 import grpc
 import pytest
 import torch
+from conftest import AbortError, FakeServicerContext
 from test_encoder import model, native_result, request
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.grpc.openengine import encoder_nixl as transport
 from tensorrt_llm.grpc.openengine.bindings import encoder_transfer_pb2
 from tensorrt_llm.grpc.openengine.bindings import generation_pb2 as pb
+from tensorrt_llm.grpc.openengine.encoder_transfer import EncoderTransferServicer
+from tensorrt_llm.grpc.openengine.errors import (
+    ENCODER_TRANSFER_REJECTED_METADATA,
+    EncoderTransferRejected,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -974,3 +981,55 @@ def test_producer_quota_is_reserved_before_cloning_concurrent_exports(pair, monk
     assert json.loads(reference.opaque_state)["id"] in producer._exports
     producer.close()
     assert producer._used == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_encoder_transfer_keeps_native_work_alive():
+    started, finish = threading.Event(), threading.Event()
+
+    def transfer(cache, destination):
+        started.set()
+        assert finish.wait(10)
+
+    inference = SimpleNamespace(_encoder_cleanup_tasks=set())
+    inference.encoder_role = "encode"
+    inference._encoder_cache = SimpleNamespace(transfer=transfer)
+    transfer_service = EncoderTransferServicer(inference)
+    task = asyncio.create_task(
+        transfer_service.Transfer(
+            encoder_transfer_pb2.TransferEncoderCacheRequest(), FakeServicerContext()
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(inference._encoder_cleanup_tasks) == 1
+        assert not next(iter(inference._encoder_cleanup_tasks)).done()
+    finally:
+        finish.set()
+        await asyncio.gather(*tuple(inference._encoder_cleanup_tasks))
+    assert not inference._encoder_cleanup_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rejected", [True, False])
+async def test_transfer_rejection_marker_requires_proven_prewrite_failure(rejected):
+    error = EncoderTransferRejected("expired reference") if rejected else ValueError("write failed")
+
+    def transfer(cache, destination):
+        raise error
+
+    inference = SimpleNamespace(_encoder_cleanup_tasks=set())
+    inference.encoder_role = "encode"
+    inference._encoder_cache = SimpleNamespace(transfer=transfer)
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
+        await EncoderTransferServicer(inference).Transfer(
+            encoder_transfer_pb2.TransferEncoderCacheRequest(), context
+        )
+    assert context.abort_code == (
+        grpc.StatusCode.INVALID_ARGUMENT if rejected else grpc.StatusCode.UNAVAILABLE
+    )
+    assert context.trailing_metadata == ((ENCODER_TRANSFER_REJECTED_METADATA,) if rejected else ())
