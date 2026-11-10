@@ -31,7 +31,8 @@ import uuid
 from ..logger import logger
 
 _CACHE_DIR_ENV = "TRTLLM_CUTE_DSL_CACHE_DIR"
-# The hooks below reach into CuTe DSL internals checked against these releases only.
+# CuTe DSL releases whose internals the hooks below were checked against; a new nvidia-cutlass-dsl
+# pin turns the cache off until it is added here and test_cute_dsl_file_cache.py passes on it.
 _TESTED_DSL_VERSIONS = frozenset({"4.8.0"})
 _KEY_VERSION = b"tllm-cute-dsl-file-cache-v1"
 # The compile option that only names an output location.
