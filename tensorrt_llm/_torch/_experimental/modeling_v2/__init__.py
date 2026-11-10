@@ -14,11 +14,12 @@ Entry is a single LLM API argument::
 
     LLM(model, modeling_v2="require")
 
-``off`` (the default) is byte-for-byte today's behaviour: the resolver returns
-immediately and nothing in this package is imported. ``auto`` uses a target
-when one claims the configuration and falls back to the built-in
-implementation otherwise. ``require`` raises instead of falling back -- see
-``_router_index`` for why that mode is not optional.
+``off`` is byte-for-byte the built-in behaviour: the resolver returns
+immediately and nothing in this package is imported. ``auto`` (the default)
+uses a target when one claims the configuration and falls back to the built-in
+implementation otherwise. A target decorated ``@disable_v2_by_default`` is used
+only when the caller sets ``modeling_v2`` itself. ``require`` raises instead of
+falling back -- see ``_router_index`` for why that mode is not optional.
 
 This package sits *beside* ``_torch/models/`` rather than inside it. Targets
 are not registered in the model zoo at all: ``route`` returns the class and the
@@ -30,6 +31,7 @@ from ._router_index import (
     MODELING_V2_VALIDATE_ENV,
     ModelingV2Mode,
     NoTarget,
+    disable_v2_by_default,
     modeling_v2_resolve,
     modeling_v2_resolve_on_all_ranks,
     resolved_mode,
@@ -40,6 +42,7 @@ __all__ = [
     "MODELING_V2_VALIDATE_ENV",
     "ModelingV2Mode",
     "NoTarget",
+    "disable_v2_by_default",
     "modeling_v2_resolve",
     "resolved_mode",
     "modeling_v2_resolve_on_all_ranks",

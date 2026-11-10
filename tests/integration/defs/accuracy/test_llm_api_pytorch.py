@@ -206,6 +206,26 @@ class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
             pytest.skip("FP8 pre-quantized Ministral-8B model not available")
 
 
+class TestApertus8BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "swiss-ai/Apertus-8B-Instruct-2509"
+    MODEL_PATH = f"{llm_models_root()}/Apertus-8B-Instruct-2509"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestApertus1p5_8B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "swiss-ai/Apertus-v1.5-8B"
+    MODEL_PATH = f"{llm_models_root()}/Apertus-v1.5-8B"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 # This class has extensively parameterized test methods, which yield totally 200 test cases.
 # This is because this model requires high test coverage over the feature combinations.
 # Normally we should not parameterize test methods so extensively -- just test on the typical/important feature combinations.
@@ -7697,6 +7717,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                  torch_compile_config=TorchCompileConfig()
                  if piecewise else None,
                  max_seq_len=4096,
+                 modeling_v2="off",
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             if kv_dtype == "nvfp4":
@@ -7820,6 +7841,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 # Keep the whole acceptance probe: the default buffer holds
                 # only the latest 1000 iterations.
                 max_stats_len=5000,
+                modeling_v2="off",
                 trust_remote_code=True,
                 **piecewise_kwargs) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION

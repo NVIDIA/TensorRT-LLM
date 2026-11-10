@@ -34,7 +34,8 @@ import requests
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
 from defs.common import (get_ucx_tls, parse_gsm8k_output,
-                         resolve_llm_model_path, wait_for_server)
+                         resolve_llm_model_path, wait_for_reported_addr,
+                         wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
 from defs.deepseek_v41_gsm8k import GSM8K_TEST_TIMEOUT
@@ -800,7 +801,7 @@ def setup_disagg_cluster(
     log_output_dir: str | None = None,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
-    """Load config, launch workers + disagg server, wait for ready.
+    """Load config, launch the workers and the disagg server, wait for ready.
 
     Args:
         config_file: Path to disaggregated server config YAML
@@ -819,7 +820,8 @@ def setup_disagg_cluster(
             startup fails (CI's --output-dir, so they get uploaded)
 
     Returns:
-        tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir)
+        tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir),
+        where server_port is the port the disagg server bound
     """
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
@@ -847,7 +849,6 @@ def setup_disagg_cluster(
     if disagg_cluster_overrides:
         disagg_cluster.update(disagg_cluster_overrides)
     server_host = config.get("hostname", "localhost")
-    server_port = get_free_port()
     if save_log:
         log_base = os.path.join(cwd or ".", "disagg-logs")
         os.makedirs(log_base, exist_ok=True)
@@ -856,15 +857,27 @@ def setup_disagg_cluster(
         work_dir = tempfile.mkdtemp()
     logger.info(f"Disagg cluster work_dir (worker logs): {work_dir}")
     server_env = env
-    coordinator_url = f"http://{server_host}:{server_port}"
+    report_addr = None
     if config.get("num_workers", 1) > 1:
+        # trtllm-serve rejects port 0 for a fleet, whose frontends share one
+        # public port, so that port and the coordinator's are picked here.
+        server_port = get_free_port()
         coordinator_port = get_free_port()
         while coordinator_port == server_port:
             coordinator_port = get_free_port()
-        coordinator_url = f"http://{server_host}:{coordinator_port}"
+        disagg_cluster[
+            "cluster_uri"] = f"http://{server_host}:{coordinator_port}"
         server_env = (env or os.environ).copy()
         server_env["TRTLLM_DISAGG_COORDINATOR_PORT"] = str(coordinator_port)
-    disagg_cluster["cluster_uri"] = coordinator_url
+    else:
+        # The server binds a kernel-assigned port and writes it to report_addr,
+        # so no other process can take the port between choosing and binding
+        # it. The server hosts the cluster storage on its own port and never
+        # reads the port in its copy of cluster_uri; the workers get the
+        # reported address.
+        server_port = 0
+        report_addr = os.path.join(work_dir, "disagg_server.addr")
+        disagg_cluster["cluster_uri"] = f"http://{server_host}:0"
 
     # Auto-deduce minimal_instances from num_instances
     ctx_servers = config.get("context_servers", {})
@@ -884,18 +897,12 @@ def setup_disagg_cluster(
                     gen_servers.get("pipeline_parallel_size", 1) *
                     gen_servers.get("context_parallel_size", 1))
 
-    # Build worker configs
     internal_request_auth_key = config.get(
         "internal_request_auth_key") or secrets.token_hex(32)
-    ctx_worker_config = build_worker_config(config, ctx_servers, disagg_cluster)
-    gen_worker_config = build_worker_config(config, gen_servers, disagg_cluster)
-    ctx_worker_config["internal_request_auth_key"] = internal_request_auth_key
-    gen_worker_config["internal_request_auth_key"] = internal_request_auth_key
 
     cluster_start = time.perf_counter()
     print("[startup] cluster_launch_to_ready: start", flush=True)
 
-    # Launch workers
     model = model_name or config.get("model")
     if model:
         model = resolve_llm_model_path(model)
@@ -908,6 +915,62 @@ def setup_disagg_cluster(
     num_gpus = torch.cuda.device_count()
 
     try:
+        server_config = {
+            "hostname":
+            server_host,
+            "port":
+            server_port,
+            "num_workers":
+            config.get("num_workers", 1),
+            "disagg_cluster":
+            disagg_cluster,
+            "context_servers": {
+                "router": ctx_servers.get("router", {})
+            },
+            "generation_servers": {
+                "router": gen_servers.get("router", {})
+            },
+            "conditional_disagg_config":
+            config.get("conditional_disagg_config", None),
+            "perf_metrics_max_requests":
+            config.get("perf_metrics_max_requests", 0),
+            "perf_metrics_output_dir":
+            config.get("perf_metrics_output_dir", None),
+            "return_perf_metrics":
+            config.get("return_perf_metrics", False),
+            "internal_request_auth_key":
+            internal_request_auth_key,
+        }
+        if schedule_style:
+            server_config["schedule_style"] = schedule_style
+        server_launch_kwargs = dict(save_log=save_log, env=server_env, cwd=cwd)
+        if report_addr is not None:
+            # The workers register with the server, so a server on a
+            # kernel-assigned port starts first and they get the port it
+            # reports.
+            disagg_server = run_disagg_server(server_config,
+                                              work_dir,
+                                              server_port,
+                                              report_addr=report_addr,
+                                              **server_launch_kwargs)
+            _, server_port = wait_for_reported_addr(report_addr,
+                                                    server_start_timeout,
+                                                    disagg_server.process)
+            disagg_server.port = server_port
+            disagg_cluster = dict(
+                disagg_cluster,
+                cluster_uri=f"http://{server_host}:{server_port}")
+
+        # Build worker configs and launch workers
+        ctx_worker_config = build_worker_config(config, ctx_servers,
+                                                disagg_cluster)
+        gen_worker_config = build_worker_config(config, gen_servers,
+                                                disagg_cluster)
+        ctx_worker_config[
+            "internal_request_auth_key"] = internal_request_auth_key
+        gen_worker_config[
+            "internal_request_auth_key"] = internal_request_auth_key
+
         for i in range(num_ctx_instances):
             device_ids = ",".join(
                 str(d) for d in dict.fromkeys((next_device + j) % num_gpus
@@ -948,41 +1011,12 @@ def setup_disagg_cluster(
             )
             next_device += gpus_per_gen
 
-        # Build minimal server config and launch
-        server_config = {
-            "hostname":
-            server_host,
-            "port":
-            server_port,
-            "num_workers":
-            config.get("num_workers", 1),
-            "disagg_cluster":
-            disagg_cluster,
-            "context_servers": {
-                "router": ctx_servers.get("router", {})
-            },
-            "generation_servers": {
-                "router": gen_servers.get("router", {})
-            },
-            "conditional_disagg_config":
-            config.get("conditional_disagg_config", None),
-            "perf_metrics_max_requests":
-            config.get("perf_metrics_max_requests", 0),
-            "perf_metrics_output_dir":
-            config.get("perf_metrics_output_dir", None),
-            "return_perf_metrics":
-            config.get("return_perf_metrics", False),
-            "internal_request_auth_key":
-            internal_request_auth_key,
-        }
-        if schedule_style:
-            server_config["schedule_style"] = schedule_style
-        disagg_server = run_disagg_server(server_config,
-                                          work_dir,
-                                          server_port,
-                                          save_log=save_log,
-                                          env=server_env,
-                                          cwd=cwd)
+        if disagg_server is None:
+            # A fleet's public and coordinator ports are picked above, so its
+            # server starts after the workers.
+            disagg_server = run_disagg_server(server_config, work_dir,
+                                              server_port,
+                                              **server_launch_kwargs)
 
         all_workers = ctx_workers + gen_workers
 

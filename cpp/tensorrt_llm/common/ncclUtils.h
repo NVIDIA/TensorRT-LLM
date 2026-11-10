@@ -247,6 +247,11 @@ public:
     // still in use are returned when their deterministic tensor scope ends.
     void releaseGraphPoolOwner(int64_t owner);
 
+    // While set on this host thread, requestBuffer returns an invalid buffer without touching the
+    // pool, so callers fall back to plain memory. Used where ranks are not SPMD, such as PARALLEL
+    // autotuning. Returns the previous setting.
+    bool setWindowAllocationSuppressed(bool suppressed);
+
     // Search for a buffer by pointer. Returns an invalid buffer if not found.
     // This matches the UBManager.search_buffer() interface.
     NCCLWindowBuffer searchBuffer(ncclComm_t comm, void* ptr) const;

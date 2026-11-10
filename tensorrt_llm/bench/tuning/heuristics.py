@@ -3,6 +3,7 @@ from typing import Tuple
 
 import torch
 
+from tensorrt_llm._errors import ResourceError
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.bench.tuning.dataclasses import (
     ModelConfig,
@@ -14,6 +15,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .utils import get_device_memory
+
+_NOT_ENOUGH_GPU_MEMORY_HINT = "Use more GPUs (--tp / --pp), or a smaller or quantized checkpoint."
 
 BYTES_PER_ELEM = {
     QuantAlgo.NO_QUANT: 2.0,
@@ -122,9 +125,10 @@ def calc_engine_setting(
     bytes_per_elem = BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT)
     if isinstance(model_config, (NemotronHybridConfig, Qwen3HybridConfig)):
         mamba_ssm_cache_dtype = model_config.mamba_ssm_cache_dtype
-        if mamba_ssm_cache_dtype != "auto":
-            if str_dtype_to_torch(mamba_ssm_cache_dtype) == torch.float32:
-                bytes_per_elem = 4.0
+        if mamba_ssm_cache_dtype in (None, "auto"):
+            mamba_ssm_cache_dtype = model_config.dtype
+        if str_dtype_to_torch(mamba_ssm_cache_dtype) == torch.float32:
+            bytes_per_elem = 4.0
 
     gb_per_extra_cache = model_config.extra_model_cache_in_gb(bytes_per_elem, target_seq_len)
     kv_cache_max_requests = cache_memory / (gb_per_token * target_seq_len + gb_per_extra_cache)
@@ -154,7 +158,7 @@ def calc_engine_setting(
 
     # Functional and performance
     if total_gpu_memory < engine_size:
-        raise RuntimeError(
+        raise ResourceError(
             f"The model requires at least: {engine_size:.2f} GB, "
             f"the total GPU memory of {total_gpu_memory:.2f} is insufficient.\n"
             "----------------------------------------------------------\n"
@@ -171,12 +175,14 @@ def calc_engine_setting(
             f"Number of Tensor Parallel Shards: {tp_size}\n"
             f"Number of Pipeline Parallel Stages: {pp_size}\n"
             f"KV Cache GPU Memory Fraction: {kv_cache_gpu_mem_fraction}\n"
-            "----------------------------------------------------------\n"
+            "----------------------------------------------------------\n",
+            hint=_NOT_ENOUGH_GPU_MEMORY_HINT,
         )
     if kv_cache_max_requests < 1:
-        raise RuntimeError(
-            "The amount of KV cache memory is insufficient to "
-            "run this model. Please try with more GPUs."
+        raise ResourceError(
+            "The amount of KV cache memory is insufficient to run this model. "
+            "Please try with more GPUs.",
+            hint=_NOT_ENOUGH_GPU_MEMORY_HINT,
         )
     warning_gpu_count = pp_size if enable_attention_dp else n_gpus
     if cache_memory / warning_gpu_count < 10.0:

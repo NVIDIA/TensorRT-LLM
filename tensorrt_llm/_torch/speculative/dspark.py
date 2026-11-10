@@ -266,7 +266,8 @@ class DSparkSpecMetadata(SpecMetadata):
         # ``DFlashSpecMetadata.prepare`` (dflash.py:96-113).
         worker = getattr(self, "_dspark_worker", None)
         if worker is not None and worker._win_inited:
-            current = set(self.request_ids)
+            # Requests paused in place (GEN slot preemption) keep their window.
+            current = set(self.request_ids) | getattr(self, "paused_in_place_ids", frozenset())
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
@@ -594,15 +595,18 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._win = int(draft_model._attn_params["window_size"])
             head_dim = int(draft_model._attn_params["head_dim"])
 
-            # Real requests occupy slots ``[0, max_batch)``; one extra "scratch" row
-            # at index ``max_batch`` absorbs padded / unknown request IDs (CUDA-graph
+            # Real requests occupy slots ``[0, num_slots)`` (``max_batch`` plus
+            # requests paused in place by GEN slot preemption); one extra "scratch"
+            # row at index ``num_slots`` absorbs padded / unknown request IDs (CUDA-graph
             # padding, ADP idle requests, or disagg seed forwards that arrive without
             # a real request id) so they can never overwrite a live request's rolling
             # window. Previously such IDs aliased to slot 0 and corrupted whichever
             # real request occupied it. The scratch row is never handed out through
             # ``_free_slots`` and its contents are throwaway.
-            self._scratch_slot = max_batch
-            num_rows = max_batch + 1
+            cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
+            num_slots = max_batch + getattr(cache_manager, "gen_preemption_headroom", 0)
+            self._scratch_slot = num_slots
+            num_rows = num_slots + 1
 
             # Both CUDA-graph padding variants, each with K+1 runtime widths,
             # use ``[CUDA_GRAPH_DUMMY_REQUEST_ID - 2*(K+1) + 1,
@@ -650,12 +654,12 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 with torch.inference_mode(False):
                     self._draft_seq_cuda = torch.zeros((), dtype=torch.int32, device="cuda")
                 self._build_verify_planner(draft_model, block_size)
-            self._free_slots = deque(range(max_batch))
+            self._free_slots = deque(range(num_slots))
             self._req_to_slot = {}
             logger.info(
                 f"DSpark: allocated rolling KV windows "
                 f"[{num_rows}, {num_stages}, {self._win}, {head_dim}] "
-                f"({max_batch} request slots + 1 scratch row)"
+                f"({num_slots} request slots + 1 scratch row)"
             )
             # Buffer state is complete independently of CuTe DSL prewarming.
             # A failed prewarm must not cause the next forward to recreate the
@@ -685,6 +689,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 warmup_fused_dsv4_dspark_attention(
                     block_size,
                     eps=float(draft_model._attn_params["eps"]),
+                    num_heads=int(draft_model._attn_params["n_heads"]),
                 )
         self._attention_warmup_attempted = True
 
@@ -741,6 +746,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self.verify_planner = DSparkVerifyPlanner(
             cfg=cfg,
             apply_calibration=apply_calibration,
+            device_windows=bool(
+                getattr(self.spec_config, "enable_fused_confidence_scheduler", False)
+            ),
         )
         logger.info(
             f"DSpark verify planner: max_verify_len={self.verify_planner.max_verify_len}, "
@@ -1288,6 +1296,15 @@ class DSparkWorker(DFlashWorker):
         ):
             self._markov_tp_exchange = tp_pair_exchange(mapping, AllReduceStrategy.NCCL)
 
+    @staticmethod
+    def block_width_for(spec_config, *, shift_label: bool = True) -> int:
+        """Block slots a DSpark worker computes for ``spec_config``.
+
+        The ``shift_label`` convention reads slots 0..K-1; a checkpoint that
+        turns it off reads slots 1..K and needs K+1 positions.
+        """
+        return spec_config.max_draft_len + (0 if shift_label else 1)
+
     def _draft_block_width(self, draft_model) -> int:
         """Block width under the dspark ``shift_label`` convention.
 
@@ -1296,9 +1313,9 @@ class DSparkWorker(DFlashWorker):
         checkpoint at max_draft_len=7, which is how both published DSpark
         drafters are meant to run.
         """
-        if getattr(draft_model, "_dspark_shift_label", False):
-            return self.max_draft_len
-        return super()._draft_block_width(draft_model)
+        return self.block_width_for(
+            self.spec_config, shift_label=getattr(draft_model, "_dspark_shift_label", False)
+        )
 
     def _draft_slot_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int

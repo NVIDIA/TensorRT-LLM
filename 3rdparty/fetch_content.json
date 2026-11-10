@@ -95,7 +95,10 @@
       "git_tag": "e2ebe7656649f619af0ad1d457b534283034655e",
       "git_submodules": "",
       "source_subdir": "dont-add-this-project-with-add-subdirectory",
-      "patch_file": "patches/msa_strided_paged_kv.patch"
+      "patch_file": [
+        "patches/msa_strided_paged_kv.patch",
+        "patches/msa_jit_device_arch.patch"
+      ]
     },
     {
       "name": "nanobind",

@@ -18,7 +18,10 @@ from tensorrt_llm.inputs.multimodal import (MultimodalEncoderRequestState,
                                             MultimodalParams,
                                             get_multimodal_item_metadata)
 from tensorrt_llm.kv_hints.protocol import KvHintsSnapshot
+from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import LogprobMode
+
+from .request_inputs import ExecutorRequest
 
 SamplingConfig = tllm_executor.SamplingConfig
 
@@ -37,7 +40,6 @@ UNKNOWN: typing.ClassVar[LlmRequestState]  # value = <LlmRequestState.UNKNOWN: 0
 LlmRequestState = tensorrt_llm.bindings.LlmRequestState
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 
-ExecutorRequest = tllm_executor.Request
 ExecutorResponse = tllm_executor.Response
 FinishReason = tllm_executor.FinishReason
 
@@ -132,6 +134,34 @@ class LogitsStorage:
             self._device_fragments: List[torch.Tensor] = []
             self._current_position = 0
 
+    def prepare(self,
+                vocab_size: int,
+                dtype: torch.dtype,
+                device: torch.device,
+                *,
+                cpu_fallback: bool = False) -> None:
+        """Allocate one-beam context storage, optionally falling back to host RAM."""
+        if self._storage is not None:
+            return
+        shape = (self.seq_length, 1, vocab_size)
+        if self.use_device_memory:
+            try:
+                storage = torch.empty(shape, dtype=dtype, device=device)
+            except torch.OutOfMemoryError:
+                if not cpu_fallback:
+                    raise
+                logger.warning_once(
+                    "Not enough GPU memory for complete context logits; storing them "
+                    "in host memory, so RequestOutput.context_logits is a CPU tensor.",
+                    key="context_logits_host_fallback")
+                # Large complete outputs need not consume pinned host memory.
+                storage = torch.empty(shape, dtype=dtype, device="cpu")
+        else:
+            storage = torch.empty(shape, dtype=dtype, device="cpu")
+        self._storage = storage
+        self.beam_width = 1
+        self.vocab_size = vocab_size
+
     def _init(self, logits: torch.Tensor):
         _, self.beam_width, self.vocab_size = logits.shape
 
@@ -160,7 +190,7 @@ class LogitsStorage:
             pin_memory=prefer_pinned(),
             requires_grad=False)
 
-    def append(self, logits: torch.Tensor):
+    def append(self, logits: torch.Tensor, *, reusable: bool = False):
         if logits.ndim == 2:
             logits = logits.unsqueeze(1)
         assert logits.ndim == 3, f"Bad logits shape, expect [num_tokens, beam_width, vocab_size], got {logits.shape}"
@@ -185,7 +215,8 @@ class LogitsStorage:
                 )
 
             self._storage[position:new_position].copy_(logits,
-                                                       non_blocking=True)
+                                                       non_blocking=not reusable
+                                                       or self._storage.is_cuda)
             self._logits_indices.append((position, new_position))
 
     def get(self, all_logits: bool, exclude_last: bool) -> torch.Tensor | None:
@@ -307,6 +338,9 @@ class PyResult:
         """
         exclude_last_generation_logits: bool | None = None
         context_logits_list: list[torch.Tensor] = field(default_factory=list)
+        context_logits_on_cpu: bool = False
+        prompt_logprob_rows: list[torch.Tensor] = field(default_factory=list)
+        prompt_last_logprobs: torch.Tensor | None = None
         generation_logits_list: list[torch.Tensor] = field(default_factory=list)
         reset_log_probs: tuple[list[TokenLogprobs] | list[SimpleTokenLogprobs],
                                list[float] | None] | None = None
@@ -342,6 +376,10 @@ class PyResult:
 
         # Note that in C++ implemnetation both context logits and generation logits are stored on host memory.
         # Here we only use host memory for generation logits if in chunked model.
+        # Prompt logprobs reduced on the executor (``reduce_prompt_logprobs``
+        # rows); the worker builds the user-facing values from them.
+        self.context_prompt_logprob_rows: list[torch.Tensor] | None = None
+        self.context_prompt_last_logprobs: torch.Tensor | None = None
         self._context_logits = LogitsStorage(
             seq_length=prompt_len,
             use_device_memory=use_device_memory,
@@ -374,6 +412,8 @@ class PyResult:
         self.diff = PyResult.Diff()
 
     def get_diff(self) -> Diff:
+        if self._context_logits is not None and self._context_logits._storage is not None:
+            self.diff.context_logits_on_cpu = self.context_logits_on_cpu
         for i, context_logits in enumerate(self.diff.context_logits_list):
             self.diff.context_logits_list[i] = context_logits.to("cpu")
         for i, generation_logits in enumerate(self.diff.generation_logits_list):
@@ -383,9 +423,24 @@ class PyResult:
         return self.diff
 
     def apply_diff(self, diff: Diff):
+        if diff.prompt_logprob_rows:
+            if self.context_prompt_logprob_rows is None:
+                self.context_prompt_logprob_rows = []
+            self.context_prompt_logprob_rows.extend(diff.prompt_logprob_rows)
+        if diff.prompt_last_logprobs is not None:
+            self.context_prompt_last_logprobs = diff.prompt_last_logprobs
         if diff.exclude_last_generation_logits is not None:
             self._exclude_last_generation_logits = diff.exclude_last_generation_logits
         if len(diff.context_logits_list) > 0:
+            first = diff.context_logits_list[0]
+            # Preserve host fallback, including when only the receiving rank
+            # lacks space for the complete result.
+            device = torch.device(
+                "cpu" if diff.context_logits_on_cpu else "cuda")
+            self._context_logits.prepare(first.shape[-1],
+                                         first.dtype,
+                                         device,
+                                         cpu_fallback=True)
             for context_logits in diff.context_logits_list:
                 self._context_logits.append(context_logits)
         if len(diff.generation_logits_list) > 0:
@@ -416,9 +471,62 @@ class PyResult:
         self._exclude_last_generation_logits = exclude_last_generation_logits
         self.diff.exclude_last_generation_logits = exclude_last_generation_logits
 
-    def append_context_logits(self, context_logits: torch.Tensor):
+    def prepare_context_logits(self, vocab_size: int,
+                               device: torch.device) -> None:
+        """Allocate the complete FP32 context-logits storage before projection.
+
+        Args:
+            vocab_size: Full (gathered) vocabulary size of each stored row.
+            device: Preferred device; GPU allocation failure falls back to
+                host memory.
+        """
+        assert self._context_logits is not None
+        self._context_logits.prepare(vocab_size,
+                                     torch.float32,
+                                     device,
+                                     cpu_fallback=True)
+
+    @property
+    def context_logits_on_cpu(self) -> bool:
+        assert self._context_logits is not None and self._context_logits._storage is not None
+        return self._context_logits._storage.device.type == "cpu"
+
+    def append_prompt_logprobs(self, rows: torch.Tensor) -> None:
+        """Record reduced prompt logprobs of consecutive prompt tokens.
+
+        Args:
+            rows: ``[tokens, columns]`` FP64 host tensor from
+                ``reduce_prompt_logprobs``; row ``t`` scores the prompt token
+                that follows the ``t``-th consumed context position.
+        """
+        if self.context_prompt_logprob_rows is None:
+            self.context_prompt_logprob_rows = []
+        self.context_prompt_logprob_rows.append(rows)
+        self.diff.prompt_logprob_rows.append(rows)
+
+    def set_prompt_last_logprobs(self, logprobs: torch.Tensor) -> None:
+        """Retain the last prompt position's normalized log probabilities.
+
+        The worker scores the first generated token with this row once it is
+        known, without normalizing it again.
+
+        Args:
+            logprobs: ``[1, vocab]`` FP32 host tensor of log-softmax values,
+                normalized on the device that produced the logits.
+        """
+        self.context_prompt_last_logprobs = logprobs
+        self.diff.prompt_last_logprobs = logprobs
+
+    def append_context_logits(self,
+                              context_logits: torch.Tensor,
+                              *,
+                              reusable: bool = False):
         if self._context_logits:
-            self._context_logits.append(context_logits)
+            self._context_logits.append(context_logits, reusable=reusable)
+            if reusable:
+                # Retain the owned destination view, never the next chunk's scratch.
+                begin, end = self._context_logits._logits_indices[-1]
+                context_logits = self._context_logits._storage[begin:end, 0]
             self.diff.context_logits_list.append(context_logits)
 
     def append_generation_logits(self, generation_logits: torch.Tensor):
@@ -619,8 +727,9 @@ class PyResult:
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
-        ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
-         'first_gen_log_probs', 'mm_embedding_handles',
+        ('context_logits', 'context_prompt_logprob_rows',
+         'context_prompt_last_logprobs', 'generation_logits', 'log_probs',
+         'cum_log_probs', 'first_gen_log_probs', 'mm_embedding_handles',
          'additional_context_outputs', 'additional_generation_outputs',
          'encoder_output', 'mrope_position_ids_handle',
          'mrope_position_deltas_handle'))
@@ -702,6 +811,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             client_id: int = None,
             return_log_probs: bool = False,
             return_context_logits: bool = False,
+            context_logits_explicit: bool = True,
+            prompt_logprobs: int | None = None,
+            prompt_logprobs_simple_format: bool = False,
             return_generation_logits: bool = False,
             return_logits_device_memory: bool = True,
             exclude_last_generation_logits: bool = False,
@@ -834,6 +946,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Router Replay: attach routed_experts to this request's output.
         self.py_return_routed_experts = return_routed_experts
         self.py_return_context_logits = return_context_logits
+        self.py_context_logits_explicit = context_logits_explicit
+        self.py_prompt_logprobs = prompt_logprobs
+        self.py_prompt_logprobs_simple_format = prompt_logprobs_simple_format
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
         self.py_additional_outputs = additional_outputs
@@ -1236,6 +1351,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             client_id=self.py_client_id,
             return_log_probs=self.py_return_log_probs,
             return_context_logits=self.py_return_context_logits,
+            context_logits_explicit=self.py_context_logits_explicit,
+            prompt_logprobs=self.py_prompt_logprobs,
+            prompt_logprobs_simple_format=self.py_prompt_logprobs_simple_format,
             return_generation_logits=self.py_return_generation_logits,
             return_logits_device_memory=self.py_return_logits_device_memory,
             exclude_last_generation_logits=self.py_result.
@@ -1576,11 +1694,14 @@ def is_multimodal_encoder_ready(request: LlmRequest) -> bool:
 
 def executor_request_to_llm_request(
         req_id: int,
-        executor_request: ExecutorRequest,
+        executor_request: ExecutorRequest | tllm_executor.Request,
         child_req_ids: List[int],
         exclude_last_generation_logits: bool,
         input_token_ids: Optional[List] = None,
         position_ids: Optional[List] = None) -> LlmRequest:
+    envelope = ExecutorRequest.adapt(executor_request)
+    inputs = envelope.inputs
+    executor_request = envelope.request
     sampling_config = executor_request.sampling_config
 
     if input_token_ids is not None:
@@ -1622,7 +1743,7 @@ def executor_request_to_llm_request(
     # Python multimodal data is the canonical source for mRoPE model inputs.
     # Preserve input-processor values and fill only missing entries when a
     # directly constructed executor request carries the public MropeConfig.
-    py_multimodal_data = getattr(executor_request, "py_multimodal_data", None)
+    py_multimodal_data = inputs.multimodal_data
     if executor_request.mrope_config is not None:
         if py_multimodal_data is None:
             py_multimodal_data = {}
@@ -1637,8 +1758,8 @@ def executor_request_to_llm_request(
         mrope_config.setdefault("mrope_position_deltas", mrope_position_deltas)
 
     agent_hierarchy = None
-    if getattr(executor_request, "py_scheduling_params", None) is not None:
-        agent_hierarchy = executor_request.py_scheduling_params.agent_hierarchy
+    if inputs.scheduling_params is not None:
+        agent_hierarchy = inputs.scheduling_params.agent_hierarchy
 
     # Audio encoder-decoder models (e.g. Whisper) carry the encoder input as a
     # feature tensor, not encoder token ids. Python owns the payload; native
@@ -1696,13 +1817,15 @@ def executor_request_to_llm_request(
         if executor_request.lora_config is not None else None,
         lora_config=executor_request.lora_config.config
         if executor_request.lora_config is not None else None,
-        py_lora_path=getattr(executor_request, "py_lora_path", None),
-        py_lora_ckpt_source=getattr(executor_request, "py_lora_ckpt_source",
-                                    None),
+        py_lora_path=inputs.lora_path,
+        py_lora_ckpt_source=inputs.lora_ckpt_source,
         return_log_probs=executor_request.output_config.return_log_probs,
-        num_logprobs=getattr(executor_request, "py_num_logprobs", 0),
+        num_logprobs=inputs.num_logprobs,
         return_context_logits=executor_request.output_config.
         return_context_logits,
+        context_logits_explicit=inputs.context_logits_explicit,
+        prompt_logprobs=inputs.prompt_logprobs,
+        prompt_logprobs_simple_format=inputs.prompt_logprobs_simple_format,
         return_perf_metrics=executor_request.output_config.return_perf_metrics,
         return_generation_logits=executor_request.output_config.
         return_generation_logits,
@@ -1716,8 +1839,7 @@ def executor_request_to_llm_request(
         exclude_input_from_output=executor_request.output_config.
         exclude_input_from_output,
         guided_decoding_params=executor_request.guided_decoding_params,
-        py_logits_post_processors=getattr(executor_request,
-                                          "py_logits_post_processors", None),
+        py_logits_post_processors=inputs.logits_post_processors,
         encoder_input_tokens=executor_request.encoder_input_token_ids,
         encoder_input_features=encoder_input_features,
         encoder_output_len=encoder_output_len,
@@ -1729,16 +1851,13 @@ def executor_request_to_llm_request(
         llm_request_type=llm_request_type,
         context_phase_params=executor_request.context_phase_params,
         cache_salt=executor_request.cache_salt,
-        arrival_time=getattr(executor_request, "py_arrival_time", None),
+        arrival_time=inputs.arrival_time,
         py_multimodal_data=py_multimodal_data,
         kv_cache_retention_config=executor_request.kv_cache_retention_config,
         agent_hierarchy=agent_hierarchy,
-        logprobs_mode=getattr(executor_request, "py_logprobs_mode",
-                              LogprobMode.RAW),
-        logprobs_simple_format=getattr(executor_request,
-                                       "py_logprobs_simple_format", False),
-        return_routed_experts=getattr(executor_request,
-                                      "py_return_routed_experts", False),
+        logprobs_mode=inputs.logprobs_mode,
+        logprobs_simple_format=inputs.logprobs_simple_format,
+        return_routed_experts=inputs.return_routed_experts,
     )
 
     # Bad-words list for the TorchSampler path, kept in its native
@@ -1755,18 +1874,12 @@ def executor_request_to_llm_request(
     ngram_size = executor_request.sampling_config.no_repeat_ngram_size
     llm_request.py_no_repeat_ngram_size = ngram_size if ngram_size else None
 
-    llm_request.py_original_end_id = getattr(executor_request,
-                                             "py_original_end_id",
-                                             llm_request.py_end_id)
-    llm_request.py_disaggregated_params = getattr(executor_request,
-                                                  "py_disaggregated_params",
-                                                  None)
-    llm_request.py_conversation_params = getattr(executor_request,
-                                                 "py_conversation_params", None)
+    llm_request.py_original_end_id = inputs.original_end_id
+    llm_request.py_disaggregated_params = inputs.disaggregated_params
+    llm_request.py_conversation_params = inputs.conversation_params
     # Published by the attention-DP router before this conversion, if at all.
-    llm_request.py_uncached_prefill_tokens = getattr(
-        executor_request, "py_uncached_prefill_tokens", None)
-    llm_request.py_kv_hints = getattr(executor_request, "py_kv_hints", None)
+    llm_request.py_uncached_prefill_tokens = inputs.uncached_prefill_tokens
+    llm_request.py_kv_hints = inputs.kv_hints
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

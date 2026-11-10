@@ -8,6 +8,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
+from tensorrt_llm._startup_errors import mark_startup_stage
 from tensorrt_llm.logger import logger
 
 
@@ -66,6 +67,9 @@ class _WarmupTimer:
         try:
             yield
             completed = True
+        except BaseException as exc:
+            mark_startup_stage(exc, f"warmup/{name}")
+            raise
         finally:
             elapsed = time.perf_counter() - start
             if record:
