@@ -224,18 +224,23 @@ class _ResponsesStreamingResponse(ClosingStreamingResponse):
                     await pipeline.result().body_iterator.aclose()
 
 
-def _guard_relayed_responses_stream(answer: Response) -> Response:
-    """``answer``, with a stream that fails early ending in an ``error`` event.
+def _guard_relayed_responses_stream(
+        answer: Response,
+        terminal_events: Callable[[str, str, int], list]) -> Response:
+    """``answer``, with a stream that fails early ending in ``terminal_events``.
 
-    The stream is the generation worker's own, response.created included, so
-    there is no response of this server's to report as failed.
+    The stream is the generation worker's own, response.created included. The
+    worker answers under the request's id, so the events a processor built
+    from the request makes for a failed stream, error and then
+    response.failed, name the response the worker opened, and a cut relay
+    ends as a stream this server opened does. A request no processor can be
+    built from ends on the bare error event (stream_error_event).
     """
     if not isinstance(answer, StreamingResponse):
         return answer
-    return StreamingResponse(
-        content=guard_responses_stream(answer.body_iterator,
-                                       stream_error_event),
-        media_type="text/event-stream")
+    return StreamingResponse(content=guard_responses_stream(
+        answer.body_iterator, terminal_events),
+                             media_type="text/event-stream")
 
 
 def _error_response_failure(response: Response) -> tuple[str, str]:
@@ -532,7 +537,10 @@ class OpenAIDisaggServer:
 
         A streamed request whose pipeline is still running after
         _RESPONSES_STREAM_START_WAIT_S is answered from here at once; see
-        _responses_stream_when_done.
+        _responses_stream_when_done. One whose pipeline answers within the
+        wait has the generation worker's stream relayed as it is; should that
+        stream fail before its terminal event, the relay ends with error and
+        response.failed (_guard_relayed_responses_stream).
         """
         responses = self._wrap_entry_point(self._service.openai_responses)
         if not request.stream:
@@ -545,11 +553,11 @@ class OpenAIDisaggServer:
             # Cancelling the request cancels its pipeline.
             pipeline.cancel()
             raise
-        if pipeline.done():
-            return _guard_relayed_responses_stream(pipeline.result())
         try:
             # The opening names request.request_id, the id every worker is sent
-            # (_encode_request_body) and answers under.
+            # (_encode_request_body) and answers under; so do the error and
+            # response.failed events that end a stream cut before its terminal
+            # event, relayed or not.
             processor = ResponsesStreamingProcessor(
                 request=request,
                 sampling_params=request.to_sampling_params(),
@@ -557,8 +565,13 @@ class OpenAIDisaggServer:
             opening = processor.get_initial_responses()
         except ValueError:
             # The opening is built from the request alone; a request it cannot
-            # be built from is answered when its pipeline answers.
-            return _guard_relayed_responses_stream(await pipeline)
+            # be built from is answered when its pipeline answers, and its
+            # relayed stream, if cut, ends on the bare error event.
+            return _guard_relayed_responses_stream(await pipeline,
+                                                   stream_error_event)
+        if pipeline.done():
+            return _guard_relayed_responses_stream(
+                pipeline.result(), processor.get_stream_failed_events)
         # keep_responses_stream_alive repeats the opening's response.in_progress
         # whenever the stream is silent, as it is while the pipeline runs.
         return _ResponsesStreamingResponse(

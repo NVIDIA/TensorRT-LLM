@@ -1205,8 +1205,63 @@ async def test_an_opened_stream_whose_generation_stream_fails_ends_with_response
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
-async def test_a_relayed_generation_stream_that_fails_ends_with_an_error_event(schedule_style):
-    """After a fast context phase the worker's own opening is relayed, so only error is added."""
+async def test_a_relayed_generation_stream_that_fails_ends_with_error_and_response_failed(
+    schedule_style,
+):
+    """After a fast context phase the worker's own opening is relayed; a cut still ends in both events.
+
+    The worker answers under the request's id, so the failed response is the one
+    its opening named: status failed, no output, the cause in `error`.
+    """
+
+    async def context_phase():
+        pass
+
+    workers = _WorkersFailingAfterTheFirstOutput(context_phase)
+    sent = []
+
+    def on_send(message):
+        sent.append(message)
+        workers.on_send(message)
+
+    with contextlib.suppress(aiohttp.ClientPayloadError):
+        await _post_responses(_responses_server(schedule_style, workers).app, on_send=on_send)
+
+    events = _sse_events(sent)
+    assert [event for event, _ in events] == [
+        "response.created",
+        "response.in_progress",
+        "response.output_text.delta",
+        "error",
+        "response.failed",
+    ]
+    assert [data["sequence_number"] for _, data in events] == [0, 1, 2, 3, 4]
+    assert (events[-2][1]["code"], events[-2][1]["message"]) == (
+        "upstream_error",
+        "ClientPayloadError",
+    )
+    opened, failed = events[0][1]["response"], events[-1][1]["response"]
+    assert failed["id"] == opened["id"]
+    assert (failed["status"], failed["output"]) == ("failed", [])
+    assert (failed["error"]["code"], failed["error"]["message"]) == (
+        "server_error",
+        "ClientPayloadError",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+async def test_a_cut_relay_with_no_processor_to_fail_the_response_ends_on_the_bare_error(
+    monkeypatch, schedule_style
+):
+    """The failed response comes from a processor built from the request; without one, error alone.
+
+    The processor is made to fail directly: a request whose sampling parameters it
+    rejects is rejected by the workers too, so no stream of it is ever relayed.
+    """
+    monkeypatch.setattr(
+        openai_disagg_server, "ResponsesStreamingProcessor", Mock(side_effect=ValueError("none"))
+    )
 
     async def context_phase():
         pass
@@ -1229,10 +1284,7 @@ async def test_a_relayed_generation_stream_that_fails_ends_with_an_error_event(s
         "error",
     ]
     assert [data["sequence_number"] for _, data in events] == [0, 1, 2, 3]
-    assert (events[-1][1]["code"], events[-1][1]["message"]) == (
-        "upstream_error",
-        "ClientPayloadError",
-    )
+    assert events[-1][1]["code"] == "upstream_error"
 
 
 @pytest.mark.asyncio
