@@ -244,8 +244,9 @@ def run_check(
     gpus = (disagg_spec.device_count(member) if disagg_spec else None) or world
     if devices is None:
         devices = claimed_devices(workspace)
-    # A check takes as many of the run's devices as its member is wide: the first ones.
-    devices = tuple(devices)[:gpus] if len(devices) >= gpus else tuple(range(gpus))
+    # A check takes as many of the run's devices as it needs, the first ones; never a device
+    # the run did not claim. With no run behind it (a bare command line), the first ones.
+    devices = tuple(devices)[:gpus] if devices else tuple(range(gpus))
     repo = Path(str(spec.get("trtllm_repo_path") or "."))
     tree = Path(tree).resolve() if tree is not None else repo.resolve()
     spec = {**spec, "trtllm_repo_path": str(tree)}

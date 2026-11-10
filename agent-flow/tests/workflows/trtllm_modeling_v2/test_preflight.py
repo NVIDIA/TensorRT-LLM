@@ -111,6 +111,20 @@ def test_a_relative_variant_needs_its_units_benchmark_and_disagg_one_node(tmp_pa
         preflight.check_disagg_placement(task)
 
 
+def test_preflight_claims_the_devices_the_widest_check_takes(tmp_path):
+    """The disaggregated test starts two engines: more devices than the widest member."""
+    task = _task(tmp_path, parallel="unified", members=["tp1", "tep2"])
+    assert preflight.devices_needed(task, 2) == 2
+    task["features"] = ["disagg"]
+    task["accuracy"] = {"disagg": {"test": "tests/test_d.py::TestM::test_auto_dtype"}}
+    assert preflight.devices_needed(task, 2) == 4  # two engines at tep2
+    task["accuracy"]["disagg"]["devices"] = 3
+    assert preflight.devices_needed(task, 2) == 3  # as declared
+    task["environment"]["gpus_per_node"] = 2
+    del task["accuracy"]["disagg"]["devices"]
+    assert preflight.devices_needed(task, 2) == 2  # never more than the host holds
+
+
 def _fake_boot(fails: dict[str, str], booted: list):
     """A boot gate that fails the members named in ``fails`` with their detail."""
 

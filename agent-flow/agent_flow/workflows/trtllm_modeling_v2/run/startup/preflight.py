@@ -505,6 +505,20 @@ def check_variant_anchors(task_data: Mapping[str, Any], world_size: int) -> list
     return notes
 
 
+def devices_needed(task_data: Mapping[str, Any], world_size: int) -> int:
+    """The most devices one check of the run takes: the widest member's, or the disaggregated test's.
+
+    Every check runs on this host, on the devices preflight claims. The
+    disaggregated-serving test starts two engines (``DisaggSpec.device_count``),
+    so it can take more than the widest member.
+    """
+    spec = disagg_checks.DisaggSpec.from_task(task_data)
+    if spec is None or disagg_checks.GATE_NAME not in assembly_units(task_data):
+        return world_size
+    members = members_for(task_data, disagg_checks.GATE_NAME, world_size)
+    return max([world_size, *(spec.device_count(member) or 0 for member in members)])
+
+
 def check_disagg_placement(task_data: Mapping[str, Any]) -> list[str]:
     """The native test's per-node device request fits the allocation geometry."""
     spec = disagg_checks.DisaggSpec.from_task(task_data)
@@ -838,11 +852,18 @@ def run_preflight(
         raise PreflightError(str(exc)) from exc
 
     python = str(env_block.get("python", "python3"))
-    # The orchestrator and the GPUs are the same machine: the devices are claimed here.
+    # The orchestrator and the GPUs are the same machine: the devices are claimed here, as
+    # many as the widest check takes.
+    need = devices_needed(task_data, world_size)
+    if need > world_size:
+        notes.append(
+            f"devices: {need} claimed, not {world_size}: the disaggregated-serving test starts "
+            "two engines"
+        )
     if claim:
-        devices = claim_devices(world_size, arch, python, runner=runner, notes=notes)
+        devices = claim_devices(need, arch, python, runner=runner, notes=notes)
     else:
-        devices = tuple(range(world_size))
+        devices = tuple(range(need))
         notes.append(
             "dry run: no device was queried or claimed, and the multi-rank probe did not run; "
             "a real start does both"
@@ -927,6 +948,7 @@ __all__ = [
     "UnsupportedSpeculationError",
     "check_capture_lists",
     "check_disagg_placement",
+    "devices_needed",
     "check_variant_anchors",
     "check_kv_cache_configs",
     "check_speculation_support",
