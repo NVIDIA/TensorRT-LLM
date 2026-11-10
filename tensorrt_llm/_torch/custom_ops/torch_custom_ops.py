@@ -27,6 +27,7 @@ from torch._higher_order_ops.effects import _EffectType, _register_effectful_op
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm import deep_gemm
+from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
@@ -396,7 +397,7 @@ def fused_moe(
     except RuntimeError as e:
         error_msg = str(e)
         if "DeepGEMM only supports Hopper" in error_msg:
-            raise RuntimeError(
+            raise UnsupportedError(
                 f"{error_msg}"
                 "Note: This is the Cutlass backend with DeepGemm JIT path. "
                 "For Blackwell (SM100+) support, please use the DEEPGEMM backend instead."
@@ -2232,6 +2233,13 @@ class Fp8QuantKernelRunner(TunableRunner):
         return a
 
 
+# The deep_gemm package compiles each layout with nvcc and releases the GIL
+# meanwhile (its kernel caches are only touched with the GIL held), so the
+# autotuner drives the JIT of a sweep's distinct layouts on a thread pool
+# (TuningConfig.parallel_jit_warmup; -1 sizes it from this rank's CPUs).
+_DEEP_GEMM_JIT_WARMUP_THREADS = -1
+
+
 class fp8SwapABGemmRunner(TunableRunner):
     """Runs quantize + DeepGemm FP8 GEMM. Single tactic for JIT warmup."""
 
@@ -2247,6 +2255,7 @@ class fp8SwapABGemmRunner(TunableRunner):
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, deep_gemm_jit_warmup_buckets), ),
         exclude_from_cache=True,
+        parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
     )
 
     def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool,
@@ -2294,14 +2303,14 @@ class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
     """Runs DeepGemm with pre-quantized FP8 activations and packed scales."""
 
     # The same step-16 grid as the other two DeepGemm runners: a layout no
-    # bucket selects is compiled mid-inference instead, and DeepGemm forks
-    # nvcc while holding the GIL.
+    # bucket selects is compiled mid-inference instead.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, deep_gemm_jit_warmup_buckets), ),
         constraint_specs=(ConstraintSpec(
             1, 0, lambda input_shapes: input_shapes[0][0]), ),
         exclude_from_cache=True,
+        parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
     )
 
     def __init__(self, output_dtype: torch.dtype,
@@ -2446,7 +2455,10 @@ def _(
 # cubins and compiles nothing.
 class Fp8BlockScalingGemmRunner(TunableRunner):
     # Without exclude_from_cache, a warm disk cache short-circuits tuning and
-    # the JIT warmup never runs.
+    # the JIT warmup never runs. The warmup stays serial (no
+    # parallel_jit_warmup): on Hopper the kernels come from the C++ DeepGEMM
+    # JIT in cpp/include/tensorrt_llm/deep_gemm, whose runtime cache is not
+    # safe to use from several threads, and the op runs without the GIL.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, deep_gemm_jit_warmup_buckets), ),
@@ -2717,7 +2729,6 @@ _AR_TUNE_NCCL_SYMMETRIC_LOGGED = False
 
 class AllReduceRunner(TunableRunner):
     _prealloc_lock: ClassVar[threading.Lock] = threading.Lock()
-    _prealloc_done: ClassVar[set] = set()
     # Set from AllReduce.__init__ via extra_attrs when the model is built.
     _prealloc_max_num_tokens: ClassVar[Optional[int]] = None
     _prealloc_hidden_size: ClassVar[Optional[int]] = None
@@ -2778,46 +2789,29 @@ class AllReduceRunner(TunableRunner):
             return
         if not hasattr(torch.ops.trtllm, "preallocate_nccl_window_buffer"):
             return
+        preallocate = getattr(torch.ops.trtllm.preallocate_nccl_window_buffer,
+                              "bytes", None)
+        if preallocate is None:
+            return
         if input_tensor.numel() == 0 or input_tensor.size(0) == 0:
             return
-        if hasattr(torch.cuda, "is_current_stream_capturing"):
-            try:
-                if torch.cuda.is_current_stream_capturing():
-                    return
-            except (RuntimeError, AssertionError):
-                # If capture status can't be queried, avoid prealloc to be safe.
-                return
-
-        # If max_num_tokens and hidden_size are provided, pre-allocate at 2x
-        # the model-configured size to give the NCCL window allocator extra
-        # headroom beyond the nominal max shape.  dtype comes from the model
-        # spec; fall back to the actual input tensor's properties when any
-        # value is missing.
-        # The dummy tensor is created here, after the stream-capture guard,
-        # so it is never allocated inside a CUDA graph context.
+        # Size the windows from model metadata without allocating a dummy tensor.
+        # The existing input tensor supplies the custom op's CUDA dispatch key.
         if max_num_tokens is not None and hidden_size is not None:
-            prealloc_input = torch.empty(
-                [2 * max_num_tokens, hidden_size],
-                dtype=dtype if dtype is not None else input_tensor.dtype,
-                device=input_tensor.device)
+            prealloc_dtype = dtype if dtype is not None else input_tensor.dtype
+            element_size = prealloc_dtype.itemsize
+            buffer_size = 2 * max_num_tokens * hidden_size * element_size
         else:
-            prealloc_input = input_tensor
-
-        num_tokens = int(prealloc_input.size(0))
-        if num_tokens <= 0:
+            buffer_size = input_tensor.numel() * input_tensor.element_size()
+        if buffer_size <= 0:
             return
-        group_key = tuple(group)
-        cache_key = (group_key, num_tokens)
         with cls._prealloc_lock:
-            if cache_key in cls._prealloc_done:
-                return
-            cls._prealloc_done.add(cache_key)
-
-        logger.debug(
-            "[tunable_allreduce] Pre-allocating NCCL window buffers: "
-            "tokens=%d group=%s", num_tokens, list(group))
-        torch.ops.trtllm.preallocate_nccl_window_buffer(prealloc_input, group,
-                                                        2)
+            logger.debug(
+                "[tunable_allreduce] Pre-allocating NCCL window buffers: "
+                "bytes=%d group=%s", buffer_size, list(group))
+            # The native allocator reuses eligible buffers and replenishes those
+            # claimed by another graph pool. Prior success does not imply availability.
+            preallocate(input_tensor, group, 2, buffer_size)
 
     def get_valid_tactics(
         self,
@@ -2958,6 +2952,16 @@ def _(
     count: int,
 ) -> None:
     return None
+
+
+@torch.library.register_fake("trtllm::preallocate_nccl_window_buffer.bytes")
+def _(
+    input: torch.Tensor,
+    group: List[int],
+    count: int,
+    size_bytes: int,
+) -> bool:
+    return False
 
 
 @torch.library.register_fake("trtllm::begin_nccl_window_tensor_scope")

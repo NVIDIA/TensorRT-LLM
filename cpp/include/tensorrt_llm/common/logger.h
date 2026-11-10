@@ -178,6 +178,43 @@ public:
         return log(level, module, rank, format.c_str(), args...);
     }
 
+    // ---- log-once overloads -------------------------------------------------
+    //! Log the message only the first time the given key is seen for the calling module.
+    //! Keys are scoped by the calling module (the top-level source directory reported by
+    //! extractModule()), not by file, so keys must be unique within a module: equal key text in
+    //! two files of the same module suppresses the second message. Keys are shared by all threads
+    //! and Logger instances; callers must keep the number of keys bounded. A key is consumed only
+    //! when the message is enabled at the current level, so lowering the log level later (e.g.
+    //! from ERROR to INFO) still surfaces the message.
+
+#if defined(_MSC_VER)
+    template <typename... Args>
+    void logOnce(Level const level, std::string_view key, char const* format, Args const&... args);
+
+    template <typename... Args>
+    void logOnce(Level const level, Module module, std::string_view key, char const* format, Args const&... args);
+#else
+    template <typename... Args>
+    void logOnce(Level const level, std::string_view key, char const* format, Args const&... args)
+        __attribute__((format(printf, 4, 0)));
+
+    template <typename... Args>
+    void logOnce(Level const level, Module module, std::string_view key, char const* format, Args const&... args)
+        __attribute__((format(printf, 5, 0)));
+#endif
+
+    template <typename... Args>
+    void logOnce(Level const level, std::string_view key, std::string const& format, Args const&... args)
+    {
+        logOnce(level, key, format.c_str(), args...);
+    }
+
+    template <typename... Args>
+    void logOnce(Level const level, Module module, std::string_view key, std::string const& format, Args const&... args)
+    {
+        logOnce(level, module, key, format.c_str(), args...);
+    }
+
     // ---- exception logging --------------------------------------------------
 
     void log(std::exception const& ex, Level level = Level::ERROR);
@@ -254,6 +291,9 @@ private:
     /// Format: "level:mod1,mod2;level:mod3,mod4"
     /// e.g.   "debug:runtime,kernel;info:plugin;warning:layers"
     static std::map<std::string, Level, std::less<>> parseModuleLevels(char const* envValue);
+
+    /// Returns true the first time this (module, key) log-once pair is seen and records it.
+    static bool consumeLogOnceKey(std::string_view module, std::string_view key);
 
     static inline char const* getLevelName(Level const level)
     {
@@ -390,6 +430,29 @@ void Logger::log(Logger::Level const level, Module module, int const rank, char 
         out << std::endl;
     }
 }
+
+// ===========================================================================
+// Template implementations — log-once wrappers
+// ===========================================================================
+
+template <typename... Args>
+void Logger::logOnce(Logger::Level const level, std::string_view key, char const* format, Args const&... args)
+{
+    if (isEnabled(level) && consumeLogOnceKey(std::string_view{}, key))
+    {
+        log(level, format, args...);
+    }
+}
+
+template <typename... Args>
+void Logger::logOnce(
+    Logger::Level const level, Module module, std::string_view key, char const* format, Args const&... args)
+{
+    if (isEnabled(level, module.name) && consumeLogOnceKey(module.name, key))
+    {
+        log(level, module, format, args...);
+    }
+}
 } // namespace common
 
 TRTLLM_NAMESPACE_END
@@ -410,4 +473,25 @@ TRTLLM_NAMESPACE_END
 #define TLLM_LOG_INFO(...) TLLM_LOG(tensorrt_llm::common::Logger::INFO, __VA_ARGS__)
 #define TLLM_LOG_WARNING(...) TLLM_LOG(tensorrt_llm::common::Logger::WARNING, __VA_ARGS__)
 #define TLLM_LOG_ERROR(...) TLLM_LOG(tensorrt_llm::common::Logger::ERROR, __VA_ARGS__)
+
+// Log-once variants: the message is emitted only the first time `key` is seen for the calling
+// module. Keys are scoped by module (top-level source directory), not by file, so keys must be
+// unique within a module and bounded in number. See Logger::logOnce().
+#define TLLM_LOG_ONCE(level, key, ...)                                                                                 \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        auto* const logger = tensorrt_llm::common::Logger::getLogger();                                                \
+        constexpr auto tllmModule_ = tensorrt_llm::common::Logger::extractModule(__FILE__);                            \
+        if (logger->isEnabled(level, tllmModule_))                                                                     \
+        {                                                                                                              \
+            logger->logOnce(level, tensorrt_llm::common::Logger::Module{tllmModule_}, key, __VA_ARGS__);               \
+        }                                                                                                              \
+    } while (0)
+
+#define TLLM_LOG_TRACE_ONCE(key, ...) TLLM_LOG_ONCE(tensorrt_llm::common::Logger::TRACE, key, __VA_ARGS__)
+#define TLLM_LOG_DEBUG_ONCE(key, ...) TLLM_LOG_ONCE(tensorrt_llm::common::Logger::DEBUG, key, __VA_ARGS__)
+#define TLLM_LOG_INFO_ONCE(key, ...) TLLM_LOG_ONCE(tensorrt_llm::common::Logger::INFO, key, __VA_ARGS__)
+#define TLLM_LOG_WARNING_ONCE(key, ...) TLLM_LOG_ONCE(tensorrt_llm::common::Logger::WARNING, key, __VA_ARGS__)
+#define TLLM_LOG_ERROR_ONCE(key, ...) TLLM_LOG_ONCE(tensorrt_llm::common::Logger::ERROR, key, __VA_ARGS__)
+
 #define TLLM_LOG_EXCEPTION(ex, ...) tensorrt_llm::common::Logger::getLogger()->log(ex, ##__VA_ARGS__)

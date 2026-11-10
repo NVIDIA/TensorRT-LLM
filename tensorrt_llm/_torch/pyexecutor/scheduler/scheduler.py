@@ -233,6 +233,9 @@ class ScheduledRequests:
     """Maps a request id to the prompt-ordered indices of its multimodal items
     selected for encoder execution this iteration (only items whose encoder
     outputs are still missing). ``None`` when no items were scheduled."""
+    paused_in_place_ids: frozenset[int]
+    """Generation requests paused in place or displaced by a forced resume:
+    left out of this batch, but their drafter state must be kept."""
 
     def __init__(self):
         self.attention_dp_phase: RemoteTailPhase | None = None
@@ -245,6 +248,7 @@ class ScheduledRequests:
         self.recompute_paused_requests: RequestList = []
         self.added_inflight_req_ids: list[int] = []
         self.scheduled_mm_encoder_items: dict[int, list[int]] | None = None
+        self.paused_in_place_ids: frozenset[int] = frozenset()
 
     @property
     def is_generation_only(self) -> bool:

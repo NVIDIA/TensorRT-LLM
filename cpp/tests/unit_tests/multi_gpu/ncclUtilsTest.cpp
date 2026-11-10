@@ -399,6 +399,17 @@ TEST_F(NcclCommResourceManagerTest, ResourceCount)
 // NCCLWindowAllocator Tests
 //==============================================================================
 
+// Allocator tests need the same membership and rank order for host consensus.
+std::shared_ptr<ncclComm_t> createWindowComm(ncclComm_t parentComm, int color, int key)
+{
+    auto comm = createSplitComm(parentComm, color, key);
+    // These fixtures split all world ranks with the same color and preserve rank order.
+    std::vector<int> ranks(mpi::MpiComm::world().getSize());
+    std::iota(ranks.begin(), ranks.end(), 0);
+    nccl_util::registerHostCommunicator(*comm, mpi::MpiComm::world(), ranks);
+    return comm;
+}
+
 class NCCLWindowAllocatorTest : public ::testing::Test
 {
 protected:
@@ -450,6 +461,28 @@ protected:
     std::shared_ptr<ncclComm_t> mComm;
 };
 
+TEST_F(NCCLWindowAllocatorTest, HostConsensusBorrowsCommunicators)
+{
+    auto comm = createSplitComm(*mComm, 0, mRank);
+    EXPECT_ANY_THROW(nccl_util::hostAllTrue(*comm, true));
+    auto host = mpi::MpiComm::world().split(0, mRank);
+    std::vector<int> ranks(mWorldSize);
+    std::iota(ranks.begin(), ranks.end(), 0);
+    nccl_util::registerHostCommunicator(*comm, host, ranks);
+    EXPECT_EQ(comm.use_count(), 1);
+    EXPECT_TRUE(nccl_util::hostAllTrue(*comm, true));
+    EXPECT_FALSE(nccl_util::hostAllTrue(*comm, mRank != 0));
+    nccl_util::NcclCommResourceManager::getInstance().cleanupResources(*comm);
+    EXPECT_ANY_THROW(nccl_util::hostAllTrue(*comm, true));
+    EXPECT_EQ(host.getSize(), mWorldSize);
+    nccl_util::registerHostCommunicator(*comm, host, ranks);
+    EXPECT_TRUE(nccl_util::hostAllTrue(*comm, true));
+    std::weak_ptr<ncclComm_t> weakComm = comm;
+    comm.reset();
+    EXPECT_TRUE(weakComm.expired());
+    EXPECT_EQ(host.getRank(), mRank);
+}
+
 TEST_F(NCCLWindowAllocatorTest, BasicAllocation)
 {
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
@@ -476,7 +509,7 @@ TEST_F(NCCLWindowAllocatorTest, RequestedBuffersFollowUnsuppressedRequests)
 {
     using Access = nccl_util::NCCLWindowAllocatorTestAccess;
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
-    auto const testComm = createSplitComm(*mComm, 0, mRank);
+    auto const testComm = createWindowComm(*mComm, 0, mRank);
     size_t constexpr kBufferSize = 4 * 1024;
 
     // The flag is process-wide: start from an unrequested state and restore it on every exit.
@@ -513,7 +546,7 @@ TEST_F(NCCLWindowAllocatorTest, RequestedBuffersFollowUnsuppressedRequests)
 TEST_F(NCCLWindowAllocatorTest, ExplicitStreamAllocationAndCapture)
 {
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
-    auto const testComm = createSplitComm(*mComm, 0, mRank);
+    auto const testComm = createWindowComm(*mComm, 0, mRank);
     tr::CudaStream const stream;
     size_t constexpr kBufferSize = 4 * 1024;
     int64_t constexpr kOwner = 505;
@@ -528,9 +561,15 @@ TEST_F(NCCLWindowAllocatorTest, ExplicitStreamAllocationAndCapture)
     nccl_util::NCCLWindowBuffer newBuffer;
     EXPECT_NO_THROW(reusedBuffer = allocator.requestBuffer(*testComm, kBufferSize, stream.get()));
     {
-        // Registration is prohibited during capture, so the larger request uses the unregistered fallback.
-        ExpectedLifecycleWarning const expectedWarning{allocator};
-        EXPECT_NO_THROW(newBuffer = allocator.requestBuffer(*testComm, kBufferSize * 2, stream.get()));
+        if (nccl_util::isNcclWindowRegistrationCaptureSupported())
+        {
+            EXPECT_NO_THROW(newBuffer = allocator.requestBuffer(*testComm, kBufferSize * 2, stream.get()));
+        }
+        else
+        {
+            ExpectedLifecycleWarning const expectedWarning{allocator};
+            EXPECT_NO_THROW(newBuffer = allocator.requestBuffer(*testComm, kBufferSize * 2, stream.get()));
+        }
     }
     allocator.setGraphPoolOwner(-1);
     cudaGraph_t graph = nullptr;
@@ -542,9 +581,11 @@ TEST_F(NCCLWindowAllocatorTest, ExplicitStreamAllocationAndCapture)
 
     EXPECT_TRUE(reusedBuffer.isValid());
     EXPECT_EQ(reusedBuffer.ptr, buffer.ptr);
-    EXPECT_FALSE(newBuffer.isValid());
-    EXPECT_EQ(allocator.getBufferCount(*testComm), 1);
+    bool const captureSupported = nccl_util::isNcclWindowRegistrationCaptureSupported();
+    EXPECT_EQ(newBuffer.isValid(), captureSupported);
+    EXPECT_EQ(allocator.getBufferCount(*testComm), captureSupported ? 2 : 1);
     allocator.releaseBuffer(*testComm, reusedBuffer.ptr);
+    allocator.releaseBuffer(*testComm, newBuffer.ptr);
     allocator.releaseGraphPoolOwner(kOwner);
 
     nccl_util::ScopedNCCLWindowBuffer const scopedBuffer(testComm, kBufferSize * 2, stream.get());
@@ -698,7 +739,7 @@ TEST_F(NCCLWindowAllocatorTest, BestFitReuse)
 TEST_F(NCCLWindowAllocatorTest, FailureCacheIsSizeAwareForNewAllocations)
 {
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
-    auto testComm = createSplitComm(*mComm, 0, mRank);
+    auto testComm = createWindowComm(*mComm, 0, mRank);
 
     constexpr size_t failureSize = 1024 * 1024;
     nccl_util::NCCLWindowAllocatorTestAccess::recordSymmetricFailure(allocator, *testComm, failureSize);
@@ -718,7 +759,7 @@ TEST_F(NCCLWindowAllocatorTest, FailureCacheIsSizeAwareForNewAllocations)
 TEST_F(NCCLWindowAllocatorTest, FailureCacheDoesNotDisableReusableBuffers)
 {
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
-    auto testComm = createSplitComm(*mComm, 0, mRank);
+    auto testComm = createWindowComm(*mComm, 0, mRank);
 
     auto buffer1MB = allocator.requestBuffer(*testComm, 1024 * 1024);
     ASSERT_TRUE(buffer1MB.isValid());
@@ -743,7 +784,7 @@ TEST_F(NCCLWindowAllocatorTest, FailureCacheDoesNotDisableReusableBuffers)
 TEST_F(NCCLWindowAllocatorTest, FailureCachePreservesCaptureFallbackAndReuse)
 {
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
-    auto testComm = createSplitComm(*mComm, 0, mRank);
+    auto testComm = createWindowComm(*mComm, 0, mRank);
     constexpr size_t kBufferSize = 512 * 1024;
     constexpr int64_t kOwner = 404;
     auto const captureStream = at::cuda::getStreamFromPool();
@@ -793,7 +834,7 @@ TEST_F(NCCLWindowAllocatorTest, FailureCachePreservesCaptureFallbackAndReuse)
 TEST_F(NCCLWindowAllocatorTest, FailureCacheKeepsSmallestFailureSize)
 {
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
-    auto testComm = createSplitComm(*mComm, 0, mRank);
+    auto testComm = createWindowComm(*mComm, 0, mRank);
 
     nccl_util::NCCLWindowAllocatorTestAccess::recordSymmetricFailure(allocator, *testComm, 2 * 1024 * 1024);
     nccl_util::NCCLWindowAllocatorTestAccess::recordSymmetricFailure(allocator, *testComm, 1024 * 1024);
@@ -985,7 +1026,7 @@ TEST_F(NCCLWindowAllocatorTest, CleanupOnCommDestroy)
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
 
     // Create a separate comm using split for this test
-    auto testComm = createSplitComm(*mComm, 0, mRank);
+    auto testComm = createWindowComm(*mComm, 0, mRank);
 
     // Store the raw comm value before destruction
     ncclComm_t rawComm = *testComm;
@@ -1042,8 +1083,8 @@ TEST_F(NCCLWindowAllocatorTest, MultipleComms)
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
 
     // Create two different communicators using split (different colors)
-    auto comm1 = createSplitComm(*mComm, 0, mRank);
-    auto comm2 = createSplitComm(*mComm, 1, mRank);
+    auto comm1 = createWindowComm(*mComm, 0, mRank);
+    auto comm2 = createWindowComm(*mComm, 1, mRank);
 
     const size_t bufferSize = 4 * 1024;
 
@@ -1164,7 +1205,7 @@ TEST_F(CreateNCCLWindowTensorTest, CurrentStreamCapture)
     auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
     ExpectedLifecycleWarning const expectedWarning{allocator};
     allocator.setGraphPoolOwner(-1);
-    auto const testComm = createSplitComm(*mComm, 0, mRank);
+    auto const testComm = createWindowComm(*mComm, 0, mRank);
     auto const stream = at::cuda::getStreamFromPool();
     c10::cuda::CUDAStreamGuard const streamGuard(stream);
 
