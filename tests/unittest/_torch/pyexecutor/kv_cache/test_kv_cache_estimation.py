@@ -1883,6 +1883,31 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
     assert creator._kv_cache_config.pool_ratio == target_pool_ratio
 
 
+@pytest.mark.parametrize(
+    ("draft_windows", "estimation_windows"),
+    [([4096], [4096]), ([512, 9472], None), (None, None)],
+    ids=["single-window", "vswa", "full-attention"],
+)
+def test_separate_draft_estimation_keeps_a_single_window(
+    draft_windows: list[int] | None, estimation_windows: list[int] | None
+) -> None:
+    """A single-window drafter's estimation pool is charged a window per request, as at runtime.
+
+    VSWA drafters keep the full-attention fallback, so their estimation pool stays one group.
+    """
+    creator = _one_model_draft_creator([1.0], Mock(), None)
+    with patch.object(creator, "_get_draft_max_attention_window", return_value=draft_windows):
+        estimation = creator._get_one_model_draft_kv_cache_config(
+            creator._kv_cache_config, creator._max_seq_len, estimating_kv_cache=True
+        )
+        final = creator._get_one_model_draft_kv_cache_config(
+            creator._kv_cache_config, creator._max_seq_len
+        )
+
+    assert estimation.max_attention_window == estimation_windows
+    assert final.max_attention_window == draft_windows
+
+
 def test_one_model_draft_kv_uses_the_drafter_mapping_under_helix() -> None:
     # Helix + attention DP (Kimi K3 helix_a2a): the drafter is built head-TP on a
     # mapping without attention DP, so its KV heads must be sharded the same way,

@@ -2903,10 +2903,14 @@ class KvCacheCreator:
         """Return a clone with the draft manager's attention-window layout."""
         # Estimation uses a small max_tokens-sized temporary draft cache before
         # the measured GPU budget is available to split. Applying VSWA there
-        # would size every window pool from the unsplit free-memory budget.
-        max_attention_window = (None if estimating_kv_cache else
-                                self._get_draft_max_attention_window(
-                                    max_seq_len, kv_cache_config))
+        # would size every window pool from the unsplit free-memory budget. A
+        # single window keeps one pool, and the draft is charged a window per
+        # request, as at runtime, rather than every token.
+        max_attention_window = self._get_draft_max_attention_window(
+            max_seq_len, kv_cache_config)
+        if estimating_kv_cache and uses_vswa_kv_cache_layout(
+                max_attention_window):
+            max_attention_window = None
         update = {"max_attention_window": max_attention_window}
         if (kv_cache_config.mixed_precision_kv is not None and
                 not self._speculative_config.spec_dec_mode.is_mtp_one_model()):
