@@ -164,17 +164,10 @@ def test_plan_task_order_runs_full_tasks_then_longest_tails() -> None:
     assert order([5, 9, 5, 2], 10) == [(1, 0), (0, 0), (2, 0), (3, 0)]
 
 
-def test_plan_without_wave_plan_keeps_the_rule_and_request_order() -> None:
-    reduce_mod = _plan_mod()
-    plan = reduce_mod.plan_packed_tasks
-    # The default plan (TRTLLM_FP4_MLA_PACKED_WAVE_PLAN=0): rule-based task length, request
-    # order, no wave simulation.
-    assert plan([1, 79, 3, 176], 24, 17, wave_plan=False) == (13, [0, 1, 8, 9, 23])
-    assert plan([128] * 15 + [1024], 48, 17, wave_plan=False) == (
-        86,
-        list(range(0, 32, 2)) + [42],
-    )
-    order = reduce_mod.plan_task_order([24, 30, 3, 14], 10, wave_plan=False)
+def test_task_order_without_wave_plan_keeps_request_order() -> None:
+    # The default plan (TRTLLM_FP4_MLA_PACKED_WAVE_PLAN=0) keeps request order; its rule-based
+    # task lengths are the wave_plan=False rows of test_plan_packed_tasks_balances_by_kv_length.
+    order = _plan_mod().plan_task_order([24, 30, 3, 14], 10, wave_plan=False)
     assert order == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (2, 0), (3, 0), (3, 1)]
 
 
