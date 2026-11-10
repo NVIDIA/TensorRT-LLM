@@ -59,9 +59,22 @@ _BF16_KV_ALGOS = {
     _BF16_TP8EP2: (None, QuantAlgo.FP8),
 }
 
-# The MoE backends the targets stand for: they run their own fused_moe, so a
+# The MoE backends the targets stand for: they run their own expert path, so a
 # request for another backend does not route here.
 _BF16_MOE_BACKENDS = frozenset({"AUTO", "CUTLASS"})
+
+# The NVFP4 release: MIXED_PRECISION weights and an 8-bit (FP8) KV cache, gated on
+# sm_107 (Rubin) with 4 ranks. tep4: attention and mamba heads tensor-parallel over
+# the 4 ranks. dep4: attention data-parallel, everything but the routed experts whole
+# on every rank. Both put the routed experts expert-parallel over the same 4 ranks --
+# a weight-layout difference, which is why each is a target rather than a branch.
+_NVFP4_QUANT = ("MIXED_PRECISION", 8)
+_NVFP4_SM = (10, 7)
+_NVFP4_TEP4 = (4, False, 1, 4)
+_NVFP4_DEP4 = (4, True, 1, 4)
+_NVFP4_LAYOUTS = frozenset({_NVFP4_TEP4, _NVFP4_DEP4})
+# The NVFP4 targets run their routed experts on the trtllm-gen fp4 runner.
+_NVFP4_MOE_BACKENDS = frozenset({"AUTO", "TRTLLM"})
 
 
 def _block_kinds(pretrained_config: Any) -> frozenset:
@@ -134,14 +147,17 @@ def route(
             f"config shape {shape}, block kinds {sorted(kinds)}; the nemotron_h targets are "
             "Nemotron-3 Ultra 550B-A55B (mamba, attention and moe blocks)"
         )
-    if quant != _BF16_QUANT:
+    if quant not in (_BF16_QUANT, _NVFP4_QUANT):
         raise NoTarget(
-            f"quantization {quant}; the nemotron_h targets run the BF16 release (no quantization)"
+            f"quantization {quant}; the nemotron_h targets run the BF16 release (no "
+            "quantization) or the NVFP4 one (MIXED_PRECISION, FP8 KV)"
         )
-    if compute_capability != _BF16_SM:
+    nvfp4 = quant == _NVFP4_QUANT
+    sm = _NVFP4_SM if nvfp4 else _BF16_SM
+    if compute_capability != sm:
         raise NoTarget(
-            f"compute capability {compute_capability}; the nemotron_h BF16 targets are "
-            "certified on sm_100 only"
+            f"compute capability {compute_capability}, quantization {quant}; the nemotron_h "
+            f"{'NVFP4' if nvfp4 else 'BF16'} targets are certified on sm_{sm[0]}{sm[1]} only"
         )
 
     # The parallel layout.
@@ -174,7 +190,13 @@ def route(
             f"parallel layout {split} with attn_tp_size={mapping.attn_tp_size}; the targets "
             "split the heads over the whole TP group"
         )
-    if layout not in _BF16_KV_ALGOS:
+    if nvfp4 and layout not in _NVFP4_LAYOUTS:
+        raise NoTarget(
+            f"parallel layout {split}; the NVFP4 targets are gated on 4 ranks with the routed "
+            "experts expert-parallel over them, either tep4 (tensor-parallel attention and "
+            "mamba) or dep4 (attention data parallel)"
+        )
+    if not nvfp4 and layout not in _BF16_KV_ALGOS:
         raise NoTarget(
             f"parallel layout {split}; the BF16 targets are gated on tp8 with the routed "
             "experts expert-parallel over the 8 ranks (tep8: moe_ep 8) or in two expert-parallel "
@@ -182,7 +204,7 @@ def route(
         )
     # Only two GB200 trays (4 GPUs each, one NVLink domain) were measured; an 8-GPU node
     # runs the intra-node all-reduce path nobody has gated.
-    if not mapping.is_multi_node():
+    if not nvfp4 and not mapping.is_multi_node():
         raise NoTarget(
             f"parallel layout {split} inside one node of {mapping.gpus_per_node} GPUs; the "
             "BF16 targets are gated on two GB200 trays of four"
@@ -217,10 +239,12 @@ def route(
             "and register no layer with the balancer"
         )
     requested = str(model_config.moe_backend_requested).upper()
-    if requested not in _BF16_MOE_BACKENDS:
+    backends = _NVFP4_MOE_BACKENDS if nvfp4 else _BF16_MOE_BACKENDS
+    if requested not in backends:
         raise NoTarget(
-            f"moe_config.backend={model_config.moe_backend_requested!r}; the BF16 targets run "
-            "their routed experts on CUTLASS"
+            f"moe_config.backend={model_config.moe_backend_requested!r}; the "
+            f"{'NVFP4' if nvfp4 else 'BF16'} targets run their routed experts on "
+            f"{'TRTLLM' if nvfp4 else 'CUTLASS'}"
         )
     if str(llm_args.prefill_cuda_graph_backend.value) == "piecewise":
         raise NoTarget(
@@ -228,8 +252,9 @@ def route(
             "which the targets do not implement"
         )
     kv_cache_quant_algo = engine_kv_cache_quant_algo(model_config, llm_args)
-    if kv_cache_quant_algo not in _BF16_KV_ALGOS[layout]:
-        served = " or ".join("bf16" if a is None else str(a) for a in _BF16_KV_ALGOS[layout])
+    kv_algos = (QuantAlgo.FP8,) if nvfp4 else _BF16_KV_ALGOS[layout]
+    if kv_cache_quant_algo not in kv_algos:
+        served = " or ".join("bf16" if a is None else str(a) for a in kv_algos)
         raise NoTarget(
             f"KV cache {kv_cache_quant_algo} at parallel layout {split}; the target reads and "
             f"writes a {served} KV cache"
@@ -240,11 +265,36 @@ def route(
     state_dtype = effective_mamba_ssm_cache_dtype(
         model_config, kv_cache_config.mamba_ssm_cache_dtype
     )
-    if state_dtype != torch.float32:
+    # The state dtype each release's gates ran with: the BF16 checkpoint's own fp32, and
+    # fp16 for the NVFP4 targets.
+    gated_state = torch.float16 if nvfp4 else torch.float32
+    if state_dtype != gated_state:
         raise NoTarget(
             f"a {state_dtype} recurrent-state cache (kv_cache_config.mamba_ssm_cache_dtype); "
-            "the BF16 targets keep the checkpoint's fp32 SSM state"
+            f"the {'NVFP4' if nvfp4 else 'BF16'} targets were gated with a {gated_state} "
+            "SSM state"
         )
+    if nvfp4 and kv_cache_config.mamba_ssm_stochastic_rounding:
+        raise NoTarget(
+            "kv_cache_config.mamba_ssm_stochastic_rounding=True: the NVFP4 targets write the "
+            "fp16 SSM state with round-to-nearest"
+        )
+
+    # Nemotron-3 Ultra 550B-A55B NVFP4 on 4 sm_107 GPUs, tep4.
+    if layout == _NVFP4_TEP4:
+        from .nemotron3_ultra_nvfp4__sm_107__tep4.modeling import (
+            ModelingV2Nemotron3UltraNvfp4Sm107Tep4,
+        )
+
+        return ModelingV2Nemotron3UltraNvfp4Sm107Tep4
+
+    # Nemotron-3 Ultra 550B-A55B NVFP4 on 4 sm_107 GPUs, dep4.
+    if layout == _NVFP4_DEP4:
+        from .nemotron3_ultra_nvfp4__sm_107__dep4.modeling import (
+            ModelingV2Nemotron3UltraNvfp4Sm107Dep4,
+        )
+
+        return ModelingV2Nemotron3UltraNvfp4Sm107Dep4
 
     # Nemotron-3 Ultra 550B-A55B BF16 on 8 sm_100 GPUs, tep8.
     if layout == _BF16_TEP8:

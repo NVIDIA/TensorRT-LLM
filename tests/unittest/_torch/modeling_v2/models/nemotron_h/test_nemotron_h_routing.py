@@ -19,6 +19,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MoeConfig, NGramDecodingConfig, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
 
@@ -264,3 +265,78 @@ def test_ultra_bf16_tp8ep2_matches_over_an_fp8_kv_cache(mode):
 def test_ultra_bf16_tp8ep2_refuses_an_nvfp4_kv_cache():
     config = _model_config(_ultra_bf16_config(), **_TP8EP2)
     _refused(config, "KV cache", kv_cache_config=_kv(dtype="nvfp4"))
+
+
+# --- NVFP4 on sm_107 -------------------------------------------------------------
+
+_ULTRA_NVFP4_TEP4_TARGET = (
+    "models.nemotron_h.nemotron3_ultra_nvfp4__sm_107__tep4.modeling."
+    "ModelingV2Nemotron3UltraNvfp4Sm107Tep4"
+)
+_ULTRA_NVFP4_DEP4_TARGET = (
+    "models.nemotron_h.nemotron3_ultra_nvfp4__sm_107__dep4.modeling."
+    "ModelingV2Nemotron3UltraNvfp4Sm107Dep4"
+)
+_TEP4 = dict(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1, enable_attention_dp=False)
+_DEP4 = dict(_TEP4, enable_attention_dp=True)
+
+
+@pytest.fixture
+def _on_sm107(monkeypatch):
+    """Route as if this were a Rubin GPU."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
+
+
+def _nvfp4_config(**mapping):
+    """The NVFP4 release as the loader resolves it: its config declares an FP8 KV cache."""
+    return _model_config(_ultra_config(), kv_cache_quant_algo=QuantAlgo.FP8, **mapping)
+
+
+def _nvfp4_kv(**overrides) -> KvCacheConfig:
+    """The KV cache configuration the NVFP4 gates ran with: block reuse off, fp16 state."""
+    return _kv(**dict(dict(mamba_ssm_cache_dtype="float16"), **overrides))
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize(
+    "mapping, target",
+    [(_TEP4, _ULTRA_NVFP4_TEP4_TARGET), (_DEP4, _ULTRA_NVFP4_DEP4_TARGET)],
+    ids=["tep4", "dep4"],
+)
+def test_ultra_nvfp4_matches(_on_sm107, mapping, target, mode):
+    """Attention DP is an identity criterion: it selects the replicated-attention target."""
+    resolved = modeling_v2_resolve(
+        _nvfp4_config(**mapping), _llm_args(mode, kv_cache_config=_nvfp4_kv())
+    )
+    assert _qualified(resolved) == target
+
+
+@pytest.mark.parametrize(
+    "mapping, llm_kwargs, missed",
+    [
+        (dict(_TEP4, moe_ep_size=1, moe_tp_size=4), {}, "moe_ep=1"),
+        (dict(world_size=8, tp_size=8, moe_ep_size=8), {}, "world_size=8"),
+        (_TEP4, dict(kv_cache_config=_nvfp4_kv(mamba_ssm_cache_dtype="float32")), "float32"),
+        (
+            _TEP4,
+            dict(kv_cache_config=_nvfp4_kv(mamba_ssm_stochastic_rounding=True)),
+            "stochastic_rounding",
+        ),
+        (_DEP4, dict(kv_cache_config=_nvfp4_kv(dtype="nvfp4")), "KV cache"),
+        (_TEP4, dict(kv_cache_config=_nvfp4_kv(enable_block_reuse=True)), "enable_block_reuse"),
+    ],
+    ids=["moe-tp4", "eight-ranks", "fp32-state", "stochastic-rounding", "nvfp4-kv", "reuse"],
+)
+def test_ultra_nvfp4_near_misses_do_not_match(_on_sm107, mapping, llm_kwargs, missed):
+    llm_kwargs.setdefault("kv_cache_config", _nvfp4_kv())
+    _refused(_nvfp4_config(**mapping), missed, **llm_kwargs)
+
+
+def test_ultra_nvfp4_refuses_another_moe_backend(_on_sm107):
+    config = replace(_nvfp4_config(**_TEP4), moe_backend_requested="CUTLASS")
+    _refused(config, "moe_config.backend", kv_cache_config=_nvfp4_kv())
+
+
+def test_ultra_nvfp4_on_sm103_does_not_match(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 3))
+    _refused(_nvfp4_config(**_TEP4), r"compute capability \(10, 3\)", kv_cache_config=_nvfp4_kv())
