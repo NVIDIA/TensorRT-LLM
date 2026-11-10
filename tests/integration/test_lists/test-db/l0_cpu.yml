@@ -380,11 +380,16 @@ l0_cpu:
   - unittest/llmapi/test_runtime_memory_api.py
   - unittest/llmapi/test_sampling_params.py
   - unittest/llmapi/test_serialization.py
+  - unittest/llmapi/test_serve_cli_no_mutation.py
   - unittest/llmapi/test_serve_frontend_affinity.py
   - unittest/llmapi/test_serve_context_only_settings.py
   - unittest/llmapi/test_serve_multi_frontend_helpers.py
   - unittest/llmapi/test_serve_multi_frontend_route_gate.py
   - unittest/llmapi/test_serve_num_frontends_default.py
+  - unittest/llmapi/test_serve_cli_config_sources.py
+  - unittest/llmapi/test_serve_cli_net.py
+  - unittest/llmapi/test_serve_cli_options.py
+  - unittest/llmapi/test_serve_cli_wiring.py
   - unittest/llmapi/test_serve_report_addr.py
   - unittest/llmapi/test_serve_sleep_mode.py
   - unittest/llmapi/test_session_prefetcher.py

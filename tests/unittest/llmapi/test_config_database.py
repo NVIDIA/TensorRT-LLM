@@ -303,7 +303,7 @@ def test_serve_cli_passes_middlewares_to_launch_server():
         )
 
     assert mock_launch_server.call_count == 1
-    assert mock_launch_server.call_args.args[4] == middleware
+    assert mock_launch_server.call_args.kwargs["middleware"] == middleware
 
 
 def test_serve_cli_enable_visual_gen_routes_to_visual_gen():
@@ -324,12 +324,11 @@ def test_serve_cli_enable_visual_gen_routes_to_visual_gen():
 
     mock_launch_server.assert_not_called()
     mock_launch_visual_gen_server.assert_called_once()
-    assert mock_launch_visual_gen_server.call_args.args[:4] == (
-        "localhost",
-        8000,
-        "dummy/model",
-        None,
-    )
+    visual_gen_kwargs = mock_launch_visual_gen_server.call_args.kwargs
+    assert visual_gen_kwargs["host"] == "localhost"
+    assert visual_gen_kwargs["port"] == 8000
+    assert visual_gen_kwargs["model"] == "dummy/model"
+    assert visual_gen_kwargs["visual_gen_args"] is None
 
 
 def test_serve_cli_rejects_middleware_with_grpc():
