@@ -600,13 +600,13 @@ def processScanResults(ref) {
         if (params.postMergeBuildNumber?.trim()) {
             postMergeArgs += " --post-merge-build-number ${params.postMergeBuildNumber}"
         }
-        withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
+        withCredentials([string(credentialsId: 'CORA_SLACK_BOT_TOKEN', variable: 'CORA_BOT_TOKEN')]) {
             withEnv([
                 "TRTLLM_ES_POST_URL=${ELASTICSEARCH_POST_URL}",
                 "TRTLLM_ES_PREAPPROVED_POST_URL=${ELASTICSEARCH_PREAPPROVED_POST_URL}",
                 "TRTLLM_ES_QUERY_URL=${ELASTICSEARCH_QUERY_URL}",
                 "TRTLLM_ES_INDEX_BASE=${TRTLLM_ES_INDEX_BASE}",
-                "TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}"
+                "CORA_SLACK_BOT_TOKEN=${CORA_BOT_TOKEN}"
             ]) {
                 sh """
                     python3 -m venv venv
