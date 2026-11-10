@@ -755,8 +755,9 @@ def test_nested_eager_layers_release_after_first_window_request(
 ) -> None:
     """Nested unscoped layer calls around the first window request each release their leases.
 
-    The inner call keeps its outputs, then the outer call keeps its own, as nested layer scopes
-    would at their exits. Later calls are scoped.
+    Each release gets its own call's inputs, passed by keyword or by position. The inner call
+    keeps its outputs, then the outer call keeps its own, as nested layer scopes would at their
+    exits. Later calls are scoped.
     """
     from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 
@@ -768,10 +769,12 @@ def test_nested_eager_layers_release_after_first_window_request(
         def __init__(self) -> None:
             super().__init__()
             self.inner = InnerLayer()
+            self.inner_inputs = [object()]
             self.inner_outputs: list[list[object]] = []
 
         def forward(self, hidden_states: list[object]) -> list[object]:
-            self.inner_outputs.append(self.inner(hidden_states))
+            # By keyword, as models call their decoder layers.
+            self.inner_outputs.append(self.inner(hidden_states=self.inner_inputs))
             return hidden_states
 
     # Before the outer and the inner call; after the inner call, which makes the first request;
@@ -801,9 +804,11 @@ def test_nested_eager_layers_release_after_first_window_request(
     output = [object()]
     try:
         assert layer(output) is output
-        assert [event[0] for event in tensor_scope_events] == ["release", "release"]
-        assert tensor_scope_events[0][2] == layer.inner_outputs[0]
-        assert tensor_scope_events[1][2] == output
+        # The fixture collects a call's inputs as [args, kwargs].
+        assert tensor_scope_events == [
+            ("release", [(), {"hidden_states": layer.inner_inputs}], layer.inner_outputs[0]),
+            ("release", [(output,), {}], output),
+        ]
         assert layer(output) is output
     finally:
         for handle in handles:
