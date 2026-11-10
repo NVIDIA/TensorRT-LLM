@@ -38,8 +38,8 @@ class KernelContext:
     landing: str
     paths: tuple[str, ...] | None
     shared: tuple[str, ...]
-    environment_kind: str
-    devices: int
+    #: The devices the run claimed: kernel writers running beside each other take one each.
+    device_ids: tuple[int, ...]
 
 
 def _tier(value: Any) -> int | None:
@@ -54,7 +54,8 @@ def _tier(value: Any) -> int | None:
 def kernel_prompt(ctx: KernelContext) -> str:
     """Render the dispatch, spreading kernel writers over the host's devices."""
     # Kernel tasks of one unit run beside each other: without an index each would take device 0.
-    device = ctx.item.n % ctx.devices if ctx.devices > 1 else None
+    ids = ctx.device_ids
+    device = ids[ctx.item.n % len(ids)] if len(ids) > 1 else None
     tier = _tier(ctx.tier)
     local_variant = ctx.paths is not None and ctx.landing != ctx.item.target
     row_note = (ctx.item.note or "").strip()

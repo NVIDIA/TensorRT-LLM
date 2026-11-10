@@ -344,18 +344,20 @@ def kernel_context() -> kernel.KernelContext:
         landing="ops/norm/rmsnorm__r4",
         paths=("entry.py", "test.py"),
         shared=("catalog/norm/rmsnorm.py", "catalog/test_rmsnorm.py"),
-        environment_kind="local",
-        devices=4,
+        device_ids=(4, 5, 6, 7),
     )
 
 
-@pytest.mark.parametrize("environment,devices", [("local", 1), ("local", 4)])
-def test_kernel_writers_are_spread_over_the_hosts_devices(
-    kernel_context: kernel.KernelContext, environment: str, devices: int
+@pytest.mark.parametrize("claimed,device", [((4,), None), ((4, 5, 6, 7), 4), ((2, 3, 5), 3)])
+def test_kernel_writers_are_spread_over_the_devices_the_run_claimed(
+    kernel_context: kernel.KernelContext, claimed: tuple[int, ...], device: int | None
 ) -> None:
-    ctx = replace(kernel_context, environment_kind=environment, devices=devices)
+    ctx = replace(kernel_context, device_ids=claimed)
     text = kernel.kernel_prompt(ctx)
-    assert ("CUDA_VISIBLE_DEVICES=0" in text) is (devices > 1)
+    # Row 4 takes the claimed device at 4 modulo their count, never an index nobody claimed.
+    assert ("CUDA_VISIBLE_DEVICES=" in text) is (device is not None)
+    if device is not None:
+        assert f"**Use `CUDA_VISIBLE_DEVICES={device}` for this dispatch**" in text
     assert text.index(ctx.note) < text.index("## Your task")
     assert text.index("## Tag `kernel`") < text.index("## Tag `fix`")
     assert "from .ops.norm.rmsnorm__r4 import rmsnorm" in text

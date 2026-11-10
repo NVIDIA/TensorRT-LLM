@@ -876,7 +876,6 @@ class Pipeline:
         except (OSError, yaml.YAMLError, AttributeError):
             rows = ()
         row = next((r for r in rows if isinstance(r, dict) and str(r.get("n")) == str(item.n)), {})
-        environment = w.task_data.get("environment") or {}
         return kernel_prompt(
             KernelContext(
                 item=item,
@@ -894,8 +893,7 @@ class Pipeline:
                 landing=landing,
                 paths=entry_paths(item, target_rel, repo),
                 shared=tuple(shared_entry_paths(item.target)) if landing != item.target else (),
-                environment_kind=str(environment.get("kind", "local")),
-                devices=int(environment.get("gpus_per_node") or 1),
+                device_ids=tuple(self.state.devices),
             )
         )
 

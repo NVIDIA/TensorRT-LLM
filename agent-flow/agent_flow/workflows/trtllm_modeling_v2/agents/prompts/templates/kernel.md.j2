@@ -9,7 +9,7 @@ Dispatch {{ ctx.item.n }}: **{{ ctx.item.mode }}** the catalog entry `{{ ctx.ite
 {% if ctx.note %}
 {{ ctx.note }}
 {% endif %}{% if device is not none %}
-**Use `CUDA_VISIBLE_DEVICES={{ device }}` for this dispatch**, not the devices in the launch protocol above. This node has {{ ctx.devices }} devices and your batch is running concurrently; every kernel writer taking the same device turns a memory error into the symptom.
+**Use `CUDA_VISIBLE_DEVICES={{ device }}` for this dispatch**, not the devices in the launch protocol above. The run holds {{ ctx.device_ids | length }} devices and other kernel tasks run beside yours; every kernel writer taking the same device turns a memory error into the symptom.
 {% endif %}{% if ctx.goal %}
 ## Your task: `{{ ctx.task_id }}` (tags: {{ purpose_tags }})
 
