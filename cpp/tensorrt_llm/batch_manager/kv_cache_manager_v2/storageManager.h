@@ -370,6 +370,7 @@ public:
         uint64_t reclaimed;
         uint64_t dropped;
         uint64_t writeThroughPages;
+        uint64_t writeThroughSkipped; // eligible pages not written through: no free disk slot or background budget
     };
 
     [[nodiscard]] DiskCopyCounters diskCopyCounters() const noexcept;
@@ -606,13 +607,14 @@ private:
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> mNumRetainedCopies;
     KeepCopyStats mKeepCopyStats;
 
-    // Write-through: pages evicted GPU -> host are also copied to free disk slots as retained copies.
-    void writeThroughToDisk(
-        CacheLevel hostLevel, std::vector<SharedPtr<Page>> const& pages, DropRecorder const& dropRecorder);
+    // Write-through: pages evicted GPU -> host are also copied to free disk slots as retained copies, as background
+    // writes. It never evicts or reclaims anything to make room.
+    void writeThroughToDisk(CacheLevel hostLevel, std::vector<SharedPtr<Page>> const& pages);
     // Completion event of a write-through still reading this host page, or a null event.
     [[nodiscard]] CachedCudaEvent pendingDiskWrite(Page const& page) const;
     bool mDiskWriteThrough{false};
     uint64_t mWriteThroughPages{0};
+    uint64_t mWriteThroughSkipped{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

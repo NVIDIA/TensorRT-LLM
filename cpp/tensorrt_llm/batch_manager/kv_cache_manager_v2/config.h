@@ -107,7 +107,8 @@ struct DiskCacheTierConfig
     // Keep a committed page's disk copy after a restore, so its next eviction to disk writes nothing.
     bool keepCopyAfterRestore = false;
 
-    // Also copy pages evicted GPU -> host to disk in the background. Requires keepCopyAfterRestore.
+    // Also copy pages evicted GPU -> host to disk in the background, into free disk slots only and behind restores
+    // and required writes. Requires keepCopyAfterRestore and numIoThreads > 0.
     bool writeThrough = false;
 
     [[nodiscard]] CacheTier tier() const noexcept

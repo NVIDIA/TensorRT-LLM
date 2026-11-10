@@ -11573,6 +11573,34 @@ class TestNoBatchingDiskOptions(TestNoBatching):
         self._run_and_close(reuse)
         self.manager.clear_reusable_blocks()
 
+    def test_write_through_uses_only_free_disk_slots(self) -> None:
+        # A write-through copy only saves a later write. On a full disk it must not evict pages whose only copy is
+        # on disk to make room for itself.
+        self.prepare(32 << 20, 256 << 20, 96 << 20, 36, 128, 1, kv_buf_size=32768)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        for _ in range(16):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        # Shrinking the host tier pushes its pages down, so the disk fills with pages it holds the only copy of.
+        # Growing it back leaves room on the host, so later GPU -> host evictions go no further.
+        self.assertTrue(self.manager.resize(CacheLevel(1), 32 << 20))
+        self.assertTrue(self.manager.resize(CacheLevel(1), 256 << 20))
+        free_before = sum(
+            stats.free for stats in self.manager.get_storage_statistics(CacheLevel(2))
+        )
+        before = _introspection.disk_copy_counters(self.manager)
+
+        for _ in range(4):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+        after = _introspection.disk_copy_counters(self.manager)
+        self.assertLessEqual(
+            after["write_through_pages"] - before["write_through_pages"], free_before
+        )
+        self.assertGreater(
+            after.get("write_through_skipped", 0), before.get("write_through_skipped", 0)
+        )
+        self.manager.clear_reusable_blocks()
+
     def test_partial_tail_decoded_after_restore_reads_back_correctly(self) -> None:
         # A request that stops committing keeps decoding into its partially committed tail page. Each suspend
         # pushes its pages to disk and each resume restores them; a disk copy of the tail made on an earlier trip
@@ -11636,7 +11664,6 @@ class TestNoBatchingDiskOptions(TestNoBatching):
         self._run_and_close(reuse)
         self.manager.clear_reusable_blocks()
 
-
     def test_held_pages_take_kept_copy_slots_on_a_full_disk(self) -> None:
         # Held pages of a suspended request and droppable pages whose disk copies are kept fall into a disk tier
         # filled with exactly those copies. A kept copy only saves a write, so the held pages must get its slot.
@@ -11664,11 +11691,15 @@ class TestNoBatchingDiskOptions(TestNoBatching):
             filler.close()
             # Restoring A keeps every disk slot as a copy of one of its pages.
             prompt = first.kv_cache.committed_tokens
-            restored = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 0)
+            restored = self.Request(
+                next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 0
+            )
             self.assertTrue(restored.kv_cache.resume(stream))
             self.run_request(restored, 32, False)
             restored.kv_cache.close()
-            self.assertEqual(_introspection.disk_copy_counters(self.manager)["retained"], disk_pages)
+            self.assertEqual(
+                _introspection.disk_copy_counters(self.manager)["retained"], disk_pages
+            )
             # A suspended request holds as many GPU pages as the disk has.
             held = self.manager.create_kv_cache(None, tokens(disk_pages))
             self.assertTrue(held.resume(stream))
@@ -11685,6 +11716,7 @@ class TestNoBatchingDiskOptions(TestNoBatching):
             held.close()
         s.take_finish_event()
         self.manager.clear_reusable_blocks()
+
 
 class TestResizeQuotaDiskOptions(TestResizeQuota):
     disk_tier_options = _ALL_DISK_OPTIONS

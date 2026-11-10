@@ -222,7 +222,20 @@ namespace
 
 constexpr ssize_t kDiskIoChunkBytes = ssize_t{4} << 20;
 
+// Background (write-through) bytes issued but not yet written are capped. A required write can end up waiting for a
+// background one (an eviction that takes a written-through copy's slot back waits for that copy's write), so the cap
+// bounds that wait: 1 GiB is well under a second of NVMe write bandwidth.
+constexpr size_t kMaxBackgroundDiskWriteBytes = size_t{1} << 30;
+
+// Pieces are served reads first, then required writes, then background writes. A piece that has waited longer than
+// its limit is served ahead of that order (at most every other piece while reads wait), so a steady stream of reads
+// cannot starve writes. Required writes free host slots that restores may be waiting for, so they age sooner.
+constexpr auto kRequiredWriteMaxWait = std::chrono::milliseconds(10);
+constexpr auto kBackgroundWriteMaxWait = std::chrono::milliseconds(100);
+
 std::atomic<size_t> gAsyncDiskIoThreads{0};
+std::atomic<size_t> gBackgroundDiskWriteBytes{0};
+thread_local bool tBackgroundDiskWrites = false;
 
 // O_DIRECT descriptors, reopened via /proc/self/fd and keyed by fd and inode, since a closed pool file's fd
 // number can be reused for another file.
@@ -383,7 +396,18 @@ CompletionFlags* completionFlags() noexcept
 
 struct DiskTransfer
 {
+    DiskTransfer() = default;
+    DiskTransfer(DiskTransfer const&) = delete;
+    DiskTransfer& operator=(DiskTransfer const&) = delete;
+
+    ~DiskTransfer()
+    {
+        // Destroyed once its last piece has run, or when its launch failed.
+        gBackgroundDiskWriteBytes.fetch_sub(backgroundBytes, std::memory_order_relaxed);
+    }
+
     bool isRead = false;
+    size_t backgroundBytes = 0; // nonzero for a background write: its share of gBackgroundDiskWriteBytes
     std::vector<Task<MemAddress, DiskAddress>> reads;
     std::vector<Task<DiskAddress, MemAddress>> writes;
     ssize_t numBytes = 0;
@@ -481,12 +505,14 @@ public:
         {
             std::lock_guard<std::mutex> lock(mMutex);
             mInFlight += numPieces;
-            auto& queue = transfer->isRead ? mReads : mWrites;
+            auto& queue = transfer->isRead ? mReads : (transfer->backgroundBytes != 0 ? mBackground : mWrites);
+            auto const queued = std::chrono::steady_clock::now();
             for (size_t task = 0; task < transfer->numTasks(); ++task)
             {
                 for (ssize_t offset = 0; offset < transfer->numBytes; offset += chunk)
                 {
-                    queue.push_back(Piece{transfer, task, offset, std::min(chunk, transfer->numBytes - offset)});
+                    queue.push_back(
+                        Piece{transfer, task, offset, std::min(chunk, transfer->numBytes - offset), queued});
                 }
             }
         }
@@ -500,7 +526,36 @@ private:
         size_t task;
         ssize_t offset;
         ssize_t length;
+        std::chrono::steady_clock::time_point queued;
     };
+
+    // Called with mMutex held and at least one queue nonempty.
+    std::deque<Piece>& nextQueue()
+    {
+        bool const readsWaiting = !mReads.empty();
+        if (!readsWaiting || !mServedAgedPiece)
+        {
+            auto const now = std::chrono::steady_clock::now();
+            auto const overdue = [now](std::deque<Piece> const& queue, auto maxWait)
+            { return !queue.empty() && now - queue.front().queued >= maxWait; };
+            if (overdue(mWrites, kRequiredWriteMaxWait))
+            {
+                mServedAgedPiece = readsWaiting;
+                return mWrites;
+            }
+            if (overdue(mBackground, kBackgroundWriteMaxWait))
+            {
+                mServedAgedPiece = readsWaiting;
+                return mBackground;
+            }
+        }
+        mServedAgedPiece = false;
+        if (readsWaiting)
+        {
+            return mReads;
+        }
+        return !mWrites.empty() ? mWrites : mBackground;
+    }
 
     void run()
     {
@@ -509,9 +564,8 @@ private:
             Piece piece;
             {
                 std::unique_lock<std::mutex> lock(mMutex);
-                mCv.wait(lock, [this] { return !mReads.empty() || !mWrites.empty(); });
-                // Reads (restores) first: they are on the critical path.
-                auto& queue = !mReads.empty() ? mReads : mWrites;
+                mCv.wait(lock, [this] { return !mReads.empty() || !mWrites.empty() || !mBackground.empty(); });
+                auto& queue = nextQueue();
                 piece = std::move(queue.front());
                 queue.pop_front();
             }
@@ -537,9 +591,11 @@ private:
     std::mutex mMutex;
     std::condition_variable mCv;
     std::condition_variable mIdleCv;
-    size_t mInFlight = 0; // pieces queued or running
-    std::deque<Piece> mReads;
-    std::deque<Piece> mWrites;
+    size_t mInFlight = 0;          // pieces queued or running
+    bool mServedAgedPiece = false; // the last piece jumped the queue while reads were waiting
+    std::deque<Piece> mReads;      // restores: on the critical path
+    std::deque<Piece> mWrites;     // required evictions to disk
+    std::deque<Piece> mBackground; // write-through copies
 };
 
 // Set once by configureAsyncDiskIo, before gAsyncDiskIoThreads. Intentionally leaked: detached workers may
@@ -616,6 +672,32 @@ bool asyncDiskIo() noexcept
 }
 
 } // namespace
+
+bool asyncDiskIoEnabled() noexcept
+{
+    return asyncDiskIo();
+}
+
+BackgroundDiskWriteScope::BackgroundDiskWriteScope() noexcept
+    : mPrevious(tBackgroundDiskWrites)
+{
+    tBackgroundDiskWrites = true;
+}
+
+BackgroundDiskWriteScope::~BackgroundDiskWriteScope()
+{
+    tBackgroundDiskWrites = mPrevious;
+}
+
+size_t backgroundDiskWriteBudget() noexcept
+{
+    if (!asyncDiskIo())
+    {
+        return 0;
+    }
+    size_t const issued = gBackgroundDiskWriteBytes.load(std::memory_order_relaxed);
+    return issued < kMaxBackgroundDiskWriteBytes ? kMaxBackgroundDiskWriteBytes - issued : 0;
+}
 
 bool consumeFailedDiskWrite(int fd, ssize_t pos) noexcept
 {
@@ -728,6 +810,11 @@ CUresult copyHostToDisk(std::vector<Task<DiskAddress, MemAddress>> tasks, ssize_
     {
         auto transfer = std::make_shared<DiskTransfer>();
         transfer->isRead = false;
+        if (tBackgroundDiskWrites)
+        {
+            transfer->backgroundBytes = static_cast<size_t>(numBytes) * tasks.size();
+            gBackgroundDiskWriteBytes.fetch_add(transfer->backgroundBytes, std::memory_order_relaxed);
+        }
         transfer->writes = std::move(tasks);
         transfer->numBytes = numBytes;
         return launchDiskTransfer(std::move(transfer), stream);

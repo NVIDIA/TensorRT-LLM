@@ -2794,6 +2794,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             counters["reclaimed"] = c.reclaimed;
             counters["dropped"] = c.dropped;
             counters["write_through_pages"] = c.writeThroughPages;
+            counters["write_through_skipped"] = c.writeThroughSkipped;
             return counters;
         },
         nb::arg("manager"));

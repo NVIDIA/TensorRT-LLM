@@ -2056,6 +2056,11 @@ def test_KvCacheConfig_disk_offload_options(tmp_path):
         KvCacheConfig(disk_write_through=True)
     assert "disk_keep_copy_after_restore" in str(exc_info.value)
 
+    with pytest.raises(ValidationError) as exc_info:
+        KvCacheConfig(disk_keep_copy_after_restore=True,
+                      disk_write_through=True)
+    assert "disk_io_threads" in str(exc_info.value)
+
     with pytest.raises(ValidationError):
         KvCacheConfig(disk_io_threads=-1)
 
@@ -2077,6 +2082,11 @@ def test_KvCacheConfig_disk_offload_options(tmp_path):
 
     with pytest.raises(ValueError):
         DiskCacheTierConfig(2048, str(tmp_path), write_through=True).validate()
+    with pytest.raises(ValueError, match="numIoThreads"):
+        DiskCacheTierConfig(2048,
+                            str(tmp_path),
+                            keep_copy_after_restore=True,
+                            write_through=True).validate()
     with pytest.raises(ValueError):
         DiskCacheTierConfig(2048, str(tmp_path), num_io_threads=-1).validate()
 

@@ -585,6 +585,13 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
             configureAsyncDiskIo(static_cast<size_t>(std::max(disk->numIoThreads, 0)));
         }
     }
+    if (mDiskWriteThrough && !asyncDiskIoEnabled())
+    {
+        // Write-through copies are background writes; without the I/O pool they would run on the stream's host
+        // function, ahead of restores.
+        TLLM_LOG_WARNING("[kvCacheManagerV2] disk write_through needs async disk I/O (num_io_threads > 0); disabled");
+        mDiskWriteThrough = false;
+    }
     if (mKeepDiskCopy)
     {
         TLLM_LOG_INFO("[kvCacheManagerV2] disk tier: keep_copy_after_restore=1 write_through=%d",
@@ -904,7 +911,7 @@ bool StorageManager::keepDiskCopyEnabled() const noexcept
 StorageManager::DiskCopyCounters StorageManager::diskCopyCounters() const noexcept
 {
     return {mRetainedCopies.size(), mKeepCopyStats.created, mKeepCopyStats.reused, mKeepCopyStats.reclaimed,
-        mKeepCopyStats.dropped, mWriteThroughPages};
+        mKeepCopyStats.dropped, mWriteThroughPages, mWriteThroughSkipped};
 }
 
 SlotCount StorageManager::numRetainedCopies(CacheLevel level, std::optional<PoolGroupIndex> pgIdx) const
@@ -1070,8 +1077,7 @@ CachedCudaEvent StorageManager::pendingDiskWrite(Page const& page) const
     return CachedCudaEvent::makeNull();
 }
 
-void StorageManager::writeThroughToDisk(
-    CacheLevel hostLevel, std::vector<SharedPtr<Page>> const& pages, DropRecorder const& dropRecorder)
+void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<SharedPtr<Page>> const& pages)
 {
     CacheLevel const diskLevel = hostLevel + 1;
     if (diskLevel >= numCacheLevels() || cacheTier(hostLevel) != CacheTier::HOST_MEM
@@ -1091,29 +1097,13 @@ void StorageManager::writeThroughToDisk(
     for (auto& [batchingLayerGroupId, batch] : batches)
     {
         PoolGroupIndex const pgIdx = getPoolGroupIndex(diskLevel, batchingLayerGroupId);
-        SlotCount const wanted = slotCountValueFromSize(batch.size());
-        SlotCount free = poolGroup(diskLevel, pgIdx).numFreeSlots();
-        if (free < wanted && isLastLevel(diskLevel))
-        {
-            // The pages being written were just used, so they are newer than any page that lives only on disk.
-            // Dropping the least recently used disk pages costs no I/O; do that before reclaiming retained copies.
-            SlotCount const evictable = mLevels.at(diskLevel).controller.numEvictablePages(pgIdx);
-            SlotCount const numToEvict = std::min(wanted - free, evictable);
-            if (numToEvict > 0)
-            {
-                TypedVec<PoolGroupIndex, SlotCount> minNumPages(numPoolGroups(diskLevel), 0);
-                minNumPages.at(pgIdx) = numToEvict;
-                forceEvict(diskLevel, minNumPages, dropRecorder);
-                free = poolGroup(diskLevel, pgIdx).numFreeSlots();
-            }
-        }
-        if (free < wanted)
-        {
-            // Then recycle the oldest retained copies (duplicates).
-            releaseRetainedCopies(diskLevel, pgIdx, wanted - free);
-            free = poolGroup(diskLevel, pgIdx).numFreeSlots();
-        }
-        size_t const take = std::min(batch.size(), static_cast<size_t>(std::max<SlotCount>(free, 0)));
+        // A write-through copy only saves a later write, so it never makes room: it takes free disk slots only,
+        // and stays within the background write budget so it cannot build up a backlog.
+        SlotCount const free = poolGroup(diskLevel, pgIdx).numFreeSlots();
+        size_t const pageBytes = slotSize(diskLevel, pgIdx).at(PoolIndex{0});
+        size_t const take = std::min({batch.size(), static_cast<size_t>(std::max<SlotCount>(free, 0)),
+            pageBytes == 0 ? batch.size() : backgroundDiskWriteBudget() / pageBytes});
+        mWriteThroughSkipped += batch.size() - take;
         if (take == 0)
         {
             continue;
@@ -1127,7 +1117,11 @@ void StorageManager::writeThroughToDisk(
         {
             previousEvents.push_back(page->readyEvent);
         }
-        auto slots = _batchedMigrate(diskLevel, hostLevel, batch, /*updateSrc=*/false, MigrationRecorder{});
+        std::optional<std::vector<Slot>> slots;
+        {
+            BackgroundDiskWriteScope const background;
+            slots = _batchedMigrate(diskLevel, hostLevel, batch, /*updateSrc=*/false, MigrationRecorder{});
+        }
         for (size_t i = 0; i < take; ++i)
         {
             batch[i]->readyEvent = std::move(previousEvents[i]);
@@ -1702,7 +1696,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             _batchedMigrate(lvlId, srcLevel, pages, /*updateSrc=*/true, migrationRecorder);
             if (mDiskWriteThrough && srcLevel == kHotLevel)
             {
-                writeThroughToDisk(lvlId, pages, dropRecorder);
+                writeThroughToDisk(lvlId, pages);
             }
             for (auto const& page : pages)
             {

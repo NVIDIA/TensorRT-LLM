@@ -159,6 +159,10 @@ void DiskCacheTierConfig::validate() const
     {
         throw std::invalid_argument("DiskCacheTierConfig: writeThrough requires keepCopyAfterRestore");
     }
+    if (writeThrough && numIoThreads == 0)
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: writeThrough requires numIoThreads > 0");
+    }
 }
 
 namespace

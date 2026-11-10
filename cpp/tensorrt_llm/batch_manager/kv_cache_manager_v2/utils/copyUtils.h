@@ -43,6 +43,27 @@ void configureAsyncDiskIo(size_t numThreads) noexcept;
 //! Testing only: make the next \p count disk write pieces fail without writing.
 void injectDiskWriteFailuresForTesting(uint64_t count) noexcept;
 
+//! Whether host <-> disk copies run on the async I/O pool (configureAsyncDiskIo started it).
+[[nodiscard]] bool asyncDiskIoEnabled() noexcept;
+
+//! While an instance is alive, host-to-disk copies issued by this thread are background writes. The I/O pool serves
+//! them after reads and required writes. Write-through copies use this: they only save a later write.
+class BackgroundDiskWriteScope
+{
+public:
+    BackgroundDiskWriteScope() noexcept;
+    ~BackgroundDiskWriteScope();
+    BackgroundDiskWriteScope(BackgroundDiskWriteScope const&) = delete;
+    BackgroundDiskWriteScope& operator=(BackgroundDiskWriteScope const&) = delete;
+
+private:
+    bool mPrevious;
+};
+
+//! Bytes of background writes that may still be issued: 0 without the async I/O pool, otherwise what is left under
+//! a process-wide cap on background bytes issued and not yet written.
+[[nodiscard]] size_t backgroundDiskWriteBudget() noexcept;
+
 //! Call before closing a disk pool file: waits for in-flight I/O and closes its cached O_DIRECT descriptor.
 void releaseDiskFile(int fd) noexcept;
 

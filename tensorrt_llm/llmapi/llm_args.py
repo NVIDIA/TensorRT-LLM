@@ -5348,8 +5348,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         status="prototype",
         description=
         "When a reusable block is evicted from GPU to host, also copy it to disk in the background, so its "
-        "later host-to-disk eviction writes nothing. Requires `disk_keep_copy_after_restore`. Only used by KV "
-        "cache manager v2 with a disk cache.")
+        "later host-to-disk eviction writes nothing. Copies use free disk space only and are written after "
+        "restores and evictions. Requires `disk_keep_copy_after_restore` and `disk_io_threads` > 0. Only used "
+        "by KV cache manager v2 with a disk cache.")
     cross_kv_cache_fraction: Optional[float] = Field(
         default=None,
         description=
@@ -5804,6 +5805,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if self.disk_write_through and not self.disk_keep_copy_after_restore:
             raise ValueError(
                 "kv_cache_config.disk_write_through requires disk_keep_copy_after_restore"
+            )
+        if self.disk_write_through and self.disk_io_threads == 0:
+            raise ValueError(
+                "kv_cache_config.disk_write_through requires disk_io_threads > 0"
             )
         return self
 
