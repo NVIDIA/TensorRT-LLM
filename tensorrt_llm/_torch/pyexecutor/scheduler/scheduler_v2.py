@@ -345,6 +345,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Registered by PyExecutor; see set_disagg_transfer_admission_controller.
         self._disagg_transfer_controller = None
 
+        # Generation requests paused in place (GEN slot preemption).
+        self._gen_paused_ids: frozenset[int] = frozenset()
+        self._gen_resumed_ids: frozenset[int] = frozenset()
+        self._gen_preemption_enabled = False
+
         # `is True`: a manager without the flag reads as off.
         self._swa_scratch_reuse = (
             getattr(kv_cache_manager, "enable_swa_scratch_reuse", False) is True
@@ -446,6 +451,21 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._remote_tail_context_ids = context_request_ids
         self._remote_tail_generation_ids = generation_request_ids
 
+    def set_gen_paused_ids(
+        self, request_ids: frozenset[int], resumed_ids: frozenset[int] = frozenset()
+    ) -> None:
+        """Leave paused requests resident and give resumes priority this pass."""
+        self._gen_preemption_enabled = True
+        self._gen_paused_ids = request_ids
+        self._gen_resumed_ids = resumed_ids
+
+    def _filter_paused_requests(self, requests: RequestList) -> RequestList:
+        paused = [req for req in requests if req.py_request_id in self._gen_paused_ids]
+        for req in paused:
+            # Resume from the host token, not a stale overlap tensor.
+            self._clear_request_runtime_state(req)
+        return [req for req in requests if req.py_request_id not in self._gen_paused_ids]
+
     def _filter_remote_tail_phase_requests(self, requests: RequestList) -> RequestList:
         phase = self.remote_tail_phase
         if phase is None:
@@ -503,6 +523,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Use indexed iteration (while + req_it_end) so that MAX_UTIL
         # eviction can shrink the range from the tail.
         requests_list = self._filter_remote_tail_phase_requests(list(active_requests))
+        if self._gen_paused_ids:
+            requests_list = self._filter_paused_requests(requests_list)
         exclusive_remote_mode = next(
             (
                 getattr(req, "py_csa2_remote_tail_mode", None)
@@ -527,6 +549,10 @@ class KVCacheV2Scheduler(RequestScheduler):
                 )
             )
 
+        # Resume deadlines take precedence over the first-token preference.
+        if self._gen_resumed_ids:
+            requests_list.sort(key=lambda req: req.py_request_id not in self._gen_resumed_ids)
+
         req_it_end = len(requests_list)
         recompute_pause_state = _RecomputePauseState(req_it_end)
         req_it = 0
@@ -546,7 +572,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Index of each pending context request in requests_list.
         pending_ctx_index: dict[int, int] = {}
 
-        # Pre-claim PEFT pages for GENERATION_TO_COMPLETE requests.
+        # Pre-claim PEFT pages for terminal requests and, with GEN preemption,
+        # every live decode, including requests omitted from this batch.
         # In the overlap executor these requests are no longer scheduled
         # (state outside schedulable range) but their adapters haven't
         # been released yet (mark_request_done runs after prepare_resources
@@ -554,8 +581,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         # empty and context requests with a different adapter could be
         # admitted, causing ensure_batch to crash when it can't evict the
         # still-active adapter.
-        for req in requests_list:
-            if req.state_value == self._gen_to_complete_state_value:
+        for req in active_requests:
+            if req.state_value == self._gen_to_complete_state_value or (
+                self._gen_preemption_enabled
+                and req.state_value == LlmRequestState.GENERATION_IN_PROGRESS.value
+            ):
+                # Paused and displaced decode requests still hold their adapters.
                 budget.pre_claim_peft(req)
 
         # --- Phase 1: generation / disagg only ---
@@ -912,8 +943,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         ):
             # A non-ADP replay that cannot acquire KV must let decode release
             # pages. Retry admission without replay; keep its forward isolated.
+            # Pass every active request so the retry keeps the PEFT claims of
+            # paused decodes, which requests_list has already dropped.
             return self._schedule_loop(
-                requests_list,
+                active_requests,
                 inflight_request_ids,
                 defer_remote_tail_context=True,
                 prefix_waits=prefix_waits,

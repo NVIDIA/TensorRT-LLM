@@ -635,7 +635,9 @@ def _estimate_mamba_hybrid_cache_cost(
         )
     state_bytes_per_rank = local_mamba_layers * params.get_states_bytes_per_layer(mapping)
     state_bytes_per_rank += extra_state_bytes_per_rank
-    max_resident_sequences = max_batch_size * mapping.pp_size
+    max_resident_sequences = max_batch_size * mapping.pp_size + int(
+        kwargs.get("gen_preemption_headroom", 0)
+    )
 
     if include_explicit_snapshots:
         fixed_rules, unaligned_fixed_rules = _mamba_snapshot_rule_counts(

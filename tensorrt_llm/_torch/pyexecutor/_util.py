@@ -90,6 +90,8 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         KVCacheV2Scheduler, MultimodalEagerEncoderScheduler,
                         MultimodalScheduler, SimpleScheduler,
                         SimpleUnifiedScheduler)
+from .scheduler.gen_preemption import (headroom_for_args,
+                                       unsupported_headroom_reason)
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -1011,6 +1013,7 @@ class KvCacheCreator:
     # Paired-reuse protocol flag. ``build_managers`` resolves it once and hands
     # it to both constructors; the managers must not re-derive it.
     _joint_kv_cache_reuse = False
+    _gen_preemption_headroom: int = 0
 
     def __init__(
         self,
@@ -1033,6 +1036,7 @@ class KvCacheCreator:
         execution_stream: Optional[torch.cuda.Stream] = None,
         draft_config: Optional[ModelConfig] = None,
         skip_est: bool = False,
+        gen_preemption_headroom: int = 0,
     ):
         self._model_engine = model_engine
         self._mapping = mapping
@@ -1052,6 +1056,7 @@ class KvCacheCreator:
         # Estimation can shrink _max_seq_len; cache ownership must stay fixed.
         self._unification_max_seq_len = max_seq_len
         self._max_batch_size = max_batch_size
+        self._gen_preemption_headroom = gen_preemption_headroom
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
         self._mla_chunked_profile_length: int | None = None
@@ -1242,6 +1247,7 @@ class KvCacheCreator:
                 tokens_per_block=tokens_per_block,
                 max_seq_len=self._max_seq_len,
                 max_batch_size=self._max_batch_size,
+                gen_preemption_headroom=self._gen_preemption_headroom,
                 max_num_tokens=self._max_num_tokens,
                 kv_cache_config=kv_cache_config,
                 spec_config=self._speculative_config,
@@ -1677,7 +1683,8 @@ class KvCacheCreator:
                 self._mapping,
                 self._max_batch_size,
                 self._llm_args.disable_overlap_scheduler,
-                enable_overlap_headroom=False),
+                enable_overlap_headroom=False,
+                gen_preemption_headroom=self._gen_preemption_headroom),
             max_beam_width=store.max_beam_width,
             vocab_size=resolve_vocab_size(
                 self._model_engine.model.model_config.pretrained_config))
@@ -2221,6 +2228,7 @@ class KvCacheCreator:
             tokens_per_block=self._tokens_per_block,
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,
+            gen_preemption_headroom=self._gen_preemption_headroom,
             spec_config=self._speculative_config,
             sparse_attention_config=self._sparse_attention_config,
             max_num_tokens=self._max_num_tokens,
@@ -2822,6 +2830,7 @@ class KvCacheCreator:
             tokens_per_block=draft_tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=self._max_batch_size,
+            gen_preemption_headroom=self._gen_preemption_headroom,
             spec_config=self._speculative_config,
             sparse_attention_config=sparse_attn_config,
             max_num_tokens=self._max_num_tokens,
@@ -3448,6 +3457,7 @@ class KvCacheCreator:
             tokens_per_block=self._tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=self._max_batch_size,
+            gen_preemption_headroom=self._gen_preemption_headroom,
             spec_config=None,
             sparse_attention_config=None,
             max_num_tokens=self._max_num_tokens,
@@ -3746,7 +3756,8 @@ def _create_kv_cache_manager(
         joint_kv_cache_reuse: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
-        shared_draft_block_width: Optional[int] = None) -> KVCacheManager:
+        shared_draft_block_width: Optional[int] = None,
+        gen_preemption_headroom: int = 0) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -3891,6 +3902,8 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["max_cuda_graph_batch_size"] = (
             model_engine.max_cuda_graph_batch_size
             if model_engine is not None else max_cuda_graph_batch_size)
+        manager_extra_kwargs[
+            "gen_preemption_headroom"] = gen_preemption_headroom
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
         manager_extra_kwargs["max_copy_beam_width"] = max_copy_beam_width
         manager_extra_kwargs[
@@ -4364,19 +4377,20 @@ def create_kv_cache_compression_manager(
 def compute_max_num_sequences(mapping: Mapping,
                               max_batch_size: int,
                               disable_overlap_scheduler: bool,
-                              enable_overlap_headroom: bool = False) -> int:
+                              enable_overlap_headroom: bool = False,
+                              gen_preemption_headroom: int = 0) -> int:
     """Size the sequence-slot pool (and the sampler state it indexes).
 
     ``enable_overlap_headroom`` is intentionally opt-in; see
     ``should_enable_overlap_headroom``. Pipeline parallelism already sizes the
-    pool by ``pp_size``.
+    pool by ``pp_size``. GEN slot preemption adds a slot per paused request.
     """
     if mapping.has_pp():
         num_micro_batches = mapping.pp_size
     else:
         num_micro_batches = (2 if enable_overlap_headroom
                              and not disable_overlap_scheduler else 1)
-    return max_batch_size * num_micro_batches
+    return max_batch_size * num_micro_batches + gen_preemption_headroom
 
 
 def resolve_max_num_sequences(model_engine,
@@ -4391,12 +4405,13 @@ def resolve_max_num_sequences(model_engine,
     engine_seats = getattr(model_engine, "max_num_seq_slots", None)
     if engine_seats is not None:
         return engine_seats
-    return compute_max_num_sequences(mapping,
-                                     max_batch_size,
-                                     llm_args.disable_overlap_scheduler,
-                                     enable_overlap_headroom=getattr(
-                                         model_engine,
-                                         "enable_overlap_headroom", False))
+    return compute_max_num_sequences(
+        mapping,
+        max_batch_size,
+        llm_args.disable_overlap_scheduler,
+        enable_overlap_headroom=getattr(model_engine, "enable_overlap_headroom",
+                                        False),
+        gen_preemption_headroom=headroom_for_args(max_batch_size, llm_args))
 
 
 def should_enable_adp_dummy_fixes(mapping: Mapping) -> bool:
@@ -4974,6 +4989,11 @@ def create_py_executor_instance(
         dense_dwdp_manager=dense_dwdp_manager,
         max_num_sequences=max_num_sequences,
     )
+    # Mirror the creator's gen_preemption gate (the pools were sized against
+    # the same reason): an executor that cannot pause keeps the feature off
+    # here instead of re-deriving a short-pool warning from its own check.
+    headroom_reason = unsupported_headroom_reason(
+        llm_args.scheduler_config.gen_preemption, llm_args)
     spec_config = model_engine.spec_config
     config = model_engine.model.model_config.pretrained_config
     return PyExecutor(
@@ -5019,6 +5039,8 @@ def create_py_executor_instance(
         enable_non_overlap_adp_forward_intent=(
             should_enable_non_overlap_adp_forward_intent(
                 mapping, llm_args.disable_overlap_scheduler)),
+        gen_preemption=llm_args.scheduler_config.gen_preemption
+        if headroom_reason is None else None,
     )
 
 
