@@ -606,7 +606,7 @@ def test_prims_ts_context_lazy_rescale_with_late_key_block(
     wrapper.plan(
         device=device,
         batch_size=1,
-        max_seq_len_q=q_len,
+        max_q_len=q_len,
         max_kv_len=kv_len,
         num_qo_heads=1,
         num_kv_heads=1,
@@ -617,7 +617,7 @@ def test_prims_ts_context_lazy_rescale_with_late_key_block(
         out_dtype=dtype,
         page_size=page_size,
         mask_type="dense",
-        sm_scale=sm_scale,
+        softmax_scale=sm_scale,
     )
     wrapper.run(query, k_cache, v_cache, qo_indptr, block_tables, seq_lens, out=output)
     torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
@@ -720,7 +720,7 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
     wrapper.plan(
         device=device,
         batch_size=batch_size,
-        max_seq_len_q=3,
+        max_q_len=3,
         max_kv_len=max_seq_len,
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
@@ -738,12 +738,12 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
 
     assert len(compile_records) == 3
     assert [
-        (args[0].max_seq_len_q, args[0].max_kv_len, policy["scheduler"])
+        (args[0].max_q_len, args[0].max_kv_len, args[0].runtime_lengths, policy["scheduler"])
         for args, policy, _compiled in compile_records
     ] == [
-        (96, 96, "clc_dynamic_persistent"),
-        (128, 128, "nonpersistent"),
-        (3, 64, "clc_dynamic_persistent"),
+        (None, None, True, "clc_dynamic_persistent"),
+        (None, None, True, "nonpersistent"),
+        (None, None, True, "clc_dynamic_persistent"),
     ]
     assert compile_records[0][0] != compile_records[2][0]
     assert len({id(recorded) for _args, _policy, recorded in compile_records}) == 3
@@ -863,11 +863,11 @@ def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
         head_dim,
         page_size,
         max_seq_len,
-        max_seq_len_q=1,
+        max_q_len=1,
         packed_query=False,
-        q_data_type=dtype,
-        kv_data_type=dtype,
-        o_data_type=dtype,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=dtype,
         mask_type="causal",
         workspace_buffer=external_workspace,
     )
@@ -978,7 +978,7 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
         qk_rope_head_dim,
         page_size,
         max_seq_len,
-        max_seq_len_q=1,
+        max_q_len=1,
         q_dtype=dtype,
         kv_dtype=dtype,
         out_dtype=dtype,
@@ -999,11 +999,11 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
         qk_rope_head_dim,
         page_size,
         max_seq_len,
-        max_seq_len_q=1,
+        max_q_len=1,
         packed_query=False,
-        q_data_type=dtype,
-        kv_data_type=dtype,
-        o_data_type=dtype,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=dtype,
         mask_type="causal",
         workspace_buffer=external_workspace,
     )
@@ -1019,7 +1019,7 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
         kv_cache,
         block_tables,
         seq_lens,
-        bmm1_scale=bmm1_scale,
+        softmax_scale=bmm1_scale,
         out=output,
     )
     graph = torch.cuda.CUDAGraph()
@@ -1029,7 +1029,7 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
             kv_cache,
             block_tables,
             seq_lens,
-            bmm1_scale=bmm1_scale,
+            softmax_scale=bmm1_scale,
             out=output,
             validate=False,
         )
@@ -1047,8 +1047,8 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         max_kv_len=max_seq_len,
-        max_seq_len_q=1,
-        bmm1_scale=bmm1_scale,
+        max_q_len=1,
+        softmax_scale=bmm1_scale,
         out_dtype=dtype,
         out=torch.empty_like(output),
         mask_type="causal",
@@ -1130,11 +1130,11 @@ def test_prims_ts_decode_graph_profiles_reset_shared_workspace_a_b_a() -> None:
             head_dim,
             page_size,
             max_seq_len,
-            max_seq_len_q=1,
+            max_q_len=1,
             packed_query=False,
-            q_data_type=dtype,
-            kv_data_type=dtype,
-            o_data_type=dtype,
+            q_dtype=dtype,
+            kv_dtype=dtype,
+            out_dtype=dtype,
             mask_type="causal",
             workspace_buffer=shared_workspace,
         )
@@ -1289,11 +1289,11 @@ def test_prims_ts_decode_wrappers_share_workspace_across_serialized_layers() -> 
             head_dim,
             page_size,
             max_seq_len,
-            max_seq_len_q=1,
+            max_q_len=1,
             packed_query=False,
-            q_data_type=dtype,
-            kv_data_type=dtype,
-            o_data_type=dtype,
+            q_dtype=dtype,
+            kv_dtype=dtype,
+            out_dtype=dtype,
             mask_type="causal",
             workspace_buffer=shared_workspace,
         )
@@ -1404,18 +1404,54 @@ _CACHE_FREE_CASE = dict(
 )
 
 
-@pytest.mark.parametrize("outlier", [1.0, 10.0])
 @pytest.mark.parametrize(
-    ("qk_dtype", "v_dtype", "vc_attention", "vc_repair_budget", "vc_smooth", "seq_len"),
+    (
+        "qk_dtype",
+        "v_dtype",
+        "vc_attention",
+        "vc_repair_budget",
+        "vc_smooth",
+        "seq_len",
+        "outlier",
+        "cuda_graph",
+    ),
     [
-        ("bf16", "fp8", False, 0.0, True, 256),
-        ("fp8", "fp8", False, 0.0, True, 256),
-        ("bf16", "fp8", True, 0.0, True, 256),
-        ("bf16", "fp8", True, 0.0, False, 200),
-        ("bf16", "fp8", True, 0.01, True, 200),
-        ("fp8", "fp8", True, 0.0, True, 200),
-        ("fp8", "fp8", True, 0.0, False, 256),
-        ("fp8", "fp8", True, 0.01, True, 256),
+        pytest.param(
+            "bf16",
+            "fp8",
+            False,
+            0.0,
+            True,
+            200,
+            1.0,
+            True,
+            id="bf16-qk-fp8-v-partial-cuda-graph",
+        ),
+        pytest.param(
+            "fp8",
+            "fp8",
+            False,
+            0.0,
+            True,
+            256,
+            1.0,
+            True,
+            id="fp8-qkv-cuda-graph",
+        ),
+        ("bf16", "fp8", False, 0.0, True, 200, 10.0, False),
+        ("fp8", "fp8", False, 0.0, True, 256, 10.0, False),
+        ("bf16", "fp8", True, 0.0, True, 256, 1.0, False),
+        ("bf16", "fp8", True, 0.0, True, 256, 10.0, False),
+        ("bf16", "fp8", True, 0.0, False, 200, 1.0, False),
+        ("bf16", "fp8", True, 0.0, False, 200, 10.0, False),
+        ("bf16", "fp8", True, 0.01, True, 200, 1.0, False),
+        ("bf16", "fp8", True, 0.01, True, 200, 10.0, False),
+        ("fp8", "fp8", True, 0.0, True, 200, 1.0, False),
+        ("fp8", "fp8", True, 0.0, True, 200, 10.0, False),
+        ("fp8", "fp8", True, 0.0, False, 256, 1.0, False),
+        ("fp8", "fp8", True, 0.0, False, 256, 10.0, False),
+        ("fp8", "fp8", True, 0.01, True, 256, 1.0, False),
+        ("fp8", "fp8", True, 0.01, True, 256, 10.0, False),
     ],
 )
 def test_prims_ts_cache_free_fp8_recipes(
@@ -1427,6 +1463,7 @@ def test_prims_ts_cache_free_fp8_recipes(
     vc_smooth: bool,
     seq_len: int,
     outlier: float,
+    cuda_graph: bool,
 ) -> None:
     """Cache-free recipes plan FP8 operands, fold the per-tensor scales, and match SDPA.
 
@@ -1435,6 +1472,8 @@ def test_prims_ts_cache_free_fp8_recipes(
     logits are unchanged. Each sample is checked against SDPA. The VC rows cover both
     V-Smooth phases, inside the window with tile means and after it on the plain
     demean-off plan, and a length that is not a multiple of the 128-token tile.
+    The CUDA graph rows replay quantization and attention with changed Q/K/V,
+    covering both float/tensor and tensor/tensor global-scale combinations.
     """
     from tensorrt_llm._torch.attention.backends.prims_ts.context import BatchPrefillTSWrapper
     from tensorrt_llm.visual_gen.args import QuantAttentionConfig
@@ -1447,6 +1486,20 @@ def test_prims_ts_cache_free_fp8_recipes(
     )
     plans: list[dict] = []
     runs: list[dict] = []
+    forward_calls: list[tuple] = []
+    if cuda_graph:
+        from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
+
+        assert not vc_attention
+        forward = PrimsTSFmha._forward_without_kv_cache
+
+        def recording_forward(self: PrimsTSFmha, *args: object, **kwargs: object) -> None:
+            # The library keeps only a weak reference to its owning attention.
+            forward_calls.append((self.attn, self, args, kwargs))
+            forward(self, *args, **kwargs)
+
+        monkeypatch.setattr(PrimsTSFmha, "_forward_without_kv_cache", recording_forward)
+
     plan, run = BatchPrefillTSWrapper.plan, BatchPrefillTSWrapper.run
 
     def recording_plan(self, *args, **kwargs):
@@ -1504,8 +1557,8 @@ def test_prims_ts_cache_free_fp8_recipes(
         assert (run_kwargs["vc"].q_scale is not None) == (qk_dtype == "fp8")
         assert (plan_kwargs["vc_config"].repair_tiles > 0) == (vc_repair_budget > 0)
         assert plan_kwargs["vc_config"].demean == (vc_smooth and not vc_repair_budget)
-        assert run_kwargs["output_scale"] is None
-        assert run_kwargs["scale_softmax_log2"] is None
+        assert run_kwargs["output_scale"] == 1.0
+        assert run_kwargs["softmax_scale"] == 1.0 / math.sqrt(case.head_dim)
     else:
         # The quantize op returns BF16-rounded dequant scales.
         torch.testing.assert_close(
@@ -1515,13 +1568,11 @@ def test_prims_ts_cache_free_fp8_recipes(
             expected = (
                 dequant_scale(inputs["q"])
                 * dequant_scale(inputs["new_k"])
-                * (math.log2(math.e) / math.sqrt(case.head_dim))
+                / math.sqrt(case.head_dim)
             )
-            torch.testing.assert_close(
-                run_kwargs["scale_softmax_log2"], expected, rtol=1e-2, atol=0.0
-            )
+            torch.testing.assert_close(run_kwargs["softmax_scale"], expected, rtol=1e-2, atol=0.0)
         else:
-            assert run_kwargs["scale_softmax_log2"] is None
+            assert run_kwargs["softmax_scale"] == 1.0 / math.sqrt(case.head_dim)
     # The second sample's output is ``outlier`` times larger. Normalize it before comparing.
     sample_gain = torch.tensor([1.0, outlier], device=out.device).view(-1, 1)
     torch.testing.assert_close(
@@ -1530,6 +1581,39 @@ def test_prims_ts_cache_free_fp8_recipes(
         atol=FP8_ATOL + BF16_ATOL,
         rtol=BF16_RTOL,
     )
+
+    if cuda_graph:
+        ((_owner, library, args, kwargs),) = forward_calls
+        q_input, k_input, v_input = args[:3]
+        captured_output = args[4].output
+        assert captured_output is not None
+        original_q, original_k, original_v = q_input.clone(), k_input.clone(), v_input.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            forward(library, *args, **kwargs)
+        # Replay the warmed adapter, including quantization and its live scales.
+        for q_gain, k_gain, v_gain in ((3.0, 0.7, 0.3), (0.3, 1.7, 3.0)):
+            q_input.copy_(original_q * q_gain)
+            k_input.copy_(original_k * k_gain)
+            v_input.copy_(original_v * v_gain)
+            captured_output.zero_()
+            graph.replay()
+            expected = (
+                torch.nn.functional.scaled_dot_product_attention(
+                    bhsd(q_input), bhsd(k_input), bhsd(v_input)
+                )
+                .transpose(1, 2)
+                .reshape_as(captured_output)
+            )
+            relative_error = (captured_output.float() - expected).norm() / expected.norm()
+            assert relative_error.item() < 0.15
+            torch.testing.assert_close(
+                captured_output.float() / v_gain,
+                expected / v_gain,
+                atol=FP8_ATOL + BF16_ATOL,
+                rtol=BF16_RTOL,
+            )
+        assert len(plans) == 1
 
 
 def test_prims_ts_recipe_requires_prims_ts_library(monkeypatch: pytest.MonkeyPatch) -> None:

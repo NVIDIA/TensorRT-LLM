@@ -22,6 +22,7 @@ import math
 import os
 import random
 import sys
+import threading
 import time
 import unittest
 from contextlib import contextmanager
@@ -11387,6 +11388,228 @@ class TestPoison(TestKVCacheManagerV2):
 
         self.assertIn("deliberate test poisoning", take_poison())
         self.assertIsNone(poison_reason())
+
+
+class TestTeardownWithoutCudaContext(TestKVCacheManagerV2):
+    """Finalization on a thread that has no CUDA context must not poison the process.
+
+    A manager or cache that was never shut down is freed by whichever thread drops its last
+    reference, and a thread that never touched CUDA has no current context. Teardown then has to
+    make the manager's own context current: otherwise its driver calls fail with
+    CUDA_ERROR_INVALID_CONTEXT, and since a destructor can only report that through the
+    process-wide latch, every later manager in the process would raise CorruptedError.
+
+    Each test here leaves no manager alive, so a failure is blamed on it rather than on the test
+    that happens to run next. Where the teardown releases device memory, the test also checks
+    that the memory came back: a teardown that could not push the context leaks instead of
+    poisoning, and would otherwise pass unnoticed.
+    """
+
+    #: A teardown that deadlocks cannot be killed; failing here beats hanging the shard.
+    JOIN_TIMEOUT_S = 120
+    #: Device memory that may stay behind after a teardown (stream and event pools, driver
+    #: bookkeeping); far below the 64 MiB pool a leaked manager would keep.
+    FREE_MEMORY_SLACK = 4 << 20
+    #: What the teardown has to give back for the memory check to mean anything.
+    MIN_HELD_MEMORY = 16 << 20
+
+    def setUp(self) -> None:
+        super().setUp()
+        if not hasattr(_introspection, "poison_for_testing"):
+            raise unittest.SkipTest("the poison latch is C++-backend only")
+        # A host tier as well, so the teardown also unregisters host memory.
+        self.cfg = create_config(32, 64 << 20, 16 << 20, 0, 2, None, 0)
+        # Outlives every cache opened here: a cache stays resumed on it until it is closed.
+        self.stream_holder = CachedCudaStream()
+        self.stream = cast(CudaStream, self.stream_holder.handle)
+
+    def tearDown(self) -> None:
+        super().tearDown()
+        del self.stream_holder
+
+    def _drop_without_cuda_context(self, holder: list[object]) -> None:
+        """Drops everything in holder on a fresh thread, which has no current CUDA context."""
+        errors: list[BaseException] = []
+
+        def drop() -> None:
+            try:
+                holder.clear()
+                gc.collect()
+            except BaseException as error:  # noqa: BLE001 - re-raised on the test thread
+                errors.append(error)
+
+        thread = threading.Thread(target=drop, name="no-cuda-context")
+        thread.start()
+        thread.join(self.JOIN_TIMEOUT_S)
+        self.assertFalse(thread.is_alive(), f"teardown did not finish in {self.JOIN_TIMEOUT_S}s")
+        if errors:
+            raise errors[0]
+
+    @staticmethod
+    def _device_free_memory() -> int:
+        import cuda.bindings.runtime as cudart
+
+        err, free, _total = cudart.cudaMemGetInfo()
+        assert int(err) == int(cudart.cudaError_t.cudaSuccess)
+        return free
+
+    def _assert_memory_returned(self, free_before: int, free_while_held: int) -> None:
+        """The device memory the teardown had to release is free again."""
+        held = free_before - free_while_held
+        self.assertGreaterEqual(held, self.MIN_HELD_MEMORY, "the check would be vacuous")
+        free_after = self._device_free_memory()
+        self.assertGreaterEqual(free_after, free_before - self.FREE_MEMORY_SLACK, f"{held} B held")
+
+    def _open_cache(
+        self, manager: KVCacheManager, tokens: list[TokenIdExt] | None = None
+    ) -> _KVCache:
+        """A resumed cache holding committed pages, so a teardown has pages to release."""
+        if tokens is None:
+            tokens = [self.next_token() for _ in range(64)]
+        cache = manager.create_kv_cache(input_tokens=tokens)
+        self.assertTrue(cache.resume(self.stream))
+        self.assertTrue(cache.resize(len(tokens)))
+        cache.commit(tokens[cache.num_committed_tokens :])
+        return cache
+
+    def _exercise(self, manager: KVCacheManager) -> None:
+        """Runs a request through the manager, so the teardown has events and pages to release."""
+        self._open_cache(manager).close()
+
+    def _plan_drop(
+        self, manager: KVCacheManager, num_tokens: int = 64
+    ) -> tuple[PlannedDropHandle, list[TokenIdExt]]:
+        """A live plan over a closed cache's committed blocks, as the executor keeps them.
+
+        Also returns the cache's tokens: the plan has been applied once they stop matching.
+        Full-attention blocks are never planned, so only a sliding-window manager yields a plan
+        that drops anything.
+        """
+        tokens = [self.next_token() for _ in range(num_tokens)]
+        cache = self._open_cache(manager, tokens)
+        cache.stop_committing()
+        handle = cache.plan_committed_block_drop()
+        cache.close()
+        assert handle is not None
+        return handle, tokens
+
+    def _assert_process_still_usable(self) -> None:
+        self.assertIsNone(poison_reason())
+        self.assertEqual(num_live_managers(), 0)
+        fresh = KVCacheManager(self.cfg)
+        try:
+            self._exercise(fresh)
+        finally:
+            fresh.shutdown()
+        self.assertIsNone(poison_reason())
+
+    def test_manager_finalized_without_cuda_context_does_not_poison(self) -> None:
+        free_before = self._device_free_memory()
+        holder: list[object] = [KVCacheManager(self.cfg)]
+        self._exercise(cast(KVCacheManager, holder[0]))
+        free_while_held = self._device_free_memory()
+
+        self._drop_without_cuda_context(holder)
+        self._assert_process_still_usable()
+        self._assert_memory_returned(free_before, free_while_held)
+
+    def test_open_cache_and_manager_finalized_together_without_cuda_context(self) -> None:
+        """The cache's own finalization closes it, which records its finish event."""
+        free_before = self._device_free_memory()
+        manager = KVCacheManager(self.cfg)
+        holder: list[object] = [manager, self._open_cache(manager)]
+        del manager
+        free_while_held = self._device_free_memory()
+
+        self._drop_without_cuda_context(holder)
+        self._assert_process_still_usable()
+        self._assert_memory_returned(free_before, free_while_held)
+
+    def test_cache_finalized_without_cuda_context_leaves_the_manager_usable(self) -> None:
+        self.manager = KVCacheManager(self.cfg)
+        holder: list[object] = [self._open_cache(self.manager)]
+
+        self._drop_without_cuda_context(holder)
+        self.assertIsNone(poison_reason())
+        self._exercise(self.manager)
+        self.manager.shutdown()
+        del self.manager
+        gc.collect()
+        self._assert_process_still_usable()
+
+    def test_planned_drop_handle_finalized_without_cuda_context_applies_the_plan(self) -> None:
+        """Dropping the handle is how the plan is applied; it may free a page's last owner."""
+        # A window of one block: the plan covers the cache's whole single block.
+        tokens_per_block = 32
+        self.manager = KVCacheManager(
+            create_config(tokens_per_block, 64 << 20, 16 << 20, 0, 2, tokens_per_block, 0)
+        )
+        handle, planned_tokens = self._plan_drop(self.manager, num_tokens=tokens_per_block)
+        holder: list[object] = [handle]
+        del handle
+        # Planning alone keeps the block reusable; applying the plan is what drops it.
+        self.assertGreater(self.manager.probe_reuse(input_tokens=planned_tokens), 0)
+
+        self._drop_without_cuda_context(holder)
+        self.assertIsNone(poison_reason())
+        self.assertEqual(self.manager.probe_reuse(input_tokens=planned_tokens), 0)
+        # The manager still plans drops and serves requests.
+        self._plan_drop(self.manager)[0].drop()
+        self._exercise(self.manager)
+        self.manager.shutdown()
+        del self.manager
+        gc.collect()
+        self._assert_process_still_usable()
+
+    def test_batch_and_manager_finalized_together_without_cuda_context(self) -> None:
+        """~Batch frees its device and pinned buffers itself, inside its context scope."""
+
+        def new_batch(manager: KVCacheManager) -> Batch:
+            # Large enough that a Batch left behind shows above FREE_MEMORY_SLACK on its own.
+            return Batch(
+                manager, self.stream, index_tables=[], max_batch_size=512, max_blocks_per_seq=8192
+            )
+
+        # The first Batch in a process loads the sparse-copy kernels, whose module memory
+        # (about 68 MiB) the process keeps; measure from the second one.
+        warm_up = KVCacheManager(self.cfg)
+        new_batch(warm_up)
+        warm_up.shutdown()
+        del warm_up
+        gc.collect()
+
+        free_before = self._device_free_memory()
+        manager = KVCacheManager(self.cfg)
+        free_with_manager = self._device_free_memory()
+        batch = new_batch(manager)
+        holder: list[object] = [batch, manager]
+        del batch, manager
+        free_while_held = self._device_free_memory()
+        self.assertGreaterEqual(
+            free_with_manager - free_while_held,
+            2 * self.FREE_MEMORY_SLACK,
+            "the Batch holds too little device memory for a leak of it to be seen",
+        )
+
+        self._drop_without_cuda_context(holder)
+        self._assert_process_still_usable()
+        self._assert_memory_returned(free_before, free_while_held)
+
+    def test_shut_down_manager_finalized_without_cuda_context_is_a_no_op(self) -> None:
+        """After shutdown() the destructor has nothing to release, on any thread."""
+        free_before = self._device_free_memory()
+        manager = KVCacheManager(self.cfg)
+        self._exercise(manager)
+        manager.shutdown()
+        manager.shutdown()  # idempotent
+        self.assertGreaterEqual(
+            self._device_free_memory(), free_before - self.FREE_MEMORY_SLACK, "shutdown() leaked"
+        )
+        holder: list[object] = [manager]
+        del manager
+
+        self._drop_without_cuda_context(holder)
+        self._assert_process_still_usable()
 
 
 if __name__ == "__main__":
