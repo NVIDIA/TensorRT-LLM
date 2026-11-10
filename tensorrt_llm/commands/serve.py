@@ -58,10 +58,10 @@ from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi.disagg_utils import (
-    DisaggClusterConfig, DisaggServerConfig, MetadataServerConfig, ServerRole,
-    extract_disagg_cluster_config, parse_disagg_config_file,
-    parse_metadata_server_config_file, validate_config_bool,
-    validate_internal_request_auth_key)
+    CtxGenServerConfig, DisaggClusterConfig, DisaggServerConfig,
+    MetadataServerConfig, ServerRole, extract_disagg_cluster_config,
+    parse_disagg_config_file, parse_metadata_server_config_file,
+    validate_config_bool, validate_internal_request_auth_key)
 from tensorrt_llm.llmapi.llm_args import (SERVE_CLI_CONFIG_FIELDS,
                                           KvCacheConnectorConfig, SleepConfig,
                                           TorchLlmArgs, build_cli_config)
@@ -2869,7 +2869,7 @@ _TP_OR_ATTENTION_DP_MISMATCH = (
 
 
 def _shared_draft_kv_blocker(
-        server_configs,
+        server_configs: list[CtxGenServerConfig],
         *,
         check_tp_and_attention_dp: bool = True) -> Optional[str]:
     """What keeps the context and generation servers from sharing draft KV, or None."""
