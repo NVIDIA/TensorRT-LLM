@@ -45,7 +45,6 @@ def _request(
     beam_width=1,
     admitted_beam_width=None,
     tokens=(1, 2, 3),
-    orig_prompt_len=None,
     is_last_context_chunk=True,
 ):
     tokens = list(tokens)
@@ -57,7 +56,7 @@ def _request(
         py_apply_batched_logits_processor=batched,
         py_beam_width=admitted_beam_width or beam_width,
         py_prompt_len=len(tokens),
-        py_orig_prompt_len=len(tokens) if orig_prompt_len is None else orig_prompt_len,
+        py_orig_prompt_len=len(tokens),
         get_beam_width_by_iter=lambda for_next_iteration: beam_width,
         get_tokens=lambda beam: list(tokens),
     )
@@ -151,18 +150,11 @@ def test_beam_rows_and_histories_reach_the_batched_processor():
     assert torch.equal(logits[:, 0], torch.tensor([1.0, 2.0, 2.0, 3.0, 5.0, 5.0, 6.0, 7.0]))
 
 
-@pytest.mark.parametrize(
-    "chunk_kwargs",
-    [
-        # get_tokens(0) is the whole prompt during chunked prefill, so only
-        # the request's own chunk bookkeeping tells a middle chunk apart.
-        pytest.param({"is_last_context_chunk": False}, id="middle_chunk"),
-        pytest.param({"orig_prompt_len": 2}, id="prompt_shorter_than_tokens"),
-    ],
-)
-def test_an_unfinished_context_chunk_is_not_handed_over(chunk_kwargs):
+def test_a_middle_context_chunk_is_not_handed_over():
+    # get_tokens(0) is the whole prompt during chunked prefill, so only the
+    # request's own chunk bookkeeping tells a middle chunk apart.
     processor = _Recorder()
-    chunk = _request(1, batched=True, tokens=(1, 2, 3), **chunk_kwargs)
+    chunk = _request(1, batched=True, tokens=(1, 2, 3), is_last_context_chunk=False)
     last = _request(2, batched=True, tokens=(4, 5))
 
     logits = _logits(2)

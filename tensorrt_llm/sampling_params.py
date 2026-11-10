@@ -173,7 +173,8 @@ class BatchedLogitsProcessor(ABC):
 
         The callback runs on every tensor-parallel rank of the last pipeline stage, and each rank
         samples from its own copy of the edits: a callback with side effects runs ``tp_size`` times
-        per step, and a nondeterministic one can make the ranks sample different tokens.
+        per step, and a nondeterministic one can make the ranks sample different tokens. With
+        attention data parallelism each rank instead calls it with only the requests it owns.
 
         Args:
             req_ids (List[int]): A batch of request ids.
@@ -219,7 +220,8 @@ class SamplingParams:
             The callback is called once per decoding step with every scheduled request that sets this, after each
             request's own logits_processor(s). On the PyTorch backend it runs on every tensor-parallel rank of the
             last pipeline stage, each sampling from its own edits, so it must be deterministic and free of side
-            effects; it is not supported together with speculative decoding there.
+            effects; it is not supported together with speculative decoding there. With attention data
+            parallelism each rank calls it with only the requests that rank owns.
 
         n (int): Number of sequences to generate. Defaults to 1.
         best_of (int, optional): Number of sequences to consider for best output. Defaults to None.
