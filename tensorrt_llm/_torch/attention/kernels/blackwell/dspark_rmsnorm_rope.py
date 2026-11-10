@@ -7,37 +7,13 @@ from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import T, dsl_user_op
 
 try:
     from cuda.bindings import driver as cuda
 except ImportError:
     from cuda import cuda
 
-
-@dsl_user_op
-def _cvt_rp_ue8m0(value, *, loc=None, ip=None) -> cutlass.Uint8:
-    """Round a positive FP32 value up to its raw UE8M0 exponent byte."""
-    packed = llvm.inline_asm(
-        T.i16(),
-        [cutlass.Float32(value).ir_value(loc=loc, ip=ip)],
-        "cvt.rp.satfinite.ue8m0x2.f32 $0, 0f00000000, $1;",
-        "=h,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return cutlass.Uint8(cutlass.Int16(packed) & cutlass.Int16(0xFF))
-
-
-@dsl_user_op
-def _ue8m0_to_f32(exponent, *, loc=None, ip=None) -> cutlass.Float32:
-    """Widen a nonzero UE8M0 exponent byte to its FP32 power of two."""
-    bits = cutlass.Uint32(exponent) << cutlass.Uint32(23)
-    return cutlass.Float32(llvm.bitcast(T.f32(), bits.ir_value(loc=loc, ip=ip)))
+from tensorrt_llm._torch.kernels.blackwell.dense_gemm_persistent import _round_up_ue8m0, _u32_as_f32
 
 
 class DSparkRMSNormRoPEKernel:
@@ -437,8 +413,10 @@ class DSparkRMSNormFP8QuantKernel:
                 block_absmax = cute.arch.warp_reduction_max(local_absmax)
                 # The 1e-10 floor keeps the exponent byte nonzero (normal FP32 scale).
                 block_absmax = cute.arch.fmax(block_absmax, cutlass.Float32(1e-10))
-                scale = _cvt_rp_ue8m0(block_absmax * cutlass.Float32(1.0 / 448.0))
-                quant_scale = cute.arch.rcp_approx(_ue8m0_to_f32(scale))
+                scale_byte = _round_up_ue8m0(block_absmax * cutlass.Float32(1.0 / 448.0))
+                quant_scale = cute.arch.rcp_approx(
+                    _u32_as_f32(cutlass.Uint32(scale_byte) << cutlass.Uint32(23))
+                )
 
                 for item in cutlass.range_constexpr(self.values_per_thread):
                     dim = block_base + tidx * self.values_per_thread + item
@@ -454,7 +432,7 @@ class DSparkRMSNormFP8QuantKernel:
                         + ((row % 128) // 32) * 4
                     )
                     for replica in cutlass.range_constexpr(4):
-                        output_scale[scale_offset + replica] = scale
+                        output_scale[scale_offset + replica] = scale_byte
 
 
 class DSparkConcatFP8QuantKernel:
@@ -503,7 +481,7 @@ class DSparkConcatFP8QuantKernel:
         lane = tidx % cute.arch.WARP_SIZE
         row = row_block * self.num_warps + warp
         total_rows = first.shape[0] + second.shape[0]
-        scale = cutlass.Uint8(0)
+        scale_byte = cutlass.Uint8(0)
 
         if cutlass.dynamic_expr(row < total_rows):
             values = cute.make_rmem_tensor((self.values_per_thread,), cutlass.BFloat16)
@@ -534,8 +512,10 @@ class DSparkConcatFP8QuantKernel:
             block_absmax = cute.arch.warp_reduction_max(local_absmax)
             # The 1e-10 floor keeps the exponent byte nonzero (normal FP32 scale).
             block_absmax = cute.arch.fmax(block_absmax, cutlass.Float32(1e-10))
-            scale = _cvt_rp_ue8m0(block_absmax * cutlass.Float32(1.0 / 448.0))
-            quant_scale = cute.arch.rcp_approx(_ue8m0_to_f32(scale))
+            scale_byte = _round_up_ue8m0(block_absmax * cutlass.Float32(1.0 / 448.0))
+            quant_scale = cute.arch.rcp_approx(
+                _u32_as_f32(cutlass.Uint32(scale_byte) << cutlass.Uint32(23))
+            )
             for item in cutlass.range_constexpr(self.values_per_thread):
                 dim = block_base + lane * self.values_per_thread + item
                 output[row, dim] = (cutlass.Float32(values[item]) * quant_scale).to(
@@ -550,4 +530,4 @@ class DSparkConcatFP8QuantKernel:
                     + ((row % 128) // 32) * 4
                 )
                 for replica in cutlass.range_constexpr(4):
-                    output_scale[scale_offset + replica] = scale
+                    output_scale[scale_offset + replica] = scale_byte

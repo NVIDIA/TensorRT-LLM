@@ -627,6 +627,53 @@ def test_dspark_fp8_input_producers_match_reference_and_reuse_dynamic_m_compile(
             atol=0,
         )
 
+    # A block amax of exactly 448 * 2**k keeps the scale 2**k (byte 127 + k); 1e3 rounds up to
+    # 4 (byte 129). One block per amax, the rest of each block at most half of it.
+    boundary_amax = (448.0 * 2.0, 448.0 * 2.0**8, 448.0 * 2.0**40, 1.0e3)
+    boundary_bytes = torch.tensor([128, 135, 167, 129], dtype=torch.uint8)
+    boundary_blocks = torch.empty(len(boundary_amax), 128)
+    for index, amax in enumerate(boundary_amax):
+        boundary_blocks[index] = (torch.rand(128) - 0.5) * amax
+        boundary_blocks[index, 7 * index + 3] = amax if index % 2 else -amax
+    boundary_blocks = boundary_blocks.to(device="cuda", dtype=torch.bfloat16)
+    assert torch.equal(
+        boundary_blocks.float().abs().amax(dim=1),
+        torch.tensor(boundary_amax, device="cuda").to(torch.bfloat16).float(),
+    )
+    rows = len(boundary_amax)
+
+    # Concat producer: row r carries the boundary block in its quant block r.
+    boundary_input = torch.randn(rows, hidden_dim, device="cuda", dtype=torch.bfloat16)
+    for index in range(rows):
+        boundary_input[index, index * 128 : (index + 1) * 128] = boundary_blocks[index]
+    expected_fp8, expected_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(boundary_input)
+    actual_fp8, actual_scale = cute_dsl_dspark_concat_fp8_quant(
+        boundary_input[:1], boundary_input[1:]
+    )
+    torch.testing.assert_close(actual_fp8.float(), expected_fp8.float(), rtol=0, atol=0)
+    actual_active = active_scales(actual_scale, rows)
+    torch.testing.assert_close(actual_active, active_scales(expected_scale, rows), rtol=0, atol=0)
+    quant_blocks = hidden_dim // 128
+    for index in range(rows):
+        offset = (index * quant_blocks + index) * 4
+        assert torch.all(actual_active[offset : offset + 4].cpu() == boundary_bytes[index])
+
+    # RMSNorm producer: +-1 inputs have an RMS of 1, so the weight sets each block amax.
+    signs = torch.randint(0, 2, (rows, hidden_dim), device="cuda", dtype=torch.int32)
+    norm_input = (signs * 2 - 1).to(torch.bfloat16)
+    boundary_weight = torch.randn(hidden_dim, device="cuda", dtype=torch.bfloat16)
+    boundary_weight[: rows * 128] = boundary_blocks.abs().flatten()
+    expected_norm = _rmsnorm(norm_input, boundary_weight, eps)
+    expected_fp8, expected_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(expected_norm)
+    actual_fp8, actual_scale = cute_dsl_dspark_rmsnorm_fp8_quant(norm_input, boundary_weight, eps)
+    torch.testing.assert_close(actual_fp8.float(), expected_fp8.float(), rtol=0, atol=0)
+    actual_active = active_scales(actual_scale, rows)
+    torch.testing.assert_close(actual_active, active_scales(expected_scale, rows), rtol=0, atol=0)
+    for row in range(rows):
+        for index in range(rows):
+            offset = (row * quant_blocks + index) * 4
+            assert torch.all(actual_active[offset : offset + 4].cpu() == boundary_bytes[index])
+
     # Runtime row counts and row strides reuse the two initialization artifacts.
     assert _compile_dspark_concat_fp8_quant.cache_info().misses == 1
     assert _compile_dspark_rmsnorm_fp8_quant.cache_info().misses == 1
