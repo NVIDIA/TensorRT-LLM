@@ -310,6 +310,11 @@ Qwen/Qwen3.8-2.4T-A95B:
     accuracy: 93.80
 Qwen/Qwen3.8-Flash-Next:
   - accuracy: 95.72
+  # Block FP8 without speculative decoding, under the protocol of the FP8 MTP row (chat
+  # template, thinking with a short-reasoning system prompt, 512 output tokens), measured on
+  # the built-in implementation: TEP4 on GB300, TRTLLM MoE, bf16 Mamba SSM cache.
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 95.34
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: MTP
     accuracy: 95.11
