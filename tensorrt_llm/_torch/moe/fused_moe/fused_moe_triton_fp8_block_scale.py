@@ -10,10 +10,11 @@ import triton.language as tl
 
 _BLOCK_SHAPE = [128, 128]  # [group_k, group_n] for FP8 block-scale
 _BLOCK_SIZE_M = 16
-# Used when experts average at least one full large tile, so that each weight
-# tile is loaded once per 64 rows instead of once per 16. Below that, with the
-# 64-row config tuned at max_num_tokens as in serving, the padding costs more
-# than the loads save. Measured on RTX PRO 6000 (SM120); SM121 is unmeasured.
+# Used when experts average more than one full large tile, so that each weight
+# tile is loaded once per 64 rows instead of once per 16. Up to that, with the
+# 64-row config tuned at max_num_tokens as in serving, the padding costs about
+# as much as or more than the loads save. Measured on RTX PRO 6000 (SM120);
+# SM121 is unmeasured.
 _BLOCK_SIZE_M_LARGE = 64
 _LARGE_M_MIN_ROWS = _BLOCK_SIZE_M_LARGE
 
@@ -26,7 +27,7 @@ def _block_size_m(num_tokens: int, top_k: int, num_experts: int) -> int:
     ``_local_slot_ids`` clamps onto the edge slots with a zero scale, and any
     dispatch padding: those piles favor the large tile as real rows do.
     """
-    if num_tokens * top_k >= _LARGE_M_MIN_ROWS * num_experts:
+    if num_tokens * top_k > _LARGE_M_MIN_ROWS * num_experts:
         return _BLOCK_SIZE_M_LARGE
     return _BLOCK_SIZE_M
 

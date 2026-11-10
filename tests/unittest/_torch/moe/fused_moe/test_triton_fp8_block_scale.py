@@ -125,10 +125,10 @@ SHAPES = [
     MoeShape("tiny", num_tokens=64, hidden=256, intermediate=512, num_experts=8, top_k=2),
     MoeShape("tiny_topk1", num_tokens=64, hidden=256, intermediate=512, num_experts=8, top_k=1),
     # Enough rows per expert for the prefill block size
-    MoeShape("tiny_prefill", num_tokens=256, hidden=256, intermediate=512, num_experts=8, top_k=2),
+    MoeShape("tiny_prefill", num_tokens=320, hidden=256, intermediate=512, num_experts=8, top_k=2),
     # The same, through the unfused second-GEMM store
     MoeShape(
-        "tiny_prefill_topk1", num_tokens=512, hidden=256, intermediate=512, num_experts=8, top_k=1
+        "tiny_prefill_topk1", num_tokens=640, hidden=256, intermediate=512, num_experts=8, top_k=1
     ),
     MoeShape(
         "laguna_corr",
@@ -152,11 +152,11 @@ SHAPES = [
 # available for manual experiments but out of the correctness parametrization.
 CORRECTNESS_SHAPES = [s for s in SHAPES if s.name != "laguna_bench"]
 
-# Global shapes split over EP_SIZE ranks: 64 and 16 rows per local expert slot,
+# Global shapes split over EP_SIZE ranks: 80 and 16 rows per local expert slot,
 # so both tile heights.
 EP_SIZE = 2
 EP_SHAPES = [
-    MoeShape("ep2_prefill", num_tokens=256, hidden=256, intermediate=512, num_experts=16, top_k=2),
+    MoeShape("ep2_prefill", num_tokens=320, hidden=256, intermediate=512, num_experts=16, top_k=2),
     MoeShape("ep2_decode", num_tokens=64, hidden=256, intermediate=512, num_experts=16, top_k=2),
 ]
 SHAPES_BY_NAME = {s.name: s for s in SHAPES + EP_SHAPES}
@@ -307,8 +307,8 @@ def test_clamp_is_rejected_for_a_non_swiglu_activation() -> None:
 def test_block_size_m_threshold() -> None:
     """Pins the switch to the large tile, and which test shapes take it, so that
     moving the threshold cannot silently drop the 64-row path from the tests."""
-    assert _block_size_m(256, 2, 8) == _BLOCK_SIZE_M_LARGE
-    assert _block_size_m(255, 2, 8) == _BLOCK_SIZE_M
+    assert _block_size_m(257, 2, 8) == _BLOCK_SIZE_M_LARGE
+    assert _block_size_m(256, 2, 8) == _BLOCK_SIZE_M
 
     def block_size_m(name: str) -> int:
         s = SHAPES_BY_NAME[name]
@@ -403,12 +403,13 @@ def _prewarm_stub(intermediate: int, use_dp: bool) -> types.SimpleNamespace:
 @pytest.mark.parametrize(
     ("max_num_tokens", "use_dp", "token_counts"),
     [
-        # 8 local experts at top_k 2 take the large tile from 256 tokens.
-        (255, False, [1]),
-        (256, False, [1, 256]),
+        # 8 local experts at top_k 2 take the large tile above 256 tokens.
+        (256, False, [1]),
+        (257, False, [1, 257]),
         (4096, False, [1, 4096]),
         # Under attention DP a rank computes all 4 ranks' tokens.
-        (64, True, [1, 256]),
+        (64, True, [1]),
+        (100, True, [1, 400]),
     ],
 )
 def test_prewarm_tunes_each_tile_height_once(
