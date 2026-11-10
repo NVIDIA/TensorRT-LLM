@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """Node-local peer pointer mapping over an NCCL LSA-registered arena.
 
 Drop-in replacement for :class:`SymmetricBufferHost` / :class:`SymmetricBufferDevice`

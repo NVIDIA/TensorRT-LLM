@@ -157,7 +157,7 @@ class _DedupMetadataPushRouter(KernelComponent):
     sorted_metadata_region = "nvlink.token_comm_dedup.sorted_metadata"
     sorted_scores_region = "nvlink.token_comm_dedup.sorted_scores"
     pool_expert_base_region = "nvlink.token_comm_dedup.pool_expert_base"
-    token_src_metadata_region = "nvlink.token_comm_dedup.token_src_metadata"
+    token_src_metadata_region = "nvlink.token_comm_dedup.token_src_metadata"  # nosec B105
     fc1_topk_scores_region = "nvlink.token_comm_dedup.fc1_topk_scores"
     source_expert_base_region = "nvlink.token_comm_dedup.source_expert_base"
     push_destination_base_region = "nvlink.token_comm_dedup.push_destination_base"
@@ -1390,18 +1390,18 @@ class TokenCommDedup(KernelComponent):
     fc2_order_output_region = "nvlink.token_comm_dedup.fc2_order_output"
     pre_reduced_activation_region = "nvlink.token_comm_dedup.pre_reduced_activation"
     pre_reduced_activation_sf_region = "nvlink.token_comm_dedup.pre_reduced_activation_sf"
-    token_back_schedule_region = "nvlink.token_comm_dedup.token_back_schedule"
+    token_back_schedule_region = "nvlink.token_comm_dedup.token_back_schedule"  # nosec B105
     # Rank-major copies pulled by a token's first same-rank occurrence (dispatch dedup).
 
-    token_in_mbarrier_region = "nvlink.token_comm_dedup.main_smem.token_in_mbarriers"
-    token_back_mbarrier_region = "nvlink.token_comm_dedup.main_smem.token_back_mbarriers"
+    token_in_mbarrier_region = "nvlink.token_comm_dedup.main_smem.token_in_mbarriers"  # nosec B105
+    token_back_mbarrier_region = "nvlink.token_comm_dedup.main_smem.token_back_mbarriers"  # nosec B105
     expert_sizes_smem_region = "nvlink.token_comm_dedup.main_smem.expert_sizes"
-    token_in_activation_smem_region = "nvlink.token_comm_dedup.main_smem.token_in_activation"
-    token_in_sf_smem_region = "nvlink.token_comm_dedup.main_smem.token_in_sf"
-    token_back_activation_smem_region = "nvlink.token_comm_dedup.main_smem.token_back_activation"
+    token_in_activation_smem_region = "nvlink.token_comm_dedup.main_smem.token_in_activation"  # nosec B105
+    token_in_sf_smem_region = "nvlink.token_comm_dedup.main_smem.token_in_sf"  # nosec B105
+    token_back_activation_smem_region = "nvlink.token_comm_dedup.main_smem.token_back_activation"  # nosec B105
     # hybrid_warps: second set of rings for the dispatch warps, overlaid on their token_in stage.
-    token_back_reuse_activation_smem_region = "nvlink.token_comm_dedup.main_smem.token_back_reuse_activation"
-    token_back_sf_smem_region = "nvlink.token_comm_dedup.main_smem.token_back_sf"
+    token_back_reuse_activation_smem_region = "nvlink.token_comm_dedup.main_smem.token_back_reuse_activation"  # nosec B105
+    token_back_sf_smem_region = "nvlink.token_comm_dedup.main_smem.token_back_sf"  # nosec B105
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, type]:
@@ -1589,7 +1589,7 @@ class TokenCommDedup(KernelComponent):
         """hybrid_warps: the standalone combine warps AND the dispatch warps (after token_in) both run token_back.
         Twice the combine workers for the same chunk size; wins where the combine tail dominates (Qwen T>=8k:
         -5..-7 %), loses where mainloop interference dominates (DSV4 8k: +6 %)."""
-        return self.token_back_mode == "hybrid_warps"
+        return self.token_back_mode == "hybrid_warps"  # nosec B105
 
     @property
     def token_back_worker_groups(self) -> int:
@@ -1802,7 +1802,7 @@ class TokenCommDedup(KernelComponent):
             buffer_space="local",
             byte_alignment=128,
         )
-        if self.token_back_schedule_mode == "atomic_counter":
+        if self.token_back_schedule_mode == "atomic_counter":  # nosec B105
             workspace.register(
                 self.token_back_schedule_region, cutlass.Int32, (1,), buffer_space="local", reset="tail_reset"
             )
@@ -2174,7 +2174,7 @@ class TokenCommDedup(KernelComponent):
         owned_sizes = smem_workspace.tensor(self.expert_sizes_smem_region, smem_base)
         if cutlass.const_expr(self.token_back_mode in ("standalone_warps", "hybrid_warps")):
             # The dispatch warps already met this barrier inside token_in (hybrid); only the standalone group waits.
-            if cutlass.const_expr(self.token_back_mode == "standalone_warps") or self._transfer_group == Int32(1):
+            if cutlass.const_expr(self.token_back_mode == "standalone_warps") or self._transfer_group == Int32(1):  # nosec B105
                 sizes_ready_barrier = pipeline.NamedBarrier(
                     barrier_id=self.standalone_size_barrier_id, num_threads=2 * self.transfer_thread_count
                 )
@@ -2190,7 +2190,7 @@ class TokenCommDedup(KernelComponent):
 
         iket.range_push("token_back.work")
         next_dense_token = global_worker_idx - global_worker_count
-        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):
+        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):  # nosec B105
             next_dense_token = Int32(0)
         next_dense_token = self.next_token(next_dense_token)
         completed_expert_prefix = Int32(0)
@@ -2401,9 +2401,9 @@ class TokenCommDedup(KernelComponent):
         workers_per_cta = self.transfer_warp_count * self.token_back_worker_groups
         global_worker_count = self.promised_launchable_sm_count * workers_per_cta
         schedule_counter = None
-        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):
+        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):  # nosec B105
             schedule_counter = self._device_workspace.ptr(self.token_back_schedule_region)
-        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):
+        if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):  # nosec B105
             claimed_token = Int32(0)
             if self._lane_idx == Int32(0):
                 claimed_token = cute.arch.atomic_add(schedule_counter, Int32(1), sem="relaxed", scope="gpu")

@@ -29,7 +29,7 @@ class TokenCommCtaMainloop:
         self.dispatch_warp_count = token_comm.dispatch_warp_count
         self.combine_warp_start = token_comm.combine_warp_start
         self.combine_warp_count = token_comm.combine_warp_count
-        if token_comm.token_back_mode != "standalone_warps":
+        if token_comm.token_back_mode != "standalone_warps":  # nosec B105
             raise ValueError("Dedicated communication CTAs require standalone token-back warps.")
         if not token_back_on_compute_ctas:
             dispatch_end = self.dispatch_warp_start + self.dispatch_warp_count

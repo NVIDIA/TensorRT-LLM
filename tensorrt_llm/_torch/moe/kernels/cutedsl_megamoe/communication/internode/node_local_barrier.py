@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """Sense-reversing barrier over the ranks of one NVLink domain (node), not the whole world."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """L2 prefetch of the expert weights the FC12 kernel will stream first.
 
 The weights do not depend on the routed tokens, only on which (expert, output

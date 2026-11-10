@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """Internode token communication component: NVLink domain plus NCCL GIN rail relay.
 
 Selected through the master switch ``ImplDesc["internode"] = True`` (``token_comm_kind == "internode_gin"``);
@@ -234,7 +236,7 @@ class TokenCommInternodeGin(TokenCommNonDeterministic):
             )
         if self.num_nodes > 1 and not self.enable_nccl_gin:
             raise ValueError("More than one NVLink domain requires enable_nccl_gin.")
-        if self.relay_warp_count > 0 and self.token_back_mode == "standalone_warps":
+        if self.relay_warp_count > 0 and self.token_back_mode == "standalone_warps":  # nosec B105
             raise ValueError("Relay warps 12-15 and token_back_mode='standalone_warps' both need warps 12-15.")
         if self._fc2_done_release_scope not in ("gpu", "sys"):
             raise ValueError(f"fc2_done_release_scope must be 'gpu' or 'sys', got {self._fc2_done_release_scope!r}.")

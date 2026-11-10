@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """Byte layout of one Stage 1 relay message (port of ``pre_unification/comm/nccl_gin_layout.py``).
 
 A relay message carries one node-deduplicated token to its destination node: the 16-byte

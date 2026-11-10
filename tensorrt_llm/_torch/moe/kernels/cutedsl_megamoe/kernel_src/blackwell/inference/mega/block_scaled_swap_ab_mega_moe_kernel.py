@@ -219,7 +219,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.token_comm_kind = impl_desc.get("token_comm_kind", "internode_gin" if self.internode else "nvlink")
         if self.token_comm_kind not in ("nvlink", "internode_gin"):
             raise ValueError(f"token_comm_kind must be 'nvlink' or 'internode_gin', got {self.token_comm_kind!r}.")
-        if self.internode != (self.token_comm_kind == "internode_gin"):
+        if self.internode != (self.token_comm_kind == "internode_gin"):  # nosec B105
             raise ValueError(
                 "internode=True selects token_comm_kind='internode_gin' and internode=False (the default) "
                 f"'nvlink'; got internode={self.internode}, token_comm_kind={self.token_comm_kind!r}."
@@ -297,7 +297,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.relay_warp_count = self.token_comm.relay_warp_count
         if self.relay_warp_count not in (0, 4):
             raise ValueError(f"relay_warp_count must be 0 or 4, got {self.relay_warp_count}.")
-        if self.relay_warp_count > 0 and self.token_back_mode == "standalone_warps":
+        if self.relay_warp_count > 0 and self.token_back_mode == "standalone_warps":  # nosec B105
             raise ValueError("token_back_mode='standalone_warps' and a relay warp group both need warps 12-15.")
         if self.relay_warp_count > 0:
             # The internode combine gather also runs on the epilogue warps after their last tile.
@@ -307,7 +307,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     "The component's combine_epilogue_worker_warps must equal the kernel's epilogue warp "
                     f"count ({len(self.epilogue_warp_ids)})."
                 )
-        wide_layout = self.token_back_mode == "standalone_warps" or self.relay_warp_count > 0
+        wide_layout = self.token_back_mode == "standalone_warps" or self.relay_warp_count > 0  # nosec B105
         self.threads_per_cta = 16 * 32 if wide_layout else 12 * 32
         self.other_warp_register_count = 64 if wide_layout else 72
         self.max_tokens = self.token_comm.worst_case_token_count
@@ -1326,7 +1326,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         pipeline_init_wait_mixed_cga(
             self.cluster_shape_mn, self.resolved_fallback_cluster_shape_mn, is_fallback_cluster
         )
-        finalize_barrier_thread_count = 12 * 32 if self.token_back_mode == "standalone_warps" else 8 * 32
+        finalize_barrier_thread_count = 12 * 32 if self.token_back_mode == "standalone_warps" else 8 * 32  # nosec B105
         finalize_barrier = pipeline.NamedBarrier(barrier_id=13, num_threads=finalize_barrier_thread_count)
 
         if warp_idx == self.scheduler_warp_id:
@@ -1459,7 +1459,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 self.token_comm.token_in(self._smem_workspace, smem_base)
                 iket.range_pop()
                 if cutlass.const_expr(
-                    self.token_comm.token_back_enabled and self.token_back_mode != "standalone_warps"
+                    self.token_comm.token_back_enabled and self.token_back_mode != "standalone_warps"  # nosec B105
                 ):
                     iket.range_push("mega.token_back")
                     self.token_comm.token_back(self._smem_workspace, smem_base)
@@ -1468,7 +1468,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 iket.range_push("mega.tail_reset")
                 self.token_comm.reset_tail()
                 iket.range_pop()
-            elif cutlass.const_expr(self.token_back_mode == "standalone_warps"):
+            elif cutlass.const_expr(self.token_back_mode == "standalone_warps"):  # nosec B105
                 iket.range_push("mega.token_back_standalone")
                 self.token_comm.token_back(self._smem_workspace, smem_base)
                 iket.range_pop()

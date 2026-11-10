@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """Router of the internode component: node-local metadata push plus the remote-node histogram.
 
 Extends :class:`_MetadataPushRouter` (already node-scoped through ``ranks_per_node``) with the

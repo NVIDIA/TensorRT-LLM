@@ -259,7 +259,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             sf_vec_size=self.sf_vec_size,
         )
         tmem_plan = make_tcgen05_tmem_plan(mma_instruction, self.architecture, self.mma_tiler_mnk)
-        if self.token_back_ready_granularity == "token_tile":
+        if self.token_back_ready_granularity == "token_tile":  # nosec B105
             tokens_per_fc1_ready_slot, fc2_done_signals_per_token_tile = derive_fc2_ready_geometry(
                 hidden_size=self.hidden_size,
                 mma_tiler_mnk=self.mma_tiler_mnk,
@@ -340,7 +340,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             self.epilogue = SwapABGatedActEpilogueDedup(fc12_problem_desc, resolved_impl_desc)
         else:
             self.epilogue = SwapABGatedActEpilogue(fc12_problem_desc, resolved_impl_desc)
-        if self.token_back_ready_granularity == "token_tile":
+        if self.token_back_ready_granularity == "token_tile":  # nosec B105
             self._validate_token_tile_ready_contract()
         if self.epilogue.fc1_output_dtype is not self.b_dtype:
             raise ValueError("Epilogue FC1 output dtype must match the Mainloop B dtype.")
@@ -408,7 +408,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             or any(isinstance(w, bool) or not isinstance(w, int) or w <= 0 for w in warps)
         ):
             raise ValueError(f"A split needs comm_warps as two positive ints, got {warps}.")
-        if self.token_back_mode != "standalone_warps":
+        if self.token_back_mode != "standalone_warps":  # nosec B105
             raise ValueError("A CTA split requires token_back_mode='standalone_warps'.")
         dispatch_warps, back_warps = warps
         # Check the warps that actually coexist in each concrete CTA branch.
@@ -480,7 +480,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
     def _validate_geometry(self) -> None:
         if self.token_back_ready_granularity not in ("expert", "token_tile"):
             raise ValueError(f"Unsupported token_back_ready_granularity {self.token_back_ready_granularity!r}.")
-        if self.token_back_ready_granularity == "token_tile":
+        if self.token_back_ready_granularity == "token_tile":  # nosec B105
             if not (
                 self.schedule_mode in ("grouped", "phase_interleave")
                 and self.work_id_mode == "atomic_counter"
@@ -532,7 +532,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 raise ValueError("combine_dedup supports the BF16 combine format only.")
             if self.world_size > 32:
                 raise ValueError("combine_dedup keeps the destination-rank mask in an Int32; world_size must be <= 32.")
-            if self.token_back_mode == "epi_warps":
+            if self.token_back_mode == "epi_warps":  # nosec B105
                 raise ValueError(
                     "combine_dedup pushes the reduced rank-major rows from the combine warps; use "
                     "reuse_dispatch_warps or standalone_warps."
@@ -541,7 +541,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 raise ValueError("combine_dedup stages FC2 subtiles in SMEM for per-token bulk stores; fc2_use_bulk must be on.")
             if self.comm_clusters > 0:
                 raise ValueError("combine_dedup does not support the communication CTA split (comm_clusters must be 0).")
-            if self.token_back_ready_granularity != "expert":
+            if self.token_back_ready_granularity != "expert":  # nosec B105
                 # The dedup combine warps poll one fc2_done counter per local expert (expert-prefix wait).
                 raise ValueError("combine_dedup signals FC2 completion per expert; token_back_ready_granularity must be 'expert'.")
         if self.intermediate_gateup_size % 2 != 0:
@@ -1510,7 +1510,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     self.token_comm.token_back_enabled
                     and (
                         self.token_back_mode in ("reuse_dispatch_warps", "hybrid_warps")
-                        or (self.token_back_mode == "epi_warps" and not self.token_comm.token_back_push_data)
+                        or (self.token_back_mode == "epi_warps" and not self.token_comm.token_back_push_data)  # nosec B105
                     )
                     and not self._diag_skip_token_back
                 ):
