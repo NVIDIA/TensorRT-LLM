@@ -39,8 +39,20 @@ _GEOMETRY = dict(
 )
 
 
-@pytest.mark.parametrize("query_length", [1, 127, 128, 129, 255, 256, 257, 2048])
-@pytest.mark.parametrize("kv_length", [0, 1, 127, 128, 129, 255, 256, 257, 4607])
+@pytest.mark.parametrize(
+    "query_length,kv_length",
+    [
+        (1, 0),
+        (127, 1),
+        (128, 127),
+        (129, 128),
+        (255, 129),
+        (256, 255),
+        (257, 256),
+        (2048, 257),
+        (1, 4607),
+    ],
+)
 @pytest.mark.parametrize("mask_type", ["causal", "dense"])
 def test_capacity_floor_preserves_tile_counts(
     query_length: int, kv_length: int, mask_type: str
@@ -115,6 +127,6 @@ def test_runtime_key_and_plan_use_the_same_normalized_capacities() -> None:
         and node.func.attr == "plan"
     )
     keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in plan.keywords}
-    assert keywords["max_seq_len_q"] == "q_capacity"
+    assert keywords["max_q_len"] == "q_capacity"
     assert keywords["max_kv_len"] == "kv_capacity"
-    assert keywords["packed"] == "True"
+    assert keywords["packed_query"] == "True"

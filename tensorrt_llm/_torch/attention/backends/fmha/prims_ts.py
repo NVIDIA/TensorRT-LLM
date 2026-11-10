@@ -964,7 +964,7 @@ class PrimsTSFmha(PhasedFmha):
             raise RuntimeError("PrimTS MLA decode requires a positive batch size.")
         # Within a prepared KV capacity, dense MLA instances fix the mask,
         # dtypes and Helix stats/bounds modes. Only batch and verify width vary.
-        key = (batch_size, max_seq_len_q)
+        key = (batch_size, max_q_len)
         wrapper = self._mla_decode_wrappers.get(key)
         if wrapper is not None:
             return wrapper
@@ -1384,6 +1384,8 @@ class PrimsTSFmha(PhasedFmha):
         q_processed, k_processed = (buffers["q"], buffers["k"]) if fp8 else (q, k)
         v_processed = buffers["v"] if fp8 else v
         sm_scale = self._get_bmm1_scale(attn)
+        softmax_scale = buffers["bmm1_scale"][:1] if fp8 else sm_scale
+        output_scale = buffers["bmm2_scale"] if fp8 else 1.0
         torch.ops.trtllm.mla_context_preprocess(
             q,
             k,
@@ -1440,7 +1442,7 @@ class PrimsTSFmha(PhasedFmha):
             wrapper.plan(
                 device=q.device,
                 batch_size=params.batch_size,
-                max_seq_len_q=q_capacity,
+                max_q_len=q_capacity,
                 max_kv_len=kv_capacity,
                 num_qo_heads=attn.num_heads,
                 num_kv_heads=attn.num_heads,
@@ -1450,9 +1452,10 @@ class PrimsTSFmha(PhasedFmha):
                 k_dtype=k_processed.dtype,
                 v_dtype=v_processed.dtype,
                 out_dtype=params.output.dtype,
-                packed=True,
+                packed_query=True,
                 mask_type=mask,
-                sm_scale=sm_scale,
+                softmax_scale=softmax_scale,
+                output_scale=output_scale,
                 store_softmax_stats=stats is not None,
             )
             self._mla_context_wrappers[key] = wrapper
@@ -1464,9 +1467,8 @@ class PrimsTSFmha(PhasedFmha):
             kv_indptr,
             out=params.output,
             softmax_stats=stats,
-            softmax_scale=buffers["bmm1_scale"][:1] if fp8 and stats is not None else None,
-            scale_softmax_log2=buffers["bmm1_scale"][1:] if fp8 else None,
-            output_scale=buffers["bmm2_scale"] if fp8 else None,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
             validate=False,
         )
 

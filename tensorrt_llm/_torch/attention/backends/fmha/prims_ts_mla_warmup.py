@@ -91,7 +91,7 @@ class PrimsTSDenseMlaWarmup:
 
         if not isinstance(metadata, TrtllmAttentionMetadata):
             return 0, 0
-        context_geometries: list[_ContextPlanGeometry] = []
+        context_states = []
         decode_states: list[_MLADecodePlanState] = []
         for module in model.modules():
             if not isinstance(module, MLA) or module.sparse_attn_hooks is not None:
@@ -108,27 +108,29 @@ class PrimsTSDenseMlaWarmup:
                             context_state is not None
                             and context_state.geometry.device.type == "cuda"
                         ):
-                            context_geometries.append(context_state.geometry)
+                            context_states.append(context_state)
                     for decode_wrapper in library._mla_decode_wrappers.values():
                         decode_state = decode_wrapper._plan_state
                         if decode_state is not None and decode_state.device.type == "cuda":
                             decode_states.append(decode_state)
-        if not context_geometries and not decode_states:
+        if not context_states and not decode_states:
             return 0, 0
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("PrimTS dense MLA startup planning cannot run during capture.")
 
         contexts = decodes = 0
         widths = set()
-        for geometry in context_geometries:
+        for state in context_states:
             contexts += self._prewarm_context(
-                geometry,
+                state.geometry,
                 metadata,
                 max_num_tokens=max_num_tokens,
                 max_seq_len=max_seq_len,
+                softmax_scale=state.softmax_scale,
+                output_scale=state.output_scale,
             )
         for state in decode_states:
-            widths.add(state.max_seq_len_q)
+            widths.add(state.max_q_len)
             decodes += self._prewarm_decode(
                 state, max_batch_size=max_batch_size, max_num_tokens=max_num_tokens
             )
@@ -145,8 +147,11 @@ class PrimsTSDenseMlaWarmup:
         *,
         max_num_tokens: int,
         max_seq_len: int,
+        softmax_scale: float | torch.Tensor = 1.0,
+        output_scale: float | torch.Tensor = 1.0,
     ) -> int:
         from tensorrt_llm._torch.attention.backends.prims_ts import context
+        from tensorrt_llm._torch.attention.backends.prims_ts._scales import scale_types
 
         from .prims_ts import _mla_context_capacities
 
@@ -156,8 +161,8 @@ class PrimsTSDenseMlaWarmup:
             head_dim_vo=geometry.head_dim_vo,
             qk_dtype=geometry.qk_dtype,
             pv_dtype=geometry.pv_dtype,
-            output_dtype=geometry.output_dtype,
-            packed=geometry.packed,
+            output_dtype=geometry.out_dtype,
+            packed=geometry.packed_query,
             uniform_packed_lengths=geometry.uniform_packed_lengths,
             mask_type=geometry.mask_type,
             window_left=geometry.window_left,
@@ -180,13 +185,13 @@ class PrimsTSDenseMlaWarmup:
             kwargs = dict(
                 device=geometry.device,
                 batch_size=1,
-                max_seq_len_q=query_capacity,
+                max_q_len=query_capacity,
                 max_kv_len=kv_capacity,
                 num_qo_heads=geometry.num_qo_heads,
                 num_kv_heads=geometry.num_kv_heads,
                 head_dim=geometry.head_dim,
                 head_dim_vo=geometry.head_dim_vo,
-                packed=True,
+                packed_query=True,
                 mask_type=mask,
                 window_left=-1,
                 store_softmax_stats=stats,
@@ -195,9 +200,11 @@ class PrimsTSDenseMlaWarmup:
                 **kwargs,
                 qk_dtype=geometry.qk_dtype,
                 pv_dtype=geometry.pv_dtype,
-                output_dtype=geometry.output_dtype,
+                out_dtype=geometry.out_dtype,
             )
-            signature = context._context_compile_spec(candidate)
+            signature = context._context_compile_spec(
+                candidate, scale_types=scale_types(softmax_scale, output_scale)
+            )
             if signature in self._completed:
                 continue
             # Normal plan() loads real callables. Probe/precompile-only modes
@@ -207,7 +214,9 @@ class PrimsTSDenseMlaWarmup:
                 q_dtype=geometry.qk_dtype,
                 k_dtype=geometry.qk_dtype,
                 v_dtype=geometry.pv_dtype,
-                out_dtype=geometry.output_dtype,
+                out_dtype=geometry.out_dtype,
+                softmax_scale=softmax_scale,
+                output_scale=output_scale,
             )
             self._completed.add(signature)
             loaded += 1
@@ -221,18 +230,19 @@ class PrimsTSDenseMlaWarmup:
         max_num_tokens: int,
     ) -> int:
         from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
+        from tensorrt_llm._torch.attention.backends.prims_ts._scales import scale_types
 
-        query_width = state.max_seq_len_q
+        query_width = state.max_q_len
         max_batch = min(max_batch_size, max_num_tokens // query_width)
         representatives = {}
         q_dtype_key = mla_decode._dtype_key(state.q_dtype)
         kv_dtype_key = mla_decode._dtype_key(state.kv_dtype)
-        output_dtype_key = mla_decode._dtype_key(state.output_dtype)
+        output_dtype_key = mla_decode._dtype_key(state.out_dtype)
         for batch_size in range(1, max_batch + 1):
             launch = mla_decode._resolve_mla_decode_launch_spec(
                 state.device.index,
                 batch_size,
-                state.num_heads,
+                state.num_qo_heads,
                 state.kv_lora_rank,
                 state.qk_rope_head_dim,
                 state.page_size,
@@ -242,20 +252,25 @@ class PrimsTSDenseMlaWarmup:
                 output_dtype_key,
                 state.mask_type,
                 query_width,
-                state.store_softmax_stats,
-                state.use_kv_bounds,
+                softmax_rescale_threshold_log2=state.softmax_rescale_threshold_log2,
+                store_softmax_stats=state.store_softmax_stats,
+                use_kv_bounds=state.use_kv_bounds,
             )
             signature = mla_decode._make_mla_decode_compile_spec(
                 launch,
                 device_index=state.device.index,
-                num_heads=state.num_heads,
+                num_qo_heads=state.num_qo_heads,
                 kv_lora_rank=state.kv_lora_rank,
                 qk_rope_head_dim=state.qk_rope_head_dim,
                 page_size=state.page_size,
                 q_dtype_key=q_dtype_key,
-                output_dtype_key=output_dtype_key,
-                max_seq_len_q=query_width,
+                out_dtype_key=output_dtype_key,
+                max_q_len=query_width,
                 packed_query=state.packed_query,
+                runtime_kv_lengths=True,
+                write_final_lse=state.lse_mode != "none",
+                lse_mode=state.lse_mode,
+                scale_types=(*scale_types(state.softmax_scale, state.output_scale), False),
                 store_softmax_stats=state.store_softmax_stats,
                 use_kv_bounds=state.use_kv_bounds,
             )
@@ -265,17 +280,23 @@ class PrimsTSDenseMlaWarmup:
             mla_decode.BatchMLADecodePagedTSWrapper().plan(
                 state.device,
                 batch_size,
-                state.num_heads,
+                state.num_qo_heads,
                 state.kv_lora_rank,
                 state.qk_rope_head_dim,
                 state.page_size,
                 state.max_kv_len,
-                max_seq_len_q=query_width,
+                max_q_len=query_width,
                 packed_query=state.packed_query,
-                q_data_type=state.q_dtype,
-                kv_data_type=state.kv_dtype,
-                o_data_type=state.output_dtype,
+                q_dtype=state.q_dtype,
+                kv_dtype=state.kv_dtype,
+                out_dtype=state.out_dtype,
                 mask_type=state.mask_type,
+                softmax_scale=state.softmax_scale,
+                output_scale=state.output_scale,
+                lse_mode=state.lse_mode,
+                tuning=mla_decode.MLAAttentionTuning(
+                    softmax_rescale_threshold_log2=state.softmax_rescale_threshold_log2
+                ),
                 store_softmax_stats=state.store_softmax_stats,
                 use_kv_bounds=state.use_kv_bounds,
             )
