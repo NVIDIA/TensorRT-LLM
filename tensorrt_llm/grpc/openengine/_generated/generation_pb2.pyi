@@ -321,15 +321,3 @@ class Usage(_message.Message):
     cached_prompt_tokens: int
     reasoning_tokens: int
     def __init__(self, prompt_tokens: _Optional[int] = ..., completion_tokens: _Optional[int] = ..., total_tokens: _Optional[int] = ..., cached_prompt_tokens: _Optional[int] = ..., reasoning_tokens: _Optional[int] = ...) -> None: ...
-
-class TransferEncoderCacheRequest(_message.Message):
-    __slots__ = ("cache", "destination")
-    CACHE_FIELD_NUMBER: _ClassVar[int]
-    DESTINATION_FIELD_NUMBER: _ClassVar[int]
-    cache: EncoderCacheRef
-    destination: bytes
-    def __init__(self, cache: _Optional[_Union[EncoderCacheRef, _Mapping]] = ..., destination: _Optional[bytes] = ...) -> None: ...
-
-class TransferEncoderCacheResponse(_message.Message):
-    __slots__ = ()
-    def __init__(self) -> None: ...

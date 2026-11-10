@@ -243,74 +243,14 @@ async def test_encoder_capability_discovery_is_typed_and_role_specific(role, bac
         assert info.encoder.schema_version == 1
         assert info.encoder.encoder_only is (role == "encode")
         assert info.encoder.accepts_cache is (role == "consume")
-        assert info.extra["trtllm_encoder_cache_release"] is True
+        assert info.encoder.supports_abort_cleanup is (role == "encode")
+        assert info.encoder.requires_cache is (role == "consume")
+        assert "trtllm_encoder_cache_release" not in info.extra
+        assert "trtllm_requires_encoder_cache" not in info.extra
         assert list(info.encoder.transfer_backends) == [backend]
     if role == "encode":
         assert info.generation.output_logprobs.supported is False
         assert info.generation.guided_decoding.supported is False
-
-
-@pytest.mark.asyncio
-async def test_cancelled_encoder_transfer_keeps_native_work_alive():
-    import asyncio
-    import threading
-
-    from tensorrt_llm.grpc.openengine.bindings import generation_pb2
-
-    started, finish = threading.Event(), threading.Event()
-
-    def transfer(cache, destination):
-        started.set()
-        assert finish.wait(10)
-
-    inference = _inference()
-    inference.encoder_role = "encode"
-    inference._encoder_cache = SimpleNamespace(transfer=transfer)
-    control = _servicer(inference=inference)
-    task = asyncio.create_task(
-        control.TransferEncoderCache(
-            generation_pb2.TransferEncoderCacheRequest(), FakeServicerContext()
-        )
-    )
-    try:
-        assert await asyncio.to_thread(started.wait, 5)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert len(inference._encoder_cleanup_tasks) == 1
-        assert not next(iter(inference._encoder_cleanup_tasks)).done()
-    finally:
-        finish.set()
-        await asyncio.gather(*tuple(inference._encoder_cleanup_tasks))
-    assert not inference._encoder_cleanup_tasks
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("rejected", [True, False])
-async def test_transfer_rejection_marker_requires_proven_prewrite_failure(rejected):
-    from tensorrt_llm.grpc.openengine.bindings import generation_pb2
-    from tensorrt_llm.grpc.openengine.errors import (
-        ENCODER_TRANSFER_REJECTED_METADATA,
-        EncoderTransferRejected,
-    )
-
-    error = EncoderTransferRejected("expired reference") if rejected else ValueError("write failed")
-
-    def transfer(cache, destination):
-        raise error
-
-    inference = _inference()
-    inference.encoder_role = "encode"
-    inference._encoder_cache = SimpleNamespace(transfer=transfer)
-    context = FakeServicerContext()
-    with pytest.raises(AbortError):
-        await _servicer(inference=inference).TransferEncoderCache(
-            generation_pb2.TransferEncoderCacheRequest(), context
-        )
-    assert context.abort_code == (
-        grpc.StatusCode.INVALID_ARGUMENT if rejected else grpc.StatusCode.UNAVAILABLE
-    )
-    assert context.trailing_metadata == ((ENCODER_TRANSFER_REJECTED_METADATA,) if rejected else ())
 
 
 @pytest.mark.asyncio

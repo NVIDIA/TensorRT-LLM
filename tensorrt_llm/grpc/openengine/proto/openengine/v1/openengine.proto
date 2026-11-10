@@ -57,10 +57,6 @@ service Control {
   rpc UnloadLora(UnloadLoraRequest) returns (UnloadLoraResponse);
   rpc ListLoras(ListLorasRequest) returns (ListLorasResponse);
 
-  // Returns only after the encoder backend has completed the data transfer.
-  // Single-use handoffs must not be retried after an uncertain outcome.
-  rpc TransferEncoderCache(TransferEncoderCacheRequest) returns (TransferEncoderCacheResponse);
-
   // Disaggregated serving / KV transfer. Connector info: ServerInfo.kv_connector.
   rpc GetKvEventSources(GetKvEventSourcesRequest) returns (GetKvEventSourcesResponse);
   rpc SubscribeKvEvents(SubscribeKvEventsRequest) returns (stream SubscribeKvEventsResponse);

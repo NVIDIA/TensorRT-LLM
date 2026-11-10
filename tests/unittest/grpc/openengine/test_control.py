@@ -1035,6 +1035,10 @@ async def test_encoder_cache_requirement_is_distinct_from_consumption_capability
     info = await _servicer(inference=inference).GetModelInfo(
         model_pb2.GetModelInfoRequest(model=MODEL), FakeServicerContext()
     )
-    extra = dict(info.extra)
-    assert extra.get("trtllm_encoder_cache_release", False) is bool(role)
-    assert extra.get("trtllm_requires_encoder_cache", False) is (role == "consume")
+    assert info.HasField("encoder") is bool(role)
+    assert info.encoder.encoder_only is (role == "encode")
+    assert info.encoder.accepts_cache is (role == "consume")
+    assert info.encoder.supports_abort_cleanup is (role == "encode")
+    assert info.encoder.requires_cache is (role == "consume")
+    assert "trtllm_encoder_cache_release" not in info.extra
+    assert "trtllm_requires_encoder_cache" not in info.extra

@@ -275,7 +275,7 @@ def test_encoder_role_validation_fails_closed():
     req.ClearField("encoder")
     with pytest.raises(UnsupportedFeatureError, match="cache reference"):
         oe.validate_encoder(req, "consume")
-    req.kv.session.session_id = "123"
+    req.kv.session.session_id = "prefilled"
     assert oe.validate_encoder(req, "consume") == ""
     req.encoder.cache.transfer_backend = oe.BACKEND
     with pytest.raises(UnsupportedFeatureError, match="must not consume an encoder cache"):

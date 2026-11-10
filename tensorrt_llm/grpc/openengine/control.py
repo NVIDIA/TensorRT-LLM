@@ -28,7 +28,6 @@ from .bindings import (
     MINIMUM_CLIENT_REVISION,
     SCHEMA_RELEASE,
     SCHEMA_REVISION,
-    generation_pb2,
     kv_pb2,
     lifecycle_pb2,
     lora_pb2,
@@ -38,7 +37,7 @@ from .bindings import (
 )
 from .capabilities import supported_guides, supports_image_routing
 from .coordinator import CoordinationError, FrontendClient, InvalidRequestIdError
-from .errors import ENCODER_TRANSFER_REJECTED_METADATA, AbortFailedError, EncoderTransferRejected
+from .errors import AbortFailedError
 from .kv_events import data_parallel_size, events_config
 from .request_mapping import conversation_affinity_enabled, token_ids_input_supported
 
@@ -137,37 +136,6 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
                 self._load_snapshot = await asyncio.to_thread(getter) if callable(getter) else {}
                 self._load_snapshot_deadline = time.monotonic() + _LOAD_SNAPSHOT_CACHE_SECONDS
         return self._load_snapshot
-
-    async def TransferEncoderCache(self, request, context):
-        cache = getattr(self._inference, "_encoder_cache", None)
-        transfer = getattr(cache, "transfer", None)
-        if not transfer or self._inference.encoder_role != "encode":
-            await context.abort(grpc.StatusCode.UNIMPLEMENTED, "encoder transfer is not enabled")
-            return
-        # Keep the task alive through cancellation: source buffers remain owned
-        # by the transfer until native completion or transport quarantine.
-        task = asyncio.create_task(asyncio.to_thread(transfer, request.cache, request.destination))
-        self._inference._encoder_cleanup_tasks.add(task)
-
-        def completed(done):
-            self._inference._encoder_cleanup_tasks.discard(done)
-            if not done.cancelled():
-                done.exception()  # Observe failures even when the requesting RPC was cancelled.
-
-        task.add_done_callback(completed)
-        try:
-            await asyncio.shield(task)
-        except EncoderTransferRejected as error:
-            await context.abort(
-                grpc.StatusCode.INVALID_ARGUMENT,
-                str(error),
-                trailing_metadata=(ENCODER_TRANSFER_REJECTED_METADATA,),
-            )
-            return
-        except (RuntimeError, ValueError) as error:
-            await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
-            return
-        return generation_pb2.TransferEncoderCacheResponse()
 
     def _engine_is_healthy(self) -> bool:
         """Readiness via the predicate the engine's own HTTP /health uses.
@@ -334,17 +302,16 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         info.extra.update({"trtllm_supported_modalities": sorted(media_modalities)})
         role = getattr(self._inference, "encoder_role", "")
         if role:
-            info.extra.update({"trtllm_encoder_cache_release": True})
             info.encoder.CopyFrom(
                 model_pb2.EncoderCapabilities(
                     schema_version=1,
                     encoder_only=role == "encode",
                     accepts_cache=role == "consume",
                     transfer_backends=[self._inference._encoder_cache.backend],
+                    supports_abort_cleanup=role == "encode",
+                    requires_cache=role == "consume",
                 )
             )
-        if role == "consume":
-            info.extra.update({"trtllm_requires_encoder_cache": True})
         if supports_image_routing(self._llm, media_modalities):
             info.extra.update({"trtllm_image_routing_version": 1})
 

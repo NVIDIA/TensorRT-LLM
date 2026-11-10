@@ -308,9 +308,11 @@ Multiple frontends require the default classic IPC executor and a nonzero port. 
 
 ## Schema and binding provenance
 
-The schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository at signed Git tag [`v0.1.0`](https://github.com/ai-dynamo/openengine/releases/tag/v0.1.0), Git commit `b5f2bd93721f7b888d3e2440679e0ae7012939d1`. That release maps to the public [`buf.build/openengine/openengine`](https://buf.build/openengine/openengine) module at immutable BSR release `768a93c7b44e40f28c692ad0b471a8f2`.
+The baseline schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](https://github.com/ai-dynamo/openengine) repository at signed Git tag [`v0.1.0`](https://github.com/ai-dynamo/openengine/releases/tag/v0.1.0), Git commit `b5f2bd93721f7b888d3e2440679e0ae7012939d1`. That release maps to the public [`buf.build/openengine/openengine`](https://buf.build/openengine/openengine) module at immutable BSR release `768a93c7b44e40f28c692ad0b471a8f2`.
 
-TensorRT-LLM vendors that immutable schema under `tensorrt_llm/grpc/openengine/proto/`. `3rdparty/vendor_sources.lock.yaml` pins the upstream commit and verifies that the schema files are exact upstream copies. The adjacent `manifest.json` records protocol metadata, generator versions, and runtime floors. The deterministic private bindings under `tensorrt_llm.grpc.openengine._generated` are checked in so ordinary wheel and editable builds do not require a protocol compiler or network access.
+The encoder extension is pinned to canonical [OpenEngine #35](https://github.com/ai-dynamo/openengine/pull/35), which is not yet included in that BSR release. Its exact source revision is recorded in the vendor lock and schema manifest.
+
+TensorRT-LLM vendors the immutable schema under `tensorrt_llm/grpc/openengine/proto/`. `3rdparty/vendor_sources.lock.yaml` pins the upstream commit and verifies that the schema files are exact upstream copies. The adjacent `manifest.json` records protocol metadata, generator versions, and runtime floors. The deterministic private bindings under `tensorrt_llm.grpc.openengine._generated` are checked in so ordinary wheel and editable builds do not require a protocol compiler or network access.
 
 When changing the schema, generator, or `requirements-build-openengine.txt`, regenerate and commit the bindings:
 
@@ -374,7 +376,8 @@ hosts using matching source overlays. Focused CPU checks cover the final rebased
 branch; GPU validation of that branch has not been repeated.
 
 `ModelInfo.encoder` advertises the schema version, encoder-only or cache-consumer
-role, and supported transfer backends. Encoder-only requests set
+role, supported transfer backends, typed abort cleanup support and mandatory-cache
+policy. Producers advertise one backend; consumers may accept multiple. Encoder-only requests set
 `encoder.encode_only` and terminate with `EncoderReady`. The downstream request
 retains the original prompt and media identities and supplies `encoder.cache`
 to PD or P; it does not fetch the image or run its own vision encoder. Text-only
@@ -408,7 +411,8 @@ The encoder imports native exports into owned GPU tensors. Its single-use
 reference includes layout, dtype, shape,
 input/model identity and the producer endpoint, not source memory addresses.
 The consumer allocates/registers receive tensors and invokes
-`Control.TransferEncoderCache`; the producer writes to those buffers and returns
+the TensorRT-LLM-owned `trtllm.openengine.v1.EncoderTransfer.Transfer` RPC on
+the same gRPC listener; the producer writes to those buffers and returns
 only after native completion. Dynamo carries the opaque reference only. Metadata
 and mRoPE tensors are carried along with the image embeddings.
 
@@ -429,7 +433,8 @@ CUDA NIXL consumers then reclaim zero-reference CUDA IPC allocations after
 successful native shutdown.
 
 Only trusted engine peers may call the transfer RPC or provide handoff metadata;
-this is not a public tensor-upload API. Deployment networking must make the
+its private schema lives in `proto/trtllm/openengine/v1/`. Sharing the listener
+does not restrict access to the service. Deployment networking must make the
 advertised gRPC and NIXL endpoints reachable across hosts.
 
 Pending exports expire after five minutes when the cache is collected, and
