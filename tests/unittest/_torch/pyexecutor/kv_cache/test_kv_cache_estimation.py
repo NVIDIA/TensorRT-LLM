@@ -1609,6 +1609,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     bounded: bool,
     expected_budget: int,
     expected_cap: int | None,
+    kv_cost: CacheCost = CacheCost(slope=3),
 ) -> None:
     """Verify measured chunk capacity and preserve Hopper's existing reserve policy."""
 
@@ -1683,7 +1684,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
             return_value={"allocated_bytes.all.current": 128, "allocated_bytes.all.peak": 256},
         ),
         patch.object(creator, "_encode_dummy_inputs", return_value=None),
-        patch.object(creator, "_get_kv_size_per_token", return_value=CacheCost(slope=3)),
+        patch.object(creator, "_get_kv_size_per_token", return_value=kv_cost),
         patch.object(torch.cuda, "empty_cache"),
         patch.object(torch.cuda, "reset_peak_memory_stats"),
         # Use a nonzero backend cost: the 512-byte budget splits into 384 bytes
@@ -1713,6 +1714,36 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     assert kv_cache_config.max_tokens == user_max_tokens
     assert kv_cache_config.pool_ratio == pool_ratio
     assert kv_cache_config.avg_seq_len == avg_seq_len
+
+
+@pytest.mark.parametrize(
+    ("fixed_bytes", "expected_budget", "expected_cap"),
+    [
+        # The 256 bytes beyond the fixed part split at a common token count: 64 tokens
+        # of KV at 3 bytes and 64 tokens of workspace at 1 byte.
+        (256, 448, 64),
+        # Nothing is left beyond the fixed part: no workspace and no admission cap.
+        (512, 512, None),
+    ],
+    ids=["split_beyond_fixed", "budget_within_fixed"],
+)
+def test_estimation_workspace_reserve_keeps_fixed_kv_cost_in_pool(
+    fixed_bytes: int, expected_budget: int, expected_cap: int | None
+) -> None:
+    """The context-MLA workspace split leaves the fixed part of the 512-byte budget to the pool.
+
+    A fixed part (``CacheCost.intercept``, as a hybrid model's recurrent states) does not
+    scale with tokens, so only the budget beyond it is shared with the workspace.
+    """
+    test_estimation_temporarily_uses_inferred_pool_sizing(
+        sm=100,
+        chunked_workspace_profiled=False,
+        chunked_prefill=True,
+        bounded=True,
+        expected_budget=expected_budget,
+        expected_cap=expected_cap,
+        kv_cost=CacheCost(slope=3, intercept=fixed_bytes),
+    )
 
 
 @pytest.mark.parametrize("estimating", [False, True])

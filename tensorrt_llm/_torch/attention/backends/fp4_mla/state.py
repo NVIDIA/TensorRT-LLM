@@ -64,6 +64,9 @@ class Fp4MlaState:
     num_blocks: list[int] | None = None
     num_context_blocks: int = 0
     num_generation_blocks: int = 0
+    # Whether every generation sequence fills all of its pages, cached across
+    # the layers of a step. Its key does not include the KV lengths, so it is
+    # reset whenever they change.
     full_pages_cache: tuple[tuple, bool] | None = None
     workspaces: dict[str, torch.Tensor] = field(default_factory=dict)
     v_packed_cache_tags: dict[str, tuple] = field(default_factory=dict)
@@ -142,6 +145,7 @@ class Fp4MlaState:
         self.generation_lengths_num_contexts = -1
         self.generation_lengths_capture_recorded = False
         self.packed_plan_key = None
+        self.full_pages_cache = None
 
     def prepare(self, metadata: TrtllmAttentionMetadata, kv_lens: torch.Tensor) -> None:
         # All local layers reuse this FP8 view only within the current batch.

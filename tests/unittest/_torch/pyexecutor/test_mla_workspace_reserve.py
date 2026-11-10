@@ -275,7 +275,7 @@ def test_workspace_bytes_zero_only_for_absorption_mode_sparse_mla(
     ],
 )
 def test_workspace_reserve_cap(budget, k, w, kv_len_cap, expected_cap):
-    reserve, cap = get_mla_context_workspace_reserve(budget, k, w, kv_len_cap)
+    reserve, cap = get_mla_context_workspace_reserve(budget, k, w, kv_len_cap, 0)
     assert cap == expected_cap
     assert cap == int(reserve / w)  # the cap is exactly what the reserve covers
     assert reserve <= w * kv_len_cap  # never reserves beyond the worst case
@@ -294,7 +294,7 @@ def test_workspace_reserve_cap(budget, k, w, kv_len_cap, expected_cap):
 )
 def test_workspace_reserve_zero_for_bad_inputs(budget, k, w, kv_len_cap):
     # Any non-positive input -> reserve nothing and carry no cap (no admission cap applied).
-    assert get_mla_context_workspace_reserve(budget, k, w, kv_len_cap) == (0, None)
+    assert get_mla_context_workspace_reserve(budget, k, w, kv_len_cap, 0) == (0, None)
 
 
 # ---- carried admission-cap read (executor side, V1/V2) ----

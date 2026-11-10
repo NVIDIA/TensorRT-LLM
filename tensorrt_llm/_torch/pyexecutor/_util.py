@@ -709,23 +709,29 @@ def get_indexer_mqa_logits_workspace_reserve(kv_cache_memory: int,
 
 
 def get_mla_context_workspace_reserve(budget_bytes, k_bytes_per_token,
-                                      w_bytes_per_token, kv_len_cap):
+                                      w_bytes_per_token, kv_len_cap,
+                                      fixed_bytes):
     """Bytes to reserve for the fp8 context-MLA workspace, and the token admission cap that reserve covers.
 
     Reserve ``w * kv_len_cap`` (the worst-case summed attended KV), clamped to the per-token split
-    ``budget * w / (k + w)`` so a memory-constrained node shares the budget at a common token count rather
-    than starving the KV pool. The admission cap is ``reserve / w == min(kv_len_cap, budget / (k + w))``
-    tokens; the scheduler admits at most that much summed attended KV, so the fp8 dequant staging buffer
-    this reserve covers stays within it. This accounts for the fp8 staging term only -- the separate BF16
-    full-gather buffers on the reuse path are not yet charged here (tracked as a follow-up), so this bounds
-    but does not by itself guarantee the reuse-path peak. Returns ``(reserve_bytes, cap_tokens)``, or
-    ``(0, None)`` when any input is non-positive.
+    ``(budget - fixed) * w / (k + w)`` so a memory-constrained node shares the budget at a common token
+    count rather than starving the KV pool. ``fixed`` is the part of the KV cache cost that does not scale
+    with tokens (``CacheCost.intercept``, for example a hybrid model's recurrent states or the FP4 MLA
+    high-precision pages of the resident sequences); the pool needs it in full, so only the rest of the
+    budget is split. The admission cap is
+    ``reserve / w == min(kv_len_cap, (budget - fixed) / (k + w))`` tokens; the scheduler admits at most that
+    much summed attended KV, so the fp8 dequant staging buffer this reserve covers stays within it. This
+    accounts for the fp8 staging term only -- the separate BF16 full-gather buffers on the reuse path are not
+    yet charged here (tracked as a follow-up), so this bounds but does not by itself guarantee the reuse-path
+    peak. Returns ``(reserve_bytes, cap_tokens)``, or ``(0, None)`` when any input is non-positive or the
+    budget does not exceed ``fixed``.
     """
-    if not (budget_bytes > 0 and k_bytes_per_token > 0 and w_bytes_per_token > 0
-            and kv_len_cap and kv_len_cap > 0):
+    token_budget_bytes = budget_bytes - fixed_bytes
+    if not (token_budget_bytes > 0 and k_bytes_per_token > 0
+            and w_bytes_per_token > 0 and kv_len_cap and kv_len_cap > 0):
         return 0, None
     reserve = min(
-        w_bytes_per_token * kv_len_cap, budget_bytes * w_bytes_per_token /
+        w_bytes_per_token * kv_len_cap, token_budget_bytes * w_bytes_per_token /
         (k_bytes_per_token + w_bytes_per_token))
     return reserve, int(reserve / w_bytes_per_token)
 
@@ -2079,11 +2085,12 @@ class KvCacheCreator:
         # NVFP4 DSA context gather that consume the complete attended prefix. The backend declares that
         # distinction through runtime_workspace_is_chunked_prefill_bounded. When a reserve applies,
         # reserve w * L_cap bytes -- covering the worst-case summed attended KV the scheduler admits
-        # (get_mla_context_workspace_kv_len_cap) -- but clamp it to the per-token split budget * w / (k + w)
-        # so a memory-constrained node shares the budget at a common token count instead of starving the
-        # pool. Equivalently the pool keeps max((budget - w*L_cap)/k, budget/(k+w)) tokens. The reserve
-        # covers exactly reserve/w tokens of summed attended KV; that count is carried to the KV manager as
-        # the scheduler's admission cap so it never re-derives the cap from pool layout (which V2
+        # (get_mla_context_workspace_kv_len_cap) -- but clamp it to the per-token split
+        # (budget - c) * w / (k + w), where c is the fixed (token-independent) part of the KV cost, so a
+        # memory-constrained node shares the budget at a common token count instead of starving the pool.
+        # Equivalently the pool keeps c plus max((budget - c - w*L_cap)/k, (budget - c)/(k+w)) tokens.
+        # The reserve covers exactly reserve/w tokens of summed attended KV; that count is carried to the
+        # KV manager as the scheduler's admission cap so it never re-derives the cap from pool layout (which V2
         # overstates). No cap or w == 0 -> no-op.
         # A completed chunk-aware profiling run already prices the cached-KV
         # staging buffers in the measured peak. Do not subtract an additional
@@ -2115,11 +2122,14 @@ class KvCacheCreator:
                 and get_sm_version() >= 100))
         if w_bytes_per_token > 0 and kv_len_cap:
             budget_before = kv_cache_max_memory
+            kv_cost = self._get_kv_size_per_token()
             workspace_reserve, self._fp8_ctx_mla_kv_len_cap = (
                 get_mla_context_workspace_reserve(
                     budget_before,
-                    self._get_kv_size_per_token().slope, w_bytes_per_token,
-                    kv_len_cap))
+                    kv_cost.slope,
+                    w_bytes_per_token,
+                    kv_len_cap,
+                    fixed_bytes=kv_cost.intercept))
             if workspace_reserve > 0:
                 kv_cache_max_memory = int(budget_before - workspace_reserve)
                 logger.info(

@@ -8833,8 +8833,8 @@ class PyExecutor:
 
         The KV-cache estimator is the single decision point: it reserves context-MLA workspace only when
         cached tokens can grow it past the profiled floor, and carries the exact token cap that reserve
-        covers onto the KV manager as `fp8_ctx_mla_kv_len_cap` (`min(L_cap, budget/(k+w))`). The scheduler
-        reads that decision directly rather than re-deriving it from pool layout, which V2 overstates
+        covers onto the KV manager as `fp8_ctx_mla_kv_len_cap` (`min(L_cap, (budget-fixed)/(k+w))`). The
+        scheduler reads that decision directly rather than re-deriving it from pool layout, which V2 overstates
         (`blocks_in_primary_pool` forwards `get_page_index_upper_bound`, not the available-page count).
         A carried value of None -- no affected MLA workspace or no reservation needed -- means no admission
         cap is applied. A carried 0 is a real cap (a budget so
@@ -8861,8 +8861,8 @@ class PyExecutor:
         the cached resolution in `_get_ctx_mla_kv_len_cap`, so it fires at most once per executor.
 
         Only the memory budget can produce a cap this small: the reserve is clamped to
-        `budget * w / (k + w)` (`get_mla_context_workspace_reserve`) and the cap is that reserve divided
-        by `w`, while the `fp8_context_mla_kv_len_cap` override is floored at `max_seq_len`
+        `(budget - fixed) * w / (k + w)` (`get_mla_context_workspace_reserve`) and the cap is that reserve
+        divided by `w`, while the `fp8_context_mla_kv_len_cap` override is floored at `max_seq_len`
         (`get_mla_context_workspace_kv_len_cap`). So the override is never the cause, and raising it is
         never the fix -- point at the budget instead.
         """
