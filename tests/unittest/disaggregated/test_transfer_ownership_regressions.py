@@ -1910,7 +1910,9 @@ def test_request_data_for_a_cleared_session_is_failed_not_parked(retried: bool) 
         slice_id=0,
     )
 
-    sender._respond_with_kv(b"receiver", [MessageType.REQUEST_DATA, info.to_bytes()])
+    sender._respond_with_kv(
+        b"receiver", [MessageType.REQUEST_DATA, info.to_bytes(), _KV_RESULT_REPORT_TOKEN]
+    )
 
     sender._save_peer_req_info.assert_not_called()
     sender._send_failed_result_to_receiver.assert_called_once_with(info)
@@ -1932,7 +1934,9 @@ def test_request_data_for_a_session_not_yet_created_is_still_parked() -> None:
         unique_rid=110,
     )
 
-    sender._respond_with_kv(b"receiver", [MessageType.REQUEST_DATA, info.to_bytes()])
+    sender._respond_with_kv(
+        b"receiver", [MessageType.REQUEST_DATA, info.to_bytes(), _KV_RESULT_REPORT_TOKEN]
+    )
 
     sender._save_peer_req_info.assert_called_once_with(info)
     sender._send_failed_result_to_receiver.assert_not_called()
@@ -1958,7 +1962,9 @@ def test_retried_request_data_for_a_live_session_is_failed_not_parked() -> None:
         slice_id=0,
     )
 
-    sender._respond_with_kv(b"receiver", [MessageType.REQUEST_DATA, info.to_bytes()])
+    sender._respond_with_kv(
+        b"receiver", [MessageType.REQUEST_DATA, info.to_bytes(), _KV_RESULT_REPORT_TOKEN]
+    )
 
     sender._save_peer_req_info.assert_not_called()
     sender._send_failed_result_to_receiver.assert_called_once_with(info)
@@ -1991,6 +1997,7 @@ def test_cleared_session_failure_reaches_the_waiting_receive(
 
     def publish(task: KVRecvTask) -> None:
         task.expected_transfers = 1
+        task._kv_result_report_tokens = {3: _KV_RESULT_REPORT_TOKEN}
         session.mark_transferring(task.slice_id)
 
     receiver.dispatch_task = publish
@@ -2014,7 +2021,9 @@ def test_cleared_session_failure_reaches_the_waiting_receive(
         slice_id=0,
     )
 
-    sender._respond_with_kv(b"gen", [MessageType.REQUEST_DATA, info.to_bytes()])
+    sender._respond_with_kv(
+        b"gen", [MessageType.REQUEST_DATA, info.to_bytes(), _KV_RESULT_REPORT_TOKEN]
+    )
     (reply,) = [call.args[0] for call in dealer.send.call_args_list]
     receiver._process_kv_agent_result(b"ctx", reply)
 
@@ -2059,6 +2068,7 @@ def _two_writer_receive_failed_by_one(rid: int, timeout_s: float | None = None):
 
     def publish(task: KVRecvTask) -> None:
         task.expected_transfers = 2
+        task._kv_result_report_tokens = {3: _KV_RESULT_REPORT_TOKEN, 4: _KV_RESULT_REPORT_TOKEN}
         session.mark_transferring(task.slice_id)
 
     receiver.dispatch_task = publish
@@ -2080,7 +2090,9 @@ def _two_writer_receive_failed_by_one(rid: int, timeout_s: float | None = None):
         unique_rid=rid,
         slice_id=0,
     )
-    sender._respond_with_kv(b"gen", [MessageType.REQUEST_DATA, info.to_bytes()])
+    sender._respond_with_kv(
+        b"gen", [MessageType.REQUEST_DATA, info.to_bytes(), _KV_RESULT_REPORT_TOKEN]
+    )
     (reply,) = [call.args[0] for call in dealer.send.call_args_list]
     receiver._process_kv_agent_result(b"ctx", reply)
 
@@ -2128,7 +2140,10 @@ def test_failed_receive_is_kept_until_every_writer_has_reported(
 
     result = AgentResult.SUCCESS if sibling == "succeeds" else AgentResult.FAILED
     receiver._process_kv_agent_result(
-        b"ctx", transfer_mod._make_kv_result_msg(4, rid, 0, True, result)
+        b"ctx",
+        transfer_mod._make_kv_result_msg(
+            4, rid, 0, True, result, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+        ),
     )
     assert not session.failed_receive_awaits_writers()
     assert transceiver.check_gen_transfer_status(None) == ([], [rid], [])
@@ -2166,7 +2181,10 @@ def test_cancel_does_not_free_a_failed_receive_before_its_writers_stop(
     assert rid in receiver._sessions
 
     receiver._process_kv_agent_result(
-        b"ctx", transfer_mod._make_kv_result_msg(4, rid, 0, True, AgentResult.SUCCESS)
+        b"ctx",
+        transfer_mod._make_kv_result_msg(
+            4, rid, 0, True, AgentResult.SUCCESS, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+        ),
     )
     assert not session.has_transferring_tasks()
     if canceller == "local":
