@@ -361,20 +361,28 @@ class TestBaseToolParser:
         assert "test_function" in info.begin
         assert info.trigger == "[TOOL_CALLS]"
 
-    def test_finish_default_noop(self, sample_tools):
-        """The default finalization hook emits nothing and keeps state.
-
-        Existing parsers manage ``self._buffer`` incrementally; the
-        end-of-stream hook must not change their behavior.
-        """
+    def test_finish_keeps_a_buffer_that_cannot_progress(self, sample_tools):
+        """Only part of the start token is buffered: no increment could report anything."""
         parser = ConcreteToolParser()
-        parser._buffer = '[TOOL_CALLS] {"name":"get_weather"'
+        parser._buffer = "[TOOL_"
 
         result = parser.finish(sample_tools)
 
         assert result.normal_text == ""
         assert result.calls == []
-        assert parser._buffer == '[TOOL_CALLS] {"name":"get_weather"'
+        assert parser._buffer == "[TOOL_"
+
+    def test_finish_reports_the_call_the_last_increment_brought(
+            self, sample_tools):
+        """A whole call arrives in the last increment: finish() reports its arguments too."""
+        parser = ConcreteToolParser()
+        text = '[TOOL_CALLS] {"name": "get_weather", "arguments": {"location": "Paris"}}'
+
+        assert _streamed_calls(parser, [text],
+                               sample_tools) == [("get_weather", {
+                                   "location": "Paris"
+                               })]
+        assert parser.finish(sample_tools).calls == []
 
     def test_extracts_forced_tool_calls_default_false(self):
         """Forced tool_choice extraction is opt-in per parser."""
@@ -384,6 +392,30 @@ class TestBaseToolParser:
 # ============================================================================
 # Qwen3ToolParser Tests
 # ============================================================================
+
+
+def _streamed_calls(parser, increments, tools):
+    """The calls a client assembles from the increments and finish(): (name, arguments)."""
+    results = [
+        parser.parse_streaming_increment(piece, tools) for piece in increments
+    ]
+    results.append(parser.finish(tools))
+    names, arguments = {}, {}
+    for result in results:
+        for call in result.calls:
+            if call.name:
+                names[call.tool_index] = call.name
+            if call.parameters:
+                arguments[call.tool_index] = (
+                    arguments.get(call.tool_index, "") + call.parameters)
+    return [(names.get(index), json.loads(arguments.get(index) or "{}"))
+            for index in sorted(names.keys() | arguments.keys())]
+
+
+def _whole_calls(parser, text, tools):
+    """The calls detect_and_parse reads from the whole text: (name, arguments)."""
+    return [(call.name, json.loads(call.parameters or "{}"))
+            for call in parser.detect_and_parse(text, tools).calls]
 
 
 class ToolParserTestCases(NamedTuple):
@@ -439,6 +471,18 @@ class BaseToolParserTestClass:
     @pytest.fixture(scope="class")
     def tool_parser_test_cases(self) -> ToolParserTestCases:
         return self.make_tool_parser_test_cases()
+
+    def test_finish_reports_the_calls_of_a_reply_in_one_increment(
+            self, sample_tools, parser, tool_parser_test_cases):
+        """A reply in one increment: the stream and finish() give its calls.
+
+        The calls are those detect_and_parse reads from the same text.
+        """
+        text = tool_parser_test_cases.detect_and_parse_single_tool[0]
+
+        streamed = _streamed_calls(parser, [text], sample_tools)
+
+        assert streamed == _whole_calls(self.make_parser(), text, sample_tools)
 
     def test_has_tool_call_false(self, parser):
         """Test has_tool_call returns False when no tool call present."""
@@ -8541,3 +8585,20 @@ def test_dsml_stream_cut_inside_the_block_keeps_only_the_content(
     assert content == "Checking."
     assert parser_cls().detect_and_parse(text,
                                          sample_tools).normal_text == content
+
+
+@pytest.mark.parametrize("test_class",
+                         [TestQwen3ToolParser, TestGemma4ToolParser])
+def test_finish_reports_every_call_of_a_reply_in_one_increment(
+        sample_tools, test_class):
+    """Several calls in the last increment: finish() delivers all of them.
+
+    The calls are those detect_and_parse reads from the same text.
+    """
+    test = test_class()
+    text = test.make_tool_parser_test_cases().detect_and_parse_multiple_tools[0]
+
+    streamed = _streamed_calls(test.make_parser(), [text], sample_tools)
+
+    assert len(streamed) > 1
+    assert streamed == _whole_calls(test.make_parser(), text, sample_tools)
