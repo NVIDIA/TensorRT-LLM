@@ -289,7 +289,9 @@ def test_decision_file_extra_keys_scope_and_role_endings() -> None:
     extra = _common.decision_file_block("assembler", ("blocked_reason", "uncertified"))
     assert "<task>-<attempt>.yaml" in plain
     assert "This role also carries" not in plain
-    assert "  blocked_reason: ...\n  uncertified: ...\n```" in extra
+    # Top-level keys, beside the decision, which is the file's first line.
+    assert "\nblocked_reason: ...\nuncertified: ...\n```" in extra
+    assert "```yaml\ndecision: <exactly one of the decisions listed above>\nsummary: |" in plain
     assert _common.scope_block("full") == ""
     assert "ignore the vision tensors" in _common.scope_block("text_only")
     for role, prompt in asdict(prompts.DEFAULT_PROMPTS).items():

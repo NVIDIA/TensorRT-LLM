@@ -8,18 +8,18 @@ SPDX-License-Identifier: Apache-2.0 -#}
 <workspace>/decisions/<task>-<attempt>.yaml
 ```
 
-The exact path is given at the end of your dispatch prompt. Write that file and no other: every turn is given its own path, and a decision written anywhere else is never read. The file is YAML with exactly these keys:
+The exact path is given at the end of your dispatch prompt. Write that file and no other: every turn is given its own path, and a decision written anywhere else is never read. The file is YAML, and its **first line is the decision**:
 
 ```yaml
+decision: <exactly one of the decisions listed above>
 summary: |
   What you did, in a few lines. Numbers verbatim from tool output.
-decision: <exactly one of the decisions listed above>
 ```
 {% if extra %}
-This role also carries these keys when they apply:
+This role also carries these keys when they apply, beside the two above:
 
 ```yaml
-{% for key in extra %}  {{ key }}: ...
+{% for key in extra %}{{ key }}: ...
 {% endfor %}```
 {% endif %}
-Any other value, or no file, is a turn that produced no decision.
+A file without `decision`, any other value, or no file is a turn that produced no decision.
