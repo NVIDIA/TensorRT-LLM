@@ -4,6 +4,7 @@
 """Unit tests for the OpenEngine Control service."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -943,6 +944,22 @@ async def test_subscribe_kv_events_is_unimplemented(enabled):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("role,has_discard", [("", True), ("consume", True), ("encode", False)])
+async def test_abort_encoder_cache_requires_encode_cleanup_support(role, has_discard):
+    inference = _inference()
+    inference.encoder_role = role
+    inference._encoder_cache = SimpleNamespace(**({"discard": Mock()} if has_discard else {}))
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
+        await _servicer(inference=inference).Abort(
+            lifecycle_pb2.AbortRequest(encoder_cache={}), context
+        )
+    assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
+    if has_discard:
+        inference._encoder_cache.discard.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_abort_encoder_cache_reports_release_and_idempotent_outcomes():
     from tensorrt_llm.grpc.openengine.bindings import generation_pb2
 
@@ -976,6 +993,7 @@ async def test_abort_encoder_cache_reports_release_and_idempotent_outcomes():
     [
         (ValueError("invalid reference"), grpc.StatusCode.INVALID_ARGUMENT),
         (RuntimeError("transport unhealthy"), grpc.StatusCode.UNAVAILABLE),
+        (OSError("cannot remove cached encoder output"), grpc.StatusCode.INTERNAL),
     ],
 )
 async def test_abort_encoder_cache_preserves_failures(failure, code):

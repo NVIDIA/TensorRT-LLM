@@ -846,6 +846,22 @@ def test_multirank_native_only_keeps_existing_progress_contract(enable_adp: bool
     executor.async_transfer_manager.has_any_inflight_requests.assert_not_called()
 
 
+def test_single_rank_native_shutdown_waits_for_send_completion() -> None:
+    executor = _executor()
+    executor.kv_connector_manager = None
+    executor.dist.world_size = 1
+    executor.is_shutdown = True
+    executor.active_requests = []
+    executor.waiting_queue = []
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.has_any_inflight_requests.return_value = True
+
+    for _ in range(3):
+        assert not executor.should_stop_processing
+    executor.async_transfer_manager.has_any_inflight_requests.return_value = False
+    assert executor.should_stop_processing
+
+
 @pytest.mark.parametrize("global_pending", [False, True])
 def test_single_rank_adp_connector_preserves_deferred_response_snapshot(
     global_pending: bool,

@@ -62,6 +62,23 @@ class FakeAgent:
     def invalidate_remote_agent(self, name):
         self.loaded.discard(name)
 
+    def check_remote_descs(self, name, descs):
+        peer = self.agents[name]
+        targets = [
+            desc if isinstance(desc, tuple) else (desc.addr, desc.len, desc.device_id)
+            for desc in descs.descs
+        ]
+        return all(
+            any(
+                source[0] <= target[0]
+                and target[0] + target[1] <= source[0] + source[1]
+                and source[2] == target[2]
+                for reg in peer.registrations.values()
+                for source in reg.descs
+            )
+            for target in targets
+        )
+
     def submit_transfer_requests(self, req):
         self.writes += 1
         peer = self.agents[req.remote_name]
@@ -387,6 +404,37 @@ def test_bad_destination_size_does_not_consume_export(pair):
         producer.transfer(ref, b'{"descs": []}')
     assert len(producer._exports) == 1
     assert not producer.failed
+
+
+@pytest.mark.parametrize("invalid", ["address", "device"])
+def test_unregistered_destination_preserves_reference_for_retry(pair, monkeypatch, invalid):
+    producer, consumer = pair
+    llm, _ = model()
+    reference = producer.publish(native_result()[0], request(), llm)
+    original = transport._descriptors
+
+    def unregistered(tensors, name):
+        registration, source, descs = original(tensors, name)
+        if "-receive-" in name:
+            descs = [list(desc) for desc in descs]
+            if invalid == "address":
+                descs[0][0] += descs[0][1]
+            else:
+                descs[0][2] += 1
+        return registration, source, descs
+
+    with monkeypatch.context() as patch:
+        patch.setattr(transport, "_descriptors", unregistered)
+        with pytest.raises(EncoderTransferRejected, match="not registered"):
+            _receive(consumer, reference)
+    assert not producer.failed and not consumer.failed
+    assert _writes(producer) == 0
+    assert json.loads(reference.opaque_state)["id"] in producer._exports
+    assert _sender(producer).stopped and not _sender(producer).registrations
+    assert consumer._used == 0 and _receiver(consumer).stopped
+    actual = _receive(consumer, reference)
+    assert torch.equal(actual[0], torch.arange(8, dtype=torch.float32).reshape(2, 4))
+    assert producer._used == consumer._used == 0
 
 
 def test_reference_does_not_expose_source_addresses(pair):

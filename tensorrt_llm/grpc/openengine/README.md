@@ -312,6 +312,10 @@ The baseline schema source is the Apache-2.0-licensed [`ai-dynamo/openengine`](h
 
 The encoder extension is pinned to canonical [OpenEngine #35](https://github.com/ai-dynamo/openengine/pull/35), which is not yet included in that BSR release. Its exact source revision is recorded in the vendor lock and schema manifest.
 
+Before releasing the encoder extension, pin the merged upstream schema revision
+and regenerate the vendored bindings. Draft revisions use the canonical
+`openengine.v1` namespace and must not be treated as a stable wire contract.
+
 TensorRT-LLM vendors the immutable schema under `tensorrt_llm/grpc/openengine/proto/`. `3rdparty/vendor_sources.lock.yaml` pins the upstream commit and verifies that the schema files are exact upstream copies. The adjacent `manifest.json` records protocol metadata, generator versions, and runtime floors. The deterministic private bindings under `tensorrt_llm.grpc.openengine._generated` are checked in so ordinary wheel and editable builds do not require a protocol compiler or network access.
 
 When changing the schema, generator, or `requirements-build-openengine.txt`, regenerate and commit the bindings:

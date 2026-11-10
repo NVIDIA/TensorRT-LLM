@@ -330,6 +330,8 @@ class NixlEncoderCache:
                 target = MemoryDescs(
                     getattr(MemoryType, peer["memory_type"]), [tuple(d) for d in peer["descs"]]
                 )
+                if not agent.check_remote_descs(peer["name"], target):
+                    raise ValueError("encoder receive buffers are not registered")
                 transfer = TransferRequest(TransferOp.WRITE, source, target, peer["name"])
                 # Submission can post a WRITE and then raise before returning status.
                 submitted = True
