@@ -92,9 +92,10 @@ Set `TLLM_PROFILE_CUSTOM_REGIONS` before process startup. Unset, empty or
 whitespace-only values select `workflow,mpi,nccl,nanobind`; `kv` and `moe` are
 opt-in. Set `none` to disable all custom scopes, or list categories separated by
 commas. Invalid nonempty selections warn and use the defaults. Selection is
-cached for the process lifetime. Native NCCL and nanobind scopes also require
-their build options. See the [shared profiler contract](profiler-metadata.md)
-for the capture prerequisites and execution-trace metadata format.
+cached for the process lifetime. Native NCCL and nanobind metadata scopes are
+not yet instrumented in this layer. See the
+[shared profiler contract](profiler-metadata.md) for the capture prerequisites
+and execution-trace metadata format.
 
 ### Enable GIL information in NVTX markers
 
