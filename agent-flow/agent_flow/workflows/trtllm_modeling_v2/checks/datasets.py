@@ -13,8 +13,9 @@ found it missing there lost its benchmarks to it.
 dataset's repository into the workspace (``datasets/<repo>``), first from the local
 HuggingFace cache. ``datasets/status.json`` says where each stands. A gate that needs one
 still being staged waits for it (:func:`wait`); one that could not be staged runs as
-before, and the journal says why. :func:`staged_spec` is how a check reads it. Where the models root lacks the dataset, a root that
-holds it beside the models (:func:`models_root`) is what the tree's own tests read.
+before, and the journal says why. :func:`staged_spec` is how a check reads it. Where the
+models root lacks the dataset, a root that holds it beside the models (:func:`models_root`)
+is what the tree's own tests read.
 """
 
 from __future__ import annotations
