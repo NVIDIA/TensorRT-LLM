@@ -138,8 +138,10 @@ def test_drain_reaps_inflight_sends():
 
 
 def test_drain_waits_for_unpublished_gen_receives():
-    """Generation side (copy-based rebalancing): an admitted request whose receive has not started
-    still counts as in flight, and every pass advances receives.
+    """Generation side: unpublished receives count as in flight.
+
+    With copy-based rebalancing an admitted request whose receive has not started still counts as in
+    flight, and every drain pass advances receives.
     """
     s = _executor(_Xcvr())
     s.unpublished_gen_receives = 2
@@ -448,8 +450,10 @@ def test_generation_side_rebalance_integrity(tmp_path):
 
 @pytest.mark.parametrize("registered, cross_node", [(True, False), (False, True), (True, True)])
 def test_fixed_layout_is_not_vetoed(registered, cross_node):
-    """Copy-based rebalancing: the arena is registered once and never remapped, so a peer holding this
-    rank's layout (generation side) and a peer on another node are no reason to stop rebalancing.
+    """Copy-based rebalancing: a fixed layout is never vetoed.
+
+    The arena is registered once and never remapped, so a peer holding this rank's layout (generation
+    side) and a peer on another node are no reason to stop rebalancing.
     """
     x = object.__new__(KvCacheTransceiverV2)
     x._transfer_worker = types.SimpleNamespace(
