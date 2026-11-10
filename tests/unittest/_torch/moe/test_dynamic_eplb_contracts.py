@@ -1999,6 +1999,7 @@ def _autotune_helpers(torch):
         "validate_megamoe_tactic",
         "_epi_flag_batch_for_tokens",
         "_expand_megamoe_ready_tactics",
+        "_with_atomic_counter_work_ids",
         "enumerate_megamoe_candidate_tactics",
     }
     constants = {
@@ -2010,6 +2011,7 @@ def _autotune_helpers(torch):
         "_TOKEN_BACK_READY_GRANULARITIES",
         "_TACTIC_LEN",
         "_TACTIC_LEN_V4",
+        "_ATOMIC_COUNTER_HELPER_SMS",
         "_LEGACY_TACTIC_LEN",
         "_FLAG_BATCH_MAX",
         "_GEOMETRIES",
