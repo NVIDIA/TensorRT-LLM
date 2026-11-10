@@ -22,13 +22,17 @@ def _fake_kv_cache(matched: int, reused: int) -> SimpleNamespace:
     )
 
 
-def _fake_request(is_dummy_request: bool = False) -> SimpleNamespace:
+def _fake_request(
+    is_dummy: bool = False, is_disagg_generation_init_state: bool = False
+) -> SimpleNamespace:
     return SimpleNamespace(
         py_request_id=1,
         prompt_len=1 << 21,
         context_current_position=0,
-        is_dummy_request=is_dummy_request,
-        is_disagg_generation_init_state=False,
+        # Like an attention DP or CUDA graph padding dummy, which is not a dummy_request.
+        is_dummy=is_dummy,
+        is_dummy_request=False,
+        is_disagg_generation_init_state=is_disagg_generation_init_state,
         expect_snapshot_points=[],
     )
 
@@ -63,11 +67,12 @@ def test_counts_loss_without_branch_snapshots():
     assert manager._page_pruned_tokens_total == 0
 
 
-def test_skips_resumed_dummy_and_estimation_lookups():
+def test_skips_resumed_dummy_disagg_and_estimation_lookups():
     manager = _manager()
     manager._record_branch_snapshot_point(_fake_request(), _fake_kv_cache(100, 0), None)
+    manager._record_branch_snapshot_point(_fake_request(is_dummy=True), _fake_kv_cache(100, 0), 100)
     manager._record_branch_snapshot_point(
-        _fake_request(is_dummy_request=True), _fake_kv_cache(100, 0), 100
+        _fake_request(is_disagg_generation_init_state=True), _fake_kv_cache(100, 0), 100
     )
     manager.is_estimating_kv_cache = True
     manager._record_branch_snapshot_point(_fake_request(), _fake_kv_cache(100, 0), 100)

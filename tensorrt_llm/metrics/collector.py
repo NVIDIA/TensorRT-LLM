@@ -373,15 +373,19 @@ class MetricsCollector:
         self.kv_cache_prefix_matched_tokens_total = Counter(
             name=self.metric_prefix + "kv_cache_prefix_matched_tokens_total",
             documentation=(
-                "Hybrid recurrent models: total prompt tokens whose prefix "
-                "matched in the attention KV cache"),
+                "Hybrid recurrent models: process-lifetime total prompt "
+                "tokens of this rank whose prefix matched in the attention KV "
+                "cache. Resets only when the serving process restarts."),
             labelnames=iteration_labelnames)
         self.kv_cache_prefix_snapshot_lost_tokens_total = Counter(
             name=self.metric_prefix +
             "kv_cache_prefix_snapshot_lost_tokens_total",
             documentation=(
-                "Hybrid recurrent models: total matched prefix tokens "
-                "recomputed because no recurrent-state snapshot covered them"),
+                "Hybrid recurrent models: process-lifetime total matched "
+                "prefix tokens of this rank recomputed because no "
+                "recurrent-state snapshot covered them; its ratio to "
+                "kv_cache_prefix_matched_tokens_total is the share of prefix "
+                "reuse lost. Resets only when the serving process restarts."),
             labelnames=iteration_labelnames)
         self.kv_cache_intra_device_copy_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_intra_device_copy_bytes_total",

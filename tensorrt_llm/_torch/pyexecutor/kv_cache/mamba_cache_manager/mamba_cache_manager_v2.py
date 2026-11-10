@@ -1770,7 +1770,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if (
             self.local_num_mamba_layers == 0
             or self.is_estimating_kv_cache
-            or req.is_dummy_request
+            or req.is_dummy
             or req.is_disagg_generation_init_state
         ):
             return
@@ -1784,7 +1784,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._warn_on_snapshot_loss()
 
     def _warn_on_snapshot_loss(self) -> None:
-        """Warn once when missing snapshots cost a large share of prefix reuse."""
+        """Warn once when missing snapshots cost a large share of prefix reuse.
+
+        Judged on this rank's lookups only; with attention DP, other ranks'
+        loss is in the per-rank Prometheus counters.
+        """
         matched = self._prefix_matched_tokens_total
         if (
             matched < _SNAPSHOT_LOSS_MIN_MATCHED_TOKENS
@@ -1806,7 +1810,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             divergence_hint = "'kv_cache_config.block_reuse_config.enable_branch_snapshot'"
         logger.warning(
             f"[MambaHybridCacheManagerV2] {share:.0%} of the prefix tokens matched in the "
-            "attention cache were recomputed because no recurrent-state snapshot covered "
+            "attention cache on rank 0 were recomputed because no recurrent-state snapshot covered "
             "them. If prompts diverge between snapshot points, try "
             f"{divergence_hint}. If snapshots were evicted, give the recurrent-state "
             "pool a larger share of the cache with 'kv_cache_config.pool_ratio' or a "

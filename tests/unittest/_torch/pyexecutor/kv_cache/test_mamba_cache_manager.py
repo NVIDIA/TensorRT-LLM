@@ -4723,6 +4723,7 @@ def _fake_context_request(
         prompt_len=prompt_len,
         context_current_position=context_current_position,
         is_dummy_request=is_dummy_request,
+        is_dummy=is_dummy_request,
         is_disagg_generation_init_state=is_disagg_generation_init_state,
         expect_snapshot_points=list(expect_snapshot_points or []),
     )
