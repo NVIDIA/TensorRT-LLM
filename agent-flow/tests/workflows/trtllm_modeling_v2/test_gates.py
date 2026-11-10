@@ -1680,3 +1680,14 @@ def test_a_module_that_skips_itself_on_import_has_a_result_not_a_hole(tmp_path):
     )
     assert not failed[0].env_digest and failed[1:3] == (0, 1)
     assert "environment probe failed" in failed[3]
+
+
+def test_a_missing_anchor_row_says_how_to_measure_and_write_one(tmp_path):
+    references = tmp_path / "gsm8k.yaml"
+    references.write_text("org/other:\n  - accuracy: 50.0\n", encoding="utf-8")
+    with pytest.raises(KeyError) as raised:
+        accuracy_checks.load_reference_score(references, "org/model")
+    message = str(raised.value)
+    assert "never invented" in message
+    assert "`org/model:` then `  - accuracy: <score>`" in message
+    assert "trtllm-eval --model <checkpoint> <benchmark>" in message

@@ -201,7 +201,11 @@ def load_reference_score(
         raise KeyError(
             f"{path} has no entry for {model_key!r}. The anchor comes from a written "
             f"source or from the user — it is never invented. Add the entry (citing "
-            f"where the score came from) before the accuracy gate can run."
+            f"where the score came from) before the accuracy gate can run: "
+            f"`{model_key}:` then `  - accuracy: <score>`, committed to the checkout. A "
+            f"score under the gate's own protocol comes from an implementation that already "
+            f"serves the checkpoint, e.g. `trtllm-eval --model <checkpoint> <benchmark>` on "
+            f"a TensorRT-LLM whose existing model class loads it, on the same GPU type."
         )
 
     wanted = {k: v for k, v in (discriminators or {}).items() if v is not None}
