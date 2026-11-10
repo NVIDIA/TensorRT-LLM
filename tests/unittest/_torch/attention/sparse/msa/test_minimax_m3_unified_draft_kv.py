@@ -731,6 +731,8 @@ def _dspark_creator(*, is_disagg: bool, context_kernel: bool = False) -> KvCache
         )
 
     target, draft = model_config(QuantAlgo.NVFP4), model_config()
+    # DSpark's checkpoint declares its sliding window.
+    draft.pretrained_config.sliding_window = 4096
     lowering = DFLASH_CONTEXT_LOWERING if context_kernel else "causal decode + future-block merge"
     creator = object.__new__(KvCacheCreator)
     creator._speculative_config = SimpleNamespace(
@@ -783,6 +785,7 @@ def _gate_creator(
     speculative: bool = True,
     pp_size: int = 1,
     full_attention_drafter: bool = False,
+    omit_draft_window_metadata: bool = False,
 ) -> KvCacheCreator:
     """``_dspark_creator`` with one setting changed, for the unify-gate table."""
     creator = _dspark_creator(is_disagg=is_disagg, context_kernel=context_kernel)
@@ -795,6 +798,10 @@ def _gate_creator(
     draft.pretrained_config.num_key_value_heads = draft_kv_heads
     if full_attention_drafter:
         draft.pretrained_config.use_sliding_window = False
+        draft_window = None
+    if omit_draft_window_metadata:
+        # A checkpoint without window fields is full attention too.
+        del draft.pretrained_config.sliding_window
         draft_window = None
     window = creator._unification_max_seq_len if draft_window is None else draft_window
     creator._get_draft_max_attention_window = lambda *_: [window]
@@ -862,6 +869,14 @@ _GATE_CASES = [
         _BOTH,
         None,
         dict(full_attention_drafter=True),
+        False,
+        "drafter uses full attention",
+    ),
+    (
+        "full-attention-drafter-without-window-fields",
+        _BOTH,
+        None,
+        dict(omit_draft_window_metadata=True),
         False,
         "drafter uses full attention",
     ),

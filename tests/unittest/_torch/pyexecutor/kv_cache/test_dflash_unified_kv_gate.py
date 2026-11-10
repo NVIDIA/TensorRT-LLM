@@ -695,8 +695,10 @@ def test_launcher_leaves_tp_and_attention_dp_to_hosting_managers(
         plain = _creator(is_disagg=True, target=layout, draft=layout, tp_size=2)
         plain._mapping.enable_attention_dp = enable_attention_dp
         assert not plain._should_unify_dflash_kv_cache()
+        draft = _model_config(kv_heads=8, head_dim=128)
+        draft.pretrained_config.sliding_window = 128
         hosting = _creator(
-            is_disagg=True, target=layout, draft=layout, tp_size=2, draft_windows=[128]
+            is_disagg=True, target=layout, draft=draft, tp_size=2, draft_windows=[128]
         )
         hosting._mapping.enable_attention_dp = enable_attention_dp
         hosting._kv_cache_manager_cls = MiniMaxM3KVCacheManagerV2
