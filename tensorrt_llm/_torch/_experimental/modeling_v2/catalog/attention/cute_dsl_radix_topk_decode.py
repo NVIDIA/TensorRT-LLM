@@ -13,6 +13,7 @@ from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, mak
 
 from .._op import Arch, Cell, OpWrapper
 from . import _radix_topk_decode as _kernel
+from .indexer_topk_decode import indexer_topk_decode
 
 TOP_K = _kernel.TOP_K
 _PAD_KEY = _kernel.PAD_KEY
@@ -505,3 +506,146 @@ class CuteDslRadixTopkDecode(OpWrapper):
 
 
 cute_dsl_radix_topk_decode = CuteDslRadixTopkDecode()
+
+
+@dataclass(frozen=True)
+class CompiledSplitRadixTopkDecode:
+    """Precompiled partition and merge launches; scratch is supplied by the caller."""
+
+    stage1: object
+    stage2: object
+    device_id: int
+    next_n: int
+    partitions: int
+    use_pdl: bool
+    sm_count: int
+
+
+_SPLIT_COMPILED: dict[tuple[int, int, int, bool], CompiledSplitRadixTopkDecode] = {}
+
+
+def build_split(
+    device_id: int, *, next_n: int = 4, partitions: int = 10, use_pdl: bool = True
+) -> CompiledSplitRadixTopkDecode:
+    """Compile a two-launch selector, before capture, for SM107 component experiments.
+
+    Rows, width and row stride are symbolic. The selector retains the long-row native
+    split's ten logical partition boundaries and sentinel padding.
+    """
+    if next_n not in (1, 4) or partitions != 10:
+        raise ValueError("split radix requires next_n 1/4 and exactly 10 native partitions")
+    key = (int(device_id), int(next_n), int(partitions), bool(use_pdl))
+    if key in _SPLIT_COMPILED:
+        return _SPLIT_COMPILED[key]
+    with torch.cuda.device(device_id):
+        rows, cols, batch, size = (cute.sym_int() for _ in range(4))
+        stride = cute.sym_int64()
+        fake_logits = make_fake_tensor(
+            cutlass.Float32, (rows, cols), stride=(stride, 1), assumed_align=4
+        )
+        fake_lens = make_fake_compact_tensor(cutlass.Int32, (batch,), assumed_align=4)
+        fake_aux_i = make_fake_compact_tensor(cutlass.Int32, (size,), assumed_align=4)
+        fake_aux_l = make_fake_compact_tensor(cutlass.Float32, (size,), assumed_align=4)
+        fake_out = make_fake_compact_tensor(
+            cutlass.Int32, (rows, TOP_K), stride_order=(1, 0), assumed_align=4
+        )
+        stream = make_fake_stream(use_tvm_ffi_env_stream=True)
+        kernel = _kernel.SplitRadixTopkDecodeKernel(next_n, partitions, use_pdl)
+        stage1 = cute.compile(
+            kernel.split,
+            fake_logits,
+            fake_lens,
+            fake_aux_i,
+            fake_aux_l,
+            stream,
+            options="--enable-tvm-ffi",
+        )
+        stage2 = cute.compile(
+            kernel.merge,
+            fake_aux_i,
+            fake_aux_l,
+            fake_out,
+            stream,
+            options="--enable-tvm-ffi",
+        )
+        sm_count = torch.cuda.get_device_properties(device_id).multi_processor_count
+        handle = CompiledSplitRadixTopkDecode(stage1, stage2, *key, int(sm_count))
+        logits = torch.zeros((next_n, 4096), dtype=torch.float32, device="cuda")
+        lens = torch.full((1,), 4096, dtype=torch.int32, device="cuda")
+        out = torch.empty((next_n, TOP_K), dtype=torch.int32, device="cuda")
+        aux_i = torch.empty(next_n * partitions * TOP_K, dtype=torch.int32, device="cuda")
+        aux_l = torch.empty_like(aux_i, dtype=torch.float32)
+        stage1(logits, lens, aux_i, aux_l)
+        stage2(aux_i, aux_l, out)
+        torch.cuda.synchronize()
+    _SPLIT_COMPILED[key] = handle
+    return handle
+
+
+def split_radix_topk_decode(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    aux_indices: torch.Tensor,
+    aux_logits: torch.Tensor,
+    *,
+    compiled: CompiledSplitRadixTopkDecode,
+) -> torch.Tensor:
+    """Select K=2048 from fp32 ``logits[batch * next_n, width]`` into int32 ``indices``.
+
+    ``seq_lens[batch]`` is int32 and read on device for each replay. Both contiguous scratch
+    buffers hold at least ``rows * partitions * 2048`` elements; their initial contents are
+    ignored. Unit-stride logits may have padded rows and nonzero storage offsets. This
+    selector uses the native op when its shape would select fewer than ten partitions,
+    preserving that shape's sentinel and nonfinite behavior.
+    """
+    if logits.ndim != 2 or logits.dtype != torch.float32 or not logits.is_cuda:
+        raise ValueError("logits must be a two-dimensional CUDA float32 tensor")
+    rows, width = logits.shape
+    if not 4096 <= width <= 1048584 or rows > 64:
+        raise ValueError("split radix requires width 4096..1048584 and at most 64 rows")
+    if logits.stride(1) != 1 or logits.stride(0) < width:
+        raise ValueError("logits must have unit column stride and non-overlapping rows")
+    if seq_lens.shape != (rows // compiled.next_n,) or rows % compiled.next_n:
+        raise ValueError("seq_lens must contain one length per request")
+    if indices.shape != (rows, TOP_K):
+        raise ValueError(f"indices must have shape ({rows}, {TOP_K})")
+    native_partitions = blocks_per_row(rows, width, compiled.sm_count)
+    needed = rows * native_partitions * TOP_K
+    for name, tensor, dtype in (
+        ("seq_lens", seq_lens, torch.int32),
+        ("indices", indices, torch.int32),
+        ("aux_indices", aux_indices, torch.int32),
+        ("aux_logits", aux_logits, torch.float32),
+    ):
+        if tensor.dtype != dtype or tensor.device != logits.device or not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous {dtype} on {logits.device}")
+    if logits.device.index != compiled.device_id:
+        raise ValueError("compiled selector and logits must be on the same CUDA device")
+    if aux_indices.numel() < needed or aux_logits.numel() < needed:
+        raise ValueError(f"scratch must hold at least {needed} elements")
+    if rows:
+        if native_partitions != compiled.partitions:
+            return indexer_topk_decode(
+                logits, seq_lens, indices, compiled.next_n, TOP_K, 1, aux_indices, aux_logits
+            )
+        flat_i, flat_l = aux_indices.view(-1), aux_logits.view(-1)
+        compiled.stage1(logits, seq_lens, flat_i, flat_l)
+        compiled.stage2(flat_i, flat_l, indices)
+    return indices
+
+
+def validate_split_radix_topk_lengths(
+    logits: torch.Tensor, seq_lens: torch.Tensor, *, next_n: int
+) -> None:
+    """Eager test guard for device metadata; never call from the production launch path.
+
+    A legal request contains the preceding ``next_n - 1`` tokens, with its last causal end
+    within the score row. CUDA graph capture must use already validated legal metadata.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("validate split radix lengths before CUDA graph capture")
+    if seq_lens.numel():
+        shortest, longest = torch.aminmax(seq_lens)
+        if int(shortest) < next_n - 1 or int(longest) > logits.shape[1]:
+            raise ValueError("seq_lens must be within [next_n - 1, logits width]")

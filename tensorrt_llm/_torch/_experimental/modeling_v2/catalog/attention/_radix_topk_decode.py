@@ -715,3 +715,178 @@ class RadixTopkDecodeKernel:
         self.kernel(logits, seq_lens, out, blocks_per_row).launch(
             grid=(rows, 1, 1), block=(self.T, 1, 1), stream=stream
         )
+
+
+class SplitRadixTopkDecodeKernel(RadixTopkDecodeKernel):
+    """Partition selection and exact radix merge, with caller-owned candidate storage."""
+
+    def __init__(self, next_n: int, partitions: int, use_pdl: bool):
+        super().__init__(next_n)
+        self.partitions = partitions
+        self.use_pdl = use_pdl
+
+    @cute.jit
+    def _select_partition(self, score, end, s_hist, s_out, s_lkey, s_lcol, s_warp, s_scal, tid):
+        """Select a native stage's candidates, including its negative-NaN ordering."""
+        if tid < cutlass.Int32(_NUM_SCALARS):
+            s_scal[tid] = cutlass.Int32(0)
+        self._clear(s_hist, D1_BINS, tid)
+        neg = cutlass.Int32(0)
+        col = tid
+        while col < end:
+            key = _key(score[col])
+            self._count(s_hist, _digit(key, D1_SHIFT, D1_MASK), cutlass.Int32(1))
+            if key > cutlass.Uint32(NEG_INF_KEY):
+                neg = neg + cutlass.Int32(1)
+            col = col + cutlass.Int32(self.T)
+        if neg > cutlass.Int32(0):
+            self._count(s_scal, cutlass.Int32(_N_NEG_NAN), neg)
+        cute.arch.barrier()
+        if s_scal[_N_NEG_NAN] == cutlass.Int32(0):
+            self._select(
+                score,
+                end,
+                cutlass.Int32(0),
+                s_hist,
+                s_out,
+                s_lkey,
+                s_lcol,
+                s_warp,
+                s_scal,
+                tid,
+            )
+        else:
+            # No mask is used by a standalone native selection stage.
+            self._stage(
+                score,
+                cutlass.Int32(0),
+                end,
+                False,
+                cutlass.Int32(0),
+                True,
+                s_hist,
+                s_out,
+                s_hist,
+                s_warp,
+                s_scal,
+                tid,
+            )
+        cute.arch.barrier()
+
+    @cute.kernel
+    def split_kernel(
+        self,
+        logits: cute.Tensor,
+        seq_lens: cute.Tensor,
+        aux_indices: cute.Tensor,
+        aux_logits: cute.Tensor,
+    ):
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+        row, part, _ = cute.arch.block_idx()
+        tid, _, _ = cute.arch.thread_idx()
+        smem = SmemAllocator()
+        s_hist = smem.allocate_tensor(cutlass.Int32, cute.make_layout((D1_BINS,)), 128)
+        s_out = smem.allocate_tensor(cutlass.Int32, cute.make_layout((TOP_K,)), 128)
+        s_lkey = smem.allocate_tensor(cutlass.Uint32, cute.make_layout((LIST_CAPACITY,)), 128)
+        s_lcol = smem.allocate_tensor(cutlass.Int32, cute.make_layout((LIST_CAPACITY,)), 128)
+        s_warp = smem.allocate_tensor(cutlass.Int32, cute.make_layout((self.W,)), 128)
+        s_scal = smem.allocate_tensor(cutlass.Int32, cute.make_layout((_NUM_SCALARS,)), 128)
+        cols = cute.size(logits, mode=[1])
+        end = seq_lens[row // cutlass.Int32(self.next_n)] - cutlass.Int32(self.next_n)
+        end = end + row % cutlass.Int32(self.next_n) + cutlass.Int32(1)
+        if (end < cutlass.Int32(0)) | (end > cols):
+            end = cutlass.Int32(0)
+        span = end // cutlass.Int32(self.partitions)
+        start = part * span
+        stop = start + span
+        if part == cutlass.Int32(self.partitions - 1):
+            stop = end
+        length = stop - start
+        src = logits[row, None]
+        score = cute.make_tensor(src.iterator + start, cute.make_layout((length,)))
+        dst = (row * cutlass.Int32(self.partitions) + part) * cutlass.Int32(TOP_K)
+        if length > cutlass.Int32(TOP_K):
+            self._select_partition(
+                score, length, s_hist, s_out, s_lkey, s_lcol, s_warp, s_scal, tid
+            )
+        k = tid
+        while k < cutlass.Int32(TOP_K):
+            col = cutlass.Int32(-1)
+            value = cutlass.Float32(-_FLT_MAX)
+            if length > cutlass.Int32(TOP_K):
+                col = s_out[k]
+                value = score[col]
+                col = col + start
+            elif k < length:
+                col = start + k
+                value = score[k]
+            aux_indices[dst + k] = col
+            aux_logits[dst + k] = value
+            k = k + cutlass.Int32(self.T)
+
+    @cute.kernel
+    def merge_kernel(self, aux_indices: cute.Tensor, aux_logits: cute.Tensor, out: cute.Tensor):
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+        row, _, _ = cute.arch.block_idx()
+        tid, _, _ = cute.arch.thread_idx()
+        smem = SmemAllocator()
+        s_hist = smem.allocate_tensor(cutlass.Int32, cute.make_layout((D1_BINS,)), 128)
+        s_out = smem.allocate_tensor(cutlass.Int32, cute.make_layout((TOP_K,)), 128)
+        s_lkey = smem.allocate_tensor(cutlass.Uint32, cute.make_layout((LIST_CAPACITY,)), 128)
+        s_lcol = smem.allocate_tensor(cutlass.Int32, cute.make_layout((LIST_CAPACITY,)), 128)
+        s_warp = smem.allocate_tensor(cutlass.Int32, cute.make_layout((self.W,)), 128)
+        s_scal = smem.allocate_tensor(cutlass.Int32, cute.make_layout((_NUM_SCALARS,)), 128)
+        length = cutlass.Int32(self.partitions * TOP_K)
+        base = row * length
+        score = cute.make_tensor(aux_logits.iterator + base, cute.make_layout((length,)))
+        self._select_partition(score, length, s_hist, s_out, s_lkey, s_lcol, s_warp, s_scal, tid)
+        # Candidate padding participates in selection, but the output contract keeps
+        # every valid column before the -1 suffix. Compact within this merge launch.
+        if tid == cutlass.Int32(0):
+            s_scal[_N_OUT] = cutlass.Int32(0)
+        k = tid
+        while k < cutlass.Int32(TOP_K):
+            out[row, k] = cutlass.Int32(-1)
+            k = k + cutlass.Int32(self.T)
+        cute.arch.barrier()
+        k = tid
+        while k < cutlass.Int32(TOP_K):
+            col = aux_indices[base + s_out[k]]
+            valid = col >= cutlass.Int32(0)
+            pos = self._claim(s_scal, _N_OUT, valid)
+            if valid:
+                out[row, pos] = col
+            k = k + cutlass.Int32(self.T)
+
+    @cute.jit
+    def split(
+        self,
+        logits: cute.Tensor,
+        seq_lens: cute.Tensor,
+        aux_indices: cute.Tensor,
+        aux_logits: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self.split_kernel(logits, seq_lens, aux_indices, aux_logits).launch(
+            grid=(cute.size(logits, mode=[0]), self.partitions, 1),
+            block=(self.T, 1, 1),
+            stream=stream,
+            use_pdl=self.use_pdl,
+        )
+
+    @cute.jit
+    def merge(
+        self,
+        aux_indices: cute.Tensor,
+        aux_logits: cute.Tensor,
+        out: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        self.merge_kernel(aux_indices, aux_logits, out).launch(
+            grid=(cute.size(out, mode=[0]), 1, 1),
+            block=(self.T, 1, 1),
+            stream=stream,
+            use_pdl=self.use_pdl,
+        )
