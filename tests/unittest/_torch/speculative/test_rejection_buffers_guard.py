@@ -51,6 +51,25 @@ def _alloc_meta(**over):
     return types.SimpleNamespace(**base)
 
 
+def test_padding_onehot_rejects_the_scratch_row():
+    m = _alloc_meta(draft_probs_last_dim=0, dummy_slot_row=0, is_cuda_graph=False)
+    SpecMetadata.prepare_rejection_sampling_buffers(m)
+    assert m.dummy_slot_row == R
+    m.draft_probs.fill_(0.5)
+
+    SpecMetadata.write_padding_onehot_draft_probs(m, [0, R - 1], 2)
+    for slot in (0, R - 1):
+        assert torch.all(m.draft_probs[slot, :2, 0] == 1.0)
+        assert torch.all(m.draft_probs[slot, :2, 1:] == 0.0)
+        assert torch.all(m.draft_probs[slot, 2:] == 0.5)
+    assert torch.all(m.draft_probs[1 : R - 1] == 0.5)
+
+    for bad_slot in (R, -1):
+        with pytest.raises(RuntimeError, match="padding slot ids"):
+            SpecMetadata.write_padding_onehot_draft_probs(m, [bad_slot], 2)
+    assert torch.all(m.draft_probs[R] == 0.5)
+
+
 def test_prepare_buffers_allocates_when_enabled():
     # Shared draft/target vocab: draft_probs + batch_slot_ids are allocated;
     # full_draft_probs is skipped (only needed when the vocabs differ).
