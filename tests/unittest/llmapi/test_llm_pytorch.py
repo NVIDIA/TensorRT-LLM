@@ -26,15 +26,14 @@ from .lora_test_utils import (create_mock_nemo_lora_checkpoint,
                               compare_cuda_graph_lora_params_filler,
                               CUDAGraphLoRATestParams,
                               test_lora_with_and_without_cuda_graph)
-from .test_llm import (_test_llm_capture_request_error, get_model_path,
-                       global_kvcache_config, global_kvcache_config_no_reuse,
-                       llama_model_path, llm_get_stats_async_test_harness,
-                       llm_get_stats_test_harness,
-                       llm_return_logprobs_test_harness, llm_test_harness,
-                       prompts, run_llm_abort_request,
-                       sampling_params_for_aborting_request,
-                       run_llm_with_postprocess_parallel_and_result_handler,
-                       tinyllama_logits_processor_test_harness)
+from .test_llm import (
+    MyLogitsProcessor, _test_llm_capture_request_error, get_model_path,
+    global_kvcache_config, global_kvcache_config_no_reuse, llama_model_path,
+    llm_get_stats_async_test_harness, llm_get_stats_test_harness,
+    llm_return_logprobs_test_harness, llm_test_harness, prompts,
+    run_llm_abort_request, sampling_params_for_aborting_request,
+    run_llm_with_postprocess_parallel_and_result_handler,
+    tinyllama_logits_processor_test_harness)
 from utils.util import (force_ampere, similar, skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
@@ -75,6 +74,29 @@ def test_tinyllama_logits_processor(enable_chunked_prefill,
         backend="pytorch",
         enable_chunked_prefill=enable_chunked_prefill,
         return_context_logits=return_context_logits)
+
+
+@force_ampere
+@pytest.mark.part2
+def test_logits_processor_leaves_context_logits_unchanged():
+    # A per-request processor turns the context-logits plan off; the returned
+    # context logits must still be the model's own scores, as with the plan.
+    with LLM(llama_model_path,
+             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                           enable_block_reuse=False)) as llm:
+        biased_word_id = llm.tokenizer.encode("Z", add_special_tokens=False)[-1]
+        plain, processed = llm.generate(["A B C", "A B C"], [
+            SamplingParams(max_tokens=3, return_context_logits=True),
+            SamplingParams(max_tokens=3,
+                           return_context_logits=True,
+                           logits_processor=MyLogitsProcessor(biased_word_id)),
+        ])
+    assert processed.outputs[0].token_ids == [biased_word_id] * 3
+    assert torch.isfinite(processed.context_logits).all()
+    torch.testing.assert_close(processed.context_logits,
+                               plain.context_logits,
+                               rtol=0,
+                               atol=1e-3)
 
 
 @skip_ray

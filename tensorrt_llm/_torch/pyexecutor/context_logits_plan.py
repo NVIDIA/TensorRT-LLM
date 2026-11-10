@@ -71,15 +71,16 @@ def context_logits_rows(request: LlmRequest, *, context_logits_handled: bool) ->
     return 1
 
 
-def keep_sampled_context_rows(
+def store_context_logits_from_full_rows(
     context_requests: Sequence[LlmRequest], logits: torch.Tensor
 ) -> torch.Tensor:
-    """Drop the context rows the sampler does not read from logits that hold every token.
+    """Store context logits from logits that hold every context token; keep the sampling rows.
 
     Without the context-logits plan, a step that gathers context logits projects
-    every scheduled context token, for every context request. The sampler and
-    the logits post-processors expect only the requesting requests' chunks plus
-    one row for each other context request (see `context_logits_rows`).
+    every scheduled context token, for every context request. Storing the
+    requested chunks here, before any logits post-processor runs, keeps them the
+    model's own scores, as the plan does; what remains is the plan's layout, one
+    row per context request followed by the other rows.
 
     Args:
         context_requests: The step's context requests, in row order.
@@ -87,24 +88,26 @@ def keep_sampled_context_rows(
             first; rows after the context tokens are kept as they are.
 
     Returns:
-        ``logits`` itself when nothing is dropped, otherwise a new tensor.
+        ``[num_contexts + other_rows, vocab]``: the last row of each context
+        chunk, then the remaining rows.
     """
+    num_context_tokens = sum(request.context_chunk_size for request in context_requests)
+    if num_context_tokens > logits.shape[0]:
+        raise ValueError(
+            f"logits have {logits.shape[0]} rows, fewer than the "
+            f"{num_context_tokens} scheduled context tokens"
+        )
     keep: list[int] = []
     start = 0
     for request in context_requests:
-        chunk_size = request.context_chunk_size
+        end = start + request.context_chunk_size
         if request.py_return_context_logits:
-            keep.extend(range(start, start + chunk_size))
-        else:
-            keep.append(start + chunk_size - 1)
-        start += chunk_size
-    if len(keep) == start:
-        return logits
-    if start > logits.shape[0]:
-        raise ValueError(
-            f"logits have {logits.shape[0]} rows, fewer than the {start} scheduled context tokens"
-        )
+            store_context_logits(request, logits[start:end])
+        keep.append(end - 1)
+        start = end
     keep.extend(range(start, logits.shape[0]))
+    # A copy, so later in-place edits of the sampling rows cannot reach the
+    # stored context logits, which may still be views of ``logits``.
     return logits.index_select(0, torch.tensor(keep, device=logits.device))
 
 
