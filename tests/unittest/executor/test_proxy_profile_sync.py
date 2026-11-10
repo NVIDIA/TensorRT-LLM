@@ -176,7 +176,9 @@ def bare_proxy():
         socket = SimpleNamespace(
             setsockopt=lambda *args: None,
             get_monitor_socket=lambda **kwargs: SimpleNamespace(
-                poll=lambda timeout: False, close=lambda **kwargs: None
+                poll=lambda timeout: False,
+                getsockopt=lambda option: 0,
+                close=lambda **kwargs: None,
             ),
             disable_monitor=lambda: None,
         )

@@ -16,6 +16,7 @@
 """Single-owner command delivery and command-connection loss detection."""
 
 import collections
+import itertools
 
 # Only serializes executor commands; this owner does not deserialize input.
 import pickle  # nosec B403
@@ -108,14 +109,27 @@ class _RequestSender:
     dead. Losing an established direct connection makes delivery uncertain, so
     pending requests fail rather than replaying commands after reconnection.
 
-    With ``direct_send``, callers write queued commands themselves. CPython can
-    deny a waiting thread the GIL for as long as another thread keeps briefly
-    releasing it, as a busy asyncio loop does, so unbatched admission and loss
+    With ``direct_send``, callers can write queued commands themselves. CPython
+    can deny a waiting thread the GIL for as long as another thread keeps
+    briefly releasing it, as a busy asyncio loop does, so admission and loss
     detection must not depend on scheduling the owner thread. Every socket and
     monitor use then happens under the condition lock, without waiting while
     holding it, which provides the memory barrier libzmq requires when a socket
     changes threads. The owner retries non-blocking writes during backpressure
     and connection setup, enforces their deadlines, and performs shutdown.
+
+    Unbatched callers write each command at once. With batching, the owner
+    coalesces queued commands into one message; a caller that finds admission
+    full writes the backlog as one message instead of rejecting.
+
+    Code under the condition lock avoids calls that release the GIL where an
+    equivalent exists: it checks socket readiness with ``ZMQ_EVENTS`` rather
+    than ``zmq_poll`` and wakes the owner only when the owner has work. A thread
+    that releases the GIL while holding the lock must wait for the GIL again
+    before the lock is free; with another CPU-bound thread, each such release
+    can hold every caller for several switch intervals. For the same reason
+    the direct owner waits on an event, not the condition, and stays off the
+    lock while callers keep checking the connection.
     """
 
     MAX_BATCH_SIZE = 1024
@@ -123,6 +137,8 @@ class _RequestSender:
     MAX_PENDING_CONTROLS = 1024
     MAX_INFLIGHT_BATCHES = _COMMAND_QUEUE_HWM
     SEND_TIMEOUT = 0.05
+    # Callers check the connection on every send; the owner covers idle time.
+    IDLE_CHECK_INTERVAL = 0.2
     CONNECT_TIMEOUT = 5.0
 
     def __init__(
@@ -144,6 +160,10 @@ class _RequestSender:
         self._pending = collections.deque()
         self._pending_requests = 0
         self._pending_controls = 0
+        self._capacity_waiters = 0
+        # The direct owner waits on this event rather than the condition.
+        self._owner_wake = threading.Event()
+        self._connection_checked = float("-inf")
         self._pending_cancel_ids: set[int] = set()
         self._stop_workers_on_failure = stop_workers_on_failure
         self._cond = threading.Condition()
@@ -157,7 +177,7 @@ class _RequestSender:
         self._connection = _CommandConnection()
         self._connection_lost: ConnectionError | None = None
         self._connected = False
-        self._direct_send = direct_send and not batching
+        self._direct_send = direct_send
         self._close_deadline = float("inf")
         self._ready = threading.Event()
         with self._cond:
@@ -204,7 +224,11 @@ class _RequestSender:
                     break
                 if not wait_for_capacity:
                     raise EngineUnavailableError("Executor command queue is full")
-                self._cond.wait(self.SEND_TIMEOUT if self._direct_send else None)
+                self._capacity_waiters += 1
+                try:
+                    self._cond.wait(self.SEND_TIMEOUT if self._direct_send else None)
+                finally:
+                    self._capacity_waiters -= 1
                 self._check_admission()
             self._pending.append((payload, control, cancellation_id))
             if cancellation_id is not None:
@@ -213,8 +237,13 @@ class _RequestSender:
                 self._pending_controls += 1
             else:
                 self._pending_requests += 1
-            self._write_pending_locked()
-            self._cond.notify_all()
+            if not self._batching:
+                self._write_pending_locked()
+            # A command left queued needs the owner, and a write may have made
+            # room for a caller waiting for capacity. Waking the owner after it
+            # has nothing to do costs every caller GIL handoffs under load.
+            if self._pending or self._capacity_waiters:
+                self._wake_locked()
 
     def _write_pending_locked(self, *, owner: bool = False) -> None:
         """Write queued commands in order without waiting for the socket."""
@@ -225,25 +254,34 @@ class _RequestSender:
         self._poll_connection_locked()
         if self._connection_lost is not None:
             # The owner fails accepted work; nothing may follow a lost peer.
-            self._cond.notify_all()
+            self._wake_locked()
             return
+        size = self.MAX_BATCH_SIZE if self._batching else 1
         while self._pending:
-            item = self._pending[0]
+            items = list(itertools.islice(self._pending, size))
             try:
-                self._request_queue.put([item[0]], timeout=0)
+                # A zero timeout checks writability without zmq_poll, which
+                # would release the GIL while the condition lock is held.
+                self._request_queue.put([item[0] for item in items], timeout=0)
             except zmq.Again:
                 # The owner retries during backpressure or connection setup.
                 return
             except Exception:
                 if owner:
                     raise
-                # The owner retries the same command and records the failure.
-                self._cond.notify_all()
+                # The owner retries the same commands and records the failure.
+                self._wake_locked()
                 return
-            self._pending.popleft()
+            for _ in items:
+                self._pending.popleft()
             self._connected = True
-            self._mark_taken((item,))
-            self._mark_sent((item,))
+            self._mark_taken(items)
+            self._mark_sent(items)
+
+    def _wake_locked(self) -> None:
+        """Wake callers waiting on the condition and the direct owner."""
+        self._cond.notify_all()
+        self._owner_wake.set()
 
     def _mark_taken(self, items) -> None:
         for _, control, cancellation_id in items:
@@ -278,7 +316,7 @@ class _RequestSender:
             self._pending_controls = self._pending_requests = 0
             if not self._is_finalizing():
                 self._start()
-            self._cond.notify_all()
+            self._wake_locked()
 
     def close(
         self,
@@ -299,17 +337,20 @@ class _RequestSender:
             self._send_sentinel |= send_sentinel
             self._start()
             thread = self._thread
-            self._cond.notify_all()
+            self._wake_locked()
         if thread is not threading.current_thread():
             thread.join(timeout)
             if thread.is_alive():
                 self._record_failure(TimeoutError("Executor command sender shutdown timed out"))
 
     def _peer_attached(self) -> bool:
-        return bool(self._request_queue.socket.poll(0, zmq.POLLOUT))
+        return bool(self._request_queue.socket.getsockopt(zmq.EVENTS) & zmq.POLLOUT)
 
     def _poll_connection_locked(self) -> None:
-        while self._monitor.poll(0):
+        self._connection_checked = time.monotonic()
+        # ZMQ_EVENTS processes pending socket commands like zmq_poll, but
+        # without releasing the GIL while the condition lock is held.
+        while self._monitor.getsockopt(zmq.EVENTS) & zmq.POLLIN:
             message = recv_monitor_message(self._monitor)
             event = message["event"]
             if event == zmq.EVENT_HANDSHAKE_SUCCEEDED:
@@ -377,13 +418,23 @@ class _RequestSender:
             return items
 
     def _run_direct(self) -> None:
-        """Retry queued writes, leaving the socket to callers between attempts."""
+        """Retry queued writes, leaving the socket to callers between attempts.
+
+        The owner waits on its own event because a condition wait always takes
+        the lock back, competing with callers. With nothing queued, it checks
+        the connection only after callers have not checked it for
+        ``IDLE_CHECK_INTERVAL``, so it does not compete with active callers for
+        the lock or the GIL and still detects the loss of an idle connection.
+        """
         connect_deadline = None
-        with self._cond:
-            while True:
+        while True:
+            # Cleared before the state is read, so no wake-up is lost.
+            self._owner_wake.clear()
+            with self._cond:
                 self._check_terminal()
                 self._write_pending_locked(owner=True)
-                if not self._pending:
+                retry = bool(self._pending)
+                if not retry:
                     if self._closed:
                         return
                     connect_deadline = None
@@ -396,7 +447,15 @@ class _RequestSender:
                             raise TimeoutError("Executor command connection timed out")
                     if now >= self._close_deadline:
                         raise TimeoutError("Executor command sender shutdown timed out")
-                self._cond.wait(self.SEND_TIMEOUT)
+            # A caller that leaves a command queued, closes or fails the sender
+            # sets the event. Queued commands are not read here: a caller can
+            # hold one while it writes it, and waking for it would only wait
+            # for that caller's lock.
+            while not self._owner_wake.wait(
+                self.SEND_TIMEOUT if retry else self.IDLE_CHECK_INTERVAL
+            ):
+                if retry or time.monotonic() - self._connection_checked >= self.IDLE_CHECK_INTERVAL:
+                    break
 
     def _run(self) -> None:
         try:
