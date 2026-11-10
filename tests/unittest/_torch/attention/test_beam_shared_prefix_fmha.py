@@ -20,10 +20,12 @@ requires a GPU plus the model checkpoint.
 """
 
 import functools
+import gc
 import math
 import os
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from utils.llm_data import llm_models_root
@@ -33,13 +35,22 @@ from tensorrt_llm._torch.attention.backends.fmha.beam_shared_prefix import (
     BeamSharedPrefixFmha,
     _BeamStepState,
     _Config,
+    _create_wrapper,
+    _float_workspace,
+    _get_float_workspace,
     _HostPlan,
+    _plan_wrapper,
+    _PlanKey,
     _step_indices,
     _StepIndices,
     fused_tail_and_merge,
     merge_prefix_and_tail,
     metadata_eligible,
     plan_step,
+)
+from tensorrt_llm._torch.attention.backends.fmha.shared_prefix_fa4 import (
+    PrefixGroups,
+    prefix_request_tables,
 )
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -414,6 +425,102 @@ def test_plan_step_drops_the_previous_plan_when_a_step_is_not_planned(monkeypatc
     declined.fmha_plan_caches = meta.fmha_plan_caches
     plan_step(declined)
     assert state.plan is None
+
+
+def test_prefix_request_tables_chunk_skip_empty_groups_and_size_the_last_page():
+    i32 = lambda *v: np.array(v, dtype=np.int32)  # noqa: E731
+    # Group 0: 200 queries over 3 pages (last holds 1 token); group 1: empty; group 2: 4 queries.
+    groups = PrefixGroups(
+        num_groups=3,
+        qo_indptr=i32(0, 200, 200, 204),
+        prefix_indptr=i32(0, 3, 3, 5),
+        prefix_indices=i32(10, 11, 12, 20, 21),
+        prefix_last_page_len=i32(1, 1, 16),
+    )
+    tables, seq_lens, cum_q, cum_kv = prefix_request_tables(
+        groups, tokens_per_block=32, chunk_tokens=128, num_requests=5, max_pages=4
+    )
+    assert seq_lens.tolist() == [65, 65, 48, 0, 0]  # (count - 1) * 32 + last page
+    assert tables[0, :3].tolist() == tables[1, :3].tolist() == [10, 11, 12]
+    assert tables[2, :2].tolist() == [20, 21]
+    assert cum_q.tolist() == [0, 128, 200, 204, 204, 204]
+    assert cum_kv.tolist() == [0, 65, 130, 178, 178, 178]
+    with pytest.raises(RuntimeError, match="more prefix requests"):
+        prefix_request_tables(groups, 32, 128, num_requests=2, max_pages=4)
+
+
+def test_float_workspace_is_owned_per_kv_cache_manager_and_released_with_it():
+    class Manager:
+        pass
+
+    cpu = torch.device("cpu")
+    first, second = Manager(), Manager()
+    a = _get_float_workspace(first, cpu, 1024)
+    assert _get_float_workspace(first, cpu, 1024) is a
+    assert _get_float_workspace(second, cpu, 1024) is not a
+    del second
+    gc.collect()
+    assert len(_float_workspace) == 1
+
+
+@needs_flashinfer
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_replanning_a_cuda_graph_wrapper_does_not_wait_for_the_gpu():
+    """Under CUDA graphs every step re-plans the wrapper; that must not synchronize the stream
+    (it would serialize the host with the previous step and defeat the overlap scheduler)."""
+
+    class Manager:
+        max_blocks_per_seq = 8
+        max_batch_size = 2
+        max_beam_width = 4
+
+    device = torch.device("cuda")
+    metadata = SimpleNamespace(
+        kv_cache_block_offsets=torch.zeros(1, device=device),
+        kv_cache_manager=Manager(),
+        tokens_per_block=16,
+    )
+    plan = _HostPlan(
+        step=1,
+        num_requests=2,
+        beam_width=4,
+        qo_indptr=torch.tensor([0, 4, 8], dtype=torch.int32),
+        paged_kv_indptr=torch.tensor([0, 3, 5], dtype=torch.int32),
+        paged_kv_indices=torch.tensor([3, 4, 5, 8, 9], dtype=torch.int32),
+        paged_kv_last_page_len=torch.tensor([5, 16], dtype=torch.int32),
+        tail_len=8,
+    )
+    state = SimpleNamespace(
+        is_cuda_graph=True,
+        plan=plan,
+        planned_step={},
+        config=_Config(backend="fa2", fused_tail=True, check=False, max_tail=8),
+    )
+    key = _PlanKey(8, 2, 64, torch.bfloat16, 0.125)
+    wrapper = _create_wrapper(state, key, metadata)
+    _plan_wrapper(state, key, wrapper, metadata)  # warm up (builds the plan module)
+    torch.cuda.synchronize()
+
+    torch.cuda._sleep(2_000_000_000)  # keep the stream busy for about a second
+    busy = torch.cuda.Event()
+    busy.record()
+    _plan_wrapper(state, key, wrapper, metadata)
+    returned_while_busy = not busy.query()
+    torch.cuda.synchronize()
+    assert returned_while_busy, "re-planning waited for the GPU stream"
+
+
+def test_run_generation_without_a_step_plan_runs_the_regular_kernel():
+    """The manager caches a selection by batch shape, so an unplanned batch can reach the
+    library: it must fall back instead of failing the step."""
+    lib = object.__new__(BeamSharedPrefixFmha)
+    calls = []
+    lib._context_impl = SimpleNamespace(run_generation=calls.append)
+    params = SimpleNamespace(
+        attn=None, meta=SimpleNamespace(fmha_plan_caches={}), qkv_input=torch.zeros(1)
+    )
+    lib.run_generation(params)
+    assert calls == [params]
 
 
 @needs_flashinfer
