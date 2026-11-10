@@ -1421,14 +1421,28 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     // Keep-disk-copy: a fallen page whose copy is retained at this level takes that slot back, so it needs no free
     // slot here. Pin those copies, then reclaim other retained copies only for what eviction cannot cover.
     PagesByLifeCycle keptPages(numLifeCycles());
+    // Kept pages came out of the caller's fallenPages, which may hold their only references. If this frame fails
+    // before accepting them, hand them back so the caller's rollback reschedules them instead of dropping them.
+    bool keptPagesAccepted = false;
     auto unpinKeptPages = FuncGuard(
         [&]()
         {
-            for (auto const& pages : keptPages)
+            for (LifeCycleId lifeCycle{0}; lifeCycle < keptPages.size(); ++lifeCycle)
             {
-                for (auto const& page : pages)
+                for (auto& page : keptPages.at(lifeCycle))
                 {
                     pinRetainedCopy(*page, lvlId, false);
+                    if (!keptPagesAccepted)
+                    {
+                        try
+                        {
+                            fallenPages.at(lifeCycle).push_back(std::move(page));
+                        }
+                        catch (std::exception const&)
+                        {
+                            // Out of memory while unwinding: the page is dropped, as it would be without the guard.
+                        }
+                    }
                 }
             }
         });
@@ -1674,6 +1688,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         auto& accepted = acceptedPages.at(lifeCycle);
         accepted.insert(accepted.end(), keptPages.at(lifeCycle).begin(), keptPages.at(lifeCycle).end());
     }
+    keptPagesAccepted = true;
 
     for (PoolGroupIndex pgIdx{0}; pgIdx < grouping.numPoolGroups(); ++pgIdx)
     {
