@@ -37,9 +37,10 @@ from .base import CutlassFusedMoEBase
 from .eligibility import BF16_ONLY, SmSupport, check_cutlass_leaf
 from .identity import TECHNIQUE_TRITON, cutlass_descriptor
 
-# (N, K, BLOCK_SIZE_M) GEMM autotune keys prewarm_decode_kernels has tuned. The
-# autotuner cache is per process, and the layers of a model share their shapes.
-_prewarmed_gemm_keys: set[tuple[int, int, int]] = set()
+# (N, K, BLOCK_SIZE_M, top_k) GEMM keys prewarm_decode_kernels has tuned: the
+# autotune key plus top_k, a constexpr of the kernels. The autotuner cache is per
+# process, and the layers of a model share their shapes.
+_prewarmed_gemm_keys: set[tuple[int, int, int, int]] = set()
 
 
 @register_moe_impl
@@ -83,7 +84,7 @@ class TrtllmTritonFp8BlockScalesImpl(CutlassFusedMoEBase):
 
     def prewarm_decode_kernels(self, max_num_tokens: int, verify_batches: bool) -> int:
         """Tune both GEMMs at every tile height a forward of up to ``max_num_tokens``
-        tokens per rank reaches; returns the number of autotune keys tuned.
+        tokens per rank reaches; returns the number of GEMM keys tuned.
 
         The decode-kernel prewarm hook ``DecoderWarmup`` calls on every module
         that defines it. Otherwise each tile height is tuned by the first forward
@@ -106,8 +107,8 @@ class TrtllmTritonFp8BlockScalesImpl(CutlassFusedMoEBase):
         for num_tokens in token_counts:
             block_size_m = _block_size_m(num_tokens, top_k, num_local_experts)
             keys = {
-                (*self.w3_w1_weight.shape[1:], block_size_m),
-                (*self.w2_weight.shape[1:], block_size_m),
+                (*self.w3_w1_weight.shape[1:], block_size_m, top_k),
+                (*self.w2_weight.shape[1:], block_size_m, top_k),
             } - _prewarmed_gemm_keys
             if not keys:
                 continue
