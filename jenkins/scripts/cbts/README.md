@@ -130,7 +130,7 @@ jenkins/scripts/cbts/                  outer vendor dir — put on PYTHONPATH fo
 │   │   │   └── touch_db.py   read-only accessor over cbts_touchmap.sqlite + the untrusted-capture signals
 │   │   └── collection/    post-merge collection that produces the touch DB (see its README / COLLECTION.md)
 │   └── command/           unified CLI, `python -m cbts.command ...`
-│       ├── main.py        `main` — CLI entry + Selector + SelectionResult + scope combine + trigger-mode filter
+│       ├── main.py        `main` — CLI entry + Selector + SelectionResult + scope combine
 │       ├── dryrun.py       `dryrun` — replay CBTS over historical commits → per-PR summary.txt + filtered YAMLs + INDEX.md (debug only)
 │       ├── report_decision.py  `report-decision` — post the decision (hit-stage count, case-level skip rate, fallback) to OpenSearch for CI-health monitoring
 │       └── coverage/
@@ -212,13 +212,12 @@ Stage patterns match original stage names even when narrowed stages have a
 repartitioned across the selected shards. An explicitly selected shard 6 can
 therefore execute as group 1/1 while retaining its stage name with `-cbts`.
 
-## Trigger-mode filter
+## Stage scheduling
 
-The Python CLI's `pr.post_merge` input defaults to false, excluding Post-Merge
-stages. Jenkins requests decisions over both pre-merge and Post-Merge stages;
-its command-stage filter then determines which stages can actually run. This
-allows `--stage-list` and `--extra-stage` to select Post-Merge stages without
-requiring `--post-merge` or allowing other Post-Merge stages into the run.
+The Python selector returns affected candidates across pre-merge and Post-Merge
+stages without filtering by trigger mode. Jenkins does not pass `post_merge` to
+the selector. Groovy alone applies the command-selected stage scope, including
+explicit `--stage-list` / `--extra-stage` requests and `--post-merge`.
 
 ## How it's invoked (CI)
 
@@ -237,8 +236,7 @@ INPUT_JSON:
 ```json
 {
   "changed_files": ["tests/..."],
-  "diffs": {"tests/...": "@@ ..."},
-  "post_merge": false
+  "diffs": {"tests/...": "@@ ..."}
 }
 ```
 
