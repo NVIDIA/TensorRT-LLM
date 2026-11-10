@@ -15,14 +15,14 @@ vendors:
   flashinfer-prims-ts:
     url: https://github.com/bastianhagedorn/flashinfer.git
     branch: trtllm-prims-ts-decode-corr-cluster-acquire-20261107
-    commit: 2326abc10182b08b2d8da787075cf3da19273457
+    commit: 1d1bece82fece8d806ca0dd560121be03c85b990
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention/backends/prims_ts
     include:
     - '**/*.py'
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
     patch_digest: sha256:f35ef4d096314a21c710b849b0a1f731cf1edbf50d32cdee46b635f45fe6b47a
-    digest: sha256-tree-v1:1305bb28ef2137b76e25d2d31d5d05b3dc240ecaa05651b2413fbf95ccc91470
+    digest: sha256-tree-v1:18bf28009105207c4a0ad089fc63e208cc63f86f3bd5137e8c29855b302ede96
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0

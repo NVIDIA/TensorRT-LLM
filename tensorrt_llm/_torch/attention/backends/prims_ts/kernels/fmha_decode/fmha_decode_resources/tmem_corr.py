@@ -504,16 +504,23 @@ class TmemCorrResource(DecodeGenResourceBase):
     ) -> None:
         """Wait for all peer async cluster partial stores before local reduction."""
         _ = self
-        # Give every correction lane one nonblocking acquire attempt. When the
+        # Give every correction lane one nonblocking wait attempt. When the
         # short transaction is already complete this preserves the all-lane
         # fast path; otherwise only lane 0 continues polling. The existing
         # correction-group barrier publishes lane 0's ready point before any
         # reducer lane reads the distributed-SMEM partials.
         # The peers' st.async complete-tx releases at cluster scope, so the
-        # acquire must be at cluster scope too; the default CTA scope does not
-        # synchronize with a thread of another CTA.
+        # wait must observe it at cluster scope; the default CTA scope does
+        # not synchronize with a thread of another CTA. The wait itself is
+        # relaxed and the acquire is a fence restricted to shared::cluster,
+        # which orders the distributed-SMEM reads without the L1 invalidation
+        # an acquire.cluster wait would cost.
         cluster_transaction_ready = prims.mbarrier_try_wait_parity(
-            mbarrier, 0, time_limit=0, scope=prims.MBarrierScope.CLUSTER
+            mbarrier,
+            0,
+            time_limit=0,
+            scope=prims.MBarrierScope.CLUSTER,
+            order=prims.MemOrder.RELAXED,
         )
         if warp_grp_thread_idx == Int32(0):
             while not cluster_transaction_ready:
@@ -522,7 +529,9 @@ class TmemCorrResource(DecodeGenResourceBase):
                     0,
                     time_limit=10_000_000,
                     scope=prims.MBarrierScope.CLUSTER,
+                    order=prims.MemOrder.RELAXED,
                 )
+        prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
         prims.barrier_cta_sync(barrier_id, thread_count=barrier_threads)
 
     @cute.jit
