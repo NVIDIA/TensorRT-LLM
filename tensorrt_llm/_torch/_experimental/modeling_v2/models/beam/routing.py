@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from ..._router_index import NoTarget
+from .full_model_nvfp4__sm_103__tp4.limits import MAX_NUM_TOKENS
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
@@ -40,37 +41,44 @@ def speculation_refusal(spec_config: Any, llm_args: Optional[Any] = None) -> Opt
     mode = getattr(spec_config, "spec_dec_mode", None)
     if mode is None or not mode.is_dflash():
         return f"speculative decoding {type(spec_config).__name__} is not DFlash"
+    reasons = []
     if spec_config.speculative_model is None:
-        return "DFlash needs its drafter checkpoint (speculative_model)"
+        reasons.append("DFlash needs its drafter checkpoint (speculative_model)")
     if spec_config.attention_backend != "TRTLLM":
-        return (
+        reasons.append(
             f"DFlash attention_backend {spec_config.attention_backend!r}; the drafter's context "
             "lives in paged KV-cache layers, which only the TRTLLM backend reads"
         )
     if spec_config.max_draft_len != DFLASH_MAX_DRAFT_LEN:
-        return f"DFlash max_draft_len {spec_config.max_draft_len}, not {DFLASH_MAX_DRAFT_LEN}"
+        reasons.append(
+            f"DFlash max_draft_len {spec_config.max_draft_len}, not {DFLASH_MAX_DRAFT_LEN}"
+        )
     if spec_config.draft_len_schedule:
-        return "a DFlash draft_len_schedule changes the verification width per step"
+        reasons.append("a DFlash draft_len_schedule changes the verification width per step")
     if spec_config.use_rejection_sampling:
-        return "DFlash rejection sampling; verification is strict greedy"
-    if llm_args is not None and not llm_args.disable_overlap_scheduler:
-        return "the overlap scheduler with DFlash"
-    return None
+        reasons.append("DFlash rejection sampling; verification is strict greedy")
+    if llm_args is not None and not getattr(llm_args, "disable_overlap_scheduler", True):
+        reasons.append("the overlap scheduler with DFlash")
+    return "; ".join(reasons) or None
 
 
 def engine_refusal(llm_args: Optional[Any]) -> Optional[str]:
-    """Why the engine's per-step token budget exceeds what the target computes, or None.
+    """Report all unsupported scheduling options and token budgets for this eager target.
 
-    The target runs at most ``model.MAX_NUM_TOKENS`` tokens per call (the attention op's
-    measured step size), so ``max_num_tokens`` must lie in ``[1, MAX_NUM_TOKENS]``.
+    CUDA graphs and overlap scheduling are unsupported by this target's host-synchronizing
+    expert provider. The per-step token budget must lie in ``[1, MAX_NUM_TOKENS]``.
     """
-    if llm_args is None or getattr(llm_args, "max_num_tokens", None) is None:
+    if llm_args is None:
         return None
-    from .full_model_nvfp4__sm_103__tp4.model import MAX_NUM_TOKENS
-
-    if not 1 <= llm_args.max_num_tokens <= MAX_NUM_TOKENS:
-        return f"max_num_tokens {llm_args.max_num_tokens} is outside [1, {MAX_NUM_TOKENS}]"
-    return None
+    reasons = []
+    if getattr(llm_args, "cuda_graph_config", None) is not None:
+        reasons.append("CUDA graphs are not supported by this eager Beam target")
+    if not getattr(llm_args, "disable_overlap_scheduler", True):
+        reasons.append("the overlap scheduler is not supported by this eager Beam target")
+    max_tokens = getattr(llm_args, "max_num_tokens", None)
+    if max_tokens is not None and not 1 <= max_tokens <= MAX_NUM_TOKENS:
+        reasons.append(f"max_num_tokens {max_tokens} is outside [1, {MAX_NUM_TOKENS}]")
+    return "; ".join(reasons) or None
 
 
 def checkpoint_refusal(pretrained_config: Any, spec_config: Optional[Any]) -> Optional[str]:

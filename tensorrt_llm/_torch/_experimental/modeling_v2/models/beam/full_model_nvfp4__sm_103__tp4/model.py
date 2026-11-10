@@ -55,11 +55,10 @@ from tensorrt_llm.mapping import Mapping as ParallelMapping
 
 from . import _attention
 from .component import BeamCheckpointLayoutNvfp4Sm103Tp4
+from .limits import MAX_NUM_TOKENS
 
 #: Logical decoder layers, all executed by every call.
 NUM_LAYERS = 52
-#: Tokens per call of the supported deployment (its native ``max_num_tokens``).
-MAX_NUM_TOKENS = 8192
 #: KV cache page size of the supported deployment.
 TOKENS_PER_BLOCK = 32
 

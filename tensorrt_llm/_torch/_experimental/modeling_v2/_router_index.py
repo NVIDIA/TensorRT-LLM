@@ -204,7 +204,15 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None
-        logger.info(
-            f"modeling_v2: no target fits {arch!r} ({why}); using the built-in implementation"
-        )
+        from ...models.modeling_auto import AutoModelForCausalLM
+
+        if AutoModelForCausalLM._resolve_class(config) is None:
+            logger.warning(
+                f"modeling_v2: no target fits {arch!r} ({why}); "
+                "no built-in implementation is available as a fallback"
+            )
+        else:
+            logger.info(
+                f"modeling_v2: no target fits {arch!r} ({why}); using the built-in implementation"
+            )
         return None
