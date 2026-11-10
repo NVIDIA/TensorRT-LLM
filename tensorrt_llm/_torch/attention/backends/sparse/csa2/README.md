@@ -131,16 +131,18 @@ on load to the bytes the context FP8 quantizer writes, and follows the trtllm-ge
 FP8 softmax (P rounded to E4M3 after scaling by 448, FP32 row sums, sink in the
 denominator).
 
-With legacy scaled SWA storage, native generation steps of at most 16 query rows
-per rank instead attend the selected rows straight from the persistent caches
-(`direct_decode.py`): one CuTe DSL launch decodes the SWA and main rows exactly
-into BF16 shared memory and attends them with the BF16 query and the sink, so
-neither the FP8 staging nor the native FMHA runs. The backend decides per tile in
+Generation steps of at most 16 query rows per rank can instead attend the selected
+rows straight from the persistent caches (`direct_decode.py`): one CuTe DSL launch
+decodes the SWA rows (528-byte scaled or 512-byte unit-scale E4M3 records) and main
+rows exactly into BF16 shared memory and attends them with the BF16 query and the
+sink, so neither the FP8 staging nor the native FMHA runs, and PrimTS skips its
+selection compaction and split-KV reduction. The backend decides per tile in
 `direct_decode_applies` (generation-only forwards without context tokens,
-528-byte scaled SWA records, SM100/SM103/SM107, a geometry that fits one CTA's
-shared memory); every layer of such a forward takes it. Larger native batches
-keep the format-aware staging path unless the fused decode below takes them, and
-payload-only FP8 SWA always stages; PrimTS remains direct for both SWA formats.
+SM100/SM103/SM107, a geometry that fits one CTA's shared memory): native FP8 staging
+takes it with 528-byte scaled SWA records and PrimTS with either SWA format; every
+layer of such a forward takes it. Larger native batches keep the format-aware staging
+path unless the fused decode below takes them, native payload-only FP8 SWA always
+stages, and larger PrimTS batches run PrimTS.
 
 Other generation tiles with 64 query heads per rank over 528-byte scaled SWA
 records, except the `gen_fmha` tiles below, do not stage either:

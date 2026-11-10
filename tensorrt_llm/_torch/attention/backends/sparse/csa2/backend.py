@@ -166,7 +166,14 @@ class CSA2TrtllmAttention(TrtllmAttention):
             if owners:
                 widths.add(128 + (layout.index_topk + 127) // 128 * 128)
             device = torch.device("cuda", torch.cuda.current_device())
-            # Generation tiles of up to one step's queries take a selection bank.
+            # Generation tiles of up to one step's queries take a selection bank, with an
+            # owner slot per row of the largest layer's MAIN pool.
+            main_pool_rows = (
+                max_batch_size
+                * max(1, max_seq_len // min(layout.compress_ratios[i] for i in owners))
+                if owners
+                else 0
+            )
             reserve = sum(
                 workspace_reservation_bytes(
                     device,
@@ -174,6 +181,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
                     width,
                     max_num_tokens,
                     generation_queries=min(max_num_tokens, query_capacity),
+                    main_pool_rows=main_pool_rows,
                 )
                 for width in widths
             )
@@ -370,11 +378,11 @@ class CSA2TrtllmAttention(TrtllmAttention):
             )
 
     def forward(self, q, k, v, metadata, forward_args=None, **kwargs):
-        if not self.native_fp8:
-            return super().forward(q, k, v, metadata, forward_args=forward_args, **kwargs)
         args = merge_attention_forward_args(forward_args, kwargs)
         if self.direct_decode_applies(q, metadata, args):
             return self._forward_direct(q, metadata, args)
+        if not self.native_fp8:
+            return super().forward(q, k, v, metadata, forward_args=forward_args, **kwargs)
         state = getattr(args.sparse_backend_args, "state", None)
         if state is not None and state.query_rope is not None:
             raise ValueError("Only the CSA2 direct decode applies the query RoPE itself")
@@ -412,6 +420,8 @@ class CSA2TrtllmAttention(TrtllmAttention):
             and forward_args.attention_input_type == AttentionInputType.generation_only
             and metadata.num_contexts == 0
             and metadata.shared_plan is None
+            # A module's tile of this backend: PrimTS plans packed tiles, native ones staged.
+            and metadata.kv_input_mode == self.kv_input_mode
             and self.direct_decode_serves(
                 metadata.num_tokens,
                 context_tokens,
@@ -422,13 +432,20 @@ class CSA2TrtllmAttention(TrtllmAttention):
 
     def direct_decode_serves(self, rows, context_tokens, main_width, device) -> bool:
         """The forward-level part of ``direct_decode_applies``: the module asks it before
-        projecting, to leave the query RoPE to the launch. The launch only decodes legacy
-        scaled SWA records; payload-only FP8 uses the format-aware staging path."""
+        projecting, to leave the query RoPE to the launch. The launch decodes either SWA format;
+        native FP8 staging takes it for legacy scaled SWA records only (payload-only FP8 uses
+        the format-aware staging path), and PrimTS, which reads the packed pools too, for both.
+        """
         from .direct_decode import MAX_ROWS, direct_decode_device_supported, direct_decode_fits
 
         return (
-            self.native_fp8
-            and self.swa_cache_format == "swa"
+            (
+                (self.native_fp8 and self.swa_cache_format == "swa")
+                or (
+                    self.compute_backend == "prims_ts"
+                    and self.swa_cache_format in ("swa", "swa_fp8")
+                )
+            )
             and not self.sparse_params.use_packed_sparse_attention
             and context_tokens == 0
             and 0 < rows <= MAX_ROWS

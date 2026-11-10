@@ -1227,7 +1227,7 @@ def test_prims_ts_workspace_reservation_honors_packed_sources_and_head_sharding(
 ) -> None:
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import backend, prims_ts
     from tensorrt_llm._torch.attention.backends.sparse.csa2._prims_ts_bank import (
-        main_bank_rows_limit,
+        main_bank_reserved_rows,
         main_records_rows_limit,
     )
 
@@ -1250,19 +1250,29 @@ def test_prims_ts_workspace_reservation_honors_packed_sources_and_head_sharding(
         width: int,
         queries: int,
         generation_queries: int = 0,
+        main_pool_rows: int = 0,
     ) -> int:
-        calls.append((device, heads, width, queries, generation_queries))
+        calls.append((device, heads, width, queries, generation_queries, main_pool_rows))
         arena_bytes = 4096 + 4 * queries * (width + 2)
-        # Widths with MAIN rows also retain the device's bounded context MAIN bank and its
-        # one-byte row marks, and the selection bank of the largest generation tile.
+        # Widths with MAIN rows also retain the reserved rows of the device's context MAIN
+        # bank and its one-byte row marks, and the selection bank of the largest generation
+        # tile with an INT64 owner slot per MAIN pool row.
         bank_bytes = 0
         if width > 128:
             selections = generation_queries * (width - 128)
-            bank_bytes = main_bank_rows_limit() * 513 + 512 * min(
-                max(selections, main_bank_rows_limit()), main_records_rows_limit()
+            bank_bytes = main_bank_reserved_rows() * 513 + 512 * min(
+                max(selections, main_bank_reserved_rows()), main_records_rows_limit()
             )
+            bank_bytes += 8 * (main_pool_rows + 1)
         assert (
-            reserve(device, heads, width, queries, generation_queries=generation_queries)
+            reserve(
+                device,
+                heads,
+                width,
+                queries,
+                generation_queries=generation_queries,
+                main_pool_rows=main_pool_rows,
+            )
             == arena_bytes + bank_bytes
         )
         return 101
@@ -1284,12 +1294,14 @@ def test_prims_ts_workspace_reservation_honors_packed_sources_and_head_sharding(
     widths = {128} if swa_only else {128, 640}
     assert {call[2] for call in calls} == widths
     assert len(calls) == len(widths)
-    for device, heads, _, queries, generation_queries in calls:
+    for device, heads, _, queries, generation_queries, main_pool_rows in calls:
         assert device == torch.device("cuda", 0)
         assert heads == (128 if attention_dp else 64)
         assert queries == 8
         # One generation step of max_batch_size requests, one token each without drafts.
         assert generation_queries == 2
+        # max_batch_size requests of max_seq_len rows at the KV source's ratio of 1.
+        assert main_pool_rows == (0 if swa_only else 2 * 512)
     config.sparse_attention_config.use_fp8_staging = True
     native = backend.CSA2TrtllmAttention.runtime_workspace_fixed_bytes(config, mapping, **kwargs)
     assert automatic == native + 101 * len(widths)
@@ -3537,7 +3549,9 @@ def test_prims_ts_metadata_main_bank_rows() -> None:
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
-def test_prims_ts_main_bank_plan(manager_requests):
+def test_prims_ts_main_bank_plan(manager_requests, monkeypatch):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_bank
+
     manager, requests = manager_requests
     metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager)
     _prepare(metadata, requests, [0, 0], [3, 2])
@@ -3574,3 +3588,9 @@ def test_prims_ts_main_bank_plan(manager_requests):
     assert bank(q, 512, 1, query_start=0) is None
     assert bank(q[:3], 512, 1, query_start=0, kv_input_mode="packed") is None
     assert bank(q, 512, None, query_start=0, kv_input_mode="packed") is None
+    # A phase that owns more MAIN rows than the reservation covers keeps its bank up to the
+    # bank's row limit, and decodes in the kernel past it.
+    monkeypatch.setattr(_prims_ts_bank, "_RESERVED_BANK_BYTES", 512)
+    assert metadata._prims_ts_main_bank(q, 512, 1) is not None
+    monkeypatch.setattr(_prims_ts_bank, "_MAX_BANK_BYTES", (owner_rows - 1) * 512)
+    assert metadata._prims_ts_main_bank(q, 512, 1) is None

@@ -26,7 +26,9 @@ if TYPE_CHECKING:
 __all__ = [
     "decode_main_bank",
     "decode_main_records",
+    "dedup_main_records",
     "main_bank_marks",
+    "main_bank_reserved_rows",
     "main_bank_rows_limit",
     "main_bank_storage",
     "main_records_rows_limit",
@@ -40,16 +42,24 @@ _WARPS = 8
 # Rows a warp owns, and how many of them it reads before converting any.
 _GROUP = 8
 _BATCH = 4
-# Bank storage is retained per device and bounded, so it is reserved with the
-# PrimTS workspace; larger phases keep decoding MAIN rows inside the kernel.
-_MAX_BANK_BYTES = 64 << 20
+# Bank storage is retained per device. The PrimTS workspace reservation covers its first
+# _RESERVED_BANK_BYTES; a phase that owns more MAIN rows, such as a chunk of long cached
+# contexts, grows it on demand up to _MAX_BANK_BYTES. Larger phases keep decoding MAIN rows
+# inside the kernel.
+_RESERVED_BANK_BYTES = 64 << 20
+_MAX_BANK_BYTES = 1 << 30
 _BANK_CACHE_KEY = "csa2_prims_ts_main_bank"
 _MARKS_CACHE_KEY = "csa2_prims_ts_main_bank_marks"
 
 
 def main_bank_rows_limit() -> int:
-    """Most MAIN rows one bank holds; also the bound its reservation covers."""
+    """Most MAIN rows one context bank holds."""
     return _MAX_BANK_BYTES // _BANK_ROW_BYTES
+
+
+def main_bank_reserved_rows() -> int:
+    """Bank rows the PrimTS workspace reservation covers; also the selection bank's minimum."""
+    return _RESERVED_BANK_BYTES // _BANK_ROW_BYTES
 
 
 def main_bank_storage(arenas: dict, device: torch.device, rows: int) -> torch.Tensor:
@@ -57,6 +67,7 @@ def main_bank_storage(arenas: dict, device: torch.device, rows: int) -> torch.Te
 
     Storage grows to the next power of two of rows, up to
     :func:`main_bank_rows_limit`, and is only allocated outside CUDA Graph capture.
+    Growth past :func:`main_bank_reserved_rows` allocates beyond the workspace reservation.
     """
     if not 0 < rows <= main_bank_rows_limit():
         raise ValueError("CSA2 PrimTS MAIN bank rows exceed its reserved capacity")
@@ -416,7 +427,7 @@ def main_records_storage(
     It holds one decoded row per MAIN selection of a tile that has no MAIN bank, for
     :func:`decode_main_records`. It is allocated once, outside CUDA Graph capture, at
     ``capacity`` rows (the selections of the largest tile its plans serve), at least
-    :func:`main_bank_rows_limit` rows and at most :func:`main_records_rows_limit`, so CUDA
+    :func:`main_bank_reserved_rows` rows and at most :func:`main_records_rows_limit`, so CUDA
     Graphs that captured it never see it move. A larger tile replaces it with a larger
     allocation and retains the previous one for the graphs that captured it.
     """
@@ -431,7 +442,7 @@ def main_records_storage(
             )
         if storage is not None:
             arenas.setdefault((_RETIRED_RECORDS_CACHE_KEY, device), []).append(storage)
-        capacity = min(max(capacity, rows, main_bank_rows_limit()), main_records_rows_limit())
+        capacity = min(max(capacity, rows, main_bank_reserved_rows()), main_records_rows_limit())
         storage = torch.empty((capacity, _BANK_ROW_BYTES), device=device, dtype=torch.uint8)
         arenas[key] = storage
         # The direct decode reads no offsets; any INT64 vector stands in.
@@ -483,3 +494,249 @@ def decode_main_records(
     _compiled(torch.int32, 1, False, readable, True)(
         main_pool, records.view(rows, 1), offsets, bank, bank[0], 0, rows, 1
     )
+
+
+_OWNERS_CACHE_KEY = "csa2_prims_ts_main_record_owners"
+_EPOCH_CACHE_KEY = "csa2_prims_ts_main_record_epoch"
+_OWNER_BLOCK = 1024
+
+
+def main_record_owners(
+    arenas: dict, device: torch.device, pool_rows: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the device's INT64 per-MAIN-pool-row owner slots and its INT64[1] epoch.
+
+    A slot holds ``(epoch << 32) | (2**31 - 1 - f)`` for the smallest selection ``f``
+    of the latest :func:`decode_main_records` call that read its row. Each call claims
+    with the next epoch, so older values never win and no slot is ever cleared. Both are
+    allocated zero-filled outside CUDA Graph capture and only grow.
+    """
+    key = (_OWNERS_CACHE_KEY, device)
+    owners = arenas.get(key)
+    if owners is None or owners.shape[0] < pool_rows:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "CSA2 PrimTS MAIN record owners cannot be allocated during CUDA Graph capture"
+            )
+        owners = torch.zeros((max(pool_rows, 1),), device=device, dtype=torch.int64)
+        arenas[key] = owners
+        arenas.setdefault(
+            (_EPOCH_CACHE_KEY, device), torch.zeros((1,), device=device, dtype=torch.int64)
+        )
+    return owners, arenas[(_EPOCH_CACHE_KEY, device)]
+
+
+@cache
+def _claim_kernel():
+    import triton
+    import triton.language as tl
+
+    # Record counts and pool sizes vary per call; one compiled variant serves them all.
+    @triton.jit(do_not_specialize=["count", "pool_rows"])
+    def claim(records, owners, epoch, count, pool_rows, BLOCK: tl.constexpr):
+        """Each selected pool row's slot keeps this call's smallest selection reading it."""
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        inside = offs < count
+        record = tl.load(records + offs, mask=inside, other=-1)
+        valid = inside & (record >= 0) & (record < pool_rows)
+        current = tl.load(epoch) + 1
+        value = (current << 32) | (2147483647 - offs).to(tl.int64)
+        tl.atomic_max(owners + record, value, mask=valid, sem="relaxed")
+
+    return claim
+
+
+def _records_kernel() -> type:
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass import Int32, Int64
+
+    from ...prims_ts.kernels.fmha_decode.fmha_decode_resources.smem_transformed_kv import (
+        _cvt_e2m1_word_to_e4m3_words,
+    )
+
+    class _MainRecordsDecode:
+        """Decode a selection bank's owned rows; lane ``l`` converts channels ``[16 l, 16 l + 16)``.
+
+        Warp ``w`` owns selections ``[8 w, 8 w + 8)``. Lane ``i < 8`` reads selection
+        ``8 w + i``'s record and its row's owner slot, writes the bank row the kernel reads
+        for it (the owner's) and keeps the row to decode only when it is the owner. The
+        warp then decodes its kept rows four at a time, issuing every pool read of a batch
+        before converting any, exactly as :func:`decode_main_bank` converts them. Thread 0
+        of block 0 advances the epoch for the next call.
+        """
+
+        @cute.kernel
+        def kernel(
+            self,
+            pool: cute.Tensor,
+            records: cute.Tensor,
+            owners: cute.Tensor,
+            epoch: cute.Tensor,
+            bank_rows: cute.Tensor,
+            bank: cute.Tensor,
+            count: Int32,
+        ) -> None:
+            lane = cute.arch.thread_idx()[0] % Int32(32)
+            warp = cute.arch.block_idx()[0] * Int32(_WARPS) + cute.arch.thread_idx()[0] // Int32(32)
+            if cute.arch.block_idx()[0] == Int32(0) and cute.arch.thread_idx()[0] == Int32(0):
+                epoch[0] = epoch[0] + Int64(1)
+            first = warp * Int32(_GROUP)
+            own = first + lane
+            physical = Int32(-1)
+            if lane < Int32(_GROUP) and own < count:
+                record = Int32(records[own])
+                target = own
+                if record >= Int32(0) and record < Int32(pool.shape[0]):
+                    value = Int64(owners[record])
+                    target = Int32((1 << 31) - 1) - Int32(value & Int64(0xFFFFFFFF))
+                    if target == own:
+                        physical = record
+                bank_rows[own] = target
+            pending = cute.arch.vote_ballot_sync(physical >= Int32(0))
+            stride = Int64(pool.stride[0])
+            while pending != Int32(0):
+                sources, active, reads = [], [], []
+                for _ in cutlass.range_constexpr(_BATCH):
+                    source = cute.arch.clz(cute.arch.brev(pending))
+                    active.append(pending != Int32(0))
+                    pending = pending & (pending - Int32(1))
+                    sources.append(source)
+                    row = Int64(cute.arch.shuffle_sync(physical, source))
+                    row = cutlass.select_(row >= Int64(0), row, Int64(0))
+                    packed = cutlass.Pointer(
+                        pool.iterator + row * stride + Int64(lane * Int32(8)), dtype=Int32
+                    ).load(count=2, alignment=8)
+                    reads.append(
+                        (
+                            Int32(packed[0]),
+                            Int32(packed[1]),
+                            Int32(pool[row, Int32(_HEAD_DIM // 2) + lane]),
+                        )
+                    )
+                for slot in cutlass.range_constexpr(_BATCH):
+                    if active[slot]:
+                        low, high, scale = reads[slot]
+                        values = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
+                        values[0], values[1] = _cvt_e2m1_word_to_e4m3_words(low, scale)
+                        values[2], values[3] = _cvt_e2m1_word_to_e4m3_words(high, scale)
+                        destination = bank.iterator + Int64(first + sources[slot]) * Int64(
+                            _BANK_ROW_BYTES
+                        )
+                        cutlass.Pointer(destination + Int64(lane * Int32(16)), dtype=Int32).store(
+                            values.load(0, 4), alignment=16
+                        )
+
+        @cute.jit
+        def __call__(
+            self,
+            pool: cute.Tensor,
+            records: cute.Tensor,
+            owners: cute.Tensor,
+            epoch: cute.Tensor,
+            bank_rows: cute.Tensor,
+            bank: cute.Tensor,
+            count: Int32,
+            stream: object,
+        ) -> None:
+            rows_per_block = _WARPS * _GROUP
+            self.kernel(pool, records, owners, epoch, bank_rows, bank, count).launch(
+                grid=((count + Int32(rows_per_block - 1)) // Int32(rows_per_block), 1, 1),
+                block=(32 * _WARPS, 1, 1),
+                stream=stream,
+            )
+
+    return _MainRecordsDecode
+
+
+@cache
+def _compiled_records() -> "Callable[..., object]":
+    import cutlass
+    import cutlass.cute as cute
+
+    pool = cute.runtime.make_fake_tensor(
+        cutlass.Uint8,
+        (cute.sym_int(), _MAIN_ROW_BYTES),
+        stride=(cute.sym_int64(divisibility=8), 1),
+        assumed_align=16,
+    )
+
+    def vector(dtype, align):
+        return cute.runtime.make_fake_compact_tensor(
+            dtype, (cute.sym_int(),), stride_order=(0,), assumed_align=align
+        )
+
+    bank = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8, (cute.sym_int(), _BANK_ROW_BYTES), stride_order=(1, 0), assumed_align=16
+    )
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return cute.compile[cute.FrontendNext](
+        _records_kernel()(),
+        pool,
+        vector(cutlass.Int32, 4),
+        vector(cutlass.Int64, 8),
+        vector(cutlass.Int64, 8),
+        vector(cutlass.Int32, 4),
+        bank,
+        cutlass.Int32(0),
+        stream,
+        options="--enable-tvm-ffi --opt-level 2",
+    )
+
+
+def dedup_main_records(
+    main_pool: torch.Tensor,
+    records: torch.Tensor,
+    bank_rows: torch.Tensor,
+    bank: torch.Tensor,
+    arenas: dict,
+) -> None:
+    """Decode each MAIN row a generation tile selects once, on the current stream.
+
+    A tile's query rows of one request select largely the same MAIN rows. Selection ``f``
+    (flat index of ``records``) reading pool row ``records.flat[f]`` is served by the
+    smallest selection reading that row: ``bank_rows.flat[f]`` becomes that owner's bank
+    row, and only owners decode, converting exactly as :func:`decode_main_records`. A
+    negative or out-of-pool record maps to its own bank row and decodes nothing.
+
+    Args:
+        main_pool: The packed MAIN pool, aligned CUDA UINT8[pool_rows,288] with 8-byte
+            aligned row strides.
+        records: Contiguous CUDA INT32[rows, width] pool rows, negative for none.
+        bank_rows: Contiguous CUDA INT32 tensor shaped like ``records`` (output).
+        bank: Contiguous CUDA UINT8[rows * width, 512] from :func:`main_records_storage`.
+        arenas: The arenas that hold ``bank`` and the owner slots.
+    """
+    if (
+        main_pool.dtype != torch.uint8
+        or main_pool.ndim != 2
+        or main_pool.shape[1] != _MAIN_ROW_BYTES
+        or main_pool.stride(1) != 1
+        or main_pool.stride(0) % 8
+        or main_pool.data_ptr() % 16
+        or main_pool.shape[0] == 0
+    ):
+        raise ValueError(
+            "CSA2 MAIN dedup source must be an aligned nonempty CUDA UINT8[N,288] pool"
+        )
+    for name, tensor in (("records", records), ("bank_rows", bank_rows)):
+        if (
+            tensor.dtype != torch.int32
+            or tensor.shape != records.shape
+            or not tensor.is_contiguous()
+            or tensor.device != main_pool.device
+        ):
+            raise ValueError(f"CSA2 MAIN selection {name} must be contiguous INT32 like records")
+    count = records.numel()
+    if bank.shape != (count, _BANK_ROW_BYTES) or not bank.is_contiguous() or bank.data_ptr() % 16:
+        raise ValueError("CSA2 MAIN selection bank must be contiguous aligned CUDA UINT8[rows,512]")
+    if count == 0:
+        return
+    if count >= 1 << 31:
+        raise ValueError("CSA2 MAIN selections exceed the INT32 owner domain")
+    pool_rows = int(main_pool.shape[0])
+    owners, epoch = main_record_owners(arenas, main_pool.device, pool_rows)
+    flat = records.view(-1)
+    grid = ((count + _OWNER_BLOCK - 1) // _OWNER_BLOCK, 1, 1)
+    _claim_kernel()[grid](flat, owners, epoch, count, pool_rows, BLOCK=_OWNER_BLOCK)
+    _compiled_records()(main_pool, flat, owners, epoch, bank_rows.view(-1), bank, count)

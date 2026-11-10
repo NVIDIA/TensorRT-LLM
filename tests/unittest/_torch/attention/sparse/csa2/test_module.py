@@ -280,7 +280,7 @@ def test_module_sends_whole_context_and_generation_phases(
     model._project_output = lambda output, position, inverse_rope_applied, rotated_back: (
         output.flatten(1)
     )
-    assert model.supports_row_split is (implementation == "trtllm")
+    assert model.supports_row_split is (implementation in ("trtllm", "prims_ts"))
     actual = model(hidden, positions, source)
     expected = hidden + (row_ids[:, None].remainder(7) + 1).to(hidden.dtype)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -295,6 +295,42 @@ def test_module_sends_whole_context_and_generation_phases(
     ]
     assert published == [("swa", 0), ("global", 0)]
     assert index_calls == [(0, count)] and entered == [0]
+    if not model.supports_row_split:
+        return
+    # The decoder pass's eager break sends the same phases through the same provider entry.
+    calls.clear()
+    phase_outputs.clear()
+    published.clear()
+    index_calls.clear()
+    model._prepare_global = lambda local, global_hidden, batch, position: (
+        global_hidden,
+        global_hidden[:, :128],
+    )
+    model.global_transforms = lambda position: (None, None)
+    attended = torch.empty_like(hidden)
+    model.attend_rows(
+        hidden,
+        positions,
+        hidden.view(count, 1, 512),
+        hidden,
+        positions.float().reshape(-1, 1, 1),
+        None,
+        torch.ones(count, 1),
+        attended,
+        source,
+        count,
+    )
+    torch.testing.assert_close(attended, expected, atol=0, rtol=0)
+    assert calls == [
+        (phase, start, rows)
+        for phase, start, rows in (
+            (AttentionInputType.context_only, 0, contexts),
+            (AttentionInputType.generation_only, contexts, generations),
+        )
+        if rows
+    ]
+    assert published == [("swa", 0), ("global", 0)]
+    assert index_calls == [(0, count)]
 
 
 @pytest.fixture
@@ -3042,7 +3078,7 @@ def test_hf_factory_auto_backend_and_staging(
     if prims_ts:
         assert isinstance(model._compute_helper, CSA2PrimsTS)
         assert not model.backend.fused_context
-        assert not model.supports_row_split
+        assert model.supports_row_split
     else:
         assert model._compute_helper is None
         assert model.supports_row_split
@@ -4087,6 +4123,9 @@ def test_prims_ts_decode_unit_scale_query_matches_bf16(monkeypatch, module_cache
     model._fp8_q_min_tokens = 1
     # The BF16 comparison Q comes from the same MXFP8 GEMM, not the small-M kernel.
     monkeypatch.setattr(model, "_lowm_projects", lambda linear, rows: False)
+    # Keep this one-row step on PrimTS: by default steps of at most 16 rows take the direct decode.
+    serves_direct = model.backend.direct_decode_serves
+    monkeypatch.setattr(model.backend, "direct_decode_serves", lambda *args: False)
     for linear in (model.wq_a, model.wq_b, model.wkv):
         linear.quant_method.tune_mxfp8_backends = True
     calls = []
@@ -4141,6 +4180,15 @@ def test_prims_ts_decode_unit_scale_query_matches_bf16(monkeypatch, module_cache
             actual = captured.clone()
             expected = run(False)
             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        # The direct decode attends the same step with the BF16 query and no PrimTS query
+        # quantization, whichever Q projection is asked for; it agrees to the E4M3 rounding of Q.
+        monkeypatch.setattr(model.backend, "direct_decode_serves", serves_direct)
+        for fp8_query in (False, True):
+            calls.clear()
+            direct = run(fp8_query)
+            assert calls == []
+            error = (direct.float() - expected.float()).abs().mean() / expected.float().abs().mean()
+            assert error < 0.05
     torch.cuda.synchronize()
 
 

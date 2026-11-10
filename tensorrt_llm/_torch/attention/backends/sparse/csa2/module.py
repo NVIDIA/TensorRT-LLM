@@ -877,16 +877,18 @@ class DeepseekV41Attention(nn.Module):
         return qr, q
 
     def _fp8_query_request(
-        self, hidden_states: torch.Tensor, positions: torch.Tensor, attn_metadata
+        self, hidden_states: torch.Tensor, positions: torch.Tensor, attn_metadata, direct: bool
     ) -> _FP8Query | None:
         """Ask the decode Q projection of an FP8-staging backend for the E4M3 Q that staging, the
         fused decode kernel or PrimTS consumes.
 
         Staging also takes Q's amax word; the fused decode kernel and PrimTS read the unit-scale
-        Q as is, which is what PrimTS's own query quantization makes of the RoPE'd BF16 Q.
+        Q as is, which is what PrimTS's own query quantization makes of the RoPE'd BF16 Q. A
+        direct-decode forward reads the BF16 Q before its RoPE instead.
         """
         if not (
-            getattr(self, "_fp8_q_projection", False)
+            not direct
+            and getattr(self, "_fp8_q_projection", False)
             and attn_metadata.num_ctx_tokens == 0
             and hidden_states.shape[0] >= self._fp8_q_min_tokens
             and self.projection_quantization == "mxfp8"
@@ -1586,10 +1588,12 @@ class DeepseekV41Attention(nn.Module):
 
     @property
     def supports_row_split(self) -> bool:
-        """Whether ``project_rows`` and ``attend_rows`` reproduce ``forward`` (native path only)."""
-        return (
-            not self.backend.sparse_params.use_packed_sparse_attention
-            and self._compute_helper is None
+        """Whether ``project_rows`` and ``attend_rows`` reproduce ``forward``.
+
+        The native path and the PrimTS helper do; both attend the projected BF16 query rows.
+        """
+        return not self.backend.sparse_params.use_packed_sparse_attention and (
+            self._compute_helper is None or self.backend.compute_backend == "prims_ts"
         )
 
     def project_rows(
@@ -1631,7 +1635,8 @@ class DeepseekV41Attention(nn.Module):
         """Sparse attention of the first ``rows`` projected rows into ``output``; zero the rest.
 
         The metadata-driven remainder of ``forward``, including a Full layer's own global
-        projection when it was not precomputed.
+        projection when it was not precomputed, through the provider ``forward`` uses: the
+        PrimTS helper over packed KV, or the native backend.
         """
         if rows:
             layer_idx = self.layer.layer_idx
@@ -1686,6 +1691,7 @@ class DeepseekV41Attention(nn.Module):
                     query_start=start,
                     staging_dtype=self.backend.staging_dtype,
                     layer_idx=layer_idx,
+                    kv_input_mode=self.backend.kv_input_mode,
                 )
                 args = AttentionForwardArgs(
                     attention_input_type=(
@@ -1695,9 +1701,21 @@ class DeepseekV41Attention(nn.Module):
                     ),
                     attention_sinks=self.attn_sink,
                     output=output[start:end].flatten(1),
-                    sparse_backend_args=CSA2BackendForwardArgs(state=state, query_start=start),
+                    sparse_backend_args=CSA2BackendForwardArgs(
+                        swa_cache_format=self.backend.swa_cache_format,
+                        state=state,
+                        query_start=start,
+                    ),
                 )
-                self.backend.forward(tile.flatten(1), None, None, metadata, forward_args=args)
+                if self._compute_helper is not None:
+                    compute = (
+                        self._compute_helper.forward_context
+                        if metadata.num_contexts
+                        else self._compute_helper.forward_generation
+                    )
+                    compute(tile.flatten(1), metadata, args)
+                else:
+                    self.backend.forward(tile.flatten(1), None, None, metadata, forward_args=args)
         if rows < output.shape[0]:
             output[rows:].zero_()
 
@@ -1848,11 +1866,13 @@ class DeepseekV41Attention(nn.Module):
             and not torch.cuda.is_current_stream_capturing()
             and is_sm_100f()
         )
-        # A direct-decode forward leaves the query RoPE to its attention launch.
+        # A direct-decode forward leaves the query RoPE to its attention launch. Small PrimTS
+        # generation steps take it too: it attends the packed pools without compaction or a
+        # split-KV reduction.
         extra_width = 0 if self.layer.mode == CSA2Mode.SWA else self.layout.index_topk
         direct = (
             attn_metadata.num_ctx_tokens == 0
-            and self._compute_helper is None
+            and (self._compute_helper is None or self.backend.compute_backend == "prims_ts")
             and not self.rotary_emb.is_neox
             and self.qk_rope_head_dim == 64
             and self.backend.direct_decode_serves(
@@ -1918,10 +1938,7 @@ class DeepseekV41Attention(nn.Module):
                 latent_mxfp8=getattr(self, "_mxfp8_query_latent", False),
             )
         else:
-            # The direct decode attends the BF16 Q and applies its RoPE itself.
-            fp8_query = (
-                None if direct else self._fp8_query_request(hidden_states, positions, attn_metadata)
-            )
+            fp8_query = self._fp8_query_request(hidden_states, positions, attn_metadata, direct)
             qr, q, swa = self._project_query_and_swa(
                 hidden_states,
                 decode_only=attn_metadata.num_ctx_tokens == 0,
@@ -2159,7 +2176,7 @@ class DeepseekV41Attention(nn.Module):
                 self.backend.forward_fused_decode(tile, args)
             elif self.backend.sparse_params.use_packed_sparse_attention:
                 self.backend.forward_packed(tile.flatten(1), metadata, args)
-            elif self._compute_helper is not None:
+            elif self._compute_helper is not None and not direct:
                 compute = (
                     self._compute_helper.forward_context
                     if metadata.num_contexts

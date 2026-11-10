@@ -1159,6 +1159,84 @@ def test_prims_ts_main_records_match_main_bank(stride: int) -> None:
         decode_main_records(pool, records, bank[:-1], arenas)
 
 
+def _dedup_reference(records: torch.Tensor, pool_rows: int) -> torch.Tensor:
+    """Each selection's owner: the smallest flat index selecting its pool row, else itself."""
+    flat = records.view(-1).tolist()
+    first, owners = {}, []
+    for index, record in enumerate(flat):
+        if 0 <= record < pool_rows:
+            owners.append(first.setdefault(record, index))
+        else:
+            owners.append(index)
+    return torch.tensor(owners, dtype=torch.int32).view(records.shape)
+
+
+@torch.inference_mode()
+def test_prims_ts_main_records_dedup() -> None:
+    """Deduplicated selection banks decode each selected row once, at its first selection.
+
+    Every selection reads its owner's bank row, which holds exactly what the plain selection
+    bank decodes for it. Owner slots carry an epoch, so later calls, eager or replayed from a
+    CUDA Graph, with other records never see an earlier call's owners.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2._prims_ts_bank import (
+        decode_main_records,
+        dedup_main_records,
+        main_records_storage,
+    )
+
+    torch.manual_seed(4111)
+    device = torch.device("cuda", torch.cuda.current_device())
+    main = _pool("main", 288, 2000)
+    rows, width = 24, 512
+    arenas, plain_arenas = {}, {}
+    bank = main_records_storage(arenas, device, rows * width)
+    plain = main_records_storage(plain_arenas, device, rows * width)
+    bank_rows = torch.empty((rows, width), device=device, dtype=torch.int32)
+
+    def check(records: torch.Tensor) -> None:
+        decode_main_records(main, records, plain, plain_arenas)
+        owners = _dedup_reference(records.cpu(), main.shape[0]).to(device)
+        torch.testing.assert_close(bank_rows, owners, atol=0, rtol=0)
+        valid = ((records >= 0) & (records < main.shape[0])).view(-1)
+        read = bank[bank_rows.view(-1).long()]
+        torch.testing.assert_close(read[valid], plain[valid], atol=0, rtol=0)
+
+    def case(seed: int) -> torch.Tensor:
+        generator = torch.Generator(device=device).manual_seed(seed)
+        # Four query rows per request draw from one shared set, as draft tokens do.
+        shared = torch.randint(
+            0, main.shape[0], (rows // 4, 700), device=device, generator=generator
+        )
+        pick = torch.randint(0, 700, (rows, width), device=device, generator=generator)
+        records = shared[torch.arange(rows, device=device)[:, None] // 4, pick].to(torch.int32)
+        records[:, -7:] = -1
+        records[3, :5] = main.shape[0] + 9
+        return records.contiguous()
+
+    for seed in (1, 2):
+        records = case(seed)
+        dedup_main_records(main, records, bank_rows, bank, arenas)
+        check(records)
+    # A captured call claims with the device epoch each replay advances.
+    records = case(3)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        dedup_main_records(main, records, bank_rows, bank, arenas)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dedup_main_records(main, records, bank_rows, bank, arenas)
+    for seed in (4, 5):
+        records.copy_(case(seed))
+        graph.replay()
+        torch.cuda.synchronize()
+        check(records)
+    with pytest.raises(ValueError, match="like records"):
+        dedup_main_records(main, records, bank_rows[:-1], bank, arenas)
+
+
 @torch.inference_mode()
 def test_prims_ts_selection_bank_storage_capacity() -> None:
     """The selection bank is sized once for its largest planned tile and never moves under it.
@@ -1168,7 +1246,7 @@ def test_prims_ts_selection_bank_storage_capacity() -> None:
     the largest generation tile.
     """
     from tensorrt_llm._torch.attention.backends.sparse.csa2._prims_ts_bank import (
-        main_bank_rows_limit,
+        main_bank_reserved_rows,
         main_records_rows_limit,
         main_records_storage,
     )
@@ -1180,9 +1258,9 @@ def test_prims_ts_selection_bank_storage_capacity() -> None:
     arenas = {}
     small = main_records_storage(arenas, device, 7)
     assert small.shape == (7, 512)
-    # Never smaller than the context bank bound, whatever the requested capacity.
+    # Never smaller than the reserved context bank rows, whatever the requested capacity.
     retained = main_records_storage(arenas, device, 1).untyped_storage()
-    assert retained.nbytes() == main_bank_rows_limit() * 512
+    assert retained.nbytes() == main_bank_reserved_rows() * 512
     # A larger tile: one allocation at the planned capacity, retaining the old storage.
     rows, capacity = 768 * 512, 2048 * 512
     large = main_records_storage(arenas, device, rows, capacity=capacity)
@@ -1199,12 +1277,41 @@ def test_prims_ts_selection_bank_storage_capacity() -> None:
     with pytest.raises(ValueError, match="selection bank"):
         main_records_storage(arenas, device, main_records_rows_limit() + 1)
     base = workspace_reservation_bytes(device, 64, 640, 768)
+    # The selection bank, plus its epoch and an INT64 owner slot per MAIN pool row.
     assert workspace_reservation_bytes(device, 64, 640, 768, generation_queries=768) == (
-        base + 768 * 512 * 512
+        base + 768 * 512 * 512 + 8
     )
+    assert workspace_reservation_bytes(
+        device, 64, 640, 768, generation_queries=768, main_pool_rows=1000
+    ) == (base + 768 * 512 * 512 + 8 * 1001)
     assert workspace_reservation_bytes(device, 64, 128, 768, generation_queries=768) == (
         workspace_reservation_bytes(device, 64, 128, 768)
     )
+
+
+@torch.inference_mode()
+def test_prims_ts_main_bank_storage_grows_past_reservation() -> None:
+    """A context bank of more rows than the reservation covers grows on demand, up to its limit."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2._prims_ts_bank import (
+        main_bank_marks,
+        main_bank_reserved_rows,
+        main_bank_rows_limit,
+        main_bank_storage,
+    )
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    reserved = main_bank_reserved_rows()
+    assert reserved < main_bank_rows_limit()
+    arenas = {}
+    bank = main_bank_storage(arenas, device, reserved + 1)
+    assert bank.shape == (reserved + 1, 512)
+    # The next power of two of the rows.
+    assert bank.untyped_storage().nbytes() == 2 * reserved * 512
+    marks = main_bank_marks(arenas, device, reserved + 1)
+    assert marks.shape == (reserved + 1,) and torch.count_nonzero(marks) == 0
+    for retained in (main_bank_storage, main_bank_marks):
+        with pytest.raises(ValueError, match="MAIN bank rows"):
+            retained(arenas, device, main_bank_rows_limit() + 1)
 
 
 @pytest.mark.parametrize("rows", [4, 192, 768])
@@ -1217,6 +1324,7 @@ def test_prims_ts_selection_bank_attention_matches_packed(rows: int) -> None:
     """
     from tensorrt_llm._torch.attention.backends.sparse.csa2._prims_ts_bank import (
         decode_main_records,
+        dedup_main_records,
         main_records_storage,
     )
     from tensorrt_llm._torch.attention.backends.sparse.csa2._prims_ts_packed import (
@@ -1266,14 +1374,22 @@ def test_prims_ts_selection_bank_attention_matches_packed(rows: int) -> None:
     ml[1::3], ml[2::7] = 77, 0
     # Selections past a query's length are not read; poison them in the record table.
     mi[torch.arange(main_width, device=device)[None, :] >= ml[:, None]] = -1
-    arenas = {}
+    arenas, dedup_arenas = {}, {}
     bank = main_records_storage(arenas, device, rows * main_width)
     decode_main_records(main, mi, bank, arenas)
     flat = torch.arange(rows * main_width, device=device, dtype=torch.int32).view(rows, main_width)
+    # The deduplicated bank decodes each selected row once; selections read their owner's row.
+    dedup_bank = main_records_storage(dedup_arenas, device, rows * main_width)
+    owners = torch.empty_like(mi)
+    dedup_main_records(main, mi, owners, dedup_bank, dedup_arenas)
     sinks = torch.linspace(-1, 1, heads, device=device)
     outputs, lses = {}, {}
-    for main_format, source, indices in (("main", main, mi), ("main_fp8", bank, flat)):
-        outputs[main_format] = torch.full_like(q, torch.nan)
+    for name, main_format, source, indices in (
+        ("main", "main", main, mi),
+        ("main_fp8", "main_fp8", bank, flat),
+        ("dedup", "main_fp8", dedup_bank, owners),
+    ):
+        outputs[name] = torch.full_like(q, torch.nan)
         plans[main_format].run(
             q,
             swa,
@@ -1285,9 +1401,10 @@ def test_prims_ts_selection_bank_attention_matches_packed(rows: int) -> None:
             softmax_scale=512**-0.5,
             output_scale=0.75,
             sinks=sinks,
-            out=outputs[main_format],
+            out=outputs[name],
         )
-        lses[main_format] = plans[main_format]._state.buffers["lse"].clone()
+        lses[name] = plans[main_format]._state.buffers["lse"].clone()
     assert torch.isfinite(outputs["main"]).all()
-    torch.testing.assert_close(outputs["main_fp8"], outputs["main"], atol=0, rtol=0)
-    torch.testing.assert_close(lses["main_fp8"], lses["main"], atol=0, rtol=0)
+    for name in ("main_fp8", "dedup"):
+        torch.testing.assert_close(outputs[name], outputs["main"], atol=0, rtol=0)
+        torch.testing.assert_close(lses[name], lses["main"], atol=0, rtol=0)

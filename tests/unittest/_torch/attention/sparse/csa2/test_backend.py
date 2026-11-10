@@ -2214,8 +2214,13 @@ def test_native_fp8_staging_keeps_rows_beyond_the_e4m3_range(
 @pytest.mark.parametrize("kv_dtype", ["fp8", "fp8_ds_mla", "auto"])
 @pytest.mark.parametrize("native_fp8", [False, True])
 @pytest.mark.parametrize("packed", [False, True])
-def test_direct_decode_admission_requires_scaled_swa(
-    monkeypatch: pytest.MonkeyPatch, kv_dtype: str, native_fp8: bool, packed: bool
+@pytest.mark.parametrize("compute_backend", ["trtllm", "prims_ts"])
+def test_direct_decode_admission_by_swa_format_and_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_dtype: str,
+    native_fp8: bool,
+    packed: bool,
+    compute_backend: str,
 ) -> None:
     from types import SimpleNamespace
 
@@ -2225,6 +2230,7 @@ def test_direct_decode_admission_requires_scaled_swa(
 
     monkeypatch.setattr(direct_decode, "direct_decode_device_supported", lambda device: True)
     attn = SimpleNamespace(
+        compute_backend=compute_backend,
         native_fp8=native_fp8,
         swa_cache_format=resolve_swa_cache_format(kv_dtype),
         sparse_params=CSA2Params(use_packed_sparse_attention=packed),
@@ -2232,7 +2238,8 @@ def test_direct_decode_admission_requires_scaled_swa(
     )
     serves = CSA2TrtllmAttention.direct_decode_serves
     device = torch.device("cpu")
-    expected = native_fp8 and not packed and kv_dtype != "fp8"
+    # Native FP8 staging takes it for scaled SWA records only; PrimTS for either SWA format.
+    expected = not packed and ((native_fp8 and kv_dtype != "fp8") or compute_backend == "prims_ts")
     for rows in (1, direct_decode.MAX_ROWS):
         assert serves(attn, rows, 0, 512, device) is expected
     assert not serves(attn, 0, 0, 512, device)

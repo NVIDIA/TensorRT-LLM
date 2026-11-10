@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import torch
 
 from ...interface import AttentionForwardArgs, AttentionInputType
-from ._prims_ts_bank import main_bank_rows_limit, main_records_rows_limit
+from ._prims_ts_bank import main_bank_reserved_rows, main_records_rows_limit
 from .params import CSA2BackendForwardArgs, PrimsTSMainFormat, SwaCacheFormat
 
 if TYPE_CHECKING:
@@ -65,24 +65,28 @@ def workspace_reservation_bytes(
     width: int,
     queries: int,
     generation_queries: int = 0,
+    main_pool_rows: int = 0,
 ) -> int:
     """Bound one serial arena shared by eager and graph-retained packed plans.
 
     All wrapper Q8/reduction/LSE/dummy storage is carved from the byte
     workspace. Plans own no additional defaults or cache tensors. Compact
     metadata is the only separate allocation, plus, for widths with MAIN rows,
-    the bounded storage of the device's decoded context MAIN bank and its
-    one-byte row marks, and the selection bank of generation tiles of up to
-    ``generation_queries`` rows.
+    the reserved storage of the device's decoded context MAIN bank and its
+    one-byte row marks (a phase that owns more MAIN rows grows them past the
+    reservation), and the selection bank of generation tiles of up to
+    ``generation_queries`` rows with its INT64 owner slot per row of a MAIN pool
+    of up to ``main_pool_rows`` rows.
     """
     bank = 0
     if width > _SWA_TILE:
-        bank = main_bank_rows_limit() * (_HEAD_DIM + 1)
+        bank = main_bank_reserved_rows() * (_HEAD_DIM + 1)
         if generation_queries > 0:
             selections = generation_queries * (width - _SWA_TILE)
             bank += _HEAD_DIM * min(
-                max(selections, main_bank_rows_limit()), main_records_rows_limit()
+                max(selections, main_bank_reserved_rows()), main_records_rows_limit()
             )
+            bank += 8 * (main_pool_rows + 1)
     return _workspace_capacity(device, heads, width, queries) + 4 * queries * (width + 2) + bank
 
 
@@ -101,6 +105,9 @@ def _metadata_view(prepared: _PrimsTSMetadata, rows: int) -> _PrimsTSMetadata:
 
 class CSA2PrimsTS:
     """Module compute helper; plans and serial scratch belong to query metadata."""
+
+    # A selection bank converts each selected MAIN row once (dedup_main_records).
+    dedup_selection_bank = True
 
     def __init__(self, attention: CSA2TrtllmAttention) -> None:
         self.attention = attention
@@ -260,6 +267,7 @@ class CSA2PrimsTS:
         from ._prims_ts_bank import (
             decode_main_bank,
             decode_main_records,
+            dedup_main_records,
             main_bank_marks,
             main_bank_storage,
             main_records_storage,
@@ -337,13 +345,16 @@ class CSA2PrimsTS:
                     extra_indices.numel(),
                     capacity=max(max_queries, q.shape[0]) * prepared.extra_indices.shape[1],
                 )
-                # Selection c of query r reads bank row r * width + c.
-                extra_indices = record.get("selection_indices")
-                if extra_indices is None:
-                    extra_indices = torch.arange(
+                if "selection_indices" not in record:
+                    # Both index sets exist before capture, whichever a call uses.
+                    record["selection_indices"] = torch.arange(
                         prepared.extra_indices.numel(), device=q.device, dtype=torch.int32
                     ).view(prepared.extra_indices.shape)
-                    record["selection_indices"] = extra_indices
+                    record["selection_rows"] = torch.empty_like(prepared.extra_indices)
+                dedup = self.dedup_selection_bank and self._shares_main_rows(raw, q.shape[0])
+                # Selection c of query r reads bank row r * width + c, or with dedup the bank
+                # row of the first selection of its MAIN row, the only selections decoded.
+                extra_indices = record["selection_rows" if dedup else "selection_indices"]
             sources = dict(
                 swa_cache=inputs.swa_pool,
                 swa_indices=prepared.indices,
@@ -372,7 +383,14 @@ class CSA2PrimsTS:
                 decode_main_bank(inputs.main_pool, bank, main_source, marks)
             if selection_bank:
                 # The compacted MAIN records, after this layer's MAIN publication.
-                decode_main_records(inputs.main_pool, prepared.extra_indices, main_source, arenas)
+                if dedup:
+                    dedup_main_records(
+                        inputs.main_pool, prepared.extra_indices, extra_indices, main_source, arenas
+                    )
+                else:
+                    decode_main_records(
+                        inputs.main_pool, prepared.extra_indices, main_source, arenas
+                    )
             output = forward_args.output
             if output is None:
                 output = torch.empty_like(q, memory_format=torch.contiguous_format)
@@ -393,6 +411,19 @@ class CSA2PrimsTS:
             if mxfp8 is not None:
                 raw.state.output_mxfp8_written = True
             return output
+
+    @staticmethod
+    def _shares_main_rows(raw: CSA2BackendForwardArgs, rows: int) -> bool:
+        """Whether a generation tile's query rows can select the same MAIN rows.
+
+        Only rows of one request share MAIN rows: a tile of one query row per request has
+        no duplicates to skip. A standalone tile without forward state is assumed to share.
+        """
+        state = raw.state
+        if state is None:
+            return True
+        requests = state.metadata.num_generations
+        return requests <= 0 or rows > requests
 
     def _uses_selection_bank(
         self, q: torch.Tensor, metadata: CSA2TrtllmMetadata, swa_cache_format: SwaCacheFormat

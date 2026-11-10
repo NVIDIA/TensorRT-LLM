@@ -809,8 +809,8 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         converts each row once. A phase that selects at least as many rows as its
         requests own decodes all of them; one that selects fewer, such as a
         bounded-replay tile of a long context, decodes only the rows its
-        selections keep. Without logical provenance, or beyond the reserved bank
-        capacity, keep in-kernel decoding.
+        selections keep. Without logical provenance, or beyond the bank's row
+        limit, keep in-kernel decoding.
         """
         from ._prims_ts_bank import main_bank_rows_limit
 

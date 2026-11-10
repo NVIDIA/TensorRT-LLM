@@ -25,7 +25,7 @@ def reference_sparse_decode(
     """FP32 dense reference of ``direct_sparse_decode`` (exactly decoded rows, FP32 softmax)."""
     rows = q.shape[0]
     parts, masks = [], []
-    sources = [(swa_pool, swa_indices, "swa")]
+    sources = [(swa_pool, swa_indices, "swa_fp8" if swa_pool.shape[1] == 512 else "swa")]
     if main_indices is not None and main_indices.shape[1] > 0:
         slots = main_indices.long()
         if main_mapping is not None:
@@ -64,9 +64,9 @@ def reference_sparse_decode(
     return torch.einsum("qhk,qkd->qhd", probabilities, kv).bfloat16()
 
 
-def _pools(swa_slots=300, main_slots=2048, seed=0, main_stride=356):
+def _pools(swa_slots=300, main_slots=2048, seed=0, main_stride=356, swa_format="swa"):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    swa = pack_rows(torch.randn(swa_slots, 512, device="cuda", generator=g) * 2, "swa")
+    swa = pack_rows(torch.randn(swa_slots, 512, device="cuda", generator=g) * 2, swa_format)
     # The main cache is a strided view of its page group (main and index records interleaved).
     owner = torch.empty(main_slots, main_stride, device="cuda", dtype=torch.uint8)
     main = owner[:, :288]
@@ -128,9 +128,11 @@ def _assert_close_to_fp32(actual, expected):
 
 # 8 query heads per rank (TP8) run as a zero-padded 16-head MMA tile.
 @pytest.mark.parametrize("main_width,heads,rows", [(512, 8, 16), (512, 64, 6), (0, 64, 2)])
+# Scaled 528-byte SWA records and unit-scale 512-byte E4M3 records (``kv_cache_config.dtype="fp8"``).
+@pytest.mark.parametrize("swa_format", ["swa", "swa_fp8"])
 @torch.inference_mode()
-def test_matches_fp32_reference(rows, heads, main_width):
-    case = _case(rows, heads, 128, main_width, mapped=main_width > 0)
+def test_matches_fp32_reference(rows, heads, main_width, swa_format):
+    case = _case(rows, heads, 128, main_width, mapped=main_width > 0, swa_format=swa_format)
     si, mi = case[2], case[4]
     # A row without valid keys attends only the sink: zeros.
     si[-1] = -1
