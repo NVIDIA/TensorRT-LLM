@@ -213,6 +213,38 @@ def test_draft_layer_specs_join_the_hybrid_nvfp4_manager() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+def test_only_the_draft_layers_block_offset_rows_are_built() -> None:
+    """Target layers address pages by slot id, so each step rebuilds only the draft layers' rows."""
+    torch.cuda.init()
+    unified = _manager(_specs())
+    try:
+        (request,) = unified.add_dummy_requests([7], token_nums=[200])
+        sentinel = -7
+        offsets = torch.full(
+            (unified.num_attention_op_pools, 1, 2, unified.max_blocks_per_seq),
+            sentinel,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        unified.copy_batch_block_offsets(offsets, [7], 1, 1, 1)
+        torch.cuda.synchronize()
+        pool_of = {
+            layer: int(unified.kv_cache_pool_mapping[unified.layer_offsets[layer], 0])
+            for layer in unified.pp_layers
+        }
+        draft_rows = {pool_of[layer] for layer in unified.draft_layer_ids}
+        target_rows = {pool_of[layer] for layer in unified.target_layer_ids} - draft_rows
+        assert target_rows, "the target layers need attention-op rows of their own"
+        for row in sorted(target_rows):
+            assert (offsets[row] == sentinel).all(), row
+        for row in sorted(draft_rows):
+            assert (offsets[row, 0, :, :2] >= 0).all(), row
+        unified.free_resources(request)
+    finally:
+        unified.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
 def test_warmup_scrub_clears_every_slot() -> None:
     """The post-warmup NaN/Inf scrub zeroes every slot of target and draft layers alike."""
     torch.cuda.init()

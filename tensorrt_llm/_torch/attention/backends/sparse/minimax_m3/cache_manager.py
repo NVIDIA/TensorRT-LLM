@@ -883,8 +883,43 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
     def _prepare_swa_scratch_copy_tensors(self, index_mapper_capacity: int) -> None:
         # Staging for the per-layer block-offset copy, which a pool-less hybrid NVFP4 cache never runs.
+        self._draft_attention_op_rows: Optional[slice] = None
         if self.dtype != DataType.NVFP4 or self.layer_specs is not None:
             super()._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
+        if self.dtype != DataType.NVFP4 or self.layer_specs is None:
+            return
+        # A hybrid cache's target layers address pages by slot id, so only the explicit
+        # draft layers read attention-op block offsets: build just their rows each step.
+        rows = sorted(
+            int(self.layer_offsets[layer]) for layer in self.draft_layer_ids
+            if layer in self.layer_offsets
+        )
+        if not rows or rows != list(range(rows[0], rows[-1] + 1)):
+            return
+        sl = slice(rows[0], rows[-1] + 1)
+        self._draft_attention_op_rows = sl
+        self._device_attention_op_pool_ids = self._device_attention_op_pool_ids[sl].contiguous()
+        self._device_attention_op_scales = self._device_attention_op_scales[sl].contiguous()
+        self._device_attention_op_layer_offsets = self._device_attention_op_layer_offsets[
+            sl
+        ].contiguous()
+        self._device_attention_op_scratch_pages = self._device_attention_op_scratch_pages[
+            sl
+        ].contiguous()
+        self._device_attention_op_block_offsets_staging = (
+            self._device_attention_op_block_offsets_staging[sl].clone()
+        )
+
+    def _copy_batch_block_offsets_per_layer(
+        self, dst_tensor: torch.Tensor, *args: Any, **kwargs: Any
+    ) -> None:
+        """Fill only the draft layers' rows when the staging holds just those."""
+        rows = getattr(self, "_draft_attention_op_rows", None)
+        # The base slices dst and staging to num_attention_op_pools rows; both views
+        # here have exactly the draft rows, so the slices keep them whole.
+        super()._copy_batch_block_offsets_per_layer(
+            dst_tensor if rows is None else dst_tensor[rows], *args, **kwargs
+        )
 
     def copy_batch_block_offsets(
         self,
