@@ -24,6 +24,7 @@ gather match the per-rank copy, so output is bitwise identical.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import errno
 import fcntl
@@ -38,7 +39,9 @@ from typing import Callable, Optional, Protocol
 PLE_SHARED_HOST_ENV = "TRTLLM_MODELING_V2_PLE_SHARED_HOST"
 #: Where the rendezvous files live; must be a directory every sharing process sees (tmpfs).
 PLE_SHARED_HOST_DIR_ENV = "TRTLLM_MODELING_V2_PLE_SHARED_HOST_DIR"
-_DEFAULT_DIR = "/dev/shm"
+# Shared by every user of the host: the files are named per uid, opened with O_NOFOLLOW, created
+# 0600 and read only when this uid owns them (`_open_own`).
+_DEFAULT_DIR = "/dev/shm"  # nosec B108
 _OFF = frozenset({"", "0", "off", "false", "no", "none"})
 _SCOPE = "node"
 
@@ -244,6 +247,15 @@ class MemfdBacking:
         return "memfd"
 
 
+def _open_own(path: str, flags: int, mode: int = 0o600) -> int:
+    """`os.open` that refuses a symlink and a file another uid owns (the directory is shared)."""
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+    if os.fstat(fd).st_uid != os.getuid():
+        os.close(fd)
+        raise PermissionError(f"{path} is owned by another user")
+    return fd
+
+
 def segment_name(key: str, scope_label: str) -> str:
     """The rendezvous file stem: per user, per table content, per scope."""
     return f"trtllm-ple-{os.getuid()}-{scope_label}-{key[:24]}"
@@ -292,7 +304,7 @@ class SharedHostSegment:
         self._fd = -1
         # Bound now: at interpreter shutdown the modules may already be torn down.
         self._close = os.close
-        self._lock_fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        self._lock_fd = _open_own(self.lock_path, os.O_RDWR | os.O_CREAT)
         try:
             fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as error:
@@ -316,7 +328,7 @@ class SharedHostSegment:
 
     def _read_descriptor(self) -> Optional[dict]:
         try:
-            with open(self.descriptor_path) as fh:
+            with os.fdopen(_open_own(self.descriptor_path, os.O_RDONLY)) as fh:
                 desc = json.load(fh)
         except (OSError, ValueError):
             return None
@@ -398,7 +410,9 @@ class SharedHostSegment:
                 backing=self.backing.describe(),
             )
             tmp = f"{self.descriptor_path}.{os.getpid()}.tmp"
-            with open(tmp, "w") as fh:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp)
+            with os.fdopen(_open_own(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL), "w") as fh:
                 json.dump(desc, fh)
             os.replace(tmp, self.descriptor_path)
         self._unlock()
@@ -416,7 +430,7 @@ class SharedHostSegment:
     def _withdraw(self) -> None:
         """Owner: unlink the descriptor if it still names this pid and fd, before the fd closes."""
         try:
-            with open(self.descriptor_path) as fh:
+            with os.fdopen(_open_own(self.descriptor_path, os.O_RDONLY)) as fh:
                 desc = json.load(fh)
             if desc.get("pid") == os.getpid() and desc.get("fd") == self._fd:
                 os.unlink(self.descriptor_path)
