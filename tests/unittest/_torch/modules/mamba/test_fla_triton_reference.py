@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Triton FLA prefill kernels against reference formulas, at shapes where every
-row and column mask is false somewhere.
+"""Triton FLA prefill kernels against reference formulas, at shapes with partial
+tail rows and columns.
 
 The Triton gated delta rule is the GDN prefill wherever FlashInfer does not cover
 the GPU (SM80/86/89). Packed lengths are unaligned to the 16/64-token chunks, K and
-V are not multiples of the 64/32 tiles, and there are fewer key heads than value
-heads, so a kernel that drops or misplaces a tail row or column fails here.
+V are not multiples of 64, and there are fewer key heads than value heads. Which
+tiles are partial depends on the block sizes autotune picks; K above 128 and
+equal-length batches are not covered here.
 """
 
 import pytest
@@ -74,21 +75,40 @@ def _fp64_reference(q, k, v, g, beta, pool, indices, cu_seqlens):
 
 
 def check_chunk_gated_delta_rule(device: str, dtype: torch.dtype) -> None:
-    """Packed varlen call with an indexed pool against the fp64 recurrence."""
+    """Packed varlen calls against the fp64 recurrence: dense states in and out,
+    as the GDN mixer calls it, then an indexed pool updated in place."""
     q, k, v, g, beta, pool, cu_seqlens, indices = _gdn_operands(device, dtype)
-    kwargs = dict(
+    ref_o, ref_pool = _fp64_reference(q, k, v, g, beta, pool, indices, cu_seqlens)
+    pool_before = pool.clone()
+    # Every token and head has an output above atol, so a zeroed row cannot pass.
+    assert ref_o.float().abs().amax(-1).min() > 2 * ATOL_OUTPUT
+
+    o, final = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=pool.index_select(0, indices),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+    )
+    torch.testing.assert_close(o.float(), ref_o.float(), rtol=RTOL, atol=ATOL_OUTPUT)
+    torch.testing.assert_close(
+        final.to(pool.dtype), ref_pool.index_select(0, indices), rtol=RTOL, atol=ATOL_STATE
+    )
+
+    o, _ = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
         initial_state=pool,
         initial_state_indices=indices,
         inplace_indexed_state_update=True,
         cu_seqlens=cu_seqlens,
     )
-    ref_o, ref_pool = _fp64_reference(q, k, v, g, beta, pool, indices, cu_seqlens)
-    pool_before = pool.clone()
-
-    o, _ = chunk_gated_delta_rule(q, k, v, g, beta, **kwargs)
-
-    # Well above atol, so a zeroed or dropped tile cannot pass.
-    assert ref_o.float().abs().amax() > 20 * ATOL_OUTPUT
     torch.testing.assert_close(o.float(), ref_o.float(), rtol=RTOL, atol=ATOL_OUTPUT)
     torch.testing.assert_close(pool, ref_pool, rtol=RTOL, atol=ATOL_STATE)
     untouched = [s for s in range(NUM_SLOTS) if s not in SLOTS]
