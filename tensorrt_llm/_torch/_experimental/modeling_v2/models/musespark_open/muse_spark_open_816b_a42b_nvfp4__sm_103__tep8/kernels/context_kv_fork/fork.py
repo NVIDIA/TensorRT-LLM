@@ -76,6 +76,7 @@ step before anything reads them.
 
 from __future__ import annotations
 
+import os
 import types
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -358,6 +359,15 @@ def compacts_after_join(worker) -> bool:
     return isinstance(worker, WindowCompactDFlashWorker)
 
 
+def _fused_prep_from_env():
+    """``drafter_step_prep.from_env()`` when ``MUSESPARK_OPEN_DRAFTER_FUSED_PREP=1``, else None (no import)."""
+    if os.environ.get("MUSESPARK_OPEN_DRAFTER_FUSED_PREP", "0").strip() != "1":
+        return None
+    from ...ops.spec import drafter_step_prep
+
+    return drafter_step_prep.from_env()
+
+
 # --------------------------------------------------------------------------
 # The side chain and its controller
 # --------------------------------------------------------------------------
@@ -372,6 +382,9 @@ class Launched:
     point: str
     #: The captured rows the side chain projected (a view of the shared capture buffer).
     gen_hs: torch.Tensor
+    #: Whether the side chain and the commit run the fused paged bookkeeping
+    #: (``MUSESPARK_OPEN_DRAFTER_FUSED_PREP``, ``ops/spec/drafter_step_prep.py``).
+    fused: bool = False
 
 
 class ContextKvFork:
@@ -405,6 +418,8 @@ class ContextKvFork:
         self.parallel_min_requests: Optional[int] = None
         #: Reports a step a lever left to the path below it (``dispatch.Plan.declined``), or None.
         self.declined: Optional[Callable[..., None]] = None
+        #: The fused paged bookkeeping (``MUSESPARK_OPEN_DRAFTER_FUSED_PREP=1``), or None (default off).
+        self.prep = _fused_prep_from_env()
 
     @property
     def launched(self) -> bool:
@@ -484,11 +499,15 @@ class ContextKvFork:
                 "the side chain cannot be forked from it"
             )
         capture = current_capture_id()
+        fused = (
+            self.prep is not None
+            and self.prep.takes(self.worker, num_gens, k + 1)
+        )
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
-            gen_hs = self.side_chain(spec_metadata, attn_metadata, num_gens, k)
+            gen_hs = self.side_chain(spec_metadata, attn_metadata, num_gens, k, fused)
         self._early = None
-        self._launched = Launched(main, capture, num_gens, k, point, gen_hs)
+        self._launched = Launched(main, capture, num_gens, k, point, gen_hs, fused)
         self.launches[point] += 1
 
     # -- the worker side ---------------------------------------------------
@@ -535,7 +554,9 @@ class ContextKvFork:
         base, last = arena_columns(worker)
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
-            if worker._ctx_paged:
+            if worker._ctx_paged and launched.fused:
+                self.prep.commit_context(worker, slots, num_accepted, rows, num_ctx)
+            elif worker._ctx_paged:
                 num_ctx.copy_(worker._commit_context(slots, num_accepted.long(), rows))
             elif base is None or compacts_after_join(worker):
                 context_kv_commit(
@@ -693,14 +714,26 @@ class ContextKvFork:
             return None
         return num_gens, k
 
-    def side_chain(self, spec_metadata, attn_metadata, num_gens: int, k: int) -> torch.Tensor:
+    def side_chain(
+        self, spec_metadata, attn_metadata, num_gens: int, k: int, fused: bool = False
+    ) -> torch.Tensor:
         """The built-in store of the step's context K/V, unmasked; runs on the side stream.
 
         The worker's ``_store_step_context`` without its mask, after this step's page
         table decode over the KV cache manager's pages. Its first launch is a torch
         kernel, so the fork is a plain dependency on the main stream's last kernel.
+        With ``fused`` (``MUSESPARK_OPEN_DRAFTER_FUSED_PREP``, a paged context only) the decode
+        and the store are ``drafter_step_prep``'s launches, the same bytes.
         """
         worker, drafter = self.worker, self.draft_model
+        if fused:
+            self.prep.refresh_block_tables(worker, attn_metadata, num_gens)
+            slots = worker._batch_to_slot[:num_gens]
+            gen_hs = spec_metadata.captured_hidden_states[
+                : num_gens * (k + 1), : spec_metadata.hidden_size * spec_metadata.num_capture_layers
+            ]
+            self.prep.store_step_context(worker, drafter, gen_hs, slots, self.rows[:num_gens], k + 1)
+            return gen_hs
         refusal = _side_chain_refusal(worker, drafter) if self.side_chain_on else None
         if self.side_chain_on and refusal is None:
             # The dense full-length arena only (``_side_chain_refusal``): no page table to decode.
