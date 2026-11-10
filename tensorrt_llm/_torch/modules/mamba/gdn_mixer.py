@@ -220,6 +220,7 @@ def _inforward_split_prefill_core(
     split: InforwardSnapshotSplit,
     stage_ssm: torch.Tensor,
     output: Optional[torch.Tensor],
+    g_is_linear: bool = False,
 ) -> torch.Tensor:
     """Chunked GDN prefill of a context-only batch with in-forward Mamba snapshots.
 
@@ -236,6 +237,7 @@ def _inforward_split_prefill_core(
         split: This step's split (``Mamba2Metadata.inforward_split``).
         stage_ssm: The layer's SSM staging rows, ``[rows, H, V, K]``.
         output: Optional preallocated output.
+        g_is_linear: ``g`` already holds ``alpha = exp(g)`` (the FlashInfer gate convention), for both scans.
     """
     initial = ssm_states.index_select(0, split.gather)
     core_out, final = chunk_gated_delta_rule(
@@ -250,6 +252,7 @@ def _inforward_split_prefill_core(
         head_first=False,
         use_qk_l2norm_in_kernel=False,
         output=output,
+        g_is_linear=g_is_linear,
     )
     final = final.to(ssm_states.dtype)
     ssm_states.index_copy_(0, split.live, final.index_select(0, split.main_rows))
@@ -265,6 +268,7 @@ def _inforward_split_prefill_core(
         cu_seqlens=split.cu_tail,
         head_first=False,
         use_qk_l2norm_in_kernel=False,
+        g_is_linear=g_is_linear,
     )
     stage_ssm.index_copy_(0, split.stage_rows, tail_final.to(stage_ssm.dtype))
     core_out[0].index_copy_(0, tail, tail_out[0].to(core_out.dtype))
@@ -2066,6 +2070,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 inforward_split,
                 kwargs["inforward_stage"][0],
                 output,
+                g_is_linear=g_linear,
             )
 
         if (
