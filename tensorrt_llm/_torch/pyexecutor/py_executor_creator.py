@@ -1602,6 +1602,7 @@ def create_py_executor(
             )
     except BaseException:
         gpu_memory_providers.end_executor(monitor_token)
+        gpu_memory_tagging.forget_startup_of(monitor_token)
         current_dwdp_manager = get_global_dwdp_manager()
         if (current_dwdp_manager is not None
                 and current_dwdp_manager is not previous_dwdp_manager):

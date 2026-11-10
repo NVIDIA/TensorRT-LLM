@@ -190,9 +190,12 @@ on resume.
 * **Allocation stacks need PyTorch's native allocator.** With
   `PYTORCH_ALLOC_CONF=backend:cudaMallocAsync` or a pluggable allocator,
   `TLLM_MEM_MONITOR_STACKS=1` records nothing.
-* **One executor at a time per process for startup records.** Each
-  executor's components are reported separately, but the startup-step
-  breakdown and the warmup baseline describe the executor started last.
+* **Startup records belong to one executor per process.** Each executor's
+  components are reported separately. When an executor starts while another
+  one in the same process is still running, its startup is not recorded
+  (a warning says so), so the running executor's startup breakdown, warmup
+  comparison and buffer names stay correct; the records are dropped when the
+  executor they describe shuts down.
 
 ## Cost
 

@@ -177,6 +177,29 @@ def test_startup_state_does_not_leak(monkeypatch):
             raise KeyboardInterrupt
     assert logged == [], "reported after an interrupt"
 
+    # An executor started while another is alive leaves the running one's
+    # startup records alone; they go when the executor they describe ends.
+    from tensorrt_llm._torch.memory.monitor import providers
+
+    first = providers.begin_executor()
+    with tagging.startup_window() as recording:
+        assert recording is True, "the only executor records its startup"
+        startup._stages.append(startup.StageSample("model", "Model", 0, 0, 1, 1))
+    second = providers.begin_executor()
+    with tagging.startup_window() as recording:
+        assert recording is False, "a second live executor's startup is not recorded"
+    assert startup.stages(), "the running executor's steps survive the second startup"
+    providers.end_executor(second)
+    tagging.forget_startup_of(second)
+    assert startup.stages(), "ending another executor keeps them"
+    providers.end_executor(first)
+    tagging.forget_startup_of(first)
+    assert not startup.stages(), "ending the executor they describe drops them"
+    third = providers.begin_executor()
+    with tagging.startup_window() as recording:
+        assert recording is True, "with no executor left, the next one records again"
+    providers.end_executor(third)
+
     # A region before the first step is not counted twice.
     startup.clear()
     state = types.SimpleNamespace(process=1000 * MB)

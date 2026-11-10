@@ -78,7 +78,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from . import startup
+from . import providers, startup
 from .capability import tagging_supported
 from .claims import claim_module_memory, claimed_modules, claimed_storages, clear_claims
 from .names import CUDA_GRAPHS, UNTAGGED
@@ -92,6 +92,7 @@ __all__ = [
     "claim_module_memory",
     "claimed_modules",
     "clear_claims",
+    "forget_startup_of",
     "TagSnapshot",
     "freeze_tag_map",
     "get_frozen_map",
@@ -438,6 +439,24 @@ def get_frozen_map() -> TagSnapshot:
     return _frozen
 
 
+#: The executor whose startup the process-wide startup records describe.
+_startup_executor: object | None = None
+
+
+def forget_startup_of(token: object) -> None:
+    """Drop the startup records if they describe the executor ``token``.
+
+    Called when that executor shuts down, so a later report does not
+    describe the startup of an executor that no longer exists.
+    """
+    global _startup_executor
+    if token is None or token is not _startup_executor:
+        return
+    _startup_executor = None
+    startup.clear()
+    set_frozen_map(TagSnapshot(supported=False))
+
+
 @contextlib.contextmanager
 def startup_window(rank: int | None = None) -> Iterator[bool]:
     """Record tags for the duration of startup, then freeze, stop and report.
@@ -452,13 +471,28 @@ def startup_window(rank: int | None = None) -> Iterator[bool]:
     startup that raises part way through still publishes what it managed to
     tag and still reports, which is exactly when a breakdown is worth having.
     """
+    global _startup_executor
     if not full_mode(rank):
         yield False
         return
+    if providers.other_live_executors():
+        # Startup records -- steps, regions, the warmup baseline and the
+        # frozen tags -- are per process. Recording this executor's startup
+        # would overwrite those of the executor still serving, whose reports
+        # would then compare against the wrong warmup and lose the names of
+        # its buffers.
+        logger.warning(
+            "memory monitor: another executor is running in this process; this "
+            "executor's startup is not recorded, and reports keep describing the "
+            "running executor's startup"
+        )
+        yield False
+        return
 
-    # A process can build more than one executor; what the previous one
-    # recorded would otherwise be reported as this one's.
+    # A process can build more than one executor in turn; what the previous
+    # one recorded would otherwise be reported as this one's.
     startup.clear()
+    _startup_executor = providers.current_executor()
     recording = start_tagging_window()
     failed = interrupted = out_of_memory = False
     try:

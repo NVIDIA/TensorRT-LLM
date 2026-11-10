@@ -76,6 +76,7 @@ from ..distributed.communicator import ReduceOp
 from ..memory import monitor as gpu_memory_monitor
 from ..memory.monitor import providers as gpu_memory_providers
 from ..memory.monitor import stacks as gpu_memory_stacks
+from ..memory.monitor import tagging as gpu_memory_tagging
 from ..memory.monitor import triggers as gpu_memory_triggers
 from ..memory.monitor.ranks import RankReporter
 from ..models.modeling_multimodal_mixin import \
@@ -2670,6 +2671,7 @@ class PyExecutor:
         if memory_monitor_token is not None:
             self._memory_monitor_token = None
             gpu_memory_providers.end_executor(memory_monitor_token)
+            gpu_memory_tagging.forget_startup_of(memory_monitor_token)
         # Stops only a stack recording the monitor itself started.
         gpu_memory_stacks.stop_stack_recording()
         encoder_launch_executor = getattr(self, "encoder_launch_executor", None)

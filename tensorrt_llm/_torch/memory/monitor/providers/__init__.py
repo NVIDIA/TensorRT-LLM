@@ -60,9 +60,11 @@ __all__ = [
     "SymmMemProvider",
     "begin_executor",
     "clear_registered_providers",
+    "current_executor",
     "collect_all",
     "default_providers",
     "end_executor",
+    "other_live_executors",
     "register_provider",
 ]
 
@@ -86,6 +88,8 @@ class MonitorProvider(Protocol):
 _registered: list[tuple[object | None, MonitorProvider]] = []
 #: The executor being built; registrations made meanwhile belong to it.
 _current_executor: object | None = None
+#: Executors begun and not yet ended, oldest first.
+_live_executors: list[object] = []
 
 
 def begin_executor() -> object:
@@ -97,7 +101,18 @@ def begin_executor() -> object:
     """
     global _current_executor
     _current_executor = object()
+    _live_executors.append(_current_executor)
     return _current_executor
+
+
+def current_executor() -> object | None:
+    """The token of the executor being built, if any."""
+    return _current_executor
+
+
+def other_live_executors() -> int:
+    """How many executors other than the one being built are alive."""
+    return sum(1 for token in _live_executors if token is not _current_executor)
 
 
 def end_executor(token: object) -> None:
@@ -109,6 +124,7 @@ def end_executor(token: object) -> None:
     """
     global _current_executor
     _registered[:] = [(owner, p) for owner, p in _registered if owner is not token]
+    _live_executors[:] = [t for t in _live_executors if t is not token]
     if _current_executor is token:
         _current_executor = None
     if not any(owner is not None for owner, _ in _registered):
@@ -134,6 +150,7 @@ def clear_registered_providers() -> None:
     """Drop every registration, of every executor."""
     global _current_executor
     _registered.clear()
+    _live_executors.clear()
     _current_executor = None
 
 
