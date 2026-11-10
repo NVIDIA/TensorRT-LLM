@@ -56,7 +56,11 @@ def test_auto_pipeline_detects_registered_ltx23_class_name(tmp_path: Path, class
     ],
 )
 def test_ltx23_routes_workflow_variants(extra_attrs: dict, expected: type) -> None:
-    assert LTX23Pipeline.resolve_variant(SimpleNamespace(extra_attrs=extra_attrs)) is expected
+    config = SimpleNamespace(
+        extra_attrs=extra_attrs,
+        primary_pretrained_config=SimpleNamespace(_name_or_path=""),
+    )
+    assert LTX23Pipeline.resolve_variant(config) is expected
 
 
 def test_ltx23_rejects_unknown_workflow() -> None:
