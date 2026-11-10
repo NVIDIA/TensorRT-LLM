@@ -203,12 +203,14 @@ def _assembled_tower() -> V.VisionTower:
 
 
 def _request_media(modality, grids):
-    """A payload whose pixel tensor has the assembled tower's patch width and no storage."""
+    """A payload whose pixel tensor has the assembled tower's patch width and dtype and no
+    storage."""
     patches = sum(t * h * w for t, h, w in grids)
     key = "pixel_values" if modality == "image" else "pixel_values_videos"
     grid_key = "image_grid_thw" if modality == "image" else "video_grid_thw"
+    tower = _assembled_tower()
     return {
-        key: torch.empty(patches, _assembled_tower().pixel_width, device="meta"),
+        key: torch.empty(patches, tower.pixel_width, dtype=tower.dtype, device="meta"),
         grid_key: torch.tensor(grids),
     }
 
@@ -665,10 +667,12 @@ def _grid(value):
     return lambda d: d["image"].update(image_grid_thw=torch.tensor(value))
 
 
-def _pixels(rows, extra=0):
+def _pixels(rows, extra=0, dtype=None):
     def edit(d):
-        width = _assembled_tower().pixel_width + extra
-        d["video"]["pixel_values_videos"] = torch.empty(rows, width, device="meta")
+        tower = _assembled_tower()
+        d["video"]["pixel_values_videos"] = torch.empty(
+            rows, tower.pixel_width + extra, dtype=dtype or tower.dtype, device="meta"
+        )
 
     return edit
 
@@ -704,6 +708,11 @@ _REFUSED = [
     ("grid_1d", _req(_grid([1, 4, 4]), image=_TILE), r"one \(t, h, w\) row per image"),
     ("pixel_rows", _req(_pixels(5), video=VIDEOS), "describe 48 patch rows"),
     ("pixel_width", _req(_pixels(48, 1), video=VIDEOS), "48 patch rows of"),
+    ("pixel_dtype", _req(_pixels(48, dtype=torch.uint8), video=VIDEOS),
+     "torch.uint8; the vision tower runs at torch.bfloat16"),
+    ("precomputed_embedding",
+     _req(lambda d: d.update(multimodal_embedding=[torch.zeros(4, 8)]), image=_TILE),
+     "precomputed image embeddings"),
     ("no_grid", _req(lambda d: d["video"].pop("video_grid_thw"), video=VIDEOS),
      "this target reads 'pixel_values_videos'"),
     ("positions_short", _req(_positions(3, 1, 40), video=VIDEOS), "one position per prompt token"),

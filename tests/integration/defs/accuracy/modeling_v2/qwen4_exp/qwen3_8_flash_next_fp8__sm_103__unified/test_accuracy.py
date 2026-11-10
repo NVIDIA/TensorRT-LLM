@@ -159,6 +159,14 @@ class TestModelingV2Qwen38FlashNextFp8Sm103Unified(LlmapiAccuracyTestHarness):
         runtime turns reuse off. No FP8_BLOCK_SCALES row names a KV-cache algorithm, so the FP8
         pool is held to the bf16 pool's row.
         """
+        if env.get("TRTLLM_MODELING_V2_MOE_ALLTOALL"):
+            from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
+                NVLinkOneSided,
+            )
+
+            # The target declines the all-to-all where it cannot run it.
+            if not NVLinkOneSided.is_platform_supported():
+                pytest.skip("no MNNVL on this node: the all-to-all MoE round trip cannot run")
         kv_cache_config = KvCacheConfig(
             dtype=kv_dtype,
             free_gpu_memory_fraction=0.6,

@@ -47,6 +47,10 @@ VISION_NORM_EPS = 1e-6
 #: ops' certified ceiling. Calls are cut between frames, so a request is bounded per frame.
 VISION_CALL_MAX_PATCHES = 32768
 
+#: The grids `VisionTower.warm_up` runs: one patch count that is a multiple of 16 (4x4) and one
+#: that is not (2x2).
+WARM_UP_GRIDS = (((1, 4, 4),), ((1, 2, 2),))
+
 #: `mask_type` 0: bidirectional within a batch segment (causal would depend on raster order).
 _VISION_MASK_PADDING = 0
 
@@ -293,6 +297,16 @@ class VisionTower:
         # Persistent scratch `thop_attention` grows in place; not the engine's own workspace.
         self._ws: torch.Tensor | None = None
 
+    def warm_up(self) -> None:
+        """Run the tower once per `WARM_UP_GRIDS` grid on zero pixels, so every JIT kernel it
+        launches is compiled at load rather than on the first media request. The rope and
+        position-embedding kernels take the grid as unspecialized ints; the layer norm's row
+        count is specialized only on divisibility by 16, and the two grids cover both."""
+        device = self._w.pos.device
+        for grid in WARM_UP_GRIDS:
+            rows = sum(t * h * w for t, h, w in grid)
+            self._run(torch.zeros(rows, self.pixel_width, dtype=self.dtype, device=device), grid)
+
     def __call__(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
         """Return the `[sum(t*h*w) / merge**2, out_hidden_size]` placeholder rows, in grid order.
 
@@ -514,10 +528,17 @@ def in_prompt_order(merge: int, params, towers: dict) -> torch.Tensor:
 def validate_request(tower, request) -> None:
     """Admission check the executor runs on every new request, from its host-side payload only.
 
-    It refuses what the forward would assert on: an assert inside the step ends the executor."""
+    It refuses what the forward would assert on: an assert inside the step ends the executor.
+    It also refuses precomputed image embeddings, which the tower cannot splice."""
     data = request.py_multimodal_data
     if not data:
         return
+    if data.get("multimodal_embedding") is not None:
+        raise ValueError(
+            "this target does not splice precomputed image embeddings "
+            "(multimodal_data['multimodal_embedding']); send the image/video pixels "
+            "(multimodal_data['image'/'video']) so the vision tower runs"
+        )
     grids = {}
     for modality, (pixel_key, grid_key) in MEDIA_KEYS.items():
         media = data.get(modality)
@@ -588,6 +609,11 @@ def _media_grid(tower, modality, media, pixel_key, grid_key):
         raise ValueError(
             f"{pixel_key} is {tuple(pixel_values.shape)}; its grids describe {patches} patch "
             f"rows of {tower.pixel_width}"
+        )
+    if pixel_values.dtype != tower.dtype:
+        raise ValueError(
+            f"{pixel_key} is {pixel_values.dtype}; the vision tower runs at {tower.dtype} "
+            "(multimodal_config.vision_gpu_normalize ships uint8)"
         )
     return grid
 
