@@ -77,6 +77,8 @@ def test_skips_resumed_dummy_disagg_and_estimation_lookups():
     manager.is_estimating_kv_cache = True
     manager._record_branch_snapshot_point(_fake_request(), _fake_kv_cache(100, 0), 100)
     assert manager._prefix_matched_tokens_total == 0
+    assert manager._snapshot_pruned_tokens_total == 0
+    assert manager._iter_prefix_snapshot_lost_tokens == 0
 
 
 @pytest.mark.parametrize(
