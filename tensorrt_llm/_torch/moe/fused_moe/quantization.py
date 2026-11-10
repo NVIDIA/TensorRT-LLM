@@ -2715,6 +2715,16 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                     "pre_quant_scale (NVFP4_AWQ / NVFP4_ARC) is not supported "
                     "with non-gated activations.")
 
+        block_scales = [
+            ("w1_weight_scale", w1_weight_scale, module.hidden_size),
+            ("w2_weight_scale", w2_weight_scale, module.intermediate_size)
+        ]
+        if module.is_gated_activation:
+            block_scales.append(
+                ("w3_weight_scale", w3_weight_scale, module.hidden_size))
+        for name, scale, in_features in block_scales:
+            self.check_block_scale(module, name, scale, in_features)
+
         # Cutlass stages the two halves of w3_w1 per expert and needs the slot
         # id as the staging key; other backends write straight through.
         w3_w1_weight_kargs = {}
@@ -2780,6 +2790,62 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         module._weights_loaded = True
         module._streamed_expert_slots.add(local_slot_id)
 
+    def check_block_scale(self, module: torch.nn.Module, name: str,
+                          scale: Optional[torch.Tensor],
+                          in_features: int) -> None:
+        """Refuse a checkpoint block scale that does not cover its weight.
+
+        One scale covers ``module.scaling_vector_size`` inputs of a row, so the
+        checkpoint tensor needs ``ceil(in_features / scaling_vector_size)``
+        columns. The scale loaders zero-pad a narrower tensor to the width of
+        their destination, which leaves the blocks past its end with a zero
+        scale instead of failing: an MXFP4 expert, one E8M0 scale per 32
+        inputs, read as NVFP4 loads that way and computes garbage.
+        """
+        if scale is None:
+            raise ValueError(
+                f"MoE layer {module.layer_idx}: the checkpoint has no {name}; "
+                f"an NVFP4 expert needs one block scale per "
+                f"{module.scaling_vector_size} inputs.")
+        needed = -(-in_features // module.scaling_vector_size)
+        if scale.dim() != 2 or scale.shape[-1] < needed:
+            raise ValueError(
+                f"MoE layer {module.layer_idx}: {name} has shape "
+                f"{tuple(scale.shape)}, but {in_features} inputs in blocks of "
+                f"{module.scaling_vector_size} need {needed} columns. The "
+                f"checkpoint stores this layer in another format; configure "
+                f"the layer's quantization from the checkpoint block it is "
+                f"read from.")
+
+    def check_checkpoint_expert(self, module: torch.nn.Module, weights: Dict,
+                                expert_id: int) -> None:
+        """Refuse a checkpoint expert that this method would load wrongly.
+
+        The loaders read every scale with ``weights.get`` and skip what is
+        missing, so an expert stored in another format loads without an
+        error. Each projection of an expert whose weight ``weights`` carries
+        needs a block scale that covers it (``check_block_scale``) and, when
+        the checkpoint carries global scales, its ``weight_scale_2``, which
+        every alpha is computed from whether the activations are quantized
+        with the checkpoint's ``input_scale`` or dynamically. An expert whose
+        weight is not in ``weights``, as in a partial reload, is not judged.
+        """
+        if (module.weight_loading_mode != MoEWeightLoadingMode.VANILLA
+                or f"{expert_id}.w1.weight" not in weights):
+            return
+        projections = [("w1", module.hidden_size),
+                       ("w2", module.intermediate_size)]
+        if module.is_gated_activation:
+            projections.append(("w3", module.hidden_size))
+        for proj, in_features in projections:
+            key = f"{expert_id}.{proj}.weight_scale"
+            self.check_block_scale(module, key, weights.get(key), in_features)
+            key = f"{expert_id}.{proj}.weight_scale_2"
+            if self.checkpoint_has_global_scales and key not in weights:
+                raise ValueError(
+                    f"MoE layer {module.layer_idx}: the checkpoint has no "
+                    f"{key}; an NVFP4 expert needs its global weight scale.")
+
     def load_fp4_weight_block_scales(
             self,
             module: torch.nn.Module,
@@ -2804,6 +2870,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         for local_slot_id, expert_id in enumerate(load_expert_ids):
             if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
                 if not ignore_weight_scale:
+                    self.check_checkpoint_expert(module, weights, expert_id)
                     w1_weight_scale = weights.get(
                         f"{expert_id}.w1.weight_scale")
                     w3_weight_scale = weights.get(
