@@ -108,309 +108,156 @@ This executes the same tests that run post-merge for this hardware/backend.
 
 ## Waiving tests
 
-Sometimes a test is known to fail due to a bug or unsupported feature. Instead
-of removing it from the YAML test lists, add the test name to
-`tests/integration/test_lists/waives.txt`. A matching entry with a `SKIP` marker
-prevents the test body from running. Always include `SKIP (reason)` explicitly.
+For known failures, add a line to `tests/integration/test_lists/waives.txt` rather
+than removing the test from its YAML list. Use `<test> SKIP (reason)`, with an
+explicit `SKIP` and a tracking bug or brief explanation. A matching waive skips
+the test body.
 
-For PR CI, Jenkins normally merges the PR's waive list with the latest
-target-branch list (tip of tree, or TOT), then applies exact-line removals from
-the PR diff. Pytest receives the merged list via `--waives-file`, so main TOT
-waives can also apply to PRs targeting main even if those lines are absent from
-the PR's checkout.
+In PR CI, Jenkins normally merges the PR list with the latest target-branch
+list (tip of tree, or TOT), then applies exact-line removals from the PR diff.
+Pytest receives this effective list via `--waives-file`: main TOT waives can
+therefore affect PRs targeting main even when absent from the PR checkout.
 
-Use one waive per line, with a bug link or a brief explanation in parentheses:
+### Writing a waive
 
-```text
-accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[False] SKIP (https://nvbugs/6120535)
-```
-
-Blank lines are ignored. `#` starts a comment anywhere on a line, even inside
-quotes or a reason. The `-k` option is supported: `-k "modeling_llama"` is valid,
-but `-k "case#tag"` is truncated at `#`. Use tracking URLs without fragments;
-a `#` in a reason URL can remove its closing parenthesis and make the whole
-waive file fail to parse.
-
-The examples below use illustrative test names and reasons; replace them with
-the actual test and tracking reference.
-
-### Test names and test-list metadata
-
-For both ordinary integration tests and `unittest/` entries, copy the test path
-and command-line options, but remove `ISOLATION`, `TIMEOUT (N)`, and YAML comments
-before appending `SKIP (reason)`. These scheduling/timeout directives are not
-part of the collected node ID; leaving them in a waive name prevents a match.
-For example, these YAML entries:
+Copy the test path and command-line options, omitting `ISOLATION`, `TIMEOUT (N)`,
+and YAML comments. This metadata is not part of the collected node ID; leaving
+it in a waive name prevents a match. This applies to integration and `unittest/`
+entries alike:
 
 ```yaml
 - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales[latency] TIMEOUT (90) ISOLATION
 - unittest/executor/test_base_worker.py ISOLATION
 ```
 
-need these waives, without the test-list metadata:
-
 ```text
 accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales[latency] SKIP (Known issue in this test)
 unittest/executor/test_base_worker.py SKIP (Known issue in this file)
 ```
 
-### Two matching layers for unit tests
+Use one waive per line; blank lines are ignored. `#` starts a comment anywhere,
+including inside quotes or reasons. `-k "modeling_llama"` is valid, but
+`-k "case#tag"` is truncated. Use tracking URLs without fragments: a `#` can
+remove the reason's closing parenthesis and break parsing of the whole file.
+Replace the illustrative names and reasons below with actual tests and bugs.
 
-A test-db entry beginning with `unittest/` launches an integration wrapper,
-`test_unittests.py::test_unittests_v2`, which starts a separate pytest run for the
-selected unit tests. The waive file is applied at both layers:
+### Matching: outer entries and inner unit tests
 
-1. **Outer integration test:** an exact match skips the entire wrapper entry,
-   before it launches the inner pytest run.
-2. **Inner unit tests:** if the wrapper runs, waives can skip individual collected
-   tests, methods/functions, classes, or files. Directory matching is not supported.
+Ordinary integration tests match exact node IDs. A `unittest/` test-db entry
+has two layers: an integration wrapper, then a separate pytest run for its
+selected unit tests. Waives apply during `pytest_collection_modifyitems` at
+each layer, before test bodies run.
 
-The inner matching rules apply only to unit tests. Ordinary integration test
-waives use exact node ID matching; they do not inherit the inner unittest
-file/class/function matching described below.
+**Outer entry:** `unittest/<entry>` becomes
+`test_unittests.py::test_unittests_v2[unittest/<entry>]`. The full entry includes
+options such as `-k`, `-m`, and `--ignore`: copy their order, internal spaces,
+and quotes exactly. Equivalent shell arguments are not normalized. Changing
+them requires rechecking the waive. An exact match skips the wrapper and its
+entire inner run; inner waives cannot restore it.
 
-### Outer layer: match the complete test-db entry
+For `unittest/_torch/modeling SKIP (Known modeling issue)`:
 
-The parser converts a `unittest/` entry into a wrapper node ID, preserving the
-test path and command-line options such as `-k`, `-m`, and `--ignore` inside the
-brackets:
-
-```text
-unittest/_torch/modeling
-  -> test_unittests.py::test_unittests_v2[unittest/_torch/modeling]
-
-unittest/_torch/modeling -k "modeling_llama"
-  -> test_unittests.py::test_unittests_v2[unittest/_torch/modeling -k "modeling_llama"]
-```
-
-The outer waive lookup compares the complete node IDs. It does not interpret
-the waive name as a directory prefix, glob, or regular expression, and it does
-not normalize equivalent shell arguments. Copy the entry exactly, including
-option order, internal spaces, and quotes, after omitting test-list metadata as
-described above.
-
-For this waive:
-
-```text
-unittest/_torch/modeling SKIP (Known modeling issue)
-```
-
-| Separate test-db entry | Entire entry skipped by this waive? | Reason |
-| --- | --- | --- |
-| `unittest/_torch/modeling` | Yes | The complete entry matches. |
-| `unittest/_torch/modeling -k "modeling_llama"` | No | The `-k` option is part of a different entry. |
-| `unittest/_torch/modeling -k "modeling_gemma3"` | No | The `-k` option is part of a different entry. |
-| `unittest/_torch/modeling/test_modeling_llama.py` | No | Its wrapper parameter is the file path, which does not equal the waived directory path. |
-
-Each row is a separate wrapper task. This waive skips the first task as a whole;
-the file and `-k` tasks do not match it, even though they select tests from the
-same directory.
-To skip several filtered entries as whole tasks, list each complete entry:
-
-```text
-unittest/_torch/modeling -k "modeling_llama" SKIP (Known modeling issue)
-unittest/_torch/modeling -k "modeling_gemma3" SKIP (Known modeling issue)
-unittest/_torch/modeling -k "modeling_gpt_oss" SKIP (Known modeling issue)
-unittest/_torch/modeling -k "modeling_gemma4" SKIP (Known modeling issue)
-unittest/_torch/modeling -k "modeling_whisper" SKIP (Known modeling issue)
-```
-
-### Inner layer: match a case, function, class, or file
-
-For an illustrative collected unittest node ID:
-
-```text
-unittest/_torch/modeling/test_example.py::TestExample::test_forward[fp16]
-```
-
-the inner matcher tries the following names in order. Append `SKIP (reason)` to
-the desired name in `waives.txt`:
-
-| Priority | Waive name | Scope |
-| --- | --- | --- |
-| 1 | `unittest/_torch/modeling/test_example.py::TestExample::test_forward[fp16]` | This parameter instance only. |
-| 2 | `unittest/_torch/modeling/test_example.py::TestExample::test_forward` | All parameter instances of this method. |
-| 3 | `unittest/_torch/modeling/test_example.py::TestExample` | All collected tests in this class. |
-| 4 | `unittest/_torch/modeling/test_example.py` | All collected tests in this file. |
-| No inner match | `unittest/_torch/modeling` | The current inner matcher does not expand a directory to its tests. |
-
-The first matching name wins. The matcher first checks the complete node ID,
-then removes the parameter suffix beginning with `[`, then repeatedly removes
-the last `::` component. It stops at the file path; it never walks up directory
-components. A standalone function follows the same rule without the class step.
-Globs, regular expressions, and partial parameter names are not supported.
-To skip an entire directory invocation, use the outer entry rule instead.
-
-A file-level waive applies even when that file is reached through a different
-outer entry. For example:
-
-```text
-unittest/_torch/modeling/test_example.py SKIP (Known issue in this file)
-```
-
-If an outer entry such as `unittest/_torch/modeling -k "example"` collects tests
-from that file, those inner tests are skipped. Other selected files are unaffected
-by this waive. Use a method or parameter-instance waive to keep the rest of the
-file running. Conversely, an inner waive cannot restore tests whose entire outer
-entry was already skipped.
-
-### Platform scope: all platforms, one platform, or one SM version
-
-These rules apply to the shared integration/unittest runner that receives
-`--waives-file`, not automatically to every Jenkins stage or independent test
-runner. Choose the platform scope separately from the test scope. In the table below,
-`<test>` is a complete integration node ID, a complete `unittest/` entry, or an
-inner unittest name at one of the supported levels above.
-
-CI supplies `--test-prefix=<stage-name>` to the outer pytest run and forwards it
-as `<stage-name>/unittest` to the inner unittest run. The table below assumes
-this CI setup. Unprefixed integration waives also work in a local run without
-`--test-prefix`.
-
-| Waive form | Platform scope |
+| Separate test-db entry | Entire entry skipped? |
 | --- | --- |
-| `<test> SKIP (reason)` | All platforms where the test matches and the waive file is supplied. |
-| `full:DGX_H100/<test> SKIP (reason)` | The `DGX_H100` test-prefix namespace. |
-| `full:H100_PCIe/<test> SKIP (reason)` | The `H100_PCIe` test-prefix namespace. |
-| `full:CPU/<test> SKIP (reason)` | The `CPU` test-prefix namespace, without querying a GPU. |
-| `full:sm90/<test> SKIP (reason)` | Runs where the current pytest process can detect SM90 on its visible CUDA device 0. |
+| `unittest/_torch/modeling` | Yes: exact entry. |
+| `unittest/_torch/modeling -k "modeling_llama"` | No: the options make it a different entry. |
+| `unittest/_torch/modeling/test_modeling_llama.py` | No: the file path is a different entry. |
 
-**All platforms:** omit `full:` and the platform name. The parser prepends the
-current `--test-prefix`, if set, so the same waive follows the test across CI
-platforms. For example, this skips the complete filtered entry wherever it runs:
+This is not a directory-prefix match. To skip several filtered entries, list
+each complete entry with its own `SKIP (reason)`.
 
-```text
-unittest/_torch/modeling -k "modeling_llama" SKIP (Known issue on all platforms)
-```
+**Inner unittest:** if the wrapper runs, the matcher checks these names in order:
 
-**One platform:** add `full:<platform>/` using the actual CI test-prefix name:
-
-```text
-full:DGX_H100/unittest/_torch/modeling -k "modeling_llama" SKIP (Known issue on this platform)
-```
-
-`full:` means the name already supplies a prefix. For a matching platform, the
-parser expands the platform name to the current test prefix, including its
-stage suffix. The platform component is the part before the first `-` in
-`--test-prefix`: for `DGX_H100-PyTorch-1`, use `full:DGX_H100/`.
-
-Expansion currently replaces every occurrence of the platform string in the name.
-If it also appears in a path or parameter ID (for example,
-`full:CPU/test_example.py::test_device[CPU]`), that text is rewritten too and can
-prevent a match. SM-qualified waives have the same limitation for repeated
-`smXX` strings.
-
-With `--test-prefix=A100X-PyTorch-1`, the unprefixed waive follows that prefix,
-while `full:DGX_H100/` does not match. Platform names are case-sensitive strings
-from the test prefix, not GPU-name aliases: `full:H100/` does not match
-`DGX_H100-PyTorch-1` or `H100_PCIe-CPP-1`, and `full:A100/` does not match
-`A100X-PyTorch-1`. Copy the platform component from the actual invocation or the
-[stage definitions](source:jenkins/L0_Test.groovy), not the GPU model name or
-test-db YAML filename.
-
-**Several selected platforms:** add a separate prefixed line for each platform:
-
-```text
-full:A100X/unittest/_torch/modeling -k "modeling_llama" SKIP (Known issue on these platforms)
-full:DGX_H100/unittest/_torch/modeling -k "modeling_llama" SKIP (Known issue on these platforms)
-```
-
-These lines do not include `H100_PCIe`. Comma-separated platform lists and `*`
-wildcards are not expanded. Do not also retain an unprefixed `SKIP` for the same
-test when the intended scope is limited to these platforms: that line would
-still skip the matching test on other platforms.
-
-**One SM version across platforms:** use `full:sm<version>/`:
-
-```text
-full:sm90/unittest/_torch/modeling -k "modeling_llama" SKIP (Known issue on SM90)
-```
-
-When SM detection succeeds and returns 90, the parser replaces `sm90` with the
-current test prefix. This can cover both `DGX_H100` and `H100_PCIe` runs without
-listing each name, provided their pytest processes can query the device. It is
-an exact SM-version match, not a minimum version or a wildcard.
-
-SM detection uses `get_sm_version()` in the integration conftest. It queries
-`torch.cuda.get_device_properties(0)` in the current pytest process and returns
-`major * 10 + minor`. It does not infer SM from the stage name, a YAML platform
-condition, or a remote inference server. Device 0 means the first CUDA device
-visible to that process; this is not a check of every GPU in a multi-GPU stage.
-Waives are applied by `pytest_collection_modifyitems`, before test bodies run.
-The relevant GPU visibility is therefore that of the pytest process collecting
-the tests, including the inner pytest process for unittest waives. A GPU used
-later by a model worker or remote server does not establish that visibility.
-
-| Runtime condition | Detection result | Effect of `full:sm90/` with a normal platform prefix |
+| Priority | Waive name (append `SKIP (reason)`) | Scope |
 | --- | --- | --- |
-| Visible device 0 reports compute capability 9.0 | `90` | Expands to the current prefix and can match the test. |
-| `torch.cuda.is_available()` is false, including a CPU-only environment | `0` | Does not match. |
-| `get_device_properties(0)` raises `RuntimeError` | `0` | Does not match. |
-| Importing or calling the helper raises another exception | The waive parser catches the exception. | Does not match. |
+| 1 | `unittest/test_example.py::TestExample::test_forward[fp16]` | One parameter instance. |
+| 2 | `unittest/test_example.py::TestExample::test_forward` | All parameter instances of the method. |
+| 3 | `unittest/test_example.py::TestExample` | All collected tests in the class. |
+| 4 | `unittest/test_example.py` | All collected tests in the file. |
 
-When the SM does not match or detection raises, the parser leaves the literal
-`sm90/` prefix unchanged. It does not fall back to an all-platform waive or raise
-an error for the unmatched waive. Therefore, SM waives are conditional on runtime
-GPU visibility; they are not a guarantee that every stage can determine its SM.
+The first matching name wins: check the full node ID, remove the parameter
+suffix starting at `[`, then remove the last `::` component repeatedly. A
+standalone function has no class step. Matching stops at the file; the current
+inner matcher does not walk directories. A directory invocation can only be
+waived as an exact outer entry. Neither layer supports globs, regular
+expressions, or partial parameter names; ordinary integration tests do not
+inherit the inner file/class/function matching.
 
-**CPU stages:** the standard `CPU-Generic-x86-*` and `CPU-Generic-arm-*` stages
-use `l0_cpu.yml` (zero GPUs) and pass their stage names as `--test-prefix`.
-In a CPU-only process, `get_sm_version()` returns `0`, not a real GPU SM version.
-To waive a test on these CPU stages, use a platform prefix:
+A file waive also skips its tests when collected through another outer entry
+(for example, one with `-k`), leaving other selected files unaffected. Use a
+method or case waive to keep the rest of that file running. Use collected node
+IDs and `unittest/` paths, not repository-root `tests/unittest/` paths.
 
-```text
-full:CPU/unittest/_torch/modeling SKIP (Known CPU-only issue)
-```
+### Platform scope
 
-This matches the whole `unittest/_torch/modeling` entry in `l0_cpu.yml`; it does
-not recursively cover other entries or variants with `-k` options. `full:CPU/`
-also works with the supported inner unittest names. A `cpu_only` test marker
-alone does not determine SM; the helper queries the process's actual CUDA
-visibility.
+Scope applies to runners receiving `--waives-file`, not automatically to every
+Jenkins stage or independent runner. CI passes `--test-prefix=<stage-name>` to
+outer pytest and `<stage-name>/unittest` to inner pytest. The forms below assume
+that setup. `<test>` can be an exact integration/outer entry or a supported
+inner unittest name; platform scope does not change its matching rules.
 
-The same platform syntax applies to individual unit tests. For example, this
-skips one illustrative parameter instance only in the `DGX_H100` namespace:
+| Waive form (append `SKIP (reason)`) | Scope |
+| --- | --- |
+| `<test>` | All platforms where the test matches and the waive file is supplied. The current prefix is added if set; unprefixed integration waives also work locally without `--test-prefix`. |
+| `full:DGX_H100/<test>` | `DGX_H100` stages, e.g. `DGX_H100-PyTorch-1`. |
+| `full:H100_PCIe/<test>` | `H100_PCIe` stages, e.g. `H100_PCIe-CPP-1`. |
+| `full:A100X/<test>` | `A100X` stages, e.g. `A100X-PyTorch-1`. |
+| `full:CPU/<test>` | Standard `CPU-Generic-x86-*` and `CPU-Generic-arm-*` stages (`l0_cpu.yml`, zero GPUs), without GPU detection. |
+| `full:sm90/<test>` | Exact SM90 detected by the collecting pytest process; can cover both `DGX_H100` and `H100_PCIe`. See detection limits below. |
 
-```text
-full:DGX_H100/unittest/_torch/modeling/test_example.py::TestExample::test_forward[fp16] SKIP (Known issue on this platform)
-```
+`full:` supplies a prefix instead of having one prepended. For a matching
+platform, the parser expands the part before the first `-` in `--test-prefix`
+to that full prefix. Names are case-sensitive: `H100` is not an alias for
+`DGX_H100` or `H100_PCIe`, nor is `A100` an alias for `A100X`. Copy the name from
+the actual invocation or [stage definitions](source:jenkins/L0_Test.groovy),
+not the GPU model or test-db filename. A bare `DGX_H100/<test>` without `full:`
+gets the current prefix prepended again.
 
-Use `full:DGX_H100/`, not a bare `DGX_H100/`: without `full:`, the parser treats the
-entire name as unprefixed and prepends the current prefix again. Platform scoping
-does not change the outer exact-entry or inner unittest matching rules.
+For several platforms, use one line each, such as `full:A100X/<test>` and
+`full:DGX_H100/<test>`; these exclude `H100_PCIe`. Comma lists and `*` are not
+expanded. Remove any unprefixed `SKIP` for that test when narrowing its scope,
+or it will still skip on other platforms.
 
-### Checking a waive
+Expansion currently replaces **every occurrence** of the platform/SM string.
+For example, `full:CPU/test_example.py::test_device[CPU]` also rewrites the
+parameter ID and can stop matching; repeated `smXX` strings have the same issue.
 
-- Use a case or function waive for isolated failures. For widespread unit-test
-  failures, a temporary whole-entry waive can restore CI more efficiently;
-  it also skips unaffected tests in that entry. Link the tracking bugs, prioritize
-  their fixes, and remove the waive once those fixes are verified to restore coverage.
-- For a whole entry, copy the test path and all command-line options from the
-  YAML value after `- `, omitting metadata such as `ISOLATION`, `TIMEOUT (N)`,
-  and YAML comments before appending `SKIP (reason)`.
-  Changing the command-line options can stop an existing waive from matching.
-- For an inner unittest, use the actual collected node ID, including parameter
-  IDs when needed. Use `unittest/` paths as in the test lists, not repository-root
-  `tests/unittest/` paths. Check any `full:` hardware restriction as well.
-- Inspect the run's effective `--waives-file`, including target-branch waives.
-  Collection output helps identify names, but `--collect-only` does not prove
-  that a test body will be skipped. Check the run's skip status and reason for
-  the intended entry or case.
+**SM detection:** `full:sm<version>/` expands to the current test prefix only
+when `get_sm_version()` equals that version, not a minimum version or range. It queries
+`torch.cuda.get_device_properties(0)` in the collecting pytest process and
+returns `major * 10 + minor`. Device 0 is that process's first visible CUDA
+device, not every GPU in a multi-GPU stage. The inner pytest process needs its
+own visibility. Stage names, YAML conditions, `cpu_only` markers, and GPUs used
+later by model workers or remote servers do not establish the detected SM.
+
+- CUDA unavailable (including CPU-only processes), or `get_device_properties(0)`
+  raising `RuntimeError`: the helper returns `0`, not a real GPU SM version.
+- Other import/detection exceptions: the waive parser catches them.
+- On mismatch or detection failure, `sm90/` stays literal under a normal platform
+  prefix, so the waive does not match. There is no all-platform fallback or
+  unmatched-waive error. SM detection is not guaranteed in every stage;
+  use `full:CPU/` for standard CPU stages.
+
+### Choosing and checking a waive
+
+- Use a case/function waive for isolated failures. For widespread unit-test
+  failures, a temporary whole-entry waive can restore CI more efficiently,
+  but also skips unaffected tests in that entry. Track the bugs, prioritize
+  fixes, and remove the waive after verifying them to restore coverage.
+- Verify the intended entry/case and platform against the run's effective
+  `--waives-file`, including target-branch waives. `--collect-only` helps identify
+  names but does not prove skipping: check the run's skip status and reason.
 
 Implementation references:
 
-- [`mergeWaiveList`](source:jenkins/L0_MergeRequest.groovy) and
-  [`mergeWaiveList.py`](source:jenkins/scripts/mergeWaiveList.py)
-  combine the PR and target-branch waive lists.
-- [`parse_test_list_lines` and `apply_waives`](source:tests/integration/defs/test_list_parser.py)
-  parse entries and apply exact outer matches.
-- [`test_unittests_v2`](source:tests/integration/defs/test_unittests.py)
-  launches the inner pytest run and forwards the waive file.
-- [`apply_waives_ut`](source:tests/unittest/conftest.py)
-  applies inner unittest matches in the order above.
-- [`get_sm_version`](source:tests/integration/defs/conftest.py)
-  queries visible device 0 and returns `0` when CUDA is unavailable or its device
-  property query raises `RuntimeError`.
+- [Jenkins `mergeWaiveList`](source:jenkins/L0_MergeRequest.groovy) and
+  [`mergeWaiveList.py`](source:jenkins/scripts/mergeWaiveList.py): PR/TOT merging.
+- [`parse_test_list_lines` / `apply_waives`](source:tests/integration/defs/test_list_parser.py):
+  parsing, prefixes, and exact outer matching.
+- [`test_unittests_v2`](source:tests/integration/defs/test_unittests.py) /
+  [`apply_waives_ut`](source:tests/unittest/conftest.py): inner pytest invocation,
+  waive-file forwarding, and inner matching.
+- [`get_sm_version`](source:tests/integration/defs/conftest.py): SM detection.
 
 When changing waive merging, matching, or prefix handling, update this section
 and [`tests/integration/test_lists/AGENTS.md`](source:tests/integration/test_lists/AGENTS.md)

@@ -23,19 +23,15 @@ Supplements the repository-root and `tests/AGENTS.md` guidance.
 Before editing `waives.txt` or changing a waived test-list entry, read the
 [waive matching rules](../../../docs/source/developer-guide/ci-overview.md#waiving-tests).
 
-- Whole-entry waives match exactly, including command-line arguments such as `-k`.
-  Omit `ISOLATION`, `TIMEOUT (N)`, and YAML comments from waive names.
-  Use tracking URLs without fragments; a literal `#` starts a comment anywhere.
-  Recheck the corresponding waive when changing those arguments.
-- Inner unittest waives support case, function, class, and file matching, but
-  not directory matching. A directory waive does not recursively skip its tests.
-- Choose platform scope explicitly: no `full:` prefix applies across platforms;
-  `full:<platform>/` targets a CI test-prefix namespace; `full:sm<version>/`
-  depends on the current pytest process detecting that SM on visible CUDA device 0.
-  Use the actual stage prefix: `H100` is not an alias for `DGX_H100` or `H100_PCIe`.
-  Repeated platform/SM strings in a name are also rewritten; verify the resulting match.
-  For standard CPU stages use `full:CPU/`. List multiple platforms on separate lines.
-- Use case/function waives for isolated failures, or a temporary whole-entry
-  waive for widespread failures. Include tracking links or a reason and restore
-  the skipped coverage once the fixes are verified.
-- Keep this guide and the CI overview in sync when changing waive processing.
+- Copy whole-entry names and options exactly; recheck waives when options change.
+  Omit `ISOLATION`, `TIMEOUT (N)`, and YAML comments. Use `SKIP (reason)` and
+  fragment-free tracking URLs: `#` starts a comment anywhere.
+- Inner unittest matching supports case/function/class/file, not directories.
+  A directory waive only skips its exact outer entry.
+- Choose [platform scope](../../../docs/source/developer-guide/ci-overview.md#platform-scope):
+  unprefixed for all platforms, `full:<platform>/` for actual stage prefixes
+  (`full:CPU/` for CPU), or `full:sm<version>/` for visible device 0's detected SM.
+  Follow the guide's alias, multiple-platform, and string-replacement limits.
+- Use case/function waives for isolated failures or temporary whole-entry waives
+  for widespread failures. Track fixes and restore coverage once verified.
+- Update this file and the CI overview together when changing waive processing.
