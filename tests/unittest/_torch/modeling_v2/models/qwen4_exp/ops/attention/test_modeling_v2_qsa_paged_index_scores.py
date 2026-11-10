@@ -500,3 +500,105 @@ def test_rejects_metadata_shorter_than_the_rows(only_visible_blocks) -> None:
     args["query_positions"] = args["query_positions"][:4]
     with pytest.raises(ValueError, match="one entry per row"):
         op(**args)
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [((67584, 8190),), ((5000, 300), (20000, 1700)), ((131072, 4093),)],
+    ids=["one-request-8190-at-67k", "two-requests", "ragged-4093-at-128k"],
+)
+def test_prefill_query_tile_is_bitwise_the_engine_launch(chunks) -> None:
+    """`prefill_query_tile` takes the deeper query-tiled launch, bitwise the engine's launch on
+    every visible column. `chunks`: `(position of the first row, rows)` per request."""
+    gen = torch.Generator(device=DEV).manual_seed(len(chunks) * 7919 + chunks[0][0])
+    tpb, cr, width = 32, 4, 8196
+    pages = [math.ceil((p + n) / tpb) for p, n in chunks]
+    pool = sum(pages) + 8
+    cache = (torch.randn(pool, tpb, 1, 128, generator=gen, device=DEV) * 0.5).to(torch.bfloat16)
+    table = torch.full((16, width), -1, dtype=torch.int32, device=DEV)
+    perm = 8 + torch.randperm(sum(pages), generator=gen, device=DEV).to(torch.int32)
+    slots = [3 + 5 * r for r in range(len(chunks))]
+    start = 0
+    for slot, n_pages in zip(slots, pages):
+        table[slot, :n_pages] = perm[start : start + n_pages]
+        start += n_pages
+    rows = sum(n for _, n in chunks)
+    q = (torch.randn(rows, 6, 128, generator=gen, device=DEV) * 0.5).to(torch.bfloat16)[:, :4]
+    positions = torch.cat(
+        [torch.arange(p, p + n, dtype=torch.int32, device=DEV) for p, n in chunks]
+    )
+    requests = torch.cat(
+        [torch.full((n,), s, dtype=torch.int32, device=DEV) for s, (_, n) in zip(slots, chunks)]
+    )
+    args = dict(
+        q=q,
+        index_cache=cache,
+        block_table=table,
+        query_positions=positions,
+        request_indices=requests,
+        tokens_per_block=tpb,
+        compress_ratio=cr,
+        only_visible_blocks=True,
+        context_rows=True,
+    )
+    assert _entry._takes_prefill_query_tile(q, True, True, False)
+    with _watch_launches() as watcher:
+        out = op(**args, prefill_query_tile=True)
+        torch.cuda.synchronize()
+    assert watcher.branch == "query_tile"
+    assert watcher.grid[0] == math.ceil(rows / _entry._PREFILL_QUERY_TILE)
+    with _watch_launches() as watcher:
+        default = op(**args)
+        torch.cuda.synchronize()
+    assert watcher.branch == "query_tile"
+    assert watcher.grid[0] != math.ceil(rows / _entry._PREFILL_QUERY_TILE)
+    ref = _engine_scores(**args)
+    vis = _visible(args)
+    assert torch.equal(torch.where(vis, out, 0.0), torch.where(vis, ref, 0.0))
+    assert torch.equal(torch.where(vis, default, 0.0), torch.where(vis, ref, 0.0))
+
+
+def test_visible_split_compiles_one_variant_up_to_a_row_tile() -> None:
+    """Launches of up to one row tile (`16 // heads` rows) share one compiled variant."""
+    dev = torch.cuda.current_device()
+    kernel = _entry._qsa_index_scores_visible_split_kernel
+    heads, dim, tpb, cr = 4, 128, 32, 4
+    g = torch.Generator(device=DEV).manual_seed(7)
+    cache = torch.randn(64, tpb, 1, dim, generator=g, device=DEV).to(torch.bfloat16)
+    table = torch.randint(0, 64, (8, 40), generator=g, device=DEV, dtype=torch.int32)
+    seen = []
+    for rows in (4, 1, 2, 3, 5, 8):
+        q = torch.randn(rows, heads, dim, generator=g, device=DEV).to(torch.bfloat16)
+        positions = torch.randint(100, 1279, (rows,), generator=g, device=DEV, dtype=torch.int64)
+        requests = torch.randint(0, 8, (rows,), generator=g, device=DEV, dtype=torch.int32)
+        args = (q, cache, table, positions, requests, tpb, cr, True, False)
+        _compare(op(*args), op.reference(*args))
+        seen.append(len(kernel.device_caches[dev][0]))
+    assert len(set(seen)) == 1, seen
+
+
+@pytest.mark.parametrize("rows", [32, 64, 96])
+def test_visible_split_wide_batch_programs_are_bitwise_the_narrow_split(rows: int) -> None:
+    """`wide_split` scores every visible column bitwise as the narrow split, over ragged windows."""
+    g = torch.Generator(device=DEV).manual_seed(rows)
+    tpb, cr, heads, dim = 32, 4, 4, 128
+    ctx = torch.randint(64, 200000, (rows,), generator=g, device=DEV)
+    pages = (ctx + tpb - 1) // tpb
+    max_pages = int(pages.max())
+    total = int(pages.sum())
+    cache = torch.randn(total, tpb, 1, dim, generator=g, device=DEV).to(torch.bfloat16)
+    perm = torch.randperm(total, generator=g, device=DEV).to(torch.int32)
+    bt = torch.zeros(rows, max_pages, dtype=torch.int32, device=DEV)
+    off = 0
+    for r in range(rows):
+        bt[r, : int(pages[r])] = perm[off : off + int(pages[r])]
+        off += int(pages[r])
+    q = torch.randn(rows, heads, dim, generator=g, device=DEV).to(torch.bfloat16)
+    pos = (ctx - 1).to(torch.int64)
+    req = torch.arange(rows, dtype=torch.int64, device=DEV)
+    wide = _entry._qsa_index_scores_visible_split(q, cache, bt, pos, req, tpb, cr, False, wide=True)
+    narrow = _entry._qsa_index_scores_visible_split(q, cache, bt, pos, req, tpb, cr, False)
+    torch.cuda.synchronize()
+    visible = torch.clamp((pos + 1) // cr, max=wide.shape[1])
+    mask = torch.arange(wide.shape[1], device=DEV)[None, :] < visible[:, None]
+    assert torch.equal(torch.where(mask, wide, 0.0), torch.where(mask, narrow, 0.0))

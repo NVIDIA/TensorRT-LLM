@@ -65,7 +65,8 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: rows, inject (True), hc_count (4), rank (320), logits_width (384), dtype (bf16).
+    # spec: rows, inject (True), hc_count (4), rank (320), logits_width (384), dtype (bf16),
+    # capture (False: eager; True: replayed from a captured CUDA graph over two steps' logits).
     # The default target's HC mixers run this form on the fresh fp32 `cublas_mm` output
     # over the first `hc_first_cols` = ceil((320 + 4) / 32) * 32 = 352 columns of the
     # first projection: hence the 352-wide cells.
@@ -93,6 +94,23 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
             why="default stack-final mixer (no inject): one decode token",
             spec=dict(rows=1, inject=False, logits_width=352),
         ),
+        # The FP8 unified target's HC mixers in its captured decode graph (batches 1..128).
+        Cell(
+            why="FP8 unified captured HC mixer, batch 2: 352-wide logits",
+            spec=dict(rows=2, logits_width=352, capture=True),
+        ),
+        Cell(
+            why="FP8 unified captured HC mixer, batch 72: 352-wide logits",
+            spec=dict(rows=72, logits_width=352, capture=True),
+        ),
+        Cell(
+            why="FP8 unified captured HC mixer, batch 120: 352-wide logits",
+            spec=dict(rows=120, logits_width=352, capture=True),
+        ),
+        Cell(
+            why="FP8 unified captured HC mixer, batch 128 (the largest): 352-wide",
+            spec=dict(rows=128, logits_width=352, capture=True),
+        ),
     )
 
     note = """
@@ -107,6 +125,9 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
     Preconditions: `logits` fp32, unit column stride, at least
     `rank (+ hc_count)` columns; `hc_count` a power of two. Graph-capturable.
 
+    CUDA-graph capture (the `capture` cells): the replay is bitwise the eager
+    call, and a second step's logits replay bitwise their own eager call.
+
     Source: a Triton kernel JIT-compiled at first call for the running device;
     the cells ran on sm_103. One program per row with an int64 row offset;
     2^31 elements is 6.1e6 rows of 352, far past the envelope.
@@ -120,7 +141,8 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
     Not certified: zero rows; rows past 8192; hc_count other than 4; rank
     other than 320; float16 outputs. The kernel has no row-count switch, so row
     counts between the cells take the same path, and the logits width enters
-    only as the row stride (128 rows is driven at 384 wide only).
+    only as the row stride. Not driven under capture: the form without the
+    injection, and the other captured batches.
     """
 
     def __call__(
