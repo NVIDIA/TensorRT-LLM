@@ -102,6 +102,7 @@ def _manager(offload: bool) -> Mock:
         impl=impl,
         pp_layers=[0, 1],
         num_kv_heads_per_layer=[1, 1],
+        mixed_precision_high_layers={},
         get_disagg_role_mapper_kinds=lambda: {Role.ALL: MapperKind.REPLICATED},
         get_disagg_role_layouts=lambda: {},
     )
@@ -233,7 +234,7 @@ def test_receiver_dispatches_host_and_device_pool_requests(
     receiver.dispatch_task(task)
     assert task.expected_transfers == 1
     receiver._request_sender_data.assert_called_once_with(
-        src.sender_endpoints[0], req_info.to_bytes()
+        src.sender_endpoints[0], req_info.to_bytes(), task._kv_result_report_tokens[0]
     )
 
 
