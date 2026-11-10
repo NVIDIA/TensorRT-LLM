@@ -957,7 +957,7 @@ class TestKeepaliveInterval:
             ("2.5", 2.5),
             (" 30 ", 30.0),
             ("0", 0.0),
-            ("-3", 0.0),
+            ("0.0", 0.0),
         ],
     )
     def test_the_interval_is_read_from_the_environment(
@@ -972,8 +972,8 @@ class TestKeepaliveInterval:
         monkeypatch.setattr(responses_utils, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", 0.25)
         assert responses_stream_keepalive_interval() == 0.25
 
-    @pytest.mark.parametrize("raw", ["soon", "1s", "nan", "inf"])
-    def test_a_value_that_is_not_a_number_keeps_the_default_and_warns_once(
+    @pytest.mark.parametrize("raw", ["soon", "1s", "nan", "inf", "-3", "-0.5"])
+    def test_a_negative_value_or_one_that_is_not_a_number_keeps_the_default_and_warns_once(
         self, monkeypatch, logged_warnings, raw
     ):
         _set_keepalive_env(monkeypatch, raw)

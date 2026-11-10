@@ -3319,9 +3319,9 @@ def responses_stream_keepalive_interval() -> float:
     """Seconds a stream may stay silent before a keepalive is sent; 0 means never.
 
     ``TRTLLM_RESPONSES_STREAM_KEEPALIVE_S`` when it is set, else
-    ``RESPONSES_STREAM_KEEPALIVE_INTERVAL_S``. Zero or a negative value turns
-    the keepalive off. A value that is not a finite number is reported once
-    and the default kept.
+    ``RESPONSES_STREAM_KEEPALIVE_INTERVAL_S``. Zero turns the keepalive off.
+    A value that is negative or not a finite number is reported once and the
+    default kept.
     """
     raw = os.environ.get(RESPONSES_STREAM_KEEPALIVE_ENV, "").strip()
     if not raw:
@@ -3330,13 +3330,14 @@ def responses_stream_keepalive_interval() -> float:
         interval = float(raw)
     except ValueError:
         interval = math.nan
-    if not math.isfinite(interval):
+    if not math.isfinite(interval) or interval < 0:
         logger.warning_once(
-            f"{RESPONSES_STREAM_KEEPALIVE_ENV}={raw!r} is not a finite number "
-            f"of seconds; keeping {RESPONSES_STREAM_KEEPALIVE_INTERVAL_S:g} s.",
+            f"{RESPONSES_STREAM_KEEPALIVE_ENV}={raw!r} is not a finite, "
+            f"non-negative number of seconds; keeping "
+            f"{RESPONSES_STREAM_KEEPALIVE_INTERVAL_S:g} s.",
             key="responses_stream_keepalive_env")
         return RESPONSES_STREAM_KEEPALIVE_INTERVAL_S
-    return max(interval, 0.0)
+    return interval
 
 
 _IN_PROGRESS_FRAME_START = "event: response.in_progress\n"
