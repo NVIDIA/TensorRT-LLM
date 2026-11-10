@@ -16,6 +16,7 @@
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import TracebackType
 from typing import Literal
 
 from tensorrt_llm import _profiler
@@ -81,6 +82,17 @@ class _ProfiledKvCacheTransceiver(KvCacheTransceiver):
     def __getattr__(self, name: str) -> object:
         # Backend capabilities read by orchestration belong to the resource owner.
         return getattr(self._transceiver, name)
+
+    def __enter__(self) -> "_ProfiledKvCacheTransceiver":
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc_val: BaseException | None,
+        _exc_tb: TracebackType | None,
+    ) -> None:
+        self.shutdown()
 
     @property
     def kv_transfer_timeout_ms(self) -> int | None:
