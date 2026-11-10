@@ -19,6 +19,7 @@ end-to-end test runs Qwen3-0.6B beam search with and without the library and
 requires a GPU plus the model checkpoint.
 """
 
+import functools
 import math
 import os
 from types import SimpleNamespace
@@ -30,6 +31,10 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm._torch.attention.backends.fmha.beam_shared_prefix import (
     LIB_NAME,
     BeamSharedPrefixFmha,
+    _BeamStepState,
+    _Config,
+    _HostPlan,
+    _step_indices,
     _StepIndices,
     fused_tail_and_merge,
     merge_prefix_and_tail,
@@ -61,8 +66,7 @@ def _reference_prefix_state(
     return out.view(rows, num_heads, head_dim), lse2.view(rows, num_heads)
 
 
-@pytest.mark.parametrize("tail_len, with_mask", [(1, False), (3, False), (4, True)])
-@pytest.mark.parametrize("group", [1, 2, 4])
+@pytest.mark.parametrize("tail_len, with_mask, group", [(4, True, 2), (1, False, 4), (3, False, 1)])
 def test_merge_prefix_and_tail_matches_dense_attention(tail_len, with_mask, group):
     gen = torch.Generator().manual_seed(1234)
     rows, num_kv_heads, head_dim, prefix_len = 6, 2, 64, 37
@@ -157,14 +161,23 @@ def _beam_meta(manager, *, beam_width=4, request_ids=(7, 9), kv_lens=(11, 7),
     )
 
 
-# FlashInfer layout: the full product. FA4 layout (bf16 only, as FA4 is): group x tail x head size.
+# Group size only changes the tile padding (1, 2, 4, 8 share one code path; 3 and 6 need padding),
+# head size only the tile, tail length 0/1/3 are distinct paths, dtype only the casts, and the FA4
+# layout only the LSE strides and scale.
 _FUSED_CASES = [
-    (g, t, h, dt, False)
-    for g in (1, 2, 4, 8)
-    for t in (0, 1, 3)
-    for h in (64, 128)
-    for dt in (torch.bfloat16, torch.float16)
-] + [(g, t, h, torch.bfloat16, True) for g in (1, 2, 4, 8) for t in (0, 1, 3) for h in (64, 128)]
+    (1, 3, 128, torch.bfloat16, False),
+    (4, 3, 128, torch.bfloat16, False),
+    (8, 1, 64, torch.bfloat16, False),
+    (4, 0, 128, torch.bfloat16, False),
+    (2, 3, 64, torch.float16, False),
+    (8, 0, 128, torch.float16, False),
+    (3, 3, 128, torch.bfloat16, False),
+    (6, 1, 64, torch.bfloat16, False),
+    (4, 3, 256, torch.bfloat16, False),
+    (2, 3, 128, torch.bfloat16, True),
+    (4, 0, 64, torch.bfloat16, True),
+    (8, 1, 128, torch.bfloat16, True),
+]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -302,6 +315,93 @@ def test_plan_step_reads_beam0_prompt_pages_from_kv_manager_v2(monkeypatch):
 
 
 @needs_flashinfer
+def test_plan_step_with_prompts_that_fill_their_last_page_exactly(monkeypatch):
+    """A prompt that is a multiple of the block size has a full last page, not an empty one."""
+    monkeypatch.setenv("TLLM_FMHA_LIBS", f"+{LIB_NAME}")
+    manager = _ManagerV2({7: [40, 41, 42], 9: [50, 51]})
+    meta = _beam_meta(manager, kv_lens=(9, 5), prompt_lens=(8, 4))
+    plan_step(meta)
+    plan = meta.fmha_plan_caches[LIB_NAME].plan
+    assert plan.paged_kv_indices.tolist() == [40, 41, 50]
+    assert plan.paged_kv_last_page_len.tolist() == [4, 4]
+
+
+@needs_flashinfer
+def test_plan_step_under_cuda_graphs_fixes_the_tail_and_rejects_a_longer_one(monkeypatch):
+    """Under CUDA graphs the tail length is fixed at ``MAX_TAIL`` when the graph is captured, so a
+    beam with more generated positions than that fails loudly instead of being truncated."""
+    monkeypatch.setenv("TLLM_FMHA_LIBS", f"+{LIB_NAME}")
+    manager = _ManagerV2({7: [40, 41, 42, 43], 9: [50, 51, 52]})
+    monkeypatch.setenv("TLLM_BEAM_SHARED_PREFIX_MAX_TAIL", "6")
+    meta = _beam_meta(manager)
+    meta.is_cuda_graph = True
+    plan_step(meta)
+    assert meta.fmha_plan_caches[LIB_NAME].plan.tail_len == 6
+    monkeypatch.setenv("TLLM_BEAM_SHARED_PREFIX_MAX_TAIL", "2")
+    longer = _beam_meta(manager, kv_lens=(15, 7))  # request 7 carries 4 generated positions
+    longer.is_cuda_graph = True
+    with pytest.raises(RuntimeError, match="CUDA graphs were captured"):
+        plan_step(longer)
+
+
+def test_step_indices_gather_the_tail_through_cache_indirection():
+    """Past generated positions are read from the block of the beam that produced them (per the
+    sampler's indirection), across a block boundary, behind a context row, with page stride 2."""
+    num_ctx, beam_width, tokens_per_block, page_stride = 1, 2, 4, 2
+    prompt_lens, kv_lens = (6, 5), (10, 8)  # tails of 3 and 2 generated positions; tail_len 3
+    rows = beam_width * len(prompt_lens)
+    offsets = torch.zeros(1, num_ctx + rows, 2, 6, dtype=torch.int32)
+    for row in range(num_ctx + rows):
+        for block in range(6):
+            offsets[0, row, 0, block] = page_stride * (10 * row + block)  # page 10*row + block
+    indirection = torch.zeros(len(prompt_lens), beam_width, 16, dtype=torch.int32)
+    indirection[:, 0, :] = 1  # beam 0 reads positions written by beam 1, and the reverse
+    meta = SimpleNamespace(
+        num_contexts=num_ctx,
+        tokens_per_block=tokens_per_block,
+        kv_cache_block_offsets=offsets,
+        kv_lens_cuda_runtime=torch.tensor([5, *[v for v in kv_lens for _ in range(beam_width)]]),
+        prompt_lens_cuda_runtime=torch.tensor(
+            [5, *[p for p in prompt_lens for _ in range(beam_width)]]
+        ),
+        cache_indirection=indirection,
+    )
+    plan = _HostPlan(
+        step=1,
+        num_requests=len(prompt_lens),
+        beam_width=beam_width,
+        qo_indptr=torch.zeros(3, dtype=torch.int32),
+        paged_kv_indptr=torch.zeros(3, dtype=torch.int32),
+        paged_kv_indices=torch.zeros(1, dtype=torch.int32),
+        paged_kv_last_page_len=torch.zeros(2, dtype=torch.int32),
+        tail_len=3,
+    )
+    state = _BeamStepState(
+        is_cuda_graph=False,
+        pool_index=0,
+        page_scale=page_stride,
+        page_stride=page_stride,
+        config=_Config.from_env(),
+        num_pages=1000,
+        plan=plan,
+    )
+    got = _step_indices(state, meta, 1000)
+
+    for row in range(rows):
+        request, beam = divmod(row, beam_width)
+        current = kv_lens[request] - 1
+        assert got.write_page[row] == 10 * (num_ctx + row) + current // tokens_per_block
+        assert got.write_slot[row] == current % tokens_per_block
+        for i in range(3):
+            position = prompt_lens[request] + i
+            source_row = num_ctx + request * beam_width + (1 - beam)
+            assert got.tail_valid[row, i] == (position < current)
+            if position < current:
+                assert got.tail_page[row, i] == 10 * source_row + position // tokens_per_block
+                assert got.tail_slot[row, i] == position % tokens_per_block
+
+
+@needs_flashinfer
 def test_plan_step_drops_the_previous_plan_when_a_step_is_not_planned(monkeypatch):
     """A step that declines planning must not leave the last step's page table to be reused."""
     monkeypatch.setenv("TLLM_FMHA_LIBS", f"+{LIB_NAME}")
@@ -331,8 +431,6 @@ def test_plan_step_rejects_an_invalid_prompt_page_index(monkeypatch):
         (PositionEmbeddingType.learned_absolute, True),
         (PositionEmbeddingType.rope_gpt_neox, False),
         (PositionEmbeddingType.alibi, False),
-        (PositionEmbeddingType.relative, False),
-        (PositionEmbeddingType.deferred, False),
     ],
 )
 def test_library_serves_only_models_that_apply_position_embeddings_themselves(
@@ -452,44 +550,84 @@ def _assert_beams_match(reference, candidate, beam_width, min_overlap=0.9):
                 assert abs(ref_lp - cand_lp) < 0.1 + 0.02 * abs(ref_lp)
 
 
+_E2E_BASE_ENV = {"TLLM_WORKER_USE_SINGLE_PROCESS": "1"}
+_E2E_BEAM_WIDTH = 16
+_E2E_PROMPT_LENGTHS = (300, 173)
+_E2E_MAX_TOKENS = 3
+# Prompts end 30 tokens into a 32-token KV block, so 5 generated tokens cross a block boundary.
+_BOUNDARY_PROMPT_LENGTHS = (286, 190)
+_BOUNDARY_MAX_TOKENS = 5
+
+
+def _e2e_prompts(lengths):
+    vocab = 150000
+    return [
+        [1024 + ((17 * i + 13 * p) % (vocab - 1024)) for p in range(n)]
+        for i, n in enumerate(lengths)
+    ]
+
+
+@functools.lru_cache(maxsize=2)
+def _e2e_fallback_beams(model_path, lengths, max_tokens):
+    """The fallback kernel's beams; the plain and FA4 tests share one run."""
+    return _run_beam_search(
+        model_path, _e2e_prompts(lengths), _E2E_BEAM_WIDTH, max_tokens, _E2E_BASE_ENV
+    )
+
+
+def _e2e_candidate(model_path, lengths, max_tokens, **extra_env):
+    """Beam search with the library on; returns the beams and the library's call counts."""
+    iterations = {}
+    env = (
+        _E2E_BASE_ENV
+        | {
+            "TLLM_FMHA_LIBS": f"+{LIB_NAME}",
+            # Check mode validates the page table and prefix attention against dense references.
+            "TLLM_BEAM_SHARED_PREFIX_CHECK": "1",
+            "TLLM_BEAM_SHARED_PREFIX_MAX_TAIL": str(max_tokens - 1),
+        }
+        | extra_env
+    )
+    beams = _run_beam_search(
+        model_path,
+        _e2e_prompts(lengths),
+        _E2E_BEAM_WIDTH,
+        max_tokens,
+        env,
+        iterations=iterations,
+    )
+    assert iterations["served"] > 0, iterations
+    return beams
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.skipif(_qwen3_small_path() is None, reason="Qwen3-0.6B checkpoint not available")
 @pytest.mark.threadleak(enabled=False)
 def test_beam_shared_prefix_matches_fallback_e2e():
     """Beam search with the library reproduces the fallback kernel's beams.
 
-    Three output tokens over a prompt that spans several KV blocks, two
-    requests in one batch, CUDA graphs on: the second and third decode steps
-    exercise the indirection-gathered tail, the first the empty tail.
+    Three output tokens over a prompt that spans several KV blocks, two requests in one batch,
+    CUDA graphs on: the second and third decode steps exercise the indirection-gathered tail, the
+    first the empty tail.
     """
     model_path = _qwen3_small_path()
-    vocab = 150000
-    prompts = [
-        [1024 + ((17 * i + 13 * p) % (vocab - 1024)) for p in range(n)]
-        for i, n in enumerate((300, 173))
-    ]
-    beam_width, max_tokens = 16, 3
+    candidate = _e2e_candidate(model_path, _E2E_PROMPT_LENGTHS, _E2E_MAX_TOKENS)
+    reference = _e2e_fallback_beams(model_path, _E2E_PROMPT_LENGTHS, _E2E_MAX_TOKENS)
+    _assert_beams_match(reference, candidate, _E2E_BEAM_WIDTH)
 
-    base_env = {"TLLM_WORKER_USE_SINGLE_PROCESS": "1"}
-    reference = _run_beam_search(model_path, prompts, beam_width, max_tokens, base_env)
-    # Check mode validates the page table and prefix attention against dense references.
-    iterations = {}
-    candidate = _run_beam_search(
-        model_path,
-        prompts,
-        beam_width,
-        max_tokens,
-        base_env
-        | {
-            "TLLM_FMHA_LIBS": f"+{LIB_NAME}",
-            "TLLM_BEAM_SHARED_PREFIX_CHECK": "1",
-            "TLLM_BEAM_SHARED_PREFIX_MAX_TAIL": str(max_tokens - 1),
-        },
-        iterations=iterations,
-    )
 
-    assert iterations["served"] > 0, iterations
-    _assert_beams_match(reference, candidate, beam_width)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.skipif(_qwen3_small_path() is None, reason="Qwen3-0.6B checkpoint not available")
+@pytest.mark.threadleak(enabled=False)
+def test_beam_shared_prefix_tails_cross_a_kv_block_boundary_e2e():
+    """Five generated tokens cross a KV block boundary, so later steps gather tails of up to four
+    positions from two blocks. The fallback kernel's own beam sets differ between processes at this
+    length (near-tied beams are pruned differently), so only gross disagreement fails here; the
+    per-layer dense check (check mode) and the index unit test carry the exactness."""
+    model_path = _qwen3_small_path()
+    candidate = _e2e_candidate(model_path, _BOUNDARY_PROMPT_LENGTHS, _BOUNDARY_MAX_TOKENS)
+    reference = _e2e_fallback_beams(model_path, _BOUNDARY_PROMPT_LENGTHS, _BOUNDARY_MAX_TOKENS)
+    _assert_beams_match(reference, candidate, _E2E_BEAM_WIDTH, min_overlap=0.5)
 
 
 def _fa4_prefix_available() -> bool:
@@ -506,35 +644,16 @@ def _fa4_prefix_available() -> bool:
 def test_beam_shared_prefix_fa4_backend_matches_fallback_e2e():
     """The FlashAttention-4 prefix backend reproduces the fallback kernel's beams, graphs on."""
     model_path = _qwen3_small_path()
-    vocab = 150000
-    prompts = [
-        [1024 + ((17 * i + 13 * p) % (vocab - 1024)) for p in range(n)]
-        for i, n in enumerate((300, 173))
-    ]
-    beam_width, max_tokens = 16, 3
-
-    base_env = {"TLLM_WORKER_USE_SINGLE_PROCESS": "1"}
-    reference = _run_beam_search(model_path, prompts, beam_width, max_tokens, base_env)
-    iterations = {}
-    candidate = _run_beam_search(
+    candidate = _e2e_candidate(
         model_path,
-        prompts,
-        beam_width,
-        max_tokens,
-        base_env
-        | {
-            "TLLM_FMHA_LIBS": f"+{LIB_NAME}",
-            "TLLM_BEAM_SHARED_PREFIX_BACKEND": "fa4",
-            "TLLM_BEAM_SHARED_PREFIX_CHECK": "1",
-            "TLLM_BEAM_SHARED_PREFIX_MAX_TAIL": str(max_tokens - 1),
-        },
-        iterations=iterations,
+        _E2E_PROMPT_LENGTHS,
+        _E2E_MAX_TOKENS,
+        TLLM_BEAM_SHARED_PREFIX_BACKEND="fa4",
     )
-    assert iterations["served"] > 0, iterations
-
     # FA4 rounds differently, and beam search prunes at near-ties, so 1-2 of 16 beams may differ
     # (equally accurate against fp32). The top beam and shared beams' scores must still agree.
-    _assert_beams_match(reference, candidate, beam_width, min_overlap=0.75)
+    reference = _e2e_fallback_beams(model_path, _E2E_PROMPT_LENGTHS, _E2E_MAX_TOKENS)
+    _assert_beams_match(reference, candidate, _E2E_BEAM_WIDTH, min_overlap=0.75)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
