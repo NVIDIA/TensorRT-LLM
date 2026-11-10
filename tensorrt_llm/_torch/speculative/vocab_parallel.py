@@ -851,6 +851,13 @@ def markov_sampled_chain(
         ``[B, K]`` int32 draft tokens.
     """
     num_reqs, num_steps, vocab = block_logits.shape
+    # The kernels read every bias column and gather markov_w1 rows of drawn
+    # tokens up to the logits width, so narrower tables would be read past.
+    if markov_w1.shape[0] != vocab or markov_w2.shape[0] != vocab:
+        raise ValueError(
+            f"DSpark Markov head: tables of {markov_w1.shape[0]} / {markov_w2.shape[0]} "
+            f"rows do not match the draft logits width {vocab}."
+        )
     device = block_logits.device
     tokens = torch.empty((num_reqs, num_steps), dtype=torch.int32, device=device)
     if num_reqs == 0 or num_steps == 0:

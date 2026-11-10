@@ -654,6 +654,29 @@ def test_chain_noise_reaches_far_tail_tokens() -> None:
     assert out.max() > 32.5 and out.min() > -2.9
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("table", ["w1", "w2"])
+def test_chain_rejects_markov_tables_narrower_than_the_logits(table: str) -> None:
+    """A draft logits width beyond the Markov tables raises before any kernel launch."""
+    vocab, rank = 64, 4
+    w1, w2 = torch.zeros(vocab, rank), torch.zeros(vocab, rank)
+    if table == "w1":
+        w1 = torch.zeros(vocab - 8, rank)
+    else:
+        w2 = torch.zeros(vocab - 8, rank)
+    with pytest.raises(ValueError, match="do not match the draft logits width 64"):
+        markov_sampled_chain(
+            torch.zeros(1, 1, vocab),
+            torch.zeros(1, dtype=torch.int64),
+            w1,
+            w2,
+            torch.ones(1),
+            torch.zeros(1, dtype=torch.int64),
+            torch.zeros(1, 1, dtype=torch.int64),
+            torch.empty(1, 1, vocab),
+        )
+
+
 @_needs_cuda
 @pytest.mark.parametrize(
     "logit, temperature", [(2.0**30, 1.0), (128.0, 1 / 4096)], ids=["huge_logit", "tiny_temp"]
