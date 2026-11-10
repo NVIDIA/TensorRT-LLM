@@ -144,6 +144,8 @@ class DSv41DSparkDraftModel(DSv4DSparkDraftModel):
     block_cls = DSv41DSparkBlock
     uses_lagged_pre = True
     checkpoint_fp8_block_size = 32
+    # V4.1 loads attention through cache_attn_weights_from_state_dict (BF16).
+    supports_fp8_attn_projections = False
     # Reference DSparkBlock.forward_head passes collapsed x to confidence,
     # while only the shared vocabulary projection consumes norm(x).
     confidence_uses_normalized_hidden = False

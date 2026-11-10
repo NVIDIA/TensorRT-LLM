@@ -1248,6 +1248,8 @@ class DSv4DSparkDraftModel(nn.Module):
     block_cls = DSv4DSparkBlock
     uses_lagged_pre = False
     checkpoint_fp8_block_size = 128
+    # Whether post_load_weights(weights) can bind the loaded FP8 attention Linears.
+    supports_fp8_attn_projections = True
     confidence_uses_normalized_hidden = True
 
     def __init__(
@@ -1364,7 +1366,9 @@ class DSv4DSparkDraftModel(nn.Module):
         self._freqs_cap = _runtime_position_cap(model_config, config, self.block_size + 2)
         self._freqs_table_cache: Dict = {}
         self._context_wkv_fp8 = None
-        self._use_bf16_linear = _use_dspark_bf16_linear(model_config.mapping)
+        self._use_bf16_linear = _use_dspark_bf16_linear(
+            model_config.mapping, fp8_supported=self.supports_fp8_attn_projections
+        )
 
     def post_load_weights(self, weights: Optional[Dict] = None) -> None:
         """Transform draft linears and bind the selected attention backend."""
@@ -1401,51 +1405,9 @@ class DSv4DSparkDraftModel(nn.Module):
         scale = scale.repeat_interleave(block, 1)[:, :input_features]
         return (weight * scale).to(torch.bfloat16)
 
-    def _cache_attn_weights(self, src: Dict) -> None:
-        """Populate each stage's ``_dspark_attn`` from a dict of raw ``mtp.{s}.attn.*``
-        tensors (source-agnostic core shared by the two public entry points).
-
-        The captured-context attention runs the validated ``_dspark_attention_forward_legacy``
-        free function on reference-layout bf16 weights dequantized here. Sourcing the
-        separate ``wq_a``/``wkv`` (plain 128×128 block scale) sidesteps the TRT-LLM
-        ``MLA`` module's fused + interleaved fp8 storage (``kv_a_proj_with_mqa`` fuses
-        ``q_a``+``kv`` and stores the scale interleaved). This mirrors the
-        golden-validated dequant exactly.
-        """
-        self._use_bf16_linear = True
-        self._context_wkv_fp8 = None
-        for s, stage in enumerate(self.mtp_layers):
-            pref = f"mtp.{s}.attn."
-            dev = stage.input_layernorm.weight.device
-
-            def deq(name: str, fp8: bool) -> torch.Tensor:
-                w = src[f"{pref}{name}.weight"].to(dev)
-                if fp8:
-                    return self._block_dequant(
-                        w,
-                        src[f"{pref}{name}.scale"].to(dev),
-                        block=self.checkpoint_fp8_block_size,
-                    )
-                return w.to(torch.bfloat16)
-
-            stage._dspark_attn = dict(
-                wq_a=deq("wq_a", True),
-                q_norm_w=src[f"{pref}q_norm.weight"].to(dev).to(torch.bfloat16),
-                wq_b=deq("wq_b", True),
-                wkv=deq("wkv", True),
-                kv_norm_w=src[f"{pref}kv_norm.weight"].to(dev).to(torch.bfloat16),
-                # wo_a IS fp8+scale in the checkpoint (verified); always dequant.
-                wo_a=deq("wo_a", True),
-                wo_b=deq("wo_b", True),
-                attn_sink=src[f"{pref}attn_sink"].to(dev).float(),
-            )
-
     def cache_attn_weights_from_checkpoint(self, ckpt_dir: str, weight_map: Dict[str, str]) -> None:
         """Populate ``_dspark_attn`` by reading the ``mtp.{s}.attn.*`` tensors from the
-        checkpoint shards on disk, then dequantizing via :meth:`_cache_attn_weights`.
-
-        TODO(step 3): source these from the loaded ``MLA`` modules instead, once the
-        fused/interleaved fp8 scale layout is decoded, to drop the checkpoint I/O.
+        checkpoint shards on disk, then dequantizing via :meth:`_bind_bf16_attn_projections`.
         """
         from safetensors import safe_open
 
@@ -1459,14 +1421,14 @@ class DSv4DSparkDraftModel(nn.Module):
             with safe_open(os.path.join(ckpt_dir, shard), framework="pt", device="cpu") as f:
                 for k in ks:
                     raw[k] = f.get_tensor(k)
-        self._cache_attn_weights(raw)
+        self._bind_bf16_attn_projections(raw)
 
     def cache_attn_weights_from_state_dict(self, weights: Dict) -> None:
         """Populate ``_dspark_attn`` from an already-loaded in-memory ``weights`` dict
-        (no extra disk I/O); used on the one-engine load path
-        (``DSv4DSparkForCausalLM.load_weights``). Delegates to :meth:`_cache_attn_weights`.
+        (no extra disk I/O). DeepSeek-V4.1 DSpark loads its BF16 attention projections
+        this way; delegates to :meth:`_bind_bf16_attn_projections`.
         """
-        self._cache_attn_weights(weights)
+        self._bind_bf16_attn_projections(weights)
 
     def _dspark_freqs_table(self, device: torch.device) -> torch.Tensor:
         """Return the plain-RoPE table cached for ``(device, cap)``.
@@ -2156,7 +2118,12 @@ class DSv4DSparkDraftModel(nn.Module):
         )
 
     def _bind_bf16_attn_projections(self, weights: Dict) -> None:
-        """Bind all five captured-context attention projections as BF16 tensors."""
+        """Bind all five captured-context attention projections as BF16 tensors.
+
+        Dequantizes the raw ``mtp.{s}.attn.*`` checkpoint tensors with the
+        checkpoint's FP8 block size and disables every FP8 projection path.
+        """
+        self._use_bf16_linear = True
         for stage_id, stage in enumerate(self.mtp_layers):
             prefix = f"mtp.{stage_id}.attn."
             device = stage.input_layernorm.weight.device
@@ -2164,7 +2131,7 @@ class DSv4DSparkDraftModel(nn.Module):
             def dequant(name: str) -> torch.Tensor:
                 weight = weights[f"{prefix}{name}.weight"].to(device)
                 scale = weights[f"{prefix}{name}.scale"].to(device)
-                return self._block_dequant(weight, scale)
+                return self._block_dequant(weight, scale, block=self.checkpoint_fp8_block_size)
 
             stage._dspark_context_wkv_slice = None
             stage._dspark_attn = dict(
@@ -4496,15 +4463,20 @@ def _fused_fp8_output_projection_from_quantized(
     return projected.view(batch, block, projected.shape[-1])
 
 
-def _use_dspark_bf16_linear(mapping) -> bool:
+def _use_dspark_bf16_linear(mapping, fp8_supported: bool = True) -> bool:
     """Keep BF16 outside Rubin unless FP8 is explicitly requested."""
     requested = os.environ.get(_DSPARK_LINEAR_BACKEND_ENV)
     sharded = mapping.tp_size > 1 and not mapping.enable_attention_dp
     if requested is None:
-        return sharded or get_sm_version() != 107
+        return not fp8_supported or sharded or get_sm_version() != 107
     backend = requested.lower()
     if backend not in ("fp8", "bf16"):
         raise ValueError(f"{_DSPARK_LINEAR_BACKEND_ENV} must be 'fp8' or 'bf16', got {backend!r}")
+    if backend == "fp8" and not fp8_supported:
+        raise ValueError(
+            f"{_DSPARK_LINEAR_BACKEND_ENV}=fp8 is not supported by this DSpark drafter; "
+            "it binds BF16 attention projections"
+        )
     if backend == "fp8" and sharded:
         raise ValueError(f"{_DSPARK_LINEAR_BACKEND_ENV}=fp8 requires TP=1 or attention DP")
     return backend == "bf16"

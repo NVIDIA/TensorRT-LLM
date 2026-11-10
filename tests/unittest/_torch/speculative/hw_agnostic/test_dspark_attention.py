@@ -561,6 +561,22 @@ def test_use_dspark_bf16_linear_rejects_sharded_fp8(monkeypatch):
         modeling_dspark._use_dspark_bf16_linear(mapping)
 
 
+@pytest.mark.parametrize("value,expected", [(None, True), ("bf16", True), ("fp8", None)])
+def test_use_dspark_bf16_linear_without_fp8_support(monkeypatch, value, expected):
+    monkeypatch.setattr(modeling_dspark, "get_sm_version", lambda: 107)
+    if value is None:
+        monkeypatch.delenv("TRTLLM_DSPARK_LINEAR_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DSPARK_LINEAR_BACKEND", value)
+    for tp_size, enable_attention_dp in ((1, False), (2, True), (2, False)):
+        mapping = types.SimpleNamespace(tp_size=tp_size, enable_attention_dp=enable_attention_dp)
+        if expected is None:
+            with pytest.raises(ValueError, match="not supported by this DSpark drafter"):
+                modeling_dspark._use_dspark_bf16_linear(mapping, fp8_supported=False)
+        else:
+            assert modeling_dspark._use_dspark_bf16_linear(mapping, fp8_supported=False)
+
+
 def test_use_dspark_bf16_linear_rejects_invalid_backend(monkeypatch):
     monkeypatch.setenv("TRTLLM_DSPARK_LINEAR_BACKEND", "auto")
     mapping = types.SimpleNamespace(tp_size=1, enable_attention_dp=False)
@@ -1046,6 +1062,40 @@ def test_bind_bf16_attn_projections_disables_every_fp8_projection():
     assert bound["use_fused_qkv_input_projection"] is False
     assert bound["use_fused_q_input_projection"] is False
     assert model._context_wkv_fp8 is None
+
+
+@pytest.mark.parametrize("block", [128, 32])
+def test_bind_bf16_attn_projections_uses_checkpoint_block_size(block: int) -> None:
+    model = DSv4DSparkDraftModel.__new__(DSv4DSparkDraftModel)
+    torch.nn.Module.__init__(model)
+    model.checkpoint_fp8_block_size = block
+    model._use_bf16_linear = False
+    stage = types.SimpleNamespace(input_layernorm=types.SimpleNamespace(weight=torch.ones(1)))
+    model.mtp_layers = [stage]
+    prefix = "mtp.0.attn."
+    generator = torch.Generator().manual_seed(block)
+    weights = {
+        f"{prefix}q_norm.weight": torch.ones(2),
+        f"{prefix}kv_norm.weight": torch.ones(3),
+        f"{prefix}attn_sink": torch.zeros(6),
+    }
+    for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
+        weights[f"{prefix}{name}.weight"] = torch.randn(128, 128, generator=generator).to(
+            torch.float8_e4m3fn
+        )
+        weights[f"{prefix}{name}.scale"] = torch.rand(
+            128 // block, 128 // block, generator=generator
+        )
+
+    model._bind_bf16_attn_projections(weights)
+
+    assert model._use_bf16_linear is True
+    assert stage._dspark_context_wkv_slice is None
+    for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
+        weight = weights[f"{prefix}{name}.weight"].float()
+        scale = weights[f"{prefix}{name}.scale"]
+        expected = weight * scale.repeat_interleave(block, 0).repeat_interleave(block, 1)
+        torch.testing.assert_close(stage._dspark_attn[name], expected.to(torch.bfloat16))
 
 
 def test_context_wkv_fp8_quantizes_once_per_window_write(monkeypatch):
