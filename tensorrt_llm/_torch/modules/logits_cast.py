@@ -28,12 +28,22 @@ _BLOCK = 2048
 _NUM_WARPS = 4
 
 
-@triton.jit
+# numel is not specialized, so every logits shape runs one compiled kernel, and a
+# new row count never compiles inside a CUDA graph capture. Without the
+# multiple-of-16 hint, a masked access is only as wide as the mask is uniform, so
+# full blocks skip the mask to keep 128-bit loads and stores; only the last,
+# partial block is masked.
+@triton.jit(do_not_specialize=["numel"])
 def _widen_to_fp32_kernel(src_ptr, dst_ptr, numel, BLOCK: tl.constexpr):
-    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < numel
-    values = tl.load(src_ptr + offsets, mask=mask, eviction_policy="evict_first")
-    tl.store(dst_ptr + offsets, values.to(tl.float32), mask=mask)
+    start = tl.program_id(0).to(tl.int64) * BLOCK
+    offsets = start + tl.arange(0, BLOCK)
+    if start + BLOCK <= numel:
+        values = tl.load(src_ptr + offsets, eviction_policy="evict_first")
+        tl.store(dst_ptr + offsets, values.to(tl.float32))
+    else:
+        mask = offsets < numel
+        values = tl.load(src_ptr + offsets, mask=mask, eviction_policy="evict_first")
+        tl.store(dst_ptr + offsets, values.to(tl.float32), mask=mask)
 
 
 def widen_logits_to_fp32(logits: torch.Tensor) -> torch.Tensor:
