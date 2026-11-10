@@ -709,7 +709,6 @@ class DecoderCudaGraphs:
                 if not context_only:
                     from tensorrt_llm._torch.modules.linear import (
                         MXFP8LinearMethod,
-                        cuda_graph_gemm_tuning,
                         flashinfer_mxfp8_autotune,
                         flashinfer_mxfp8_decode_graph_capture,
                     )
@@ -731,11 +730,7 @@ class DecoderCudaGraphs:
                         if is_warmup_only and flashinfer_methods
                         else contextlib.nullcontext()
                     )
-                    with (
-                        flashinfer_autotune_context,
-                        flashinfer_mxfp8_decode_graph_capture(),
-                        cuda_graph_gemm_tuning(tune=is_warmup_only),
-                    ):
+                    with flashinfer_autotune_context, flashinfer_mxfp8_decode_graph_capture():
                         self._capture_generation_cuda_graphs(resource_manager)
                     if (
                         is_warmup_only
