@@ -73,6 +73,12 @@ Set `TLLM_DEBUG_MODE=1` to enable debug assertions (`NDEBUG=False`). Default is 
 
 ## Gotchas
 
+- **The disk I/O pool is process-wide.** `DiskCacheTierConfig.num_io_threads` starts one pool
+  per process at the first nonzero value; later managers, including ones that pass 0, share it.
+  In a test process, tests after a disk-options test run with the pool even if they set 0, and
+  `_introspection.async_disk_io_enabled()` tells which path ran. `_introspection.disk_copy_counters()`
+  reports the retained-copy counters and `inject_disk_write_failures_for_testing()` forces write
+  failures.
 - **String salt participates directly in matching.** `ReuseScope.salt` is an
   optional string used by scope equality, hashing, indexing, and prefix reuse.
   Hash its full UTF-8 bytes with a length prefix; distinguish `None`, `""`, and
