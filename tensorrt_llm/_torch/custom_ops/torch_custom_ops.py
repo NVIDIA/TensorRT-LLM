@@ -2233,6 +2233,13 @@ class Fp8QuantKernelRunner(TunableRunner):
         return a
 
 
+# The deep_gemm package compiles each layout with nvcc and releases the GIL
+# meanwhile (its kernel caches are only touched with the GIL held), so the
+# autotuner drives the JIT of a sweep's distinct layouts on a thread pool
+# (TuningConfig.parallel_jit_warmup; -1 sizes it from this rank's CPUs).
+_DEEP_GEMM_JIT_WARMUP_THREADS = -1
+
+
 class fp8SwapABGemmRunner(TunableRunner):
     """Runs quantize + DeepGemm FP8 GEMM. Single tactic for JIT warmup."""
 
@@ -2248,6 +2255,7 @@ class fp8SwapABGemmRunner(TunableRunner):
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, deep_gemm_jit_warmup_buckets), ),
         exclude_from_cache=True,
+        parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
     )
 
     def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool,
@@ -2295,14 +2303,14 @@ class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
     """Runs DeepGemm with pre-quantized FP8 activations and packed scales."""
 
     # The same step-16 grid as the other two DeepGemm runners: a layout no
-    # bucket selects is compiled mid-inference instead, and DeepGemm forks
-    # nvcc while holding the GIL.
+    # bucket selects is compiled mid-inference instead.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, deep_gemm_jit_warmup_buckets), ),
         constraint_specs=(ConstraintSpec(
             1, 0, lambda input_shapes: input_shapes[0][0]), ),
         exclude_from_cache=True,
+        parallel_jit_warmup=_DEEP_GEMM_JIT_WARMUP_THREADS,
     )
 
     def __init__(self, output_dtype: torch.dtype,
@@ -2447,7 +2455,10 @@ def _(
 # cubins and compiles nothing.
 class Fp8BlockScalingGemmRunner(TunableRunner):
     # Without exclude_from_cache, a warm disk cache short-circuits tuning and
-    # the JIT warmup never runs.
+    # the JIT warmup never runs. The warmup stays serial (no
+    # parallel_jit_warmup): on Hopper the kernels come from the C++ DeepGEMM
+    # JIT in cpp/include/tensorrt_llm/deep_gemm, whose runtime cache is not
+    # safe to use from several threads, and the op runs without the GIL.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, deep_gemm_jit_warmup_buckets), ),
