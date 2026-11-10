@@ -15,6 +15,7 @@
 """B12x MoE backend gating and dispatch tests."""
 
 import dataclasses
+import inspect
 import sys
 import types
 from typing import Optional
@@ -671,6 +672,22 @@ def _reset_to_stock_validator(kernel, monkeypatch) -> None:
     )
 
 
+def _reset_to_pre_fix_validator(kernel, monkeypatch) -> None:
+    """Start from a validator that applies the search floor to every tile, as
+    flashinfer 0.6.17 to 0.7.1 do. Where the installed validator exempts forced
+    tiles through ``enforce_search_floor``, that validator with the floor
+    always on, and without the parameter, stands in for them."""
+    _reset_to_stock_validator(kernel, monkeypatch)
+    stock = kernel._candidate_tile_fits
+    if "enforce_search_floor" not in inspect.signature(stock).parameters:
+        return
+
+    def pre_fix_fits(**kwargs):
+        return stock(**kwargs, enforce_search_floor=True)
+
+    monkeypatch.setattr(kernel, "_candidate_tile_fits", pre_fix_fits)
+
+
 def _fits(kernel, **overrides) -> bool:
     kwargs = dict(cta_m_blocks=1, max_shared_mem=_RTX_PRO_6000_SMEM, **_QWEN36_FC2, **_ULTRA_FC2)
     kwargs.update(overrides)
@@ -679,7 +696,7 @@ def _fits(kernel, **overrides) -> bool:
 
 def test_w4a16_ultra_wide_fc2_shim_accepts_repinned_ultra_tile(monkeypatch):
     kernel = _flashinfer_w4a16_kernel()
-    _reset_to_stock_validator(kernel, monkeypatch)
+    _reset_to_pre_fix_validator(kernel, monkeypatch)
     assert not _fits(kernel), (
         "flashinfer's stock validator accepts the ultra-wide FC2 tile; the shim in "
         "fused_moe_cute_dsl_b12x.py is no longer needed"
@@ -703,7 +720,7 @@ def test_w4a16_ultra_wide_fc2_shim_accepts_repinned_ultra_tile(monkeypatch):
 
 def test_w4a16_ultra_wide_fc2_shim_is_idempotent(monkeypatch):
     kernel = _flashinfer_w4a16_kernel()
-    _reset_to_stock_validator(kernel, monkeypatch)
+    _reset_to_pre_fix_validator(kernel, monkeypatch)
     stock = kernel._candidate_tile_fits
 
     assert _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() is True
@@ -716,9 +733,49 @@ def test_w4a16_ultra_wide_fc2_shim_is_idempotent(monkeypatch):
 
 def test_w4a16_ultra_wide_fc2_shim_yields_to_upstream_fix(monkeypatch):
     kernel = _flashinfer_w4a16_kernel()
-    _reset_to_stock_validator(kernel, monkeypatch)
+    _reset_to_pre_fix_validator(kernel, monkeypatch)
     stock = kernel._candidate_tile_fits
     monkeypatch.setattr(kernel, "_ultra_wide_fc2_tile_fits", lambda **_: True, raising=False)
 
     assert _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() is False
     assert kernel._candidate_tile_fits is stock
+
+
+def test_w4a16_forced_ultra_wide_fc2_tile_reaches_kernel_build(monkeypatch):
+    """The custom-op launch recompiles with the tiles the selector chose,
+    forced through ``force_tile_config``. After the hook every W4A16 B12x leaf
+    runs at construction, that re-pin of the ultra-wide FC2 tile gets past tile
+    validation to the kernel build, on the installed flashinfer."""
+    kernel = _flashinfer_w4a16_kernel()
+    _reset_to_stock_validator(kernel, monkeypatch)
+    _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation()
+
+    class KernelBuildReached(Exception):
+        pass
+
+    built = {}
+
+    def build_kernel(**kwargs):
+        built.update(kwargs)
+        raise KernelBuildReached
+
+    # The build compiles CuTe DSL code for a GPU; only the tiles it gets matter.
+    monkeypatch.setattr(kernel, "W4A16FusedMoeKernel", build_kernel)
+    with pytest.raises(KernelBuildReached):
+        kernel.compile_w4a16_fused_moe(
+            size_m=4,
+            hidden_size=2048,
+            intermediate_size=512,
+            num_experts=8,
+            top_k=2,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            moe_block_size=8,
+            max_m_blocks=1,
+            sms=188,
+            max_shared_mem=101376,
+            # (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n), 256 threads each.
+            force_tile_config=(128, 128, 32, 512),
+        )
+    assert (built["fc2_tile_n"], built["fc2_tile_k"]) == (512, 32)
