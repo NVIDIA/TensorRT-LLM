@@ -357,8 +357,10 @@ The field name `speculative_model_dir` can also be used as an alias for `specula
 One-engine speculative decoding captures its decode CUDA graphs once per sampling variant: `greedy` for
 batches whose requests all decode greedily, `advanced` for batches with a sampled request (one whose
 temperature, top-k, top-p or min-p does not resolve to greedy decoding; a seed or a penalty alone does not),
-and `temperature_only` for sampled batches whose sampled requests set only a temperature (MTP-Eagle one-model
-decoding with tensor parallelism, without attention DP, relaxed acceptance, rejection sampling or penalties).
+and `temperature_only` for sampled batches whose sampled requests set only a temperature. `temperature_only`
+needs a model whose MTP-Eagle one-model decode samples vocabulary-sharded logits (the spec-decode fast paths;
+today Qwen3.5 checkpoints on SM 10.0/10.3 GPUs), tensor parallelism, and no attention DP, relaxed acceptance,
+rejection sampling or penalties; on other models the first CUDA graph capture rejects it.
 `cuda_graph_config.sampling_variants` (prototype) captures only the listed variants, which shortens startup
 and saves graph memory:
 
@@ -370,11 +372,13 @@ cuda_graph_config:
 
 - Without `temperature_only`, temperature-only batches replay the `advanced` graphs.
 - Without `greedy`, greedy batches replay the sampled graphs (`temperature_only` if listed, else `advanced`)
-  and still decode greedily, at a cost: they lose the argmax fast paths (the vocabulary-sharded target argmax
-  and, with rejection sampling, argmax drafting and its LM-head-TP path), add sampling-parameter and RNG-state
-  uploads, take the sampled path in eager steps too, and on the `advanced` graphs exact ties can break
-  differently than on the `greedy` graphs. With MTP-Eagle one-model decoding and tensor parallelism, listing
-  `temperature_only` keeps the exact vocabulary-sharded argmax for greedy batches.
+  and still decode greedily, at a cost: they add sampling-parameter and RNG-state uploads, take the sampled
+  path in eager steps too, and on the `advanced` graphs exact ties can break differently than on the `greedy`
+  graphs. They also lose the argmax fast paths: with rejection sampling, argmax drafting and its LM-head-TP
+  path; and the vocabulary-sharded target argmax where the model has one. A model with the spec-decode fast
+  paths keeps that argmax by listing `temperature_only`, unless it uses rejection sampling; DFlash with tensor
+  parallelism keeps its shard selection when it runs without rejection sampling and with
+  `advanced_sampling_mode: no_topk_no_topp`.
 - Without `advanced`, a sampled batch that `temperature_only` does not serve runs eagerly, and the first one
   logs a warning. Under attention DP, every rank then runs that step eagerly.
 
